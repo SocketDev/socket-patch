@@ -336,14 +336,16 @@ async fn run_vendor_interactive_path(
             vendored_purls,
         )
         .await;
-        if !gc.pruned.is_empty() {
+        if !args.common.silent && !gc.pruned.is_empty() {
             println!(
                 "GC: pruned {} manifest entr{}.",
                 gc.pruned.len(),
                 if gc.pruned.len() == 1 { "y" } else { "ies" },
             );
         }
-        print_gc_vendored_line(&gc);
+        if !args.common.silent {
+            print_gc_vendored_line(&gc);
+        }
     }
     match boxed_scan_vendor_step(
         &args.common,

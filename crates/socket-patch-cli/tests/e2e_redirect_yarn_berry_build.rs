@@ -85,19 +85,23 @@ fn has_command(cmd: &str) -> bool {
 }
 
 fn scrub_socket_env(cmd: &mut Command) {
+    // Seed-then-scrub (mirrors e2e_golang_redirect.rs): yarn berry lets EVERY
+    // `.yarnrc.yml` setting be overridden by a `YARN_*` env var (env outranks
+    // the project yarnrc), so an ambient `YARN_NODE_LINKER=pnp` was verified
+    // to turn both tests red — the fixture install builds a PnP tree and
+    // node_modules/left-pad never exists. The explicit env_remove below
+    // clears the seed too, but if the scrub is ever dropped the seed (rather
+    // than a developer's ambient shell, which this suite can't rely on) turns
+    // the tests red immediately.
+    cmd.env("YARN_NODE_LINKER", "pnp");
     for (k, _) in std::env::vars_os() {
-        if k.to_string_lossy().starts_with("SOCKET_") {
+        let key = k.to_string_lossy();
+        if key.starts_with("SOCKET_") || key.starts_with("YARN_") {
             cmd.env_remove(&k);
         }
     }
     cmd.env_remove("VIRTUAL_ENV");
-    for v in [
-        "YARN_CACHE_FOLDER",
-        "YARN_GLOBAL_FOLDER",
-        "YARN_ENABLE_GLOBAL_CACHE",
-    ] {
-        cmd.env_remove(v);
-    }
+    cmd.env_remove("YARN_NODE_LINKER");
 }
 
 fn corepack(cwd: &Path, pm: &str, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
@@ -415,6 +419,39 @@ async fn berry_hosted_project(
     assert_eq!(
         env["redirect"]["redirected"], 1,
         "one dep redirected: {env}"
+    );
+    // In-run VEX (step 3 of the module doc): the envelope's vex block plus the
+    // document's unverified `(redirected)` attestation. Without these, a scan
+    // that silently skips the VEX write (or emits the wrong statement) stays
+    // green — the exit code only catches a HARD vex failure.
+    assert_eq!(env["vex"]["path"], "out.vex.json", "vex block: {env}");
+    assert_eq!(env["vex"]["statements"], 1, "vex block: {env}");
+    assert_eq!(env["vex"]["format"], "openvex-0.2.0", "vex block: {env}");
+    assert_eq!(
+        env["vex"]["verified"], false,
+        "in-run redirect VEX is attested from the ledger, not hash-verified: {env}"
+    );
+    let vex_doc: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(proj.join("out.vex.json")).unwrap()).unwrap();
+    let stmts = vex_doc["statements"].as_array().unwrap();
+    assert_eq!(
+        stmts.len(),
+        1,
+        "exactly the redirected patch attested: {vex_doc}"
+    );
+    assert_eq!(
+        stmts[0]["vulnerability"]["name"], GHSA,
+        "vex doc: {vex_doc}"
+    );
+    assert_eq!(stmts[0]["status"], "not_affected", "vex doc: {vex_doc}");
+    assert_eq!(
+        stmts[0]["products"][0]["subcomponents"][0]["@id"], PURL,
+        "vex doc: {vex_doc}"
+    );
+    assert_eq!(
+        stmts[0]["impact_statement"].as_str().unwrap(),
+        format!("Patched via Socket patch {UUID} (redirected)"),
+        "the in-run attestation must carry the (redirected) marker: {vex_doc}"
     );
 
     // Lockfile pin: the encoded __archiveUrl + the 10c0 checksum.

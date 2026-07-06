@@ -18,7 +18,7 @@ use toml_edit::{Array, DocumentMut, InlineTable, Item, Table, Value};
 
 use super::detect::{deps_contain_hook, HOOK_DEP};
 use crate::patch::vendor::common::detect_eol;
-use crate::utils::fs::atomic_write_bytes;
+use crate::utils::fs::atomic_write_bytes_preserving_mode;
 
 /// Which manifest format a path is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,7 +70,12 @@ async fn finish(
         Ok(None) => PthEditResult::ok(path, PthStatus::AlreadyConfigured),
         Ok(Some(new_content)) => {
             if !dry_run {
-                if let Err(e) = atomic_write_bytes(path, new_content.as_bytes()).await {
+                // Mode-preserving: these are user-owned manifests we merely
+                // edit; the plain writer's fresh stage inode would reset a
+                // 0600 pyproject.toml / requirements.txt to umask defaults.
+                if let Err(e) =
+                    atomic_write_bytes_preserving_mode(path, new_content.as_bytes()).await
+                {
                     return PthEditResult::err(path, e.to_string());
                 }
             }
@@ -278,11 +283,13 @@ fn poetry_add(doc: &mut DocumentMut) -> Result<bool, String> {
 
     // Classic Poetry can't express `socket-patch[hook]` as a key, so declare
     // the equivalent: `socket-patch` carrying the `hook` extra. Already wired
-    // if a bare `socket-patch-hook` key exists or the extra is already present.
-    if deps.contains_key("socket-patch-hook") {
+    // if a bare `socket-patch-hook` key exists or the extra is already present
+    // — matched canonically, since Poetry accepts any PEP 503 spelling.
+    if poetry_dep_key(deps, "socket-patch-hook").is_some() {
         return Ok(false);
     }
-    if let Some(item) = deps.get_mut("socket-patch") {
+    if let Some(key) = poetry_dep_key(deps, "socket-patch") {
+        let item = deps.get_mut(&key).expect("key came from this table");
         if item_has_hook_extra(item) {
             return Ok(false);
         }
@@ -297,7 +304,7 @@ fn poetry_add(doc: &mut DocumentMut) -> Result<bool, String> {
             extras.push("hook");
             tbl.insert("extras", Item::Value(Value::Array(extras)));
         } else if let Some(version) = item.as_str().map(str::to_string) {
-            deps.insert("socket-patch", Item::Value(hook_inline_table(&version)));
+            deps.insert(&key, Item::Value(hook_inline_table(&version)));
         } else {
             // Any other shape (e.g. Poetry's multiple-constraints array of
             // tables) carries spec data a blanket replacement would destroy.
@@ -327,19 +334,20 @@ fn poetry_remove(doc: &mut DocumentMut) -> bool {
     };
 
     let mut changed = false;
-    // Drop a legacy bare `socket-patch-hook` key if present.
-    if deps.remove("socket-patch-hook").is_some() {
+    // Drop a legacy bare `socket-patch-hook` key (any PEP 503 spelling).
+    if let Some(key) = poetry_dep_key(deps, "socket-patch-hook") {
+        deps.remove(&key);
         changed = true;
     }
     // Strip the `hook` extra from a `socket-patch` dep table, leaving the rest
     // of the spec intact.
-    if let Some(tbl) = deps
-        .get_mut("socket-patch")
+    if let Some(tbl) = poetry_dep_key(deps, "socket-patch")
+        .and_then(|key| deps.get_mut(&key))
         .and_then(Item::as_table_like_mut)
     {
         if let Some(extras) = tbl.get_mut("extras").and_then(Item::as_array_mut) {
             let before = extras.len();
-            extras.retain(|v| v.as_str() != Some("hook"));
+            extras.retain(|v| !v.as_str().is_some_and(|s| s.eq_ignore_ascii_case("hook")));
             if extras.len() != before {
                 changed = true;
             }
@@ -349,6 +357,28 @@ fn poetry_remove(doc: &mut DocumentMut) -> bool {
         }
     }
     changed
+}
+
+/// PEP 503 canonical form of a package name: `-`/`_`/`.` are interchangeable
+/// and comparison is case-insensitive. Poetry accepts any spelling as a
+/// dependency key, so the structural helpers must match keys canonically —
+/// the textual probe ([`super::detect::deps_contain_hook`]) already does.
+fn canonical_pypi_name(name: &str) -> String {
+    name.to_lowercase()
+        .chars()
+        .map(|c| if c == '_' || c == '.' { '-' } else { c })
+        .collect()
+}
+
+/// Find the key in a Poetry dependencies table whose canonical form is
+/// `canonical`, returning the user's spelling so edits land on it in place
+/// (inserting under the canonical name next to a variant-spelled key would
+/// declare the dependency twice — Poetry rejects that).
+fn poetry_dep_key(deps: &Table, canonical: &str) -> Option<String> {
+    deps.iter()
+        .map(|(k, _)| k)
+        .find(|k| canonical_pypi_name(k) == canonical)
+        .map(str::to_string)
 }
 
 /// Build `{ version = "<v>", extras = ["hook"] }`.
@@ -362,12 +392,15 @@ fn hook_inline_table(version: &str) -> Value {
 }
 
 /// True if a dependency item (inline table or sub-table) already carries the
-/// `hook` extra.
+/// `hook` extra (case-insensitively — PEP 685 normalizes extras names).
 fn item_has_hook_extra(item: &Item) -> bool {
     item.as_table_like()
         .and_then(|t| t.get("extras"))
         .and_then(Item::as_array)
-        .map(|a| a.iter().any(|v| v.as_str() == Some("hook")))
+        .map(|a| {
+            a.iter()
+                .any(|v| v.as_str().is_some_and(|s| s.eq_ignore_ascii_case("hook")))
+        })
         .unwrap_or(false)
 }
 
@@ -416,10 +449,10 @@ pub fn pyproject_contains_hook(content: &str) -> bool {
         .and_then(|p| p.get("dependencies"))
         .and_then(Item::as_table)
     {
-        if deps.contains_key("socket-patch-hook") {
+        if poetry_dep_key(deps, "socket-patch-hook").is_some() {
             return true;
         }
-        if let Some(item) = deps.get("socket-patch") {
+        if let Some(item) = poetry_dep_key(deps, "socket-patch").and_then(|key| deps.get(&key)) {
             if item_has_hook_extra(item) {
                 return true;
             }
@@ -611,6 +644,56 @@ mod tests {
         );
         let tool_only = "[tool.black]\nline-length = 100\n";
         assert!(pyproject_add(tool_only).is_err());
+    }
+
+    #[test]
+    fn test_pep621_dynamic_dependencies_refused() {
+        // setuptools/hatch dynamic-metadata pattern: `dependencies` is declared
+        // dynamic and resolved from an external source at build time. PEP 621
+        // forbids a field that is both listed in `dynamic` and set statically,
+        // so inserting a static `dependencies` array makes every backend refuse
+        // to build. The edit must fail closed instead of bricking the build.
+        let toml = "[project]\nname = \"x\"\ndynamic = [\"dependencies\"]\n\n\
+                    [tool.setuptools.dynamic]\ndependencies = {file = [\"requirements.txt\"]}\n";
+        assert!(
+            pyproject_add(toml).is_err(),
+            "must not add a static dependencies array next to dynamic = [\"dependencies\"]"
+        );
+    }
+
+    #[test]
+    fn test_poetry2_dynamic_dependencies_routes_to_poetry() {
+        // Poetry 2.x documented pattern: a PEP 621 `[project]` table with
+        // `dynamic = ["dependencies"]` while the real dependency surface stays
+        // in `[tool.poetry.dependencies]`. The hook must land in the poetry
+        // table — a static `[project].dependencies` array is both ignored by
+        // Poetry at install time and invalid per PEP 621.
+        let toml = "[project]\nname = \"x\"\ndynamic = [\"dependencies\"]\n\n\
+                    [tool.poetry.dependencies]\npython = \"^3.9\"\n";
+        let out = pyproject_add(toml).unwrap().unwrap();
+        let doc = out.parse::<DocumentMut>().unwrap();
+        assert!(
+            item_has_hook_extra(&doc["tool"]["poetry"]["dependencies"]["socket-patch"]),
+            "hook must be wired via the poetry table:\n{out}"
+        );
+        assert!(
+            doc.get("project")
+                .and_then(|p| p.get("dependencies"))
+                .is_none(),
+            "must not synthesize a static [project].dependencies:\n{out}"
+        );
+        // Idempotent through the same route.
+        assert!(pyproject_add(&out).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_pep621_other_dynamic_fields_still_edited_statically() {
+        // Only `dependencies` being dynamic blocks the static edit; dynamic
+        // version (the common setuptools-scm case) keeps the PEP 621 path.
+        let toml =
+            "[project]\nname = \"x\"\ndynamic = [\"version\"]\ndependencies = [\"requests\"]\n";
+        let out = pyproject_add(toml).unwrap().unwrap();
+        assert!(out.contains("socket-patch[hook]"));
     }
 
     #[test]
@@ -828,6 +911,131 @@ mod tests {
             !pyproject_contains_hook(&removed),
             "after remove the hook must be gone:\n{removed}"
         );
+    }
+
+    // ── mode preservation (user-owned manifests keep their permission bits) ──
+    //
+    // The rename-based atomic write swaps in a fresh stage inode; without the
+    // mode-preserving variant a 0600 private manifest silently becomes 0644.
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_edit_preserves_file_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+
+        // A 0600 private pyproject.toml must stay private after add.
+        let py = dir.path().join("pyproject.toml");
+        tokio::fs::write(&py, "[project]\nname = \"x\"\ndependencies = []\n")
+            .await
+            .unwrap();
+        tokio::fs::set_permissions(&py, std::fs::Permissions::from_mode(0o600))
+            .await
+            .unwrap();
+        let res = add_hook_dependency(&py, ManifestKind::Pyproject, false).await;
+        assert_eq!(res.status, PthStatus::Updated);
+        let mode = tokio::fs::metadata(&py).await.unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "add must not reset pyproject.toml mode");
+
+        // A 0744 requirements.txt keeps its exec bit after remove (red under
+        // ANY umask: a 0666-created stage inode can never carry exec bits).
+        let req = dir.path().join("requirements.txt");
+        tokio::fs::write(&req, "requests\nsocket-patch[hook]\n")
+            .await
+            .unwrap();
+        tokio::fs::set_permissions(&req, std::fs::Permissions::from_mode(0o744))
+            .await
+            .unwrap();
+        let res = remove_hook_dependency(&req, ManifestKind::Requirements, false).await;
+        assert_eq!(res.status, PthStatus::Updated);
+        let mode = tokio::fs::metadata(&req).await.unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o744, "remove must not reset requirements.txt mode");
+    }
+
+    // ── PEP 503/685 spellings in the Poetry TABLE forms ──────────────
+    //
+    // `-`/`_`/`.` are interchangeable in package names and names/extras are
+    // case-insensitive; Poetry installs the hook from any spelling, so the
+    // structural helpers must recognize them the way the textual probe
+    // (`deps_contain_hook`) already does.
+
+    #[test]
+    fn test_poetry_add_pep503_variant_keys_idempotent() {
+        // A hook already declared under a variant spelling must be recognized,
+        // not shadowed by a second entry for the same canonical package.
+        let wheel =
+            "[tool.poetry]\nname = \"x\"\n\n[tool.poetry.dependencies]\nsocket_patch_hook = \"*\"\n";
+        assert!(pyproject_add(wheel).unwrap().is_none());
+        let extra = "[tool.poetry]\nname = \"x\"\n\n[tool.poetry.dependencies]\n\
+                     socket_patch = {version = \"^3.3.0\", extras = [\"hook\"]}\n";
+        assert!(pyproject_add(extra).unwrap().is_none());
+        // PEP 685: extras names are case-insensitive too.
+        let cased = "[tool.poetry]\nname = \"x\"\n\n[tool.poetry.dependencies]\n\
+                     socket-patch = {version = \"*\", extras = [\"Hook\"]}\n";
+        assert!(pyproject_add(cased).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_poetry_add_merges_into_pep503_variant_key() {
+        // An existing dep under a variant spelling gains the extra in place —
+        // not a duplicate `socket-patch` key canonicalizing to the same
+        // package, which Poetry rejects as a twice-declared dependency.
+        let toml =
+            "[tool.poetry]\nname = \"x\"\n\n[tool.poetry.dependencies]\nSocket_Patch = \"^3.3.0\"\n";
+        let out = pyproject_add(toml).unwrap().unwrap();
+        let doc = out.parse::<DocumentMut>().unwrap();
+        let deps = doc["tool"]["poetry"]["dependencies"].as_table().unwrap();
+        assert!(
+            deps.get("socket-patch").is_none(),
+            "must not add a duplicate key:\n{out}"
+        );
+        let item = deps.get("Socket_Patch").expect("user's spelling kept");
+        assert!(
+            item_has_hook_extra(item),
+            "extra merged under the user's spelling:\n{out}"
+        );
+        assert_eq!(
+            item.as_table_like()
+                .and_then(|t| t.get("version"))
+                .and_then(Item::as_str),
+            Some("^3.3.0"),
+            "existing version must be preserved"
+        );
+    }
+
+    #[test]
+    fn test_poetry_remove_pep503_variant_keys() {
+        // remove must unwire the hook regardless of spelling — leaving it
+        // declared means the .pth carrier keeps installing after `remove`.
+        let wheel = "[tool.poetry.dependencies]\nsocket_patch_hook = \"*\"\n";
+        let out = pyproject_remove(wheel)
+            .unwrap()
+            .expect("variant wheel key must be removed");
+        assert!(!pyproject_contains_hook(&out));
+
+        let extra =
+            "[tool.poetry.dependencies]\n\"socket.patch\" = {version = \"*\", extras = [\"Hook\"]}\n";
+        let out = pyproject_remove(extra)
+            .unwrap()
+            .expect("variant extras form must be stripped");
+        assert!(!pyproject_contains_hook(&out));
+    }
+
+    #[test]
+    fn test_pyproject_contains_hook_pep503_poetry_forms() {
+        assert!(pyproject_contains_hook(
+            "[tool.poetry.dependencies]\nsocket_patch_hook = \"*\"\n"
+        ));
+        assert!(pyproject_contains_hook(
+            "[tool.poetry.dependencies]\nSocket_Patch = {version = \"*\", extras = [\"hook\"]}\n"
+        ));
+        assert!(pyproject_contains_hook(
+            "[tool.poetry.dependencies]\nsocket-patch = {version = \"*\", extras = [\"Hook\"]}\n"
+        ));
+        // A different package that merely shares the prefix is not the hook.
+        assert!(!pyproject_contains_hook(
+            "[tool.poetry.dependencies]\nsocket-patchwork = \"*\"\n"
+        ));
     }
 
     #[tokio::test]

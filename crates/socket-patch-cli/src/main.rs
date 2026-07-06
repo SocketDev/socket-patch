@@ -1,8 +1,31 @@
 use socket_patch_cli::{commands, parse_with_uuid_fallback, Commands};
 use socket_patch_core::utils::env_compat::promote_legacy_env_vars;
 
+/// Restore the default SIGPIPE disposition. The Rust runtime starts every
+/// process with SIGPIPE ignored, so once a pipeline consumer exits
+/// (`socket-patch scan | head -1`) the next `println!` gets `EPIPE` and
+/// *panics* — exit 101 and a "failed printing to stdout: Broken pipe"
+/// crash report instead of the quiet SIGPIPE death every other Unix CLI
+/// has in that position. Network sockets are unaffected: std and socket2
+/// write with `MSG_NOSIGNAL` / `SO_NOSIGPIPE`.
+#[cfg(unix)]
+fn restore_default_sigpipe() {
+    // SAFETY: SIG_DFL is a valid disposition for SIGPIPE, and this runs
+    // first thing in `main`, before any other threads exist.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
+#[cfg(not(unix))]
+fn restore_default_sigpipe() {}
+
 #[tokio::main]
 async fn main() {
+    // Must precede any output: the deprecation warnings and clap help both
+    // write to possibly-already-closed pipes.
+    restore_default_sigpipe();
+
     // Migrate legacy SOCKET_PATCH_* env vars into the new SOCKET_* names
     // before clap parses, so downstream code only needs to know the new
     // names. A one-shot deprecation warning fires per legacy name set.

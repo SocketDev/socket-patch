@@ -91,39 +91,25 @@ mod host_guard {
     const PACKAGE_JSON: &str =
         "{ \"name\": \"sm-proj\", \"version\": \"0.0.0\", \"private\": true, \"dependencies\": { \"minimist\": \"1.2.2\" } }\n";
 
-    /// Every `SOCKET_*` env var clap consults for the `setup` surface this
-    /// test drives. The verdict's whole signal is that `setup` reflects ONLY
-    /// the explicit flags (`--check`, `--yes`, `--cwd`, `--remove`, `--json`);
-    /// an ambient `SOCKET_CWD` could retarget the run away from our maven
-    /// fixture, and `SOCKET_EXPERIMENTAL_MAVEN` is scrubbed too so an enabled
-    /// gate in the shell/CI can never quietly turn maven into a configurable
-    /// surface behind the test's back. Mirrors `setup_matrix_pypi.rs` /
-    /// `setup_matrix_deno.rs`.
-    const SOCKET_ENV_VARS: &[&str] = &[
-        "SOCKET_CWD",
-        "SOCKET_MANIFEST_PATH",
-        "SOCKET_API_URL",
-        "SOCKET_API_TOKEN",
-        "SOCKET_ORG_SLUG",
-        "SOCKET_PROXY_URL",
-        "SOCKET_ECOSYSTEMS",
-        "SOCKET_DOWNLOAD_MODE",
-        "SOCKET_OFFLINE",
-        "SOCKET_GLOBAL",
-        "SOCKET_GLOBAL_PREFIX",
-        "SOCKET_JSON",
-        "SOCKET_VERBOSE",
-        "SOCKET_SILENT",
-        "SOCKET_DRY_RUN",
-        "SOCKET_YES",
-        "SOCKET_LOCK_TIMEOUT",
-        "SOCKET_BREAK_LOCK",
-        "SOCKET_DEBUG",
-        "SOCKET_TELEMETRY_DISABLED",
-        "SOCKET_SAVE_ONLY",
-        "SOCKET_ONE_OFF",
-        "SOCKET_ALL_RELEASES",
-        "SOCKET_EXPERIMENTAL_MAVEN",
+    /// Ambient decoys [`run`]'s prefix scrub must strip, planted by the test
+    /// itself so the scrub is exercised on every run, not only in hostile
+    /// shells. Three demonstrated failure classes on the old fixed-list scrub:
+    /// clap parses env-bound `GlobalArgs` values on EVERY invocation whether
+    /// or not the command uses the flag, so an invalid ambient `SOCKET_STRICT`
+    /// / `SOCKET_VENDOR_SOURCE` aborts the parse (exit 2) before `setup` even
+    /// runs; a (perfectly valid!) ambient `SOCKET_SETUP_EXCLUDE` stands in for
+    /// `setup --exclude`, which a real `setup` run PERSISTS — creating
+    /// `.socket/manifest.json` inside the maven fixture and failing
+    /// `assert_pristine`; and an enabled `SOCKET_EXPERIMENTAL_MAVEN` gate in
+    /// the shell/CI could quietly change maven's surface behind the test's
+    /// back. (Safe to set process-wide: the only other test in this binary is
+    /// the `#[ignore]`d matrix pass, which routes through
+    /// `smc::host_driver_command`'s own `SOCKET_*` prefix scrub.)
+    const HOSTILE_DECOYS: &[(&str, &str)] = &[
+        ("SOCKET_STRICT", "banana"),
+        ("SOCKET_VENDOR_SOURCE", "bogus-decoy"),
+        ("SOCKET_SETUP_EXCLUDE", "decoy-member"),
+        ("SOCKET_EXPERIMENTAL_MAVEN", "true"),
     ];
 
     /// Absolute path to the binary under test, via cargo's `CARGO_BIN_EXE_*`.
@@ -132,14 +118,19 @@ mod host_guard {
     }
 
     /// Run the CLI with `args` in `cwd`; returns `(exit_code, stdout, stderr)`.
-    /// The entire `SOCKET_*` surface is stripped so behaviour reflects the
-    /// explicit flags alone (see [`SOCKET_ENV_VARS`]) — nothing reaches authed
-    /// endpoints and no ambient var can stand in for a flag.
+    /// The entire `SOCKET_*` surface is stripped BY PREFIX — a fixed list rots
+    /// (it missed `SOCKET_SETUP_EXCLUDE` / `SOCKET_VENDOR_SOURCE` /
+    /// `SOCKET_STRICT`, all parsed on every `setup` invocation; see
+    /// [`HOSTILE_DECOYS`]) — so behaviour reflects the explicit flags alone:
+    /// nothing reaches authed endpoints and no ambient var can stand in for a
+    /// flag.
     fn run(cwd: &Path, args: &[&str]) -> (i32, String, String) {
         let mut cmd = Command::new(binary());
         cmd.args(args).current_dir(cwd);
-        for var in SOCKET_ENV_VARS {
-            cmd.env_remove(var);
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("SOCKET_") {
+                cmd.env_remove(&key);
+            }
         }
         let out = cmd.output().expect("failed to execute socket-patch binary");
         (
@@ -234,6 +225,14 @@ mod host_guard {
 
     #[test]
     fn maven_setup_is_a_clean_noop_host() {
+        // Committed regression guard for the env scrub itself: with the old
+        // fixed-list scrub these leaked into the child — SOCKET_STRICT /
+        // SOCKET_VENDOR_SOURCE aborted every parse (exit 2) and
+        // SOCKET_SETUP_EXCLUDE made the real `setup` run write
+        // `.socket/manifest.json` into the fixture (assert_pristine RED).
+        for (k, v) in HOSTILE_DECOYS {
+            std::env::set_var(k, v);
+        }
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         std::fs::write(root.join("pom.xml"), POM_XML).unwrap();
@@ -317,5 +316,9 @@ mod host_guard {
             Some(1),
             "positive control: exactly the package.json must count as needing configuration.\n{out}"
         );
+
+        for (k, _) in HOSTILE_DECOYS {
+            std::env::remove_var(k);
+        }
     }
 }

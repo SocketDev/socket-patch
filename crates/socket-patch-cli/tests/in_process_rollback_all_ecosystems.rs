@@ -79,6 +79,19 @@ fn write_manifest_with_patch(
     std::fs::write(socket.join("manifest.json"), body).unwrap();
 }
 
+/// Run `rollback` with the ambient `VIRTUAL_ENV` scrubbed first.
+///
+/// `find_local_venv_site_packages` honors `VIRTUAL_ENV` FIRST and, when it
+/// holds a site-packages dir, early-returns — the fixture's `.venv` is never
+/// probed, rollback exits 0 with zero results, and the byte-restore
+/// assertion fails. Running this suite from an activated shell venv turned
+/// the pypi test red. Tests are `#[serial]`, so the scrub cannot race
+/// another test.
+async fn rollback_scrubbed(args: RollbackArgs) -> i32 {
+    std::env::remove_var("VIRTUAL_ENV");
+    rollback_run(args).await
+}
+
 fn default_rollback_args(cwd: &Path, eco: &str) -> RollbackArgs {
     RollbackArgs {
         common: socket_patch_cli::args::GlobalArgs {
@@ -231,7 +244,26 @@ async fn rollback_pypi_restores_original_content() {
         "precondition: file must be in patched state before rollback"
     );
 
-    let code = rollback_run(default_rollback_args(tmp.path(), "pypi")).await;
+    // Simulate an activated shell venv: point VIRTUAL_ENV at a populated
+    // venv OUTSIDE the project. Without the scrub in `rollback_scrubbed`
+    // the crawler early-returns with this decoy's site-packages and never
+    // reaches the fixture's `.venv` (exactly the pre-fix ambient failure),
+    // so this guard goes red if the scrub is ever dropped. The decoy
+    // tempdir must outlive the rollback call.
+    let decoy = tempfile::tempdir().unwrap();
+    let decoy_site = if cfg!(windows) {
+        decoy.path().join("Lib").join("site-packages")
+    } else {
+        decoy
+            .path()
+            .join("lib")
+            .join("python3.11")
+            .join("site-packages")
+    };
+    std::fs::create_dir_all(decoy_site.join("decoypkg-1.0.0.dist-info")).unwrap();
+    std::env::set_var("VIRTUAL_ENV", decoy.path());
+
+    let code = rollback_scrubbed(default_rollback_args(tmp.path(), "pypi")).await;
     assert_eq!(code, 0, "pypi rollback must report success (exit 0)");
     let after = std::fs::read(pkg_dir.join("__init__.py")).unwrap();
     assert_eq!(after, original, "pypi rollback must restore original bytes");

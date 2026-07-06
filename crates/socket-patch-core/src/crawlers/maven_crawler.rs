@@ -154,10 +154,20 @@ pub fn parse_pom_group_artifact_version(content: &str) -> Option<(String, String
         // the same line (`<modules></modules>`) or self-closes
         // (`<dependencies/>`) leaves the depth unchanged; only a lone open
         // increments and a lone close decrements.
+        //
+        // Any line carrying a close tag still holds that section's content up
+        // to the close (`<version>9.9</version></dependencies>`, or a whole
+        // compact `<dependencies>...</dependencies>` block), so it must not
+        // reach extraction even once the depth is back to 0 — otherwise a
+        // dependency's coordinates leak as the project's. A coordinate that
+        // legitimately follows a close on the same line is sacrificed to
+        // `None`, which scan rescues via the directory-path fallback.
+        let mut saw_section_close = false;
         for section in &skip_sections {
             let open = opening_tag(trimmed, section);
             let has_open = open.is_some();
             let has_close = contains_closing_tag(trimmed, section);
+            saw_section_close |= has_close;
             if has_open && !has_close && open != Some(true) {
                 skip_depth += 1;
             } else if has_close && !has_open {
@@ -165,7 +175,7 @@ pub fn parse_pom_group_artifact_version(content: &str) -> Option<(String, String
             }
         }
 
-        if skip_depth > 0 {
+        if skip_depth > 0 || saw_section_close {
             continue;
         }
 
@@ -942,6 +952,46 @@ mod tests {
       </plugin>
     </plugins>
   </build >
+  <version>1.0.0</version>
+</project>"#;
+        let (g, a, v) = parse_pom_group_artifact_version(content).unwrap();
+        assert_eq!(g, "com.example");
+        assert_eq!(a, "my-app");
+        assert_eq!(v, "1.0.0");
+    }
+
+    #[test]
+    fn test_parse_pom_compact_single_line_skip_block_does_not_leak() {
+        // REGRESSION: a skip section that opens AND closes on one physical
+        // line (compact/minified formatting) leaves skip_depth unchanged, and
+        // extraction then ran over that same line — leaking the dependency's
+        // <version> as the project's (the project's own <version> comes
+        // later, but first-match wins). Parse must not return 9.9.9 here.
+        let content = r#"<project>
+  <groupId>com.example</groupId>
+  <artifactId>my-app</artifactId>
+  <dependencies><dependency><groupId>org.leak</groupId><artifactId>leak</artifactId><version>9.9.9</version></dependency></dependencies>
+  <version>1.0.0</version>
+</project>"#;
+        let (g, a, v) = parse_pom_group_artifact_version(content).unwrap();
+        assert_eq!(g, "com.example");
+        assert_eq!(a, "my-app");
+        assert_eq!(v, "1.0.0");
+    }
+
+    #[test]
+    fn test_parse_pom_value_on_skip_section_close_line_does_not_leak() {
+        // REGRESSION: on the line that CLOSES a skip section, the depth is
+        // decremented before the skip check, so a coordinate sharing that
+        // physical line (still inside the section) was extracted — leaking
+        // the plugin's <version> as the project's.
+        let content = r#"<project>
+  <groupId>com.example</groupId>
+  <artifactId>my-app</artifactId>
+  <build>
+    <plugins><plugin>
+      <groupId>org.leak</groupId>
+      <version>9.9.9</version></plugin></plugins></build>
   <version>1.0.0</version>
 </project>"#;
         let (g, a, v) = parse_pom_group_artifact_version(content).unwrap();

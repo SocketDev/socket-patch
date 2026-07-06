@@ -97,6 +97,21 @@ fn assert_not_discovered(bodies: &[String], needle: &str) {
     );
 }
 
+/// Run `scan` with the ambient `VIRTUAL_ENV` scrubbed first.
+///
+/// `find_local_venv_site_packages` honors `VIRTUAL_ENV` FIRST and, when it
+/// yields a site-packages dir, early-returns WITHOUT scanning `.venv`/`venv`
+/// in the cwd. Running this suite from an activated virtualenv (or under
+/// direnv auto-activation) therefore made every test scan the shell's venv
+/// instead of the planted fixture — false reds across the whole file. Tests
+/// are `#[serial]`, so the scrub cannot race another test;
+/// `pypi_virtual_env_env_var_override` sets the var deliberately and calls
+/// `scan_run` directly.
+async fn scan_scrubbed(args: ScanArgs) -> i32 {
+    std::env::remove_var("VIRTUAL_ENV");
+    scan_run(args).await
+}
+
 fn default_args(cwd: &Path, api_url: String) -> ScanArgs {
     ScanArgs {
         common: socket_patch_cli::args::GlobalArgs {
@@ -140,7 +155,10 @@ async fn pypi_venv_layout_discovered() {
 
     let server = MockServer::start().await;
     mock_batch_empty(&server).await;
-    assert_eq!(scan_run(default_args(tmp.path(), server.uri())).await, 0);
+    assert_eq!(
+        scan_scrubbed(default_args(tmp.path(), server.uri())).await,
+        0
+    );
     assert_discovered(&batch_bodies(&server).await, "pkg:pypi/venv-pkg@1.0.0");
 }
 
@@ -158,7 +176,10 @@ async fn pypi_venv_python312_layout_discovered() {
 
     let server = MockServer::start().await;
     mock_batch_empty(&server).await;
-    assert_eq!(scan_run(default_args(tmp.path(), server.uri())).await, 0);
+    assert_eq!(
+        scan_scrubbed(default_args(tmp.path(), server.uri())).await,
+        0
+    );
     assert_discovered(&batch_bodies(&server).await, "pkg:pypi/venv-pkg-312@1.0.0");
 }
 
@@ -176,7 +197,10 @@ async fn pypi_venv_python313_layout_discovered() {
 
     let server = MockServer::start().await;
     mock_batch_empty(&server).await;
-    assert_eq!(scan_run(default_args(tmp.path(), server.uri())).await, 0);
+    assert_eq!(
+        scan_scrubbed(default_args(tmp.path(), server.uri())).await,
+        0
+    );
     assert_discovered(&batch_bodies(&server).await, "pkg:pypi/venv-pkg-313@1.0.0");
 }
 
@@ -220,7 +244,7 @@ async fn pypi_alternate_venv_dir_names() {
 
         let server = MockServer::start().await;
         mock_batch_empty(&server).await;
-        let res = scan_run(default_args(tmp.path(), server.uri())).await;
+        let res = scan_scrubbed(default_args(tmp.path(), server.uri())).await;
         assert_eq!(res, 0, "venv name {venv_name} should scan cleanly");
 
         let bodies = batch_bodies(&server).await;
@@ -249,6 +273,7 @@ async fn pypi_virtual_env_env_var_override() {
     let server = MockServer::start().await;
     mock_batch_empty(&server).await;
 
+    // Deliberately NOT `scan_scrubbed`: this test IS the VIRTUAL_ENV path.
     std::env::set_var("VIRTUAL_ENV", &custom_venv);
     let res = scan_run(default_args(tmp.path(), server.uri())).await;
     std::env::remove_var("VIRTUAL_ENV");
@@ -280,7 +305,10 @@ async fn pypi_dist_info_only_layout() {
 
     let server = MockServer::start().await;
     mock_batch_empty(&server).await;
-    assert_eq!(scan_run(default_args(tmp.path(), server.uri())).await, 0);
+    assert_eq!(
+        scan_scrubbed(default_args(tmp.path(), server.uri())).await,
+        0
+    );
     // A package with no source dir is still a real install and must be
     // discovered from its dist-info alone.
     assert_discovered(&batch_bodies(&server).await, "pkg:pypi/dist-only@1.0.0");
@@ -307,7 +335,10 @@ async fn pypi_canonical_name_normalization() {
 
     let server = MockServer::start().await;
     mock_batch_empty(&server).await;
-    assert_eq!(scan_run(default_args(tmp.path(), server.uri())).await, 0);
+    assert_eq!(
+        scan_scrubbed(default_args(tmp.path(), server.uri())).await,
+        0
+    );
     let bodies = batch_bodies(&server).await;
     // Must be canonicalized to lowercase before hitting the API...
     assert_discovered(&bodies, "pkg:pypi/sqlalchemy@2.0.30");
@@ -334,7 +365,10 @@ async fn pypi_multiple_python_versions_in_venvs() {
 
     let server = MockServer::start().await;
     mock_batch_empty(&server).await;
-    assert_eq!(scan_run(default_args(tmp.path(), server.uri())).await, 0);
+    assert_eq!(
+        scan_scrubbed(default_args(tmp.path(), server.uri())).await,
+        0
+    );
     // BOTH venvs must be scanned — discovering only one would still exit 0.
     let bodies = batch_bodies(&server).await;
     assert_discovered(&bodies, "pkg:pypi/pkg311@1.0.0");
@@ -362,7 +396,10 @@ async fn pypi_empty_site_packages_safe() {
 
     let server = MockServer::start().await;
     mock_batch_empty(&server).await;
-    assert_eq!(scan_run(default_args(tmp.path(), server.uri())).await, 0);
+    assert_eq!(
+        scan_scrubbed(default_args(tmp.path(), server.uri())).await,
+        0
+    );
 
     let bodies = batch_bodies(&server).await;
     // The one real package must be discovered (proves the crawl happened).
@@ -400,7 +437,10 @@ async fn pypi_malformed_metadata_handled_gracefully() {
 
     let server = MockServer::start().await;
     mock_batch_empty(&server).await;
-    assert_eq!(scan_run(default_args(tmp.path(), server.uri())).await, 0);
+    assert_eq!(
+        scan_scrubbed(default_args(tmp.path(), server.uri())).await,
+        0
+    );
     assert_discovered(&batch_bodies(&server).await, "pkg:pypi/malformed@1.0.0");
 }
 
@@ -438,7 +478,7 @@ async fn pypi_egg_info_layout_handled() {
 
     let server = MockServer::start().await;
     mock_batch_empty(&server).await;
-    let res = scan_run(default_args(tmp.path(), server.uri())).await;
+    let res = scan_scrubbed(default_args(tmp.path(), server.uri())).await;
     assert_eq!(res, 0, "egg-info layout must scan cleanly without crashing");
     let bodies = batch_bodies(&server).await;
     // Control: proves the crawler genuinely walked this site-packages dir.
@@ -446,4 +486,40 @@ async fn pypi_egg_info_layout_handled() {
     // Not discovered today; neither the canonical nor raw name may appear.
     assert_not_discovered(&bodies, "pkg:pypi/legacy-pkg@1.0.0");
     assert_not_discovered(&bodies, "pkg:pypi/legacy_pkg@1.0.0");
+}
+
+// ---------------------------------------------------------------------------
+// Ambient VIRTUAL_ENV (activated shell venv) must not hijack the suite
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[serial]
+async fn pypi_ambient_virtual_env_does_not_hijack_scan() {
+    // Simulate running the suite from an activated venv: VIRTUAL_ENV points
+    // at a populated venv OUTSIDE the project. Without the scrub in
+    // `scan_scrubbed`, the crawler early-returns with the ambient venv's
+    // site-packages and never reaches the project's `.venv` — the decoy is
+    // discovered and the local package is not (this reddened 9 of 11 tests
+    // in this file before the scrub existed). This guard fails if
+    // `scan_scrubbed` ever stops scrubbing.
+    let shell = tempfile::tempdir().unwrap();
+    let decoy_site = venv_site_packages(&shell.path().join("shell-venv"), "python3.11");
+    std::fs::create_dir_all(&decoy_site).unwrap();
+    write_dist_info(&decoy_site, "ambient_decoy", "6.6.6");
+    std::env::set_var("VIRTUAL_ENV", shell.path().join("shell-venv"));
+
+    let tmp = tempfile::tempdir().unwrap();
+    let site = venv_site_packages(&tmp.path().join(".venv"), "python3.11");
+    std::fs::create_dir_all(&site).unwrap();
+    write_dist_info(&site, "local_pkg", "1.0.0");
+
+    let server = MockServer::start().await;
+    mock_batch_empty(&server).await;
+    assert_eq!(
+        scan_scrubbed(default_args(tmp.path(), server.uri())).await,
+        0
+    );
+    let bodies = batch_bodies(&server).await;
+    assert_discovered(&bodies, "pkg:pypi/local-pkg@1.0.0");
+    assert_not_discovered(&bodies, "pkg:pypi/ambient-decoy@6.6.6");
 }

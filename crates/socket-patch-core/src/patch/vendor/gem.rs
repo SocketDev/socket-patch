@@ -34,8 +34,9 @@
 //!   hard-fails `BUNDLE_FROZEN=true bundle install` (exit 16).
 //!
 //! The Gemfile gains `path:` on the gem's declaration (rewritten in place when
-//! it is a statically-parseable single top-level line, quote style preserved)
-//! or, for a transitive dependency, a managed block appended at EOF. Anything
+//! it is a statically-parseable single top-level line, quote style and
+//! trailing options like `require: false` preserved) or, for a transitive
+//! dependency, a managed block appended at EOF. Anything
 //! the conservative line grammar cannot prove safe to rewrite is REFUSED —
 //! never guessed at.
 //!
@@ -54,7 +55,8 @@ use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::{ApplyResult, PatchSources};
 use crate::patch::copy_tree::{fresh_copy, remove_tree};
 use crate::patch::path_safety::is_safe_single_segment;
-use crate::utils::fs::atomic_write_bytes;
+use crate::patch::redirect::gem_line_trailing_options;
+use crate::utils::fs::atomic_write_bytes_preserving_mode;
 use crate::utils::purl::{build_gem_purl, parse_gem_purl};
 
 use super::common::{
@@ -387,8 +389,10 @@ pub async fn vendor_gem(
     result.package_path = copy_dir.display().to_string();
 
     // ── Gemfile edit ─────────────────────────────────────────────────────
+    // Both project files are user-owned: preserve their permission bits.
     let new_gemfile = apply_gemfile_plan(&gemfile_text, &plan);
-    if let Err(e) = atomic_write_bytes(&gemfile_path, new_gemfile.as_bytes()).await {
+    if let Err(e) = atomic_write_bytes_preserving_mode(&gemfile_path, new_gemfile.as_bytes()).await
+    {
         let _ = remove_tree(&uuid_dir).await;
         result.success = false;
         result.error = Some(format!("failed to write Gemfile: {e}"));
@@ -397,10 +401,12 @@ pub async fn vendor_gem(
 
     // ── Gemfile.lock edit (a failure here unwinds the Gemfile) ───────────
     let lock_edit = match edit_lock(&lock_text, name, version, &copy_rel) {
-        Ok(edit) => match atomic_write_bytes(&lock_path, edit.text.as_bytes()).await {
-            Ok(()) => Ok(edit),
-            Err(e) => Err(format!("failed to write Gemfile.lock: {e}")),
-        },
+        Ok(edit) => {
+            match atomic_write_bytes_preserving_mode(&lock_path, edit.text.as_bytes()).await {
+                Ok(()) => Ok(edit),
+                Err(e) => Err(format!("failed to write Gemfile.lock: {e}")),
+            }
+        }
         Err(e) => Err(format!("failed to edit Gemfile.lock: {e}")),
     };
     let lock_edit = match lock_edit {
@@ -409,7 +415,9 @@ pub async fn vendor_gem(
             // Unwind: a Gemfile pointing at a path the lock doesn't agree
             // with is exactly the half-wired state the pair edit exists to
             // prevent — restore the recorded original bytes.
-            if let Err(e) = atomic_write_bytes(&gemfile_path, gemfile_text.as_bytes()).await {
+            if let Err(e) =
+                atomic_write_bytes_preserving_mode(&gemfile_path, gemfile_text.as_bytes()).await
+            {
                 detail.push_str(&format!(" (Gemfile unwind also failed: {e})"));
             }
             let _ = remove_tree(&uuid_dir).await;
@@ -914,18 +922,30 @@ fn plan_gemfile_edit(
             "the `gem \"{name}\"` declaration is not editable: {reason}"
         ));
     }
+    // Trailing options (`require: false`, `group: :test`, …) must survive the
+    // rewrite: dropping `require: false` auto-requires the gem at boot,
+    // changing app behavior while vendored.
+    let opts = gem_line_trailing_options(&rest);
+    let new_line = if opts.is_empty() {
+        format!("gem {q}{name}{q}, {q}{version}{q}, path: {q}{rel}{q}")
+    } else {
+        format!("gem {q}{name}{q}, {q}{version}{q}, path: {q}{rel}{q}, {opts}")
+    };
     Ok(GemfilePlan::Rewrite {
         original_line: lines[idx].to_string(),
-        new_line: format!("gem {q}{name}{q}, {q}{version}{q}, path: {q}{rel}{q}"),
+        new_line,
     })
 }
 
 /// Match `gem "<name>"` / `gem '<name>'` (or the parenthesized call form) at
 /// the start of a trimmed line. Returns the quote char, everything after the
-/// closing quote, and whether the call was parenthesized.
+/// closing quote, and whether the call was parenthesized. Space OR tab after
+/// the keyword — a tab-separated declaration the grammar cannot see would
+/// fall through to the transitive Append plan, leaving the Gemfile declaring
+/// the gem twice (bundler hard-fails on the duplicate).
 fn gem_declaration<'a>(trimmed: &'a str, name: &str) -> Option<(char, &'a str, bool)> {
     let rest = trimmed.strip_prefix("gem")?;
-    let (paren, rest) = match rest.strip_prefix(' ') {
+    let (paren, rest) = match rest.strip_prefix([' ', '\t']) {
         Some(r) => (false, r),
         None => (true, rest.strip_prefix('(')?),
     };
@@ -943,9 +963,13 @@ fn gem_declaration<'a>(trimmed: &'a str, name: &str) -> Option<(char, &'a str, b
 }
 
 /// Why the text after the gem name blocks an in-place rewrite (`None` = safe).
-/// Only the code before any `#` comment counts — a trailing comment is
-/// dropped by the rewrite, which is acceptable because the verbatim original
-/// line lives in the ledger for revert.
+/// Only the code before any `#` comment counts — a comment trailing plain
+/// version constraints is dropped by the rewrite (acceptable: the verbatim
+/// original line lives in the ledger for revert), while one trailing kept
+/// options rides along with them verbatim. Every source-selecting option is
+/// blocked, not just `path:`/`git:`: bundler allows ONE source per gem, so a
+/// preserved `source:` (etc.) alongside the `path:` we add would fail every
+/// `bundle` invocation.
 fn rest_blocks_edit(rest: &str) -> Option<String> {
     let code = rest.split('#').next().unwrap_or("").trim();
     if code.is_empty() {
@@ -957,7 +981,20 @@ fn rest_blocks_edit(rest: &str) -> Option<String> {
     if code.ends_with(',') {
         return Some("the declaration continues on the next line".to_string());
     }
-    for tok in ["path:", ":path", "git:", ":git", "github:", ":github"] {
+    for tok in [
+        "path:",
+        ":path",
+        "git:",
+        ":git",
+        "github:",
+        ":github",
+        "source:",
+        ":source",
+        "gist:",
+        ":gist",
+        "bitbucket:",
+        ":bitbucket",
+    ] {
         if code.contains(tok) {
             return Some(format!(
                 "the declaration already carries `{tok}` (revert any previous vendoring first)"
@@ -1283,7 +1320,7 @@ async fn revert_gemfile_record(
         }
     };
     if !dry_run {
-        atomic_write_bytes(gemfile_path, restored.as_bytes())
+        atomic_write_bytes_preserving_mode(gemfile_path, restored.as_bytes())
             .await
             .map_err(|e| format!("failed to write Gemfile: {e}"))?;
     }
@@ -1313,7 +1350,7 @@ async fn revert_lock_record(
         return Ok(false);
     };
     if !dry_run {
-        atomic_write_bytes(lock_path, restored.as_bytes())
+        atomic_write_bytes_preserving_mode(lock_path, restored.as_bytes())
             .await
             .map_err(|e| format!("failed to write Gemfile.lock: {e}"))?;
     }
@@ -1362,7 +1399,7 @@ async fn revert_lock_checksum_record(
     };
     lines[i] = original.to_string();
     if !dry_run {
-        atomic_write_bytes(lock_path, lines.join("\n").as_bytes())
+        atomic_write_bytes_preserving_mode(lock_path, lines.join("\n").as_bytes())
             .await
             .map_err(|e| format!("failed to write Gemfile.lock: {e}"))?;
     }
@@ -2720,6 +2757,132 @@ mod tests {
                 .unwrap(),
             v1
         );
+    }
+
+    /// Trailing options on the declaration (`require: false`, `group: :test`,
+    /// …) must survive the rewrite: dropping `require: false` auto-requires
+    /// the gem at boot, changing app behavior while vendored (the redirect
+    /// backend's `gem_line_trailing_options` twin, FIXED there 2026-07-06).
+    #[tokio::test]
+    async fn test_rewrite_preserves_trailing_options() {
+        let gemfile =
+            "source \"https://rubygems.org\"\n\ngem \"puma\"\ngem \"rack\", \"~> 3.1\", require: false\n";
+        let (_tmp, root, installed, blobs, record) = fixture(gemfile, LOCK_DIRECT).await;
+
+        let (result, entry, _w) =
+            unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
+            format!(
+                "source \"https://rubygems.org\"\n\ngem \"puma\"\ngem \"rack\", \"3.2.6\", path: \"{}\", require: false\n",
+                copy_rel()
+            ),
+            "trailing options must survive the rewrite"
+        );
+
+        // Revert restores the original line (options and all) verbatim.
+        let outcome = revert_gem(&entry.unwrap(), &root, false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
+            gemfile
+        );
+    }
+
+    /// `source:` selects a registry — carried alongside the `path:` we add it
+    /// is a bundler error (one source per gem), and silently dropping it
+    /// would hide the user's routing. Refused like `git:`/`github:`.
+    #[tokio::test]
+    async fn test_refuses_source_option_declaration() {
+        let gemfile =
+            "source \"https://rubygems.org\"\n\ngem \"puma\"\ngem \"rack\", \"~> 3.1\", source: \"https://gems.example\"\n";
+        let (_tmp, root, installed, blobs, record) = fixture(gemfile, LOCK_DIRECT).await;
+
+        let (code, detail) =
+            unwrap_refused(run_vendor(&root, &blobs, &installed, &record, false).await);
+        assert_eq!(code, "gemfile_declaration_not_editable");
+        assert!(detail.contains("source:"), "{detail}");
+        assert!(!root.join(".socket").exists());
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
+            gemfile
+        );
+    }
+
+    /// `gem\t"rack"` (tab separator) is a valid ruby call. If the grammar
+    /// cannot see it, the plan falls through to the transitive Append and the
+    /// Gemfile ends up declaring rack TWICE (registry line + managed path:
+    /// block) — bundler hard-fails every install until hand-repaired.
+    #[tokio::test]
+    async fn test_tab_separated_declaration_rewritten_not_duplicated() {
+        let gemfile = "source \"https://rubygems.org\"\n\ngem\t\"rack\", \"~> 3.1\"\n";
+        let (_tmp, root, installed, blobs, record) = fixture(gemfile, LOCK_DIRECT).await;
+
+        let (result, entry, _w) =
+            unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
+        assert!(result.success, "{:?}", result.error);
+        let new_gemfile = tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap();
+        assert!(
+            !new_gemfile.contains(MANAGED_OPEN),
+            "must rewrite in place, never append a duplicate declaration: {new_gemfile}"
+        );
+        assert!(
+            !new_gemfile.contains("~> 3.1"),
+            "registry declaration replaced: {new_gemfile}"
+        );
+        assert!(new_gemfile.contains(&copy_rel()), "{new_gemfile}");
+
+        let outcome = revert_gem(&entry.unwrap(), &root, false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
+            gemfile
+        );
+    }
+
+    /// Gemfile + Gemfile.lock are USER-owned files vendor merely edits: the
+    /// pair edit and every revert write must keep their permission bits (the
+    /// plain atomic writer swaps in a umask-default inode — a 0600 private
+    /// Gemfile silently becomes 0644; see
+    /// `atomic_write_bytes_preserving_mode`). The CHECKSUMS fixture exercises
+    /// all three revert writers.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_pair_edit_and_revert_preserve_file_modes() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_tmp, root, installed, blobs, record) =
+            fixture_318(SPIKE_GEMFILE_CHECKSUMS, SPIKE_LOCK_CHECKSUMS_BEFORE).await;
+        for f in [GEMFILE, GEMFILE_LOCK] {
+            tokio::fs::set_permissions(root.join(f), std::fs::Permissions::from_mode(0o600))
+                .await
+                .unwrap();
+        }
+
+        let (result, entry, _w) =
+            unwrap_done(run_vendor_318(&root, &blobs, &installed, &record, false).await);
+        assert!(result.success, "{:?}", result.error);
+        for f in [GEMFILE, GEMFILE_LOCK] {
+            let mode = tokio::fs::metadata(root.join(f))
+                .await
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "{f} mode reset by the vendor pair edit");
+        }
+
+        let outcome = revert_gem(&entry.unwrap(), &root, false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        for f in [GEMFILE, GEMFILE_LOCK] {
+            let mode = tokio::fs::metadata(root.join(f))
+                .await
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "{f} mode reset by revert");
+        }
     }
 
     // ─────────────── service-download path (Tier B: gem) ──────────────────

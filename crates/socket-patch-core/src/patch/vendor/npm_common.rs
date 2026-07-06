@@ -207,7 +207,14 @@ pub(super) async fn stage_patch_pack(
     // dropped nested node_modules, repacking would produce a tarball npm
     // cannot satisfy those deps from. Refuse before patching.
     if let Ok(bytes) = tokio::fs::read(stage.join("package.json")).await {
-        if let Ok(pkg) = serde_json::from_slice::<Value>(&bytes) {
+        // npm and Node tolerate a leading UTF-8 BOM in package.json (and the
+        // crawler strips one, so a BOM'd install IS vendored), but serde_json
+        // rejects it — and a parse failure here fails OPEN, skipping the
+        // bundled-deps refusal below.
+        let text = String::from_utf8_lossy(&bytes);
+        if let Ok(pkg) =
+            serde_json::from_str::<Value>(crate::package_json::detect::strip_bom(&text))
+        {
             if declares_bundled_deps(&pkg) {
                 return Err(Box::new(refused(
                     "vendor_bundled_deps_unsupported",

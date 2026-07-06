@@ -25,7 +25,7 @@ use serde_json::Value;
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::patch::bun_lock_text;
 use crate::patch::path_safety;
-use crate::utils::purl::strip_purl_qualifiers;
+use crate::utils::purl::{percent_decode_purl_component, strip_purl_qualifiers};
 
 use super::npm_common::is_safe_npm_name;
 use super::npm_flavor::{detect_npm_lock_flavor, NpmLockFlavor};
@@ -833,7 +833,8 @@ async fn inventory_uv_lock(project_root: &Path) -> Option<Vec<LockfileEntry>> {
     let mut out = Vec::new();
     // Line-oriented: uv emits `[[package]]` blocks; wheels live either as
     // inline `{ url = "…", hash = "sha256:…" }` table rows or one-line
-    // arrays. A pure-python wheel ends `py3-none-any.whl`.
+    // arrays. A pure wheel ends `-none-any.whl` ([`pure_wheel_from_uv_unit`],
+    // the same rule the ledger recovery applies).
     let mut name: Option<String> = None;
     let mut version: Option<String> = None;
     let mut sourced_registry = true;
@@ -886,21 +887,11 @@ async fn inventory_uv_lock(project_root: &Path) -> Option<Vec<LockfileEntry>> {
             // Registry packages: `source = { registry = "…" }`; editable/
             // virtual/path/git sources are not fetchable artifacts.
             sourced_registry = t.contains("registry");
-        } else if wheel.is_none() && t.contains("py3-none-any.whl") {
-            // `{ url = "…py3-none-any.whl", hash = "sha256:…" }`
-            let url = t
-                .split("url = \"")
-                .nth(1)
-                .and_then(|r| r.split('"').next())
-                .unwrap_or("");
-            let sha = t
-                .split("hash = \"sha256:")
-                .nth(1)
-                .and_then(|r| r.split('"').next())
-                .unwrap_or("");
-            if !url.is_empty() && is_hex_of_len(sha, 64) {
-                wheel = Some((url.to_string(), sha.to_ascii_lowercase()));
-            }
+        } else if wheel.is_none() {
+            // One line may hold several `{ url = "…", hash = "sha256:…" }`
+            // wheels (one-line arrays); pair the pure wheel with ITS OWN
+            // hash, never the line's first url/hash.
+            wheel = pure_wheel_from_uv_unit(t);
         }
     }
     flush(
@@ -1220,6 +1211,10 @@ pub async fn wired_vendor_integrity(
 
 /// `pkg:<eco>/<name>@<version>` → (name, version). The name may itself
 /// contain `/` (npm scopes, go modules); the version is after the LAST `@`.
+/// Components percent-decode (`%40scope` → `@scope`): the ledger stores
+/// `base_purl` verbatim as the manifest spelled it, while [`LockfileEntry`]
+/// carries literal coordinates — the name feeds the registry URL and the
+/// berry cache-zip recipe.
 fn parse_base_purl_coords(base_purl: &str) -> Option<(String, String)> {
     let rest = base_purl.strip_prefix("pkg:")?;
     let (_, name_ver) = rest.split_once('/')?;
@@ -1227,7 +1222,13 @@ fn parse_base_purl_coords(base_purl: &str) -> Option<(String, String)> {
     if name.is_empty() || version.is_empty() {
         return None;
     }
-    Some((name.to_string(), version.to_string()))
+    let name = name
+        .split('/')
+        .map(percent_decode_purl_component)
+        .collect::<Vec<_>>()
+        .join("/");
+    let version = percent_decode_purl_component(version).into_owned();
+    Some((name, version))
 }
 
 /// First wiring record of one of `kinds` carrying an `original` payload.
@@ -2082,6 +2083,35 @@ source = { editable = "." }
     }
 
     #[tokio::test]
+    async fn uv_lock_one_line_wheels_array_pairs_the_pure_wheel_with_its_own_hash() {
+        // A one-line `wheels = […]` array (valid TOML — hand-maintained or
+        // formatter-collapsed locks) listing a platform wheel BEFORE the
+        // pure one: the entry must carry the pure wheel's url+hash, never
+        // the first url/hash on the line.
+        let tmp = tempfile::tempdir().unwrap();
+        let platform_sha = "a".repeat(64);
+        let pure_sha = "b".repeat(64);
+        write(
+            tmp.path(),
+            "uv.lock",
+            &format!(
+                "version = 1\n\n[[package]]\nname = \"six\"\nversion = \"1.16.0\"\n\
+                 source = {{ registry = \"https://pypi.org/simple\" }}\n\
+                 wheels = [{{ url = \"https://files.pythonhosted.org/packages/aa/six-1.16.0-cp312-cp312-macosx_11_0_arm64.whl\", hash = \"sha256:{platform_sha}\" }}, {{ url = \"https://files.pythonhosted.org/packages/bb/six-1.16.0-py2.py3-none-any.whl\", hash = \"sha256:{pure_sha}\" }}]\n"
+            ),
+        )
+        .await;
+
+        let entries = inventory_pypi_locks(tmp.path()).await.unwrap();
+        let six = entry(&entries, "six");
+        assert!(
+            six.resolved.as_deref().unwrap().ends_with("-none-any.whl"),
+            "the platform wheel must never be resolved as pure: {six:?}"
+        );
+        assert_eq!(six.integrity, LockIntegrity::Sha256Hex(pure_sha));
+    }
+
+    #[tokio::test]
     async fn poetry_and_requirements_are_discovery_only() {
         let tmp = tempfile::tempdir().unwrap();
         write(
@@ -2371,6 +2401,42 @@ mod recover_tests {
         let mut locked = entry("pypi", "pkg:pypi/six@1.16.0", vec![]);
         locked.artifact.platform_locked = Some(true);
         assert!(recover_lock_entry(tmp.path(), &locked).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn recover_decodes_percent_encoded_base_purl() {
+        // The ledger stores base_purl verbatim as the manifest spelled it —
+        // often percent-encoded (`pkg:npm/%40scope/x@1.2.3`). The recovered
+        // entry must carry literal coordinates: the name feeds the registry
+        // tarball URL and the berry cache-zip recipe (which embeds it in
+        // member paths), so an encoded name fails every checksum rebuild.
+        let tmp = tempfile::tempdir().unwrap();
+        let e = entry(
+            "npm",
+            "pkg:npm/%40scope/x@1.2.3",
+            vec![rec(
+                "yarn_berry_lock_entry",
+                serde_json::json!(["\"@scope/x@npm:1.2.3\":", "  checksum: 10c0/abcdef"]),
+            )],
+        );
+        let got = recover_lock_entry(tmp.path(), &e).await.unwrap();
+        assert_eq!(got.name, "@scope/x");
+        assert_eq!(got.purl, "pkg:npm/@scope/x@1.2.3");
+
+        // Version components decode too (`1.0.0%2Bbuild` → `1.0.0+build`).
+        let e = entry(
+            "npm",
+            "pkg:npm/x@1.0.0%2Bbuild",
+            vec![rec(
+                "npm_lock_entry",
+                serde_json::json!({
+                    "resolved": "https://registry.npmjs.org/x/-/x-1.0.0+build.tgz",
+                    "integrity": "sha512-AAAA",
+                }),
+            )],
+        );
+        let got = recover_lock_entry(tmp.path(), &e).await.unwrap();
+        assert_eq!(got.version, "1.0.0+build");
     }
 
     #[tokio::test]

@@ -69,12 +69,32 @@ fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
     )
 }
 
+/// Run npm with ambient `npm_config_*` env scrubbed. npm reads any
+/// `npm_config_<key>` variable (case-insensitive) as config wherever the
+/// invocation doesn't pin a flag: an ambient `npm_config_dry_run=true` turns
+/// the fixture install into a no-op that still exits 0 (so the skip-gate
+/// passes and the marker asserts panic), and `npm_config_save=false`
+/// suppresses the package-lock.json every later oracle reads. Both verified
+/// hostile values are seeded and then scrubbed — `env_remove` clears the seed
+/// too, so the child never sees it, but if a scrub line is ever dropped the
+/// seed (not a developer's shell) turns the suite red immediately.
 fn npm(cwd: &Path, args: &[&str]) -> Output {
-    Command::new("npm")
-        .args(args)
+    let mut cmd = Command::new("npm");
+    cmd.args(args)
         .current_dir(cwd)
-        .output()
-        .expect("failed to run npm")
+        .env("npm_config_dry_run", "true")
+        .env("npm_config_save", "false")
+        .env_remove("npm_config_dry_run")
+        .env_remove("npm_config_save");
+    for (k, _) in std::env::vars_os() {
+        if k.to_string_lossy()
+            .to_ascii_lowercase()
+            .starts_with("npm_config_")
+        {
+            cmd.env_remove(&k);
+        }
+    }
+    cmd.output().expect("failed to run npm")
 }
 
 /// Git-blob SHA-256 (`sha256("blob <len>\0" ++ bytes)`) — the hash format

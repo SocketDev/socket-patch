@@ -533,6 +533,66 @@ mod tests {
         assert!(body.contains("jobs = 2"));
     }
 
+    #[tokio::test]
+    async fn test_prefers_legacy_config_when_both_exist() {
+        // cargo warns "both `.cargo/config` and `.cargo/config.toml` exist.
+        // Using `.cargo/config`" — when both are present the entry must land
+        // in the file cargo actually reads, or the patch is silently inert.
+        let dir = tempfile::tempdir().unwrap();
+        let cargo_dir = dir.path().join(".cargo");
+        fs::create_dir_all(&cargo_dir).await.unwrap();
+        fs::write(cargo_dir.join("config"), "[build]\njobs = 2\n")
+            .await
+            .unwrap();
+        fs::write(cargo_dir.join("config.toml"), "[net]\nretry = 3\n")
+            .await
+            .unwrap();
+        assert!(
+            ensure_patch_entry(dir.path(), "cfg-if", &vendor_path("cfg-if", "1.0.4"), false)
+                .await
+                .unwrap()
+        );
+        let legacy = fs::read_to_string(cargo_dir.join("config")).await.unwrap();
+        assert!(
+            legacy.contains("cfg-if"),
+            "entry must go into the file cargo uses: {legacy}"
+        );
+        let toml = fs::read_to_string(cargo_dir.join("config.toml"))
+            .await
+            .unwrap();
+        assert!(
+            !toml.contains("cfg-if"),
+            "config.toml is ignored by cargo while `config` exists; must stay untouched"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_edit_preserves_existing_file_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let cargo_dir = dir.path().join(".cargo");
+        fs::create_dir_all(&cargo_dir).await.unwrap();
+        let cfg = cargo_dir.join("config.toml");
+        fs::write(&cfg, "[build]\njobs = 4\n").await.unwrap();
+        // 0o640 never matches a fresh-inode default (0666 & !umask is one of
+        // 600/644/664/666), so a writer that drops the destination's bits is
+        // caught under any umask.
+        fs::set_permissions(&cfg, std::fs::Permissions::from_mode(0o640))
+            .await
+            .unwrap();
+        assert!(
+            ensure_patch_entry(dir.path(), "cfg-if", &vendor_path("cfg-if", "1.0.4"), false)
+                .await
+                .unwrap()
+        );
+        let mode = fs::metadata(&cfg).await.unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o640,
+            "editing a user-owned config must not reset its permission bits"
+        );
+    }
+
     // ── exact-restore: emptied socket-created config is deleted ──────
     #[tokio::test]
     async fn test_drop_deletes_socket_created_config_and_dir() {

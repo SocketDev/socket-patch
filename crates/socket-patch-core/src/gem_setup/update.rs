@@ -68,9 +68,14 @@ const MANAGED_MARKER: &str = "# >>> socket-patch:managed";
 /// The exact block `setup` appends to the Gemfile (trailing newline included).
 /// `File.expand_path(..., __dir__)` resolves relative to the Gemfile's own dir,
 /// so the reference is correct regardless of where `bundle` is invoked from.
+/// The source MUST be `path:`, not `git:`: Bundler fetches a `git:` plugin via
+/// `git clone <dir>`, and the generated dir is a plain directory (committing it
+/// to the parent repo does not give it a `.git`), so a `git:` source fails
+/// every `bundle install` with "repository ... does not exist". A `path:`
+/// source loads the directory in place.
 const MANAGED_BLOCK: &str = "\
 # >>> socket-patch:managed (added by `socket-patch setup`; do not edit) >>>\n\
-plugin 'socket-patch', git: File.expand_path('.socket/bundler-plugin', __dir__)\n\
+plugin 'socket-patch', path: File.expand_path('.socket/bundler-plugin', __dir__)\n\
 # <<< socket-patch:managed <<<\n";
 
 /// What we append after the user's content: a blank-line separator + the block.
@@ -104,8 +109,19 @@ fn gemfile_remove(content: &str) -> Option<String> {
     // block if the leading separator was edited away.
     let appended = appended();
     if let Some(idx) = content.find(&appended) {
+        let end = idx + appended.len();
+        // The separator "\n" doubles as the terminator of a final unterminated
+        // pre-setup line. Stripping it is only safe when the block sits at EOF
+        // (the byte-exact restore) or the separator is a pure blank line
+        // (preceded by a newline, or at the start of the file); otherwise the
+        // user's lines on either side of the block would glue into one.
+        let start = if end == content.len() || idx == 0 || content[..idx].ends_with('\n') {
+            idx
+        } else {
+            idx + 1
+        };
         let mut out = content.to_string();
-        out.replace_range(idx..idx + appended.len(), "");
+        out.replace_range(start..end, "");
         Some(out)
     } else {
         // Separator edited away: strip just the block. If the block body was
@@ -204,7 +220,10 @@ mod tests {
             "original bytes preserved as a prefix"
         );
         assert!(is_plugin_directive_present(&out));
-        assert!(out.contains("plugin 'socket-patch'"));
+        // `path:`-sourced, never `git:`: Bundler git-clones a `git:` plugin
+        // source, and the plain generated dir is uncloneable, breaking every
+        // `bundle install` on the wired project.
+        assert!(out.contains("plugin 'socket-patch', path:"));
         assert!(out.contains("File.expand_path('.socket/bundler-plugin', __dir__)"));
         // Idempotent.
         assert!(gemfile_add(&out).is_none());
@@ -290,6 +309,23 @@ mod tests {
             gemfile_remove(&user_edited).unwrap(),
             format!("{GEMFILE}gem 'extra', '2.0'\n"),
             "only our block is removed; the user's later gems survive verbatim"
+        );
+    }
+
+    #[test]
+    fn test_remove_does_not_glue_lines_when_original_lacked_trailing_newline() {
+        // Original Gemfile has no final newline; setup's "\n" separator becomes
+        // the terminator of that last line. The user then adds gems AFTER our
+        // block. remove must not strip that separator along with the block —
+        // doing so glues `gem 'colorize', '1.1.0'` onto `gem 'extra', '2.0'`
+        // (one invalid Ruby line).
+        let no_nl = "source 'https://rubygems.org'\ngem 'colorize', '1.1.0'";
+        let added = gemfile_add(no_nl).unwrap();
+        let user_edited = format!("{added}gem 'extra', '2.0'\n");
+        assert_eq!(
+            gemfile_remove(&user_edited).unwrap(),
+            format!("{no_nl}\ngem 'extra', '2.0'\n"),
+            "the separator newline must survive as the last line's terminator"
         );
     }
 

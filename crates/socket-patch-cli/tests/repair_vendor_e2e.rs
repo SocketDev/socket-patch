@@ -642,6 +642,59 @@ async fn repair_ledger_reconstruction_rejects_drifted_surviving_artifact() {
     );
 }
 
+/// 7d. `.socket/vendor` deleted wholesale AND the installed copy's UNPATCHED
+///     member tampered (the patched file keeps its pristine bytes, so the
+///     backend's per-file checks all pass). The reconstruction rebuilds from
+///     the installed copy, so the rebuilt artifact cannot reproduce the wired
+///     lock integrity — the same trust anchor tests 9/10 enforce for the
+///     unverified-fetch rung. It must be rejected fail-closed (nothing kept,
+///     exit 1), never blessed into the reconstructed ledger while `npm ci`
+///     stays broken.
+#[tokio::test]
+async fn repair_reconstruction_rejects_tampered_installed_copy() {
+    let mock = MockServer::start().await;
+    mount_patch_api(&mock).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_fixture(
+        tmp.path(),
+        "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+        "sha512-orig==",
+    );
+    let tgz = vendor_project(tmp.path(), &mock.uri(), &[]);
+
+    std::fs::remove_dir_all(tmp.path().join(".socket/vendor")).unwrap();
+    // Tamper the installed copy's UNPATCHED member; name/version stay intact
+    // so the crawler still finds the package, and the patched index.js keeps
+    // its BEFORE bytes so per-file hash checks pass.
+    std::fs::write(
+        tmp.path().join("node_modules/left-pad/package.json"),
+        br#"{"name":"left-pad","version":"1.3.0","scripts":{"postinstall":"evil"}}"#,
+    )
+    .unwrap();
+
+    mount_blob(&mock).await;
+    let (code, stdout, stderr) = run_cli(
+        tmp.path(),
+        &mock.uri(),
+        &["repair", "--download-mode", "file"],
+    );
+    assert_eq!(code, 1, "stdout={stdout} stderr={stderr}");
+    let v = parse_env(&stdout);
+    assert!(
+        events_of(&v).iter().any(|e| e["action"] == "failed"
+            && e["errorCode"] == "vendor_artifact_rebuild_failed"
+            && e["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("integrity the lockfile records")),
+        "envelope={v}"
+    );
+    assert!(
+        !tgz.exists(),
+        "a rebuild that cannot reproduce the wired integrity must not be kept"
+    );
+}
+
 /// 8. No ledger AND no manifest — only the rewired lockfile: the uuid in
 ///    the lock path drives an API view fetch and the entry is re-created
 ///    DETACHED (manifest-invisible), with the artifact rebuilt.

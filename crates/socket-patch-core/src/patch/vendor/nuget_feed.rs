@@ -40,6 +40,9 @@
 //! Edit order: artifact → nuget.config → packages.lock.json. Any failure after
 //! the artifact removes the uuid dir; a lock-write failure additionally unwinds
 //! the config to its recorded pre-vendor bytes, so the pair is never half-wired.
+//! (On the wired hot path the config is already correct and stays, so a lock
+//! re-pin failure there keeps the rebuilt artifact — deleting it would leave
+//! the wired config pointing at nothing.)
 
 use std::path::{Path, PathBuf};
 
@@ -51,12 +54,12 @@ use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::{ApplyResult, PatchSources};
 use crate::patch::copy_tree::remove_tree;
 use crate::patch::path_safety::is_safe_single_segment;
-use crate::utils::fs::{atomic_write_bytes, list_dir_entries};
+use crate::utils::fs::{atomic_write_bytes, atomic_write_bytes_preserving_mode, list_dir_entries};
 use crate::utils::purl::{build_nuget_purl, parse_nuget_purl};
 
 use super::common::{
-    already_patched_result, done, failed_result, insert_before, rebuild_zip, refused,
-    synthesized_result, zip_matches_after_hashes,
+    already_patched_result, done, failed_result, rebuild_zip, refused, synthesized_result,
+    zip_matches_after_hashes,
 };
 use super::path::vendor_uuid_dir_rel;
 use super::registry_fetch::extract_zip;
@@ -247,7 +250,16 @@ pub async fn vendor_nuget(
         let lock_ok = match &lock_text {
             None => true,
             Some(text) => match tokio::fs::read(&nupkg_path).await {
-                Ok(bytes) => lock_pinned(text, name, &version_norm, &content_hash(&bytes)),
+                Ok(bytes) => {
+                    let expected = content_hash(&bytes);
+                    // Pinned at our bytes, or no matching resolved entry at
+                    // all — the same absence `edit_lock` tolerates with a
+                    // warning on the first run. Treating absence as stale
+                    // would misreport "missing or stale; rebuilt" on every
+                    // rerun with nothing to actually pin.
+                    lock_pinned(text, name, &version_norm, &expected)
+                        || matches!(edit_lock(text, name, &version_norm, &expected), Ok(None))
+                }
                 Err(_) => false,
             },
         };
@@ -285,14 +297,30 @@ pub async fn vendor_nuget(
             if !result.success {
                 return done(result, None, warnings);
             }
+            result.package_path = nupkg_path.display().to_string();
             // Re-pin the lock at the rebuilt bytes (the config is untouched).
+            // A failure here keeps the rebuilt artifact: the config (from the
+            // first run) is still wired at this feed, so deleting the uuid dir
+            // would leave a wired config pointing at nothing and brick every
+            // restore.
             if let Some(text) = &lock_text {
                 let new_hash = content_hash(&bytes);
-                if let Ok(Some(edit)) = edit_lock(text, name, &version_norm, &new_hash) {
-                    if let Err(e) = atomic_write_bytes(&lock_path, edit.text.as_bytes()).await {
-                        let _ = remove_tree(&uuid_dir).await;
+                match edit_lock(text, name, &version_norm, &new_hash) {
+                    Ok(Some(edit)) => {
+                        if let Err(e) =
+                            atomic_write_bytes_preserving_mode(&lock_path, edit.text.as_bytes())
+                                .await
+                        {
+                            result.success = false;
+                            result.error =
+                                Some(format!("failed to rewrite {PACKAGES_LOCK}: {e}"));
+                            return done(result, None, warnings);
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(detail) => {
                         result.success = false;
-                        result.error = Some(format!("failed to rewrite {PACKAGES_LOCK}: {e}"));
+                        result.error = Some(detail);
                         return done(result, None, warnings);
                     }
                 }
@@ -370,7 +398,9 @@ pub async fn vendor_nuget(
     let config_target = config_path
         .clone()
         .unwrap_or_else(|| project_root.join("nuget.config"));
-    if let Err(e) = atomic_write_bytes(&config_target, config_edit.new_text.as_bytes()).await {
+    if let Err(e) =
+        atomic_write_bytes_preserving_mode(&config_target, config_edit.new_text.as_bytes()).await
+    {
         let _ = remove_tree(&uuid_dir).await;
         result.success = false;
         result.error = Some(format!("failed to write {}: {e}", config_target.display()));
@@ -382,7 +412,9 @@ pub async fn vendor_nuget(
     if let Some(text) = &lock_text {
         match edit_lock(text, name, &version_norm, &new_hash) {
             Ok(Some(edit)) => {
-                if let Err(e) = atomic_write_bytes(&lock_path, edit.text.as_bytes()).await {
+                if let Err(e) =
+                    atomic_write_bytes_preserving_mode(&lock_path, edit.text.as_bytes()).await
+                {
                     unwind_config(&config_target, config_text.as_deref(), &uuid_dir).await;
                     result.success = false;
                     result.error = Some(format!("failed to write {PACKAGES_LOCK}: {e}"));
@@ -837,18 +869,26 @@ fn build_config_edit(
             })
         }
         Some(text) => {
+            // Every anchor find and source scan runs against the
+            // comment-blanked view (same length, so offsets splice into
+            // `text`). NuGet never reads a comment: a commented-out section
+            // must not capture an insert (the wired source would be invisible
+            // and restore would silently serve the UNPATCHED package), and a
+            // commented-out `<add>` must not become a catch-all target (the
+            // mapping would fan `*` out to a source that does not exist).
+            let visible = blank_comments(text);
             // Whether we are about to CREATE the mapping section (vs. extend an
             // existing one) — decided against the pre-edit text.
-            let creating_mapping = !text.contains("</packageSourceMapping>");
+            let creating_mapping = !visible.contains("</packageSourceMapping>");
             // The pre-existing sources the catch-all fans `*` out to. When the
             // config has NONE and we are creating a mapping from scratch, a
             // socket-only mapping would NU1100 every other package, so seed the
             // implicit default nuget.org source (unless already present) and map
             // `*` to it. Mirrors redirect::add_nuget_source.
-            let mut catch_all_keys = parse_config_source_keys(text);
+            let mut catch_all_keys = parse_config_source_keys(&visible);
             let seed_nuget_org = creating_mapping
                 && catch_all_keys.is_empty()
-                && !text.contains(NUGET_ORG_SOURCE_KEY);
+                && !visible.contains(NUGET_ORG_SOURCE_KEY);
 
             let source_add = format!("    <add key=\"{source_key}\" value=\"{source_rel}\" />\n");
             let org_add = format!(
@@ -866,7 +906,7 @@ fn build_config_edit(
             //    self-closing `<packageSources />` carries no children, so
             //    expand it in place into an open/close pair rather than leaving
             //    it dangling beside a duplicate element.
-            let with_source = if let Some((start, end)) = self_closing_package_sources(text) {
+            let with_source = if let Some((start, end)) = self_closing_package_sources(&visible) {
                 let mut expanded = String::with_capacity(text.len() + injected_sources.len() + 40);
                 expanded.push_str(&text[..start]);
                 expanded.push_str(&format!(
@@ -874,26 +914,23 @@ fn build_config_edit(
                 ));
                 expanded.push_str(&text[end..]);
                 expanded
-            } else if text.contains("</packageSources>") {
-                insert_before(text, "</packageSources>", &injected_sources).ok_or_else(|| {
-                    "could not locate </packageSources> to insert the vendored source".to_string()
-                })?
-            } else if text.contains("</configuration>") {
+            } else if let Some(at) = visible.find("</packageSources>") {
+                insert_at_line(text, at, &injected_sources)
+            } else if let Some(at) = visible.find("</configuration>") {
                 let block = format!("  <packageSources>\n{injected_sources}  </packageSources>\n");
-                insert_before(text, "</configuration>", &block).ok_or_else(|| {
-                    "could not locate </configuration> to insert a packageSources section"
-                        .to_string()
-                })?
+                insert_at_line(text, at, &block)
             } else {
                 return Err("nuget.config has no </configuration> to edit".to_string());
             };
             // 2. Mapping: extend an existing section, or create one over the
-            //    pre-existing sources (the load-bearing catch-all).
+            //    pre-existing sources (the load-bearing catch-all). The blanked
+            //    view is recomputed — step 1 shifted the offsets.
+            let visible_ws = blank_comments(&with_source);
             let new_text = if !creating_mapping {
-                insert_before(&with_source, "</packageSourceMapping>", &mapping_fragment)
-                    .ok_or_else(|| {
-                        "could not locate </packageSourceMapping> to insert the mapping".to_string()
-                    })?
+                let at = visible_ws.find("</packageSourceMapping>").ok_or_else(|| {
+                    "could not locate </packageSourceMapping> to insert the mapping".to_string()
+                })?;
+                insert_at_line(&with_source, at, &mapping_fragment)
             } else {
                 let mut block = String::from("  <packageSourceMapping>\n");
                 for key in &catch_all_keys {
@@ -903,10 +940,11 @@ fn build_config_edit(
                 }
                 block.push_str(&mapping_fragment);
                 block.push_str("  </packageSourceMapping>\n");
-                insert_before(&with_source, "</configuration>", &block).ok_or_else(|| {
+                let at = visible_ws.find("</configuration>").ok_or_else(|| {
                     "could not locate </configuration> to insert a packageSourceMapping section"
                         .to_string()
-                })?
+                })?;
+                insert_at_line(&with_source, at, &block)
             };
             Ok(ConfigEdit {
                 new_text,
@@ -916,10 +954,50 @@ fn build_config_edit(
     }
 }
 
+/// `text` with every `<!-- … -->` comment blanked to spaces (newlines kept),
+/// preserving length so offsets found in the blanked view splice into the
+/// original. NuGet never reads a comment, so anchors and source keys inside
+/// one must be invisible to the wiring logic — the nuget twin of maven's
+/// `find_wireable_anchor` comment masking. An unterminated comment blanks
+/// through EOF (fail-closed).
+fn blank_comments(text: &str) -> String {
+    let mut out = text.as_bytes().to_vec();
+    let mut from = 0;
+    while let Some(rel) = text[from..].find("<!--") {
+        let start = from + rel;
+        let end = match text[start + 4..].find("-->") {
+            Some(rel_end) => start + 4 + rel_end + 3,
+            None => text.len(),
+        };
+        for b in &mut out[start..end] {
+            if *b != b'\n' {
+                *b = b' ';
+            }
+        }
+        from = end;
+    }
+    // Every replaced byte became ASCII space; newlines are never continuation
+    // bytes, so the result is valid UTF-8.
+    String::from_utf8(out).expect("blanking preserves UTF-8")
+}
+
+/// Insert `insertion` (already newline-terminated) at the start of the line
+/// containing byte offset `at` — the offset comes from the comment-blanked
+/// view, which shares offsets with `text`.
+fn insert_at_line(text: &str, at: usize, insertion: &str) -> String {
+    let line_start = text[..at].rfind('\n').map(|n| n + 1).unwrap_or(0);
+    let mut out = String::with_capacity(text.len() + insertion.len());
+    out.push_str(&text[..line_start]);
+    out.push_str(insertion);
+    out.push_str(&text[line_start..]);
+    out
+}
+
 /// Extract the `key` attribute of every `<add ... />` element inside
 /// `<packageSources>`. Deliberately minimal (no XML parser dependency): scans
 /// the packageSources span for `<add ... key="..." ...>` elements. These are
-/// the "pre-existing sources" the catch-all maps `*` to.
+/// the "pre-existing sources" the catch-all maps `*` to. Callers pass the
+/// comment-blanked text so a commented-out source never contributes a key.
 fn parse_config_source_keys(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let Some(start) = text.find("<packageSources") else {
@@ -994,6 +1072,17 @@ async fn revert_config_record(
     w: &WiringRecord,
     dry_run: bool,
 ) -> Result<bool, String> {
+    // SECURITY: state.json is committed and tamper-able; `w.file` is joined
+    // under the project root and then written through. Vendor only ever
+    // records a root-level config basename, so anything else — a `../`, an
+    // absolute path — would turn the whole-file restore into an arbitrary
+    // file overwrite/delete. Rejected fail-closed, like the uuid above.
+    if !is_safe_single_segment(&w.file) {
+        return Err(format!(
+            "refusing revert: unsafe wiring file path {:?}",
+            w.file
+        ));
+    }
     let config_path = project_root.join(&w.file);
     let Some(source_key) = w.key.as_deref() else {
         return Ok(false);
@@ -1018,7 +1107,7 @@ async fn revert_config_record(
         match &w.original {
             // Pre-existed → restore the verbatim original bytes.
             Some(Value::String(orig)) => {
-                atomic_write_bytes(&config_path, orig.as_bytes())
+                atomic_write_bytes_preserving_mode(&config_path, orig.as_bytes())
                     .await
                     .map_err(|e| format!("failed to restore {}: {e}", config_path.display()))?;
             }
@@ -1049,7 +1138,7 @@ async fn revert_config_record(
     if let Some(block) = mapping_block {
         out = out.replacen(&block, "", 1);
     }
-    atomic_write_bytes(&config_path, out.as_bytes())
+    atomic_write_bytes_preserving_mode(&config_path, out.as_bytes())
         .await
         .map_err(|e| {
             format!(
@@ -1210,7 +1299,7 @@ async fn revert_lock_record(
         return Ok(true);
     }
     let restored = text.replace(&ours_q, &format!("\"{orig}\""));
-    atomic_write_bytes(lock_path, restored.as_bytes())
+    atomic_write_bytes_preserving_mode(lock_path, restored.as_bytes())
         .await
         .map_err(|e| format!("failed to restore {}: {e}", lock_path.display()))?;
     Ok(true)
@@ -1221,7 +1310,7 @@ async fn revert_lock_record(
 async fn unwind_config(config_target: &Path, original: Option<&str>, uuid_dir: &Path) {
     match original {
         Some(orig) => {
-            let _ = atomic_write_bytes(config_target, orig.as_bytes()).await;
+            let _ = atomic_write_bytes_preserving_mode(config_target, orig.as_bytes()).await;
         }
         None => {
             let _ = tokio::fs::remove_file(config_target).await;
@@ -2018,5 +2107,557 @@ mod tests {
         assert_eq!(code, "vendor_nupkg_not_found");
         assert!(!root.join(".socket").exists());
         assert!(!root.join("nuget.config").exists());
+    }
+
+    // ── comment-blind wiring regressions ───────────────────────────────────
+
+    /// `t` with every `<!-- … -->` span dropped — what NuGet actually reads.
+    fn visible_text(t: &str) -> String {
+        let mut out = String::new();
+        let mut rest = t;
+        while let Some(start) = rest.find("<!--") {
+            out.push_str(&rest[..start]);
+            match rest[start + 4..].find("-->") {
+                Some(end) => rest = &rest[start + 4 + end + 3..],
+                None => rest = "",
+            }
+        }
+        out.push_str(rest);
+        out
+    }
+
+    #[test]
+    fn wires_outside_commented_package_sources() {
+        // A commented-out <packageSources> block above the real one: the
+        // vendored <add> must land in the REAL section. NuGet never reads a
+        // comment — a source wired into one silently restores the UNPATCHED
+        // package while vendor reports success.
+        let orig = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
+                    <configuration>\n\
+                    \x20 <!--\n\
+                    \x20 <packageSources>\n\
+                    \x20   <add key=\"old\" value=\"https://old/v3/index.json\" />\n\
+                    \x20 </packageSources>\n\
+                    \x20 -->\n\
+                    \x20 <packageSources>\n\
+                    \x20   <add key=\"corp\" value=\"https://corp/nuget/v3/index.json\" />\n\
+                    \x20 </packageSources>\n\
+                    </configuration>\n";
+        let edit = build_config_edit(
+            Some(orig),
+            &source_key(),
+            &format!(".socket/vendor/nuget/{UUID}"),
+            "Newtonsoft.Json",
+        )
+        .unwrap();
+        let vis = visible_text(&edit.new_text);
+        assert!(
+            vis.contains(&format!("<add key=\"{}\"", source_key())),
+            "the vendored source must be outside comments: {}",
+            edit.new_text
+        );
+        assert!(
+            vis.contains("<package pattern=\"Newtonsoft.Json\" />"),
+            "the id mapping must be outside comments: {}",
+            edit.new_text
+        );
+        // The catch-all fans out to the ACTIVE source, not the commented one.
+        assert!(
+            vis.contains("<packageSource key=\"corp\">"),
+            "catch-all target is the active corp source: {}",
+            edit.new_text
+        );
+        assert!(
+            !edit.new_text.contains("<packageSource key=\"old\">"),
+            "a commented-out source must not become a catch-all target: {}",
+            edit.new_text
+        );
+    }
+
+    #[test]
+    fn commented_mapping_section_gets_real_mapping() {
+        // The only </packageSourceMapping> is inside a comment: treating it as
+        // an existing section drops our mapping inside the comment (invisible
+        // to NuGet) and skips the load-bearing catch-all.
+        let orig = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
+                    <configuration>\n\
+                    \x20 <packageSources>\n\
+                    \x20   <add key=\"corp\" value=\"https://corp/nuget/v3/index.json\" />\n\
+                    \x20 </packageSources>\n\
+                    \x20 <!--\n\
+                    \x20 <packageSourceMapping>\n\
+                    \x20   <packageSource key=\"corp\">\n\
+                    \x20     <package pattern=\"*\" />\n\
+                    \x20   </packageSource>\n\
+                    \x20 </packageSourceMapping>\n\
+                    \x20 -->\n\
+                    </configuration>\n";
+        let edit = build_config_edit(
+            Some(orig),
+            &source_key(),
+            &format!(".socket/vendor/nuget/{UUID}"),
+            "Newtonsoft.Json",
+        )
+        .unwrap();
+        let vis = visible_text(&edit.new_text);
+        assert!(
+            vis.contains(&format!("<packageSource key=\"{}\">", source_key())),
+            "our mapping must live in a REAL section: {}",
+            edit.new_text
+        );
+        assert!(
+            vis.contains("<packageSource key=\"corp\">")
+                && vis.contains("<package pattern=\"*\" />"),
+            "creating the mapping from scratch needs the catch-all: {}",
+            edit.new_text
+        );
+    }
+
+    #[test]
+    fn catch_all_skips_commented_sources() {
+        // A commented-out <add> inside the real packageSources must not become
+        // a catch-all target — mapping `*` to a source NuGet cannot see
+        // hard-fails every restore.
+        let orig = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
+                    <configuration>\n\
+                    \x20 <packageSources>\n\
+                    \x20   <!-- <add key=\"old\" value=\"https://old/v3/index.json\" /> -->\n\
+                    \x20   <add key=\"corp\" value=\"https://corp/nuget/v3/index.json\" />\n\
+                    \x20 </packageSources>\n\
+                    </configuration>\n";
+        let edit = build_config_edit(
+            Some(orig),
+            &source_key(),
+            &format!(".socket/vendor/nuget/{UUID}"),
+            "Newtonsoft.Json",
+        )
+        .unwrap();
+        let t = &edit.new_text;
+        assert!(t.contains("<packageSource key=\"corp\">"), "{t}");
+        assert!(
+            !t.contains("<packageSource key=\"old\">"),
+            "a commented-out source must not become a catch-all target: {t}"
+        );
+    }
+
+    #[test]
+    fn seeds_org_when_sources_all_commented() {
+        // Every source is commented out and the org URL only appears inside
+        // the comment: a from-scratch mapping must seed a REAL nuget.org
+        // source, else the socket-only mapping NU1100s every other package.
+        let orig = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
+                    <configuration>\n\
+                    \x20 <packageSources>\n\
+                    \x20   <!-- <add key=\"nuget.org\" value=\"https://api.nuget.org/v3/index.json\" /> -->\n\
+                    \x20 </packageSources>\n\
+                    </configuration>\n";
+        let edit = build_config_edit(
+            Some(orig),
+            &source_key(),
+            &format!(".socket/vendor/nuget/{UUID}"),
+            "Newtonsoft.Json",
+        )
+        .unwrap();
+        let vis = visible_text(&edit.new_text);
+        assert!(
+            vis.contains("<add key=\"nuget.org\""),
+            "nuget.org must be seeded as an ACTIVE source: {}",
+            edit.new_text
+        );
+        assert!(
+            vis.contains(
+                "    <packageSource key=\"nuget.org\">\n      <package pattern=\"*\" />"
+            ),
+            "the catch-all must target the seeded active source: {}",
+            edit.new_text
+        );
+    }
+
+    // ── wired hot-path rebuild regressions ─────────────────────────────────
+
+    #[tokio::test]
+    async fn wired_rebuild_reports_vendored_nupkg_path() {
+        let (dir, blobs, installed, record) = fixture(true, None).await;
+        let root = dir.path();
+        let (r1, _e, _w) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert!(r1.success);
+        tokio::fs::remove_file(root.join(copy_rel())).await.unwrap();
+
+        let (r2, e2, w2) = unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert!(r2.success, "{:?}", r2.error);
+        assert!(e2.is_none());
+        assert!(w2.iter().any(|w| w.code == "vendor_artifact_rebuilt"));
+        assert_eq!(
+            r2.package_path,
+            root.join(copy_rel()).display().to_string(),
+            "the hot-path rebuild must report the vendored nupkg, not the deleted temp stage"
+        );
+    }
+
+    #[tokio::test]
+    async fn rerun_with_no_matching_lock_entry_is_idempotent() {
+        // A lock that never resolved the patched id: nothing to pin (run 1
+        // warns), and a rerun must be AlreadyPatched — not a phantom "missing
+        // or stale" artifact rebuild on every invocation.
+        let (dir, blobs, installed, record) = fixture(false, None).await;
+        let root = dir.path();
+        let other_lock = serde_json::to_string_pretty(&json!({
+            "version": 1,
+            "dependencies": {
+                "net8.0": {
+                    "Some.Other.Pkg": {
+                        "type": "Direct",
+                        "requested": "[1.0.0, )",
+                        "resolved": "1.0.0",
+                        "contentHash": "OTHERhash=="
+                    }
+                }
+            }
+        }))
+        .unwrap();
+        tokio::fs::write(root.join(PACKAGES_LOCK), &other_lock)
+            .await
+            .unwrap();
+
+        let (r1, e1, w1) = unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert!(r1.success, "{:?}", r1.error);
+        assert!(e1.is_some());
+        assert!(w1.iter().any(|w| w.code == "vendor_nuget_lock_entry_absent"));
+
+        let (r2, e2, w2) = unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert!(r2.success, "{:?}", r2.error);
+        assert!(e2.is_none());
+        assert!(
+            !w2.iter().any(|w| w.code == "vendor_artifact_rebuilt"),
+            "an unpinnable lock must not force a phantom rebuild on every rerun: {w2:?}"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(PACKAGES_LOCK))
+                .await
+                .unwrap(),
+            other_lock,
+            "nothing to pin — the lock must stay untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn wired_rerun_with_corrupt_lock_fails() {
+        let (dir, blobs, installed, record) = fixture(true, None).await;
+        let root = dir.path();
+        let (r1, _e, _w) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert!(r1.success);
+        // The lock rots after vendoring. The fresh path fails closed on an
+        // unparseable lock; the wired rebuild leg must not silently skip the
+        // re-pin and report success instead.
+        tokio::fs::write(root.join(PACKAGES_LOCK), b"{ not json")
+            .await
+            .unwrap();
+        let (r2, e2, _w2) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert!(e2.is_none());
+        assert!(!r2.success, "a corrupt lock must fail the rerun, not vanish");
+        assert!(
+            r2.error.as_deref().unwrap_or("").contains("unparseable"),
+            "{:?}",
+            r2.error
+        );
+        assert!(
+            root.join(copy_rel()).exists(),
+            "the wired feed keeps its artifact"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hot_path_lock_write_failure_keeps_wired_artifact() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (dir, blobs, installed, record) = fixture(true, None).await;
+        let root = dir.path();
+        let (r1, _e, _w) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert!(r1.success);
+        tokio::fs::remove_file(root.join(copy_rel())).await.unwrap();
+
+        // A read-only project root blocks the lock's atomic stage file. Skip
+        // when the environment ignores modes (running as root).
+        tokio::fs::set_permissions(root, std::fs::Permissions::from_mode(0o555))
+            .await
+            .unwrap();
+        if std::fs::write(root.join(".probe"), b"x").is_ok() {
+            let _ = std::fs::remove_file(root.join(".probe"));
+            tokio::fs::set_permissions(root, std::fs::Permissions::from_mode(0o755))
+                .await
+                .unwrap();
+            return;
+        }
+        let outcome = run_vendor(root, &blobs, &installed, &record, false).await;
+        tokio::fs::set_permissions(root, std::fs::Permissions::from_mode(0o755))
+            .await
+            .unwrap();
+
+        let (r2, _e2, _w2) = unwrap_done(outcome);
+        assert!(!r2.success, "the failed lock re-pin must be reported");
+        assert!(
+            root.join(copy_rel()).exists(),
+            "nuget.config (from run 1) still points at the feed — the rebuilt \
+             nupkg must survive a lock re-pin failure or restore bricks"
+        );
+    }
+
+    // ── tamper-able wiring `file` regression ───────────────────────────────
+
+    #[tokio::test]
+    async fn revert_refuses_wiring_file_outside_project_root() {
+        // state.json is committed and tamper-able: a crafted wiring `file`
+        // must not read or write through `../` out of the project root (the
+        // fast path would overwrite an arbitrary file with attacker-chosen
+        // `original` bytes).
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside.txt");
+        tokio::fs::write(&outside, b"precious").await.unwrap();
+        let root = dir.path().join("proj");
+        tokio::fs::create_dir_all(&root).await.unwrap();
+
+        let entry = VendorEntry {
+            ecosystem: "nuget".to_string(),
+            base_purl: PURL.to_string(),
+            uuid: UUID.to_string(),
+            artifact: VendorArtifact {
+                path: copy_rel(),
+                sha256: String::new(),
+                size: None,
+                platform_locked: None,
+            },
+            wiring: vec![WiringRecord {
+                file: "../outside.txt".to_string(),
+                kind: CONFIG_SOURCE_WIRING_KIND.to_string(),
+                action: WiringAction::Rewritten,
+                key: Some(source_key()),
+                original: Some(Value::String("EVIL".to_string())),
+                new: Some(Value::String("precious".to_string())),
+            }],
+            lock: None,
+            took_over_go_patches: false,
+            detached: false,
+            record: None,
+            flavor: None,
+            uv: None,
+            pnpm: None,
+            poetry: None,
+            pdm: None,
+            pipenv: None,
+        };
+        let outcome = revert_nuget(&entry, &root, false).await;
+        assert!(
+            !outcome.success,
+            "an escaping wiring file must refuse the revert: {outcome:?}"
+        );
+        assert_eq!(
+            tokio::fs::read(&outside).await.unwrap(),
+            b"precious",
+            "the file outside the project root must not be touched"
+        );
+    }
+
+    // ── mode preservation (unix) ───────────────────────────────────────────
+
+    #[cfg(unix)]
+    async fn mode_of(p: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt as _;
+        tokio::fs::metadata(p).await.unwrap().permissions().mode() & 0o7777
+    }
+
+    #[cfg(unix)]
+    fn preexisting_cfg() -> &'static str {
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
+         <configuration>\n\
+         \x20 <packageSources>\n\
+         \x20   <add key=\"nuget.org\" value=\"https://api.nuget.org/v3/index.json\" />\n\
+         \x20 </packageSources>\n\
+         </configuration>\n"
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn vendor_preserves_config_and_lock_modes() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (dir, blobs, installed, record) = fixture(true, Some(preexisting_cfg())).await;
+        let root = dir.path();
+        tokio::fs::set_permissions(
+            root.join("nuget.config"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .await
+        .unwrap();
+        tokio::fs::set_permissions(
+            root.join(PACKAGES_LOCK),
+            std::fs::Permissions::from_mode(0o640),
+        )
+        .await
+        .unwrap();
+
+        let (result, _e, _w) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(
+            mode_of(&root.join("nuget.config")).await,
+            0o600,
+            "wiring must not reset nuget.config's mode"
+        );
+        assert_eq!(
+            mode_of(&root.join(PACKAGES_LOCK)).await,
+            0o640,
+            "the lock pin must not reset packages.lock.json's mode"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hot_path_repin_preserves_lock_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (dir, blobs, installed, record) = fixture(true, None).await;
+        let root = dir.path();
+        let (r1, _e, _w) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert!(r1.success);
+        tokio::fs::set_permissions(
+            root.join(PACKAGES_LOCK),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .await
+        .unwrap();
+        tokio::fs::remove_file(root.join(copy_rel())).await.unwrap();
+
+        let (r2, _e2, _w2) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert!(r2.success, "{:?}", r2.error);
+        assert_eq!(
+            mode_of(&root.join(PACKAGES_LOCK)).await,
+            0o600,
+            "the hot-path re-pin must not reset packages.lock.json's mode"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn revert_preserves_config_and_lock_modes() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (dir, blobs, installed, record) = fixture(true, Some(preexisting_cfg())).await;
+        let root = dir.path();
+        let (r1, entry, _w) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert!(r1.success);
+        let entry = entry.unwrap();
+        tokio::fs::set_permissions(
+            root.join("nuget.config"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .await
+        .unwrap();
+        tokio::fs::set_permissions(
+            root.join(PACKAGES_LOCK),
+            std::fs::Permissions::from_mode(0o640),
+        )
+        .await
+        .unwrap();
+
+        let outcome = revert_nuget(&entry, root, false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("nuget.config"))
+                .await
+                .unwrap(),
+            preexisting_cfg()
+        );
+        assert_eq!(
+            mode_of(&root.join("nuget.config")).await,
+            0o600,
+            "the whole-file config restore must not reset its mode"
+        );
+        assert_eq!(
+            mode_of(&root.join(PACKAGES_LOCK)).await,
+            0o640,
+            "the lock unpin must not reset packages.lock.json's mode"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn revert_excise_preserves_config_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (dir, blobs, installed, record) = fixture(true, Some(preexisting_cfg())).await;
+        let root = dir.path();
+        let (r1, entry, _w) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert!(r1.success);
+        let entry = entry.unwrap();
+        // A user edit after vendoring forces the excise path.
+        let wired = tokio::fs::read_to_string(root.join("nuget.config"))
+            .await
+            .unwrap();
+        let edited = wired.replacen("</configuration>", "<!-- user note -->\n</configuration>", 1);
+        assert_ne!(edited, wired);
+        tokio::fs::write(root.join("nuget.config"), &edited)
+            .await
+            .unwrap();
+        tokio::fs::set_permissions(
+            root.join("nuget.config"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .await
+        .unwrap();
+
+        let outcome = revert_nuget(&entry, root, false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        let after = tokio::fs::read_to_string(root.join("nuget.config"))
+            .await
+            .unwrap();
+        assert!(!after.contains(&source_key()), "excised: {after}");
+        assert!(after.contains("user note"), "user edit kept: {after}");
+        assert_eq!(
+            mode_of(&root.join("nuget.config")).await,
+            0o600,
+            "the excise write must not reset nuget.config's mode"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_lock_edit_unwind_preserves_config_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (dir, blobs, installed, record) = fixture(false, Some(preexisting_cfg())).await;
+        let root = dir.path();
+        tokio::fs::write(root.join(PACKAGES_LOCK), b"{ not json")
+            .await
+            .unwrap();
+        tokio::fs::set_permissions(
+            root.join("nuget.config"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .await
+        .unwrap();
+
+        let (result, entry, _w) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert!(!result.success, "unparseable lock fails the vendor");
+        assert!(entry.is_none());
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("nuget.config"))
+                .await
+                .unwrap(),
+            preexisting_cfg(),
+            "the config unwind restores the original"
+        );
+        assert_eq!(
+            mode_of(&root.join("nuget.config")).await,
+            0o600,
+            "the unwind restore must not reset nuget.config's mode"
+        );
+        assert!(
+            !root.join(format!(".socket/vendor/nuget/{UUID}")).exists(),
+            "partial uuid dir removed"
+        );
     }
 }

@@ -59,12 +59,48 @@ fn run_cmd(
     args.extend_from_slice(extra_args);
     let mut cmd = Command::new(binary());
     cmd.args(&args).current_dir(cwd);
+    // The binary binds a wide `SOCKET_*` env surface; an ambient value
+    // silently changes what these tests exercise — SOCKET_ECOSYSTEMS=cargo
+    // makes scan skip the npm fixture (scannedPackages 0), SOCKET_CWD aims
+    // the crawl outside the tempdir, SOCKET_GLOBAL flips to global mode.
+    // The highest-risk vars are seeded with hostile values and then
+    // scrubbed — `env_remove` clears the seed too, so the child never sees
+    // it, but if a scrub line is ever dropped the seed (rather than a
+    // developer's ambient shell, which this suite can't rely on) turns the
+    // tests red immediately. Same pattern as `common::run_with_env`.
+    cmd.env("SOCKET_CWD", "/nonexistent")
+        .env("SOCKET_ECOSYSTEMS", "cargo")
+        .env("SOCKET_GLOBAL", "true")
+        .env("SOCKET_GLOBAL_PREFIX", "/nonexistent")
+        .env("SOCKET_DRY_RUN", "true")
+        .env("SOCKET_MANIFEST_PATH", "/nonexistent/manifest.json")
+        .env_remove("SOCKET_CWD")
+        .env_remove("SOCKET_ECOSYSTEMS")
+        .env_remove("SOCKET_GLOBAL")
+        .env_remove("SOCKET_GLOBAL_PREFIX")
+        .env_remove("SOCKET_DRY_RUN")
+        .env_remove("SOCKET_MANIFEST_PATH");
+    // Prefix-scrub whatever else the ambient shell carries (SOCKET_YES,
+    // SOCKET_STRICT, SOCKET_VENDOR_SOURCE, ...). Unlike common/mod.rs this
+    // scrub covers the telemetry opt-outs too: this suite's entire point is
+    // asserting telemetry POSTs against a local wiremock, so an opted-out
+    // dev shell must not vacuously green the count-0 asserts.
+    for (key, _) in std::env::vars_os() {
+        let name = key.to_string_lossy();
+        if name.starts_with("SOCKET_") {
+            cmd.env_remove(&key);
+        }
+    }
     // Default: disable the test-environment short-circuit
     // (`is_telemetry_disabled()` flips on `VITEST=true`).
     cmd.env_remove("VITEST");
     cmd.env_remove("SOCKET_TELEMETRY_DISABLED");
     cmd.env_remove("SOCKET_PATCH_TELEMETRY_DISABLED");
     cmd.env_remove("SOCKET_OFFLINE");
+    // An ambient VIRTUAL_ENV hijacks the python crawler (its site-packages
+    // get crawled as project packages), breaking the exact
+    // `scannedPackages` oracles below.
+    cmd.env_remove("VIRTUAL_ENV");
     // `send_telemetry_event` reads SOCKET_API_URL from the environment
     // directly (not the clap arg), so pointing it at the mock here is
     // how the telemetry POST also lands on our recorder.
@@ -211,22 +247,39 @@ async fn scan_skips_telemetry_in_airgap_mode() {
         &[("SOCKET_OFFLINE", "1")],
     );
 
-    // Guard against a vacuous pass: prove scan actually ran its body (it
-    // crawled node_modules and reported the one package) rather than
-    // crashing before the telemetry-suppression point, which would also
-    // yield zero POSTs.
-    assert_eq!(code, 0, "offline scan must still succeed; stderr={stderr}");
+    // Strict airgap (CLI_CONTRACT.md `--offline`: "never contact the
+    // network — operations that need remote data fail loudly"): scan's
+    // patch discovery IS remote data, so offline scan must refuse loudly
+    // up front instead of POSTing the crawled package inventory to the
+    // batch endpoint. The error envelope doubles as the anti-vacuous
+    // guard — a crash before the offline gate would exit nonzero too,
+    // but couldn't emit the refusal envelope.
+    assert_eq!(
+        code, 1,
+        "offline scan must fail loudly; stdout={stdout} stderr={stderr}"
+    );
     let v: serde_json::Value = serde_json::from_str(&stdout)
         .unwrap_or_else(|e| panic!("scan stdout not JSON: {e}\n{stdout}"));
     assert_eq!(
-        v["status"], "success",
-        "offline scan status; stdout={stdout}"
+        v["status"], "error",
+        "offline scan must report an error envelope; stdout={stdout}"
     );
-    assert_eq!(
-        v["scannedPackages"], 1,
-        "offline scan must crawl the one package; stdout={stdout}"
+    assert!(
+        v["error"].as_str().unwrap_or_default().contains("offline"),
+        "offline scan's error must name the offline gate; stdout={stdout}"
     );
 
+    // The airgap core: ZERO requests of any kind — no batch POST (which
+    // would exfiltrate the crawled package inventory), no telemetry.
+    let received = mock.received_requests().await.expect("recording enabled");
+    assert!(
+        received.is_empty(),
+        "SOCKET_OFFLINE=1 must suppress every network request during scan; saw: {:?}",
+        received
+            .iter()
+            .map(|r| format!("{} {}", r.method, r.url.path()))
+            .collect::<Vec<_>>()
+    );
     let count = telemetry_post_count(&mock, None).await;
     assert_eq!(
         count, 0,
@@ -329,7 +382,7 @@ async fn get_skips_telemetry_in_airgap_mode() {
     write_root_package_json(tmp.path());
     write_npm_package(tmp.path(), "lodash", "4.17.20");
 
-    let (_code, stdout, _stderr) = run_cmd(
+    let (code, stdout, stderr) = run_cmd(
         tmp.path(),
         &mock.uri(),
         "get",
@@ -337,29 +390,38 @@ async fn get_skips_telemetry_in_airgap_mode() {
         &[("SOCKET_OFFLINE", "1")],
     );
 
-    // Anti-vacuous guard: get must have reached the fetch step (it queries
-    // the view endpoint regardless of airgap) — proving it ran far enough
-    // to hit the telemetry-suppression point. A crash before that would
-    // also produce zero telemetry POSTs and falsely "pass".
-    let received = mock.received_requests().await.expect("recording enabled");
-    let view_hits = received
-        .iter()
-        .filter(|r| {
-            r.method == wiremock::http::Method::GET
-                && r.url
-                    .path()
-                    .contains(&format!("/v0/orgs/{ORG_SLUG}/patches/view/"))
-        })
-        .count();
+    // Strict airgap (CLI_CONTRACT.md `--offline`: "never contact the
+    // network — operations that need remote data fail loudly"): every
+    // `get` mode fetches remote patch data, so offline get must refuse
+    // loudly before touching the view endpoint. The error envelope is
+    // the anti-vacuous guard — a crash before the offline gate exits
+    // nonzero too, but couldn't emit the refusal envelope.
+    assert_eq!(
+        code, 1,
+        "offline get must fail loudly; stdout={stdout} stderr={stderr}"
+    );
+    let v: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("get stdout not JSON: {e}\n{stdout}"));
+    assert_eq!(
+        v["status"], "error",
+        "offline get must report an error envelope; stdout={stdout}"
+    );
     assert!(
-        view_hits >= 1,
-        "offline get must still query the view endpoint; saw paths: {:?}; stdout={stdout}",
-        received
-            .iter()
-            .map(|r| r.url.path().to_string())
-            .collect::<Vec<_>>()
+        v["error"].as_str().unwrap_or_default().contains("offline"),
+        "offline get's error must name the offline gate; stdout={stdout}"
     );
 
+    // The airgap core: ZERO requests of any kind — no view GET, no
+    // telemetry.
+    let received = mock.received_requests().await.expect("recording enabled");
+    assert!(
+        received.is_empty(),
+        "SOCKET_OFFLINE=1 must suppress every network request during get; saw: {:?}",
+        received
+            .iter()
+            .map(|r| format!("{} {}", r.method, r.url.path()))
+            .collect::<Vec<_>>()
+    );
     let count = telemetry_post_count(&mock, None).await;
     assert_eq!(
         count, 0,

@@ -36,7 +36,7 @@ use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::{ApplyResult, PatchSources};
 use crate::patch::copy_tree::{fresh_copy, remove_tree};
 use crate::patch::path_safety::{is_safe_multi_segment, is_safe_single_segment};
-use crate::utils::fs::atomic_write_bytes;
+use crate::utils::fs::atomic_write_bytes_preserving_mode;
 use crate::utils::purl::{build_composer_purl, parse_composer_purl};
 
 use super::common::{
@@ -167,25 +167,45 @@ pub async fn vendor_composer(
         // ARTIFACT only. The lock is already correct and the first run's
         // ledger entry holds the only pre-vendor original — running the
         // full path here would re-record the live VENDORED fragment as
-        // `original`, breaking a later `--revert`.
+        // `original`, breaking a later `--revert`. Service-preferred like
+        // the full path (a service-vendored package may have no installed
+        // copy to rebuild from — only the service can).
         if !dry_run {
+            if let Some(refusal) = service_offline_conflict(service) {
+                return refusal;
+            }
             let mut warnings: Vec<VendorWarning> = Vec::new();
-            let result = match copy_and_patch(
-                purl,
-                installed_dir,
+            let result = match composer_service_copy(
+                service,
+                record,
+                &pkg,
                 &copy_dir,
                 &uuid_dir,
-                record,
-                sources,
-                force,
-                &pkg,
-                version,
                 &mut warnings,
             )
             .await
             {
-                Ok(result) => result,
-                Err(result) => return done(result, None, warnings),
+                ComposerServiceCopy::Used => already_patched_result(purl, &copy_dir, &record.files),
+                ComposerServiceCopy::HardFail(outcome) => return *outcome,
+                ComposerServiceCopy::FallBack => {
+                    match copy_and_patch(
+                        purl,
+                        installed_dir,
+                        &copy_dir,
+                        &uuid_dir,
+                        record,
+                        sources,
+                        force,
+                        &pkg,
+                        version,
+                        &mut warnings,
+                    )
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(result) => return done(result, None, warnings),
+                    }
+                }
             };
             warnings.push(VendorWarning::new(
                 "vendor_artifact_rebuilt",
@@ -262,10 +282,21 @@ pub async fn vendor_composer(
         result.error = Some("composer.lock entry is not a JSON object".to_string());
         return done(result, None, warnings);
     };
+    // Never record one of our own (stale) edits as the "original" — revert
+    // must restore the pre-vendor registry fragment, not a dangling
+    // `.socket/vendor/` pointer from an earlier uuid. The persist layer
+    // carries the true original forward from the entry being replaced when
+    // the record holds `None`.
+    let was_vendored = original_obj
+        .get("dist")
+        .and_then(|d| d.get("url"))
+        .and_then(Value::as_str)
+        .and_then(parse_vendor_path)
+        .is_some_and(|p| p.eco == "composer");
     let rewritten = rewrite_lock_entry(original_obj, &copy_rel, &record.uuid);
     lock[section][idx] = Value::Object(rewritten.clone());
     let write_result = match composer_json_bytes(&lock) {
-        Ok(bytes) => atomic_write_bytes(&lock_path, &bytes).await,
+        Ok(bytes) => atomic_write_bytes_preserving_mode(&lock_path, &bytes).await,
         Err(e) => Err(e),
     };
     if let Err(e) = write_result {
@@ -302,7 +333,7 @@ pub async fn vendor_composer(
             kind: WIRING_KIND.to_string(),
             action: WiringAction::Rewritten,
             key: Some(format!("{section}:{pkg}")),
-            original: Some(original_entry),
+            original: (!was_vendored).then_some(original_entry),
             new: Some(Value::Object(rewritten)),
         }],
         lock: None,
@@ -683,7 +714,7 @@ async fn restore_lock_entry(
     if !dry_run {
         lock[section][idx] = original;
         let bytes = composer_json_bytes(&lock).map_err(|e| e.to_string())?;
-        atomic_write_bytes(lock_path, &bytes)
+        atomic_write_bytes_preserving_mode(lock_path, &bytes)
             .await
             .map_err(|e| format!("failed to write composer.lock: {e}"))?;
     }
@@ -1528,6 +1559,160 @@ mod tests {
                 .unwrap(),
             PATCHED
         );
+    }
+
+    /// The vendor rewrite and the revert restore swap `composer.lock`'s inode;
+    /// both must keep the user's permission bits (a 0640 lock silently
+    /// becoming umask-default 0644 leaks group/other access the user removed).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_lock_write_preserves_file_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let lock = lock_value("psr/log", "3.0.2", false);
+        let (dir, blobs, installed, record) = fixture(&lock).await;
+        let root = dir.path();
+        let lock_path = root.join(COMPOSER_LOCK);
+        tokio::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o640))
+            .await
+            .unwrap();
+
+        let (result, entry, _w) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, PURL, false).await);
+        assert!(result.success, "{:?}", result.error);
+        let mode = tokio::fs::metadata(&lock_path)
+            .await
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o640, "vendor rewrite must keep composer.lock's mode");
+
+        let outcome = revert_composer(&entry.unwrap(), root, false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        let mode = tokio::fs::metadata(&lock_path)
+            .await
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o640, "revert restore must keep composer.lock's mode");
+    }
+
+    /// Re-vendor under a NEW patch uuid (a patch update taking over the
+    /// entry): the wiring must record `original: None` — never the previous
+    /// run's own stale path dist. The persist layer carries the true
+    /// pre-vendor original forward from the entry being replaced and sweeps
+    /// the old uuid dir, so a recorded stale dist would make a later
+    /// `--revert` restore a dangling `.socket/vendor/composer/` pointer.
+    #[tokio::test]
+    async fn test_takeover_rerun_never_records_own_wiring_as_original() {
+        let lock = lock_value("psr/log", "3.0.2", false);
+        let (dir, blobs, installed, record) = fixture(&lock).await;
+        let root = dir.path();
+
+        let (r1, e1, _) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, PURL, false).await);
+        assert!(r1.success, "{:?}", r1.error);
+        assert!(e1.is_some());
+
+        const UUID_B: &str = "0a1b2c3d-4e5f-6071-8293-a4b5c6d7e8f9";
+        let mut record_b = record.clone();
+        record_b.uuid = UUID_B.to_string();
+        let (r2, e2, _) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record_b, PURL, false).await);
+        assert!(r2.success, "{:?}", r2.error);
+        let e2 = e2.expect("takeover records a fresh entry");
+        let w = &e2.wiring[0];
+        assert_eq!(w.key.as_deref(), Some("packages:psr/log"));
+        assert!(
+            w.original.is_none(),
+            "own stale wiring must never be recorded as original: {:?}",
+            w.original
+        );
+
+        // The lock is rewired at the new uuid's copy.
+        let new_lock: Value = serde_json::from_str(
+            &tokio::fs::read_to_string(root.join(COMPOSER_LOCK))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            new_lock["packages"][0]["dist"]["url"],
+            format!(".socket/vendor/composer/{UUID_B}/psr/log@3.0.2")
+        );
+    }
+
+    /// Wired lock + missing copy + `--vendor-source=service`: the artifact
+    /// rebuild must be service-preferred like the full path (a
+    /// service-vendored package may have no installed copy to rebuild from),
+    /// and `--offline` + `service` must refuse in the rebuild path too.
+    #[tokio::test]
+    async fn service_rebuild_of_missing_copy_uses_service() {
+        let lock = lock_value("psr/log", "3.0.2", false);
+        let (dir, blobs, _installed, record) = fixture(&lock).await;
+        let root = dir.path();
+        let zip = make_dist_zip(
+            "php-fig-log-f16e1d5",
+            &[
+                ("src/LoggerInterface.php", PATCHED),
+                ("composer.json", b"{\"name\": \"psr/log\"}\n"),
+            ],
+        );
+        let sri = sri_sha512(&zip);
+        let server = wiremock::MockServer::start().await;
+        mount_composer_granted(&server, &sri, &zip).await;
+        let cfg = composer_service_cfg(&server.uri(), VendorSource::Service, false);
+        let bogus_installed = root.join("no-such-install");
+
+        let (r1, e1, _) =
+            unwrap_done(vendor_with_service(root, &blobs, &bogus_installed, &record, &cfg).await);
+        assert!(r1.success, "{:?}", r1.error);
+        assert!(e1.is_some());
+        let lock_bytes = tokio::fs::read(root.join(COMPOSER_LOCK)).await.unwrap();
+
+        // Fresh-clone hole: the committed copy is gone, the lock still wired.
+        crate::patch::copy_tree::remove_tree(&root.join(copy_rel()))
+            .await
+            .unwrap();
+
+        let (r2, e2, w2) =
+            unwrap_done(vendor_with_service(root, &blobs, &bogus_installed, &record, &cfg).await);
+        assert!(
+            r2.success,
+            "service-mode rebuild must re-download the prebuilt dist: {:?}",
+            r2.error
+        );
+        assert!(e2.is_none(), "artifact-only rebuild must not re-record");
+        assert!(
+            w2.iter().any(|w| w.code == "vendor_artifact_rebuilt"),
+            "{w2:?}"
+        );
+        assert!(
+            w2.iter().any(|w| w.code == "vendor_prebuilt_downloaded"),
+            "{w2:?}"
+        );
+        assert_eq!(
+            tokio::fs::read(root.join(copy_rel()).join("src/LoggerInterface.php"))
+                .await
+                .unwrap(),
+            PATCHED
+        );
+        assert_eq!(
+            tokio::fs::read(root.join(COMPOSER_LOCK)).await.unwrap(),
+            lock_bytes,
+            "composer.lock untouched by the rebuild"
+        );
+
+        // The offline+service conflict is refused in the rebuild path too.
+        crate::patch::copy_tree::remove_tree(&root.join(copy_rel()))
+            .await
+            .unwrap();
+        let offline = composer_service_cfg(&server.uri(), VendorSource::Service, true);
+        let (code, _) = unwrap_refused(
+            vendor_with_service(root, &blobs, &bogus_installed, &record, &offline).await,
+        );
+        assert_eq!(code, "vendor_service_offline_conflict");
     }
 
     /// `--offline` + `--vendor-source=service` refuses without any network.

@@ -61,6 +61,19 @@ pub async fn break_hardlink_if_needed(path: &Path) -> std::io::Result<CowAction>
     };
 
     if lstat.file_type().is_symlink() {
+        // Gate on the *target's* type before reading through the link:
+        // `read()` on a symlink to a FIFO blocks forever at `open(2)`
+        // waiting for a writer (the same hazard the hardlink branch
+        // guards against below), and a device target reads unbounded
+        // bytes. Non-regular targets are not cow's problem — leave the
+        // link untouched, matching the hardlink branch's treatment of
+        // non-regular inodes. `metadata` follows the link, so a
+        // dangling symlink still surfaces as the NotFound error the
+        // read-through used to produce.
+        let target_meta = tokio::fs::metadata(path).await?;
+        if !target_meta.is_file() {
+            return Ok(CowAction::AlreadyPrivate);
+        }
         // Read through the symlink (this DOES follow it) to grab the
         // current target content. We need it on disk as a regular
         // file at `path` so the patch write lands on our copy.
@@ -379,6 +392,52 @@ mod tests {
         .expect("must not block reading the FIFO")
         .unwrap();
         assert_eq!(action, CowAction::AlreadyPrivate);
+        assert_eq!(leftover_stage_count(dir.path()), 0);
+    }
+
+    /// The symlink branch has the same FIFO hazard the hardlink branch
+    /// guards against: `read()` through a symlink whose target is a
+    /// FIFO blocks forever at `open(2)` waiting for a writer, hanging
+    /// the whole apply. A symlink to a non-regular inode is not cow's
+    /// problem — it must come back promptly as `AlreadyPrivate` with
+    /// the link untouched.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlink_to_fifo_is_not_routed_into_symlink_break() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("pipe");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let link = dir.path().join("pipe-link");
+        tokio::fs::symlink(&fifo, &link).await.unwrap();
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            break_hardlink_if_needed(&link),
+        )
+        .await;
+        // Rescue: if the code under test wrongly opened the FIFO for
+        // read, give it a writer + immediate EOF so the blocked pool
+        // thread can exit — otherwise a regression wedges the test
+        // binary at runtime shutdown instead of failing the asserts
+        // below. (O_RDWR on a FIFO never blocks; no-op when the code
+        // behaved.)
+        drop(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&fifo),
+        );
+        let action = result
+            .expect("must not block opening the FIFO through the symlink")
+            .unwrap();
+        assert_eq!(action, CowAction::AlreadyPrivate);
+        // The symlink itself must be left untouched.
+        let meta = tokio::fs::symlink_metadata(&link).await.unwrap();
+        assert!(meta.file_type().is_symlink());
         assert_eq!(leftover_stage_count(dir.path()), 0);
     }
 

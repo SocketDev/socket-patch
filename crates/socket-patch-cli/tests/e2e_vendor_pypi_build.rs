@@ -99,10 +99,21 @@ fn find_uv() -> Option<PathBuf> {
     candidate.is_file().then_some(candidate)
 }
 
-/// Run a toolchain command with a scrubbed VIRTUAL_ENV + explicit env.
+/// Run a toolchain command with ambient python/uv/pip env scrubbed —
+/// `PYTHON*` (a `PYTHONPATH` shadow hijacks the marker oracle), `UV_*`
+/// (`UV_PROJECT_ENVIRONMENT` moves the venv away from `.venv`), `PIP_*`,
+/// and `VIRTUAL_ENV` are all toolchain behavior inputs and must not leak
+/// from the developer's shell. Scrub BEFORE seeding the explicit env — the
+/// last env call wins.
 fn tool(exe: &Path, cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
     let mut cmd = Command::new(exe);
     cmd.args(args).current_dir(cwd);
+    for (k, _) in std::env::vars_os() {
+        let name = k.to_string_lossy();
+        if name.starts_with("PYTHON") || name.starts_with("UV_") || name.starts_with("PIP_") {
+            cmd.env_remove(&k);
+        }
+    }
     cmd.env_remove("VIRTUAL_ENV");
     for (k, v) in env {
         cmd.env(k, v);
@@ -229,6 +240,28 @@ fn python_oracle(venv: &Path, cwd: &Path) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
+/// RED guards for the `tool()` hermeticity scrub: bake the hostile ambient
+/// values in so this suite fails deterministically if the leak returns.
+/// `UV_PROJECT_ENVIRONMENT` must be scrubbed (or `uv sync` builds the venv
+/// away from `.venv` and `site_packages` panics) and the `PYTHONPATH` shadow
+/// `six` must be scrubbed (or the marker oracle imports the shadow and every
+/// patched-wheel assert dies on AttributeError). Constant paths only — both
+/// tests share this process's environment.
+fn bake_leak_guards() {
+    let shadow = std::env::temp_dir().join("socket-e2e-pypi-shadow");
+    std::fs::create_dir_all(&shadow).unwrap();
+    std::fs::write(
+        shadow.join("six.py"),
+        "# ambient shadow module - no SOCKET_PATCHED attr\n",
+    )
+    .unwrap();
+    std::env::set_var("PYTHONPATH", &shadow);
+    std::env::set_var(
+        "UV_PROJECT_ENVIRONMENT",
+        std::env::temp_dir().join("socket-e2e-uv-env-leak"),
+    );
+}
+
 fn copy_dir_recursive(src: &Path, dst: &Path) {
     std::fs::create_dir_all(dst).unwrap();
     for entry in std::fs::read_dir(src).unwrap() {
@@ -250,6 +283,7 @@ fn uv_vendor_fresh_checkout_frozen_offline_and_revert() {
         println!("SKIP e2e_vendor_pypi_build(uv): `uv` not on PATH or at ~/.local/bin/uv");
         return;
     };
+    bake_leak_guards();
     let tmp = tempfile::tempdir().unwrap();
     let proj = tmp.path().join("proj");
     std::fs::create_dir_all(&proj).unwrap();
@@ -447,6 +481,7 @@ fn pip_requirements_vendor_fresh_checkout_no_index_and_revert() {
         println!("SKIP e2e_vendor_pypi_build(pip): no python3/python on PATH");
         return;
     };
+    bake_leak_guards();
     let tmp = tempfile::tempdir().unwrap();
     let proj = tmp.path().join("proj");
     std::fs::create_dir_all(&proj).unwrap();

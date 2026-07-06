@@ -63,6 +63,39 @@ fn write_root_package_json(root: &Path) {
     .unwrap();
 }
 
+/// Hermeticity scrub for the apply/rollback helpers. The binary binds a wide
+/// `SOCKET_*` env surface; an ambient value silently changes the branch under
+/// test — `SOCKET_DRY_RUN=true` turns every rollback into a no-op
+/// (`rolledBack: 0`, bytes never restored) and `SOCKET_MANIFEST_PATH` points
+/// apply at a manifest that isn't there (`noManifest`, exit 0). Both verified
+/// red against unscrubbed helpers. Seed-then-scrub: hostile values for the
+/// vars that break these tests are set first, then the whole prefix is
+/// removed — if the scrub ever stops running, the seeds turn every test in
+/// this file red immediately. Telemetry opt-outs are deliberately kept so an
+/// opted-out dev stays opted out (`--offline` already disables telemetry).
+fn scrub_socket_env(cmd: &mut Command) {
+    const HOSTILE_SEEDS: &[(&str, &str)] = &[
+        ("SOCKET_DRY_RUN", "true"),
+        ("SOCKET_GLOBAL", "true"),
+        ("SOCKET_GLOBAL_PREFIX", "/nonexistent"),
+        ("SOCKET_MANIFEST_PATH", "/nonexistent/manifest.json"),
+    ];
+    for (k, v) in HOSTILE_SEEDS {
+        cmd.env(k, v);
+    }
+    // Explicit removes cover the seeds (they are not in the parent env);
+    // the vars_os() sweep covers whatever the ambient shell/CI exported.
+    for (k, _) in HOSTILE_SEEDS {
+        cmd.env_remove(k);
+    }
+    for (key, _) in std::env::vars_os() {
+        let name = key.to_string_lossy();
+        if name.starts_with("SOCKET_") && !name.contains("TELEMETRY") {
+            cmd.env_remove(&key);
+        }
+    }
+}
+
 /// Write a minimal manifest with one (file-less) patch for the given PURL.
 fn write_manifest(root: &Path, purl: &str) {
     let socket = root.join(".socket");
@@ -88,19 +121,18 @@ fn write_manifest(root: &Path, purl: &str) {
 /// Run `socket-patch apply --offline --json --ecosystems <eco>` and return
 /// the exit code + parsed envelope.
 fn run_apply_for_ecosystem(cwd: &Path, ecosystem: &str) -> (i32, Value) {
-    let out = Command::new(binary())
-        .args([
-            "apply",
-            "--offline",
-            "--json",
-            "--ecosystems",
-            ecosystem,
-            "--silent",
-        ])
-        .current_dir(cwd)
-        .env_remove("SOCKET_API_TOKEN")
-        .output()
-        .expect("run socket-patch");
+    let mut cmd = Command::new(binary());
+    cmd.args([
+        "apply",
+        "--offline",
+        "--json",
+        "--ecosystems",
+        ecosystem,
+        "--silent",
+    ])
+    .current_dir(cwd);
+    scrub_socket_env(&mut cmd);
+    let out = cmd.output().expect("run socket-patch");
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     let env: Value = serde_json::from_str(stdout.trim())
         .unwrap_or_else(|e| panic!("apply envelope must parse ({e}); stdout={stdout}"));
@@ -448,7 +480,11 @@ fn run_rollback(
     if global {
         cmd.arg("--global");
     }
-    cmd.current_dir(cwd).env_remove("SOCKET_API_TOKEN");
+    cmd.current_dir(cwd);
+    // Scrub BEFORE seeding fixture envs: the fixture list includes
+    // SOCKET_-prefixed vars (SOCKET_EXPERIMENTAL_MAVEN/NUGET) that the
+    // prefix sweep would otherwise wipe (last env call per key wins).
+    scrub_socket_env(&mut cmd);
     for (k, v) in envs {
         cmd.env(k, v);
     }
@@ -670,11 +706,12 @@ fn rollback_dispatch_filter_excludes_out_of_scope_package() {
     let tmp = tempfile::tempdir().unwrap();
     write_root_package_json(tmp.path());
     let fixture = fixture_npm(tmp.path());
-    // Sanity: an in-scope rollback DOES restore (proves the fixture is valid
-    // and the differential below is meaningful, not vacuously a no-op).
+    // Out of scope first: the pypi crawler must not discover (or touch) the
+    // npm fixture — the file stays PATCHED.
     assert_rollback_not_dispatched(tmp.path(), "pypi", &fixture);
-    // After the out-of-scope no-op the file is still PATCHED; now the matching
-    // ecosystem must actually restore it to ORIGINAL.
+    // Then in scope: the SAME fixture must actually restore to ORIGINAL.
+    // This doubles as the sanity proof that the fixture is valid, so the
+    // out-of-scope no-op above was meaningful, not vacuous.
     assert_rollback_restored(tmp.path(), "npm", &fixture);
 }
 

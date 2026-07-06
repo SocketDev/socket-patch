@@ -28,7 +28,7 @@ use std::path::Path;
 use serde_json::{Map, Value};
 
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
-use crate::utils::fs::atomic_write_bytes;
+use crate::utils::fs::atomic_write_bytes_preserving_mode;
 
 use super::common::serialize_json;
 use super::path::parse_vendor_path;
@@ -293,7 +293,7 @@ pub(super) async fn wire_pipenv(
     }
 
     let new_text = to_canonical_json(&lock);
-    atomic_write_bytes(&root.join(LOCK_FILE), new_text.as_bytes())
+    atomic_write_bytes_preserving_mode(&root.join(LOCK_FILE), new_text.as_bytes())
         .await
         .map_err(|e| {
             (
@@ -407,7 +407,7 @@ pub(super) async fn revert_pipenv(
     // churn a lock whose formatting we did not produce.
     if changed && !dry_run {
         let new_text = to_canonical_json(&lock);
-        if let Err(e) = atomic_write_bytes(&lock_path, new_text.as_bytes()).await {
+        if let Err(e) = atomic_write_bytes_preserving_mode(&lock_path, new_text.as_bytes()).await {
             return RevertOutcome {
                 success: false,
                 warnings,
@@ -986,6 +986,41 @@ mod tests {
             LOCK_DIRECT_REGISTRY,
             "no record matched: the lock is not even re-serialized"
         );
+    }
+
+    /// Pipfile.lock is a user-owned file we merely edit: both the vendor
+    /// rewrite and the revert restore must keep its permission bits (a 0600
+    /// private lock must not silently become umask-default 0644).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn lock_writes_preserve_file_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = write_lock(LOCK_DIRECT_REGISTRY).await;
+        let lock_path = tmp.path().join("Pipfile.lock");
+        tokio::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o600))
+            .await
+            .unwrap();
+
+        let p = load_pipenv_project(tmp.path()).await.unwrap();
+        let (wiring, meta) = wire_default(&p, tmp.path()).await;
+        let mode = tokio::fs::metadata(&lock_path)
+            .await
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(mode, 0o600, "wire must preserve the lockfile's mode");
+
+        let outcome = revert_pipenv(&entry_for(wiring, meta), tmp.path(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        let mode = tokio::fs::metadata(&lock_path)
+            .await
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(mode, 0o600, "revert must preserve the lockfile's mode");
+        assert_eq!(read_lock(tmp.path()).await, LOCK_DIRECT_REGISTRY);
     }
 
     /// A third-party edit to the entry we wrote (e.g. `pipenv lock`

@@ -27,9 +27,15 @@ pub(crate) struct BunEntry {
     pub(crate) trailing_comma: bool,
 }
 
-/// `name@spec` split at the LAST `@` (scoped names keep their leading `@`).
+/// `name@spec` split at the FIRST `@` past the leading character: a name's
+/// only `@` is a scope marker at index 0, while the spec itself may contain
+/// `@` (a vendored path keeps the scope dir in its leaf —
+/// `@scope/pkg@.socket/vendor/npm/<uuid>/@scope/pkg-1.0.0.tgz`), so the
+/// last `@` is not a safe split point.
 pub(crate) fn split_name_spec(s: &str) -> Option<(&str, &str)> {
-    let at = s.rfind('@').filter(|&i| i > 0)?;
+    let at = s
+        .char_indices()
+        .find_map(|(i, c)| (c == '@' && i > 0).then_some(i))?;
     Some((&s[..at], &s[at + 1..]))
 }
 
@@ -151,18 +157,21 @@ fn scan_json_string(s: &str) -> Result<usize, String> {
 }
 
 /// Byte index one past the `]` matching the `[` at the start of `s`
-/// (string- and nesting-aware).
+/// (string- and nesting-aware; closer type must match its opener).
 fn scan_balanced_array(s: &str) -> Result<usize, String> {
     let bytes = s.as_bytes();
-    let mut depth = 0usize;
+    let mut stack: Vec<u8> = Vec::new();
     let mut i = 0;
     while i < bytes.len() {
         match bytes[i] {
             b'"' => i += scan_json_string(&s[i..])? - 1,
-            b'[' | b'{' => depth += 1,
+            b'[' => stack.push(b']'),
+            b'{' => stack.push(b'}'),
             b']' | b'}' => {
-                depth -= 1;
-                if depth == 0 {
+                if stack.pop() != Some(bytes[i]) {
+                    return Err("mismatched brackets".to_string());
+                }
+                if stack.is_empty() {
                     return Ok(i + 1);
                 }
             }
@@ -178,17 +187,20 @@ fn scan_balanced_array(s: &str) -> Result<usize, String> {
 fn split_top_level(interior: &str) -> Result<Vec<String>, String> {
     let bytes = interior.as_bytes();
     let mut elems = Vec::new();
-    let mut depth = 0usize;
+    let mut stack: Vec<u8> = Vec::new();
     let mut elem_start = 0usize;
     let mut i = 0;
     while i < bytes.len() {
         match bytes[i] {
             b'"' => i += scan_json_string(&interior[i..])? - 1,
-            b'[' | b'{' => depth += 1,
+            b'[' => stack.push(b']'),
+            b'{' => stack.push(b'}'),
             b']' | b'}' => {
-                depth = depth.checked_sub(1).ok_or("unbalanced brackets")?;
+                if stack.pop() != Some(bytes[i]) {
+                    return Err("unbalanced brackets".to_string());
+                }
             }
-            b',' if depth == 0 => {
+            b',' if stack.is_empty() => {
                 elems.push(interior[elem_start..i].trim().to_string());
                 elem_start = i + 1;
             }
@@ -260,11 +272,28 @@ mod tests {
             None,
             "a scope @ alone is not a version sep"
         );
+        assert_eq!(
+            split_name_spec("@scope/pkg@.socket/vendor/npm/u/@scope/pkg-1.0.0.tgz"),
+            Some(("@scope/pkg", ".socket/vendor/npm/u/@scope/pkg-1.0.0.tgz")),
+            "an @ inside the spec (scoped vendored leaf) must not shift the split"
+        );
 
         // Fail-closed grammar.
         assert!(
             parse_entry_line("    \"k\": [\"a\", ").is_err(),
             "unterminated"
+        );
+        assert!(
+            parse_entry_line(r#"    "k": ["a"},"#).is_err(),
+            "array closed by `}}` must not parse"
+        );
+        assert!(
+            parse_entry_line(r#"    "k": ["a", {"x": 1]],"#).is_err(),
+            "object closed by `]` must not parse"
+        );
+        assert!(
+            parse_entry_line(r#"    "k": ["a", [1}]"#).is_err(),
+            "nested array closed by `}}` must not parse"
         );
         assert!(parse_entry_line("    k: [\"a\"]").is_err(), "unquoted key");
         assert!(parse_entry_line("    \"k\": \"not an array\"").is_err());

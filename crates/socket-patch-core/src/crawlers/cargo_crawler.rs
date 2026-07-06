@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use super::types::{CrawledPackage, CrawlerOptions};
+use crate::patch::path_safety;
 use crate::utils::fs::is_dir;
 
 // ---------------------------------------------------------------------------
@@ -210,6 +211,16 @@ impl CargoCrawler {
 
         for purl in purls {
             if let Some((name, version)) = crate::utils::purl::parse_cargo_purl(purl) {
+                // Both coordinates are joined onto the scanned source root
+                // below and the resolved crate dir is patched IN PLACE, so a
+                // tampered PURL must not be able to traverse out of the
+                // root. Reject before touching the filesystem —
+                // `verify_crate_at_path` is no defense, since it compares
+                // against the escaped directory's own Cargo.toml.
+                if !is_safe_cargo_coordinate(name, version) {
+                    continue;
+                }
+
                 // Registry layout first (<name>-<version>/), then vendor (<name>/).
                 for dir in [
                     src_path.join(format!("{name}-{version}")),
@@ -391,6 +402,20 @@ impl CargoCrawler {
         }
         crate::utils::fs::home_dir().join(".cargo")
     }
+}
+
+/// SECURITY: `find_by_purls` formats name/version into a `<name>-<version>`
+/// registry dir (and the bare `<name>` vendor dir) joined onto the scanned
+/// source root, after which the resolved directory is patched in place — so
+/// a tampered PURL must not be able to traverse out of the root. A real
+/// crates.io name/version never contains a separator, a `.`/`..` segment, a
+/// backslash, a colon, or a NUL. Delegates to
+/// [`path_safety::is_safe_single_segment`], which also rejects `:` — a
+/// Windows drive-relative coordinate (`C:evil`) joins as an absolute path.
+/// Fails closed. Mirrors the nuget/maven/go/deno/npm/ruby crawler
+/// coordinate guards.
+fn is_safe_cargo_coordinate(name: &str, version: &str) -> bool {
+    path_safety::is_safe_single_segment(name) && path_safety::is_safe_single_segment(version)
 }
 
 impl Default for CargoCrawler {
@@ -978,6 +1003,79 @@ version = "fake"
 
         assert_eq!(result.len(), 1);
         assert!(result.contains_key("pkg:cargo/serde@1.0.200"));
+    }
+
+    #[test]
+    fn test_is_safe_cargo_coordinate() {
+        // Real coordinates pass, including hyphen/underscore names,
+        // prerelease tags, and build metadata.
+        assert!(is_safe_cargo_coordinate("serde", "1.0.200"));
+        assert!(is_safe_cargo_coordinate("serde_json", "1.0.120"));
+        assert!(is_safe_cargo_coordinate("sha-1", "0.10.0"));
+        assert!(is_safe_cargo_coordinate("crate", "1.0.0-rc.1"));
+        assert!(is_safe_cargo_coordinate(
+            "wasi",
+            "0.11.0+wasi-snapshot-preview1"
+        ));
+
+        // Traversal / separator smuggling fails closed.
+        assert!(!is_safe_cargo_coordinate("..", "1.0.0"));
+        assert!(!is_safe_cargo_coordinate("../escaped", "1.0.0"));
+        assert!(!is_safe_cargo_coordinate("a/b", "1.0.0"));
+        assert!(!is_safe_cargo_coordinate("a\\b", "1.0.0"));
+        assert!(!is_safe_cargo_coordinate("a\0b", "1.0.0"));
+        assert!(!is_safe_cargo_coordinate("a", ".."));
+        assert!(!is_safe_cargo_coordinate("a", "../../escaped"));
+        assert!(!is_safe_cargo_coordinate("a", "1/0"));
+        assert!(!is_safe_cargo_coordinate("a", "."));
+        assert!(!is_safe_cargo_coordinate("", "1.0.0"));
+        assert!(!is_safe_cargo_coordinate("a", ""));
+        // Windows drive-relative escape: a `:` (e.g. `C:evil`) makes the
+        // joined path absolute under `Path::join`.
+        assert!(!is_safe_cargo_coordinate("C:evil", "1.0.0"));
+        assert!(!is_safe_cargo_coordinate("a", "C:1.0.0"));
+    }
+
+    /// SECURITY regression: a tampered manifest PURL whose name or version
+    /// carries a `..`/separator must NOT resolve to a directory outside the
+    /// scanned crate source root. `find_by_purls` joins the PURL-derived
+    /// name/version onto `src_path` (`<name>-<version>` registry dirs,
+    /// bare `<name>` vendor dirs) and the resolved directory is patched IN
+    /// PLACE — so an escape means an arbitrary out-of-tree write.
+    /// `verify_crate_at_path` is no defense: it compares against the
+    /// escaped directory's own `Cargo.toml`, which the attacker controls.
+    /// Twin of the nuget/maven/go/deno/npm/ruby crawler coordinate guards.
+    #[tokio::test]
+    async fn test_find_by_purls_rejects_traversal_coordinate() {
+        let root = tempfile::tempdir().unwrap();
+        let src = root.path().join("registry");
+        tokio::fs::create_dir_all(&src).await.unwrap();
+
+        // An out-of-tree crate dir whose Cargo.toml matches the traversal
+        // PURL's coordinates, so the only thing standing between the
+        // attacker and a match is the coordinate guard.
+        let escaped = root.path().join("evil");
+        tokio::fs::create_dir_all(&escaped).await.unwrap();
+        tokio::fs::write(
+            escaped.join("Cargo.toml"),
+            "[package]\nname = \"../evil\"\nversion = \"1.0.0\"\n",
+        )
+        .await
+        .unwrap();
+
+        let purls = vec![
+            // name traversal, vendor-layout probe: registry/../evil
+            "pkg:cargo/../evil@1.0.0".to_string(),
+            // version traversal (joined into the registry-layout dir name)
+            "pkg:cargo/pwn@../../evil".to_string(),
+        ];
+
+        let crawler = CargoCrawler::new();
+        let result = crawler.find_by_purls(&src, &purls).await.unwrap();
+        assert!(
+            result.is_empty(),
+            "traversal PURL must not resolve to an out-of-tree directory, got {result:?}"
+        );
     }
 
     #[tokio::test]

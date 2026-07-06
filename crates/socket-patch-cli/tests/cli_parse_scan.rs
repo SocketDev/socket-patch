@@ -45,9 +45,13 @@ const SCAN_ENV_VARS: &[&str] = &[
     "SOCKET_MANIFEST_PATH",
     "SOCKET_OFFLINE",
     "SOCKET_ORG_SLUG",
+    "SOCKET_PATCH_SERVER_URL",
     "SOCKET_PROXY_URL",
     "SOCKET_SILENT",
+    "SOCKET_STRICT",
     "SOCKET_TELEMETRY_DISABLED",
+    "SOCKET_VENDOR_SOURCE",
+    "SOCKET_VENDOR_URL",
     "SOCKET_VERBOSE",
     "SOCKET_VEX",
     "SOCKET_VEX_COMPACT",
@@ -688,4 +692,75 @@ fn legacy_mode_spellings_still_parse() {
         Some(ScanMode::Vendored),
         "legacy --vendor folds into the mode selector"
     );
+}
+
+// --- scrub-list completeness guard -----------------------------------------
+
+/// Full-surface snapshot of a parsed `ScanArgs`, for env-leak detection.
+/// The flattened `GlobalArgs` participates via its `Debug` impl so every
+/// field — including ones added after this file was written — is covered
+/// without being named here; the scan-local and vex-embed fields (no
+/// `Debug` derive) are formatted individually.
+fn snap(a: &ScanArgs) -> String {
+    format!(
+        "{:?} batch_size={} apply={} prune={} sync={} vendor={} detached={} \
+         redirect={} mode={:?} all_releases={} vex={:?} vex_product={:?} \
+         vex_no_verify={} vex_doc_id={:?} vex_compact={}",
+        a.common,
+        a.batch_size,
+        a.apply,
+        a.prune,
+        a.sync,
+        a.vendor,
+        a.detached,
+        a.redirect,
+        a.mode,
+        a.all_releases,
+        a.vex.vex,
+        a.vex.vex_product,
+        a.vex.vex_no_verify,
+        a.vex.vex_doc_id,
+        a.vex.vex_compact,
+    )
+}
+
+#[test]
+#[serial_test::serial]
+fn scrub_covers_every_scan_env_var_clap_consults() {
+    // `SCAN_ENV_VARS` claims to cover every `SOCKET_*` var clap consults
+    // while parsing `scan`. The production oracles are
+    // `GLOBAL_ARG_ENV_VARS` (the flattened `GlobalArgs`, consulted by every
+    // subcommand the moment a binding lands) and `LOCAL_ARG_ENV_VARS`
+    // (subcommand-local bindings — scan's own plus other subcommands',
+    // which the scan parse never reads, so probing them is harmless). For
+    // each var: plant `garbage`, parse under the scrub, and require the
+    // exact clean-parse result. A var missing from the scrub fails loudly
+    // either way — validated flags (bools, ints, `--ecosystems`,
+    // `--vendor-source`) abort the parse; free-form strings/paths leak a
+    // visibly non-default value into the snapshot.
+    let baseline = snap(&parse_scan(&[]));
+    for &var in socket_patch_cli::args::GLOBAL_ARG_ENV_VARS
+        .iter()
+        .chain(socket_patch_cli::args::LOCAL_ARG_ENV_VARS)
+    {
+        let prev = std::env::var(var).ok();
+        std::env::set_var(var, "garbage");
+        let parsed = with_clean_env(|| Cli::try_parse_from(["socket-patch", "scan"]));
+        match prev {
+            Some(v) => std::env::set_var(var, v),
+            None => std::env::remove_var(var),
+        }
+        let args = match parsed {
+            Ok(cli) => match cli.command {
+                Commands::Scan(a) => a,
+                _ => panic!("expected Scan"),
+            },
+            Err(e) => panic!("ambient {var}=garbage aborted the scrubbed parse: {e}"),
+        };
+        assert_eq!(
+            snap(&args),
+            baseline,
+            "ambient {var}=garbage leaked into the scrubbed parse",
+        );
+    }
 }

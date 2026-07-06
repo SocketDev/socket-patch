@@ -210,6 +210,67 @@ fn setup_remove_silent_prints_nothing_but_removes() {
     );
 }
 
+/// Errors must still print under `--silent` ("errors only", not "nothing"),
+/// mirroring the remove/scan silent suites: an invalid package.json keeps
+/// its error message on stderr and exit 1 in all three modes, while the
+/// informational stdout stays suppressed.
+#[test]
+fn setup_silent_keeps_error_output() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(tmp.path().join("package.json"), "{ not json").unwrap();
+
+    for mode in [&[][..], &["--check"][..], &["--remove"][..]] {
+        let mut args: Vec<&str> = mode.to_vec();
+        args.extend(["--silent", "--yes"]);
+        let (code, stdout, stderr) = run_setup(tmp.path(), &args);
+        assert_eq!(
+            code, 1,
+            "invalid package.json must exit 1 for {mode:?}; stdout={stdout:?} stderr={stderr:?}"
+        );
+        assert!(
+            stdout.trim().is_empty(),
+            "--silent must still suppress informational stdout for {mode:?}; got {stdout:?}"
+        );
+        assert!(
+            stderr.contains("Invalid package.json"),
+            "--silent must NOT suppress error output for {mode:?}; got {stderr:?}"
+        );
+    }
+}
+
+/// Same contract for the apply-phase (post-preview) failures: a package.json
+/// that previews fine but cannot be rewritten (read-only directory) must
+/// surface its write error on stderr under `--silent`, not just exit 1.
+#[cfg(unix)]
+#[test]
+fn setup_silent_keeps_apply_phase_error_output() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_root(tmp.path());
+    std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    let (code, stdout, stderr) = run_setup(tmp.path(), &["--silent", "--yes"]);
+
+    // Restore so the tempdir can clean up regardless of the assertions.
+    std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert_eq!(
+        code, 1,
+        "unwritable package.json must exit 1; stdout={stdout:?} stderr={stderr:?}"
+    );
+    assert!(
+        stdout.trim().is_empty(),
+        "--silent must still suppress informational stdout; got {stdout:?}"
+    );
+    assert!(
+        stderr_chatter(&stderr)
+            .iter()
+            .any(|l| l.starts_with("Error:")),
+        "--silent must NOT suppress the apply-phase write error; got {stderr:?}"
+    );
+}
+
 /// The `no_files` path (no project found at all) is informational, not an
 /// error: under `--silent` it must print nothing and exit 0. Covers both
 /// the plain-setup inline branch and the shared `report_no_files` helper

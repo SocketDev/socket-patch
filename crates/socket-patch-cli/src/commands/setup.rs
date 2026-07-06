@@ -20,7 +20,7 @@ use socket_patch_core::pth_hook::edit::{
     PthEditResult, PthStatus,
 };
 use socket_patch_core::utils::telemetry::track_patch_setup;
-use socket_patch_core::vex::applied_patches;
+use socket_patch_core::vex::applied_patches_with_vendor;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
@@ -182,7 +182,12 @@ fn confirm_proceed(prompt: &str) -> bool {
     print!("{prompt}");
     io::stdout().flush().unwrap();
     let mut answer = String::new();
-    io::stdin().read_line(&mut answer).unwrap();
+    if io::stdin().read_line(&mut answer).is_err() {
+        // Terminals can deliver non-UTF-8 bytes (e.g. a Latin-1 paste);
+        // `read_line` reports those as InvalidData. Treat any read
+        // failure like an unrecognized answer (abort), not a panic.
+        return false;
+    }
     let answer = answer.trim().to_lowercase();
     answer == "y" || answer == "yes"
 }
@@ -773,8 +778,11 @@ async fn append_gem_check_entries(
 /// wired but patches drifted/un-applied is not in a correctly-patched state.
 ///
 /// Reuses the same machinery `vex` uses — the qualified-aware rollback resolver
-/// (so release-variant PURLs resolve) honoring `--ecosystems`, then
-/// [`applied_patches`]. An *uninstalled* package (`package_not_found`, also the
+/// (so release-variant PURLs resolve) honoring `--ecosystems`, the committed
+/// vendor ledger ([`crate::commands::vex::load_vendor_context`]: a vendored
+/// patch is judged by its `.socket/vendor/` artifact — the bytes the next
+/// install consumes — never the expectedly-unpatched installed tree), then
+/// [`applied_patches_with_vendor`]. An *uninstalled* package (`package_not_found`, also the
 /// bucket for out-of-scope PURLs absent from the map) cannot be patched yet, and
 /// a degenerate zero-file record (`no_files`) has nothing to hash — neither is
 /// drift, so both are skipped. A missing/empty/unreadable manifest contributes
@@ -795,7 +803,8 @@ async fn append_patch_consistency_entries(
     let package_paths =
         find_manifest_package_paths(&purls, common, common.silent || common.json).await;
 
-    let outcome = applied_patches(&manifest, &package_paths).await;
+    let vendor = crate::commands::vex::load_vendor_context(common, &manifest).await;
+    let outcome = applied_patches_with_vendor(&manifest, &package_paths, vendor.as_ref()).await;
     for failed in &outcome.failed {
         match failed.reason.as_str() {
             // Not installed (or out of scope) / nothing to hash → not drift.
@@ -858,7 +867,13 @@ async fn run_check(args: &SetupArgs) -> i32 {
     for loc in &npm_files {
         let (state, err) = match tokio::fs::read_to_string(&loc.path).await {
             Ok(content) => {
-                if serde_json::from_str::<serde_json::Value>(&content).is_err() {
+                // npm and Node strip a leading UTF-8 BOM when reading
+                // package.json (and `setup` itself tolerates one via
+                // `is_setup_configured_str`); parse the same bytes they would,
+                // or a BOM'd configured file fails `--check` as "Invalid
+                // package.json" while `setup` calls it already_configured.
+                let json = content.strip_prefix('\u{feff}').unwrap_or(&content);
+                if serde_json::from_str::<serde_json::Value>(json).is_err() {
                     (CheckState::Error, Some("Invalid package.json".to_string()))
                 } else if is_setup_configured_str(&content).needs_update {
                     (CheckState::NeedsConfiguration, None)
@@ -973,6 +988,20 @@ async fn run_check(args: &SetupArgs) -> i32 {
                 "{needs} manifest(s) need configuration, {errs} error(s). Run `socket-patch setup` to fix."
             );
         }
+    } else {
+        // `--silent` is "errors only": the status report is muted, but
+        // read/parse failures must still reach stderr. A plain
+        // needs-configuration state is not an error — the exit code alone
+        // carries it.
+        for (_, path, state, err) in &entries {
+            if *state == CheckState::Error {
+                eprintln!(
+                    "Error: {}: {}",
+                    pathdiff(path, &args.common.cwd),
+                    err.as_deref().unwrap_or("unknown error")
+                );
+            }
+        }
     }
 
     if all_ok {
@@ -1077,6 +1106,10 @@ async fn run_remove(args: &SetupArgs) -> i32 {
                 println!("No socket-patch install hooks found to remove.");
             }
         }
+        eprint_errors_when_silent(
+            common,
+            &remove_error_messages(&npm_preview, &py_preview, &extra_preview),
+        );
         return if preview_errs > 0 { 1 } else { 0 };
     }
 
@@ -1088,6 +1121,10 @@ async fn run_remove(args: &SetupArgs) -> i32 {
             println!("\nSummary:");
             println!("  {n_remove} item(s) would have socket-patch removed");
         }
+        eprint_errors_when_silent(
+            common,
+            &remove_error_messages(&npm_preview, &py_preview, &extra_preview),
+        );
         return if preview_errs > 0 { 1 } else { 0 };
     }
 
@@ -1168,6 +1205,11 @@ async fn run_remove(args: &SetupArgs) -> i32 {
         }
     }
 
+    eprint_errors_when_silent(
+        common,
+        &remove_error_messages(&npm_results, &py_results, &extra_results),
+    );
+
     if errs > 0 {
         1
     } else {
@@ -1186,6 +1228,64 @@ fn outcome_error_messages(o: &SetupOutcome) -> Vec<String> {
         .filter(|f| f.get("status").and_then(|s| s.as_str()) == Some("error"))
         .filter_map(|f| f.get("error").and_then(|e| e.as_str()).map(str::to_string))
         .collect()
+}
+
+/// `--silent` is "errors only" (CLI_CONTRACT.md): the previews, summaries,
+/// and status report that normally carry per-item failures are muted, so
+/// before an error exit the failures themselves must still reach stderr —
+/// mirroring `remove`/`scan`, whose error paths keep their stderr output.
+/// JSON mode is exempt: its envelope already carries the errors.
+fn eprint_errors_when_silent(common: &GlobalArgs, errs: &[String]) {
+    if !common.silent || common.json {
+        return;
+    }
+    for e in errs {
+        eprintln!("Error: {e}");
+    }
+}
+
+/// Per-item error messages across the three remove result families (npm +
+/// Python + gem/composer) — the preview "Errors:" section and the
+/// silent-mode stderr reporting share this.
+fn remove_error_messages(
+    npm: &[RemoveResult],
+    py: &[PthEditResult],
+    extra: &SetupOutcome,
+) -> Vec<String> {
+    let mut errs: Vec<String> = npm
+        .iter()
+        .filter(|r| r.status == RemoveStatus::Error)
+        .filter_map(|r| r.error.clone())
+        .chain(
+            py.iter()
+                .filter(|r| r.status == PthStatus::Error)
+                .filter_map(|r| r.error.clone()),
+        )
+        .collect();
+    errs.extend(outcome_error_messages(extra));
+    errs
+}
+
+/// Per-item error messages across the three setup result families (npm +
+/// Python + gem/composer) — the preview "Errors:" section and the
+/// silent-mode stderr reporting share this.
+fn setup_error_messages(
+    npm: &[UpdateResult],
+    py: &[PthEditResult],
+    extra: &SetupOutcome,
+) -> Vec<String> {
+    let mut errs: Vec<String> = npm
+        .iter()
+        .filter(|r| r.status == UpdateStatus::Error)
+        .filter_map(|r| r.error.clone())
+        .chain(
+            py.iter()
+                .filter(|r| r.status == PthStatus::Error)
+                .filter_map(|r| r.error.clone()),
+        )
+        .collect();
+    errs.extend(outcome_error_messages(extra));
+    errs
 }
 
 fn print_remove_preview(
@@ -1234,17 +1334,7 @@ fn print_remove_preview(
 
     // Surface failures so the "(see errors above)" line `run_remove` prints when
     // nothing could be removed actually points at something.
-    let mut errs: Vec<String> = npm
-        .iter()
-        .filter(|r| r.status == RemoveStatus::Error)
-        .filter_map(|r| r.error.clone())
-        .chain(
-            py.iter()
-                .filter(|r| r.status == PthStatus::Error)
-                .filter_map(|r| r.error.clone()),
-        )
-        .collect();
-    errs.extend(outcome_error_messages(extra));
+    let errs = remove_error_messages(npm, py, extra);
     if !errs.is_empty() {
         println!("Errors:");
         for e in &errs {
@@ -1444,6 +1534,10 @@ async fn run_setup(args: &SetupArgs) -> i32 {
                 println!("All install hooks are already configured with socket-patch!");
             }
         }
+        eprint_errors_when_silent(
+            common,
+            &setup_error_messages(&npm_preview, &py_preview, &extra_preview),
+        );
         return if preview_errors > 0 { 1 } else { 0 };
     }
 
@@ -1462,6 +1556,10 @@ async fn run_setup(args: &SetupArgs) -> i32 {
             println!("\nSummary (dry run):");
             println!("  {n_changes} item(s) would be updated");
         }
+        eprint_errors_when_silent(
+            common,
+            &setup_error_messages(&npm_preview, &py_preview, &extra_preview),
+        );
         return if preview_errors > 0 { 1 } else { 0 };
     }
 
@@ -1556,6 +1654,11 @@ async fn run_setup(args: &SetupArgs) -> i32 {
         }
     }
 
+    eprint_errors_when_silent(
+        common,
+        &setup_error_messages(&npm_results, &py_results, &extra_results),
+    );
+
     if errors > 0 {
         1
     } else {
@@ -1613,17 +1716,7 @@ fn print_setup_preview(
         );
     }
 
-    let mut errs: Vec<String> = npm
-        .iter()
-        .filter(|r| r.status == UpdateStatus::Error)
-        .filter_map(|r| r.error.clone())
-        .chain(
-            py.iter()
-                .filter(|r| r.status == PthStatus::Error)
-                .filter_map(|r| r.error.clone()),
-        )
-        .collect();
-    errs.extend(outcome_error_messages(extra));
+    let errs = setup_error_messages(npm, py, extra);
     if !errs.is_empty() {
         println!("\nErrors:");
         for e in &errs {

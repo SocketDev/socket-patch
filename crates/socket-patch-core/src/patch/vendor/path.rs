@@ -33,7 +33,7 @@ use std::path::{Path, PathBuf};
 
 use crate::crawlers::Ecosystem;
 use crate::patch::path_safety::{is_canonical_uuid, is_safe_multi_segment, is_safe_single_segment};
-use crate::utils::fs::{entry_is_dir, list_dir_entries};
+use crate::utils::fs::list_dir_entries;
 
 /// Project-relative root of all vendored artifacts.
 pub(crate) const VENDOR_DIR: &str = ".socket/vendor";
@@ -286,7 +286,10 @@ pub async fn sweep_vendor_dirs(project_root: &Path) -> Vec<SweptVendorDir> {
                 continue;
             }
             let dir = entry.path();
-            if !entry_is_dir(&entry).await {
+            // Symlink-strict (lstat, not stat): vendor staging never writes
+            // symlinks, so a symlinked uuid dir cannot be ours — sweeping it
+            // would read (and let callers delete through) its target.
+            if !entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
                 continue;
             }
             let purls = collect_leaf_purls(eco, &dir).await;
@@ -321,8 +324,11 @@ async fn collect_leaf_purls(eco: &str, uuid_dir: &Path) -> Vec<String> {
             }
             // Keep descending through structural levels (go module path
             // segments, composer vendor dirs, npm @scope dirs) up to a sane
-            // depth bound.
-            if entry_is_dir(&entry).await && leaf.matches('/').count() < 8 {
+            // depth bound. Symlink-strict like the go-patches walker: a
+            // symlink in a committed unit is never ours and must not pull
+            // out-of-tree paths into the walk.
+            let is_real_dir = entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false);
+            if is_real_dir && leaf.matches('/').count() < 8 {
                 stack.push((entry.path(), leaf));
             }
         }
@@ -565,5 +571,52 @@ mod tests {
             vec!["pkg:golang/github.com/foo/bar@v1.4.2".to_string()]
         );
         assert_eq!(go.uuid, UUID);
+    }
+
+    /// SECURITY: the vendor tree is committed and tamper-able, and vendor
+    /// staging never writes symlinks — so a symlink anywhere under
+    /// `.socket/vendor/` cannot be ours. The sweep must be symlink-strict
+    /// (like the go-patches walker it mirrors): never descend through a
+    /// symlinked dir inside a unit, and never sweep a symlinked uuid dir —
+    /// otherwise a committed `link -> /` makes the sweep read arbitrary
+    /// out-of-tree paths and attribute purls found there to the unit.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sweep_never_follows_symlinks_out_of_the_vendor_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // An outside tree containing a perfectly parseable npm leaf.
+        let outside = root.join("outside");
+        tokio::fs::create_dir_all(&outside).await.unwrap();
+        tokio::fs::write(outside.join("lodash-4.17.21.tgz"), b"x")
+            .await
+            .unwrap();
+
+        // A real uuid dir whose CONTENTS include a symlink to the outside dir.
+        let unit = root.join(format!(".socket/vendor/npm/{UUID}"));
+        tokio::fs::create_dir_all(&unit).await.unwrap();
+        std::os::unix::fs::symlink(&outside, unit.join("esc")).unwrap();
+
+        // A uuid dir that IS a symlink to the outside dir.
+        tokio::fs::create_dir_all(root.join(".socket/vendor/cargo"))
+            .await
+            .unwrap();
+        std::os::unix::fs::symlink(
+            &outside,
+            root.join(".socket/vendor/cargo/11111111-2222-4333-8444-555555555555"),
+        )
+        .unwrap();
+
+        let swept = sweep_vendor_dirs(root).await;
+        assert!(
+            !swept.iter().any(|s| s.eco == "cargo"),
+            "symlinked uuid dir must not be swept as a unit: {swept:?}"
+        );
+        let npm = swept.iter().find(|s| s.eco == "npm").unwrap();
+        assert!(
+            npm.purls.is_empty(),
+            "purls must never be reconstructed through a symlink: {:?}",
+            npm.purls
+        );
     }
 }

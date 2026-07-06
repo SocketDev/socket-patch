@@ -442,6 +442,32 @@ fn apply_breaks_hardlinks_on_multi_file_patch() {
     }
 }
 
+/// Hermeticity RED guard: the binary binds a wide env surface via clap
+/// `env =` fallbacks (`SOCKET_DRY_RUN`, `SOCKET_CWD`,
+/// `SOCKET_MANIFEST_PATH`, `SOCKET_GLOBAL`, …), so an ambient value in
+/// the developer's or CI's shell silently reconfigures every `apply`
+/// this suite runs. `common::run` must scrub the `SOCKET_*` prefix;
+/// bake the hostile value in with `set_var` so the suite fails
+/// deterministically if the scrub regresses. `SOCKET_DRY_RUN=true` is
+/// the sharpest probe: apply exits 0 with a success-shaped envelope
+/// while writing nothing, so every CoW content assertion in this file
+/// would chase a no-op.
+#[test]
+fn run_scrubs_ambient_socket_env() {
+    std::env::set_var("SOCKET_DRY_RUN", "true");
+    let fx = Fixture::new();
+    std::fs::write(fx.index_js(), ORIGINAL_BYTES).unwrap();
+    fx.stage_patch();
+
+    let env = apply_json_ok(fx.root());
+    assert_applied(&env, TEST_PURL, &["package/index.js"]);
+    assert_eq!(
+        git_sha256_file(&fx.index_js()),
+        git_sha256(PATCHED_BYTES),
+        "apply ran as a dry-run no-op — ambient SOCKET_DRY_RUN leaked through common::run"
+    );
+}
+
 /// Regular files (no hardlink, no symlink) are the common case.
 /// CoW must be a no-op fast path: no stage litter in the parent
 /// directory, no extra inodes created, the file is rewritten in

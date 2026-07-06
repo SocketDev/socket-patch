@@ -2,7 +2,7 @@ use std::path::Path;
 use tokio::fs;
 
 use super::detect::{remove_package_json_content, update_package_json_content, PackageManager};
-use crate::utils::fs::atomic_write_bytes;
+use crate::utils::fs::atomic_write_bytes_preserving_mode;
 
 /// Result of updating a single package.json.
 #[derive(Debug, Clone)]
@@ -47,7 +47,9 @@ pub async fn update_package_json(
     match update_package_json_content(&content, pm) {
         Ok((modified, new_content, old_pi, new_pi, _, _)) => {
             if modified && !dry_run {
-                if let Err(e) = atomic_write_bytes(package_json_path, new_content.as_bytes()).await
+                if let Err(e) =
+                    atomic_write_bytes_preserving_mode(package_json_path, new_content.as_bytes())
+                        .await
                 {
                     return UpdateResult {
                         path: path_str,
@@ -129,7 +131,9 @@ pub async fn remove_package_json(package_json_path: &Path, dry_run: bool) -> Rem
     match remove_package_json_content(&content) {
         Ok((modified, new_content, status)) => {
             if modified && !dry_run {
-                if let Err(e) = atomic_write_bytes(package_json_path, new_content.as_bytes()).await
+                if let Err(e) =
+                    atomic_write_bytes_preserving_mode(package_json_path, new_content.as_bytes())
+                        .await
                 {
                     return RemoveResult {
                         path: path_str,
@@ -501,6 +505,59 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert_eq!(parsed["scripts"]["build"], "tsc");
         assert!(!content.contains("socket-patch"));
+    }
+
+    /// The stage+rename write swaps in a fresh inode, so unless the writer
+    /// re-applies the destination's permission bits, an edit resets the
+    /// user's package.json mode to umask defaults (typically 0644): a 0600
+    /// user-private manifest silently becomes world-readable, and a 0664
+    /// group-writable one locks the group out. npm's own write-file-atomic
+    /// preserves mode on package.json edits; so must we. (The 0744 file
+    /// makes this red under any umask — a 0666-based create can never
+    /// produce an exec bit.)
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_update_preserves_file_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        for mode in [0o600u32, 0o744] {
+            let pkg = dir.path().join(format!("pkg-{mode:o}.json"));
+            fs::write(&pkg, r#"{"name":"x","scripts":{"build":"tsc"}}"#)
+                .await
+                .unwrap();
+            std::fs::set_permissions(&pkg, std::fs::Permissions::from_mode(mode)).unwrap();
+
+            let result = update_package_json(&pkg, false, PackageManager::Npm).await;
+            assert_eq!(result.status, UpdateStatus::Updated, "mode {mode:o}");
+            let got = std::fs::metadata(&pkg).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                got, mode,
+                "update must preserve the package.json mode, got {got:o} for {mode:o}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_remove_preserves_file_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        for mode in [0o600u32, 0o744] {
+            let pkg = dir.path().join(format!("pkg-{mode:o}.json"));
+            fs::write(&pkg, r#"{"name":"x","scripts":{"build":"tsc"}}"#)
+                .await
+                .unwrap();
+            update_package_json(&pkg, false, PackageManager::Npm).await;
+            std::fs::set_permissions(&pkg, std::fs::Permissions::from_mode(mode)).unwrap();
+
+            let result = remove_package_json(&pkg, false).await;
+            assert_eq!(result.status, RemoveStatus::Removed, "mode {mode:o}");
+            let got = std::fs::metadata(&pkg).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                got, mode,
+                "remove must preserve the package.json mode, got {got:o} for {mode:o}"
+            );
+        }
     }
 
     /// A dry-run must never create a stage file either — it does no I/O at all.

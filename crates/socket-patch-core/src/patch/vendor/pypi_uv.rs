@@ -19,7 +19,7 @@ use std::path::Path;
 use toml_edit::{DocumentMut, Item, Table, Value};
 
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
-use crate::utils::fs::atomic_write_bytes;
+use crate::utils::fs::atomic_write_bytes_preserving_mode;
 
 use super::common::{item_get, pep508_name, pep621_declared_names, record};
 use super::state::{UvMeta, VendorEntry, WiringAction, WiringRecord};
@@ -368,7 +368,22 @@ pub(super) async fn wire_uv(
     wheel_sha256_hex: &str,
     record_uuid: &str,
 ) -> Result<(Vec<WiringRecord>, UvMeta), (&'static str, String)> {
-    check_target_guards(p, canon_name, record_uuid)?;
+    match check_target_guards(p, canon_name, record_uuid)? {
+        // Defensive: the orchestrator short-circuits in-sync pre-flight and
+        // never calls wire on it (we must never re-record our own edit as an
+        // "original", and a re-run requires-dist rewrite would append a
+        // duplicate `path` key — unparseable TOML).
+        UvTarget::InSync => {
+            return Err((
+                "pypi_uv_source_already_exists",
+                format!(
+                    "pyproject.toml already wires {canon_name} to this patch's vendored wheel; \
+                     nothing to wire"
+                ),
+            ))
+        }
+        UvTarget::Fresh => {}
+    }
     let class = classify_dependency(p, canon_name);
     let mut wiring: Vec<WiringRecord> = Vec::new();
 
@@ -516,8 +531,11 @@ pub(super) async fn wire_uv(
     }
 
     // ── commit: pyproject first, then the lock; unwind on lock failure ────
+    // Mode-preserving: both are user-owned files we merely edit, so the
+    // swapped-in inode must keep its permission bits rather than reset them
+    // to umask defaults (same class as the poetry/pdm/pipenv writers).
     let pyproject_path = root.join("pyproject.toml");
-    atomic_write_bytes(&pyproject_path, new_pyproject.as_bytes())
+    atomic_write_bytes_preserving_mode(&pyproject_path, new_pyproject.as_bytes())
         .await
         .map_err(|e| {
             (
@@ -525,11 +543,14 @@ pub(super) async fn wire_uv(
                 format!("cannot write pyproject.toml: {e}"),
             )
         })?;
-    if let Err(e) = atomic_write_bytes(&root.join("uv.lock"), new_lock.as_bytes()).await {
+    if let Err(e) =
+        atomic_write_bytes_preserving_mode(&root.join("uv.lock"), new_lock.as_bytes()).await
+    {
         // Unwind so a sources-bearing pyproject is never paired with the old
         // registry lock (that combo makes `uv lock --check` fail and plain
         // `uv sync` rewrite the lock under the user).
-        let _ = atomic_write_bytes(&pyproject_path, p.pyproject_text.as_bytes()).await;
+        let _ =
+            atomic_write_bytes_preserving_mode(&pyproject_path, p.pyproject_text.as_bytes()).await;
         return Err((
             "pypi_uv_write_failed",
             format!("cannot write uv.lock: {e}; pyproject.toml was restored"),
@@ -662,14 +683,17 @@ pub(super) async fn revert_uv(entry: &VendorEntry, root: &Path, dry_run: bool) -
 
     if !dry_run {
         // Reverse of the wire order: the lock first, then the pyproject.
-        if let Err(e) = atomic_write_bytes(&lock_path, lock_text.as_bytes()).await {
+        if let Err(e) = atomic_write_bytes_preserving_mode(&lock_path, lock_text.as_bytes()).await
+        {
             return RevertOutcome {
                 success: false,
                 warnings,
                 error: Some(format!("cannot write uv.lock: {e}")),
             };
         }
-        if let Err(e) = atomic_write_bytes(&pyproject_path, pyproject_text.as_bytes()).await {
+        if let Err(e) =
+            atomic_write_bytes_preserving_mode(&pyproject_path, pyproject_text.as_bytes()).await
+        {
             return RevertOutcome {
                 success: false,
                 warnings,
@@ -1506,6 +1530,16 @@ wheels = [
     #[tokio::test]
     async fn lock_write_failure_unwinds_pyproject() {
         let tmp = write_pair(DIRECT_REGISTRY_PYPROJECT, DIRECT_REGISTRY_LOCK).await;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            tokio::fs::set_permissions(
+                tmp.path().join("pyproject.toml"),
+                std::fs::Permissions::from_mode(0o600),
+            )
+            .await
+            .unwrap();
+        }
         let p = load_uv_project(tmp.path()).await.unwrap();
         // Make the lock unwritable: a directory can't be renamed over.
         tokio::fs::remove_file(tmp.path().join("uv.lock"))
@@ -1535,6 +1569,17 @@ wheels = [
             pyproject, DIRECT_REGISTRY_PYPROJECT,
             "pyproject must be unwound"
         );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = tokio::fs::metadata(tmp.path().join("pyproject.toml"))
+                .await
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "the unwind write reset the mode");
+        }
     }
 
     #[tokio::test]
@@ -1596,6 +1641,94 @@ wheels = [
             lock, TRANSITIVE_REGISTRY_LOCK,
             "[manifest] removed when created by vendor"
         );
+    }
+
+    /// wire_uv must refuse an in-sync pair (defensive parity with the
+    /// poetry/pdm/pipenv backends): re-wiring would append a SECOND `path`
+    /// key to the requires-dist entry (duplicate-key TOML — the lock stops
+    /// parsing) and re-record our own vendored fragments as pre-vendor
+    /// "originals", so a later revert would restore the vendored state.
+    #[tokio::test]
+    async fn wire_refuses_in_sync_pair_instead_of_corrupting_it() {
+        let tmp = write_pair(DIRECT_PATH_PYPROJECT, DIRECT_PATH_LOCK).await;
+        let p = load_uv_project(tmp.path()).await.unwrap();
+        assert_eq!(
+            check_target_guards(&p, "six", UUID),
+            Ok(UvTarget::InSync),
+            "precondition: the pair is in sync at this uuid"
+        );
+
+        let err = wire_uv(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UUID,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, "pypi_uv_source_already_exists");
+        let (pyproject, lock) = read_pair(tmp.path()).await;
+        assert_eq!(pyproject, DIRECT_PATH_PYPROJECT, "pair must be untouched");
+        assert_eq!(lock, DIRECT_PATH_LOCK, "pair must be untouched");
+    }
+
+    /// Wire and revert edit user-owned files in place — the swapped-in inode
+    /// must keep the destination's permission bits rather than reset them to
+    /// umask defaults (same class as the poetry/pdm/pipenv writers).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wire_and_revert_preserve_file_modes() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = write_pair(DIRECT_REGISTRY_PYPROJECT, DIRECT_REGISTRY_LOCK).await;
+        for f in ["pyproject.toml", "uv.lock"] {
+            tokio::fs::set_permissions(
+                tmp.path().join(f),
+                std::fs::Permissions::from_mode(0o600),
+            )
+            .await
+            .unwrap();
+        }
+        let mode_of = |f: &str| {
+            let path = tmp.path().join(f);
+            async move {
+                tokio::fs::metadata(path)
+                    .await
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777
+            }
+        };
+
+        let p = load_uv_project(tmp.path()).await.unwrap();
+        let (wiring, meta) = wire_uv(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f",
+        )
+        .await
+        .unwrap();
+        assert_eq!(mode_of("pyproject.toml").await, 0o600, "wire reset the mode");
+        assert_eq!(mode_of("uv.lock").await, 0o600, "wire reset the mode");
+
+        let entry = entry_for(wiring, meta);
+        let outcome = revert_uv(&entry, tmp.path(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert_eq!(
+            mode_of("pyproject.toml").await,
+            0o600,
+            "revert reset the mode"
+        );
+        assert_eq!(mode_of("uv.lock").await, 0o600, "revert reset the mode");
     }
 
     #[tokio::test]

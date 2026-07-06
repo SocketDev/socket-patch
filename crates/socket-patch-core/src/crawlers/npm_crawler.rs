@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -33,7 +33,11 @@ struct PackageJsonPartial {
 /// Read and parse a `package.json` file, returning `(name, version)` if valid.
 pub async fn read_package_json(pkg_json_path: &Path) -> Option<(String, String)> {
     let content = tokio::fs::read_to_string(pkg_json_path).await.ok()?;
-    let pkg: PackageJsonPartial = serde_json::from_str(&content).ok()?;
+    // npm and Node both tolerate a leading UTF-8 BOM in package.json
+    // (Windows-authored packages ship them), but serde_json rejects it —
+    // a BOM'd install would be invisible to scan and unpatchable.
+    let pkg: PackageJsonPartial =
+        serde_json::from_str(crate::package_json::detect::strip_bom(&content)).ok()?;
     let name = pkg.name?;
     let version = pkg.version?;
     if name.is_empty() || version.is_empty() {
@@ -326,6 +330,19 @@ impl NpmCrawler {
         // so it looks results back up under the PURL it handed in. Keying by a
         // reconstructed/stripped PURL silently loses every qualified PURL
         // (e.g. `pkg:npm/foo@1.0.0?vcs_url=...`).
+        struct Target {
+            namespace: Option<String>,
+            name: String,
+            version: String,
+            purl: String,
+            /// Install dir relative to a `node_modules` root
+            /// (`@scope/name` or `name`) — which is also exactly what the
+            /// package.json `name` field must say for this dir to BE that
+            /// package.
+            dir_key: String,
+        }
+
+        let mut pending: Vec<Target> = Vec::new();
         for purl in purls {
             let Some((namespace, name, version)) = Self::parse_purl_components(purl) else {
                 continue;
@@ -349,26 +366,110 @@ impl NpmCrawler {
                 Some(ns) => format!("{ns}/{name}"),
                 None => name.clone(),
             };
-            let pkg_path = node_modules_path.join(dir_key);
-            let pkg_json_path = pkg_path.join("package.json");
+            pending.push(Target {
+                namespace,
+                name,
+                version,
+                purl: purl.clone(),
+                dir_key,
+            });
+        }
 
-            if let Some((_, found_version)) = read_package_json(&pkg_json_path).await {
-                if found_version == version {
-                    result.insert(
-                        purl.clone(),
-                        CrawledPackage {
-                            name,
-                            version: found_version,
-                            namespace,
-                            purl: purl.clone(),
-                            path: pkg_path,
-                        },
-                    );
+        // Probe trees breadth-first: the root `node_modules` first (so a
+        // root-level install always wins), then — only while targets remain
+        // unresolved — each nested `node_modules`. npm nests a conflicting
+        // version under the dependent package, so a patched version can
+        // exist *only* nested; CLI_CONTRACT ("Deeply nested transitive
+        // dependencies are fully supported") promises those are patched
+        // identically to direct deps, and `crawl_all` (scan) already
+        // discovers them at unbounded depth.
+        let mut queue: VecDeque<PathBuf> = VecDeque::from([node_modules_path.to_path_buf()]);
+        while let Some(nm_path) = queue.pop_front() {
+            if pending.is_empty() {
+                break;
+            }
+            let mut unresolved = Vec::with_capacity(pending.len());
+            for target in pending {
+                let pkg_path = nm_path.join(&target.dir_key);
+                let pkg_json_path = pkg_path.join("package.json");
+
+                match read_package_json(&pkg_json_path).await {
+                    // The on-disk *name* must match too: an alias install
+                    // (`npm i foo@npm:bar@1.0.0`) puts a different package
+                    // in `node_modules/foo`, so matching on version alone
+                    // would misidentify it and patch the wrong package's
+                    // files.
+                    Some((found_name, found_version))
+                        if found_name == target.dir_key && found_version == target.version =>
+                    {
+                        result.insert(
+                            target.purl.clone(),
+                            CrawledPackage {
+                                name: target.name,
+                                version: found_version,
+                                namespace: target.namespace,
+                                purl: target.purl,
+                                path: pkg_path,
+                            },
+                        );
+                    }
+                    _ => unresolved.push(target),
                 }
+            }
+            pending = unresolved;
+            if !pending.is_empty() {
+                Self::collect_nested_node_modules(&nm_path, &mut queue).await;
             }
         }
 
         Ok(result)
+    }
+
+    /// Append the `node_modules` dirs living one level below `nm_path`
+    /// (inside each of its package dirs, scoped or not) to `queue`.
+    /// Mirrors `scan_node_modules`' traversal policy: hidden entries are
+    /// skipped and symlinked packages are never traversed — a symlink here
+    /// points into pnpm's content-addressed store or an `npm link` target
+    /// outside the project.
+    async fn collect_nested_node_modules(nm_path: &Path, queue: &mut VecDeque<PathBuf>) {
+        for entry in crate::utils::fs::list_dir_entries(nm_path).await {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.starts_with('.') || name_str == "node_modules" {
+                continue;
+            }
+            let Some(file_type) = crate::utils::fs::entry_file_type(&entry).await else {
+                continue;
+            };
+            if !file_type.is_dir() {
+                continue;
+            }
+            let entry_path = nm_path.join(&name);
+
+            if name_str.starts_with('@') {
+                for scoped in crate::utils::fs::list_dir_entries(&entry_path).await {
+                    let scoped_name = scoped.file_name();
+                    if scoped_name.to_string_lossy().starts_with('.') {
+                        continue;
+                    }
+                    let Some(scoped_type) = crate::utils::fs::entry_file_type(&scoped).await else {
+                        continue;
+                    };
+                    if !scoped_type.is_dir() {
+                        continue;
+                    }
+                    let nested = entry_path.join(&scoped_name).join("node_modules");
+                    if is_dir(&nested).await {
+                        queue.push_back(nested);
+                    }
+                }
+            } else {
+                let nested = entry_path.join("node_modules");
+                if is_dir(&nested).await {
+                    queue.push_back(nested);
+                }
+            }
+        }
     }
 
     // ------------------------------------------------------------------

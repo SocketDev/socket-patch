@@ -56,6 +56,17 @@ pub async fn run(args: RepairArgs) -> i32 {
         return 2;
     }
 
+    // Resolve telemetry credentials through the API client the way
+    // apply/rollback/remove do: passing the raw `--api-token`/`--org` flag
+    // values meant env-provided SOCKET_API_TOKEN/SOCKET_ORG_SLUG (the
+    // standard configuration) never reached telemetry, which then fell
+    // back to the anonymous public-proxy endpoint instead of the
+    // org-scoped one.
+    let (telemetry_client, _) =
+        get_api_client_with_overrides(args.common.api_client_overrides()).await;
+    let api_token = telemetry_client.api_token().cloned();
+    let org_slug = telemetry_client.org_slug().cloned();
+
     let manifest_path = args.common.resolved_manifest_path();
 
     if tokio::fs::metadata(&manifest_path).await.is_err() {
@@ -151,8 +162,8 @@ pub async fn run(args: RepairArgs) -> i32 {
             if had_failure {
                 track_patch_repair_failed(
                     "One or more artifacts failed to download",
-                    args.common.api_token.as_deref(),
-                    args.common.org.as_deref(),
+                    api_token.as_deref(),
+                    org_slug.as_deref(),
                 )
                 .await;
             } else {
@@ -160,8 +171,8 @@ pub async fn run(args: RepairArgs) -> i32 {
                     counts.downloaded,
                     counts.cleaned,
                     counts.bytes_freed,
-                    args.common.api_token.as_deref(),
-                    args.common.org.as_deref(),
+                    api_token.as_deref(),
+                    org_slug.as_deref(),
                 )
                 .await;
             }
@@ -175,12 +186,7 @@ pub async fn run(args: RepairArgs) -> i32 {
             }
         }
         Err(e) => {
-            track_patch_repair_failed(
-                &e,
-                args.common.api_token.as_deref(),
-                args.common.org.as_deref(),
-            )
-            .await;
+            track_patch_repair_failed(&e, api_token.as_deref(), org_slug.as_deref()).await;
             if args.common.json {
                 let env = error_envelope(Command::Repair, args.common.dry_run, "repair_failed", &e);
                 println!("{}", env.to_pretty_json());
@@ -407,9 +413,20 @@ async fn repair_inner(
                 }
             }
             Err(e) => {
-                if !quiet {
+                // A failed cleanup is error output: `--silent` (suppress
+                // NON-error output) must not mute it, and the JSON envelope
+                // must carry it — a bare `status: success` with no events is
+                // indistinguishable from "nothing to clean". Recorded as an
+                // informational skip (not `Failed`) to preserve the human
+                // path's warn-and-continue contract: status stays success,
+                // exit stays 0.
+                if !args.common.json {
                     eprintln!("Warning: blob cleanup failed: {e}");
                 }
+                env.record(
+                    PatchEvent::artifact(PatchAction::Skipped)
+                        .with_reason("cleanup_failed", format!("blob cleanup failed: {e}")),
+                );
             }
         }
 
@@ -429,9 +446,14 @@ async fn repair_inner(
                     }
                 }
                 Err(e) => {
-                    if !quiet {
+                    // Same contract as the blob-cleanup arm above.
+                    if !args.common.json {
                         eprintln!("Warning: {label} cleanup failed: {e}");
                     }
+                    env.record(PatchEvent::artifact(PatchAction::Skipped).with_reason(
+                        "cleanup_failed",
+                        format!("{label} cleanup failed: {e}"),
+                    ));
                 }
             }
         }

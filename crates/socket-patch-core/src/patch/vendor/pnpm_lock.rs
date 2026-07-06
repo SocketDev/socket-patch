@@ -40,7 +40,7 @@ use serde_json::Value;
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::PatchSources;
 use crate::patch::copy_tree::remove_tree;
-use crate::utils::fs::atomic_write_bytes;
+use crate::utils::fs::atomic_write_bytes_preserving_mode;
 
 use super::common::{already_patched_result, detect_indent, done, refused, serialize_json};
 use super::npm_common::{
@@ -160,6 +160,9 @@ pub async fn vendor_pnpm(
                  package is installed and locked (`pnpm install`) before vendoring"
             ),
         );
+    }
+    if let Err(detail) = check_rewritable_refs(&lines, name, version) {
+        return refused("vendor_lock_entry_unsupported", detail);
     }
 
     // ── 4. Stage → patch → pack (shared flavor-agnostic pipeline) ────────
@@ -473,8 +476,11 @@ pub async fn revert_pnpm(entry: &VendorEntry, project_root: &Path, dry_run: bool
     // Reverse write order: lock first, package.json second.
     if lock_dirty {
         if let Some(lines) = &lock_lines {
-            if let Err(e) =
-                atomic_write_bytes(&project_root.join(PNPM_LOCK), lines.join("\n").as_bytes()).await
+            if let Err(e) = atomic_write_bytes_preserving_mode(
+                &project_root.join(PNPM_LOCK),
+                lines.join("\n").as_bytes(),
+            )
+            .await
             {
                 return RevertOutcome::failed(format!("cannot write {PNPM_LOCK}: {e}"));
             }
@@ -488,7 +494,9 @@ pub async fn revert_pnpm(entry: &VendorEntry, project_root: &Path, dry_run: bool
                     return RevertOutcome::failed(format!("cannot serialize {PACKAGE_JSON}: {e}"))
                 }
             };
-            if let Err(e) = atomic_write_bytes(&project_root.join(PACKAGE_JSON), &bytes).await {
+            if let Err(e) =
+                atomic_write_bytes_preserving_mode(&project_root.join(PACKAGE_JSON), &bytes).await
+            {
                 return RevertOutcome::failed(format!("cannot write {PACKAGE_JSON}: {e}"));
             }
         }
@@ -751,7 +759,9 @@ fn check_lock_override(
 
 /// Pre-flight: does the lock have a packages entry vendoring can target —
 /// the registry `name@version` key, or our own rekeyed `name@file:` key
-/// (the in-sync / stale-uuid re-run)?
+/// (the in-sync / stale-uuid re-run)? The ours-probe binds to THIS
+/// version's leaf — a sibling version's vendored entry is not a target
+/// (see `vendor_value_is_for`).
 fn lock_has_target_package(lines: &[String], name: &str, version: &str) -> bool {
     let Some((start, end)) = section_bounds(lines, "packages") else {
         return false;
@@ -764,13 +774,86 @@ fn lock_has_target_package(lines: &[String], name: &str, version: &str) -> bool 
             return true;
         }
         if let Some(rest) = block.key.strip_prefix(&ours_prefix) {
-            if is_vendor_value(rest) {
+            if vendor_value_is_for(rest, name, version) {
                 return true;
             }
         }
         i = block.end;
     }
     false
+}
+
+/// Pre-flight fail-closed guard against reference forms the surgery does
+/// not rewrite. The five edits move the plain registry forms only — the
+/// `name@version` packages/snapshots keys, bare-`version` importer fields
+/// and snapshot dep refs. The same package instance can also be referenced
+/// through a PEER-SUFFIXED dep path (`name@version(peer@…)`, emitted
+/// whenever the package has peerDependencies) or an ALIASED value
+/// (`npm:name@version` specs record `name@version` as the dep value).
+/// Those spellings would survive the rekey verbatim and dangle — pnpm then
+/// hard-rejects the lock (a snapshot/importer referencing a dep path whose
+/// packages entry no longer exists) — so refuse before anything is staged
+/// or written. The spike has no pnpm-blessed fixtures for either shape;
+/// guessing their rewritten spelling risks worse corruption than refusing.
+fn check_rewritable_refs(lines: &[String], name: &str, version: &str) -> Result<(), String> {
+    let reg_key = format!("{name}@{version}");
+    let key_peer_prefix = format!("{reg_key}(");
+    let val_peer_prefix = format!("{version}(");
+    let refuse = |what: &str, spelling: &str| {
+        Err(format!(
+            "{PNPM_LOCK} references {reg_key} through {what} (`{spelling}`) that the \
+             pair surgery cannot rewrite — vendoring would leave a dangling reference \
+             pnpm rejects; this lock shape is not supported yet"
+        ))
+    };
+    if let Some((start, end)) = section_bounds(lines, "snapshots") {
+        let mut i = start + 1;
+        while let Some(block) = next_block(lines, i, end) {
+            if block.key.starts_with(&key_peer_prefix) {
+                return refuse("a peer-suffixed snapshot key", &block.key);
+            }
+            for line in &lines[block.header + 1..block.end] {
+                let Some((dep, _repr, rest)) = parse_key_line(line, 6) else {
+                    continue;
+                };
+                if rest == reg_key || rest.starts_with(&key_peer_prefix) {
+                    return refuse("an aliased snapshot reference", &rest);
+                }
+                if dep == name && rest.starts_with(&val_peer_prefix) {
+                    return refuse("a peer-suffixed snapshot reference", &rest);
+                }
+            }
+            i = block.end;
+        }
+    }
+    if let Some((start, end)) = section_bounds(lines, "importers") {
+        let mut i = start + 1;
+        while let Some(importer) = next_block(lines, i, end) {
+            let mut k = importer.header + 1;
+            while k < importer.end {
+                let Some((dep, _repr, rest)) = parse_key_line(&lines[k], 6) else {
+                    k += 1;
+                    continue;
+                };
+                if !rest.is_empty() {
+                    k += 1;
+                    continue;
+                }
+                let (_, ver, f) = dep_field_lines(lines, k + 1, importer.end);
+                if let Some((_, v)) = ver {
+                    if v == reg_key || v.starts_with(&key_peer_prefix) {
+                        return refuse("an aliased importer version", &v);
+                    }
+                    if dep == name && v.starts_with(&val_peer_prefix) {
+                        return refuse("a peer-suffixed importer version", &v);
+                    }
+                }
+                k = f;
+            }
+            i = importer.end;
+        }
+    }
+    Ok(())
 }
 
 // ───────────────────────── package.json override ─────────────────────────
@@ -1582,17 +1665,22 @@ async fn commit_pair(
     new_lock: Option<&[u8]>,
 ) -> Result<(), String> {
     if let Some(bytes) = new_pkg {
-        atomic_write_bytes(&project_root.join(PACKAGE_JSON), bytes)
+        atomic_write_bytes_preserving_mode(&project_root.join(PACKAGE_JSON), bytes)
             .await
             .map_err(|e| format!("cannot write {PACKAGE_JSON}: {e}"))?;
     }
     if let Some(bytes) = new_lock {
-        if let Err(e) = atomic_write_bytes(&project_root.join(PNPM_LOCK), bytes).await {
+        if let Err(e) = atomic_write_bytes_preserving_mode(&project_root.join(PNPM_LOCK), bytes).await
+        {
             if new_pkg.is_some() {
                 // Unwind (best effort): a failure here leaves the desync pair
                 // anyway, but the lock write failing usually means the
                 // restore fails identically loudly.
-                let _ = atomic_write_bytes(&project_root.join(PACKAGE_JSON), original_pkg).await;
+                let _ = atomic_write_bytes_preserving_mode(
+                    &project_root.join(PACKAGE_JSON),
+                    original_pkg,
+                )
+                .await;
             }
             return Err(format!(
                 "cannot write {PNPM_LOCK}: {e} ({PACKAGE_JSON} restored to its original bytes)"
@@ -2616,18 +2704,43 @@ snapshots:
     /// must bind to its own version's entries — a name-only "ours" match
     /// would let the second vendor clobber/rekey the first one's blocks
     /// (live-debugged on Flowise: identical duplicated mapping keys).
+    /// 1.2.0 is reachable through a transitive dependent's snapshot ref
+    /// (the Flowise shape) — the P1 `npm:` ALIAS shape now refuses
+    /// fail-closed instead (see
+    /// `aliased_same_version_reference_refuses_fail_closed`; the surgery
+    /// cannot rewrite alias dep paths and used to strand them dangling).
     #[tokio::test]
     async fn multi_version_vendor_does_not_clobber_sibling_entries() {
-        let fx = fixture_with(P1_BEFORE_PKG, P1_BEFORE_LOCK).await;
+        // P1 with the `left-pad-old` alias swapped for a `dep-two`
+        // dependent whose snapshot pulls left-pad@1.2.0 transitively.
+        let pkg = P1_BEFORE_PKG.replace(
+            "\"left-pad-old\": \"npm:left-pad@1.2.0\"",
+            "\"dep-two\": \"1.0.0\"",
+        );
+        assert_ne!(pkg, P1_BEFORE_PKG);
+        let lock = P1_BEFORE_LOCK
+            .replace(
+                "      left-pad-old:\n        specifier: npm:left-pad@1.2.0\n        version: left-pad@1.2.0",
+                "      dep-two:\n        specifier: 1.0.0\n        version: 1.0.0",
+            )
+            .replace(
+                "  left-pad@1.2.0:\n    resolution: {integrity: sha512-OQadpCyF",
+                "  dep-two@1.0.0:\n    resolution: {integrity: sha512-depTwo==}\n\n  left-pad@1.2.0:\n    resolution: {integrity: sha512-OQadpCyF",
+            )
+            .replace(
+                "  left-pad@1.2.0: {}",
+                "  dep-two@1.0.0:\n    dependencies:\n      left-pad: 1.2.0\n\n  left-pad@1.2.0: {}",
+            );
+        assert_ne!(lock, P1_BEFORE_LOCK);
+        let fx = fixture_with(&pkg, &lock).await;
         let (r1, e1, _) = expect_done(fx.vendor(false).await);
-        assert!(r1.success);
+        assert!(r1.success, "{:?}", r1.error);
         assert!(e1.is_some());
         let tgz_13 = fx.rel_tgz();
 
-        // Vendor left-pad@1.2.0 under a DIFFERENT uuid (the `left-pad-old`
-        // npm: alias resolves it in the same lock).
+        // Vendor left-pad@1.2.0 under a DIFFERENT uuid.
         let uuid2 = "22222222-3333-4444-8555-666666666666";
-        let installed2 = fx.root().join("node_modules/left-pad-old");
+        let installed2 = fx.root().join("node_modules/dep-two/node_modules/left-pad");
         tokio::fs::create_dir_all(&installed2).await.unwrap();
         tokio::fs::write(
             installed2.join("package.json"),
@@ -2661,6 +2774,13 @@ snapshots:
         let lock = fx.read(PNPM_LOCK).await;
         let key13 = format!("  left-pad@file:{tgz_13}:");
         let key12 = format!("  left-pad@file:.socket/vendor/npm/{uuid2}/left-pad-1.2.0.tgz:");
+        // dep-two's transitive snapshot ref moved to the bare file form.
+        assert!(
+            lock.contains(&format!(
+                "      left-pad: file:.socket/vendor/npm/{uuid2}/left-pad-1.2.0.tgz"
+            )),
+            "transitive 1.2.0 ref rewritten:\n{lock}"
+        );
         // Both versions' packages + snapshots blocks exist exactly once
         // each (snapshot entries may be inline `key: {}`).
         for (key, label) in [(&key13, "1.3.0"), (&key12, "1.2.0")] {
@@ -2734,6 +2854,240 @@ snapshots:
             !healed.contains("sha512-DRIFT"),
             "drifted integrity healed: {snap_count} refs
 {healed}"
+        );
+    }
+
+    /// The pair are user-owned files the surgery merely edits: vendor and
+    /// revert writes must keep their permission bits (a 0600 private lock
+    /// must not silently become umask-default 0644) — same contract as
+    /// npm_lock's `lock_writes_preserve_file_mode`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pair_writes_preserve_file_modes() {
+        use std::os::unix::fs::PermissionsExt;
+        let fx = fixture_with(P1_BEFORE_PKG, P1_BEFORE_LOCK).await;
+        tokio::fs::set_permissions(
+            fx.root().join(PNPM_LOCK),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .await
+        .unwrap();
+        tokio::fs::set_permissions(
+            fx.root().join(PACKAGE_JSON),
+            std::fs::Permissions::from_mode(0o640),
+        )
+        .await
+        .unwrap();
+        let mode_of = |name: &str| {
+            let path = fx.root().join(name);
+            async move {
+                tokio::fs::metadata(path)
+                    .await
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o7777
+            }
+        };
+
+        let (result, entry, _) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        let entry = entry.unwrap();
+        assert_eq!(mode_of(PNPM_LOCK).await, 0o600, "vendor: lock mode kept");
+        assert_eq!(mode_of(PACKAGE_JSON).await, 0o640, "vendor: pkg mode kept");
+
+        let outcome = revert_pnpm(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert_eq!(mode_of(PNPM_LOCK).await, 0o600, "revert: lock mode kept");
+        assert_eq!(mode_of(PACKAGE_JSON).await, 0o640, "revert: pkg mode kept");
+    }
+
+    /// A lock referencing the target through a PEER-SUFFIXED dep path
+    /// (`left-pad@1.3.0(react@18.2.0)` — what pnpm emits whenever the
+    /// package has peerDependencies): the surgery rewrites only the plain
+    /// registry forms, so proceeding would rekey the `packages:` entry
+    /// while the suffixed snapshot key and importer version keep pointing
+    /// at the now-missing `left-pad@1.3.0` — a lock pnpm hard-rejects.
+    /// Must refuse fail-closed BEFORE anything is staged or written.
+    #[tokio::test]
+    async fn peer_suffixed_target_refuses_fail_closed() {
+        let peer_lock = "lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+importers:
+
+  .:
+    dependencies:
+      left-pad:
+        specifier: 1.3.0
+        version: 1.3.0(react@18.2.0)
+      react:
+        specifier: 18.2.0
+        version: 18.2.0
+
+packages:
+
+  left-pad@1.3.0:
+    resolution: {integrity: sha512-XI5MPzVNApjAyhQzphX8BkmKsKUxD4LdyK24iZeQGinBN9yTQT3bFlCBy/aVx2HrNcqQGsdot8ghrjyrvMCoEA==}
+    peerDependencies:
+      react: '>=16'
+
+  react@18.2.0:
+    resolution: {integrity: sha512-reactreactreactreactreactreactreactreactreactreactreactreactreactreactreactreactreactre==}
+
+snapshots:
+
+  left-pad@1.3.0(react@18.2.0):
+    dependencies:
+      react: 18.2.0
+
+  react@18.2.0: {}
+";
+        let fx = fixture_with(P1_BEFORE_PKG, peer_lock).await;
+        let detail = expect_refused(fx.vendor(false).await, "vendor_lock_entry_unsupported");
+        assert!(detail.contains("left-pad@1.3.0(react@18.2.0)"), "{detail}");
+        assert_eq!(fx.read(PNPM_LOCK).await, peer_lock, "lock untouched");
+        assert_eq!(fx.read(PACKAGE_JSON).await, P1_BEFORE_PKG, "pkg untouched");
+        assert!(
+            !fx.root().join(".socket/vendor").exists(),
+            "refusal stages nothing"
+        );
+    }
+
+    /// A lock referencing the target through an ALIAS at the exact patched
+    /// version (`renamed-pad: npm:left-pad@1.3.0` → `version: left-pad@1.3.0`,
+    /// same for snapshot dep refs): the surgery leaves those spellings
+    /// verbatim, so the rekey would strand them pointing at a
+    /// packages/snapshots entry that no longer exists. Must refuse
+    /// fail-closed, nothing staged or written.
+    #[tokio::test]
+    async fn aliased_same_version_reference_refuses_fail_closed() {
+        // Importer-level alias.
+        let importer_alias_lock = "lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+importers:
+
+  .:
+    dependencies:
+      left-pad:
+        specifier: 1.3.0
+        version: 1.3.0
+      renamed-pad:
+        specifier: npm:left-pad@1.3.0
+        version: left-pad@1.3.0
+
+packages:
+
+  left-pad@1.3.0:
+    resolution: {integrity: sha512-XI5MPzVNApjAyhQzphX8BkmKsKUxD4LdyK24iZeQGinBN9yTQT3bFlCBy/aVx2HrNcqQGsdot8ghrjyrvMCoEA==}
+
+snapshots:
+
+  left-pad@1.3.0: {}
+";
+        let fx = fixture_with(P1_BEFORE_PKG, importer_alias_lock).await;
+        let detail = expect_refused(fx.vendor(false).await, "vendor_lock_entry_unsupported");
+        assert!(detail.contains("left-pad@1.3.0"), "{detail}");
+        assert_eq!(fx.read(PNPM_LOCK).await, importer_alias_lock);
+        assert!(!fx.root().join(".socket/vendor").exists());
+
+        // Snapshot-level alias ref inside a dependent's block.
+        let snapshot_alias_lock = "lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+importers:
+
+  .:
+    dependencies:
+      host:
+        specifier: 1.0.0
+        version: 1.0.0
+      left-pad:
+        specifier: 1.3.0
+        version: 1.3.0
+
+packages:
+
+  host@1.0.0:
+    resolution: {integrity: sha512-hosthosthosthosthosthosthosthosthosthosthosthosthosthosthosthosthosthosthosthosthosthos==}
+
+  left-pad@1.3.0:
+    resolution: {integrity: sha512-XI5MPzVNApjAyhQzphX8BkmKsKUxD4LdyK24iZeQGinBN9yTQT3bFlCBy/aVx2HrNcqQGsdot8ghrjyrvMCoEA==}
+
+snapshots:
+
+  host@1.0.0:
+    dependencies:
+      renamed-pad: left-pad@1.3.0
+
+  left-pad@1.3.0: {}
+";
+        let fx = fixture_with(P1_BEFORE_PKG, snapshot_alias_lock).await;
+        let detail = expect_refused(fx.vendor(false).await, "vendor_lock_entry_unsupported");
+        assert!(detail.contains("left-pad@1.3.0"), "{detail}");
+        assert_eq!(fx.read(PNPM_LOCK).await, snapshot_alias_lock);
+        assert!(!fx.root().join(".socket/vendor").exists());
+    }
+
+    /// A lock whose ONLY same-name entry is a SIBLING version's vendored
+    /// key (`left-pad@file:…/left-pad-1.2.0.tgz` while vendoring 1.3.0)
+    /// has no entry the surgery can target: pre-flight must refuse
+    /// `vendor_lock_entry_not_found` BEFORE staging, not pass a
+    /// version-blind ours-probe and then die mid-surgery with a
+    /// misleading "vanished mid-rewrite" error + an orphaned artifact dir.
+    #[tokio::test]
+    async fn sibling_only_vendored_lock_refuses_entry_not_found() {
+        let uuid2 = "22222222-3333-4444-8555-666666666666";
+        let tgz12 = format!(".socket/vendor/npm/{uuid2}/left-pad-1.2.0.tgz");
+        let pkg = format!(
+            "{{\n  \"name\": \"x\",\n  \"dependencies\": {{\n    \"left-pad\": \"1.2.0\"\n  }},\n  \"pnpm\": {{\n    \"overrides\": {{\n      \"left-pad@1.2.0\": \"file:{tgz12}\"\n    }}\n  }}\n}}\n"
+        );
+        let lock = format!(
+            "lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+overrides:
+  left-pad@1.2.0: file:{tgz12}
+
+importers:
+
+  .:
+    dependencies:
+      left-pad:
+        specifier: file:{tgz12}
+        version: file:{tgz12}
+
+packages:
+
+  left-pad@file:{tgz12}:
+    resolution: {{integrity: sha512-sibling==, tarball: file:{tgz12}}}
+    version: 1.2.0
+
+snapshots:
+
+  left-pad@file:{tgz12}: {{}}
+"
+        );
+        let fx = fixture_with(&pkg, &lock).await;
+        let detail = expect_refused(fx.vendor(false).await, "vendor_lock_entry_not_found");
+        assert!(detail.contains("left-pad@1.3.0"), "{detail}");
+        assert_eq!(fx.read(PNPM_LOCK).await, lock, "lock untouched");
+        assert!(
+            !fx.root().join(format!(".socket/vendor/npm/{UUID}")).exists(),
+            "refusal stages no artifact"
         );
     }
 

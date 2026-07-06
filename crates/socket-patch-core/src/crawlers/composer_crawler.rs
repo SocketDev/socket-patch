@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use super::types::{CrawledPackage, CrawlerOptions};
+use crate::patch::path_safety;
 use crate::utils::fs::{is_dir, is_file};
 use crate::utils::process::{CommandRunner, SystemCommandRunner};
 
@@ -277,6 +278,20 @@ pub(crate) fn normalize_version(version: &str) -> &str {
     version
 }
 
+/// Whether an installed.json package name is safe to join onto the
+/// vendor root. Both `crawl_all` and `find_by_purls` split the recorded
+/// name at `/` and join the pieces onto the vendor directory, and the
+/// resolved directory is later patched in place — so a tampered
+/// installed.json name like `../evil` would otherwise read (and later
+/// write) out of tree. Every `/`-separated segment must be a safe single
+/// segment ([`path_safety::is_safe_multi_segment`]), which also rejects
+/// `.`/`..`, backslashes, colons (a Windows drive-relative `C:evil`
+/// joins as an absolute path), NULs, and empty segments. Fails closed.
+/// Twin of the npm/deno/go/cargo/maven/nuget coordinate gates.
+fn is_safe_composer_name(name: &str) -> bool {
+    path_safety::is_safe_multi_segment(name)
+}
+
 /// Read and parse `vendor/composer/installed.json`.
 ///
 /// Supports both Composer 1 (flat JSON array) and Composer 2
@@ -313,7 +328,7 @@ async fn read_installed_json(vendor_path: &Path) -> Vec<ComposerPackageEntry> {
         .filter_map(|entry| {
             let name = entry.get("name")?.as_str()?;
             let version = entry.get("version")?.as_str()?;
-            if name.is_empty() || version.is_empty() {
+            if name.is_empty() || version.is_empty() || !is_safe_composer_name(name) {
                 return None;
             }
             Some(ComposerPackageEntry {
@@ -867,6 +882,105 @@ mod tests {
         assert_eq!(pkg.path, vendor_dir.join("Foo").join("Bar"));
         assert_eq!(pkg.namespace, Some("foo".to_string()));
         assert_eq!(pkg.name, "bar");
+    }
+
+    #[tokio::test]
+    async fn test_crawl_all_rejects_traversal_name_from_installed_json() {
+        // installed.json is part of the (untrusted) project being scanned.
+        // A tampered name like `../evil` joins onto the vendor root and
+        // resolves to a directory OUTSIDE it; apply would later write patch
+        // content there. The crawler must drop such entries — twin of the
+        // npm/cargo/maven/nuget/deno/go coordinate gates.
+        let dir = tempfile::tempdir().unwrap();
+        let vendor_dir = dir.path().join("vendor");
+
+        let composer_dir = vendor_dir.join("composer");
+        tokio::fs::create_dir_all(&composer_dir).await.unwrap();
+        tokio::fs::write(
+            composer_dir.join("installed.json"),
+            r#"{"packages": [
+                {"name": "monolog/monolog", "version": "3.5.0"},
+                {"name": "../evil", "version": "1.0.0"}
+            ]}"#,
+        )
+        .await
+        .unwrap();
+        tokio::fs::create_dir_all(vendor_dir.join("monolog").join("monolog"))
+            .await
+            .unwrap();
+        // The traversal target exists OUTSIDE the vendor root, so the
+        // on-disk `is_dir` corroboration alone does not stop it.
+        tokio::fs::create_dir_all(dir.path().join("evil"))
+            .await
+            .unwrap();
+        tokio::fs::write(dir.path().join("composer.json"), "{}")
+            .await
+            .unwrap();
+
+        let crawler = ComposerCrawler::new();
+        let options = CrawlerOptions {
+            cwd: dir.path().to_path_buf(),
+            global: false,
+            global_prefix: None,
+        };
+
+        let packages = crawler.crawl_all(&options).await;
+        assert_eq!(
+            packages.len(),
+            1,
+            "traversal entry must be dropped, got: {:?}",
+            packages.iter().map(|p| &p.path).collect::<Vec<_>>()
+        );
+        assert_eq!(packages[0].name, "monolog");
+    }
+
+    #[tokio::test]
+    async fn test_find_by_purls_rejects_traversal_name_from_installed_json() {
+        // Same threat via the lookup path: a manifest purl whose
+        // namespace/name mirror a tampered installed.json entry would
+        // resolve a package directory outside the vendor root and hand it
+        // to apply as a patch target.
+        let dir = tempfile::tempdir().unwrap();
+        let vendor_dir = dir.path().join("vendor");
+
+        let composer_dir = vendor_dir.join("composer");
+        tokio::fs::create_dir_all(&composer_dir).await.unwrap();
+        tokio::fs::write(
+            composer_dir.join("installed.json"),
+            r#"{"packages": [{"name": "../evil", "version": "1.0.0"}]}"#,
+        )
+        .await
+        .unwrap();
+        tokio::fs::create_dir_all(dir.path().join("evil"))
+            .await
+            .unwrap();
+
+        let crawler = ComposerCrawler::new();
+        let purls = vec!["pkg:composer/../evil@1.0.0".to_string()];
+        let result = crawler.find_by_purls(&vendor_dir, &purls).await.unwrap();
+        assert!(
+            result.is_empty(),
+            "traversal name escaped the vendor root: {:?}",
+            result.values().map(|p| &p.path).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_is_safe_composer_name() {
+        // Real composer names (vendor/name, case-preserved, dots/dashes).
+        assert!(is_safe_composer_name("monolog/monolog"));
+        assert!(is_safe_composer_name("Foo/Bar"));
+        assert!(is_safe_composer_name("symfony/polyfill-php80"));
+        assert!(is_safe_composer_name("phpunit/php-code-coverage"));
+        // Traversal, separators, absolute/drive forms, empties.
+        assert!(!is_safe_composer_name("../evil"));
+        assert!(!is_safe_composer_name("evil/.."));
+        assert!(!is_safe_composer_name("./evil"));
+        assert!(!is_safe_composer_name("/abs/path"));
+        assert!(!is_safe_composer_name("a//b"));
+        assert!(!is_safe_composer_name("a\\b/c"));
+        assert!(!is_safe_composer_name("C:evil/x"));
+        assert!(!is_safe_composer_name(""));
     }
 
     #[tokio::test]

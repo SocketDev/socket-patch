@@ -26,7 +26,7 @@ use std::path::Path;
 use toml_edit::{DocumentMut, Item, Value};
 
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
-use crate::utils::fs::atomic_write_bytes;
+use crate::utils::fs::atomic_write_bytes_preserving_mode;
 
 use super::common::{
     item_get, lock_units_named, pep508_name, pep621_declared_names, record,
@@ -363,7 +363,10 @@ pub async fn wire_pdm(
         wheel_sha256_hex,
     )?;
     let new_lock = p.lock_text.replacen(&old_unit, &new_unit, 1);
-    atomic_write_bytes(&root.join(LOCK_FILE), new_lock.as_bytes())
+    // Mode-preserving: the lock is a user-owned file we merely edit, so the
+    // swapped-in inode must keep its permission bits rather than reset them
+    // to umask defaults (same class as the revert leg in common.rs).
+    atomic_write_bytes_preserving_mode(&root.join(LOCK_FILE), new_lock.as_bytes())
         .await
         .map_err(|e| {
             (
@@ -438,6 +441,18 @@ fn rewrite_target_package_unit(
         })?;
     let unit = package_unit_lines(&lock_text[span]);
     let old_unit = unit.join("\n");
+    // The splice is a literal-text replace of this LF-joined fragment; a lock
+    // whose physical lines differ from the logical ones (CRLF endings) would
+    // silently no-op the replace while still recording the wiring — refuse.
+    if !lock_text.contains(&old_unit) {
+        return Err((
+            "pypi_pdm_lock_parse_failed",
+            format!(
+                "the {canon} [[package]] entry does not match {LOCK_FILE} byte-for-byte \
+                 (CRLF line endings?); re-lock with pdm so the lock is LF-normalized"
+            ),
+        ));
+    }
     let mut out =
         replace_files_array(&unit, wheel_file_name, wheel_sha256_hex).ok_or_else(|| {
             // The hash guard already requires hashed files entries; reaching here
@@ -1046,6 +1061,61 @@ distribution = false
             assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
             assert_eq!(read_lock(tmp.path()).await, before, "byte-identical revert");
         }
+    }
+
+    /// The lock file is user-owned: wiring the splice must not reset its
+    /// permission bits (the `package_json/update.rs` mode-reset bug, same
+    /// class — see `atomic_write_bytes_preserving_mode`; the revert leg is
+    /// covered in common.rs).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wire_preserves_lock_file_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = write_project(LOCK_DIRECT_REGISTRY, PYPROJECT_DIRECT).await;
+        let lock_path = tmp.path().join("pdm.lock");
+        let mut perms = std::fs::metadata(&lock_path).unwrap().permissions();
+        perms.set_mode(0o600);
+        std::fs::set_permissions(&lock_path, perms).unwrap();
+
+        let p = load_pdm_project(tmp.path()).await.unwrap();
+        wire_default(&p, tmp.path()).await;
+        assert_eq!(read_lock(tmp.path()).await, LOCK_DIRECT_VENDORED);
+        let mode = std::fs::metadata(&lock_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "wiring must preserve the lock file's permission bits"
+        );
+    }
+
+    /// A CRLF lock (e.g. a `core.autocrlf` checkout) parses fine but its
+    /// physical lines differ from the LF-joined splice fragment, so the
+    /// literal-text replace would match nothing — wiring must refuse
+    /// fail-closed rather than report success with the lock never rewired.
+    #[tokio::test]
+    async fn crlf_lock_refuses_instead_of_silently_not_wiring() {
+        let crlf = LOCK_DIRECT_REGISTRY.replace('\n', "\r\n");
+        let tmp = write_project(&crlf, PYPROJECT_DIRECT).await;
+        let p = load_pdm_project(tmp.path()).await.unwrap();
+        assert_eq!(
+            check_target_guards(&p, "six", "1.16.0", UUID).unwrap(),
+            PdmTarget::Fresh,
+            "the parsed view accepts CRLF; only the splice must refuse"
+        );
+
+        let err = wire_pdm(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UUID,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, "pypi_pdm_lock_parse_failed");
+        assert_eq!(read_lock(tmp.path()).await, crlf, "refusal writes nothing");
     }
 
     #[tokio::test]

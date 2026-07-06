@@ -749,6 +749,35 @@ impl ApiClient {
         }
     }
 
+    /// Build the URL (and an `is_authenticated` flag) for the vendor
+    /// package-reference POST of [`Self::request_vendor_package`].
+    ///
+    /// Authenticated `/v0/orgs/<slug>/patches/package` when a token + org
+    /// slug are configured and we're not pinned to the public proxy —
+    /// mirrors [`Self::binary_url`]'s decision so a bearer is never sent to
+    /// the proxy. Otherwise it targets the proxy's `/patch/package`.
+    /// `vendor_url` (staging / local-dev) overrides the base in every case.
+    ///
+    /// The base mirrors [`Self::binary_url`] too: in public-proxy mode the
+    /// client's own `api_url` IS the proxy, but an authenticated client that
+    /// lacks an org slug must re-derive the proxy base from the environment
+    /// — its `api_url` is the auth host, which has no `/patch/*` routes.
+    fn vendor_package_url(&self, vendor_url: Option<&str>) -> (String, bool) {
+        let use_auth =
+            self.api_token.is_some() && self.org_slug.is_some() && !self.use_public_proxy;
+        let base = match vendor_url {
+            Some(v) => v.trim_end_matches('/').to_string(),
+            None if use_auth || self.use_public_proxy => self.api_url.clone(),
+            None => proxy_url_from_env().trim_end_matches('/').to_string(),
+        };
+        if use_auth {
+            let slug = self.org_slug.as_deref().unwrap();
+            (format!("{base}/v0/orgs/{slug}/patches/package"), true)
+        } else {
+            (format!("{base}/patch/package"), false)
+        }
+    }
+
     /// Step 1 of [`Self::fetch_vendor_package`]: POST the package-reference
     /// endpoint and return the single requested UUID's result.
     async fn request_vendor_package(
@@ -763,20 +792,10 @@ impl ApiClient {
             // the authenticated endpoint defaults to false.
             free_only: free_only.then_some(true),
         };
-        // Authenticated when a token + org slug are configured and we're not
-        // pinned to the public proxy — mirrors `binary_url`'s decision so a
-        // bearer is never sent to the proxy.
-        let use_auth =
-            self.api_token.is_some() && self.org_slug.is_some() && !self.use_public_proxy;
-        let base = vendor_url
-            .unwrap_or(&self.api_url)
-            .trim_end_matches('/')
-            .to_string();
+        let (url, use_auth) = self.vendor_package_url(vendor_url);
+        debug_log(&format!("POST {url}"));
 
         let resp = if use_auth {
-            let slug = self.org_slug.as_deref().unwrap();
-            let url = format!("{base}/v0/orgs/{slug}/patches/package");
-            debug_log(&format!("POST {url}"));
             self.client
                 .post(&url)
                 .header(header::CONTENT_TYPE, "application/json")
@@ -784,8 +803,6 @@ impl ApiClient {
                 .send()
                 .await
         } else {
-            let url = format!("{base}/patch/package");
-            debug_log(&format!("POST {url}"));
             // Plain (no-auth) client: never leak the bearer to the proxy.
             plain_client()
                 .post(&url)
@@ -1100,6 +1117,16 @@ pub async fn get_api_client_with_overrides(overrides: ApiClientEnvOverrides) -> 
     // Auto-resolve org slug if not provided
     let final_org_slug = if resolved_org_slug.is_some() {
         resolved_org_slug
+    } else if matches!(
+        std::env::var("SOCKET_OFFLINE").unwrap_or_default().as_str(),
+        "1" | "true"
+    ) {
+        // Strict airgap: `--offline` (mirrored into `SOCKET_OFFLINE` by the
+        // CLI before any client is built — same vocabulary the telemetry
+        // kill-switch matches) means zero network contact, so the org-slug
+        // auto-resolution round-trip must not fire. The slug only labels
+        // org-scoped fetches and telemetry, both already gated off offline.
+        None
     } else {
         let temp_client = ApiClient::new(ApiClientOptions {
             api_url: api_url.clone(),
@@ -2214,6 +2241,89 @@ mod tests {
         assert_eq!(
             url,
             "https://api.socket.dev/v0/orgs/my-org/patches/diff/uuid-123"
+        );
+    }
+
+    // ── vendor_package_url: package-reference POST target ───────────────
+    //
+    // Regression: an authenticated client *without* an org slug (auto-
+    // resolution failed, or `SOCKET_OFFLINE` skipped it) built the proxy
+    // route on its own `api_url` — `https://api.socket.dev/patch/package` —
+    // a path the auth host does not serve, so every vendor-service fetch
+    // failed with a 404-shaped `Other` error. `binary_url` re-derives the
+    // proxy base from the environment for exactly this client state; the
+    // vendor POST must do the same.
+
+    #[test]
+    fn vendor_package_url_auth_without_org_slug_targets_proxy_host() {
+        let client = ApiClient::new(ApiClientOptions {
+            api_url: "https://api.socket.dev".into(),
+            api_token: Some("sktsec_x_api".into()),
+            use_public_proxy: false,
+            org_slug: None,
+        });
+        let (url, use_auth) = client.vendor_package_url(None);
+        assert!(!use_auth, "no org slug → unauthenticated proxy request");
+        assert!(
+            !url.starts_with("https://api.socket.dev"),
+            "must not target the auth host (it has no /patch/* routes); got: {url}"
+        );
+        assert_eq!(
+            url,
+            format!(
+                "{}/patch/package",
+                proxy_url_from_env().trim_end_matches('/')
+            ),
+            "base must be the env-derived proxy host, like binary_url"
+        );
+    }
+
+    #[test]
+    fn vendor_package_url_proxy_client_uses_configured_api_url() {
+        // A public-proxy client's api_url IS the proxy — an explicit
+        // `--proxy-url` override must be honored, not re-read from env.
+        let client = proxy_client("https://custom.proxy.example");
+        let (url, use_auth) = client.vendor_package_url(None);
+        assert!(!use_auth);
+        assert_eq!(url, "https://custom.proxy.example/patch/package");
+    }
+
+    #[test]
+    fn vendor_package_url_authenticated_uses_org_path() {
+        let client = ApiClient::new(ApiClientOptions {
+            api_url: "https://api.socket.dev".into(),
+            api_token: Some("sktsec_x_api".into()),
+            use_public_proxy: false,
+            org_slug: Some("my-org".into()),
+        });
+        let (url, use_auth) = client.vendor_package_url(None);
+        assert!(use_auth);
+        assert_eq!(url, "https://api.socket.dev/v0/orgs/my-org/patches/package");
+    }
+
+    #[test]
+    fn vendor_package_url_vendor_url_overrides_base() {
+        // The staging override wins for every client state, including the
+        // no-org-slug fallback (it must not be clobbered by the env proxy).
+        let auth = ApiClient::new(ApiClientOptions {
+            api_url: "https://api.socket.dev".into(),
+            api_token: Some("sktsec_x_api".into()),
+            use_public_proxy: false,
+            org_slug: Some("my-org".into()),
+        });
+        assert_eq!(
+            auth.vendor_package_url(Some("http://localhost:9099/")).0,
+            "http://localhost:9099/v0/orgs/my-org/patches/package"
+        );
+        let no_org = ApiClient::new(ApiClientOptions {
+            api_url: "https://api.socket.dev".into(),
+            api_token: Some("sktsec_x_api".into()),
+            use_public_proxy: false,
+            org_slug: None,
+        });
+        assert_eq!(
+            no_org.vendor_package_url(Some("http://localhost:9099")).0,
+            "http://localhost:9099/patch/package"
         );
     }
 

@@ -794,3 +794,84 @@ async fn apply_mismatch_redownloads_full_blob_and_applies() {
     let content = std::fs::read(tmp.path().join("node_modules/mismatch/index.js")).unwrap();
     assert_eq!(content, after);
 }
+
+// ---------------------------------------------------------------------------
+// --offline is a strict airgap: ZERO network requests, including the
+// telemetry-labeling client's org-slug auto-resolution at command start.
+// ---------------------------------------------------------------------------
+
+/// `run()` builds an API client up front purely to label telemetry with the
+/// token/org. When `SOCKET_API_TOKEN` is set but no org is configured, that
+/// client construction auto-resolves the org slug via `GET
+/// /v0/organizations` — a live network round-trip that must not happen under
+/// `--offline` (the same strict-airgap contract that already disables
+/// telemetry and blob fetching). The apply itself is fully satisfiable
+/// offline here (blob staged locally), so the ONLY traffic the mock could
+/// ever see is contract-violating.
+#[tokio::test]
+async fn offline_apply_with_token_makes_zero_network_requests() {
+    let before = b"offline airgap before\n";
+    let after = b"offline airgap after\n";
+    let before_hash = git_sha256(before);
+    let after_hash = git_sha256(after);
+
+    // No mocks mounted: every request is a violation, and all are recorded.
+    let mock = MockServer::start().await;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_root_package_json(tmp.path());
+    write_npm_package(tmp.path(), "airgap-test", "1.0.0", "index.js", before);
+    let socket = tmp.path().join(".socket");
+    write_manifest_with_patch(
+        &socket,
+        "pkg:npm/airgap-test@1.0.0",
+        "33333333-3333-4333-8333-333333333333",
+        &before_hash,
+        &after_hash,
+    );
+    let blobs = socket.join("blobs");
+    std::fs::create_dir_all(&blobs).expect("create blobs");
+    std::fs::write(blobs.join(&after_hash), after).expect("stage blob");
+
+    let mut cmd = Command::new(binary());
+    cmd.args(["apply", "--json", "--offline"])
+        .current_dir(tmp.path());
+    // Scrub ambient SOCKET_* (an ambient SOCKET_ORG_SLUG would skip the
+    // auto-resolution and make this test vacuously green), then seed only
+    // what the scenario needs: token set, org absent, both URLs pinned to
+    // the mock so any traffic — API or proxy path — is captured.
+    for (k, _) in std::env::vars_os() {
+        if k.to_string_lossy().starts_with("SOCKET_") {
+            cmd.env_remove(&k);
+        }
+    }
+    cmd.env("SOCKET_API_URL", mock.uri())
+        .env("SOCKET_PROXY_URL", mock.uri())
+        .env("SOCKET_API_TOKEN", "fake-token-for-test");
+    let out = cmd.output().expect("run socket-patch");
+    let code = out.status.code().unwrap_or(-1);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert_eq!(
+        code, 0,
+        "offline apply with a locally staged blob must succeed; \
+         stdout={stdout}\nstderr={stderr}"
+    );
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("json envelope");
+    assert_eq!(
+        v["summary"]["applied"], 1,
+        "the staged patch must actually apply offline; stdout={stdout}"
+    );
+
+    let requests = mock.received_requests().await.unwrap_or_default();
+    let hits: Vec<String> = requests
+        .iter()
+        .map(|r| format!("{} {}", r.method, r.url.path()))
+        .collect();
+    assert!(
+        hits.is_empty(),
+        "--offline must make ZERO network requests (strict airgap), but the \
+         mock server saw: {hits:?}"
+    );
+}

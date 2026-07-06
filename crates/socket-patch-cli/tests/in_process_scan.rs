@@ -178,6 +178,21 @@ fn req_body(req: &wiremock::Request) -> String {
     String::from_utf8_lossy(&req.body).into_owned()
 }
 
+/// Run `scan` with the ambient `VIRTUAL_ENV` scrubbed first.
+///
+/// `find_local_venv_site_packages` honors `VIRTUAL_ENV` FIRST — an absolute
+/// path unrelated to `cwd` — so running this suite from an activated
+/// virtualenv (or under direnv auto-activation) injected the shell's venv
+/// packages into every scan: 5 of 17 tests went red (extra pypi purls broke
+/// the "no batch POST" / exact-post-count oracles). Same fix as
+/// `in_process_python_envs.rs::scan_scrubbed`. Tests are `#[serial]`, so the
+/// scrub cannot race another test; `scan_ignores_ambient_virtual_env` is the
+/// mutation guard that goes red if this scrub is removed.
+async fn run_scrubbed(args: ScanArgs) -> i32 {
+    std::env::remove_var("VIRTUAL_ENV");
+    run(args).await
+}
+
 // ---------------------------------------------------------------------------
 // Discovery — read-only --json mode
 // ---------------------------------------------------------------------------
@@ -193,7 +208,7 @@ async fn scan_empty_project_json() {
     let mut args = default_args(tmp.path());
     args.common.api_url = server.uri();
 
-    assert_eq!(run(args).await, 0);
+    assert_eq!(run_scrubbed(args).await, 0);
     // An empty project crawls zero packages, so the batch API must never
     // be queried. (Asserting only exit 0 would also pass if the crawler
     // silently found nothing on a *non-empty* project.)
@@ -217,7 +232,7 @@ async fn scan_installed_package_discovers_patch() {
     let mut args = default_args(tmp.path());
     args.common.api_url = server.uri();
 
-    assert_eq!(run(args).await, 0);
+    assert_eq!(run_scrubbed(args).await, 0);
     // The installed package must actually be discovered by the crawler and
     // sent to the batch endpoint. Without this, a regression that crawled
     // nothing would still exit 0 and pass the old test.
@@ -250,7 +265,7 @@ async fn scan_apply_dry_run_does_not_write() {
     args.apply = true;
     args.common.dry_run = true;
 
-    assert_eq!(run(args).await, 0);
+    assert_eq!(run_scrubbed(args).await, 0);
     assert!(
         !tmp.path().join(".socket/manifest.json").exists(),
         "dry-run must not write manifest"
@@ -287,7 +302,7 @@ async fn scan_apply_wet_writes_manifest_and_blob() {
     args.common.api_url = server.uri();
     args.apply = true;
 
-    let code = run(args).await;
+    let code = run_scrubbed(args).await;
     // Apply over our handcrafted node_modules deterministically reports
     // partial_failure (exit 1): the on-disk "package/index.js" doesn't
     // match the fixture's beforeHash, so the patch can't be applied. The
@@ -363,7 +378,7 @@ async fn scan_prune_only_dry_run_reports_orphans() {
     args.prune = true;
     args.common.dry_run = true;
 
-    assert_eq!(run(args).await, 0);
+    assert_eq!(run_scrubbed(args).await, 0);
     // Dry-run preserves the manifest *entirely* unchanged — the stale entry
     // must survive and remain the sole entry (a buggy preview that actually
     // pruned, or that added/dropped entries, must fail here).
@@ -420,7 +435,7 @@ async fn scan_prune_only_wet_removes_orphans() {
     args.common.api_url = server.uri();
     args.prune = true;
 
-    assert_eq!(run(args).await, 0);
+    assert_eq!(run_scrubbed(args).await, 0);
     let body = std::fs::read_to_string(tmp.path().join(".socket/manifest.json")).unwrap();
     let m: serde_json::Value = serde_json::from_str(&body).unwrap();
     let patches = m["patches"].as_object().unwrap();
@@ -458,7 +473,7 @@ async fn scan_sync_full_cycle_against_clean_project() {
     args.common.api_url = server.uri();
     args.sync = true;
 
-    let code = run(args).await;
+    let code = run_scrubbed(args).await;
     // --sync == --apply --prune; apply over the hash-mismatched fixture file
     // deterministically partial-fails (exit 1) just like the apply-wet case.
     assert_eq!(
@@ -504,7 +519,7 @@ async fn scan_small_batch_size_chunks_requests() {
     let mut args = default_args(tmp.path());
     args.common.api_url = server.uri();
     args.batch_size = 1; // force 3 separate API calls
-    assert_eq!(run(args).await, 0);
+    assert_eq!(run_scrubbed(args).await, 0);
     // The whole point of this test: batch_size=1 over 3 discovered packages
     // must produce exactly 3 separate batch requests, each carrying one
     // package. The original test asserted *nothing* about chunking.
@@ -558,7 +573,7 @@ async fn scan_ecosystems_filter_excludes_others() {
     let mut args = default_args(tmp.path());
     args.common.api_url = server.uri();
     args.common.ecosystems = Some(vec!["pypi".to_string()]);
-    assert_eq!(run(args).await, 0);
+    assert_eq!(run_scrubbed(args).await, 0);
     // The npm package must be filtered out by `--ecosystems pypi`. With no
     // surviving packages the batch API is never queried — proving the
     // filter actually excluded the npm package rather than the scan just
@@ -591,7 +606,7 @@ async fn scan_non_json_with_patches_prints_table() {
     args.common.api_url = server.uri();
     args.common.json = false;
 
-    let code = run(args).await;
+    let code = run_scrubbed(args).await;
     // Non-JSON path: discovery → batch query → render table → fetch
     // per-package details. We only mount the batch mock, so detail-fetch
     // 404s and scan exits 1 ("Could not fetch patch details"). That exit is
@@ -625,7 +640,7 @@ async fn scan_non_json_empty_project_friendly_message() {
     args.common.api_url = server.uri();
     args.common.json = false;
 
-    assert_eq!(run(args).await, 0);
+    assert_eq!(run_scrubbed(args).await, 0);
     // No packages crawled → the friendly "No packages found" path → no API
     // call at all.
     let reqs = recorded(&server).await;
@@ -640,18 +655,17 @@ async fn scan_non_json_empty_project_friendly_message() {
 //
 // The original `assert!(code == 0 || code == 1)` here was the headline
 // loophole of this file: a disjoint-outcome assertion that passes whether
-// the scan correctly surfaces the failure OR silently swallows it. scan.rs
-// itself documents the intended behavior (see the `if batch_error_count ==
-// total_batches` block): "surface this as a full scan failure rather than
-// silently reporting zero patches." The implementation only emits a
-// telemetry event there — it does NOT set status="error" or a non-zero exit
-// — so when *every* batch errors, `run` returns 0 and prints
-// status="success" with an empty package list.
+// the scan correctly surfaces the failure OR silently swallows it. The
+// implementation used to only emit a telemetry event when every batch
+// errored — returning 0 and printing status="success" with an empty package
+// list — so the assertions below were first committed RED to encode the
+// documented intent ("surface this as a full scan failure rather than
+// silently reporting zero patches").
 //
-// The assertions below encode the documented intent. They are EXPECTED TO
-// FAIL against the current (buggy) implementation and are left RED on
-// purpose to guard the fix — matching the project's existing convention for
-// this same bug (see memory: scan-all-batches-failed-reports-success).
+// That bug is now FIXED (scan/mod.rs bails with exit 1 when
+// batch_error_count == total_batches, and discover_selected likewise errors
+// when every detail query fails); these tests pass and stay as regression
+// guards for both levels.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -670,7 +684,7 @@ async fn scan_api_500_does_not_panic() {
     let mut args = default_args(tmp.path());
     args.common.api_url = server.uri();
 
-    let code = run(args).await;
+    let code = run_scrubbed(args).await;
 
     // Real path actually executed: the batch endpoint was queried (and 500'd)
     // and no spurious manifest was written.
@@ -685,8 +699,8 @@ async fn scan_api_500_does_not_panic() {
         "a fully-failed scan must not write a manifest"
     );
 
-    // Intended behavior (currently a KNOWN BUG — left RED to guard the fix):
-    // when every batch errors, the scan must NOT report plain success.
+    // Regression guard (bug fixed — see section comment above): when every
+    // batch errors, the scan must NOT report plain success.
     assert_ne!(
         code, 0,
         "scan must report failure (non-zero exit) when ALL API batches fail; \
@@ -703,15 +717,15 @@ async fn scan_unreachable_api_does_not_panic() {
     let mut args = default_args(tmp.path());
     args.common.api_url = "http://127.0.0.1:1".to_string();
 
-    let code = run(args).await;
+    let code = run_scrubbed(args).await;
 
     assert!(
         !tmp.path().join(".socket/manifest.json").exists(),
         "an unreachable-API scan must not write a manifest"
     );
 
-    // Same KNOWN BUG as above (left RED): a connection failure on every
-    // batch must surface as a non-zero exit, not a silent success.
+    // Same regression guard as above: a connection failure on every batch
+    // must surface as a non-zero exit, not a silent success.
     assert_ne!(
         code, 0,
         "scan must report failure when the API is unreachable for every batch"
@@ -744,7 +758,7 @@ async fn scan_apply_all_detail_queries_failed_is_an_error() {
     args.common.api_url = server.uri();
     args.apply = true;
 
-    let code = run(args).await;
+    let code = run_scrubbed(args).await;
 
     assert!(
         !tmp.path().join(".socket/manifest.json").exists(),
@@ -781,7 +795,7 @@ async fn scan_batch_size_zero_does_not_panic() {
 
     // No panic, and the discovered package still reaches the batch endpoint
     // (proving the loop ran rather than being skipped).
-    assert_eq!(run(args).await, 0);
+    assert_eq!(run_scrubbed(args).await, 0);
     let reqs = recorded(&server).await;
     let posts = batch_posts(&reqs);
     assert_eq!(
@@ -856,7 +870,7 @@ async fn scan_prune_with_ecosystem_filter_keeps_other_ecosystem() {
     args.common.ecosystems = Some(vec!["npm".to_string()]);
     args.prune = true;
 
-    assert_eq!(run(args).await, 0);
+    assert_eq!(run_scrubbed(args).await, 0);
 
     let body = std::fs::read_to_string(socket.join("manifest.json")).unwrap();
     let m: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -878,6 +892,56 @@ async fn scan_prune_with_ecosystem_filter_keeps_other_ecosystem() {
         patches.len(),
         2,
         "exactly the orphan should be removed; got {m}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Regression: ambient VIRTUAL_ENV must not leak into the scan.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[serial]
+async fn scan_ignores_ambient_virtual_env() {
+    // Mutation guard for `run_scrubbed`: plants a populated decoy venv in
+    // VIRTUAL_ENV and scans an empty project — no purl may reach the API.
+    // Without the scrub the python crawler honors VIRTUAL_ENV first and
+    // "discovers" the decoy package (proven RED: the batch POST carried
+    // pkg:pypi/decoy-pkg@9.9.9). Tests are #[serial], so the env mutation
+    // cannot race another test.
+    let server = MockServer::start().await;
+    mock_batch_empty(&server).await;
+
+    let decoy = tempfile::tempdir().unwrap();
+    let dist_info = decoy
+        .path()
+        .join("lib/python3.11/site-packages/decoy_pkg-9.9.9.dist-info");
+    std::fs::create_dir_all(&dist_info).unwrap();
+    std::fs::write(
+        dist_info.join("METADATA"),
+        "Metadata-Version: 2.1\nName: decoy-pkg\nVersion: 9.9.9\n",
+    )
+    .unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_root_package_json(tmp.path());
+    let mut args = default_args(tmp.path());
+    args.common.api_url = server.uri();
+
+    std::env::set_var("VIRTUAL_ENV", decoy.path());
+    let code = run_scrubbed(args).await;
+    std::env::remove_var("VIRTUAL_ENV");
+
+    assert_eq!(code, 0);
+    let reqs = recorded(&server).await;
+    assert!(
+        batch_posts(&reqs).is_empty(),
+        "ambient VIRTUAL_ENV must not inject its packages into a scan of an \
+         unrelated project; saw {} batch POST(s): {:?}",
+        batch_posts(&reqs).len(),
+        batch_posts(&reqs)
+            .iter()
+            .map(|p| req_body(p))
+            .collect::<Vec<_>>()
     );
 }
 
@@ -920,7 +984,7 @@ async fn scan_non_json_dry_run_does_not_mutate() {
     args.prune = true;
     args.common.dry_run = true;
 
-    assert_eq!(run(args).await, 0);
+    assert_eq!(run_scrubbed(args).await, 0);
 
     // Manifest is byte-for-byte unchanged: neither the apply nor the prune
     // GC touched it.

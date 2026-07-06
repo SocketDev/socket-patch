@@ -608,7 +608,7 @@ exit 0
 /// `uv tool install` puts a tool at `~/.local/share/uv/tools/<name>/`
 /// with its own venv. The script installs `httpie` (a small CLI tool
 /// available on PyPI), then drives a patch against one of its modules.
-fn uv_tool_script(_api_url: &str, patched_marker: &str) -> String {
+fn uv_tool_script(api_url: &str, patched_marker: &str) -> String {
     // httpie has a top-level package called `httpie`. We patch
     // `httpie/__init__.py`. The PURL in the manifest is fixed up by
     // the wiremock fixture; here we just need to discover it.
@@ -632,7 +632,9 @@ parse_scanned() {{
 #    Measuring the DELTA introduced by `uv tool install` isolates the
 #    uv-tools contribution and can only be satisfied if that layout was
 #    actually walked.
-BASELINE_OUT=$(socket-patch scan --json --global --ecosystems pypi 2>/tmp/baseline.err)
+BASELINE_OUT=$(socket-patch scan --json --global \
+  --api-url '{api_url}' --api-token fake --org {ORG} \
+  --ecosystems pypi 2>/tmp/baseline.err)
 BASELINE_RC=$?
 cat /tmp/baseline.err >&2 || true
 if [ "$BASELINE_RC" -ne 0 ]; then
@@ -667,7 +669,9 @@ echo "Installed httpie at: $INIT_PY" >&2
 #    output reports a `scannedPackages` count but doesn't enumerate by name
 #    (only patched packages are listed), so we compare the count against the
 #    baseline.
-SCAN_OUT=$(socket-patch scan --json --global --ecosystems pypi 2>/tmp/scan.err)
+SCAN_OUT=$(socket-patch scan --json --global \
+  --api-url '{api_url}' --api-token fake --org {ORG} \
+  --ecosystems pypi 2>/tmp/scan.err)
 SCAN_RC=$?
 echo "scan exit=$SCAN_RC" >&2
 cat /tmp/scan.err >&2 || true
@@ -725,6 +729,32 @@ echo "===E2E PASS {patched_marker}==="
 exit 0
 "#
     )
+}
+
+/// Hermeticity guard for the uv-tool variant, runnable without the
+/// docker image. BOTH scans in the generated script (baseline +
+/// post-install) must be pinned to the test's wiremock: without
+/// `--api-url`, `scan --global` falls back to the LIVE public patch
+/// proxy, leaking the container's real installed purls to production
+/// on every run and failing outright (an all-batches-failed scan
+/// exits 1) on any machine where that proxy is unreachable.
+#[test]
+fn uv_tool_script_pins_scans_to_the_mock_api() {
+    let script = uv_tool_script("http://host.docker.internal:12345", "marker");
+    assert_eq!(
+        script
+            .matches("--api-url 'http://host.docker.internal:12345'")
+            .count(),
+        2,
+        "both uv-tool scans (baseline + post-install) must target the \
+         test's wiremock, not the live public proxy:\n{script}"
+    );
+    assert_eq!(
+        script.matches(&format!("--org {ORG}")).count(),
+        2,
+        "both uv-tool scans must send their batch queries to the mocked \
+         org endpoint:\n{script}"
+    );
 }
 
 /// Returns `true` when the test should skip (docker missing, image

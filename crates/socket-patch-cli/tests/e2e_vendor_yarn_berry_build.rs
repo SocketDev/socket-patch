@@ -57,34 +57,37 @@ fn has_corepack_pm(pm: &str) -> bool {
 
 fn corepack(cwd: &Path, pm: &str, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
     let mut cmd = Command::new("corepack");
-    cmd.arg(pm)
-        .args(args)
-        .current_dir(cwd)
-        .env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0");
+    cmd.arg(pm).args(args).current_dir(cwd);
+    // Scrub FIRST (it removes YARN_* / SOCKET_* from the inherited env), then
+    // seed the hermetic flags so they survive (Command: last env call wins).
+    scrub_socket_env(&mut cmd);
+    cmd.env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0");
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
-    scrub_socket_env(&mut cmd);
     cmd.output().expect("failed to run corepack")
 }
 
-/// Remove ambient `SOCKET_*` vars and the yarn cache/global env the harness
-/// controls (so a developer's settings can't leak into the child).
+/// Remove ambient `SOCKET_*` and `YARN_*` vars (so a developer's settings
+/// can't leak into the child).
 fn scrub_socket_env(cmd: &mut Command) {
+    // Seed-then-scrub (mirrors e2e_redirect_yarn_berry_build.rs): yarn berry
+    // lets EVERY `.yarnrc.yml` setting be overridden by a `YARN_*` env var
+    // (env outranks the project yarnrc), so an ambient `YARN_NODE_LINKER=pnp`
+    // was verified to turn this test red — the fixture install builds a PnP
+    // tree and node_modules/left-pad never exists. The explicit env_remove
+    // below clears the seed too, but if the scrub is ever dropped the seed
+    // (rather than a developer's ambient shell, which this suite can't rely
+    // on) turns the test red immediately.
+    cmd.env("YARN_NODE_LINKER", "pnp");
     for (k, _) in std::env::vars_os() {
-        let k = k.to_string_lossy();
-        if k.starts_with("SOCKET_") {
-            cmd.env_remove(k.as_ref());
+        let key = k.to_string_lossy();
+        if key.starts_with("SOCKET_") || key.starts_with("YARN_") {
+            cmd.env_remove(&k);
         }
     }
     cmd.env_remove("VIRTUAL_ENV");
-    for v in [
-        "YARN_CACHE_FOLDER",
-        "YARN_GLOBAL_FOLDER",
-        "YARN_ENABLE_GLOBAL_CACHE",
-    ] {
-        cmd.env_remove(v);
-    }
+    cmd.env_remove("YARN_NODE_LINKER");
 }
 
 fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
@@ -182,6 +185,23 @@ fn yarn_berry_vendor_fresh_checkout_immutable_check_cache_and_revert() {
     // 1. REAL fixture: yarn berry install (network allowed here, private
     //    global cache).
     let global = tmp.path().join("yarn-global");
+    // RED guard (e2e_vendor_bun_build bug class): the seeded YARN_GLOBAL_FOLDER
+    // must actually reach the corepack child — a scrub that runs AFTER the
+    // extra_env seed silently wipes it (Command: last env call wins) and every
+    // install below quietly uses the developer's real `~/.yarn/berry`.
+    let probe = corepack(
+        &proj,
+        YARN_BERRY,
+        &["config", "get", "globalFolder"],
+        &[("YARN_GLOBAL_FOLDER", global.to_str().unwrap())],
+    );
+    let reported = String::from_utf8_lossy(&probe.stdout);
+    assert!(
+        probe.status.success() && reported.trim().ends_with("yarn-global"),
+        "seeded YARN_GLOBAL_FOLDER must survive the env scrub (scrub must run \
+         before the seed); yarn reports globalFolder = `{}`",
+        reported.trim()
+    );
     let install = corepack(
         &proj,
         YARN_BERRY,

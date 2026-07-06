@@ -6,11 +6,9 @@
 //! installed packages.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
-fn binary() -> PathBuf {
-    env!("CARGO_BIN_EXE_socket-patch").into()
-}
+#[path = "common/mod.rs"]
+mod common;
 
 const TWO_PATCH_MANIFEST: &str = r#"{
   "patches": {
@@ -52,19 +50,16 @@ fn make_socket_dir(root: &Path) -> PathBuf {
     socket
 }
 
+/// All spawns go through `common::run_with_env`, which scrubs the ambient
+/// `SOCKET_*` environment: an inherited SOCKET_DRY_RUN=true silently turns
+/// every wet remove below into a no-op preview, and an inherited
+/// SOCKET_MANIFEST_PATH / SOCKET_PROXY_URL aims the mutation (or the
+/// rollback blob fetch) outside the tempdir.
 fn run_remove(cwd: &Path, identifier: &str, extra: &[&str]) -> (i32, String) {
     let mut args = vec!["remove", identifier, "--json", "--yes", "--skip-rollback"];
     args.extend_from_slice(extra);
-    let out = Command::new(binary())
-        .args(&args)
-        .current_dir(cwd)
-        .env_remove("SOCKET_API_TOKEN")
-        .output()
-        .expect("run socket-patch");
-    (
-        out.status.code().unwrap_or(-1),
-        String::from_utf8_lossy(&out.stdout).to_string(),
-    )
+    let (code, stdout, _stderr) = common::run_with_env(cwd, &args, &[]);
+    (code, stdout)
 }
 
 fn read_manifest(socket: &Path) -> serde_json::Value {
@@ -254,33 +249,34 @@ fn remove_event_has_required_envelope_fields() {
 /// manifest entry must NOT be deleted (fail-closed — never drop a patch from
 /// the manifest while leaving patched files un-restored on disk).
 ///
-/// Here we drive the real path. The synthetic patch references blobs/files
-/// that don't exist on disk, so rollback cannot complete and `remove` must
-/// abort with `rollback_failed`, leaving the manifest fully intact. A
-/// regression that swallowed the rollback failure and deleted the entry
-/// anyway would flip this test red.
+/// Here we drive the real path. The synthetic patch's beforeHash blob does
+/// not exist in `.socket/blobs`, and `--offline` forbids fetching it, so
+/// rollback cannot complete and `remove` must abort with `rollback_failed`,
+/// leaving the manifest fully intact. A regression that swallowed the
+/// rollback failure and deleted the entry anyway would flip this test red.
+///
+/// `--offline` is what keeps this hermetic: without it, rollback fetches the
+/// missing before-blob from the live proxy (`GET /patch/blob/<beforeHash>`)
+/// and the test only passes because that request 404s.
 #[test]
 fn remove_without_skip_rollback_fails_closed_and_keeps_manifest() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let socket = make_socket_dir(tmp.path());
     let before = std::fs::read(socket.join("manifest.json")).expect("read before");
 
-    let out = Command::new(binary())
-        .args([
+    let (code, stdout, _stderr) = common::run_with_env(
+        tmp.path(),
+        &[
             "remove",
             "pkg:npm/__remove_test_a__@1.0.0",
             "--json",
             "--yes",
-        ])
-        .current_dir(tmp.path())
-        .env_remove("SOCKET_API_TOKEN")
-        .env_remove("SOCKET_SKIP_ROLLBACK")
-        .output()
-        .expect("run socket-patch");
-    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+            "--offline",
+        ],
+        &[],
+    );
     assert_eq!(
-        out.status.code(),
-        Some(1),
+        code, 1,
         "a failed rollback must abort remove; stdout=\n{stdout}"
     );
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
@@ -396,8 +392,9 @@ fn remove_honors_manifest_path_override() {
     std::fs::create_dir_all(&custom_dir).unwrap();
     std::fs::write(custom_dir.join("patches.json"), TWO_PATCH_MANIFEST).unwrap();
 
-    let out = Command::new(binary())
-        .args([
+    let (code, stdout, _stderr) = common::run_with_env(
+        tmp.path(),
+        &[
             "remove",
             "pkg:npm/__remove_test_a__@1.0.0",
             "--json",
@@ -405,13 +402,10 @@ fn remove_honors_manifest_path_override() {
             "--skip-rollback",
             "--manifest-path",
             "custom/patches.json",
-        ])
-        .current_dir(tmp.path())
-        .env_remove("SOCKET_API_TOKEN")
-        .output()
-        .expect("run socket-patch");
-    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-    assert_eq!(out.status.code(), Some(0), "stdout=\n{stdout}");
+        ],
+        &[],
+    );
+    assert_eq!(code, 0, "stdout=\n{stdout}");
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
     assert_eq!(v["status"], "success");
     assert_eq!(v["summary"]["removed"], 1);
@@ -531,23 +525,21 @@ fn remove_dry_run_with_rollback_does_not_create_blobs_dir() {
     let socket = make_socket_dir(tmp.path());
     assert!(!socket.join("blobs").exists(), "precondition: no blobs dir");
 
-    let out = Command::new(binary())
-        .args([
+    let (code, stdout, _stderr) = common::run_with_env(
+        tmp.path(),
+        &[
             "remove",
             "pkg:npm/__remove_test_a__@1.0.0",
             "--json",
             "--yes",
             "--dry-run",
             "--offline",
-        ])
-        .current_dir(tmp.path())
-        .env_remove("SOCKET_API_TOKEN")
-        .output()
-        .expect("run socket-patch");
-    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        ],
+        &[],
+    );
     // Offline + missing before-blobs: the preview accurately reports the
     // rollback failure a wet run would hit (exit 1, rollback_failed)...
-    assert_eq!(out.status.code(), Some(1), "stdout=\n{stdout}");
+    assert_eq!(code, 1, "stdout=\n{stdout}");
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
     assert_eq!(v["error"]["code"], "rollback_failed");
     assert_eq!(

@@ -134,7 +134,28 @@ pub fn deps_contain_hook(text: &str) -> bool {
             .chars()
             .filter(|c| !c.is_whitespace())
             .collect();
-        HOOK_MARKERS.iter().any(|m| normalized.contains(*m))
+        if HOOK_MARKERS.iter().any(|m| normalized.contains(*m)) {
+            return true;
+        }
+        // PEP 503 makes `-`/`_`/`.` interchangeable in package names and PEP
+        // 508 lets the hook extra ride with others (`socket-patch[cli,hook]`),
+        // so pip installs the hook from spellings the markers above miss
+        // (`socket_patch[hook]`). Canonicalize and probe for the wheel name or
+        // a `socket-patch[...]` extras list containing `hook`.
+        let canon: String = normalized
+            .chars()
+            .map(|c| if c == '_' || c == '.' { '-' } else { c })
+            .collect();
+        if canon.contains("socket-patch-hook") {
+            return true;
+        }
+        canon.match_indices("socket-patch[").any(|(i, m)| {
+            let rest = &canon[i + m.len()..];
+            match rest.find(']') {
+                Some(end) => rest[..end].split(',').any(|e| e == "hook"),
+                None => false,
+            }
+        })
     })
 }
 
@@ -149,6 +170,25 @@ mod tests {
         assert!(deps_contain_hook("Socket-Patch[hook]>=3.3.0"));
         assert!(deps_contain_hook("socket-patch-hook==3.3.0"));
         assert!(deps_contain_hook("socket_patch_hook"));
+    }
+
+    #[test]
+    fn test_deps_contain_hook_pep503_and_combined_extras() {
+        // PEP 503: `-`, `_`, `.` are interchangeable in the name — pip
+        // installs the hook from all of these.
+        assert!(deps_contain_hook("socket_patch[hook]"));
+        assert!(deps_contain_hook("socket.patch[hook]==3.3.0"));
+        assert!(deps_contain_hook("Socket_Patch [hook]"));
+        assert!(deps_contain_hook("socket.patch_hook"));
+        // PEP 508: the hook extra combined with others still declares it.
+        assert!(deps_contain_hook("socket-patch[cli,hook]>=3.3.0"));
+        assert!(deps_contain_hook("socket-patch[ hook , cli ]"));
+        assert!(deps_contain_hook("socket_patch[cli,hook]"));
+        // Some other extra alone is NOT the hook, `hooky` is a different
+        // extra, and an unterminated bracket is not a spec.
+        assert!(!deps_contain_hook("socket_patch[cli]"));
+        assert!(!deps_contain_hook("socket-patch[hooky]"));
+        assert!(!deps_contain_hook("socket-patch[hook"));
     }
 
     #[test]

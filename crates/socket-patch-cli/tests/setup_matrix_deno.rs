@@ -176,8 +176,28 @@ mod host_guard {
         );
     }
 
+    /// Ambient decoys `run()`'s scrub must strip. Two failure classes:
+    /// clap parses env-bound values on EVERY invocation whether or not the
+    /// command uses the flag, so an invalid ambient `SOCKET_STRICT` /
+    /// `SOCKET_VENDOR_SOURCE` aborts the parse (exit 2) before `setup` even
+    /// runs; and `SOCKET_SETUP_EXCLUDE` stands in for `setup --exclude` —
+    /// the exact surface under test. Planted by the roundtrip test itself so
+    /// the scrub is exercised on every run, not only in hostile shells.
+    /// (Safe to set process-wide: the only other test in this binary routes
+    /// through `smc::host_driver_command`, which prefix-scrubs `SOCKET_*`.)
+    const HOSTILE_DECOYS: &[(&str, &str)] = &[
+        ("SOCKET_STRICT", "banana"),
+        ("SOCKET_VENDOR_SOURCE", "bogus-decoy"),
+        ("SOCKET_VENDOR_URL", "http://127.0.0.1:9/decoy"),
+        ("SOCKET_PATCH_SERVER_URL", "http://127.0.0.1:9/decoy"),
+        ("SOCKET_SETUP_EXCLUDE", "decoy-member"),
+    ];
+
     #[test]
     fn deno_setup_roundtrip_host() {
+        for (k, v) in HOSTILE_DECOYS {
+            std::env::set_var(k, v);
+        }
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         std::fs::write(root.join("package.json"), PACKAGE_JSON).unwrap();
@@ -333,5 +353,9 @@ mod host_guard {
             Some(0),
             "no manifest may report configured after the hook is removed.\n{out}"
         );
+
+        for (k, _) in HOSTILE_DECOYS {
+            std::env::remove_var(k);
+        }
     }
 }

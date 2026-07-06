@@ -372,7 +372,10 @@ fn nuget_home() -> PathBuf {
 
 /// Check if the cwd contains any .NET project indicators.
 async fn is_dotnet_project(cwd: &Path) -> bool {
-    let extensions = [".csproj", ".fsproj", ".vbproj", ".sln"];
+    // `.slnx` is the XML solution format (GA since VS 2022 17.13 /
+    // dotnet 9.0.200); migrating deletes the old `.sln`, and a solution
+    // root often has no other root-level marker.
+    let extensions = [".csproj", ".fsproj", ".vbproj", ".sln", ".slnx"];
 
     for entry in crate::utils::fs::list_dir_entries(cwd).await {
         if let Some(name) = entry.file_name().to_str() {
@@ -619,6 +622,50 @@ mod tests {
             .await
             .unwrap();
         assert!(super::is_dotnet_project(dir.path()).await);
+    }
+
+    /// Regression: `.slnx` (the XML solution format, GA since VS 2022
+    /// 17.13 / dotnet 9.0.200) replaces `.sln` when a repo migrates — the
+    /// old file is deleted. A solution root keeps its projects in
+    /// subdirectories, so `.slnx` is often the ONLY root-level .NET
+    /// marker; without it the local-mode gate fails and
+    /// `get_nuget_package_paths` returns no paths at all (not even the
+    /// global cache), silently disabling NuGet patching for that repo.
+    #[tokio::test]
+    async fn test_is_dotnet_project_slnx() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(dir.path().join("MySolution.slnx"), "<Solution/>")
+            .await
+            .unwrap();
+        assert!(super::is_dotnet_project(dir.path()).await);
+
+        let crawler = NuGetCrawler::new();
+        let options = CrawlerOptions {
+            cwd: dir.path().to_path_buf(),
+            global: false,
+            global_prefix: None,
+        };
+        // Path discovery must also flow through: an assets-file path in a
+        // sub-project of the .slnx solution is found once the gate passes.
+        let pkg_folder = dir.path().join("nuget-cache");
+        tokio::fs::create_dir_all(&pkg_folder).await.unwrap();
+        let obj_dir = dir.path().join("MyApp").join("obj");
+        tokio::fs::create_dir_all(&obj_dir).await.unwrap();
+        tokio::fs::write(
+            obj_dir.join("project.assets.json"),
+            serde_json::to_string(&serde_json::json!({
+                "packageFolders": { pkg_folder.to_string_lossy().to_string(): {} }
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let paths = crawler.get_nuget_package_paths(&options).await.unwrap();
+        assert!(
+            paths.contains(&pkg_folder),
+            "a .slnx solution root must be gated in and its sub-project assets discovered, got {paths:?}"
+        );
     }
 
     #[tokio::test]

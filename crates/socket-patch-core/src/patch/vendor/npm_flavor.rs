@@ -190,10 +190,16 @@ pub(crate) async fn detect_npm_lock_flavor(
     };
 
     // Multiple lockfiles: warn about every present file the detected
-    // flavor's wiring does not cover.
+    // flavor's wiring does not cover. Both yarn flavors wire the same
+    // yarn.lock; the family table keys that family under YarnClassic, so a
+    // berry detection claims it too (never self-warn about the wired file).
+    let family_owner = match detected {
+        NpmLockFlavor::YarnBerry => NpmLockFlavor::YarnClassic,
+        other => other,
+    };
     let mut warnings = Vec::new();
     for (flavor, family) in LOCKFILE_FAMILIES {
-        if flavor == detected {
+        if flavor == family_owner {
             continue;
         }
         for file in family {
@@ -516,6 +522,30 @@ mod tests {
         touch(tmp.path(), "yarn.lock", "garbage: true\n").await;
         let (code, _) = detect_npm_lock_flavor(tmp.path()).await.unwrap_err();
         assert_eq!(code, "vendor_lockfile_version_unsupported");
+    }
+
+    #[tokio::test]
+    async fn yarn_berry_does_not_warn_about_its_own_yarn_lock() {
+        // The berry backend wires yarn.lock itself — detecting berry from
+        // that file must not emit a vendor_multiple_lockfiles warning
+        // claiming installs driven by yarn.lock get UNPATCHED bytes.
+        let tmp = tempfile::tempdir().unwrap();
+        touch(tmp.path(), "yarn.lock", YARN_BERRY).await;
+        let (flavor, warnings) = detect_npm_lock_flavor(tmp.path()).await.unwrap();
+        assert_eq!(flavor, NpmLockFlavor::YarnBerry);
+        assert!(warnings.is_empty(), "{warnings:?}");
+
+        // Genuinely unwired siblings still warn — exactly one, for the
+        // stray package-lock.json, never for yarn.lock.
+        touch(tmp.path(), "package-lock.json", "{}").await;
+        let (flavor, warnings) = detect_npm_lock_flavor(tmp.path()).await.unwrap();
+        assert_eq!(flavor, NpmLockFlavor::YarnBerry);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].detail.contains("package-lock.json"),
+            "{warnings:?}"
+        );
+        assert!(!warnings[0].detail.contains("`yarn.lock`"), "{warnings:?}");
     }
 
     #[tokio::test]

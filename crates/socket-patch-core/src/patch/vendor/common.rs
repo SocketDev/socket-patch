@@ -15,7 +15,7 @@ use crate::patch::apply::{
     is_safe_relative_subpath, normalize_file_path, ApplyResult, VerifyResult, VerifyStatus,
 };
 use crate::patch::file_hash::compute_file_git_sha256;
-use crate::utils::fs::atomic_write_bytes;
+use crate::utils::fs::atomic_write_bytes_preserving_mode;
 
 use super::state::{VendorEntry, WiringAction, WiringRecord};
 use super::{RevertOutcome, VendorOutcome, VendorServiceConfig, VendorWarning};
@@ -145,21 +145,6 @@ pub(crate) fn serialize_json(value: &Value, indent: &str) -> std::io::Result<Vec
     value.serialize(&mut ser).map_err(std::io::Error::other)?;
     out.push(b'\n');
     Ok(out)
-}
-
-/// Insert `insertion` (already newline-terminated) immediately before the line
-/// containing the first occurrence of `needle`. Returns `None` if `needle` is
-/// absent.
-pub(crate) fn insert_before(haystack: &str, needle: &str, insertion: &str) -> Option<String> {
-    let idx = haystack.find(needle)?;
-    // Back up to the start of the needle's line so the insertion lands on its
-    // own line(s) directly above.
-    let line_start = haystack[..idx].rfind('\n').map(|n| n + 1).unwrap_or(0);
-    let mut out = String::with_capacity(haystack.len() + insertion.len());
-    out.push_str(&haystack[..line_start]);
-    out.push_str(insertion);
-    out.push_str(&haystack[line_start..]);
-    Some(out)
 }
 
 /// Serialize `(name, bytes, unix mode)` entries — in the given order — into
@@ -450,7 +435,10 @@ pub(crate) async fn revert_lock_fragment_splice(
     }
 
     if !dry_run {
-        if let Err(e) = atomic_write_bytes(&lock_path, lock_text.as_bytes()).await {
+        // Mode-preserving: the lock is a user-owned file we merely edit, so
+        // the swapped-in inode must keep its permission bits rather than
+        // reset them to umask defaults.
+        if let Err(e) = atomic_write_bytes_preserving_mode(&lock_path, lock_text.as_bytes()).await {
             return RevertOutcome {
                 success: false,
                 warnings,
@@ -462,5 +450,66 @@ pub(crate) async fn revert_lock_fragment_splice(
         success: true,
         warnings,
         error: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The lock file is user-owned: reverting the splice must not reset its
+    /// permission bits (the `package_json/update.rs` mode-reset bug, same
+    /// class — see `atomic_write_bytes_preserving_mode`).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn revert_lock_fragment_splice_preserves_lock_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("poetry.lock");
+        tokio::fs::write(&lock, "alpha\nNEW-FRAGMENT\nomega\n")
+            .await
+            .unwrap();
+        let mut perms = std::fs::metadata(&lock).unwrap().permissions();
+        perms.set_mode(0o600);
+        std::fs::set_permissions(&lock, perms).unwrap();
+
+        let mut entry: VendorEntry = serde_json::from_value(serde_json::json!({
+            "ecosystem": "pypi",
+            "basePurl": "pkg:pypi/six@1.16.0",
+            "uuid": "u",
+            "artifact": {"path": ".socket/vendor/pypi/u/x.whl"},
+            "wiring": [],
+        }))
+        .unwrap();
+        entry.wiring = vec![record(
+            "poetry.lock",
+            "poetry_lock_package",
+            WiringAction::Rewritten,
+            "six",
+            Some("OLD-FRAGMENT".into()),
+            "NEW-FRAGMENT".into(),
+        )];
+
+        let outcome = revert_lock_fragment_splice(
+            &entry,
+            dir.path(),
+            false,
+            "poetry.lock",
+            "poetry_lock_package",
+            "poetry",
+        )
+        .await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        assert_eq!(
+            tokio::fs::read_to_string(&lock).await.unwrap(),
+            "alpha\nOLD-FRAGMENT\nomega\n",
+            "fragment restored"
+        );
+        let mode = std::fs::metadata(&lock).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "revert must preserve the lock file's permission bits"
+        );
     }
 }

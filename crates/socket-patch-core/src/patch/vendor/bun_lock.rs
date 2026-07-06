@@ -560,6 +560,27 @@ mod tests {
 }
 "#;
 
+    // Scoped package: the vendored spec embeds an `@` inside the path
+    // (`@scope/pkg@.socket/vendor/npm/<uuid>/@scope/pkg-1.0.0.tgz` — the
+    // scope stays a real subdirectory in the tarball leaf), so name/path
+    // splitting must not key on the LAST `@`.
+    const SCOPED_BEFORE_LOCK: &str = r#"{
+  "lockfileVersion": 1,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "scoped-fixture",
+      "dependencies": {
+        "@scope/pkg": "1.0.0",
+      },
+    },
+  },
+  "packages": {
+    "@scope/pkg": ["@scope/pkg@1.0.0", "", {}, "sha512-XI5MPzVNApjAyhQzphX8BkmKsKUxD4LdyK24iZeQGinBN9yTQT3bFlCBy/aVx2HrNcqQGsdot8ghrjyrvMCoEA=="],
+  }
+}
+"#;
+
     struct Fixture {
         tmp: tempfile::TempDir,
         record: PatchRecord,
@@ -908,6 +929,105 @@ mod tests {
             tgz_first,
             "tarball byte-identical across re-runs"
         );
+    }
+
+    /// Build a scoped-package fixture and vendor it once (not dry).
+    async fn scoped_fixture() -> Fixture {
+        let fx = fixture_with(SCOPED_BEFORE_LOCK, "node_modules/@scope/pkg").await;
+        tokio::fs::write(
+            fx.installed.join("package.json"),
+            br#"{"name":"@scope/pkg","version":"1.0.0"}"#,
+        )
+        .await
+        .unwrap();
+        fx
+    }
+
+    async fn vendor_scoped(fx: &Fixture) -> VendorOutcome {
+        let blobs = fx.root().join(".socket/blobs");
+        let sources = PatchSources::blobs_only(&blobs);
+        vendor_bun(
+            "pkg:npm/@scope/pkg@1.0.0",
+            &fx.installed,
+            fx.root(),
+            &fx.record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            None,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn scoped_package_rerun_is_in_sync_not_refused() {
+        let fx = scoped_fixture().await;
+        let (result, entry, _) = expect_done(vendor_scoped(&fx).await);
+        assert!(result.success, "{:?}", result.error);
+        assert!(entry.is_some());
+        let lock_first = fx.read_lock().await;
+        assert!(
+            lock_first.contains(&format!(
+                "\"@scope/pkg@.socket/vendor/npm/{UUID}/@scope/pkg-1.0.0.tgz\""
+            )),
+            "vendored spec keeps the scope dir in the leaf: {lock_first}"
+        );
+
+        // The in-sync re-run must synthesize AlreadyPatched, not refuse.
+        let (result, entry, _) = expect_done(vendor_scoped(&fx).await);
+        assert!(result.success, "{:?}", result.error);
+        assert!(entry.is_none(), "in-sync re-run records nothing");
+        assert!(
+            result
+                .files_verified
+                .iter()
+                .all(|v| v.status == VerifyStatus::AlreadyPatched),
+            "{:?}",
+            result.files_verified
+        );
+        assert_eq!(fx.read_lock().await, lock_first, "lock byte-stable");
+    }
+
+    #[tokio::test]
+    async fn scoped_reserialized_entry_is_still_ours_on_revert() {
+        let fx = scoped_fixture().await;
+        let (_, entry, _) = expect_done(vendor_scoped(&fx).await);
+        let entry = entry.unwrap();
+
+        // Simulate bun re-serializing the line without moving the entry:
+        // same key, same tuple, trailing comma dropped. The uuid-ownership
+        // fallback (not the byte-exact compare) must still claim it.
+        let live = fx.read_lock().await;
+        let new_line = entry.wiring[0]
+            .new
+            .as_ref()
+            .and_then(Value::as_str)
+            .unwrap();
+        let reserialized = new_line.strip_suffix(',').unwrap();
+        tokio::fs::write(
+            fx.root().join(BUN_LOCK),
+            live.replacen(new_line, reserialized, 1),
+        )
+        .await
+        .unwrap();
+
+        let outcome = revert_bun(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(
+            outcome.warnings.is_empty(),
+            "an unmoved entry is ours, not drift: {:?}",
+            outcome.warnings
+        );
+        assert_eq!(
+            fx.read_lock().await,
+            SCOPED_BEFORE_LOCK,
+            "registry tuple byte-restored"
+        );
+        assert!(!fx
+            .root()
+            .join(format!(".socket/vendor/npm/{UUID}"))
+            .exists());
     }
 
     #[tokio::test]

@@ -145,6 +145,22 @@ async fn mount_patch_api(mock: &MockServer, uuid: &str) {
         .await;
 }
 
+/// Spawn the built binary in `root` with `extra_env` injected into the
+/// child environment.
+fn run_cli_env(root: &Path, argv: &[&str], extra_env: &[(&str, &str)]) -> (i32, String, String) {
+    let mut cmd = Command::new(binary());
+    cmd.args(argv).current_dir(root);
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().expect("run");
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
 fn run_scan_vendor(root: &Path, mock_uri: &str, extra: &[&str]) -> (i32, String, String) {
     let mut argv = vec![
         "scan",
@@ -159,16 +175,7 @@ fn run_scan_vendor(root: &Path, mock_uri: &str, extra: &[&str]) -> (i32, String,
         ORG_SLUG,
     ];
     argv.extend_from_slice(extra);
-    let out = Command::new(binary())
-        .args(&argv)
-        .current_dir(root)
-        .output()
-        .expect("run");
-    (
-        out.status.code().unwrap_or(-1),
-        String::from_utf8_lossy(&out.stdout).into_owned(),
-        String::from_utf8_lossy(&out.stderr).into_owned(),
-    )
+    run_cli_env(root, &argv, &[])
 }
 
 /// Vendor flows hold patch content in MEMORY: `.socket/` must end up with
@@ -522,6 +529,70 @@ async fn scan_vendor_flag_conflicts_are_clap_errors() {
             "argv={argv:?}: {stderr}"
         );
     }
+}
+
+/// No invocation in this suite may emit telemetry. Telemetry resolves its
+/// endpoint from `SOCKET_API_URL` / `SOCKET_PROXY_URL` env ONLY (the
+/// `--api-url` flag is invisible to it — utils::telemetry), so the
+/// unhardened harness sent every successful run's `patch_vendored` event to
+/// the LIVE `/v0/orgs/test-org/telemetry` with the fake bearer token. Seed
+/// the child env with a reachable endpoint (worst case for the kill-switch)
+/// and prove not a single telemetry request escapes.
+#[tokio::test]
+async fn scan_vendor_emits_no_telemetry_even_with_endpoint_env() {
+    let mock = MockServer::start().await;
+    mount_patch_api(&mock, UUID).await;
+    // Accept both telemetry arms: authenticated (`/v0/orgs/<slug>/telemetry`)
+    // and public-proxy (`/patch/telemetry`). Unmatched requests are recorded
+    // by wiremock anyway; mounting keeps the child's send path realistic.
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG_SLUG}/telemetry")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/patch/telemetry"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .mount(&mock)
+        .await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_fixture(tmp.path());
+
+    let mock_uri = mock.uri();
+    let (code, stdout, stderr) = run_cli_env(
+        tmp.path(),
+        &[
+            "scan",
+            "--json",
+            "--vendor",
+            "--yes",
+            "--api-url",
+            &mock_uri,
+            "--api-token",
+            "fake-token",
+            "--org",
+            ORG_SLUG,
+        ],
+        &[
+            ("SOCKET_API_URL", mock_uri.as_str()),
+            ("SOCKET_PROXY_URL", mock_uri.as_str()),
+        ],
+    );
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+
+    let telemetry: Vec<String> = mock
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.url.path().to_string())
+        .filter(|p| p.contains("telemetry"))
+        .collect();
+    assert!(
+        telemetry.is_empty(),
+        "test runs must never phone telemetry home (live-API leak when \
+         SOCKET_API_URL is unset); observed: {telemetry:?}"
+    );
 }
 
 // ───────────── percent-encoded scoped purls (API canonical form) ─────────────

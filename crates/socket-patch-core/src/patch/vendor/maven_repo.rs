@@ -68,12 +68,12 @@ use crate::manifest::schema::{PatchFileInfo, PatchRecord};
 use crate::patch::apply::{ApplyResult, PatchSources};
 use crate::patch::copy_tree::remove_tree;
 use crate::patch::path_safety::is_safe_single_segment;
-use crate::utils::fs::atomic_write_bytes;
+use crate::utils::fs::{atomic_write_bytes, atomic_write_bytes_preserving_mode};
 use crate::utils::purl::{build_maven_purl, parse_maven_purl};
 
 use super::common::{
-    already_patched_result, done, failed_result, insert_before, rebuild_zip, refused,
-    synthesized_result, zip_matches_after_hashes,
+    already_patched_result, done, failed_result, rebuild_zip, refused, synthesized_result,
+    zip_matches_after_hashes,
 };
 use super::path::vendor_uuid_dir_rel;
 use super::registry_fetch::extract_zip;
@@ -247,7 +247,7 @@ pub async fn vendor_maven(
         // re-record the live vendored pom.xml as `original`, breaking revert.
         if !dry_run {
             let mut warnings: Vec<VendorWarning> = vec![shadow_warning];
-            let (_bytes, result) = match materialise_and_write(
+            let (_bytes, mut result) = match materialise_and_write(
                 purl,
                 installed_dir,
                 &uuid_dir,
@@ -273,6 +273,7 @@ pub async fn vendor_maven(
             if !result.success {
                 return done(result, None, warnings);
             }
+            result.package_path = jar_path.display().to_string();
             warnings.push(VendorWarning::new(
                 "vendor_artifact_rebuilt",
                 format!(
@@ -345,7 +346,8 @@ pub async fn vendor_maven(
             return done(result, None, warnings);
         }
     };
-    if let Err(e) = atomic_write_bytes(&pom_xml_path, new_pom_xml.as_bytes()).await {
+    if let Err(e) = atomic_write_bytes_preserving_mode(&pom_xml_path, new_pom_xml.as_bytes()).await
+    {
         let _ = remove_tree(&uuid_dir).await;
         result.success = false;
         result.error = Some(format!("failed to write {}: {e}", pom_xml_path.display()));
@@ -846,21 +848,121 @@ fn sha1_hex(bytes: &[u8]) -> String {
 /// `<repositories>` (or create the section before `</project>`). The pom is
 /// edited by targeted string insertion so all other bytes — formatting,
 /// comments, key order — are preserved and a later revert restores it
-/// byte-identically.
+/// byte-identically. Anchors are chosen with [`find_wireable_anchor`], never a
+/// bare substring match: a `</repositories>` inside an XML comment or inside
+/// `<profiles>` would swallow the block where Maven never reads it, so the
+/// build would silently resolve the UNPATCHED jar while vendor reports
+/// success.
 fn build_repo_edit(original: &str, repo_id: &str, uuid_dir_rel: &str) -> Result<String, String> {
     let block = repository_block(repo_id, uuid_dir_rel);
-    if original.contains("</repositories>") {
-        insert_before(original, "</repositories>", &block).ok_or_else(|| {
-            "could not locate </repositories> to insert the vendored <repository>".to_string()
-        })
-    } else if original.contains("</project>") {
+    if let Some(at) = find_wireable_anchor(original, "</repositories>") {
+        Ok(insert_block_at(original, at, &block))
+    } else if let Some(at) = find_wireable_anchor(original, "</project>") {
         let section = format!("  <repositories>\n{block}  </repositories>\n");
-        insert_before(original, "</project>", &section).ok_or_else(|| {
-            "could not locate </project> to insert a <repositories> section".to_string()
-        })
+        Ok(insert_block_at(original, at, &section))
     } else {
         Err("pom.xml has no </project> to edit".to_string())
     }
+}
+
+/// The insertion anchor: the first occurrence of `needle` Maven will actually
+/// read — outside every `<!-- -->` comment and outside `<profiles>` (a
+/// profile-scoped `<repositories>` is only consulted when that profile is
+/// activated, so it can never serve the always-on vendored repository).
+/// `None` when every occurrence is masked.
+fn find_wireable_anchor(text: &str, needle: &str) -> Option<usize> {
+    let mut masked = comment_spans(text);
+    masked.extend(profiles_spans(text, &masked));
+    find_outside(text, needle, 0, &masked)
+}
+
+/// Byte spans of `<!-- … -->` comments (an unterminated comment runs to EOF —
+/// the same drop-the-tail discipline as [`strip_xml_comments`]).
+fn comment_spans(text: &str) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut from = 0;
+    while let Some(rel) = text[from..].find("<!--") {
+        let start = from + rel;
+        match text[start + 4..].find("-->") {
+            Some(rel_end) => {
+                let end = start + 4 + rel_end + 3;
+                spans.push((start, end));
+                from = end;
+            }
+            None => {
+                spans.push((start, text.len()));
+                break;
+            }
+        }
+    }
+    spans
+}
+
+/// Byte spans covered by `<profiles>…</profiles>` elements, with the tags
+/// themselves matched outside `comments`. A self-closing `<profiles/>` spans
+/// nothing; an unclosed element masks through EOF (fail-closed — better to
+/// refuse than to wire a block Maven may never read).
+fn profiles_spans(text: &str, comments: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    const OPEN: &str = "<profiles";
+    const CLOSE: &str = "</profiles>";
+    let mut spans = Vec::new();
+    let mut from = 0;
+    while let Some(open) = find_outside(text, OPEN, from, comments) {
+        // Boundary check: `<profilesX>` is not `<profiles>`.
+        let after = &text[open + OPEN.len()..];
+        let boundary_ok = match after.chars().next() {
+            None => true,
+            Some(c) => c == '>' || c == '/' || c.is_whitespace(),
+        };
+        if !boundary_ok {
+            from = open + OPEN.len();
+            continue;
+        }
+        // A self-closing `<profiles/>` (or `<profiles …/>`) has no interior.
+        if let Some(gt) = text[open..].find('>').map(|r| open + r) {
+            if text[..gt].ends_with('/') {
+                from = gt + 1;
+                continue;
+            }
+        }
+        match find_outside(text, CLOSE, open, comments) {
+            Some(close) => {
+                let end = close + CLOSE.len();
+                spans.push((open, end));
+                from = end;
+            }
+            None => {
+                spans.push((open, text.len()));
+                break;
+            }
+        }
+    }
+    spans
+}
+
+/// First occurrence of `needle` at/after `from` whose start lies outside every
+/// `spans` range; `None` when only masked occurrences remain.
+fn find_outside(text: &str, needle: &str, from: usize, spans: &[(usize, usize)]) -> Option<usize> {
+    let mut at = from;
+    while let Some(rel) = text[at..].find(needle) {
+        let pos = at + rel;
+        if !spans.iter().any(|&(s, e)| pos >= s && pos < e) {
+            return Some(pos);
+        }
+        at = pos + needle.len();
+    }
+    None
+}
+
+/// `insert_before` at a known byte offset: insert `insertion` (already
+/// newline-terminated) at the start of the line containing `at`.
+fn insert_block_at(haystack: &str, at: usize, insertion: &str) -> String {
+    let line_start = haystack[..at].rfind('\n').map(|n| n + 1).unwrap_or(0);
+    let mut out = String::with_capacity(haystack.len() + insertion.len());
+    out.push_str(&haystack[..line_start]);
+    out.push_str(insertion);
+    out.push_str(&haystack[line_start..]);
+    out
 }
 
 /// The `<repository>` element served from the committed maven2 repo. The URL
@@ -1017,7 +1119,7 @@ async fn revert_repo_record(
         if dry_run {
             return Ok(true);
         }
-        atomic_write_bytes(pom_xml_path, original.as_bytes())
+        atomic_write_bytes_preserving_mode(pom_xml_path, original.as_bytes())
             .await
             .map_err(|e| format!("failed to restore {}: {e}", pom_xml_path.display()))?;
         return Ok(true);
@@ -1036,7 +1138,7 @@ async fn revert_repo_record(
         return Ok(true);
     }
     let excised = strip_empty_repositories(&live.replacen(&block, "", 1));
-    atomic_write_bytes(pom_xml_path, excised.as_bytes())
+    atomic_write_bytes_preserving_mode(pom_xml_path, excised.as_bytes())
         .await
         .map_err(|e| {
             format!(
@@ -1836,5 +1938,192 @@ mod tests {
         assert!(!is_safe_group_id("a..b"));
         assert!(!is_safe_group_id("a/b"));
         assert!(!is_safe_group_id("a:b"));
+    }
+
+    #[tokio::test]
+    async fn wires_outside_commented_repositories() {
+        // A commented-out <repositories> section must not capture the insert:
+        // a block landing inside the comment is invisible to Maven, so the
+        // build would silently resolve the UNPATCHED jar while vendor reports
+        // success.
+        let commented = "<project xmlns=\"http://maven.apache.org/POM/4.0.0\">\n\
+             \x20 <modelVersion>4.0.0</modelVersion>\n\
+             \x20 <groupId>com.example</groupId>\n\
+             \x20 <artifactId>app</artifactId>\n\
+             \x20 <version>1.0.0</version>\n\
+             \x20 <!--\n\
+             \x20 <repositories>\n\
+             \x20   <repository><id>old-corp</id><url>https://old/repo</url></repository>\n\
+             \x20 </repositories>\n\
+             \x20 -->\n\
+             </project>\n";
+        let (dir, blobs, installed, record) = fixture(Some(commented), true, true).await;
+        let root = dir.path();
+        let (result, _e, _w) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert!(result.success, "{:?}", result.error);
+        let wired = tokio::fs::read_to_string(root.join(PROJECT_POM))
+            .await
+            .unwrap();
+        assert!(
+            strip_xml_comments(&wired).contains(&format!("<id>socket-patch-vendor-{UUID}</id>")),
+            "the vendored <repository> must be outside comments (Maven-visible): {wired}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wires_project_root_not_profile_repositories() {
+        // A <repositories> inside <profiles> is only consulted when that
+        // profile is activated; anchoring our block there leaves the default
+        // build silently resolving the UNPATCHED jar.
+        let profiled = "<project xmlns=\"http://maven.apache.org/POM/4.0.0\">\n\
+             \x20 <modelVersion>4.0.0</modelVersion>\n\
+             \x20 <groupId>com.example</groupId>\n\
+             \x20 <artifactId>app</artifactId>\n\
+             \x20 <version>1.0.0</version>\n\
+             \x20 <profiles>\n\
+             \x20   <profile>\n\
+             \x20     <id>internal</id>\n\
+             \x20     <repositories>\n\
+             \x20       <repository><id>corp</id><url>https://corp/repo</url></repository>\n\
+             \x20     </repositories>\n\
+             \x20   </profile>\n\
+             \x20 </profiles>\n\
+             </project>\n";
+        let (dir, blobs, installed, record) = fixture(Some(profiled), true, true).await;
+        let root = dir.path();
+        let (result, _e, _w) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert!(result.success, "{:?}", result.error);
+        let wired = tokio::fs::read_to_string(root.join(PROJECT_POM))
+            .await
+            .unwrap();
+        let id = format!("<id>socket-patch-vendor-{UUID}</id>");
+        assert!(wired.contains(&id), "wired: {wired}");
+        let p_open = wired.find("<profiles>").unwrap();
+        let p_close = wired.find("</profiles>").unwrap();
+        assert!(
+            !wired[p_open..p_close].contains(&id),
+            "the vendored <repository> must not land inside <profiles>: {wired}"
+        );
+    }
+
+    #[test]
+    fn repo_edit_skips_commented_and_profile_anchors() {
+        // Only a commented </repositories> → a NEW real section is created.
+        let commented = "<project>\n<!--\n  <repositories>\n  </repositories>\n-->\n</project>\n";
+        let out =
+            build_repo_edit(commented, "socket-patch-vendor-x", ".socket/vendor/maven/x").unwrap();
+        assert!(
+            strip_xml_comments(&out).contains("<id>socket-patch-vendor-x</id>"),
+            "block must be Maven-visible: {out}"
+        );
+        // Only a profile-scoped </repositories> → likewise anchored at </project>.
+        let profiled = "<project>\n  <profiles>\n    <profile>\n      <repositories>\n      \
+                        </repositories>\n    </profile>\n  </profiles>\n</project>\n";
+        let out =
+            build_repo_edit(profiled, "socket-patch-vendor-x", ".socket/vendor/maven/x").unwrap();
+        let p_close = out.find("</profiles>").unwrap();
+        let id_at = out.find("<id>socket-patch-vendor-x</id>").unwrap();
+        assert!(id_at > p_close, "block must land after </profiles>: {out}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wire_preserves_pom_xml_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (dir, blobs, installed, record) = fixture(Some(project_pom()), true, true).await;
+        let root = dir.path();
+        let pom_path = root.join(PROJECT_POM);
+        tokio::fs::set_permissions(&pom_path, std::fs::Permissions::from_mode(0o600))
+            .await
+            .unwrap();
+
+        let (result, _e, _w) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert!(result.success, "{:?}", result.error);
+        let mode = tokio::fs::metadata(&pom_path)
+            .await
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(
+            mode, 0o600,
+            "wiring must not reset the user's pom.xml mode"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn revert_preserves_pom_xml_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (dir, blobs, installed, record) = fixture(Some(project_pom()), true, true).await;
+        let root = dir.path();
+        let pom_path = root.join(PROJECT_POM);
+
+        async fn mode_of(p: &Path) -> u32 {
+            tokio::fs::metadata(p).await.unwrap().permissions().mode() & 0o7777
+        }
+
+        // Byte-identical fast path (whole-file restore).
+        let (result, entry, _w) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert!(result.success);
+        let entry = entry.unwrap();
+        tokio::fs::set_permissions(&pom_path, std::fs::Permissions::from_mode(0o600))
+            .await
+            .unwrap();
+        let outcome = revert_maven(&entry, root, false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert_eq!(
+            mode_of(&pom_path).await,
+            0o600,
+            "whole-file restore must not reset the pom.xml mode"
+        );
+
+        // Re-vendor, drift with a user edit, revert → the excise path writes too.
+        let (result, entry, _w) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert!(result.success);
+        let entry = entry.unwrap();
+        let wired = tokio::fs::read_to_string(&pom_path).await.unwrap();
+        let edited = wired.replacen(
+            "</project>",
+            "  <properties>\n  </properties>\n</project>",
+            1,
+        );
+        tokio::fs::write(&pom_path, &edited).await.unwrap();
+        tokio::fs::set_permissions(&pom_path, std::fs::Permissions::from_mode(0o640))
+            .await
+            .unwrap();
+        let outcome = revert_maven(&entry, root, false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert_eq!(
+            mode_of(&pom_path).await,
+            0o640,
+            "the excise path must not reset the pom.xml mode"
+        );
+    }
+
+    #[tokio::test]
+    async fn wired_rebuild_reports_vendored_jar_path() {
+        // The wired-but-missing-artifact rebuild leg must report the vendored
+        // jar path, not the (deleted) temp stage the rebuild ran in.
+        let (dir, blobs, installed, record) = fixture(Some(project_pom()), true, true).await;
+        let root = dir.path();
+        let (r1, _e, _w) = unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert!(r1.success);
+        remove_tree(&root.join(format!(".socket/vendor/maven/{UUID}")))
+            .await
+            .unwrap();
+        let (r2, _e2, _w2) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert!(r2.success, "{:?}", r2.error);
+        assert_eq!(
+            r2.package_path,
+            root.join(jar_rel()).display().to_string(),
+            "rebuild leg must report the vendored jar, not the temp stage"
+        );
     }
 }

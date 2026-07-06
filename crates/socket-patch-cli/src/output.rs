@@ -33,7 +33,9 @@ pub fn color(text: &str, code: &str, use_color: bool) -> String {
 pub enum SelectError {
     /// User cancelled the selection.
     Cancelled,
-    /// JSON mode requires explicit selection (e.g. via --id).
+    /// JSON mode requires explicit selection (re-running with the chosen
+    /// UUID as the identifier — `--id` is a boolean type-tag, not a
+    /// value-taking selector).
     JsonModeNeedsExplicit,
 }
 
@@ -323,7 +325,7 @@ mod tests {
     #[test]
     fn select_one_json_mode_ignores_options_contents() {
         // Even with a single option, JSON mode must defer to an explicit
-        // `--id` rather than silently picking it.
+        // UUID re-run rather than silently picking it.
         let opts = vec!["only".to_string()];
         assert!(matches!(
             select_one("pick", &opts, true),

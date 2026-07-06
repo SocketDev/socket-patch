@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use tokio::fs;
 
-use super::detect::PackageManager;
+use super::detect::{strip_bom, PackageManager};
 use crate::utils::fs::{entry_file_type, is_dir, list_dir_entries};
 
 /// Detect the package manager based on lockfiles in the project root.
@@ -133,7 +133,7 @@ async fn detect_workspaces(package_json_path: &Path) -> WorkspaceConfig {
         Err(_) => return default,
     };
 
-    let pkg: serde_json::Value = match serde_json::from_str(&content) {
+    let pkg: serde_json::Value = match serde_json::from_str(strip_bom(&content)) {
         Ok(v) => v,
         Err(_) => return default,
     };
@@ -171,7 +171,9 @@ fn parse_pnpm_workspace_patterns(yaml_content: &str) -> Vec<String> {
     let mut patterns = Vec::new();
     let mut in_packages = false;
 
-    for line in yaml_content.lines() {
+    // A BOM is not Unicode whitespace, so `trim` would leave it glued to a
+    // first-line `packages:` header and the whole section would be missed.
+    for line in strip_bom(yaml_content).lines() {
         let trimmed = line.trim();
 
         // The header may carry an inline comment (`packages: # globs`); a `#`
@@ -479,6 +481,17 @@ mod tests {
         assert_eq!(parse_pnpm_workspace_patterns(yaml), vec!["packages/**"]);
     }
 
+    #[test]
+    fn test_parse_pnpm_bom_first_line() {
+        // A UTF-8 BOM (Windows editors commonly write one) is NOT Unicode
+        // whitespace, so `trim` leaves it in place and a `packages:` header on
+        // the first line never matches — every pattern is silently lost, and
+        // because pnpm-workspace.yaml still marks the project as a pnpm
+        // workspace, no fallback walk runs: zero members discovered.
+        let yaml = "\u{feff}packages:\n  - packages/*";
+        assert_eq!(parse_pnpm_workspace_patterns(yaml), vec!["packages/*"]);
+    }
+
     // ── Group 2: workspace detection + file discovery ────────────────
 
     #[tokio::test]
@@ -555,6 +568,53 @@ mod tests {
         let config = detect_workspaces(&pkg).await;
         assert!(matches!(config.ws_type, WorkspaceType::Pnpm));
         assert_eq!(config.patterns, vec!["packages/*"]);
+    }
+
+    #[tokio::test]
+    async fn test_detect_workspaces_npm_with_bom() {
+        // npm strips a leading UTF-8 BOM before parsing package.json, so a
+        // BOM'd manifest is npm-valid; its workspaces must not be silently
+        // dropped (which would demote the project to "no workspace").
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("package.json");
+        fs::write(&pkg, "\u{feff}{\"workspaces\": [\"packages/*\"]}")
+            .await
+            .unwrap();
+        let config = detect_workspaces(&pkg).await;
+        assert!(matches!(config.ws_type, WorkspaceType::Npm));
+        assert_eq!(config.patterns, vec!["packages/*"]);
+    }
+
+    #[tokio::test]
+    async fn test_find_bom_root_workspace_negation_honored() {
+        // End-to-end symptom of the BOM gap: with a BOM'd root manifest the
+        // workspace config silently degraded to None, so members were found
+        // only by the fallback walk — mislabeled as non-workspace and with
+        // `!`-negations ignored, letting setup edit an excluded package.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            "\u{feff}{\"workspaces\": [\"packages/*\", \"!packages/private\"]}",
+        )
+        .await
+        .unwrap();
+        for member in ["a", "private"] {
+            let m = dir.path().join("packages").join(member);
+            fs::create_dir_all(&m).await.unwrap();
+            fs::write(m.join("package.json"), r#"{"name":"m"}"#)
+                .await
+                .unwrap();
+        }
+        let result = find_package_json_files(dir.path()).await;
+        assert!(matches!(result.workspace_type, WorkspaceType::Npm));
+        let members: Vec<_> = result.files.iter().filter(|f| f.is_workspace).collect();
+        assert_eq!(
+            members.len(),
+            1,
+            "negated member must stay excluded under a BOM'd root: {:?}",
+            result.files.iter().map(|f| &f.path).collect::<Vec<_>>()
+        );
+        assert!(members[0].path.ends_with("packages/a/package.json"));
     }
 
     #[tokio::test]

@@ -3,15 +3,20 @@
 //! output; these tests exercise the table printers, verbose
 //! verification details, and `--silent` short-circuits that the JSON
 //! tests don't reach.
+//!
+//! All binary invocations go through `common::run_with_env`, which
+//! scrubs the ambient `SOCKET_*` environment. That scrub is load-bearing
+//! here: the binary env-binds the very dimension this suite tests
+//! (SOCKET_JSON, SOCKET_SILENT, SOCKET_VERBOSE) plus behavior toggles
+//! like SOCKET_DRY_RUN — an ambient SOCKET_DRY_RUN=true turned every
+//! apply below into a silent no-op and failed the on-disk assertions.
 
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::Path;
 
 use sha2::{Digest, Sha256};
 
-fn binary() -> PathBuf {
-    env!("CARGO_BIN_EXE_socket-patch").into()
-}
+#[path = "common/mod.rs"]
+mod common;
 
 fn git_sha256(content: &[u8]) -> String {
     let header = format!("blob {}\0", content.len());
@@ -95,14 +100,8 @@ fn apply_non_json_prints_human_readable_summary() {
     write_npm_package(tmp.path(), "non-json-target", "1.0.0", before);
     write_manifest(tmp.path(), "pkg:npm/non-json-target@1.0.0", before, after);
 
-    let out = Command::new(binary())
-        .args(["apply", "--offline"])
-        .current_dir(tmp.path())
-        .env_remove("SOCKET_API_TOKEN")
-        .output()
-        .expect("run");
-    assert_eq!(out.status.code(), Some(0));
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    let (code, stdout, _stderr) = common::run_with_env(tmp.path(), &["apply", "--offline"], &[]);
+    assert_eq!(code, 0);
     // The human-readable summary must report the count *and* name the
     // patched package — not merely print one of two loosely-OR'd words.
     assert!(
@@ -130,14 +129,9 @@ fn apply_verbose_prints_per_file_details() {
     write_npm_package(tmp.path(), "verbose-target", "1.0.0", before);
     write_manifest(tmp.path(), "pkg:npm/verbose-target@1.0.0", before, after);
 
-    let out = Command::new(binary())
-        .args(["apply", "--offline", "--verbose"])
-        .current_dir(tmp.path())
-        .env_remove("SOCKET_API_TOKEN")
-        .output()
-        .expect("run");
-    assert_eq!(out.status.code(), Some(0));
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    let (code, stdout, _stderr) =
+        common::run_with_env(tmp.path(), &["apply", "--offline", "--verbose"], &[]);
+    assert_eq!(code, 0);
     // `--verbose` is the whole point of this test: it MUST emit the
     // per-file "Detailed verification" block. The old `|| "Summary"`
     // escape made this vacuous because the non-verbose path also prints
@@ -174,17 +168,12 @@ fn apply_silent_emits_no_stdout() {
     write_npm_package(tmp.path(), "silent-target", "1.0.0", before);
     write_manifest(tmp.path(), "pkg:npm/silent-target@1.0.0", before, after);
 
-    let out = Command::new(binary())
-        .args(["apply", "--offline", "--silent"])
-        .current_dir(tmp.path())
-        .env_remove("SOCKET_API_TOKEN")
-        .output()
-        .expect("run");
-    assert_eq!(out.status.code(), Some(0));
+    let (code, stdout, _stderr) =
+        common::run_with_env(tmp.path(), &["apply", "--offline", "--silent"], &[]);
+    assert_eq!(code, 0);
     assert!(
-        out.stdout.is_empty(),
-        "--silent must suppress stdout; got: {:?}",
-        String::from_utf8_lossy(&out.stdout)
+        stdout.is_empty(),
+        "--silent must suppress stdout; got: {stdout:?}"
     );
     // Silence must mean "quiet", not "skip the work": the patch must
     // still be applied to disk. A no-op apply that prints nothing would
@@ -199,14 +188,8 @@ fn apply_silent_emits_no_stdout() {
 #[test]
 fn apply_no_manifest_non_json_prints_message() {
     let tmp = tempfile::tempdir().unwrap();
-    let out = Command::new(binary())
-        .args(["apply"])
-        .current_dir(tmp.path())
-        .env_remove("SOCKET_API_TOKEN")
-        .output()
-        .expect("run");
-    assert_eq!(out.status.code(), Some(0));
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    let (code, stdout, _stderr) = common::run_with_env(tmp.path(), &["apply"], &[]);
+    assert_eq!(code, 0);
     assert!(
         stdout.contains("No .socket folder found, skipping patch application"),
         "non-JSON no-manifest must print friendly message; got: {stdout}"
@@ -222,14 +205,9 @@ fn apply_dry_run_non_json_prints_verification_summary() {
     write_npm_package(tmp.path(), "dry-target", "1.0.0", before);
     write_manifest(tmp.path(), "pkg:npm/dry-target@1.0.0", before, after);
 
-    let out = Command::new(binary())
-        .args(["apply", "--offline", "--dry-run"])
-        .current_dir(tmp.path())
-        .env_remove("SOCKET_API_TOKEN")
-        .output()
-        .expect("run");
-    assert_eq!(out.status.code(), Some(0));
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    let (code, stdout, _stderr) =
+        common::run_with_env(tmp.path(), &["apply", "--offline", "--dry-run"], &[]);
+    assert_eq!(code, 0);
     assert!(
         stdout.contains("Patch verification complete") && stdout.contains("can be patched"),
         "dry-run non-JSON should print the verification summary; got: {stdout}"
@@ -259,13 +237,8 @@ fn list_non_json_prints_table() {
     let tmp = tempfile::tempdir().unwrap();
     write_manifest(tmp.path(), "pkg:npm/list-target@1.0.0", before, after);
 
-    let out = Command::new(binary())
-        .args(["list"])
-        .current_dir(tmp.path())
-        .output()
-        .expect("run");
-    assert_eq!(out.status.code(), Some(0));
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    let (code, stdout, _stderr) = common::run_with_env(tmp.path(), &["list"], &[]);
+    assert_eq!(code, 0);
     // Require BOTH the PURL and the concrete CVE id (not the weaker
     // "Vulnerabilities" header alternative), so a table that drops the
     // vuln detail can't pass.
@@ -290,13 +263,8 @@ fn list_empty_manifest_non_json() {
     std::fs::create_dir_all(&socket).unwrap();
     std::fs::write(socket.join("manifest.json"), r#"{"patches":{}}"#).unwrap();
 
-    let out = Command::new(binary())
-        .args(["list"])
-        .current_dir(tmp.path())
-        .output()
-        .expect("run");
-    assert_eq!(out.status.code(), Some(0));
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    let (code, stdout, _stderr) = common::run_with_env(tmp.path(), &["list"], &[]);
+    assert_eq!(code, 0);
     assert!(
         stdout.contains("No patches found"),
         "empty manifest non-JSON message; got: {stdout}"
@@ -306,13 +274,8 @@ fn list_empty_manifest_non_json() {
 #[test]
 fn list_no_manifest_non_json_prints_error_to_stderr() {
     let tmp = tempfile::tempdir().unwrap();
-    let out = Command::new(binary())
-        .args(["list"])
-        .current_dir(tmp.path())
-        .output()
-        .expect("run");
-    assert_eq!(out.status.code(), Some(1));
-    let stderr = String::from_utf8_lossy(&out.stderr);
+    let (code, _stdout, stderr) = common::run_with_env(tmp.path(), &["list"], &[]);
+    assert_eq!(code, 1);
     assert!(
         stderr.contains("Manifest not found") || stderr.contains("not found"),
         "non-JSON list-without-manifest must print to stderr; got: {stderr}"
@@ -328,28 +291,23 @@ fn scan_non_json_no_packages_prints_friendly_message() {
     let tmp = tempfile::tempdir().unwrap();
     write_root(tmp.path());
     // Scan needs network normally, but with no packages crawled it
-    // short-circuits before the network call.
-    let out = Command::new(binary())
-        .args(["scan"])
-        .current_dir(tmp.path())
-        .env_remove("SOCKET_API_TOKEN")
-        // Point SOCKET_API_URL at a closed port so any accidental
-        // network call fails fast.
-        .env("SOCKET_API_URL", "http://127.0.0.1:1")
-        .output()
-        .expect("run");
+    // short-circuits before the network call. Point SOCKET_API_URL at a
+    // closed port so any accidental network call fails fast (injected
+    // AFTER the ambient scrub, so it is the only SOCKET_* var in effect).
+    let (code, stdout, stderr) = common::run_with_env(
+        tmp.path(),
+        &["scan"],
+        &[("SOCKET_API_URL", "http://127.0.0.1:1")],
+    );
     // With no installed packages, scan short-circuits BEFORE the network
     // call (we point SOCKET_API_URL at a dead port to prove no request is
     // made) and exits cleanly with the friendly message. The old test
     // accepted literally any non-empty output on either stream, which a
     // crash or a network-error spew would also satisfy.
     assert_eq!(
-        out.status.code(),
-        Some(0),
-        "scan with no packages must short-circuit to a clean exit; stderr={}",
-        String::from_utf8_lossy(&out.stderr)
+        code, 0,
+        "scan with no packages must short-circuit to a clean exit; stderr={stderr}"
     );
-    let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("No packages found"),
         "scan non-JSON must print the no-packages message; got: {stdout}"
@@ -378,14 +336,8 @@ fn repair_non_json_no_orphans_prints_summary() {
         "fixture precondition: afterHash blob present"
     );
 
-    let out = Command::new(binary())
-        .args(["repair", "--offline"])
-        .current_dir(tmp.path())
-        .env_remove("SOCKET_API_TOKEN")
-        .output()
-        .expect("run");
-    assert_eq!(out.status.code(), Some(0));
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    let (code, stdout, _stderr) = common::run_with_env(tmp.path(), &["repair", "--offline"], &[]);
+    assert_eq!(code, 0);
     // With exactly one in-use blob and no orphans, repair must report the
     // all-in-use status (not a removal) and finish. The old check accepted
     // any output containing "Repair complete.", so a repair that wrongly
@@ -422,14 +374,8 @@ fn repair_non_json_with_orphans_prints_cleanup_summary() {
         "fixture precondition: afterHash blob present"
     );
 
-    let out = Command::new(binary())
-        .args(["repair", "--offline"])
-        .current_dir(tmp.path())
-        .env_remove("SOCKET_API_TOKEN")
-        .output()
-        .expect("run");
-    assert_eq!(out.status.code(), Some(0));
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    let (code, stdout, _stderr) = common::run_with_env(tmp.path(), &["repair", "--offline"], &[]);
+    assert_eq!(code, 0);
     // The test name promises a *cleanup* summary, so assert the cleanup
     // actually happened — both in the printed summary and on disk. Pin the
     // exact count (the orphan blob + the by-design-unused beforeHash blob =
@@ -465,19 +411,17 @@ fn remove_non_json_prints_what_will_be_removed() {
     let tmp = tempfile::tempdir().unwrap();
     write_manifest(tmp.path(), "pkg:npm/remove-target@1.0.0", b"a", b"b");
 
-    let out = Command::new(binary())
-        .args([
+    let (code, stdout, _stderr) = common::run_with_env(
+        tmp.path(),
+        &[
             "remove",
             "pkg:npm/remove-target@1.0.0",
             "--yes",
             "--skip-rollback",
-        ])
-        .current_dir(tmp.path())
-        .env_remove("SOCKET_API_TOKEN")
-        .output()
-        .expect("run");
-    assert_eq!(out.status.code(), Some(0));
-    let stdout = String::from_utf8_lossy(&out.stdout);
+        ],
+        &[],
+    );
+    assert_eq!(code, 0);
     assert!(
         stdout.contains("Removed 1 patch(es) from manifest")
             && stdout.contains("pkg:npm/remove-target@1.0.0"),
@@ -505,14 +449,8 @@ fn rollback_non_json_prints_summary() {
     write_npm_package(tmp.path(), "rb-non-json", "1.0.0", after);
     write_manifest(tmp.path(), "pkg:npm/rb-non-json@1.0.0", before, after);
 
-    let out = Command::new(binary())
-        .args(["rollback", "--offline"])
-        .current_dir(tmp.path())
-        .env_remove("SOCKET_API_TOKEN")
-        .output()
-        .expect("run");
-    assert_eq!(out.status.code(), Some(0));
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    let (code, stdout, _stderr) = common::run_with_env(tmp.path(), &["rollback", "--offline"], &[]);
+    assert_eq!(code, 0);
     assert!(
         stdout.contains("Rolled back packages:") && stdout.contains("pkg:npm/rb-non-json@1.0.0"),
         "non-JSON rollback should print summary naming the PURL; got: {stdout}"
@@ -536,14 +474,9 @@ fn rollback_verbose_prints_per_file_details() {
     write_npm_package(tmp.path(), "rb-verbose", "1.0.0", after);
     write_manifest(tmp.path(), "pkg:npm/rb-verbose@1.0.0", before, after);
 
-    let out = Command::new(binary())
-        .args(["rollback", "--offline", "--verbose"])
-        .current_dir(tmp.path())
-        .env_remove("SOCKET_API_TOKEN")
-        .output()
-        .expect("run");
-    assert_eq!(out.status.code(), Some(0));
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    let (code, stdout, _stderr) =
+        common::run_with_env(tmp.path(), &["rollback", "--offline", "--verbose"], &[]);
+    assert_eq!(code, 0);
     // `--verbose` must add the per-file "Detailed verification" block.
     // The old `|| "Rolled"` alternative matched the non-verbose summary,
     // making the verbose-specific assertion vacuous.
@@ -571,8 +504,9 @@ fn get_non_json_invalid_uuid_falls_through_to_package_search() {
     // Invalid identifier without --cve/--ghsa/--package etc. The binary
     // should fall through to package-name search and either succeed or
     // exit 1 cleanly. We're exercising the type-detection branch.
-    let out = Command::new(binary())
-        .args([
+    let (code, stdout, _stderr) = common::run_with_env(
+        tmp.path(),
+        &[
             "get",
             "not-a-real-package",
             "--save-only",
@@ -583,12 +517,9 @@ fn get_non_json_invalid_uuid_falls_through_to_package_search() {
             "fake",
             "--org",
             "test-org",
-        ])
-        .current_dir(tmp.path())
-        .output()
-        .expect("run");
-    let code = out.status.code().unwrap_or(-1);
-    let stdout = String::from_utf8_lossy(&out.stdout);
+        ],
+        &[],
+    );
     // The point of the test is the type-detection branch: an identifier
     // that is neither CVE/GHSA/UUID nor an explicit flag must fall through
     // to a *package-name search*. The old `0 || 1` accepted any outcome —
@@ -608,8 +539,9 @@ fn get_non_json_invalid_uuid_falls_through_to_package_search() {
 #[test]
 fn get_with_explicit_cve_flag_works() {
     let tmp = tempfile::tempdir().unwrap();
-    let out = Command::new(binary())
-        .args([
+    let (code, stdout, _stderr) = common::run_with_env(
+        tmp.path(),
+        &[
             "get",
             "CVE-2099-99999",
             "--cve",
@@ -622,18 +554,15 @@ fn get_with_explicit_cve_flag_works() {
             "fake",
             "--org",
             "test-org",
-        ])
-        .current_dir(tmp.path())
-        .output()
-        .expect("run");
+        ],
+        &[],
+    );
     // The API is unreachable (dead port), so this must surface a network
     // error — exit 1 with a structured JSON error payload whose URL proves
     // the `--cve` flag routed to the by-cve endpoint. The old test accepted
     // exit 0-or-1 and only parsed JSON "if non-empty", so an empty stdout
     // or a wrong endpoint would have passed.
-    let code = out.status.code().unwrap_or(-1);
     assert_eq!(code, 1, "unreachable API must yield a failure exit");
-    let stdout = String::from_utf8_lossy(&out.stdout);
     let v: serde_json::Value =
         serde_json::from_str(stdout.trim()).expect("must emit parseable JSON");
     assert_eq!(
@@ -652,8 +581,9 @@ fn get_with_explicit_ghsa_flag_works() {
     let tmp = tempfile::tempdir().unwrap();
     // Non-JSON so we can assert the human-readable routing line on stdout
     // and the network error (with the by-ghsa endpoint) on stderr.
-    let out = Command::new(binary())
-        .args([
+    let (code, stdout, stderr) = common::run_with_env(
+        tmp.path(),
+        &[
             "get",
             "GHSA-1111-2222-3333",
             "--ghsa",
@@ -665,14 +595,10 @@ fn get_with_explicit_ghsa_flag_works() {
             "fake",
             "--org",
             "test-org",
-        ])
-        .current_dir(tmp.path())
-        .output()
-        .expect("run");
-    let code = out.status.code().unwrap_or(-1);
+        ],
+        &[],
+    );
     assert_eq!(code, 1, "unreachable API must yield a failure exit");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stdout.contains("Searching patches for GHSA: GHSA-1111-2222-3333"),
         "--ghsa must announce a GHSA search; got: {stdout}"
@@ -686,8 +612,9 @@ fn get_with_explicit_ghsa_flag_works() {
 #[test]
 fn get_with_explicit_package_flag_works() {
     let tmp = tempfile::tempdir().unwrap();
-    let out = Command::new(binary())
-        .args([
+    let (code, stdout, _stderr) = common::run_with_env(
+        tmp.path(),
+        &[
             "get",
             "some-package",
             "--package",
@@ -700,20 +627,17 @@ fn get_with_explicit_package_flag_works() {
             "fake",
             "--org",
             "test-org",
-        ])
-        .current_dir(tmp.path())
-        .output()
-        .expect("run");
+        ],
+        &[],
+    );
     // `--package` forces a package-name search. With no installed packages
     // it short-circuits locally (never reaching the dead API), exits 0, and
     // emits the structured "no_packages" JSON. The old `0 || 1` would have
     // accepted a crash or a misrouted vuln lookup.
-    let code = out.status.code().unwrap_or(-1);
     assert_eq!(
         code, 0,
         "package search with no packages should exit cleanly"
     );
-    let stdout = String::from_utf8_lossy(&out.stdout);
     let v: serde_json::Value =
         serde_json::from_str(stdout.trim()).expect("must emit parseable JSON");
     assert_eq!(v["status"], "no_packages", "got: {stdout}");
@@ -727,13 +651,8 @@ fn get_with_explicit_package_flag_works() {
 #[test]
 fn setup_no_files_non_json_prints_friendly_message() {
     let tmp = tempfile::tempdir().unwrap();
-    let out = Command::new(binary())
-        .args(["setup"])
-        .current_dir(tmp.path())
-        .output()
-        .expect("run");
-    assert_eq!(out.status.code(), Some(0));
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    let (code, stdout, _stderr) = common::run_with_env(tmp.path(), &["setup"], &[]);
+    assert_eq!(code, 0);
     assert!(
         stdout.contains("No package.json"),
         "non-JSON setup must report missing package.json; got: {stdout}"
@@ -749,13 +668,9 @@ fn setup_dry_run_non_json_prints_preview() {
     )
     .unwrap();
     let before = std::fs::read_to_string(tmp.path().join("package.json")).unwrap();
-    let out = Command::new(binary())
-        .args(["setup", "--dry-run", "--yes"])
-        .current_dir(tmp.path())
-        .output()
-        .expect("run");
-    assert_eq!(out.status.code(), Some(0));
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    let (code, stdout, _stderr) =
+        common::run_with_env(tmp.path(), &["setup", "--dry-run", "--yes"], &[]);
+    assert_eq!(code, 0);
     assert!(
         stdout.contains("would be updated") && stdout.contains("postinstall"),
         "non-JSON setup dry-run should preview the postinstall hook; got: {stdout}"
@@ -779,8 +694,9 @@ fn setup_dry_run_non_json_prints_preview() {
 #[test]
 fn bare_uuid_fallback_treats_uuid_as_get_identifier() {
     let tmp = tempfile::tempdir().unwrap();
-    let out = Command::new(binary())
-        .args([
+    let (code, stdout, _stderr) = common::run_with_env(
+        tmp.path(),
+        &[
             "11111111-1111-4111-8111-111111111111",
             "--save-only",
             "--yes",
@@ -791,18 +707,15 @@ fn bare_uuid_fallback_treats_uuid_as_get_identifier() {
             "fake",
             "--org",
             "test-org",
-        ])
-        .current_dir(tmp.path())
-        .output()
-        .expect("run");
-    let code = out.status.code().unwrap_or(-1);
+        ],
+        &[],
+    );
     // The bare UUID must be rewritten to `get <UUID>` and routed to the
     // patch-view endpoint. We prove the rewrite happened by inspecting the
     // failed-request URL in the JSON error: it must hit
     // `patches/view/<uuid>`. The old `0 || 1` would have passed even if the
     // UUID were treated as an unknown command or misrouted.
     assert_eq!(code, 1, "unreachable API must yield a failure exit");
-    let stdout = String::from_utf8_lossy(&out.stdout);
     let v: serde_json::Value =
         serde_json::from_str(stdout.trim()).expect("must emit parseable JSON");
     assert_eq!(v["status"], "error", "got: {stdout}");
@@ -819,16 +732,13 @@ fn bare_uuid_fallback_treats_uuid_as_get_identifier() {
 
 #[test]
 fn each_subcommand_help_prints_usage() {
+    let tmp = tempfile::tempdir().unwrap();
     let subcommands = [
         "apply", "rollback", "get", "scan", "list", "remove", "setup", "repair", "gc",
     ];
     for sub in subcommands {
-        let out = Command::new(binary())
-            .args([sub, "--help"])
-            .output()
-            .expect("run");
-        assert_eq!(out.status.code(), Some(0), "subcommand {sub} --help failed");
-        let stdout = String::from_utf8_lossy(&out.stdout);
+        let (code, stdout, _stderr) = common::run_with_env(tmp.path(), &[sub, "--help"], &[]);
+        assert_eq!(code, 0, "subcommand {sub} --help failed");
         assert!(
             stdout.contains("Usage:") || stdout.contains("USAGE"),
             "{sub} --help must print usage; got: {stdout}"
@@ -838,12 +748,9 @@ fn each_subcommand_help_prints_usage() {
 
 #[test]
 fn top_level_help_prints_all_subcommands() {
-    let out = Command::new(binary())
-        .args(["--help"])
-        .output()
-        .expect("run");
-    assert_eq!(out.status.code(), Some(0));
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    let tmp = tempfile::tempdir().unwrap();
+    let (code, stdout, _stderr) = common::run_with_env(tmp.path(), &["--help"], &[]);
+    assert_eq!(code, 0);
     for sub in [
         "apply", "rollback", "get", "scan", "list", "remove", "setup", "repair",
     ] {
@@ -858,12 +765,9 @@ fn top_level_help_prints_all_subcommands() {
 
 #[test]
 fn version_flag_prints_version() {
-    let out = Command::new(binary())
-        .args(["--version"])
-        .output()
-        .expect("run");
-    assert_eq!(out.status.code(), Some(0));
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    let tmp = tempfile::tempdir().unwrap();
+    let (code, stdout, _stderr) = common::run_with_env(tmp.path(), &["--version"], &[]);
+    assert_eq!(code, 0);
     // Derive the expected version from the crate metadata at compile time
     // rather than a hardcoded literal. The old test OR'd in a stale
     // "3.0.0", so a binary reporting any (even wrong) version still passed.

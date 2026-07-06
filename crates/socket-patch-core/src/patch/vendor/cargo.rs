@@ -659,6 +659,8 @@ mod tests {
     use std::path::PathBuf;
 
     const UUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
+    /// A second canonical uuid, for re-vendor (patch update) scenarios.
+    const UUID2: &str = "0a1b2c3d-4e5f-6a7b-8c9d-0e1f2a3b4c5d";
     const PURL: &str = "pkg:cargo/cfg-if@1.0.4";
     const PRISTINE: &[u8] = b"pub fn cfg() {}\n";
     const PATCHED: &[u8] = b"pub fn cfg() { /* patched */ }\n";
@@ -1376,6 +1378,128 @@ mod tests {
         // The refusals deleted nothing: the vendored state is fully intact.
         assert!(root.join(copy_rel()).exists());
         assert!(cargo_config::read_patch_entries(root).await["cfg-if"].socket_owned);
+    }
+
+    /// A patch update moves the manifest to a NEW uuid for the same crate.
+    /// The CLI re-vendors straight over the first run's live wiring (see
+    /// `persist_vendor_entry`: originals are carried forward and the old
+    /// uuid dir swept afterwards — there is no revert-first). The lock is
+    /// already in the detached shape from the first run, so the re-vendor
+    /// must accept it as the desired state and succeed — never fail and
+    /// unwind the live config entry (which bricks every build: no `[patch]`
+    /// entry left, source-less lock entry).
+    #[tokio::test]
+    async fn test_revendor_new_uuid_over_live_wiring_succeeds() {
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        expect_done(run_vendor(PURL, root, &blobs, &pristine, &record, false).await);
+        let lock_detached = tokio::fs::read(root.join("Cargo.lock")).await.unwrap();
+
+        let mut record2 = record.clone();
+        record2.uuid = UUID2.into();
+        let (result, entry, _warnings) =
+            expect_done(run_vendor(PURL, root, &blobs, &pristine, &record2, false).await);
+        assert!(result.success, "re-vendor must succeed: {:?}", result.error);
+
+        // The config entry is repointed at the new uuid's copy.
+        let new_rel = format!(".socket/vendor/cargo/{UUID2}/cfg-if-1.0.4");
+        assert_eq!(
+            cargo_config::read_patch_entries(root).await["cfg-if"]
+                .path
+                .as_deref(),
+            Some(new_rel.as_str())
+        );
+        // The new copy carries the patched bytes; the old uuid dir is left
+        // for the caller's stale-artifact sweep (the caller owns the ledger).
+        assert_eq!(
+            tokio::fs::read(root.join(&new_rel).join("src/lib.rs"))
+                .await
+                .unwrap(),
+            PATCHED
+        );
+        assert!(root.join(copy_rel()).exists());
+        // The already-detached lock is untouched.
+        assert_eq!(
+            tokio::fs::read(root.join("Cargo.lock")).await.unwrap(),
+            lock_detached
+        );
+        // A fresh entry is emitted for the ledger. This run edited no lock,
+        // so it records no originals — the true pre-vendor source/checksum
+        // live only in the entry being replaced (the caller carries them
+        // forward).
+        let entry = entry.expect("re-vendor emits the new ledger entry");
+        assert_eq!(entry.uuid, UUID2);
+        assert_eq!(entry.artifact.path, new_rel);
+        assert_eq!(entry.lock, None);
+    }
+
+    /// When the lock-detach step fails mid-re-vendor (here: the lock went
+    /// corrupt, which the pre-flight cross-check deliberately skips), the
+    /// unwind must put the PRIOR socket-owned config entry back — dropping
+    /// it would destroy the first vendor's live wiring.
+    #[tokio::test]
+    async fn test_detach_failure_unwind_restores_prior_socket_entry() {
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        expect_done(run_vendor(PURL, root, &blobs, &pristine, &record, false).await);
+
+        tokio::fs::write(root.join("Cargo.lock"), "not = = toml [[[")
+            .await
+            .unwrap();
+
+        let mut record2 = record.clone();
+        record2.uuid = UUID2.into();
+        let (result, entry, _warnings) =
+            expect_done(run_vendor(PURL, root, &blobs, &pristine, &record2, false).await);
+        assert!(!result.success);
+        assert!(entry.is_none());
+        // The prior entry is restored, not dropped; the new uuid dir is gone.
+        assert_eq!(
+            cargo_config::read_patch_entries(root).await["cfg-if"]
+                .path
+                .as_deref(),
+            Some(copy_rel().as_str()),
+            "unwind must restore the pre-existing socket entry"
+        );
+        assert!(!root.join(format!(".socket/vendor/cargo/{UUID2}")).exists());
+        assert!(
+            root.join(copy_rel()).exists(),
+            "first vendor's copy untouched"
+        );
+    }
+
+    /// Deleting the WHOLE uuid dir (not just the copy leaf) loses the
+    /// committed marker; the artifact-only rebuild must restore it alongside
+    /// the copy (as the golang backend does), or the re-committed vendor
+    /// unit is incomplete.
+    #[tokio::test]
+    async fn test_wired_deleted_uuid_dir_rebuild_restores_marker() {
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        expect_done(run_vendor(PURL, root, &blobs, &pristine, &record, false).await);
+        remove_tree(&root.join(format!(".socket/vendor/cargo/{UUID}")))
+            .await
+            .unwrap();
+
+        let (result, entry, warnings) =
+            expect_done(run_vendor(PURL, root, &blobs, &pristine, &record, false).await);
+        assert!(result.success, "{:?}", result.error);
+        assert!(entry.is_none());
+        assert!(
+            warnings.iter().any(|w| w.code == "vendor_artifact_rebuilt"),
+            "{warnings:?}"
+        );
+        assert_eq!(
+            tokio::fs::read(root.join(copy_rel()).join("src/lib.rs"))
+                .await
+                .unwrap(),
+            PATCHED
+        );
+        let marker = root.join(format!(".socket/vendor/cargo/{UUID}/{VENDOR_MARKER_FILE}"));
+        assert!(
+            marker.exists(),
+            "rebuild must restore the committed marker file"
+        );
     }
 
     #[tokio::test]

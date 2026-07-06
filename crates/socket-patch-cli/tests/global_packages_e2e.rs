@@ -27,6 +27,36 @@ fn binary() -> PathBuf {
     env!("CARGO_BIN_EXE_socket-patch").into()
 }
 
+/// Build a `socket-patch` `Command` with the ambient `SOCKET_*` env
+/// surface scrubbed (mirrors `common::run_with_env`). The binary binds
+/// ~20 `SOCKET_*` vars via clap, so an ambient value silently changes
+/// what these tests exercise — `SOCKET_DRY_RUN=true` flips every apply
+/// envelope's `dryRun` field, and `SOCKET_GLOBAL_PREFIX` bypasses the
+/// npm/yarn/pnpm resolution chain this file exists to cover. The
+/// highest-risk vars are seeded with hostile values and then scrubbed —
+/// `env_remove` clears the seed too, so the child never sees it, but if
+/// a scrub line is ever dropped the seed (rather than a developer's
+/// ambient shell, which the suite can't rely on) turns the tests red
+/// immediately. Telemetry opt-outs are kept so an opted-out dev stays
+/// opted out.
+fn cli(cwd: &Path) -> Command {
+    let mut cmd = Command::new(binary());
+    cmd.current_dir(cwd);
+    cmd.env("SOCKET_DRY_RUN", "true")
+        .env("SOCKET_GLOBAL_PREFIX", "/nonexistent")
+        .env("SOCKET_MANIFEST_PATH", "/nonexistent/manifest.json")
+        .env_remove("SOCKET_DRY_RUN")
+        .env_remove("SOCKET_GLOBAL_PREFIX")
+        .env_remove("SOCKET_MANIFEST_PATH");
+    for (key, _) in std::env::vars_os() {
+        let name = key.to_string_lossy();
+        if name.starts_with("SOCKET_") && !name.contains("TELEMETRY") {
+            cmd.env_remove(&key);
+        }
+    }
+    cmd
+}
+
 fn write_manifest(root: &Path, purl: &str) {
     let socket = root.join(".socket");
     std::fs::create_dir_all(&socket).unwrap();
@@ -174,10 +204,8 @@ fn apply_global_resolves_real_npm_prefix() {
     let tmp = tempfile::tempdir().unwrap();
     write_manifest(tmp.path(), "pkg:npm/__global_test__@1.0.0");
 
-    let out = Command::new(binary())
+    let out = cli(tmp.path())
         .args(["apply", "--global", "--offline", "--json", "--silent"])
-        .current_dir(tmp.path())
-        .env_remove("SOCKET_API_TOKEN")
         .output()
         .expect("run socket-patch");
     let code = out.status.code().unwrap_or(-1);
@@ -194,10 +222,8 @@ fn rollback_global_resolves_real_npm_prefix() {
     let tmp = tempfile::tempdir().unwrap();
     write_manifest(tmp.path(), "pkg:npm/__rollback_global__@1.0.0");
 
-    let out = Command::new(binary())
+    let out = cli(tmp.path())
         .args(["rollback", "--global", "--offline", "--json", "--silent"])
-        .current_dir(tmp.path())
-        .env_remove("SOCKET_API_TOKEN")
         .output()
         .expect("run socket-patch");
     let code = out.status.code().unwrap_or(-1);
@@ -232,7 +258,7 @@ fn apply_global_prefix_uses_explicit_path() {
     write_manifest(tmp.path(), PREFIX_PURL);
 
     let run = |cwd: &Path| {
-        let out = Command::new(binary())
+        let out = cli(cwd)
             .args([
                 "apply",
                 "--global",
@@ -242,8 +268,6 @@ fn apply_global_prefix_uses_explicit_path() {
                 "--json",
                 "--silent",
             ])
-            .current_dir(cwd)
-            .env_remove("SOCKET_API_TOKEN")
             .output()
             .expect("run socket-patch");
         (
@@ -281,7 +305,7 @@ fn rollback_global_prefix_uses_explicit_path() {
     write_manifest(tmp.path(), PREFIX_PURL);
 
     let run = || {
-        let out = Command::new(binary())
+        let out = cli(tmp.path())
             .args([
                 "rollback",
                 "--global",
@@ -291,8 +315,6 @@ fn rollback_global_prefix_uses_explicit_path() {
                 "--json",
                 "--silent",
             ])
-            .current_dir(tmp.path())
-            .env_remove("SOCKET_API_TOKEN")
             .output()
             .expect("run socket-patch");
         (
@@ -356,10 +378,8 @@ fn apply_global_with_empty_path_handles_missing_npm() {
     let tmp = tempfile::tempdir().unwrap();
     write_manifest(tmp.path(), "pkg:npm/__missing_npm__@1.0.0");
 
-    let out = Command::new(binary())
+    let out = cli(tmp.path())
         .args(["apply", "--global", "--offline", "--json", "--silent"])
-        .current_dir(tmp.path())
-        .env_remove("SOCKET_API_TOKEN")
         // Empty PATH so no package-manager binary can be located.
         .env("PATH", "/nonexistent-dir-for-test")
         .output()
@@ -378,10 +398,8 @@ fn rollback_global_with_empty_path_handles_missing_npm() {
     let tmp = tempfile::tempdir().unwrap();
     write_manifest(tmp.path(), "pkg:npm/__missing_npm__@1.0.0");
 
-    let out = Command::new(binary())
+    let out = cli(tmp.path())
         .args(["rollback", "--global", "--offline", "--json", "--silent"])
-        .current_dir(tmp.path())
-        .env_remove("SOCKET_API_TOKEN")
         .env("PATH", "/nonexistent-dir-for-test")
         .output()
         .expect("run socket-patch");
@@ -443,10 +461,8 @@ fn apply_global_with_stub_npm_root_resolves_path() {
 
     write_manifest(tmp.path(), "pkg:npm/__stubbed_npm__@1.0.0");
 
-    let out = Command::new(binary())
+    let out = cli(tmp.path())
         .args(["apply", "--global", "--offline", "--json", "--silent"])
-        .current_dir(tmp.path())
-        .env_remove("SOCKET_API_TOKEN")
         .env("PATH", stub_dir.to_str().unwrap())
         .output()
         .expect("run socket-patch");
@@ -486,10 +502,8 @@ fn apply_global_with_empty_npm_root_output_handles_error() {
 
     write_manifest(tmp.path(), "pkg:npm/__empty_npm__@1.0.0");
 
-    let out = Command::new(binary())
+    let out = cli(tmp.path())
         .args(["apply", "--global", "--offline", "--json", "--silent"])
-        .current_dir(tmp.path())
-        .env_remove("SOCKET_API_TOKEN")
         .env("PATH", stub_dir.to_str().unwrap())
         .output()
         .expect("run socket-patch");
@@ -519,10 +533,8 @@ fn apply_global_with_failing_npm_handles_error() {
 
     write_manifest(tmp.path(), "pkg:npm/__failing_npm__@1.0.0");
 
-    let out = Command::new(binary())
+    let out = cli(tmp.path())
         .args(["apply", "--global", "--offline", "--json", "--silent"])
-        .current_dir(tmp.path())
-        .env_remove("SOCKET_API_TOKEN")
         .env("PATH", stub_dir.to_str().unwrap())
         .output()
         .expect("run socket-patch");

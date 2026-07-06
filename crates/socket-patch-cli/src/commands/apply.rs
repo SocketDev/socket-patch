@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::args::{apply_env_toggles, GlobalArgs};
-use crate::commands::fetch_stage::{stage_patch_sources, StageOutcome};
+use crate::commands::fetch_stage::{stage_patch_sources, StageOutcome, StagedSources};
 use crate::commands::lock_cli::{acquire_or_emit, lock_broken_event};
 use crate::commands::vex::{generate_vex_from_manifest_path, VexEmbedArgs};
 use crate::ecosystem_dispatch::{find_packages_for_purls, partition_purls};
@@ -69,12 +69,12 @@ async fn ensure_blobs_for_mismatches(
     args: &ApplyArgs,
     manifest: &PatchManifest,
     all_packages: &HashMap<String, PathBuf>,
-    blobs_path: &Path,
+    staged: &mut StagedSources,
 ) {
     if args.common.strict && !args.force {
         return; // strict fails on mismatch — nothing to fetch
     }
-    let needed = mismatch_blob_gaps(manifest, all_packages, blobs_path, args.force).await;
+    let needed = mismatch_blob_gaps(manifest, all_packages, &staged.blobs, args.force).await;
     if needed.is_empty() {
         return;
     }
@@ -94,6 +94,19 @@ async fn ensure_blobs_for_mismatches(
             needed.len()
         );
     }
+    // Apply is read-only against `.socket/`: when the stage step returned
+    // direct `.socket/` paths (everything had a local source), the on-demand
+    // blobs must go to a transient overlay, never `.socket/blobs/`.
+    let Some(blobs_path) = staged.writable_blobs().await else {
+        if !args.common.silent && !args.common.json {
+            eprintln!(
+                "Warning: could not stage a transient blob directory; {} mismatched file(s) \
+                 will fail to apply",
+                needed.len()
+            );
+        }
+        return;
+    };
     let (client, _) = get_api_client_with_overrides(args.common.api_client_overrides()).await;
     let _ = socket_patch_core::api::blob_fetcher::fetch_blobs_by_hash(
         &needed, blobs_path, &client, None,
@@ -304,11 +317,18 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
         // silently passing — the guard treats exit 0 as "in sync".
         Ok(None) => return 0,
         Err(e) => {
-            if !args.common.silent && !args.common.json {
-                eprintln!(
-                    "Patch redirect check could not read the manifest ({e}); \
-                     treating as drift (fail-closed)."
-                );
+            let msg = format!(
+                "Patch redirect check could not read the manifest ({e}); \
+                 treating as drift (fail-closed)."
+            );
+            if args.common.json {
+                let mut env = Envelope::new(Command::Apply);
+                env.mark_error(EnvelopeError::new("manifest_unreadable", msg));
+                println!("{}", env.to_pretty_json());
+            } else {
+                // Errors print even under --silent ("errors only", never
+                // "nothing"): exit 1 with no message would be undiagnosable.
+                eprintln!("{msg}");
             }
             return 1;
         }
@@ -375,7 +395,9 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
             }
             env.mark_partial_failure();
             println!("{}", env.to_pretty_json());
-        } else if !args.common.silent {
+        } else {
+            // Drift IS the error the exit code signals — it prints even
+            // under --silent ("errors only", never "nothing").
             eprintln!("Patch redirects are OUT OF SYNC:");
             for (_, _, detail) in &drifts {
                 eprintln!("  {detail}");
@@ -601,7 +623,9 @@ pub async fn run(args: ApplyArgs) -> i32 {
                     "yarn-berry Plug'n'Play layout is not supported by socket-patch (packages live inside .yarn/cache zips). Use `yarn patch <pkg>` instead.",
                 ));
                 println!("{}", env.to_pretty_json());
-            } else if !args.common.silent {
+            } else {
+                // Errors print even under --silent ("errors only", never
+                // "nothing"): exit 1 with no message would be undiagnosable.
                 eprintln!("Error: yarn-berry Plug'n'Play layout is not supported.");
                 eprintln!(
                     "  Packages live inside .yarn/cache/*.zip — socket-patch cannot rewrite them in place."
@@ -802,20 +826,25 @@ pub async fn run(args: ApplyArgs) -> i32 {
 
             // Human-readable VEX status (JSON mode already folded the
             // outcome into the envelope above).
-            if !args.common.json && !args.common.silent {
+            if !args.common.json {
                 match &vex_result {
                     Some(Ok(summary)) => {
-                        println!(
-                            "Wrote OpenVEX document with {} statement(s) to {}",
-                            summary.statements,
-                            args.vex.vex.as_ref().unwrap().display(),
-                        );
+                        if !args.common.silent {
+                            println!(
+                                "Wrote OpenVEX document with {} statement(s) to {}",
+                                summary.statements,
+                                args.vex.vex.as_ref().unwrap().display(),
+                            );
+                        }
                     }
                     Some(Err(e)) => {
+                        // Errors print even under --silent ("errors only",
+                        // never "nothing"): exit 1 with no message would be
+                        // undiagnosable.
                         eprintln!("Error: VEX generation failed: {}", e.message);
                     }
                     None => {
-                        if args.common.dry_run && args.vex.vex.is_some() {
+                        if !args.common.silent && args.common.dry_run && args.vex.vex.is_some() {
                             println!("Skipping VEX generation (--dry-run: nothing was applied).");
                         }
                     }
@@ -862,7 +891,9 @@ pub async fn run(args: ApplyArgs) -> i32 {
                 env.dry_run = args.common.dry_run;
                 env.mark_error(EnvelopeError::new("apply_failed", e.clone()));
                 println!("{}", env.to_pretty_json());
-            } else if !args.common.silent {
+            } else {
+                // Errors print even under --silent ("errors only", never
+                // "nothing"): exit 1 with no message would be undiagnosable.
                 eprintln!("Error: {e}");
             }
             1
@@ -966,7 +997,7 @@ async fn apply_patches_inner(
         .patches
         .retain(|purl, _| target_manifest_purls.contains(purl));
 
-    let staged = match stage_patch_sources(&args.common, &scoped_manifest, socket_dir).await? {
+    let mut staged = match stage_patch_sources(&args.common, &scoped_manifest, socket_dir).await? {
         StageOutcome::Ready(s) => s,
         StageOutcome::Unavailable => return Ok((false, Vec::new(), Vec::new())),
     };
@@ -1042,7 +1073,7 @@ async fn apply_patches_inner(
     }
 
     // Apply patches
-    ensure_blobs_for_mismatches(args, &manifest, &all_packages, &staged.blobs).await;
+    ensure_blobs_for_mismatches(args, &manifest, &all_packages, &mut staged).await;
     let sources = staged.as_patch_sources();
     let policy = mismatch_policy(args.force, args.common.strict);
     let mut has_errors = false;

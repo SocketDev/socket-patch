@@ -53,7 +53,7 @@ In v3.0 every subcommand accepts the same set of "global" flags via a single sha
 | `--debug` | — | `SOCKET_DEBUG` | `false` | bool | Verbose debug logs to stderr |
 | `--no-telemetry` | — | `SOCKET_TELEMETRY_DISABLED` | `false` | bool | Disable anonymous usage telemetry |
 
-The `--offline` semantics unified in v3.0. Previously `apply` enforced strict airgap, `repair` skipped network ops, and `rollback` failed when blobs were missing. All three now mean the same thing: never contact the network, fail loudly when a required local source is missing. On `repair`, `--offline` and `--download-only` are mutually exclusive (exit 2).
+The `--offline` semantics unified in v3.0. Previously `apply` enforced strict airgap, `repair` skipped network ops, and `rollback` failed when blobs were missing. All three now mean the same thing: never contact the network, fail loudly when a required local source is missing. On `repair`, `--offline` and `--download-only` are mutually exclusive (exit 2). `scan` and `get` need remote data for their core function (patch discovery / patch fetch), so `--offline` refuses them up front — exit 1 with an error naming the offline gate (JSON: `status: "error"`), before any crawl, client build, or network contact. This covers `scan --vendor` too: offline vendored staging is `vendor --offline`'s job.
 
 The `--strict` mismatch policy applies to the in-place apply paths (apply/get/scan --apply/hook/go redirect). DEFAULT (v3.4): a file whose on-disk content matches neither the patch's beforeHash nor its afterHash is overwritten with the FULL verified patched content (the diff strategy self-disables on a wrong base; archive/blob writes are hash-gated to exactly afterHash; the missing blob is downloaded on demand) and surfaced as a `content_mismatch_overwritten` stderr warning + Skipped event. `--strict` turns that case into a hard error. `--force` overrides `--strict` and additionally skips missing files. Vendor staging is unaffected (it always auto-overwrites into its private stage).
 
@@ -171,8 +171,8 @@ in particular, are behavior changes that gate a version bump when implemented).
 4. **`check` proves a correctly-patched state.** `setup --check` reports `configured` only when the
    in-scope ecosystems are *actually in a correctly patched state* — install hooks present **and**
    on-disk patch consistency verified (the `apply --check` invariant: every manifest file's hash matches
-   `afterHash`). *(Partially implemented; **hook-presence only today** — `check` does not yet verify
-   on-disk patch consistency. RED-guarded.)*
+   `afterHash`). *(Implemented — `run_check` appends a `patch` entry per installed-but-drifted PURL via
+   `append_patch_consistency_entries`; uninstalled packages and zero-file records are not drift.)*
 
 5. **In-repo and committable.** `setup` writes only inside the working tree: `package.json`,
    `pyproject.toml`/`requirements.txt`, the `Gemfile` + generated `.socket/bundler-plugin/`. Every
@@ -232,7 +232,7 @@ still show up in VEX).
 |---|---|---|---|
 | npm / yarn / pnpm / bun | `scripts.postinstall` + `scripts.dependencies` | `npm/pnpm install` (+ `install <pkg>`) | pnpm: root package only |
 | pypi | `socket-patch[hook]` dependency → `.pth` startup hook | Python interpreter startup after installed-set change | manifest = `pyproject.toml` (uv/poetry/pdm/hatch) or `requirements.txt` (pip) |
-| gem | managed `plugin "socket-patch"` block in the `Gemfile` → committed in-tree Bundler plugin under `.socket/bundler-plugin/` | every `bundle install` (cached + fresh: load-time digest gate + `after-install-all` hook) | Bundler loads only committed git plugins, so the generated dir must be committed; CLI must be on `PATH`. Phase 1 references the in-tree plugin via `git:`; Phase 2 (follow-up) switches to a published `socket-patch-bundler` gem |
+| gem | managed `plugin "socket-patch"` block in the `Gemfile` → committed in-tree Bundler plugin under `.socket/bundler-plugin/` | every `bundle install` (cached + fresh: load-time digest gate + `after-install-all` hook) | the plugin is `path:`-sourced (a `git:` dir source is uncloneable — the generated dir is not a git repo — and fails `bundle install`); the dir must be committed so clones/CI have it; CLI must be on `PATH`. Phase 2 (follow-up) switches to a published `socket-patch-bundler` gem |
 | composer | `socket-patch apply` appended to `composer.json`'s `post-install-cmd` + `post-update-cmd` script events | every `composer install` / `composer update` | CLI must be on `PATH` |
 | cargo · golang | **none** (apply-only) | — | see "Cargo and Go: apply-only, no setup" below; candidates for the **manual** declaration |
 | nuget · maven · deno | **none** (apply-only) | — | `setup` reports `no_files`; candidates for the **manual** declaration |
@@ -282,9 +282,12 @@ share the limitation).
 **Deeply nested transitive dependencies are fully supported.** The npm crawler recurses `node_modules`
 at unbounded depth, and `apply` is path-agnostic — it patches a package by PURL against the manifest
 regardless of how deep in the dependency tree it was installed, so a deeply-nested transitive dependency
-is patched identically to a direct one. Pinned by
-`crawl_all_discovers_deeply_nested_transitive_deps` in
-`crates/socket-patch-core/tests/crawler_npm_e2e.rs`.
+is patched identically to a direct one. Both halves are pinned in
+`crates/socket-patch-core/tests/crawler_npm_e2e.rs`: discovery by
+`crawl_all_discovers_deeply_nested_transitive_deps`, and apply-side resolution by
+`find_by_purls_resolves_nested_only_install` (`find_by_purls` probes the tree root first, then falls
+back breadth-first into nested `node_modules` for still-unresolved PURLs; a root-level install always
+wins, pinned by `find_by_purls_prefers_root_copy_over_nested_duplicate`).
 
 ### JSON output shapes (`setup`, `setup --check`, `setup --remove`)
 
@@ -746,6 +749,7 @@ Every `--json` invocation emits a single JSON object that follows the **unified 
 | `no_local_source`         | `skipped`/`failed` | `--offline` and the patch is missing from `.socket/`. |
 | `paid_required`           | `failed` / status=`paidRequired` | get/scan: patch needs a paid plan and the caller's token isn't entitled. |
 | `download_failed`         | `failed`         | repair/get: network or 404 on patch fetch. |
+| `cleanup_failed`          | `skipped` (warning) | repair: an orphan-sweep pass (blobs, diff or package archives) failed mid-way (e.g. permission error). The run continues and exits 0; human mode carries the warning on stderr (not muted by `--silent`). |
 | `rollback_failed`         | `failed`         | remove/rollback: file restore could not complete. |
 | `vendored`                | `skipped`        | apply (every ecosystem) + scan `--apply`: the package is managed by `socket-patch vendor`; the command yields ownership (scan also skips the download). Rollback surfaces the same skip via its `vendored: []` array. |
 | `vendor_reverted`         | `removed`        | remove: vendoring reverted (lock fragments restored, artifact + ledger entry gone) as part of removing the patch. |

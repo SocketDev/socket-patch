@@ -27,6 +27,11 @@ uuid = { workspace = true }
 regex = { workspace = true }
 tempfile = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+# main.rs restores the default SIGPIPE disposition so piped invocations
+# (`socket-patch scan | head -1`) die quietly instead of panicking.
+libc = { workspace = true }
+
 [features]
 # Every ecosystem (npm, PyPI, Ruby gems, Go, Cargo, NuGet, Maven, Composer,
 # Deno) is unconditionally compiled in — there are no ecosystem feature gates.

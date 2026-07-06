@@ -52,6 +52,47 @@ fn has(cmd: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Build a package-manager `Command` with ambient PM-config env scrubbed by
+/// case-insensitive prefix. Package managers read config from env and env
+/// outranks project config: an ambient `npm_config_dry_run=true` turns a
+/// fixture install into an exit-0 no-op (npm/pnpm/bun honor `npm_config_*`),
+/// `YARN_NODE_LINKER=pnp` flips berry to a PnP layout with no `node_modules`
+/// (env outranks `.yarnrc.yml`), and `BUNDLE_FROZEN=true` fails the bundler
+/// install into a silent SKIP — all false verdicts unrelated to the code
+/// under test.
+///
+/// For prefixes with a verified-hostile knob the hostile value is seeded and
+/// then explicitly removed: the child never sees it, but if a scrub line is
+/// ever dropped the seed (not a developer's shell) turns the suite red
+/// immediately. Seed test-specific env AFTER this helper — `Command` env
+/// calls apply in order, so a later scrub would wipe the seed.
+fn pm_command(program: &str, prefixes: &[&str]) -> Command {
+    let mut cmd = Command::new(program);
+    for p in prefixes {
+        match *p {
+            "npm_config_" => {
+                cmd.env("npm_config_dry_run", "true")
+                    .env_remove("npm_config_dry_run");
+            }
+            "YARN_" => {
+                cmd.env("YARN_NODE_LINKER", "pnp")
+                    .env_remove("YARN_NODE_LINKER");
+            }
+            _ => {}
+        }
+    }
+    for (k, _) in std::env::vars_os() {
+        let name = k.to_string_lossy().to_ascii_lowercase();
+        if prefixes
+            .iter()
+            .any(|p| name.starts_with(&p.to_ascii_lowercase()))
+        {
+            cmd.env_remove(&k);
+        }
+    }
+    cmd
+}
+
 fn default_apply(cwd: &Path) -> ApplyArgs {
     ApplyArgs {
         common: socket_patch_cli::args::GlobalArgs {
@@ -111,7 +152,7 @@ async fn yarn_install_then_apply_patches_file() {
     )
     .unwrap();
 
-    let status = Command::new("yarn")
+    let status = pm_command("yarn", &["npm_config_", "YARN_"])
         .args(["install", "--silent", "--no-progress"])
         .current_dir(tmp.path())
         .stdout(std::process::Stdio::piped())
@@ -171,7 +212,7 @@ async fn pnpm_install_then_apply_patches_file() {
     )
     .unwrap();
 
-    let status = Command::new("pnpm")
+    let status = pm_command("pnpm", &["npm_config_"])
         .args(["install", "--silent", "--no-frozen-lockfile"])
         .current_dir(tmp.path())
         .stdout(std::process::Stdio::piped())
@@ -271,7 +312,7 @@ async fn npm_workspaces_monorepo_apply() {
         r#"{ "name": "a", "version": "1.0.0", "dependencies": { "ms": "2.1.3" } }"#,
     )
     .unwrap();
-    let status = Command::new("npm")
+    let status = pm_command("npm", &["npm_config_"])
         .args(["install", "--silent", "--no-audit", "--no-fund"])
         .current_dir(tmp.path())
         .output()
@@ -337,9 +378,12 @@ gem 'colorize', '1.1.0'
     )
     .unwrap();
     // Install into a local vendor/bundle path to avoid touching the
-    // user's gem environment.
-    let status = Command::new("bundle")
-        .args(["install", "--path", "vendor/bundle", "--quiet"])
+    // user's gem environment. The path is passed via `BUNDLE_PATH` (not the
+    // legacy `--path` flag, which Bundler ≥3 removed — with it this leg
+    // silently SKIPped on every modern machine and never ran).
+    let status = pm_command("bundle", &["BUNDLE_"])
+        .args(["install", "--quiet"])
+        .env("BUNDLE_PATH", "vendor/bundle")
         .current_dir(tmp.path())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -433,7 +477,7 @@ async fn bun_install_then_apply_patches_file() {
 
     // Private cache so the fixture install never touches the user's bun cache.
     let cache = tmp.path().join("bun-cache");
-    let status = Command::new("bun")
+    let status = pm_command("bun", &["npm_config_", "BUN_"])
         .args(["install", "--no-progress"])
         .current_dir(tmp.path())
         .env("BUN_INSTALL_CACHE_DIR", &cache)
@@ -517,7 +561,7 @@ async fn yarn_berry_node_modules_linker_apply_patches_file() {
     .unwrap();
 
     let global = tmp.path().join("yarn-global");
-    let status = Command::new("corepack")
+    let status = pm_command("corepack", &["npm_config_", "YARN_"])
         .args(["yarn@4.12.0", "install"])
         .current_dir(tmp.path())
         .env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0")

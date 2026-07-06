@@ -11,13 +11,12 @@
 //! or the `gem` image is absent (the common case locally and in this
 //! eval). gem is also NOT npm-family (see `is_npm_family` in the harness
 //! and `run-case.sh`), so the harness's check/remove behavioral
-//! round-trip is skipped entirely for it; and because gem's
-//! `baseline_supported` is false in matrix.json the only thing the matrix
-//! could ever assert is the coarse `actual_applied == expect_applied`
-//! verdict — which, on a crashed or never-run case, defaults to the same
-//! `false` that satisfies every negative-control scenario. The net
-//! effect: the matrix call can never turn red for a genuine gem `setup`
-//! regression. On its own it protects nothing.
+//! round-trip is skipped entirely for it. When Docker + the image ARE
+//! present the matrix does assert the coarse
+//! `actual_applied == expect_applied` verdict against a real
+//! `bundle install` (it caught the uncloneable `git:` plugin source), but
+//! that protection is environment-conditional — a machine without the
+//! image gets silent green.
 //!
 //! To close that loophole WITHOUT touching the shared harness or the bash
 //! driver, [`host_guard::gem_setup_roundtrip_host`] runs unconditionally
@@ -71,40 +70,6 @@ mod host_guard {
     /// the test disagrees with a renamed/removed marker rather than copying it.
     const MANAGED_MARKER: &str = "# >>> socket-patch:managed";
 
-    /// Every `SOCKET_*` env var clap consults for the surface this test
-    /// drives. Stripped from the child so the run reflects ONLY the explicit
-    /// flags (`--cwd`, `--yes`, `--check`, `--remove`, `--json`). Without
-    /// this, an ambient `SOCKET_CWD` / `SOCKET_JSON` / `SOCKET_OFFLINE` in
-    /// the shell or CI could satisfy an assertion via the environment rather
-    /// than the flag under test. (Mirrors the scrub used by the
-    /// `cli_parse_*` and `setup_matrix_pypi` suites.)
-    const SOCKET_ENV_VARS: &[&str] = &[
-        "SOCKET_CWD",
-        "SOCKET_MANIFEST_PATH",
-        "SOCKET_API_URL",
-        "SOCKET_API_TOKEN",
-        "SOCKET_ORG_SLUG",
-        "SOCKET_PROXY_URL",
-        "SOCKET_ECOSYSTEMS",
-        "SOCKET_DOWNLOAD_MODE",
-        "SOCKET_OFFLINE",
-        "SOCKET_GLOBAL",
-        "SOCKET_GLOBAL_PREFIX",
-        "SOCKET_JSON",
-        "SOCKET_VERBOSE",
-        "SOCKET_SILENT",
-        "SOCKET_DRY_RUN",
-        "SOCKET_YES",
-        "SOCKET_LOCK_TIMEOUT",
-        "SOCKET_BREAK_LOCK",
-        "SOCKET_DEBUG",
-        "SOCKET_TELEMETRY_DISABLED",
-        "SOCKET_SAVE_ONLY",
-        "SOCKET_ONE_OFF",
-        "SOCKET_ALL_RELEASES",
-        "SOCKET_PATCH_BIN",
-    ];
-
     /// Absolute path to the binary under test, via cargo's `CARGO_BIN_EXE_*`.
     fn binary() -> std::path::PathBuf {
         env!("CARGO_BIN_EXE_socket-patch").into()
@@ -117,9 +82,24 @@ mod host_guard {
     fn run(cwd: &Path, args: &[&str]) -> (i32, String, String) {
         let mut cmd = Command::new(binary());
         cmd.args(args).current_dir(cwd);
-        for var in SOCKET_ENV_VARS {
-            cmd.env_remove(var);
+        // Prefix-scrub the whole ambient `SOCKET_*` surface (mirrors
+        // `tests/common::run_with_env`). clap binds ~30 `SOCKET_*` vars across
+        // the global + per-command flags and the set keeps growing, so an
+        // itemized list rots: `SOCKET_STRICT`, `SOCKET_VENDOR_SOURCE`, and
+        // setup's own `SOCKET_SETUP_EXCLUDE` were all missing from the list
+        // this replaced — an ambient `SOCKET_VENDOR_SOURCE=bogus` aborted
+        // every invocation with a clap parse error (exit 2) and turned this
+        // guard red for an environmental reason.
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("SOCKET_") {
+                cmd.env_remove(&key);
+            }
         }
+        // This guard's contract is "no network" (module docs): `setup` fires a
+        // usage-telemetry POST when telemetry is enabled, and the scrub above
+        // would strip a developer's own opt-out. Force it off for the child —
+        // no assertion here concerns telemetry.
+        cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
         let out = cmd.output().expect("failed to execute socket-patch binary");
         (
             out.status.code().unwrap_or(-1),
@@ -225,9 +205,31 @@ mod host_guard {
             body.contains("plugin 'socket-patch'"),
             "Gemfile must reference the socket-patch plugin:\n{body}"
         );
+        // The directive must use a `path:` source. A `git:` source makes
+        // Bundler `git clone` the directory, and `.socket/bundler-plugin/` is
+        // a plain generated dir (committing it to the PARENT repo does not
+        // give it a `.git`), so every `bundle install` on a wired project
+        // fails with "repository ... does not exist" (exit 11) and the plugin
+        // never loads. Verified against real Bundler in the gem Docker image.
+        assert!(
+            body.contains("plugin 'socket-patch', path:"),
+            "the plugin directive must be `path:`-sourced (a `git:` dir source \
+             is uncloneable and breaks every `bundle install`):\n{body}"
+        );
         // and the generated plugin carries the two triggers + fail-loud applier.
         assert!(plugins_rb.exists(), "plugins.rb must be generated");
         assert!(gemspec.exists(), "the plugin gemspec must be generated");
+        // Bundler refuses to LOAD a plugin whose gemspec require paths are
+        // missing on disk ("The following plugin paths don't exist: .../lib.
+        // ... Continuing without installing plugin"). The plugin dir is flat
+        // (no lib/), so the gemspec must pin `require_paths = ["."]` or the
+        // plugin is silently skipped on every install.
+        let spec = std::fs::read_to_string(&gemspec).unwrap();
+        assert!(
+            spec.contains("s.require_paths = [\".\"]"),
+            "gemspec must set require_paths to the flat plugin dir, or Bundler \
+             silently skips loading the plugin:\n{spec}"
+        );
         let rb = std::fs::read_to_string(&plugins_rb).unwrap();
         assert!(
             rb.contains("Bundler::Plugin.add_hook(\"after-install-all\")"),
@@ -304,6 +306,59 @@ mod host_guard {
                 "check (removed)"
             ),
             "needs_configuration"
+        );
+    }
+
+    /// `bundle` resolves the Gemfile by walking UP from the invocation dir,
+    /// and `discover_bundler_project` documents the same contract. Run from a
+    /// subdirectory with NO `--cwd` flag the CLI defaults to the RELATIVE
+    /// `--cwd .` — whose lexical `Path::parent()` chain is `Some("")` → `None`
+    /// without ever reaching the real parent directories — so the walk-up must
+    /// re-root itself on the process cwd to find the ancestor Gemfile, and the
+    /// wiring must land at the Gemfile's dir, never the invocation subdir.
+    #[test]
+    fn gem_setup_discovers_root_project_from_subdirectory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("Gemfile"), GEMFILE).unwrap();
+        let sub = root.join("lib").join("widgets");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        // check from the subdir: the (unconfigured) root project must be found.
+        let (code, out, err) = run(&sub, &["setup", "--check", "--json"]);
+        assert_eq!(
+            code, 1,
+            "check from a subdirectory must find the unconfigured ancestor \
+             Gemfile (exit 1), not report no_files (exit 0).\n{out}\n{err}"
+        );
+        assert_eq!(
+            json_str(&parse_json(&out, "check (subdir)"), "status", "check (subdir)"),
+            "needs_configuration"
+        );
+
+        // setup from the subdir: wires the ROOT project.
+        let (code, out, err) = run(&sub, &["setup", "--yes", "--json"]);
+        assert_eq!(code, 0, "setup from a subdirectory must exit 0.\n{out}\n{err}");
+        assert_eq!(
+            json_str(&parse_json(&out, "setup (subdir)"), "status", "setup (subdir)"),
+            "success"
+        );
+        let body = gemfile_body(root);
+        assert!(
+            body.contains(MANAGED_MARKER),
+            "managed block lands in the ROOT Gemfile:\n{body}"
+        );
+        assert!(
+            root.join(PLUGIN_DIR).join("plugins.rb").exists(),
+            "plugin dir lands at the Gemfile's dir (the project root)"
+        );
+        assert!(
+            !sub.join(PLUGIN_DIR).exists(),
+            "no plugin dir may be generated in the invocation subdir"
+        );
+        assert!(
+            !sub.join("Gemfile").exists(),
+            "no Gemfile may be synthesized in the invocation subdir"
         );
     }
 }

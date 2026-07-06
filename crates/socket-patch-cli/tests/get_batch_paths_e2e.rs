@@ -24,39 +24,26 @@ const ORG_SLUG: &str = "test-org";
 const UUID_A: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const UUID_B: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 
-/// Every `SOCKET_*` env var that `get`/`GlobalArgs` reads as an `#[arg(env=…)]`
-/// fallback. These subprocess tests assert an EXACT envelope, so any one of
-/// these leaking in from the ambient shell (CI, a dev's `.envrc`, etc.) could
-/// silently redirect the command to a different path (offline mode, a real
-/// api-url, download-only, …) and make a broken impl look green. We scrub the
-/// whole surface so behavior is fully determined by the explicit CLI flags.
-const SOCKET_ENV_VARS: &[&str] = &[
-    "SOCKET_API_TOKEN",
-    "SOCKET_API_URL",
-    "SOCKET_ORG_SLUG",
-    "SOCKET_SAVE_ONLY",
-    "SOCKET_YES",
-    "SOCKET_JSON",
-    "SOCKET_OFFLINE",
-    "SOCKET_FORCE",
-    "SOCKET_DOWNLOAD_MODE",
-    "SOCKET_DOWNLOAD_ONLY",
-    "SOCKET_ALL_RELEASES",
-    "SOCKET_BATCH_SIZE",
-    "SOCKET_CWD",
-    "SOCKET_DEBUG",
-    "SOCKET_DRY_RUN",
-    "SOCKET_ECOSYSTEMS",
-    "SOCKET_GLOBAL",
-    "SOCKET_GLOBAL_PREFIX",
-    "SOCKET_MANIFEST_PATH",
-    "SOCKET_ONE_OFF",
-    "SOCKET_PROXY_URL",
-    "SOCKET_SILENT",
-    "SOCKET_SKIP_ROLLBACK",
-    "SOCKET_VERBOSE",
-    "SOCKET_VEX",
-];
+/// Scrub the binary's entire `SOCKET_*` env surface (keeping telemetry
+/// opt-outs, so an opted-out dev stays opted out) before spawning. These
+/// subprocess tests assert an EXACT envelope, so any `#[arg(env=…)]`
+/// fallback leaking in from the ambient shell (CI, a dev's `.envrc`, …)
+/// can silently redirect the command to a different path (offline mode, a
+/// real api-url, …) — or, for value-parsed args like `SOCKET_LOCK_TIMEOUT`
+/// (u64) and `SOCKET_VENDOR_SOURCE` (enum), turn every invocation into an
+/// exit-2 usage error before `get` even runs. A fixed allowlist here
+/// rotted as flags were added (it predated `SOCKET_LOCK_TIMEOUT`,
+/// `SOCKET_STRICT`, `SOCKET_VENDOR_*`, `SOCKET_PATCH_SERVER_URL`,
+/// `SOCKET_BREAK_LOCK` — ambient `SOCKET_LOCK_TIMEOUT=bogus` failed 6 of
+/// these 7 tests); the prefix scrub can't rot.
+fn scrub_socket_env(cmd: &mut Command) {
+    for (key, _) in std::env::vars_os() {
+        let name = key.to_string_lossy();
+        if name.starts_with("SOCKET_") && !name.contains("TELEMETRY") {
+            cmd.env_remove(&key);
+        }
+    }
+}
 
 /// Run `socket-patch get <identifier>` with `--json --save-only --yes`
 /// against `api_url` (authenticated mode). Returns (code, stdout, stderr).
@@ -82,9 +69,7 @@ fn run_get_auth(
     args.extend_from_slice(extra);
     let mut cmd = Command::new(binary());
     cmd.args(&args).current_dir(cwd);
-    for var in SOCKET_ENV_VARS {
-        cmd.env_remove(var);
-    }
+    scrub_socket_env(&mut cmd);
     let out = cmd.output().expect("run socket-patch");
     (
         out.status.code().unwrap_or(-1),
@@ -187,11 +172,20 @@ async fn get_by_purl_with_multiple_patches_emits_selection_required() {
         );
     }
 
-    // The error text must instruct the user how to disambiguate.
+    // The error text must instruct the user how to disambiguate — and the
+    // instruction must be one the CLI actually accepts. `--id` is a boolean
+    // type-tag (see get_id_flag_does_not_accept_a_value below), so selection
+    // happens by re-running with the chosen UUID as the positional
+    // identifier; the old "Specify --id <UUID>" wording sent users straight
+    // into a clap usage error.
     let err = v["error"].as_str().unwrap_or("");
     assert!(
-        err.contains("--id"),
-        "selection_required error must instruct the user to specify --id; got {err:?}"
+        !err.contains("--id <"),
+        "error must not instruct the value-taking `--id <UUID>` form the CLI rejects; got {err:?}"
+    );
+    assert!(
+        err.to_lowercase().contains("re-run") && err.to_lowercase().contains("uuid"),
+        "error must direct the user to re-run with one of the listed UUIDs; got {err:?}"
     );
 }
 
@@ -200,11 +194,13 @@ async fn get_by_purl_with_multiple_patches_emits_selection_required() {
 /// usage error: exit code 2, a clap error on stderr naming the stray
 /// argument, and crucially NO JSON envelope on stdout.
 ///
-/// Production inconsistency (reported, not fixed here): the
-/// `selection_required` message instructs users to "Specify --id <UUID>",
-/// which contradicts `--id` being a boolean flag — there is no
-/// value-taking UUID selector to drive a "specified UUID didn't match a
-/// candidate" branch. This test locks the *actual* CLI contract.
+/// This contract is why the `selection_required` wording matters:
+/// selection happens by re-running with the chosen UUID as the positional
+/// identifier (`get <uuid> --id`), never by passing a value to `--id`.
+/// The envelope's error text used to instruct the impossible
+/// "Specify --id <UUID>" form; the selection test above pins the
+/// corrected instruction, and this test locks the boolean CLI contract
+/// it depends on.
 #[tokio::test]
 async fn get_id_flag_does_not_accept_a_value() {
     let mock = MockServer::start().await; // must never be reached

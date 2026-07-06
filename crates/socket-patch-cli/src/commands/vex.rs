@@ -321,9 +321,7 @@ async fn generate_vex(
         let vendored = manifest
             .patches
             .keys()
-            .filter(|purl| {
-                socket_patch_core::patch::vendor::lookup_entry(&entries, purl).is_some()
-            })
+            .filter(|purl| socket_patch_core::patch::vendor::lookup_entry(&entries, purl).is_some())
             .cloned()
             .collect();
         VerifyOutcome {
@@ -604,7 +602,9 @@ async fn resolve_product_id(common: &GlobalArgs, product: Option<&str>) -> Resul
 
 /// Build the [`VendorContext`] for verification: the committed
 /// `.socket/vendor/state.json` ledger plus synthesized entries for the
-/// legacy `.socket/go-patches/` redirect backend.
+/// legacy `.socket/go-patches/` redirect backend. Shared by `vex` and
+/// `setup --check`'s patch-consistency pass — both must judge a vendored
+/// patch by the committed artifact, never the installed tree.
 ///
 /// The go-patches synthesis fixes a latent bug: an apply-redirected Go
 /// patch leaves the module cache pristine (the `replace` directive routes
@@ -618,7 +618,7 @@ async fn resolve_product_id(common: &GlobalArgs, product: Option<&str>) -> Resul
 /// installed tree, fail verification there, and are omitted — fail-closed,
 /// never falsely attested. Returns `None` when there is nothing vendored
 /// and no redirect to synthesize (the common case).
-async fn load_vendor_context(
+pub(crate) async fn load_vendor_context(
     common: &GlobalArgs,
     manifest: &PatchManifest,
 ) -> Option<VendorContext> {
@@ -627,8 +627,8 @@ async fn load_vendor_context(
         Err(e) => {
             if !common.silent {
                 eprintln!(
-                    "Warning: unreadable vendor state ({e}); vendored patches will be \
-                     omitted from VEX"
+                    "Warning: unreadable vendor state ({e}); vendored patches cannot be \
+                     verified from the committed artifact"
                 );
             }
             HashMap::new()

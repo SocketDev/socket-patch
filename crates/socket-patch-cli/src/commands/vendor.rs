@@ -322,21 +322,39 @@ pub async fn run(args: VendorArgs) -> i32 {
     };
 
     // Embedded VEX: same contract as `apply --vex` — only on success, and a
-    // requested-but-failed VEX flips the exit code.
+    // requested-but-failed VEX flips the exit code. A dry run vendors
+    // nothing, so there is no vendored state to attest: generating here
+    // would verify the deliberately untouched tree, spuriously fail the
+    // whole command with `no_applicable_patches`, and write an attestation
+    // file during --dry-run. Skip instead.
     if exit == 0 && !args.revert {
         if let Some(vex_path) = args.vex.vex.as_ref() {
-            let params = args.vex.to_build_params();
-            match generate_vex_from_manifest_path(&args.common, &params, &manifest_path).await {
-                Ok(summary) => {
-                    env.vex = Some(VexSummary {
-                        path: vex_path.display().to_string(),
-                        statements: summary.statements,
-                        format: "openvex-0.2.0".to_string(),
-                    });
+            if args.common.dry_run {
+                if !args.common.json && !args.common.silent {
+                    println!("Skipping VEX generation (--dry-run: nothing was vendored).");
                 }
-                Err(e) => {
-                    env.mark_error(EnvelopeError::new(e.code, e.message.clone()));
-                    exit = 1;
+            } else {
+                let params = args.vex.to_build_params();
+                match generate_vex_from_manifest_path(&args.common, &params, &manifest_path).await
+                {
+                    Ok(summary) => {
+                        env.vex = Some(VexSummary {
+                            path: vex_path.display().to_string(),
+                            statements: summary.statements,
+                            format: "openvex-0.2.0".to_string(),
+                        });
+                    }
+                    Err(e) => {
+                        env.mark_error(EnvelopeError::new(e.code, e.message.clone()));
+                        // The envelope only prints under --json; in human mode
+                        // this error is the sole explanation for the flipped
+                        // exit code, so it prints even under --silent ("errors
+                        // only", never "nothing").
+                        if !args.common.json {
+                            eprintln!("Error: VEX generation failed: {}", e.message);
+                        }
+                        exit = 1;
+                    }
                 }
             }
         }

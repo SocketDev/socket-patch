@@ -127,7 +127,7 @@ fn composer_add(content: &str) -> Result<Option<String>, String> {
 
     let mut changed = false;
     for event in HOOK_EVENTS {
-        changed |= add_command_to_event(scripts, event);
+        changed |= add_command_to_event(scripts, event)?;
     }
     if !changed {
         // We created an empty `scripts` object above only if it was absent;
@@ -163,45 +163,55 @@ fn composer_remove(content: &str) -> Result<Option<String>, String> {
         return Ok(None);
     }
     if scripts.is_empty() {
-        root.remove("scripts");
+        // shift_remove: with preserve_order, plain `remove` is swap_remove and
+        // would teleport the last root key into this slot.
+        root.shift_remove("scripts");
     }
     Ok(Some(serde_json::to_string_pretty(&doc).unwrap() + "\n"))
 }
 
 /// Add [`APPLY_COMMAND`] to one event, normalising string → array. Returns
-/// whether the event changed. Any command already carrying [`HOOK_MARKER`]
+/// whether the event changed; errors on a non-string/array event value it
+/// refuses to clobber. Any command already carrying [`HOOK_MARKER`]
 /// counts as present — the same predicate as [`is_hook_present`] / `--check`,
 /// so a user-customized flag set is left alone rather than duplicated.
-fn add_command_to_event(scripts: &mut Map<String, Value>, event: &str) -> bool {
+fn add_command_to_event(scripts: &mut Map<String, Value>, event: &str) -> Result<bool, String> {
     if event_contains_marker(scripts.get(event)) {
-        return false;
+        return Ok(false);
     }
     let cmd = Value::String(APPLY_COMMAND.to_string());
     match scripts.get_mut(event) {
         None => {
             scripts.insert(event.to_string(), Value::Array(vec![cmd]));
-            true
+            Ok(true)
         }
         Some(Value::String(s)) => {
             let existing = Value::String(s.clone());
             scripts.insert(event.to_string(), Value::Array(vec![existing, cmd]));
-            true
+            Ok(true)
         }
         Some(Value::Array(arr)) => {
             arr.push(cmd);
-            true
+            Ok(true)
         }
-        // A non-string/array script value is user data we won't clobber.
-        Some(_) => false,
+        // A non-string/array script value is user data we won't clobber — and
+        // can't wire into, so treating it as "no change" would surface as
+        // AlreadyConfigured while `--check` says not configured. Refuse loudly,
+        // like the non-object-`scripts` guard.
+        Some(_) => Err(format!(
+            "Invalid composer.json: \"{event}\" script is not a string or array"
+        )),
     }
 }
 
 /// Remove [`APPLY_COMMAND`] from one event, pruning an emptied event key.
 /// Returns whether the event changed.
 fn remove_command_from_event(scripts: &mut Map<String, Value>, event: &str) -> bool {
+    // shift_remove throughout: with preserve_order, plain `remove` is
+    // swap_remove and would shuffle the user's other scripts.
     match scripts.get_mut(event) {
         Some(Value::String(s)) if s == APPLY_COMMAND => {
-            scripts.remove(event);
+            scripts.shift_remove(event);
             true
         }
         Some(Value::Array(arr)) => {
@@ -211,7 +221,7 @@ fn remove_command_from_event(scripts: &mut Map<String, Value>, event: &str) -> b
                 return false;
             }
             if arr.is_empty() {
-                scripts.remove(event);
+                scripts.shift_remove(event);
             }
             true
         }
@@ -617,6 +627,62 @@ mod tests {
             let name = entry.file_name().to_string_lossy().into_owned();
             assert!(!name.starts_with(".socket-stage-"), "stage litter: {name}");
         }
+    }
+
+    #[test]
+    fn test_remove_event_prune_preserves_sibling_script_order() {
+        // Regression: with preserve_order, serde_json's `Map::remove` is
+        // swap_remove — pruning an emptied event key teleported the *last*
+        // script into its slot, shuffling the user's own scripts. Scenario:
+        // setup wired the events first, the user appended scripts later.
+        let inp = format!(
+            "{{\"scripts\":{{\"post-install-cmd\":[\"{APPLY_COMMAND}\"],\"post-update-cmd\":[\"{APPLY_COMMAND}\"],\"test\":\"phpunit\",\"lint\":\"phpcs\"}}}}"
+        );
+        let removed = composer_remove(&inp).unwrap().unwrap();
+        assert!(!is_hook_present(&removed));
+        let pos_test = removed.find("\"test\"").unwrap();
+        let pos_lint = removed.find("\"lint\"").unwrap();
+        assert!(
+            pos_test < pos_lint,
+            "sibling script order must survive event pruning:\n{removed}"
+        );
+    }
+
+    #[test]
+    fn test_remove_scripts_prune_preserves_root_key_order() {
+        // Regression: same swap_remove hazard at the root — pruning an emptied
+        // `scripts` object teleported the last root key into its slot.
+        let inp = format!(
+            "{{\"name\":\"acme/app\",\"scripts\":{{\"post-install-cmd\":[\"{APPLY_COMMAND}\"]}},\"require\":{{\"php\":\">=8.1\"}},\"autoload\":{{}}}}"
+        );
+        let removed = composer_remove(&inp).unwrap().unwrap();
+        assert!(parse(&removed).get("scripts").is_none(), "scripts pruned");
+        let pos_name = removed.find("\"name\"").unwrap();
+        let pos_require = removed.find("\"require\"").unwrap();
+        let pos_autoload = removed.find("\"autoload\"").unwrap();
+        assert!(
+            pos_name < pos_require && pos_require < pos_autoload,
+            "root key order must survive scripts pruning:\n{removed}"
+        );
+    }
+
+    #[test]
+    fn test_add_malformed_event_value_is_error_not_silent_success() {
+        // Regression: an event value that is neither string nor array can't be
+        // wired (we won't clobber it), but reporting "no change" surfaced as
+        // AlreadyConfigured — exit-0 success — while `--check`
+        // (is_hook_present) says not configured on the very same file. Refusal
+        // must be a loud error, matching the non-object-`scripts` guard.
+        let malformed = "{\"scripts\":{\"post-install-cmd\":42,\"post-update-cmd\":{\"a\":\"b\"}}}";
+        assert!(!is_hook_present(malformed), "nothing configured here");
+        let err = composer_add(malformed).unwrap_err();
+        assert!(
+            err.contains("not a string or array"),
+            "refusal must be an error, got: {err}"
+        );
+        // remove stays a no-op: a non-string/array value can't hold our
+        // command, so there is honestly nothing to strip.
+        assert!(composer_remove(malformed).unwrap().is_none());
     }
 
     #[test]

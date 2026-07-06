@@ -1,5 +1,5 @@
 //! End-to-end tests for embedded OpenVEX generation via `--vex` on the
-//! `apply` and `scan` subcommands.
+//! `apply`, `scan`, and `vendor` subcommands.
 //!
 //! These exercise the *integration* added on top of the core `vex`
 //! pipeline (which `e2e_vex.rs` already covers): that a successful
@@ -415,6 +415,72 @@ fn apply_vex_failure_flips_exit_code() {
     assert_eq!(&on_disk, b"after contents\n");
 }
 
+/// `--silent` means "errors only", never "nothing" (CLI_CONTRACT): a
+/// requested-but-failed VEX still exits 1, and the failure message must
+/// reach stderr. Regression guard: the human-readable VEX status block
+/// gated ALL of its arms — the error arm included — on `!silent`, so
+/// `apply --silent --vex out.json` on a VEX failure exited 1 with zero
+/// diagnostic output. Same fixture as `apply_vex_failure_flips_exit_code`:
+/// apply succeeds offline, then product detection fails (no root
+/// package.json / git remote, no `--vex-product`).
+#[test]
+fn apply_silent_vex_failure_keeps_error_output() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path();
+    seed_offline_apply(cwd);
+    let vex_path = cwd.join("apply.vex.json");
+
+    let out = cli()
+        .args([
+            "apply",
+            "--cwd",
+            cwd.to_str().unwrap(),
+            "--offline",
+            "--silent",
+            "--vex",
+            vex_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("invoke apply");
+    assert!(
+        !out.status.success(),
+        "a requested-but-failed VEX must flip the exit code even under --silent"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stdout.trim().is_empty(),
+        "--silent must produce no stdout; got {stdout:?}"
+    );
+    assert!(
+        stderr.contains("VEX generation failed"),
+        "--silent must NOT suppress the VEX failure message; got {stderr:?}"
+    );
+
+    // Control run: the same failure WITHOUT --silent must print the same
+    // error (re-running on the patched tree is still a successful apply —
+    // "already patched" — so VEX still runs and still fails) — otherwise
+    // the assertion above could pass against a message that never prints
+    // for anyone.
+    let loud = cli()
+        .args([
+            "apply",
+            "--cwd",
+            cwd.to_str().unwrap(),
+            "--offline",
+            "--vex",
+            vex_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("invoke apply");
+    assert!(!loud.status.success());
+    let loud_stderr = String::from_utf8_lossy(&loud.stderr);
+    assert!(
+        loud_stderr.contains("VEX generation failed"),
+        "non-silent VEX failure must print the error; got {loud_stderr:?}"
+    );
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // scan --vex (read-only; zero installed packages → no network)
 // ──────────────────────────────────────────────────────────────────────
@@ -539,4 +605,83 @@ fn scan_json_vex_verify_failure_is_error() {
     assert_eq!(result["status"], "error");
     assert_eq!(result["error"]["code"], "no_applicable_patches");
     assert!(!vex_path.exists());
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// vendor --vex (same fail-the-command contract as apply --vex)
+// ──────────────────────────────────────────────────────────────────────
+
+/// `vendor --vex` shares apply's fail-the-command contract, but its
+/// human-readable mode dropped the VEX outcome entirely: the `Err` arm
+/// only marked the JSON envelope — which prints solely under `--json` —
+/// so a requested-but-failed VEX flipped the exit from 0 to 1 without a
+/// word of diagnosis, with or without `--silent`. Offline fixture: an
+/// empty-patches manifest makes vendor itself succeed ("no vendorable
+/// patches in scope") and VEX generation then fail deterministically
+/// (`no_patches`) before touching the network.
+#[test]
+fn vendor_human_vex_failure_prints_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path();
+    write_manifest(cwd, &PatchManifest::new());
+    let vex_path = cwd.join("vendor.vex.json");
+
+    // Control: without --vex this exact fixture exits 0 — the failure
+    // asserted below is introduced by the VEX side-effect alone.
+    let base = cli()
+        .args(["vendor", "--cwd", cwd.to_str().unwrap(), "--offline"])
+        .output()
+        .expect("invoke vendor");
+    assert!(
+        base.status.success(),
+        "vendor without --vex must exit 0 on an empty manifest. stderr:\n{}",
+        String::from_utf8_lossy(&base.stderr)
+    );
+
+    let out = cli()
+        .args([
+            "vendor",
+            "--cwd",
+            cwd.to_str().unwrap(),
+            "--offline",
+            "--vex",
+            vex_path.to_str().unwrap(),
+            "--vex-product",
+            "pkg:npm/my-app@1.0.0",
+        ])
+        .output()
+        .expect("invoke vendor");
+    assert!(
+        !out.status.success(),
+        "a requested-but-failed VEX must flip vendor's exit code"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("VEX generation failed"),
+        "human mode must print the VEX failure, got {stderr:?}"
+    );
+    assert!(!vex_path.exists(), "no VEX file on failure");
+
+    // And under --silent the error must survive ("errors only", never
+    // "nothing").
+    let silent = cli()
+        .args([
+            "vendor",
+            "--cwd",
+            cwd.to_str().unwrap(),
+            "--offline",
+            "--silent",
+            "--vex",
+            vex_path.to_str().unwrap(),
+            "--vex-product",
+            "pkg:npm/my-app@1.0.0",
+        ])
+        .output()
+        .expect("invoke vendor");
+    assert!(!silent.status.success());
+    let silent_stderr = String::from_utf8_lossy(&silent.stderr);
+    assert!(
+        silent_stderr.contains("VEX generation failed"),
+        "--silent must NOT suppress the VEX failure message; got {silent_stderr:?}"
+    );
 }

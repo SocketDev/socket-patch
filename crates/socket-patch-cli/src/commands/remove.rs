@@ -118,14 +118,31 @@ pub async fn run(args: RemoveArgs) -> i32 {
 
     let manifest_path = args.common.resolved_manifest_path();
 
-    if tokio::fs::metadata(&manifest_path).await.is_err() {
-        emit_error_envelope(
-            args.common.json,
-            args.common.dry_run,
-            "manifest_not_found",
-            format!("Manifest not found at {}", manifest_path.display()),
-        );
-        return 1;
+    let manifest_missing = tokio::fs::metadata(&manifest_path).await.is_err();
+    if manifest_missing {
+        // A pure-detached project (`scan --vendor --detached`) has a
+        // vendor ledger but deliberately no manifest, and `remove` is the
+        // per-purl exit path for its entries — so a missing manifest is
+        // only fatal when the ledger has no detached match either. An
+        // unreadable ledger falls through to the error: nothing is
+        // mutated on that path.
+        let has_detached_match = load_state(&args.common.cwd)
+            .await
+            .map(|s| {
+                vendor_entries_matching(&s, &args.identifier)
+                    .iter()
+                    .any(|(_, e)| e.detached)
+            })
+            .unwrap_or(false);
+        if !has_detached_match {
+            emit_error_envelope(
+                args.common.json,
+                args.common.dry_run,
+                "manifest_not_found",
+                format!("Manifest not found at {}", manifest_path.display()),
+            );
+            return 1;
+        }
     }
 
     // Serialize against concurrent socket-patch runs targeting the
@@ -149,26 +166,32 @@ pub async fn run(args: RemoveArgs) -> i32 {
     let _lock = acquired.guard;
     let lock_was_broken = acquired.broke_lock;
 
-    // Read manifest to show what will be removed and confirm
-    let manifest = match read_manifest(&manifest_path).await {
-        Ok(Some(m)) => m,
-        Ok(None) => {
-            emit_error_envelope(
-                args.common.json,
-                args.common.dry_run,
-                "manifest_invalid",
-                "Invalid manifest".to_string(),
-            );
-            return 1;
-        }
-        Err(e) => {
-            emit_error_envelope(
-                args.common.json,
-                args.common.dry_run,
-                "manifest_unreadable",
-                e.to_string(),
-            );
-            return 1;
+    // Read manifest to show what will be removed and confirm. On the
+    // pure-detached path there is no manifest to read or mutate; an empty
+    // view routes the flow to the detached-only removal below.
+    let manifest = if manifest_missing {
+        PatchManifest::new()
+    } else {
+        match read_manifest(&manifest_path).await {
+            Ok(Some(m)) => m,
+            Ok(None) => {
+                emit_error_envelope(
+                    args.common.json,
+                    args.common.dry_run,
+                    "manifest_invalid",
+                    "Invalid manifest".to_string(),
+                );
+                return 1;
+            }
+            Err(e) => {
+                emit_error_envelope(
+                    args.common.json,
+                    args.common.dry_run,
+                    "manifest_unreadable",
+                    e.to_string(),
+                );
+                return 1;
+            }
         }
     };
 
@@ -260,14 +283,11 @@ pub async fn run(args: RemoveArgs) -> i32 {
             println!("Rolling back patch before removal...");
         }
         match rollback_patches(
-            &args.common.cwd,
+            &args.common,
             &manifest_path,
             Some(&args.identifier),
             args.common.dry_run,
             args.common.json || args.common.silent,
-            args.common.offline,
-            args.common.global,
-            args.common.global_prefix.clone(),
             None,
         )
         .await
@@ -365,7 +385,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
     if !vendored_matches.is_empty() {
         if args.skip_rollback {
             for (key, _) in &vendored_matches {
-                if !args.common.json {
+                if !args.common.json && !args.common.silent {
                     eprintln!(
                         "Note: {key} is vendored; --skip-rollback leaves the vendor wiring and \
                          artifact in place (the next `vendor` run will reconcile-revert it)."
@@ -383,7 +403,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
                 let outcome =
                     dispatch_revert_one(entry, &args.common.cwd, args.common.dry_run).await;
                 for w in &outcome.warnings {
-                    if !args.common.json {
+                    if !args.common.json && !args.common.silent {
                         eprintln!("Warning ({}): {}", w.code, w.detail);
                     }
                     vendor_skipped_events.push(
@@ -411,7 +431,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
                     return 1;
                 }
                 if args.common.dry_run {
-                    if !args.common.json {
+                    if !args.common.json && !args.common.silent {
                         println!("Would revert vendoring for {key}");
                     }
                     // Dry-run flips the would-be Removed to a Verified
@@ -434,7 +454,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
                     );
                     return 1;
                 }
-                if !args.common.json {
+                if !args.common.json && !args.common.silent {
                     println!("Reverted vendoring for {key}");
                 }
                 vendor_reverted_events.push(
@@ -603,7 +623,7 @@ async fn remove_detached_only(
         return 1;
     }
 
-    if !args.common.json {
+    if !args.common.json && !args.common.silent {
         eprintln!("The following detached vendored patch(es) will be reverted and removed:");
         for (key, entry) in &detached {
             eprintln!("  - {key} (UUID: {})", short_uuid(&entry.uuid));
@@ -630,7 +650,7 @@ async fn remove_detached_only(
     for (key, entry) in &detached {
         let outcome = dispatch_revert_one(entry, &args.common.cwd, args.common.dry_run).await;
         for w in &outcome.warnings {
-            if !args.common.json {
+            if !args.common.json && !args.common.silent {
                 eprintln!("Warning ({}): {}", w.code, w.detail);
             }
             env.record(
@@ -657,7 +677,7 @@ async fn remove_detached_only(
             return 1;
         }
         if args.common.dry_run {
-            if !args.common.json {
+            if !args.common.json && !args.common.silent {
                 println!("Would revert vendoring for {key}");
             }
             // Verified preview (the dry-run convention); still recorded
@@ -680,7 +700,7 @@ async fn remove_detached_only(
             );
             return 1;
         }
-        if !args.common.json {
+        if !args.common.json && !args.common.silent {
             println!("Reverted vendoring for {key}");
         }
         env.record(

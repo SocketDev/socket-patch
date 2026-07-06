@@ -44,8 +44,10 @@ pub struct UnlockArgs {
     /// strings `true`/`false` from the env binding, so
     /// `SOCKET_UNLOCK_RELEASE=1` (or an exported-but-empty
     /// `SOCKET_UNLOCK_RELEASE=`) aborted every `unlock` invocation.
-    /// This flag is also outside `GLOBAL_ARG_ENV_VARS`, so `main`'s
-    /// empty-var scrub never rescues it.
+    /// (`main`'s empty-var scrub also removes a blank
+    /// `SOCKET_UNLOCK_RELEASE` via `LOCAL_ARG_ENV_VARS`, but the
+    /// parser itself must not depend on it — library callers of
+    /// `Cli::parse` never run the scrub.)
     #[arg(
         long = "release",
         env = "SOCKET_UNLOCK_RELEASE",
@@ -243,7 +245,10 @@ fn emit_free(
     } else if release && removed {
         println!("Lock is free. Removed {}.", lock_file.display());
     } else if would_remove {
-        println!("Lock is free. Would remove {} (dry run).", lock_file.display());
+        println!(
+            "Lock is free. Would remove {} (dry run).",
+            lock_file.display()
+        );
     } else if release {
         println!("Lock is free (no lock file to remove).");
     } else {

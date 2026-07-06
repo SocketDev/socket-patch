@@ -178,6 +178,33 @@ fn lock_held_human_mode_mentions_other_process() {
     );
 }
 
+/// `--silent` is "errors only" (CLI_CONTRACT.md), never "nothing":
+/// a lock_held contention under `apply --silent` must still put the
+/// error line on stderr. Exit 1 with zero output is undiagnosable —
+/// the same violation fixed for setup/scan/apply's other error exits.
+#[test]
+fn lock_held_silent_mode_still_reports_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket_dir = dir.path().join(".socket");
+    setup_socket_dir(&socket_dir);
+    let _external = take_external_lock(&socket_dir);
+
+    let (code, stdout, stderr) = run(dir.path(), &["apply", "--silent"]);
+    assert_eq!(
+        code, 1,
+        "silent-mode contention must still exit 1.\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.trim().is_empty(),
+        "silent human mode must not print to stdout, got:\n{stdout}"
+    );
+    assert!(
+        stderr.contains("Error: another socket-patch process is operating in this directory"),
+        "--silent means errors only, not no errors: the lock_held line \
+         must reach stderr, got:\n{stderr}"
+    );
+}
+
 /// Release the lock; a fresh apply must succeed (or at least not
 /// return `lock_held`). Confirms the binary doesn't get into a
 /// stuck state if the lock file already exists from a prior run.

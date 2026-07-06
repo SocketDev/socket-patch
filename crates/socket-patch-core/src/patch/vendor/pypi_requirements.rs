@@ -17,7 +17,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
-use crate::utils::fs::atomic_write_bytes;
+use crate::utils::fs::atomic_write_bytes_preserving_mode;
 
 use super::common::detect_eol;
 use super::state::{VendorEntry, WiringAction, WiringRecord};
@@ -130,15 +130,28 @@ pub(super) async fn wire_requirements(
 ) -> Result<Vec<WiringRecord>, (&'static str, String)> {
     let plan = plan_requirements(root, canon_name, version, rel_wheel, wheel_sha256_hex).await?;
     let mut wiring = Vec::new();
+    let mut written: Vec<&PlannedFile> = Vec::new();
     for file in &plan {
-        atomic_write_bytes(&root.join(&file.rel), file.new_content.as_bytes())
-            .await
-            .map_err(|e| {
-                (
-                    "pypi_requirements_write_failed",
-                    format!("cannot write {}: {e}", file.rel),
+        if let Err(e) =
+            atomic_write_bytes_preserving_mode(&root.join(&file.rel), file.new_content.as_bytes())
+                .await
+        {
+            // Unwind: the orchestrator sweeps the wheel dir on a wiring
+            // error, so a surviving half-wired file would reference a
+            // deleted artifact — with no ledger entry recorded to revert it.
+            for w in written.iter().rev() {
+                let _ = atomic_write_bytes_preserving_mode(
+                    &root.join(&w.rel),
+                    w.original_content.as_bytes(),
                 )
-            })?;
+                .await;
+            }
+            return Err((
+                "pypi_requirements_write_failed",
+                format!("cannot write {}: {e}", file.rel),
+            ));
+        }
+        written.push(file);
         wiring.extend(file.records.iter().cloned());
     }
     Ok(wiring)
@@ -244,7 +257,9 @@ pub(super) async fn revert_requirements(
 
     if !dry_run {
         for (file, content) in &reverted {
-            if let Err(e) = atomic_write_bytes(&root.join(file), content.as_bytes()).await {
+            if let Err(e) =
+                atomic_write_bytes_preserving_mode(&root.join(file), content.as_bytes()).await
+            {
                 return RevertOutcome {
                     success: false,
                     warnings,
@@ -288,6 +303,9 @@ fn drift_warning(file: &str, rec: &WiringRecord) -> VendorWarning {
 struct PlannedFile {
     /// Root-relative, forward-slashed path.
     rel: String,
+    /// The pre-edit content, kept so a multi-file write that fails partway
+    /// can restore the files already written.
+    original_content: String,
     new_content: String,
     records: Vec<WiringRecord>,
 }
@@ -396,6 +414,7 @@ async fn plan_requirements(
         }
         planned.push(PlannedFile {
             rel: file.rel.clone(),
+            original_content: file.content.clone(),
             new_content,
             records,
         });
@@ -426,6 +445,7 @@ async fn plan_requirements(
         new_content.push_str(nl);
         planned.push(PlannedFile {
             rel: root_file.rel.clone(),
+            original_content: root_file.content.clone(),
             new_content,
             records: vec![WiringRecord {
                 file: root_file.rel.clone(),
@@ -487,7 +507,10 @@ async fn collect_requirements_files(root: &Path) -> Result<Vec<ReqFile>, (&'stat
             // see inside it. Skip.
             continue;
         };
-        let editable = !rel.starts_with("../");
+        // Out-of-root (`../`) and absolute includes resolve outside any
+        // committable root — readable so a pin inside can refuse, never
+        // editable. (`Path::join` passes an absolute `rel` through verbatim.)
+        let editable = !rel.starts_with("../") && !Path::new(&rel).is_absolute();
         let include_dir = match rel.rfind('/') {
             Some(i) => rel[..i].to_string(),
             None => String::new(),
@@ -530,11 +553,13 @@ fn include_target(text: &str) -> Option<&str> {
 }
 
 /// Lexically normalize a relative path (`a/../b` → `b`); escapes above the
-/// root keep their `../` prefix so the caller can spot out-of-root includes.
+/// root keep their `../` prefix and absolute paths keep their leading `/`,
+/// so the caller can spot out-of-root includes.
 fn normalize_rel_path(path: &str) -> String {
     let mut stack: Vec<&str> = Vec::new();
     let mut leading_parents = 0usize;
     let normalized = path.replace('\\', "/");
+    let absolute = normalized.starts_with('/');
     for comp in normalized.split('/') {
         match comp {
             "" | "." => {}
@@ -549,6 +574,9 @@ fn normalize_rel_path(path: &str) -> String {
         }
     }
     let mut out = String::new();
+    if absolute {
+        out.push('/');
+    }
     for _ in 0..leading_parents {
         out.push_str("../");
     }
@@ -574,7 +602,12 @@ fn logical_lines(content: &str) -> Vec<LogicalLine> {
     while i < lines.len() {
         let start = i;
         let mut physical = vec![lines[i].to_string()];
-        while lines[i].trim_end().ends_with('\\') && i + 1 < lines.len() {
+        // pip's join_lines never continues a comment line: `# ...\` is a
+        // complete comment, not a continuation of the next line.
+        while lines[i].trim_end().ends_with('\\')
+            && !lines[i].trim_start().starts_with('#')
+            && i + 1 < lines.len()
+        {
             i += 1;
             physical.push(lines[i].to_string());
         }
@@ -913,6 +946,139 @@ mod tests {
                 .await
                 .unwrap(),
             "six==1.16.0\n"
+        );
+    }
+
+    /// Multi-file wiring is transactional: when the write to the SECOND
+    /// planned file fails, the already-written first file is restored. The
+    /// orchestrator sweeps the wheel dir on a wiring error, so a surviving
+    /// half-wired file would reference a deleted artifact — with no ledger
+    /// entry recorded to revert it. (wire_uv rolls its pyproject write back
+    /// the same way when the lock write fails.)
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wire_failure_rolls_back_already_written_files() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let original_root = "six==1.16.0\n-r deps/pinned.txt\n";
+        let tmp = write_root(original_root).await;
+        tokio::fs::create_dir_all(tmp.path().join("deps"))
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.path().join("deps/pinned.txt"), "six==1.16.0\n")
+            .await
+            .unwrap();
+        // Read-only include dir: planning READS it fine, the atomic write
+        // (temp file in the same dir) fails. Root is planned/written first.
+        let deps = tmp.path().join("deps");
+        let mut perms = std::fs::metadata(&deps).unwrap().permissions();
+        perms.set_mode(0o555);
+        std::fs::set_permissions(&deps, perms.clone()).unwrap();
+
+        let err = wire_requirements(tmp.path(), "six", "1.16.0", REL_WHEEL, SHA)
+            .await
+            .unwrap_err();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&deps, perms).unwrap();
+        assert_eq!(err.0, "pypi_requirements_write_failed");
+        assert_eq!(
+            read_root(tmp.path()).await,
+            original_root,
+            "the already-written root must be rolled back on a later write failure"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(tmp.path().join("deps/pinned.txt"))
+                .await
+                .unwrap(),
+            "six==1.16.0\n"
+        );
+    }
+
+    /// Wire and revert both rewrite requirements files in place; a committed
+    /// file's mode (e.g. group-readable 0o640 under a strict umask) must
+    /// survive both. The plain atomic writer swaps in a fresh umask-default
+    /// inode — same class as the npm/pipenv lockfile mode resets.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wire_and_revert_preserve_requirements_file_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = write_root("six==1.16.0\n").await;
+        let path = tmp.path().join("requirements.txt");
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o640);
+        std::fs::set_permissions(&path, perms).unwrap();
+
+        let wiring = wire_requirements(tmp.path(), "six", "1.16.0", REL_WHEEL, SHA)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o640,
+            "wire must preserve the file mode"
+        );
+
+        let outcome = revert_requirements(&entry_for(wiring), tmp.path(), false).await;
+        assert!(outcome.success);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o640,
+            "revert must preserve the file mode"
+        );
+    }
+
+    /// pip's join_lines never treats a comment line ending in `\` as a
+    /// continuation (COMMENT_RE guard) — the pin on the next physical line is
+    /// a real requirement. Swallowing it into the comment classifies the
+    /// package as absent, and the appended duplicate makes
+    /// `pip install -r requirements.txt` fail with a double requirement.
+    #[tokio::test]
+    async fn comment_ending_in_backslash_does_not_swallow_the_next_line() {
+        let tmp = write_root("# vendored from C:\\deps\\\nsix==1.16.0\n").await;
+        let wiring = wire_requirements(tmp.path(), "six", "1.16.0", REL_WHEEL, SHA)
+            .await
+            .unwrap();
+        assert_eq!(wiring.len(), 1);
+        assert_eq!(
+            wiring[0].action,
+            WiringAction::Rewritten,
+            "the pin below the comment must be rewritten in place, not duplicated"
+        );
+        assert_eq!(
+            read_root(tmp.path()).await,
+            format!("# vendored from C:\\deps\\\n{}\n", expected_line())
+        );
+    }
+
+    /// An absolute `-r /abs/path.txt` include resolves outside any committable
+    /// root; a pin there must refuse exactly like a `../` include. Mangling it
+    /// into an in-root relative path silently skips the file pip *can* read,
+    /// and the transitive line appended at the root EOF gives pip a "double
+    /// requirement" error.
+    #[tokio::test]
+    async fn pin_in_absolute_include_refuses() {
+        let outer = tempfile::tempdir().unwrap();
+        let root = outer.path().join("project");
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let shared = outer.path().join("shared.txt");
+        tokio::fs::write(&shared, "six==1.16.0\n").await.unwrap();
+        let root_content = format!("-r {}\n", shared.display());
+        tokio::fs::write(root.join("requirements.txt"), &root_content)
+            .await
+            .unwrap();
+        let err = wire_requirements(&root, "six", "1.16.0", REL_WHEEL, SHA)
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, "pypi_requirements_outside_root");
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("requirements.txt"))
+                .await
+                .unwrap(),
+            root_content,
+            "refusal leaves the root untouched"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(&shared).await.unwrap(),
+            "six==1.16.0\n",
+            "the absolute include is never edited"
         );
     }
 

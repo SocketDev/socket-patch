@@ -12,7 +12,10 @@ use crate::api::client::{SecondaryArtifact, VendorServiceOutcome};
 use crate::patch::vendor::lock_inventory::LockIntegrity;
 use crate::patch::vendor::registry_fetch::{artifact_matches_integrity, verify_go_h1};
 use crate::patch::vendor::VendorServiceConfig;
-use crate::patch::vendor::{common::refused, VendorOutcome, VendorWarning};
+use crate::patch::vendor::{
+    common::{refused, service_offline_conflict},
+    VendorOutcome, VendorWarning,
+};
 
 /// A service archive whose bytes have passed integrity verification.
 ///
@@ -131,6 +134,12 @@ pub(crate) async fn service_archive_copy(
     noun: &str,
     warnings: &mut Vec<VendorWarning>,
 ) -> ServiceCopy {
+    // The maven/nuget flows have no earlier guard, so the fail-closed
+    // `--vendor-source=service` + `--offline` refusal lives here (the other
+    // backends check the same helper at their entry points).
+    if let Some(refusal) = service_offline_conflict(service) {
+        return ServiceCopy::HardFail(Box::new(refusal));
+    }
     let Some(cfg) = service else {
         return ServiceCopy::FallBack;
     };
@@ -319,6 +328,45 @@ mod tests {
             fetch_verified_archive(&cfg_for(&server), UUID).await,
             ServiceArtifact::IntegrityMismatch(_)
         ));
+    }
+
+    /// `--vendor-source=service --offline` is a fail-closed refusal (the same
+    /// `vendor_service_offline_conflict` the other backends give via
+    /// `service_offline_conflict`), never a silent local-build fallback —
+    /// maven/nuget funnel through here and have no earlier guard.
+    #[tokio::test]
+    async fn service_copy_offline_conflict_hard_fails() {
+        let server = MockServer::start().await;
+        let mut cfg = cfg_for(&server);
+        cfg.offline = true;
+        let mut warnings = Vec::new();
+        match service_archive_copy(Some(&cfg), UUID, "x", ".jar", &mut warnings).await {
+            ServiceCopy::HardFail(outcome) => match *outcome {
+                VendorOutcome::Refused { code, .. } => {
+                    assert_eq!(code, "vendor_service_offline_conflict");
+                }
+                other => panic!("expected Refused, got {other:?}"),
+            },
+            ServiceCopy::Used(_) => panic!("offline run must not download"),
+            ServiceCopy::FallBack => {
+                panic!("--vendor-source=service --offline fell back to a local build")
+            }
+        }
+    }
+
+    /// Under `auto`, offline stays a quiet fallback to the local build.
+    #[tokio::test]
+    async fn service_copy_offline_auto_falls_back() {
+        let server = MockServer::start().await;
+        let mut cfg = cfg_for(&server);
+        cfg.source = VendorSource::Auto;
+        cfg.offline = true;
+        let mut warnings = Vec::new();
+        assert!(matches!(
+            service_archive_copy(Some(&cfg), UUID, "x", ".jar", &mut warnings).await,
+            ServiceCopy::FallBack
+        ));
+        assert!(warnings.is_empty(), "quiet fallback, no warning");
     }
 
     /// A config without a client is a quiet Unavailable, not a panic.

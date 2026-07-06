@@ -456,6 +456,128 @@ async fn scan_vendor_silent_gc_prints_nothing() {
     );
 }
 
+/// The embedded-VEX failure path must keep its error under `--silent`
+/// ("errors only", not "nothing"): a requested-but-failed `--vex` exits
+/// 1, and the failure message must still reach stderr. Regression
+/// guard: `embed_vex_human` gated its error print on `!silent`, so
+/// `scan --silent --vex out.json` failed with exit 1 and no output at
+/// all. Fully offline: the empty crawl short-circuits before the API,
+/// and the missing manifest makes VEX generation fail deterministically
+/// (`manifest_not_found`).
+#[test]
+fn scan_silent_vex_failure_keeps_error_output() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_root(tmp.path());
+    let vex_path = tmp.path().join("out.vex.json");
+    let vex_arg = vex_path.to_str().unwrap().to_string();
+
+    let (code, stdout, stderr) = run_scan(tmp.path(), &["--silent", "--vex", &vex_arg]);
+    assert_eq!(
+        code, 1,
+        "requested-but-failed VEX must exit 1; stdout={stdout:?} stderr={stderr:?}"
+    );
+    assert!(
+        stdout.trim().is_empty(),
+        "--silent must produce no stdout; got {stdout:?}"
+    );
+    assert!(
+        stderr.contains("VEX generation failed"),
+        "--silent must NOT suppress the VEX failure message; got {stderr:?}"
+    );
+
+    // Control run: the same failure WITHOUT --silent must print the same
+    // error — otherwise the assertion above could pass against a message
+    // that never prints for anyone.
+    let (loud_code, _, loud_stderr) = run_scan(tmp.path(), &["--vex", &vex_arg]);
+    assert_eq!(loud_code, 1);
+    assert!(
+        loud_stderr.contains("VEX generation failed"),
+        "non-silent VEX failure must print the error; got {loud_stderr:?}"
+    );
+}
+
+/// The redirect flow's embedded-VEX failure path must keep its error
+/// under `--silent` too ("errors only", not "nothing"): `scan --redirect
+/// --vex out.json --silent` with nothing to attest (the reference is
+/// forbidden, no manifest exists) exits 1, and the failure message must
+/// still reach stderr. Regression guard: `run_redirect` printed its
+/// `vex_error` inside the `!silent` human branch, so the run failed with
+/// exit 1 and no output at all — the same bug `embed_vex_human` already
+/// fixed on the non-redirect path (see
+/// `scan_silent_vex_failure_keeps_error_output` above).
+#[tokio::test]
+async fn scan_redirect_silent_vex_failure_keeps_error_output() {
+    let purl = "pkg:npm/silent-target@1.0.0";
+    let before = b"before\n";
+
+    let mock = MockServer::start().await;
+    mount_one_patch_api(&mock, purl, before).await;
+    // Reference endpoint: the patch exists but this org may not download
+    // it, so nothing is redirected and the requested VEX has no subject.
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/package")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "results": { UUID: { "status": "forbidden", "url": null, "purl": purl, "artifacts": [], "registryOverride": null } }
+        })))
+        .mount(&mock)
+        .await;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_root(tmp.path());
+    write_npm_package(tmp.path(), "silent-target", "1.0.0", before);
+    let vex_path = tmp.path().join("out.vex.json");
+    let vex_arg = vex_path.to_str().unwrap().to_string();
+
+    let args = |silent: bool| {
+        let mut v = vec!["--redirect", "--yes"];
+        if silent {
+            v.push("--silent");
+        }
+        v.extend_from_slice(&["--vex", &vex_arg, "--vex-product", "pkg:npm/consumer@0.0.0"]);
+        v
+    };
+
+    let base = [
+        "--api-url".to_string(),
+        mock.uri(),
+        "--api-token".to_string(),
+        "fake-token".to_string(),
+        "--org".to_string(),
+        ORG_SLUG.to_string(),
+    ];
+    let full: Vec<&str> = args(true)
+        .into_iter()
+        .chain(base.iter().map(String::as_str))
+        .collect();
+    let (code, stdout, stderr) = run_scan(tmp.path(), &full);
+    assert_eq!(
+        code, 1,
+        "requested-but-failed VEX must exit 1; stdout={stdout:?} stderr={stderr:?}"
+    );
+    assert!(
+        stdout.trim().is_empty(),
+        "--silent must produce no stdout; got {stdout:?}"
+    );
+    assert!(
+        stderr.contains("VEX generation failed"),
+        "--silent must NOT suppress the redirect VEX failure message; got {stderr:?}"
+    );
+
+    // Control run: the same failure WITHOUT --silent must print the same
+    // error — otherwise the assertion above could pass against a message
+    // that never prints for anyone.
+    let full_loud: Vec<&str> = args(false)
+        .into_iter()
+        .chain(base.iter().map(String::as_str))
+        .collect();
+    let (loud_code, _, loud_stderr) = run_scan(tmp.path(), &full_loud);
+    assert_eq!(loud_code, 1);
+    assert!(
+        loud_stderr.contains("VEX generation failed"),
+        "non-silent redirect VEX failure must print the error; got {loud_stderr:?}"
+    );
+}
+
 /// Errors must still print under `--silent` ("errors only", not
 /// "nothing"): when every API batch fails, the failure message keeps
 /// its stderr output and exit 1 — but the informational "Found N

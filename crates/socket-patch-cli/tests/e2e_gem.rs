@@ -17,7 +17,6 @@
 //! cargo test -p socket-patch-cli --test e2e_gem -- --ignored
 //! ```
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -135,21 +134,6 @@ fn read_patch_files(manifest_path: &Path) -> serde_json::Value {
     patch["files"].clone()
 }
 
-/// Record hashes of all files in the gem dir that will be patched.
-fn record_original_hashes(gem_dir: &Path, files: &serde_json::Value) -> HashMap<String, String> {
-    let mut hashes = HashMap::new();
-    for (rel_path, _) in files.as_object().expect("files object") {
-        let full_path = gem_dir.join(rel_path);
-        let hash = if full_path.exists() {
-            git_sha256_file(&full_path)
-        } else {
-            String::new()
-        };
-        hashes.insert(rel_path.clone(), hash);
-    }
-    hashes
-}
-
 /// Verify all patched files match their afterHash from the manifest.
 fn assert_after_hashes(gem_dir: &Path, files: &serde_json::Value) {
     for (rel_path, info) in files.as_object().expect("files object") {
@@ -190,21 +174,49 @@ fn assert_before_hashes(gem_dir: &Path, files: &serde_json::Value) {
     }
 }
 
-/// Verify files match the originally recorded hashes.
-fn assert_original_hashes(gem_dir: &Path, original_hashes: &HashMap<String, String>) {
-    for (rel_path, orig_hash) in original_hashes {
-        if orig_hash.is_empty() {
-            continue;
-        }
-        let full_path = gem_dir.join(rel_path);
-        if full_path.exists() {
-            assert_eq!(
-                git_sha256_file(&full_path),
-                *orig_hash,
-                "{rel_path} should match original hash"
-            );
-        }
-    }
+/// The "files are not patched" oracle used by `test_gem_dry_run` /
+/// `test_gem_save_only` (after `get --no-apply` / `get --save-only`) must
+/// FAIL when the gem is actually in the applied state — otherwise a `get`
+/// that wrongly applies sails through the whole test. Hermetic stand-in for
+/// that masked regression: a gem dir whose files carry afterHash content
+/// plus a patch-created file, checked with the exact oracle those tests run.
+#[test]
+fn not_patched_oracle_catches_applied_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let gem_dir = dir.path().to_path_buf();
+
+    let files = serde_json::json!({
+        "lib/modified.rb": {
+            "beforeHash": git_sha256(b"original content\n"),
+            "afterHash": git_sha256(b"patched content\n"),
+        },
+        "lib/created.rb": {
+            "beforeHash": "",
+            "afterHash": git_sha256(b"new file\n"),
+        },
+    });
+
+    // Applied state: modified file has afterHash content, created file exists.
+    std::fs::create_dir_all(gem_dir.join("lib")).unwrap();
+    std::fs::write(gem_dir.join("lib/modified.rb"), b"patched content\n").unwrap();
+    std::fs::write(gem_dir.join("lib/created.rb"), b"new file\n").unwrap();
+
+    let oracle = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // The exact not-patched oracle the lifecycle tests run. It must be
+        // anchored to the manifest's beforeHash, not a snapshot taken after
+        // the command under test (which is vacuously self-consistent).
+        assert_before_hashes(&gem_dir, &files);
+    }));
+    assert!(
+        oracle.is_err(),
+        "the not-patched oracle passed on a fully applied gem — it cannot \
+         catch a `get --no-apply`/`--save-only` that wrongly applies"
+    );
+
+    // And it must PASS on the pristine state (no false failures).
+    std::fs::write(gem_dir.join("lib/modified.rb"), b"original content\n").unwrap();
+    std::fs::remove_file(gem_dir.join("lib/created.rb")).unwrap();
+    assert_before_hashes(&gem_dir, &files);
 }
 
 // ---------------------------------------------------------------------------
@@ -533,14 +545,16 @@ fn test_gem_dry_run() {
     // Read manifest to get file list and expected hashes.
     let manifest_path = cwd.join(".socket/manifest.json");
     let files = read_patch_files(&manifest_path);
-    let original_hashes = record_original_hashes(&gem_dir, &files);
 
-    // Files should still be original (not patched).
-    assert_original_hashes(&gem_dir, &original_hashes);
+    // Files should still be original (not patched) — checked against the
+    // manifest's beforeHash, an oracle independent of the current disk
+    // state (a snapshot taken after `get --no-apply` would pass even if
+    // the flag regressed and applied).
+    assert_before_hashes(&gem_dir, &files);
 
     // Dry-run should succeed but leave files untouched.
     assert_run_ok(cwd, &["apply", "--dry-run"], "apply --dry-run");
-    assert_original_hashes(&gem_dir, &original_hashes);
+    assert_before_hashes(&gem_dir, &files);
 
     // Real apply should work.
     assert_run_ok(cwd, &["apply"], "apply");
@@ -570,10 +584,10 @@ fn test_gem_save_only() {
     // Read manifest to get file list and expected hashes.
     let manifest_path = cwd.join(".socket/manifest.json");
     let files = read_patch_files(&manifest_path);
-    let original_hashes = record_original_hashes(&gem_dir, &files);
 
-    // Files should still be original (not patched).
-    assert_original_hashes(&gem_dir, &original_hashes);
+    // Files should still be original (not patched) — checked against the
+    // manifest's beforeHash, independent of the current disk state.
+    assert_before_hashes(&gem_dir, &files);
 
     let manifest: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();

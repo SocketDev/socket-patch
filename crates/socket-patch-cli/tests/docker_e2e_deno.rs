@@ -162,6 +162,29 @@ fn api_url_for_container(server: &MockServer) -> String {
     format!("http://host.docker.internal:{}", server.address().port())
 }
 
+/// Minimal wiremock for the JSR scan variant: the batch endpoint answers
+/// "no patches" for whatever purls scan submits. Nothing else is
+/// consulted — the variant only verifies discovery counts — but pinning
+/// scan to this server keeps the run hermetic: without it the CLI falls
+/// back to the live public patch proxy, so the test would leak synthetic
+/// `pkg:jsr` purls to production and fail outright wherever that proxy
+/// is unreachable (an all-batches-failed scan exits 1).
+async fn make_empty_batch_mock_server() -> MockServer {
+    let listener = std::net::TcpListener::bind("0.0.0.0:0").expect("bind wiremock to 0.0.0.0:0");
+    let server = MockServer::builder().listener(listener).start().await;
+
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/batch")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "packages": [],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(&server)
+        .await;
+
+    server
+}
+
 /// Driver script for the `deno install` + node_modules variant. Deno
 /// 2.0 reads `package.json`, resolves dependencies through the npm
 /// registry, and populates `node_modules/` — at which point the
@@ -292,7 +315,9 @@ exit 0
 /// produce scannable trees. This test stages exactly that layout via
 /// `mkdir` so the docker run proves the CLI ↔ DenoCrawler integration
 /// end-to-end, even before real-world Deno output matches.
-fn deno_jsr_script() -> String {
+fn deno_jsr_script(api_url: &str) -> String {
+    // Plain `.replace` instead of `format!` so the script's many literal
+    // braces (JSON heredocs, bash expansions) don't need `{{` escaping.
     r#"#!/usr/bin/env bash
 set -uo pipefail
 
@@ -360,9 +385,12 @@ EOF
 
 # socket-patch scan --global --ecosystems deno --global-prefix <path>.
 # global-prefix bypasses default ~/.cache/deno discovery and points
-# explicitly at our synthetic JSR root.
+# explicitly at our synthetic JSR root. The API args pin the patch
+# lookup to the host wiremock — omitting them would send the batch
+# query to the live public proxy instead.
 SCAN_OUT=$(socket-patch scan --json --global \
   --global-prefix "$JSR" \
+  --api-url '{api_url}' --api-token fake --org {ORG} \
   --ecosystems deno 2>/tmp/scan.err)
 SCAN_RC=$?
 echo "scan exit=$SCAN_RC" >&2
@@ -413,7 +441,31 @@ echo "scanned jsr packages count matches oracle: $SCANNED" >&2
 echo "===SCAN VERIFIED===" >&2
 echo "===E2E PASS==="
 exit 0
-"#.to_string()
+"#
+    .replace("{api_url}", api_url)
+    .replace("{ORG}", ORG)
+}
+
+/// Hermeticity guard for the JSR variant, runnable without the docker
+/// image. Every network-touching `socket-patch` invocation in the
+/// generated script must be pinned to the test's wiremock: without
+/// `--api-url`, `scan` falls back to the LIVE public patch proxy, so
+/// the run leaks the synthetic `pkg:jsr` purls to production and fails
+/// outright (an all-batches-failed scan exits 1) on any machine where
+/// that proxy is unreachable.
+#[test]
+fn deno_jsr_script_pins_scan_to_the_mock_api() {
+    let script = deno_jsr_script("http://host.docker.internal:12345");
+    assert!(
+        script.contains("--api-url 'http://host.docker.internal:12345'"),
+        "JSR-variant scan must target the test's wiremock, not the live \
+         public proxy:\n{script}"
+    );
+    assert!(
+        script.contains(&format!("--org {ORG}")),
+        "JSR-variant scan must send the batch query to the mocked org \
+         endpoint:\n{script}"
+    );
 }
 
 /// Returns `true` when the test must skip because the docker image is
@@ -504,10 +556,12 @@ async fn deno_install_node_modules_full_apply_chain() {
 
 #[tokio::test]
 async fn deno_jsr_synthetic_layout_scan_verifies_discovery() {
+    let server = make_empty_batch_mock_server().await;
+    let api_url = api_url_for_container(&server);
     if skip_if_no_image() {
         return;
     }
-    let out = run_container(&deno_jsr_script());
+    let out = run_container(&deno_jsr_script(&api_url));
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(

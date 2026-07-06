@@ -594,6 +594,25 @@ fn bare_uuid_fallback_still_routes_to_get_not_vendor() {
     }
 }
 
+// --- Harness invariants --------------------------------------------------------
+
+/// Drift guard: [`EnvScrub`] must cover every env var `GlobalArgs` binds —
+/// the production `GLOBAL_ARG_ENV_VARS` list is the source of truth. A
+/// `GlobalArgs` flag whose env var is missing from [`SOCKET_ENV_VARS`]
+/// escapes the scrub, so an ambient value in the developer's shell or CI
+/// (e.g. `SOCKET_STRICT=garbage`) aborts every parse in this file —
+/// exactly the wrong-reason failure mode the hermeticity contract at the
+/// top of this file promises away.
+#[test]
+fn env_scrub_covers_every_global_arg_env_var() {
+    for var in socket_patch_cli::args::GLOBAL_ARG_ENV_VARS {
+        assert!(
+            SOCKET_ENV_VARS.contains(var),
+            "{var} is bound by GlobalArgs but missing from SOCKET_ENV_VARS — EnvScrub won't scrub it",
+        );
+    }
+}
+
 // --- Error paths -------------------------------------------------------------
 
 #[test]

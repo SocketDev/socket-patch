@@ -19,7 +19,7 @@ use std::process::Command;
 #[path = "common/mod.rs"]
 mod common;
 
-use common::{git_sha256, has_command, run_with_env};
+use common::{binary, git_sha256, has_command};
 
 const UMOD: &str = "example.com/upstream";
 const UVER: &str = "v1.0.0";
@@ -28,13 +28,39 @@ const PRISTINE_LIB: &str = "package upstream\n\nfunc Greeting() string { return 
 const PATCHED_LIB: &str = "package upstream\n\nfunc Greeting() string { return \"PATCHED\" }\n";
 
 /// Env for every `go` invocation: hermetic file-proxy + temp cache, sums off.
+/// `GOTOOLCHAIN=local` keeps the installed toolchain from trying to download
+/// a different one — an ambient `GOTOOLCHAIN` pin would otherwise send every
+/// `go` command chasing a toolchain the file proxy can't serve.
 fn go_env<'a>(modcache: &'a str, proxy_url: &'a str) -> Vec<(&'a str, &'a str)> {
     vec![
         ("GOMODCACHE", modcache),
         ("GOPROXY", proxy_url),
         ("GOSUMDB", "off"),
         ("GOFLAGS", "-mod=mod"),
+        ("GOTOOLCHAIN", "local"),
     ]
+}
+
+/// Run socket-patch with ambient `SOCKET_*` scrubbed + the fixture GOMODCACHE
+/// (the go crawler resolves installed modules through it). Every global flag
+/// is env-backed (`SOCKET_DRY_RUN`, `SOCKET_GLOBAL`, `SOCKET_MANIFEST_PATH`,
+/// …), so an unscrubbed ambient value would silently reconfigure `apply` /
+/// `--check` out from under the assertions.
+fn run_socket(cwd: &Path, args: &[&str], modcache: &Path) -> (i32, String, String) {
+    let mut cmd = Command::new(binary());
+    cmd.args(args).current_dir(cwd);
+    for (k, _) in std::env::vars_os() {
+        if k.to_string_lossy().starts_with("SOCKET_") {
+            cmd.env_remove(&k);
+        }
+    }
+    cmd.env("GOMODCACHE", modcache);
+    let out = cmd.output().expect("failed to run socket-patch binary");
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
 }
 
 fn go(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> std::process::Output {
@@ -156,6 +182,14 @@ fn go_build_links_patch_via_replace_redirect() {
         eprintln!("skipping e2e_golang_build: `go`/`zip` not installed");
         return;
     }
+    // RED guards for the hermeticity pins: bake the hostile ambient values in
+    // so this suite fails deterministically if either leak returns.
+    // `GOTOOLCHAIN` must lose to go_env's `local` pin (or every `go` command
+    // chases a nonexistent toolchain through the file proxy); `SOCKET_DRY_RUN`
+    // must be scrubbed by `run_socket` (or every apply is a no-op that still
+    // exits 0 and the patched-symbol assert sees PRISTINE).
+    std::env::set_var("GOTOOLCHAIN", "go1.99.99");
+    std::env::set_var("SOCKET_DRY_RUN", "true");
     let tmp = tempfile::tempdir().unwrap();
     let (consumer, modcache, proxy_url) = stage(tmp.path());
     let cs = consumer.to_str().unwrap();
@@ -174,10 +208,10 @@ fn go_build_links_patch_via_replace_redirect() {
     // Patch + apply (socket-patch reads only the cache; no `go`). This writes the
     // project-local copy under `.socket/go-patches/` and the `go.mod` `replace`.
     write_patch(&consumer);
-    let (code, so, se) = run_with_env(
+    let (code, so, se) = run_socket(
         &consumer,
         &["apply", "--offline", "--ecosystems", "golang", "--cwd", cs],
-        &[("GOMODCACHE", mc)],
+        &modcache,
     );
     assert_eq!(code, 0, "apply failed.\n{so}\n{se}");
 
@@ -196,10 +230,10 @@ fn go_build_links_patch_via_replace_redirect() {
 
     // `apply --check` (read-only redirect auditor) reports the committed
     // redirect as in sync.
-    let (code, _so, _se) = run_with_env(
+    let (code, _so, _se) = run_socket(
         &consumer,
         &["apply", "--check", "--ecosystems", "golang", "--cwd", cs],
-        &[("GOMODCACHE", mc)],
+        &modcache,
     );
     assert_eq!(code, 0, "apply --check should be in sync after apply");
 
@@ -217,10 +251,10 @@ fn go_build_links_patch_via_replace_redirect() {
         "package upstream\n\nfunc Greeting() string { return \"DRIFT\" }\n",
     )
     .unwrap();
-    let (code, _so, _se) = run_with_env(
+    let (code, _so, _se) = run_socket(
         &consumer,
         &["apply", "--check", "--ecosystems", "golang", "--cwd", cs],
-        &[("GOMODCACHE", mc)],
+        &modcache,
     );
     assert_ne!(
         code, 0,
@@ -228,10 +262,10 @@ fn go_build_links_patch_via_replace_redirect() {
     );
 
     // A fresh `apply` re-materialises the copy and `go build` links PATCHED again.
-    let (code, _so, _se) = run_with_env(
+    let (code, _so, _se) = run_socket(
         &consumer,
         &["apply", "--offline", "--ecosystems", "golang", "--cwd", cs],
-        &[("GOMODCACHE", mc)],
+        &modcache,
     );
     assert_eq!(code, 0, "re-apply should heal the drifted copy");
     let healed = go(&consumer, &["run", "."], &goenv);

@@ -41,6 +41,25 @@ impl StagedSources {
             mem_blobs: None,
         }
     }
+
+    /// Blob destination for post-stage, on-demand fetches (apply's mismatch
+    /// blob top-up). When sources are read directly from `.socket/` (no
+    /// overlay was staged), promote `blobs` to a transient overlay tempdir
+    /// first — a late download must never land in the persistent
+    /// `.socket/blobs/` cache (this module's read-only contract). `None`
+    /// when the overlay cannot be created; the caller skips the fetch and
+    /// the affected files fail as they would offline.
+    pub(crate) async fn writable_blobs(&mut self) -> Option<&Path> {
+        if self._stage.is_none() {
+            let stage = tempfile::tempdir().ok()?;
+            let blobs = stage.path().join("blobs");
+            tokio::fs::create_dir_all(&blobs).await.ok()?;
+            overlay_dir(&self.blobs, &blobs).await;
+            self.blobs = blobs;
+            self._stage = Some(stage);
+        }
+        Some(&self.blobs)
+    }
 }
 
 /// The staging outcome.

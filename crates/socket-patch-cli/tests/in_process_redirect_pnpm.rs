@@ -256,6 +256,144 @@ async fn hosted_rewrites_pnpm_root_lock_resolution() {
     );
 }
 
+/// (a2) SCOPED package: pnpm lockfileVersion 9 single-quotes `packages:` keys
+/// that begin with `@` (`'@scope/name@1.0.0':` — YAML forbids a plain scalar
+/// starting with `@`; verified against pnpm 10 output), and the API serves
+/// scoped purls percent-encoded (`pkg:npm/%40scope/name@version`). The
+/// rewriter must splice the resolution under the QUOTED key, and the run must
+/// count the dep as redirected (ledger edit present) — a silent
+/// entry-not-found here would leave every scoped npm package unredirected.
+#[tokio::test]
+#[serial]
+async fn hosted_rewrites_pnpm_quoted_scoped_key() {
+    const SCOPED_NAME: &str = "@socktest/in-proc-redirect-pnpm";
+    const SCOPED_PURL: &str = "pkg:npm/%40socktest/in-proc-redirect-pnpm@1.0.0";
+    const SCOPED_HOSTED_URL: &str = "http://patch.test/patch/npm/%40socktest/in-proc-redirect-pnpm/1.0.0/22222222-2222-4222-8222-222222222222/11111111-1111-4111-8111-111111111111/in-proc-redirect-pnpm-1.0.0.tgz";
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/batch")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "packages": [{
+                "purl": SCOPED_PURL,
+                "patches": [{
+                    "uuid": UUID, "purl": SCOPED_PURL, "tier": "free",
+                    "cveIds": [], "ghsaIds": [], "severity": "high",
+                    "title": "pnpm scoped redirect fixture"
+                }]
+            }],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex(format!(
+            "^/v0/orgs/{ORG}/patches/by-package/.+$"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "patches": [{
+                "uuid": UUID, "purl": SCOPED_PURL,
+                "publishedAt": "2024-01-01T00:00:00Z",
+                "description": "x", "license": "MIT", "tier": "free",
+                "vulnerabilities": {}
+            }],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/package")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "results": {
+                UUID: {
+                    "status": "granted",
+                    "url": SCOPED_HOSTED_URL,
+                    "purl": SCOPED_PURL,
+                    "artifacts": [{
+                        "kind": "tarball",
+                        "url": SCOPED_HOSTED_URL,
+                        "integrity": { "sha512": PATCHED_SHA512 }
+                    }],
+                    "registryOverride": null
+                }
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::write(
+        root.join("package.json"),
+        format!(
+            r#"{{ "name": "consumer", "version": "0.0.0", "dependencies": {{ "{SCOPED_NAME}": "{VERSION}" }} }}"#
+        ),
+    )
+    .unwrap();
+    let pkg = root.join("node_modules").join(SCOPED_NAME);
+    std::fs::create_dir_all(&pkg).unwrap();
+    std::fs::write(
+        pkg.join("package.json"),
+        format!(r#"{{ "name": "{SCOPED_NAME}", "version": "{VERSION}" }}"#),
+    )
+    .unwrap();
+    // The quoted-key shape below is byte-for-byte what pnpm 10 (lockfile 9.0)
+    // emits for a scoped dependency.
+    std::fs::write(
+        root.join("pnpm-lock.yaml"),
+        format!(
+            "lockfileVersion: '9.0'
+
+importers:
+  .:
+    dependencies:
+      '{SCOPED_NAME}':
+        specifier: {VERSION}
+        version: {VERSION}
+
+packages:
+
+  '{SCOPED_NAME}@{VERSION}':
+    resolution: {{integrity: {UPSTREAM_SHA512}}}
+
+snapshots:
+
+  '{SCOPED_NAME}@{VERSION}': {{}}
+"
+        ),
+    )
+    .unwrap();
+
+    let code = run(hosted_args(root, server.uri())).await;
+    assert_eq!(code, 0, "scan --mode hosted should succeed for scoped pnpm");
+
+    let lock = std::fs::read_to_string(root.join("pnpm-lock.yaml")).unwrap();
+    assert!(
+        lock.contains(&format!(
+            "  '{SCOPED_NAME}@{VERSION}':\n    resolution: {{integrity: {PATCHED_SHA512}, tarball: {SCOPED_HOSTED_URL}}}"
+        )),
+        "the QUOTED scoped key's resolution must be spliced (quotes preserved); got:\n{lock}"
+    );
+    assert!(
+        !lock.contains("UPSTREAMupstream"),
+        "the upstream integrity must be replaced; got:\n{lock}"
+    );
+
+    let ledger: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(root.join(".socket/vendor/redirect-state.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        ledger["edits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["kind"] == "redirect_pnpm_resolution"
+                && e["key"] == format!("{SCOPED_NAME}@{VERSION}")),
+        "the ledger must record the scoped redirect edit: {ledger}"
+    );
+}
+
 /// (b) `scan --mode hosted --vex`: the redirected pnpm patch is attested with
 /// the `(redirected)` provenance marker (bytes are remote until install, so
 /// this is the NO-VERIFY attestation built from the ledger record — the same

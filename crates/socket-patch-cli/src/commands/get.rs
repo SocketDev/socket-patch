@@ -910,6 +910,9 @@ pub(crate) async fn download_patch_records(
                 downloaded += 1;
             }
             Ok(None) => {
+                if !params.json && !params.silent {
+                    eprintln!("  [fail] {} (could not fetch details)", search_result.purl);
+                }
                 failed += 1;
                 patch_records_json.push(serde_json::json!({
                     "purl": search_result.purl,
@@ -919,6 +922,9 @@ pub(crate) async fn download_patch_records(
                 }));
             }
             Err(e) => {
+                if !params.json && !params.silent {
+                    eprintln!("  [fail] {} ({e})", search_result.purl);
+                }
                 failed += 1;
                 patch_records_json.push(serde_json::json!({
                     "purl": search_result.purl,
@@ -1058,7 +1064,15 @@ pub async fn download_and_apply_patches(
 
     let mut manifest = match read_manifest(&manifest_path).await {
         Ok(Some(m)) => m,
-        _ => PatchManifest::new(),
+        Ok(None) => PatchManifest::new(),
+        // Fail closed on a manifest that exists but can't be read/parsed:
+        // treating it as empty would let the unconditional write below
+        // replace the file and destroy every tracked patch record.
+        Err(e) => {
+            let err = format!("Failed to read manifest: {e}");
+            report_error(params.json, &err);
+            return (1, serde_json::json!({"status": "error", "error": err}));
+        }
     };
 
     // Narrow multi-release selections to the installed distribution
@@ -1309,6 +1323,20 @@ pub async fn run(args: GetArgs) -> i32 {
         // `rollback --one-off`'s not-yet-implemented contract; rejected
         // before any network or disk activity.
         report_error(args.common.json, "One-off get mode is not yet implemented");
+        return 1;
+    }
+    // Strict airgap (CLI_CONTRACT.md `--offline`: never contact the
+    // network; operations that need remote data fail loudly). Every `get`
+    // mode fetches remote patch data — proceeding would hit the API (and
+    // save the fetched patch into the manifest) — so refuse before the
+    // client is built (org auto-resolve is itself a network call). No
+    // telemetry fires here: offline gates `is_telemetry_disabled` too.
+    if args.common.offline {
+        report_error(
+            args.common.json,
+            "get requires network access to fetch patches and cannot run with \
+             --offline/SOCKET_OFFLINE (strict airgap)",
+        );
         return 1;
     }
 
@@ -1747,7 +1775,14 @@ async fn save_and_apply_patch(args: &GetArgs, patch: &PatchResponse) -> i32 {
 
     let mut manifest = match read_manifest(&manifest_path).await {
         Ok(Some(m)) => m,
-        _ => PatchManifest::new(),
+        Ok(None) => PatchManifest::new(),
+        // Fail closed like the download flow: an unreadable manifest
+        // treated as empty would be rewritten below with only this one
+        // patch, destroying every tracked record.
+        Err(e) => {
+            report_error(args.common.json, format!("Failed to read manifest: {e}"));
+            return 1;
+        }
     };
 
     // Build the manifest `files` map. UUID flow is more permissive than
@@ -1794,10 +1829,17 @@ async fn save_and_apply_patch(args: &GetArgs, patch: &PatchResponse) -> i32 {
         return 1;
     }
 
-    let added = manifest
-        .patches
-        .get(&patch.purl)
-        .is_none_or(|p| p.uuid != patch.uuid);
+    // Classify against the manifest state BEFORE the insert, with the same
+    // vocabulary `download_and_apply_patches` emits (CLI_CONTRACT.md): a
+    // different uuid already recorded at this purl is `updated` (+`oldUuid`),
+    // not `added` — consumers diff manifest replacements on that action.
+    let action = decide_patch_action(&manifest, &patch.purl, &patch.uuid);
+    let changed = action != PatchAction::Skipped;
+    let action_label = match &action {
+        PatchAction::Added => "added",
+        PatchAction::Updated { .. } => "updated",
+        PatchAction::Skipped => "skipped",
+    };
 
     manifest
         .patches
@@ -1813,14 +1855,14 @@ async fn save_and_apply_patch(args: &GetArgs, patch: &PatchResponse) -> i32 {
     // different one, VEX verification fails closed (`vendor_uuid_mismatch`)
     // until a `vendor` run refreshes the committed artifact.
     let mut warnings: Vec<String> = Vec::new();
-    if added {
+    if changed {
         warn_on_vendored_uuid_drift(
             &args.common.cwd,
             quiet,
             &[serde_json::json!({
                 "purl": patch.purl,
                 "uuid": patch.uuid,
-                "action": "added",
+                "action": action_label,
             })],
             &mut warnings,
         )
@@ -1829,15 +1871,17 @@ async fn save_and_apply_patch(args: &GetArgs, patch: &PatchResponse) -> i32 {
 
     if !quiet {
         println!("\nPatch saved to {}", manifest_path.display());
-        if added {
-            println!("  Added: 1");
-        } else {
-            println!("  Skipped: 1 (already exists)");
+        match &action {
+            PatchAction::Added => println!("  Added: 1"),
+            PatchAction::Updated { old_uuid } => {
+                println!("  Updated: 1 (replacing {})", short_uuid(old_uuid));
+            }
+            PatchAction::Skipped => println!("  Skipped: 1 (already exists)"),
         }
     }
 
     let mut apply_succeeded = false;
-    if !args.save_only && added {
+    if !args.save_only && changed {
         if !quiet {
             println!("\nApplying patches...");
         }
@@ -1857,7 +1901,7 @@ async fn save_and_apply_patch(args: &GetArgs, patch: &PatchResponse) -> i32 {
     // partial failure. The `status` field must agree with the exit code
     // returned below; a hardcoded `success` alongside a non-zero exit
     // misleads JSON consumers.
-    let apply_failed = !apply_succeeded && added && !args.save_only;
+    let apply_failed = !apply_succeeded && changed && !args.save_only;
     // No "download failed" concept here — a blob failure early-returns
     // with status `error` above — so only the apply step can degrade us.
     let (status, exit_code) = run_outcome(false, apply_failed);
@@ -1866,17 +1910,20 @@ async fn save_and_apply_patch(args: &GetArgs, patch: &PatchResponse) -> i32 {
         let mut patch_record = serde_json::json!({
             "purl": patch.purl,
             "uuid": patch.uuid,
-            "action": if added { "added" } else { "skipped" },
+            "action": action_label,
         });
-        if added {
-            // Only enrich when the patch was actually added — a `skipped`
-            // record means the consumer already saw the metadata last time.
+        if let PatchAction::Updated { old_uuid } = &action {
+            patch_record["oldUuid"] = serde_json::json!(old_uuid);
+        }
+        if changed {
+            // Only enrich added/updated records — a `skipped` record means
+            // the consumer already saw the metadata last time.
             merge_metadata(&mut patch_record, patch_event_metadata(patch));
         }
         let mut result_json = serde_json::json!({
             "status": status,
             "found": 1,
-            "downloaded": if added { 1 } else { 0 },
+            "downloaded": if changed { 1 } else { 0 },
             "applied": if apply_succeeded { 1 } else { 0 },
             "patches": [patch_record],
         });

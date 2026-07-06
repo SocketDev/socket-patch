@@ -3,27 +3,26 @@
 //! editing + audit record) and need no network.
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::Path;
 
-fn binary() -> PathBuf {
-    env!("CARGO_BIN_EXE_socket-patch").into()
-}
+#[path = "common/mod.rs"]
+mod common;
 
+/// Run `setup --json --yes [extra]` in `cwd` through the shared hermetic
+/// runner. The binary binds a wide `SOCKET_*` env surface (SOCKET_DRY_RUN,
+/// SOCKET_ECOSYSTEMS, SOCKET_CWD, SOCKET_SETUP_EXCLUDE, ...); an ambient
+/// value silently flips what every test here exercises (SOCKET_DRY_RUN=true
+/// turns each real run into a dry run, SOCKET_ECOSYSTEMS=npm hides the
+/// Python branch entirely), so `common::run_with_env`'s seed-then-scrub is
+/// load-bearing, not hygiene.
 fn run_setup(cwd: &Path, extra: &[&str]) -> (i32, serde_json::Value) {
     let mut args = vec!["setup", "--json", "--yes"];
     args.extend_from_slice(extra);
-    let out = Command::new(binary())
-        .args(&args)
-        .current_dir(cwd)
-        .env_remove("SOCKET_API_TOKEN")
-        .env("SOCKET_TELEMETRY_DISABLED", "1")
-        .output()
-        .expect("run socket-patch");
-    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let (code, stdout, _stderr) =
+        common::run_with_env(cwd, &args, &[("SOCKET_TELEMETRY_DISABLED", "1")]);
     let v = serde_json::from_str(&stdout)
         .unwrap_or_else(|e| panic!("stdout must be JSON ({e}):\n{stdout}"));
-    (out.status.code().unwrap_or(-1), v)
+    (code, v)
 }
 
 fn write(path: &Path, content: &str) {
@@ -260,6 +259,40 @@ fn idempotent_second_run_reports_already_configured() {
 }
 
 #[test]
+fn pep503_equivalent_hook_spellings_are_already_configured() {
+    // pip installs the hook from `socket_patch[hook]` exactly as from the
+    // canonical spelling (PEP 503: `-`/`_`/`.` are interchangeable in names)
+    // and from a combined-extras spec like `socket-patch[cli,hook]` (PEP 508).
+    // Setup must recognize both as configured: appending a second spelling of
+    // the same requirement is non-idempotent, `--check` would fail a CI gate
+    // on a correctly configured repo, and `--remove` would report nothing to
+    // remove while the hook stays wired.
+    for spec in ["socket_patch[hook]\n", "socket-patch[cli,hook]>=1.0\n"] {
+        let tmp = tempfile::tempdir().unwrap();
+        write(&tmp.path().join("requirements.txt"), spec);
+
+        let (code, v) = run_setup(tmp.path(), &[]);
+        assert_eq!(code, 0, "spec {spec:?}: payload={v}");
+        assert_eq!(
+            v["status"], "already_configured",
+            "spec {spec:?} already declares the hook; setup must not re-add it: {v}"
+        );
+        assert_eq!(
+            read(&tmp.path().join("requirements.txt")),
+            spec,
+            "spec {spec:?}: requirements.txt must be untouched"
+        );
+
+        let (code, v) = run_setup(tmp.path(), &["--check"]);
+        assert_eq!(
+            code, 0,
+            "spec {spec:?}: --check must pass on a configured project: {v}"
+        );
+        assert_eq!(v["status"], "configured", "spec {spec:?}: {v}");
+    }
+}
+
+#[test]
 fn dry_run_does_not_modify_or_create_files() {
     let tmp = tempfile::tempdir().unwrap();
     let original = "requests\n";
@@ -404,22 +437,15 @@ fn setup_python_writes_only_inside_repo() {
         "sentinel HOME must start empty"
     );
 
-    let out = Command::new(binary())
-        .args(["setup", "--json", "--yes"])
-        .current_dir(proj.path())
-        .env_remove("SOCKET_API_TOKEN")
-        .env_remove("SOCKET_ECOSYSTEMS")
-        .env_remove("SOCKET_CWD")
-        .env("HOME", home.path())
-        .env("SOCKET_TELEMETRY_DISABLED", "1")
-        .output()
-        .expect("run socket-patch");
-    assert_eq!(
-        out.status.code(),
-        Some(0),
-        "setup should succeed; stderr=\n{}",
-        String::from_utf8_lossy(&out.stderr)
+    let (code, _stdout, stderr) = common::run_with_env(
+        proj.path(),
+        &["setup", "--json", "--yes"],
+        &[
+            ("HOME", home.path().to_str().unwrap()),
+            ("SOCKET_TELEMETRY_DISABLED", "1"),
+        ],
     );
+    assert_eq!(code, 0, "setup should succeed; stderr=\n{stderr}");
 
     assert!(
         files_under(home.path()).is_empty(),
@@ -465,5 +491,139 @@ fn setup_python_state_is_clone_portable() {
         read(&b.path().join("requirements.txt")),
         before,
         "--check must not modify the clone"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Property 7 — the post-edit lockfile refresh must not rewrite the user's
+// pinned dependency set. Poetry 1.x's bare `poetry lock` re-resolves EVERY
+// dependency to the newest compatible version (the pin-preserving spelling is
+// `lock --no-update`); Poetry 2.x makes pin-preserving the default and
+// REMOVES `--no-update`, so setup must try the 1.x spelling first and fall
+// back to the bare form when the flag is unknown. Same shape for PDM
+// (`--update-reuse`). A fake package manager on PATH records the argv setup
+// actually invokes.
+// ---------------------------------------------------------------------------
+
+/// Lay a fake `name` executable into `bin_dir` that appends its argv to `log`
+/// and exits 0 — unless the argv contains `reject_arg`, in which case it prints
+/// an unknown-option error and exits 1 without logging (a tool that does not
+/// know the flag, e.g. Poetry 2.x and `--no-update`).
+#[cfg(unix)]
+fn write_pm_shim(bin_dir: &Path, name: &str, log: &Path, reject_arg: Option<&str>) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(bin_dir).expect("create shim dir");
+    let reject = match reject_arg {
+        Some(flag) => format!(
+            "case \"$*\" in *{flag}*) echo 'The \"{flag}\" option does not exist.' >&2; exit 1;; esac\n"
+        ),
+        None => String::new(),
+    };
+    let body = format!(
+        "#!/bin/sh\n{reject}printf '%s\\n' \"$*\" >> '{}'\nexit 0\n",
+        log.display()
+    );
+    let p = bin_dir.join(name);
+    std::fs::write(&p, body).expect("write shim");
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).expect("chmod shim");
+}
+
+/// `run_setup` with the shim dir prepended to PATH so the spawned lockfile
+/// refresh resolves to the fake package manager.
+#[cfg(unix)]
+fn run_setup_with_shims(cwd: &Path, bin_dir: &Path) -> (i32, serde_json::Value) {
+    let path_env = format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let (code, stdout, _stderr) = common::run_with_env(
+        cwd,
+        &["setup", "--json", "--yes"],
+        &[("SOCKET_TELEMETRY_DISABLED", "1"), ("PATH", &path_env)],
+    );
+    let v = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("stdout must be JSON ({e}):\n{stdout}"));
+    (code, v)
+}
+
+const POETRY_PYPROJECT: &str = "[tool.poetry]\nname = \"x\"\nversion = \"0.1.0\"\ndescription = \"\"\nauthors = []\n\n[tool.poetry.dependencies]\npython = \"^3.9\"\n";
+
+#[cfg(unix)]
+#[test]
+fn poetry_lock_refresh_asks_for_pin_preserving_lock_first() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(&tmp.path().join("pyproject.toml"), POETRY_PYPROJECT);
+    write(&tmp.path().join("poetry.lock"), "# stub lock\n");
+    let log = tmp.path().join("poetry-argv.log");
+    // Poetry 1.x: knows both `lock` and `lock --no-update`.
+    write_pm_shim(&tmp.path().join("bin"), "poetry", &log, None);
+
+    let (code, v) = run_setup_with_shims(tmp.path(), &tmp.path().join("bin"));
+    assert_eq!(code, 0, "setup must succeed: {v}");
+    let argvs = read(&log);
+    let first = argvs.lines().next().unwrap_or_default();
+    assert_eq!(
+        first, "lock --no-update",
+        "on a tool that accepts it, the FIRST lock invocation must be the \
+         pin-preserving `poetry lock --no-update` — the bare `poetry lock` \
+         re-resolves the user's entire pinned set on Poetry 1.x; got argv log:\n{argvs}"
+    );
+    assert!(
+        v.get("warnings").is_none(),
+        "successful pin-preserving refresh must not warn: {v}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn poetry_2x_without_no_update_falls_back_to_bare_lock() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(&tmp.path().join("pyproject.toml"), POETRY_PYPROJECT);
+    write(&tmp.path().join("poetry.lock"), "# stub lock\n");
+    let log = tmp.path().join("poetry-argv.log");
+    // Poetry 2.x: `--no-update` was removed (pin-preserving became the
+    // default), so that spelling exits non-zero.
+    write_pm_shim(
+        &tmp.path().join("bin"),
+        "poetry",
+        &log,
+        Some("--no-update"),
+    );
+
+    let (code, v) = run_setup_with_shims(tmp.path(), &tmp.path().join("bin"));
+    assert_eq!(code, 0, "setup must succeed: {v}");
+    let argvs = read(&log);
+    assert_eq!(
+        argvs.lines().last().unwrap_or_default(),
+        "lock",
+        "when `--no-update` is unknown the bare `poetry lock` must still run \
+         (it is pin-preserving on 2.x); got argv log:\n{argvs}"
+    );
+    assert!(
+        v.get("warnings").is_none(),
+        "a successful fallback is not a failure — no lockfile warning: {v}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn pdm_lock_refresh_asks_for_pin_preserving_lock_first() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        &tmp.path().join("pyproject.toml"),
+        "[project]\nname = \"x\"\nversion = \"0.1.0\"\ndependencies = [\"requests\"]\n\n[tool.pdm]\n",
+    );
+    write(&tmp.path().join("pdm.lock"), "# stub lock\n");
+    let log = tmp.path().join("pdm-argv.log");
+    write_pm_shim(&tmp.path().join("bin"), "pdm", &log, None);
+
+    let (code, v) = run_setup_with_shims(tmp.path(), &tmp.path().join("bin"));
+    assert_eq!(code, 0, "setup must succeed: {v}");
+    let argvs = read(&log);
+    assert_eq!(
+        argvs.lines().next().unwrap_or_default(),
+        "lock --update-reuse",
+        "the first PDM lock invocation must reuse the user's pins; got argv log:\n{argvs}"
     );
 }

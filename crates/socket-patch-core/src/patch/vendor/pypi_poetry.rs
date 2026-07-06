@@ -22,7 +22,7 @@ use std::path::Path;
 use toml_edit::{DocumentMut, Item};
 
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
-use crate::utils::fs::atomic_write_bytes;
+use crate::utils::fs::atomic_write_bytes_preserving_mode;
 
 use super::common::{
     item_get, lock_units_named, pep621_declared_names, record, revert_lock_fragment_splice,
@@ -295,7 +295,10 @@ pub(super) async fn wire_poetry(
         wheel_sha256_hex,
     )?;
     let new_lock = p.lock_text.replacen(&old_unit, &new_unit, 1);
-    atomic_write_bytes(&root.join(LOCK_FILE), new_lock.as_bytes())
+    // Mode-preserving: the lock is a user-owned file we merely edit, so the
+    // swapped-in inode must keep its permission bits rather than reset them
+    // to umask defaults (same class as the revert leg in common.rs).
+    atomic_write_bytes_preserving_mode(&root.join(LOCK_FILE), new_lock.as_bytes())
         .await
         .map_err(|e| {
             (
@@ -364,6 +367,19 @@ fn rewrite_target_package_unit(
         })?;
     let unit = package_unit_lines(&lock_text[span]);
     let old_unit = unit.join("\n");
+    // The unit's lines were re-derived via `str::lines()`, which strips `\r`
+    // — on a CRLF lock (git autocrlf checkout) the joined fragment can never
+    // byte-match the file and the caller's replacen splice would silently
+    // no-op while still recording a rewrite. Fail closed instead.
+    if !lock_text.contains(&old_unit) {
+        return Err((
+            "pypi_poetry_lock_parse_failed",
+            format!(
+                "the {canon} [[package]] entry cannot be spliced back into {LOCK_FILE} \
+                 (non-LF line endings?); normalize the lock to LF and retry"
+            ),
+        ));
+    }
     let mut out =
         replace_files_array(&unit, wheel_file_name, wheel_sha256_hex).ok_or_else(|| {
             // 2.x locks always carry files[]; a unit without one is a shape we
@@ -789,6 +805,61 @@ content-hash = "09f98227642bff952b3df8f8fcc74f1538c091a3ac3ed0031500188347ecb3ca
             assert_eq!(meta.dep_class, dep_class);
             assert_eq!(meta.lock_version, lock_version);
         }
+    }
+
+    /// The lock is a user-owned file we merely edit: wiring must not reset
+    /// its permission bits (same class as the revert leg in common.rs and
+    /// pdm's wire — the plain atomic writer swaps in a umask-mode inode).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wire_preserves_lock_file_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = write_project(LOCK21_DIRECT_REGISTRY, PYPROJECT_DIRECT).await;
+        let lock = tmp.path().join("poetry.lock");
+        let mut perms = std::fs::metadata(&lock).unwrap().permissions();
+        perms.set_mode(0o600);
+        std::fs::set_permissions(&lock, perms).unwrap();
+
+        let p = load_poetry_project(tmp.path()).await.unwrap();
+        let _ = wire_default(&p, tmp.path()).await;
+
+        assert_eq!(read_lock(tmp.path()).await, LOCK21_DIRECT_VENDORED);
+        let mode = std::fs::metadata(&lock).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "wiring must preserve the lock file's permission bits"
+        );
+    }
+
+    /// A CRLF lock (git autocrlf checkout) parses fine, but the splice
+    /// fragment is re-derived via `str::lines()` (which strips `\r`) and can
+    /// never byte-match the file — the replacen would silently no-op while
+    /// still reporting success and recording a rewrite that never landed.
+    /// Wiring must refuse instead.
+    #[tokio::test]
+    async fn crlf_lock_refuses_instead_of_silently_wiring_nothing() {
+        let crlf = LOCK21_DIRECT_REGISTRY.replace('\n', "\r\n");
+        let tmp = write_project(&crlf, PYPROJECT_DIRECT).await;
+        let p = load_poetry_project(tmp.path()).await.unwrap();
+        assert_eq!(
+            check_target_guards(&p, "six", "1.16.0", UUID).unwrap(),
+            PoetryTarget::Fresh
+        );
+
+        let err = wire_poetry(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UUID,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, "pypi_poetry_lock_parse_failed");
+        assert_eq!(read_lock(tmp.path()).await, crlf, "refusal writes nothing");
     }
 
     #[tokio::test]

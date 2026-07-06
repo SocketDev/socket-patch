@@ -47,8 +47,8 @@ use sha2::{Digest, Sha256};
 mod common;
 
 use common::{
-    assert_run_ok, cargo_run, has_command, parse_json_envelope, run, sha256_hex, write_blob,
-    write_minimal_manifest, PatchEntry,
+    assert_run_ok, cargo_run, has_command, parse_json_envelope, run, run_with_env, sha256_hex,
+    write_blob, write_minimal_manifest, PatchEntry,
 };
 
 const ORIGINAL_LIB_RS: &str = "pub fn hello() -> &'static str { \"world\" }\n";
@@ -170,11 +170,21 @@ fn cargo_check(consumer: &Path, cargo_home: &Path) -> std::process::Output {
     // checksum verification happens at *unpack/copy* time, and once
     // a build has consumed the source cargo will short-circuit on
     // subsequent runs even if the underlying files changed.
-    let _ = std::fs::remove_dir_all(consumer.join("target"));
+    //
+    // CARGO_TARGET_DIR must be pinned to the dir we just wiped: an
+    // ambient redirect (shared target dirs are common) sends the build
+    // cache elsewhere, the wipe no-ops, and cargo short-circuits on the
+    // warm cache without re-verifying checksums — turning the negative
+    // control red and the positive round trips vacuous.
+    let target = consumer.join("target");
+    let _ = std::fs::remove_dir_all(&target);
     cargo_run(
         consumer,
         &["check", "--offline", "--frozen"],
-        &[("CARGO_HOME", cargo_home.to_str().unwrap())],
+        &[
+            ("CARGO_HOME", cargo_home.to_str().unwrap()),
+            ("CARGO_TARGET_DIR", target.to_str().unwrap()),
+        ],
     )
 }
 
@@ -1002,10 +1012,20 @@ fn apply_normalizes_package_prefix_in_cargo_checksum() {
 ///   - patches-api.socket.dev (socket-patch get, public proxy)
 ///
 /// The traitobject 0.0.1 patch adds a `compile_error!` to `src/lib.rs`
-/// guarded by the `allow-unmaintained` feature — so the consumer
-/// declares the dep with `features = ["allow-unmaintained"]` to keep
-/// the build green and let us assert "cargo check succeeded after the
-/// real patch was applied."
+/// gated on `#[cfg(not(feature = "allow-unmaintained"))]`, and adds
+/// that feature to the crate's Cargo.toml. The consumer MUST declare
+/// the dep bare: cargo resolves features from the crates.io INDEX,
+/// which knows nothing of the patch-added feature, so declaring
+/// `features = ["allow-unmaintained"]` fails resolution ("does not
+/// have that feature") before fetch even runs — against both the
+/// unpatched AND the patched crate. (This test originally shipped
+/// with the feature declared; the resulting resolution error was
+/// swallowed by the fetch skip path and the test silently skipped
+/// itself on every machine.) The end-to-end oracle is therefore the
+/// patch's own compile_error: cargo accepting the rewritten checksums
+/// and then failing compilation with the "unmaintained" message
+/// proves the sidecar fixup landed AND that rustc consumed the
+/// patched bytes.
 #[test]
 #[ignore]
 fn traitobject_real_socket_patch_round_trip() {
@@ -1018,9 +1038,9 @@ fn traitobject_real_socket_patch_round_trip() {
     let cargo_home = root.path().join(".cargo-home");
     std::fs::create_dir_all(consumer.join("src")).unwrap();
 
-    // Consumer crate that uses traitobject. The `allow-unmaintained`
-    // feature opts past the post-patch `compile_error!` guard so the
-    // build can actually link.
+    // Consumer crate that uses traitobject, declared bare (see the
+    // doc comment: the patch-added feature is index-invisible and can
+    // never be enabled on a registry dependency).
     std::fs::write(
         consumer.join("Cargo.toml"),
         r#"[package]
@@ -1029,7 +1049,7 @@ version = "0.0.1"
 edition = "2021"
 
 [dependencies]
-traitobject = { version = "0.0.1", features = ["allow-unmaintained"] }
+traitobject = "0.0.1"
 "#,
     )
     .unwrap();
@@ -1070,31 +1090,35 @@ traitobject = { version = "0.0.1", features = ["allow-unmaintained"] }
     }
     let traitobject_dir = traitobject_dir
         .expect("traitobject-0.0.1 should be unpacked under cargo registry/src after cargo fetch");
+    // Modern cargo no longer materializes `.cargo-checksum.json` under
+    // registry/src — it writes a bare `.cargo-ok` marker and verifies the
+    // .crate tarball at unpack time, leaving no per-file hashes for the
+    // sidecar to fix up (fixup correctly returns "nothing to do"). Older
+    // toolchains DO ship the file; snapshot conditionally so the rewrite
+    // assertions still fire wherever the file exists.
     let checksum_path = traitobject_dir.join(".cargo-checksum.json");
-    let pre_apply_checksum: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(&checksum_path)
-            .expect("traitobject-0.0.1 must ship .cargo-checksum.json"),
-    )
-    .unwrap();
+    let pre_apply_checksum: Option<serde_json::Value> = std::fs::read_to_string(&checksum_path)
+        .ok()
+        .map(|raw| serde_json::from_str(&raw).expect("pre-apply .cargo-checksum.json must parse"));
 
     // 3. Run `socket-patch get` against the public proxy. This
-    //    downloads + applies the real patch in one shot.
-    let socket_patch_run = Command::new(env!("CARGO_BIN_EXE_socket-patch"))
-        .args([
+    //    downloads + applies the real patch in one shot. Route through
+    //    the scrubbed runner so ambient SOCKET_* (DRY_RUN, MANIFEST_PATH,
+    //    GLOBAL, ...) can't no-op or redirect the apply; the scrub also
+    //    strips SOCKET_API_TOKEN, forcing the public proxy.
+    let (get_code, get_stdout, get_stderr) = run_with_env(
+        &consumer,
+        &[
             "get",
             "b15f2b7f-d5cb-43c9-b793-80f71682188f",
             "--cwd",
             consumer.to_str().unwrap(),
-        ])
-        .env("CARGO_HOME", cargo_home_str)
-        .env_remove("SOCKET_API_TOKEN") // force public proxy
-        .output()
-        .expect("socket-patch get");
-    if !socket_patch_run.status.success() {
+        ],
+        &[("CARGO_HOME", cargo_home_str)],
+    );
+    if get_code != 0 {
         eprintln!(
-            "SKIP: socket-patch get failed (likely network):\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&socket_patch_run.stdout),
-            String::from_utf8_lossy(&socket_patch_run.stderr),
+            "SKIP: socket-patch get failed (likely network):\nstdout:\n{get_stdout}\nstderr:\n{get_stderr}"
         );
         return;
     }
@@ -1111,41 +1135,73 @@ traitobject = { version = "0.0.1", features = ["allow-unmaintained"] }
         "manifest should contain the traitobject patch: {manifest}"
     );
 
-    // 5. The sidecar fixup must have rewritten .cargo-checksum.json.
-    //    The patch covers src/lib.rs (and Cargo.toml, Cargo.lock,
-    //    README.md), so those entries should have NEW SHA256 values
-    //    while every unpatched-file entry stays put.
-    let post_apply_checksum: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&checksum_path).unwrap()).unwrap();
-    let pre_files = pre_apply_checksum["files"].as_object().unwrap();
-    let post_files = post_apply_checksum["files"].as_object().unwrap();
-    let patched_paths = ["Cargo.toml", "Cargo.lock", "README.md", "src/lib.rs"];
-    for f in patched_paths {
-        if let (Some(pre), Some(post)) = (pre_files.get(f), post_files.get(f)) {
-            assert_ne!(
-                pre, post,
-                ".cargo-checksum.json entry for {f} should change after apply"
-            );
+    // 5. Where a `.cargo-checksum.json` existed, the sidecar fixup must
+    //    have rewritten it: the patch covers src/lib.rs (and Cargo.toml,
+    //    Cargo.lock, README.md), so those entries should have NEW SHA256
+    //    values while every unpatched-file entry stays put. Where cargo
+    //    never wrote one (modern toolchains), the sidecar must not
+    //    invent one.
+    match &pre_apply_checksum {
+        Some(pre) => {
+            let post_apply_checksum: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(&checksum_path)
+                    .expect("sidecar must not delete .cargo-checksum.json"),
+            )
+            .unwrap();
+            let pre_files = pre["files"].as_object().unwrap();
+            let post_files = post_apply_checksum["files"].as_object().unwrap();
+            let patched_paths = ["Cargo.toml", "Cargo.lock", "README.md", "src/lib.rs"];
+            for f in patched_paths {
+                if let (Some(pre), Some(post)) = (pre_files.get(f), post_files.get(f)) {
+                    assert_ne!(
+                        pre, post,
+                        ".cargo-checksum.json entry for {f} should change after apply"
+                    );
+                    assert_eq!(
+                        post.as_str().unwrap().len(),
+                        64,
+                        "post-apply hash for {f} should be 64-hex SHA256"
+                    );
+                }
+            }
+            // `package` field is preserved (the .crate tarball hash didn't
+            // become honestly recomputable without the original .crate).
             assert_eq!(
-                post.as_str().unwrap().len(),
-                64,
-                "post-apply hash for {f} should be 64-hex SHA256"
+                pre["package"], post_apply_checksum["package"],
+                ".cargo-checksum.json `package` field must survive the rewrite unchanged"
+            );
+        }
+        None => {
+            assert!(
+                !checksum_path.exists(),
+                "apply must not create a .cargo-checksum.json cargo never wrote"
             );
         }
     }
-    // `package` field is preserved (the .crate tarball hash didn't
-    // become honestly recomputable without the original .crate).
-    assert_eq!(
-        pre_apply_checksum["package"], post_apply_checksum["package"],
-        ".cargo-checksum.json `package` field must survive the rewrite unchanged"
-    );
 
-    // 6. The whole point: cargo accepts the patched sources.
+    // 6. The whole point: cargo gets PAST checksum verification and
+    //    compiles the PATCHED source. A green build is impossible here
+    //    by the patch's design (the compile_error can only be silenced
+    //    by a feature no registry consumer can enable), so the honest
+    //    oracle is two-sided:
+    //      * no "checksum ... has changed" rejection — the sidecar
+    //        rewrite was accepted by cargo's registry-source
+    //        verification, and
+    //      * the patch's own compile_error text in stderr — the bytes
+    //        rustc consumed are the patched bytes, not the originals
+    //        (unpatched traitobject compiles clean, so a silent
+    //        no-op apply would turn this check green and fail below).
     let check = cargo_check(&consumer, &cargo_home);
+    let check_stderr = String::from_utf8_lossy(&check.stderr);
     assert!(
-        check.status.success(),
-        "cargo check should succeed against patched traitobject.\nstdout:\n{}\nstderr:\n{}",
+        !(check_stderr.contains("checksum") && check_stderr.contains("changed")),
+        "cargo must accept the sidecar-rewritten checksums, not reject them:\n{check_stderr}"
+    );
+    assert!(
+        !check.status.success() && check_stderr.contains("unmaintained"),
+        "cargo check must fail with the patch's `unmaintained` compile_error \
+         (proving the patched source compiled); a success here means the \
+         patch never reached the compiled bytes.\nstdout:\n{}\nstderr:\n{check_stderr}",
         String::from_utf8_lossy(&check.stdout),
-        String::from_utf8_lossy(&check.stderr),
     );
 }

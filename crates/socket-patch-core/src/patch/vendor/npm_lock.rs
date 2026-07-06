@@ -21,7 +21,7 @@ use serde_json::Value;
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::PatchSources;
 use crate::patch::copy_tree::remove_tree;
-use crate::utils::fs::atomic_write_bytes;
+use crate::utils::fs::atomic_write_bytes_preserving_mode;
 
 use super::common::{already_patched_result, detect_indent, done, refused, serialize_json};
 use super::npm_common::{done_failure, guard_coordinates, guard_revert_uuid_dir, stage_patch_pack};
@@ -297,7 +297,8 @@ pub async fn vendor_npm(
         Ok(out) => out,
         Err(e) => return done_failure(purl, format!("cannot serialize {lock_name}: {e}")),
     };
-    if let Err(e) = atomic_write_bytes(&project_root.join(&lock_name), &out).await {
+    if let Err(e) = atomic_write_bytes_preserving_mode(&project_root.join(&lock_name), &out).await
+    {
         return done_failure(purl, format!("cannot write {lock_name}: {e}"));
     }
 
@@ -419,7 +420,7 @@ pub async fn revert_npm(entry: &VendorEntry, project_root: &Path, dry_run: bool)
                     return RevertOutcome::failed(format!("cannot serialize {lock_name}: {e}"))
                 }
             };
-            if let Err(e) = atomic_write_bytes(&lock_path, &out).await {
+            if let Err(e) = atomic_write_bytes_preserving_mode(&lock_path, &out).await {
                 return RevertOutcome::failed(format!("cannot write {lock_name}: {e}"));
             }
         }
@@ -1369,6 +1370,28 @@ mod tests {
         );
     }
 
+    /// npm and Node tolerate a leading UTF-8 BOM in package.json
+    /// (Windows-authored packages ship them, and the crawler strips it — so
+    /// a BOM'd install IS discovered and vendored), but serde_json rejects
+    /// one, and the bundled-deps guard fails OPEN on a parse error: a BOM
+    /// must not skip the refusal and pack a tarball whose bundled
+    /// node_modules was pruned.
+    #[tokio::test]
+    async fn bundled_deps_refusal_survives_package_json_bom() {
+        let fx = fixture().await;
+        let mut pkg_json = b"\xEF\xBB\xBF".to_vec();
+        pkg_json
+            .extend_from_slice(br#"{"name":"left-pad","version":"1.3.0","bundleDependencies":["dep"]}"#);
+        tokio::fs::write(fx.installed().join("package.json"), pkg_json)
+            .await
+            .unwrap();
+        expect_refused(fx.vendor(false).await, "vendor_bundled_deps_unsupported");
+        assert!(
+            !fx.root().join(".socket/vendor").exists(),
+            "refusal writes nothing"
+        );
+    }
+
     #[tokio::test]
     async fn lockfile_v1_is_refused() {
         let lock = json!({
@@ -1638,6 +1661,40 @@ mod tests {
                 .exists(),
             "uuid dir pruned"
         );
+    }
+
+    /// The lockfile is a user-owned file we merely edit: both the vendor
+    /// rewrite and the revert restore must keep its permission bits (a 0600
+    /// private lock must not silently become umask-default 0644).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn lock_writes_preserve_file_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let fx = fixture().await;
+        tokio::fs::set_permissions(fx.lock_path(), std::fs::Permissions::from_mode(0o600))
+            .await
+            .unwrap();
+
+        let (result, entry, _) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        let entry = entry.unwrap();
+        let mode = tokio::fs::metadata(fx.lock_path())
+            .await
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(mode, 0o600, "vendor must preserve the lockfile's mode");
+
+        let outcome = revert_npm(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        let mode = tokio::fs::metadata(fx.lock_path())
+            .await
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(mode, 0o600, "revert must preserve the lockfile's mode");
     }
 
     #[tokio::test]

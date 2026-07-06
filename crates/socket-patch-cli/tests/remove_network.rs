@@ -28,40 +28,6 @@ fn binary() -> PathBuf {
     env!("CARGO_BIN_EXE_socket-patch").into()
 }
 
-/// Every `SOCKET_*` env var the `remove` binary consults (clap-flattened
-/// `GlobalArgs` plus runtime toggles). The spawned child inherits the parent
-/// process environment, so any of these leaking in from the developer's shell
-/// or CI could satisfy the behaviour under test *instead of* the argv —
-/// masking a regression. Most dangerous here: an ambient `SOCKET_OFFLINE`
-/// would make the `--offline` test (2) pass even if the `--offline` *flag*
-/// handling regressed, and `SOCKET_MANIFEST_PATH`/`SOCKET_CWD` could point the
-/// binary at a different manifest than the one `manifest_has_entry` reads back.
-/// `run_remove` scrubs all of these from the child, then sets only the four it
-/// controls, so each assertion exercises the flag/argv path and nothing else.
-const SOCKET_ENV_VARS: &[&str] = &[
-    "SOCKET_CWD",
-    "SOCKET_MANIFEST_PATH",
-    "SOCKET_API_URL",
-    "SOCKET_API_TOKEN",
-    "SOCKET_ORG_SLUG",
-    "SOCKET_PROXY_URL",
-    "SOCKET_ECOSYSTEMS",
-    "SOCKET_DOWNLOAD_MODE",
-    "SOCKET_OFFLINE",
-    "SOCKET_GLOBAL",
-    "SOCKET_GLOBAL_PREFIX",
-    "SOCKET_JSON",
-    "SOCKET_VERBOSE",
-    "SOCKET_SILENT",
-    "SOCKET_DRY_RUN",
-    "SOCKET_YES",
-    "SOCKET_FORCE",
-    "SOCKET_LOCK_TIMEOUT",
-    "SOCKET_BREAK_LOCK",
-    "SOCKET_DEBUG",
-    "SOCKET_TELEMETRY_DISABLED",
-];
-
 const ORG_SLUG: &str = "test-org";
 const PURL: &str = "pkg:npm/remove-network-test@1.0.0";
 const UUID: &str = "11111111-1111-4111-8111-111111111111";
@@ -127,14 +93,24 @@ fn run_remove(cwd: &Path, api_url: &str, extra: &[&str]) -> (i32, String) {
     argv.extend_from_slice(extra);
     let mut cmd = Command::new(binary());
     cmd.args(&argv).current_dir(cwd);
-    // Hermeticity: drop every SOCKET_* var the child might inherit from the
-    // ambient environment before re-setting only the four this test controls.
-    // Without this, an ambient `SOCKET_OFFLINE` could make the `--offline`
-    // test pass for the wrong reason (env, not flag), and a stray
-    // `SOCKET_MANIFEST_PATH`/`SOCKET_CWD` could aim the binary at the wrong
-    // manifest. The set must be re-set *after* scrubbing.
-    for var in SOCKET_ENV_VARS {
-        cmd.env_remove(var);
+    // Hermeticity: drop every ambient SOCKET_* var by prefix before
+    // re-setting only the four this test controls. The spawned child
+    // inherits the parent environment, and the binary binds a wide
+    // `SOCKET_*` env surface (clap-flattened `GlobalArgs`, per-command
+    // flags, runtime toggles) — an ambient value satisfies (or defeats)
+    // the behaviour under test *instead of* the argv. An ambient
+    // `SOCKET_OFFLINE` would make the `--offline` test pass even if the
+    // *flag* handling regressed; `SOCKET_MANIFEST_PATH`/`SOCKET_CWD`
+    // could aim the binary at the wrong manifest. Scrub by prefix, not
+    // an enumerated list: a list drifts from the binary's env surface —
+    // it missed `SOCKET_SKIP_ROLLBACK` (remove's own env-bound flag),
+    // under which `remove --offline` skipped rollback entirely, exited
+    // 0, and deleted the entry, failing both tests for the wrong
+    // reason. The controlled set must be seeded *after* scrubbing.
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("SOCKET_") {
+            cmd.env_remove(&key);
+        }
     }
     let out = cmd
         .env("SOCKET_API_URL", api_url)

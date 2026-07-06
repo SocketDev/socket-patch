@@ -176,8 +176,10 @@ VPOM="$LEAF/commons-text-1.10.0.pom"
 # fabricated minimal stand-in.
 grep -q 'commons-lang3' "$VPOM" || { cat "$VPOM" >&2; fail "vendored pom dropped the commons-lang3 transitive"; }
 # The patched marker really is inside the rebuilt jar.
-rm -rf /tmp/vjx && mkdir -p /tmp/vjx && ( cd /tmp/vjx && jar xf "$OLDPWD/$VJAR" META-INF/NOTICE.txt 2>/dev/null || jar xf "$PWD/$VJAR" )
+rm -rf /tmp/vjx && mkdir -p /tmp/vjx && ( cd /tmp/vjx && jar xf "$OLDPWD/$VJAR" META-INF/NOTICE.txt 2>/dev/null || jar xf "$OLDPWD/$VJAR" )
 grep -q 'SOCKET-PATCH-VENDOR-E2E-MARKER' /tmp/vjx/META-INF/NOTICE.txt || fail "rebuilt jar's NOTICE.txt is not patched"
+[ "$(sha256sum /tmp/vjx/META-INF/NOTICE.txt | cut -d' ' -f1)" = "$(cat /workspace/snap/patched.sha)" ] \
+  || fail "rebuilt jar's NOTICE.txt is not byte-identical to the staged patched bytes"
 # The sidecar matches the jar bytes (what checksumPolicy=fail validates).
 [ "$(sha1sum "$VJAR" | cut -d' ' -f1)" = "$(cat "$VJAR.sha1" | tr -d '[:space:]')" ] || fail "jar .sha1 sidecar does not match the jar bytes"
 echo "===ARTIFACT VERIFIED==="
@@ -259,6 +261,8 @@ cmp -s target/dep/commons-text-1.10.0.jar "$VJAR" \
 # And it really carries the patched marker.
 rm -rf /tmp/cjx && mkdir -p /tmp/cjx && ( cd /tmp/cjx && jar xf "/workspace/fresh/target/dep/commons-text-1.10.0.jar" META-INF/NOTICE.txt 2>/dev/null || jar xf "/workspace/fresh/target/dep/commons-text-1.10.0.jar" )
 grep -q 'SOCKET-PATCH-VENDOR-E2E-MARKER' /tmp/cjx/META-INF/NOTICE.txt || fail "consumed commons-text jar is not patched"
+[ "$(sha256sum /tmp/cjx/META-INF/NOTICE.txt | cut -d' ' -f1)" = "$(cat /workspace/snap/patched.sha)" ] \
+  || fail "consumed NOTICE.txt is not byte-identical to the staged patched bytes"
 echo "===FRESH INSTALL VERIFIED==="
 
 # TAMPER PROBE: mutate the vendored jar (leaving its .sha1 stale), purge the

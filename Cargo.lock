@@ -2424,6 +2424,7 @@ dependencies = [
  "fs2",
  "hex",
  "indicatif",
+ "libc",
  "portable-pty",
  "regex",
  "reqwest",

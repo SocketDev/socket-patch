@@ -235,11 +235,14 @@ pub(crate) fn mismatch_overwrite_warnings(
 }
 
 /// Patch-target files (non-empty `beforeHash`) absent from the staged
-/// copy. Vendor staging force-applies (see [`force_apply_staged`]), and
-/// force silently SKIPS missing files — which would pack an artifact
-/// without the fix. This pre-check restores the strict apply's
-/// fail-closed behavior for the non-`--force` path. Unsafe keys are
-/// skipped here: the apply pipeline itself rejects them fail-closed.
+/// copy — or present but not hashable (a directory, a non-regular file,
+/// an unreadable file). Vendor staging force-applies (see
+/// [`force_apply_staged`]), and force silently SKIPS every file verify
+/// reports as `NotFound` — both truly-missing files AND hash failures —
+/// which would pack an artifact without the fix. This pre-check restores
+/// the strict apply's fail-closed behavior for the non-`--force` path.
+/// Unsafe keys are skipped here: the apply pipeline itself rejects them
+/// fail-closed.
 pub(crate) async fn missing_existing_patch_files(
     staged_dir: &Path,
     files: &HashMap<String, PatchFileInfo>,
@@ -253,10 +256,15 @@ pub(crate) async fn missing_existing_patch_files(
         if !is_safe_relative_subpath(normalized) {
             continue;
         }
-        if tokio::fs::metadata(staged_dir.join(normalized))
-            .await
-            .is_err()
-        {
+        let path = staged_dir.join(normalized);
+        let hashable = match tokio::fs::metadata(&path).await {
+            Err(_) => false,
+            // The is_file gate must come BEFORE the open probe: opening a
+            // non-regular file (FIFO) can block indefinitely.
+            Ok(m) if !m.is_file() => false,
+            Ok(_) => tokio::fs::File::open(&path).await.is_ok(),
+        };
+        if !hashable {
             missing.push(file_name.clone());
         }
     }
@@ -342,12 +350,19 @@ pub async fn harvest_artifact_blobs(
             || lower.ends_with(".nupkg")
             || lower.ends_with(".jar")
         {
+            // Gate on metadata BEFORE reading: opening a non-regular file
+            // planted at the artifact path (a FIFO) blocks until a writer
+            // appears — wedging the run — and the size cap must bound the
+            // read, not audit it after the bytes are already in memory.
+            if !tokio::fs::metadata(&artifact)
+                .await
+                .is_ok_and(|m| m.is_file() && m.len() <= MAX_ARTIFACT_BYTES)
+            {
+                continue;
+            }
             let Ok(bytes) = tokio::fs::read(&artifact).await else {
                 continue;
             };
-            if bytes.len() as u64 > MAX_ARTIFACT_BYTES {
-                continue;
-            }
             let Ok(mut archive) = zip::ZipArchive::new(std::io::Cursor::new(bytes)) else {
                 continue;
             };
@@ -385,10 +400,16 @@ pub async fn harvest_artifact_blobs(
                 if !is_safe_relative_subpath(rel) {
                     continue;
                 }
-                if let Ok(content) = tokio::fs::read(artifact.join(rel)).await {
-                    if content.len() as u64 > MAX_FILE_BYTES {
-                        continue;
-                    }
+                let path = artifact.join(rel);
+                // Same gate as the zip-shaped artifacts above: never open a
+                // non-regular file (FIFO wedge), bound the read up front.
+                if !tokio::fs::metadata(&path)
+                    .await
+                    .is_ok_and(|m| m.is_file() && m.len() <= MAX_FILE_BYTES)
+                {
+                    continue;
+                }
+                if let Ok(content) = tokio::fs::read(&path).await {
                     let h = compute_git_sha256_from_bytes(&content);
                     if h == info.after_hash {
                         out.insert(h, content);
@@ -647,6 +668,114 @@ mod vendor_source_tests {
 }
 
 #[cfg(test)]
+mod staging_tests {
+    use super::*;
+    use crate::manifest::schema::{PatchFileInfo, PatchRecord};
+
+    fn one_file_record(file: &str) -> PatchRecord {
+        let mut files = HashMap::new();
+        files.insert(
+            file.to_string(),
+            PatchFileInfo {
+                before_hash: "aa".repeat(32),
+                after_hash: "bb".repeat(32),
+            },
+        );
+        PatchRecord {
+            uuid: "11111111-2222-4333-8444-555555555555".to_string(),
+            exported_at: "2024-01-01T00:00:00Z".to_string(),
+            files,
+            vulnerabilities: HashMap::new(),
+            description: String::new(),
+            license: "MIT".to_string(),
+            tier: "free".to_string(),
+        }
+    }
+
+    /// A patch target that EXISTS but cannot be hashed (here: a directory
+    /// where a file is expected) must fail the pre-check. The forced apply
+    /// downgrades verify's hash failure to a silent NotFound skip, which
+    /// would pack an artifact WITHOUT the fix while reporting success.
+    #[tokio::test]
+    async fn directory_at_patch_target_is_flagged_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("index.js")).unwrap();
+        let record = one_file_record("index.js");
+        let missing = missing_existing_patch_files(tmp.path(), &record.files).await;
+        assert_eq!(missing, vec!["index.js".to_string()]);
+    }
+
+    /// Same class via file permissions: an unreadable staged file hash-fails
+    /// in verify and would be force-skipped silently.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unreadable_patch_target_is_flagged_missing() {
+        use std::os::unix::fs::PermissionsExt as _;
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root reads anything; the probe can't fail
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("index.js");
+        std::fs::write(&target, b"original").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let record = one_file_record("index.js");
+        let missing = missing_existing_patch_files(tmp.path(), &record.files).await;
+        assert_eq!(missing, vec!["index.js".to_string()]);
+    }
+
+    /// A readable staged file (even with mismatched content) is NOT flagged —
+    /// that's the force-overwrite path, not the missing path.
+    #[tokio::test]
+    async fn readable_target_is_not_flagged() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("index.js"), b"whatever").unwrap();
+        let record = one_file_record("index.js");
+        assert!(
+            missing_existing_patch_files(tmp.path(), &record.files)
+                .await
+                .is_empty()
+        );
+    }
+
+    /// End-to-end through the vendor staging entrypoint: without `--force`,
+    /// an unhashable target must fail the whole staged apply closed rather
+    /// than succeed with the file silently skipped.
+    #[tokio::test]
+    async fn force_apply_staged_fails_closed_on_unhashable_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let staged = tmp.path().join("stage");
+        std::fs::create_dir_all(staged.join("index.js")).unwrap();
+        let blobs = tmp.path().join("blobs");
+        std::fs::create_dir_all(&blobs).unwrap();
+        let record = one_file_record("index.js");
+        let sources = PatchSources::blobs_only(&blobs);
+
+        let mut warnings = Vec::new();
+        let result = force_apply_staged(
+            "pkg:npm/x@1.0.0",
+            &staged,
+            &record,
+            &sources,
+            false,
+            false,
+            "x",
+            "1.0.0",
+            &mut warnings,
+        )
+        .await;
+        assert!(
+            !result.success,
+            "an unhashable patch target must fail the staged apply closed, got {result:?}"
+        );
+        assert!(
+            result.error.as_deref().unwrap_or("").contains("index.js"),
+            "error names the file: {:?}",
+            result.error
+        );
+    }
+}
+
+#[cfg(test)]
 mod harvest_tests {
     use super::*;
     use crate::hash::git_sha256::compute_git_sha256_from_bytes;
@@ -771,6 +900,80 @@ mod harvest_tests {
         let (k, r) = record(purl, UUID, "package/index.js", PATCHED);
         let patches = HashMap::from([(k, r)]);
         assert!(harvest_artifact_blobs(&project, &patches).await.is_empty());
+    }
+
+    /// Release a reader wedged in `open(2)` on `fifo` (pre-fix behavior) so
+    /// the tokio blocking pool can shut down; the write side closing
+    /// immediately EOFs the read.
+    #[cfg(unix)]
+    fn unblock_fifo_reader(fifo: &Path) {
+        let fifo = fifo.to_path_buf();
+        std::thread::spawn(move || {
+            let _ = std::fs::OpenOptions::new().write(true).open(fifo);
+        });
+    }
+
+    #[cfg(unix)]
+    fn mkfifo(path: &Path) {
+        use std::os::unix::ffi::OsStrExt as _;
+        let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+    }
+
+    /// A FIFO planted at a zip-shaped artifact path must be skipped, not
+    /// read: `open(2)` on a FIFO blocks until a writer appears, wedging the
+    /// whole harvest (and with it the vendor run) forever.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fifo_zip_artifact_never_wedges_harvest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let purl = "pkg:pypi/lib@1.0.0";
+        let rel = format!(".socket/vendor/pypi/{UUID}/lib-1.0.0-py3-none-any.whl");
+        let fifo = tmp.path().join(&rel);
+        std::fs::create_dir_all(fifo.parent().unwrap()).unwrap();
+        mkfifo(&fifo);
+        write_ledger(tmp.path(), purl, UUID, &rel);
+
+        let (k, r) = record(purl, UUID, "lib/__init__.py", PATCHED);
+        let patches = HashMap::from([(k, r)]);
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            harvest_artifact_blobs(tmp.path(), &patches),
+        )
+        .await;
+        if res.is_err() {
+            unblock_fifo_reader(&fifo);
+        }
+        let map = res.expect("harvest must not hang on a FIFO artifact");
+        assert!(map.is_empty(), "a FIFO artifact contributes nothing");
+    }
+
+    /// Same wedge through the dir-shaped branch: a FIFO at a record-relative
+    /// file inside a directory artifact must be skipped, not read.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fifo_inside_dir_artifact_never_wedges_harvest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let purl = "pkg:cargo/serde@1.0.0";
+        let rel = format!(".socket/vendor/cargo/{UUID}/serde-1.0.0");
+        let file_dir = tmp.path().join(&rel).join("src");
+        std::fs::create_dir_all(&file_dir).unwrap();
+        let fifo = file_dir.join("lib.rs");
+        mkfifo(&fifo);
+        write_ledger(tmp.path(), purl, UUID, &rel);
+
+        let (k, r) = record(purl, UUID, "src/lib.rs", PATCHED);
+        let patches = HashMap::from([(k, r)]);
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            harvest_artifact_blobs(tmp.path(), &patches),
+        )
+        .await;
+        if res.is_err() {
+            unblock_fifo_reader(&fifo);
+        }
+        let map = res.expect("harvest must not hang on a FIFO inside a dir artifact");
+        assert!(map.is_empty(), "a FIFO file contributes nothing");
     }
 
     #[tokio::test]

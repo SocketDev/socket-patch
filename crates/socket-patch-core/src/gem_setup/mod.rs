@@ -11,9 +11,12 @@
 //!     on every `bundle install` (load-time digest gate + `after-install-all`
 //!     hook), failing the build loudly on a patch failure;
 //!   * a managed block appended to the `Gemfile` that references the plugin via
-//!     `plugin "socket-patch", git: File.expand_path(".socket/bundler-plugin",
-//!     __dir__)`. Bundler only loads *committed* git plugins, so the generated
-//!     directory must be committed.
+//!     `plugin "socket-patch", path: File.expand_path(".socket/bundler-plugin",
+//!     __dir__)`. The source must be `path:` — Bundler fetches `git:` plugin
+//!     sources with `git clone`, and the generated dir is a plain directory
+//!     (committing it to the parent repo does not give it a `.git`), so `git:`
+//!     fails every `bundle install`. The directory still must be committed so
+//!     clones and CI have the plugin on disk.
 //!
 //! The actual gem patching is done by `apply` (unchanged); this module only
 //! manages the setup wiring. Phase 2 (follow-up) replaces the in-tree plugin
@@ -70,7 +73,34 @@ pub async fn discover_bundler_project(cwd: &Path) -> Option<BundlerProject> {
                 });
             }
         }
-        dir = dir.parent()?.to_path_buf();
+        dir = if matches!(
+            dir.components().next_back(),
+            Some(std::path::Component::ParentDir)
+        ) {
+            // `Path::parent` is lexical: it strips a trailing `..`, stepping
+            // the walk back DOWN into the directory the `..` just escaped
+            // (parent of `a/b/..` is `a/b`) and probing descendants outside
+            // the real ancestry. Resolve the position against the filesystem —
+            // the same way the kernel resolved this iteration's metadata
+            // probes — and continue from its real parent.
+            fs::canonicalize(&dir).await.ok()?.parent()?.to_path_buf()
+        } else {
+            match dir.parent() {
+                Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+                // A relative `cwd` (e.g. the CLI's default `--cwd .`) exhausts its
+                // lexical components here (`Path::parent` of `.` is `Some("")`,
+                // then `None`) without ever reaching the real parent directories.
+                // Re-root the walk on the process cwd so the true ancestry is
+                // still probed — `bundle` resolves the Gemfile from the invocation
+                // dir's real ancestors, wherever it is run from.
+                _ if dir.is_relative() => std::env::current_dir()
+                    .ok()?
+                    .join(&dir)
+                    .parent()?
+                    .to_path_buf(),
+                _ => return None,
+            }
+        };
     }
 }
 
@@ -292,6 +322,37 @@ mod tests {
         assert_eq!(fs::read_to_string(&proj.gemfile).await.unwrap(), "inner\n");
     }
 
+    #[tokio::test]
+    async fn test_discover_dot_dot_cwd_walks_real_ancestry_not_back_down() {
+        // `--cwd`/SOCKET_CWD may carry `..` components (`--cwd ..`, `$PWD/..`).
+        // The metadata probes resolve them against the real filesystem, but
+        // `Path::parent` strips components lexically — the parent of
+        // `up/mid/b/..` is `up/mid/b`, the very directory the `..` just
+        // escaped. The walk must continue UP the real ancestry
+        // (`up/mid` → `up`), never back down into a descendant that `bundle`
+        // itself would not consult.
+        let dir = tempfile::tempdir().unwrap();
+        // Canonicalize so the expected root compares path-exactly (macOS
+        // tempdirs live behind the /var → /private/var symlink).
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let up = base.join("up");
+        let b = up.join("mid").join("b");
+        fs::create_dir_all(&b).await.unwrap();
+        write(&up.join("Gemfile"), "real ancestor\n").await;
+        write(&b.join("Gemfile"), "descendant, not in the ancestry\n").await;
+
+        let proj = discover_bundler_project(&b.join("..")).await.unwrap();
+        assert_eq!(
+            proj.root, up,
+            "walk from up/mid (= up/mid/b/..) must reach the ancestor `up`, \
+             not fall back down into up/mid/b"
+        );
+        assert_eq!(
+            fs::read_to_string(&proj.gemfile).await.unwrap(),
+            "real ancestor\n"
+        );
+    }
+
     #[test]
     fn test_templates_are_well_formed() {
         // The plugin must carry the ownership marker and both triggers.
@@ -313,6 +374,10 @@ mod tests {
         assert!(GEMSPEC.starts_with(GENERATED_MARKER));
         assert!(GEMSPEC.contains("\"socket-patch\""));
         assert!(GEMSPEC.contains("plugins.rb"));
+        // The flat plugin dir has no lib/; without this override Bundler
+        // refuses to load the plugin ("plugin paths don't exist: .../lib")
+        // and silently continues without it.
+        assert!(GEMSPEC.contains("s.require_paths = [\".\"]"));
     }
 
     #[tokio::test]

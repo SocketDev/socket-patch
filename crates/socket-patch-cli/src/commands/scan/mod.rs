@@ -325,9 +325,9 @@ async fn embed_vex_human(
             0
         }
         Err(e) => {
-            if !common.silent {
-                eprintln!("Error: VEX generation failed: {}", e.message);
-            }
+            // Errors print even under --silent ("errors only", never
+            // "nothing"): exit 1 with no message would be undiagnosable.
+            eprintln!("Error: VEX generation failed: {}", e.message);
             1
         }
     }
@@ -409,6 +409,38 @@ pub async fn run(mut args: ScanArgs) -> i32 {
     if let Err(message) = resolve_mode_flags(&mut args) {
         eprintln!("error: {message}");
         return 2;
+    }
+
+    // Strict airgap (CLI_CONTRACT.md `--offline`: never contact the
+    // network; operations that need remote data fail loudly). Scan's
+    // patch discovery IS remote data — proceeding would POST the crawled
+    // package inventory to the batch endpoint — so refuse up front,
+    // before the crawl and before the API client is built (org
+    // auto-resolve is itself a network call). No telemetry fires here:
+    // offline gates `is_telemetry_disabled` too.
+    if args.common.offline {
+        let err = "scan requires network access to query the patch API and cannot run with \
+                   --offline/SOCKET_OFFLINE (strict airgap)";
+        if args.common.json {
+            // Mirror the all-batches-failed error envelope shape so JSON
+            // consumers see one consistent scan-error schema.
+            let result = serde_json::json!({
+                "status": "error",
+                "error": err,
+                "scannedPackages": 0,
+                "packagesWithPatches": 0,
+                "totalPatches": 0,
+                "freePatches": 0,
+                "paidPatches": 0,
+                "canAccessPaidPatches": false,
+                "packages": [],
+                "updates": [],
+            });
+            println!("{}", serde_json::to_string_pretty(&result).unwrap());
+        } else {
+            eprintln!("Error: {err}");
+        }
+        return 1;
     }
 
     // `--sync` is sugar for `--mode agent --prune`. Derive locals once and

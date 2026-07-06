@@ -4,15 +4,17 @@
 //! match) and a few error paths the main get_invariants suite doesn't
 //! reach.
 
-use std::path::PathBuf;
-use std::process::Command;
-
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-fn binary() -> PathBuf {
-    env!("CARGO_BIN_EXE_socket-patch").into()
-}
+// Every invocation must go through `common::run`/`run_with_env`: the binary
+// binds a wide `SOCKET_*` env surface, and a raw `Command::new(binary())`
+// inherits the developer's shell — an exported `SOCKET_ONE_OFF=true` aborts
+// every `get` here, `SOCKET_PROXY_URL` outranks the proxy these tests pin,
+// and `SOCKET_MANIFEST_PATH` makes a *passing* test write its manifest and
+// blobs into whatever real project the variable points at.
+#[path = "common/mod.rs"]
+mod common;
 
 const ORG_SLUG: &str = "test-org";
 const UUID_A: &str = "11111111-1111-4111-8111-111111111111";
@@ -34,8 +36,9 @@ async fn received_paths(mock: &MockServer) -> Vec<String> {
 fn get_one_off_and_save_only_together_errors() {
     // The two flags are mutually exclusive — using both must fail.
     let tmp = tempfile::tempdir().unwrap();
-    let out = Command::new(binary())
-        .args([
+    let (code, stdout, _stderr) = common::run(
+        tmp.path(),
+        &[
             "get",
             UUID_A,
             "--one-off",
@@ -48,12 +51,9 @@ fn get_one_off_and_save_only_together_errors() {
             "fake",
             "--org",
             ORG_SLUG,
-        ])
-        .current_dir(tmp.path())
-        .output()
-        .expect("run");
-    assert_eq!(out.status.code(), Some(1));
-    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        ],
+    );
+    assert_eq!(code, 1);
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     assert_eq!(v["status"], "error");
     let err = v["error"].as_str().expect("error message");
@@ -118,8 +118,9 @@ async fn get_with_id_flag_selects_specific_patch() {
     let tmp = tempfile::tempdir().unwrap();
     let _ = purl;
     let _ = encoded;
-    let out = Command::new(binary())
-        .args([
+    let (code, stdout, _stderr) = common::run(
+        tmp.path(),
+        &[
             "get",
             UUID_B,
             "--id",
@@ -132,12 +133,8 @@ async fn get_with_id_flag_selects_specific_patch() {
             "fake",
             "--org",
             ORG_SLUG,
-        ])
-        .current_dir(tmp.path())
-        .output()
-        .expect("run");
-    let code = out.status.code().unwrap_or(-1);
-    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        ],
+    );
     assert_eq!(
         code, 0,
         "--id fetch-by-UUID of a free patch must succeed; stdout={stdout}"
@@ -209,8 +206,9 @@ async fn get_with_no_matching_purl_emits_not_found() {
         .await;
 
     let tmp = tempfile::tempdir().unwrap();
-    let out = Command::new(binary())
-        .args([
+    let (code, stdout, _stderr) = common::run(
+        tmp.path(),
+        &[
             "get",
             purl,
             "--save-only",
@@ -222,16 +220,12 @@ async fn get_with_no_matching_purl_emits_not_found() {
             "fake",
             "--org",
             ORG_SLUG,
-        ])
-        .current_dir(tmp.path())
-        .output()
-        .expect("run");
+        ],
+    );
     assert_eq!(
-        out.status.code(),
-        Some(0),
+        code, 0,
         "an empty (but successful) lookup is exit 0, not an error"
     );
-    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     assert_eq!(v["status"], "not_found", "stdout={stdout}");
     assert_eq!(v["found"], 0, "stdout={stdout}");
@@ -274,27 +268,29 @@ async fn get_by_package_with_single_paid_patch_emits_paid_required() {
         .await;
 
     let tmp = tempfile::tempdir().unwrap();
-    let out = Command::new(binary())
-        .args([
+    let uri = mock.uri();
+    // Seed the proxy under its MODERN name: `SOCKET_PROXY_URL` outranks the
+    // legacy `SOCKET_PATCH_PROXY_URL` in `proxy_url_from_env`, so pinning the
+    // legacy name alone loses to an ambient modern one. The scrub in
+    // `run_with_env` also strips any ambient `SOCKET_API_TOKEN`, forcing the
+    // public-proxy (free-tier) client this test is about.
+    let (code, stdout, _stderr) = common::run_with_env(
+        tmp.path(),
+        &[
             "get",
             purl,
             "--save-only",
             "--yes",
             "--json",
             "--api-url",
-            &mock.uri(),
-        ])
-        .current_dir(tmp.path())
-        .env("SOCKET_PATCH_PROXY_URL", mock.uri())
-        .env_remove("SOCKET_API_TOKEN")
-        .output()
-        .expect("run");
+            &uri,
+        ],
+        &[("SOCKET_PROXY_URL", uri.as_str())],
+    );
     assert_eq!(
-        out.status.code(),
-        Some(0),
+        code, 0,
         "a recognized-but-paywalled patch is not an error exit"
     );
-    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     // The mock returned exactly one paid patch and canAccessPaidPatches=false,
     // so the deterministic outcome is paid_required — not a vague "anything
@@ -347,8 +343,9 @@ async fn get_with_invalid_search_purl_falls_through() {
         .await;
 
     let tmp = tempfile::tempdir().unwrap();
-    let out = Command::new(binary())
-        .args([
+    let (code, stdout, _stderr) = common::run(
+        tmp.path(),
+        &[
             "get",
             "just-a-package-name",
             "--save-only",
@@ -360,16 +357,12 @@ async fn get_with_invalid_search_purl_falls_through() {
             "fake",
             "--org",
             ORG_SLUG,
-        ])
-        .current_dir(tmp.path())
-        .output()
-        .expect("run");
+        ],
+    );
     assert_eq!(
-        out.status.code(),
-        Some(0),
+        code, 0,
         "package-name fallback over an empty workspace is a clean exit 0"
     );
-    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     // Deterministic outcome: the un-typed identifier fell through to the
     // package search, which found nothing installed.
@@ -422,8 +415,9 @@ async fn get_uuid_returns_paid_patch_with_token_succeeds() {
         .await;
 
     let tmp = tempfile::tempdir().unwrap();
-    let out = Command::new(binary())
-        .args([
+    let (code, stdout, _stderr) = common::run(
+        tmp.path(),
+        &[
             "get",
             UUID_A,
             "--save-only",
@@ -435,12 +429,8 @@ async fn get_uuid_returns_paid_patch_with_token_succeeds() {
             "real-token-but-not-validated-by-mock",
             "--org",
             ORG_SLUG,
-        ])
-        .current_dir(tmp.path())
-        .output()
-        .expect("run");
-    let code = out.status.code().unwrap_or(-1);
-    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        ],
+    );
     assert_eq!(
         code, 0,
         "paid patch via authenticated path must succeed; stdout={stdout}"
@@ -472,12 +462,9 @@ async fn get_uuid_returns_paid_patch_with_token_succeeds() {
 
 #[test]
 fn get_help_lists_all_identifier_flags() {
-    let out = Command::new(binary())
-        .args(["get", "--help"])
-        .output()
-        .expect("run");
-    assert_eq!(out.status.code(), Some(0));
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    let tmp = tempfile::tempdir().unwrap();
+    let (code, stdout, _stderr) = common::run(tmp.path(), &["get", "--help"]);
+    assert_eq!(code, 0);
     for flag in [
         "--id",
         "--cve",
@@ -540,8 +527,9 @@ async fn get_on_vendored_purl_warns_about_uuid_drift() {
     )
     .unwrap();
 
-    let out = Command::new(binary())
-        .args([
+    let (code, stdout, _stderr) = common::run(
+        tmp.path(),
+        &[
             "get",
             UUID_B,
             "--id",
@@ -554,12 +542,8 @@ async fn get_on_vendored_purl_warns_about_uuid_drift() {
             "fake",
             "--org",
             ORG_SLUG,
-        ])
-        .current_dir(tmp.path())
-        .output()
-        .expect("run");
-    let code = out.status.code().unwrap_or(-1);
-    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        ],
+    );
     assert_eq!(code, 0, "explicit get still succeeds; stdout={stdout}");
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     assert_eq!(v["status"], "success", "stdout={stdout}");
@@ -577,5 +561,103 @@ async fn get_on_vendored_purl_warns_about_uuid_drift() {
     assert!(
         w.contains("socket-patch vendor"),
         "warning must point at the remedy; got: {w}"
+    );
+}
+
+#[tokio::test]
+async fn get_uuid_replacing_existing_manifest_entry_reports_updated() {
+    // CLI_CONTRACT.md's `PatchAction` vocabulary: `updated` — emitted by
+    // `apply`, `scan --sync`, `get` — means "a different UUID replaced an
+    // older one for this PURL. `oldUuid` set." The fetch-by-UUID save path
+    // (`save_and_apply_patch`) must classify against the pre-insert manifest
+    // exactly like `download_and_apply_patches` does; reporting the
+    // replacement as `added` (without `oldUuid`) hides the overwrite from
+    // consumers that diff on `action == "updated"` — including the jq
+    // recipe the contract itself documents.
+    let mock = MockServer::start().await;
+    let purl = "pkg:npm/replace-me@1.0.0";
+
+    Mock::given(method("GET"))
+        .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/view/{UUID_B}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "uuid": UUID_B,
+            "purl": purl,
+            "publishedAt": "2024-02-01T00:00:00Z",
+            "files": {},
+            "vulnerabilities": {},
+            "description": "Newer patch for the same purl",
+            "license": "MIT",
+            "tier": "free",
+        })))
+        .mount(&mock)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    // The manifest already records this purl at UUID_A.
+    let socket_dir = tmp.path().join(".socket");
+    std::fs::create_dir_all(&socket_dir).unwrap();
+    std::fs::write(
+        socket_dir.join("manifest.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "patches": { purl: {
+                "uuid": UUID_A,
+                "exportedAt": "2024-01-01T00:00:00Z",
+                "files": {},
+                "vulnerabilities": {},
+                "description": "Older patch",
+                "license": "MIT",
+                "tier": "free",
+            }}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let (code, stdout, _stderr) = common::run(
+        tmp.path(),
+        &[
+            "get",
+            UUID_B,
+            "--id",
+            "--save-only",
+            "--yes",
+            "--json",
+            "--api-url",
+            &mock.uri(),
+            "--api-token",
+            "fake",
+            "--org",
+            ORG_SLUG,
+        ],
+    );
+    assert_eq!(
+        code, 0,
+        "replacing an existing entry succeeds; stdout={stdout}"
+    );
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert_eq!(v["status"], "success", "stdout={stdout}");
+    assert_eq!(
+        v["downloaded"], 1,
+        "an update is a real download; stdout={stdout}"
+    );
+    assert_eq!(
+        v["patches"][0]["action"], "updated",
+        "a different uuid at the same purl is `updated`, not `added`; stdout={stdout}"
+    );
+    assert_eq!(
+        v["patches"][0]["oldUuid"], UUID_A,
+        "`updated` must carry the uuid it replaced; stdout={stdout}"
+    );
+    // Contract: the metadata block rides `added` AND `updated` records.
+    assert_eq!(
+        v["patches"][0]["description"], "Newer patch for the same purl",
+        "updated records must carry patch metadata; stdout={stdout}"
+    );
+    // And the manifest really moved to the new uuid.
+    let body = std::fs::read_to_string(socket_dir.join("manifest.json")).unwrap();
+    let m: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        m["patches"][purl]["uuid"], UUID_B,
+        "manifest must now record the replacement uuid; manifest={m}"
     );
 }

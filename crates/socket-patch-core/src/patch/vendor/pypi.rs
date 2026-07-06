@@ -1382,6 +1382,144 @@ wheels = [
         );
     }
 
+    /// Re-running vendor on an already-wired requirements project must be
+    /// the same in-sync skip the lock flavors report — NOT a second
+    /// `(transitive)` line append: the duplicate hands pip two competing
+    /// requirements, and re-recording the entry would clobber the original
+    /// pin's wiring record (the only copy of the pre-vendor line).
+    #[tokio::test]
+    async fn requirements_revendor_is_in_sync_skip() {
+        let fx = e2e_fixture().await;
+        let sources = PatchSources::blobs_only(&fx.blobs);
+        let vendor_one = || {
+            vendor_pypi(
+                "pkg:pypi/six@1.16.0",
+                &fx.site_packages,
+                &fx.root,
+                &fx.record,
+                &sources,
+                "2026-06-09T00:00:00Z",
+                false,
+                false,
+                None,
+            )
+        };
+        let VendorOutcome::Done { result, entry, .. } = vendor_one().await else {
+            panic!("first vendor must be Done");
+        };
+        assert!(result.success, "{:?}", result.error);
+        assert!(entry.is_some());
+        let wired = tokio::fs::read_to_string(fx.root.join("requirements.txt"))
+            .await
+            .unwrap();
+
+        // Intact wheel: in-sync skip — nothing recorded, file byte-identical.
+        let VendorOutcome::Done {
+            result: r2,
+            entry: e2,
+            warnings: w2,
+        } = vendor_one().await
+        else {
+            panic!("re-run must be Done");
+        };
+        assert!(r2.success, "{:?}", r2.error);
+        assert!(e2.is_none(), "in-sync re-run records nothing");
+        assert_eq!(
+            tokio::fs::read_to_string(fx.root.join("requirements.txt"))
+                .await
+                .unwrap(),
+            wired,
+            "re-run must not touch requirements.txt"
+        );
+        assert!(
+            !w2.iter().any(|w| w.code == "vendor_artifact_rebuilt"),
+            "intact wheel must not claim a rebuild: {w2:?}"
+        );
+
+        // Deleted wheel: artifact-only rebuild, wiring untouched.
+        let uuid_dir = fx.root.join(format!(".socket/vendor/pypi/{UUID}"));
+        tokio::fs::remove_dir_all(&uuid_dir).await.unwrap();
+        let VendorOutcome::Done {
+            result: r3,
+            entry: e3,
+            warnings: w3,
+        } = vendor_one().await
+        else {
+            panic!("rebuild run must be Done");
+        };
+        assert!(r3.success, "{:?}", r3.error);
+        assert!(e3.is_none(), "artifact-only rebuild records no entry");
+        assert!(
+            w3.iter().any(|w| w.code == "vendor_artifact_rebuilt"),
+            "rebuild is surfaced: {w3:?}"
+        );
+        assert!(uuid_dir.join("six-1.16.0-py2.py3-none-any.whl").is_file());
+        assert_eq!(
+            tokio::fs::read_to_string(fx.root.join("requirements.txt"))
+                .await
+                .unwrap(),
+            wired,
+            "rebuild must not touch requirements.txt"
+        );
+    }
+
+    /// A requirements file already wired to an EARLIER patch uuid for the
+    /// same package refuses (mirrors uv/poetry): appending a second wheel
+    /// line would leave pip two competing requirements, and the new entry
+    /// would clobber the old one's ledger record, orphaning its line.
+    #[tokio::test]
+    async fn requirements_stale_uuid_vendor_line_refuses() {
+        const UUID2: &str = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
+        let fx = e2e_fixture().await;
+        let sources = PatchSources::blobs_only(&fx.blobs);
+        let vendor_with = |record: PatchRecord| {
+            let sources = &sources;
+            let fx = &fx;
+            async move {
+                vendor_pypi(
+                    "pkg:pypi/six@1.16.0",
+                    &fx.site_packages,
+                    &fx.root,
+                    &record,
+                    sources,
+                    "2026-06-09T00:00:00Z",
+                    false,
+                    false,
+                    None,
+                )
+                .await
+            }
+        };
+        let VendorOutcome::Done { result, .. } = vendor_with(fx.record.clone()).await else {
+            panic!("first vendor must be Done");
+        };
+        assert!(result.success, "{:?}", result.error);
+        let wired = tokio::fs::read_to_string(fx.root.join("requirements.txt"))
+            .await
+            .unwrap();
+
+        // Same package, new patch generation (different uuid).
+        let mut record2 = fx.record.clone();
+        record2.uuid = UUID2.to_string();
+        let outcome = vendor_with(record2).await;
+        let VendorOutcome::Refused { code, detail } = outcome else {
+            panic!("expected Refused, got {outcome:?}");
+        };
+        assert_eq!(code, "pypi_requirements_already_vendored");
+        assert!(detail.contains(UUID), "{detail}");
+        // Pre-flight refusal: no second line, no new uuid dir.
+        assert_eq!(
+            tokio::fs::read_to_string(fx.root.join("requirements.txt"))
+                .await
+                .unwrap(),
+            wired
+        );
+        assert!(!fx
+            .root
+            .join(format!(".socket/vendor/pypi/{UUID2}"))
+            .exists());
+    }
+
     #[tokio::test]
     async fn platform_specific_tags_set_platform_locked_and_warn() {
         let fx = e2e_fixture().await;

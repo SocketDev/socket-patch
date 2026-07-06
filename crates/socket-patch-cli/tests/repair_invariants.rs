@@ -16,9 +16,13 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const ORG_SLUG: &str = "test-org";
 
-/// Every `SOCKET_*` env var that maps onto a `GlobalArgs`/`RepairArgs` field.
-/// The child binary must NOT inherit any of these from the ambient
-/// environment, or the assertions stop testing what they claim:
+fn binary() -> PathBuf {
+    env!("CARGO_BIN_EXE_socket-patch").into()
+}
+
+/// A `socket-patch` command rooted at `cwd` with every ambient `SOCKET_*`
+/// env var scrubbed, so every assertion exercises the flag/argv path and
+/// nothing the ambient environment happened to leak in:
 ///   * an ambient `SOCKET_OFFLINE` would make every `--offline` test pass even
 ///     if the `--offline` *flag* path regressed (the binary would be offline
 ///     for the wrong reason);
@@ -28,45 +32,20 @@ const ORG_SLUG: &str = "test-org";
 ///   * `SOCKET_DOWNLOAD_ONLY` / `SOCKET_DOWNLOAD_MODE` / `SOCKET_DRY_RUN`
 ///     could flip the cleanup-vs-download branch out from under the test.
 ///
-/// We scrub the whole set and then re-set only the handful a given test
-/// deliberately controls.
-const SOCKET_ENV_VARS: &[&str] = &[
-    "SOCKET_CWD",
-    "SOCKET_MANIFEST_PATH",
-    "SOCKET_API_URL",
-    "SOCKET_API_TOKEN",
-    "SOCKET_ORG_SLUG",
-    "SOCKET_PROXY_URL",
-    "SOCKET_ECOSYSTEMS",
-    "SOCKET_DOWNLOAD_MODE",
-    "SOCKET_DOWNLOAD_ONLY",
-    "SOCKET_OFFLINE",
-    "SOCKET_GLOBAL",
-    "SOCKET_GLOBAL_PREFIX",
-    "SOCKET_JSON",
-    "SOCKET_VERBOSE",
-    "SOCKET_SILENT",
-    "SOCKET_DRY_RUN",
-    "SOCKET_YES",
-    "SOCKET_FORCE",
-    "SOCKET_LOCK_TIMEOUT",
-    "SOCKET_BREAK_LOCK",
-    "SOCKET_DEBUG",
-    "SOCKET_TELEMETRY_DISABLED",
-];
-
-fn binary() -> PathBuf {
-    env!("CARGO_BIN_EXE_socket-patch").into()
-}
-
-/// A `socket-patch` command rooted at `cwd` with the full `SOCKET_*` env
-/// scrubbed, so every assertion exercises the flag/argv path and nothing the
-/// ambient environment happened to leak in.
+/// Scrubbing is by prefix, not an explicit list: an explicit list drifts
+/// stale as `GlobalArgs` grows (it had already missed `SOCKET_STRICT` /
+/// `SOCKET_VENDOR_SOURCE`, whose validating parsers abort every invocation
+/// with exit 2 on ambient garbage), and `main` migrates legacy
+/// `SOCKET_PATCH_*` names into `SOCKET_*` at startup, which the prefix also
+/// covers. Tests re-seed (via `.env()`, after this scrub) only the handful
+/// they deliberately control.
 fn socket_cmd(cwd: &Path) -> Command {
     let mut cmd = Command::new(binary());
     cmd.current_dir(cwd);
-    for var in SOCKET_ENV_VARS {
-        cmd.env_remove(var);
+    for (name, _) in std::env::vars_os() {
+        if name.to_string_lossy().starts_with("SOCKET_") {
+            cmd.env_remove(name);
+        }
     }
     cmd
 }
@@ -473,6 +452,102 @@ fn repair_download_only_skips_cleanup() {
         socket.join("blobs").join(&orphan_hash).exists(),
         "--download-only must skip cleanup; orphan should still exist"
     );
+}
+
+/// Regression: a FAILED cleanup pass must not be silently swallowed by
+/// `--json` / `--silent`. The human loud path warns on stderr
+/// ("Warning: blob cleanup failed: ...") and continues with exit 0 — but
+/// both warnings in `repair_inner`'s cleanup arms were gated on
+/// `!(json || silent)`, so:
+///   * `repair --json` emitted a clean `status: success` envelope with zero
+///     events — a machine consumer could not distinguish "cleaned up fine"
+///     from "cleanup failed with EACCES and the orphan is still there";
+///   * `repair --silent` ("suppress non-error output") muted the failure
+///     entirely, though an error is exactly what --silent must still print.
+///
+/// The fixture makes cleanup fail deterministically: the blobs dir is
+/// read-only (r-x), so the orphan unlink fails EACCES while directory
+/// listing and stat still work.
+#[cfg(unix)]
+#[test]
+fn repair_cleanup_failure_is_reported_in_json_and_silent_modes() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let socket = make_socket_dir(tmp.path());
+    write_blob(&socket, REFERENCED_HASH, b"kept");
+    let orphan = "0badf00d".repeat(8); // 64 chars, not referenced
+    write_blob(&socket, &orphan, b"orphan bytes");
+    let blobs_dir = socket.join("blobs");
+    std::fs::set_permissions(&blobs_dir, std::fs::Permissions::from_mode(0o555))
+        .expect("chmod blobs dir read-only");
+
+    // Control (loud human mode): proves the fixture actually trips the
+    // cleanup-failure path — the warning is on stderr and the run still
+    // exits 0 (cleanup failure is warn-and-continue, not fatal). If this
+    // fails, the environment can unlink from a r-x dir (e.g. running as
+    // root) and the assertions below would be vacuous.
+    let loud = socket_cmd(tmp.path())
+        .args(["repair", "--offline"])
+        .output()
+        .expect("run socket-patch");
+    assert_eq!(
+        loud.status.code(),
+        Some(0),
+        "control: cleanup failure must stay non-fatal; stderr=\n{}",
+        String::from_utf8_lossy(&loud.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&loud.stderr).contains("blob cleanup failed"),
+        "control: loud human mode must warn about the failed cleanup; stderr=\n{}",
+        String::from_utf8_lossy(&loud.stderr)
+    );
+    assert!(
+        blobs_dir.join(&orphan).exists(),
+        "control: the orphan must have survived the failed cleanup"
+    );
+
+    // JSON mode: the envelope must carry the cleanup failure as an
+    // informational skip event (warn-and-continue semantics preserved:
+    // status stays success, exit stays 0, nothing was removed).
+    let (code, stdout) = run_repair(tmp.path(), &[]);
+    assert_eq!(code, 0, "json: cleanup failure stays non-fatal; stdout=\n{stdout}");
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("envelope JSON");
+    assert_eq!(v["status"], "success");
+    assert_eq!(v["summary"]["removed"], 0);
+    let events = v["events"].as_array().expect("events array");
+    let skip = events
+        .iter()
+        .find(|e| e["action"] == "skipped" && e["errorCode"] == "cleanup_failed")
+        .unwrap_or_else(|| {
+            panic!("json: envelope must record the failed cleanup; got events={events:?}")
+        });
+    assert!(
+        skip["reason"].as_str().unwrap_or("").contains("blob"),
+        "the skip reason must name the failing cleanup pass; got {skip}"
+    );
+
+    // Silent mode: stdout stays empty, but the failure warning must still
+    // reach stderr — --silent suppresses non-ERROR output only.
+    let silent = socket_cmd(tmp.path())
+        .args(["repair", "--offline", "--silent"])
+        .output()
+        .expect("run socket-patch");
+    assert_eq!(silent.status.code(), Some(0));
+    assert!(
+        String::from_utf8_lossy(&silent.stdout).trim().is_empty(),
+        "--silent must keep stdout empty; got:\n{}",
+        String::from_utf8_lossy(&silent.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&silent.stderr).contains("blob cleanup failed"),
+        "--silent must NOT mute the cleanup-failure warning; stderr=\n{}",
+        String::from_utf8_lossy(&silent.stderr)
+    );
+
+    // Restore permissions so the tempdir can be cleaned up.
+    std::fs::set_permissions(&blobs_dir, std::fs::Permissions::from_mode(0o755))
+        .expect("restore blobs dir permissions");
 }
 
 // ---------------------------------------------------------------------------

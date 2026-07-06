@@ -2,15 +2,23 @@
 //!
 //! These tests exercise crawling against a temporary directory with a fake
 //! Maven local repository layout.  They do **not** require network access or a
-//! real Maven/Java installation.
+//! real Maven/Java installation: the scan's patch lookup is pinned to an
+//! in-test [`wiremock`] public-proxy stand-in via `--proxy-url`. That pinning
+//! is load-bearing, not cosmetic — since the all-batches-failed fix, an
+//! unreachable API is a hard scan failure (exit 1, `status: "error"`), so an
+//! unpinned scan would phone home to the live proxy on every test run and go
+//! red whenever the network (or an ambient `SOCKET_*` variable) misbehaved.
 //!
 //! # Running
 //! ```sh
-//! cargo test -p socket-patch-cli --test e2e_maven
+//! cargo test -p socket-patch-cli --test e2e_maven -- --ignored
 //! ```
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -20,24 +28,77 @@ fn binary() -> PathBuf {
     env!("CARGO_BIN_EXE_socket-patch").into()
 }
 
-fn run(args: &[&str], cwd: &std::path::Path, m2_repo: &std::path::Path) -> Output {
-    Command::new(binary())
-        .args(args)
-        .current_dir(cwd)
-        // Point the crawler at the fake local repo.
-        .env("MAVEN_REPO_LOCAL", m2_repo)
-        // The Maven crawler is gated behind a runtime opt-in
-        // (`maven_runtime_enabled` in ecosystem_dispatch.rs); without
-        // this the crawl short-circuits to zero packages and the scan
-        // prints "No packages found." These tests are named for Maven
-        // *discovery*, so they must enable the real crawl path — otherwise
-        // they only ever exercise the disabled stub and pass vacuously.
-        .env("SOCKET_EXPERIMENTAL_MAVEN", "1")
-        // Keep the run hermetic: no ambient token, no inherited repo path.
-        .env_remove("SOCKET_API_TOKEN")
-        .env_remove("M2_HOME")
-        .output()
-        .expect("Failed to run socket-patch binary")
+/// Start a mock Socket public proxy answering the scan's `POST /patch/batch`
+/// with an empty (no-patch) result, so no scan in this file ever leaves
+/// localhost.
+async fn start_proxy() -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/patch/batch"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "packages": [],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(&server)
+        .await;
+    server
+}
+
+/// Run the binary as a blocking subprocess (off the async runtime so the
+/// in-test proxy can service its requests concurrently), pinned to `proxy_url`.
+///
+/// `SOCKET_API_TOKEN` is stripped so the binary deterministically takes the
+/// public-proxy path (an ambient token would flip it onto the authenticated
+/// API, bypassing `--proxy-url`), and every other variable that could
+/// redirect the API elsewhere or disable it is scrubbed so an ambient value
+/// can't quietly change what the scan reports.
+async fn run(args: &[&str], cwd: &Path, m2_repo: &Path, proxy_url: &str) -> Output {
+    let mut args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    args.extend(["--proxy-url".to_string(), proxy_url.to_string()]);
+    let cwd = cwd.to_path_buf();
+    let m2_repo = m2_repo.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        Command::new(binary())
+            .args(&arg_refs)
+            .current_dir(&cwd)
+            // Point the crawler at the fake local repo.
+            .env("MAVEN_REPO_LOCAL", &m2_repo)
+            // The Maven crawler is gated behind a runtime opt-in
+            // (`maven_runtime_enabled` in ecosystem_dispatch.rs); without
+            // this the crawl short-circuits to zero packages and the scan
+            // prints "No packages found." These tests are named for Maven
+            // *discovery*, so they must enable the real crawl path — otherwise
+            // they only ever exercise the disabled stub and pass vacuously.
+            .env("SOCKET_EXPERIMENTAL_MAVEN", "1")
+            // Keep the run hermetic: no ambient token, no inherited repo path.
+            .env_remove("SOCKET_API_TOKEN")
+            .env_remove("M2_HOME")
+            .env_remove("SOCKET_API_URL")
+            .env_remove("SOCKET_OFFLINE")
+            .env_remove("SOCKET_PROXY_URL")
+            .env_remove("SOCKET_PATCH_PROXY_URL")
+            .env_remove("SOCKET_BATCH_SIZE")
+            .output()
+            .expect("Failed to run socket-patch binary")
+    })
+    .await
+    .expect("socket-patch subprocess task panicked")
+}
+
+/// Regression guard for the hermeticity fix: every scan in a test must have
+/// routed its patch lookup through the in-test proxy. Fewer recorded requests
+/// than scans means at least one binary invocation talked to the live API (or
+/// skipped the lookup outright) despite the pinning — exactly the bug this
+/// file used to have.
+async fn assert_proxy_served_scans(server: &MockServer, scans: usize) {
+    let requests = server.received_requests().await.unwrap_or_default();
+    assert!(
+        requests.len() >= scans,
+        "expected all {scans} scan invocations to hit the in-test proxy; \
+         recorded only {} request(s)",
+        requests.len()
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -45,9 +106,11 @@ fn run(args: &[&str], cwd: &std::path::Path, m2_repo: &std::path::Path) -> Outpu
 // ---------------------------------------------------------------------------
 
 /// Verify that `socket-patch scan` discovers artifacts in a fake Maven local repo.
-#[test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "experimental ecosystem (maven): not gating CI until the maven backend is implemented; run with --ignored"]
-fn scan_discovers_maven_artifacts() {
+async fn scan_discovers_maven_artifacts() {
+    let server = start_proxy().await;
+    let proxy_url = server.uri();
     let dir = tempfile::tempdir().unwrap();
 
     // Set up a fake Maven local repository
@@ -109,7 +172,9 @@ fn scan_discovers_maven_artifacts() {
         &["scan", "--cwd", project_dir.to_str().unwrap()],
         &project_dir,
         &m2_repo,
-    );
+        &proxy_url,
+    )
+    .await;
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let combined = format!("{stdout}{stderr}");
@@ -143,7 +208,9 @@ fn scan_discovers_maven_artifacts() {
         &["scan", "--json", "--cwd", project_dir.to_str().unwrap()],
         &project_dir,
         &m2_repo,
-    );
+        &proxy_url,
+    )
+    .await;
     let json = String::from_utf8_lossy(&json_out.stdout);
     assert!(
         json_out.status.success(),
@@ -161,12 +228,16 @@ fn scan_discovers_maven_artifacts() {
         json.contains("\"status\": \"success\""),
         "expected status == success in JSON output, got:\n{json}"
     );
+
+    assert_proxy_served_scans(&server, 2).await;
 }
 
 /// Verify that `socket-patch scan` discovers Gradle project artifacts.
-#[test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "experimental ecosystem (maven): not gating CI until the maven backend is implemented; run with --ignored"]
-fn scan_discovers_gradle_project_artifacts() {
+async fn scan_discovers_gradle_project_artifacts() {
+    let server = start_proxy().await;
+    let proxy_url = server.uri();
     let dir = tempfile::tempdir().unwrap();
 
     // Set up a fake Maven local repository
@@ -205,7 +276,9 @@ fn scan_discovers_gradle_project_artifacts() {
         &["scan", "--json", "--cwd", project_dir.to_str().unwrap()],
         &project_dir,
         &m2_repo,
-    );
+        &proxy_url,
+    )
+    .await;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -237,7 +310,9 @@ fn scan_discovers_gradle_project_artifacts() {
         &["scan", "--cwd", project_dir.to_str().unwrap()],
         &project_dir,
         &m2_repo,
-    );
+        &proxy_url,
+    )
+    .await;
     let h_combined = format!(
         "{}{}",
         String::from_utf8_lossy(&human.stdout),
@@ -247,4 +322,6 @@ fn scan_discovers_gradle_project_artifacts() {
         h_combined.contains("Found 1 packages") && h_combined.contains("(1 maven)"),
         "expected the Gradle project to discover exactly 1 Maven artifact, got:\n{h_combined}"
     );
+
+    assert_proxy_served_scans(&server, 2).await;
 }

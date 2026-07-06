@@ -59,7 +59,7 @@ pub enum ReplaceOwner {
 /// for a user-authored path. The two prefixes don't overlap, but `Vendor` is
 /// tested first to keep the intent explicit (`.socket/vendor/golang/` is more
 /// specific than a hypothetical future `.socket/` catch-all).
-fn detect_owner(path: &str) -> Option<ReplaceOwner> {
+pub(crate) fn detect_owner(path: &str) -> Option<ReplaceOwner> {
     let norm = path.replace('\\', "/");
     let norm = norm.strip_prefix("./").unwrap_or(&norm);
     for (owner, dir) in [
@@ -186,8 +186,9 @@ async fn edit_go_mod(
             if !dry_run {
                 // go.mod is user-owned (their own require/replace directives and
                 // comments live alongside our socket `replace`) — a torn write
-                // would corrupt a manifest that no longer builds.
-                crate::utils::fs::atomic_write_bytes(&path, new.as_bytes())
+                // would corrupt a manifest that no longer builds, and the swap
+                // must keep the file's permission bits.
+                crate::utils::fs::atomic_write_bytes_preserving_mode(&path, new.as_bytes())
                     .await
                     .map_err(|e| format!("write {}: {e}", path.display()))?;
             }
@@ -215,7 +216,6 @@ fn for_each_directive_body(
     keyword: &str,
     mut f: impl FnMut(usize, &str) -> Result<(), String>,
 ) -> Result<(), String> {
-    let single = format!("{keyword} ");
     let mut in_block = false;
     for (i, raw) in content.lines().enumerate() {
         let line = strip_comment(raw).trim();
@@ -228,13 +228,17 @@ fn for_each_directive_body(
             } else {
                 f(i, line)?;
             }
-        } else if let Some(rest) = line.strip_prefix(keyword).map(str::trim_start) {
+        } else if let Some(after) = line.strip_prefix(keyword) {
+            let rest = after.trim_start();
             match rest {
                 "(" => in_block = true,
                 "()" => {} // empty inline block — nothing inside
                 _ => {
-                    if let Some(body) = line.strip_prefix(&single) {
-                        f(i, body)?;
+                    // Go's lexer separates tokens on ANY whitespace, so
+                    // `replace\tmod …` is as valid as `replace mod …` (and
+                    // `replaceX` is a different word entirely).
+                    if after.starts_with(char::is_whitespace) && !rest.is_empty() {
+                        f(i, rest)?;
                     }
                 }
             }
@@ -328,7 +332,10 @@ fn upsert_replace_entry(
         let mut lines: Vec<String> = content.lines().map(str::to_string).collect();
         let raw = &lines[idx];
         let indent: String = raw.chars().take_while(|c| c.is_whitespace()).collect();
-        let is_block_member = !strip_comment(raw).trim_start().starts_with("replace ");
+        let is_block_member = !strip_comment(raw)
+            .trim_start()
+            .strip_prefix("replace")
+            .is_some_and(|rest| rest.starts_with(char::is_whitespace));
         let new = if is_block_member {
             format!("{indent}{module} {version} => {want_path}")
         } else {
@@ -446,11 +453,13 @@ fn remove_replace_entry(
             i = close + 1;
             continue;
         }
-        if let Some(body) = line.strip_prefix("replace ") {
-            if let Some(e) = parse_replace_body(body) {
-                if e.module == module && e.owner == Some(owner) {
-                    keep[i] = false;
-                    changed = true;
+        if let Some(after) = line.strip_prefix("replace") {
+            if after.starts_with(char::is_whitespace) {
+                if let Some(e) = parse_replace_body(after) {
+                    if e.module == module && e.owner == Some(owner) {
+                        keep[i] = false;
+                        changed = true;
+                    }
                 }
             }
         }
@@ -966,6 +975,75 @@ replace (
             on_disk.starts_with(original),
             "original content kept verbatim as a prefix"
         );
+    }
+
+    /// `go.mod` is user-owned: editing it must not reset its permission bits
+    /// (a 0600 private go.mod silently becoming umask-default 0644 is the
+    /// `package_json/update.rs` mode-reset bug, same class).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_ensure_preserves_go_mod_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("go.mod");
+        fs::write(&path, "module m\n\ngo 1.21\n").await.unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o600);
+        std::fs::set_permissions(&path, perms).unwrap();
+
+        assert!(ensure_replace_entry(
+            dir.path(),
+            "github.com/foo/bar",
+            "v1.4.2",
+            GO_PATCHES_DIR,
+            false
+        )
+        .await
+        .unwrap());
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "edit must preserve go.mod permission bits");
+    }
+
+    // ── tab-separated directives (Go's lexer: any whitespace separates) ──────
+    /// A hand-formatted `replace\tmodule … => …` (tab after the keyword) is
+    /// valid go.mod. Upsert must recognize it as the existing socket-owned
+    /// entry — appending a second directive for the same module+version makes
+    /// go.mod invalid ("duplicate replacement").
+    #[test]
+    fn test_upsert_recognizes_tab_separated_socket_replace() {
+        let gomod = "module m\n\nreplace\tgithub.com/foo/bar v1.4.2 => ./.socket/go-patches/github.com/foo/bar@v1.4.2\n";
+        let out =
+            upsert_replace_entry(gomod, "github.com/foo/bar", "v1.4.2", GO_PATCHES_DIR).unwrap();
+        // Either a no-op or an in-place normalization is fine; a duplicate is not.
+        // Count raw text occurrences — parse_replace_entries can't be the
+        // oracle for a form the parser itself might be blind to.
+        let content = out.as_deref().unwrap_or(gomod);
+        assert_eq!(
+            content.matches("github.com/foo/bar v1.4.2 =>").count(),
+            1,
+            "must not append a duplicate replace for the module: {content:?}"
+        );
+        // Still a well-formed single-line directive (keyword kept).
+        assert!(
+            content.contains("replace")
+                && content.contains(
+                    "github.com/foo/bar v1.4.2 => ./.socket/go-patches/github.com/foo/bar@v1.4.2"
+                ),
+        );
+    }
+
+    /// Same input: drop must remove the tab-separated socket-owned directive —
+    /// leaving it behind strands a `replace` pointing at a copy dir the caller
+    /// is about to delete.
+    #[test]
+    fn test_remove_tab_separated_socket_replace() {
+        let gomod = "module m\n\nreplace\tgithub.com/foo/bar v1.4.2 => ./.socket/go-patches/github.com/foo/bar@v1.4.2\n";
+        let out = remove_replace_entry(gomod, "github.com/foo/bar", ReplaceOwner::GoPatches)
+            .unwrap()
+            .expect("tab-separated socket replace must be removable");
+        assert!(!out.contains("go-patches"));
+        assert!(out.contains("module m"));
     }
 
     #[tokio::test]

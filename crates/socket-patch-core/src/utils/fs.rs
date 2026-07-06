@@ -172,6 +172,35 @@ pub(crate) fn home_dir() -> PathBuf {
 /// filesystem), so a reader or recovering process only ever sees the complete
 /// old or the complete new bytes.
 pub(crate) async fn atomic_write_bytes(path: &Path, content: &[u8]) -> std::io::Result<()> {
+    atomic_write_bytes_as(path, content, None).await
+}
+
+/// [`atomic_write_bytes`], but the new inode keeps the destination's existing
+/// permission bits (when the destination exists).
+///
+/// The rename swaps in a fresh stage inode created with umask defaults, so the
+/// plain writer resets a user-owned file's mode — a 0600 private package.json
+/// silently becomes 0644, a 0664 group-writable one locks the group out. Use
+/// this variant for files the *user* owns and we merely edit (package.json,
+/// Gemfile, …), matching npm's write-file-atomic. The patch engine keeps the
+/// plain writer: `restore_file_permissions` re-applies pre-patch mode + uid/gid
+/// itself after the rename.
+pub(crate) async fn atomic_write_bytes_preserving_mode(
+    path: &Path,
+    content: &[u8],
+) -> std::io::Result<()> {
+    let perms = tokio::fs::metadata(path)
+        .await
+        .ok()
+        .map(|m| m.permissions());
+    atomic_write_bytes_as(path, content, perms).await
+}
+
+async fn atomic_write_bytes_as(
+    path: &Path,
+    content: &[u8],
+    perms: Option<std::fs::Permissions>,
+) -> std::io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let stem = path
         .file_name()
@@ -193,6 +222,16 @@ pub(crate) async fn atomic_write_bytes(path: &Path, content: &[u8]) -> std::io::
     if let Err(e) = file.sync_all().await {
         let _ = tokio::fs::remove_file(&stage).await;
         return Err(e);
+    }
+    // Set the preserved mode on the stage *before* the rename so the file
+    // never appears at the destination with the wrong bits, even briefly.
+    // The content is already written through the open handle, so a
+    // restrictive mode (0400, 0000) cannot fail the write.
+    if let Some(p) = perms {
+        if let Err(e) = file.set_permissions(p).await {
+            let _ = tokio::fs::remove_file(&stage).await;
+            return Err(e);
+        }
     }
     drop(file);
 
@@ -406,6 +445,33 @@ mod tests {
                 other => panic!("unexpected entry: {other}"),
             }
         }
+    }
+
+    /// The preserving writer re-applies the destination's mode to the new
+    /// inode (0744's exec bit cannot come from a 0666-based create, so this
+    /// is red under any umask if preservation regresses), while a missing
+    /// destination is simply created with umask defaults.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn atomic_write_preserving_mode_keeps_dest_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("f");
+        tokio::fs::write(&path, b"old").await.unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o744)).unwrap();
+
+        atomic_write_bytes_preserving_mode(&path, b"new")
+            .await
+            .unwrap();
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), b"new");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o744, "existing mode must survive the rename");
+
+        let fresh = tmp.path().join("fresh");
+        atomic_write_bytes_preserving_mode(&fresh, b"x")
+            .await
+            .unwrap();
+        assert_eq!(tokio::fs::read(&fresh).await.unwrap(), b"x");
     }
 
     /// `entry_file_type` is the symlink-aware counterpart: it reports

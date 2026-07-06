@@ -61,7 +61,8 @@ const MODE_FILE_EXEC: u32 = 0o100755;
 /// `tgz_bytes` for `node_modules/<package_ident>/`.
 ///
 /// Fail-closed: any tar shape the spiked recipe did not cover (symlinks,
-/// hardlinks, non-ASCII names, single-component paths) is an `Err` — a wrong
+/// hardlinks, non-ASCII names, single-component paths, non-canonical paths
+/// — `./`, `..`, `//`, absolute — and duplicate paths) is an `Err` — a wrong
 /// checksum would brick the user's `yarn install` with a YN0018, so we never
 /// guess.
 pub(super) fn berry_cache_checksum_10c0(
@@ -98,6 +99,7 @@ fn collect_entries(tgz_bytes: &[u8], package_ident: &str) -> Result<Vec<ZipEntry
     let prefix = format!("node_modules/{package_ident}");
     let mut entries: Vec<ZipEntry> = Vec::new();
     let mut seen_dirs: HashSet<String> = HashSet::new();
+    let mut seen_files: HashSet<String> = HashSet::new();
 
     // mkdirp: emit every missing ancestor of `dirpath` (no trailing slash),
     // shallowest first, exactly once.
@@ -129,6 +131,21 @@ fn collect_entries(tgz_bytes: &[u8], package_ident: &str) -> Result<Vec<ZipEntry
         if !raw_name.is_ascii() {
             return Err(format!("tar entry name `{raw_name}` is not ASCII"));
         }
+        // yarn normalizes `./`/`//` away and skips absolute/`..` entries
+        // before stripping the first component — shapes the spike never
+        // covered. Stripping the first *raw* component would hash a layout
+        // yarn disagrees with; refuse rather than guess.
+        let canonical = raw_name.strip_suffix('/').unwrap_or(&raw_name);
+        if canonical.is_empty()
+            || canonical
+                .split('/')
+                .any(|c| c.is_empty() || c == "." || c == "..")
+        {
+            return Err(format!(
+                "tar entry name `{raw_name}` is not in canonical form; cannot rebuild the \
+                 berry cache zip deterministically"
+            ));
+        }
         // Strip the first path component (`package/` for npm packs).
         let stripped = raw_name
             .split_once('/')
@@ -151,6 +168,14 @@ fn collect_entries(tgz_bytes: &[u8], package_ident: &str) -> Result<Vec<ZipEntry
                     ));
                 }
                 let target = format!("{prefix}/{stripped}");
+                // yarn overwrites a repeated path in place (one zip entry);
+                // emitting two diverges — another unspiked shape to refuse.
+                if !seen_files.insert(target.clone()) {
+                    return Err(format!(
+                        "tarball contains `{raw_name}` more than once; cannot rebuild the \
+                         berry cache zip deterministically"
+                    ));
+                }
                 let parent = target.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
                 mkdirp(parent, &mut seen_dirs, &mut entries);
                 let mut data = Vec::new();
@@ -456,6 +481,49 @@ mod tests {
                 entry.name()
             );
         }
+    }
+
+    /// Build a tgz of regular-file entries whose names are written straight
+    /// into the GNU header, bypassing tar-rs path validation — the only way
+    /// to reproduce the non-canonical names hand-rolled registry tarballs
+    /// can carry.
+    fn tgz_with_names(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::new(6));
+        let mut tar = tar::Builder::new(gz);
+        for (path, data) in entries {
+            let mut h = tar::Header::new_gnu();
+            h.set_entry_type(tar::EntryType::Regular);
+            h.set_size(data.len() as u64);
+            h.set_mode(0o644);
+            h.as_gnu_mut().unwrap().name[..path.len()].copy_from_slice(path.as_bytes());
+            h.set_cksum();
+            tar.append(&h, *data).unwrap();
+        }
+        tar.into_inner().unwrap().finish().unwrap()
+    }
+
+    /// Path shapes yarn's converter normalizes (`./`, `//`) or skips
+    /// outright (absolute, `..`) before stripping the first component, and
+    /// duplicate paths (yarn overwrites in place — one zip entry, not two):
+    /// none covered by the spike, so hashing our literal mapping would emit
+    /// a checksum yarn disagrees with. Must fail closed, never guess.
+    #[test]
+    fn non_canonical_and_duplicate_paths_fail_closed() {
+        for name in [
+            "./package/index.js",
+            "package/./index.js",
+            "package/../index.js",
+            "/package/index.js",
+            "package//index.js",
+        ] {
+            let tgz = tgz_with_names(&[(name, b"x")]);
+            let err = berry_cache_checksum_10c0(&tgz, "x").unwrap_err();
+            assert!(err.contains("not in canonical form"), "`{name}`: {err}");
+        }
+
+        let tgz = tgz_with_names(&[("package/a.txt", b"1"), ("package/a.txt", b"2")]);
+        let err = berry_cache_checksum_10c0(&tgz, "x").unwrap_err();
+        assert!(err.contains("more than once"), "{err}");
     }
 
     #[test]

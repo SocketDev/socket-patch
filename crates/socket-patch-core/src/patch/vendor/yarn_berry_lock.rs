@@ -36,7 +36,7 @@ use sha2::{Digest, Sha512};
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::{normalize_file_path, PatchSources};
 use crate::patch::copy_tree::remove_tree;
-use crate::utils::fs::atomic_write_bytes;
+use crate::utils::fs::atomic_write_bytes_preserving_mode;
 use crate::utils::uri::encode_uri_component;
 
 use super::berry_zip::berry_cache_checksum_10c0;
@@ -490,7 +490,7 @@ pub async fn revert_yarn_berry(
                     );
                 }
                 if changed {
-                    if let Err(e) = atomic_write_bytes(&lock_path, text.as_bytes()).await {
+                    if let Err(e) = atomic_write_bytes_preserving_mode(&lock_path, text.as_bytes()).await {
                         return RevertOutcome::failed(format!("cannot write {YARN_LOCK}: {e}"));
                     }
                 }
@@ -534,7 +534,7 @@ pub async fn revert_yarn_berry(
                     let indent = detect_indent(&String::from_utf8_lossy(&bytes));
                     match serialize_json(&pkg, &indent) {
                         Ok(out) => {
-                            if let Err(e) = atomic_write_bytes(&pkg_path, &out).await {
+                            if let Err(e) = atomic_write_bytes_preserving_mode(&pkg_path, &out).await {
                                 return RevertOutcome::failed(format!(
                                     "cannot write {PACKAGE_JSON}: {e}"
                                 ));
@@ -644,11 +644,11 @@ async fn commit_pair(
     new_lock: &[u8],
 ) -> Result<(), String> {
     let pkg_path = project_root.join(PACKAGE_JSON);
-    atomic_write_bytes(&pkg_path, new_pkg)
+    atomic_write_bytes_preserving_mode(&pkg_path, new_pkg)
         .await
         .map_err(|e| format!("cannot write {PACKAGE_JSON}: {e}"))?;
-    if let Err(e) = atomic_write_bytes(&project_root.join(YARN_LOCK), new_lock).await {
-        return match atomic_write_bytes(&pkg_path, orig_pkg).await {
+    if let Err(e) = atomic_write_bytes_preserving_mode(&project_root.join(YARN_LOCK), new_lock).await {
+        return match atomic_write_bytes_preserving_mode(&pkg_path, orig_pkg).await {
             Ok(()) => Err(format!(
                 "cannot write {YARN_LOCK}: {e} ({PACKAGE_JSON} restored)"
             )),
@@ -1404,6 +1404,57 @@ __metadata:
             tokio::fs::read(root.join(PACKAGE_JSON)).await.unwrap(),
             b"orig-pkg",
             "package.json unwound to its original bytes"
+        );
+    }
+
+    /// package.json and yarn.lock are user-owned files we merely edit: the
+    /// vendor pair commit and the revert restore must keep their permission
+    /// bits (a 0600 private file must not silently become umask-default 0644).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pair_writes_preserve_file_modes() {
+        use std::os::unix::fs::PermissionsExt;
+        let fx = fixture().await;
+        tokio::fs::set_permissions(fx.pkg_path(), std::fs::Permissions::from_mode(0o600))
+            .await
+            .unwrap();
+        tokio::fs::set_permissions(fx.lock_path(), std::fs::Permissions::from_mode(0o640))
+            .await
+            .unwrap();
+        let mode = |path: PathBuf| async move {
+            tokio::fs::metadata(path)
+                .await
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777
+        };
+
+        let (result, entry, _) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        let entry = entry.unwrap();
+        assert_eq!(
+            mode(fx.pkg_path()).await,
+            0o600,
+            "vendor must preserve package.json's mode"
+        );
+        assert_eq!(
+            mode(fx.lock_path()).await,
+            0o640,
+            "vendor must preserve yarn.lock's mode"
+        );
+
+        let outcome = revert_yarn_berry(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert_eq!(
+            mode(fx.pkg_path()).await,
+            0o600,
+            "revert must preserve package.json's mode"
+        );
+        assert_eq!(
+            mode(fx.lock_path()).await,
+            0o640,
+            "revert must preserve yarn.lock's mode"
         );
     }
 

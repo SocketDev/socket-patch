@@ -222,6 +222,7 @@ pub async fn apply_go_redirect(
 
     // Fresh copy pristine → copy_dir.
     if let Err(e) = fresh_copy(pristine_src, &copy_dir, None).await {
+        teardown_failed_redirect(project_root, &copy_dir, module, version, base_rel).await;
         return synthesized_result(
             purl,
             &copy_dir,
@@ -235,7 +236,7 @@ pub async fn apply_go_redirect(
     // module path. Pre-modules packages have none in their extracted cache dir
     // (validated: `gopkg.in/inf.v0`), so synthesize Go's own minimal form.
     if let Err(e) = ensure_module_go_mod(&copy_dir, module).await {
-        let _ = remove_tree(&copy_dir).await;
+        teardown_failed_redirect(project_root, &copy_dir, module, version, base_rel).await;
         return synthesized_result(
             purl,
             &copy_dir,
@@ -256,7 +257,7 @@ pub async fn apply_go_redirect(
 
     if !result.success {
         // Don't leave a half-built copy that verify/reconcile would misjudge.
-        let _ = remove_tree(&copy_dir).await;
+        teardown_failed_redirect(project_root, &copy_dir, module, version, base_rel).await;
         return result;
     }
 
@@ -505,6 +506,30 @@ pub async fn verify_go_redirect_state(
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
+
+/// Failure cleanup for the rebuild legs of [`apply_go_redirect`]. By the time
+/// a rebuild leg fails, any pre-existing copy is already gone (`fresh_copy`
+/// removes the destination first), so a pre-existing socket-owned `replace`
+/// directive — a re-apply healing drift, or a version bump — would dangle at a
+/// deleted/husk directory and every `go build` fails with "replacement
+/// directory does not exist". Tear down to the same end state a failed FIRST
+/// apply leaves: no copy, no directive (the build falls back to the unpatched
+/// module until a later apply succeeds). The drop is owner-filtered, keyed by
+/// the owner `base_rel` implies, so the other backend's and the user's
+/// directives are never touched — and on a first apply it is a no-op.
+async fn teardown_failed_redirect(
+    project_root: &Path,
+    copy_dir: &Path,
+    module: &str,
+    version: &str,
+    base_rel: &str,
+) {
+    let _ = remove_tree(copy_dir).await;
+    if let Some(owner) = go_mod_edit::detect_owner(&replace_target_path(base_rel, module, version))
+    {
+        let _ = go_mod_edit::drop_replace_entry(project_root, module, owner, false).await;
+    }
+}
 
 /// True if the copy exists, every patched file in it already hashes to its
 /// `afterHash`, and a socket-owned `replace` pins this version's copy.
@@ -884,6 +909,139 @@ mod tests {
         );
         // No replace directive written.
         assert!(read_replace_entries(root).await.is_empty());
+    }
+
+    /// A failed RE-apply (drift heal / patch-content update) must not leave
+    /// `go.mod` pointing at a copy dir the failure path just deleted. The
+    /// rebuild leg destroys the existing copy (`fresh_copy`) and, on pipeline
+    /// failure, removes the half-built one — so the pre-existing socket-owned
+    /// `replace` directive would reference a nonexistent directory and every
+    /// `go build` fails with "replacement directory does not exist". Failure
+    /// must fall back to the unpatched module: directive dropped alongside the
+    /// copy, the same end state as a first-apply failure.
+    #[tokio::test]
+    async fn test_failed_reapply_drops_directive_with_copy() {
+        let (dir, blobs, pristine, files, _after) = fixture().await;
+        let root = dir.path();
+        let sources = PatchSources::blobs_only(&blobs);
+        let result = apply_go_redirect(
+            PURL,
+            MODULE,
+            VERSION,
+            &pristine,
+            root,
+            GO_PATCHES_DIR,
+            &files,
+            &sources,
+            None,
+            false,
+            MismatchPolicy::Warn,
+        )
+        .await;
+        assert!(result.success, "setup apply failed: {:?}", result.error);
+
+        // Drift the copy so the in-sync hot path is skipped and the rebuild
+        // leg runs.
+        let copy_dir = root.join(".socket/go-patches/github.com/foo/bar@v1.4.2");
+        tokio::fs::write(copy_dir.join("bar.go"), b"corrupted")
+            .await
+            .unwrap();
+
+        // Re-apply with EMPTY blob sources → the apply pipeline fails after
+        // the copy was already rebuilt from pristine.
+        let empty = root.join(".socket/empty-blobs");
+        tokio::fs::create_dir_all(&empty).await.unwrap();
+        let empty_sources = PatchSources::blobs_only(&empty);
+        let result = apply_go_redirect(
+            PURL,
+            MODULE,
+            VERSION,
+            &pristine,
+            root,
+            GO_PATCHES_DIR,
+            &files,
+            &empty_sources,
+            None,
+            false,
+            MismatchPolicy::Warn,
+        )
+        .await;
+        assert!(!result.success, "re-apply with no blobs must fail");
+
+        assert!(!copy_dir.exists(), "failed copy must be rolled back");
+        let entries = read_replace_entries(root).await;
+        assert!(
+            !entries
+                .iter()
+                .any(|e| e.module == MODULE && e.socket_owned()),
+            "a socket-owned replace must not survive pointing at a deleted \
+             copy (go.mod would brick the build): {entries:?}"
+        );
+    }
+
+    /// Same invariant when the pristine source itself is gone: `fresh_copy`
+    /// force-removes the stale copy FIRST and then fails walking the missing
+    /// source, so without cleanup the directive dangles at a deleted dir.
+    #[tokio::test]
+    async fn test_failed_recopy_missing_pristine_drops_directive() {
+        let (dir, blobs, pristine, files, _after) = fixture().await;
+        let root = dir.path();
+        let sources = PatchSources::blobs_only(&blobs);
+        let result = apply_go_redirect(
+            PURL,
+            MODULE,
+            VERSION,
+            &pristine,
+            root,
+            GO_PATCHES_DIR,
+            &files,
+            &sources,
+            None,
+            false,
+            MismatchPolicy::Warn,
+        )
+        .await;
+        assert!(result.success, "setup apply failed: {:?}", result.error);
+
+        // Drift the copy, then make the pristine source vanish (evicted
+        // module cache).
+        let copy_dir = root.join(".socket/go-patches/github.com/foo/bar@v1.4.2");
+        tokio::fs::write(copy_dir.join("bar.go"), b"corrupted")
+            .await
+            .unwrap();
+        tokio::fs::remove_dir_all(&pristine).await.unwrap();
+
+        let result = apply_go_redirect(
+            PURL,
+            MODULE,
+            VERSION,
+            &pristine,
+            root,
+            GO_PATCHES_DIR,
+            &files,
+            &sources,
+            None,
+            false,
+            MismatchPolicy::Warn,
+        )
+        .await;
+        assert!(
+            !result.success,
+            "re-apply with no pristine source must fail"
+        );
+
+        assert!(
+            !copy_dir.exists(),
+            "fresh_copy removed the stale copy before failing"
+        );
+        let entries = read_replace_entries(root).await;
+        assert!(
+            !entries
+                .iter()
+                .any(|e| e.module == MODULE && e.socket_owned()),
+            "a socket-owned replace must not survive pointing at a deleted \
+             copy (go.mod would brick the build): {entries:?}"
+        );
     }
 
     #[tokio::test]

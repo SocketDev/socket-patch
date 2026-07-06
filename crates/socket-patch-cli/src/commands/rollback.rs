@@ -276,7 +276,9 @@ pub async fn run(args: RollbackArgs) -> i32 {
                 }))
                 .unwrap()
             );
-        } else if !args.common.silent {
+        } else {
+            // Errors print even under --silent ("errors only", never
+            // "nothing"): exit 1 with no message would be undiagnosable.
             eprintln!("Manifest not found at {}", manifest_path.display());
         }
         return 1;
@@ -472,7 +474,9 @@ pub async fn run(args: RollbackArgs) -> i32 {
                     }))
                     .unwrap()
                 );
-            } else if !args.common.silent {
+            } else {
+                // Errors print even under --silent ("errors only", never
+                // "nothing"): exit 1 with no message would be undiagnosable.
                 eprintln!("Error: {e}");
             }
             1
@@ -607,7 +611,10 @@ async fn rollback_patches_inner(
     let missing_blobs = get_missing_before_blobs(&gate_manifest, &blobs_path).await;
     if !missing_blobs.is_empty() {
         if args.common.offline {
-            if !args.common.silent && !args.common.json {
+            // Errors print even under --silent ("errors only", never
+            // "nothing"): this bail is the run's ONLY diagnostic — the JSON
+            // envelope carries a contentless partial_failure.
+            if !args.common.json {
                 eprintln!(
                     "Error: {} blob(s) are missing and --offline mode is enabled.",
                     missing_blobs.len()
@@ -635,7 +642,9 @@ async fn rollback_patches_inner(
         // blobs and spuriously abort a mixed local-go rollback.
         let still_missing = get_missing_before_blobs(&gate_manifest, &blobs_path).await;
         if !still_missing.is_empty() {
-            if !args.common.silent && !args.common.json {
+            // Errors print even under --silent — same contract as the
+            // offline bail above.
+            if !args.common.json {
                 eprintln!(
                     "{} blob(s) could not be downloaded. Cannot rollback.",
                     still_missing.len()
@@ -745,7 +754,10 @@ async fn rollback_patches_inner(
 
             if !result.success {
                 has_errors = true;
-                if !args.common.silent && !args.common.json {
+                // Errors print even under --silent ("errors only", never
+                // "nothing"): with the summary muted, this line is the
+                // silent run's only failure diagnostic.
+                if !args.common.json {
                     eprintln!(
                         "Failed to rollback {}: {}",
                         purl,
@@ -762,30 +774,31 @@ async fn rollback_patches_inner(
 
 // Export for use by remove command. The third tuple element lists
 // vendor-owned purls that were excluded from in-place rollback (benign).
-#[allow(clippy::too_many_arguments)]
+//
+// Takes the caller's `GlobalArgs` as the base (only the per-call fields are
+// overridden): the nested missing-blob download builds its API client from
+// `api_client_overrides()`, so flag-passed `--api-url` / `--api-token` /
+// `--org` / `--proxy-url` must flow through. A from-scratch
+// `GlobalArgs::default()` here silently dropped them — with credentials
+// passed as flags the nested client was unauthenticated and pointed at the
+// public proxy, so the download failed and the whole `remove` aborted with
+// `rollback_failed` (see tests/remove_rollback_api_overrides.rs).
 pub(crate) async fn rollback_patches(
-    cwd: &Path,
+    common: &crate::args::GlobalArgs,
     manifest_path: &Path,
     identifier: Option<&str>,
     dry_run: bool,
     silent: bool,
-    offline: bool,
-    global: bool,
-    global_prefix: Option<PathBuf>,
     ecosystems: Option<Vec<String>>,
 ) -> Result<(bool, Vec<RollbackResult>, Vec<String>), String> {
     let args = RollbackArgs {
         identifier: identifier.map(String::from),
         common: crate::args::GlobalArgs {
-            cwd: cwd.to_path_buf(),
             manifest_path: manifest_path.display().to_string(),
-            offline,
-            global,
-            global_prefix,
             ecosystems,
             silent,
             dry_run,
-            ..crate::args::GlobalArgs::default()
+            ..common.clone()
         },
         one_off: false,
     };
@@ -1412,15 +1425,17 @@ mod tests {
         // With no npm package installed under the tempdir the run finds
         // nothing to do — but it must get past the gate and report success,
         // not abort over a blob it would never read.
+        let common = crate::args::GlobalArgs {
+            cwd: root.to_path_buf(),
+            offline: true,
+            ..crate::args::GlobalArgs::default()
+        };
         let (success, results, _vendored_skipped) = rollback_patches(
-            root,
+            &common,
             &manifest_path,
             None,
             false, // dry_run
             true,  // silent
-            true,  // offline
-            false, // global
-            None,
             Some(vec!["npm".to_string()]),
         )
         .await
@@ -1459,16 +1474,18 @@ mod tests {
             .unwrap();
         // The npm before-blob is deliberately absent.
 
+        let common = crate::args::GlobalArgs {
+            cwd: root.to_path_buf(),
+            offline: true,
+            ..crate::args::GlobalArgs::default()
+        };
         let (success, results, _vendored_skipped) = rollback_patches(
-            root,
+            &common,
             &manifest_path,
             None,
             false, // dry_run
             true,  // silent
-            true,  // offline
-            false, // global
-            None,
-            None, // no ecosystem filter — the npm patch is in scope
+            None,  // no ecosystem filter — the npm patch is in scope
         )
         .await
         .expect("rollback must not error");

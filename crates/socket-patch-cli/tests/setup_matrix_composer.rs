@@ -24,6 +24,9 @@
 #[path = "setup_matrix_common/mod.rs"]
 mod smc;
 
+#[path = "common/mod.rs"]
+mod common;
+
 /// Documentation/negative-control pass through the shared Docker matrix.
 /// Kept for parity with the other ecosystems and to run the composer
 /// negative controls when Docker + the `composer` image are present.
@@ -42,32 +45,24 @@ fn composer() {
 // ─────────────────────────────────────────────────────────────────────────
 mod host_guard {
     use std::path::Path;
-    use std::process::Command;
 
     /// A realistic composer-only project: a PHP manifest requiring the
     /// same package the matrix targets, and nothing the npm/Python/Cargo
     /// detectors would recognise.
     const COMPOSER_JSON: &str = "{\n  \"name\": \"acme/widget\",\n  \"require\": {\n    \"monolog/monolog\": \"3.5.0\"\n  }\n}\n";
 
-    /// Absolute path to the binary under test, via cargo's `CARGO_BIN_EXE_*`.
-    fn binary() -> std::path::PathBuf {
-        env!("CARGO_BIN_EXE_socket-patch").into()
-    }
-
     /// Run the CLI with `args` in `cwd`; returns `(exit_code, stdout, stderr)`.
-    /// `SOCKET_API_TOKEN` is stripped so nothing reaches authed endpoints.
+    /// Delegates to the shared `common::run_with_env`, which seeds-then-scrubs
+    /// the binary's entire ambient `SOCKET_*` surface — stripping only
+    /// `SOCKET_API_TOKEN` (as this helper originally did) left the guard at
+    /// the mercy of the parent shell: an ambient `SOCKET_ECOSYSTEMS=cargo`
+    /// filtered composer out of scope (first `--check` exits 0 as `no_files`),
+    /// and `SOCKET_DRY_RUN=true` no-ops the very write under test.
+    /// `SOCKET_TELEMETRY_DISABLED=1` is injected because this file promises
+    /// "no network": each real `setup` run otherwise fire-and-forgets a live
+    /// `patch_setup` POST to the telemetry endpoint.
     fn run(cwd: &Path, args: &[&str]) -> (i32, String, String) {
-        let out = Command::new(binary())
-            .args(args)
-            .current_dir(cwd)
-            .env_remove("SOCKET_API_TOKEN")
-            .output()
-            .expect("failed to execute socket-patch binary");
-        (
-            out.status.code().unwrap_or(-1),
-            String::from_utf8_lossy(&out.stdout).to_string(),
-            String::from_utf8_lossy(&out.stderr).to_string(),
-        )
+        super::common::run_with_env(cwd, args, &[("SOCKET_TELEMETRY_DISABLED", "1")])
     }
 
     /// Parse the CLI's `--json` stdout into the single top-level object the
