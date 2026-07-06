@@ -109,22 +109,25 @@ pub(crate) async fn dispatch_vendor_one(
     let eco = ecosystem_dir_for_purl(purl)?;
 
     // Prebuilt service downloads now cover every vendorable ecosystem: npm,
-    // pypi, cargo, golang, composer, and gem. Gem's `.gem` archive doesn't
-    // carry the eval-able stub gemspec a bundler path source wants, so the
-    // converter generates it and serves it as a `gem-stub-gemspec` second
-    // artifact alongside the `.gem` (the gem backend downloads + verifies both).
+    // pypi, cargo, golang, composer, gem, nuget, and maven. Gem's `.gem`
+    // archive doesn't carry the eval-able stub gemspec a bundler path source
+    // wants, so the converter generates it and serves it as a
+    // `gem-stub-gemspec` second artifact alongside the `.gem` (the gem backend
+    // downloads + verifies both).
     // Under fail-closed `service` mode, refuse any not-covered ecosystem with a
     // clear message rather than silently building (which would violate the
     // contract). Under `auto`/`build` they fall through to the local build.
-    const SERVICE_ECOSYSTEMS: &[&str] =
-        &["npm", "pypi", "cargo", "golang", "composer", "gem", "nuget"];
+    const SERVICE_ECOSYSTEMS: &[&str] = &[
+        "npm", "pypi", "cargo", "golang", "composer", "gem", "nuget", "maven",
+    ];
     if let Some(cfg) = service {
         if cfg.source.requires_service() && !SERVICE_ECOSYSTEMS.contains(&eco) {
             return Some(VendorOutcome::Refused {
                 code: "vendor_service_unsupported_ecosystem",
                 detail: format!(
                     "--vendor-source=service is not supported for `{eco}` \
-                     (prebuilt downloads cover npm, pypi, cargo, golang, composer, and gem); \
+                     (prebuilt downloads cover npm, pypi, cargo, golang, composer, \
+                     gem, nuget, and maven); \
                      use --vendor-source=auto or --vendor-source=build"
                 ),
             });

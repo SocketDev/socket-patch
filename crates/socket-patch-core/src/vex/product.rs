@@ -140,13 +140,13 @@ fn scan_toml_section(content: &str, section: &str) -> Option<(String, String)> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        if line.starts_with('[') {
+        if let Some(rest) = line.strip_prefix('[') {
             // A header may carry a trailing comment (`[package] # x`)
             // and whitespace inside the brackets (`[ package ]`) —
             // both valid TOML that cargo and tomllib accept. Anything
             // else after the closing bracket means a different (or
             // malformed) section.
-            in_section = match line[1..].split_once(']') {
+            in_section = match rest.split_once(']') {
                 Some((inner, after)) => {
                     let after = after.trim_start();
                     (after.is_empty() || after.starts_with('#')) && inner.trim() == section
