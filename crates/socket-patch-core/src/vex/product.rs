@@ -134,7 +134,6 @@ fn scan_toml_section(content: &str, section: &str) -> Option<(String, String)> {
     let mut in_section = false;
     let mut name: Option<String> = None;
     let mut version: Option<String> = None;
-    let header = format!("[{section}]");
 
     for raw in content.lines() {
         let line = raw.trim();
@@ -142,14 +141,15 @@ fn scan_toml_section(content: &str, section: &str) -> Option<(String, String)> {
             continue;
         }
         if line.starts_with('[') {
-            // A header may carry a trailing comment (`[package] # x`) —
-            // valid TOML that cargo and tomllib both accept. Anything
+            // A header may carry a trailing comment (`[package] # x`)
+            // and whitespace inside the brackets (`[ package ]`) —
+            // both valid TOML that cargo and tomllib accept. Anything
             // else after the closing bracket means a different (or
             // malformed) section.
-            in_section = match line.strip_prefix(header.as_str()) {
-                Some(rest) => {
-                    let rest = rest.trim_start();
-                    rest.is_empty() || rest.starts_with('#')
+            in_section = match line[1..].split_once(']') {
+                Some((inner, after)) => {
+                    let after = after.trim_start();
+                    (after.is_empty() || after.starts_with('#')) && inner.trim() == section
                 }
                 None => false,
             };
@@ -249,13 +249,36 @@ fn scan_remote_origin_url(content: &str) -> Option<String> {
         if key.trim() != "url" {
             continue;
         }
-        let value = value.trim();
+        let value = parse_git_config_value(value);
         if value.is_empty() {
             return None;
         }
-        return Some(value.to_string());
+        return Some(value);
     }
     None
+}
+
+/// Reduce the raw right-hand side of a git config `key = value` line
+/// to the value git itself reports (verified against `git config -f`):
+/// `#`/`;` begin a comment outside double quotes — no preceding
+/// whitespace required — `"` quotes a segment verbatim (comment chars
+/// inside stay literal), and `\` escapes the next character (passed
+/// through literally; `\n`-style control escapes never occur in urls).
+/// Trailing unquoted whitespace is stripped.
+fn parse_git_config_value(raw: &str) -> String {
+    let mut out = String::new();
+    let mut in_quotes = false;
+    let mut chars = raw.trim_start().chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => in_quotes = !in_quotes,
+            '\\' => out.extend(chars.next()),
+            '#' | ';' if !in_quotes => break,
+            _ => out.push(c),
+        }
+    }
+    out.truncate(out.trim_end().len());
+    out
 }
 
 /// Convert a git remote URL to a PURL when possible, else return the
@@ -1370,6 +1393,129 @@ mod tests {
     #[test]
     fn scan_origin_url_commented_foreign_header_closes_section() {
         let cfg = "[remote \"origin\"]\n[remote \"upstream\"] # backup\n\turl = git@github.com:other/repo.git\n";
+        assert!(scan_remote_origin_url(cfg).is_none());
+    }
+
+    // ── Regression: whitespace inside TOML table headers ──────────
+    // TOML permits whitespace around the key in a table header
+    // (`[ package ]`, `[project ]`) — tomllib and cargo both accept
+    // it. The exact `strip_prefix("[package]")` match treated such a
+    // header as a foreign section, so a manifest the user's own
+    // toolchain accepts yielded no PURL. Mirrors the cargo crawler's
+    // `parse_table_header`, which already trims inside the brackets.
+
+    #[test]
+    fn scan_toml_section_header_with_inner_whitespace() {
+        let toml = "[ package ]\nname = \"x\"\nversion = \"1.0\"\n";
+        let (n, v) = scan_toml_section(toml, "package").unwrap();
+        assert_eq!(n, "x");
+        assert_eq!(v, "1.0");
+    }
+
+    /// Spaced header carrying a trailing comment — both relaxations
+    /// compose.
+    #[test]
+    fn scan_toml_section_spaced_header_with_trailing_comment() {
+        let toml = "[ package ] # metadata\nname = \"x\"\nversion = \"1.0\"\n";
+        let (n, v) = scan_toml_section(toml, "package").unwrap();
+        assert_eq!(n, "x");
+        assert_eq!(v, "1.0");
+    }
+
+    /// A spaced FOREIGN header must still close the current section.
+    #[test]
+    fn scan_toml_spaced_foreign_header_still_closes_section() {
+        let toml = "[package]\nname = \"x\"\n[ dependencies ]\nversion = \"9.9\"\n";
+        assert!(scan_toml_section(toml, "package").is_none());
+    }
+
+    /// Junk (non-comment) after the closing bracket is still rejected
+    /// as a malformed/foreign header — the relaxation is inside the
+    /// brackets only.
+    #[test]
+    fn scan_toml_header_with_trailing_junk_still_rejected() {
+        let toml = "[package] junk\nname = \"x\"\nversion = \"1.0\"\n";
+        assert!(scan_toml_section(toml, "package").is_none());
+    }
+
+    #[tokio::test]
+    async fn detect_cargo_toml_spaced_header() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[ package ]\nname = \"spaced-rust\"\nversion = \"1.0.0\"\n",
+        )
+        .await
+        .unwrap();
+        let r = detect_product(dir.path()).await;
+        assert_eq!(r.purl.as_deref(), Some("pkg:cargo/spaced-rust@1.0.0"));
+    }
+
+    #[tokio::test]
+    async fn detect_pyproject_spaced_header() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            dir.path().join("pyproject.toml"),
+            "[project ]\nname = \"spaced-py\"\nversion = \"0.4.0\"\n",
+        )
+        .await
+        .unwrap();
+        let r = detect_product(dir.path()).await;
+        assert_eq!(r.purl.as_deref(), Some("pkg:pypi/spaced-py@0.4.0"));
+    }
+
+    // ── Regression: git config VALUE comments and quoting ─────────
+    // git strips a `;`/`#` comment from an unquoted value — with or
+    // without preceding whitespace — and unquotes `"..."` segments
+    // (comment chars inside quotes stay literal). Verified against
+    // `git config -f`. Returning the raw text produced a WRONG
+    // product identity, e.g. `pkg:github/foo/bar.git ; mirror` from
+    // `url = git@github.com:foo/bar.git ; mirror`.
+
+    #[test]
+    fn scan_origin_url_strips_trailing_semicolon_comment() {
+        let cfg = "[remote \"origin\"]\n\turl = git@github.com:foo/bar.git ; mirror note\n";
+        assert_eq!(
+            scan_remote_origin_url(cfg).as_deref(),
+            Some("git@github.com:foo/bar.git")
+        );
+    }
+
+    /// git starts the comment at `#` even with NO whitespace before
+    /// it: `url = https://host/a#frag` resolves to `https://host/a`.
+    #[test]
+    fn scan_origin_url_strips_hash_comment_without_space() {
+        let cfg = "[remote \"origin\"]\n\turl = https://host/a#frag\n";
+        assert_eq!(scan_remote_origin_url(cfg).as_deref(), Some("https://host/a"));
+    }
+
+    /// A double-quoted value is unquoted, matching git.
+    #[test]
+    fn scan_origin_url_unquotes_double_quoted_value() {
+        let cfg = "[remote \"origin\"]\n\turl = \"git@github.com:foo/bar.git\"\n";
+        assert_eq!(
+            scan_remote_origin_url(cfg).as_deref(),
+            Some("git@github.com:foo/bar.git")
+        );
+    }
+
+    /// Comment characters INSIDE a quoted segment are literal value
+    /// bytes, not comment starts — `"https://host/a#frag"` keeps its
+    /// fragment.
+    #[test]
+    fn scan_origin_url_comment_char_inside_quotes_is_literal() {
+        let cfg = "[remote \"origin\"]\n\turl = \"https://host/a#frag\"\n";
+        assert_eq!(
+            scan_remote_origin_url(cfg).as_deref(),
+            Some("https://host/a#frag")
+        );
+    }
+
+    /// A value that is ONLY a comment (`url = ; x`) is an empty url —
+    /// same fall-through as the existing `url = ` case.
+    #[test]
+    fn scan_origin_url_value_that_is_only_comment_is_none() {
+        let cfg = "[remote \"origin\"]\n\turl = ; commented out\n";
         assert!(scan_remote_origin_url(cfg).is_none());
     }
 

@@ -424,6 +424,10 @@ pub async fn get_global_python_site_packages() -> Vec<PathBuf> {
     // uv tools — platform-specific install root.
     #[cfg(target_os = "macos")]
     {
+        // Legacy/secondary location only: uv follows XDG conventions on
+        // macOS (`uv tool dir` → ~/.local/share/uv/tools, covered by the
+        // not(windows) scan below), but older layouts used the platform
+        // data dir, so keep scanning it too.
         let uv_base = home_dir
             .join("Library")
             .join("Application Support")
@@ -446,8 +450,11 @@ pub async fn get_global_python_site_packages() -> Vec<PathBuf> {
             }
         }
     }
-    #[cfg(all(not(target_os = "macos"), not(windows)))]
+    #[cfg(not(windows))]
     {
+        // uv uses XDG paths on BOTH Linux and macOS (`uv tool dir` →
+        // ~/.local/share/uv/tools; verified against a real uv install —
+        // macOS does NOT get an Application Support tool dir).
         let uv_base = home_dir
             .join(".local")
             .join("share")
@@ -509,6 +516,9 @@ pub async fn get_global_python_site_packages() -> Vec<PathBuf> {
 ///   * `requirements.txt` — pip-compile / bare requirements
 ///   * `uv.lock` — uv-managed projects (PEP 751 export sibling is
 ///     `pylock.toml` but in practice `uv.lock` is what ships)
+///   * `Pipfile` / `Pipfile.lock` — pipenv projects, which commonly
+///     ship NEITHER pyproject.toml nor requirements.txt and keep
+///     their venvs out-of-tree (`~/.local/share/virtualenvs`)
 pub async fn is_python_project(cwd: &Path) -> bool {
     let markers = [
         "pyproject.toml",
@@ -516,6 +526,8 @@ pub async fn is_python_project(cwd: &Path) -> bool {
         "setup.cfg",
         "requirements.txt",
         "uv.lock",
+        "Pipfile",
+        "Pipfile.lock",
     ];
     for m in &markers {
         if tokio::fs::metadata(cwd.join(m)).await.is_ok() {
@@ -614,11 +626,16 @@ impl PythonCrawler {
     ) -> Result<HashMap<String, CrawledPackage>, std::io::Error> {
         let mut result = HashMap::new();
 
-        // Build lookup: canonicalized-name@version -> purl
+        // Build lookup: canonicalized-name@version -> purl. The API serves
+        // purls percent-encoded (a PEP 440 local/epoch version carries
+        // `+`/`!`, arriving as `%2B`/`%21`), so decode the coordinates
+        // before keying or the installed package never matches.
         let mut purl_lookup: HashMap<String, &str> = HashMap::new();
         for purl in purls {
             if let Some((name, version)) = crate::utils::purl::parse_pypi_purl(purl) {
-                let key = format!("{}@{}", canonicalize_pypi_name(name), version);
+                let name = crate::utils::purl::percent_decode_purl_component(name);
+                let version = crate::utils::purl::percent_decode_purl_component(version);
+                let key = format!("{}@{}", canonicalize_pypi_name(&name), version);
                 purl_lookup.insert(key, purl.as_str());
             }
         }

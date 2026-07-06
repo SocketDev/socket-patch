@@ -299,6 +299,29 @@ fn sanitize_error_message_replaces_home_with_tilde() {
 
 #[test]
 #[serial]
+fn sanitize_error_message_root_home_leaves_message_unchanged() {
+    // Containers running as an unmapped UID commonly get HOME=/ (and some
+    // init systems hand root HOME=/). A "/" home carries no user-identifying
+    // information, so there is nothing to redact — and naively replacing it
+    // would rewrite EVERY path separator in the message
+    // ("/etc/hosts" -> "~etc~hosts"), garbling the telemetry payload. Same
+    // splice-corruption class as the empty-HOME guard already in the impl.
+    with_home("/", || {
+        let msg = "failed to read /etc/hosts and /tmp/socket/blob.bin";
+        assert_eq!(sanitize_error_message(msg), msg);
+    });
+    // Trailing-slash homes must still redact, and must not eat the
+    // separator that follows the home prefix.
+    with_home("/home/socket-sentinel/", || {
+        assert_eq!(
+            sanitize_error_message("error at /home/socket-sentinel/.cache/x"),
+            "error at ~/.cache/x"
+        );
+    });
+}
+
+#[test]
+#[serial]
 fn sanitize_error_message_falls_back_to_userprofile() {
     // On Windows-style hosts HOME may be absent and USERPROFILE is the source.
     let saved: Vec<(&str, Option<String>)> = HOME_VARS

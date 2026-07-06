@@ -189,11 +189,30 @@ fn pyproject_add(content: &str) -> Result<Option<String>, String> {
         .and_then(|t| t.get("poetry"))
         .and_then(Item::as_table)
         .is_some();
+    // PEP 621 forbids a field that is both listed in `dynamic` and set
+    // statically, so a project with `dynamic = ["dependencies"]` (setuptools/
+    // hatch dynamic metadata, or Poetry 2.x keeping its dependency surface in
+    // `[tool.poetry.dependencies]`) must not gain a static array — every
+    // backend would refuse to build the manifest.
+    let dynamic_deps = doc
+        .get("project")
+        .and_then(Item::as_table)
+        .and_then(|t| t.get("dynamic"))
+        .and_then(Item::as_array)
+        .map(|a| a.iter().any(|v| v.as_str() == Some("dependencies")))
+        .unwrap_or(false);
 
-    let changed = if has_poetry && !real_pep621 {
+    let changed = if has_poetry && (!real_pep621 || dynamic_deps) {
         poetry_add(&mut doc)?
-    } else if real_pep621 {
+    } else if real_pep621 && !dynamic_deps {
         pep621_add(&mut doc)?
+    } else if dynamic_deps {
+        return Err(
+            "pyproject.toml declares `[project].dependencies` as dynamic; adding a static \
+             dependencies array would make the manifest invalid — declare the hook in the \
+             source the dynamic metadata is resolved from (or use requirements.txt) instead"
+                .to_string(),
+        );
     } else {
         // Neither surface exists (e.g. a `[build-system]`-only or tool-config-only
         // pyproject.toml of a setup.py/setup.cfg project). Synthesizing a
@@ -948,7 +967,12 @@ mod tests {
             .unwrap();
         let res = remove_hook_dependency(&req, ManifestKind::Requirements, false).await;
         assert_eq!(res.status, PthStatus::Updated);
-        let mode = tokio::fs::metadata(&req).await.unwrap().permissions().mode() & 0o777;
+        let mode = tokio::fs::metadata(&req)
+            .await
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
         assert_eq!(mode, 0o744, "remove must not reset requirements.txt mode");
     }
 

@@ -1152,6 +1152,71 @@ async fn find_by_purls_resolves_nested_only_install() {
     assert_eq!(d.path, a_nm.join("@s").join("d"));
 }
 
+/// Regression: a FIFO planted at a `package.json` path must be skipped
+/// promptly, never opened blockingly. `tokio::fs::read_to_string` performs a
+/// plain `open(2)`, which on a FIFO waits for a writer that never comes — so
+/// one special file inside `node_modules` (a malicious package's postinstall
+/// can create one; npm itself never extracts FIFOs) wedged `scan`
+/// (crawl_all) and `apply` (find_by_purls) indefinitely, with no error and
+/// no timeout. Same class as the `open_regular_file` guards in
+/// `patch/file_hash.rs`, the cargo sidecar, and the vendor harvest/verify
+/// readers.
+#[cfg(unix)]
+#[tokio::test]
+async fn read_package_json_rejects_fifo_without_hanging() {
+    let tmp = tempfile::tempdir().unwrap();
+    let nm = tmp.path().join("node_modules");
+    let fifo_pkg = nm.join("fifo-pkg");
+    tokio::fs::create_dir_all(&fifo_pkg).await.unwrap();
+    let fifo = fifo_pkg.join("package.json");
+    let status = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("mkfifo must be runnable");
+    assert!(status.success(), "mkfifo failed");
+    // A sibling real package proves the tree stays crawlable around the FIFO.
+    stage_npm_pkg(&nm, "real-pkg", "1.0.0").await;
+
+    // On timeout the open is wedged in a `spawn_blocking` thread that the
+    // runtime waits for on shutdown; connect a writer to release it so the
+    // test can FAIL instead of hanging the whole suite.
+    let release_and_panic = |what: &str| -> ! {
+        let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
+        panic!("{what} must complete promptly with a FIFO package.json in the tree");
+    };
+    let deadline = std::time::Duration::from_secs(5);
+
+    let Ok(direct) = tokio::time::timeout(deadline, read_package_json(&fifo)).await else {
+        release_and_panic("read_package_json");
+    };
+    assert_eq!(direct, None, "a FIFO is not a valid package.json");
+
+    let crawler = NpmCrawler;
+    let Ok(crawled) = tokio::time::timeout(deadline, crawler.crawl_all(&options_at(tmp.path()))).await
+    else {
+        release_and_panic("crawl_all (scan)");
+    };
+    let names: Vec<&str> = crawled.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["real-pkg"],
+        "the sibling real package must still be discovered, the FIFO skipped"
+    );
+
+    let Ok(found) = tokio::time::timeout(
+        deadline,
+        crawler.find_by_purls(&nm, &["pkg:npm/fifo-pkg@1.0.0".to_string()]),
+    )
+    .await
+    else {
+        release_and_panic("find_by_purls (apply's resolver)");
+    };
+    assert!(
+        found.unwrap().is_empty(),
+        "the FIFO-backed purl must resolve to nothing"
+    );
+}
+
 /// When the same `name@version` exists at the root *and* nested, the root
 /// copy must win (shallowest-first), preserving the pre-existing behavior
 /// for everything resolvable at the root.

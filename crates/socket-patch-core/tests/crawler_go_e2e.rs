@@ -421,6 +421,57 @@ async fn get_module_cache_paths_home_go_pkg_mod_fallback() {
     );
 }
 
+/// A set-but-EMPTY `HOME` must count as unset, matching the empty guard on
+/// `GOMODCACHE` and the empty-entry filter on `GOPATH`: honoring `""` makes
+/// the last-resort fallback return the RELATIVE path `go/pkg/mod`, pointing
+/// every crawl and lookup at `<cwd>/go/pkg/mod` inside the user's project
+/// instead of a real module cache.
+#[tokio::test]
+#[serial]
+async fn get_module_cache_paths_empty_home_returns_no_paths() {
+    let tmp = tempfile::tempdir().unwrap();
+    tokio::fs::write(
+        tmp.path().join("go.mod"),
+        b"module example.com/test\n\ngo 1.21\n",
+    )
+    .await
+    .unwrap();
+    let prev_gomod = std::env::var("GOMODCACHE").ok();
+    let prev_gopath = std::env::var("GOPATH").ok();
+    let prev_home = std::env::var("HOME").ok();
+    let prev_profile = std::env::var("USERPROFILE").ok();
+    std::env::remove_var("GOMODCACHE");
+    std::env::remove_var("GOPATH");
+    std::env::remove_var("USERPROFILE");
+    std::env::set_var("HOME", "");
+
+    let crawler = GoCrawler;
+    let paths = crawler
+        .get_module_cache_paths(&options_at(tmp.path()))
+        .await
+        .unwrap();
+
+    if let Some(v) = prev_gomod {
+        std::env::set_var("GOMODCACHE", v);
+    }
+    if let Some(v) = prev_gopath {
+        std::env::set_var("GOPATH", v);
+    }
+    if let Some(v) = prev_home {
+        std::env::set_var("HOME", v);
+    } else {
+        std::env::remove_var("HOME");
+    }
+    if let Some(v) = prev_profile {
+        std::env::set_var("USERPROFILE", v);
+    }
+
+    assert!(
+        paths.is_empty(),
+        "empty HOME must not yield a CWD-relative go/pkg/mod cache path; got {paths:?}"
+    );
+}
+
 #[tokio::test]
 #[serial]
 async fn get_module_cache_paths_gopath_fallback_when_gomodcache_unset() {

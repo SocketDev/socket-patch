@@ -137,6 +137,8 @@ async fn cargo_home_fallback_to_home_dot_cargo() {
     }
     if let Some(v) = prev_home {
         std::env::set_var("HOME", v);
+    } else {
+        std::env::remove_var("HOME");
     }
 
     // Exactly the one staged index dir — proves the fallback resolved to
@@ -437,26 +439,31 @@ fn parse_cargo_toml_version_workspace_returns_none() {
     assert_eq!(parse_cargo_toml_name_version(toml), None);
 }
 
-/// `verify_crate_at_path` with a dir-name-only match (workspace
-/// version) but a mismatched purl name — must return false. Exercises
-/// the `parsed_name == name && parsed_version == version` false arm
-/// (cargo_crawler.rs:344-346).
+/// `verify_crate_at_path` with a dir-name-only parse (workspace
+/// version) whose result mismatches the requested coordinates — must
+/// return false. The vendor probe for `pkg:cargo/sha-1@0.10.6` is the
+/// staged `sha-1/` dir itself: its manifest bails (workspace version)
+/// and its dir name parses as ("sha", "1") ≠ ("sha-1", "0.10.6"), so
+/// the version cannot be confirmed and the crate must be rejected.
+/// Exercises the `n == name && v == version` false arm
+/// (cargo_crawler.rs:349).
 #[tokio::test]
 async fn find_by_purls_verify_fallback_dir_name_mismatch_returns_empty() {
     let tmp = tempfile::tempdir().unwrap();
-    let pkg = tmp.path().join("real-crate-1.0.0");
+    let pkg = tmp.path().join("sha-1");
     tokio::fs::create_dir(&pkg).await.unwrap();
     tokio::fs::write(
         pkg.join("Cargo.toml"),
-        "[package]\nname = \"real-crate\"\nversion.workspace = true\n",
+        "[package]\nname = \"sha-1\"\nversion.workspace = true\n",
     )
     .await
     .unwrap();
 
     let crawler = CargoCrawler;
-    // Ask for a name that doesn't match the dir layout.
+    // Registry probe `sha-1-0.10.6/` misses; vendor probe `sha-1/` hits
+    // the staged dir and must fail verification.
     let result = crawler
-        .find_by_purls(tmp.path(), &["pkg:cargo/other-crate@1.0.0".to_string()])
+        .find_by_purls(tmp.path(), &["pkg:cargo/sha-1@0.10.6".to_string()])
         .await
         .unwrap();
     assert!(result.is_empty(), "dir-name mismatch must reject");
@@ -644,21 +651,25 @@ async fn crawl_all_handles_unreadable_src_path() {
 }
 
 /// `verify_crate_at_path` returns false when neither the Cargo.toml
-/// parses NOR the dir-name parses — exercises the `else { false }`
-/// arm at line 345-346.
+/// parses NOR the dir-name parses. The vendor probe for
+/// `pkg:cargo/foo@1.0.0` is the staged `foo/` dir itself: its
+/// Cargo.toml is unparseable and `foo` has no `-<digit>` boundary, so
+/// both parsers fail and the crate must be rejected — exercises the
+/// dir-name-fallback `is_some_and` short-circuit on `None`
+/// (cargo_crawler.rs:346-349).
 #[tokio::test]
 async fn find_by_purls_verify_fails_when_both_parsers_fail() {
     let tmp = tempfile::tempdir().unwrap();
-    let bad = tmp.path().join("not-cargo-like-at-all");
+    let bad = tmp.path().join("foo");
     tokio::fs::create_dir(&bad).await.unwrap();
     tokio::fs::write(bad.join("Cargo.toml"), b"this is not toml")
         .await
         .unwrap();
 
     let crawler = CargoCrawler;
-    // The strict registry dir for `pkg:cargo/foo@1.0.0` is
-    // `tmp/foo-1.0.0/` (doesn't exist). The vendor dir `tmp/foo/`
-    // also doesn't exist. So neither layout matches and we get empty.
+    // Registry probe `tmp/foo-1.0.0/` misses; vendor probe `tmp/foo/`
+    // hits the staged dir, whose broken manifest and version-less dir
+    // name must both fail to verify.
     let result = crawler
         .find_by_purls(tmp.path(), &["pkg:cargo/foo@1.0.0".to_string()])
         .await

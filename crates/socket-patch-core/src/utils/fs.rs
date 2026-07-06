@@ -148,7 +148,10 @@ pub(crate) async fn entry_file_type(entry: &DirEntry) -> Option<FileType> {
 
 /// Resolve the user's home directory: `HOME`, then `USERPROFILE`
 /// (Windows), then a literal `"~"` — a harmless non-existent path so
-/// downstream joins probe nothing rather than panic. The shared
+/// downstream joins probe nothing rather than panic. A set-but-empty
+/// variable counts as unset: honoring `""` would turn every
+/// `home_dir().join(…)` probe into a CWD-relative path, pointing the
+/// crawlers at directories inside the user's project. The shared
 /// fallback chain for every crawler that scans well-known per-user
 /// package roots (`~/.cargo`, `~/.m2`, `~/.nuget`, …) and for
 /// telemetry's home-dir redaction; previously copy-pasted into each.
@@ -156,8 +159,10 @@ pub(crate) async fn entry_file_type(entry: &DirEntry) -> Option<FileType> {
 /// no-home-means-no-path chain instead.
 pub(crate) fn home_dir() -> PathBuf {
     let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_else(|_| "~".to_string());
+        .ok()
+        .filter(|h| !h.is_empty())
+        .or_else(|| std::env::var("USERPROFILE").ok().filter(|h| !h.is_empty()))
+        .unwrap_or_else(|| "~".to_string());
     PathBuf::from(home)
 }
 
@@ -472,6 +477,35 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(tokio::fs::read(&fresh).await.unwrap(), b"x");
+    }
+
+    /// Regression: a set-but-empty `HOME` (stripped CI/container/sudo
+    /// environments) must be treated as unset, exactly like the documented
+    /// no-home fallback. Honoring `""` made `home_dir()` return an empty
+    /// `PathBuf`, so every `home_dir().join(".cargo")`-style probe became a
+    /// CWD-relative path and the crawlers scanned directories inside the
+    /// user's project as if they were the per-user package roots.
+    #[test]
+    #[serial_test::serial]
+    fn home_dir_treats_empty_home_as_unset() {
+        let prev_home = std::env::var("HOME").ok();
+        let prev_profile = std::env::var("USERPROFILE").ok();
+        std::env::set_var("HOME", "");
+        std::env::set_var("USERPROFILE", "");
+        let home = home_dir();
+        match prev_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        match prev_profile {
+            Some(v) => std::env::set_var("USERPROFILE", v),
+            None => std::env::remove_var("USERPROFILE"),
+        }
+        assert_eq!(
+            home,
+            PathBuf::from("~"),
+            "empty HOME/USERPROFILE must fall back to the harmless `~` sentinel"
+        );
     }
 
     /// `entry_file_type` is the symlink-aware counterpart: it reports

@@ -120,7 +120,25 @@ pub async fn verify_file_rollback(
             }
             Ok(_) => {}
         }
-        let current_hash = compute_file_git_sha256(&filepath).await.unwrap_or_default();
+        // A hash failure (directory/FIFO planted at the path, unreadable
+        // file, dangling symlink target) is the same unverifiable state as a
+        // stat failure above and must fail closed with the real error — a
+        // swallowed error would misreport "modified after patching" with a
+        // fabricated empty hash, and would compare equal to an empty
+        // `after_hash`, wrongly clearing the entry for deletion.
+        let current_hash = match compute_file_git_sha256(&filepath).await {
+            Ok(h) => h,
+            Err(e) => {
+                return VerifyRollbackResult {
+                    file: file_name.to_string(),
+                    status: VerifyRollbackStatus::NotFound,
+                    message: Some(format!("Failed to hash file: {}", e)),
+                    current_hash: None,
+                    expected_hash: None,
+                    target_hash: None,
+                };
+            }
+        };
         if current_hash == file_info.after_hash {
             return VerifyRollbackResult {
                 file: file_name.to_string(),

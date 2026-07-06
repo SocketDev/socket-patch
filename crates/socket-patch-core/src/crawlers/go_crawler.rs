@@ -248,9 +248,14 @@ impl GoCrawler {
                 return Some(first.join("pkg").join("mod"));
             }
         }
+        // A set-but-empty HOME/USERPROFILE counts as unset, matching the
+        // GOMODCACHE and GOPATH guards above: honoring `""` would yield the
+        // RELATIVE path `go/pkg/mod`, pointing the crawl at a directory
+        // inside the user's project instead of a real module cache.
         let home = std::env::var("HOME")
-            .or_else(|_| std::env::var("USERPROFILE"))
-            .ok()?;
+            .ok()
+            .filter(|h| !h.is_empty())
+            .or_else(|| std::env::var("USERPROFILE").ok().filter(|h| !h.is_empty()))?;
         Some(PathBuf::from(home).join("go").join("pkg").join("mod"))
     }
 

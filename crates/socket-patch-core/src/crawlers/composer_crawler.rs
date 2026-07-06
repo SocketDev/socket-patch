@@ -236,10 +236,14 @@ async fn get_composer_home() -> Option<PathBuf> {
         }
     }
 
-    // Platform defaults
+    // Platform defaults. A set-but-empty HOME counts as unset: honoring
+    // `""` would turn the `.composer`/`.config/composer` probes below into
+    // CWD-relative paths inside the user's project (same rule as
+    // `utils::fs::home_dir`).
     let home_dir = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .ok()?;
+        .ok()
+        .filter(|h| !h.is_empty())
+        .or_else(|| std::env::var("USERPROFILE").ok().filter(|h| !h.is_empty()))?;
     let home = PathBuf::from(home_dir);
 
     let candidates = [

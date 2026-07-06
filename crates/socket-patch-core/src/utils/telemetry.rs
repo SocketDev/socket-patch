@@ -177,10 +177,16 @@ pub fn sanitize_error_message(message: &str) -> String {
     // `home_dir()` falls back to a literal `"~"` when no home is set, and
     // replacing `"~"` with `"~"` is a no-op. A set-but-empty HOME must be
     // skipped explicitly — replacing `""` would splice `~` between every byte.
+    // Trailing separators are trimmed so a `HOME=/home/user/` redaction keeps
+    // the separator (`~/.cache`, not `~.cache`); a home that trims to nothing
+    // (`HOME=/`, common for unmapped-UID containers) is a filesystem root with
+    // no user-identifying prefix to redact — replacing it would splice `~`
+    // between every path segment in the message.
+    let home = home.trim_end_matches(['/', '\\']);
     if home.is_empty() {
         return message.to_string();
     }
-    message.replace(home.as_ref(), "~")
+    message.replace(home, "~")
 }
 
 /// Build a telemetry event. `error` is an `(error_type, message)` pair; the

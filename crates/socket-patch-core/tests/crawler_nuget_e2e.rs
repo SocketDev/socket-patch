@@ -792,7 +792,7 @@ async fn get_nuget_package_paths_discovers_assets_json_in_subproject() {
 }
 
 /// Empty `packageFolders` object in assets.json must not surface any
-/// paths (line 447-448 `if result.is_empty()` arm).
+/// paths (`parse_project_assets_package_folders` yields an empty vec).
 #[tokio::test]
 #[serial]
 async fn get_nuget_package_paths_assets_json_empty_packagefolders_yields_no_paths() {
@@ -802,6 +802,15 @@ async fn get_nuget_package_paths_assets_json_empty_packagefolders_yields_no_path
     tokio::fs::write(obj.join("project.assets.json"), br#"{"packageFolders":{}}"#)
         .await
         .unwrap();
+    // A .NET marker so the local-mode gate passes and the assets parse
+    // actually runs — without it the gate returns early and the
+    // assertion holds vacuously.
+    tokio::fs::write(
+        tmp.path().join("MyProj.csproj"),
+        r#"<Project Sdk="Microsoft.NET.Sdk"></Project>"#,
+    )
+    .await
+    .unwrap();
 
     let prev = std::env::var("NUGET_PACKAGES").ok();
     let prev_home = std::env::var("HOME").ok();
@@ -838,6 +847,15 @@ async fn get_nuget_package_paths_assets_json_malformed_skipped() {
     tokio::fs::write(obj.join("project.assets.json"), b"this is not json")
         .await
         .unwrap();
+    // A .NET marker so the local-mode gate passes and the assets parse
+    // actually runs — without it the gate returns early and the
+    // assertion holds vacuously.
+    tokio::fs::write(
+        tmp.path().join("MyProj.csproj"),
+        r#"<Project Sdk="Microsoft.NET.Sdk"></Project>"#,
+    )
+    .await
+    .unwrap();
 
     let prev = std::env::var("NUGET_PACKAGES").ok();
     let prev_home = std::env::var("HOME").ok();

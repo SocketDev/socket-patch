@@ -512,6 +512,67 @@ async fn get_vendor_paths_global_no_composer_no_home_layout_returns_empty() {
     );
 }
 
+/// A set-but-empty `HOME` (stripped CI/container/sudo environments) must
+/// be treated as unset, not honored: `PathBuf::from("")` turns the
+/// `.composer` / `.config/composer` platform-default probes into
+/// CWD-relative paths, so a `.composer/vendor/` directory inside the
+/// user's project gets scanned as if it were the global composer home.
+/// Twin of the `utils::fs::home_dir` empty-HOME fix.
+#[tokio::test]
+#[serial_test::serial]
+async fn get_vendor_paths_global_empty_home_not_cwd_relative() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Plant a project-local .composer/vendor inside what will be the CWD.
+    tokio::fs::create_dir_all(tmp.path().join(".composer").join("vendor"))
+        .await
+        .unwrap();
+    let empty_path = tempfile::tempdir().unwrap();
+
+    let prev_composer = std::env::var("COMPOSER_HOME").ok();
+    let prev_home = std::env::var("HOME").ok();
+    let prev_profile = std::env::var("USERPROFILE").ok();
+    let prev_path = std::env::var("PATH").ok();
+    let prev_cwd = std::env::current_dir().unwrap();
+    std::env::remove_var("COMPOSER_HOME");
+    std::env::set_var("HOME", "");
+    std::env::set_var("USERPROFILE", "");
+    std::env::set_var("PATH", empty_path.path());
+    std::env::set_current_dir(tmp.path()).unwrap();
+
+    let crawler = ComposerCrawler;
+    let opts = CrawlerOptions {
+        cwd: tmp.path().to_path_buf(),
+        global: true,
+        global_prefix: None,
+    };
+    let paths = crawler.get_vendor_paths(&opts).await.unwrap();
+
+    std::env::set_current_dir(prev_cwd).unwrap();
+    if let Some(v) = prev_composer {
+        std::env::set_var("COMPOSER_HOME", v);
+    }
+    if let Some(v) = prev_home {
+        std::env::set_var("HOME", v);
+    } else {
+        std::env::remove_var("HOME");
+    }
+    if let Some(v) = prev_profile {
+        std::env::set_var("USERPROFILE", v);
+    } else {
+        std::env::remove_var("USERPROFILE");
+    }
+    if let Some(v) = prev_path {
+        std::env::set_var("PATH", v);
+    } else {
+        std::env::remove_var("PATH");
+    }
+
+    assert!(
+        paths.is_empty(),
+        "empty HOME must not resolve to CWD-relative .composer probes; got {paths:?}"
+    );
+}
+
 #[path = "common/mod.rs"]
 mod common;
 
