@@ -11,6 +11,7 @@ use std::path::Path;
 use tokio::fs;
 
 use super::{add_plugin_files, remove_plugin_files, BundlerProject};
+use crate::utils::fs::atomic_write_bytes;
 
 /// Outcome of one setup edit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,7 +21,7 @@ pub enum GemSetupStatus {
     Error,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct GemEditResult {
     /// Envelope `files[].kind` (`gemfile` | `gem_plugin`).
     pub kind: &'static str,
@@ -31,7 +32,7 @@ pub struct GemEditResult {
 
 impl GemEditResult {
     /// Build a result from an `Ok(changed)` / `Err(message)` outcome.
-    pub(crate) fn from_result(
+    pub(super) fn from_result(
         kind: &'static str,
         path: String,
         result: Result<bool, String>,
@@ -59,68 +60,22 @@ impl GemEditResult {
     }
 }
 
-/// Atomically write `content` to `path`.
-///
-/// A bare `fs::write` truncates the target before writing, so a crash, power
-/// loss, or interrupted process mid-write would leave the user's committed
-/// `Gemfile` truncated or empty — destroying the file we only meant to
-/// append a three-line block to. Instead we write to a sibling stage file,
-/// fsync it, then rename over the target (rename is atomic on the same
-/// filesystem) so a reader ever sees either the old bytes or the complete new
-/// bytes. Mirrors the hardened writer in `composer_setup` / `package_json`.
-async fn atomic_write(path: &Path, content: &str) -> std::io::Result<()> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let stem = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "Gemfile".to_string());
-    let stage = parent.join(format!(".socket-stage-{}-{}", stem, uuid::Uuid::new_v4()));
-
-    let mut file = tokio::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&stage)
-        .await?;
-
-    use tokio::io::AsyncWriteExt;
-    if let Err(e) = file.write_all(content.as_bytes()).await {
-        let _ = tokio::fs::remove_file(&stage).await;
-        return Err(e);
-    }
-    if let Err(e) = file.sync_all().await {
-        let _ = tokio::fs::remove_file(&stage).await;
-        return Err(e);
-    }
-    drop(file);
-
-    if let Err(e) = tokio::fs::rename(&stage, path).await {
-        let _ = tokio::fs::remove_file(&stage).await;
-        return Err(e);
-    }
-
-    // The rename only updated the parent directory entry; fsync the directory
-    // so the rename itself survives a crash. Best-effort, Unix only.
-    #[cfg(unix)]
-    {
-        if let Ok(dir) = tokio::fs::File::open(parent).await {
-            let _ = dir.sync_all().await;
-        }
-    }
-
-    Ok(())
-}
-
 /// Stable substring identifying our managed block — `setup --check` and the
 /// add/remove edits all key on it, so a user-authored `plugin` line is never
 /// mistaken for ours.
-pub const MANAGED_MARKER: &str = "# >>> socket-patch:managed";
+const MANAGED_MARKER: &str = "# >>> socket-patch:managed";
 
 /// The exact block `setup` appends to the Gemfile (trailing newline included).
 /// `File.expand_path(..., __dir__)` resolves relative to the Gemfile's own dir,
 /// so the reference is correct regardless of where `bundle` is invoked from.
+/// The source MUST be `path:`, not `git:`: Bundler fetches a `git:` plugin via
+/// `git clone <dir>`, and the generated dir is a plain directory (committing it
+/// to the parent repo does not give it a `.git`), so a `git:` source fails
+/// every `bundle install` with "repository ... does not exist". A `path:`
+/// source loads the directory in place.
 const MANAGED_BLOCK: &str = "\
 # >>> socket-patch:managed (added by `socket-patch setup`; do not edit) >>>\n\
-plugin 'socket-patch', git: File.expand_path('.socket/bundler-plugin', __dir__)\n\
+plugin 'socket-patch', path: File.expand_path('.socket/bundler-plugin', __dir__)\n\
 # <<< socket-patch:managed <<<\n";
 
 /// What we append after the user's content: a blank-line separator + the block.
@@ -154,8 +109,19 @@ fn gemfile_remove(content: &str) -> Option<String> {
     // block if the leading separator was edited away.
     let appended = appended();
     if let Some(idx) = content.find(&appended) {
+        let end = idx + appended.len();
+        // The separator "\n" doubles as the terminator of a final unterminated
+        // pre-setup line. Stripping it is only safe when the block sits at EOF
+        // (the byte-exact restore) or the separator is a pure blank line
+        // (preceded by a newline, or at the start of the file); otherwise the
+        // user's lines on either side of the block would glue into one.
+        let start = if end == content.len() || idx == 0 || content[..idx].ends_with('\n') {
+            idx
+        } else {
+            idx + 1
+        };
         let mut out = content.to_string();
-        out.replace_range(idx..idx + appended.len(), "");
+        out.replace_range(start..end, "");
         Some(out)
     } else {
         // Separator edited away: strip just the block. If the block body was
@@ -179,7 +145,10 @@ async fn edit_gemfile_add(gemfile: &Path, dry_run: bool) -> GemEditResult {
             None => Ok(false),
             Some(new) => {
                 if !dry_run {
-                    atomic_write(gemfile, &new)
+                    // Stage+fsync+rename via the crate-wide hardened writer:
+                    // the user's committed Gemfile must never be left torn by
+                    // a crash mid-write.
+                    atomic_write_bytes(gemfile, new.as_bytes())
                         .await
                         .map_err(|e| e.to_string())?;
                 }
@@ -204,7 +173,7 @@ async fn edit_gemfile_remove(gemfile: &Path, dry_run: bool) -> GemEditResult {
             None => Ok(false),
             Some(new) => {
                 if !dry_run {
-                    atomic_write(gemfile, &new)
+                    atomic_write_bytes(gemfile, new.as_bytes())
                         .await
                         .map_err(|e| e.to_string())?;
                 }
@@ -251,7 +220,10 @@ mod tests {
             "original bytes preserved as a prefix"
         );
         assert!(is_plugin_directive_present(&out));
-        assert!(out.contains("plugin 'socket-patch'"));
+        // `path:`-sourced, never `git:`: Bundler git-clones a `git:` plugin
+        // source, and the plain generated dir is uncloneable, breaking every
+        // `bundle install` on the wired project.
+        assert!(out.contains("plugin 'socket-patch', path:"));
         assert!(out.contains("File.expand_path('.socket/bundler-plugin', __dir__)"));
         // Idempotent.
         assert!(gemfile_add(&out).is_none());
@@ -337,6 +309,23 @@ mod tests {
             gemfile_remove(&user_edited).unwrap(),
             format!("{GEMFILE}gem 'extra', '2.0'\n"),
             "only our block is removed; the user's later gems survive verbatim"
+        );
+    }
+
+    #[test]
+    fn test_remove_does_not_glue_lines_when_original_lacked_trailing_newline() {
+        // Original Gemfile has no final newline; setup's "\n" separator becomes
+        // the terminator of that last line. The user then adds gems AFTER our
+        // block. remove must not strip that separator along with the block —
+        // doing so glues `gem 'colorize', '1.1.0'` onto `gem 'extra', '2.0'`
+        // (one invalid Ruby line).
+        let no_nl = "source 'https://rubygems.org'\ngem 'colorize', '1.1.0'";
+        let added = gemfile_add(no_nl).unwrap();
+        let user_edited = format!("{added}gem 'extra', '2.0'\n");
+        assert_eq!(
+            gemfile_remove(&user_edited).unwrap(),
+            format!("{no_nl}\ngem 'extra', '2.0'\n"),
+            "the separator newline must survive as the last line's terminator"
         );
     }
 

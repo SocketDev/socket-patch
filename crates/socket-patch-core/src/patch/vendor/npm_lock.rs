@@ -1,7 +1,7 @@
 //! npm vendor backend: lock surgery + orchestration.
 //!
 //! Vendoring an npm package = pack the patched tree into a deterministic
-//! tarball under `.socket/vendor/npm/<uuid>/` ([`super::npm_pack`]) and
+//! tarball under `.socket/vendor/npm/<uuid>/` (`super::npm_pack`) and
 //! rewrite every matching lockfile entry's `resolved` to a relative `file:`
 //! spec + `integrity` to the tarball's recomputed sha512. That lock-only
 //! rewrite passes `npm ci` (spike-proven; see `spikes/PHASE0-FINDINGS.txt`):
@@ -14,18 +14,18 @@
 //! bytes — no error, no patch. Every rewrite therefore carries the packed
 //! tarball's own hash, never an inherited one.
 
-use std::collections::HashMap;
 use std::path::Path;
 
 use serde_json::Value;
 
 use crate::manifest::schema::PatchRecord;
-use crate::patch::apply::{ApplyResult, PatchSources, VerifyResult, VerifyStatus};
+use crate::patch::apply::PatchSources;
 use crate::patch::copy_tree::remove_tree;
-use crate::utils::fs::atomic_write_bytes;
+use crate::utils::fs::atomic_write_bytes_preserving_mode;
 
-use super::npm_common::{done_failure, guard_coordinates, refused, stage_patch_pack};
-use super::path::{parse_vendor_path, vendor_uuid_dir_rel};
+use super::common::{already_patched_result, detect_indent, done, refused, serialize_json};
+use super::npm_common::{done_failure, guard_coordinates, guard_revert_uuid_dir, stage_patch_pack};
+use super::path::parse_vendor_path;
 use super::state::{
     write_marker, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
 };
@@ -187,11 +187,7 @@ pub async fn vendor_npm(
     let Some(staged) = staged else {
         // Failed patch (no lock writes — wiring is last, so the project is
         // byte-untouched) or a dry run (stops after the verify).
-        return VendorOutcome::Done {
-            result,
-            entry: None,
-            warnings,
-        };
+        return done(result, None, warnings);
     };
     // `staged.name`/`staged.version` echo the validated coords (the wiring
     // below keeps using the borrowed `name`/`version`).
@@ -202,7 +198,6 @@ pub async fn vendor_npm(
     let rel_tgz = staged.rel_tgz;
     let packed = staged.packed;
     let staged_pkg_json = staged.staged_pkg_json;
-    let dest = project_root.join(&rel_tgz);
     // Forward slashes by construction (uuid_dir_rel + leaf are built with
     // `/`), relative to the project dir — the spelling npm resolves
     // `file:` specs against.
@@ -290,24 +285,20 @@ pub async fn vendor_npm(
         // integrity: the project is in sync. Touch nothing (the tarball
         // rewrite above was byte-identical by determinism) and synthesize an
         // AlreadyPatched-style success, mirroring the go_redirect hot path.
-        let verified = record
-            .files
-            .keys()
-            .map(|f| already_patched_verify(f))
-            .collect();
-        return VendorOutcome::Done {
-            result: synthesized_result(purl, &dest, verified, true, None),
-            entry: None,
+        return done(
+            already_patched_result(purl, &project_root.join(&rel_tgz), &record.files),
+            None,
             warnings,
-        };
+        );
     }
 
     let indent = detect_indent(&String::from_utf8_lossy(&lock_bytes));
-    let out = match serialize_lock(&lock, &indent) {
+    let out = match serialize_json(&lock, &indent) {
         Ok(out) => out,
         Err(e) => return done_failure(purl, format!("cannot serialize {lock_name}: {e}")),
     };
-    if let Err(e) = atomic_write_bytes(&project_root.join(&lock_name), &out).await {
+    if let Err(e) = atomic_write_bytes_preserving_mode(&project_root.join(&lock_name), &out).await
+    {
         return done_failure(purl, format!("cannot write {lock_name}: {e}"));
     }
 
@@ -315,16 +306,7 @@ pub async fn vendor_npm(
     // The marker is informational belt-and-braces (never a trust input), so
     // a write failure downgrades to a warning rather than failing a vendor
     // whose lock is already correctly wired.
-    let mut vulnerabilities: Vec<String> = record.vulnerabilities.keys().cloned().collect();
-    vulnerabilities.sort();
-    let marker = VendorMarker {
-        schema_version: 1,
-        purl: base_purl.clone(),
-        patch_uuid: record.uuid.clone(),
-        ecosystem: "npm".to_string(),
-        vulnerabilities,
-        vendored_at: vendored_at.to_string(),
-    };
+    let marker = VendorMarker::new("npm", &base_purl, record, vendored_at);
     if let Err(e) = write_marker(&project_root.join(&uuid_dir_rel), &marker).await {
         warnings.push(VendorWarning::new(
             "vendor_marker_write_failed",
@@ -354,11 +336,7 @@ pub async fn vendor_npm(
         pdm: None,
         pipenv: None,
     };
-    VendorOutcome::Done {
-        result,
-        entry: Some(entry),
-        warnings,
-    }
+    done(result, Some(entry), warnings)
 }
 
 /// Undo one vendored npm package: restore the recorded lock fragments and
@@ -368,11 +346,9 @@ pub async fn revert_npm(entry: &VendorEntry, project_root: &Path, dry_run: bool)
     // state.json and names the directory tree we are about to DELETE.
     // Validate through the same fail-closed grammar vendor used before any
     // disk access — never delete by an unvalidated path.
-    let Some(uuid_dir_rel) = vendor_uuid_dir_rel("npm", &entry.uuid) else {
-        return RevertOutcome::failed(format!(
-            "refusing revert: `{}` is not a canonical patch uuid (tampered state.json?)",
-            entry.uuid
-        ));
+    let uuid_dir_rel = match guard_revert_uuid_dir(&entry.uuid) {
+        Ok(d) => d,
+        Err(outcome) => return outcome,
     };
     if dry_run {
         return RevertOutcome::ok();
@@ -438,13 +414,13 @@ pub async fn revert_npm(entry: &VendorEntry, project_root: &Path, dry_run: bool)
 
         if changed {
             let indent = detect_indent(&String::from_utf8_lossy(&lock_bytes));
-            let out = match serialize_lock(&lock, &indent) {
+            let out = match serialize_json(&lock, &indent) {
                 Ok(out) => out,
                 Err(e) => {
                     return RevertOutcome::failed(format!("cannot serialize {lock_name}: {e}"))
                 }
             };
-            if let Err(e) = atomic_write_bytes(&lock_path, &out).await {
+            if let Err(e) = atomic_write_bytes_preserving_mode(&lock_path, &out).await {
                 return RevertOutcome::failed(format!("cannot write {lock_name}: {e}"));
             }
         }
@@ -742,70 +718,16 @@ async fn select_lockfile(project_root: &Path) -> std::io::Result<Option<(String,
     Ok(None)
 }
 
-/// The lock's indent unit: the leading whitespace of the first indented
-/// line (npm emits 2 spaces; respect whatever formatter the project uses
-/// so untouched lines stay byte-identical in diffs). Defaults to 2 spaces.
-fn detect_indent(text: &str) -> String {
-    for line in text.lines() {
-        let trimmed = line.trim_start_matches([' ', '\t']);
-        if !trimmed.is_empty() && trimmed.len() < line.len() {
-            return line[..line.len() - trimmed.len()].to_string();
-        }
-    }
-    "  ".to_string()
-}
-
-/// Pretty-print with the detected indent + trailing newline — npm's own
-/// output shape, so `npm install` after vendoring produces no format-only
-/// churn.
-fn serialize_lock(lock: &Value, indent: &str) -> std::io::Result<Vec<u8>> {
-    use serde::Serialize;
-    let mut out = Vec::new();
-    let formatter = serde_json::ser::PrettyFormatter::with_indent(indent.as_bytes());
-    let mut ser = serde_json::Serializer::with_formatter(&mut out, formatter);
-    lock.serialize(&mut ser).map_err(std::io::Error::other)?;
-    out.push(b'\n');
-    Ok(out)
-}
-
-fn synthesized_result(
-    package_key: &str,
-    path: &Path,
-    files_verified: Vec<VerifyResult>,
-    success: bool,
-    error: Option<String>,
-) -> ApplyResult {
-    ApplyResult {
-        package_key: package_key.to_string(),
-        package_path: path.display().to_string(),
-        success,
-        files_verified,
-        files_patched: Vec::new(),
-        applied_via: HashMap::new(),
-        error,
-        sidecar: None,
-    }
-}
-
-fn already_patched_verify(file: &str) -> VerifyResult {
-    VerifyResult {
-        file: file.to_string(),
-        status: VerifyStatus::AlreadyPatched,
-        message: None,
-        current_hash: None,
-        expected_hash: None,
-        target_hash: None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::hash::git_sha256::compute_git_sha256_from_bytes;
     use crate::manifest::schema::PatchFileInfo;
+    use crate::patch::apply::{ApplyResult, VerifyStatus};
     use base64::Engine as _;
     use serde_json::json;
     use sha2::{Digest, Sha512};
+    use std::collections::HashMap;
     use std::path::PathBuf;
 
     const UUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
@@ -938,7 +860,7 @@ mod tests {
             .await
             .unwrap();
 
-        let lock_bytes = serialize_lock(&lock, "  ").unwrap();
+        let lock_bytes = serialize_json(&lock, "  ").unwrap();
         tokio::fs::write(root.join(PACKAGE_LOCK), &lock_bytes)
             .await
             .unwrap();
@@ -1448,6 +1370,28 @@ mod tests {
         );
     }
 
+    /// npm and Node tolerate a leading UTF-8 BOM in package.json
+    /// (Windows-authored packages ship them, and the crawler strips it — so
+    /// a BOM'd install IS discovered and vendored), but serde_json rejects
+    /// one, and the bundled-deps guard fails OPEN on a parse error: a BOM
+    /// must not skip the refusal and pack a tarball whose bundled
+    /// node_modules was pruned.
+    #[tokio::test]
+    async fn bundled_deps_refusal_survives_package_json_bom() {
+        let fx = fixture().await;
+        let mut pkg_json = b"\xEF\xBB\xBF".to_vec();
+        pkg_json
+            .extend_from_slice(br#"{"name":"left-pad","version":"1.3.0","bundleDependencies":["dep"]}"#);
+        tokio::fs::write(fx.installed().join("package.json"), pkg_json)
+            .await
+            .unwrap();
+        expect_refused(fx.vendor(false).await, "vendor_bundled_deps_unsupported");
+        assert!(
+            !fx.root().join(".socket/vendor").exists(),
+            "refusal writes nothing"
+        );
+    }
+
     #[tokio::test]
     async fn lockfile_v1_is_refused() {
         let lock = json!({
@@ -1640,7 +1584,7 @@ mod tests {
         // Give one lock instance dep-mirror fields the patch obsoletes.
         let mut lock = default_lock();
         lock["packages"]["node_modules/left-pad"]["peerDependencies"] = json!({ "gone": "^1.0.0" });
-        let lock_bytes = serialize_lock(&lock, "  ").unwrap();
+        let lock_bytes = serialize_json(&lock, "  ").unwrap();
         tokio::fs::write(fx.lock_path(), &lock_bytes).await.unwrap();
         fx.lock_bytes = lock_bytes;
 
@@ -1719,6 +1663,40 @@ mod tests {
         );
     }
 
+    /// The lockfile is a user-owned file we merely edit: both the vendor
+    /// rewrite and the revert restore must keep its permission bits (a 0600
+    /// private lock must not silently become umask-default 0644).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn lock_writes_preserve_file_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let fx = fixture().await;
+        tokio::fs::set_permissions(fx.lock_path(), std::fs::Permissions::from_mode(0o600))
+            .await
+            .unwrap();
+
+        let (result, entry, _) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        let entry = entry.unwrap();
+        let mode = tokio::fs::metadata(fx.lock_path())
+            .await
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(mode, 0o600, "vendor must preserve the lockfile's mode");
+
+        let outcome = revert_npm(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        let mode = tokio::fs::metadata(fx.lock_path())
+            .await
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(mode, 0o600, "revert must preserve the lockfile's mode");
+    }
+
     #[tokio::test]
     async fn revert_leaves_drifted_entries_alone_with_warning() {
         let fx = fixture().await;
@@ -1729,7 +1707,7 @@ mod tests {
         let mut live = fx.read_lock().await;
         live["packages"]["node_modules/left-pad"]["resolved"] =
             json!("https://example.com/their-fork.tgz");
-        tokio::fs::write(fx.lock_path(), serialize_lock(&live, "  ").unwrap())
+        tokio::fs::write(fx.lock_path(), serialize_json(&live, "  ").unwrap())
             .await
             .unwrap();
 

@@ -1,4 +1,4 @@
-#![cfg(all(unix, feature = "golang"))]
+#![cfg(unix)]
 //! End-to-end for the Go `replace`-redirect backend, driven through the CLI
 //! binary. No `go` toolchain needed: `apply`/`--check` only read a pristine
 //! extracted module-cache dir and write project-local copies + a `go.mod`
@@ -15,9 +15,7 @@ use std::path::Path;
 #[path = "common/mod.rs"]
 mod common;
 
-use common::{
-    git_sha256, git_sha256_file, run_with_env, write_blob, write_minimal_manifest, PatchEntry,
-};
+use common::{binary, git_sha256, git_sha256_file, write_blob, write_minimal_manifest, PatchEntry};
 
 const MODULE: &str = "github.com/foo/bar";
 const VERSION: &str = "v1.4.2";
@@ -30,7 +28,7 @@ const REPLACE_LINE: &str =
     "replace github.com/foo/bar v1.4.2 => ./.socket/go-patches/github.com/foo/bar@v1.4.2";
 
 /// Stage a fake extracted module-cache dir + a consumer go.mod + the synthetic
-/// patch manifest/blob. Returns (root, gomodcache, cache_src_file).
+/// patch manifest/blob. Returns (gomodcache, cache_dir).
 fn stage(root: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
     // Fake GOMODCACHE with the pristine extracted module.
     let gomodcache = root.join("modcache");
@@ -67,9 +65,47 @@ fn stage(root: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
     (gomodcache, cache_dir)
 }
 
+/// Run the CLI binary with the environment pinned hard (mirrors the
+/// seed-then-scrub runner in `e2e_golang.rs`). Each variable below was
+/// verified to break this suite when inherited from the ambient shell, so it
+/// is seeded with a hostile value and then scrubbed — `env_remove` clears the
+/// seed too, so the child never sees it, but if a scrub line is ever dropped
+/// the seed (rather than a developer's ambient shell, which this suite can't
+/// rely on) turns the tests red immediately. `SOCKET_GLOBAL` /
+/// `SOCKET_GLOBAL_PREFIX` take the redirect backend out of local scope
+/// (apply patches the fake module cache IN PLACE and `--check` exits 0
+/// having checked nothing), `SOCKET_DRY_RUN` makes every apply a no-op, and
+/// `SOCKET_MANIFEST_PATH` points apply/check at a manifest that isn't there.
+/// `--offline`, `--ecosystems`, and `--cwd` are passed as flags, which
+/// outrank env, so their env twins can't bite; `GOMODCACHE` pins the crawl
+/// root (so `GOPATH` is never consulted).
+fn run_cli(root: &Path, gomodcache: &Path, args: &[&str]) -> (i32, String, String) {
+    let out = std::process::Command::new(binary())
+        .args(args)
+        .current_dir(root)
+        .env("GOMODCACHE", gomodcache)
+        .env("SOCKET_GLOBAL", "true")
+        .env("SOCKET_GLOBAL_PREFIX", "/nonexistent")
+        .env("SOCKET_DRY_RUN", "true")
+        .env("SOCKET_MANIFEST_PATH", "/nonexistent/manifest.json")
+        .env_remove("SOCKET_GLOBAL")
+        .env_remove("SOCKET_GLOBAL_PREFIX")
+        .env_remove("SOCKET_DRY_RUN")
+        .env_remove("SOCKET_MANIFEST_PATH")
+        .env_remove("SOCKET_API_TOKEN")
+        .output()
+        .expect("failed to execute socket-patch binary");
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).to_string(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+    )
+}
+
 fn apply(root: &Path, gomodcache: &Path) -> (i32, String, String) {
-    run_with_env(
+    run_cli(
         root,
+        gomodcache,
         &[
             "apply",
             "--offline",
@@ -78,13 +114,13 @@ fn apply(root: &Path, gomodcache: &Path) -> (i32, String, String) {
             "--cwd",
             root.to_str().unwrap(),
         ],
-        &[("GOMODCACHE", gomodcache.to_str().unwrap())],
     )
 }
 
 fn check(root: &Path, gomodcache: &Path) -> i32 {
-    run_with_env(
+    run_cli(
         root,
+        gomodcache,
         &[
             "apply",
             "--check",
@@ -94,7 +130,6 @@ fn check(root: &Path, gomodcache: &Path) -> i32 {
             "--cwd",
             root.to_str().unwrap(),
         ],
-        &[("GOMODCACHE", gomodcache.to_str().unwrap())],
     )
     .0
 }

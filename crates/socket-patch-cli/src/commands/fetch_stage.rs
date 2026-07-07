@@ -19,20 +19,21 @@ use socket_patch_core::manifest::schema::PatchManifest;
 use socket_patch_core::patch::apply::PatchSources;
 use tempfile::TempDir;
 
+use super::get::{base64_decode, is_valid_blob_hash};
 use crate::args::GlobalArgs;
 
 /// Resolved artifact locations for the patch pipeline. Holds the overlay
 /// `TempDir` alive — sources become invalid when this is dropped.
-pub struct StagedSources {
-    pub blobs: PathBuf,
-    pub diffs: PathBuf,
-    pub packages: PathBuf,
+pub(crate) struct StagedSources {
+    pub(crate) blobs: PathBuf,
+    diffs: PathBuf,
+    packages: PathBuf,
     _stage: Option<TempDir>,
 }
 
 impl StagedSources {
     /// Borrow as the core pipeline's source set.
-    pub fn as_patch_sources(&self) -> PatchSources<'_> {
+    pub(crate) fn as_patch_sources(&self) -> PatchSources<'_> {
         PatchSources {
             blobs_path: &self.blobs,
             packages_path: Some(&self.packages),
@@ -40,16 +41,54 @@ impl StagedSources {
             mem_blobs: None,
         }
     }
+
+    /// Blob destination for post-stage, on-demand fetches (apply's mismatch
+    /// blob top-up). When sources are read directly from `.socket/` (no
+    /// overlay was staged), promote `blobs` to a transient overlay tempdir
+    /// first — a late download must never land in the persistent
+    /// `.socket/blobs/` cache (this module's read-only contract). `None`
+    /// when the overlay cannot be created; the caller skips the fetch and
+    /// the affected files fail as they would offline.
+    pub(crate) async fn writable_blobs(&mut self) -> Option<&Path> {
+        if self._stage.is_none() {
+            let stage = tempfile::tempdir().ok()?;
+            let blobs = stage.path().join("blobs");
+            tokio::fs::create_dir_all(&blobs).await.ok()?;
+            overlay_dir(&self.blobs, &blobs).await;
+            self.blobs = blobs;
+            self._stage = Some(stage);
+        }
+        Some(&self.blobs)
+    }
 }
 
 /// The staging outcome.
-pub enum StageOutcome {
+pub(crate) enum StageOutcome {
     /// Every patch has a readable source at the returned paths.
     Ready(StagedSources),
     /// Sources are unavailable (offline with missing artifacts, or downloads
     /// failed). User-facing diagnostics were already printed; the caller
     /// reports command failure.
     Unavailable,
+}
+
+/// Shared offline diagnostic: patches with no usable local source while
+/// `--offline` is set (first five PURLs, then the `repair` hint).
+fn report_offline_missing(common: &GlobalArgs, purls: &[&str]) {
+    if common.silent || common.json {
+        return;
+    }
+    eprintln!(
+        "Error: {} patch(es) have no local source and --offline is set:",
+        purls.len()
+    );
+    for purl in purls.iter().take(5) {
+        eprintln!("  - {}", purl);
+    }
+    if purls.len() > 5 {
+        eprintln!("  ... and {} more", purls.len() - 5);
+    }
+    eprintln!("Run \"socket-patch repair\" to download missing artifacts.");
 }
 
 /// Mirror `src`'s files into `dst` by hardlink (copy fallback). Pre-seeds the
@@ -83,11 +122,12 @@ async fn overlay_dir(src: &Path, dst: &Path) {
 /// tempdir and fetch the gap. `Err` is a hard setup failure (bad
 /// `--download-mode`, tempdir creation); `Ok(Unavailable)` is the soft
 /// "cannot proceed" path with diagnostics already printed.
-pub async fn stage_patch_sources(
+pub(crate) async fn stage_patch_sources(
     common: &GlobalArgs,
     manifest: &PatchManifest,
     socket_dir: &Path,
 ) -> Result<StageOutcome, String> {
+    let quiet = common.silent || common.json;
     let socket_blobs_path = socket_dir.join("blobs");
     let socket_diffs_path = socket_dir.join("diffs");
     let socket_packages_path = socket_dir.join("packages");
@@ -130,19 +170,7 @@ pub async fn stage_patch_sources(
         // verification on its own; we still surface the no-source
         // diagnosis so the user runs `repair` before retrying.
         if !patches_without_source.is_empty() {
-            if !common.silent && !common.json {
-                eprintln!(
-                    "Error: {} patch(es) have no local source and --offline is set:",
-                    patches_without_source.len()
-                );
-                for purl in patches_without_source.iter().take(5) {
-                    eprintln!("  - {}", purl);
-                }
-                if patches_without_source.len() > 5 {
-                    eprintln!("  ... and {} more", patches_without_source.len() - 5);
-                }
-                eprintln!("Run \"socket-patch repair\" to download missing artifacts.");
-            }
+            report_offline_missing(common, &patches_without_source);
             return Ok(StageOutcome::Unavailable);
         }
     }
@@ -177,19 +205,22 @@ pub async fn stage_patch_sources(
     // exclusively from the tempdir; `.socket/` is never mutated. Dropping
     // `StagedSources` removes the directory and any downloaded bytes.
     let stage = tempfile::tempdir().map_err(|e| e.to_string())?;
-    let stage_blobs = stage.path().join("blobs");
-    let stage_diffs = stage.path().join("diffs");
-    let stage_packages = stage.path().join("packages");
-    for dir in [&stage_blobs, &stage_diffs, &stage_packages] {
+    let staged = StagedSources {
+        blobs: stage.path().join("blobs"),
+        diffs: stage.path().join("diffs"),
+        packages: stage.path().join("packages"),
+        _stage: Some(stage),
+    };
+    for dir in [&staged.blobs, &staged.diffs, &staged.packages] {
         tokio::fs::create_dir_all(dir)
             .await
             .map_err(|e| e.to_string())?;
     }
-    overlay_dir(&socket_blobs_path, &stage_blobs).await;
-    overlay_dir(&socket_diffs_path, &stage_diffs).await;
-    overlay_dir(&socket_packages_path, &stage_packages).await;
+    overlay_dir(&socket_blobs_path, &staged.blobs).await;
+    overlay_dir(&socket_diffs_path, &staged.diffs).await;
+    overlay_dir(&socket_packages_path, &staged.packages).await;
 
-    if !common.silent && !common.json {
+    if !quiet {
         println!(
             "Downloading missing patch artifacts (mode: {})...",
             download_mode.as_tag()
@@ -197,16 +228,11 @@ pub async fn stage_patch_sources(
     }
 
     let (client, _) = get_api_client_with_overrides(common.api_client_overrides()).await;
-    let sources = PatchSources {
-        blobs_path: &stage_blobs,
-        packages_path: Some(&stage_packages),
-        diffs_path: Some(&stage_diffs),
-        mem_blobs: None,
-    };
+    let sources = staged.as_patch_sources();
     let fetch_result =
         fetch_missing_sources(manifest, &sources, download_mode, &client, None).await;
 
-    if !common.silent && !common.json {
+    if !quiet {
         println!("{}", format_fetch_result(&fetch_result));
     }
 
@@ -214,38 +240,33 @@ pub async fn stage_patch_sources(
     // a fallback. Patches that lack the requested mode on the server will
     // still apply via the legacy blob path.
     if download_mode != DownloadMode::File {
-        let still_missing_blobs = get_missing_blobs(manifest, &stage_blobs).await;
+        let still_missing_blobs = get_missing_blobs(manifest, &staged.blobs).await;
         if !still_missing_blobs.is_empty() {
-            if !common.silent && !common.json {
+            if !quiet {
                 println!(
                     "Falling back to per-file blob downloads for {} blob(s)...",
                     still_missing_blobs.len()
                 );
             }
-            let blob_result = fetch_missing_blobs(manifest, &stage_blobs, &client, None).await;
-            if !common.silent && !common.json {
+            let blob_result = fetch_missing_blobs(manifest, &staged.blobs, &client, None).await;
+            if !quiet {
                 println!("{}", format_fetch_result(&blob_result));
             }
             if blob_result.failed > 0 && fetch_result.failed > 0 {
-                if !common.silent && !common.json {
+                if !quiet {
                     eprintln!("Some artifacts could not be downloaded. Cannot apply patches.");
                 }
                 return Ok(StageOutcome::Unavailable);
             }
         }
     } else if fetch_result.failed > 0 {
-        if !common.silent && !common.json {
+        if !quiet {
             eprintln!("Some blobs could not be downloaded. Cannot apply patches.");
         }
         return Ok(StageOutcome::Unavailable);
     }
 
-    Ok(StageOutcome::Ready(StagedSources {
-        blobs: stage_blobs,
-        diffs: stage_diffs,
-        packages: stage_packages,
-        _stage: Some(stage),
-    }))
+    Ok(StageOutcome::Ready(staged))
 }
 
 /// In-memory staged sources for the VENDOR flows.
@@ -256,7 +277,7 @@ pub async fn stage_patch_sources(
 /// `.socket/blobs` entries and no temporary files. The committed
 /// `.socket/vendor/` artifact is the patch; nothing else should land on
 /// disk.
-pub struct MemStagedSources {
+pub(crate) struct MemStagedSources {
     blobs: PathBuf,
     diffs: PathBuf,
     packages: PathBuf,
@@ -266,7 +287,7 @@ pub struct MemStagedSources {
 impl MemStagedSources {
     /// Borrow as the core pipeline's source set (memory overlay first,
     /// on-disk artifacts as the read-only fallback).
-    pub fn as_patch_sources(&self) -> PatchSources<'_> {
+    pub(crate) fn as_patch_sources(&self) -> PatchSources<'_> {
         PatchSources {
             blobs_path: &self.blobs,
             packages_path: Some(&self.packages),
@@ -277,7 +298,7 @@ impl MemStagedSources {
 }
 
 /// The in-memory staging outcome (mirror of [`StageOutcome`]).
-pub enum MemStageOutcome {
+pub(crate) enum MemStageOutcome {
     Ready(MemStagedSources),
     Unavailable,
 }
@@ -290,12 +311,13 @@ pub enum MemStageOutcome {
 /// memory from the patch view endpoint (`blobContent`), preceded by the
 /// committed-artifact harvest. Offline runs with missing sources are
 /// `Unavailable` with the same diagnostics as the disk stager.
-pub async fn stage_vendor_sources_in_memory(
+pub(crate) async fn stage_vendor_sources_in_memory(
     common: &GlobalArgs,
     manifest: &PatchManifest,
     socket_dir: &Path,
     project_root: &Path,
 ) -> Result<MemStageOutcome, String> {
+    let quiet = common.silent || common.json;
     let blobs = socket_dir.join("blobs");
     let diffs = socket_dir.join("diffs");
     let packages = socket_dir.join("packages");
@@ -326,111 +348,90 @@ pub async fn stage_vendor_sources_in_memory(
         })
         .collect();
 
-    if to_fetch.is_empty() {
-        return Ok(MemStageOutcome::Ready(MemStagedSources {
-            blobs,
-            diffs,
-            packages,
-            mem: HashMap::new(),
-        }));
-    }
-
-    // The committed vendor artifact IS the patched content: harvest its
-    // afterHash blobs into memory so in-sync re-runs and fresh clones of
-    // already-vendored projects stage with no network and no disk blobs.
-    let mut mem =
-        socket_patch_core::patch::vendor::harvest_artifact_blobs(project_root, &manifest.patches)
-            .await;
-    if !mem.is_empty() {
-        to_fetch.retain(|(purl, _)| {
-            manifest.patches.get(*purl).is_none_or(|record| {
-                !record.files.values().all(|f| {
-                    !missing_blobs.contains(&f.after_hash) || mem.contains_key(&f.after_hash)
+    let mut mem = HashMap::new();
+    if !to_fetch.is_empty() {
+        // The committed vendor artifact IS the patched content: harvest its
+        // afterHash blobs into memory so in-sync re-runs and fresh clones of
+        // already-vendored projects stage with no network and no disk blobs.
+        mem = socket_patch_core::patch::vendor::harvest_artifact_blobs(
+            project_root,
+            &manifest.patches,
+        )
+        .await;
+        if !mem.is_empty() {
+            to_fetch.retain(|(purl, _)| {
+                manifest.patches.get(*purl).is_none_or(|record| {
+                    !record.files.values().all(|f| {
+                        !missing_blobs.contains(&f.after_hash) || mem.contains_key(&f.after_hash)
+                    })
                 })
-            })
-        });
-        if to_fetch.is_empty() {
-            return Ok(MemStageOutcome::Ready(MemStagedSources {
-                blobs,
-                diffs,
-                packages,
-                mem,
-            }));
+            });
         }
     }
 
-    if common.offline {
-        if !common.silent && !common.json {
-            eprintln!(
-                "Error: {} patch(es) have no local source and --offline is set:",
+    if !to_fetch.is_empty() {
+        if common.offline {
+            let purls: Vec<&str> = to_fetch.iter().map(|(purl, _)| *purl).collect();
+            report_offline_missing(common, &purls);
+            return Ok(MemStageOutcome::Unavailable);
+        }
+
+        if !quiet {
+            println!(
+                "Fetching {} patch(es)' content (kept in memory)...",
                 to_fetch.len()
             );
-            for (purl, _) in to_fetch.iter().take(5) {
-                eprintln!("  - {}", purl);
-            }
-            if to_fetch.len() > 5 {
-                eprintln!("  ... and {} more", to_fetch.len() - 5);
-            }
-            eprintln!("Run \"socket-patch repair\" to download missing artifacts.");
         }
-        return Ok(MemStageOutcome::Unavailable);
-    }
 
-    if !common.silent && !common.json {
-        println!(
-            "Fetching {} patch(es)' content (kept in memory)...",
-            to_fetch.len()
-        );
-    }
-
-    let (client, _) = get_api_client_with_overrides(common.api_client_overrides()).await;
-    let mut failed: Vec<&str> = Vec::new();
-    for (purl, uuid) in &to_fetch {
-        match client.fetch_patch(common.org.as_deref(), uuid).await {
-            Ok(Some(patch)) => {
-                let mut complete = true;
-                for (file, info) in &patch.files {
-                    let (Some(b64), Some(hash)) = (&info.blob_content, &info.after_hash) else {
-                        if !common.silent && !common.json {
-                            eprintln!("  [error] {purl}: no blob content served for {file}");
-                        }
-                        complete = false;
-                        break;
-                    };
-                    // Same key guard as the disk writer: the hash names the
-                    // lookup key the apply pipeline gates writes on.
-                    if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
-                        complete = false;
-                        break;
-                    }
-                    match super::get::base64_decode(b64) {
-                        Ok(bytes) => {
-                            mem.insert(hash.clone(), bytes);
-                        }
-                        Err(_) => {
+        let (client, _) = get_api_client_with_overrides(common.api_client_overrides()).await;
+        let mut failed: Vec<&str> = Vec::new();
+        for (purl, uuid) in &to_fetch {
+            match client.fetch_patch(common.org.as_deref(), uuid).await {
+                Ok(Some(patch)) => {
+                    let mut complete = true;
+                    for (file, info) in &patch.files {
+                        let (Some(b64), Some(hash)) = (&info.blob_content, &info.after_hash) else {
+                            if !quiet {
+                                eprintln!("  [error] {purl}: no blob content served for {file}");
+                            }
+                            complete = false;
+                            break;
+                        };
+                        // Same key guard as the disk writer: the hash names the
+                        // lookup key the apply pipeline gates writes on.
+                        if !is_valid_blob_hash(hash) {
                             complete = false;
                             break;
                         }
+                        match base64_decode(b64) {
+                            Ok(bytes) => {
+                                mem.insert(hash.clone(), bytes);
+                            }
+                            Err(_) => {
+                                complete = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !complete {
+                        failed.push(purl);
                     }
                 }
-                if !complete {
-                    failed.push(purl);
+                _ => failed.push(purl),
+            }
+        }
+        if !failed.is_empty() {
+            if !quiet {
+                eprintln!(
+                    "Error: could not fetch patch content for {} patch(es):",
+                    failed.len()
+                );
+                for purl in failed.iter().take(5) {
+                    eprintln!("  - {}", purl);
                 }
             }
-            _ => failed.push(purl),
+            return Ok(MemStageOutcome::Unavailable);
         }
-    }
-    if !failed.is_empty() {
-        if !common.silent && !common.json {
-            eprintln!(
-                "Error: could not fetch patch content for {} patch(es):",
-                failed.len()
-            );
-            for purl in failed.iter().take(5) {
-                eprintln!("  - {}", purl);
-            }
-        }
-        return Ok(MemStageOutcome::Unavailable);
     }
 
     Ok(MemStageOutcome::Ready(MemStagedSources {

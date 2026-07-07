@@ -253,6 +253,65 @@ fn monorepo_scenarios_keep_their_negative_controls() {
     );
 }
 
+/// The headline guarantee — `setup` must NOT choke on the foreign manifests —
+/// is the driver's `setup_exit` field. `setup --yes` aggregates errors across
+/// ALL manifest kinds it edits (npm + python + gem + composer; see
+/// `run_setup` in commands/setup.rs) and exits 1 on `partial_failure`, so in
+/// the polyglot monorepo it can land the npm hook (⇒ `check` passes, the
+/// patch applies, every other round-trip probe looks healthy) and STILL choke
+/// on a foreign slice. The round-trip validator must flag that; if it only
+/// watches the check/install/remove exits, the exact regression this suite
+/// exists to catch passes green. Hermetic: feeds the validator a synthetic
+/// driver result, no docker.
+#[test]
+fn round_trip_flags_setup_choke_even_when_hook_lands() {
+    let case = smc::load_section(
+        "monorepo_targets",
+        "monorepo_scenarios",
+        "monorepo",
+        "monorepo",
+        "mono",
+    )
+    .into_iter()
+    .next()
+    .expect("at least one monorepo case");
+
+    // A driver result where every probe EXCEPT setup_exit is healthy —
+    // exactly what a hook-landed-then-choked setup produces.
+    let result = |setup_exit: i64| smc::RunResult {
+        actual_applied: true,
+        raw: String::new(),
+        parsed: Some(serde_json::json!({
+            "actual_applied": true,
+            "applied_before_setup": false,
+            "applied_after_remove": false,
+            "primary_marker_present": true,
+            "setup_exit": setup_exit,
+            "install_exit": 0,
+            "check_before_setup_exit": 2,
+            "check_after_setup_exit": 0,
+            "remove_exit": 0,
+            "check_after_remove_exit": 2,
+        })),
+    };
+
+    // Sanity: a fully healthy round trip must not be flagged.
+    assert_eq!(
+        smc::round_trip_failure(&case, &result(0)),
+        None,
+        "healthy synthetic round-trip result must pass"
+    );
+
+    let failure = smc::round_trip_failure(&case, &result(1)).expect(
+        "round_trip_failure must flag setup_exit=1: a `setup` that chokes on a foreign \
+         manifest after landing the npm hook currently passes the whole suite",
+    );
+    assert!(
+        failure.contains("setup exit"),
+        "failure message should name the setup exit problem, got: {failure}"
+    );
+}
+
 /// Defensive cross-check on the harness routing: `layout == "monorepo"` is the
 /// ONLY thing that makes a non-npm-family `pm` (here `mono`) take the
 /// round-trip + LEAK-detection path. If the driver's `is_npm_family` gate ever

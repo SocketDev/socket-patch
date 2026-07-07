@@ -3,30 +3,33 @@
 //! `vendor` rewires whichever lockfile actually drives the project's
 //! installs, so the probe sniffs lockfile CONTENT (not just file presence):
 //! a `pnpm-lock.yaml` only routes to the pnpm backend when its
-//! `lockfileVersion` is one we have fixtures for, and a `yarn.lock` is only
-//! "yarn classic" when it carries the v1 header (a berry lock — top-level
-//! `__metadata:` — checksums installs against its cache zips even under the
-//! node-modules linker, so vendoring is structurally impossible there).
+//! `lockfileVersion` is one we have fixtures for, and a `yarn.lock` routes
+//! to classic or berry by its header (the v1 comment vs a top-level
+//! `__metadata:` key). Only yarn PnP projects (`.pnp.*` loaders) are
+//! refused outright — their packages never land on disk to stage.
 //!
-//! The router fans `vendor`/`revert` out per detected flavor. Today only the
-//! package-lock backend ([`super::npm_lock`]) exists; the yarn-classic /
-//! pnpm / bun arms refuse with the same stable code the CLI's old layout
-//! gate used (`vendor_pkg_manager_unsupported`) and will be replaced by real
-//! backends. Reverts fail CLOSED on a flavor this build has no backend for —
-//! never guess at another flavor's wiring records.
+//! The router fans `vendor`/`revert` out per detected flavor. All five
+//! flavors have real backends: package-lock ([`super::npm_lock`]),
+//! yarn classic ([`super::yarn_classic_lock`]), yarn berry
+//! ([`super::yarn_berry_lock`]), pnpm ([`super::pnpm_lock`]), and bun
+//! ([`super::bun_lock`]); a lockfile the probe can't classify refuses with
+//! a stable code. Reverts fail CLOSED on a flavor this build has no
+//! backend for — never guess at another flavor's wiring records.
 
 use std::path::Path;
 
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::PatchSources;
 
-use super::npm_lock;
 use super::state::VendorEntry;
-use super::{RevertOutcome, VendorOutcome, VendorWarning};
+use super::{
+    bun_lock, npm_lock, pnpm_lock, yarn_berry_lock, yarn_classic_lock, RevertOutcome,
+    VendorOutcome, VendorWarning,
+};
 
 /// Which lockfile flavor drives this project's npm installs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NpmLockFlavor {
+pub(crate) enum NpmLockFlavor {
     /// `package-lock.json` / `npm-shrinkwrap.json` (npm).
     PackageLock,
     /// `yarn.lock` with the `# yarn lockfile v1` header (yarn classic).
@@ -41,7 +44,7 @@ pub enum NpmLockFlavor {
 
 impl NpmLockFlavor {
     /// The stable string recorded as [`VendorEntry::flavor`].
-    pub fn as_str(self) -> &'static str {
+    fn as_str(self) -> &'static str {
         match self {
             NpmLockFlavor::PackageLock => "package-lock",
             NpmLockFlavor::YarnClassic => "yarn-classic",
@@ -56,14 +59,9 @@ impl NpmLockFlavor {
 /// so there is nothing on disk to stage and no lockfile entry to rewire.
 const PNP_MARKERS: [&str; 3] = [".pnp.cjs", ".pnp.js", ".pnp.loader.mjs"];
 
-/// The pnpm lockfile version the (future) pnpm backend is built against.
-const PNPM_SUPPORTED_LOCK_VERSION: &str = "9.0";
-
-/// How many head lines the content sniffs read. The markers sit at the very
-/// top of their files (pnpm's `lockfileVersion` is line 1; yarn's v1 header
-/// is in the leading comment block; berry's `__metadata:` is the first
-/// top-level key after it).
-const SNIFF_HEAD_LINES: usize = 5;
+/// How many head lines the yarn content sniff reads (the v1 header sits in
+/// the leading comment block; berry's `__metadata:` is the first top-level
+/// key after it).
 const YARN_SNIFF_HEAD_LINES: usize = 30;
 
 /// Every lockfile name the probe knows, grouped into wiring families: the
@@ -102,7 +100,7 @@ const LOCKFILE_FAMILIES: [(NpmLockFlavor, &[&str]); 4] = [
 /// `Ok` carries one `vendor_multiple_lockfiles` warning per OTHER known
 /// lockfile present (outside the detected flavor's family): installs driven
 /// by an unwired lockfile would still install the unpatched registry bytes.
-pub async fn detect_npm_lock_flavor(
+pub(crate) async fn detect_npm_lock_flavor(
     project_root: &Path,
 ) -> Result<(NpmLockFlavor, Vec<VendorWarning>), (&'static str, String)> {
     let exists = |name: &str| {
@@ -140,9 +138,12 @@ pub async fn detect_npm_lock_flavor(
             ));
         }
 
-        // 3. pnpm: only lockfileVersion 9.0 has a wiring backend.
+        // 3. pnpm: only lockfileVersion 9.0 has a wiring backend (the sniff
+        //    is the pnpm backend's own pre-flight check).
         if exists("pnpm-lock.yaml").await {
-            sniff_pnpm_lock(project_root).await?;
+            let text = read_lock(project_root, "pnpm-lock.yaml").await?;
+            pnpm_lock::check_lock_version(&text)
+                .map_err(|detail| ("vendor_lockfile_version_unsupported", detail))?;
             break 'flavor NpmLockFlavor::Pnpm;
         }
 
@@ -189,10 +190,16 @@ pub async fn detect_npm_lock_flavor(
     };
 
     // Multiple lockfiles: warn about every present file the detected
-    // flavor's wiring does not cover.
+    // flavor's wiring does not cover. Both yarn flavors wire the same
+    // yarn.lock; the family table keys that family under YarnClassic, so a
+    // berry detection claims it too (never self-warn about the wired file).
+    let family_owner = match detected {
+        NpmLockFlavor::YarnBerry => NpmLockFlavor::YarnClassic,
+        other => other,
+    };
     let mut warnings = Vec::new();
     for (flavor, family) in LOCKFILE_FAMILIES {
-        if flavor == detected {
+        if flavor == family_owner {
             continue;
         }
         for file in family {
@@ -212,41 +219,17 @@ pub async fn detect_npm_lock_flavor(
     Ok((detected, warnings))
 }
 
-/// `pnpm-lock.yaml` head sniff: the first lines carry
-/// `lockfileVersion: '9.0'` (pnpm quotes it; accept double-quoted and bare
-/// spellings too). Anything else has no wiring backend.
-async fn sniff_pnpm_lock(project_root: &Path) -> Result<(), (&'static str, String)> {
-    let text = tokio::fs::read_to_string(project_root.join("pnpm-lock.yaml"))
+/// Read a lockfile for content-sniffing. An unreadable-but-present file maps
+/// to the same stable code as a missing one.
+async fn read_lock(project_root: &Path, name: &str) -> Result<String, (&'static str, String)> {
+    tokio::fs::read_to_string(project_root.join(name))
         .await
         .map_err(|e| {
             (
                 "vendor_lockfile_missing",
-                format!("cannot read pnpm-lock.yaml: {e}"),
+                format!("cannot read {name}: {e}"),
             )
-        })?;
-    let version = text
-        .lines()
-        .take(SNIFF_HEAD_LINES)
-        .find_map(|line| line.strip_prefix("lockfileVersion:"))
-        .map(|rest| rest.trim().trim_matches(['\'', '"']).to_string());
-    match version {
-        Some(v) if v == PNPM_SUPPORTED_LOCK_VERSION => Ok(()),
-        Some(v) => Err((
-            "vendor_lockfile_version_unsupported",
-            format!(
-                "pnpm-lock.yaml has lockfileVersion {v}; only {PNPM_SUPPORTED_LOCK_VERSION} \
-                 is supported — re-lock with pnpm >= 9"
-            ),
-        )),
-        None => Err((
-            "vendor_lockfile_version_unsupported",
-            format!(
-                "pnpm-lock.yaml has no lockfileVersion in its first {SNIFF_HEAD_LINES} \
-                 lines; only {PNPM_SUPPORTED_LOCK_VERSION} is supported — re-lock with \
-                 pnpm >= 9"
-            ),
-        )),
-    }
+        })
 }
 
 /// `yarn.lock` head sniff: berry locks carry a top-level (column-0)
@@ -254,14 +237,7 @@ async fn sniff_pnpm_lock(project_root: &Path) -> Result<(), (&'static str, Strin
 /// comment header. Berry wins the check — a berry lock must never be
 /// mistaken for classic.
 async fn sniff_yarn_lock(project_root: &Path) -> Result<NpmLockFlavor, (&'static str, String)> {
-    let text = tokio::fs::read_to_string(project_root.join("yarn.lock"))
-        .await
-        .map_err(|e| {
-            (
-                "vendor_lockfile_missing",
-                format!("cannot read yarn.lock: {e}"),
-            )
-        })?;
+    let text = read_lock(project_root, "yarn.lock").await?;
     let head: Vec<&str> = text.lines().take(YARN_SNIFF_HEAD_LINES).collect();
     // Berry wins the check (it must never be mistaken for classic). The
     // node-modules linker keeps packages on disk for staging, and berry's
@@ -303,77 +279,30 @@ pub async fn vendor_npm_any(
         Ok(found) => found,
         Err((code, detail)) => return VendorOutcome::Refused { code, detail },
     };
+    // Every backend takes the identical 9-argument tuple; the macro collapses
+    // the five-way repetition (same shape as the CLI dispatcher's `vend!`).
+    macro_rules! vend {
+        ($backend:path) => {
+            $backend(
+                purl,
+                installed_dir,
+                project_root,
+                record,
+                sources,
+                vendored_at,
+                dry_run,
+                force,
+                service,
+            )
+            .await
+        };
+    }
     let mut outcome = match flavor {
-        NpmLockFlavor::PackageLock => {
-            npm_lock::vendor_npm(
-                purl,
-                installed_dir,
-                project_root,
-                record,
-                sources,
-                vendored_at,
-                dry_run,
-                force,
-                service,
-            )
-            .await
-        }
-        NpmLockFlavor::YarnClassic => {
-            super::yarn_classic_lock::vendor_yarn_classic(
-                purl,
-                installed_dir,
-                project_root,
-                record,
-                sources,
-                vendored_at,
-                dry_run,
-                force,
-                service,
-            )
-            .await
-        }
-        NpmLockFlavor::YarnBerry => {
-            super::yarn_berry_lock::vendor_yarn_berry(
-                purl,
-                installed_dir,
-                project_root,
-                record,
-                sources,
-                vendored_at,
-                dry_run,
-                force,
-                service,
-            )
-            .await
-        }
-        NpmLockFlavor::Pnpm => {
-            super::pnpm_lock::vendor_pnpm(
-                purl,
-                installed_dir,
-                project_root,
-                record,
-                sources,
-                vendored_at,
-                dry_run,
-                force,
-                service,
-            )
-            .await
-        }
-        NpmLockFlavor::Bun => {
-            super::bun_lock::vendor_bun(
-                purl,
-                installed_dir,
-                project_root,
-                record,
-                sources,
-                vendored_at,
-                dry_run,
-                force,
-                service,
-            )
-            .await
-        }
+        NpmLockFlavor::PackageLock => vend!(npm_lock::vendor_npm),
+        NpmLockFlavor::YarnClassic => vend!(yarn_classic_lock::vendor_yarn_classic),
+        NpmLockFlavor::YarnBerry => vend!(yarn_berry_lock::vendor_yarn_berry),
+        NpmLockFlavor::Pnpm => vend!(pnpm_lock::vendor_pnpm),
+        NpmLockFlavor::Bun => vend!(bun_lock::vendor_bun),
     };
     // Probe warnings (e.g. a sibling lockfile that will install UNPATCHED
     // bytes) precede the backend's own; the ledger records which flavor wired
@@ -384,11 +313,7 @@ pub async fn vendor_npm_any(
         entry, warnings, ..
     } = &mut outcome
     {
-        if !probe_warnings.is_empty() {
-            let mut merged = probe_warnings;
-            merged.append(warnings);
-            *warnings = merged;
-        }
+        warnings.splice(0..0, probe_warnings);
         if let Some(entry) = entry {
             entry.flavor = Some(flavor.as_str().to_string());
         }
@@ -411,7 +336,7 @@ pub async fn vendor_npm_any(
 /// never be routed here (the probe would always call them unused).
 pub async fn vendored_entry_in_use(entry: &VendorEntry, project_root: &Path) -> Option<bool> {
     match entry.flavor.as_deref() {
-        Some("pnpm") => super::pnpm_lock::pnpm_entry_in_use(entry, project_root).await,
+        Some("pnpm") => pnpm_lock::pnpm_entry_in_use(entry, project_root).await,
         // The remaining flavors wire resolutions into the lock itself
         // (resolved URLs / file: ranges / package tuples), so a textual
         // probe for the uuid dir is exact: the path appears iff some
@@ -456,13 +381,13 @@ pub async fn revert_npm_any(
     match entry.flavor.as_deref() {
         None | Some("package-lock") => npm_lock::revert_npm(entry, project_root, dry_run).await,
         Some("yarn-classic") => {
-            super::yarn_classic_lock::revert_yarn_classic(entry, project_root, dry_run).await
+            yarn_classic_lock::revert_yarn_classic(entry, project_root, dry_run).await
         }
         Some("yarn-berry") => {
-            super::yarn_berry_lock::revert_yarn_berry(entry, project_root, dry_run).await
+            yarn_berry_lock::revert_yarn_berry(entry, project_root, dry_run).await
         }
-        Some("pnpm") => super::pnpm_lock::revert_pnpm(entry, project_root, dry_run).await,
-        Some("bun") => super::bun_lock::revert_bun(entry, project_root, dry_run).await,
+        Some("pnpm") => pnpm_lock::revert_pnpm(entry, project_root, dry_run).await,
+        Some("bun") => bun_lock::revert_bun(entry, project_root, dry_run).await,
         Some(other) => RevertOutcome::failed(format!(
             "this socket-patch build cannot revert npm vendor flavor `{other}` — upgrade \
              socket-patch and re-run"
@@ -482,12 +407,6 @@ mod tests {
 
     async fn touch(root: &Path, name: &str, content: &str) {
         tokio::fs::write(root.join(name), content).await.unwrap();
-    }
-
-    async fn detect(
-        root: &Path,
-    ) -> Result<(NpmLockFlavor, Vec<VendorWarning>), (&'static str, String)> {
-        detect_npm_lock_flavor(root).await
     }
 
     const YARN_V1: &str = "# THIS IS AN AUTOGENERATED FILE. DO NOT EDIT THIS FILE DIRECTLY.\n\
@@ -513,7 +432,7 @@ mod tests {
             touch(tmp.path(), marker, "/* pnp */").await;
             // Even with a perfectly good package-lock present.
             touch(tmp.path(), "package-lock.json", "{}").await;
-            let (code, detail) = detect(tmp.path()).await.unwrap_err();
+            let (code, detail) = detect_npm_lock_flavor(tmp.path()).await.unwrap_err();
             assert_eq!(code, "vendor_yarn_berry_unsupported", "{marker}");
             assert!(detail.contains(marker), "{detail}");
             assert!(detail.contains("yarn patch"), "{detail}");
@@ -524,20 +443,20 @@ mod tests {
     async fn bun_lock_routes_and_lockb_refuses() {
         let tmp = tempfile::tempdir().unwrap();
         touch(tmp.path(), "bun.lock", "{\n  \"lockfileVersion\": 1\n}\n").await;
-        let (flavor, warnings) = detect(tmp.path()).await.unwrap();
+        let (flavor, warnings) = detect_npm_lock_flavor(tmp.path()).await.unwrap();
         assert_eq!(flavor, NpmLockFlavor::Bun);
         assert!(warnings.is_empty());
 
         // bun.lock wins over a stray bun.lockb (no warning for the sibling).
         touch(tmp.path(), "bun.lockb", "binary").await;
-        let (flavor, warnings) = detect(tmp.path()).await.unwrap();
+        let (flavor, warnings) = detect_npm_lock_flavor(tmp.path()).await.unwrap();
         assert_eq!(flavor, NpmLockFlavor::Bun);
         assert!(warnings.is_empty(), "{warnings:?}");
 
         // lockb alone: actionable migration pointer.
         let tmp = tempfile::tempdir().unwrap();
         touch(tmp.path(), "bun.lockb", "binary").await;
-        let (code, detail) = detect(tmp.path()).await.unwrap_err();
+        let (code, detail) = detect_npm_lock_flavor(tmp.path()).await.unwrap_err();
         assert_eq!(code, "vendor_bun_lockb_unsupported");
         assert!(
             detail.contains("bun install --save-text-lockfile"),
@@ -560,14 +479,14 @@ mod tests {
                 &format!("{head}\n\nsettings: {{}}\n"),
             )
             .await;
-            let (flavor, _) = detect(tmp.path()).await.unwrap();
+            let (flavor, _) = detect_npm_lock_flavor(tmp.path()).await.unwrap();
             assert_eq!(flavor, NpmLockFlavor::Pnpm, "{head}");
         }
 
         // Older version: named in the error.
         let tmp = tempfile::tempdir().unwrap();
         touch(tmp.path(), "pnpm-lock.yaml", "lockfileVersion: '6.0'\n").await;
-        let (code, detail) = detect(tmp.path()).await.unwrap_err();
+        let (code, detail) = detect_npm_lock_flavor(tmp.path()).await.unwrap_err();
         assert_eq!(code, "vendor_lockfile_version_unsupported");
         assert!(detail.contains("6.0"), "{detail}");
         assert!(detail.contains("pnpm >= 9"), "{detail}");
@@ -580,7 +499,7 @@ mod tests {
             "settings:\n  autoInstallPeers: true\n",
         )
         .await;
-        let (code, _) = detect(tmp.path()).await.unwrap_err();
+        let (code, _) = detect_npm_lock_flavor(tmp.path()).await.unwrap_err();
         assert_eq!(code, "vendor_lockfile_version_unsupported");
     }
 
@@ -588,7 +507,7 @@ mod tests {
     async fn yarn_sniff_separates_classic_berry_and_unknown() {
         let tmp = tempfile::tempdir().unwrap();
         touch(tmp.path(), "yarn.lock", YARN_V1).await;
-        let (flavor, _) = detect(tmp.path()).await.unwrap();
+        let (flavor, _) = detect_npm_lock_flavor(tmp.path()).await.unwrap();
         assert_eq!(flavor, NpmLockFlavor::YarnClassic);
 
         // A berry (node-modules) lock now routes to the YarnBerry backend
@@ -596,13 +515,37 @@ mod tests {
         // Only PnP (`.pnp.*` markers, caught earlier) stays refused.
         let tmp = tempfile::tempdir().unwrap();
         touch(tmp.path(), "yarn.lock", YARN_BERRY).await;
-        let (flavor, _) = detect(tmp.path()).await.unwrap();
+        let (flavor, _) = detect_npm_lock_flavor(tmp.path()).await.unwrap();
         assert_eq!(flavor, NpmLockFlavor::YarnBerry);
 
         let tmp = tempfile::tempdir().unwrap();
         touch(tmp.path(), "yarn.lock", "garbage: true\n").await;
-        let (code, _) = detect(tmp.path()).await.unwrap_err();
+        let (code, _) = detect_npm_lock_flavor(tmp.path()).await.unwrap_err();
         assert_eq!(code, "vendor_lockfile_version_unsupported");
+    }
+
+    #[tokio::test]
+    async fn yarn_berry_does_not_warn_about_its_own_yarn_lock() {
+        // The berry backend wires yarn.lock itself — detecting berry from
+        // that file must not emit a vendor_multiple_lockfiles warning
+        // claiming installs driven by yarn.lock get UNPATCHED bytes.
+        let tmp = tempfile::tempdir().unwrap();
+        touch(tmp.path(), "yarn.lock", YARN_BERRY).await;
+        let (flavor, warnings) = detect_npm_lock_flavor(tmp.path()).await.unwrap();
+        assert_eq!(flavor, NpmLockFlavor::YarnBerry);
+        assert!(warnings.is_empty(), "{warnings:?}");
+
+        // Genuinely unwired siblings still warn — exactly one, for the
+        // stray package-lock.json, never for yarn.lock.
+        touch(tmp.path(), "package-lock.json", "{}").await;
+        let (flavor, warnings) = detect_npm_lock_flavor(tmp.path()).await.unwrap();
+        assert_eq!(flavor, NpmLockFlavor::YarnBerry);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].detail.contains("package-lock.json"),
+            "{warnings:?}"
+        );
+        assert!(!warnings[0].detail.contains("`yarn.lock`"), "{warnings:?}");
     }
 
     #[tokio::test]
@@ -610,23 +553,23 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         touch(tmp.path(), "package-lock.json", "{}").await;
         assert_eq!(
-            detect(tmp.path()).await.unwrap().0,
+            detect_npm_lock_flavor(tmp.path()).await.unwrap().0,
             NpmLockFlavor::PackageLock
         );
 
         let tmp = tempfile::tempdir().unwrap();
         touch(tmp.path(), "npm-shrinkwrap.json", "{}").await;
-        let (flavor, warnings) = detect(tmp.path()).await.unwrap();
+        let (flavor, warnings) = detect_npm_lock_flavor(tmp.path()).await.unwrap();
         assert_eq!(flavor, NpmLockFlavor::PackageLock);
         assert!(warnings.is_empty());
 
         // Shrinkwrap + package-lock are the same family: no self-warning.
         touch(tmp.path(), "package-lock.json", "{}").await;
-        let (_, warnings) = detect(tmp.path()).await.unwrap();
+        let (_, warnings) = detect_npm_lock_flavor(tmp.path()).await.unwrap();
         assert!(warnings.is_empty(), "{warnings:?}");
 
         let tmp = tempfile::tempdir().unwrap();
-        let (code, _) = detect(tmp.path()).await.unwrap_err();
+        let (code, _) = detect_npm_lock_flavor(tmp.path()).await.unwrap_err();
         assert_eq!(code, "vendor_lockfile_missing");
     }
 
@@ -636,7 +579,7 @@ mod tests {
         // rush.json and its generated-workspace lock under common/config.
         let tmp = tempfile::tempdir().unwrap();
         touch(tmp.path(), "rush.json", r#"{"rushVersion":"5.0.0"}"#).await;
-        let (code, detail) = detect(tmp.path()).await.unwrap_err();
+        let (code, detail) = detect_npm_lock_flavor(tmp.path()).await.unwrap_err();
         assert_eq!(code, "vendor_rush_unsupported");
         // Names the install model and routes to hosted mode.
         assert!(detail.contains("pnpm-config.json"), "{detail}");
@@ -657,7 +600,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         touch(tmp.path(), "rush.json", r#"{"rushVersion":"5.0.0"}"#).await;
         touch(tmp.path(), "package-lock.json", "{}").await;
-        let (flavor, _) = detect(tmp.path()).await.unwrap();
+        let (flavor, _) = detect_npm_lock_flavor(tmp.path()).await.unwrap();
         assert_eq!(flavor, NpmLockFlavor::PackageLock);
     }
 
@@ -670,7 +613,7 @@ mod tests {
         touch(tmp.path(), "pnpm-lock.yaml", PNPM_9).await;
         touch(tmp.path(), "yarn.lock", YARN_V1).await;
         touch(tmp.path(), "package-lock.json", "{}").await;
-        let (flavor, warnings) = detect(tmp.path()).await.unwrap();
+        let (flavor, warnings) = detect_npm_lock_flavor(tmp.path()).await.unwrap();
         assert_eq!(flavor, NpmLockFlavor::Bun);
         let named: Vec<&str> = warnings.iter().map(|w| w.detail.as_str()).collect();
         assert_eq!(warnings.len(), 3, "{named:?}");
@@ -691,7 +634,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         touch(tmp.path(), "package-lock.json", "{}").await;
         touch(tmp.path(), "yarn.lock", YARN_V1).await;
-        let (flavor, warnings) = detect(tmp.path()).await.unwrap();
+        let (flavor, warnings) = detect_npm_lock_flavor(tmp.path()).await.unwrap();
         assert_eq!(flavor, NpmLockFlavor::YarnClassic);
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(
@@ -840,28 +783,7 @@ mod tests {
     #[tokio::test]
     async fn revert_routes_by_flavor_and_fails_closed_on_unknown() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut entry = VendorEntry {
-            ecosystem: "npm".into(),
-            base_purl: "pkg:npm/left-pad@1.3.0".into(),
-            uuid: UUID.into(),
-            artifact: VendorArtifact {
-                path: format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz"),
-                sha256: String::new(),
-                size: None,
-                platform_locked: None,
-            },
-            wiring: Vec::new(),
-            lock: None,
-            took_over_go_patches: false,
-            detached: false,
-            record: None,
-            flavor: Some("future-pm".into()),
-            uv: None,
-            pnpm: None,
-            poetry: None,
-            pdm: None,
-            pipenv: None,
-        };
+        let mut entry = probe_entry(Some("future-pm"));
 
         // A flavor this build has no backend for: fail closed, name it.
         let outcome = revert_npm_any(&entry, tmp.path(), false).await;
@@ -884,7 +806,7 @@ mod tests {
         }
     }
 
-    /// One minimal entry per flavor for the in-use probe.
+    /// One minimal npm vendor entry stamped with the given flavor.
     fn probe_entry(flavor: Option<&str>) -> VendorEntry {
         VendorEntry {
             ecosystem: "npm".into(),

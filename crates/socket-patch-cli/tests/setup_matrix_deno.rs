@@ -78,55 +78,31 @@ mod host_guard {
     const DENO_JSON: &str =
         "{ \"name\": \"sm-proj\", \"version\": \"0.0.0\", \"nodeModulesDir\": \"auto\" }\n";
 
-    /// Every `SOCKET_*` env var clap consults for the `setup` surface this
-    /// test drives. The round-trip's whole signal is the contrast between
-    /// flag-present and flag-absent runs (`--check`, `--yes`, `--cwd`,
-    /// `--remove`); an ambient `SOCKET_CWD` / `SOCKET_YES` / `SOCKET_OFFLINE`
-    /// / `SOCKET_MANIFEST_PATH` etc. in the shell or CI could stand in for a
-    /// flag and mask a flag-handling regression (e.g. `--cwd` being ignored,
-    /// or `--check` silently succeeding). Strip the full surface so behaviour
-    /// reflects the explicit flags alone. Mirrors `setup_matrix_pypi.rs`.
-    const SOCKET_ENV_VARS: &[&str] = &[
-        "SOCKET_CWD",
-        "SOCKET_MANIFEST_PATH",
-        "SOCKET_API_URL",
-        "SOCKET_API_TOKEN",
-        "SOCKET_ORG_SLUG",
-        "SOCKET_PROXY_URL",
-        "SOCKET_ECOSYSTEMS",
-        "SOCKET_DOWNLOAD_MODE",
-        "SOCKET_OFFLINE",
-        "SOCKET_GLOBAL",
-        "SOCKET_GLOBAL_PREFIX",
-        "SOCKET_JSON",
-        "SOCKET_VERBOSE",
-        "SOCKET_SILENT",
-        "SOCKET_DRY_RUN",
-        "SOCKET_YES",
-        "SOCKET_LOCK_TIMEOUT",
-        "SOCKET_BREAK_LOCK",
-        "SOCKET_DEBUG",
-        "SOCKET_TELEMETRY_DISABLED",
-        "SOCKET_SAVE_ONLY",
-        "SOCKET_ONE_OFF",
-        "SOCKET_ALL_RELEASES",
-    ];
-
     /// Absolute path to the binary under test, via cargo's `CARGO_BIN_EXE_*`.
     fn binary() -> std::path::PathBuf {
         env!("CARGO_BIN_EXE_socket-patch").into()
     }
 
     /// Run the CLI with `args` in `cwd`; returns `(exit_code, stdout, stderr)`.
-    /// The entire `SOCKET_*` surface is stripped so behaviour reflects the
-    /// explicit flags alone (see [`SOCKET_ENV_VARS`]) — nothing reaches authed
-    /// endpoints and no ambient var can stand in for a flag.
+    /// The entire `SOCKET_*` surface is stripped BY PREFIX — a fixed list rots
+    /// (this file's missed `SOCKET_STRICT` / `SOCKET_VENDOR_SOURCE`, both
+    /// parsed on every `setup` invocation; see [`HOSTILE_DECOYS`]) — so
+    /// behaviour reflects the explicit flags alone: nothing reaches authed
+    /// endpoints and no ambient var can stand in for a flag. Mirrors
+    /// `setup_matrix_pypi.rs`.
     fn run(cwd: &Path, args: &[&str]) -> (i32, String, String) {
         let mut cmd = Command::new(binary());
         cmd.args(args).current_dir(cwd);
-        for var in SOCKET_ENV_VARS {
-            cmd.env_remove(var);
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("SOCKET_") {
+                cmd.env_remove(&key);
+            }
         }
+        // This guard's contract is "no network" (module docs): `setup` fires a
+        // usage-telemetry POST when telemetry is enabled, and the scrub above
+        // would strip a developer's own opt-out. Force it off for the child —
+        // no assertion here concerns telemetry.
+        cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
         let out = cmd.output().expect("failed to execute socket-patch binary");
         (
             out.status.code().unwrap_or(-1),
@@ -176,8 +152,28 @@ mod host_guard {
         );
     }
 
+    /// Ambient decoys `run()`'s scrub must strip. Two failure classes:
+    /// clap parses env-bound values on EVERY invocation whether or not the
+    /// command uses the flag, so an invalid ambient `SOCKET_STRICT` /
+    /// `SOCKET_VENDOR_SOURCE` aborts the parse (exit 2) before `setup` even
+    /// runs; and `SOCKET_SETUP_EXCLUDE` stands in for `setup --exclude` —
+    /// the exact surface under test. Planted by the roundtrip test itself so
+    /// the scrub is exercised on every run, not only in hostile shells.
+    /// (Safe to set process-wide: the only other test in this binary routes
+    /// through `smc::host_driver_command`, which prefix-scrubs `SOCKET_*`.)
+    const HOSTILE_DECOYS: &[(&str, &str)] = &[
+        ("SOCKET_STRICT", "banana"),
+        ("SOCKET_VENDOR_SOURCE", "bogus-decoy"),
+        ("SOCKET_VENDOR_URL", "http://127.0.0.1:9/decoy"),
+        ("SOCKET_PATCH_SERVER_URL", "http://127.0.0.1:9/decoy"),
+        ("SOCKET_SETUP_EXCLUDE", "decoy-member"),
+    ];
+
     #[test]
     fn deno_setup_roundtrip_host() {
+        for (k, v) in HOSTILE_DECOYS {
+            std::env::set_var(k, v);
+        }
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         std::fs::write(root.join("package.json"), PACKAGE_JSON).unwrap();
@@ -333,5 +329,9 @@ mod host_guard {
             Some(0),
             "no manifest may report configured after the hook is removed.\n{out}"
         );
+
+        for (k, _) in HOSTILE_DECOYS {
+            std::env::remove_var(k);
+        }
     }
 }

@@ -14,46 +14,26 @@ fn binary() -> PathBuf {
     env!("CARGO_BIN_EXE_socket-patch").into()
 }
 
-/// Every `SOCKET_*` env var that `GlobalArgs` / `RollbackArgs` read as a flag
-/// fallback. The child process inherits the parent's environment, so an
-/// ambient value here would let a test pass via the environment instead of via
-/// the flag (and the real code path) it is named after — e.g. an ambient
-/// `SOCKET_OFFLINE=true` would satisfy the `--offline` tests even if `--offline`
-/// were broken, and `SOCKET_MANIFEST_PATH` would silently redirect the manifest
-/// out from under the no-manifest / override tests. Scrub the whole surface so
-/// behavior is driven only by the explicit args we pass.
-const SOCKET_ENV_VARS: &[&str] = &[
-    "SOCKET_API_TOKEN",
-    "SOCKET_CWD",
-    "SOCKET_MANIFEST_PATH",
-    "SOCKET_API_URL",
-    "SOCKET_ORG_SLUG",
-    "SOCKET_PROXY_URL",
-    "SOCKET_ECOSYSTEMS",
-    "SOCKET_DOWNLOAD_MODE",
-    "SOCKET_OFFLINE",
-    "SOCKET_GLOBAL",
-    "SOCKET_GLOBAL_PREFIX",
-    "SOCKET_JSON",
-    "SOCKET_VERBOSE",
-    "SOCKET_SILENT",
-    "SOCKET_DRY_RUN",
-    "SOCKET_YES",
-    "SOCKET_LOCK_TIMEOUT",
-    "SOCKET_BREAK_LOCK",
-    "SOCKET_DEBUG",
-    "SOCKET_TELEMETRY_DISABLED",
-    "SOCKET_ONE_OFF",
-];
-
 /// A `rollback` command with the full `SOCKET_*` environment scrubbed and the
 /// working directory pinned. All tests build their child process through here
 /// so none can be satisfied by ambient environment instead of the code path.
+///
+/// The child process inherits the parent's environment, so an ambient value
+/// would let a test pass via the environment instead of via the flag (and the
+/// real code path) it is named after — e.g. an ambient `SOCKET_OFFLINE=true`
+/// would satisfy the `--offline` tests even if `--offline` were broken, and
+/// `SOCKET_MANIFEST_PATH` would silently redirect the manifest out from under
+/// the no-manifest / override tests. Scrub by prefix, not by list: an explicit
+/// list rots as flags are added (it missed `SOCKET_VENDOR_SOURCE`, whose
+/// ambient garbage aborted every invocation with a clap usage error). Tests
+/// that need a `SOCKET_*` var seed it AFTER this scrub via `.env()`.
 fn rollback_cmd(cwd: &Path) -> Command {
     let mut cmd = Command::new(binary());
     cmd.arg("rollback").current_dir(cwd);
-    for var in SOCKET_ENV_VARS {
-        cmd.env_remove(var);
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("SOCKET_") {
+            cmd.env_remove(&key);
+        }
     }
     cmd
 }

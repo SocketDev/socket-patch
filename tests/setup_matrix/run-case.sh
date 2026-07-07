@@ -681,7 +681,8 @@ export XDG_CACHE_HOME="$WORKDIR/.cache"
 # observation so the lifecycle hook acts on a pristine package. This verifies
 # behavior end-to-end rather than reading package.json:
 #   * patch: NOT applied before setup → applied after setup → NOT applied after remove
-#   * check: fails before setup → passes after setup → fails after remove
+#   * check: fails before setup → passes after the post-setup install (hook
+#     present AND patches applied on disk) → fails after remove
 #
 # Every other case (run_setup=0, or non-npm-family ecosystems) keeps the simple
 # single-install flow, preserving the existing aspirational expect_applied
@@ -705,20 +706,25 @@ if is_npm_family && [ "$SM_RUN_SETUP" = 1 ]; then
   "$SP_BIN" setup --check --json; CHECK_BEFORE_SETUP_EXIT=$?
   log "check-before-setup exit=$CHECK_BEFORE_SETUP_EXIT"
 
-  # (3) setup, then check must report "configured" (zero).
+  # (3) setup must succeed. (Its `--check` is probed AFTER the next install:
+  # since contract property 4 shipped, check also verifies on-disk patch
+  # consistency, and right after `setup` the pre-hook install from (1) is
+  # legitimately still unpatched — check would fail there by design.)
   log "running: socket-patch setup --yes"
   "$SP_BIN" setup --yes --json; SETUP_EXIT=$?
   log "setup exit=$SETUP_EXIT"
   [ -f package.json ] && { log "package.json scripts after setup:"; grep -A6 '"scripts"' package.json || true; }
-  "$SP_BIN" setup --check --json; CHECK_AFTER_SETUP_EXIT=$?
-  log "check-after-setup exit=$CHECK_AFTER_SETUP_EXIT"
 
-  # (4) AFTER setup: clean reinstall → the hook fires → MAIN applied result.
+  # (4) AFTER setup: clean reinstall → the hook fires → MAIN applied result;
+  # NOW check must report "configured" (zero): hooks present AND patches
+  # applied on disk — the contract's correctly-patched state.
   reset_modules
   log "[after-setup] install for pm=$SM_PM (layout=$SM_LAYOUT)"
   do_install; INSTALL_EXIT=$?
   log "[after-setup] install exit=$INSTALL_EXIT"
   verify_applied   # sets the canonical APPLIED / PRIMARY_PRESENT / TARGET
+  "$SP_BIN" setup --check --json; CHECK_AFTER_SETUP_EXIT=$?
+  log "check-after-setup exit=$CHECK_AFTER_SETUP_EXIT"
 
   # (5) remove, then check must report "needs configuration" (non-zero) again.
   log "running: socket-patch setup --remove --yes"

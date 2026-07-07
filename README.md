@@ -25,7 +25,7 @@ socket-patch delivers the same patched bytes three different ways. The modes dif
 | golang | ✅ `go.mod` `replace` → `.socket/go-patches/` | ✅ `replace` → the committed vendor tree | ❌ **not possible** — sumdb, module-path identity, and default-GOPROXY leakage each rule it out; see [docs/design/golang-hosted-no-go.md](docs/design/golang-hosted-no-go.md). **Use vendored** (`redirect_golang_unsupported` names the remedy) |
 | maven | ⚠️ experimental — gated behind `SOCKET_EXPERIMENTAL_MAVEN=1` (in-place jar patching corrupts the `~/.m2` checksum sidecars); prefer vendored / hosted | ✅ **new** — committed maven2 `file://` repository. A root pom declaring `<modules>` (multi-module aggregator) is refused (`vendor_maven_multimodule_unsupported`), and a gradle-only project is refused (`vendor_gradle_unsupported`) | ✅ **pom projects only, fail-closed** — the patched jar is served under a Socket-only `<version>-socket.<hex8>` suffix, so the rewriter pins that version (rewrite the literal `<version>`, or add a `<dependencyManagement>` entry for a transitive) alongside the `<repository>` insert (`checksumPolicy=fail`). An outage or tamper on the Socket repo then hard-fails the build — the suffixed version exists nowhere else, so there is no silent fall-through to Central. Optionally emits Maven 3.9+ Trusted Checksums files pinning the jar + pom sha256. `${property}` versions are refused. Gradle builds get a paste-able `exclusiveContent` snippet (`redirect_gradle_manual_snippet`); no build script is edited. See [Maven & NuGet caveats](#maven--nuget-caveats) |
 | nuget | ⚠️ experimental — gated behind `SOCKET_EXPERIMENTAL_NUGET=1` (in-place patching breaks the `.nupkg.sha512` tamper-evidence sidecar); prefer vendored / hosted | ✅ **new** — committed folder feed + `packageSourceMapping` + `packages.lock.json` contentHash pin | ✅ `nuget.config` source + source-mapping, `packages.lock.json` contentHash rewrite. See the locked-mode note in [Maven & NuGet caveats](#maven--nuget-caveats) |
-| composer | ✅ post-install script events (opt-in `composer` compile feature) | ✅ `composer.lock` `dist: path` rewrite | ✅ `composer.lock` dist url + shasum rewrite |
+| composer | ✅ post-install script events | ✅ `composer.lock` `dist: path` rewrite | ✅ `composer.lock` dist url + shasum rewrite |
 
 > **Maven / NuGet discovery gate**: discovering *installed* Maven and NuGet packages (the crawl behind `scan` / `apply` / `vendor`) currently requires the same `SOCKET_EXPERIMENTAL_MAVEN=1` / `SOCKET_EXPERIMENTAL_NUGET=1` opt-in in every mode. The vendored/hosted wiring itself is safe — the gate guards the agent-mode sidecar risk.
 
@@ -105,12 +105,8 @@ pip install socket-patch
 cargo install socket-patch-cli
 ```
 
-By default this builds with npm, PyPI, and Cargo support. For additional
-ecosystems:
-
-```bash
-cargo install socket-patch-cli --features golang,maven,composer,nuget,deno
-```
+This builds with every supported ecosystem (npm, PyPI, Ruby gems, Cargo,
+Go, Maven, Composer, NuGet, Deno) compiled in.
 
 ### RubyGems
 
@@ -150,7 +146,7 @@ Each flag has a matching `SOCKET_*` environment variable. **Precedence is CLI ar
 | Flag | Env var | Description |
 |------|---------|-------------|
 | `--cwd <dir>` | `SOCKET_CWD` | Working directory (default: `.`). The manifest path is resolved relative to this. |
-| `-m, --manifest-path <path>` | `SOCKET_MANIFEST_PATH` | Path to the patch manifest, resolved relative to `--cwd` (default: `.socket/manifest.json`). |
+| `--manifest-path <path>` | `SOCKET_MANIFEST_PATH` | Path to the patch manifest, resolved relative to `--cwd` (default: `.socket/manifest.json`). |
 | `--api-url <url>` | `SOCKET_API_URL` | Socket API URL for the authenticated endpoint (default: `https://api.socket.dev`). |
 | `--api-token <token>` | `SOCKET_API_TOKEN` | Socket API token. When omitted, the public patch proxy is used. |
 | `-o, --org <slug>` | `SOCKET_ORG_SLUG` | Organization slug. Auto-resolved when omitted and a token is set. |
@@ -161,15 +157,16 @@ Each flag has a matching `SOCKET_*` environment variable. **Precedence is CLI ar
 | `--vendor-url <url>` | `SOCKET_VENDOR_URL` | Base host for the vendoring service's package-reference request (default: the active `--api-url`/`--proxy-url` base). Point at staging / local dev for testing. |
 | `--patch-server-url <url>` | `SOCKET_PATCH_SERVER_URL` | Override the host of the prebuilt-archive download URL the service returns (default: as returned). Mainly for local-dev / testing. |
 | `--offline` | `SOCKET_OFFLINE` | Strict airgap: never contact the network. Operations that need remote data fail loudly. |
+| `--strict` | `SOCKET_STRICT` | Fail-closed on before-hash mismatches instead of the default warn-and-overwrite: a file whose current content matches neither `beforeHash` nor `afterHash` aborts that package's apply. Overridden by `--force`. |
 | `-g, --global` | `SOCKET_GLOBAL` | Operate on globally-installed packages. |
 | `--global-prefix <path>` | `SOCKET_GLOBAL_PREFIX` | Override the path used to discover globally-installed packages. |
-| `-j, --json` | `SOCKET_JSON` | Emit machine-readable JSON output. Every JSON response includes a `"status"` field (`"success"`, `"error"`, `"no_manifest"`, etc.) for reliable programmatic consumption. |
+| `-j, --json` | `SOCKET_JSON` | Emit machine-readable JSON output. Every JSON response includes a `"status"` field — camelCase on the envelope commands (`"success"`, `"error"`, `"noManifest"`, `"partialFailure"`; apply/list/repair/remove/vendor), snake_case on the legacy shapes (`"partial_failure"`, `"not_found"`; get/scan/rollback/setup). See [CLI_CONTRACT.md](crates/socket-patch-cli/CLI_CONTRACT.md) for the exact shapes. |
 | `-v, --verbose` | `SOCKET_VERBOSE` | Show extra detail in human-readable output. |
 | `-s, --silent` | `SOCKET_SILENT` | Suppress non-error output. |
 | `--dry-run` | `SOCKET_DRY_RUN` | Preview the operation without making any mutations. |
 | `-y, --yes` | `SOCKET_YES` | Skip interactive confirmation prompts. |
 | `--lock-timeout <secs>` | `SOCKET_LOCK_TIMEOUT` | Seconds to wait for `.socket/apply.lock` before giving up. `0`/unset = a single non-blocking try; a positive value retries with backoff. Only meaningful for mutating commands (`apply`, `rollback`, `repair`, `remove`). |
-| `--break-lock` | `SOCKET_BREAK_LOCK` | Force-remove a stale `.socket/apply.lock` before acquiring it. Use only when no other socket-patch process is running; emits an auditable `lock_broken` event in the JSON envelope. |
+| `--break-lock` | `SOCKET_BREAK_LOCK` | Reclaim a stale `.socket/apply.lock` (one left by a crashed run) before acquiring it — the file itself is never deleted, and a lock with a live holder is refused. Use only when no other socket-patch process is running; emits an auditable `lock_broken` event in the JSON envelope. |
 | `--debug` | `SOCKET_DEBUG` | Emit verbose debug logs to stderr. |
 | `--no-telemetry` | `SOCKET_TELEMETRY_DISABLED` | Disable anonymous usage telemetry. |
 
@@ -536,6 +533,34 @@ socket-patch repair --download-only
 socket-patch repair --json
 ```
 
+### `unlock`
+
+Inspect — and optionally release — the `.socket/apply.lock` advisory lock that the mutating commands (`apply`, `rollback`, `repair`, `remove`, `vendor`) take. Exits `0` when the lock is free and `1` when another socket-patch process holds it, so CI gates and monitoring can pattern-match the exit code without parsing JSON.
+
+Reach for it when recovering from a crashed run that left a stale `apply.lock` behind: `unlock` tells you whether anything still holds the lock, and `unlock --release` deletes the file once it's confirmed free. A held lock is never released — for that scenario re-run the failing mutating command with [`--break-lock`](#global-options) (or wait for the holder with `--lock-timeout`).
+
+**Usage:**
+```bash
+socket-patch unlock [options]
+```
+
+**Command-specific options** (plus all [Global Options](#global-options)):
+| Flag | Description |
+|------|-------------|
+| `--release` | When the lock is free, also delete the lock file (it is normally retained across runs). Refused when the lock is held. (env: `SOCKET_UNLOCK_RELEASE`) |
+
+**Examples:**
+```bash
+# Is anything holding the lock?
+socket-patch unlock
+
+# Free a stale lock left by a crashed run
+socket-patch unlock --release
+
+# JSON output for scripting
+socket-patch unlock --json
+```
+
 ### `setup`
 
 Configure your project so patches are **re-applied automatically after install** — no manual `socket-patch apply` step in CI. `setup` is a one-time operation: run it, commit the change together with your `.socket/` patches, and every later install handles the rest. It is strictly **opt-in** — nothing is hooked unless you run `setup` and commit the result.
@@ -543,7 +568,7 @@ Configure your project so patches are **re-applied automatically after install**
 - **npm / yarn / pnpm / bun** — writes a `postinstall` script into `package.json` so any install re-applies patches (pnpm: root package only).
 - **Python (pip / uv / poetry / pdm / hatch)** — Python has no universal post-install hook, so `setup` instead commits a **`socket-patch[hook]`** dependency (for classic Poetry, the equivalent `socket-patch = { extras = ["hook"] }`). Installing it lays down a startup `.pth` (shipped by the small `socket-patch-hook` wheel) that re-applies your committed `.socket/` patches the next time the interpreter runs. It is package-manager-agnostic (it rides the interpreter, not any one installer) and **fail-open** — a hook error can never break interpreter startup.
 - **Ruby gems (Bundler)** — adds a managed `plugin "socket-patch"` block to the `Gemfile` and commits an in-tree Bundler plugin under `.socket/bundler-plugin/`. It re-applies patches on every `bundle install` (cached *and* fresh). (Requires the `socket-patch` CLI on `PATH`.)
-- **Composer (PHP)** *(opt-in `composer` feature)* — appends `socket-patch apply` to `composer.json`'s `post-install-cmd` / `post-update-cmd` script events, so patches re-apply on every `composer install` / `composer update`. Only available in a build compiled with `--features composer`. (Requires the `socket-patch` CLI on `PATH`.)
+- **Composer (PHP)** — appends `socket-patch apply` to `composer.json`'s `post-install-cmd` / `post-update-cmd` script events, so patches re-apply on every `composer install` / `composer update`. (Requires the `socket-patch` CLI on `PATH`.)
 - **Cargo & Go** — *apply-only, no `setup` hook.* A one-click auto-repatch-on-build isn't possible for these, so `setup` skips them. Patch with `socket-patch apply` directly: **cargo** patches the crate in place (in `vendor/` or the registry cache, rewriting `.cargo-checksum.json` so `cargo build` accepts it); **go** writes a project-local patched copy under `.socket/go-patches/` plus a `go.mod` `replace` directive (the module cache is `go.sum`-verified, so in-place patching can't build). Commit `go.mod` + `.socket/go-patches/` so a clone builds the patched bytes. Declare them in `setup.manual` for VEX attestation.
 - **Apply-only ecosystems** (nuget · maven · deno) — no native install hook to wire, so `setup` reports `no_files`; patch them on demand with `socket-patch apply`.
 
@@ -627,6 +652,19 @@ socket-patch vex --json --output socket.vex.json
 # Generate on a build box without verifying on-disk files
 socket-patch vex --no-verify --output socket.vex.json
 ```
+
+### Undoing things
+
+Six commands undo different layers of socket-patch state — pick by what you want back:
+
+| Command | What it undoes |
+|---------|----------------|
+| [`rollback`](#rollback) | Restores the original file bytes but **keeps the manifest entry** — the next `apply` re-applies the patch |
+| [`remove`](#remove) | Rollback **plus** deletes the manifest entry and reverts any vendoring — **permanent**, the patch is fully gone in one command |
+| [`vendor --revert`](#vendor) | **Un-vendors wholesale**: restores the recorded original lockfile fragments byte-for-byte and removes the `.socket/vendor/` artifacts — works without a manifest |
+| [`scan --prune`](#scan) | **Reconciles, doesn't reverse**: drops manifest entries for packages no longer installed and garbage-collects orphan blob/diff/archive files — installed patches stay |
+| [`repair`](#repair) (alias `gc`) | **Restores health, not originals**: re-downloads missing blobs, rebuilds missing/corrupt vendored artifacts, and cleans up unused ones |
+| [`unlock --release`](#unlock) | **Frees a stale lock** left by a crashed run — never touches patches or the manifest, and refuses while the lock is held |
 
 ## OpenVEX attestations
 
@@ -721,7 +759,7 @@ socket-patch scan --json --mode agent --prune --yes | jq '{
 
 # Apply patches and check result
 socket-patch apply --json | jq '.status'
-# "success", "partial_failure", "no_manifest", or "error"
+# "success", "partialFailure", "noManifest", or "error"
 ```
 
 When stdin is not a TTY (e.g., in CI pipelines), interactive prompts auto-proceed instead of blocking. Progress indicators and ANSI colors are automatically suppressed when output is piped.

@@ -6,8 +6,6 @@
 //! hidden-dir skip, `get_nuget_package_paths` discovery branches —
 //! goes uncovered without these tests.
 
-#![cfg(feature = "nuget")]
-
 use std::path::Path;
 
 use serial_test::serial;
@@ -22,7 +20,6 @@ fn options_at(root: &Path) -> CrawlerOptions {
         cwd: root.to_path_buf(),
         global: false,
         global_prefix: None,
-        batch_size: 100,
     }
 }
 
@@ -176,7 +173,6 @@ async fn crawl_all_discovers_global_cache_layout() {
         cwd: tmp.path().to_path_buf(),
         global: true,
         global_prefix: Some(tmp.path().to_path_buf()),
-        batch_size: 100,
     };
     let result = crawler.crawl_all(&opts).await;
     assert_eq!(result.len(), 2);
@@ -218,7 +214,6 @@ async fn crawl_all_discovers_legacy_layout() {
         cwd: tmp.path().to_path_buf(),
         global: true,
         global_prefix: Some(tmp.path().to_path_buf()),
-        batch_size: 100,
     };
     let result = crawler.crawl_all(&opts).await;
     // Legacy layout preserves the original folder casing in the name/version,
@@ -261,7 +256,6 @@ async fn crawl_all_skips_hidden_directories() {
         cwd: tmp.path().to_path_buf(),
         global: true,
         global_prefix: Some(tmp.path().to_path_buf()),
-        batch_size: 100,
     };
     let result = crawler.crawl_all(&opts).await;
     // Only the real package should show up.
@@ -287,7 +281,6 @@ async fn get_nuget_package_paths_with_global_prefix_returns_only_prefix() {
         cwd: tmp.path().to_path_buf(),
         global: true,
         global_prefix: Some(tmp.path().to_path_buf()),
-        batch_size: 100,
     };
     let paths = crawler.get_nuget_package_paths(&opts).await.unwrap();
     assert_eq!(paths, vec![tmp.path().to_path_buf()]);
@@ -492,7 +485,6 @@ async fn crawl_all_handles_unreadable_pkg_path() {
         cwd: tmp.path().to_path_buf(),
         global: true,
         global_prefix: Some(pkg.clone()),
-        batch_size: 100,
     };
     let result = crawler.crawl_all(&opts).await;
     common::chmod_readable(&pkg);
@@ -534,7 +526,6 @@ async fn crawl_all_handles_unreadable_version_dir() {
         cwd: tmp.path().to_path_buf(),
         global: true,
         global_prefix: Some(tmp.path().to_path_buf()),
-        batch_size: 100,
     };
     let result = crawler.crawl_all(&opts).await;
     common::chmod_readable(&pkg_name_dir);
@@ -566,7 +557,6 @@ async fn crawl_all_skips_files_at_top_level() {
         cwd: tmp.path().to_path_buf(),
         global: true,
         global_prefix: Some(tmp.path().to_path_buf()),
-        batch_size: 100,
     };
     let result = crawler.crawl_all(&opts).await;
     let names: Vec<&str> = result.iter().map(|p| p.name.as_str()).collect();
@@ -587,7 +577,6 @@ async fn crawl_all_missing_pkg_path_returns_empty() {
         global: true,
         // Point global_prefix at a non-existent dir.
         global_prefix: Some(tmp.path().join("does-not-exist")),
-        batch_size: 100,
     };
     let result = crawler.crawl_all(&opts).await;
     assert!(result.is_empty());
@@ -619,7 +608,6 @@ async fn get_nuget_package_paths_global_mode_returns_nuget_home() {
         cwd: tmp.path().to_path_buf(),
         global: true,
         global_prefix: None,
-        batch_size: 100,
     };
     let paths = crawler.get_nuget_package_paths(&opts).await.unwrap();
 
@@ -651,7 +639,6 @@ async fn get_nuget_package_paths_global_mode_missing_home_returns_empty() {
         cwd: tmp.path().to_path_buf(),
         global: true,
         global_prefix: None,
-        batch_size: 100,
     };
     let paths = crawler.get_nuget_package_paths(&opts).await.unwrap();
 
@@ -805,7 +792,7 @@ async fn get_nuget_package_paths_discovers_assets_json_in_subproject() {
 }
 
 /// Empty `packageFolders` object in assets.json must not surface any
-/// paths (line 447-448 `if result.is_empty()` arm).
+/// paths (`parse_project_assets_package_folders` yields an empty vec).
 #[tokio::test]
 #[serial]
 async fn get_nuget_package_paths_assets_json_empty_packagefolders_yields_no_paths() {
@@ -815,6 +802,15 @@ async fn get_nuget_package_paths_assets_json_empty_packagefolders_yields_no_path
     tokio::fs::write(obj.join("project.assets.json"), br#"{"packageFolders":{}}"#)
         .await
         .unwrap();
+    // A .NET marker so the local-mode gate passes and the assets parse
+    // actually runs — without it the gate returns early and the
+    // assertion holds vacuously.
+    tokio::fs::write(
+        tmp.path().join("MyProj.csproj"),
+        r#"<Project Sdk="Microsoft.NET.Sdk"></Project>"#,
+    )
+    .await
+    .unwrap();
 
     let prev = std::env::var("NUGET_PACKAGES").ok();
     let prev_home = std::env::var("HOME").ok();
@@ -851,6 +847,15 @@ async fn get_nuget_package_paths_assets_json_malformed_skipped() {
     tokio::fs::write(obj.join("project.assets.json"), b"this is not json")
         .await
         .unwrap();
+    // A .NET marker so the local-mode gate passes and the assets parse
+    // actually runs — without it the gate returns early and the
+    // assertion holds vacuously.
+    tokio::fs::write(
+        tmp.path().join("MyProj.csproj"),
+        r#"<Project Sdk="Microsoft.NET.Sdk"></Project>"#,
+    )
+    .await
+    .unwrap();
 
     let prev = std::env::var("NUGET_PACKAGES").ok();
     let prev_home = std::env::var("HOME").ok();

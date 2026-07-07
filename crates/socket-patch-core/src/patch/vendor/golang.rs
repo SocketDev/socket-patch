@@ -19,16 +19,20 @@
 use std::path::Path;
 
 use crate::manifest::schema::PatchRecord;
-use crate::patch::apply::{ApplyResult, PatchSources, VerifyResult, VerifyStatus};
+use crate::patch::apply::{MismatchPolicy, PatchSources};
 use crate::patch::copy_tree::remove_tree;
 use crate::patch::go_mod_edit::{
     self, read_replace_entries, replace_target_path, ReplaceOwner, GO_PATCHES_DIR,
 };
 use crate::patch::go_redirect::{
-    apply_go_redirect, are_safe_redirect_coords, ensure_module_go_mod,
+    apply_go_redirect, are_safe_redirect_coords, copy_dir_for, ensure_module_go_mod,
 };
 use crate::utils::purl::{parse_golang_purl, strip_purl_qualifiers};
 
+use super::common::{
+    already_patched_result, copy_matches_after_hashes, done, failed_result, refused,
+    service_offline_conflict,
+};
 use super::path::vendor_uuid_dir_rel;
 use super::registry_fetch::extract_zip_with_prefix;
 use super::service_fetch::{fetch_verified_archive, ServiceArtifact};
@@ -36,56 +40,6 @@ use super::state::{
     write_marker, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
 };
 use super::{RevertOutcome, VendorOutcome, VendorServiceConfig, VendorWarning};
-
-fn already_patched_verify(file: &str) -> VerifyResult {
-    VerifyResult {
-        file: file.to_string(),
-        status: VerifyStatus::AlreadyPatched,
-        message: None,
-        current_hash: None,
-        expected_hash: None,
-        target_hash: None,
-    }
-}
-
-/// A synthesized success [`ApplyResult`] for a service-downloaded module: there
-/// is no local apply to verify (the downloaded zip IS the patched module), so
-/// every patched file reads as `AlreadyPatched` — trust is the verified service
-/// integrity (sha512 + the `h1:` module dirhash).
-fn synthesized_success(
-    purl: &str,
-    copy_dir: &Path,
-    files_verified: Vec<VerifyResult>,
-) -> ApplyResult {
-    ApplyResult {
-        package_key: purl.to_string(),
-        package_path: copy_dir.display().to_string(),
-        success: true,
-        files_verified,
-        files_patched: Vec::new(),
-        applied_via: std::collections::HashMap::new(),
-        error: None,
-        sidecar: None,
-    }
-}
-
-/// The committed copy exists and every patched file matches its afterHash.
-async fn copy_hashes_ok(
-    copy_dir: &Path,
-    files: &std::collections::HashMap<String, crate::manifest::schema::PatchFileInfo>,
-) -> bool {
-    if tokio::fs::metadata(copy_dir).await.is_err() {
-        return false;
-    }
-    for (file_name, info) in files {
-        let path = copy_dir.join(crate::patch::apply::normalize_file_path(file_name));
-        match crate::patch::file_hash::compute_file_git_sha256(&path).await {
-            Ok(h) if h == info.after_hash => {}
-            _ => return false,
-        }
-    }
-    true
-}
 
 /// Vendor one Go module: patched copy in the uuid dir + a vendor-owned
 /// `replace` directive + marker, returning the ledger entry to persist.
@@ -112,10 +66,7 @@ pub async fn vendor_go_module(
 ) -> VendorOutcome {
     // ── coordinate validation (fail-closed, before any disk access) ──────
     let Some((module, version)) = parse_golang_purl(purl) else {
-        return VendorOutcome::Refused {
-            code: "unsafe_coordinates",
-            detail: format!("not a golang purl: {purl}"),
-        };
+        return refused("unsafe_coordinates", format!("not a golang purl: {purl}"));
     };
     // SECURITY: `module`+`version` key the on-disk copy dir
     // (`.socket/vendor/golang/<uuid>/<module>@<version>/`) and the `replace`
@@ -123,25 +74,25 @@ pub async fn vendor_go_module(
     // manifest PURL would let the copy escape `.socket/vendor/` — refuse
     // before any disk access (same guard the redirect engine applies).
     if !are_safe_redirect_coords(module, version) {
-        return VendorOutcome::Refused {
-            code: "unsafe_coordinates",
-            detail: format!(
+        return refused(
+            "unsafe_coordinates",
+            format!(
                 "refusing to vendor unsafe golang coordinates `{module}`/`{version}` \
                  (a `..` segment, absolute path, or separator would escape \
                  .socket/vendor/golang/)"
             ),
-        };
+        );
     }
     // SECURITY: the uuid is a dedicated path level created here and deleted by
     // `--revert`; anything but the canonical UUID grammar is rejected.
     let Some(base_rel) = vendor_uuid_dir_rel("golang", &record.uuid) else {
-        return VendorOutcome::Refused {
-            code: "unsafe_coordinates",
-            detail: format!(
+        return refused(
+            "unsafe_coordinates",
+            format!(
                 "refusing to vendor {purl}: patch uuid `{}` is not a canonical uuid",
                 record.uuid
             ),
-        };
+        );
     };
 
     // Detect an existing socket-owned directive BEFORE the engine rewrites it:
@@ -163,28 +114,12 @@ pub async fn vendor_go_module(
     // `prior_path` recorded here would be our own vendored pointer.
     let wired =
         prior_path.as_deref() == Some(replace_target_path(&base_rel, module, version).as_str());
-    let copy_dir = project_root
-        .join(&base_rel)
-        .join(format!("{module}@{version}"));
-    let copy_was_ok = wired && copy_hashes_ok(&copy_dir, &record.files).await;
+    let copy_dir = copy_dir_for(project_root, &base_rel, module, version);
+    let copy_was_ok = wired && copy_matches_after_hashes(&copy_dir, &record.files).await;
 
-    // Vendor auto-force policy (the engine's copy is staged from the
-    // pristine source, never the user's tree — see `force_apply_staged`):
-    // missing patch targets still fail closed unless the caller's own
-    // `--force` asked for the skip tolerance, then the engine apply runs
-    // forced so a beforeHash mismatch (already-applied module, or a patch
-    // built against different bytes) overwrites with the verified patched
-    // content. The engine is shared with the in-place `apply` redirect
-    // path, whose strict semantics stay unchanged.
     let mut warnings: Vec<VendorWarning> = Vec::new();
-    if let Some(cfg) = service {
-        if cfg.source.requires_service() && cfg.offline {
-            return VendorOutcome::Refused {
-                code: "vendor_service_offline_conflict",
-                detail: "--vendor-source=service needs the network but --offline is set"
-                    .to_string(),
-            };
-        }
+    if let Some(refusal) = service_offline_conflict(service) {
+        return refusal;
     }
 
     // Acquire the patched module: prefer the prebuilt module zip from the patch
@@ -199,36 +134,42 @@ pub async fn vendor_go_module(
         &base_rel,
         &copy_dir,
         project_root,
+        dry_run,
+        copy_was_ok,
+        wired,
         &mut warnings,
     )
     .await
     {
         GoServiceRedirect::Used => {
-            let verified = record
-                .files
-                .keys()
-                .map(|f| already_patched_verify(f))
-                .collect();
-            synthesized_success(purl, &copy_dir, verified)
+            // No local apply to verify (the downloaded zip IS the patched
+            // module), so every patched file reads as `AlreadyPatched` — trust
+            // is the verified service integrity (sha512 + the `h1:` dirhash).
+            already_patched_result(purl, &copy_dir, &record.files)
         }
         GoServiceRedirect::HardFail(outcome) => return *outcome,
         GoServiceRedirect::FallBack => {
             // Vendor auto-force policy (the engine's copy is staged from the
-            // pristine source, never the user's tree): missing patch targets
-            // still fail closed unless the caller's own `--force` asked for the
-            // skip tolerance.
+            // pristine source, never the user's tree — see `force_apply_staged`):
+            // missing patch targets still fail closed unless the caller's own
+            // `--force` asked for the skip tolerance, then the engine apply runs
+            // forced so a beforeHash mismatch (already-applied module, or a
+            // patch built against different bytes) overwrites with the verified
+            // patched content. The engine is shared with the in-place `apply`
+            // redirect path, whose strict semantics stay unchanged.
             if !force {
                 let missing =
                     super::missing_existing_patch_files(pristine_src, &record.files).await;
                 if let Some(first) = missing.first() {
-                    return VendorOutcome::Done {
-                        result: super::failed_apply_result(
+                    return done(
+                        failed_result(
                             purl,
+                            Path::new(""),
                             format!("Cannot apply patch: {first} - File not found"),
                         ),
-                        entry: None,
+                        None,
                         warnings,
-                    };
+                    );
                 }
             }
             // The engine does the heavy lifting: fresh copy → hardened apply
@@ -245,7 +186,7 @@ pub async fn vendor_go_module(
                 sources,
                 Some(&record.uuid),
                 dry_run,
-                crate::patch::apply::MismatchPolicy::Force,
+                MismatchPolicy::Force,
             )
             .await;
             if result.success {
@@ -256,11 +197,7 @@ pub async fn vendor_go_module(
     };
 
     if dry_run {
-        return VendorOutcome::Done {
-            result,
-            entry: None,
-            warnings,
-        };
+        return done(result, None, warnings);
     }
     if !result.success {
         // The engine already rolled back a half-built copy, but its rollback
@@ -268,20 +205,12 @@ pub async fn vendor_go_module(
         // path husks (or a copy left by a failed `replace` upsert) linger
         // under `.socket/vendor/golang/`.
         let _ = remove_tree(&project_root.join(&base_rel)).await;
-        return VendorOutcome::Done {
-            result,
-            entry: None,
-            warnings,
-        };
+        return done(result, None, warnings);
     }
     // A patch with no files is a no-op success: the engine wrote no copy and
     // no `replace`, so there is nothing to record or mark.
     if record.files.is_empty() {
-        return VendorOutcome::Done {
-            result,
-            entry: None,
-            warnings,
-        };
+        return done(result, None, warnings);
     }
 
     if wired {
@@ -292,16 +221,8 @@ pub async fn vendor_go_module(
             // A wholesale-deleted uuid dir lost the informational marker;
             // restore it alongside the rebuilt copy (never a trust input —
             // a failed write only warns).
-            let mut vulnerabilities: Vec<String> = record.vulnerabilities.keys().cloned().collect();
-            vulnerabilities.sort();
-            let marker = VendorMarker {
-                schema_version: 1,
-                purl: strip_purl_qualifiers(purl).to_string(),
-                patch_uuid: record.uuid.clone(),
-                ecosystem: "golang".to_string(),
-                vulnerabilities,
-                vendored_at: vendored_at.to_string(),
-            };
+            let marker =
+                VendorMarker::new("golang", strip_purl_qualifiers(purl), record, vendored_at);
             if let Err(e) = write_marker(&project_root.join(&base_rel), &marker).await {
                 warnings.push(VendorWarning::new(
                     "marker_write_failed",
@@ -316,11 +237,7 @@ pub async fn vendor_go_module(
                 ),
             ));
         }
-        return VendorOutcome::Done {
-            result,
-            entry: None,
-            warnings,
-        };
+        return done(result, None, warnings);
     }
 
     if takeover {
@@ -328,9 +245,7 @@ pub async fn vendor_go_module(
         // the apply backend's copy is now unreachable — delete it (built from
         // OUR validated coordinates, never from the go.mod string). NotFound
         // is fine (the user may have cleaned it already).
-        let stale = project_root
-            .join(GO_PATCHES_DIR)
-            .join(format!("{module}@{version}"));
+        let stale = copy_dir_for(project_root, GO_PATCHES_DIR, module, version);
         let _ = remove_tree(&stale).await;
         // Prune now-empty parent husks (`<go-patches>/example.com/`) up to
         // and including the go-patches root. `remove_dir` is non-recursive:
@@ -358,16 +273,7 @@ pub async fn vendor_go_module(
 
     // ── marker + ledger entry ─────────────────────────────────────────────
     let base_purl = strip_purl_qualifiers(purl).to_string();
-    let mut vulnerabilities: Vec<String> = record.vulnerabilities.keys().cloned().collect();
-    vulnerabilities.sort();
-    let marker = VendorMarker {
-        schema_version: 1,
-        purl: base_purl.clone(),
-        patch_uuid: record.uuid.clone(),
-        ecosystem: "golang".to_string(),
-        vulnerabilities,
-        vendored_at: vendored_at.to_string(),
-    };
+    let marker = VendorMarker::new("golang", &base_purl, record, vendored_at);
     if let Err(e) = write_marker(&project_root.join(&base_rel), &marker).await {
         // The marker is belt-and-braces metadata (never a trust input); a
         // failed write must not undo a fully-wired vendor — surface it.
@@ -415,11 +321,7 @@ pub async fn vendor_go_module(
         pipenv: None,
     };
 
-    VendorOutcome::Done {
-        result,
-        entry: Some(entry),
-        warnings,
-    }
+    done(result, Some(entry), warnings)
 }
 
 /// Outcome of attempting to materialise the go copy from the patch service.
@@ -437,6 +339,11 @@ enum GoServiceRedirect {
 /// `{module}@{version}/` prefix), ensure a `go.mod`, and wire the `replace`
 /// directive — the same end state `apply_go_redirect` produces, minus the copy
 /// + local apply. Maps each service outcome onto the `auto` / `service` policy.
+///
+/// `wired` — the run started with the vendor `replace` already pointing at
+/// THIS uuid's copy; a failure leg must then also drop that directive with the
+/// uuid dir it just removed, or go.mod dangles at a deleted path and every
+/// `go build` fails (mirrors the engine's `teardown_failed_redirect`).
 #[allow(clippy::too_many_arguments)]
 async fn go_service_redirect(
     service: Option<&VendorServiceConfig>,
@@ -446,18 +353,30 @@ async fn go_service_redirect(
     base_rel: &str,
     copy_dir: &Path,
     project_root: &Path,
+    dry_run: bool,
+    copy_was_ok: bool,
+    wired: bool,
     warnings: &mut Vec<VendorWarning>,
 ) -> GoServiceRedirect {
     let Some(cfg) = service else {
         return GoServiceRedirect::FallBack;
     };
+    // Dry runs never reach the service: every leg below writes for real
+    // (copy-dir replace, go.mod upsert) — the engine's read-only verify is
+    // the preview (the same gate the npm/pypi backends apply). And an intact
+    // wired copy is already byte-identical to the verified service end state:
+    // never tear it down for a re-download whose failure would strand go.mod
+    // pointing at a deleted dir.
+    if dry_run || copy_was_ok {
+        return GoServiceRedirect::FallBack;
+    }
     // An empty-files patch is a degenerate no-op; let the engine's empty
     // handling deal with it rather than downloading anything.
     if !cfg.service_enabled() || record.files.is_empty() {
         return GoServiceRedirect::FallBack;
     }
     fn hard(code: &'static str, detail: String) -> GoServiceRedirect {
-        GoServiceRedirect::HardFail(Box::new(VendorOutcome::Refused { code, detail }))
+        GoServiceRedirect::HardFail(Box::new(refused(code, detail)))
     }
     let miss = |warnings: &mut Vec<VendorWarning>, code: &'static str, reason: String| {
         if cfg.source.requires_service() {
@@ -470,12 +389,13 @@ async fn go_service_redirect(
             GoServiceRedirect::FallBack
         }
     };
-    match fetch_verified_archive(cfg, &record.uuid, module).await {
+    match fetch_verified_archive(cfg, &record.uuid).await {
         ServiceArtifact::Ready(archive) => {
             // Clean copy dir; extract the module zip (strip its literal
             // `{module}@{version}/` prefix) into it.
             let _ = remove_tree(copy_dir).await;
             if let Err(e) = tokio::fs::create_dir_all(copy_dir).await {
+                teardown_failed_service_copy(project_root, base_rel, module, wired).await;
                 return hard(
                     "vendor_prebuilt_write_failed",
                     format!("cannot create {}: {e}", copy_dir.display()),
@@ -483,7 +403,7 @@ async fn go_service_redirect(
             }
             let prefix = format!("{module}@{version}/");
             if let Err(e) = extract_zip_with_prefix(&archive.bytes, copy_dir, &prefix) {
-                let _ = remove_tree(&project_root.join(base_rel)).await;
+                teardown_failed_service_copy(project_root, base_rel, module, wired).await;
                 return hard(
                     "vendor_prebuilt_extract_failed",
                     format!("cannot extract the prebuilt module zip: {e}"),
@@ -492,7 +412,7 @@ async fn go_service_redirect(
             // A `replace` target needs a go.mod declaring the module path;
             // pre-modules zips may lack one — synthesize the minimal form.
             if let Err(e) = ensure_module_go_mod(copy_dir, module).await {
-                let _ = remove_tree(&project_root.join(base_rel)).await;
+                teardown_failed_service_copy(project_root, base_rel, module, wired).await;
                 return hard(
                     "vendor_prebuilt_write_failed",
                     format!("cannot synthesize go.mod for the copy: {e}"),
@@ -502,7 +422,7 @@ async fn go_service_redirect(
                 go_mod_edit::ensure_replace_entry(project_root, module, version, base_rel, false)
                     .await
             {
-                let _ = remove_tree(&project_root.join(base_rel)).await;
+                teardown_failed_service_copy(project_root, base_rel, module, wired).await;
                 return hard(
                     "vendor_prebuilt_wire_failed",
                     format!("failed to update go.mod: {e}"),
@@ -542,6 +462,29 @@ async fn go_service_redirect(
             "vendor_prebuilt_unavailable",
             format!("patch service request failed ({reason})"),
         ),
+    }
+}
+
+/// Failure cleanup for the service legs (the vendor-side sibling of the
+/// engine's `teardown_failed_redirect`): the uuid dir just lost its copy to a
+/// failed materialisation — clear it, and when the run started `wired` to
+/// this uuid also drop the now-dangling vendor `replace` directive. Fall back
+/// to the unpatched-module end state a failed first run leaves, never a
+/// go.mod whose replacement directory no longer exists (every `go build`
+/// would fail). `wired` doubles as the path condition: it asserts the live
+/// directive targets THIS uuid, so a directive pointing at another uuid's
+/// intact copy is never dropped (and the owner filter protects go-patches /
+/// user-authored lines).
+async fn teardown_failed_service_copy(
+    project_root: &Path,
+    base_rel: &str,
+    module: &str,
+    wired: bool,
+) {
+    let _ = remove_tree(&project_root.join(base_rel)).await;
+    if wired {
+        let _ = go_mod_edit::drop_replace_entry(project_root, module, ReplaceOwner::Vendor, false)
+            .await;
     }
 }
 
@@ -611,7 +554,6 @@ mod tests {
     use crate::hash::git_sha256::compute_git_sha256_from_bytes;
     use crate::manifest::schema::{PatchFileInfo, VulnerabilityInfo};
     use crate::patch::apply::ApplyResult;
-    use crate::patch::apply::MismatchPolicy;
     use crate::patch::vendor::state::VENDOR_MARKER_FILE;
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -883,9 +825,7 @@ mod tests {
         let copy1 = tokio::fs::read(&copy).await.unwrap();
         let mod1 = tokio::fs::read(&gomod).await.unwrap();
 
-        crate::patch::copy_tree::remove_tree(&root.join(copy_rel()))
-            .await
-            .unwrap();
+        remove_tree(&root.join(copy_rel())).await.unwrap();
 
         let (result, entry, warnings) =
             expect_done(run_vendor(PURL, root, &blobs, &pristine, &record, false).await);
@@ -1406,6 +1346,189 @@ mod tests {
                 .await
                 .unwrap(),
             PATCHED
+        );
+    }
+
+    /// Dry-run must write nothing and stay off the network even when the
+    /// service path is enabled (auto/service + client): the prebuilt download
+    /// would delete/recreate the copy dir and rewrite go.mod for real.
+    #[tokio::test]
+    async fn dry_run_with_service_enabled_writes_nothing_and_stays_offline() {
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        let zip = make_module_zip(&[
+            ("go.mod", b"module github.com/foo/bar\n\ngo 1.21\n"),
+            ("bar.go", PATCHED),
+        ]);
+        let sri = sri_sha512(&zip);
+        let server = wiremock::MockServer::start().await;
+        mount_go_granted(&server, &sri, None, &zip).await;
+        let gomod_before = tokio::fs::read_to_string(root.join("go.mod"))
+            .await
+            .unwrap();
+        let sources = PatchSources::blobs_only(&blobs);
+
+        let outcome = vendor_go_module(
+            PURL,
+            &pristine,
+            root,
+            &record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            /*dry_run=*/ true,
+            false,
+            Some(&go_service_cfg(&server.uri(), VendorSource::Auto, false)),
+        )
+        .await;
+        let (result, entry, _warnings) = expect_done(outcome);
+        assert!(result.success, "{:?}", result.error);
+        assert!(entry.is_none(), "dry-run emits no entry");
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("go.mod"))
+                .await
+                .unwrap(),
+            gomod_before,
+            "go.mod untouched by a service dry-run"
+        );
+        assert!(
+            !root.join(format!(".socket/vendor/golang/{UUID}")).exists(),
+            "no copy dir created"
+        );
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "dry-run must not contact the vendor service"
+        );
+    }
+
+    /// A wired re-run with an intact committed copy must never be degraded by
+    /// the service path: the current end state already IS the service end
+    /// state. A re-download that then fails (corrupt zip) would otherwise
+    /// delete the copy AND the uuid dir while go.mod still points there —
+    /// bricking a previously healthy build.
+    #[tokio::test]
+    async fn service_rerun_with_intact_copy_never_degrades_wired_state() {
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        // First run: local build wires copy + replace (no service).
+        expect_done(run_vendor(PURL, root, &blobs, &pristine, &record, false).await);
+        let copy = root.join(copy_rel()).join("bar.go");
+        let gomod = root.join("go.mod");
+        let mod1 = tokio::fs::read(&gomod).await.unwrap();
+
+        // Re-run with the service serving a Ready-but-corrupt artifact: the
+        // sha512 matches the corrupt bytes, so only zip extraction can fail.
+        let junk: &[u8] = b"not a zip at all";
+        let server = wiremock::MockServer::start().await;
+        mount_go_granted(&server, &sri_sha512(junk), None, junk).await;
+        let sources = PatchSources::blobs_only(&blobs);
+        let outcome = vendor_go_module(
+            PURL,
+            &pristine,
+            root,
+            &record,
+            &sources,
+            "2026-06-10T00:00:00Z",
+            false,
+            false,
+            Some(&go_service_cfg(&server.uri(), VendorSource::Auto, false)),
+        )
+        .await;
+
+        let (result, entry, _warnings) = expect_done(outcome);
+        assert!(
+            result.success,
+            "in-sync re-run must stay healthy: {:?}",
+            result.error
+        );
+        assert!(entry.is_none(), "no re-recorded entry");
+        assert_eq!(
+            tokio::fs::read(&copy).await.unwrap(),
+            PATCHED,
+            "committed copy intact"
+        );
+        assert_eq!(
+            tokio::fs::read(&gomod).await.unwrap(),
+            mod1,
+            "go.mod byte-stable"
+        );
+    }
+
+    /// A failed rebuild of a wired-but-stale copy must not leave the vendor
+    /// `replace` directive pointing at the removed uuid dir (go: "replacement
+    /// directory does not exist" — build bricked). The failure must fall back
+    /// to the unpatched-module end state: dir gone AND directive gone.
+    #[tokio::test]
+    async fn failed_stale_copy_rebuild_drops_dangling_directive() {
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        expect_done(run_vendor(PURL, root, &blobs, &pristine, &record, false).await);
+
+        // The committed copy drifts AND the patched blob is gone: the
+        // artifact rebuild has no source for afterHash content and fails.
+        tokio::fs::write(root.join(copy_rel()).join("bar.go"), b"drifted\n")
+            .await
+            .unwrap();
+        tokio::fs::remove_file(blobs.join(git_sha(PATCHED)))
+            .await
+            .unwrap();
+
+        let (result, entry, _warnings) =
+            expect_done(run_vendor(PURL, root, &blobs, &pristine, &record, false).await);
+        assert!(!result.success, "rebuild without blobs must fail");
+        assert!(entry.is_none());
+        assert!(
+            !root.join(format!(".socket/vendor/golang/{UUID}")).exists(),
+            "uuid dir cleared"
+        );
+        assert!(
+            read_replace_entries(root)
+                .await
+                .iter()
+                .all(|e| e.module != MODULE),
+            "no dangling replace directive at the deleted copy"
+        );
+    }
+
+    /// Same invariant through the service legs: when the service rebuild of a
+    /// wired-but-stale copy fails mid-materialisation (corrupt zip), the
+    /// directive from the earlier healthy run is torn down with the uuid dir.
+    #[tokio::test]
+    async fn failed_service_rebuild_of_stale_copy_drops_dangling_directive() {
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        expect_done(run_vendor(PURL, root, &blobs, &pristine, &record, false).await);
+        // Stale copy → the service rebuild leg runs on the re-run.
+        tokio::fs::write(root.join(copy_rel()).join("bar.go"), b"drifted\n")
+            .await
+            .unwrap();
+
+        let junk: &[u8] = b"not a zip at all";
+        let server = wiremock::MockServer::start().await;
+        mount_go_granted(&server, &sri_sha512(junk), None, junk).await;
+        let sources = PatchSources::blobs_only(&blobs);
+        let outcome = vendor_go_module(
+            PURL,
+            &pristine,
+            root,
+            &record,
+            &sources,
+            "2026-06-10T00:00:00Z",
+            false,
+            false,
+            Some(&go_service_cfg(&server.uri(), VendorSource::Auto, false)),
+        )
+        .await;
+        expect_refused(outcome, "vendor_prebuilt_extract_failed");
+        assert!(
+            !root.join(format!(".socket/vendor/golang/{UUID}")).exists(),
+            "uuid dir cleared"
+        );
+        assert!(
+            read_replace_entries(root)
+                .await
+                .iter()
+                .all(|e| e.module != MODULE),
+            "no dangling replace directive at the deleted copy"
         );
     }
 

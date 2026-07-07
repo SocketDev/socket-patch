@@ -316,6 +316,39 @@ async fn bun_hosted_project(tag: &str, tamper_served_tarball: bool) -> Option<Bu
         env["redirect"]["redirected"], 1,
         "one dep redirected: {env}"
     );
+    // In-run VEX (step 3 of the module doc): the envelope's vex block plus the
+    // document's unverified `(redirected)` attestation. Without these, a scan
+    // that silently skips the VEX write (or emits the wrong statement) stays
+    // green — the exit code only catches a HARD vex failure.
+    assert_eq!(env["vex"]["path"], "out.vex.json", "vex block: {env}");
+    assert_eq!(env["vex"]["statements"], 1, "vex block: {env}");
+    assert_eq!(env["vex"]["format"], "openvex-0.2.0", "vex block: {env}");
+    assert_eq!(
+        env["vex"]["verified"], false,
+        "in-run redirect VEX is attested from the ledger, not hash-verified: {env}"
+    );
+    let vex_doc: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(proj.join("out.vex.json")).unwrap()).unwrap();
+    let stmts = vex_doc["statements"].as_array().unwrap();
+    assert_eq!(
+        stmts.len(),
+        1,
+        "exactly the redirected patch attested: {vex_doc}"
+    );
+    assert_eq!(
+        stmts[0]["vulnerability"]["name"], GHSA,
+        "vex doc: {vex_doc}"
+    );
+    assert_eq!(stmts[0]["status"], "not_affected", "vex doc: {vex_doc}");
+    assert_eq!(
+        stmts[0]["products"][0]["subcomponents"][0]["@id"], PURL,
+        "vex doc: {vex_doc}"
+    );
+    assert_eq!(
+        stmts[0]["impact_statement"].as_str().unwrap(),
+        format!("Patched via Socket patch {UUID} (redirected)"),
+        "the in-run attestation must carry the (redirected) marker: {vex_doc}"
+    );
 
     // Lockfile pin: the hosted URL (as the tuple spec) + the patched sha512.
     let lock = std::fs::read_to_string(proj.join("bun.lock")).unwrap();

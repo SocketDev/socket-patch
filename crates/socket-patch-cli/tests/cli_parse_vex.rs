@@ -11,9 +11,10 @@
 //! and `scan`, the ambient env var broke those commands too (including
 //! `apply` running from a postinstall hook). The fix wires
 //! `value_parser = parse_bool_flag`, matching the `GlobalArgs` bool flags
-//! and `repair --download-only` / `unlock --release`. These vars are also
-//! outside `GLOBAL_ARG_ENV_VARS`, so `main`'s empty-var scrub never rescues
-//! them.
+//! and `repair --download-only` / `unlock --release`. `main`'s empty-var
+//! scrub also removes exported-but-empty values (the vars are in
+//! `LOCAL_ARG_ENV_VARS`), but these library-level parses bypass `main`, so
+//! the value parser must accept the empty string itself.
 //!
 //! ## Hermeticity
 //!
@@ -21,7 +22,10 @@
 //! [`EnvScrub`]) and each test is `#[serial_test::serial]` because the
 //! process environment is global. This mirrors `cli_parse_repair.rs`.
 
+use std::path::PathBuf;
+
 use clap::Parser;
+use socket_patch_cli::commands::vex::VexArgs;
 use socket_patch_cli::{Cli, Commands};
 
 /// Every `SOCKET_*` env var clap consults while parsing `vex`, `apply`, or
@@ -38,7 +42,11 @@ const SOCKET_ENV_VARS: &[&str] = &[
     "SOCKET_PROXY_URL",
     "SOCKET_ECOSYSTEMS",
     "SOCKET_DOWNLOAD_MODE",
+    "SOCKET_VENDOR_SOURCE",
+    "SOCKET_VENDOR_URL",
+    "SOCKET_PATCH_SERVER_URL",
     "SOCKET_OFFLINE",
+    "SOCKET_STRICT",
     "SOCKET_GLOBAL",
     "SOCKET_GLOBAL_PREFIX",
     "SOCKET_JSON",
@@ -173,6 +181,158 @@ fn empty_vex_compact_env_parses_as_false_on_scan() {
     match cli.command {
         Commands::Scan(a) => assert!(!a.vex.vex_compact, "empty SOCKET_VEX_COMPACT must be false"),
         _ => panic!("expected Scan"),
+    }
+}
+
+/// Owned, comparable snapshot of *every* parsed field in `VexArgs` — its own
+/// five flags plus every field of the flattened `GlobalArgs`. `VexArgs` /
+/// `GlobalArgs` are production types that don't derive `PartialEq`, so this
+/// mirror exists purely so a single `assert_eq!` can police the entire
+/// parsed surface at once. Mirrors `cli_parse_repair.rs`.
+#[derive(Debug, Clone, PartialEq)]
+struct Snap {
+    cwd: PathBuf,
+    manifest_path: String,
+    api_url: String,
+    api_token: Option<String>,
+    org: Option<String>,
+    proxy_url: String,
+    ecosystems: Option<Vec<String>>,
+    download_mode: String,
+    vendor_source: String,
+    vendor_url: Option<String>,
+    patch_server_url: Option<String>,
+    offline: bool,
+    strict: bool,
+    global: bool,
+    global_prefix: Option<PathBuf>,
+    json: bool,
+    verbose: bool,
+    silent: bool,
+    dry_run: bool,
+    yes: bool,
+    lock_timeout: Option<u64>,
+    break_lock: bool,
+    debug: bool,
+    no_telemetry: bool,
+    output: Option<PathBuf>,
+    product: Option<String>,
+    no_verify: bool,
+    doc_id: Option<String>,
+    compact: bool,
+}
+
+fn snapshot(a: &VexArgs) -> Snap {
+    Snap {
+        cwd: a.common.cwd.clone(),
+        manifest_path: a.common.manifest_path.clone(),
+        api_url: a.common.api_url.clone(),
+        api_token: a.common.api_token.clone(),
+        org: a.common.org.clone(),
+        proxy_url: a.common.proxy_url.clone(),
+        ecosystems: a.common.ecosystems.clone(),
+        download_mode: a.common.download_mode.clone(),
+        vendor_source: a.common.vendor_source.clone(),
+        vendor_url: a.common.vendor_url.clone(),
+        patch_server_url: a.common.patch_server_url.clone(),
+        offline: a.common.offline,
+        strict: a.common.strict,
+        global: a.common.global,
+        global_prefix: a.common.global_prefix.clone(),
+        json: a.common.json,
+        verbose: a.common.verbose,
+        silent: a.common.silent,
+        dry_run: a.common.dry_run,
+        yes: a.common.yes,
+        lock_timeout: a.common.lock_timeout,
+        break_lock: a.common.break_lock,
+        debug: a.common.debug,
+        no_telemetry: a.common.no_telemetry,
+        output: a.output.clone(),
+        product: a.product.clone(),
+        no_verify: a.no_verify,
+        doc_id: a.doc_id.clone(),
+        compact: a.compact,
+    }
+}
+
+/// Independent oracle: the snapshot a correct parse of bare `vex` (no flags,
+/// no env) must produce. The values are transcribed BY HAND from the
+/// `default_value`/`default_value_t` declarations on `VexArgs`/`GlobalArgs`
+/// and the `DEFAULT_*` constants in `socket-patch-core` — NOT read back from
+/// a live parse — so this can actually disagree with the implementation if a
+/// default regresses.
+fn expected_defaults() -> Snap {
+    Snap {
+        cwd: PathBuf::from("."),
+        manifest_path: ".socket/manifest.json".to_string(),
+        api_url: "https://api.socket.dev".to_string(),
+        api_token: None,
+        org: None,
+        proxy_url: "https://patches-api.socket.dev".to_string(),
+        ecosystems: None,
+        download_mode: "diff".to_string(),
+        vendor_source: "auto".to_string(),
+        vendor_url: None,
+        patch_server_url: None,
+        offline: false,
+        strict: false,
+        global: false,
+        global_prefix: None,
+        json: false,
+        verbose: false,
+        silent: false,
+        dry_run: false,
+        yes: false,
+        lock_timeout: None,
+        break_lock: false,
+        debug: false,
+        no_telemetry: false,
+        output: None,
+        product: None,
+        no_verify: false,
+        doc_id: None,
+        compact: false,
+    }
+}
+
+/// [`SOCKET_ENV_VARS`] claims to list "every `SOCKET_*` env var clap consults
+/// while parsing `vex`, `apply`, or `scan`". `GlobalArgs` is flattened in
+/// whole, so the production `GLOBAL_ARG_ENV_VARS` list is the oracle — a flag
+/// added to `GlobalArgs` with an env binding is consulted here the moment it
+/// lands, and if the scrub list lags behind, an ambient value either aborts
+/// every parse in this file (validated flags: bools, ints, `--ecosystems`,
+/// `--vendor-source`) or silently leaks into the parsed args (string flags),
+/// voiding the hermeticity the module doc promises. `garbage` is rejected by
+/// every validating parser and visibly non-default for every
+/// string/path/option flag, so a missing scrub entry fails loudly either way.
+/// Mirrors `cli_parse_repair.rs` / `cli_parse_get.rs`.
+#[test]
+#[serial_test::serial]
+fn scrub_covers_every_global_env_var_clap_consults() {
+    for &var in socket_patch_cli::args::GLOBAL_ARG_ENV_VARS {
+        let prev = std::env::var(var).ok();
+        std::env::set_var(var, "garbage");
+        let parsed = {
+            let _scrub = EnvScrub::new();
+            Cli::try_parse_from(["socket-patch", "vex"])
+        };
+        match prev {
+            Some(v) => std::env::set_var(var, v),
+            None => std::env::remove_var(var),
+        }
+        let a = match parsed {
+            Ok(cli) => match cli.command {
+                Commands::Vex(a) => a,
+                _ => panic!("expected Vex"),
+            },
+            Err(e) => panic!("ambient {var}=garbage aborted the scrubbed parse: {e}"),
+        };
+        assert_eq!(
+            snapshot(&a),
+            expected_defaults(),
+            "ambient {var}=garbage leaked into the scrubbed parse",
+        );
     }
 }
 

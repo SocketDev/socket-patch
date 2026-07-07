@@ -1,4 +1,3 @@
-#![cfg(feature = "cargo")]
 //! In-process full-apply test for the cargo (Rust) ecosystem.
 //!
 //! Adds `cfg-if = "=1.0.0"` to a Cargo.toml, runs `cargo fetch` against

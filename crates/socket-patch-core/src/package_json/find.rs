@@ -1,7 +1,8 @@
 use std::path::{Path, PathBuf};
 use tokio::fs;
 
-use super::detect::PackageManager;
+use super::detect::{strip_bom, PackageManager};
+use crate::utils::fs::{entry_file_type, is_dir, list_dir_entries};
 
 /// Detect the package manager based on lockfiles in the project root.
 /// Checks for pnpm-lock.yaml, pnpm-lock.yml, and pnpm-workspace.yaml.
@@ -24,9 +25,9 @@ pub enum WorkspaceType {
 
 /// Workspace configuration.
 #[derive(Debug, Clone)]
-pub struct WorkspaceConfig {
-    pub ws_type: WorkspaceType,
-    pub patterns: Vec<String>,
+struct WorkspaceConfig {
+    ws_type: WorkspaceType,
+    patterns: Vec<String>,
 }
 
 /// Location of a discovered package.json file.
@@ -35,7 +36,6 @@ pub struct PackageJsonLocation {
     pub path: PathBuf,
     pub is_root: bool,
     pub is_workspace: bool,
-    pub workspace_pattern: Option<String>,
 }
 
 /// Result of finding package.json files.
@@ -60,23 +60,34 @@ pub async fn find_package_json_files(start_path: &Path) -> PackageJsonFindResult
         root_exists = true;
         workspace_config = detect_workspaces(&root_package_json).await;
         results.push(PackageJsonLocation {
-            path: root_package_json,
+            path: root_package_json.clone(),
             is_root: true,
             is_workspace: false,
-            workspace_pattern: None,
         });
     }
 
     match workspace_config.ws_type {
         WorkspaceType::None => {
+            // No workspace config: pick up nested manifests with a bounded
+            // walk (the root entry is already in `results`).
             if root_exists {
-                let nested = find_nested_package_json_files(start_path).await;
-                results.extend(nested);
+                let mut nested = Vec::new();
+                search_recursive(start_path, 0, 5, &mut nested).await;
+                results.extend(nested.into_iter().filter(|p| *p != root_package_json).map(
+                    |path| PackageJsonLocation {
+                        path,
+                        is_root: false,
+                        is_workspace: false,
+                    },
+                ));
             }
         }
         _ => {
-            let ws_packages = find_workspace_packages(start_path, &workspace_config).await;
-            results.extend(ws_packages);
+            // Members are collected into their own vec so a `!`-negation
+            // pattern can only remove members, never the root entry.
+            let mut members = Vec::new();
+            collect_workspace_members(start_path, &workspace_config, 0, &mut members).await;
+            results.extend(members);
         }
     }
 
@@ -94,7 +105,7 @@ pub async fn find_package_json_files(start_path: &Path) -> PackageJsonFindResult
 }
 
 /// Detect workspace configuration from package.json.
-pub async fn detect_workspaces(package_json_path: &Path) -> WorkspaceConfig {
+async fn detect_workspaces(package_json_path: &Path) -> WorkspaceConfig {
     let default = WorkspaceConfig {
         ws_type: WorkspaceType::None,
         patterns: Vec::new(),
@@ -122,7 +133,7 @@ pub async fn detect_workspaces(package_json_path: &Path) -> WorkspaceConfig {
         Err(_) => return default,
     };
 
-    let pkg: serde_json::Value = match serde_json::from_str(&content) {
+    let pkg: serde_json::Value = match serde_json::from_str(strip_bom(&content)) {
         Ok(v) => v,
         Err(_) => return default,
     };
@@ -160,7 +171,9 @@ fn parse_pnpm_workspace_patterns(yaml_content: &str) -> Vec<String> {
     let mut patterns = Vec::new();
     let mut in_packages = false;
 
-    for line in yaml_content.lines() {
+    // A BOM is not Unicode whitespace, so `trim` would leave it glued to a
+    // first-line `packages:` header and the whole section would be missed.
+    for line in strip_bom(yaml_content).lines() {
         let trimmed = line.trim();
 
         // The header may carry an inline comment (`packages: # globs`); a `#`
@@ -229,23 +242,14 @@ fn parse_yaml_list_value(raw: &str) -> String {
     value.trim().to_string()
 }
 
-/// Find workspace packages based on workspace patterns, recursing into any
-/// member that is **itself** a workspace root (property 9's nested-workspace
-/// rule). A member's own `workspaces` patterns are resolved relative to that
-/// member's directory.
-async fn find_workspace_packages(
-    root_path: &Path,
-    config: &WorkspaceConfig,
-) -> Vec<PackageJsonLocation> {
-    let mut results = Vec::new();
-    collect_workspace_members(root_path, config, 0, &mut results).await;
-    results
-}
-
 /// Bounded-depth recursion limit for nested workspaces — deep enough for any
 /// real monorepo, a hard stop against a pattern that loops back on itself.
 const MAX_WORKSPACE_DEPTH: usize = 10;
 
+/// Collect workspace members matching the config's patterns, recursing into
+/// any member that is **itself** a workspace root (property 9's
+/// nested-workspace rule). A member's own `workspaces` patterns are resolved
+/// relative to that member's directory.
 async fn collect_workspace_members(
     root_path: &Path,
     config: &WorkspaceConfig,
@@ -272,7 +276,6 @@ async fn collect_workspace_members(
                 path: p,
                 is_root: false,
                 is_workspace: true,
-                workspace_pattern: Some(pattern.clone()),
             });
             // If this member declares its own workspaces, configure ITS members
             // too (one repo-root `setup` covers the whole nested tree). The
@@ -324,7 +327,7 @@ async fn find_packages_matching_pattern(root_path: &Path, pattern: &str) -> Vec<
                 if fs::metadata(&own_pkg).await.is_ok() {
                     results.push(own_pkg);
                 }
-                search_recursive(&search_path, &mut results).await;
+                search_recursive(&search_path, 0, usize::MAX, &mut results).await;
             }
         }
         _ => {
@@ -346,26 +349,17 @@ fn is_ignored_dir(name: &str) -> bool {
 
 /// Search one level deep for package.json files.
 async fn search_one_level(dir: &Path, results: &mut Vec<PathBuf>) {
-    let mut entries = match fs::read_dir(dir).await {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-
-    while let Ok(Some(entry)) = entries.next_entry().await {
+    for entry in list_dir_entries(dir).await {
         let path = entry.path();
         // A single-level `dir/*` glob follows a symlinked direct member, the
         // way npm/pnpm (and our cargo `glob_dir`) resolve a workspace member
         // that is itself a symlink. `entry.file_type()` reports the *link's*
         // own type — `is_dir() == false` — so it would silently drop such a
         // member; stat the path instead so the link is followed. (The
-        // recursive `**` searchers below deliberately do NOT follow symlinks,
+        // recursive searcher below deliberately does NOT follow symlinks,
         // to avoid loops/escapes — there a symlink's `is_dir() == false` is the
         // desired skip.)
-        if !fs::metadata(&path)
-            .await
-            .map(|m| m.is_dir())
-            .unwrap_or(false)
-        {
+        if !is_dir(&path).await {
             continue;
         }
         // A `dir/*` pattern must not pick up node_modules/hidden/output dirs as
@@ -380,27 +374,24 @@ async fn search_one_level(dir: &Path, results: &mut Vec<PathBuf>) {
     }
 }
 
-/// Search recursively for package.json files.
-async fn search_recursive(dir: &Path, results: &mut Vec<PathBuf>) {
-    let mut entries = match fs::read_dir(dir).await {
-        Ok(e) => e,
-        Err(_) => return,
-    };
+/// Search recursively for package.json files, descending at most `max_depth`
+/// directory levels below `dir` (pass `usize::MAX` for an unbounded walk).
+/// Symlinks are deliberately not followed — see `search_one_level`.
+async fn search_recursive(dir: &Path, depth: usize, max_depth: usize, results: &mut Vec<PathBuf>) {
+    if depth > max_depth {
+        return;
+    }
 
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        let ft = match entry.file_type().await {
-            Ok(ft) => ft,
-            Err(_) => continue,
+    for entry in list_dir_entries(dir).await {
+        let Some(ft) = entry_file_type(&entry).await else {
+            continue;
         };
         if !ft.is_dir() {
             continue;
         }
 
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-
         // Skip hidden directories, node_modules, dist, build
-        if is_ignored_dir(&name_str) {
+        if is_ignored_dir(&entry.file_name().to_string_lossy()) {
             continue;
         }
 
@@ -410,61 +401,7 @@ async fn search_recursive(dir: &Path, results: &mut Vec<PathBuf>) {
             results.push(pkg_json);
         }
 
-        Box::pin(search_recursive(&full_path, results)).await;
-    }
-}
-
-/// Find nested package.json files without workspace configuration.
-async fn find_nested_package_json_files(start_path: &Path) -> Vec<PackageJsonLocation> {
-    let mut results = Vec::new();
-    let root_pkg = start_path.join("package.json");
-    search_nested(start_path, &root_pkg, 0, &mut results).await;
-    results
-}
-
-async fn search_nested(
-    dir: &Path,
-    root_pkg: &Path,
-    depth: usize,
-    results: &mut Vec<PackageJsonLocation>,
-) {
-    if depth > 5 {
-        return;
-    }
-
-    let mut entries = match fs::read_dir(dir).await {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        let ft = match entry.file_type().await {
-            Ok(ft) => ft,
-            Err(_) => continue,
-        };
-        if !ft.is_dir() {
-            continue;
-        }
-
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-
-        if is_ignored_dir(&name_str) {
-            continue;
-        }
-
-        let full_path = entry.path();
-        let pkg_json = full_path.join("package.json");
-        if fs::metadata(&pkg_json).await.is_ok() && pkg_json != root_pkg {
-            results.push(PackageJsonLocation {
-                path: pkg_json,
-                is_root: false,
-                is_workspace: false,
-                workspace_pattern: None,
-            });
-        }
-
-        Box::pin(search_nested(&full_path, root_pkg, depth + 1, results)).await;
+        Box::pin(search_recursive(&full_path, depth + 1, max_depth, results)).await;
     }
 }
 
@@ -544,6 +481,17 @@ mod tests {
         assert_eq!(parse_pnpm_workspace_patterns(yaml), vec!["packages/**"]);
     }
 
+    #[test]
+    fn test_parse_pnpm_bom_first_line() {
+        // A UTF-8 BOM (Windows editors commonly write one) is NOT Unicode
+        // whitespace, so `trim` leaves it in place and a `packages:` header on
+        // the first line never matches — every pattern is silently lost, and
+        // because pnpm-workspace.yaml still marks the project as a pnpm
+        // workspace, no fallback walk runs: zero members discovered.
+        let yaml = "\u{feff}packages:\n  - packages/*";
+        assert_eq!(parse_pnpm_workspace_patterns(yaml), vec!["packages/*"]);
+    }
+
     // ── Group 2: workspace detection + file discovery ────────────────
 
     #[tokio::test]
@@ -620,6 +568,53 @@ mod tests {
         let config = detect_workspaces(&pkg).await;
         assert!(matches!(config.ws_type, WorkspaceType::Pnpm));
         assert_eq!(config.patterns, vec!["packages/*"]);
+    }
+
+    #[tokio::test]
+    async fn test_detect_workspaces_npm_with_bom() {
+        // npm strips a leading UTF-8 BOM before parsing package.json, so a
+        // BOM'd manifest is npm-valid; its workspaces must not be silently
+        // dropped (which would demote the project to "no workspace").
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("package.json");
+        fs::write(&pkg, "\u{feff}{\"workspaces\": [\"packages/*\"]}")
+            .await
+            .unwrap();
+        let config = detect_workspaces(&pkg).await;
+        assert!(matches!(config.ws_type, WorkspaceType::Npm));
+        assert_eq!(config.patterns, vec!["packages/*"]);
+    }
+
+    #[tokio::test]
+    async fn test_find_bom_root_workspace_negation_honored() {
+        // End-to-end symptom of the BOM gap: with a BOM'd root manifest the
+        // workspace config silently degraded to None, so members were found
+        // only by the fallback walk — mislabeled as non-workspace and with
+        // `!`-negations ignored, letting setup edit an excluded package.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            "\u{feff}{\"workspaces\": [\"packages/*\", \"!packages/private\"]}",
+        )
+        .await
+        .unwrap();
+        for member in ["a", "private"] {
+            let m = dir.path().join("packages").join(member);
+            fs::create_dir_all(&m).await.unwrap();
+            fs::write(m.join("package.json"), r#"{"name":"m"}"#)
+                .await
+                .unwrap();
+        }
+        let result = find_package_json_files(dir.path()).await;
+        assert!(matches!(result.workspace_type, WorkspaceType::Npm));
+        let members: Vec<_> = result.files.iter().filter(|f| f.is_workspace).collect();
+        assert_eq!(
+            members.len(),
+            1,
+            "negated member must stay excluded under a BOM'd root: {:?}",
+            result.files.iter().map(|f| &f.path).collect::<Vec<_>>()
+        );
+        assert!(members[0].path.ends_with("packages/a/package.json"));
     }
 
     #[tokio::test]

@@ -57,10 +57,10 @@ fn search_result(uuid: &str, purl: &str) -> PatchSearchResult {
 fn params(root: &Path, server: &MockServer) -> DownloadParams {
     DownloadParams {
         cwd: root.to_path_buf(),
+        manifest_path: root.join(".socket/manifest.json"),
         org: Some(ORG.to_string()),
         // save_only isolates download bookkeeping from the apply step.
         save_only: true,
-        one_off: false,
         global: false,
         global_prefix: None,
         json: true,
@@ -176,5 +176,60 @@ async fn successful_update_is_counted_once() {
     assert_eq!(
         manifest["patches"][PURL]["uuid"], NEW_UUID,
         "manifest={manifest}"
+    );
+}
+
+/// A manifest that EXISTS but cannot be parsed must be a hard error.
+/// `read_manifest` reserves `Ok(None)` for "file missing"; swallowing the
+/// `Err` case into an empty manifest means the unconditional
+/// `write_manifest` at the end of the run silently REPLACES the corrupt
+/// file — destroying every previously tracked patch record — while the
+/// run reports a clean `added` success.
+#[tokio::test]
+#[serial]
+async fn corrupt_manifest_is_a_hard_error_not_silently_clobbered() {
+    let server = MockServer::start().await;
+    // The detail fetch itself would succeed: the failure must come from
+    // the manifest read, before anything is downloaded or rewritten.
+    Mock::given(method("GET"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/view/{NEW_UUID}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "uuid": NEW_UUID,
+            "purl": PURL,
+            "publishedAt": "2024-06-01T00:00:00Z",
+            "files": {
+                "package/index.js": {
+                    "beforeHash": "0000000000000000000000000000000000000000000000000000000000000000",
+                    "afterHash":  "1111111111111111111111111111111111111111111111111111111111111111",
+                    "blobContent": "cGF0Y2hlZAo=",
+                    "beforeBlobContent": "b3JpZ2luYWwK",
+                }
+            },
+            "vulnerabilities": {},
+            "description": "new", "license": "MIT", "tier": "free",
+        })))
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let socket = tmp.path().join(".socket");
+    std::fs::create_dir_all(&socket).unwrap();
+    // E.g. a git merge left conflict markers in a committed manifest.
+    let corrupt = "<<<<<<< HEAD\n{ \"patches\": {} }\n";
+    std::fs::write(socket.join("manifest.json"), corrupt).unwrap();
+
+    let selected = vec![search_result(NEW_UUID, PURL)];
+    let (code, json) = download_and_apply_patches(&selected, &params(tmp.path(), &server)).await;
+
+    assert_eq!(
+        code, 1,
+        "an unreadable manifest must fail the run, not be treated as empty; json={json}"
+    );
+    assert_eq!(json["status"], "error", "json={json}");
+
+    let body = std::fs::read_to_string(tmp.path().join(".socket/manifest.json")).unwrap();
+    assert_eq!(
+        body, corrupt,
+        "a corrupt manifest must be left untouched, never overwritten"
     );
 }

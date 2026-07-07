@@ -60,7 +60,34 @@ fn run_in_pty_bytes(args: &[&str], cwd: &Path, input: &[u8], timeout: Duration) 
         cmd.arg(a);
     }
     cmd.cwd(cwd);
-    cmd.env_remove("SOCKET_API_TOKEN");
+    // The binary binds a wide `SOCKET_*` env surface (SOCKET_YES,
+    // SOCKET_JSON, SOCKET_DRY_RUN, SOCKET_SILENT, SOCKET_MANIFEST_PATH,
+    // ...). An ambient value silently reroutes what these tests exercise —
+    // SOCKET_YES=true skips the very confirm prompts this file exists to
+    // drive, and SOCKET_SILENT=true suppresses the output the oracles
+    // match. The highest-risk vars are seeded with hostile values and then
+    // scrubbed — `env_remove` clears the seed too, so the child never sees
+    // it, but if a scrub line is ever dropped the seed (rather than a
+    // developer's ambient shell, which this suite can't rely on) turns the
+    // tests red immediately.
+    cmd.env("SOCKET_YES", "true");
+    cmd.env("SOCKET_JSON", "true");
+    cmd.env("SOCKET_DRY_RUN", "true");
+    cmd.env("SOCKET_SILENT", "true");
+    cmd.env_remove("SOCKET_YES");
+    cmd.env_remove("SOCKET_JSON");
+    cmd.env_remove("SOCKET_DRY_RUN");
+    cmd.env_remove("SOCKET_SILENT");
+    // Prefix-scrub whatever else the ambient shell carries (SOCKET_CWD,
+    // SOCKET_MANIFEST_PATH, SOCKET_API_TOKEN — removing the token also
+    // forces the public proxy). Telemetry opt-outs are deliberately kept
+    // so an opted-out dev stays opted out.
+    for (key, _) in std::env::vars_os() {
+        let name = key.to_string_lossy();
+        if name.starts_with("SOCKET_") && !name.contains("TELEMETRY") {
+            cmd.env_remove(&key);
+        }
+    }
 
     let mut child = pair
         .slave
@@ -223,6 +250,56 @@ fn setup_interactive_default_no_aborts() {
     );
     let pkg = std::fs::read_to_string(tmp.path().join("package.json")).unwrap();
     assert_eq!(pkg, original, "default-N must not modify package.json");
+}
+
+#[test]
+fn setup_interactive_non_utf8_answer_aborts_without_panic() {
+    // Same regression class as remove_interactive_non_utf8_answer_
+    // declines_without_panic below, but for setup's own prompt reader
+    // (`confirm_proceed`), a separate implementation from
+    // `output::confirm`: a Latin-1 paste (`é` = 0xE9) at
+    // "Proceed with these changes? (y/N): " makes `read_line` return
+    // InvalidData, and unwrapping it panics the CLI (exit 101) instead
+    // of treating the unreadable answer as "not yes" (abort).
+    let tmp = tempfile::tempdir().unwrap();
+    let original = r#"{ "name": "p", "version": "1.0.0" }
+"#;
+    std::fs::write(tmp.path().join("package.json"), original).unwrap();
+
+    let (code, output) = run_in_pty_bytes(
+        &["setup"],
+        tmp.path(),
+        b"\xE9\n",
+        Duration::from_secs(15),
+    );
+    assert!(
+        !output.contains("panicked"),
+        "non-UTF-8 answer must not panic the CLI; got: {output}"
+    );
+    assert_eq!(
+        code, 0,
+        "non-UTF-8 answer must abort cleanly, not crash; got: {output}"
+    );
+    // The interactive prompt MUST have run (vacuity guard as above), and
+    // the unreadable answer must land on the default-N abort path.
+    assert!(
+        output.contains("Proceed with these changes?"),
+        "setup must have shown the interactive confirm prompt; got: {output}"
+    );
+    assert!(
+        !output.contains("Non-interactive mode detected"),
+        "setup must NOT have taken the non-interactive branch in a PTY; got: {output}"
+    );
+    assert!(
+        output.contains("Aborted"),
+        "non-UTF-8 answer must be treated as 'no' and abort; got: {output}"
+    );
+    assert!(
+        !output.contains("Applying changes..."),
+        "non-UTF-8 answer must abort before applying; got: {output}"
+    );
+    let pkg = std::fs::read_to_string(tmp.path().join("package.json")).unwrap();
+    assert_eq!(pkg, original, "aborted setup must not modify package.json");
 }
 
 // ---------------------------------------------------------------------------

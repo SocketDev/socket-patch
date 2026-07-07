@@ -111,8 +111,10 @@ fn image_present(image: &str) -> bool {
 }
 
 /// One concrete case = a (target, scenario) pair from matrix.json.
+/// `pub` (with private fields) so wrapper suites can obtain real cases via
+/// [`load_section`] and regression-test the validators without docker.
 #[derive(Clone)]
-struct Case {
+pub struct Case {
     id: String,
     ecosystem: String,
     pm: String,
@@ -185,7 +187,8 @@ impl Case {
 /// spec section: ("targets","scenarios") for single projects,
 /// ("workspace_targets","workspace_scenarios") for nested workspaces,
 /// ("monorepo_targets","monorepo_scenarios") for the polyglot monorepo.
-fn load_section(
+/// `pub` so wrapper suites can load real cases for validator regression tests.
+pub fn load_section(
     targets_key: &str,
     scenarios_key: &str,
     layout: &str,
@@ -241,10 +244,61 @@ fn load_section(
     cases
 }
 
-struct RunResult {
-    actual_applied: bool,
-    raw: String,
-    parsed: Option<serde_json::Value>,
+/// `pub` (like [`host_driver_command`]) so wrapper suites can synthesize
+/// driver results and regression-test [`round_trip_failure`] without docker.
+pub struct RunResult {
+    pub actual_applied: bool,
+    pub raw: String,
+    pub parsed: Option<serde_json::Value>,
+}
+
+/// Build the host-mode driver invocation: `bash run-case.sh` with the
+/// case's `SM_*` env, the binary under test, and (for pypi) the hook
+/// wheel. `pub` so the `setup_matrix_env_guard` wrapper can inspect the
+/// exact `Command` `run_case` spawns.
+pub fn host_driver_command(env: &[(String, String)], wheel: Option<&Path>) -> Command {
+    let mut cmd = Command::new("bash");
+    cmd.arg(driver_path());
+    // Host mode inherits the parent process's environment, and the driver
+    // passes it straight through to the binary under test AND the native
+    // package-manager installs. Scrub the ambient surface that can flip a
+    // verdict for the wrong reason BEFORE seeding the case env (docker mode
+    // is naturally immune — only the explicit `-e` vars cross over):
+    //   * SOCKET_*     — global-flag fallbacks of the binary under test:
+    //     SOCKET_DRY_RUN=true no-ops the hook's apply, SOCKET_CWD recreates
+    //     the workspace-breaking mode run-case.sh documents it must avoid,
+    //     SOCKET_MANIFEST_PATH/SOCKET_GLOBAL retarget it. The driver
+    //     re-exports the ones it needs (OFFLINE/FORCE/API_TOKEN/...);
+    //     telemetry opt-outs are kept so an opted-out dev stays opted out.
+    //     Also covers a stale ambient SOCKET_PATCH_HOOK_WHEEL.
+    //   * SM_*         — the driver's own contract; an ambient SM_WORKDIR
+    //     would make every parallel case share one scratch dir (the races
+    //     the driver's blob_tmp comment warns about).
+    //   * npm_config_* / YARN_* — PM config that changes whether lifecycle
+    //     hooks even fire (npm_config_ignore_scripts, YARN_ENABLE_SCRIPTS)
+    //     or where installs resolve from.
+    //   * VIRTUAL_ENV / SETUP_MATRIX_SHIM_DIR — hijack the python crawler /
+    //     the shims' PATH-cleanup logic.
+    for (key, _) in std::env::vars_os() {
+        let name = key.to_string_lossy();
+        let hit = ["SOCKET_", "SM_", "YARN_"]
+            .iter()
+            .any(|p| name.starts_with(p))
+            || name.to_ascii_lowercase().starts_with("npm_config_")
+            || name == "VIRTUAL_ENV"
+            || name == "SETUP_MATRIX_SHIM_DIR";
+        if hit && !name.contains("TELEMETRY") {
+            cmd.env_remove(&key);
+        }
+    }
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    cmd.env("SOCKET_PATCH_BIN", binary());
+    if let Some(w) = wheel {
+        cmd.env("SOCKET_PATCH_HOOK_WHEEL", w);
+    }
+    cmd
 }
 
 /// Execute one case via the bash driver (container or host) and parse
@@ -262,16 +316,9 @@ fn run_case(case: &Case) -> RunResult {
     };
 
     let output = if host_mode() {
-        let mut cmd = Command::new("bash");
-        cmd.arg(&driver);
-        for (k, v) in &env {
-            cmd.env(k, v);
-        }
-        cmd.env("SOCKET_PATCH_BIN", binary());
-        if let Some(w) = &wheel {
-            cmd.env("SOCKET_PATCH_HOOK_WHEEL", w);
-        }
-        cmd.output().expect("spawn bash driver")
+        host_driver_command(&env, wheel.as_deref())
+            .output()
+            .expect("spawn bash driver")
     } else {
         let script =
             std::fs::read_to_string(&driver).unwrap_or_else(|e| panic!("read driver: {e}"));
@@ -481,14 +528,15 @@ fn run_cases(label: &str, cases: Vec<Case>) {
 /// Validate the behavioral `(setup)·(install)` round-trip emitted by the driver.
 /// Verifies — through real install cycles, not by reading package.json — that:
 ///
-/// 1. `setup --check` fails before setup, passes after setup, fails after
-///    `setup --remove` (and remove itself succeeds);
+/// 1. `setup --check` fails before setup, passes after the post-setup install
+///    (hook present AND on-disk patch consistency, per contract property 4),
+///    fails after `setup --remove` (and setup + remove themselves succeed);
 /// 2. the patch is NOT applied before setup and NOT applied after remove
 ///    (the after-setup application is covered separately by the main
 ///    `actual_applied == expect_applied` assertion).
 ///
 /// Returns a failure message describing any violation, or `None` on success.
-fn round_trip_failure(case: &Case, res: &RunResult) -> Option<String> {
+pub fn round_trip_failure(case: &Case, res: &RunResult) -> Option<String> {
     // The main loop already turns a missing result line into a hard failure
     // and `continue`s before reaching here, so this branch is defensive: never
     // silently treat an absent result as a passing round-trip.
@@ -549,6 +597,20 @@ fn round_trip_failure(case: &Case, res: &RunResult) -> Option<String> {
              (vacuous round-trip)"
                 .to_string(),
         );
+    }
+
+    // `setup --yes` itself must succeed. `check-after-setup == 0` alone cannot
+    // catch a partial failure: setup aggregates errors across every manifest
+    // kind it edits (npm + python + gem + composer) and exits 1 on
+    // `partial_failure`, so it can land the npm hook (check passes, the patch
+    // applies) and still choke on another manifest — for the polyglot
+    // monorepo that IS the headline regression this suite exists to catch.
+    let setup = int("setup_exit");
+    if setup != Some(0) {
+        problems.push(format!(
+            "setup exit={setup:?} (want 0: `setup --yes` must succeed; non-zero means setup \
+             choked even if the npm hook landed)"
+        ));
     }
 
     // (1) `setup --check` exit code must track the configured state:

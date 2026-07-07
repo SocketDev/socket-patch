@@ -1,7 +1,5 @@
 //! Integration coverage for `crawlers::go_crawler`.
 
-#![cfg(feature = "golang")]
-
 use std::path::Path;
 
 use serial_test::serial;
@@ -18,7 +16,6 @@ fn options_at(root: &Path) -> CrawlerOptions {
         cwd: root.to_path_buf(),
         global: false,
         global_prefix: None,
-        batch_size: 100,
     }
 }
 
@@ -142,7 +139,6 @@ async fn get_module_cache_paths_with_global_prefix_passthrough() {
         cwd: tmp.path().to_path_buf(),
         global: true,
         global_prefix: Some(tmp.path().to_path_buf()),
-        batch_size: 100,
     };
     let paths = crawler.get_module_cache_paths(&opts).await.unwrap();
     assert_eq!(paths, vec![tmp.path().to_path_buf()]);
@@ -218,7 +214,6 @@ async fn crawl_all_handles_unreadable_cache_path() {
         cwd: tmp.path().to_path_buf(),
         global: true,
         global_prefix: Some(cache.clone()),
-        batch_size: 100,
     };
     let result = crawler.crawl_all(&opts).await;
     common::chmod_readable(&cache);
@@ -334,7 +329,6 @@ async fn crawl_all_finds_nested_versioned_module() {
         cwd: tmp.path().to_path_buf(),
         global: true,
         global_prefix: Some(tmp.path().to_path_buf()),
-        batch_size: 100,
     };
     let result = crawler.crawl_all(&opts).await;
     assert_eq!(result.len(), 1);
@@ -368,7 +362,6 @@ async fn crawl_all_skips_cache_metadata_dir() {
         cwd: tmp.path().to_path_buf(),
         global: true,
         global_prefix: Some(tmp.path().to_path_buf()),
-        batch_size: 100,
     };
     let result = crawler.crawl_all(&opts).await;
     assert_eq!(
@@ -425,6 +418,57 @@ async fn get_module_cache_paths_home_go_pkg_mod_fallback() {
     assert!(
         paths.iter().any(|p| p == &expected),
         "HOME/go/pkg/mod fallback must work; got {paths:?}"
+    );
+}
+
+/// A set-but-EMPTY `HOME` must count as unset, matching the empty guard on
+/// `GOMODCACHE` and the empty-entry filter on `GOPATH`: honoring `""` makes
+/// the last-resort fallback return the RELATIVE path `go/pkg/mod`, pointing
+/// every crawl and lookup at `<cwd>/go/pkg/mod` inside the user's project
+/// instead of a real module cache.
+#[tokio::test]
+#[serial]
+async fn get_module_cache_paths_empty_home_returns_no_paths() {
+    let tmp = tempfile::tempdir().unwrap();
+    tokio::fs::write(
+        tmp.path().join("go.mod"),
+        b"module example.com/test\n\ngo 1.21\n",
+    )
+    .await
+    .unwrap();
+    let prev_gomod = std::env::var("GOMODCACHE").ok();
+    let prev_gopath = std::env::var("GOPATH").ok();
+    let prev_home = std::env::var("HOME").ok();
+    let prev_profile = std::env::var("USERPROFILE").ok();
+    std::env::remove_var("GOMODCACHE");
+    std::env::remove_var("GOPATH");
+    std::env::remove_var("USERPROFILE");
+    std::env::set_var("HOME", "");
+
+    let crawler = GoCrawler;
+    let paths = crawler
+        .get_module_cache_paths(&options_at(tmp.path()))
+        .await
+        .unwrap();
+
+    if let Some(v) = prev_gomod {
+        std::env::set_var("GOMODCACHE", v);
+    }
+    if let Some(v) = prev_gopath {
+        std::env::set_var("GOPATH", v);
+    }
+    if let Some(v) = prev_home {
+        std::env::set_var("HOME", v);
+    } else {
+        std::env::remove_var("HOME");
+    }
+    if let Some(v) = prev_profile {
+        std::env::set_var("USERPROFILE", v);
+    }
+
+    assert!(
+        paths.is_empty(),
+        "empty HOME must not yield a CWD-relative go/pkg/mod cache path; got {paths:?}"
     );
 }
 

@@ -39,7 +39,11 @@ const SOCKET_ENV_VARS: &[&str] = &[
     "SOCKET_PROXY_URL",
     "SOCKET_ECOSYSTEMS",
     "SOCKET_DOWNLOAD_MODE",
+    "SOCKET_VENDOR_SOURCE",
+    "SOCKET_VENDOR_URL",
+    "SOCKET_PATCH_SERVER_URL",
     "SOCKET_OFFLINE",
+    "SOCKET_STRICT",
     "SOCKET_GLOBAL",
     "SOCKET_GLOBAL_PREFIX",
     "SOCKET_JSON",
@@ -128,7 +132,11 @@ struct Snap {
     proxy_url: String,
     ecosystems: Option<Vec<String>>,
     download_mode: String,
+    vendor_source: String,
+    vendor_url: Option<String>,
+    patch_server_url: Option<String>,
     offline: bool,
+    strict: bool,
     global: bool,
     global_prefix: Option<PathBuf>,
     json: bool,
@@ -160,7 +168,11 @@ fn snapshot(a: &GetArgs) -> Snap {
         proxy_url: a.common.proxy_url.clone(),
         ecosystems: a.common.ecosystems.clone(),
         download_mode: a.common.download_mode.clone(),
+        vendor_source: a.common.vendor_source.clone(),
+        vendor_url: a.common.vendor_url.clone(),
+        patch_server_url: a.common.patch_server_url.clone(),
         offline: a.common.offline,
+        strict: a.common.strict,
         global: a.common.global,
         global_prefix: a.common.global_prefix.clone(),
         json: a.common.json,
@@ -200,7 +212,11 @@ fn expected_defaults(identifier: &str) -> Snap {
         proxy_url: "https://patches-api.socket.dev".to_string(),
         ecosystems: None,
         download_mode: "diff".to_string(),
+        vendor_source: "auto".to_string(),
+        vendor_url: None,
+        patch_server_url: None,
         offline: false,
+        strict: false,
         global: false,
         global_prefix: None,
         json: false,
@@ -513,4 +529,46 @@ fn unknown_flag_errors() {
         Ok(_) => panic!("expected parse error for unknown flag"),
     };
     assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+}
+
+// --- Hermeticity of the scrub itself -------------------------------------------
+
+#[test]
+#[serial_test::serial]
+fn scrub_covers_every_global_env_var_clap_consults() {
+    // [`SOCKET_ENV_VARS`] claims to list "every SOCKET_* env var that clap
+    // consults while parsing `get`". `GlobalArgs` is flattened in whole, so
+    // the production `GLOBAL_ARG_ENV_VARS` list is the oracle — a flag added
+    // to `GlobalArgs` with an env binding is consulted here the moment it
+    // lands, and if the scrub list lags behind, an ambient value either
+    // aborts every parse in this file (validated flags: bools, ints,
+    // `--ecosystems`, `--vendor-source`) or silently leaks into the parsed
+    // args (string flags), voiding the hermeticity the module doc promises.
+    // `garbage` is rejected by every validating parser and visibly non-default
+    // for every string/path/option flag, so a missing scrub entry fails
+    // loudly either way.
+    for &var in socket_patch_cli::args::GLOBAL_ARG_ENV_VARS {
+        let prev = std::env::var(var).ok();
+        std::env::set_var(var, "garbage");
+        let parsed = {
+            let _scrub = EnvScrub::new();
+            Cli::try_parse_from(["socket-patch", "get", "some-id"])
+        };
+        match prev {
+            Some(v) => std::env::set_var(var, v),
+            None => std::env::remove_var(var),
+        }
+        let a = match parsed {
+            Ok(cli) => match cli.command {
+                Commands::Get(a) => a,
+                _ => panic!("expected Get"),
+            },
+            Err(e) => panic!("ambient {var}=garbage aborted the scrubbed parse: {e}"),
+        };
+        assert_eq!(
+            snapshot(&a),
+            expected_defaults("some-id"),
+            "ambient {var}=garbage leaked into the scrubbed parse",
+        );
+    }
 }

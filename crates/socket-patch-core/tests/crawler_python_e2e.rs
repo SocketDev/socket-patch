@@ -358,6 +358,40 @@ async fn get_global_python_site_packages_discovers_uv_tools_macos() {
     );
 }
 
+/// uv follows XDG conventions on macOS too: `uv tool dir` resolves to
+/// `~/.local/share/uv/tools` (verified against a real uv install), NOT
+/// `~/Library/Application Support/uv/tools`. Scanning only the Application
+/// Support path makes every `uv tool install`ed package invisible to
+/// global discovery on macOS.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[serial]
+async fn get_global_python_site_packages_discovers_uv_tools_xdg_on_macos() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sp = tmp
+        .path()
+        .join(".local")
+        .join("share")
+        .join("uv")
+        .join("tools")
+        .join("black")
+        .join("lib")
+        .join("python3.11")
+        .join("site-packages");
+    tokio::fs::create_dir_all(&sp).await.unwrap();
+
+    let prev_home = std::env::var("HOME").ok();
+    std::env::set_var("HOME", tmp.path());
+    let result = get_global_python_site_packages().await;
+    if let Some(v) = prev_home {
+        std::env::set_var("HOME", v);
+    }
+    assert!(
+        result.iter().any(|p| p == &sp),
+        "XDG uv tools layout must surface on macOS; got {result:?}"
+    );
+}
+
 /// `uv tool install <pkg>` on Linux installs into
 /// `~/.local/share/uv/tools/<pkg>/lib/python3.X/site-packages/`.
 #[cfg(all(not(target_os = "macos"), not(windows)))]
@@ -475,7 +509,6 @@ async fn get_site_packages_paths_falls_back_via_pyproject_marker() {
         cwd: project.path().to_path_buf(),
         global: false,
         global_prefix: None,
-        batch_size: 100,
     };
     let result = crawler.get_site_packages_paths(&opts).await.unwrap();
     if let Some(v) = prev_home {
@@ -551,7 +584,6 @@ async fn get_site_packages_paths_falls_back_via_uv_lock_marker() {
         cwd: project.path().to_path_buf(),
         global: false,
         global_prefix: None,
-        batch_size: 100,
     };
     let result = crawler.get_site_packages_paths(&opts).await.unwrap();
     if let Some(v) = prev_home {
@@ -573,6 +605,61 @@ async fn get_site_packages_paths_falls_back_via_uv_lock_marker() {
     let _ = (result, staged);
 }
 
+/// A pipenv-managed project ships `Pipfile`/`Pipfile.lock` and commonly has
+/// NO pyproject.toml / setup.py / requirements.txt — the marker list must
+/// include it or a fresh clone (pipenv keeps its venvs out-of-tree under
+/// `~/.local/share/virtualenvs`) returns zero packages via the no-marker
+/// early-out. The vendor layer already treats `Pipfile.lock` as a
+/// first-class pypi flavor; discovery must agree.
+#[tokio::test]
+#[serial]
+async fn get_site_packages_paths_falls_back_via_pipfile_marker() {
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    tokio::fs::write(
+        project.path().join("Pipfile"),
+        b"[packages]\nrequests = \"*\"\n",
+    )
+    .await
+    .unwrap();
+
+    // Stage an anaconda3 layout under the stubbed HOME — scanned by global
+    // discovery on every platform, so this test needs no per-OS forks.
+    let staged = home
+        .path()
+        .join("anaconda3")
+        .join("lib")
+        .join("python3.11")
+        .join("site-packages");
+    tokio::fs::create_dir_all(&staged).await.unwrap();
+
+    let prev_virtual_env = std::env::var("VIRTUAL_ENV").ok();
+    std::env::remove_var("VIRTUAL_ENV");
+    let prev_home = std::env::var("HOME").ok();
+    std::env::set_var("HOME", home.path());
+    let crawler = PythonCrawler;
+    let opts = CrawlerOptions {
+        cwd: project.path().to_path_buf(),
+        global: false,
+        global_prefix: None,
+    };
+    let result = crawler.get_site_packages_paths(&opts).await.unwrap();
+    if let Some(v) = prev_home {
+        std::env::set_var("HOME", v);
+    }
+    if let Some(v) = prev_virtual_env {
+        std::env::set_var("VIRTUAL_ENV", v);
+    }
+
+    #[cfg(not(windows))]
+    assert!(
+        result.iter().any(|p| p == &staged),
+        "Pipfile marker must trigger global fallback; got {result:?}"
+    );
+    #[cfg(windows)]
+    let _ = (result, staged);
+}
+
 /// Without any Python-project marker AND without a venv, local-mode
 /// discovery returns an empty Vec — no false positives from scanning
 /// a non-Python project.
@@ -585,7 +672,6 @@ async fn get_site_packages_paths_no_marker_no_venv_returns_empty() {
         cwd: project.path().to_path_buf(),
         global: false,
         global_prefix: None,
-        batch_size: 100,
     };
     let prev_virtual_env = std::env::var("VIRTUAL_ENV").ok();
     std::env::remove_var("VIRTUAL_ENV");
@@ -695,7 +781,6 @@ async fn crawl_all_handles_unreadable_site_packages() {
         cwd: tmp.path().to_path_buf(),
         global: true,
         global_prefix: Some(site_packages.clone()),
-        batch_size: 100,
     };
     let result = crawler.crawl_all(&opts).await;
     common::chmod_readable(&site_packages);
@@ -804,6 +889,36 @@ async fn find_by_purls_strips_subpath() {
     assert_eq!(pkg.path, tmp.path());
 }
 
+/// The patches API serves purls in canonical percent-encoded form (see
+/// `percent_decode_purl_component`): a PEP 440 local/epoch version carries
+/// `+`/`!`, which arrive as `%2B`/`%21`. The lookup key must be built from
+/// the DECODED coordinates or the installed package silently fails to match
+/// — reported "not installed", patch skipped. Twin of the npm crawler's
+/// percent-decode handling.
+#[tokio::test]
+async fn find_by_purls_percent_decodes_encoded_version() {
+    let tmp = tempfile::tempdir().unwrap();
+    stage_dist_info(tmp.path(), "torch", "2.1.0+cpu").await;
+
+    let crawler = PythonCrawler;
+    let result = crawler
+        .find_by_purls(tmp.path(), &["pkg:pypi/torch@2.1.0%2Bcpu".to_string()])
+        .await
+        .unwrap();
+    assert_eq!(
+        result.len(),
+        1,
+        "%-encoded version must decode before lookup; got {result:?}"
+    );
+    // Keyed by the ORIGINAL (encoded) PURL, like the qualifier/subpath tests.
+    let pkg = result
+        .get("pkg:pypi/torch@2.1.0%2Bcpu")
+        .expect("result must be keyed by the original encoded PURL");
+    assert_eq!(pkg.name, "torch");
+    assert_eq!(pkg.version, "2.1.0+cpu");
+    assert_eq!(pkg.purl, "pkg:pypi/torch@2.1.0%2Bcpu");
+}
+
 #[tokio::test]
 async fn find_by_purls_empty_purls_returns_empty() {
     let tmp = tempfile::tempdir().unwrap();
@@ -870,7 +985,6 @@ async fn crawl_all_via_site_packages_finds_dist_info_packages() {
         cwd: tmp.path().to_path_buf(),
         global: true,
         global_prefix: Some(tmp.path().to_path_buf()),
-        batch_size: 100,
     };
     let result = crawler.crawl_all(&opts).await;
     assert_eq!(
@@ -914,7 +1028,6 @@ async fn crawl_all_with_unparseable_dist_info_skips() {
         cwd: tmp.path().to_path_buf(),
         global: true,
         global_prefix: Some(tmp.path().to_path_buf()),
-        batch_size: 100,
     };
     let result = crawler.crawl_all(&opts).await;
     assert!(
@@ -936,7 +1049,6 @@ async fn get_site_packages_paths_with_global_prefix_passthrough() {
         cwd: tmp.path().to_path_buf(),
         global: false,
         global_prefix: Some(custom.clone()),
-        batch_size: 100,
     };
     let paths = crawler.get_site_packages_paths(&opts).await.unwrap();
     assert_eq!(paths, vec![custom]);

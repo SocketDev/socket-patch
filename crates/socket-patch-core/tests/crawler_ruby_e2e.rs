@@ -32,7 +32,6 @@ fn options_at(root: &Path) -> CrawlerOptions {
         cwd: root.to_path_buf(),
         global: false,
         global_prefix: None,
-        batch_size: 100,
     }
 }
 
@@ -182,7 +181,6 @@ async fn crawl_all_discovers_gems_in_path() {
         cwd: tmp.path().to_path_buf(),
         global: true,
         global_prefix: Some(tmp.path().to_path_buf()),
-        batch_size: 100,
     };
     let result = crawler.crawl_all(&opts).await;
     assert_eq!(result.len(), 2);
@@ -217,7 +215,6 @@ async fn get_gem_paths_with_global_prefix_returns_only_prefix() {
         cwd: tmp.path().to_path_buf(),
         global: true,
         global_prefix: Some(tmp.path().to_path_buf()),
-        batch_size: 100,
     };
     let paths = crawler.get_gem_paths(&opts).await.unwrap();
     assert_eq!(paths, vec![tmp.path().to_path_buf()]);
@@ -363,7 +360,6 @@ async fn global_gem_discovery_via_home_dotgem_layout() {
         cwd: tmp.path().to_path_buf(),
         global: true,
         global_prefix: None,
-        batch_size: 100,
     };
     let paths = crawler.get_gem_paths(&opts).await.unwrap();
     if let Some(v) = prev {
@@ -399,7 +395,6 @@ async fn crawl_all_handles_unreadable_gem_dir() {
         cwd: tmp.path().to_path_buf(),
         global: true,
         global_prefix: Some(gem_dir.clone()),
-        batch_size: 100,
     };
     let result = crawler.crawl_all(&opts).await;
     common::chmod_readable(&gem_dir);
@@ -471,7 +466,6 @@ async fn global_gem_discovery_no_binary_no_home_layout_returns_empty() {
         cwd: tmp.path().to_path_buf(),
         global: true,
         global_prefix: None,
-        batch_size: 100,
     };
     let paths = crawler.get_gem_paths(&opts).await.unwrap();
 
@@ -517,7 +511,6 @@ async fn global_gem_discovery_via_rvm_layout() {
         cwd: tmp.path().to_path_buf(),
         global: true,
         global_prefix: None,
-        batch_size: 100,
     };
     let paths = crawler.get_gem_paths(&opts).await.unwrap();
     if let Some(v) = prev {
@@ -554,7 +547,6 @@ async fn global_gem_discovery_via_rbenv_layout() {
         cwd: tmp.path().to_path_buf(),
         global: true,
         global_prefix: None,
-        batch_size: 100,
     };
     let paths = crawler.get_gem_paths(&opts).await.unwrap();
     if let Some(v) = prev {

@@ -8,7 +8,7 @@ use std::path::Path;
 /// carrier). A single, familiar line. Classic Poetry can't express an extra as
 /// a bare key, so [`super::edit`] emits the equivalent
 /// `socket-patch = { extras = ["hook"] }` there instead.
-pub const HOOK_DEP: &str = "socket-patch[hook]";
+pub(crate) const HOOK_DEP: &str = "socket-patch[hook]";
 
 /// Substrings (space-insensitive, lower-cased) that mean the hook is already
 /// declared — the `socket-patch[hook]` extra, the standalone wheel, or the
@@ -42,15 +42,21 @@ impl PythonPackageManager {
         }
     }
 
-    /// The lockfile-refresh command `(program, args)` for managers whose frozen
-    /// CI install reads a lockfile that must be regenerated after editing the
-    /// dependency list. `None` for managers that resolve dependencies directly
-    /// from the manifest at install time (pip, hatch).
-    pub fn lock_command(&self) -> Option<(&'static str, &'static [&'static str])> {
+    /// The lockfile-refresh invocations `(program, spellings)` for managers
+    /// whose frozen CI install reads a lockfile that must be regenerated
+    /// after editing the dependency list. Each arg-list is tried in order
+    /// until one succeeds: the first is the pin-preserving spelling where
+    /// the tool has a distinct one (`poetry lock --no-update` on Poetry 1.x —
+    /// bare `poetry lock` re-resolves the user's whole pinned set there;
+    /// `pdm lock --update-reuse`), the last is the bare `lock` accepted
+    /// everywhere (already pin-preserving on Poetry 2.x, where `--no-update`
+    /// was removed, and on uv). `None` for managers that resolve dependencies
+    /// directly from the manifest at install time (pip, hatch).
+    pub fn lock_commands(&self) -> Option<(&'static str, &'static [&'static [&'static str]])> {
         match self {
-            Self::Uv => Some(("uv", &["lock"])),
-            Self::Poetry => Some(("poetry", &["lock"])),
-            Self::Pdm => Some(("pdm", &["lock"])),
+            Self::Uv => Some(("uv", &[&["lock"]])),
+            Self::Poetry => Some(("poetry", &[&["lock", "--no-update"], &["lock"]])),
+            Self::Pdm => Some(("pdm", &[&["lock", "--update-reuse"], &["lock"]])),
             Self::Hatch | Self::Pip => None,
         }
     }
@@ -91,7 +97,8 @@ pub async fn detect_python_pm(cwd: &Path) -> PythonPackageManager {
 }
 
 /// True if a `[prefix]` or `[prefix.*]` table header appears in the TOML text.
-fn has_table(content: &str, prefix: &str) -> bool {
+/// Also used by the pypi vendor flavor router (`patch::vendor::pypi`).
+pub(crate) fn has_table(content: &str, prefix: &str) -> bool {
     content.lines().any(|line| {
         let l = line.trim();
         let Some(rest) = l.strip_prefix('[') else {
@@ -123,10 +130,7 @@ pub fn deps_contain_hook(text: &str) -> bool {
         // Drop a `#` comment first (requirements.txt and TOML both comment
         // with `#`): a commented-out `# socket-patch[hook]` declares nothing —
         // pip never installs it — and a marker mentioned inside a trailing
-        // comment must not read as configured. Same first-`#` rule as
-        // `edit::strip_requirement_comment`, so the `setup --check` / state
-        // probes (which call this on raw file content) agree with the editors
-        // (which pre-strip) on identical bytes.
+        // comment must not read as configured.
         let spec = match line.find('#') {
             Some(i) => &line[..i],
             None => line,
@@ -136,13 +140,29 @@ pub fn deps_contain_hook(text: &str) -> bool {
             .chars()
             .filter(|c| !c.is_whitespace())
             .collect();
-        HOOK_MARKERS.iter().any(|m| normalized.contains(*m))
+        if HOOK_MARKERS.iter().any(|m| normalized.contains(*m)) {
+            return true;
+        }
+        // PEP 503 makes `-`/`_`/`.` interchangeable in package names and PEP
+        // 508 lets the hook extra ride with others (`socket-patch[cli,hook]`),
+        // so pip installs the hook from spellings the markers above miss
+        // (`socket_patch[hook]`). Canonicalize and probe for the wheel name or
+        // a `socket-patch[...]` extras list containing `hook`.
+        let canon: String = normalized
+            .chars()
+            .map(|c| if c == '_' || c == '.' { '-' } else { c })
+            .collect();
+        if canon.contains("socket-patch-hook") {
+            return true;
+        }
+        canon.match_indices("socket-patch[").any(|(i, m)| {
+            let rest = &canon[i + m.len()..];
+            match rest.find(']') {
+                Some(end) => rest[..end].split(',').any(|e| e == "hook"),
+                None => false,
+            }
+        })
     })
-}
-
-/// True if a single PEP 508 dependency spec is the hook dependency.
-pub fn spec_is_hook(spec: &str) -> bool {
-    deps_contain_hook(spec)
 }
 
 #[cfg(test)]
@@ -156,6 +176,25 @@ mod tests {
         assert!(deps_contain_hook("Socket-Patch[hook]>=3.3.0"));
         assert!(deps_contain_hook("socket-patch-hook==3.3.0"));
         assert!(deps_contain_hook("socket_patch_hook"));
+    }
+
+    #[test]
+    fn test_deps_contain_hook_pep503_and_combined_extras() {
+        // PEP 503: `-`, `_`, `.` are interchangeable in the name — pip
+        // installs the hook from all of these.
+        assert!(deps_contain_hook("socket_patch[hook]"));
+        assert!(deps_contain_hook("socket.patch[hook]==3.3.0"));
+        assert!(deps_contain_hook("Socket_Patch [hook]"));
+        assert!(deps_contain_hook("socket.patch_hook"));
+        // PEP 508: the hook extra combined with others still declares it.
+        assert!(deps_contain_hook("socket-patch[cli,hook]>=3.3.0"));
+        assert!(deps_contain_hook("socket-patch[ hook , cli ]"));
+        assert!(deps_contain_hook("socket_patch[cli,hook]"));
+        // Some other extra alone is NOT the hook, `hooky` is a different
+        // extra, and an unterminated bracket is not a spec.
+        assert!(!deps_contain_hook("socket_patch[cli]"));
+        assert!(!deps_contain_hook("socket-patch[hooky]"));
+        assert!(!deps_contain_hook("socket-patch[hook"));
     }
 
     #[test]
@@ -272,12 +311,22 @@ mod tests {
     }
 
     #[test]
-    fn test_lock_command() {
+    fn test_lock_commands() {
         assert_eq!(
-            PythonPackageManager::Uv.lock_command(),
-            Some(("uv", &["lock"][..]))
+            PythonPackageManager::Uv.lock_commands(),
+            Some(("uv", &[&["lock"][..]][..]))
         );
-        assert_eq!(PythonPackageManager::Pip.lock_command(), None);
-        assert_eq!(PythonPackageManager::Hatch.lock_command(), None);
+        // Pin-preserving spelling first, bare `lock` fallback for versions
+        // that dropped the flag (Poetry 2.x).
+        assert_eq!(
+            PythonPackageManager::Poetry.lock_commands(),
+            Some(("poetry", &[&["lock", "--no-update"][..], &["lock"][..]][..]))
+        );
+        assert_eq!(
+            PythonPackageManager::Pdm.lock_commands(),
+            Some(("pdm", &[&["lock", "--update-reuse"][..], &["lock"][..]][..]))
+        );
+        assert_eq!(PythonPackageManager::Pip.lock_commands(), None);
+        assert_eq!(PythonPackageManager::Hatch.lock_commands(), None);
     }
 }

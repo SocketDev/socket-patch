@@ -13,7 +13,7 @@ pub const DEFAULT_SOCKET_API_URL: &str = "https://api.socket.dev";
 /// tracks the published release (currently `3.x`) instead of drifting from a
 /// hardcoded literal. Server-side analytics and any minimum-version gating rely
 /// on this reporting the real version.
-pub const USER_AGENT: &str = concat!("SocketPatchCLI/", env!("CARGO_PKG_VERSION"));
+pub(crate) const USER_AGENT: &str = concat!("SocketPatchCLI/", env!("CARGO_PKG_VERSION"));
 
 #[cfg(test)]
 mod tests {

@@ -1,38 +1,30 @@
 use socket_patch_core::crawlers::{
-    CrawledPackage, CrawlerOptions, Ecosystem, NpmCrawler, PythonCrawler,
+    CrawledPackage, CrawlerOptions, Ecosystem, NpmCrawler, PythonCrawler, RubyCrawler,
 };
 use socket_patch_core::utils::purl::strip_purl_qualifiers;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
-#[cfg(feature = "cargo")]
+use crate::args::GlobalArgs;
+
 use socket_patch_core::crawlers::CargoCrawler;
-#[cfg(feature = "composer")]
 use socket_patch_core::crawlers::ComposerCrawler;
-#[cfg(feature = "deno")]
 use socket_patch_core::crawlers::DenoCrawler;
-#[cfg(feature = "golang")]
 use socket_patch_core::crawlers::GoCrawler;
-#[cfg(feature = "maven")]
 use socket_patch_core::crawlers::MavenCrawler;
-#[cfg(feature = "nuget")]
 use socket_patch_core::crawlers::NuGetCrawler;
-use socket_patch_core::crawlers::RubyCrawler;
 
 /// Runtime opt-in gate for experimental Maven support.
 ///
-/// Even when the binary is compiled with `--features maven`, the
-/// crawler does NOT run unless `SOCKET_EXPERIMENTAL_MAVEN=1` (or
+/// The Maven crawler does NOT run unless `SOCKET_EXPERIMENTAL_MAVEN=1` (or
 /// `=true`). Applying a Maven patch corrupts the jar sidecar
 /// checksums (`<jar>.jar.sha1`, `<jar>.jar.md5`) that the local
 /// Maven repository keeps next to each artifact, and there is no
 /// recovery — the user has to re-download the jar.
-#[cfg(feature = "maven")]
 fn maven_runtime_enabled() -> bool {
     env_truthy("SOCKET_EXPERIMENTAL_MAVEN")
 }
 
-#[cfg(feature = "maven")]
 fn warn_maven_disabled(skipped: usize) {
     eprintln!(
         "Warning: {} Maven patch(es) skipped — Maven support is experimental.",
@@ -49,12 +41,10 @@ fn warn_maven_disabled(skipped: usize) {
 /// fixup cannot honestly rewrite this without the original `.nupkg`
 /// (which we don't have post-extraction). Refuse to dispatch unless
 /// the operator has explicitly opted in to the experimental tier.
-#[cfg(feature = "nuget")]
 fn nuget_runtime_enabled() -> bool {
     env_truthy("SOCKET_EXPERIMENTAL_NUGET")
 }
 
-#[cfg(feature = "nuget")]
 fn warn_nuget_disabled(skipped: usize) {
     eprintln!(
         "Warning: {} NuGet patch(es) skipped — NuGet support is experimental.",
@@ -65,7 +55,6 @@ fn warn_nuget_disabled(skipped: usize) {
     eprintln!("  Set SOCKET_EXPERIMENTAL_NUGET=1 to enable at your own risk.");
 }
 
-#[cfg(any(feature = "maven", feature = "nuget"))]
 fn env_truthy(name: &str) -> bool {
     std::env::var(name)
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -164,7 +153,7 @@ type MergeFn = fn(&mut HashMap<String, PathBuf>, &[String], HashMap<String, Craw
 fn merge_first_wins(
     out: &mut HashMap<String, PathBuf>,
     _purls: &[String],
-    packages: HashMap<String, socket_patch_core::crawlers::CrawledPackage>,
+    packages: HashMap<String, CrawledPackage>,
 ) {
     for (purl, pkg) in packages {
         out.entry(purl).or_insert(pkg.path);
@@ -180,7 +169,7 @@ fn merge_first_wins(
 fn merge_qualified(
     out: &mut HashMap<String, PathBuf>,
     purls: &[String],
-    packages: HashMap<String, socket_patch_core::crawlers::CrawledPackage>,
+    packages: HashMap<String, CrawledPackage>,
 ) {
     for (base_purl, pkg) in packages {
         for qualified in purls {
@@ -251,7 +240,6 @@ async fn dispatch_find(
         on_match = variant_merge,
     );
 
-    #[cfg(feature = "cargo")]
     scan_ecosystem!(
         out = out,
         partitioned = partitioned,
@@ -283,7 +271,6 @@ async fn dispatch_find(
         on_match = variant_merge,
     );
 
-    #[cfg(feature = "golang")]
     scan_ecosystem!(
         out = out,
         partitioned = partitioned,
@@ -298,7 +285,6 @@ async fn dispatch_find(
         on_match = merge_first_wins,
     );
 
-    #[cfg(feature = "maven")]
     if let Some(maven_purls) = partitioned.get(&Ecosystem::Maven) {
         if !maven_purls.is_empty() && !maven_runtime_enabled() {
             if !silent {
@@ -325,7 +311,6 @@ async fn dispatch_find(
         }
     }
 
-    #[cfg(feature = "composer")]
     scan_ecosystem!(
         out = out,
         partitioned = partitioned,
@@ -340,7 +325,6 @@ async fn dispatch_find(
         on_match = merge_first_wins,
     );
 
-    #[cfg(feature = "nuget")]
     if let Some(nuget_purls) = partitioned.get(&Ecosystem::Nuget) {
         if !nuget_purls.is_empty() && !nuget_runtime_enabled() {
             if !silent {
@@ -363,7 +347,6 @@ async fn dispatch_find(
         }
     }
 
-    #[cfg(feature = "deno")]
     scan_ecosystem!(
         out = out,
         partitioned = partitioned,
@@ -404,6 +387,32 @@ pub async fn find_packages_for_rollback(
     dispatch_find(partitioned, options, silent, merge_qualified).await
 }
 
+/// Resolve manifest PURLs to their installed on-disk paths (partition,
+/// build crawler options from the global args, dispatch). Uses the
+/// rollback (qualified-aware) resolver, NOT `find_packages_for_purls`:
+/// release-variant ecosystems (PyPI / RubyGems / Maven) key the manifest
+/// by *qualified* PURLs (`?artifact_id=`, `?platform=`,
+/// `?classifier=&ext=`), but the crawler only knows the *base* PURL.
+/// `find_packages_for_purls` would key the result map by the base PURL,
+/// so qualified manifest lookups would all miss and every PyPI/Gem/Maven
+/// patch would silently resolve as `package_not_found`. The rollback
+/// variant fans each base path back out to every qualified manifest PURL
+/// — the same mapping the manifest was written with (`get` uses the same
+/// resolver).
+pub async fn find_manifest_package_paths(
+    purls: &[String],
+    common: &GlobalArgs,
+    quiet: bool,
+) -> HashMap<String, PathBuf> {
+    let partitioned = partition_purls(purls, common.ecosystems.as_deref());
+    let crawler_options = CrawlerOptions {
+        cwd: common.cwd.clone(),
+        global: common.global,
+        global_prefix: common.global_prefix.clone(),
+    };
+    find_packages_for_rollback(&partitioned, &crawler_options, quiet).await
+}
+
 /// Crawl all enabled ecosystems and return all packages plus per-ecosystem counts.
 pub async fn crawl_all_ecosystems(
     options: &CrawlerOptions,
@@ -421,25 +430,19 @@ pub async fn crawl_all_ecosystems(
 
     crawl!(Ecosystem::Npm, NpmCrawler);
     crawl!(Ecosystem::Pypi, PythonCrawler);
-    #[cfg(feature = "cargo")]
     crawl!(Ecosystem::Cargo, CargoCrawler);
     crawl!(Ecosystem::Gem, RubyCrawler);
-    #[cfg(feature = "golang")]
     crawl!(Ecosystem::Golang, GoCrawler);
-    #[cfg(feature = "maven")]
     if maven_runtime_enabled() {
         // Same runtime gate as `find_packages_for_purls` — `scan`
         // walks the Maven repo only when the operator has explicitly
         // opted into experimental support.
         crawl!(Ecosystem::Maven, MavenCrawler);
     }
-    #[cfg(feature = "composer")]
     crawl!(Ecosystem::Composer, ComposerCrawler);
-    #[cfg(feature = "nuget")]
     if nuget_runtime_enabled() {
         crawl!(Ecosystem::Nuget, NuGetCrawler);
     }
-    #[cfg(feature = "deno")]
     crawl!(Ecosystem::Deno, DenoCrawler);
 
     (all_packages, counts)
@@ -690,22 +693,15 @@ mod tests {
     fn release_variant_predicate_matches_dispatch_expectations() {
         assert!(Ecosystem::Pypi.supports_release_variants());
         assert!(Ecosystem::Gem.supports_release_variants());
-        #[cfg(feature = "maven")]
         assert!(Ecosystem::Maven.supports_release_variants());
         assert!(!Ecosystem::Npm.supports_release_variants());
-        #[cfg(feature = "cargo")]
         assert!(!Ecosystem::Cargo.supports_release_variants());
-        #[cfg(feature = "golang")]
         assert!(!Ecosystem::Golang.supports_release_variants());
-        #[cfg(feature = "composer")]
         assert!(!Ecosystem::Composer.supports_release_variants());
-        #[cfg(feature = "nuget")]
         assert!(!Ecosystem::Nuget.supports_release_variants());
-        #[cfg(feature = "deno")]
         assert!(!Ecosystem::Deno.supports_release_variants());
     }
 
-    #[cfg(any(feature = "maven", feature = "nuget"))]
     #[test]
     fn env_truthy_accepts_one_and_true_case_insensitive() {
         let key = "SOCKET_TEST_ENV_TRUTHY";
@@ -721,7 +717,6 @@ mod tests {
         assert!(!env_truthy(key));
     }
 
-    #[cfg(any(feature = "maven", feature = "nuget"))]
     #[test]
     fn env_truthy_rejects_empty_and_padded_values() {
         // The experimental gates must NOT open on an empty assignment
@@ -756,15 +751,7 @@ mod tests {
             "pkg:cargo/baz@3.0".to_string(),
         ];
         let map = partition_purls(&purls, None);
-        // `pkg:cargo/...` is only recognized when the `cargo` feature is
-        // compiled in; otherwise `Ecosystem::from_purl` drops it. Keep the
-        // expected length in step with the active feature set so this test
-        // is correct in both configurations.
-        #[cfg(feature = "cargo")]
-        let expected_len = 3;
-        #[cfg(not(feature = "cargo"))]
-        let expected_len = 2;
-        assert_eq!(map.len(), expected_len);
+        assert_eq!(map.len(), 3);
         assert_eq!(
             map.get(&Ecosystem::Npm),
             Some(&vec!["pkg:npm/foo@1.0".to_string()])
@@ -773,7 +760,6 @@ mod tests {
             map.get(&Ecosystem::Pypi),
             Some(&vec!["pkg:pypi/bar@2.0".to_string()])
         );
-        #[cfg(feature = "cargo")]
         assert_eq!(
             map.get(&Ecosystem::Cargo),
             Some(&vec!["pkg:cargo/baz@3.0".to_string()])
@@ -909,7 +895,6 @@ mod tests {
             cwd,
             global: false,
             global_prefix: None,
-            batch_size: 100,
         }
     }
 
@@ -985,7 +970,6 @@ mod tests {
     // one gets no entry. That distinction lets us test the gate without a
     // real Maven repo / NuGet cache fixture.
 
-    #[cfg(feature = "maven")]
     #[tokio::test]
     #[serial_test::serial(experimental_gate_env)]
     async fn crawl_all_gates_maven_on_runtime_flag() {
@@ -1008,7 +992,6 @@ mod tests {
         std::env::remove_var("SOCKET_EXPERIMENTAL_MAVEN");
     }
 
-    #[cfg(feature = "nuget")]
     #[tokio::test]
     #[serial_test::serial(experimental_gate_env)]
     async fn crawl_all_gates_nuget_on_runtime_flag() {

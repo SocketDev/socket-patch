@@ -56,10 +56,11 @@ fn has_command(cmd: &str) -> bool {
 /// `SOCKET_*` var scrubbed.
 fn bun(cwd: &Path, args: &[&str], cache_dir: &Path) -> Output {
     let mut cmd = Command::new("bun");
-    cmd.args(args)
-        .current_dir(cwd)
-        .env("BUN_INSTALL_CACHE_DIR", cache_dir);
+    cmd.args(args).current_dir(cwd);
+    // Scrub BEFORE seeding: scrub_socket_env removes BUN_INSTALL_CACHE_DIR,
+    // and Command's last env call wins.
     scrub_socket_env(&mut cmd);
+    cmd.env("BUN_INSTALL_CACHE_DIR", cache_dir);
     cmd.output().expect("failed to run bun")
 }
 
@@ -179,6 +180,14 @@ fn bun_vendor_fresh_checkout_frozen_install_and_revert() {
         );
         return;
     }
+    // Hermeticity guard: the install must have gone through the PRIVATE cache.
+    // If BUN_INSTALL_CACHE_DIR never reached the child, bun silently used the
+    // user's global cache and the fresh-checkout "empty cache" premise is void.
+    assert!(
+        cache.is_dir() && std::fs::read_dir(&cache).unwrap().next().is_some(),
+        "fixture install did not populate the private BUN_INSTALL_CACHE_DIR at {}",
+        cache.display()
+    );
 
     let installed_index = proj.join("node_modules").join(DEP).join("index.js");
     let orig = std::fs::read(&installed_index).expect("installed index.js");

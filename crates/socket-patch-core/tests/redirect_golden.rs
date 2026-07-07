@@ -13,7 +13,7 @@
 //! (nuget.config, maven pom). Any shared fixture not yet ported is skipped
 //! here (logged) rather than silently ignored.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -86,7 +86,7 @@ fn redirect_golden_fixtures_match() {
         root.display()
     );
 
-    let mut asserted = 0;
+    let mut asserted: BTreeSet<String> = BTreeSet::new();
     for case in &cases {
         let rel = rel_key(&root, case);
         // rel = "<eco>/<flavor>/<case>"; eco_flavor = "<eco>/<flavor>".
@@ -147,11 +147,17 @@ fn redirect_golden_fixtures_match() {
         let again = rewrite_registry_redirect(&files, &overrides);
         assert_eq!(again.files, result.files, "{rel}: non-deterministic");
 
-        asserted += 1;
+        asserted.insert(eco_flavor.to_string());
     }
+    // Per-flavor, not a case count: a case total stays comfortably above the
+    // flavor count, so counting cases lets an entire implemented eco/flavor
+    // lose its fixtures (bad rebase, fixture-sync failure) without failing.
+    let missing: Vec<&&str> = RUST_IMPLEMENTED
+        .iter()
+        .filter(|f| !asserted.contains(**f))
+        .collect();
     assert!(
-        asserted >= RUST_IMPLEMENTED.len(),
-        "expected to assert all {} implemented ecosystems, got {asserted}",
-        RUST_IMPLEMENTED.len()
+        missing.is_empty(),
+        "implemented eco/flavors with no golden case asserted: {missing:?}"
     );
 }

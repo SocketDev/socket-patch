@@ -268,6 +268,51 @@ fn yarn_pnp_refuses_in_human_mode() {
     assert_pristine_package_dir(index.parent().unwrap());
 }
 
+/// `--silent` is "errors only" (CLI_CONTRACT.md), never "nothing":
+/// the yarn-PnP refusal is an error exit, so it must still print the
+/// refusal to stderr under `--silent`. Without this, `apply --silent`
+/// on a PnP checkout exits 1 with zero output — undiagnosable in CI
+/// logs (the same contract violation class fixed in `setup`/`scan`).
+#[test]
+fn yarn_pnp_refusal_still_prints_error_under_silent() {
+    let dir = tempfile::tempdir().unwrap();
+    make_yarn_berry_project(dir.path());
+    let index = stage_applicable_package(dir.path());
+
+    let (code, stdout, stderr) = run(dir.path(), &["apply", "--silent"]);
+    assert_eq!(
+        code, 1,
+        "expected exit 1.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    // The error itself must survive --silent, and it must be THIS
+    // error: pin both the layout and the workaround, same as the
+    // human-mode test.
+    assert!(
+        stderr.contains("Plug'n'Play"),
+        "--silent is errors-only, not nothing: stderr must still name the \
+         Plug'n'Play layout, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("yarn patch"),
+        "--silent is errors-only, not nothing: stderr must still point at \
+         `yarn patch`, got:\n{stderr}"
+    );
+    // --silent must not smuggle the message onto stdout instead (that
+    // would break `2>/dev/null`-style CI splits) and must not emit a
+    // JSON envelope without --json.
+    assert!(
+        stdout.trim().is_empty(),
+        "--silent human mode should write the error to stderr only, got stdout:\n{stdout}"
+    );
+    // Same pre-apply-bail guarantee as the other refusal tests.
+    assert_eq!(
+        std::fs::read(&index).unwrap(),
+        ORIGINAL_BYTES,
+        "yarn-PnP refusal (--silent) must NOT patch the on-disk file"
+    );
+    assert_pristine_package_dir(index.parent().unwrap());
+}
+
 /// Negative control: a plain npm layout (no `.pnp.cjs`) must NOT
 /// surface the yarn-pnp error code. The apply may still fail for
 /// unrelated reasons (no matching packages on disk, etc.) — we

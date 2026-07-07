@@ -378,6 +378,89 @@ fn property7_vendored_purl_bypasses_setup_manual_filter() {
     );
 }
 
+/// The property-7 vendored exemption (and the "(vendored)" phrasing) must
+/// survive `--no-verify`: the exemption's rationale — the committed
+/// `.socket/vendor/` artifact + lockfile wiring IS the persistence
+/// mechanism — is about how the patch persists, not about whether this run
+/// hashed it. The vendored classification comes from the committed ledger,
+/// which `--no-verify` can read without hashing anything (the artifact dir
+/// is deliberately ABSENT here to pin that no hashing happens).
+#[test]
+fn property7_vendored_exemption_survives_no_verify() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path();
+    let vendored_purl = "pkg:cargo/serde@1.0.0";
+
+    // Ledger only — no artifact on disk. `--no-verify` must not care.
+    write_vendor_state(cwd, vendored_purl, ".socket/vendor/cargo/absent");
+
+    let mut manifest = PatchManifest::new();
+    manifest.patches.insert(
+        vendored_purl.to_string(),
+        make_record(
+            UUID,
+            "src/lib.rs",
+            &"b".repeat(64),
+            "GHSA-vend-dddd",
+            &["CVE-2024-6"],
+        ),
+    );
+    // Control: an npm patch with no hook configured and no `manual`
+    // declaration — property 7 must still drop it under `--no-verify`
+    // (the filter runs regardless of verification mode).
+    manifest.patches.insert(
+        "pkg:npm/unconfigured-pkg@1.0.0".to_string(),
+        make_record(
+            "11111111-1111-4111-8111-111111111111",
+            "package/index.js",
+            &"c".repeat(64),
+            "GHSA-npm-control",
+            &["CVE-2024-7"],
+        ),
+    );
+    // NO setup section: nothing configured, nothing manual.
+    write_manifest(cwd, &manifest, false);
+
+    let out = cli()
+        .args([
+            "vex",
+            "--no-verify",
+            "--cwd",
+            cwd.to_str().unwrap(),
+            "--product",
+            "pkg:cargo/app@1.0.0",
+        ])
+        .output()
+        .expect("invoke vex");
+    assert!(
+        out.status.success(),
+        "--no-verify must keep the vendored patch's property-7 exemption. stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let doc: Value = serde_json::from_str(&stdout).unwrap();
+    let stmts = doc["statements"].as_array().unwrap();
+    assert_eq!(
+        stmts.len(),
+        1,
+        "only the vendored patch bypasses property 7 under --no-verify; the \
+         unconfigured npm control must still be dropped. doc:\n{stdout}"
+    );
+    assert_eq!(stmts[0]["vulnerability"]["name"], "GHSA-vend-dddd");
+    let impact = stmts[0]["impact_statement"].as_str().unwrap();
+    assert_eq!(
+        impact,
+        format!("Patched via Socket patch {UUID} (vendored)"),
+        "--no-verify must not lose the (vendored) provenance marker"
+    );
+    assert!(
+        !stdout.contains("GHSA-npm-control"),
+        "the non-vendored, non-configured npm patch must be filtered even \
+         under --no-verify:\n{stdout}"
+    );
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // 4. legacy go-patches redirect regression — an apply-redirected Go patch
 // must verify against the `.socket/go-patches/` copy dir (the bytes the

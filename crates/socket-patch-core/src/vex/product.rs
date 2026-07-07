@@ -19,6 +19,15 @@
 
 use std::path::Path;
 
+// npm/Node strip a BOM from package.json and cargo accepts one in Cargo.toml,
+// but serde_json and the line scanner both reject it — without this, manifests
+// the user's own toolchain accepts yield no PURL.
+use crate::package_json::detect::strip_bom;
+
+/// Version-extracting parser for one manifest flavor, keyed by file name in
+/// the priority table inside [`detect_product`].
+type ManifestParser = fn(&str) -> Option<String>;
+
 /// Outcome of [`detect_product`].
 #[derive(Debug, Clone, Default)]
 pub struct DetectResult {
@@ -38,50 +47,33 @@ pub async fn detect_product(cwd: &Path) -> DetectResult {
         return result;
     }
 
-    let pkg_json = cwd.join("package.json");
-    let pyproject = cwd.join("pyproject.toml");
-    let cargo = cwd.join("Cargo.toml");
-
-    let pkg_json_exists = tokio::fs::metadata(&pkg_json).await.is_ok();
-    let pyproject_exists = tokio::fs::metadata(&pyproject).await.is_ok();
-    let cargo_exists = tokio::fs::metadata(&cargo).await.is_ok();
-
-    // Names of every manifest present, in priority order — used for the
-    // "detected (...)" portion of the multi-manifest warning.
+    // 2. Package manifests, in priority order. `present` collects every
+    // manifest on disk for the "detected (...)" portion of the
+    // multi-manifest warning; `selected` records the manifest ACTUALLY
+    // used — not merely the highest-priority one present, because that
+    // one may fail to parse (invalid JSON, missing version, workspace
+    // inheritance) and fall through to a lower-priority manifest. The
+    // warning must name what we used, otherwise it misreports the source.
+    let manifests: [(&str, ManifestParser); 3] = [
+        ("package.json", parse_package_json),
+        ("pyproject.toml", parse_pyproject),
+        ("Cargo.toml", parse_cargo_toml),
+    ];
     let mut present = Vec::new();
-    if pkg_json_exists {
-        present.push("package.json");
-    }
-    if pyproject_exists {
-        present.push("pyproject.toml");
-    }
-    if cargo_exists {
-        present.push("Cargo.toml");
-    }
-
-    // Read manifests in priority order, taking the first that yields a
-    // usable PURL. `selected` records the manifest ACTUALLY used — not
-    // merely the highest-priority one present, because that one may fail
-    // to parse (invalid JSON, missing version, workspace inheritance) and
-    // fall through to a lower-priority manifest. The warning must name
-    // what we used, otherwise it misreports the source.
     let mut selected: Option<&str> = None;
-    if pkg_json_exists {
-        if let Some(purl) = read_package_json(&pkg_json).await {
-            result.purl = Some(purl);
-            selected = Some("package.json");
+    for (name, parse) in manifests {
+        let path = cwd.join(name);
+        if tokio::fs::metadata(&path).await.is_err() {
+            continue;
         }
-    }
-    if result.purl.is_none() && pyproject_exists {
-        if let Some(purl) = read_pyproject(&pyproject).await {
-            result.purl = Some(purl);
-            selected = Some("pyproject.toml");
-        }
-    }
-    if result.purl.is_none() && cargo_exists {
-        if let Some(purl) = read_cargo_toml(&cargo).await {
-            result.purl = Some(purl);
-            selected = Some("Cargo.toml");
+        present.push(name);
+        if result.purl.is_none() {
+            if let Ok(content) = tokio::fs::read_to_string(&path).await {
+                if let Some(purl) = parse(&content) {
+                    result.purl = Some(purl);
+                    selected = Some(name);
+                }
+            }
         }
     }
 
@@ -100,17 +92,8 @@ pub async fn detect_product(cwd: &Path) -> DetectResult {
     result
 }
 
-/// Strip a leading UTF-8 BOM. npm/Node strip one from package.json and
-/// cargo accepts one in Cargo.toml, but serde_json and the line scanner
-/// both reject it — without this, manifests the user's own toolchain
-/// accepts yield no PURL. Mirrors `package_json/detect.rs`.
-fn strip_bom(content: &str) -> &str {
-    content.strip_prefix('\u{feff}').unwrap_or(content)
-}
-
-async fn read_package_json(path: &Path) -> Option<String> {
-    let content = tokio::fs::read_to_string(path).await.ok()?;
-    let v: serde_json::Value = serde_json::from_str(strip_bom(&content)).ok()?;
+fn parse_package_json(content: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(strip_bom(content)).ok()?;
     let name = v.get("name")?.as_str()?;
     let version = v.get("version")?.as_str()?;
     if name.is_empty() || version.is_empty() {
@@ -121,21 +104,19 @@ async fn read_package_json(path: &Path) -> Option<String> {
     Some(format!("pkg:npm/{name}@{version}"))
 }
 
-async fn read_pyproject(path: &Path) -> Option<String> {
-    let content = tokio::fs::read_to_string(path).await.ok()?;
+fn parse_pyproject(content: &str) -> Option<String> {
     // No BOM strip here, unlike npm/cargo: tomllib (and pip's vendored
     // tomli) reject a BOM'd pyproject.toml outright, so such a file is
     // not a buildable Python project and must keep yielding None.
     // PEP 621 `[project]` takes precedence (newer projects favor it),
     // then fall back to Poetry's `[tool.poetry]` for legacy layouts.
-    let (name, version) = scan_toml_section(&content, "project")
-        .or_else(|| scan_toml_section(&content, "tool.poetry"))?;
+    let (name, version) = scan_toml_section(content, "project")
+        .or_else(|| scan_toml_section(content, "tool.poetry"))?;
     Some(format!("pkg:pypi/{name}@{version}"))
 }
 
-async fn read_cargo_toml(path: &Path) -> Option<String> {
-    let content = tokio::fs::read_to_string(path).await.ok()?;
-    let (name, version) = scan_toml_section(strip_bom(&content), "package")?;
+fn parse_cargo_toml(content: &str) -> Option<String> {
+    let (name, version) = scan_toml_section(strip_bom(content), "package")?;
     Some(format!("pkg:cargo/{name}@{version}"))
 }
 
@@ -153,22 +134,22 @@ fn scan_toml_section(content: &str, section: &str) -> Option<(String, String)> {
     let mut in_section = false;
     let mut name: Option<String> = None;
     let mut version: Option<String> = None;
-    let header = format!("[{section}]");
 
     for raw in content.lines() {
         let line = raw.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        if line.starts_with('[') {
-            // A header may carry a trailing comment (`[package] # x`) —
-            // valid TOML that cargo and tomllib both accept. Anything
+        if let Some(rest) = line.strip_prefix('[') {
+            // A header may carry a trailing comment (`[package] # x`)
+            // and whitespace inside the brackets (`[ package ]`) —
+            // both valid TOML that cargo and tomllib accept. Anything
             // else after the closing bracket means a different (or
             // malformed) section.
-            in_section = match line.strip_prefix(header.as_str()) {
-                Some(rest) => {
-                    let rest = rest.trim_start();
-                    rest.is_empty() || rest.starts_with('#')
+            in_section = match rest.split_once(']') {
+                Some((inner, after)) => {
+                    let after = after.trim_start();
+                    (after.is_empty() || after.starts_with('#')) && inner.trim() == section
                 }
                 None => false,
             };
@@ -222,11 +203,7 @@ async fn find_git_config(start: &Path) -> Option<std::path::PathBuf> {
     };
     loop {
         let candidate = cursor.join(".git").join("config");
-        if tokio::fs::metadata(&candidate)
-            .await
-            .map(|m| m.is_file())
-            .unwrap_or(false)
-        {
+        if crate::utils::fs::is_file(&candidate).await {
             return Some(candidate);
         }
         match cursor.parent() {
@@ -272,13 +249,36 @@ fn scan_remote_origin_url(content: &str) -> Option<String> {
         if key.trim() != "url" {
             continue;
         }
-        let value = value.trim();
+        let value = parse_git_config_value(value);
         if value.is_empty() {
             return None;
         }
-        return Some(value.to_string());
+        return Some(value);
     }
     None
+}
+
+/// Reduce the raw right-hand side of a git config `key = value` line
+/// to the value git itself reports (verified against `git config -f`):
+/// `#`/`;` begin a comment outside double quotes — no preceding
+/// whitespace required — `"` quotes a segment verbatim (comment chars
+/// inside stay literal), and `\` escapes the next character (passed
+/// through literally; `\n`-style control escapes never occur in urls).
+/// Trailing unquoted whitespace is stripped.
+fn parse_git_config_value(raw: &str) -> String {
+    let mut out = String::new();
+    let mut in_quotes = false;
+    let mut chars = raw.trim_start().chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => in_quotes = !in_quotes,
+            '\\' => out.extend(chars.next()),
+            '#' | ';' if !in_quotes => break,
+            _ => out.push(c),
+        }
+    }
+    out.truncate(out.trim_end().len());
+    out
 }
 
 /// Convert a git remote URL to a PURL when possible, else return the
@@ -365,11 +365,12 @@ fn parse_toml_string_kv(line: &str, key: &str) -> Option<String> {
     if lhs.trim() != key {
         return None;
     }
-    let rhs = rhs[1..].trim(); // drop the leading '=' and surrounding ws
-                               // The value must open with a string delimiter; match it to its twin.
-                               // `'` is a literal string (no escapes), `"` a basic string — for our
-                               // purposes (names/versions, which never contain escaped quotes) the
-                               // first matching delimiter terminates the value in both cases.
+    // Drop the leading '=' and surrounding whitespace. The value must
+    // open with a string delimiter; match it to its twin. `'` is a
+    // literal string (no escapes), `"` a basic string — for our purposes
+    // (names/versions, which never contain escaped quotes) the first
+    // matching delimiter terminates the value in both cases.
+    let rhs = rhs[1..].trim();
     let quote = rhs.chars().next().filter(|c| *c == '"' || *c == '\'')?;
     let stripped = &rhs[quote.len_utf8()..];
     let end = stripped.find(quote)?;
@@ -1392,6 +1393,129 @@ mod tests {
     #[test]
     fn scan_origin_url_commented_foreign_header_closes_section() {
         let cfg = "[remote \"origin\"]\n[remote \"upstream\"] # backup\n\turl = git@github.com:other/repo.git\n";
+        assert!(scan_remote_origin_url(cfg).is_none());
+    }
+
+    // ── Regression: whitespace inside TOML table headers ──────────
+    // TOML permits whitespace around the key in a table header
+    // (`[ package ]`, `[project ]`) — tomllib and cargo both accept
+    // it. The exact `strip_prefix("[package]")` match treated such a
+    // header as a foreign section, so a manifest the user's own
+    // toolchain accepts yielded no PURL. Mirrors the cargo crawler's
+    // `parse_table_header`, which already trims inside the brackets.
+
+    #[test]
+    fn scan_toml_section_header_with_inner_whitespace() {
+        let toml = "[ package ]\nname = \"x\"\nversion = \"1.0\"\n";
+        let (n, v) = scan_toml_section(toml, "package").unwrap();
+        assert_eq!(n, "x");
+        assert_eq!(v, "1.0");
+    }
+
+    /// Spaced header carrying a trailing comment — both relaxations
+    /// compose.
+    #[test]
+    fn scan_toml_section_spaced_header_with_trailing_comment() {
+        let toml = "[ package ] # metadata\nname = \"x\"\nversion = \"1.0\"\n";
+        let (n, v) = scan_toml_section(toml, "package").unwrap();
+        assert_eq!(n, "x");
+        assert_eq!(v, "1.0");
+    }
+
+    /// A spaced FOREIGN header must still close the current section.
+    #[test]
+    fn scan_toml_spaced_foreign_header_still_closes_section() {
+        let toml = "[package]\nname = \"x\"\n[ dependencies ]\nversion = \"9.9\"\n";
+        assert!(scan_toml_section(toml, "package").is_none());
+    }
+
+    /// Junk (non-comment) after the closing bracket is still rejected
+    /// as a malformed/foreign header — the relaxation is inside the
+    /// brackets only.
+    #[test]
+    fn scan_toml_header_with_trailing_junk_still_rejected() {
+        let toml = "[package] junk\nname = \"x\"\nversion = \"1.0\"\n";
+        assert!(scan_toml_section(toml, "package").is_none());
+    }
+
+    #[tokio::test]
+    async fn detect_cargo_toml_spaced_header() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[ package ]\nname = \"spaced-rust\"\nversion = \"1.0.0\"\n",
+        )
+        .await
+        .unwrap();
+        let r = detect_product(dir.path()).await;
+        assert_eq!(r.purl.as_deref(), Some("pkg:cargo/spaced-rust@1.0.0"));
+    }
+
+    #[tokio::test]
+    async fn detect_pyproject_spaced_header() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            dir.path().join("pyproject.toml"),
+            "[project ]\nname = \"spaced-py\"\nversion = \"0.4.0\"\n",
+        )
+        .await
+        .unwrap();
+        let r = detect_product(dir.path()).await;
+        assert_eq!(r.purl.as_deref(), Some("pkg:pypi/spaced-py@0.4.0"));
+    }
+
+    // ── Regression: git config VALUE comments and quoting ─────────
+    // git strips a `;`/`#` comment from an unquoted value — with or
+    // without preceding whitespace — and unquotes `"..."` segments
+    // (comment chars inside quotes stay literal). Verified against
+    // `git config -f`. Returning the raw text produced a WRONG
+    // product identity, e.g. `pkg:github/foo/bar.git ; mirror` from
+    // `url = git@github.com:foo/bar.git ; mirror`.
+
+    #[test]
+    fn scan_origin_url_strips_trailing_semicolon_comment() {
+        let cfg = "[remote \"origin\"]\n\turl = git@github.com:foo/bar.git ; mirror note\n";
+        assert_eq!(
+            scan_remote_origin_url(cfg).as_deref(),
+            Some("git@github.com:foo/bar.git")
+        );
+    }
+
+    /// git starts the comment at `#` even with NO whitespace before
+    /// it: `url = https://host/a#frag` resolves to `https://host/a`.
+    #[test]
+    fn scan_origin_url_strips_hash_comment_without_space() {
+        let cfg = "[remote \"origin\"]\n\turl = https://host/a#frag\n";
+        assert_eq!(scan_remote_origin_url(cfg).as_deref(), Some("https://host/a"));
+    }
+
+    /// A double-quoted value is unquoted, matching git.
+    #[test]
+    fn scan_origin_url_unquotes_double_quoted_value() {
+        let cfg = "[remote \"origin\"]\n\turl = \"git@github.com:foo/bar.git\"\n";
+        assert_eq!(
+            scan_remote_origin_url(cfg).as_deref(),
+            Some("git@github.com:foo/bar.git")
+        );
+    }
+
+    /// Comment characters INSIDE a quoted segment are literal value
+    /// bytes, not comment starts — `"https://host/a#frag"` keeps its
+    /// fragment.
+    #[test]
+    fn scan_origin_url_comment_char_inside_quotes_is_literal() {
+        let cfg = "[remote \"origin\"]\n\turl = \"https://host/a#frag\"\n";
+        assert_eq!(
+            scan_remote_origin_url(cfg).as_deref(),
+            Some("https://host/a#frag")
+        );
+    }
+
+    /// A value that is ONLY a comment (`url = ; x`) is an empty url —
+    /// same fall-through as the existing `url = ` case.
+    #[test]
+    fn scan_origin_url_value_that_is_only_comment_is_none() {
+        let cfg = "[remote \"origin\"]\n\turl = ; commented out\n";
         assert!(scan_remote_origin_url(cfg).is_none());
     }
 

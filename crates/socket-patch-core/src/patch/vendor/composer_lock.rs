@@ -27,23 +27,22 @@
 //! (`JSON_PRETTY_PRINT`) + trailing newline; serde_json does not escape `/`
 //! (matching `JSON_UNESCAPED_SLASHES`).
 
-use std::collections::HashMap;
 use std::path::Path;
 
-use serde::Serialize;
 use serde_json::{json, Map, Value};
 
-use crate::manifest::schema::{PatchFileInfo, PatchRecord};
-use crate::patch::apply::{
-    is_safe_relative_subpath, normalize_file_path, ApplyResult, PatchSources, VerifyResult,
-    VerifyStatus,
-};
+use crate::crawlers::composer_crawler::normalize_version;
+use crate::manifest::schema::PatchRecord;
+use crate::patch::apply::{ApplyResult, PatchSources};
 use crate::patch::copy_tree::{fresh_copy, remove_tree};
-use crate::patch::file_hash::compute_file_git_sha256;
 use crate::patch::path_safety::{is_safe_multi_segment, is_safe_single_segment};
-use crate::utils::fs::atomic_write_bytes;
+use crate::utils::fs::atomic_write_bytes_preserving_mode;
 use crate::utils::purl::{build_composer_purl, parse_composer_purl};
 
+use super::common::{
+    already_patched_result, copy_matches_after_hashes, done, refused, serialize_json,
+    service_offline_conflict, synthesized_result,
+};
 use super::path::{parse_vendor_path, vendor_uuid_dir_rel};
 use super::registry_fetch::extract_zip;
 use super::service_fetch::{fetch_verified_archive, ServiceArtifact};
@@ -61,23 +60,6 @@ const COMPOSER_LOCK: &str = "composer.lock";
 /// the lowercase canonical package name — `:` cannot appear in a composer
 /// package name, so the encoding is unambiguous.
 const WIRING_KIND: &str = "composer_lock_package";
-
-/// Marker schema version written into `socket-patch.vendor.json`.
-const MARKER_SCHEMA_VERSION: u32 = 1;
-
-/// Normalize a composer version for identity comparison: strip a single
-/// leading `v`/`V` when it directly precedes a digit (`v6.4.1` → `6.4.1`).
-/// Local twin of the private `crawlers::composer_crawler::normalize_version`
-/// (not visible from here); keep the two in sync.
-fn normalize_version(version: &str) -> &str {
-    let mut chars = version.chars();
-    if matches!(chars.next(), Some('v') | Some('V'))
-        && chars.next().map(|c| c.is_ascii_digit()).unwrap_or(false)
-    {
-        return &version[1..];
-    }
-    version
-}
 
 /// Vendor a composer package: materialize a patched copy under
 /// `.socket/vendor/composer/<uuid>/<vendor>/<name>@<version>` and rewire the
@@ -133,11 +115,8 @@ pub async fn vendor_composer(
 
     // A patch with no files is meaningless to vendor: no-op success, no edits.
     if record.files.is_empty() {
-        return VendorOutcome::Done {
-            result: synthesized_result(purl, &copy_dir, Vec::new(), true, None),
-            entry: None,
-            warnings: Vec::new(),
-        };
+        let result = synthesized_result(purl, &copy_dir, Vec::new(), true, None);
+        return done(result, None, Vec::new());
     }
 
     // ── lock presence + entry ────────────────────────────────────────────
@@ -181,60 +160,53 @@ pub async fn vendor_composer(
     // verbatim pre-vendor original, and re-recording here would clobber it.
     if entry_is_wired(&lock[section][idx], &copy_rel) {
         if copy_matches_after_hashes(&copy_dir, &record.files).await {
-            let verified = record
-                .files
-                .keys()
-                .map(|f| already_patched_verify(f))
-                .collect();
-            return VendorOutcome::Done {
-                result: synthesized_result(purl, &copy_dir, verified, true, None),
-                entry: None,
-                warnings: Vec::new(),
-            };
+            let result = already_patched_result(purl, &copy_dir, &record.files);
+            return done(result, None, Vec::new());
         }
         // Wired but the committed copy is missing/stale: rebuild the
         // ARTIFACT only. The lock is already correct and the first run's
         // ledger entry holds the only pre-vendor original — running the
         // full path here would re-record the live VENDORED fragment as
-        // `original`, breaking a later `--revert`.
+        // `original`, breaking a later `--revert`. Service-preferred like
+        // the full path (a service-vendored package may have no installed
+        // copy to rebuild from — only the service can).
         if !dry_run {
-            if let Err(e) = fresh_copy(installed_dir, &copy_dir, None).await {
-                return VendorOutcome::Done {
-                    result: synthesized_result(
-                        purl,
-                        &copy_dir,
-                        Vec::new(),
-                        false,
-                        Some(format!("failed to copy installed package: {e}")),
-                    ),
-                    entry: None,
-                    warnings: Vec::new(),
-                };
+            if let Some(refusal) = service_offline_conflict(service) {
+                return refusal;
             }
             let mut warnings: Vec<VendorWarning> = Vec::new();
-            let mut result = super::force_apply_staged(
-                purl,
-                &copy_dir,
+            let result = match composer_service_copy(
+                service,
                 record,
-                sources,
-                false,
-                force,
                 &pkg,
-                version,
+                &copy_dir,
+                &uuid_dir,
                 &mut warnings,
             )
-            .await;
-            result.package_path = copy_dir.display().to_string();
-            if !result.success {
-                // Don't leave a half-built copy; the pre-state was already
-                // broken, so removing restores the (missing) status quo.
-                let _ = remove_tree(&uuid_dir).await;
-                return VendorOutcome::Done {
-                    result,
-                    entry: None,
-                    warnings,
-                };
-            }
+            .await
+            {
+                ComposerServiceCopy::Used => already_patched_result(purl, &copy_dir, &record.files),
+                ComposerServiceCopy::HardFail(outcome) => return *outcome,
+                ComposerServiceCopy::FallBack => {
+                    match copy_and_patch(
+                        purl,
+                        installed_dir,
+                        &copy_dir,
+                        &uuid_dir,
+                        record,
+                        sources,
+                        force,
+                        &pkg,
+                        version,
+                        &mut warnings,
+                    )
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(result) => return done(result, None, warnings),
+                    }
+                }
+            };
             warnings.push(VendorWarning::new(
                 "vendor_artifact_rebuilt",
                 format!(
@@ -242,11 +214,7 @@ pub async fn vendor_composer(
                      rebuilt at {copy_rel} (composer.lock untouched)"
                 ),
             ));
-            return VendorOutcome::Done {
-                result,
-                entry: None,
-                warnings,
-            };
+            return done(result, None, warnings);
         }
         // Dry runs fall through to the verify-only preview below.
     }
@@ -267,11 +235,7 @@ pub async fn vendor_composer(
         )
         .await;
         result.package_path = copy_dir.display().to_string();
-        return VendorOutcome::Done {
-            result,
-            entry: None,
-            warnings: dry_warnings,
-        };
+        return done(result, None, dry_warnings);
     }
 
     // ── copy + patch (wiring last) ───────────────────────────────────────
@@ -279,64 +243,33 @@ pub async fn vendor_composer(
     // no installed package needed); else copy the installed package and patch
     // it.
     let mut warnings: Vec<VendorWarning> = Vec::new();
-    if let Some(cfg) = service {
-        if cfg.source.requires_service() && cfg.offline {
-            return refused(
-                "vendor_service_offline_conflict",
-                "--vendor-source=service needs the network but --offline is set",
-            );
-        }
+    if let Some(refusal) = service_offline_conflict(service) {
+        return refusal;
     }
     let mut result =
         match composer_service_copy(service, record, &pkg, &copy_dir, &uuid_dir, &mut warnings)
             .await
         {
-            ComposerServiceCopy::Used => {
-                let verified = record
-                    .files
-                    .keys()
-                    .map(|f| already_patched_verify(f))
-                    .collect();
-                synthesized_result(purl, &copy_dir, verified, true, None)
-            }
+            ComposerServiceCopy::Used => already_patched_result(purl, &copy_dir, &record.files),
             ComposerServiceCopy::HardFail(outcome) => return *outcome,
             ComposerServiceCopy::FallBack => {
-                if let Err(e) = fresh_copy(installed_dir, &copy_dir, None).await {
-                    return VendorOutcome::Done {
-                        result: synthesized_result(
-                            purl,
-                            &copy_dir,
-                            Vec::new(),
-                            false,
-                            Some(format!("failed to copy installed package: {e}")),
-                        ),
-                        entry: None,
-                        warnings,
-                    };
-                }
-                let mut result = super::force_apply_staged(
+                match copy_and_patch(
                     purl,
+                    installed_dir,
                     &copy_dir,
+                    &uuid_dir,
                     record,
                     sources,
-                    false,
                     force,
                     &pkg,
                     version,
                     &mut warnings,
                 )
-                .await;
-                result.package_path = copy_dir.display().to_string();
-                if !result.success {
-                    // Don't leave a half-built copy; the lock was never touched.
-                    let _ = remove_tree(&uuid_dir).await;
-                    return VendorOutcome::Done {
-                        result,
-                        entry: None,
-                        warnings,
-                    };
+                .await
+                {
+                    Ok(result) => result,
+                    Err(result) => return done(result, None, warnings),
                 }
-                result
             }
         };
 
@@ -347,41 +280,35 @@ pub async fn vendor_composer(
         let _ = remove_tree(&uuid_dir).await;
         result.success = false;
         result.error = Some("composer.lock entry is not a JSON object".to_string());
-        return VendorOutcome::Done {
-            result,
-            entry: None,
-            warnings,
-        };
+        return done(result, None, warnings);
     };
+    // Never record one of our own (stale) edits as the "original" — revert
+    // must restore the pre-vendor registry fragment, not a dangling
+    // `.socket/vendor/` pointer from an earlier uuid. The persist layer
+    // carries the true original forward from the entry being replaced when
+    // the record holds `None`.
+    let was_vendored = original_obj
+        .get("dist")
+        .and_then(|d| d.get("url"))
+        .and_then(Value::as_str)
+        .and_then(parse_vendor_path)
+        .is_some_and(|p| p.eco == "composer");
     let rewritten = rewrite_lock_entry(original_obj, &copy_rel, &record.uuid);
     lock[section][idx] = Value::Object(rewritten.clone());
     let write_result = match composer_json_bytes(&lock) {
-        Ok(bytes) => atomic_write_bytes(&lock_path, &bytes).await,
+        Ok(bytes) => atomic_write_bytes_preserving_mode(&lock_path, &bytes).await,
         Err(e) => Err(e),
     };
     if let Err(e) = write_result {
         let _ = remove_tree(&uuid_dir).await;
         result.success = false;
         result.error = Some(format!("failed to write composer.lock: {e}"));
-        return VendorOutcome::Done {
-            result,
-            entry: None,
-            warnings,
-        };
+        return done(result, None, warnings);
     }
 
     // ── marker + ledger entry ────────────────────────────────────────────
     let base_purl = build_composer_purl(&vendor, &name, version);
-    let mut vulnerabilities: Vec<String> = record.vulnerabilities.keys().cloned().collect();
-    vulnerabilities.sort();
-    let marker = VendorMarker {
-        schema_version: MARKER_SCHEMA_VERSION,
-        purl: base_purl.clone(),
-        patch_uuid: record.uuid.clone(),
-        ecosystem: "composer".to_string(),
-        vulnerabilities,
-        vendored_at: vendored_at.to_string(),
-    };
+    let marker = VendorMarker::new("composer", &base_purl, record, vendored_at);
     if let Err(e) = write_marker(&uuid_dir, &marker).await {
         // The marker is informational only (state.json is the ledger of
         // record), so its failure must not fail an otherwise-wired vendor.
@@ -406,7 +333,7 @@ pub async fn vendor_composer(
             kind: WIRING_KIND.to_string(),
             action: WiringAction::Rewritten,
             key: Some(format!("{section}:{pkg}")),
-            original: Some(original_entry),
+            original: (!was_vendored).then_some(original_entry),
             new: Some(Value::Object(rewritten)),
         }],
         lock: None,
@@ -421,11 +348,7 @@ pub async fn vendor_composer(
         pipenv: None,
     };
 
-    VendorOutcome::Done {
-        result,
-        entry: Some(entry),
-        warnings,
-    }
+    done(result, Some(entry), warnings)
 }
 
 /// Revert a composer vendor entry: restore the verbatim original lock entry
@@ -515,6 +438,47 @@ pub async fn revert_composer(
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
+/// Copy the installed package into `copy_dir` and run the hardened apply
+/// pipeline against it (vendor auto-force policy — see
+/// [`super::force_apply_staged`]). On apply failure the whole uuid dir is
+/// removed — a partial copy under `.socket/vendor/` would be misjudged by
+/// verify/sweep — and the failed [`ApplyResult`] is the `Err` for the caller
+/// to bubble (composer.lock is only ever edited after this succeeds).
+#[allow(clippy::too_many_arguments)]
+async fn copy_and_patch(
+    purl: &str,
+    installed_dir: &Path,
+    copy_dir: &Path,
+    uuid_dir: &Path,
+    record: &PatchRecord,
+    sources: &PatchSources<'_>,
+    force: bool,
+    pkg: &str,
+    version: &str,
+    warnings: &mut Vec<VendorWarning>,
+) -> Result<ApplyResult, ApplyResult> {
+    if let Err(e) = fresh_copy(installed_dir, copy_dir, None).await {
+        return Err(synthesized_result(
+            purl,
+            copy_dir,
+            Vec::new(),
+            false,
+            Some(format!("failed to copy installed package: {e}")),
+        ));
+    }
+    let mut result = super::force_apply_staged(
+        purl, copy_dir, record, sources, false, force, pkg, version, warnings,
+    )
+    .await;
+    result.package_path = copy_dir.display().to_string();
+    if !result.success {
+        // Don't leave a half-built copy under `.socket/vendor/`.
+        let _ = remove_tree(uuid_dir).await;
+        return Err(result);
+    }
+    Ok(result)
+}
+
 /// Outcome of attempting to materialise the composer copy from the patch service.
 enum ComposerServiceCopy {
     /// The prebuilt dist zip was extracted into `copy_dir`.
@@ -540,11 +504,11 @@ async fn composer_service_copy(
     let Some(cfg) = service else {
         return ComposerServiceCopy::FallBack;
     };
-    if !cfg.service_enabled() || record.files.is_empty() {
+    if !cfg.service_enabled() {
         return ComposerServiceCopy::FallBack;
     }
     fn hard(code: &'static str, detail: String) -> ComposerServiceCopy {
-        ComposerServiceCopy::HardFail(Box::new(VendorOutcome::Refused { code, detail }))
+        ComposerServiceCopy::HardFail(Box::new(refused(code, detail)))
     }
     let miss = |warnings: &mut Vec<VendorWarning>, code: &'static str, reason: String| {
         if cfg.source.requires_service() {
@@ -557,7 +521,7 @@ async fn composer_service_copy(
             ComposerServiceCopy::FallBack
         }
     };
-    match fetch_verified_archive(cfg, &record.uuid, pkg).await {
+    match fetch_verified_archive(cfg, &record.uuid).await {
         ServiceArtifact::Ready(archive) => {
             let _ = remove_tree(copy_dir).await;
             if let Err(e) = tokio::fs::create_dir_all(copy_dir).await {
@@ -608,13 +572,6 @@ async fn composer_service_copy(
             "vendor_prebuilt_unavailable",
             format!("patch service request failed ({reason})"),
         ),
-    }
-}
-
-fn refused(code: &'static str, detail: impl Into<String>) -> VendorOutcome {
-    VendorOutcome::Refused {
-        code,
-        detail: detail.into(),
     }
 }
 
@@ -695,37 +652,7 @@ fn rewrite_lock_entry(
 /// (`JSON_PRETTY_PRINT`) + trailing newline. serde_json never escapes `/`,
 /// matching `JSON_UNESCAPED_SLASHES`.
 fn composer_json_bytes(value: &Value) -> std::io::Result<Vec<u8>> {
-    let mut buf = Vec::new();
-    let fmt = serde_json::ser::PrettyFormatter::with_indent(b"    ");
-    let mut ser = serde_json::Serializer::with_formatter(&mut buf, fmt);
-    value.serialize(&mut ser).map_err(std::io::Error::other)?;
-    buf.push(b'\n');
-    Ok(buf)
-}
-
-/// True when the copy exists and every patched file in it already hashes to
-/// its `afterHash` (the vendor twin of `go_redirect::redirect_in_sync`).
-async fn copy_matches_after_hashes(
-    copy_dir: &Path,
-    files: &HashMap<String, PatchFileInfo>,
-) -> bool {
-    if tokio::fs::metadata(copy_dir).await.is_err() {
-        return false;
-    }
-    for (file_name, info) in files {
-        let normalized = normalize_file_path(file_name);
-        // SECURITY: never hash through a manifest key that escapes the copy
-        // dir — fail the sync check instead (the full pipeline would refuse
-        // the key anyway).
-        if !is_safe_relative_subpath(normalized) {
-            return false;
-        }
-        match compute_file_git_sha256(&copy_dir.join(normalized)).await {
-            Ok(h) if h == info.after_hash => {}
-            _ => return false,
-        }
-    }
-    true
+    serialize_json(value, "    ")
 }
 
 /// Restore one `composer_lock_package` wiring record. `Ok(true)` = restored
@@ -787,48 +714,21 @@ async fn restore_lock_entry(
     if !dry_run {
         lock[section][idx] = original;
         let bytes = composer_json_bytes(&lock).map_err(|e| e.to_string())?;
-        atomic_write_bytes(lock_path, &bytes)
+        atomic_write_bytes_preserving_mode(lock_path, &bytes)
             .await
             .map_err(|e| format!("failed to write composer.lock: {e}"))?;
     }
     Ok(true)
 }
 
-fn synthesized_result(
-    package_key: &str,
-    copy_dir: &Path,
-    files_verified: Vec<VerifyResult>,
-    success: bool,
-    error: Option<String>,
-) -> ApplyResult {
-    ApplyResult {
-        package_key: package_key.to_string(),
-        package_path: copy_dir.display().to_string(),
-        success,
-        files_verified,
-        files_patched: Vec::new(),
-        applied_via: HashMap::new(),
-        error,
-        sidecar: None,
-    }
-}
-
-fn already_patched_verify(file: &str) -> VerifyResult {
-    VerifyResult {
-        file: file.to_string(),
-        status: VerifyStatus::AlreadyPatched,
-        message: None,
-        current_hash: None,
-        expected_hash: None,
-        target_hash: None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::hash::git_sha256::compute_git_sha256_from_bytes;
+    use crate::manifest::schema::PatchFileInfo;
+    use crate::patch::apply::{ApplyResult, VerifyStatus};
     use crate::patch::vendor::state::VENDOR_MARKER_FILE;
+    use std::collections::HashMap;
     use std::path::PathBuf;
 
     const UUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
@@ -1659,6 +1559,160 @@ mod tests {
                 .unwrap(),
             PATCHED
         );
+    }
+
+    /// The vendor rewrite and the revert restore swap `composer.lock`'s inode;
+    /// both must keep the user's permission bits (a 0640 lock silently
+    /// becoming umask-default 0644 leaks group/other access the user removed).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_lock_write_preserves_file_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let lock = lock_value("psr/log", "3.0.2", false);
+        let (dir, blobs, installed, record) = fixture(&lock).await;
+        let root = dir.path();
+        let lock_path = root.join(COMPOSER_LOCK);
+        tokio::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o640))
+            .await
+            .unwrap();
+
+        let (result, entry, _w) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, PURL, false).await);
+        assert!(result.success, "{:?}", result.error);
+        let mode = tokio::fs::metadata(&lock_path)
+            .await
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o640, "vendor rewrite must keep composer.lock's mode");
+
+        let outcome = revert_composer(&entry.unwrap(), root, false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        let mode = tokio::fs::metadata(&lock_path)
+            .await
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o640, "revert restore must keep composer.lock's mode");
+    }
+
+    /// Re-vendor under a NEW patch uuid (a patch update taking over the
+    /// entry): the wiring must record `original: None` — never the previous
+    /// run's own stale path dist. The persist layer carries the true
+    /// pre-vendor original forward from the entry being replaced and sweeps
+    /// the old uuid dir, so a recorded stale dist would make a later
+    /// `--revert` restore a dangling `.socket/vendor/composer/` pointer.
+    #[tokio::test]
+    async fn test_takeover_rerun_never_records_own_wiring_as_original() {
+        let lock = lock_value("psr/log", "3.0.2", false);
+        let (dir, blobs, installed, record) = fixture(&lock).await;
+        let root = dir.path();
+
+        let (r1, e1, _) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, PURL, false).await);
+        assert!(r1.success, "{:?}", r1.error);
+        assert!(e1.is_some());
+
+        const UUID_B: &str = "0a1b2c3d-4e5f-6071-8293-a4b5c6d7e8f9";
+        let mut record_b = record.clone();
+        record_b.uuid = UUID_B.to_string();
+        let (r2, e2, _) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record_b, PURL, false).await);
+        assert!(r2.success, "{:?}", r2.error);
+        let e2 = e2.expect("takeover records a fresh entry");
+        let w = &e2.wiring[0];
+        assert_eq!(w.key.as_deref(), Some("packages:psr/log"));
+        assert!(
+            w.original.is_none(),
+            "own stale wiring must never be recorded as original: {:?}",
+            w.original
+        );
+
+        // The lock is rewired at the new uuid's copy.
+        let new_lock: Value = serde_json::from_str(
+            &tokio::fs::read_to_string(root.join(COMPOSER_LOCK))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            new_lock["packages"][0]["dist"]["url"],
+            format!(".socket/vendor/composer/{UUID_B}/psr/log@3.0.2")
+        );
+    }
+
+    /// Wired lock + missing copy + `--vendor-source=service`: the artifact
+    /// rebuild must be service-preferred like the full path (a
+    /// service-vendored package may have no installed copy to rebuild from),
+    /// and `--offline` + `service` must refuse in the rebuild path too.
+    #[tokio::test]
+    async fn service_rebuild_of_missing_copy_uses_service() {
+        let lock = lock_value("psr/log", "3.0.2", false);
+        let (dir, blobs, _installed, record) = fixture(&lock).await;
+        let root = dir.path();
+        let zip = make_dist_zip(
+            "php-fig-log-f16e1d5",
+            &[
+                ("src/LoggerInterface.php", PATCHED),
+                ("composer.json", b"{\"name\": \"psr/log\"}\n"),
+            ],
+        );
+        let sri = sri_sha512(&zip);
+        let server = wiremock::MockServer::start().await;
+        mount_composer_granted(&server, &sri, &zip).await;
+        let cfg = composer_service_cfg(&server.uri(), VendorSource::Service, false);
+        let bogus_installed = root.join("no-such-install");
+
+        let (r1, e1, _) =
+            unwrap_done(vendor_with_service(root, &blobs, &bogus_installed, &record, &cfg).await);
+        assert!(r1.success, "{:?}", r1.error);
+        assert!(e1.is_some());
+        let lock_bytes = tokio::fs::read(root.join(COMPOSER_LOCK)).await.unwrap();
+
+        // Fresh-clone hole: the committed copy is gone, the lock still wired.
+        crate::patch::copy_tree::remove_tree(&root.join(copy_rel()))
+            .await
+            .unwrap();
+
+        let (r2, e2, w2) =
+            unwrap_done(vendor_with_service(root, &blobs, &bogus_installed, &record, &cfg).await);
+        assert!(
+            r2.success,
+            "service-mode rebuild must re-download the prebuilt dist: {:?}",
+            r2.error
+        );
+        assert!(e2.is_none(), "artifact-only rebuild must not re-record");
+        assert!(
+            w2.iter().any(|w| w.code == "vendor_artifact_rebuilt"),
+            "{w2:?}"
+        );
+        assert!(
+            w2.iter().any(|w| w.code == "vendor_prebuilt_downloaded"),
+            "{w2:?}"
+        );
+        assert_eq!(
+            tokio::fs::read(root.join(copy_rel()).join("src/LoggerInterface.php"))
+                .await
+                .unwrap(),
+            PATCHED
+        );
+        assert_eq!(
+            tokio::fs::read(root.join(COMPOSER_LOCK)).await.unwrap(),
+            lock_bytes,
+            "composer.lock untouched by the rebuild"
+        );
+
+        // The offline+service conflict is refused in the rebuild path too.
+        crate::patch::copy_tree::remove_tree(&root.join(copy_rel()))
+            .await
+            .unwrap();
+        let offline = composer_service_cfg(&server.uri(), VendorSource::Service, true);
+        let (code, _) = unwrap_refused(
+            vendor_with_service(root, &blobs, &bogus_installed, &record, &offline).await,
+        );
+        assert_eq!(code, "vendor_service_offline_conflict");
     }
 
     /// `--offline` + `--vendor-source=service` refuses without any network.

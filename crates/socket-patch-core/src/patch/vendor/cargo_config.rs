@@ -30,11 +30,12 @@ use std::path::{Path, PathBuf};
 use tokio::fs;
 use toml_edit::{DocumentMut, InlineTable, Item, Table, Value};
 
-use crate::utils::fs::atomic_write_bytes;
+use crate::pth_hook::edit::ensure_table;
+use crate::utils::fs::atomic_write_bytes_preserving_mode;
 
 /// Project-relative root of the vendor backend's committed crate copies. An
 /// entry whose `path` is under this prefix is socket-owned.
-pub const CARGO_VENDOR_DIR: &str = ".socket/vendor/cargo";
+const CARGO_VENDOR_DIR: &str = ".socket/vendor/cargo";
 
 /// Project-relative root of the retired `[patch]`-redirect backend's copies.
 /// Entries under this prefix are still recognised as socket-owned so vendor
@@ -48,7 +49,7 @@ pub struct PatchEntryInfo {
     /// The `path` value as written (verbatim), or `None` for a non-path
     /// source (e.g. `git`/`registry`).
     pub path: Option<String>,
-    /// True iff `path` is under [`CARGO_VENDOR_DIR`] or
+    /// True iff `path` is under `CARGO_VENDOR_DIR` or
     /// [`LEGACY_CARGO_PATCHES_DIR`].
     pub socket_owned: bool,
 }
@@ -98,19 +99,17 @@ pub async fn read_patch_entries(project_root: &Path) -> HashMap<String, PatchEnt
 // ── config-file resolution + read-or-create write ────────────────────────────
 
 /// Resolve the config file under `<project_root>/.cargo/`. Prefers an existing
-/// `config.toml`, then an existing legacy `config`, else `config.toml` (created
-/// on first write).
+/// legacy `config`: when both files exist cargo reads the one WITHOUT the
+/// extension (and warns) — writing into `config.toml` there would leave the
+/// `[patch]` entry silently inert. Falls back to an existing `config.toml`,
+/// else `config.toml` (created on first write).
 async fn config_path(project_root: &Path) -> PathBuf {
     let dir = project_root.join(".cargo");
-    let toml = dir.join("config.toml");
-    if fs::metadata(&toml).await.is_ok() {
-        return toml;
-    }
     let legacy = dir.join("config");
     if fs::metadata(&legacy).await.is_ok() {
         return legacy;
     }
-    toml
+    dir.join("config.toml")
 }
 
 /// Apply a pure transform to the config file, writing only if it changed and
@@ -161,8 +160,10 @@ async fn edit_config(
                     // comments alongside our `[patch]` entries. Commit
                     // atomically (stage + fsync + rename) so a crash mid-write
                     // can never truncate content we only meant to add one
-                    // entry to.
-                    atomic_write_bytes(&path, new.as_bytes())
+                    // entry to — and keep the destination's permission bits
+                    // (the rename would otherwise reset them to the fresh
+                    // stage inode's default).
+                    atomic_write_bytes_preserving_mode(&path, new.as_bytes())
                         .await
                         .map_err(|e| format!("write {}: {e}", path.display()))?;
                 }
@@ -192,24 +193,6 @@ fn entry_path(item: &Item) -> Option<&str> {
     item.as_table_like()
         .and_then(|t| t.get("path"))
         .and_then(Item::as_str)
-}
-
-/// Ensure `parent[key]` is a table, creating it if absent. Errors if present
-/// but a non-table. Mirrors `pth_hook::edit::ensure_table`.
-fn ensure_table<'a>(
-    parent: &'a mut Table,
-    key: &str,
-    implicit: bool,
-) -> Result<&'a mut Table, String> {
-    if !parent.contains_key(key) {
-        let mut t = Table::new();
-        t.set_implicit(implicit);
-        parent.insert(key, Item::Table(t));
-    }
-    parent
-        .get_mut(key)
-        .and_then(Item::as_table_mut)
-        .ok_or_else(|| format!("`{key}` is not a table"))
 }
 
 fn upsert_patch_entry(content: &str, name: &str, rel_path: &str) -> Result<Option<String>, String> {
@@ -548,6 +531,66 @@ mod tests {
         let body = fs::read_to_string(cargo_dir.join("config")).await.unwrap();
         assert!(body.contains("cfg-if"));
         assert!(body.contains("jobs = 2"));
+    }
+
+    #[tokio::test]
+    async fn test_prefers_legacy_config_when_both_exist() {
+        // cargo warns "both `.cargo/config` and `.cargo/config.toml` exist.
+        // Using `.cargo/config`" — when both are present the entry must land
+        // in the file cargo actually reads, or the patch is silently inert.
+        let dir = tempfile::tempdir().unwrap();
+        let cargo_dir = dir.path().join(".cargo");
+        fs::create_dir_all(&cargo_dir).await.unwrap();
+        fs::write(cargo_dir.join("config"), "[build]\njobs = 2\n")
+            .await
+            .unwrap();
+        fs::write(cargo_dir.join("config.toml"), "[net]\nretry = 3\n")
+            .await
+            .unwrap();
+        assert!(
+            ensure_patch_entry(dir.path(), "cfg-if", &vendor_path("cfg-if", "1.0.4"), false)
+                .await
+                .unwrap()
+        );
+        let legacy = fs::read_to_string(cargo_dir.join("config")).await.unwrap();
+        assert!(
+            legacy.contains("cfg-if"),
+            "entry must go into the file cargo uses: {legacy}"
+        );
+        let toml = fs::read_to_string(cargo_dir.join("config.toml"))
+            .await
+            .unwrap();
+        assert!(
+            !toml.contains("cfg-if"),
+            "config.toml is ignored by cargo while `config` exists; must stay untouched"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_edit_preserves_existing_file_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let cargo_dir = dir.path().join(".cargo");
+        fs::create_dir_all(&cargo_dir).await.unwrap();
+        let cfg = cargo_dir.join("config.toml");
+        fs::write(&cfg, "[build]\njobs = 4\n").await.unwrap();
+        // 0o640 never matches a fresh-inode default (0666 & !umask is one of
+        // 600/644/664/666), so a writer that drops the destination's bits is
+        // caught under any umask.
+        fs::set_permissions(&cfg, std::fs::Permissions::from_mode(0o640))
+            .await
+            .unwrap();
+        assert!(
+            ensure_patch_entry(dir.path(), "cfg-if", &vendor_path("cfg-if", "1.0.4"), false)
+                .await
+                .unwrap()
+        );
+        let mode = fs::metadata(&cfg).await.unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o640,
+            "editing a user-owned config must not reset its permission bits"
+        );
     }
 
     // ── exact-restore: emptied socket-created config is deleted ──────

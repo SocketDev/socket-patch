@@ -72,6 +72,8 @@ fn sample_doc() -> Document {
             "pkg:npm/lodash@4.17.20".to_string(),
             "pkg:npm/minimist@1.2.0".to_string(),
         ],
+        &[],
+        &[],
         &options(),
     )
     .expect("build sample doc")
@@ -104,6 +106,8 @@ fn merged_doc() -> Document {
             "pkg:npm/aaa@1.0.0".to_string(),
             "pkg:npm/bbb@2.0.0".to_string(),
         ],
+        &[],
+        &[],
         &options(),
     )
     .expect("build merged doc")

@@ -15,9 +15,9 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::manifest::schema::PatchManifest;
+use crate::manifest::schema::{PatchManifest, PatchRecord};
 use crate::patch::apply::{verify_file_patch, VerifyStatus};
-use crate::patch::vendor::state::VendorEntry;
+use crate::patch::vendor::state::{lookup_entry, VendorEntry};
 use crate::patch::vendor::verify::verify_vendored_patch_record;
 
 /// One entry per manifest PURL that did NOT pass verification. The
@@ -99,49 +99,25 @@ pub async fn applied_patches_with_vendor(
     let mut out = VerifyOutcome::default();
 
     for (purl, record) in &manifest.patches {
-        if let Some(ctx) = vendor {
-            let entry = ctx
-                .entries
-                .get(purl)
-                .or_else(|| ctx.entries.values().find(|e| e.base_purl == *purl));
-            if let Some(entry) = entry {
-                match verify_vendored_patch_record(&ctx.project_root, entry, record).await {
-                    Ok(()) => {
-                        out.applied.push(purl.clone());
-                        out.vendored.push(purl.clone());
-                    }
-                    Err(reason) => out.failed.push(FailedPatch {
-                        purl: purl.clone(),
-                        reason,
-                    }),
-                }
-                continue;
-            }
-            if let Some(copy_dir) = ctx.go_patches.get(purl) {
-                match verify_patch_record(copy_dir, record).await {
-                    Ok(()) => out.applied.push(purl.clone()),
-                    Err(reason) => out.failed.push(FailedPatch {
-                        purl: purl.clone(),
-                        reason,
-                    }),
-                }
-                continue;
-            }
-        }
-
-        let pkg_path = match package_paths.get(purl) {
-            Some(p) => p,
-            None => {
-                out.failed.push(FailedPatch {
-                    purl: purl.clone(),
-                    reason: "package_not_found".to_string(),
-                });
-                continue;
-            }
+        let vendor_entry =
+            vendor.and_then(|ctx| lookup_entry(&ctx.entries, purl).map(|e| (ctx, e)));
+        let result = if let Some((ctx, entry)) = vendor_entry {
+            verify_vendored_patch_record(&ctx.project_root, entry, record).await
+        } else if let Some(copy_dir) = vendor.and_then(|ctx| ctx.go_patches.get(purl)) {
+            verify_patch_record(copy_dir, record).await
+        } else if let Some(pkg_path) = package_paths.get(purl) {
+            verify_patch_record(pkg_path, record).await
+        } else {
+            Err("package_not_found".to_string())
         };
 
-        match verify_patch_record(pkg_path, record).await {
-            Ok(()) => out.applied.push(purl.clone()),
+        match result {
+            Ok(()) => {
+                out.applied.push(purl.clone());
+                if vendor_entry.is_some() {
+                    out.vendored.push(purl.clone());
+                }
+            }
             Err(reason) => out.failed.push(FailedPatch {
                 purl: purl.clone(),
                 reason,
@@ -161,10 +137,7 @@ pub async fn applied_patches_with_vendor(
 /// zero-file record offers nothing to hash, so — per the module's
 /// "omit when unconfirmed" contract — it is reported as `no_files` and
 /// dropped from the VEX document rather than vacuously attested.
-async fn verify_patch_record(
-    pkg_path: &Path,
-    record: &crate::manifest::schema::PatchRecord,
-) -> Result<(), String> {
+async fn verify_patch_record(pkg_path: &Path, record: &PatchRecord) -> Result<(), String> {
     if record.files.is_empty() {
         return Err("no_files".to_string());
     }

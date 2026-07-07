@@ -2,6 +2,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use super::types::{CrawledPackage, CrawlerOptions};
+use crate::patch::path_safety;
+use crate::utils::fs::is_dir;
 
 // ---------------------------------------------------------------------------
 // Case-encoding helpers
@@ -162,8 +164,8 @@ impl GoCrawler {
             .unwrap_or_default();
 
         for cache_path in &cache_paths {
-            let found = self.scan_module_cache(cache_path, &mut seen).await;
-            packages.extend(found);
+            self.scan_dir_recursive(cache_path, cache_path, &mut seen, &mut packages)
+                .await;
         }
 
         packages
@@ -201,6 +203,9 @@ impl GoCrawler {
                 let module_dir = cache_path.join(format!("{encoded}@{encoded_version}"));
 
                 if is_dir(&module_dir).await {
+                    if is_partially_extracted(cache_path, &encoded, &encoded_version).await {
+                        continue;
+                    }
                     // Split module_path into namespace and name
                     let (namespace, name) = split_module_path(module_path);
 
@@ -243,9 +248,14 @@ impl GoCrawler {
                 return Some(first.join("pkg").join("mod"));
             }
         }
+        // A set-but-empty HOME/USERPROFILE counts as unset, matching the
+        // GOMODCACHE and GOPATH guards above: honoring `""` would yield the
+        // RELATIVE path `go/pkg/mod`, pointing the crawl at a directory
+        // inside the user's project instead of a real module cache.
         let home = std::env::var("HOME")
-            .or_else(|_| std::env::var("USERPROFILE"))
-            .ok()?;
+            .ok()
+            .filter(|h| !h.is_empty())
+            .or_else(|| std::env::var("USERPROFILE").ok().filter(|h| !h.is_empty()))?;
         Some(PathBuf::from(home).join("go").join("pkg").join("mod"))
     }
 
@@ -256,17 +266,6 @@ impl GoCrawler {
     ///
     /// We walk the tree looking for directories whose name contains `@`
     /// (the version separator), which marks a versioned module.
-    async fn scan_module_cache(
-        &self,
-        cache_path: &Path,
-        seen: &mut HashSet<String>,
-    ) -> Vec<CrawledPackage> {
-        let mut results = Vec::new();
-        self.scan_dir_recursive(cache_path, cache_path, seen, &mut results)
-            .await;
-        results
-    }
-
     fn scan_dir_recursive<'a>(
         &'a self,
         base_path: &'a Path,
@@ -298,13 +297,11 @@ impl GoCrawler {
                 // Build the child path from the raw `OsStr` rather than the
                 // lossy UTF-8 rendering, so non-UTF-8 directory names still
                 // resolve to the correct on-disk path.
-                let full_path = current_path.join(entry.file_name());
+                let full_path = current_path.join(&dir_name);
 
                 // Check if this directory has `@` in its name (versioned module)
                 if dir_name_str.contains('@') {
-                    if let Some(pkg) =
-                        self.parse_versioned_dir(base_path, &full_path, &dir_name_str, seen)
-                    {
+                    if let Some(pkg) = self.parse_versioned_dir(base_path, &full_path, seen).await {
                         results.push(pkg);
                     }
                 } else {
@@ -317,11 +314,10 @@ impl GoCrawler {
     }
 
     /// Parse a versioned directory (containing `@`) into a `CrawledPackage`.
-    fn parse_versioned_dir(
+    async fn parse_versioned_dir(
         &self,
         base_path: &Path,
         dir_path: &Path,
-        _dir_name: &str,
         seen: &mut HashSet<String>,
     ) -> Option<CrawledPackage> {
         // Get the relative path from the cache root.
@@ -335,6 +331,12 @@ impl GoCrawler {
         let version = &rel_str[at_idx + 1..];
 
         if encoded_module_path.is_empty() || version.is_empty() {
+            return None;
+        }
+
+        // `version` is still the ENCODED on-disk form here, which is what
+        // the marker path is keyed by.
+        if is_partially_extracted(base_path, encoded_module_path, version).await {
             return None;
         }
 
@@ -385,35 +387,44 @@ fn split_module_path(module_path: &str) -> (&str, &str) {
 /// safe to join onto the module-cache root in [`GoCrawler::find_by_purls`].
 ///
 /// A Go module path legitimately contains `/` separators
-/// (`github.com/foo/bar`), so the path is validated **per segment** rather
-/// than rejecting all separators — but a real path never has an empty, `.`,
-/// or `..` segment (a leading `/` yields an empty first segment, so absolute
-/// paths are rejected here too). A version is a single segment with no
-/// separator. Backslashes and NULs are rejected outright. This mirrors the
+/// (`github.com/foo/bar`), so it is validated per segment via
+/// [`path_safety::is_safe_multi_segment`] — a real path never has an empty,
+/// `.`, or `..` segment, and absolute paths are rejected too. A version is a
+/// single segment ([`path_safety::is_safe_single_segment`]). Both helpers
+/// reject backslashes, NULs, and `:` — a Windows drive-relative coordinate
+/// (`C:evil`, `C:/evil`) joins as an absolute path. This mirrors the
 /// `go_redirect` coordinate guard and fails closed so a tampered manifest PURL
 /// cannot traverse out of the cache.
 fn is_safe_module_coordinate(module_path: &str, version: &str) -> bool {
-    let module_ok = !module_path.is_empty()
-        && !module_path.contains('\\')
-        && !module_path.contains('\0')
-        && module_path
-            .split('/')
-            .all(|seg| !seg.is_empty() && seg != "." && seg != "..");
-    let version_ok = !version.is_empty()
-        && version != "."
-        && version != ".."
-        && !version.contains('/')
-        && !version.contains('\\')
-        && !version.contains('\0');
-    module_ok && version_ok
+    path_safety::is_safe_multi_segment(module_path) && path_safety::is_safe_single_segment(version)
 }
 
-/// Check whether a path is a directory.
-async fn is_dir(path: &Path) -> bool {
-    tokio::fs::metadata(path)
-        .await
-        .map(|m| m.is_dir())
-        .unwrap_or(false)
+/// Whether Go's partial-extraction marker exists for an (encoded) module
+/// coordinate under `cache_path`.
+///
+/// Go (≥1.14.2) extracts a module zip in place at its final
+/// `<path>@<version>` location, creating
+/// `cache/download/<path>/@v/<version>.partial` first and removing it only
+/// after extraction succeeds (`cmd/go/internal/modfetch/fetch.go` — the
+/// marker exists "to prevent other processes from reading the directory if
+/// we crash"). A dir whose marker survives is incomplete: Go treats it as
+/// not downloaded (`DownloadDirPartialError`) and deletes + re-extracts it
+/// on next use, destroying anything patched into it. Both the scan and the
+/// PURL lookup must therefore skip it. Mirrors Go's `os.Stat(partialPath)`
+/// succeeded check in `DownloadDir`; both halves of the coordinate are the
+/// case-ENCODED on-disk forms, matching Go's `CachePath(mod, "partial")`.
+async fn is_partially_extracted(
+    cache_path: &Path,
+    encoded_module: &str,
+    encoded_version: &str,
+) -> bool {
+    let marker = cache_path
+        .join("cache")
+        .join("download")
+        .join(encoded_module)
+        .join("@v")
+        .join(format!("{encoded_version}.partial"));
+    tokio::fs::metadata(&marker).await.is_ok()
 }
 
 #[cfg(test)]
@@ -626,7 +637,6 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: Some(dir.path().to_path_buf()),
-            batch_size: 100,
         };
 
         let packages = crawler.crawl_all(&options).await;
@@ -654,7 +664,6 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: Some(dir.path().to_path_buf()),
-            batch_size: 100,
         };
 
         let packages = crawler.crawl_all(&options).await;
@@ -686,7 +695,6 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: Some(dir.path().to_path_buf()),
-            batch_size: 100,
         };
 
         let packages = crawler.crawl_all(&options).await;
@@ -703,7 +711,6 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: None,
-            batch_size: 100,
         };
 
         let paths = crawler.get_module_cache_paths(&options).await.unwrap();
@@ -727,7 +734,6 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: Some(dir.path().to_path_buf()),
-            batch_size: 100,
         };
 
         let packages = crawler.crawl_all(&options).await;
@@ -745,13 +751,13 @@ mod tests {
     /// `encoded_module_path = ""`. The empty-prefix guard in
     /// parse_versioned_dir must return None rather than emit a
     /// `("", "v1.0.0")` ghost package with an empty module path.
-    #[test]
-    fn test_parse_versioned_dir_empty_module_path_guard() {
+    #[tokio::test]
+    async fn test_parse_versioned_dir_empty_module_path_guard() {
         let base = std::path::Path::new("/cache");
         let dir = std::path::Path::new("/cache/@v1.0.0");
         let mut seen = HashSet::new();
         let crawler = GoCrawler;
-        let result = crawler.parse_versioned_dir(base, dir, "@v1.0.0", &mut seen);
+        let result = crawler.parse_versioned_dir(base, dir, &mut seen).await;
         assert!(
             result.is_none(),
             "empty encoded module path must yield None"
@@ -801,7 +807,6 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: Some(dir.path().to_path_buf()),
-            batch_size: 100,
         };
 
         let packages = crawler.crawl_all(&options).await;
@@ -829,7 +834,6 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: Some(dir.path().to_path_buf()),
-            batch_size: 100,
         };
 
         let packages = crawler.crawl_all(&options).await;
@@ -886,7 +890,6 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: Some(dir.path().to_path_buf()),
-            batch_size: 100,
         };
 
         let packages = crawler.crawl_all(&options).await;
@@ -913,7 +916,6 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: Some(dir.path().to_path_buf()),
-            batch_size: 100,
         };
 
         let packages = crawler.crawl_all(&options).await;
@@ -923,8 +925,8 @@ mod tests {
         assert!(purls.contains("pkg:golang/github.com/gin-gonic/gin@v1.9.1"));
     }
 
-    #[test]
-    fn test_parse_versioned_dir_empty_version_guard() {
+    #[tokio::test]
+    async fn test_parse_versioned_dir_empty_version_guard() {
         // A dir name with a trailing `@` and no version (`foo@`) is
         // malformed metadata: the empty-version guard must yield None
         // rather than emit a package with an empty version that would
@@ -933,7 +935,7 @@ mod tests {
         let dir = std::path::Path::new("/cache/github.com/foo/bar@");
         let mut seen = HashSet::new();
         let crawler = GoCrawler;
-        let result = crawler.parse_versioned_dir(base, dir, "bar@", &mut seen);
+        let result = crawler.parse_versioned_dir(base, dir, &mut seen).await;
         assert!(result.is_none(), "empty version must yield None");
     }
 
@@ -991,6 +993,112 @@ mod tests {
         );
     }
 
+    /// Unit contract for the coordinate gate: real module paths/versions
+    /// pass; a `:` is rejected because a Windows drive-relative coordinate
+    /// (`C:evil`, `C:/evil`) joins as an absolute path under `Path::join`.
+    #[test]
+    fn test_is_safe_module_coordinate_rejects_colon() {
+        assert!(is_safe_module_coordinate("github.com/foo/bar", "v1.2.3"));
+        assert!(!is_safe_module_coordinate("C:/evil", "v1.0.0"));
+        assert!(!is_safe_module_coordinate(
+            "github.com/C:evil/bar",
+            "v1.0.0"
+        ));
+        assert!(!is_safe_module_coordinate("github.com/foo/bar", "C:v1.0.0"));
+    }
+
+    #[tokio::test]
+    async fn test_crawl_skips_partially_extracted_module() {
+        // Go (≥1.14.2) extracts a module zip IN PLACE at its final
+        // `<path>@<version>` location, creating a
+        // `cache/download/<path>/@v/<version>.partial` marker first and
+        // removing it only after extraction succeeds. Per
+        // `cmd/go/internal/modfetch/fetch.go`, the marker exists "to prevent
+        // other processes from reading the directory if we crash" — a dir
+        // whose marker survives is incomplete, and Go deletes + re-extracts
+        // it on next use, destroying anything patched into it. The crawler
+        // must treat it like Go does: not installed.
+        let dir = tempfile::tempdir().unwrap();
+
+        let complete = dir.path().join("github.com").join("foo").join("ok@v1.0.0");
+        tokio::fs::create_dir_all(&complete).await.unwrap();
+
+        let partial = dir.path().join("github.com").join("foo").join("bad@v2.0.0");
+        tokio::fs::create_dir_all(&partial).await.unwrap();
+        let marker_dir = dir
+            .path()
+            .join("cache")
+            .join("download")
+            .join("github.com")
+            .join("foo")
+            .join("bad")
+            .join("@v");
+        tokio::fs::create_dir_all(&marker_dir).await.unwrap();
+        tokio::fs::write(marker_dir.join("v2.0.0.partial"), b"")
+            .await
+            .unwrap();
+
+        let crawler = GoCrawler::new();
+        let options = CrawlerOptions {
+            cwd: dir.path().to_path_buf(),
+            global: false,
+            global_prefix: Some(dir.path().to_path_buf()),
+        };
+
+        let packages = crawler.crawl_all(&options).await;
+        let purls: HashSet<_> = packages.iter().map(|p| p.purl.as_str()).collect();
+        assert!(
+            purls.contains("pkg:golang/github.com/foo/ok@v1.0.0"),
+            "the completely extracted module must still be found"
+        );
+        assert!(
+            !purls.contains("pkg:golang/github.com/foo/bad@v2.0.0"),
+            "a module dir with a surviving .partial marker is incomplete \
+             and must be skipped"
+        );
+        assert_eq!(packages.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_find_by_purls_skips_partially_extracted_module() {
+        // Same marker protocol as the scan test, exercised through the
+        // lookup path — and with case-escaped coordinates, pinning that the
+        // marker is probed at the ENCODED path and version
+        // (`.../!azure/bar/@v/v1.0.0-!r!c1.partial`), exactly where Go's
+        // `CachePath(mod, "partial")` writes it.
+        let dir = tempfile::tempdir().unwrap();
+
+        let module_dir = dir
+            .path()
+            .join("github.com")
+            .join("!azure")
+            .join("bar@v1.0.0-!r!c1");
+        tokio::fs::create_dir_all(&module_dir).await.unwrap();
+        let marker_dir = dir
+            .path()
+            .join("cache")
+            .join("download")
+            .join("github.com")
+            .join("!azure")
+            .join("bar")
+            .join("@v");
+        tokio::fs::create_dir_all(&marker_dir).await.unwrap();
+        tokio::fs::write(marker_dir.join("v1.0.0-!r!c1.partial"), b"")
+            .await
+            .unwrap();
+
+        let crawler = GoCrawler::new();
+        let purls = vec!["pkg:golang/github.com/Azure/bar@v1.0.0-RC1".to_string()];
+        let result = crawler.find_by_purls(dir.path(), &purls).await.unwrap();
+
+        assert!(
+            result.is_empty(),
+            "a half-extracted module (surviving .partial marker) must not \
+             be returned as a patch target — Go will delete and re-extract \
+             the dir, silently destroying any patch applied there"
+        );
+    }
+
     #[tokio::test]
     async fn test_find_by_purls_absent_returns_empty_ok() {
         // No matching directory on disk → Ok(empty map), never an Err.
@@ -1028,7 +1136,6 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: Some(dir.path().to_path_buf()),
-            batch_size: 100,
         };
 
         let packages = crawler.crawl_all(&options).await;

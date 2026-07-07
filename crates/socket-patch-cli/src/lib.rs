@@ -7,7 +7,7 @@
 
 pub mod args;
 pub mod commands;
-pub mod ecosystem_dispatch;
+pub(crate) mod ecosystem_dispatch;
 pub mod json_envelope;
 pub mod output;
 
@@ -83,7 +83,7 @@ pub enum Commands {
 ///
 /// Used by [`parse_with_uuid_fallback`] to detect the convenience form
 /// `socket-patch <UUID>` and rewrite it to `socket-patch get <UUID>`.
-pub fn looks_like_uuid(s: &str) -> bool {
+fn looks_like_uuid(s: &str) -> bool {
     let parts: Vec<&str> = s.split('-').collect();
     if parts.len() != 5 {
         return false;

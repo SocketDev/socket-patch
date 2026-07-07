@@ -27,13 +27,12 @@
 //! grammar that fails CLOSED on anything unexpected; the file is never fed
 //! to a JSON parser.
 
-use std::collections::HashMap;
 use std::path::Path;
 
 use serde_json::Value;
 
 use crate::manifest::schema::PatchRecord;
-use crate::patch::apply::{ApplyResult, PatchSources, VerifyResult, VerifyStatus};
+use crate::patch::apply::PatchSources;
 use crate::patch::bun_lock_text::{
     check_lock_version, decode_json_string, packages_bounds, parse_entry_line,
     parse_packages_section, split_name_spec, BunEntry,
@@ -41,8 +40,9 @@ use crate::patch::bun_lock_text::{
 use crate::patch::copy_tree::remove_tree;
 use crate::utils::fs::atomic_write_bytes;
 
-use super::npm_common::{done_failure, guard_coordinates, refused, stage_patch_pack, tgz_rel_leaf};
-use super::path::{parse_vendor_path, vendor_uuid_dir_rel};
+use super::common::{already_patched_result, refused};
+use super::npm_common::{done_failure, guard_coordinates, guard_revert_uuid_dir, stage_patch_pack};
+use super::path::parse_vendor_path;
 use super::state::{
     write_marker, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
 };
@@ -54,18 +54,12 @@ const BUN_LOCK: &str = "bun.lock";
 /// original/new = the verbatim entry LINE.
 const KIND_LOCK_PACKAGE: &str = "bun_lock_package";
 
-/// SECURITY: revert writes are restricted to the one file vendor edits — a
-/// poisoned state.json must not be able to point the rewrite at an arbitrary
-/// project file. Records naming anything else are skipped with a warning
-/// (fail-closed).
-const REVERT_ALLOWLIST: [&str; 1] = [BUN_LOCK];
-
 /// Vendor one installed npm package into a bun project (see the module doc).
 /// Same contract as `npm_lock::vendor_npm`: refuse-early / wire-last,
 /// `entry` present iff `result.success` and not a dry run, and an in-sync
 /// re-run synthesizes AlreadyPatched with no entry.
 #[allow(clippy::too_many_arguments)]
-pub async fn vendor_bun(
+pub(crate) async fn vendor_bun(
     purl: &str,
     installed_dir: &Path,
     project_root: &Path,
@@ -84,8 +78,6 @@ pub async fn vendor_bun(
         Err(outcome) => return *outcome,
     };
     let (name, version) = (coords.name.as_str(), coords.version.as_str());
-    // BN3 spelling: BARE project-relative path, no `file:`/`./` prefix.
-    let rel_tgz = format!("{}/{}", coords.uuid_dir_rel, tgz_rel_leaf(name, version));
 
     // ── 2. Read + strictly parse the lock (refuse before any write) ──────
     let lock_text = match tokio::fs::read_to_string(project_root.join(BUN_LOCK)).await {
@@ -153,7 +145,8 @@ pub async fn vendor_bun(
             warnings,
         };
     };
-    debug_assert_eq!(staged.rel_tgz, rel_tgz);
+    // BN3 spelling: BARE project-relative path, no `file:`/`./` prefix.
+    let rel_tgz = staged.rel_tgz;
     let packed = staged.packed;
     if staged.staged_pkg_json.is_some() {
         // The tuple's deps object mirrors the package's own manifest; the
@@ -181,7 +174,7 @@ pub async fn vendor_bun(
             TupleShape::Ours { path } => {
                 // Idempotency: an instance already carrying this exact path
                 // and integrity needs no edit and no wiring record.
-                if path == rel_tgz && entry.elems[2] == json_str(&packed.integrity) {
+                if path == rel_tgz && entry.elems[2] == format!("\"{}\"", packed.integrity) {
                     continue;
                 }
                 (entry.elems[1].clone(), true)
@@ -219,13 +212,8 @@ pub async fn vendor_bun(
         // Every instance already points at this uuid with the packed
         // integrity: in sync. The tarball re-pack above was byte-identical
         // by determinism; synthesize AlreadyPatched and record nothing.
-        let verified = record
-            .files
-            .keys()
-            .map(|f| already_patched_verify(f))
-            .collect();
         return VendorOutcome::Done {
-            result: synthesized_result(purl, &project_root.join(&rel_tgz), verified, true, None),
+            result: already_patched_result(purl, &project_root.join(&rel_tgz), &record.files),
             entry: None,
             warnings,
         };
@@ -238,16 +226,7 @@ pub async fn vendor_bun(
     }
 
     // ── 6. Marker + ledger entry ──────────────────────────────────────────
-    let mut vulnerabilities: Vec<String> = record.vulnerabilities.keys().cloned().collect();
-    vulnerabilities.sort();
-    let marker = VendorMarker {
-        schema_version: 1,
-        purl: coords.base_purl.clone(),
-        patch_uuid: record.uuid.clone(),
-        ecosystem: "npm".to_string(),
-        vulnerabilities,
-        vendored_at: vendored_at.to_string(),
-    };
+    let marker = VendorMarker::new("npm", &coords.base_purl, record, vendored_at);
     if let Err(e) = write_marker(&project_root.join(&coords.uuid_dir_rel), &marker).await {
         warnings.push(VendorWarning::new(
             "vendor_marker_write_failed",
@@ -287,24 +266,30 @@ pub async fn vendor_bun(
 /// Undo one bun-vendored package: restore the recorded entry lines and
 /// remove the artifact dir. Reverse application order; per-record ownership
 /// is re-checked against the live line (drift ⇒ warning, left alone).
-pub async fn revert_bun(entry: &VendorEntry, project_root: &Path, dry_run: bool) -> RevertOutcome {
+pub(crate) async fn revert_bun(
+    entry: &VendorEntry,
+    project_root: &Path,
+    dry_run: bool,
+) -> RevertOutcome {
     // SECURITY: `entry.uuid` comes from the committed, tamper-able
     // state.json and names the directory tree we are about to DELETE.
     // Validate through the same fail-closed grammar vendor used.
-    let Some(uuid_dir_rel) = vendor_uuid_dir_rel("npm", &entry.uuid) else {
-        return RevertOutcome::failed(format!(
-            "refusing revert: `{}` is not a canonical patch uuid (tampered state.json?)",
-            entry.uuid
-        ));
+    let uuid_dir_rel = match guard_revert_uuid_dir(&entry.uuid) {
+        Ok(d) => d,
+        Err(outcome) => return outcome,
     };
     if dry_run {
         return RevertOutcome::ok();
     }
     let mut outcome = RevertOutcome::ok();
 
+    // SECURITY: revert writes are restricted to the one file vendor edits — a
+    // poisoned state.json must not be able to point the rewrite at an
+    // arbitrary project file. Records naming anything else are skipped with a
+    // warning (fail-closed).
     let mut touches_lock = false;
     for rec in &entry.wiring {
-        if !REVERT_ALLOWLIST.contains(&rec.file.as_str()) {
+        if rec.file != BUN_LOCK {
             outcome.warnings.push(VendorWarning::new(
                 "vendor_lock_entry_drifted",
                 format!(
@@ -462,52 +447,15 @@ fn classify(entry: &BunEntry, target_spec: &str, name: &str) -> Option<TupleShap
     }
 }
 
-/// Encode for verbatim comparison against a tuple element.
-fn json_str(s: &str) -> String {
-    format!("\"{s}\"")
-}
-
-// ───────────────────────── small shared helpers ───────────────────────────
-// (same shapes as npm_lock's; duplicated because that module's helpers are
-// private and this file is the only allowed edit surface)
-
-fn synthesized_result(
-    package_key: &str,
-    path: &Path,
-    files_verified: Vec<VerifyResult>,
-    success: bool,
-    error: Option<String>,
-) -> ApplyResult {
-    ApplyResult {
-        package_key: package_key.to_string(),
-        package_path: path.display().to_string(),
-        success,
-        files_verified,
-        files_patched: Vec::new(),
-        applied_via: HashMap::new(),
-        error,
-        sidecar: None,
-    }
-}
-
-fn already_patched_verify(file: &str) -> VerifyResult {
-    VerifyResult {
-        file: file.to_string(),
-        status: VerifyStatus::AlreadyPatched,
-        message: None,
-        current_hash: None,
-        expected_hash: None,
-        target_hash: None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::hash::git_sha256::compute_git_sha256_from_bytes;
     use crate::manifest::schema::PatchFileInfo;
+    use crate::patch::apply::{ApplyResult, VerifyStatus};
     use base64::Engine as _;
     use sha2::{Digest, Sha512};
+    use std::collections::HashMap;
     use std::path::PathBuf;
 
     const UUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
@@ -608,6 +556,27 @@ mod tests {
     "left-pad": ["left-pad@1.2.0", "", {}, "sha512-OQadpCyFCT/VLniZQgym8d3/ofIJtuZyw2ibsVeIUOexKgW/osn8+mMFJbwGMPeDC4GnLzD8q115WPCDx4YRWg=="],
 
     "haspad/left-pad": ["left-pad@.socket/vendor/npm/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/left-pad-1.3.0.tgz", {}, "sha512-BeCz4t+xVlVhKgnBa2K5pAR1MKUgHxv3w9G4T/ADxBhxHNY1ByfS0zcyKi6WQYEM+W2MbTE5kpwwVpgkS//6lQ=="],
+  }
+}
+"#;
+
+    // Scoped package: the vendored spec embeds an `@` inside the path
+    // (`@scope/pkg@.socket/vendor/npm/<uuid>/@scope/pkg-1.0.0.tgz` — the
+    // scope stays a real subdirectory in the tarball leaf), so name/path
+    // splitting must not key on the LAST `@`.
+    const SCOPED_BEFORE_LOCK: &str = r#"{
+  "lockfileVersion": 1,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "scoped-fixture",
+      "dependencies": {
+        "@scope/pkg": "1.0.0",
+      },
+    },
+  },
+  "packages": {
+    "@scope/pkg": ["@scope/pkg@1.0.0", "", {}, "sha512-XI5MPzVNApjAyhQzphX8BkmKsKUxD4LdyK24iZeQGinBN9yTQT3bFlCBy/aVx2HrNcqQGsdot8ghrjyrvMCoEA=="],
   }
 }
 "#;
@@ -960,6 +929,105 @@ mod tests {
             tgz_first,
             "tarball byte-identical across re-runs"
         );
+    }
+
+    /// Build a scoped-package fixture and vendor it once (not dry).
+    async fn scoped_fixture() -> Fixture {
+        let fx = fixture_with(SCOPED_BEFORE_LOCK, "node_modules/@scope/pkg").await;
+        tokio::fs::write(
+            fx.installed.join("package.json"),
+            br#"{"name":"@scope/pkg","version":"1.0.0"}"#,
+        )
+        .await
+        .unwrap();
+        fx
+    }
+
+    async fn vendor_scoped(fx: &Fixture) -> VendorOutcome {
+        let blobs = fx.root().join(".socket/blobs");
+        let sources = PatchSources::blobs_only(&blobs);
+        vendor_bun(
+            "pkg:npm/@scope/pkg@1.0.0",
+            &fx.installed,
+            fx.root(),
+            &fx.record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            None,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn scoped_package_rerun_is_in_sync_not_refused() {
+        let fx = scoped_fixture().await;
+        let (result, entry, _) = expect_done(vendor_scoped(&fx).await);
+        assert!(result.success, "{:?}", result.error);
+        assert!(entry.is_some());
+        let lock_first = fx.read_lock().await;
+        assert!(
+            lock_first.contains(&format!(
+                "\"@scope/pkg@.socket/vendor/npm/{UUID}/@scope/pkg-1.0.0.tgz\""
+            )),
+            "vendored spec keeps the scope dir in the leaf: {lock_first}"
+        );
+
+        // The in-sync re-run must synthesize AlreadyPatched, not refuse.
+        let (result, entry, _) = expect_done(vendor_scoped(&fx).await);
+        assert!(result.success, "{:?}", result.error);
+        assert!(entry.is_none(), "in-sync re-run records nothing");
+        assert!(
+            result
+                .files_verified
+                .iter()
+                .all(|v| v.status == VerifyStatus::AlreadyPatched),
+            "{:?}",
+            result.files_verified
+        );
+        assert_eq!(fx.read_lock().await, lock_first, "lock byte-stable");
+    }
+
+    #[tokio::test]
+    async fn scoped_reserialized_entry_is_still_ours_on_revert() {
+        let fx = scoped_fixture().await;
+        let (_, entry, _) = expect_done(vendor_scoped(&fx).await);
+        let entry = entry.unwrap();
+
+        // Simulate bun re-serializing the line without moving the entry:
+        // same key, same tuple, trailing comma dropped. The uuid-ownership
+        // fallback (not the byte-exact compare) must still claim it.
+        let live = fx.read_lock().await;
+        let new_line = entry.wiring[0]
+            .new
+            .as_ref()
+            .and_then(Value::as_str)
+            .unwrap();
+        let reserialized = new_line.strip_suffix(',').unwrap();
+        tokio::fs::write(
+            fx.root().join(BUN_LOCK),
+            live.replacen(new_line, reserialized, 1),
+        )
+        .await
+        .unwrap();
+
+        let outcome = revert_bun(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(
+            outcome.warnings.is_empty(),
+            "an unmoved entry is ours, not drift: {:?}",
+            outcome.warnings
+        );
+        assert_eq!(
+            fx.read_lock().await,
+            SCOPED_BEFORE_LOCK,
+            "registry tuple byte-restored"
+        );
+        assert!(!fx
+            .root()
+            .join(format!(".socket/vendor/npm/{UUID}"))
+            .exists());
     }
 
     #[tokio::test]

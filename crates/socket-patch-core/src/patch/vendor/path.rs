@@ -31,53 +31,30 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::crawlers::Ecosystem;
 use crate::patch::path_safety::{is_canonical_uuid, is_safe_multi_segment, is_safe_single_segment};
 use crate::utils::fs::list_dir_entries;
 
 /// Project-relative root of all vendored artifacts.
-pub const VENDOR_DIR: &str = ".socket/vendor";
+pub(crate) const VENDOR_DIR: &str = ".socket/vendor";
 
 /// The ecosystem directory names under [`VENDOR_DIR`]. These double as the
-/// `<eco>` capture of the recovery convention and are independent of which
-/// features this binary was compiled with (an orphan sweep must still
-/// recognise — and report, not delete — a dir for a compiled-out ecosystem).
-pub const ECOSYSTEM_DIRS: &[&str] = &[
+/// `<eco>` capture of the recovery convention.
+pub(crate) const ECOSYSTEM_DIRS: &[&str] = &[
     "npm", "cargo", "golang", "composer", "gem", "pypi", "nuget", "maven",
 ];
 
 /// The vendor ecosystem-dir name for a PURL, or `None` when the ecosystem has
-/// no vendor backend (jsr) or is compiled out of this binary.
+/// no vendor backend (jsr).
+///
+/// The dir name is `Ecosystem::cli_name()`: both are persisted contracts
+/// (cli_name in manifests/sidecars, the dir in committed vendor paths) and
+/// they deliberately share one spelling — see `ECOSYSTEM_DIRS` above.
 pub fn ecosystem_dir_for_purl(purl: &str) -> Option<&'static str> {
-    if purl.starts_with("pkg:npm/") {
-        return Some("npm");
+    match Ecosystem::from_purl(purl)? {
+        Ecosystem::Deno => None,
+        eco => Some(eco.cli_name()),
     }
-    if purl.starts_with("pkg:pypi/") {
-        return Some("pypi");
-    }
-    if purl.starts_with("pkg:gem/") {
-        return Some("gem");
-    }
-    #[cfg(feature = "cargo")]
-    if purl.starts_with("pkg:cargo/") {
-        return Some("cargo");
-    }
-    #[cfg(feature = "golang")]
-    if purl.starts_with("pkg:golang/") {
-        return Some("golang");
-    }
-    #[cfg(feature = "composer")]
-    if purl.starts_with("pkg:composer/") {
-        return Some("composer");
-    }
-    #[cfg(feature = "nuget")]
-    if purl.starts_with("pkg:nuget/") {
-        return Some("nuget");
-    }
-    #[cfg(feature = "maven")]
-    if purl.starts_with("pkg:maven/") {
-        return Some("maven");
-    }
-    None
 }
 
 /// The project-relative uuid dir (`.socket/vendor/<eco>/<uuid>`), validated.
@@ -94,7 +71,7 @@ pub fn vendor_uuid_dir_rel(eco: &str, uuid: &str) -> Option<String> {
 }
 
 /// One parsed vendored path (the output of [`parse_vendor_path`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct VendorPathParts {
     /// Ecosystem dir name (`npm`, `cargo`, …).
     pub eco: String,
@@ -197,7 +174,7 @@ fn split_nuget_leaf(stem: &str) -> Option<(&str, &str)> {
 /// Reconstruct the base PURL from a vendored leaf. This is the orphan-sweep
 /// FALLBACK identification (state.json is the ledger of record); `None` means
 /// "unrecognisable — report, never delete by guess".
-pub fn leaf_to_purl(eco: &str, leaf: &str) -> Option<String> {
+fn leaf_to_purl(eco: &str, leaf: &str) -> Option<String> {
     match eco {
         "npm" => {
             let stem = leaf.strip_suffix(".tgz")?;
@@ -283,7 +260,7 @@ pub fn leaf_to_purl(eco: &str, leaf: &str) -> Option<String> {
 }
 
 /// One swept vendored unit: the uuid dir and what could be learned about it.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct SweptVendorDir {
     pub eco: String,
     pub uuid: String,
@@ -309,7 +286,10 @@ pub async fn sweep_vendor_dirs(project_root: &Path) -> Vec<SweptVendorDir> {
                 continue;
             }
             let dir = entry.path();
-            if !crate::utils::fs::entry_is_dir(&entry).await {
+            // Symlink-strict (lstat, not stat): vendor staging never writes
+            // symlinks, so a symlinked uuid dir cannot be ours — sweeping it
+            // would read (and let callers delete through) its target.
+            if !entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
                 continue;
             }
             let purls = collect_leaf_purls(eco, &dir).await;
@@ -344,8 +324,11 @@ async fn collect_leaf_purls(eco: &str, uuid_dir: &Path) -> Vec<String> {
             }
             // Keep descending through structural levels (go module path
             // segments, composer vendor dirs, npm @scope dirs) up to a sane
-            // depth bound.
-            if crate::utils::fs::entry_is_dir(&entry).await && leaf.matches('/').count() < 8 {
+            // depth bound. Symlink-strict like the go-patches walker: a
+            // symlink in a committed unit is never ours and must not pull
+            // out-of-tree paths into the walk.
+            let is_real_dir = entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false);
+            if is_real_dir && leaf.matches('/').count() < 8 {
                 stack.push((entry.path(), leaf));
             }
         }
@@ -373,6 +356,32 @@ mod tests {
             vendor_uuid_dir_rel("jsr", UUID).is_none(),
             "unknown eco dir"
         );
+    }
+
+    /// `ecosystem_dir_for_purl` derives the dir from `Ecosystem::cli_name()`.
+    /// The dir is an on-disk contract (committed vendor paths), so every
+    /// classification must land inside `ECOSYSTEM_DIRS` — a cli_name rename
+    /// must fail here rather than silently move the vendor layout. JSR stays
+    /// backend-less.
+    #[test]
+    fn ecosystem_dir_matches_contract_dirs() {
+        for eco in Ecosystem::all() {
+            let purl = format!("pkg:{}/example@1.0.0", eco.cli_name());
+            match ecosystem_dir_for_purl(&purl) {
+                Some(dir) => {
+                    assert_eq!(dir, eco.cli_name());
+                    assert!(
+                        ECOSYSTEM_DIRS.contains(&dir),
+                        "dir {dir:?} missing from ECOSYSTEM_DIRS"
+                    );
+                }
+                None => {
+                    assert_eq!(*eco, Ecosystem::Deno, "only deno lacks a vendor backend");
+                }
+            }
+        }
+        assert_eq!(ecosystem_dir_for_purl("pkg:jsr/@std/path@0.220.0"), None);
+        assert_eq!(ecosystem_dir_for_purl("pkg:unknown/foo@1.0"), None);
     }
 
     #[test]
@@ -562,5 +571,52 @@ mod tests {
             vec!["pkg:golang/github.com/foo/bar@v1.4.2".to_string()]
         );
         assert_eq!(go.uuid, UUID);
+    }
+
+    /// SECURITY: the vendor tree is committed and tamper-able, and vendor
+    /// staging never writes symlinks — so a symlink anywhere under
+    /// `.socket/vendor/` cannot be ours. The sweep must be symlink-strict
+    /// (like the go-patches walker it mirrors): never descend through a
+    /// symlinked dir inside a unit, and never sweep a symlinked uuid dir —
+    /// otherwise a committed `link -> /` makes the sweep read arbitrary
+    /// out-of-tree paths and attribute purls found there to the unit.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sweep_never_follows_symlinks_out_of_the_vendor_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // An outside tree containing a perfectly parseable npm leaf.
+        let outside = root.join("outside");
+        tokio::fs::create_dir_all(&outside).await.unwrap();
+        tokio::fs::write(outside.join("lodash-4.17.21.tgz"), b"x")
+            .await
+            .unwrap();
+
+        // A real uuid dir whose CONTENTS include a symlink to the outside dir.
+        let unit = root.join(format!(".socket/vendor/npm/{UUID}"));
+        tokio::fs::create_dir_all(&unit).await.unwrap();
+        std::os::unix::fs::symlink(&outside, unit.join("esc")).unwrap();
+
+        // A uuid dir that IS a symlink to the outside dir.
+        tokio::fs::create_dir_all(root.join(".socket/vendor/cargo"))
+            .await
+            .unwrap();
+        std::os::unix::fs::symlink(
+            &outside,
+            root.join(".socket/vendor/cargo/11111111-2222-4333-8444-555555555555"),
+        )
+        .unwrap();
+
+        let swept = sweep_vendor_dirs(root).await;
+        assert!(
+            !swept.iter().any(|s| s.eco == "cargo"),
+            "symlinked uuid dir must not be swept as a unit: {swept:?}"
+        );
+        let npm = swept.iter().find(|s| s.eco == "npm").unwrap();
+        assert!(
+            npm.purls.is_empty(),
+            "purls must never be reconstructed through a symlink: {:?}",
+            npm.purls
+        );
     }
 }

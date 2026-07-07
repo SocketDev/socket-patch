@@ -2,22 +2,11 @@ use std::collections::HashSet;
 
 use reqwest::header::{self, HeaderMap, HeaderValue};
 use reqwest::StatusCode;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::api::types::*;
-use crate::constants::{
-    DEFAULT_PATCH_API_PROXY_URL, DEFAULT_SOCKET_API_URL, USER_AGENT as USER_AGENT_VALUE,
-};
-use crate::utils::env_compat::read_env_with_legacy;
-
-/// Check if debug mode is enabled via SOCKET_DEBUG env (falling back to the
-/// legacy SOCKET_PATCH_DEBUG name with a one-shot deprecation warning).
-fn is_debug_enabled() -> bool {
-    match read_env_with_legacy("SOCKET_DEBUG", "SOCKET_PATCH_DEBUG") {
-        Some(val) => val == "1" || val == "true",
-        None => false,
-    }
-}
+use crate::constants::{DEFAULT_SOCKET_API_URL, USER_AGENT as USER_AGENT_VALUE};
+use crate::utils::env_compat::{is_debug_enabled, proxy_url_from_env};
 
 /// Log debug messages when debug mode is enabled.
 fn debug_log(message: &str) {
@@ -71,49 +60,20 @@ struct BatchSearchBody {
     components: Vec<BatchComponent>,
 }
 
+impl BatchSearchBody {
+    fn new(purls: &[String]) -> Self {
+        Self {
+            components: purls
+                .iter()
+                .map(|p| BatchComponent { purl: p.clone() })
+                .collect(),
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct BatchComponent {
     purl: String,
-}
-
-/// Body for the patch-package reference POST endpoint (`scan --redirect`).
-#[derive(Serialize)]
-struct RegistryReferenceBody {
-    uuids: Vec<String>,
-}
-
-/// One downloadable artifact from the reference endpoint.
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ReferenceArtifact {
-    pub kind: String,
-    #[serde(default)]
-    pub url: Option<String>,
-    #[serde(default)]
-    pub integrity: crate::patch::redirect::Integrity,
-}
-
-/// One patch's resolved hosted-patch reference — mirrors the api-v0
-/// `POST /v0/orgs/{org}/patches/package` (and proxy `/patch/package`) result:
-/// the grant-tokenized artifact URL(s) + integrity + per-ecosystem registry
-/// override that `scan --redirect` turns into a `DepOverride`.
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RegistryReference {
-    pub status: String,
-    #[serde(default)]
-    pub url: Option<String>,
-    #[serde(default)]
-    pub purl: Option<String>,
-    #[serde(default)]
-    pub artifacts: Vec<ReferenceArtifact>,
-    #[serde(default)]
-    pub registry_override: Option<crate::patch::redirect::RegistryOverride>,
-}
-
-#[derive(Deserialize)]
-struct RegistryReferenceResponse {
-    results: std::collections::HashMap<String, RegistryReference>,
 }
 
 impl ApiClient {
@@ -322,12 +282,7 @@ impl ApiClient {
         if !self.use_public_proxy {
             let slug = org_slug.or(self.org_slug.as_deref()).unwrap_or("default");
             let path = format!("/v0/orgs/{}/patches/batch", slug);
-            let body = BatchSearchBody {
-                components: purls
-                    .iter()
-                    .map(|p| BatchComponent { purl: p.clone() })
-                    .collect(),
-            };
+            let body = BatchSearchBody::new(purls);
             let result = self
                 .post_json::<BatchSearchResponse, _>(&path, &body)
                 .await?;
@@ -358,7 +313,7 @@ impl ApiClient {
     pub async fn fetch_registry_references(
         &self,
         uuids: &[String],
-    ) -> Result<std::collections::HashMap<String, RegistryReference>, ApiError> {
+    ) -> Result<std::collections::HashMap<String, PackageVendorResult>, ApiError> {
         if uuids.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
@@ -368,11 +323,12 @@ impl ApiClient {
             let slug = self.org_slug.as_deref().unwrap_or("default");
             format!("/v0/orgs/{}/patches/package", slug)
         };
-        let body = RegistryReferenceBody {
+        let body = PackageVendorRequest {
             uuids: uuids.to_vec(),
+            free_only: None,
         };
         let resp = self
-            .post_json::<RegistryReferenceResponse, _>(&path, &body)
+            .post_json::<PackageVendorResponse, _>(&path, &body)
             .await?;
         Ok(resp.map(|r| r.results).unwrap_or_default())
     }
@@ -405,12 +361,7 @@ impl ApiClient {
         let url = format!("{}/patch/batch", self.api_url);
         debug_log(&format!("POST {}", url));
 
-        let body = BatchSearchBody {
-            components: purls
-                .iter()
-                .map(|p| BatchComponent { purl: p.clone() })
-                .collect(),
-        };
+        let body = BatchSearchBody::new(purls);
 
         let resp = self
             .client
@@ -510,27 +461,19 @@ impl ApiClient {
         Ok(assemble_batch_from_individual(all_results))
     }
 
-    /// Fetch organizations accessible to the current API token.
-    pub async fn fetch_organizations(
-        &self,
-    ) -> Result<Vec<crate::api::types::OrganizationInfo>, ApiError> {
-        let path = "/v0/organizations";
-        match self
-            .get_json::<crate::api::types::OrganizationsResponse>(path)
-            .await?
-        {
-            Some(resp) => Ok(resp.organizations.into_values().collect()),
-            None => Ok(Vec::new()),
-        }
-    }
-
     /// Resolve the org slug from the API token by querying `/v0/organizations`.
     ///
     /// If there is exactly one org, returns its slug.
     /// If there are multiple, picks the first and prints a warning.
     /// If there are none, returns an error.
-    pub async fn resolve_org_slug(&self) -> Result<String, ApiError> {
-        let orgs = self.fetch_organizations().await?;
+    async fn resolve_org_slug(&self) -> Result<String, ApiError> {
+        let orgs = match self
+            .get_json::<crate::api::types::OrganizationsResponse>("/v0/organizations")
+            .await?
+        {
+            Some(resp) => resp.organizations.into_values().collect(),
+            None => Vec::new(),
+        };
         select_org_slug(orgs)
     }
 
@@ -547,7 +490,7 @@ impl ApiClient {
                 hash
             )));
         }
-        self.fetch_binary("blob", "blob", hash).await
+        self.fetch_binary("blob", hash).await
     }
 
     /// Fetch a per-file diff archive (tar.gz of bsdiff deltas) by patch UUID.
@@ -562,7 +505,7 @@ impl ApiClient {
                 uuid
             )));
         }
-        self.fetch_binary("diff", "diff", uuid).await
+        self.fetch_binary("diff", uuid).await
     }
 
     /// Fetch a per-package patch archive (tar.gz of patched files) by patch UUID.
@@ -575,7 +518,7 @@ impl ApiClient {
                 uuid
             )));
         }
-        self.fetch_binary("package", "package", uuid).await
+        self.fetch_binary("package", uuid).await
     }
 
     /// Build the URL (and an `is_authenticated` flag) for a binary fetch of
@@ -603,8 +546,7 @@ impl ApiClient {
             let base = if self.use_public_proxy {
                 self.api_url.clone()
             } else {
-                read_env_with_legacy("SOCKET_PROXY_URL", "SOCKET_PATCH_PROXY_URL")
-                    .unwrap_or_else(|| DEFAULT_PATCH_API_PROXY_URL.to_string())
+                proxy_url_from_env()
             };
             let u = format!(
                 "{}/patch/{}/{}",
@@ -618,53 +560,37 @@ impl ApiClient {
 
     /// Shared implementation for `fetch_blob` / `fetch_diff` / `fetch_package`.
     ///
-    /// `kind` is the URL segment (`blob` / `diff` / `package`). `label` is the
-    /// human-readable noun used in log + error messages. `identifier` is the
-    /// hash or UUID interpolated into the URL.
+    /// `kind` is the URL segment (`blob` / `diff` / `package`), doubling as the
+    /// noun in log + error messages. `identifier` is the hash or UUID
+    /// interpolated into the URL.
     async fn fetch_binary(
         &self,
         kind: &str,
-        label: &str,
         identifier: &str,
     ) -> Result<Option<Vec<u8>>, ApiError> {
         let (url, use_auth) = self.binary_url(kind, identifier);
 
-        debug_log(&format!("GET {} {}", label, url));
+        debug_log(&format!("GET {} {}", kind, url));
 
-        // Build the request. When fetching from the public proxy (different
-        // base URL than self.api_url), we use a plain client without auth
-        // headers to avoid leaking credentials to the proxy.
-        let resp = if use_auth {
-            self.client
-                .get(&url)
-                .header(header::ACCEPT, "application/octet-stream")
-                .send()
-                .await
+        // When fetching from the public proxy (different base URL than
+        // self.api_url), use a plain client without auth headers to avoid
+        // leaking credentials to the proxy.
+        let client = if use_auth {
+            self.client.clone()
         } else {
-            let mut headers = HeaderMap::new();
-            headers.insert(
-                header::USER_AGENT,
-                HeaderValue::from_static(USER_AGENT_VALUE),
-            );
-            headers.insert(
-                header::ACCEPT,
-                HeaderValue::from_static("application/octet-stream"),
-            );
-
-            let plain_client = reqwest::Client::builder()
-                .default_headers(headers)
-                .build()
-                .expect("failed to build plain reqwest client");
-
-            plain_client.get(&url).send().await
+            plain_client()
         };
-
-        let resp = resp.map_err(|e| {
-            ApiError::Network(format!(
-                "Network error fetching {} {}: {}",
-                label, identifier, e
-            ))
-        })?;
+        let resp = client
+            .get(&url)
+            .header(header::ACCEPT, "application/octet-stream")
+            .send()
+            .await
+            .map_err(|e| {
+                ApiError::Network(format!(
+                    "Network error fetching {} {}: {}",
+                    kind, identifier, e
+                ))
+            })?;
 
         let status = resp.status();
 
@@ -672,7 +598,7 @@ impl ApiClient {
             let bytes = resp.bytes().await.map_err(|e| {
                 ApiError::Network(format!(
                     "Error reading {} body for {}: {}",
-                    label, identifier, e
+                    kind, identifier, e
                 ))
             })?;
             return Ok(Some(bytes.to_vec()));
@@ -693,7 +619,7 @@ impl ApiClient {
         let text = resp.text().await.unwrap_or_default();
         Err(ApiError::Other(format!(
             "Failed to fetch {} {}: status {} - {}",
-            label,
+            kind,
             identifier,
             status.as_u16(),
             text,
@@ -713,7 +639,7 @@ impl ApiClient {
     /// the step-2 download host (both for staging / local-dev / testing). The
     /// returned [`FetchedVendorPackage`] carries the *unverified* bytes plus the
     /// service-reported integrity — the caller verifies before use.
-    pub async fn fetch_vendor_package(
+    pub(crate) async fn fetch_vendor_package(
         &self,
         uuid: &str,
         free_only: bool,
@@ -811,10 +737,7 @@ impl ApiClient {
             ServeDownload::Ok(bytes) => VendorServiceOutcome::Ready(FetchedVendorPackage {
                 tarball: bytes,
                 integrity_sri,
-                sha1_hex: artifact.integrity.sha1.clone(),
                 dirhash_h1: artifact.integrity.dirhash_h1.clone(),
-                size_bytes: artifact.size_bytes,
-                content_type: artifact.content_type.clone(),
                 source_url: download_url,
                 secondary_artifacts,
             }),
@@ -823,6 +746,35 @@ impl ApiClient {
             }
             ServeDownload::Pending => VendorServiceOutcome::Pending,
             ServeDownload::Failed(e) => VendorServiceOutcome::Failed(e),
+        }
+    }
+
+    /// Build the URL (and an `is_authenticated` flag) for the vendor
+    /// package-reference POST of [`Self::request_vendor_package`].
+    ///
+    /// Authenticated `/v0/orgs/<slug>/patches/package` when a token + org
+    /// slug are configured and we're not pinned to the public proxy —
+    /// mirrors [`Self::binary_url`]'s decision so a bearer is never sent to
+    /// the proxy. Otherwise it targets the proxy's `/patch/package`.
+    /// `vendor_url` (staging / local-dev) overrides the base in every case.
+    ///
+    /// The base mirrors [`Self::binary_url`] too: in public-proxy mode the
+    /// client's own `api_url` IS the proxy, but an authenticated client that
+    /// lacks an org slug must re-derive the proxy base from the environment
+    /// — its `api_url` is the auth host, which has no `/patch/*` routes.
+    fn vendor_package_url(&self, vendor_url: Option<&str>) -> (String, bool) {
+        let use_auth =
+            self.api_token.is_some() && self.org_slug.is_some() && !self.use_public_proxy;
+        let base = match vendor_url {
+            Some(v) => v.trim_end_matches('/').to_string(),
+            None if use_auth || self.use_public_proxy => self.api_url.clone(),
+            None => proxy_url_from_env().trim_end_matches('/').to_string(),
+        };
+        if use_auth {
+            let slug = self.org_slug.as_deref().unwrap();
+            (format!("{base}/v0/orgs/{slug}/patches/package"), true)
+        } else {
+            (format!("{base}/patch/package"), false)
         }
     }
 
@@ -840,20 +792,10 @@ impl ApiClient {
             // the authenticated endpoint defaults to false.
             free_only: free_only.then_some(true),
         };
-        // Authenticated when a token + org slug are configured and we're not
-        // pinned to the public proxy — mirrors `binary_url`'s decision so a
-        // bearer is never sent to the proxy.
-        let use_auth =
-            self.api_token.is_some() && self.org_slug.is_some() && !self.use_public_proxy;
-        let base = vendor_url
-            .unwrap_or(&self.api_url)
-            .trim_end_matches('/')
-            .to_string();
+        let (url, use_auth) = self.vendor_package_url(vendor_url);
+        debug_log(&format!("POST {url}"));
 
         let resp = if use_auth {
-            let slug = self.org_slug.as_deref().unwrap();
-            let url = format!("{base}/v0/orgs/{slug}/patches/package");
-            debug_log(&format!("POST {url}"));
             self.client
                 .post(&url)
                 .header(header::CONTENT_TYPE, "application/json")
@@ -861,8 +803,6 @@ impl ApiClient {
                 .send()
                 .await
         } else {
-            let url = format!("{base}/patch/package");
-            debug_log(&format!("POST {url}"));
             // Plain (no-auth) client: never leak the bearer to the proxy.
             plain_client()
                 .post(&url)
@@ -947,7 +887,7 @@ impl ApiClient {
     /// tarball download; the caller verifies the bytes against the artifact's
     /// integrity. A 404/410/408 surfaces as an error (a secondary the
     /// reference promised should be present).
-    pub async fn download_artifact(&self, url: &str) -> Result<Vec<u8>, ApiError> {
+    pub(crate) async fn download_artifact(&self, url: &str) -> Result<Vec<u8>, ApiError> {
         match self.download_vendor_archive(url).await {
             ServeDownload::Ok(bytes) => Ok(bytes),
             ServeDownload::NotFound => Err(ApiError::Other(format!("artifact not found: {url}"))),
@@ -970,16 +910,12 @@ const MAX_VENDOR_PACKAGE_BYTES: u64 = 256 * 1024 * 1024;
 /// here — callers must verify against `integrity_sri` (and, for golang, the
 /// `h1:` dirhash) before writing/extracting.
 #[derive(Debug, Clone)]
-pub struct FetchedVendorPackage {
+pub(crate) struct FetchedVendorPackage {
     pub tarball: Vec<u8>,
     /// Normalized Subresource-Integrity string, always `sha512-<b64>`.
     pub integrity_sri: String,
-    /// Hex sha1 of the archive, when the service reported one.
-    pub sha1_hex: Option<String>,
     /// golang module-zip dirhash (`h1:<b64>`), when present.
     pub dirhash_h1: Option<String>,
-    pub size_bytes: Option<u64>,
-    pub content_type: Option<String>,
     /// The (possibly host-rewritten) URL the bytes were fetched from.
     pub source_url: String,
     /// The OTHER served artifacts (e.g. the gem path-source stub gemspec),
@@ -991,7 +927,7 @@ pub struct FetchedVendorPackage {
 /// A non-tarball served artifact reference (e.g. `gem-stub-gemspec`): its kind,
 /// final download URL, and sha512 SRI. Bytes are fetched + verified on demand.
 #[derive(Debug, Clone)]
-pub struct SecondaryArtifact {
+pub(crate) struct SecondaryArtifact {
     pub kind: String,
     pub url: String,
     /// Normalized `sha512-<b64>` of the artifact bytes.
@@ -1004,7 +940,7 @@ pub struct SecondaryArtifact {
 /// `Ready` → use the service archive; `Pending`/`Unavailable`/`Failed` → fall
 /// back to a local build under `auto`, or hard-fail under `service`.
 #[derive(Debug)]
-pub enum VendorServiceOutcome {
+pub(crate) enum VendorServiceOutcome {
     /// Archive downloaded; integrity carried for the caller to verify.
     Ready(FetchedVendorPackage),
     /// The archive is still building (`pending_build` status or serve 408) —
@@ -1154,10 +1090,7 @@ pub async fn get_api_client_with_overrides(overrides: ApiClientEnvOverrides) -> 
         .filter(|s| !s.is_empty());
 
     if api_token.is_none() {
-        let proxy_url = overrides.proxy_url.unwrap_or_else(|| {
-            read_env_with_legacy("SOCKET_PROXY_URL", "SOCKET_PATCH_PROXY_URL")
-                .unwrap_or_else(|| DEFAULT_PATCH_API_PROXY_URL.to_string())
-        });
+        let proxy_url = overrides.proxy_url.unwrap_or_else(proxy_url_from_env);
         eprintln!("No SOCKET_API_TOKEN set. Using public patch API proxy (free patches only).");
         let client = ApiClient::new(ApiClientOptions {
             api_url: proxy_url,
@@ -1184,6 +1117,16 @@ pub async fn get_api_client_with_overrides(overrides: ApiClientEnvOverrides) -> 
     // Auto-resolve org slug if not provided
     let final_org_slug = if resolved_org_slug.is_some() {
         resolved_org_slug
+    } else if matches!(
+        std::env::var("SOCKET_OFFLINE").unwrap_or_default().as_str(),
+        "1" | "true"
+    ) {
+        // Strict airgap: `--offline` (mirrored into `SOCKET_OFFLINE` by the
+        // CLI before any client is built — same vocabulary the telemetry
+        // kill-switch matches) means zero network contact, so the org-slug
+        // auto-resolution round-trip must not fire. The slug only labels
+        // org-scoped fetches and telemetry, both already gated off offline.
+        None
     } else {
         let temp_client = ApiClient::new(ApiClientOptions {
             api_url: api_url.clone(),
@@ -1229,10 +1172,10 @@ pub async fn get_api_client_with_overrides(overrides: ApiClientEnvOverrides) -> 
 /// shouldn't block access to free patches. The auth header is
 /// deliberately dropped (`api_token: None`).
 pub fn build_proxy_fallback_client(overrides: &ApiClientEnvOverrides) -> ApiClient {
-    let proxy_url = overrides.proxy_url.clone().unwrap_or_else(|| {
-        read_env_with_legacy("SOCKET_PROXY_URL", "SOCKET_PATCH_PROXY_URL")
-            .unwrap_or_else(|| DEFAULT_PATCH_API_PROXY_URL.to_string())
-    });
+    let proxy_url = overrides
+        .proxy_url
+        .clone()
+        .unwrap_or_else(proxy_url_from_env);
     ApiClient::new(ApiClientOptions {
         api_url: proxy_url,
         api_token: None,
@@ -1247,7 +1190,7 @@ pub fn build_proxy_fallback_client(overrides: &ApiClientEnvOverrides) -> ApiClie
 /// gets configured with the storage representation by mistake (users
 /// copy what they see in the dashboard). Surfacing this as a hint
 /// short-circuits a confusing 401 round-trip.
-pub fn looks_like_token_hash(token: &str) -> bool {
+fn looks_like_token_hash(token: &str) -> bool {
     matches!(
         token.split_once('-'),
         Some(("sha256" | "sha384" | "sha512", _))
@@ -1269,7 +1212,7 @@ pub fn looks_like_token_hash(token: &str) -> bool {
 /// The returned message redacts the middle of the token (first 8 +
 /// last 4 chars) so a real token doesn't leak into stderr if a user
 /// pastes one with a wrong suffix.
-pub fn validate_token_shape(token: &str) -> Option<String> {
+fn validate_token_shape(token: &str) -> Option<String> {
     let has_prefix = token.starts_with("sktsec_");
     let has_suffix = token.ends_with("_api") || token.ends_with("_agent");
     // Measure in characters, not bytes: the preview/length reporting below
@@ -1378,7 +1321,7 @@ fn is_batch_unsupported(status: StatusCode, body: &str) -> bool {
 /// Returns an error when the list is empty, the sole slug when there is
 /// exactly one, and the first slug (with a warning) when there are several.
 ///
-/// `fetch_organizations` collects from a `HashMap`, so the upstream order is
+/// `resolve_org_slug` collects from a `HashMap`, so the upstream order is
 /// not stable across runs. We sort by slug first so the chosen org *and* the
 /// warning text are deterministic — otherwise a token with multiple orgs
 /// could silently operate against a different org on each invocation.
@@ -2301,6 +2244,89 @@ mod tests {
         );
     }
 
+    // ── vendor_package_url: package-reference POST target ───────────────
+    //
+    // Regression: an authenticated client *without* an org slug (auto-
+    // resolution failed, or `SOCKET_OFFLINE` skipped it) built the proxy
+    // route on its own `api_url` — `https://api.socket.dev/patch/package` —
+    // a path the auth host does not serve, so every vendor-service fetch
+    // failed with a 404-shaped `Other` error. `binary_url` re-derives the
+    // proxy base from the environment for exactly this client state; the
+    // vendor POST must do the same.
+
+    #[test]
+    fn vendor_package_url_auth_without_org_slug_targets_proxy_host() {
+        let client = ApiClient::new(ApiClientOptions {
+            api_url: "https://api.socket.dev".into(),
+            api_token: Some("sktsec_x_api".into()),
+            use_public_proxy: false,
+            org_slug: None,
+        });
+        let (url, use_auth) = client.vendor_package_url(None);
+        assert!(!use_auth, "no org slug → unauthenticated proxy request");
+        assert!(
+            !url.starts_with("https://api.socket.dev"),
+            "must not target the auth host (it has no /patch/* routes); got: {url}"
+        );
+        assert_eq!(
+            url,
+            format!(
+                "{}/patch/package",
+                proxy_url_from_env().trim_end_matches('/')
+            ),
+            "base must be the env-derived proxy host, like binary_url"
+        );
+    }
+
+    #[test]
+    fn vendor_package_url_proxy_client_uses_configured_api_url() {
+        // A public-proxy client's api_url IS the proxy — an explicit
+        // `--proxy-url` override must be honored, not re-read from env.
+        let client = proxy_client("https://custom.proxy.example");
+        let (url, use_auth) = client.vendor_package_url(None);
+        assert!(!use_auth);
+        assert_eq!(url, "https://custom.proxy.example/patch/package");
+    }
+
+    #[test]
+    fn vendor_package_url_authenticated_uses_org_path() {
+        let client = ApiClient::new(ApiClientOptions {
+            api_url: "https://api.socket.dev".into(),
+            api_token: Some("sktsec_x_api".into()),
+            use_public_proxy: false,
+            org_slug: Some("my-org".into()),
+        });
+        let (url, use_auth) = client.vendor_package_url(None);
+        assert!(use_auth);
+        assert_eq!(url, "https://api.socket.dev/v0/orgs/my-org/patches/package");
+    }
+
+    #[test]
+    fn vendor_package_url_vendor_url_overrides_base() {
+        // The staging override wins for every client state, including the
+        // no-org-slug fallback (it must not be clobbered by the env proxy).
+        let auth = ApiClient::new(ApiClientOptions {
+            api_url: "https://api.socket.dev".into(),
+            api_token: Some("sktsec_x_api".into()),
+            use_public_proxy: false,
+            org_slug: Some("my-org".into()),
+        });
+        assert_eq!(
+            auth.vendor_package_url(Some("http://localhost:9099/")).0,
+            "http://localhost:9099/v0/orgs/my-org/patches/package"
+        );
+        let no_org = ApiClient::new(ApiClientOptions {
+            api_url: "https://api.socket.dev".into(),
+            api_token: Some("sktsec_x_api".into()),
+            use_public_proxy: false,
+            org_slug: None,
+        });
+        assert_eq!(
+            no_org.vendor_package_url(Some("http://localhost:9099")).0,
+            "http://localhost:9099/patch/package"
+        );
+    }
+
     // ── select_org_slug: deterministic org selection ────────────────────
 
     fn org(slug: &str) -> crate::api::types::OrganizationInfo {
@@ -2567,7 +2593,6 @@ mod vendor_package_tests {
             VendorServiceOutcome::Ready(pkg) => {
                 assert_eq!(pkg.tarball, TARBALL);
                 assert_eq!(pkg.integrity_sri, "sha512-ABC123==");
-                assert_eq!(pkg.sha1_hex.as_deref(), Some("deadbeef"));
                 assert_eq!(pkg.source_url, serve_url);
             }
             other => panic!("expected Ready, got {other:?}"),

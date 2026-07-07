@@ -39,23 +39,23 @@ pub struct ScriptSetupStatus {
     pub needs_update: bool,
 }
 
+/// Read `scripts.<key>` as a string, treating absent or non-string as empty.
+fn read_script(package_json: &serde_json::Value, key: &str) -> String {
+    package_json
+        .get("scripts")
+        .and_then(|s| s.get(key))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
 /// Check if package.json scripts are properly configured for socket-patch.
 /// Checks both the postinstall and dependencies lifecycle scripts.
-pub fn is_setup_configured(package_json: &serde_json::Value) -> ScriptSetupStatus {
-    let scripts = package_json.get("scripts");
-
-    let postinstall_script = scripts
-        .and_then(|s| s.get("postinstall"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
+fn is_setup_configured(package_json: &serde_json::Value) -> ScriptSetupStatus {
+    let postinstall_script = read_script(package_json, "postinstall");
     let postinstall_configured = script_is_configured(&postinstall_script);
 
-    let dependencies_script = scripts
-        .and_then(|s| s.get("dependencies"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
+    let dependencies_script = read_script(package_json, "dependencies");
     let dependencies_configured = script_is_configured(&dependencies_script);
 
     ScriptSetupStatus {
@@ -68,10 +68,12 @@ pub fn is_setup_configured(package_json: &serde_json::Value) -> ScriptSetupStatu
 }
 
 /// Strip a leading UTF-8 BOM. npm and Node tolerate (and strip) a BOM in
-/// package.json — files saved by Windows editors commonly carry one — but
-/// serde_json rejects it, so every parse of user-supplied package.json content
-/// must go through this first or npm-valid manifests error out.
-fn strip_bom(content: &str) -> &str {
+/// package.json, and cargo accepts one in Cargo.toml — files saved by Windows
+/// editors commonly carry one — but serde_json (and vex's TOML line scanner)
+/// reject it, so every parse of user-supplied manifest content must go through
+/// this first or toolchain-valid manifests error out. Also used by
+/// `vex::product`.
+pub(crate) fn strip_bom(content: &str) -> &str {
     content.strip_prefix('\u{feff}').unwrap_or(content)
 }
 
@@ -91,7 +93,7 @@ pub fn is_setup_configured_str(content: &str) -> ScriptSetupStatus {
 
 /// Generate an updated script that includes the socket-patch apply command.
 /// If already configured, returns unchanged. Otherwise prepends the command.
-pub fn generate_updated_script(current_script: &str, pm: PackageManager) -> String {
+fn generate_updated_script(current_script: &str, pm: PackageManager) -> String {
     let command = socket_patch_command(pm);
     let trimmed = current_script.trim();
 
@@ -112,7 +114,7 @@ pub fn generate_updated_script(current_script: &str, pm: PackageManager) -> Stri
 /// Update a package.json Value with socket-patch in both postinstall and
 /// dependencies scripts.
 /// Returns (modified, new_postinstall, new_dependencies).
-pub fn update_package_json_object(
+fn update_package_json_object(
     package_json: &mut serde_json::Value,
     pm: PackageManager,
 ) -> (bool, String, String) {
@@ -175,7 +177,7 @@ pub fn update_package_json_object(
 /// - `(true, Some(rest))` — patch segment(s) removed, other commands survive.
 /// - `(true, None)` — the script was *only* socket-patch; the key should be
 ///   deleted entirely.
-pub fn remove_socket_patch_from_script(script: &str) -> (bool, Option<String>) {
+fn remove_socket_patch_from_script(script: &str) -> (bool, Option<String>) {
     let trimmed = script.trim();
     if trimmed.is_empty() {
         return (false, None);
@@ -211,7 +213,7 @@ pub fn remove_socket_patch_from_script(script: &str) -> (bool, Option<String>) {
 
 /// Status of a remove operation on a single package.json object.
 #[derive(Debug, Clone)]
-pub struct ScriptRemoveStatus {
+pub(crate) struct ScriptRemoveStatus {
     pub modified: bool,
     pub old_postinstall: String,
     pub new_postinstall: Option<String>,
@@ -225,25 +227,15 @@ pub struct ScriptRemoveStatus {
 /// `scripts` ends up empty the whole `scripts` key is dropped too — undoing
 /// exactly what [`update_package_json_object`] added. Returns a
 /// [`ScriptRemoveStatus`] describing what changed.
-pub fn remove_package_json_object(package_json: &mut serde_json::Value) -> ScriptRemoveStatus {
-    let read_script = |pj: &serde_json::Value, key: &str| -> String {
-        pj.get("scripts")
-            .and_then(|s| s.get(key))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string()
-    };
-
+fn remove_package_json_object(package_json: &mut serde_json::Value) -> ScriptRemoveStatus {
     let old_postinstall = read_script(package_json, "postinstall");
     let old_dependencies = read_script(package_json, "dependencies");
 
+    // `remove_socket_patch_from_script` reports `changed` only when a
+    // socket-patch segment was actually present and removed.
     let (pi_changed, new_postinstall) = remove_socket_patch_from_script(&old_postinstall);
     let (dep_changed, new_dependencies) = remove_socket_patch_from_script(&old_dependencies);
-
-    // Only treat as modified when a socket-patch segment was actually present.
-    let pi_had_patch = pi_changed && script_is_configured(&old_postinstall);
-    let dep_had_patch = dep_changed && script_is_configured(&old_dependencies);
-    let modified = pi_had_patch || dep_had_patch;
+    let modified = pi_changed || dep_changed;
 
     if !modified {
         return ScriptRemoveStatus {
@@ -262,7 +254,7 @@ pub fn remove_package_json_object(package_json: &mut serde_json::Value) -> Scrip
         .get_mut("scripts")
         .and_then(|s| s.as_object_mut())
     {
-        if pi_had_patch {
+        if pi_changed {
             match &new_postinstall {
                 Some(s) => {
                     scripts.insert(
@@ -275,7 +267,7 @@ pub fn remove_package_json_object(package_json: &mut serde_json::Value) -> Scrip
                 }
             }
         }
-        if dep_had_patch {
+        if dep_changed {
             match &new_dependencies {
                 Some(s) => {
                     scripts.insert(
@@ -308,7 +300,7 @@ pub fn remove_package_json_object(package_json: &mut serde_json::Value) -> Scrip
 
 /// Parse package.json content and remove socket-patch lifecycle scripts.
 /// Returns `(modified, new_content, status)`.
-pub fn remove_package_json_content(
+pub(crate) fn remove_package_json_content(
     content: &str,
 ) -> Result<(bool, String, ScriptRemoveStatus), String> {
     let mut package_json: serde_json::Value = serde_json::from_str(strip_bom(content))
@@ -338,7 +330,7 @@ pub fn remove_package_json_content(
 /// Parse package.json content and update it with socket-patch scripts.
 /// Returns (modified, new_content, old_postinstall, new_postinstall,
 /// old_dependencies, new_dependencies).
-pub fn update_package_json_content(
+pub(crate) fn update_package_json_content(
     content: &str,
     pm: PackageManager,
 ) -> Result<(bool, String, String, String, String, String), String> {

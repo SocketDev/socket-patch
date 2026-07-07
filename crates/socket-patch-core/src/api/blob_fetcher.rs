@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::api::client::ApiClient;
 use crate::manifest::operations::get_after_hash_blobs;
@@ -116,9 +116,10 @@ pub async fn fetch_missing_blobs(
 
     // Ensure blobs directory exists
     if let Err(e) = tokio::fs::create_dir_all(blobs_path).await {
-        return all_failed_result(missing.iter(), |h| {
-            (h.clone(), format!("Cannot create blobs directory: {}", e))
-        });
+        return all_failed_result(
+            missing.iter(),
+            &format!("Cannot create blobs directory: {}", e),
+        );
     }
 
     let hashes: Vec<String> = missing.into_iter().collect();
@@ -128,20 +129,16 @@ pub async fn fetch_missing_blobs(
 /// Build a [`FetchMissingBlobsResult`] whose entries are all failures
 /// for the same reason. Used by the early-return branches that hit a
 /// blocker (e.g. cannot create blobs dir) before any download attempt.
-fn all_failed_result<'a, I, F>(items: I, mut into_pair: F) -> FetchMissingBlobsResult
-where
-    I: IntoIterator<Item = &'a String>,
-    F: FnMut(&'a String) -> (String, String),
-{
+fn all_failed_result<'a>(
+    items: impl IntoIterator<Item = &'a String>,
+    error: &str,
+) -> FetchMissingBlobsResult {
     let results: Vec<BlobFetchResult> = items
         .into_iter()
-        .map(|item| {
-            let (hash, error) = into_pair(item);
-            BlobFetchResult {
-                hash,
-                success: false,
-                error: Some(error),
-            }
+        .map(|hash| BlobFetchResult {
+            hash: hash.clone(),
+            success: false,
+            error: Some(error.to_string()),
         })
         .collect();
     let failed = results.len();
@@ -171,9 +168,10 @@ pub async fn fetch_blobs_by_hash(
 
     // Ensure blobs directory exists
     if let Err(e) = tokio::fs::create_dir_all(blobs_path).await {
-        return all_failed_result(hashes.iter(), |h| {
-            (h.clone(), format!("Cannot create blobs directory: {}", e))
-        });
+        return all_failed_result(
+            hashes.iter(),
+            &format!("Cannot create blobs directory: {}", e),
+        );
     }
 
     // Filter out hashes that already exist on disk
@@ -206,17 +204,14 @@ pub async fn fetch_blobs_by_hash(
     }
 
     let download_result = download_hashes(&to_download, blobs_path, client, on_progress).await;
+    results.extend(download_result.results);
 
     FetchMissingBlobsResult {
         total: hashes.len(),
         downloaded: download_result.downloaded,
         failed: download_result.failed,
         skipped,
-        results: {
-            let mut combined = results;
-            combined.extend(download_result.results);
-            combined
-        },
+        results,
     }
 }
 
@@ -257,30 +252,16 @@ pub async fn fetch_missing_sources(
     client: &ApiClient,
     on_progress: Option<&OnProgress>,
 ) -> FetchMissingBlobsResult {
-    match mode {
+    let (dir, kind) = match mode {
         DownloadMode::File => {
-            fetch_missing_blobs(manifest, sources.blobs_path, client, on_progress).await
+            return fetch_missing_blobs(manifest, sources.blobs_path, client, on_progress).await
         }
-        DownloadMode::Diff => match sources.diffs_path {
-            Some(dir) => {
-                fetch_missing_archives_inner(manifest, dir, ArchiveKind::Diff, client, on_progress)
-                    .await
-            }
-            None => FetchMissingBlobsResult::default(),
-        },
-        DownloadMode::Package => match sources.packages_path {
-            Some(dir) => {
-                fetch_missing_archives_inner(
-                    manifest,
-                    dir,
-                    ArchiveKind::Package,
-                    client,
-                    on_progress,
-                )
-                .await
-            }
-            None => FetchMissingBlobsResult::default(),
-        },
+        DownloadMode::Diff => (sources.diffs_path, ArchiveKind::Diff),
+        DownloadMode::Package => (sources.packages_path, ArchiveKind::Package),
+    };
+    match dir {
+        Some(dir) => fetch_missing_archives_inner(manifest, dir, kind, client, on_progress).await,
+        None => FetchMissingBlobsResult::default(),
     }
 }
 
@@ -303,12 +284,10 @@ async fn fetch_missing_archives_inner(
     }
 
     if let Err(e) = tokio::fs::create_dir_all(archives_dir).await {
-        return all_failed_result(missing.iter(), |u| {
-            (
-                u.clone(),
-                format!("Cannot create archives directory: {}", e),
-            )
-        });
+        return all_failed_result(
+            missing.iter(),
+            &format!("Cannot create archives directory: {}", e),
+        );
     }
 
     let uuids: Vec<String> = missing.into_iter().collect();
@@ -329,7 +308,7 @@ async fn fetch_missing_archives_inner(
 
         match fetch_result {
             Ok(Some(data)) => {
-                let archive_path: PathBuf = archives_dir.join(format!("{}.tar.gz", uuid));
+                let archive_path = archives_dir.join(format!("{}.tar.gz", uuid));
                 match write_cache_entry_atomic(&archive_path, &data).await {
                     Ok(()) => {
                         results.push(BlobFetchResult {
@@ -447,6 +426,12 @@ pub fn format_fetch_result(result: &FetchMissingBlobsResult) -> String {
 /// makes the final path always either the complete bytes or absent, never a
 /// torn intermediate, matching the stage+rename discipline used by the
 /// patch-apply and copy-on-write write paths.
+///
+/// Deliberately LIGHTER than [`crate::utils::fs::atomic_write_bytes`] (no
+/// file fsync, no dir fsync, `.socket-dl-` prefix): these are re-downloadable
+/// content-addressed cache entries, not user-owned files — post-crash loss
+/// of a cache entry is harmless, so the extra durability isn't worth the
+/// I/O. Do not "consolidate" this into the hardened writer.
 async fn write_cache_entry_atomic(dest: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let parent = dest.parent().ok_or_else(|| {
         std::io::Error::new(
@@ -460,7 +445,7 @@ async fn write_cache_entry_atomic(dest: &Path, bytes: &[u8]) -> std::io::Result<
         .unwrap_or_else(|| "blob".to_string());
     // Leading dot keeps the stage out of editor/glob views; the uuid suffix
     // keeps concurrent writers of the same entry from colliding.
-    let stage: PathBuf = parent.join(format!(".socket-dl-{}-{}", stem, uuid::Uuid::new_v4()));
+    let stage = parent.join(format!(".socket-dl-{}-{}", stem, uuid::Uuid::new_v4()));
 
     if let Err(e) = tokio::fs::write(&stage, bytes).await {
         // A partial stage would otherwise leak as a `.socket-dl-*` turd.
@@ -524,7 +509,7 @@ async fn download_hashes(
                     continue;
                 }
 
-                let blob_path: PathBuf = blobs_path.join(hash);
+                let blob_path = blobs_path.join(hash);
                 match write_cache_entry_atomic(&blob_path, &data).await {
                     Ok(()) => {
                         results.push(BlobFetchResult {

@@ -3,8 +3,10 @@ use std::collections::HashMap;
 use once_cell::sync::Lazy;
 use uuid::Uuid;
 
-use crate::constants::{DEFAULT_PATCH_API_PROXY_URL, DEFAULT_SOCKET_API_URL, USER_AGENT};
-use crate::utils::env_compat::read_env_with_legacy;
+use crate::constants::{DEFAULT_SOCKET_API_URL, USER_AGENT};
+use crate::utils::env_compat::{is_debug_enabled, proxy_url_from_env, read_env_with_legacy};
+use crate::utils::fs::home_dir;
+use crate::vex::time::unix_to_ymdhms;
 
 // ---------------------------------------------------------------------------
 // Session ID — generated once per process invocation
@@ -26,7 +28,7 @@ const PACKAGE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Telemetry event types for the patch lifecycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PatchTelemetryEventType {
+enum PatchTelemetryEventType {
     // Write-side: apply / remove / rollback
     PatchApplied,
     PatchApplyFailed,
@@ -56,7 +58,7 @@ pub enum PatchTelemetryEventType {
 
 impl PatchTelemetryEventType {
     /// Return the wire-format string for this event type.
-    pub fn as_str(&self) -> &'static str {
+    fn as_str(&self) -> &'static str {
         match self {
             Self::PatchApplied => "patch_applied",
             Self::PatchApplyFailed => "patch_apply_failed",
@@ -84,49 +86,32 @@ impl PatchTelemetryEventType {
 
 /// Telemetry context describing the execution environment.
 #[derive(Debug, Clone, serde::Serialize)]
-pub struct PatchTelemetryContext {
-    pub version: String,
-    pub platform: String,
-    pub arch: String,
-    pub command: String,
+struct PatchTelemetryContext {
+    version: String,
+    platform: String,
+    arch: String,
+    command: String,
 }
 
 /// Error details for telemetry events.
 #[derive(Debug, Clone, serde::Serialize)]
-pub struct PatchTelemetryError {
+struct PatchTelemetryError {
     #[serde(rename = "type")]
-    pub error_type: String,
-    pub message: Option<String>,
+    error_type: String,
+    message: Option<String>,
 }
 
 /// Telemetry event structure for patch operations.
 #[derive(Debug, Clone, serde::Serialize)]
-pub struct PatchTelemetryEvent {
-    pub event_sender_created_at: String,
-    pub event_type: String,
-    pub context: PatchTelemetryContext,
-    pub session_id: String,
+struct PatchTelemetryEvent {
+    event_sender_created_at: String,
+    event_type: String,
+    context: PatchTelemetryContext,
+    session_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub metadata: Option<HashMap<String, serde_json::Value>>,
+    metadata: Option<HashMap<String, serde_json::Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<PatchTelemetryError>,
-}
-
-/// Options for tracking a patch event.
-pub struct TrackPatchEventOptions {
-    /// The type of event being tracked.
-    pub event_type: PatchTelemetryEventType,
-    /// The CLI command being executed (e.g., "apply", "remove", "rollback").
-    pub command: String,
-    /// Optional metadata to include with the event.
-    pub metadata: Option<HashMap<String, serde_json::Value>>,
-    /// Optional error information if the operation failed.
-    /// Tuple of (error_type, message).
-    pub error: Option<(String, String)>,
-    /// Optional API token for authenticated telemetry endpoint.
-    pub api_token: Option<String>,
-    /// Optional organization slug for authenticated telemetry endpoint.
-    pub org_slug: Option<String>,
+    error: Option<PatchTelemetryError>,
 }
 
 // ---------------------------------------------------------------------------
@@ -161,17 +146,6 @@ pub fn is_telemetry_disabled() -> bool {
     disabled_via_env || vitest || offline
 }
 
-/// Check if debug mode is enabled. Reads `SOCKET_DEBUG` (with legacy
-/// `SOCKET_PATCH_DEBUG` shim).
-fn is_debug_enabled() -> bool {
-    matches!(
-        read_env_with_legacy("SOCKET_DEBUG", "SOCKET_PATCH_DEBUG")
-            .unwrap_or_default()
-            .as_str(),
-        "1" | "true"
-    )
-}
-
 /// Log debug messages when debug mode is enabled.
 fn debug_log(message: &str) {
     if is_debug_enabled() {
@@ -198,75 +172,55 @@ fn build_telemetry_context(command: &str) -> PatchTelemetryContext {
 /// Replaces the user's home directory path with `~` to avoid leaking
 /// sensitive file system information.
 pub fn sanitize_error_message(message: &str) -> String {
-    if let Some(home) = home_dir_string() {
-        if !home.is_empty() {
-            return message.replace(&home, "~");
-        }
+    let home = home_dir();
+    let home = home.to_string_lossy();
+    // `home_dir()` falls back to a literal `"~"` when no home is set, and
+    // replacing `"~"` with `"~"` is a no-op. A set-but-empty HOME must be
+    // skipped explicitly — replacing `""` would splice `~` between every byte.
+    // Trailing separators are trimmed so a `HOME=/home/user/` redaction keeps
+    // the separator (`~/.cache`, not `~.cache`); a home that trims to nothing
+    // (`HOME=/`, common for unmapped-UID containers) is a filesystem root with
+    // no user-identifying prefix to redact — replacing it would splice `~`
+    // between every path segment in the message.
+    let home = home.trim_end_matches(['/', '\\']);
+    if home.is_empty() {
+        return message.to_string();
     }
-    message.to_string()
+    message.replace(home, "~")
 }
 
-/// Get the home directory as a string.
-fn home_dir_string() -> Option<String> {
-    std::env::var("HOME")
-        .ok()
-        .or_else(|| std::env::var("USERPROFILE").ok())
-}
-
-/// Build a telemetry event from the given options.
-fn build_telemetry_event(options: &TrackPatchEventOptions) -> PatchTelemetryEvent {
-    let error = options
-        .error
-        .as_ref()
-        .map(|(error_type, message)| PatchTelemetryError {
-            error_type: error_type.clone(),
-            message: Some(sanitize_error_message(message)),
-        });
-
+/// Build a telemetry event. `error` is an `(error_type, message)` pair; the
+/// message is home-dir-sanitized before it leaves the process.
+fn build_telemetry_event(
+    event_type: PatchTelemetryEventType,
+    command: &str,
+    metadata: Option<HashMap<String, serde_json::Value>>,
+    error: Option<(String, String)>,
+) -> PatchTelemetryEvent {
     PatchTelemetryEvent {
         event_sender_created_at: chrono_now_iso(),
-        event_type: options.event_type.as_str().to_string(),
-        context: build_telemetry_context(&options.command),
+        event_type: event_type.as_str().to_string(),
+        context: build_telemetry_context(command),
         session_id: SESSION_ID.clone(),
-        metadata: options.metadata.clone(),
-        error,
+        metadata,
+        error: error.map(|(error_type, message)| PatchTelemetryError {
+            error_type,
+            message: Some(sanitize_error_message(&message)),
+        }),
     }
 }
 
-/// Get the current time as an ISO 8601 string.
+/// Get the current time as an ISO 8601 string with millisecond precision,
+/// e.g. `2024-01-15T10:30:45.123Z`. The civil-date arithmetic is shared with
+/// `vex::time` (`unix_to_ymdhms`); only the `.mmm` suffix differs from the
+/// RFC 3339 string vex emits.
 fn chrono_now_iso() -> String {
-    let now = std::time::SystemTime::now();
-    let duration = now
+    let duration = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
-    let secs = duration.as_secs();
-
-    let days = secs / 86400;
-    let remaining = secs % 86400;
-    let hours = remaining / 3600;
-    let minutes = (remaining % 3600) / 60;
-    let seconds = remaining % 60;
+    let (year, month, day, hours, minutes, seconds) = unix_to_ymdhms(duration.as_secs());
     let millis = duration.subsec_millis();
-
-    let (year, month, day) = days_to_ymd(days);
-
     format!("{year:04}-{month:02}-{day:02}T{hours:02}:{minutes:02}:{seconds:02}.{millis:03}Z")
-}
-
-/// Convert days since Unix epoch to (year, month, day).
-fn days_to_ymd(days: u64) -> (u64, u64, u64) {
-    // Adapted from Howard Hinnant's civil_from_days algorithm
-    let z = days as i64 + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = (z - era * 146097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    (y as u64, m, d)
 }
 
 // ---------------------------------------------------------------------------
@@ -299,9 +253,7 @@ fn resolve_telemetry_endpoint(api_token: Option<&str>, org_slug: Option<&str>) -
             (format!("{api_url}/v0/orgs/{slug}/telemetry"), true)
         }
         _ => {
-            let proxy_url = read_env_with_legacy("SOCKET_PROXY_URL", "SOCKET_PATCH_PROXY_URL")
-                .filter(|u| !u.is_empty())
-                .unwrap_or_else(|| DEFAULT_PATCH_API_PROXY_URL.to_string());
+            let proxy_url = proxy_url_from_env();
             let proxy_url = proxy_url.trim_end_matches('/');
             (format!("{proxy_url}/patch/telemetry"), false)
         }
@@ -359,57 +311,19 @@ async fn send_telemetry_event(
 }
 
 // ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
-
-/// Track a patch lifecycle event.
-///
-/// This function is non-blocking and will never return errors. Telemetry
-/// failures are logged in debug mode but do not affect CLI operation.
-///
-/// If telemetry is disabled (via environment variables), the function returns
-/// immediately.
-pub async fn track_patch_event(options: TrackPatchEventOptions) {
-    if is_telemetry_disabled() {
-        debug_log("Telemetry is disabled, skipping event");
-        return;
-    }
-
-    let event = build_telemetry_event(&options);
-    send_telemetry_event(
-        &event,
-        options.api_token.as_deref(),
-        options.org_slug.as_deref(),
-    )
-    .await;
-}
-
-// ---------------------------------------------------------------------------
-// Convenience functions
+// Per-event tracker wrappers (the public API)
 //
 // These accept `Option<&str>` for api_token/org_slug to make call sites
 // convenient (callers typically have `Option<String>` and call `.as_deref()`).
 // ---------------------------------------------------------------------------
 
-/// Convert a `serde_json::json!({...})` object into the `HashMap` that
-/// [`TrackPatchEventOptions::metadata`] expects, swallowing the conversion
-/// to avoid `.unwrap()` noise at every call site.
-fn metadata_from_json(value: serde_json::Value) -> Option<HashMap<String, serde_json::Value>> {
-    match value {
-        serde_json::Value::Object(map) => {
-            if map.is_empty() {
-                None
-            } else {
-                Some(map.into_iter().collect())
-            }
-        }
-        _ => None,
-    }
-}
-
 /// Shared fire-and-forget helper for the per-event tracker wrappers below.
-/// Centralizes the `String::from` plumbing for the four optional fields
-/// that every tracker shares.
+///
+/// Non-blocking and never returns errors: telemetry failures are logged in
+/// debug mode but do not affect CLI operation. Returns immediately when
+/// telemetry is disabled via environment variables. `metadata` is a
+/// `serde_json::json!({...})` object; non-object / empty values are dropped
+/// to avoid `.unwrap()` noise at every call site.
 async fn fire(
     event_type: PatchTelemetryEventType,
     command: &'static str,
@@ -418,15 +332,18 @@ async fn fire(
     api_token: Option<&str>,
     org_slug: Option<&str>,
 ) {
-    track_patch_event(TrackPatchEventOptions {
-        event_type,
-        command: command.to_string(),
-        metadata: metadata_from_json(metadata),
-        error: error.map(|e| ("Error".to_string(), e.to_string())),
-        api_token: api_token.map(String::from),
-        org_slug: org_slug.map(String::from),
-    })
-    .await;
+    if is_telemetry_disabled() {
+        debug_log("Telemetry is disabled, skipping event");
+        return;
+    }
+
+    let metadata = match metadata {
+        serde_json::Value::Object(map) if !map.is_empty() => Some(map.into_iter().collect()),
+        _ => None,
+    };
+    let error = error.map(|e| ("Error".to_string(), e.to_string()));
+    let event = build_telemetry_event(event_type, command, metadata, error);
+    send_telemetry_event(&event, api_token, org_slug).await;
 }
 
 /// Track a successful patch application.
@@ -583,8 +500,7 @@ pub async fn track_patch_rollback_failed(
 /// The argument count intentionally mirrors the metadata fields the
 /// dashboard needs — grouping them into a struct would force callers
 /// to build a config object for a single fire-and-forget call, which
-/// is worse ergonomics for a tracker. `track_patch_event` is the
-/// general path when you need that flexibility.
+/// is worse ergonomics for a tracker.
 #[allow(clippy::too_many_arguments)]
 pub async fn track_patch_scanned(
     packages_scanned: usize,
@@ -913,7 +829,9 @@ mod tests {
 
     #[test]
     fn test_sanitize_error_message() {
-        let home = home_dir_string().unwrap_or_else(|| "/home/testuser".to_string());
+        let home = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .unwrap_or_else(|_| "/home/testuser".to_string());
         let msg = format!("Failed to read {home}/projects/secret/file.txt");
         let sanitized = sanitize_error_message(&msg);
         assert!(sanitized.contains("~/projects/secret/file.txt"));
@@ -1031,16 +949,8 @@ mod tests {
 
     #[test]
     fn test_build_telemetry_event_basic() {
-        let options = TrackPatchEventOptions {
-            event_type: PatchTelemetryEventType::PatchApplied,
-            command: "apply".to_string(),
-            metadata: None,
-            error: None,
-            api_token: None,
-            org_slug: None,
-        };
-
-        let event = build_telemetry_event(&options);
+        let event =
+            build_telemetry_event(PatchTelemetryEventType::PatchApplied, "apply", None, None);
         assert_eq!(event.event_type, "patch_applied");
         assert_eq!(event.context.command, "apply");
         assert!(!event.session_id.is_empty());
@@ -1057,16 +967,12 @@ mod tests {
             serde_json::Value::Number(5.into()),
         );
 
-        let options = TrackPatchEventOptions {
-            event_type: PatchTelemetryEventType::PatchApplied,
-            command: "apply".to_string(),
-            metadata: Some(metadata),
-            error: None,
-            api_token: None,
-            org_slug: None,
-        };
-
-        let event = build_telemetry_event(&options);
+        let event = build_telemetry_event(
+            PatchTelemetryEventType::PatchApplied,
+            "apply",
+            Some(metadata),
+            None,
+        );
         assert!(event.metadata.is_some());
         let meta = event.metadata.unwrap();
         assert_eq!(
@@ -1077,16 +983,12 @@ mod tests {
 
     #[test]
     fn test_build_telemetry_event_with_error() {
-        let options = TrackPatchEventOptions {
-            event_type: PatchTelemetryEventType::PatchApplyFailed,
-            command: "apply".to_string(),
-            metadata: None,
-            error: Some(("IoError".to_string(), "file not found".to_string())),
-            api_token: None,
-            org_slug: None,
-        };
-
-        let event = build_telemetry_event(&options);
+        let event = build_telemetry_event(
+            PatchTelemetryEventType::PatchApplyFailed,
+            "apply",
+            None,
+            Some(("IoError".to_string(), "file not found".to_string())),
+        );
         assert!(event.error.is_some());
         let err = event.error.unwrap();
         assert_eq!(err.error_type, "IoError");
@@ -1112,93 +1014,6 @@ mod tests {
         assert!(ts.contains('-'));
         assert!(ts.contains(':'));
         assert_eq!(ts.len(), 24); // YYYY-MM-DDTHH:MM:SS.mmmZ
-    }
-
-    #[test]
-    fn test_days_to_ymd_epoch() {
-        let (y, m, d) = days_to_ymd(0);
-        assert_eq!((y, m, d), (1970, 1, 1));
-    }
-
-    #[test]
-    fn test_days_to_ymd_known_date() {
-        // 2024-01-01 is day 19723
-        let (y, m, d) = days_to_ymd(19723);
-        assert_eq!((y, m, d), (2024, 1, 1));
-    }
-
-    /// Independent brute-force civil-date counter used to cross-check
-    /// `days_to_ymd` (Howard Hinnant's algorithm) without sharing any of its
-    /// arithmetic — so a regression in either is caught.
-    fn brute_days_to_ymd(days: u64) -> (u64, u64, u64) {
-        fn is_leap(y: u64) -> bool {
-            (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400)
-        }
-        let mut rem = days;
-        let mut y = 1970u64;
-        loop {
-            let year_len = if is_leap(y) { 366 } else { 365 };
-            if rem < year_len {
-                break;
-            }
-            rem -= year_len;
-            y += 1;
-        }
-        let months = [
-            31,
-            if is_leap(y) { 29 } else { 28 },
-            31,
-            30,
-            31,
-            30,
-            31,
-            31,
-            30,
-            31,
-            30,
-            31,
-        ];
-        let mut m = 0usize;
-        while rem >= months[m] {
-            rem -= months[m];
-            m += 1;
-        }
-        (y, (m + 1) as u64, rem + 1)
-    }
-
-    /// Spot-check the trickiest civil-date edges: leap day, the day after,
-    /// non-leap century boundaries (1900/2100/2200/2300 — divisible by 100 but
-    /// not 400, so NOT leap) and leap centuries (2000/2400), plus year/month
-    /// rollovers. Each is computed by hand to anchor the value.
-    #[test]
-    fn test_days_to_ymd_edge_dates() {
-        // 2000-02-29 (leap century) and the day after.
-        assert_eq!(brute_days_to_ymd(11016), (2000, 2, 29)); // anchor the oracle
-        assert_eq!(days_to_ymd(11016), (2000, 2, 29));
-        assert_eq!(days_to_ymd(11017), (2000, 3, 1));
-
-        // 2100-02-28 must NOT be followed by Feb 29 — 2100 is not a leap year.
-        let feb28_2100 = brute_days_to_ymd(47540);
-        assert_eq!(feb28_2100, (2100, 2, 28));
-        assert_eq!(days_to_ymd(47540), (2100, 2, 28));
-        assert_eq!(days_to_ymd(47541), (2100, 3, 1));
-
-        // Year/month rollover: Dec 31 -> Jan 1.
-        assert_eq!(days_to_ymd(19722), (2023, 12, 31));
-        assert_eq!(days_to_ymd(19723), (2024, 1, 1));
-    }
-
-    /// Exhaustive cross-check against the independent counter across ~1265
-    /// years, covering every leap rule and century boundary through 3235.
-    #[test]
-    fn test_days_to_ymd_matches_brute_force() {
-        for days in 0..462_000u64 {
-            assert_eq!(
-                days_to_ymd(days),
-                brute_days_to_ymd(days),
-                "mismatch at day {days}"
-            );
-        }
     }
 
     /// The time-of-day split in `chrono_now_iso` must carve a within-day

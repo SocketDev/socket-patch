@@ -42,6 +42,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use super::types::{CrawledPackage, CrawlerOptions};
+use crate::patch::path_safety;
+use crate::utils::fs::{home_dir, is_dir};
 
 /// Deno (JSR) ecosystem crawler.
 pub struct DenoCrawler;
@@ -54,8 +56,8 @@ impl DenoCrawler {
 
     /// Get the JSR cache root paths to scan.
     ///
-    /// In global mode (or with `--global-prefix`), returns
-    /// `$DENO_DIR/npm/jsr.io/` directly.
+    /// With `--global-prefix`, returns the prefix directly; otherwise
+    /// resolves `$DENO_DIR/npm/jsr.io/`.
     ///
     /// In local mode, only returns paths when the cwd looks like a
     /// Deno project (`deno.json`, `deno.jsonc`, or `deno.lock`
@@ -64,21 +66,12 @@ impl DenoCrawler {
         &self,
         options: &CrawlerOptions,
     ) -> Result<Vec<PathBuf>, std::io::Error> {
-        if options.global || options.global_prefix.is_some() {
-            if let Some(ref custom) = options.global_prefix {
-                return Ok(vec![custom.clone()]);
-            }
-            let cache = deno_dir().join("npm").join("jsr.io");
-            if is_dir(&cache).await {
-                return Ok(vec![cache]);
-            }
+        if let Some(ref custom) = options.global_prefix {
+            return Ok(vec![custom.clone()]);
+        }
+        if !options.global && !is_deno_project(&options.cwd).await {
             return Ok(Vec::new());
         }
-
-        if !is_deno_project(&options.cwd).await {
-            return Ok(Vec::new());
-        }
-
         let cache = deno_dir().join("npm").join("jsr.io");
         if is_dir(&cache).await {
             Ok(vec![cache])
@@ -205,16 +198,14 @@ async fn scan_jsr_cache(root: &Path, seen: &mut HashSet<String>, out: &mut Vec<C
 /// Whether a PURL-derived path component is safe to join onto the JSR cache
 /// root. A JSR scope (`@std`), package name (`path`), and version (`0.220.0`)
 /// are each a single path segment, so a real one never contains a separator,
-/// a `.`/`..` segment, a backslash, or a NUL. Rejecting those fail-closed
-/// blocks a tampered manifest PURL from traversing out of the cache via
-/// `find_by_purls` (which does no content verification and patches in place).
+/// a `.`/`..` segment, a backslash, a colon, or a NUL. Rejecting those
+/// fail-closed blocks a tampered manifest PURL from traversing out of the
+/// cache via `find_by_purls` (which does no content verification and patches
+/// in place). Delegates to [`path_safety::is_safe_single_segment`], which
+/// also rejects `:` — a Windows drive-relative component (`C:evil`) joins as
+/// an absolute path.
 fn is_safe_jsr_component(component: &str) -> bool {
-    !component.is_empty()
-        && component != "."
-        && component != ".."
-        && !component.contains('/')
-        && !component.contains('\\')
-        && !component.contains('\0')
+    path_safety::is_safe_single_segment(component)
 }
 
 /// Returns true if `cwd` looks like a Deno project.
@@ -281,23 +272,6 @@ fn default_cache_root() -> PathBuf {
     home_dir().join(".cache")
 }
 
-/// Resolve the user's home directory, mirroring the `HOME` ->
-/// `USERPROFILE` -> `~` fallback chain used by the other crawlers.
-fn home_dir() -> PathBuf {
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_else(|_| "~".to_string());
-    PathBuf::from(home)
-}
-
-/// Check whether a path is a directory.
-async fn is_dir(path: &Path) -> bool {
-    tokio::fs::metadata(path)
-        .await
-        .map(|m| m.is_dir())
-        .unwrap_or(false)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -357,7 +331,6 @@ mod tests {
             cwd: tmp.path().to_path_buf(),
             global: true,
             global_prefix: Some(cache),
-            batch_size: 100,
         };
         assert!(crawler.crawl_all(&opts).await.is_empty());
     }
@@ -523,9 +496,20 @@ mod tests {
             cwd: project.path().to_path_buf(), // no deno.json/.jsonc/.lock
             global: false,
             global_prefix: None,
-            batch_size: 100,
         };
         assert!(crawler.crawl_all(&opts).await.is_empty());
+    }
+
+    /// Unit contract for the coordinate gate: real scope/name/version
+    /// components pass; a `:` is rejected because a Windows drive-relative
+    /// component (`C:evil`) joins as an absolute path under `Path::join`.
+    #[test]
+    fn is_safe_jsr_component_rejects_colon() {
+        assert!(is_safe_jsr_component("@std"));
+        assert!(is_safe_jsr_component("path"));
+        assert!(is_safe_jsr_component("0.220.0"));
+        assert!(!is_safe_jsr_component("C:evil"));
+        assert!(!is_safe_jsr_component("c:"));
     }
 
     #[tokio::test]

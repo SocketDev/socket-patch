@@ -12,7 +12,7 @@ use crate::utils::process::{CommandRunner, SystemCommandRunner};
 ///
 /// Tries `python3`, `python`, and `py` (Windows launcher) in order,
 /// returning the first one that responds to `--version`.
-pub fn find_python_command() -> Option<&'static str> {
+fn find_python_command() -> Option<&'static str> {
     find_python_command_with(&SystemCommandRunner)
 }
 
@@ -26,9 +26,6 @@ pub fn find_python_command_with(runner: &dyn CommandRunner) -> Option<&'static s
         .find(|cmd| runner.run(cmd, &["--version"]).is_some())
 }
 
-/// Default batch size for crawling.
-const _DEFAULT_BATCH_SIZE: usize = 100;
-
 // ---------------------------------------------------------------------------
 // PEP 503 name canonicalization
 // ---------------------------------------------------------------------------
@@ -36,7 +33,7 @@ const _DEFAULT_BATCH_SIZE: usize = 100;
 /// Canonicalize a Python package name per PEP 503.
 ///
 /// Lowercases, trims, and replaces runs of `[-_.]` with a single `-`.
-pub fn canonicalize_pypi_name(name: &str) -> String {
+pub(crate) fn canonicalize_pypi_name(name: &str) -> String {
     let trimmed = name.trim().to_lowercase();
     let mut result = String::with_capacity(trimmed.len());
     let mut in_separator_run = false;
@@ -216,7 +213,7 @@ pub async fn find_python_dirs(base_path: &Path, segments: &[&str]) -> Vec<PathBu
 /// Find `site-packages` (or `dist-packages`) directories under a base dir.
 ///
 /// Handles both Unix (`lib/python3.X/site-packages`) and macOS/Linux layouts.
-pub async fn find_site_packages_under(
+async fn find_site_packages_under(
     base_dir: &Path,
     sub_dir_type: &str, // "site-packages" or "dist-packages"
 ) -> Vec<PathBuf> {
@@ -267,7 +264,7 @@ pub async fn get_global_python_site_packages() -> Vec<PathBuf> {
     let mut results = Vec::new();
     let mut seen = HashSet::new();
 
-    let add_path = |p: PathBuf, seen: &mut HashSet<PathBuf>, results: &mut Vec<PathBuf>| {
+    fn add_path(p: PathBuf, seen: &mut HashSet<PathBuf>, results: &mut Vec<PathBuf>) {
         let resolved = if p.is_absolute() {
             p
         } else {
@@ -276,7 +273,7 @@ pub async fn get_global_python_site_packages() -> Vec<PathBuf> {
         if seen.insert(resolved.clone()) {
             results.push(resolved);
         }
-    };
+    }
 
     // 1. Ask Python for site-packages
     if let Some(python_cmd) = find_python_command() {
@@ -295,9 +292,7 @@ pub async fn get_global_python_site_packages() -> Vec<PathBuf> {
     }
 
     // 2. Well-known system paths
-    let home_dir = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_else(|_| "~".to_string());
+    let home_dir = crate::utils::fs::home_dir();
 
     // Helper closure to scan base/{lib,lib64}/python3.*/[dist|site]-packages.
     // `lib64` is the multilib dir on RHEL/Fedora/SUSE where compiled
@@ -313,14 +308,7 @@ pub async fn get_global_python_site_packages() -> Vec<PathBuf> {
         let mut matches = find_python_dirs(base, &["lib", "python3.*", pkg_type]).await;
         matches.extend(find_python_dirs(base, &["lib64", "python3.*", pkg_type]).await);
         for m in matches {
-            let resolved = if m.is_absolute() {
-                m
-            } else {
-                std::path::absolute(&m).unwrap_or(m)
-            };
-            if seen.insert(resolved.clone()) {
-                results.push(resolved);
-            }
+            add_path(m, seen, results);
         }
     }
 
@@ -345,7 +333,7 @@ pub async fn get_global_python_site_packages() -> Vec<PathBuf> {
         )
         .await;
         // pip --user on Unix
-        let user_local = PathBuf::from(&home_dir).join(".local");
+        let user_local = home_dir.join(".local");
         scan_well_known(&user_local, "site-packages", &mut seen, &mut results).await;
     }
 
@@ -418,7 +406,7 @@ pub async fn get_global_python_site_packages() -> Vec<PathBuf> {
     {
         let pyenv_root = std::env::var("PYENV_ROOT")
             .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from(&home_dir).join(".pyenv"));
+            .unwrap_or_else(|_| home_dir.join(".pyenv"));
         let pyenv_versions = pyenv_root.join("versions");
         let pyenv_matches =
             find_python_dirs(&pyenv_versions, &["*", "lib", "python3.*", "site-packages"]).await;
@@ -428,15 +416,19 @@ pub async fn get_global_python_site_packages() -> Vec<PathBuf> {
     }
 
     // Conda
-    let anaconda = PathBuf::from(&home_dir).join("anaconda3");
+    let anaconda = home_dir.join("anaconda3");
     scan_well_known(&anaconda, "site-packages", &mut seen, &mut results).await;
-    let miniconda = PathBuf::from(&home_dir).join("miniconda3");
+    let miniconda = home_dir.join("miniconda3");
     scan_well_known(&miniconda, "site-packages", &mut seen, &mut results).await;
 
     // uv tools — platform-specific install root.
     #[cfg(target_os = "macos")]
     {
-        let uv_base = PathBuf::from(&home_dir)
+        // Legacy/secondary location only: uv follows XDG conventions on
+        // macOS (`uv tool dir` → ~/.local/share/uv/tools, covered by the
+        // not(windows) scan below), but older layouts used the platform
+        // data dir, so keep scanning it too.
+        let uv_base = home_dir
             .join("Library")
             .join("Application Support")
             .join("uv")
@@ -458,9 +450,12 @@ pub async fn get_global_python_site_packages() -> Vec<PathBuf> {
             }
         }
     }
-    #[cfg(all(not(target_os = "macos"), not(windows)))]
+    #[cfg(not(windows))]
     {
-        let uv_base = PathBuf::from(&home_dir)
+        // uv uses XDG paths on BOTH Linux and macOS (`uv tool dir` →
+        // ~/.local/share/uv/tools; verified against a real uv install —
+        // macOS does NOT get an Application Support tool dir).
+        let uv_base = home_dir
             .join(".local")
             .join("share")
             .join("uv")
@@ -482,7 +477,7 @@ pub async fn get_global_python_site_packages() -> Vec<PathBuf> {
     // should surface those.
     #[cfg(not(windows))]
     {
-        let uv_python = PathBuf::from(&home_dir)
+        let uv_python = home_dir
             .join(".local")
             .join("share")
             .join("uv")
@@ -521,6 +516,9 @@ pub async fn get_global_python_site_packages() -> Vec<PathBuf> {
 ///   * `requirements.txt` — pip-compile / bare requirements
 ///   * `uv.lock` — uv-managed projects (PEP 751 export sibling is
 ///     `pylock.toml` but in practice `uv.lock` is what ships)
+///   * `Pipfile` / `Pipfile.lock` — pipenv projects, which commonly
+///     ship NEITHER pyproject.toml nor requirements.txt and keep
+///     their venvs out-of-tree (`~/.local/share/virtualenvs`)
 pub async fn is_python_project(cwd: &Path) -> bool {
     let markers = [
         "pyproject.toml",
@@ -528,6 +526,8 @@ pub async fn is_python_project(cwd: &Path) -> bool {
         "setup.cfg",
         "requirements.txt",
         "uv.lock",
+        "Pipfile",
+        "Pipfile.lock",
     ];
     for m in &markers {
         if tokio::fs::metadata(cwd.join(m)).await.is_ok() {
@@ -597,8 +597,19 @@ impl PythonCrawler {
             .unwrap_or_default();
 
         for sp_path in &sp_paths {
-            let found = self.scan_site_packages(sp_path, &mut seen).await;
-            packages.extend(found);
+            for (name, version) in list_dist_info_packages(sp_path).await {
+                let purl = format!("pkg:pypi/{name}@{version}");
+                if !seen.insert(purl.clone()) {
+                    continue;
+                }
+                packages.push(CrawledPackage {
+                    name,
+                    version,
+                    namespace: None,
+                    purl,
+                    path: sp_path.clone(),
+                });
+            }
         }
 
         packages
@@ -615,10 +626,15 @@ impl PythonCrawler {
     ) -> Result<HashMap<String, CrawledPackage>, std::io::Error> {
         let mut result = HashMap::new();
 
-        // Build lookup: canonicalized-name@version -> purl
+        // Build lookup: canonicalized-name@version -> purl. The API serves
+        // purls percent-encoded (a PEP 440 local/epoch version carries
+        // `+`/`!`, arriving as `%2B`/`%21`), so decode the coordinates
+        // before keying or the installed package never matches.
         let mut purl_lookup: HashMap<String, &str> = HashMap::new();
         for purl in purls {
-            if let Some((name, version)) = Self::parse_pypi_purl(purl) {
+            if let Some((name, version)) = crate::utils::purl::parse_pypi_purl(purl) {
+                let name = crate::utils::purl::percent_decode_purl_component(name);
+                let version = crate::utils::purl::percent_decode_purl_component(version);
                 let key = format!("{}@{}", canonicalize_pypi_name(&name), version);
                 purl_lookup.insert(key, purl.as_str());
             }
@@ -628,98 +644,42 @@ impl PythonCrawler {
             return Ok(result);
         }
 
-        // Scan all .dist-info dirs
-        for entry in crate::utils::fs::list_dir_entries(site_packages_path).await {
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-            if !name_str.ends_with(".dist-info") {
-                continue;
-            }
-
-            let dist_info_path = site_packages_path.join(&*name_str);
-            if let Some((raw_name, version)) = read_python_metadata(&dist_info_path).await {
-                let canon_name = canonicalize_pypi_name(&raw_name);
-                let key = format!("{canon_name}@{version}");
-
-                if let Some(&matched_purl) = purl_lookup.get(&key) {
-                    result.insert(
-                        matched_purl.to_string(),
-                        CrawledPackage {
-                            name: canon_name,
-                            version,
-                            namespace: None,
-                            purl: matched_purl.to_string(),
-                            path: site_packages_path.to_path_buf(),
-                        },
-                    );
-                }
+        for (name, version) in list_dist_info_packages(site_packages_path).await {
+            let key = format!("{name}@{version}");
+            if let Some(&matched_purl) = purl_lookup.get(&key) {
+                result.insert(
+                    matched_purl.to_string(),
+                    CrawledPackage {
+                        name,
+                        version,
+                        namespace: None,
+                        purl: matched_purl.to_string(),
+                        path: site_packages_path.to_path_buf(),
+                    },
+                );
             }
         }
 
         Ok(result)
     }
+}
 
-    // ------------------------------------------------------------------
-    // Private helpers
-    // ------------------------------------------------------------------
-
-    /// Scan a `site-packages` directory for `.dist-info` directories.
-    async fn scan_site_packages(
-        &self,
-        site_packages_path: &Path,
-        seen: &mut HashSet<String>,
-    ) -> Vec<CrawledPackage> {
-        let mut results = Vec::new();
-
-        for entry in crate::utils::fs::list_dir_entries(site_packages_path).await {
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-            if !name_str.ends_with(".dist-info") {
-                continue;
-            }
-
-            let dist_info_path = site_packages_path.join(&*name_str);
-            if let Some((raw_name, version)) = read_python_metadata(&dist_info_path).await {
-                let canon_name = canonicalize_pypi_name(&raw_name);
-                let purl = format!("pkg:pypi/{canon_name}@{version}");
-
-                if seen.contains(&purl) {
-                    continue;
-                }
-                seen.insert(purl.clone());
-
-                results.push(CrawledPackage {
-                    name: canon_name,
-                    version,
-                    namespace: None,
-                    purl,
-                    path: site_packages_path.to_path_buf(),
-                });
-            }
+/// Scan a `site-packages` directory for `.dist-info` entries, returning
+/// `(canonicalized name, version)` for each package that yields metadata.
+async fn list_dist_info_packages(site_packages_path: &Path) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for entry in crate::utils::fs::list_dir_entries(site_packages_path).await {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if !name_str.ends_with(".dist-info") {
+            continue;
         }
-
-        results
-    }
-
-    /// Parse a PyPI PURL string to extract name and version.
-    /// Strips qualifiers and subpath before parsing.
-    fn parse_pypi_purl(purl: &str) -> Option<(String, String)> {
-        // A `#subpath` can appear without a preceding `?qualifier`, so the
-        // shared helper cuts at whichever comes first — a `?`-only cut would
-        // leak the subpath into the version and miss the installed package.
-        let base = crate::utils::purl::strip_purl_qualifiers(purl);
-
-        let rest = base.strip_prefix("pkg:pypi/")?;
-        let at_idx = rest.rfind('@')?;
-        let name = &rest[..at_idx];
-        let version = &rest[at_idx + 1..];
-
-        if name.is_empty() || version.is_empty() {
-            return None;
+        let dist_info_path = site_packages_path.join(&*name_str);
+        if let Some((raw_name, version)) = read_python_metadata(&dist_info_path).await {
+            out.push((canonicalize_pypi_name(&raw_name), version));
         }
-
-        Some((name.to_string(), version.to_string()))
     }
+    out
 }
 
 impl Default for PythonCrawler {
@@ -745,6 +705,7 @@ pub fn parse_python_site_packages_output(stdout: &str) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::purl::parse_pypi_purl;
 
     #[test]
     fn test_canonicalize_pypi_name_basic() {
@@ -767,17 +728,20 @@ mod tests {
         assert_eq!(canonicalize_pypi_name("  requests  "), "requests");
     }
 
+    // `find_by_purls` delegates purl parsing to the shared
+    // `crate::utils::purl::parse_pypi_purl`; these pin the behaviors the
+    // crawler depends on (qualifier/subpath stripping, non-pypi rejection).
+
     #[test]
     fn test_parse_pypi_purl() {
-        let (name, ver) = PythonCrawler::parse_pypi_purl("pkg:pypi/requests@2.28.0").unwrap();
+        let (name, ver) = parse_pypi_purl("pkg:pypi/requests@2.28.0").unwrap();
         assert_eq!(name, "requests");
         assert_eq!(ver, "2.28.0");
     }
 
     #[test]
     fn test_parse_pypi_purl_with_qualifiers() {
-        let (name, ver) =
-            PythonCrawler::parse_pypi_purl("pkg:pypi/requests@2.28.0?artifact_id=abc").unwrap();
+        let (name, ver) = parse_pypi_purl("pkg:pypi/requests@2.28.0?artifact_id=abc").unwrap();
         assert_eq!(name, "requests");
         assert_eq!(ver, "2.28.0");
     }
@@ -788,22 +752,20 @@ mod tests {
     /// silently failing the installed-package match.
     #[test]
     fn test_parse_pypi_purl_with_subpath() {
-        let (name, ver) =
-            PythonCrawler::parse_pypi_purl("pkg:pypi/requests@2.28.0#src/requests").unwrap();
+        let (name, ver) = parse_pypi_purl("pkg:pypi/requests@2.28.0#src/requests").unwrap();
         assert_eq!(name, "requests");
         assert_eq!(ver, "2.28.0");
 
         // Qualifier + subpath together (subpath follows qualifiers).
-        let (name, ver) =
-            PythonCrawler::parse_pypi_purl("pkg:pypi/requests@2.28.0?artifact_id=abc#src").unwrap();
+        let (name, ver) = parse_pypi_purl("pkg:pypi/requests@2.28.0?artifact_id=abc#src").unwrap();
         assert_eq!(name, "requests");
         assert_eq!(ver, "2.28.0");
     }
 
     #[test]
     fn test_parse_pypi_purl_invalid() {
-        assert!(PythonCrawler::parse_pypi_purl("pkg:npm/lodash@4.17.21").is_none());
-        assert!(PythonCrawler::parse_pypi_purl("not-a-purl").is_none());
+        assert!(parse_pypi_purl("pkg:npm/lodash@4.17.21").is_none());
+        assert!(parse_pypi_purl("not-a-purl").is_none());
     }
 
     #[tokio::test]
@@ -938,7 +900,6 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: None,
-            batch_size: 100,
         };
         let packages = crawler.crawl_all(&options).await;
         assert_eq!(packages.len(), 1);
@@ -978,7 +939,6 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: None,
-            batch_size: 100,
         };
         let packages = crawler.crawl_all(&options).await;
         assert_eq!(packages.len(), 1);
@@ -1201,7 +1161,6 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: None,
-            batch_size: 100,
         };
 
         let packages = crawler.crawl_all(&options).await;
@@ -1229,13 +1188,11 @@ mod tests {
 
     #[test]
     fn test_home_dir_detection() {
-        // Verify the fallback chain works: HOME -> USERPROFILE -> "~"
-        let home = std::env::var("HOME")
-            .or_else(|_| std::env::var("USERPROFILE"))
-            .unwrap_or_else(|_| "~".to_string());
-        // On any CI or dev machine, we should get a real path, not "~"
-        assert_ne!(home, "~", "expected a real home directory");
-        assert!(!home.is_empty());
+        // Verify the shared fallback chain (HOME -> USERPROFILE -> "~")
+        // yields a real path, not the "~" sentinel, on any CI or dev machine.
+        let home = crate::utils::fs::home_dir();
+        assert_ne!(home, PathBuf::from("~"), "expected a real home directory");
+        assert!(!home.as_os_str().is_empty());
     }
 
     #[tokio::test]

@@ -2,6 +2,9 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use super::types::{CrawledPackage, CrawlerOptions};
+use crate::patch::path_safety;
+use crate::utils::fs::{entry_is_dir, home_dir, is_dir, list_dir_entries};
+use crate::utils::process::{CommandRunner, SystemCommandRunner};
 
 /// Ruby/RubyGems ecosystem crawler for discovering gems in Bundler vendor
 /// directories or global gem installation paths.
@@ -52,15 +55,11 @@ impl RubyCrawler {
 
         if has_gemfile || has_gemfile_lock {
             // Try gem env gemdir
-            let mut paths = Vec::new();
             if let Some(gemdir) = Self::run_gem_env("gemdir").await {
                 let gems_path = PathBuf::from(gemdir).join("gems");
                 if is_dir(&gems_path).await {
-                    paths.push(gems_path);
+                    return Ok(vec![gems_path]);
                 }
-            }
-            if !paths.is_empty() {
-                return Ok(paths);
             }
         }
 
@@ -136,8 +135,8 @@ impl RubyCrawler {
         let vendor_ruby = cwd.join("vendor").join("bundle").join("ruby");
         let mut paths = Vec::new();
 
-        for entry in crate::utils::fs::list_dir_entries(&vendor_ruby).await {
-            if !crate::utils::fs::entry_is_dir(&entry).await {
+        for entry in list_dir_entries(&vendor_ruby).await {
+            if !entry_is_dir(&entry).await {
                 continue;
             }
             let gems_dir = vendor_ruby.join(entry.file_name()).join("gems");
@@ -175,10 +174,7 @@ impl RubyCrawler {
         }
 
         // Fallback well-known paths
-        let home = std::env::var("HOME")
-            .or_else(|_| std::env::var("USERPROFILE"))
-            .unwrap_or_else(|_| "~".to_string());
-        let home = PathBuf::from(home);
+        let home = home_dir();
 
         let fallback_globs = [
             home.join(".gem").join("ruby"),
@@ -187,8 +183,8 @@ impl RubyCrawler {
         ];
 
         for base in &fallback_globs {
-            for entry in crate::utils::fs::list_dir_entries(base).await {
-                if !crate::utils::fs::entry_is_dir(&entry).await {
+            for entry in list_dir_entries(base).await {
+                if !entry_is_dir(&entry).await {
                     continue;
                 }
 
@@ -203,7 +199,7 @@ impl RubyCrawler {
 
                 // ~/.rbenv/versions/*/lib/ruby/gems/*/gems/
                 let lib_ruby_gems = entry_path.join("lib").join("ruby").join("gems");
-                for sub_entry in crate::utils::fs::list_dir_entries(&lib_ruby_gems).await {
+                for sub_entry in list_dir_entries(&lib_ruby_gems).await {
                     let gems_dir = lib_ruby_gems.join(sub_entry.file_name()).join("gems");
                     if is_dir(&gems_dir).await && seen.insert(gems_dir.clone()) {
                         paths.push(gems_dir);
@@ -220,7 +216,7 @@ impl RubyCrawler {
         ];
 
         for base in &system_bases {
-            for entry in crate::utils::fs::list_dir_entries(base).await {
+            for entry in list_dir_entries(base).await {
                 let gems_dir = base.join(entry.file_name()).join("gems");
                 if is_dir(&gems_dir).await && seen.insert(gems_dir.clone()) {
                     paths.push(gems_dir);
@@ -233,18 +229,8 @@ impl RubyCrawler {
 
     /// Run `gem env <key>` and return the trimmed stdout.
     async fn run_gem_env(key: &str) -> Option<String> {
-        Self::run_gem_env_with(&crate::utils::process::SystemCommandRunner, key)
-    }
-
-    /// Version of `run_gem_env` that accepts an injected
-    /// `CommandRunner`. Tests use this with a `MockCommandRunner` to
-    /// exercise the success arm (gem binary present, stdout parsed)
-    /// without requiring ruby on the host's PATH.
-    fn run_gem_env_with(
-        runner: &dyn crate::utils::process::CommandRunner,
-        key: &str,
-    ) -> Option<String> {
-        parse_gem_env_output(runner.run("gem", &["env", key]).as_deref().unwrap_or(""))
+        let stdout = SystemCommandRunner.run("gem", &["env", key]);
+        parse_gem_env_output(stdout.as_deref().unwrap_or(""))
     }
 
     /// Scan a gem directory and return all valid gem packages found.
@@ -255,8 +241,8 @@ impl RubyCrawler {
     ) -> Vec<CrawledPackage> {
         let mut results = Vec::new();
 
-        for entry in crate::utils::fs::list_dir_entries(gem_path).await {
-            if !crate::utils::fs::entry_is_dir(&entry).await {
+        for entry in list_dir_entries(gem_path).await {
+            if !entry_is_dir(&entry).await {
                 continue;
             }
 
@@ -279,10 +265,9 @@ impl RubyCrawler {
 
                 let purl = crate::utils::purl::build_gem_purl(&name, &version);
 
-                if seen.contains(&purl) {
+                if !seen.insert(purl.clone()) {
                     continue;
                 }
-                seen.insert(purl.clone());
 
                 results.push(CrawledPackage {
                     name,
@@ -310,7 +295,7 @@ impl RubyCrawler {
         }
 
         // Check for any .gemspec file
-        for entry in crate::utils::fs::list_dir_entries(path).await {
+        for entry in list_dir_entries(path).await {
             if let Some(name) = entry.file_name().to_str() {
                 if name.ends_with(".gemspec") {
                     return true;
@@ -360,7 +345,7 @@ impl RubyCrawler {
             return Some(exact);
         }
         let prefix = format!("{name}-{version}-");
-        for entry in crate::utils::fs::list_dir_entries(gem_path).await {
+        for entry in list_dir_entries(gem_path).await {
             let file_name = entry.file_name();
             let dir_name = file_name.to_string_lossy();
             if dir_name.starts_with(&prefix) {
@@ -407,29 +392,16 @@ fn gem_homes_to_gems_dirs(gempath: &str) -> Vec<PathBuf> {
 /// Whether a PURL-derived gem coordinate is safe to join onto the gem root.
 /// SECURITY: `find_by_purls` formats name/version into a `<name>-<version>`
 /// directory name joined onto `gem_path`, and a real gem name/version is
-/// dash/dot/word characters only — never a separator, NUL, or bare dot
-/// segment. `verify_gem_at_path` only checks for `lib/`/`.gemspec` and gems
-/// are patched in place, so a tampered manifest PURL (`pkg:gem/../x@1.0`,
+/// dash/dot/word characters only — never a separator, colon, NUL, or bare
+/// dot segment. `verify_gem_at_path` only checks for `lib/`/`.gemspec` and
+/// gems are patched in place, so a tampered manifest PURL (`pkg:gem/../x@1.0`,
 /// an absolute name, a `/`-bearing version) must be rejected here, fail
-/// closed. Mirrors the deno/go/maven/npm/nuget crawler coordinate guards.
+/// closed. Delegates to [`path_safety::is_safe_single_segment`], which also
+/// rejects `:` — a Windows drive-relative coordinate (`C:evil`) joins as an
+/// absolute path. Mirrors the deno/go/maven/npm/nuget crawler coordinate
+/// guards.
 fn is_safe_gem_coordinate(name: &str, version: &str) -> bool {
-    let safe = |s: &str| {
-        !s.is_empty()
-            && s != "."
-            && s != ".."
-            && !s.contains('/')
-            && !s.contains('\\')
-            && !s.contains('\0')
-    };
-    safe(name) && safe(version)
-}
-
-/// Check whether a path is a directory.
-async fn is_dir(path: &Path) -> bool {
-    tokio::fs::metadata(path)
-        .await
-        .map(|m| m.is_dir())
-        .unwrap_or(false)
+    path_safety::is_safe_single_segment(name) && path_safety::is_safe_single_segment(version)
 }
 
 #[cfg(test)]
@@ -529,7 +501,6 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: Some(dir.path().to_path_buf()),
-            batch_size: 100,
         };
 
         let packages = crawler.crawl_all(&options).await;
@@ -572,7 +543,6 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: Some(dir.path().to_path_buf()),
-            batch_size: 100,
         };
 
         let packages = crawler.crawl_all(&options).await;
@@ -671,7 +641,6 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: Some(dir.path().to_path_buf()),
-            batch_size: 100,
         };
         let packages = crawler.crawl_all(&options).await;
         assert_eq!(packages.len(), 1);
@@ -789,7 +758,6 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: Some(dir.path().to_path_buf()),
-            batch_size: 100,
         };
         let packages = crawler.crawl_all(&options).await;
         let purls: HashSet<_> = packages.iter().map(|p| p.purl.as_str()).collect();
@@ -877,7 +845,6 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: None,
-            batch_size: 100,
         };
         let paths = crawler.get_gem_paths(&options).await.unwrap();
         assert!(
@@ -979,6 +946,10 @@ mod tests {
         assert!(!is_safe_gem_coordinate("a\\b", "1.0.0"));
         assert!(!is_safe_gem_coordinate("a\0b", "1.0.0"));
         assert!(!is_safe_gem_coordinate("/abs/evil", "1.0.0"));
+        // Windows drive-relative escape: a `:` (e.g. `C:evil`) makes the
+        // joined path absolute under `Path::join`.
+        assert!(!is_safe_gem_coordinate("C:evil", "1.0.0"));
+        assert!(!is_safe_gem_coordinate("rails", "C:1.0.0"));
     }
 
     /// Gem names with embedded underscores/digits and multi-dash names

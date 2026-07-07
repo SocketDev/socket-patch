@@ -3,8 +3,6 @@
 //! detection, gradle marker detection, m2_repo_path env-var
 //! resolution, walkdir-based scanning.
 
-#![cfg(feature = "maven")]
-
 use std::path::Path;
 
 use serial_test::serial;
@@ -17,7 +15,6 @@ fn options_at(root: &Path) -> CrawlerOptions {
         cwd: root.to_path_buf(),
         global: false,
         global_prefix: None,
-        batch_size: 100,
     }
 }
 
@@ -265,7 +262,6 @@ async fn get_maven_repo_paths_global_mode_with_maven_repo_local() {
         cwd: tmp.path().to_path_buf(),
         global: true,
         global_prefix: None,
-        batch_size: 100,
     };
     let paths = crawler.get_maven_repo_paths(&opts).await.unwrap();
 
@@ -297,7 +293,6 @@ async fn get_maven_repo_paths_global_mode_no_m2_returns_empty() {
         cwd: tmp.path().to_path_buf(),
         global: true,
         global_prefix: None,
-        batch_size: 100,
     };
     let paths = crawler.get_maven_repo_paths(&opts).await.unwrap();
 
@@ -320,8 +315,7 @@ async fn get_maven_repo_paths_global_mode_no_m2_returns_empty() {
 }
 
 /// `find_by_purls` for a version directory that contains a non-`.pom`
-/// file but no `.pom` — exercise the `has_pom_file` return-false arm
-/// (line 405) via verify_maven_at_path.
+/// file but no `.pom` — exercise the `has_pom_file` return-false arm.
 #[tokio::test]
 async fn find_by_purls_version_dir_without_pom_returns_empty() {
     let tmp = tempfile::tempdir().unwrap();
@@ -431,7 +425,6 @@ async fn crawl_all_discovers_packages_in_repo() {
         cwd: tmp.path().to_path_buf(),
         global: true,
         global_prefix: Some(tmp.path().to_path_buf()),
-        batch_size: 100,
     };
     let result = crawler.crawl_all(&opts).await;
     // `>= 2` would pass on garbage/duplicate packages — assert the exact
@@ -468,7 +461,6 @@ async fn crawl_all_with_empty_repo_returns_empty() {
         cwd: tmp.path().to_path_buf(),
         global: true,
         global_prefix: Some(tmp.path().to_path_buf()),
-        batch_size: 100,
     };
     let result = crawler.crawl_all(&opts).await;
     assert!(result.is_empty());
@@ -484,7 +476,6 @@ async fn get_maven_repo_paths_with_global_prefix_returns_only_prefix() {
         cwd: tmp.path().to_path_buf(),
         global: true,
         global_prefix: Some(tmp.path().to_path_buf()),
-        batch_size: 100,
     };
     let paths = crawler.get_maven_repo_paths(&opts).await.unwrap();
     assert_eq!(paths, vec![tmp.path().to_path_buf()]);

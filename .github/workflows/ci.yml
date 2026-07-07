@@ -198,13 +198,12 @@ jobs:
         # gitignore pattern so a stray local run can't accidentally
         # commit a 600 KB report.
         #
-        # Explicit feature list (instead of --all-features) excludes the
+        # Default features (instead of --all-features) exclude the
         # docker-e2e feature — those tests need Docker images this job
         # doesn't build. The coverage-docker matrix covers them
         # separately, and coverage-merge stitches everything together.
         run: |
           cargo llvm-cov --workspace \
-            --features cargo,golang,maven,composer,nuget,deno \
             --no-report
           cargo llvm-cov report --lcov --output-path coverage-host.lcov
           cargo llvm-cov report --summary-only | tee coverage-summary.txt
@@ -320,7 +319,7 @@ jobs:
         # cargo llvm-cov manages its own env in the test step).
         run: |
           eval "$(cargo llvm-cov show-env --export-prefix 2>/dev/null)"
-          cargo build --bin socket-patch --features cargo,golang,maven,composer,nuget,deno
+          cargo build --bin socket-patch
 
       - name: Configure docker-e2e coverage hooks
         run: |
@@ -341,7 +340,7 @@ jobs:
             nuget)    EXTRA="--test docker_e2e_vendor_nuget" ;;
           esac
           cargo llvm-cov \
-            --features docker-e2e,cargo,golang,maven,composer,nuget,deno \
+            --features docker-e2e \
             --no-report \
             --test docker_e2e_${{ matrix.ecosystem }} $EXTRA
 
@@ -639,19 +638,10 @@ jobs:
           load: true
 
       - name: Run ${{ matrix.ecosystem }} Docker e2e test
-        # The optional ecosystems gate their docker_e2e file behind their
-        # own feature (`#![cfg(all(feature = "docker-e2e", feature =
-        # "<eco>"))]`), so the harness must be built with that feature too —
-        # otherwise the test binary compiles to zero tests and passes
-        # vacuously. npm/pypi/gem are unconditional and have no such feature.
-        # (The socket-patch binary inside the image is always --all-features.)
+        # Every ecosystem is unconditionally compiled in; only the
+        # `docker-e2e` feature is needed to compile the suite itself.
         run: |
-          eco='${{ matrix.ecosystem }}'
-          case "$eco" in
-            npm|pypi|gem) features=docker-e2e ;;
-            *) features="docker-e2e,$eco" ;;
-          esac
-          cargo test -p socket-patch-cli --features "$features" --test "docker_e2e_$eco"
+          cargo test -p socket-patch-cli --features docker-e2e --test "docker_e2e_${{ matrix.ecosystem }}"
 
   # ----------------------------------------------------------------------
   # Experimental `setup`-flow matrix (NON-BLOCKING).

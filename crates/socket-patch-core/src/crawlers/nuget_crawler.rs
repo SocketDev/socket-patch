@@ -2,6 +2,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use super::types::{CrawledPackage, CrawlerOptions};
+use crate::patch::path_safety;
+use crate::utils::fs::is_dir;
 
 /// NuGet/.NET ecosystem crawler for discovering packages in global cache,
 /// legacy `packages/` folders, and `obj/` restore layouts.
@@ -109,71 +111,51 @@ impl NuGetCrawler {
         let mut result: HashMap<String, CrawledPackage> = HashMap::new();
 
         for purl in purls {
-            if let Some((name, version)) = crate::utils::purl::parse_nuget_purl(purl) {
-                // SECURITY: the coordinates are untrusted manifest input
-                // joined onto the package root and then patched IN PLACE
-                // (NuGet has no redirect backend). Reject anything that
-                // could traverse out of the root before touching the
-                // filesystem — `verify_nuget_package` only checks for
-                // `lib/` or a `.nuspec`, so it is no defense.
-                if !is_safe_nuget_coordinate(name, version) {
-                    continue;
-                }
+            let Some((name, version)) = crate::utils::purl::parse_nuget_purl(purl) else {
+                continue;
+            };
+            // SECURITY: the coordinates are untrusted manifest input
+            // joined onto the package root and then patched IN PLACE
+            // (NuGet has no redirect backend). Reject anything that
+            // could traverse out of the root before touching the
+            // filesystem — `verify_nuget_package` only checks for
+            // `lib/` or a `.nuspec`, so it is no defense.
+            if !is_safe_nuget_coordinate(name, version) {
+                continue;
+            }
 
-                // Try global cache layout: <lowercase-name>/<lowercase-version>/.
-                // NuGet lowercases BOTH the id and the version when it lays
-                // out the global packages folder, so a prerelease tag like
-                // `2.0.0-RC1` lives on disk as `2.0.0-rc1`. Lowercasing only
-                // the name (but not the version) would miss those packages.
-                let global_dir = pkg_path
-                    .join(name.to_lowercase())
-                    .join(version.to_lowercase());
-                if self.verify_nuget_package(&global_dir).await {
-                    result.insert(
-                        purl.clone(),
-                        CrawledPackage {
-                            name: name.to_string(),
-                            version: version.to_string(),
-                            namespace: None,
-                            purl: purl.clone(),
-                            path: global_dir,
-                        },
-                    );
-                    continue;
-                }
+            // Global cache layout: <lowercase-name>/<lowercase-version>/.
+            // NuGet lowercases BOTH the id and the version when it lays
+            // out the global packages folder, so a prerelease tag like
+            // `2.0.0-RC1` lives on disk as `2.0.0-rc1`. Lowercasing only
+            // the name (but not the version) would miss those packages.
+            let global_dir = pkg_path
+                .join(name.to_lowercase())
+                .join(version.to_lowercase());
+            // Legacy layout: <Name>.<Version>/, tried exact-case first, then
+            // case-insensitively (NuGet names are case-insensitive).
+            let legacy_dir = pkg_path.join(format!("{name}.{version}"));
 
-                // Try legacy layout: <Name>.<Version>/
-                let legacy_dir = pkg_path.join(format!("{name}.{version}"));
-                if self.verify_nuget_package(&legacy_dir).await {
-                    result.insert(
-                        purl.clone(),
-                        CrawledPackage {
-                            name: name.to_string(),
-                            version: version.to_string(),
-                            namespace: None,
-                            purl: purl.clone(),
-                            path: legacy_dir,
-                        },
-                    );
-                    continue;
-                }
-
-                // Try case-insensitive legacy scan (NuGet names are case-insensitive)
-                if let Some(found_dir) = self
-                    .find_legacy_dir_case_insensitive(pkg_path, name, version)
+            let found = if self.verify_nuget_package(&global_dir).await {
+                Some(global_dir)
+            } else if self.verify_nuget_package(&legacy_dir).await {
+                Some(legacy_dir)
+            } else {
+                self.find_legacy_dir_case_insensitive(pkg_path, name, version)
                     .await
-                {
-                    result.insert(
-                        purl.clone(),
-                        CrawledPackage {
-                            name: name.to_string(),
-                            version: version.to_string(),
-                            namespace: None,
-                            purl: purl.clone(),
-                            path: found_dir,
-                        },
-                    );
-                }
+            };
+
+            if let Some(path) = found {
+                result.insert(
+                    purl.clone(),
+                    CrawledPackage {
+                        name: name.to_string(),
+                        version: version.to_string(),
+                        namespace: None,
+                        purl: purl.clone(),
+                        path,
+                    },
+                );
             }
         }
 
@@ -314,7 +296,15 @@ impl NuGetCrawler {
         }
 
         // Check for any .nuspec file
-        find_nuspec_in_dir(path).await.is_some()
+        for entry in crate::utils::fs::list_dir_entries(path).await {
+            if let Some(name) = entry.file_name().to_str() {
+                if name.ends_with(".nuspec") {
+                    return true;
+                }
+            }
+        }
+
+        false
     }
 
     /// Find a legacy package directory with case-insensitive matching.
@@ -356,18 +346,12 @@ impl Default for NuGetCrawler {
 /// which the resolved directory is patched IN PLACE (NuGet has no redirect
 /// backend) — so a tampered PURL must not be able to traverse out of the
 /// root. A real NuGet id/version never contains a separator, a `.`/`..`
-/// segment, a backslash, or a NUL. Fails closed. Mirrors the
-/// maven/go/deno/npm crawler coordinate guards.
+/// segment, a backslash, a colon, or a NUL. Delegates to
+/// [`path_safety::is_safe_single_segment`], which also rejects `:` — a
+/// Windows drive-relative coordinate (`C:evil`) joins as an absolute path.
+/// Fails closed. Mirrors the maven/go/deno/npm crawler coordinate guards.
 fn is_safe_nuget_coordinate(name: &str, version: &str) -> bool {
-    let safe_segment = |s: &str| {
-        !s.is_empty()
-            && s != "."
-            && s != ".."
-            && !s.contains('/')
-            && !s.contains('\\')
-            && !s.contains('\0')
-    };
-    safe_segment(name) && safe_segment(version)
+    path_safety::is_safe_single_segment(name) && path_safety::is_safe_single_segment(version)
 }
 
 /// Get the NuGet global packages folder.
@@ -383,15 +367,15 @@ fn nuget_home() -> PathBuf {
         }
     }
 
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_else(|_| "~".to_string());
-    PathBuf::from(home).join(".nuget").join("packages")
+    crate::utils::fs::home_dir().join(".nuget").join("packages")
 }
 
 /// Check if the cwd contains any .NET project indicators.
 async fn is_dotnet_project(cwd: &Path) -> bool {
-    let extensions = [".csproj", ".fsproj", ".vbproj", ".sln"];
+    // `.slnx` is the XML solution format (GA since VS 2022 17.13 /
+    // dotnet 9.0.200); migrating deletes the old `.sln`, and a solution
+    // root often has no other root-level marker.
+    let extensions = [".csproj", ".fsproj", ".vbproj", ".sln", ".slnx"];
 
     for entry in crate::utils::fs::list_dir_entries(cwd).await {
         if let Some(name) = entry.file_name().to_str() {
@@ -439,29 +423,17 @@ fn parse_legacy_dir_name(dir_name: &str) -> Option<(String, String)> {
     Some((name.to_string(), version.to_string()))
 }
 
-/// Find a `.nuspec` file in a directory.
-async fn find_nuspec_in_dir(dir: &Path) -> Option<PathBuf> {
-    for entry in crate::utils::fs::list_dir_entries(dir).await {
-        if let Some(name) = entry.file_name().to_str() {
-            if name.ends_with(".nuspec") {
-                return Some(dir.join(name));
-            }
-        }
-    }
-    None
-}
-
 /// Discover additional package paths from `obj/project.assets.json` files.
 async fn discover_paths_from_assets(cwd: &Path) -> Vec<PathBuf> {
     let mut paths = Vec::new();
 
     // Look for obj/project.assets.json in cwd
     let assets_path = cwd.join("obj").join("project.assets.json");
-    if let Some(pkg_folder) = parse_project_assets_package_folders(&assets_path).await {
-        for folder in pkg_folder {
-            paths.push(folder);
-        }
-    }
+    paths.extend(
+        parse_project_assets_package_folders(&assets_path)
+            .await
+            .unwrap_or_default(),
+    );
 
     // Also check subdirectories one level deep for multi-project solutions
     for entry in crate::utils::fs::list_dir_entries(cwd).await {
@@ -472,11 +444,11 @@ async fn discover_paths_from_assets(cwd: &Path) -> Vec<PathBuf> {
             .join(entry.file_name())
             .join("obj")
             .join("project.assets.json");
-        if let Some(pkg_folders) = parse_project_assets_package_folders(&sub_assets).await {
-            for folder in pkg_folders {
-                paths.push(folder);
-            }
-        }
+        paths.extend(
+            parse_project_assets_package_folders(&sub_assets)
+                .await
+                .unwrap_or_default(),
+        );
     }
     paths
 }
@@ -489,22 +461,7 @@ async fn parse_project_assets_package_folders(path: &Path) -> Option<Vec<PathBuf
     let content = tokio::fs::read_to_string(path).await.ok()?;
     let json: serde_json::Value = serde_json::from_str(&content).ok()?;
     let folders = json.get("packageFolders")?.as_object()?;
-
-    let result: Vec<PathBuf> = folders.keys().map(PathBuf::from).collect();
-
-    if result.is_empty() {
-        None
-    } else {
-        Some(result)
-    }
-}
-
-/// Check whether a path is a directory.
-async fn is_dir(path: &Path) -> bool {
-    tokio::fs::metadata(path)
-        .await
-        .map(|m| m.is_dir())
-        .unwrap_or(false)
+    Some(folders.keys().map(PathBuf::from).collect())
 }
 
 #[cfg(test)]
@@ -602,7 +559,6 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: Some(dir.path().to_path_buf()),
-            batch_size: 100,
         };
 
         let packages = crawler.crawl_all(&options).await;
@@ -635,7 +591,6 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: Some(dir.path().to_path_buf()),
-            batch_size: 100,
         };
 
         let packages = crawler.crawl_all(&options).await;
@@ -667,6 +622,50 @@ mod tests {
             .await
             .unwrap();
         assert!(super::is_dotnet_project(dir.path()).await);
+    }
+
+    /// Regression: `.slnx` (the XML solution format, GA since VS 2022
+    /// 17.13 / dotnet 9.0.200) replaces `.sln` when a repo migrates — the
+    /// old file is deleted. A solution root keeps its projects in
+    /// subdirectories, so `.slnx` is often the ONLY root-level .NET
+    /// marker; without it the local-mode gate fails and
+    /// `get_nuget_package_paths` returns no paths at all (not even the
+    /// global cache), silently disabling NuGet patching for that repo.
+    #[tokio::test]
+    async fn test_is_dotnet_project_slnx() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(dir.path().join("MySolution.slnx"), "<Solution/>")
+            .await
+            .unwrap();
+        assert!(super::is_dotnet_project(dir.path()).await);
+
+        let crawler = NuGetCrawler::new();
+        let options = CrawlerOptions {
+            cwd: dir.path().to_path_buf(),
+            global: false,
+            global_prefix: None,
+        };
+        // Path discovery must also flow through: an assets-file path in a
+        // sub-project of the .slnx solution is found once the gate passes.
+        let pkg_folder = dir.path().join("nuget-cache");
+        tokio::fs::create_dir_all(&pkg_folder).await.unwrap();
+        let obj_dir = dir.path().join("MyApp").join("obj");
+        tokio::fs::create_dir_all(&obj_dir).await.unwrap();
+        tokio::fs::write(
+            obj_dir.join("project.assets.json"),
+            serde_json::to_string(&serde_json::json!({
+                "packageFolders": { pkg_folder.to_string_lossy().to_string(): {} }
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let paths = crawler.get_nuget_package_paths(&options).await.unwrap();
+        assert!(
+            paths.contains(&pkg_folder),
+            "a .slnx solution root must be gated in and its sub-project assets discovered, got {paths:?}"
+        );
     }
 
     #[tokio::test]
@@ -719,7 +718,6 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: Some(dir.path().to_path_buf()),
-            batch_size: 100,
         };
 
         let packages = crawler.crawl_all(&options).await;
@@ -785,7 +783,6 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: None,
-            batch_size: 100,
         };
 
         let paths = crawler.get_nuget_package_paths(&options).await.unwrap();
@@ -813,7 +810,6 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: None,
-            batch_size: 100,
         };
 
         let paths = crawler.get_nuget_package_paths(&options).await.unwrap();
@@ -867,7 +863,6 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: Some(dir.path().to_path_buf()),
-            batch_size: 100,
         };
 
         let pkgs = crawler.crawl_all(&options).await;
@@ -896,7 +891,6 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: Some(dir.path().to_path_buf()),
-            batch_size: 100,
         };
 
         let pkgs = crawler.crawl_all(&options).await;
@@ -928,7 +922,6 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: Some(dir.path().to_path_buf()),
-            batch_size: 100,
         };
 
         let mut purls: Vec<String> = crawler
@@ -999,6 +992,10 @@ mod tests {
         assert!(!is_safe_nuget_coordinate("a", "."));
         assert!(!is_safe_nuget_coordinate("", "1.0.0"));
         assert!(!is_safe_nuget_coordinate("a", ""));
+        // Windows drive-relative escape: a `:` (e.g. `C:evil`) makes the
+        // joined path absolute under `Path::join`.
+        assert!(!is_safe_nuget_coordinate("C:evil", "1.0.0"));
+        assert!(!is_safe_nuget_coordinate("a", "C:1.0.0"));
     }
 
     /// SECURITY regression: a tampered manifest PURL whose name or version

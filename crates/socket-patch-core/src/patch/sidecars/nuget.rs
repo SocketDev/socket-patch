@@ -21,6 +21,7 @@
 use std::path::Path;
 
 use crate::patch::apply::DirWriteGuard;
+use crate::utils::fs::{is_file, list_dir_entries};
 
 use super::{
     SidecarAdvisory, SidecarAdvisoryCode, SidecarError, SidecarFile, SidecarFileAction,
@@ -116,23 +117,12 @@ pub(crate) async fn fixup(pkg_path: &Path) -> Result<Option<SidecarPayload>, Sid
 /// directory false-positive, not fail-open against a symlinked marker
 /// (the symlink-drop trap the npm/cargo crawlers were bitten by).
 async fn has_signed_marker(pkg_path: &Path) -> bool {
-    let mut entries = match tokio::fs::read_dir(pkg_path).await {
-        Ok(rd) => rd,
-        Err(_) => return false,
-    };
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        if !entry
+    for entry in list_dir_entries(pkg_path).await {
+        if entry
             .file_name()
             .as_encoded_bytes()
             .ends_with(b".nupkg.sha512")
-        {
-            continue;
-        }
-        // Name matches — confirm it's a regular file before believing it.
-        if tokio::fs::metadata(entry.path())
-            .await
-            .map(|m| m.is_file())
-            .unwrap_or(false)
+            && is_file(&entry.path()).await
         {
             return true;
         }

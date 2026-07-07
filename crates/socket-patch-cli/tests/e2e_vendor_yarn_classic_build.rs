@@ -63,14 +63,16 @@ fn has_corepack_pm(pm: &str) -> bool {
 /// prompt disabled, and every `SOCKET_*` var scrubbed.
 fn corepack(cwd: &Path, pm: &str, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
     let mut cmd = Command::new("corepack");
-    cmd.arg(pm)
-        .args(args)
-        .current_dir(cwd)
-        .env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0");
+    cmd.arg(pm).args(args).current_dir(cwd);
+    // Scrub FIRST (it removes YARN_CACHE_FOLDER / SOCKET_* from the inherited
+    // env), then seed the hermetic flags so they survive (Command: last env
+    // call wins). Scrubbing last wiped the caller's private cache override,
+    // so the fixture install silently used the developer's global cache.
+    scrub_socket_env(&mut cmd);
+    cmd.env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0");
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
-    scrub_socket_env(&mut cmd);
     cmd.output().expect("failed to run corepack")
 }
 
@@ -200,6 +202,16 @@ fn yarn_classic_vendor_fresh_checkout_frozen_offline_install_and_revert() {
         );
         return;
     }
+
+    // Hermeticity guard: the install must have gone through the PRIVATE cache.
+    // If YARN_CACHE_FOLDER never reached the child, yarn silently used the
+    // user's global cache and the fresh-checkout "empty cache" premise is
+    // void (a leaked run even parks the PATCHED tarball in the global cache).
+    assert!(
+        cache.is_dir() && std::fs::read_dir(&cache).unwrap().next().is_some(),
+        "fixture install did not populate the private YARN_CACHE_FOLDER at {}",
+        cache.display()
+    );
 
     let installed_index = proj.join("node_modules").join(DEP).join("index.js");
     let orig = std::fs::read(&installed_index).expect("installed index.js");
@@ -368,6 +380,15 @@ fn yarn_classic_vendor_fresh_checkout_frozen_offline_install_and_revert() {
          vendored tarball.\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&ci.stdout),
         String::from_utf8_lossy(&ci.stderr),
+    );
+    // Same guard for the fresh install: yarn unpacks even `file:` tarballs
+    // through its cache, so an untouched fresh_cache means the GLOBAL cache
+    // served the install and the offline-from-vendored-tarball proof is
+    // vacuous.
+    assert!(
+        fresh_cache.is_dir() && std::fs::read_dir(&fresh_cache).unwrap().next().is_some(),
+        "fresh install did not populate the private YARN_CACHE_FOLDER at {}",
+        fresh_cache.display()
     );
     let fresh_installed =
         std::fs::read(fresh.join("node_modules").join(DEP).join("index.js")).unwrap();

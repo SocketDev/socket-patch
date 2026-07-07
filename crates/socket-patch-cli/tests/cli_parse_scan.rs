@@ -45,9 +45,13 @@ const SCAN_ENV_VARS: &[&str] = &[
     "SOCKET_MANIFEST_PATH",
     "SOCKET_OFFLINE",
     "SOCKET_ORG_SLUG",
+    "SOCKET_PATCH_SERVER_URL",
     "SOCKET_PROXY_URL",
     "SOCKET_SILENT",
+    "SOCKET_STRICT",
     "SOCKET_TELEMETRY_DISABLED",
+    "SOCKET_VENDOR_SOURCE",
+    "SOCKET_VENDOR_URL",
     "SOCKET_VERBOSE",
     "SOCKET_VEX",
     "SOCKET_VEX_COMPACT",
@@ -303,9 +307,6 @@ fn batch_size_negative_fails() {
 #[test]
 #[serial_test::serial]
 fn ecosystems_csv_multi() {
-    // Use only the unconditional ecosystems (npm/pypi/gem are always
-    // compiled in) so this CSV-splitting assertion is independent of which
-    // optional ecosystem features the test crate was built with.
     let args = parse_scan(&["--ecosystems", "npm,pypi,gem"]);
     assert_eq!(
         args.common.ecosystems,
@@ -320,35 +321,10 @@ fn ecosystems_csv_multi() {
 #[test]
 #[serial_test::serial]
 fn ecosystems_unsupported_name_rejected() {
-    // The `--ecosystems` value-parser rejects names this build does not
-    // support — both typos and ecosystems whose feature is not compiled
-    // in. `definitely-not-an-ecosystem` is never a valid name in any
-    // feature configuration, so this assertion holds regardless of the
-    // build's feature set.
+    // The `--ecosystems` value-parser rejects names that are not
+    // supported ecosystems, so typos fail loudly.
     let err = match try_parse_scan(&["--ecosystems", "definitely-not-an-ecosystem"]) {
         Ok(_) => panic!("unsupported ecosystem name should fail to parse"),
-        Err(e) => e,
-    };
-    assert!(
-        matches!(
-            err.kind(),
-            clap::error::ErrorKind::ValueValidation | clap::error::ErrorKind::InvalidValue
-        ),
-        "expected ValueValidation or InvalidValue, got {:?}",
-        err.kind()
-    );
-}
-
-/// maven is not in the default feature set, so a default build must reject
-/// `--ecosystems maven` (the whole point of marking it unsupported). When
-/// the `maven` feature *is* compiled in, the name is legitimately accepted,
-/// so this assertion is itself feature-gated to match.
-#[cfg(not(feature = "maven"))]
-#[test]
-#[serial_test::serial]
-fn ecosystems_maven_rejected_without_feature() {
-    let err = match try_parse_scan(&["--ecosystems", "maven"]) {
-        Ok(_) => panic!("`maven` must be rejected when the maven feature is off"),
         Err(e) => e,
     };
     assert!(
@@ -561,15 +537,16 @@ fn scan_json_empty_cwd_emits_updates_key() {
 // --- `--mode` selector (documented spelling of the mode booleans) ----------
 //
 // `--mode <hosted|vendored|agent>` is the RELEASED spelling of the three
-// mode flags. The clap parser only fills `args.mode`; `resolve_mode_flags`
-// (run at the top of `scan::run`, exercised directly here) folds it into the
-// legacy `--redirect`/`--vendor`/`--apply` booleans and enforces the
-// cross-mode rules clap can't express (a value-dependent conflict). These
-// tests lock both the fold and the legacy aliases.
+// mode flags. `resolve_mode_flags` (run at the top of `scan::run`,
+// exercised directly here) makes `args.mode` the single source of truth:
+// the legacy `--redirect`/`--vendor`/`--apply`/`--sync` booleans fold INTO
+// the enum (they are input spellings, never read downstream), and the
+// cross-mode rules clap can't express (a value-dependent conflict) are
+// enforced. These tests lock both the fold and the legacy aliases.
 
 /// Parse `extra` (must parse cleanly at the clap level), then run the mode
-/// fold — mirroring exactly what `scan::run` does before it reads any mode
-/// boolean.
+/// fold — mirroring exactly what `scan::run` does before it reads the
+/// resolved mode.
 fn parse_and_resolve(extra: &[&str]) -> Result<ScanArgs, String> {
     let mut args = parse_scan(extra);
     resolve_mode_flags(&mut args)?;
@@ -578,35 +555,55 @@ fn parse_and_resolve(extra: &[&str]) -> Result<ScanArgs, String> {
 
 #[test]
 #[serial_test::serial]
-fn mode_hosted_folds_to_redirect() {
-    // The parser records the enum verbatim...
-    assert_eq!(
-        parse_scan(&["--mode", "hosted"]).mode,
-        Some(ScanMode::Hosted)
-    );
-    // ...and the fold turns it into the redirect boolean, exclusively.
+fn mode_hosted_is_the_source_of_truth() {
+    // The parser records the enum verbatim and the fold leaves it as the
+    // single source of truth (the booleans are inputs, not outputs).
     let folded = parse_and_resolve(&["--mode", "hosted"]).expect("fold ok");
-    assert!(folded.redirect, "--mode hosted sets --redirect");
-    assert!(!folded.vendor);
-    assert!(!folded.apply);
+    assert_eq!(folded.mode, Some(ScanMode::Hosted));
+    // ...and the legacy boolean spelling folds INTO the enum.
+    let folded = parse_and_resolve(&["--redirect"]).expect("fold ok");
+    assert_eq!(
+        folded.mode,
+        Some(ScanMode::Hosted),
+        "--redirect == --mode hosted"
+    );
 }
 
 #[test]
 #[serial_test::serial]
-fn mode_vendored_folds_to_vendor() {
+fn mode_vendored_is_the_source_of_truth() {
     let folded = parse_and_resolve(&["--mode", "vendored"]).expect("fold ok");
-    assert!(folded.vendor, "--mode vendored sets --vendor");
-    assert!(!folded.redirect);
-    assert!(!folded.apply);
+    assert_eq!(folded.mode, Some(ScanMode::Vendored));
+    let folded = parse_and_resolve(&["--vendor"]).expect("fold ok");
+    assert_eq!(
+        folded.mode,
+        Some(ScanMode::Vendored),
+        "--vendor == --mode vendored"
+    );
 }
 
 #[test]
 #[serial_test::serial]
-fn mode_agent_folds_to_apply() {
+fn mode_agent_is_the_source_of_truth() {
     let folded = parse_and_resolve(&["--mode", "agent"]).expect("fold ok");
-    assert!(folded.apply, "--mode agent sets --apply");
-    assert!(!folded.redirect);
-    assert!(!folded.vendor);
+    assert_eq!(folded.mode, Some(ScanMode::Agent));
+    let folded = parse_and_resolve(&["--apply"]).expect("fold ok");
+    assert_eq!(
+        folded.mode,
+        Some(ScanMode::Agent),
+        "--apply == --mode agent"
+    );
+    // --sync counts as an agent-mode spelling (its prune half is orthogonal).
+    let folded = parse_and_resolve(&["--sync"]).expect("fold ok");
+    assert_eq!(
+        folded.mode,
+        Some(ScanMode::Agent),
+        "--sync == --mode agent --prune"
+    );
+    assert!(folded.sync, "the prune half of --sync stays readable");
+    // No mode selected at all: scan stays read-only.
+    let folded = parse_and_resolve(&[]).expect("fold ok");
+    assert_eq!(folded.mode, None, "modeless scan is read-only");
 }
 
 #[test]
@@ -645,15 +642,15 @@ fn mode_hosted_with_vendor_boolean_errors() {
 fn mode_agent_with_apply_boolean_is_allowed() {
     // Same mode spelled both ways is redundant but legal.
     let folded = parse_and_resolve(&["--mode", "agent", "--apply"]).expect("same-mode ok");
-    assert!(folded.apply);
+    assert_eq!(folded.mode, Some(ScanMode::Agent));
 }
 
 #[test]
 #[serial_test::serial]
 fn mode_agent_with_sync_boolean_is_allowed() {
-    // --sync implies --apply, so it counts as an agent-mode spelling.
+    // --sync implies agent mode, so it counts as an agent-mode spelling.
     let folded = parse_and_resolve(&["--mode", "agent", "--sync"]).expect("same-mode ok");
-    assert!(folded.apply);
+    assert_eq!(folded.mode, Some(ScanMode::Agent));
     assert!(folded.sync);
 }
 
@@ -662,7 +659,7 @@ fn mode_agent_with_sync_boolean_is_allowed() {
 fn mode_vendored_with_detached_ok() {
     // --detached is legal under vendored mode selected via --mode.
     let folded = parse_and_resolve(&["--mode", "vendored", "--detached"]).expect("fold ok");
-    assert!(folded.vendor);
+    assert_eq!(folded.mode, Some(ScanMode::Vendored));
     assert!(folded.detached);
 }
 
@@ -682,13 +679,88 @@ fn detached_without_vendored_mode_errors() {
 #[test]
 #[serial_test::serial]
 fn legacy_mode_spellings_still_parse() {
-    // The boolean aliases keep working with no `--mode` given; the fold is
-    // then a no-op and leaves the booleans exactly as parsed.
+    // The boolean aliases keep working with no `--mode` given; the fold
+    // derives the mode enum from them (the inverse of the historical
+    // direction — `args.mode` is now the single source of truth).
     assert!(parse_scan(&["--redirect"]).redirect);
     assert!(parse_scan(&["--vendor"]).vendor);
     assert!(parse_scan(&["--apply"]).apply);
     let folded = parse_and_resolve(&["--vendor", "--detached"]).expect("legacy fold ok");
-    assert!(folded.vendor);
     assert!(folded.detached);
-    assert_eq!(folded.mode, None, "no --mode ⇒ selector stays None");
+    assert_eq!(
+        folded.mode,
+        Some(ScanMode::Vendored),
+        "legacy --vendor folds into the mode selector"
+    );
+}
+
+// --- scrub-list completeness guard -----------------------------------------
+
+/// Full-surface snapshot of a parsed `ScanArgs`, for env-leak detection.
+/// The flattened `GlobalArgs` participates via its `Debug` impl so every
+/// field — including ones added after this file was written — is covered
+/// without being named here; the scan-local and vex-embed fields (no
+/// `Debug` derive) are formatted individually.
+fn snap(a: &ScanArgs) -> String {
+    format!(
+        "{:?} batch_size={} apply={} prune={} sync={} vendor={} detached={} \
+         redirect={} mode={:?} all_releases={} vex={:?} vex_product={:?} \
+         vex_no_verify={} vex_doc_id={:?} vex_compact={}",
+        a.common,
+        a.batch_size,
+        a.apply,
+        a.prune,
+        a.sync,
+        a.vendor,
+        a.detached,
+        a.redirect,
+        a.mode,
+        a.all_releases,
+        a.vex.vex,
+        a.vex.vex_product,
+        a.vex.vex_no_verify,
+        a.vex.vex_doc_id,
+        a.vex.vex_compact,
+    )
+}
+
+#[test]
+#[serial_test::serial]
+fn scrub_covers_every_scan_env_var_clap_consults() {
+    // `SCAN_ENV_VARS` claims to cover every `SOCKET_*` var clap consults
+    // while parsing `scan`. The production oracles are
+    // `GLOBAL_ARG_ENV_VARS` (the flattened `GlobalArgs`, consulted by every
+    // subcommand the moment a binding lands) and `LOCAL_ARG_ENV_VARS`
+    // (subcommand-local bindings — scan's own plus other subcommands',
+    // which the scan parse never reads, so probing them is harmless). For
+    // each var: plant `garbage`, parse under the scrub, and require the
+    // exact clean-parse result. A var missing from the scrub fails loudly
+    // either way — validated flags (bools, ints, `--ecosystems`,
+    // `--vendor-source`) abort the parse; free-form strings/paths leak a
+    // visibly non-default value into the snapshot.
+    let baseline = snap(&parse_scan(&[]));
+    for &var in socket_patch_cli::args::GLOBAL_ARG_ENV_VARS
+        .iter()
+        .chain(socket_patch_cli::args::LOCAL_ARG_ENV_VARS)
+    {
+        let prev = std::env::var(var).ok();
+        std::env::set_var(var, "garbage");
+        let parsed = with_clean_env(|| Cli::try_parse_from(["socket-patch", "scan"]));
+        match prev {
+            Some(v) => std::env::set_var(var, v),
+            None => std::env::remove_var(var),
+        }
+        let args = match parsed {
+            Ok(cli) => match cli.command {
+                Commands::Scan(a) => a,
+                _ => panic!("expected Scan"),
+            },
+            Err(e) => panic!("ambient {var}=garbage aborted the scrubbed parse: {e}"),
+        };
+        assert_eq!(
+            snap(&args),
+            baseline,
+            "ambient {var}=garbage leaked into the scrubbed parse",
+        );
+    }
 }

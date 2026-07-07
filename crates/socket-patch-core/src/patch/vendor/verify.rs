@@ -81,21 +81,29 @@ pub async fn verify_vendored_patch_record(
         return Err("vendor_artifact_missing".to_string());
     }
 
-    let path_str = artifact.to_string_lossy().to_string();
-    if path_str.ends_with(".tgz") || path_str.ends_with(".tar.gz") {
-        verify_tarball_members(&artifact, record).await
-    } else if path_str.ends_with(".whl")
-        || path_str.ends_with(".nupkg")
-        || path_str.ends_with(".jar")
-    {
-        // A `.nupkg` is a plain OPC zip (NuGet) and a `.jar` is a plain zip
-        // (Maven) — both carry member paths that are package-relative, exactly
-        // the manifest key space, so the bounded zip reader used for wheels
-        // verifies them verbatim.
-        verify_wheel_members(&artifact, record).await
-    } else {
-        verify_dir_members(&artifact, record).await
+    // Archive-shaped artifacts are decoded in memory and their members hashed:
+    // npm tarballs via the bomb-capped patch-archive reader (it strips the
+    // `package/` prefix, matching `normalize_file_path`'d keys); `.whl` /
+    // `.nupkg` (a plain OPC zip) / `.jar` (a plain zip) via the bounded zip
+    // reader — their member paths are package-relative, exactly the manifest
+    // key space. Everything else is a dir-shaped copy hashed in place.
+    let path_str = artifact.to_string_lossy();
+    let is_tarball = path_str.ends_with(".tgz") || path_str.ends_with(".tar.gz");
+    let is_zip =
+        path_str.ends_with(".whl") || path_str.ends_with(".nupkg") || path_str.ends_with(".jar");
+    if !is_tarball && !is_zip {
+        return verify_dir_members(&artifact, record).await;
     }
+    let map = tokio::task::spawn_blocking(move || {
+        if is_tarball {
+            read_archive_to_map(&artifact).map_err(|_| "vendor_artifact_unreadable".to_string())
+        } else {
+            read_wheel_to_map(&artifact)
+        }
+    })
+    .await
+    .map_err(|_| "vendor_artifact_unreadable".to_string())??;
+    verify_member_map(&map, record)
 }
 
 /// Dir-shaped ecosystems (cargo/golang/composer/gem): hash files in place,
@@ -115,37 +123,33 @@ async fn verify_dir_members(dir: &Path, record: &PatchRecord) -> Result<(), Stri
     Ok(())
 }
 
-/// npm tarballs: decode in memory via the bomb-capped patch-archive reader
-/// (it strips the `package/` prefix, matching `normalize_file_path`'d keys)
-/// and hash each member against its afterHash.
-async fn verify_tarball_members(tgz: &Path, record: &PatchRecord) -> Result<(), String> {
-    let tgz = tgz.to_path_buf();
-    let map = tokio::task::spawn_blocking(move || read_archive_to_map(&tgz))
-        .await
-        .map_err(|_| "vendor_artifact_unreadable".to_string())?
-        .map_err(|_| "vendor_artifact_unreadable".to_string())?;
-    verify_member_map(&map, record)
-}
-
-/// pypi wheels: bounded zip decode (member names are site-packages-relative,
-/// exactly the manifest's pypi key space).
-async fn verify_wheel_members(whl: &Path, record: &PatchRecord) -> Result<(), String> {
-    let whl = whl.to_path_buf();
-    let map = tokio::task::spawn_blocking(move || read_wheel_to_map(&whl))
-        .await
-        .map_err(|_| "vendor_artifact_unreadable".to_string())??;
-    verify_member_map(&map, record)
-}
-
 fn read_wheel_to_map(whl: &Path) -> Result<HashMap<String, Vec<u8>>, String> {
+    // Open non-blockingly and require a regular file: a FIFO planted at the
+    // artifact path would otherwise wedge the audit in `open(2)` waiting for
+    // a writer that never comes (mirrors `read_archive_to_map`; O_NONBLOCK
+    // has no effect on regular-file reads).
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(whl)
+            .map_err(|_| "vendor_artifact_unreadable".to_string())?
+    };
+    #[cfg(not(unix))]
     let file = std::fs::File::open(whl).map_err(|_| "vendor_artifact_unreadable".to_string())?;
+    if !file.metadata().map(|m| m.is_file()).unwrap_or(false) {
+        return Err("vendor_artifact_unreadable".to_string());
+    }
     let mut zip =
         zip::ZipArchive::new(file).map_err(|_| "vendor_artifact_unreadable".to_string())?;
     if zip.len() > MAX_WHEEL_ENTRIES {
         return Err("vendor_artifact_unreadable".to_string());
     }
     let mut out = HashMap::new();
-    let mut total: u64 = 0;
+    let mut declared: u64 = 0;
+    let mut actual: u64 = 0;
     for i in 0..zip.len() {
         let mut entry = zip
             .by_index(i)
@@ -153,19 +157,29 @@ fn read_wheel_to_map(whl: &Path) -> Result<HashMap<String, Vec<u8>>, String> {
         if !entry.is_file() {
             continue;
         }
-        // SECURITY: bound the cumulative decompressed size before reading —
-        // a committed-but-tampered wheel must not balloon an audit's memory.
-        total = total.saturating_add(entry.size());
-        if total > MAX_WHEEL_DECOMPRESSED_BYTES {
+        // SECURITY: bound the cumulative decompressed size — a
+        // committed-but-tampered wheel must not balloon an audit's memory.
+        // The declared `entry.size()` is header data the attacker controls
+        // and the zip reader never enforces, so the binding budget is bytes
+        // ACTUALLY decompressed; the declared check just fails honest
+        // oversized wheels before reading anything.
+        declared = declared.saturating_add(entry.size());
+        if declared > MAX_WHEEL_DECOMPRESSED_BYTES {
             return Err("vendor_artifact_unreadable".to_string());
         }
         let name = entry.name().to_string();
         let mut bytes = Vec::new();
+        // +1 so an entry that would exceed the remaining budget reads one
+        // byte past it and is rejected, rather than truncating silently.
         entry
             .by_ref()
-            .take(MAX_WHEEL_DECOMPRESSED_BYTES)
+            .take(MAX_WHEEL_DECOMPRESSED_BYTES - actual + 1)
             .read_to_end(&mut bytes)
             .map_err(|_| "vendor_artifact_unreadable".to_string())?;
+        actual = actual.saturating_add(bytes.len() as u64);
+        if actual > MAX_WHEEL_DECOMPRESSED_BYTES {
+            return Err("vendor_artifact_unreadable".to_string());
+        }
         out.insert(name, bytes);
     }
     Ok(out)
@@ -591,6 +605,95 @@ mod tests {
                 .unwrap_err(),
             "vendor_artifact_missing"
         );
+    }
+
+    /// Rewrite every declared uncompressed size in `zip_path` (central
+    /// directory AND local headers) to 0, leaving compressed data and CRCs
+    /// intact — the header lie a tampered wheel uses to slip a decompression
+    /// bomb past size accounting that trusts `entry.size()`.
+    fn zero_declared_sizes(zip_path: &Path) {
+        let mut bytes = std::fs::read(zip_path).unwrap();
+        let eocd = bytes.len() - 22;
+        assert_eq!(&bytes[eocd..eocd + 4], b"PK\x05\x06", "EOCD not found");
+        let cd_count = u16::from_le_bytes([bytes[eocd + 10], bytes[eocd + 11]]) as usize;
+        let mut off =
+            u32::from_le_bytes(bytes[eocd + 16..eocd + 20].try_into().unwrap()) as usize;
+        for _ in 0..cd_count {
+            assert_eq!(&bytes[off..off + 4], b"PK\x01\x02", "central header not found");
+            let name_len = u16::from_le_bytes([bytes[off + 28], bytes[off + 29]]) as usize;
+            let extra_len = u16::from_le_bytes([bytes[off + 30], bytes[off + 31]]) as usize;
+            let comment_len = u16::from_le_bytes([bytes[off + 32], bytes[off + 33]]) as usize;
+            let lho =
+                u32::from_le_bytes(bytes[off + 42..off + 46].try_into().unwrap()) as usize;
+            bytes[off + 24..off + 28].fill(0);
+            assert_eq!(&bytes[lho..lho + 4], b"PK\x03\x04", "local header not found");
+            bytes[lho + 22..lho + 26].fill(0);
+            off += 46 + name_len + extra_len + comment_len;
+        }
+        std::fs::write(zip_path, bytes).unwrap();
+    }
+
+    /// SECURITY: the declared `entry.size()` is attacker-controlled header
+    /// data the zip reader never enforces — accounting must budget by bytes
+    /// ACTUALLY decompressed, or a wheel declaring 0 everywhere buffers up to
+    /// 64 MiB × 10_000 entries into the audit's memory.
+    #[test]
+    fn wheel_bomb_with_lying_declared_sizes_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let whl = tmp.path().join("bomb-1.0.0-py3-none-any.whl");
+        // 5 × 16 MiB of zeros = 80 MiB actual (over the 64 MiB cap), a few
+        // KiB compressed; every header then claims 0 uncompressed bytes.
+        let file = std::fs::File::create(&whl).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let member = vec![0u8; 16 * 1024 * 1024];
+        for i in 0..5 {
+            zip.start_file::<_, ()>(format!("pad{i}.bin"), Default::default())
+                .unwrap();
+            zip.write_all(&member).unwrap();
+        }
+        zip.finish().unwrap();
+        zero_declared_sizes(&whl);
+
+        assert!(
+            read_wheel_to_map(&whl).is_err(),
+            "an 80 MiB-actual wheel declaring 0 bytes must not be buffered past the cap"
+        );
+    }
+
+    /// SECURITY: a FIFO planted at the artifact path must fail verification,
+    /// not wedge the audit in `open(2)` waiting for a writer that never
+    /// comes (the tarball reader and file hasher already guard this).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fifo_wheel_artifact_fails_instead_of_wedging() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let rel = format!(".socket/vendor/pypi/{UUID}/six-1.16.0-py2.py3-none-any.whl");
+        tokio::fs::create_dir_all(root.join(format!(".socket/vendor/pypi/{UUID}")))
+            .await
+            .unwrap();
+        let fifo = root.join(&rel);
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) }, 0);
+
+        let rec = record(UUID, "six.py");
+        let ent = entry("pypi", UUID, &rel);
+        let verdict = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            verify_vendored_patch_record(root, &ent, &rec),
+        )
+        .await;
+        // Release any opener still blocked on the FIFO (the buggy case) so
+        // runtime shutdown doesn't hang on its spawn_blocking thread.
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            let _ = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&fifo);
+        }
+        let verdict = verdict.expect("a planted FIFO must not wedge verification");
+        assert_eq!(verdict.unwrap_err(), "vendor_artifact_unreadable");
     }
 
     /// Full classification matrix for the repair-facing health check.

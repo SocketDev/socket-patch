@@ -17,8 +17,6 @@
 //! No network. No toolchain. Unix-gated for the chmod-based test;
 //! the rest are portable.
 
-use std::collections::HashMap;
-
 use socket_patch_core::patch::cow::{break_hardlink_if_needed, CowAction};
 use socket_patch_core::patch::sidecars::dispatch_fixup;
 
@@ -36,7 +34,7 @@ use socket_patch_core::patch::sidecars::dispatch_fixup;
 /// early-return would NOT change the result and the regression would
 /// stay green. We use `pkg:pypi/...` because the pypi arm
 /// *unconditionally* emits an advisory (`Some`) whenever it is reached
-/// — and it is compiled in every feature configuration. So observing
+/// — and it is always compiled in. So observing
 /// `None` here can ONLY mean the empty-patched short-circuit fired
 /// before PURL classification. (This mirrors the in-tree lib test
 /// `empty_patched_short_circuits_before_advisory`, which the original
@@ -44,7 +42,7 @@ use socket_patch_core::patch::sidecars::dispatch_fixup;
 #[tokio::test]
 async fn dispatch_fixup_empty_patched_returns_none() {
     let tmp = tempfile::tempdir().unwrap();
-    let out = dispatch_fixup("pkg:pypi/requests@2.28.0", tmp.path(), &[], &HashMap::new())
+    let out = dispatch_fixup("pkg:pypi/requests@2.28.0", tmp.path(), &[])
         .await
         .unwrap();
     assert!(
@@ -63,7 +61,6 @@ async fn dispatch_fixup_unknown_ecosystem_returns_none() {
         "pkg:totally-not-an-ecosystem/x@1",
         tmp.path(),
         &["x".to_string()],
-        &HashMap::new(),
     )
     .await
     .unwrap();
@@ -87,7 +84,6 @@ async fn dispatch_fixup_unknown_ecosystem_returns_none() {
 /// `sha256_file(on_disk)`, and the open fails with NotFound. The
 /// `.map_err(|source| SidecarError::Io { ... })?` wraps it; the
 /// dispatcher returns `Err(SidecarError::Io)`.
-#[cfg(feature = "cargo")]
 #[tokio::test]
 async fn dispatch_fixup_cargo_sha256_file_failure_arm() {
     use socket_patch_core::patch::sidecars::SidecarError;
@@ -107,7 +103,6 @@ async fn dispatch_fixup_cargo_sha256_file_failure_arm() {
         "pkg:cargo/anything@1.0.0",
         pkg,
         &["package/missing-on-disk.txt".to_string()],
-        &HashMap::new(),
     )
     .await;
 
@@ -143,7 +138,6 @@ async fn dispatch_fixup_cargo_sha256_file_failure_arm() {
 ///
 /// Together with the no-metadata + signed-marker tests this nails
 /// down every branch in `has_signed_marker`'s setup.
-#[cfg(feature = "nuget")]
 #[tokio::test]
 async fn dispatch_fixup_nuget_with_nonexistent_pkg_path() {
     let tmp = tempfile::tempdir().unwrap();
@@ -153,7 +147,6 @@ async fn dispatch_fixup_nuget_with_nonexistent_pkg_path() {
         "pkg:nuget/Anything@1.0.0",
         &absent,
         &["package/file.txt".to_string()],
-        &HashMap::new(),
     )
     .await
     .unwrap();

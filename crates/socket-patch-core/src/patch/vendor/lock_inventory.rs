@@ -22,9 +22,10 @@ use std::path::Path;
 
 use serde_json::Value;
 
+use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::patch::bun_lock_text;
 use crate::patch::path_safety;
-use crate::utils::purl::strip_purl_qualifiers;
+use crate::utils::purl::{percent_decode_purl_component, strip_purl_qualifiers};
 
 use super::npm_common::is_safe_npm_name;
 use super::npm_flavor::{detect_npm_lock_flavor, NpmLockFlavor};
@@ -97,9 +98,7 @@ impl LockfileEntry {
 /// Inventory the project's npm-family lockfile. Routes by
 /// [`detect_npm_lock_flavor`] (PnP markers, bun.lockb, unsupported lock
 /// versions, and a missing lockfile all yield `None`).
-pub async fn inventory_npm_lock(
-    project_root: &Path,
-) -> Option<(NpmLockFlavor, Vec<LockfileEntry>)> {
+async fn inventory_npm_lock(project_root: &Path) -> Option<(NpmLockFlavor, Vec<LockfileEntry>)> {
     // Rush monorepos have no root package.json/lock pair; their single
     // pnpm source-of-truth lives under common/config/rush/. The flavor
     // probe (root-relative) can't see it, so fall back explicitly when the
@@ -129,21 +128,17 @@ pub fn lookup<'a>(entries: &'a [LockfileEntry], purl: &str) -> Option<&'a Lockfi
     let decoded = crate::utils::purl::normalize_purl(strip_purl_qualifiers(purl)).into_owned();
     let rest = decoded.strip_prefix("pkg:")?;
     let (purl_type, rest) = rest.split_once('/')?;
-    // purl type → vendor-ecosystem tag (same mapping the dispatcher uses).
+    // purl types double as the vendor-ecosystem tags (same set the
+    // dispatcher recognizes).
     let eco = match purl_type {
-        "npm" => "npm",
-        "cargo" => "cargo",
-        "golang" => "golang",
-        "pypi" => "pypi",
-        "gem" => "gem",
-        "composer" => "composer",
+        "npm" | "cargo" | "golang" | "pypi" | "gem" | "composer" => purl_type,
         _ => return None,
     };
     let at = rest.rfind('@').filter(|&i| i > 0)?;
     let (name, version) = (&rest[..at], &rest[at + 1..]);
     // pypi names compare in PEP 503 normalized form.
     let name = if eco == "pypi" {
-        pep503(name)
+        canonicalize_pypi_name(name)
     } else {
         name.to_string()
     };
@@ -159,15 +154,12 @@ pub async fn inventory_project(project_root: &Path) -> Vec<LockfileEntry> {
     if let Some((_, entries)) = inventory_npm_lock(project_root).await {
         out.extend(entries);
     }
-    #[cfg(feature = "cargo")]
     if let Some(entries) = inventory_cargo_lock(project_root).await {
         out.extend(entries);
     }
-    #[cfg(feature = "golang")]
     if let Some(entries) = inventory_go_sum(project_root).await {
         out.extend(entries);
     }
-    #[cfg(feature = "composer")]
     if let Some(entries) = inventory_composer_lock(project_root).await {
         out.extend(entries);
     }
@@ -222,8 +214,7 @@ fn dedup_prefer_integrity(raw: Vec<LockfileEntry>) -> Vec<LockfileEntry> {
 /// entries are fetchable (their `checksum` is the sha256 of the `.crate`
 /// file); workspace members (no `source`) are skipped, and git/custom-
 /// registry sources stay listed for discovery without a verifier.
-#[cfg(feature = "cargo")]
-pub async fn inventory_cargo_lock(project_root: &Path) -> Option<Vec<LockfileEntry>> {
+async fn inventory_cargo_lock(project_root: &Path) -> Option<Vec<LockfileEntry>> {
     let text = tokio::fs::read_to_string(project_root.join("Cargo.lock"))
         .await
         .ok()?;
@@ -249,11 +240,7 @@ pub async fn inventory_cargo_lock(project_root: &Path) -> Option<Vec<LockfileEnt
             let crates_io = source.contains("github.com/rust-lang/crates.io-index")
                 || source.contains("index.crates.io");
             let integrity = match checksum {
-                Some(c)
-                    if crates_io && c.len() == 64 && c.bytes().all(|b| b.is_ascii_hexdigit()) =>
-                {
-                    LockIntegrity::Sha256Hex(c)
-                }
+                Some(c) if crates_io && is_hex_of_len(&c, 64) => LockIntegrity::Sha256Hex(c),
                 _ => LockIntegrity::None,
             };
             let purl = format!("pkg:cargo/{name}@{version}");
@@ -301,8 +288,7 @@ pub async fn inventory_cargo_lock(project_root: &Path) -> Option<Vec<LockfileEnt
 /// `/go.mod`-suffixed lines hash only the manifest and are skipped. go.sum
 /// may list more modules than the final build graph — acceptable for
 /// discovery, and the manifest decides what actually gets vendored.
-#[cfg(feature = "golang")]
-pub async fn inventory_go_sum(project_root: &Path) -> Option<Vec<LockfileEntry>> {
+async fn inventory_go_sum(project_root: &Path) -> Option<Vec<LockfileEntry>> {
     let text = tokio::fs::read_to_string(project_root.join("go.sum"))
         .await
         .ok()?;
@@ -340,6 +326,10 @@ pub async fn inventory_go_sum(project_root: &Path) -> Option<Vec<LockfileEntry>>
 /// layer's integrity rule decides fetchability).
 fn http_url(raw: &str) -> Option<String> {
     (raw.starts_with("https://") || raw.starts_with("http://")).then(|| raw.to_string())
+}
+
+fn is_hex_of_len(s: &str, len: usize) -> bool {
+    s.len() == len && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 // ──────────────────── package-lock.json / npm-shrinkwrap ────────────────────
@@ -402,16 +392,6 @@ async fn inventory_package_lock(root: &Path) -> Option<Vec<LockfileEntry>> {
 
 // ─────────────────────────── pnpm-lock.yaml v9 ───────────────────────────
 
-/// Extract one value from an inline YAML map fragment like
-/// `{integrity: sha512-…, tarball: file:…}` (values optionally quoted).
-fn inline_map_value(fragment: &str, field: &str) -> Option<String> {
-    let at = fragment.find(&format!("{field}:"))?;
-    let rest = fragment[at + field.len() + 1..].trim_start();
-    let end = rest.find([',', '}']).unwrap_or(rest.len());
-    let value = rest[..end].trim().trim_matches(['\'', '"']);
-    (!value.is_empty()).then(|| value.to_string())
-}
-
 async fn inventory_pnpm_lock(root: &Path) -> Option<Vec<LockfileEntry>> {
     inventory_pnpm_lock_at(&root.join("pnpm-lock.yaml")).await
 }
@@ -447,10 +427,10 @@ async fn inventory_pnpm_lock_at(lock_path: &Path) -> Option<Vec<LockfileEntry>> 
         for line in &lines[block.header + 1..block.end] {
             let t = line.trim();
             if let Some(rest) = t.strip_prefix("resolution:") {
-                if let Some(v) = inline_map_value(rest, "integrity") {
+                if let Some(v) = inline_yaml_field(rest, "integrity:") {
                     integrity = LockIntegrity::Sri(v);
                 }
-                tarball = inline_map_value(rest, "tarball");
+                tarball = inline_yaml_field(rest, "tarball:");
                 break;
             }
         }
@@ -546,8 +526,7 @@ async fn inventory_yarn_classic(root: &Path) -> Option<Vec<LockfileEntry>> {
             Some(raw) => match raw.split_once('#') {
                 Some((url, frag)) => (
                     http_url(url),
-                    (frag.len() == 40 && frag.bytes().all(|b| b.is_ascii_hexdigit()))
-                        .then(|| frag.to_ascii_lowercase()),
+                    is_hex_of_len(frag, 40).then(|| frag.to_ascii_lowercase()),
                 ),
                 None => (http_url(raw), None),
             },
@@ -657,8 +636,7 @@ async fn inventory_bun(root: &Path) -> Option<Vec<LockfileEntry>> {
 /// (sha1 of the dist zip) is frequently empty — such entries stay
 /// discovery-only. Names lowercase to the canonical packagist form;
 /// versions drop the pretty leading `v`.
-#[cfg(feature = "composer")]
-pub async fn inventory_composer_lock(project_root: &Path) -> Option<Vec<LockfileEntry>> {
+async fn inventory_composer_lock(project_root: &Path) -> Option<Vec<LockfileEntry>> {
     let bytes = tokio::fs::read(project_root.join("composer.lock"))
         .await
         .ok()?;
@@ -709,12 +687,11 @@ pub async fn inventory_composer_lock(project_root: &Path) -> Option<Vec<Lockfile
                 .and_then(|d| d.get("shasum"))
                 .and_then(Value::as_str)
                 .unwrap_or("");
-            let integrity =
-                if is_zip && shasum.len() == 40 && shasum.bytes().all(|b| b.is_ascii_hexdigit()) {
-                    LockIntegrity::Sha1Hex(shasum.to_ascii_lowercase())
-                } else {
-                    LockIntegrity::None
-                };
+            let integrity = if is_zip && is_hex_of_len(shasum, 40) {
+                LockIntegrity::Sha1Hex(shasum.to_ascii_lowercase())
+            } else {
+                LockIntegrity::None
+            };
             let purl = format!("pkg:composer/{name}@{version}");
             out.push(LockfileEntry {
                 ecosystem: "composer",
@@ -736,7 +713,7 @@ pub async fn inventory_composer_lock(project_root: &Path) -> Option<Vec<Lockfile
 /// `CHECKSUMS` section's sha256 values when present (older locks stay
 /// discovery-only). Platform-suffixed specs (`nokogiri (1.16.5-arm64-…)`)
 /// are skipped — platform gems are unsupported for vendoring anyway.
-pub async fn inventory_gemfile_lock(project_root: &Path) -> Option<Vec<LockfileEntry>> {
+async fn inventory_gemfile_lock(project_root: &Path) -> Option<Vec<LockfileEntry>> {
     let text = tokio::fs::read_to_string(project_root.join("Gemfile.lock"))
         .await
         .ok()?;
@@ -776,8 +753,7 @@ pub async fn inventory_gemfile_lock(project_root: &Path) -> Option<Vec<LockfileE
                     trimmed.rsplit_once(" sha256=").map(|(s, h)| (s, h.trim()))
                 {
                     if let Some((name, version)) = parse_gem_spec_line(spec_part) {
-                        if hash_part.len() == 64 && hash_part.bytes().all(|b| b.is_ascii_hexdigit())
-                        {
+                        if is_hex_of_len(hash_part, 64) {
                             checksums.insert((name, version), hash_part.to_ascii_lowercase());
                         }
                     }
@@ -830,33 +806,15 @@ fn parse_gem_spec_line(line: &str) -> Option<(String, String)> {
 }
 
 // ─────────────────────────────── pypi locks ───────────────────────────────
-
-/// PEP 503 name normalization (`Foo._Bar` → `foo-bar`) — pypi purls and
-/// lock entries must compare in this form.
-fn pep503(name: &str) -> String {
-    let mut out = String::with_capacity(name.len());
-    let mut last_dash = false;
-    for c in name.chars() {
-        let c = c.to_ascii_lowercase();
-        if c == '-' || c == '_' || c == '.' {
-            if !last_dash {
-                out.push('-');
-                last_dash = true;
-            }
-        } else {
-            out.push(c);
-            last_dash = false;
-        }
-    }
-    out
-}
+// pypi purls and lock entries compare in PEP 503 normalized form
+// (`Foo._Bar` → `foo-bar`) — see `canonicalize_pypi_name`.
 
 /// Inventory the pypi lock the project carries. Fetchable resolution
 /// (URL + sha256 of a pure `py3-none-any` wheel) comes from `uv.lock`;
 /// `poetry.lock` and `--hash`-pinned `requirements.txt` contribute
 /// DISCOVERY-only entries (no recorded URL; platform-independent wheel
 /// choice is not derivable offline). Pipenv/pdm locks: not yet read.
-pub async fn inventory_pypi_locks(project_root: &Path) -> Option<Vec<LockfileEntry>> {
+async fn inventory_pypi_locks(project_root: &Path) -> Option<Vec<LockfileEntry>> {
     if let Some(out) = inventory_uv_lock(project_root).await {
         return Some(out);
     }
@@ -875,7 +833,8 @@ async fn inventory_uv_lock(project_root: &Path) -> Option<Vec<LockfileEntry>> {
     let mut out = Vec::new();
     // Line-oriented: uv emits `[[package]]` blocks; wheels live either as
     // inline `{ url = "…", hash = "sha256:…" }` table rows or one-line
-    // arrays. A pure-python wheel ends `py3-none-any.whl`.
+    // arrays. A pure wheel ends `-none-any.whl` ([`pure_wheel_from_uv_unit`],
+    // the same rule the ledger recovery applies).
     let mut name: Option<String> = None;
     let mut version: Option<String> = None;
     let mut sourced_registry = true;
@@ -886,7 +845,7 @@ async fn inventory_uv_lock(project_root: &Path) -> Option<Vec<LockfileEntry>> {
                  wheel: &mut Option<(String, String)>,
                  out: &mut Vec<LockfileEntry>| {
         if let (Some(n), Some(v)) = (name.take(), version.take()) {
-            let canonical = pep503(&n);
+            let canonical = canonicalize_pypi_name(&n);
             if *sourced_registry
                 && path_safety::is_safe_single_segment(&canonical)
                 && path_safety::is_safe_single_segment(&v)
@@ -928,21 +887,11 @@ async fn inventory_uv_lock(project_root: &Path) -> Option<Vec<LockfileEntry>> {
             // Registry packages: `source = { registry = "…" }`; editable/
             // virtual/path/git sources are not fetchable artifacts.
             sourced_registry = t.contains("registry");
-        } else if wheel.is_none() && t.contains("py3-none-any.whl") {
-            // `{ url = "…py3-none-any.whl", hash = "sha256:…" }`
-            let url = t
-                .split("url = \"")
-                .nth(1)
-                .and_then(|r| r.split('"').next())
-                .unwrap_or("");
-            let sha = t
-                .split("hash = \"sha256:")
-                .nth(1)
-                .and_then(|r| r.split('"').next())
-                .unwrap_or("");
-            if !url.is_empty() && sha.len() == 64 && sha.bytes().all(|b| b.is_ascii_hexdigit()) {
-                wheel = Some((url.to_string(), sha.to_ascii_lowercase()));
-            }
+        } else if wheel.is_none() {
+            // One line may hold several `{ url = "…", hash = "sha256:…" }`
+            // wheels (one-line arrays); pair the pure wheel with ITS OWN
+            // hash, never the line's first url/hash.
+            wheel = pure_wheel_from_uv_unit(t);
         }
     }
     flush(
@@ -979,7 +928,7 @@ async fn inventory_poetry_lock(project_root: &Path) -> Option<Vec<LockfileEntry>
             continue;
         }
         if let Some(v) = t.strip_prefix("name = ") {
-            name = Some(pep503(v.trim_matches('"')));
+            name = Some(canonicalize_pypi_name(v.trim_matches('"')));
         } else if let Some(v) = t.strip_prefix("version = ") {
             if let Some(n) = name.take() {
                 let v = v.trim_matches('"').to_string();
@@ -1021,7 +970,7 @@ async fn inventory_requirements_txt(project_root: &Path) -> Option<Vec<LockfileE
         let Some((raw_name, version)) = spec.split_once("==") else {
             continue;
         };
-        let name = pep503(raw_name.split('[').next().unwrap_or(raw_name).trim());
+        let name = canonicalize_pypi_name(raw_name.split('[').next().unwrap_or(raw_name).trim());
         let version = version.trim().to_string();
         if name.is_empty()
             || !path_safety::is_safe_single_segment(&name)
@@ -1262,6 +1211,10 @@ pub async fn wired_vendor_integrity(
 
 /// `pkg:<eco>/<name>@<version>` → (name, version). The name may itself
 /// contain `/` (npm scopes, go modules); the version is after the LAST `@`.
+/// Components percent-decode (`%40scope` → `@scope`): the ledger stores
+/// `base_purl` verbatim as the manifest spelled it, while [`LockfileEntry`]
+/// carries literal coordinates — the name feeds the registry URL and the
+/// berry cache-zip recipe.
 fn parse_base_purl_coords(base_purl: &str) -> Option<(String, String)> {
     let rest = base_purl.strip_prefix("pkg:")?;
     let (_, name_ver) = rest.split_once('/')?;
@@ -1269,7 +1222,13 @@ fn parse_base_purl_coords(base_purl: &str) -> Option<(String, String)> {
     if name.is_empty() || version.is_empty() {
         return None;
     }
-    Some((name.to_string(), version.to_string()))
+    let name = name
+        .split('/')
+        .map(percent_decode_purl_component)
+        .collect::<Vec<_>>()
+        .join("/");
+    let version = percent_decode_purl_component(version).into_owned();
+    Some((name, version))
 }
 
 /// First wiring record of one of `kinds` carrying an `original` payload.
@@ -1282,10 +1241,6 @@ fn wiring_original<'a>(
         .iter()
         .find(|r| kinds.contains(&r.kind.as_str()) && r.original.is_some())
         .and_then(|r| r.original.as_ref())
-}
-
-fn is_hex_of_len(s: &str, len: usize) -> bool {
-    s.len() == len && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// Per-flavor npm recovery: the wiring kinds disambiguate the lock flavor,
@@ -1893,7 +1848,6 @@ __metadata:
         assert_eq!(out[0].integrity, LockIntegrity::Sri("sha512-x==".into()));
     }
 
-    #[cfg(feature = "cargo")]
     #[tokio::test]
     async fn cargo_lock_inventories_crates_io_entries() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1946,7 +1900,6 @@ checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         assert_eq!(entry(&entries, "git-dep").integrity, LockIntegrity::None);
     }
 
-    #[cfg(feature = "golang")]
     #[tokio::test]
     async fn go_sum_inventories_module_zip_lines() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1999,7 +1952,6 @@ checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         );
     }
 
-    #[cfg(feature = "composer")]
     #[tokio::test]
     async fn composer_lock_inventories_dist_entries() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2128,6 +2080,35 @@ source = { editable = "." }
             LockIntegrity::None
         );
         assert!(!entries.iter().any(|e| e.name == "local-proj"));
+    }
+
+    #[tokio::test]
+    async fn uv_lock_one_line_wheels_array_pairs_the_pure_wheel_with_its_own_hash() {
+        // A one-line `wheels = […]` array (valid TOML — hand-maintained or
+        // formatter-collapsed locks) listing a platform wheel BEFORE the
+        // pure one: the entry must carry the pure wheel's url+hash, never
+        // the first url/hash on the line.
+        let tmp = tempfile::tempdir().unwrap();
+        let platform_sha = "a".repeat(64);
+        let pure_sha = "b".repeat(64);
+        write(
+            tmp.path(),
+            "uv.lock",
+            &format!(
+                "version = 1\n\n[[package]]\nname = \"six\"\nversion = \"1.16.0\"\n\
+                 source = {{ registry = \"https://pypi.org/simple\" }}\n\
+                 wheels = [{{ url = \"https://files.pythonhosted.org/packages/aa/six-1.16.0-cp312-cp312-macosx_11_0_arm64.whl\", hash = \"sha256:{platform_sha}\" }}, {{ url = \"https://files.pythonhosted.org/packages/bb/six-1.16.0-py2.py3-none-any.whl\", hash = \"sha256:{pure_sha}\" }}]\n"
+            ),
+        )
+        .await;
+
+        let entries = inventory_pypi_locks(tmp.path()).await.unwrap();
+        let six = entry(&entries, "six");
+        assert!(
+            six.resolved.as_deref().unwrap().ends_with("-none-any.whl"),
+            "the platform wheel must never be resolved as pure: {six:?}"
+        );
+        assert_eq!(six.integrity, LockIntegrity::Sha256Hex(pure_sha));
     }
 
     #[tokio::test]
@@ -2420,6 +2401,42 @@ mod recover_tests {
         let mut locked = entry("pypi", "pkg:pypi/six@1.16.0", vec![]);
         locked.artifact.platform_locked = Some(true);
         assert!(recover_lock_entry(tmp.path(), &locked).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn recover_decodes_percent_encoded_base_purl() {
+        // The ledger stores base_purl verbatim as the manifest spelled it —
+        // often percent-encoded (`pkg:npm/%40scope/x@1.2.3`). The recovered
+        // entry must carry literal coordinates: the name feeds the registry
+        // tarball URL and the berry cache-zip recipe (which embeds it in
+        // member paths), so an encoded name fails every checksum rebuild.
+        let tmp = tempfile::tempdir().unwrap();
+        let e = entry(
+            "npm",
+            "pkg:npm/%40scope/x@1.2.3",
+            vec![rec(
+                "yarn_berry_lock_entry",
+                serde_json::json!(["\"@scope/x@npm:1.2.3\":", "  checksum: 10c0/abcdef"]),
+            )],
+        );
+        let got = recover_lock_entry(tmp.path(), &e).await.unwrap();
+        assert_eq!(got.name, "@scope/x");
+        assert_eq!(got.purl, "pkg:npm/@scope/x@1.2.3");
+
+        // Version components decode too (`1.0.0%2Bbuild` → `1.0.0+build`).
+        let e = entry(
+            "npm",
+            "pkg:npm/x@1.0.0%2Bbuild",
+            vec![rec(
+                "npm_lock_entry",
+                serde_json::json!({
+                    "resolved": "https://registry.npmjs.org/x/-/x-1.0.0+build.tgz",
+                    "integrity": "sha512-AAAA",
+                }),
+            )],
+        );
+        let got = recover_lock_entry(tmp.path(), &e).await.unwrap();
+        assert_eq!(got.version, "1.0.0+build");
     }
 
     #[tokio::test]

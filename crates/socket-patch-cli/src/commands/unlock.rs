@@ -14,7 +14,10 @@
 //! operators who want a true clean slate. Refused when the lock is
 //! held — that's the `--break-lock` flag's job on the mutating
 //! subcommands, and routing the two through different verbs makes
-//! the dangerous override explicit.
+//! the dangerous override explicit. Under the global `--dry-run`
+//! flag the release is previewed, not performed: the leftover file
+//! stays on disk and the JSON body carries `dryRun` + `wouldRelease`
+//! instead of flipping `released`.
 
 use std::path::Path;
 use std::time::Duration;
@@ -24,7 +27,8 @@ use socket_patch_core::patch::apply_lock::{acquire, LockError};
 use socket_patch_core::utils::telemetry::{track_patch_unlock_failed, track_patch_unlocked};
 
 use crate::args::{apply_env_toggles, parse_bool_flag, GlobalArgs};
-use crate::json_envelope::{Command, Envelope, EnvelopeError};
+use crate::commands::lock_cli::error_envelope;
+use crate::json_envelope::Command;
 
 #[derive(Args)]
 pub struct UnlockArgs {
@@ -40,8 +44,10 @@ pub struct UnlockArgs {
     /// strings `true`/`false` from the env binding, so
     /// `SOCKET_UNLOCK_RELEASE=1` (or an exported-but-empty
     /// `SOCKET_UNLOCK_RELEASE=`) aborted every `unlock` invocation.
-    /// This flag is also outside `GLOBAL_ARG_ENV_VARS`, so `main`'s
-    /// empty-var scrub never rescues it.
+    /// (`main`'s empty-var scrub also removes a blank
+    /// `SOCKET_UNLOCK_RELEASE` via `LOCAL_ARG_ENV_VARS`, but the
+    /// parser itself must not depend on it — library callers of
+    /// `Cli::parse` never run the scrub.)
     #[arg(
         long = "release",
         env = "SOCKET_UNLOCK_RELEASE",
@@ -62,8 +68,8 @@ pub async fn run(args: UnlockArgs) -> i32 {
     let manifest_path = args.common.resolved_manifest_path();
     let socket_dir = manifest_path.parent().unwrap_or(Path::new("."));
     let lock_file = socket_dir.join("apply.lock");
-    let api_token = args.common.api_token.clone();
-    let org_slug = args.common.org.clone();
+    let api_token = args.common.api_token.as_deref();
+    let org_slug = args.common.org.as_deref();
 
     // No `.socket/` at all → treat as "free" (no one could be
     // holding a lock that doesn't exist). Useful for fresh repos
@@ -73,13 +79,15 @@ pub async fn run(args: UnlockArgs) -> i32 {
         // remove, so `released` is false regardless of whether the
         // user passed --release. Telemetry and the emitted envelope
         // must agree on this.
-        track_patch_unlocked(false, false, api_token.as_deref(), org_slug.as_deref()).await;
+        track_patch_unlocked(false, false, api_token, org_slug).await;
         return emit_free(
             args.common.json,
             args.common.silent,
             &lock_file,
             false,
+            false,
             args.release,
+            args.common.dry_run,
         );
     }
 
@@ -98,7 +106,7 @@ pub async fn run(args: UnlockArgs) -> i32 {
             // delete races nothing.
             drop(guard);
 
-            if args.release {
+            let removed = if args.release && !args.common.dry_run {
                 match std::fs::remove_file(&lock_file) {
                     // `remove_file` here almost always returns `Ok`
                     // (the probe's `acquire` ensured the file exists),
@@ -108,86 +116,63 @@ pub async fn run(args: UnlockArgs) -> i32 {
                     // operator asked for a clean slate), but only claim
                     // we "released" something when a lock file was there
                     // before we probed.
-                    Ok(()) => {
-                        track_patch_unlocked(
-                            false,
-                            lock_existed,
-                            api_token.as_deref(),
-                            org_slug.as_deref(),
-                        )
-                        .await;
-                        emit_free(
-                            args.common.json,
-                            args.common.silent,
-                            &lock_file,
-                            lock_existed,
-                            true,
-                        )
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        // The file was never created (e.g. socket
-                        // dir existed but no run has acquired the
-                        // lock yet). Treat as success.
-                        track_patch_unlocked(
-                            false,
-                            false,
-                            api_token.as_deref(),
-                            org_slug.as_deref(),
-                        )
-                        .await;
-                        emit_free(
-                            args.common.json,
-                            args.common.silent,
-                            &lock_file,
-                            false,
-                            true,
-                        )
-                    }
+                    Ok(()) => lock_existed,
+                    // NotFound: the file was never created (e.g. socket
+                    // dir existed but no run has acquired the lock yet).
+                    // Treat as success.
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
                     Err(e) => {
                         let msg = format!(
                             "failed to remove lock file at {}: {}",
                             lock_file.display(),
                             e
                         );
-                        track_patch_unlock_failed(&msg, api_token.as_deref(), org_slug.as_deref())
-                            .await;
-                        emit_error(args.common.json, args.common.silent, "lock_io", &msg);
-                        1
+                        track_patch_unlock_failed(&msg, api_token, org_slug).await;
+                        emit_error(
+                            args.common.json,
+                            args.common.silent,
+                            args.common.dry_run,
+                            "lock_io",
+                            &msg,
+                        );
+                        return 1;
                     }
                 }
             } else {
-                track_patch_unlocked(false, false, api_token.as_deref(), org_slug.as_deref()).await;
-                emit_free(
-                    args.common.json,
-                    args.common.silent,
-                    &lock_file,
-                    false,
-                    false,
-                )
-            }
+                // `--dry-run` previews the release without performing it —
+                // the pre-existing leftover (the thing a real `--release`
+                // would delete) stays on disk. Deleting a file the probe
+                // itself just created is NOT the previewed mutation though:
+                // leaving it would make the dry run the only mode that
+                // *adds* state, so restore the tree to what we found.
+                if args.common.dry_run && !lock_existed {
+                    let _ = std::fs::remove_file(&lock_file);
+                }
+                false
+            };
+            let would_remove = args.release && args.common.dry_run && lock_existed;
+            track_patch_unlocked(false, removed, api_token, org_slug).await;
+            emit_free(
+                args.common.json,
+                args.common.silent,
+                &lock_file,
+                removed,
+                would_remove,
+                args.release,
+                args.common.dry_run,
+            )
         }
         Err(LockError::Held) => {
-            track_patch_unlock_failed(
-                "lock held by another process",
-                api_token.as_deref(),
-                org_slug.as_deref(),
-            )
-            .await;
+            track_patch_unlock_failed("lock held by another process", api_token, org_slug).await;
+            let msg = format!(
+                "another socket-patch process is operating in {}",
+                socket_dir.display()
+            );
             if args.common.json {
-                let mut env = Envelope::new(Command::Unlock);
-                env.mark_error(EnvelopeError::new(
-                    "lock_held",
-                    format!(
-                        "another socket-patch process is operating in {}",
-                        socket_dir.display()
-                    ),
-                ));
+                let env = error_envelope(Command::Unlock, args.common.dry_run, "lock_held", &msg);
                 println!("{}", env.to_pretty_json());
             } else if !args.common.silent {
-                eprintln!(
-                    "Lock is held: another socket-patch process is operating in {}.",
-                    socket_dir.display()
-                );
+                eprintln!("Lock is held: {msg}.");
                 if args.release {
                     eprintln!(
                         "  Refusing to release a held lock. Re-run the failing mutating command with --break-lock if you're sure no holder exists."
@@ -202,8 +187,14 @@ pub async fn run(args: UnlockArgs) -> i32 {
         }
         Err(LockError::Io { path, source }) => {
             let msg = format!("failed to open lock file at {}: {}", path.display(), source);
-            track_patch_unlock_failed(&msg, api_token.as_deref(), org_slug.as_deref()).await;
-            emit_error(args.common.json, args.common.silent, "lock_io", &msg);
+            track_patch_unlock_failed(&msg, api_token, org_slug).await;
+            emit_error(
+                args.common.json,
+                args.common.silent,
+                args.common.dry_run,
+                "lock_io",
+                &msg,
+            );
             1
         }
     }
@@ -211,11 +202,21 @@ pub async fn run(args: UnlockArgs) -> i32 {
 
 /// Print the "free" success envelope and return exit code 0.
 /// `removed` is true when `--release` actually deleted the file
-/// (vs. the no-op case where the file didn't exist).
+/// (vs. the no-op case where the file didn't exist). `would_remove`
+/// is the `--dry-run` preview of `removed`: a pre-existing leftover
+/// that a real `--release` would have deleted.
 /// `silent` suppresses the human-readable lines (the JSON envelope is
 /// machine output and always prints) — same `--silent` contract as the
 /// sibling subcommands.
-fn emit_free(json: bool, silent: bool, lock_file: &Path, removed: bool, release: bool) -> i32 {
+fn emit_free(
+    json: bool,
+    silent: bool,
+    lock_file: &Path,
+    removed: bool,
+    would_remove: bool,
+    release: bool,
+    dry_run: bool,
+) -> i32 {
     if json {
         // Build the success body by hand rather than re-using the
         // shared `Envelope` shape — the `events`/`summary` fields
@@ -223,17 +224,31 @@ fn emit_free(json: bool, silent: bool, lock_file: &Path, removed: bool, release:
         // `{status, lockFile, ...}` is friendlier to jq pipelines.
         // We still tag `command: "unlock"` so generic consumers
         // can route on subcommand identity.
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "command": "unlock",
             "status": "free",
             "lockFile": lock_file.display().to_string(),
             "released": removed,
         });
+        // `released` stays truthful on a dry run (nothing was deleted),
+        // so the preview rides separate additive fields — same shape as
+        // `setup`'s dry-run-only `dryRun`/`wouldUpdate` pair.
+        if dry_run {
+            body["dryRun"] = serde_json::json!(true);
+            if release {
+                body["wouldRelease"] = serde_json::json!(would_remove);
+            }
+        }
         println!("{}", serde_json::to_string_pretty(&body).unwrap());
     } else if silent {
         // Suppress the informational lines; the exit code carries the verdict.
     } else if release && removed {
         println!("Lock is free. Removed {}.", lock_file.display());
+    } else if would_remove {
+        println!(
+            "Lock is free. Would remove {} (dry run).",
+            lock_file.display()
+        );
     } else if release {
         println!("Lock is free (no lock file to remove).");
     } else {
@@ -242,10 +257,9 @@ fn emit_free(json: bool, silent: bool, lock_file: &Path, removed: bool, release:
     0
 }
 
-fn emit_error(json: bool, silent: bool, code: &str, message: &str) {
+fn emit_error(json: bool, silent: bool, dry_run: bool, code: &str, message: &str) {
     if json {
-        let mut env = Envelope::new(Command::Unlock);
-        env.mark_error(EnvelopeError::new(code, message));
+        let env = error_envelope(Command::Unlock, dry_run, code, message);
         println!("{}", env.to_pretty_json());
     } else if !silent {
         eprintln!("Error: {message}.");
@@ -383,6 +397,48 @@ mod tests {
         assert!(
             !socket_dir.join("apply.lock").exists(),
             "--release must remove an unheld stale lock file"
+        );
+    }
+
+    /// `--release --dry-run` previews the release without performing
+    /// it: the pre-existing leftover file must survive. Regression
+    /// guard: `run` never read `common.dry_run`, so the global
+    /// `--dry-run` ("Preview, no mutations") flag was silently ignored
+    /// and the file was deleted anyway.
+    #[tokio::test]
+    async fn run_release_dry_run_keeps_leftover_lock_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_dir = dir.path().join(".socket");
+        std::fs::create_dir_all(&socket_dir).unwrap();
+        std::fs::write(socket_dir.join("apply.lock"), b"crashed-run-leftover").unwrap();
+
+        let mut args = args_in(dir.path(), true);
+        args.common.dry_run = true;
+        let code = run(args).await;
+        assert_eq!(code, 0);
+        assert!(
+            socket_dir.join("apply.lock").is_file(),
+            "--dry-run must not delete the leftover lock file"
+        );
+    }
+
+    /// `--release --dry-run` against a clean `.socket/` must not leave
+    /// the probe-created file behind — a dry run may not *add* state
+    /// either. Companion to `run_release_cleans_up_probe_created_file`.
+    #[tokio::test]
+    async fn run_release_dry_run_leaves_no_probe_created_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_dir = dir.path().join(".socket");
+        std::fs::create_dir_all(&socket_dir).unwrap();
+        assert!(!socket_dir.join("apply.lock").exists());
+
+        let mut args = args_in(dir.path(), true);
+        args.common.dry_run = true;
+        let code = run(args).await;
+        assert_eq!(code, 0);
+        assert!(
+            !socket_dir.join("apply.lock").exists(),
+            "--release --dry-run must not leave a probe-created lock file behind"
         );
     }
 

@@ -1,18 +1,7 @@
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::manifest::schema::PatchManifest;
-
-/// Resolve a manifest path: absolute paths are returned as-is, relative paths
-/// are joined to `cwd`. Centralizes the duplicate block previously inlined in
-/// apply/rollback/list/remove/repair commands.
-pub fn resolve_manifest_path(cwd: &Path, manifest_path: &str) -> PathBuf {
-    if Path::new(manifest_path).is_absolute() {
-        PathBuf::from(manifest_path)
-    } else {
-        cwd.join(manifest_path)
-    }
-}
 
 /// Get only afterHash blobs referenced by a manifest.
 /// Used for apply operations -- we only need the patched file content, not the original.
@@ -51,7 +40,7 @@ pub fn get_before_hash_blobs(manifest: &PatchManifest) -> HashSet<String> {
 
 /// Validate a parsed JSON value as a PatchManifest.
 /// Returns Ok(manifest) if valid, or Err(message) if invalid.
-pub fn validate_manifest(value: &serde_json::Value) -> Result<PatchManifest, String> {
+fn validate_manifest(value: &serde_json::Value) -> Result<PatchManifest, String> {
     serde_json::from_value::<PatchManifest>(value.clone())
         .map_err(|e| format!("Invalid manifest: {}", e))
 }
@@ -67,7 +56,7 @@ pub async fn read_manifest(
     let content = match tokio::fs::read_to_string(path).await {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e), // FIX: propagate actual I/O error
+        Err(e) => return Err(e),
     };
 
     let parsed: serde_json::Value = match serde_json::from_str(&content) {
@@ -104,48 +93,7 @@ pub async fn write_manifest(
     let path = path.as_ref();
     let content = serde_json::to_string_pretty(manifest)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let stem = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "manifest.json".to_string());
-    let stage = parent.join(format!(".socket-stage-{}-{}", stem, uuid::Uuid::new_v4()));
-
-    let mut file = tokio::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&stage)
-        .await?;
-
-    use tokio::io::AsyncWriteExt;
-    if let Err(e) = file.write_all(content.as_bytes()).await {
-        let _ = tokio::fs::remove_file(&stage).await;
-        return Err(e);
-    }
-    if let Err(e) = file.sync_all().await {
-        let _ = tokio::fs::remove_file(&stage).await;
-        return Err(e);
-    }
-    drop(file);
-
-    if let Err(e) = tokio::fs::rename(&stage, path).await {
-        let _ = tokio::fs::remove_file(&stage).await;
-        return Err(e);
-    }
-
-    // Durability: `sync_all` flushed the file's data, but the rename only
-    // updated the parent directory entry. fsync the directory so the rename
-    // itself survives a crash. Unix only; best-effort, since a directory we
-    // can't open for fsync must not fail an otherwise-successful write.
-    #[cfg(unix)]
-    {
-        if let Ok(dir) = tokio::fs::File::open(parent).await {
-            let _ = dir.sync_all().await;
-        }
-    }
-
-    Ok(())
+    crate::utils::fs::atomic_write_bytes(path, content.as_bytes()).await
 }
 
 #[cfg(test)]
@@ -528,31 +476,5 @@ mod tests {
                 "a failed write must not leave stage litter, found {name}"
             );
         }
-    }
-
-    #[test]
-    fn test_resolve_manifest_path_relative_joins_cwd() {
-        let cwd = Path::new("/tmp/proj");
-        let resolved = resolve_manifest_path(cwd, ".socket/manifest.json");
-        assert_eq!(resolved, PathBuf::from("/tmp/proj/.socket/manifest.json"));
-    }
-
-    #[test]
-    fn test_resolve_manifest_path_absolute_unchanged() {
-        let cwd = Path::new("/tmp/proj");
-        let absolute = if cfg!(windows) {
-            r"C:\custom\manifest.json"
-        } else {
-            "/etc/custom/manifest.json"
-        };
-        let resolved = resolve_manifest_path(cwd, absolute);
-        assert_eq!(resolved, PathBuf::from(absolute));
-    }
-
-    #[test]
-    fn test_resolve_manifest_path_relative_dotted() {
-        let cwd = Path::new("/tmp/proj");
-        let resolved = resolve_manifest_path(cwd, "../manifest.json");
-        assert_eq!(resolved, PathBuf::from("/tmp/proj/../manifest.json"));
     }
 }

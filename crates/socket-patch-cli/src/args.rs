@@ -13,7 +13,7 @@
 //! names are still read at runtime (via `socket_patch_core::env_compat`) with
 //! a one-shot deprecation warning; they will be removed in the next major.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::Args;
 
@@ -26,11 +26,8 @@ use socket_patch_core::patch::vendor::VendorSource;
 
 /// clap value-parser for each `--ecosystems` / `SOCKET_ECOSYSTEMS` token.
 ///
-/// Rejects any name this build does not support — both typos and
-/// ecosystems whose Cargo feature is not compiled in (e.g. `maven` /
-/// `nuget` on a default build, which ships npm + PyPI + Ruby gems + Go +
-/// Cargo). `Ecosystem::all()` is itself `#[cfg]`-gated, so the accepted
-/// set tracks the compiled feature set exactly.
+/// Rejects any name that is not a supported ecosystem, so typos fail
+/// loudly instead of silently matching nothing.
 ///
 /// Without this, an unsupported name parsed fine and was then silently
 /// dropped by `partition_purls`/`crawl_all_ecosystems`, so the user got a
@@ -124,8 +121,8 @@ pub struct GlobalArgs {
     )]
     pub proxy_url: String,
 
-    /// Restrict to these ecosystems (comma-separated). Names not supported
-    /// by this build (e.g. `maven`/`nuget` unless compiled in) are rejected.
+    /// Restrict to these ecosystems (comma-separated). Names that are not
+    /// supported ecosystems are rejected.
     #[arg(
         long = "ecosystems",
         short = 'e',
@@ -305,13 +302,14 @@ pub struct GlobalArgs {
 }
 
 impl GlobalArgs {
-    /// Resolve `manifest_path` against `cwd`. See
-    /// `socket_patch_core::manifest::operations::resolve_manifest_path`.
-    pub fn resolved_manifest_path(&self) -> PathBuf {
-        socket_patch_core::manifest::operations::resolve_manifest_path(
-            &self.cwd,
-            &self.manifest_path,
-        )
+    /// Resolve `manifest_path` against `cwd`: absolute paths are returned
+    /// as-is, relative paths are joined to `cwd`.
+    pub(crate) fn resolved_manifest_path(&self) -> PathBuf {
+        if Path::new(&self.manifest_path).is_absolute() {
+            PathBuf::from(&self.manifest_path)
+        } else {
+            self.cwd.join(&self.manifest_path)
+        }
     }
 
     /// Build [`ApiClientEnvOverrides`] from the CLI flags.
@@ -346,7 +344,7 @@ impl GlobalArgs {
 /// without this mirror a bare `--offline` flag (or a truthy spelling like
 /// `SOCKET_OFFLINE=yes` that core's `"1" | "true"` match doesn't recognize)
 /// still let telemetry fire a network request.
-pub fn apply_env_toggles(common: &GlobalArgs) {
+pub(crate) fn apply_env_toggles(common: &GlobalArgs) {
     if common.offline {
         std::env::set_var("SOCKET_OFFLINE", "1");
     }
@@ -359,7 +357,7 @@ pub fn apply_env_toggles(common: &GlobalArgs) {
 }
 
 /// Every env var `GlobalArgs` binds (one per `env = "..."` attribute above).
-/// Single source of truth for [`scrub_empty_global_env_vars`] and the
+/// Single source of truth for [`scrub_empty_env_vars`] and the
 /// clean-environment test harnesses.
 pub const GLOBAL_ARG_ENV_VARS: &[&str] = &[
     "SOCKET_CWD",
@@ -374,6 +372,7 @@ pub const GLOBAL_ARG_ENV_VARS: &[&str] = &[
     "SOCKET_VENDOR_URL",
     "SOCKET_PATCH_SERVER_URL",
     "SOCKET_OFFLINE",
+    "SOCKET_STRICT",
     "SOCKET_GLOBAL",
     "SOCKET_GLOBAL_PREFIX",
     "SOCKET_JSON",
@@ -387,21 +386,48 @@ pub const GLOBAL_ARG_ENV_VARS: &[&str] = &[
     "SOCKET_TELEMETRY_DISABLED",
 ];
 
-/// Remove exported-but-**empty** `GlobalArgs` env vars before clap parses.
+/// Every env var a **subcommand-local** flag binds (one per `env = "..."`
+/// attribute in `commands/*.rs`). Same contract as [`GLOBAL_ARG_ENV_VARS`]:
+/// single source of truth for [`scrub_empty_env_vars`] and the
+/// clean-environment test harnesses. A flag added with an `env` binding but
+/// missing here escapes the empty-var scrub — the invariant tests below
+/// parse every entry against its owning subcommand to keep this honest.
+pub const LOCAL_ARG_ENV_VARS: &[&str] = &[
+    "SOCKET_FORCE",
+    "SOCKET_SAVE_ONLY",
+    "SOCKET_ONE_OFF",
+    "SOCKET_ALL_RELEASES",
+    "SOCKET_SKIP_ROLLBACK",
+    "SOCKET_DOWNLOAD_ONLY",
+    "SOCKET_SETUP_EXCLUDE",
+    "SOCKET_VENDOR_REVERT",
+    "SOCKET_UNLOCK_RELEASE",
+    "SOCKET_BATCH_SIZE",
+    "SOCKET_VEX",
+    "SOCKET_VEX_OUTPUT",
+    "SOCKET_VEX_PRODUCT",
+    "SOCKET_VEX_NO_VERIFY",
+    "SOCKET_VEX_DOC_ID",
+    "SOCKET_VEX_COMPACT",
+];
+
+/// Remove exported-but-**empty** flag-bound env vars before clap parses.
 ///
 /// `SOCKET_CWD=` — the conventional shell/CI idiom for blanking a variable
 /// without unsetting it — must mean "unset, fall back to the default", not
 /// abort the command. [`parse_bool_flag`] already gives the bool flags that
 /// semantic, but clap rejects an empty `SOCKET_CWD` / `SOCKET_GLOBAL_PREFIX`
-/// ("a value is required"), `SOCKET_LOCK_TIMEOUT` ("cannot parse integer
-/// from empty string") and `SOCKET_ECOSYSTEMS` (the per-token validator)
-/// outright — a single stray blank var crashed every subcommand — and an
-/// empty `SOCKET_DOWNLOAD_MODE` / `SOCKET_MANIFEST_PATH` leaked `""` past
-/// the documented defaults. Called from `main` after legacy-name promotion
-/// and before clap runs. Only exactly-empty values are scrubbed; whitespace
-/// is significant in paths, so it is left for the parsers to judge.
-pub fn scrub_empty_global_env_vars() {
-    for &var in GLOBAL_ARG_ENV_VARS {
+/// ("a value is required"), `SOCKET_LOCK_TIMEOUT` / `SOCKET_BATCH_SIZE`
+/// ("cannot parse integer from empty string") and `SOCKET_ECOSYSTEMS` (the
+/// per-token validator) outright — a single stray blank var crashed every
+/// subcommand — and an empty `SOCKET_DOWNLOAD_MODE` / `SOCKET_MANIFEST_PATH`
+/// (or `SOCKET_VEX_OUTPUT`, which would silently target `""`) leaked `""`
+/// past the documented defaults. Called from `main` after legacy-name
+/// promotion and before clap runs. Only exactly-empty values are scrubbed;
+/// whitespace is significant in paths, so it is left for the parsers to
+/// judge.
+pub fn scrub_empty_env_vars() {
+    for &var in GLOBAL_ARG_ENV_VARS.iter().chain(LOCAL_ARG_ENV_VARS) {
         if matches!(std::env::var(var).as_deref(), Ok("")) {
             std::env::remove_var(var);
         }
@@ -466,19 +492,12 @@ mod tests {
         common: GlobalArgs,
     }
 
-    /// Full list of env vars `GlobalArgs` reads, so each clap-parse test starts
-    /// from a known-clean environment (no ambient `SOCKET_*` bleed-through).
-    /// Aliases the production list so the scrub and the harness can't drift.
-    const SOCKET_ENV_VARS: &[&str] = GLOBAL_ARG_ENV_VARS;
-
-    /// Snapshot/clear every `SOCKET_*` var, run `f`, then restore. Keeps the
+    /// Snapshot/clear each var in `vars`, run `f`, then restore. Keeps the
     /// env-mutating clap tests hermetic and reversible.
-    fn with_clean_socket_env(f: impl FnOnce()) {
-        let saved: Vec<(&str, Option<String>)> = SOCKET_ENV_VARS
-            .iter()
-            .map(|&k| (k, std::env::var(k).ok()))
-            .collect();
-        for &k in SOCKET_ENV_VARS {
+    fn with_env_cleared(vars: &[&str], f: impl FnOnce()) {
+        let saved: Vec<(&str, Option<String>)> =
+            vars.iter().map(|&k| (k, std::env::var(k).ok())).collect();
+        for &k in vars {
             std::env::remove_var(k);
         }
         f();
@@ -490,24 +509,22 @@ mod tests {
         }
     }
 
+    /// Clear every env var a flag reads — global and subcommand-local (the
+    /// production lists, so the scrub and the harness can't drift), giving
+    /// each clap-parse test a known-clean environment with no ambient
+    /// `SOCKET_*` bleed-through.
+    fn with_clean_socket_env(f: impl FnOnce()) {
+        with_env_cleared(GLOBAL_ARG_ENV_VARS, || {
+            with_env_cleared(LOCAL_ARG_ENV_VARS, f);
+        });
+    }
+
     /// Clear the extra env the core telemetry gate reads beyond the
     /// `SOCKET_*` set (`is_telemetry_disabled` also consults `VITEST` and the
     /// legacy `SOCKET_PATCH_TELEMETRY_DISABLED` name), so the airgap tests
     /// below can't pass or fail vacuously. Restores afterwards.
     fn with_clean_telemetry_env(f: impl FnOnce()) {
-        const EXTRA: &[&str] = &["VITEST", "SOCKET_PATCH_TELEMETRY_DISABLED"];
-        let saved: Vec<(&str, Option<String>)> =
-            EXTRA.iter().map(|&k| (k, std::env::var(k).ok())).collect();
-        for &k in EXTRA {
-            std::env::remove_var(k);
-        }
-        f();
-        for (k, v) in saved {
-            match v {
-                Some(v) => std::env::set_var(k, v),
-                None => std::env::remove_var(k),
-            }
-        }
+        with_env_cleared(&["VITEST", "SOCKET_PATCH_TELEMETRY_DISABLED"], f);
     }
 
     /// `--offline` promises "never contact the network", but the telemetry
@@ -556,14 +573,14 @@ mod tests {
         });
     }
 
-    /// `scrub_empty_global_env_vars` removes exactly-empty `SOCKET_*` globals
-    /// (the `VAR=` blank-without-unsetting idiom) and nothing else: set,
-    /// non-empty values — even whitespace-only ones, which are significant in
-    /// paths — survive, and the previously-crashing parse then sees plain
-    /// defaults.
+    /// `scrub_empty_env_vars` removes exactly-empty `SOCKET_*` flag vars
+    /// (the `VAR=` blank-without-unsetting idiom) — global and local — and
+    /// nothing else: set, non-empty values — even whitespace-only ones,
+    /// which are significant in paths — survive, and the
+    /// previously-crashing parse then sees plain defaults.
     #[test]
     #[serial_test::serial]
-    fn scrub_empty_global_env_vars_unsets_only_empties() {
+    fn scrub_empty_env_vars_unsets_only_empties() {
         with_clean_socket_env(|| {
             std::env::set_var("SOCKET_CWD", "");
             std::env::set_var("SOCKET_LOCK_TIMEOUT", "");
@@ -571,16 +588,23 @@ mod tests {
             std::env::set_var("SOCKET_ECOSYSTEMS", "");
             std::env::set_var("SOCKET_DOWNLOAD_MODE", "");
             std::env::set_var("SOCKET_VENDOR_SOURCE", "");
+            std::env::set_var("SOCKET_BATCH_SIZE", "");
+            std::env::set_var("SOCKET_VEX_OUTPUT", "");
             std::env::set_var("SOCKET_MANIFEST_PATH", "keep.json");
             std::env::set_var("SOCKET_ORG_SLUG", " ");
 
-            scrub_empty_global_env_vars();
+            scrub_empty_env_vars();
 
             assert!(
                 std::env::var("SOCKET_CWD").is_err(),
                 "empty var is scrubbed"
             );
             assert!(std::env::var("SOCKET_LOCK_TIMEOUT").is_err());
+            assert!(
+                std::env::var("SOCKET_BATCH_SIZE").is_err(),
+                "empty subcommand-local vars are scrubbed too"
+            );
+            assert!(std::env::var("SOCKET_VEX_OUTPUT").is_err());
             assert_eq!(
                 std::env::var("SOCKET_MANIFEST_PATH").as_deref(),
                 Ok("keep.json"),
@@ -876,27 +900,43 @@ mod tests {
     /// An absolute `manifest_path` ignores `cwd` and passes through unchanged.
     #[test]
     fn resolved_manifest_path_passes_absolute_through() {
+        let absolute = if cfg!(windows) {
+            r"C:\etc\socket\manifest.json"
+        } else {
+            "/etc/socket/manifest.json"
+        };
         let args = GlobalArgs {
             cwd: PathBuf::from("/work/project"),
-            manifest_path: "/etc/socket/manifest.json".to_string(),
+            manifest_path: absolute.to_string(),
+            ..GlobalArgs::default()
+        };
+        assert_eq!(args.resolved_manifest_path(), PathBuf::from(absolute));
+    }
+
+    /// A dotted relative `manifest_path` is joined verbatim, not normalized.
+    #[test]
+    fn resolved_manifest_path_joins_dotted_relative_verbatim() {
+        let args = GlobalArgs {
+            cwd: PathBuf::from("/work/project"),
+            manifest_path: "../manifest.json".to_string(),
             ..GlobalArgs::default()
         };
         assert_eq!(
             args.resolved_manifest_path(),
-            PathBuf::from("/etc/socket/manifest.json"),
+            PathBuf::from("/work/project/../manifest.json"),
         );
     }
 
-    /// `parse_supported_ecosystem` accepts every name this build compiles in
+    /// `parse_supported_ecosystem` accepts every supported ecosystem name
     /// and returns it verbatim.
     #[test]
-    fn parse_supported_ecosystem_accepts_compiled_in_names() {
+    fn parse_supported_ecosystem_accepts_supported_names() {
         for e in Ecosystem::all() {
             let name = e.cli_name();
             assert_eq!(
                 parse_supported_ecosystem(name),
                 Ok(name.to_string()),
-                "{name:?} is compiled in and must be accepted",
+                "{name:?} is a supported ecosystem and must be accepted",
             );
         }
     }
@@ -971,42 +1011,182 @@ mod tests {
         });
     }
 
+    /// The mirror only works if every subcommand's `run` actually calls
+    /// `apply_env_toggles`. `list` and `setup` fire telemetry
+    /// (`track_patch_listed` / `track_patch_setup`) whose kill-switch reads
+    /// `SOCKET_TELEMETRY_DISABLED` / `SOCKET_OFFLINE` from the env only — a
+    /// run entry point that skips the mirror silently ignores
+    /// `--no-telemetry` and lets `--offline` (strict airgap: never contact
+    /// the network) still fire the telemetry HTTP request.
+    #[test]
+    #[serial_test::serial]
+    fn list_and_setup_run_mirror_global_toggles_for_airgap() {
+        with_clean_socket_env(|| {
+            with_clean_telemetry_env(|| {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                let toggles_on = |cwd: &Path| GlobalArgs {
+                    cwd: cwd.to_path_buf(),
+                    offline: true,
+                    no_telemetry: true,
+                    silent: true,
+                    ..GlobalArgs::default()
+                };
+
+                // Guard against a vacuous pass: the gate must start open.
+                assert!(!socket_patch_core::utils::telemetry::is_telemetry_disabled());
+
+                let tmp = tempfile::tempdir().unwrap();
+                rt.block_on(crate::commands::list::run(
+                    crate::commands::list::ListArgs {
+                        common: toggles_on(tmp.path()),
+                    },
+                ));
+                assert!(
+                    socket_patch_core::utils::telemetry::is_telemetry_disabled(),
+                    "`list --offline --no-telemetry` must mirror the toggles into the \
+                     env — its telemetry kill-switch reads only SOCKET_OFFLINE / \
+                     SOCKET_TELEMETRY_DISABLED",
+                );
+
+                // Reset the mirrored vars so setup can't pass on list's leftovers.
+                std::env::remove_var("SOCKET_OFFLINE");
+                std::env::remove_var("SOCKET_TELEMETRY_DISABLED");
+
+                let tmp = tempfile::tempdir().unwrap();
+                rt.block_on(crate::commands::setup::run(
+                    crate::commands::setup::SetupArgs {
+                        check: false,
+                        remove: false,
+                        exclude: Vec::new(),
+                        common: GlobalArgs {
+                            // `setup` must not write anything from a unit test.
+                            dry_run: true,
+                            ..toggles_on(tmp.path())
+                        },
+                    },
+                ));
+                assert!(
+                    socket_patch_core::utils::telemetry::is_telemetry_disabled(),
+                    "`setup --offline --no-telemetry` must mirror the toggles into the env",
+                );
+            });
+        });
+    }
+
     /// `apply_env_toggles` mirrors `--debug` / `--no-telemetry` into the env
     /// vars core code reads directly, and is a no-op when the flags are off.
     /// `#[serial]` because it mutates process-global env state.
     #[test]
     #[serial_test::serial]
     fn apply_env_toggles_mirrors_flags_into_env() {
-        let saved_debug = std::env::var("SOCKET_DEBUG").ok();
-        let saved_telemetry = std::env::var("SOCKET_TELEMETRY_DISABLED").ok();
-        std::env::remove_var("SOCKET_DEBUG");
-        std::env::remove_var("SOCKET_TELEMETRY_DISABLED");
+        with_env_cleared(&["SOCKET_DEBUG", "SOCKET_TELEMETRY_DISABLED"], || {
+            // Flags off: no-op, env stays unset.
+            apply_env_toggles(&GlobalArgs::default());
+            assert!(std::env::var("SOCKET_DEBUG").is_err());
+            assert!(std::env::var("SOCKET_TELEMETRY_DISABLED").is_err());
 
-        // Flags off: no-op, env stays unset.
-        apply_env_toggles(&GlobalArgs::default());
-        assert!(std::env::var("SOCKET_DEBUG").is_err());
-        assert!(std::env::var("SOCKET_TELEMETRY_DISABLED").is_err());
+            // Flags on: mirrored into the env.
+            let args = GlobalArgs {
+                debug: true,
+                no_telemetry: true,
+                ..GlobalArgs::default()
+            };
+            apply_env_toggles(&args);
+            assert_eq!(std::env::var("SOCKET_DEBUG").as_deref(), Ok("1"));
+            assert_eq!(
+                std::env::var("SOCKET_TELEMETRY_DISABLED").as_deref(),
+                Ok("1")
+            );
+        });
+    }
 
-        // Flags on: mirrored into the env.
-        let args = GlobalArgs {
-            debug: true,
-            no_telemetry: true,
-            ..GlobalArgs::default()
-        };
-        apply_env_toggles(&args);
-        assert_eq!(std::env::var("SOCKET_DEBUG").as_deref(), Ok("1"));
-        assert_eq!(
-            std::env::var("SOCKET_TELEMETRY_DISABLED").as_deref(),
-            Ok("1")
-        );
+    /// Policy invariant: EVERY env-bound boolean flag on every subcommand
+    /// parses with [`parse_bool_flag`] semantics — the boolish vocabulary is
+    /// accepted, exported-but-empty means false, garbage is a parse error.
+    /// Table-driven against the real `Cli` so a new flag added with clap's
+    /// default bool-from-env parser (accepts only `true`/`false` — the
+    /// recurring "`SOCKET_X=1` aborts the parse" bug class) or with
+    /// `BoolishValueParser` (rejects `VAR=`) fails here, not in the field.
+    #[test]
+    #[serial_test::serial]
+    fn every_env_bound_bool_flag_parses_boolishly_and_tolerates_empty() {
+        use clap::Parser as _;
 
-        match saved_debug {
-            Some(v) => std::env::set_var("SOCKET_DEBUG", v),
-            None => std::env::remove_var("SOCKET_DEBUG"),
-        }
-        match saved_telemetry {
-            Some(v) => std::env::set_var("SOCKET_TELEMETRY_DISABLED", v),
-            None => std::env::remove_var("SOCKET_TELEMETRY_DISABLED"),
-        }
+        // (env var, argv of a subcommand that binds it) — every bool entry
+        // of `LOCAL_ARG_ENV_VARS`, on each subcommand that binds it.
+        const BOOL_BINDINGS: &[(&str, &[&str])] = &[
+            ("SOCKET_FORCE", &["socket-patch", "apply"]),
+            ("SOCKET_FORCE", &["socket-patch", "vendor"]),
+            ("SOCKET_SAVE_ONLY", &["socket-patch", "get", "x"]),
+            ("SOCKET_ONE_OFF", &["socket-patch", "get", "x"]),
+            ("SOCKET_ONE_OFF", &["socket-patch", "rollback"]),
+            ("SOCKET_ALL_RELEASES", &["socket-patch", "get", "x"]),
+            ("SOCKET_ALL_RELEASES", &["socket-patch", "scan"]),
+            ("SOCKET_SKIP_ROLLBACK", &["socket-patch", "remove", "x"]),
+            ("SOCKET_DOWNLOAD_ONLY", &["socket-patch", "repair"]),
+            ("SOCKET_VENDOR_REVERT", &["socket-patch", "vendor"]),
+            ("SOCKET_UNLOCK_RELEASE", &["socket-patch", "unlock"]),
+            ("SOCKET_VEX_NO_VERIFY", &["socket-patch", "vex"]),
+            ("SOCKET_VEX_COMPACT", &["socket-patch", "vex"]),
+            // The embedded `--vex-*` twins share the same env vars and must
+            // not abort host commands (e.g. apply from a postinstall hook).
+            ("SOCKET_VEX_NO_VERIFY", &["socket-patch", "apply"]),
+            ("SOCKET_VEX_COMPACT", &["socket-patch", "scan"]),
+        ];
+
+        with_clean_socket_env(|| {
+            for &(var, argv) in BOOL_BINDINGS {
+                for (val, should_parse) in
+                    [("", true), ("1", true), ("yes", true), ("garbage", false)]
+                {
+                    std::env::set_var(var, val);
+                    let result = crate::Cli::try_parse_from(argv.iter().copied());
+                    assert_eq!(
+                        result.is_ok(),
+                        should_parse,
+                        "{var}={val:?} on {argv:?} — expected parse {}: {:?}",
+                        if should_parse { "success" } else { "failure" },
+                        result.err().map(|e| e.to_string()),
+                    );
+                    std::env::remove_var(var);
+                }
+            }
+        });
+    }
+
+    /// Companion invariant for the **value-typed** local env vars: an
+    /// exported-but-empty value (`VAR=`) must not crash its subcommand —
+    /// [`scrub_empty_env_vars`] (run by `main` before clap) removes it, and
+    /// the parse then sees plain defaults.
+    #[test]
+    #[serial_test::serial]
+    fn empty_value_typed_local_env_vars_are_rescued_by_the_scrub() {
+        use clap::Parser as _;
+
+        const VALUE_BINDINGS: &[(&str, &[&str])] = &[
+            ("SOCKET_BATCH_SIZE", &["socket-patch", "scan"]),
+            ("SOCKET_SETUP_EXCLUDE", &["socket-patch", "setup"]),
+            ("SOCKET_VEX", &["socket-patch", "apply"]),
+            ("SOCKET_VEX_OUTPUT", &["socket-patch", "vex"]),
+            ("SOCKET_VEX_PRODUCT", &["socket-patch", "vex"]),
+            ("SOCKET_VEX_DOC_ID", &["socket-patch", "vex"]),
+        ];
+
+        with_clean_socket_env(|| {
+            for &(var, argv) in VALUE_BINDINGS {
+                std::env::set_var(var, "");
+                scrub_empty_env_vars();
+                let result = crate::Cli::try_parse_from(argv.iter().copied());
+                assert!(
+                    result.is_ok(),
+                    "{var}= (exported empty) on {argv:?} must be scrubbed, not abort: {:?}",
+                    result.err().map(|e| e.to_string()),
+                );
+                std::env::remove_var(var);
+            }
+        });
     }
 }

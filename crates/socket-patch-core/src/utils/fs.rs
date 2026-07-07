@@ -2,13 +2,15 @@
 //! crate-wide atomic file writer ([`atomic_write_bytes`]).
 //!
 //! Each crawler walks one or more package directories and decides
-//! whether each entry is a candidate package. The two operations that
+//! whether each entry is a candidate package. The operations that
 //! all eight crawlers repeat are:
 //!
 //! - listing entries in a directory while tolerating permission /
 //!   I/O errors (we treat an unreadable directory as "no entries");
 //! - asking whether an entry is a directory while tolerating
-//!   `file_type()` failures (we treat a stat error as "not a dir").
+//!   `file_type()` failures (we treat a stat error as "not a dir");
+//! - asking whether an arbitrary path is a directory while tolerating
+//!   stat errors ([`is_dir`], same "not a dir" fallback).
 //!
 //! Centralizing both keeps each crawler free of the
 //! `match read_dir { Ok(rd) => rd, Err(_) => return … }` boilerplate
@@ -25,7 +27,7 @@
 //! crawlers (pnpm's content-addressed store relies on resolving
 //! symlinks into `node_modules/.pnpm/*`).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use std::fs::FileType;
 use tokio::fs::DirEntry;
@@ -38,7 +40,7 @@ use tokio::fs::DirEntry;
 /// iteration stops. The crawlers treat all of these the same way:
 /// surface whatever the readable portion of the subtree yields, but
 /// don't abort the whole crawl.
-pub async fn list_dir_entries(path: &Path) -> Vec<DirEntry> {
+pub(crate) async fn list_dir_entries(path: &Path) -> Vec<DirEntry> {
     let mut entries = match tokio::fs::read_dir(path).await {
         Ok(rd) => rd,
         Err(_) => return Vec::new(),
@@ -62,12 +64,74 @@ pub async fn list_dir_entries(path: &Path) -> Vec<DirEntry> {
 /// would wrongly report `false`. To honor the documented
 /// symlink-following contract — which crawlers like deno/python/ruby
 /// rely on for symlinked package directories — we stat the resolved
-/// `entry.path()` via `tokio::fs::metadata`, which does follow links.
-pub async fn entry_is_dir(entry: &DirEntry) -> bool {
-    tokio::fs::metadata(entry.path())
+/// `entry.path()` via [`is_dir`], which does follow links.
+pub(crate) async fn entry_is_dir(entry: &DirEntry) -> bool {
+    is_dir(&entry.path()).await
+}
+
+/// Check whether `path` is a directory, following symlinks.
+///
+/// Returns `false` if the stat fails (missing path, broken symlink,
+/// permission error, etc.) — the crawlers probe candidate package
+/// roots and treat "can't stat" the same as "not there". The
+/// `Path`-taking counterpart of [`entry_is_dir`]; previously
+/// copy-pasted into every crawler.
+pub(crate) async fn is_dir(path: &Path) -> bool {
+    tokio::fs::metadata(path)
         .await
         .map(|m| m.is_dir())
         .unwrap_or(false)
+}
+
+/// Check whether `path` is a regular file, following symlinks.
+///
+/// Returns `false` if the stat fails (missing path, broken symlink,
+/// permission error, etc.) — the file-shaped sibling of [`is_dir`],
+/// with the same "can't stat means not there" contract.
+pub(crate) async fn is_file(path: &Path) -> bool {
+    tokio::fs::metadata(path)
+        .await
+        .map(|m| m.is_file())
+        .unwrap_or(false)
+}
+
+/// Open `path` read-only, requiring a regular file.
+///
+/// Returns the open handle plus its `fstat` metadata. Deriving the
+/// metadata from the open descriptor — rather than `stat`-ing the path
+/// separately — means the size and any bytes subsequently read cannot
+/// come from different inodes, even if the path is renamed/replaced
+/// concurrently (the patch engine reads files an attacker may swap at
+/// any moment).
+///
+/// On Unix the open itself is non-blocking (`O_NONBLOCK`): a plain
+/// `open(2)` of a FIFO with `O_RDONLY` waits for a writer that may
+/// never come, which would hang the patch engine forever before the
+/// regular-file guard below ever runs. `O_NONBLOCK` has no effect on
+/// regular-file reads; the handle-based `is_file` check then rejects
+/// FIFOs/devices/directories with `InvalidInput` instead of reading
+/// them (on some platforms a directory reads as zero bytes, which
+/// would otherwise be silently hashed as the empty blob).
+pub(crate) async fn open_regular_file(
+    path: &Path,
+) -> std::io::Result<(tokio::fs::File, std::fs::Metadata)> {
+    #[cfg(unix)]
+    let file = tokio::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .await?;
+    #[cfg(not(unix))]
+    let file = tokio::fs::File::open(path).await?;
+
+    let metadata = file.metadata().await?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    Ok((file, metadata))
 }
 
 /// Return the raw `FileType` for `entry`, swallowing stat errors.
@@ -78,8 +142,28 @@ pub async fn entry_is_dir(entry: &DirEntry) -> bool {
 /// be treated as scannable-but-non-recurseable). The returned
 /// `FileType` is the symlink-aware kind from `entry.file_type()`,
 /// not the resolved-target kind from `metadata()`.
-pub async fn entry_file_type(entry: &DirEntry) -> Option<FileType> {
+pub(crate) async fn entry_file_type(entry: &DirEntry) -> Option<FileType> {
     entry.file_type().await.ok()
+}
+
+/// Resolve the user's home directory: `HOME`, then `USERPROFILE`
+/// (Windows), then a literal `"~"` — a harmless non-existent path so
+/// downstream joins probe nothing rather than panic. A set-but-empty
+/// variable counts as unset: honoring `""` would turn every
+/// `home_dir().join(…)` probe into a CWD-relative path, pointing the
+/// crawlers at directories inside the user's project. The shared
+/// fallback chain for every crawler that scans well-known per-user
+/// package roots (`~/.cargo`, `~/.m2`, `~/.nuget`, …) and for
+/// telemetry's home-dir redaction; previously copy-pasted into each.
+/// The go/composer crawlers deliberately use a stricter
+/// no-home-means-no-path chain instead.
+pub(crate) fn home_dir() -> PathBuf {
+    let home = std::env::var("HOME")
+        .ok()
+        .filter(|h| !h.is_empty())
+        .or_else(|| std::env::var("USERPROFILE").ok().filter(|h| !h.is_empty()))
+        .unwrap_or_else(|| "~".to_string());
+    PathBuf::from(home)
 }
 
 /// Atomically commit `content` to `path` via stage + fsync + rename.
@@ -92,7 +176,36 @@ pub async fn entry_file_type(entry: &DirEntry) -> Option<FileType> {
 /// sibling file, fsync it, then rename over the target (atomic on the same
 /// filesystem), so a reader or recovering process only ever sees the complete
 /// old or the complete new bytes.
-pub async fn atomic_write_bytes(path: &Path, content: &[u8]) -> std::io::Result<()> {
+pub(crate) async fn atomic_write_bytes(path: &Path, content: &[u8]) -> std::io::Result<()> {
+    atomic_write_bytes_as(path, content, None).await
+}
+
+/// [`atomic_write_bytes`], but the new inode keeps the destination's existing
+/// permission bits (when the destination exists).
+///
+/// The rename swaps in a fresh stage inode created with umask defaults, so the
+/// plain writer resets a user-owned file's mode — a 0600 private package.json
+/// silently becomes 0644, a 0664 group-writable one locks the group out. Use
+/// this variant for files the *user* owns and we merely edit (package.json,
+/// Gemfile, …), matching npm's write-file-atomic. The patch engine keeps the
+/// plain writer: `restore_file_permissions` re-applies pre-patch mode + uid/gid
+/// itself after the rename.
+pub(crate) async fn atomic_write_bytes_preserving_mode(
+    path: &Path,
+    content: &[u8],
+) -> std::io::Result<()> {
+    let perms = tokio::fs::metadata(path)
+        .await
+        .ok()
+        .map(|m| m.permissions());
+    atomic_write_bytes_as(path, content, perms).await
+}
+
+async fn atomic_write_bytes_as(
+    path: &Path,
+    content: &[u8],
+    perms: Option<std::fs::Permissions>,
+) -> std::io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let stem = path
         .file_name()
@@ -114,6 +227,16 @@ pub async fn atomic_write_bytes(path: &Path, content: &[u8]) -> std::io::Result<
     if let Err(e) = file.sync_all().await {
         let _ = tokio::fs::remove_file(&stage).await;
         return Err(e);
+    }
+    // Set the preserved mode on the stage *before* the rename so the file
+    // never appears at the destination with the wrong bits, even briefly.
+    // The content is already written through the open handle, so a
+    // restrictive mode (0400, 0000) cannot fail the write.
+    if let Some(p) = perms {
+        if let Err(e) = file.set_permissions(p).await {
+            let _ = tokio::fs::remove_file(&stage).await;
+            return Err(e);
+        }
     }
     drop(file);
 
@@ -243,6 +366,22 @@ mod tests {
         }
     }
 
+    /// `is_dir` reports directories, and falls back to `false` for
+    /// files, missing paths, and (via `metadata`'s symlink-following)
+    /// resolves links to their target kind.
+    #[tokio::test]
+    async fn is_dir_dir_file_and_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("d");
+        tokio::fs::create_dir(&dir).await.unwrap();
+        let file = tmp.path().join("f");
+        tokio::fs::write(&file, b"x").await.unwrap();
+
+        assert!(is_dir(&dir).await);
+        assert!(!is_dir(&file).await);
+        assert!(!is_dir(&tmp.path().join("missing")).await);
+    }
+
     /// Regression: `list_dir_entries` must hit the `read_dir` Err arm
     /// when handed a path that is a regular file (not a directory) and
     /// return an empty vec rather than panic. Crawlers routinely probe
@@ -311,6 +450,62 @@ mod tests {
                 other => panic!("unexpected entry: {other}"),
             }
         }
+    }
+
+    /// The preserving writer re-applies the destination's mode to the new
+    /// inode (0744's exec bit cannot come from a 0666-based create, so this
+    /// is red under any umask if preservation regresses), while a missing
+    /// destination is simply created with umask defaults.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn atomic_write_preserving_mode_keeps_dest_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("f");
+        tokio::fs::write(&path, b"old").await.unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o744)).unwrap();
+
+        atomic_write_bytes_preserving_mode(&path, b"new")
+            .await
+            .unwrap();
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), b"new");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o744, "existing mode must survive the rename");
+
+        let fresh = tmp.path().join("fresh");
+        atomic_write_bytes_preserving_mode(&fresh, b"x")
+            .await
+            .unwrap();
+        assert_eq!(tokio::fs::read(&fresh).await.unwrap(), b"x");
+    }
+
+    /// Regression: a set-but-empty `HOME` (stripped CI/container/sudo
+    /// environments) must be treated as unset, exactly like the documented
+    /// no-home fallback. Honoring `""` made `home_dir()` return an empty
+    /// `PathBuf`, so every `home_dir().join(".cargo")`-style probe became a
+    /// CWD-relative path and the crawlers scanned directories inside the
+    /// user's project as if they were the per-user package roots.
+    #[test]
+    #[serial_test::serial]
+    fn home_dir_treats_empty_home_as_unset() {
+        let prev_home = std::env::var("HOME").ok();
+        let prev_profile = std::env::var("USERPROFILE").ok();
+        std::env::set_var("HOME", "");
+        std::env::set_var("USERPROFILE", "");
+        let home = home_dir();
+        match prev_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        match prev_profile {
+            Some(v) => std::env::set_var("USERPROFILE", v),
+            None => std::env::remove_var("USERPROFILE"),
+        }
+        assert_eq!(
+            home,
+            PathBuf::from("~"),
+            "empty HOME/USERPROFILE must fall back to the harmless `~` sentinel"
+        );
     }
 
     /// `entry_file_type` is the symlink-aware counterpart: it reports

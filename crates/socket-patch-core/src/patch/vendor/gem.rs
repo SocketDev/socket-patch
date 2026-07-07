@@ -34,8 +34,9 @@
 //!   hard-fails `BUNDLE_FROZEN=true bundle install` (exit 16).
 //!
 //! The Gemfile gains `path:` on the gem's declaration (rewritten in place when
-//! it is a statically-parseable single top-level line, quote style preserved)
-//! or, for a transitive dependency, a managed block appended at EOF. Anything
+//! it is a statically-parseable single top-level line, quote style and
+//! trailing options like `require: false` preserved) or, for a transitive
+//! dependency, a managed block appended at EOF. Anything
 //! the conservative line grammar cannot prove safe to rewrite is REFUSED —
 //! never guessed at.
 //!
@@ -46,22 +47,22 @@
 //! sources and the missing `.so` only fails at `require` time with a
 //! confusing error — refusing up front is the honest failure.
 
-use std::collections::HashMap;
 use std::path::Path;
 
 use serde_json::Value;
 
-use crate::manifest::schema::{PatchFileInfo, PatchRecord};
-use crate::patch::apply::{
-    is_safe_relative_subpath, normalize_file_path, ApplyResult, PatchSources, VerifyResult,
-    VerifyStatus,
-};
+use crate::manifest::schema::PatchRecord;
+use crate::patch::apply::{ApplyResult, PatchSources};
 use crate::patch::copy_tree::{fresh_copy, remove_tree};
-use crate::patch::file_hash::compute_file_git_sha256;
 use crate::patch::path_safety::is_safe_single_segment;
-use crate::utils::fs::atomic_write_bytes;
+use crate::patch::redirect::gem_line_trailing_options;
+use crate::utils::fs::atomic_write_bytes_preserving_mode;
 use crate::utils::purl::{build_gem_purl, parse_gem_purl};
 
+use super::common::{
+    already_patched_result, copy_matches_after_hashes, done, refused, service_offline_conflict,
+    synthesized_result,
+};
 use super::path::vendor_uuid_dir_rel;
 use super::registry_fetch::extract_gem_data;
 use super::service_fetch::{
@@ -97,9 +98,6 @@ const LOCK_CHECKSUM_WIRING_KIND: &str = "gemfile_lock_checksum";
 /// Managed-block fence for transitive (not-Gemfile-declared) gems.
 const MANAGED_OPEN: &str = "# >>> socket-patch vendor (managed) >>>";
 const MANAGED_CLOSE: &str = "# <<< socket-patch vendor (managed) <<<";
-
-/// Marker schema version written into `socket-patch.vendor.json`.
-const MARKER_SCHEMA_VERSION: u32 = 1;
 
 /// Vendor a gem: materialize a patched copy (plus its stub gemspec) under
 /// `.socket/vendor/gem/<uuid>/<name>-<version>` and pair-edit Gemfile +
@@ -168,11 +166,11 @@ pub async fn vendor_gem(
 
     // A patch with no files is meaningless to vendor: no-op success, no edits.
     if record.files.is_empty() {
-        return VendorOutcome::Done {
-            result: synthesized_result(purl, &copy_dir, Vec::new(), true, None),
-            entry: None,
-            warnings: Vec::new(),
-        };
+        return done(
+            synthesized_result(purl, &copy_dir, Vec::new(), true, None),
+            None,
+            Vec::new(),
+        );
     }
 
     // Platform-suffixed installs (`<name>-<version>-x86_64-linux`) ship
@@ -264,16 +262,11 @@ pub async fn vendor_gem(
     if lock_wired {
         if lock_checksum_in_sync(&lock_text, name, version) {
             if copy_ok {
-                let verified = record
-                    .files
-                    .keys()
-                    .map(|f| already_patched_verify(f))
-                    .collect();
-                return VendorOutcome::Done {
-                    result: synthesized_result(purl, &copy_dir, verified, true, None),
-                    entry: None,
-                    warnings: Vec::new(),
-                };
+                return done(
+                    already_patched_result(purl, &copy_dir, &record.files),
+                    None,
+                    Vec::new(),
+                );
             }
             // Wired (Gemfile + lock + CHECKSUMS) but the committed copy is
             // missing/stale: rebuild the ARTIFACT only — the pair edit is
@@ -282,14 +275,8 @@ pub async fn vendor_gem(
             // Service-preferred like the full path (an auto-fetched gem has no
             // local stub to rebuild from — only the service can).
             if !dry_run {
-                if let Some(cfg) = service {
-                    if cfg.source.requires_service() && cfg.offline {
-                        return refused(
-                            "vendor_service_offline_conflict",
-                            "--vendor-source=service needs the network but --offline is set"
-                                .to_string(),
-                        );
-                    }
+                if let Some(refusal) = service_offline_conflict(service) {
+                    return refusal;
                 }
                 let mut warnings: Vec<VendorWarning> = Vec::new();
                 let result = match materialise_patched_copy(
@@ -311,25 +298,16 @@ pub async fn vendor_gem(
                     Ok(result) => result,
                     Err(outcome) => return *outcome,
                 };
-                if !result.success {
-                    return VendorOutcome::Done {
-                        result,
-                        entry: None,
-                        warnings,
-                    };
+                if result.success {
+                    warnings.push(VendorWarning::new(
+                        "vendor_artifact_rebuilt",
+                        format!(
+                            "the committed vendored copy for {name}@{version} was missing or \
+                             stale; rebuilt at {copy_rel} (Gemfile and Gemfile.lock untouched)"
+                        ),
+                    ));
                 }
-                warnings.push(VendorWarning::new(
-                    "vendor_artifact_rebuilt",
-                    format!(
-                        "the committed vendored copy for {name}@{version} was missing or \
-                         stale; rebuilt at {copy_rel} (Gemfile and Gemfile.lock untouched)"
-                    ),
-                ));
-                return VendorOutcome::Done {
-                    result,
-                    entry: None,
-                    warnings,
-                };
+                return done(result, None, warnings);
             }
             // Dry runs fall through to the verify-only preview below.
         } else {
@@ -367,11 +345,7 @@ pub async fn vendor_gem(
         )
         .await;
         result.package_path = copy_dir.display().to_string();
-        return VendorOutcome::Done {
-            result,
-            entry: None,
-            warnings: dry_warnings,
-        };
+        return done(result, None, dry_warnings);
     }
 
     // ── Gemfile edit plan (refusals before any write) ────────────────────
@@ -385,13 +359,8 @@ pub async fn vendor_gem(
     // (download + extract; no local install or patch-apply needed); else copy
     // the installed gem, drop in the local stub gemspec, and apply the patch.
     let mut warnings: Vec<VendorWarning> = Vec::new();
-    if let Some(cfg) = service {
-        if cfg.source.requires_service() && cfg.offline {
-            return refused(
-                "vendor_service_offline_conflict",
-                "--vendor-source=service needs the network but --offline is set".to_string(),
-            );
-        }
+    if let Some(refusal) = service_offline_conflict(service) {
+        return refusal;
     }
     let mut result = match materialise_patched_copy(
         purl,
@@ -415,33 +384,29 @@ pub async fn vendor_gem(
     if !result.success {
         // The copy / stub / patch step left the result un-successful (and
         // cleaned up its own partial copy); neither project file was touched.
-        return VendorOutcome::Done {
-            result,
-            entry: None,
-            warnings,
-        };
+        return done(result, None, warnings);
     }
     result.package_path = copy_dir.display().to_string();
 
     // ── Gemfile edit ─────────────────────────────────────────────────────
+    // Both project files are user-owned: preserve their permission bits.
     let new_gemfile = apply_gemfile_plan(&gemfile_text, &plan);
-    if let Err(e) = atomic_write_bytes(&gemfile_path, new_gemfile.as_bytes()).await {
+    if let Err(e) = atomic_write_bytes_preserving_mode(&gemfile_path, new_gemfile.as_bytes()).await
+    {
         let _ = remove_tree(&uuid_dir).await;
         result.success = false;
         result.error = Some(format!("failed to write Gemfile: {e}"));
-        return VendorOutcome::Done {
-            result,
-            entry: None,
-            warnings,
-        };
+        return done(result, None, warnings);
     }
 
     // ── Gemfile.lock edit (a failure here unwinds the Gemfile) ───────────
     let lock_edit = match edit_lock(&lock_text, name, version, &copy_rel) {
-        Ok(edit) => match atomic_write_bytes(&lock_path, edit.text.as_bytes()).await {
-            Ok(()) => Ok(edit),
-            Err(e) => Err(format!("failed to write Gemfile.lock: {e}")),
-        },
+        Ok(edit) => {
+            match atomic_write_bytes_preserving_mode(&lock_path, edit.text.as_bytes()).await {
+                Ok(()) => Ok(edit),
+                Err(e) => Err(format!("failed to write Gemfile.lock: {e}")),
+            }
+        }
         Err(e) => Err(format!("failed to edit Gemfile.lock: {e}")),
     };
     let lock_edit = match lock_edit {
@@ -450,32 +415,21 @@ pub async fn vendor_gem(
             // Unwind: a Gemfile pointing at a path the lock doesn't agree
             // with is exactly the half-wired state the pair edit exists to
             // prevent — restore the recorded original bytes.
-            if let Err(e) = atomic_write_bytes(&gemfile_path, gemfile_text.as_bytes()).await {
+            if let Err(e) =
+                atomic_write_bytes_preserving_mode(&gemfile_path, gemfile_text.as_bytes()).await
+            {
                 detail.push_str(&format!(" (Gemfile unwind also failed: {e})"));
             }
             let _ = remove_tree(&uuid_dir).await;
             result.success = false;
             result.error = Some(detail);
-            return VendorOutcome::Done {
-                result,
-                entry: None,
-                warnings,
-            };
+            return done(result, None, warnings);
         }
     };
 
     // ── marker + ledger entry ────────────────────────────────────────────
     let base_purl = build_gem_purl(name, version);
-    let mut vulnerabilities: Vec<String> = record.vulnerabilities.keys().cloned().collect();
-    vulnerabilities.sort();
-    let marker = VendorMarker {
-        schema_version: MARKER_SCHEMA_VERSION,
-        purl: base_purl.clone(),
-        patch_uuid: record.uuid.clone(),
-        ecosystem: "gem".to_string(),
-        vulnerabilities,
-        vendored_at: vendored_at.to_string(),
-    };
+    let marker = VendorMarker::new("gem", &base_purl, record, vendored_at);
     if let Err(e) = write_marker(&uuid_dir, &marker).await {
         // Informational only (state.json is the ledger of record) — a marker
         // failure must not fail an otherwise-wired vendor.
@@ -567,11 +521,7 @@ pub async fn vendor_gem(
         pipenv: None,
     };
 
-    VendorOutcome::Done {
-        result,
-        entry: Some(entry),
-        warnings,
-    }
+    done(result, Some(entry), warnings)
 }
 
 // ── materialisation (service download / local build) ──────────────────────────
@@ -621,7 +571,7 @@ async fn gem_service_copy(
         return GemServiceCopy::FallBack;
     }
     fn hard(code: &'static str, detail: String) -> GemServiceCopy {
-        GemServiceCopy::HardFail(Box::new(VendorOutcome::Refused { code, detail }))
+        GemServiceCopy::HardFail(Box::new(refused(code, detail)))
     }
     let miss = |warnings: &mut Vec<VendorWarning>, code: &'static str, reason: String| {
         if cfg.source.requires_service() {
@@ -636,7 +586,7 @@ async fn gem_service_copy(
     };
 
     // Step 1: the prebuilt `.gem` (sha512-verified against the reference).
-    let archive = match fetch_verified_archive(cfg, &record.uuid, name).await {
+    let archive = match fetch_verified_archive(cfg, &record.uuid).await {
         ServiceArtifact::Ready(archive) => archive,
         ServiceArtifact::IntegrityMismatch(reason) => {
             return miss(
@@ -671,7 +621,7 @@ async fn gem_service_copy(
     };
 
     // Step 2: the stub gemspec the converter generated alongside the `.gem`.
-    let stub = match fetch_verified_secondary(cfg, &archive, GEM_STUB_ARTIFACT_KIND, name).await {
+    let stub = match fetch_verified_secondary(cfg, &archive, GEM_STUB_ARTIFACT_KIND).await {
         SecondaryArtifactResult::Ready(bytes) => bytes,
         SecondaryArtifactResult::Absent => {
             return miss(
@@ -771,12 +721,7 @@ async fn materialise_patched_copy(
         GemServiceCopy::Used => {
             // The service `.gem` is the patched package; trust its verified
             // integrity (every file reads as AlreadyPatched).
-            let verified = record
-                .files
-                .keys()
-                .map(|f| already_patched_verify(f))
-                .collect();
-            Ok(synthesized_result(purl, copy_dir, verified, true, None))
+            Ok(already_patched_result(purl, copy_dir, &record.files))
         }
         GemServiceCopy::HardFail(outcome) => Err(outcome),
         GemServiceCopy::FallBack => {
@@ -977,18 +922,30 @@ fn plan_gemfile_edit(
             "the `gem \"{name}\"` declaration is not editable: {reason}"
         ));
     }
+    // Trailing options (`require: false`, `group: :test`, …) must survive the
+    // rewrite: dropping `require: false` auto-requires the gem at boot,
+    // changing app behavior while vendored.
+    let opts = gem_line_trailing_options(&rest);
+    let new_line = if opts.is_empty() {
+        format!("gem {q}{name}{q}, {q}{version}{q}, path: {q}{rel}{q}")
+    } else {
+        format!("gem {q}{name}{q}, {q}{version}{q}, path: {q}{rel}{q}, {opts}")
+    };
     Ok(GemfilePlan::Rewrite {
         original_line: lines[idx].to_string(),
-        new_line: format!("gem {q}{name}{q}, {q}{version}{q}, path: {q}{rel}{q}"),
+        new_line,
     })
 }
 
 /// Match `gem "<name>"` / `gem '<name>'` (or the parenthesized call form) at
 /// the start of a trimmed line. Returns the quote char, everything after the
-/// closing quote, and whether the call was parenthesized.
+/// closing quote, and whether the call was parenthesized. Space OR tab after
+/// the keyword — a tab-separated declaration the grammar cannot see would
+/// fall through to the transitive Append plan, leaving the Gemfile declaring
+/// the gem twice (bundler hard-fails on the duplicate).
 fn gem_declaration<'a>(trimmed: &'a str, name: &str) -> Option<(char, &'a str, bool)> {
     let rest = trimmed.strip_prefix("gem")?;
-    let (paren, rest) = match rest.strip_prefix(' ') {
+    let (paren, rest) = match rest.strip_prefix([' ', '\t']) {
         Some(r) => (false, r),
         None => (true, rest.strip_prefix('(')?),
     };
@@ -1006,9 +963,13 @@ fn gem_declaration<'a>(trimmed: &'a str, name: &str) -> Option<(char, &'a str, b
 }
 
 /// Why the text after the gem name blocks an in-place rewrite (`None` = safe).
-/// Only the code before any `#` comment counts — a trailing comment is
-/// dropped by the rewrite, which is acceptable because the verbatim original
-/// line lives in the ledger for revert.
+/// Only the code before any `#` comment counts — a comment trailing plain
+/// version constraints is dropped by the rewrite (acceptable: the verbatim
+/// original line lives in the ledger for revert), while one trailing kept
+/// options rides along with them verbatim. Every source-selecting option is
+/// blocked, not just `path:`/`git:`: bundler allows ONE source per gem, so a
+/// preserved `source:` (etc.) alongside the `path:` we add would fail every
+/// `bundle` invocation.
 fn rest_blocks_edit(rest: &str) -> Option<String> {
     let code = rest.split('#').next().unwrap_or("").trim();
     if code.is_empty() {
@@ -1020,7 +981,20 @@ fn rest_blocks_edit(rest: &str) -> Option<String> {
     if code.ends_with(',') {
         return Some("the declaration continues on the next line".to_string());
     }
-    for tok in ["path:", ":path", "git:", ":git", "github:", ":github"] {
+    for tok in [
+        "path:",
+        ":path",
+        "git:",
+        ":git",
+        "github:",
+        ":github",
+        "source:",
+        ":source",
+        "gist:",
+        ":gist",
+        "bitbucket:",
+        ":bitbucket",
+    ] {
         if code.contains(tok) {
             return Some(format!(
                 "the declaration already carries `{tok}` (revert any previous vendoring first)"
@@ -1346,7 +1320,7 @@ async fn revert_gemfile_record(
         }
     };
     if !dry_run {
-        atomic_write_bytes(gemfile_path, restored.as_bytes())
+        atomic_write_bytes_preserving_mode(gemfile_path, restored.as_bytes())
             .await
             .map_err(|e| format!("failed to write Gemfile: {e}"))?;
     }
@@ -1376,7 +1350,7 @@ async fn revert_lock_record(
         return Ok(false);
     };
     if !dry_run {
-        atomic_write_bytes(lock_path, restored.as_bytes())
+        atomic_write_bytes_preserving_mode(lock_path, restored.as_bytes())
             .await
             .map_err(|e| format!("failed to write Gemfile.lock: {e}"))?;
     }
@@ -1425,7 +1399,7 @@ async fn revert_lock_checksum_record(
     };
     lines[i] = original.to_string();
     if !dry_run {
-        atomic_write_bytes(lock_path, lines.join("\n").as_bytes())
+        atomic_write_bytes_preserving_mode(lock_path, lines.join("\n").as_bytes())
             .await
             .map_err(|e| format!("failed to write Gemfile.lock: {e}"))?;
     }
@@ -1565,73 +1539,14 @@ fn gemspec_declares_extensions(spec_text: &str) -> bool {
     false
 }
 
-/// True when the copy exists and every patched file in it already hashes to
-/// its `afterHash` (the vendor twin of `go_redirect::redirect_in_sync`).
-async fn copy_matches_after_hashes(
-    copy_dir: &Path,
-    files: &HashMap<String, PatchFileInfo>,
-) -> bool {
-    if tokio::fs::metadata(copy_dir).await.is_err() {
-        return false;
-    }
-    for (file_name, info) in files {
-        let normalized = normalize_file_path(file_name);
-        // SECURITY: never hash through a manifest key that escapes the copy
-        // dir — fail the sync check instead (the full pipeline would refuse
-        // the key anyway).
-        if !is_safe_relative_subpath(normalized) {
-            return false;
-        }
-        match compute_file_git_sha256(&copy_dir.join(normalized)).await {
-            Ok(h) if h == info.after_hash => {}
-            _ => return false,
-        }
-    }
-    true
-}
-
-fn refused(code: &'static str, detail: impl Into<String>) -> VendorOutcome {
-    VendorOutcome::Refused {
-        code,
-        detail: detail.into(),
-    }
-}
-
-fn synthesized_result(
-    package_key: &str,
-    copy_dir: &Path,
-    files_verified: Vec<VerifyResult>,
-    success: bool,
-    error: Option<String>,
-) -> ApplyResult {
-    ApplyResult {
-        package_key: package_key.to_string(),
-        package_path: copy_dir.display().to_string(),
-        success,
-        files_verified,
-        files_patched: Vec::new(),
-        applied_via: HashMap::new(),
-        error,
-        sidecar: None,
-    }
-}
-
-fn already_patched_verify(file: &str) -> VerifyResult {
-    VerifyResult {
-        file: file.to_string(),
-        status: VerifyStatus::AlreadyPatched,
-        message: None,
-        current_hash: None,
-        expected_hash: None,
-        target_hash: None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::hash::git_sha256::compute_git_sha256_from_bytes;
+    use crate::manifest::schema::PatchFileInfo;
+    use crate::patch::apply::VerifyStatus;
     use crate::patch::vendor::state::VENDOR_MARKER_FILE;
+    use std::collections::HashMap;
     use std::path::PathBuf;
 
     const UUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
@@ -2842,6 +2757,132 @@ mod tests {
                 .unwrap(),
             v1
         );
+    }
+
+    /// Trailing options on the declaration (`require: false`, `group: :test`,
+    /// …) must survive the rewrite: dropping `require: false` auto-requires
+    /// the gem at boot, changing app behavior while vendored (the redirect
+    /// backend's `gem_line_trailing_options` twin, FIXED there 2026-07-06).
+    #[tokio::test]
+    async fn test_rewrite_preserves_trailing_options() {
+        let gemfile =
+            "source \"https://rubygems.org\"\n\ngem \"puma\"\ngem \"rack\", \"~> 3.1\", require: false\n";
+        let (_tmp, root, installed, blobs, record) = fixture(gemfile, LOCK_DIRECT).await;
+
+        let (result, entry, _w) =
+            unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
+            format!(
+                "source \"https://rubygems.org\"\n\ngem \"puma\"\ngem \"rack\", \"3.2.6\", path: \"{}\", require: false\n",
+                copy_rel()
+            ),
+            "trailing options must survive the rewrite"
+        );
+
+        // Revert restores the original line (options and all) verbatim.
+        let outcome = revert_gem(&entry.unwrap(), &root, false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
+            gemfile
+        );
+    }
+
+    /// `source:` selects a registry — carried alongside the `path:` we add it
+    /// is a bundler error (one source per gem), and silently dropping it
+    /// would hide the user's routing. Refused like `git:`/`github:`.
+    #[tokio::test]
+    async fn test_refuses_source_option_declaration() {
+        let gemfile =
+            "source \"https://rubygems.org\"\n\ngem \"puma\"\ngem \"rack\", \"~> 3.1\", source: \"https://gems.example\"\n";
+        let (_tmp, root, installed, blobs, record) = fixture(gemfile, LOCK_DIRECT).await;
+
+        let (code, detail) =
+            unwrap_refused(run_vendor(&root, &blobs, &installed, &record, false).await);
+        assert_eq!(code, "gemfile_declaration_not_editable");
+        assert!(detail.contains("source:"), "{detail}");
+        assert!(!root.join(".socket").exists());
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
+            gemfile
+        );
+    }
+
+    /// `gem\t"rack"` (tab separator) is a valid ruby call. If the grammar
+    /// cannot see it, the plan falls through to the transitive Append and the
+    /// Gemfile ends up declaring rack TWICE (registry line + managed path:
+    /// block) — bundler hard-fails every install until hand-repaired.
+    #[tokio::test]
+    async fn test_tab_separated_declaration_rewritten_not_duplicated() {
+        let gemfile = "source \"https://rubygems.org\"\n\ngem\t\"rack\", \"~> 3.1\"\n";
+        let (_tmp, root, installed, blobs, record) = fixture(gemfile, LOCK_DIRECT).await;
+
+        let (result, entry, _w) =
+            unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
+        assert!(result.success, "{:?}", result.error);
+        let new_gemfile = tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap();
+        assert!(
+            !new_gemfile.contains(MANAGED_OPEN),
+            "must rewrite in place, never append a duplicate declaration: {new_gemfile}"
+        );
+        assert!(
+            !new_gemfile.contains("~> 3.1"),
+            "registry declaration replaced: {new_gemfile}"
+        );
+        assert!(new_gemfile.contains(&copy_rel()), "{new_gemfile}");
+
+        let outcome = revert_gem(&entry.unwrap(), &root, false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
+            gemfile
+        );
+    }
+
+    /// Gemfile + Gemfile.lock are USER-owned files vendor merely edits: the
+    /// pair edit and every revert write must keep their permission bits (the
+    /// plain atomic writer swaps in a umask-default inode — a 0600 private
+    /// Gemfile silently becomes 0644; see
+    /// `atomic_write_bytes_preserving_mode`). The CHECKSUMS fixture exercises
+    /// all three revert writers.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_pair_edit_and_revert_preserve_file_modes() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_tmp, root, installed, blobs, record) =
+            fixture_318(SPIKE_GEMFILE_CHECKSUMS, SPIKE_LOCK_CHECKSUMS_BEFORE).await;
+        for f in [GEMFILE, GEMFILE_LOCK] {
+            tokio::fs::set_permissions(root.join(f), std::fs::Permissions::from_mode(0o600))
+                .await
+                .unwrap();
+        }
+
+        let (result, entry, _w) =
+            unwrap_done(run_vendor_318(&root, &blobs, &installed, &record, false).await);
+        assert!(result.success, "{:?}", result.error);
+        for f in [GEMFILE, GEMFILE_LOCK] {
+            let mode = tokio::fs::metadata(root.join(f))
+                .await
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "{f} mode reset by the vendor pair edit");
+        }
+
+        let outcome = revert_gem(&entry.unwrap(), &root, false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        for f in [GEMFILE, GEMFILE_LOCK] {
+            let mode = tokio::fs::metadata(root.join(f))
+                .await
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "{f} mode reset by revert");
+        }
     }
 
     // ─────────────── service-download path (Tier B: gem) ──────────────────

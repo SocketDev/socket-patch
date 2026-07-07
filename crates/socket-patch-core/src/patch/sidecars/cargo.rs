@@ -33,6 +33,7 @@ use sha2::{Digest, Sha256};
 
 use crate::hash::git_sha256::compute_git_sha256_from_bytes;
 use crate::patch::apply::{apply_file_patch, is_safe_relative_subpath, normalize_file_path};
+use crate::utils::fs::open_regular_file;
 
 use super::{SidecarError, SidecarFile, SidecarFileAction, SidecarPayload};
 
@@ -209,8 +210,8 @@ async fn update_entries(
         }
 
         let on_disk = pkg_path.join(&normalized);
-        let hash = match sha256_file(&on_disk).await {
-            Ok(hash) => hash,
+        let bytes = match read_regular_file(&on_disk).await {
+            Ok(bytes) => bytes,
             Err(e) if remove_missing && e.kind() == std::io::ErrorKind::NotFound => {
                 // Rollback deleted this patch-added file; drop the entry
                 // apply's fixup inserted for it. Only NotFound qualifies —
@@ -226,57 +227,33 @@ async fn update_entries(
                 });
             }
         };
-        files.insert(normalized, Value::String(hash));
+        // Cargo wants the plain lowercase-hex SHA256 of the raw bytes
+        // (not the Git "blob N\0" framing used elsewhere).
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        files.insert(
+            normalized,
+            Value::String(format!("{:x}", hasher.finalize())),
+        );
     }
     Ok(())
 }
 
-/// Compute the lowercase-hex SHA256 of the file at `path`.
-///
-/// Loads the whole file into memory and hashes in one go.
-/// Cargo source files are bounded (the registry rejects crates
-/// whose `.crate` tarball exceeds ~10MB unpacked), so a single
-/// read is cheaper than the streaming-loop dance — and the open
-/// error passes through untouched, which the
-/// `dispatch_fixup_cargo_sha256_file_failure_arm` integration
-/// test drives via a non-existent path.
-async fn sha256_file(path: &Path) -> std::io::Result<String> {
-    let bytes = read_regular_file(path).await?;
-    let mut hasher = Sha256::new();
-    hasher.update(&bytes);
-    Ok(format!("{:x}", hasher.finalize()))
-}
-
 /// Read a whole file, refusing anything that isn't a regular file.
 ///
-/// Both call sites read paths inside the (untrusted) package tree. A
-/// plain `open(2)` with `O_RDONLY` on a FIFO planted at one of those
-/// paths waits for a writer that may never come — hanging the patch
-/// engine forever before any guard runs. As in
-/// [`compute_file_git_sha256`](crate::patch::file_hash::compute_file_git_sha256),
-/// the open is non-blocking on Unix (a no-op for regular files) and the
-/// `is_file` check on the open handle rejects FIFOs/devices/directories
-/// instead of reading them.
+/// Both call sites read paths inside the (untrusted) package tree, so
+/// the open goes through [`open_regular_file`] — non-blocking on Unix,
+/// rejecting FIFOs/devices/directories — to keep a planted special
+/// file from hanging the patch engine (see its docs). Loading the
+/// whole file is fine: cargo source files are bounded (the registry
+/// rejects crates whose `.crate` tarball exceeds ~10MB unpacked), and
+/// the open error passes through untouched, which the
+/// `dispatch_fixup_cargo_sha256_file_failure_arm` integration test
+/// drives via a non-existent path.
 async fn read_regular_file(path: &Path) -> std::io::Result<Vec<u8>> {
     use tokio::io::AsyncReadExt;
 
-    #[cfg(unix)]
-    let mut file = tokio::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK)
-        .open(path)
-        .await?;
-    #[cfg(not(unix))]
-    let mut file = tokio::fs::File::open(path).await?;
-
-    let metadata = file.metadata().await?;
-    if !metadata.is_file() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("{} is not a regular file", path.display()),
-        ));
-    }
-
+    let (mut file, metadata) = open_regular_file(path).await?;
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
     file.read_to_end(&mut bytes).await?;
     Ok(bytes)

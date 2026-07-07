@@ -56,9 +56,7 @@
 //! artifact never leaves a dangling `<repository>`.
 
 use std::collections::HashMap;
-use std::io::Read as _;
-use std::io::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 use serde_json::Value;
@@ -67,18 +65,19 @@ use sha2::{Digest as _, Sha256};
 
 use crate::constants::USER_AGENT;
 use crate::manifest::schema::{PatchFileInfo, PatchRecord};
-use crate::patch::apply::{
-    is_safe_relative_subpath, normalize_file_path, ApplyResult, PatchSources, VerifyResult,
-    VerifyStatus,
-};
+use crate::patch::apply::{ApplyResult, PatchSources};
 use crate::patch::copy_tree::remove_tree;
 use crate::patch::path_safety::is_safe_single_segment;
-use crate::utils::fs::atomic_write_bytes;
+use crate::utils::fs::{atomic_write_bytes, atomic_write_bytes_preserving_mode};
 use crate::utils::purl::{build_maven_purl, parse_maven_purl};
 
+use super::common::{
+    already_patched_result, done, failed_result, rebuild_zip, refused, synthesized_result,
+    zip_matches_after_hashes,
+};
 use super::path::vendor_uuid_dir_rel;
 use super::registry_fetch::extract_zip;
-use super::service_fetch::{fetch_verified_archive, ServiceArtifact};
+use super::service_fetch::{service_archive_copy, ServiceCopy};
 use super::state::{
     write_marker, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
 };
@@ -91,9 +90,6 @@ const PROJECT_POM: &str = "pom.xml";
 /// `pom.xml` snapshot (the authoritative revert record); its `key` is the
 /// repository id we added, which the revert ownership gate keys off.
 const REPO_WIRING_KIND: &str = "maven_pom_repository";
-
-/// Marker schema version written into `socket-patch.vendor.json`.
-const MARKER_SCHEMA_VERSION: u32 = 1;
 
 /// Bound on a pom download from the registry — a pom is dependency metadata
 /// (small XML); a multi-MB response is a mirror serving the wrong thing.
@@ -119,18 +115,12 @@ fn group_id_to_path(group_id: &str) -> String {
 }
 
 /// A groupId is safe to convert to a path and join onto the vendor root: each
-/// dot-delimited segment is non-empty and not a traversal token, and the whole
-/// string carries no separator/backslash/colon/NUL. Mirrors the maven crawler's
+/// dot-delimited segment must be a safe path segment on its own (non-empty, no
+/// separator/backslash/colon/NUL), which also rejects the empty string and
+/// leading/trailing/double dots. Same delegation as the maven crawler's
 /// `is_safe_maven_coordinate` group half. Fails closed on tampered coordinates.
 fn is_safe_group_id(group_id: &str) -> bool {
-    !group_id.is_empty()
-        && !group_id.contains('/')
-        && !group_id.contains('\\')
-        && !group_id.contains(':')
-        && !group_id.contains('\0')
-        && group_id
-            .split('.')
-            .all(|seg| !seg.is_empty() && seg != "." && seg != "..")
+    group_id.split('.').all(is_safe_single_segment)
 }
 
 /// Vendor a Maven package: rebuild a patched `.jar` under a committed maven2
@@ -186,16 +176,20 @@ pub async fn vendor_maven(
     let jar_copy_rel = format!("{leaf_rel}/{jar_leaf}");
     let uuid_dir = project_root.join(&uuid_dir_rel);
     let leaf_dir = project_root.join(&leaf_rel);
-    let jar_path = leaf_dir.join(&jar_leaf);
+    // Join the full forward-slash rel rather than `leaf_dir.join(&jar_leaf)`:
+    // the joined form puts an OS separator (`\` on Windows) before the leaf
+    // while every other reported path keeps the rel's forward slashes —
+    // `package_path` reports (and tests compare) this as a display string.
+    let jar_path = project_root.join(&jar_copy_rel);
     let repo_id = format!("socket-patch-vendor-{}", record.uuid);
 
     // A patch with no files is meaningless to vendor: no-op success, no edits.
     if record.files.is_empty() {
-        return VendorOutcome::Done {
-            result: synthesized_result(purl, &jar_path, Vec::new(), true, None),
-            entry: None,
-            warnings: Vec::new(),
-        };
+        return done(
+            synthesized_result(purl, &jar_path, Vec::new(), true, None),
+            None,
+            Vec::new(),
+        );
     }
 
     // ── project pom.xml: presence + aggregator/gradle refusals ────────────
@@ -244,26 +238,20 @@ pub async fn vendor_maven(
     // sidecars are all in sync → touch nothing, report AlreadyPatched. `entry`
     // stays `None`: the first run's ledger entry holds the only copy of the
     // verbatim pre-vendor pom.xml, and re-recording here would clobber it.
-    let repo_wired = pom_xml_text.contains(&repo_id);
-    if repo_wired {
+    if pom_xml_text.contains(&repo_id) {
         if artifact_in_sync(&leaf_dir, &jar_leaf, &pom_leaf, &record.files).await {
-            let verified = record
-                .files
-                .keys()
-                .map(|f| already_patched_verify(f))
-                .collect();
-            return VendorOutcome::Done {
-                result: synthesized_result(purl, &jar_path, verified, true, None),
-                entry: None,
-                warnings: vec![shadow_warning],
-            };
+            return done(
+                already_patched_result(purl, &jar_path, &record.files),
+                None,
+                vec![shadow_warning],
+            );
         }
         // Wired but the committed artifact is missing/stale: rebuild the
         // ARTIFACT only. pom.xml is already correct, and the full path would
         // re-record the live vendored pom.xml as `original`, breaking revert.
         if !dry_run {
             let mut warnings: Vec<VendorWarning> = vec![shadow_warning];
-            let (_bytes, result) = match materialise_and_write(
+            let (_bytes, mut result) = match materialise_and_write(
                 purl,
                 installed_dir,
                 &uuid_dir,
@@ -287,12 +275,9 @@ pub async fn vendor_maven(
                 Err(outcome) => return *outcome,
             };
             if !result.success {
-                return VendorOutcome::Done {
-                    result,
-                    entry: None,
-                    warnings,
-                };
+                return done(result, None, warnings);
             }
+            result.package_path = jar_path.display().to_string();
             warnings.push(VendorWarning::new(
                 "vendor_artifact_rebuilt",
                 format!(
@@ -300,11 +285,7 @@ pub async fn vendor_maven(
                      stale; rebuilt at {leaf_rel} (pom.xml untouched)"
                 ),
             ));
-            return VendorOutcome::Done {
-                result,
-                entry: None,
-                warnings,
-            };
+            return done(result, None, warnings);
         }
         // Dry runs fall through to the verify-only preview below.
     }
@@ -324,11 +305,7 @@ pub async fn vendor_maven(
             &mut dry_warnings,
         )
         .await;
-        return VendorOutcome::Done {
-            result,
-            entry: None,
-            warnings: dry_warnings,
-        };
+        return done(result, None, dry_warnings);
     }
 
     // ── materialise the patched jar + real pom + sidecars ─────────────────
@@ -359,11 +336,7 @@ pub async fn vendor_maven(
     if !result.success {
         // The rebuild left the result un-successful (and cleaned up its own
         // partial artifact); pom.xml was never touched.
-        return VendorOutcome::Done {
-            result,
-            entry: None,
-            warnings,
-        };
+        return done(result, None, warnings);
     }
     result.package_path = jar_path.display().to_string();
 
@@ -374,36 +347,20 @@ pub async fn vendor_maven(
             let _ = remove_tree(&uuid_dir).await;
             result.success = false;
             result.error = Some(detail);
-            return VendorOutcome::Done {
-                result,
-                entry: None,
-                warnings,
-            };
+            return done(result, None, warnings);
         }
     };
-    if let Err(e) = atomic_write_bytes(&pom_xml_path, new_pom_xml.as_bytes()).await {
+    if let Err(e) = atomic_write_bytes_preserving_mode(&pom_xml_path, new_pom_xml.as_bytes()).await
+    {
         let _ = remove_tree(&uuid_dir).await;
         result.success = false;
         result.error = Some(format!("failed to write {}: {e}", pom_xml_path.display()));
-        return VendorOutcome::Done {
-            result,
-            entry: None,
-            warnings,
-        };
+        return done(result, None, warnings);
     }
 
     // ── marker + ledger entry ─────────────────────────────────────────────
     let base_purl = build_maven_purl(group_id, artifact_id, version);
-    let mut vulnerabilities: Vec<String> = record.vulnerabilities.keys().cloned().collect();
-    vulnerabilities.sort();
-    let marker = VendorMarker {
-        schema_version: MARKER_SCHEMA_VERSION,
-        purl: base_purl.clone(),
-        patch_uuid: record.uuid.clone(),
-        ecosystem: "maven".to_string(),
-        vulnerabilities,
-        vendored_at: vendored_at.to_string(),
-    };
+    let marker = VendorMarker::new("maven", &base_purl, record, vendored_at);
     if let Err(e) = write_marker(&uuid_dir, &marker).await {
         // Informational only (state.json is the ledger of record) — a marker
         // failure must not fail an otherwise-wired vendor.
@@ -451,11 +408,7 @@ pub async fn vendor_maven(
         pipenv: None,
     };
 
-    VendorOutcome::Done {
-        result,
-        entry: Some(entry),
-        warnings,
-    }
+    done(result, Some(entry), warnings)
 }
 
 /// Revert a Maven vendor entry: surgically remove our `<repository>` from
@@ -561,39 +514,31 @@ async fn materialise_and_write(
 ) -> Result<(Vec<u8>, ApplyResult), Box<VendorOutcome>> {
     // The patched jar first (service Tier A, else local rebuild). A non-fatal
     // failure returns an un-successful ApplyResult with nothing written.
-    let (jar_bytes, result) = match maven_service_copy(service, record, artifact_id, warnings).await
-    {
-        MavenServiceCopy::Used(bytes) => {
-            let verified = record
-                .files
-                .keys()
-                .map(|f| already_patched_verify(f))
-                .collect();
-            (
-                bytes,
-                synthesized_result(purl, jar_path, verified, true, None),
-            )
-        }
-        MavenServiceCopy::HardFail(outcome) => return Err(outcome),
-        MavenServiceCopy::FallBack => {
-            match local_rebuild_jar(
-                purl,
-                installed_dir,
-                jar_path,
-                artifact_id,
-                version,
-                record,
-                sources,
-                force,
-                warnings,
-            )
-            .await
-            {
-                Ok(pair) => pair,
-                Err(outcome) => return Err(outcome),
+    let (jar_bytes, result) =
+        match service_archive_copy(service, &record.uuid, artifact_id, ".jar", warnings).await {
+            ServiceCopy::Used(bytes) => {
+                (bytes, already_patched_result(purl, jar_path, &record.files))
             }
-        }
-    };
+            ServiceCopy::HardFail(outcome) => return Err(outcome),
+            ServiceCopy::FallBack => {
+                match local_rebuild_jar(
+                    purl,
+                    installed_dir,
+                    jar_path,
+                    artifact_id,
+                    version,
+                    record,
+                    sources,
+                    force,
+                    warnings,
+                )
+                .await
+                {
+                    Ok(pair) => pair,
+                    Err(outcome) => return Err(outcome),
+                }
+            }
+        };
     if !result.success {
         // Local rebuild reported a failure; nothing on disk to clean up (the
         // jar is rebuilt in memory and only written below on success).
@@ -682,7 +627,7 @@ async fn local_rebuild_jar(
     // dependency resolve reads the central directory, so lexicographic entry
     // order + fixed timestamps yield stable bytes across re-runs).
     let stage_path = stage.path().to_path_buf();
-    let rezip = tokio::task::spawn_blocking(move || rebuild_jar(&stage_path)).await;
+    let rezip = tokio::task::spawn_blocking(move || rebuild_zip(&stage_path, None)).await;
     let jar_bytes = match rezip {
         Ok(Ok(b)) => b,
         Ok(Err(e)) => {
@@ -699,84 +644,6 @@ async fn local_rebuild_jar(
         }
     };
     Ok((jar_bytes, result))
-}
-
-/// Outcome of attempting to materialise the jar from the patch service.
-enum MavenServiceCopy {
-    /// The prebuilt patched `.jar` bytes (write them verbatim).
-    Used(Vec<u8>),
-    /// Bubble this terminal outcome (boxed — `VendorOutcome` is large).
-    HardFail(Box<VendorOutcome>),
-    /// Fall back to the local rebuild.
-    FallBack,
-}
-
-/// Download + integrity-verify the prebuilt patched `.jar` (Tier A: the verified
-/// archive bytes ARE the vendored jar). Maps each service outcome onto the
-/// `auto` / `service` fallback policy.
-async fn maven_service_copy(
-    service: Option<&VendorServiceConfig>,
-    record: &PatchRecord,
-    artifact_id: &str,
-    warnings: &mut Vec<VendorWarning>,
-) -> MavenServiceCopy {
-    let Some(cfg) = service else {
-        return MavenServiceCopy::FallBack;
-    };
-    if !cfg.service_enabled() {
-        return MavenServiceCopy::FallBack;
-    }
-    fn hard(code: &'static str, detail: String) -> MavenServiceCopy {
-        MavenServiceCopy::HardFail(Box::new(VendorOutcome::Refused { code, detail }))
-    }
-    let miss = |warnings: &mut Vec<VendorWarning>, code: &'static str, reason: String| {
-        if cfg.source.requires_service() {
-            hard("vendor_prebuilt_required", reason)
-        } else {
-            warnings.push(VendorWarning::new(
-                code,
-                format!("{reason}; building locally instead"),
-            ));
-            MavenServiceCopy::FallBack
-        }
-    };
-    match fetch_verified_archive(cfg, &record.uuid, artifact_id).await {
-        ServiceArtifact::Ready(archive) => {
-            warnings.push(VendorWarning::new(
-                "vendor_prebuilt_downloaded",
-                format!(
-                    "vendored {artifact_id} from the patch service ({})",
-                    archive.source_url
-                ),
-            ));
-            MavenServiceCopy::Used(archive.bytes)
-        }
-        ServiceArtifact::IntegrityMismatch(reason) => miss(
-            warnings,
-            "vendor_prebuilt_integrity_mismatch",
-            format!("prebuilt .jar failed integrity ({reason})"),
-        ),
-        ServiceArtifact::Pending => miss(
-            warnings,
-            "vendor_prebuilt_pending",
-            "prebuilt .jar is still building".to_string(),
-        ),
-        ServiceArtifact::Unavailable(reason) => {
-            if cfg.source.requires_service() {
-                hard(
-                    "vendor_prebuilt_required",
-                    format!("prebuilt .jar unavailable: {reason}"),
-                )
-            } else {
-                MavenServiceCopy::FallBack
-            }
-        }
-        ServiceArtifact::Failed(reason) => miss(
-            warnings,
-            "vendor_prebuilt_unavailable",
-            format!("patch service request failed ({reason})"),
-        ),
-    }
 }
 
 /// Acquire the REAL upstream pom bytes: the cached `~/.m2` copy first (the
@@ -922,46 +789,6 @@ async fn extract_jar_to_stage(src_jar: &Path) -> Result<tempfile::TempDir, Strin
     Ok(stage)
 }
 
-/// Re-zip the patched stage into a deterministic jar: entries sorted
-/// lexicographically, a fixed timestamp, and a fixed deflate level so rebuilding
-/// the same patched tree always yields identical bytes (churn-free commits +
-/// a stable `.sha1`). A jar is a plain zip resolved via its central directory,
-/// so entry order is free to be lexicographic.
-fn rebuild_jar(stage: &Path) -> Result<Vec<u8>, String> {
-    let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
-    for entry in walkdir::WalkDir::new(stage).follow_links(false) {
-        let entry = entry.map_err(|e| format!("walk {}: {e}", stage.display()))?;
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let rel = entry
-            .path()
-            .strip_prefix(stage)
-            .map_err(|e| format!("strip prefix: {e}"))?;
-        let name = rel.to_string_lossy().replace('\\', "/");
-        let bytes = std::fs::read(entry.path()).map_err(|e| format!("read {name}: {e}"))?;
-        entries.push((name, bytes));
-    }
-    entries.sort_by(|a, b| a.0.cmp(&b.0));
-
-    let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-    for (name, bytes) in &entries {
-        let options = zip::write::SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Deflated)
-            .compression_level(Some(6))
-            .last_modified_time(zip::DateTime::default())
-            .unix_permissions(0o644);
-        writer
-            .start_file(name, options)
-            .map_err(|e| format!("zip start {name}: {e}"))?;
-        writer
-            .write_all(bytes)
-            .map_err(|e| format!("zip write {name}: {e}"))?;
-    }
-    let cursor = writer.finish().map_err(|e| format!("zip finish: {e}"))?;
-    Ok(cursor.into_inner())
-}
-
 /// Write the jar + pom + their `.sha1` sidecars into the maven2 leaf dir,
 /// creating it. Errors are strings.
 async fn write_maven_artifact(
@@ -996,65 +823,23 @@ async fn artifact_in_sync(
     pom_leaf: &str,
     files: &HashMap<String, PatchFileInfo>,
 ) -> bool {
-    let jar = leaf_dir.join(jar_leaf);
-    if !jar_matches_after_hashes(&jar, files).await {
+    if !zip_matches_after_hashes(&leaf_dir.join(jar_leaf), files).await {
         return false;
     }
     // The pom + both sidecars must exist and match their bytes.
-    sidecar_matches(&jar).await && sidecar_matches(&leaf_dir.join(pom_leaf)).await
+    sidecar_matches(leaf_dir, jar_leaf).await && sidecar_matches(leaf_dir, pom_leaf).await
 }
 
-/// True when `<file>.sha1` exists and equals the hex sha1 of `<file>`'s bytes.
-async fn sidecar_matches(file: &Path) -> bool {
-    let Ok(bytes) = tokio::fs::read(file).await else {
+/// True when `<leaf>.sha1` exists and equals the hex sha1 of `<leaf>`'s bytes.
+async fn sidecar_matches(leaf_dir: &Path, leaf: &str) -> bool {
+    let Ok(bytes) = tokio::fs::read(leaf_dir.join(leaf)).await else {
         return false;
     };
-    let Ok(recorded) = tokio::fs::read_to_string(with_suffix(file, ".sha1")).await else {
+    let Ok(recorded) = tokio::fs::read_to_string(leaf_dir.join(format!("{leaf}.sha1"))).await
+    else {
         return false;
     };
     recorded.trim() == sha1_hex(&bytes)
-}
-
-/// Append a suffix to a path's file name (`foo.jar` + `.sha1` → `foo.jar.sha1`).
-fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
-    let mut name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    name.push_str(suffix);
-    path.with_file_name(name)
-}
-
-/// True when the committed jar exists and every patched file in it already
-/// hashes to its `afterHash` (the vendor twin of the NuGet feed's
-/// `nupkg_matches_after_hashes`, reading the jar's zip entries).
-async fn jar_matches_after_hashes(jar_path: &Path, files: &HashMap<String, PatchFileInfo>) -> bool {
-    use crate::hash::git_sha256::compute_git_sha256_from_bytes;
-    let Ok(bytes) = tokio::fs::read(jar_path).await else {
-        return false;
-    };
-    let Ok(mut archive) = zip::ZipArchive::new(std::io::Cursor::new(bytes)) else {
-        return false;
-    };
-    for (file_name, info) in files {
-        let normalized = normalize_file_path(file_name);
-        // SECURITY: never look up a key that escapes the package dir — treat it
-        // as out-of-sync (the full pipeline would refuse it anyway).
-        if !is_safe_relative_subpath(normalized) {
-            return false;
-        }
-        let Ok(mut entry) = archive.by_name(normalized) else {
-            return false;
-        };
-        let mut content = Vec::with_capacity(entry.size() as usize);
-        if entry.read_to_end(&mut content).is_err() {
-            return false;
-        }
-        if compute_git_sha256_from_bytes(&content) != info.after_hash {
-            return false;
-        }
-    }
-    true
 }
 
 fn sha1_hex(bytes: &[u8]) -> String {
@@ -1067,21 +852,121 @@ fn sha1_hex(bytes: &[u8]) -> String {
 /// `<repositories>` (or create the section before `</project>`). The pom is
 /// edited by targeted string insertion so all other bytes — formatting,
 /// comments, key order — are preserved and a later revert restores it
-/// byte-identically.
+/// byte-identically. Anchors are chosen with [`find_wireable_anchor`], never a
+/// bare substring match: a `</repositories>` inside an XML comment or inside
+/// `<profiles>` would swallow the block where Maven never reads it, so the
+/// build would silently resolve the UNPATCHED jar while vendor reports
+/// success.
 fn build_repo_edit(original: &str, repo_id: &str, uuid_dir_rel: &str) -> Result<String, String> {
     let block = repository_block(repo_id, uuid_dir_rel);
-    if original.contains("</repositories>") {
-        insert_before(original, "</repositories>", &block).ok_or_else(|| {
-            "could not locate </repositories> to insert the vendored <repository>".to_string()
-        })
-    } else if original.contains("</project>") {
+    if let Some(at) = find_wireable_anchor(original, "</repositories>") {
+        Ok(insert_block_at(original, at, &block))
+    } else if let Some(at) = find_wireable_anchor(original, "</project>") {
         let section = format!("  <repositories>\n{block}  </repositories>\n");
-        insert_before(original, "</project>", &section).ok_or_else(|| {
-            "could not locate </project> to insert a <repositories> section".to_string()
-        })
+        Ok(insert_block_at(original, at, &section))
     } else {
         Err("pom.xml has no </project> to edit".to_string())
     }
+}
+
+/// The insertion anchor: the first occurrence of `needle` Maven will actually
+/// read — outside every `<!-- -->` comment and outside `<profiles>` (a
+/// profile-scoped `<repositories>` is only consulted when that profile is
+/// activated, so it can never serve the always-on vendored repository).
+/// `None` when every occurrence is masked.
+fn find_wireable_anchor(text: &str, needle: &str) -> Option<usize> {
+    let mut masked = comment_spans(text);
+    masked.extend(profiles_spans(text, &masked));
+    find_outside(text, needle, 0, &masked)
+}
+
+/// Byte spans of `<!-- … -->` comments (an unterminated comment runs to EOF —
+/// the same drop-the-tail discipline as [`strip_xml_comments`]).
+fn comment_spans(text: &str) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut from = 0;
+    while let Some(rel) = text[from..].find("<!--") {
+        let start = from + rel;
+        match text[start + 4..].find("-->") {
+            Some(rel_end) => {
+                let end = start + 4 + rel_end + 3;
+                spans.push((start, end));
+                from = end;
+            }
+            None => {
+                spans.push((start, text.len()));
+                break;
+            }
+        }
+    }
+    spans
+}
+
+/// Byte spans covered by `<profiles>…</profiles>` elements, with the tags
+/// themselves matched outside `comments`. A self-closing `<profiles/>` spans
+/// nothing; an unclosed element masks through EOF (fail-closed — better to
+/// refuse than to wire a block Maven may never read).
+fn profiles_spans(text: &str, comments: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    const OPEN: &str = "<profiles";
+    const CLOSE: &str = "</profiles>";
+    let mut spans = Vec::new();
+    let mut from = 0;
+    while let Some(open) = find_outside(text, OPEN, from, comments) {
+        // Boundary check: `<profilesX>` is not `<profiles>`.
+        let after = &text[open + OPEN.len()..];
+        let boundary_ok = match after.chars().next() {
+            None => true,
+            Some(c) => c == '>' || c == '/' || c.is_whitespace(),
+        };
+        if !boundary_ok {
+            from = open + OPEN.len();
+            continue;
+        }
+        // A self-closing `<profiles/>` (or `<profiles …/>`) has no interior.
+        if let Some(gt) = text[open..].find('>').map(|r| open + r) {
+            if text[..gt].ends_with('/') {
+                from = gt + 1;
+                continue;
+            }
+        }
+        match find_outside(text, CLOSE, open, comments) {
+            Some(close) => {
+                let end = close + CLOSE.len();
+                spans.push((open, end));
+                from = end;
+            }
+            None => {
+                spans.push((open, text.len()));
+                break;
+            }
+        }
+    }
+    spans
+}
+
+/// First occurrence of `needle` at/after `from` whose start lies outside every
+/// `spans` range; `None` when only masked occurrences remain.
+fn find_outside(text: &str, needle: &str, from: usize, spans: &[(usize, usize)]) -> Option<usize> {
+    let mut at = from;
+    while let Some(rel) = text[at..].find(needle) {
+        let pos = at + rel;
+        if !spans.iter().any(|&(s, e)| pos >= s && pos < e) {
+            return Some(pos);
+        }
+        at = pos + needle.len();
+    }
+    None
+}
+
+/// `insert_before` at a known byte offset: insert `insertion` (already
+/// newline-terminated) at the start of the line containing `at`.
+fn insert_block_at(haystack: &str, at: usize, insertion: &str) -> String {
+    let line_start = haystack[..at].rfind('\n').map(|n| n + 1).unwrap_or(0);
+    let mut out = String::with_capacity(haystack.len() + insertion.len());
+    out.push_str(&haystack[..line_start]);
+    out.push_str(insertion);
+    out.push_str(&haystack[line_start..]);
+    out
 }
 
 /// The `<repository>` element served from the committed maven2 repo. The URL
@@ -1103,21 +988,6 @@ fn repository_block(repo_id: &str, uuid_dir_rel: &str) -> String {
          \x20     </snapshots>\n\
          \x20   </repository>\n"
     )
-}
-
-/// Insert `insertion` (already newline-terminated) immediately before the line
-/// containing the first occurrence of `needle`. Returns `None` if `needle` is
-/// absent.
-fn insert_before(haystack: &str, needle: &str, insertion: &str) -> Option<String> {
-    let idx = haystack.find(needle)?;
-    // Back up to the start of the needle's line so the insertion lands on its
-    // own line(s) directly above.
-    let line_start = haystack[..idx].rfind('\n').map(|n| n + 1).unwrap_or(0);
-    let mut out = String::with_capacity(haystack.len() + insertion.len());
-    out.push_str(&haystack[..line_start]);
-    out.push_str(insertion);
-    out.push_str(&haystack[line_start..]);
-    Some(out)
 }
 
 /// True when the pom declares a real (non-commented) `<modules>` element — an
@@ -1253,7 +1123,7 @@ async fn revert_repo_record(
         if dry_run {
             return Ok(true);
         }
-        atomic_write_bytes(pom_xml_path, original.as_bytes())
+        atomic_write_bytes_preserving_mode(pom_xml_path, original.as_bytes())
             .await
             .map_err(|e| format!("failed to restore {}: {e}", pom_xml_path.display()))?;
         return Ok(true);
@@ -1272,7 +1142,7 @@ async fn revert_repo_record(
         return Ok(true);
     }
     let excised = strip_empty_repositories(&live.replacen(&block, "", 1));
-    atomic_write_bytes(pom_xml_path, excised.as_bytes())
+    atomic_write_bytes_preserving_mode(pom_xml_path, excised.as_bytes())
         .await
         .map_err(|e| {
             format!(
@@ -1310,51 +1180,11 @@ fn strip_empty_repositories(pom: &str) -> String {
     out
 }
 
-// ── shared helpers ────────────────────────────────────────────────────────────────
-
-fn refused(code: &'static str, detail: impl Into<String>) -> VendorOutcome {
-    VendorOutcome::Refused {
-        code,
-        detail: detail.into(),
-    }
-}
-
-fn synthesized_result(
-    package_key: &str,
-    jar_path: &Path,
-    files_verified: Vec<VerifyResult>,
-    success: bool,
-    error: Option<String>,
-) -> ApplyResult {
-    ApplyResult {
-        package_key: package_key.to_string(),
-        package_path: jar_path.display().to_string(),
-        success,
-        files_verified,
-        files_patched: Vec::new(),
-        applied_via: HashMap::new(),
-        error,
-        sidecar: None,
-    }
-}
-
-fn failed_result(purl: &str, jar_path: &Path, error: String) -> ApplyResult {
-    synthesized_result(purl, jar_path, Vec::new(), false, Some(error))
-}
-
-fn already_patched_verify(file: &str) -> VerifyResult {
-    VerifyResult {
-        file: file.to_string(),
-        status: VerifyStatus::AlreadyPatched,
-        message: None,
-        current_hash: None,
-        expected_hash: None,
-        target_hash: None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use std::io::{Read as _, Write as _};
+    use std::path::PathBuf;
+
     use super::*;
     use crate::hash::git_sha256::compute_git_sha256_from_bytes;
     use crate::patch::vendor::state::VENDOR_MARKER_FILE;
@@ -2112,5 +1942,192 @@ mod tests {
         assert!(!is_safe_group_id("a..b"));
         assert!(!is_safe_group_id("a/b"));
         assert!(!is_safe_group_id("a:b"));
+    }
+
+    #[tokio::test]
+    async fn wires_outside_commented_repositories() {
+        // A commented-out <repositories> section must not capture the insert:
+        // a block landing inside the comment is invisible to Maven, so the
+        // build would silently resolve the UNPATCHED jar while vendor reports
+        // success.
+        let commented = "<project xmlns=\"http://maven.apache.org/POM/4.0.0\">\n\
+             \x20 <modelVersion>4.0.0</modelVersion>\n\
+             \x20 <groupId>com.example</groupId>\n\
+             \x20 <artifactId>app</artifactId>\n\
+             \x20 <version>1.0.0</version>\n\
+             \x20 <!--\n\
+             \x20 <repositories>\n\
+             \x20   <repository><id>old-corp</id><url>https://old/repo</url></repository>\n\
+             \x20 </repositories>\n\
+             \x20 -->\n\
+             </project>\n";
+        let (dir, blobs, installed, record) = fixture(Some(commented), true, true).await;
+        let root = dir.path();
+        let (result, _e, _w) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert!(result.success, "{:?}", result.error);
+        let wired = tokio::fs::read_to_string(root.join(PROJECT_POM))
+            .await
+            .unwrap();
+        assert!(
+            strip_xml_comments(&wired).contains(&format!("<id>socket-patch-vendor-{UUID}</id>")),
+            "the vendored <repository> must be outside comments (Maven-visible): {wired}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wires_project_root_not_profile_repositories() {
+        // A <repositories> inside <profiles> is only consulted when that
+        // profile is activated; anchoring our block there leaves the default
+        // build silently resolving the UNPATCHED jar.
+        let profiled = "<project xmlns=\"http://maven.apache.org/POM/4.0.0\">\n\
+             \x20 <modelVersion>4.0.0</modelVersion>\n\
+             \x20 <groupId>com.example</groupId>\n\
+             \x20 <artifactId>app</artifactId>\n\
+             \x20 <version>1.0.0</version>\n\
+             \x20 <profiles>\n\
+             \x20   <profile>\n\
+             \x20     <id>internal</id>\n\
+             \x20     <repositories>\n\
+             \x20       <repository><id>corp</id><url>https://corp/repo</url></repository>\n\
+             \x20     </repositories>\n\
+             \x20   </profile>\n\
+             \x20 </profiles>\n\
+             </project>\n";
+        let (dir, blobs, installed, record) = fixture(Some(profiled), true, true).await;
+        let root = dir.path();
+        let (result, _e, _w) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert!(result.success, "{:?}", result.error);
+        let wired = tokio::fs::read_to_string(root.join(PROJECT_POM))
+            .await
+            .unwrap();
+        let id = format!("<id>socket-patch-vendor-{UUID}</id>");
+        assert!(wired.contains(&id), "wired: {wired}");
+        let p_open = wired.find("<profiles>").unwrap();
+        let p_close = wired.find("</profiles>").unwrap();
+        assert!(
+            !wired[p_open..p_close].contains(&id),
+            "the vendored <repository> must not land inside <profiles>: {wired}"
+        );
+    }
+
+    #[test]
+    fn repo_edit_skips_commented_and_profile_anchors() {
+        // Only a commented </repositories> → a NEW real section is created.
+        let commented = "<project>\n<!--\n  <repositories>\n  </repositories>\n-->\n</project>\n";
+        let out =
+            build_repo_edit(commented, "socket-patch-vendor-x", ".socket/vendor/maven/x").unwrap();
+        assert!(
+            strip_xml_comments(&out).contains("<id>socket-patch-vendor-x</id>"),
+            "block must be Maven-visible: {out}"
+        );
+        // Only a profile-scoped </repositories> → likewise anchored at </project>.
+        let profiled = "<project>\n  <profiles>\n    <profile>\n      <repositories>\n      \
+                        </repositories>\n    </profile>\n  </profiles>\n</project>\n";
+        let out =
+            build_repo_edit(profiled, "socket-patch-vendor-x", ".socket/vendor/maven/x").unwrap();
+        let p_close = out.find("</profiles>").unwrap();
+        let id_at = out.find("<id>socket-patch-vendor-x</id>").unwrap();
+        assert!(id_at > p_close, "block must land after </profiles>: {out}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wire_preserves_pom_xml_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (dir, blobs, installed, record) = fixture(Some(project_pom()), true, true).await;
+        let root = dir.path();
+        let pom_path = root.join(PROJECT_POM);
+        tokio::fs::set_permissions(&pom_path, std::fs::Permissions::from_mode(0o600))
+            .await
+            .unwrap();
+
+        let (result, _e, _w) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert!(result.success, "{:?}", result.error);
+        let mode = tokio::fs::metadata(&pom_path)
+            .await
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(
+            mode, 0o600,
+            "wiring must not reset the user's pom.xml mode"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn revert_preserves_pom_xml_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (dir, blobs, installed, record) = fixture(Some(project_pom()), true, true).await;
+        let root = dir.path();
+        let pom_path = root.join(PROJECT_POM);
+
+        async fn mode_of(p: &Path) -> u32 {
+            tokio::fs::metadata(p).await.unwrap().permissions().mode() & 0o7777
+        }
+
+        // Byte-identical fast path (whole-file restore).
+        let (result, entry, _w) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert!(result.success);
+        let entry = entry.unwrap();
+        tokio::fs::set_permissions(&pom_path, std::fs::Permissions::from_mode(0o600))
+            .await
+            .unwrap();
+        let outcome = revert_maven(&entry, root, false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert_eq!(
+            mode_of(&pom_path).await,
+            0o600,
+            "whole-file restore must not reset the pom.xml mode"
+        );
+
+        // Re-vendor, drift with a user edit, revert → the excise path writes too.
+        let (result, entry, _w) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert!(result.success);
+        let entry = entry.unwrap();
+        let wired = tokio::fs::read_to_string(&pom_path).await.unwrap();
+        let edited = wired.replacen(
+            "</project>",
+            "  <properties>\n  </properties>\n</project>",
+            1,
+        );
+        tokio::fs::write(&pom_path, &edited).await.unwrap();
+        tokio::fs::set_permissions(&pom_path, std::fs::Permissions::from_mode(0o640))
+            .await
+            .unwrap();
+        let outcome = revert_maven(&entry, root, false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert_eq!(
+            mode_of(&pom_path).await,
+            0o640,
+            "the excise path must not reset the pom.xml mode"
+        );
+    }
+
+    #[tokio::test]
+    async fn wired_rebuild_reports_vendored_jar_path() {
+        // The wired-but-missing-artifact rebuild leg must report the vendored
+        // jar path, not the (deleted) temp stage the rebuild ran in.
+        let (dir, blobs, installed, record) = fixture(Some(project_pom()), true, true).await;
+        let root = dir.path();
+        let (r1, _e, _w) = unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert!(r1.success);
+        remove_tree(&root.join(format!(".socket/vendor/maven/{UUID}")))
+            .await
+            .unwrap();
+        let (r2, _e2, _w2) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert!(r2.success, "{:?}", r2.error);
+        assert_eq!(
+            r2.package_path,
+            root.join(jar_rel()).display().to_string(),
+            "rebuild leg must report the vendored jar, not the temp stage"
+        );
     }
 }

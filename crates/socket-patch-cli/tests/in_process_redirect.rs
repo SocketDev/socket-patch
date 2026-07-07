@@ -910,6 +910,256 @@ async fn scan_redirect_migrates_bun_lockb_then_redirects() {
     );
 }
 
+/// A `socket-patch` Command with the ambient `SOCKET_*` env surface scrubbed,
+/// for the subprocess tests below: the binary binds a wide clap env surface
+/// (SOCKET_DRY_RUN, SOCKET_OFFLINE, SOCKET_ECOSYSTEMS, SOCKET_PROXY_URL, ...),
+/// and an ambient value silently changes what these tests exercise — ambient
+/// `SOCKET_DRY_RUN=true` turns the rewrite into a no-op and every on-disk
+/// oracle red. Seed-then-scrub (the `common/mod.rs` pattern): the hostile
+/// seeds never reach the child because `env_remove` clears them too, but if a
+/// scrub line is ever dropped the seed turns the suite red immediately.
+/// Telemetry opt-outs are deliberately kept so an opted-out dev stays opted
+/// out. The in-process tests above don't need this — their literal `ScanArgs`
+/// bypass clap's env bindings entirely.
+fn scrubbed_cli() -> std::process::Command {
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_socket-patch"));
+    cmd.env("SOCKET_DRY_RUN", "true")
+        .env("SOCKET_OFFLINE", "true")
+        .env("SOCKET_ECOSYSTEMS", "cargo")
+        .env("SOCKET_MANIFEST_PATH", "/nonexistent/manifest.json")
+        .env_remove("SOCKET_DRY_RUN")
+        .env_remove("SOCKET_OFFLINE")
+        .env_remove("SOCKET_ECOSYSTEMS")
+        .env_remove("SOCKET_MANIFEST_PATH");
+    for (key, _) in std::env::vars_os() {
+        let name = key.to_string_lossy();
+        if name.starts_with("SOCKET_") && !name.contains("TELEMETRY") {
+            cmd.env_remove(&key);
+        }
+    }
+    cmd
+}
+
+/// The bun migration's child output must NOT leak into the `--json` stdout
+/// envelope: bun prints its own install chatter, and inheriting the parent's
+/// stdout would interleave that chatter before the JSON document, breaking
+/// every consumer that parses stdout. A deliberately chatty shim emulates a
+/// noisy bun.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn bun_migration_output_does_not_corrupt_json_envelope() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("package.json"),
+        format!(
+            r#"{{ "name": "consumer", "version": "0.0.0", "dependencies": {{ "{NAME}": "^{VERSION}" }} }}"#
+        ),
+    )
+    .unwrap();
+    let pkg = tmp.path().join("node_modules").join(NAME);
+    std::fs::create_dir_all(&pkg).unwrap();
+    std::fs::write(
+        pkg.join("package.json"),
+        format!(r#"{{ "name": "{NAME}", "version": "{VERSION}" }}"#),
+    )
+    .unwrap();
+    std::fs::write(tmp.path().join("bun.lockb"), b"BUN-BINARY-PLACEHOLDER").unwrap();
+
+    let bin_dir = tmp.path().join("fakebin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let shim = bin_dir.join("bun");
+    let bun_lock_body = format!(
+        "{{\n  \"lockfileVersion\": 1,\n  \"packages\": {{\n    \
+         \"{NAME}\": [\"{NAME}@{VERSION}\", \"\", {{}}, \"sha512-UPSTREAMupstream==\"],\n  \
+         }}\n}}\n"
+    );
+    std::fs::write(
+        &shim,
+        format!(
+            "#!/bin/sh\n\
+             # a chatty bun: install progress goes to STDOUT\n\
+             echo \"bun install v1.2.19 (canary)\"\n\
+             echo \"Saved bun.lock\"\n\
+             cat > bun.lock <<'LOCK'\n{bun_lock_body}LOCK\n\
+             rm -f bun.lockb\n\
+             exit 0\n"
+        ),
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    // Subprocess (not in-process) so the shim's PATH injection is scoped to
+    // the child and the child's stdout can be parsed back.
+    let out = scrubbed_cli()
+        .args([
+            "scan",
+            "--redirect",
+            "--json",
+            "--yes",
+            "--cwd",
+            tmp.path().to_str().unwrap(),
+            "--api-url",
+            &server.uri(),
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+        ])
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                bin_dir.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .output()
+        .expect("run socket-patch");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "scan --redirect must succeed; stdout=\n{}\nstderr=\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let env_json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "--json stdout must be a pure JSON envelope (bun's migration chatter \
+             must not leak into it): {e}\nstdout:\n{}",
+            String::from_utf8_lossy(&out.stdout)
+        )
+    });
+    assert_eq!(
+        env_json["redirect"]["redirected"], 1,
+        "envelope: {env_json}"
+    );
+    let lock = std::fs::read_to_string(tmp.path().join("bun.lock")).unwrap();
+    assert!(
+        lock.contains(HOSTED_URL),
+        "the migrated bun.lock must be redirected; got:\n{lock}"
+    );
+}
+
+/// A bun.lockb project where NOTHING is redirectable (the only patch's
+/// reference is denied) must NOT have its lockfile migrated: the migration
+/// exists solely so the bun rewriter can edit a text lock, and running it with
+/// no npm override would destructively re-lock the project — bun.lockb deleted,
+/// bun.lock created, a ledger written — as a pure side effect of a no-op scan.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn no_redirectable_patch_leaves_bun_lockb_alone() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    // Reference endpoint: the patch exists but this org may not download it.
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/package")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "results": { UUID: { "status": "forbidden", "url": null, "purl": PURL, "artifacts": [], "registryOverride": null } }
+        })))
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("package.json"),
+        format!(
+            r#"{{ "name": "consumer", "version": "0.0.0", "dependencies": {{ "{NAME}": "^{VERSION}" }} }}"#
+        ),
+    )
+    .unwrap();
+    let pkg = tmp.path().join("node_modules").join(NAME);
+    std::fs::create_dir_all(&pkg).unwrap();
+    std::fs::write(
+        pkg.join("package.json"),
+        format!(r#"{{ "name": "{NAME}", "version": "{VERSION}" }}"#),
+    )
+    .unwrap();
+    std::fs::write(tmp.path().join("bun.lockb"), b"BUN-BINARY-PLACEHOLDER").unwrap();
+
+    // A fake `bun` on PATH that WOULD migrate if invoked — the assertion below
+    // is that it never runs (bun.lockb survives untouched).
+    let bin_dir = tmp.path().join("fakebin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let shim = bin_dir.join("bun");
+    std::fs::write(
+        &shim,
+        "#!/bin/sh\n\
+         echo '{ \"lockfileVersion\": 1, \"packages\": {} }' > bun.lock\n\
+         rm -f bun.lockb\n\
+         exit 0\n",
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let orig_path = std::env::var("PATH").unwrap_or_default();
+    // SAFETY: single-threaded #[serial] test; PATH restored below.
+    unsafe {
+        std::env::set_var("PATH", format!("{}:{orig_path}", bin_dir.display()));
+    }
+
+    let code = run(redirect_args(tmp.path(), server.uri())).await;
+
+    unsafe {
+        std::env::set_var("PATH", orig_path);
+    }
+    assert_eq!(code, 0, "a fully-skipped redirect still exits 0");
+    assert!(
+        tmp.path().join("bun.lockb").exists(),
+        "bun.lockb must survive a scan that redirected nothing"
+    );
+    assert!(
+        !tmp.path().join("bun.lock").exists(),
+        "no text lock may be created when nothing is redirectable"
+    );
+    assert!(
+        !tmp.path()
+            .join(".socket/vendor/redirect-state.json")
+            .exists(),
+        "no ledger may be written when nothing was redirected"
+    );
+}
+
+/// A ledger that cannot be written is an ERROR, not a silent success: the
+/// lockfile has already been rewritten, and
+/// `.socket/vendor/redirect-state.json` is the only revert path (and the VEX
+/// record store), so swallowing the write failure would leave the repo
+/// redirected with no way back while reporting success.
+#[tokio::test]
+#[serial]
+async fn unwritable_ledger_fails_the_run() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_project(tmp.path());
+    // Occupy the ledger path with a DIRECTORY so the ledger write must fail.
+    std::fs::create_dir_all(tmp.path().join(".socket/vendor/redirect-state.json")).unwrap();
+
+    let code = run(redirect_args(tmp.path(), server.uri())).await;
+    assert_eq!(code, 1, "a failed ledger write must flip the exit code");
+    // The failure is about the ledger, not the rewrite: the lockfile edit
+    // landed before the ledger write was attempted.
+    let lock = std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap();
+    assert!(
+        lock.contains(HOSTED_URL),
+        "the lockfile rewrite precedes the ledger write; got:\n{lock}"
+    );
+}
+
 // ── Rush monorepo ────────────────────────────────────────────────────────
 
 /// A Rush pnpm lock (v9) resolving the patched package under `packages:`, so
@@ -1018,7 +1268,7 @@ async fn scan_redirect_rewrites_rush_common_and_subspace_locks() {
 /// hosting test can't read back. No package-manager binary is needed: the
 /// rewrite is pure text over the fixture locks.
 fn run_redirect_subprocess(cwd: &Path, api_url: &str) -> serde_json::Value {
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_socket-patch"))
+    let out = scrubbed_cli()
         .args([
             "scan",
             "--redirect",
@@ -1060,6 +1310,75 @@ fn warning_codes(env: &serde_json::Value) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// The rewriters' own warnings must reach HUMAN mode too, not just the
+/// `--json` envelope: they carry the load-bearing "why nothing happened /
+/// what you must do" guidance (`redirect_npm_no_lockfile`,
+/// `redirect_gradle_manual_snippet`, the missing-integrity family).
+/// Regression guard: the human branch printed the skipped/record/migration/
+/// rush warnings but dropped `rewrite.warnings` entirely, so a default-mode
+/// `scan --redirect` in a lockfile-less project reported "Redirected 0
+/// package(s)" with no explanation at all. Subprocess (not in-process) so
+/// stderr can be read back.
+#[tokio::test]
+#[serial]
+async fn redirect_human_mode_prints_rewriter_warnings() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    // Installed tree + package.json only — NO lockfile, so the npm rewriter
+    // emits `redirect_npm_no_lockfile` for the granted override.
+    std::fs::write(
+        tmp.path().join("package.json"),
+        format!(
+            r#"{{ "name": "consumer", "version": "0.0.0", "dependencies": {{ "{NAME}": "{VERSION}" }} }}"#
+        ),
+    )
+    .unwrap();
+    let pkg = tmp.path().join("node_modules").join(NAME);
+    std::fs::create_dir_all(&pkg).unwrap();
+    std::fs::write(
+        pkg.join("package.json"),
+        format!(r#"{{ "name": "{NAME}", "version": "{VERSION}" }}"#),
+    )
+    .unwrap();
+
+    let out = scrubbed_cli()
+        .args([
+            "scan",
+            "--redirect",
+            "--yes",
+            "--cwd",
+            tmp.path().to_str().unwrap(),
+            "--api-url",
+            &server.uri(),
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+        ])
+        .output()
+        .expect("run socket-patch");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a no-op redirect still exits 0; stdout=\n{stdout}\nstderr=\n{stderr}"
+    );
+    assert!(
+        stdout.contains("Redirected 0 package(s)"),
+        "anchor: the run must have taken the human-mode redirect branch; \
+         stdout=\n{stdout}"
+    );
+    assert!(
+        stderr.contains("no package-lock.json"),
+        "human mode must print the rewriter's no-lockfile warning (JSON mode \
+         already carries it); stderr=\n{stderr}"
+    );
 }
 
 /// The `redirect_rush_repo_state_stale` warning fires exactly when a Rush lock
@@ -1114,5 +1433,62 @@ async fn rush_repo_state_stale_warning_is_gated_on_repo_state_presence() {
     assert!(
         lock.contains(HOSTED_URL),
         "the common lock must still be redirected without repo-state.json; got:\n{lock}"
+    );
+}
+
+/// The `redirect_rush_repo_state_stale` warning claims a Rush lock "was edited
+/// outside `rush update`" — so it must fire only when the rewrite actually
+/// landed in a Rush lock. A Rush repo whose locks resolve only an UNRELATED
+/// package (the granted patch's dep is installed but absent from every lock)
+/// gets no lock edit and therefore no stale-hash warning, even with
+/// repo-state.json present.
+#[tokio::test]
+#[serial]
+async fn rush_stale_warning_requires_an_actual_lock_edit() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("rush.json"),
+        r#"{ "rushVersion": "5.100.0" }"#,
+    )
+    .unwrap();
+    let common = tmp.path().join("common/config/rush");
+    std::fs::create_dir_all(&common).unwrap();
+    // The lock resolves a package the granted patch does NOT cover.
+    std::fs::write(
+        common.join("pnpm-lock.yaml"),
+        rush_pnpm_lock("unrelated-pkg"),
+    )
+    .unwrap();
+    std::fs::write(
+        common.join("repo-state.json"),
+        "{\n  \"pnpmShrinkwrapHash\": \"deadbeef\",\n  \"preventManualShrinkwrapChanges\": true\n}\n",
+    )
+    .unwrap();
+    // Installed copy so discovery still selects the patch.
+    write_installed(tmp.path(), NAME, VERSION, b"unpatched installed bytes\n");
+    let lock_before =
+        std::fs::read_to_string(tmp.path().join("common/config/rush/pnpm-lock.yaml")).unwrap();
+
+    let env = run_redirect_subprocess(tmp.path(), &server.uri());
+    assert_eq!(env["status"], "success", "envelope: {env}");
+    assert_eq!(
+        env["redirect"]["redirected"], 0,
+        "nothing pins the patch, so nothing may count as redirected: {env}"
+    );
+    assert!(
+        !warning_codes(&env).contains(&"redirect_rush_repo_state_stale".to_string()),
+        "no lock was edited, so the stale-hash warning must not fire; got warnings {:?}",
+        warning_codes(&env)
+    );
+    let lock_after =
+        std::fs::read_to_string(tmp.path().join("common/config/rush/pnpm-lock.yaml")).unwrap();
+    assert_eq!(
+        lock_before, lock_after,
+        "the unrelated lock must be untouched"
     );
 }

@@ -1,4 +1,3 @@
-#![cfg(feature = "golang")]
 //! End-to-end tests for the Go module patching lifecycle.
 //!
 //! These tests exercise crawling against a temporary directory with a fake
@@ -13,7 +12,7 @@
 //!
 //! # Running
 //! ```sh
-//! cargo test -p socket-patch-cli --features golang --test e2e_golang
+//! cargo test -p socket-patch-cli --test e2e_golang
 //! ```
 
 use std::collections::BTreeSet;
@@ -73,6 +72,27 @@ async fn run(args: &[&str], cwd: &Path, gomodcache: &Path, api_url: &str) -> Out
             .env("SOCKET_API_URL", &api_url)
             .env("SOCKET_API_TOKEN", "sktsec_dummy_e2e_golang_token_api")
             .env("SOCKET_ORG_SLUG", ORG)
+            // Ambient-pollution regression guard: seed a hostile value for
+            // each scan-affecting variable, then scrub it below. `env_remove`
+            // clears explicitly-set values too, so the child never sees the
+            // seeds — but if a scrub line is ever dropped, the seed (rather
+            // than a developer's ambient shell, which this suite can't rely
+            // on) turns the tests red immediately. Each seed was verified to
+            // break the suite when inherited: `SOCKET_ECOSYSTEMS` filters the
+            // go crawler out entirely, `SOCKET_GLOBAL` / `SOCKET_GLOBAL_PREFIX`
+            // redirect the crawl away from the pinned `GOMODCACHE`, and
+            // `SOCKET_JSON` / `SOCKET_SILENT` replace or suppress the human
+            // output the tests assert on.
+            .env("SOCKET_ECOSYSTEMS", "npm")
+            .env("SOCKET_GLOBAL", "true")
+            .env("SOCKET_GLOBAL_PREFIX", "/nonexistent")
+            .env("SOCKET_JSON", "true")
+            .env("SOCKET_SILENT", "true")
+            .env_remove("SOCKET_ECOSYSTEMS")
+            .env_remove("SOCKET_GLOBAL")
+            .env_remove("SOCKET_GLOBAL_PREFIX")
+            .env_remove("SOCKET_JSON")
+            .env_remove("SOCKET_SILENT")
             .env_remove("GOPATH")
             .env_remove("SOCKET_OFFLINE")
             .env_remove("SOCKET_PROXY_URL")

@@ -39,7 +39,7 @@ fn git_sha256(content: &[u8]) -> String {
 /// crawler so the test environment matches what the crawler probes.
 fn find_python() -> Option<&'static str> {
     for cmd in ["python3", "python", "py"] {
-        let ok = Command::new(cmd)
+        let ok = python_cmd(cmd)
             .arg("--version")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -55,6 +55,33 @@ fn find_python() -> Option<&'static str> {
 
 fn has_python3() -> bool {
     find_python().is_some()
+}
+
+/// Build a `Command` for a python/pip spawn with the hostile ambient env
+/// scrubbed. Any `PIP_*` var silently reconfigures every pip invocation:
+/// `PIP_DRY_RUN=1` turns `pip install` into an exit-0 no-op and
+/// `PIP_TARGET` diverts the install outside the venv — both verified to
+/// leave the venv without `six.py`, stranding all four tests at the
+/// "six.py not found" assert. `PYTHONHOME`/`PYTHONPATH` reshape the
+/// interpreter the venv is built from, so they're cleared too. The two
+/// verified hostile values are seeded and then scrubbed — `env_remove`
+/// clears the seed as well, so the child never sees it, but if the scrub
+/// is ever dropped the seeds (not a developer's ambient shell) turn the
+/// suite red immediately.
+fn python_cmd(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    let mut cmd = Command::new(program);
+    cmd.env("PIP_DRY_RUN", "1")
+        .env("PIP_TARGET", "/nonexistent")
+        .env_remove("PIP_DRY_RUN")
+        .env_remove("PIP_TARGET")
+        .env_remove("PYTHONHOME")
+        .env_remove("PYTHONPATH");
+    for (k, _) in std::env::vars_os() {
+        if k.to_string_lossy().starts_with("PIP_") {
+            cmd.env_remove(&k);
+        }
+    }
+    cmd
 }
 
 /// Path to `pip` inside the given venv. PEP-405 mandates a different
@@ -73,14 +100,14 @@ fn venv_pip(venv: &Path) -> PathBuf {
 fn install_six(tmp: &Path) -> PathBuf {
     let venv = tmp.join(".venv");
     let python = find_python().expect("python interpreter not on PATH");
-    let status = Command::new(python)
+    let status = python_cmd(python)
         .args(["-m", "venv", venv.to_str().unwrap()])
         .status()
         .expect("python venv");
     assert!(status.success(), "failed to create venv");
 
     let pip = venv_pip(&venv);
-    let status = Command::new(&pip)
+    let status = python_cmd(&pip)
         .args([
             "install",
             "--disable-pip-version-check",
@@ -471,6 +498,24 @@ async fn pypi_apply_dry_run_does_not_modify_file() {
         "dry-run batch request did not include the discovered six PURL {purl}; \
          the unchanged file does not prove dry-run suppressed a real patch; \
          bodies: {batch_bodies:?}"
+    );
+    // Discovery alone still doesn't pin the APPLY path: a scan that
+    // degraded to plain listing (e.g. a broken `--apply` → agent-mode
+    // fold in `resolve_mode_flags`) also queries batch with the purl,
+    // exits 0, and leaves the file untouched — vacuously green. In JSON
+    // mode only the agent-mode apply branch fetches per-package patch
+    // details (`discover_selected`, which runs before the dry-run gate),
+    // so requiring that fetch proves dry-run reached the apply path with
+    // a real patch selected and then declined to write. Mutation-verified:
+    // dropping the `--apply` fold passes every assert above but fails here.
+    assert!(
+        requests.iter().any(|r| r
+            .url
+            .path()
+            .starts_with(&format!("/v0/orgs/{ORG}/patches/by-package/"))),
+        "dry-run never fetched per-package patch details — the agent-mode \
+         apply branch did not run, so the unchanged file proves nothing \
+         about dry-run apply"
     );
 }
 

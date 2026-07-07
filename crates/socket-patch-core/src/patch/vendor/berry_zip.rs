@@ -35,6 +35,7 @@
 //!   fields, no comments, one CDH per LFH in the same order;
 //! * **EOCD** — single disk, no zip64, no archive comment.
 
+use std::collections::HashSet;
 use std::io::Read;
 
 use flate2::read::GzDecoder;
@@ -60,7 +61,8 @@ const MODE_FILE_EXEC: u32 = 0o100755;
 /// `tgz_bytes` for `node_modules/<package_ident>/`.
 ///
 /// Fail-closed: any tar shape the spiked recipe did not cover (symlinks,
-/// hardlinks, non-ASCII names, single-component paths) is an `Err` — a wrong
+/// hardlinks, non-ASCII names, single-component paths, non-canonical paths
+/// — `./`, `..`, `//`, absolute — and duplicate paths) is an `Err` — a wrong
 /// checksum would brick the user's `yarn install` with a YN0018, so we never
 /// guess.
 pub(super) fn berry_cache_checksum_10c0(
@@ -96,15 +98,12 @@ fn rebuild_cache_zip(tgz_bytes: &[u8], package_ident: &str) -> Result<Vec<u8>, S
 fn collect_entries(tgz_bytes: &[u8], package_ident: &str) -> Result<Vec<ZipEntry>, String> {
     let prefix = format!("node_modules/{package_ident}");
     let mut entries: Vec<ZipEntry> = Vec::new();
-    let mut seen_dirs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen_dirs: HashSet<String> = HashSet::new();
+    let mut seen_files: HashSet<String> = HashSet::new();
 
     // mkdirp: emit every missing ancestor of `dirpath` (no trailing slash),
     // shallowest first, exactly once.
-    fn mkdirp(
-        dirpath: &str,
-        seen: &mut std::collections::HashSet<String>,
-        out: &mut Vec<ZipEntry>,
-    ) {
+    fn mkdirp(dirpath: &str, seen: &mut HashSet<String>, out: &mut Vec<ZipEntry>) {
         let parts: Vec<&str> = dirpath.split('/').collect();
         for i in 1..=parts.len() {
             let d = format!("{}/", parts[..i].join("/"));
@@ -132,12 +131,28 @@ fn collect_entries(tgz_bytes: &[u8], package_ident: &str) -> Result<Vec<ZipEntry
         if !raw_name.is_ascii() {
             return Err(format!("tar entry name `{raw_name}` is not ASCII"));
         }
+        // yarn normalizes `./`/`//` away and skips absolute/`..` entries
+        // before stripping the first component — shapes the spike never
+        // covered. Stripping the first *raw* component would hash a layout
+        // yarn disagrees with; refuse rather than guess.
+        let canonical = raw_name.strip_suffix('/').unwrap_or(&raw_name);
+        if canonical.is_empty()
+            || canonical
+                .split('/')
+                .any(|c| c.is_empty() || c == "." || c == "..")
+        {
+            return Err(format!(
+                "tar entry name `{raw_name}` is not in canonical form; cannot rebuild the \
+                 berry cache zip deterministically"
+            ));
+        }
         // Strip the first path component (`package/` for npm packs).
-        let stripped = raw_name.split('/').skip(1).collect::<Vec<_>>().join("/");
-        let stripped = stripped.trim_end_matches('/');
+        let stripped = raw_name
+            .split_once('/')
+            .map_or("", |(_, rest)| rest)
+            .trim_end_matches('/');
 
-        let entry_type = entry.header().entry_type();
-        match entry_type {
+        match entry.header().entry_type() {
             tar::EntryType::Directory => {
                 let dir = if stripped.is_empty() {
                     prefix.clone()
@@ -153,6 +168,14 @@ fn collect_entries(tgz_bytes: &[u8], package_ident: &str) -> Result<Vec<ZipEntry
                     ));
                 }
                 let target = format!("{prefix}/{stripped}");
+                // yarn overwrites a repeated path in place (one zip entry);
+                // emitting two diverges — another unspiked shape to refuse.
+                if !seen_files.insert(target.clone()) {
+                    return Err(format!(
+                        "tarball contains `{raw_name}` more than once; cannot rebuild the \
+                         berry cache zip deterministically"
+                    ));
+                }
                 let parent = target.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
                 mkdirp(parent, &mut seen_dirs, &mut entries);
                 let mut data = Vec::new();
@@ -208,10 +231,9 @@ fn write_zip(entries: &[ZipEntry]) -> Result<Vec<u8>, String> {
 
     let mut blob: Vec<u8> = Vec::new();
     let mut central: Vec<u8> = Vec::new();
-    let mut offsets: Vec<u32> = Vec::with_capacity(entries.len());
 
     for e in entries {
-        offsets.push(as_u32(blob.len(), "local header offset")?);
+        let offset = as_u32(blob.len(), "local header offset")?;
         let crc = if e.is_dir {
             0
         } else {
@@ -220,6 +242,8 @@ fn write_zip(entries: &[ZipEntry]) -> Result<Vec<u8>, String> {
             crc.sum()
         };
         let size = as_u32(e.data.len(), "entry size")?;
+        let name_len =
+            u16::try_from(e.name.len()).map_err(|_| "entry name too long".to_string())?;
         let vneed = if e.is_dir {
             VERSION_NEEDED_DIR
         } else {
@@ -235,10 +259,7 @@ fn write_zip(entries: &[ZipEntry]) -> Result<Vec<u8>, String> {
         w32(&mut blob, crc);
         w32(&mut blob, size); // compressed == uncompressed (stored)
         w32(&mut blob, size);
-        w16(
-            &mut blob,
-            u16::try_from(e.name.len()).map_err(|_| "entry name too long".to_string())?,
-        );
+        w16(&mut blob, name_len);
         w16(&mut blob, 0); // extra len
         blob.extend_from_slice(e.name.as_bytes());
         blob.extend_from_slice(&e.data);
@@ -253,13 +274,13 @@ fn write_zip(entries: &[ZipEntry]) -> Result<Vec<u8>, String> {
         w32(&mut central, crc);
         w32(&mut central, size);
         w32(&mut central, size);
-        w16(&mut central, e.name.len() as u16);
+        w16(&mut central, name_len);
         w16(&mut central, 0); // extra len
         w16(&mut central, 0); // comment len
         w16(&mut central, 0); // disk number start
         w16(&mut central, 0); // internal attrs
         w32(&mut central, e.mode << 16); // external attrs
-        w32(&mut central, *offsets.last().expect("just pushed"));
+        w32(&mut central, offset);
         central.extend_from_slice(e.name.as_bytes());
     }
 
@@ -460,6 +481,49 @@ mod tests {
                 entry.name()
             );
         }
+    }
+
+    /// Build a tgz of regular-file entries whose names are written straight
+    /// into the GNU header, bypassing tar-rs path validation — the only way
+    /// to reproduce the non-canonical names hand-rolled registry tarballs
+    /// can carry.
+    fn tgz_with_names(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::new(6));
+        let mut tar = tar::Builder::new(gz);
+        for (path, data) in entries {
+            let mut h = tar::Header::new_gnu();
+            h.set_entry_type(tar::EntryType::Regular);
+            h.set_size(data.len() as u64);
+            h.set_mode(0o644);
+            h.as_gnu_mut().unwrap().name[..path.len()].copy_from_slice(path.as_bytes());
+            h.set_cksum();
+            tar.append(&h, *data).unwrap();
+        }
+        tar.into_inner().unwrap().finish().unwrap()
+    }
+
+    /// Path shapes yarn's converter normalizes (`./`, `//`) or skips
+    /// outright (absolute, `..`) before stripping the first component, and
+    /// duplicate paths (yarn overwrites in place — one zip entry, not two):
+    /// none covered by the spike, so hashing our literal mapping would emit
+    /// a checksum yarn disagrees with. Must fail closed, never guess.
+    #[test]
+    fn non_canonical_and_duplicate_paths_fail_closed() {
+        for name in [
+            "./package/index.js",
+            "package/./index.js",
+            "package/../index.js",
+            "/package/index.js",
+            "package//index.js",
+        ] {
+            let tgz = tgz_with_names(&[(name, b"x")]);
+            let err = berry_cache_checksum_10c0(&tgz, "x").unwrap_err();
+            assert!(err.contains("not in canonical form"), "`{name}`: {err}");
+        }
+
+        let tgz = tgz_with_names(&[("package/a.txt", b"1"), ("package/a.txt", b"2")]);
+        let err = berry_cache_checksum_10c0(&tgz, "x").unwrap_err();
+        assert!(err.contains("more than once"), "{err}");
     }
 
     #[test]

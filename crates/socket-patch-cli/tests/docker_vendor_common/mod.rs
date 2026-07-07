@@ -136,6 +136,9 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 git_blob_sha() {
   # git blob sha256: sha256("blob <len>\0" + bytes)
   local f="$1"
+  # Fail up front: the hashing pipeline's exit status comes from `cut`, so a
+  # missing file would otherwise "succeed" with the hash of the bare header.
+  [ -f "$f" ] && [ -r "$f" ] || return 1
   local len
   len=$(wc -c < "$f" | tr -d '[:space:]')
   { printf 'blob %s\0' "$len"; cat "$f"; } | sha256sum | cut -d' ' -f1

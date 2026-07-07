@@ -26,10 +26,7 @@
 
 use serde::Serialize;
 
-pub use socket_patch_core::patch::sidecars::{
-    SidecarAdvisory, SidecarAdvisoryCode, SidecarFile, SidecarFileAction, SidecarRecord,
-    SidecarSeverity,
-};
+pub use socket_patch_core::patch::sidecars::{SidecarFile, SidecarFileAction, SidecarRecord};
 
 /// Top-level JSON envelope emitted by every `--json` invocation.
 #[derive(Debug, Clone, Serialize)]
@@ -133,13 +130,6 @@ impl Envelope {
         self.events.push(event);
     }
 
-    /// Append a sidecar fixup record. Called once per `ApplyResult`
-    /// whose `sidecar` field is `Some`. Order matches the order
-    /// `apply` processed packages, which is best-effort.
-    pub fn record_sidecar(&mut self, sidecar: SidecarRecord) {
-        self.sidecars.push(sidecar);
-    }
-
     /// Mark the run as a partial failure. Idempotent.
     pub fn mark_partial_failure(&mut self) {
         if !matches!(self.status, Status::Error) {
@@ -210,15 +200,8 @@ impl PatchEvent {
     /// Use the `with_*` builders to attach optional fields.
     pub fn new(action: PatchAction, purl: impl Into<String>) -> Self {
         Self {
-            action,
             purl: Some(purl.into()),
-            uuid: None,
-            old_uuid: None,
-            files: Vec::new(),
-            reason: None,
-            error_code: None,
-            error: None,
-            details: None,
+            ..Self::artifact(action)
         }
     }
 
@@ -722,7 +705,7 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&env.to_pretty_json()).unwrap();
         assert!(!v.as_object().unwrap().contains_key("sidecars"));
 
-        env.record_sidecar(SidecarRecord {
+        env.sidecars.push(SidecarRecord {
             purl: "pkg:cargo/foo@1.0.0".into(),
             ecosystem: "cargo".into(),
             files: vec![SidecarFile {

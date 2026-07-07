@@ -27,16 +27,19 @@ use std::path::{Path, PathBuf};
 
 use crate::manifest::schema::{PatchFileInfo, PatchManifest};
 use crate::patch::apply::{
-    apply_package_patch, normalize_file_path, ApplyResult, MismatchPolicy, PatchSources,
-    VerifyResult, VerifyStatus,
+    apply_package_patch, is_safe_relative_subpath, normalize_file_path, ApplyResult,
+    MismatchPolicy, PatchSources,
 };
 use crate::patch::file_hash::compute_file_git_sha256;
+use crate::patch::vendor::common::{
+    already_patched_result, copy_matches_after_hashes, synthesized_result,
+};
 use crate::utils::purl::{build_golang_purl, parse_golang_purl, strip_purl_qualifiers};
 
 use super::copy_tree::{fresh_copy, remove_tree};
 use super::go_mod_edit::{
-    self, expected_replace_path, read_replace_entries, read_required_versions, replace_target_path,
-    ReplaceOwner, GO_PATCHES_DIR,
+    self, read_replace_entries, read_required_versions, replace_target_path, ReplaceOwner,
+    GO_PATCHES_DIR,
 };
 use super::path_safety;
 
@@ -124,7 +127,11 @@ impl std::fmt::Display for Drift {
 /// [`GO_PATCHES_DIR`] for apply, `<GO_VENDOR_DIR>/<uuid>` for vendor).
 /// `module` carries the real (decoded) module path with `/`-separators, so the
 /// on-disk layout mirrors the module cache (`github.com/foo/bar@v1.4.2`).
-fn copy_dir_for(project_root: &Path, base_rel: &str, module: &str, version: &str) -> PathBuf {
+///
+/// `pub` (not `pub(crate)`): the single home of this on-disk layout — the
+/// vendor backend and the CLI's VEX go-patches synthesis key the same copy
+/// dir and must stay in lockstep rather than carry drift-prone mirrors.
+pub fn copy_dir_for(project_root: &Path, base_rel: &str, module: &str, version: &str) -> PathBuf {
     project_root
         .join(base_rel)
         .join(format!("{module}@{version}"))
@@ -141,7 +148,11 @@ fn copy_dir_for(project_root: &Path, base_rel: &str, module: &str, version: &str
 /// separators (`github.com/foo/bar`), so it is validated **per segment**
 /// (see [`path_safety::is_safe_multi_segment`]); a version is a single
 /// segment. Reject fail-closed before any disk access.
-pub(crate) fn are_safe_redirect_coords(module: &str, version: &str) -> bool {
+///
+/// `pub` (not `pub(crate)`): the CLI's VEX go-patches synthesis keys the
+/// same copy-dir path from the same untrusted `go.mod` coordinates and must
+/// apply this exact guard rather than a drift-prone mirror.
+pub fn are_safe_redirect_coords(module: &str, version: &str) -> bool {
     path_safety::is_safe_multi_segment(module) && path_safety::is_safe_single_segment(version)
 }
 
@@ -206,12 +217,12 @@ pub async fn apply_go_redirect(
     // fingerprint stays stable across repeated applies (the guard re-runs apply
     // on most "deps changed" builds).
     if redirect_in_sync(&copy_dir, files, project_root, module, version, base_rel).await {
-        let verified = files.keys().map(|f| already_patched_verify(f)).collect();
-        return synthesized_result(purl, &copy_dir, verified, true, None);
+        return already_patched_result(purl, &copy_dir, files);
     }
 
     // Fresh copy pristine → copy_dir.
     if let Err(e) = fresh_copy(pristine_src, &copy_dir, None).await {
+        teardown_failed_redirect(project_root, &copy_dir, module, version, base_rel).await;
         return synthesized_result(
             purl,
             &copy_dir,
@@ -225,7 +236,7 @@ pub async fn apply_go_redirect(
     // module path. Pre-modules packages have none in their extracted cache dir
     // (validated: `gopkg.in/inf.v0`), so synthesize Go's own minimal form.
     if let Err(e) = ensure_module_go_mod(&copy_dir, module).await {
-        let _ = remove_tree(&copy_dir).await;
+        teardown_failed_redirect(project_root, &copy_dir, module, version, base_rel).await;
         return synthesized_result(
             purl,
             &copy_dir,
@@ -246,7 +257,7 @@ pub async fn apply_go_redirect(
 
     if !result.success {
         // Don't leave a half-built copy that verify/reconcile would misjudge.
-        let _ = remove_tree(&copy_dir).await;
+        teardown_failed_redirect(project_root, &copy_dir, module, version, base_rel).await;
         return result;
     }
 
@@ -431,21 +442,27 @@ pub async fn verify_go_redirect_state(
             drifts.push(Drift::MissingCopy { purl: purl.clone() });
         } else {
             for (file_name, info) in &record.files {
-                let path = copy_dir.join(normalize_file_path(file_name));
-                match compute_file_git_sha256(&path).await {
-                    Ok(h) if h == info.after_hash => {}
-                    Ok(h) => drifts.push(Drift::StaleCopy {
+                let normalized = normalize_file_path(file_name);
+                // SECURITY: never hash through a manifest key that escapes
+                // the copy dir — a poisoned manifest (`../../../home/...`)
+                // would otherwise leak the existence + content hash of an
+                // arbitrary user-readable file into the audit output.
+                // Fail closed as drift (`found: None`, no read), same as the
+                // guarded `copy_matches_after_hashes` this audit mirrors.
+                let found = if is_safe_relative_subpath(normalized) {
+                    compute_file_git_sha256(&copy_dir.join(normalized))
+                        .await
+                        .ok()
+                } else {
+                    None
+                };
+                if found.as_deref() != Some(info.after_hash.as_str()) {
+                    drifts.push(Drift::StaleCopy {
                         purl: purl.clone(),
                         file: file_name.clone(),
                         expected: info.after_hash.clone(),
-                        found: Some(h),
-                    }),
-                    Err(_) => drifts.push(Drift::StaleCopy {
-                        purl: purl.clone(),
-                        file: file_name.clone(),
-                        expected: info.after_hash.clone(),
-                        found: None,
-                    }),
+                        found,
+                    });
                 }
             }
         }
@@ -454,7 +471,7 @@ pub async fn verify_go_redirect_state(
         // keys `replace` by module + version, so a socket directive pinned to
         // another version (an aborted/partial apply, a bad merge, a hand-edit)
         // is silently ignored while the copy-hash checks above pass.
-        let expected = expected_replace_path(module, version);
+        let expected = replace_target_path(GO_PATCHES_DIR, module, version);
         let socket = entries
             .iter()
             .find(|e| e.module == module && e.owner == Some(ReplaceOwner::GoPatches));
@@ -490,6 +507,30 @@ pub async fn verify_go_redirect_state(
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
+/// Failure cleanup for the rebuild legs of [`apply_go_redirect`]. By the time
+/// a rebuild leg fails, any pre-existing copy is already gone (`fresh_copy`
+/// removes the destination first), so a pre-existing socket-owned `replace`
+/// directive — a re-apply healing drift, or a version bump — would dangle at a
+/// deleted/husk directory and every `go build` fails with "replacement
+/// directory does not exist". Tear down to the same end state a failed FIRST
+/// apply leaves: no copy, no directive (the build falls back to the unpatched
+/// module until a later apply succeeds). The drop is owner-filtered, keyed by
+/// the owner `base_rel` implies, so the other backend's and the user's
+/// directives are never touched — and on a first apply it is a no-op.
+async fn teardown_failed_redirect(
+    project_root: &Path,
+    copy_dir: &Path,
+    module: &str,
+    version: &str,
+    base_rel: &str,
+) {
+    let _ = remove_tree(copy_dir).await;
+    if let Some(owner) = go_mod_edit::detect_owner(&replace_target_path(base_rel, module, version))
+    {
+        let _ = go_mod_edit::drop_replace_entry(project_root, module, owner, false).await;
+    }
+}
+
 /// True if the copy exists, every patched file in it already hashes to its
 /// `afterHash`, and a socket-owned `replace` pins this version's copy.
 async fn redirect_in_sync(
@@ -500,15 +541,8 @@ async fn redirect_in_sync(
     version: &str,
     base_rel: &str,
 ) -> bool {
-    if tokio::fs::metadata(copy_dir).await.is_err() {
+    if !copy_matches_after_hashes(copy_dir, files).await {
         return false;
-    }
-    for (file_name, info) in files {
-        let path = copy_dir.join(normalize_file_path(file_name));
-        match compute_file_git_sha256(&path).await {
-            Ok(h) if h == info.after_hash => {}
-            _ => return false,
-        }
     }
     let expected = replace_target_path(base_rel, module, version);
     read_replace_entries(project_root).await.iter().any(|e| {
@@ -533,104 +567,20 @@ pub(crate) async fn ensure_module_go_mod(copy_dir: &Path, module: &str) -> std::
     if tokio::fs::metadata(&go_mod).await.is_ok() {
         return Ok(());
     }
-    atomic_write(&go_mod, format!("module {module}\n").as_bytes()).await
-}
-
-/// Atomically commit `content` to `path` via stage + fsync + rename. Mirrors the
-/// hardened writer in [`crate::patch::go_mod_edit`]: a reader/recovering process
-/// only ever sees the complete old or complete new bytes, never a truncated
-/// intermediate.
-async fn atomic_write(path: &Path, content: &[u8]) -> std::io::Result<()> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let stem = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "go.mod".to_string());
-    let stage = parent.join(format!(".socket-stage-{}-{}", stem, uuid::Uuid::new_v4()));
-
-    let mut file = tokio::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&stage)
-        .await?;
-
-    use tokio::io::AsyncWriteExt;
-    if let Err(e) = file.write_all(content).await {
-        let _ = tokio::fs::remove_file(&stage).await;
-        return Err(e);
-    }
-    if let Err(e) = file.sync_all().await {
-        let _ = tokio::fs::remove_file(&stage).await;
-        return Err(e);
-    }
-    drop(file);
-
-    if let Err(e) = tokio::fs::rename(&stage, path).await {
-        let _ = tokio::fs::remove_file(&stage).await;
-        return Err(e);
-    }
-
-    // The rename only updated the parent directory entry; fsync the directory so
-    // the rename itself survives a crash. Best-effort, Unix only.
-    #[cfg(unix)]
-    {
-        if let Ok(dir) = tokio::fs::File::open(parent).await {
-            let _ = dir.sync_all().await;
-        }
-    }
-
-    Ok(())
-}
-
-fn synthesized_result(
-    package_key: &str,
-    copy_dir: &Path,
-    files_verified: Vec<VerifyResult>,
-    success: bool,
-    error: Option<String>,
-) -> ApplyResult {
-    ApplyResult {
-        package_key: package_key.to_string(),
-        package_path: copy_dir.display().to_string(),
-        success,
-        files_verified,
-        files_patched: Vec::new(),
-        applied_via: HashMap::new(),
-        error,
-        sidecar: None,
-    }
-}
-
-fn already_patched_verify(file: &str) -> VerifyResult {
-    VerifyResult {
-        file: file.to_string(),
-        status: VerifyStatus::AlreadyPatched,
-        message: None,
-        current_hash: None,
-        expected_hash: None,
-        target_hash: None,
-    }
+    crate::utils::fs::atomic_write_bytes(&go_mod, format!("module {module}\n").as_bytes()).await
 }
 
 /// Recursively find every patched-copy module dir under `go_patches_root`,
 /// returning `(purl, dir)`. A module dir is identified by an `@` in its final
-/// path component (`github.com/foo/bar@v1.4.2`); recursion stops there (the
+/// path component (`github.com/foo/bar@v1.4.2`); descent stops there (the
 /// module's own contents are not scanned). Returns empty if the root is absent.
 async fn collect_copy_modules(go_patches_root: &Path) -> Vec<(String, PathBuf)> {
     let mut out = Vec::new();
-    collect_copy_modules_inner(go_patches_root, String::new(), &mut out).await;
-    out
-}
-
-fn collect_copy_modules_inner<'a>(
-    dir: &'a Path,
-    prefix: String,
-    out: &'a mut Vec<(String, PathBuf)>,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'a>> {
-    Box::pin(async move {
-        let mut rd = match tokio::fs::read_dir(dir).await {
+    let mut pending = vec![(go_patches_root.to_path_buf(), String::new())];
+    while let Some((dir, prefix)) = pending.pop() {
+        let mut rd = match tokio::fs::read_dir(&dir).await {
             Ok(rd) => rd,
-            Err(_) => return,
+            Err(_) => continue,
         };
         while let Ok(Some(entry)) = rd.next_entry().await {
             if !entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
@@ -639,8 +589,7 @@ fn collect_copy_modules_inner<'a>(
             let name = entry.file_name().to_string_lossy().to_string();
             if let Some(at) = name.rfind('@') {
                 // `<name_before_@>` is the module's final path segment.
-                let leaf = &name[..at];
-                let version = &name[at + 1..];
+                let (leaf, version) = (&name[..at], &name[at + 1..]);
                 let module = if prefix.is_empty() {
                     leaf.to_string()
                 } else {
@@ -649,17 +598,18 @@ fn collect_copy_modules_inner<'a>(
                 if !module.is_empty() && !version.is_empty() {
                     out.push((build_golang_purl(&module, version), entry.path()));
                 }
-                // Do not recurse into a module dir.
+                // Do not descend into a module dir.
             } else {
                 let child_prefix = if prefix.is_empty() {
-                    name.clone()
+                    name
                 } else {
                     format!("{prefix}/{name}")
                 };
-                collect_copy_modules_inner(&entry.path(), child_prefix, out).await;
+                pending.push((entry.path(), child_prefix));
             }
         }
-    })
+    }
+    out
 }
 
 #[cfg(test)]
@@ -959,6 +909,139 @@ mod tests {
         );
         // No replace directive written.
         assert!(read_replace_entries(root).await.is_empty());
+    }
+
+    /// A failed RE-apply (drift heal / patch-content update) must not leave
+    /// `go.mod` pointing at a copy dir the failure path just deleted. The
+    /// rebuild leg destroys the existing copy (`fresh_copy`) and, on pipeline
+    /// failure, removes the half-built one — so the pre-existing socket-owned
+    /// `replace` directive would reference a nonexistent directory and every
+    /// `go build` fails with "replacement directory does not exist". Failure
+    /// must fall back to the unpatched module: directive dropped alongside the
+    /// copy, the same end state as a first-apply failure.
+    #[tokio::test]
+    async fn test_failed_reapply_drops_directive_with_copy() {
+        let (dir, blobs, pristine, files, _after) = fixture().await;
+        let root = dir.path();
+        let sources = PatchSources::blobs_only(&blobs);
+        let result = apply_go_redirect(
+            PURL,
+            MODULE,
+            VERSION,
+            &pristine,
+            root,
+            GO_PATCHES_DIR,
+            &files,
+            &sources,
+            None,
+            false,
+            MismatchPolicy::Warn,
+        )
+        .await;
+        assert!(result.success, "setup apply failed: {:?}", result.error);
+
+        // Drift the copy so the in-sync hot path is skipped and the rebuild
+        // leg runs.
+        let copy_dir = root.join(".socket/go-patches/github.com/foo/bar@v1.4.2");
+        tokio::fs::write(copy_dir.join("bar.go"), b"corrupted")
+            .await
+            .unwrap();
+
+        // Re-apply with EMPTY blob sources → the apply pipeline fails after
+        // the copy was already rebuilt from pristine.
+        let empty = root.join(".socket/empty-blobs");
+        tokio::fs::create_dir_all(&empty).await.unwrap();
+        let empty_sources = PatchSources::blobs_only(&empty);
+        let result = apply_go_redirect(
+            PURL,
+            MODULE,
+            VERSION,
+            &pristine,
+            root,
+            GO_PATCHES_DIR,
+            &files,
+            &empty_sources,
+            None,
+            false,
+            MismatchPolicy::Warn,
+        )
+        .await;
+        assert!(!result.success, "re-apply with no blobs must fail");
+
+        assert!(!copy_dir.exists(), "failed copy must be rolled back");
+        let entries = read_replace_entries(root).await;
+        assert!(
+            !entries
+                .iter()
+                .any(|e| e.module == MODULE && e.socket_owned()),
+            "a socket-owned replace must not survive pointing at a deleted \
+             copy (go.mod would brick the build): {entries:?}"
+        );
+    }
+
+    /// Same invariant when the pristine source itself is gone: `fresh_copy`
+    /// force-removes the stale copy FIRST and then fails walking the missing
+    /// source, so without cleanup the directive dangles at a deleted dir.
+    #[tokio::test]
+    async fn test_failed_recopy_missing_pristine_drops_directive() {
+        let (dir, blobs, pristine, files, _after) = fixture().await;
+        let root = dir.path();
+        let sources = PatchSources::blobs_only(&blobs);
+        let result = apply_go_redirect(
+            PURL,
+            MODULE,
+            VERSION,
+            &pristine,
+            root,
+            GO_PATCHES_DIR,
+            &files,
+            &sources,
+            None,
+            false,
+            MismatchPolicy::Warn,
+        )
+        .await;
+        assert!(result.success, "setup apply failed: {:?}", result.error);
+
+        // Drift the copy, then make the pristine source vanish (evicted
+        // module cache).
+        let copy_dir = root.join(".socket/go-patches/github.com/foo/bar@v1.4.2");
+        tokio::fs::write(copy_dir.join("bar.go"), b"corrupted")
+            .await
+            .unwrap();
+        tokio::fs::remove_dir_all(&pristine).await.unwrap();
+
+        let result = apply_go_redirect(
+            PURL,
+            MODULE,
+            VERSION,
+            &pristine,
+            root,
+            GO_PATCHES_DIR,
+            &files,
+            &sources,
+            None,
+            false,
+            MismatchPolicy::Warn,
+        )
+        .await;
+        assert!(
+            !result.success,
+            "re-apply with no pristine source must fail"
+        );
+
+        assert!(
+            !copy_dir.exists(),
+            "fresh_copy removed the stale copy before failing"
+        );
+        let entries = read_replace_entries(root).await;
+        assert!(
+            !entries
+                .iter()
+                .any(|e| e.module == MODULE && e.socket_owned()),
+            "a socket-owned replace must not survive pointing at a deleted \
+             copy (go.mod would brick the build): {entries:?}"
+        );
     }
 
     #[tokio::test]
@@ -1343,6 +1426,64 @@ mod tests {
         assert!(drifts
             .iter()
             .any(|d| matches!(d, Drift::OrphanReplace { .. })));
+    }
+
+    /// SECURITY: the audit must not hash through a manifest file key that
+    /// escapes the copy dir — a poisoned committed manifest would otherwise
+    /// leak the existence + content hash of an arbitrary user-readable file
+    /// into the drift report. The unsafe key fails closed as
+    /// `StaleCopy { found: None }` with no out-of-tree read.
+    #[tokio::test]
+    async fn test_verify_rejects_escaping_manifest_key_without_reading() {
+        let (dir, blobs, pristine, files, _after) = fixture().await;
+        let root = dir.path();
+        let sources = PatchSources::blobs_only(&blobs);
+        apply_go_redirect(
+            PURL,
+            MODULE,
+            VERSION,
+            &pristine,
+            root,
+            GO_PATCHES_DIR,
+            &files,
+            &sources,
+            None,
+            false,
+            MismatchPolicy::Warn,
+        )
+        .await;
+
+        // The out-of-tree file a poisoned key points at (5 `..`s climb from
+        // `.socket/go-patches/github.com/foo/bar@v1.4.2/` back to root).
+        tokio::fs::write(root.join("secret.txt"), b"out-of-tree")
+            .await
+            .unwrap();
+        let mut manifest = manifest_with(&files);
+        manifest.patches.get_mut(PURL).unwrap().files.insert(
+            "../../../../../secret.txt".to_string(),
+            PatchFileInfo {
+                before_hash: "0".repeat(64),
+                after_hash: "1".repeat(64),
+            },
+        );
+
+        let desired: HashSet<String> = [PURL.to_string()].into_iter().collect();
+        let drifts = verify_go_redirect_state(root, &manifest, &desired)
+            .await
+            .unwrap_err();
+        let found = drifts
+            .iter()
+            .find_map(|d| match d {
+                Drift::StaleCopy { file, found, .. } if file.contains("secret") => {
+                    Some(found.clone())
+                }
+                _ => None,
+            })
+            .expect("unsafe key must surface as drift");
+        assert_eq!(
+            found, None,
+            "must fail closed WITHOUT hashing the out-of-tree file"
+        );
     }
 
     #[tokio::test]

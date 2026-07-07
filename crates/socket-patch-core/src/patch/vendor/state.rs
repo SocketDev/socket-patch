@@ -23,12 +23,14 @@
 //! flavor strings they have no backend for. Both keep an old binary safe
 //! against a newer project checkout.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize, Serializer};
+use serde::{Deserialize, Serialize};
 
+use crate::manifest::schema::PatchRecord;
 use crate::utils::fs::atomic_write_bytes;
+use crate::utils::serde::serialize_sorted;
 
 use super::path::VENDOR_DIR;
 
@@ -36,15 +38,7 @@ use super::path::VENDOR_DIR;
 pub const VENDOR_STATE_REL: &str = ".socket/vendor/state.json";
 
 /// Current schema version.
-pub const VENDOR_STATE_VERSION: u32 = 1;
-
-fn serialize_sorted<S, V>(map: &HashMap<String, V>, serializer: S) -> Result<S::Ok, S::Error>
-where
-    S: Serializer,
-    V: Serialize,
-{
-    map.iter().collect::<BTreeMap<_, _>>().serialize(serializer)
-}
+const VENDOR_STATE_VERSION: u32 = 1;
 
 /// The vendored artifact (a tarball/wheel file, or the copy directory for the
 /// dir-shaped ecosystems).
@@ -262,16 +256,24 @@ impl VendorState {
             entries: HashMap::new(),
         }
     }
-
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
 }
 
 impl Default for VendorState {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// The ledger entry addressable as `purl`: the exact map key first, then
+/// any entry whose resolved `base_purl` equals it (a qualified manifest
+/// key resolves to the entry recorded under the base PURL).
+pub fn lookup_entry<'a>(
+    entries: &'a HashMap<String, VendorEntry>,
+    purl: &str,
+) -> Option<&'a VendorEntry> {
+    entries
+        .get(purl)
+        .or_else(|| entries.values().find(|e| e.base_purl == purl))
 }
 
 fn state_path(project_root: &Path) -> PathBuf {
@@ -313,7 +315,7 @@ pub async fn load_state(project_root: &Path) -> std::io::Result<VendorState> {
 /// empty, so a fully-reverted project carries no vendor residue.
 pub async fn save_state(project_root: &Path, state: &VendorState) -> std::io::Result<()> {
     let path = state_path(project_root);
-    if state.is_empty() {
+    if state.entries.is_empty() {
         match tokio::fs::remove_file(&path).await {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -343,7 +345,7 @@ pub async fn save_state(project_root: &Path, state: &VendorState) -> std::io::Re
 /// a trust input — sweep/verify key off state.json + the path uuid.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
-pub struct VendorMarker {
+pub(crate) struct VendorMarker {
     pub schema_version: u32,
     pub purl: String,
     pub patch_uuid: String,
@@ -355,11 +357,33 @@ pub struct VendorMarker {
     pub vendored_at: String,
 }
 
+impl VendorMarker {
+    /// The schema-v1 marker every backend writes: `record`'s uuid plus its
+    /// vulnerability ids, sorted.
+    pub(crate) fn new(
+        ecosystem: &str,
+        purl: &str,
+        record: &PatchRecord,
+        vendored_at: &str,
+    ) -> Self {
+        let mut vulnerabilities: Vec<String> = record.vulnerabilities.keys().cloned().collect();
+        vulnerabilities.sort();
+        VendorMarker {
+            schema_version: 1,
+            purl: purl.to_string(),
+            patch_uuid: record.uuid.clone(),
+            ecosystem: ecosystem.to_string(),
+            vulnerabilities,
+            vendored_at: vendored_at.to_string(),
+        }
+    }
+}
+
 /// File name of the marker inside the uuid dir.
-pub const VENDOR_MARKER_FILE: &str = "socket-patch.vendor.json";
+pub(crate) const VENDOR_MARKER_FILE: &str = "socket-patch.vendor.json";
 
 /// Write the marker atomically into `uuid_dir`.
-pub async fn write_marker(uuid_dir: &Path, marker: &VendorMarker) -> std::io::Result<()> {
+pub(crate) async fn write_marker(uuid_dir: &Path, marker: &VendorMarker) -> std::io::Result<()> {
     let mut bytes = serde_json::to_vec_pretty(marker).map_err(std::io::Error::other)?;
     bytes.push(b'\n');
     atomic_write_bytes(&uuid_dir.join(VENDOR_MARKER_FILE), &bytes).await
@@ -608,7 +632,7 @@ mod tests {
     async fn missing_file_is_empty_corrupt_file_is_error() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        assert!(load_state(root).await.unwrap().is_empty());
+        assert!(load_state(root).await.unwrap().entries.is_empty());
 
         tokio::fs::create_dir_all(root.join(".socket/vendor"))
             .await
@@ -639,7 +663,7 @@ mod tests {
         .await
         .unwrap();
         assert!(
-            load_state(root).await.unwrap().is_empty(),
+            load_state(root).await.unwrap().entries.is_empty(),
             "a foreign mode-tagged ledger is not vendor data"
         );
 

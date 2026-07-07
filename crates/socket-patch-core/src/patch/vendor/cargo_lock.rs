@@ -17,23 +17,16 @@
 //!
 //! The removed `source`/`checksum` pair is not recoverable offline (the
 //! checksum is the sha256 of the registry `.crate` tarball, not of the
-//! extracted tree), so [`detach_lock_entry`] returns it for the vendor ledger
-//! ([`super::state::CargoLockOriginal`]) and [`restore_lock_entry`] writes it
-//! back on revert.
+//! extracted tree), so [`detach_lock_entry`] returns it as the vendor ledger's
+//! [`CargoLockOriginal`] and [`restore_lock_entry`] writes it back on revert.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use toml_edit::{DocumentMut, Item, Table};
 
-use crate::utils::fs::atomic_write_bytes;
-
-/// The original lock fields removed by [`detach_lock_entry`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LockEntryOriginal {
-    pub source: String,
-    pub checksum: Option<String>,
-}
+use super::state::CargoLockOriginal;
+use crate::utils::fs::atomic_write_bytes_preserving_mode;
 
 /// Why a lock edit could not be performed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,27 +76,28 @@ async fn read_lock(
     Ok((path, doc))
 }
 
-/// Find the index of the `[[package]]` table matching `name`+`version`.
-fn find_package_index(doc: &DocumentMut, name: &str, version: &str) -> Option<usize> {
-    let pkgs = doc.get("package")?.as_array_of_tables()?;
-    pkgs.iter().position(|t| {
-        t.get("name").and_then(Item::as_str) == Some(name)
-            && t.get("version").and_then(Item::as_str) == Some(version)
-    })
-}
-
-fn package_table_mut(doc: &mut DocumentMut, idx: usize) -> Result<&mut Table, LockEditError> {
-    doc.get_mut("package")
-        .and_then(Item::as_array_of_tables_mut)
-        .and_then(|a| a.get_mut(idx))
-        .ok_or(LockEditError::EntryMissing)
+/// Find the `[[package]]` table matching `name`+`version`.
+fn find_package_mut<'a>(
+    doc: &'a mut DocumentMut,
+    name: &str,
+    version: &str,
+) -> Option<&'a mut Table> {
+    doc.get_mut("package")?
+        .as_array_of_tables_mut()?
+        .iter_mut()
+        .find(|t| {
+            t.get("name").and_then(Item::as_str) == Some(name)
+                && t.get("version").and_then(Item::as_str) == Some(version)
+        })
 }
 
 /// Commit the edited lock atomically (stage + fsync + rename). The lock is a
 /// committed file shared with cargo itself; a torn write would corrupt the
-/// whole project's resolution, so never truncate-in-place.
+/// whole project's resolution, so never truncate-in-place. Mode-preserving:
+/// the lock is a user-owned file we merely edit, so the swapped-in inode must
+/// keep its permission bits rather than reset them to umask defaults.
 async fn write_lock(path: &Path, doc: &DocumentMut) -> Result<(), LockEditError> {
-    atomic_write_bytes(path, doc.to_string().as_bytes())
+    atomic_write_bytes_preserving_mode(path, doc.to_string().as_bytes())
         .await
         .map_err(|e| LockEditError::Io(e.to_string()))
 }
@@ -120,10 +114,9 @@ pub async fn detach_lock_entry(
     name: &str,
     version: &str,
     dry_run: bool,
-) -> Result<LockEntryOriginal, LockEditError> {
+) -> Result<CargoLockOriginal, LockEditError> {
     let (path, mut doc) = read_lock(project_root).await?;
-    let idx = find_package_index(&doc, name, version).ok_or(LockEditError::EntryMissing)?;
-    let table = package_table_mut(&mut doc, idx)?;
+    let table = find_package_mut(&mut doc, name, version).ok_or(LockEditError::EntryMissing)?;
 
     // A workspace/path/git dependency has no `source` — vendoring it would be
     // wrong (the user already controls those bytes); refuse.
@@ -142,7 +135,7 @@ pub async fn detach_lock_entry(
     if !dry_run {
         write_lock(&path, &doc).await?;
     }
-    Ok(LockEntryOriginal { source, checksum })
+    Ok(CargoLockOriginal { source, checksum })
 }
 
 /// Re-attach the original `source`/`checksum` to the `name`+`version` entry on
@@ -154,14 +147,13 @@ pub async fn restore_lock_entry(
     project_root: &Path,
     name: &str,
     version: &str,
-    original: &LockEntryOriginal,
+    original: &CargoLockOriginal,
     dry_run: bool,
 ) -> Result<bool, LockEditError> {
     let (path, mut doc) = read_lock(project_root).await?;
-    let Some(idx) = find_package_index(&doc, name, version) else {
+    let Some(table) = find_package_mut(&mut doc, name, version) else {
         return Ok(false);
     };
-    let table = package_table_mut(&mut doc, idx)?;
     if table.get("source").is_some() {
         return Ok(false);
     }
@@ -196,10 +188,7 @@ pub async fn restore_lock_entry(
 /// Multi-version aware: a v4 lock may resolve the same name at several
 /// versions. Reads only the project lockfile: no registry, no network.
 pub async fn read_locked_versions(project_root: &Path) -> Option<HashMap<String, HashSet<String>>> {
-    let content = tokio::fs::read_to_string(project_root.join("Cargo.lock"))
-        .await
-        .ok()?;
-    let doc = content.parse::<DocumentMut>().ok()?;
+    let (_path, doc) = read_lock(project_root).await.ok()?;
     let pkgs = doc.get("package")?.as_array_of_tables()?;
     let mut map: HashMap<String, HashSet<String>> = HashMap::new();
     for t in pkgs.iter() {
@@ -408,7 +397,7 @@ mod tests {
     #[tokio::test]
     async fn restore_skips_re_resolved_and_absent_entries() {
         let dir = fixture().await;
-        let orig = LockEntryOriginal {
+        let orig = CargoLockOriginal {
             source: SOURCE.to_string(),
             checksum: Some(CHECKSUM.to_string()),
         };
@@ -503,6 +492,95 @@ mod tests {
             .await
             .unwrap();
         assert!(read_locked_versions(empty.path()).await.is_none());
+    }
+
+    /// The lock is a user-owned committed file we merely edit: the atomic
+    /// rename must not reset its permission bits to umask defaults (a 0600
+    /// private lock silently becoming 0644, a 0664 group-writable one locking
+    /// the group out).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn lock_edits_preserve_file_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = fixture().await;
+        let path = dir.path().join("Cargo.lock");
+        tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .await
+            .unwrap();
+
+        let orig = detach_lock_entry(dir.path(), "cfg-if", "1.0.4", false)
+            .await
+            .unwrap();
+        let mode = tokio::fs::metadata(&path)
+            .await
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(mode, 0o600, "detach must not reset the lock's mode");
+
+        assert!(
+            restore_lock_entry(dir.path(), "cfg-if", "1.0.4", &orig, false)
+                .await
+                .unwrap()
+        );
+        let mode = tokio::fs::metadata(&path)
+            .await
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(mode, 0o600, "restore must not reset the lock's mode");
+    }
+
+    /// Round trip for a realistic entry: mid-file (another `[[package]]`
+    /// follows) and carrying a `dependencies` array, so restore's key re-sort
+    /// must slot source/checksum between `version` and `dependencies`.
+    #[tokio::test]
+    async fn round_trip_mid_file_entry_with_dependencies() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = format!(
+            "# This file is automatically @generated by Cargo.\n\
+             # It is not intended for manual editing.\n\
+             version = 4\n\
+             \n\
+             [[package]]\n\
+             name = \"app\"\n\
+             version = \"0.1.0\"\n\
+             dependencies = [\n \"serde\",\n]\n\
+             \n\
+             [[package]]\n\
+             name = \"serde\"\n\
+             version = \"1.0.219\"\n\
+             source = \"{SOURCE}\"\n\
+             checksum = \"{CHECKSUM}\"\n\
+             dependencies = [\n \"serde_derive\",\n]\n\
+             \n\
+             [[package]]\n\
+             name = \"serde_derive\"\n\
+             version = \"1.0.219\"\n\
+             source = \"{SOURCE}\"\n\
+             checksum = \"{CHECKSUM}\"\n"
+        );
+        tokio::fs::write(dir.path().join("Cargo.lock"), &body)
+            .await
+            .unwrap();
+
+        let orig = detach_lock_entry(dir.path(), "serde", "1.0.219", false)
+            .await
+            .unwrap();
+        assert!(
+            restore_lock_entry(dir.path(), "serde", "1.0.219", &orig, false)
+                .await
+                .unwrap()
+        );
+        let after = tokio::fs::read_to_string(dir.path().join("Cargo.lock"))
+            .await
+            .unwrap();
+        assert_eq!(
+            after, body,
+            "mid-file entry with dependencies must round-trip byte-identically"
+        );
     }
 
     #[tokio::test]

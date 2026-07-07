@@ -20,7 +20,6 @@ fn options_at(root: &Path) -> CrawlerOptions {
         cwd: root.to_path_buf(),
         global: false,
         global_prefix: None,
-        batch_size: 100,
     }
 }
 
@@ -173,7 +172,6 @@ async fn get_node_modules_paths_global_prefix_passthrough() {
         cwd: tmp.path().to_path_buf(),
         global: false,
         global_prefix: Some(custom.clone()),
-        batch_size: 100,
     };
     let paths = crawler.get_node_modules_paths(&opts).await.unwrap();
     assert_eq!(paths, vec![custom]);
@@ -191,7 +189,6 @@ async fn get_node_modules_paths_global_mode_no_prefix() {
         cwd: tmp.path().to_path_buf(),
         global: true,
         global_prefix: None,
-        batch_size: 100,
     };
     // Just must not panic — the actual list depends on the host.
     let _paths = crawler.get_node_modules_paths(&opts).await.unwrap();
@@ -1006,5 +1003,239 @@ async fn crawl_all_does_not_recurse_through_symlinked_nested_package() {
     assert!(
         !names.contains(&"buried"),
         "crawler must not recurse through the symlink into the store"
+    );
+}
+
+// ── regression pins: metadata identity + nested lookup ─────────
+
+/// Regression: npm (and Node's own loader) strip a leading UTF-8 BOM from
+/// `package.json`, so a published package may legitimately ship one
+/// (Windows-authored packages do). `serde_json::from_str` rejects the BOM,
+/// which made the crawler silently skip the package — a vulnerable install
+/// invisible to `scan` and unpatchable by `apply`. Same class as the
+/// `strip_bom` fixes in `package_json/detect.rs`.
+#[tokio::test]
+async fn read_package_json_tolerates_utf8_bom() {
+    let tmp = tempfile::tempdir().unwrap();
+    let nm = tmp.path().join("node_modules");
+    let pkg_dir = nm.join("bommed");
+    tokio::fs::create_dir_all(&pkg_dir).await.unwrap();
+    tokio::fs::write(
+        pkg_dir.join("package.json"),
+        "\u{feff}{\"name\":\"bommed\",\"version\":\"1.0.0\"}",
+    )
+    .await
+    .unwrap();
+
+    let result = read_package_json(&pkg_dir.join("package.json")).await;
+    assert_eq!(
+        result,
+        Some(("bommed".to_string(), "1.0.0".to_string())),
+        "a BOM'd package.json is npm-valid and must parse"
+    );
+
+    // The production symptom: the package must be visible to scan…
+    let crawler = NpmCrawler;
+    let crawled = crawler.crawl_all(&options_at(tmp.path())).await;
+    assert_eq!(
+        crawled.len(),
+        1,
+        "BOM'd package must be discovered by crawl_all; got {crawled:?}"
+    );
+
+    // …and resolvable by apply's lookup.
+    let found = crawler
+        .find_by_purls(&nm, &["pkg:npm/bommed@1.0.0".to_string()])
+        .await
+        .unwrap();
+    assert!(
+        found.contains_key("pkg:npm/bommed@1.0.0"),
+        "BOM'd package must resolve in find_by_purls; got {found:?}"
+    );
+}
+
+/// Regression: `find_by_purls` verified only the *version* of the
+/// `package.json` it probed, never the *name*. An npm alias install
+/// (`npm i foo@npm:bar@1.0.0`) puts package `bar` in `node_modules/foo`;
+/// a patch for `foo@1.0.0` would then be "resolved" to bar's directory and
+/// applied to a completely different package's files (with the default
+/// mismatch policy applying the full patched blob of `foo` over `bar`).
+/// The probe must require the on-disk name to match the PURL identity.
+#[tokio::test]
+async fn find_by_purls_rejects_alias_dir_with_matching_version() {
+    let tmp = tempfile::tempdir().unwrap();
+    let nm = tmp.path().join("node_modules");
+
+    // `npm i foo@npm:bar@1.0.0` layout: dir name ≠ package.json name.
+    let alias_dir = nm.join("foo");
+    tokio::fs::create_dir_all(&alias_dir).await.unwrap();
+    tokio::fs::write(
+        alias_dir.join("package.json"),
+        r#"{"name":"bar","version":"1.0.0"}"#,
+    )
+    .await
+    .unwrap();
+
+    let crawler = NpmCrawler;
+    let result = crawler
+        .find_by_purls(&nm, &["pkg:npm/foo@1.0.0".to_string()])
+        .await
+        .unwrap();
+    assert!(
+        result.is_empty(),
+        "an aliased dir holding a different package must not be identified \
+         as the PURL target; got {result:?}"
+    );
+
+    // Scoped twin: @s/x aliasing some other package.
+    let scoped_alias = nm.join("@s").join("x");
+    tokio::fs::create_dir_all(&scoped_alias).await.unwrap();
+    tokio::fs::write(
+        scoped_alias.join("package.json"),
+        r#"{"name":"@other/pkg","version":"2.0.0"}"#,
+    )
+    .await
+    .unwrap();
+    let result = crawler
+        .find_by_purls(&nm, &["pkg:npm/@s/x@2.0.0".to_string()])
+        .await
+        .unwrap();
+    assert!(
+        result.is_empty(),
+        "scoped alias must not be misidentified; got {result:?}"
+    );
+}
+
+/// Regression: CLI_CONTRACT promises "deeply nested transitive dependencies
+/// are fully supported … `apply` is path-agnostic … patched identically to a
+/// direct one", and `crawl_all` (scan) discovers them at unbounded depth —
+/// but `find_by_purls` (apply's resolver) probed only the tree root, so a
+/// version that exists *only* nested (root holds a different major, the
+/// classic hoisting-conflict layout) was scannable yet unpatchable: apply
+/// reported "No packages found that match available patches".
+#[tokio::test]
+async fn find_by_purls_resolves_nested_only_install() {
+    let tmp = tempfile::tempdir().unwrap();
+    let nm = tmp.path().join("node_modules");
+
+    // Root: a@1.0.0 and the shadowing b@3.0.0. The patched b@2.0.0 lives
+    // only at a/node_modules/b (npm's layout when siblings conflict).
+    stage_npm_pkg(&nm, "a", "1.0.0").await;
+    stage_npm_pkg(&nm, "b", "3.0.0").await;
+    let a_nm = nm.join("a").join("node_modules");
+    stage_npm_pkg(&a_nm, "b", "2.0.0").await;
+    // Depth 3: a → b → c.
+    let b_nm = a_nm.join("b").join("node_modules");
+    stage_npm_pkg(&b_nm, "c", "5.0.0").await;
+    // Nested scoped package.
+    stage_npm_pkg(&a_nm, "@s/d", "1.0.0").await;
+
+    let crawler = NpmCrawler;
+    let purls = vec![
+        "pkg:npm/b@2.0.0".to_string(),
+        "pkg:npm/c@5.0.0".to_string(),
+        "pkg:npm/@s/d@1.0.0".to_string(),
+    ];
+    let result = crawler.find_by_purls(&nm, &purls).await.unwrap();
+
+    let b = result
+        .get("pkg:npm/b@2.0.0")
+        .expect("nested-only b@2.0.0 must resolve (root b@3.0.0 shadows it)");
+    assert_eq!(b.path, a_nm.join("b"), "must point at the nested copy");
+    let c = result
+        .get("pkg:npm/c@5.0.0")
+        .expect("depth-3 transitive c@5.0.0 must resolve");
+    assert_eq!(c.path, b_nm.join("c"));
+    let d = result
+        .get("pkg:npm/@s/d@1.0.0")
+        .expect("nested scoped @s/d@1.0.0 must resolve");
+    assert_eq!(d.path, a_nm.join("@s").join("d"));
+}
+
+/// Regression: a FIFO planted at a `package.json` path must be skipped
+/// promptly, never opened blockingly. `tokio::fs::read_to_string` performs a
+/// plain `open(2)`, which on a FIFO waits for a writer that never comes — so
+/// one special file inside `node_modules` (a malicious package's postinstall
+/// can create one; npm itself never extracts FIFOs) wedged `scan`
+/// (crawl_all) and `apply` (find_by_purls) indefinitely, with no error and
+/// no timeout. Same class as the `open_regular_file` guards in
+/// `patch/file_hash.rs`, the cargo sidecar, and the vendor harvest/verify
+/// readers.
+#[cfg(unix)]
+#[tokio::test]
+async fn read_package_json_rejects_fifo_without_hanging() {
+    let tmp = tempfile::tempdir().unwrap();
+    let nm = tmp.path().join("node_modules");
+    let fifo_pkg = nm.join("fifo-pkg");
+    tokio::fs::create_dir_all(&fifo_pkg).await.unwrap();
+    let fifo = fifo_pkg.join("package.json");
+    let status = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("mkfifo must be runnable");
+    assert!(status.success(), "mkfifo failed");
+    // A sibling real package proves the tree stays crawlable around the FIFO.
+    stage_npm_pkg(&nm, "real-pkg", "1.0.0").await;
+
+    // On timeout the open is wedged in a `spawn_blocking` thread that the
+    // runtime waits for on shutdown; connect a writer to release it so the
+    // test can FAIL instead of hanging the whole suite.
+    let release_and_panic = |what: &str| -> ! {
+        let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
+        panic!("{what} must complete promptly with a FIFO package.json in the tree");
+    };
+    let deadline = std::time::Duration::from_secs(5);
+
+    let Ok(direct) = tokio::time::timeout(deadline, read_package_json(&fifo)).await else {
+        release_and_panic("read_package_json");
+    };
+    assert_eq!(direct, None, "a FIFO is not a valid package.json");
+
+    let crawler = NpmCrawler;
+    let Ok(crawled) = tokio::time::timeout(deadline, crawler.crawl_all(&options_at(tmp.path()))).await
+    else {
+        release_and_panic("crawl_all (scan)");
+    };
+    let names: Vec<&str> = crawled.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["real-pkg"],
+        "the sibling real package must still be discovered, the FIFO skipped"
+    );
+
+    let Ok(found) = tokio::time::timeout(
+        deadline,
+        crawler.find_by_purls(&nm, &["pkg:npm/fifo-pkg@1.0.0".to_string()]),
+    )
+    .await
+    else {
+        release_and_panic("find_by_purls (apply's resolver)");
+    };
+    assert!(
+        found.unwrap().is_empty(),
+        "the FIFO-backed purl must resolve to nothing"
+    );
+}
+
+/// When the same `name@version` exists at the root *and* nested, the root
+/// copy must win (shallowest-first), preserving the pre-existing behavior
+/// for everything resolvable at the root.
+#[tokio::test]
+async fn find_by_purls_prefers_root_copy_over_nested_duplicate() {
+    let tmp = tempfile::tempdir().unwrap();
+    let nm = tmp.path().join("node_modules");
+    stage_npm_pkg(&nm, "a", "1.0.0").await;
+    stage_npm_pkg(&nm, "dup", "1.0.0").await;
+    stage_npm_pkg(&nm.join("a").join("node_modules"), "dup", "1.0.0").await;
+
+    let crawler = NpmCrawler;
+    let result = crawler
+        .find_by_purls(&nm, &["pkg:npm/dup@1.0.0".to_string()])
+        .await
+        .unwrap();
+    assert_eq!(
+        result.get("pkg:npm/dup@1.0.0").map(|p| p.path.clone()),
+        Some(nm.join("dup")),
+        "root copy must be preferred over the nested duplicate"
     );
 }

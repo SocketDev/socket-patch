@@ -2,6 +2,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use super::types::{CrawledPackage, CrawlerOptions};
+use crate::patch::path_safety;
+use crate::utils::fs::is_dir;
 
 // ---------------------------------------------------------------------------
 // POM XML minimal parser
@@ -152,10 +154,20 @@ pub fn parse_pom_group_artifact_version(content: &str) -> Option<(String, String
         // the same line (`<modules></modules>`) or self-closes
         // (`<dependencies/>`) leaves the depth unchanged; only a lone open
         // increments and a lone close decrements.
+        //
+        // Any line carrying a close tag still holds that section's content up
+        // to the close (`<version>9.9</version></dependencies>`, or a whole
+        // compact `<dependencies>...</dependencies>` block), so it must not
+        // reach extraction even once the depth is back to 0 — otherwise a
+        // dependency's coordinates leak as the project's. A coordinate that
+        // legitimately follows a close on the same line is sacrificed to
+        // `None`, which scan rescues via the directory-path fallback.
+        let mut saw_section_close = false;
         for section in &skip_sections {
             let open = opening_tag(trimmed, section);
             let has_open = open.is_some();
             let has_close = contains_closing_tag(trimmed, section);
+            saw_section_close |= has_close;
             if has_open && !has_close && open != Some(true) {
                 skip_depth += 1;
             } else if has_close && !has_open {
@@ -163,7 +175,7 @@ pub fn parse_pom_group_artifact_version(content: &str) -> Option<(String, String
             }
         }
 
-        if skip_depth > 0 {
+        if skip_depth > 0 || saw_section_close {
             continue;
         }
 
@@ -279,33 +291,26 @@ fn parse_path_coordinates(
 /// The coordinates come straight from the (untrusted) manifest PURL and are
 /// joined onto the repo root, after which the resolved directory is patched IN
 /// PLACE (Maven has no `replace`-redirect backend). A tampered PURL must not be
-/// able to traverse out of the repository. `verify_maven_at_path` only checks
-/// for a `.pom` file, so it is no defense — this gate is. Fails closed.
+/// able to traverse out of the repository. `has_pom_file` only checks for a
+/// `.pom` file, so it is no defense — this gate is. Fails closed.
 ///
 /// - `artifact_id` and `version` are each a single path segment, so a real one
-///   never contains a separator, a `.`/`..` segment, a backslash, or a NUL.
+///   never contains a separator, a `.`/`..` segment, a backslash, a colon, or
+///   a NUL — [`path_safety::is_safe_single_segment`].
 /// - `group_id` is dot-separated and run through [`group_id_to_path`] (each
-///   `.` becomes `/`). Requiring every dot-split segment to be non-empty
-///   rejects the forms that would convert to an absolute or `..`-bearing path
-///   (`.` -> `/`, `.a` -> `/a`, `a..b` -> `a//b`).
+///   `.` becomes `/`), so every dot-split segment must independently satisfy
+///   [`path_safety::is_safe_single_segment`]. That rejects the forms that
+///   would convert to an absolute or `..`-bearing path (`.` -> `/`, `.a` ->
+///   `/a`, `a..b` -> `a//b`) and — unlike the previous local check — a `/`
+///   smuggled inside a dot-split segment (`/etc`, `com/evil`).
 ///
-/// Mirrors the `go_crawler` / `deno_crawler` coordinate guards.
+/// The delegation also rejects `:` everywhere — a Windows drive-relative
+/// coordinate (`C:evil`) joins as an absolute path. Mirrors the `go_crawler`
+/// / `deno_crawler` coordinate guards.
 fn is_safe_maven_coordinate(group_id: &str, artifact_id: &str, version: &str) -> bool {
-    let safe_segment = |s: &str| {
-        !s.is_empty()
-            && s != "."
-            && s != ".."
-            && !s.contains('/')
-            && !s.contains('\\')
-            && !s.contains('\0')
-    };
-    let group_ok = !group_id.is_empty()
-        && !group_id.contains('\\')
-        && !group_id.contains('\0')
-        && group_id
-            .split('.')
-            .all(|seg| !seg.is_empty() && seg != "." && seg != "..");
-    group_ok && safe_segment(artifact_id) && safe_segment(version)
+    group_id.split('.').all(path_safety::is_safe_single_segment)
+        && path_safety::is_safe_single_segment(artifact_id)
+        && path_safety::is_safe_single_segment(version)
 }
 
 // ---------------------------------------------------------------------------
@@ -423,10 +428,10 @@ impl MavenCrawler {
                     .join(artifact_id)
                     .join(version);
 
-                if self
-                    .verify_maven_at_path(&expected_path, group_id, artifact_id, version)
-                    .await
-                {
+                // The path already encodes the coordinates
+                // (groupId/artifactId/version), so verifying the package is
+                // just checking a `.pom` file exists there.
+                if self.has_pom_file(&expected_path).await {
                     result.insert(
                         purl.clone(),
                         CrawledPackage {
@@ -458,10 +463,7 @@ impl MavenCrawler {
         if let Ok(m2_home) = std::env::var("M2_HOME") {
             return PathBuf::from(m2_home).join("repository");
         }
-        let home = std::env::var("HOME")
-            .or_else(|_| std::env::var("USERPROFILE"))
-            .unwrap_or_else(|_| "~".to_string());
-        PathBuf::from(home).join(".m2").join("repository")
+        crate::utils::fs::home_dir().join(".m2").join("repository")
     }
 
     /// Scan a Maven repository directory and return all valid packages found.
@@ -512,20 +514,6 @@ impl MavenCrawler {
         results
     }
 
-    /// Verify that a Maven package directory contains a `.pom` file
-    /// with the expected coordinates.
-    async fn verify_maven_at_path(
-        &self,
-        path: &Path,
-        _group_id: &str,
-        _artifact_id: &str,
-        _version: &str,
-    ) -> bool {
-        // The path already encodes the coordinates (groupId/artifactId/version),
-        // so we just need to verify a .pom file exists here.
-        self.has_pom_file(path).await
-    }
-
     /// Check if a directory contains at least one `.pom` file.
     async fn has_pom_file(&self, path: &Path) -> bool {
         if !is_dir(path).await {
@@ -548,14 +536,6 @@ impl Default for MavenCrawler {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// Check whether a path is a directory.
-async fn is_dir(path: &Path) -> bool {
-    tokio::fs::metadata(path)
-        .await
-        .map(|m| m.is_dir())
-        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -981,6 +961,46 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_pom_compact_single_line_skip_block_does_not_leak() {
+        // REGRESSION: a skip section that opens AND closes on one physical
+        // line (compact/minified formatting) leaves skip_depth unchanged, and
+        // extraction then ran over that same line — leaking the dependency's
+        // <version> as the project's (the project's own <version> comes
+        // later, but first-match wins). Parse must not return 9.9.9 here.
+        let content = r#"<project>
+  <groupId>com.example</groupId>
+  <artifactId>my-app</artifactId>
+  <dependencies><dependency><groupId>org.leak</groupId><artifactId>leak</artifactId><version>9.9.9</version></dependency></dependencies>
+  <version>1.0.0</version>
+</project>"#;
+        let (g, a, v) = parse_pom_group_artifact_version(content).unwrap();
+        assert_eq!(g, "com.example");
+        assert_eq!(a, "my-app");
+        assert_eq!(v, "1.0.0");
+    }
+
+    #[test]
+    fn test_parse_pom_value_on_skip_section_close_line_does_not_leak() {
+        // REGRESSION: on the line that CLOSES a skip section, the depth is
+        // decremented before the skip check, so a coordinate sharing that
+        // physical line (still inside the section) was extracted — leaking
+        // the plugin's <version> as the project's.
+        let content = r#"<project>
+  <groupId>com.example</groupId>
+  <artifactId>my-app</artifactId>
+  <build>
+    <plugins><plugin>
+      <groupId>org.leak</groupId>
+      <version>9.9.9</version></plugin></plugins></build>
+  <version>1.0.0</version>
+</project>"#;
+        let (g, a, v) = parse_pom_group_artifact_version(content).unwrap();
+        assert_eq!(g, "com.example");
+        assert_eq!(a, "my-app");
+        assert_eq!(v, "1.0.0");
+    }
+
+    #[test]
     fn test_parse_pom_parent_block_with_foreign_prefixed_child() {
         // A `<parentLink>` decoy must not be mistaken for opening the real
         // `<parent>` block, and the real `<parent>` groupId must still be the
@@ -1126,7 +1146,7 @@ mod tests {
         // directory outside the Maven repo root. Maven patches are applied IN
         // PLACE at the directory the crawler returns (no redirect backend
         // stands between resolution and disk), so an escape means an
-        // arbitrary out-of-tree write. `verify_maven_at_path` only checks for
+        // arbitrary out-of-tree write. `has_pom_file` only checks for
         // a `.pom` file, which does nothing to stop traversal — hence the
         // fail-closed coordinate guard. Twin of the go/deno crawler guards.
         let root = tempfile::tempdir().unwrap();
@@ -1188,6 +1208,17 @@ mod tests {
         assert!(!is_safe_maven_coordinate("", "a", "1.0.0"));
         assert!(!is_safe_maven_coordinate("g", "", "1.0.0"));
         assert!(!is_safe_maven_coordinate("g", "a", ""));
+        // Windows drive-relative escape: a `:` (e.g. `C:evil`) makes the
+        // joined path absolute under `Path::join`; rejected in every
+        // coordinate, including inside a dot-split groupId segment.
+        assert!(!is_safe_maven_coordinate("C:evil.org", "a", "1.0.0"));
+        assert!(!is_safe_maven_coordinate("g", "C:evil", "1.0.0"));
+        assert!(!is_safe_maven_coordinate("g", "a", "C:1.0.0"));
+        // A `/` smuggled inside a dot-split groupId segment never hits the
+        // per-dot-segment checks (`/etc` has no dots at all) but converts to
+        // an absolute or deeper path via `group_id_to_path`.
+        assert!(!is_safe_maven_coordinate("/etc", "a", "1.0.0"));
+        assert!(!is_safe_maven_coordinate("com/evil", "a", "1.0.0"));
     }
 
     // ---- crawl_all tests ----
@@ -1240,7 +1271,6 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: Some(dir.path().to_path_buf()),
-            batch_size: 100,
         };
 
         let packages = crawler.crawl_all(&options).await;
@@ -1279,7 +1309,6 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: Some(dir.path().to_path_buf()),
-            batch_size: 100,
         };
 
         let packages = crawler.crawl_all(&options).await;
@@ -1315,7 +1344,6 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: Some(dir.path().to_path_buf()),
-            batch_size: 100,
         };
 
         let packages = crawler.crawl_all(&options).await;
@@ -1334,7 +1362,6 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: None,
-            batch_size: 100,
         };
 
         let paths = crawler.get_maven_repo_paths(&options).await.unwrap();
@@ -1349,7 +1376,6 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: Some(dir.path().to_path_buf()),
-            batch_size: 100,
         };
 
         let paths = crawler.get_maven_repo_paths(&options).await.unwrap();

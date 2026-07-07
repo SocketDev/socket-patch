@@ -32,6 +32,45 @@ fn binary() -> PathBuf {
     env!("CARGO_BIN_EXE_socket-patch").into()
 }
 
+/// Spawn the CLI with the ambient environment scrubbed, so the flags each
+/// test passes are the only thing deciding behaviour.
+///
+/// The binary binds a wide `SOCKET_*` env surface: an ambient
+/// `SOCKET_DRY_RUN=true` turns both real applies here into no-op dry runs
+/// (every variant `verified`, exit 0 — both tests red), and
+/// `SOCKET_GLOBAL` / `SOCKET_GLOBAL_PREFIX` aim the crawl — and the patch
+/// WRITES — at the host's real site-packages. Seed-then-scrub (mirrors
+/// `common::run_with_env`): the highest-risk vars are seeded with hostile
+/// values so a dropped scrub line turns the tests red immediately;
+/// telemetry opt-outs are deliberately kept.
+///
+/// `VIRTUAL_ENV` must go too: the PyPI crawler early-returns on it, so an
+/// activated ambient venv hijacks discovery away from the tmp venv (six is
+/// "not installed" — both tests red) or, if that venv holds six@1.16.0,
+/// aims the patch at the developer's own environment. A hostile seed is
+/// impossible here (only a *real* venv path triggers the early return), so
+/// it is plain-removed.
+fn run_apply_scrubbed(args: &[&str]) -> std::process::Output {
+    let mut cmd = Command::new(binary());
+    cmd.args(args)
+        .env("SOCKET_DRY_RUN", "true")
+        .env("SOCKET_GLOBAL", "true")
+        .env("SOCKET_GLOBAL_PREFIX", "/nonexistent")
+        .env("SOCKET_MANIFEST_PATH", "/nonexistent/manifest.json")
+        .env_remove("SOCKET_DRY_RUN")
+        .env_remove("SOCKET_GLOBAL")
+        .env_remove("SOCKET_GLOBAL_PREFIX")
+        .env_remove("SOCKET_MANIFEST_PATH")
+        .env_remove("VIRTUAL_ENV");
+    for (key, _) in std::env::vars_os() {
+        let name = key.to_string_lossy();
+        if name.starts_with("SOCKET_") && !name.contains("TELEMETRY") {
+            cmd.env_remove(&key);
+        }
+    }
+    cmd.output().expect("run socket-patch apply")
+}
+
 fn git_sha256(content: &[u8]) -> String {
     let header = format!("blob {}\0", content.len());
     let mut hasher = Sha256::new();
@@ -169,27 +208,17 @@ fn failed_installed_variant_is_not_also_reported_not_installed() {
     // child's stdout. This is reliable under cargo's test-output capture, unlike
     // an in-process `gag`-based stdout redirect (which races libtest's own
     // capture). NOT `--force`: exercises the variant-matches-installed path,
-    // exactly where the misreport happened. SOCKET_* are scrubbed so the flags
-    // decide behaviour.
-    let output = Command::new(binary())
-        .args([
-            "apply",
-            "--offline",
-            "--ecosystems",
-            "pypi",
-            "--json",
-            "--cwd",
-            tmp.path().to_str().unwrap(),
-        ])
-        .env_remove("SOCKET_API_TOKEN")
-        .env_remove("SOCKET_OFFLINE")
-        .env_remove("SOCKET_ECOSYSTEMS")
-        .env_remove("SOCKET_JSON")
-        .env_remove("SOCKET_FORCE")
-        .env_remove("SOCKET_CWD")
-        .env_remove("SOCKET_MANIFEST_PATH")
-        .output()
-        .expect("run socket-patch apply");
+    // exactly where the misreport happened. SOCKET_* and VIRTUAL_ENV are
+    // scrubbed so the flags decide behaviour.
+    let output = run_apply_scrubbed(&[
+        "apply",
+        "--offline",
+        "--ecosystems",
+        "pypi",
+        "--json",
+        "--cwd",
+        tmp.path().to_str().unwrap(),
+    ]);
     let code = output.status.code().unwrap_or(-1);
     let out = String::from_utf8_lossy(&output.stdout).to_string();
 
@@ -318,26 +347,16 @@ fn partial_multi_variant_failure_fails_the_command() {
     )
     .expect("write manifest");
 
-    let output = Command::new(binary())
-        .args([
-            "apply",
-            "--force",
-            "--offline",
-            "--ecosystems",
-            "pypi",
-            "--json",
-            "--cwd",
-            tmp.path().to_str().unwrap(),
-        ])
-        .env_remove("SOCKET_API_TOKEN")
-        .env_remove("SOCKET_OFFLINE")
-        .env_remove("SOCKET_ECOSYSTEMS")
-        .env_remove("SOCKET_JSON")
-        .env_remove("SOCKET_FORCE")
-        .env_remove("SOCKET_CWD")
-        .env_remove("SOCKET_MANIFEST_PATH")
-        .output()
-        .expect("run socket-patch apply");
+    let output = run_apply_scrubbed(&[
+        "apply",
+        "--force",
+        "--offline",
+        "--ecosystems",
+        "pypi",
+        "--json",
+        "--cwd",
+        tmp.path().to_str().unwrap(),
+    ]);
     let code = output.status.code().unwrap_or(-1);
     let out = String::from_utf8_lossy(&output.stdout).to_string();
 

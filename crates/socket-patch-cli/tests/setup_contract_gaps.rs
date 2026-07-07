@@ -1,18 +1,14 @@
-//! **Executable spec for the not-yet-implemented parts of the `setup` contract.**
+//! **Executable spec for the once-unimplemented parts of the `setup` contract.**
 //!
 //! Every test in this file encodes a property from the "Setup command contract"
-//! section of `crates/socket-patch-cli/CLI_CONTRACT.md` that the current binary
-//! does **not** yet satisfy. They are intentionally RED — exactly like the
-//! pre-existing all-batches-failed guard in `scan_invariants.rs::scan_handles_
-//! api_500_error_gracefully`. They are NOT regressions: a failure here means the
-//! gap is still open. When the corresponding property is implemented, the test
-//! flips green and protects it thereafter.
+//! section of `crates/socket-patch-cli/CLI_CONTRACT.md` that the binary did not
+//! originally satisfy. They began life intentionally RED (executable
+//! documentation of the open gaps); every property here has since SHIPPED —
+//! see the per-section comments — so today these are ordinary, active
+//! regression guards. A failure now IS a regression. Do not "fix" one by
+//! weakening the assertions.
 //!
-//! This work was scoped as *documentation + tests only* — we deliberately did
-//! not change production behavior, so these stay RED on purpose. Do not "fix"
-//! them by weakening the assertions.
-//!
-//! Each test names the property it guards and explains why it is currently RED.
+//! Each test names the property it guards.
 
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -22,35 +18,19 @@ fn binary() -> PathBuf {
     env!("CARGO_BIN_EXE_socket-patch").into()
 }
 
-/// `SOCKET_*` vars scrubbed from every child so behaviour is decided by flags +
-/// fixtures alone (mirrors setup_invariants.rs). Critically includes
-/// `SOCKET_ECOSYSTEMS` (whose ambient value would defeat the prop-2 scoping
-/// test) and the cargo-backend `SOCKET_PATCH_*` knobs.
-const SOCKET_ENV_VARS: &[&str] = &[
-    "SOCKET_CWD",
-    "SOCKET_MANIFEST_PATH",
-    "SOCKET_API_TOKEN",
-    "SOCKET_ECOSYSTEMS",
-    "SOCKET_OFFLINE",
-    "SOCKET_JSON",
-    "SOCKET_DRY_RUN",
-    "SOCKET_YES",
-    "SOCKET_SETUP_EXCLUDE",
-    "SOCKET_VEX_NO_VERIFY",
-    "SOCKET_VEX_PRODUCT",
-    "SOCKET_DEBUG",
-    "SOCKET_TELEMETRY_DISABLED",
-    "SOCKET_PATCH_BIN",
-    "SOCKET_PATCH_DEBUG",
-];
-
-/// Run the binary with a scrubbed environment, telemetry off, and HOME pointed
-/// at `home`. Returns (exit code, stdout).
+/// Run the binary with every ambient `SOCKET_*` var scrubbed (prefix scrub —
+/// a fixed list rots as flags grow: ambient `SOCKET_GLOBAL=true` alone sent
+/// the patch-consistency crawl to the global prefix, hiding the drifted
+/// package and turning the prop-4 test green-for-the-wrong-reason; ambient
+/// `SOCKET_ECOSYSTEMS` would likewise defeat the prop-2 scoping test),
+/// telemetry off, and HOME pointed at `home`. Returns (exit code, stdout).
 fn run(cwd: &Path, home: &Path, args: &[&str]) -> (i32, String) {
     let mut cmd = Command::new(binary());
     cmd.args(args).current_dir(cwd);
-    for var in SOCKET_ENV_VARS {
-        cmd.env_remove(var);
+    for (name, _) in std::env::vars() {
+        if name.starts_with("SOCKET_") {
+            cmd.env_remove(name);
+        }
     }
     cmd.env("HOME", home);
     cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
@@ -188,6 +168,151 @@ fn setup_check_detects_unapplied_manifest_patch() {
     assert_ne!(
         v["status"], "configured",
         "check must NOT report `configured` for a hooked-but-unpatched repo; stdout=\n{stdout}"
+    );
+}
+
+// ===========================================================================
+// Property 4 (vendored) — the patch-consistency pass must judge a VENDORED
+// patch by its committed `.socket/vendor/` artifact, which core's
+// `applied_patches_with_vendor` contract makes the SOLE evidence: an
+// unpatched installed tree is EXPECTED after vendoring (the next install
+// re-materializes it from the artifact; go redirects leave the module cache
+// pristine forever), and a patched-looking installed tree must not launder a
+// tampered artifact. `vex` builds that vendor context
+// (commands/vex.rs::load_vendor_context); `setup --check` must too — without
+// it a healthy vendored repo false-fails `--check` with `not_applied`, and a
+// tampered artifact passes.
+// ===========================================================================
+
+/// Canonical-grammar patch UUID — the vendored-artifact verifier validates
+/// the uuid path level against the record, so fixtures must use the real
+/// shape (mirrors e2e_vex_vendor.rs).
+const VENDOR_UUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
+
+/// Lay down the shared vendored fixture: hook wired, an installed
+/// `node_modules/vendpkg` at `installed` bytes, a committed dir-shaped
+/// vendored artifact at `vendored` bytes, the `.socket/vendor/state.json`
+/// ledger entry binding the purl to it, and a manifest record whose
+/// afterHash is the hash of `patched`.
+fn setup_vendored_fixture(proj: &Path, home: &Path, installed: &[u8], vendored: &[u8]) {
+    use socket_patch_core::patch::vendor::state::{VendorArtifact, VendorEntry, VendorState};
+
+    write(
+        &proj.join("package.json"),
+        r#"{ "name": "x", "version": "1.0.0" }"#,
+    );
+    let (c, _) = run(proj, home, &["setup", "--json", "--yes"]);
+    assert_eq!(c, 0, "precondition: initial setup wires the hook");
+
+    let original = b"original\n";
+    let patched = b"patched\n";
+
+    let pkg = proj.join("node_modules/vendpkg");
+    write(
+        &pkg.join("package.json"),
+        r#"{ "name": "vendpkg", "version": "1.0.0" }"#,
+    );
+    write(&pkg.join("index.js"), &String::from_utf8_lossy(installed));
+
+    // The committed vendored artifact (dir-shaped copy).
+    let rel = format!(".socket/vendor/npm/{VENDOR_UUID}/vendpkg-1.0.0");
+    write(
+        &proj.join(&rel).join("index.js"),
+        &String::from_utf8_lossy(vendored),
+    );
+
+    let mut state = VendorState::new();
+    state.entries.insert(
+        "pkg:npm/vendpkg@1.0.0".to_string(),
+        VendorEntry {
+            ecosystem: "npm".to_string(),
+            base_purl: "pkg:npm/vendpkg@1.0.0".to_string(),
+            uuid: VENDOR_UUID.to_string(),
+            artifact: VendorArtifact {
+                path: rel,
+                sha256: String::new(),
+                size: None,
+                platform_locked: None,
+            },
+            wiring: Vec::new(),
+            lock: None,
+            took_over_go_patches: false,
+            detached: false,
+            record: None,
+            flavor: None,
+            uv: None,
+            pnpm: None,
+            poetry: None,
+            pdm: None,
+            pipenv: None,
+        },
+    );
+    write(
+        &proj.join(".socket/vendor/state.json"),
+        &serde_json::to_string_pretty(&state).unwrap(),
+    );
+
+    write(
+        &proj.join(".socket/manifest.json"),
+        &format!(
+            r#"{{ "patches": {{
+  "pkg:npm/vendpkg@1.0.0": {{
+    "uuid": "{VENDOR_UUID}",
+    "exportedAt": "2024-01-01T00:00:00Z",
+    "files": {{ "package/index.js": {{ "beforeHash": "{before}", "afterHash": "{after}" }} }},
+    "vulnerabilities": {{ "GHSA-aaaa-bbbb-cccc": {{ "cves": ["CVE-2024-0001"], "summary": "x", "severity": "high", "description": "d" }} }},
+    "description": "d", "license": "MIT", "tier": "free"
+  }}
+}} }}"#,
+            before = git_sha256(original),
+            after = git_sha256(patched),
+        ),
+    );
+}
+
+#[test]
+fn setup_check_judges_vendored_patch_by_committed_artifact() {
+    let proj = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+
+    // Healthy vendored state: the artifact carries the patch; the installed
+    // tree still holds the ORIGINAL bytes (expected until the next install).
+    setup_vendored_fixture(proj.path(), home.path(), b"original\n", b"patched\n");
+
+    let (code, stdout) = run(proj.path(), home.path(), &["setup", "--check", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert_eq!(
+        code, 0,
+        "check must trust the committed vendored artifact — an unpatched \
+         installed tree is EXPECTED after vendoring, not drift; stdout=\n{stdout}"
+    );
+    assert_eq!(
+        v["status"], "configured",
+        "a healthy vendored repo must report `configured`; stdout=\n{stdout}"
+    );
+}
+
+#[test]
+fn setup_check_flags_tampered_vendored_artifact_despite_patched_tree() {
+    let proj = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+
+    // Laundering attempt: the committed artifact was tampered with, but the
+    // installed tree LOOKS patched. The artifact is the sole evidence — the
+    // consumed bytes on the next install — so check must fail.
+    setup_vendored_fixture(proj.path(), home.path(), b"patched\n", b"TAMPERED\n");
+
+    let (code, stdout) = run(proj.path(), home.path(), &["setup", "--check", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert_eq!(
+        code, 1,
+        "a tampered vendored artifact must fail check even when the installed \
+         tree looks patched; stdout=\n{stdout}"
+    );
+    assert_ne!(
+        v["status"], "configured",
+        "a patched-looking installed tree must not launder a tampered vendor \
+         artifact; stdout=\n{stdout}"
     );
 }
 

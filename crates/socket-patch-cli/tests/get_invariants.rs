@@ -3,15 +3,13 @@
 //! package-name search) plus the save-and-apply / paid / not-found
 //! error paths. Real-API integration stays in `e2e_npm.rs`.
 
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::Path;
 
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-fn binary() -> PathBuf {
-    env!("CARGO_BIN_EXE_socket-patch").into()
-}
+#[path = "common/mod.rs"]
+mod common;
 
 const ORG_SLUG: &str = "test-org";
 const UUID: &str = "11111111-1111-4111-8111-111111111111";
@@ -20,6 +18,13 @@ const AFTER_HASH: &str = "111111111111111111111111111111111111111111111111111111
 /// base64 "cGF0Y2hlZAo=" decodes to exactly these bytes.
 const BLOB_BYTES: &[u8] = b"patched\n";
 
+/// Run `get` via `common::run_with_env`, which scrubs the ambient
+/// `SOCKET_*` environment before spawning. The binary binds a wide env
+/// surface (`SOCKET_ONE_OFF`, `SOCKET_MANIFEST_PATH`, `SOCKET_CWD`,
+/// `SOCKET_OFFLINE`, ...); an ambient value silently changes what these
+/// tests exercise — `SOCKET_ONE_OFF=true` alone fails every invocation
+/// here ("--one-off and --save-only cannot be used together"), and
+/// `SOCKET_MANIFEST_PATH` aims the manifest write OUTSIDE the tempdir.
 fn run_get(cwd: &Path, api_url: &str, identifier: &str, extra: &[&str]) -> (i32, String, String) {
     let mut args = vec![
         "get",
@@ -35,16 +40,7 @@ fn run_get(cwd: &Path, api_url: &str, identifier: &str, extra: &[&str]) -> (i32,
         ORG_SLUG,
     ];
     args.extend_from_slice(extra);
-    let out = Command::new(binary())
-        .args(&args)
-        .current_dir(cwd)
-        .output()
-        .expect("run socket-patch");
-    (
-        out.status.code().unwrap_or(-1),
-        String::from_utf8_lossy(&out.stdout).to_string(),
-        String::from_utf8_lossy(&out.stderr).to_string(),
-    )
+    common::run_with_env(cwd, &args, &[])
 }
 
 /// PatchResponse JSON suitable as a `view/{uuid}` response. All fields
@@ -462,29 +458,34 @@ async fn get_uuid_paid_patch_via_public_proxy_emits_paid_required_envelope() {
         .await;
 
     let tmp = tempfile::tempdir().expect("tempdir");
-    let out = Command::new(binary())
-        .args([
+    // No --api-token / --org: the scrubbed env (common::run_with_env
+    // strips ambient SOCKET_*, including SOCKET_API_TOKEN and the
+    // canonical SOCKET_PROXY_URL, which outranks the legacy var seeded
+    // below) makes the binary fall back to the public proxy — the mock.
+    let uri = mock.uri();
+    let (code, stdout, stderr) = common::run_with_env(
+        tmp.path(),
+        &[
             "get",
             UUID,
             "--json",
             "--save-only",
             "--yes",
             "--api-url",
-            &mock.uri(),
-        ])
-        .current_dir(tmp.path())
-        .env("SOCKET_PATCH_PROXY_URL", mock.uri())
-        .env_remove("SOCKET_API_TOKEN")
-        .output()
-        .expect("run socket-patch");
+            &uri,
+        ],
+        &[("SOCKET_PATCH_PROXY_URL", uri.as_str())],
+    );
 
-    let stdout = String::from_utf8_lossy(&out.stdout);
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
-        panic!(
-            "invalid JSON envelope: {e}\nstdout:\n{stdout}\nstderr:\n{}",
-            String::from_utf8_lossy(&out.stderr)
-        )
+        panic!("invalid JSON envelope: {e}\nstdout:\n{stdout}\nstderr:\n{stderr}")
     });
+    // paid_required is a clean (non-error) outcome — same contract as
+    // not_found: status and $? must agree, and 0 is the documented code.
+    assert_eq!(
+        code, 0,
+        "paid_required must exit 0; stdout={stdout}; stderr={stderr}"
+    );
     assert_eq!(
         v["status"], "paid_required",
         "UUID-fetched paid patch via public proxy must emit paid_required; got {v}"
@@ -507,8 +508,11 @@ async fn get_uuid_paid_patch_via_public_proxy_emits_paid_required_envelope() {
 async fn get_paid_patch_via_public_proxy_returns_paid_required() {
     // When using the public proxy (no api-token + no org), a paid patch
     // returns a `paid_required` status. To simulate this we DON'T pass
-    // --api-token / --org so the binary falls back to the public proxy.
-    // We also have to point SOCKET_PATCH_PROXY_URL at the mock.
+    // --api-token / --org so the binary falls back to the public proxy
+    // (the scrubbed env guarantees no ambient SOCKET_API_TOKEN /
+    // SOCKET_PROXY_URL interferes). We also have to point
+    // SOCKET_PATCH_PROXY_URL (the legacy alias, injected post-scrub) at
+    // the mock.
     let mock = MockServer::start().await;
     let purl = "pkg:npm/paidpkg@1.0.0";
     let encoded = "pkg%3Anpm%2Fpaidpkg%401.0.0";
@@ -532,28 +536,31 @@ async fn get_paid_patch_via_public_proxy_returns_paid_required() {
         .await;
 
     let tmp = tempfile::tempdir().expect("tempdir");
-    let out = Command::new(binary())
-        .args([
+    let uri = mock.uri();
+    let (code, stdout, stderr) = common::run_with_env(
+        tmp.path(),
+        &[
             "get",
             purl,
             "--json",
             "--save-only",
             "--yes",
             "--api-url",
-            &mock.uri(),
-        ])
-        .current_dir(tmp.path())
-        .env("SOCKET_PATCH_PROXY_URL", mock.uri())
-        .env_remove("SOCKET_API_TOKEN")
-        .output()
-        .expect("run socket-patch");
+            &uri,
+        ],
+        &[("SOCKET_PATCH_PROXY_URL", uri.as_str())],
+    );
 
-    let stdout = String::from_utf8_lossy(&out.stdout);
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     // A single paid patch with no paid access must emit `paid_required`
     // with zero downloads/applies and the patch echoed back as paid.
     // Asserting merely `!= success` would let a generic error envelope
     // (or any other status) pass and mask a broken paid-path branch.
+    // Like not_found, paid_required is a clean outcome: exit 0.
+    assert_eq!(
+        code, 0,
+        "paid_required must exit 0; stdout={stdout}; stderr={stderr}"
+    );
     assert_eq!(
         v["status"], "paid_required",
         "paid patch without token must emit paid_required; got: {v}"

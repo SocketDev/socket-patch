@@ -9,6 +9,7 @@ use socket_patch_core::utils::telemetry::{track_patch_remove_failed, track_patch
 use std::path::Path;
 use std::time::Duration;
 
+use super::get::short_uuid;
 use super::rollback::{all_files_already_original, rollback_patches};
 use super::vendor::dispatch_revert_one;
 use crate::args::{apply_env_toggles, GlobalArgs};
@@ -16,21 +17,28 @@ use crate::commands::lock_cli::{acquire_or_emit, lock_broken_event};
 use crate::json_envelope::{Command, Envelope, EnvelopeError, PatchAction, PatchEvent, Status};
 use crate::output::confirm;
 
+/// A remove/rollback identifier matches a patch by PURL for `pkg:`
+/// identifiers (a base PURL matches every release variant of that
+/// package@version; a qualified PURL targets a single patch), or by patch
+/// uuid otherwise.
+pub(crate) fn patch_matches(purl: &str, uuid: &str, identifier: &str) -> bool {
+    if identifier.starts_with("pkg:") {
+        purl_matches_identifier(purl, identifier)
+    } else {
+        uuid == identifier
+    }
+}
+
 /// Vendor-ledger entries matching a remove identifier: by ledger key or
-/// base purl for `pkg:` identifiers (a base PURL matches every release
-/// variant, mirroring the manifest matching), or by patch uuid otherwise.
-/// Sorted by key for deterministic event order.
+/// base purl (mirroring the manifest matching). Sorted by key for
+/// deterministic event order.
 fn vendor_entries_matching(state: &VendorState, identifier: &str) -> Vec<(String, VendorEntry)> {
     let mut matches: Vec<(String, VendorEntry)> = state
         .entries
         .iter()
         .filter(|(key, entry)| {
-            if identifier.starts_with("pkg:") {
-                purl_matches_identifier(key, identifier)
-                    || purl_matches_identifier(&entry.base_purl, identifier)
-            } else {
-                entry.uuid == identifier
-            }
+            patch_matches(key, &entry.uuid, identifier)
+                || patch_matches(&entry.base_purl, &entry.uuid, identifier)
         })
         .map(|(k, e)| (k.clone(), e.clone()))
         .collect();
@@ -38,11 +46,38 @@ fn vendor_entries_matching(state: &VendorState, identifier: &str) -> Vec<(String
     matches
 }
 
-/// Emit a `remove` error envelope and return. Used by the many error
-/// paths in `run` so they all share the same JSON shape.
-fn emit_error_envelope(json: bool, code: &str, message: String) {
+/// Emit the `not_found` envelope (or stderr line) for an identifier that
+/// matched nothing, tracking the failure. Both the pre-flight match and
+/// the post-rollback manifest mutation share this exit path. `dry_run`
+/// rides the envelope so a preview's failures still report `dryRun: true`
+/// (matching apply's error envelopes and remove's own success envelope).
+async fn emit_not_found(
+    json: bool,
+    dry_run: bool,
+    identifier: &str,
+    api_token: Option<&str>,
+    org_slug: Option<&str>,
+) {
+    let msg = format!("No patch found matching identifier: {identifier}");
+    track_patch_remove_failed(&msg, api_token, org_slug).await;
     if json {
         let mut env = Envelope::new(Command::Remove);
+        env.dry_run = dry_run;
+        env.status = Status::NotFound;
+        env.error = Some(EnvelopeError::new("not_found", msg));
+        println!("{}", env.to_pretty_json());
+    } else {
+        eprintln!("{msg}");
+    }
+}
+
+/// Emit a `remove` error envelope and return. Used by the many error
+/// paths in `run` so they all share the same JSON shape. `dry_run` rides
+/// the envelope so preview failures report `dryRun: true`.
+fn emit_error_envelope(json: bool, dry_run: bool, code: &str, message: String) {
+    if json {
+        let mut env = Envelope::new(Command::Remove);
+        env.dry_run = dry_run;
         env.mark_error(EnvelopeError::new(code, message));
         println!("{}", env.to_pretty_json());
     } else {
@@ -59,10 +94,17 @@ pub struct RemoveArgs {
     pub common: GlobalArgs,
 
     /// Skip rolling back files before removing (only update manifest).
+    ///
+    /// `value_parser = parse_bool_flag` matches the `GlobalArgs` bool flags:
+    /// clap's default bool parser accepts only the literal strings
+    /// `true`/`false` from the env binding, so `SOCKET_SKIP_ROLLBACK=1` (or
+    /// an exported-but-empty `SOCKET_SKIP_ROLLBACK=`) aborted every
+    /// `remove` invocation.
     #[arg(
         long = "skip-rollback",
         env = "SOCKET_SKIP_ROLLBACK",
-        default_value_t = false
+        default_value_t = false,
+        value_parser = crate::args::parse_bool_flag,
     )]
     pub skip_rollback: bool,
 }
@@ -76,13 +118,31 @@ pub async fn run(args: RemoveArgs) -> i32 {
 
     let manifest_path = args.common.resolved_manifest_path();
 
-    if tokio::fs::metadata(&manifest_path).await.is_err() {
-        emit_error_envelope(
-            args.common.json,
-            "manifest_not_found",
-            format!("Manifest not found at {}", manifest_path.display()),
-        );
-        return 1;
+    let manifest_missing = tokio::fs::metadata(&manifest_path).await.is_err();
+    if manifest_missing {
+        // A pure-detached project (`scan --vendor --detached`) has a
+        // vendor ledger but deliberately no manifest, and `remove` is the
+        // per-purl exit path for its entries — so a missing manifest is
+        // only fatal when the ledger has no detached match either. An
+        // unreadable ledger falls through to the error: nothing is
+        // mutated on that path.
+        let has_detached_match = load_state(&args.common.cwd)
+            .await
+            .map(|s| {
+                vendor_entries_matching(&s, &args.identifier)
+                    .iter()
+                    .any(|(_, e)| e.detached)
+            })
+            .unwrap_or(false);
+        if !has_detached_match {
+            emit_error_envelope(
+                args.common.json,
+                args.common.dry_run,
+                "manifest_not_found",
+                format!("Manifest not found at {}", manifest_path.display()),
+            );
+            return 1;
+        }
     }
 
     // Serialize against concurrent socket-patch runs targeting the
@@ -96,7 +156,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
         Command::Remove,
         args.common.json,
         args.common.silent,
-        false, // remove has no --dry-run
+        args.common.dry_run,
         Duration::from_secs(args.common.lock_timeout.unwrap_or(0)),
         args.common.break_lock,
     ) {
@@ -106,40 +166,41 @@ pub async fn run(args: RemoveArgs) -> i32 {
     let _lock = acquired.guard;
     let lock_was_broken = acquired.broke_lock;
 
-    // Read manifest to show what will be removed and confirm
-    let manifest = match read_manifest(&manifest_path).await {
-        Ok(Some(m)) => m,
-        Ok(None) => {
-            emit_error_envelope(
-                args.common.json,
-                "manifest_invalid",
-                "Invalid manifest".to_string(),
-            );
-            return 1;
-        }
-        Err(e) => {
-            emit_error_envelope(args.common.json, "manifest_unreadable", e.to_string());
-            return 1;
+    // Read manifest to show what will be removed and confirm. On the
+    // pure-detached path there is no manifest to read or mutate; an empty
+    // view routes the flow to the detached-only removal below.
+    let manifest = if manifest_missing {
+        PatchManifest::new()
+    } else {
+        match read_manifest(&manifest_path).await {
+            Ok(Some(m)) => m,
+            Ok(None) => {
+                emit_error_envelope(
+                    args.common.json,
+                    args.common.dry_run,
+                    "manifest_invalid",
+                    "Invalid manifest".to_string(),
+                );
+                return 1;
+            }
+            Err(e) => {
+                emit_error_envelope(
+                    args.common.json,
+                    args.common.dry_run,
+                    "manifest_unreadable",
+                    e.to_string(),
+                );
+                return 1;
+            }
         }
     };
 
-    // Find matching patches to show what will be removed. A base PURL
-    // (no `?`) matches every release variant of that package@version; a
-    // qualified PURL or a UUID targets a single patch.
-    let matching: Vec<(&String, &socket_patch_core::manifest::schema::PatchRecord)> =
-        if args.identifier.starts_with("pkg:") {
-            manifest
-                .patches
-                .iter()
-                .filter(|(purl, _)| purl_matches_identifier(purl, &args.identifier))
-                .collect()
-        } else {
-            manifest
-                .patches
-                .iter()
-                .filter(|(_, patch)| patch.uuid == args.identifier)
-                .collect()
-        };
+    // Find matching patches to show what will be removed.
+    let matching: Vec<_> = manifest
+        .patches
+        .iter()
+        .filter(|(purl, patch)| patch_matches(purl, &patch.uuid, &args.identifier))
+        .collect();
 
     if matching.is_empty() {
         // Detached vendored patches (`scan --vendor --detached`) have no
@@ -165,16 +226,14 @@ pub async fn run(args: RemoveArgs) -> i32 {
             .await;
         }
 
-        let msg = format!("No patch found matching identifier: {}", args.identifier);
-        track_patch_remove_failed(&msg, api_token.as_deref(), org_slug.as_deref()).await;
-        if args.common.json {
-            let mut env = Envelope::new(Command::Remove);
-            env.status = Status::NotFound;
-            env.error = Some(EnvelopeError::new("not_found", msg));
-            println!("{}", env.to_pretty_json());
-        } else {
-            eprintln!("No patch found matching identifier: {}", args.identifier);
-        }
+        emit_not_found(
+            args.common.json,
+            args.common.dry_run,
+            &args.identifier,
+            api_token.as_deref(),
+            org_slug.as_deref(),
+        )
+        .await;
         return 1;
     }
 
@@ -196,21 +255,21 @@ pub async fn run(args: RemoveArgs) -> i32 {
             eprintln!("The following patch(es) will be removed:");
         }
         for (purl, patch) in &matching {
-            let file_count = patch.files.len();
-            // Short-UUID for display only. Slice on a char boundary and
-            // tolerate UUIDs shorter than 8 chars — a malformed manifest
-            // must not panic the whole command in the display path.
-            let short_uuid = patch.uuid.get(..8).unwrap_or(patch.uuid.as_str());
             eprintln!(
                 "  - {} (UUID: {}, {} file(s))",
-                purl, short_uuid, file_count
+                purl,
+                short_uuid(&patch.uuid),
+                patch.files.len()
             );
         }
         eprintln!();
     }
 
+    // `--dry-run` previews without mutating, so there is nothing to
+    // confirm — skip the prompt (matching the global contract row:
+    // "Preview, no mutations").
     let prompt = format!("Remove {} patch(es) and rollback files?", matching.len());
-    if !confirm(&prompt, true, args.common.yes, args.common.json) {
+    if !args.common.dry_run && !confirm(&prompt, true, args.common.yes, args.common.json) {
         if !args.common.json && !args.common.silent {
             println!("Removal cancelled.");
         }
@@ -224,14 +283,11 @@ pub async fn run(args: RemoveArgs) -> i32 {
             println!("Rolling back patch before removal...");
         }
         match rollback_patches(
-            &args.common.cwd,
+            &args.common,
             &manifest_path,
             Some(&args.identifier),
-            false,
+            args.common.dry_run,
             args.common.json || args.common.silent,
-            args.common.offline,
-            args.common.global,
-            args.common.global_prefix.clone(),
             None,
         )
         .await
@@ -245,7 +301,8 @@ pub async fn run(args: RemoveArgs) -> i32 {
                     )
                     .await;
                     emit_error_envelope(
-                        args.common.json,
+        args.common.json,
+        args.common.dry_run,
                         "rollback_failed",
                         "Rollback failed during patch removal. Use --skip-rollback to remove from manifest without restoring files.".to_string(),
                     );
@@ -283,7 +340,8 @@ pub async fn run(args: RemoveArgs) -> i32 {
             Err(e) => {
                 track_patch_remove_failed(&e, api_token.as_deref(), org_slug.as_deref()).await;
                 emit_error_envelope(
-                    args.common.json,
+        args.common.json,
+        args.common.dry_run,
                     "rollback_failed",
                     format!("Error during rollback: {e}. Use --skip-rollback to remove from manifest without restoring files."),
                 );
@@ -310,6 +368,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
         Err(e) => {
             emit_error_envelope(
                 args.common.json,
+                args.common.dry_run,
                 "vendor_state_unreadable",
                 format!("cannot read .socket/vendor/state.json: {e}"),
             );
@@ -326,7 +385,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
     if !vendored_matches.is_empty() {
         if args.skip_rollback {
             for (key, _) in &vendored_matches {
-                if !args.common.json {
+                if !args.common.json && !args.common.silent {
                     eprintln!(
                         "Note: {key} is vendored; --skip-rollback leaves the vendor wiring and \
                          artifact in place (the next `vendor` run will reconcile-revert it)."
@@ -341,9 +400,10 @@ pub async fn run(args: RemoveArgs) -> i32 {
             }
         } else {
             for (key, entry) in &vendored_matches {
-                let outcome = dispatch_revert_one(entry, &args.common.cwd, false).await;
+                let outcome =
+                    dispatch_revert_one(entry, &args.common.cwd, args.common.dry_run).await;
                 for w in &outcome.warnings {
-                    if !args.common.json {
+                    if !args.common.json && !args.common.silent {
                         eprintln!("Warning ({}): {}", w.code, w.detail);
                     }
                     vendor_skipped_events.push(
@@ -360,6 +420,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
                     .await;
                     emit_error_envelope(
                         args.common.json,
+                        args.common.dry_run,
                         "vendor_revert_failed",
                         format!(
                             "could not revert vendoring for {key}: {}. The manifest was not \
@@ -369,16 +430,31 @@ pub async fn run(args: RemoveArgs) -> i32 {
                     );
                     return 1;
                 }
+                if args.common.dry_run {
+                    if !args.common.json && !args.common.silent {
+                        println!("Would revert vendoring for {key}");
+                    }
+                    // Dry-run flips the would-be Removed to a Verified
+                    // preview, same convention as apply/vendor/repair.
+                    vendor_reverted_events.push(
+                        PatchEvent::new(PatchAction::Verified, key.clone()).with_reason(
+                            "vendor_would_revert",
+                            "vendoring would be reverted on remove",
+                        ),
+                    );
+                    continue;
+                }
                 vendor_state.entries.remove(key);
                 if let Err(e) = save_state(&args.common.cwd, &vendor_state).await {
                     emit_error_envelope(
                         args.common.json,
+                        args.common.dry_run,
                         "vendor_state_write_failed",
                         e.to_string(),
                     );
                     return 1;
                 }
-                if !args.common.json {
+                if !args.common.json && !args.common.silent {
                     println!("Reverted vendoring for {key}");
                 }
                 vendor_reverted_events.push(
@@ -389,44 +465,74 @@ pub async fn run(args: RemoveArgs) -> i32 {
         }
     }
 
-    // Now remove from manifest
-    match remove_patch_from_manifest(&args.identifier, &manifest_path).await {
+    // Now remove from manifest. On --dry-run the removal is simulated in
+    // memory (manifest untouched) so the blob sweep below can still
+    // preview against the post-removal reference set.
+    let removal = if args.common.dry_run {
+        let removed: Vec<String> = matching.iter().map(|(purl, _)| (*purl).clone()).collect();
+        let mut simulated = manifest.clone();
+        simulated.patches.retain(|purl, _| !removed.contains(purl));
+        Ok((removed, simulated))
+    } else {
+        remove_patch_from_manifest(&args.identifier, &manifest_path).await
+    };
+    match removal {
         Ok((removed, manifest)) => {
             if removed.is_empty() {
-                let msg = format!("No patch found matching identifier: {}", args.identifier);
-                track_patch_remove_failed(&msg, api_token.as_deref(), org_slug.as_deref()).await;
-                if args.common.json {
-                    let mut env = Envelope::new(Command::Remove);
-                    env.status = Status::NotFound;
-                    env.error = Some(EnvelopeError::new("not_found", msg));
-                    println!("{}", env.to_pretty_json());
-                } else {
-                    eprintln!("No patch found matching identifier: {}", args.identifier);
-                }
+                emit_not_found(
+                    args.common.json,
+                    args.common.dry_run,
+                    &args.identifier,
+                    api_token.as_deref(),
+                    org_slug.as_deref(),
+                )
+                .await;
                 return 1;
             }
 
             if !args.common.json && !args.common.silent {
-                println!("Removed {} patch(es) from manifest:", removed.len());
+                if args.common.dry_run {
+                    println!("Would remove {} patch(es) from manifest:", removed.len());
+                } else {
+                    println!("Removed {} patch(es) from manifest:", removed.len());
+                }
                 for purl in &removed {
                     println!("  - {purl}");
                 }
-                println!("\nManifest updated at {}", manifest_path.display());
+                if args.common.dry_run {
+                    println!("\nDry run — nothing was changed.");
+                } else {
+                    println!("\nManifest updated at {}", manifest_path.display());
+                }
             }
 
-            // Clean up unused blobs
-            let socket_dir = manifest_path.parent().unwrap();
+            // Clean up unused blobs (previewed, not deleted, on --dry-run).
             let blobs_path = socket_dir.join("blobs");
             let mut blobs_removed = 0;
-            if let Ok(cleanup_result) = cleanup_unused_blobs(&manifest, &blobs_path, false).await {
+            if let Ok(cleanup_result) =
+                cleanup_unused_blobs(&manifest, &blobs_path, args.common.dry_run).await
+            {
                 blobs_removed = cleanup_result.blobs_removed;
                 if !args.common.json && !args.common.silent && cleanup_result.blobs_removed > 0 {
-                    println!("\n{}", format_cleanup_result(&cleanup_result, false));
+                    println!(
+                        "\n{}",
+                        format_cleanup_result(&cleanup_result, args.common.dry_run)
+                    );
                 }
             }
 
             if args.common.json {
                 let mut env = Envelope::new(Command::Remove);
+                env.dry_run = args.common.dry_run;
+                // Dry-run flips would-be Removed events to Verified
+                // previews (the apply/vendor/repair convention), so
+                // `summary.removed` stays "manifest entries actually
+                // deleted" — zero on a preview.
+                let removal_action = if args.common.dry_run {
+                    PatchAction::Verified
+                } else {
+                    PatchAction::Removed
+                };
                 if lock_was_broken {
                     env.record(lock_broken_event(socket_dir));
                 }
@@ -442,9 +548,10 @@ pub async fn run(args: RemoveArgs) -> i32 {
                 for ev in vendor_skipped_events {
                     env.record(ev);
                 }
-                // One Removed event per purl whose manifest entry was deleted.
+                // One Removed event per purl whose manifest entry was
+                // deleted (Verified on --dry-run).
                 for purl in &removed {
-                    env.record(PatchEvent::new(PatchAction::Removed, purl.clone()));
+                    env.record(PatchEvent::new(removal_action, purl.clone()));
                 }
                 // One artifact-level Removed event carrying the
                 // blob-sweep and rollback counts. Emitted whenever either
@@ -463,7 +570,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
                 // totals from `details`, never from `summary.removed`.
                 if blobs_removed > 0 || rollback_count > 0 {
                     env.events
-                        .push(PatchEvent::artifact(PatchAction::Removed).with_details(
+                        .push(PatchEvent::artifact(removal_action).with_details(
                             serde_json::json!({
                                 "blobsRemoved": blobs_removed,
                                 "rolledBack": rollback_count,
@@ -473,12 +580,14 @@ pub async fn run(args: RemoveArgs) -> i32 {
                 println!("{}", env.to_pretty_json());
             }
 
-            track_patch_removed(removed.len(), api_token.as_deref(), org_slug.as_deref()).await;
+            if !args.common.dry_run {
+                track_patch_removed(removed.len(), api_token.as_deref(), org_slug.as_deref()).await;
+            }
             0
         }
         Err(e) => {
             track_patch_remove_failed(&e, api_token.as_deref(), org_slug.as_deref()).await;
-            emit_error_envelope(args.common.json, "remove_failed", e);
+            emit_error_envelope(args.common.json, args.common.dry_run, "remove_failed", e);
             1
         }
     }
@@ -503,6 +612,7 @@ async fn remove_detached_only(
     if args.skip_rollback {
         emit_error_envelope(
             args.common.json,
+            args.common.dry_run,
             "vendor_state_retained",
             format!(
                 "{} matches only detached vendored patch(es); removing one means reverting \
@@ -513,19 +623,19 @@ async fn remove_detached_only(
         return 1;
     }
 
-    if !args.common.json {
+    if !args.common.json && !args.common.silent {
         eprintln!("The following detached vendored patch(es) will be reverted and removed:");
         for (key, entry) in &detached {
-            let short_uuid = entry.uuid.get(..8).unwrap_or(entry.uuid.as_str());
-            eprintln!("  - {key} (UUID: {short_uuid})");
+            eprintln!("  - {key} (UUID: {})", short_uuid(&entry.uuid));
         }
         eprintln!();
     }
+    // `--dry-run` previews without mutating — nothing to confirm.
     let prompt = format!(
         "Remove {} vendored patch(es) and revert their vendoring?",
         detached.len()
     );
-    if !confirm(&prompt, true, args.common.yes, args.common.json) {
+    if !args.common.dry_run && !confirm(&prompt, true, args.common.yes, args.common.json) {
         if !args.common.json {
             println!("Removal cancelled.");
         }
@@ -533,13 +643,14 @@ async fn remove_detached_only(
     }
 
     let mut env = Envelope::new(Command::Remove);
+    env.dry_run = args.common.dry_run;
     if lock_was_broken {
         env.record(lock_broken_event(socket_dir));
     }
     for (key, entry) in &detached {
-        let outcome = dispatch_revert_one(entry, &args.common.cwd, false).await;
+        let outcome = dispatch_revert_one(entry, &args.common.cwd, args.common.dry_run).await;
         for w in &outcome.warnings {
-            if !args.common.json {
+            if !args.common.json && !args.common.silent {
                 eprintln!("Warning ({}): {}", w.code, w.detail);
             }
             env.record(
@@ -556,6 +667,7 @@ async fn remove_detached_only(
             .await;
             emit_error_envelope(
                 args.common.json,
+                args.common.dry_run,
                 "vendor_revert_failed",
                 format!(
                     "could not revert vendoring for {key}: {}",
@@ -564,12 +676,31 @@ async fn remove_detached_only(
             );
             return 1;
         }
+        if args.common.dry_run {
+            if !args.common.json && !args.common.silent {
+                println!("Would revert vendoring for {key}");
+            }
+            // Verified preview (the dry-run convention); still recorded
+            // so `summary.verified` counts the would-be removals.
+            env.record(
+                PatchEvent::new(PatchAction::Verified, key.clone()).with_reason(
+                    "vendor_would_revert",
+                    "vendoring would be reverted on remove",
+                ),
+            );
+            continue;
+        }
         state.entries.remove(key);
         if let Err(e) = save_state(&args.common.cwd, &state).await {
-            emit_error_envelope(args.common.json, "vendor_state_write_failed", e.to_string());
+            emit_error_envelope(
+                args.common.json,
+                args.common.dry_run,
+                "vendor_state_write_failed",
+                e.to_string(),
+            );
             return 1;
         }
-        if !args.common.json {
+        if !args.common.json && !args.common.silent {
             println!("Reverted vendoring for {key}");
         }
         env.record(
@@ -580,7 +711,9 @@ async fn remove_detached_only(
     if args.common.json {
         println!("{}", env.to_pretty_json());
     }
-    track_patch_removed(detached.len(), api_token, org_slug).await;
+    if !args.common.dry_run {
+        track_patch_removed(detached.len(), api_token, org_slug).await;
+    }
     0
 }
 
@@ -593,28 +726,15 @@ async fn remove_patch_from_manifest(
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "Invalid manifest".to_string())?;
 
-    let mut removed = Vec::new();
+    let removed: Vec<String> = manifest
+        .patches
+        .iter()
+        .filter(|(purl, patch)| patch_matches(purl, &patch.uuid, identifier))
+        .map(|(purl, _)| purl.clone())
+        .collect();
 
-    let purls_to_remove: Vec<String> = if identifier.starts_with("pkg:") {
-        // Base PURL removes every release variant; qualified PURL removes one.
-        manifest
-            .patches
-            .keys()
-            .filter(|purl| purl_matches_identifier(purl, identifier))
-            .cloned()
-            .collect()
-    } else {
-        manifest
-            .patches
-            .iter()
-            .filter(|(_, patch)| patch.uuid == identifier)
-            .map(|(purl, _)| purl.clone())
-            .collect()
-    };
-
-    for purl in purls_to_remove {
-        manifest.patches.remove(&purl);
-        removed.push(purl);
+    for purl in &removed {
+        manifest.patches.remove(purl);
     }
 
     if !removed.is_empty() {

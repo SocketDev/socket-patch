@@ -487,15 +487,11 @@ async fn revert_works_without_manifest() {
 /// and the supported npm patch still vendors. The exemplar is `pkg:jsr/...`
 /// (Deno's JSR registry) — the one compiled-in ecosystem with no vendor
 /// backend now that nuget and maven vendor (`vendor/path.rs` pins jsr as
-/// having no vendor dir by design). How the entry surfaces depends on whether
-/// this build compiled the `deno` ecosystem in:
-///   * compiled out (default features): the purl is unknown, dropped by
-///     `partition_purls` before vendor's is_vendorable partition → no event.
-///   * compiled in (`--all-features`, as CI runs): the purl is recognized but
-///     not vendorable → a `skipped` event carrying `vendor_unsupported_ecosystem`.
+/// having no vendor dir by design). The purl is recognized but not
+/// vendorable → a `skipped` event carrying `vendor_unsupported_ecosystem`.
 ///
-/// Either way the jsr purl is never `applied`, the npm patch vendors, and the
-/// run exits 0.
+/// The jsr purl is never `applied`, the npm patch vendors, and the run
+/// exits 0.
 #[tokio::test]
 async fn unsupported_ecosystem_purl_is_a_benign_skip() {
     let fx = npm_fixture_with_purls(&[PURL, "pkg:jsr/@std/path@1.0.0"]);
@@ -510,21 +506,16 @@ async fn unsupported_ecosystem_purl_is_a_benign_skip() {
         .iter()
         .find(|e| e["purl"].as_str().is_some_and(|p| p.contains("jsr")))
         .cloned();
-    // The jsr purl is never vendored, on any feature set.
+    // The jsr purl is never vendored.
     assert!(
         jsr_event.as_ref().is_none_or(|e| e["action"] != "applied"),
         "jsr purl must never be applied: {env:#}"
     );
 
-    if cfg!(feature = "deno") {
-        // Recognized but not vendorable ⇒ an explicit, informative skip.
-        let ev = jsr_event.expect("deno compiled in ⇒ explicit skip event");
-        assert_eq!(ev["action"], "skipped", "{env:#}");
-        assert_eq!(ev["errorCode"], "vendor_unsupported_ecosystem", "{env:#}");
-    } else {
-        // Compiled out ⇒ the unknown purl is dropped before vendor sees it.
-        assert!(jsr_event.is_none(), "deno compiled out ⇒ no event: {env:#}");
-    }
+    // Recognized but not vendorable ⇒ an explicit, informative skip.
+    let ev = jsr_event.expect("jsr purl must produce an explicit skip event");
+    assert_eq!(ev["action"], "skipped", "{env:#}");
+    assert_eq!(ev["errorCode"], "vendor_unsupported_ecosystem", "{env:#}");
 
     assert!(fx.tgz_path().is_file(), "the npm patch still vendors");
 }
@@ -1015,7 +1006,6 @@ async fn remove_detached_only_purl_reverts() {
 /// reason `vendored` — apply must never repoint the vendor-owned `replace`
 /// back at `.socket/go-patches/`. The ledger entry is seeded by hand (the
 /// exact state `vendor` persists) so the test needs no full go vendor run.
-#[cfg(feature = "golang")]
 #[tokio::test]
 async fn vendored_golang_purl_skipped_by_apply() {
     use socket_patch_core::patch::vendor::state::{VendorArtifact, VendorEntry, VendorState};
@@ -1414,4 +1404,59 @@ fn vendor_resolves_percent_encoded_scope_purl() {
         json!(REG_RESOLVED)
     );
     assert!(!fx.vendor_dir().join("npm").exists(), "artifacts removed");
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// 11. --dry-run --vex: skipped, not generated
+// ─────────────────────────────────────────────────────────────────────
+
+/// A dry run vendors nothing, so there is no vendored state to attest:
+/// generating VEX here verified the deliberately untouched tree, spuriously
+/// failed the whole command with `no_applicable_patches`, and would write an
+/// attestation file during --dry-run (the same contract `apply --dry-run
+/// --vex` already honors by skipping generation).
+#[tokio::test]
+async fn dry_run_vex_is_skipped_not_generated() {
+    let fx = npm_fixture();
+    let vex_path = fx.root().join("vendor-dry.vex.json");
+    let mut args = vendor_args(fx.root());
+    args.common.dry_run = true;
+    args.vex.vex = Some(vex_path.clone());
+
+    let code = vendor_run(args).await;
+    assert_eq!(code, 0, "vendor --dry-run --vex must not fail");
+    assert!(
+        !vex_path.exists(),
+        "--dry-run must never write an attestation file"
+    );
+    // The dry run itself stayed read-only.
+    assert_eq!(fx.lock_bytes(), fx.original_lock, "lock untouched");
+    assert!(!fx.vendor_dir().exists(), "no artifacts staged");
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// 12. fail-closed --vendor-source=service refuses --offline
+// ─────────────────────────────────────────────────────────────────────
+
+/// `--vendor-source=service` promises "prebuilt service artifacts only",
+/// and `--offline` forbids the network the service needs — the combination
+/// can never be satisfied. It must refuse up front; silently falling back
+/// to a local build (what `service_enabled() == false` otherwise causes in
+/// every backend) violates the fail-closed contract.
+#[tokio::test]
+async fn offline_service_mode_refuses_instead_of_building() {
+    let fx = npm_fixture();
+    let mut args = vendor_args(fx.root());
+    args.common.vendor_source = "service".to_string();
+
+    let code = vendor_run(args).await;
+    assert_ne!(
+        code, 0,
+        "--offline --vendor-source=service cannot be satisfied and must refuse"
+    );
+    assert!(
+        !fx.tgz_path().exists(),
+        "service mode must not silently build a local artifact"
+    );
+    assert_eq!(fx.lock_bytes(), fx.original_lock, "lock untouched");
 }

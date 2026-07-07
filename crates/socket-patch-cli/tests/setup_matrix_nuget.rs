@@ -38,7 +38,7 @@
 //! gap closed, not that something broke.
 //!
 //! Run: `cargo test -p socket-patch-cli --features setup-e2e --test setup_matrix_nuget`
-#![cfg(all(feature = "setup-e2e", feature = "nuget"))]
+#![cfg(feature = "setup-e2e")]
 
 #[path = "setup_matrix_common/mod.rs"]
 mod smc;
@@ -83,38 +83,27 @@ mod host_guard {
         <PackageReference Include=\"Newtonsoft.Json\" Version=\"13.0.3\" />\n  \
         </ItemGroup>\n</Project>\n";
 
-    /// Every `SOCKET_*` env var clap consults for the surface this test
-    /// drives. Stripped from the child so the run reflects ONLY the explicit
-    /// flags (`--cwd`, `--yes`, `--check`, `--remove`, `--json`). Without
-    /// this, an ambient `SOCKET_CWD` / `SOCKET_JSON` / `SOCKET_OFFLINE` in
-    /// the shell or CI could satisfy an assertion via the environment rather
-    /// than the flag under test. (Mirrors the scrub used by the
-    /// `cli_parse_*` and `setup_matrix_gem` suites.)
-    const SOCKET_ENV_VARS: &[&str] = &[
-        "SOCKET_CWD",
-        "SOCKET_MANIFEST_PATH",
-        "SOCKET_API_URL",
-        "SOCKET_API_TOKEN",
-        "SOCKET_ORG_SLUG",
-        "SOCKET_PROXY_URL",
-        "SOCKET_ECOSYSTEMS",
-        "SOCKET_DOWNLOAD_MODE",
-        "SOCKET_OFFLINE",
-        "SOCKET_GLOBAL",
-        "SOCKET_GLOBAL_PREFIX",
-        "SOCKET_JSON",
-        "SOCKET_VERBOSE",
-        "SOCKET_SILENT",
-        "SOCKET_DRY_RUN",
-        "SOCKET_YES",
-        "SOCKET_LOCK_TIMEOUT",
-        "SOCKET_BREAK_LOCK",
-        "SOCKET_DEBUG",
-        "SOCKET_TELEMETRY_DISABLED",
-        "SOCKET_SAVE_ONLY",
-        "SOCKET_ONE_OFF",
-        "SOCKET_ALL_RELEASES",
-        "SOCKET_EXPERIMENTAL_NUGET",
+    /// Ambient decoys [`run`]'s prefix scrub must strip, planted by the test
+    /// itself so the scrub is exercised on every run, not only in hostile
+    /// shells. Three demonstrated failure classes on the old fixed-list scrub
+    /// (same trio as `setup_matrix_maven`): clap parses env-bound
+    /// `GlobalArgs` values on EVERY invocation whether or not the command
+    /// uses the flag, so an invalid ambient `SOCKET_STRICT` /
+    /// `SOCKET_VENDOR_SOURCE` aborts the parse (exit 2) before `setup` even
+    /// runs; and a (perfectly valid!) ambient `SOCKET_SETUP_EXCLUDE` stands
+    /// in for `setup --exclude`, which a real `setup` run PERSISTS —
+    /// creating `.socket/manifest.json` inside the dotnet fixture and
+    /// failing the final only-the-csproj assertion. `SOCKET_EXPERIMENTAL_NUGET`
+    /// rides along so the experimental gate can never quietly change nuget's
+    /// surface behind the test's back. (Safe to set process-wide: the only
+    /// other test in this binary is the `#[ignore]`d matrix pass, which
+    /// routes through `smc::host_driver_command`'s own `SOCKET_*` prefix
+    /// scrub.)
+    const HOSTILE_DECOYS: &[(&str, &str)] = &[
+        ("SOCKET_STRICT", "banana"),
+        ("SOCKET_VENDOR_SOURCE", "bogus-decoy"),
+        ("SOCKET_SETUP_EXCLUDE", "decoy-member"),
+        ("SOCKET_EXPERIMENTAL_NUGET", "true"),
     ];
 
     /// Absolute path to the binary under test, via cargo's `CARGO_BIN_EXE_*`.
@@ -123,14 +112,19 @@ mod host_guard {
     }
 
     /// Run the CLI with `args` in `cwd`; returns `(exit_code, stdout, stderr)`.
-    /// The entire `SOCKET_*` surface is stripped so behaviour reflects the
-    /// explicit flags alone — nothing reaches authed endpoints and no ambient
-    /// var can stand in for a flag.
+    /// The entire `SOCKET_*` surface is stripped BY PREFIX — a fixed list rots
+    /// (it missed `SOCKET_SETUP_EXCLUDE` / `SOCKET_VENDOR_SOURCE` /
+    /// `SOCKET_STRICT`, all parsed on every `setup` invocation; see
+    /// [`HOSTILE_DECOYS`]) — so behaviour reflects the explicit flags alone:
+    /// nothing reaches authed endpoints and no ambient var can stand in for a
+    /// flag.
     fn run(cwd: &Path, args: &[&str]) -> (i32, String, String) {
         let mut cmd = Command::new(binary());
         cmd.args(args).current_dir(cwd);
-        for var in SOCKET_ENV_VARS {
-            cmd.env_remove(var);
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("SOCKET_") {
+                cmd.env_remove(&key);
+            }
         }
         let out = cmd.output().expect("failed to execute socket-patch binary");
         (
@@ -205,6 +199,14 @@ mod host_guard {
     /// assertion the Docker matrix can never make for nuget.
     #[test]
     fn nuget_setup_roundtrip_host() {
+        // Committed regression guard for the env scrub itself: with the old
+        // fixed-list scrub these leaked into the child — SOCKET_STRICT /
+        // SOCKET_VENDOR_SOURCE aborted every parse (exit 2) and
+        // SOCKET_SETUP_EXCLUDE made the real `setup` run write
+        // `.socket/manifest.json` into the fixture (final entries check RED).
+        for (k, v) in HOSTILE_DECOYS {
+            std::env::set_var(k, v);
+        }
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         std::fs::write(root.join(CSPROJ_NAME), CSPROJ).unwrap();

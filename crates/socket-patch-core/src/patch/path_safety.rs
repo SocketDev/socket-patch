@@ -26,16 +26,11 @@ pub(crate) fn is_safe_single_segment(s: &str) -> bool {
 }
 
 /// A multi-segment relative path (Go module path `github.com/foo/bar`, npm
-/// scoped name `@scope/name`, composer `vendor/name`): `/`-separated segments,
-/// each non-empty and not `.`/`..`; no leading `/`, no backslash, no colon,
-/// no NUL.
+/// scoped name `@scope/name`, composer `vendor/name`): every `/`-separated
+/// segment must be safe on its own, which also rejects the empty string, a
+/// leading/trailing `/`, and `//` (each yields an empty segment).
 pub(crate) fn is_safe_multi_segment(s: &str) -> bool {
-    if s.is_empty() || s.starts_with('/') || s.contains('\\') || s.contains(':') || s.contains('\0')
-    {
-        return false;
-    }
-    s.split('/')
-        .all(|seg| !seg.is_empty() && seg != "." && seg != "..")
+    s.split('/').all(is_safe_single_segment)
 }
 
 /// The canonical lowercase hyphenated UUID grammar

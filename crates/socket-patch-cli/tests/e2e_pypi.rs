@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use sha2::{Digest, Sha256};
+use socket_patch_cli::args::{GLOBAL_ARG_ENV_VARS, LOCAL_ARG_ENV_VARS};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -57,14 +58,47 @@ fn git_sha256_file(path: &Path) -> String {
     git_sha256(&content)
 }
 
+/// The three legacy `SOCKET_PATCH_*` names still honored at runtime via
+/// `socket_patch_core::env_compat` — not in the clap-bound lists, so they
+/// need scrubbing separately.
+const LEGACY_ENV_VARS: &[&str] = &[
+    "SOCKET_PATCH_PROXY_URL",
+    "SOCKET_PATCH_DEBUG",
+    "SOCKET_PATCH_TELEMETRY_DISABLED",
+];
+
 /// Run the CLI binary with the given args, setting `cwd` as the working dir.
+///
+/// The environment is pinned hard: every env var the CLI binds (the canonical
+/// `GLOBAL_ARG_ENV_VARS` / `LOCAL_ARG_ENV_VARS` lists plus [`LEGACY_ENV_VARS`])
+/// is scrubbed so ambient developer/CI configuration can't change the
+/// lifecycle under test. Scrubbing `SOCKET_API_TOKEN` also forces the
+/// public-proxy (free-tier) path this suite relies on. The stakes are higher
+/// here than in the offline suites: an inherited `SOCKET_GLOBAL=true` takes
+/// `get`/`apply` out of the temp venv and patches the host's real
+/// site-packages, while `SOCKET_MANIFEST_PATH` relocates `.socket/` (verified
+/// to fail `get` outright) and `SOCKET_DRY_RUN` / `SOCKET_SAVE_ONLY` turn the
+/// apply steps into silent no-ops. The hostile seeds below are cleared by the
+/// scrub loop — the child never sees them — but if the scrub is ever dropped
+/// the seeds (rather than a developer's ambient shell, which this suite can't
+/// rely on) turn the tests red immediately.
 fn run(cwd: &Path, args: &[&str]) -> (i32, String, String) {
-    let out: Output = Command::new(binary())
-        .args(args)
+    let mut cmd = Command::new(binary());
+    cmd.args(args)
         .current_dir(cwd)
-        .env_remove("SOCKET_API_TOKEN") // force public proxy (free-tier)
-        .output()
-        .expect("failed to execute socket-patch binary");
+        .env("SOCKET_GLOBAL", "true")
+        .env("SOCKET_GLOBAL_PREFIX", "/nonexistent")
+        .env("SOCKET_DRY_RUN", "true")
+        .env("SOCKET_SAVE_ONLY", "true")
+        .env("SOCKET_MANIFEST_PATH", "/nonexistent/manifest.json");
+    for var in GLOBAL_ARG_ENV_VARS
+        .iter()
+        .chain(LOCAL_ARG_ENV_VARS)
+        .chain(LEGACY_ENV_VARS)
+    {
+        cmd.env_remove(var);
+    }
+    let out: Output = cmd.output().expect("failed to execute socket-patch binary");
 
     let code = out.status.code().unwrap_or(-1);
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();

@@ -1,8 +1,8 @@
 //! Flavor-agnostic npm vendoring pipeline: coordinate guards plus the shared
 //! stage→patch→pack steps.
 //!
-//! Every npm lockfile flavor (package-lock today; yarn-classic/pnpm/bun
-//! backends to come) vendors the same way up to the wiring: validate the
+//! Every npm lockfile flavor (package-lock, yarn-classic/berry, pnpm, bun)
+//! vendors the same way up to the wiring: validate the
 //! coordinates fail-closed, stage a private copy of the installed package in
 //! a tempdir OUTSIDE the project, prune nested `node_modules`, refuse
 //! bundled-deps packages, run the hardened apply pipeline against the stage,
@@ -12,25 +12,25 @@
 //! the project byte-untouched (a dry run stops after verification and
 //! creates nothing on disk).
 
-use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
 use crate::manifest::schema::PatchRecord;
-use crate::patch::apply::{
-    normalize_file_path, ApplyResult, PatchSources, VerifyResult, VerifyStatus,
-};
+use crate::patch::apply::{normalize_file_path, ApplyResult, PatchSources};
 use crate::patch::copy_tree::{fresh_copy, remove_tree};
 use crate::patch::package::read_archive_to_map;
 use crate::patch::path_safety;
 use crate::utils::fs::atomic_write_bytes;
 use crate::utils::purl::{percent_decode_purl_component, strip_purl_qualifiers};
 
+use super::common::{
+    already_patched_result, done, failed_result, refused, service_offline_conflict,
+};
 use super::npm_pack::{pack_deterministic, PackedTarball};
 use super::path::vendor_uuid_dir_rel;
 use super::service_fetch::{fetch_verified_archive, ServiceArtifact};
-use super::{VendorOutcome, VendorServiceConfig, VendorWarning};
+use super::{RevertOutcome, VendorOutcome, VendorServiceConfig, VendorWarning};
 
 /// Validated npm vendoring coordinates (the output of
 /// [`guard_coordinates`]). `name`/`version` are the percent-DECODED purl
@@ -94,6 +94,21 @@ pub(super) fn guard_coordinates(
     })
 }
 
+/// Validate a revert's patch uuid and return the `.socket/vendor/npm/<uuid>`
+/// dir it names.
+///
+/// SECURITY: the uuid comes from the committed, tamper-able state.json and
+/// names the directory tree revert is about to DELETE — validate through the
+/// same fail-closed grammar vendor used, before any disk access. `Err`
+/// carries the ready failure to bubble verbatim.
+pub(super) fn guard_revert_uuid_dir(uuid: &str) -> Result<String, RevertOutcome> {
+    vendor_uuid_dir_rel("npm", uuid).ok_or_else(|| {
+        RevertOutcome::failed(format!(
+            "refusing revert: `{uuid}` is not a canonical patch uuid (tampered state.json?)"
+        ))
+    })
+}
+
 /// The shared pipeline's product: a verified, deterministically packed
 /// tarball plus the facts the flavor wiring needs.
 pub(super) struct NpmStagedPack {
@@ -147,13 +162,10 @@ pub(super) async fn stage_patch_pack(
     // locally. A dry run previews the local build (no network). Per the
     // `auto`/`service` policy a non-fatal miss falls back to the local build
     // below; under `service` it fails closed.
+    if let Some(refusal) = service_offline_conflict(service) {
+        return Err(Box::new(refusal));
+    }
     if let Some(cfg) = service {
-        if cfg.source.requires_service() && cfg.offline {
-            return Err(Box::new(refused(
-                "vendor_service_offline_conflict",
-                "--vendor-source=service needs the network but --offline is set".to_string(),
-            )));
-        }
         if cfg.service_enabled() && !dry_run {
             match try_service_pack(purl, project_root, &coords, record, cfg, warnings).await {
                 ServicePackDecision::Used(pair) => return Ok(*pair),
@@ -195,7 +207,14 @@ pub(super) async fn stage_patch_pack(
     // dropped nested node_modules, repacking would produce a tarball npm
     // cannot satisfy those deps from. Refuse before patching.
     if let Ok(bytes) = tokio::fs::read(stage.join("package.json")).await {
-        if let Ok(pkg) = serde_json::from_slice::<Value>(&bytes) {
+        // npm and Node tolerate a leading UTF-8 BOM in package.json (and the
+        // crawler strips one, so a BOM'd install IS vendored), but serde_json
+        // rejects it — and a parse failure here fails OPEN, skipping the
+        // bundled-deps refusal below.
+        let text = String::from_utf8_lossy(&bytes);
+        if let Ok(pkg) =
+            serde_json::from_str::<Value>(crate::package_json::detect::strip_bom(&text))
+        {
             if declares_bundled_deps(&pkg) {
                 return Err(Box::new(refused(
                     "vendor_bundled_deps_unsupported",
@@ -233,20 +252,7 @@ pub(super) async fn stage_patch_pack(
     }
 
     // ── Pack the deterministic tarball ──────────────────────────────────
-    let rel_tgz = format!(
-        "{}/{}",
-        coords.uuid_dir_rel,
-        tgz_rel_leaf(&coords.name, &coords.version)
-    );
-    let dest = project_root.join(&rel_tgz);
-    if let Some(parent) = dest.parent() {
-        if let Err(e) = tokio::fs::create_dir_all(parent).await {
-            return Err(Box::new(done_failure(
-                purl,
-                format!("cannot create {}: {e}", parent.display()),
-            )));
-        }
-    }
+    let (rel_tgz, dest) = prepare_tgz_dest(purl, project_root, &coords).await?;
     let packed = match pack_deterministic(&stage, &dest).await {
         Ok(p) => p,
         Err(e) => {
@@ -309,7 +315,7 @@ async fn try_service_pack(
 ) -> ServicePackDecision {
     let hard_fail =
         |detail: String| ServicePackDecision::HardFail(Box::new(done_failure(purl, detail)));
-    match fetch_verified_archive(cfg, &record.uuid, &coords.name).await {
+    match fetch_verified_archive(cfg, &record.uuid).await {
         ServiceArtifact::Ready(archive) => {
             match staged_pack_from_service_bytes(
                 purl,
@@ -329,10 +335,13 @@ async fn try_service_pack(
                             coords.name, coords.version, archive.source_url
                         ),
                     ));
-                    let result = synthesized_service_result(
+                    // No local apply to verify — every patched file reads as
+                    // `AlreadyPatched` (trust is the service-verified
+                    // integrity).
+                    let result = already_patched_result(
                         purl,
                         &project_root.join(&staged.rel_tgz),
-                        record,
+                        &record.files,
                     );
                     ServicePackDecision::Used(Box::new((Some(staged), result)))
                 }
@@ -416,20 +425,7 @@ async fn staged_pack_from_service_bytes(
         )));
     }
 
-    let rel_tgz = format!(
-        "{}/{}",
-        coords.uuid_dir_rel,
-        tgz_rel_leaf(&coords.name, &coords.version)
-    );
-    let dest = project_root.join(&rel_tgz);
-    if let Some(parent) = dest.parent() {
-        if let Err(e) = tokio::fs::create_dir_all(parent).await {
-            return Err(Box::new(done_failure(
-                purl,
-                format!("cannot create {}: {e}", parent.display()),
-            )));
-        }
-    }
+    let (rel_tgz, dest) = prepare_tgz_dest(purl, project_root, coords).await?;
     if let Err(e) = atomic_write_bytes(&dest, bytes).await {
         return Err(Box::new(done_failure(
             purl,
@@ -475,36 +471,32 @@ async fn read_package_json_from_vendored_tgz(dest: &Path) -> Result<Value, Strin
         .map_err(|e| format!("vendored package.json is not parseable JSON: {e}"))
 }
 
-/// Synthesize a success [`ApplyResult`] for a service-downloaded package:
-/// there is no local apply to verify, so every patched file reads as
-/// `AlreadyPatched` (trust is the service-verified integrity). Mirrors the
-/// in-sync hot path's synthesized result.
-fn synthesized_service_result(purl: &str, dest: &Path, record: &PatchRecord) -> ApplyResult {
-    let files_verified = record
-        .files
-        .keys()
-        .map(|file| VerifyResult {
-            file: file.clone(),
-            status: VerifyStatus::AlreadyPatched,
-            message: None,
-            current_hash: None,
-            expected_hash: None,
-            target_hash: None,
-        })
-        .collect();
-    ApplyResult {
-        package_key: purl.to_string(),
-        package_path: dest.display().to_string(),
-        success: true,
-        files_verified,
-        files_patched: Vec::new(),
-        applied_via: HashMap::new(),
-        error: None,
-        sidecar: None,
-    }
-}
-
 // ───────────────────────────── small helpers ─────────────────────────────
+
+/// The artifact's project-relative path (`<uuid_dir>/<leaf>`) and absolute
+/// destination, with the destination's parent directories created. Shared by
+/// the local pack and the service download so the two paths cannot drift.
+async fn prepare_tgz_dest(
+    purl: &str,
+    project_root: &Path,
+    coords: &NpmCoords,
+) -> Result<(String, PathBuf), Box<VendorOutcome>> {
+    let rel_tgz = format!(
+        "{}/{}",
+        coords.uuid_dir_rel,
+        tgz_rel_leaf(&coords.name, &coords.version)
+    );
+    let dest = project_root.join(&rel_tgz);
+    if let Some(parent) = dest.parent() {
+        if let Err(e) = tokio::fs::create_dir_all(parent).await {
+            return Err(Box::new(done_failure(
+                purl,
+                format!("cannot create {}: {e}", parent.display()),
+            )));
+        }
+    }
+    Ok((rel_tgz, dest))
+}
 
 /// `pkg:npm/[@scope/]name@version` → `(name, version)`; scoped names keep
 /// the `@scope/` prefix. The LAST `@` separates the version (a leading
@@ -576,19 +568,11 @@ async fn read_staged_package_json(stage: &Path) -> Result<Value, String> {
         .map_err(|e| format!("patched package.json is not parseable JSON: {e}"))
 }
 
-pub(super) fn refused(code: &'static str, detail: String) -> VendorOutcome {
-    VendorOutcome::Refused { code, detail }
-}
-
 /// A backend failure after the refusal phase: `Done` with a failed
 /// synthesized [`ApplyResult`], mirroring `go_redirect`'s synthesized
 /// results.
 pub(super) fn done_failure(purl: &str, error: String) -> VendorOutcome {
-    VendorOutcome::Done {
-        result: super::failed_apply_result(purl, error),
-        entry: None,
-        warnings: Vec::new(),
-    }
+    done(failed_result(purl, Path::new(""), error), None, Vec::new())
 }
 
 #[cfg(test)]

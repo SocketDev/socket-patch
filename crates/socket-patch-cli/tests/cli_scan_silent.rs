@@ -301,6 +301,283 @@ async fn scan_silent_apply_flow_produces_no_output_but_still_applies() {
     );
 }
 
+/// A v3 package-lock with a single registry-resolved dependency, so the
+/// `--vendor` flow can rewire it to the vendored artifact (the npm vendor
+/// backend keys off lock entries).
+fn write_npm_lock(root: &Path) {
+    let lock = serde_json::json!({
+        "name": "scan-silent-test",
+        "version": "0.0.0",
+        "lockfileVersion": 3,
+        "requires": true,
+        "packages": {
+            "": {
+                "name": "scan-silent-test",
+                "version": "0.0.0",
+                "dependencies": { "silent-target": "^1.0.0" }
+            },
+            "node_modules/silent-target": {
+                "version": "1.0.0",
+                "resolved": "https://registry.npmjs.org/silent-target/-/silent-target-1.0.0.tgz",
+                "integrity": "sha512-orig==",
+                "license": "MIT"
+            }
+        }
+    });
+    let mut bytes = serde_json::to_vec_pretty(&lock).unwrap();
+    bytes.push(b'\n');
+    std::fs::write(root.join("package-lock.json"), bytes).unwrap();
+}
+
+/// Seed `.socket/manifest.json` with an entry for a package that is NOT
+/// installed, so a `--prune` pass has something to prune.
+fn seed_manifest_with_gone_entry(root: &Path) {
+    let socket = root.join(".socket");
+    std::fs::create_dir_all(&socket).unwrap();
+    let manifest = serde_json::json!({
+        "patches": {
+            "pkg:npm/gone@1.0.0": {
+                "uuid": "99999999-9999-4999-8999-999999999999",
+                "exportedAt": "2024-01-01T00:00:00Z",
+                "files": {
+                    "package/index.js": {
+                        "beforeHash": "0".repeat(64),
+                        "afterHash": "a".repeat(64),
+                    }
+                },
+                "vulnerabilities": {},
+                "description": "seed",
+                "license": "MIT",
+                "tier": "free",
+            }
+        }
+    });
+    std::fs::write(
+        socket.join("manifest.json"),
+        serde_json::to_string_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+}
+
+/// The vendored-mode GC line must honor `--silent` like the apply-mode one
+/// does: `scan --vendor --prune --silent --yes` prints nothing when it
+/// succeeds. Regression guard: `run_vendor_interactive_path` printed
+/// "GC: pruned N manifest entries." (and the vendored-revert GC line)
+/// unconditionally.
+#[tokio::test]
+async fn scan_vendor_silent_gc_prints_nothing() {
+    let purl = "pkg:npm/silent-target@1.0.0";
+    let before = b"before\n";
+
+    let mock = MockServer::start().await;
+    mount_one_patch_api(&mock, purl, before).await;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_root(tmp.path());
+    write_npm_lock(tmp.path());
+    write_npm_package(tmp.path(), "silent-target", "1.0.0", before);
+    seed_manifest_with_gone_entry(tmp.path());
+
+    let (code, stdout, stderr) = run_scan(
+        tmp.path(),
+        &[
+            "--vendor",
+            "--prune",
+            "--silent",
+            "--yes",
+            "--api-url",
+            &mock.uri(),
+            "--api-token",
+            "fake-token",
+            "--org",
+            ORG_SLUG,
+        ],
+    );
+    assert_eq!(
+        code, 0,
+        "scan --vendor --prune must succeed; stdout={stdout:?} stderr={stderr:?}"
+    );
+    assert!(
+        stdout.trim().is_empty(),
+        "--silent must produce no stdout (regression: the vendor path's \
+         GC line printed unconditionally); got {stdout:?}"
+    );
+    let chatter = stderr_chatter(&stderr);
+    assert!(
+        chatter.is_empty(),
+        "--silent must produce no stderr chatter on success; got {chatter:?}"
+    );
+
+    // Silent suppresses output, not the work: the prune and the vendoring
+    // both still happened.
+    let manifest =
+        std::fs::read_to_string(tmp.path().join(".socket/manifest.json")).expect("read manifest");
+    let v: serde_json::Value = serde_json::from_str(&manifest).expect("parse manifest");
+    assert!(
+        v["patches"]["pkg:npm/gone@1.0.0"].is_null(),
+        "the uninstalled entry must still be pruned under --silent: {v}"
+    );
+    assert_eq!(v["patches"][purl]["uuid"], UUID, "manifest={v}");
+    assert!(
+        tmp.path()
+            .join(format!(".socket/vendor/npm/{UUID}/silent-target-1.0.0.tgz"))
+            .is_file(),
+        "the package must still be vendored under --silent"
+    );
+
+    // Control run: the same scenario WITHOUT --silent must print the GC
+    // line — otherwise the assertions above pass vacuously.
+    let tmp2 = tempfile::tempdir().expect("tempdir");
+    write_root(tmp2.path());
+    write_npm_lock(tmp2.path());
+    write_npm_package(tmp2.path(), "silent-target", "1.0.0", before);
+    seed_manifest_with_gone_entry(tmp2.path());
+    let (loud_code, loud_stdout, loud_stderr) = run_scan(
+        tmp2.path(),
+        &[
+            "--vendor",
+            "--prune",
+            "--yes",
+            "--api-url",
+            &mock.uri(),
+            "--api-token",
+            "fake-token",
+            "--org",
+            ORG_SLUG,
+        ],
+    );
+    assert_eq!(
+        loud_code, 0,
+        "control run must succeed; stderr={loud_stderr:?}"
+    );
+    assert!(
+        loud_stdout.contains("GC: pruned 1 manifest entry."),
+        "non-silent vendor scan must print the GC line; got {loud_stdout:?}"
+    );
+}
+
+/// The embedded-VEX failure path must keep its error under `--silent`
+/// ("errors only", not "nothing"): a requested-but-failed `--vex` exits
+/// 1, and the failure message must still reach stderr. Regression
+/// guard: `embed_vex_human` gated its error print on `!silent`, so
+/// `scan --silent --vex out.json` failed with exit 1 and no output at
+/// all. Fully offline: the empty crawl short-circuits before the API,
+/// and the missing manifest makes VEX generation fail deterministically
+/// (`manifest_not_found`).
+#[test]
+fn scan_silent_vex_failure_keeps_error_output() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_root(tmp.path());
+    let vex_path = tmp.path().join("out.vex.json");
+    let vex_arg = vex_path.to_str().unwrap().to_string();
+
+    let (code, stdout, stderr) = run_scan(tmp.path(), &["--silent", "--vex", &vex_arg]);
+    assert_eq!(
+        code, 1,
+        "requested-but-failed VEX must exit 1; stdout={stdout:?} stderr={stderr:?}"
+    );
+    assert!(
+        stdout.trim().is_empty(),
+        "--silent must produce no stdout; got {stdout:?}"
+    );
+    assert!(
+        stderr.contains("VEX generation failed"),
+        "--silent must NOT suppress the VEX failure message; got {stderr:?}"
+    );
+
+    // Control run: the same failure WITHOUT --silent must print the same
+    // error — otherwise the assertion above could pass against a message
+    // that never prints for anyone.
+    let (loud_code, _, loud_stderr) = run_scan(tmp.path(), &["--vex", &vex_arg]);
+    assert_eq!(loud_code, 1);
+    assert!(
+        loud_stderr.contains("VEX generation failed"),
+        "non-silent VEX failure must print the error; got {loud_stderr:?}"
+    );
+}
+
+/// The redirect flow's embedded-VEX failure path must keep its error
+/// under `--silent` too ("errors only", not "nothing"): `scan --redirect
+/// --vex out.json --silent` with nothing to attest (the reference is
+/// forbidden, no manifest exists) exits 1, and the failure message must
+/// still reach stderr. Regression guard: `run_redirect` printed its
+/// `vex_error` inside the `!silent` human branch, so the run failed with
+/// exit 1 and no output at all — the same bug `embed_vex_human` already
+/// fixed on the non-redirect path (see
+/// `scan_silent_vex_failure_keeps_error_output` above).
+#[tokio::test]
+async fn scan_redirect_silent_vex_failure_keeps_error_output() {
+    let purl = "pkg:npm/silent-target@1.0.0";
+    let before = b"before\n";
+
+    let mock = MockServer::start().await;
+    mount_one_patch_api(&mock, purl, before).await;
+    // Reference endpoint: the patch exists but this org may not download
+    // it, so nothing is redirected and the requested VEX has no subject.
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/package")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "results": { UUID: { "status": "forbidden", "url": null, "purl": purl, "artifacts": [], "registryOverride": null } }
+        })))
+        .mount(&mock)
+        .await;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_root(tmp.path());
+    write_npm_package(tmp.path(), "silent-target", "1.0.0", before);
+    let vex_path = tmp.path().join("out.vex.json");
+    let vex_arg = vex_path.to_str().unwrap().to_string();
+
+    let args = |silent: bool| {
+        let mut v = vec!["--redirect", "--yes"];
+        if silent {
+            v.push("--silent");
+        }
+        v.extend_from_slice(&["--vex", &vex_arg, "--vex-product", "pkg:npm/consumer@0.0.0"]);
+        v
+    };
+
+    let base = [
+        "--api-url".to_string(),
+        mock.uri(),
+        "--api-token".to_string(),
+        "fake-token".to_string(),
+        "--org".to_string(),
+        ORG_SLUG.to_string(),
+    ];
+    let full: Vec<&str> = args(true)
+        .into_iter()
+        .chain(base.iter().map(String::as_str))
+        .collect();
+    let (code, stdout, stderr) = run_scan(tmp.path(), &full);
+    assert_eq!(
+        code, 1,
+        "requested-but-failed VEX must exit 1; stdout={stdout:?} stderr={stderr:?}"
+    );
+    assert!(
+        stdout.trim().is_empty(),
+        "--silent must produce no stdout; got {stdout:?}"
+    );
+    assert!(
+        stderr.contains("VEX generation failed"),
+        "--silent must NOT suppress the redirect VEX failure message; got {stderr:?}"
+    );
+
+    // Control run: the same failure WITHOUT --silent must print the same
+    // error — otherwise the assertion above could pass against a message
+    // that never prints for anyone.
+    let full_loud: Vec<&str> = args(false)
+        .into_iter()
+        .chain(base.iter().map(String::as_str))
+        .collect();
+    let (loud_code, _, loud_stderr) = run_scan(tmp.path(), &full_loud);
+    assert_eq!(loud_code, 1);
+    assert!(
+        loud_stderr.contains("VEX generation failed"),
+        "non-silent redirect VEX failure must print the error; got {loud_stderr:?}"
+    );
+}
+
 /// Errors must still print under `--silent` ("errors only", not
 /// "nothing"): when every API batch fails, the failure message keeps
 /// its stderr output and exit 1 — but the informational "Found N

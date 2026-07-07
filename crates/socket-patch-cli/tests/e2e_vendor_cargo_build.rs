@@ -1,4 +1,3 @@
-#![cfg(feature = "cargo")]
 //! Real-cargo capstone e2e for `socket-patch vendor` — the committability
 //! proof for the `[patch.crates-io]` + Cargo.lock-surgery wiring.
 //!

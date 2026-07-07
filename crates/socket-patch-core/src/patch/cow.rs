@@ -25,7 +25,7 @@
 //! `GetFileInformationByHandle` via `windows-sys` for full Windows
 //! parity.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// Outcome of [`break_hardlink_if_needed`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,6 +61,19 @@ pub async fn break_hardlink_if_needed(path: &Path) -> std::io::Result<CowAction>
     };
 
     if lstat.file_type().is_symlink() {
+        // Gate on the *target's* type before reading through the link:
+        // `read()` on a symlink to a FIFO blocks forever at `open(2)`
+        // waiting for a writer (the same hazard the hardlink branch
+        // guards against below), and a device target reads unbounded
+        // bytes. Non-regular targets are not cow's problem — leave the
+        // link untouched, matching the hardlink branch's treatment of
+        // non-regular inodes. `metadata` follows the link, so a
+        // dangling symlink still surfaces as the NotFound error the
+        // read-through used to produce.
+        let target_meta = tokio::fs::metadata(path).await?;
+        if !target_meta.is_file() {
+            return Ok(CowAction::AlreadyPrivate);
+        }
         // Read through the symlink (this DOES follow it) to grab the
         // current target content. We need it on disk as a regular
         // file at `path` so the patch write lands on our copy.
@@ -79,7 +92,8 @@ pub async fn break_hardlink_if_needed(path: &Path) -> std::io::Result<CowAction>
         // target, a crash), the original would be gone with nothing to
         // roll back to. The rename-over-symlink is a single atomic
         // step — on any failure `path` still holds the original link.
-        // This mirrors the hardlink branch below and `write_atomic`.
+        // This mirrors the hardlink branch below and the apply path's
+        // `utils::fs::atomic_write_bytes`.
         write_via_stage_rename(path, &target_bytes).await?;
         return Ok(CowAction::BrokeSymlink);
     }
@@ -110,14 +124,11 @@ pub async fn break_hardlink_if_needed(path: &Path) -> std::io::Result<CowAction>
 /// `path`. Cross-FS-safe because the stage lives in the same
 /// directory as the target, so `rename(2)` is intra-filesystem.
 async fn write_via_stage_rename(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    // Preconditions: cow callers always pass a real file path
-    // inside a package directory, so `path.parent()` and
-    // `path.file_name()` are guaranteed `Some`. The previous
-    // `unwrap_or_else` defaults only fired on `path == "/"`,
-    // which cow can never reach (lstat on "/" returns a directory,
-    // and the hardlink branch's `read("/")` errors out long
-    // before we get here). Using `.expect()` documents the
-    // invariant and eliminates the dead defensive default.
+    // Cow callers always pass a real file path inside a package
+    // directory, so `path.parent()` and `path.file_name()` are
+    // guaranteed `Some`: the only counterexample, `path == "/"`,
+    // is unreachable (lstat on "/" reports a directory, and the
+    // hardlink branch's `read("/")` errors long before we get here).
     let parent = path
         .parent()
         .expect("cow stage path always has a parent — callers pass package-internal files");
@@ -127,13 +138,13 @@ async fn write_via_stage_rename(path: &Path, bytes: &[u8]) -> std::io::Result<()
     // but defense in depth.)
     let stem = path
         .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .expect("cow stage path always has a file_name — callers pass package-internal files");
-    let stage: PathBuf = parent.join(format!(".socket-cow-{}-{}", stem, uuid::Uuid::new_v4()));
+        .expect("cow stage path always has a file_name — callers pass package-internal files")
+        .to_string_lossy();
+    let stage = parent.join(format!(".socket-cow-{}-{}", stem, uuid::Uuid::new_v4()));
     // Stage write. If this fails *after* creating the file (e.g. a
     // mid-write ENOSPC), the partial stage would otherwise leak as a
     // `.socket-cow-*` turd, so clean it up before propagating — same
-    // discipline as `apply::write_atomic`'s write arm.
+    // discipline as `utils::fs::atomic_write_bytes`'s write arm.
     if let Err(e) = tokio::fs::write(&stage, bytes).await {
         let _ = tokio::fs::remove_file(&stage).await;
         return Err(e);
@@ -381,6 +392,52 @@ mod tests {
         .expect("must not block reading the FIFO")
         .unwrap();
         assert_eq!(action, CowAction::AlreadyPrivate);
+        assert_eq!(leftover_stage_count(dir.path()), 0);
+    }
+
+    /// The symlink branch has the same FIFO hazard the hardlink branch
+    /// guards against: `read()` through a symlink whose target is a
+    /// FIFO blocks forever at `open(2)` waiting for a writer, hanging
+    /// the whole apply. A symlink to a non-regular inode is not cow's
+    /// problem — it must come back promptly as `AlreadyPrivate` with
+    /// the link untouched.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlink_to_fifo_is_not_routed_into_symlink_break() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("pipe");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let link = dir.path().join("pipe-link");
+        tokio::fs::symlink(&fifo, &link).await.unwrap();
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            break_hardlink_if_needed(&link),
+        )
+        .await;
+        // Rescue: if the code under test wrongly opened the FIFO for
+        // read, give it a writer + immediate EOF so the blocked pool
+        // thread can exit — otherwise a regression wedges the test
+        // binary at runtime shutdown instead of failing the asserts
+        // below. (O_RDWR on a FIFO never blocks; no-op when the code
+        // behaved.)
+        drop(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&fifo),
+        );
+        let action = result
+            .expect("must not block opening the FIFO through the symlink")
+            .unwrap();
+        assert_eq!(action, CowAction::AlreadyPrivate);
+        // The symlink itself must be left untouched.
+        let meta = tokio::fs::symlink_metadata(&link).await.unwrap();
+        assert!(meta.file_type().is_symlink());
         assert_eq!(leftover_stage_count(dir.path()), 0);
     }
 

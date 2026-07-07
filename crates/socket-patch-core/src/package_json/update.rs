@@ -1,71 +1,18 @@
 use std::path::Path;
 use tokio::fs;
 
-use super::detect::{
-    is_setup_configured_str, remove_package_json_content, update_package_json_content,
-    PackageManager,
-};
-
-/// Atomically write `content` to `path`.
-///
-/// A bare `fs::write` truncates the target before writing, so a crash, power
-/// loss, or interrupted process mid-write would leave the user's
-/// `package.json` truncated or empty — destroying the file we only meant to
-/// append two scripts to. Instead we write to a sibling stage file, fsync it,
-/// then rename over the target (rename is atomic on the same filesystem) so the
-/// reader ever sees either the old bytes or the complete new bytes. Mirrors the
-/// hardened writer in `manifest/operations.rs`.
-async fn atomic_write(path: &Path, content: &str) -> std::io::Result<()> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let stem = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "package.json".to_string());
-    let stage = parent.join(format!(".socket-stage-{}-{}", stem, uuid::Uuid::new_v4()));
-
-    let mut file = tokio::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&stage)
-        .await?;
-
-    use tokio::io::AsyncWriteExt;
-    if let Err(e) = file.write_all(content.as_bytes()).await {
-        let _ = tokio::fs::remove_file(&stage).await;
-        return Err(e);
-    }
-    if let Err(e) = file.sync_all().await {
-        let _ = tokio::fs::remove_file(&stage).await;
-        return Err(e);
-    }
-    drop(file);
-
-    if let Err(e) = tokio::fs::rename(&stage, path).await {
-        let _ = tokio::fs::remove_file(&stage).await;
-        return Err(e);
-    }
-
-    // The rename only updated the parent directory entry; fsync the directory
-    // so the rename itself survives a crash. Best-effort, Unix only.
-    #[cfg(unix)]
-    {
-        if let Ok(dir) = tokio::fs::File::open(parent).await {
-            let _ = dir.sync_all().await;
-        }
-    }
-
-    Ok(())
-}
+use super::detect::{remove_package_json_content, update_package_json_content, PackageManager};
+use crate::utils::fs::atomic_write_bytes_preserving_mode;
 
 /// Result of updating a single package.json.
 #[derive(Debug, Clone)]
 pub struct UpdateResult {
     pub path: String,
     pub status: UpdateStatus,
+    /// Previous `postinstall` script (empty if absent).
     pub old_script: String,
+    /// New `postinstall` script.
     pub new_script: String,
-    pub old_dependencies_script: String,
-    pub new_dependencies_script: String,
     pub error: Option<String>,
 }
 
@@ -92,49 +39,23 @@ pub async fn update_package_json(
                 status: UpdateStatus::Error,
                 old_script: String::new(),
                 new_script: String::new(),
-                old_dependencies_script: String::new(),
-                new_dependencies_script: String::new(),
                 error: Some(e.to_string()),
             };
         }
     };
 
-    let status = is_setup_configured_str(&content);
-    if !status.needs_update {
-        return UpdateResult {
-            path: path_str,
-            status: UpdateStatus::AlreadyConfigured,
-            old_script: status.postinstall_script.clone(),
-            new_script: status.postinstall_script,
-            old_dependencies_script: status.dependencies_script.clone(),
-            new_dependencies_script: status.dependencies_script,
-            error: None,
-        };
-    }
-
     match update_package_json_content(&content, pm) {
-        Ok((modified, new_content, old_pi, new_pi, old_dep, new_dep)) => {
-            if !modified {
-                return UpdateResult {
-                    path: path_str,
-                    status: UpdateStatus::AlreadyConfigured,
-                    old_script: old_pi,
-                    new_script: new_pi,
-                    old_dependencies_script: old_dep,
-                    new_dependencies_script: new_dep,
-                    error: None,
-                };
-            }
-
-            if !dry_run {
-                if let Err(e) = atomic_write(package_json_path, &new_content).await {
+        Ok((modified, new_content, old_pi, new_pi, _, _)) => {
+            if modified && !dry_run {
+                if let Err(e) =
+                    atomic_write_bytes_preserving_mode(package_json_path, new_content.as_bytes())
+                        .await
+                {
                     return UpdateResult {
                         path: path_str,
                         status: UpdateStatus::Error,
                         old_script: old_pi,
                         new_script: new_pi,
-                        old_dependencies_script: old_dep,
-                        new_dependencies_script: new_dep,
                         error: Some(e.to_string()),
                     };
                 }
@@ -142,11 +63,13 @@ pub async fn update_package_json(
 
             UpdateResult {
                 path: path_str,
-                status: UpdateStatus::Updated,
+                status: if modified {
+                    UpdateStatus::Updated
+                } else {
+                    UpdateStatus::AlreadyConfigured
+                },
                 old_script: old_pi,
                 new_script: new_pi,
-                old_dependencies_script: old_dep,
-                new_dependencies_script: new_dep,
                 error: None,
             }
         }
@@ -155,8 +78,6 @@ pub async fn update_package_json(
             status: UpdateStatus::Error,
             old_script: String::new(),
             new_script: String::new(),
-            old_dependencies_script: String::new(),
-            new_dependencies_script: String::new(),
             error: Some(e),
         },
     }
@@ -209,20 +130,11 @@ pub async fn remove_package_json(package_json_path: &Path, dry_run: bool) -> Rem
 
     match remove_package_json_content(&content) {
         Ok((modified, new_content, status)) => {
-            if !modified {
-                return RemoveResult {
-                    path: path_str,
-                    status: RemoveStatus::NotConfigured,
-                    old_script: status.old_postinstall,
-                    new_script: status.new_postinstall,
-                    old_dependencies_script: status.old_dependencies,
-                    new_dependencies_script: status.new_dependencies,
-                    error: None,
-                };
-            }
-
-            if !dry_run {
-                if let Err(e) = atomic_write(package_json_path, &new_content).await {
+            if modified && !dry_run {
+                if let Err(e) =
+                    atomic_write_bytes_preserving_mode(package_json_path, new_content.as_bytes())
+                        .await
+                {
                     return RemoveResult {
                         path: path_str,
                         status: RemoveStatus::Error,
@@ -237,7 +149,11 @@ pub async fn remove_package_json(package_json_path: &Path, dry_run: bool) -> Rem
 
             RemoveResult {
                 path: path_str,
-                status: RemoveStatus::Removed,
+                status: if modified {
+                    RemoveStatus::Removed
+                } else {
+                    RemoveStatus::NotConfigured
+                },
                 old_script: status.old_postinstall,
                 new_script: status.new_postinstall,
                 old_dependencies_script: status.old_dependencies,
@@ -589,6 +505,59 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert_eq!(parsed["scripts"]["build"], "tsc");
         assert!(!content.contains("socket-patch"));
+    }
+
+    /// The stage+rename write swaps in a fresh inode, so unless the writer
+    /// re-applies the destination's permission bits, an edit resets the
+    /// user's package.json mode to umask defaults (typically 0644): a 0600
+    /// user-private manifest silently becomes world-readable, and a 0664
+    /// group-writable one locks the group out. npm's own write-file-atomic
+    /// preserves mode on package.json edits; so must we. (The 0744 file
+    /// makes this red under any umask — a 0666-based create can never
+    /// produce an exec bit.)
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_update_preserves_file_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        for mode in [0o600u32, 0o744] {
+            let pkg = dir.path().join(format!("pkg-{mode:o}.json"));
+            fs::write(&pkg, r#"{"name":"x","scripts":{"build":"tsc"}}"#)
+                .await
+                .unwrap();
+            std::fs::set_permissions(&pkg, std::fs::Permissions::from_mode(mode)).unwrap();
+
+            let result = update_package_json(&pkg, false, PackageManager::Npm).await;
+            assert_eq!(result.status, UpdateStatus::Updated, "mode {mode:o}");
+            let got = std::fs::metadata(&pkg).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                got, mode,
+                "update must preserve the package.json mode, got {got:o} for {mode:o}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_remove_preserves_file_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        for mode in [0o600u32, 0o744] {
+            let pkg = dir.path().join(format!("pkg-{mode:o}.json"));
+            fs::write(&pkg, r#"{"name":"x","scripts":{"build":"tsc"}}"#)
+                .await
+                .unwrap();
+            update_package_json(&pkg, false, PackageManager::Npm).await;
+            std::fs::set_permissions(&pkg, std::fs::Permissions::from_mode(mode)).unwrap();
+
+            let result = remove_package_json(&pkg, false).await;
+            assert_eq!(result.status, RemoveStatus::Removed, "mode {mode:o}");
+            let got = std::fs::metadata(&pkg).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                got, mode,
+                "remove must preserve the package.json mode, got {got:o} for {mode:o}"
+            );
+        }
     }
 
     /// A dry-run must never create a stage file either — it does no I/O at all.

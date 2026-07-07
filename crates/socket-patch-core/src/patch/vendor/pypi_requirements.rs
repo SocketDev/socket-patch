@@ -11,29 +11,26 @@
 //!
 //! Logical-line model: physical lines join on a trailing `\`; comments start
 //! at a `#` preceded by whitespace (or column 0) outside that. The dominant
-//! newline style is preserved (mirroring `pth_hook/edit.rs`).
+//! newline style is preserved.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
-use crate::utils::fs::atomic_write_bytes;
+use crate::utils::fs::atomic_write_bytes_preserving_mode;
 
+use super::common::detect_eol;
 use super::state::{VendorEntry, WiringAction, WiringRecord};
 use super::{RevertOutcome, VendorWarning};
 
 /// Classification of the target package within the requirements tree.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PinSearch {
+#[derive(Debug, PartialEq, Eq)]
+enum PinSearch {
     /// A clean `name==version` pin (no extras). `line_start` / `line_count`
     /// span the PHYSICAL lines (0-based) of the first matching logical line.
     Exact {
         line_start: usize,
         line_count: usize,
-        /// Always `None` today — pins WITH extras classify as [`PinSearch::Extras`];
-        /// the field is kept so the span type can carry them if extras
-        /// rewriting is ever supported.
-        extras: Option<String>,
         /// The environment marker verbatim (text after `;`), to carry over.
         marker: Option<String>,
         /// The pin carries `--hash` options (informational; the rewrite
@@ -50,13 +47,18 @@ pub enum PinSearch {
     Absent,
 }
 
-/// Find the target pin in one file's content. Precedence is fail-closed:
-/// any extras occurrence wins over any non-pin occurrence wins over a clean
-/// exact pin — a file that names the package ambiguously is never rewritten.
-pub fn find_pin(content: &str, canon_name: &str, version: &str) -> PinSearch {
+/// One clean exact pin occurrence: `(line_start, line_count, marker, hashed)`
+/// — the PHYSICAL-line span (0-based) of the logical line, the environment
+/// marker to carry over, and whether the pin carried `--hash` options.
+type PinSpan = (usize, usize, Option<String>, bool);
+
+/// Scan one file for the target package: every clean exact
+/// `canon_name==version` pin, plus whether any occurrence carries extras or
+/// a non-exact specifier.
+fn scan_pins(content: &str, canon_name: &str, version: &str) -> (Vec<PinSpan>, bool, bool) {
+    let mut exact = Vec::new();
     let mut found_extras = false;
     let mut found_range = false;
-    let mut exact: Option<PinSearch> = None;
     for ll in logical_lines(content) {
         let Some(req) = parse_requirement_line(&ll.text) else {
             continue;
@@ -74,44 +76,106 @@ pub fn find_pin(content: &str, canon_name: &str, version: &str) -> PinSearch {
             .filter(|c| !c.is_whitespace())
             .collect();
         if spec_no_ws == format!("=={version}") {
-            if exact.is_none() {
-                exact = Some(PinSearch::Exact {
-                    line_start: ll.start,
-                    line_count: ll.physical.len(),
-                    extras: None,
-                    marker: req.marker,
-                    hashed: req.hashed,
-                });
-            }
+            exact.push((ll.start, ll.physical.len(), req.marker, req.hashed));
         } else {
             found_range = true;
         }
     }
+    (exact, found_extras, found_range)
+}
+
+/// Find the target pin in one file's content. Precedence is fail-closed:
+/// any extras occurrence wins over any non-pin occurrence wins over a clean
+/// exact pin — a file that names the package ambiguously is never rewritten.
+fn find_pin(content: &str, canon_name: &str, version: &str) -> PinSearch {
+    let (exact, found_extras, found_range) = scan_pins(content, canon_name, version);
     if found_extras {
         return PinSearch::Extras;
     }
     if found_range {
         return PinSearch::Range;
     }
-    exact.unwrap_or(PinSearch::Absent)
+    match exact.into_iter().next() {
+        Some((line_start, line_count, marker, hashed)) => PinSearch::Exact {
+            line_start,
+            line_count,
+            marker,
+            hashed,
+        },
+        None => PinSearch::Absent,
+    }
+}
+
+/// Pre-flight verdict: wire fresh, or the files are already wired to this
+/// exact patch generation (mirrors `UvTarget` / `PoetryTarget`).
+pub(super) enum RequirementsTarget {
+    Fresh,
+    InSync,
 }
 
 /// Pre-flight the wiring without writing — the orchestrator runs this before
 /// building the wheel so every refusal happens with the tree byte-untouched.
+///
+/// A file already carrying a socket vendor line for this package
+/// short-circuits the plan: at the SAME patch uuid it is our own first-run
+/// edit (in sync — the artifact-only rebuild path handles a deleted wheel);
+/// at a DIFFERENT uuid it refuses — appending a second wheel line would
+/// leave pip two competing requirements, and the new ledger entry would
+/// clobber the old one's record, orphaning its line.
 pub(super) async fn preflight_requirements(
     root: &Path,
     canon_name: &str,
     version: &str,
-) -> Result<(), (&'static str, String)> {
+    record_uuid: &str,
+) -> Result<RequirementsTarget, (&'static str, String)> {
+    let files = collect_requirements_files(root).await?;
+    for file in &files {
+        if let Some(found) = vendored_uuid_for(&file.content, canon_name) {
+            if found == record_uuid {
+                return Ok(RequirementsTarget::InSync);
+            }
+            return Err((
+                "pypi_requirements_already_vendored",
+                format!(
+                    "{}: already routes {canon_name} to the socket-patch vendored wheel for \
+                     patch {found}; run `socket-patch vendor --revert` before re-vendoring",
+                    file.rel
+                ),
+            ));
+        }
+    }
     plan_requirements(root, canon_name, version, "", "")
         .await
-        .map(|_| ())
+        .map(|_| RequirementsTarget::Fresh)
+}
+
+/// Find a socket vendor line for `canon_name` in one file's content and
+/// return the patch uuid its wheel path names. Matches the exact shape
+/// [`vendor_line`] writes: a wheel-path token plus the
+/// `# socket-patch vendor: <name>==<version>` comment tag.
+fn vendored_uuid_for(content: &str, canon_name: &str) -> Option<String> {
+    for line in content.lines() {
+        let trimmed = line.trim();
+        let Some((_, tag)) = trimmed.split_once("# socket-patch vendor: ") else {
+            continue;
+        };
+        if !tag.starts_with(canon_name) || !tag[canon_name.len()..].starts_with("==") {
+            continue;
+        }
+        let token = trimmed.split_whitespace().next().unwrap_or("");
+        if let Some(parts) = super::path::parse_vendor_path(token) {
+            if parts.eco == "pypi" {
+                return Some(parts.uuid);
+            }
+        }
+    }
+    None
 }
 
 /// Rewrite every exact pin across the root `requirements.txt` and its `-r`
 /// includes (or append a managed transitive line at the root EOF when the
 /// package is absent). Returns the wiring records in application order.
-pub async fn wire_requirements(
+pub(super) async fn wire_requirements(
     root: &Path,
     canon_name: &str,
     version: &str,
@@ -120,15 +184,28 @@ pub async fn wire_requirements(
 ) -> Result<Vec<WiringRecord>, (&'static str, String)> {
     let plan = plan_requirements(root, canon_name, version, rel_wheel, wheel_sha256_hex).await?;
     let mut wiring = Vec::new();
+    let mut written: Vec<&PlannedFile> = Vec::new();
     for file in &plan {
-        atomic_write_bytes(&root.join(&file.rel), file.new_content.as_bytes())
-            .await
-            .map_err(|e| {
-                (
-                    "pypi_requirements_write_failed",
-                    format!("cannot write {}: {e}", file.rel),
+        if let Err(e) =
+            atomic_write_bytes_preserving_mode(&root.join(&file.rel), file.new_content.as_bytes())
+                .await
+        {
+            // Unwind: the orchestrator sweeps the wheel dir on a wiring
+            // error, so a surviving half-wired file would reference a
+            // deleted artifact — with no ledger entry recorded to revert it.
+            for w in written.iter().rev() {
+                let _ = atomic_write_bytes_preserving_mode(
+                    &root.join(&w.rel),
+                    w.original_content.as_bytes(),
                 )
-            })?;
+                .await;
+            }
+            return Err((
+                "pypi_requirements_write_failed",
+                format!("cannot write {}: {e}", file.rel),
+            ));
+        }
+        written.push(file);
         wiring.extend(file.records.iter().cloned());
     }
     Ok(wiring)
@@ -139,7 +216,11 @@ pub async fn wire_requirements(
 /// what vendor wrote are left alone with `vendor_revert_line_drifted`; any
 /// surviving reference to the vendored uuid dir afterwards raises
 /// `vendor_revert_residual_reference`.
-pub async fn revert_requirements(entry: &VendorEntry, root: &Path, dry_run: bool) -> RevertOutcome {
+pub(super) async fn revert_requirements(
+    entry: &VendorEntry,
+    root: &Path,
+    dry_run: bool,
+) -> RevertOutcome {
     let mut warnings: Vec<VendorWarning> = Vec::new();
 
     // Group records per file, preserving application order within each.
@@ -185,7 +266,7 @@ pub async fn revert_requirements(entry: &VendorEntry, root: &Path, dry_run: bool
                 return RevertOutcome::failed(format!("cannot read {file}: {e}"));
             }
         };
-        let nl = newline_of(&content);
+        let nl = detect_eol(&content);
         let had_trailing_newline = content.ends_with('\n');
         let mut lines: Vec<String> = content.lines().map(str::to_string).collect();
 
@@ -230,7 +311,9 @@ pub async fn revert_requirements(entry: &VendorEntry, root: &Path, dry_run: bool
 
     if !dry_run {
         for (file, content) in &reverted {
-            if let Err(e) = atomic_write_bytes(&root.join(file), content.as_bytes()).await {
+            if let Err(e) =
+                atomic_write_bytes_preserving_mode(&root.join(file), content.as_bytes()).await
+            {
                 return RevertOutcome {
                     success: false,
                     warnings,
@@ -274,6 +357,9 @@ fn drift_warning(file: &str, rec: &WiringRecord) -> VendorWarning {
 struct PlannedFile {
     /// Root-relative, forward-slashed path.
     rel: String,
+    /// The pre-edit content, kept so a multi-file write that fails partway
+    /// can restore the files already written.
+    original_content: String,
     new_content: String,
     records: Vec<WiringRecord>,
 }
@@ -342,31 +428,15 @@ async fn plan_requirements(
 
         // Rewrite EVERY exact-pin occurrence in this file, bottom-up so the
         // recorded spans (against the original content) stay valid.
-        let mut spans: Vec<(usize, usize, Option<String>)> = Vec::new();
-        for ll in logical_lines(&file.content) {
-            let Some(req) = parse_requirement_line(&ll.text) else {
-                continue;
-            };
-            if canonicalize_pypi_name(&req.name) != canon_name || req.extras.is_some() {
-                continue;
-            }
-            let spec: String = req
-                .specifier
-                .chars()
-                .filter(|c| !c.is_whitespace())
-                .collect();
-            if spec == format!("=={version}") {
-                spans.push((ll.start, ll.physical.len(), req.marker));
-            }
-        }
+        let (spans, _, _) = scan_pins(&file.content, canon_name, version);
         if spans.is_empty() {
             continue;
         }
-        let nl = newline_of(&file.content);
+        let nl = detect_eol(&file.content);
         let original_lines: Vec<String> = file.content.lines().map(str::to_string).collect();
         let mut lines = original_lines.clone();
         let mut records = Vec::new();
-        for (start, count, marker) in spans.iter().rev() {
+        for (start, count, marker, _) in spans.iter().rev() {
             let line = vendor_line(
                 rel_wheel,
                 wheel_sha256_hex,
@@ -398,6 +468,7 @@ async fn plan_requirements(
         }
         planned.push(PlannedFile {
             rel: file.rel.clone(),
+            original_content: file.content.clone(),
             new_content,
             records,
         });
@@ -419,7 +490,7 @@ async fn plan_requirements(
             &None,
             true,
         );
-        let nl = newline_of(&root_file.content);
+        let nl = detect_eol(&root_file.content);
         let mut new_content = root_file.content.clone();
         if !new_content.is_empty() && !new_content.ends_with('\n') {
             new_content.push_str(nl);
@@ -428,6 +499,7 @@ async fn plan_requirements(
         new_content.push_str(nl);
         planned.push(PlannedFile {
             rel: root_file.rel.clone(),
+            original_content: root_file.content.clone(),
             new_content,
             records: vec![WiringRecord {
                 file: root_file.rel.clone(),
@@ -489,7 +561,10 @@ async fn collect_requirements_files(root: &Path) -> Result<Vec<ReqFile>, (&'stat
             // see inside it. Skip.
             continue;
         };
-        let editable = !rel.starts_with("../");
+        // Out-of-root (`../`) and absolute includes resolve outside any
+        // committable root — readable so a pin inside can refuse, never
+        // editable. (`Path::join` passes an absolute `rel` through verbatim.)
+        let editable = !rel.starts_with("../") && !Path::new(&rel).is_absolute();
         let include_dir = match rel.rfind('/') {
             Some(i) => rel[..i].to_string(),
             None => String::new(),
@@ -532,11 +607,13 @@ fn include_target(text: &str) -> Option<&str> {
 }
 
 /// Lexically normalize a relative path (`a/../b` → `b`); escapes above the
-/// root keep their `../` prefix so the caller can spot out-of-root includes.
+/// root keep their `../` prefix and absolute paths keep their leading `/`,
+/// so the caller can spot out-of-root includes.
 fn normalize_rel_path(path: &str) -> String {
     let mut stack: Vec<&str> = Vec::new();
     let mut leading_parents = 0usize;
     let normalized = path.replace('\\', "/");
+    let absolute = normalized.starts_with('/');
     for comp in normalized.split('/') {
         match comp {
             "" | "." => {}
@@ -551,6 +628,9 @@ fn normalize_rel_path(path: &str) -> String {
         }
     }
     let mut out = String::new();
+    if absolute {
+        out.push('/');
+    }
     for _ in 0..leading_parents {
         out.push_str("../");
     }
@@ -576,7 +656,12 @@ fn logical_lines(content: &str) -> Vec<LogicalLine> {
     while i < lines.len() {
         let start = i;
         let mut physical = vec![lines[i].to_string()];
-        while lines[i].trim_end().ends_with('\\') && i + 1 < lines.len() {
+        // pip's join_lines never continues a comment line: `# ...\` is a
+        // complete comment, not a continuation of the next line.
+        while lines[i].trim_end().ends_with('\\')
+            && !lines[i].trim_start().starts_with('#')
+            && i + 1 < lines.len()
+        {
             i += 1;
             physical.push(lines[i].to_string());
         }
@@ -666,15 +751,6 @@ fn parse_requirement_line(text: &str) -> Option<ParsedRequirement> {
     })
 }
 
-/// The file's dominant newline style (mirrors `pth_hook/edit.rs`).
-fn newline_of(content: &str) -> &'static str {
-    if content.contains("\r\n") {
-        "\r\n"
-    } else {
-        "\n"
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -761,13 +837,11 @@ mod tests {
             PinSearch::Exact {
                 line_start,
                 line_count,
-                extras,
                 marker,
                 hashed,
             } => {
                 assert_eq!(line_start, 1);
                 assert_eq!(line_count, 1);
-                assert_eq!(extras, None);
                 assert_eq!(marker.as_deref(), Some("python_version >= \"3.8\""));
                 assert!(hashed);
             }
@@ -926,6 +1000,139 @@ mod tests {
                 .await
                 .unwrap(),
             "six==1.16.0\n"
+        );
+    }
+
+    /// Multi-file wiring is transactional: when the write to the SECOND
+    /// planned file fails, the already-written first file is restored. The
+    /// orchestrator sweeps the wheel dir on a wiring error, so a surviving
+    /// half-wired file would reference a deleted artifact — with no ledger
+    /// entry recorded to revert it. (wire_uv rolls its pyproject write back
+    /// the same way when the lock write fails.)
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wire_failure_rolls_back_already_written_files() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let original_root = "six==1.16.0\n-r deps/pinned.txt\n";
+        let tmp = write_root(original_root).await;
+        tokio::fs::create_dir_all(tmp.path().join("deps"))
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.path().join("deps/pinned.txt"), "six==1.16.0\n")
+            .await
+            .unwrap();
+        // Read-only include dir: planning READS it fine, the atomic write
+        // (temp file in the same dir) fails. Root is planned/written first.
+        let deps = tmp.path().join("deps");
+        let mut perms = std::fs::metadata(&deps).unwrap().permissions();
+        perms.set_mode(0o555);
+        std::fs::set_permissions(&deps, perms.clone()).unwrap();
+
+        let err = wire_requirements(tmp.path(), "six", "1.16.0", REL_WHEEL, SHA)
+            .await
+            .unwrap_err();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&deps, perms).unwrap();
+        assert_eq!(err.0, "pypi_requirements_write_failed");
+        assert_eq!(
+            read_root(tmp.path()).await,
+            original_root,
+            "the already-written root must be rolled back on a later write failure"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(tmp.path().join("deps/pinned.txt"))
+                .await
+                .unwrap(),
+            "six==1.16.0\n"
+        );
+    }
+
+    /// Wire and revert both rewrite requirements files in place; a committed
+    /// file's mode (e.g. group-readable 0o640 under a strict umask) must
+    /// survive both. The plain atomic writer swaps in a fresh umask-default
+    /// inode — same class as the npm/pipenv lockfile mode resets.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wire_and_revert_preserve_requirements_file_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = write_root("six==1.16.0\n").await;
+        let path = tmp.path().join("requirements.txt");
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o640);
+        std::fs::set_permissions(&path, perms).unwrap();
+
+        let wiring = wire_requirements(tmp.path(), "six", "1.16.0", REL_WHEEL, SHA)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o640,
+            "wire must preserve the file mode"
+        );
+
+        let outcome = revert_requirements(&entry_for(wiring), tmp.path(), false).await;
+        assert!(outcome.success);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o640,
+            "revert must preserve the file mode"
+        );
+    }
+
+    /// pip's join_lines never treats a comment line ending in `\` as a
+    /// continuation (COMMENT_RE guard) — the pin on the next physical line is
+    /// a real requirement. Swallowing it into the comment classifies the
+    /// package as absent, and the appended duplicate makes
+    /// `pip install -r requirements.txt` fail with a double requirement.
+    #[tokio::test]
+    async fn comment_ending_in_backslash_does_not_swallow_the_next_line() {
+        let tmp = write_root("# vendored from C:\\deps\\\nsix==1.16.0\n").await;
+        let wiring = wire_requirements(tmp.path(), "six", "1.16.0", REL_WHEEL, SHA)
+            .await
+            .unwrap();
+        assert_eq!(wiring.len(), 1);
+        assert_eq!(
+            wiring[0].action,
+            WiringAction::Rewritten,
+            "the pin below the comment must be rewritten in place, not duplicated"
+        );
+        assert_eq!(
+            read_root(tmp.path()).await,
+            format!("# vendored from C:\\deps\\\n{}\n", expected_line())
+        );
+    }
+
+    /// An absolute `-r /abs/path.txt` include resolves outside any committable
+    /// root; a pin there must refuse exactly like a `../` include. Mangling it
+    /// into an in-root relative path silently skips the file pip *can* read,
+    /// and the transitive line appended at the root EOF gives pip a "double
+    /// requirement" error.
+    #[tokio::test]
+    async fn pin_in_absolute_include_refuses() {
+        let outer = tempfile::tempdir().unwrap();
+        let root = outer.path().join("project");
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let shared = outer.path().join("shared.txt");
+        tokio::fs::write(&shared, "six==1.16.0\n").await.unwrap();
+        let root_content = format!("-r {}\n", shared.display());
+        tokio::fs::write(root.join("requirements.txt"), &root_content)
+            .await
+            .unwrap();
+        let err = wire_requirements(&root, "six", "1.16.0", REL_WHEEL, SHA)
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, "pypi_requirements_outside_root");
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("requirements.txt"))
+                .await
+                .unwrap(),
+            root_content,
+            "refusal leaves the root untouched"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(&shared).await.unwrap(),
+            "six==1.16.0\n",
+            "the absolute include is never edited"
         );
     }
 

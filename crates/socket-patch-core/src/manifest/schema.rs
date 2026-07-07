@@ -1,21 +1,6 @@
-use serde::{Deserialize, Serialize, Serializer};
-use std::collections::{BTreeMap, HashMap};
-
-/// Serialize a `HashMap` with its keys in sorted order so the emitted JSON is
-/// deterministic across runs. The manifest is persisted as `.socket/manifest.json`
-/// and committed to git; `HashMap`'s randomized iteration order would otherwise
-/// re-shuffle the keys on every write, producing spurious diffs and merge
-/// conflicts. This mirrors the `BTreeMap` choice in `vex::schema`, which the
-/// project made for the same "easier diffing across runs" reason. The public
-/// field type stays `HashMap` (so callers and deserialization are unaffected);
-/// only the on-the-wire ordering is pinned.
-fn serialize_sorted<S, V>(map: &HashMap<String, V>, serializer: S) -> Result<S::Ok, S::Error>
-where
-    S: Serializer,
-    V: Serialize,
-{
-    map.iter().collect::<BTreeMap<_, _>>().serialize(serializer)
-}
+use crate::utils::serde::serialize_sorted;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// Information about a vulnerability fixed by a patch.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -71,7 +56,7 @@ pub struct SetupConfig {
 
 impl SetupConfig {
     /// Whether this carries no setup state (so the manifest can omit the key).
-    pub fn is_empty(&self) -> bool {
+    fn is_empty(&self) -> bool {
         self.exclude.is_empty() && self.manual.is_empty()
     }
 }
@@ -88,7 +73,7 @@ fn setup_is_absent(setup: &Option<SetupConfig>) -> bool {
 
 /// The top-level patch manifest structure.
 /// Stored as `.socket/manifest.json`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct PatchManifest {
     /// Maps package PURL (e.g., "pkg:npm/lodash@4.17.21") -> patch record.
     #[serde(serialize_with = "serialize_sorted")]
@@ -104,16 +89,7 @@ pub struct PatchManifest {
 impl PatchManifest {
     /// Create an empty manifest.
     pub fn new() -> Self {
-        Self {
-            patches: HashMap::new(),
-            setup: None,
-        }
-    }
-}
-
-impl Default for PatchManifest {
-    fn default() -> Self {
-        Self::new()
+        Self::default()
     }
 }
 

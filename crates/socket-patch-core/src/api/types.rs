@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use crate::patch::redirect::{Integrity, RegistryOverride};
+
 /// Organization info returned by the `/v0/organizations` endpoint.
 #[derive(Debug, Clone, Deserialize)]
 pub struct OrganizationInfo {
@@ -101,7 +103,7 @@ pub struct BatchSearchResponse {
 /// download URLs + integrity. The public proxy forces `free_only`.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct PackageVendorRequest {
+pub(crate) struct PackageVendorRequest {
     pub uuids: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub free_only: Option<bool>,
@@ -110,12 +112,13 @@ pub struct PackageVendorRequest {
 /// Response from the package-vendor endpoint: one result per requested UUID,
 /// keyed by the UUID string.
 #[derive(Debug, Clone, Deserialize)]
-pub struct PackageVendorResponse {
+pub(crate) struct PackageVendorResponse {
     pub results: HashMap<String, PackageVendorResult>,
 }
 
 /// One package-vendor result. `status` is the discriminator; `url` / `purl` /
-/// `artifacts` are populated only for `granted` / `reused`.
+/// `artifacts` / `registry_override` are populated only for `granted` /
+/// `reused`.
 ///
 /// `status` values: `granted` | `reused` | `pending_build` | `build_failed`
 /// | `withdrawn` | `forbidden` | `not_found`.
@@ -129,6 +132,10 @@ pub struct PackageVendorResult {
     pub purl: Option<String>,
     #[serde(default)]
     pub artifacts: Option<Vec<PackageVendorArtifact>>,
+    /// Per-ecosystem registry override that `scan --redirect` turns into a
+    /// `DepOverride`.
+    #[serde(default)]
+    pub registry_override: Option<RegistryOverride>,
 }
 
 /// One served artifact: the native tarball (`kind: "tarball"`), or a
@@ -141,31 +148,12 @@ pub struct PackageVendorArtifact {
     pub kind: String,
     #[serde(default)]
     pub url: Option<String>,
+    /// Every ecosystem's tarball populates `sha512` (npm SRI form
+    /// `sha512-<b64>`) + `sha1` + `md5`; golang additionally `dirhash_h1`
+    /// (`h1:<b64>`); the npm yarn-berry zip carries only `yarn_berry10c0`
+    /// (`10c0/<sha512-hex>`). No ecosystem exposes a plain sha256.
     #[serde(default)]
-    pub content_type: Option<String>,
-    #[serde(default)]
-    pub size_bytes: Option<u64>,
-    #[serde(default)]
-    pub integrity: PackageVendorIntegrity,
-}
-
-/// Per-artifact integrity hashes. Every ecosystem's tarball populates `sha512`
-/// (npm SRI form `sha512-<b64>`) + `sha1` + `md5`; golang additionally
-/// `dirhash_h1` (`h1:<b64>`); the npm yarn-berry zip carries only
-/// `yarn_berry10c0` (`10c0/<sha512-hex>`). No ecosystem exposes a plain sha256.
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PackageVendorIntegrity {
-    #[serde(default)]
-    pub sha512: Option<String>,
-    #[serde(default)]
-    pub sha1: Option<String>,
-    #[serde(default)]
-    pub md5: Option<String>,
-    #[serde(default)]
-    pub dirhash_h1: Option<String>,
-    #[serde(default)]
-    pub yarn_berry10c0: Option<String>,
+    pub integrity: Integrity,
 }
 
 #[cfg(test)]

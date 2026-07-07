@@ -23,19 +23,15 @@
 //!
 //! All ecosystems return a [`SidecarRecord`] via [`dispatch_fixup`].
 //! The record is the canonical JSON-envelope shape — see
-//! [`types`] for field documentation and stability guarantees.
+//! [`SidecarRecord`] for field documentation and stability guarantees.
 
-use std::collections::HashMap;
 use std::path::Path;
 
 use crate::crawlers::Ecosystem;
-use crate::manifest::schema::PatchFileInfo;
 
-#[cfg(feature = "cargo")]
 pub(crate) mod cargo;
-#[cfg(feature = "nuget")]
 pub(crate) mod nuget;
-pub mod types;
+mod types;
 
 pub use types::{
     SidecarAdvisory, SidecarAdvisoryCode, SidecarFile, SidecarFileAction, SidecarRecord,
@@ -71,7 +67,7 @@ pub enum SidecarError {
 
 /// Helper for advisory-only ecosystems (PyPI / gem / Go) — builds a
 /// payload with no touched files and a single structured advisory.
-pub(crate) fn advisory_only_payload(
+fn advisory_only_payload(
     code: SidecarAdvisoryCode,
     severity: SidecarSeverity,
     message: &str,
@@ -82,6 +78,26 @@ pub(crate) fn advisory_only_payload(
             code,
             severity,
             message: message.to_string(),
+        }),
+    }
+}
+
+/// Uniform `Error`-severity record for a fixup/resync that raised.
+/// Both apply's and rollback's best-effort boundaries convert a
+/// [`SidecarError`] into this shape (empty `files`, advisory code
+/// `sidecar_fixup_failed`) so consumers see the same JSON regardless
+/// of direction; only the message differs.
+pub(crate) fn fixup_failed_record(package_key: &str, message: String) -> SidecarRecord {
+    SidecarRecord {
+        purl: package_key.to_string(),
+        ecosystem: Ecosystem::from_purl(package_key)
+            .map(|eco| eco.cli_name().to_string())
+            .unwrap_or_else(|| "unknown".to_string()),
+        files: Vec::new(),
+        advisory: Some(SidecarAdvisory {
+            code: SidecarAdvisoryCode::SidecarFixupFailed,
+            severity: SidecarSeverity::Error,
+            message,
         }),
     }
 }
@@ -101,28 +117,22 @@ pub(crate) fn advisory_only_payload(
 /// files_patched`) plus any verified `AlreadyPatched` — an earlier
 /// apply that failed partway wrote those but never reached this
 /// boundary, so their sidecar entries are still stale and the retry
-/// must resync them. `files` is reserved for future use (currently
-/// unread).
-#[allow(unused_variables)] // `pkg_path` is feature-gated below
+/// must resync them.
 pub async fn dispatch_fixup(
     package_key: &str,
     pkg_path: &Path,
     patched: &[String],
-    _files: &HashMap<String, PatchFileInfo>,
 ) -> Result<Option<SidecarRecord>, SidecarError> {
     if patched.is_empty() {
         return Ok(None);
     }
 
-    let ecosystem = match Ecosystem::from_purl(package_key) {
-        Some(eco) => eco,
-        None => return Ok(None),
+    let Some(ecosystem) = Ecosystem::from_purl(package_key) else {
+        return Ok(None);
     };
 
     let payload: Option<SidecarPayload> = match ecosystem {
-        #[cfg(feature = "cargo")]
         Ecosystem::Cargo => cargo::fixup(pkg_path, patched).await?,
-        #[cfg(feature = "nuget")]
         Ecosystem::Nuget => nuget::fixup(pkg_path).await?,
         Ecosystem::Pypi => Some(advisory_only_payload(
             SidecarAdvisoryCode::PypiRecordStale,
@@ -137,7 +147,6 @@ pub async fn dispatch_fixup(
             "Ruby gem: `bundle install --redownload` will revert these \
              patches by reinstalling from the cached .gem.",
         )),
-        #[cfg(feature = "golang")]
         Ecosystem::Golang => Some(advisory_only_payload(
             SidecarAdvisoryCode::GoModVerifyFails,
             SidecarSeverity::Warning,
@@ -170,8 +179,7 @@ pub async fn dispatch_fixup(
 /// `AlreadyOriginal` (restored by an earlier partial rollback that
 /// never reached this boundary). Same return contract as
 /// [`dispatch_fixup`].
-#[allow(unused_variables)] // `pkg_path` is feature-gated below
-pub async fn dispatch_rollback_fixup(
+pub(crate) async fn dispatch_rollback_fixup(
     package_key: &str,
     pkg_path: &Path,
     rolled_back: &[String],
@@ -180,13 +188,11 @@ pub async fn dispatch_rollback_fixup(
         return Ok(None);
     }
 
-    let ecosystem = match Ecosystem::from_purl(package_key) {
-        Some(eco) => eco,
-        None => return Ok(None),
+    let Some(ecosystem) = Ecosystem::from_purl(package_key) else {
+        return Ok(None);
     };
 
     let payload: Option<SidecarPayload> = match ecosystem {
-        #[cfg(feature = "cargo")]
         Ecosystem::Cargo => cargo::resync_after_rollback(pkg_path, rolled_back).await?,
         _ => None,
     };
@@ -203,14 +209,10 @@ pub async fn dispatch_rollback_fixup(
 mod tests {
     use super::*;
 
-    fn empty_files() -> HashMap<String, PatchFileInfo> {
-        HashMap::new()
-    }
-
     #[tokio::test]
     async fn empty_patched_returns_none() {
         let d = tempfile::tempdir().unwrap();
-        let out = dispatch_fixup("pkg:npm/anything@1.0.0", d.path(), &[], &empty_files())
+        let out = dispatch_fixup("pkg:npm/anything@1.0.0", d.path(), &[])
             .await
             .unwrap();
         assert!(out.is_none());
@@ -223,7 +225,6 @@ mod tests {
             "pkg:npm/anything@1.0.0",
             d.path(),
             &["package/x.js".to_string()],
-            &empty_files(),
         )
         .await
         .unwrap();
@@ -237,7 +238,6 @@ mod tests {
             "pkg:pypi/requests@2.28.0",
             d.path(),
             &["package/foo.py".to_string()],
-            &empty_files(),
         )
         .await
         .unwrap();
@@ -258,7 +258,6 @@ mod tests {
             "pkg:gem/rails@7.1.0",
             d.path(),
             &["lib/rails.rb".to_string()],
-            &empty_files(),
         )
         .await
         .unwrap();
@@ -272,14 +271,9 @@ mod tests {
     async fn unknown_ecosystem_returns_none() {
         // PURL has no recognized prefix → dispatcher bails with None.
         let d = tempfile::tempdir().unwrap();
-        let out = dispatch_fixup(
-            "pkg:weirdo/x@1",
-            d.path(),
-            &["x".to_string()],
-            &empty_files(),
-        )
-        .await
-        .unwrap();
+        let out = dispatch_fixup("pkg:weirdo/x@1", d.path(), &["x".to_string()])
+            .await
+            .unwrap();
         assert!(out.is_none());
     }
 
@@ -292,7 +286,7 @@ mod tests {
     #[tokio::test]
     async fn empty_patched_short_circuits_before_advisory() {
         let d = tempfile::tempdir().unwrap();
-        let out = dispatch_fixup("pkg:pypi/requests@2.28.0", d.path(), &[], &empty_files())
+        let out = dispatch_fixup("pkg:pypi/requests@2.28.0", d.path(), &[])
             .await
             .unwrap();
         assert!(
@@ -312,7 +306,6 @@ mod tests {
     /// Cargo PURL routes through `dispatch_fixup` to the checksum
     /// rewriter and the resulting record denormalizes purl + ecosystem
     /// and carries the rewritten-file entry.
-    #[cfg(feature = "cargo")]
     #[tokio::test]
     async fn cargo_dispatch_rewrites_checksum_and_builds_record() {
         let d = tempfile::tempdir().unwrap();
@@ -332,14 +325,9 @@ mod tests {
         .await
         .unwrap();
 
-        let out = dispatch_fixup(
-            "pkg:cargo/mycrate@1.0.0",
-            pkg,
-            &["src/lib.rs".to_string()],
-            &empty_files(),
-        )
-        .await
-        .unwrap();
+        let out = dispatch_fixup("pkg:cargo/mycrate@1.0.0", pkg, &["src/lib.rs".to_string()])
+            .await
+            .unwrap();
 
         let record = out.expect("cargo dispatch must produce a record");
         assert_eq!(record.ecosystem, "cargo");
@@ -353,7 +341,6 @@ mod tests {
     /// Cargo crate with no `.cargo-checksum.json` → the sub-fixup
     /// returns `None`, so `dispatch_fixup` produces no record (not an
     /// empty-files record).
-    #[cfg(feature = "cargo")]
     #[tokio::test]
     async fn cargo_dispatch_without_checksum_returns_none() {
         let d = tempfile::tempdir().unwrap();
@@ -361,7 +348,6 @@ mod tests {
             "pkg:cargo/mycrate@1.0.0",
             d.path(),
             &["src/lib.rs".to_string()],
-            &empty_files(),
         )
         .await
         .unwrap();
@@ -372,7 +358,6 @@ mod tests {
     /// `dispatch_fixup` must propagate the `SidecarError` (the apply
     /// boundary converts it to a `sidecar_fixup_failed` advisory) and
     /// must NOT swallow it into `Ok(None)`.
-    #[cfg(feature = "cargo")]
     #[tokio::test]
     async fn cargo_dispatch_propagates_malformed_error() {
         let d = tempfile::tempdir().unwrap();
@@ -383,7 +368,6 @@ mod tests {
             "pkg:cargo/mycrate@1.0.0",
             d.path(),
             &["src/lib.rs".to_string()],
-            &empty_files(),
         )
         .await
         .unwrap_err();
@@ -393,7 +377,6 @@ mod tests {
     /// NuGet PURL routes through `dispatch_fixup` to the metadata
     /// neutralizer; the on-disk `.nupkg.metadata` is deleted and the
     /// record records it as `Deleted`.
-    #[cfg(feature = "nuget")]
     #[tokio::test]
     async fn nuget_dispatch_deletes_metadata_and_builds_record() {
         let d = tempfile::tempdir().unwrap();
@@ -405,7 +388,6 @@ mod tests {
             "pkg:nuget/Newtonsoft.Json@13.0.3",
             d.path(),
             &["lib/x.dll".to_string()],
-            &empty_files(),
         )
         .await
         .unwrap();
@@ -422,7 +404,6 @@ mod tests {
     }
 
     /// NuGet package with neither metadata nor signature → no record.
-    #[cfg(feature = "nuget")]
     #[tokio::test]
     async fn nuget_dispatch_nothing_to_do_returns_none() {
         let d = tempfile::tempdir().unwrap();
@@ -430,7 +411,6 @@ mod tests {
             "pkg:nuget/Newtonsoft.Json@13.0.3",
             d.path(),
             &["lib/x.dll".to_string()],
-            &empty_files(),
         )
         .await
         .unwrap();
@@ -439,7 +419,6 @@ mod tests {
 
     /// Go PURL routes through `dispatch_fixup` to the advisory-only
     /// path and denormalizes the ecosystem name to `golang`.
-    #[cfg(feature = "golang")]
     #[tokio::test]
     async fn golang_dispatch_returns_structured_advisory() {
         let d = tempfile::tempdir().unwrap();
@@ -447,7 +426,6 @@ mod tests {
             "pkg:golang/github.com/gin-gonic/gin@v1.9.1",
             d.path(),
             &["gin.go".to_string()],
-            &empty_files(),
         )
         .await
         .unwrap();
@@ -462,7 +440,6 @@ mod tests {
     /// Rollback dispatcher: a cargo PURL routes to the checksum resync
     /// and the record carries the rewritten-file entry; a deleted
     /// (patch-added) file's entry is dropped from the map.
-    #[cfg(feature = "cargo")]
     #[tokio::test]
     async fn cargo_rollback_dispatch_resyncs_checksum() {
         let d = tempfile::tempdir().unwrap();
@@ -532,24 +509,6 @@ mod tests {
         let out = dispatch_rollback_fixup("pkg:cargo/mycrate@1.0.0", d.path(), &[])
             .await
             .unwrap();
-        assert!(out.is_none());
-    }
-
-    /// When the `cargo` feature is disabled, a `pkg:cargo/` PURL is
-    /// unrecognized by `Ecosystem::from_purl` and `dispatch_fixup`
-    /// returns `None` rather than attempting (or panicking on) a fixup.
-    #[cfg(not(feature = "cargo"))]
-    #[tokio::test]
-    async fn cargo_purl_without_feature_returns_none() {
-        let d = tempfile::tempdir().unwrap();
-        let out = dispatch_fixup(
-            "pkg:cargo/mycrate@1.0.0",
-            d.path(),
-            &["src/lib.rs".to_string()],
-            &empty_files(),
-        )
-        .await
-        .unwrap();
         assert!(out.is_none());
     }
 }

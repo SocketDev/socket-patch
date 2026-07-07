@@ -25,12 +25,12 @@
 
 use std::path::Path;
 
-use serde::Serialize;
 use serde_json::{Map, Value};
 
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
-use crate::utils::fs::atomic_write_bytes;
+use crate::utils::fs::atomic_write_bytes_preserving_mode;
 
+use super::common::serialize_json;
 use super::path::parse_vendor_path;
 use super::state::{PipenvMeta, VendorEntry, WiringAction, WiringRecord};
 use super::{RevertOutcome, VendorWarning};
@@ -49,9 +49,7 @@ const NON_REGISTRY_KEYS: [&str; 6] = ["path", "git", "hg", "svn", "bzr", "editab
 
 /// A loaded-and-guard-checked pipenv project.
 #[derive(Debug)]
-pub struct PipenvProject {
-    /// Verbatim Pipfile.lock text (byte-stability oracle for reverts).
-    pub lock_text: String,
+pub(super) struct PipenvProject {
     /// Parsed lock (the edit substrate — re-serialized canonically).
     pub lock: Value,
     /// Non-fatal advisories raised during load. ALWAYS contains the
@@ -62,7 +60,7 @@ pub struct PipenvProject {
 
 /// What the target entries already look like.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PipenvTarget {
+pub(super) enum PipenvTarget {
     /// At least one registry-shaped entry: proceed to build the wheel and
     /// wire.
     Fresh,
@@ -76,7 +74,9 @@ pub enum PipenvTarget {
 /// Read + parse Pipfile.lock and run every project-level guard. Refuses
 /// before ANY write — the orchestrator runs this (and the target guards)
 /// before the wheel is built, so a refusal leaves the tree byte-untouched.
-pub async fn load_pipenv_project(root: &Path) -> Result<PipenvProject, (&'static str, String)> {
+pub(super) async fn load_pipenv_project(
+    root: &Path,
+) -> Result<PipenvProject, (&'static str, String)> {
     let lock_text = match tokio::fs::read_to_string(root.join(LOCK_FILE)).await {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -127,11 +127,7 @@ pub async fn load_pipenv_project(root: &Path) -> Result<PipenvProject, (&'static
          protected only by the committed wheel itself; `socket-patch verify` re-checks its \
          sha256 against the lock entry",
     )];
-    Ok(PipenvProject {
-        lock_text,
-        lock,
-        warnings,
-    })
+    Ok(PipenvProject { lock, warnings })
 }
 
 /// Target-specific guards (also re-run by [`wire_pipenv`] right before
@@ -216,7 +212,7 @@ pub(super) fn check_target_guards(
 /// pipenv serialization). `rel_wheel` is the project-relative wheel path
 /// (`.socket/vendor/pypi/<uuid>/<wheel>`, no `./` prefix — the fixture's
 /// `./` spelling is applied here).
-pub async fn wire_pipenv(
+pub(super) async fn wire_pipenv(
     p: &PipenvProject,
     root: &Path,
     canon_name: &str,
@@ -297,7 +293,7 @@ pub async fn wire_pipenv(
     }
 
     let new_text = to_canonical_json(&lock);
-    atomic_write_bytes(&root.join(LOCK_FILE), new_text.as_bytes())
+    atomic_write_bytes_preserving_mode(&root.join(LOCK_FILE), new_text.as_bytes())
         .await
         .map_err(|e| {
             (
@@ -312,7 +308,11 @@ pub async fn wire_pipenv(
 /// gated). An entry that no longer matches what we wrote is left alone with
 /// a `vendor_lock_entry_drifted` warning — revert never clobbers third-party
 /// edits.
-pub async fn revert_pipenv(entry: &VendorEntry, root: &Path, dry_run: bool) -> RevertOutcome {
+pub(super) async fn revert_pipenv(
+    entry: &VendorEntry,
+    root: &Path,
+    dry_run: bool,
+) -> RevertOutcome {
     let lock_path = root.join(LOCK_FILE);
     let lock_text = match tokio::fs::read_to_string(&lock_path).await {
         Ok(t) => t,
@@ -407,7 +407,7 @@ pub async fn revert_pipenv(entry: &VendorEntry, root: &Path, dry_run: bool) -> R
     // churn a lock whose formatting we did not produce.
     if changed && !dry_run {
         let new_text = to_canonical_json(&lock);
-        if let Err(e) = atomic_write_bytes(&lock_path, new_text.as_bytes()).await {
+        if let Err(e) = atomic_write_bytes_preserving_mode(&lock_path, new_text.as_bytes()).await {
             return RevertOutcome {
                 success: false,
                 warnings,
@@ -460,15 +460,9 @@ fn to_canonical_json(value: &Value) -> String {
             other => other.clone(),
         }
     }
-    let mut buf = Vec::new();
-    let formatter = serde_json::ser::PrettyFormatter::with_indent(b"    ");
-    let mut ser = serde_json::Serializer::with_formatter(&mut buf, formatter);
-    sorted(value)
-        .serialize(&mut ser)
+    let bytes = serialize_json(&sorted(value), "    ")
         .expect("serializing a serde_json::Value cannot fail");
-    let mut text = String::from_utf8(buf).expect("serde_json emits UTF-8");
-    text.push('\n');
-    text
+    String::from_utf8(bytes).expect("serde_json emits UTF-8")
 }
 
 #[cfg(test)]
@@ -992,6 +986,41 @@ mod tests {
             LOCK_DIRECT_REGISTRY,
             "no record matched: the lock is not even re-serialized"
         );
+    }
+
+    /// Pipfile.lock is a user-owned file we merely edit: both the vendor
+    /// rewrite and the revert restore must keep its permission bits (a 0600
+    /// private lock must not silently become umask-default 0644).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn lock_writes_preserve_file_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = write_lock(LOCK_DIRECT_REGISTRY).await;
+        let lock_path = tmp.path().join("Pipfile.lock");
+        tokio::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o600))
+            .await
+            .unwrap();
+
+        let p = load_pipenv_project(tmp.path()).await.unwrap();
+        let (wiring, meta) = wire_default(&p, tmp.path()).await;
+        let mode = tokio::fs::metadata(&lock_path)
+            .await
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(mode, 0o600, "wire must preserve the lockfile's mode");
+
+        let outcome = revert_pipenv(&entry_for(wiring, meta), tmp.path(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        let mode = tokio::fs::metadata(&lock_path)
+            .await
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(mode, 0o600, "revert must preserve the lockfile's mode");
+        assert_eq!(read_lock(tmp.path()).await, LOCK_DIRECT_REGISTRY);
     }
 
     /// A third-party edit to the entry we wrote (e.g. `pipenv lock`

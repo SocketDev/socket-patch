@@ -86,6 +86,7 @@ fn global_flag_cases() -> Vec<(&'static str, Option<&'static str>, fn(&GlobalArg
             assert_eq!(c.patch_server_url.as_deref(), Some("http://localhost:4026"))
         }),
         ("--offline", None, |c| assert!(c.offline)),
+        ("--strict", None, |c| assert!(c.strict)),
         ("--global", None, |c| assert!(c.global)),
         ("--global-prefix", Some("/opt/global"), |c| {
             assert_eq!(c.global_prefix, Some(PathBuf::from("/opt/global")))
@@ -217,15 +218,45 @@ fn global_flag_cases_cover_every_global_field() {
         patch_server_url: _,
     } = common;
 
-    // 23 fields ↔ 23 long-flag cases. Bump both this count and add a case when
+    // 24 fields ↔ 24 long-flag cases. Bump both this count and add a case when
     // the destructure above forces you to add a field.
     assert_eq!(
         global_flag_cases().len(),
-        23,
+        24,
         "every GlobalArgs field needs a long-flag case in global_flag_cases()",
     );
 
     restore_global_env(saved);
+}
+
+/// Tripwire for the tripwire above: the manual field count can be bumped
+/// without actually adding a case for the new flag (exactly how `--strict`
+/// shipped unguarded). Derive the long-flag set from clap itself and demand a
+/// case for each — this cannot drift.
+#[test]
+fn global_flag_cases_cover_every_global_long_flag() {
+    use clap::CommandFactory;
+
+    #[derive(Parser, Debug)]
+    struct Probe {
+        #[command(flatten)]
+        common: GlobalArgs,
+    }
+
+    let tested: std::collections::HashSet<String> = global_flag_cases()
+        .iter()
+        .map(|(flag, _, _)| flag.trim_start_matches("--").to_string())
+        .collect();
+    let missing: Vec<String> = Probe::command()
+        .get_arguments()
+        .filter(|a| a.get_id() != "help")
+        .filter_map(|a| a.get_long().map(str::to_string))
+        .filter(|long| !tested.contains(long))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "GlobalArgs long flags with no case in global_flag_cases(): {missing:?}",
+    );
 }
 
 /// Tripwire: every subcommand clap knows about must appear in the
@@ -389,12 +420,13 @@ fn env_vars_populate_global_args() {
         ("SOCKET_API_TOKEN", "env-token"),
         ("SOCKET_ORG_SLUG", "env-org"),
         ("SOCKET_PROXY_URL", "https://env-proxy.example.com"),
-        // npm + gem are unconditional ecosystems, so this env-binding
-        // assertion holds regardless of which optional features are
-        // compiled in (maven is not in the default build).
         ("SOCKET_ECOSYSTEMS", "npm,gem"),
         ("SOCKET_DOWNLOAD_MODE", "package"),
+        ("SOCKET_VENDOR_SOURCE", "service"),
+        ("SOCKET_VENDOR_URL", "https://env-vendor.example.com"),
+        ("SOCKET_PATCH_SERVER_URL", "http://localhost:4026"),
         ("SOCKET_OFFLINE", "true"),
+        ("SOCKET_STRICT", "true"),
         ("SOCKET_GLOBAL", "true"),
         ("SOCKET_GLOBAL_PREFIX", "/env/global"),
         ("SOCKET_JSON", "true"),
@@ -432,7 +464,17 @@ fn env_vars_populate_global_args() {
             Some(&["npm".to_string(), "gem".to_string()][..])
         );
         assert_eq!(args.common.download_mode, "package");
+        assert_eq!(args.common.vendor_source, "service");
+        assert_eq!(
+            args.common.vendor_url.as_deref(),
+            Some("https://env-vendor.example.com")
+        );
+        assert_eq!(
+            args.common.patch_server_url.as_deref(),
+            Some("http://localhost:4026")
+        );
         assert!(args.common.offline);
+        assert!(args.common.strict);
         assert!(args.common.global);
         assert_eq!(
             args.common.global_prefix,
@@ -477,6 +519,7 @@ fn bool_env_vars_accept_one_and_yes() {
     // (env var name, value to set)
     let cases: &[(&str, &str)] = &[
         ("SOCKET_OFFLINE", "1"),
+        ("SOCKET_STRICT", "on"),
         ("SOCKET_GLOBAL", "yes"),
         ("SOCKET_JSON", "on"),
         ("SOCKET_VERBOSE", "1"),
@@ -499,6 +542,7 @@ fn bool_env_vars_accept_one_and_yes() {
     let cli = Cli::try_parse_from(["socket-patch", "list"]).expect("parse");
     if let socket_patch_cli::Commands::List(args) = cli.command {
         assert!(args.common.offline, "SOCKET_OFFLINE=1 must parse as true");
+        assert!(args.common.strict, "SOCKET_STRICT=on must parse as true");
         assert!(args.common.global, "SOCKET_GLOBAL=yes must parse as true");
         assert!(args.common.json, "SOCKET_JSON=on must parse as true");
         assert!(args.common.verbose, "SOCKET_VERBOSE=1 must parse as true");
@@ -598,8 +642,9 @@ fn bool_env_vars_reject_zero_and_falsey() {
 #[serial_test::serial]
 fn empty_bool_env_var_resolves_to_false_not_crash() {
     // (env var, accessor) for every boolean global.
-    let bool_vars: [(&str, fn(&GlobalArgs) -> bool); 10] = [
+    let bool_vars: [(&str, fn(&GlobalArgs) -> bool); 11] = [
         ("SOCKET_OFFLINE", |c| c.offline),
+        ("SOCKET_STRICT", |c| c.strict),
         ("SOCKET_GLOBAL", |c| c.global),
         ("SOCKET_JSON", |c| c.json),
         ("SOCKET_VERBOSE", |c| c.verbose),
@@ -629,30 +674,13 @@ fn empty_bool_env_var_resolves_to_false_not_crash() {
     restore_global_env(saved);
 }
 
-/// Names of every `SOCKET_*` env var that `GlobalArgs` binds, so tests that
-/// need a clean slate can save/clear/restore them in one place.
-const GLOBAL_ENV_VARS: &[&str] = &[
-    "SOCKET_CWD",
-    "SOCKET_MANIFEST_PATH",
-    "SOCKET_API_URL",
-    "SOCKET_API_TOKEN",
-    "SOCKET_ORG_SLUG",
-    "SOCKET_PROXY_URL",
-    "SOCKET_ECOSYSTEMS",
-    "SOCKET_DOWNLOAD_MODE",
-    "SOCKET_OFFLINE",
-    "SOCKET_GLOBAL",
-    "SOCKET_GLOBAL_PREFIX",
-    "SOCKET_JSON",
-    "SOCKET_VERBOSE",
-    "SOCKET_SILENT",
-    "SOCKET_DRY_RUN",
-    "SOCKET_YES",
-    "SOCKET_LOCK_TIMEOUT",
-    "SOCKET_BREAK_LOCK",
-    "SOCKET_DEBUG",
-    "SOCKET_TELEMETRY_DISABLED",
-];
+/// Every `SOCKET_*` env var that `GlobalArgs` binds, so tests that need a
+/// clean slate can save/clear/restore them in one place. This is the
+/// production list itself — a private copy already went stale once
+/// (`SOCKET_STRICT` + the vendor knobs were missing, so ambient values
+/// survived the "clean slate" and could taint every parse in this file);
+/// `save_and_clear_covers_every_bound_global_env_var` above pins the fix.
+use socket_patch_cli::args::GLOBAL_ARG_ENV_VARS as GLOBAL_ENV_VARS;
 
 /// An exported-but-**empty** non-bool env var must mean "unset", not crash.
 ///
@@ -663,7 +691,7 @@ const GLOBAL_ENV_VARS: &[&str] = &[
 /// "cannot parse integer from empty string"), and empty
 /// `SOCKET_DOWNLOAD_MODE=` / `SOCKET_MANIFEST_PATH=` leaked `""` past the
 /// documented defaults. The binary now scrubs empty `GlobalArgs` env vars
-/// before clap parses (`args::scrub_empty_global_env_vars` in `main`),
+/// before clap parses (`args::scrub_empty_env_vars` in `main`),
 /// restoring the documented CLI > env > default precedence for blank vars.
 /// This spawns the real binary because the scrub is `main` wiring.
 #[test]
@@ -684,6 +712,11 @@ fn empty_nonbool_env_vars_do_not_crash_the_binary() {
         "SOCKET_LOCK_TIMEOUT",
         "SOCKET_ECOSYSTEMS",
         "SOCKET_DOWNLOAD_MODE",
+        // Crash-class without the scrub: the vendor-source validator rejects
+        // `""` outright; the two URL knobs would leak `Some("")` downstream.
+        "SOCKET_VENDOR_SOURCE",
+        "SOCKET_VENDOR_URL",
+        "SOCKET_PATCH_SERVER_URL",
     ] {
         cmd.env(var, "");
     }
@@ -713,6 +746,48 @@ fn empty_nonbool_env_vars_do_not_crash_the_binary() {
         "blank env vars must fall back to defaults: {envelope}",
     );
     assert_eq!(out.status.code(), Some(1), "manifest_not_found exits 1");
+}
+
+/// `save_and_clear_global_env` must clear **every** env var `GlobalArgs`
+/// binds — the production list, not a private copy that can go stale. A var
+/// that survives the clear taints every parse in this file: an ambient
+/// `SOCKET_STRICT=garbage` in a developer's shell would abort all of them
+/// with a `ValueValidation` error that looks nothing like the real cause.
+#[test]
+#[serial_test::serial]
+fn save_and_clear_covers_every_bound_global_env_var() {
+    use socket_patch_cli::args::GLOBAL_ARG_ENV_VARS;
+
+    // Snapshot the full bound set so this test is hermetic even on failure.
+    let originals: Vec<(&str, Option<String>)> = GLOBAL_ARG_ENV_VARS
+        .iter()
+        .map(|&k| (k, std::env::var(k).ok()))
+        .collect();
+    for &(k, _) in &originals {
+        std::env::set_var(k, "ambient-poison");
+    }
+
+    // Discard the snapshot it returns — it captured the poison values.
+    let _ = save_and_clear_global_env();
+
+    let leaked: Vec<&str> = GLOBAL_ARG_ENV_VARS
+        .iter()
+        .copied()
+        .filter(|k| std::env::var(k).is_ok())
+        .collect();
+
+    // Restore before asserting so a failure can't poison later serial tests.
+    for (k, orig) in originals {
+        match orig {
+            Some(v) => std::env::set_var(k, v),
+            None => std::env::remove_var(k),
+        }
+    }
+
+    assert!(
+        leaked.is_empty(),
+        "save_and_clear_global_env left GlobalArgs-bound env vars set: {leaked:?}",
+    );
 }
 
 fn save_and_clear_global_env() -> Vec<(&'static str, Option<String>)> {
@@ -806,9 +881,13 @@ fn production_defaults_populate_when_unset() {
     assert_eq!(c.api_url, "https://api.socket.dev");
     assert_eq!(c.proxy_url, "https://patches-api.socket.dev");
     assert_eq!(c.download_mode, "diff");
+    assert_eq!(c.vendor_source, "auto");
+    assert!(c.vendor_url.is_none());
+    assert!(c.patch_server_url.is_none());
     assert!(c.api_token.is_none());
     assert!(c.org.is_none());
     assert!(c.ecosystems.is_none());
+    assert!(!c.strict);
     assert!(!c.offline && !c.global && !c.json && !c.verbose && !c.silent);
     assert!(!c.dry_run && !c.yes && !c.break_lock && !c.debug && !c.no_telemetry);
     assert!(c.lock_timeout.is_none());

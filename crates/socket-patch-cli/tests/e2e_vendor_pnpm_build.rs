@@ -65,18 +65,30 @@ fn corepack(cwd: &Path, pm: &str, args: &[&str]) -> Output {
     cmd.output().expect("failed to run corepack")
 }
 
-/// Remove ambient `SOCKET_*` vars and the pnpm store env the harness controls
-/// (the `--store-dir` flag is always passed explicitly).
+/// Remove ambient `SOCKET_*` / `PNPM_*` / `npm_config_*` vars (the
+/// `--store-dir` flag is always passed explicitly).
+///
+/// Seed-then-scrub (mirrors e2e_redirect_yarn_berry_build.rs): pnpm lets
+/// EVERY `.npmrc` setting be overridden by an `npm_config_*` env var (env
+/// outranks the project npmrc), so an ambient `npm_config_node_linker=pnp`
+/// was verified to turn the capstone red — pnpm emits a `.pnp.cjs` and
+/// `vendor` refuses the project as unsupported Plug'n'Play. The explicit
+/// env_remove below clears the seed too, but if the prefix scrub is ever
+/// dropped the seed (rather than a developer's ambient shell, which this
+/// suite can't rely on) turns the test red immediately.
 fn scrub_socket_env(cmd: &mut Command) {
+    cmd.env("npm_config_node_linker", "pnp");
     for (k, _) in std::env::vars_os() {
-        let k = k.to_string_lossy();
-        if k.starts_with("SOCKET_") {
-            cmd.env_remove(k.as_ref());
+        let key = k.to_string_lossy();
+        if key.starts_with("SOCKET_")
+            || key.starts_with("PNPM_")
+            || key.to_ascii_lowercase().starts_with("npm_config_")
+        {
+            cmd.env_remove(&k);
         }
     }
     cmd.env_remove("VIRTUAL_ENV");
-    cmd.env_remove("PNPM_HOME");
-    cmd.env_remove("npm_config_store_dir");
+    cmd.env_remove("npm_config_node_linker");
 }
 
 fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {

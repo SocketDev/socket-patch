@@ -44,52 +44,30 @@ fn copy_tree(src: &Path, dst: &Path) {
     }
 }
 
-/// Every `SOCKET_*` env var that `setup` (via `GlobalArgs`) honours as a
-/// fallback for a CLI flag. These tests drive `setup` purely through flags and
-/// on-disk fixtures, so ANY of these leaking in from the developer's shell or
-/// CI would let an assertion pass for the wrong reason — e.g. an ambient
-/// `SOCKET_DRY_RUN=true` would keep a regressed `--check`/`--yes` path from
-/// writing (satisfying the "must not modify" checks vacuously), and an ambient
-/// `SOCKET_ECOSYSTEMS`/`SOCKET_YES`/`SOCKET_CWD` would silently change which
-/// manifest is touched and how the script is rendered. Scrub the whole set
-/// from every child so behaviour is decided by flags alone. Mirrors the
-/// hardened helpers in remove_network.rs / repair_invariants.rs.
-const SOCKET_ENV_VARS: &[&str] = &[
-    "SOCKET_CWD",
-    "SOCKET_MANIFEST_PATH",
-    "SOCKET_API_URL",
-    "SOCKET_API_TOKEN",
-    "SOCKET_ORG_SLUG",
-    "SOCKET_PROXY_URL",
-    "SOCKET_ECOSYSTEMS",
-    "SOCKET_DOWNLOAD_MODE",
-    "SOCKET_DOWNLOAD_ONLY",
-    "SOCKET_OFFLINE",
-    "SOCKET_GLOBAL",
-    "SOCKET_GLOBAL_PREFIX",
-    "SOCKET_JSON",
-    "SOCKET_VERBOSE",
-    "SOCKET_SILENT",
-    "SOCKET_DRY_RUN",
-    "SOCKET_YES",
-    "SOCKET_FORCE",
-    "SOCKET_LOCK_TIMEOUT",
-    "SOCKET_BREAK_LOCK",
-    "SOCKET_DEBUG",
-    "SOCKET_TELEMETRY_DISABLED",
-    // Other SOCKET_PATCH_* knobs that could steer setup behaviour.
-    "SOCKET_PATCH_BIN",
-    "SOCKET_PATCH_DEBUG",
-    "SOCKET_PATCH_PROXY_URL",
-    "SOCKET_PATCH_TELEMETRY_DISABLED",
-];
-
-/// Build a `setup` invocation with the full `SOCKET_*` environment scrubbed.
+/// Build a `setup` invocation with every ambient `SOCKET_*` env var scrubbed
+/// by prefix. These tests drive `setup` purely through flags and on-disk
+/// fixtures, so ANY `SOCKET_*` fallback leaking in from the developer's shell
+/// or CI would let an assertion pass (or fail) for the wrong reason — e.g. an
+/// ambient `SOCKET_DRY_RUN=true` would keep a regressed `--check`/`--yes` path
+/// from writing (satisfying the "must not modify" checks vacuously), and an
+/// ambient `SOCKET_ECOSYSTEMS`/`SOCKET_YES`/`SOCKET_CWD` would silently change
+/// which manifest is touched and how the script is rendered. A fixed name
+/// list is the trap the sibling suites already fell into (remove_network.rs
+/// missed `SOCKET_SKIP_ROLLBACK`; this file's list missed
+/// `SOCKET_SETUP_EXCLUDE`, setup's own env-bound `--exclude` fallback, which
+/// silently dropped workspace members AND persisted the ambient exclude into
+/// `.socket/manifest.json`), so scrub by prefix like common::run_with_env.
+/// Telemetry opt-outs are deliberately kept: they only suppress phone-home
+/// and cannot steer the behaviour under test, and an opted-out dev should
+/// stay opted out.
 fn setup_command(cwd: &Path, args: &[&str]) -> Command {
     let mut cmd = Command::new(binary());
     cmd.args(args).current_dir(cwd);
-    for var in SOCKET_ENV_VARS {
-        cmd.env_remove(var);
+    for (key, _) in std::env::vars_os() {
+        let name = key.to_string_lossy();
+        if name.starts_with("SOCKET_") && !name.contains("TELEMETRY") {
+            cmd.env_remove(&key);
+        }
     }
     cmd
 }
@@ -538,6 +516,44 @@ fn setup_check_configured_project_exits_zero() {
     assert_eq!(files[0]["status"], "configured");
 }
 
+/// npm and Node strip a UTF-8 BOM in package.json — files saved by Windows
+/// editors commonly carry one — and every other setup surface already
+/// tolerates it: `setup` wires a BOM'd file (update.rs pins) and reports a
+/// BOM'd configured file `already_configured`. `--check` must agree: a BOM'd,
+/// fully-configured file is `configured` (exit 0), NOT `Error: Invalid
+/// package.json` (exit 1). Regression guard: `run_check` raw-parsed the file
+/// without stripping the BOM, so the same file `setup` calls configured
+/// failed `--check`.
+#[test]
+fn setup_check_tolerates_bom_like_npm() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write(
+        &tmp.path().join("package.json"),
+        "\u{feff}{\"scripts\":{\"postinstall\":\"npx @socketsecurity/socket-patch apply --silent --ecosystems npm\",\"dependencies\":\"npx @socketsecurity/socket-patch apply --silent --ecosystems npm\"}}",
+    );
+
+    // `setup` itself treats the file as valid and already configured (and
+    // therefore leaves it byte-identical, BOM included).
+    let (setup_code, setup_stdout) = run_setup(tmp.path(), &["--yes"]);
+    assert_eq!(
+        setup_code, 0,
+        "setup must accept a BOM'd configured package.json; stdout=\n{setup_stdout}"
+    );
+    let v: serde_json::Value = serde_json::from_str(&setup_stdout).expect("valid JSON");
+    assert_eq!(v["status"], "already_configured");
+
+    // `--check` must reach the same verdict npm (and `setup`) do.
+    let (code, stdout) = run_setup(tmp.path(), &["--check"]);
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert_eq!(
+        code, 0,
+        "a BOM'd configured package.json must pass --check; stdout=\n{stdout}"
+    );
+    assert_eq!(v["status"], "configured", "stdout=\n{stdout}");
+    assert_eq!(v["errors"], 0, "stdout=\n{stdout}");
+    assert_eq!(v["files"][0]["status"], "configured", "stdout=\n{stdout}");
+}
+
 #[test]
 fn setup_check_unconfigured_project_exits_nonzero() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -798,14 +814,10 @@ fn setup_writes_only_inside_repo() {
         "sentinel HOME must start empty"
     );
 
-    let mut cmd = Command::new(binary());
-    cmd.args(["setup", "--json", "--yes"])
-        .current_dir(proj.path());
-    for var in SOCKET_ENV_VARS {
-        cmd.env_remove(var);
-    }
+    let mut cmd = setup_command(proj.path(), &["setup", "--json", "--yes"]);
     // Redirect HOME at the sentinel and disable telemetry so the only writes we
-    // could observe are setup's own manifest edits.
+    // could observe are setup's own manifest edits. (Seed after the scrub —
+    // the helper keeps TELEMETRY vars anyway, but the write matters here.)
     cmd.env("HOME", home.path());
     cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
     let out = cmd.output().expect("run socket-patch");

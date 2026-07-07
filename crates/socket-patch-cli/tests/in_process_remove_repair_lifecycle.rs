@@ -719,3 +719,152 @@ async fn repair_offline_with_present_blobs_succeeds() {
         "the surviving blob's content must be unchanged"
     );
 }
+
+/// Regression: `remove` is the documented per-purl exit path for detached
+/// vendored patches (`scan --vendor --detached`), and detached mode writes
+/// NO manifest (scan_vendor_e2e pins "detached mode must not create a
+/// manifest"). But `remove`'s pre-flight manifest-existence gate returned
+/// `manifest_not_found` (exit 1) before the detached branch could run, so
+/// on a pure-detached project — the primary detached scenario — the exit
+/// path was unreachable. The ledger stayed wired forever.
+#[tokio::test]
+#[serial]
+async fn remove_detached_vendored_without_manifest_reverts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let purl = "pkg:npm/detached-only@1.0.0";
+    let uuid = "55555555-5555-4555-8555-555555555555";
+
+    // What `scan --vendor --detached` leaves behind: ledger + artifact,
+    // no `.socket/manifest.json`. Empty wiring makes the npm revert a
+    // pure offline artifact-dir delete.
+    let vendor = tmp.path().join(".socket/vendor");
+    let artifact_dir = vendor.join("npm").join(uuid);
+    std::fs::create_dir_all(&artifact_dir).unwrap();
+    std::fs::write(artifact_dir.join("package.tgz"), b"tgz").unwrap();
+    std::fs::write(
+        vendor.join("state.json"),
+        format!(
+            r#"{{
+              "version": 1,
+              "entries": {{
+                "{purl}": {{
+                  "ecosystem": "npm",
+                  "basePurl": "{purl}",
+                  "uuid": "{uuid}",
+                  "artifact": {{ "path": ".socket/vendor/npm/{uuid}/package.tgz" }},
+                  "detached": true,
+                  "wiring": []
+                }}
+              }}
+            }}"#
+        ),
+    )
+    .unwrap();
+
+    let args = RemoveArgs {
+        common: socket_patch_cli::args::GlobalArgs {
+            cwd: tmp.path().to_path_buf(),
+            manifest_path: ".socket/manifest.json".to_string(),
+            yes: true,
+            global: false,
+            global_prefix: None,
+            json: true,
+            ..socket_patch_cli::args::GlobalArgs::default()
+        },
+        identifier: purl.to_string(),
+        skip_rollback: false,
+    };
+    assert_eq!(
+        remove_run(args).await,
+        0,
+        "remove must revert a detached vendored patch even with no manifest"
+    );
+    // The revert happened: ledger entry dropped (empty ledger deleted)
+    // and the vendored artifact removed.
+    assert!(
+        !vendor.join("state.json").exists(),
+        "detached ledger entry must be reverted (empty ledger deleted)"
+    );
+    assert!(
+        !artifact_dir.exists(),
+        "the vendored artifact must be deleted on remove"
+    );
+    // And no manifest was conjured into being along the way.
+    assert!(
+        !tmp.path().join(".socket/manifest.json").exists(),
+        "remove must not create a manifest on a pure-detached project"
+    );
+}
+
+/// Regression: `repair` passed only the `--api-token`/`--org` FLAG values
+/// to its telemetry calls, while every sibling command (apply, rollback,
+/// remove) resolves credentials through the API client — which falls back
+/// to `SOCKET_API_TOKEN`/`SOCKET_ORG_SLUG`. With env-provided credentials
+/// (the standard configuration) repair's telemetry therefore went
+/// unauthenticated to the PUBLIC proxy endpoint instead of the org-scoped
+/// `/v0/orgs/<slug>/telemetry`, losing org attribution entirely.
+#[tokio::test]
+#[serial]
+async fn repair_telemetry_attributed_to_env_credentials() {
+    let tmp = tempfile::tempdir().unwrap();
+    let blob = b"present blob for telemetry test\n";
+    let hash = git_sha256(blob);
+
+    // Blob already present → nothing to download; the only request the
+    // mock should see is the org-scoped telemetry POST.
+    let socket = tmp.path().join(".socket");
+    std::fs::create_dir_all(&socket).unwrap();
+    std::fs::write(
+        socket.join("manifest.json"),
+        format!(
+            r#"{{ "patches": {{
+                "pkg:npm/telemetry-test@1.0.0": {{
+                    "uuid": "18181818-1818-4181-8181-181818181818",
+                    "exportedAt": "2024-01-01T00:00:00Z",
+                    "files": {{ "package/x.js": {{
+                        "beforeHash": "0000000000000000000000000000000000000000000000000000000000000000",
+                        "afterHash": "{hash}"
+                    }}}},
+                    "vulnerabilities": {{}}, "description": "x",
+                    "license": "MIT", "tier": "free"
+                }}
+            }}}}"#
+        ),
+    )
+    .unwrap();
+    let blobs = socket.join("blobs");
+    std::fs::create_dir_all(&blobs).unwrap();
+    std::fs::write(blobs.join(&hash), blob).unwrap();
+
+    let server = MockServer::start().await;
+
+    std::env::set_var("SOCKET_API_URL", server.uri());
+    std::env::set_var("SOCKET_API_TOKEN", "fake");
+    std::env::set_var("SOCKET_ORG_SLUG", ORG);
+    // The telemetry kill-switch must not be ambiently on, or the oracle
+    // below would fail for the wrong reason (`is_telemetry_disabled`
+    // reads these at runtime).
+    std::env::remove_var("SOCKET_TELEMETRY_DISABLED");
+    std::env::remove_var("SOCKET_PATCH_TELEMETRY_DISABLED");
+    std::env::remove_var("SOCKET_OFFLINE");
+    std::env::remove_var("VITEST");
+    let code = repair_run(make_repair_args(tmp.path(), "file")).await;
+    std::env::remove_var("SOCKET_API_URL");
+    std::env::remove_var("SOCKET_API_TOKEN");
+    std::env::remove_var("SOCKET_ORG_SLUG");
+    assert_eq!(code, 0, "repair with all blobs present must succeed");
+
+    // The success event must land on the org-scoped endpoint of the
+    // configured API URL — not on the public proxy.
+    let telemetry_hits = server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.url.path() == format!("/v0/orgs/{ORG}/telemetry"))
+        .count();
+    assert_eq!(
+        telemetry_hits, 1,
+        "repair telemetry must use the env-resolved token/org (org-scoped endpoint)"
+    );
+}

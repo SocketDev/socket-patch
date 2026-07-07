@@ -1,10 +1,8 @@
-//! Shared tree-copy helpers for the project-local Go `replace`-redirect backend
-//! ([`crate::patch::go_redirect`]). It materialises a project-local **patched
-//! copy** of a module by copying its pristine source out of the read-only,
-//! checksum-verified module cache into a writable dir under `.socket/`, then
-//! patching the copy in place.
-//!
-//! Only compiled when the Go redirect backend is enabled (gated in `mod.rs`).
+//! Shared tree-copy helpers used by the Go `replace`-redirect backend
+//! ([`crate::patch::go_redirect`]) and the vendor backends. They materialise a
+//! project-local **patched copy** of a package by copying its pristine source
+//! out of a read-only registry/module cache into a writable dir under
+//! `.socket/`, then patching the copy in place.
 
 use std::path::Path;
 
@@ -60,12 +58,13 @@ pub(crate) async fn fresh_copy(
         Ok(())
     })
     .await
-    .map_err(|e| std::io::Error::other(e.to_string()))?
+    .map_err(to_io)?
 }
 
-/// Recursively remove a tree, retrying once after relaxing perms (a previously
-/// patched copy may carry read-only file modes copied from the registry/cache).
-pub(crate) fn force_remove_dir_all(dir: &Path) -> std::io::Result<()> {
+/// Recursively remove a tree, retrying once after relaxing *directory* perms
+/// (a previously patched copy may carry read-only dir modes copied from the
+/// registry/cache; on unix file modes never gate unlinking).
+fn force_remove_dir_all(dir: &Path) -> std::io::Result<()> {
     match std::fs::remove_dir_all(dir) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -82,18 +81,20 @@ pub(crate) fn force_remove_dir_all(dir: &Path) -> std::io::Result<()> {
                     .into_iter()
                     .flatten()
                 {
-                    let ft = entry.file_type();
-                    // Never chmod a symlink: `set_permissions` follows the link
-                    // and would mutate its *target's* mode — which may live
-                    // outside the tree. A symlink is unlinked via the write bit
-                    // on its (relaxed) parent dir; its own mode is irrelevant.
-                    if ft.is_symlink() {
+                    // Only directory modes gate removal on unix: unlinking an
+                    // entry needs write+execute on its (relaxed) parent dir,
+                    // never a mode on the entry itself. Never chmod anything
+                    // else: `set_permissions` follows a symlink and would
+                    // mutate its *target's* mode, and a regular file may be a
+                    // hard link to an inode outside the tree — chmod'ing it
+                    // mutates that shared inode. (Links aren't followed, so a
+                    // symlinked dir reports !is_dir and is skipped too.)
+                    if !entry.file_type().is_dir() {
                         continue;
                     }
-                    let mode = if ft.is_dir() { 0o755 } else { 0o644 };
                     let _ = std::fs::set_permissions(
                         entry.path(),
-                        std::fs::Permissions::from_mode(mode),
+                        std::fs::Permissions::from_mode(0o755),
                     );
                 }
             }
@@ -107,7 +108,7 @@ pub async fn remove_tree(dir: &Path) -> std::io::Result<()> {
     let dir = dir.to_path_buf();
     tokio::task::spawn_blocking(move || force_remove_dir_all(&dir))
         .await
-        .map_err(|e| std::io::Error::other(e.to_string()))?
+        .map_err(to_io)?
 }
 
 #[cfg(test)]
@@ -273,8 +274,8 @@ mod tests {
     /// Regression: the perm-relax retry in [`force_remove_dir_all`] must not
     /// chmod *through* a symlink. `set_permissions` follows links, so a symlink
     /// entry would silently mutate its target's mode — which can live outside
-    /// the tree. (Copy trees are symlink-free today, but this is a general
-    /// pub(crate) helper and the safety property must hold regardless.)
+    /// the tree. (Copy trees are symlink-free today, but [`remove_tree`] is a
+    /// general pub helper and the safety property must hold regardless.)
     #[cfg(unix)]
     #[tokio::test]
     async fn relax_loop_must_not_chmod_external_symlink_target() {
@@ -303,6 +304,41 @@ mod tests {
             mode
         );
         assert!(outside.exists());
+    }
+
+    /// Regression: the perm-relax retry must not chmod regular files at all.
+    /// On unix, unlinking needs write on the *parent dir*, never a mode on the
+    /// file itself — so the file chmod had no benefit, and a file inside the
+    /// tree may be a *hard link* to an inode outside it (dedupe tools,
+    /// store-linked installs; vendored copies live in the user's project
+    /// indefinitely). chmod'ing it mutates the shared inode's mode
+    /// (0o600 secret → 0o644 world-readable).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn relax_loop_must_not_chmod_hardlinked_external_inode() {
+        let base = tempfile::tempdir().unwrap();
+        // An external precious file with restrictive perms.
+        let outside = base.path().join("secret.txt");
+        fs::write(&outside, b"secret").unwrap();
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o600)).unwrap();
+
+        // A tree whose FIRST remove_dir_all will FAIL (read-only dir) so the
+        // perm-relax retry runs, containing a HARD link to `outside`.
+        let root = base.path().join("tree");
+        fs::create_dir_all(&root).unwrap();
+        fs::hard_link(&outside, root.join("link.txt")).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o555)).unwrap();
+
+        remove_tree(&root).await.unwrap();
+
+        assert!(!root.exists(), "tree should still be removed");
+        let mode = fs::metadata(&outside).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "external hardlinked inode mode was changed to {:o}",
+            mode
+        );
+        assert_eq!(fs::read(&outside).unwrap(), b"secret");
     }
 
     /// Regression: the perm-relax retry must not traverse *through* a

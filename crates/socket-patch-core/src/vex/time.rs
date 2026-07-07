@@ -19,7 +19,7 @@ pub fn now_rfc3339() -> String {
 ///
 /// Pulled out as its own function so the formatting can be unit-tested
 /// against fixed timestamps without mocking the system clock.
-pub fn format_unix_secs_rfc3339(secs: u64) -> String {
+fn format_unix_secs_rfc3339(secs: u64) -> String {
     let (year, month, day, hour, minute, second) = unix_to_ymdhms(secs);
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
@@ -30,7 +30,10 @@ pub fn format_unix_secs_rfc3339(secs: u64) -> String {
 /// <http://howardhinnant.github.io/date_algorithms.html#civil_from_days>.
 /// Adapted to operate on a non-negative second count — socket-patch only
 /// ever stamps "now", so pre-1970 inputs are out of scope.
-fn unix_to_ymdhms(secs: u64) -> (i32, u32, u32, u32, u32, u32) {
+///
+/// Also the date backbone of `utils::telemetry`'s millisecond-precision
+/// timestamps, so this is the single civil-date implementation in the crate.
+pub(crate) fn unix_to_ymdhms(secs: u64) -> (i32, u32, u32, u32, u32, u32) {
     let days = (secs / 86_400) as i64;
     let secs_of_day = (secs % 86_400) as u32;
     let hour = secs_of_day / 3600;
@@ -341,6 +344,60 @@ mod tests {
             assert_eq!(cur.len(), 20, "bad width at secs={secs}: {cur:?}");
             prev = cur;
             secs += STRIDE;
+        }
+    }
+
+    /// Independent brute-force civil-date counter used to cross-check
+    /// `unix_to_ymdhms` (Howard Hinnant's algorithm) without sharing any of
+    /// its arithmetic — so a regression in either is caught.
+    fn brute_days_to_ymd(days: u64) -> (u64, u64, u64) {
+        fn is_leap(y: u64) -> bool {
+            (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400)
+        }
+        let mut rem = days;
+        let mut y = 1970u64;
+        loop {
+            let year_len = if is_leap(y) { 366 } else { 365 };
+            if rem < year_len {
+                break;
+            }
+            rem -= year_len;
+            y += 1;
+        }
+        let months = [
+            31,
+            if is_leap(y) { 29 } else { 28 },
+            31,
+            30,
+            31,
+            30,
+            31,
+            31,
+            30,
+            31,
+            30,
+            31,
+        ];
+        let mut m = 0usize;
+        while rem >= months[m] {
+            rem -= months[m];
+            m += 1;
+        }
+        (y, (m + 1) as u64, rem + 1)
+    }
+
+    /// Exhaustive cross-check against the independent counter across ~1265
+    /// years, covering every leap rule and century boundary through 3235.
+    #[test]
+    fn unix_to_ymdhms_matches_brute_force() {
+        for days in 0..462_000u64 {
+            let (y, m, d, h, mi, s) = unix_to_ymdhms(days * 86_400);
+            assert_eq!((h, mi, s), (0, 0, 0), "midnight expected at day {days}");
+            assert_eq!(
+                (y as u64, m as u64, d as u64),
+                brute_days_to_ymd(days),
+                "mismatch at day {days}"
+            );
         }
     }
 

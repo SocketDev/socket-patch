@@ -240,7 +240,7 @@ async fn populated_manifest_returns_0_json() {
 #[tokio::test]
 async fn absolute_manifest_path_wins_over_cwd() {
     // Manifest lives in tmp_manifest_dir, cwd points elsewhere.
-    // resolve_manifest_path() must prefer the absolute path.
+    // resolved_manifest_path() must prefer the absolute path.
     let tmp_manifest_dir = tempfile::tempdir().unwrap();
     let tmp_cwd = tempfile::tempdir().unwrap();
 

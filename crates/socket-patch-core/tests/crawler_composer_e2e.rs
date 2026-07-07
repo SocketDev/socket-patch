@@ -3,8 +3,6 @@
 //! find_by_purls happy path, crawl_all via installed.json parsing,
 //! malformed installed.json variants.
 
-#![cfg(feature = "composer")]
-
 use std::path::Path;
 
 use socket_patch_core::crawlers::composer_crawler::parse_composer_home_output;
@@ -30,7 +28,6 @@ fn options_at(root: &Path) -> CrawlerOptions {
         cwd: root.to_path_buf(),
         global: false,
         global_prefix: None,
-        batch_size: 100,
     }
 }
 
@@ -179,7 +176,6 @@ async fn crawl_all_via_installed_json_returns_packages() {
         cwd: tmp.path().to_path_buf(),
         global: true,
         global_prefix: Some(tmp.path().join("vendor")),
-        batch_size: 100,
     };
     let result = crawler.crawl_all(&opts).await;
     assert_eq!(result.len(), 1);
@@ -218,7 +214,6 @@ async fn crawl_all_with_corrupt_installed_json_returns_empty() {
         cwd: tmp.path().to_path_buf(),
         global: true,
         global_prefix: Some(vendor.clone()),
-        batch_size: 100,
     };
     let result = crawler.crawl_all(&opts).await;
     assert!(result.is_empty(), "corrupt JSON must yield empty crawl");
@@ -250,7 +245,6 @@ async fn get_vendor_paths_with_global_prefix_passthrough() {
         cwd: tmp.path().to_path_buf(),
         global: true,
         global_prefix: Some(tmp.path().to_path_buf()),
-        batch_size: 100,
     };
     let paths = crawler.get_vendor_paths(&opts).await.unwrap();
     assert_eq!(paths, vec![tmp.path().to_path_buf()]);
@@ -353,7 +347,6 @@ async fn get_vendor_paths_global_via_composer_home_env() {
         cwd: tmp.path().to_path_buf(),
         global: true,
         global_prefix: None,
-        batch_size: 100,
     };
     let paths = crawler.get_vendor_paths(&opts).await.unwrap();
 
@@ -395,7 +388,6 @@ async fn get_vendor_paths_global_via_home_dot_composer_fallback() {
         cwd: tmp.path().to_path_buf(),
         global: true,
         global_prefix: None,
-        batch_size: 100,
     };
     let paths = crawler.get_vendor_paths(&opts).await.unwrap();
 
@@ -448,7 +440,6 @@ async fn get_vendor_paths_global_via_home_xdg_config_composer_fallback() {
         cwd: tmp.path().to_path_buf(),
         global: true,
         global_prefix: None,
-        batch_size: 100,
     };
     let paths = crawler.get_vendor_paths(&opts).await.unwrap();
 
@@ -498,7 +489,6 @@ async fn get_vendor_paths_global_no_composer_no_home_layout_returns_empty() {
         cwd: tmp.path().to_path_buf(),
         global: true,
         global_prefix: None,
-        batch_size: 100,
     };
     let paths = crawler.get_vendor_paths(&opts).await.unwrap();
 
@@ -519,6 +509,67 @@ async fn get_vendor_paths_global_no_composer_no_home_layout_returns_empty() {
     assert!(
         paths.is_empty(),
         "no composer source anywhere must yield empty; got {paths:?}"
+    );
+}
+
+/// A set-but-empty `HOME` (stripped CI/container/sudo environments) must
+/// be treated as unset, not honored: `PathBuf::from("")` turns the
+/// `.composer` / `.config/composer` platform-default probes into
+/// CWD-relative paths, so a `.composer/vendor/` directory inside the
+/// user's project gets scanned as if it were the global composer home.
+/// Twin of the `utils::fs::home_dir` empty-HOME fix.
+#[tokio::test]
+#[serial_test::serial]
+async fn get_vendor_paths_global_empty_home_not_cwd_relative() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Plant a project-local .composer/vendor inside what will be the CWD.
+    tokio::fs::create_dir_all(tmp.path().join(".composer").join("vendor"))
+        .await
+        .unwrap();
+    let empty_path = tempfile::tempdir().unwrap();
+
+    let prev_composer = std::env::var("COMPOSER_HOME").ok();
+    let prev_home = std::env::var("HOME").ok();
+    let prev_profile = std::env::var("USERPROFILE").ok();
+    let prev_path = std::env::var("PATH").ok();
+    let prev_cwd = std::env::current_dir().unwrap();
+    std::env::remove_var("COMPOSER_HOME");
+    std::env::set_var("HOME", "");
+    std::env::set_var("USERPROFILE", "");
+    std::env::set_var("PATH", empty_path.path());
+    std::env::set_current_dir(tmp.path()).unwrap();
+
+    let crawler = ComposerCrawler;
+    let opts = CrawlerOptions {
+        cwd: tmp.path().to_path_buf(),
+        global: true,
+        global_prefix: None,
+    };
+    let paths = crawler.get_vendor_paths(&opts).await.unwrap();
+
+    std::env::set_current_dir(prev_cwd).unwrap();
+    if let Some(v) = prev_composer {
+        std::env::set_var("COMPOSER_HOME", v);
+    }
+    if let Some(v) = prev_home {
+        std::env::set_var("HOME", v);
+    } else {
+        std::env::remove_var("HOME");
+    }
+    if let Some(v) = prev_profile {
+        std::env::set_var("USERPROFILE", v);
+    } else {
+        std::env::remove_var("USERPROFILE");
+    }
+    if let Some(v) = prev_path {
+        std::env::set_var("PATH", v);
+    } else {
+        std::env::remove_var("PATH");
+    }
+
+    assert!(
+        paths.is_empty(),
+        "empty HOME must not resolve to CWD-relative .composer probes; got {paths:?}"
     );
 }
 
@@ -604,7 +655,6 @@ async fn crawl_all_dedups_across_vendor_paths() {
         cwd: tmp.path().to_path_buf(),
         global: true,
         global_prefix: Some(custom_vendor),
-        batch_size: 100,
     };
     let result = crawler.crawl_all(&opts).await;
     assert_eq!(

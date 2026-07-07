@@ -98,13 +98,24 @@ fn git_sha256_file(path: &Path) -> String {
 }
 
 fn run(cwd: &Path, args: &[&str]) -> (i32, String, String) {
-    let out: Output = Command::new(binary())
-        .args(args)
-        .current_dir(cwd)
-        .env_remove("SOCKET_API_TOKEN")
-        .env_remove("SOCKET_API_URL")
-        .output()
-        .expect("failed to execute socket-patch binary");
+    let mut cmd = Command::new(binary());
+    cmd.args(args).current_dir(cwd);
+    // The binary binds a wide `SOCKET_*` env surface (SOCKET_CWD,
+    // SOCKET_DRY_RUN, SOCKET_GLOBAL, SOCKET_GLOBAL_PREFIX, SOCKET_PROXY_URL,
+    // SOCKET_MANIFEST_PATH, ...). An ambient value silently changes what
+    // these tests exercise — SOCKET_DRY_RUN=true turns every `scan --apply`
+    // into a no-op preview, and SOCKET_GLOBAL aims mutations at the host's
+    // *real* global node_modules. Scrub the whole prefix so only the flags
+    // each test passes are in effect; removing SOCKET_API_TOKEN also forces
+    // the public proxy (free-tier). Telemetry opt-outs are deliberately kept
+    // so an opted-out dev stays opted out.
+    for (key, _) in std::env::vars_os() {
+        let name = key.to_string_lossy();
+        if name.starts_with("SOCKET_") && !name.contains("TELEMETRY") {
+            cmd.env_remove(&key);
+        }
+    }
+    let out: Output = cmd.output().expect("failed to execute socket-patch binary");
     let code = out.status.code().unwrap_or(-1);
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     let stderr = String::from_utf8_lossy(&out.stderr).to_string();

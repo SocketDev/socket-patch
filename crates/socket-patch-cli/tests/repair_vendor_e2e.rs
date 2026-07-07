@@ -516,6 +516,185 @@ async fn repair_reconstructs_ledger_from_lockfile_references() {
     assert!(!tgz.exists(), "revert removed the artifact");
 }
 
+/// 7b. Only `state.json` was lost; the committed artifact survived INTACT.
+///     Repair restores the ledger entry from the lockfile reference without
+///     rebuilding — the artifact bytes stay untouched and the re-synthesized
+///     entry fingerprints them.
+#[tokio::test]
+async fn repair_restores_ledger_for_intact_surviving_artifact() {
+    let mock = MockServer::start().await;
+    mount_patch_api(&mock).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_fixture(
+        tmp.path(),
+        "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+        "sha512-orig==",
+    );
+    let tgz = vendor_project(tmp.path(), &mock.uri(), &[]);
+    let vendored_bytes = std::fs::read(&tgz).unwrap();
+
+    std::fs::remove_file(tmp.path().join(".socket/vendor/state.json")).unwrap();
+
+    mount_blob(&mock).await;
+    let (code, stdout, stderr) = run_cli(
+        tmp.path(),
+        &mock.uri(),
+        &["repair", "--download-mode", "file"],
+    );
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    let v = parse_env(&stdout);
+    assert!(
+        events_of(&v)
+            .iter()
+            .any(|e| e["action"] == "rebuilt" && e["details"]["ledgerRestored"] == true),
+        "envelope={v}"
+    );
+    assert_eq!(
+        std::fs::read(&tgz).unwrap(),
+        vendored_bytes,
+        "an intact artifact is restored, not rebuilt"
+    );
+    let state: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(tmp.path().join(".socket/vendor/state.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        state["entries"][PURL]["artifact"]["sha256"],
+        sha256_hex(&vendored_bytes),
+        "state={state}"
+    );
+}
+
+/// 7c. `state.json` lost AND the surviving artifact DRIFTED from the wired
+///     lock integrity while its patched members still verify (an unpatched
+///     member was altered — exactly the drift the whole-file ledger sha
+///     would have caught, but the re-synthesized entry has no sha yet).
+///     Reconstruction must not bless the drifted bytes into the new ledger:
+///     the artifact is rebuilt and reproduces the wired integrity.
+#[tokio::test]
+async fn repair_ledger_reconstruction_rejects_drifted_surviving_artifact() {
+    let mock = MockServer::start().await;
+    mount_patch_api(&mock).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_fixture(
+        tmp.path(),
+        "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+        "sha512-orig==",
+    );
+    let tgz = vendor_project(tmp.path(), &mock.uri(), &[]);
+    let lock: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap(),
+    )
+    .unwrap();
+    let wired_sri = lock["packages"]["node_modules/left-pad"]["integrity"]
+        .as_str()
+        .expect("vendor wired the lock integrity")
+        .to_string();
+
+    std::fs::remove_file(tmp.path().join(".socket/vendor/state.json")).unwrap();
+    // Drift: an UNPATCHED member changes; the patched member keeps its
+    // AFTER bytes, so per-file afterHashes still verify.
+    let mut drifted = tar::Builder::new(flate2::write::GzEncoder::new(
+        Vec::new(),
+        flate2::Compression::default(),
+    ));
+    for (p, bytes) in [
+        (
+            "package/package.json",
+            br#"{"name":"left-pad","version":"1.3.0","scripts":{"postinstall":"evil"}}"#.as_slice(),
+        ),
+        ("package/index.js", AFTER),
+    ] {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(bytes.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        drifted.append_data(&mut header, p, bytes).unwrap();
+    }
+    let drifted = drifted.into_inner().unwrap().finish().unwrap();
+    assert_ne!(sri_of(&drifted), wired_sri, "fixture must actually drift");
+    std::fs::write(&tgz, &drifted).unwrap();
+
+    mount_blob(&mock).await;
+    let (code, stdout, stderr) = run_cli(
+        tmp.path(),
+        &mock.uri(),
+        &["repair", "--download-mode", "file"],
+    );
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    let v = parse_env(&stdout);
+    // THE regression: after a successful repair the committed artifact must
+    // be the bytes the rewired lock records — not the drifted ones blessed
+    // into the reconstructed ledger.
+    assert_eq!(
+        sri_of(&std::fs::read(&tgz).unwrap()),
+        wired_sri,
+        "envelope={v}"
+    );
+    let state: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(tmp.path().join(".socket/vendor/state.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        state["entries"][PURL]["artifact"]["sha256"],
+        sha256_hex(&std::fs::read(&tgz).unwrap()),
+        "state={state}"
+    );
+}
+
+/// 7d. `.socket/vendor` deleted wholesale AND the installed copy's UNPATCHED
+///     member tampered (the patched file keeps its pristine bytes, so the
+///     backend's per-file checks all pass). The reconstruction rebuilds from
+///     the installed copy, so the rebuilt artifact cannot reproduce the wired
+///     lock integrity — the same trust anchor tests 9/10 enforce for the
+///     unverified-fetch rung. It must be rejected fail-closed (nothing kept,
+///     exit 1), never blessed into the reconstructed ledger while `npm ci`
+///     stays broken.
+#[tokio::test]
+async fn repair_reconstruction_rejects_tampered_installed_copy() {
+    let mock = MockServer::start().await;
+    mount_patch_api(&mock).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_fixture(
+        tmp.path(),
+        "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+        "sha512-orig==",
+    );
+    let tgz = vendor_project(tmp.path(), &mock.uri(), &[]);
+
+    std::fs::remove_dir_all(tmp.path().join(".socket/vendor")).unwrap();
+    // Tamper the installed copy's UNPATCHED member; name/version stay intact
+    // so the crawler still finds the package, and the patched index.js keeps
+    // its BEFORE bytes so per-file hash checks pass.
+    std::fs::write(
+        tmp.path().join("node_modules/left-pad/package.json"),
+        br#"{"name":"left-pad","version":"1.3.0","scripts":{"postinstall":"evil"}}"#,
+    )
+    .unwrap();
+
+    mount_blob(&mock).await;
+    let (code, stdout, stderr) = run_cli(
+        tmp.path(),
+        &mock.uri(),
+        &["repair", "--download-mode", "file"],
+    );
+    assert_eq!(code, 1, "stdout={stdout} stderr={stderr}");
+    let v = parse_env(&stdout);
+    assert!(
+        events_of(&v).iter().any(|e| e["action"] == "failed"
+            && e["errorCode"] == "vendor_artifact_rebuild_failed"
+            && e["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("integrity the lockfile records")),
+        "envelope={v}"
+    );
+    assert!(
+        !tgz.exists(),
+        "a rebuild that cannot reproduce the wired integrity must not be kept"
+    );
+}
+
 /// 8. No ledger AND no manifest — only the rewired lockfile: the uuid in
 ///    the lock path drives an API view fetch and the entry is re-created
 ///    DETACHED (manifest-invisible), with the artifact rebuilt.

@@ -46,7 +46,11 @@ const SOCKET_ENV_VARS: &[&str] = &[
     "SOCKET_PROXY_URL",
     "SOCKET_ECOSYSTEMS",
     "SOCKET_DOWNLOAD_MODE",
+    "SOCKET_VENDOR_SOURCE",
+    "SOCKET_VENDOR_URL",
+    "SOCKET_PATCH_SERVER_URL",
     "SOCKET_OFFLINE",
+    "SOCKET_STRICT",
     "SOCKET_GLOBAL",
     "SOCKET_GLOBAL_PREFIX",
     "SOCKET_JSON",
@@ -138,7 +142,11 @@ struct Snap {
     proxy_url: String,
     ecosystems: Option<Vec<String>>,
     download_mode: String,
+    vendor_source: String,
+    vendor_url: Option<String>,
+    patch_server_url: Option<String>,
     offline: bool,
+    strict: bool,
     global: bool,
     global_prefix: Option<PathBuf>,
     json: bool,
@@ -163,7 +171,11 @@ fn snapshot(a: &RepairArgs) -> Snap {
         proxy_url: a.common.proxy_url.clone(),
         ecosystems: a.common.ecosystems.clone(),
         download_mode: a.common.download_mode.clone(),
+        vendor_source: a.common.vendor_source.clone(),
+        vendor_url: a.common.vendor_url.clone(),
+        patch_server_url: a.common.patch_server_url.clone(),
         offline: a.common.offline,
+        strict: a.common.strict,
         global: a.common.global,
         global_prefix: a.common.global_prefix.clone(),
         json: a.common.json,
@@ -195,7 +207,11 @@ fn expected_defaults() -> Snap {
         proxy_url: "https://patches-api.socket.dev".to_string(),
         ecosystems: None,
         download_mode: "diff".to_string(),
+        vendor_source: "auto".to_string(),
+        vendor_url: None,
+        patch_server_url: None,
         offline: false,
+        strict: false,
         global: false,
         global_prefix: None,
         json: false,
@@ -385,8 +401,10 @@ fn repair_gc_alias_accepts_flags() {
 /// fall back to the default (false)", not abort every `repair` invocation
 /// with a ValueValidation error. The flattened `GlobalArgs` bool flags
 /// already have this semantic via `parse_bool_flag`; `repair`'s own
-/// `--download-only` env binding must match (it is also outside
-/// `GLOBAL_ARG_ENV_VARS`, so `main`'s empty-var scrub never rescues it).
+/// `--download-only` env binding must match. (`main`'s empty-var scrub also
+/// removes a blank `SOCKET_DOWNLOAD_ONLY` via `LOCAL_ARG_ENV_VARS`, but the
+/// parser itself must not depend on it — library callers of `Cli::parse`
+/// never run the scrub, as this test's direct `try_parse_from` shows.)
 #[test]
 #[serial_test::serial]
 fn empty_download_only_env_var_parses_as_false_not_crash() {
@@ -417,6 +435,48 @@ fn truthy_download_only_env_var_sets_flag() {
     match cli.command {
         Commands::Repair(a) => assert!(a.download_only),
         _ => panic!("expected Repair"),
+    }
+}
+
+// --- Hermeticity of the scrub itself -------------------------------------------
+
+#[test]
+#[serial_test::serial]
+fn scrub_covers_every_global_env_var_clap_consults() {
+    // [`SOCKET_ENV_VARS`] claims to list "every SOCKET_* env var that clap
+    // consults while parsing `repair`". `GlobalArgs` is flattened in whole,
+    // so the production `GLOBAL_ARG_ENV_VARS` list is the oracle — a flag
+    // added to `GlobalArgs` with an env binding is consulted here the moment
+    // it lands, and if the scrub list lags behind, an ambient value either
+    // aborts every parse in this file (validated flags: bools, ints,
+    // `--ecosystems`, `--vendor-source`) or silently leaks into the parsed
+    // args (string flags), voiding the hermeticity the module doc promises.
+    // `garbage` is rejected by every validating parser and visibly
+    // non-default for every string/path/option flag, so a missing scrub
+    // entry fails loudly either way. Mirrors `cli_parse_get.rs`.
+    for &var in socket_patch_cli::args::GLOBAL_ARG_ENV_VARS {
+        let prev = std::env::var(var).ok();
+        std::env::set_var(var, "garbage");
+        let parsed = {
+            let _scrub = EnvScrub::new();
+            Cli::try_parse_from(["socket-patch", "repair"])
+        };
+        match prev {
+            Some(v) => std::env::set_var(var, v),
+            None => std::env::remove_var(var),
+        }
+        let a = match parsed {
+            Ok(cli) => match cli.command {
+                Commands::Repair(a) => a,
+                _ => panic!("expected Repair"),
+            },
+            Err(e) => panic!("ambient {var}=garbage aborted the scrubbed parse: {e}"),
+        };
+        assert_eq!(
+            snapshot(&a),
+            expected_defaults(),
+            "ambient {var}=garbage leaked into the scrubbed parse",
+        );
     }
 }
 

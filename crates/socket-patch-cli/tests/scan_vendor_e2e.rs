@@ -145,6 +145,37 @@ async fn mount_patch_api(mock: &MockServer, uuid: &str) {
         .await;
 }
 
+/// Spawn the built binary in `root` with `extra_env` injected into the
+/// child environment.
+fn run_cli_env(root: &Path, argv: &[&str], extra_env: &[(&str, &str)]) -> (i32, String, String) {
+    let mut cmd = Command::new(binary());
+    cmd.args(argv).current_dir(root);
+    // Scrub the ambient `SOCKET_*` surface (prefix scrub — fixed lists rot)
+    // so a developer's shell can't steer the child, then force the telemetry
+    // kill-switch: telemetry resolves its endpoint from `SOCKET_API_URL` /
+    // `SOCKET_PROXY_URL` env ONLY (`--api-url` is invisible to it), so an
+    // ambient value would send every run's events to the LIVE API with the
+    // fake bearer token. Caller-supplied env lands last so explicit
+    // injections survive the scrub —
+    // `scan_vendor_emits_no_telemetry_even_with_endpoint_env` seeds those
+    // endpoint vars deliberately and proves the kill-switch still holds.
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("SOCKET_") {
+            cmd.env_remove(&key);
+        }
+    }
+    cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().expect("run");
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
 fn run_scan_vendor(root: &Path, mock_uri: &str, extra: &[&str]) -> (i32, String, String) {
     let mut argv = vec![
         "scan",
@@ -159,16 +190,7 @@ fn run_scan_vendor(root: &Path, mock_uri: &str, extra: &[&str]) -> (i32, String,
         ORG_SLUG,
     ];
     argv.extend_from_slice(extra);
-    let out = Command::new(binary())
-        .args(&argv)
-        .current_dir(root)
-        .output()
-        .expect("run");
-    (
-        out.status.code().unwrap_or(-1),
-        String::from_utf8_lossy(&out.stdout).into_owned(),
-        String::from_utf8_lossy(&out.stderr).into_owned(),
-    )
+    run_cli_env(root, &argv, &[])
 }
 
 /// Vendor flows hold patch content in MEMORY: `.socket/` must end up with
@@ -409,6 +431,95 @@ async fn scan_vendor_dry_run_previews_without_touching_disk() {
     );
 }
 
+/// Interactive (non-JSON) `scan --vendor --detached` with a failing patch
+/// view fetch must SAY what failed: exit 1 with a `[fail]` line naming the
+/// purl on stderr. Regression guard: `download_patch_records`' failure arms
+/// recorded the error only in their JSON report, so the human path exited
+/// non-zero with no error output at all (the JSON report is discarded and
+/// the vendor engine just says "No vendorable patches in scope").
+#[tokio::test]
+async fn scan_vendor_detached_fetch_failure_reports_error() {
+    let mock = MockServer::start().await;
+    // Discovery succeeds (batch + per-package search, same shapes as
+    // `mount_patch_api`), but the view fetch fails.
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/batch")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "packages": [{
+                "purl": PURL,
+                "patches": [{
+                    "uuid": UUID,
+                    "purl": PURL,
+                    "tier": "free",
+                    "cveIds": ["CVE-2026-0001"],
+                    "ghsaIds": [],
+                    "severity": "high",
+                    "title": "vendor target"
+                }]
+            }],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/v0/orgs/{ORG_SLUG}/patches/by-package/{ENCODED}"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "patches": [{
+                "uuid": UUID,
+                "purl": PURL,
+                "publishedAt": "2026-01-01T00:00:00Z",
+                "description": "Vendor patch",
+                "license": "MIT",
+                "tier": "free",
+                "vulnerabilities": {}
+            }],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/view/{UUID}")))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&mock)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_fixture(tmp.path());
+
+    let out = Command::new(binary())
+        .args([
+            "scan",
+            "--vendor",
+            "--detached",
+            "--yes",
+            "--api-url",
+            &mock.uri(),
+            "--api-token",
+            "fake-token",
+            "--org",
+            ORG_SLUG,
+        ])
+        .current_dir(tmp.path())
+        .env("SOCKET_TELEMETRY_DISABLED", "1")
+        .output()
+        .expect("run");
+    let code = out.status.code().unwrap_or(-1);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert_eq!(
+        code, 1,
+        "a failed download must exit non-zero; stdout={stdout}; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("[fail]") && stderr.contains("left-pad"),
+        "the failed fetch must be reported on stderr, not swallowed; \
+         stdout={stdout}; stderr={stderr}"
+    );
+}
+
 #[tokio::test]
 async fn scan_vendor_flag_conflicts_are_clap_errors() {
     // --vendor conflicts with --apply/--sync; --detached requires --vendor.
@@ -433,6 +544,70 @@ async fn scan_vendor_flag_conflicts_are_clap_errors() {
             "argv={argv:?}: {stderr}"
         );
     }
+}
+
+/// No invocation in this suite may emit telemetry. Telemetry resolves its
+/// endpoint from `SOCKET_API_URL` / `SOCKET_PROXY_URL` env ONLY (the
+/// `--api-url` flag is invisible to it — utils::telemetry), so the
+/// unhardened harness sent every successful run's `patch_vendored` event to
+/// the LIVE `/v0/orgs/test-org/telemetry` with the fake bearer token. Seed
+/// the child env with a reachable endpoint (worst case for the kill-switch)
+/// and prove not a single telemetry request escapes.
+#[tokio::test]
+async fn scan_vendor_emits_no_telemetry_even_with_endpoint_env() {
+    let mock = MockServer::start().await;
+    mount_patch_api(&mock, UUID).await;
+    // Accept both telemetry arms: authenticated (`/v0/orgs/<slug>/telemetry`)
+    // and public-proxy (`/patch/telemetry`). Unmatched requests are recorded
+    // by wiremock anyway; mounting keeps the child's send path realistic.
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG_SLUG}/telemetry")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/patch/telemetry"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .mount(&mock)
+        .await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_fixture(tmp.path());
+
+    let mock_uri = mock.uri();
+    let (code, stdout, stderr) = run_cli_env(
+        tmp.path(),
+        &[
+            "scan",
+            "--json",
+            "--vendor",
+            "--yes",
+            "--api-url",
+            &mock_uri,
+            "--api-token",
+            "fake-token",
+            "--org",
+            ORG_SLUG,
+        ],
+        &[
+            ("SOCKET_API_URL", mock_uri.as_str()),
+            ("SOCKET_PROXY_URL", mock_uri.as_str()),
+        ],
+    );
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+
+    let telemetry: Vec<String> = mock
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.url.path().to_string())
+        .filter(|p| p.contains("telemetry"))
+        .collect();
+    assert!(
+        telemetry.is_empty(),
+        "test runs must never phone telemetry home (live-API leak when \
+         SOCKET_API_URL is unset); observed: {telemetry:?}"
+    );
 }
 
 // ───────────── percent-encoded scoped purls (API canonical form) ─────────────
@@ -1142,6 +1317,142 @@ async fn scan_discovers_lockfile_only_packages_with_warning() {
     assert!(
         stderr.contains("not yet installed (lockfile-only)"),
         "stderr={stderr}"
+    );
+}
+
+/// The not-installed flag must survive the API's purl spelling: the
+/// patches API serves purls in canonical percent-encoded form
+/// (`pkg:npm/%40scope/...` — see `utils::purl`), while the lockfile
+/// supplement records the literal on-disk form (`pkg:npm/@scope/...`).
+/// The apply-path skip partitions already bridge the encodings via
+/// `normalize_purl`; the JSON `notInstalled` flag and the table's
+/// `[NOT INSTALLED]` marker must agree with them.
+#[tokio::test]
+async fn scan_flags_scoped_lockfile_only_package_despite_api_purl_encoding() {
+    const SCOPED_ENCODED: &str = "pkg:npm/%40scope/left-pad@1.3.0";
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/batch")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "packages": [{
+                "purl": SCOPED_ENCODED,
+                "patches": [{
+                    "uuid": UUID,
+                    "purl": SCOPED_ENCODED,
+                    "tier": "free",
+                    "cveIds": ["CVE-2026-0001"],
+                    "ghsaIds": [],
+                    "severity": "high",
+                    "title": "scoped fixture"
+                }]
+            }],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(&mock)
+        .await;
+    // Detail route for the human run's fetch phase (the purl is
+    // URL-encoded into the path — match any by-package request).
+    Mock::given(method("GET"))
+        .and(wiremock::matchers::path_regex(format!(
+            "^/v0/orgs/{ORG_SLUG}/patches/by-package/.+$"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "patches": [{
+                "uuid": UUID,
+                "purl": SCOPED_ENCODED,
+                "publishedAt": "2026-01-01T00:00:00Z",
+                "description": "Scoped patch",
+                "license": "MIT",
+                "tier": "free",
+                "vulnerabilities": {}
+            }],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(&mock)
+        .await;
+
+    // Lockfile-only fixture for @scope/left-pad (literal on-disk spelling,
+    // no node_modules).
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("package.json"),
+        r#"{ "name": "scoped-test", "version": "0.0.0", "dependencies": { "@scope/left-pad": "^1.3.0" } }"#,
+    )
+    .unwrap();
+    let lock = serde_json::json!({
+        "name": "scoped-test",
+        "version": "0.0.0",
+        "lockfileVersion": 3,
+        "requires": true,
+        "packages": {
+            "": {
+                "name": "scoped-test",
+                "version": "0.0.0",
+                "dependencies": { "@scope/left-pad": "^1.3.0" }
+            },
+            "node_modules/@scope/left-pad": {
+                "version": "1.3.0",
+                "resolved": "https://registry.npmjs.org/@scope/left-pad/-/left-pad-1.3.0.tgz",
+                "integrity": "sha512-unused==",
+                "license": "WTFPL"
+            }
+        }
+    });
+    std::fs::write(
+        tmp.path().join("package-lock.json"),
+        serde_json::to_vec_pretty(&lock).unwrap(),
+    )
+    .unwrap();
+
+    // JSON: the additive notInstalled flag must be set even though the
+    // API spelled the purl percent-encoded.
+    let out = Command::new(binary())
+        .args([
+            "scan",
+            "--json",
+            "--api-url",
+            &mock.uri(),
+            "--api-token",
+            "fake-token",
+            "--org",
+            ORG_SLUG,
+        ])
+        .current_dir(tmp.path())
+        .env("SOCKET_TELEMETRY_DISABLED", "1")
+        .output()
+        .expect("run");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert_eq!(v["lockfileOnlyPackages"], 1, "{v}");
+    assert_eq!(v["packages"][0]["purl"], SCOPED_ENCODED, "{v}");
+    assert_eq!(
+        v["packages"][0]["notInstalled"], true,
+        "notInstalled must bridge the API's percent-encoded purl: {v}"
+    );
+
+    // Human table: the [NOT INSTALLED] marker must match through the
+    // encoding difference too.
+    let out = Command::new(binary())
+        .args([
+            "scan",
+            "--api-url",
+            &mock.uri(),
+            "--api-token",
+            "fake-token",
+            "--org",
+            ORG_SLUG,
+            "--dry-run",
+            "--yes",
+        ])
+        .current_dir(tmp.path())
+        .env("SOCKET_TELEMETRY_DISABLED", "1")
+        .output()
+        .expect("run");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stdout.contains("[NOT INSTALLED]"),
+        "stdout={stdout}; stderr={stderr}"
     );
 }
 

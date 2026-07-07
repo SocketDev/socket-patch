@@ -20,7 +20,10 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-pub mod state;
+use crate::crawlers::python_crawler::canonicalize_pypi_name;
+use crate::patch::vendor::yarn_berry_lock::yarnrc_compression_level;
+
+mod state;
 pub use state::{load_redirect_state, RedirectState, REDIRECT_STATE_REL};
 
 /// One ecosystem's integrity hashes (mirrors the TS `PatchArtifactIntegrity`).
@@ -178,6 +181,12 @@ fn rewrite_npm_lock(
         return;
     };
     let Ok(mut lock) = serde_json::from_str::<Value>(&files[lockfile]) else {
+        // A corrupt lockfile is strictly worse than a missing one (which
+        // warns above) — never skip the whole npm redirect silently.
+        result.warnings.push(RewriteWarning {
+            code: "redirect_npm_lock_unparseable".into(),
+            detail: format!("{lockfile} is not valid JSON; npm redirect skipped"),
+        });
         return;
     };
     let mut changed = false;
@@ -281,23 +290,6 @@ fn rewrite_npm_v2_deps(
 }
 
 // ── pip requirements.txt ────────────────────────────────────────────────────
-fn normalize_py_name(name: &str) -> String {
-    let mut out = String::new();
-    let mut prev_dash = false;
-    for ch in name.to_lowercase().chars() {
-        if ch == '-' || ch == '_' || ch == '.' {
-            if !prev_dash {
-                out.push('-');
-                prev_dash = true;
-            }
-        } else {
-            out.push(ch);
-            prev_dash = false;
-        }
-    }
-    out
-}
-
 fn rewrite_pypi_requirements(
     files: &BTreeMap<String, String>,
     overrides: &[DepOverride],
@@ -321,7 +313,7 @@ fn rewrite_pypi_requirements(
             });
             continue;
         };
-        let target = normalize_py_name(&dep.name);
+        let target = canonicalize_pypi_name(&dep.name);
         for raw in lines.iter_mut() {
             let line = raw.trim();
             if line.is_empty() || line.starts_with('#') || line.starts_with('-') {
@@ -330,7 +322,7 @@ fn rewrite_pypi_requirements(
             let Some(caps) = name_re.captures(line) else {
                 continue;
             };
-            if normalize_py_name(&caps[1]) != target {
+            if canonicalize_pypi_name(&caps[1]) != target {
                 continue;
             }
             // pip-compile --generate-hashes emits backslash continuations
@@ -387,10 +379,6 @@ fn rewrite_pypi_requirements(
 }
 
 // ── cargo (Cargo.toml + .cargo/config.toml + Cargo.lock) ─────────────────────
-fn cargo_registry_name(patch_uuid: &str) -> String {
-    format!("socket-patch-{patch_uuid}")
-}
-
 fn rewrite_cargo(
     files: &BTreeMap<String, String>,
     overrides: &[DepOverride],
@@ -431,7 +419,7 @@ fn rewrite_cargo(
             });
             continue;
         };
-        let reg = cargo_registry_name(&dep.patch_uuid);
+        let reg = format!("socket-patch-{}", dep.patch_uuid);
         let index_url = &ov.index_url;
 
         // 1. .cargo/config.toml registry definition (idempotent).
@@ -457,14 +445,19 @@ fn rewrite_cargo(
 
         // 2. Cargo.toml dep → add `registry = "<reg>"`.
         if let Some(toml) = cargo_toml.as_mut() {
-            if let Some(edit) = add_cargo_toml_registry(toml, &dep.name, &reg) {
-                result.edits.push(edit);
-                toml_changed = true;
-            } else {
-                result.warnings.push(RewriteWarning {
-                    code: "redirect_cargo_toml_dep_not_found".into(),
-                    detail: format!("no [dependencies] entry for {} in Cargo.toml", dep.name),
-                });
+            match add_cargo_toml_registry(toml, &dep.name, &reg) {
+                CargoTomlRewrite::Rewritten(edit) => {
+                    result.edits.push(*edit);
+                    toml_changed = true;
+                }
+                // Re-run over an already-redirected Cargo.toml: not missing.
+                CargoTomlRewrite::AlreadyRedirected => {}
+                CargoTomlRewrite::NotFound => {
+                    result.warnings.push(RewriteWarning {
+                        code: "redirect_cargo_toml_dep_not_found".into(),
+                        detail: format!("no [dependencies] entry for {} in Cargo.toml", dep.name),
+                    });
+                }
             }
         }
 
@@ -507,14 +500,31 @@ fn rewrite_cargo(
     }
 }
 
-fn add_cargo_toml_registry(content: &mut String, crate_name: &str, reg: &str) -> Option<FileEdit> {
+/// Outcome of the Cargo.toml dependency rewrite — a re-run over an entry that
+/// already carries OUR `registry = "socket-patch-…"` is "already redirected"
+/// (silent), not "dependency not found" (caller warns).
+enum CargoTomlRewrite {
+    Rewritten(Box<FileEdit>),
+    AlreadyRedirected,
+    NotFound,
+}
+
+fn add_cargo_toml_registry(content: &mut String, crate_name: &str, reg: &str) -> CargoTomlRewrite {
     let c = regex::escape(crate_name);
     // Inline table: `crate = { version = "…", … }`.
     let table_re = Regex::new(&format!(r"(?m)^({c}\s*=\s*\{{)([^}}\n]*)(\}})")).unwrap();
     if let Some(m) = table_re.captures(content) {
         let inner = m.get(2).unwrap().as_str();
+        if Regex::new(&format!(r#"\bregistry\s*=\s*"{}""#, regex::escape(reg)))
+            .unwrap()
+            .is_match(inner)
+        {
+            return CargoTomlRewrite::AlreadyRedirected;
+        }
         if Regex::new(r"\bregistry\s*=").unwrap().is_match(inner) {
-            return None;
+            // Pinned to some OTHER registry — leave it alone; the caller's
+            // warning surfaces that the redirect did not land.
+            return CargoTomlRewrite::NotFound;
         }
         let whole = m.get(0).unwrap().as_str().to_string();
         let inner_trim = inner.trim_end();
@@ -529,14 +539,14 @@ fn add_cargo_toml_registry(content: &mut String, crate_name: &str, reg: &str) ->
             m.get(3).unwrap().as_str()
         );
         *content = content.replacen(&whole, &rebuilt, 1);
-        return Some(FileEdit {
+        return CargoTomlRewrite::Rewritten(Box::new(FileEdit {
             path: "Cargo.toml".into(),
             kind: "redirect_cargo_toml_dep".into(),
             action: "rewritten".into(),
             key: Some(crate_name.into()),
             original: Some(Value::String(whole)),
             new: Some(Value::String(rebuilt)),
-        });
+        }));
     }
     // Plain version: `crate = "1.0"`.
     let ver_re = Regex::new(&format!(r#"(?m)^({c}\s*=\s*)"([^"]+)"\s*$"#)).unwrap();
@@ -548,16 +558,16 @@ fn add_cargo_toml_registry(content: &mut String, crate_name: &str, reg: &str) ->
             m.get(2).unwrap().as_str()
         );
         *content = content.replacen(&whole, &rebuilt, 1);
-        return Some(FileEdit {
+        return CargoTomlRewrite::Rewritten(Box::new(FileEdit {
             path: "Cargo.toml".into(),
             kind: "redirect_cargo_toml_dep".into(),
             action: "rewritten".into(),
             key: Some(crate_name.into()),
             original: Some(Value::String(whole)),
             new: Some(Value::String(rebuilt)),
-        });
+        }));
     }
-    None
+    CargoTomlRewrite::NotFound
 }
 
 fn set_cargo_lock_source(
@@ -634,22 +644,20 @@ enum CargoLockRewrite {
 }
 
 // ── pnpm-lock.yaml ───────────────────────────────────────────────────────────
-/// A `pnpm-lock.yaml` is `pnpm-lock.yaml` at the project root or at any nested
-/// path (e.g. Rush repos keep them under `common/config/rush/`). Every such
-/// files-map key is rewritten under the same grammar.
-fn is_pnpm_lock_key(key: &str) -> bool {
-    key == "pnpm-lock.yaml" || key.ends_with("/pnpm-lock.yaml")
-}
-
 fn rewrite_pnpm_lock(
     files: &BTreeMap<String, String>,
     overrides: &[DepOverride],
     result: &mut RewriteResult,
 ) {
     let npm: Vec<&DepOverride> = overrides.iter().filter(|o| o.ecosystem == "npm").collect();
-    // Deterministic order: BTreeMap iterates keys sorted, so goldens are
-    // stable across every pnpm lock in the set.
-    let lock_keys: Vec<&String> = files.keys().filter(|k| is_pnpm_lock_key(k)).collect();
+    // A pnpm lock lives at the project root or at any nested path (e.g. Rush
+    // repos keep them under `common/config/rush/`); every such files-map key
+    // is rewritten under the same grammar. Deterministic order: BTreeMap
+    // iterates keys sorted, so goldens are stable across every lock in the set.
+    let lock_keys: Vec<&String> = files
+        .keys()
+        .filter(|k| k.as_str() == "pnpm-lock.yaml" || k.ends_with("/pnpm-lock.yaml"))
+        .collect();
     if npm.is_empty() || lock_keys.is_empty() {
         return;
     }
@@ -668,12 +676,16 @@ fn rewrite_pnpm_lock(
             });
             continue;
         };
-        // `(^ {2}/?<fn>@<ver>:\n(?: {4,}.*\n)*? {4,}resolution: )\{([^}\n]*)\}`
-        let pat = String::from(r"(?m)(^ {2}/?")
-            + &regex::escape(&fname)
-            + "@"
-            + &regex::escape(&dep.version)
-            + r":\n(?: {4,}.*\n)*? {4,}resolution: )\{([^}\n]*)\}";
+        // `(^ {2}(?:'<key>'|/?<key>):\n(?: {4,}.*\n)*? {4,}resolution: )\{([^}\n]*)\}`
+        // where `<key>` is `<fn>@<ver>`. lockfileVersion 9 single-quotes keys
+        // that begin with `@` (`'@scope/name@1.0.0':` — YAML forbids a plain
+        // scalar starting with `@`); v6 keys start with `/` and are unquoted.
+        let key = regex::escape(&fname) + "@" + &regex::escape(&dep.version);
+        let pat = String::from(r"(?m)(^ {2}(?:'")
+            + &key
+            + r"'|/?"
+            + &key
+            + r"):\n(?: {4,}.*\n)*? {4,}resolution: )\{([^}\n]*)\}";
         let re = Regex::new(&pat).unwrap();
         let mut matched_any = false;
         for (key, content, changed) in &mut contents {
@@ -839,15 +851,6 @@ fn berry_cache_key(content: &str) -> Option<String> {
         }
     }
     None
-}
-
-/// `.yarnrc.yml` `compressionLevel:` scalar, when set (flat top-level line
-/// scan — yarn writes it as a top-level scalar, spike B4).
-fn yarnrc_compression_level(rc: &str) -> Option<String> {
-    rc.lines().find_map(|line| {
-        let rest = line.strip_prefix("compressionLevel:")?;
-        Some(rest.trim().trim_matches(['\'', '"']).to_string())
-    })
 }
 
 /// Split `name@npm:...` at the `@` past a leading `@scope/` marker.
@@ -1046,7 +1049,7 @@ fn rewrite_bun_lock(
     result: &mut RewriteResult,
 ) {
     use crate::patch::bun_lock_text::{
-        check_lock_version, decode_json_string, parse_packages_section, split_name_spec,
+        check_lock_version, decode_json_string, parse_packages_section,
     };
 
     let npm: Vec<&DepOverride> = overrides.iter().filter(|o| o.ecosystem == "npm").collect();
@@ -1122,9 +1125,8 @@ fn rewrite_bun_lock(
                 }
                 deps_verbatim = entry.elems[1].clone();
             } else {
-                // `split_name_spec` guards a same-name-but-unowned entry (user
-                // file:/URL dep, other version) — never touched.
-                let _ = split_name_spec(&spec);
+                // Same-name-but-unowned entry (user file:/URL dep, other
+                // version) — never touched.
                 continue;
             }
             let original = lines[entry.line_idx].clone();
@@ -1181,7 +1183,7 @@ fn rewrite_uv_lock(
         };
         // Find the [[package]] block for this name+version by string bounds
         // (no lookahead in Rust regex). Iterate over [[package]] starts.
-        let target = normalize_py_name(&dep.name);
+        let target = canonicalize_pypi_name(&dep.name);
         let mut matched = false;
         let marker = "[[package]]\n";
         let mut search = 0usize;
@@ -1196,7 +1198,7 @@ fn rewrite_uv_lock(
             search = block_end;
             let name_ok = name_re
                 .captures(&block)
-                .map(|c| normalize_py_name(&c[1]) == target)
+                .map(|c| canonicalize_pypi_name(&c[1]) == target)
                 .unwrap_or(false);
             let version_ok = block.contains(&format!("version = \"{}\"\n", dep.version))
                 || block.contains(&format!("version = \"{}\"", dep.version));
@@ -1225,8 +1227,12 @@ fn rewrite_uv_lock(
             if !wheel_re.is_match(&body) {
                 continue;
             }
+            // Repoint EVERY url/hash entry in the block — sdist AND all
+            // wheels. uv prefers a wheel, so an upstream `wheels` entry left
+            // behind installs the unpatched artifact while the redirect is
+            // reported (and attested) as landed.
             let new_body = wheel_re
-                .replace(
+                .replace_all(
                     &body,
                     format!(
                         "{{ url = \"{}\", hash = \"sha256:{sha256}\"${{1}} }}",
@@ -1236,6 +1242,9 @@ fn rewrite_uv_lock(
                 )
                 .to_string();
             if new_body == body {
+                // Already redirected (re-run): the entry exists at the target
+                // values — not "entry not found".
+                matched = true;
                 continue;
             }
             content = format!(
@@ -1608,6 +1617,32 @@ fn rewrite_nuget(
 }
 
 // ── rubygems (Gemfile + Gemfile.lock) ────────────────────────────────────────
+
+/// The argument tail of a `gem "name", …` line minus any leading quoted
+/// version-constraint args (`"7.0.0"`, `'~> 7.0'`, `">= 1", "< 2"`) — i.e. the
+/// options (`require: false`, `group: :test`, …) that must survive the move
+/// into the source block. Empty when the line carries none; bails to empty on
+/// an unparseable tail (unbalanced quote), matching the previous behavior.
+/// Shared with the vendor backend's Gemfile rewrite (`patch::vendor::gem`),
+/// which has the same drop-the-options failure mode.
+pub(crate) fn gem_line_trailing_options(tail: &str) -> String {
+    let mut rest = tail.trim_start();
+    loop {
+        let Some(after_comma) = rest.strip_prefix(',') else {
+            return String::new();
+        };
+        let arg = after_comma.trim_start();
+        match arg.chars().next() {
+            Some(q @ ('"' | '\'')) => match arg[1..].find(q) {
+                Some(end) => rest = arg[1 + end + 1..].trim_start(),
+                None => return String::new(),
+            },
+            Some(_) => return arg.trim_end().to_string(),
+            None => return String::new(),
+        }
+    }
+}
+
 fn rewrite_gem(
     files: &BTreeMap<String, String>,
     overrides: &[DepOverride],
@@ -1653,17 +1688,30 @@ fn rewrite_gem(
                 let gem_line_re = Regex::new(
                     &(String::from(r#"(?m)^\s*gem ["']"#)
                         + &regex::escape(&dep.name)
-                        + r#"["'][^\n]*$"#),
+                        + r#"["']([^\n]*)$"#),
                 )
                 .unwrap();
                 let block = format!(
                     "source \"{}\" do\n  gem \"{}\", \"{}\"\nend",
                     ov.index_url, dep.name, dep.version
                 );
-                if let Some(m) = gem_line_re.find(gf) {
-                    let original = m.as_str().to_string();
-                    let new_gf = gem_line_re.replace(gf, block.as_str()).to_string();
-                    *gf = new_gf;
+                if let Some(m) = gem_line_re.captures(gf) {
+                    let original = m.get(0).unwrap().as_str().to_string();
+                    // Trailing options (`require: false`, `group: …`) must
+                    // survive the move into the source block — dropping
+                    // `require: false` auto-requires the gem at boot.
+                    let opts = gem_line_trailing_options(m.get(1).unwrap().as_str());
+                    let block = if opts.is_empty() {
+                        block
+                    } else {
+                        format!(
+                            "source \"{}\" do\n  gem \"{}\", \"{}\", {opts}\nend",
+                            ov.index_url, dep.name, dep.version
+                        )
+                    };
+                    // Plain replacen: the block may carry user text (`opts`),
+                    // which a regex replacement would `$`-expand.
+                    *gf = gf.replacen(&original, &block, 1);
                     gemfile_changed = true;
                     result.edits.push(FileEdit {
                         path: "Gemfile".into(),
@@ -1812,11 +1860,6 @@ const MVN_CONFIG_ARGS: &[&str] = &[
 const MVN_CONFIG: &str = ".mvn/maven.config";
 const MVN_CHECKSUMS: &str = ".mvn/checksums/checksums.sha256";
 
-/// Unique-per-patch maven repository id (valid chars: alnum, `-`, `_`, `.`).
-fn maven_repository_id(patch_uuid: &str) -> String {
-    format!("socket-patch-{patch_uuid}")
-}
-
 /// Strip any `sha256-`/`sha256:` SRI-style prefix off a stored hash, leaving the
 /// bare lowercase hex Maven's trusted-checksums summary file expects (twin of
 /// the TS `bareSha256Hex`).
@@ -1954,7 +1997,8 @@ fn rewrite_maven_pom(
         if pom.is_none() {
             continue;
         }
-        let repo_id = maven_repository_id(&dep.patch_uuid);
+        // Unique-per-patch repository id (valid chars: alnum, `-`, `_`, `.`).
+        let repo_id = format!("socket-patch-{}", dep.patch_uuid);
 
         // LEGACY same-GAV fallback: no suffixed version means the patched jar is
         // served under its original GAV. Add the repository (transport checksum
@@ -2248,36 +2292,23 @@ fn rewrite_maven_pom(
     }
 }
 
-/// The `<repository>` block for the socket-patch source: releases enabled with
+/// Insert the socket-patch `<repository>` block: releases enabled with
 /// `<checksumPolicy>fail</checksumPolicy>` (the transport-level check against
 /// the served `.jar.sha1`); snapshots disabled (patched artifacts are always
-/// released versions). Indented for insertion under a `<repositories>` element.
-fn maven_repository_block(id: &str, url: &str) -> String {
-    format!(
-        "    <repository>\n      <id>{id}</id>\n      <url>{url}</url>\n      <releases>\n        <enabled>true</enabled>\n        <checksumPolicy>fail</checksumPolicy>\n      </releases>\n      <snapshots>\n        <enabled>false</enabled>\n      </snapshots>\n    </repository>"
-    )
-}
-
-/// Insert the socket-patch repository block. Prefer an existing
-/// `<repositories>` element (single replace, inserted first so it's consulted
-/// before the project's other repositories); otherwise author a full
-/// `<repositories>` section immediately before the closing `</project>`.
-/// `<repositories>` is matched exactly so it never collides with
-/// `<pluginRepositories>`.
+/// released versions). Prefer an existing `<repositories>` element (single
+/// replace, inserted first so it's consulted before the project's other
+/// repositories); otherwise author a full `<repositories>` section immediately
+/// before the closing `</project>`. `<repositories>` is matched exactly so it
+/// never collides with `<pluginRepositories>`.
 fn insert_maven_repository(pom: &str, id: &str, url: &str) -> String {
-    let block = maven_repository_block(id, url);
+    let block = format!(
+        "    <repository>\n      <id>{id}</id>\n      <url>{url}</url>\n      <releases>\n        <enabled>true</enabled>\n        <checksumPolicy>fail</checksumPolicy>\n      </releases>\n      <snapshots>\n        <enabled>false</enabled>\n      </snapshots>\n    </repository>"
+    );
     if pom.contains("<repositories>") {
         return pom.replacen("<repositories>", &format!("<repositories>\n{block}"), 1);
     }
     let section = format!("  <repositories>\n{block}\n  </repositories>");
     pom.replacen("</project>", &format!("{section}\n</project>"), 1)
-}
-
-/// A `<dependency>` block for a `<dependencyManagement>` pin (2-space step ×4).
-fn maven_management_dependency_block(group_id: &str, artifact_id: &str, version: &str) -> String {
-    format!(
-        "      <dependency>\n        <groupId>{group_id}</groupId>\n        <artifactId>{artifact_id}</artifactId>\n        <version>{version}</version>\n      </dependency>"
-    )
 }
 
 /// Add a `<dependencyManagement>` version pin. Prefer extending an existing
@@ -2291,7 +2322,9 @@ fn insert_maven_dependency_management(
     artifact_id: &str,
     version: &str,
 ) -> String {
-    let block = maven_management_dependency_block(group_id, artifact_id, version);
+    let block = format!(
+        "      <dependency>\n        <groupId>{group_id}</groupId>\n        <artifactId>{artifact_id}</artifactId>\n        <version>{version}</version>\n      </dependency>"
+    );
     let dm_re = Regex::new(r"(?s)<dependencyManagement>\s*<dependencies>").unwrap();
     if let Some(m) = dm_re.find(pom) {
         let matched = m.as_str();
@@ -3291,5 +3324,263 @@ mod tests {
         rewrite_bun_lock(&files, &[no_sha], &mut r);
         assert!(r.files.is_empty());
         assert_eq!(r.warnings[0].code, "redirect_bun_missing_sha512");
+    }
+
+    /// A realistic uv.lock block carries BOTH an `sdist` entry and a `wheels`
+    /// entry. Every `{ url, hash }` in the block must be repointed at the
+    /// hosted patch: uv PREFERS a wheel, so leaving `wheels` at the upstream
+    /// URL/hash makes the install silently use the UNPATCHED artifact while
+    /// the scan confirms the dep as redirected (the artifact URL landed in
+    /// the sdist slot).
+    #[test]
+    fn uv_lock_sdist_and_wheels_all_repointed() {
+        let lock = "version = 1\nrequires-python = \">=3.8\"\n\n[[package]]\nname = \"requests\"\nversion = \"2.28.1\"\nsource = { registry = \"https://pypi.org/simple\" }\nsdist = { url = \"https://files.pythonhosted.org/packages/aa/requests-2.28.1.tar.gz\", hash = \"sha256:aaaa\" }\nwheels = [\n    { url = \"https://files.pythonhosted.org/packages/bb/requests-2.28.1-py3-none-any.whl\", hash = \"sha256:bbbb\" },\n]\n";
+        let mut files = BTreeMap::new();
+        files.insert("uv.lock".to_string(), lock.to_string());
+        let url = "http://patch.test/requests-2.28.1-py3-none-any.whl";
+        let overrides = vec![pypi_override("requests", "2.28.1", url, &"c".repeat(64))];
+        let first = rewrite_registry_redirect(&files, &overrides);
+        let out = first.files.get("uv.lock").expect("uv.lock rewritten");
+        assert!(
+            !out.contains("files.pythonhosted.org"),
+            "no upstream URL may survive for the redirected dep: {out}"
+        );
+        assert_eq!(
+            out.matches(url).count(),
+            2,
+            "sdist AND wheel repointed: {out}"
+        );
+        assert_eq!(
+            out.matches(&format!("hash = \"sha256:{}\"", "c".repeat(64)))
+                .count(),
+            2,
+            "both hashes pinned: {out}"
+        );
+
+        // Re-run over the rewritten output: a no-op, and NOT reported as
+        // entry-not-found (the entry exists — it is already redirected).
+        let mut again = files.clone();
+        again.insert("uv.lock".to_string(), out.clone());
+        let second = rewrite_registry_redirect(&again, &overrides);
+        assert!(
+            second.files.is_empty() && second.edits.is_empty(),
+            "re-run must be a no-op: files={:?} edits={:?}",
+            second.files.keys(),
+            second.edits
+        );
+        assert!(
+            !second
+                .warnings
+                .iter()
+                .any(|w| w.code == "redirect_uv_entry_not_found"),
+            "already-redirected must not warn entry-not-found: {:?}",
+            second.warnings
+        );
+    }
+
+    fn cargo_sparse_override() -> DepOverride {
+        DepOverride {
+            ecosystem: "cargo".into(),
+            name: "serde".into(),
+            namespace: None,
+            version: "1.0.190".into(),
+            token: "tok".into(),
+            patch_uuid: "uuid".into(),
+            artifact_url: "https://patch.test/serde-1.0.190.crate".into(),
+            berry_zip_url: None,
+            registry_override: Some(RegistryOverride {
+                kind: "cargo-sparse".into(),
+                index_url: "sparse+https://patch.test/cargo/uuid/".into(),
+                identifiers: RegistryOverrideIdentifiers {
+                    name: "serde".into(),
+                    version: "1.0.190".into(),
+                    cargo_cksum_sha256: Some("e".repeat(64)),
+                    ..Default::default()
+                },
+            }),
+            integrity: Integrity::default(),
+        }
+    }
+
+    /// A re-run over already-redirected cargo output must be SILENT: the
+    /// Cargo.toml dep already carries `registry = "socket-patch-…"`, which is
+    /// "already redirected", not "dependency missing" — warning
+    /// `redirect_cargo_toml_dep_not_found` on every re-run is false and sends
+    /// the operator hunting for a [dependencies] entry that exists.
+    #[test]
+    fn cargo_rerun_over_redirected_output_is_silent() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "Cargo.toml".to_string(),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1.0.190\"\n"
+                .to_string(),
+        );
+        files.insert(
+            "Cargo.lock".to_string(),
+            "version = 3\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.190\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"91f70896d6720bc714a4a57d22fc91f1db634680e65c8efe13323f1fa38d53f5\"\n"
+                .to_string(),
+        );
+        let overrides = vec![cargo_sparse_override()];
+        let first = rewrite_registry_redirect(&files, &overrides);
+        assert!(!first.edits.is_empty(), "first pass records edits");
+        assert!(first.warnings.is_empty(), "{:?}", first.warnings);
+
+        let mut again = files.clone();
+        for (name, content) in &first.files {
+            again.insert(name.clone(), content.clone());
+        }
+        let second = rewrite_registry_redirect(&again, &overrides);
+        assert!(
+            second.files.is_empty() && second.edits.is_empty(),
+            "re-run must be a no-op: files={:?} edits={:?}",
+            second.files.keys(),
+            second.edits
+        );
+        assert!(
+            second.warnings.is_empty(),
+            "re-run over redirected output must not warn: {:?}",
+            second.warnings
+        );
+    }
+
+    fn gem_override(name: &str, version: &str) -> DepOverride {
+        DepOverride {
+            ecosystem: "gem".into(),
+            name: name.into(),
+            namespace: None,
+            version: version.into(),
+            token: "tok".into(),
+            patch_uuid: "uuid".into(),
+            artifact_url: format!("https://patch.test/{name}-{version}.gem"),
+            berry_zip_url: None,
+            registry_override: Some(RegistryOverride {
+                kind: "rubygems-compact-index".into(),
+                index_url: "https://patch.test/gem/tok/uuid/".into(),
+                identifiers: RegistryOverrideIdentifiers {
+                    name: name.into(),
+                    version: version.into(),
+                    gem_checksum_sha256: Some("f".repeat(64)),
+                    ..Default::default()
+                },
+            }),
+            integrity: Integrity::default(),
+        }
+    }
+
+    /// Trailing options on the original `gem` line (`require: false`,
+    /// `group: …`) must survive the move into the source block — dropping
+    /// `require: false` auto-requires the gem at boot, changing app behavior
+    /// (e.g. rack-mini-profiler enables itself globally when required).
+    #[test]
+    fn gemfile_rewrite_preserves_trailing_options() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "Gemfile".to_string(),
+            "source \"https://rubygems.org\"\n\ngem \"rack-mini-profiler\", \"3.1.0\", require: false\n"
+                .to_string(),
+        );
+        let r = rewrite_registry_redirect(&files, &[gem_override("rack-mini-profiler", "3.1.0")]);
+        let out = r.files.get("Gemfile").expect("Gemfile rewritten");
+        assert!(
+            out.contains("  gem \"rack-mini-profiler\", \"3.1.0\", require: false\n"),
+            "options preserved inside the source block: {out}"
+        );
+    }
+
+    /// An unparseable package-lock.json must surface a warning, not silently
+    /// skip the npm redirect entirely (missing-lockfile already warns; a
+    /// corrupt lockfile is strictly worse and was silent).
+    #[test]
+    fn npm_unparseable_lockfile_warns() {
+        let mut files = BTreeMap::new();
+        files.insert("package-lock.json".to_string(), "{ not json".to_string());
+        let overrides = vec![npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://patch.test/lp.tgz",
+            "sha512-PATCHED==",
+        )];
+        let r = rewrite_registry_redirect(&files, &overrides);
+        assert!(r.files.is_empty() && r.edits.is_empty());
+        assert!(
+            r.warnings
+                .iter()
+                .any(|w| w.code == "redirect_npm_lock_unparseable"),
+            "corrupt lockfile must warn: {:?}",
+            r.warnings
+        );
+    }
+
+    /// pnpm lockfileVersion 9 single-quotes `packages:` keys that begin with
+    /// `@` (`'@scope/name@1.0.0':` — YAML forbids a plain scalar starting
+    /// with `@`), so the rewriter must match the quoted form too. Without it,
+    /// every scoped npm package silently fails to redirect (entry_not_found
+    /// warning only) while unscoped deps in the same run succeed.
+    #[test]
+    fn pnpm_v9_quoted_scoped_key_is_rewritten() {
+        let lock = "lockfileVersion: '9.0'
+
+importers:
+  .:
+    dependencies:
+      '@socktest/pkg':
+        specifier: 1.0.0
+        version: 1.0.0
+
+packages:
+
+  '@socktest/pkg@1.0.0':
+    resolution: {integrity: sha512-UPSTREAM==}
+
+snapshots:
+
+  '@socktest/pkg@1.0.0': {}
+";
+        let mut files = BTreeMap::new();
+        files.insert("pnpm-lock.yaml".to_string(), lock.to_string());
+        let ovr = npm_override(
+            "@socktest/pkg",
+            "1.0.0",
+            "http://patch.test/socktest-pkg-1.0.0.tgz",
+            "sha512-PATCHED==",
+        );
+        let first = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        let out = first.files.get("pnpm-lock.yaml").unwrap_or_else(|| {
+            panic!(
+                "the quoted scoped key must be rewritten; warnings={:?}",
+                first.warnings
+            )
+        });
+        assert!(
+            out.contains(
+                "  '@socktest/pkg@1.0.0':\n    resolution: {integrity: sha512-PATCHED==, \
+                 tarball: http://patch.test/socktest-pkg-1.0.0.tgz}"
+            ),
+            "resolution spliced under the QUOTED key (quotes preserved): {out}"
+        );
+        assert!(
+            !out.contains("sha512-UPSTREAM=="),
+            "upstream integrity replaced: {out}"
+        );
+        assert!(
+            first
+                .edits
+                .iter()
+                .any(|e| e.kind == "redirect_pnpm_resolution"
+                    && e.key.as_deref() == Some("@socktest/pkg@1.0.0")),
+            "edit recorded under the unquoted name@version key: {:?}",
+            first.edits
+        );
+
+        // Re-run over the rewritten output: no edits, no file changes.
+        let mut again = files.clone();
+        again.insert("pnpm-lock.yaml".to_string(), out.clone());
+        let second = rewrite_registry_redirect(&again, std::slice::from_ref(&ovr));
+        assert!(
+            second.files.is_empty() && second.edits.is_empty(),
+            "re-run over a redirected scoped entry must be a no-op: files={:?} edits={:?}",
+            second.files.keys(),
+            second.edits
+        );
     }
 }

@@ -2,8 +2,6 @@
 //! docker e2e suite doesn't drive (project-marker gates, env-var
 //! resolution, malformed cache layouts, etc.).
 
-#![cfg(feature = "deno")]
-
 use std::path::Path;
 
 use serial_test::serial;
@@ -17,7 +15,6 @@ fn options_at(root: &Path) -> CrawlerOptions {
         cwd: root.to_path_buf(),
         global: false,
         global_prefix: None,
-        batch_size: 100,
     }
 }
 
@@ -154,7 +151,6 @@ async fn crawl_all_enumerates_jsr_packages() {
         cwd: tmp.path().to_path_buf(),
         global: true,
         global_prefix: Some(tmp.path().to_path_buf()),
-        batch_size: 100,
     };
     let result = crawler.crawl_all(&opts).await;
     let purls: Vec<&str> = result.iter().map(|p| p.purl.as_str()).collect();
@@ -196,7 +192,6 @@ async fn crawl_all_global_via_deno_dir_env_scans_cache() {
         cwd: tempfile::tempdir().unwrap().path().to_path_buf(),
         global: true,
         global_prefix: None,
-        batch_size: 100,
     };
     let result = crawler.crawl_all(&opts).await;
     assert_eq!(result.len(), 1, "got {:?}", result);
@@ -223,7 +218,6 @@ async fn crawl_all_does_not_recurse_below_version_layer() {
         cwd: tmp.path().to_path_buf(),
         global: true,
         global_prefix: Some(tmp.path().to_path_buf()),
-        batch_size: 100,
     };
     let result = crawler.crawl_all(&opts).await;
     assert_eq!(
@@ -250,7 +244,6 @@ async fn crawl_all_skips_dirs_not_starting_with_at() {
         cwd: tmp.path().to_path_buf(),
         global: true,
         global_prefix: Some(tmp.path().to_path_buf()),
-        batch_size: 100,
     };
     let result = crawler.crawl_all(&opts).await;
     // Exactly the one legitimate package — not the bogus `notascope/foo`.
@@ -281,7 +274,6 @@ async fn get_jsr_cache_paths_global_prefix_passthrough() {
         cwd: tmp.path().to_path_buf(),
         global: true,
         global_prefix: Some(tmp.path().to_path_buf()),
-        batch_size: 100,
     };
     let paths = crawler.get_jsr_cache_paths(&opts).await.unwrap();
     assert_eq!(paths, vec![tmp.path().to_path_buf()]);
@@ -301,7 +293,6 @@ async fn get_jsr_cache_paths_global_via_deno_dir_env() {
         cwd: tmp.path().to_path_buf(),
         global: true,
         global_prefix: None,
-        batch_size: 100,
     };
     let paths = crawler.get_jsr_cache_paths(&opts).await.unwrap();
 
@@ -322,7 +313,6 @@ async fn get_jsr_cache_paths_global_deno_dir_missing_cache_returns_empty() {
         cwd: tmp.path().to_path_buf(),
         global: true,
         global_prefix: None,
-        batch_size: 100,
     };
     let paths = crawler.get_jsr_cache_paths(&opts).await.unwrap();
     assert!(

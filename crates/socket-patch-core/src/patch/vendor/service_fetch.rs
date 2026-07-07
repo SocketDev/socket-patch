@@ -12,13 +12,17 @@ use crate::api::client::{SecondaryArtifact, VendorServiceOutcome};
 use crate::patch::vendor::lock_inventory::LockIntegrity;
 use crate::patch::vendor::registry_fetch::{artifact_matches_integrity, verify_go_h1};
 use crate::patch::vendor::VendorServiceConfig;
+use crate::patch::vendor::{
+    common::{refused, service_offline_conflict},
+    VendorOutcome, VendorWarning,
+};
 
 /// A service archive whose bytes have passed integrity verification.
 ///
 /// Deliberately minimal: every consumer recomputes the hashes it needs from
 /// `bytes` (so a service-downloaded artifact describes itself byte-identically
 /// to a local build), so the service-reported sha1/md5/size are not re-carried.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct VerifiedArchive {
     /// The verified archive bytes (npm `.tgz`, pypi `.whl`/sdist, cargo
     /// `.crate`, golang/composer `.zip`, gem `.gem`, …).
@@ -56,15 +60,12 @@ pub(crate) enum ServiceArtifact {
 
 /// Download and integrity-verify the prebuilt archive for `uuid`.
 ///
-/// `verify_name` is only consulted for the (npm) yarn-berry checksum kind,
-/// which v1 never verifies here — pass the package's bare name for forward
-/// compatibility. Verification always checks the sha512 floor and, when the
-/// service supplied a golang `h1:` dirhash, that too (it covers the zip's
-/// contents, which `go mod verify` relies on).
+/// Verification always checks the sha512 floor and, when the service supplied
+/// a golang `h1:` dirhash, that too (it covers the zip's contents, which
+/// `go mod verify` relies on).
 pub(crate) async fn fetch_verified_archive(
     cfg: &VendorServiceConfig,
     uuid: &str,
-    verify_name: &str,
 ) -> ServiceArtifact {
     let Some(client) = cfg.client.as_ref() else {
         return ServiceArtifact::Unavailable("vendor service not configured".to_string());
@@ -86,10 +87,11 @@ pub(crate) async fn fetch_verified_archive(
         VendorServiceOutcome::Failed(err) => return ServiceArtifact::Failed(err.to_string()),
     };
 
-    // sha512 floor — every ecosystem's tarball carries it.
+    // sha512 floor — every ecosystem's tarball carries it. The name arg only
+    // feeds the yarn-berry checksum recipe; the Sri verifier ignores it.
     if let Err(e) = artifact_matches_integrity(
         &pkg.tarball,
-        verify_name,
+        "",
         &LockIntegrity::Sri(pkg.integrity_sri.clone()),
     ) {
         return ServiceArtifact::IntegrityMismatch(e);
@@ -110,6 +112,93 @@ pub(crate) async fn fetch_verified_archive(
     })
 }
 
+/// Outcome of attempting to materialise a single-file artifact from the patch
+/// service (the Tier-A backends — maven `.jar`, nuget `.nupkg` — where the
+/// verified archive bytes ARE the vendored artifact, written verbatim).
+pub(crate) enum ServiceCopy {
+    /// The prebuilt patched bytes (write them verbatim).
+    Used(Vec<u8>),
+    /// Bubble this terminal outcome (boxed — `VendorOutcome` is large).
+    HardFail(Box<VendorOutcome>),
+    /// Fall back to the local rebuild.
+    FallBack,
+}
+
+/// Download + integrity-verify the prebuilt patched archive for the Tier-A
+/// backends, mapping each service outcome onto the `auto` / `service` fallback
+/// policy. `noun` is the artifact kind used in messages (".jar" / ".nupkg").
+pub(crate) async fn service_archive_copy(
+    service: Option<&VendorServiceConfig>,
+    uuid: &str,
+    name: &str,
+    noun: &str,
+    warnings: &mut Vec<VendorWarning>,
+) -> ServiceCopy {
+    // The maven/nuget flows have no earlier guard, so the fail-closed
+    // `--vendor-source=service` + `--offline` refusal lives here (the other
+    // backends check the same helper at their entry points).
+    if let Some(refusal) = service_offline_conflict(service) {
+        return ServiceCopy::HardFail(Box::new(refusal));
+    }
+    let Some(cfg) = service else {
+        return ServiceCopy::FallBack;
+    };
+    if !cfg.service_enabled() {
+        return ServiceCopy::FallBack;
+    }
+    fn hard(code: &'static str, detail: String) -> ServiceCopy {
+        ServiceCopy::HardFail(Box::new(refused(code, detail)))
+    }
+    let miss = |warnings: &mut Vec<VendorWarning>, code: &'static str, reason: String| {
+        if cfg.source.requires_service() {
+            hard("vendor_prebuilt_required", reason)
+        } else {
+            warnings.push(VendorWarning::new(
+                code,
+                format!("{reason}; building locally instead"),
+            ));
+            ServiceCopy::FallBack
+        }
+    };
+    match fetch_verified_archive(cfg, uuid).await {
+        ServiceArtifact::Ready(archive) => {
+            warnings.push(VendorWarning::new(
+                "vendor_prebuilt_downloaded",
+                format!(
+                    "vendored {name} from the patch service ({})",
+                    archive.source_url
+                ),
+            ));
+            ServiceCopy::Used(archive.bytes)
+        }
+        ServiceArtifact::IntegrityMismatch(reason) => miss(
+            warnings,
+            "vendor_prebuilt_integrity_mismatch",
+            format!("prebuilt {noun} failed integrity ({reason})"),
+        ),
+        ServiceArtifact::Pending => miss(
+            warnings,
+            "vendor_prebuilt_pending",
+            format!("prebuilt {noun} is still building"),
+        ),
+        ServiceArtifact::Unavailable(reason) => {
+            if cfg.source.requires_service() {
+                hard(
+                    "vendor_prebuilt_required",
+                    format!("prebuilt {noun} unavailable: {reason}"),
+                )
+            } else {
+                ServiceCopy::FallBack
+            }
+        }
+        ServiceArtifact::Failed(reason) => miss(
+            warnings,
+            "vendor_prebuilt_unavailable",
+            format!("patch service request failed ({reason})"),
+        ),
+    }
+}
+
 /// Outcome of fetching + verifying a named secondary artifact.
 pub(crate) enum SecondaryArtifactResult {
     /// Bytes downloaded and sha512-verified.
@@ -126,16 +215,14 @@ pub(crate) enum SecondaryArtifactResult {
 /// Download + integrity-verify the secondary artifact of `kind` (e.g.
 /// `gem-stub-gemspec`) referenced by a [`VerifiedArchive`].
 ///
-/// `verify_name` is the package's bare name (only consulted by the yarn-berry
-/// checksum kind, which never reaches here). The bytes are verified against the
-/// artifact's own sha512 SRI, fail-closed like the primary archive. Returns
-/// `Absent` when the archive referenced no artifact of this kind — the caller
-/// treats that as a miss (fall back under `auto`, refuse under `service`).
+/// The bytes are verified against the artifact's own sha512 SRI, fail-closed
+/// like the primary archive. Returns `Absent` when the archive referenced no
+/// artifact of this kind — the caller treats that as a miss (fall back under
+/// `auto`, refuse under `service`).
 pub(crate) async fn fetch_verified_secondary(
     cfg: &VendorServiceConfig,
     archive: &VerifiedArchive,
     kind: &str,
-    verify_name: &str,
 ) -> SecondaryArtifactResult {
     let Some(client) = cfg.client.as_ref() else {
         return SecondaryArtifactResult::Failed("vendor service not configured".to_string());
@@ -149,9 +236,10 @@ pub(crate) async fn fetch_verified_secondary(
         Err(e) => return SecondaryArtifactResult::Failed(e.to_string()),
     };
 
+    // As above: the Sri verifier never reads the name arg.
     if let Err(e) = artifact_matches_integrity(
         &bytes,
-        verify_name,
+        "",
         &LockIntegrity::Sri(artifact.integrity_sri.clone()),
     ) {
         return SecondaryArtifactResult::IntegrityMismatch(e);
@@ -217,7 +305,7 @@ mod tests {
         let sri = PackedTarball::from_bytes(body).integrity;
         mount_granted(&server, &sri, body).await;
 
-        match fetch_verified_archive(&cfg_for(&server), UUID, "x").await {
+        match fetch_verified_archive(&cfg_for(&server), UUID).await {
             ServiceArtifact::Ready(v) => {
                 assert_eq!(v.bytes, body);
                 assert_eq!(v.integrity_sri, sri);
@@ -237,9 +325,48 @@ mod tests {
         mount_granted(&server, &wrong, body).await;
 
         assert!(matches!(
-            fetch_verified_archive(&cfg_for(&server), UUID, "x").await,
+            fetch_verified_archive(&cfg_for(&server), UUID).await,
             ServiceArtifact::IntegrityMismatch(_)
         ));
+    }
+
+    /// `--vendor-source=service --offline` is a fail-closed refusal (the same
+    /// `vendor_service_offline_conflict` the other backends give via
+    /// `service_offline_conflict`), never a silent local-build fallback —
+    /// maven/nuget funnel through here and have no earlier guard.
+    #[tokio::test]
+    async fn service_copy_offline_conflict_hard_fails() {
+        let server = MockServer::start().await;
+        let mut cfg = cfg_for(&server);
+        cfg.offline = true;
+        let mut warnings = Vec::new();
+        match service_archive_copy(Some(&cfg), UUID, "x", ".jar", &mut warnings).await {
+            ServiceCopy::HardFail(outcome) => match *outcome {
+                VendorOutcome::Refused { code, .. } => {
+                    assert_eq!(code, "vendor_service_offline_conflict");
+                }
+                other => panic!("expected Refused, got {other:?}"),
+            },
+            ServiceCopy::Used(_) => panic!("offline run must not download"),
+            ServiceCopy::FallBack => {
+                panic!("--vendor-source=service --offline fell back to a local build")
+            }
+        }
+    }
+
+    /// Under `auto`, offline stays a quiet fallback to the local build.
+    #[tokio::test]
+    async fn service_copy_offline_auto_falls_back() {
+        let server = MockServer::start().await;
+        let mut cfg = cfg_for(&server);
+        cfg.source = VendorSource::Auto;
+        cfg.offline = true;
+        let mut warnings = Vec::new();
+        assert!(matches!(
+            service_archive_copy(Some(&cfg), UUID, "x", ".jar", &mut warnings).await,
+            ServiceCopy::FallBack
+        ));
+        assert!(warnings.is_empty(), "quiet fallback, no warning");
     }
 
     /// A config without a client is a quiet Unavailable, not a panic.
@@ -254,7 +381,7 @@ mod tests {
             offline: false,
         };
         assert!(matches!(
-            fetch_verified_archive(&cfg, UUID, "x").await,
+            fetch_verified_archive(&cfg, UUID).await,
             ServiceArtifact::Unavailable(_)
         ));
     }

@@ -5,10 +5,12 @@
 //! parse_bool_flag`, so clap's default bool parser accepted only the
 //! literal strings `true`/`false` from the env — `SOCKET_UNLOCK_RELEASE=1`
 //! (or an exported-but-empty `SOCKET_UNLOCK_RELEASE=`) aborted every
-//! `unlock` invocation with a ValueValidation error. The flag is also
-//! outside `GLOBAL_ARG_ENV_VARS`, so `main`'s empty-var scrub never
-//! rescues it. Same bug class previously fixed on `repair
-//! --download-only` and `rollback --one-off`.
+//! `unlock` invocation with a ValueValidation error. (`main`'s
+//! empty-var scrub also removes a blank `SOCKET_UNLOCK_RELEASE` via
+//! `LOCAL_ARG_ENV_VARS`, but the parser itself must not depend on it —
+//! library callers of `Cli::parse` never run the scrub, as these
+//! tests' direct `try_parse_from` shows.) Same bug class previously
+//! fixed on `repair --download-only` and `rollback --one-off`.
 //!
 //! ## Hermeticity
 //!
@@ -32,7 +34,11 @@ const SOCKET_ENV_VARS: &[&str] = &[
     "SOCKET_PROXY_URL",
     "SOCKET_ECOSYSTEMS",
     "SOCKET_DOWNLOAD_MODE",
+    "SOCKET_VENDOR_SOURCE",
+    "SOCKET_VENDOR_URL",
+    "SOCKET_PATCH_SERVER_URL",
     "SOCKET_OFFLINE",
+    "SOCKET_STRICT",
     "SOCKET_GLOBAL",
     "SOCKET_GLOBAL_PREFIX",
     "SOCKET_JSON",
@@ -84,6 +90,29 @@ fn release_of(cli: Cli) -> bool {
         Commands::Unlock(a) => a.release,
         _ => panic!("expected Unlock"),
     }
+}
+
+/// Drift guard for [`SOCKET_ENV_VARS`]: parsing `unlock` consults every
+/// flattened `GlobalArgs` env binding, so the scrub list must cover all
+/// of `GLOBAL_ARG_ENV_VARS` (plus the subcommand-local
+/// `SOCKET_UNLOCK_RELEASE`). Regression: the hand-rolled list omitted
+/// `SOCKET_VENDOR_SOURCE` / `SOCKET_VENDOR_URL` /
+/// `SOCKET_PATCH_SERVER_URL` / `SOCKET_STRICT`, so an ambient
+/// `SOCKET_VENDOR_SOURCE=bogus` in the developer's shell or CI aborted
+/// every parse in this file — spuriously failing all four tests.
+#[test]
+fn env_scrub_covers_every_global_args_env_var() {
+    for var in socket_patch_cli::args::GLOBAL_ARG_ENV_VARS {
+        assert!(
+            SOCKET_ENV_VARS.contains(var),
+            "SOCKET_ENV_VARS is missing the GlobalArgs binding {var}; \
+             an ambient {var} would leak into every parse in this file"
+        );
+    }
+    assert!(
+        SOCKET_ENV_VARS.contains(&"SOCKET_UNLOCK_RELEASE"),
+        "SOCKET_ENV_VARS must scrub unlock's own env binding"
+    );
 }
 
 #[test]

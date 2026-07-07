@@ -21,15 +21,13 @@
 //! view-fetched patch content.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use sha2::{Digest, Sha256};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-fn binary() -> PathBuf {
-    env!("CARGO_BIN_EXE_socket-patch").into()
-}
+#[path = "common/mod.rs"]
+mod common;
 
 const ORG_SLUG: &str = "test-org";
 const UUID: &str = "1a2b3c4d-5e6f-4a1b-8c2d-0123456789ab";
@@ -266,6 +264,11 @@ async fn mount_blob(mock: &MockServer) {
         .await;
 }
 
+/// Runs through `common::run_with_env`, which seed-then-scrubs the ambient
+/// `SOCKET_*` surface the binary binds via clap `env=` (SOCKET_DRY_RUN,
+/// SOCKET_ECOSYSTEMS, SOCKET_CWD, ...) — an ambient value would silently
+/// change what every test here exercises (SOCKET_DRY_RUN=true turns the
+/// vendor setup and every repair into a no-op).
 fn run_cli(root: &Path, mock_uri: &str, argv: &[&str]) -> (i32, String, String) {
     let mut full = argv.to_vec();
     full.extend_from_slice(&[
@@ -277,17 +280,7 @@ fn run_cli(root: &Path, mock_uri: &str, argv: &[&str]) -> (i32, String, String) 
         "--org",
         ORG_SLUG,
     ]);
-    let out = Command::new(binary())
-        .args(&full)
-        .current_dir(root)
-        .env("SOCKET_TELEMETRY_DISABLED", "1")
-        .output()
-        .expect("run");
-    (
-        out.status.code().unwrap_or(-1),
-        String::from_utf8_lossy(&out.stdout).into_owned(),
-        String::from_utf8_lossy(&out.stderr).into_owned(),
-    )
+    common::run_with_env(root, &full, &[("SOCKET_TELEMETRY_DISABLED", "1")])
 }
 
 /// `scan --vendor --yes` to establish a vendored flavor project; returns the
@@ -510,6 +503,82 @@ async fn ledger_gone_reconstructs_from_lock(flavor: Flavor) {
         flavor.tag()
     );
     assert_wiring_intact(tmp.path(), flavor);
+}
+
+// ── (e) ledger gone + drifted installed copy → fail-closed ─────────────────
+//
+// The reconstructed entry records no sha; the rewired lockfile's integrity
+// (pnpm `integrity:`, berry `checksum: 10c0/…`, bun tuple sha512) is the ONLY
+// anchor for the rebuilt bytes. A rebuild packed from an installed copy that
+// drifted since vendoring (a file added by a build tool, an edited unpatched
+// file) can never match that integrity — the package manager rejects the
+// artifact on its next install. Repair must fail closed, not report success
+// and bless the drifted bytes into a fresh ledger (which would make every
+// later repair see Healthy and never fix it).
+
+async fn ledger_gone_drifted_copy_fails_closed(flavor: Flavor) {
+    let mock = MockServer::start().await;
+    mount_patch_api(&mock).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_fixture(tmp.path(), flavor);
+    let tgz = vendor_project(tmp.path(), &mock.uri());
+    let lock1 = std::fs::read(tmp.path().join(flavor.lock_name())).unwrap();
+
+    // Drift an UNPATCHED part of the installed copy (patched-file tampering
+    // is already caught by the beforeHash gate; this is invisible to it).
+    std::fs::write(
+        tmp.path().join("node_modules").join(DEP).join("drifted.js"),
+        b"injected after vendoring\n",
+    )
+    .unwrap();
+    std::fs::remove_dir_all(tmp.path().join(".socket/vendor")).unwrap();
+
+    mount_blob(&mock).await;
+    let (code, stdout, stderr) = run_cli(
+        tmp.path(),
+        &mock.uri(),
+        &["repair", "--download-mode", "file"],
+    );
+    assert_eq!(
+        code, 1,
+        "{}: a rebuild that cannot match the lockfile's recorded integrity must fail closed: \
+         stdout={stdout} stderr={stderr}",
+        flavor.tag()
+    );
+    let v = parse_env(&stdout);
+    assert!(
+        events_of(&v)
+            .iter()
+            .any(|e| e["action"] == "failed" && e["errorCode"] == "vendor_artifact_rebuild_failed"),
+        "{}: envelope={v}",
+        flavor.tag()
+    );
+    assert!(
+        !tgz.exists(),
+        "{}: an artifact the lockfile rejects must not be left on disk",
+        flavor.tag()
+    );
+    assert_eq!(
+        std::fs::read(tmp.path().join(flavor.lock_name())).unwrap(),
+        lock1,
+        "{}: the lockfile (the trust anchor) stays untouched",
+        flavor.tag()
+    );
+}
+
+#[tokio::test]
+async fn repair_fails_closed_on_drifted_copy_pnpm() {
+    ledger_gone_drifted_copy_fails_closed(Flavor::Pnpm).await;
+}
+
+#[tokio::test]
+async fn repair_fails_closed_on_drifted_copy_yarn_berry() {
+    ledger_gone_drifted_copy_fails_closed(Flavor::YarnBerry).await;
+}
+
+#[tokio::test]
+async fn repair_fails_closed_on_drifted_copy_bun() {
+    ledger_gone_drifted_copy_fails_closed(Flavor::Bun).await;
 }
 
 #[tokio::test]

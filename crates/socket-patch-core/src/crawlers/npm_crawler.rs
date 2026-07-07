@@ -1,14 +1,12 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
 use super::types::{CrawledPackage, CrawlerOptions};
+use crate::patch::path_safety;
+use crate::utils::fs::is_dir;
 use crate::utils::purl::{percent_decode_purl_component, strip_purl_qualifiers};
-
-/// Default batch size for crawling.
-#[cfg(test)]
-const DEFAULT_BATCH_SIZE: usize = 100;
 
 /// Directories to skip when searching for workspace node_modules.
 const SKIP_DIRS: &[&str] = &[
@@ -34,8 +32,23 @@ struct PackageJsonPartial {
 
 /// Read and parse a `package.json` file, returning `(name, version)` if valid.
 pub async fn read_package_json(pkg_json_path: &Path) -> Option<(String, String)> {
-    let content = tokio::fs::read_to_string(pkg_json_path).await.ok()?;
-    let pkg: PackageJsonPartial = serde_json::from_str(&content).ok()?;
+    use tokio::io::AsyncReadExt;
+
+    // The path lives inside the (untrusted) package tree: a planted FIFO
+    // would make a plain `read_to_string` open block forever waiting for a
+    // writer, wedging scan (crawl_all) and apply (find_by_purls). Open via
+    // `open_regular_file` — non-blocking on Unix, rejecting
+    // FIFOs/devices/directories (see its docs).
+    let (mut file, metadata) = crate::utils::fs::open_regular_file(pkg_json_path)
+        .await
+        .ok()?;
+    let mut content = String::with_capacity(metadata.len() as usize);
+    file.read_to_string(&mut content).await.ok()?;
+    // npm and Node both tolerate a leading UTF-8 BOM in package.json
+    // (Windows-authored packages ship them), but serde_json rejects it —
+    // a BOM'd install would be invisible to scan and unpatchable.
+    let pkg: PackageJsonPartial =
+        serde_json::from_str(crate::package_json::detect::strip_bom(&content)).ok()?;
     let name = pkg.name?;
     let version = pkg.version?;
     if name.is_empty() || version.is_empty() {
@@ -303,7 +316,7 @@ impl NpmCrawler {
             .unwrap_or_default();
 
         for nm_path in &nm_paths {
-            let found = self.scan_node_modules(nm_path, &mut seen).await;
+            let found = Self::scan_node_modules(nm_path, &mut seen).await;
             packages.extend(found);
         }
 
@@ -322,8 +335,6 @@ impl NpmCrawler {
     ) -> Result<HashMap<String, CrawledPackage>, std::io::Error> {
         let mut result: HashMap<String, CrawledPackage> = HashMap::new();
 
-        // Parse each PURL to extract the directory key and expected version.
-        //
         // `purl` is the *verbatim* caller-supplied PURL, including any
         // `?qualifiers`. The result map is keyed by this exact string: the
         // dispatcher drives npm with `passthrough_purls` + `merge_first_wins`,
@@ -335,58 +346,141 @@ impl NpmCrawler {
             name: String,
             version: String,
             purl: String,
+            /// Install dir relative to a `node_modules` root
+            /// (`@scope/name` or `name`) — which is also exactly what the
+            /// package.json `name` field must say for this dir to BE that
+            /// package.
             dir_key: String,
         }
 
-        let mut targets: Vec<Target> = Vec::new();
-
+        let mut pending: Vec<Target> = Vec::new();
         for purl in purls {
-            if let Some((ns, name, version)) = Self::parse_purl_components(purl) {
-                // SECURITY: `ns`/`name` come straight from the (untrusted)
-                // manifest PURL and are joined onto `node_modules_path` below,
-                // then patched in place. A real npm scope/name is a single
-                // path segment, so reject any that could traverse out of the
-                // tree (`pkg:npm/../../evil@1.0.0`). Fail closed — twin of the
-                // deno/go/maven coordinate gates.
-                let ns_safe = ns.as_deref().map(is_safe_npm_component).unwrap_or(true);
-                if !ns_safe || !is_safe_npm_component(&name) {
-                    continue;
-                }
-                let dir_key = match &ns {
-                    Some(ns_str) => format!("{ns_str}/{name}"),
-                    None => name.clone(),
-                };
-                targets.push(Target {
-                    namespace: ns,
-                    name,
-                    version,
-                    purl: purl.clone(),
-                    dir_key,
-                });
+            let Some((namespace, name, version)) = Self::parse_purl_components(purl) else {
+                continue;
+            };
+
+            // SECURITY: `namespace`/`name` come straight from the (untrusted)
+            // manifest PURL and are joined onto `node_modules_path` below,
+            // then patched in place. A real npm scope/name is a single
+            // path segment, so reject any that could traverse out of the
+            // tree (`pkg:npm/../../evil@1.0.0`). Fail closed — twin of the
+            // deno/go/maven coordinate gates.
+            let ns_safe = namespace
+                .as_deref()
+                .map(is_safe_npm_component)
+                .unwrap_or(true);
+            if !ns_safe || !is_safe_npm_component(&name) {
+                continue;
             }
+
+            let dir_key = match &namespace {
+                Some(ns) => format!("{ns}/{name}"),
+                None => name.clone(),
+            };
+            pending.push(Target {
+                namespace,
+                name,
+                version,
+                purl: purl.clone(),
+                dir_key,
+            });
         }
 
-        for target in &targets {
-            let pkg_path = node_modules_path.join(&target.dir_key);
-            let pkg_json_path = pkg_path.join("package.json");
+        // Probe trees breadth-first: the root `node_modules` first (so a
+        // root-level install always wins), then — only while targets remain
+        // unresolved — each nested `node_modules`. npm nests a conflicting
+        // version under the dependent package, so a patched version can
+        // exist *only* nested; CLI_CONTRACT ("Deeply nested transitive
+        // dependencies are fully supported") promises those are patched
+        // identically to direct deps, and `crawl_all` (scan) already
+        // discovers them at unbounded depth.
+        let mut queue: VecDeque<PathBuf> = VecDeque::from([node_modules_path.to_path_buf()]);
+        while let Some(nm_path) = queue.pop_front() {
+            if pending.is_empty() {
+                break;
+            }
+            let mut unresolved = Vec::with_capacity(pending.len());
+            for target in pending {
+                let pkg_path = nm_path.join(&target.dir_key);
+                let pkg_json_path = pkg_path.join("package.json");
 
-            if let Some((_, version)) = read_package_json(&pkg_json_path).await {
-                if version == target.version {
-                    result.insert(
-                        target.purl.clone(),
-                        CrawledPackage {
-                            name: target.name.clone(),
-                            version,
-                            namespace: target.namespace.clone(),
-                            purl: target.purl.clone(),
-                            path: pkg_path.clone(),
-                        },
-                    );
+                match read_package_json(&pkg_json_path).await {
+                    // The on-disk *name* must match too: an alias install
+                    // (`npm i foo@npm:bar@1.0.0`) puts a different package
+                    // in `node_modules/foo`, so matching on version alone
+                    // would misidentify it and patch the wrong package's
+                    // files.
+                    Some((found_name, found_version))
+                        if found_name == target.dir_key && found_version == target.version =>
+                    {
+                        result.insert(
+                            target.purl.clone(),
+                            CrawledPackage {
+                                name: target.name,
+                                version: found_version,
+                                namespace: target.namespace,
+                                purl: target.purl,
+                                path: pkg_path,
+                            },
+                        );
+                    }
+                    _ => unresolved.push(target),
                 }
+            }
+            pending = unresolved;
+            if !pending.is_empty() {
+                Self::collect_nested_node_modules(&nm_path, &mut queue).await;
             }
         }
 
         Ok(result)
+    }
+
+    /// Append the `node_modules` dirs living one level below `nm_path`
+    /// (inside each of its package dirs, scoped or not) to `queue`.
+    /// Mirrors `scan_node_modules`' traversal policy: hidden entries are
+    /// skipped and symlinked packages are never traversed — a symlink here
+    /// points into pnpm's content-addressed store or an `npm link` target
+    /// outside the project.
+    async fn collect_nested_node_modules(nm_path: &Path, queue: &mut VecDeque<PathBuf>) {
+        for entry in crate::utils::fs::list_dir_entries(nm_path).await {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.starts_with('.') || name_str == "node_modules" {
+                continue;
+            }
+            let Some(file_type) = crate::utils::fs::entry_file_type(&entry).await else {
+                continue;
+            };
+            if !file_type.is_dir() {
+                continue;
+            }
+            let entry_path = nm_path.join(&name);
+
+            if name_str.starts_with('@') {
+                for scoped in crate::utils::fs::list_dir_entries(&entry_path).await {
+                    let scoped_name = scoped.file_name();
+                    if scoped_name.to_string_lossy().starts_with('.') {
+                        continue;
+                    }
+                    let Some(scoped_type) = crate::utils::fs::entry_file_type(&scoped).await else {
+                        continue;
+                    };
+                    if !scoped_type.is_dir() {
+                        continue;
+                    }
+                    let nested = entry_path.join(&scoped_name).join("node_modules");
+                    if is_dir(&nested).await {
+                        queue.push_back(nested);
+                    }
+                }
+            } else {
+                let nested = entry_path.join("node_modules");
+                if is_dir(&nested).await {
+                    queue.push_back(nested);
+                }
+            }
+        }
     }
 
     // ------------------------------------------------------------------
@@ -522,51 +616,57 @@ impl NpmCrawler {
     // ------------------------------------------------------------------
 
     /// Scan a `node_modules` directory, returning all valid packages found.
-    async fn scan_node_modules(
-        &self,
-        node_modules_path: &Path,
-        seen: &mut HashSet<String>,
-    ) -> Vec<CrawledPackage> {
-        let mut results = Vec::new();
+    /// Recurses into each package's own nested `node_modules`.
+    fn scan_node_modules<'a>(
+        node_modules_path: &'a Path,
+        seen: &'a mut HashSet<String>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<CrawledPackage>> + 'a>> {
+        Box::pin(async move {
+            let mut results = Vec::new();
 
-        for entry in crate::utils::fs::list_dir_entries(node_modules_path).await {
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy().to_string();
+            for entry in crate::utils::fs::list_dir_entries(node_modules_path).await {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy().to_string();
 
-            // Skip hidden files and node_modules
-            if name_str.starts_with('.') || name_str == "node_modules" {
-                continue;
-            }
-
-            let Some(file_type) = crate::utils::fs::entry_file_type(&entry).await else {
-                continue;
-            };
-
-            // Allow both directories and symlinks (pnpm uses symlinks)
-            if !file_type.is_dir() && !file_type.is_symlink() {
-                continue;
-            }
-
-            let entry_path = node_modules_path.join(&name_str);
-
-            if name_str.starts_with('@') {
-                // Scoped packages
-                let scoped = Self::scan_scoped_packages(&entry_path, seen).await;
-                results.extend(scoped);
-            } else {
-                // Regular package
-                if let Some(pkg) = Self::check_package(&entry_path, seen).await {
-                    results.push(pkg);
+                // Skip hidden files and node_modules
+                if name_str.starts_with('.') || name_str == "node_modules" {
+                    continue;
                 }
-                // Nested node_modules only for real directories (not symlinks)
-                if file_type.is_dir() {
-                    let nested = Self::scan_nested_node_modules(&entry_path, seen).await;
-                    results.extend(nested);
+
+                let Some(file_type) = crate::utils::fs::entry_file_type(&entry).await else {
+                    continue;
+                };
+
+                // Allow both directories and symlinks (pnpm uses symlinks)
+                if !file_type.is_dir() && !file_type.is_symlink() {
+                    continue;
+                }
+
+                let entry_path = node_modules_path.join(&name_str);
+
+                if name_str.starts_with('@') {
+                    // Scoped packages
+                    let scoped = Self::scan_scoped_packages(&entry_path, seen).await;
+                    results.extend(scoped);
+                } else {
+                    // Regular package
+                    if let Some(pkg) = Self::check_package(&entry_path, seen).await {
+                        results.push(pkg);
+                    }
+                    // Recurse into nested node_modules only for real
+                    // directories (not symlinks). Following a symlink here
+                    // would walk into pnpm's content-addressed store (or an
+                    // `npm link` target outside the project).
+                    if file_type.is_dir() {
+                        let nested =
+                            Self::scan_node_modules(&entry_path.join("node_modules"), seen).await;
+                        results.extend(nested);
+                    }
                 }
             }
-        }
 
-        results
+            results
+        })
     }
 
     /// Scan a scoped packages directory (`@scope/`).
@@ -600,58 +700,9 @@ impl NpmCrawler {
 
                 // Nested node_modules only for real directories
                 if file_type.is_dir() {
-                    let nested = Self::scan_nested_node_modules(&pkg_path, seen).await;
+                    let nested =
+                        Self::scan_node_modules(&pkg_path.join("node_modules"), seen).await;
                     results.extend(nested);
-                }
-            }
-
-            results
-        })
-    }
-
-    /// Scan nested `node_modules` inside a package (if it exists).
-    fn scan_nested_node_modules<'a>(
-        pkg_path: &'a Path,
-        seen: &'a mut HashSet<String>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<CrawledPackage>> + 'a>> {
-        Box::pin(async move {
-            let nested_nm = pkg_path.join("node_modules");
-            let mut results = Vec::new();
-
-            for entry in crate::utils::fs::list_dir_entries(&nested_nm).await {
-                let name = entry.file_name();
-                let name_str = name.to_string_lossy().to_string();
-
-                if name_str.starts_with('.') || name_str == "node_modules" {
-                    continue;
-                }
-
-                let Some(file_type) = crate::utils::fs::entry_file_type(&entry).await else {
-                    continue;
-                };
-
-                if !file_type.is_dir() && !file_type.is_symlink() {
-                    continue;
-                }
-
-                let entry_path = nested_nm.join(&name_str);
-
-                if name_str.starts_with('@') {
-                    let scoped = Self::scan_scoped_packages(&entry_path, seen).await;
-                    results.extend(scoped);
-                } else {
-                    if let Some(pkg) = Self::check_package(&entry_path, seen).await {
-                        results.push(pkg);
-                    }
-                    // Recurse into deeper nested node_modules only for real
-                    // directories (not symlinks) — matching the invariant in
-                    // `scan_node_modules`/`scan_scoped_packages`. Following a
-                    // symlink here would walk into pnpm's content-addressed
-                    // store (or an `npm link` target outside the project).
-                    if file_type.is_dir() {
-                        let deeper = Self::scan_nested_node_modules(&entry_path, seen).await;
-                        results.extend(deeper);
-                    }
                 }
             }
 
@@ -739,30 +790,20 @@ impl Default for NpmCrawler {
 // Utility
 // ---------------------------------------------------------------------------
 
-/// Check whether a path is a directory (follows symlinks).
-async fn is_dir(path: &Path) -> bool {
-    tokio::fs::metadata(path)
-        .await
-        .map(|m| m.is_dir())
-        .unwrap_or(false)
-}
-
 /// Whether a PURL-derived path component is safe to join onto the
 /// `node_modules` root. An npm package's scope (`@types`) and bare name
 /// (`node`) are each a single path segment, so a real one never contains a
-/// separator, a `.`/`..` segment, a backslash, or a NUL. `find_by_purls`
-/// joins these straight from the (untrusted) manifest PURL onto the
-/// `node_modules` root and then patches the resolved package in place, so a
-/// tampered PURL like `pkg:npm/../../evil@1.0.0` would otherwise read (and
-/// later write) out of tree. Reject those fail-closed. Twin of the deno
-/// (`is_safe_jsr_component`), go, and maven coordinate gates.
+/// separator, a `.`/`..` segment, a backslash, a colon, or a NUL.
+/// `find_by_purls` joins these straight from the (untrusted) manifest PURL
+/// onto the `node_modules` root and then patches the resolved package in
+/// place, so a tampered PURL like `pkg:npm/../../evil@1.0.0` would otherwise
+/// read (and later write) out of tree. Delegates to
+/// [`path_safety::is_safe_single_segment`], which also rejects `:` — a
+/// Windows drive-relative component (`C:evil`) joins as an absolute path.
+/// Fails closed. Twin of the deno (`is_safe_jsr_component`), go, and maven
+/// coordinate gates.
 fn is_safe_npm_component(component: &str) -> bool {
-    !component.is_empty()
-        && component != "."
-        && component != ".."
-        && !component.contains('/')
-        && !component.contains('\\')
-        && !component.contains('\0')
+    path_safety::is_safe_single_segment(component)
 }
 
 #[cfg(test)]
@@ -893,7 +934,6 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: None,
-            batch_size: DEFAULT_BATCH_SIZE,
         };
 
         let packages = crawler.crawl_all(&options).await;
@@ -922,7 +962,6 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: None,
-            batch_size: DEFAULT_BATCH_SIZE,
         };
 
         let packages = crawler.crawl_all(&options).await;
@@ -1300,6 +1339,10 @@ mod tests {
         assert!(!is_safe_npm_component("a/b"));
         assert!(!is_safe_npm_component("a\\b"));
         assert!(!is_safe_npm_component("a\0b"));
+        // Windows drive-relative escape: a `:` (e.g. `C:evil`) makes the
+        // joined path absolute under `Path::join`.
+        assert!(!is_safe_npm_component("C:evil"));
+        assert!(!is_safe_npm_component("c:"));
     }
 
     /// A PURL whose version is not the one on disk must be skipped, while a

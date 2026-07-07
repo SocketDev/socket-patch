@@ -2,6 +2,9 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use super::types::{CrawledPackage, CrawlerOptions};
+use crate::patch::path_safety;
+use crate::utils::fs::{is_dir, is_file};
+use crate::utils::process::{CommandRunner, SystemCommandRunner};
 
 /// PHP/Composer ecosystem crawler for discovering packages in Composer
 /// vendor directories.
@@ -21,10 +24,6 @@ impl ComposerCrawler {
         Self
     }
 
-    // ------------------------------------------------------------------
-    // Public API
-    // ------------------------------------------------------------------
-
     /// Get vendor paths based on options.
     ///
     /// In global mode, checks `$COMPOSER_HOME/vendor/` (env var, command
@@ -41,7 +40,14 @@ impl ComposerCrawler {
             if let Some(ref custom) = options.global_prefix {
                 return Ok(vec![custom.clone()]);
             }
-            return Ok(Self::get_global_vendor_paths().await);
+            let mut paths = Vec::new();
+            if let Some(composer_home) = get_composer_home().await {
+                let vendor_dir = composer_home.join("vendor");
+                if is_dir(&vendor_dir).await {
+                    paths.push(vendor_dir);
+                }
+            }
+            return Ok(paths);
         }
 
         // Local mode
@@ -187,24 +193,6 @@ impl ComposerCrawler {
 
         Ok(result)
     }
-
-    // ------------------------------------------------------------------
-    // Private helpers
-    // ------------------------------------------------------------------
-
-    /// Get global Composer vendor paths.
-    async fn get_global_vendor_paths() -> Vec<PathBuf> {
-        let mut paths = Vec::new();
-
-        if let Some(composer_home) = get_composer_home().await {
-            let vendor_dir = composer_home.join("vendor");
-            if is_dir(&vendor_dir).await {
-                paths.push(vendor_dir);
-            }
-        }
-
-        paths
-    }
 }
 
 impl Default for ComposerCrawler {
@@ -240,24 +228,22 @@ async fn get_composer_home() -> Option<PathBuf> {
     }
 
     // Try `composer global config home`
-    if let Ok(output) = std::process::Command::new("composer")
-        .args(["global", "config", "home"])
-        .output()
-    {
-        if output.status.success() {
-            if let Some(path) = parse_composer_home_output(&String::from_utf8_lossy(&output.stdout))
-            {
-                if is_dir(&path).await {
-                    return Some(path);
-                }
+    if let Some(stdout) = SystemCommandRunner.run("composer", &["global", "config", "home"]) {
+        if let Some(path) = parse_composer_home_output(&stdout) {
+            if is_dir(&path).await {
+                return Some(path);
             }
         }
     }
 
-    // Platform defaults
+    // Platform defaults. A set-but-empty HOME counts as unset: honoring
+    // `""` would turn the `.composer`/`.config/composer` probes below into
+    // CWD-relative paths inside the user's project (same rule as
+    // `utils::fs::home_dir`).
     let home_dir = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .ok()?;
+        .ok()
+        .filter(|h| !h.is_empty())
+        .or_else(|| std::env::var("USERPROFILE").ok().filter(|h| !h.is_empty()))?;
     let home = PathBuf::from(home_dir);
 
     let candidates = [
@@ -282,7 +268,11 @@ async fn get_composer_home() -> Option<PathBuf> {
 /// version (`6.4.1`), so strip a single leading `v`/`V` when it
 /// directly precedes a digit. Versions that don't fit that shape (e.g.
 /// `dev-main`, `1.0.x-dev`) are returned untouched.
-fn normalize_version(version: &str) -> &str {
+///
+/// Also used by the composer vendor backend
+/// (`patch::vendor::composer_lock`) to match lock versions against PURL
+/// versions through the same normalization.
+pub(crate) fn normalize_version(version: &str) -> &str {
     let mut chars = version.chars();
     if matches!(chars.next(), Some('v') | Some('V'))
         && chars.next().map(|c| c.is_ascii_digit()).unwrap_or(false)
@@ -290,6 +280,20 @@ fn normalize_version(version: &str) -> &str {
         return &version[1..];
     }
     version
+}
+
+/// Whether an installed.json package name is safe to join onto the
+/// vendor root. Both `crawl_all` and `find_by_purls` split the recorded
+/// name at `/` and join the pieces onto the vendor directory, and the
+/// resolved directory is later patched in place — so a tampered
+/// installed.json name like `../evil` would otherwise read (and later
+/// write) out of tree. Every `/`-separated segment must be a safe single
+/// segment ([`path_safety::is_safe_multi_segment`]), which also rejects
+/// `.`/`..`, backslashes, colons (a Windows drive-relative `C:evil`
+/// joins as an absolute path), NULs, and empty segments. Fails closed.
+/// Twin of the npm/deno/go/cargo/maven/nuget coordinate gates.
+fn is_safe_composer_name(name: &str) -> bool {
+    path_safety::is_safe_multi_segment(name)
 }
 
 /// Read and parse `vendor/composer/installed.json`.
@@ -328,7 +332,7 @@ async fn read_installed_json(vendor_path: &Path) -> Vec<ComposerPackageEntry> {
         .filter_map(|entry| {
             let name = entry.get("name")?.as_str()?;
             let version = entry.get("version")?.as_str()?;
-            if name.is_empty() || version.is_empty() {
+            if name.is_empty() || version.is_empty() || !is_safe_composer_name(name) {
                 return None;
             }
             Some(ComposerPackageEntry {
@@ -337,22 +341,6 @@ async fn read_installed_json(vendor_path: &Path) -> Vec<ComposerPackageEntry> {
             })
         })
         .collect()
-}
-
-/// Check whether a path is a directory.
-async fn is_dir(path: &Path) -> bool {
-    tokio::fs::metadata(path)
-        .await
-        .map(|m| m.is_dir())
-        .unwrap_or(false)
-}
-
-/// Check whether a path is a file.
-async fn is_file(path: &Path) -> bool {
-    tokio::fs::metadata(path)
-        .await
-        .map(|m| m.is_file())
-        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -395,7 +383,6 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: None,
-            batch_size: 100,
         };
 
         let packages = crawler.crawl_all(&options).await;
@@ -520,7 +507,6 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: None,
-            batch_size: 100,
         };
 
         let packages = crawler.crawl_all(&options).await;
@@ -568,7 +554,6 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: None,
-            batch_size: 100,
         };
 
         let packages = crawler.crawl_all(&options).await;
@@ -667,7 +652,6 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: None,
-            batch_size: 100,
         };
 
         let packages = crawler.crawl_all(&options).await;
@@ -710,7 +694,6 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: None,
-            batch_size: 100,
         };
 
         let packages = crawler.crawl_all(&options).await;
@@ -820,7 +803,6 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: None,
-            batch_size: 100,
         };
 
         let packages = crawler.crawl_all(&options).await;
@@ -860,7 +842,6 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: None,
-            batch_size: 100,
         };
 
         let packages = crawler.crawl_all(&options).await;
@@ -905,6 +886,105 @@ mod tests {
         assert_eq!(pkg.path, vendor_dir.join("Foo").join("Bar"));
         assert_eq!(pkg.namespace, Some("foo".to_string()));
         assert_eq!(pkg.name, "bar");
+    }
+
+    #[tokio::test]
+    async fn test_crawl_all_rejects_traversal_name_from_installed_json() {
+        // installed.json is part of the (untrusted) project being scanned.
+        // A tampered name like `../evil` joins onto the vendor root and
+        // resolves to a directory OUTSIDE it; apply would later write patch
+        // content there. The crawler must drop such entries — twin of the
+        // npm/cargo/maven/nuget/deno/go coordinate gates.
+        let dir = tempfile::tempdir().unwrap();
+        let vendor_dir = dir.path().join("vendor");
+
+        let composer_dir = vendor_dir.join("composer");
+        tokio::fs::create_dir_all(&composer_dir).await.unwrap();
+        tokio::fs::write(
+            composer_dir.join("installed.json"),
+            r#"{"packages": [
+                {"name": "monolog/monolog", "version": "3.5.0"},
+                {"name": "../evil", "version": "1.0.0"}
+            ]}"#,
+        )
+        .await
+        .unwrap();
+        tokio::fs::create_dir_all(vendor_dir.join("monolog").join("monolog"))
+            .await
+            .unwrap();
+        // The traversal target exists OUTSIDE the vendor root, so the
+        // on-disk `is_dir` corroboration alone does not stop it.
+        tokio::fs::create_dir_all(dir.path().join("evil"))
+            .await
+            .unwrap();
+        tokio::fs::write(dir.path().join("composer.json"), "{}")
+            .await
+            .unwrap();
+
+        let crawler = ComposerCrawler::new();
+        let options = CrawlerOptions {
+            cwd: dir.path().to_path_buf(),
+            global: false,
+            global_prefix: None,
+        };
+
+        let packages = crawler.crawl_all(&options).await;
+        assert_eq!(
+            packages.len(),
+            1,
+            "traversal entry must be dropped, got: {:?}",
+            packages.iter().map(|p| &p.path).collect::<Vec<_>>()
+        );
+        assert_eq!(packages[0].name, "monolog");
+    }
+
+    #[tokio::test]
+    async fn test_find_by_purls_rejects_traversal_name_from_installed_json() {
+        // Same threat via the lookup path: a manifest purl whose
+        // namespace/name mirror a tampered installed.json entry would
+        // resolve a package directory outside the vendor root and hand it
+        // to apply as a patch target.
+        let dir = tempfile::tempdir().unwrap();
+        let vendor_dir = dir.path().join("vendor");
+
+        let composer_dir = vendor_dir.join("composer");
+        tokio::fs::create_dir_all(&composer_dir).await.unwrap();
+        tokio::fs::write(
+            composer_dir.join("installed.json"),
+            r#"{"packages": [{"name": "../evil", "version": "1.0.0"}]}"#,
+        )
+        .await
+        .unwrap();
+        tokio::fs::create_dir_all(dir.path().join("evil"))
+            .await
+            .unwrap();
+
+        let crawler = ComposerCrawler::new();
+        let purls = vec!["pkg:composer/../evil@1.0.0".to_string()];
+        let result = crawler.find_by_purls(&vendor_dir, &purls).await.unwrap();
+        assert!(
+            result.is_empty(),
+            "traversal name escaped the vendor root: {:?}",
+            result.values().map(|p| &p.path).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_is_safe_composer_name() {
+        // Real composer names (vendor/name, case-preserved, dots/dashes).
+        assert!(is_safe_composer_name("monolog/monolog"));
+        assert!(is_safe_composer_name("Foo/Bar"));
+        assert!(is_safe_composer_name("symfony/polyfill-php80"));
+        assert!(is_safe_composer_name("phpunit/php-code-coverage"));
+        // Traversal, separators, absolute/drive forms, empties.
+        assert!(!is_safe_composer_name("../evil"));
+        assert!(!is_safe_composer_name("evil/.."));
+        assert!(!is_safe_composer_name("./evil"));
+        assert!(!is_safe_composer_name("/abs/path"));
+        assert!(!is_safe_composer_name("a//b"));
+        assert!(!is_safe_composer_name("a\\b/c"));
+        assert!(!is_safe_composer_name("C:evil/x"));
+        assert!(!is_safe_composer_name(""));
     }
 
     #[tokio::test]

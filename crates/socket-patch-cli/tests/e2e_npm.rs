@@ -65,12 +65,24 @@ fn git_sha256_file(path: &Path) -> String {
 /// Run the CLI binary with the given args, setting `cwd` as the working dir.
 /// Returns `(exit_code, stdout, stderr)`.
 fn run(cwd: &Path, args: &[&str]) -> (i32, String, String) {
-    let out: Output = Command::new(binary())
-        .args(args)
-        .current_dir(cwd)
-        .env_remove("SOCKET_API_TOKEN") // force public proxy (free-tier)
-        .output()
-        .expect("failed to execute socket-patch binary");
+    let mut cmd = Command::new(binary());
+    cmd.args(args).current_dir(cwd);
+    // The binary binds a wide `SOCKET_*` env surface (SOCKET_CWD,
+    // SOCKET_DRY_RUN, SOCKET_STRICT, SOCKET_ECOSYSTEMS, SOCKET_GLOBAL_PREFIX,
+    // ...). An ambient value silently changes what these tests exercise —
+    // SOCKET_DRY_RUN=true turns every real apply into a no-op, and
+    // SOCKET_GLOBAL_PREFIX flips commands into global mode, aiming mutations
+    // at the host's *real* global node_modules. Scrub the whole prefix so
+    // only the flags each test passes are in effect; removing
+    // SOCKET_API_TOKEN also forces the public proxy (free-tier). Telemetry
+    // opt-outs are deliberately kept so an opted-out dev stays opted out.
+    for (key, _) in std::env::vars_os() {
+        let name = key.to_string_lossy();
+        if name.starts_with("SOCKET_") && !name.contains("TELEMETRY") {
+            cmd.env_remove(&key);
+        }
+    }
+    let out: Output = cmd.output().expect("failed to execute socket-patch binary");
 
     let code = out.status.code().unwrap_or(-1);
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
@@ -551,14 +563,16 @@ fn test_npm_apply_force() {
         "corrupted file should have a different hash"
     );
 
-    // Normal apply should fail *specifically* because of the hash mismatch
-    // — not for some unrelated reason (missing patch, crash, lock error)
-    // that would also yield a non-zero exit and let a regression hide. Use
-    // the JSON envelope to pin the failure to our PURL and its reason.
-    let (code, stdout, stderr) = run(cwd, &["apply", "--json"]);
+    // The default policy on a hash mismatch is warn-and-overwrite (the full
+    // patched blob is applied); `--strict` opts out and fails closed. The
+    // mismatch must fail *specifically* because of the hash mismatch — not
+    // for some unrelated reason (missing patch, crash, lock error) that
+    // would also yield a non-zero exit and let a regression hide. Use the
+    // JSON envelope to pin the failure to our PURL and its reason.
+    let (code, stdout, stderr) = run(cwd, &["apply", "--strict", "--json"]);
     assert_ne!(
         code, 0,
-        "apply without --force should fail on hash mismatch.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        "apply --strict should fail on hash mismatch.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     let env: serde_json::Value = serde_json::from_str(&stdout)
         .unwrap_or_else(|e| panic!("apply --json should emit JSON: {e}\nstdout:\n{stdout}"));
@@ -579,6 +593,15 @@ fn test_npm_apply_force() {
     assert!(
         err_msg.contains("hash") && err_msg.contains("match"),
         "failure should be a hash mismatch on the patched file, got error: {err_msg:?}"
+    );
+
+    // Strict must not have touched the file — the --force leg below is only
+    // meaningful if the mismatch is still on disk (a strict that wrote the
+    // patched content would leave --force a vacuous already-patched skip).
+    assert_ne!(
+        git_sha256_file(&index_js),
+        AFTER_HASH,
+        "apply --strict must leave the mismatched file unmodified"
     );
 
     // Apply with --force should succeed.

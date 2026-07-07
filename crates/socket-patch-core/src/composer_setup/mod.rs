@@ -25,7 +25,7 @@ use tokio::fs;
 /// CLI is invoked from `PATH` (composer has no `npx`-style fetch), offline (the
 /// patches are committed under `.socket/`) and silent (so it doesn't clutter
 /// composer's own output).
-pub const APPLY_COMMAND: &str = "socket-patch apply --offline --silent --ecosystems composer";
+const APPLY_COMMAND: &str = "socket-patch apply --offline --silent --ecosystems composer";
 
 /// Composer script events `setup` wires: post-install-cmd fires after
 /// `composer install`, post-update-cmd after `composer update`. Covering both
@@ -44,7 +44,7 @@ pub enum ComposerSetupStatus {
     Error,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ComposerEditResult {
     /// Envelope `files[].kind` — always `composer`.
     pub kind: &'static str,
@@ -53,50 +53,15 @@ pub struct ComposerEditResult {
     pub error: Option<String>,
 }
 
-impl ComposerEditResult {
-    fn from_result(path: String, result: Result<bool, String>) -> Self {
-        match result {
-            Ok(true) => Self {
-                kind: "composer",
-                path,
-                status: ComposerSetupStatus::Updated,
-                error: None,
-            },
-            Ok(false) => Self {
-                kind: "composer",
-                path,
-                status: ComposerSetupStatus::AlreadyConfigured,
-                error: None,
-            },
-            Err(e) => Self {
-                kind: "composer",
-                path,
-                status: ComposerSetupStatus::Error,
-                error: Some(e),
-            },
-        }
-    }
-}
-
-/// A discovered composer project (the dir holding `composer.json`).
-#[derive(Debug, Clone)]
-pub struct ComposerProject {
-    pub root: PathBuf,
-    pub composer_json: PathBuf,
-}
-
-/// Find the composer project rooted at `cwd` (a `composer.json` in `cwd`).
-/// cwd-only, matching the other single-project backends (gem/pypi/go).
-pub async fn discover_composer_project(cwd: &Path) -> Option<ComposerProject> {
+/// Find the composer project rooted at `cwd`: the path to a `composer.json`
+/// directly in `cwd`. cwd-only, matching the other single-project backends
+/// (gem/pypi/go).
+pub async fn discover_composer_project(cwd: &Path) -> Option<PathBuf> {
     let composer_json = cwd.join("composer.json");
-    if fs::metadata(&composer_json).await.is_ok() {
-        Some(ComposerProject {
-            root: cwd.to_path_buf(),
-            composer_json,
-        })
-    } else {
-        None
-    }
+    fs::metadata(&composer_json)
+        .await
+        .is_ok()
+        .then_some(composer_json)
 }
 
 /// Static check: does this `composer.json` already wire our re-apply hook into
@@ -130,27 +95,39 @@ fn event_contains_marker(value: Option<&Value>) -> bool {
 
 // ── pure transforms ──────────────────────────────────────────────────────────
 
-/// Append [`APPLY_COMMAND`] to both hook events, normalising each to an array.
-/// `None` if already present in every event (idempotent no-op).
-fn composer_add(content: &str) -> Result<Option<String>, String> {
-    let mut doc: Value =
+/// Parse `composer.json` for editing, rejecting malformed input: the root must
+/// be a JSON object, and a present `scripts` must be an object (or `null`) —
+/// add refuses to clobber it, remove refuses to silently swallow it as a
+/// "nothing to remove" no-op.
+fn parse_checked(content: &str) -> Result<Value, String> {
+    let doc: Value =
         serde_json::from_str(content).map_err(|e| format!("Invalid composer.json: {e}"))?;
     if !doc.is_object() {
         return Err("Invalid composer.json: root is not a JSON object".to_string());
     }
-    // Refuse to clobber a present-but-non-object `scripts`.
     if let Some(scripts) = doc.get("scripts") {
         if !scripts.is_null() && !scripts.is_object() {
             return Err("Invalid composer.json: \"scripts\" is not a JSON object".to_string());
         }
     }
+    Ok(doc)
+}
 
+/// Append [`APPLY_COMMAND`] to both hook events, normalising each to an array.
+/// `None` if already present in every event (idempotent no-op).
+fn composer_add(content: &str) -> Result<Option<String>, String> {
+    let mut doc = parse_checked(content)?;
     let root = doc.as_object_mut().unwrap();
-    let scripts = ensure_scripts_object(root);
+
+    // Get-or-create the `scripts` object (replacing a `null`).
+    if !root.get("scripts").map(Value::is_object).unwrap_or(false) {
+        root.insert("scripts".to_string(), Value::Object(Map::new()));
+    }
+    let scripts = root.get_mut("scripts").unwrap().as_object_mut().unwrap();
 
     let mut changed = false;
     for event in HOOK_EVENTS {
-        changed |= add_command_to_event(scripts, event);
+        changed |= add_command_to_event(scripts, event)?;
     }
     if !changed {
         // We created an empty `scripts` object above only if it was absent;
@@ -170,18 +147,7 @@ fn composer_add(content: &str) -> Result<Option<String>, String> {
 /// Strip [`APPLY_COMMAND`] from both hook events, pruning emptied events and an
 /// emptied `scripts` object. `None` if our command is absent everywhere.
 fn composer_remove(content: &str) -> Result<Option<String>, String> {
-    let mut doc: Value =
-        serde_json::from_str(content).map_err(|e| format!("Invalid composer.json: {e}"))?;
-    if !doc.is_object() {
-        return Err("Invalid composer.json: root is not a JSON object".to_string());
-    }
-    // Mirror `composer_add`: a present-but-non-object `scripts` is malformed and
-    // must error, not be silently swallowed as a "nothing to remove" no-op.
-    if let Some(scripts) = doc.get("scripts") {
-        if !scripts.is_null() && !scripts.is_object() {
-            return Err("Invalid composer.json: \"scripts\" is not a JSON object".to_string());
-        }
-    }
+    let mut doc = parse_checked(content)?;
     let root = doc.as_object_mut().unwrap();
     // An absent (or `null`) `scripts` is a legitimate no-op: nothing of ours.
     let scripts = match root.get_mut("scripts").and_then(Value::as_object_mut) {
@@ -197,54 +163,55 @@ fn composer_remove(content: &str) -> Result<Option<String>, String> {
         return Ok(None);
     }
     if scripts.is_empty() {
-        root.remove("scripts");
+        // shift_remove: with preserve_order, plain `remove` is swap_remove and
+        // would teleport the last root key into this slot.
+        root.shift_remove("scripts");
     }
     Ok(Some(serde_json::to_string_pretty(&doc).unwrap() + "\n"))
 }
 
-/// Get-or-create the `scripts` object (replacing a `null`).
-fn ensure_scripts_object(root: &mut Map<String, Value>) -> &mut Map<String, Value> {
-    let needs_init = !root.get("scripts").map(Value::is_object).unwrap_or(false);
-    if needs_init {
-        root.insert("scripts".to_string(), Value::Object(Map::new()));
-    }
-    root.get_mut("scripts").unwrap().as_object_mut().unwrap()
-}
-
 /// Add [`APPLY_COMMAND`] to one event, normalising string → array. Returns
-/// whether the event changed. Any command already carrying [`HOOK_MARKER`]
+/// whether the event changed; errors on a non-string/array event value it
+/// refuses to clobber. Any command already carrying [`HOOK_MARKER`]
 /// counts as present — the same predicate as [`is_hook_present`] / `--check`,
 /// so a user-customized flag set is left alone rather than duplicated.
-fn add_command_to_event(scripts: &mut Map<String, Value>, event: &str) -> bool {
+fn add_command_to_event(scripts: &mut Map<String, Value>, event: &str) -> Result<bool, String> {
     if event_contains_marker(scripts.get(event)) {
-        return false;
+        return Ok(false);
     }
     let cmd = Value::String(APPLY_COMMAND.to_string());
     match scripts.get_mut(event) {
         None => {
             scripts.insert(event.to_string(), Value::Array(vec![cmd]));
-            true
+            Ok(true)
         }
         Some(Value::String(s)) => {
             let existing = Value::String(s.clone());
             scripts.insert(event.to_string(), Value::Array(vec![existing, cmd]));
-            true
+            Ok(true)
         }
         Some(Value::Array(arr)) => {
             arr.push(cmd);
-            true
+            Ok(true)
         }
-        // A non-string/array script value is user data we won't clobber.
-        Some(_) => false,
+        // A non-string/array script value is user data we won't clobber — and
+        // can't wire into, so treating it as "no change" would surface as
+        // AlreadyConfigured while `--check` says not configured. Refuse loudly,
+        // like the non-object-`scripts` guard.
+        Some(_) => Err(format!(
+            "Invalid composer.json: \"{event}\" script is not a string or array"
+        )),
     }
 }
 
 /// Remove [`APPLY_COMMAND`] from one event, pruning an emptied event key.
 /// Returns whether the event changed.
 fn remove_command_from_event(scripts: &mut Map<String, Value>, event: &str) -> bool {
+    // shift_remove throughout: with preserve_order, plain `remove` is
+    // swap_remove and would shuffle the user's other scripts.
     match scripts.get_mut(event) {
         Some(Value::String(s)) if s == APPLY_COMMAND => {
-            scripts.remove(event);
+            scripts.shift_remove(event);
             true
         }
         Some(Value::Array(arr)) => {
@@ -254,7 +221,7 @@ fn remove_command_from_event(scripts: &mut Map<String, Value>, event: &str) -> b
                 return false;
             }
             if arr.is_empty() {
-                scripts.remove(event);
+                scripts.shift_remove(event);
             }
             true
         }
@@ -264,65 +231,14 @@ fn remove_command_from_event(scripts: &mut Map<String, Value>, event: &str) -> b
 
 // ── async wrappers ───────────────────────────────────────────────────────────
 
-/// Atomically write `content` to `path`.
-///
-/// A bare `fs::write` truncates the target before writing, so a crash, power
-/// loss, or interrupted process mid-write would leave the user's committed
-/// `composer.json` truncated or empty — destroying the file we only meant to
-/// append two script events to. Instead we write to a sibling stage file,
-/// fsync it, then rename over the target (rename is atomic on the same
-/// filesystem) so a reader ever sees either the old bytes or the complete new
-/// bytes. Mirrors the hardened writer in `package_json/update.rs`.
-async fn atomic_write(path: &Path, content: &str) -> std::io::Result<()> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let stem = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "composer.json".to_string());
-    let stage = parent.join(format!(".socket-stage-{}-{}", stem, uuid::Uuid::new_v4()));
-
-    let mut file = tokio::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&stage)
-        .await?;
-
-    use tokio::io::AsyncWriteExt;
-    if let Err(e) = file.write_all(content.as_bytes()).await {
-        let _ = tokio::fs::remove_file(&stage).await;
-        return Err(e);
-    }
-    if let Err(e) = file.sync_all().await {
-        let _ = tokio::fs::remove_file(&stage).await;
-        return Err(e);
-    }
-    drop(file);
-
-    if let Err(e) = tokio::fs::rename(&stage, path).await {
-        let _ = tokio::fs::remove_file(&stage).await;
-        return Err(e);
-    }
-
-    // The rename only updated the parent directory entry; fsync the directory
-    // so the rename itself survives a crash. Best-effort, Unix only.
-    #[cfg(unix)]
-    {
-        if let Ok(dir) = tokio::fs::File::open(parent).await {
-            let _ = dir.sync_all().await;
-        }
-    }
-
-    Ok(())
-}
-
 /// Wire the project: append our command to the composer script events.
-pub async fn add_hook(project: &ComposerProject, dry_run: bool) -> ComposerEditResult {
-    edit(&project.composer_json, dry_run, composer_add).await
+pub async fn add_hook(composer_json: &Path, dry_run: bool) -> ComposerEditResult {
+    edit(composer_json, dry_run, composer_add).await
 }
 
 /// Unwire the project: strip our command, pruning emptied keys.
-pub async fn remove_hook(project: &ComposerProject, dry_run: bool) -> ComposerEditResult {
-    edit(&project.composer_json, dry_run, composer_remove).await
+pub async fn remove_hook(composer_json: &Path, dry_run: bool) -> ComposerEditResult {
+    edit(composer_json, dry_run, composer_remove).await
 }
 
 async fn edit(
@@ -341,7 +257,10 @@ async fn edit(
             None => Ok(false),
             Some(new) => {
                 if !dry_run {
-                    atomic_write(composer_json, &new)
+                    // The crate-wide atomic writer (stage+fsync+rename): the
+                    // user's committed composer.json must never be left torn
+                    // by a crash mid-write.
+                    crate::utils::fs::atomic_write_bytes(composer_json, new.as_bytes())
                         .await
                         .map_err(|e| e.to_string())?;
                 }
@@ -350,7 +269,17 @@ async fn edit(
         }
     }
     .await;
-    ComposerEditResult::from_result(composer_json.display().to_string(), result)
+    let (status, error) = match result {
+        Ok(true) => (ComposerSetupStatus::Updated, None),
+        Ok(false) => (ComposerSetupStatus::AlreadyConfigured, None),
+        Err(e) => (ComposerSetupStatus::Error, Some(e)),
+    };
+    ComposerEditResult {
+        kind: "composer",
+        path: composer_json.display().to_string(),
+        status,
+        error,
+    }
 }
 
 #[cfg(test)]
@@ -487,19 +416,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cj = dir.path().join("composer.json");
         fs::write(&cj, BASIC).await.unwrap();
-        let project = discover_composer_project(dir.path()).await.unwrap();
+        let found = discover_composer_project(dir.path()).await.unwrap();
 
-        let added = add_hook(&project, false).await;
+        let added = add_hook(&found, false).await;
         assert_eq!(added.status, ComposerSetupStatus::Updated);
         assert!(is_hook_present(&fs::read_to_string(&cj).await.unwrap()));
 
         // Idempotent.
         assert_eq!(
-            add_hook(&project, false).await.status,
+            add_hook(&found, false).await.status,
             ComposerSetupStatus::AlreadyConfigured
         );
 
-        let removed = remove_hook(&project, false).await;
+        let removed = remove_hook(&found, false).await;
         assert_eq!(removed.status, ComposerSetupStatus::Updated);
         assert_eq!(
             fs::read_to_string(&cj).await.unwrap(),
@@ -513,8 +442,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cj = dir.path().join("composer.json");
         fs::write(&cj, BASIC).await.unwrap();
-        let project = discover_composer_project(dir.path()).await.unwrap();
-        let res = add_hook(&project, true).await;
+        let found = discover_composer_project(dir.path()).await.unwrap();
+        let res = add_hook(&found, true).await;
         assert_eq!(res.status, ComposerSetupStatus::Updated);
         assert_eq!(
             fs::read_to_string(&cj).await.unwrap(),
@@ -664,8 +593,8 @@ mod tests {
         fs::write(&cj, BASIC).await.unwrap();
         std::fs::set_permissions(&cj, std::fs::Permissions::from_mode(0o444)).unwrap();
 
-        let project = discover_composer_project(dir.path()).await.unwrap();
-        let res = add_hook(&project, false).await;
+        let found = discover_composer_project(dir.path()).await.unwrap();
+        let res = add_hook(&found, false).await;
         assert_eq!(
             res.status,
             ComposerSetupStatus::Updated,
@@ -680,14 +609,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cj = dir.path().join("composer.json");
         fs::write(&cj, BASIC).await.unwrap();
-        let project = discover_composer_project(dir.path()).await.unwrap();
+        let found = discover_composer_project(dir.path()).await.unwrap();
 
         assert_eq!(
-            add_hook(&project, false).await.status,
+            add_hook(&found, false).await.status,
             ComposerSetupStatus::Updated
         );
         assert_eq!(
-            remove_hook(&project, false).await.status,
+            remove_hook(&found, false).await.status,
             ComposerSetupStatus::Updated
         );
         assert_eq!(fs::read_to_string(&cj).await.unwrap(), BASIC);
@@ -698,6 +627,62 @@ mod tests {
             let name = entry.file_name().to_string_lossy().into_owned();
             assert!(!name.starts_with(".socket-stage-"), "stage litter: {name}");
         }
+    }
+
+    #[test]
+    fn test_remove_event_prune_preserves_sibling_script_order() {
+        // Regression: with preserve_order, serde_json's `Map::remove` is
+        // swap_remove — pruning an emptied event key teleported the *last*
+        // script into its slot, shuffling the user's own scripts. Scenario:
+        // setup wired the events first, the user appended scripts later.
+        let inp = format!(
+            "{{\"scripts\":{{\"post-install-cmd\":[\"{APPLY_COMMAND}\"],\"post-update-cmd\":[\"{APPLY_COMMAND}\"],\"test\":\"phpunit\",\"lint\":\"phpcs\"}}}}"
+        );
+        let removed = composer_remove(&inp).unwrap().unwrap();
+        assert!(!is_hook_present(&removed));
+        let pos_test = removed.find("\"test\"").unwrap();
+        let pos_lint = removed.find("\"lint\"").unwrap();
+        assert!(
+            pos_test < pos_lint,
+            "sibling script order must survive event pruning:\n{removed}"
+        );
+    }
+
+    #[test]
+    fn test_remove_scripts_prune_preserves_root_key_order() {
+        // Regression: same swap_remove hazard at the root — pruning an emptied
+        // `scripts` object teleported the last root key into its slot.
+        let inp = format!(
+            "{{\"name\":\"acme/app\",\"scripts\":{{\"post-install-cmd\":[\"{APPLY_COMMAND}\"]}},\"require\":{{\"php\":\">=8.1\"}},\"autoload\":{{}}}}"
+        );
+        let removed = composer_remove(&inp).unwrap().unwrap();
+        assert!(parse(&removed).get("scripts").is_none(), "scripts pruned");
+        let pos_name = removed.find("\"name\"").unwrap();
+        let pos_require = removed.find("\"require\"").unwrap();
+        let pos_autoload = removed.find("\"autoload\"").unwrap();
+        assert!(
+            pos_name < pos_require && pos_require < pos_autoload,
+            "root key order must survive scripts pruning:\n{removed}"
+        );
+    }
+
+    #[test]
+    fn test_add_malformed_event_value_is_error_not_silent_success() {
+        // Regression: an event value that is neither string nor array can't be
+        // wired (we won't clobber it), but reporting "no change" surfaced as
+        // AlreadyConfigured — exit-0 success — while `--check`
+        // (is_hook_present) says not configured on the very same file. Refusal
+        // must be a loud error, matching the non-object-`scripts` guard.
+        let malformed = "{\"scripts\":{\"post-install-cmd\":42,\"post-update-cmd\":{\"a\":\"b\"}}}";
+        assert!(!is_hook_present(malformed), "nothing configured here");
+        let err = composer_add(malformed).unwrap_err();
+        assert!(
+            err.contains("not a string or array"),
+            "refusal must be an error, got: {err}"
+        );
+        // remove stays a no-op: a non-string/array value can't hold our
+        // command, so there is honestly nothing to strip.
+        assert!(composer_remove(malformed).unwrap().is_none());
     }
 
     #[test]

@@ -1,8 +1,6 @@
 use clap::Args;
-#[cfg(feature = "composer")]
 use socket_patch_core::composer_setup::{self, ComposerSetupStatus};
 use socket_patch_core::crawlers::python_crawler::is_python_project;
-use socket_patch_core::crawlers::CrawlerOptions;
 use socket_patch_core::gem_setup::{self, GemSetupStatus};
 use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
 use socket_patch_core::manifest::schema::{PatchManifest, SetupConfig};
@@ -14,17 +12,20 @@ use socket_patch_core::package_json::update::{
     remove_package_json, update_package_json, RemoveResult, RemoveStatus, UpdateResult,
     UpdateStatus,
 };
-use socket_patch_core::pth_hook::{
-    add_hook_dependency, deps_contain_hook, detect_python_pm, pyproject_contains_hook,
-    remove_hook_dependency, ManifestKind, PthEditResult, PthStatus, PythonPackageManager,
+use socket_patch_core::pth_hook::detect::{
+    deps_contain_hook, detect_python_pm, PythonPackageManager,
+};
+use socket_patch_core::pth_hook::edit::{
+    add_hook_dependency, pyproject_contains_hook, remove_hook_dependency, ManifestKind,
+    PthEditResult, PthStatus,
 };
 use socket_patch_core::utils::telemetry::track_patch_setup;
-use socket_patch_core::vex::applied_patches;
+use socket_patch_core::vex::applied_patches_with_vendor;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use crate::args::GlobalArgs;
-use crate::ecosystem_dispatch::{find_packages_for_rollback, partition_purls};
+use crate::args::{apply_env_toggles, GlobalArgs};
+use crate::ecosystem_dispatch::find_manifest_package_paths;
 use crate::output::stdin_is_tty;
 
 /// Stringify the detected npm-family manager for telemetry.
@@ -72,7 +73,7 @@ pub struct SetupArgs {
         long = "check",
         conflicts_with = "remove",
         default_value_t = false,
-        value_parser = clap::builder::BoolishValueParser::new(),
+        value_parser = crate::args::parse_bool_flag,
     )]
     pub check: bool,
 
@@ -82,7 +83,7 @@ pub struct SetupArgs {
     #[arg(
         long = "remove",
         default_value_t = false,
-        value_parser = clap::builder::BoolishValueParser::new(),
+        value_parser = crate::args::parse_bool_flag,
     )]
     pub remove: bool,
 
@@ -98,6 +99,7 @@ pub struct SetupArgs {
 }
 
 pub async fn run(args: SetupArgs) -> i32 {
+    apply_env_toggles(&args.common);
     if args.check {
         run_check(&args).await
     } else if args.remove {
@@ -135,17 +137,17 @@ async fn discover(args: &SetupArgs, excludes: &[String]) -> Vec<PackageJsonLocat
         .collect()
 }
 
-/// Emit the shared "nothing found" result and exit code. `counts` carries the
-/// per-command zero-valued summary fields (`check` → configured/needs/errors,
-/// `remove` → removed/notConfigured/errors) so the `no_files` envelope keeps the
-/// documented shape (CLI_CONTRACT "Setup command contract") instead of dropping
-/// them — matching what the plain `setup` `no_files` path already emits.
-fn report_no_files(args: &SetupArgs, status: &str, counts: &[(&str, i64)]) -> i32 {
+/// Emit the shared `no_files` result and exit code. `counts` carries the
+/// per-command zero-valued summary fields (`setup` → updated/already/errors,
+/// `check` → configured/needs/errors, `remove` → removed/notConfigured/errors)
+/// so the `no_files` envelope keeps the documented shape (CLI_CONTRACT "Setup
+/// command contract") instead of dropping them.
+fn report_no_files(args: &SetupArgs, counts: &[(&str, i64)]) -> i32 {
     if args.common.json {
         // `serde_json::Map` preserves insertion order (the crate enables
         // `preserve_order`), so status → counts → files comes out in that order.
         let mut map = serde_json::Map::new();
-        map.insert("status".to_string(), serde_json::json!(status));
+        map.insert("status".to_string(), serde_json::json!("no_files"));
         for (key, value) in counts {
             map.insert((*key).to_string(), serde_json::json!(value));
         }
@@ -165,6 +167,29 @@ fn pathdiff(path: &str, base: &Path) -> String {
     p.strip_prefix(base)
         .map(|r| r.display().to_string())
         .unwrap_or_else(|_| path.to_string())
+}
+
+/// The setup/remove mutation gate (shared verbatim by both flows): default-no
+/// prompt on a TTY, auto-proceed with a stderr note when stdin is not
+/// interactive. Returns whether to go ahead. (Deliberately NOT
+/// `output::confirm`, whose semantics differ: stderr prompt, `default_yes`
+/// honored on non-TTY and empty input.)
+fn confirm_proceed(prompt: &str) -> bool {
+    if !stdin_is_tty() {
+        eprintln!("Non-interactive mode detected, proceeding automatically.");
+        return true;
+    }
+    print!("{prompt}");
+    io::stdout().flush().unwrap();
+    let mut answer = String::new();
+    if io::stdin().read_line(&mut answer).is_err() {
+        // Terminals can deliver non-UTF-8 bytes (e.g. a Latin-1 paste);
+        // `read_line` reports those as InvalidData. Treat any read
+        // failure like an unrecognized answer (abort), not a panic.
+        return false;
+    }
+    let answer = answer.trim().to_lowercase();
+    answer == "y" || answer == "yes"
 }
 
 /// Whether an ecosystem is in scope for this run, honoring the global
@@ -214,10 +239,12 @@ fn is_member_excluded(manifest_path: &Path, cwd: &Path, excludes: &[String]) -> 
     excludes.iter().any(|e| normalize_rel_path(e) == rel)
 }
 
-/// The persisted `setup.exclude` list from `.socket/manifest.json` (empty if no
-/// manifest / no setup state). Read-only.
-async fn read_setup_excludes(common: &GlobalArgs) -> Vec<String> {
-    match read_manifest(&common.resolved_manifest_path()).await {
+/// The exclude set in effect for this run: the persisted `setup.exclude` list
+/// from `.socket/manifest.json` (empty if no manifest / no setup state) union
+/// the `--exclude` flag values (all normalized). This is what a clone inherits
+/// — a clone with no flag still reads the persisted set. Read-only.
+async fn effective_excludes(common: &GlobalArgs, flag: &[String]) -> Vec<String> {
+    let mut set: Vec<String> = match read_manifest(&common.resolved_manifest_path()).await {
         Ok(Some(m)) => m
             .setup
             .map(|s| s.exclude)
@@ -226,14 +253,7 @@ async fn read_setup_excludes(common: &GlobalArgs) -> Vec<String> {
             .map(|e| normalize_rel_path(e))
             .collect(),
         _ => Vec::new(),
-    }
-}
-
-/// The exclude set in effect for this run: the persisted `setup.exclude` union
-/// the `--exclude` flag values (all normalized). This is what a clone inherits
-/// — a clone with no flag still reads the persisted set.
-async fn effective_excludes(common: &GlobalArgs, flag: &[String]) -> Vec<String> {
-    let mut set = read_setup_excludes(common).await;
+    };
     for e in flag {
         let n = normalize_rel_path(e);
         if !n.is_empty() && !set.contains(&n) {
@@ -329,9 +349,8 @@ pub(crate) async fn configured_ecosystems(
         }
     }
 
-    #[cfg(feature = "composer")]
-    if let Some(project) = composer_setup::discover_composer_project(&common.cwd).await {
-        if let Ok(content) = tokio::fs::read_to_string(&project.composer_json).await {
+    if let Some(composer_json) = composer_setup::discover_composer_project(&common.cwd).await {
+        if let Ok(content) = tokio::fs::read_to_string(&composer_json).await {
             if composer_setup::is_hook_present(&content) {
                 set.insert(Ecosystem::Composer);
             }
@@ -345,7 +364,6 @@ pub(crate) async fn configured_ecosystems(
 const ECO_NPM: &[&str] = &["npm"];
 const ECO_PYPI: &[&str] = &["pypi", "python"];
 const ECO_GEM: &[&str] = &["gem", "ruby"];
-#[cfg(feature = "composer")]
 const ECO_COMPOSER: &[&str] = &["composer", "php"];
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -454,8 +472,13 @@ async fn finalize_python(plan: &PythonPlan, edits: &[PthEditResult], cwd: &Path)
         return warnings;
     }
     // Lockfile refresh (broad auto-edit): only when the manager uses a lockfile
-    // that exists. Best-effort — never fatal.
-    if let Some((program, args)) = plan.pm.lock_command() {
+    // that exists. Best-effort — never fatal. The spellings are tried in
+    // order: pin-preserving first (`poetry lock --no-update`,
+    // `pdm lock --update-reuse`), bare `lock` as the fallback for versions
+    // that dropped the flag (Poetry 2.x, where bare `lock` is already
+    // pin-preserving). A successful fallback is not a failure — only warn
+    // when every spelling failed.
+    if let Some((program, spellings)) = plan.pm.lock_commands() {
         let lockfile = match plan.pm {
             PythonPackageManager::Uv => Some("uv.lock"),
             PythonPackageManager::Poetry => Some("poetry.lock"),
@@ -467,49 +490,50 @@ async fn finalize_python(plan: &PythonPlan, edits: &[PthEditResult], cwd: &Path)
             None => false,
         };
         if lock_present {
-            match tokio::process::Command::new(program)
-                .args(args)
-                .current_dir(cwd)
-                .output()
-                .await
-            {
-                Ok(o) if o.status.success() => {}
-                Ok(o) => warnings.push(format!(
-                    "`{program} {}` failed ({}); update the lockfile manually",
-                    args.join(" "),
-                    o.status
-                )),
-                Err(e) => warnings.push(format!(
-                    "could not run `{program} {}`: {e}; update the lockfile manually",
-                    args.join(" ")
-                )),
+            let mut failure: Option<String> = None;
+            for args in spellings {
+                match tokio::process::Command::new(program)
+                    .args(*args)
+                    .current_dir(cwd)
+                    .output()
+                    .await
+                {
+                    Ok(o) if o.status.success() => {
+                        failure = None;
+                        break;
+                    }
+                    Ok(o) => {
+                        failure = Some(format!(
+                            "`{program} {}` failed ({}); update the lockfile manually",
+                            args.join(" "),
+                            o.status
+                        ));
+                    }
+                    Err(e) => {
+                        // The program itself didn't spawn (not installed /
+                        // not on PATH): retrying another spelling of the
+                        // same program is pointless.
+                        failure = Some(format!(
+                            "could not run `{program} {}`: {e}; update the lockfile manually",
+                            args.join(" ")
+                        ));
+                        break;
+                    }
+                }
+            }
+            if let Some(w) = failure {
+                warnings.push(w);
             }
         }
     }
     warnings
 }
 
-fn pth_status_str(s: &PthStatus) -> &'static str {
-    match s {
-        PthStatus::Updated => "updated",
-        PthStatus::AlreadyConfigured => "already_configured",
-        PthStatus::Error => "error",
-    }
-}
-
-fn update_status_str(s: &UpdateStatus) -> &'static str {
-    match s {
-        UpdateStatus::Updated => "updated",
-        UpdateStatus::AlreadyConfigured => "already_configured",
-        UpdateStatus::Error => "error",
-    }
-}
-
 // ─────────────────────────────────────────────────────────────────────────
 // Shared per-ecosystem setup outcome
 // ─────────────────────────────────────────────────────────────────────────
 
-/// Feature-agnostic summary of one ecosystem branch's contribution to a
+/// Summary of one ecosystem branch's contribution to a
 /// setup/remove run. Each `build_*_outcome` returns one of these and the shared
 /// reporting code merges + renders them without naming ecosystem-specific types.
 #[derive(Default)]
@@ -532,8 +556,7 @@ struct SetupOutcome {
 
 /// Build the gem branch's contribution to a setup/remove run: add (or remove)
 /// the managed `plugin "socket-patch"` block in the Gemfile + the generated
-/// `.socket/bundler-plugin/` plugin files. Gem is an unconditional ecosystem,
-/// so this is never feature-gated.
+/// `.socket/bundler-plugin/` plugin files.
 async fn build_gem_outcome(common: &GlobalArgs, remove: bool, dry_run: bool) -> SetupOutcome {
     if !eco_in_scope(common, ECO_GEM) {
         return SetupOutcome::default();
@@ -604,15 +627,12 @@ fn gem_status_str(s: &GemSetupStatus, for_remove: bool) -> &'static str {
 
 /// Build the composer branch's contribution to a setup/remove run: add (or
 /// remove) the `socket-patch apply` command in `composer.json`'s
-/// `post-install-cmd` / `post-update-cmd` script events. Feature-gated behind
-/// `composer` (a no-op `Default` when off) — composer apply itself only exists
-/// with the feature, so wiring a hook without it would be incoherent.
-#[cfg(feature = "composer")]
+/// `post-install-cmd` / `post-update-cmd` script events.
 async fn build_composer_outcome(common: &GlobalArgs, remove: bool, dry_run: bool) -> SetupOutcome {
     if !eco_in_scope(common, ECO_COMPOSER) {
         return SetupOutcome::default();
     }
-    let project = match composer_setup::discover_composer_project(&common.cwd).await {
+    let composer_json = match composer_setup::discover_composer_project(&common.cwd).await {
         Some(p) => p,
         None => return SetupOutcome::default(),
     };
@@ -623,9 +643,9 @@ async fn build_composer_outcome(common: &GlobalArgs, remove: bool, dry_run: bool
     };
 
     let r = if remove {
-        composer_setup::remove_hook(&project, dry_run).await
+        composer_setup::remove_hook(&composer_json, dry_run).await
     } else {
-        composer_setup::add_hook(&project, dry_run).await
+        composer_setup::add_hook(&composer_json, dry_run).await
     };
 
     let mut added_paths: Vec<String> = Vec::new();
@@ -660,16 +680,6 @@ async fn build_composer_outcome(common: &GlobalArgs, remove: bool, dry_run: bool
     out
 }
 
-#[cfg(not(feature = "composer"))]
-async fn build_composer_outcome(
-    _common: &GlobalArgs,
-    _remove: bool,
-    _dry_run: bool,
-) -> SetupOutcome {
-    SetupOutcome::default()
-}
-
-#[cfg(feature = "composer")]
 fn composer_status_str(s: &ComposerSetupStatus, for_remove: bool) -> &'static str {
     match (s, for_remove) {
         (ComposerSetupStatus::Updated, false) => "updated",
@@ -684,7 +694,6 @@ fn composer_status_str(s: &ComposerSetupStatus, for_remove: bool) -> &'static st
 /// `run_check` entries list. Returns whether a composer project was found.
 /// Checks the SETUP wiring only — patch consistency is the shared
 /// `append_patch_consistency_entries` pass.
-#[cfg(feature = "composer")]
 async fn append_composer_check_entries(
     common: &GlobalArgs,
     entries: &mut Vec<(&'static str, String, CheckState, Option<String>)>,
@@ -692,11 +701,11 @@ async fn append_composer_check_entries(
     if !eco_in_scope(common, ECO_COMPOSER) {
         return false;
     }
-    let project = match composer_setup::discover_composer_project(&common.cwd).await {
+    let composer_json = match composer_setup::discover_composer_project(&common.cwd).await {
         Some(p) => p,
         None => return false,
     };
-    let (state, err) = match tokio::fs::read_to_string(&project.composer_json).await {
+    let (state, err) = match tokio::fs::read_to_string(&composer_json).await {
         Ok(content) => {
             if composer_setup::is_hook_present(&content) {
                 (CheckState::Configured, None)
@@ -706,21 +715,8 @@ async fn append_composer_check_entries(
         }
         Err(e) => (CheckState::Error, Some(e.to_string())),
     };
-    entries.push((
-        "composer",
-        project.composer_json.display().to_string(),
-        state,
-        err,
-    ));
+    entries.push(("composer", composer_json.display().to_string(), state, err));
     true
-}
-
-#[cfg(not(feature = "composer"))]
-async fn append_composer_check_entries(
-    _common: &GlobalArgs,
-    _entries: &mut Vec<(&'static str, String, CheckState, Option<String>)>,
-) -> bool {
-    false
 }
 
 /// Materialise gem patches right after wiring the plugin (the "automatic" step)
@@ -804,8 +800,11 @@ async fn append_gem_check_entries(
 /// wired but patches drifted/un-applied is not in a correctly-patched state.
 ///
 /// Reuses the same machinery `vex` uses — the qualified-aware rollback resolver
-/// (so release-variant PURLs resolve) honoring `--ecosystems`, then
-/// [`applied_patches`]. An *uninstalled* package (`package_not_found`, also the
+/// (so release-variant PURLs resolve) honoring `--ecosystems`, the committed
+/// vendor ledger ([`crate::commands::vex::load_vendor_context`]: a vendored
+/// patch is judged by its `.socket/vendor/` artifact — the bytes the next
+/// install consumes — never the expectedly-unpatched installed tree), then
+/// [`applied_patches_with_vendor`]. An *uninstalled* package (`package_not_found`, also the
 /// bucket for out-of-scope PURLs absent from the map) cannot be patched yet, and
 /// a degenerate zero-file record (`no_files`) has nothing to hash — neither is
 /// drift, so both are skipped. A missing/empty/unreadable manifest contributes
@@ -821,20 +820,13 @@ async fn append_patch_consistency_entries(
     };
 
     let purls: Vec<String> = manifest.patches.keys().cloned().collect();
-    let partitioned = partition_purls(&purls, common.ecosystems.as_deref());
-    let crawler_options = CrawlerOptions {
-        cwd: common.cwd.clone(),
-        global: common.global,
-        global_prefix: common.global_prefix.clone(),
-        batch_size: 0, // unused for find_packages_for_rollback
-    };
     // `--json` reserves stdout for the check report: silence the dispatch's
     // human chrome ("Using <X> at: ...") like apply/rollback do.
     let package_paths =
-        find_packages_for_rollback(&partitioned, &crawler_options, common.silent || common.json)
-            .await;
+        find_manifest_package_paths(&purls, common, common.silent || common.json).await;
 
-    let outcome = applied_patches(&manifest, &package_paths).await;
+    let vendor = crate::commands::vex::load_vendor_context(common, &manifest).await;
+    let outcome = applied_patches_with_vendor(&manifest, &package_paths, vendor.as_ref()).await;
     for failed in &outcome.failed {
         match failed.reason.as_str() {
             // Not installed (or out of scope) / nothing to hash → not drift.
@@ -897,7 +889,13 @@ async fn run_check(args: &SetupArgs) -> i32 {
     for loc in &npm_files {
         let (state, err) = match tokio::fs::read_to_string(&loc.path).await {
             Ok(content) => {
-                if serde_json::from_str::<serde_json::Value>(&content).is_err() {
+                // npm and Node strip a leading UTF-8 BOM when reading
+                // package.json (and `setup` itself tolerates one via
+                // `is_setup_configured_str`); parse the same bytes they would,
+                // or a BOM'd configured file fails `--check` as "Invalid
+                // package.json" while `setup` calls it already_configured.
+                let json = content.strip_prefix('\u{feff}').unwrap_or(&content);
+                if serde_json::from_str::<serde_json::Value>(json).is_err() {
                     (CheckState::Error, Some("Invalid package.json".to_string()))
                 } else if is_setup_configured_str(&content).needs_update {
                     (CheckState::NeedsConfiguration, None)
@@ -943,7 +941,6 @@ async fn run_check(args: &SetupArgs) -> i32 {
     if entries.is_empty() {
         return report_no_files(
             args,
-            "no_files",
             &[("configured", 0), ("needsConfiguration", 0), ("errors", 0)],
         );
     }
@@ -1013,6 +1010,20 @@ async fn run_check(args: &SetupArgs) -> i32 {
                 "{needs} manifest(s) need configuration, {errs} error(s). Run `socket-patch setup` to fix."
             );
         }
+    } else {
+        // `--silent` is "errors only": the status report is muted, but
+        // read/parse failures must still reach stderr. A plain
+        // needs-configuration state is not an error — the exit code alone
+        // carries it.
+        for (_, path, state, err) in &entries {
+            if *state == CheckState::Error {
+                eprintln!(
+                    "Error: {}: {}",
+                    pathdiff(path, &args.common.cwd),
+                    err.as_deref().unwrap_or("unknown error")
+                );
+            }
+        }
     }
 
     if all_ok {
@@ -1058,11 +1069,7 @@ async fn run_remove(args: &SetupArgs) -> i32 {
         && !gem_preview.present
         && !composer_preview.present
     {
-        return report_no_files(
-            args,
-            "no_files",
-            &[("removed", 0), ("notConfigured", 0), ("errors", 0)],
-        );
+        return report_no_files(args, &[("removed", 0), ("notConfigured", 0), ("errors", 0)]);
     }
     let gem_present = gem_preview.present;
     let extra_preview = merge_outcomes(gem_preview, composer_preview);
@@ -1121,6 +1128,10 @@ async fn run_remove(args: &SetupArgs) -> i32 {
                 println!("No socket-patch install hooks found to remove.");
             }
         }
+        eprint_errors_when_silent(
+            common,
+            &remove_error_messages(&npm_preview, &py_preview, &extra_preview),
+        );
         return if preview_errs > 0 { 1 } else { 0 };
     }
 
@@ -1132,24 +1143,17 @@ async fn run_remove(args: &SetupArgs) -> i32 {
             println!("\nSummary:");
             println!("  {n_remove} item(s) would have socket-patch removed");
         }
+        eprint_errors_when_silent(
+            common,
+            &remove_error_messages(&npm_preview, &py_preview, &extra_preview),
+        );
         return if preview_errs > 0 { 1 } else { 0 };
     }
 
     // Confirm before mutating.
-    if !common.yes && !common.json {
-        if !stdin_is_tty() {
-            eprintln!("Non-interactive mode detected, proceeding automatically.");
-        } else {
-            print!("Remove these install hooks? (y/N): ");
-            io::stdout().flush().unwrap();
-            let mut answer = String::new();
-            io::stdin().read_line(&mut answer).unwrap();
-            let answer = answer.trim().to_lowercase();
-            if answer != "y" && answer != "yes" {
-                println!("Aborted");
-                return 0;
-            }
-        }
+    if !common.yes && !common.json && !confirm_proceed("Remove these install hooks? (y/N): ") {
+        println!("Aborted");
+        return 0;
     }
 
     if !quiet {
@@ -1223,6 +1227,11 @@ async fn run_remove(args: &SetupArgs) -> i32 {
         }
     }
 
+    eprint_errors_when_silent(
+        common,
+        &remove_error_messages(&npm_results, &py_results, &extra_results),
+    );
+
     if errs > 0 {
         1
     } else {
@@ -1241,6 +1250,64 @@ fn outcome_error_messages(o: &SetupOutcome) -> Vec<String> {
         .filter(|f| f.get("status").and_then(|s| s.as_str()) == Some("error"))
         .filter_map(|f| f.get("error").and_then(|e| e.as_str()).map(str::to_string))
         .collect()
+}
+
+/// `--silent` is "errors only" (CLI_CONTRACT.md): the previews, summaries,
+/// and status report that normally carry per-item failures are muted, so
+/// before an error exit the failures themselves must still reach stderr —
+/// mirroring `remove`/`scan`, whose error paths keep their stderr output.
+/// JSON mode is exempt: its envelope already carries the errors.
+fn eprint_errors_when_silent(common: &GlobalArgs, errs: &[String]) {
+    if !common.silent || common.json {
+        return;
+    }
+    for e in errs {
+        eprintln!("Error: {e}");
+    }
+}
+
+/// Per-item error messages across the three remove result families (npm +
+/// Python + gem/composer) — the preview "Errors:" section and the
+/// silent-mode stderr reporting share this.
+fn remove_error_messages(
+    npm: &[RemoveResult],
+    py: &[PthEditResult],
+    extra: &SetupOutcome,
+) -> Vec<String> {
+    let mut errs: Vec<String> = npm
+        .iter()
+        .filter(|r| r.status == RemoveStatus::Error)
+        .filter_map(|r| r.error.clone())
+        .chain(
+            py.iter()
+                .filter(|r| r.status == PthStatus::Error)
+                .filter_map(|r| r.error.clone()),
+        )
+        .collect();
+    errs.extend(outcome_error_messages(extra));
+    errs
+}
+
+/// Per-item error messages across the three setup result families (npm +
+/// Python + gem/composer) — the preview "Errors:" section and the
+/// silent-mode stderr reporting share this.
+fn setup_error_messages(
+    npm: &[UpdateResult],
+    py: &[PthEditResult],
+    extra: &SetupOutcome,
+) -> Vec<String> {
+    let mut errs: Vec<String> = npm
+        .iter()
+        .filter(|r| r.status == UpdateStatus::Error)
+        .filter_map(|r| r.error.clone())
+        .chain(
+            py.iter()
+                .filter(|r| r.status == PthStatus::Error)
+                .filter_map(|r| r.error.clone()),
+        )
+        .collect();
+    errs.extend(outcome_error_messages(extra));
+    errs
 }
 
 fn print_remove_preview(
@@ -1289,17 +1356,7 @@ fn print_remove_preview(
 
     // Surface failures so the "(see errors above)" line `run_remove` prints when
     // nothing could be removed actually points at something.
-    let mut errs: Vec<String> = npm
-        .iter()
-        .filter(|r| r.status == RemoveStatus::Error)
-        .filter_map(|r| r.error.clone())
-        .chain(
-            py.iter()
-                .filter(|r| r.status == PthStatus::Error)
-                .filter_map(|r| r.error.clone()),
-        )
-        .collect();
-    errs.extend(outcome_error_messages(extra));
+    let errs = remove_error_messages(npm, py, extra);
     if !errs.is_empty() {
         println!("Errors:");
         for e in &errs {
@@ -1418,22 +1475,10 @@ async fn run_setup(args: &SetupArgs) -> i32 {
         && !gem_preview.present
         && !composer_preview.present
     {
-        if common.json {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "status": "no_files",
-                    "updated": 0,
-                    "alreadyConfigured": 0,
-                    "errors": 0,
-                    "files": [],
-                }))
-                .unwrap()
-            );
-        } else if !common.silent {
-            println!("No package.json, Python, Bundler, or Composer project found");
-        }
-        return 0;
+        return report_no_files(
+            args,
+            &[("updated", 0), ("alreadyConfigured", 0), ("errors", 0)],
+        );
     }
 
     let gem_present = gem_preview.present;
@@ -1511,6 +1556,10 @@ async fn run_setup(args: &SetupArgs) -> i32 {
                 println!("All install hooks are already configured with socket-patch!");
             }
         }
+        eprint_errors_when_silent(
+            common,
+            &setup_error_messages(&npm_preview, &py_preview, &extra_preview),
+        );
         return if preview_errors > 0 { 1 } else { 0 };
     }
 
@@ -1529,23 +1578,16 @@ async fn run_setup(args: &SetupArgs) -> i32 {
             println!("\nSummary (dry run):");
             println!("  {n_changes} item(s) would be updated");
         }
+        eprint_errors_when_silent(
+            common,
+            &setup_error_messages(&npm_preview, &py_preview, &extra_preview),
+        );
         return if preview_errors > 0 { 1 } else { 0 };
     }
 
-    if !common.yes && !common.json {
-        if !stdin_is_tty() {
-            eprintln!("Non-interactive mode detected, proceeding automatically.");
-        } else {
-            print!("Proceed with these changes? (y/N): ");
-            io::stdout().flush().unwrap();
-            let mut answer = String::new();
-            io::stdin().read_line(&mut answer).unwrap();
-            let answer = answer.trim().to_lowercase();
-            if answer != "y" && answer != "yes" {
-                println!("Aborted");
-                return 0;
-            }
-        }
+    if !common.yes && !common.json && !confirm_proceed("Proceed with these changes? (y/N): ") {
+        println!("Aborted");
+        return 0;
     }
 
     if !quiet {
@@ -1634,6 +1676,11 @@ async fn run_setup(args: &SetupArgs) -> i32 {
         }
     }
 
+    eprint_errors_when_silent(
+        common,
+        &setup_error_messages(&npm_results, &py_results, &extra_results),
+    );
+
     if errors > 0 {
         1
     } else {
@@ -1691,17 +1738,7 @@ fn print_setup_preview(
         );
     }
 
-    let mut errs: Vec<String> = npm
-        .iter()
-        .filter(|r| r.status == UpdateStatus::Error)
-        .filter_map(|r| r.error.clone())
-        .chain(
-            py.iter()
-                .filter(|r| r.status == PthStatus::Error)
-                .filter_map(|r| r.error.clone()),
-        )
-        .collect();
-    errs.extend(outcome_error_messages(extra));
+    let errs = setup_error_messages(npm, py, extra);
     if !errs.is_empty() {
         println!("\nErrors:");
         for e in &errs {
@@ -1747,7 +1784,11 @@ fn print_setup_envelope(
             serde_json::json!({
                 "kind": "package_json",
                 "path": r.path,
-                "status": update_status_str(&r.status),
+                "status": match r.status {
+                    UpdateStatus::Updated => "updated",
+                    UpdateStatus::AlreadyConfigured => "already_configured",
+                    UpdateStatus::Error => "error",
+                },
                 "error": r.error,
             })
         })
@@ -1756,7 +1797,11 @@ fn print_setup_envelope(
         serde_json::json!({
             "kind": "pth",
             "path": r.path,
-            "status": pth_status_str(&r.status),
+            "status": match r.status {
+                PthStatus::Updated => "updated",
+                PthStatus::AlreadyConfigured => "already_configured",
+                PthStatus::Error => "error",
+            },
             "error": r.error,
         })
     }));

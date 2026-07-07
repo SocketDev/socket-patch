@@ -20,9 +20,7 @@ pub mod schema;
 pub mod time;
 pub mod verify;
 
-pub use build::{
-    build_document, build_document_with_provenance, build_document_with_vendored, BuildOptions,
-};
+pub use build::{build_document, BuildOptions};
 pub use product::{detect_product, DetectResult};
 pub use schema::{
     Document, Justification, Product, Statement, Status, Subcomponent, Vulnerability,

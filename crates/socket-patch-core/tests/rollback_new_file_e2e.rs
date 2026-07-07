@@ -188,6 +188,68 @@ async fn verify_existing_file_rollback_missing_blob() {
     assert_eq!(result.expected_hash, None);
 }
 
+/// New-file rollback fail-closed: the patch-added path is occupied by
+/// something unhashable (here: a directory). The hash error must surface
+/// as a blocking status carrying the real error — not be swallowed into
+/// an empty-string "hash" that gets misreported as "modified after
+/// patching" with a fabricated `current_hash: Some("")`.
+#[tokio::test]
+async fn verify_new_file_rollback_unhashable_entry_fails_closed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pkg = tmp.path();
+    let blobs = tmp.path().join("blobs");
+    std::fs::create_dir(&blobs).unwrap();
+
+    // A directory sits where the patch-added file should be.
+    std::fs::create_dir(pkg.join("added.txt")).unwrap();
+
+    let file_info = PatchFileInfo {
+        before_hash: String::new(),
+        after_hash: git_sha256(b"content the patch added"),
+    };
+    let result = verify_file_rollback(pkg, "package/added.txt", &file_info, &blobs).await;
+    // Same convention as the pre-existing-file branch and this branch's own
+    // stat-failure arm: unverifiable state → NotFound + the underlying error.
+    assert_eq!(result.status, VerifyRollbackStatus::NotFound);
+    let msg = result.message.as_deref().unwrap_or("");
+    assert!(
+        msg.starts_with("Failed to hash file:"),
+        "must surface the hash error, not claim the file was modified: {msg:?}"
+    );
+    // No hash was computed — a fabricated Some("") must never be reported.
+    assert_eq!(result.current_hash, None);
+    assert_eq!(result.expected_hash, None);
+    assert_eq!(result.target_hash, None);
+}
+
+/// Fail-open twin of the test above: when a malformed manifest carries an
+/// empty `after_hash` alongside the empty `before_hash`, a swallowed hash
+/// error ("") compares equal to the empty `after_hash` — verify reported
+/// `Ready` and cleared an entry it could not read for deletion. An
+/// unverifiable entry must never verify `Ready`.
+#[tokio::test]
+async fn verify_new_file_rollback_unhashable_entry_empty_after_hash_not_ready() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pkg = tmp.path();
+    let blobs = tmp.path().join("blobs");
+    std::fs::create_dir(&blobs).unwrap();
+
+    std::fs::create_dir(pkg.join("added.txt")).unwrap();
+
+    let file_info = PatchFileInfo {
+        before_hash: String::new(),
+        after_hash: String::new(),
+    };
+    let result = verify_file_rollback(pkg, "package/added.txt", &file_info, &blobs).await;
+    assert_ne!(
+        result.status,
+        VerifyRollbackStatus::Ready,
+        "an entry that cannot be hashed must never be cleared for deletion"
+    );
+    assert_eq!(result.status, VerifyRollbackStatus::NotFound);
+    assert_eq!(result.current_hash, None);
+}
+
 // Marker so `Path` import isn't unused on platforms that gate
 // helper code differently.
 #[allow(dead_code)]

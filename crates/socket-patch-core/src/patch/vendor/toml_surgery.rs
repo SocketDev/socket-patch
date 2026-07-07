@@ -1,7 +1,7 @@
 //! Pure text-surgery helpers for lockfile-shaped TOML.
 //!
-//! The pypi/uv backend (and the upcoming poetry/pdm/pipenv ones) edit locks
-//! by TARGETED text surgery rather than a TOML re-serialize: the spike
+//! The pypi/uv, poetry, and pdm backends edit locks by TARGETED text
+//! surgery rather than a TOML re-serialize: the spike
 //! proved a surgical edit reproduces the lock generator's own serializer
 //! output byte-identically, which keeps `--check`-style validations green
 //! and the committed diff minimal. These helpers are the shared, purely
@@ -54,9 +54,69 @@ where
     None
 }
 
-/// Exclusive end index of the bracket opened at `open_idx` (quote-aware;
+/// The unit's lines with any trailing foreign top-level section cut off.
+/// [`find_unit_span`] ends a unit at the NEXT `[[package]]` or EOF, but a
+/// trailing section (poetry's `[metadata]`) would otherwise be swallowed —
+/// truncate at the first top-level header that is not a `[package.*]`
+/// sub-table, dropping the blank separator.
+pub(super) fn package_unit_lines(unit_text: &str) -> Vec<&str> {
+    let mut unit: Vec<&str> = unit_text.lines().collect();
+    if let Some(stop) = unit
+        .iter()
+        .enumerate()
+        .skip(1)
+        .find_map(|(i, l)| (l.starts_with('[') && !l.starts_with("[package.")).then_some(i))
+    {
+        unit.truncate(stop);
+        while unit.last().is_some_and(|l| l.trim().is_empty()) {
+            unit.pop();
+        }
+    }
+    unit
+}
+
+/// Rewrite the unit's `files = [...]` array (single- or multi-line) to the
+/// single patched-wheel `{file, hash}` element, preserving every other line
+/// verbatim — the splice shape shared by the poetry and pdm locks. `None`
+/// when the unit has no files array (the callers fail closed rather than
+/// guess a placement).
+pub(super) fn replace_files_array(
+    unit: &[&str],
+    wheel_file_name: &str,
+    wheel_sha256_hex: &str,
+) -> Option<Vec<String>> {
+    let files_lines = [
+        "files = [".to_string(),
+        format!("    {{file = \"{wheel_file_name}\", hash = \"sha256:{wheel_sha256_hex}\"}},"),
+        "]".to_string(),
+    ];
+
+    let mut out: Vec<String> = Vec::new();
+    let mut files_done = false;
+    let mut i = 0;
+    while i < unit.len() {
+        let line = unit[i];
+        if line.starts_with("files = [") {
+            out.extend(files_lines.iter().cloned());
+            files_done = true;
+            if !line.trim_end().ends_with(']') {
+                // skip the original multi-line array body + closing bracket
+                while i + 1 < unit.len() && unit[i + 1].trim() != "]" {
+                    i += 1;
+                }
+                i += 1;
+            }
+        } else {
+            out.push(line.to_string());
+        }
+        i += 1;
+    }
+    files_done.then_some(out)
+}
+
+/// Exclusive end index of the `[` array opened at `open_idx` (quote-aware;
 /// TOML basic strings with backslash escapes).
-pub(super) fn balanced_span(text: &str, open_idx: usize, open: char, close: char) -> Option<usize> {
+pub(super) fn balanced_span(text: &str, open_idx: usize) -> Option<usize> {
     let mut depth = 0i32;
     let mut in_str = false;
     let mut escaped = false;
@@ -73,12 +133,12 @@ pub(super) fn balanced_span(text: &str, open_idx: usize, open: char, close: char
         }
         if c == '"' {
             in_str = true;
-        } else if c == open {
+        } else if c == '[' {
             depth += 1;
-        } else if c == close {
+        } else if c == ']' {
             depth -= 1;
             if depth == 0 {
-                return Some(open_idx + i + c.len_utf8());
+                return Some(open_idx + i + 1);
             }
         }
     }
@@ -158,13 +218,22 @@ pub(super) fn split_top_level_commas(text: &str) -> Vec<&str> {
     out
 }
 
+/// The drift-tolerant revert splice: replace the first occurrence of `new`
+/// with `orig`. `None` when either fragment is missing (a malformed wiring
+/// record) or `new` no longer appears (the fragment drifted) — the callers
+/// warn and leave the text untouched.
+pub(super) fn replace_fragment(
+    text: &str,
+    new: Option<&str>,
+    orig: Option<&str>,
+) -> Option<String> {
+    let (new, orig) = (new?, orig?);
+    text.contains(new).then(|| text.replacen(new, orig, 1))
+}
+
 /// Remove the first exact occurrence of `needle`; `None` when absent.
 pub(super) fn remove_substring(text: &str, needle: &str) -> Option<String> {
-    let idx = text.find(needle)?;
-    let mut out = String::with_capacity(text.len() - needle.len());
-    out.push_str(&text[..idx]);
-    out.push_str(&text[idx + needle.len()..]);
-    Some(out)
+    text.contains(needle).then(|| text.replacen(needle, "", 1))
 }
 
 /// Remove the first line that equals `line` exactly; `None` when absent.
@@ -258,13 +327,60 @@ mod tests {
     }
 
     #[test]
+    fn package_unit_lines_truncates_trailing_foreign_section() {
+        // A [package.*] sub-table stays; a trailing [metadata] (plus its
+        // blank separator) is cut.
+        let unit = "[[package]]\nname = \"six\"\n\n[package.source]\ntype = \"file\"\n\n[metadata]\nlock-version = \"2.1\"";
+        assert_eq!(
+            package_unit_lines(unit),
+            vec![
+                "[[package]]",
+                "name = \"six\"",
+                "",
+                "[package.source]",
+                "type = \"file\""
+            ]
+        );
+        // No foreign section → untouched.
+        assert_eq!(
+            package_unit_lines("[[package]]\nname = \"six\""),
+            vec!["[[package]]", "name = \"six\""]
+        );
+    }
+
+    #[test]
+    fn replace_files_array_handles_multi_line_inline_and_absent() {
+        let multi = ["name = \"six\"", "files = [", "    {file = \"a\"},", "]"];
+        assert_eq!(
+            replace_files_array(&multi, "w.whl", "beef").unwrap(),
+            vec![
+                "name = \"six\"",
+                "files = [",
+                "    {file = \"w.whl\", hash = \"sha256:beef\"},",
+                "]"
+            ]
+        );
+        let inline = ["files = []", "summary = \"x\""];
+        assert_eq!(
+            replace_files_array(&inline, "w.whl", "beef").unwrap(),
+            vec![
+                "files = [",
+                "    {file = \"w.whl\", hash = \"sha256:beef\"},",
+                "]",
+                "summary = \"x\""
+            ]
+        );
+        assert!(replace_files_array(&["name = \"six\""], "w.whl", "beef").is_none());
+    }
+
+    #[test]
     fn balanced_span_is_quote_aware() {
         let text = "x = [\"a]b\", [1, 2], \"c\\\"]d\"] tail";
         let open = text.find('[').unwrap();
-        let end = balanced_span(text, open, '[', ']').unwrap();
+        let end = balanced_span(text, open).unwrap();
         assert_eq!(&text[open..end], "[\"a]b\", [1, 2], \"c\\\"]d\"]");
         // Unbalanced → None.
-        assert!(balanced_span("[1, 2", 0, '[', ']').is_none());
+        assert!(balanced_span("[1, 2", 0).is_none());
     }
 
     #[test]
@@ -281,6 +397,14 @@ mod tests {
 
     #[test]
     fn removal_helpers_round_trip() {
+        assert_eq!(
+            replace_fragment("a new b", Some("new"), Some("old")).as_deref(),
+            Some("a old b")
+        );
+        assert_eq!(replace_fragment("a b", Some("new"), Some("old")), None);
+        assert_eq!(replace_fragment("a new b", None, Some("old")), None);
+        assert_eq!(replace_fragment("a new b", Some("new"), None), None);
+
         assert_eq!(remove_substring("abcdef", "cd").as_deref(), Some("abef"));
         assert_eq!(remove_substring("abcdef", "xy"), None);
 
