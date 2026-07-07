@@ -176,7 +176,11 @@ pub async fn vendor_maven(
     let jar_copy_rel = format!("{leaf_rel}/{jar_leaf}");
     let uuid_dir = project_root.join(&uuid_dir_rel);
     let leaf_dir = project_root.join(&leaf_rel);
-    let jar_path = leaf_dir.join(&jar_leaf);
+    // Join the full forward-slash rel rather than `leaf_dir.join(&jar_leaf)`:
+    // the joined form puts an OS separator (`\` on Windows) before the leaf
+    // while every other reported path keeps the rel's forward slashes —
+    // `package_path` reports (and tests compare) this as a display string.
+    let jar_path = project_root.join(&jar_copy_rel);
     let repo_id = format!("socket-patch-vendor-{}", record.uuid);
 
     // A patch with no files is meaningless to vendor: no-op success, no edits.
