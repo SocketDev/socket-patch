@@ -42,15 +42,21 @@ impl PythonPackageManager {
         }
     }
 
-    /// The lockfile-refresh command `(program, args)` for managers whose frozen
-    /// CI install reads a lockfile that must be regenerated after editing the
-    /// dependency list. `None` for managers that resolve dependencies directly
-    /// from the manifest at install time (pip, hatch).
-    pub fn lock_command(&self) -> Option<(&'static str, &'static [&'static str])> {
+    /// The lockfile-refresh invocations `(program, spellings)` for managers
+    /// whose frozen CI install reads a lockfile that must be regenerated
+    /// after editing the dependency list. Each arg-list is tried in order
+    /// until one succeeds: the first is the pin-preserving spelling where
+    /// the tool has a distinct one (`poetry lock --no-update` on Poetry 1.x —
+    /// bare `poetry lock` re-resolves the user's whole pinned set there;
+    /// `pdm lock --update-reuse`), the last is the bare `lock` accepted
+    /// everywhere (already pin-preserving on Poetry 2.x, where `--no-update`
+    /// was removed, and on uv). `None` for managers that resolve dependencies
+    /// directly from the manifest at install time (pip, hatch).
+    pub fn lock_commands(&self) -> Option<(&'static str, &'static [&'static [&'static str]])> {
         match self {
-            Self::Uv => Some(("uv", &["lock"])),
-            Self::Poetry => Some(("poetry", &["lock"])),
-            Self::Pdm => Some(("pdm", &["lock"])),
+            Self::Uv => Some(("uv", &[&["lock"]])),
+            Self::Poetry => Some(("poetry", &[&["lock", "--no-update"], &["lock"]])),
+            Self::Pdm => Some(("pdm", &[&["lock", "--update-reuse"], &["lock"]])),
             Self::Hatch | Self::Pip => None,
         }
     }
@@ -305,12 +311,22 @@ mod tests {
     }
 
     #[test]
-    fn test_lock_command() {
+    fn test_lock_commands() {
         assert_eq!(
-            PythonPackageManager::Uv.lock_command(),
-            Some(("uv", &["lock"][..]))
+            PythonPackageManager::Uv.lock_commands(),
+            Some(("uv", &[&["lock"][..]][..]))
         );
-        assert_eq!(PythonPackageManager::Pip.lock_command(), None);
-        assert_eq!(PythonPackageManager::Hatch.lock_command(), None);
+        // Pin-preserving spelling first, bare `lock` fallback for versions
+        // that dropped the flag (Poetry 2.x).
+        assert_eq!(
+            PythonPackageManager::Poetry.lock_commands(),
+            Some(("poetry", &[&["lock", "--no-update"][..], &["lock"][..]][..]))
+        );
+        assert_eq!(
+            PythonPackageManager::Pdm.lock_commands(),
+            Some(("pdm", &[&["lock", "--update-reuse"][..], &["lock"][..]][..]))
+        );
+        assert_eq!(PythonPackageManager::Pip.lock_commands(), None);
+        assert_eq!(PythonPackageManager::Hatch.lock_commands(), None);
     }
 }

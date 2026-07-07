@@ -31,7 +31,7 @@ use tokio::fs;
 use toml_edit::{DocumentMut, InlineTable, Item, Table, Value};
 
 use crate::pth_hook::edit::ensure_table;
-use crate::utils::fs::atomic_write_bytes;
+use crate::utils::fs::atomic_write_bytes_preserving_mode;
 
 /// Project-relative root of the vendor backend's committed crate copies. An
 /// entry whose `path` is under this prefix is socket-owned.
@@ -99,19 +99,17 @@ pub async fn read_patch_entries(project_root: &Path) -> HashMap<String, PatchEnt
 // ── config-file resolution + read-or-create write ────────────────────────────
 
 /// Resolve the config file under `<project_root>/.cargo/`. Prefers an existing
-/// `config.toml`, then an existing legacy `config`, else `config.toml` (created
-/// on first write).
+/// legacy `config`: when both files exist cargo reads the one WITHOUT the
+/// extension (and warns) — writing into `config.toml` there would leave the
+/// `[patch]` entry silently inert. Falls back to an existing `config.toml`,
+/// else `config.toml` (created on first write).
 async fn config_path(project_root: &Path) -> PathBuf {
     let dir = project_root.join(".cargo");
-    let toml = dir.join("config.toml");
-    if fs::metadata(&toml).await.is_ok() {
-        return toml;
-    }
     let legacy = dir.join("config");
     if fs::metadata(&legacy).await.is_ok() {
         return legacy;
     }
-    toml
+    dir.join("config.toml")
 }
 
 /// Apply a pure transform to the config file, writing only if it changed and
@@ -162,8 +160,10 @@ async fn edit_config(
                     // comments alongside our `[patch]` entries. Commit
                     // atomically (stage + fsync + rename) so a crash mid-write
                     // can never truncate content we only meant to add one
-                    // entry to.
-                    atomic_write_bytes(&path, new.as_bytes())
+                    // entry to — and keep the destination's permission bits
+                    // (the rename would otherwise reset them to the fresh
+                    // stage inode's default).
+                    atomic_write_bytes_preserving_mode(&path, new.as_bytes())
                         .await
                         .map_err(|e| format!("write {}: {e}", path.display()))?;
                 }

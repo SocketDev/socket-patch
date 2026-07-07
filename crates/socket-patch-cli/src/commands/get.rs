@@ -587,7 +587,7 @@ pub(crate) fn select_patches(
                         "{}",
                         serde_json::to_string_pretty(&serde_json::json!({
                             "status": "selection_required",
-                            "error": format!("Multiple patches available for {purl}. Specify --id <UUID> to select one."),
+                            "error": format!("Multiple patches available for {purl}. Re-run with the chosen UUID as the identifier (`socket-patch get <uuid>`) to select one."),
                             "purl": purl,
                             "options": options_json,
                         }))

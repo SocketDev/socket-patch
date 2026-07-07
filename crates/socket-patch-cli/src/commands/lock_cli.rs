@@ -115,12 +115,12 @@ pub(crate) fn acquire_or_emit(
             } else {
                 (held_message(timeout), Hint::UnlockOrBreakLock)
             };
-            emit(command, json, silent, dry_run, "lock_held", &msg, hint);
+            emit(command, json, dry_run, "lock_held", &msg, hint);
             Err(1)
         }
         Err(LockError::Io { path, source }) => {
             let msg = format!("failed to open lock file at {}: {}", path.display(), source);
-            emit(command, json, silent, dry_run, "lock_io", &msg, Hint::None);
+            emit(command, json, dry_run, "lock_io", &msg, Hint::None);
             Err(1)
         }
     }
@@ -203,21 +203,17 @@ enum Hint {
     UnlockOrBreakLock,
 }
 
-fn emit(
-    command: Command,
-    json: bool,
-    silent: bool,
-    dry_run: bool,
-    code: &str,
-    message: &str,
-    hint: Hint,
-) {
+fn emit(command: Command, json: bool, dry_run: bool, code: &str, message: &str, hint: Hint) {
     if json {
         println!(
             "{}",
             error_envelope(command, dry_run, code, message).to_pretty_json()
         );
-    } else if !silent {
+    } else {
+        // Errors print even under --silent ("errors only", never "nothing"
+        // — CLI_CONTRACT.md): exit 1 with no message would be
+        // undiagnosable. The remediation hint is part of the error report,
+        // not informational chatter, so it prints with the error.
         eprintln!("Error: {message}.");
         match hint {
             Hint::None => {}

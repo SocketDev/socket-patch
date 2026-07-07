@@ -22,7 +22,9 @@ use super::path::vendor_uuid_dir_rel;
 use super::pypi_pdm::{PdmProject, PdmTarget};
 use super::pypi_pipenv::{PipenvProject, PipenvTarget};
 use super::pypi_poetry::{PoetryProject, PoetryTarget};
-use super::pypi_requirements::{preflight_requirements, revert_requirements, wire_requirements};
+use super::pypi_requirements::{
+    preflight_requirements, revert_requirements, wire_requirements, RequirementsTarget,
+};
 use super::pypi_uv::{
     check_target_guards, load_uv_project, revert_uv, wire_uv, UvProject, UvTarget,
 };
@@ -305,12 +307,11 @@ pub async fn vendor_pypi(
             }
         }
         PypiFlavor::Requirements => {
-            if let Err((code, detail)) =
-                preflight_requirements(project_root, &canon_name, version).await
-            {
-                return refused(code, detail);
+            match preflight_requirements(project_root, &canon_name, version, &record.uuid).await {
+                Ok(RequirementsTarget::InSync) => WiringPlan::InSync,
+                Ok(RequirementsTarget::Fresh) => WiringPlan::Requirements,
+                Err((code, detail)) => return refused(code, detail),
             }
-            WiringPlan::Requirements
         }
         PypiFlavor::Poetry => {
             let project = match super::pypi_poetry::load_poetry_project(project_root).await {

@@ -504,7 +504,23 @@ pub(crate) async fn repair_vendored_artifacts(
     let mut must_verify: HashMap<String, lock_inventory::LockIntegrity> = HashMap::new();
     for c in &candidates {
         if all_packages.contains_key(&c.purl) {
-            continue; // installed copy: works offline too
+            // Installed copy: works offline too. But for a RECONSTRUCTED
+            // entry the copy is an unverified source — the ledger that
+            // recorded the artifact sha is gone, so the rewired lockfile's
+            // integrity is the ONLY trust anchor. A copy that drifted since
+            // vendoring (build-tool artifacts, edited unpatched files) packs
+            // into a tarball the package manager would reject on its next
+            // install; register the wired integrity so the rebuilt artifact
+            // is verified below, exactly like the unverified-registry rung.
+            if c.reconstructed {
+                if let Some(wired) =
+                    lock_inventory::wired_vendor_integrity(&common.cwd, &c.entry.artifact.path)
+                        .await
+                {
+                    must_verify.insert(c.purl.clone(), wired);
+                }
+            }
+            continue;
         }
         if common.offline {
             fail(
@@ -590,6 +606,31 @@ pub(crate) async fn repair_vendored_artifacts(
         let Some(pkg_path) = all_packages.get(&c.purl).cloned() else {
             continue; // failed above
         };
+        // For an unverified-source rebuild the rewired lockfile is the trust
+        // anchor: snapshot the wiring files so a failed post-verify can put
+        // them back byte-for-byte. The backend's re-wire may refresh the
+        // recorded integrity/checksum to the rebuilt tarball's — blessing
+        // exactly the drifted bytes the verify below is about to reject.
+        let wiring_snapshot: Option<Vec<(std::path::PathBuf, Vec<u8>)>> =
+            if must_verify.contains_key(&c.purl) {
+                let mut snap = Vec::new();
+                for name in [
+                    "package-lock.json",
+                    "npm-shrinkwrap.json",
+                    "pnpm-lock.yaml",
+                    "yarn.lock",
+                    "bun.lock",
+                    "package.json",
+                ] {
+                    let p = common.cwd.join(name);
+                    if let Ok(bytes) = tokio::fs::read(&p).await {
+                        snap.push((p, bytes));
+                    }
+                }
+                Some(snap)
+            } else {
+                None
+            };
         let outcome = dispatch_vendor_one(
             &c.purl,
             &pkg_path,
@@ -652,6 +693,14 @@ pub(crate) async fn repair_vendored_artifacts(
                     };
                     if let Err(detail) = verdict {
                         remove_vendor_dir(&common.cwd, &c.entry.ecosystem, &c.entry.uuid).await;
+                        // Put the trust anchor back exactly as it was: the
+                        // backend's re-wire may have refreshed the recorded
+                        // integrity to the rejected rebuild's.
+                        if let Some(snap) = &wiring_snapshot {
+                            for (path, bytes) in snap {
+                                let _ = tokio::fs::write(path, bytes).await;
+                            }
+                        }
                         fail(
                             env,
                             quiet,

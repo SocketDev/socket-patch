@@ -472,8 +472,13 @@ async fn finalize_python(plan: &PythonPlan, edits: &[PthEditResult], cwd: &Path)
         return warnings;
     }
     // Lockfile refresh (broad auto-edit): only when the manager uses a lockfile
-    // that exists. Best-effort — never fatal.
-    if let Some((program, args)) = plan.pm.lock_command() {
+    // that exists. Best-effort — never fatal. The spellings are tried in
+    // order: pin-preserving first (`poetry lock --no-update`,
+    // `pdm lock --update-reuse`), bare `lock` as the fallback for versions
+    // that dropped the flag (Poetry 2.x, where bare `lock` is already
+    // pin-preserving). A successful fallback is not a failure — only warn
+    // when every spelling failed.
+    if let Some((program, spellings)) = plan.pm.lock_commands() {
         let lockfile = match plan.pm {
             PythonPackageManager::Uv => Some("uv.lock"),
             PythonPackageManager::Poetry => Some("poetry.lock"),
@@ -485,22 +490,39 @@ async fn finalize_python(plan: &PythonPlan, edits: &[PthEditResult], cwd: &Path)
             None => false,
         };
         if lock_present {
-            match tokio::process::Command::new(program)
-                .args(args)
-                .current_dir(cwd)
-                .output()
-                .await
-            {
-                Ok(o) if o.status.success() => {}
-                Ok(o) => warnings.push(format!(
-                    "`{program} {}` failed ({}); update the lockfile manually",
-                    args.join(" "),
-                    o.status
-                )),
-                Err(e) => warnings.push(format!(
-                    "could not run `{program} {}`: {e}; update the lockfile manually",
-                    args.join(" ")
-                )),
+            let mut failure: Option<String> = None;
+            for args in spellings {
+                match tokio::process::Command::new(program)
+                    .args(*args)
+                    .current_dir(cwd)
+                    .output()
+                    .await
+                {
+                    Ok(o) if o.status.success() => {
+                        failure = None;
+                        break;
+                    }
+                    Ok(o) => {
+                        failure = Some(format!(
+                            "`{program} {}` failed ({}); update the lockfile manually",
+                            args.join(" "),
+                            o.status
+                        ));
+                    }
+                    Err(e) => {
+                        // The program itself didn't spawn (not installed /
+                        // not on PATH): retrying another spelling of the
+                        // same program is pointless.
+                        failure = Some(format!(
+                            "could not run `{program} {}`: {e}; update the lockfile manually",
+                            args.join(" ")
+                        ));
+                        break;
+                    }
+                }
+            }
+            if let Some(w) = failure {
+                warnings.push(w);
             }
         }
     }

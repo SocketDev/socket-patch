@@ -106,16 +106,70 @@ fn find_pin(content: &str, canon_name: &str, version: &str) -> PinSearch {
     }
 }
 
+/// Pre-flight verdict: wire fresh, or the files are already wired to this
+/// exact patch generation (mirrors `UvTarget` / `PoetryTarget`).
+pub(super) enum RequirementsTarget {
+    Fresh,
+    InSync,
+}
+
 /// Pre-flight the wiring without writing — the orchestrator runs this before
 /// building the wheel so every refusal happens with the tree byte-untouched.
+///
+/// A file already carrying a socket vendor line for this package
+/// short-circuits the plan: at the SAME patch uuid it is our own first-run
+/// edit (in sync — the artifact-only rebuild path handles a deleted wheel);
+/// at a DIFFERENT uuid it refuses — appending a second wheel line would
+/// leave pip two competing requirements, and the new ledger entry would
+/// clobber the old one's record, orphaning its line.
 pub(super) async fn preflight_requirements(
     root: &Path,
     canon_name: &str,
     version: &str,
-) -> Result<(), (&'static str, String)> {
+    record_uuid: &str,
+) -> Result<RequirementsTarget, (&'static str, String)> {
+    let files = collect_requirements_files(root).await?;
+    for file in &files {
+        if let Some(found) = vendored_uuid_for(&file.content, canon_name) {
+            if found == record_uuid {
+                return Ok(RequirementsTarget::InSync);
+            }
+            return Err((
+                "pypi_requirements_already_vendored",
+                format!(
+                    "{}: already routes {canon_name} to the socket-patch vendored wheel for \
+                     patch {found}; run `socket-patch vendor --revert` before re-vendoring",
+                    file.rel
+                ),
+            ));
+        }
+    }
     plan_requirements(root, canon_name, version, "", "")
         .await
-        .map(|_| ())
+        .map(|_| RequirementsTarget::Fresh)
+}
+
+/// Find a socket vendor line for `canon_name` in one file's content and
+/// return the patch uuid its wheel path names. Matches the exact shape
+/// [`vendor_line`] writes: a wheel-path token plus the
+/// `# socket-patch vendor: <name>==<version>` comment tag.
+fn vendored_uuid_for(content: &str, canon_name: &str) -> Option<String> {
+    for line in content.lines() {
+        let trimmed = line.trim();
+        let Some((_, tag)) = trimmed.split_once("# socket-patch vendor: ") else {
+            continue;
+        };
+        if !tag.starts_with(canon_name) || !tag[canon_name.len()..].starts_with("==") {
+            continue;
+        }
+        let token = trimmed.split_whitespace().next().unwrap_or("");
+        if let Some(parts) = super::path::parse_vendor_path(token) {
+            if parts.eco == "pypi" {
+                return Some(parts.uuid);
+            }
+        }
+    }
+    None
 }
 
 /// Rewrite every exact pin across the root `requirements.txt` and its `-r`

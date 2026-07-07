@@ -150,6 +150,21 @@ async fn mount_patch_api(mock: &MockServer, uuid: &str) {
 fn run_cli_env(root: &Path, argv: &[&str], extra_env: &[(&str, &str)]) -> (i32, String, String) {
     let mut cmd = Command::new(binary());
     cmd.args(argv).current_dir(root);
+    // Scrub the ambient `SOCKET_*` surface (prefix scrub — fixed lists rot)
+    // so a developer's shell can't steer the child, then force the telemetry
+    // kill-switch: telemetry resolves its endpoint from `SOCKET_API_URL` /
+    // `SOCKET_PROXY_URL` env ONLY (`--api-url` is invisible to it), so an
+    // ambient value would send every run's events to the LIVE API with the
+    // fake bearer token. Caller-supplied env lands last so explicit
+    // injections survive the scrub —
+    // `scan_vendor_emits_no_telemetry_even_with_endpoint_env` seeds those
+    // endpoint vars deliberately and proves the kill-switch still holds.
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("SOCKET_") {
+            cmd.env_remove(&key);
+        }
+    }
+    cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
     for (k, v) in extra_env {
         cmd.env(k, v);
     }

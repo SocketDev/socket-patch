@@ -32,7 +32,7 @@ use super::registry_fetch::extract_tgz;
 use super::service_fetch::{fetch_verified_archive, ServiceArtifact};
 use super::state::{
     write_marker, CargoLockOriginal, VendorArtifact, VendorEntry, VendorMarker, WiringAction,
-    WiringRecord,
+    WiringRecord, VENDOR_MARKER_FILE,
 };
 use super::{RevertOutcome, VendorOutcome, VendorServiceConfig, VendorWarning};
 
@@ -412,6 +412,24 @@ pub async fn vendor_cargo_crate(
                  rebuilt at {copy_rel} (config and lock untouched)"
             ),
         ));
+        // The rebuild may have recreated the whole uuid dir (deleted
+        // wholesale, marker included): restore the committed marker
+        // alongside the copy so the re-committed vendor unit is complete.
+        // Only when missing — a copy-only rebuild keeps the original marker
+        // (and its vendoredAt).
+        if tokio::fs::metadata(uuid_dir.join(VENDOR_MARKER_FILE))
+            .await
+            .is_err()
+        {
+            let marker =
+                VendorMarker::new("cargo", strip_purl_qualifiers(purl), record, vendored_at);
+            if let Err(e) = write_marker(&uuid_dir, &marker).await {
+                warnings.push(VendorWarning::new(
+                    "marker_write_failed",
+                    format!("could not write the vendor marker: {e}"),
+                ));
+            }
+        }
         return done(result, None, warnings);
     }
 
@@ -493,11 +511,32 @@ pub async fn vendor_cargo_crate(
                 ));
                 None
             }
+            Err(LockEditError::NotRegistry) if prior_path.is_some() => {
+                // Re-vendor over live wiring (a patch update moved the
+                // manifest to a new uuid): the prior socket-owned run already
+                // detached this entry — source-less is exactly the shape we
+                // produce. The lock is in the desired state; the true
+                // pre-vendor originals live only in the ledger entry being
+                // replaced, which the caller carries forward. Record nothing.
+                None
+            }
             Err(e) => {
                 // Without the lock edit, `--locked` builds fail closed on the
                 // [patch] we just wired — a half-vendored state. UNWIND the
-                // config entry + copy so the project is back where it started.
-                let _ = cargo_config::drop_patch_entry(project_root, name, false).await;
+                // config edit so the project is back where it started:
+                // restore the prior socket-owned entry when this was a
+                // re-vendor (dropping it would destroy the first run's live
+                // wiring), else drop the entry we just added. Either way
+                // remove this run's copy.
+                match prior_path.as_deref() {
+                    Some(p) => {
+                        let _ =
+                            cargo_config::ensure_patch_entry(project_root, name, p, false).await;
+                    }
+                    None => {
+                        let _ = cargo_config::drop_patch_entry(project_root, name, false).await;
+                    }
+                }
                 let _ = remove_tree(&uuid_dir).await;
                 result.success = false;
                 result.error = Some(format!(

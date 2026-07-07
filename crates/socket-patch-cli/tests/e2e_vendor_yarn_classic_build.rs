@@ -63,14 +63,16 @@ fn has_corepack_pm(pm: &str) -> bool {
 /// prompt disabled, and every `SOCKET_*` var scrubbed.
 fn corepack(cwd: &Path, pm: &str, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
     let mut cmd = Command::new("corepack");
-    cmd.arg(pm)
-        .args(args)
-        .current_dir(cwd)
-        .env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0");
+    cmd.arg(pm).args(args).current_dir(cwd);
+    // Scrub FIRST (it removes YARN_CACHE_FOLDER / SOCKET_* from the inherited
+    // env), then seed the hermetic flags so they survive (Command: last env
+    // call wins). Scrubbing last wiped the caller's private cache override,
+    // so the fixture install silently used the developer's global cache.
+    scrub_socket_env(&mut cmd);
+    cmd.env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0");
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
-    scrub_socket_env(&mut cmd);
     cmd.output().expect("failed to run corepack")
 }
 

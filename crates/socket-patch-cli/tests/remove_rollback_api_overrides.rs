@@ -40,7 +40,11 @@ const SOCKET_ENV_VARS: &[&str] = &[
     "SOCKET_PROXY_URL",
     "SOCKET_ECOSYSTEMS",
     "SOCKET_DOWNLOAD_MODE",
+    "SOCKET_VENDOR_SOURCE",
+    "SOCKET_VENDOR_URL",
+    "SOCKET_PATCH_SERVER_URL",
     "SOCKET_OFFLINE",
+    "SOCKET_STRICT",
     "SOCKET_GLOBAL",
     "SOCKET_GLOBAL_PREFIX",
     "SOCKET_JSON",
@@ -55,6 +59,21 @@ const SOCKET_ENV_VARS: &[&str] = &[
     "SOCKET_ONE_OFF",
     "SOCKET_SKIP_ROLLBACK",
 ];
+
+/// Drift guard: the scrub must cover every env var `GlobalArgs` binds — the
+/// production `GLOBAL_ARG_ENV_VARS` list is the source of truth. A var
+/// missing here escapes the scrub, so an ambient value in the developer's
+/// shell or CI (e.g. `SOCKET_STRICT=garbage`) aborts every invocation in
+/// this file. Mirrors `cli_parse_vendor.rs`.
+#[test]
+fn env_scrub_covers_every_global_arg_env_var() {
+    for var in socket_patch_cli::args::GLOBAL_ARG_ENV_VARS {
+        assert!(
+            SOCKET_ENV_VARS.contains(var),
+            "{var} is bound by GlobalArgs but missing from SOCKET_ENV_VARS — the scrub won't strip it",
+        );
+    }
+}
 
 /// Git-SHA256: SHA256("blob <len>\0" ++ content).
 fn git_sha256(content: &[u8]) -> String {

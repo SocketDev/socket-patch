@@ -486,42 +486,53 @@ pub(super) async fn run_redirect(
             result["error"] = serde_json::json!({ "code": code, "message": message });
         }
         println!("{}", serde_json::to_string_pretty(&result).unwrap());
-    } else if !args.common.silent {
-        let verb = if args.common.dry_run {
-            "would rewrite"
-        } else {
-            "rewrote"
-        };
-        println!(
-            "Redirected {} package(s); {verb} {} file(s).",
-            confirmed.len(),
-            rewritten.len()
-        );
-        for s in &skipped {
-            eprintln!("  skipped {} ({})", s["purl"], s["reason"]);
-        }
-        for w in &record_warnings {
-            eprintln!("  warning: {}", w["detail"]);
-        }
-        for w in &migration_warnings {
-            eprintln!("  warning: {}", w["detail"]);
-        }
-        for w in &rush_warnings {
-            eprintln!("  warning: {}", w["detail"]);
-        }
-        if let Some(statements) = vex_statements {
-            eprintln!(
-                "Wrote OpenVEX document with {} statement(s) to {} (redirected patches are \
-                 attested from the ledger, not hash-verified — their bytes are fetched at \
-                 install time; run `socket-patch vex` after installing to verify against \
-                 the installed tree).",
-                statements,
-                args.vex.vex.as_ref().unwrap().display(),
+    } else {
+        if !args.common.silent {
+            let verb = if args.common.dry_run {
+                "would rewrite"
+            } else {
+                "rewrote"
+            };
+            println!(
+                "Redirected {} package(s); {verb} {} file(s).",
+                confirmed.len(),
+                rewritten.len()
             );
-        } else if let Some((_, message)) = &vex_error {
+            for s in &skipped {
+                eprintln!("  skipped {} ({})", s["purl"], s["reason"]);
+            }
+            // Same warning set as the JSON envelope, same order: the
+            // rewriter's own warnings first (e.g. `no package-lock.json`),
+            // then the record/migration/rush extras.
+            for w in &rewrite.warnings {
+                eprintln!("  warning: {}", w.detail);
+            }
+            for w in &record_warnings {
+                eprintln!("  warning: {}", w["detail"]);
+            }
+            for w in &migration_warnings {
+                eprintln!("  warning: {}", w["detail"]);
+            }
+            for w in &rush_warnings {
+                eprintln!("  warning: {}", w["detail"]);
+            }
+            if let Some(statements) = vex_statements {
+                eprintln!(
+                    "Wrote OpenVEX document with {} statement(s) to {} (redirected patches are \
+                     attested from the ledger, not hash-verified — their bytes are fetched at \
+                     install time; run `socket-patch vex` after installing to verify against \
+                     the installed tree).",
+                    statements,
+                    args.vex.vex.as_ref().unwrap().display(),
+                );
+            } else if args.vex.vex.is_some() && args.common.dry_run {
+                eprintln!("Skipping VEX generation (--dry-run).");
+            }
+        }
+        // Errors print even under --silent ("errors only", never
+        // "nothing"): exit 1 with no message would be undiagnosable.
+        if let Some((_, message)) = &vex_error {
             eprintln!("Error: VEX generation failed: {message}");
-        } else if args.vex.vex.is_some() && args.common.dry_run {
-            eprintln!("Skipping VEX generation (--dry-run).");
         }
     }
     vex_code
