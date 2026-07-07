@@ -25,13 +25,19 @@ use docker_vendor_common::{bash_prelude, stage_patch_fn};
 const SHA256SUM_SHIM: &str =
     "command -v sha256sum >/dev/null 2>&1 || sha256sum() { shasum -a 256 \"$@\"; }\n";
 
+/// A *functional* bash, not merely a spawnable one: on windows-latest
+/// `Command::new("bash")` resolves to the System32 WSL stub, which spawns
+/// fine with no distro installed but cannot run a script (it prints its
+/// error as UTF-16 on stdout and exits non-zero) — `.status().is_ok()`
+/// passed on it and the suite ran against a bash that executes nothing.
+/// Probe an actual `-c` run and require the sentinel to come back.
 fn has_bash() -> bool {
     Command::new("bash")
-        .arg("--version")
-        .stdout(Stdio::null())
+        .args(["-c", "echo bash-probe-ok"])
         .stderr(Stdio::null())
-        .status()
-        .is_ok()
+        .output()
+        .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).contains("bash-probe-ok"))
+        .unwrap_or(false)
 }
 
 /// Run `body` under the same prelude + stage_patch definitions the docker
