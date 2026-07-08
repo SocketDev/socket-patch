@@ -25,14 +25,16 @@ jobs:
         run: rustup show
 
       - name: Cache cargo
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        # Swatinem/rust-cache instead of a raw actions/cache of the whole
+        # target/ dir: it prunes the cache to dependency artifacts (~5-10x
+        # smaller), which keeps this repo's total cache footprint inside
+        # GitHub's 10 GiB budget — previously a single main run produced
+        # ~8 GiB of caches and every PR save evicted them (cold e2e legs
+        # recompiled the full ~275-crate graph each run). save-if restricts
+        # writes to main so PR branches restore without churning the budget.
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ubuntu-latest-cargo-clippy-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ubuntu-latest-cargo-clippy-
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Run clippy
         run: cargo clippy --workspace --all-features -- -D warnings
@@ -82,14 +84,16 @@ jobs:
         run: rustup show
 
       - name: Cache cargo
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        # Swatinem/rust-cache instead of a raw actions/cache of the whole
+        # target/ dir: it prunes the cache to dependency artifacts (~5-10x
+        # smaller), which keeps this repo's total cache footprint inside
+        # GitHub's 10 GiB budget — previously a single main run produced
+        # ~8 GiB of caches and every PR save evicted them (cold e2e legs
+        # recompiled the full ~275-crate graph each run). save-if restricts
+        # writes to main so PR branches restore without churning the budget.
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ matrix.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ matrix.os }}-cargo-
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Build
         run: cargo build --workspace --all-features
@@ -138,14 +142,16 @@ jobs:
         run: rustup show
 
       - name: Cache cargo
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        # Swatinem/rust-cache instead of a raw actions/cache of the whole
+        # target/ dir: it prunes the cache to dependency artifacts (~5-10x
+        # smaller), which keeps this repo's total cache footprint inside
+        # GitHub's 10 GiB budget — previously a single main run produced
+        # ~8 GiB of caches and every PR save evicted them (cold e2e legs
+        # recompiled the full ~275-crate graph each run). save-if restricts
+        # writes to main so PR branches restore without churning the budget.
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ubuntu-latest-cargo-release-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ubuntu-latest-cargo-release-
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Run tests (release)
         run: cargo test --workspace --all-features --release
@@ -181,14 +187,16 @@ jobs:
           tool: cargo-llvm-cov@0.8.7
 
       - name: Cache cargo
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        # Swatinem/rust-cache instead of a raw actions/cache of the whole
+        # target/ dir: it prunes the cache to dependency artifacts (~5-10x
+        # smaller), which keeps this repo's total cache footprint inside
+        # GitHub's 10 GiB budget — previously a single main run produced
+        # ~8 GiB of caches and every PR save evicted them (cold e2e legs
+        # recompiled the full ~275-crate graph each run). save-if restricts
+        # writes to main so PR branches restore without churning the budget.
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ubuntu-latest-cargo-coverage-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ubuntu-latest-cargo-coverage-
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Run tests with coverage
         # Two-step pattern: `--no-report` runs instrumented tests and
@@ -519,14 +527,19 @@ jobs:
         run: rustup show
 
       - name: Cache cargo
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        # Swatinem/rust-cache instead of a raw actions/cache of the whole
+        # target/ dir: it prunes the cache to dependency artifacts (~5-10x
+        # smaller), which keeps this repo's total cache footprint inside
+        # GitHub's 10 GiB budget — previously a single main run produced
+        # ~8 GiB of caches and every PR save evicted them (cold e2e legs
+        # recompiled the full ~275-crate graph each run). save-if restricts
+        # writes to main so PR branches restore without churning the budget.
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ matrix.os }}-cargo-e2e-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ matrix.os }}-cargo-e2e-
+          # Matrix suites otherwise collide on one key: only one of the ~9
+          # same-OS legs wins the cache reserve and the rest fail to save.
+          key: ${{ matrix.suite }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Setup Node.js
         if: matrix.suite == 'e2e_npm' || matrix.suite == 'e2e_scan' || matrix.suite == 'e2e_safety_pnpm'
