@@ -418,6 +418,26 @@ async fn go_service_redirect(
                     format!("cannot synthesize go.mod for the copy: {e}"),
                 );
             }
+            // Verify the EXTRACTED TREE before wiring the consumer's go.mod:
+            // the SRI proves the zip bytes are intact, but an unexpected
+            // internal layout (the `{module}@{version}/` prefix strip
+            // mismatching) lands the patched files at the wrong paths, and
+            // the caller would synthesize success from `record.files` while
+            // the copy is wrong. Fail closed → `auto` falls back to the
+            // local build; do it BEFORE editing go.mod so nothing points at
+            // a bad copy. (Mirrors composer_lock.rs.)
+            if !copy_matches_after_hashes(copy_dir, &record.files).await {
+                teardown_failed_service_copy(project_root, base_rel, module, wired).await;
+                return miss(
+                    warnings,
+                    "vendor_prebuilt_layout_mismatch",
+                    format!(
+                        "prebuilt module zip for {module} extracted to an \
+                         unexpected layout (patched files absent at their \
+                         recorded paths)"
+                    ),
+                );
+            }
             if let Err(e) =
                 go_mod_edit::ensure_replace_entry(project_root, module, version, base_rel, false)
                     .await

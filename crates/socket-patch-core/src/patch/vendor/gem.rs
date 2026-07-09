@@ -685,6 +685,24 @@ async fn gem_service_copy(
             format!("cannot write the stub gemspec into the vendored dir: {e}"),
         );
     }
+    // Verify the EXTRACTED data.tar.gz tree, not just the .gem bytes: the
+    // SRI proves the download is intact, but an unexpected internal layout
+    // lands the patched files at the wrong paths and the caller would
+    // synthesize success from `record.files` while the copy is wrong. (The
+    // stub gemspec we just wrote is not in record.files, so it is not part
+    // of this check.) Fail closed → `auto` falls back to the local build.
+    // (Mirrors composer_lock.rs.)
+    if !copy_matches_after_hashes(copy_dir, &record.files).await {
+        let _ = remove_tree(uuid_dir).await;
+        return miss(
+            warnings,
+            "vendor_prebuilt_layout_mismatch",
+            format!(
+                "prebuilt .gem for {name} extracted to an unexpected layout \
+                 (patched files absent at their recorded paths)"
+            ),
+        );
+    }
     warnings.push(VendorWarning::new(
         "vendor_prebuilt_downloaded",
         format!(

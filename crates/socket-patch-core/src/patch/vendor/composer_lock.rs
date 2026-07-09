@@ -538,6 +538,30 @@ async fn composer_service_copy(
                     format!("cannot extract the prebuilt dist zip: {e}"),
                 );
             }
+            // Verify the EXTRACTED TREE, not just the archive bytes. The
+            // archive-bytes SRI (checked in fetch_verified_archive) proves
+            // the download is intact, but says nothing about whether the
+            // internal layout lands the patched files at the paths the
+            // record names: a zip with an unexpected wrapper dir (the
+            // single-level `strip_first` leaves an extra `pkg-<sha>/`
+            // segment) or a root-level `src/…` (over-stripped) extracts
+            // "successfully" with every file at the WRONG path. Without
+            // this check the caller synthesized success purely from
+            // `record.files` and shipped a copy missing its patched files
+            // (exit 0, empty copy_dir on disk). Fail closed here and let
+            // the `auto` source fall back to the local build.
+            if !copy_matches_after_hashes(copy_dir, &record.files).await {
+                let _ = remove_tree(copy_dir).await;
+                return miss(
+                    warnings,
+                    "vendor_prebuilt_layout_mismatch",
+                    format!(
+                        "prebuilt dist zip for {pkg} extracted to an \
+                         unexpected layout (patched files absent at their \
+                         recorded paths)"
+                    ),
+                );
+            }
             warnings.push(VendorWarning::new(
                 "vendor_prebuilt_downloaded",
                 format!(
@@ -1499,6 +1523,106 @@ mod tests {
         assert!(warnings
             .iter()
             .any(|w| w.code == "vendor_prebuilt_downloaded"));
+    }
+
+    /// Wrong internal layout (double wrapper → the single-level strip
+    /// misplaces the patched file) must NOT be reported as success from
+    /// `record.files` alone. Under `service` mode it hard-fails
+    /// `vendor_prebuilt_layout_mismatch`; the file is not at the expected
+    /// path. Regression for the exit-0-empty-copy incident (run 29040958337).
+    #[tokio::test]
+    async fn service_wrong_layout_service_mode_hard_fails() {
+        let lock = lock_value("psr/log", "3.0.2", false);
+        let (dir, blobs, installed, record) = fixture(&lock).await;
+        let root = dir.path();
+        // A double wrapper: single strip_first leaves `extra/src/...`, so the
+        // patched file never lands at `copy_dir/src/LoggerInterface.php`.
+        let zip = make_dist_zip(
+            "outer-wrapper",
+            &[("extra/src/LoggerInterface.php", PATCHED)],
+        );
+        let sri = sri_sha512(&zip);
+        let server = wiremock::MockServer::start().await;
+        mount_composer_granted(&server, &sri, &zip).await;
+
+        let outcome = vendor_with_service(
+            root,
+            &blobs,
+            &installed,
+            &record,
+            &composer_service_cfg(&server.uri(), VendorSource::Service, false),
+        )
+        .await;
+        // Service mode has no fallback, so `miss()` surfaces the uniform
+        // `vendor_prebuilt_required` code (same as an integrity mismatch);
+        // the layout diagnosis rides in the detail. The point of the
+        // regression is that it REFUSES rather than synthesizing success —
+        // and the copy dir does not hold the file at its recorded path.
+        match outcome {
+            VendorOutcome::Refused { code, detail } => {
+                assert_eq!(code, "vendor_prebuilt_required");
+                assert!(
+                    detail.contains("unexpected layout"),
+                    "the refusal must diagnose the layout mismatch: {detail}"
+                );
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert!(
+            tokio::fs::metadata(root.join(copy_rel()).join("src/LoggerInterface.php"))
+                .await
+                .is_err(),
+            "the misplaced service copy must not be left at the recorded path"
+        );
+    }
+
+    /// Same wrong-layout archive under `auto`: the guard trips and the local
+    /// build takes over, producing a correct copy — success WITHOUT the bad
+    /// service bytes.
+    #[tokio::test]
+    async fn service_wrong_layout_auto_falls_back_to_build() {
+        let lock = lock_value("psr/log", "3.0.2", false);
+        let (dir, blobs, installed, record) = fixture(&lock).await;
+        let root = dir.path();
+        let zip = make_dist_zip(
+            "outer-wrapper",
+            &[("extra/src/LoggerInterface.php", PATCHED)],
+        );
+        let sri = sri_sha512(&zip);
+        let server = wiremock::MockServer::start().await;
+        mount_composer_granted(&server, &sri, &zip).await;
+
+        let (result, entry, warnings) = unwrap_done(
+            vendor_with_service(
+                root,
+                &blobs,
+                &installed,
+                &record,
+                &composer_service_cfg(&server.uri(), VendorSource::Auto, false),
+            )
+            .await,
+        );
+        assert!(
+            result.success,
+            "auto must fall back to the local build when the service layout \
+             is wrong: {:?}",
+            result.error
+        );
+        assert!(entry.is_some());
+        // The copy holds the patched bytes at the RIGHT path (from the local
+        // build, not the misplaced service extract).
+        assert_eq!(
+            tokio::fs::read(root.join(copy_rel()).join("src/LoggerInterface.php"))
+                .await
+                .unwrap(),
+            PATCHED
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.code == "vendor_prebuilt_layout_mismatch"),
+            "the fallback must record why the service copy was rejected: {warnings:?}"
+        );
     }
 
     /// `service` mode + integrity mismatch hard-fails, nothing extracted.
