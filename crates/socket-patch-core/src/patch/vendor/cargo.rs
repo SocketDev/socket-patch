@@ -142,6 +142,24 @@ async fn cargo_service_copy(
                 );
             }
             let _ = tokio::fs::remove_file(copy_dir.join(".cargo-checksum.json")).await;
+            // Verify the EXTRACTED TREE, not just the archive bytes: the SRI
+            // proves the download is intact, but an unexpected internal
+            // layout (the single `{name}-{version}/` strip leaving an extra
+            // wrapper, or an over-strip) lands the patched files at the wrong
+            // paths and the caller would synthesize success from
+            // `record.files` while the copy is wrong. Fail closed → `auto`
+            // falls back to the local build. (Mirrors composer_lock.rs.)
+            if !copy_matches_after_hashes(copy_dir, &record.files).await {
+                let _ = remove_tree(copy_dir).await;
+                return miss(
+                    warnings,
+                    "vendor_prebuilt_layout_mismatch",
+                    format!(
+                        "prebuilt crate for {name} extracted to an unexpected \
+                         layout (patched files absent at their recorded paths)"
+                    ),
+                );
+            }
             warnings.push(VendorWarning::new(
                 "vendor_prebuilt_downloaded",
                 format!(
