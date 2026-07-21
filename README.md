@@ -153,8 +153,9 @@ For the three authentication settings, the [Socket CLI](https://docs.socket.dev/
   2. Env var           SOCKET_API_TOKEN / SOCKET_ORG_SLUG / SOCKET_API_URL
   3. Peer alias env    SOCKET_CLI_API_TOKEN / SOCKET_CLI_ORG_SLUG / SOCKET_CLI_API_BASE_URL
   4. socket-cli config <data dir>/socket/settings/config.json — read-only
-                       (Linux: ~/.local/share; macOS: ~/Library/Application Support,
-                        both after $XDG_DATA_HOME; Windows: %LOCALAPPDATA%)
+                       (Linux: ~/.local/share; macOS: ~/Library/Application Support
+                        then legacy ~/.local/share, both after $XDG_DATA_HOME;
+                        Windows: %LOCALAPPDATA%)
   5. Built-in default  no token → public proxy; org → auto-resolve; https://api.socket.dev
 ```
 

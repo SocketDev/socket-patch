@@ -4,7 +4,9 @@
 //! base64-encoded JSON object at `<data dir>/socket/settings/config.json`:
 //!
 //! - Linux:   `$XDG_DATA_HOME` or `~/.local/share`
-//! - macOS:   `$XDG_DATA_HOME` or `~/Library/Application Support`
+//! - macOS:   `$XDG_DATA_HOME` or `~/Library/Application Support`,
+//!   then the legacy `~/.local/share` (older socket-cli wrote the
+//!   Linux-style path on every platform)
 //! - Windows: `%LOCALAPPDATA%` or `%USERPROFILE%\AppData\Local`
 //!
 //! socket-patch reads exactly three keys — `apiToken`, `defaultOrg` (with
@@ -74,10 +76,20 @@ pub fn no_api_token_veto() -> bool {
     env_flag("SOCKET_NO_API_TOKEN")
 }
 
-/// The platform data dir socket-cli resolves in its `getSocketAppDataPath`
-/// (`packages/cli/src/constants/paths.mts`) — mirrored exactly so both
-/// tools find the same file.
-fn data_home() -> Option<PathBuf> {
+/// Candidate config file paths, most-preferred first, mirroring
+/// socket-cli's `getSocketAppDataPath` (`packages/cli/src/constants/paths.mts`)
+/// so both tools find the same file. Empty when no data dir resolves
+/// (e.g. `HOME` unset in a stripped container) — silently absent.
+///
+/// macOS gets two candidates: current socket-cli resolves
+/// `$XDG_DATA_HOME` else `~/Library/Application Support`, but earlier
+/// releases wrote the Linux-style `~/.local/share` path on every
+/// platform and real logins exist there in the wild, so the native
+/// location is probed first and the legacy one second.
+pub fn config_json_paths() -> Vec<PathBuf> {
+    fn config_json(data_dir: PathBuf) -> PathBuf {
+        data_dir.join("socket").join("settings").join("config.json")
+    }
     #[cfg(windows)]
     {
         env_non_empty("LOCALAPPDATA")
@@ -85,28 +97,36 @@ fn data_home() -> Option<PathBuf> {
             .or_else(|| {
                 env_non_empty("USERPROFILE").map(|p| PathBuf::from(p).join("AppData").join("Local"))
             })
+            .map(config_json)
+            .into_iter()
+            .collect()
     }
     #[cfg(target_os = "macos")]
     {
-        env_non_empty("XDG_DATA_HOME")
-            .map(PathBuf::from)
-            .or_else(|| {
-                env_non_empty("HOME")
-                    .map(|h| PathBuf::from(h).join("Library").join("Application Support"))
-            })
+        if let Some(xdg) = env_non_empty("XDG_DATA_HOME") {
+            return vec![config_json(PathBuf::from(xdg))];
+        }
+        match env_non_empty("HOME") {
+            Some(home) => vec![
+                config_json(
+                    PathBuf::from(&home)
+                        .join("Library")
+                        .join("Application Support"),
+                ),
+                config_json(PathBuf::from(home).join(".local/share")),
+            ],
+            None => Vec::new(),
+        }
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
         env_non_empty("XDG_DATA_HOME")
             .map(PathBuf::from)
             .or_else(|| env_non_empty("HOME").map(|h| PathBuf::from(h).join(".local/share")))
+            .map(config_json)
+            .into_iter()
+            .collect()
     }
-}
-
-/// Full path of socket-cli's persisted config, or `None` when no data dir
-/// resolves (e.g. `HOME` unset in a stripped container) — silently absent.
-pub fn config_json_path() -> Option<PathBuf> {
-    data_home().map(|d| d.join("socket").join("settings").join("config.json"))
 }
 
 /// Decode the config file body: base64(JSON) per socket-cli, with a plain-JSON
@@ -144,33 +164,37 @@ fn parse_config_bytes(raw: &[u8]) -> Result<SocketCliConfig, String> {
     })
 }
 
-/// Read the config from disk. `None` covers every failure path; a corrupt
-/// or unreadable file warns (callers cache this, so it fires once per
-/// process).
+/// Read the config from disk: the first candidate whose file exists wins.
+/// `None` covers every failure path; a present-but-unusable file warns and
+/// stops the probe — falling through to a stale lower-priority file would
+/// silently resurrect old credentials. (Callers cache this, so the warning
+/// fires once per process.)
 fn read_from_disk() -> Option<SocketCliConfig> {
-    let path = config_json_path()?;
-    let raw = match std::fs::read(&path) {
-        Ok(raw) => raw,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
-        Err(e) => {
-            eprintln!(
-                "[socket-patch] warning: unreadable socket-cli config at {}: {e}; ignoring it",
-                path.display()
-            );
-            return None;
-        }
-    };
-    match parse_config_bytes(&raw) {
-        Ok(config) => Some(config),
-        Err(e) => {
-            eprintln!(
-                "[socket-patch] warning: could not parse socket-cli config at {}: {e}; \
-                 ignoring it (re-run `socket login` to rewrite it)",
-                path.display()
-            );
-            None
-        }
+    for path in config_json_paths() {
+        let raw = match std::fs::read(&path) {
+            Ok(raw) => raw,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                eprintln!(
+                    "[socket-patch] warning: unreadable socket-cli config at {}: {e}; ignoring it",
+                    path.display()
+                );
+                return None;
+            }
+        };
+        return match parse_config_bytes(&raw) {
+            Ok(config) => Some(config),
+            Err(e) => {
+                eprintln!(
+                    "[socket-patch] warning: could not parse socket-cli config at {}: {e}; \
+                     ignoring it (re-run `socket login` to rewrite it)",
+                    path.display()
+                );
+                None
+            }
+        };
     }
+    None
 }
 
 /// The socket-cli config, if present and enabled. The disk read is done at
@@ -309,8 +333,8 @@ mod tests {
             &[("XDG_DATA_HOME", Some("/xdg")), ("HOME", Some("/home/u"))],
             || {
                 assert_eq!(
-                    config_json_path(),
-                    Some(PathBuf::from("/xdg/socket/settings/config.json"))
+                    config_json_paths(),
+                    vec![PathBuf::from("/xdg/socket/settings/config.json")]
                 );
             },
         );
@@ -318,15 +342,19 @@ mod tests {
             &[("XDG_DATA_HOME", None), ("HOME", Some("/home/u"))],
             || {
                 assert_eq!(
-                    config_json_path(),
-                    Some(PathBuf::from(
+                    config_json_paths(),
+                    vec![PathBuf::from(
                         "/home/u/.local/share/socket/settings/config.json"
-                    ))
+                    )]
                 );
             },
         );
     }
 
+    /// macOS: `XDG_DATA_HOME` wins outright; otherwise the native
+    /// Application Support path is probed first with the legacy
+    /// Linux-style `~/.local/share` path second (older socket-cli
+    /// releases wrote there on every platform — real logins exist).
     #[test]
     #[serial_test::serial]
     #[cfg(target_os = "macos")]
@@ -335,8 +363,8 @@ mod tests {
             &[("XDG_DATA_HOME", Some("/xdg")), ("HOME", Some("/Users/u"))],
             || {
                 assert_eq!(
-                    config_json_path(),
-                    Some(PathBuf::from("/xdg/socket/settings/config.json"))
+                    config_json_paths(),
+                    vec![PathBuf::from("/xdg/socket/settings/config.json")]
                 );
             },
         );
@@ -344,10 +372,13 @@ mod tests {
             &[("XDG_DATA_HOME", None), ("HOME", Some("/Users/u"))],
             || {
                 assert_eq!(
-                    config_json_path(),
-                    Some(PathBuf::from(
-                        "/Users/u/Library/Application Support/socket/settings/config.json"
-                    ))
+                    config_json_paths(),
+                    vec![
+                        PathBuf::from(
+                            "/Users/u/Library/Application Support/socket/settings/config.json"
+                        ),
+                        PathBuf::from("/Users/u/.local/share/socket/settings/config.json"),
+                    ]
                 );
             },
         );
@@ -363,18 +394,18 @@ mod tests {
         with_env(
             &[("XDG_DATA_HOME", Some("")), ("HOME", Some("/home/u"))],
             || {
-                let path = config_json_path().expect("HOME fallback");
+                let paths = config_json_paths();
                 assert!(
-                    path.starts_with("/home/u"),
-                    "blank XDG_DATA_HOME must fall through to HOME: {path:?}"
+                    !paths.is_empty() && paths.iter().all(|p| p.starts_with("/home/u")),
+                    "blank XDG_DATA_HOME must fall through to HOME: {paths:?}"
                 );
             },
         );
         with_env(&[("XDG_DATA_HOME", None), ("HOME", Some(""))], || {
-            assert_eq!(config_json_path(), None);
+            assert_eq!(config_json_paths(), Vec::<PathBuf>::new());
         });
         with_env(&[("XDG_DATA_HOME", None), ("HOME", None)], || {
-            assert_eq!(config_json_path(), None);
+            assert_eq!(config_json_paths(), Vec::<PathBuf>::new());
         });
     }
 

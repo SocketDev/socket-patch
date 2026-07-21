@@ -655,7 +655,7 @@ The binary reads — **never writes** — the JS Socket CLI's persisted config, 
 | Platform | Location |
 |---|---|
 | Linux | `$XDG_DATA_HOME` or `~/.local/share`, + `/socket/settings/config.json` |
-| macOS | `$XDG_DATA_HOME` or `~/Library/Application Support`, + `/socket/settings/config.json` |
+| macOS | `$XDG_DATA_HOME` or `~/Library/Application Support`, + `/socket/settings/config.json`; when `$XDG_DATA_HOME` is unset the legacy `~/.local/share` location is probed second (older socket-cli releases wrote the Linux-style path on every platform) |
 | Windows | `%LOCALAPPDATA%` or `%USERPROFILE%\AppData\Local`, + `\socket\settings\config.json` |
 
 Exactly three keys are honored, each slotting **below** the env var and **above** the built-in default for its setting, resolved per key independently:

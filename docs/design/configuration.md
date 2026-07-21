@@ -42,9 +42,11 @@ Empty string == unset at every layer (repo-wide rule).
 ```
 
 Implementation: `socket_patch_core::utils::socket_cli_config` (path
-resolution mirrors socket-cli's `getSocketAppDataPath`, lenient
-base64→JSON→plain-JSON decode, allowlist copy, `OnceLock` disk cache with
-the gate checked per call), consumed by `get_api_client_with_overrides`
+resolution mirrors socket-cli's `getSocketAppDataPath` — plus, on macOS, a
+second probe of the legacy `~/.local/share` location that older socket-cli
+releases wrote on every platform; lenient base64→JSON→plain-JSON decode,
+allowlist copy, `OnceLock` disk cache with the gate checked per call),
+consumed by `get_api_client_with_overrides`
 (`api/client.rs`) and — for `apiBaseUrl` — by the shared
 `resolve_api_base_url()` that the telemetry endpoint resolver also uses, so
 client and telemetry can never disagree about the API host. The
