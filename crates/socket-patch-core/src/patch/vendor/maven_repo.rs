@@ -2052,10 +2052,7 @@ mod tests {
             .permissions()
             .mode()
             & 0o7777;
-        assert_eq!(
-            mode, 0o600,
-            "wiring must not reset the user's pom.xml mode"
-        );
+        assert_eq!(mode, 0o600, "wiring must not reset the user's pom.xml mode");
     }
 
     #[cfg(unix)]

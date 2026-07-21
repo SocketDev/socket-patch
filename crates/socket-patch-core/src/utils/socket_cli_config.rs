@@ -80,16 +80,20 @@ pub fn no_api_token_veto() -> bool {
 fn data_home() -> Option<PathBuf> {
     #[cfg(windows)]
     {
-        env_non_empty("LOCALAPPDATA").map(PathBuf::from).or_else(|| {
-            env_non_empty("USERPROFILE").map(|p| PathBuf::from(p).join("AppData").join("Local"))
-        })
+        env_non_empty("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .or_else(|| {
+                env_non_empty("USERPROFILE").map(|p| PathBuf::from(p).join("AppData").join("Local"))
+            })
     }
     #[cfg(target_os = "macos")]
     {
-        env_non_empty("XDG_DATA_HOME").map(PathBuf::from).or_else(|| {
-            env_non_empty("HOME")
-                .map(|h| PathBuf::from(h).join("Library").join("Application Support"))
-        })
+        env_non_empty("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .or_else(|| {
+                env_non_empty("HOME")
+                    .map(|h| PathBuf::from(h).join("Library").join("Application Support"))
+            })
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
@@ -400,10 +404,7 @@ mod tests {
         );
         // No env, config disabled → built-in default.
         with_env(
-            &[
-                ("SOCKET_API_URL", None),
-                ("SOCKET_NO_CONFIG", Some("1")),
-            ],
+            &[("SOCKET_API_URL", None), ("SOCKET_NO_CONFIG", Some("1"))],
             || {
                 assert_eq!(
                     resolve_api_base_url(),

@@ -1486,7 +1486,10 @@ mod tests {
     #[test]
     fn scan_origin_url_strips_hash_comment_without_space() {
         let cfg = "[remote \"origin\"]\n\turl = https://host/a#frag\n";
-        assert_eq!(scan_remote_origin_url(cfg).as_deref(), Some("https://host/a"));
+        assert_eq!(
+            scan_remote_origin_url(cfg).as_deref(),
+            Some("https://host/a")
+        );
     }
 
     /// A double-quoted value is unquoted, matching git.

@@ -1087,25 +1087,22 @@ pub async fn get_api_client_with_overrides(overrides: ApiClientEnvOverrides) -> 
     // "unset" at every layer. `SOCKET_NO_API_TOKEN` vetoes the *ambient*
     // token sources (env + config) so unauthenticated behavior can be
     // forced without unsetting anything; an explicit override still wins.
-    let api_token = overrides
-        .api_token
-        .filter(|t| !t.is_empty())
-        .or_else(|| {
-            if socket_cli_config::no_api_token_veto() {
-                debug_log("api token: suppressed by SOCKET_NO_API_TOKEN");
-                return None;
-            }
-            std::env::var("SOCKET_API_TOKEN")
-                .ok()
-                .filter(|t| !t.is_empty())
-                .or_else(|| {
-                    socket_cli_config::load()
-                        .and_then(|c| c.api_token.clone())
-                        .inspect(|_| {
-                            debug_log("api token: from socket-cli config (`socket login`)");
-                        })
-                })
-        });
+    let api_token = overrides.api_token.filter(|t| !t.is_empty()).or_else(|| {
+        if socket_cli_config::no_api_token_veto() {
+            debug_log("api token: suppressed by SOCKET_NO_API_TOKEN");
+            return None;
+        }
+        std::env::var("SOCKET_API_TOKEN")
+            .ok()
+            .filter(|t| !t.is_empty())
+            .or_else(|| {
+                socket_cli_config::load()
+                    .and_then(|c| c.api_token.clone())
+                    .inspect(|_| {
+                        debug_log("api token: from socket-cli config (`socket login`)");
+                    })
+            })
+    });
     let resolved_org_slug = overrides
         .org_slug
         .filter(|s| !s.is_empty())
@@ -1575,6 +1572,46 @@ pub enum ApiError {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    /// `SOCKET_NO_API_TOKEN` must veto an env-supplied token: the client
+    /// falls back to the public proxy exactly as if no token were set.
+    /// Serialized: SOCKET_* env is process-global (the socket_cli_config
+    /// suite touches SOCKET_NO_CONFIG concurrently otherwise).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn no_api_token_veto_forces_public_proxy() {
+        let saved_token = std::env::var("SOCKET_API_TOKEN").ok();
+        std::env::set_var("SOCKET_API_TOKEN", "sktsec_ambient_api");
+        std::env::set_var("SOCKET_NO_API_TOKEN", "1");
+        let (client, use_public_proxy) =
+            get_api_client_with_overrides(ApiClientEnvOverrides::default()).await;
+        std::env::remove_var("SOCKET_NO_API_TOKEN");
+        match saved_token {
+            Some(v) => std::env::set_var("SOCKET_API_TOKEN", v),
+            None => std::env::remove_var("SOCKET_API_TOKEN"),
+        }
+        assert!(use_public_proxy, "vetoed env token must select the proxy");
+        assert!(client.api_token.is_none());
+    }
+
+    /// An explicit override (the `--api-token` flag) survives the veto —
+    /// `SOCKET_NO_API_TOKEN` suppresses only ambient sources. The org
+    /// override skips auto-resolution so no network fires.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn explicit_token_override_survives_veto() {
+        std::env::set_var("SOCKET_NO_API_TOKEN", "1");
+        let raw = format!("sktsec_{}_api", "x".repeat(44));
+        let (client, use_public_proxy) = get_api_client_with_overrides(ApiClientEnvOverrides {
+            api_token: Some(raw.clone()),
+            org_slug: Some("test-org".to_string()),
+            ..ApiClientEnvOverrides::default()
+        })
+        .await;
+        std::env::remove_var("SOCKET_NO_API_TOKEN");
+        assert!(!use_public_proxy, "an explicit token must authenticate");
+        assert_eq!(client.api_token.as_deref(), Some(raw.as_str()));
+    }
 
     #[test]
     fn test_urlencoding_basic() {

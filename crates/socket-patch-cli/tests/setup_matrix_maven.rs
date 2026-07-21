@@ -128,7 +128,9 @@ mod host_guard {
         let mut cmd = Command::new(binary());
         cmd.args(args).current_dir(cwd);
         for (key, _) in std::env::vars_os() {
-            if key.to_string_lossy().starts_with("SOCKET_") {
+            if key.to_string_lossy().starts_with("SOCKET_")
+                && key.to_string_lossy() != "SOCKET_NO_CONFIG"
+            {
                 cmd.env_remove(&key);
             }
         }

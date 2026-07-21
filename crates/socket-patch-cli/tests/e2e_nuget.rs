@@ -70,6 +70,7 @@ async fn run(args: &[&str], cwd: &Path, nuget_packages: &Path, proxy_url: &str) 
             // is what makes these tests actually exercise the NuGet code path.
             .env("SOCKET_EXPERIMENTAL_NUGET", "1")
             .env_remove("SOCKET_API_TOKEN")
+            .env_remove("SOCKET_CLI_API_TOKEN")
             .env_remove("SOCKET_API_URL")
             .env_remove("SOCKET_OFFLINE")
             .env_remove("SOCKET_PROXY_URL")

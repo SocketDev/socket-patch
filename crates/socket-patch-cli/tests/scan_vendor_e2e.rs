@@ -160,7 +160,9 @@ fn run_cli_env(root: &Path, argv: &[&str], extra_env: &[(&str, &str)]) -> (i32, 
     // `scan_vendor_emits_no_telemetry_even_with_endpoint_env` seeds those
     // endpoint vars deliberately and proves the kill-switch still holds.
     for (key, _) in std::env::vars_os() {
-        if key.to_string_lossy().starts_with("SOCKET_") {
+        if key.to_string_lossy().starts_with("SOCKET_")
+            && key.to_string_lossy() != "SOCKET_NO_CONFIG"
+        {
             cmd.env_remove(&key);
         }
     }

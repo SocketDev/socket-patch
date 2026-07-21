@@ -270,7 +270,10 @@ fn yes_long() {
 #[test]
 fn proxy_url_long() {
     let args = parse_rollback(&["--proxy-url", "https://proxy.example"]);
-    assert_eq!(args.common.proxy_url.as_deref(), Some("https://proxy.example"));
+    assert_eq!(
+        args.common.proxy_url.as_deref(),
+        Some("https://proxy.example")
+    );
 }
 
 #[test]

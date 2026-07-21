@@ -354,7 +354,10 @@ mod tests {
         std::env::set_var(CANONICAL, "");
         std::env::set_var(ALIAS, "alias-value");
         promote_aliases(&[(CANONICAL, ALIAS)]);
-        assert_eq!(std::env::var(CANONICAL).ok().as_deref(), Some("alias-value"));
+        assert_eq!(
+            std::env::var(CANONICAL).ok().as_deref(),
+            Some("alias-value")
+        );
         std::env::remove_var(CANONICAL);
 
         std::env::set_var(ALIAS, "");
