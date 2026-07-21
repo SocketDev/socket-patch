@@ -11,11 +11,21 @@
 //!
 //! The lock file lives at `<.socket>/apply.lock`. It is created on
 //! demand (the parent `.socket/` directory must exist first; callers
-//! get a clear error otherwise) and is **never deleted** — the file
-//! handle drop releases the OS-level advisory lock, but the inode
-//! sticks around for next time. That keeps the lock idempotent across
-//! restarts and avoids a race where two callers create the lock file
-//! at the same time.
+//! get a clear error otherwise) and is retained by the mutating
+//! commands across runs — the file handle drop releases the OS-level
+//! advisory lock, but the inode sticks around for next time. That
+//! keeps the lock idempotent across restarts and avoids a race where
+//! two callers create the lock file at the same time. Callers must
+//! never unlink a lock they hold (or one a live process might hold):
+//! a competitor keeping or taking an advisory lock on the orphaned
+//! inode while a fresh acquire locks its replacement defeats mutual
+//! exclusion. The one sanctioned deletion is `socket-patch repair`,
+//! which removes the leftover file as its final housekeeping step —
+//! after releasing its own guard — so a finished repair leaves a
+//! clean `.socket/` tree. A leftover file from a crashed run needs no
+//! removal to unblock anything: the kernel released the dead
+//! process's advisory lock with its file handle, so the next acquire
+//! reclaims the file in place.
 //!
 //! Locking is advisory (`flock(2)` on Unix, `LockFileEx` on Windows
 //! via the `fs2` crate). Non-cooperating writers (a user shelling

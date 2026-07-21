@@ -11,7 +11,7 @@
 //! and `scan`, the ambient env var broke those commands too (including
 //! `apply` running from a postinstall hook). The fix wires
 //! `value_parser = parse_bool_flag`, matching the `GlobalArgs` bool flags
-//! and `repair --download-only` / `unlock --release`. `main`'s empty-var
+//! and `repair --download-only`. `main`'s empty-var
 //! scrub also removes exported-but-empty values (the vars are in
 //! `LOCAL_ARG_ENV_VARS`), but these library-level parses bypass `main`, so
 //! the value parser must accept the empty string itself.
@@ -55,7 +55,6 @@ const SOCKET_ENV_VARS: &[&str] = &[
     "SOCKET_DRY_RUN",
     "SOCKET_YES",
     "SOCKET_LOCK_TIMEOUT",
-    "SOCKET_BREAK_LOCK",
     "SOCKET_DEBUG",
     "SOCKET_TELEMETRY_DISABLED",
     // VexArgs / VexEmbedArgs
@@ -212,7 +211,6 @@ struct Snap {
     dry_run: bool,
     yes: bool,
     lock_timeout: Option<u64>,
-    break_lock: bool,
     debug: bool,
     no_telemetry: bool,
     output: Option<PathBuf>,
@@ -245,7 +243,6 @@ fn snapshot(a: &VexArgs) -> Snap {
         dry_run: a.common.dry_run,
         yes: a.common.yes,
         lock_timeout: a.common.lock_timeout,
-        break_lock: a.common.break_lock,
         debug: a.common.debug,
         no_telemetry: a.common.no_telemetry,
         output: a.output.clone(),
@@ -285,7 +282,6 @@ fn expected_defaults() -> Snap {
         dry_run: false,
         yes: false,
         lock_timeout: None,
-        break_lock: false,
         debug: false,
         no_telemetry: false,
         output: None,

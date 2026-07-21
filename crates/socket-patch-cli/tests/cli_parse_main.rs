@@ -76,7 +76,7 @@ fn help_flag_triggers_display_help() {
     // listed in the rendered help.
     let help = err.to_string();
     for name in [
-        "apply", "rollback", "get", "scan", "list", "remove", "setup", "repair", "unlock", "vex",
+        "scan", "apply", "vex", "vendor", "setup", "rollback", "get", "list", "remove", "repair",
     ] {
         assert!(
             help.contains(name),
@@ -167,17 +167,16 @@ fn repair_subcommand_parses() {
 }
 
 #[test]
-fn unlock_subcommand_parses() {
-    // `unlock` is one of the two newest subcommands and the second-to-last
-    // arm in main.rs's dispatch match — keep its name + dispatch wiring
-    // covered alongside the older commands.
-    let cli = parse(&["socket-patch", "unlock"]).expect("unlock must parse with no positional");
-    assert!(matches!(cli.command, Commands::Unlock(_)));
+fn unlock_subcommand_is_removed() {
+    // BREAKING (4.0): the `unlock` subcommand was folded into `repair`
+    // (which now deletes the leftover `apply.lock` after finishing).
+    // Pin the removal so the name can't quietly come back half-wired.
+    let err = expect_err(parse(&["socket-patch", "unlock"]));
+    assert_eq!(err.kind(), clap::error::ErrorKind::InvalidSubcommand);
 }
 
 #[test]
 fn vex_subcommand_parses() {
-    // `vex` is the last arm in main.rs's dispatch match; lock its name in.
     let cli = parse(&["socket-patch", "vex"]).expect("vex must parse with no positional");
     assert!(matches!(cli.command, Commands::Vex(_)));
 }

@@ -267,21 +267,6 @@ pub struct GlobalArgs {
     #[arg(long = "lock-timeout", env = "SOCKET_LOCK_TIMEOUT")]
     pub lock_timeout: Option<u64>,
 
-    /// Reclaim a stale `<.socket>/apply.lock` left behind by a
-    /// crashed run (the file is never deleted — deleting a lock file
-    /// defeats mutual exclusion). Refuses with `lock_held` if a live
-    /// socket-patch process still holds the lock. Emits a
-    /// `lock_broken` warning event in the JSON envelope so the
-    /// action is auditable. Only meaningful for mutating
-    /// subcommands; other commands accept it silently.
-    #[arg(
-        long = "break-lock",
-        env = "SOCKET_BREAK_LOCK",
-        default_value_t = false,
-        value_parser = parse_bool_flag,
-    )]
-    pub break_lock: bool,
-
     /// Emit verbose debug logs to stderr.
     #[arg(
         long = "debug",
@@ -381,7 +366,6 @@ pub const GLOBAL_ARG_ENV_VARS: &[&str] = &[
     "SOCKET_DRY_RUN",
     "SOCKET_YES",
     "SOCKET_LOCK_TIMEOUT",
-    "SOCKET_BREAK_LOCK",
     "SOCKET_DEBUG",
     "SOCKET_TELEMETRY_DISABLED",
 ];
@@ -401,7 +385,6 @@ pub const LOCAL_ARG_ENV_VARS: &[&str] = &[
     "SOCKET_DOWNLOAD_ONLY",
     "SOCKET_SETUP_EXCLUDE",
     "SOCKET_VENDOR_REVERT",
-    "SOCKET_UNLOCK_RELEASE",
     "SOCKET_BATCH_SIZE",
     "SOCKET_VEX",
     "SOCKET_VEX_OUTPUT",
@@ -472,7 +455,6 @@ impl Default for GlobalArgs {
             dry_run: false,
             yes: false,
             lock_timeout: None,
-            break_lock: false,
             debug: false,
             no_telemetry: false,
         }
@@ -826,7 +808,6 @@ mod tests {
             assert!(!cli.common.global);
             assert!(!cli.common.dry_run);
             assert!(!cli.common.yes);
-            assert!(!cli.common.break_lock);
             assert!(!cli.common.debug);
             assert!(!cli.common.no_telemetry);
         });
@@ -1128,7 +1109,6 @@ mod tests {
             ("SOCKET_SKIP_ROLLBACK", &["socket-patch", "remove", "x"]),
             ("SOCKET_DOWNLOAD_ONLY", &["socket-patch", "repair"]),
             ("SOCKET_VENDOR_REVERT", &["socket-patch", "vendor"]),
-            ("SOCKET_UNLOCK_RELEASE", &["socket-patch", "unlock"]),
             ("SOCKET_VEX_NO_VERIFY", &["socket-patch", "vex"]),
             ("SOCKET_VEX_COMPACT", &["socket-patch", "vex"]),
             // The embedded `--vex-*` twins share the same env vars and must

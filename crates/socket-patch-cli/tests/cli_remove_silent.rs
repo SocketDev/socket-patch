@@ -2,11 +2,10 @@
 //!
 //! CLI_CONTRACT.md defines `--silent` as "Errors only". Regression
 //! guard: `remove` gated all of its human-readable chatter on `!json`
-//! alone, hardcoded `silent: false` into `acquire_or_emit` (so the
-//! `--break-lock` stale-lock warning printed anyway), and passed only
-//! `json` as `rollback_patches`' silent param — so `remove --silent`
-//! printed everything. Same bug class previously fixed in `list`,
-//! `repair`, and `get`. Runs fully offline: the patch record has no
+//! alone, and passed only `json` as `rollback_patches`' silent param —
+//! so `remove --silent` printed everything. Same bug class previously
+//! fixed in `list`, `repair`, and `get`. Runs fully offline: the patch
+//! record has no
 //! files (so rollback fetches no blobs) and the project dir has no
 //! installed packages, so the internal rollback takes the
 //! "not installed" path and the manifest mutation needs no network.
@@ -127,12 +126,10 @@ fn remove_silent_produces_no_output_on_success() {
     );
 }
 
-/// `--silent` must also reach the lock helper: reclaiming a stale
-/// `apply.lock` via `--break-lock` prints a stderr warning that
-/// `acquire_or_emit` gates on its `silent` param — which `remove`
-/// hardcoded to `false`.
+/// A leftover `apply.lock` with no live holder must not disturb a
+/// silent remove: the acquire reclaims it in place with no chatter.
 #[test]
-fn remove_silent_suppresses_break_lock_warning() {
+fn remove_silent_reclaims_stale_lock_without_output() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let socket = make_socket_dir(tmp.path());
     std::fs::write(socket.join("apply.lock"), b"").expect("write stale lock");
@@ -143,36 +140,20 @@ fn remove_silent_suppresses_break_lock_warning() {
             "pkg:npm/__remove_silent_test__@1.0.0",
             "--silent",
             "--yes",
-            "--break-lock",
             "--skip-rollback",
         ],
     );
     assert_eq!(
         code, 0,
-        "remove must succeed; stdout={stdout:?} stderr={stderr:?}"
+        "remove must succeed through a stale lock file; stdout={stdout:?} stderr={stderr:?}"
     );
+    let stderr_rest: Vec<&str> = stderr
+        .lines()
+        .filter(|l| !l.contains("SOCKET_API_TOKEN") && !l.trim().is_empty())
+        .collect();
     assert!(
-        !stderr.contains("reclaimed stale"),
-        "--silent must suppress the stale-lock warning; got {stderr:?}"
-    );
-
-    // Control run: without --silent the warning must appear.
-    let tmp2 = tempfile::tempdir().expect("tempdir");
-    let socket2 = make_socket_dir(tmp2.path());
-    std::fs::write(socket2.join("apply.lock"), b"").expect("write stale lock");
-    let (loud_code, _loud_stdout, loud_stderr) = run_remove(
-        tmp2.path(),
-        &[
-            "pkg:npm/__remove_silent_test__@1.0.0",
-            "--yes",
-            "--break-lock",
-            "--skip-rollback",
-        ],
-    );
-    assert_eq!(loud_code, 0);
-    assert!(
-        loud_stderr.contains("reclaimed stale"),
-        "non-silent --break-lock must print the stale-lock warning; got {loud_stderr:?}"
+        stderr_rest.is_empty(),
+        "--silent must produce no stderr chatter; got {stderr_rest:?}"
     );
 }
 

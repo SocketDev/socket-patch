@@ -167,14 +167,19 @@ fn lock_held_human_mode_mentions_other_process() {
     );
     // Pin the actual contention contract phrase rather than just
     // "another"+"process": the binary prints the lock_held message and
-    // the actionable unlock/break-lock hint.
+    // the wait hint. Held always means a live process, so the only
+    // honest advice is to wait (or budget a wait via --lock-timeout).
     assert!(
         stderr.contains("Error: another socket-patch process is operating in this directory"),
         "stderr should carry the lock_held error line, got:\n{stderr}"
     );
     assert!(
-        stderr.contains("--break-lock") && stderr.contains("socket-patch unlock"),
-        "stderr should give the actionable unlock/break-lock hint, got:\n{stderr}"
+        stderr.contains("--lock-timeout"),
+        "stderr should give the actionable wait hint, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("unlock") && !stderr.contains("--break-lock"),
+        "the unlock/break-lock hints were removed with those commands, got:\n{stderr}"
     );
 }
 
@@ -355,123 +360,36 @@ fn helper_lock_is_actually_exclusive() {
     );
 }
 
-/// `apply --break-lock` against a pre-staged lock file (no live
-/// holder) reclaims the file and proceeds with the apply pass. The
-/// JSON envelope must surface the `lock_broken` warning event so the
-/// action is auditable.
-///
-/// Setup mirrors the OS-level scenario: a previous run crashed and
-/// left `apply.lock` behind, but the OS-level flock was released
-/// (so a fresh acquire would succeed even without --break-lock).
-/// The --break-lock path is the safe-by-design version of `rm` —
-/// it never actually unlinks (that would defeat mutual exclusion),
-/// it verifies no live holder and records the audit event.
+/// `apply` against a pre-staged lock file (no live holder) reclaims
+/// the file in place and proceeds with the apply pass — no flag
+/// needed. Mirrors the OS-level scenario: a previous run crashed and
+/// left `apply.lock` behind, but the kernel released the dead
+/// holder's flock, so a fresh acquire sails through. This fact is
+/// what made `--break-lock` (and the `unlock` subcommand) redundant.
 #[test]
-fn break_lock_reclaims_stale_file_and_records_warning() {
+fn stale_lock_file_does_not_block_apply() {
     let dir = tempfile::tempdir().unwrap();
     let socket_dir = dir.path().join(".socket");
     setup_socket_dir(&socket_dir);
-    // Pre-stage a lock file but DON'T hold an OS lock — simulates
-    // the post-crash scenario where the file lingers but flock was
-    // released. Without --break-lock the binary would still
-    // acquire fine (`acquire` re-opens the file); with --break-lock
-    // we additionally get the audit event.
+    // Pre-stage a lock file but DON'T hold an OS lock.
     std::fs::write(socket_dir.join("apply.lock"), b"").unwrap();
 
-    let (code, stdout, stderr) = run(dir.path(), &["apply", "--json", "--break-lock"]);
+    let (code, stdout, stderr) = run(dir.path(), &["apply", "--json"]);
     let env = parse_json_envelope(&stdout);
-    // --break-lock breaks the stale file and then acquires cleanly, so
-    // the run must NOT itself be a lock_held failure. Prove the binary
-    // genuinely re-acquired the lock and drove the real apply pipeline
-    // to completion (partialFailure against the absent synthetic
-    // package, no top-level error) — not merely that the errorCode
-    // happened to differ from "lock_held". Without this, a regression
-    // that emitted the audit event but then bailed before acquiring
-    // (or with some other non-lock error) would slip through the
-    // `assert_ne!` + event-presence checks below.
+    // Prove the binary genuinely acquired the lock and drove the real
+    // apply pipeline to completion (partialFailure against the absent
+    // synthetic package, no top-level error).
     assert_lock_acquired(&env);
-    assert_ne!(
-        envelope_error_code(&env),
-        Some("lock_held"),
-        "--break-lock should acquire, not report lock_held.\nenvelope: {env}"
-    );
     // Same exit contract as every other acquired-then-pipeline run in
     // this file: partialFailure against an absent package exits 1.
     assert_eq!(
         code, 1,
-        "break-lock apply that ran the pipeline to partialFailure must exit 1.\nstderr:\n{stderr}"
-    );
-    let events = env["events"].as_array().expect("events array");
-    // Exactly one lock_broken audit event, carrying the audit reason
-    // that names the action and the lock path.
-    let lock_broken: Vec<_> = events
-        .iter()
-        .filter(|e| {
-            e.get("action").and_then(|v| v.as_str()) == Some("skipped")
-                && e.get("errorCode").and_then(|v| v.as_str()) == Some("lock_broken")
-        })
-        .collect();
-    assert_eq!(
-        lock_broken.len(),
-        1,
-        "apply --break-lock should emit exactly one lock_broken skipped event.\nstdout:\n{stdout}"
-    );
-    let reason = lock_broken[0]
-        .get("reason")
-        .and_then(|v| v.as_str())
-        .expect("lock_broken event must carry a reason");
-    assert!(
-        reason.contains("--break-lock") && reason.contains("apply.lock"),
-        "lock_broken reason should name the action and the lock file, got: {reason}"
-    );
-    // The break is also reflected in the skipped tally.
-    assert!(
-        env["summary"]["skipped"].as_u64().unwrap_or(0) >= 1,
-        "lock_broken should be counted in summary.skipped.\nenvelope: {env}"
+        "apply that ran the pipeline to partialFailure must exit 1.\nstderr:\n{stderr}"
     );
     // The inode is kept for subsequent acquires.
     assert!(
         socket_dir.join("apply.lock").is_file(),
-        "apply.lock should still exist after --break-lock acquires"
-    );
-}
-
-/// Regression: when `--break-lock` itself is refused because a LIVE
-/// holder owns the lock, the stderr hint must not advise rerunning
-/// with `--break-lock` — the user just did exactly that, and the
-/// probe refused precisely because a holder exists, so the advice
-/// can only loop. (The plain-contention hint, with no --break-lock
-/// passed, rightly keeps suggesting the flag — see
-/// `lock_held_human_mode_mentions_other_process`.)
-#[test]
-fn break_lock_refusal_does_not_advise_break_lock_again() {
-    let dir = tempfile::tempdir().unwrap();
-    let socket_dir = dir.path().join(".socket");
-    setup_socket_dir(&socket_dir);
-    let _external = take_external_lock(&socket_dir);
-
-    let (code, stdout, stderr) = run(dir.path(), &["apply", "--break-lock"]);
-    assert_eq!(
-        code, 1,
-        "--break-lock against a live holder must refuse with exit 1.\nstderr:\n{stderr}"
-    );
-    assert!(
-        stdout.trim().is_empty(),
-        "human mode must not print a JSON envelope to stdout, got:\n{stdout}"
-    );
-    assert!(
-        stderr.contains("Error: another socket-patch process is operating in this directory"),
-        "stderr should carry the lock_held error line, got:\n{stderr}"
-    );
-    // Still actionable: the inspect path remains valid.
-    assert!(
-        stderr.contains("socket-patch unlock"),
-        "stderr should still point at `socket-patch unlock`, got:\n{stderr}"
-    );
-    // The regression: no self-defeating "rerun with --break-lock".
-    assert!(
-        !stderr.contains("rerun with --break-lock"),
-        "a refused --break-lock must not advise rerunning with --break-lock, got:\n{stderr}"
+        "apply.lock should still exist after the run"
     );
 }
 

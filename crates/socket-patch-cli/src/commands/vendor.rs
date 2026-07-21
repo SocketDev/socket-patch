@@ -38,7 +38,7 @@ use std::time::Duration;
 use crate::args::{apply_env_toggles, GlobalArgs};
 use crate::commands::apply::{result_to_event, variant_matches_installed};
 use crate::commands::fetch_stage::{stage_vendor_sources_in_memory, MemStageOutcome};
-use crate::commands::lock_cli::{acquire_or_emit, lock_broken_event};
+use crate::commands::lock_cli::acquire_or_emit;
 use crate::commands::vex::{generate_vex_from_manifest_path, VexEmbedArgs};
 use crate::ecosystem_dispatch::{find_packages_for_purls, partition_purls};
 use crate::json_envelope::{
@@ -297,26 +297,19 @@ pub async fn run(args: VendorArgs) -> i32 {
 
     // Same lock as apply/rollback: vendor mutates the same lockfiles and
     // `.socket/` tree, so a separate lock would allow an apply↔vendor race.
-    let acquired = match acquire_or_emit(
+    let _lock = match acquire_or_emit(
         &socket_dir,
         Command::Vendor,
         args.common.json,
-        args.common.silent,
         args.common.dry_run,
         Duration::from_secs(args.common.lock_timeout.unwrap_or(0)),
-        args.common.break_lock,
     ) {
-        Ok(acquired) => acquired,
+        Ok(guard) => guard,
         Err(code) => return code,
     };
-    let _lock = acquired.guard;
-    let lock_was_broken = acquired.broke_lock;
 
     let mut env = Envelope::new(Command::Vendor);
     env.dry_run = args.common.dry_run;
-    if lock_was_broken {
-        env.record(lock_broken_event(&socket_dir));
-    }
 
     let mut exit = if args.revert {
         run_revert(&args, &mut env).await
