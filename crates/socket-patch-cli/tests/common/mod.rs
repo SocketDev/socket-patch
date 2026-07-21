@@ -608,7 +608,7 @@ mod oracle_selftests {
         // No `error` object → both error accessors return None (not a panic,
         // not a stale hit), so success-path consumers asserting `None` stay
         // honest.
-        let ok = parse_json_envelope(r#"{"status":"free","command":"unlock"}"#);
+        let ok = parse_json_envelope(r#"{"status":"success","command":"list"}"#);
         assert_eq!(envelope_error_code(&ok), None);
         assert_eq!(envelope_error_message(&ok), None);
 

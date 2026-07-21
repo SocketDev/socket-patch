@@ -31,8 +31,23 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
+    /// Scan installed packages for available security patches
+    Scan(commands::scan::ScanArgs),
+
     /// Apply security patches to dependencies
     Apply(commands::apply::ApplyArgs),
+
+    /// Generate an OpenVEX 0.2.0 attestation describing the
+    /// vulnerabilities mitigated by the applied patches.
+    Vex(commands::vex::VexArgs),
+
+    /// Eject patched dependencies into committable `.socket/vendor/`
+    /// and rewire lockfiles so fresh checkouts build with the patches
+    /// (no socket-patch or Socket API needed). `--revert` undoes it.
+    Vendor(commands::vendor::VendorArgs),
+
+    /// Configure package.json postinstall scripts to apply patches
+    Setup(commands::setup::SetupArgs),
 
     /// Rollback patches to restore original files
     Rollback(commands::rollback::RollbackArgs),
@@ -41,19 +56,14 @@ pub enum Commands {
     #[command(visible_alias = "download")]
     Get(commands::get::GetArgs),
 
-    /// Scan installed packages for available security patches
-    Scan(commands::scan::ScanArgs),
-
     /// List all patches in the local manifest
     List(commands::list::ListArgs),
 
     /// Remove a patch from the manifest by PURL or UUID (rolls back files first)
     Remove(commands::remove::RemoveArgs),
 
-    /// Configure package.json postinstall scripts to apply patches
-    Setup(commands::setup::SetupArgs),
-
-    /// Download missing blobs and clean up unused blobs.
+    /// Download missing blobs, clean up unused blobs, and reset the
+    /// advisory lock state.
     ///
     /// `repair` (alias `gc`) is a first-class command for cleaning up
     /// the `.socket/` directory without running a scan. For the
@@ -62,21 +72,6 @@ pub enum Commands {
     /// their own when the user wants to clean up without an apply pass.
     #[command(visible_alias = "gc")]
     Repair(commands::repair::RepairArgs),
-
-    /// Inspect (and optionally release) the `<.socket>/apply.lock`
-    /// advisory file lock used by mutating subcommands. Exits 0
-    /// when free, 1 when held. Pass `--release` to also delete the
-    /// lock file when it is free.
-    Unlock(commands::unlock::UnlockArgs),
-
-    /// Eject patched dependencies into committable `.socket/vendor/`
-    /// and rewire lockfiles so fresh checkouts build with the patches
-    /// (no socket-patch or Socket API needed). `--revert` undoes it.
-    Vendor(commands::vendor::VendorArgs),
-
-    /// Generate an OpenVEX 0.2.0 attestation describing the
-    /// vulnerabilities mitigated by the applied patches.
-    Vex(commands::vex::VexArgs),
 }
 
 /// Check whether `s` looks like a UUID (8-4-4-4-12 hex pattern).

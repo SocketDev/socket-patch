@@ -5,7 +5,7 @@
 //!
 //! 1. `--manifest-path` / `SOCKET_MANIFEST_PATH` is a documented global
 //!    flag ("Manifest location, resolved relative to `--cwd`") honored by
-//!    apply/list/remove/rollback/repair/vendor/unlock — and by scan's own
+//!    apply/list/remove/rollback/repair/vendor — and by scan's own
 //!    discovery and GC — but `get`'s save paths hardcoded
 //!    `<cwd>/.socket/manifest.json` (and `<cwd>/.socket/blobs`). A `get`
 //!    under a custom manifest path saved the patch to a location every

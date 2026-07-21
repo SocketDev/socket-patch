@@ -59,7 +59,6 @@ const SOCKET_ENV_VARS: &[&str] = &[
     "SOCKET_DRY_RUN",
     "SOCKET_YES",
     "SOCKET_LOCK_TIMEOUT",
-    "SOCKET_BREAK_LOCK",
     "SOCKET_DEBUG",
     "SOCKET_TELEMETRY_DISABLED",
     // RepairArgs-specific
@@ -155,7 +154,6 @@ struct Snap {
     dry_run: bool,
     yes: bool,
     lock_timeout: Option<u64>,
-    break_lock: bool,
     debug: bool,
     no_telemetry: bool,
     download_only: bool,
@@ -184,7 +182,6 @@ fn snapshot(a: &RepairArgs) -> Snap {
         dry_run: a.common.dry_run,
         yes: a.common.yes,
         lock_timeout: a.common.lock_timeout,
-        break_lock: a.common.break_lock,
         debug: a.common.debug,
         no_telemetry: a.common.no_telemetry,
         download_only: a.download_only,
@@ -220,7 +217,6 @@ fn expected_defaults() -> Snap {
         dry_run: false,
         yes: false,
         lock_timeout: None,
-        break_lock: false,
         debug: false,
         no_telemetry: false,
         download_only: false,
@@ -235,7 +231,7 @@ fn repair_defaults_match_contract() {
     // Pin the *entire* default surface in one shot against the independent
     // oracle. The previous version only checked download_mode, cwd,
     // manifest_path, dry_run, offline, download_only and json — leaving
-    // api_url, proxy_url, verbose, silent, yes, lock_timeout, break_lock,
+    // api_url, proxy_url, verbose, silent, yes, lock_timeout,
     // debug, no_telemetry, global, global_prefix, ecosystems, api_token and
     // org free to regress unnoticed.
     assert_eq!(snapshot(&args), expected_defaults());

@@ -29,7 +29,7 @@ fn parse_apply(extra: &[&str]) -> ApplyArgs {
 /// Used to prove that a single flag flips *only* its own field — without
 /// this, each positive test ignores all other fields, so a parser bug that
 /// cross-wired `--yes` into `--force` (auto-approve → silently bypass the
-/// beforeHash check) or any flag into `--break-lock` / `--global` would still
+/// beforeHash check) or any flag into `--global` would still
 /// stay green. Keep this in sync with the boolean flags in the contract.
 fn bool_flags(a: &ApplyArgs) -> Vec<(&'static str, bool)> {
     vec![
@@ -42,7 +42,6 @@ fn bool_flags(a: &ApplyArgs) -> Vec<(&'static str, bool)> {
         ("yes", a.common.yes),
         ("debug", a.common.debug),
         ("no_telemetry", a.common.no_telemetry),
-        ("break_lock", a.common.break_lock),
         ("force", a.force),
         ("check", a.check),
         ("vex_no_verify", a.vex.vex_no_verify),
@@ -87,8 +86,9 @@ fn defaults_match_contract() {
 
     // The remaining global defaults from the contract table. These were
     // previously unpinned, which let a dangerous default-value drift slip
-    // through silently — e.g. `--break-lock` defaulting to `true` would make
-    // `apply` steal a live lock, or the API/proxy URLs silently retargeting.
+    // through silently — e.g. `--yes` defaulting to `true` would make
+    // `apply` auto-approve every prompt, or the API/proxy URLs silently
+    // retargeting.
     assert_eq!(a.common.api_url, "https://api.socket.dev");
     assert_eq!(a.common.api_token, None);
     assert_eq!(a.common.org, None);
@@ -96,7 +96,6 @@ fn defaults_match_contract() {
     assert!(!a.common.yes);
     assert!(!a.common.debug);
     assert!(!a.common.no_telemetry);
-    assert!(!a.common.break_lock);
     assert_eq!(a.common.lock_timeout, None);
 
     // `apply --check` is read-only audit mode. It MUST default off, otherwise
@@ -298,13 +297,6 @@ fn no_telemetry_long() {
     assert_only_true(&a, &["no_telemetry"]);
 }
 
-#[test]
-fn break_lock_long() {
-    let a = parse_apply(&["--break-lock"]);
-    assert!(a.common.break_lock);
-    assert_only_true(&a, &["break_lock"]);
-}
-
 /// Bare boolean flags are `SetTrue` (num_args = 0): they must NOT swallow the
 /// following token as a value. If `--force` silently became value-taking, a
 /// wrapper invoking `apply --force <something>` would change meaning. Assert
@@ -332,7 +324,6 @@ fn all_bools_settable_together() {
         "--yes",
         "--debug",
         "--no-telemetry",
-        "--break-lock",
         "--force",
         "--check",
     ]);
@@ -348,7 +339,6 @@ fn all_bools_settable_together() {
             "yes",
             "debug",
             "no_telemetry",
-            "break_lock",
             "force",
             "check",
         ],

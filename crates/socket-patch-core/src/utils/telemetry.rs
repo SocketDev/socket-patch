@@ -49,8 +49,6 @@ enum PatchTelemetryEventType {
     PatchRepaired,
     PatchRepairFailed,
     PatchSetup,
-    PatchUnlocked,
-    PatchUnlockFailed,
     // OpenVEX attestation (added in #81)
     VexGenerated,
     VexFailed,
@@ -76,8 +74,6 @@ impl PatchTelemetryEventType {
             Self::PatchRepaired => "patch_repaired",
             Self::PatchRepairFailed => "patch_repair_failed",
             Self::PatchSetup => "patch_setup",
-            Self::PatchUnlocked => "patch_unlocked",
-            Self::PatchUnlockFailed => "patch_unlock_failed",
             Self::VexGenerated => "vex_generated",
             Self::VexFailed => "vex_failed",
         }
@@ -598,7 +594,7 @@ pub async fn track_patch_fetch_failed(
 }
 
 // ---------------------------------------------------------------------------
-// Inspection / housekeeping trackers: list / repair / setup / unlock
+// Inspection / housekeeping trackers: list / repair / setup
 // ---------------------------------------------------------------------------
 
 /// Track a successful `list`. Reports the number of patches surfaced.
@@ -666,43 +662,6 @@ pub async fn track_patch_setup(manager: &str, api_token: Option<&str>, org_slug:
         "setup",
         serde_json::json!({ "manager": manager }),
         None::<&str>,
-        api_token,
-        org_slug,
-    )
-    .await;
-}
-
-/// Track a successful `unlock`. `was_held` indicates whether another
-/// process was holding the lock at probe time; `released` is true when
-/// `--release` actually removed the lock file (vs. the inspect-only case).
-pub async fn track_patch_unlocked(
-    was_held: bool,
-    released: bool,
-    api_token: Option<&str>,
-    org_slug: Option<&str>,
-) {
-    fire(
-        PatchTelemetryEventType::PatchUnlocked,
-        "unlock",
-        serde_json::json!({ "was_held": was_held, "released": released }),
-        None::<&str>,
-        api_token,
-        org_slug,
-    )
-    .await;
-}
-
-/// Track a failed `unlock`.
-pub async fn track_patch_unlock_failed(
-    error: impl std::fmt::Display,
-    api_token: Option<&str>,
-    org_slug: Option<&str>,
-) {
-    fire(
-        PatchTelemetryEventType::PatchUnlockFailed,
-        "unlock",
-        serde_json::Value::Null,
-        Some(error),
         api_token,
         org_slug,
     )
@@ -902,14 +861,6 @@ mod tests {
             "patch_repair_failed"
         );
         assert_eq!(PatchTelemetryEventType::PatchSetup.as_str(), "patch_setup");
-        assert_eq!(
-            PatchTelemetryEventType::PatchUnlocked.as_str(),
-            "patch_unlocked"
-        );
-        assert_eq!(
-            PatchTelemetryEventType::PatchUnlockFailed.as_str(),
-            "patch_unlock_failed"
-        );
         // OpenVEX
         assert_eq!(
             PatchTelemetryEventType::VexGenerated.as_str(),
