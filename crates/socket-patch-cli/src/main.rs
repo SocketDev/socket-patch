@@ -1,5 +1,6 @@
 use socket_patch_cli::{commands, parse_with_uuid_fallback, Commands};
-use socket_patch_core::utils::env_compat::promote_legacy_env_vars;
+use socket_patch_core::utils::env_compat::{promote_legacy_env_vars, promote_peer_env_vars};
+use socket_patch_core::utils::socket_cli_config;
 
 /// Restore the default SIGPIPE disposition. The Rust runtime starts every
 /// process with SIGPIPE ignored, so once a pipeline consumer exits
@@ -30,6 +31,19 @@ async fn main() {
     // before clap parses, so downstream code only needs to know the new
     // names. A one-shot deprecation warning fires per legacy name set.
     promote_legacy_env_vars();
+
+    // Then accept the JS socket-cli's SOCKET_CLI_* peer names (silently —
+    // they are aliases, not deprecations) so `socket login` / socket-cli
+    // env setups work for socket-patch unchanged. Canonical names win.
+    promote_peer_env_vars();
+
+    // SOCKET_NO_API_TOKEN (or its SOCKET_CLI_ alias, promoted above)
+    // suppresses ambient tokens: scrub the env var before clap parses so
+    // only an explicit `--api-token` flag can authenticate. Core applies
+    // the same veto to its own env/config fallback layers.
+    if socket_cli_config::no_api_token_veto() {
+        std::env::remove_var("SOCKET_API_TOKEN");
+    }
 
     // Then drop exported-but-empty SOCKET_* flag vars — global and
     // subcommand-local (`SOCKET_CWD=` means "unset", not "crash the

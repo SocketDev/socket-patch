@@ -103,6 +103,49 @@ pub fn promote_legacy_env_vars() {
     ]);
 }
 
+/// Peer env-var aliases accepted from the sibling JS Socket CLI, so an
+/// environment configured for `socket` (e.g. a CI job exporting
+/// `SOCKET_CLI_API_TOKEN`) works for `socket-patch` unchanged.
+///
+/// First entry is the canonical `SOCKET_*` name (what clap and core read);
+/// second is the accepted `SOCKET_CLI_*` peer name. Unlike
+/// [`promote_legacy_env_vars`] these are **not** deprecated — promotion is
+/// silent and the canonical name simply wins when both are set. The list is
+/// deliberately tight: `SOCKET_CLI_CONFIG` (ephemeral JSON override),
+/// `SOCKET_CLI_API_PROXY` (an HTTP forward proxy — reqwest already honors
+/// `HTTP_PROXY`/`HTTPS_PROXY`), and `SOCKET_CLI_DEBUG` are intentionally
+/// not mirrored.
+pub const PEER_ENV_ALIASES: &[(&str, &str)] = &[
+    ("SOCKET_API_TOKEN", "SOCKET_CLI_API_TOKEN"),
+    ("SOCKET_ORG_SLUG", "SOCKET_CLI_ORG_SLUG"),
+    ("SOCKET_API_URL", "SOCKET_CLI_API_BASE_URL"),
+    ("SOCKET_NO_API_TOKEN", "SOCKET_CLI_NO_API_TOKEN"),
+];
+
+/// Silently copy each set-and-non-empty [`PEER_ENV_ALIASES`] value onto its
+/// canonical `SOCKET_*` name when the canonical name is unset or empty.
+/// Call once, early in `main`, right after [`promote_legacy_env_vars`] and
+/// before the empty-var scrub / clap parse.
+pub fn promote_peer_env_vars() {
+    promote_aliases(PEER_ENV_ALIASES);
+}
+
+/// Core of [`promote_peer_env_vars`], parameterized over the alias table so
+/// tests can use isolated env-var names.
+fn promote_aliases(aliases: &[(&str, &str)]) {
+    for &(canonical, alias) in aliases {
+        let canonical_set = matches!(std::env::var(canonical).as_deref(), Ok(v) if !v.is_empty());
+        if canonical_set {
+            continue;
+        }
+        if let Ok(value) = std::env::var(alias) {
+            if !value.is_empty() {
+                std::env::set_var(canonical, value);
+            }
+        }
+    }
+}
+
 /// Core of [`promote_legacy_env_vars`], parameterized over the rename table so
 /// it can be exercised in tests with isolated env-var names (the real names are
 /// read concurrently by other tests in this binary).
@@ -265,5 +308,58 @@ mod tests {
         promote_renames(&[(NEW, LEGACY)]);
         assert_eq!(std::env::var(NEW).ok(), None);
         std::env::remove_var(LEGACY);
+    }
+
+    /// Peer-alias promotion copies a set alias onto the unset canonical
+    /// name — and, unlike the legacy shim, records **no** deprecation
+    /// warning (peer names are supported, not deprecated).
+    #[test]
+    fn peer_alias_promotes_silently_when_canonical_unset() {
+        const CANONICAL: &str = "SOCKET_TEST_PEER_PROMOTE";
+        const ALIAS: &str = "SOCKET_TEST_PEER_PROMOTE_CLI";
+        std::env::remove_var(CANONICAL);
+        std::env::set_var(ALIAS, "from-alias");
+        promote_aliases(&[(CANONICAL, ALIAS)]);
+        assert_eq!(std::env::var(CANONICAL).ok().as_deref(), Some("from-alias"));
+        assert!(
+            !WARNED.lock().unwrap().contains(ALIAS),
+            "peer promotion must not register a deprecation warning"
+        );
+        std::env::remove_var(CANONICAL);
+        std::env::remove_var(ALIAS);
+    }
+
+    /// The canonical name wins when both are set — the alias never clobbers.
+    #[test]
+    fn peer_alias_does_not_clobber_canonical() {
+        const CANONICAL: &str = "SOCKET_TEST_PEER_KEEP";
+        const ALIAS: &str = "SOCKET_TEST_PEER_KEEP_CLI";
+        std::env::set_var(CANONICAL, "canonical-value");
+        std::env::set_var(ALIAS, "alias-value");
+        promote_aliases(&[(CANONICAL, ALIAS)]);
+        assert_eq!(
+            std::env::var(CANONICAL).ok().as_deref(),
+            Some("canonical-value")
+        );
+        std::env::remove_var(CANONICAL);
+        std::env::remove_var(ALIAS);
+    }
+
+    /// Empty == unset on both sides: an empty canonical is filled from the
+    /// alias, and an empty alias is never promoted.
+    #[test]
+    fn peer_alias_treats_empty_as_unset() {
+        const CANONICAL: &str = "SOCKET_TEST_PEER_EMPTY";
+        const ALIAS: &str = "SOCKET_TEST_PEER_EMPTY_CLI";
+        std::env::set_var(CANONICAL, "");
+        std::env::set_var(ALIAS, "alias-value");
+        promote_aliases(&[(CANONICAL, ALIAS)]);
+        assert_eq!(std::env::var(CANONICAL).ok().as_deref(), Some("alias-value"));
+        std::env::remove_var(CANONICAL);
+
+        std::env::set_var(ALIAS, "");
+        promote_aliases(&[(CANONICAL, ALIAS)]);
+        assert_eq!(std::env::var(CANONICAL).ok(), None);
+        std::env::remove_var(ALIAS);
     }
 }

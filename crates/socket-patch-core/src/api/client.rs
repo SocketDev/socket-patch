@@ -5,8 +5,9 @@ use reqwest::StatusCode;
 use serde::Serialize;
 
 use crate::api::types::*;
-use crate::constants::{DEFAULT_SOCKET_API_URL, USER_AGENT as USER_AGENT_VALUE};
+use crate::constants::USER_AGENT as USER_AGENT_VALUE;
 use crate::utils::env_compat::{is_debug_enabled, proxy_url_from_env};
+use crate::utils::socket_cli_config;
 
 /// Log debug messages when debug mode is enabled.
 fn debug_log(message: &str) {
@@ -1042,24 +1043,29 @@ pub struct ApiClientEnvOverrides {
     pub proxy_url: Option<String>,
 }
 
-/// Get an API client configured from environment variables.
+/// Get an API client configured from environment variables (and, below
+/// them, the socket-cli config file — see
+/// [`crate::utils::socket_cli_config`]).
 ///
-/// If `SOCKET_API_TOKEN` is not set, the client will use the public patch
-/// API proxy which provides free access to free-tier patches without
-/// authentication.
+/// If no API token is found (env, then socket-cli config), the client will
+/// use the public patch API proxy which provides free access to free-tier
+/// patches without authentication.
 ///
-/// When `SOCKET_API_TOKEN` is set but no org slug is provided (neither via
-/// argument nor `SOCKET_ORG_SLUG` env var), the function will attempt to
-/// auto-resolve the org slug by querying `GET /v0/organizations`.
+/// When a token is set but no org slug is provided (argument,
+/// `SOCKET_ORG_SLUG` env var, or socket-cli config `defaultOrg`), the
+/// function will attempt to auto-resolve the org slug by querying
+/// `GET /v0/organizations`.
 ///
 /// # Environment variables
 ///
 /// | Variable | Purpose |
 /// |---|---|
-/// | `SOCKET_API_URL` | Override the API URL (default `https://api.socket.dev`) |
-/// | `SOCKET_API_TOKEN` | API token for authenticated access |
+/// | `SOCKET_API_URL` | Override the API URL (default `https://api.socket.dev`; socket-cli config `apiBaseUrl` sits between) |
+/// | `SOCKET_API_TOKEN` | API token for authenticated access (socket-cli config `apiToken` is the fallback) |
 /// | `SOCKET_PROXY_URL` | Override the public proxy URL (default `https://patches-api.socket.dev`). Legacy: `SOCKET_PATCH_PROXY_URL`. |
-/// | `SOCKET_ORG_SLUG` | Organization slug |
+/// | `SOCKET_ORG_SLUG` | Organization slug (socket-cli config `defaultOrg` is the fallback) |
+/// | `SOCKET_NO_API_TOKEN` | Truthy: ignore ambient tokens (env + config); only an explicit override authenticates |
+/// | `SOCKET_NO_CONFIG` | Truthy: disable the socket-cli config fallback layer entirely |
 ///
 /// Returns `(client, use_public_proxy)`.
 pub async fn get_api_client_from_env(org_slug: Option<&str>) -> (ApiClient, bool) {
@@ -1076,22 +1082,60 @@ pub async fn get_api_client_from_env(org_slug: Option<&str>) -> (ApiClient, bool
 /// `--api-token`, `--org`, `--proxy-url` flags via [`crate::utils`] in the
 /// CLI crate.
 pub async fn get_api_client_with_overrides(overrides: ApiClientEnvOverrides) -> (ApiClient, bool) {
+    // Per-key fallback chain: explicit override (CLI flag) → env var →
+    // socket-cli config file → built-in default. Empty strings mean
+    // "unset" at every layer. `SOCKET_NO_API_TOKEN` vetoes the *ambient*
+    // token sources (env + config) so unauthenticated behavior can be
+    // forced without unsetting anything; an explicit override still wins.
     let api_token = overrides
         .api_token
-        .or_else(|| std::env::var("SOCKET_API_TOKEN").ok())
-        .filter(|t| !t.is_empty());
+        .filter(|t| !t.is_empty())
+        .or_else(|| {
+            if socket_cli_config::no_api_token_veto() {
+                debug_log("api token: suppressed by SOCKET_NO_API_TOKEN");
+                return None;
+            }
+            std::env::var("SOCKET_API_TOKEN")
+                .ok()
+                .filter(|t| !t.is_empty())
+                .or_else(|| {
+                    socket_cli_config::load()
+                        .and_then(|c| c.api_token.clone())
+                        .inspect(|_| {
+                            debug_log("api token: from socket-cli config (`socket login`)");
+                        })
+                })
+        });
     let resolved_org_slug = overrides
         .org_slug
-        .or_else(|| std::env::var("SOCKET_ORG_SLUG").ok())
+        .filter(|s| !s.is_empty())
         // Treat an empty slug as "not provided" (mirroring the api_token
         // handling above). Otherwise `SOCKET_ORG_SLUG=""` would be taken as
         // an explicit slug, skip auto-resolution, and build broken
         // `/v0/orgs//patches/...` URLs with an empty slug segment.
-        .filter(|s| !s.is_empty());
+        .or_else(|| {
+            std::env::var("SOCKET_ORG_SLUG")
+                .ok()
+                .filter(|s| !s.is_empty())
+        })
+        .or_else(|| {
+            socket_cli_config::load()
+                .and_then(|c| c.default_org.clone())
+                .inspect(|slug| {
+                    debug_log(&format!("org slug: `{slug}` from socket-cli config"));
+                })
+        });
 
     if api_token.is_none() {
-        let proxy_url = overrides.proxy_url.unwrap_or_else(proxy_url_from_env);
-        eprintln!("No SOCKET_API_TOKEN set. Using public patch API proxy (free patches only).");
+        let proxy_url = overrides
+            .proxy_url
+            .filter(|u| !u.is_empty())
+            .unwrap_or_else(proxy_url_from_env);
+        eprintln!(
+            "No SOCKET_API_TOKEN set (and no socket-cli login found) — using the \
+             public patch API proxy (free patches only). Run `socket login` or set \
+             SOCKET_API_TOKEN to access org patches."
+        );
         let client = ApiClient::new(ApiClientOptions {
             api_url: proxy_url,
             api_token: None,
@@ -1111,8 +1155,10 @@ pub async fn get_api_client_with_overrides(overrides: ApiClientEnvOverrides) -> 
 
     let api_url = overrides
         .api_url
-        .or_else(|| std::env::var("SOCKET_API_URL").ok())
-        .unwrap_or_else(|| DEFAULT_SOCKET_API_URL.to_string());
+        .filter(|u| !u.is_empty())
+        // Env → socket-cli config `apiBaseUrl` → default; shared with the
+        // telemetry endpoint resolver so the two can't disagree.
+        .unwrap_or_else(socket_cli_config::resolve_api_base_url);
 
     // Auto-resolve org slug if not provided
     let final_org_slug = if resolved_org_slug.is_some() {

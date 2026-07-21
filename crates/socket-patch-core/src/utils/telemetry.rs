@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use once_cell::sync::Lazy;
 use uuid::Uuid;
 
-use crate::constants::{DEFAULT_SOCKET_API_URL, USER_AGENT};
+use crate::constants::USER_AGENT;
 use crate::utils::env_compat::{is_debug_enabled, proxy_url_from_env, read_env_with_legacy};
 use crate::utils::fs::home_dir;
 use crate::vex::time::unix_to_ymdhms;
@@ -243,10 +243,10 @@ fn resolve_telemetry_endpoint(api_token: Option<&str>, org_slug: Option<&str>) -
 
     match (token, slug) {
         (Some(_token), Some(slug)) => {
-            let api_url = std::env::var("SOCKET_API_URL")
-                .ok()
-                .filter(|u| !u.is_empty())
-                .unwrap_or_else(|| DEFAULT_SOCKET_API_URL.to_string());
+            // Same env → socket-cli config → default chain as API-client
+            // construction, so telemetry can't target a different host than
+            // the client that produced the event.
+            let api_url = crate::utils::socket_cli_config::resolve_api_base_url();
             // Trim trailing slashes like `ApiClient::new` does, so a base URL
             // of `https://host/` doesn't produce a malformed `//v0/...` path.
             let api_url = api_url.trim_end_matches('/');
