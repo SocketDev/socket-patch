@@ -72,13 +72,13 @@ fn defaults_no_positional() {
     assert_eq!(args.common.global_prefix, None);
     assert!(!args.one_off);
     assert_eq!(args.common.org, None);
-    assert_eq!(args.common.api_url, "https://api.socket.dev");
+    assert_eq!(args.common.api_url, None); // default applied in core resolver
     assert_eq!(args.common.api_token, None);
     assert_eq!(args.common.ecosystems, None);
     assert!(!args.common.json);
     assert!(!args.common.verbose);
     // Remaining global defaults the contract pins but the original test omitted.
-    assert_eq!(args.common.proxy_url, "https://patches-api.socket.dev");
+    assert_eq!(args.common.proxy_url, None); // default applied in core resolver
     assert_eq!(args.common.download_mode, "diff");
     assert!(!args.common.yes);
     assert_eq!(args.common.lock_timeout, None);
@@ -203,7 +203,7 @@ fn org_long() {
 #[test]
 fn api_url_long() {
     let args = parse_rollback(&["--api-url", "https://api"]);
-    assert_eq!(args.common.api_url, "https://api");
+    assert_eq!(args.common.api_url.as_deref(), Some("https://api"));
 }
 
 #[test]
@@ -270,7 +270,7 @@ fn yes_long() {
 #[test]
 fn proxy_url_long() {
     let args = parse_rollback(&["--proxy-url", "https://proxy.example"]);
-    assert_eq!(args.common.proxy_url, "https://proxy.example");
+    assert_eq!(args.common.proxy_url.as_deref(), Some("https://proxy.example"));
 }
 
 #[test]

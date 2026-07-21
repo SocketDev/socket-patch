@@ -19,7 +19,7 @@ use clap::Args;
 
 use socket_patch_core::api::client::ApiClientEnvOverrides;
 use socket_patch_core::constants::{
-    DEFAULT_PATCH_API_PROXY_URL, DEFAULT_PATCH_MANIFEST_PATH, DEFAULT_SOCKET_API_URL,
+    DEFAULT_PATCH_MANIFEST_PATH,
 };
 use socket_patch_core::crawlers::Ecosystem;
 use socket_patch_core::patch::vendor::VendorSource;
@@ -97,13 +97,12 @@ pub struct GlobalArgs {
     )]
     pub manifest_path: String,
 
-    /// Socket API URL (authenticated endpoint).
-    #[arg(
-        long = "api-url",
-        env = "SOCKET_API_URL",
-        default_value = DEFAULT_SOCKET_API_URL,
-    )]
-    pub api_url: String,
+    /// Socket API URL (authenticated endpoint) [default:
+    /// https://api.socket.dev]. No clap default: `None` lets the core
+    /// resolver fall through env and the socket-cli config file before
+    /// applying `DEFAULT_SOCKET_API_URL`.
+    #[arg(long = "api-url", env = "SOCKET_API_URL")]
+    pub api_url: Option<String>,
 
     /// Socket API token. Absence selects the public patch proxy.
     #[arg(long = "api-token", env = "SOCKET_API_TOKEN")]
@@ -113,13 +112,11 @@ pub struct GlobalArgs {
     #[arg(long = "org", short = 'o', env = "SOCKET_ORG_SLUG")]
     pub org: Option<String>,
 
-    /// Public proxy URL used when no API token is set.
-    #[arg(
-        long = "proxy-url",
-        env = "SOCKET_PROXY_URL",
-        default_value = DEFAULT_PATCH_API_PROXY_URL,
-    )]
-    pub proxy_url: String,
+    /// Public proxy URL used when no API token is set [default:
+    /// https://patches-api.socket.dev]. No clap default, matching
+    /// `api_url` — resolution happens in `get_api_client_with_overrides`.
+    #[arg(long = "proxy-url", env = "SOCKET_PROXY_URL")]
+    pub proxy_url: Option<String>,
 
     /// Restrict to these ecosystems (comma-separated). Names that are not
     /// supported ecosystems are rejected.
@@ -314,20 +311,18 @@ impl GlobalArgs {
 
     /// Build [`ApiClientEnvOverrides`] from the CLI flags.
     ///
-    /// `api_token` and `org` are forwarded as `Some(_)` only when set.
-    /// `api_url` and `proxy_url` are forwarded only when non-empty;
-    /// `GlobalArgs::default()` leaves both empty so integration tests
-    /// that mutate env vars *after* constructing args still get env-var
-    /// resolution from `get_api_client_with_overrides`. In production
-    /// clap always populates them with either the CLI value, the env
-    /// value, or the clap-declared default — all non-empty — so the
-    /// resolved value still flows through.
+    /// Every field is forwarded as `Some(_)` only when set and non-empty.
+    /// `None` (no flag, no env var — the fields carry no clap default)
+    /// defers resolution to `get_api_client_with_overrides`, which falls
+    /// through env vars and the socket-cli config file to the built-in
+    /// defaults. The empty filter keeps `--api-url ""` meaning "unset"
+    /// rather than forwarding a blank override.
     pub fn api_client_overrides(&self) -> ApiClientEnvOverrides {
         ApiClientEnvOverrides {
-            api_url: Some(self.api_url.clone()).filter(|s| !s.is_empty()),
+            api_url: self.api_url.clone().filter(|s| !s.is_empty()),
             api_token: self.api_token.clone().filter(|s| !s.is_empty()),
             org_slug: self.org.clone().filter(|s| !s.is_empty()),
-            proxy_url: Some(self.proxy_url.clone()).filter(|s| !s.is_empty()),
+            proxy_url: self.proxy_url.clone().filter(|s| !s.is_empty()),
         }
     }
 }
@@ -442,21 +437,20 @@ impl Default for GlobalArgs {
     /// when neither CLI flag nor env var is set), so this `Default` is
     /// only reached from tests building `GlobalArgs` directly.
     ///
-    /// `api_url` and `proxy_url` are intentionally **empty** here (not
-    /// the production default URLs). That lets tests set
-    /// `SOCKET_API_URL` / `SOCKET_PROXY_URL` via `std::env::set_var`
-    /// *after* constructing the args struct and have those env vars
-    /// flow through to the API client — `api_client_overrides` skips
-    /// empty values so the underlying `get_api_client_with_overrides`
-    /// falls back to env-var resolution.
+    /// `api_url` and `proxy_url` are `None` here (not the production
+    /// default URLs). That lets tests set `SOCKET_API_URL` /
+    /// `SOCKET_PROXY_URL` via `std::env::set_var` *after* constructing
+    /// the args struct and have those env vars flow through to the API
+    /// client — `api_client_overrides` forwards `None` so the underlying
+    /// `get_api_client_with_overrides` falls back to env-var resolution.
     fn default() -> Self {
         Self {
             cwd: PathBuf::from("."),
             manifest_path: DEFAULT_PATCH_MANIFEST_PATH.to_string(),
-            api_url: String::new(),
+            api_url: None,
             api_token: None,
             org: None,
-            proxy_url: String::new(),
+            proxy_url: None,
             ecosystems: None,
             download_mode: "diff".to_string(),
             vendor_source: "auto".to_string(),
@@ -836,10 +830,10 @@ mod tests {
     #[test]
     fn api_client_overrides_forwards_set_values() {
         let args = GlobalArgs {
-            api_url: "https://api.example.com".to_string(),
+            api_url: Some("https://api.example.com".to_string()),
             api_token: Some("tok123".to_string()),
             org: Some("acme".to_string()),
-            proxy_url: "https://proxy.example.com".to_string(),
+            proxy_url: Some("https://proxy.example.com".to_string()),
             ..GlobalArgs::default()
         };
         let o = args.api_client_overrides();
@@ -849,8 +843,8 @@ mod tests {
         assert_eq!(o.proxy_url.as_deref(), Some("https://proxy.example.com"));
     }
 
-    /// `GlobalArgs::default()` leaves `api_url`/`proxy_url` empty and the
-    /// optional fields `None`, so every override must come back `None` —
+    /// `GlobalArgs::default()` leaves every field `None`,
+    /// so every override must come back `None` —
     /// this is what lets integration tests set `SOCKET_*` env vars *after*
     /// constructing args and still have env-var resolution win downstream.
     #[test]
@@ -870,10 +864,10 @@ mod tests {
     #[test]
     fn api_client_overrides_filters_empty_strings() {
         let args = GlobalArgs {
-            api_url: String::new(),
+            api_url: Some(String::new()),
             api_token: Some(String::new()),
             org: Some(String::new()),
-            proxy_url: String::new(),
+            proxy_url: Some(String::new()),
             ..GlobalArgs::default()
         };
         let o = args.api_client_overrides();

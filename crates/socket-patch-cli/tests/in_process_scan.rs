@@ -206,7 +206,7 @@ async fn scan_empty_project_json() {
     let tmp = tempfile::tempdir().unwrap();
     write_root_package_json(tmp.path());
     let mut args = default_args(tmp.path());
-    args.common.api_url = server.uri();
+    args.common.api_url = Some(server.uri());
 
     assert_eq!(run_scrubbed(args).await, 0);
     // An empty project crawls zero packages, so the batch API must never
@@ -230,7 +230,7 @@ async fn scan_installed_package_discovers_patch() {
     write_root_package_json(tmp.path());
     write_npm_package(tmp.path(), "in-proc-scan", "1.0.0");
     let mut args = default_args(tmp.path());
-    args.common.api_url = server.uri();
+    args.common.api_url = Some(server.uri());
 
     assert_eq!(run_scrubbed(args).await, 0);
     // The installed package must actually be discovered by the crawler and
@@ -261,7 +261,7 @@ async fn scan_apply_dry_run_does_not_write() {
     write_root_package_json(tmp.path());
     write_npm_package(tmp.path(), "in-proc-scan", "1.0.0");
     let mut args = default_args(tmp.path());
-    args.common.api_url = server.uri();
+    args.common.api_url = Some(server.uri());
     args.apply = true;
     args.common.dry_run = true;
 
@@ -299,7 +299,7 @@ async fn scan_apply_wet_writes_manifest_and_blob() {
     write_root_package_json(tmp.path());
     write_npm_package(tmp.path(), "in-proc-scan", "1.0.0");
     let mut args = default_args(tmp.path());
-    args.common.api_url = server.uri();
+    args.common.api_url = Some(server.uri());
     args.apply = true;
 
     let code = run_scrubbed(args).await;
@@ -374,7 +374,7 @@ async fn scan_prune_only_dry_run_reports_orphans() {
     .unwrap();
 
     let mut args = default_args(tmp.path());
-    args.common.api_url = server.uri();
+    args.common.api_url = Some(server.uri());
     args.prune = true;
     args.common.dry_run = true;
 
@@ -432,7 +432,7 @@ async fn scan_prune_only_wet_removes_orphans() {
     .unwrap();
 
     let mut args = default_args(tmp.path());
-    args.common.api_url = server.uri();
+    args.common.api_url = Some(server.uri());
     args.prune = true;
 
     assert_eq!(run_scrubbed(args).await, 0);
@@ -470,7 +470,7 @@ async fn scan_sync_full_cycle_against_clean_project() {
     write_root_package_json(tmp.path());
     write_npm_package(tmp.path(), "in-proc-scan", "1.0.0");
     let mut args = default_args(tmp.path());
-    args.common.api_url = server.uri();
+    args.common.api_url = Some(server.uri());
     args.sync = true;
 
     let code = run_scrubbed(args).await;
@@ -517,7 +517,7 @@ async fn scan_small_batch_size_chunks_requests() {
     write_npm_package(tmp.path(), "pkg-c", "3.0.0");
 
     let mut args = default_args(tmp.path());
-    args.common.api_url = server.uri();
+    args.common.api_url = Some(server.uri());
     args.batch_size = 1; // force 3 separate API calls
     assert_eq!(run_scrubbed(args).await, 0);
     // The whole point of this test: batch_size=1 over 3 discovered packages
@@ -571,7 +571,7 @@ async fn scan_ecosystems_filter_excludes_others() {
     write_npm_package(tmp.path(), "npm-pkg", "1.0.0");
 
     let mut args = default_args(tmp.path());
-    args.common.api_url = server.uri();
+    args.common.api_url = Some(server.uri());
     args.common.ecosystems = Some(vec!["pypi".to_string()]);
     assert_eq!(run_scrubbed(args).await, 0);
     // The npm package must be filtered out by `--ecosystems pypi`. With no
@@ -603,7 +603,7 @@ async fn scan_non_json_with_patches_prints_table() {
     write_root_package_json(tmp.path());
     write_npm_package(tmp.path(), "in-proc-scan", "1.0.0");
     let mut args = default_args(tmp.path());
-    args.common.api_url = server.uri();
+    args.common.api_url = Some(server.uri());
     args.common.json = false;
 
     let code = run_scrubbed(args).await;
@@ -637,7 +637,7 @@ async fn scan_non_json_empty_project_friendly_message() {
     let tmp = tempfile::tempdir().unwrap();
     write_root_package_json(tmp.path());
     let mut args = default_args(tmp.path());
-    args.common.api_url = server.uri();
+    args.common.api_url = Some(server.uri());
     args.common.json = false;
 
     assert_eq!(run_scrubbed(args).await, 0);
@@ -682,7 +682,7 @@ async fn scan_api_500_does_not_panic() {
     write_root_package_json(tmp.path());
     write_npm_package(tmp.path(), "in-proc-scan", "1.0.0");
     let mut args = default_args(tmp.path());
-    args.common.api_url = server.uri();
+    args.common.api_url = Some(server.uri());
 
     let code = run_scrubbed(args).await;
 
@@ -715,7 +715,7 @@ async fn scan_unreachable_api_does_not_panic() {
     write_root_package_json(tmp.path());
     write_npm_package(tmp.path(), "in-proc-scan", "1.0.0");
     let mut args = default_args(tmp.path());
-    args.common.api_url = "http://127.0.0.1:1".to_string();
+    args.common.api_url = Some("http://127.0.0.1:1".to_string());
 
     let code = run_scrubbed(args).await;
 
@@ -755,7 +755,7 @@ async fn scan_apply_all_detail_queries_failed_is_an_error() {
     write_root_package_json(tmp.path());
     write_npm_package(tmp.path(), "in-proc-scan", "1.0.0");
     let mut args = default_args(tmp.path());
-    args.common.api_url = server.uri();
+    args.common.api_url = Some(server.uri());
     args.apply = true;
 
     let code = run_scrubbed(args).await;
@@ -790,7 +790,7 @@ async fn scan_batch_size_zero_does_not_panic() {
     write_root_package_json(tmp.path());
     write_npm_package(tmp.path(), "in-proc-scan", "1.0.0");
     let mut args = default_args(tmp.path());
-    args.common.api_url = server.uri();
+    args.common.api_url = Some(server.uri());
     args.batch_size = 0;
 
     // No panic, and the discovered package still reaches the batch endpoint
@@ -866,7 +866,7 @@ async fn scan_prune_with_ecosystem_filter_keeps_other_ecosystem() {
     .unwrap();
 
     let mut args = default_args(tmp.path());
-    args.common.api_url = server.uri();
+    args.common.api_url = Some(server.uri());
     args.common.ecosystems = Some(vec!["npm".to_string()]);
     args.prune = true;
 
@@ -925,7 +925,7 @@ async fn scan_ignores_ambient_virtual_env() {
     let tmp = tempfile::tempdir().unwrap();
     write_root_package_json(tmp.path());
     let mut args = default_args(tmp.path());
-    args.common.api_url = server.uri();
+    args.common.api_url = Some(server.uri());
 
     std::env::set_var("VIRTUAL_ENV", decoy.path());
     let code = run_scrubbed(args).await;
@@ -979,7 +979,7 @@ async fn scan_non_json_dry_run_does_not_mutate() {
     let before = std::fs::read_to_string(socket.join("manifest.json")).unwrap();
 
     let mut args = default_args(tmp.path());
-    args.common.api_url = server.uri();
+    args.common.api_url = Some(server.uri());
     args.common.json = false; // interactive path
     args.prune = true;
     args.common.dry_run = true;

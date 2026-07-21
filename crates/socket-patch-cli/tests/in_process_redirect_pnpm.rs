@@ -34,7 +34,7 @@ fn hosted_args(cwd: &Path, api_url: String) -> ScanArgs {
             cwd: cwd.to_path_buf(),
             org: Some(ORG.to_string()),
             api_token: Some("fake".to_string()),
-            api_url,
+            api_url: Some(api_url),
             json: true,
             yes: true,
             ..socket_patch_cli::args::GlobalArgs::default()

@@ -83,7 +83,7 @@ fn get_args(identifier: &str, cwd: &Path, api_url: String) -> GetArgs {
             cwd: cwd.to_path_buf(),
             yes: true,
             api_token: Some("fake-token-for-tests".to_string()),
-            api_url,
+            api_url: Some(api_url),
             json: true,
             no_telemetry: true,
             download_mode: "diff".to_string(),

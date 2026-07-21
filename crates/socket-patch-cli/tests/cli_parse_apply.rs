@@ -88,11 +88,13 @@ fn defaults_match_contract() {
     // The remaining global defaults from the contract table. These were
     // previously unpinned, which let a dangerous default-value drift slip
     // through silently — e.g. `--break-lock` defaulting to `true` would make
-    // `apply` steal a live lock, or the API/proxy URLs silently retargeting.
-    assert_eq!(a.common.api_url, "https://api.socket.dev");
+    // `apply` steal a live lock. The API/proxy URLs parse to `None` (no clap
+    // default) — the documented production URLs are applied by
+    // `get_api_client_with_overrides` after env + socket-cli config fallback.
+    assert_eq!(a.common.api_url, None);
     assert_eq!(a.common.api_token, None);
     assert_eq!(a.common.org, None);
-    assert_eq!(a.common.proxy_url, "https://patches-api.socket.dev");
+    assert_eq!(a.common.proxy_url, None);
     assert!(!a.common.yes);
     assert!(!a.common.debug);
     assert!(!a.common.no_telemetry);
@@ -413,8 +415,9 @@ fn api_url_long() {
     assert_eq!(
         parse_apply(&["--api-url", "https://api.example.test"])
             .common
-            .api_url,
-        "https://api.example.test"
+            .api_url
+            .as_deref(),
+        Some("https://api.example.test")
     );
 }
 
@@ -434,8 +437,9 @@ fn proxy_url_long() {
     assert_eq!(
         parse_apply(&["--proxy-url", "https://proxy.example.test"])
             .common
-            .proxy_url,
-        "https://proxy.example.test"
+            .proxy_url
+            .as_deref(),
+        Some("https://proxy.example.test")
     );
 }
 

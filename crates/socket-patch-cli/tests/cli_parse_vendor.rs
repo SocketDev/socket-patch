@@ -157,10 +157,10 @@ fn parse_vendor_with_env(env: &[(&str, &str)], extra: &[&str]) -> Result<VendorA
 struct Snap {
     cwd: PathBuf,
     manifest_path: String,
-    api_url: String,
+    api_url: Option<String>,
     api_token: Option<String>,
     org: Option<String>,
-    proxy_url: String,
+    proxy_url: Option<String>,
     ecosystems: Option<Vec<String>>,
     download_mode: String,
     offline: bool,
@@ -228,10 +228,10 @@ fn expected_defaults() -> Snap {
     Snap {
         cwd: PathBuf::from("."),
         manifest_path: ".socket/manifest.json".to_string(),
-        api_url: "https://api.socket.dev".to_string(),
+        api_url: None, // no clap default — resolved in core
         api_token: None,
         org: None,
-        proxy_url: "https://patches-api.socket.dev".to_string(),
+        proxy_url: None, // no clap default — resolved in core
         ecosystems: None,
         download_mode: "diff".to_string(),
         offline: false,

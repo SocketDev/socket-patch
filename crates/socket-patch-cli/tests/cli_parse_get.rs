@@ -126,10 +126,10 @@ struct Snap {
     identifier: String,
     cwd: PathBuf,
     manifest_path: String,
-    api_url: String,
+    api_url: Option<String>,
     api_token: Option<String>,
     org: Option<String>,
-    proxy_url: String,
+    proxy_url: Option<String>,
     ecosystems: Option<Vec<String>>,
     download_mode: String,
     vendor_source: String,
@@ -206,10 +206,10 @@ fn expected_defaults(identifier: &str) -> Snap {
         identifier: identifier.to_string(),
         cwd: PathBuf::from("."),
         manifest_path: ".socket/manifest.json".to_string(),
-        api_url: "https://api.socket.dev".to_string(),
+        api_url: None, // no clap default — resolved in core
         api_token: None,
         org: None,
-        proxy_url: "https://patches-api.socket.dev".to_string(),
+        proxy_url: None, // no clap default — resolved in core
         ecosystems: None,
         download_mode: "diff".to_string(),
         vendor_source: "auto".to_string(),
@@ -388,7 +388,7 @@ fn ghsa_flag_sets_ghsa() {
 fn api_url_flag_sets_api_url() {
     let a = parse_get(&["some-id", "--api-url", "https://api.example.com"]);
     let mut want = expected_defaults("some-id");
-    want.api_url = "https://api.example.com".to_string();
+    want.api_url = Some("https://api.example.com".to_string());
     assert_eq!(snapshot(&a), want);
 }
 
