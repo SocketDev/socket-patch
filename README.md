@@ -83,11 +83,12 @@ The full list of prebuilt targets (Windows, 32-bit ARM, i686, Android) is in
 
 ## Five-minute tutorial
 
-No account or token is needed to follow along — without an API token the CLI talks to
-Socket's public patch proxy, which serves the free tier of patches anonymously. (An API
-token unlocks your organization's patch tier; if you've already run `socket login` with
-the [Socket CLI](https://docs.socket.dev/docs/socket-cli), socket-patch picks it up
-automatically — see [Configuration sources](#configuration-sources).)
+No account or token is needed to follow along — without an API token `socket-patch`
+talks to Socket's public patch proxy, which serves the free tier of patches anonymously.
+(An API token unlocks your organization's patch tier; if you've already run
+`socket login` with the separate [Socket CLI](https://docs.socket.dev/docs/socket-cli),
+`socket-patch` picks it up automatically — see
+[Configuration sources](#configuration-sources).)
 
 **1. Scan your project.** From your project root, ask Socket which of your installed
 dependencies have patches available:
@@ -105,7 +106,11 @@ the edit.
 
 > If it prints `No patches available for installed packages.`, none of your installed
 > dependency versions currently has a Socket patch — the good outcome, with nothing to
-> apply. To walk the rest of the loop anyway, make a scratch project pinned to a version
+> apply. (One exception: Maven and NuGet installed-package discovery is experimental and
+> off by default — `scan` silently skips them unless `SOCKET_EXPERIMENTAL_MAVEN=1` /
+> `SOCKET_EXPERIMENTAL_NUGET=1` is set; see the
+> [mode × ecosystem matrix](docs/ecosystems.md#mode--ecosystem-matrix).)
+> To walk the rest of the loop anyway, make a scratch project pinned to a version
 > that has a free patch — at the time of writing, `flatted@3.3.1`:
 >
 > ```bash
@@ -154,11 +159,11 @@ deletes the manifest entry):
 socket-patch remove "pkg:npm/flatted@3.3.1"
 ```
 
-That's the whole loop: **scan → apply when prompted → setup → commit**. This tutorial used the default
-*agent* mode, where the CLI re-applies patches after each install. There are two other
-ways to persist patches — committing the patched packages themselves (*vendored*) or
-pinning them in your lockfile (*hosted*) — and choosing between the three is the next
-section.
+That's the whole loop: **scan → apply when prompted → setup → commit**. This tutorial
+used the default *agent* mode, where the CLI re-applies patches after each install.
+There are two other ways to persist patches — committing the patched packages themselves
+(*vendored*) or pinning them in your lockfile (*hosted*) — and choosing between the
+three is the next section.
 
 ## How Socket Patch works
 
@@ -170,9 +175,9 @@ content matches neither the expected original nor the patched result is overwrit
 the full verified patched content plus a stderr warning (`content_mismatch_overwritten`);
 pass `--strict` (a [global option](#global-options)) to fail closed on mismatch instead,
 or `apply --force` to skip pre-application hash verification entirely (see
-[`apply`](#apply)). Either way the CLI verifies the result after writing. Patches are looked up by package URL
-([PURL](https://github.com/package-url/purl-spec)) — e.g. `pkg:npm/lodash@4.17.20` — so
-everything is keyed to exact versions.
+[`apply`](#apply)). Either way the CLI verifies the result after writing. Patches are
+looked up by package URL ([PURL](https://github.com/package-url/purl-spec)) — e.g.
+`pkg:npm/lodash@4.17.20` — so everything is keyed to exact versions.
 
 **Local state lives in `.socket/`** at your project root, and is designed to be
 committed:
@@ -277,7 +282,8 @@ socket-patch scan --json --mode agent --prune --yes
 The working-tree changes (the `.socket/` directory — plus lockfile edits if your bot
 runs `--mode vendored` or `--mode hosted`) are what your PR tooling commits — e.g.
 `peter-evans/create-pull-request` picks them up automatically; use the JSON summary for
-the PR title/body. See [Scripting & CI/CD](#scripting--cicd).
+the PR title/body. See [Scripting & CI/CD](#scripting--cicd), including how to supply
+`SOCKET_API_TOKEN` for org-tier patches.
 
 ### Tell your vulnerability scanner about the patches
 
@@ -350,42 +356,14 @@ These flags are accepted by **every** subcommand and go after the command name �
 Each flag has a matching `SOCKET_*` environment variable, listed in the table;
 command-specific flags list theirs in each command's own table. **Precedence is CLI arg
 > env var > default** — with one extra fallback layer for the three authentication
-settings, described next.
-
-### Configuration sources
-
-For the three authentication settings, the [Socket CLI](https://docs.socket.dev/docs/socket-cli)'s
-persisted login sits between the env var and the built-in default — run `socket login`
-(or `socket config set apiToken` / `defaultOrg`) once and socket-patch picks it up too.
-Resolution is per key, and an empty value means "unset" at every layer:
-
-```
---api-token / --org / --api-url
-  1. CLI flag
-  2. Env var           SOCKET_API_TOKEN / SOCKET_ORG_SLUG / SOCKET_API_URL
-  3. Peer alias env    SOCKET_CLI_API_TOKEN / SOCKET_CLI_ORG_SLUG / SOCKET_CLI_API_BASE_URL
-  4. socket-cli config <data dir>/socket/settings/config.json — read-only
-                       (Linux: ~/.local/share; macOS: ~/Library/Application Support
-                        then legacy ~/.local/share, both after $XDG_DATA_HOME;
-                        Windows: %LOCALAPPDATA%)
-  5. Built-in default  no token → public proxy; org → auto-resolve; https://api.socket.dev
-```
-
-Two env-only toggles adjust this: `SOCKET_NO_API_TOKEN=1` ignores ambient tokens (env +
-config; an explicit `--api-token` still wins) — useful to force the anonymous public
-proxy in CI or a test run — and `SOCKET_NO_CONFIG=1` disables the config-file layer
-entirely. socket-patch never *writes* the config file, and a corrupt one only produces a
-stderr warning — it never breaks a command or pollutes `--json` output. socket-patch
-does **not** read `.env` files or any per-repository config for endpoints or
-credentials: a cloned repo must never be able to redirect where patches come from or
-spend your token. (Full rationale: [docs/design/configuration.md](docs/design/configuration.md).)
+settings, described in [Configuration sources](#configuration-sources) below.
 
 | Flag | Env var | Description |
 |------|---------|-------------|
 | `--cwd <dir>` | `SOCKET_CWD` | Working directory (default: `.`). The manifest path is resolved relative to this. |
 | `--manifest-path <path>` | `SOCKET_MANIFEST_PATH` | Path to the patch manifest, resolved relative to `--cwd` (default: `.socket/manifest.json`). |
 | `--api-url <url>` | `SOCKET_API_URL` | Socket API URL for the authenticated endpoint (default: `https://api.socket.dev`). |
-| `--api-token <token>` | `SOCKET_API_TOKEN` | Socket API token — optional. The easiest setup is `socket login` with the [Socket CLI](https://docs.socket.dev/docs/socket-cli) (see [Configuration sources](#configuration-sources)); to set it directly, create a token in the [Socket dashboard](https://socket.dev) under your organization's API tokens settings and use the raw token (`sktsec_<...>_api`) shown at generation time, **not** the `sha512-...` display hash. When no token resolves from any source, the anonymous public patch proxy is used (free patches). |
+| `--api-token <token>` | `SOCKET_API_TOKEN` | Socket API token — optional. When no token resolves from any source, the anonymous public patch proxy is used (free patches). See [Configuration sources](#configuration-sources) for how to obtain and persist one. |
 | `-o, --org <slug>` | `SOCKET_ORG_SLUG` | Organization slug. Auto-resolved when omitted and a token is set. |
 | `--proxy-url <url>` | `SOCKET_PROXY_URL` | Public proxy URL used when no API token is set (default: `https://patches-api.socket.dev`). |
 | `-e, --ecosystems <list>` | `SOCKET_ECOSYSTEMS` | Restrict to specific ecosystems (comma-separated, e.g. `npm,pypi`). Unknown names are rejected. |
@@ -405,6 +383,42 @@ spend your token. (Full rationale: [docs/design/configuration.md](docs/design/co
 | `--lock-timeout <secs>` | `SOCKET_LOCK_TIMEOUT` | Seconds to wait for `.socket/apply.lock` before giving up. `0`/unset = a single non-blocking try; a positive value retries with backoff. Only meaningful for mutating commands (`apply`, `rollback`, `repair`, `remove`). |
 | `--debug` | `SOCKET_DEBUG` | Emit verbose debug logs to stderr. |
 | `--no-telemetry` | `SOCKET_TELEMETRY_DISABLED` | Disable anonymous usage telemetry. |
+
+#### Configuration sources
+
+For the three authentication settings, the [Socket CLI](https://docs.socket.dev/docs/socket-cli)'s
+persisted login sits between the env var and the built-in default — run `socket login`
+(or `socket config set apiToken` / `defaultOrg`) once and `socket-patch` picks it up
+too. The `SOCKET_CLI_*` env vars the JS CLI reads are honored as peer aliases as well,
+so one export configures both tools. To set a token directly instead, create one in the
+[Socket dashboard](https://socket.dev) under your organization's API tokens settings and
+use the raw token (`sktsec_<...>_api`) shown at generation time, **not** the
+`sha512-...` display hash. Resolution is per key, and an empty value means "unset" at
+every layer:
+
+```
+--api-token / --org / --api-url
+  1. CLI flag
+  2. Env var           SOCKET_API_TOKEN / SOCKET_ORG_SLUG / SOCKET_API_URL — or the
+                       SOCKET_CLI_* peer aliases (SOCKET_CLI_API_TOKEN /
+                       SOCKET_CLI_ORG_SLUG / SOCKET_CLI_API_BASE_URL); the
+                       canonical name wins when both are set
+  3. socket-cli config <data dir>/socket/settings/config.json — read-only
+                       (Linux: $XDG_DATA_HOME, else ~/.local/share;
+                        macOS: $XDG_DATA_HOME, else ~/Library/Application Support,
+                        then legacy ~/.local/share; Windows: %LOCALAPPDATA%)
+  4. Built-in default  no token → public proxy; org → auto-resolve;
+                       url → https://api.socket.dev
+```
+
+Two env-only toggles adjust this. `SOCKET_NO_API_TOKEN=1` ignores ambient tokens (env +
+config; an explicit `--api-token` still wins) — useful to force the anonymous public
+proxy in CI or a test run. `SOCKET_NO_CONFIG=1` disables the config-file layer entirely.
+`socket-patch` never *writes* the config file, and a corrupt one only produces a stderr
+warning — it never breaks a command or pollutes `--json` output. `socket-patch` does
+**not** read `.env` files or any per-repository config for endpoints or credentials: a
+cloned repo must never be able to redirect where patches come from or spend your token.
+(Full rationale: [docs/design/configuration.md](docs/design/configuration.md).)
 
 The sections below list only each command's **command-specific** flags.
 
@@ -1085,7 +1099,14 @@ Contract:
 ## Scripting & CI/CD
 
 All commands support `--json` for machine-readable output. JSON responses always include
-a `"status"` field for easy error detection:
+a `"status"` field for easy error detection.
+
+**Authentication in CI:** a runner has no `socket login` state — if your organization
+has org-tier patches, provide the token as a CI secret via `SOCKET_API_TOKEN` (without
+it, runs silently fall back to the anonymous public proxy and see free patches only, and
+paid-tier blob downloads report `paidRequired`). To deliberately pin a run to the
+anonymous free tier, set `SOCKET_NO_API_TOKEN=1`. See
+[Configuration sources](#configuration-sources).
 
 ```bash
 # Check for available patches in CI (read-only)
