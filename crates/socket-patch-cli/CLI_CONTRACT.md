@@ -387,10 +387,10 @@ per service outcome:
 Coverage today: **npm** (all lock flavors), **pypi** (wheel — sdist falls back / refuses), **cargo**
 (download + extract the `.crate`), **golang** (download + extract the module zip, verify the `h1:`
 dirhash, wire the `replace`), **composer** (download + extract the dist zip), **gem** (download +
-extract the `.gem`, plus a `gem-stub-gemspec` SECOND artifact), and **nuget** (download the prebuilt
-`.nupkg`). **maven** attempts the prebuilt `.jar` download under `auto` but is NOT in the fail-closed
-`service` coverage list — `--vendor-source service` refuses maven purls with
-`vendor_service_unsupported_ecosystem`. The Tier-B ecosystems
+extract the `.gem`, plus a `gem-stub-gemspec` SECOND artifact), **nuget** (download the prebuilt
+`.nupkg`), and **maven** (download the prebuilt `.jar` + the registry pom; in the fail-closed
+`service` coverage list since the `service_mode_gate_admits_maven` fix — PR #117 shipped the backend
+but left maven off `SERVICE_ECOSYSTEMS`). The Tier-B ecosystems
 (cargo/golang/composer/gem) download the patched archive and extract it into the vendor directory —
 the same source tree the local build commits — then run the existing path-dep wiring; their
 build-equivalence is exercised by the toolchain-backed e2e suites (which skip when the package
