@@ -87,7 +87,7 @@ fn run_cmd(
     // dev shell must not vacuously green the count-0 asserts.
     for (key, _) in std::env::vars_os() {
         let name = key.to_string_lossy();
-        if name.starts_with("SOCKET_") {
+        if name.starts_with("SOCKET_") && name != "SOCKET_NO_CONFIG" {
             cmd.env_remove(&key);
         }
     }

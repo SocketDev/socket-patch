@@ -121,7 +121,7 @@ fn defaults_match_contract() {
     assert!(!args.common.yes);
     assert!(!args.common.global);
     assert_eq!(args.common.global_prefix, None);
-    assert_eq!(args.common.api_url, "https://api.socket.dev");
+    assert_eq!(args.common.api_url, None); // default applied in core resolver
     assert_eq!(args.common.api_token, None);
     assert_eq!(args.common.ecosystems, None);
     assert!(
@@ -248,7 +248,7 @@ fn global_prefix_flag() {
 #[serial_test::serial]
 fn api_url_flag() {
     let args = parse_scan(&["--api-url", "https://api"]);
-    assert_eq!(args.common.api_url, "https://api");
+    assert_eq!(args.common.api_url.as_deref(), Some("https://api"));
 }
 
 #[test]

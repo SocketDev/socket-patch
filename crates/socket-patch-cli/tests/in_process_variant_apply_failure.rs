@@ -64,7 +64,8 @@ fn run_apply_scrubbed(args: &[&str]) -> std::process::Output {
         .env_remove("VIRTUAL_ENV");
     for (key, _) in std::env::vars_os() {
         let name = key.to_string_lossy();
-        if name.starts_with("SOCKET_") && !name.contains("TELEMETRY") {
+        if name.starts_with("SOCKET_") && !name.contains("TELEMETRY") && name != "SOCKET_NO_CONFIG"
+        {
             cmd.env_remove(&key);
         }
     }

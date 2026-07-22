@@ -93,6 +93,7 @@ fn run_cli(root: &Path, gomodcache: &Path, args: &[&str]) -> (i32, String, Strin
         .env_remove("SOCKET_DRY_RUN")
         .env_remove("SOCKET_MANIFEST_PATH")
         .env_remove("SOCKET_API_TOKEN")
+        .env_remove("SOCKET_CLI_API_TOKEN")
         .output()
         .expect("failed to execute socket-patch binary");
     (

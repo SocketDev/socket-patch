@@ -540,7 +540,8 @@ async fn ledger_gone_drifted_copy_fails_closed(flavor: Flavor) {
         &["repair", "--download-mode", "file"],
     );
     assert_eq!(
-        code, 1,
+        code,
+        1,
         "{}: a rebuild that cannot match the lockfile's recorded integrity must fail closed: \
          stdout={stdout} stderr={stderr}",
         flavor.tag()

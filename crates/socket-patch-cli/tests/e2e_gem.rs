@@ -67,6 +67,7 @@ fn run(cwd: &Path, args: &[&str]) -> (i32, String, String) {
         .args(args)
         .current_dir(cwd)
         .env_remove("SOCKET_API_TOKEN")
+        .env_remove("SOCKET_CLI_API_TOKEN")
         .output()
         .expect("failed to execute socket-patch binary");
 

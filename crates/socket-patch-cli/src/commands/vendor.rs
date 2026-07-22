@@ -331,8 +331,7 @@ pub async fn run(args: VendorArgs) -> i32 {
                 }
             } else {
                 let params = args.vex.to_build_params();
-                match generate_vex_from_manifest_path(&args.common, &params, &manifest_path).await
-                {
+                match generate_vex_from_manifest_path(&args.common, &params, &manifest_path).await {
                     Ok(summary) => {
                         env.vex = Some(VexSummary {
                             path: vex_path.display().to_string(),

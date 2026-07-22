@@ -584,12 +584,7 @@ fn poetry_2x_without_no_update_falls_back_to_bare_lock() {
     let log = tmp.path().join("poetry-argv.log");
     // Poetry 2.x: `--no-update` was removed (pin-preserving became the
     // default), so that spelling exits non-zero.
-    write_pm_shim(
-        &tmp.path().join("bin"),
-        "poetry",
-        &log,
-        Some("--no-update"),
-    );
+    write_pm_shim(&tmp.path().join("bin"), "poetry", &log, Some("--no-update"));
 
     let (code, v) = run_setup_with_shims(tmp.path(), &tmp.path().join("bin"));
     assert_eq!(code, 0, "setup must succeed: {v}");

@@ -312,8 +312,7 @@ pub async fn vendor_nuget(
                                 .await
                         {
                             result.success = false;
-                            result.error =
-                                Some(format!("failed to rewrite {PACKAGES_LOCK}: {e}"));
+                            result.error = Some(format!("failed to rewrite {PACKAGES_LOCK}: {e}"));
                             return done(result, None, warnings);
                         }
                     }
@@ -2265,9 +2264,7 @@ mod tests {
             edit.new_text
         );
         assert!(
-            vis.contains(
-                "    <packageSource key=\"nuget.org\">\n      <package pattern=\"*\" />"
-            ),
+            vis.contains("    <packageSource key=\"nuget.org\">\n      <package pattern=\"*\" />"),
             "the catch-all must target the seeded active source: {}",
             edit.new_text
         );
@@ -2279,8 +2276,7 @@ mod tests {
     async fn wired_rebuild_reports_vendored_nupkg_path() {
         let (dir, blobs, installed, record) = fixture(true, None).await;
         let root = dir.path();
-        let (r1, _e, _w) =
-            unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        let (r1, _e, _w) = unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
         assert!(r1.success);
         tokio::fs::remove_file(root.join(copy_rel())).await.unwrap();
 
@@ -2323,7 +2319,9 @@ mod tests {
         let (r1, e1, w1) = unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
         assert!(r1.success, "{:?}", r1.error);
         assert!(e1.is_some());
-        assert!(w1.iter().any(|w| w.code == "vendor_nuget_lock_entry_absent"));
+        assert!(w1
+            .iter()
+            .any(|w| w.code == "vendor_nuget_lock_entry_absent"));
 
         let (r2, e2, w2) = unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
         assert!(r2.success, "{:?}", r2.error);
@@ -2345,8 +2343,7 @@ mod tests {
     async fn wired_rerun_with_corrupt_lock_fails() {
         let (dir, blobs, installed, record) = fixture(true, None).await;
         let root = dir.path();
-        let (r1, _e, _w) =
-            unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        let (r1, _e, _w) = unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
         assert!(r1.success);
         // The lock rots after vendoring. The fresh path fails closed on an
         // unparseable lock; the wired rebuild leg must not silently skip the
@@ -2354,10 +2351,12 @@ mod tests {
         tokio::fs::write(root.join(PACKAGES_LOCK), b"{ not json")
             .await
             .unwrap();
-        let (r2, e2, _w2) =
-            unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        let (r2, e2, _w2) = unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
         assert!(e2.is_none());
-        assert!(!r2.success, "a corrupt lock must fail the rerun, not vanish");
+        assert!(
+            !r2.success,
+            "a corrupt lock must fail the rerun, not vanish"
+        );
         assert!(
             r2.error.as_deref().unwrap_or("").contains("unparseable"),
             "{:?}",
@@ -2375,8 +2374,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
         let (dir, blobs, installed, record) = fixture(true, None).await;
         let root = dir.path();
-        let (r1, _e, _w) =
-            unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        let (r1, _e, _w) = unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
         assert!(r1.success);
         tokio::fs::remove_file(root.join(copy_rel())).await.unwrap();
 
@@ -2519,8 +2517,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
         let (dir, blobs, installed, record) = fixture(true, None).await;
         let root = dir.path();
-        let (r1, _e, _w) =
-            unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        let (r1, _e, _w) = unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
         assert!(r1.success);
         tokio::fs::set_permissions(
             root.join(PACKAGES_LOCK),
@@ -2597,7 +2594,11 @@ mod tests {
         let wired = tokio::fs::read_to_string(root.join("nuget.config"))
             .await
             .unwrap();
-        let edited = wired.replacen("</configuration>", "<!-- user note -->\n</configuration>", 1);
+        let edited = wired.replacen(
+            "</configuration>",
+            "<!-- user note -->\n</configuration>",
+            1,
+        );
         assert_ne!(edited, wired);
         tokio::fs::write(root.join("nuget.config"), &edited)
             .await

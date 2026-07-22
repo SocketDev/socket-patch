@@ -73,6 +73,7 @@ async fn run(args: &[&str], cwd: &Path, m2_repo: &Path, proxy_url: &str) -> Outp
             .env("SOCKET_EXPERIMENTAL_MAVEN", "1")
             // Keep the run hermetic: no ambient token, no inherited repo path.
             .env_remove("SOCKET_API_TOKEN")
+            .env_remove("SOCKET_CLI_API_TOKEN")
             .env_remove("M2_HOME")
             .env_remove("SOCKET_API_URL")
             .env_remove("SOCKET_OFFLINE")

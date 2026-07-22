@@ -1670,7 +1670,8 @@ async fn commit_pair(
             .map_err(|e| format!("cannot write {PACKAGE_JSON}: {e}"))?;
     }
     if let Some(bytes) = new_lock {
-        if let Err(e) = atomic_write_bytes_preserving_mode(&project_root.join(PNPM_LOCK), bytes).await
+        if let Err(e) =
+            atomic_write_bytes_preserving_mode(&project_root.join(PNPM_LOCK), bytes).await
         {
             if new_pkg.is_some() {
                 // Unwind (best effort): a failure here leaves the desync pair
@@ -3086,7 +3087,9 @@ snapshots:
         assert!(detail.contains("left-pad@1.3.0"), "{detail}");
         assert_eq!(fx.read(PNPM_LOCK).await, lock, "lock untouched");
         assert!(
-            !fx.root().join(format!(".socket/vendor/npm/{UUID}")).exists(),
+            !fx.root()
+                .join(format!(".socket/vendor/npm/{UUID}"))
+                .exists(),
             "refusal stages no artifact"
         );
     }

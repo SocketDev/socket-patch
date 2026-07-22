@@ -63,6 +63,7 @@ async fn run(args: &[&str], cwd: &Path, proxy_url: &str) -> Output {
             .current_dir(&cwd)
             .env("CARGO_HOME", cwd.join(".cargo"))
             .env_remove("SOCKET_API_TOKEN")
+            .env_remove("SOCKET_CLI_API_TOKEN")
             .env_remove("SOCKET_API_URL")
             .env_remove("SOCKET_OFFLINE")
             .env_remove("SOCKET_PROXY_URL")

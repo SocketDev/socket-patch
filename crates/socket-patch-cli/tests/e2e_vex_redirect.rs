@@ -40,7 +40,7 @@ fn binary() -> &'static str {
 fn cli() -> Command {
     let mut cmd = Command::new(binary());
     for (key, _) in std::env::vars() {
-        if key.starts_with("SOCKET_") {
+        if key.starts_with("SOCKET_") && key != "SOCKET_NO_CONFIG" {
             cmd.env_remove(key);
         }
     }

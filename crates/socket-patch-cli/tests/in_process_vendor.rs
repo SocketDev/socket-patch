@@ -219,7 +219,7 @@ fn run_cli(cwd: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> (i32, Strin
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_socket-patch"));
     cmd.args(args).current_dir(cwd);
     for (key, _) in std::env::vars() {
-        if key.starts_with("SOCKET_") {
+        if key.starts_with("SOCKET_") && key != "SOCKET_NO_CONFIG" {
             cmd.env_remove(key);
         }
     }

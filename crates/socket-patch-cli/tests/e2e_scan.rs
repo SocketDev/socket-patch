@@ -111,7 +111,8 @@ fn run(cwd: &Path, args: &[&str]) -> (i32, String, String) {
     // so an opted-out dev stays opted out.
     for (key, _) in std::env::vars_os() {
         let name = key.to_string_lossy();
-        if name.starts_with("SOCKET_") && !name.contains("TELEMETRY") {
+        if name.starts_with("SOCKET_") && !name.contains("TELEMETRY") && name != "SOCKET_NO_CONFIG"
+        {
             cmd.env_remove(&key);
         }
     }

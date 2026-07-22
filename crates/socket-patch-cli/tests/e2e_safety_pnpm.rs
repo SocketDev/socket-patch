@@ -133,6 +133,23 @@ where
     };
     while let Some(Ok(entry)) = entries.next() {
         let p = entry.path();
+        // NEVER follow symlinks out of the store. pnpm ≥ 10.34 records
+        // every project the store has served as a symlink under
+        // `<store>/v10/projects/<hash>` → `../../../proj_a`. Following
+        // it walks back INTO the project tree, where this search finds
+        // proj_a's node_modules copy of index.js — freshly PATCHED —
+        // and misreports it as "the store entry", failing the
+        // store-must-stay-unpatched asserts even though the real CAFS
+        // entry is untouched (whether that happens depends on readdir
+        // order, so it was ubuntu-deterministic but flaky elsewhere).
+        // The store's real content (`files/`, `index/`) contains no
+        // symlinks, so skipping them is lossless.
+        let is_symlink = std::fs::symlink_metadata(&p)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(true);
+        if is_symlink {
+            continue;
+        }
         if let Some(hit) = f(&p) {
             return Some(hit);
         }

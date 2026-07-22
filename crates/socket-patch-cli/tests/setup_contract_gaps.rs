@@ -28,7 +28,7 @@ fn run(cwd: &Path, home: &Path, args: &[&str]) -> (i32, String) {
     let mut cmd = Command::new(binary());
     cmd.args(args).current_dir(cwd);
     for (name, _) in std::env::vars() {
-        if name.starts_with("SOCKET_") {
+        if name.starts_with("SOCKET_") && name != "SOCKET_NO_CONFIG" {
             cmd.env_remove(name);
         }
     }

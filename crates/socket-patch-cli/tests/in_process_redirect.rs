@@ -33,7 +33,7 @@ fn redirect_args(cwd: &Path, api_url: String) -> ScanArgs {
             cwd: cwd.to_path_buf(),
             org: Some(ORG.to_string()),
             api_token: Some("fake".to_string()),
-            api_url,
+            api_url: Some(api_url),
             json: true,
             yes: true,
             ..socket_patch_cli::args::GlobalArgs::default()
@@ -933,7 +933,8 @@ fn scrubbed_cli() -> std::process::Command {
         .env_remove("SOCKET_MANIFEST_PATH");
     for (key, _) in std::env::vars_os() {
         let name = key.to_string_lossy();
-        if name.starts_with("SOCKET_") && !name.contains("TELEMETRY") {
+        if name.starts_with("SOCKET_") && !name.contains("TELEMETRY") && name != "SOCKET_NO_CONFIG"
+        {
             cmd.env_remove(&key);
         }
     }

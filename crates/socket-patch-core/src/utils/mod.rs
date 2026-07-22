@@ -5,5 +5,6 @@ pub mod fuzzy_match;
 pub mod process;
 pub mod purl;
 pub(crate) mod serde;
+pub mod socket_cli_config;
 pub mod telemetry;
 pub mod uri;

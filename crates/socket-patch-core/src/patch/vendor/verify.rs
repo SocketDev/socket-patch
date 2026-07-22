@@ -616,17 +616,23 @@ mod tests {
         let eocd = bytes.len() - 22;
         assert_eq!(&bytes[eocd..eocd + 4], b"PK\x05\x06", "EOCD not found");
         let cd_count = u16::from_le_bytes([bytes[eocd + 10], bytes[eocd + 11]]) as usize;
-        let mut off =
-            u32::from_le_bytes(bytes[eocd + 16..eocd + 20].try_into().unwrap()) as usize;
+        let mut off = u32::from_le_bytes(bytes[eocd + 16..eocd + 20].try_into().unwrap()) as usize;
         for _ in 0..cd_count {
-            assert_eq!(&bytes[off..off + 4], b"PK\x01\x02", "central header not found");
+            assert_eq!(
+                &bytes[off..off + 4],
+                b"PK\x01\x02",
+                "central header not found"
+            );
             let name_len = u16::from_le_bytes([bytes[off + 28], bytes[off + 29]]) as usize;
             let extra_len = u16::from_le_bytes([bytes[off + 30], bytes[off + 31]]) as usize;
             let comment_len = u16::from_le_bytes([bytes[off + 32], bytes[off + 33]]) as usize;
-            let lho =
-                u32::from_le_bytes(bytes[off + 42..off + 46].try_into().unwrap()) as usize;
+            let lho = u32::from_le_bytes(bytes[off + 42..off + 46].try_into().unwrap()) as usize;
             bytes[off + 24..off + 28].fill(0);
-            assert_eq!(&bytes[lho..lho + 4], b"PK\x03\x04", "local header not found");
+            assert_eq!(
+                &bytes[lho..lho + 4],
+                b"PK\x03\x04",
+                "local header not found"
+            );
             bytes[lho + 22..lho + 26].fill(0);
             off += 46 + name_len + extra_len + comment_len;
         }

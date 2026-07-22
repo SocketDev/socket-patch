@@ -220,7 +220,7 @@ fn scan_args(cwd: &Path, api_url: String, all_releases: bool) -> ScanArgs {
             yes: true,
             global: false,
             global_prefix: None,
-            api_url,
+            api_url: Some(api_url),
             api_token: Some("fake".to_string()),
             ecosystems: Some(vec!["gem".to_string()]),
             download_mode: "diff".to_string(),
@@ -477,7 +477,7 @@ async fn remove_base_purl_clears_all_platforms_and_rolls_back() {
         common: socket_patch_cli::args::GlobalArgs {
             cwd: tmp.path().to_path_buf(),
             org: Some(ORG.to_string()),
-            api_url: server.uri(),
+            api_url: Some(server.uri()),
             api_token: Some("fake".to_string()),
             json: true,
             yes: true,
@@ -520,7 +520,7 @@ async fn rollback_all_over_broad_manifest_succeeds() {
         common: socket_patch_cli::args::GlobalArgs {
             cwd: tmp.path().to_path_buf(),
             org: Some(ORG.to_string()),
-            api_url: server.uri(),
+            api_url: Some(server.uri()),
             api_token: Some("fake".to_string()),
             json: true,
             ecosystems: Some(vec!["gem".to_string()]),
