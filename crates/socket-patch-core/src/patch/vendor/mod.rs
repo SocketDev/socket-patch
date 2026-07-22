@@ -730,11 +730,9 @@ mod staging_tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("index.js"), b"whatever").unwrap();
         let record = one_file_record("index.js");
-        assert!(
-            missing_existing_patch_files(tmp.path(), &record.files)
-                .await
-                .is_empty()
-        );
+        assert!(missing_existing_patch_files(tmp.path(), &record.files)
+            .await
+            .is_empty());
     }
 
     /// End-to-end through the vendor staging entrypoint: without `--force`,

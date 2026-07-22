@@ -69,7 +69,7 @@ fn bun(cwd: &Path, args: &[&str], cache_dir: &Path) -> Output {
 fn scrub_socket_env(cmd: &mut Command) {
     for (k, _) in std::env::vars_os() {
         let k = k.to_string_lossy();
-        if k.starts_with("SOCKET_") {
+        if k.starts_with("SOCKET_") && k != "SOCKET_NO_CONFIG" {
             cmd.env_remove(k.as_ref());
         }
     }

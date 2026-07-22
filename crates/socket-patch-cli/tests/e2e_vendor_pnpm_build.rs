@@ -80,9 +80,10 @@ fn scrub_socket_env(cmd: &mut Command) {
     cmd.env("npm_config_node_linker", "pnp");
     for (k, _) in std::env::vars_os() {
         let key = k.to_string_lossy();
-        if key.starts_with("SOCKET_")
+        if (key.starts_with("SOCKET_")
             || key.starts_with("PNPM_")
-            || key.to_ascii_lowercase().starts_with("npm_config_")
+            || key.to_ascii_lowercase().starts_with("npm_config_"))
+            && key != "SOCKET_NO_CONFIG"
         {
             cmd.env_remove(&k);
         }

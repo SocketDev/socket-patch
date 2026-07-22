@@ -1192,7 +1192,8 @@ async fn read_package_json_rejects_fifo_without_hanging() {
     assert_eq!(direct, None, "a FIFO is not a valid package.json");
 
     let crawler = NpmCrawler;
-    let Ok(crawled) = tokio::time::timeout(deadline, crawler.crawl_all(&options_at(tmp.path()))).await
+    let Ok(crawled) =
+        tokio::time::timeout(deadline, crawler.crawl_all(&options_at(tmp.path()))).await
     else {
         release_and_panic("crawl_all (scan)");
     };

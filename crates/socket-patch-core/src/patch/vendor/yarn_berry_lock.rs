@@ -490,7 +490,9 @@ pub async fn revert_yarn_berry(
                     );
                 }
                 if changed {
-                    if let Err(e) = atomic_write_bytes_preserving_mode(&lock_path, text.as_bytes()).await {
+                    if let Err(e) =
+                        atomic_write_bytes_preserving_mode(&lock_path, text.as_bytes()).await
+                    {
                         return RevertOutcome::failed(format!("cannot write {YARN_LOCK}: {e}"));
                     }
                 }
@@ -534,7 +536,9 @@ pub async fn revert_yarn_berry(
                     let indent = detect_indent(&String::from_utf8_lossy(&bytes));
                     match serialize_json(&pkg, &indent) {
                         Ok(out) => {
-                            if let Err(e) = atomic_write_bytes_preserving_mode(&pkg_path, &out).await {
+                            if let Err(e) =
+                                atomic_write_bytes_preserving_mode(&pkg_path, &out).await
+                            {
                                 return RevertOutcome::failed(format!(
                                     "cannot write {PACKAGE_JSON}: {e}"
                                 ));
@@ -647,7 +651,9 @@ async fn commit_pair(
     atomic_write_bytes_preserving_mode(&pkg_path, new_pkg)
         .await
         .map_err(|e| format!("cannot write {PACKAGE_JSON}: {e}"))?;
-    if let Err(e) = atomic_write_bytes_preserving_mode(&project_root.join(YARN_LOCK), new_lock).await {
+    if let Err(e) =
+        atomic_write_bytes_preserving_mode(&project_root.join(YARN_LOCK), new_lock).await
+    {
         return match atomic_write_bytes_preserving_mode(&pkg_path, orig_pkg).await {
             Ok(()) => Err(format!(
                 "cannot write {YARN_LOCK}: {e} ({PACKAGE_JSON} restored)"

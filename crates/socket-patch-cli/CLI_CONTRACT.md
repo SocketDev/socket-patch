@@ -25,7 +25,7 @@ This document defines the **public surface** of the `socket-patch` binary. Anyth
 
 ## Global arguments
 
-In v3.0 every subcommand accepts the same set of "global" flags via a single shared `GlobalArgs` struct that's `#[command(flatten)]`-ed into each per-command struct (`crates/socket-patch-cli/src/args.rs`). Subcommands that don't actually consume a given flag accept it silently — e.g. `list --global` parses fine and is a no-op. Every flag also has an environment-variable binding; precedence is **CLI arg > env var > default**.
+In v3.0 every subcommand accepts the same set of "global" flags via a single shared `GlobalArgs` struct that's `#[command(flatten)]`-ed into each per-command struct (`crates/socket-patch-cli/src/args.rs`). Subcommands that don't actually consume a given flag accept it silently — e.g. `list --global` parses fine and is a no-op. Every flag also has an environment-variable binding; precedence is **CLI arg > env var > default** — and for exactly three keys (`--api-token`, `--org`, `--api-url`) the JS socket-cli's persisted login sits between env var and default: **CLI arg > env var (canonical, then `SOCKET_CLI_*` alias) > socket-cli `config.json` > default**. See "Persisted configuration" under Environment variables.
 
 | Long | Short | Env var | Default | Type | Semantic |
 |---|---|---|---|---|---|
@@ -598,6 +598,10 @@ worse, lets a warm cache silently serve unpatched bytes):
 
 All v3.0 env vars use the `SOCKET_*` prefix. Three legacy `SOCKET_PATCH_*` names are still honored at runtime for compatibility: on first read of any of the three the binary emits a one-shot deprecation warning to stderr (the warning fires unconditionally — even under `--silent` / `--json` — because it's a transition signal users need to see). The legacy names will be removed in the next major release.
 
+Four `SOCKET_CLI_*` names from the sibling JS Socket CLI are additionally accepted as **peer aliases** (supported, not deprecated — no warning): `SOCKET_CLI_API_TOKEN` → `SOCKET_API_TOKEN`, `SOCKET_CLI_ORG_SLUG` → `SOCKET_ORG_SLUG`, `SOCKET_CLI_API_BASE_URL` → `SOCKET_API_URL`, `SOCKET_CLI_NO_API_TOKEN` → `SOCKET_NO_API_TOKEN`. The canonical `SOCKET_*` name always wins when both are set; promotion is silent and happens in-process before clap parses. Other socket-cli names (`SOCKET_CLI_CONFIG`, `SOCKET_CLI_API_PROXY`, `SOCKET_CLI_DEBUG`) are deliberately **not** honored.
+
+Empty string means unset at every layer: exported-but-empty flag-bound vars are scrubbed before clap parses, and the API-client resolution filters empty values at each fallback step.
+
 | Env var | CLI equivalent | Default | Notes |
 |---|---|---|---|
 | `SOCKET_CWD` | `--cwd` | `.` | — |
@@ -633,6 +637,42 @@ All v3.0 env vars use the `SOCKET_*` prefix. Three legacy `SOCKET_PATCH_*` names
 | `SOCKET_SETUP_EXCLUDE` | `setup --exclude` | (none) | Local to `setup`; comma-separated workspace-member paths, persisted to `setup.exclude`. |
 | `SOCKET_VEX` | `apply --vex` / `scan --vex` / `vendor --vex` | (none) | Embedded OpenVEX output path. The `SOCKET_VEX_*` knobs (`_PRODUCT`, `_NO_VERIFY`, `_DOC_ID`, `_COMPACT`) are shared with the standalone `vex` command; on the host commands they bind to `--vex-product` etc. |
 | `SOCKET_VEX_OUTPUT` | `vex --output` / `-O` | (none) | Local to the standalone `vex`: document output path (required with `--json`). |
+
+### Config-layer toggles (env-only)
+
+| Env var | Default | Notes |
+|---|---|---|
+| `SOCKET_NO_CONFIG` | `false` | Truthy (`1`/`true`/`yes`/`on`): disable the socket-cli persisted-config fallback layer entirely — pure flag+env behavior. Also the test-hermeticity switch (the workspace `.cargo/config.toml` exports it as `1` for every cargo-run process). |
+| `SOCKET_NO_API_TOKEN` | `false` | Truthy: ignore **ambient** API tokens (the `SOCKET_API_TOKEN` env var and the socket-cli config token); only an explicit `--api-token` flag authenticates. Peer alias: `SOCKET_CLI_NO_API_TOKEN`. |
+
+### Persisted configuration (socket-cli `config.json`)
+
+The binary reads — **never writes** — the JS Socket CLI's persisted config, so a single `socket login` (or `socket config set apiToken/defaultOrg`) configures socket-patch too. The file is `<data dir>/socket/settings/config.json`, a base64-encoded JSON object:
+
+| Platform | Location |
+|---|---|
+| Linux | `$XDG_DATA_HOME` or `~/.local/share`, + `/socket/settings/config.json` |
+| macOS | `$XDG_DATA_HOME` or `~/Library/Application Support`, + `/socket/settings/config.json`; when `$XDG_DATA_HOME` is unset the legacy `~/.local/share` location is probed second (older socket-cli releases wrote the Linux-style path on every platform) |
+| Windows | `%LOCALAPPDATA%` or `%USERPROFILE%\AppData\Local`, + `\socket\settings\config.json` |
+
+Exactly three keys are honored, each slotting **below** the env var and **above** the built-in default for its setting, resolved per key independently:
+
+| Config key | Feeds | Env var above it |
+|---|---|---|
+| `apiToken` | `--api-token` | `SOCKET_API_TOKEN` |
+| `defaultOrg` (alias `org`; `defaultOrg` wins) | `--org` | `SOCKET_ORG_SLUG` |
+| `apiBaseUrl` | `--api-url` | `SOCKET_API_URL` |
+
+Contract properties:
+
+- **Read-only pledge**: socket-patch never creates, modifies, or deletes this file; socket-cli owns it. There is no `socket-patch login`/`config` subcommand — use `socket login`.
+- Other socket-cli keys (`apiProxy`, `enforcedOrgs`, `skipAskToPersistDefaultOrg`) and unknown keys are ignored. Non-string or empty values for the three honored keys count as unset. For an HTTP forward proxy use the standard `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` vars, which the HTTP client honors; socket-cli's `apiProxy` is deliberately not mapped (and is unrelated to `--proxy-url`, which is the public patch *endpoint*).
+- Missing file / unresolvable data dir: silent (the normal case). Present but unreadable or undecodable (not base64(JSON), with a plain-JSON leniency fallback): a one-shot stderr warning naming the path, then treated as absent — never fatal, and `--json` stdout stays clean (all diagnostics are stderr-only).
+- The file is read lazily at most once per process, only when a key is still unresolved after flag + env.
+- The telemetry endpoint resolver shares the same `apiBaseUrl` chain as API-client construction (`resolve_api_base_url`), so telemetry can never target a different host than the client.
+- `--offline` semantics are unchanged: reading the local file is not network contact; a config-sourced token is inert offline.
+- **Repo-level files never carry endpoints, credentials, or interlock-disablers**: configuration for those comes only from flags, env vars, this user-level file, and built-in defaults — never from files inside the repository being patched (manifest, socket.yml, `.env`, …).
+- `--debug` names the source on stderr whenever a setting resolves from the socket-cli config (the token value itself is never echoed).
 
 ### Registry override env vars
 

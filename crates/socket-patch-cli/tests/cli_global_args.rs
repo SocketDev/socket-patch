@@ -56,7 +56,7 @@ fn global_flag_cases() -> Vec<(&'static str, Option<&'static str>, fn(&GlobalArg
             assert_eq!(c.manifest_path, "custom.json")
         }),
         ("--api-url", Some("https://example.com"), |c| {
-            assert_eq!(c.api_url, "https://example.com")
+            assert_eq!(c.api_url.as_deref(), Some("https://example.com"))
         }),
         ("--api-token", Some("tok123"), |c| {
             assert_eq!(c.api_token.as_deref(), Some("tok123"))
@@ -65,7 +65,7 @@ fn global_flag_cases() -> Vec<(&'static str, Option<&'static str>, fn(&GlobalArg
             assert_eq!(c.org.as_deref(), Some("acme"))
         }),
         ("--proxy-url", Some("https://proxy.example.com"), |c| {
-            assert_eq!(c.proxy_url, "https://proxy.example.com")
+            assert_eq!(c.proxy_url.as_deref(), Some("https://proxy.example.com"))
         }),
         ("--ecosystems", Some("npm,pypi"), |c| {
             assert_eq!(
@@ -451,10 +451,16 @@ fn env_vars_populate_global_args() {
     if let socket_patch_cli::Commands::List(args) = cli.command {
         assert_eq!(args.common.cwd, std::path::PathBuf::from("/env/cwd"));
         assert_eq!(args.common.manifest_path, "env-manifest.json");
-        assert_eq!(args.common.api_url, "https://env-api.example.com");
+        assert_eq!(
+            args.common.api_url.as_deref(),
+            Some("https://env-api.example.com")
+        );
         assert_eq!(args.common.api_token.as_deref(), Some("env-token"));
         assert_eq!(args.common.org.as_deref(), Some("env-org"));
-        assert_eq!(args.common.proxy_url, "https://env-proxy.example.com");
+        assert_eq!(
+            args.common.proxy_url.as_deref(),
+            Some("https://env-proxy.example.com")
+        );
         assert_eq!(
             args.common.ecosystems.as_deref(),
             Some(&["npm".to_string(), "gem".to_string()][..])
@@ -822,7 +828,8 @@ fn cli_arg_overrides_env_var() {
         panic!("expected List");
     };
     assert_eq!(
-        args.common.api_url, "https://cli-api.example.com",
+        args.common.api_url.as_deref(),
+        Some("https://cli-api.example.com"),
         "CLI --api-url must override SOCKET_API_URL"
     );
 
@@ -832,7 +839,8 @@ fn cli_arg_overrides_env_var() {
         panic!("expected List");
     };
     assert_eq!(
-        args.common.api_url, "https://env-api.example.com",
+        args.common.api_url.as_deref(),
+        Some("https://env-api.example.com"),
         "with no CLI flag the env var must resolve through"
     );
 
@@ -851,10 +859,11 @@ fn cli_arg_overrides_env_var() {
 }
 
 /// Regression: with neither CLI flags nor env vars set, clap must populate the
-/// documented production defaults (the `default_value = ".."` attributes). This
-/// is the production path that `GlobalArgs::default()` deliberately does *not*
-/// mirror for `api_url`/`proxy_url`, so it needs its own coverage — and
-/// `api_client_overrides()` must therefore forward those concrete URLs.
+/// documented production defaults (the `default_value = ".."` attributes).
+/// `api_url`/`proxy_url` deliberately carry **no** clap default: they parse to
+/// `None` so `get_api_client_with_overrides` can fall through env and the
+/// socket-cli config file before applying the documented production URLs —
+/// `api_client_overrides()` must therefore forward `None` for both.
 #[test]
 #[serial_test::serial]
 fn production_defaults_populate_when_unset() {
@@ -867,8 +876,8 @@ fn production_defaults_populate_when_unset() {
     let c = &args.common;
     assert_eq!(c.cwd, std::path::PathBuf::from("."));
     assert_eq!(c.manifest_path, ".socket/manifest.json");
-    assert_eq!(c.api_url, "https://api.socket.dev");
-    assert_eq!(c.proxy_url, "https://patches-api.socket.dev");
+    assert_eq!(c.api_url, None, "no clap default — resolved in core");
+    assert_eq!(c.proxy_url, None, "no clap default — resolved in core");
     assert_eq!(c.download_mode, "diff");
     assert_eq!(c.vendor_source, "auto");
     assert!(c.vendor_url.is_none());
@@ -882,14 +891,11 @@ fn production_defaults_populate_when_unset() {
     assert!(c.lock_timeout.is_none());
     assert!(c.global_prefix.is_none());
 
-    // On the production path (unlike GlobalArgs::default()) the URLs are
-    // non-empty, so api_client_overrides must forward them.
+    // With no flag and no env var the overrides stay `None`, so the core
+    // resolver (env → socket-cli config → documented default) decides.
     let o = c.api_client_overrides();
-    assert_eq!(o.api_url.as_deref(), Some("https://api.socket.dev"));
-    assert_eq!(
-        o.proxy_url.as_deref(),
-        Some("https://patches-api.socket.dev")
-    );
+    assert!(o.api_url.is_none(), "unset --api-url must not override");
+    assert!(o.proxy_url.is_none(), "unset --proxy-url must not override");
     assert!(o.api_token.is_none());
     assert!(o.org_slug.is_none());
 

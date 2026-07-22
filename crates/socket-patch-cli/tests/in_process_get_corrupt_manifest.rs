@@ -53,10 +53,10 @@ async fn uuid_get_with_corrupt_manifest_fails_without_clobbering() {
         identifier: UUID.to_string(),
         common: GlobalArgs {
             cwd: tmp.path().to_path_buf(),
-            api_url: server.uri(),
+            api_url: Some(server.uri()),
             api_token: Some("fake-token".to_string()),
             org: Some(ORG.to_string()),
-            proxy_url: server.uri(),
+            proxy_url: Some(server.uri()),
             json: true,
             no_telemetry: true,
             ..GlobalArgs::default()

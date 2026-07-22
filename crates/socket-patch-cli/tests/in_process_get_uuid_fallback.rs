@@ -57,10 +57,10 @@ async fn stale_token_uuid_get_falls_back_to_proxy_end_to_end() {
         identifier: UUID.to_string(),
         common: GlobalArgs {
             cwd: tmp.path().to_path_buf(),
-            api_url: server.uri(),
+            api_url: Some(server.uri()),
             api_token: Some("stale-token".to_string()),
             org: Some(ORG.to_string()),
-            proxy_url: server.uri(),
+            proxy_url: Some(server.uri()),
             json: true,
             no_telemetry: true,
             ..GlobalArgs::default()

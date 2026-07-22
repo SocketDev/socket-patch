@@ -43,7 +43,9 @@ fn socket_cmd(cwd: &Path) -> Command {
     let mut cmd = Command::new(binary());
     cmd.current_dir(cwd);
     for (name, _) in std::env::vars_os() {
-        if name.to_string_lossy().starts_with("SOCKET_") {
+        if name.to_string_lossy().starts_with("SOCKET_")
+            && name.to_string_lossy() != "SOCKET_NO_CONFIG"
+        {
             cmd.env_remove(name);
         }
     }
@@ -518,7 +520,10 @@ fn repair_cleanup_failure_is_reported_in_json_and_silent_modes() {
     // informational skip event (warn-and-continue semantics preserved:
     // status stays success, exit stays 0, nothing was removed).
     let (code, stdout) = run_repair(tmp.path(), &[]);
-    assert_eq!(code, 0, "json: cleanup failure stays non-fatal; stdout=\n{stdout}");
+    assert_eq!(
+        code, 0,
+        "json: cleanup failure stays non-fatal; stdout=\n{stdout}"
+    );
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("envelope JSON");
     assert_eq!(v["status"], "success");
     assert_eq!(v["summary"]["removed"], 0);

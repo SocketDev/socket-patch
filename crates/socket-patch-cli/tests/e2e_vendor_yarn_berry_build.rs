@@ -82,7 +82,7 @@ fn scrub_socket_env(cmd: &mut Command) {
     cmd.env("YARN_NODE_LINKER", "pnp");
     for (k, _) in std::env::vars_os() {
         let key = k.to_string_lossy();
-        if key.starts_with("SOCKET_") || key.starts_with("YARN_") {
+        if (key.starts_with("SOCKET_") || key.starts_with("YARN_")) && key != "SOCKET_NO_CONFIG" {
             cmd.env_remove(&k);
         }
     }

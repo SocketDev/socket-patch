@@ -13,3 +13,14 @@ rustflags = ["-C", "link-arg=/STACK:8388608"]
 
 [target.'cfg(all(windows, target_env = "gnu"))']
 rustflags = ["-C", "link-args=-Wl,--stack,8388608"]
+
+# Keep a developer's real `socket login` state out of every test run: the
+# CLI reads the JS socket-cli's persisted config.json as a fallback token
+# source (crates/socket-patch-core/src/utils/socket_cli_config.rs), so an
+# ambient login would silently flip "no token → public proxy" tests onto
+# the authenticated path. Test child processes inherit this from the test
+# binary; the env scrub loops in tests deliberately skip this variable.
+# To exercise the config layer, tests (and manual runs) override it with a
+# falsy value, e.g. `SOCKET_NO_CONFIG=0`.
+[env]
+SOCKET_NO_CONFIG = "1"

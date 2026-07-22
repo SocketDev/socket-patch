@@ -80,7 +80,7 @@ fn default_scan_args(cwd: &Path, eco: &str, api_url: String) -> ScanArgs {
             global: true,
             // bypass per-ecosystem project-marker check
             global_prefix: None,
-            api_url,
+            api_url: Some(api_url),
             api_token: Some("fake".to_string()),
             ecosystems: Some(vec![eco.to_string()]),
             download_mode: "diff".to_string(),

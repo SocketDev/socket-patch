@@ -99,6 +99,7 @@ fn apply_dry_run_empty_manifest_emits_dry_run_envelope() {
         .args(["apply", "--json", "--dry-run"])
         .current_dir(tmp.path())
         .env_remove("SOCKET_API_TOKEN")
+        .env_remove("SOCKET_CLI_API_TOKEN")
         .output()
         .expect("run apply");
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -168,6 +169,7 @@ fn apply_dry_run_with_real_patch_verifies_without_mutating() {
         .args(["apply", "--json", "--dry-run", "--offline"])
         .current_dir(tmp.path())
         .env_remove("SOCKET_API_TOKEN")
+        .env_remove("SOCKET_CLI_API_TOKEN")
         .output()
         .expect("run apply --dry-run");
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -251,6 +253,7 @@ fn apply_dry_run_with_real_patch_verifies_without_mutating() {
         .args(["apply", "--json", "--offline"])
         .current_dir(tmp.path())
         .env_remove("SOCKET_API_TOKEN")
+        .env_remove("SOCKET_CLI_API_TOKEN")
         .output()
         .expect("run apply (real)");
     let stdout2 = String::from_utf8_lossy(&out2.stdout);
@@ -336,6 +339,7 @@ fn apply_dry_run_human_count_excludes_vendored() {
         .args(["apply", "--json", "--dry-run", "--offline"])
         .current_dir(tmp.path())
         .env_remove("SOCKET_API_TOKEN")
+        .env_remove("SOCKET_CLI_API_TOKEN")
         .output()
         .expect("run apply --json --dry-run");
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -366,6 +370,7 @@ fn apply_dry_run_human_count_excludes_vendored() {
         .args(["apply", "--dry-run", "--offline"])
         .current_dir(tmp.path())
         .env_remove("SOCKET_API_TOKEN")
+        .env_remove("SOCKET_CLI_API_TOKEN")
         .output()
         .expect("run apply --dry-run");
     assert_eq!(out.status.code(), Some(0));
@@ -386,6 +391,7 @@ fn repair_dry_run_offline_emits_dry_run_envelope() {
         .args(["repair", "--json", "--dry-run", "--offline"])
         .current_dir(tmp.path())
         .env_remove("SOCKET_API_TOKEN")
+        .env_remove("SOCKET_CLI_API_TOKEN")
         .output()
         .expect("run repair");
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -413,6 +419,7 @@ fn rollback_with_empty_manifest_emits_envelope() {
         .args(["rollback", "--json", "--offline"])
         .current_dir(tmp.path())
         .env_remove("SOCKET_API_TOKEN")
+        .env_remove("SOCKET_CLI_API_TOKEN")
         .output()
         .expect("run rollback");
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -452,6 +459,7 @@ fn remove_with_no_socket_dir_emits_manifest_not_found() {
         ])
         .current_dir(tmp.path())
         .env_remove("SOCKET_API_TOKEN")
+        .env_remove("SOCKET_CLI_API_TOKEN")
         .output()
         .expect("run remove");
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -479,6 +487,7 @@ fn list_with_empty_manifest_emits_empty_envelope() {
         .args(["list", "--json"])
         .current_dir(tmp.path())
         .env_remove("SOCKET_API_TOKEN")
+        .env_remove("SOCKET_CLI_API_TOKEN")
         .output()
         .expect("run list");
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -506,6 +515,7 @@ fn apply_silent_no_manifest_produces_no_output() {
         .args(["apply", "--silent"])
         .current_dir(tmp.path())
         .env_remove("SOCKET_API_TOKEN")
+        .env_remove("SOCKET_CLI_API_TOKEN")
         .output()
         .expect("run apply");
     assert_eq!(out.status.code(), Some(0));

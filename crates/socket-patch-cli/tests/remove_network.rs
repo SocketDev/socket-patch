@@ -108,7 +108,9 @@ fn run_remove(cwd: &Path, api_url: &str, extra: &[&str]) -> (i32, String) {
     // 0, and deleted the entry, failing both tests for the wrong
     // reason. The controlled set must be seeded *after* scrubbing.
     for (key, _) in std::env::vars_os() {
-        if key.to_string_lossy().starts_with("SOCKET_") {
+        if key.to_string_lossy().starts_with("SOCKET_")
+            && key.to_string_lossy() != "SOCKET_NO_CONFIG"
+        {
             cmd.env_remove(&key);
         }
     }

@@ -44,6 +44,23 @@ in this file — see `.github/workflows/release.yml` (`version` job).
 
 ### Added
 
+- **`socket login` now configures socket-patch.** The JS Socket CLI's
+  persisted config (`<data dir>/socket/settings/config.json`) is read —
+  never written — as a fallback layer below env vars for `apiToken`,
+  `defaultOrg`, and `apiBaseUrl`: precedence per key is CLI flag > env var
+  > socket-cli config > built-in default. Four `SOCKET_CLI_*` env names
+  are accepted as silent peer aliases (`SOCKET_CLI_API_TOKEN`,
+  `SOCKET_CLI_ORG_SLUG`, `SOCKET_CLI_API_BASE_URL`,
+  `SOCKET_CLI_NO_API_TOKEN`); the canonical `SOCKET_*` names win. Two new
+  env-only toggles: `SOCKET_NO_API_TOKEN` ignores ambient tokens (env +
+  config; an explicit `--api-token` still authenticates) and
+  `SOCKET_NO_CONFIG` disables the config layer. A corrupt config file
+  warns once on stderr and is ignored; `--json` stdout is unaffected. The
+  telemetry endpoint now resolves the API base through the same chain as
+  client construction, so a config-supplied `apiBaseUrl` applies to both.
+  Design notes: `docs/design/configuration.md`.
+
+
 - **Hosted patch mode: `scan --mode hosted` (a.k.a. the hidden `--redirect`).**
   The third patch-application mode: instead of applying in place (agent) or
   committing artifacts (vendored), `scan` rewrites lockfiles / registry
@@ -272,6 +289,11 @@ in this file — see `.github/workflows/release.yml` (`version` job).
 
 ### Changed
 
+- `--api-url` / `--proxy-url` no longer carry clap-level defaults: with
+  neither flag nor env var set they parse as unset and the documented
+  default URLs are applied at API-client construction (after the
+  socket-cli config layer). Observable behavior is unchanged unless a
+  socket-cli login exists.
 - **All ecosystem feature flags removed — every ecosystem is always compiled
   in.** The `cargo`, `golang`, `maven`, `composer`, `nuget`, and `deno` Cargo
   features are gone from both crates; npm, PyPI, Ruby gems, Go, Cargo, NuGet,

@@ -143,6 +143,24 @@ These flags are accepted by **every** subcommand — they are flattened into eac
 
 Each flag has a matching `SOCKET_*` environment variable. **Precedence is CLI arg > env var > default**, so a flag on the command line always wins over the environment.
 
+### Configuration sources
+
+For the three authentication settings, the [Socket CLI](https://docs.socket.dev/docs/socket-cli)'s persisted login sits between the env var and the built-in default — run `socket login` (or `socket config set apiToken` / `defaultOrg`) once and socket-patch picks it up too. Resolution is per key, and an empty value means "unset" at every layer:
+
+```
+--api-token / --org / --api-url
+  1. CLI flag
+  2. Env var           SOCKET_API_TOKEN / SOCKET_ORG_SLUG / SOCKET_API_URL
+  3. Peer alias env    SOCKET_CLI_API_TOKEN / SOCKET_CLI_ORG_SLUG / SOCKET_CLI_API_BASE_URL
+  4. socket-cli config <data dir>/socket/settings/config.json — read-only
+                       (Linux: ~/.local/share; macOS: ~/Library/Application Support
+                        then legacy ~/.local/share, both after $XDG_DATA_HOME;
+                        Windows: %LOCALAPPDATA%)
+  5. Built-in default  no token → public proxy; org → auto-resolve; https://api.socket.dev
+```
+
+Two env-only toggles adjust this: `SOCKET_NO_API_TOKEN=1` ignores ambient tokens (env + config; an explicit `--api-token` still wins), and `SOCKET_NO_CONFIG=1` disables the config-file layer entirely. socket-patch never *writes* the config file, and a corrupt one only produces a stderr warning — it never breaks a command or pollutes `--json` output. socket-patch does **not** read `.env` files or any per-repository config for endpoints or credentials: a cloned repo must never be able to redirect where patches come from or spend your token.
+
 | Flag | Env var | Description |
 |------|---------|-------------|
 | `--cwd <dir>` | `SOCKET_CWD` | Working directory (default: `.`). The manifest path is resolved relative to this. |

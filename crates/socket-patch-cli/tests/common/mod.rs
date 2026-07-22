@@ -92,10 +92,16 @@ pub fn run_with_env(cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> (i32, St
     // stays opted out.
     for (key, _) in std::env::vars_os() {
         let name = key.to_string_lossy();
-        if name.starts_with("SOCKET_") && !name.contains("TELEMETRY") {
+        if name.starts_with("SOCKET_") && !name.contains("TELEMETRY") && name != "SOCKET_NO_CONFIG"
+        {
             cmd.env_remove(&key);
         }
     }
+    // Belt-and-braces on top of the `.cargo/config.toml` `[env]` default:
+    // a developer's real `socket login` (the socket-cli config.json token
+    // fallback) must never authenticate a test child — it would flip every
+    // "no token → public proxy" assertion onto the authed path.
+    cmd.env("SOCKET_NO_CONFIG", "1");
     // Caller-supplied env lands last so explicit injections (runtime
     // gates, discovery roots) survive the scrub.
     for (k, v) in env {

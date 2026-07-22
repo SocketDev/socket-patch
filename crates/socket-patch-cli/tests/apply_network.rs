@@ -841,7 +841,7 @@ async fn offline_apply_with_token_makes_zero_network_requests() {
     // what the scenario needs: token set, org absent, both URLs pinned to
     // the mock so any traffic — API or proxy path — is captured.
     for (k, _) in std::env::vars_os() {
-        if k.to_string_lossy().starts_with("SOCKET_") {
+        if k.to_string_lossy().starts_with("SOCKET_") && k.to_string_lossy() != "SOCKET_NO_CONFIG" {
             cmd.env_remove(&k);
         }
     }

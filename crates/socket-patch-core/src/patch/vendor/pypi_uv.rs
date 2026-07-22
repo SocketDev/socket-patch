@@ -683,8 +683,7 @@ pub(super) async fn revert_uv(entry: &VendorEntry, root: &Path, dry_run: bool) -
 
     if !dry_run {
         // Reverse of the wire order: the lock first, then the pyproject.
-        if let Err(e) = atomic_write_bytes_preserving_mode(&lock_path, lock_text.as_bytes()).await
-        {
+        if let Err(e) = atomic_write_bytes_preserving_mode(&lock_path, lock_text.as_bytes()).await {
             return RevertOutcome {
                 success: false,
                 warnings,
@@ -1685,12 +1684,9 @@ wheels = [
         use std::os::unix::fs::PermissionsExt;
         let tmp = write_pair(DIRECT_REGISTRY_PYPROJECT, DIRECT_REGISTRY_LOCK).await;
         for f in ["pyproject.toml", "uv.lock"] {
-            tokio::fs::set_permissions(
-                tmp.path().join(f),
-                std::fs::Permissions::from_mode(0o600),
-            )
-            .await
-            .unwrap();
+            tokio::fs::set_permissions(tmp.path().join(f), std::fs::Permissions::from_mode(0o600))
+                .await
+                .unwrap();
         }
         let mode_of = |f: &str| {
             let path = tmp.path().join(f);
@@ -1717,7 +1713,11 @@ wheels = [
         )
         .await
         .unwrap();
-        assert_eq!(mode_of("pyproject.toml").await, 0o600, "wire reset the mode");
+        assert_eq!(
+            mode_of("pyproject.toml").await,
+            0o600,
+            "wire reset the mode"
+        );
         assert_eq!(mode_of("uv.lock").await, 0o600, "wire reset the mode");
 
         let entry = entry_for(wiring, meta);

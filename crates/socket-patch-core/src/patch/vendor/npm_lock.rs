@@ -297,8 +297,7 @@ pub async fn vendor_npm(
         Ok(out) => out,
         Err(e) => return done_failure(purl, format!("cannot serialize {lock_name}: {e}")),
     };
-    if let Err(e) = atomic_write_bytes_preserving_mode(&project_root.join(&lock_name), &out).await
-    {
+    if let Err(e) = atomic_write_bytes_preserving_mode(&project_root.join(&lock_name), &out).await {
         return done_failure(purl, format!("cannot write {lock_name}: {e}"));
     }
 
@@ -1380,8 +1379,9 @@ mod tests {
     async fn bundled_deps_refusal_survives_package_json_bom() {
         let fx = fixture().await;
         let mut pkg_json = b"\xEF\xBB\xBF".to_vec();
-        pkg_json
-            .extend_from_slice(br#"{"name":"left-pad","version":"1.3.0","bundleDependencies":["dep"]}"#);
+        pkg_json.extend_from_slice(
+            br#"{"name":"left-pad","version":"1.3.0","bundleDependencies":["dep"]}"#,
+        );
         tokio::fs::write(fx.installed().join("package.json"), pkg_json)
             .await
             .unwrap();

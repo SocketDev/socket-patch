@@ -91,7 +91,9 @@ mod host_guard {
         // every invocation with a clap parse error (exit 2) and turned this
         // guard red for an environmental reason.
         for (key, _) in std::env::vars_os() {
-            if key.to_string_lossy().starts_with("SOCKET_") {
+            if key.to_string_lossy().starts_with("SOCKET_")
+                && key.to_string_lossy() != "SOCKET_NO_CONFIG"
+            {
                 cmd.env_remove(&key);
             }
         }
@@ -332,15 +334,26 @@ mod host_guard {
              Gemfile (exit 1), not report no_files (exit 0).\n{out}\n{err}"
         );
         assert_eq!(
-            json_str(&parse_json(&out, "check (subdir)"), "status", "check (subdir)"),
+            json_str(
+                &parse_json(&out, "check (subdir)"),
+                "status",
+                "check (subdir)"
+            ),
             "needs_configuration"
         );
 
         // setup from the subdir: wires the ROOT project.
         let (code, out, err) = run(&sub, &["setup", "--yes", "--json"]);
-        assert_eq!(code, 0, "setup from a subdirectory must exit 0.\n{out}\n{err}");
         assert_eq!(
-            json_str(&parse_json(&out, "setup (subdir)"), "status", "setup (subdir)"),
+            code, 0,
+            "setup from a subdirectory must exit 0.\n{out}\n{err}"
+        );
+        assert_eq!(
+            json_str(
+                &parse_json(&out, "setup (subdir)"),
+                "status",
+                "setup (subdir)"
+            ),
             "success"
         );
         let body = gemfile_body(root);

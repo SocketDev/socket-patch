@@ -84,7 +84,8 @@ fn run_in_pty_bytes(args: &[&str], cwd: &Path, input: &[u8], timeout: Duration) 
     // so an opted-out dev stays opted out.
     for (key, _) in std::env::vars_os() {
         let name = key.to_string_lossy();
-        if name.starts_with("SOCKET_") && !name.contains("TELEMETRY") {
+        if name.starts_with("SOCKET_") && !name.contains("TELEMETRY") && name != "SOCKET_NO_CONFIG"
+        {
             cmd.env_remove(&key);
         }
     }
@@ -266,12 +267,8 @@ fn setup_interactive_non_utf8_answer_aborts_without_panic() {
 "#;
     std::fs::write(tmp.path().join("package.json"), original).unwrap();
 
-    let (code, output) = run_in_pty_bytes(
-        &["setup"],
-        tmp.path(),
-        b"\xE9\n",
-        Duration::from_secs(15),
-    );
+    let (code, output) =
+        run_in_pty_bytes(&["setup"], tmp.path(), b"\xE9\n", Duration::from_secs(15));
     assert!(
         !output.contains("panicked"),
         "non-UTF-8 answer must not panic the CLI; got: {output}"

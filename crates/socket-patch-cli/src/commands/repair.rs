@@ -469,10 +469,10 @@ async fn repair_inner(
                     if !args.common.json {
                         eprintln!("Warning: {label} cleanup failed: {e}");
                     }
-                    env.record(PatchEvent::artifact(PatchAction::Skipped).with_reason(
-                        "cleanup_failed",
-                        format!("{label} cleanup failed: {e}"),
-                    ));
+                    env.record(
+                        PatchEvent::artifact(PatchAction::Skipped)
+                            .with_reason("cleanup_failed", format!("{label} cleanup failed: {e}")),
+                    );
                 }
             }
         }
