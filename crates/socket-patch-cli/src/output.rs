@@ -5,6 +5,13 @@ pub(crate) fn stdin_is_tty() -> bool {
     std::io::stdin().is_terminal()
 }
 
+/// The update notifier's TTY gate reads *stderr*, not stdin: the notice
+/// prints there, and stdout may be legitimately piped (`list | jq`) in a
+/// perfectly interactive session.
+pub(crate) fn stderr_is_tty() -> bool {
+    std::io::stderr().is_terminal()
+}
+
 /// Format a severity string with optional ANSI colors.
 pub fn format_severity(s: &str, use_color: bool) -> String {
     if !use_color {

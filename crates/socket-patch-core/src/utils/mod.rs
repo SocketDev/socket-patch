@@ -1,6 +1,7 @@
 pub mod cleanup_blobs;
 pub mod env_compat;
 pub mod fs;
+pub(crate) mod http;
 pub mod fuzzy_match;
 pub mod process;
 pub mod purl;

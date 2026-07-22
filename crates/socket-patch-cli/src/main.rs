@@ -70,6 +70,27 @@ async fn main() {
         Err(err) => err.exit(),
     };
 
+    // A successful parse with `update == true` means a subcommand was also
+    // given (`socket-patch --update scan`) — bare `--update` is rewritten
+    // to the hidden `self-update` subcommand before it can parse Ok. The
+    // combination is contradictory; refuse with the contract's usage exit.
+    if cli.update {
+        eprintln!(
+            "error: --update cannot be combined with a subcommand; run `socket-patch --update` on its own"
+        );
+        std::process::exit(2);
+    }
+
+    // Passive update notifier: guards + (maybe) a background check kicked
+    // off before dispatch, joined with a short grace budget after it.
+    // Structurally skipped for `--update` itself — an explicit update IS
+    // the check, and it refreshes the notifier's cache on its own.
+    let notifier = if matches!(cli.command, Commands::SelfUpdate(_)) {
+        None
+    } else {
+        socket_patch_cli::update_notifier::spawn_if_due(cli.command.global_args())
+    };
+
     let exit_code = match cli.command {
         Commands::Scan(args) => commands::scan::run(args).await,
         Commands::Apply(args) => commands::apply::run(args).await,
@@ -81,7 +102,13 @@ async fn main() {
         Commands::List(args) => commands::list::run(args).await,
         Commands::Remove(args) => commands::remove::run(args).await,
         Commands::Repair(args) => commands::repair::run(args).await,
+        Commands::SelfUpdate(args) => commands::update::run(args).await,
     };
+
+    // Never delays exit beyond its 500 ms grace budget; never changes the
+    // exit code; prints (at most) its notice to stderr after all command
+    // output.
+    socket_patch_cli::update_notifier::finish(notifier).await;
 
     std::process::exit(exit_code);
 }

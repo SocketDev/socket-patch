@@ -29,11 +29,17 @@ case "$OS" in
     detect_libc() {
       if ldd --version 2>&1 | grep -qi musl; then
         echo "musl"
-      elif [ -e /lib/ld-musl-*.so.1 ] 2>/dev/null; then
-        echo "musl"
-      else
-        echo "gnu"
+        return
       fi
+      # `[ -e ]` cannot take a glob (SC2144): with several matches it is a
+      # syntax error, with none it tests the literal pattern. Loop instead.
+      for loader in /lib/ld-musl-*.so.1; do
+        if [ -e "$loader" ]; then
+          echo "musl"
+          return
+        fi
+      done
+      echo "gnu"
     }
     LIBC="$(detect_libc)"
     case "$ARCH" in

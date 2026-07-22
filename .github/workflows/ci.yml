@@ -64,6 +64,12 @@ jobs:
           php -l composer/socket-patch/bin/socket-patch
           ( cd composer/socket-patch && composer validate --no-check-publish )
 
+      - name: Shell — shellcheck the curl|sh installer
+        # install.sh is the third distribution artifact this job lints; it
+        # had no coverage anywhere before the self-update work touched the
+        # same surface. shellcheck is pre-installed on ubuntu-latest.
+        run: shellcheck --shell=sh scripts/install.sh
+
   test:
     strategy:
       fail-fast: false
@@ -484,6 +490,13 @@ jobs:
           #   cargo test -p socket-patch-cli --test e2e_pypi -- --ignored
           #   cargo test -p socket-patch-cli --test e2e_gem  -- --ignored
           #   cargo test -p socket-patch-cli --test e2e_scan -- --ignored
+          #
+          # Same policy for the self-update live smoke (hits real
+          # github.com releases; catches asset-naming/redirect/SUMS
+          # drift against the published pipeline — most useful right
+          # after a release):
+          #
+          #   cargo test -p socket-patch-cli --test self_update_e2e -- --ignored
           #
           # PR-time coverage for the same code paths comes from the
           # `e2e-docker` matrix below, which runs the same flow

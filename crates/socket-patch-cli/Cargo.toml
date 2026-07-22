@@ -17,6 +17,7 @@ path = "src/main.rs"
 
 [dependencies]
 socket-patch-core = { workspace = true }
+semver = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -61,6 +62,8 @@ sha1 = { workspace = true }
 # scan_vendor_e2e builds pristine registry tarballs for the auto-fetch tests.
 tar = { workspace = true }
 flate2 = { workspace = true }
+# update_fixture builds the Windows-shaped release archive for self-update e2e.
+zip = { workspace = true }
 hex = { workspace = true }
 wiremock = { workspace = true }
 portable-pty = { workspace = true }

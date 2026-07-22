@@ -353,6 +353,8 @@ pub enum Command {
     List,
     Remove,
     Repair,
+    /// `--update` (the hidden `self-update` subcommand).
+    Update,
 }
 
 /// Top-level status. Serializes camelCase.
