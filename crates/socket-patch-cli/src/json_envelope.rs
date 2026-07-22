@@ -343,17 +343,16 @@ impl AppliedVia {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Command {
+    Scan,
     Apply,
+    Vex,
+    Vendor,
+    Setup,
     Rollback,
     Get,
-    Scan,
     List,
     Remove,
     Repair,
-    Setup,
-    Unlock,
-    Vendor,
-    Vex,
 }
 
 /// Top-level status. Serializes camelCase.
@@ -847,17 +846,16 @@ mod tests {
         // `rename_all` arm can't silently change what `command` a
         // consumer routes on.
         for (command, tag) in [
+            (Command::Scan, "scan"),
             (Command::Apply, "apply"),
+            (Command::Vex, "vex"),
+            (Command::Vendor, "vendor"),
+            (Command::Setup, "setup"),
             (Command::Rollback, "rollback"),
             (Command::Get, "get"),
-            (Command::Scan, "scan"),
             (Command::List, "list"),
             (Command::Remove, "remove"),
             (Command::Repair, "repair"),
-            (Command::Setup, "setup"),
-            (Command::Unlock, "unlock"),
-            (Command::Vendor, "vendor"),
-            (Command::Vex, "vex"),
         ] {
             let serialized = serde_json::to_string(&command).unwrap();
             assert_eq!(serialized, format!("\"{tag}\""), "Command::{command:?}");

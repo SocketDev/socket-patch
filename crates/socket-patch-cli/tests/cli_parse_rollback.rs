@@ -25,8 +25,8 @@ fn parse_rollback(extra: &[&str]) -> RollbackArgs {
 /// Every boolean toggle on `rollback`, as `(contract name, current value)`.
 /// Used to prove that a single flag flips *only* its own field — without this,
 /// each positive test ignores all other fields, so a parser bug that
-/// cross-wired e.g. `--one-off` into `--global`, `--silent` into `--break-lock`
-/// (stealing a live lock), or any flag into another would still stay green.
+/// cross-wired e.g. `--one-off` into `--global`, `--silent` into `--yes`
+/// (auto-approving prompts), or any flag into another would still stay green.
 /// Keep this in sync with the boolean flags in the contract.
 fn bool_flags(a: &RollbackArgs) -> Vec<(&'static str, bool)> {
     vec![
@@ -39,7 +39,6 @@ fn bool_flags(a: &RollbackArgs) -> Vec<(&'static str, bool)> {
         ("yes", a.common.yes),
         ("debug", a.common.debug),
         ("no_telemetry", a.common.no_telemetry),
-        ("break_lock", a.common.break_lock),
         ("one_off", a.one_off),
     ]
 }
@@ -82,7 +81,6 @@ fn defaults_no_positional() {
     assert_eq!(args.common.download_mode, "diff");
     assert!(!args.common.yes);
     assert_eq!(args.common.lock_timeout, None);
-    assert!(!args.common.break_lock);
     assert!(!args.common.debug);
     assert!(!args.common.no_telemetry);
     // Belt-and-suspenders: with no args, NO boolean toggle may be on.
@@ -289,13 +287,6 @@ fn lock_timeout_long() {
 }
 
 #[test]
-fn break_lock_long() {
-    let args = parse_rollback(&["--break-lock"]);
-    assert!(args.common.break_lock);
-    assert_only_true(&args, &["break_lock"]);
-}
-
-#[test]
 fn debug_long() {
     let args = parse_rollback(&["--debug"]);
     assert!(args.common.debug);
@@ -324,7 +315,6 @@ fn all_bools_settable_together() {
         "--yes",
         "--debug",
         "--no-telemetry",
-        "--break-lock",
         "--one-off",
     ]);
     assert_only_true(
@@ -339,7 +329,6 @@ fn all_bools_settable_together() {
             "yes",
             "debug",
             "no_telemetry",
-            "break_lock",
             "one_off",
         ],
     );

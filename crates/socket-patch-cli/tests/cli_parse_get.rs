@@ -52,7 +52,6 @@ const SOCKET_ENV_VARS: &[&str] = &[
     "SOCKET_DRY_RUN",
     "SOCKET_YES",
     "SOCKET_LOCK_TIMEOUT",
-    "SOCKET_BREAK_LOCK",
     "SOCKET_DEBUG",
     "SOCKET_TELEMETRY_DISABLED",
     // GetArgs-specific
@@ -145,7 +144,6 @@ struct Snap {
     dry_run: bool,
     yes: bool,
     lock_timeout: Option<u64>,
-    break_lock: bool,
     debug: bool,
     no_telemetry: bool,
     id: bool,
@@ -181,7 +179,6 @@ fn snapshot(a: &GetArgs) -> Snap {
         dry_run: a.common.dry_run,
         yes: a.common.yes,
         lock_timeout: a.common.lock_timeout,
-        break_lock: a.common.break_lock,
         debug: a.common.debug,
         no_telemetry: a.common.no_telemetry,
         id: a.id,
@@ -225,7 +222,6 @@ fn expected_defaults(identifier: &str) -> Snap {
         dry_run: false,
         yes: false,
         lock_timeout: None,
-        break_lock: false,
         debug: false,
         no_telemetry: false,
         id: false,
@@ -246,7 +242,7 @@ fn defaults_with_only_required_identifier() {
     let a = parse_get(&["some-id"]);
     // Pin the *entire* default surface in one shot against the independent
     // oracle. This covers fields the old test silently skipped (manifest_path,
-    // proxy_url, offline, verbose, silent, dry_run, lock_timeout, break_lock,
+    // proxy_url, offline, verbose, silent, dry_run, lock_timeout,
     // debug, no_telemetry, ecosystems) — any of which could regress to a
     // non-default and go unnoticed under a field-cherry-picked assertion.
     assert_eq!(snapshot(&a), expected_defaults("some-id"));

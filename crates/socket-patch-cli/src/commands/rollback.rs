@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use crate::args::{apply_env_toggles, parse_bool_flag, GlobalArgs};
 use crate::commands::apply::is_local_go;
-use crate::commands::lock_cli::{acquire_or_emit, LOCK_BROKEN_CODE};
+use crate::commands::lock_cli::acquire_or_emit;
 use crate::commands::remove::patch_matches;
 use crate::ecosystem_dispatch::{find_packages_for_rollback, partition_purls};
 use crate::json_envelope::Command as EnvelopeCommand;
@@ -288,20 +288,16 @@ pub async fn run(args: RollbackArgs) -> i32 {
     // same `.socket/` directory. See
     // `socket_patch_core::patch::apply_lock`.
     let socket_dir = manifest_path.parent().unwrap_or(Path::new("."));
-    let acquired = match acquire_or_emit(
+    let _lock = match acquire_or_emit(
         socket_dir,
         EnvelopeCommand::Rollback,
         args.common.json,
-        args.common.silent,
         args.common.dry_run,
         Duration::from_secs(args.common.lock_timeout.unwrap_or(0)),
-        args.common.break_lock,
     ) {
-        Ok(acquired) => acquired,
+        Ok(guard) => guard,
         Err(code) => return code,
     };
-    let _lock = acquired.guard;
-    let lock_was_broken = acquired.broke_lock;
 
     match rollback_patches_inner(&args, &manifest_path).await {
         Ok((success, results, vendored)) => {
@@ -316,21 +312,11 @@ pub async fn run(args: RollbackArgs) -> i32 {
             let failed_count = results.iter().filter(|r| !r.success).count();
 
             if args.common.json {
-                // `warnings` carries non-fatal audit info — currently
-                // just the `lock_broken` notice when --break-lock fired.
-                // Empty array stays present in the JSON shape so
-                // consumers can rely on `.warnings[]` without
-                // null-checking.
-                let mut warnings = Vec::new();
-                if lock_was_broken {
-                    warnings.push(serde_json::json!({
-                        "code": LOCK_BROKEN_CODE,
-                        "message": format!(
-                            "--break-lock reclaimed stale {}/apply.lock (no live holder)",
-                            socket_dir.display()
-                        ),
-                    }));
-                }
+                // `warnings` carries non-fatal audit info. Nothing
+                // populates it today (the `lock_broken` notice left with
+                // `--break-lock`), but the empty array stays present in
+                // the JSON shape so consumers can rely on `.warnings[]`
+                // without null-checking.
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
@@ -339,7 +325,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
                         "alreadyOriginal": already_original_count,
                         "failed": failed_count,
                         "dryRun": args.common.dry_run,
-                        "warnings": warnings,
+                        "warnings": [],
                         // Vendor-owned purls excluded from in-place rollback
                         // (benign — `remove` or `vendor --revert` undo them).
                         "vendored": vendored,

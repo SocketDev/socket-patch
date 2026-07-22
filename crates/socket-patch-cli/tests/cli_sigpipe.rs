@@ -22,12 +22,16 @@ const BINARY: &str = env!("CARGO_BIN_EXE_socket-patch");
 /// `libc::SIGPIPE`, inlined so the test crate needs no libc dependency.
 const SIGPIPE: i32 = 13;
 
-/// `unlock` in an empty directory is the cheapest command that writes to
-/// stdout: offline, lock-free, no manifest needed — prints "Lock is free."
+/// `list` against an empty manifest is the cheapest command that writes
+/// to stdout: offline, lock-free — prints "No patches found in manifest."
 /// and exits 0 when stdout is healthy.
 #[test]
 fn closed_stdout_pipe_is_not_a_panic() {
     let dir = tempfile::tempdir().expect("tempdir");
+    let socket = dir.path().join(".socket");
+    std::fs::create_dir_all(&socket).expect("create .socket");
+    std::fs::write(socket.join("manifest.json"), r#"{ "patches": {} }"#)
+        .expect("write manifest");
 
     // Build a pipe and close the read end BEFORE the child spawns, so the
     // child's first stdout write hits EPIPE deterministically (piping to a
@@ -36,7 +40,7 @@ fn closed_stdout_pipe_is_not_a_panic() {
     drop(reader);
 
     let mut cmd = Command::new(BINARY);
-    cmd.arg("unlock")
+    cmd.arg("list")
         .current_dir(dir.path())
         .stdout(Stdio::from(writer))
         .stderr(Stdio::piped());

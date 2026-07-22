@@ -31,7 +31,7 @@ use socket_patch_cli::Cli;
 /// being listed here — closing the "someone forgot the flatten on a new
 /// command and nobody noticed" gap this file claims to guard.
 const SUBCOMMANDS_NO_POSITIONAL: &[&str] = &[
-    "apply", "list", "scan", "setup", "repair", "rollback", "unlock", "vendor", "vex",
+    "apply", "list", "scan", "setup", "repair", "rollback", "vendor", "vex",
 ];
 
 /// Subcommands that require a positional identifier.
@@ -98,7 +98,6 @@ fn global_flag_cases() -> Vec<(&'static str, Option<&'static str>, fn(&GlobalArg
         ("--yes", None, |c| assert!(c.yes)),
         ("--debug", None, |c| assert!(c.debug)),
         ("--no-telemetry", None, |c| assert!(c.no_telemetry)),
-        ("--break-lock", None, |c| assert!(c.break_lock)),
         ("--lock-timeout", Some("30"), |c| {
             assert_eq!(c.lock_timeout, Some(30))
         }),
@@ -119,7 +118,6 @@ fn common_of(cli: &Cli) -> &GlobalArgs {
         Remove(a) => &a.common,
         Setup(a) => &a.common,
         Repair(a) => &a.common,
-        Unlock(a) => &a.common,
         Vendor(a) => &a.common,
         Vex(a) => &a.common,
     }
@@ -209,7 +207,6 @@ fn global_flag_cases_cover_every_global_field() {
         dry_run: _,
         yes: _,
         lock_timeout: _,
-        break_lock: _,
         debug: _,
         no_telemetry: _,
         strict: _,
@@ -218,11 +215,11 @@ fn global_flag_cases_cover_every_global_field() {
         patch_server_url: _,
     } = common;
 
-    // 24 fields ↔ 24 long-flag cases. Bump both this count and add a case when
+    // 23 fields ↔ 23 long-flag cases. Bump both this count and add a case when
     // the destructure above forces you to add a field.
     assert_eq!(
         global_flag_cases().len(),
-        24,
+        23,
         "every GlobalArgs field needs a long-flag case in global_flag_cases()",
     );
 
@@ -435,7 +432,6 @@ fn env_vars_populate_global_args() {
         ("SOCKET_DRY_RUN", "true"),
         ("SOCKET_YES", "true"),
         ("SOCKET_LOCK_TIMEOUT", "30"),
-        ("SOCKET_BREAK_LOCK", "true"),
         ("SOCKET_DEBUG", "true"),
         ("SOCKET_TELEMETRY_DISABLED", "true"),
     ];
@@ -492,7 +488,6 @@ fn env_vars_populate_global_args() {
         assert!(args.common.dry_run);
         assert!(args.common.yes);
         assert_eq!(args.common.lock_timeout, Some(30));
-        assert!(args.common.break_lock);
         assert!(args.common.debug);
         assert!(args.common.no_telemetry);
     } else {
@@ -532,7 +527,6 @@ fn bool_env_vars_accept_one_and_yes() {
         ("SOCKET_SILENT", "y"),
         ("SOCKET_DRY_RUN", "1"),
         ("SOCKET_YES", "yes"),
-        ("SOCKET_BREAK_LOCK", "1"),
         ("SOCKET_DEBUG", "1"),
         ("SOCKET_TELEMETRY_DISABLED", "1"),
     ];
@@ -555,10 +549,6 @@ fn bool_env_vars_accept_one_and_yes() {
         assert!(args.common.silent, "SOCKET_SILENT=y must parse as true");
         assert!(args.common.dry_run, "SOCKET_DRY_RUN=1 must parse as true");
         assert!(args.common.yes, "SOCKET_YES=yes must parse as true");
-        assert!(
-            args.common.break_lock,
-            "SOCKET_BREAK_LOCK=1 must parse as true"
-        );
         assert!(args.common.debug, "SOCKET_DEBUG=1 must parse as true");
         assert!(
             args.common.no_telemetry,
@@ -648,7 +638,7 @@ fn bool_env_vars_reject_zero_and_falsey() {
 #[serial_test::serial]
 fn empty_bool_env_var_resolves_to_false_not_crash() {
     // (env var, accessor) for every boolean global.
-    let bool_vars: [(&str, fn(&GlobalArgs) -> bool); 11] = [
+    let bool_vars: [(&str, fn(&GlobalArgs) -> bool); 10] = [
         ("SOCKET_OFFLINE", |c| c.offline),
         ("SOCKET_STRICT", |c| c.strict),
         ("SOCKET_GLOBAL", |c| c.global),
@@ -657,7 +647,6 @@ fn empty_bool_env_var_resolves_to_false_not_crash() {
         ("SOCKET_SILENT", |c| c.silent),
         ("SOCKET_DRY_RUN", |c| c.dry_run),
         ("SOCKET_YES", |c| c.yes),
-        ("SOCKET_BREAK_LOCK", |c| c.break_lock),
         ("SOCKET_DEBUG", |c| c.debug),
         ("SOCKET_TELEMETRY_DISABLED", |c| c.no_telemetry),
     ];
@@ -898,7 +887,7 @@ fn production_defaults_populate_when_unset() {
     assert!(c.ecosystems.is_none());
     assert!(!c.strict);
     assert!(!c.offline && !c.global && !c.json && !c.verbose && !c.silent);
-    assert!(!c.dry_run && !c.yes && !c.break_lock && !c.debug && !c.no_telemetry);
+    assert!(!c.dry_run && !c.yes && !c.debug && !c.no_telemetry);
     assert!(c.lock_timeout.is_none());
     assert!(c.global_prefix.is_none());
 

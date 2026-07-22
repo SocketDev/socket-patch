@@ -123,6 +123,13 @@ fn repair_with_no_manifest_emits_manifest_not_found_envelope() {
     assert_eq!(v["command"], "repair");
     assert_eq!(v["status"], "error");
     assert_eq!(v["error"]["code"], "manifest_not_found");
+    // The early return fires before lock acquisition and before the
+    // lock-file cleanup: repair must not conjure a `.socket/` directory
+    // into a project that never had one.
+    assert!(
+        !tmp.path().join(".socket").exists(),
+        "repair on a bare directory must not create .socket/"
+    );
 }
 
 /// A project whose ONLY trace is the hosted-mode redirect ledger
@@ -553,6 +560,121 @@ fn repair_cleanup_failure_is_reported_in_json_and_silent_modes() {
     // Restore permissions so the tempdir can be cleaned up.
     std::fs::set_permissions(&blobs_dir, std::fs::Permissions::from_mode(0o755))
         .expect("restore blobs dir permissions");
+}
+
+// ---------------------------------------------------------------------------
+// Advisory-lock cleanup — repair owns the old `unlock --release` behavior
+// ---------------------------------------------------------------------------
+
+/// Take an exclusive flock on the binary's lock file path (the same
+/// `fs2` primitive the binary uses). Returns the open file handle whose
+/// drop releases the lock — keep it bound for the test's duration.
+fn take_external_lock(socket_dir: &Path) -> std::fs::File {
+    use fs2::FileExt;
+    let path = socket_dir.join("apply.lock");
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .expect("open lock file");
+    file.try_lock_exclusive()
+        .expect("test could not take initial lock");
+    file
+}
+
+/// A leftover `apply.lock` from an earlier (or crashed) run is removed
+/// by a successful repair — the fold-in of the old `unlock --release`.
+#[test]
+fn repair_deletes_leftover_lock_file_on_success() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let socket = make_socket_dir(tmp.path());
+    write_blob(&socket, REFERENCED_HASH, b"patched content");
+    std::fs::write(socket.join("apply.lock"), b"leftover").expect("stage stale lock");
+
+    let (code, stdout) = run_repair(tmp.path(), &[]);
+    assert_eq!(code, 0, "expected exit 0; stdout=\n{stdout}");
+    assert!(
+        !socket.join("apply.lock").exists(),
+        "repair must delete the leftover apply.lock"
+    );
+}
+
+/// Even with no pre-existing lock file, the acquire creates one
+/// (`create(true)`); repair must clean up after itself so a finished
+/// run leaves no lock file either way.
+#[test]
+fn repair_deletes_probe_created_lock_file() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let socket = make_socket_dir(tmp.path());
+    write_blob(&socket, REFERENCED_HASH, b"patched content");
+    assert!(!socket.join("apply.lock").exists());
+
+    let (code, stdout) = run_repair(tmp.path(), &[]);
+    assert_eq!(code, 0, "expected exit 0; stdout=\n{stdout}");
+    assert!(
+        !socket.join("apply.lock").exists(),
+        "repair must leave no apply.lock behind"
+    );
+}
+
+/// `--dry-run` mutates nothing — including the lock file.
+#[test]
+fn repair_dry_run_preserves_lock_file() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let socket = make_socket_dir(tmp.path());
+    write_blob(&socket, REFERENCED_HASH, b"patched content");
+    std::fs::write(socket.join("apply.lock"), b"leftover").expect("stage stale lock");
+
+    let (code, stdout) = run_repair(tmp.path(), &["--dry-run"]);
+    assert_eq!(code, 0, "expected exit 0; stdout=\n{stdout}");
+    assert!(
+        socket.join("apply.lock").exists(),
+        "--dry-run must not delete apply.lock"
+    );
+}
+
+/// A LIVE holder makes repair refuse with `lock_held` (exit 1) and
+/// keeps its lock file — repair resets leftover state, it never steals
+/// a lock out from under a running process.
+#[test]
+fn repair_refuses_and_keeps_lock_when_live_holder() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let socket = make_socket_dir(tmp.path());
+    let _external = take_external_lock(&socket);
+
+    let (code, stdout) = run_repair(tmp.path(), &[]);
+    assert_eq!(code, 1, "expected lock_held exit 1; stdout=\n{stdout}");
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("envelope JSON");
+    assert_eq!(v["command"], "repair");
+    assert_eq!(v["status"], "error");
+    assert_eq!(v["error"]["code"], "lock_held");
+    assert!(
+        socket.join("apply.lock").exists(),
+        "a refused repair must leave the live holder's lock file alone"
+    );
+}
+
+/// The lock-file cleanup is housekeeping that runs on every completion
+/// path, not a success reward: a repair that fails past the lock (here:
+/// an unparseable manifest → `repair_failed`) still deletes the file.
+#[test]
+fn repair_deletes_lock_file_even_when_repair_fails() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let socket = tmp.path().join(".socket");
+    std::fs::create_dir_all(&socket).unwrap();
+    std::fs::write(socket.join("manifest.json"), "{ not valid json").unwrap();
+    std::fs::write(socket.join("apply.lock"), b"leftover").expect("stage stale lock");
+
+    let (code, stdout) = run_repair(tmp.path(), &[]);
+    assert_eq!(code, 1, "expected repair_failed exit 1; stdout=\n{stdout}");
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("envelope JSON");
+    assert_eq!(v["error"]["code"], "repair_failed");
+    assert!(
+        !socket.join("apply.lock").exists(),
+        "the lock-file cleanup must run on the failure path too"
+    );
 }
 
 // ---------------------------------------------------------------------------

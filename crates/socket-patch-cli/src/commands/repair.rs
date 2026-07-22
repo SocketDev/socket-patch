@@ -14,7 +14,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::args::{apply_env_toggles, parse_bool_flag, GlobalArgs};
-use crate::commands::lock_cli::{acquire_or_emit, error_envelope, lock_broken_event};
+use crate::commands::lock_cli::{acquire_or_emit, error_envelope};
 use crate::json_envelope::{Command, Envelope, PatchAction, PatchEvent, Status};
 
 #[derive(Args)]
@@ -127,32 +127,22 @@ pub async fn run(args: RepairArgs) -> i32 {
     }
 
     // Serialize against concurrent socket-patch runs targeting the
-    // same `.socket/` directory. See `apply_lock`.
+    // same `.socket/` directory. See `apply_lock`. A live holder makes
+    // repair refuse with `lock_held` — it never steals the lock.
     let socket_dir = manifest_path.parent().unwrap_or(Path::new("."));
-    let acquired = match acquire_or_emit(
+    let lock = match acquire_or_emit(
         socket_dir,
         Command::Repair,
         args.common.json,
-        args.common.silent,
         args.common.dry_run,
         Duration::from_secs(args.common.lock_timeout.unwrap_or(0)),
-        args.common.break_lock,
     ) {
-        Ok(acquired) => acquired,
+        Ok(guard) => guard,
         Err(code) => return code,
     };
-    let _lock = acquired.guard;
-    let lock_was_broken = acquired.broke_lock;
 
-    match repair_inner(&args, &manifest_path).await {
-        Ok((mut env, counts)) => {
-            if lock_was_broken {
-                // Audit trail for `--break-lock`. Event ordering is
-                // documented as best-effort; appending keeps the
-                // `Envelope::record` invariant intact (events + summary
-                // stay in sync).
-                env.record(lock_broken_event(socket_dir));
-            }
+    let exit_code = match repair_inner(&args, &manifest_path).await {
+        Ok((env, counts)) => {
             // A repair where some artifacts failed to download is marked a
             // partial failure inside `repair_inner` (a `Failed` event plus
             // `mark_partial_failure`). Mirror `apply`: surface that as a
@@ -195,7 +185,36 @@ pub async fn run(args: RepairArgs) -> i32 {
             }
             1
         }
+    };
+
+    // Clean slate: repair owns the lock-file cleanup (the mutating
+    // commands deliberately leave `apply.lock` behind between runs).
+    // Drop our guard FIRST so the unlink races nothing we hold, then
+    // best-effort delete. A live holder never reaches here — contention
+    // already returned above. The residual window (a competitor that
+    // acquires between the drop and the unlink gets its file orphaned)
+    // is microseconds at the tail of a finished repair and worth the
+    // trade; see `apply_lock`'s module doc.
+    drop(lock);
+    if !args.common.dry_run {
+        let lock_file = socket_dir.join("apply.lock");
+        match std::fs::remove_file(&lock_file) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                // Housekeeping only: a leftover lock file is harmless, so
+                // a failed delete warns (human mode) without flipping the
+                // exit code of an otherwise-finished repair.
+                if !args.common.silent && !args.common.json {
+                    eprintln!(
+                        "Warning: could not remove lock file {}: {e}",
+                        lock_file.display()
+                    );
+                }
+            }
+        }
     }
+    exit_code
 }
 
 /// Aggregate counts surfaced by `repair_inner` for telemetry use.

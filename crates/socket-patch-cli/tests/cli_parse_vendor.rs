@@ -56,7 +56,6 @@ const SOCKET_ENV_VARS: &[&str] = &[
     "SOCKET_DRY_RUN",
     "SOCKET_YES",
     "SOCKET_LOCK_TIMEOUT",
-    "SOCKET_BREAK_LOCK",
     "SOCKET_DEBUG",
     "SOCKET_TELEMETRY_DISABLED",
     // VendorArgs-specific
@@ -172,7 +171,6 @@ struct Snap {
     dry_run: bool,
     yes: bool,
     lock_timeout: Option<u64>,
-    break_lock: bool,
     debug: bool,
     no_telemetry: bool,
     force: bool,
@@ -203,7 +201,6 @@ fn snapshot(a: &VendorArgs) -> Snap {
         dry_run: a.common.dry_run,
         yes: a.common.yes,
         lock_timeout: a.common.lock_timeout,
-        break_lock: a.common.break_lock,
         debug: a.common.debug,
         no_telemetry: a.common.no_telemetry,
         force: a.force,
@@ -243,7 +240,6 @@ fn expected_defaults() -> Snap {
         dry_run: false,
         yes: false,
         lock_timeout: None,
-        break_lock: false,
         debug: false,
         no_telemetry: false,
         force: false,
@@ -415,15 +411,6 @@ fn lock_timeout_flag_sets_lock_timeout() {
     let a = parse_vendor(&["--lock-timeout", "30"]);
     let mut want = expected_defaults();
     want.lock_timeout = Some(30);
-    assert_eq!(snapshot(&a), want);
-}
-
-#[test]
-#[serial_test::serial]
-fn break_lock_flag_sets_break_lock() {
-    let a = parse_vendor(&["--break-lock"]);
-    let mut want = expected_defaults();
-    want.break_lock = true;
     assert_eq!(snapshot(&a), want);
 }
 

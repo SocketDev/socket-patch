@@ -13,7 +13,7 @@ use super::get::short_uuid;
 use super::rollback::{all_files_already_original, rollback_patches};
 use super::vendor::dispatch_revert_one;
 use crate::args::{apply_env_toggles, GlobalArgs};
-use crate::commands::lock_cli::{acquire_or_emit, lock_broken_event};
+use crate::commands::lock_cli::acquire_or_emit;
 use crate::json_envelope::{Command, Envelope, EnvelopeError, PatchAction, PatchEvent, Status};
 use crate::output::confirm;
 
@@ -151,20 +151,16 @@ pub async fn run(args: RemoveArgs) -> i32 {
     // self-deadlock — so the outer remove invocation holds it for
     // both the rollback and the manifest mutation.
     let socket_dir = manifest_path.parent().unwrap_or(Path::new("."));
-    let acquired = match acquire_or_emit(
+    let _lock = match acquire_or_emit(
         socket_dir,
         Command::Remove,
         args.common.json,
-        args.common.silent,
         args.common.dry_run,
         Duration::from_secs(args.common.lock_timeout.unwrap_or(0)),
-        args.common.break_lock,
     ) {
-        Ok(acquired) => acquired,
+        Ok(guard) => guard,
         Err(code) => return code,
     };
-    let _lock = acquired.guard;
-    let lock_was_broken = acquired.broke_lock;
 
     // Read manifest to show what will be removed and confirm. On the
     // pure-detached path there is no manifest to read or mutate; an empty
@@ -218,8 +214,6 @@ pub async fn run(args: RemoveArgs) -> i32 {
                 &args,
                 detached,
                 detached_state,
-                lock_was_broken,
-                socket_dir,
                 api_token.as_deref(),
                 org_slug.as_deref(),
             )
@@ -533,9 +527,6 @@ pub async fn run(args: RemoveArgs) -> i32 {
                 } else {
                     PatchAction::Removed
                 };
-                if lock_was_broken {
-                    env.record(lock_broken_event(socket_dir));
-                }
                 // Chronological: the vendor revert ran before the rollback
                 // and the manifest mutation. Reverted events bypass
                 // `record` so `summary.removed` stays equal to the number
@@ -604,8 +595,6 @@ async fn remove_detached_only(
     args: &RemoveArgs,
     detached: Vec<(String, VendorEntry)>,
     mut state: VendorState,
-    lock_was_broken: bool,
-    socket_dir: &Path,
     api_token: Option<&str>,
     org_slug: Option<&str>,
 ) -> i32 {
@@ -644,9 +633,6 @@ async fn remove_detached_only(
 
     let mut env = Envelope::new(Command::Remove);
     env.dry_run = args.common.dry_run;
-    if lock_was_broken {
-        env.record(lock_broken_event(socket_dir));
-    }
     for (key, entry) in &detached {
         let outcome = dispatch_revert_one(entry, &args.common.cwd, args.common.dry_run).await;
         for w in &outcome.warnings {

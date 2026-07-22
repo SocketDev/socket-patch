@@ -33,9 +33,9 @@ const UUID_B: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 /// (u64) and `SOCKET_VENDOR_SOURCE` (enum), turn every invocation into an
 /// exit-2 usage error before `get` even runs. A fixed allowlist here
 /// rotted as flags were added (it predated `SOCKET_LOCK_TIMEOUT`,
-/// `SOCKET_STRICT`, `SOCKET_VENDOR_*`, `SOCKET_PATCH_SERVER_URL`,
-/// `SOCKET_BREAK_LOCK` — ambient `SOCKET_LOCK_TIMEOUT=bogus` failed 6 of
-/// these 7 tests); the prefix scrub can't rot.
+/// `SOCKET_STRICT`, `SOCKET_VENDOR_*`, `SOCKET_PATCH_SERVER_URL` —
+/// ambient `SOCKET_LOCK_TIMEOUT=bogus` failed 6 of these 7 tests); the
+/// prefix scrub can't rot.
 fn scrub_socket_env(cmd: &mut Command) {
     for (key, _) in std::env::vars_os() {
         let name = key.to_string_lossy();

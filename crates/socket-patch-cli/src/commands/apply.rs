@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use crate::args::{apply_env_toggles, GlobalArgs};
 use crate::commands::fetch_stage::{stage_patch_sources, StageOutcome, StagedSources};
-use crate::commands::lock_cli::{acquire_or_emit, lock_broken_event};
+use crate::commands::lock_cli::acquire_or_emit;
 use crate::commands::vex::{generate_vex_from_manifest_path, VexEmbedArgs};
 use crate::ecosystem_dispatch::{find_packages_for_purls, partition_purls};
 use crate::json_envelope::{
@@ -592,20 +592,16 @@ pub async fn run(args: ApplyArgs) -> i32 {
     // `.socket/` directory. The guard releases on function return; see
     // `socket_patch_core::patch::apply_lock`.
     let socket_dir = manifest_path.parent().unwrap_or(Path::new("."));
-    let acquired = match acquire_or_emit(
+    let _lock = match acquire_or_emit(
         socket_dir,
         Command::Apply,
         args.common.json,
-        args.common.silent,
         args.common.dry_run,
         Duration::from_secs(args.common.lock_timeout.unwrap_or(0)),
-        args.common.break_lock,
     ) {
-        Ok(acquired) => acquired,
+        Ok(guard) => guard,
         Err(code) => return code,
     };
-    let _lock = acquired.guard;
-    let lock_was_broken = acquired.broke_lock;
 
     // Package-manager layout detection. yarn-berry PnP keeps packages
     // inside `.yarn/cache/*.zip` and resolves them via `.pnp.cjs` —
@@ -687,9 +683,6 @@ pub async fn run(args: ApplyArgs) -> i32 {
             if args.common.json {
                 let mut env = Envelope::new(Command::Apply);
                 env.dry_run = args.common.dry_run;
-                if lock_was_broken {
-                    env.record(lock_broken_event(socket_dir));
-                }
                 for result in &results {
                     env.record(result_to_event(result, args.common.dry_run));
                     // Mismatch overwrites ride as Skipped warning events

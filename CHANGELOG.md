@@ -14,6 +14,34 @@ in this file — see `.github/workflows/release.yml` (`version` job).
 
 ## [Unreleased]
 
+### Removed (BREAKING — lands in v4.0)
+
+- **The `unlock` subcommand.** Folded into `repair`, which now deletes the
+  leftover `<.socket>/apply.lock` file as its final housekeeping step (skipped
+  under `--dry-run`, refused with `lock_held` while another live socket-patch
+  process holds the lock). Rationale: a leftover lock file from a crashed run
+  never blocked acquisition in the first place — the OS releases a dead
+  holder's advisory lock along with its file handle — so `unlock`'s inspect
+  path had no recovery scenario, and its `--release` file deletion is now
+  automatic. Migration: `unlock --release` → `repair`; the probe-style
+  "is anything holding the lock?" check → run the mutating command (optionally
+  with `--lock-timeout`) and branch on `errorCode: lock_held`.
+  `SOCKET_UNLOCK_RELEASE` is gone with the subcommand, and the
+  `patch_unlocked` / `patch_unlock_failed` telemetry events are retired.
+- **The global `--break-lock` flag and `SOCKET_BREAK_LOCK` env var.** It never
+  stole a live holder's lock (deliberately, since that defeats mutual
+  exclusion) and a stale file never contends, so all it did was emit a
+  `lock_broken` audit event for a reclaim that plain acquisition performs
+  anyway. The `lock_broken` warning event and rollback's `warnings[]`
+  `lock_broken` entry are no longer emitted (`warnings` stays present, now
+  always empty). The `lock_held` stderr hint now advises waiting /
+  `--lock-timeout` instead of pointing at the removed commands.
+
+### Changed (BREAKING — lands in v4.0)
+
+- **`--help` command order** is now workflow-first: `scan`, `apply`, `vex`,
+  `vendor`, `setup`, then `rollback`, `get`, `list`, `remove`, `repair`.
+
 ### Added
 
 - **`socket login` now configures socket-patch.** The JS Socket CLI's

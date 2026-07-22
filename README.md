@@ -184,61 +184,12 @@ Two env-only toggles adjust this: `SOCKET_NO_API_TOKEN=1` ignores ambient tokens
 | `--dry-run` | `SOCKET_DRY_RUN` | Preview the operation without making any mutations. |
 | `-y, --yes` | `SOCKET_YES` | Skip interactive confirmation prompts. |
 | `--lock-timeout <secs>` | `SOCKET_LOCK_TIMEOUT` | Seconds to wait for `.socket/apply.lock` before giving up. `0`/unset = a single non-blocking try; a positive value retries with backoff. Only meaningful for mutating commands (`apply`, `rollback`, `repair`, `remove`). |
-| `--break-lock` | `SOCKET_BREAK_LOCK` | Reclaim a stale `.socket/apply.lock` (one left by a crashed run) before acquiring it — the file itself is never deleted, and a lock with a live holder is refused. Use only when no other socket-patch process is running; emits an auditable `lock_broken` event in the JSON envelope. |
 | `--debug` | `SOCKET_DEBUG` | Emit verbose debug logs to stderr. |
 | `--no-telemetry` | `SOCKET_TELEMETRY_DISABLED` | Disable anonymous usage telemetry. |
 
 ## Commands
 
 The tables below list only the **command-specific** flags. Every command also accepts the [Global Options](#global-options) above.
-
-### `get`
-
-Get security patches from Socket API and apply them. Accepts a UUID, CVE ID, GHSA ID, PURL, or package name. The identifier type is auto-detected but can be forced with a flag.
-
-Alias: `download`
-
-**Usage:**
-```bash
-socket-patch get <identifier> [options]
-```
-
-**Command-specific options** (plus all [Global Options](#global-options)):
-| Flag | Description |
-|------|-------------|
-| `--id` | Force identifier to be treated as a UUID |
-| `--cve` | Force identifier to be treated as a CVE ID |
-| `--ghsa` | Force identifier to be treated as a GHSA ID |
-| `-p, --package` | Force identifier to be treated as a package name |
-| `--save-only` | Download patch without applying it (alias: `--no-apply`) |
-| `--one-off` | Apply patch immediately without saving to the `.socket` folder |
-| `--all-releases` | Download patches for every release/distribution variant of a matched package (PyPI wheel/sdist, RubyGems platform, Maven classifier), not just the installed one |
-
-> Authenticated lookups require an org: pass `--org <slug>` (or set `SOCKET_ORG_SLUG`) when using `SOCKET_API_TOKEN`.
-
-**Examples:**
-```bash
-# Get patch by UUID
-socket-patch get 550e8400-e29b-41d4-a716-446655440000
-
-# Get patch by CVE
-socket-patch get CVE-2024-12345
-
-# Get patch by GHSA
-socket-patch get GHSA-xxxx-yyyy-zzzz
-
-# Get patch by package name (fuzzy matches installed packages)
-socket-patch get lodash
-
-# Download only, don't apply
-socket-patch get CVE-2024-12345 --save-only
-
-# Apply to global packages
-socket-patch get lodash -g
-
-# JSON output for scripting
-socket-patch get CVE-2024-12345 --json -y
-```
 
 ### `scan`
 
@@ -352,6 +303,39 @@ socket-patch apply --vex socket.vex.json
 > committed vendored artifact is the patch, so there is nothing for `apply` to do — even when
 > the installed tree (e.g. `node_modules/`) is absent.
 
+### `vex`
+
+Generate an [OpenVEX](https://github.com/openvex) 0.2.0 attestation describing the vulnerabilities that the applied patches have mitigated. See [OpenVEX attestations](#openvex-attestations) below for the full workflow.
+
+**Usage:**
+```bash
+socket-patch vex [options]
+```
+
+**Command-specific options** (plus all [Global Options](#global-options)):
+| Flag | Description |
+|------|-------------|
+| `-O, --output <path>` | Write the VEX document to this path instead of stdout. Required when combined with `--json`. (env: `SOCKET_VEX_OUTPUT`) |
+| `--product <id>` | Override the auto-detected top-level product PURL/identifier. (env: `SOCKET_VEX_PRODUCT`) |
+| `--no-verify` | Skip the on-disk file-hash check and trust the manifest — useful on a build machine that doesn't have the patched files laid out. (env: `SOCKET_VEX_NO_VERIFY`) |
+| `--doc-id <id>` | Override the document `@id`. Default is a random `urn:uuid:<v4>` regenerated each run; pin this for a reproducible identifier. (env: `SOCKET_VEX_DOC_ID`) |
+| `--compact` | Emit compact JSON instead of pretty-printed. (env: `SOCKET_VEX_COMPACT`) |
+
+**Examples:**
+```bash
+# Print a VEX document to stdout (human-readable status goes to stderr)
+socket-patch vex
+
+# Write the document to a file
+socket-patch vex --output socket.vex.json
+
+# CI shape: VEX doc to file, machine-readable envelope to stdout
+socket-patch vex --json --output socket.vex.json
+
+# Generate on a build box without verifying on-disk files
+socket-patch vex --no-verify --output socket.vex.json
+```
+
 ### `vendor`
 
 `apply`'s **committable** sibling — the standalone command behind
@@ -418,6 +402,65 @@ socket-patch vendor --json
 > Prefer one command? [`scan --mode vendored`](#scan) discovers, downloads, *and* vendors in a single
 > pass.
 
+### `setup`
+
+Configure your project so patches are **re-applied automatically after install** — no manual `socket-patch apply` step in CI. `setup` is a one-time operation: run it, commit the change together with your `.socket/` patches, and every later install handles the rest. It is strictly **opt-in** — nothing is hooked unless you run `setup` and commit the result.
+
+- **npm / yarn / pnpm / bun** — writes a `postinstall` script into `package.json` so any install re-applies patches (pnpm: root package only).
+- **Python (pip / uv / poetry / pdm / hatch)** — Python has no universal post-install hook, so `setup` instead commits a **`socket-patch[hook]`** dependency (for classic Poetry, the equivalent `socket-patch = { extras = ["hook"] }`). Installing it lays down a startup `.pth` (shipped by the small `socket-patch-hook` wheel) that re-applies your committed `.socket/` patches the next time the interpreter runs. It is package-manager-agnostic (it rides the interpreter, not any one installer) and **fail-open** — a hook error can never break interpreter startup.
+- **Ruby gems (Bundler)** — adds a managed `plugin "socket-patch"` block to the `Gemfile` and commits an in-tree Bundler plugin under `.socket/bundler-plugin/`. It re-applies patches on every `bundle install` (cached *and* fresh). (Requires the `socket-patch` CLI on `PATH`.)
+- **Composer (PHP)** — appends `socket-patch apply` to `composer.json`'s `post-install-cmd` / `post-update-cmd` script events, so patches re-apply on every `composer install` / `composer update`. (Requires the `socket-patch` CLI on `PATH`.)
+- **Cargo & Go** — *apply-only, no `setup` hook.* A one-click auto-repatch-on-build isn't possible for these, so `setup` skips them. Patch with `socket-patch apply` directly: **cargo** patches the crate in place (in `vendor/` or the registry cache, rewriting `.cargo-checksum.json` so `cargo build` accepts it); **go** writes a project-local patched copy under `.socket/go-patches/` plus a `go.mod` `replace` directive (the module cache is `go.sum`-verified, so in-place patching can't build). Commit `go.mod` + `.socket/go-patches/` so a clone builds the patched bytes. Declare them in `setup.manual` for VEX attestation.
+- **Apply-only ecosystems** (nuget · maven · deno) — no native install hook to wire, so `setup` reports `no_files`; patch them on demand with `socket-patch apply`.
+
+**Usage:**
+```bash
+socket-patch setup            # configure (interactive)
+socket-patch setup --check    # verify configured; non-zero exit if not (CI gate)
+socket-patch setup --remove   # revert what setup added
+```
+
+**Command-specific options** (plus all [Global Options](#global-options) — `--dry-run`, `--yes`, `--json`, `--cwd`):
+| Flag | Description |
+|------|-------------|
+| `--check` | Read-only verification that every manifest is configured; exits non-zero if any still needs setup. Never writes (safe in CI). Conflicts with `--remove`. |
+| `--remove` | Revert the install hooks `setup` added (npm `package.json` scripts, the Python `socket-patch[hook]` dependency, and the gem Bundler plugin wiring). |
+
+#### Disabling / opting out (Python hook)
+
+The Python hook is designed to be easy to skip or remove:
+
+- **Per interpreter / CI step:** set `SOCKET_PATCH_HOOK=off` (or `SOCKET_NO_HOOK=1`). This is checked *before any hook code runs*, so it fully bypasses the hook for that process.
+- **Remove from a project:** `socket-patch setup --remove`, then `pip uninstall socket-patch-hook`.
+- **Never opted in:** if you don't run `setup`, there is no hook — it is opt-in by design.
+
+#### What the Python hook does, and its safety model
+
+On interpreter startup, *only when the set of installed packages changed*, the hook runs `socket-patch apply --offline --ecosystems pypi` for the project that owns the current virtualenv, re-applying only the patches committed in that project's `.socket/`. Specifically:
+
+- It is **anchored to the virtualenv** it is installed in (not the working directory), so a `python` started from an unrelated directory cannot pull in a foreign `.socket/manifest.json`.
+- It **verifies each file's hash before patching** and **never writes outside the installed package directory** (path-escaping manifest keys are refused).
+- It resolves the `socket-patch` binary from the **installed `socket-patch` package** (not from `PATH`), so an unexpected binary on `PATH` is not executed.
+- It runs **offline** (no network at startup) and is **fail-open** (any error is swallowed; it can never abort the interpreter).
+
+**Examples:**
+```bash
+# Interactive setup (all detected ecosystems, auto-detected)
+socket-patch setup
+
+# Non-interactive
+socket-patch setup -y
+
+# Preview changes
+socket-patch setup --dry-run
+
+# Verify configuration in CI (exits non-zero if not set up)
+socket-patch setup --check
+
+# JSON output for scripting
+socket-patch setup --json -y
+```
+
 ### `rollback`
 
 Rollback patches to restore original files. If no identifier is given, all patches are rolled back. Packages managed by [`vendor`](#vendor) are excluded — their patch lives in the committed artifact, not the installed tree — and are listed in the JSON output's `vendored` array (use `remove` or `vendor --revert` to undo them).
@@ -448,6 +491,54 @@ socket-patch rollback --dry-run
 
 # JSON output
 socket-patch rollback --json
+```
+
+### `get`
+
+Get security patches from Socket API and apply them. Accepts a UUID, CVE ID, GHSA ID, PURL, or package name. The identifier type is auto-detected but can be forced with a flag.
+
+Alias: `download`
+
+**Usage:**
+```bash
+socket-patch get <identifier> [options]
+```
+
+**Command-specific options** (plus all [Global Options](#global-options)):
+| Flag | Description |
+|------|-------------|
+| `--id` | Force identifier to be treated as a UUID |
+| `--cve` | Force identifier to be treated as a CVE ID |
+| `--ghsa` | Force identifier to be treated as a GHSA ID |
+| `-p, --package` | Force identifier to be treated as a package name |
+| `--save-only` | Download patch without applying it (alias: `--no-apply`) |
+| `--one-off` | Apply patch immediately without saving to the `.socket` folder |
+| `--all-releases` | Download patches for every release/distribution variant of a matched package (PyPI wheel/sdist, RubyGems platform, Maven classifier), not just the installed one |
+
+> Authenticated lookups require an org: pass `--org <slug>` (or set `SOCKET_ORG_SLUG`) when using `SOCKET_API_TOKEN`.
+
+**Examples:**
+```bash
+# Get patch by UUID
+socket-patch get 550e8400-e29b-41d4-a716-446655440000
+
+# Get patch by CVE
+socket-patch get CVE-2024-12345
+
+# Get patch by GHSA
+socket-patch get GHSA-xxxx-yyyy-zzzz
+
+# Get patch by package name (fuzzy matches installed packages)
+socket-patch get lodash
+
+# Download only, don't apply
+socket-patch get CVE-2024-12345 --save-only
+
+# Apply to global packages
+socket-patch get lodash -g
+
+# JSON output for scripting
+socket-patch get CVE-2024-12345 --json -y
 ```
 
 ### `list`
@@ -520,11 +611,13 @@ socket-patch remove "pkg:npm/lodash@4.17.20" --json
 
 ### `repair`
 
-Download missing blobs and clean up unused blobs.
+Download missing blobs, clean up unused blobs, and reset the advisory lock state.
 
 Alias: `gc`
 
 `repair` cleans up the `.socket/` directory without running a scan — useful when you've manually adjusted the manifest, recovered from a partial-failure state, or just want to free space. For the combined workflow (discover + apply + GC in one pass), use `scan --mode agent --prune --json --yes` instead.
+
+As its final step, `repair` removes the leftover `.socket/apply.lock` file that mutating commands retain between runs (skipped under `--dry-run`). A leftover file from a crashed run never blocks anything — the OS releases a dead process's lock automatically — so this is pure housekeeping. If another socket-patch process is actively running, `repair` refuses up front with `lock_held` (exit 1); it never steals a live lock — wait for the other process to finish, or budget a wait with `--lock-timeout`.
 
 **Usage:**
 ```bash
@@ -551,129 +644,9 @@ socket-patch repair --download-only
 socket-patch repair --json
 ```
 
-### `unlock`
-
-Inspect — and optionally release — the `.socket/apply.lock` advisory lock that the mutating commands (`apply`, `rollback`, `repair`, `remove`, `vendor`) take. Exits `0` when the lock is free and `1` when another socket-patch process holds it, so CI gates and monitoring can pattern-match the exit code without parsing JSON.
-
-Reach for it when recovering from a crashed run that left a stale `apply.lock` behind: `unlock` tells you whether anything still holds the lock, and `unlock --release` deletes the file once it's confirmed free. A held lock is never released — for that scenario re-run the failing mutating command with [`--break-lock`](#global-options) (or wait for the holder with `--lock-timeout`).
-
-**Usage:**
-```bash
-socket-patch unlock [options]
-```
-
-**Command-specific options** (plus all [Global Options](#global-options)):
-| Flag | Description |
-|------|-------------|
-| `--release` | When the lock is free, also delete the lock file (it is normally retained across runs). Refused when the lock is held. (env: `SOCKET_UNLOCK_RELEASE`) |
-
-**Examples:**
-```bash
-# Is anything holding the lock?
-socket-patch unlock
-
-# Free a stale lock left by a crashed run
-socket-patch unlock --release
-
-# JSON output for scripting
-socket-patch unlock --json
-```
-
-### `setup`
-
-Configure your project so patches are **re-applied automatically after install** — no manual `socket-patch apply` step in CI. `setup` is a one-time operation: run it, commit the change together with your `.socket/` patches, and every later install handles the rest. It is strictly **opt-in** — nothing is hooked unless you run `setup` and commit the result.
-
-- **npm / yarn / pnpm / bun** — writes a `postinstall` script into `package.json` so any install re-applies patches (pnpm: root package only).
-- **Python (pip / uv / poetry / pdm / hatch)** — Python has no universal post-install hook, so `setup` instead commits a **`socket-patch[hook]`** dependency (for classic Poetry, the equivalent `socket-patch = { extras = ["hook"] }`). Installing it lays down a startup `.pth` (shipped by the small `socket-patch-hook` wheel) that re-applies your committed `.socket/` patches the next time the interpreter runs. It is package-manager-agnostic (it rides the interpreter, not any one installer) and **fail-open** — a hook error can never break interpreter startup.
-- **Ruby gems (Bundler)** — adds a managed `plugin "socket-patch"` block to the `Gemfile` and commits an in-tree Bundler plugin under `.socket/bundler-plugin/`. It re-applies patches on every `bundle install` (cached *and* fresh). (Requires the `socket-patch` CLI on `PATH`.)
-- **Composer (PHP)** — appends `socket-patch apply` to `composer.json`'s `post-install-cmd` / `post-update-cmd` script events, so patches re-apply on every `composer install` / `composer update`. (Requires the `socket-patch` CLI on `PATH`.)
-- **Cargo & Go** — *apply-only, no `setup` hook.* A one-click auto-repatch-on-build isn't possible for these, so `setup` skips them. Patch with `socket-patch apply` directly: **cargo** patches the crate in place (in `vendor/` or the registry cache, rewriting `.cargo-checksum.json` so `cargo build` accepts it); **go** writes a project-local patched copy under `.socket/go-patches/` plus a `go.mod` `replace` directive (the module cache is `go.sum`-verified, so in-place patching can't build). Commit `go.mod` + `.socket/go-patches/` so a clone builds the patched bytes. Declare them in `setup.manual` for VEX attestation.
-- **Apply-only ecosystems** (nuget · maven · deno) — no native install hook to wire, so `setup` reports `no_files`; patch them on demand with `socket-patch apply`.
-
-**Usage:**
-```bash
-socket-patch setup            # configure (interactive)
-socket-patch setup --check    # verify configured; non-zero exit if not (CI gate)
-socket-patch setup --remove   # revert what setup added
-```
-
-**Command-specific options** (plus all [Global Options](#global-options) — `--dry-run`, `--yes`, `--json`, `--cwd`):
-| Flag | Description |
-|------|-------------|
-| `--check` | Read-only verification that every manifest is configured; exits non-zero if any still needs setup. Never writes (safe in CI). Conflicts with `--remove`. |
-| `--remove` | Revert the install hooks `setup` added (npm `package.json` scripts, the Python `socket-patch[hook]` dependency, and the gem Bundler plugin wiring). |
-
-#### Disabling / opting out (Python hook)
-
-The Python hook is designed to be easy to skip or remove:
-
-- **Per interpreter / CI step:** set `SOCKET_PATCH_HOOK=off` (or `SOCKET_NO_HOOK=1`). This is checked *before any hook code runs*, so it fully bypasses the hook for that process.
-- **Remove from a project:** `socket-patch setup --remove`, then `pip uninstall socket-patch-hook`.
-- **Never opted in:** if you don't run `setup`, there is no hook — it is opt-in by design.
-
-#### What the Python hook does, and its safety model
-
-On interpreter startup, *only when the set of installed packages changed*, the hook runs `socket-patch apply --offline --ecosystems pypi` for the project that owns the current virtualenv, re-applying only the patches committed in that project's `.socket/`. Specifically:
-
-- It is **anchored to the virtualenv** it is installed in (not the working directory), so a `python` started from an unrelated directory cannot pull in a foreign `.socket/manifest.json`.
-- It **verifies each file's hash before patching** and **never writes outside the installed package directory** (path-escaping manifest keys are refused).
-- It resolves the `socket-patch` binary from the **installed `socket-patch` package** (not from `PATH`), so an unexpected binary on `PATH` is not executed.
-- It runs **offline** (no network at startup) and is **fail-open** (any error is swallowed; it can never abort the interpreter).
-
-**Examples:**
-```bash
-# Interactive setup (all detected ecosystems, auto-detected)
-socket-patch setup
-
-# Non-interactive
-socket-patch setup -y
-
-# Preview changes
-socket-patch setup --dry-run
-
-# Verify configuration in CI (exits non-zero if not set up)
-socket-patch setup --check
-
-# JSON output for scripting
-socket-patch setup --json -y
-```
-
-### `vex`
-
-Generate an [OpenVEX](https://github.com/openvex) 0.2.0 attestation describing the vulnerabilities that the applied patches have mitigated. See [OpenVEX attestations](#openvex-attestations) below for the full workflow.
-
-**Usage:**
-```bash
-socket-patch vex [options]
-```
-
-**Command-specific options** (plus all [Global Options](#global-options)):
-| Flag | Description |
-|------|-------------|
-| `-O, --output <path>` | Write the VEX document to this path instead of stdout. Required when combined with `--json`. (env: `SOCKET_VEX_OUTPUT`) |
-| `--product <id>` | Override the auto-detected top-level product PURL/identifier. (env: `SOCKET_VEX_PRODUCT`) |
-| `--no-verify` | Skip the on-disk file-hash check and trust the manifest — useful on a build machine that doesn't have the patched files laid out. (env: `SOCKET_VEX_NO_VERIFY`) |
-| `--doc-id <id>` | Override the document `@id`. Default is a random `urn:uuid:<v4>` regenerated each run; pin this for a reproducible identifier. (env: `SOCKET_VEX_DOC_ID`) |
-| `--compact` | Emit compact JSON instead of pretty-printed. (env: `SOCKET_VEX_COMPACT`) |
-
-**Examples:**
-```bash
-# Print a VEX document to stdout (human-readable status goes to stderr)
-socket-patch vex
-
-# Write the document to a file
-socket-patch vex --output socket.vex.json
-
-# CI shape: VEX doc to file, machine-readable envelope to stdout
-socket-patch vex --json --output socket.vex.json
-
-# Generate on a build box without verifying on-disk files
-socket-patch vex --no-verify --output socket.vex.json
-```
-
 ### Undoing things
 
-Six commands undo different layers of socket-patch state — pick by what you want back:
+Five commands undo different layers of socket-patch state — pick by what you want back:
 
 | Command | What it undoes |
 |---------|----------------|
@@ -681,8 +654,7 @@ Six commands undo different layers of socket-patch state — pick by what you wa
 | [`remove`](#remove) | Rollback **plus** deletes the manifest entry and reverts any vendoring — **permanent**, the patch is fully gone in one command |
 | [`vendor --revert`](#vendor) | **Un-vendors wholesale**: restores the recorded original lockfile fragments byte-for-byte and removes the `.socket/vendor/` artifacts — works without a manifest |
 | [`scan --prune`](#scan) | **Reconciles, doesn't reverse**: drops manifest entries for packages no longer installed and garbage-collects orphan blob/diff/archive files — installed patches stay |
-| [`repair`](#repair) (alias `gc`) | **Restores health, not originals**: re-downloads missing blobs, rebuilds missing/corrupt vendored artifacts, and cleans up unused ones |
-| [`unlock --release`](#unlock) | **Frees a stale lock** left by a crashed run — never touches patches or the manifest, and refuses while the lock is held |
+| [`repair`](#repair) (alias `gc`) | **Restores health, not originals**: re-downloads missing blobs, rebuilds missing/corrupt vendored artifacts, cleans up unused ones, and removes the leftover `apply.lock` from a crashed run |
 
 ## OpenVEX attestations
 

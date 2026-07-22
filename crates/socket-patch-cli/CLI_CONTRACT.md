@@ -8,17 +8,18 @@ This document defines the **public surface** of the `socket-patch` binary. Anyth
 
 | Name | Visible alias(es) | Notes |
 |---|---|---|
+| `scan` | — | Crawl installed packages for available patches |
 | `apply` | — | Apply patches from the local manifest |
+| `vex` | — | Emit an OpenVEX 0.2.0 attestation derived from the local manifest |
+| `vendor` | — | Eject patched dependencies into committable `.socket/vendor/` and rewire lockfiles |
+| `setup` | — | Wire automatic-patching install hooks (npm/pypi/gem) |
 | `rollback` | — | Restore original files; takes optional positional `identifier` |
 | `get` | `download` | Fetch + apply patch; requires positional `identifier` |
-| `scan` | — | Crawl installed packages for available patches |
 | `list` | — | Print patches in the local manifest |
 | `remove` | — | Remove patch from manifest (rolls back first); requires positional `identifier` |
-| `setup` | — | Wire automatic-patching install hooks (npm/pypi/gem) |
-| `repair` | `gc` | Download missing blobs, rebuild missing/corrupt vendored artifacts, clean up unused ones |
-| `unlock` | — | Inspect (and optionally `--release`) the `<.socket>/apply.lock` advisory lock the mutating subcommands take; exits 0 when free, 1 when held (see [`src/commands/unlock.rs`](src/commands/unlock.rs)) |
-| `vendor` | — | Eject patched dependencies into committable `.socket/vendor/` and rewire lockfiles |
-| `vex` | — | Emit an OpenVEX 0.2.0 attestation derived from the local manifest |
+| `repair` | `gc` | Download missing blobs, rebuild missing/corrupt vendored artifacts, clean up unused ones, and delete the leftover `<.socket>/apply.lock` as a final housekeeping step (skipped under `--dry-run`; refuses with `lock_held` when a live process holds the lock) |
+
+**Removed in v4.0:** the `unlock` subcommand (fold: `repair` now cleans up the lock file; a leftover lock from a crashed run never blocks acquisition — the OS releases a dead holder's advisory lock — so there is no stale-lock state to inspect or clear before a mutating command).
 
 **Bare-UUID fallback.** `socket-patch <UUID>` is rewritten to `socket-patch get <UUID>`. The UUID shape checked is the standard 8-4-4-4-12 hex pattern (case-insensitive). See [`src/lib.rs::looks_like_uuid`](src/lib.rs).
 
@@ -49,7 +50,6 @@ In v3.0 every subcommand accepts the same set of "global" flags via a single sha
 | `--dry-run` | — | `SOCKET_DRY_RUN` | `false` | bool | Preview, no mutations |
 | `--yes` | `-y` | `SOCKET_YES` | `false` | bool | Skip prompts |
 | `--lock-timeout` | — | `SOCKET_LOCK_TIMEOUT` | (none) | seconds (u64) | How long to wait for `<.socket>/apply.lock`. Unset and `0` both mean a single non-blocking try; a positive value retries with a 100 ms backoff. Only meaningful on the mutating subcommands |
-| `--break-lock` | — | `SOCKET_BREAK_LOCK` | `false` | bool | Reclaim a stale `apply.lock` left by a crashed run (the file is never deleted — that would defeat mutual exclusion). Refuses with `lock_held` when a live process holds it; emits an auditable `lock_broken` warning event |
 | `--debug` | — | `SOCKET_DEBUG` | `false` | bool | Verbose debug logs to stderr |
 | `--no-telemetry` | — | `SOCKET_TELEMETRY_DISABLED` | `false` | bool | Disable anonymous usage telemetry |
 
@@ -80,7 +80,6 @@ Beyond the globals above, each subcommand defines a small set of local arguments
 | `rollback` | optional positional `identifier`; `--one-off` | `SOCKET_ONE_OFF` | Rollback target |
 | `vex` | `--output` / `-O`, `--product`, `--no-verify`, `--doc-id`, `--compact` | `SOCKET_VEX_OUTPUT`, `SOCKET_VEX_PRODUCT`, `SOCKET_VEX_NO_VERIFY`, `SOCKET_VEX_DOC_ID`, `SOCKET_VEX_COMPACT` | OpenVEX 0.2.0 document generation; see "vex output channels" below |
 | `repair` | `--download-only` | `SOCKET_DOWNLOAD_ONLY` | Repair-specific cleanup mode (mutually exclusive with `--offline`; combining them is a usage error, exit 2) |
-| `unlock` | `--release` | `SOCKET_UNLOCK_RELEASE` | When the lock is free, also delete the lock file (normally retained across runs). Refused when the lock is held — reclaiming a held-looking lock is `--break-lock`'s job on the mutating subcommand |
 | `setup` | `--check`, `--remove` (mutually exclusive); `--exclude` (CSV member paths); honors global `--ecosystems` | `SOCKET_SETUP_EXCLUDE`, `SOCKET_ECOSYSTEMS` | Wire / verify / revert the automatic-patching install hooks. `--exclude` skips + persists workspace members (property 9). See [Setup command contract](#setup-command-contract) |
 
 `scan --apply` opts JSON callers into the full discover → select → apply pipeline. Without it, `scan --json` stays read-only (discovery + `updates` array only). No effect outside `--json` mode — the non-JSON path always prompts the user interactively.
@@ -108,7 +107,7 @@ The rewriter reads a fixed set of candidate files from the project root: the npm
 * `.socket/vendor/state.json` — the **vendored**-mode ledger (see "Ownership, state, and reversal" below): wiring edits with verbatim pre-vendor originals, artifact fingerprints, optional `detached` records.
 * `.socket/vendor/redirect-state.json` — the **hosted**-mode ledger (`RedirectState` in `socket-patch-core/src/patch/redirect/state.rs`): `{ version, mode: "hosted", edits[], records{} }`. `edits` are recorded `FileEdit`s (append-only across re-runs — merge, never clobber: the pre-redirect originals a future revert needs live here); `records` maps PURL → the full manifest `PatchRecord` so a post-install `vex` can attest redirected patches with no manifest entry. The `mode` string is opaque to the loader (pre-rename ledgers carrying `"redirect"` still load; a hosted re-run normalizes them to `"hosted"`). Written identically by this CLI and by the depscan backend's hosted PR flow (`github-patch-pr-hosted.ts`).
 
-`--dry-run` previews what `apply` / `rollback` / `scan --apply` / `repair` / `remove` / `unlock --release` would do without mutating disk. In JSON mode, the envelope is populated with would-be actions and counts (`remove --dry-run` skips the confirmation prompt — there is nothing to confirm — and flips its would-be `Removed` events to `Verified` previews, so `summary.removed` stays "entries actually deleted"; `unlock --release --dry-run` keeps `released: false` and reports the preview via additive `dryRun` + `wouldRelease` fields).
+`--dry-run` previews what `apply` / `rollback` / `scan --apply` / `repair` / `remove` would do without mutating disk. In JSON mode, the envelope is populated with would-be actions and counts (`remove --dry-run` skips the confirmation prompt — there is nothing to confirm — and flips its would-be `Removed` events to `Verified` previews, so `summary.removed` stays "entries actually deleted"). `repair --dry-run` also skips the final lock-file deletion.
 
 The hidden alias `--no-apply` on `get --save-only` is **part of the contract** — it does not appear in `--help` but is widely used in existing scripts.
 
@@ -626,7 +625,6 @@ Empty string means unset at every layer: exported-but-empty flag-bound vars are 
 | `SOCKET_DRY_RUN` | `--dry-run` | `false` | — |
 | `SOCKET_YES` | `--yes` / `-y` | `false` | — |
 | `SOCKET_LOCK_TIMEOUT` | `--lock-timeout` | (none) | Seconds to wait for `apply.lock`; unset/`0` = single non-blocking try. |
-| `SOCKET_BREAK_LOCK` | `--break-lock` | `false` | Reclaim a stale `apply.lock`; refused when a live process holds it. |
 | `SOCKET_DEBUG` | `--debug` | `false` | **Renamed in v3.0** (was `SOCKET_PATCH_DEBUG`). |
 | `SOCKET_TELEMETRY_DISABLED` | `--no-telemetry` | `false` | **Renamed in v3.0** (was `SOCKET_PATCH_TELEMETRY_DISABLED`). |
 | `SOCKET_FORCE` | `apply --force` / `-f` | `false` | Local to `apply`. |
@@ -636,7 +634,6 @@ Empty string means unset at every layer: exported-but-empty flag-bound vars are 
 | `SOCKET_ALL_RELEASES` | `get --all-releases` / `scan --all-releases` | `false` | Local to `get`/`scan`. Download patches for every release/distribution variant, not just the installed one. |
 | `SOCKET_SKIP_ROLLBACK` | `remove --skip-rollback` | `false` | Local to `remove`. |
 | `SOCKET_DOWNLOAD_ONLY` | `repair --download-only` | `false` | Local to `repair`. |
-| `SOCKET_UNLOCK_RELEASE` | `unlock --release` | `false` | Local to `unlock`. Delete the lock file when free; refused when held. |
 | `SOCKET_SETUP_EXCLUDE` | `setup --exclude` | (none) | Local to `setup`; comma-separated workspace-member paths, persisted to `setup.exclude`. |
 | `SOCKET_VEX` | `apply --vex` / `scan --vex` / `vendor --vex` | (none) | Embedded OpenVEX output path. The `SOCKET_VEX_*` knobs (`_PRODUCT`, `_NO_VERIFY`, `_DOC_ID`, `_COMPACT`) are shared with the standalone `vex` command; on the host commands they bind to `--vex-product` etc. |
 | `SOCKET_VEX_OUTPUT` | `vex --output` / `-O` | (none) | Local to the standalone `vex`: document output path (required with `--json`). |
@@ -718,7 +715,7 @@ Every `--json` invocation emits a single JSON object that follows the **unified 
 
 ```jsonc
 {
-  "command":  "apply" | "rollback" | "get" | "scan" | "list" | "remove" | "repair" | "setup" | "unlock" | "vendor" | "vex",
+  "command":  "scan" | "apply" | "vex" | "vendor" | "setup" | "rollback" | "get" | "list" | "remove" | "repair",
   "status":   "success" | "partialFailure" | "error" | "noManifest" | "paidRequired" | "notFound",
   "dryRun":   false,
   "events":   [ <PatchEvent>, ... ],
@@ -858,9 +855,8 @@ The remaining commands still emit their pre-v3.0 ad-hoc JSON shapes and will mig
 - ⏳ `rollback` — still emits per-package result records.
 - ⏳ `setup` — still emits its own `{ status, updated, alreadyConfigured, errors, files }` shape (and the `--check` / `--remove` variants), now documented in full under [Setup command contract](#setup-command-contract).
 
-Two commands are **intentionally not** plain-envelope and will stay that way (not migration debt):
+One command is **intentionally not** plain-envelope and will stay that way (not migration debt):
 
-- `unlock` — **mixed**: the free path emits a flat `{ "command": "unlock", "status": "free", "lockFile": "...", "released": bool }` object (jq-friendly; documented at `src/commands/unlock.rs::emit_free`; under `--dry-run` it gains additive `dryRun: true` and — with `--release` — `wouldRelease: bool` fields, `released` staying truthfully false), while the held/error paths emit the standard envelope (`status: "error"`, code `lock_held` / `lock_io`).
 - `vex` — **hybrid**: the OpenVEX document is itself JSON and is the primary output; the envelope appears only under `--json --output <path>`. See the [vex output channels](#vex-output-channels) table.
 
 ### `patches[]` entry shape for `get` and `scan --apply`
@@ -956,7 +952,7 @@ Exit `1` when `status` is `partialFailure` (any `events[*].action == "failed"`) 
 | `1` | Error (missing/invalid manifest, fetch failed, apply failed, selection cancelled in non-JSON mode, etc.) |
 | `2` | Usage error: clap parse failures (unknown flag/value, missing required arg — including the clap-enforced `setup --check --remove` conflict) and the conflicts the commands enforce themselves — `scan`'s cross-mode conflicts (`--mode` combined with a DIFFERENT mode's boolean spelling, rejected in `resolve_mode_flags`), `repair --offline --download-only`. `vex` also exits `2` on hard errors before document generation (see its tri-state table below) |
 
-`list` returns **`0`** for an empty manifest and **`1`** for a missing manifest — these are distinct and load-bearing. `unlock` returns **`0`** when the lock is free and **`1`** when it is held (its `--release` refusal on a held lock is that same exit 1).
+`list` returns **`0`** for an empty manifest and **`1`** for a missing manifest — these are distinct and load-bearing. Every mutating subcommand returns **`1`** with `errorCode: lock_held` when another live socket-patch process holds `<.socket>/apply.lock`.
 
 `vex` exit codes are tri-state:
 
