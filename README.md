@@ -980,7 +980,7 @@ socket-patch repair [options]
 # Full repair (download missing + clean up unused)
 socket-patch repair
 
-# Repair without network access (missing blobs fail per-entry instead of downloading)
+# Cleanup only — missing blobs are warned about and skipped, never downloaded
 socket-patch repair --offline
 
 # Download missing blobs only
