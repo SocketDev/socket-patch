@@ -98,7 +98,9 @@ impl LockfileEntry {
 /// Inventory the project's npm-family lockfile. Routes by
 /// [`detect_npm_lock_flavor`] (PnP markers, bun.lockb, unsupported lock
 /// versions, and a missing lockfile all yield `None`).
-async fn inventory_npm_lock(project_root: &Path) -> Option<(NpmLockFlavor, Vec<LockfileEntry>)> {
+pub(crate) async fn inventory_npm_lock(
+    project_root: &Path,
+) -> Option<(NpmLockFlavor, Vec<LockfileEntry>)> {
     // Rush monorepos have no root package.json/lock pair; their single
     // pnpm source-of-truth lives under common/config/rush/. The flavor
     // probe (root-relative) can't see it, so fall back explicitly when the
