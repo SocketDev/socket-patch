@@ -55,9 +55,11 @@ pub enum ScanMode {
     /// Rewrite lockfiles so ONLY patched dependencies resolve to Socket's
     /// hosted patch server (== `--redirect`): no artifact bytes land in the
     /// repo, but installs must reach the patch server.
+    #[value(alias = "host")]
     Hosted,
     /// Commit patched artifacts to `.socket/vendor/` (== `--vendor`):
     /// hermetic, offline-safe installs at the cost of repo size.
+    #[value(alias = "vendor")]
     Vendored,
     /// Record patches in `.socket/manifest.json` + blobs and re-apply them
     /// in place, e.g. from CI (== `--apply`): smallest repo footprint, but
