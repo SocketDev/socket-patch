@@ -450,11 +450,16 @@ impl FakeReleaseBuilder {
                     .collect::<Vec<_>>(),
             );
             for name in &self.corrupt_sums_for {
-                // Flip the first hex nibble of the line whose name matches.
+                // Flip the first hex nibble of the matching line. Match on
+                // the full "  <name>" suffix, not a bare ends_with — a
+                // bare match would also corrupt a DIFFERENT asset whose
+                // name merely ends with this one ("a.tar.gz" vs
+                // "socket-patch-a.tar.gz").
+                let suffix = format!("  {name}");
                 sums = sums
                     .lines()
                     .map(|line| {
-                        if line.ends_with(name.as_str()) {
+                        if line.ends_with(&suffix) {
                             let flipped = if line.starts_with('0') { "f" } else { "0" };
                             format!("{flipped}{}", &line[1..])
                         } else {

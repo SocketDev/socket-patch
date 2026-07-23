@@ -150,14 +150,49 @@ pub async fn run(args: UpdateArgs) -> i32 {
 
     let asset = asset_name_for_target(UPDATE_TARGET);
 
-    // 4. Already there? (An explicit pin may go up OR down; `latest` never
-    //    downgrades — a dev build newer than the newest release is left
-    //    alone.) --force reinstalls regardless.
     let update_available = if pinned {
         target_version != current
     } else {
         is_newer(&target_version, &current)
     };
+
+    // 4. --dry-run is check-only, and it reports FIRST — whether or not an
+    //    update is available, the probe's contract is one metadata request,
+    //    zero downloads, zero mutation, exit 0, with `updateAvailable` in
+    //    the details (scripts branch on it).
+    if args.common.dry_run {
+        let msg = if update_available {
+            format!("Update available: socket-patch {current} → {target_version} (dry run; not installed)")
+        } else if args.force {
+            format!("Would reinstall socket-patch {target_version} (dry run; --force)")
+        } else {
+            format!("socket-patch {current} is already the latest version.")
+        };
+        if args.common.json {
+            let mut env = Envelope::new(Command::Update);
+            env.dry_run = true;
+            env.record(
+                PatchEvent::artifact(PatchAction::Verified)
+                    .with_reason("update_check", &msg)
+                    .with_details(serde_json::json!({
+                        "current": current.to_string(),
+                        "latest": target_version.to_string(),
+                        "updateAvailable": update_available,
+                        "target": UPDATE_TARGET,
+                        "asset": asset,
+                        "path": install_path.display().to_string(),
+                    })),
+            );
+            println!("{}", env.to_pretty_json());
+        } else if !args.common.silent {
+            println!("{msg}");
+        }
+        return 0;
+    }
+
+    // 5. Already there? (An explicit pin may go up OR down; `latest` never
+    //    downgrades — a dev build newer than the newest release is left
+    //    alone.) --force reinstalls regardless.
     if !update_available && !args.force {
         let msg = if pinned {
             format!("socket-patch is already version {current}.")
@@ -173,35 +208,6 @@ pub async fn run(args: UpdateArgs) -> i32 {
                     .with_details(serde_json::json!({
                         "current": current.to_string(),
                         "latest": target_version.to_string(),
-                    })),
-            );
-            println!("{}", env.to_pretty_json());
-        } else if !args.common.silent {
-            println!("{msg}");
-        }
-        return 0;
-    }
-
-    // 5. --dry-run is check-only: report, download nothing, mutate nothing.
-    if args.common.dry_run {
-        let msg = if update_available {
-            format!("Update available: socket-patch {current} → {target_version} (dry run; not installed)")
-        } else {
-            format!("Would reinstall socket-patch {target_version} (dry run; --force)")
-        };
-        if args.common.json {
-            let mut env = Envelope::new(Command::Update);
-            env.dry_run = true;
-            env.record(
-                PatchEvent::artifact(PatchAction::Verified)
-                    .with_reason("update_check", &msg)
-                    .with_details(serde_json::json!({
-                        "current": current.to_string(),
-                        "latest": target_version.to_string(),
-                        "updateAvailable": update_available,
-                        "target": UPDATE_TARGET,
-                        "asset": asset,
-                        "path": install_path.display().to_string(),
                     })),
             );
             println!("{}", env.to_pretty_json());

@@ -182,6 +182,38 @@ async fn update_dry_run_checks_without_downloading() {
     update_fixture::StagedInstall::assert_build_artifact_untouched(&real_hash);
 }
 
+/// `--dry-run` on an ALREADY-CURRENT install still reports through the
+/// verified/update_check probe shape (`updateAvailable: false`) — review
+/// regression: it used to fall into the skipped/already_latest path,
+/// breaking scripts that branch on the documented probe fields.
+#[tokio::test]
+async fn update_dry_run_up_to_date_still_reports_probe_shape() {
+    let install = staged_install();
+    let (served, _) = make_served_binary();
+
+    let release = FakeReleaseBuilder::new(CURRENT)
+        .asset_for_current_target(&served)
+        .expect_sums_fetches(0)
+        .expect_asset_downloads(0)
+        .mount()
+        .await;
+
+    let (code, stdout, _) = run_installed(
+        &install,
+        &["--update", "--dry-run", "--json"],
+        &[("SOCKET_UPDATE_BASE_URL", &release.base_url)],
+    );
+    assert_eq!(code, 0);
+    let env = common::parse_json_envelope(&stdout);
+    assert_eq!(env["dryRun"], true);
+    assert_eq!(env["events"][0]["action"], "verified");
+    let details = &env["events"][0]["details"];
+    assert_eq!(details["updateAvailable"], false);
+    assert_eq!(details["current"], CURRENT);
+    assert_eq!(details["latest"], CURRENT);
+    install.assert_binary_intact();
+}
+
 /// Already on the latest release: informational no-op, exit 0, and the
 /// sums/asset routes are never touched.
 #[tokio::test]

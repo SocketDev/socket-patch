@@ -11,11 +11,15 @@
 //! move the new one in, schedule the old file's removal).
 //!
 //! Concurrency: one advisory `flock` on `<state-dir>/update.lock` makes
-//! concurrent `--update` runs single-flight. The lock file lives in the
-//! per-user state dir, never in the install dir (writing locks into
-//! `/usr/local/bin` would demand privileges the check itself doesn't
-//! need), and `flock` semantics release it when the process dies — there
-//! is no stale-lock failure mode.
+//! concurrent `--update` runs single-flight **per environment**. The lock
+//! file lives in the per-user state dir, never in the install dir (writing
+//! locks into `/usr/local/bin` would demand privileges the check itself
+//! doesn't need), and `flock` semantics release it when the process dies —
+//! there is no stale-lock failure mode. Two updaters whose state dirs
+//! diverge (different `$HOME`s targeting one shared install) can race, but
+//! every path to the destination is a whole-file rename and the stage
+//! sweep is age-gated, so the worst case is duplicated work with a
+//! complete binary winning — never a torn one.
 
 use std::path::{Path, PathBuf};
 
@@ -80,6 +84,32 @@ pub fn swap_binary(staged: &Path, dest: &Path) -> Result<(), UpdateError> {
     result
 }
 
+/// Linux file capabilities (`setcap`) live in the `security.capability`
+/// xattr — the same class of privilege grant as setuid: a rename replaces
+/// the inode and an unprivileged updater cannot restore them, so a target
+/// carrying them is refused rather than silently stripped.
+#[cfg(target_os = "linux")]
+fn has_file_capabilities(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(cpath) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    let ret = unsafe {
+        libc::getxattr(
+            cpath.as_ptr(),
+            c"security.capability".as_ptr(),
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    ret > 0
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn has_file_capabilities(_path: &Path) -> bool {
+    false
+}
+
 #[cfg(unix)]
 fn swap_binary_inner(staged: &Path, dest: &Path) -> Result<(), UpdateError> {
     use std::os::unix::fs::PermissionsExt;
@@ -92,6 +122,13 @@ fn swap_binary_inner(staged: &Path, dest: &Path) -> Result<(), UpdateError> {
         return Err(UpdateError::SwapFailed(format!(
             "refusing to replace {}: it carries setuid/setgid bits an update cannot restore; \
              reinstall manually",
+            dest.display()
+        )));
+    }
+    if has_file_capabilities(dest) {
+        return Err(UpdateError::SwapFailed(format!(
+            "refusing to replace {}: it carries file capabilities (setcap) an update cannot \
+             restore; reinstall manually and re-apply setcap",
             dest.display()
         )));
     }

@@ -54,34 +54,19 @@ impl StagedBinary {
 }
 
 /// Download client: credential-free (User-Agent only — the Socket bearer
-/// must never reach GitHub/CDN hosts), explicit timeouts, and on the
-/// default endpoints an HTTPS-only redirect policy — GitHub bounces asset
-/// downloads to a CDN, and one `http://` hop would let a MITM serve both a
-/// malicious archive and its matching SHA256SUMS. Overridden bases
-/// (wiremock, mirrors) are plain-`http` on loopback by design, so the
-/// policy only applies when `endpoints.is_default()`.
+/// must never reach GitHub/CDN hosts), explicit timeouts, and the shared
+/// redirect policy (`release::follow_redirect_policy`): HTTPS-only hops on
+/// the default endpoints, hop-count-limited on overridden (loopback/
+/// mirror) bases.
 fn download_client(
     endpoints: &UpdateEndpoints,
     timeouts: &UpdateTimeouts,
 ) -> Result<reqwest::Client, UpdateError> {
-    let redirect_policy = if endpoints.is_default() {
-        reqwest::redirect::Policy::custom(|attempt| {
-            if attempt.previous().len() > 10 {
-                attempt.error("too many redirects")
-            } else if attempt.url().scheme() != "https" {
-                attempt.error("refusing insecure (non-HTTPS) redirect for a release download")
-            } else {
-                attempt.follow()
-            }
-        })
-    } else {
-        reqwest::redirect::Policy::limited(10)
-    };
     reqwest::Client::builder()
         .user_agent(crate::constants::USER_AGENT)
         .connect_timeout(timeouts.connect)
         .timeout(timeouts.download)
-        .redirect(redirect_policy)
+        .redirect(super::release::follow_redirect_policy(endpoints))
         .build()
         .map_err(|e| UpdateError::Network(format!("failed to build HTTP client: {e}")))
 }
@@ -228,14 +213,34 @@ fn stage_binary(dest_dir: &Path, bytes: &[u8]) -> Result<PathBuf, UpdateError> {
 }
 
 /// Best-effort sweep of stale stage files (crash leftovers) in `dest_dir`.
+///
+/// Age-gated: the update lock lives in the per-user state dir, so two
+/// updaters with divergent state-dir resolution (different `$HOME`s
+/// targeting one shared `/usr/local/bin`) can run concurrently — an
+/// unconditional sweep would delete the other run's *live* stage mid-
+/// pipeline and turn a benign race into a spurious failure. A genuine
+/// crash leftover is minutes-to-days old; a live stage is seconds old.
 pub(crate) fn sweep_stale_stages(dest_dir: &Path) {
+    const MIN_STALE_AGE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
     let Ok(entries) = std::fs::read_dir(dest_dir) else {
         return;
     };
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if name.starts_with(STAGE_PREFIX) || name.starts_with(".socket-patch.old-") {
+        if !name.starts_with(STAGE_PREFIX) && !name.starts_with(".socket-patch.old-") {
+            continue;
+        }
+        let old_enough = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|mtime| mtime.elapsed().ok())
+            .map(|age| age >= MIN_STALE_AGE)
+            // Unreadable metadata/clock: assume stale — the pre-gate
+            // behavior — rather than accumulating junk forever.
+            .unwrap_or(true);
+        if old_enough {
             let _ = std::fs::remove_file(entry.path());
         }
     }
@@ -458,7 +463,7 @@ mod tests {
     }
 
     #[test]
-    fn stage_lands_executable_in_dest_dir_and_sweep_removes_stale() {
+    fn stage_lands_executable_in_dest_dir_and_sweep_is_age_gated() {
         let tmp = tempfile::tempdir().unwrap();
         let staged = stage_binary(tmp.path(), b"#!/bin/sh\nexit 0\n").unwrap();
         assert!(staged.starts_with(tmp.path()));
@@ -473,8 +478,27 @@ mod tests {
             let mode = std::fs::metadata(&staged).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o755, "staged binary must be executable");
         }
+        // A seconds-old stage may belong to a CONCURRENT update whose lock
+        // lives in a different state dir (shared install, divergent HOMEs)
+        // — the sweep must leave it alone.
         sweep_stale_stages(tmp.path());
-        assert!(!staged.exists(), "sweep must remove stale stage files");
+        assert!(
+            staged.exists(),
+            "sweep must not remove a freshly-created (possibly live) stage"
+        );
+        // Aged past the threshold it is a crash leftover and goes away.
+        #[cfg(unix)]
+        {
+            let ok = std::process::Command::new("touch")
+                .args(["-m", "-t", "202001010000"])
+                .arg(&staged)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            assert!(ok, "touch -t must succeed to age the stage file");
+            sweep_stale_stages(tmp.path());
+            assert!(!staged.exists(), "sweep must remove old stage leftovers");
+        }
     }
 
     #[cfg(unix)]

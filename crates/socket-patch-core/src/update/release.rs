@@ -233,6 +233,31 @@ pub fn sha256sums_entry(sums: &str, file: &str) -> Result<String, UpdateError> {
     })
 }
 
+/// The redirect policy for every update-related request that follows
+/// redirects: on the default (real GitHub) endpoints any non-HTTPS hop is
+/// refused — GitHub bounces to CDNs, and one `http://` hop would let a
+/// MITM tamper with whichever leg it captures (the SHA256SUMS leg is the
+/// integrity root, so it needs this exactly as much as the archive leg).
+/// Overridden bases (wiremock fixtures, mirrors) are plain-`http` loopback
+/// by design, so there the policy is only hop-count-limited.
+pub(crate) fn follow_redirect_policy(
+    endpoints: &UpdateEndpoints,
+) -> reqwest::redirect::Policy {
+    if endpoints.is_default() {
+        reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() > 10 {
+                attempt.error("too many redirects")
+            } else if attempt.url().scheme() != "https" {
+                attempt.error("refusing insecure (non-HTTPS) redirect for release metadata")
+            } else {
+                attempt.follow()
+            }
+        })
+    } else {
+        reqwest::redirect::Policy::limited(10)
+    }
+}
+
 /// Build the reqwest client used for metadata fetches. Credential-free by
 /// construction (mirrors `plain_client`: only a User-Agent — the Socket
 /// bearer must never reach GitHub or a mirror).
@@ -298,7 +323,7 @@ async fn fetch_latest_via_api(
     endpoints: &UpdateEndpoints,
     timeouts: &UpdateTimeouts,
 ) -> Result<semver::Version, UpdateError> {
-    let client = metadata_client(timeouts, reqwest::redirect::Policy::limited(10))?;
+    let client = metadata_client(timeouts, follow_redirect_policy(endpoints))?;
     let url = endpoints.latest_api_url();
     let resp = client
         .get(&url)
@@ -334,7 +359,7 @@ pub async fn fetch_sha256sums_entry(
     version: &semver::Version,
     file: &str,
 ) -> Result<String, UpdateError> {
-    let client = metadata_client(timeouts, reqwest::redirect::Policy::limited(10))?;
+    let client = metadata_client(timeouts, follow_redirect_policy(endpoints))?;
     let url = endpoints.download_url(version, "SHA256SUMS");
     let resp = client
         .get(&url)
