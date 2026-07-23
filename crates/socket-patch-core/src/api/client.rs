@@ -877,7 +877,13 @@ impl ApiClient {
                 )));
             }
         }
-        match read_capped(resp, MAX_VENDOR_PACKAGE_BYTES).await {
+        match crate::utils::http::read_capped(
+            resp,
+            MAX_VENDOR_PACKAGE_BYTES,
+            "vendor package",
+        )
+        .await
+        {
             Ok(bytes) => ServeDownload::Ok(bytes),
             Err(e) => ServeDownload::Failed(ApiError::Network(e)),
         }
@@ -979,30 +985,8 @@ fn plain_client() -> reqwest::Client {
         .expect("failed to build plain reqwest client")
 }
 
-/// Stream a response body into memory with a hard byte cap, rejecting both an
-/// over-large declared `Content-Length` and an actual stream that exceeds the
-/// cap mid-flight.
-async fn read_capped(mut resp: reqwest::Response, max: u64) -> Result<Vec<u8>, String> {
-    if let Some(len) = resp.content_length() {
-        if len > max {
-            return Err(format!(
-                "vendor package too large: declared {len} bytes > {max} cap"
-            ));
-        }
-    }
-    let mut bytes: Vec<u8> = Vec::new();
-    while let Some(chunk) = resp
-        .chunk()
-        .await
-        .map_err(|e| format!("error reading vendor package body: {e}"))?
-    {
-        if bytes.len() as u64 + chunk.len() as u64 > max {
-            return Err(format!("vendor package exceeded {max}-byte cap mid-stream"));
-        }
-        bytes.extend_from_slice(&chunk);
-    }
-    Ok(bytes)
-}
+// The capped body reader lives in `utils/http.rs` (`read_capped`) so the
+// self-update downloader shares the identical cap semantics.
 
 /// Normalize a service-reported sha512 into SRI form (`sha512-<b64>`).
 ///

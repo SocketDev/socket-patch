@@ -24,3 +24,11 @@ rustflags = ["-C", "link-args=-Wl,--stack,8388608"]
 # falsy value, e.g. `SOCKET_NO_CONFIG=0`.
 [env]
 SOCKET_NO_CONFIG = "1"
+
+# The passive update-check notifier must never hit the network from a test
+# or a dev `cargo run`: ~90 e2e suites spawn the real binary, and the PTY
+# suites (interactive_prompts_e2e.rs) hand it a real terminal, defeating
+# the stderr-TTY guard that protects ordinary piped test runs. Notifier
+# tests opt back in with SOCKET_NO_UPDATE_CHECK=0 plus a wiremock
+# SOCKET_UPDATE_BASE_URL.
+SOCKET_NO_UPDATE_CHECK = "1"

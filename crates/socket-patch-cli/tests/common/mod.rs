@@ -57,7 +57,21 @@ pub fn run(cwd: &Path, args: &[&str]) -> (i32, String, String) {
 /// or override discovery roots (`NUGET_PACKAGES`, `GOMODCACHE`) without
 /// touching the parent process's environment — keeps tests parallel-safe.
 pub fn run_with_env(cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> (i32, String, String) {
-    let mut cmd = Command::new(binary());
+    run_bin_with_env(&binary(), cwd, args, env)
+}
+
+/// The scrub-and-run core of [`run_with_env`], parameterized over the
+/// binary path so the self-update suites can spawn a *copy* of the built
+/// binary (staged into a tempdir) under the exact same hermetic env as
+/// every other e2e test. `CARGO_BIN_EXE_socket-patch` itself must never
+/// be the target of an `--update` swap.
+pub fn run_bin_with_env(
+    bin: &Path,
+    cwd: &Path,
+    args: &[&str],
+    env: &[(&str, &str)],
+) -> (i32, String, String) {
+    let mut cmd = Command::new(bin);
     cmd.args(args).current_dir(cwd);
     // The binary binds a wide `SOCKET_*` env surface (SOCKET_CWD,
     // SOCKET_DRY_RUN, SOCKET_STRICT, SOCKET_GLOBAL, SOCKET_MANIFEST_PATH,
@@ -78,6 +92,8 @@ pub fn run_with_env(cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> (i32, St
         .env("SOCKET_JSON", "true")
         .env("SOCKET_SILENT", "true")
         .env("SOCKET_VERBOSE", "true")
+        .env("SOCKET_UPDATE_BASE_URL", "http://127.0.0.1:1")
+        .env("SOCKET_UPDATE_STATE_DIR", "/nonexistent")
         .env_remove("SOCKET_GLOBAL")
         .env_remove("SOCKET_GLOBAL_PREFIX")
         .env_remove("SOCKET_DRY_RUN")
@@ -85,6 +101,8 @@ pub fn run_with_env(cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> (i32, St
         .env_remove("SOCKET_JSON")
         .env_remove("SOCKET_SILENT")
         .env_remove("SOCKET_VERBOSE")
+        .env_remove("SOCKET_UPDATE_BASE_URL")
+        .env_remove("SOCKET_UPDATE_STATE_DIR")
         .env_remove("SOCKET_API_TOKEN");
     // Prefix-scrub whatever else the ambient shell carries; removing
     // SOCKET_API_TOKEN also forces the public proxy (free-tier).
@@ -92,7 +110,10 @@ pub fn run_with_env(cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> (i32, St
     // stays opted out.
     for (key, _) in std::env::vars_os() {
         let name = key.to_string_lossy();
-        if name.starts_with("SOCKET_") && !name.contains("TELEMETRY") && name != "SOCKET_NO_CONFIG"
+        if name.starts_with("SOCKET_")
+            && !name.contains("TELEMETRY")
+            && name != "SOCKET_NO_CONFIG"
+            && name != "SOCKET_NO_UPDATE_CHECK"
         {
             cmd.env_remove(&key);
         }
@@ -102,6 +123,12 @@ pub fn run_with_env(cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> (i32, St
     // fallback) must never authenticate a test child — it would flip every
     // "no token → public proxy" assertion onto the authed path.
     cmd.env("SOCKET_NO_CONFIG", "1");
+    // Same posture for the passive update notifier: no test child may ever
+    // fetch release metadata from real GitHub. The stderr-TTY guard covers
+    // piped children, but the PTY suites hand the binary a real terminal —
+    // this force-set is the layer that holds there. Notifier tests opt back
+    // in via caller env (which lands last).
+    cmd.env("SOCKET_NO_UPDATE_CHECK", "1");
     // Caller-supplied env lands last so explicit injections (runtime
     // gates, discovery roots) survive the scrub.
     for (k, v) in env {

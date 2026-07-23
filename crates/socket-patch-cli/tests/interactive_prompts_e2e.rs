@@ -84,11 +84,20 @@ fn run_in_pty_bytes(args: &[&str], cwd: &Path, input: &[u8], timeout: Duration) 
     // so an opted-out dev stays opted out.
     for (key, _) in std::env::vars_os() {
         let name = key.to_string_lossy();
-        if name.starts_with("SOCKET_") && !name.contains("TELEMETRY") && name != "SOCKET_NO_CONFIG"
+        if name.starts_with("SOCKET_")
+            && !name.contains("TELEMETRY")
+            && name != "SOCKET_NO_CONFIG"
+            && name != "SOCKET_NO_UPDATE_CHECK"
         {
             cmd.env_remove(&key);
         }
     }
+    // This suite is the one place test children get a REAL terminal, so the
+    // update notifier's stderr-TTY guard does not protect it. Force the
+    // kill-switch (mirroring the `.cargo/config.toml` `[env]` default the
+    // prefix scrub would otherwise strip) so no PTY child ever fetches
+    // release metadata mid-prompt.
+    cmd.env("SOCKET_NO_UPDATE_CHECK", "1");
 
     let mut child = pair
         .slave

@@ -81,6 +81,21 @@ The full list of prebuilt targets (Windows, 32-bit ARM, i686, Android) is in
 
 </details>
 
+### Updating
+
+If you installed via the one-liner or a manual download, the CLI updates itself:
+
+```bash
+socket-patch --update            # latest release (--update 3.4.0 pins a version)
+```
+
+It downloads the release for your platform, verifies its SHA-256 against the
+published `SHA256SUMS`, and atomically swaps the binary in place. Package-manager
+installs are detected and pointed at their own upgrade command instead (e.g.
+`npm update -g @socketsecurity/socket-patch`). When a newer release exists,
+interactive runs print a once-a-day reminder on stderr — set
+`SOCKET_NO_UPDATE_CHECK=1` to turn that off.
+
 ## Five-minute tutorial
 
 No account or token is needed to follow along — without an API token `socket-patch`

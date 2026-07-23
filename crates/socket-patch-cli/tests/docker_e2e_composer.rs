@@ -221,9 +221,15 @@ mkdir -p /workspace/proj && cd /workspace/proj
 cat > composer.json <<'EOF'
 {{ "name": "test/e2e", "type": "project", "require": {{}} }}
 EOF
-composer require --quiet --no-interaction monolog/monolog:3.5.0 > /tmp/install.log 2>&1 || {{
-  cat /tmp/install.log >&2; exit 1
-}}
+# monolog arrives over the real network (packagist metadata + the GitHub
+# zipball); transient stream/connection errors are the dominant flake in
+# this suite — retry with backoff before declaring the fixture broken.
+for attempt in 1 2 3; do
+  composer require --quiet --no-interaction monolog/monolog:3.5.0 > /tmp/install.log 2>&1 && break
+  if [ "$attempt" = 3 ]; then cat /tmp/install.log >&2; exit 1; fi
+  echo "composer require attempt $attempt failed; retrying" >&2
+  sleep $((attempt * 5))
+done
 
 PHP_FILE="vendor/monolog/monolog/src/Monolog/Logger.php"
 [ -f "$PHP_FILE" ] || {{ echo "FAIL: $PHP_FILE missing" >&2; ls vendor/monolog/monolog/src/Monolog/ >&2 || true; exit 1; }}
@@ -290,9 +296,13 @@ set -uo pipefail
 EXPECTED_SHA='{expected_sha}'
 
 # composer global require installs into $COMPOSER_HOME/vendor/.
-composer global require --quiet --no-interaction monolog/monolog:3.5.0 > /tmp/install.log 2>&1 || {{
-  cat /tmp/install.log >&2; exit 1
-}}
+# Same transient-network retry as the local leg (packagist + zipball).
+for attempt in 1 2 3; do
+  composer global require --quiet --no-interaction monolog/monolog:3.5.0 > /tmp/install.log 2>&1 && break
+  if [ "$attempt" = 3 ]; then cat /tmp/install.log >&2; exit 1; fi
+  echo "composer global require attempt $attempt failed; retrying" >&2
+  sleep $((attempt * 5))
+done
 
 COMPOSER_DIR=$(composer config --global home)
 PHP_FILE="$COMPOSER_DIR/vendor/monolog/monolog/src/Monolog/Logger.php"

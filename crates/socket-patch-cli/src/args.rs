@@ -371,6 +371,7 @@ pub const GLOBAL_ARG_ENV_VARS: &[&str] = &[
 /// parse every entry against its owning subcommand to keep this honest.
 pub const LOCAL_ARG_ENV_VARS: &[&str] = &[
     "SOCKET_FORCE",
+    "SOCKET_PATCH_VERSION",
     "SOCKET_SAVE_ONLY",
     "SOCKET_ONE_OFF",
     "SOCKET_ALL_RELEASES",
@@ -1093,6 +1094,7 @@ mod tests {
         const BOOL_BINDINGS: &[(&str, &[&str])] = &[
             ("SOCKET_FORCE", &["socket-patch", "apply"]),
             ("SOCKET_FORCE", &["socket-patch", "vendor"]),
+            ("SOCKET_FORCE", &["socket-patch", "self-update"]),
             ("SOCKET_SAVE_ONLY", &["socket-patch", "get", "x"]),
             ("SOCKET_ONE_OFF", &["socket-patch", "get", "x"]),
             ("SOCKET_ONE_OFF", &["socket-patch", "rollback"]),
@@ -1140,6 +1142,7 @@ mod tests {
 
         const VALUE_BINDINGS: &[(&str, &[&str])] = &[
             ("SOCKET_BATCH_SIZE", &["socket-patch", "scan"]),
+            ("SOCKET_PATCH_VERSION", &["socket-patch", "self-update"]),
             ("SOCKET_SETUP_EXCLUDE", &["socket-patch", "setup"]),
             ("SOCKET_VEX", &["socket-patch", "apply"]),
             ("SOCKET_VEX_OUTPUT", &["socket-patch", "vex"]),

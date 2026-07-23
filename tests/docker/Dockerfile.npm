@@ -32,6 +32,14 @@ RUN corepack enable \
  && corepack prepare pnpm@9.15.0 --activate \
  && corepack prepare yarn@1.22.22 --activate
 
+# Corepack defaults to fetching the LATEST package manager at run time for
+# projects with no `packageManager` field (COREPACK_DEFAULT_TO_LATEST=1),
+# silently overriding the activations above — which is how test runs
+# started downloading pnpm 11.x (requires Node >= 22) onto this Node 20
+# image and crashing with ERR_UNKNOWN_BUILTIN_MODULE(node:sqlite). Pin
+# runtime resolution to the activated versions.
+ENV COREPACK_DEFAULT_TO_LATEST=0
+
 # Cache yarn berry 4.x in corepack WITHOUT activating it: the global `yarn`
 # stays 1.22.22 (classic), and berry fixtures opt in per-project via
 # package.json `"packageManager": "yarn@4.12.0"`, which the corepack shim

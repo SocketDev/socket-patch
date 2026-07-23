@@ -23,6 +23,8 @@ This document defines the **public surface** of the `socket-patch` binary. Anyth
 
 **Bare-UUID fallback.** `socket-patch <UUID>` is rewritten to `socket-patch get <UUID>`. The UUID shape checked is the standard 8-4-4-4-12 hex pattern (case-insensitive). See [`src/lib.rs::looks_like_uuid`](src/lib.rs).
 
+**Root `--update` flag.** `socket-patch --update [VERSION]` updates the binary itself from GitHub Releases. It is a root flag, not a subcommand: argv is rewritten (the same mechanism as the bare-UUID fallback) onto an internal hidden subcommand whose name carries no stability guarantee — script the flag, never the internal name. Combining the flag with a subcommand (`socket-patch --update scan`) is a usage error (exit 2). Full contract: [Self-update contract](#self-update-contract-socket-patch---update).
+
 ## Global arguments
 
 In v3.0 every subcommand accepts the same set of "global" flags via a single shared `GlobalArgs` struct that's `#[command(flatten)]`-ed into each per-command struct (`crates/socket-patch-cli/src/args.rs`). Subcommands that don't actually consume a given flag accept it silently — e.g. `list --global` parses fine and is a no-op. Every flag also has an environment-variable binding; precedence is **CLI arg > env var > default** — and for exactly three keys (`--api-token`, `--org`, `--api-url`) the JS socket-cli's persisted login sits between env var and default: **CLI arg > env var (canonical, then `SOCKET_CLI_*` alias) > socket-cli `config.json` > default**. See "Persisted configuration" under Environment variables.
@@ -594,6 +596,57 @@ worse, lets a warm cache silently serve unpatched bytes):
 * `vendor` exits like `apply`: 0 on success (benign skips included), 1 on any refusal/failure
   (`partialFailure`), 2 on usage errors. `--dry-run` verifies and writes nothing.
 
+## Self-update contract (`socket-patch --update`)
+
+`socket-patch --update [VERSION]` replaces the running binary with a release from `https://github.com/SocketDev/socket-patch/releases` — the same artifacts, `SHA256SUMS` verification, and asset naming `install.sh` uses. It is for **standalone installs** (install.sh, manual tarball copy); every other channel is refused with that channel's own upgrade command.
+
+Synopsis and behavior:
+
+| Invocation | Behavior |
+|---|---|
+| `--update` | Resolve the latest release; install it if newer than the running version. Already-newest (including a dev build newer than any release): informational no-op, exit 0. `latest` never downgrades. |
+| `--update 3.4.0` | Install exactly that version, **up or down** — an explicit pin is explicit intent, no `--force` needed. Pin == current: no-op, exit 0. Also settable via `SOCKET_PATCH_VERSION` (the same pin env `install.sh` and the gem/composer launchers honor); a malformed version is a usage error (exit 2). |
+| `--update --force` | Reinstall/downgrade even when already at the target version, and proceed past a managed-install refusal (with a warning that the owning manager's next upgrade will overwrite the binary). Env: `SOCKET_FORCE`. |
+| `--update --dry-run` | **Check-only**: one metadata request, zero downloads, zero mutation, exit 0 — and always the `verified`/`update_check` event shape, whether or not an update exists. `--json` details carry `{current, latest, updateAvailable, target, asset, path}` — the cheap scriptable "is an update available" probe. |
+| `--update --offline` | Refused up front (strict airgap, before any client exists), exit 1. `--force` does **not** bypass it. |
+
+Honored global flags: `--json`, `--silent` (errors only), `--yes` (skip the confirm prompt; `--json` also auto-confirms), `--dry-run`, `--offline`, `--verbose`, `--debug`, `--no-telemetry`. Other global flags parse and are ignored (the `list --global` precedent).
+
+**Managed-install refusal.** The canonicalized executable path (symlinked invocations resolve to the real file) is classified before any network I/O; non-standalone channels exit 1 with `errorCode: managed_install` and the owning manager's command:
+
+| Detected channel | Hint |
+|---|---|
+| npm (`node_modules` path component) | `npm update -g @socketsecurity/socket-patch` |
+| PyPI wheel (`site-packages`/`dist-packages`) | `pip install --upgrade socket-patch` |
+| `cargo install` (`$CARGO_HOME/bin`, `~/.cargo/bin`) | `cargo install socket-patch-cli` |
+| gem/composer launcher cache (`<cache>/socket-patch/bin/…` — the two share one layout) | `gem update socket-patch` or `composer update socketsecurity/socket-patch` |
+| Homebrew (`Cellar`, `/opt/homebrew`) | `brew upgrade socket-patch` |
+
+**Pipeline order** (each step gates the next; a failure at any point leaves the installed binary untouched): fetch `SHA256SUMS` → fetch the archive (`socket-patch-<target-triple>.tar.gz`/`.zip`, explicit timeouts, size caps) → verify the SHA-256 **before** extraction → extract the single expected member → stage as an executable sibling **in the install directory** (`EACCES` here is the permissions preflight → exit 1 with a sudo hint; system temp is never used, so `noexec` mounts don't matter) → run the staged binary's `--version` self-check (against real GitHub the reported version must equal the release tag; under a `SOCKET_UPDATE_BASE_URL` override a mismatch only warns) → one atomic rename over the install path (mode-preserving; a **setuid/setgid** target — or, on Linux, one carrying **file capabilities** (`setcap`) — is refused, since an unprivileged swap cannot restore those grants; Windows uses the rename-dance via `self-replace`). Concurrent updates are single-flighted per environment by an advisory lock at `<state dir>/update.lock` (`errorCode: update_in_progress`; the OS releases a dead holder's lock, so there is no stale-lock state). Two updaters whose state dirs diverge (e.g. different `$HOME`s targeting one shared `/usr/local/bin`) are not serialized, but every path to the destination is a whole-file rename and stage cleanup is age-gated — the worst case is duplicated work, never a torn binary.
+
+**Envelope.** `command: "update"`. Success events: `downloaded` (`details: {asset, bytes, sha256}`) then `updated` (`details: {from, to, path, target}`). No-op: `skipped` with reason `already_latest`. Dry-run: `verified` with reason `update_check`. Top-level `errorCode` values (stable): `offline`, `managed_install`, `check_failed`, `asset_not_found`, `download_failed`, `checksum_mismatch`, `verify_failed`, `swap_failed`, `permission_denied`, `update_in_progress`. Exit codes: 0 success / no-op / dry-run; 1 operational failure; 2 usage.
+
+**Trust model.** Checksum-only, rooted in HTTPS + GitHub (identical to install.sh and the launcher wrappers): `SHA256SUMS` is served from the same origin as the archives, there are no signatures yet. Downloads are credential-free — the Socket API bearer is never sent to the release host — and non-HTTPS redirect hops are refused when talking to the default endpoints.
+
+### Passive update notice
+
+Commands other than `--update` itself may print, on **stderr only**, after all command output:
+
+```
+[socket-patch] Update available: 3.3.0 → 3.4.0
+[socket-patch] Run `socket-patch --update` to upgrade (set SOCKET_NO_UPDATE_CHECK=1 to hide)
+```
+
+The second line is channel-aware (an npm-managed install is pointed at `npm update -g …`, not at `--update`). Contract promises:
+
+- At most one release-metadata fetch per 24 h (cached in the state file below; a failed fetch also counts), and at most one notice per 24 h while an update is pending.
+- Never under `--json`, `--silent`, `--offline`/`SOCKET_OFFLINE`, in CI (`CI`/`GITHUB_ACTIONS` env), when stderr is not a terminal, or when `SOCKET_NO_UPDATE_CHECK` is truthy. Silenced means **zero network I/O**, not just no output.
+- Never changes a command's exit code or stdout; adds at most ~500 ms to a run (the background check is abandoned past that grace budget and retried on a later run).
+- State-file corruption, clock skew, or an unwritable cache dir degrade to "never checked" — they can never break a command.
+- Independent of telemetry: `--no-telemetry` does not affect the update check (it fetches public release metadata with no identifying payload beyond the CLI User-Agent); `SOCKET_OFFLINE` kills both.
+
+State lives at `$XDG_CACHE_HOME`|`~/.cache` (Unix/macOS) or `%LOCALAPPDATA%` (Windows) + `/socket-patch/update-check.json` (camelCase JSON: `schemaVersion`, `lastCheckAt`, `latestSeen`, `lastNotifiedAt`; unix seconds). A completed `--update` refreshes `latestSeen`, so the notifier never nags about a version the user just installed.
+
 ## Environment variables
 
 All v3.0 env vars use the `SOCKET_*` prefix. Three legacy `SOCKET_PATCH_*` names are still honored at runtime for compatibility: on first read of any of the three the binary emits a one-shot deprecation warning to stderr (the warning fires unconditionally — even under `--silent` / `--json` — because it's a transition signal users need to see). The legacy names will be removed in the next major release.
@@ -627,7 +680,8 @@ Empty string means unset at every layer: exported-but-empty flag-bound vars are 
 | `SOCKET_LOCK_TIMEOUT` | `--lock-timeout` | (none) | Seconds to wait for `apply.lock`; unset/`0` = single non-blocking try. |
 | `SOCKET_DEBUG` | `--debug` | `false` | **Renamed in v3.0** (was `SOCKET_PATCH_DEBUG`). |
 | `SOCKET_TELEMETRY_DISABLED` | `--no-telemetry` | `false` | **Renamed in v3.0** (was `SOCKET_PATCH_TELEMETRY_DISABLED`). |
-| `SOCKET_FORCE` | `apply --force` / `-f` | `false` | Local to `apply`. |
+| `SOCKET_FORCE` | `apply --force` / `-f`, `--update --force` | `false` | Local to `apply` and `--update`. |
+| `SOCKET_PATCH_VERSION` | `--update <VERSION>` | (latest) | Local to `--update`; the same pin `install.sh` and the gem/composer launchers honor. Not one of the deprecated legacy `SOCKET_PATCH_*` trio. |
 | `SOCKET_BATCH_SIZE` | `scan --batch-size` | `100` | Local to `scan`. |
 | `SOCKET_SAVE_ONLY` | `get --save-only` | `false` | Local to `get`. |
 | `SOCKET_ONE_OFF` | `get --one-off` / `rollback --one-off` | `false` | Local to `get`/`rollback`. Both are **not yet implemented**: the flag parses (boolishly, empty-tolerant) and the command fails up front with a "not yet implemented" error, before any network or disk activity. |
@@ -644,6 +698,7 @@ Empty string means unset at every layer: exported-but-empty flag-bound vars are 
 |---|---|---|
 | `SOCKET_NO_CONFIG` | `false` | Truthy (`1`/`true`/`yes`/`on`): disable the socket-cli persisted-config fallback layer entirely — pure flag+env behavior. Also the test-hermeticity switch (the workspace `.cargo/config.toml` exports it as `1` for every cargo-run process). |
 | `SOCKET_NO_API_TOKEN` | `false` | Truthy: ignore **ambient** API tokens (the `SOCKET_API_TOKEN` env var and the socket-cli config token); only an explicit `--api-token` flag authenticates. Peer alias: `SOCKET_CLI_NO_API_TOKEN`. |
+| `SOCKET_NO_UPDATE_CHECK` | `false` | Truthy: disable the passive update notice entirely (see "Passive update notice"). Explicit `--update` still works. Also a test-hermeticity switch (the workspace `.cargo/config.toml` exports it as `1` for every cargo-run process). No `SOCKET_CLI_*` alias (socket-cli has no equivalent today). |
 
 ### Persisted configuration (socket-cli `config.json`)
 
@@ -694,6 +749,10 @@ These exist for staged rollouts and the launcher wrappers. They are **internal**
 | `SOCKET_EXPERIMENTAL_MAVEN` | Opt-in gate (`=1`) for the maven installed-package crawl behind `scan`/`apply`/`vendor` — agent-mode in-place jar patching corrupts the `~/.m2` checksum sidecars, so discovery stays off by default (`src/ecosystem_dispatch.rs`). |
 | `SOCKET_EXPERIMENTAL_NUGET` | Same gate for nuget — in-place patching breaks the `.nupkg.sha512` tamper-evidence sidecar. |
 | `SOCKET_PATCH_BIN` | Points the RubyGems / Composer launcher wrappers and the gem Bundler plugin at an existing `socket-patch` binary (skips the download-on-first-run); also the escape hatch `apply` names when a golang-featureless binary is asked to audit Go redirects. |
+| `SOCKET_UPDATE_BASE_URL` | Points BOTH the release-metadata and asset-download routes of `--update`/the update notice at one base (mirror or test fixture) instead of `github.com` + `api.github.com`. Overriding it relaxes the downloaded binary's version self-check from hard-fail to warning. |
+| `SOCKET_UPDATE_STATE_DIR` | Overrides the per-user dir holding `update-check.json` + `update.lock` (tests point it into a tempdir). |
+| `SOCKET_UPDATE_TIMEOUT_MS` | Caps the update fetches' connect/metadata/download budgets (defaults 10 s / 30 s / 300 s; the notice's fetch defaults to 2 s). Doubles as the slow-network escape hatch. |
+| `SOCKET_UPDATE_NOTIFIER_FORCE` | Test hook: bypasses the update notice's stderr-TTY guard — and nothing else (opt-out, offline, `--silent`, `--json`, CI all still win). |
 
 ### Deprecated env vars
 
@@ -837,6 +896,7 @@ Every `--json` invocation emits a single JSON object that follows the **unified 
 | `list`       | `Discovered` (with `details.vulnerabilities`, `details.tier`, `details.license`, `details.description`, `details.exportedAt`) |
 | `repair`/`gc`| `Downloaded` (or `Verified` on dry-run) · `Rebuilt` (vendored artifacts; `Verified` previews on dry-run) · `Skipped` (vendor_uuid_mismatch) · `Removed` (or `Verified`) · `Failed` events |
 | `remove`     | `Removed` (per purl; `Verified` on dry-run) · artifact-level `Removed`/`Verified` event (with `details.blobsRemoved`, `details.rolledBack`) |
+| `--update`   | `Downloaded` → `Updated` (success) · `Skipped` (already_latest) · `Verified` (dry-run check, reason update_check) — see the Self-update contract section for details fields and top-level error codes |
 
 ### Migration status (v3.0)
 
