@@ -3,12 +3,13 @@
 //!
 //! Model: after clap parses (and never for `--update` itself — `main`
 //! skips the hook structurally), a guard stack decides whether a check may
-//! run at all. If one is due, the fetch happens in a spawned tokio task
-//! while the real command does its work; at the end of the run the task is
-//! joined with a 500 ms grace budget. A fetch that misses the budget is
-//! not waited for — its result (persisted by the task, unless the process
-//! wins the race and exits first, which self-heals next run) surfaces as a
-//! zero-latency cached notice on the NEXT run.
+//! run at all. If one is due, a spawned tokio task first records the
+//! attempt (so "once a day" holds even if the process exits mid-fetch),
+//! then fetches while the real command does its work; at the end of the
+//! run the task is joined with a 500 ms grace budget. A fetch that misses
+//! the budget is abandoned — a completed result surfaces as a zero-latency
+//! cached notice on the NEXT run, a killed one waits for tomorrow's
+//! attempt.
 //!
 //! Invariants (enforced by `update_notifier_e2e.rs`):
 //! - a silenced run performs **zero network I/O**, not just zero output;
@@ -189,10 +190,23 @@ pub fn spawn_if_due(common: &GlobalArgs) -> Option<Notifier> {
     })
 }
 
-/// The background fetch: bounded hard at 2 s (or the test override),
-/// persists its outcome — on failure too, so a broken network is retried
-/// at most once a day. All errors are swallowed into debug logs.
+/// The background fetch, bounded hard at 2 s (or the test override).
+///
+/// The ATTEMPT is persisted before the fetch, not after: the process may
+/// exit (and kill this task) as soon as the carrier command finishes, and
+/// on some platforms even a dead endpoint takes seconds to fail (Windows
+/// retries SYNs to a closed port) — recording afterwards would let every
+/// sub-grace command on a broken network burn a fresh fetch attempt.
+/// Writing first makes "at most one attempt per day" hold unconditionally;
+/// the cost is that a killed fetch's result waits for tomorrow's retry.
+/// All errors are swallowed into debug logs.
 async fn refresh_latest(debug: bool) -> Option<semver::Version> {
+    let mut state = core_update::load_state();
+    state.last_check_at = Some(core_update::unix_now());
+    if let Err(e) = core_update::save_state(&state).await {
+        debug_log(debug, &format!("could not persist update state: {e}"));
+    }
+
     let endpoints = UpdateEndpoints::from_env();
     let override_ms = std::env::var("SOCKET_UPDATE_TIMEOUT_MS")
         .ok()
@@ -213,13 +227,13 @@ async fn refresh_latest(debug: bool) -> Option<semver::Version> {
         }
     };
 
-    let mut state = core_update::load_state();
-    state.last_check_at = Some(core_update::unix_now());
     if let Some(v) = &fetched {
+        let mut state = core_update::load_state();
+        state.last_check_at = Some(core_update::unix_now());
         state.latest_seen = Some(v.to_string());
-    }
-    if let Err(e) = core_update::save_state(&state).await {
-        debug_log(debug, &format!("could not persist update state: {e}"));
+        if let Err(e) = core_update::save_state(&state).await {
+            debug_log(debug, &format!("could not persist update state: {e}"));
+        }
     }
     fetched
 }

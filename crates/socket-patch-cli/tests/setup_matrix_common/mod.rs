@@ -512,16 +512,39 @@ fn run_cases(label: &str, cases: Vec<Case>) {
         }
     }
 
+    // In docker mode the binary under test is the one BAKED INTO the local
+    // socket-patch-test-* image, not the workspace build — a weeks-old
+    // image fails current expectations deterministically and looks like a
+    // mystery regression (both report the same crate version, so only the
+    // image age gives it away). Say so in the failure message instead of
+    // letting the next person rediscover it.
+    let mode_hint = if host_mode() {
+        String::new()
+    } else {
+        let image = cases
+            .first()
+            .map(|c| c.image.as_str())
+            .unwrap_or("<ecosystem>");
+        format!(
+            "\nNOTE: docker mode ran the socket-patch binary baked into the \
+             local image (check its age: `docker images socket-patch-test-*`). \
+             A stale image fails current expectations without any real \
+             regression — rebuild first:\n  \
+             docker build -f tests/docker/Dockerfile.base -t socket-patch-test-base:latest .\n  \
+             docker build -f tests/docker/Dockerfile.{image} -t socket-patch-test-{image}:latest ."
+        )
+    };
     assert!(
         failures.is_empty(),
         "{}: {} of {} setup-matrix case(s) did not meet the aspirational \
          expectation. BASELINE GAP entries are the experimental TODO list \
          (this suite is non-blocking in CI); REGRESSION / LEAK entries are \
-         real problems:\n{}",
+         real problems:\n{}{}",
         label,
         failures.len(),
         cases.len(),
-        failures.join("\n")
+        failures.join("\n"),
+        mode_hint
     );
 }
 

@@ -1169,11 +1169,21 @@ async fn read_package_json_rejects_fifo_without_hanging() {
     let fifo_pkg = nm.join("fifo-pkg");
     tokio::fs::create_dir_all(&fifo_pkg).await.unwrap();
     let fifo = fifo_pkg.join("package.json");
-    let status = std::process::Command::new("mkfifo")
-        .arg(&fifo)
-        .status()
-        .expect("mkfifo must be runnable");
-    assert!(status.success(), "mkfifo failed");
+    // mkfifo(2) directly, not the /usr/bin/mkfifo binary: spawning a child
+    // here made the test flake under heavy parallel load (fork/exec
+    // starvation panicked the fixture setup before the code under test
+    // ever ran), and the syscall needs no process at all.
+    let c_path = {
+        use std::os::unix::ffi::OsStrExt;
+        std::ffi::CString::new(fifo.as_os_str().as_bytes()).expect("fifo path has no NUL")
+    };
+    let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
+    assert_eq!(
+        rc,
+        0,
+        "mkfifo(2) failed: {}",
+        std::io::Error::last_os_error()
+    );
     // A sibling real package proves the tree stays crawlable around the FIFO.
     stage_npm_pkg(&nm, "real-pkg", "1.0.0").await;
 
