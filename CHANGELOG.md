@@ -44,6 +44,29 @@ in this file — see `.github/workflows/release.yml` (`version` job).
 
 ### Added
 
+- **`socket-patch --update` — self-update.** Downloads the release for the
+  compiled target from GitHub Releases, verifies it against the published
+  `SHA256SUMS` before extraction, sanity-execs the staged binary, and
+  atomically swaps it in place (Windows uses the rename-dance via
+  `self-replace`; a setuid/setgid install is refused). `--update 3.4.0`
+  (or `SOCKET_PATCH_VERSION`) pins a version, up or down; bare `--update`
+  never downgrades; `--force` reinstalls. `--dry-run` is a check-only
+  probe (zero downloads, `updateAvailable` in the `--json` details).
+  Package-manager-managed installs (npm, pip, cargo, the gem/composer
+  launcher cache, Homebrew) are detected from the canonicalized executable
+  path and refused with that manager's own upgrade command; `--force`
+  overrides. `--offline` refuses up front and `--force` cannot bypass it.
+  Concurrent updates are single-flighted via an advisory lock; every
+  failure path leaves the installed binary untouched.
+- **Passive update notice.** Interactive runs mention a newer release at
+  most once a day, on stderr only, after the command's own output:
+  suppressed under `--json`/`--silent`/`--offline`, in CI, when stderr is
+  not a terminal, or with `SOCKET_NO_UPDATE_CHECK=1` (suppressed means
+  zero network I/O). The background check can never alter a command's
+  exit code, stdout, or add more than ~500 ms; state corruption degrades
+  to "never checked". An explicit `--update` refreshes the notice's cache.
+- **`shellcheck scripts/install.sh` in CI** (and a fix for the SC2144
+  glob-with-`-e` musl-loader probe it found).
 - **`socket login` now configures socket-patch.** The JS Socket CLI's
   persisted config (`<data dir>/socket/settings/config.json`) is read —
   never written — as a fallback layer below env vars for `apiToken`,
