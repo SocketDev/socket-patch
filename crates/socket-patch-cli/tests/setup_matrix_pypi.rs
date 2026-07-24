@@ -49,26 +49,31 @@
 mod smc;
 
 #[test]
+#[serial_test::serial]
 fn pip() {
     smc::run_pm("pypi", "pip");
 }
 
 #[test]
+#[serial_test::serial]
 fn uv() {
     smc::run_pm("pypi", "uv");
 }
 
 #[test]
+#[serial_test::serial]
 fn poetry() {
     smc::run_pm("pypi", "poetry");
 }
 
 #[test]
+#[serial_test::serial]
 fn pdm() {
     smc::run_pm("pypi", "pdm");
 }
 
 #[test]
+#[serial_test::serial]
 fn hatch() {
     smc::run_pm("pypi", "hatch");
 }
@@ -213,15 +218,14 @@ mod host_guard {
     /// a real pip project, asserting REAL on-disk + JSON state at every stage.
     /// This is the assertion the Docker matrix can never make for pypi.
     #[test]
+    #[serial_test::serial]
     fn pypi_setup_roundtrip_host() {
         // Committed regression guard for the env scrub itself: with the old
         // fixed-list scrub these leaked into the child — SOCKET_STRICT /
         // SOCKET_VENDOR_SOURCE aborted every parse (exit 2) and
         // SOCKET_SETUP_EXCLUDE made the real `setup` run write
         // `.socket/manifest.json` into the fixture.
-        for (k, v) in HOSTILE_DECOYS {
-            std::env::set_var(k, v);
-        }
+        let _decoys = crate::smc::DecoyGuard::set(HOSTILE_DECOYS);
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         std::fs::write(root.join("requirements.txt"), REQ_INITIAL).unwrap();
@@ -392,10 +396,6 @@ mod host_guard {
             "needs_configuration",
             "after remove the project must report needs_configuration again:\n{v}"
         );
-
-        for (k, _) in HOSTILE_DECOYS {
-            std::env::remove_var(k);
-        }
     }
 
     /// Regression: a commented-out hook line is NOT a configured project.
@@ -407,6 +407,7 @@ mod host_guard {
     /// project with no hook at all. Check and setup must agree on the same
     /// bytes.
     #[test]
+    #[serial_test::serial]
     fn pypi_check_ignores_commented_out_hook_host() {
         const REQ_COMMENTED: &str = "requests==2.31.0\n# socket-patch[hook]\n";
         let tmp = tempfile::tempdir().unwrap();
@@ -454,6 +455,7 @@ mod host_guard {
     /// running the real binary against a hand-authored Poetry manifest in each
     /// state. Fully hermetic: `--check` neither writes nor refreshes a lockfile.
     #[test]
+    #[serial_test::serial]
     fn poetry_check_recognizes_structural_hook_host() {
         // ── configured: the exact structural form `setup` emits ─────────────
         let tmp = tempfile::tempdir().unwrap();
@@ -520,11 +522,13 @@ mod host_guard {
 // these don't apply today — but the install itself must succeed.
 
 #[test]
+#[serial_test::serial]
 fn pip_workspace() {
     smc::run_workspace_pm("pypi", "pip");
 }
 
 #[test]
+#[serial_test::serial]
 fn uv_workspace() {
     smc::run_workspace_pm("pypi", "uv");
 }

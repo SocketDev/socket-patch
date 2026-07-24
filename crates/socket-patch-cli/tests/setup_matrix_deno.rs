@@ -46,6 +46,7 @@ mod smc;
 /// path that silently no-ops on skip — it is NOT a regression guard. The
 /// real teeth live in [`host_guard`] below.
 #[test]
+#[serial_test::serial]
 // Experimental ecosystem (deno): the setup-matrix aspirational cases are a
 // BASELINE GAP (setup does not wire deno's install hook yet). This passes on CI
 // only because the runners lack the `deno` toolchain (the cases soft-skip); on
@@ -172,10 +173,9 @@ mod host_guard {
     ];
 
     #[test]
+    #[serial_test::serial]
     fn deno_setup_roundtrip_host() {
-        for (k, v) in HOSTILE_DECOYS {
-            std::env::set_var(k, v);
-        }
+        let _decoys = crate::smc::DecoyGuard::set(HOSTILE_DECOYS);
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         std::fs::write(root.join("package.json"), PACKAGE_JSON).unwrap();
@@ -331,9 +331,5 @@ mod host_guard {
             Some(0),
             "no manifest may report configured after the hook is removed.\n{out}"
         );
-
-        for (k, _) in HOSTILE_DECOYS {
-            std::env::remove_var(k);
-        }
     }
 }

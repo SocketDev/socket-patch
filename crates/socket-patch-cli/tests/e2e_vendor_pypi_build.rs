@@ -278,6 +278,7 @@ fn copy_dir_recursive(src: &Path, dst: &Path) {
 // ── capstone 1: uv project flavor ─────────────────────────────────────
 
 #[test]
+#[serial_test::serial]
 fn uv_vendor_fresh_checkout_frozen_offline_and_revert() {
     let Some(uv) = find_uv() else {
         println!("SKIP e2e_vendor_pypi_build(uv): `uv` not on PATH or at ~/.local/bin/uv");
@@ -476,6 +477,7 @@ fn uv_vendor_fresh_checkout_frozen_offline_and_revert() {
 // ── capstone 2: requirements.txt flavor (pip + `uv pip`) ──────────────
 
 #[test]
+#[serial_test::serial]
 fn pip_requirements_vendor_fresh_checkout_no_index_and_revert() {
     let Some(python) = find_python() else {
         println!("SKIP e2e_vendor_pypi_build(pip): no python3/python on PATH");
