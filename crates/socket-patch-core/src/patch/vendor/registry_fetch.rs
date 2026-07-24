@@ -756,6 +756,14 @@ fn verify_integrity(bytes: &[u8], integrity: &LockIntegrity) -> Result<(), Fetch
 
 /// SRI verification: pick the strongest hash of a (possibly multi-hash,
 /// whitespace-separated) SRI string and compare base64 digests.
+///
+/// `sha1` is accepted as a LAST resort (never preferred over sha256+): it is
+/// the only integrity npm-era lockfile entries carry (yarn classic writes
+/// `integrity sha1-…` for them), and it is the exact guarantee the package
+/// manager itself enforces for those entries — refusing it would make every
+/// legacy package unvendorable whenever the prebuilt-artifact service misses
+/// (the 2026-07 strapi clean-run regression). The bare-hex twin of this trust
+/// decision already lives in the `LockIntegrity::Sha1Hex` arm above.
 fn verify_sri(bytes: &[u8], sri: &str) -> Result<(), String> {
     let mut best: Option<(u8, &str, &str)> = None;
     for token in sri.split_whitespace() {
@@ -766,6 +774,7 @@ fn verify_sri(bytes: &[u8], sri: &str) -> Result<(), String> {
             "sha512" => 3,
             "sha384" => 2,
             "sha256" => 1,
+            "sha1" => 0,
             _ => continue,
         };
         if best.map(|(r, _, _)| rank > r).unwrap_or(true) {
@@ -779,6 +788,7 @@ fn verify_sri(bytes: &[u8], sri: &str) -> Result<(), String> {
     let actual = match algo {
         "sha512" => b64.encode(Sha512::digest(bytes)),
         "sha384" => b64.encode(Sha384::digest(bytes)),
+        "sha1" => b64.encode(Sha1::digest(bytes)),
         _ => b64.encode(Sha256::digest(bytes)),
     };
     if actual == expect {
@@ -988,6 +998,30 @@ mod tests {
             verify_sri(bytes, "md5-abc=").is_err(),
             "unknown algos refuse"
         );
+    }
+
+    #[test]
+    fn sri_sha1_is_accepted_as_last_resort() {
+        use base64::Engine as _;
+        let bytes = b"hello";
+        let sha1_b64 = base64::engine::general_purpose::STANDARD.encode(Sha1::digest(bytes));
+        // npm-era lockfile entries carry ONLY `sha1-…` (the strapi clean-run
+        // regression: `no usable hash in SRI`); it must verify…
+        assert!(
+            verify_sri(bytes, &format!("sha1-{sha1_b64}")).is_ok(),
+            "sha1-only SRI must be usable"
+        );
+        // …and still be a REAL check, not a fail-open.
+        let wrong = base64::engine::general_purpose::STANDARD.encode(Sha1::digest(b"other"));
+        assert!(
+            verify_sri(bytes, &format!("sha1-{wrong}")).is_err(),
+            "sha1 mismatch must refuse"
+        );
+        // sha1 never outranks a stronger hash: a correct sha1 alongside a
+        // wrong sha512 fails (strongest wins), the reverse passes.
+        let sha512_good = sri_of(bytes);
+        assert!(verify_sri(bytes, &format!("sha1-{sha1_b64} sha512-WRONG=")).is_err());
+        assert!(verify_sri(bytes, &format!("sha1-{wrong} {sha512_good}")).is_ok());
     }
 
     #[tokio::test]
