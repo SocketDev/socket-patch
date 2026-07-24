@@ -45,6 +45,7 @@ mod smc;
 /// path that silently no-ops on skip — it is NOT a regression guard. The
 /// real teeth live in [`host_guard`] below.
 #[test]
+#[serial_test::serial]
 // Experimental ecosystem (maven): aspirational setup-matrix cases are a
 // BASELINE GAP today; this passes on CI only because the runners lack `mvn`
 // (cases soft-skip) and fails on any host that has it. Ignore so maven can
@@ -226,15 +227,14 @@ mod host_guard {
     }
 
     #[test]
+    #[serial_test::serial]
     fn maven_setup_is_a_clean_noop_host() {
         // Committed regression guard for the env scrub itself: with the old
         // fixed-list scrub these leaked into the child — SOCKET_STRICT /
         // SOCKET_VENDOR_SOURCE aborted every parse (exit 2) and
         // SOCKET_SETUP_EXCLUDE made the real `setup` run write
         // `.socket/manifest.json` into the fixture (assert_pristine RED).
-        for (k, v) in HOSTILE_DECOYS {
-            std::env::set_var(k, v);
-        }
+        let _decoys = crate::smc::DecoyGuard::set(HOSTILE_DECOYS);
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         std::fs::write(root.join("pom.xml"), POM_XML).unwrap();
@@ -318,9 +318,5 @@ mod host_guard {
             Some(1),
             "positive control: exactly the package.json must count as needing configuration.\n{out}"
         );
-
-        for (k, _) in HOSTILE_DECOYS {
-            std::env::remove_var(k);
-        }
     }
 }

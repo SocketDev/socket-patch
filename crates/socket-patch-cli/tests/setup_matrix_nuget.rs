@@ -49,6 +49,7 @@ mod smc;
 /// path that silently no-ops on skip — it is NOT a regression guard. The
 /// real teeth live in [`host_guard`] below.
 #[test]
+#[serial_test::serial]
 // Experimental ecosystem (nuget): aspirational setup-matrix cases are a
 // BASELINE GAP today; this passes on CI only because the runners lack `dotnet`
 // (cases soft-skip) and fails on any host that has it. Ignore so nuget can
@@ -200,15 +201,14 @@ mod host_guard {
     /// asserting REAL on-disk + JSON state at every stage. This is the
     /// assertion the Docker matrix can never make for nuget.
     #[test]
+    #[serial_test::serial]
     fn nuget_setup_roundtrip_host() {
         // Committed regression guard for the env scrub itself: with the old
         // fixed-list scrub these leaked into the child — SOCKET_STRICT /
         // SOCKET_VENDOR_SOURCE aborted every parse (exit 2) and
         // SOCKET_SETUP_EXCLUDE made the real `setup` run write
         // `.socket/manifest.json` into the fixture (final entries check RED).
-        for (k, v) in HOSTILE_DECOYS {
-            std::env::set_var(k, v);
-        }
+        let _decoys = crate::smc::DecoyGuard::set(HOSTILE_DECOYS);
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         std::fs::write(root.join(CSPROJ_NAME), CSPROJ).unwrap();
