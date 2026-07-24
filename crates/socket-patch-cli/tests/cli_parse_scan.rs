@@ -763,3 +763,101 @@ fn scrub_covers_every_scan_env_var_clap_consults() {
         );
     }
 }
+
+// --- hidden `--mode` value aliases ("vendor" / "host") ----------------------
+//
+// `--mode vendor` and `--mode host` are UNDOCUMENTED spellings accepted for
+// muscle-memory reasons (they match the boolean flag names). They are clap
+// value aliases on the `ScanMode` variants, which clap keeps out of help
+// output — the tests below lock in both the acceptance and the hiding.
+
+#[test]
+#[serial_test::serial]
+fn mode_alias_vendor_folds_to_vendor() {
+    // The parser resolves the hidden alias to the canonical variant...
+    assert_eq!(
+        parse_scan(&["--mode", "vendor"]).mode,
+        Some(ScanMode::Vendored)
+    );
+    // ...and the fold keeps it as the single source of truth, exactly as if
+    // `--mode vendored` were given.
+    let folded = parse_and_resolve(&["--mode", "vendor"]).expect("fold ok");
+    assert_eq!(
+        folded.mode,
+        Some(ScanMode::Vendored),
+        "--mode vendor (hidden alias) == --mode vendored"
+    );
+}
+
+#[test]
+#[serial_test::serial]
+fn mode_alias_host_folds_to_redirect() {
+    assert_eq!(parse_scan(&["--mode", "host"]).mode, Some(ScanMode::Hosted));
+    let folded = parse_and_resolve(&["--mode", "host"]).expect("fold ok");
+    assert_eq!(
+        folded.mode,
+        Some(ScanMode::Hosted),
+        "--mode host (hidden alias) == --mode hosted"
+    );
+}
+
+#[test]
+#[serial_test::serial]
+fn mode_alias_host_with_vendor_boolean_errors_with_canonical_name() {
+    // The alias resolves to `ScanMode::Hosted` at parse time, so the
+    // cross-mode contradiction fires exactly as with the canonical
+    // spelling — and the error message names the canonical mode
+    // (`cli_name()`), never echoing the alias the user typed.
+    let mut args = parse_scan(&["--mode", "host", "--vendor"]);
+    let err = resolve_mode_flags(&mut args).expect_err("cross-mode contradiction");
+    assert!(
+        err.contains("--mode hosted cannot be used with --vendor"),
+        "error must name the canonical mode (\"hosted\"), got: {err}"
+    );
+}
+
+#[test]
+#[serial_test::serial]
+fn mode_aliases_hidden_from_help() {
+    use clap::CommandFactory;
+    // clap embeds live env values into help as `[env: VAR=value]` at
+    // command-build/render time; an ambient value containing "host:" or
+    // "vendor:" (e.g. SOCKET_PROXY_URL=http://localhost:8080) would trip
+    // the alias-leak asserts below, so the whole build+render runs clean.
+    let (short, long) = with_clean_env(|| {
+        let mut cmd = Cli::command();
+        let scan = cmd.find_subcommand_mut("scan").expect("scan subcommand");
+        (
+            scan.render_help().to_string(),
+            scan.render_long_help().to_string(),
+        )
+    });
+
+    // Short help (`scan -h`) renders the compact bracketed list. Assert on
+    // the exact rendered segment — NOT on substring absence, because
+    // "vendored" contains "vendor" as a substring — so any extra value
+    // inside the brackets (a leaked alias) breaks the match.
+    assert!(
+        short.contains("[possible values: hosted, vendored, agent]"),
+        "scan -h must list exactly the canonical mode names; help was:\n{short}"
+    );
+
+    // Long help (`scan --help`) itemizes each possible value with its doc
+    // comment. The canonical items render as "hosted:" / "vendored:" /
+    // "agent:"; an alias leaking into the itemized list would render as
+    // "host:" or "vendor:" (name immediately followed by the colon).
+    for canonical in ["hosted:", "vendored:", "agent:"] {
+        assert!(
+            long.contains(canonical),
+            "scan --help must itemize `{canonical}`; help was:\n{long}"
+        );
+    }
+    for alias in ["host:", "vendor:"] {
+        // "host:" is NOT a substring of "hosted:" (the canonical item has
+        // 'e' after "host"), so any literal hit is a genuine leak.
+        assert!(
+            !long.contains(alias),
+            "hidden alias `{alias}` leaked into scan --help; help was:\n{long}"
+        );
+    }
+}
