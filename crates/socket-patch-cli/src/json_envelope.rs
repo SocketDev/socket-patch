@@ -72,6 +72,15 @@ pub struct Envelope {
     /// against ecosystems with no sidecar contract (e.g. npm).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub sidecars: Vec<SidecarRecord>,
+    /// Run-level advisories that are about the PROJECT's state rather than
+    /// any single package (e.g. `yarn_classic_berry_migration_risk`: the
+    /// wired classic lockfile would be silently de-patched by a yarn 2+
+    /// install). Distinct from per-purl `events` — consumers alert on these
+    /// without attributing them to a package. Empty (and omitted from JSON)
+    /// for runs with nothing to advise, so existing consumers see byte-
+    /// identical output.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<RunWarning>,
     /// Present only when `--vex <path>` was passed to `apply`/`scan` and
     /// an OpenVEX document was successfully generated as a side-effect of
     /// the run. Describes where it landed and how many statements it
@@ -108,6 +117,7 @@ impl Envelope {
             summary: Summary::default(),
             error: None,
             sidecars: Vec::new(),
+            warnings: Vec::new(),
             vex: None,
         }
     }
@@ -435,6 +445,17 @@ impl EnvelopeError {
             message: message.into(),
         }
     }
+}
+
+/// One run-level advisory (see [`Envelope::warnings`]). Same `code`/`detail`
+/// vocabulary as per-event reasons, but scoped to the whole project/run.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunWarning {
+    /// Stable routing tag, e.g. `yarn_classic_berry_migration_risk`.
+    pub code: String,
+    /// Human-readable explanation with the suggested remediation.
+    pub detail: String,
 }
 
 // ---------------------------------------------------------------------------

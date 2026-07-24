@@ -42,7 +42,7 @@ use crate::commands::lock_cli::acquire_or_emit;
 use crate::commands::vex::{generate_vex_from_manifest_path, VexEmbedArgs};
 use crate::ecosystem_dispatch::{find_packages_for_purls, partition_purls};
 use crate::json_envelope::{
-    Command, Envelope, EnvelopeError, PatchAction, PatchEvent, Status, VexSummary,
+    Command, Envelope, EnvelopeError, PatchAction, PatchEvent, RunWarning, Status, VexSummary,
 };
 
 #[derive(Args)]
@@ -254,6 +254,30 @@ pub(crate) fn record_warning(
     );
 }
 
+/// Run-level advisory shared by the `vendor` command and the scan-driven
+/// vendor step: warn (once, at the envelope level — not per package) when
+/// the project's classic `yarn.lock` carries vendored wiring that a stray
+/// yarn 2+ install would silently drop. The probe is state-based (it reads
+/// the on-disk lockfile), so callers invoke it unconditionally at
+/// envelope-finalize time — unwired projects and fully-reverted runs stay
+/// silent, and dry runs report the risk that already exists on disk.
+pub(crate) fn note_classic_migration_risk(
+    env: &mut Envelope,
+    project_root: &Path,
+    common: &GlobalArgs,
+) {
+    let Some(w) = vendor::yarn_classic_berry_migration_risk(project_root) else {
+        return;
+    };
+    if !common.silent && !common.json {
+        eprintln!("Warning ({}): {}", w.code, w.detail);
+    }
+    env.warnings.push(RunWarning {
+        code: w.code.to_string(),
+        detail: w.detail,
+    });
+}
+
 pub async fn run(args: VendorArgs) -> i32 {
     apply_env_toggles(&args.common);
     let (telemetry_client, use_public_proxy) =
@@ -354,6 +378,8 @@ pub async fn run(args: VendorArgs) -> i32 {
             }
         }
     }
+
+    note_classic_migration_risk(&mut env, &args.common.cwd, &args.common);
 
     if args.common.json {
         println!("{}", env.to_pretty_json());
