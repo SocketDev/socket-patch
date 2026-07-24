@@ -987,6 +987,26 @@ fn rewrite_yarn_berry(
             if !version_re.is_match(block) {
                 continue;
             }
+            // Descriptor ranges carry a protocol; only an `npm:` range names
+            // a registry tarball this rewriter can own. A `patch:` range
+            // (yarn's OWN builtin compat patches — the 2026-07 strapi
+            // incident family), `workspace:`, `portal:`, or `link:` block
+            // must survive byte-identically: splicing an npm resolution
+            // under such a key corrupts the key/resolution protocol pairing.
+            // Mirrors the vendor backend's fail-closed gate
+            // (vendor/yarn_berry_lock.rs).
+            if !parsed.iter().all(|p| p.unwrap().1.starts_with("npm:")) {
+                result.warnings.push(RewriteWarning {
+                    code: "redirect_yarn_berry_unsupported_protocol".into(),
+                    detail: format!(
+                        "lock entry `{raw_key}` resolves {fname}@{} through a protocol \
+                         the hosted redirect cannot own (workspace:/patch:/portal:/link:); \
+                         leaving it byte-identical",
+                        dep.version
+                    ),
+                });
+                continue;
+            }
             // Rewrite the resolution wholesale from name+version — handles a
             // pre-existing `::__archiveUrl=` (custom-registry lock) for free.
             let resolution = format!(
