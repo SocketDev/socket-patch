@@ -267,6 +267,18 @@ fn yarn_classic_vendor_fresh_checkout_frozen_offline_install_and_revert() {
         applied.get("errorCode").is_none(),
         "clean apply event: {applied}"
     );
+    // Run-level advisory: the fixture has no `packageManager` pin, so the
+    // wired classic lockfile is one stray `yarn@2+ install` away from being
+    // silently de-patched — the envelope must say so.
+    let run_warnings = env["warnings"].as_array().unwrap_or_else(|| {
+        panic!("wired classic project without a yarn@1 pin must carry run-level warnings: {env}")
+    });
+    assert!(
+        run_warnings
+            .iter()
+            .any(|w| w["code"] == "yarn_classic_berry_migration_risk"),
+        "expected yarn_classic_berry_migration_risk: {env}"
+    );
 
     // Artifact: deterministic tarball + informational marker in the uuid dir.
     let tgz_rel = format!(".socket/vendor/npm/{UUID}/{DEP}-{DEP_VERSION}.tgz");
@@ -426,6 +438,41 @@ fn yarn_classic_vendor_fresh_checkout_frozen_offline_install_and_revert() {
         lock_wired,
         "re-vendor must leave yarn.lock byte-identical"
     );
+    // The advisory is state-based: an in-sync re-run (wiring still on disk)
+    // must warn again…
+    assert!(
+        env2["warnings"].as_array().is_some_and(|ws| ws
+            .iter()
+            .any(|w| w["code"] == "yarn_classic_berry_migration_risk")),
+        "in-sync re-run must still carry the migration-risk advisory: {env2}"
+    );
+    // …and a `packageManager: yarn@1…` pin must silence it (corepack makes
+    // stray berry installs refuse instead of migrate).
+    let pkg_path = proj.join("package.json");
+    let mut pkg: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&pkg_path).unwrap()).unwrap();
+    pkg["packageManager"] = serde_json::Value::String("yarn@1.22.22".to_string());
+    std::fs::write(&pkg_path, serde_json::to_string_pretty(&pkg).unwrap()).unwrap();
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &[
+            "vendor",
+            "--json",
+            "--offline",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(
+        code, 0,
+        "pinned re-vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let env3 = parse_envelope(&stdout);
+    assert!(
+        env3.get("warnings").is_none(),
+        "a yarn@1 packageManager pin must suppress the advisory (and empty \
+         warnings must be omitted from JSON entirely): {env3}"
+    );
 
     // 6. REVERT PROOF: lock restored byte-for-byte, artifacts gone.
     let (code, stdout, stderr) = run_socket(
@@ -446,6 +493,11 @@ fn yarn_classic_vendor_fresh_checkout_frozen_offline_install_and_revert() {
     let renv = parse_envelope(&stdout);
     assert_eq!(renv["status"], "success", "revert envelope: {renv}");
     assert_eq!(renv["summary"]["removed"], 1, "one entry reverted: {renv}");
+    assert!(
+        renv.get("warnings").is_none(),
+        "after revert the wiring is gone — the state-based advisory must fall \
+         silent: {renv}"
+    );
     assert_eq!(
         std::fs::read(&lock_path).unwrap(),
         lock_before,
