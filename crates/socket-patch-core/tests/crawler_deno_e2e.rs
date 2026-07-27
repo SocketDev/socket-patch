@@ -54,6 +54,7 @@ async fn stage_jsr_pkg(root: &Path, scope: &str, name: &str, version: &str) -> s
 // ── find_by_purls ──────────────────────────────────────────────
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn find_by_purls_finds_jsr_package() {
     let tmp = tempfile::tempdir().unwrap();
     let pkg = stage_jsr_pkg(tmp.path(), "@std", "path", "0.220.0").await;
@@ -77,6 +78,7 @@ async fn find_by_purls_finds_jsr_package() {
 }
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn find_by_purls_no_match_returns_empty() {
     let tmp = tempfile::tempdir().unwrap();
     // Cache is NOT empty: a *different* package is present. This proves
@@ -97,6 +99,7 @@ async fn find_by_purls_no_match_returns_empty() {
 }
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn find_by_purls_non_jsr_purl_skipped() {
     let tmp = tempfile::tempdir().unwrap();
     // Stage a tree that an *ecosystem-blind* parser (one that ignored
@@ -121,6 +124,7 @@ async fn find_by_purls_non_jsr_purl_skipped() {
 /// regression that drops/ignores the scope segment when joining the
 /// path (which would let `@other/path` satisfy a `@std/path` query).
 #[tokio::test]
+#[serial_test::parallel]
 async fn find_by_purls_wrong_scope_not_resolved() {
     let tmp = tempfile::tempdir().unwrap();
     // Same name + version, but under `@other`, not the queried `@std`.
@@ -140,6 +144,7 @@ async fn find_by_purls_wrong_scope_not_resolved() {
 // ── crawl_all ─────────────────────────────────────────────────
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn crawl_all_enumerates_jsr_packages() {
     let tmp = tempfile::tempdir().unwrap();
     let std_path = stage_jsr_pkg(tmp.path(), "@std", "path", "0.220.0").await;
@@ -205,6 +210,7 @@ async fn crawl_all_global_via_deno_dir_env_scans_cache() {
 /// regression that adds a fourth descent level and emits phantom
 /// packages like `pkg:jsr/@std/path@src`.
 #[tokio::test]
+#[serial_test::parallel]
 async fn crawl_all_does_not_recurse_below_version_layer() {
     let tmp = tempfile::tempdir().unwrap();
     let pkg = stage_jsr_pkg(tmp.path(), "@std", "path", "0.220.0").await;
@@ -230,6 +236,7 @@ async fn crawl_all_does_not_recurse_below_version_layer() {
 }
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn crawl_all_skips_dirs_not_starting_with_at() {
     let tmp = tempfile::tempdir().unwrap();
     // Legitimate scope.
@@ -267,6 +274,7 @@ async fn crawl_all_skips_dirs_not_starting_with_at() {
 // ── get_jsr_cache_paths ────────────────────────────────────────
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn get_jsr_cache_paths_global_prefix_passthrough() {
     let tmp = tempfile::tempdir().unwrap();
     let crawler = DenoCrawler;

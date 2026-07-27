@@ -29,6 +29,7 @@ async fn stage_go_module(cache: &Path, module_path: &str, version: &str) -> std:
 // ── encode_module_path / decode_module_path ─────────────────────
 
 #[test]
+#[serial_test::parallel]
 fn encode_module_path_lowercases_uppercase() {
     // Per Go module proxy spec, uppercase letters get encoded as
     // `!<lowercase>` so the filesystem lookup is unambiguous on
@@ -38,12 +39,14 @@ fn encode_module_path_lowercases_uppercase() {
 }
 
 #[test]
+#[serial_test::parallel]
 fn encode_module_path_no_uppercase_passthrough() {
     let encoded = encode_module_path("github.com/gin-gonic/gin");
     assert_eq!(encoded, "github.com/gin-gonic/gin");
 }
 
 #[test]
+#[serial_test::parallel]
 fn decode_module_path_inverts_encode() {
     let encoded = encode_module_path("github.com/Sirupsen/logrus");
     // Pin the intermediate encoding too, so a buggy encode that happens to
@@ -54,6 +57,7 @@ fn decode_module_path_inverts_encode() {
 }
 
 #[test]
+#[serial_test::parallel]
 fn decode_module_path_no_bang_passthrough() {
     assert_eq!(
         decode_module_path("github.com/gin-gonic/gin"),
@@ -64,6 +68,7 @@ fn decode_module_path_no_bang_passthrough() {
 // ── parse_go_mod_module ────────────────────────────────────────
 
 #[test]
+#[serial_test::parallel]
 fn parse_go_mod_well_formed() {
     let content = "module github.com/gin-gonic/gin\n\ngo 1.21\n";
     assert_eq!(
@@ -73,12 +78,14 @@ fn parse_go_mod_well_formed() {
 }
 
 #[test]
+#[serial_test::parallel]
 fn parse_go_mod_missing_module_returns_none() {
     let content = "go 1.21\n";
     assert_eq!(parse_go_mod_module(content), None);
 }
 
 #[test]
+#[serial_test::parallel]
 fn parse_go_mod_empty_returns_none() {
     assert_eq!(parse_go_mod_module(""), None);
 }
@@ -86,6 +93,7 @@ fn parse_go_mod_empty_returns_none() {
 // ── find_by_purls ──────────────────────────────────────────────
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn find_by_purls_finds_module_in_cache() {
     let tmp = tempfile::tempdir().unwrap();
     let pkg = stage_go_module(tmp.path(), "github.com/gin-gonic/gin", "v1.9.1").await;
@@ -108,6 +116,7 @@ async fn find_by_purls_finds_module_in_cache() {
 }
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn find_by_purls_no_match_returns_empty() {
     let tmp = tempfile::tempdir().unwrap();
     let crawler = GoCrawler;
@@ -119,6 +128,7 @@ async fn find_by_purls_no_match_returns_empty() {
 }
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn find_by_purls_invalid_purl_skipped() {
     let tmp = tempfile::tempdir().unwrap();
     let crawler = GoCrawler;
@@ -132,6 +142,7 @@ async fn find_by_purls_invalid_purl_skipped() {
 // ── get_module_cache_paths ─────────────────────────────────────
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn get_module_cache_paths_with_global_prefix_passthrough() {
     let tmp = tempfile::tempdir().unwrap();
     let crawler = GoCrawler;
@@ -198,6 +209,7 @@ mod common;
 /// `scan_dir_recursive` short-circuits when read_dir returns Err.
 #[cfg(unix)]
 #[tokio::test]
+#[serial_test::parallel]
 async fn crawl_all_handles_unreadable_cache_path() {
     if common::uid_is_root() {
         eprintln!("SKIP: chmod 000 is a no-op under root");
@@ -227,6 +239,7 @@ async fn crawl_all_handles_unreadable_cache_path() {
 // `default_constructed_unit_structs` lint is deliberately allowed here.
 #[allow(clippy::default_constructed_unit_structs)]
 #[tokio::test]
+#[serial_test::parallel]
 async fn go_crawler_default_and_new_construct_cleanly() {
     let tmp = tempfile::tempdir().unwrap();
     let pkg = stage_go_module(tmp.path(), "github.com/gin-gonic/gin", "v1.9.1").await;
@@ -256,12 +269,14 @@ async fn go_crawler_default_and_new_construct_cleanly() {
 /// A `module` directive with no path (`module`) must not match — the
 /// guard at line 61 (`!rest.is_empty()`) keeps it from being returned.
 #[test]
+#[serial_test::parallel]
 fn parse_go_mod_module_directive_with_empty_path_returns_none() {
     assert_eq!(parse_go_mod_module("module\n"), None);
 }
 
 /// Quoted module path with whitespace — the strip-quotes branch.
 #[test]
+#[serial_test::parallel]
 fn parse_go_mod_module_quoted_path() {
     assert_eq!(
         parse_go_mod_module(r#"module "github.com/foo/bar""#),
@@ -274,6 +289,7 @@ fn parse_go_mod_module_quoted_path() {
 /// `decode_module_path` preserves it rather than silently dropping a byte,
 /// so decoding an unexpected/corrupt directory name never loses path data.
 #[test]
+#[serial_test::parallel]
 fn decode_module_path_trailing_bang_is_preserved() {
     assert_eq!(decode_module_path("github.com/foo!"), "github.com/foo!");
 }
@@ -284,6 +300,7 @@ fn decode_module_path_trailing_bang_is_preserved() {
 /// IS present and IS matched) proves the empty result is selective, not a
 /// blanket "find nothing" regression.
 #[tokio::test]
+#[serial_test::parallel]
 async fn find_by_purls_module_dir_missing_returns_empty() {
     let tmp = tempfile::tempdir().unwrap();
     // Stage v1.9.1 but NOT the requested v9.9.9.

@@ -10,12 +10,14 @@ use socket_patch_core::crawlers::types::CrawlerOptions;
 use socket_patch_core::crawlers::ComposerCrawler;
 
 #[test]
+#[serial_test::parallel]
 fn parse_composer_home_output_well_formed() {
     let p = parse_composer_home_output("/Users/foo/.composer\n").unwrap();
     assert_eq!(p, std::path::PathBuf::from("/Users/foo/.composer"));
 }
 
 #[test]
+#[serial_test::parallel]
 fn parse_composer_home_output_empty_returns_none() {
     assert_eq!(parse_composer_home_output(""), None);
     assert_eq!(parse_composer_home_output("   \n  "), None);
@@ -65,6 +67,7 @@ async fn stage_composer_project(root: &Path, vendor_name: &str, pkg_name: &str, 
 // ── find_by_purls ──────────────────────────────────────────────
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn find_by_purls_finds_package_in_vendor() {
     let tmp = tempfile::tempdir().unwrap();
     stage_composer_project(tmp.path(), "monolog", "monolog", "3.5.0").await;
@@ -89,6 +92,7 @@ async fn find_by_purls_finds_package_in_vendor() {
 }
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn find_by_purls_no_installed_json_returns_empty() {
     let tmp = tempfile::tempdir().unwrap();
     let vendor = tmp.path().join("vendor");
@@ -133,6 +137,7 @@ async fn find_by_purls_no_installed_json_returns_empty() {
 }
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn find_by_purls_invalid_purl_skipped() {
     let tmp = tempfile::tempdir().unwrap();
     stage_composer_project(tmp.path(), "monolog", "monolog", "3.5.0").await;
@@ -149,6 +154,7 @@ async fn find_by_purls_invalid_purl_skipped() {
 }
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn find_by_purls_version_mismatch_returns_empty() {
     let tmp = tempfile::tempdir().unwrap();
     stage_composer_project(tmp.path(), "monolog", "monolog", "3.5.0").await;
@@ -167,6 +173,7 @@ async fn find_by_purls_version_mismatch_returns_empty() {
 // ── crawl_all ─────────────────────────────────────────────────
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn crawl_all_via_installed_json_returns_packages() {
     let tmp = tempfile::tempdir().unwrap();
     stage_composer_project(tmp.path(), "monolog", "monolog", "3.5.0").await;
@@ -190,6 +197,7 @@ async fn crawl_all_via_installed_json_returns_packages() {
 }
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn crawl_all_with_corrupt_installed_json_returns_empty() {
     let tmp = tempfile::tempdir().unwrap();
     let vendor = tmp.path().join("vendor");
@@ -238,6 +246,7 @@ async fn crawl_all_with_corrupt_installed_json_returns_empty() {
 // ── get_vendor_paths ──────────────────────────────────────────
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn get_vendor_paths_with_global_prefix_passthrough() {
     let tmp = tempfile::tempdir().unwrap();
     let crawler = ComposerCrawler;
@@ -251,6 +260,7 @@ async fn get_vendor_paths_with_global_prefix_passthrough() {
 }
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn get_vendor_paths_local_no_vendor_returns_empty() {
     let tmp = tempfile::tempdir().unwrap();
     let crawler = ComposerCrawler;
@@ -262,6 +272,7 @@ async fn get_vendor_paths_local_no_vendor_returns_empty() {
 }
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn get_vendor_paths_local_no_installed_json_returns_empty() {
     let tmp = tempfile::tempdir().unwrap();
     let vendor = tmp.path().join("vendor");
@@ -283,6 +294,7 @@ async fn get_vendor_paths_local_no_installed_json_returns_empty() {
 }
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn get_vendor_paths_local_no_composer_marker_returns_empty() {
     let tmp = tempfile::tempdir().unwrap();
     let vendor = tmp.path().join("vendor");
@@ -305,6 +317,7 @@ async fn get_vendor_paths_local_no_composer_marker_returns_empty() {
 }
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn get_vendor_paths_local_full_setup_returns_vendor() {
     let tmp = tempfile::tempdir().unwrap();
     let vendor = tmp.path().join("vendor");
@@ -581,6 +594,7 @@ mod common;
 /// rather than panicking.
 #[cfg(unix)]
 #[tokio::test]
+#[serial_test::parallel]
 async fn find_by_purls_handles_unreadable_installed_json() {
     if common::uid_is_root() {
         eprintln!("SKIP: chmod 000 is a no-op under root");
@@ -635,6 +649,7 @@ async fn find_by_purls_handles_unreadable_installed_json() {
 /// vendor paths sharing the same installed package — exercises the
 /// `seen.contains` early-continue arm.
 #[tokio::test]
+#[serial_test::parallel]
 async fn crawl_all_dedups_across_vendor_paths() {
     let tmp = tempfile::tempdir().unwrap();
     let custom_vendor = tmp.path().join("custom-vendor");
@@ -668,6 +683,7 @@ async fn crawl_all_dedups_across_vendor_paths() {
 }
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn get_vendor_paths_local_with_lock_marker_also_works() {
     let tmp = tempfile::tempdir().unwrap();
     let vendor = tmp.path().join("vendor");

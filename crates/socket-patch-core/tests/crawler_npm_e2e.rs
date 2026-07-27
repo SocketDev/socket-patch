@@ -37,6 +37,7 @@ async fn stage_npm_pkg(node_modules: &Path, name: &str, version: &str) {
 // ── parse_package_name ─────────────────────────────────────────
 
 #[test]
+#[serial_test::parallel]
 fn parse_package_name_unscoped() {
     let (ns, name) = parse_package_name("lodash");
     assert_eq!(ns, None);
@@ -44,6 +45,7 @@ fn parse_package_name_unscoped() {
 }
 
 #[test]
+#[serial_test::parallel]
 fn parse_package_name_scoped() {
     let (ns, name) = parse_package_name("@types/node");
     assert_eq!(ns.as_deref(), Some("@types"));
@@ -51,6 +53,7 @@ fn parse_package_name_scoped() {
 }
 
 #[test]
+#[serial_test::parallel]
 fn parse_package_name_at_only_no_slash() {
     // `@foo` with no `/` — treated as unscoped.
     let (ns, name) = parse_package_name("@oops");
@@ -61,12 +64,14 @@ fn parse_package_name_at_only_no_slash() {
 // ── build_npm_purl ─────────────────────────────────────────────
 
 #[test]
+#[serial_test::parallel]
 fn build_npm_purl_unscoped() {
     let purl = build_npm_purl(None, "lodash", "4.17.21");
     assert_eq!(purl, "pkg:npm/lodash@4.17.21");
 }
 
 #[test]
+#[serial_test::parallel]
 fn build_npm_purl_scoped() {
     let purl = build_npm_purl(Some("@types"), "node", "20.0.0");
     assert_eq!(purl, "pkg:npm/@types/node@20.0.0");
@@ -75,6 +80,7 @@ fn build_npm_purl_scoped() {
 // ── read_package_json ──────────────────────────────────────────
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn read_package_json_well_formed() {
     let tmp = tempfile::tempdir().unwrap();
     let pkg = tmp.path().join("package.json");
@@ -87,6 +93,7 @@ async fn read_package_json_well_formed() {
 }
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn read_package_json_missing_returns_none() {
     let tmp = tempfile::tempdir().unwrap();
     let result = read_package_json(&tmp.path().join("nope.json")).await;
@@ -94,6 +101,7 @@ async fn read_package_json_missing_returns_none() {
 }
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn read_package_json_malformed_returns_none() {
     let tmp = tempfile::tempdir().unwrap();
     let pkg = tmp.path().join("package.json");
@@ -104,6 +112,7 @@ async fn read_package_json_malformed_returns_none() {
 }
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn read_package_json_missing_name_returns_none() {
     let tmp = tempfile::tempdir().unwrap();
     let pkg = tmp.path().join("package.json");
@@ -116,6 +125,7 @@ async fn read_package_json_missing_name_returns_none() {
 }
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn read_package_json_missing_version_returns_none() {
     let tmp = tempfile::tempdir().unwrap();
     let pkg = tmp.path().join("package.json");
@@ -130,6 +140,7 @@ async fn read_package_json_missing_version_returns_none() {
 /// Both fields present but empty strings — parse succeeds but the
 /// downstream is_empty guard must reject.
 #[tokio::test]
+#[serial_test::parallel]
 async fn read_package_json_empty_name_returns_none() {
     let tmp = tempfile::tempdir().unwrap();
     let pkg = tmp.path().join("package.json");
@@ -140,6 +151,7 @@ async fn read_package_json_empty_name_returns_none() {
 }
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn read_package_json_empty_version_returns_none() {
     let tmp = tempfile::tempdir().unwrap();
     let pkg = tmp.path().join("package.json");
@@ -152,6 +164,7 @@ async fn read_package_json_empty_version_returns_none() {
 // ── NpmCrawler construction ────────────────────────────────────
 
 #[test]
+#[serial_test::parallel]
 fn npm_crawler_new_and_default_construct_cleanly() {
     let _a = NpmCrawler::new();
     let _b = NpmCrawler;
@@ -162,6 +175,7 @@ fn npm_crawler_new_and_default_construct_cleanly() {
 /// `global_prefix` always takes precedence over discovery, even when
 /// `global` flag is also set.
 #[tokio::test]
+#[serial_test::parallel]
 async fn get_node_modules_paths_global_prefix_passthrough() {
     let tmp = tempfile::tempdir().unwrap();
     let custom = tmp.path().join("custom-nm");
@@ -182,6 +196,7 @@ async fn get_node_modules_paths_global_prefix_passthrough() {
 /// test env may have npm/yarn/pnpm/bun installed, we just assert the
 /// call returns Ok (it can return any set of real or empty paths).
 #[tokio::test]
+#[serial_test::parallel]
 async fn get_node_modules_paths_global_mode_no_prefix() {
     let tmp = tempfile::tempdir().unwrap();
     let crawler = NpmCrawler;
@@ -208,6 +223,7 @@ async fn get_node_modules_paths_global_mode_no_prefix() {
 /// same parser.
 #[cfg(unix)]
 #[test]
+#[serial_test::parallel]
 fn parse_bun_bin_output_well_formed_unix() {
     let parsed = parse_bun_bin_output("/home/foo/.bun/bin\n");
     assert_eq!(
@@ -217,6 +233,7 @@ fn parse_bun_bin_output_well_formed_unix() {
 }
 
 #[test]
+#[serial_test::parallel]
 fn parse_bun_bin_output_empty_returns_none() {
     assert_eq!(parse_bun_bin_output(""), None);
     assert_eq!(parse_bun_bin_output("   \n  "), None);
@@ -224,6 +241,7 @@ fn parse_bun_bin_output_empty_returns_none() {
 
 /// Root-only path has no parent — must yield None instead of panicking.
 #[test]
+#[serial_test::parallel]
 fn parse_bun_bin_output_root_path_returns_none() {
     assert_eq!(parse_bun_bin_output("/"), None);
 }
@@ -290,6 +308,7 @@ fn get_bun_global_prefix_returns_none_when_bun_not_on_path() {
 /// path. This covers the "binary present, returned valid output"
 /// arm without needing npm on PATH.
 #[test]
+#[serial_test::parallel]
 fn get_npm_global_prefix_with_mock_runner_returns_path() {
     let runner = common::MockCommandRunner::new().with_response(
         "npm",
@@ -301,6 +320,7 @@ fn get_npm_global_prefix_with_mock_runner_returns_path() {
 }
 
 #[test]
+#[serial_test::parallel]
 fn get_npm_global_prefix_with_mock_runner_empty_stdout_returns_err() {
     let runner = common::MockCommandRunner::new().with_response("npm", &["root", "-g"], Some(""));
     assert!(get_npm_global_prefix_with(&runner).is_err());
@@ -310,6 +330,7 @@ fn get_npm_global_prefix_with_mock_runner_empty_stdout_returns_err() {
 // `parse_bun_bin_output_well_formed_unix` above.
 #[cfg(unix)]
 #[test]
+#[serial_test::parallel]
 fn get_yarn_global_prefix_with_mock_runner_success() {
     let runner = common::MockCommandRunner::new().with_response(
         "yarn",
@@ -323,6 +344,7 @@ fn get_yarn_global_prefix_with_mock_runner_success() {
 }
 
 #[test]
+#[serial_test::parallel]
 fn get_pnpm_global_prefix_with_mock_runner_success() {
     let runner = common::MockCommandRunner::new().with_response(
         "pnpm",
@@ -339,6 +361,7 @@ fn get_pnpm_global_prefix_with_mock_runner_success() {
 // `parse_bun_bin_output_well_formed_unix` above.
 #[cfg(unix)]
 #[test]
+#[serial_test::parallel]
 fn get_bun_global_prefix_with_mock_runner_success() {
     let runner = common::MockCommandRunner::new().with_response(
         "bun",
@@ -354,6 +377,7 @@ fn get_bun_global_prefix_with_mock_runner_success() {
 // ── parse_npm_root_output ──────────────────────────────────────
 
 #[test]
+#[serial_test::parallel]
 fn parse_npm_root_output_well_formed() {
     assert_eq!(
         parse_npm_root_output("/usr/local/lib/node_modules\n").as_deref(),
@@ -362,6 +386,7 @@ fn parse_npm_root_output_well_formed() {
 }
 
 #[test]
+#[serial_test::parallel]
 fn parse_npm_root_output_empty_returns_none() {
     assert_eq!(parse_npm_root_output(""), None);
     assert_eq!(parse_npm_root_output("  \n  "), None);
@@ -375,6 +400,7 @@ fn parse_npm_root_output_empty_returns_none() {
 /// `_unix`-style tests above.
 #[cfg(unix)]
 #[test]
+#[serial_test::parallel]
 fn parse_yarn_dir_output_appends_node_modules() {
     let parsed = parse_yarn_dir_output("/Users/foo/.yarn/global\n");
     assert_eq!(
@@ -384,6 +410,7 @@ fn parse_yarn_dir_output_appends_node_modules() {
 }
 
 #[test]
+#[serial_test::parallel]
 fn parse_yarn_dir_output_empty_returns_none() {
     assert_eq!(parse_yarn_dir_output(""), None);
     assert_eq!(parse_yarn_dir_output("\n  \n"), None);
@@ -392,6 +419,7 @@ fn parse_yarn_dir_output_empty_returns_none() {
 // ── parse_pnpm_root_output ─────────────────────────────────────
 
 #[test]
+#[serial_test::parallel]
 fn parse_pnpm_root_output_returns_trimmed_path() {
     let parsed = parse_pnpm_root_output("/home/foo/.local/share/pnpm/global/5/node_modules\n");
     assert_eq!(
@@ -401,6 +429,7 @@ fn parse_pnpm_root_output_returns_trimmed_path() {
 }
 
 #[test]
+#[serial_test::parallel]
 fn parse_pnpm_root_output_empty_returns_none() {
     assert_eq!(parse_pnpm_root_output(""), None);
     assert_eq!(parse_pnpm_root_output("   \n  "), None);
@@ -409,6 +438,7 @@ fn parse_pnpm_root_output_empty_returns_none() {
 // ── find_by_purls ──────────────────────────────────────────────
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn find_by_purls_unscoped_package() {
     let tmp = tempfile::tempdir().unwrap();
     let nm = tmp.path().join("node_modules");
@@ -437,6 +467,7 @@ async fn find_by_purls_unscoped_package() {
 }
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn find_by_purls_scoped_package() {
     let tmp = tempfile::tempdir().unwrap();
     let nm = tmp.path().join("node_modules");
@@ -463,6 +494,7 @@ async fn find_by_purls_scoped_package() {
 }
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn find_by_purls_version_mismatch_returns_empty() {
     let tmp = tempfile::tempdir().unwrap();
     let nm = tmp.path().join("node_modules");
@@ -483,6 +515,7 @@ async fn find_by_purls_version_mismatch_returns_empty() {
 /// in, so keying by a stripped/reconstructed PURL would silently drop every
 /// qualified PURL.
 #[tokio::test]
+#[serial_test::parallel]
 async fn find_by_purls_resolves_qualified_purl_keyed_by_input() {
     let tmp = tempfile::tempdir().unwrap();
     let nm = tmp.path().join("node_modules");
@@ -517,6 +550,7 @@ async fn find_by_purls_resolves_qualified_purl_keyed_by_input() {
 /// qualifiers WITHOUT an `@`, so they cannot catch a strip-order
 /// regression — this pins it.
 #[tokio::test]
+#[serial_test::parallel]
 async fn find_by_purls_qualifier_containing_at_does_not_corrupt_version() {
     let tmp = tempfile::tempdir().unwrap();
     let nm = tmp.path().join("node_modules");
@@ -551,6 +585,7 @@ async fn find_by_purls_qualifier_containing_at_does_not_corrupt_version() {
 /// PURL with no `@` (no version separator) must be rejected via the
 /// `rfind('@')?` arm (line 707).
 #[tokio::test]
+#[serial_test::parallel]
 async fn find_by_purls_purl_without_at_skipped() {
     let tmp = tempfile::tempdir().unwrap();
     let nm = tmp.path().join("node_modules");
@@ -565,6 +600,7 @@ async fn find_by_purls_purl_without_at_skipped() {
 /// PURL with `@` but an empty version (`pkg:npm/lodash@`) — covers the
 /// `version.is_empty()` arm at line 711-712.
 #[tokio::test]
+#[serial_test::parallel]
 async fn find_by_purls_purl_with_empty_version_skipped() {
     let tmp = tempfile::tempdir().unwrap();
     let nm = tmp.path().join("node_modules");
@@ -579,6 +615,7 @@ async fn find_by_purls_purl_with_empty_version_skipped() {
 /// PURL with scope marker but no slash (`pkg:npm/@foo@1.0`) — covers
 /// the `find('/')?` arm at line 716.
 #[tokio::test]
+#[serial_test::parallel]
 async fn find_by_purls_scoped_purl_without_slash_skipped() {
     let tmp = tempfile::tempdir().unwrap();
     let nm = tmp.path().join("node_modules");
@@ -593,6 +630,7 @@ async fn find_by_purls_scoped_purl_without_slash_skipped() {
 /// Scoped PURL with empty name after slash (`pkg:npm/@scope/@1.0`) —
 /// covers the `if name.is_empty()` arm at line 719-720.
 #[tokio::test]
+#[serial_test::parallel]
 async fn find_by_purls_scoped_purl_with_empty_name_skipped() {
     let tmp = tempfile::tempdir().unwrap();
     let nm = tmp.path().join("node_modules");
@@ -605,6 +643,7 @@ async fn find_by_purls_scoped_purl_with_empty_name_skipped() {
 }
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn find_by_purls_invalid_purl_skipped() {
     let tmp = tempfile::tempdir().unwrap();
     let crawler = NpmCrawler;
@@ -618,6 +657,7 @@ async fn find_by_purls_invalid_purl_skipped() {
 // ── crawl_all ─────────────────────────────────────────────────
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn crawl_all_discovers_unscoped_and_scoped() {
     let tmp = tempfile::tempdir().unwrap();
     let nm = tmp.path().join("node_modules");
@@ -654,6 +694,7 @@ async fn crawl_all_discovers_unscoped_and_scoped() {
 }
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn crawl_all_skips_dirs_without_package_json() {
     let tmp = tempfile::tempdir().unwrap();
     let nm = tmp.path().join("node_modules");
@@ -672,6 +713,7 @@ async fn crawl_all_skips_dirs_without_package_json() {
 /// looking for nested `node_modules`, while skipping hidden dirs and
 /// well-known build-output dirs.
 #[tokio::test]
+#[serial_test::parallel]
 async fn crawl_all_recurses_into_workspace_packages() {
     let tmp = tempfile::tempdir().unwrap();
     // Root has no node_modules but a workspace subdir does.
@@ -700,6 +742,7 @@ async fn crawl_all_recurses_into_workspace_packages() {
 }
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn crawl_all_skips_hidden_and_skip_dirs() {
     let tmp = tempfile::tempdir().unwrap();
     // Hidden dirs and SKIP_DIRS entries (dist/build/coverage/tmp/...) are skipped.
@@ -751,6 +794,7 @@ mod common;
 /// `scan_node_modules` short-circuits when read_dir returns Err.
 #[cfg(unix)]
 #[tokio::test]
+#[serial_test::parallel]
 async fn crawl_all_handles_unreadable_node_modules() {
     if common::uid_is_root() {
         eprintln!("SKIP: chmod 000 is a no-op under root");
@@ -778,6 +822,7 @@ async fn crawl_all_handles_unreadable_node_modules() {
 /// while leaving a readable one alongside.
 #[cfg(unix)]
 #[tokio::test]
+#[serial_test::parallel]
 async fn crawl_all_handles_unreadable_workspace_dir() {
     if common::uid_is_root() {
         eprintln!("SKIP: chmod 000 is a no-op under root");
@@ -814,6 +859,7 @@ async fn crawl_all_handles_unreadable_workspace_dir() {
 /// the hidden-and-file-entries skip arms inside `scan_scoped_packages`
 /// and `scan_nested_node_modules`. Covers L552, 581-604, 619-665.
 #[tokio::test]
+#[serial_test::parallel]
 async fn crawl_all_handles_nested_and_messy_scope_dir() {
     let tmp = tempfile::tempdir().unwrap();
     let nm = tmp.path().join("node_modules");
@@ -897,6 +943,7 @@ async fn crawl_all_handles_nested_and_messy_scope_dir() {
 }
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn crawl_all_discovers_deeply_nested_transitive_deps() {
     // The npm crawler recurses `node_modules` at UNBOUNDED depth, so a patch
     // targeting a deeply-nested *transitive* dependency is discovered — and thus
@@ -943,6 +990,7 @@ async fn crawl_all_discovers_deeply_nested_transitive_deps() {
 }
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn crawl_all_skips_dirs_with_corrupt_package_json() {
     let tmp = tempfile::tempdir().unwrap();
     let nm = tmp.path().join("node_modules");
@@ -969,6 +1017,7 @@ async fn crawl_all_skips_dirs_with_corrupt_package_json() {
 /// that behavior.
 #[cfg(unix)]
 #[tokio::test]
+#[serial_test::parallel]
 async fn crawl_all_does_not_recurse_through_symlinked_nested_package() {
     use std::os::unix::fs::symlink;
 
@@ -1015,6 +1064,7 @@ async fn crawl_all_does_not_recurse_through_symlinked_nested_package() {
 /// invisible to `scan` and unpatchable by `apply`. Same class as the
 /// `strip_bom` fixes in `package_json/detect.rs`.
 #[tokio::test]
+#[serial_test::parallel]
 async fn read_package_json_tolerates_utf8_bom() {
     let tmp = tempfile::tempdir().unwrap();
     let nm = tmp.path().join("node_modules");
@@ -1062,6 +1112,7 @@ async fn read_package_json_tolerates_utf8_bom() {
 /// mismatch policy applying the full patched blob of `foo` over `bar`).
 /// The probe must require the on-disk name to match the PURL identity.
 #[tokio::test]
+#[serial_test::parallel]
 async fn find_by_purls_rejects_alias_dir_with_matching_version() {
     let tmp = tempfile::tempdir().unwrap();
     let nm = tmp.path().join("node_modules");
@@ -1114,6 +1165,7 @@ async fn find_by_purls_rejects_alias_dir_with_matching_version() {
 /// classic hoisting-conflict layout) was scannable yet unpatchable: apply
 /// reported "No packages found that match available patches".
 #[tokio::test]
+#[serial_test::parallel]
 async fn find_by_purls_resolves_nested_only_install() {
     let tmp = tempfile::tempdir().unwrap();
     let nm = tmp.path().join("node_modules");
@@ -1163,6 +1215,7 @@ async fn find_by_purls_resolves_nested_only_install() {
 /// readers.
 #[cfg(unix)]
 #[tokio::test]
+#[serial_test::parallel]
 async fn read_package_json_rejects_fifo_without_hanging() {
     let tmp = tempfile::tempdir().unwrap();
     let nm = tmp.path().join("node_modules");
@@ -1232,6 +1285,7 @@ async fn read_package_json_rejects_fifo_without_hanging() {
 /// copy must win (shallowest-first), preserving the pre-existing behavior
 /// for everything resolvable at the root.
 #[tokio::test]
+#[serial_test::parallel]
 async fn find_by_purls_prefers_root_copy_over_nested_duplicate() {
     let tmp = tempfile::tempdir().unwrap();
     let nm = tmp.path().join("node_modules");

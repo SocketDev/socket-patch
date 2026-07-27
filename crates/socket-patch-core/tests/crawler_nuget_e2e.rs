@@ -60,6 +60,7 @@ async fn stage_legacy_pkg(root: &Path, name: &str, version: &str) -> std::path::
 // ── find_by_purls ──────────────────────────────────────────────
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn find_by_purls_global_cache_layout_finds_package() {
     let tmp = tempfile::tempdir().unwrap();
     let pkg_dir = stage_global_cache_pkg(tmp.path(), "Newtonsoft.Json", "13.0.3").await;
@@ -77,6 +78,7 @@ async fn find_by_purls_global_cache_layout_finds_package() {
 }
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn find_by_purls_legacy_layout_finds_package() {
     let tmp = tempfile::tempdir().unwrap();
     let pkg_dir = stage_legacy_pkg(tmp.path(), "Newtonsoft.Json", "13.0.3").await;
@@ -102,6 +104,7 @@ async fn find_by_purls_legacy_layout_finds_package() {
 /// folds names. On case-sensitive filesystems (Linux ext4), the
 /// case-insensitive scan branch fires.
 #[tokio::test]
+#[serial_test::parallel]
 async fn find_by_purls_case_insensitive_legacy_layout() {
     let tmp = tempfile::tempdir().unwrap();
     let staged = stage_legacy_pkg(tmp.path(), "newtonsoft.json", "13.0.3").await;
@@ -136,6 +139,7 @@ async fn find_by_purls_case_insensitive_legacy_layout() {
 }
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn find_by_purls_no_match_returns_empty() {
     let tmp = tempfile::tempdir().unwrap();
     // Empty dir — no packages.
@@ -148,6 +152,7 @@ async fn find_by_purls_no_match_returns_empty() {
 }
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn find_by_purls_invalid_purl_skipped() {
     let tmp = tempfile::tempdir().unwrap();
     stage_global_cache_pkg(tmp.path(), "Newtonsoft.Json", "13.0.3").await;
@@ -162,6 +167,7 @@ async fn find_by_purls_invalid_purl_skipped() {
 // ── crawl_all (scan_package_dir) ───────────────────────────────
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn crawl_all_discovers_global_cache_layout() {
     let tmp = tempfile::tempdir().unwrap();
     stage_global_cache_pkg(tmp.path(), "Newtonsoft.Json", "13.0.3").await;
@@ -204,6 +210,7 @@ async fn crawl_all_discovers_global_cache_layout() {
 }
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn crawl_all_discovers_legacy_layout() {
     let tmp = tempfile::tempdir().unwrap();
     stage_legacy_pkg(tmp.path(), "Newtonsoft.Json", "13.0.3").await;
@@ -240,6 +247,7 @@ async fn crawl_all_discovers_legacy_layout() {
 }
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn crawl_all_skips_hidden_directories() {
     let tmp = tempfile::tempdir().unwrap();
     // Real package.
@@ -419,6 +427,7 @@ async fn get_nuget_package_paths_with_sln_falls_back_to_global() {
 // ── verify_nuget_package indirectly via find_by_purls ───────────
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn find_by_purls_rejects_dir_without_nuspec_or_lib() {
     let tmp = tempfile::tempdir().unwrap();
     // Create a global-cache-shaped dir but with neither .nuspec nor lib/ — verify fails.
@@ -441,6 +450,7 @@ async fn find_by_purls_rejects_dir_without_nuspec_or_lib() {
 }
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn find_by_purls_with_lib_dir_marker_succeeds() {
     let tmp = tempfile::tempdir().unwrap();
     let pkg_dir = tmp.path().join("newtonsoft.json").join("13.0.3");
@@ -469,6 +479,7 @@ mod common;
 /// `scan_package_dir` short-circuits when read_dir returns Err.
 #[cfg(unix)]
 #[tokio::test]
+#[serial_test::parallel]
 async fn crawl_all_handles_unreadable_pkg_path() {
     if common::uid_is_root() {
         eprintln!("SKIP: chmod 000 is a no-op under root");
@@ -497,6 +508,7 @@ async fn crawl_all_handles_unreadable_pkg_path() {
 /// nuget_crawler.rs:236.
 #[cfg(unix)]
 #[tokio::test]
+#[serial_test::parallel]
 async fn crawl_all_handles_unreadable_version_dir() {
     if common::uid_is_root() {
         eprintln!("SKIP: chmod 000 is a no-op under root");
@@ -543,6 +555,7 @@ async fn crawl_all_handles_unreadable_version_dir() {
 /// the `if !ft.is_dir()` continue arm at L183. Drive this by staging
 /// a plain file alongside a valid global-cache package.
 #[tokio::test]
+#[serial_test::parallel]
 async fn crawl_all_skips_files_at_top_level() {
     let tmp = tempfile::tempdir().unwrap();
     // Stage a real package so the scan actually runs.
@@ -569,6 +582,7 @@ async fn crawl_all_skips_files_at_top_level() {
 /// `scan_package_dir` short-circuits when the package dir doesn't
 /// exist — covers `read_dir(...).await` Err arm at L169.
 #[tokio::test]
+#[serial_test::parallel]
 async fn crawl_all_missing_pkg_path_returns_empty() {
     let tmp = tempfile::tempdir().unwrap();
     let crawler = NuGetCrawler;
@@ -585,6 +599,7 @@ async fn crawl_all_missing_pkg_path_returns_empty() {
 // ── NuGetCrawler construction ─────────────────────────────────
 
 #[test]
+#[serial_test::parallel]
 fn nuget_crawler_default_and_new_construct_cleanly() {
     let _a = NuGetCrawler;
     let _b = NuGetCrawler::new();
