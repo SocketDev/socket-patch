@@ -17,7 +17,9 @@ use std::time::Duration;
 use crate::args::GlobalArgs;
 use crate::commands::fetch_stage::{stage_vendor_sources_in_memory, MemStageOutcome};
 use crate::commands::get::{download_and_apply_patches, download_patch_records, DownloadParams};
-use crate::commands::vendor::{reconcile_dropped, track_outcomes_for_vendor, vendor_records};
+use crate::commands::vendor::{
+    note_classic_migration_risk, reconcile_dropped, track_outcomes_for_vendor, vendor_records,
+};
 use crate::json_envelope::{Command as EnvelopeCommand, Envelope};
 
 use super::gc::{gc_json, print_gc_vendored_line, run_apply_gc};
@@ -100,7 +102,10 @@ async fn run_scan_vendor_step(
                 Ok(Some(m)) => m,
                 Ok(None) => {
                     // No manifest ⇒ nothing downloaded and nothing
-                    // pre-existing to vendor: a clean no-op.
+                    // pre-existing to vendor: a clean no-op. Wiring from a
+                    // previous run may still sit in the lockfile, so the
+                    // state-based migration-risk advisory still applies.
+                    note_classic_migration_risk(&mut env, &common.cwd, common);
                     drop(guard);
                     return Ok((false, env));
                 }
@@ -130,6 +135,7 @@ async fn run_scan_vendor_step(
     if has_errors {
         env.mark_partial_failure();
     }
+    note_classic_migration_risk(&mut env, &common.cwd, common);
     Ok((has_errors, env))
 }
 
