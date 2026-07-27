@@ -12,6 +12,7 @@ use socket_patch_core::crawlers::types::CrawlerOptions;
 use socket_patch_core::crawlers::RubyCrawler;
 
 #[test]
+#[serial_test::parallel]
 fn parse_gem_env_output_well_formed() {
     assert_eq!(
         parse_gem_env_output("/Users/foo/.gem/ruby/3.2.0\n").as_deref(),
@@ -20,6 +21,7 @@ fn parse_gem_env_output_well_formed() {
 }
 
 #[test]
+#[serial_test::parallel]
 fn parse_gem_env_output_empty_returns_none() {
     assert_eq!(parse_gem_env_output(""), None);
     assert_eq!(parse_gem_env_output("   \n  "), None);
@@ -66,6 +68,7 @@ fn install_fake_gem(bin_dir: &Path, gemdir: &Path) {
 // ── find_by_purls ──────────────────────────────────────────────
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn find_by_purls_finds_gem_in_gem_path() {
     let tmp = tempfile::tempdir().unwrap();
     let pkg_dir = stage_gem(tmp.path(), "rails", "7.1.0").await;
@@ -85,6 +88,7 @@ async fn find_by_purls_finds_gem_in_gem_path() {
 }
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn find_by_purls_accepts_gem_with_gemspec_only() {
     let tmp = tempfile::tempdir().unwrap();
     // Stage with .gemspec but NO lib/ directory (alternate marker).
@@ -110,6 +114,7 @@ async fn find_by_purls_accepts_gem_with_gemspec_only() {
 }
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn find_by_purls_rejects_dir_without_lib_or_gemspec() {
     let tmp = tempfile::tempdir().unwrap();
     let pkg_dir = tmp.path().join("rails-7.1.0");
@@ -125,6 +130,7 @@ async fn find_by_purls_rejects_dir_without_lib_or_gemspec() {
 }
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn find_by_purls_no_match_returns_empty() {
     let tmp = tempfile::tempdir().unwrap();
     let crawler = RubyCrawler;
@@ -136,6 +142,7 @@ async fn find_by_purls_no_match_returns_empty() {
 }
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn find_by_purls_invalid_purl_skipped() {
     let tmp = tempfile::tempdir().unwrap();
     // Stage a gem dir that WOULD match `rails@7.1.0` on disk. The only
@@ -171,6 +178,7 @@ async fn find_by_purls_invalid_purl_skipped() {
 // ── crawl_all ─────────────────────────────────────────────────
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn crawl_all_discovers_gems_in_path() {
     let tmp = tempfile::tempdir().unwrap();
     stage_gem(tmp.path(), "rails", "7.1.0").await;
@@ -208,6 +216,7 @@ async fn crawl_all_discovers_gems_in_path() {
 // ── get_gem_paths ──────────────────────────────────────────────
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn get_gem_paths_with_global_prefix_returns_only_prefix() {
     let tmp = tempfile::tempdir().unwrap();
     let crawler = RubyCrawler;
@@ -221,6 +230,7 @@ async fn get_gem_paths_with_global_prefix_returns_only_prefix() {
 }
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn get_gem_paths_vendor_bundle_takes_precedence_over_global() {
     let tmp = tempfile::tempdir().unwrap();
     // Build a vendor/bundle/ruby/<ver>/gems layout. Bundler's scan
@@ -247,6 +257,7 @@ async fn get_gem_paths_vendor_bundle_takes_precedence_over_global() {
 }
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn get_gem_paths_no_gemfile_returns_empty() {
     let tmp = tempfile::tempdir().unwrap();
     // No Gemfile, no Gemfile.lock, no vendor/bundle.
@@ -379,6 +390,7 @@ mod common;
 /// drives ruby_crawler.rs:270 read_dir Err arm.
 #[cfg(unix)]
 #[tokio::test]
+#[serial_test::parallel]
 async fn crawl_all_handles_unreadable_gem_dir() {
     if common::uid_is_root() {
         eprintln!("SKIP: chmod 000 is a no-op under root");
@@ -404,6 +416,7 @@ async fn crawl_all_handles_unreadable_gem_dir() {
 
 /// `RubyCrawler::default()` should forward to `new()`.
 #[test]
+#[serial_test::parallel]
 fn ruby_crawler_default_and_new_construct_cleanly() {
     let _a = RubyCrawler;
     let _b = RubyCrawler::new();

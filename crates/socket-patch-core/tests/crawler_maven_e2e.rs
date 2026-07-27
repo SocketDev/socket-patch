@@ -47,6 +47,7 @@ async fn stage_maven_pkg(
 // ── parse_pom_group_artifact_version ───────────────────────────
 
 #[test]
+#[serial_test::parallel]
 fn parse_pom_well_formed_extracts_coordinates() {
     let pom = r#"<?xml version="1.0"?>
 <project>
@@ -66,6 +67,7 @@ fn parse_pom_well_formed_extracts_coordinates() {
 }
 
 #[test]
+#[serial_test::parallel]
 fn parse_pom_missing_group_id_returns_none() {
     let pom = r#"<?xml version="1.0"?>
 <project>
@@ -76,6 +78,7 @@ fn parse_pom_missing_group_id_returns_none() {
 }
 
 #[test]
+#[serial_test::parallel]
 fn parse_pom_missing_version_returns_none() {
     let pom = r#"<?xml version="1.0"?>
 <project>
@@ -86,12 +89,14 @@ fn parse_pom_missing_version_returns_none() {
 }
 
 #[test]
+#[serial_test::parallel]
 fn parse_pom_malformed_xml_returns_none() {
     let pom = "this is not XML at all";
     assert_eq!(parse_pom_group_artifact_version(pom), None);
 }
 
 #[test]
+#[serial_test::parallel]
 fn parse_pom_empty_string_returns_none() {
     assert_eq!(parse_pom_group_artifact_version(""), None);
 }
@@ -100,6 +105,7 @@ fn parse_pom_empty_string_returns_none() {
 /// exercise the `in_parent` arm that records `parent_group_id` and the
 /// final `group_id.or(parent_group_id)` fallback (maven_crawler.rs:124).
 #[test]
+#[serial_test::parallel]
 fn parse_pom_parent_groupid_fallback() {
     let pom = r#"<?xml version="1.0"?>
 <project>
@@ -126,6 +132,7 @@ fn parse_pom_parent_groupid_fallback() {
 /// reference — the parser must bail out instead of treating the
 /// literal placeholder as a value (line 100).
 #[test]
+#[serial_test::parallel]
 fn parse_pom_property_reference_groupid_returns_none() {
     let pom = r#"<?xml version="1.0"?>
 <project>
@@ -137,6 +144,7 @@ fn parse_pom_property_reference_groupid_returns_none() {
 }
 
 #[test]
+#[serial_test::parallel]
 fn parse_pom_property_reference_artifactid_returns_none() {
     let pom = r#"<?xml version="1.0"?>
 <project>
@@ -148,6 +156,7 @@ fn parse_pom_property_reference_artifactid_returns_none() {
 }
 
 #[test]
+#[serial_test::parallel]
 fn parse_pom_property_reference_version_returns_none() {
     let pom = r#"<?xml version="1.0"?>
 <project>
@@ -162,6 +171,7 @@ fn parse_pom_property_reference_version_returns_none() {
 /// reference — must NOT be accepted as a fallback groupId (line 86-87
 /// skip arm).
 #[test]
+#[serial_test::parallel]
 fn parse_pom_missing_artifact_id_returns_none() {
     let pom = r#"<?xml version="1.0"?>
 <project>
@@ -176,6 +186,7 @@ fn parse_pom_missing_artifact_id_returns_none() {
 /// can't extract a value, and the function returns None. Drives
 /// `extract_xml_value` line 16 (close-tag not found on same line).
 #[test]
+#[serial_test::parallel]
 fn parse_pom_split_tag_returns_none() {
     let pom = r#"<?xml version="1.0"?>
 <project>
@@ -191,6 +202,7 @@ fn parse_pom_split_tag_returns_none() {
 
 /// `MavenCrawler::default()` should forward to `new()`.
 #[test]
+#[serial_test::parallel]
 fn maven_crawler_default_and_new_construct_cleanly() {
     let _a = MavenCrawler;
     let _b = MavenCrawler::new();
@@ -317,6 +329,7 @@ async fn get_maven_repo_paths_global_mode_no_m2_returns_empty() {
 /// `find_by_purls` for a version directory that contains a non-`.pom`
 /// file but no `.pom` — exercise the `has_pom_file` return-false arm.
 #[tokio::test]
+#[serial_test::parallel]
 async fn find_by_purls_version_dir_without_pom_returns_empty() {
     let tmp = tempfile::tempdir().unwrap();
     let group_path = "org/apache/commons";
@@ -343,6 +356,7 @@ async fn find_by_purls_version_dir_without_pom_returns_empty() {
 }
 
 #[test]
+#[serial_test::parallel]
 fn parse_pom_parent_property_reference_groupid_skipped() {
     let pom = r#"<?xml version="1.0"?>
 <project>
@@ -361,6 +375,7 @@ fn parse_pom_parent_property_reference_groupid_skipped() {
 // ── find_by_purls ──────────────────────────────────────────────
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn find_by_purls_finds_package_in_m2_layout() {
     let tmp = tempfile::tempdir().unwrap();
     let pkg_dir =
@@ -388,6 +403,7 @@ async fn find_by_purls_finds_package_in_m2_layout() {
 }
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn find_by_purls_no_match_returns_empty() {
     let tmp = tempfile::tempdir().unwrap();
     let crawler = MavenCrawler;
@@ -402,6 +418,7 @@ async fn find_by_purls_no_match_returns_empty() {
 }
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn find_by_purls_invalid_purl_skipped() {
     let tmp = tempfile::tempdir().unwrap();
     let crawler = MavenCrawler;
@@ -415,6 +432,7 @@ async fn find_by_purls_invalid_purl_skipped() {
 // ── crawl_all ─────────────────────────────────────────────────
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn crawl_all_discovers_packages_in_repo() {
     let tmp = tempfile::tempdir().unwrap();
     stage_maven_pkg(tmp.path(), "org.apache.commons", "commons-lang3", "3.12.0").await;
@@ -454,6 +472,7 @@ async fn crawl_all_discovers_packages_in_repo() {
 }
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn crawl_all_with_empty_repo_returns_empty() {
     let tmp = tempfile::tempdir().unwrap();
     let crawler = MavenCrawler;
@@ -469,6 +488,7 @@ async fn crawl_all_with_empty_repo_returns_empty() {
 // ── get_maven_repo_paths ───────────────────────────────────────
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn get_maven_repo_paths_with_global_prefix_returns_only_prefix() {
     let tmp = tempfile::tempdir().unwrap();
     let crawler = MavenCrawler;

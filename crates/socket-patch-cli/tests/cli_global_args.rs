@@ -242,6 +242,7 @@ fn global_flag_cases_cover_every_global_field() {
 /// shipped unguarded). Derive the long-flag set from clap itself and demand a
 /// case for each — this cannot drift.
 #[test]
+#[serial_test::parallel]
 fn global_flag_cases_cover_every_global_long_flag() {
     use clap::CommandFactory;
 
@@ -273,6 +274,7 @@ fn global_flag_cases_cover_every_global_long_flag() {
 /// `GlobalArgs`, or forgets to add it here), this fails loudly instead of
 /// silently leaving the new command untested.
 #[test]
+#[serial_test::parallel]
 fn all_subcommands_are_covered() {
     use clap::CommandFactory;
 

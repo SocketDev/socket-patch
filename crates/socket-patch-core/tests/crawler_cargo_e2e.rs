@@ -44,6 +44,7 @@ async fn stage_vendor_crate(src: &Path, name: &str, version: &str) -> std::path:
 // ── parse_cargo_toml_name_version ──────────────────────────────
 
 #[test]
+#[serial_test::parallel]
 fn parse_cargo_toml_well_formed() {
     let toml = "[package]\nname = \"serde\"\nversion = \"1.0.200\"\nedition = \"2021\"\n";
     assert_eq!(
@@ -53,18 +54,21 @@ fn parse_cargo_toml_well_formed() {
 }
 
 #[test]
+#[serial_test::parallel]
 fn parse_cargo_toml_missing_name_returns_none() {
     let toml = "[package]\nversion = \"1.0.200\"\n";
     assert_eq!(parse_cargo_toml_name_version(toml), None);
 }
 
 #[test]
+#[serial_test::parallel]
 fn parse_cargo_toml_missing_version_returns_none() {
     let toml = "[package]\nname = \"serde\"\n";
     assert_eq!(parse_cargo_toml_name_version(toml), None);
 }
 
 #[test]
+#[serial_test::parallel]
 fn parse_cargo_toml_malformed_returns_none() {
     let toml = "this is not toml at all";
     assert_eq!(parse_cargo_toml_name_version(toml), None);
@@ -75,6 +79,7 @@ fn parse_cargo_toml_malformed_returns_none() {
 /// picked up. Covers the "left package section" early-break arm
 /// (cargo_crawler.rs:34-36).
 #[test]
+#[serial_test::parallel]
 fn parse_cargo_toml_stops_at_next_section() {
     let toml = "[package]\nname = \"foo\"\nversion = \"1.0.0\"\n\n[dependencies]\nname = \"bar\"\n";
     assert_eq!(
@@ -86,6 +91,7 @@ fn parse_cargo_toml_stops_at_next_section() {
 /// Parser must ignore key=value lines that appear BEFORE [package]
 /// (e.g. inside an earlier [profile.release] table).
 #[test]
+#[serial_test::parallel]
 fn parse_cargo_toml_ignores_lines_before_package_section() {
     let toml =
         "[profile.release]\nname = \"wrong\"\n\n[package]\nname = \"foo\"\nversion = \"1.0.0\"\n";
@@ -98,6 +104,7 @@ fn parse_cargo_toml_ignores_lines_before_package_section() {
 /// CargoCrawler's `Default` impl forwards to `new`. Exercise both
 /// for symmetry.
 #[test]
+#[serial_test::parallel]
 fn cargo_crawler_default_and_new_construct_cleanly() {
     let _a = CargoCrawler;
     let _b = CargoCrawler::new();
@@ -153,6 +160,7 @@ async fn cargo_home_fallback_to_home_dot_cargo() {
 // ── find_by_purls ──────────────────────────────────────────────
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn find_by_purls_registry_layout_finds_crate() {
     let tmp = tempfile::tempdir().unwrap();
     let pkg = stage_registry_crate(tmp.path(), "serde", "1.0.200").await;
@@ -172,6 +180,7 @@ async fn find_by_purls_registry_layout_finds_crate() {
 }
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn find_by_purls_vendor_layout_finds_crate() {
     let tmp = tempfile::tempdir().unwrap();
     let pkg = stage_vendor_crate(tmp.path(), "serde", "1.0.200").await;
@@ -192,6 +201,7 @@ async fn find_by_purls_vendor_layout_finds_crate() {
 }
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn find_by_purls_vendor_version_mismatch_returns_empty() {
     let tmp = tempfile::tempdir().unwrap();
     stage_vendor_crate(tmp.path(), "serde", "1.0.200").await;
@@ -205,6 +215,7 @@ async fn find_by_purls_vendor_version_mismatch_returns_empty() {
 }
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn find_by_purls_no_match_returns_empty() {
     let tmp = tempfile::tempdir().unwrap();
     let crawler = CargoCrawler;
@@ -216,6 +227,7 @@ async fn find_by_purls_no_match_returns_empty() {
 }
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn find_by_purls_invalid_purl_skipped() {
     let tmp = tempfile::tempdir().unwrap();
     let crawler = CargoCrawler;
@@ -229,6 +241,7 @@ async fn find_by_purls_invalid_purl_skipped() {
 // ── crawl_all ─────────────────────────────────────────────────
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn crawl_all_via_registry_layout() {
     let tmp = tempfile::tempdir().unwrap();
     stage_registry_crate(tmp.path(), "serde", "1.0.200").await;
@@ -267,6 +280,7 @@ async fn crawl_all_via_registry_layout() {
 }
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn crawl_all_empty_src_returns_empty() {
     let tmp = tempfile::tempdir().unwrap();
     let crawler = CargoCrawler;
@@ -282,6 +296,7 @@ async fn crawl_all_empty_src_returns_empty() {
 // ── get_crate_source_paths ─────────────────────────────────────
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn get_crate_source_paths_with_global_prefix_passthrough() {
     let tmp = tempfile::tempdir().unwrap();
     let crawler = CargoCrawler;
@@ -295,6 +310,7 @@ async fn get_crate_source_paths_with_global_prefix_passthrough() {
 }
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn get_crate_source_paths_with_vendor_dir_returns_vendor() {
     let tmp = tempfile::tempdir().unwrap();
     let vendor = tmp.path().join("vendor");
@@ -321,6 +337,7 @@ async fn get_crate_source_paths_with_vendor_dir_returns_vendor() {
 /// manifest (e.g. a Composer/Go project) must NOT be claimed by the
 /// cargo crawler.
 #[tokio::test]
+#[serial_test::parallel]
 async fn get_crate_source_paths_vendor_without_cargo_manifest_is_empty() {
     let tmp = tempfile::tempdir().unwrap();
     tokio::fs::create_dir(tmp.path().join("vendor"))
@@ -339,6 +356,7 @@ async fn get_crate_source_paths_vendor_without_cargo_manifest_is_empty() {
 }
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn get_crate_source_paths_no_cargo_project_returns_empty() {
     let tmp = tempfile::tempdir().unwrap();
     // No Cargo.toml, no Cargo.lock, no vendor.
@@ -357,6 +375,7 @@ async fn get_crate_source_paths_no_cargo_project_returns_empty() {
 /// parsing `<name>-<version>` from the directory name. Exercises
 /// `parse_dir_name_version` (cargo_crawler.rs:357-372).
 #[tokio::test]
+#[serial_test::parallel]
 async fn crawl_all_falls_back_to_dir_name_when_workspace_version() {
     let tmp = tempfile::tempdir().unwrap();
     // <name>-<version> directory; Cargo.toml has workspace version.
@@ -382,6 +401,7 @@ async fn crawl_all_falls_back_to_dir_name_when_workspace_version() {
 }
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn crawl_all_skips_dir_without_cargo_toml() {
     let tmp = tempfile::tempdir().unwrap();
     // Directory shaped like a crate but no Cargo.toml — must be skipped.
@@ -402,6 +422,7 @@ async fn crawl_all_skips_dir_without_cargo_toml() {
 /// version, find_by_purls compares dir name. Exercises the
 /// fallback arm in `verify_crate_at_path` (L335-L348).
 #[tokio::test]
+#[serial_test::parallel]
 async fn find_by_purls_verify_fallback_via_dir_name() {
     let tmp = tempfile::tempdir().unwrap();
     let pkg = tmp.path().join("workspace-crate-0.1.0");
@@ -434,6 +455,7 @@ async fn find_by_purls_verify_fallback_via_dir_name() {
 /// parsing — but `parse_cargo_toml_name_version` itself must return
 /// None up front.
 #[test]
+#[serial_test::parallel]
 fn parse_cargo_toml_version_workspace_returns_none() {
     let toml = "[package]\nname = \"foo\"\nversion.workspace = true\n";
     assert_eq!(parse_cargo_toml_name_version(toml), None);
@@ -448,6 +470,7 @@ fn parse_cargo_toml_version_workspace_returns_none() {
 /// Exercises the `n == name && v == version` false arm
 /// (cargo_crawler.rs:349).
 #[tokio::test]
+#[serial_test::parallel]
 async fn find_by_purls_verify_fallback_dir_name_mismatch_returns_empty() {
     let tmp = tempfile::tempdir().unwrap();
     let pkg = tmp.path().join("sha-1");
@@ -472,6 +495,7 @@ async fn find_by_purls_verify_fallback_dir_name_mismatch_returns_empty() {
 /// Hidden directory entries inside the crate source root must be
 /// skipped by `scan_crate_source` (line 274).
 #[tokio::test]
+#[serial_test::parallel]
 async fn crawl_all_skips_hidden_dirs() {
     let tmp = tempfile::tempdir().unwrap();
     // Stage a hidden dir that looks like a registry crate — must be skipped.
@@ -505,6 +529,7 @@ async fn crawl_all_skips_hidden_dirs() {
 /// been recorded in `seen` (line 310-311). Drive this by staging two
 /// registry dirs for the same crate — the second one is deduped.
 #[tokio::test]
+#[serial_test::parallel]
 async fn crawl_all_dedups_same_purl() {
     let tmp = tempfile::tempdir().unwrap();
     // Two physical dirs with identical Cargo.toml -> same purl.
@@ -572,6 +597,7 @@ async fn get_crate_source_paths_local_cargo_toml_falls_back_to_registry() {
 /// `scan_crate_source` must skip plain-file entries inside the source
 /// path — covers `!ft.is_dir()` continue arm (cargo_crawler.rs:266).
 #[tokio::test]
+#[serial_test::parallel]
 async fn crawl_all_skips_top_level_files() {
     let tmp = tempfile::tempdir().unwrap();
     stage_registry_crate(tmp.path(), "real-crate", "1.0.0").await;
@@ -596,6 +622,7 @@ async fn crawl_all_skips_top_level_files() {
 /// followed by digit), so the chain short-circuits at line 304 and
 /// the package is silently skipped.
 #[tokio::test]
+#[serial_test::parallel]
 async fn crawl_all_skips_crate_with_unparseable_toml_and_no_version_dir_name() {
     let tmp = tempfile::tempdir().unwrap();
     let bad = tmp.path().join("no-version-suffix");
@@ -625,6 +652,7 @@ mod common;
 /// it. Skipped under root because chmod has no effect on uid 0.
 #[cfg(unix)]
 #[tokio::test]
+#[serial_test::parallel]
 async fn crawl_all_handles_unreadable_src_path() {
     if common::uid_is_root() {
         eprintln!("SKIP: chmod 000 is a no-op under root");
@@ -658,6 +686,7 @@ async fn crawl_all_handles_unreadable_src_path() {
 /// dir-name-fallback `is_some_and` short-circuit on `None`
 /// (cargo_crawler.rs:346-349).
 #[tokio::test]
+#[serial_test::parallel]
 async fn find_by_purls_verify_fails_when_both_parsers_fail() {
     let tmp = tempfile::tempdir().unwrap();
     let bad = tmp.path().join("foo");

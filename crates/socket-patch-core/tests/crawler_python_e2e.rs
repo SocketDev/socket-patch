@@ -22,6 +22,7 @@ use socket_patch_core::crawlers::types::CrawlerOptions;
 use socket_patch_core::crawlers::PythonCrawler;
 
 #[test]
+#[serial_test::parallel]
 fn parse_python_site_packages_output_well_formed() {
     let stdout =
         "/usr/local/lib/python3.11/site-packages\n/usr/local/lib/python3.11/dist-packages\n";
@@ -34,12 +35,14 @@ fn parse_python_site_packages_output_well_formed() {
 }
 
 #[test]
+#[serial_test::parallel]
 fn parse_python_site_packages_output_empty_returns_empty() {
     assert!(parse_python_site_packages_output("").is_empty());
     assert!(parse_python_site_packages_output("\n  \n").is_empty());
 }
 
 #[test]
+#[serial_test::parallel]
 fn parse_python_site_packages_output_trims_and_skips_blanks() {
     let stdout = "  /a/b  \n\n   \n/c/d\n";
     let paths = parse_python_site_packages_output(stdout);
@@ -53,6 +56,7 @@ fn parse_python_site_packages_output_trims_and_skips_blanks() {
 /// the first-match-wins arm. Lets tests exercise the success arm
 /// without needing python3 on the host's PATH.
 #[test]
+#[serial_test::parallel]
 fn find_python_command_with_mock_runner_prefers_python3() {
     let runner = common::MockCommandRunner::new().with_response(
         "python3",
@@ -65,6 +69,7 @@ fn find_python_command_with_mock_runner_prefers_python3() {
 /// When `python3` is not present but `python` is, the helper should
 /// fall through to the second candidate.
 #[test]
+#[serial_test::parallel]
 fn find_python_command_with_mock_runner_falls_through_to_python() {
     let runner = common::MockCommandRunner::new().with_response(
         "python",
@@ -77,6 +82,7 @@ fn find_python_command_with_mock_runner_falls_through_to_python() {
 /// When none of `python3`/`python`/`py` are present, the helper
 /// returns None.
 #[test]
+#[serial_test::parallel]
 fn find_python_command_with_mock_runner_none_when_no_binary() {
     let runner = common::MockCommandRunner::new();
     assert_eq!(find_python_command_with(&runner), None);
@@ -101,6 +107,7 @@ async fn stage_python_layout(root: &Path, py_ver: &str) -> std::path::PathBuf {
 /// `python3.`. Covers the wildcard arm + the `name.starts_with`
 /// filter.
 #[tokio::test]
+#[serial_test::parallel]
 async fn find_python_dirs_python3_wildcard_matches_versions() {
     let tmp = tempfile::tempdir().unwrap();
     let p1 = stage_python_layout(tmp.path(), "3.11").await;
@@ -125,6 +132,7 @@ async fn find_python_dirs_python3_wildcard_matches_versions() {
 /// `*` generic wildcard matches every directory entry. Covers the
 /// generic wildcard branch (L142-L160 of python_crawler.rs).
 #[tokio::test]
+#[serial_test::parallel]
 async fn find_python_dirs_star_wildcard_matches_all() {
     let tmp = tempfile::tempdir().unwrap();
     tokio::fs::create_dir_all(
@@ -153,6 +161,7 @@ async fn find_python_dirs_star_wildcard_matches_all() {
 /// `*` wildcard skips non-directory entries (regular files). Covers
 /// the `if !ft.is_dir() { continue; }` arm.
 #[tokio::test]
+#[serial_test::parallel]
 async fn find_python_dirs_star_wildcard_skips_files() {
     let tmp = tempfile::tempdir().unwrap();
     // A regular file at the wildcard position must NOT cause issues.
@@ -177,6 +186,7 @@ async fn find_python_dirs_star_wildcard_skips_files() {
 /// `find_python_dirs` against a non-existent base path returns empty
 /// — the early-return arm.
 #[tokio::test]
+#[serial_test::parallel]
 async fn find_python_dirs_nonexistent_base_returns_empty() {
     let tmp = tempfile::tempdir().unwrap();
     let absent = tmp.path().join("does-not-exist");
@@ -187,6 +197,7 @@ async fn find_python_dirs_nonexistent_base_returns_empty() {
 /// `find_python_dirs` with empty segments returns the base path
 /// itself (terminal-recursion arm).
 #[tokio::test]
+#[serial_test::parallel]
 async fn find_python_dirs_empty_segments_returns_base() {
     let tmp = tempfile::tempdir().unwrap();
     let result = find_python_dirs(tmp.path(), &[]).await;
@@ -197,6 +208,7 @@ async fn find_python_dirs_empty_segments_returns_base() {
 /// Literal segment branch: non-wildcard segment is treated as a
 /// literal subdir.
 #[tokio::test]
+#[serial_test::parallel]
 async fn find_python_dirs_literal_segment_descends() {
     let tmp = tempfile::tempdir().unwrap();
     let target = tmp.path().join("literal_subdir").join("more");
@@ -689,6 +701,7 @@ async fn get_site_packages_paths_no_marker_no_venv_returns_empty() {
 
 /// Well-formed METADATA returns (name, version).
 #[tokio::test]
+#[serial_test::parallel]
 async fn read_python_metadata_well_formed() {
     let tmp = tempfile::tempdir().unwrap();
     let dist_info = tmp.path().join("requests-2.28.0.dist-info");
@@ -707,6 +720,7 @@ async fn read_python_metadata_well_formed() {
 /// Missing METADATA file → fall back to the `<name>-<version>.dist-info`
 /// directory name so a partially-written install stays discoverable.
 #[tokio::test]
+#[serial_test::parallel]
 async fn read_python_metadata_missing_file_falls_back_to_dir_name() {
     let tmp = tempfile::tempdir().unwrap();
     let dist_info = tmp.path().join("requests-2.28.0.dist-info");
@@ -720,6 +734,7 @@ async fn read_python_metadata_missing_file_falls_back_to_dir_name() {
 /// METADATA missing Name field → headers are unusable, so fall back to the
 /// directory name rather than dropping the package.
 #[tokio::test]
+#[serial_test::parallel]
 async fn read_python_metadata_missing_name_falls_back_to_dir_name() {
     let tmp = tempfile::tempdir().unwrap();
     let dist_info = tmp.path().join("requests-2.28.0.dist-info");
@@ -742,6 +757,7 @@ mod common;
 /// unreadable. Drives the python_crawler.rs:530 read_dir Err arm.
 #[cfg(unix)]
 #[tokio::test]
+#[serial_test::parallel]
 async fn find_by_purls_handles_unreadable_site_packages() {
     if common::uid_is_root() {
         eprintln!("SKIP: chmod 000 is a no-op under root");
@@ -766,6 +782,7 @@ async fn find_by_purls_handles_unreadable_site_packages() {
 /// unreadable — drives python_crawler.rs:584 read_dir Err arm.
 #[cfg(unix)]
 #[tokio::test]
+#[serial_test::parallel]
 async fn crawl_all_handles_unreadable_site_packages() {
     if common::uid_is_root() {
         eprintln!("SKIP: chmod 000 is a no-op under root");
@@ -790,6 +807,7 @@ async fn crawl_all_handles_unreadable_site_packages() {
 
 /// `PythonCrawler::default()` should forward to `new()`.
 #[test]
+#[serial_test::parallel]
 fn python_crawler_default_and_new_construct_cleanly() {
     let _a = PythonCrawler;
     let _b = PythonCrawler::new();
@@ -809,6 +827,7 @@ async fn stage_dist_info(site_packages: &Path, raw_name: &str, version: &str) {
 }
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn find_by_purls_matches_canonicalized_name() {
     let tmp = tempfile::tempdir().unwrap();
     // PEP 503 canonicalization: "Requests" -> "requests"
@@ -837,6 +856,7 @@ async fn find_by_purls_matches_canonicalized_name() {
 }
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn find_by_purls_strips_qualifiers() {
     let tmp = tempfile::tempdir().unwrap();
     stage_dist_info(tmp.path(), "requests", "2.28.0").await;
@@ -867,6 +887,7 @@ async fn find_by_purls_strips_qualifiers() {
 /// package silently fails to match. Twin of the strip_purl_qualifiers
 /// subpath fix in utils::purl.
 #[tokio::test]
+#[serial_test::parallel]
 async fn find_by_purls_strips_subpath() {
     let tmp = tempfile::tempdir().unwrap();
     stage_dist_info(tmp.path(), "requests", "2.28.0").await;
@@ -896,6 +917,7 @@ async fn find_by_purls_strips_subpath() {
 /// — reported "not installed", patch skipped. Twin of the npm crawler's
 /// percent-decode handling.
 #[tokio::test]
+#[serial_test::parallel]
 async fn find_by_purls_percent_decodes_encoded_version() {
     let tmp = tempfile::tempdir().unwrap();
     stage_dist_info(tmp.path(), "torch", "2.1.0+cpu").await;
@@ -920,6 +942,7 @@ async fn find_by_purls_percent_decodes_encoded_version() {
 }
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn find_by_purls_empty_purls_returns_empty() {
     let tmp = tempfile::tempdir().unwrap();
     stage_dist_info(tmp.path(), "requests", "2.28.0").await;
@@ -930,6 +953,7 @@ async fn find_by_purls_empty_purls_returns_empty() {
 }
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn find_by_purls_missing_site_packages_returns_empty() {
     let tmp = tempfile::tempdir().unwrap();
     let crawler = PythonCrawler;
@@ -945,6 +969,7 @@ async fn find_by_purls_missing_site_packages_returns_empty() {
 }
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn find_by_purls_invalid_purl_skipped() {
     let tmp = tempfile::tempdir().unwrap();
     stage_dist_info(tmp.path(), "requests", "2.28.0").await;
@@ -958,6 +983,7 @@ async fn find_by_purls_invalid_purl_skipped() {
 }
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn find_by_purls_version_mismatch_returns_empty() {
     let tmp = tempfile::tempdir().unwrap();
     stage_dist_info(tmp.path(), "requests", "2.28.0").await;
@@ -971,6 +997,7 @@ async fn find_by_purls_version_mismatch_returns_empty() {
 }
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn crawl_all_via_site_packages_finds_dist_info_packages() {
     let tmp = tempfile::tempdir().unwrap();
     stage_dist_info(tmp.path(), "Requests", "2.28.0").await;
@@ -1014,6 +1041,7 @@ async fn crawl_all_via_site_packages_finds_dist_info_packages() {
 }
 
 #[tokio::test]
+#[serial_test::parallel]
 async fn crawl_all_with_unparseable_dist_info_skips() {
     let tmp = tempfile::tempdir().unwrap();
     // No version segment in the directory name, so neither the (empty)
@@ -1039,6 +1067,7 @@ async fn crawl_all_with_unparseable_dist_info_skips() {
 /// `get_site_packages_paths` with `global_prefix` set returns just that
 /// prefix — exercises the early-return arm at python_crawler.rs:473-474.
 #[tokio::test]
+#[serial_test::parallel]
 async fn get_site_packages_paths_with_global_prefix_passthrough() {
     let tmp = tempfile::tempdir().unwrap();
     let custom = tmp.path().join("custom-sp");
@@ -1064,6 +1093,7 @@ async fn get_site_packages_paths_with_global_prefix_passthrough() {
 /// (`2.28.0`) so the result proves the blank-line break fired: a `2.28.0`
 /// result would mean the break leaked the trailing header.
 #[tokio::test]
+#[serial_test::parallel]
 async fn read_python_metadata_stops_at_blank_line_then_falls_back() {
     let tmp = tempfile::tempdir().unwrap();
     let dist = tmp.path().join("requests-9.9.9.dist-info");
@@ -1084,6 +1114,7 @@ async fn read_python_metadata_stops_at_blank_line_then_falls_back() {
 /// METADATA missing Version field → headers unusable, fall back to the
 /// directory name.
 #[tokio::test]
+#[serial_test::parallel]
 async fn read_python_metadata_missing_version_falls_back_to_dir_name() {
     let tmp = tempfile::tempdir().unwrap();
     let dist_info = tmp.path().join("requests-2.28.0.dist-info");
