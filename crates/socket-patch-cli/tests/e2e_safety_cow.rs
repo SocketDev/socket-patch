@@ -235,6 +235,7 @@ impl Fixture {
 /// patched. This is exactly the pnpm content-store isolation
 /// guarantee, but exercised without a pnpm dependency.
 #[test]
+#[serial_test::serial]
 fn apply_breaks_hardlink_before_patching() {
     let fx = Fixture::new();
     // Materialize index.js as a hardlink to an outside file. The
@@ -290,6 +291,7 @@ fn apply_breaks_hardlink_before_patching() {
 /// a private regular file holding the patched bytes; the original
 /// target stays untouched.
 #[test]
+#[serial_test::serial]
 fn apply_replaces_symlink_with_private_file() {
     let fx = Fixture::new();
     let outside = fx.root().join("outside-target.js");
@@ -332,6 +334,7 @@ fn apply_replaces_symlink_with_private_file() {
 /// siblings should stay byte-identical. Exercises the per-file CoW
 /// in a loop.
 #[test]
+#[serial_test::serial]
 fn apply_breaks_hardlinks_on_multi_file_patch() {
     let fx = Fixture::new();
     let pkg = fx.root().join("node_modules/cow-fixture");
@@ -453,6 +456,7 @@ fn apply_breaks_hardlinks_on_multi_file_patch() {
 /// while writing nothing, so every CoW content assertion in this file
 /// would chase a no-op.
 #[test]
+#[serial_test::serial]
 fn run_scrubs_ambient_socket_env() {
     std::env::set_var("SOCKET_DRY_RUN", "true");
     let fx = Fixture::new();
@@ -474,6 +478,7 @@ fn run_scrubs_ambient_socket_env() {
 /// place via the atomic-write path. This pins the
 /// `CowAction::AlreadyPrivate` route.
 #[test]
+#[serial_test::serial]
 fn apply_against_regular_file_leaves_no_cow_litter() {
     let fx = Fixture::new();
     std::fs::write(fx.index_js(), ORIGINAL_BYTES).unwrap();
@@ -504,6 +509,7 @@ fn apply_against_regular_file_leaves_no_cow_litter() {
 /// state — semantically OK but observably different. This test
 /// pins the "no observable state change on failure" promise.
 #[test]
+#[serial_test::serial]
 fn apply_failure_does_not_cow_or_modify() {
     let fx = Fixture::new();
     let outside = fx.root().join("outside.js");

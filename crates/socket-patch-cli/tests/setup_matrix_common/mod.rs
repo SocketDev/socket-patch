@@ -682,3 +682,33 @@ fn indent(s: &str) -> String {
         .collect::<Vec<_>>()
         .join("\n")
 }
+
+/// RAII setter for hostile ambient env decoys: sets each pair process-wide
+/// and removes them ALL on drop, so a panicking assertion mid-test can never
+/// leave the process env poisoned for the tests that run after it.
+///
+/// Process env is per-process, shared state. Any test that constructs this
+/// guard — and every other test in the same binary that spawns the CLI —
+/// must be `#[serial_test::serial]`: the child-env scrubs in the `run`
+/// helpers snapshot `std::env::vars_os()` and then spawn, and a concurrent
+/// `set_var` can land between the snapshot and the spawn, reaching the child
+/// un-scrubbed (the 2026-07 `setup_matrix_pypi` CI flake — the decoys made
+/// the sibling test's child abort at arg parse with exit 2).
+pub struct DecoyGuard(&'static [(&'static str, &'static str)]);
+
+impl DecoyGuard {
+    pub fn set(pairs: &'static [(&'static str, &'static str)]) -> Self {
+        for (k, v) in pairs {
+            std::env::set_var(k, v);
+        }
+        Self(pairs)
+    }
+}
+
+impl Drop for DecoyGuard {
+    fn drop(&mut self) {
+        for (k, _) in self.0 {
+            std::env::remove_var(k);
+        }
+    }
+}

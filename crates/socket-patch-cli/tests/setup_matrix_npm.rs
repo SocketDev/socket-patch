@@ -13,21 +13,25 @@
 mod smc;
 
 #[test]
+#[serial_test::serial]
 fn npm() {
     smc::run_pm("npm", "npm");
 }
 
 #[test]
+#[serial_test::serial]
 fn yarn() {
     smc::run_pm("npm", "yarn");
 }
 
 #[test]
+#[serial_test::serial]
 fn pnpm() {
     smc::run_pm("npm", "pnpm");
 }
 
 #[test]
+#[serial_test::serial]
 fn bun() {
     smc::run_pm("npm", "bun");
 }
@@ -40,16 +44,19 @@ fn bun() {
 // PASS — they're real regression guards, not gap documentation.
 
 #[test]
+#[serial_test::serial]
 fn npm_workspace() {
     smc::run_workspace_pm("npm", "npm");
 }
 
 #[test]
+#[serial_test::serial]
 fn pnpm_workspace() {
     smc::run_workspace_pm("npm", "pnpm");
 }
 
 #[test]
+#[serial_test::serial]
 fn yarn_workspace() {
     smc::run_workspace_pm("npm", "yarn");
 }
@@ -176,15 +183,14 @@ mod host_guard {
     /// state at every stage. This is the assertion the soft-skipping Docker
     /// matrix can never make.
     #[test]
+    #[serial_test::serial]
     fn npm_setup_roundtrip_host() {
         // Committed regression guard for the env scrub itself: with the old
         // fixed-list scrub these leaked into the child — SOCKET_STRICT /
         // SOCKET_VENDOR_SOURCE aborted every parse (exit 2, so the very first
         // `--check` assertion went red) and SOCKET_SETUP_EXCLUDE stood in for
         // `setup --exclude` on the real run.
-        for (k, v) in HOSTILE_DECOYS {
-            std::env::set_var(k, v);
-        }
+        let _decoys = crate::smc::DecoyGuard::set(HOSTILE_DECOYS);
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         stage_project(root);
