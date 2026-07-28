@@ -3,3 +3,25 @@
 # golden.test.ts). EOL conversion on checkout (Windows CRLF) breaks the
 # byte-for-byte comparison, so they are checked out exactly as committed.
 crates/socket-patch-core/tests/fixtures/redirect/** -text
+
+# Packagist dist allowlist (fail-closed).
+#
+# Packagist serves dist zips from GitHub codeload archives (git archive),
+# which honor export-ignore. The Composer package manifest must live at the
+# repository root (Packagist only publishes root manifests), so without this
+# block the dist zip would ship the entire repository. The deny-by-default
+# first line export-ignores every top-level entry, then the -export-ignore
+# lines un-ignore exactly the files the Composer package needs — so any
+# future top-level directory stays out of the dist zip automatically.
+#
+# Side effect (deliberate, but easy to miss): export-ignore applies to EVERY
+# git-archive consumer, not just Packagist — GitHub's auto-generated
+# "Source code (zip/tar.gz)" assets on releases and codeload tarballs
+# (`npm install SocketDev/socket-patch#tag`, pip-from-archive-URL, distro
+# packagers) will contain only the files allowlisted below. Anyone needing
+# the full source should clone the repository or use the tagged tree.
+/*             export-ignore
+/composer.json -export-ignore
+/composer      -export-ignore
+/LICENSE       -export-ignore
+/README.md     -export-ignore

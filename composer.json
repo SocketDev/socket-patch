@@ -11,7 +11,7 @@
   "require": {
     "php": ">=7.4"
   },
-  "bin": ["bin/socket-patch"],
+  "bin": ["composer/socket-patch/bin/socket-patch"],
   "support": {
     "issues": "https://github.com/SocketDev/socket-patch/issues",
     "source": "https://github.com/SocketDev/socket-patch"

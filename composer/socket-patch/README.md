@@ -19,6 +19,14 @@ the cached binary.
 So `composer require socketsecurity/socket-patch:3.2.0` downloads the `v3.2.0`
 binary — the binary version always tracks the installed package version.
 
+Note: the package manifest (`composer.json`) lives at the **repository root**,
+not in this directory — Packagist only publishes manifests found at the root of
+the VCS repository (and `composer.json` cannot carry comments explaining that
+itself). The launcher script stays here; the root manifest points its `bin` at
+`composer/socket-patch/bin/socket-patch`, and the root `.gitattributes`
+export-ignore allowlist keeps the rest of the repository out of the Packagist
+dist zip.
+
 ## Airgapped / offline use
 
 The launcher downloads on first run. For offline CI, point it at an

@@ -44,6 +44,16 @@ in this file — see `.github/workflows/release.yml` (`version` job).
 
 ### Added
 
+- **Maven Central and NuGet distribution.** Two new install channels for the
+  CLI. Maven Central: `dev.socket:socket-patch`, a dependency-free launcher
+  jar — run via `java -jar` (fetch it with `mvn dependency:copy`) or in one
+  shot with JBang. NuGet: `SocketSecurity.SocketPatch`, a .NET tool —
+  `dotnet tool install -g SocketSecurity.SocketPatch` puts `socket-patch`
+  on `PATH`. Both behave like the existing gem/composer launchers: on first
+  run they download the version-matched prebuilt binary from the GitHub
+  release, verify it against the published `SHA256SUMS` (HTTPS-only,
+  including redirects), cache it per-user, and run it; `SOCKET_PATCH_BIN`
+  points them at an existing binary instead.
 - **`socket-patch --update` — self-update.** Downloads the release for the
   compiled target from GitHub Releases, verifies it against the published
   `SHA256SUMS` before extraction, sanity-execs the staged binary, and
@@ -312,6 +322,19 @@ in this file — see `.github/workflows/release.yml` (`version` job).
 
 ### Changed
 
+- **Release workflow consolidated into a single `release.yml`.** One
+  dispatch now publishes every ecosystem package — crates.io, npm, PyPI,
+  RubyGems (both gems, via OIDC trusted publishing), Packagist, Maven
+  Central, and NuGet — with the launcher-package jobs gated on the GitHub
+  release existing. The separate `release-ecosystems.yml` workflow is
+  removed (its `release: published` trigger never fired: the release is
+  created with `GITHUB_TOKEN`, which suppresses downstream workflow
+  events). `composer.json` moved to the repository root — a Packagist
+  requirement — with a fail-closed `.gitattributes` `export-ignore` set,
+  so Packagist can publish `socketsecurity/socket-patch`. Note the
+  `export-ignore` allowlist applies to every `git archive` consumer, so
+  GitHub's auto-generated "Source code" release assets now contain only
+  the Composer package files — clone the repo for full source.
 - `--api-url` / `--proxy-url` no longer carry clap-level defaults: with
   neither flag nor env var set they parse as unset and the documented
   default URLs are applied at API-client construction (after the
@@ -343,6 +366,17 @@ in this file — see `.github/workflows/release.yml` (`version` job).
 
 ### Fixed
 
+- **npm `@socketsecurity/socket-patch`: the `./schema` export is now built
+  at publish.** The subpath pointed at a gitignored `dist/` directory that
+  nothing built during release, so it shipped broken; a `prepack` script
+  now compiles it as part of `npm publish`.
+- **Release workflow tag-guard and idempotency fixes.** The
+  tag-already-exists guard never fired (it ran `git rev-parse` in a
+  shallow, tagless checkout) — it is now a stateless `git ls-remote` check
+  that still permits same-commit retries; the GitHub-release step re-runs
+  cleanly instead of hard-failing when the release already exists; and the
+  cargo/PyPI/gem publish jobs skip already-published versions, so
+  "Re-run failed jobs" can resume a partial release safely.
 - **NuGet hosted rewriter: creating a `packageSourceMapping` from scratch now
   emits a catch-all for pre-existing sources.** `packageSourceMapping` is
   exclusive — once ANY mapping exists, every package must match some source's

@@ -1,5 +1,39 @@
 name: Release
 
+# One-workflow release: build, tag, GitHub release, and EVERY ecosystem publish
+# live in this single file — deliberately. The tag and the GitHub release are
+# created with this workflow's own GITHUB_TOKEN, and GitHub suppresses events
+# caused by GITHUB_TOKEN: a `release: published` (or `push: tags:`) trigger in
+# a second workflow file would never fire. Fanning every publish job out from
+# the one dispatch via `needs:` is the only reliable topology without a
+# PAT/GitHub App token, and it gives full job-graph visibility plus
+# "Re-run failed jobs" retryability (every publish job is idempotent).
+#
+# The launcher-package jobs (rubygems, packagist, maven-central, nuget) publish
+# thin launchers that download the prebuilt binary from the GitHub release at
+# their own version, so they only need the GitHub release (and its SHA256SUMS)
+# to exist: `needs: [version, github-release]`.
+#
+# Credentials / deployment-environment matrix (per-registry):
+#   - crates.io:     OIDC trusted publishing (rust-lang/crates-io-auth-action);
+#                    no long-lived secret, no environment.
+#   - npm:           OIDC via `npm stage publish`; staged versions require
+#                    manual 2FA approval (see the npm job's step summary).
+#   - PyPI:          OIDC trusted publishing; environment `pypi`.
+#   - RubyGems:      OIDC trusted publishing; environment `rubygems`. One
+#                    repo+workflow publisher per gem (`socket-patch` and
+#                    `socket-patch-bundler`), both satisfied by one exchange.
+#   - Packagist:     PACKAGIST_USERNAME / PACKAGIST_TOKEN in environment
+#                    `packagist` (optional — Packagist's GitHub hook syncs
+#                    tags on its own; the API ping is a promptness nudge).
+#   - Maven Central: CENTRAL_USERNAME / CENTRAL_PASSWORD (portal user token)
+#                    + CENTRAL_GPG_PRIVATE_KEY / CENTRAL_GPG_PASSPHRASE in
+#                    environment `maven-central` (no OIDC trusted publishing
+#                    exists for Central as of 2026-07).
+#   - NuGet:         OIDC trusted publishing via NuGet/login with NUGET_USER,
+#                    plus a long-lived NUGET_API_KEY fallback; environment
+#                    `nuget`.
+
 on:
   workflow_dispatch:
     inputs:
@@ -13,6 +47,8 @@ permissions: {}
 jobs:
   version:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     outputs:
       version: ${{ steps.read.outputs.VERSION }}
     steps:
@@ -28,17 +64,29 @@ jobs:
           echo "VERSION=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Release version: $VERSION"
 
-      - name: Check tag does not exist
+      - name: Check tag does not exist at a different commit
+        env:
+          VERSION: ${{ steps.read.outputs.VERSION }}
         run: |
-          VERSION="${{ steps.read.outputs.VERSION }}"
-          if git rev-parse "v${VERSION}" >/dev/null 2>&1; then
-            echo "::error::Tag v${VERSION} already exists. Bump the version in a PR first."
+          # The checkout above is shallow and tagless, so local tag lookups
+          # prove nothing — ask the remote directly (stateless). Fail only
+          # when the tag exists at a DIFFERENT commit: a tag already at
+          # $GITHUB_SHA means a previous run of this workflow got as far as
+          # tagging, and re-running it (idempotent retry) must be allowed.
+          EXISTING_SHA="$(git ls-remote origin "refs/tags/v${VERSION}" | cut -f1)"
+          if [ -z "$EXISTING_SHA" ]; then
+            echo "Tag v${VERSION} does not exist yet."
+          elif [ "$EXISTING_SHA" = "$GITHUB_SHA" ]; then
+            echo "::notice::Tag v${VERSION} already exists at this commit; continuing as a retry of a previous run."
+          else
+            echo "::error::Tag v${VERSION} already exists at ${EXISTING_SHA} (this run is at ${GITHUB_SHA}). Bump the version in a PR first."
             exit 1
           fi
 
       - name: Check CHANGELOG.md has release notes for version
+        env:
+          VERSION: ${{ steps.read.outputs.VERSION }}
         run: |
-          VERSION="${{ steps.read.outputs.VERSION }}"
           if [ ! -f CHANGELOG.md ]; then
             echo "::error::CHANGELOG.md does not exist at the repository root."
             exit 1
@@ -180,12 +228,22 @@ jobs:
       contents: write
     steps:
       - name: Checkout
+        # Intentionally persists credentials: the tag push below authenticates
+        # with this workflow's GITHUB_TOKEN. Note that tags (and releases)
+        # created with GITHUB_TOKEN do NOT trigger other workflows — GitHub
+        # suppresses events caused by that token — which is exactly why every
+        # publish job lives in THIS file instead of hanging off a
+        # `push: tags:` or `release: published` trigger elsewhere.
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Create and push tag
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
         run: |
-          TAG="v${{ needs.version.outputs.version }}"
+          TAG="v${VERSION}"
           git tag "$TAG"
+          # Pushing a tag that already exists at the same commit is a no-op
+          # success, so a re-run after a mid-release failure passes here.
           git push origin "$TAG"
 
   github-release:
@@ -209,15 +267,26 @@ jobs:
           sha256sum *.tar.gz *.zip 2>/dev/null | sort > SHA256SUMS
           cat SHA256SUMS
 
-      - name: Create GitHub Release
+      - name: Create or update GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.version.outputs.version }}
         run: |
-          TAG="v${{ needs.version.outputs.version }}"
-          gh release create "$TAG" \
-            --repo "$GITHUB_REPOSITORY" \
-            --generate-notes \
-            artifacts/*
+          TAG="v${VERSION}"
+          # Idempotent for "Re-run failed jobs": if a previous attempt already
+          # created the release, refresh its assets instead of hard-failing.
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; re-uploading assets with --clobber."
+            gh release upload "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber \
+              artifacts/*
+          else
+            gh release create "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --generate-notes \
+              artifacts/*
+          fi
 
   cargo-publish:
     needs: [version, build, tag]
@@ -238,22 +307,53 @@ jobs:
         # pinned channel + listed components if missing.
         run: rustup show
 
+      - name: Probe crates.io for already-published versions
+        id: published
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          # crates.io returns HTTP 200 for a published version and 404
+          # otherwise; its crawler policy requires a User-Agent identifying
+          # the caller. Anything but a definite 200 (including transient
+          # network errors) falls through to publishing, where `cargo publish`
+          # gives the authoritative error.
+          probe() {
+            curl -fsSL -o /dev/null \
+              -H 'User-Agent: socket-patch-release-workflow (https://github.com/SocketDev/socket-patch)' \
+              "https://crates.io/api/v1/crates/${1}/${VERSION}"
+          }
+          if probe socket-patch-core; then
+            echo "socket-patch-core ${VERSION} already on crates.io; skipping its publish."
+            echo "core=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "core=false" >> "$GITHUB_OUTPUT"
+          fi
+          if probe socket-patch-cli; then
+            echo "socket-patch-cli ${VERSION} already on crates.io; skipping its publish."
+            echo "cli=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "cli=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Authenticate with crates.io
         id: crates-io-auth
         uses: rust-lang/crates-io-auth-action@b7e9a28eded4986ec6b1fa40eeee8f8f165559ec # v1.0.3
 
       - name: Publish socket-patch-core
+        if: steps.published.outputs.core != 'true'
         run: cargo publish -p socket-patch-core
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
 
       - name: Wait for crates.io index update
+        if: steps.published.outputs.core != 'true'
         run: sleep 30
 
       - name: Copy README for CLI crate
         run: cp README.md crates/socket-patch-cli/README.md
 
       - name: Publish socket-patch-cli
+        if: steps.published.outputs.cli != 'true'
         run: cargo publish -p socket-patch-cli
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
@@ -322,6 +422,8 @@ jobs:
 
       - name: Stage-publish platform packages
         id: stage-platform
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
         run: |
           : > "${RUNNER_TEMP}/staged-packages.txt"
           for pkg_dir in npm/socket-patch-*/; do
@@ -329,40 +431,69 @@ jobs:
             echo "Staging ${pkg_name}..."
             if npm stage publish "./${pkg_dir}" --access public; then
               echo "$pkg_name" >> "${RUNNER_TEMP}/staged-packages.txt"
+            elif npm view "${pkg_name}@${VERSION}" version >/dev/null 2>&1; then
+              # Already fully published (approved) — a clean re-run.
+              echo "Already published, skipping."
+            elif npm stage list 2>/dev/null | grep -qF "${pkg_name}@${VERSION}"; then
+              # Staged but not yet 2FA-approved: `npm view` can't see staged
+              # versions, so without this check a re-run after a mid-job
+              # failure could never succeed. Best-effort match on the stage
+              # listing (format unverified against a live staged state — if it
+              # misses we still fail loudly below).
+              echo "Already staged awaiting approval, skipping."
+              echo "$pkg_name" >> "${RUNNER_TEMP}/staged-packages.txt"
             else
-              if npm view "${pkg_name}@${{ needs.version.outputs.version }}" version >/dev/null 2>&1; then
-                echo "Already published, skipping."
-              else
-                exit 1
-              fi
+              exit 1
             fi
           done
 
       - name: Copy README for npm package
         run: cp README.md npm/socket-patch/README.md
 
+      - name: Install main-package devDependencies
+        # `npm stage publish` (like `npm pack`) runs the package's `prepack`
+        # script, which compiles the `./schema` export with tsc — the
+        # `typescript` devDependency must be installed for that build.
+        #
+        # NOT `npm ci`: version-sync.sh refreshes package-lock.json while the
+        # release's platform packages are not yet on the registry, so npm
+        # records the optionalDependencies as hollow stubs ("optional": true,
+        # no version/resolved/integrity) and `npm ci` refuses that lockfile
+        # ("lock file's ...@ does not satisfy ...@X.Y.Z"). `npm install`
+        # tolerates the stubs and skips unresolvable optional platform
+        # packages (verified for both the published and unpublished-version
+        # states); --no-save keeps the runner from touching package.json.
+        working-directory: npm/socket-patch
+        run: npm install --no-save --ignore-scripts --no-audit --no-fund
+
       - name: Stage-publish main package
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
         run: |
           pkg_name="@socketsecurity/socket-patch"
           if npm stage publish ./npm/socket-patch --access public; then
             echo "$pkg_name" >> "${RUNNER_TEMP}/staged-packages.txt"
+          elif npm view "${pkg_name}@${VERSION}" version >/dev/null 2>&1; then
+            echo "Already published, skipping."
+          elif npm stage list 2>/dev/null | grep -qF "${pkg_name}@${VERSION}"; then
+            # See the platform-package step: staged-not-approved versions are
+            # invisible to `npm view`; tolerate them so re-runs can succeed.
+            echo "Already staged awaiting approval, skipping."
+            echo "$pkg_name" >> "${RUNNER_TEMP}/staged-packages.txt"
           else
-            if npm view "${pkg_name}@${{ needs.version.outputs.version }}" version >/dev/null 2>&1; then
-              echo "Already published, skipping."
-            else
-              exit 1
-            fi
+            exit 1
           fi
 
       - name: Summarize staged versions awaiting approval
         if: always()
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
         run: |
           STAGED_FILE="${RUNNER_TEMP}/staged-packages.txt"
           if [ ! -s "$STAGED_FILE" ]; then
             echo "No packages staged this run (all versions already published or publish step failed before staging)." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
-          VERSION="${{ needs.version.outputs.version }}"
           {
             echo "## npm staged versions awaiting approval"
             echo ""
@@ -398,6 +529,10 @@ jobs:
     needs: [version, build, tag]
     if: ${{ !inputs.dry-run }}
     runs-on: ubuntu-latest
+    # OIDC trusted publishing scoped to a deployment environment; also lets a
+    # maintainer gate publishing with required reviewers. Auto-created with no
+    # protection rules until configured.
+    environment: pypi
     permissions:
       contents: read
       id-token: write
@@ -422,17 +557,22 @@ jobs:
         run: cp README.md pypi/socket-patch/README.md
 
       - name: Build wheels (platform socket-patch + pure-python socket-patch-hook)
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
         run: |
-          VERSION="${{ needs.version.outputs.version }}"
           # Builds the platform-tagged socket-patch wheels AND the pure-python
           # socket-patch-hook wheel (the .pth carrier behind `socket-patch[hook]`).
           python scripts/build-pypi-wheels.py --version "$VERSION" --artifacts artifacts --dist dist
           # socket-patch and socket-patch-hook are two distinct PyPI projects.
           # Publish each from its own dir so trusted publishing mints an OIDC
           # token scoped to the right project (one upload spanning both projects
-          # can be rejected). Each project needs its own trusted publisher on
-          # PyPI; register a "pending" publisher for socket-patch-hook before the
-          # first release (repo + workflow `release.yml` + this environment).
+          # can be rejected). Each needs its own trusted publisher on PyPI
+          # (repo + workflow `release.yml`; register a "pending" publisher for
+          # socket-patch-hook before its first release). This job now runs in
+          # the `pypi` deployment environment: tighten both publishers to
+          # REQUIRE environment `pypi` — publishers registered without an
+          # environment constraint still match, so this change lands safely
+          # before that tightening happens.
           mkdir -p dist-hook
           mv dist/socket_patch_hook-*.whl dist-hook/
 
@@ -440,29 +580,117 @@ jobs:
         uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
         with:
           packages-dir: dist/
+          # Idempotent for "Re-run failed jobs": already-uploaded files skip.
+          skip-existing: true
 
       - name: Publish socket-patch-hook to PyPI
         uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
         with:
           packages-dir: dist-hook/
+          skip-existing: true
 
-  # Phase 2 scaffolding (CLI_CONTRACT "gem" support matrix): publish the
-  # `socket-patch-bundler` gem — the published form of the Bundler plugin that
-  # `socket-patch setup` currently wires via an in-tree `git:` reference. This
-  # gem is NOT yet the active mechanism (gem_setup still emits the in-tree
-  # plugin), so the job is **non-blocking** (`continue-on-error`) and skips the
-  # push when no credential is configured. A follow-up switches the generated
-  # Gemfile directive to `plugin "socket-patch-bundler"` and drops continue-on-
-  # error. Preferred hardening: RubyGems trusted publishing (OIDC), mirroring
-  # the crates.io / PyPI jobs above, in place of a long-lived API key.
-  gem-publish:
-    needs: [version, build, tag]
+  # Publishes BOTH gems via one OIDC trusted-publishing exchange:
+  #   - gem/socket-patch          — the CLI launcher gem (downloads the
+  #     prebuilt binary from the GitHub release at its own version, so this
+  #     job only needs the GitHub release + SHA256SUMS to exist).
+  #   - gem/socket-patch-bundler  — Phase 2 scaffolding, non-blocking (see the
+  #     step comment below).
+  rubygems-publish:
+    needs: [version, github-release]
     if: ${{ !inputs.dry-run }}
     runs-on: ubuntu-latest
-    continue-on-error: true
-    # Scope the publish secret to a deployment environment (zizmor
-    # secrets-outside-env); auto-created with no protection until configured.
+    # OIDC trusted publishing scoped to a deployment environment; also lets a
+    # maintainer gate publishing with required reviewers. Auto-created with no
+    # protection rules until configured.
     environment: rubygems
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      # Ruby is pre-installed on ubuntu-latest; no setup action needed.
+      - name: Lint + version-check the launcher gem
+        working-directory: gem/socket-patch
+        env:
+          EXPECTED_VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          ruby -c lib/socket_patch/launcher.rb
+          ruby -c exe/socket-patch
+          # The gemspec version is baked at the tag by scripts/version-sync.sh.
+          gemver="$(ruby -e 'print Gem::Specification.load("socket-patch.gemspec").version')"
+          if [ "$gemver" != "$EXPECTED_VERSION" ]; then
+            echo "::error::gemspec version $gemver != release $EXPECTED_VERSION (run scripts/version-sync.sh before tagging)"
+            exit 1
+          fi
+
+      - name: Lint + version-check the bundler-plugin gem
+        working-directory: gem/socket-patch-bundler
+        env:
+          EXPECTED_VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          ruby -c plugins.rb
+          # The gemspec version is baked at the tag by scripts/version-sync.sh.
+          gemver="$(ruby -e 'print Gem::Specification.load("socket-patch-bundler.gemspec").version')"
+          if [ "$gemver" != "$EXPECTED_VERSION" ]; then
+            echo "::error::gemspec version $gemver != release $EXPECTED_VERSION (run scripts/version-sync.sh before tagging)"
+            exit 1
+          fi
+
+      - name: Configure RubyGems credentials (OIDC trusted publishing)
+        # One OIDC exchange covers both gems: a trusted publisher keyed on
+        # this repo + workflow (+ the `rubygems` environment) can be
+        # registered on multiple gems on rubygems.org, and the exchanged
+        # token pushes any gem whose publisher matches.
+        uses: rubygems/configure-rubygems-credentials@dc5a8d8553e6ee01fc26761a49e99e733d17954a # v2.1.0
+
+      - name: Publish socket-patch to RubyGems
+        working-directory: gem/socket-patch
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          gem build socket-patch.gemspec
+          # `gem list -r -e -a` prints `socket-patch (3.3.0, 3.2.0, ...)`; match
+          # this version as a precise list element (preceded by `(`/space,
+          # followed by `,`/`)`).
+          if gem list --remote --exact --all socket-patch 2>/dev/null | grep -qE "[ (]${VERSION}[,)]"; then
+            echo "socket-patch ${VERSION} already on RubyGems; skipping."
+            exit 0
+          fi
+          gem push "socket-patch-${VERSION}.gem"
+
+      # Phase 2 scaffolding (CLI_CONTRACT "gem" support matrix): publish the
+      # `socket-patch-bundler` gem — the published form of the Bundler plugin
+      # that `socket-patch setup` currently wires via an in-tree `git:`
+      # reference. This gem is NOT yet the active mechanism (gem_setup still
+      # emits the in-tree plugin), so the push is **non-blocking**
+      # (`continue-on-error`). A follow-up switches the generated Gemfile
+      # directive to `plugin "socket-patch-bundler"` and drops
+      # continue-on-error.
+      - name: Publish socket-patch-bundler to RubyGems
+        continue-on-error: true
+        working-directory: gem/socket-patch-bundler
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          gem build socket-patch-bundler.gemspec
+          # Same precise-list-element match as the launcher gem above.
+          if gem list --remote --exact --all socket-patch-bundler 2>/dev/null | grep -qE "[ (]${VERSION}[,)]"; then
+            echo "socket-patch-bundler ${VERSION} already on RubyGems; skipping."
+            exit 0
+          fi
+          gem push "socket-patch-bundler-${VERSION}.gem"
+
+  packagist-publish:
+    needs: [version, github-release]
+    if: ${{ !inputs.dry-run }}
+    runs-on: ubuntu-latest
+    # Scope the Packagist secrets to a deployment environment (zizmor
+    # secrets-outside-env); auto-created with no protection until configured.
+    environment: packagist
     permissions:
       contents: read
     steps:
@@ -471,25 +699,178 @@ jobs:
         with:
           persist-credentials: false
 
-      # Ruby is pre-installed on ubuntu-latest; no setup action needed.
-      - name: Build socket-patch-bundler gem
+      # PHP + composer are pre-installed on ubuntu-latest.
+      - name: Lint launcher + validate composer.json
         run: |
-          cd gem/socket-patch-bundler
-          gem build socket-patch-bundler.gemspec
+          # The package manifest lives at the REPO ROOT (Packagist only
+          # ingests a composer.json at the VCS repository root); the launcher
+          # script itself stays under composer/socket-patch/.
+          composer validate --no-check-publish
+          php -l composer/socket-patch/bin/socket-patch
 
-      - name: Publish socket-patch-bundler to RubyGems
-        # zizmor: ignore[use-trusted-publishing]
-        # Uses an API key for now; RubyGems trusted publishing (OIDC) is the
-        # documented future hardening (see the job comment), matching the
-        # crates.io / PyPI jobs. Suppressed until that publisher is registered.
+      # Packagist is git-tag-driven: it ingests the tagged composer.json on
+      # its own via the repo's GitHub hook, so tags sync anyway — this ping is
+      # a promptness nudge. Without credentials it is a graceful no-op.
+      - name: Notify Packagist of the new tag
         env:
-          GEM_HOST_API_KEY: ${{ secrets.RUBYGEMS_API_KEY }}
+          PACKAGIST_USERNAME: ${{ secrets.PACKAGIST_USERNAME }}
+          PACKAGIST_TOKEN: ${{ secrets.PACKAGIST_TOKEN }}
         run: |
-          cd gem/socket-patch-bundler
-          if [ -z "${GEM_HOST_API_KEY}" ]; then
-            echo "::notice title=gem publish skipped::RUBYGEMS_API_KEY not set; built socket-patch-bundler but did not push (Phase 2 scaffolding)."
+          if [ -z "${PACKAGIST_USERNAME}" ] || [ -z "${PACKAGIST_TOKEN}" ]; then
+            echo "::notice title=Packagist sync skipped::PACKAGIST_USERNAME/PACKAGIST_TOKEN not set; Packagist will sync via its repo webhook."
             exit 0
           fi
-          # A re-push of an already-published version errors; the job is
-          # continue-on-error so that is non-fatal to the release.
-          gem push socket-patch-bundler-*.gem
+          curl -fsSL -XPOST -H 'content-type:application/json' \
+            "https://packagist.org/api/update-package?username=${PACKAGIST_USERNAME}&apiToken=${PACKAGIST_TOKEN}" \
+            -d '{"repository":{"url":"https://github.com/SocketDev/socket-patch"}}'
+
+  # Publishes the dependency-free launcher JAR as `dev.socket:socket-patch`.
+  # Like the other launcher packages it downloads the prebuilt binary from the
+  # GitHub release at its own version, so it only needs the GitHub release +
+  # SHA256SUMS to exist.
+  maven-central-publish:
+    needs: [version, github-release]
+    if: ${{ !inputs.dry-run }}
+    runs-on: ubuntu-latest
+    # Scope the Central portal token + GPG signing key to a deployment
+    # environment; auto-created with no protection until configured.
+    environment: maven-central
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Setup Java
+        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5.6.0
+        with:
+          distribution: temurin
+          java-version: '17'
+          # server-id must match <publishingServerId> in pom.xml. The
+          # username/password values here are environment-variable NAMES —
+          # setup-java writes a settings.xml that resolves them from the env
+          # of the mvn process at deploy time, so no secret lands on disk.
+          server-id: central
+          server-username: CENTRAL_USERNAME
+          server-password: CENTRAL_PASSWORD
+          # Empty when the secret is unset; setup-java skips the GPG import
+          # in that case (the deploy step below also skips itself).
+          gpg-private-key: ${{ secrets.CENTRAL_GPG_PRIVATE_KEY }}
+
+      - name: Lint + version-check the launcher jar
+        working-directory: maven/socket-patch
+        env:
+          EXPECTED_VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          # The project <version> is baked at the tag by
+          # scripts/version-sync.sh; the sed is anchored on the literal
+          # `<!-- x-version-sync -->` marker so plugin <version> elements
+          # are never matched.
+          pomver="$(sed -n 's|.*<version>\(.*\)</version><!-- x-version-sync -->.*|\1|p' pom.xml)"
+          if [ "$pomver" != "$EXPECTED_VERSION" ]; then
+            echo "::error::pom.xml version $pomver != release $EXPECTED_VERSION (run scripts/version-sync.sh before tagging)"
+            exit 1
+          fi
+          mvn --batch-mode --no-transfer-progress package -Dgpg.skip=true
+
+      - name: Publish to Maven Central
+        # No OIDC trusted publishing exists for Maven Central as of 2026-07
+        # (OSSRH is gone; the Central Portal user token is the documented
+        # fallback), so this authenticates with long-lived environment
+        # secrets — unlike the crates.io / PyPI / RubyGems / NuGet jobs.
+        working-directory: maven/socket-patch
+        env:
+          CENTRAL_USERNAME: ${{ secrets.CENTRAL_USERNAME }}
+          CENTRAL_PASSWORD: ${{ secrets.CENTRAL_PASSWORD }}
+          MAVEN_GPG_PASSPHRASE: ${{ secrets.CENTRAL_GPG_PASSPHRASE }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          if [ -z "${CENTRAL_USERNAME}" ]; then
+            echo "::notice title=Maven Central publish skipped::CENTRAL_USERNAME not set; built the jar but did not deploy."
+            exit 0
+          fi
+          # Idempotent for "Re-run failed jobs": repo1 serves the pom once
+          # the version is published (and Central rejects re-uploads).
+          if curl -sfI "https://repo1.maven.org/maven2/dev/socket/socket-patch/${VERSION}/socket-patch-${VERSION}.pom" >/dev/null; then
+            echo "dev.socket:socket-patch ${VERSION} already on Maven Central; skipping."
+            exit 0
+          fi
+          mvn --batch-mode --no-transfer-progress deploy
+
+  # Publishes the .NET-tool launcher as `SocketSecurity.SocketPatch`. Like the
+  # other launcher packages it downloads the prebuilt binary from the GitHub
+  # release at its own version, so it only needs the GitHub release +
+  # SHA256SUMS to exist.
+  nuget-publish:
+    needs: [version, github-release]
+    if: ${{ !inputs.dry-run }}
+    runs-on: ubuntu-latest
+    # OIDC trusted publishing scoped to a deployment environment; also lets a
+    # maintainer gate publishing with required reviewers. Auto-created with no
+    # protection rules until configured.
+    environment: nuget
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      # The `secrets` context is unreliable in step-level `if:` expressions;
+      # hoist the secret to job env and gate steps on `env.NUGET_USER`
+      # instead (house pattern).
+      NUGET_USER: ${{ secrets.NUGET_USER }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5.4.0
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Version-check + pack the .NET tool
+        working-directory: nuget/socket-patch
+        env:
+          EXPECTED_VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          # The csproj <Version> is baked at the tag by
+          # scripts/version-sync.sh (the csproj has exactly one <Version>
+          # element).
+          csprojver="$(sed -n 's|.*<Version>\(.*\)</Version>.*|\1|p' SocketSecurity.SocketPatch.csproj | head -1)"
+          if [ "$csprojver" != "$EXPECTED_VERSION" ]; then
+            echo "::error::csproj Version $csprojver != release $EXPECTED_VERSION (run scripts/version-sync.sh before tagging)"
+            exit 1
+          fi
+          dotnet pack -c Release -o "$RUNNER_TEMP/nupkg"
+
+      - name: NuGet OIDC login (trusted publishing)
+        id: nuget-login
+        # Exchanges this job's OIDC token for a short-lived nuget.org API key
+        # (trusted-publishing policy: repo `SocketDev/socket-patch` +
+        # workflow file `release.yml` + environment `nuget`). Skipped when
+        # NUGET_USER is not configured; the push step then falls back to the
+        # long-lived NUGET_API_KEY, or skips with a notice when neither is
+        # set.
+        if: env.NUGET_USER != ''
+        uses: NuGet/login@8d196754b4036150537f80ac539e15c2f1028841 # v1.2.0
+        with:
+          user: ${{ secrets.NUGET_USER }}
+
+      - name: Push to nuget.org
+        env:
+          OIDC_API_KEY: ${{ steps.nuget-login.outputs.NUGET_API_KEY }}
+          FALLBACK_API_KEY: ${{ secrets.NUGET_API_KEY }}
+        run: |
+          KEY="${OIDC_API_KEY:-${FALLBACK_API_KEY}}"
+          if [ -z "$KEY" ]; then
+            echo "::notice title=NuGet publish skipped::neither NUGET_USER (trusted publishing) nor NUGET_API_KEY is set; packed the tool but did not push."
+            exit 0
+          fi
+          # --skip-duplicate makes re-runs idempotent (a 409 for an
+          # already-published version is reported as a warning, not an error).
+          dotnet nuget push "$RUNNER_TEMP"/nupkg/*.nupkg \
+            --api-key "$KEY" \
+            --source https://api.nuget.org/v3/index.json \
+            --skip-duplicate

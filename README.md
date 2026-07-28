@@ -30,8 +30,9 @@ Detects your platform (macOS/Linux, x64/ARM64), downloads the latest binary, and
 to `/usr/local/bin` or `~/.local/bin`. Use `sudo sh` instead of `sh` if `/usr/local/bin`
 requires root.
 
-On Windows, install via npm (below) or grab a prebuilt `socket-patch-*-pc-windows-msvc.zip`
-from the [latest release](https://github.com/SocketDev/socket-patch/releases/latest).
+On Windows, install via npm or the dotnet tool (below), or grab a prebuilt
+`socket-patch-*-pc-windows-msvc.zip` from the
+[latest release](https://github.com/SocketDev/socket-patch/releases/latest).
 
 Or install through your package manager:
 
@@ -42,10 +43,17 @@ Or install through your package manager:
 | cargo | `cargo install socket-patch-cli` (builds from source with every ecosystem compiled in) |
 | gem | `gem install socket-patch` |
 | composer | `composer require socketsecurity/socket-patch` (run as `vendor/bin/socket-patch`) |
+| dotnet | `dotnet tool install -g SocketSecurity.SocketPatch` (puts `socket-patch` on your `PATH`) |
+| Maven | `mvn dependency:copy -Dartifact=dev.socket:socket-patch:<version> -DoutputDirectory=.`, then `java -jar socket-patch-<version>.jar` (see the Maven note below) |
 
-The gem and composer packages are thin launchers: on first run they download the prebuilt
-binary for your platform from the matching GitHub release, verify its SHA-256, cache it,
-and exec it. Set `SOCKET_PATCH_BIN` to an existing binary to skip the download.
+The gem, composer, Maven, and NuGet packages are thin launchers: on first run they
+download the prebuilt binary for your platform from the matching GitHub release, verify
+its SHA-256, cache it, and exec it. Set `SOCKET_PATCH_BIN` to an existing binary to skip
+the download. The Maven artifact (`dev.socket:socket-patch`) is a dependency-free
+launcher jar — there is no "latest" shorthand on Maven Central, so pin a
+[released version](https://github.com/SocketDev/socket-patch/releases); besides the
+`mvn dependency:copy` + `java -jar` recipe above, [JBang](https://www.jbang.dev) users
+can run it in one shot: `jbang dev.socket:socket-patch:<version> scan`.
 
 <details>
 <summary>Manual download</summary>
