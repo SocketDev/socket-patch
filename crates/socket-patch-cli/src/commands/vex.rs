@@ -414,9 +414,13 @@ async fn generate_vex(
     // Build the document.
     let opts = BuildOptions {
         product_id,
+        // Same "empty means unset" rule as the product override above: the
+        // document `@id` is a required field with no `skip_serializing_if`,
+        // so `--doc-id "$UNSET_VAR"` emitted a literal `"@id": ""`.
         doc_id: params
             .doc_id
             .clone()
+            .filter(|d| !d.trim().is_empty())
             .unwrap_or_else(|| format!("urn:uuid:{}", uuid::Uuid::new_v4())),
         author: "Socket".to_string(),
         tooling: Some(format!("socket-patch {}", env!("CARGO_PKG_VERSION"))),
@@ -582,7 +586,14 @@ async fn fail(common: &GlobalArgs, code: &'static str, message: String) -> VexGe
 /// Pick the product PURL from an explicit override or by filesystem
 /// auto-detect.
 async fn resolve_product_id(common: &GlobalArgs, product: Option<&str>) -> Result<String, String> {
-    if let Some(p) = product {
+    // An empty (or whitespace-only) override means "unset" — the semantics
+    // `scrub_empty_env_vars` already gives the `SOCKET_VEX_PRODUCT=` twin and
+    // `api_client_overrides` gives `--api-url ""`. Without the filter,
+    // `--product "$UNSET_VAR"` sailed through to `BuildOptions::product_id`,
+    // and `Product::id` is `skip_serializing_if = "String::is_empty"` — so the
+    // run wrote a spec-invalid document whose statements claim `not_affected`
+    // about a product carrying NO identifier at all, and exited 0.
+    if let Some(p) = product.filter(|p| !p.trim().is_empty()) {
         return Ok(p.to_string());
     }
     let detect = detect_product(&common.cwd).await;

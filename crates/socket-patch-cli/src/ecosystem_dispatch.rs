@@ -61,6 +61,22 @@ fn env_truthy(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether [`crawl_all_ecosystems`] actually visits this PURL's ecosystem
+/// in THIS process. Maven and NuGet sit behind runtime opt-in gates, and an
+/// unrecognized `pkg:<type>/` (a newer CLI's ecosystem in a committed
+/// manifest) has no crawler at all — for those, absence from the crawl
+/// carries no information about whether the package is installed. Callers
+/// that read "not in the crawl" as "no longer installed" (scan's prune GC)
+/// must not judge them.
+pub fn crawl_covers_purl(purl: &str) -> bool {
+    match Ecosystem::from_purl(purl) {
+        Some(Ecosystem::Maven) => maven_runtime_enabled(),
+        Some(Ecosystem::Nuget) => nuget_runtime_enabled(),
+        Some(_) => true,
+        None => false,
+    }
+}
+
 /// Partition PURLs by ecosystem, filtering by the `--ecosystems` flag if set.
 pub fn partition_purls(
     purls: &[String],

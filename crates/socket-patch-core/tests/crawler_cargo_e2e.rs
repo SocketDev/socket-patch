@@ -157,6 +157,60 @@ async fn cargo_home_fallback_to_home_dot_cargo() {
     );
 }
 
+/// Regression: a set-but-EMPTY `CARGO_HOME` must be treated as unset, the
+/// same way cargo itself resolves it (`home::cargo_home` filters an empty
+/// value before falling back to `$HOME/.cargo`). Honoring `""` made
+/// `cargo_home()` return an empty `PathBuf`, so the registry root became
+/// the CWD-RELATIVE path `registry/src` — the crawler then probed a
+/// directory inside the user's project instead of the real crate cache and
+/// silently discovered nothing (every crate reported not-installed).
+///
+/// Empty-valued env vars are routine in containers (`ENV CARGO_HOME=`),
+/// `CARGO_HOME= socket-patch scan` one-liners, and CI templates that
+/// interpolate an undefined variable. Twin of the guards already in
+/// go/nuget/deno/composer and `utils::fs::home_dir`.
+#[tokio::test]
+#[serial_test::serial]
+async fn empty_cargo_home_falls_back_to_home_dot_cargo() {
+    let tmp = tempfile::tempdir().unwrap();
+    let stamp_dir = tmp
+        .path()
+        .join(".cargo")
+        .join("registry")
+        .join("src")
+        .join("index.crates.io-1949cf8c6b5b557f");
+    tokio::fs::create_dir_all(&stamp_dir).await.unwrap();
+
+    let prev_cargo = std::env::var("CARGO_HOME").ok();
+    let prev_home = std::env::var("HOME").ok();
+    std::env::set_var("CARGO_HOME", "");
+    std::env::set_var("HOME", tmp.path());
+
+    let crawler = CargoCrawler;
+    let opts = CrawlerOptions {
+        cwd: tmp.path().to_path_buf(),
+        global: true,
+        global_prefix: None,
+    };
+    let paths = crawler.get_crate_source_paths(&opts).await.unwrap();
+
+    match prev_cargo {
+        Some(v) => std::env::set_var("CARGO_HOME", v),
+        None => std::env::remove_var("CARGO_HOME"),
+    }
+    match prev_home {
+        Some(v) => std::env::set_var("HOME", v),
+        None => std::env::remove_var("HOME"),
+    }
+
+    assert_eq!(
+        paths,
+        vec![stamp_dir],
+        "empty CARGO_HOME must fall back to $HOME/.cargo, not the \
+         CWD-relative `registry/src`; got {paths:?}"
+    );
+}
+
 // ── find_by_purls ──────────────────────────────────────────────
 
 #[tokio::test]

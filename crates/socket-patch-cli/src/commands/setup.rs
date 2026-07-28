@@ -209,10 +209,17 @@ fn eco_in_scope(common: &GlobalArgs, names: &[&str]) -> bool {
     }
 }
 
-/// Normalize a workspace-member / exclude path for comparison: forward slashes,
-/// no leading `./`, no trailing slash.
+/// Normalize a workspace-member / exclude path for comparison: trimmed,
+/// forward slashes, no leading `./`, no trailing slash.
+///
+/// The trim is load-bearing for the CSV spellings of `--exclude`: clap splits
+/// `--exclude "packages/a, packages/b"` (and `SOCKET_SETUP_EXCLUDE=a, b`, the
+/// idiomatic CI-YAML form) on the comma only, so the second value arrives with
+/// a leading space. Untrimmed it matches no member — the exclusion silently
+/// does nothing — and the unmatchable spelling is then persisted into
+/// `.socket/manifest.json`, where every later run and every clone inherits it.
 fn normalize_rel_path(p: &str) -> String {
-    let p = p.replace('\\', "/");
+    let p = p.trim().replace('\\', "/");
     let p = p.strip_prefix("./").unwrap_or(&p);
     p.trim_end_matches('/').to_string()
 }
@@ -236,7 +243,15 @@ fn is_member_excluded(manifest_path: &Path, cwd: &Path, excludes: &[String]) -> 
     if rel.is_empty() {
         return false;
     }
-    excludes.iter().any(|e| normalize_rel_path(e) == rel)
+    excludes.iter().any(|e| {
+        let e = normalize_rel_path(e);
+        // An exclusion covers the named directory AND everything below it. The
+        // walk finds nested manifests (`tools/inner/package.json`, and members
+        // of a member that is itself a workspace root), and those lie *inside*
+        // the excluded member — an exact-match-only test wired install hooks
+        // into a subtree the user asked setup to keep out of.
+        !e.is_empty() && (rel == e || rel.starts_with(&format!("{e}/")))
+    })
 }
 
 /// The exclude set in effect for this run: the persisted `setup.exclude` list
@@ -734,8 +749,27 @@ async fn finalize_gem(common: &GlobalArgs) -> Vec<String> {
         }
     };
     let root = common.cwd.display().to_string();
+    // Forward the manifest location: the nested `apply` re-resolves a relative
+    // `--manifest-path` against ITS OWN `--cwd`, so hand it the absolutized,
+    // already-cwd-resolved path (the `get::run_nested_apply` rule). Dropping
+    // the flag made this run read the default `.socket/manifest.json`, so a
+    // project whose patches live anywhere else materialized nothing here —
+    // silently, since a missing manifest is a clean exit-0 no-op for `apply`.
+    let manifest = common.resolved_manifest_path();
+    let manifest = std::path::absolute(&manifest).unwrap_or(manifest);
+    let manifest = manifest.display().to_string();
     match tokio::process::Command::new(&exe)
-        .args(["apply", "--offline", "--ecosystems", "gem", "--cwd", &root, "--silent"])
+        .args([
+            "apply",
+            "--offline",
+            "--ecosystems",
+            "gem",
+            "--cwd",
+            &root,
+            "--manifest-path",
+            &manifest,
+            "--silent",
+        ])
         .output()
         .await
     {
@@ -1494,10 +1528,19 @@ async fn run_setup(args: &SetupArgs) -> i32 {
         composer_present,
         npm_pm,
     );
+    // Attribute the event through the same layered credential chain as every
+    // other command — flag / env / socket-cli `config.json` — not the raw flag
+    // values. `setup` builds no API client (it is a purely local edit), so the
+    // config layer has to be consulted explicitly, exactly as `list` does:
+    // otherwise a caller authenticated by `socket login` alone reports
+    // anonymously to the public patch proxy, which with an on-prem
+    // `apiBaseUrl` also sends the event to a different host than the one the
+    // client would talk to.
+    let (telemetry_token, telemetry_org) = crate::commands::list::telemetry_credentials(common);
     track_patch_setup(
         &telemetry_manager,
-        common.api_token.as_deref(),
-        common.org.as_deref(),
+        telemetry_token.as_deref(),
+        telemetry_org.as_deref(),
     )
     .await;
 

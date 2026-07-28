@@ -305,12 +305,28 @@ fn is_safe_composer_name(name: &str) -> bool {
 /// `version`, or extra unexpected fields) is skipped rather than
 /// discarding every package in the file.
 async fn read_installed_json(vendor_path: &Path) -> Vec<ComposerPackageEntry> {
+    use tokio::io::AsyncReadExt;
+
     let installed_path = vendor_path.join("composer").join("installed.json");
 
-    let content = match tokio::fs::read_to_string(&installed_path).await {
-        Ok(c) => c,
-        Err(_) => return Vec::new(),
+    // The path lives inside the (untrusted) vendor tree: a planted FIFO
+    // would make a plain `read_to_string` open block forever waiting for
+    // a writer, wedging scan (crawl_all) and apply (find_by_purls) with
+    // no error and no timeout. `get_vendor_paths` is no defense — global
+    // mode (`--global` / `--global-prefix`) hands the vendor directory
+    // straight here having only checked `is_dir`, and local mode's
+    // `is_file` probe is a separate stat that the file can change under.
+    // Open via `open_regular_file` — non-blocking on Unix, rejecting
+    // FIFOs/devices/directories (see its docs). Twin of the npm
+    // crawler's `read_package_json` guard.
+    let Ok((mut file, metadata)) = crate::utils::fs::open_regular_file(&installed_path).await
+    else {
+        return Vec::new();
     };
+    let mut content = String::with_capacity(metadata.len() as usize);
+    if file.read_to_string(&mut content).await.is_err() {
+        return Vec::new();
+    }
 
     let root: serde_json::Value = match serde_json::from_str(&content) {
         Ok(v) => v,
@@ -985,6 +1001,88 @@ mod tests {
         assert!(!is_safe_composer_name("a\\b/c"));
         assert!(!is_safe_composer_name("C:evil/x"));
         assert!(!is_safe_composer_name(""));
+    }
+
+    /// Regression: a FIFO planted at `vendor/composer/installed.json` must be
+    /// rejected promptly, never opened blockingly. `tokio::fs::read_to_string`
+    /// performs a plain `open(2)`, which on a FIFO waits for a writer that never
+    /// comes — wedging `scan` (crawl_all) and `apply` (find_by_purls) forever,
+    /// with no error and no timeout. The local-mode `is_file` probe in
+    /// `get_vendor_paths` does not cover this: global mode (`--global` /
+    /// `--global-prefix`) hands the vendor directory straight to the reader with
+    /// no probe at all, and a stat-then-open probe is only a racy pre-check
+    /// anyway. Same class as the npm crawler's `read_package_json` FIFO fix and
+    /// the `open_regular_file` guards in `patch/file_hash.rs`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_read_installed_json_rejects_fifo_without_hanging() {
+        let dir = tempfile::tempdir().unwrap();
+        let vendor_dir = dir.path().join("vendor");
+        let composer_dir = vendor_dir.join("composer");
+        tokio::fs::create_dir_all(&composer_dir).await.unwrap();
+        // A real package directory sits next to the FIFO, so an empty result
+        // below is the unreadable metadata being skipped, not a missing tree.
+        tokio::fs::create_dir_all(vendor_dir.join("monolog").join("monolog"))
+            .await
+            .unwrap();
+
+        let fifo = composer_dir.join("installed.json");
+        // mkfifo(2) directly rather than spawning /usr/bin/mkfifo: the syscall
+        // needs no child process (a fork/exec here flaked under parallel load
+        // in the npm twin).
+        let c_path = {
+            use std::os::unix::ffi::OsStrExt;
+            std::ffi::CString::new(fifo.as_os_str().as_bytes()).expect("fifo path has no NUL")
+        };
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
+        assert_eq!(
+            rc,
+            0,
+            "mkfifo(2) failed: {}",
+            std::io::Error::last_os_error()
+        );
+
+        // On timeout the open is wedged in a `spawn_blocking` thread that the
+        // runtime joins at shutdown; connect a writer to release it so the test
+        // FAILS instead of hanging the whole suite.
+        let release_and_panic = |what: &str| -> ! {
+            let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
+            panic!("{what} must complete promptly with a FIFO installed.json");
+        };
+        let deadline = std::time::Duration::from_secs(5);
+
+        let Ok(entries) = tokio::time::timeout(deadline, read_installed_json(&vendor_dir)).await
+        else {
+            release_and_panic("read_installed_json");
+        };
+        assert!(entries.is_empty(), "a FIFO is not a valid installed.json");
+
+        let crawler = ComposerCrawler::new();
+        // Global mode: `get_vendor_paths` returns the prefix verbatim, with no
+        // `is_file` probe on installed.json — the reader is reached directly.
+        let options = CrawlerOptions {
+            cwd: dir.path().to_path_buf(),
+            global: true,
+            global_prefix: Some(vendor_dir.clone()),
+        };
+        let Ok(packages) = tokio::time::timeout(deadline, crawler.crawl_all(&options)).await else {
+            release_and_panic("crawl_all (scan)");
+        };
+        assert!(
+            packages.is_empty(),
+            "a FIFO installed.json must yield no packages, got: {packages:?}"
+        );
+
+        let purls = vec!["pkg:composer/monolog/monolog@3.5.0".to_string()];
+        let Ok(found) =
+            tokio::time::timeout(deadline, crawler.find_by_purls(&vendor_dir, &purls)).await
+        else {
+            release_and_panic("find_by_purls (apply's resolver)");
+        };
+        assert!(
+            found.unwrap().is_empty(),
+            "a FIFO installed.json must resolve no package"
+        );
     }
 
     #[tokio::test]

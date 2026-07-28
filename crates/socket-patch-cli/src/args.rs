@@ -548,6 +548,78 @@ mod tests {
         });
     }
 
+    /// `--api-url` / `--proxy-url` must reach the telemetry sender, which
+    /// resolves its endpoint from the env only
+    /// (`socket_cli_config::resolve_api_base_url` reads `SOCKET_API_URL`,
+    /// `env_compat::proxy_url_from_env` reads `SOCKET_PROXY_URL`) and never
+    /// sees the parsed flags. Without the mirror,
+    /// `socket-patch scan --api-url https://socket.internal --api-token <tok>
+    /// --org acme` POSTs the event — `Authorization: Bearer <tok>` header
+    /// included — to the default `https://api.socket.dev`, egressing an
+    /// on-prem token to the very host the operator redirected away from.
+    #[test]
+    #[serial_test::serial]
+    #[ignore = "RED: documents a real token-egress bug — `apply_env_toggles` does \
+                not mirror --api-url/--proxy-url into the env, and telemetry \
+                resolves its endpoint from the env only, so an on-prem run POSTs \
+                its Bearer token to the default api.socket.dev. The mirror was \
+                not part of this change."]
+    fn apply_env_toggles_mirrors_api_and_proxy_urls_for_telemetry() {
+        with_clean_socket_env(|| {
+            // Guard against a vacuous pass: the resolver must start at the
+            // built-in default (the cargo `[env]` `SOCKET_NO_CONFIG=1` keeps
+            // a developer's real socket-cli config out of the chain).
+            assert_eq!(
+                socket_patch_core::utils::socket_cli_config::resolve_api_base_url(),
+                socket_patch_core::constants::DEFAULT_SOCKET_API_URL,
+            );
+
+            let args = GlobalArgs {
+                api_url: Some("https://socket.internal.example".to_string()),
+                proxy_url: Some("https://proxy.internal.example".to_string()),
+                ..GlobalArgs::default()
+            };
+            apply_env_toggles(&args);
+            assert_eq!(
+                socket_patch_core::utils::socket_cli_config::resolve_api_base_url(),
+                "https://socket.internal.example",
+                "--api-url must reach the telemetry endpoint resolver",
+            );
+            assert_eq!(
+                std::env::var("SOCKET_PROXY_URL").as_deref(),
+                Ok("https://proxy.internal.example"),
+                "--proxy-url must reach the tokenless telemetry endpoint resolver",
+            );
+        });
+    }
+
+    /// The URL mirror must not invent an override: `None` (no flag, no env
+    /// var) has to stay unset so `get_api_client_with_overrides` /
+    /// `resolve_api_base_url` still fall through env → socket-cli config →
+    /// default, and `--api-url ""` keeps meaning "unset" exactly as
+    /// [`GlobalArgs::api_client_overrides`] already treats it.
+    #[test]
+    #[serial_test::serial]
+    fn apply_env_toggles_url_mirror_skips_unset_and_empty() {
+        with_clean_socket_env(|| {
+            apply_env_toggles(&GlobalArgs::default());
+            assert!(std::env::var("SOCKET_API_URL").is_err());
+            assert!(std::env::var("SOCKET_PROXY_URL").is_err());
+
+            let blank = GlobalArgs {
+                api_url: Some(String::new()),
+                proxy_url: Some(String::new()),
+                ..GlobalArgs::default()
+            };
+            apply_env_toggles(&blank);
+            assert!(
+                std::env::var("SOCKET_API_URL").is_err(),
+                "an empty --api-url must not be mirrored as a blank override",
+            );
+            assert!(std::env::var("SOCKET_PROXY_URL").is_err());
+        });
+    }
+
     /// `scrub_empty_env_vars` removes exactly-empty `SOCKET_*` flag vars
     /// (the `VAR=` blank-without-unsetting idiom) — global and local — and
     /// nothing else: set, non-empty values — even whitespace-only ones,

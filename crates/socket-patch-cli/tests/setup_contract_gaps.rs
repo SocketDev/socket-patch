@@ -465,3 +465,142 @@ fn setup_honors_exclude_for_a_workspace_member() {
         "the excluded member must not appear among the checked files:\n{stdout}"
     );
 }
+
+/// Property 9, CSV spelling: `--exclude` is comma-delimited, so
+/// `--exclude "packages/a, packages/b"` (and the `SOCKET_SETUP_EXCLUDE=a, b`
+/// form CI YAML produces) must exclude BOTH members.
+///
+/// Regression: clap splits on the comma only, so the second value reached
+/// `normalize_rel_path` as `" packages/b"`. Untrimmed it equalled no member's
+/// relative path, so the member was configured anyway — silently, with no
+/// warning that an exclusion had missed — and the unmatchable spelling was
+/// then persisted under `setup.exclude`, where every later run and every clone
+/// inherited a dead entry.
+#[test]
+fn setup_exclude_tolerates_spaces_in_the_csv_list() {
+    let proj = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    write(
+        &proj.path().join("package.json"),
+        r#"{ "name": "root", "workspaces": ["packages/*"] }"#,
+    );
+    for member in ["a", "b", "keep"] {
+        write(
+            &proj.path().join(format!("packages/{member}/package.json")),
+            &format!(r#"{{ "name": "{member}", "version": "1.0.0" }}"#),
+        );
+    }
+
+    let read = |p: PathBuf| std::fs::read_to_string(p).unwrap();
+
+    let (code, stdout) = run(
+        proj.path(),
+        home.path(),
+        &[
+            "setup",
+            "--json",
+            "--yes",
+            "--exclude",
+            "packages/a, packages/b",
+        ],
+    );
+    assert_eq!(code, 0, "scoped setup should succeed:\n{stdout}");
+
+    // Control: the run really did configure things (root + the member that was
+    // never excluded), so the assertions below cannot pass vacuously.
+    assert!(
+        read(proj.path().join("package.json")).contains("socket-patch"),
+        "the root must be configured (never excludable):\n{stdout}"
+    );
+    assert!(
+        read(proj.path().join("packages/keep/package.json")).contains("socket-patch"),
+        "the non-excluded member must be configured:\n{stdout}"
+    );
+
+    for member in ["a", "b"] {
+        let content = read(proj.path().join(format!("packages/{member}/package.json")));
+        assert!(
+            !content.contains("socket-patch"),
+            "packages/{member} was excluded on the CSV list and must NOT be \
+             configured; got:\n{content}\nstdout:\n{stdout}"
+        );
+    }
+
+    // Both spellings persist in normalized (matchable) form, so the next run
+    // and a fresh clone honor them without re-passing the flag.
+    let manifest = read(proj.path().join(".socket/manifest.json"));
+    let mv: serde_json::Value = serde_json::from_str(&manifest).expect("manifest is JSON");
+    let excl: Vec<&str> = mv["setup"]["exclude"]
+        .as_array()
+        .unwrap_or_else(|| panic!("manifest must carry setup.exclude:\n{manifest}"))
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(
+        excl,
+        vec!["packages/a", "packages/b"],
+        "the persisted set must be normalized, not the raw CSV fragments:\n{manifest}"
+    );
+}
+
+/// Property 9, subtree semantics: excluding a member excludes everything
+/// *inside* it. Discovery reaches nested manifests — a member that is itself a
+/// workspace root has its own members configured (the nested-workspace
+/// sub-property) — so an exclusion that only matched the member's own
+/// `package.json` still wired install hooks into the subtree the user asked
+/// `setup` to keep out of.
+#[test]
+fn setup_exclude_covers_manifests_nested_below_the_excluded_member() {
+    let proj = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    write(
+        &proj.path().join("package.json"),
+        r#"{ "name": "root", "workspaces": ["packages/*"] }"#,
+    );
+    // The excluded member is itself a workspace root with a nested member.
+    write(
+        &proj.path().join("packages/legacy/package.json"),
+        r#"{ "name": "legacy", "version": "1.0.0", "workspaces": ["sub/*"] }"#,
+    );
+    write(
+        &proj.path().join("packages/legacy/sub/deep/package.json"),
+        r#"{ "name": "deep", "version": "1.0.0" }"#,
+    );
+    write(
+        &proj.path().join("packages/keep/package.json"),
+        r#"{ "name": "keep", "version": "1.0.0" }"#,
+    );
+
+    let read = |p: PathBuf| std::fs::read_to_string(p).unwrap();
+
+    let (code, stdout) = run(
+        proj.path(),
+        home.path(),
+        &["setup", "--json", "--yes", "--exclude", "packages/legacy"],
+    );
+    assert_eq!(code, 0, "scoped setup should succeed:\n{stdout}");
+
+    // Control: the root and the sibling member ARE configured — proof the
+    // nested walk ran and the assertions below are not vacuous.
+    assert!(
+        read(proj.path().join("package.json")).contains("socket-patch"),
+        "the root must be configured (never excludable):\n{stdout}"
+    );
+    assert!(
+        read(proj.path().join("packages/keep/package.json")).contains("socket-patch"),
+        "the non-excluded member must be configured:\n{stdout}"
+    );
+
+    for member in ["packages/legacy", "packages/legacy/sub/deep"] {
+        let content = read(proj.path().join(member).join("package.json"));
+        assert!(
+            !content.contains("socket-patch"),
+            "{member} lies in the excluded member and must NOT be configured; \
+             got:\n{content}\nstdout:\n{stdout}"
+        );
+    }
+    assert!(
+        !stdout.contains("packages/legacy"),
+        "no manifest under the excluded member may appear in the envelope:\n{stdout}"
+    );
+}

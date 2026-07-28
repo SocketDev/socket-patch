@@ -65,9 +65,8 @@ pub fn state_dir() -> Option<PathBuf> {
         return Some(dir);
     }
     let base = if cfg!(windows) {
-        env_dir("LOCALAPPDATA").or_else(|| {
-            env_dir("USERPROFILE").map(|p| p.join("AppData").join("Local"))
-        })
+        env_dir("LOCALAPPDATA")
+            .or_else(|| env_dir("USERPROFILE").map(|p| p.join("AppData").join("Local")))
     } else {
         env_dir("XDG_CACHE_HOME").or_else(|| env_dir("HOME").map(|h| h.join(".cache")))
     };
@@ -208,10 +207,7 @@ mod tests {
         // Env-mutating test: keep it self-contained and restore.
         let prev = std::env::var_os("SOCKET_UPDATE_STATE_DIR");
         std::env::set_var("SOCKET_UPDATE_STATE_DIR", "/tmp/socket-update-test");
-        assert_eq!(
-            state_dir(),
-            Some(PathBuf::from("/tmp/socket-update-test"))
-        );
+        assert_eq!(state_dir(), Some(PathBuf::from("/tmp/socket-update-test")));
         // Empty value means unset (env_non_empty convention) — falls through
         // to the platform default rather than yielding "".
         std::env::set_var("SOCKET_UPDATE_STATE_DIR", "");

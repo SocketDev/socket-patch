@@ -70,7 +70,9 @@ pub struct StagedInstall {
 }
 
 pub fn sha256_file(p: &Path) -> String {
-    hex::encode(Sha256::digest(std::fs::read(p).expect("read file for hashing")))
+    hex::encode(Sha256::digest(
+        std::fs::read(p).expect("read file for hashing"),
+    ))
 }
 
 fn real_binary() -> PathBuf {
@@ -293,7 +295,11 @@ impl FakeRelease {
     }
 
     pub async fn received_request_count(&self) -> usize {
-        self.server.received_requests().await.unwrap_or_default().len()
+        self.server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .len()
     }
 }
 

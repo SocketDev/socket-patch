@@ -384,6 +384,91 @@ async fn scan_update_candidate_is_the_highest_ranked_patch() {
 }
 
 // ---------------------------------------------------------------------------
+// Discovery — `updates[]` bridges the two PURL spellings
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn scan_emits_updates_entry_for_scoped_purl_despite_manifest_percent_encoding() {
+    // Regression: for a SCOPED package the two purl spellings diverge.
+    //   * manifest keys are written verbatim from the *patch* purl, which
+    //     the API serves percent-encoded (`pkg:npm/%40scope/...`) — see
+    //     in_process_vendor.rs `vendor_resolves_percent_encoded_scope_purl`.
+    //   * the batch *package* key comes back in the crawler's literal
+    //     spelling (`pkg:npm/@scope/...`) — the public-proxy path builds it
+    //     from the purls we requested (`assemble_batch_from_individual`).
+    // `detect_updates` looked the manifest up by the raw batch purl, so a
+    // scoped package with a newer patch never reached `updates[]` (nor the
+    // table's `[UPDATE]` marker) — the operator silently kept the old patch.
+    let mock = MockServer::start().await;
+    let crawler_purl = "pkg:npm/@scope/left-pad@1.3.0";
+    let api_purl = "pkg:npm/%40scope/left-pad@1.3.0";
+    let new_uuid = "99999999-9999-4999-8999-999999999999";
+    let old_uuid = "11111111-1111-4111-8111-111111111111";
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/batch")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "packages": [{
+                "purl": crawler_purl,
+                "patches": [{
+                    "uuid": new_uuid,
+                    "purl": api_purl,
+                    "tier": "free",
+                    "cveIds": [],
+                    "ghsaIds": [],
+                    "severity": "high",
+                    "title": "Newer patch"
+                }]
+            }],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(&mock)
+        .await;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_root_package_json(tmp.path());
+    write_npm_package(tmp.path(), "@scope/left-pad", "1.3.0");
+    // Manifest keyed by the ENCODED purl — exactly what `get`/`scan --apply`
+    // write for a scoped package.
+    let socket = tmp.path().join(".socket");
+    std::fs::create_dir_all(&socket).unwrap();
+    std::fs::write(
+        socket.join("manifest.json"),
+        format!(
+            r#"{{
+  "patches": {{
+    "{api_purl}": {{
+      "uuid": "{old_uuid}",
+      "exportedAt": "2024-01-01T00:00:00Z",
+      "files": {{}},
+      "vulnerabilities": {{}},
+      "description": "old",
+      "license": "MIT",
+      "tier": "free"
+    }}
+  }}
+}}"#
+        ),
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) = run_scan(tmp.path(), &mock.uri(), &[]);
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    let updates = v["updates"].as_array().expect("updates array");
+    assert_eq!(
+        updates.len(),
+        1,
+        "the scoped package's newer UUID must be reported; got: {v}"
+    );
+    assert_eq!(updates[0]["purl"], crawler_purl);
+    assert_eq!(updates[0]["oldUuid"], old_uuid);
+    assert_eq!(updates[0]["newUuid"], new_uuid);
+
+    let reqs = recorded(&mock).await;
+    assert_single_batch_carries_purl(&reqs, crawler_purl);
+}
+
+// ---------------------------------------------------------------------------
 // Discovery — no manifest, no `updates` field (nothing to diff against)
 // ---------------------------------------------------------------------------
 
@@ -925,6 +1010,111 @@ async fn scan_handles_api_500_error_gracefully() {
         code > 0 && code < 100,
         "scan must fail cleanly (not crash) on 500; got exit code {code}; stderr={stderr}"
     );
+}
+
+/// Mount a batch endpoint that reports one patched package, plus a
+/// per-package detail endpoint that fails with a 500 for it. This is the
+/// "batch phase fine, detail phase totally down" shape that drives
+/// `discover_selected` into its all-queries-failed bail.
+async fn mount_batch_ok_details_500(mock: &MockServer, purl: &str, uuid: &str) {
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/batch")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "packages": [{
+                "purl": purl,
+                "patches": [{
+                    "uuid": uuid,
+                    "purl": purl,
+                    "tier": "free",
+                    "cveIds": [],
+                    "ghsaIds": [],
+                    "severity": "high",
+                    "title": "Prototype Pollution"
+                }]
+            }],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/v0/orgs/{ORG_SLUG}/patches/by-package/pkg%3Anpm%2Fminimist%401.2.2"
+        )))
+        .respond_with(ResponseTemplate::new(500).set_body_string("detail endpoint down"))
+        .mount(mock)
+        .await;
+}
+
+/// CONTRACT (CLI_CONTRACT.md, "JSON output shapes"): *every* `--json`
+/// invocation emits a single JSON object on stdout. `scan`'s other total
+/// failures honor that — `--offline` and the all-batches-failed bail both
+/// print `{"status": "error", "error": ...}`. The all-detail-queries-failed
+/// bail did not: it returned exit 1 straight out of `discover_selected`
+/// with EMPTY stdout, so a bot parsing `scan --json --apply` got a JSON
+/// parse error instead of a diagnosable failure envelope.
+#[tokio::test]
+async fn scan_apply_all_detail_queries_failed_emits_json_error_envelope() {
+    let mock = MockServer::start().await;
+    let purl = "pkg:npm/minimist@1.2.2";
+    mount_batch_ok_details_500(&mock, purl, "11111111-1111-4111-8111-111111111111").await;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_root_package_json(tmp.path());
+    write_npm_package(tmp.path(), "minimist", "1.2.2");
+
+    let (code, stdout, stderr) = run_scan(tmp.path(), &mock.uri(), &["--apply", "--yes"]);
+
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!(
+            "scan --json --apply must emit a JSON envelope even when every \
+             patch-detail query fails; err={e}; stdout={stdout:?}; stderr={stderr}"
+        )
+    });
+    assert_eq!(
+        v["status"], "error",
+        "a total detail-phase failure must be reported as status=error; envelope={v}"
+    );
+    assert!(
+        v["error"].is_string() && !v["error"].as_str().unwrap().is_empty(),
+        "the error envelope must carry a diagnosable message; envelope={v}"
+    );
+    assert_ne!(code, 0, "exit code must stay non-zero; envelope={v}");
+    assert!(
+        !tmp.path().join(".socket/manifest.json").exists(),
+        "a fully-failed detail phase must not write a manifest"
+    );
+}
+
+/// Same contract, vendored mode: `run_vendor_json_path` calls the same
+/// `discover_selected` and had the same bare `return code` with no stdout.
+#[tokio::test]
+async fn scan_vendored_all_detail_queries_failed_emits_json_error_envelope() {
+    let mock = MockServer::start().await;
+    let purl = "pkg:npm/minimist@1.2.2";
+    mount_batch_ok_details_500(&mock, purl, "11111111-1111-4111-8111-111111111111").await;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_root_package_json(tmp.path());
+    write_npm_package(tmp.path(), "minimist", "1.2.2");
+
+    let (code, stdout, stderr) =
+        run_scan(tmp.path(), &mock.uri(), &["--mode", "vendored", "--yes"]);
+
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!(
+            "scan --json --mode vendored must emit a JSON envelope even when every \
+             patch-detail query fails; err={e}; stdout={stdout:?}; stderr={stderr}"
+        )
+    });
+    assert_eq!(
+        v["status"], "error",
+        "a total detail-phase failure must be reported as status=error; envelope={v}"
+    );
+    assert!(
+        v["error"].is_string() && !v["error"].as_str().unwrap().is_empty(),
+        "the error envelope must carry a diagnosable message; envelope={v}"
+    );
+    assert_ne!(code, 0, "exit code must stay non-zero; envelope={v}");
 }
 
 // ---------------------------------------------------------------------------

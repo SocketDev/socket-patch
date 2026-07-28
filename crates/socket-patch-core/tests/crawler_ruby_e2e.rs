@@ -65,6 +65,40 @@ fn install_fake_gem(bin_dir: &Path, gemdir: &Path) {
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
+/// Like [`install_fake_gem`], but also answers `gem env gempath` with the
+/// OS-separated list of gem homes in `gempath` — the multi-home reality of
+/// rvm gemsets (`@global` + app set) and `--user-install`.
+#[cfg(unix)]
+fn install_fake_gem_with_gempath(bin_dir: &Path, gemdir: &Path, gempath: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let script = format!(
+        "#!/bin/sh\nif [ \"$1\" = env ] && [ \"$2\" = gemdir ]; then\n  printf '%s\\n' \"{}\"\n  exit 0\nfi\nif [ \"$1\" = env ] && [ \"$2\" = gempath ]; then\n  printf '%s\\n' \"{}\"\n  exit 0\nfi\nexit 1\n",
+        gemdir.display(),
+        gempath
+    );
+    let bin = bin_dir.join("gem");
+    std::fs::write(&bin, script).unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// Swap `PATH` for the duration of `f`, restoring the previous value (or
+/// unsetting it when it started unset) even though `f` returns a value.
+#[cfg(unix)]
+async fn with_path<F, Fut, T>(bin_dir: &Path, f: F) -> T
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    let prev = std::env::var("PATH").ok();
+    std::env::set_var("PATH", bin_dir);
+    let out = f().await;
+    match prev {
+        Some(v) => std::env::set_var("PATH", v),
+        None => std::env::remove_var("PATH"),
+    }
+    out
+}
+
 // ── find_by_purls ──────────────────────────────────────────────
 
 #[tokio::test]
@@ -346,6 +380,156 @@ async fn get_gem_paths_with_gemfile_lock_only_returns_gemdir() {
         paths,
         vec![gems.clone()],
         "Gemfile.lock alone must trigger `gem env gemdir`; got {paths:?}"
+    );
+}
+
+/// Bundler accepts `gems.rb` as the alternate spelling of `Gemfile`
+/// (`Bundler::SharedHelpers.default_gemfile`), and
+/// `gem_setup::discover_bundler_project` already walks up for it — so
+/// `setup` will wire a `gems.rb` project with the bundler plugin that runs
+/// `apply` on every `bundle install`. The crawler's project gate must
+/// recognize the same spelling; otherwise that project's non-deployment
+/// install (no vendor/bundle) yields zero gem paths and every scan/apply
+/// there is a silent no-op.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn get_gem_paths_with_gems_rb_manifest_returns_gemdir() {
+    let tmp = tempfile::tempdir().unwrap();
+    tokio::fs::write(
+        tmp.path().join("gems.rb"),
+        b"source 'https://rubygems.org'\n",
+    )
+    .await
+    .unwrap();
+
+    let gemdir = tempfile::tempdir().unwrap();
+    let gems = gemdir.path().join("gems");
+    tokio::fs::create_dir_all(&gems).await.unwrap();
+
+    let bin = tempfile::tempdir().unwrap();
+    install_fake_gem(bin.path(), gemdir.path());
+
+    let crawler = RubyCrawler;
+    let paths = with_path(bin.path(), || async {
+        crawler.get_gem_paths(&options_at(tmp.path())).await
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        paths,
+        vec![gems.clone()],
+        "gems.rb (Bundler's alternate manifest) must trigger `gem env gemdir`; got {paths:?}"
+    );
+}
+
+/// Same for `gems.locked`, the lock half of the alternate pair — mirrors
+/// `Gemfile.lock` alone being enough.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn get_gem_paths_with_gems_locked_only_returns_gemdir() {
+    let tmp = tempfile::tempdir().unwrap();
+    tokio::fs::write(tmp.path().join("gems.locked"), b"GEM\n")
+        .await
+        .unwrap();
+
+    let gemdir = tempfile::tempdir().unwrap();
+    let gems = gemdir.path().join("gems");
+    tokio::fs::create_dir_all(&gems).await.unwrap();
+
+    let bin = tempfile::tempdir().unwrap();
+    install_fake_gem(bin.path(), gemdir.path());
+
+    let crawler = RubyCrawler;
+    let paths = with_path(bin.path(), || async {
+        crawler.get_gem_paths(&options_at(tmp.path())).await
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        paths,
+        vec![gems.clone()],
+        "gems.locked alone must trigger `gem env gemdir`; got {paths:?}"
+    );
+}
+
+/// Local mode must scan every gem home `gem env gempath` reports, not just
+/// `gemdir`. Bundler resolves a project's gems from all of `Gem.path`, so a
+/// dependency installed into a non-`gemdir` home — rvm's shared `@global`
+/// gemset, or `~/.gem`/`$XDG_DATA_HOME` under `--user-install` — is still
+/// loaded by the project and must be discoverable (and patchable). Global
+/// mode already walks both; local mode stopping at `gemdir` silently missed
+/// those gems.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn get_gem_paths_local_includes_every_gempath_home() {
+    let tmp = tempfile::tempdir().unwrap();
+    tokio::fs::write(
+        tmp.path().join("Gemfile"),
+        b"source 'https://rubygems.org'\n",
+    )
+    .await
+    .unwrap();
+
+    // Two gem homes: the active one (`gemdir`) and a second one that only
+    // `gempath` names — e.g. rvm's `@global` gemset.
+    let home_a = tempfile::tempdir().unwrap();
+    let home_b = tempfile::tempdir().unwrap();
+    let gems_a = home_a.path().join("gems");
+    let gems_b = home_b.path().join("gems");
+    tokio::fs::create_dir_all(gems_a.join("rails-7.1.0").join("lib"))
+        .await
+        .unwrap();
+    tokio::fs::create_dir_all(gems_b.join("rake-13.2.1").join("lib"))
+        .await
+        .unwrap();
+
+    // `gempath` repeats the gemdir home first, as real RubyGems does — the
+    // result must stay deduped and keep gemdir's precedence.
+    let gempath = std::env::join_paths([home_a.path(), home_b.path()]).unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    install_fake_gem_with_gempath(bin.path(), home_a.path(), gempath.to_str().unwrap());
+
+    let crawler = RubyCrawler;
+    let (paths, decoy, crawled) = with_path(bin.path(), || async {
+        let paths = crawler
+            .get_gem_paths(&options_at(tmp.path()))
+            .await
+            .unwrap();
+        // Control: the gate still holds with `gem env` answerable — a
+        // non-Ruby cwd must not pull in the ambient gem homes.
+        let non_ruby = tempfile::tempdir().unwrap();
+        let decoy = crawler
+            .get_gem_paths(&options_at(non_ruby.path()))
+            .await
+            .unwrap();
+        let crawled = crawler.crawl_all(&options_at(tmp.path())).await;
+        (paths, decoy, crawled)
+    })
+    .await;
+
+    assert_eq!(
+        paths,
+        vec![gems_a.clone(), gems_b.clone()],
+        "local mode must return gemdir's gems/ then every other gempath home's, deduped; got {paths:?}"
+    );
+    assert!(
+        decoy.is_empty(),
+        "non-Ruby cwd must still yield no gem paths; got {decoy:?}"
+    );
+    // End-to-end: the gem that lives only in the second home is crawled.
+    let purls: Vec<&str> = crawled.iter().map(|p| p.purl.as_str()).collect();
+    assert!(
+        purls.contains(&"pkg:gem/rake@13.2.1"),
+        "a gem installed only in a non-gemdir GEM_PATH home must be discovered; got {purls:?}"
+    );
+    assert!(
+        purls.contains(&"pkg:gem/rails@7.1.0"),
+        "the gemdir home's gem must still be discovered; got {purls:?}"
     );
 }
 

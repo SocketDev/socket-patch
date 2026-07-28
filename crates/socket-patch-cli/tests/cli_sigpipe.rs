@@ -30,8 +30,7 @@ fn closed_stdout_pipe_is_not_a_panic() {
     let dir = tempfile::tempdir().expect("tempdir");
     let socket = dir.path().join(".socket");
     std::fs::create_dir_all(&socket).expect("create .socket");
-    std::fs::write(socket.join("manifest.json"), r#"{ "patches": {} }"#)
-        .expect("write manifest");
+    std::fs::write(socket.join("manifest.json"), r#"{ "patches": {} }"#).expect("write manifest");
 
     // Build a pipe and close the read end BEFORE the child spawns, so the
     // child's first stdout write hits EPIPE deterministically (piping to a

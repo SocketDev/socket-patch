@@ -335,6 +335,57 @@ async fn get_global_python_site_packages_discovers_anaconda() {
     );
 }
 
+/// macOS `pip install --user` uses the framework "user" install scheme:
+/// `~/Library/Python/<X.Y>/lib/python/site-packages` — one tree per
+/// interpreter MINOR VERSION, with a BARE `python` leaf (not `python3.X`).
+/// Both Apple's `/usr/bin/python3` and Homebrew's `python3` are framework
+/// builds and use it, so a stock Mac has several of these trees.
+///
+/// The well-known scan covers pip --user on Linux (`~/.local`) and Windows
+/// (`%APPDATA%\Python`) but had no macOS entry, so the only thing that ever
+/// surfaced such a package was the `site.getusersitepackages()` query — which
+/// reports at most the ONE interpreter first on PATH. Everything
+/// `pip3 install --user`ed under any other interpreter was invisible to
+/// global discovery.
+///
+/// Two versions are staged deliberately: the runtime-query arm can only ever
+/// contribute the host interpreter's own version, so requiring BOTH to surface
+/// keeps the test honest whatever Python the host happens to run.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[serial]
+async fn get_global_python_site_packages_discovers_macos_user_site() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut staged = Vec::new();
+    for ver in ["3.9", "3.12"] {
+        let sp = tmp
+            .path()
+            .join("Library")
+            .join("Python")
+            .join(ver)
+            .join("lib")
+            .join("python")
+            .join("site-packages");
+        tokio::fs::create_dir_all(&sp).await.unwrap();
+        staged.push(sp);
+    }
+
+    let prev_home = std::env::var("HOME").ok();
+    std::env::set_var("HOME", tmp.path());
+    let result = get_global_python_site_packages().await;
+    if let Some(v) = prev_home {
+        std::env::set_var("HOME", v);
+    }
+
+    for sp in &staged {
+        assert!(
+            result.iter().any(|p| p == sp),
+            "macOS pip --user site-packages {} must surface; got {result:?}",
+            sp.display()
+        );
+    }
+}
+
 // ── uv-tools and uv-python discovery ──────────────────────────
 
 /// `uv tool install <pkg>` on macOS installs into

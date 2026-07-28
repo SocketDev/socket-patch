@@ -98,7 +98,10 @@ async fn pip_bundled_refuses_with_pip_hint() {
         &["--update", "--yes"],
         &[("SOCKET_UPDATE_BASE_URL", DEAD_BASE_URL)],
     );
-    assert_eq!(code, 1, "pip-managed install must refuse.\nstderr:\n{stderr}");
+    assert_eq!(
+        code, 1,
+        "pip-managed install must refuse.\nstderr:\n{stderr}"
+    );
     assert!(
         stderr.contains("pip install --upgrade socket-patch"),
         "refusal must route to pip's own upgrade command: {stderr}"
@@ -135,7 +138,10 @@ async fn cargo_install_refuses_with_cargo_hint() {
             ("CARGO_HOME", &cargo_home),
         ],
     );
-    assert_eq!(code, 1, "cargo-managed install must refuse.\nstderr:\n{stderr}");
+    assert_eq!(
+        code, 1,
+        "cargo-managed install must refuse.\nstderr:\n{stderr}"
+    );
     assert!(
         stderr.contains("cargo install socket-patch-cli"),
         "refusal must route to cargo's own upgrade command: {stderr}"
@@ -262,6 +268,54 @@ async fn force_overrides_channel_refusal() {
     update_fixture::StagedInstall::assert_build_artifact_untouched(&real_hash);
 }
 
+/// The same override, one output mode over: `--json` silences stderr, so
+/// the "npm owns this and will overwrite it" advisory has to ride the
+/// envelope's `warnings[]` instead. Without it a CI wrapper running
+/// `--update --force --json` inside `node_modules` sees a bare
+/// `status: "success"` and never learns the swap is ephemeral — the same
+/// silent-override bug class [`force_overrides_channel_refusal`] guards in
+/// human mode.
+#[tokio::test]
+async fn force_override_warning_survives_json() {
+    let install = staged_install_at("node_modules/@socketsecurity/socket-patch-x/bin");
+    let (served, _) = make_served_binary();
+
+    let release = FakeReleaseBuilder::new(CURRENT)
+        .asset_for_current_target(&served)
+        .mount()
+        .await;
+
+    let (code, stdout, stderr) = run_installed(
+        &install,
+        &["--update", "--force", "--yes", "--json"],
+        &[("SOCKET_UPDATE_BASE_URL", &release.base_url)],
+    );
+    assert_eq!(
+        code, 0,
+        "--force must proceed past the channel gate.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let env = common::parse_json_envelope(&stdout);
+    assert_eq!(common::json_string(&env, "status"), Some("success"));
+    let warnings = env["warnings"].as_array().cloned().unwrap_or_default();
+    let advisory = warnings
+        .iter()
+        .find(|w| w["code"] == "managed_install_override")
+        .unwrap_or_else(|| {
+            panic!("a --json override must still report that npm owns this install: {stdout}")
+        });
+    assert!(
+        advisory["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("managed by npm"),
+        "the advisory must name the owning manager: {advisory}"
+    );
+    assert!(
+        !stderr.contains("Warning"),
+        "--json must route the advisory to the envelope, not stderr: {stderr}"
+    );
+}
+
 /// Canonicalization pin: the binary physically lives in the node_modules
 /// shape but is invoked through a plain symlink elsewhere — exactly how
 /// npm `.bin/` shims exec. Detection must classify the resolved target,
@@ -303,7 +357,10 @@ async fn symlinked_invocation_still_detected() {
     install.assert_binary_intact();
     install.assert_only_binary_present();
     assert!(
-        std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(),
+        std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
         "the invocation symlink must be left alone"
     );
 }

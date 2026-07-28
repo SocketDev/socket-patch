@@ -24,8 +24,7 @@ pub use release::{
     UpdateEndpoints, UpdateTimeouts,
 };
 pub use state::{
-    check_is_due, load_state, notice_is_due, save_state, unix_now, UpdateCheckState,
-    CHECK_INTERVAL,
+    check_is_due, load_state, notice_is_due, save_state, unix_now, UpdateCheckState, CHECK_INTERVAL,
 };
 pub use swap::resolve_install_path;
 

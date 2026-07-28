@@ -19,9 +19,10 @@
 
 use std::path::Path;
 
-// npm/Node strip a BOM from package.json and cargo accepts one in Cargo.toml,
-// but serde_json and the line scanner both reject it — without this, manifests
-// the user's own toolchain accepts yield no PURL.
+// npm/Node strip a BOM from package.json, cargo accepts one in Cargo.toml, and
+// git reads a BOM'd `.git/config`, but serde_json and the line scanners all
+// reject it — without this, files the user's own toolchain accepts yield no
+// PURL.
 use crate::package_json::detect::strip_bom;
 
 /// Version-extracting parser for one manifest flavor, keyed by file name in
@@ -217,7 +218,10 @@ async fn find_git_config(start: &Path) -> Option<std::path::PathBuf> {
 /// a git config file. Returns the trimmed URL, or `None`.
 fn scan_remote_origin_url(content: &str) -> Option<String> {
     let mut in_section = false;
-    for raw in content.lines() {
+    // git reads a BOM'd config file fine, but `trim()` does not strip
+    // U+FEFF (it carries no White_Space property), so a BOM would keep
+    // the very first header from matching `starts_with('[')`.
+    for raw in strip_bom(content).lines() {
         let line = raw.trim();
         if line.starts_with('[') {
             // git permits a `;`/`#` comment after the closing bracket;
@@ -229,7 +233,7 @@ fn scan_remote_origin_url(content: &str) -> Option<String> {
             if let Some(close) = line.find(']') {
                 let rest = line[close + 1..].trim_start();
                 if rest.is_empty() || rest.starts_with('#') || rest.starts_with(';') {
-                    in_section = &line[..=close] == "[remote \"origin\"]";
+                    in_section = is_remote_origin_header(&line[..=close]);
                     continue;
                 }
             }
@@ -237,25 +241,50 @@ fn scan_remote_origin_url(content: &str) -> Option<String> {
         if !in_section {
             continue;
         }
-        // Parse `key = value`. Only the EXACT `url` key counts: a
+        // Parse `key = value`. Only the `url` key counts (matched
+        // case-insensitively, as git matches variable names): a
         // `url`-prefixed-but-different key (git permits arbitrary
-        // config keys, e.g. a custom `urlsuffix`) or a malformed
-        // `url ...` line without an `=` must be SKIPPED, not abort
-        // the scan — otherwise a later, valid `url = ...` line in the
-        // same section would never be read.
+        // config keys, e.g. a custom `urlsuffix`), a malformed
+        // `url ...` line without an `=`, or an empty/commented-out
+        // value must be SKIPPED, not abort the scan — otherwise a
+        // later, valid `url = ...` line in the same section would
+        // never be read. (git resolves `url =` followed by a real
+        // `url = ...` to the real one.)
         let Some((key, value)) = line.split_once('=') else {
             continue;
         };
-        if key.trim() != "url" {
+        if !key.trim().eq_ignore_ascii_case("url") {
             continue;
         }
         let value = parse_git_config_value(value);
         if value.is_empty() {
-            return None;
+            continue;
         }
         return Some(value);
     }
     None
+}
+
+/// Does `header` — a `[...]` line, brackets included — name the
+/// `[remote "origin"]` section?
+///
+/// git matches SECTION names case-insensitively but subsection names
+/// case-SENSITIVELY, and skips any run of spaces/tabs between the two.
+/// Verified against `git config -f`, which also rejects
+/// `[remote"origin"]`, `[ remote "origin"]` and `[remote "origin" ]`
+/// as `bad config line`, so those stay non-matches here.
+fn is_remote_origin_header(header: &str) -> bool {
+    let Some(inner) = header.strip_prefix('[').and_then(|s| s.strip_suffix(']')) else {
+        return false;
+    };
+    let Some((section, subsection)) = inner.split_once('"') else {
+        return false;
+    };
+    section.ends_with([' ', '\t'])
+        && section
+            .trim_end_matches([' ', '\t'])
+            .eq_ignore_ascii_case("remote")
+        && subsection == "origin\""
 }
 
 /// Reduce the raw right-hand side of a git config `key = value` line
@@ -1520,6 +1549,175 @@ mod tests {
     fn scan_origin_url_value_that_is_only_comment_is_none() {
         let cfg = "[remote \"origin\"]\n\turl = ; commented out\n";
         assert!(scan_remote_origin_url(cfg).is_none());
+    }
+
+    // ── Regression: an empty `url` must not abort the section scan ──
+    // git resolves `url = ` followed by a real `url = ...` to the real
+    // one (verified: `git remote get-url origin` prints only the real
+    // url). Aborting on the empty value violated the same "skip the
+    // bad line, keep scanning" invariant the malformed-line fix above
+    // established, and silently dropped the repo's identity.
+
+    #[test]
+    fn scan_origin_url_empty_url_does_not_abort_scan() {
+        let cfg = "[remote \"origin\"]\n\turl = \n\turl = git@github.com:foo/bar.git\n";
+        assert_eq!(
+            scan_remote_origin_url(cfg).as_deref(),
+            Some("git@github.com:foo/bar.git")
+        );
+    }
+
+    /// Same shape, but the dead first value is a comment-only one.
+    #[test]
+    fn scan_origin_url_comment_only_url_does_not_abort_scan() {
+        let cfg = "[remote \"origin\"]\n\turl = ; disabled\n\turl = git@github.com:foo/bar.git\n";
+        assert_eq!(
+            scan_remote_origin_url(cfg).as_deref(),
+            Some("git@github.com:foo/bar.git")
+        );
+    }
+
+    // ── Regression: UTF-8 BOM on `.git/config` ────────────────────
+    // git reads a BOM'd config fine (verified: `git config -f` on a
+    // BOM'd file still reports remote.origin.url), but `trim()` does
+    // NOT strip U+FEFF — it has no White_Space property — so the
+    // leading `[remote "origin"]` header failed `starts_with('[')` and
+    // the section never opened. Same policy as the package.json /
+    // Cargo.toml BOM fix: a file the user's own toolchain accepts must
+    // not silently yield no PURL.
+
+    #[test]
+    fn scan_origin_url_tolerates_leading_bom() {
+        let cfg = "\u{feff}[remote \"origin\"]\n\turl = git@github.com:foo/bar.git\n";
+        assert_eq!(
+            scan_remote_origin_url(cfg).as_deref(),
+            Some("git@github.com:foo/bar.git")
+        );
+    }
+
+    #[tokio::test]
+    async fn detect_git_remote_with_bom_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let git_dir = dir.path().join(".git");
+        tokio::fs::create_dir_all(&git_dir).await.unwrap();
+        tokio::fs::write(
+            git_dir.join("config"),
+            "\u{feff}[remote \"origin\"]\n\turl = git@github.com:owner/bom-repo.git\n",
+        )
+        .await
+        .unwrap();
+
+        let r = detect_product(dir.path()).await;
+        assert_eq!(r.purl.as_deref(), Some("pkg:github/owner/bom-repo"));
+    }
+
+    // ── Regression: git config name case-insensitivity + header spacing ──
+    // Verified against `git config -f`: SECTION names and VARIABLE
+    // names are case-insensitive, subsection names are NOT, and any run
+    // of whitespace may separate the section from its quoted
+    // subsection. The exact byte comparisons rejected configs git
+    // itself accepts, so a hand-edited `.git/config` lost the repo's
+    // identity and detection silently fell through to a package
+    // manifest (or to no product at all).
+
+    #[test]
+    fn scan_origin_url_section_name_is_case_insensitive() {
+        let cfg = "[Remote \"origin\"]\n\turl = git@github.com:foo/bar.git\n";
+        assert_eq!(
+            scan_remote_origin_url(cfg).as_deref(),
+            Some("git@github.com:foo/bar.git")
+        );
+        let cfg = "[REMOTE \"origin\"]\n\turl = git@github.com:foo/bar.git\n";
+        assert_eq!(
+            scan_remote_origin_url(cfg).as_deref(),
+            Some("git@github.com:foo/bar.git")
+        );
+    }
+
+    /// Subsection names stay case-SENSITIVE, matching git: a
+    /// `[remote "ORIGIN"]` section defines `remote.ORIGIN.url`, and
+    /// `git config --get remote.origin.url` reports nothing for it.
+    #[test]
+    fn scan_origin_url_subsection_name_stays_case_sensitive() {
+        let cfg = "[remote \"ORIGIN\"]\n\turl = git@github.com:foo/bar.git\n";
+        assert!(scan_remote_origin_url(cfg).is_none());
+    }
+
+    /// git skips any run of whitespace between the section name and
+    /// its quoted subsection.
+    #[test]
+    fn scan_origin_url_header_extra_whitespace_before_subsection() {
+        let cfg = "[remote  \"origin\"]\n\turl = git@github.com:foo/bar.git\n";
+        assert_eq!(
+            scan_remote_origin_url(cfg).as_deref(),
+            Some("git@github.com:foo/bar.git")
+        );
+        let cfg = "[remote\t\"origin\"]\n\turl = git@github.com:foo/bar.git\n";
+        assert_eq!(
+            scan_remote_origin_url(cfg).as_deref(),
+            Some("git@github.com:foo/bar.git")
+        );
+    }
+
+    /// Variable names are case-insensitive too (`URL`/`UrL` both
+    /// resolve `remote.origin.url` for git).
+    #[test]
+    fn scan_origin_url_key_name_is_case_insensitive() {
+        let cfg = "[remote \"origin\"]\n\tURL = git@github.com:foo/bar.git\n";
+        assert_eq!(
+            scan_remote_origin_url(cfg).as_deref(),
+            Some("git@github.com:foo/bar.git")
+        );
+    }
+
+    /// Header shapes git itself rejects as `bad config line` stay
+    /// rejected — the relaxation must not over-match. Verified: all
+    /// three make `git config -f` fail outright.
+    #[test]
+    fn scan_origin_url_malformed_headers_stay_rejected() {
+        for cfg in [
+            "[remote \"origin\" ]\n\turl = git@github.com:foo/bar.git\n",
+            "[ remote \"origin\"]\n\turl = git@github.com:foo/bar.git\n",
+            "[remote\"origin\"]\n\turl = git@github.com:foo/bar.git\n",
+        ] {
+            assert!(
+                scan_remote_origin_url(cfg).is_none(),
+                "malformed header should not open the origin section: {cfg:?}"
+            );
+        }
+    }
+
+    /// A case-varied header must also still CLOSE an open origin
+    /// section — otherwise the next remote's url is misattributed.
+    #[test]
+    fn scan_origin_url_case_varied_foreign_header_closes_section() {
+        let cfg =
+            "[remote \"origin\"]\n[Remote \"upstream\"]\n\turl = git@github.com:other/repo.git\n";
+        assert!(scan_remote_origin_url(cfg).is_none());
+    }
+
+    /// End-to-end: a `.git/config` with a case-varied header still
+    /// wins over the package manifest, as the priority chain promises.
+    #[tokio::test]
+    async fn detect_git_remote_with_case_varied_header() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            dir.path().join("package.json"),
+            r#"{"name":"from-pkg","version":"1.0.0"}"#,
+        )
+        .await
+        .unwrap();
+        let git_dir = dir.path().join(".git");
+        tokio::fs::create_dir_all(&git_dir).await.unwrap();
+        tokio::fs::write(
+            git_dir.join("config"),
+            "[Remote \"origin\"]\n\tURL = git@github.com:owner/from-git.git\n",
+        )
+        .await
+        .unwrap();
+
+        let r = detect_product(dir.path()).await;
+        assert_eq!(r.purl.as_deref(), Some("pkg:github/owner/from-git"));
     }
 
     #[tokio::test]

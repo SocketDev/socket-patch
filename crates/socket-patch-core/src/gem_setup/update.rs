@@ -11,7 +11,7 @@ use std::path::Path;
 use tokio::fs;
 
 use super::{add_plugin_files, remove_plugin_files, BundlerProject};
-use crate::utils::fs::atomic_write_bytes;
+use crate::utils::fs::atomic_write_bytes_preserving_mode;
 
 /// Outcome of one setup edit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,37 +99,60 @@ fn gemfile_add(content: &str) -> Option<String> {
     Some(format!("{content}{}", appended()))
 }
 
+/// Every on-disk form of the managed block, paired with the separator that
+/// precedes it: the LF bytes `setup` writes, and the CRLF rewrite handed back by
+/// a `core.autocrlf` checkout (Git for Windows' default) or an editor that saves
+/// the whole Gemfile CRLF. Both are ours, so `--remove` must match both — the
+/// marker survives such a rewrite, so a CRLF block otherwise reads as
+/// "configured" forever while `remove` reports nothing to do.
+fn block_variants() -> [(&'static str, String); 2] {
+    [
+        ("\n", MANAGED_BLOCK.to_string()),
+        ("\r\n", MANAGED_BLOCK.replace('\n', "\r\n")),
+    ]
+}
+
 /// Pure transform: strip the managed block (and the separator we added),
 /// restoring the pre-setup bytes. `None` if our block is absent.
 fn gemfile_remove(content: &str) -> Option<String> {
     if !is_plugin_directive_present(content) {
         return None;
     }
-    // Remove the exact "\n<block>" we appended; fall back to stripping just the
-    // block if the leading separator was edited away.
-    let appended = appended();
-    if let Some(idx) = content.find(&appended) {
-        let end = idx + appended.len();
-        // The separator "\n" doubles as the terminator of a final unterminated
-        // pre-setup line. Stripping it is only safe when the block sits at EOF
-        // (the byte-exact restore) or the separator is a pure blank line
-        // (preceded by a newline, or at the start of the file); otherwise the
-        // user's lines on either side of the block would glue into one.
-        let start = if end == content.len() || idx == 0 || content[..idx].ends_with('\n') {
-            idx
-        } else {
-            idx + 1
-        };
-        let mut out = content.to_string();
-        out.replace_range(start..end, "");
-        Some(out)
-    } else {
-        // Separator edited away: strip just the block. If the block body was
-        // also edited (so this matches nothing), report nothing-removed rather
-        // than a false "Updated" on an unchanged, still-marked file.
-        let stripped = content.replace(MANAGED_BLOCK, "");
-        (stripped != content).then_some(stripped)
+    let mut out = content.to_string();
+    let mut changed = false;
+    for (separator, block) in block_variants() {
+        // Remove every "<separator><block>" we appended — a Gemfile can carry
+        // more than one copy (a merge that kept both sides, a hand-copied
+        // Gemfile), and leaving one behind reports "removed" while a `plugin`
+        // line pointing at the just-deleted plugin dir fails every later
+        // `bundle install`.
+        let appended = format!("{separator}{block}");
+        while let Some(idx) = out.find(&appended) {
+            let end = idx + appended.len();
+            // The separator doubles as the terminator of a final unterminated
+            // pre-setup line. Stripping it is only safe when the block sits at
+            // EOF (the byte-exact restore) or the separator is a pure blank
+            // line (preceded by a newline, or at the start of the file);
+            // otherwise the user's lines on either side of the block would glue
+            // into one.
+            let start = if end == out.len() || idx == 0 || out[..idx].ends_with('\n') {
+                idx
+            } else {
+                idx + separator.len()
+            };
+            out.replace_range(start..end, "");
+            changed = true;
+        }
+        // Separator edited away: strip the bare block.
+        if out.contains(&block) {
+            out = out.replace(&block, "");
+            changed = true;
+        }
     }
+    // If the block body itself was hand-edited (so nothing above matched),
+    // report nothing-removed rather than a false "Updated" on an unchanged,
+    // still-marked file.
+    changed.then_some(out)
 }
 
 /// Append the managed `plugin` block to the Gemfile. Idempotent
@@ -147,8 +170,11 @@ async fn edit_gemfile_add(gemfile: &Path, dry_run: bool) -> GemEditResult {
                 if !dry_run {
                     // Stage+fsync+rename via the crate-wide hardened writer:
                     // the user's committed Gemfile must never be left torn by
-                    // a crash mid-write.
-                    atomic_write_bytes(gemfile, new.as_bytes())
+                    // a crash mid-write. Mode-preserving, because the Gemfile
+                    // is the user's file and we only edit it — the rename swaps
+                    // in a fresh inode, so the plain writer would reset a 0600
+                    // private or 0664 group-writable Gemfile to umask defaults.
+                    atomic_write_bytes_preserving_mode(gemfile, new.as_bytes())
                         .await
                         .map_err(|e| e.to_string())?;
                 }
@@ -173,7 +199,7 @@ async fn edit_gemfile_remove(gemfile: &Path, dry_run: bool) -> GemEditResult {
             None => Ok(false),
             Some(new) => {
                 if !dry_run {
-                    atomic_write_bytes(gemfile, new.as_bytes())
+                    atomic_write_bytes_preserving_mode(gemfile, new.as_bytes())
                         .await
                         .map_err(|e| e.to_string())?;
                 }
@@ -185,25 +211,43 @@ async fn edit_gemfile_remove(gemfile: &Path, dry_run: bool) -> GemEditResult {
     GemEditResult::from_result("gemfile", gemfile.display().to_string(), result)
 }
 
-/// Wire the project: append the Gemfile `plugin` block and generate the in-tree
-/// plugin directory. Returns one result per artifact (`gemfile`, `gem_plugin`).
+/// Wire the project: generate the in-tree plugin directory, then append the
+/// Gemfile `plugin` block. Returns one result per artifact (`gemfile`,
+/// `gem_plugin`).
+///
+/// The plugin dir is generated FIRST and the Gemfile wired only if that
+/// succeeded, because Bundler hard-fails `bundle install` on a `plugin ... path:`
+/// directive whose source is missing ("The path ... does not exist", exit 13).
+/// Wiring first and then failing to write the files would leave the project
+/// unable to install at all — strictly worse than never having run `setup`.
+/// Wiring last keeps a failure's blast radius at "not configured".
 pub async fn add_plugin_directive(project: &BundlerProject, dry_run: bool) -> Vec<GemEditResult> {
-    vec![
-        edit_gemfile_add(&project.gemfile, dry_run).await,
-        add_plugin_files(&project.root, dry_run).await,
-    ]
+    let files = add_plugin_files(&project.root, dry_run).await;
+    if files.status == GemSetupStatus::Error {
+        return vec![files];
+    }
+    // Envelope order stays gemfile-then-gem_plugin; only execution order moved.
+    let gemfile = edit_gemfile_add(&project.gemfile, dry_run).await;
+    vec![gemfile, files]
 }
 
-/// Unwire the project: strip the Gemfile block (byte-for-byte restore) and
+/// Unwire the project: strip the Gemfile block (byte-for-byte restore), then
 /// delete the generated plugin directory.
+///
+/// Mirror of [`add_plugin_directive`]'s ordering contract, from the other end:
+/// the files are deleted only once the directive referencing them is gone. A
+/// failed un-wire that still deleted the plugin dir would leave the Gemfile
+/// pointing at a path that no longer exists, breaking every later
+/// `bundle install` (exit 13) on a project that installed fine before.
 pub async fn remove_plugin_directive(
     project: &BundlerProject,
     dry_run: bool,
 ) -> Vec<GemEditResult> {
-    vec![
-        edit_gemfile_remove(&project.gemfile, dry_run).await,
-        remove_plugin_files(&project.root, dry_run).await,
-    ]
+    let gemfile = edit_gemfile_remove(&project.gemfile, dry_run).await;
+    if gemfile.status == GemSetupStatus::Error {
+        return vec![gemfile];
+    }
+    vec![gemfile, remove_plugin_files(&project.root, dry_run).await]
 }
 
 #[cfg(test)]
@@ -345,6 +389,62 @@ mod tests {
     }
 
     #[test]
+    fn test_remove_strips_a_crlf_rewritten_block() {
+        // Git for Windows' default `core.autocrlf` ("checkout Windows-style,
+        // commit Unix-style") rewrites the LF block we wrote into CRLF on
+        // checkout — as does a Windows editor that saves the whole Gemfile
+        // CRLF. `--remove` must still strip it. Otherwise it reports
+        // "not_configured" and leaves the `plugin` line behind while
+        // `remove_plugin_files` DOES delete the generated plugin dir (its
+        // marker survives the rewrite), so every later `bundle install` dies
+        // on a plugin path that no longer exists.
+        let crlf_block = MANAGED_BLOCK.replace('\n', "\r\n");
+        let user = "source 'https://rubygems.org'\r\ngem 'colorize', '1.1.0'\r\n";
+        let configured = format!("{user}\r\n{crlf_block}");
+        assert!(is_plugin_directive_present(&configured));
+        let out =
+            gemfile_remove(&configured).expect("a CRLF-rewritten block is still ours to strip");
+        assert_eq!(
+            out, user,
+            "the CRLF checkout's pre-setup bytes are restored"
+        );
+        assert!(!is_plugin_directive_present(&out));
+    }
+
+    #[test]
+    fn test_remove_strips_a_crlf_block_without_gluing_later_user_lines() {
+        // Same CRLF rewrite, but the user added gems AFTER our block and the
+        // pre-setup file had no final newline (so the separator terminates that
+        // last line). Stripping the CRLF separator too would glue two `gem`
+        // lines into one invalid Ruby line.
+        let crlf_block = MANAGED_BLOCK.replace('\n', "\r\n");
+        let configured = format!("gem 'colorize'\r\n{crlf_block}gem 'extra', '2.0'\r\n");
+        assert_eq!(
+            gemfile_remove(&configured).unwrap(),
+            "gem 'colorize'\r\ngem 'extra', '2.0'\r\n",
+            "the CRLF separator survives as the previous line's terminator"
+        );
+    }
+
+    #[test]
+    fn test_remove_strips_every_managed_block() {
+        // A Gemfile can end up carrying two copies of the block — a merge that
+        // kept both sides, or a hand-copied Gemfile. `--remove` must strip all
+        // of them: leaving one behind reports "removed" while a `plugin` line
+        // pointing at the just-deleted plugin dir survives and fails every
+        // later `bundle install`.
+        let added = gemfile_add(GEMFILE).unwrap();
+        let doubled = format!("{added}\n{MANAGED_BLOCK}");
+        assert!(is_plugin_directive_present(&doubled));
+        let out = gemfile_remove(&doubled).unwrap();
+        assert!(
+            !is_plugin_directive_present(&out),
+            "no managed block may survive `--remove`"
+        );
+        assert_eq!(out, GEMFILE, "both blocks stripped, user bytes restored");
+    }
+
+    #[test]
     fn test_closing_marker_alone_is_not_detected_as_present() {
         // The "<<<" closing line must not satisfy the ">>>" opening marker.
         let closing_only = "gem 'x'\n# <<< socket-patch:managed <<<\n";
@@ -353,7 +453,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_full_roundtrip_via_gems_rb() {
-        // discover prefers Gemfile, so exercise the gems.rb manifest directly.
+        // Exercise Bundler's alternate manifest name end to end.
         let dir = tempfile::tempdir().unwrap();
         let gems_rb = dir.path().join("gems.rb");
         fs::write(&gems_rb, GEMFILE).await.unwrap();
@@ -461,6 +561,49 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_add_preserves_gemfile_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        // The rename swaps in a fresh stage inode created with umask defaults,
+        // so the plain writer resets the mode of a file the USER owns and we
+        // merely edit: a 0600 private Gemfile silently becomes world-readable.
+        let dir = tempfile::tempdir().unwrap();
+        let gemfile = dir.path().join("Gemfile");
+        fs::write(&gemfile, GEMFILE).await.unwrap();
+        std::fs::set_permissions(&gemfile, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let res = edit_gemfile_add(&gemfile, false).await;
+        assert_eq!(res.status, GemSetupStatus::Updated, "err: {:?}", res.error);
+        let mode = std::fs::metadata(&gemfile).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "the user's Gemfile mode must survive the edit (got {mode:o})"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_remove_preserves_gemfile_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        // Inverse of the 0600 case: a group-writable Gemfile (shared checkout)
+        // must not come back 0644, locking the group out.
+        let dir = tempfile::tempdir().unwrap();
+        let gemfile = dir.path().join("Gemfile");
+        fs::write(&gemfile, gemfile_add(GEMFILE).unwrap())
+            .await
+            .unwrap();
+        std::fs::set_permissions(&gemfile, std::fs::Permissions::from_mode(0o664)).unwrap();
+
+        let res = edit_gemfile_remove(&gemfile, false).await;
+        assert_eq!(res.status, GemSetupStatus::Updated, "err: {:?}", res.error);
+        let mode = std::fs::metadata(&gemfile).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o664,
+            "group-writable Gemfile stays group-writable (got {mode:o})"
+        );
+    }
+
     #[tokio::test]
     async fn test_edit_leaves_no_stage_litter() {
         let dir = tempfile::tempdir().unwrap();
@@ -483,6 +626,92 @@ mod tests {
             let name = entry.file_name().to_string_lossy().into_owned();
             assert!(!name.starts_with(".socket-stage-"), "stage litter: {name}");
         }
+    }
+
+    // ── the Gemfile directive must never point at a missing plugin dir ──
+    //
+    // Bundler HARD-FAILS `bundle install` on a `plugin ... path:` directive
+    // whose source directory does not exist:
+    //
+    //     $ bundle install
+    //     The path `/tmp/x/.socket/bundler-plugin` does not exist.
+    //     $ echo $?
+    //     13
+    //
+    // (verified on bundler 4.0.15). So a half-applied add — Gemfile wired, files
+    // not written — is strictly WORSE than never running setup: the project can
+    // no longer install at all. Same for a half-applied remove: files deleted,
+    // directive left behind. Both orderings must keep the directive's lifetime
+    // inside the plugin dir's.
+
+    #[tokio::test]
+    async fn test_add_leaves_gemfile_unwired_when_plugin_dir_cannot_be_generated() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("Gemfile"), GEMFILE).await.unwrap();
+        // `.socket` as a regular FILE makes `create_dir_all(".socket/bundler-
+        // plugin")` fail on every platform — the portable stand-in for a
+        // read-only checkout / ENOSPC / a clobbered `.socket`.
+        fs::write(root.join(".socket"), "not a directory\n")
+            .await
+            .unwrap();
+        let project = super::super::discover_bundler_project(root).await.unwrap();
+
+        let results = add_plugin_directive(&project, false).await;
+
+        assert!(
+            results.iter().any(|r| r.status == GemSetupStatus::Error),
+            "the failed plugin-dir generation must surface as an error: {results:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("Gemfile")).await.unwrap(),
+            GEMFILE,
+            "the Gemfile must NOT be wired to a plugin dir that does not exist — \
+             that breaks every `bundle install` (exit 13)"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_remove_keeps_plugin_files_when_gemfile_cannot_be_unwired() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("Gemfile"), GEMFILE).await.unwrap();
+        let project = super::super::discover_bundler_project(root).await.unwrap();
+        assert!(add_plugin_directive(&project, false)
+            .await
+            .iter()
+            .all(|r| r.status == GemSetupStatus::Updated));
+
+        // A read-only project root blocks the Gemfile's stage+rename (the stage
+        // sibling cannot be created) while leaving `.socket/bundler-plugin/`
+        // itself writable — so the un-wire fails but the deletes would succeed.
+        fs::set_permissions(root, std::fs::Permissions::from_mode(0o555))
+            .await
+            .unwrap();
+
+        let results = remove_plugin_directive(&project, false).await;
+
+        // Restore before any assertion can unwind, so the tempdir cleans up.
+        fs::set_permissions(root, std::fs::Permissions::from_mode(0o755))
+            .await
+            .unwrap();
+
+        assert!(
+            results.iter().any(|r| r.status == GemSetupStatus::Error),
+            "the failed Gemfile un-wire must surface as an error: {results:?}"
+        );
+        assert!(
+            is_plugin_directive_present(&fs::read_to_string(root.join("Gemfile")).await.unwrap()),
+            "precondition: the directive is still in the Gemfile"
+        );
+        assert!(
+            super::super::plugin_files_present(root).await,
+            "the plugin files must SURVIVE a failed un-wire — deleting them while \
+             the directive remains breaks every `bundle install` (exit 13)"
+        );
     }
 
     #[tokio::test]

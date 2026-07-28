@@ -76,7 +76,8 @@ pub fn detect_channel(canonical_exe: &Path, env: &ChannelEnv) -> InstallChannel 
     if has_component(canonical_exe, "node_modules") {
         return InstallChannel::Npm;
     }
-    if has_component(canonical_exe, "site-packages") || has_component(canonical_exe, "dist-packages")
+    if has_component(canonical_exe, "site-packages")
+        || has_component(canonical_exe, "dist-packages")
     {
         return InstallChannel::Pypi;
     }
@@ -328,10 +329,7 @@ mod tests {
             InstallChannel::Npm
         );
         assert_eq!(
-            detect_channel(
-                Path::new(r"C:\Users\u\.cargo\bin\socket-patch.exe"),
-                &env
-            ),
+            detect_channel(Path::new(r"C:\Users\u\.cargo\bin\socket-patch.exe"), &env),
             InstallChannel::Cargo
         );
         assert_eq!(

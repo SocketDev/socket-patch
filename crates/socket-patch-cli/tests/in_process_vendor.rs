@@ -1165,6 +1165,35 @@ fn lock_contention_exits_lock_held() {
     assert_eq!(fx.lock_bytes(), fx.original_lock, "lock untouched");
 }
 
+/// `vendor --revert` is documented to work without a manifest, and "a
+/// missing ledger is an empty ledger (clean no-op plus the orphan-dir
+/// sweep)" (CLI_CONTRACT, "Ownership, state, and reversal"). A project
+/// with no `.socket/` directory at all is exactly that case — but the
+/// apply lock lives INSIDE `.socket/`, and `apply_lock::acquire` only
+/// creates the lock *file*, never its parent. Taking the lock before
+/// noticing there is nothing to revert turns the documented no-op into a
+/// `lock_io` failure.
+#[test]
+fn revert_without_a_socket_dir_is_a_clean_no_op() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    assert!(!tmp.path().join(".socket").exists());
+
+    let (code, env) = vendor_cli(tmp.path(), &["--revert"]);
+    assert_eq!(
+        code, 0,
+        "an absent ledger is an empty ledger — revert must be a clean no-op: {env:#}"
+    );
+    assert_ne!(
+        env["error"]["code"], "lock_io",
+        "revert must not fail on the lock file it would have created inside the \
+         missing .socket/ dir: {env:#}"
+    );
+    assert!(
+        !tmp.path().join(".socket").exists(),
+        "a no-op revert must not litter a .socket/ dir"
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // 12. JSON envelope shape
 // ─────────────────────────────────────────────────────────────────────

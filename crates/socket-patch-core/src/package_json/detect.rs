@@ -1,3 +1,5 @@
+use crate::patch::vendor::common::{detect_indent, serialize_json};
+
 /// Package manager type for selecting the correct command prefix.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PackageManager {
@@ -166,11 +168,18 @@ fn update_package_json_object(
 
 /// Strip every socket-patch segment out of a single lifecycle script.
 ///
-/// Scripts are joined with `" && "` (that is exactly how
+/// Commands are chained with `&&` (that is exactly how
 /// [`generate_updated_script`] prepends the patch command), so splitting on
-/// the same separator and dropping any segment that is a socket-patch invocation
+/// that operator and dropping any segment that is a socket-patch invocation
 /// reverses the setup edit, whether the command was added to an empty script
 /// (`"<cmd>"`) or prepended to an existing one (`"<cmd> && build"`).
+///
+/// The split ignores the whitespace around `&&`: a hand-wired
+/// `"socket-patch apply&&npm run build"` is two commands, and treating it as
+/// one patch-containing segment would delete the user's `npm run build` along
+/// with the patch invocation. Survivors are re-joined with the canonical
+/// `" && "`, so a `&&` that was quoted rather than an operator comes back
+/// spaced — cosmetic, and only in scripts that also carry a patch command.
 ///
 /// Returns `(changed, new_value)`:
 /// - `(false, Some(original))` — no socket-patch segment found; leave as-is.
@@ -183,7 +192,7 @@ fn remove_socket_patch_from_script(script: &str) -> (bool, Option<String>) {
         return (false, None);
     }
 
-    let segments: Vec<&str> = trimmed.split(" && ").collect();
+    let segments: Vec<&str> = trimmed.split("&&").collect();
 
     // `changed` must reflect whether a *socket-patch* segment was removed — not
     // whether `kept` is merely shorter than `segments`. Filtering also drops
@@ -298,6 +307,43 @@ fn remove_package_json_object(package_json: &mut serde_json::Value) -> ScriptRem
     }
 }
 
+/// Re-serialize a package.json, keeping the indent unit the file already uses.
+///
+/// serde's `to_string_pretty` is hard-wired to 2 spaces, so a 4-space or
+/// tab-indented manifest came back reformatted top to bottom — turning a
+/// two-key edit into a whole-file diff. The vendor backends already respect the
+/// project's formatting when they rewrite package.json / lockfiles; reuse the
+/// same helpers so `setup` touches only the lines it means to.
+fn serialize_preserving_indent(value: &serde_json::Value, original: &str) -> String {
+    let indent = detect_indent(strip_bom(original));
+    match serialize_json(value, &indent) {
+        // Always valid UTF-8: serde_json emits escaped ASCII/UTF-8 only.
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        // Serializing a `Value` cannot fail; fall back to the 2-space form.
+        Err(_) => serde_json::to_string_pretty(value).unwrap_or_default() + "\n",
+    }
+}
+
+/// Reject a present-but-non-string lifecycle script value (`null` counts as
+/// absent, exactly like `"scripts": null`). Overwriting an array/object/number
+/// would silently discard whatever the user had there — the same reason a
+/// non-object `scripts` is refused rather than clobbered.
+fn check_script_values(package_json: &serde_json::Value) -> Result<(), String> {
+    let Some(scripts) = package_json.get("scripts").and_then(|s| s.as_object()) else {
+        return Ok(());
+    };
+    for key in ["postinstall", "dependencies"] {
+        if let Some(v) = scripts.get(key) {
+            if !v.is_null() && !v.is_string() {
+                return Err(format!(
+                    "Invalid package.json: \"scripts.{key}\" is not a string"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Parse package.json content and remove socket-patch lifecycle scripts.
 /// Returns `(modified, new_content, status)`.
 pub(crate) fn remove_package_json_content(
@@ -323,7 +369,7 @@ pub(crate) fn remove_package_json_content(
         return Ok((false, content.to_string(), status));
     }
 
-    let new_content = serde_json::to_string_pretty(&package_json).unwrap() + "\n";
+    let new_content = serialize_preserving_indent(&package_json, content);
     Ok((true, new_content, status))
 }
 
@@ -350,6 +396,7 @@ pub(crate) fn update_package_json_content(
             return Err("Invalid package.json: \"scripts\" is not a JSON object".to_string());
         }
     }
+    check_script_values(&package_json)?;
 
     let status = is_setup_configured(&package_json);
 
@@ -368,7 +415,7 @@ pub(crate) fn update_package_json_content(
     let old_dependencies = status.dependencies_script.clone();
 
     let (_, new_postinstall, new_dependencies) = update_package_json_object(&mut package_json, pm);
-    let new_content = serde_json::to_string_pretty(&package_json).unwrap() + "\n";
+    let new_content = serialize_preserving_indent(&package_json, content);
 
     Ok((
         true,
@@ -805,6 +852,28 @@ mod tests {
         assert_eq!(new.as_deref(), Some("build"));
     }
 
+    /// `&&` is a shell operator regardless of the whitespace around it, and
+    /// hand-wired scripts routinely omit the spaces. Splitting only on
+    /// `" && "` made `"socket-patch apply&&npm run build"` a single segment
+    /// that merely *contained* a patch pattern, so remove treated the whole
+    /// script as patch-only and deleted the key — silently taking the user's
+    /// `npm run build` with it.
+    #[test]
+    fn test_remove_script_ampersand_no_spaces_keeps_siblings() {
+        let (changed, new) = remove_socket_patch_from_script("socket-patch apply&&npm run build");
+        assert!(changed);
+        assert_eq!(new.as_deref(), Some("npm run build"));
+
+        let (changed, new) = remove_socket_patch_from_script("npm run build&& socket-patch apply");
+        assert!(changed);
+        assert_eq!(new.as_deref(), Some("npm run build"));
+
+        let (changed, new) =
+            remove_socket_patch_from_script("echo a &&socket-patch apply&& echo b && echo c");
+        assert!(changed);
+        assert_eq!(new.as_deref(), Some("echo a && echo b && echo c"));
+    }
+
     #[test]
     fn test_remove_script_pnpm_command() {
         // The pnpm canonical command must be recognized and stripped (it
@@ -927,6 +996,103 @@ mod tests {
     fn test_remove_content_non_object_scripts_errors() {
         let result = remove_package_json_content(r#"{"name":"x","scripts":"build"}"#);
         assert!(result.is_err());
+    }
+
+    /// End-to-end shape of the `&&`-without-spaces data loss: the user's
+    /// `npm run build` must survive `remove`, not be deleted along with the
+    /// patch command it was chained to.
+    #[test]
+    fn test_remove_content_ampersand_no_spaces_keeps_user_script() {
+        let content = r#"{"name":"x","scripts":{"postinstall":"npx @socketsecurity/socket-patch apply --silent --ecosystems npm&&npm run build"}}"#;
+        let (modified, new_content, status) = remove_package_json_content(content).unwrap();
+        assert!(modified);
+        assert_eq!(status.new_postinstall.as_deref(), Some("npm run build"));
+        let parsed: serde_json::Value = serde_json::from_str(&new_content).unwrap();
+        assert_eq!(
+            parsed["scripts"]["postinstall"], "npm run build",
+            "the user's command must survive:\n{new_content}"
+        );
+    }
+
+    /// A present-but-non-string lifecycle script is malformed. Overwriting it
+    /// silently discards the user's value; refuse it the same way a non-object
+    /// `scripts` is refused.
+    #[test]
+    fn test_update_content_non_string_script_errors() {
+        for body in [
+            r#"{"scripts":{"postinstall":["a","b"]}}"#,
+            r#"{"scripts":{"postinstall":42}}"#,
+            r#"{"scripts":{"dependencies":{"a":"b"}}}"#,
+            r#"{"scripts":{"dependencies":true}}"#,
+        ] {
+            let result = update_package_json_content(body, PackageManager::Npm);
+            assert!(result.is_err(), "expected error for {body}");
+            assert!(
+                result.as_ref().unwrap_err().contains("is not a string"),
+                "unexpected error for {body}: {:?}",
+                result.unwrap_err()
+            );
+        }
+    }
+
+    /// `null` stays benign: like `"scripts": null`, a null script value is
+    /// treated as absent and populated rather than rejected.
+    #[test]
+    fn test_update_content_null_script_is_populated() {
+        let content = r#"{"scripts":{"postinstall":null,"build":"tsc"}}"#;
+        let (modified, new_content, ..) =
+            update_package_json_content(content, PackageManager::Npm).unwrap();
+        assert!(modified);
+        let parsed: serde_json::Value = serde_json::from_str(&new_content).unwrap();
+        assert!(parsed["scripts"]["postinstall"]
+            .as_str()
+            .unwrap()
+            .contains("socket-patch apply"));
+        assert_eq!(parsed["scripts"]["build"], "tsc");
+    }
+
+    /// Rewriting the manifest must not reformat it: a 4-space or tab-indented
+    /// package.json re-serialized at serde's fixed 2-space indent turns a
+    /// two-line edit into a whole-file diff. The vendor backends already
+    /// respect the project's indent when they rewrite package.json
+    /// (`detect_indent` + `serialize_json`); `setup` must too.
+    #[test]
+    fn test_update_content_preserves_indent() {
+        for indent in ["    ", "\t"] {
+            let content = format!(
+                "{{\n{indent}\"name\": \"x\",\n{indent}\"scripts\": {{\n{indent}{indent}\"build\": \"tsc\"\n{indent}}}\n}}\n"
+            );
+            let (modified, new_content, ..) =
+                update_package_json_content(&content, PackageManager::Npm).unwrap();
+            assert!(modified);
+            assert!(
+                new_content.contains(&format!("\n{indent}\"name\": \"x\",")),
+                "indent {indent:?} not preserved at depth 1:\n{new_content}"
+            );
+            assert!(
+                new_content.contains(&format!("\n{indent}{indent}\"build\": \"tsc\",")),
+                "indent {indent:?} not preserved at depth 2:\n{new_content}"
+            );
+            // Still valid JSON with the scripts wired.
+            let parsed: serde_json::Value = serde_json::from_str(&new_content).unwrap();
+            assert!(parsed["scripts"]["postinstall"].is_string());
+            assert!(parsed["scripts"]["dependencies"].is_string());
+        }
+    }
+
+    #[test]
+    fn test_remove_content_preserves_indent() {
+        let content = "{\n    \"name\": \"x\",\n    \"scripts\": {\n        \"build\": \"tsc\",\n        \"postinstall\": \"npx @socketsecurity/socket-patch apply --silent --ecosystems npm\"\n    }\n}\n";
+        let (modified, new_content, _) = remove_package_json_content(content).unwrap();
+        assert!(modified);
+        assert!(
+            new_content.contains("\n    \"scripts\": {"),
+            "indent not preserved:\n{new_content}"
+        );
+        assert!(
+            new_content.contains("\n        \"build\": \"tsc\""),
+            "indent not preserved:\n{new_content}"
+        );
     }
 
     #[test]

@@ -322,6 +322,7 @@ fn simulate_rush_install(root: &Path, store: &Path) -> Output {
 
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial]
+#[ignore = "wall-bound real-rush/pnpm install (~70s); runs on all 3 OSes as an e2e CI matrix leg"]
 async fn rush_hosted_scan_then_simulated_pnpm_install_lands_patched_bytes() {
     if !has_corepack_pm("pnpm@9") {
         println!("SKIP e2e_redirect_rush_sim: `corepack pnpm@9` unavailable");
@@ -386,6 +387,7 @@ async fn rush_hosted_scan_then_simulated_pnpm_install_lands_patched_bytes() {
 /// integrity check.
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial]
+#[ignore = "wall-bound real-rush/pnpm install (~70s); runs on all 3 OSes as an e2e CI matrix leg"]
 async fn rush_hosted_tampered_tarball_fails_simulated_install() {
     if !has_corepack_pm("pnpm@9") {
         println!("SKIP e2e_redirect_rush_sim (tampered): `corepack pnpm@9` unavailable");
@@ -446,6 +448,7 @@ async fn rush_hosted_tampered_tarball_fails_simulated_install() {
 /// default; set `RUSH_E2E=1` to opt in.
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial]
+#[ignore = "wall-bound real-rush/pnpm install (~70s); runs on all 3 OSes as an e2e CI matrix leg (tier-2 RUSH_E2E=1 self-skip unchanged)"]
 async fn rush_hosted_real_rush_update_install() {
     if std::env::var("RUSH_E2E").as_deref() != Ok("1") {
         println!("SKIP e2e_redirect_rush_sim: set RUSH_E2E=1 to run the real-rush tier-2 leg");

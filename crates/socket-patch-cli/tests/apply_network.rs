@@ -875,3 +875,115 @@ async fn offline_apply_with_token_makes_zero_network_requests() {
          mock server saw: {hits:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Failed downloads must not condemn patches that already have a local source.
+// ---------------------------------------------------------------------------
+
+/// Write a `.socket/packages/<uuid>.tar.gz` carrying `entries`.
+fn write_package_archive(packages: &Path, uuid: &str, entries: &[(&str, &[u8])]) {
+    use std::io::Write as _;
+    std::fs::create_dir_all(packages).expect("create packages dir");
+    let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
+        std::fs::File::create(packages.join(format!("{uuid}.tar.gz"))).unwrap(),
+        flate2::Compression::default(),
+    ));
+    for (name, bytes) in entries {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(bytes.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder.append_data(&mut header, name, *bytes).unwrap();
+    }
+    builder
+        .into_inner()
+        .unwrap()
+        .finish()
+        .unwrap()
+        .flush()
+        .unwrap();
+}
+
+/// A cached `.socket/packages/<uuid>.tar.gz` is a complete source for the
+/// patch: the same tree applies fine under `--offline`. Going online must
+/// not make it FAIL — but the stage step used to bail whenever the
+/// (default) diff fetch and the blob fallback both reported failures,
+/// without checking whether any patch was actually left without a source.
+/// A server that serves no archives and no longer has the blob (GC'd,
+/// entitlement change, dead network) therefore turned a fully satisfiable
+/// apply into a whole-run abort.
+#[tokio::test]
+#[ignore = "RED: a transient fetch failure still aborts the whole run even when \
+            `.socket/packages/<uuid>.tar.gz` already satisfies the apply. The \
+            cache-fallback fix was not part of this change."]
+async fn apply_online_uses_cached_package_archive_when_downloads_fail() {
+    let before = b"pkgcache before\n";
+    let after = b"pkgcache after\n";
+    let before_hash = git_sha256(before);
+    let after_hash = git_sha256(after);
+    let uuid = "44444444-4444-4444-8444-444444444444";
+
+    // Nothing is served: diff, package and blob endpoints all 404 (wiremock
+    // default for unmounted routes), i.e. every download attempt fails.
+    let mock = MockServer::start().await;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_root_package_json(tmp.path());
+    write_npm_package(tmp.path(), "pkgcache", "1.0.0", "index.js", before);
+    let socket = tmp.path().join(".socket");
+    write_manifest_with_patch(
+        &socket,
+        "pkg:npm/pkgcache@1.0.0",
+        uuid,
+        &before_hash,
+        &after_hash,
+    );
+    // The only local source: a package archive holding the patched bytes
+    // (what `repair --download-mode package` leaves behind). No blobs.
+    write_package_archive(
+        &socket.join("packages"),
+        uuid,
+        &[("package/index.js", after)],
+    );
+
+    let (code, stdout, stderr) = run_apply(tmp.path(), &mock.uri(), &[]);
+    assert_eq!(
+        code, 0,
+        "a cached package archive is a usable source; failed downloads for \
+         artifacts we don't need must not abort the run; \
+         stdout={stdout}\nstderr={stderr}"
+    );
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert_eq!(
+        v["summary"]["applied"], 1,
+        "the patch must apply from the cached package archive; stdout={stdout}"
+    );
+    assert_eq!(v["summary"]["failed"], 0, "stdout={stdout}");
+
+    // The patched bytes came from the archive.
+    let content = std::fs::read(tmp.path().join("node_modules/pkgcache/index.js")).unwrap();
+    assert_eq!(content, after, "file must carry the patched content");
+
+    // Keep the test honest: the downloads really were attempted and really
+    // did fail (otherwise this would pass for the wrong reason).
+    let requests = mock.received_requests().await.unwrap_or_default();
+    let blob_path = format!("/v0/orgs/{ORG_SLUG}/patches/blob/{after_hash}");
+    assert!(
+        requests.iter().any(|r| r.url.path() == blob_path),
+        "the (404ing) blob fetch must have been attempted; got {:?}",
+        requests
+            .iter()
+            .map(|r| r.url.path().to_string())
+            .collect::<Vec<_>>()
+    );
+
+    // Apply stays read-only against the persistent cache.
+    let blobs_dir = socket.join("blobs");
+    if blobs_dir.exists() {
+        let entries: Vec<_> = std::fs::read_dir(&blobs_dir).unwrap().collect();
+        assert!(
+            entries.is_empty(),
+            "apply must not write to .socket/blobs/; found {entries:?}"
+        );
+    }
+}

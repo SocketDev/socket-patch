@@ -190,7 +190,21 @@ pub(super) fn detect_updates(
     };
     let mut updates = Vec::new();
     for pkg in packages {
-        let Some(existing) = manifest.patches.get(&pkg.purl) else {
+        // Manifest keys are written verbatim from the *patch* purl, which
+        // the API serves percent-encoded (`pkg:npm/%40scope/...`) and, for
+        // artifact-pinned ecosystems, qualified (`?artifact_id=...`); the
+        // batch *package* purl is the crawler's literal spelling. Bridge
+        // both divergences like the lockfile-only partition does: exact hit
+        // first, then a normalized qualifier-stripped comparison.
+        let existing = manifest.patches.get(&pkg.purl).or_else(|| {
+            let want = normalize_purl(strip_purl_qualifiers(&pkg.purl));
+            manifest
+                .patches
+                .iter()
+                .find(|(k, _)| normalize_purl(strip_purl_qualifiers(k)) == want)
+                .map(|(_, v)| v)
+        });
+        let Some(existing) = existing else {
             continue;
         };
         // The candidate is the top-ranked patch — the one the apply path

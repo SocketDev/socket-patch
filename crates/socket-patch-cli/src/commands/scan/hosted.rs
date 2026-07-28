@@ -25,6 +25,11 @@ const REDIRECT_CANDIDATE_FILES: &[&str] = &[
     "Cargo.toml",
     "Cargo.lock",
     ".cargo/config.toml",
+    // The LEGACY extensionless spelling: cargo reads `.cargo/config` in
+    // preference to `config.toml` when both exist, so the rewriter must see
+    // it (it wires the managed registry into whichever one is present) —
+    // otherwise the `[registries.…]` block lands in a file cargo ignores.
+    ".cargo/config",
     "composer.lock",
     "nuget.config",
     "packages.lock.json",
@@ -83,7 +88,12 @@ pub(super) async fn run_redirect(
     .await
     {
         Ok(s) => s,
-        Err(code) => return code,
+        // Hosted mode has no discovery envelope to fold the message into at
+        // this point (it builds its `redirect` result further down) and its
+        // other bail-outs — e.g. the reference resolve below — report on
+        // stderr the same way. `discover_selected` already printed the
+        // message; behavior here is unchanged.
+        Err((code, _message)) => return code,
     };
 
     let mut skipped: Vec<serde_json::Value> = Vec::new();
@@ -498,8 +508,14 @@ pub(super) async fn run_redirect(
                 confirmed.len(),
                 rewritten.len()
             );
+            // Human output prints the bare strings — `Value`'s `Display`
+            // would JSON-quote them (`skipped "pkg:npm/x" ("forbidden")`).
             for s in &skipped {
-                eprintln!("  skipped {} ({})", s["purl"], s["reason"]);
+                eprintln!(
+                    "  skipped {} ({})",
+                    s["purl"].as_str().unwrap_or_default(),
+                    s["reason"].as_str().unwrap_or_default()
+                );
             }
             // Same warning set as the JSON envelope, same order: the
             // rewriter's own warnings first (e.g. `no package-lock.json`),
@@ -508,13 +524,13 @@ pub(super) async fn run_redirect(
                 eprintln!("  warning: {}", w.detail);
             }
             for w in &record_warnings {
-                eprintln!("  warning: {}", w["detail"]);
+                eprintln!("  warning: {}", w["detail"].as_str().unwrap_or_default());
             }
             for w in &migration_warnings {
-                eprintln!("  warning: {}", w["detail"]);
+                eprintln!("  warning: {}", w["detail"].as_str().unwrap_or_default());
             }
             for w in &rush_warnings {
-                eprintln!("  warning: {}", w["detail"]);
+                eprintln!("  warning: {}", w["detail"].as_str().unwrap_or_default());
             }
             if let Some(statements) = vex_statements {
                 eprintln!(

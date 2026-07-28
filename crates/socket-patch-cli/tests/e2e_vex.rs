@@ -631,6 +631,123 @@ fn auto_detect_uses_package_json() {
 }
 
 // ──────────────────────────────────────────────────────────────────────
+// empty overrides mean "unset"
+//
+// `--product ""` / `--doc-id ""` is what `--product "$PRODUCT"` collapses
+// to when the variable is unset — the everyday CI shape. The env twins
+// (`SOCKET_VEX_PRODUCT=` / `SOCKET_VEX_DOC_ID=`) already mean "unset":
+// `scrub_empty_env_vars` drops exactly-empty flag vars before clap runs.
+// The flags must agree, because the failure is SILENT: `Product::id` is
+// `skip_serializing_if = "String::is_empty"`, so a blank product emits a
+// product object with no identifier at all, and a blank doc id emits
+// `"@id": ""` — both spec-invalid documents, written with exit 0.
+// ──────────────────────────────────────────────────────────────────────
+
+/// Fixture for the two tests below: a package.json for product auto-detect
+/// plus a one-patch manifest. Returns the PURL auto-detect must produce.
+fn scaffold_autodetect_project(cwd: &Path) -> &'static str {
+    std::fs::write(
+        cwd.join("package.json"),
+        r#"{"name":"my-app","version":"7.7.7"}"#,
+    )
+    .unwrap();
+
+    let mut manifest = PatchManifest::new();
+    manifest.patches.insert(
+        "pkg:npm/x@1.0.0".to_string(),
+        make_record(
+            "11111111-1111-4111-8111-111111111111",
+            "package/index.js",
+            "a".repeat(64).as_str(),
+            "b".repeat(64).as_str(),
+            "GHSA-empty-override",
+            &["CVE-EMPTY"],
+        ),
+    );
+    write_manifest(cwd, &manifest);
+    "pkg:npm/my-app@7.7.7"
+}
+
+#[test]
+fn empty_product_flag_falls_back_to_auto_detect() {
+    // Whitespace-only is the same class: `--product " "` would serialize a
+    // blank-but-present `@id`, equally unusable downstream.
+    for blank in ["", "   "] {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path();
+        let detected = scaffold_autodetect_project(cwd);
+
+        let out = cli()
+            .args([
+                "vex",
+                "--cwd",
+                cwd.to_str().unwrap(),
+                "--no-verify",
+                "--product",
+                blank,
+            ])
+            .output()
+            .expect("invoke vex");
+        assert!(
+            out.status.success(),
+            "--product {blank:?} must fall back to auto-detect, not fail. stderr:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let doc: Value = serde_json::from_slice(&out.stdout).expect("VEX JSON on stdout");
+        let product = &doc["statements"][0]["products"][0]["@id"];
+        assert!(
+            product.is_string(),
+            "--product {blank:?} must not emit a product with no identifier \
+             (an unidentifiable `not_affected` claim): {doc}"
+        );
+        assert_eq!(
+            product, detected,
+            "--product {blank:?} must mean \"unset\" and defer to auto-detect, \
+             matching the scrubbed SOCKET_VEX_PRODUCT= twin: {doc}"
+        );
+    }
+}
+
+#[test]
+fn empty_doc_id_flag_falls_back_to_generated_uuid() {
+    for blank in ["", "   "] {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path();
+        scaffold_autodetect_project(cwd);
+
+        let out = cli()
+            .args([
+                "vex",
+                "--cwd",
+                cwd.to_str().unwrap(),
+                "--no-verify",
+                "--product",
+                "pkg:npm/app@1.0.0",
+                "--doc-id",
+                blank,
+            ])
+            .output()
+            .expect("invoke vex");
+        assert!(
+            out.status.success(),
+            "--doc-id {blank:?} must fall back to a generated id, not fail. stderr:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let doc: Value = serde_json::from_slice(&out.stdout).expect("VEX JSON on stdout");
+        let id = doc["@id"]
+            .as_str()
+            .expect("document @id is a required field");
+        assert!(
+            id.starts_with("urn:uuid:") && id.len() > "urn:uuid:".len(),
+            "--doc-id {blank:?} must mean \"unset\" and generate a random urn:uuid, \
+             matching the scrubbed SOCKET_VEX_DOC_ID= twin; got {id:?}"
+        );
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
 // verify-mode tests — lay down patched files on disk and exercise the
 // hash-check pipeline. We bypass ecosystem-crawler resolution by writing
 // the manifest with PURLs whose npm package layout we control, then

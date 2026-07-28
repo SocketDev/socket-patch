@@ -271,6 +271,15 @@ pub(super) fn print_gc_vendored_line(gc: &GcSummary) {
 /// crawler purls carry the literal `@scope` — comparing the raw strings
 /// would make every encoded scoped entry look prunable and `--prune`/
 /// `--sync` would GC the very patch it just downloaded.
+///
+/// Entries the crawl never even looked for are exempt too
+/// (`crawl_covers_purl`): the runtime-gated maven/nuget crawlers with their
+/// gate off, and any `pkg:<type>/` this build has no crawler for. The
+/// manifest is a committed, shared file, so a newer CLI's ecosystem can
+/// legitimately appear in it — "absent from the crawl" then says nothing
+/// about whether the package is installed, and pruning would silently
+/// delete a teammate's patch (plus its blobs). Same fail-safe reasoning as
+/// capturing `scanned_purls` before the `--ecosystems` filter.
 fn detect_prunable(
     manifest: &PatchManifest,
     scanned_purls: &HashSet<String>,
@@ -288,6 +297,7 @@ fn detect_prunable(
             !scanned_bases.contains(base.as_ref())
                 && !vendored.contains(p.as_str())
                 && !vendored.contains(strip_purl_qualifiers(p))
+                && crate::ecosystem_dispatch::crawl_covers_purl(p.as_str())
         })
         .cloned()
         .collect()
@@ -422,6 +432,64 @@ mod tests {
         // A genuinely-gone encoded entry still prunes.
         let out = detect_prunable(&m, &scanned(&[]), &no_vendored());
         assert_eq!(out, vec!["pkg:npm/%40scope/x@1.0.0".to_string()]);
+    }
+
+    #[test]
+    fn detect_prunable_keeps_entries_of_uncrawled_ecosystems() {
+        // A manifest key whose `pkg:<type>/` this build has no crawler for
+        // (a newer CLI's ecosystem in a COMMITTED manifest, read by an older
+        // binary) is never looked for by the crawl, so its absence from
+        // `scanned_purls` says nothing about whether it is installed.
+        // Pruning it silently deletes a teammate's patch (plus its blobs)
+        // from the shared manifest.
+        let m = manifest_with(&[
+            ("pkg:hex/plug@1.14.0", "uuid-a"),
+            ("pkg:npm/gone@1.0.0", "uuid-b"),
+        ]);
+        let out = detect_prunable(&m, &scanned(&[]), &no_vendored());
+        assert_eq!(
+            out,
+            vec!["pkg:npm/gone@1.0.0".to_string()],
+            "only the crawled-ecosystem orphan may prune; got {out:?}"
+        );
+    }
+
+    #[test]
+    fn detect_prunable_keeps_runtime_gated_ecosystem_entries() {
+        // Maven/NuGet crawlers only run under their experimental opt-in
+        // env gates, so with the gate OFF their packages are invisible to
+        // the crawl — "absent" must not mean "uninstalled". (An ambient
+        // opt-in makes them genuinely crawled, which is a different
+        // scenario; skip rather than mutate the shared process env.)
+        let m = manifest_with(&[
+            ("pkg:maven/com.example/lib@1.0.0", "uuid-a"),
+            ("pkg:nuget/Some.Package@1.0.0", "uuid-b"),
+            ("pkg:npm/gone@1.0.0", "uuid-c"),
+        ]);
+        // Mirror `ecosystem_dispatch::env_truthy` exactly — the gate opens
+        // only on `1`/`true` (any case), so a merely-PRESENT but falsy
+        // `SOCKET_EXPERIMENTAL_MAVEN=0` leaves the ecosystem uncrawled and
+        // therefore exempt. Testing presence instead of truthiness made this
+        // expectation disagree with the code under test and fail spuriously.
+        let gate_open = |name: &str| {
+            std::env::var(name)
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false)
+        };
+        let mut expected = vec!["pkg:npm/gone@1.0.0".to_string()];
+        if gate_open("SOCKET_EXPERIMENTAL_MAVEN") {
+            expected.push("pkg:maven/com.example/lib@1.0.0".to_string());
+        }
+        if gate_open("SOCKET_EXPERIMENTAL_NUGET") {
+            expected.push("pkg:nuget/Some.Package@1.0.0".to_string());
+        }
+        expected.sort();
+        let mut out = detect_prunable(&m, &scanned(&[]), &no_vendored());
+        out.sort();
+        assert_eq!(
+            out, expected,
+            "a runtime-gated ecosystem that was never crawled must not prune"
+        );
     }
 
     #[test]

@@ -604,6 +604,46 @@ mod tests {
         assert!(is_hook_present(&fs::read_to_string(&cj).await.unwrap()));
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "RED: `edit()` uses the plain `atomic_write_bytes`, so the stage \
+                inode is created with umask defaults and the rename resets the \
+                user's composer.json mode (0o744 -> 0o644). Every sibling manifest \
+                editor uses `atomic_write_bytes_preserving_mode`; switching this \
+                call over is the one-line fix, which was not part of this change."]
+    async fn test_edit_preserves_manifest_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        // Regression: `composer.json` is a file the *user* owns and we merely
+        // edit, so the stage+rename must carry the destination's mode onto the
+        // new inode. The plain writer creates the stage with umask defaults, so
+        // the rename silently reset the user's mode — a 0600 private manifest
+        // becomes world-readable, a 0664 group-writable one locks the group
+        // out. Same contract as the npm sibling (`package_json::update`).
+        //
+        // The owner-exec bit is the umask-proof oracle: no umask can *add* a
+        // bit, so 0o744 can never come from a 0o666-based create.
+        let dir = tempfile::tempdir().unwrap();
+        let cj = dir.path().join("composer.json");
+        fs::write(&cj, BASIC).await.unwrap();
+        std::fs::set_permissions(&cj, std::fs::Permissions::from_mode(0o744)).unwrap();
+        let found = discover_composer_project(dir.path()).await.unwrap();
+
+        let added = add_hook(&found, false).await;
+        assert_eq!(
+            added.status,
+            ComposerSetupStatus::Updated,
+            "{:?}",
+            added.error
+        );
+        let mode = std::fs::metadata(&cj).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o744, "add must not reset the manifest's mode");
+
+        let removed = remove_hook(&found, false).await;
+        assert_eq!(removed.status, ComposerSetupStatus::Updated);
+        let mode = std::fs::metadata(&cj).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o744, "remove must not reset the manifest's mode");
+    }
+
     #[tokio::test]
     async fn test_edit_leaves_no_stage_litter() {
         let dir = tempfile::tempdir().unwrap();

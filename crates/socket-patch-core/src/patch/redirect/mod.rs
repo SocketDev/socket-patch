@@ -393,7 +393,18 @@ fn rewrite_cargo(
     }
     let mut cargo_toml = files.get("Cargo.toml").cloned();
     let mut cargo_lock = files.get("Cargo.lock").cloned();
-    let mut cargo_config = files.get(".cargo/config.toml").cloned().unwrap_or_default();
+    // Cargo reads the LEGACY extensionless `.cargo/config` in preference to
+    // `config.toml` when both exist (it warns about the duplicate), so a
+    // managed `[registries.…]` block written to `config.toml` there is
+    // silently inert and the `registry = "socket-patch-…"` this rewriter puts
+    // in Cargo.toml then names an undefined registry. Same preference
+    // `vendor::cargo_config::config_path` applies on the vendor path.
+    let cargo_config_key = if files.contains_key(".cargo/config") {
+        ".cargo/config"
+    } else {
+        ".cargo/config.toml"
+    };
+    let mut cargo_config = files.get(cargo_config_key).cloned().unwrap_or_default();
     let (mut toml_changed, mut lock_changed, mut config_changed) = (false, false, false);
 
     for dep in &cargo {
@@ -434,7 +445,7 @@ fn rewrite_cargo(
             cargo_config = format!("{cargo_config}{sep}{prefix}{block}");
             config_changed = true;
             result.edits.push(FileEdit {
-                path: ".cargo/config.toml".into(),
+                path: cargo_config_key.into(),
                 kind: "redirect_cargo_registry".into(),
                 action: "added".into(),
                 key: Some(reg.clone()),
@@ -494,9 +505,7 @@ fn rewrite_cargo(
         }
     }
     if config_changed {
-        result
-            .files
-            .insert(".cargo/config.toml".into(), cargo_config);
+        result.files.insert(cargo_config_key.into(), cargo_config);
     }
 }
 
@@ -3461,6 +3470,75 @@ mod tests {
             "re-run over redirected output must not warn: {:?}",
             second.warnings
         );
+    }
+
+    /// A project carrying the LEGACY extensionless `.cargo/config` must have
+    /// the managed `[registries.socket-patch-…]` block written into THAT file.
+    /// When both spellings exist cargo reads `config` (and warns), so a block
+    /// parked in `config.toml` is silently inert: the `registry =
+    /// "socket-patch-…"` the rewriter puts in Cargo.toml then names an
+    /// undefined registry and the build breaks — while the run still reports
+    /// the dep redirected (the index URL "landed in a file") and attests it.
+    /// Same invariant the vendor path enforces in `vendor::cargo_config`.
+    #[test]
+    fn cargo_legacy_config_is_the_file_edited() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "Cargo.toml".to_string(),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1.0.190\"\n"
+                .to_string(),
+        );
+        files.insert(
+            "Cargo.lock".to_string(),
+            "version = 3\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.190\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"91f70896d6720bc714a4a57d22fc91f1db634680e65c8efe13323f1fa38d53f5\"\n"
+                .to_string(),
+        );
+        files.insert(
+            ".cargo/config".to_string(),
+            "[net]\nretry = 3\n".to_string(),
+        );
+
+        let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+        let written = r.files.get(".cargo/config").unwrap_or_else(|| {
+            panic!(
+                "the legacy `.cargo/config` is the file cargo reads; got {:?}",
+                r.files.keys().collect::<Vec<_>>()
+            )
+        });
+        assert!(
+            written.contains("[registries.socket-patch-uuid]"),
+            "registry definition must land in the legacy config: {written}"
+        );
+        assert!(
+            written.contains("retry = 3"),
+            "the user's existing config must be preserved, not clobbered: {written}"
+        );
+        assert!(
+            !r.files.contains_key(".cargo/config.toml"),
+            "no shadowed config.toml may be created alongside the legacy config: {:?}",
+            r.files.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            r.edits
+                .iter()
+                .any(|e| e.path == ".cargo/config" && e.kind == "redirect_cargo_registry"),
+            "the recorded edit must name the file actually written (revert target): {:?}",
+            r.edits.iter().map(|e| &e.path).collect::<Vec<_>>()
+        );
+    }
+
+    /// The default (no legacy file) shape is unchanged: `.cargo/config.toml`.
+    #[test]
+    fn cargo_config_toml_is_the_default_target() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "Cargo.toml".to_string(),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1.0.190\"\n"
+                .to_string(),
+        );
+        let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+        assert!(r.files.contains_key(".cargo/config.toml"));
+        assert!(!r.files.contains_key(".cargo/config"));
     }
 
     fn gem_override(name: &str, version: &str) -> DepOverride {

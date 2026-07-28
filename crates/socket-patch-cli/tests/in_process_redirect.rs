@@ -1382,6 +1382,91 @@ async fn redirect_human_mode_prints_rewriter_warnings() {
     );
 }
 
+/// Human-mode `skipped` lines and the record/migration/rush warnings are built
+/// as `serde_json::Value`s and were printed with `{}` — `Display` for `Value`
+/// emits JSON, so every one of them reached the terminal wrapped in literal
+/// double quotes (`skipped "pkg:npm/x@1.0.0" ("forbidden")`, `warning: "…"`),
+/// unlike the adjacent `rewrite.warnings` line which prints the bare `String`.
+/// Both legs run as subprocesses so stderr can be read back.
+#[tokio::test]
+#[serial]
+async fn redirect_human_mode_warnings_are_not_json_quoted() {
+    // Leg 1 — a DENIED reference produces a `skipped` line.
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/package")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "results": { UUID: { "status": "forbidden", "url": null, "purl": PURL, "artifacts": [], "registryOverride": null } }
+        })))
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_project(tmp.path());
+    let out = scrubbed_cli()
+        .args([
+            "scan",
+            "--redirect",
+            "--yes",
+            "--cwd",
+            tmp.path().to_str().unwrap(),
+            "--api-url",
+            &server.uri(),
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+        ])
+        .output()
+        .expect("run socket-patch");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(&format!("skipped {PURL} (forbidden)")),
+        "the skipped line must print the bare purl/reason, not JSON-quoted \
+         values; stderr=\n{stderr}"
+    );
+
+    // Leg 2 — a GRANTED reference whose patch record cannot be fetched (no
+    // `view/{uuid}` mock → 404) produces a `record_fetch_failed` warning.
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_project(tmp.path());
+    let out = scrubbed_cli()
+        .args([
+            "scan",
+            "--redirect",
+            "--yes",
+            "--cwd",
+            tmp.path().to_str().unwrap(),
+            "--api-url",
+            &server.uri(),
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+        ])
+        .output()
+        .expect("run socket-patch");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stdout.contains("Redirected 1 package(s)"),
+        "anchor: the dep must have been redirected so the record fetch runs; \
+         stdout=\n{stdout}\nstderr=\n{stderr}"
+    );
+    assert!(
+        stderr.contains(&format!(
+            "warning: {PURL} redirected, but its patch record could not be fetched"
+        )),
+        "the record-fetch warning must print the bare detail string, not a \
+         JSON-quoted one; stderr=\n{stderr}"
+    );
+}
+
 /// The `redirect_rush_repo_state_stale` warning fires exactly when a Rush lock
 /// was rewritten AND common/config/rush/repo-state.json is present (the file
 /// that carries pnpmShrinkwrapHash, which an out-of-band lock edit desyncs).
@@ -1491,5 +1576,133 @@ async fn rush_stale_warning_requires_an_actual_lock_edit() {
     assert_eq!(
         lock_before, lock_after,
         "the unrelated lock must be untouched"
+    );
+}
+
+/// Cargo's hosted redirect wires the managed sparse registry into
+/// `.cargo/config.toml` — but a project carrying the LEGACY extensionless
+/// `.cargo/config` is one cargo READS INSTEAD (it warns about the duplicate
+/// and ignores `config.toml`). The redirect never even read that spelling, so
+/// the `[registries.socket-patch-<uuid>]` definition landed in an ignored file
+/// while `Cargo.toml` gained `registry = "socket-patch-<uuid>"` naming it:
+/// cargo then fails with "no index found for registry", and the run still
+/// reported the dep redirected (its index URL "landed in a file") and attested
+/// it to VEX. Same invariant `vendor::cargo_config::config_path` already
+/// enforces on the vendor path.
+#[tokio::test]
+#[serial]
+async fn cargo_redirect_writes_the_legacy_dot_cargo_config() {
+    const CARGO_PURL: &str = "pkg:cargo/serde@1.0.190";
+    const CARGO_UUID: &str = "55555555-5555-4555-8555-555555555555";
+    const CKSUM: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+    let index_url = "sparse+http://patch.test/cargo/idx/";
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/batch")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "packages": [{
+                "purl": CARGO_PURL,
+                "patches": [{
+                    "uuid": CARGO_UUID, "purl": CARGO_PURL, "tier": "free",
+                    "cveIds": [], "ghsaIds": [], "severity": "high",
+                    "title": "cargo legacy-config fixture"
+                }]
+            }],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex(format!(
+            "^/v0/orgs/{ORG}/patches/by-package/.+$"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "patches": [{
+                "uuid": CARGO_UUID, "purl": CARGO_PURL,
+                "publishedAt": "2024-01-01T00:00:00Z",
+                "description": "x", "license": "MIT", "tier": "free",
+                "vulnerabilities": {}
+            }],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/package")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "results": {
+                CARGO_UUID: {
+                    "status": "granted",
+                    "url": "http://patch.test/serde-1.0.190.crate",
+                    "purl": CARGO_PURL,
+                    "artifacts": [{
+                        "kind": "tarball",
+                        "url": "http://patch.test/serde-1.0.190.crate",
+                        "integrity": { "sha256": CKSUM }
+                    }],
+                    "registryOverride": {
+                        "kind": "cargo-sparse",
+                        "indexUrl": index_url,
+                        "identifiers": {
+                            "name": "serde",
+                            "version": "1.0.190",
+                            "cargoCksumSha256": CKSUM,
+                        }
+                    }
+                }
+            }
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/view/{CARGO_UUID}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "uuid": CARGO_UUID,
+            "purl": CARGO_PURL,
+            "publishedAt": "2024-01-01T00:00:00Z",
+            "files": {},
+            "vulnerabilities": {},
+            "description": "x", "license": "MIT", "tier": "free"
+        })))
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("Cargo.toml"),
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1.0.190\"\n",
+    )
+    .unwrap();
+    // Lockfile-only discovery: the Cargo.lock inventory supplies the purl.
+    std::fs::write(
+        tmp.path().join("Cargo.lock"),
+        "version = 3\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.190\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"91f70896d6720bc714a4a57d22fc91f1db634680e65c8efe13323f1fa38d53f5\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(tmp.path().join(".cargo")).unwrap();
+    std::fs::write(tmp.path().join(".cargo/config"), "[net]\nretry = 3\n").unwrap();
+
+    let code = run(redirect_args(tmp.path(), server.uri())).await;
+    assert_eq!(code, 0, "scan --redirect should succeed");
+
+    let legacy = std::fs::read_to_string(tmp.path().join(".cargo/config")).unwrap();
+    assert!(
+        legacy.contains(&format!("[registries.socket-patch-{CARGO_UUID}]")),
+        "the registry definition must land in the legacy `.cargo/config` — the \
+         file cargo actually reads; got:\n{legacy}"
+    );
+    assert!(
+        legacy.contains("retry = 3"),
+        "the user's existing config must be preserved: {legacy}"
+    );
+    assert!(
+        !tmp.path().join(".cargo/config.toml").exists(),
+        "no shadowed `.cargo/config.toml` may be created beside the legacy file"
+    );
+    let manifest = std::fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+    assert!(
+        manifest.contains(&format!("registry = \"socket-patch-{CARGO_UUID}\"")),
+        "anchor: the Cargo.toml dep must name the managed registry: {manifest}"
     );
 }

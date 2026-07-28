@@ -23,7 +23,9 @@ use crate::commands::vendor::{
 use crate::json_envelope::{Command as EnvelopeCommand, Envelope};
 
 use super::gc::{gc_json, print_gc_vendored_line, run_apply_gc};
-use super::{discover_selected, download_params, embed_vex_into_json, ScanArgs};
+use super::{
+    discover_selected, download_params, embed_vex_into_json, emit_discovery_error_json, ScanArgs,
+};
 
 /// Dry-run preview for `scan --vendor`: classify each selected patch
 /// against the vendor ledger without touching disk or the network beyond
@@ -175,7 +177,10 @@ async fn run_vendor_json_path(
     .await
     {
         Ok(s) => s,
-        Err(code) => return code,
+        Err((code, message)) => {
+            emit_discovery_error_json(result, &message);
+            return code;
+        }
     };
 
     if args.common.dry_run {

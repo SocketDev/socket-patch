@@ -411,6 +411,7 @@ fn fresh_checkout_npm_ci(fx: &RedirectFixture) -> (PathBuf, Output) {
 // multi_thread: the CLI/npm subprocesses block a worker thread while wiremock
 // keeps serving the API + tarball routes on the others.
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "wall-bound real-npm install (~150s); runs on all 3 OSes as an e2e CI matrix leg"]
 async fn npm_redirect_fresh_checkout_npm_ci_installs_patched_bytes_and_vex_verifies() {
     let Some(fx) = redirect_scanned_project("main", false).await else {
         return;
@@ -478,6 +479,7 @@ async fn npm_redirect_fresh_checkout_npm_ci_installs_patched_bytes_and_vex_verif
 /// install. This is what makes the redirect safe to commit: a compromised or
 /// swapped hosted artifact cannot slip past the pin.
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "wall-bound real-npm install (~150s); runs on all 3 OSes as an e2e CI matrix leg"]
 async fn npm_redirect_tampered_hosted_tarball_fails_fresh_npm_ci() {
     let Some(fx) = redirect_scanned_project("tampered", true).await else {
         return;

@@ -474,7 +474,7 @@ pub(crate) fn variant_matches_installed(first_file_status: Option<&VerifyStatus>
 /// files) means nothing can disqualify the variant. Mirrors the
 /// representative pick in core's
 /// [`select_installed_variants`](socket_patch_core::patch::apply::select_installed_variants).
-fn representative_file(
+pub(crate) fn representative_file(
     files: &HashMap<String, PatchFileInfo>,
 ) -> Option<(&String, &PatchFileInfo)> {
     files

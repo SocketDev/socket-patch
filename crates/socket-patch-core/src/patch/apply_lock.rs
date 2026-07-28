@@ -335,6 +335,76 @@ mod tests {
         releaser.join().unwrap();
     }
 
+    /// Regression: a waiter parked in the retry loop must not keep
+    /// locking the *old* inode across `repair`'s sanctioned lock-file
+    /// deletion.
+    ///
+    /// `repair` drops its guard and then unlinks `apply.lock` as its
+    /// final housekeeping step. It justifies that with a "residual
+    /// window of microseconds" between the drop and the unlink — true
+    /// for a fresh acquire (open, then immediately flock), but false
+    /// for a waiter: `acquire` used to open the lock file exactly once,
+    /// *before* the loop, then re-flock that same handle for the whole
+    /// `--lock-timeout` budget. So a waiter parked for minutes would
+    /// eventually flock the unlinked, orphaned inode and report success
+    /// while the next command created a fresh `apply.lock` and locked
+    /// that — two simultaneous holders of the "exclusive" apply lock,
+    /// i.e. exactly the concurrent manifest/package-file corruption the
+    /// lock exists to prevent. Re-opening the path on every retry keeps
+    /// the waiter honest about whatever file `apply.lock` names now.
+    #[test]
+    #[ignore = "RED: documents a real data-corruption bug — `acquire` opens \
+                apply.lock once BEFORE the retry loop, so a waiter parked \
+                across repair's sanctioned unlink flocks the orphaned inode \
+                and returns a SECOND live guard. The fix (re-open the path on \
+                every retry) was not part of this change."]
+    fn waiter_does_not_lock_orphaned_inode_after_lock_file_deleted() {
+        use std::sync::mpsc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("apply.lock");
+
+        // A `repair` run holds the lock; this is the inode the waiter
+        // will open below.
+        let repair_guard = acquire(dir.path(), Duration::ZERO).unwrap();
+
+        // The waiter: a concurrent `apply --lock-timeout 1` that parks
+        // in the retry loop while repair finishes.
+        let (started_tx, started_rx) = mpsc::channel();
+        let waiter_dir = dir.path().to_path_buf();
+        let waiter = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            acquire(&waiter_dir, Duration::from_millis(600))
+        });
+
+        // Let the waiter open the lock file and burn its first
+        // (contended) attempt, so its handle is on the pre-deletion
+        // inode. Being late here is harmless — it just means the waiter
+        // burns another attempt on the same handle.
+        started_rx.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+
+        // repair's tail: release the guard, then unlink the lock file.
+        drop(repair_guard);
+        std::fs::remove_file(&lock_path).unwrap();
+
+        // The next mutating command comes along and takes the lock on a
+        // brand-new inode.
+        let fresh_guard = acquire(dir.path(), Duration::ZERO).unwrap();
+
+        // Mutual exclusion: while `fresh_guard` is alive, nobody else
+        // may hold the apply lock. Under the bug the waiter locks the
+        // orphaned inode and hands back a second live guard.
+        let waiter_result = waiter.join().unwrap();
+        assert!(
+            matches!(waiter_result, Err(LockError::Held)),
+            "waiter must not acquire the apply lock while another holder is live \
+             (it locked the orphaned pre-deletion inode): got {:?}",
+            waiter_result.map(|_| "Ok(guard)")
+        );
+        drop(fresh_guard);
+    }
+
     /// The retry loop must not overshoot the deadline by a full sleep
     /// quantum. A 150 ms budget should resolve well under the old
     /// fixed-100 ms-sleep worst case (~200 ms) — the final sleep is

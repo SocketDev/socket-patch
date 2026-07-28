@@ -156,9 +156,9 @@ fn extract_zip_member(archive: &[u8], member: &str) -> Result<Vec<u8>, UpdateErr
     let cursor = std::io::Cursor::new(archive);
     let mut zip = zip::ZipArchive::new(cursor)
         .map_err(|e| UpdateError::VerifyFailed(format!("unreadable zip archive: {e}")))?;
-    let file = zip
-        .by_name(member)
-        .map_err(|_| UpdateError::VerifyFailed(format!("archive does not contain a {member} entry")))?;
+    let file = zip.by_name(member).map_err(|_| {
+        UpdateError::VerifyFailed(format!("archive does not contain a {member} entry"))
+    })?;
     if file.size() > MAX_BINARY_BYTES {
         return Err(UpdateError::VerifyFailed(format!(
             "{member} exceeds the {MAX_BINARY_BYTES}-byte cap"
@@ -199,9 +199,7 @@ fn stage_binary(dest_dir: &Path, bytes: &[u8]) -> Result<PathBuf, UpdateError> {
         }
     })?;
     use std::io::Write;
-    let write_result = file
-        .write_all(bytes)
-        .and_then(|()| file.sync_all());
+    let write_result = file.write_all(bytes).and_then(|()| file.sync_all());
     drop(file);
     if let Err(e) = write_result {
         let _ = std::fs::remove_file(&stage);
@@ -320,9 +318,7 @@ async fn sanity_exec(
     if version_ok {
         return Ok(None);
     }
-    let detail = format!(
-        "downloaded binary reports {reported:?} instead of version {expected}"
-    );
+    let detail = format!("downloaded binary reports {reported:?} instead of version {expected}");
     if strict {
         Err(UpdateError::VerifyFailed(detail))
     } else {
@@ -605,7 +601,10 @@ mod tests {
         std::fs::write(&path, "#!/bin/sh\necho socket-patch 9.9.9\n").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        let held = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        let held = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
         let dropper = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(150));
             drop(held);

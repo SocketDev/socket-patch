@@ -289,6 +289,120 @@ async fn scan_vendor_manifest_mode_end_to_end() {
     );
 }
 
+/// A batch endpoint that reports NO available patches for the installed
+/// set — the shape a withdrawn patch (or a free account against a
+/// paid-only catalog) produces. The by-package / view endpoints are
+/// deliberately unmounted: nothing may reach them.
+async fn mount_empty_discovery(mock: &MockServer) {
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/batch")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "packages": [],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(mock)
+        .await;
+}
+
+/// Seed a committed `.socket/manifest.json` plus its afterHash blob — the
+/// state a repo has after `scan --vendor` was run and `.socket/vendor/`
+/// was later wiped (or never committed). The blob lets the vendor engine
+/// stage sources with no download phase and no network.
+fn seed_committed_manifest(root: &Path) {
+    let socket = root.join(".socket");
+    std::fs::create_dir_all(socket.join("blobs")).unwrap();
+    std::fs::write(socket.join("blobs").join(git_sha256(AFTER)), AFTER).unwrap();
+    let manifest = serde_json::json!({
+        "patches": {
+            PURL: {
+                "uuid": UUID,
+                "exportedAt": "2026-01-01T00:00:00Z",
+                "files": {
+                    "package/index.js": {
+                        "beforeHash": git_sha256(BEFORE),
+                        "afterHash": git_sha256(AFTER),
+                    }
+                },
+                "vulnerabilities": {},
+                "description": "Vendor patch",
+                "license": "MIT",
+                "tier": "free",
+            }
+        }
+    });
+    std::fs::write(
+        socket.join("manifest.json"),
+        serde_json::to_string_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+}
+
+/// CONTRACT (CLI_CONTRACT.md, `scan --vendor`): "The whole manifest is
+/// vendored" — and `run_vendor_json_path` says so in code ("the vendor
+/// step still runs when zero patches were downloaded (re-vendor after a
+/// wipe)"). `scan/mod.rs`'s `selected.is_empty() && !vendor` guard encodes
+/// the same intent for the interactive arm.
+///
+/// But the interactive arm never reaches that guard on an empty discovery:
+/// the earlier `all_packages_with_patches.is_empty()` /
+/// `downloadable_count == 0` / `all_search_results.is_empty()` returns fire
+/// first and exit before the vendor dispatch. Same fixture, same mock, only
+/// `--json` differing must not decide whether the vendor tree gets rebuilt.
+#[tokio::test]
+async fn scan_vendor_rebuilds_committed_manifest_when_discovery_is_empty() {
+    let mock = MockServer::start().await;
+    mount_empty_discovery(&mock).await;
+    let uri = mock.uri();
+
+    // --- JSON arm (the documented behavior) ---
+    let json_tmp = tempfile::tempdir().unwrap();
+    write_fixture(json_tmp.path());
+    seed_committed_manifest(json_tmp.path());
+    let (json_code, json_out, json_err) = run_scan_vendor(json_tmp.path(), &uri, &[]);
+    let json_tgz = json_tmp
+        .path()
+        .join(format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz"));
+    assert_eq!(json_code, 0, "stdout={json_out}; stderr={json_err}");
+    assert!(
+        json_tgz.is_file(),
+        "baseline: scan --json --vendor must re-vendor the committed manifest \
+         even when discovery returns no patches; stdout={json_out}; stderr={json_err}"
+    );
+
+    // --- Interactive arm (same inputs, no --json) ---
+    let tty_tmp = tempfile::tempdir().unwrap();
+    write_fixture(tty_tmp.path());
+    seed_committed_manifest(tty_tmp.path());
+    let (tty_code, tty_out, tty_err) = run_cli_env(
+        tty_tmp.path(),
+        &[
+            "scan",
+            "--vendor",
+            "--yes",
+            "--api-url",
+            &uri,
+            "--api-token",
+            "fake-token",
+            "--org",
+            ORG_SLUG,
+        ],
+        &[],
+    );
+    let tty_tgz = tty_tmp
+        .path()
+        .join(format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz"));
+    assert_eq!(tty_code, 0, "stdout={tty_out}; stderr={tty_err}");
+    assert!(
+        tty_tgz.is_file(),
+        "scan --vendor (interactive) must re-vendor the committed manifest too — \
+         --json must not decide whether the vendor step runs; stdout={tty_out}; stderr={tty_err}"
+    );
+    assert!(
+        tty_tmp.path().join(".socket/vendor/state.json").is_file(),
+        "the ledger must be written by the interactive arm; stdout={tty_out}; stderr={tty_err}"
+    );
+}
+
 #[tokio::test]
 async fn scan_vendor_detached_mode_writes_no_manifest() {
     // scan --vendor --detached: the ledger (with embedded records) is the

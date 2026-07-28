@@ -23,8 +23,8 @@ impl RubyCrawler {
     /// Get gem installation paths based on options.
     ///
     /// In local mode, checks `vendor/bundle/ruby/*/gems/` first (Bundler
-    /// deployment layout), but only if `Gemfile` or `Gemfile.lock` exists
-    /// in the cwd. Falls back to querying `gem env gemdir`.
+    /// deployment layout), then — only if the cwd holds a Bundler manifest
+    /// or lockfile — falls back to the gem homes `gem env` reports.
     ///
     /// In global mode, queries `gem env gemdir` and `gem env gempath`, plus
     /// well-known fallback paths for rbenv, rvm, Homebrew, and system Ruby.
@@ -45,21 +45,17 @@ impl RubyCrawler {
             return Ok(vendor_gems);
         }
 
-        // Only fall back to global gem paths if this looks like a Ruby project
-        let has_gemfile = tokio::fs::metadata(options.cwd.join("Gemfile"))
-            .await
-            .is_ok();
-        let has_gemfile_lock = tokio::fs::metadata(options.cwd.join("Gemfile.lock"))
-            .await
-            .is_ok();
-
-        if has_gemfile || has_gemfile_lock {
-            // Try gem env gemdir
-            if let Some(gemdir) = Self::run_gem_env("gemdir").await {
-                let gems_path = PathBuf::from(gemdir).join("gems");
-                if is_dir(&gems_path).await {
-                    return Ok(vec![gems_path]);
-                }
+        // Only fall back to the installed gem homes if this looks like a Ruby
+        // project. A non-deployment `bundle install` puts the project's gems
+        // in the ambient gem homes, so every home `gem env` reports counts —
+        // not just `gemdir`: bundler resolves from all of `Gem.path`, and a
+        // gem the project loads routinely lives in a non-`gemdir` home (rvm
+        // keeps shared gems in the `@global` gemset; `--user-install` puts
+        // them under `~/.gem`/`$XDG_DATA_HOME`).
+        if Self::has_bundler_manifest(&options.cwd).await {
+            let gems_dirs = Self::gem_env_gems_dirs().await;
+            if !gems_dirs.is_empty() {
+                return Ok(gems_dirs);
             }
         }
 
@@ -130,6 +126,58 @@ impl RubyCrawler {
     // Private helpers
     // ------------------------------------------------------------------
 
+    /// Whether `cwd` holds a Bundler manifest or lockfile.
+    ///
+    /// Bundler accepts two spellings of the pair — the usual
+    /// `Gemfile`/`Gemfile.lock` and the alternate `gems.rb`/`gems.locked`
+    /// (`Bundler::SharedHelpers.default_gemfile`). Both count: the project
+    /// gate must recognize every project `setup` can wire, and
+    /// `gem_setup::discover_bundler_project` already walks up for `gems.rb`.
+    /// Gating on `Gemfile` alone left a `gems.rb` project with a
+    /// non-deployment `bundle install` undiscoverable — the bundler plugin
+    /// `setup` installs would run `apply` on every `bundle install` and
+    /// silently find zero gems.
+    async fn has_bundler_manifest(cwd: &Path) -> bool {
+        for name in ["Gemfile", "Gemfile.lock", "gems.rb", "gems.locked"] {
+            if tokio::fs::metadata(cwd.join(name)).await.is_ok() {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// The gem homes `gem env` itself reports, each mapped to its `gems/`
+    /// subdirectory: `gemdir` (the active `GEM_HOME`) first, then every
+    /// `gempath` (`GEM_PATH`) entry. Non-existent homes and duplicates are
+    /// dropped, so the result is the deduped set of installed-gem roots in
+    /// RubyGems' own precedence order.
+    async fn gem_env_gems_dirs() -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        let mut seen = HashSet::new();
+
+        if let Some(gemdir) = Self::run_gem_env("gemdir").await {
+            let gems_path = PathBuf::from(gemdir).join("gems");
+            if is_dir(&gems_path).await && seen.insert(gems_path.clone()) {
+                paths.push(gems_path);
+            }
+        }
+
+        // `gem env gempath` lists several gem homes separated by the OS path
+        // separator (`:` on Unix, `;` on Windows). Splitting on a hardcoded
+        // `:` shreds Windows drive-letter paths (`C:\Ruby\...;D:\...`) into
+        // `["C", "\Ruby\...;D", "\..."]`, so defer to `split_paths`, which
+        // honors the platform separator — same as the Go crawler's GOPATH.
+        if let Some(gempath) = Self::run_gem_env("gempath").await {
+            for gems_path in gem_homes_to_gems_dirs(&gempath) {
+                if is_dir(&gems_path).await && seen.insert(gems_path.clone()) {
+                    paths.push(gems_path);
+                }
+            }
+        }
+
+        paths
+    }
+
     /// Find `vendor/bundle/ruby/*/gems/` directories.
     async fn get_vendor_bundle_paths(cwd: &Path) -> Vec<PathBuf> {
         let vendor_ruby = cwd.join("vendor").join("bundle").join("ruby");
@@ -149,29 +197,9 @@ impl RubyCrawler {
 
     /// Get global gem paths by querying `gem env` and checking well-known locations.
     async fn get_global_gem_paths() -> Vec<PathBuf> {
-        let mut paths = Vec::new();
-        let mut seen = HashSet::new();
-
-        // gem env gemdir
-        if let Some(gemdir) = Self::run_gem_env("gemdir").await {
-            let gems_path = PathBuf::from(gemdir).join("gems");
-            if is_dir(&gems_path).await && seen.insert(gems_path.clone()) {
-                paths.push(gems_path);
-            }
-        }
-
-        // gem env gempath lists several gem homes separated by the OS path
-        // separator (`:` on Unix, `;` on Windows). Splitting on a hardcoded
-        // `:` shreds Windows drive-letter paths (`C:\Ruby\...;D:\...`) into
-        // `["C", "\Ruby\...;D", "\..."]`, so defer to `split_paths`, which
-        // honors the platform separator — same as the Go crawler's GOPATH.
-        if let Some(gempath) = Self::run_gem_env("gempath").await {
-            for gems_path in gem_homes_to_gems_dirs(&gempath) {
-                if is_dir(&gems_path).await && seen.insert(gems_path.clone()) {
-                    paths.push(gems_path);
-                }
-            }
-        }
+        // gem env gemdir + gem env gempath
+        let mut paths = Self::gem_env_gems_dirs().await;
+        let mut seen: HashSet<PathBuf> = paths.iter().cloned().collect();
 
         // Fallback well-known paths
         let home = home_dir();

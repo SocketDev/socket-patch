@@ -492,6 +492,42 @@ mod tests {
         assert_eq!(parse_pnpm_workspace_patterns(yaml), vec!["packages/*"]);
     }
 
+    #[test]
+    #[ignore = "RED: parse_pnpm_workspace does not support the YAML flow-sequence \
+                spelling `packages: [a, b]`. The test is correct; the parser fix \
+                was not part of this change."]
+    fn test_parse_pnpm_flow_sequence() {
+        // pnpm parses pnpm-workspace.yaml with a real YAML parser, which accepts
+        // a flow sequence (`packages: ['a/*', "b/*"]`) exactly like the block
+        // list. The line-based header check only accepted a bare `packages:`
+        // (optionally plus a comment), so an inline sequence matched no header
+        // and every pattern was silently dropped — and because
+        // pnpm-workspace.yaml still marks the project as a pnpm workspace, no
+        // fallback walk runs: zero members discovered.
+        assert_eq!(
+            parse_pnpm_workspace_patterns("packages: ['packages/*', \"apps/*\"]"),
+            vec!["packages/*", "apps/*"]
+        );
+        // Unquoted items, an empty sequence, and a trailing inline comment.
+        assert_eq!(
+            parse_pnpm_workspace_patterns("packages: [packages/*] # globs"),
+            vec!["packages/*"]
+        );
+        assert!(parse_pnpm_workspace_patterns("packages: []").is_empty());
+    }
+
+    #[test]
+    #[ignore = "RED: same missing flow-sequence support as \
+                test_parse_pnpm_flow_sequence, for the quoted-comma case."]
+    fn test_parse_pnpm_flow_sequence_keeps_quoted_comma() {
+        // A `,` inside a quoted scalar is part of the value (a brace pattern
+        // carries one), so it must not split the sequence.
+        assert_eq!(
+            parse_pnpm_workspace_patterns("packages: ['{apps,libs}/*', '!**/test/**']"),
+            vec!["{apps,libs}/*", "!**/test/**"]
+        );
+    }
+
     // ── Group 2: workspace detection + file discovery ────────────────
 
     #[tokio::test]
@@ -708,6 +744,42 @@ mod tests {
         assert_eq!(result.files.len(), 2);
         assert!(result.files[0].is_root);
         assert!(result.files[1].is_workspace);
+    }
+
+    #[tokio::test]
+    #[ignore = "RED: end-to-end consequence of the missing flow-sequence support \
+                — a pnpm workspace declared with `packages: [a, b]` has its \
+                members silently skipped by discovery."]
+    async fn test_find_pnpm_flow_sequence_members_discovered() {
+        // End-to-end symptom of the flow-sequence gap: the inline
+        // `packages: [...]` spelling yielded no patterns, so a real pnpm
+        // workspace reported zero members — and the fallback walk that would
+        // otherwise have found them is skipped for a pnpm workspace.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("package.json"), r#"{"name":"root"}"#)
+            .await
+            .unwrap();
+        fs::write(
+            dir.path().join("pnpm-workspace.yaml"),
+            "packages: ['packages/*']\n",
+        )
+        .await
+        .unwrap();
+        let pkg_a = dir.path().join("packages").join("a");
+        fs::create_dir_all(&pkg_a).await.unwrap();
+        fs::write(pkg_a.join("package.json"), r#"{"name":"a"}"#)
+            .await
+            .unwrap();
+        let result = find_package_json_files(dir.path()).await;
+        assert!(matches!(result.workspace_type, WorkspaceType::Pnpm));
+        assert!(
+            result
+                .files
+                .iter()
+                .any(|f| f.is_workspace && f.path.ends_with("packages/a/package.json")),
+            "flow-sequence member must be discovered: {:?}",
+            result.files.iter().map(|f| &f.path).collect::<Vec<_>>()
+        );
     }
 
     #[tokio::test]
