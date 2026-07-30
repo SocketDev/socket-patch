@@ -1,0 +1,52 @@
+name: Version Bump
+
+# Opens the version-bump PR that precedes a release: runs
+# scripts/bump-version.sh, which stamps the new version into every packaging
+# site (scripts/version-sync.sh), rolls CHANGELOG.md's [Unreleased] notes into
+# a dated `## [X.Y.Z]` section, and opens a `release/vX.Y.Z` PR.
+#
+# CAVEAT — PRs opened by this workflow's GITHUB_TOKEN do NOT trigger
+# pull_request CI (GitHub suppresses events caused by that token, the same
+# rule that shaped release.yml's one-workflow topology). To get CI on the PR:
+# close and reopen it from the UI, or push any commit to the branch. Running
+# `scripts/bump-version.sh <version> --pr` from a developer machine avoids
+# the problem entirely and is the preferred path; this workflow exists so a
+# bump can be started from the GitHub UI alone. See docs/releasing.md.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'New version (X.Y.Z, no leading v)'
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write       # push the release/vX.Y.Z branch
+      pull-requests: write  # open the bump PR
+    steps:
+      - name: Checkout
+        # Intentionally persists credentials: bump-version.sh pushes the
+        # release branch with this workflow's GITHUB_TOKEN.
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Open the bump PR
+        env:
+          # Never interpolate the input into the script text (zizmor
+          # template-injection); bump-version.sh validates it is a plain
+          # X.Y.Z version before doing anything.
+          VERSION: ${{ inputs.version }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          bash scripts/bump-version.sh "$VERSION" --pr
+
+      - name: Remind about the CI caveat
+        run: |
+          echo "::notice title=Bump PR opened::pull_request CI does not run on PRs opened with GITHUB_TOKEN — close/reopen the PR (or push to its branch) to trigger the checks before merging."
