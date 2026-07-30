@@ -142,6 +142,11 @@ vite.config.ts.timestamp-*
 # Rust
 target/
 
+# Maven / NuGet launcher build output
+maven/socket-patch/target/
+nuget/socket-patch/bin/
+nuget/socket-patch/obj/
+
 # npm binaries (populated at publish time)
 npm/socket-patch/bin/socket-patch-*
 

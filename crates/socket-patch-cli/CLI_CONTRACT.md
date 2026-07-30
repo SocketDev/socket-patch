@@ -748,7 +748,7 @@ These exist for staged rollouts and the launcher wrappers. They are **internal**
 |---|---|
 | `SOCKET_EXPERIMENTAL_MAVEN` | Opt-in gate (`=1`) for the maven installed-package crawl behind `scan`/`apply`/`vendor` — agent-mode in-place jar patching corrupts the `~/.m2` checksum sidecars, so discovery stays off by default (`src/ecosystem_dispatch.rs`). |
 | `SOCKET_EXPERIMENTAL_NUGET` | Same gate for nuget — in-place patching breaks the `.nupkg.sha512` tamper-evidence sidecar. |
-| `SOCKET_PATCH_BIN` | Points the RubyGems / Composer launcher wrappers and the gem Bundler plugin at an existing `socket-patch` binary (skips the download-on-first-run); also the escape hatch `apply` names when a golang-featureless binary is asked to audit Go redirects. |
+| `SOCKET_PATCH_BIN` | Points the CLI launcher wrappers (RubyGems / Composer / Maven / NuGet) and the gem Bundler plugin at an existing `socket-patch` binary (skips the download-on-first-run); also the escape hatch `apply` names when a golang-featureless binary is asked to audit Go redirects. |
 | `SOCKET_UPDATE_BASE_URL` | Points BOTH the release-metadata and asset-download routes of `--update`/the update notice at one base (mirror or test fixture) instead of `github.com` + `api.github.com`. Overriding it relaxes the downloaded binary's version self-check from hard-fail to warning. |
 | `SOCKET_UPDATE_STATE_DIR` | Overrides the per-user dir holding `update-check.json` + `update.lock` (tests point it into a tempdir). |
 | `SOCKET_UPDATE_TIMEOUT_MS` | Caps the update fetches' connect/metadata/download budgets (defaults 10 s / 30 s / 300 s; the notice's fetch defaults to 2 s). Doubles as the slow-network escape hatch. |
@@ -1037,7 +1037,7 @@ When verification is enabled (the default) and a patch is omitted, the failed PU
 
 ## Semver policy
 
-Versioning lives in **`Cargo.toml`** at the workspace root (`version = "..."`) and is propagated to npm, pypi, and cargo wrappers by **`scripts/version-sync.sh <new-version>`**.
+Versioning lives in **`Cargo.toml`** at the workspace root (`version = "..."`) and is propagated to every ecosystem wrapper and launcher package by **`scripts/version-sync.sh <new-version>`** (the full list of stamped files is below).
 
 | Change | Bump |
 |---|---|
@@ -1075,10 +1075,17 @@ This syncs the workspace package version into:
 - `gem/socket-patch-bundler/socket-patch-bundler.gemspec` (the Bundler plugin gem)
 - `gem/socket-patch/socket-patch.gemspec` + its launcher `VERSION` (the RubyGems CLI launcher)
 - the Composer CLI launcher's `SP_VERSION` (`composer/socket-patch/bin/socket-patch`)
+- `maven/socket-patch/pom.xml` (`<version>`) + the Java launcher's fallback `VERSION`
+  (`maven/socket-patch/src/main/java/dev/socket/socketpatch/Launcher.java`)
+- `nuget/socket-patch/SocketSecurity.SocketPatch.csproj` (`<Version>`) + the .NET
+  launcher's fallback version constant (`nuget/socket-patch/Program.cs`)
 
-The RubyGems + Composer CLI launchers (`socket-patch` gem, `socketsecurity/socket-patch`
-on Packagist) are published by the separate **`.github/workflows/release-ecosystems.yml`**,
-which runs after the main release publishes and only needs the GitHub release binaries to exist.
+All ecosystem publishing lives in the single **`.github/workflows/release.yml`** workflow:
+one dispatch publishes crates.io, npm, and PyPI plus the CLI launcher packages
+(`socket-patch` on RubyGems, `socketsecurity/socket-patch` on Packagist,
+`dev.socket:socket-patch` on Maven Central, `SocketSecurity.SocketPatch` on NuGet).
+The launcher-package jobs are gated on the GitHub release — with its binaries and
+`SHA256SUMS` — existing.
 
 ## How the contract is enforced
 

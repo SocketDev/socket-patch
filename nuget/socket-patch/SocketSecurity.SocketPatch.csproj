@@ -1,0 +1,47 @@
+<!--
+  NuGet (.NET tool) distribution of the socket-patch CLI: a dependency-free
+  launcher that downloads the prebuilt binary for the host platform from the
+  matching GitHub release on first run, verifies it against the release's
+  SHA256SUMS, caches it per-user, and runs it (same pattern as the RubyGems,
+  Composer, and Maven launchers - see gem/socket-patch, composer/socket-patch,
+  and maven/socket-patch).
+
+  Published by the nuget-publish job in .github/workflows/release.yml.
+  Install: dotnet tool install -g SocketSecurity.SocketPatch
+-->
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <!-- Run on any newer major runtime (net9, net10, ...) too - the launcher
+         only uses long-stable BCL surface. -->
+    <RollForward>Major</RollForward>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+
+    <PackAsTool>true</PackAsTool>
+    <ToolCommandName>socket-patch</ToolCommandName>
+    <PackageId>SocketSecurity.SocketPatch</PackageId>
+    <!-- Kept in sync by scripts/version-sync.sh. -->
+    <Version>3.3.0</Version>
+    <!-- The launcher derives the release to download from
+         AssemblyInformationalVersion, which must equal the package version -
+         don't let the SDK append a "+<git sha>" suffix to it. -->
+    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
+
+    <Authors>Socket Security</Authors>
+    <Description>CLI tool for applying security patches to dependencies. Launcher that downloads the prebuilt socket-patch binary for the host platform.</Description>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/SocketDev/socket-patch</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/SocketDev/socket-patch</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageTags>security;patch;cli;dependencies</PackageTags>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="README.md" Pack="true" PackagePath="/" />
+  </ItemGroup>
+
+</Project>

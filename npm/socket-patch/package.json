@@ -17,6 +17,7 @@
   },
   "scripts": {
     "build": "tsc",
+    "prepack": "tsc",
     "test": "pnpm run build && node --test dist/**/*.test.js"
   },
   "keywords": [
