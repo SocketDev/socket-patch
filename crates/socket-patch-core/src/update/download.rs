@@ -259,24 +259,45 @@ async fn sanity_exec(
     expected: &semver::Version,
     strict: bool,
 ) -> Result<Option<String>, UpdateError> {
-    let mut cmd = tokio::process::Command::new(staged);
-    cmd.arg("--version")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true);
-    let output = tokio::time::timeout(std::time::Duration::from_secs(10), cmd.output())
-        .await
-        .map_err(|_| {
-            UpdateError::VerifyFailed(
-                "downloaded binary hung during its --version self-check".to_string(),
-            )
-        })?
-        .map_err(|e| {
-            UpdateError::VerifyFailed(format!(
-                "downloaded binary failed to execute (wrong architecture?): {e}"
-            ))
-        })?;
+    // ETXTBSY retry: between a sibling thread's fork() and its exec(), the
+    // child briefly inherits every open fd — including a write fd on the
+    // binary staged moments ago — and exec'ing the file during that window
+    // fails with "Text file busy". The window is real for any multi-threaded
+    // process (and bites the parallel test binary under coverage), so ride
+    // it out with short sleeps instead of failing a fully verified download
+    // — the same dance Go's os/exec and cargo do.
+    const ETXTBSY_ATTEMPTS: u64 = 10;
+    let mut attempt = 0u64;
+    let output = loop {
+        let mut cmd = tokio::process::Command::new(staged);
+        cmd.arg("--version")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), cmd.output())
+            .await
+            .map_err(|_| {
+                UpdateError::VerifyFailed(
+                    "downloaded binary hung during its --version self-check".to_string(),
+                )
+            })?;
+        match result {
+            Ok(output) => break output,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::ExecutableFileBusy
+                    && attempt < ETXTBSY_ATTEMPTS =>
+            {
+                attempt += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(25 * attempt)).await;
+            }
+            Err(e) => {
+                return Err(UpdateError::VerifyFailed(format!(
+                    "downloaded binary failed to execute (wrong architecture?): {e}"
+                )));
+            }
+        }
+    };
     if !output.status.success() {
         return Err(UpdateError::VerifyFailed(format!(
             "downloaded binary's --version self-check exited with {}",
