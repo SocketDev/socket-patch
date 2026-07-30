@@ -537,17 +537,23 @@ mod tests {
             path
         };
 
+        // Each rejection asserts the REASON, not just is_err(): an unrelated
+        // spawn failure (e.g. the ETXTBSY race covered by the test below)
+        // must not masquerade as the expected rejection.
         // Wrong program name: hard error in both modes.
         let imposter = write_script("imposter", "#!/bin/sh\necho other-tool 9.9.9\n");
-        assert!(sanity_exec(&imposter, &expected, false).await.is_err());
+        let err = sanity_exec(&imposter, &expected, false).await.unwrap_err();
+        assert!(err.to_string().contains("identifies as"), "got: {err}");
 
         // Non-zero exit: hard error.
         let failing = write_script("failing", "#!/bin/sh\necho socket-patch 9.9.9\nexit 3\n");
-        assert!(sanity_exec(&failing, &expected, true).await.is_err());
+        let err = sanity_exec(&failing, &expected, true).await.unwrap_err();
+        assert!(err.to_string().contains("exited with"), "got: {err}");
 
         // Version mismatch: fatal in strict mode, warning otherwise.
         let mismatched = write_script("mismatch", "#!/bin/sh\necho socket-patch 1.0.0\n");
-        assert!(sanity_exec(&mismatched, &expected, true).await.is_err());
+        let err = sanity_exec(&mismatched, &expected, true).await.unwrap_err();
+        assert!(err.to_string().contains("instead of version"), "got: {err}");
         let warning = sanity_exec(&mismatched, &expected, false).await.unwrap();
         assert!(warning.unwrap().contains("1.0.0"));
 
@@ -558,6 +564,34 @@ mod tests {
         // Exec-format failure (not executable at all): hard error.
         let garbage = tmp.path().join("garbage");
         std::fs::write(&garbage, b"\x00\x01\x02").unwrap();
-        assert!(sanity_exec(&garbage, &expected, false).await.is_err());
+        let err = sanity_exec(&garbage, &expected, false).await.unwrap_err();
+        assert!(err.to_string().contains("failed to execute"), "got: {err}");
+    }
+
+    // Regression test for the coverage-job flake: between a sibling thread's
+    // fork() and its exec(), the child inherits every open fd — including a
+    // write fd on the just-staged binary — and exec'ing the binary during
+    // that window fails with ETXTBSY ("Text file busy"). Simulate the
+    // inherited fd with a write handle held open briefly on another thread;
+    // sanity_exec must ride it out instead of failing a verified download.
+    // Linux-only: other platforms don't reliably enforce ETXTBSY.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn sanity_exec_retries_when_binary_briefly_text_busy() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("busy");
+        std::fs::write(&path, "#!/bin/sh\necho socket-patch 9.9.9\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let held = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        let dropper = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            drop(held);
+        });
+
+        let result = sanity_exec(&path, &semver::Version::new(9, 9, 9), true).await;
+        dropper.join().unwrap();
+        assert_eq!(result.unwrap(), None);
     }
 }
