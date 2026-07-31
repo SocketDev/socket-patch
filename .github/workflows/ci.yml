@@ -860,7 +860,13 @@ jobs:
         if: steps.gate.outputs.run == 'true'
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: '20.20.2'
+          # Node 24, NOT the 20.20.2 the other jobs pin. pnpm 10 imports
+          # `node:sqlite` for its store index, which does not exist before
+          # Node 22 (and is only stable in 24) — on 20 every `pnpm install`
+          # dies with ERR_UNKNOWN_BUILTIN_MODULE. This suite drives real,
+          # current package managers against production, so it tracks what
+          # users actually run rather than the pin the offline suites need.
+          node-version: '24.x'
 
       - name: Setup npm-family package managers
         if: steps.gate.outputs.run == 'true'
