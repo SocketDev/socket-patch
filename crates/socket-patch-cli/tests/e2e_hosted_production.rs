@@ -874,7 +874,13 @@ fn yarn_berry_hosted_install_proof() {
         ("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0"),
     ];
 
-    let install = tool(&fx.proj, "yarn", &["install"], &env);
+    // `--no-immutable` on the FIXTURE install only. Berry auto-enables
+    // hardened mode on a public-PR CI run, which implies `--immutable` and
+    // refuses the lockfile this first install has to create (`YN0028: The
+    // lockfile would have been created by this install, which is explicitly
+    // forbidden`). The reinstall below keeps `--immutable` — that leg is the
+    // actual proof, and it must stay strict.
+    let install = tool(&fx.proj, "yarn", &["install", "--no-immutable"], &env);
     if !ok(&install) {
         soft_skip!(
             LEG,

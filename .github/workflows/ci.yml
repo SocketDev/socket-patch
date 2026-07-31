@@ -864,15 +864,28 @@ jobs:
 
       - name: Setup npm-family package managers
         if: steps.gate.outputs.run == 'true'
-        # corepack resolves the pinned pnpm / yarn-classic / yarn-berry the
-        # suite's fixtures request via their `packageManager` field. bun comes
-        # from npm for the same reason pnpm does in the `e2e` job: it is the
-        # one install path that works uniformly across runners.
+        env:
+          # Every corepack shim invocation — including the suite's own
+          # `has_command` probes — must be non-interactive, or the probe hangs
+          # or exits non-zero and STRICT turns that into a failed leg.
+          COREPACK_ENABLE_DOWNLOAD_PROMPT: '0'
+        # corepack resolves the yarn-classic / yarn-berry versions the suite's
+        # fixtures pin via `packageManager`; pre-download both so the first
+        # invocation inside a test isn't also a network fetch. pnpm and bun
+        # come from npm — the same install path the `e2e` job above uses, and
+        # the one that reliably puts them on PATH (a bare `corepack enable`
+        # leaves `pnpm --version` failing for a project with no
+        # `packageManager` field, which is exactly the pnpm fixture's shape).
         run: |
           set -eu
           corepack enable
-          npm install -g bun@1
-          node --version && npm --version && bun --version
+          corepack prepare yarn@1.22.22 --activate
+          corepack prepare yarn@4.6.0 --activate
+          npm install -g pnpm@10 bun@1
+          node --version
+          npm --version
+          pnpm --version
+          bun --version
 
       - name: Setup Python + uv
         if: steps.gate.outputs.run == 'true'
@@ -896,9 +909,10 @@ jobs:
 
       - name: Setup Go
         if: steps.gate.outputs.run == 'true'
-        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
         with:
-          go-version: '1.23'
+          go-version: '1.24'
+          cache: false
 
       - name: Run hosted-mode production e2e
         if: steps.gate.outputs.run == 'true'
@@ -907,6 +921,7 @@ jobs:
           # STRICT turns the suite's local "toolchain missing" soft-skips into
           # hard failures. Every toolchain it needs is installed above.
           SOCKET_PATCH_HOSTED_E2E_STRICT: '1'
+          COREPACK_ENABLE_DOWNLOAD_PROMPT: '0'
         run: |
           set -u
           # The public proxy intermittently returns 503 "Service temporarily
