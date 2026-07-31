@@ -869,19 +869,24 @@ jobs:
           # `has_command` probes — must be non-interactive, or the probe hangs
           # or exits non-zero and STRICT turns that into a failed leg.
           COREPACK_ENABLE_DOWNLOAD_PROMPT: '0'
-        # corepack resolves the yarn-classic / yarn-berry versions the suite's
-        # fixtures pin via `packageManager`; pre-download both so the first
-        # invocation inside a test isn't also a network fetch. pnpm and bun
-        # come from npm — the same install path the `e2e` job above uses, and
-        # the one that reliably puts them on PATH (a bare `corepack enable`
-        # leaves `pnpm --version` failing for a project with no
-        # `packageManager` field, which is exactly the pnpm fixture's shape).
+        # corepack owns pnpm and both yarn flavors. `corepack enable` alone is
+        # not enough: it installs the shims, but `pnpm --version` still fails
+        # for a project with no `packageManager` field — exactly the pnpm
+        # fixture's shape — because the shim has no version to resolve. The
+        # `prepare … --activate` lines set that global default AND pre-download
+        # each version, so the first invocation inside a test is not also a
+        # network fetch.
+        #
+        # pnpm must NOT come from `npm install -g` here: corepack has already
+        # created its shim at the same path, and npm refuses with EEXIST. Only
+        # bun, which corepack does not manage, comes from npm.
         run: |
           set -eu
           corepack enable
+          corepack prepare pnpm@10 --activate
           corepack prepare yarn@1.22.22 --activate
           corepack prepare yarn@4.6.0 --activate
-          npm install -g pnpm@10 bun@1
+          npm install -g bun@1
           node --version
           npm --version
           pnpm --version
