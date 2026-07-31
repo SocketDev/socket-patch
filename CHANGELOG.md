@@ -10,7 +10,10 @@ history. For full per-release detail, see the
 [GitHub releases page](https://github.com/SocketDev/socket-patch/releases).
 
 The `Release` workflow refuses to publish a version that does not appear
-in this file — see `.github/workflows/release.yml` (`version` job).
+in this file — see `scripts/release-lint.sh` (run by the `version` job in
+`.github/workflows/release.yml` and by CI on version-bump PRs). Bump PRs
+are opened by `scripts/bump-version.sh`, which rolls `[Unreleased]` over
+into the new version's section — see docs/releasing.md.
 
 ## [Unreleased]
 
@@ -44,6 +47,18 @@ in this file — see `.github/workflows/release.yml` (`version` job).
 
 ### Added
 
+- **Version-bump automation + release-readiness gate.**
+  `scripts/bump-version.sh <X.Y.Z> --pr` performs the whole bump chore —
+  stamps every packaging site via `version-sync.sh`, rolls `[Unreleased]`
+  into a dated `## [X.Y.Z]` CHANGELOG section, and opens the `release/vX.Y.Z`
+  PR (also dispatchable from the Actions tab as the **Version Bump**
+  workflow). A new `release-readiness` CI job runs `scripts/release-lint.sh`
+  on every PR: version-coherence always (version-sync must be a no-op, so a
+  hand-edited version in any one packaging site fails CI), plus the full
+  gate — non-empty CHANGELOG section, no pre-existing tag — on PRs that bump
+  the workspace version. The `Release` workflow's `version` job now runs the
+  same script, so the publish gate and the PR gate cannot drift. Playbook:
+  docs/releasing.md.
 - **Maven Central and NuGet distribution.** Two new install channels for the
   CLI. Maven Central: `dev.socket:socket-patch`, a dependency-free launcher
   jar — run via `java -jar` (fetch it with `mvn dependency:copy`) or in one

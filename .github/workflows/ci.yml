@@ -86,6 +86,45 @@ jobs:
         # same surface. shellcheck is pre-installed on ubuntu-latest.
         run: shellcheck --shell=sh scripts/install.sh
 
+      - name: Shell — shellcheck the release scripts
+        run: shellcheck scripts/version-sync.sh scripts/bump-version.sh scripts/release-lint.sh
+
+  # Release-readiness gate (scripts/release-lint.sh — the same checks the
+  # Release workflow's `version` job runs before publishing anything):
+  #   - every PR/push: version coherence — version-sync.sh must be a no-op,
+  #     so a hand-edited version in any single packaging site fails CI here
+  #     instead of surfacing mid-release;
+  #   - PRs that bump the workspace version (release/vX.Y.Z bump PRs): the
+  #     full gate — CHANGELOG has a dated, non-empty section for the new
+  #     version and the tag doesn't already exist.
+  release-readiness:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Lint release readiness
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            # Compare the workspace version against the PR base to detect a
+            # version bump. The shallow checkout doesn't have the base
+            # commit; fetch just that object.
+            git fetch --quiet --depth 1 origin "$BASE_SHA"
+            BASE_VERSION="$(git show "$BASE_SHA:Cargo.toml" | grep '^version = ' | head -1 | sed 's/version = "\(.*\)"/\1/')"
+            HEAD_VERSION="$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')"
+            if [ "$BASE_VERSION" != "$HEAD_VERSION" ]; then
+              echo "Version bump PR detected ($BASE_VERSION -> $HEAD_VERSION); running the full release gate."
+              bash scripts/release-lint.sh --tag-check
+              exit 0
+            fi
+          fi
+          bash scripts/release-lint.sh --sync-only
+
   test:
     strategy:
       fail-fast: false

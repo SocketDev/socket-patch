@@ -64,42 +64,16 @@ jobs:
           echo "VERSION=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Release version: $VERSION"
 
-      - name: Check tag does not exist at a different commit
-        env:
-          VERSION: ${{ steps.read.outputs.VERSION }}
-        run: |
-          # The checkout above is shallow and tagless, so local tag lookups
-          # prove nothing — ask the remote directly (stateless). Fail only
-          # when the tag exists at a DIFFERENT commit: a tag already at
-          # $GITHUB_SHA means a previous run of this workflow got as far as
-          # tagging, and re-running it (idempotent retry) must be allowed.
-          EXISTING_SHA="$(git ls-remote origin "refs/tags/v${VERSION}" | cut -f1)"
-          if [ -z "$EXISTING_SHA" ]; then
-            echo "Tag v${VERSION} does not exist yet."
-          elif [ "$EXISTING_SHA" = "$GITHUB_SHA" ]; then
-            echo "::notice::Tag v${VERSION} already exists at this commit; continuing as a retry of a previous run."
-          else
-            echo "::error::Tag v${VERSION} already exists at ${EXISTING_SHA} (this run is at ${GITHUB_SHA}). Bump the version in a PR first."
-            exit 1
-          fi
-
-      - name: Check CHANGELOG.md has release notes for version
-        env:
-          VERSION: ${{ steps.read.outputs.VERSION }}
-        run: |
-          if [ ! -f CHANGELOG.md ]; then
-            echo "::error::CHANGELOG.md does not exist at the repository root."
-            exit 1
-          fi
-          # A release requires an explicit `## [X.Y.Z]` / `## X.Y.Z` heading
-          # (notes written by hand in the version-bump PR).
-          if grep -qE "^## \[?${VERSION}\]?( |$)" CHANGELOG.md; then
-            echo "Found explicit CHANGELOG heading for ${VERSION}."
-            exit 0
-          fi
-          echo "::error::CHANGELOG.md has no release notes for ${VERSION}."
-          echo "::error::Add a \`## [${VERSION}] — $(date +%Y-%m-%d)\` heading with release notes before re-running."
-          exit 1
+      - name: Release-readiness gate
+        # scripts/release-lint.sh is the single source of truth for the
+        # version chores, shared with CI's release-readiness job (which runs
+        # it on the version-bump PR, so failures surface at PR time, not
+        # here). Checks: version coherence (version-sync.sh is a no-op),
+        # CHANGELOG has a non-empty section for this version, and — via
+        # --tag-check, asked of the remote since this checkout is shallow
+        # and tagless — the tag doesn't exist at a different commit (a tag
+        # already at $GITHUB_SHA is a retry of a previous run and passes).
+        run: bash scripts/release-lint.sh --tag-check
 
   build:
     needs: version
