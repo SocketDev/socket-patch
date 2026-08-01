@@ -664,6 +664,24 @@ export SOCKET_TELEMETRY_DISABLED=1 SOCKET_EXPERIMENTAL_MAVEN=1 SOCKET_EXPERIMENT
 # Isolate the pypi `.pth` hook's change-detection stamp per case so runs
 # don't bleed into each other (the stamp lives under XDG_CACHE_HOME).
 export XDG_CACHE_HOME="$WORKDIR/.cache"
+# Give the case its own home so every package manager's cache, store and
+# credentials stay inside WORKDIR. Under `--host` these run on the
+# developer's machine, where the default is their real home. The vars
+# below outrank HOME for their tools, so they are pointed inside it
+# rather than left to leak.
+#
+# RUSTUP_HOME is the exception: rustup's toolchains live under the real
+# home (defaulting to $HOME/.rustup when unset) and are shared, not
+# per-case. Pin it to that location BEFORE HOME is redirected, or rustup
+# resolves toolchains under the empty fake home and `cargo fetch` fails
+# even though CARGO_HOME is set. An already-exported RUSTUP_HOME (e.g. the
+# cargo Docker image) is preserved.
+export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+mkdir -p "$WORKDIR/home"
+export HOME="$WORKDIR/home"
+export XDG_DATA_HOME="$WORKDIR/home/.local/share" XDG_CONFIG_HOME="$WORKDIR/home/.config" XDG_STATE_HOME="$WORKDIR/home/.local/state"
+export CARGO_HOME="$WORKDIR/home/.cargo" GOPATH="$WORKDIR/home/go" GOMODCACHE="$WORKDIR/home/go/pkg/mod" GOCACHE="$WORKDIR/home/.cache/go-build"
+export PNPM_HOME="$WORKDIR/home/.pnpm" COREPACK_HOME="$WORKDIR/home/.corepack" NUGET_PACKAGES="$WORKDIR/home/.nuget/packages"
 # NOTE: deliberately do NOT export SOCKET_CWD. The install hook's apply
 # must run with whatever cwd the package manager sets for the lifecycle
 # script — the project root for a single project, and the *member* dir
