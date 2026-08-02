@@ -17,6 +17,9 @@ use std::process::{Command, Output};
 
 use sha2::{Digest, Sha256};
 
+#[path = "common/cache_env.rs"]
+mod cache_env;
+
 const UUID: &str = "3c4d5e6f-7081-4a1b-8c2d-0123456789ab";
 const UMOD: &str = "example.com/upstream";
 const UVER: &str = "v1.0.0";
@@ -31,8 +34,10 @@ fn binary() -> PathBuf {
 }
 
 fn has_command(cmd: &str) -> bool {
-    Command::new(cmd)
-        .arg("--version")
+    let mut probe = Command::new(cmd);
+    probe.arg("--version");
+    cache_env::isolate(&mut probe);
+    probe
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
@@ -71,9 +76,17 @@ fn go_env<'a>(modcache: &'a str, proxy: &'a str) -> Vec<(&'a str, &'a str)> {
     ]
 }
 
+/// Run `go` with its caches sandboxed, then the fixture's own env on top —
+/// the per-test `GOMODCACHE` (including the deliberately EMPTY one the
+/// fresh-checkout proof asserts against) still wins.
+///
+/// `GOMODCACHE` alone is not isolation: `go build` keeps its compiled objects
+/// in `GOCACHE`, a different directory that does not follow `GOPATH` either,
+/// so without [`cache_env::isolate`] this test still filled the real home.
 fn go(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
     let mut cmd = Command::new("go");
     cmd.args(args).current_dir(dir);
+    cache_env::isolate(&mut cmd);
     for (k, v) in env {
         cmd.env(k, v);
     }

@@ -18,6 +18,9 @@ use std::process::{Command, Output};
 
 use sha2::{Digest, Sha256};
 
+#[path = "common/cache_env.rs"]
+mod cache_env;
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -40,8 +43,10 @@ fn binary() -> PathBuf {
 }
 
 fn has_command(cmd: &str) -> bool {
-    Command::new(cmd)
-        .arg("--version")
+    let mut probe = Command::new(cmd);
+    probe.arg("--version");
+    cache_env::isolate(&mut probe);
+    probe
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
@@ -101,11 +106,10 @@ fn assert_run_ok(cwd: &Path, args: &[&str], context: &str) -> (String, String) {
 }
 
 fn npm_run(cwd: &Path, args: &[&str]) {
-    let out = Command::new("npm")
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .expect("failed to run npm");
+    let mut cmd = Command::new("npm");
+    cmd.args(args).current_dir(cwd);
+    cache_env::isolate(&mut cmd);
+    let out = cmd.output().expect("failed to run npm");
     assert!(
         out.status.success(),
         "npm {args:?} failed (exit {:?}).\nstdout:\n{}\nstderr:\n{}",
@@ -337,16 +341,18 @@ fn test_npm_global_lifecycle() {
     let cwd = cwd_dir.path();
 
     // -- Setup: install minimist@1.2.2 globally into a temp prefix ----------
-    let out = Command::new("npm")
-        .args([
-            "install",
-            "-g",
-            "--prefix",
-            global_dir.path().to_str().unwrap(),
-            "minimist@1.2.2",
-        ])
-        .output()
-        .expect("failed to run npm install -g");
+    let mut cmd = Command::new("npm");
+    cmd.args([
+        "install",
+        "-g",
+        "--prefix",
+        global_dir.path().to_str().unwrap(),
+        "minimist@1.2.2",
+    ]);
+    // `--prefix` is a flag, so it still decides where the package lands; the
+    // sandbox only moves the download cache off the caller's home.
+    cache_env::isolate(&mut cmd);
+    let out = cmd.output().expect("failed to run npm install -g");
     assert!(
         out.status.success(),
         "npm install -g failed.\nstdout:\n{}\nstderr:\n{}",

@@ -38,6 +38,9 @@ use std::process::{Command, Output};
 
 use sha2::{Digest, Sha256};
 
+#[path = "common/cache_env.rs"]
+mod cache_env;
+
 /// Canonical lowercase patch uuid (a dedicated path level under
 /// `.socket/vendor/gem/`) — also the probe constant's runtime value.
 const UUID: &str = "3c4d5e6f-7a8b-4a1b-8c2d-0123456789ab";
@@ -51,8 +54,10 @@ fn binary() -> PathBuf {
 }
 
 fn has_command(cmd: &str) -> bool {
-    Command::new(cmd)
-        .arg("--version")
+    let mut probe = Command::new(cmd);
+    probe.arg("--version");
+    cache_env::isolate(&mut probe);
+    probe
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
@@ -109,6 +114,9 @@ fn bundle(cwd: &Path, args: &[&str], frozen: bool) -> Output {
             cmd.env_remove(&k);
         }
     }
+    // After the `BUNDLE_*`/`GEM_*` scrub, which would otherwise take the
+    // sandbox's own BUNDLE_USER_HOME / GEM_SPEC_CACHE straight back out.
+    cache_env::isolate(&mut cmd);
     cmd.env("BUNDLE_APP_CONFIG", cwd.join(".bundle"));
     if frozen {
         cmd.env("BUNDLE_FROZEN", "true");

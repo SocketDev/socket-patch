@@ -14,6 +14,9 @@ use socket_patch_cli::commands::scan::{run as scan_run, ScanArgs};
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+#[path = "common/cache_env.rs"]
+mod cache_env;
+
 const ORG: &str = "test-org";
 const UUID: &str = "13131313-1313-4131-8131-131313131313";
 const GEM_NAME: &str = "colorize";
@@ -61,16 +64,21 @@ fn install_colorize(tmp: &Path) -> PathBuf {
     let install_dir = tmp.join(format!("vendor/bundle/ruby/{ver}"));
     std::fs::create_dir_all(&install_dir).expect("create install dir");
 
-    let status = Command::new("gem")
-        .args([
-            "install",
-            "--no-document",
-            "--install-dir",
-            install_dir.to_str().unwrap(),
-            GEM_NAME,
-            "-v",
-            GEM_VERSION,
-        ])
+    // `--install-dir` keeps the gem itself out of the user's gem environment,
+    // but RubyGems still writes its spec cache under the home directory. The
+    // sandbox catches that; `--install-dir` is a flag, so it is unaffected.
+    let mut cmd = Command::new("gem");
+    cmd.args([
+        "install",
+        "--no-document",
+        "--install-dir",
+        install_dir.to_str().unwrap(),
+        GEM_NAME,
+        "-v",
+        GEM_VERSION,
+    ]);
+    cache_env::isolate(&mut cmd);
+    let status = cmd
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .output()

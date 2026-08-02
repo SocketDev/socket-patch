@@ -12,6 +12,9 @@ use serial_test::serial;
 use sha2::{Digest, Sha256};
 use socket_patch_cli::commands::apply::{run as apply_run, ApplyArgs};
 
+#[path = "common/cache_env.rs"]
+mod cache_env;
+
 fn git_sha256(content: &[u8]) -> String {
     let header = format!("blob {}\0", content.len());
     let mut hasher = Sha256::new();
@@ -43,8 +46,10 @@ fn assert_patched(path: &Path, expected: &[u8], before_hash: &str, after_hash: &
 }
 
 fn has(cmd: &str) -> bool {
-    Command::new(cmd)
-        .arg("--version")
+    let mut probe = Command::new(cmd);
+    probe.arg("--version");
+    cache_env::isolate(&mut probe);
+    probe
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
@@ -66,6 +71,13 @@ fn has(cmd: &str) -> bool {
 /// ever dropped the seed (not a developer's shell) turns the suite red
 /// immediately. Seed test-specific env AFTER this helper — `Command` env
 /// calls apply in order, so a later scrub would wipe the seed.
+///
+/// Cache isolation is applied last, after the scrub, so these fixture
+/// installs write to a sandbox instead of the home directory of whoever ran
+/// `cargo test`. None of the tests in this file are `#[ignore]`d, so they all
+/// run by default. A test that wants a specific cache elsewhere (the bun leg
+/// pins its own `BUN_INSTALL_CACHE_DIR`) sets it on the returned `Command`
+/// and still wins.
 fn pm_command(program: &str, prefixes: &[&str]) -> Command {
     let mut cmd = Command::new(program);
     for p in prefixes {
@@ -90,6 +102,7 @@ fn pm_command(program: &str, prefixes: &[&str]) -> Command {
             cmd.env_remove(&k);
         }
     }
+    cache_env::isolate(&mut cmd);
     cmd
 }
 
@@ -524,9 +537,14 @@ async fn bun_install_then_apply_patches_file() {
 // ---------------------------------------------------------------------------
 
 fn has_corepack_pm(pm: &str) -> bool {
-    Command::new("corepack")
+    // Isolated too: this probe is what actually downloads the package manager
+    // the first time, and corepack stores it under `COREPACK_HOME`.
+    let mut probe = Command::new("corepack");
+    probe
         .args([pm, "--version"])
-        .env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0")
+        .env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0");
+    cache_env::isolate(&mut probe);
+    probe
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
