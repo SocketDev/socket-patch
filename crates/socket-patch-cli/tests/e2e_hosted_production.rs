@@ -82,6 +82,9 @@ use std::process::{Command, Output};
 
 use socket_patch_cli::args::{GLOBAL_ARG_ENV_VARS, LOCAL_ARG_ENV_VARS};
 
+#[path = "common/cache_env.rs"]
+mod cache_env;
+
 // ---------------------------------------------------------------------------
 // Production endpoints + required-patch catalog
 // ---------------------------------------------------------------------------
@@ -358,6 +361,10 @@ fn redirected_count(env: &serde_json::Value) -> u64 {
 fn tool(cwd: &Path, program: &str, args: &[&str], env: &[(&str, &str)]) -> Output {
     let mut cmd = Command::new(program);
     cmd.args(args).current_dir(cwd);
+    // Sandbox everything the per-leg `env` below does not name — corepack's
+    // downloaded package managers most of all — so a run leaves the caller's
+    // home alone.
+    cache_env::isolate(&mut cmd);
     // Keep every toolchain's cache inside the fixture so the reinstall leg
     // starts genuinely cold and cannot be satisfied from a warm host cache
     // holding the *pristine* artifact.
