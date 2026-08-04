@@ -95,6 +95,31 @@ jobs:
         # same surface. shellcheck is pre-installed on ubuntu-latest.
         run: shellcheck --shell=sh scripts/install.sh
 
+      - name: Shell — run the installer end to end
+        # shellcheck proves the script parses; this proves it installs. The
+        # script is what install.socket.dev/patch serves and what the README
+        # tells people to pipe into a shell, so "it downloads the latest
+        # release, verifies SHA256SUMS, and produces a binary that runs" is
+        # worth asserting on every PR rather than discovering from a user.
+        # Installs the LATEST RELEASE, not this checkout — on a version-bump PR
+        # that is deliberately the previous version.
+        run: |
+          sh scripts/install.sh
+          command -v socket-patch
+          socket-patch --version
+
+      - name: Shell — the installer URL is consistent across the docs
+        # The README, the script's own usage comment, and the hosting runbook
+        # all name the canonical URL. Keeping them in lockstep is the whole
+        # promise of install.socket.dev/patch being "a copy of this file".
+        run: |
+          for f in README.md scripts/install.sh docs/installer-hosting.md; do
+            if ! grep -qF 'https://install.socket.dev/patch' "$f"; then
+              echo "Error: $f no longer references https://install.socket.dev/patch" >&2
+              exit 1
+            fi
+          done
+
       - name: Shell — shellcheck the release scripts
         run: shellcheck scripts/version-sync.sh scripts/bump-version.sh scripts/release-lint.sh
 
