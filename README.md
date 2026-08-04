@@ -23,12 +23,22 @@ CVEs you've already fixed.
 One-line install (macOS / Linux):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/SocketDev/socket-patch/main/scripts/install.sh | sh
+curl -fsSL https://install.socket.dev/patch | sh
 ```
 
-Detects your platform (macOS/Linux, x64/ARM64), downloads the latest binary, and installs
-to `/usr/local/bin` or `~/.local/bin`. Use `sudo sh` instead of `sh` if `/usr/local/bin`
-requires root.
+Detects your platform (macOS/Linux, x64/ARM64), downloads the latest binary, verifies it
+against the release's `SHA256SUMS`, and installs to `/usr/local/bin` or `~/.local/bin`.
+Use `sudo sh` instead of `sh` if `/usr/local/bin` requires root. Pin a version with
+`SOCKET_PATCH_VERSION=3.3.0 sh` instead of plain `sh`.
+
+`install.socket.dev` serves a copy of [`scripts/install.sh`](scripts/install.sh) from
+this repository — read it before you run it, either there or at
+[install.socket.dev/patch](https://install.socket.dev/patch). If you would rather not
+depend on the Socket domain, `curl -fsSL
+https://raw.githubusercontent.com/SocketDev/socket-patch/main/scripts/install.sh | sh`
+does the same thing from the same bytes. See
+[docs/installer-hosting.md](docs/installer-hosting.md) for how the hosted copy is
+published.
 
 On Windows, install via npm or the dotnet tool (below), or grab a prebuilt
 `socket-patch-*-pc-windows-msvc.zip` from the

@@ -337,6 +337,19 @@ into the new version's section — see docs/releasing.md.
 
 ### Changed
 
+- **The documented one-liner installs from `https://install.socket.dev/patch`.**
+  The previous URL was `raw.githubusercontent.com`, which asks users to trust a
+  third-party CDN for a script they pipe into a shell and is the first URL a
+  locked-down egress policy blocks. The hosted copy is byte-for-byte
+  `scripts/install.sh`, with its SHA-256 published at
+  `install.socket.dev/patch.sha256`; the GitHub raw URL keeps working and serves
+  the same bytes. Binaries are still downloaded from the GitHub release and
+  verified against its `SHA256SUMS` — the trust model is unchanged, only the
+  script's origin moved. New: `docs/installer-hosting.md` (how the copy is
+  published), a CI step that runs the installer end to end instead of only
+  linting it, and an `installer-drift` workflow that checks the hosted copy
+  against this repository weekly.
+
 - **Release workflow consolidated into a single `release.yml`.** One
   dispatch now publishes every ecosystem package — crates.io, npm, PyPI,
   RubyGems (both gems, via OIDC trusted publishing), Packagist, Maven

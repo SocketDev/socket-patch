@@ -3,10 +3,14 @@ set -eu
 
 # Socket Patch installer
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/SocketDev/socket-patch/main/scripts/install.sh | sh
+#   curl -fsSL https://install.socket.dev/patch | sh
+#
+# install.socket.dev/patch serves a byte-for-byte copy of this file; the URL
+# above and the raw.githubusercontent.com path to this script are
+# interchangeable. See docs/installer-hosting.md for how the copy is published.
 #
 # Override the version that gets installed by exporting SOCKET_PATCH_VERSION:
-#   curl -fsSL .../install.sh | SOCKET_PATCH_VERSION=3.0.0 sh
+#   curl -fsSL https://install.socket.dev/patch | SOCKET_PATCH_VERSION=3.0.0 sh
 
 REPO="SocketDev/socket-patch"
 BINARY="socket-patch"
