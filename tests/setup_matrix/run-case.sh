@@ -677,16 +677,18 @@ export XDG_CACHE_HOME="$WORKDIR/.cache"
 # even though CARGO_HOME is set. An already-exported RUSTUP_HOME (e.g. the
 # cargo Docker image) is preserved.
 export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
-# Version-manager roots get the same treatment: rbenv/pyenv/nvm/volta/asdf/
-# sdkman shims resolve their root from $HOME by default, so a redirected
-# HOME with no root pinned makes ruby/python/node fail to launch at all
-# under --host. Seed each root from the real home first — only when the
-# variable is not already exported and the default directory actually
-# exists, so this is a no-op on machines (and containers) without that
-# manager.
+# Version-manager roots get the same treatment: rbenv/pyenv/nvm/fnm/volta/
+# asdf/sdkman/mise shims resolve their root from $HOME (or the XDG dirs,
+# which are also redirected below) by default, so a redirected HOME with no
+# root pinned makes ruby/python/node fail to launch at all under --host.
+# Seed each root from the real home first — only when the variable is not
+# already exported and the default directory actually exists, so this is a
+# no-op on machines (and containers) without that manager. Same list as
+# cache_env.rs TOOLCHAIN_ROOTS.
 for _vm in RBENV_ROOT:.rbenv PYENV_ROOT:.pyenv NVM_DIR:.nvm \
-    VOLTA_HOME:.volta ASDF_DIR:.asdf ASDF_DATA_DIR:.asdf \
-    SDKMAN_DIR:.sdkman; do
+    FNM_DIR:.fnm VOLTA_HOME:.volta ASDF_DIR:.asdf ASDF_DATA_DIR:.asdf \
+    SDKMAN_DIR:.sdkman MISE_DATA_DIR:.local/share/mise \
+    MISE_CONFIG_DIR:.config/mise; do
   _vm_var="${_vm%%:*}"
   _vm_dir="$HOME/${_vm#*:}"
   if [ -z "${!_vm_var:-}" ] && [ -d "$_vm_dir" ]; then
