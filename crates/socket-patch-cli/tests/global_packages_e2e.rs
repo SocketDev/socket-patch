@@ -23,6 +23,9 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[path = "common/cache_env.rs"]
+mod cache_env;
+
 fn binary() -> PathBuf {
     env!("CARGO_BIN_EXE_socket-patch").into()
 }
@@ -55,6 +58,18 @@ fn cli(cwd: &Path) -> Command {
             cmd.env_remove(&key);
         }
     }
+    // Download caches only — NOT the full `cache_env::isolate`. Resolving the
+    // real global prefixes is the whole point of this file, and those come out
+    // of `$HOME`/`PNPM_HOME`, so redirecting either would change the answer the
+    // tests assert on. These two cannot: on a machine where `pnpm`/`yarn` are
+    // corepack shims, the CLI's prefix probe makes corepack download the
+    // package manager (~900 files) into the caller's home, and npm drops a
+    // debug log in its cache when the probe fails.
+    cmd.env("COREPACK_HOME", cache_env::override_path("COREPACK_HOME"));
+    cmd.env(
+        "npm_config_cache",
+        cache_env::override_path("npm_config_cache"),
+    );
     cmd
 }
 

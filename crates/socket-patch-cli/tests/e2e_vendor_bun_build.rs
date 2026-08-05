@@ -31,6 +31,9 @@ use std::process::{Command, Output, Stdio};
 
 use sha2::{Digest, Sha256};
 
+#[path = "common/cache_env.rs"]
+mod cache_env;
+
 const UUID: &str = "1a2b3c4d-5e6f-4a1b-8c2d-0123456789ab";
 const MARKER: &str = "/* SOCKET-PATCHED */\n";
 const DEP: &str = "left-pad";
@@ -43,8 +46,10 @@ fn binary() -> PathBuf {
 }
 
 fn has_command(cmd: &str) -> bool {
-    Command::new(cmd)
-        .arg("--version")
+    let mut probe = Command::new(cmd);
+    probe.arg("--version");
+    cache_env::isolate(&mut probe);
+    probe
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -52,14 +57,16 @@ fn has_command(cmd: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Run `bun <args>` in `cwd` with the given private cache dir and every
-/// `SOCKET_*` var scrubbed.
+/// Run `bun <args>` in `cwd` with the given private cache dir, the shared
+/// cache sandbox for everything bun keeps outside that dir (`~/.bun`, the
+/// npmrc it reads), and every `SOCKET_*` var scrubbed.
 fn bun(cwd: &Path, args: &[&str], cache_dir: &Path) -> Output {
     let mut cmd = Command::new("bun");
     cmd.args(args).current_dir(cwd);
     // Scrub BEFORE seeding: scrub_socket_env removes BUN_INSTALL_CACHE_DIR,
     // and Command's last env call wins.
     scrub_socket_env(&mut cmd);
+    cache_env::isolate(&mut cmd);
     cmd.env("BUN_INSTALL_CACHE_DIR", cache_dir);
     cmd.output().expect("failed to run bun")
 }

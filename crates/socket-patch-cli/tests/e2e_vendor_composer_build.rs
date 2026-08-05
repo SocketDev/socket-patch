@@ -37,6 +37,9 @@ use std::process::{Command, Output};
 
 use sha2::{Digest, Sha256};
 
+#[path = "common/cache_env.rs"]
+mod cache_env;
+
 /// Canonical lowercase patch uuid (a dedicated path level under
 /// `.socket/vendor/composer/`) — also what `dist.reference` must carry.
 const UUID: &str = "4d5e6f7a-8b9c-4a1b-8c2d-0123456789ab";
@@ -52,8 +55,10 @@ fn binary() -> PathBuf {
 }
 
 fn has_command(cmd: &str) -> bool {
-    Command::new(cmd)
-        .arg("--version")
+    let mut probe = Command::new(cmd);
+    probe.arg("--version");
+    cache_env::isolate(&mut probe);
+    probe
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
@@ -85,11 +90,10 @@ fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
 fn composer(cwd: &Path, args: &[&str], home: &Path, cache: &Path) -> Output {
     std::fs::create_dir_all(home).unwrap();
     std::fs::create_dir_all(cache).unwrap();
-    Command::new("composer")
-        .args(args)
-        .arg("--no-interaction")
-        .current_dir(cwd)
-        .env("COMPOSER_HOME", home)
+    let mut cmd = Command::new("composer");
+    cmd.args(args).arg("--no-interaction").current_dir(cwd);
+    cache_env::isolate(&mut cmd);
+    cmd.env("COMPOSER_HOME", home)
         .env("COMPOSER_CACHE_DIR", cache)
         .output()
         .expect("failed to run composer")

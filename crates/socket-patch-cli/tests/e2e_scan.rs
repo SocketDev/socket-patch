@@ -31,6 +31,9 @@ use std::process::{Command, Output};
 
 use sha2::{Digest, Sha256};
 
+#[path = "common/cache_env.rs"]
+mod cache_env;
+
 // ---------------------------------------------------------------------------
 // Constants (shared with e2e_npm; duplicated here because Rust integration
 // test binaries don't share modules without `tests/common/mod.rs` tricks
@@ -63,8 +66,10 @@ fn binary() -> PathBuf {
 }
 
 fn has_command(cmd: &str) -> bool {
-    Command::new(cmd)
-        .arg("--version")
+    let mut probe = Command::new(cmd);
+    probe.arg("--version");
+    cache_env::isolate(&mut probe);
+    probe
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
@@ -133,11 +138,10 @@ fn assert_run_ok(cwd: &Path, args: &[&str], context: &str) -> (String, String) {
 }
 
 fn npm_run(cwd: &Path, args: &[&str]) {
-    let out = Command::new("npm")
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .expect("failed to run npm");
+    let mut cmd = Command::new("npm");
+    cmd.args(args).current_dir(cwd);
+    cache_env::isolate(&mut cmd);
+    let out = cmd.output().expect("failed to run npm");
     assert!(
         out.status.success(),
         "npm {args:?} failed (exit {:?}).\nstdout:\n{}\nstderr:\n{}",
