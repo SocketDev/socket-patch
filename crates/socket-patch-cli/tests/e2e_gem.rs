@@ -24,6 +24,9 @@ use sha2::{Digest, Sha256};
 use wiremock::matchers::{method, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+#[path = "common/cache_env.rs"]
+mod cache_env;
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -40,8 +43,10 @@ fn binary() -> PathBuf {
 }
 
 fn has_command(cmd: &str) -> bool {
-    Command::new(cmd)
-        .arg("--version")
+    let mut probe = Command::new(cmd);
+    probe.arg("--version");
+    cache_env::isolate(&mut probe);
+    probe
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
@@ -87,11 +92,10 @@ fn assert_run_ok(cwd: &Path, args: &[&str], context: &str) -> (String, String) {
 }
 
 fn bundle_run(cwd: &Path, args: &[&str]) {
-    let out = Command::new("bundle")
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .expect("failed to run bundle");
+    let mut cmd = Command::new("bundle");
+    cmd.args(args).current_dir(cwd);
+    cache_env::isolate(&mut cmd);
+    let out = cmd.output().expect("failed to run bundle");
     assert!(
         out.status.success(),
         "bundle {args:?} failed (exit {:?}).\nstdout:\n{}\nstderr:\n{}",

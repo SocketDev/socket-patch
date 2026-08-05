@@ -664,6 +664,54 @@ export SOCKET_TELEMETRY_DISABLED=1 SOCKET_EXPERIMENTAL_MAVEN=1 SOCKET_EXPERIMENT
 # Isolate the pypi `.pth` hook's change-detection stamp per case so runs
 # don't bleed into each other (the stamp lives under XDG_CACHE_HOME).
 export XDG_CACHE_HOME="$WORKDIR/.cache"
+# Give the case its own home so every package manager's cache, store and
+# credentials stay inside WORKDIR. Under `--host` these run on the
+# developer's machine, where the default is their real home. The vars
+# below outrank HOME for their tools, so they are pointed inside it
+# rather than left to leak.
+#
+# RUSTUP_HOME is the exception: rustup's toolchains live under the real
+# home (defaulting to $HOME/.rustup when unset) and are shared, not
+# per-case. Pin it to that location BEFORE HOME is redirected, or rustup
+# resolves toolchains under the empty fake home and `cargo fetch` fails
+# even though CARGO_HOME is set. An already-exported RUSTUP_HOME (e.g. the
+# cargo Docker image) is preserved.
+export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+# Version-manager roots get the same treatment: rbenv/pyenv/nvm/fnm/volta/
+# asdf/sdkman/mise shims resolve their root from $HOME (or the XDG dirs,
+# which are also redirected below) by default, so a redirected HOME with no
+# root pinned makes ruby/python/node fail to launch at all under --host.
+# Seed each root from the real home first — only when the variable is not
+# already exported and the default directory actually exists, so this is a
+# no-op on machines (and containers) without that manager. Same list as
+# cache_env.rs TOOLCHAIN_ROOTS.
+for _vm in RBENV_ROOT:.rbenv PYENV_ROOT:.pyenv NVM_DIR:.nvm \
+    FNM_DIR:.fnm VOLTA_HOME:.volta ASDF_DIR:.asdf ASDF_DATA_DIR:.asdf \
+    SDKMAN_DIR:.sdkman MISE_DATA_DIR:.local/share/mise \
+    MISE_CONFIG_DIR:.config/mise; do
+  _vm_var="${_vm%%:*}"
+  _vm_dir="$HOME/${_vm#*:}"
+  if [ -z "${!_vm_var:-}" ] && [ -d "$_vm_dir" ]; then
+    export "$_vm_var=$_vm_dir"
+  fi
+done
+unset _vm _vm_var _vm_dir
+mkdir -p "$WORKDIR/home"
+# asdf/mise read the global tool selection from ~/.tool-versions and accept
+# no absolute path to it from the environment — carry the file itself over.
+if [ -f "$HOME/.tool-versions" ]; then
+  cp "$HOME/.tool-versions" "$WORKDIR/home/.tool-versions"
+fi
+export HOME="$WORKDIR/home"
+export XDG_DATA_HOME="$WORKDIR/home/.local/share" XDG_CONFIG_HOME="$WORKDIR/home/.config" XDG_STATE_HOME="$WORKDIR/home/.local/state"
+export CARGO_HOME="$WORKDIR/home/.cargo" GOPATH="$WORKDIR/home/go" GOMODCACHE="$WORKDIR/home/go/pkg/mod" GOCACHE="$WORKDIR/home/.cache/go-build"
+export PNPM_HOME="$WORKDIR/home/.pnpm" COREPACK_HOME="$WORKDIR/home/.corepack" NUGET_PACKAGES="$WORKDIR/home/.nuget/packages"
+# Maven ignores $HOME entirely: the JVM computes `user.home` from the
+# passwd entry (getpwuid / NSHomeDirectory), so without this mvn keeps
+# writing its ~/.m2 into the REAL home while the resolve_target maven arm
+# (and the socket binary, which is $HOME-based) look in the case home.
+# -Duser.home moves the whole ~/.m2 (repository + settings) with the case.
+export MAVEN_OPTS="${MAVEN_OPTS:+$MAVEN_OPTS }-Duser.home=$WORKDIR/home"
 # NOTE: deliberately do NOT export SOCKET_CWD. The install hook's apply
 # must run with whatever cwd the package manager sets for the lifecycle
 # script — the project root for a single project, and the *member* dir

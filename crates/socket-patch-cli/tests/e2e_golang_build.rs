@@ -19,7 +19,7 @@ use std::process::Command;
 #[path = "common/mod.rs"]
 mod common;
 
-use common::{binary, git_sha256, has_command};
+use common::{binary, cache_env, git_sha256, has_command};
 
 const UMOD: &str = "example.com/upstream";
 const UVER: &str = "v1.0.0";
@@ -63,9 +63,15 @@ fn run_socket(cwd: &Path, args: &[&str], modcache: &Path) -> (i32, String, Strin
     )
 }
 
+/// Run `go` with its caches sandboxed, then the fixture's own env on top.
+///
+/// `GOMODCACHE` alone is not isolation: `go build` keeps its compiled objects
+/// in `GOCACHE`, a different directory that does not follow `GOPATH` either,
+/// so without [`cache_env::isolate`] this test still filled the real home.
 fn go(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> std::process::Output {
     let mut cmd = Command::new("go");
     cmd.args(args).current_dir(dir);
+    cache_env::isolate(&mut cmd);
     for (k, v) in env {
         cmd.env(k, v);
     }

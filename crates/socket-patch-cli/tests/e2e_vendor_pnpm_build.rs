@@ -29,6 +29,9 @@ use std::process::{Command, Output, Stdio};
 
 use sha2::{Digest, Sha256};
 
+#[path = "common/cache_env.rs"]
+mod cache_env;
+
 const UUID: &str = "1a2b3c4d-5e6f-4a1b-8c2d-0123456789ab";
 const MARKER: &str = "/* SOCKET-PATCHED */\n";
 const DEP: &str = "left-pad";
@@ -45,10 +48,13 @@ fn binary() -> PathBuf {
 }
 
 fn has_corepack_pm(pm: &str) -> bool {
-    Command::new("corepack")
-        .args([pm, "--version"])
-        .env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0")
-        .stdout(Stdio::null())
+    // Isolated too: this probe is what actually downloads the package manager
+    // the first time, and corepack stores it under `COREPACK_HOME`.
+    let mut cmd = Command::new("corepack");
+    cmd.args([pm, "--version"])
+        .env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0");
+    cache_env::isolate(&mut cmd);
+    cmd.stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
         .map(|s| s.success())
@@ -62,6 +68,9 @@ fn corepack(cwd: &Path, pm: &str, args: &[&str]) -> Output {
         .current_dir(cwd)
         .env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0");
     scrub_socket_env(&mut cmd);
+    // After the scrub: it strips ambient `PNPM_*` and `npm_config_*`, which
+    // would otherwise take the sandbox values back out again.
+    cache_env::isolate(&mut cmd);
     cmd.output().expect("failed to run corepack")
 }
 

@@ -19,6 +19,9 @@ use std::process::{Command, Output};
 use sha2::{Digest, Sha256};
 use socket_patch_cli::args::{GLOBAL_ARG_ENV_VARS, LOCAL_ARG_ENV_VARS};
 
+#[path = "common/cache_env.rs"]
+mod cache_env;
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -144,11 +147,10 @@ fn find_site_packages(cwd: &Path) -> PathBuf {
 
 /// Create a venv and install pydantic-ai (without transitive deps for speed).
 fn setup_venv(cwd: &Path) {
-    let status = Command::new("python3")
-        .args(["-m", "venv", ".venv"])
-        .current_dir(cwd)
-        .status()
-        .expect("failed to create venv");
+    let mut cmd = Command::new("python3");
+    cmd.args(["-m", "venv", ".venv"]).current_dir(cwd);
+    cache_env::isolate(&mut cmd);
+    let status = cmd.status().expect("failed to create venv");
     assert!(status.success(), "python3 -m venv failed");
 
     let pip = if cfg!(windows) {
@@ -160,17 +162,17 @@ fn setup_venv(cwd: &Path) {
     // Install both the meta-package (for dist-info that matches the PURL)
     // and the slim package (for the actual Python source files).
     // --no-deps keeps the install fast by skipping transitive dependencies.
-    let out = Command::new(&pip)
-        .args([
-            "install",
-            "--no-deps",
-            "--disable-pip-version-check",
-            "pydantic-ai==0.0.36",
-            "pydantic-ai-slim==0.0.36",
-        ])
-        .current_dir(cwd)
-        .output()
-        .expect("failed to run pip install");
+    let mut cmd = Command::new(&pip);
+    cmd.args([
+        "install",
+        "--no-deps",
+        "--disable-pip-version-check",
+        "pydantic-ai==0.0.36",
+        "pydantic-ai-slim==0.0.36",
+    ])
+    .current_dir(cwd);
+    cache_env::isolate(&mut cmd);
+    let out = cmd.output().expect("failed to run pip install");
     assert!(
         out.status.success(),
         "pip install failed.\nstdout:\n{}\nstderr:\n{}",
@@ -526,20 +528,22 @@ fn test_pypi_global_lifecycle() {
     let cwd = cwd_dir.path();
 
     // -- Setup: pip install --target into global_dir -------------------------
-    let out = Command::new("python3")
-        .args([
-            "-m",
-            "pip",
-            "install",
-            "--target",
-            global_dir.path().to_str().unwrap(),
-            "--no-deps",
-            "--disable-pip-version-check",
-            "pydantic-ai==0.0.36",
-            "pydantic-ai-slim==0.0.36",
-        ])
-        .output()
-        .expect("failed to run pip install --target");
+    let mut cmd = Command::new("python3");
+    cmd.args([
+        "-m",
+        "pip",
+        "install",
+        "--target",
+        global_dir.path().to_str().unwrap(),
+        "--no-deps",
+        "--disable-pip-version-check",
+        "pydantic-ai==0.0.36",
+        "pydantic-ai-slim==0.0.36",
+    ]);
+    // `--target` is a flag, so the packages still land in the temp dir the
+    // test asserts against; the sandbox only moves pip's cache.
+    cache_env::isolate(&mut cmd);
+    let out = cmd.output().expect("failed to run pip install --target");
     assert!(
         out.status.success(),
         "pip install --target failed.\nstdout:\n{}\nstderr:\n{}",

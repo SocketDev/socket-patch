@@ -42,6 +42,9 @@ use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+#[path = "common/cache_env.rs"]
+mod cache_env;
+
 const ORG: &str = "test-org";
 const DEP: &str = "left-pad";
 const DEP_VERSION: &str = "1.3.0";
@@ -68,11 +71,14 @@ fn has_corepack_pm(pm: &str) -> bool {
     let Ok(probe) = tempfile::tempdir() else {
         return false;
     };
-    Command::new("corepack")
-        .args([pm, "--version"])
+    // Isolated too: this probe is what actually downloads the package manager
+    // the first time, and corepack stores it under `COREPACK_HOME`.
+    let mut cmd = Command::new("corepack");
+    cmd.args([pm, "--version"])
         .current_dir(probe.path())
-        .env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0")
-        .stdout(Stdio::null())
+        .env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0");
+    cache_env::isolate(&mut cmd);
+    cmd.stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
         .map(|s| s.success())
@@ -95,6 +101,7 @@ fn corepack(cwd: &Path, pm: &str, args: &[&str], extra_env: &[(&str, &str)]) -> 
     // Scrub FIRST (it removes YARN_* / SOCKET_* from the inherited env), then
     // set the hermetic flags so they survive.
     scrub_socket_env(&mut cmd);
+    cache_env::isolate(&mut cmd);
     cmd.env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0");
     for (k, v) in extra_env {
         cmd.env(k, v);

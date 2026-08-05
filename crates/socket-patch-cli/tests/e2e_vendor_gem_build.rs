@@ -38,6 +38,9 @@ use std::process::{Command, Output};
 
 use sha2::{Digest, Sha256};
 
+#[path = "common/cache_env.rs"]
+mod cache_env;
+
 /// Canonical lowercase patch uuid (a dedicated path level under
 /// `.socket/vendor/gem/`) — also the probe constant's runtime value.
 const UUID: &str = "3c4d5e6f-7a8b-4a1b-8c2d-0123456789ab";
@@ -51,8 +54,10 @@ fn binary() -> PathBuf {
 }
 
 fn has_command(cmd: &str) -> bool {
-    Command::new(cmd)
-        .arg("--version")
+    let mut probe = Command::new(cmd);
+    probe.arg("--version");
+    cache_env::isolate(&mut probe);
+    probe
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
@@ -62,7 +67,13 @@ fn has_command(cmd: &str) -> bool {
 /// `bundle --version` → `(major, minor)`. `None` when the probe fails to run
 /// or parse (treated as "no usable bundler" by the caller).
 fn bundler_version() -> Option<(u32, u32)> {
-    let out = Command::new("bundle").arg("--version").output().ok()?;
+    let mut probe = Command::new("bundle");
+    probe.arg("--version");
+    // Isolated so the probe answers for the same environment the real
+    // `bundle install` below runs in (an rbenv/asdf setup must not make
+    // the two disagree and turn a runnable suite into a silent SKIP).
+    cache_env::isolate(&mut probe);
+    let out = probe.output().ok()?;
     if !out.status.success() {
         return None;
     }
@@ -109,6 +120,9 @@ fn bundle(cwd: &Path, args: &[&str], frozen: bool) -> Output {
             cmd.env_remove(&k);
         }
     }
+    // After the `BUNDLE_*`/`GEM_*` scrub, which would otherwise take the
+    // sandbox's own BUNDLE_USER_HOME / GEM_SPEC_CACHE straight back out.
+    cache_env::isolate(&mut cmd);
     cmd.env("BUNDLE_APP_CONFIG", cwd.join(".bundle"));
     if frozen {
         cmd.env("BUNDLE_FROZEN", "true");
@@ -259,10 +273,10 @@ fn gem_vendor_fresh_checkout_bundle_install_and_revert() {
         .unwrap_or_else(|| panic!("could not read the resolved {DEP} version from Gemfile.lock"));
 
     // The installed gem dir under bundler's deployment layout.
-    let api = Command::new("ruby")
-        .args(["-e", "puts Gem.ruby_api_version"])
-        .output()
-        .expect("failed to run ruby");
+    let mut ruby = Command::new("ruby");
+    ruby.args(["-e", "puts Gem.ruby_api_version"]);
+    cache_env::isolate(&mut ruby);
+    let api = ruby.output().expect("failed to run ruby");
     assert!(api.status.success(), "ruby api version probe failed");
     let api = String::from_utf8_lossy(&api.stdout).trim().to_string();
     let gem_dir = proj

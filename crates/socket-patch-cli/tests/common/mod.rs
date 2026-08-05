@@ -22,6 +22,11 @@ use std::process::{Command, Output};
 
 use sha2::{Digest, Sha256};
 
+/// Cache isolation for the package managers these helpers spawn. Files
+/// that don't need the rest of this module pull it in on its own with
+/// `#[path = "common/cache_env.rs"] mod cache_env;`.
+pub mod cache_env;
+
 // ── Binary discovery + invocation ─────────────────────────────────────
 
 /// Absolute path to the built `socket-patch` binary that cargo
@@ -36,8 +41,10 @@ pub fn binary() -> PathBuf {
 /// (CI gates the toolchain at the workflow level; this is a
 /// belt-and-braces guard for local runs).
 pub fn has_command(cmd: &str) -> bool {
-    Command::new(cmd)
-        .arg("--version")
+    let mut probe = Command::new(cmd);
+    probe.arg("--version");
+    cache_env::isolate(&mut probe);
+    probe
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
@@ -198,9 +205,13 @@ pub fn pnpm_run(cwd: &Path, args: &[&str], extra_env: &[(&str, &str)]) {
 /// Run `cargo` in `cwd`. Returns the raw Output so callers can
 /// inspect stdout/stderr/exit on either pass or fail — the cargo
 /// e2e test wants both passing and failing cases (negative control).
+///
+/// Caches are sandboxed by [`cache_env::isolate`] before `extra_env`
+/// is applied, so a caller that pins its own `CARGO_HOME` still wins.
 pub fn cargo_run(cwd: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
     let mut cmd = Command::new("cargo");
     cmd.args(args).current_dir(cwd);
+    cache_env::isolate(&mut cmd);
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
@@ -210,6 +221,9 @@ pub fn cargo_run(cwd: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> Outpu
 fn run_toolchain(cwd: &Path, exe: &str, args: &[&str], extra_env: &[(&str, &str)]) {
     let mut cmd = Command::new(exe);
     cmd.args(args).current_dir(cwd);
+    // Sandbox the caches first so `extra_env` can still override any
+    // individual one (`Command` env ops are last-write-wins per name).
+    cache_env::isolate(&mut cmd);
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
