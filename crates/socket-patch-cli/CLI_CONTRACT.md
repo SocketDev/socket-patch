@@ -981,9 +981,10 @@ record per PURL, so exactly one is chosen. Both `get` and every `scan`
 mode rank candidates identically (`socket_patch_core::api::ranking`),
 best first:
 
-1. **Merged** patches — the fix has landed upstream.
-2. **Severity** — `critical > high > medium = moderate > low > (unknown)`,
+1. **Severity** — `critical > high > medium = moderate > low > (unknown)`,
    taken as the worst severity across everything the patch fixes.
+2. **Merge state** — a patch that remediates *more* advisories in one blob
+   leads. Inferred, not flagged: see below.
 3. **Patch publish date**, most recent first — when the *patch* was
    published, never the upstream package's release date. Unparseable or
    absent dates sort last.
@@ -993,6 +994,42 @@ best first:
 `tier` is an **access filter, not a ranking signal**: a free `critical`
 patch outranks a paid `low` one. Paid patches are excluded outright for
 callers whose `canAccessPaidPatches` is false.
+
+#### Merge state is inferred, not reported
+
+There is no `merged` field on the wire and none is required. A merged
+patch is by definition one that folds several fixes into a single blob,
+so it **names several advisories** — which every endpoint already tells
+us. Merge state is therefore the count of distinct advisories a patch
+remediates: `vulnerabilities` map keys on `by-package` / `view`,
+`ghsaIds` on `batch` (falling back to `cveIds` only when no GHSA is
+named). `1` is an ordinary patch, `>= 2` is merged.
+
+Advisories are counted, **not** CVE ids: one advisory routinely carries
+several CVE aliases, and counting those would inflate a single-fix patch
+into a phantom merged one.
+
+As of 2026-08-05 production publishes no merged patches — all 28 patches
+sampled across npm/PyPI/gem/cargo covered exactly one advisory each — so
+this rung is currently inert and ranking falls through to recency. The
+moment a consolidated patch is published it is preferred automatically,
+with no client *or* server change.
+
+#### Why severity sits above merge state
+
+The merged patch is the general preference: it fixes the most in one
+shot, and only one patch per PURL can be applied, so breadth is what an
+operator wants. But it must never shadow a *worse* vulnerability. If a
+patch addresses a higher-severity advisory than anything the merged patch
+covers, that one wins — you do not leave a critical unfixed to pick up
+two extra mediums. Severity on the top rung expresses exactly that,
+because a patch's severity is the worst advisory it fixes:
+
+| merged patch | rival patch | winner | why |
+|---|---|---|---|
+| high     | critical | rival  | higher severity available |
+| critical | high     | merged | merged already covers the worst |
+| high     | high     | merged | severities tie → breadth decides |
 
 This ordering is also the presentation order everywhere patches are
 listed — `scan --json`'s `packages[].patches[]`, `get`'s "Found
@@ -1005,18 +1042,18 @@ get the interactive picker (or `selection_required` in `--json`); the
 ranking decides the presented order and hence the highlighted default,
 not the outcome.
 
-Two additive keys may appear on `scan --json`'s `packages[].patches[]`
-entries, both omitted when absent: `publishedAt` (present whenever the
-server supplies it; the public-proxy fallback path fills it in from the
-per-package results) and `merged` (only ever present as `true`).
+One additive key may appear on `scan --json`'s `packages[].patches[]`
+entries, omitted when absent: `publishedAt`, present whenever the server
+supplies it (the public-proxy fallback path fills it in from the
+per-package results).
 
 > **Known gap — batch responses without `publishedAt`.** `scan`'s
 > discovery (`packages[]`, the table, `updates[]`) is built from the
 > **batch** endpoint, whose response shape currently omits `publishedAt`;
 > the selection that `--apply` performs is built from the **by-package**
-> endpoint, which carries it. Ranks 1, 2, 4 and 5 agree across both, so
-> the two only diverge for a package whose top candidates tie on merge
-> status *and* severity — there the batch side falls through to the UUID
+> endpoint, which carries it. Ranks 1, 2 and 4 agree across both, so the
+> two only diverge for a package whose top candidates tie on severity
+> *and* merge state — there the batch side falls through to the UUID
 > tiebreak while apply correctly uses the date.
 >
 > Live example: `pkg:npm/axios@1.6.0` has two free `HIGH` patches;

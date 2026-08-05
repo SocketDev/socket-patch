@@ -1480,7 +1480,6 @@ fn convert_search_result_to_batch_info(patch: PatchSearchResult) -> BatchPatchIn
         // but dropping it here would cost this path the recency tiebreak in
         // `ranking` — and it is the one path where we definitely have it.
         published_at: Some(patch.published_at),
-        merged: patch.merged,
     }
 }
 
@@ -1691,7 +1690,6 @@ mod tests {
             license: "MIT".into(),
             tier: "free".into(),
             vulnerabilities: vulns,
-            merged: false,
         };
 
         let info = convert_search_result_to_batch_info(patch);
@@ -1764,7 +1762,6 @@ mod tests {
             license: "MIT".into(),
             tier: "free".into(),
             vulnerabilities: vulns,
-            merged: false,
         }
     }
 
@@ -2466,7 +2463,6 @@ mod tests {
                     license: "MIT".into(),
                     tier: "free".into(),
                     vulnerabilities: HashMap::new(),
-                    merged: false,
                 })
                 .collect(),
             can_access_paid_patches,

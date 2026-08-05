@@ -480,6 +480,37 @@ async fn published_uuids(purl: &str) -> Result<Vec<String>, String> {
         .unwrap_or_default())
 }
 
+/// `GET /patch/by-package/<purl>` returning, per patch, the `(uuid,
+/// advisory_count)` pair that drives merge-state inference.
+async fn published_patch_advisory_counts(purl: &str) -> Result<Vec<(String, usize)>, String> {
+    let url = format!("{PROXY}/patch/by-package/{}", urlencode(purl));
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .header("Accept", "application/json")
+        .send()
+        .await
+        .map_err(|e| format!("GET {url}: {e}"))?;
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| format!("GET {url}: reading body: {e}"))?;
+    let v: serde_json::Value =
+        serde_json::from_str(&body).map_err(|e| format!("GET {url}: bad JSON ({e}):\n{body}"))?;
+    Ok(v["patches"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|p| {
+                    Some((
+                        p["uuid"].as_str()?.to_string(),
+                        p["vulnerabilities"].as_object()?.len(),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
 /// `GET /patch/by-package/<purl>` returning `(uuid, publishedAt)` pairs.
 /// Sibling of [`published_uuids`] for tests that care about patch metadata
 /// rather than just which UUIDs exist.
@@ -579,6 +610,67 @@ async fn preflight_required_patches_are_published() {
         "required production patches are no longer available:\n  - {}",
         failures.join("\n  - ")
     );
+}
+
+/// Canary: production must keep naming advisories, because merge state is
+/// **inferred** from the advisory count rather than read off a flag.
+///
+/// `api::ranking` ranks a patch that remediates several advisories above one
+/// that remediates a single advisory. The whole signal is the size of the
+/// `vulnerabilities` map. If production ever stopped populating it — shipping
+/// patches with an empty map, or moving advisory ids somewhere else — every
+/// patch would collapse to coverage 0, the merge rung would go permanently
+/// inert, and selection would silently fall through to recency with no error
+/// anywhere.
+///
+/// This asserts only that the signal EXISTS (every patch names >= 1
+/// advisory), never how many. Production publishes no merged patches today —
+/// all patches sampled cover exactly one advisory — and the day that changes
+/// is not a regression, so a count of >= 2 must not fail this test.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "live production API: contacts patches-api.socket.dev. Run with --ignored."]
+async fn canary_patches_name_advisories_so_merge_state_is_inferable() {
+    let mut failures: Vec<String> = Vec::new();
+    let mut coverage_seen: Vec<(String, String, usize)> = Vec::new();
+
+    for purl in [NPM_PURL, PYPI_PURL, CARGO_PURL, GEM_PURL] {
+        match published_patch_advisory_counts(purl).await {
+            Err(e) => failures.push(format!("{purl}: production probe failed: {e}")),
+            Ok(patches) if patches.is_empty() => {
+                failures.push(format!("{purl}: production publishes no patches"))
+            }
+            Ok(patches) => {
+                for (uuid, count) in patches {
+                    if count == 0 {
+                        failures.push(format!(
+                            "{purl}: patch {uuid} names ZERO advisories — merge-state \
+                             inference has no signal to work with, so the merge rung in \
+                             api::ranking is dead for this patch"
+                        ));
+                    }
+                    coverage_seen.push((purl.to_string(), uuid, count));
+                }
+            }
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "merge-state inference signal is missing from production:\n  - {}",
+        failures.join("\n  - ")
+    );
+
+    // Informational: surfaces the day production starts publishing merged
+    // patches, without failing when it does.
+    let merged: Vec<_> = coverage_seen.iter().filter(|(_, _, c)| *c >= 2).collect();
+    if merged.is_empty() {
+        eprintln!(
+            "[info] production publishes no merged patches yet ({} patches, all single-advisory)",
+            coverage_seen.len()
+        );
+    } else {
+        eprintln!("[info] production now publishes merged patches: {merged:?}");
+    }
 }
 
 /// Canary: production's `publishedAt` must stay a **per-patch** date.

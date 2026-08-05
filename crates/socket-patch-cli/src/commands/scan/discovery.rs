@@ -320,7 +320,6 @@ mod tests {
                     severity: None,
                     title: String::new(),
                     published_at: None,
-                    merged: false,
                 })
                 .collect(),
         }
@@ -343,7 +342,6 @@ mod tests {
                     severity: Some((*severity).to_string()),
                     title: String::new(),
                     published_at: Some((*published).to_string()),
-                    merged: false,
                 })
                 .collect(),
         }
@@ -486,7 +484,6 @@ mod tests {
                 severity: None,
                 title: String::new(),
                 published_at: None,
-                merged: false,
             }],
         }
     }
@@ -533,7 +530,6 @@ mod tests {
                     severity: None,
                     title: String::new(),
                     published_at: None,
-                    merged: false,
                 },
                 BatchPatchInfo {
                     uuid: "u2".to_string(),
@@ -544,7 +540,6 @@ mod tests {
                     severity: None,
                     title: String::new(),
                     published_at: None,
-                    merged: false,
                 },
             ],
         };

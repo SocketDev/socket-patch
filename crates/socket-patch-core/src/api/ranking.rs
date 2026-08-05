@@ -10,10 +10,10 @@
 //!
 //! **The order, best first:**
 //!
-//! 1. **Merged patches** — the fix has landed upstream, so it is the one
-//!    the ecosystem is converging on.
-//! 2. **Severity** — critical > high > medium/moderate > low > unknown,
+//! 1. **Severity** — critical > high > medium/moderate > low > unknown,
 //!    taken as the worst severity across everything the patch fixes.
+//! 2. **Merge state** — a patch that remediates *more* advisories in one
+//!    blob leads. See [`merged_coverage`] for how this is inferred.
 //! 3. **Patch publish date**, most recent first. This is the date *the
 //!    patch* was published, never the date the upstream package version
 //!    was released — a 2020 package routinely carries a patch published
@@ -22,8 +22,26 @@
 //! 4. Paid tier, then UUID — pure tiebreaks, present only so the order is
 //!    total and therefore reproducible run to run.
 //!
-//! Note what is *not* in the list: `tier` is an access filter, not a
-//! ranking signal. A free critical patch outranks a paid low one.
+//! # Why severity sits above merge state
+//!
+//! The merged patch is the general preference: it fixes the most in one
+//! shot, and the manifest only holds one patch per PURL, so breadth is
+//! what an operator actually wants. But it must not shadow a *worse*
+//! vulnerability. If a newly published patch addresses a higher-severity
+//! advisory than anything the merged patch covers, that one wins — you do
+//! not leave a critical unfixed to pick up two extra mediums.
+//!
+//! Putting severity on the top rung expresses exactly that, because the
+//! severity of a patch is the *worst* advisory it fixes:
+//!
+//! | merged patch | rival patch | winner | why |
+//! |---|---|---|---|
+//! | high  | critical | rival  | higher severity available |
+//! | critical | high  | merged | merged already covers the worst |
+//! | high  | high     | merged | severities tie → breadth decides |
+//!
+//! Note what is *not* a ranking signal: `tier` is an access filter. A free
+//! critical patch outranks a paid low one.
 
 use std::cmp::{Ordering, Reverse};
 
@@ -57,6 +75,29 @@ pub fn max_severity_order<'a>(severities: impl Iterator<Item = &'a str>) -> u8 {
         .unwrap_or_else(|| severity_order(None))
 }
 
+/// How many distinct advisories a patch remediates — the **inferred merge
+/// state**, derived entirely from data the API already returns.
+///
+/// There is no `merged` flag on the wire, and none is needed: a merged
+/// patch is by definition one that folds several fixes into a single blob,
+/// so it names several advisories. `1` is an ordinary single-advisory
+/// patch; `>= 2` is a merged one; `0` means the patch names no advisory at
+/// all and cannot be preferred on this axis.
+///
+/// Counting **advisories** (GHSA ids) rather than CVE ids is deliberate:
+/// one advisory routinely carries several CVE aliases, and counting those
+/// would inflate a single-fix patch into a phantom merged one.
+///
+/// Empirically, production publishes no merged patches yet — all 28
+/// patches sampled across npm/PyPI/gem/cargo on 2026-08-05 covered exactly
+/// one advisory each, so this returns `1` for every patch live today. That
+/// is the correct answer, not a degenerate one: the ranking simply falls
+/// through to recency, and the moment Socket publishes a consolidated
+/// patch it is preferred automatically, with no client or server change.
+pub fn merged_coverage(advisory_count: usize) -> usize {
+    advisory_count
+}
+
 /// The comparable ranking key. Sorting ascending puts the best patch first.
 ///
 /// Kept as an explicit tuple-shaped struct rather than an ad-hoc tuple so
@@ -64,10 +105,14 @@ pub fn max_severity_order<'a>(severities: impl Iterator<Item = &'a str>) -> u8 {
 /// meaning of each position is documented in one place.
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct RankKey<'a> {
-    /// `false` sorts first, so this is negated: merged patches lead.
-    not_merged: bool,
-    /// 0 = critical … 4 = unknown.
+    /// 0 = critical … 4 = unknown. Top rung — see the module docs for why
+    /// this outranks merge state.
     severity: u8,
+    /// Advisory count, most first (hence `Reverse`): the inferred merge
+    /// state from [`merged_coverage`]. Below severity so a merged patch
+    /// can never shadow a higher-severity fix; above recency so breadth
+    /// beats freshness when the severities tie.
+    coverage: Reverse<usize>,
     /// Newest **patch** first — the patch's own publication date, not the
     /// package's release date. Unparseable or absent timestamps collapse
     /// to 0 and therefore sort last: the right treatment for a date we
@@ -85,8 +130,10 @@ struct RankKey<'a> {
 
 fn rank_search_result(p: &PatchSearchResult) -> RankKey<'_> {
     RankKey {
-        not_merged: !p.merged,
         severity: max_severity_order(p.vulnerabilities.values().map(|v| v.severity.as_str())),
+        // The map is keyed by advisory id, so its length IS the advisory
+        // count — no CVE-alias inflation.
+        coverage: Reverse(merged_coverage(p.vulnerabilities.len())),
         patch_published: Reverse(parse_timestamp_secs(&p.published_at).unwrap_or(0)),
         not_paid: p.tier != "paid",
         uuid: &p.uuid,
@@ -94,9 +141,18 @@ fn rank_search_result(p: &PatchSearchResult) -> RankKey<'_> {
 }
 
 fn rank_batch_info(p: &BatchPatchInfo) -> RankKey<'_> {
+    // `ghsa_ids` is the batch shape's mirror of the `vulnerabilities` map
+    // keys, so it is the advisory count. Fall back to `cve_ids` only when
+    // the server named no GHSA at all — otherwise a single advisory with
+    // two CVE aliases would read as a merged patch.
+    let advisories = if p.ghsa_ids.is_empty() {
+        p.cve_ids.len()
+    } else {
+        p.ghsa_ids.len()
+    };
     RankKey {
-        not_merged: !p.merged,
         severity: severity_order(p.severity.as_deref()),
+        coverage: Reverse(merged_coverage(advisories)),
         patch_published: Reverse(
             p.published_at
                 .as_deref()
@@ -145,13 +201,25 @@ mod tests {
             .collect()
     }
 
-    fn search(
+    /// A single-advisory patch — the only shape production publishes today.
+    fn search(uuid: &str, tier: &str, published: &str, severity: &str) -> PatchSearchResult {
+        search_multi(uuid, tier, published, &[severity])
+    }
+
+    /// A patch fixing one advisory per entry in `severities`. Two or more
+    /// makes it a *merged* patch under [`merged_coverage`].
+    fn search_multi(
         uuid: &str,
         tier: &str,
         published: &str,
-        severity: &str,
-        merged: bool,
+        severities: &[&str],
     ) -> PatchSearchResult {
+        let entries: Vec<(String, &str)> = severities
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (format!("GHSA-{uuid}-{i}"), *s))
+            .collect();
+        let refs: Vec<(&str, &str)> = entries.iter().map(|(k, v)| (k.as_str(), *v)).collect();
         PatchSearchResult {
             uuid: uuid.to_string(),
             purl: "pkg:npm/foo@1.0.0".to_string(),
@@ -159,8 +227,7 @@ mod tests {
             description: String::new(),
             license: "MIT".to_string(),
             tier: tier.to_string(),
-            vulnerabilities: vulns(&[("GHSA-aaaa-aaaa-aaaa", severity)]),
-            merged,
+            vulnerabilities: vulns(&refs),
         }
     }
 
@@ -169,18 +236,30 @@ mod tests {
         tier: &str,
         published: Option<&str>,
         severity: Option<&str>,
-        merged: bool,
+    ) -> BatchPatchInfo {
+        batch_multi(uuid, tier, published, severity, 1)
+    }
+
+    /// Batch-shaped patch naming `advisories` GHSA ids — the batch mirror
+    /// of `search_multi`.
+    fn batch_multi(
+        uuid: &str,
+        tier: &str,
+        published: Option<&str>,
+        severity: Option<&str>,
+        advisories: usize,
     ) -> BatchPatchInfo {
         BatchPatchInfo {
             uuid: uuid.to_string(),
             purl: "pkg:npm/foo@1.0.0".to_string(),
             tier: tier.to_string(),
             cve_ids: Vec::new(),
-            ghsa_ids: Vec::new(),
+            ghsa_ids: (0..advisories)
+                .map(|i| format!("GHSA-{uuid}-{i}"))
+                .collect(),
             severity: severity.map(str::to_string),
             title: String::new(),
             published_at: published.map(str::to_string),
-            merged,
         }
     }
 
@@ -237,15 +316,124 @@ mod tests {
     // ── Rank key precedence ───────────────────────────────────────────
 
     #[test]
-    fn merged_outranks_a_more_severe_unmerged_patch() {
-        // Rule 1 beats rule 2: a merged low patch leads a critical one.
+    fn merged_patch_wins_when_severities_tie() {
+        // The general preference. `z_merged` fixes two HIGH advisories,
+        // `a_single` fixes one; severities tie, so breadth decides. The
+        // uuid tiebreak points at `a_single`, and `a_single` is also the
+        // more recent patch — so only the coverage rung can produce this.
         assert_eq!(
             best_search(vec![
-                search("crit", "free", "2026-01-01T00:00:00Z", "critical", false),
-                search("merged", "free", "2020-01-01T00:00:00Z", "low", true),
+                search("a_single", "free", "2026-08-01T00:00:00Z", "high"),
+                search_multi(
+                    "z_merged",
+                    "free",
+                    "2020-01-01T00:00:00Z",
+                    &["high", "high"]
+                ),
             ]),
-            "merged"
+            "z_merged"
         );
+    }
+
+    #[test]
+    fn a_higher_severity_patch_beats_the_merged_one() {
+        // The exception. The merged patch consolidates two HIGHs, but a
+        // rival addresses a CRITICAL it does not cover. Taking breadth here
+        // would leave the worst vulnerability unfixed, so the CRITICAL
+        // wins — even though it is older, single-advisory, and its uuid
+        // sorts last.
+        assert_eq!(
+            best_search(vec![
+                search_multi(
+                    "a_merged",
+                    "free",
+                    "2026-08-01T00:00:00Z",
+                    &["high", "high"]
+                ),
+                search("z_critical", "free", "2020-01-01T00:00:00Z", "critical"),
+            ]),
+            "z_critical"
+        );
+    }
+
+    #[test]
+    fn merged_patch_wins_when_it_already_covers_the_worst_advisory() {
+        // Third row of the table in the module docs: the merged patch's max
+        // severity already matches the rival's, so there is no
+        // higher-severity fix being shadowed and breadth decides again.
+        assert_eq!(
+            best_search(vec![
+                search(
+                    "a_critical_only",
+                    "free",
+                    "2026-08-01T00:00:00Z",
+                    "critical"
+                ),
+                search_multi(
+                    "z_merged_crit",
+                    "free",
+                    "2020-01-01T00:00:00Z",
+                    &["critical", "low"],
+                ),
+            ]),
+            "z_merged_crit"
+        );
+    }
+
+    #[test]
+    fn coverage_counts_advisories_not_cve_aliases() {
+        // One advisory carrying several CVE aliases is NOT a merged patch.
+        // The search shape counts `vulnerabilities` map keys, so aliases in
+        // `cves` cannot inflate it; pin that a single-advisory patch stays
+        // at coverage 1 no matter how many CVEs hang off it.
+        let mut aliased = search("a_aliased", "free", "2026-08-01T00:00:00Z", "high");
+        aliased
+            .vulnerabilities
+            .values_mut()
+            .next()
+            .unwrap()
+            .cves
+            .extend(["CVE-1".into(), "CVE-2".into(), "CVE-3".into()]);
+        assert_eq!(aliased.vulnerabilities.len(), 1, "still one advisory");
+        // A genuine 2-advisory patch must still outrank it despite being
+        // older and later-sorting by uuid.
+        assert_eq!(
+            best_search(vec![
+                aliased,
+                search_multi(
+                    "z_merged",
+                    "free",
+                    "2020-01-01T00:00:00Z",
+                    &["high", "high"]
+                ),
+            ]),
+            "z_merged"
+        );
+    }
+
+    #[test]
+    fn merged_coverage_is_the_advisory_count() {
+        assert_eq!(merged_coverage(0), 0);
+        assert_eq!(merged_coverage(1), 1, "ordinary single-advisory patch");
+        assert!(merged_coverage(2) > merged_coverage(1), "merged leads");
+        assert!(merged_coverage(5) > merged_coverage(2));
+    }
+
+    #[test]
+    fn patch_naming_no_advisory_ranks_below_a_single_advisory_patch() {
+        // Coverage 0: nothing to prefer it for. It is also newer and
+        // earlier by uuid, so only the coverage rung demotes it.
+        let none = PatchSearchResult {
+            vulnerabilities: HashMap::new(),
+            ..search("a_none", "free", "2026-08-01T00:00:00Z", "high")
+        };
+        // Give both the same (unknown) severity so coverage is the decider:
+        // an empty vulnerabilities map ranks `severity_order(None)`.
+        let one = PatchSearchResult {
+            vulnerabilities: vulns(&[("GHSA-x", "not-a-severity")]),
+            ..search("z_one", "free", "2020-01-01T00:00:00Z", "high")
+        };
+        assert_eq!(best_search(vec![none, one]), "z_one");
     }
 
     #[test]
@@ -254,14 +442,8 @@ mod tests {
         // fixes a `critical`. Critical must win.
         assert_eq!(
             best_search(vec![
-                search("newest_low", "free", "2026-08-01T00:00:00Z", "low", false),
-                search(
-                    "older_crit",
-                    "free",
-                    "2020-01-01T00:00:00Z",
-                    "critical",
-                    false
-                ),
+                search("newest_low", "free", "2026-08-01T00:00:00Z", "low"),
+                search("older_crit", "free", "2020-01-01T00:00:00Z", "critical"),
             ]),
             "older_crit"
         );
@@ -273,14 +455,8 @@ mod tests {
         // does not rank.
         assert_eq!(
             best_search(vec![
-                search("paid_low", "paid", "2026-08-01T00:00:00Z", "low", false),
-                search(
-                    "free_crit",
-                    "free",
-                    "2020-01-01T00:00:00Z",
-                    "critical",
-                    false
-                ),
+                search("paid_low", "paid", "2026-08-01T00:00:00Z", "low"),
+                search("free_crit", "free", "2020-01-01T00:00:00Z", "critical"),
             ]),
             "free_crit"
         );
@@ -294,8 +470,8 @@ mod tests {
         // out fails this test.)
         assert_eq!(
             best_search(vec![
-                search("a_old", "free", "2024-01-01T00:00:00Z", "high", false),
-                search("z_new", "free", "2026-01-01T00:00:00Z", "high", false),
+                search("a_old", "free", "2024-01-01T00:00:00Z", "high"),
+                search("z_new", "free", "2026-01-01T00:00:00Z", "high"),
             ]),
             "z_new"
         );
@@ -313,20 +489,8 @@ mod tests {
         // both keys would be equal here and the ordering would collapse to
         // the UUID tiebreak — which would pick `0bc312a6` (the OLDER
         // patch), not `83f5a654`.
-        let older = search(
-            "0bc312a6",
-            "free",
-            "Fri, 27 Mar 2026 19:12:42 GMT",
-            "high",
-            false,
-        );
-        let newer = search(
-            "83f5a654",
-            "free",
-            "Mon, 03 Aug 2026 20:23:06 GMT",
-            "high",
-            false,
-        );
+        let older = search("0bc312a6", "free", "Fri, 27 Mar 2026 19:12:42 GMT", "high");
+        let newer = search("83f5a654", "free", "Mon, 03 Aug 2026 20:23:06 GMT", "high");
         assert_eq!(older.purl, newer.purl, "same package version");
         assert!(
             older.uuid < newer.uuid,
@@ -348,8 +512,8 @@ mod tests {
         // answer by accident.
         assert_eq!(
             best_search(vec![
-                search("a_older", "free", older, "high", false),
-                search("z_newer", "free", newer, "high", false),
+                search("a_older", "free", older, "high"),
+                search("z_newer", "free", newer, "high"),
             ]),
             "z_newer"
         );
@@ -361,15 +525,15 @@ mod tests {
         // not demote it below a less severe one.
         assert_eq!(
             best_search(vec![
-                search("dated_high", "free", "2026-01-01T00:00:00Z", "high", false),
-                search("undated_crit", "free", "not a date", "critical", false),
+                search("dated_high", "free", "2026-01-01T00:00:00Z", "high"),
+                search("undated_crit", "free", "not a date", "critical"),
             ]),
             "undated_crit"
         );
         assert_eq!(
             best_search(vec![
-                search("undated", "free", "", "high", false),
-                search("dated", "free", "2020-01-01T00:00:00Z", "high", false),
+                search("undated", "free", "", "high"),
+                search("dated", "free", "2020-01-01T00:00:00Z", "high"),
             ]),
             "dated"
         );
@@ -383,8 +547,8 @@ mod tests {
         // this fails the moment the date rung stops working or is demoted.
         assert_eq!(
             best_search(vec![
-                search("a_old_paid", "paid", "2024-01-01T00:00:00Z", "high", false),
-                search("z_new_free", "free", "2026-01-01T00:00:00Z", "high", false),
+                search("a_old_paid", "paid", "2024-01-01T00:00:00Z", "high"),
+                search("z_new_free", "free", "2026-01-01T00:00:00Z", "high"),
             ]),
             "z_new_free"
         );
@@ -394,8 +558,8 @@ mod tests {
     fn tier_breaks_ties_after_date() {
         assert_eq!(
             best_search(vec![
-                search("free", "free", "2026-01-01T00:00:00Z", "high", false),
-                search("paid", "paid", "2026-01-01T00:00:00Z", "high", false),
+                search("free", "free", "2026-01-01T00:00:00Z", "high"),
+                search("paid", "paid", "2026-01-01T00:00:00Z", "high"),
             ]),
             "paid"
         );
@@ -405,38 +569,55 @@ mod tests {
     fn uuid_is_a_deterministic_final_tiebreak() {
         // Two patches identical in every ranked dimension must still land
         // in a fixed order — otherwise `scan --json` is not reproducible.
-        let a = search("aaaa", "free", "2026-01-01T00:00:00Z", "high", false);
-        let z = search("zzzz", "free", "2026-01-01T00:00:00Z", "high", false);
+        let a = search("aaaa", "free", "2026-01-01T00:00:00Z", "high");
+        let z = search("zzzz", "free", "2026-01-01T00:00:00Z", "high");
         assert_eq!(best_search(vec![z.clone(), a.clone()]), "aaaa");
         assert_eq!(best_search(vec![a, z]), "aaaa");
     }
 
     #[test]
     fn full_precedence_chain_in_one_sort() {
+        // Exercises all four rungs at once. UUIDs are lettered in reverse
+        // of the expected order so the uuid tiebreak cannot reproduce the
+        // answer on its own.
         let mut patches = [
-            search("d_low_new", "paid", "2026-08-01T00:00:00Z", "low", false),
-            search(
-                "b_crit_old",
+            // rung 3: loses to `d` on recency (same severity, same coverage)
+            search("e_high_old", "free", "2019-01-01T00:00:00Z", "high"),
+            // rung 1: worst severity of the lot
+            search("d_high_new", "free", "2026-01-01T00:00:00Z", "high"),
+            // rung 1: critical, but single-advisory
+            search("c_crit_single", "paid", "2026-08-01T00:00:00Z", "critical"),
+            // rung 2: critical AND merged -> the winner
+            search_multi(
+                "b_crit_merged",
                 "free",
                 "2020-01-01T00:00:00Z",
-                "critical",
-                false,
+                &["critical", "low"],
             ),
-            search("a_merged", "free", "2019-01-01T00:00:00Z", "low", true),
-            search("c_high_new", "free", "2026-01-01T00:00:00Z", "high", false),
+            // rung 1: lowest severity, so last despite being newest
+            search("a_low_newest", "paid", "2026-12-01T00:00:00Z", "low"),
         ];
         patches.sort_by(cmp_search_results);
         let order: Vec<&str> = patches.iter().map(|p| p.uuid.as_str()).collect();
-        assert_eq!(order, ["a_merged", "b_crit_old", "c_high_new", "d_low_new"]);
+        assert_eq!(
+            order,
+            [
+                "b_crit_merged",
+                "c_crit_single",
+                "d_high_new",
+                "e_high_old",
+                "a_low_newest"
+            ]
+        );
     }
 
     #[test]
     fn worst_vulnerability_in_the_map_drives_severity() {
         let mixed = PatchSearchResult {
             vulnerabilities: vulns(&[("GHSA-a", "low"), ("GHSA-b", "critical")]),
-            ..search("mixed", "free", "2020-01-01T00:00:00Z", "low", false)
+            ..search("mixed", "free", "2020-01-01T00:00:00Z", "low")
         };
-        let high = search("high_only", "free", "2026-01-01T00:00:00Z", "high", false);
+        let high = search("high_only", "free", "2026-01-01T00:00:00Z", "high");
         // `mixed` is older but carries a critical — it must win.
         assert_eq!(best_search(vec![high, mixed]), "mixed");
     }
@@ -445,9 +626,9 @@ mod tests {
     fn patch_with_no_vulnerabilities_ranks_below_one_with_a_low() {
         let none = PatchSearchResult {
             vulnerabilities: HashMap::new(),
-            ..search("no_vulns", "free", "2026-08-01T00:00:00Z", "low", false)
+            ..search("no_vulns", "free", "2026-08-01T00:00:00Z", "low")
         };
-        let low = search("has_low", "free", "2020-01-01T00:00:00Z", "low", false);
+        let low = search("has_low", "free", "2020-01-01T00:00:00Z", "low");
         assert_eq!(best_search(vec![none, low]), "has_low");
     }
 
@@ -455,44 +636,114 @@ mod tests {
 
     #[test]
     fn batch_ranking_matches_search_ranking() {
+        // Severity outranks recency, same as the search shape.
         assert_eq!(
             best_batch(vec![
                 batch(
                     "newest_low",
                     "free",
                     Some("2026-08-01T00:00:00Z"),
-                    Some("low"),
-                    false
+                    Some("low")
                 ),
                 batch(
                     "older_crit",
                     "free",
                     Some("2020-01-01T00:00:00Z"),
-                    Some("critical"),
-                    false
+                    Some("critical")
                 ),
             ]),
             "older_crit"
         );
+        // Coverage decides once severities tie — the batch shape infers it
+        // from `ghsaIds` rather than a vulnerabilities map.
         assert_eq!(
             best_batch(vec![
                 batch(
-                    "crit",
+                    "a_single",
                     "free",
-                    Some("2026-01-01T00:00:00Z"),
-                    Some("critical"),
-                    false
+                    Some("2026-08-01T00:00:00Z"),
+                    Some("high")
                 ),
-                batch(
-                    "merged",
+                batch_multi(
+                    "z_merged",
                     "free",
                     Some("2020-01-01T00:00:00Z"),
-                    Some("low"),
-                    true
+                    Some("high"),
+                    2
                 ),
             ]),
-            "merged"
+            "z_merged"
         );
+        // ...and a higher-severity rival still beats the merged patch.
+        assert_eq!(
+            best_batch(vec![
+                batch_multi(
+                    "a_merged",
+                    "free",
+                    Some("2026-08-01T00:00:00Z"),
+                    Some("high"),
+                    2
+                ),
+                batch(
+                    "z_crit",
+                    "free",
+                    Some("2020-01-01T00:00:00Z"),
+                    Some("critical")
+                ),
+            ]),
+            "z_crit"
+        );
+    }
+
+    #[test]
+    fn batch_coverage_counts_ghsa_ids_not_cve_aliases() {
+        // A single advisory with three CVE aliases must stay coverage 1.
+        // `ghsa_ids` is non-empty, so `cve_ids` is ignored entirely.
+        let mut aliased = batch(
+            "a_aliased",
+            "free",
+            Some("2026-08-01T00:00:00Z"),
+            Some("high"),
+        );
+        aliased.cve_ids = vec!["CVE-1".into(), "CVE-2".into(), "CVE-3".into()];
+        assert_eq!(aliased.ghsa_ids.len(), 1, "still one advisory");
+        assert_eq!(
+            best_batch(vec![
+                aliased,
+                batch_multi(
+                    "z_merged",
+                    "free",
+                    Some("2020-01-01T00:00:00Z"),
+                    Some("high"),
+                    2
+                ),
+            ]),
+            "z_merged"
+        );
+    }
+
+    #[test]
+    fn batch_falls_back_to_cve_ids_when_no_ghsa_is_named() {
+        // Some patches may name only CVEs. With `ghsa_ids` empty the
+        // advisory count comes from `cve_ids` instead, so a
+        // two-CVE-no-GHSA patch still reads as merged.
+        let mut single = batch(
+            "a_single",
+            "free",
+            Some("2026-08-01T00:00:00Z"),
+            Some("high"),
+        );
+        single.ghsa_ids.clear();
+        single.cve_ids = vec!["CVE-1".into()];
+        let mut merged = batch(
+            "z_merged",
+            "free",
+            Some("2020-01-01T00:00:00Z"),
+            Some("high"),
+        );
+        merged.ghsa_ids.clear();
+        merged.cve_ids = vec!["CVE-2".into(), "CVE-3".into()];
+        assert_eq!(best_batch(vec![single, merged]), "z_merged");
     }
 
     #[test]
@@ -508,15 +759,13 @@ mod tests {
                     "u_aaa",
                     "free",
                     Some("Fri, 27 Mar 2026 19:12:42 GMT"),
-                    Some("HIGH"),
-                    false
+                    Some("HIGH")
                 ),
                 batch(
                     "u_zzz",
                     "free",
                     Some("Mon, 03 Aug 2026 20:23:06 GMT"),
-                    Some("HIGH"),
-                    false
+                    Some("HIGH")
                 ),
             ]),
             "u_zzz"
@@ -529,8 +778,8 @@ mod tests {
         // patches sharing a publish date rank identically regardless of
         // which purl they belong to. Guards against anyone "optimizing"
         // the key to be derived from package-level state.
-        let mut a = search("u1", "free", "2026-01-01T00:00:00Z", "high", false);
-        let mut b = search("u2", "free", "2026-01-01T00:00:00Z", "high", false);
+        let mut a = search("u1", "free", "2026-01-01T00:00:00Z", "high");
+        let mut b = search("u2", "free", "2026-01-01T00:00:00Z", "high");
         let same_purl = cmp_search_results(&a, &b);
         a.purl = "pkg:npm/alpha@1.0.0".to_string();
         b.purl = "pkg:npm/omega@9.9.9".to_string();
@@ -547,8 +796,8 @@ mod tests {
         // recency tiebreak must not cost us the severity ordering.
         assert_eq!(
             best_batch(vec![
-                batch("low", "free", None, Some("low"), false),
-                batch("crit", "free", None, Some("critical"), false),
+                batch("low", "free", None, Some("low")),
+                batch("crit", "free", None, Some("critical")),
             ]),
             "crit"
         );
@@ -558,14 +807,8 @@ mod tests {
     fn batch_missing_severity_ranks_last() {
         assert_eq!(
             best_batch(vec![
-                batch("unknown", "free", Some("2026-08-01T00:00:00Z"), None, false),
-                batch(
-                    "low",
-                    "free",
-                    Some("2020-01-01T00:00:00Z"),
-                    Some("low"),
-                    false
-                ),
+                batch("unknown", "free", Some("2026-08-01T00:00:00Z"), None),
+                batch("low", "free", Some("2020-01-01T00:00:00Z"), Some("low")),
             ]),
             "low"
         );
@@ -575,28 +818,10 @@ mod tests {
     fn batch_ordering_is_total_and_deterministic() {
         let all = || {
             vec![
-                batch("u3", "free", None, None, false),
-                batch(
-                    "u1",
-                    "paid",
-                    Some("2026-01-01T00:00:00Z"),
-                    Some("high"),
-                    false,
-                ),
-                batch(
-                    "u2",
-                    "free",
-                    Some("2026-01-01T00:00:00Z"),
-                    Some("high"),
-                    false,
-                ),
-                batch(
-                    "u0",
-                    "free",
-                    Some("2020-01-01T00:00:00Z"),
-                    Some("critical"),
-                    true,
-                ),
+                batch("u3", "free", None, None),
+                batch("u1", "paid", Some("2026-01-01T00:00:00Z"), Some("high")),
+                batch("u2", "free", Some("2026-01-01T00:00:00Z"), Some("high")),
+                batch("u0", "free", Some("2020-01-01T00:00:00Z"), Some("critical")),
             ]
         };
         let mut first = all();

@@ -2089,7 +2089,6 @@ mod tests {
             license: "MIT".into(),
             tier: tier.into(),
             vulnerabilities: HashMap::<String, VulnerabilityResponse>::new(),
-            merged: false,
         }
     }
 
@@ -2164,19 +2163,77 @@ mod tests {
         assert_eq!(out[0].tier, "free");
     }
 
+    /// `mk_patch_sev` with one advisory per severity — two or more makes it
+    /// a *merged* patch (see `api::ranking::merged_coverage`), which is
+    /// inferred from the advisory count, not from any API flag.
+    fn mk_patch_multi(
+        uuid: &str,
+        purl: &str,
+        tier: &str,
+        published_at: &str,
+        severities: &[&str],
+    ) -> PatchSearchResult {
+        let mut p = mk_patch(uuid, purl, tier, published_at);
+        for (i, sev) in severities.iter().enumerate() {
+            p.vulnerabilities.insert(
+                format!("GHSA-{uuid}-{i}"),
+                VulnerabilityResponse {
+                    cves: vec![],
+                    summary: String::new(),
+                    severity: (*sev).into(),
+                    description: String::new(),
+                },
+            );
+        }
+        p
+    }
+
     #[test]
-    fn select_prefers_merged_patch_over_higher_severity() {
-        // Rule 1 beats rule 2: a merged patch is the fix the ecosystem has
-        // converged on, so it leads even a critical non-merged patch.
-        let mut merged = mk_patch_sev("merged", "pkg:npm/foo@1.0", "free", "2020-01-01", "low");
-        merged.merged = true;
+    fn select_prefers_merged_patch_when_severities_tie() {
+        // The general preference: `z_merged` remediates two HIGH advisories
+        // in one blob, `a_single` only one. Severities tie, so breadth
+        // decides. `a_single` is both newer AND earlier by uuid, so only
+        // the coverage rung can produce this result.
         let patches = vec![
-            mk_patch_sev("crit", "pkg:npm/foo@1.0", "paid", "2026-06-01", "critical"),
-            merged,
+            mk_patch_sev("a_single", "pkg:npm/foo@1.0", "paid", "2026-06-01", "high"),
+            mk_patch_multi(
+                "z_merged",
+                "pkg:npm/foo@1.0",
+                "free",
+                "2020-01-01",
+                &["high", "high"],
+            ),
         ];
         let out = select_patches(&patches, true, false).expect("ok");
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0].uuid, "merged");
+        assert_eq!(out[0].uuid, "z_merged");
+    }
+
+    #[test]
+    fn select_prefers_a_higher_severity_patch_over_the_merged_one() {
+        // The exception. A merged patch must not shadow a worse
+        // vulnerability: `z_critical` addresses a CRITICAL the merged patch
+        // does not cover, so it wins despite being older, single-advisory,
+        // and last by uuid.
+        let patches = vec![
+            mk_patch_multi(
+                "a_merged",
+                "pkg:npm/foo@1.0",
+                "free",
+                "2026-06-01",
+                &["high", "high"],
+            ),
+            mk_patch_sev(
+                "z_critical",
+                "pkg:npm/foo@1.0",
+                "free",
+                "2020-01-01",
+                "critical",
+            ),
+        ];
+        let out = select_patches(&patches, true, false).expect("ok");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].uuid, "z_critical");
     }
 
     #[test]
@@ -2521,7 +2578,6 @@ mod tests {
             description: "desc".into(),
             license: "MIT".into(),
             tier: "free".into(),
-            merged: false,
         };
         let meta = patch_event_metadata(&patch);
         assert!(meta.as_object().unwrap().get("severity").is_none());
@@ -2552,7 +2608,6 @@ mod tests {
             description: "Fixes prototype pollution in minimist".into(),
             license: "MIT".into(),
             tier: "free".into(),
-            merged: false,
         };
         let meta = patch_event_metadata(&patch);
         assert_eq!(meta["description"], "Fixes prototype pollution in minimist");
@@ -2594,7 +2649,6 @@ mod tests {
             description: String::new(),
             license: String::new(),
             tier: String::new(),
-            merged: false,
         };
         let meta = patch_event_metadata(&patch);
         let ids: Vec<&str> = meta["vulnerabilities"]
@@ -2617,7 +2671,6 @@ mod tests {
             description: "desc".into(),
             license: "MIT".into(),
             tier: "free".into(),
-            merged: false,
         };
         let meta = patch_event_metadata(&patch);
         // `severity` is intentionally omitted (not null) when there

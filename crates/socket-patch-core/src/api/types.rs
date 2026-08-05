@@ -46,22 +46,6 @@ pub struct PatchResponse {
     pub description: String,
     pub license: String,
     pub tier: String,
-    /// Upstream-merge marker: this patch's fix has landed upstream.
-    /// Merged patches outrank everything else in patch selection (see
-    /// [`crate::api::ranking`]).
-    ///
-    /// Not yet emitted by any endpoint, so it defaults to `false` rather
-    /// than being required, and the deserializer tolerates whichever
-    /// spelling and type the server settles on.
-    #[serde(
-        default,
-        alias = "isMerged",
-        alias = "mergedAt",
-        alias = "upstreamMerged",
-        deserialize_with = "crate::utils::serde::de_truthy_flag",
-        skip_serializing_if = "crate::utils::serde::is_false"
-    )]
-    pub merged: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,16 +80,6 @@ pub struct PatchSearchResult {
     pub license: String,
     pub tier: String,
     pub vulnerabilities: HashMap<String, VulnerabilityResponse>,
-    /// Upstream-merge marker — see [`PatchResponse::merged`].
-    #[serde(
-        default,
-        alias = "isMerged",
-        alias = "mergedAt",
-        alias = "upstreamMerged",
-        deserialize_with = "crate::utils::serde::de_truthy_flag",
-        skip_serializing_if = "crate::utils::serde::is_false"
-    )]
-    pub merged: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -130,21 +104,11 @@ pub struct BatchPatchInfo {
     /// [`PatchResponse::published_at`]), if the server supplies it. The
     /// batch shape historically omits it, which is why it is optional — a
     /// `None` here only weakens the recency tiebreak in
-    /// [`crate::api::ranking`], it never changes the merged/severity
-    /// ordering. The public-proxy fallback path fills it in from the
+    /// [`crate::api::ranking`], it never changes the severity or
+    /// merge-state ordering. The public-proxy fallback path fills it in from the
     /// per-package search results.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub published_at: Option<String>,
-    /// Upstream-merge marker — see [`PatchResponse::merged`].
-    #[serde(
-        default,
-        alias = "isMerged",
-        alias = "mergedAt",
-        alias = "upstreamMerged",
-        deserialize_with = "crate::utils::serde::de_truthy_flag",
-        skip_serializing_if = "crate::utils::serde::is_false"
-    )]
-    pub merged: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -234,7 +198,6 @@ mod tests {
             description: "desc".into(),
             license: "MIT".into(),
             tier: "free".into(),
-            merged: false,
         };
         let json = serde_json::to_string(&pr).unwrap();
         assert!(json.contains("publishedAt"));
@@ -307,7 +270,6 @@ mod tests {
                     severity: Some("high".into()),
                     title: "Test".into(),
                     published_at: None,
-                    merged: false,
                 }],
             }],
             can_access_paid_patches: false,
@@ -330,7 +292,6 @@ mod tests {
             severity: Some("high".into()),
             title: "Test".into(),
             published_at: None,
-            merged: false,
         };
         let json = serde_json::to_string(&bpi).unwrap();
         assert!(json.contains("cveIds"));
@@ -366,7 +327,6 @@ mod tests {
             license: "MIT".into(),
             tier: "free".into(),
             vulnerabilities: HashMap::new(),
-            merged: false,
         };
         let json = serde_json::to_string(&psr).unwrap();
         let back: PatchSearchResult = serde_json::from_str(&json).unwrap();
@@ -601,7 +561,6 @@ mod tests {
                 license: "MIT".into(),
                 tier: "free".into(),
                 vulnerabilities: HashMap::new(),
-                merged: false,
             }],
             can_access_paid_patches: true,
         };
@@ -697,8 +656,5 @@ mod tests {
             sr.patches[0].vulnerabilities["GHSA-4hjh-wcwx-xvwj"].severity,
             "HIGH"
         );
-        // No `merged` key on the wire today -> false, not a parse error.
-        assert!(!sr.patches[0].merged);
-        assert!(!sr.patches[1].merged);
     }
 }
