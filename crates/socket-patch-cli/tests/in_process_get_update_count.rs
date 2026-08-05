@@ -51,6 +51,7 @@ fn search_result(uuid: &str, purl: &str) -> PatchSearchResult {
         license: "MIT".into(),
         tier: "free".into(),
         vulnerabilities: HashMap::new(),
+        merged: false,
     }
 }
 

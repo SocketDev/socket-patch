@@ -25,12 +25,43 @@ pub struct OrganizationsResponse {
 pub struct PatchResponse {
     pub uuid: String,
     pub purl: String,
+    /// When **this patch** was published by Socket — NOT when the upstream
+    /// package version was released. The distinction matters because patch
+    /// selection ranks by recency: a 2020 package can carry a patch
+    /// published last week.
+    ///
+    /// Confirmed per-patch against the live API: `pkg:npm/axios@1.6.0` has
+    /// two patches dated 2026-03-27 and 2026-08-03 while the package itself
+    /// shipped 2023-10-26, and `pkg:pypi/urllib3@1.26.18` carries three
+    /// patches with three distinct dates.
+    ///
+    /// **RFC 2822 / HTTP-date on the wire** — the live API emits
+    /// `Fri, 27 Mar 2026 19:12:42 GMT` (verified across npm, PyPI, cargo
+    /// and gem), while this repo's fixtures use RFC 3339. Never compare
+    /// these as raw strings; route through
+    /// [`crate::utils::date::parse_timestamp_secs`], which handles both.
     pub published_at: String,
     pub files: HashMap<String, PatchFileResponse>,
     pub vulnerabilities: HashMap<String, VulnerabilityResponse>,
     pub description: String,
     pub license: String,
     pub tier: String,
+    /// Upstream-merge marker: this patch's fix has landed upstream.
+    /// Merged patches outrank everything else in patch selection (see
+    /// [`crate::api::ranking`]).
+    ///
+    /// Not yet emitted by any endpoint, so it defaults to `false` rather
+    /// than being required, and the deserializer tolerates whichever
+    /// spelling and type the server settles on.
+    #[serde(
+        default,
+        alias = "isMerged",
+        alias = "mergedAt",
+        alias = "upstreamMerged",
+        deserialize_with = "crate::utils::serde::de_truthy_flag",
+        skip_serializing_if = "crate::utils::serde::is_false"
+    )]
+    pub merged: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,11 +88,24 @@ pub struct VulnerabilityResponse {
 pub struct PatchSearchResult {
     pub uuid: String,
     pub purl: String,
+    /// When **this patch** was published — not the package's release date.
+    /// See [`PatchResponse::published_at`] for the full semantics and the
+    /// wire-format caveat.
     pub published_at: String,
     pub description: String,
     pub license: String,
     pub tier: String,
     pub vulnerabilities: HashMap<String, VulnerabilityResponse>,
+    /// Upstream-merge marker — see [`PatchResponse::merged`].
+    #[serde(
+        default,
+        alias = "isMerged",
+        alias = "mergedAt",
+        alias = "upstreamMerged",
+        deserialize_with = "crate::utils::serde::de_truthy_flag",
+        skip_serializing_if = "crate::utils::serde::is_false"
+    )]
+    pub merged: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -82,6 +126,25 @@ pub struct BatchPatchInfo {
     pub ghsa_ids: Vec<String>,
     pub severity: Option<String>,
     pub title: String,
+    /// When **this patch** was published (see
+    /// [`PatchResponse::published_at`]), if the server supplies it. The
+    /// batch shape historically omits it, which is why it is optional — a
+    /// `None` here only weakens the recency tiebreak in
+    /// [`crate::api::ranking`], it never changes the merged/severity
+    /// ordering. The public-proxy fallback path fills it in from the
+    /// per-package search results.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub published_at: Option<String>,
+    /// Upstream-merge marker — see [`PatchResponse::merged`].
+    #[serde(
+        default,
+        alias = "isMerged",
+        alias = "mergedAt",
+        alias = "upstreamMerged",
+        deserialize_with = "crate::utils::serde::de_truthy_flag",
+        skip_serializing_if = "crate::utils::serde::is_false"
+    )]
+    pub merged: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -171,6 +234,7 @@ mod tests {
             description: "desc".into(),
             license: "MIT".into(),
             tier: "free".into(),
+            merged: false,
         };
         let json = serde_json::to_string(&pr).unwrap();
         assert!(json.contains("publishedAt"));
@@ -242,6 +306,8 @@ mod tests {
                     ghsa_ids: vec!["GHSA-1111-2222-3333".into()],
                     severity: Some("high".into()),
                     title: "Test".into(),
+                    published_at: None,
+                    merged: false,
                 }],
             }],
             can_access_paid_patches: false,
@@ -263,6 +329,8 @@ mod tests {
             ghsa_ids: vec!["GHSA-1111-2222-3333".into()],
             severity: Some("high".into()),
             title: "Test".into(),
+            published_at: None,
+            merged: false,
         };
         let json = serde_json::to_string(&bpi).unwrap();
         assert!(json.contains("cveIds"));
@@ -298,6 +366,7 @@ mod tests {
             license: "MIT".into(),
             tier: "free".into(),
             vulnerabilities: HashMap::new(),
+            merged: false,
         };
         let json = serde_json::to_string(&psr).unwrap();
         let back: PatchSearchResult = serde_json::from_str(&json).unwrap();
@@ -532,6 +601,7 @@ mod tests {
                 license: "MIT".into(),
                 tier: "free".into(),
                 vulnerabilities: HashMap::new(),
+                merged: false,
             }],
             can_access_paid_patches: true,
         };
@@ -562,5 +632,73 @@ mod tests {
         assert_eq!(sr.patches.len(), 1);
         assert!(!sr.can_access_paid_patches);
         assert_eq!(sr.patches[0].published_at, "2024-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn published_at_is_per_patch_not_per_package() {
+        // Verbatim production payload for
+        // `GET /patch/by-package/pkg%3Anpm%2Faxios%401.6.0`, captured
+        // 2026-08-04 (description/summary bodies elided).
+        //
+        // The point: ONE package version, TWO patches, TWO different
+        // `publishedAt` values. That is only possible if the field
+        // describes the patch. If it ever described the package release
+        // (axios@1.6.0 shipped 2023-10-26) both entries would carry the
+        // same date, and `api::ranking`'s recency rung would silently
+        // collapse into the UUID tiebreak.
+        let json = r#"{
+            "canAccessPaidPatches": false,
+            "patches": [
+                {
+                    "uuid": "0bc312a6-1b43-46bb-ba83-95b53867deb3",
+                    "purl": "pkg:npm/axios@1.6.0",
+                    "publishedAt": "Fri, 27 Mar 2026 19:12:42 GMT",
+                    "description": "", "license": "MIT", "tier": "free",
+                    "vulnerabilities": {
+                        "GHSA-4hjh-wcwx-xvwj": {
+                            "cves": ["CVE-2025-58754"],
+                            "summary": "DoS through lack of data size check",
+                            "severity": "HIGH",
+                            "description": ""
+                        }
+                    }
+                },
+                {
+                    "uuid": "83f5a654-db80-4086-aa3d-593036fe7c7d",
+                    "purl": "pkg:npm/axios@1.6.0",
+                    "publishedAt": "Mon, 03 Aug 2026 20:23:06 GMT",
+                    "description": "", "license": "", "tier": "free",
+                    "vulnerabilities": {
+                        "GHSA-jr5f-v2jv-69x6": {
+                            "cves": ["CVE-2025-27152"],
+                            "summary": "Possible SSRF via absolute URL",
+                            "severity": "HIGH",
+                            "description": ""
+                        }
+                    }
+                }
+            ]
+        }"#;
+        let sr: SearchResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(sr.patches.len(), 2);
+        assert_eq!(
+            sr.patches[0].purl, sr.patches[1].purl,
+            "fixture must be two patches for the SAME package version"
+        );
+        assert_ne!(
+            sr.patches[0].published_at, sr.patches[1].published_at,
+            "publishedAt must vary per patch, not per package"
+        );
+        assert_eq!(sr.patches[0].published_at, "Fri, 27 Mar 2026 19:12:42 GMT");
+        assert_eq!(sr.patches[1].published_at, "Mon, 03 Aug 2026 20:23:06 GMT");
+        // Production spells severity in uppercase; every ladder in the
+        // workspace lowercases before matching.
+        assert_eq!(
+            sr.patches[0].vulnerabilities["GHSA-4hjh-wcwx-xvwj"].severity,
+            "HIGH"
+        );
+        // No `merged` key on the wire today -> false, not a parse error.
+        assert!(!sr.patches[0].merged);
+        assert!(!sr.patches[1].merged);
     }
 }

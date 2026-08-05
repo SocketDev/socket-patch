@@ -345,6 +345,277 @@ async fn scan_apply_wet_writes_manifest_and_blob() {
 }
 
 // ---------------------------------------------------------------------------
+// Multi-patch packages — which patch scan resolves to
+// ---------------------------------------------------------------------------
+
+/// Second patch UUID for the multi-patch fixtures. Deliberately sorts
+/// *after* `UUID` lexicographically, so a test that passes because of the
+/// uuid tiebreak rather than the severity ranking would still name `UUID`.
+const UUID_LOW: &str = "22222222-2222-4222-8222-222222222222";
+
+/// A package with two available patches: a freshly-published `low` and an
+/// older `critical`. `paid` toggles `canAccessPaidPatches`, which selects
+/// between `select_patches`' auto-select branch and its interactive one.
+///
+/// This is the exact shape of the reported bug — the old selector took the
+/// most recent patch and left the critical unfixed.
+async fn mock_two_patches(server: &MockServer, paid: bool) {
+    let low = serde_json::json!({
+        "uuid": UUID_LOW, "purl": PURL, "tier": "free",
+        // Uppercase severity + RFC 2822 date, exactly as production emits
+        // them (verified against patches-api.socket.dev).
+        "cveIds": [], "ghsaIds": [], "severity": "LOW", "title": "low sev",
+        "publishedAt": "Mon, 03 Aug 2026 20:23:06 GMT",
+    });
+    let critical = serde_json::json!({
+        "uuid": UUID, "purl": PURL, "tier": "free",
+        "cveIds": [], "ghsaIds": [], "severity": "CRITICAL", "title": "critical sev",
+        "publishedAt": "Wed, 01 Jan 2025 00:00:00 GMT",
+    });
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/batch")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            // Listed newest-first, i.e. the order the old `.first()` /
+            // date-sort logic would have taken the WRONG patch from.
+            "packages": [{ "purl": PURL, "patches": [low, critical] }],
+            "canAccessPaidPatches": paid,
+        })))
+        .mount(server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path_regex(format!(
+            "^/v0/orgs/{ORG}/patches/by-package/.+$"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "patches": [
+                {
+                    "uuid": UUID_LOW, "purl": PURL,
+                    "publishedAt": "Mon, 03 Aug 2026 20:23:06 GMT",
+                    "description": "low", "license": "MIT", "tier": "free",
+                    "vulnerabilities": { "GHSA-low0-low0-low0": {
+                        "cves": [], "summary": "s", "severity": "LOW", "description": "d"
+                    }}
+                },
+                {
+                    "uuid": UUID, "purl": PURL,
+                    "publishedAt": "Wed, 01 Jan 2025 00:00:00 GMT",
+                    "description": "critical", "license": "MIT", "tier": "free",
+                    "vulnerabilities": { "GHSA-crit-crit-crit": {
+                        "cves": [], "summary": "s", "severity": "CRITICAL", "description": "d"
+                    }}
+                }
+            ],
+            "canAccessPaidPatches": paid,
+        })))
+        .mount(server)
+        .await;
+}
+
+/// The apply path must fetch the CRITICAL patch's view, not the low one.
+///
+/// Note both severities are spelled uppercase and both dates are RFC 2822,
+/// exactly as production emits them — so this also covers the case-folding
+/// and the date parse. Applying itself partial-fails (the handcrafted
+/// `node_modules` file can't match the fixture's beforeHash), which is
+/// beside the point: the assertion is about *which patch was chosen*.
+#[tokio::test]
+#[serial]
+async fn scan_apply_picks_critical_over_more_recent_low_for_paid_user() {
+    let server = MockServer::start().await;
+    mock_two_patches(&server, true).await;
+    mock_view_with_blob(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_root_package_json(tmp.path());
+    write_npm_package(tmp.path(), "in-proc-scan", "1.0.0");
+    let mut args = default_args(tmp.path());
+    args.common.api_url = Some(server.uri());
+    args.apply = true;
+
+    run_scrubbed(args).await;
+
+    let reqs = recorded(&server).await;
+    assert_eq!(
+        view_gets(&reqs, UUID),
+        1,
+        "must fetch the CRITICAL patch's view exactly once"
+    );
+    assert_eq!(
+        view_gets(&reqs, UUID_LOW),
+        0,
+        "must not fetch the low-severity patch — it lost the ranking"
+    );
+
+    let manifest_path = tmp.path().join(".socket/manifest.json");
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+    assert_eq!(
+        manifest["patches"][PURL]["uuid"], UUID,
+        "manifest must record the critical patch; got {manifest}"
+    );
+}
+
+/// Same package, but the user has no paid access, so `select_patches`
+/// takes the interactive branch. Tests run headless, so `select_one`
+/// auto-selects option 0 — which means the *presented order* is what
+/// decides, and it must be the ranked order.
+#[tokio::test]
+#[serial]
+async fn scan_apply_picks_critical_for_free_user_via_ranked_prompt_order() {
+    let server = MockServer::start().await;
+    mock_two_patches(&server, false).await;
+    mock_view_with_blob(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_root_package_json(tmp.path());
+    write_npm_package(tmp.path(), "in-proc-scan", "1.0.0");
+    let mut args = default_args(tmp.path());
+    args.common.api_url = Some(server.uri());
+    args.apply = true;
+
+    run_scrubbed(args).await;
+
+    let reqs = recorded(&server).await;
+    assert_eq!(
+        view_gets(&reqs, UUID),
+        1,
+        "non-TTY auto-select takes option 0, which must be the critical patch"
+    );
+    assert_eq!(view_gets(&reqs, UUID_LOW), 0);
+}
+
+/// Mock `view/<uuid>` for an explicit uuid, echoing back its own
+/// `publishedAt`. Both patches in the date-tiebreak fixture get one, so a
+/// wrong selection produces a *wrong* answer rather than a 404 — the test
+/// then discriminates on selection alone, not on which mock happens to
+/// exist.
+async fn mock_view_for(server: &MockServer, uuid: &str, published_at: &str) {
+    Mock::given(method("GET"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/view/{uuid}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "uuid": uuid,
+            "purl": PURL,
+            "publishedAt": published_at,
+            "files": {
+                "package/index.js": {
+                    "beforeHash": "0000000000000000000000000000000000000000000000000000000000000000",
+                    "afterHash":  "1111111111111111111111111111111111111111111111111111111111111111",
+                    "blobContent": "cGF0Y2hlZAo=",
+                }
+            },
+            "vulnerabilities": {},
+            "description": "x", "license": "MIT", "tier": "free",
+        })))
+        .mount(server)
+        .await;
+}
+
+/// Severity ties, so the PATCH PUBLISH DATE is the only thing left to
+/// decide — and it must decide correctly.
+///
+/// This is the end-to-end guard for "recency means the date the patch was
+/// published, not the date the package was released". Both patches are for
+/// the same `PURL` (one package version, one upstream release date) and both
+/// are `HIGH`; they differ only in `publishedAt`. The fixture uses the real
+/// production values from `pkg:npm/axios@1.6.0`.
+///
+/// Non-vacuity, two ways: the older patch is listed FIRST in the response
+/// (so a positional `.first()` picks it) and its UUID sorts first (so the
+/// UUID tiebreak — which is exactly where a package-level date would land
+/// us, both keys being equal — also picks it). Only a genuine per-patch date
+/// yields `UUID_NEWER`.
+#[tokio::test]
+#[serial]
+async fn scan_apply_picks_the_more_recently_published_patch_when_severity_ties() {
+    const UUID_OLDER: &str = "0bc312a6-1b43-46bb-ba83-95b53867deb3";
+    const UUID_NEWER: &str = "83f5a654-db80-4086-aa3d-593036fe7c7d";
+    const PUBLISHED_OLDER: &str = "Fri, 27 Mar 2026 19:12:42 GMT";
+    const PUBLISHED_NEWER: &str = "Mon, 03 Aug 2026 20:23:06 GMT";
+    assert!(
+        UUID_OLDER < UUID_NEWER,
+        "uuid tiebreak favors the older patch"
+    );
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/batch")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "packages": [{ "purl": PURL, "patches": [
+                { "uuid": UUID_OLDER, "purl": PURL, "tier": "free", "cveIds": [], "ghsaIds": [],
+                  "severity": "HIGH", "title": "older", "publishedAt": PUBLISHED_OLDER },
+                { "uuid": UUID_NEWER, "purl": PURL, "tier": "free", "cveIds": [], "ghsaIds": [],
+                  "severity": "HIGH", "title": "newer", "publishedAt": PUBLISHED_NEWER },
+            ]}],
+            "canAccessPaidPatches": true,
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex(format!(
+            "^/v0/orgs/{ORG}/patches/by-package/.+$"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "patches": [
+                { "uuid": UUID_OLDER, "purl": PURL, "publishedAt": PUBLISHED_OLDER,
+                  "description": "older", "license": "MIT", "tier": "free",
+                  "vulnerabilities": { "GHSA-4hjh-wcwx-xvwj": {
+                      "cves": ["CVE-2025-58754"], "summary": "s",
+                      "severity": "HIGH", "description": "d" }}},
+                { "uuid": UUID_NEWER, "purl": PURL, "publishedAt": PUBLISHED_NEWER,
+                  "description": "newer", "license": "MIT", "tier": "free",
+                  "vulnerabilities": { "GHSA-jr5f-v2jv-69x6": {
+                      "cves": ["CVE-2025-27152"], "summary": "s",
+                      "severity": "HIGH", "description": "d" }}},
+            ],
+            "canAccessPaidPatches": true,
+        })))
+        .mount(&server)
+        .await;
+    mock_view_for(&server, UUID_OLDER, PUBLISHED_OLDER).await;
+    mock_view_for(&server, UUID_NEWER, PUBLISHED_NEWER).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_root_package_json(tmp.path());
+    write_npm_package(tmp.path(), "in-proc-scan", "1.0.0");
+    let mut args = default_args(tmp.path());
+    args.common.api_url = Some(server.uri());
+    args.apply = true;
+
+    run_scrubbed(args).await;
+
+    let reqs = recorded(&server).await;
+    assert_eq!(
+        view_gets(&reqs, UUID_NEWER),
+        1,
+        "the more recently published patch must be the one fetched"
+    );
+    assert_eq!(
+        view_gets(&reqs, UUID_OLDER),
+        0,
+        "the older patch must not be fetched"
+    );
+
+    // Provenance: the manifest's `exportedAt` must be the SELECTED patch's
+    // own publish date. A wrong value here would mean the record and the
+    // blob came from different patches.
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(tmp.path().join(".socket/manifest.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(manifest["patches"][PURL]["uuid"], UUID_NEWER);
+    assert_eq!(
+        manifest["patches"][PURL]["exportedAt"], PUBLISHED_NEWER,
+        "exportedAt must carry the selected patch's own publishedAt; got {manifest}"
+    );
+}
+
+// The JSON `updates[]` counterpart to these two — that the candidate UUID
+// scan *reports* is the one apply *installs* — needs stdout, so it lives in
+// the subprocess suite as
+// `scan_invariants::scan_update_candidate_is_the_highest_ranked_patch`.
+
+// ---------------------------------------------------------------------------
 // --prune (without --apply)
 // ---------------------------------------------------------------------------
 

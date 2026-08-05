@@ -295,6 +295,94 @@ async fn scan_emits_updates_entry_when_newer_uuid_available() {
     assert_single_batch_carries_purl(&reqs, purl);
 }
 
+#[tokio::test]
+async fn scan_update_candidate_is_the_highest_ranked_patch() {
+    // `updates[].newUuid` must name the patch `--apply` would install —
+    // the highest-ranked one (merged → severity → recency), NOT whatever
+    // the server listed first. The two are computed by different code over
+    // different API shapes (`detect_updates` over the batch response,
+    // `select_patches` over by-package), so they can drift.
+    //
+    // The fixture is the reported bug in miniature: the low-severity patch
+    // is listed first AND is the more recently published, but the critical
+    // one must win. Severities are uppercase and dates are RFC 2822, as
+    // production emits them.
+    let mock = MockServer::start().await;
+    let purl = "pkg:npm/minimist@1.2.2";
+    let manifest_uuid = "11111111-1111-4111-8111-111111111111";
+    let low_uuid = "22222222-2222-4222-8222-222222222222";
+    let critical_uuid = "99999999-9999-4999-8999-999999999999";
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/batch")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "packages": [{
+                "purl": purl,
+                "patches": [
+                    {
+                        "uuid": low_uuid, "purl": purl, "tier": "free",
+                        "cveIds": [], "ghsaIds": [],
+                        "severity": "LOW", "title": "Low, but newest",
+                        "publishedAt": "Mon, 03 Aug 2026 20:23:06 GMT",
+                    },
+                    {
+                        "uuid": critical_uuid, "purl": purl, "tier": "free",
+                        "cveIds": [], "ghsaIds": [],
+                        "severity": "CRITICAL", "title": "Critical, but older",
+                        "publishedAt": "Wed, 01 Jan 2025 00:00:00 GMT",
+                    }
+                ]
+            }],
+            "canAccessPaidPatches": true,
+        })))
+        .mount(&mock)
+        .await;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_root_package_json(tmp.path());
+    write_npm_package(tmp.path(), "minimist", "1.2.2");
+    let socket = tmp.path().join(".socket");
+    std::fs::create_dir_all(&socket).unwrap();
+    std::fs::write(
+        socket.join("manifest.json"),
+        format!(
+            r#"{{
+  "patches": {{
+    "{purl}": {{
+      "uuid": "{manifest_uuid}",
+      "exportedAt": "2024-01-01T00:00:00Z",
+      "files": {{}},
+      "vulnerabilities": {{}},
+      "description": "old",
+      "license": "MIT",
+      "tier": "free"
+    }}
+  }}
+}}"#
+        ),
+    )
+    .unwrap();
+
+    let (code, stdout, _) = run_scan(tmp.path(), &mock.uri(), &[]);
+    assert_eq!(code, 0);
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    let updates = v["updates"].as_array().expect("updates array");
+    assert_eq!(updates.len(), 1, "one PURL changed UUID; got {v}");
+    assert_eq!(
+        updates[0]["newUuid"], critical_uuid,
+        "the update candidate must be the critical patch, not the newer low one; got {v}"
+    );
+
+    // The `packages[].patches` array the operator reads is ordered the same
+    // way, so the listing and the decision agree.
+    let listed = v["packages"][0]["patches"]
+        .as_array()
+        .expect("patches array");
+    assert_eq!(
+        listed[0]["uuid"], critical_uuid,
+        "listed patches must be best-first; got {v}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Discovery — no manifest, no `updates` field (nothing to diff against)
 // ---------------------------------------------------------------------------
