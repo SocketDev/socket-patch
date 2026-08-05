@@ -31,6 +31,9 @@ use std::process::{Command, Output};
 
 use sha2::{Digest, Sha256};
 
+#[path = "common/cache_env.rs"]
+mod cache_env;
+
 const UUID: &str = "4d5e6f70-8192-4a1b-8c2d-0123456789ab";
 const PURL: &str = "pkg:pypi/six@1.16.0";
 /// Appended to the installed `six.py` by the synthetic patch.
@@ -67,13 +70,15 @@ fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
 /// Resolve a Python interpreter (mirrors the core crawler's probe order).
 fn find_python() -> Option<&'static str> {
     for cmd in ["python3", "python"] {
-        let ok = Command::new(cmd)
+        let mut probe = Command::new(cmd);
+        probe
             .arg("--version")
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
+            .stderr(std::process::Stdio::null());
+        // Isolated so a pyenv shim resolves the same way here as in the
+        // fixture installs below (probe and install must not disagree).
+        cache_env::isolate(&mut probe);
+        let ok = probe.status().map(|s| s.success()).unwrap_or(false);
         if ok {
             return Some(cmd);
         }
@@ -84,13 +89,13 @@ fn find_python() -> Option<&'static str> {
 /// Resolve `uv`: PATH first, then `~/.local/bin/uv` (the standalone
 /// installer's default location).
 fn find_uv() -> Option<PathBuf> {
-    let on_path = Command::new("uv")
+    let mut probe = Command::new("uv");
+    probe
         .arg("--version")
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+        .stderr(std::process::Stdio::null());
+    cache_env::isolate(&mut probe);
+    let on_path = probe.status().map(|s| s.success()).unwrap_or(false);
     if on_path {
         return Some(PathBuf::from("uv"));
     }
@@ -105,6 +110,13 @@ fn find_uv() -> Option<PathBuf> {
 /// and `VIRTUAL_ENV` are all toolchain behavior inputs and must not leak
 /// from the developer's shell. Scrub BEFORE seeding the explicit env — the
 /// last env call wins.
+///
+/// Cache isolation goes in the middle. The uv half of this file always passed
+/// an explicit `UV_CACHE_DIR`; the pip half passed an empty env slice, so pip
+/// used the developer's own cache. [`cache_env::isolate`] gives both halves a
+/// sandboxed default, and the explicit per-test `UV_CACHE_DIR` — including
+/// the deliberately EMPTY one the fresh-checkout proof relies on — still wins
+/// because it is applied last.
 fn tool(exe: &Path, cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
     let mut cmd = Command::new(exe);
     cmd.args(args).current_dir(cwd);
@@ -115,6 +127,7 @@ fn tool(exe: &Path, cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
         }
     }
     cmd.env_remove("VIRTUAL_ENV");
+    cache_env::isolate(&mut cmd);
     for (k, v) in env {
         cmd.env(k, v);
     }

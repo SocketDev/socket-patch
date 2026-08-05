@@ -30,6 +30,9 @@ use sha2::{Digest, Sha512};
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+#[path = "common/cache_env.rs"]
+mod cache_env;
+
 const ORG: &str = "test-org";
 const DEP: &str = "left-pad";
 const DEP_VERSION: &str = "1.3.0";
@@ -52,11 +55,14 @@ fn has_corepack_pm(pm: &str) -> bool {
     let Ok(probe) = tempfile::tempdir() else {
         return false;
     };
-    Command::new("corepack")
-        .args([pm, "--version"])
+    // Isolated too: this probe is what actually downloads the package manager
+    // the first time, and corepack stores it under `COREPACK_HOME`.
+    let mut cmd = Command::new("corepack");
+    cmd.args([pm, "--version"])
         .current_dir(probe.path())
-        .env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0")
-        .stdout(Stdio::null())
+        .env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0");
+    cache_env::isolate(&mut cmd);
+    cmd.stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
         .map(|s| s.success())
@@ -64,8 +70,10 @@ fn has_corepack_pm(pm: &str) -> bool {
 }
 
 fn has_command(cmd: &str) -> bool {
-    Command::new(cmd)
-        .arg("--version")
+    let mut probe = Command::new(cmd);
+    probe.arg("--version");
+    cache_env::isolate(&mut probe);
+    probe
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -88,6 +96,9 @@ fn corepack(cwd: &Path, pm: &str, args: &[&str], extra_env: &[(&str, &str)]) -> 
     let mut cmd = Command::new("corepack");
     cmd.arg(pm).args(args).current_dir(cwd);
     scrub_socket_env(&mut cmd);
+    // After the scrub: it strips ambient `PNPM_HOME` / `npm_config_store_dir`,
+    // which would otherwise take the sandbox values back out again.
+    cache_env::isolate(&mut cmd);
     cmd.env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0");
     for (k, v) in extra_env {
         cmd.env(k, v);
@@ -501,6 +512,7 @@ async fn rush_hosted_real_rush_update_install() {
         let mut cmd = Command::new("npm");
         cmd.args(&full).current_dir(root);
         scrub_socket_env(&mut cmd);
+        cache_env::isolate(&mut cmd);
         for (k, _) in std::env::vars_os() {
             if k.to_string_lossy().starts_with("RUSH_") {
                 cmd.env_remove(&k);

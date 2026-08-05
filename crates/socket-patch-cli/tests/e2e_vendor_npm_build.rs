@@ -26,6 +26,9 @@ use std::process::{Command, Output};
 
 use sha2::{Digest, Sha256};
 
+#[path = "common/cache_env.rs"]
+mod cache_env;
+
 /// Canonical lowercase patch uuid (a dedicated path level under
 /// `.socket/vendor/npm/`).
 const UUID: &str = "1a2b3c4d-5e6f-4a1b-8c2d-0123456789ab";
@@ -41,8 +44,10 @@ fn binary() -> PathBuf {
 }
 
 fn has_command(cmd: &str) -> bool {
-    Command::new(cmd)
-        .arg("--version")
+    let mut probe = Command::new(cmd);
+    probe.arg("--version");
+    cache_env::isolate(&mut probe);
+    probe
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
@@ -94,6 +99,10 @@ fn npm(cwd: &Path, args: &[&str]) -> Output {
             cmd.env_remove(&k);
         }
     }
+    // After the scrub (it would otherwise strip an ambient `npm_config_cache`
+    // right back out) and before the caller's flags. The `--cache` argument
+    // each call site passes is a flag, not env, so it still wins.
+    cache_env::isolate(&mut cmd);
     cmd.output().expect("failed to run npm")
 }
 

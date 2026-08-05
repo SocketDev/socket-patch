@@ -38,6 +38,9 @@ use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+#[path = "common/cache_env.rs"]
+mod cache_env;
+
 const ORG: &str = "test-org";
 const DEP: &str = "left-pad";
 const DEP_VERSION: &str = "1.3.0";
@@ -59,8 +62,10 @@ fn binary() -> PathBuf {
 }
 
 fn has_command(cmd: &str) -> bool {
-    Command::new(cmd)
-        .arg("--version")
+    let mut probe = Command::new(cmd);
+    probe.arg("--version");
+    cache_env::isolate(&mut probe);
+    probe
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
@@ -88,11 +93,10 @@ fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
 }
 
 fn npm(cwd: &Path, args: &[&str]) -> Output {
-    Command::new("npm")
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .expect("failed to run npm")
+    let mut cmd = Command::new("npm");
+    cmd.args(args).current_dir(cwd);
+    cache_env::isolate(&mut cmd);
+    cmd.output().expect("failed to run npm")
 }
 
 /// Standard-base64-encoded sha512 of `bytes` — the body of the npm-family

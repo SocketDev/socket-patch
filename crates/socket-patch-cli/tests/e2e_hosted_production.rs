@@ -82,6 +82,9 @@ use std::process::{Command, Output};
 
 use socket_patch_cli::args::{GLOBAL_ARG_ENV_VARS, LOCAL_ARG_ENV_VARS};
 
+#[path = "common/cache_env.rs"]
+mod cache_env;
+
 // ---------------------------------------------------------------------------
 // Production endpoints + required-patch catalog
 // ---------------------------------------------------------------------------
@@ -215,13 +218,17 @@ fn has_command(cmd: &str) -> bool {
     } else {
         &["--version"]
     };
-    Command::new(cmd)
+    let mut probe_cmd = Command::new(cmd);
+    probe_cmd
         .args(probe)
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+        .stderr(std::process::Stdio::null());
+    // Where pnpm/yarn are corepack shims, this probe is what actually
+    // downloads the package manager — keep that out of the real
+    // COREPACK_HOME, and let the probe answer for the same environment
+    // the leg's `tool()` invocations run in.
+    cache_env::isolate(&mut probe_cmd);
+    probe_cmd.status().map(|s| s.success()).unwrap_or(false)
 }
 
 /// The three legacy `SOCKET_PATCH_*` names still honored at runtime via
@@ -358,6 +365,10 @@ fn redirected_count(env: &serde_json::Value) -> u64 {
 fn tool(cwd: &Path, program: &str, args: &[&str], env: &[(&str, &str)]) -> Output {
     let mut cmd = Command::new(program);
     cmd.args(args).current_dir(cwd);
+    // Sandbox everything the per-leg `env` below does not name — corepack's
+    // downloaded package managers most of all — so a run leaves the caller's
+    // home alone.
+    cache_env::isolate(&mut cmd);
     // Keep every toolchain's cache inside the fixture so the reinstall leg
     // starts genuinely cold and cannot be satisfied from a warm host cache
     // holding the *pristine* artifact.
@@ -1584,7 +1595,24 @@ fn gem_bundler_hosted_redirect_and_known_install_defect() {
     }
     let detail = dump(&reinstall);
     let is_known_defect = detail.contains("APIResponseMismatchError")
-        || detail.contains("revealed dependencies not in the API");
+        || detail.contains("revealed dependencies not in the API")
+        // depscan#23630 (deployed 2026-08-02) made the compact-index routes
+        // fail closed: they 404 with `{"error":"not_built"}` until the
+        // requeued gem-package rebuild populates `package_gem_index_deps`,
+        // and bundler's /api/v1/dependencies fallback then gets HTTP 200
+        // with a ZERO-byte body, so unmarshalling dies. Same server defect
+        // saga, new signature — and the exact error text depends on the
+        // bundler generation: classic Marshal (bundler 2.x) raises
+        // `ArgumentError: marshal data too short`, while SafeMarshal
+        // (ruby 3.4+/bundler 4) raises `NoMethodError: undefined method
+        // 'bytes' for nil` reading the empty header ("bytes' for nil"
+        // matches both the old backtick and new ASCII-quote rubies). The
+        // conjunction with the dependency-api retry line is required so a
+        // generic marshal/corruption error from any other source cannot
+        // hide behind this branch.
+        || (detail.contains("Retrying dependency api due to error")
+            && (detail.contains("marshal data too short")
+                || detail.contains("bytes' for nil")));
     assert!(
         !gem_strict,
         "{LEG}: SOCKET_PATCH_HOSTED_E2E_GEM_STRICT=1 and `bundle install` from \
@@ -1597,11 +1625,13 @@ fn gem_bundler_hosted_redirect_and_known_install_defect() {
          This is a new regression:\n{detail}"
     );
     println!(
-        "KNOWN PRODUCTION DEFECT {LEG}: the Socket gem patch-registry compact \
-         index omits runtime dependencies, so bundler refuses the download \
-         (APIResponseMismatchError). Hosted gem mode is unusable for gems with \
-         dependencies until the server emits them. Redirect assertions above \
-         all passed."
+        "KNOWN PRODUCTION DEFECT {LEG}: the Socket gem patch-registry either \
+         omits runtime dependencies from the compact index \
+         (APIResponseMismatchError) or, since depscan#23630, 404s the \
+         compact-index routes as not_built and serves an empty body from the \
+         dependency-API fallback (marshal data too short). Hosted gem mode is \
+         unusable for gems with dependencies until the registry rebuild \
+         completes. Redirect assertions above all passed."
     );
 }
 

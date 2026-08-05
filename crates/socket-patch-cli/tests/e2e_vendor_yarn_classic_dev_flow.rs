@@ -48,6 +48,9 @@ const NEIGHBOR_VERSION: &str = "1.20.0";
 /// Pinned yarn classic via corepack (matches the fresh-checkout capstone).
 const YARN_CLASSIC: &str = "yarn@1.22.22";
 
+#[path = "common/cache_env.rs"]
+mod cache_env;
+
 // ── self-contained helpers (convention: e2e test files stay standalone) ─
 
 fn binary() -> PathBuf {
@@ -57,10 +60,13 @@ fn binary() -> PathBuf {
 /// `corepack <pm> --version` succeeds — the only liveness probe that
 /// distinguishes "corepack present" from "this yarn flavor is fetchable".
 fn has_corepack_pm(pm: &str) -> bool {
-    Command::new("corepack")
-        .args([pm, "--version"])
-        .env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0")
-        .stdout(Stdio::null())
+    // Isolated too: this probe is what actually downloads the package manager
+    // the first time, and corepack stores it under `COREPACK_HOME`.
+    let mut cmd = Command::new("corepack");
+    cmd.args([pm, "--version"])
+        .env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0");
+    cache_env::isolate(&mut cmd);
+    cmd.stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
         .map(|s| s.success())
@@ -69,16 +75,21 @@ fn has_corepack_pm(pm: &str) -> bool {
 
 /// Run `corepack <pm> <args>` in `cwd` with the given extra env, the download
 /// prompt disabled, and every `SOCKET_*` var scrubbed.
+///
+/// The scrub runs FIRST. It ends with `env_remove("YARN_CACHE_FOLDER")`, so
+/// running it last (as this helper used to) wiped the private cache the
+/// caller had just passed in and the fixture install quietly fell back to the
+/// developer's global yarn cache — the same bug `e2e_vendor_yarn_classic_
+/// build.rs` already documents having fixed.
 fn corepack(cwd: &Path, pm: &str, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
     let mut cmd = Command::new("corepack");
-    cmd.arg(pm)
-        .args(args)
-        .current_dir(cwd)
-        .env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0");
+    cmd.arg(pm).args(args).current_dir(cwd);
+    scrub_socket_env(&mut cmd);
+    cache_env::isolate(&mut cmd);
+    cmd.env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0");
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
-    scrub_socket_env(&mut cmd);
     cmd.output().expect("failed to run corepack")
 }
 
