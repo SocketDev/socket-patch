@@ -31,6 +31,15 @@ against the release's `SHA256SUMS`, and installs to `/usr/local/bin` or `~/.loca
 Use `sudo sh` instead of `sh` if `/usr/local/bin` requires root. Pin a version with
 `SOCKET_PATCH_VERSION=3.3.0 sh` instead of plain `sh`.
 
+On a network that blocks or distrusts `github.com`, set `SOCKET_PATCH_BASE_URL` so the
+archives come from Socket too — `install.socket.dev` relays them from the GitHub release,
+checksums included:
+
+```bash
+curl -fsSL https://install.socket.dev/patch \
+  | SOCKET_PATCH_BASE_URL=https://install.socket.dev/SocketDev/socket-patch/releases sh
+```
+
 `install.socket.dev` serves a copy of [`scripts/install.sh`](scripts/install.sh) from
 this repository — read it before you run it, either there or at
 [install.socket.dev/patch](https://install.socket.dev/patch). If you would rather not

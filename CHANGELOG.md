@@ -337,6 +337,18 @@ into the new version's section — see docs/releasing.md.
 
 ### Changed
 
+- **`install.sh` can install without reaching github.com.** New
+  `SOCKET_PATCH_BASE_URL` points the archive downloads at any releases base that
+  answers GitHub's two asset paths — notably
+  `https://install.socket.dev/SocketDev/socket-patch/releases`, which relays them
+  from the GitHub release, so one URL template covers either origin. A new
+  release needs no publish for this: the origin resolves "latest" per request.
+  `socket-patch --update` can use the same host today through the
+  `SOCKET_UPDATE_BASE_URL` override it already has. Also new:
+  `SOCKET_PATCH_INSTALL_DIR` to choose the install directory explicitly instead
+  of taking `/usr/local/bin` or `~/.local/bin`. The default download origin is
+  still GitHub — see `docs/installer-hosting.md`.
+
 - **The documented one-liner installs from `https://install.socket.dev/patch`.**
   The previous URL was `raw.githubusercontent.com`, which asks users to trust a
   third-party CDN for a script they pipe into a shell and is the first URL a

@@ -108,6 +108,39 @@ jobs:
           command -v socket-patch
           socket-patch --version
 
+      - name: Shell — run the installer against an alternate origin
+        # Exercises SOCKET_PATCH_BASE_URL (and SOCKET_PATCH_INSTALL_DIR) with a
+        # base that is not the default. Uses GitHub's own releases base, which
+        # is the same URL shape install.socket.dev serves, so the template the
+        # script builds is covered regardless of whether the Socket relay is
+        # deployed yet. The dedicated Socket-origin check is the next step.
+        run: |
+          SOCKET_PATCH_BASE_URL=https://github.com/SocketDev/socket-patch/releases \
+          SOCKET_PATCH_INSTALL_DIR="$RUNNER_TEMP/alt-origin" \
+            sh scripts/install.sh
+          "$RUNNER_TEMP/alt-origin/socket-patch" --version
+
+      - name: Shell — install through install.socket.dev, once it exists
+        # The whole point of the relay is that a client never has to reach
+        # github.com. That is only assertable against the deployed host, so this
+        # step skips itself until the host resolves rather than being red from
+        # the day it merges (same posture as the installer-drift workflow).
+        run: |
+          if ! curl -sfI -m 20 https://install.socket.dev/patch/latest >/dev/null 2>&1; then
+            echo "::notice::install.socket.dev/patch/latest does not answer yet — skipping the Socket-origin install."
+            exit 0
+          fi
+          latest=$(curl -fsSL -m 20 https://install.socket.dev/patch/latest)
+          echo "install.socket.dev reports latest=$latest"
+          SOCKET_PATCH_BASE_URL=https://install.socket.dev/SocketDev/socket-patch/releases \
+          SOCKET_PATCH_INSTALL_DIR="$RUNNER_TEMP/socket-origin" \
+            sh scripts/install.sh
+          installed=$("$RUNNER_TEMP/socket-origin/socket-patch" --version | awk '{print $NF}')
+          if [ "$installed" != "$latest" ]; then
+            echo "::error::install.socket.dev says latest is $latest but installed $installed" >&2
+            exit 1
+          fi
+
       - name: Shell — the installer URL is consistent across the docs
         # The README, the script's own usage comment, and the hosting runbook
         # all name the canonical URL. Keeping them in lockstep is the whole

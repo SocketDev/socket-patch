@@ -11,10 +11,33 @@ set -eu
 #
 # Override the version that gets installed by exporting SOCKET_PATCH_VERSION:
 #   curl -fsSL https://install.socket.dev/patch | SOCKET_PATCH_VERSION=3.0.0 sh
+#
+# Override where the archives come from with SOCKET_PATCH_BASE_URL — a releases
+# base that answers GitHub's two asset paths, `<base>/latest/download/<file>`
+# and `<base>/download/v<ver>/<file>`. Use it to install without reaching
+# github.com at all:
+#
+#   … | SOCKET_PATCH_BASE_URL=https://install.socket.dev/SocketDev/socket-patch/releases sh
+#
+# install.socket.dev relays those exact paths from the GitHub release, which is
+# why one template covers both origins. Whichever origin is used, the archive is
+# still verified against the SHA256SUMS fetched from that same origin.
+#
+# Override where the binary is installed with SOCKET_PATCH_INSTALL_DIR.
 
 REPO="SocketDev/socket-patch"
 BINARY="socket-patch"
 VERSION="${SOCKET_PATCH_VERSION:-latest}"
+# Releases base. Default is GitHub; see the SOCKET_PATCH_BASE_URL note above for
+# installing through install.socket.dev instead. Trailing slashes are trimmed so
+# a base with one does not produce `//download`.
+RELEASES_BASE="${SOCKET_PATCH_BASE_URL:-https://github.com/${REPO}/releases}"
+while :; do
+  case "$RELEASES_BASE" in
+    */) RELEASES_BASE="${RELEASES_BASE%/}" ;;
+    *) break ;;
+  esac
+done
 
 # Detect platform
 OS="$(uname -s)"
@@ -88,8 +111,13 @@ else
   exit 1
 fi
 
-# Pick install directory
-if [ -w /usr/local/bin ]; then
+# Pick install directory. An explicit SOCKET_PATCH_INSTALL_DIR wins over both
+# defaults — needed for unprivileged installs into a toolchain-managed prefix,
+# and for testing the script without writing to a system path.
+if [ -n "${SOCKET_PATCH_INSTALL_DIR:-}" ]; then
+  INSTALL_DIR="$SOCKET_PATCH_INSTALL_DIR"
+  mkdir -p "$INSTALL_DIR"
+elif [ -w /usr/local/bin ]; then
   INSTALL_DIR="/usr/local/bin"
 else
   INSTALL_DIR="${HOME}/.local/bin"
@@ -100,12 +128,14 @@ fi
 TMPDIR="$(mktemp -d)"
 trap 'rm -rf "$TMPDIR"' EXIT
 
-# Pick the release path. "latest" resolves on GitHub's side; tagged versions are
-# served from /releases/download/v<version>/.
+# Pick the release path. "latest" is resolved by the origin (GitHub redirects;
+# install.socket.dev resolves it against the upstream release), so the script
+# never has to know the version number. Tagged versions are served from
+# <base>/download/v<version>/.
 if [ "$VERSION" = "latest" ]; then
-  BASE_URL="https://github.com/${REPO}/releases/latest/download"
+  BASE_URL="${RELEASES_BASE}/latest/download"
 else
-  BASE_URL="https://github.com/${REPO}/releases/download/v${VERSION#v}"
+  BASE_URL="${RELEASES_BASE}/download/v${VERSION#v}"
 fi
 
 ARCHIVE="${BINARY}-${TARGET}.tar.gz"

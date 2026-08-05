@@ -21,6 +21,45 @@ it stays stable if the artifacts ever move.
 The GitHub URL still works and still serves the same bytes. Anyone who would
 rather not add a dependency on the Socket domain can keep using it.
 
+## Installing without reaching github.com
+
+By default the script downloads archives from the GitHub release. Point it
+somewhere else with `SOCKET_PATCH_BASE_URL` — a releases base that answers
+GitHub's two asset paths, `<base>/latest/download/<file>` and
+`<base>/download/v<ver>/<file>`:
+
+```sh
+curl -fsSL https://install.socket.dev/patch \
+  | SOCKET_PATCH_BASE_URL=https://install.socket.dev/SocketDev/socket-patch/releases sh
+```
+
+`install.socket.dev` relays those exact paths from the GitHub release, which is
+why one template covers both origins and the script needs no branching. It also
+exposes a cleaner shape for humans and for scripts that want the version:
+
+| Endpoint | Serves |
+|---|---|
+| `install.socket.dev/patch/latest` | the latest version as plain text (`3.4.0`) |
+| `install.socket.dev/patch/dl/v3.4.0/<asset>` | that release's asset, immutably cached |
+| `install.socket.dev/patch/dl/latest/<asset>` | the same asset from whatever is latest |
+
+**A new release needs no publish for any of this.** "Latest" is resolved per
+request against the upstream release, so cutting 3.4.0 makes it installable from
+`install.socket.dev` immediately — nothing runs at release time.
+
+`socket-patch --update` can use the same host today, with no changes to the CLI,
+via the endpoint override it already has:
+
+```sh
+SOCKET_UPDATE_BASE_URL=https://install.socket.dev socket-patch --update
+```
+
+One caveat worth knowing before standardizing on that: a non-default
+`SOCKET_UPDATE_BASE_URL` intentionally downgrades the downloaded binary's
+version self-check from hard-fail to a warning, because the override is meant
+for mirrors that may repackage. Making Socket's host a first-class endpoint set
+that keeps the strict check is a CLI change, not a hosting one.
+
 ## What the trust model actually is
 
 Unchanged by the hosting move, and worth being precise about:
@@ -83,9 +122,15 @@ mangled publish is caught even when the hash somehow matches expectations.
   through a package manager or a release archive. A `patch.ps1` object on the
   same host would be the natural addition — the hosting side already supports
   it, nothing here does yet.
-- **Objects must stay flat.** `gcs-bucket-server` interpolates the object name
-  into the GCS JSON API URL unencoded, so only bucket-root keys resolve
-  (`patch`, `patch.sha256`, `index.html`). A nested path like
-  `/patch/3.3.0/install.sh` would 404 until that is fixed on the depscan side.
+- **Objects must stay flat** — for the *bucket-backed* paths only (`patch`,
+  `patch.sha256`, `index.html`). `gcs-bucket-server` interpolates the object name
+  into the GCS JSON API URL unencoded, so only bucket-root keys resolve. This
+  does not affect `/patch/dl/**`, which is relayed by a separate service and
+  never touches the bucket.
+- **The default download origin is still GitHub.** The `SOCKET_PATCH_BASE_URL`
+  mechanism ships first; flipping the default to `install.socket.dev` is a
+  one-line change, deliberately held until the relay is verified in prod. A
+  script that defaults to a host which does not answer yet is a broken installer
+  for everyone running it from a git checkout or the raw GitHub URL.
 
 [depscan]: https://github.com/SocketDev/depscan
