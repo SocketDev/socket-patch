@@ -3,6 +3,7 @@ use regex::Regex;
 use socket_patch_core::api::client::{
     build_proxy_fallback_client, get_api_client_with_overrides, is_fallback_candidate,
 };
+use socket_patch_core::api::ranking::{cmp_search_results, severity_order};
 use socket_patch_core::api::types::{
     PatchResponse, PatchSearchResult, SearchResponse, VulnerabilityResponse,
 };
@@ -82,18 +83,14 @@ pub(crate) fn decide_patch_action(
     }
 }
 
-/// Ordinal rank for severity strings. Higher = worse. Unknown labels
-/// (including GHSA's `moderate` which maps to `medium`) get sensible
-/// defaults so the max-severity selector still works.
+/// Ordinal rank for severity strings. Higher = worse — the inverse of
+/// core's [`severity_order`], which this derives from so the two ladders
+/// cannot drift. Unknown labels (including GHSA's `moderate`, which maps to
+/// `medium`) get sensible defaults so the max-severity selector still works.
 fn severity_rank(severity: &str) -> u8 {
-    match severity.to_ascii_lowercase().as_str() {
-        "critical" => 4,
-        "high" => 3,
-        // GHSA emits `moderate`; treat it as the medium-tier signal.
-        "moderate" | "medium" => 2,
-        "low" => 1,
-        _ => 0,
-    }
+    // severity_order: 0 = critical … 4 = unknown. Flip it so 4 = critical
+    // and unknown lands at 0, which callers below treat as "no signal".
+    4 - severity_order(Some(severity))
 }
 
 /// Return the highest-severity label from a vulnerabilities map.
@@ -489,10 +486,22 @@ fn detect_identifier_type(identifier: &str) -> Option<IdentifierType> {
 
 /// Select one patch per PURL from available patches.
 ///
-/// - Paid users: auto-select the most recent paid patch per PURL.
+/// Within a PURL, candidates are ranked by [`cmp_search_results`]: merged
+/// patches first, then by severity (critical → low), then most recently
+/// published. `tier` is an access filter here, not a ranking signal — a
+/// free critical patch outranks a paid low one.
+///
+/// - Users with paid access: auto-select the top-ranked patch per PURL.
 /// - Free users with one patch: auto-select it.
-/// - Free users with multiple patches: interactive selection via dialoguer.
+/// - Free users with multiple patches: interactive selection via dialoguer,
+///   with the options presented in ranked order so the best patch is both
+///   the highlighted default and what a non-TTY run auto-picks.
 /// - JSON mode with multiple free patches: returns an error with options list.
+///
+/// The returned vec is sorted by PURL. It is assembled from a `HashMap`,
+/// whose iteration order is randomized per process; without the sort the
+/// download order — and every `--json` array derived from it — would differ
+/// run to run.
 ///
 /// Returns `Ok(selected_patches)` or `Err(exit_code)` if selection fails.
 pub(crate) fn select_patches(
@@ -510,18 +519,23 @@ pub(crate) fn select_patches(
 
     let mut selected = Vec::new();
 
-    for (purl, mut group) in by_purl {
-        // Sort by published_at descending (most recent first)
-        group.sort_by(|a, b| b.published_at.cmp(&a.published_at));
+    // Iterate PURLs in a fixed order too: the interactive prompts below are
+    // presented to a human one after another, and a randomized sequence
+    // would be disorienting across otherwise identical runs.
+    let mut groups: Vec<(String, Vec<&PatchSearchResult>)> = by_purl.into_iter().collect();
+    groups.sort_by(|a, b| a.0.cmp(&b.0));
+
+    for (purl, mut group) in groups {
+        // Canonical best-first order (see `api::ranking`). The API client
+        // already sorts each response, but this call site merges results
+        // across several queries, so re-sort the assembled group.
+        group.sort_by(|a, b| cmp_search_results(a, b));
 
         if can_access_paid {
-            // Paid user: prefer most recent paid patch, fallback to most recent free
-            let choice = group
-                .iter()
-                .find(|p| p.tier == "paid")
-                .or_else(|| group.first())
-                .unwrap();
-            selected.push((*choice).clone());
+            // Take the top-ranked patch. Note this is NOT "prefer paid":
+            // tier only breaks ties once merge status, severity and recency
+            // have all tied.
+            selected.push(group[0].clone());
         } else if group.len() == 1 {
             selected.push(group[0].clone());
         } else {
@@ -603,6 +617,8 @@ pub(crate) fn select_patches(
         }
     }
 
+    // PURL-sorted by construction: `groups` was sorted above and this loop
+    // pushes at most one entry per group.
     Ok(selected)
 }
 
@@ -1707,8 +1723,16 @@ pub async fn run(args: GetArgs) -> i32 {
     code
 }
 
+/// Print the patches a search turned up, grouped by PURL and best-first
+/// within each PURL — the same order [`select_patches`] resolves in, so the
+/// listing's first entry for a package is the one that will be applied.
+/// A `by-cve` / `by-ghsa` search can span several packages, hence the PURL
+/// grouping.
 fn display_search_results(patches: &[PatchSearchResult], can_access_paid: bool) {
     println!("\nFound patches:\n");
+
+    let mut patches: Vec<&PatchSearchResult> = patches.iter().collect();
+    patches.sort_by(|a, b| a.purl.cmp(&b.purl).then_with(|| cmp_search_results(a, b)));
 
     for (i, patch) in patches.iter().enumerate() {
         let tier_label = if patch.tier == "paid" {
@@ -2068,6 +2092,28 @@ mod tests {
         }
     }
 
+    /// `mk_patch` with a single vulnerability at the given severity, so the
+    /// severity rung of the ranking is exercised.
+    fn mk_patch_sev(
+        uuid: &str,
+        purl: &str,
+        tier: &str,
+        published_at: &str,
+        severity: &str,
+    ) -> PatchSearchResult {
+        let mut p = mk_patch(uuid, purl, tier, published_at);
+        p.vulnerabilities.insert(
+            format!("GHSA-{uuid}"),
+            VulnerabilityResponse {
+                cves: vec![],
+                summary: String::new(),
+                severity: severity.into(),
+                description: String::new(),
+            },
+        );
+        p
+    }
+
     #[test]
     fn select_free_user_one_free_patch_returns_it() {
         let patches = vec![mk_patch("u1", "pkg:npm/foo@1.0", "free", "2024-01-01")];
@@ -2077,14 +2123,201 @@ mod tests {
     }
 
     #[test]
-    fn select_paid_user_prefers_paid_over_free_same_purl() {
+    fn select_paid_user_picks_highest_severity_not_most_recent() {
+        // The reported bug. An authorized user's package has a fresh `low`
+        // patch and an older `critical` one; the old selector took the
+        // newest and silently left the critical unfixed.
         let patches = vec![
-            mk_patch("free1", "pkg:npm/foo@1.0", "free", "2024-06-01"),
+            mk_patch_sev("new_low", "pkg:npm/foo@1.0", "paid", "2026-06-01", "low"),
+            mk_patch_sev(
+                "old_crit",
+                "pkg:npm/foo@1.0",
+                "paid",
+                "2024-01-01",
+                "critical",
+            ),
+        ];
+        let out = select_patches(&patches, true, false).expect("ok");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].uuid, "old_crit");
+    }
+
+    #[test]
+    fn select_paid_user_picks_free_critical_over_paid_low() {
+        // Severity outranks tier: `tier` gates *access*, it does not rank.
+        // A paid subscriber must not be handed a low-severity paid patch
+        // when a critical free one exists for the same package.
+        let patches = vec![
+            mk_patch_sev("paid_low", "pkg:npm/foo@1.0", "paid", "2026-06-01", "low"),
+            mk_patch_sev(
+                "free_crit",
+                "pkg:npm/foo@1.0",
+                "free",
+                "2024-01-01",
+                "critical",
+            ),
+        ];
+        let out = select_patches(&patches, true, false).expect("ok");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].uuid, "free_crit");
+        assert_eq!(out[0].tier, "free");
+    }
+
+    /// `mk_patch_sev` with one advisory per severity — two or more makes it
+    /// a *merged* patch (see `api::ranking::merged_coverage`), which is
+    /// inferred from the advisory count, not from any API flag.
+    fn mk_patch_multi(
+        uuid: &str,
+        purl: &str,
+        tier: &str,
+        published_at: &str,
+        severities: &[&str],
+    ) -> PatchSearchResult {
+        let mut p = mk_patch(uuid, purl, tier, published_at);
+        for (i, sev) in severities.iter().enumerate() {
+            p.vulnerabilities.insert(
+                format!("GHSA-{uuid}-{i}"),
+                VulnerabilityResponse {
+                    cves: vec![],
+                    summary: String::new(),
+                    severity: (*sev).into(),
+                    description: String::new(),
+                },
+            );
+        }
+        p
+    }
+
+    #[test]
+    fn select_prefers_merged_patch_when_severities_tie() {
+        // The general preference: `z_merged` remediates two HIGH advisories
+        // in one blob, `a_single` only one. Severities tie, so breadth
+        // decides. `a_single` is both newer AND earlier by uuid, so only
+        // the coverage rung can produce this result.
+        let patches = vec![
+            mk_patch_sev("a_single", "pkg:npm/foo@1.0", "paid", "2026-06-01", "high"),
+            mk_patch_multi(
+                "z_merged",
+                "pkg:npm/foo@1.0",
+                "free",
+                "2020-01-01",
+                &["high", "high"],
+            ),
+        ];
+        let out = select_patches(&patches, true, false).expect("ok");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].uuid, "z_merged");
+    }
+
+    #[test]
+    fn select_prefers_a_higher_severity_patch_over_the_merged_one() {
+        // The exception. A merged patch must not shadow a worse
+        // vulnerability: `z_critical` addresses a CRITICAL the merged patch
+        // does not cover, so it wins despite being older, single-advisory,
+        // and last by uuid.
+        let patches = vec![
+            mk_patch_multi(
+                "a_merged",
+                "pkg:npm/foo@1.0",
+                "free",
+                "2026-06-01",
+                &["high", "high"],
+            ),
+            mk_patch_sev(
+                "z_critical",
+                "pkg:npm/foo@1.0",
+                "free",
+                "2020-01-01",
+                "critical",
+            ),
+        ];
+        let out = select_patches(&patches, true, false).expect("ok");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].uuid, "z_critical");
+    }
+
+    #[test]
+    fn select_recency_is_chronological_not_lexicographic() {
+        // `publishedAt` is RFC 2822 on the wire, so the old raw-string
+        // compare ordered by weekday name. With equal severities the newer
+        // patch must win regardless of which weekday it fell on.
+        let older = "Wed, 01 Jan 2025 00:00:00 GMT";
+        let newer = "Fri, 01 Aug 2026 00:00:00 GMT";
+        assert!(older > newer, "precondition: raw strings sort backwards");
+        // Adversarial UUIDs: `a_older` sorts first, so the final uuid
+        // tiebreak points at the wrong patch and cannot rescue this test if
+        // the date rung breaks.
+        let patches = vec![
+            mk_patch_sev("a_older", "pkg:npm/foo@1.0", "paid", older, "high"),
+            mk_patch_sev("z_newer", "pkg:npm/foo@1.0", "paid", newer, "high"),
+        ];
+        let out = select_patches(&patches, true, false).expect("ok");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].uuid, "z_newer");
+    }
+
+    #[test]
+    fn select_recency_uses_the_patch_date_not_the_package_release_date() {
+        // Real production pair: both patches are for `axios@1.6.0` — one
+        // package version, one upstream release date (2023-10-26) — yet
+        // they carry different publish dates because the field describes
+        // the PATCH. Severities tie, so the date is the deciding rung.
+        //
+        // Non-vacuity: `0bc312a6` < `83f5a654`, so if the ranking ever fell
+        // back to the UUID tiebreak (which is what a package-level date
+        // would cause, both keys being equal) this would select the OLDER
+        // patch and fail.
+        let patches = vec![
+            mk_patch_sev(
+                "0bc312a6",
+                "pkg:npm/axios@1.6.0",
+                "free",
+                "Fri, 27 Mar 2026 19:12:42 GMT",
+                "HIGH",
+            ),
+            mk_patch_sev(
+                "83f5a654",
+                "pkg:npm/axios@1.6.0",
+                "free",
+                "Mon, 03 Aug 2026 20:23:06 GMT",
+                "HIGH",
+            ),
+        ];
+        let out = select_patches(&patches, true, false).expect("ok");
+        assert_eq!(out.len(), 1, "one patch per PURL");
+        assert_eq!(out[0].uuid, "83f5a654");
+    }
+
+    #[test]
+    fn select_returns_purl_sorted_output() {
+        // The grouping map has randomized iteration order; without an
+        // explicit sort the download sequence (and every JSON array derived
+        // from it) would differ run to run.
+        let patches = vec![
+            mk_patch("c", "pkg:npm/ccc@1.0", "paid", "2024-01-01"),
+            mk_patch("a", "pkg:npm/aaa@1.0", "paid", "2024-01-01"),
+            mk_patch("b", "pkg:npm/bbb@1.0", "paid", "2024-01-01"),
+        ];
+        for _ in 0..8 {
+            let out = select_patches(&patches, true, false).expect("ok");
+            let purls: Vec<&str> = out.iter().map(|p| p.purl.as_str()).collect();
+            assert_eq!(
+                purls,
+                ["pkg:npm/aaa@1.0", "pkg:npm/bbb@1.0", "pkg:npm/ccc@1.0"]
+            );
+        }
+    }
+
+    #[test]
+    fn select_paid_user_prefers_paid_when_everything_else_ties() {
+        // Tier survives only as a late tiebreak: same merge status, same
+        // (absent) severity, same publish date → paid wins.
+        let patches = vec![
+            mk_patch("free1", "pkg:npm/foo@1.0", "free", "2024-01-01"),
             mk_patch("paid1", "pkg:npm/foo@1.0", "paid", "2024-01-01"),
         ];
         let out = select_patches(&patches, true, false).expect("ok");
         assert_eq!(out.len(), 1);
-        // Paid wins even if free is more recent.
         assert_eq!(out[0].uuid, "paid1");
         assert_eq!(out[0].tier, "paid");
     }

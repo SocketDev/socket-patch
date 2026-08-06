@@ -729,6 +729,13 @@ pub async fn run(mut args: ScanArgs) -> i32 {
         }
     }
 
+    // The client returns each batch's packages PURL-sorted, but the batches
+    // themselves are concatenated in chunk order, so the assembled list is
+    // only sorted *within* each chunk. Sort globally: this list drives the
+    // human table, the `--json` `packages` array, and the apply order, all
+    // of which operators diff across runs.
+    all_packages_with_patches.sort_by(|a, b| a.purl.cmp(&b.purl));
+
     // If every batch errored, surface this as a full scan failure rather
     // than silently reporting zero patches (which historically looked
     // identical to "no patches for these packages").

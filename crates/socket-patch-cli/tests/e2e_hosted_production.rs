@@ -491,6 +491,73 @@ async fn published_uuids(purl: &str) -> Result<Vec<String>, String> {
         .unwrap_or_default())
 }
 
+/// `GET /patch/by-package/<purl>` returning, per patch, the `(uuid,
+/// advisory_count)` pair that drives merge-state inference.
+async fn published_patch_advisory_counts(purl: &str) -> Result<Vec<(String, usize)>, String> {
+    let url = format!("{PROXY}/patch/by-package/{}", urlencode(purl));
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .header("Accept", "application/json")
+        .send()
+        .await
+        .map_err(|e| format!("GET {url}: {e}"))?;
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| format!("GET {url}: reading body: {e}"))?;
+    let v: serde_json::Value =
+        serde_json::from_str(&body).map_err(|e| format!("GET {url}: bad JSON ({e}):\n{body}"))?;
+    Ok(v["patches"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|p| {
+                    Some((
+                        p["uuid"].as_str()?.to_string(),
+                        p["vulnerabilities"].as_object()?.len(),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+/// `GET /patch/by-package/<purl>` returning `(uuid, publishedAt)` pairs.
+/// Sibling of [`published_uuids`] for tests that care about patch metadata
+/// rather than just which UUIDs exist.
+async fn published_patch_dates(purl: &str) -> Result<Vec<(String, String)>, String> {
+    let url = format!("{PROXY}/patch/by-package/{}", urlencode(purl));
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .header("Accept", "application/json")
+        .send()
+        .await
+        .map_err(|e| format!("GET {url}: {e}"))?;
+    let status = resp.status();
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| format!("GET {url}: reading body: {e}"))?;
+    if !status.is_success() {
+        return Err(format!("GET {url}: HTTP {status}\n{body}"));
+    }
+    let v: serde_json::Value =
+        serde_json::from_str(&body).map_err(|e| format!("GET {url}: bad JSON ({e}):\n{body}"))?;
+    Ok(v["patches"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|p| {
+                    Some((
+                        p["uuid"].as_str()?.to_string(),
+                        p["publishedAt"].as_str()?.to_string(),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
 /// Percent-encode a PURL for use as a single path segment. `reqwest` will not
 /// do this for us — a raw `pkg:npm/...` would be split into path segments and
 /// 404.
@@ -554,6 +621,163 @@ async fn preflight_required_patches_are_published() {
         "required production patches are no longer available:\n  - {}",
         failures.join("\n  - ")
     );
+}
+
+/// Canary: production must keep naming advisories, because merge state is
+/// **inferred** from the advisory count rather than read off a flag.
+///
+/// `api::ranking` ranks a patch that remediates several advisories above one
+/// that remediates a single advisory. The whole signal is the size of the
+/// `vulnerabilities` map. If production ever stopped populating it — shipping
+/// patches with an empty map, or moving advisory ids somewhere else — every
+/// patch would collapse to coverage 0, the merge rung would go permanently
+/// inert, and selection would silently fall through to recency with no error
+/// anywhere.
+///
+/// This asserts only that the signal EXISTS (every patch names >= 1
+/// advisory), never how many. Production publishes no merged patches today —
+/// all patches sampled cover exactly one advisory — and the day that changes
+/// is not a regression, so a count of >= 2 must not fail this test.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "live production API: contacts patches-api.socket.dev. Run with --ignored."]
+async fn canary_patches_name_advisories_so_merge_state_is_inferable() {
+    let mut failures: Vec<String> = Vec::new();
+    let mut coverage_seen: Vec<(String, String, usize)> = Vec::new();
+
+    for purl in [NPM_PURL, PYPI_PURL, CARGO_PURL, GEM_PURL] {
+        match published_patch_advisory_counts(purl).await {
+            Err(e) => failures.push(format!("{purl}: production probe failed: {e}")),
+            Ok(patches) if patches.is_empty() => {
+                failures.push(format!("{purl}: production publishes no patches"))
+            }
+            Ok(patches) => {
+                for (uuid, count) in patches {
+                    if count == 0 {
+                        failures.push(format!(
+                            "{purl}: patch {uuid} names ZERO advisories — merge-state \
+                             inference has no signal to work with, so the merge rung in \
+                             api::ranking is dead for this patch"
+                        ));
+                    }
+                    coverage_seen.push((purl.to_string(), uuid, count));
+                }
+            }
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "merge-state inference signal is missing from production:\n  - {}",
+        failures.join("\n  - ")
+    );
+
+    // Informational: surfaces the day production starts publishing merged
+    // patches, without failing when it does.
+    let merged: Vec<_> = coverage_seen.iter().filter(|(_, _, c)| *c >= 2).collect();
+    if merged.is_empty() {
+        eprintln!(
+            "[info] production publishes no merged patches yet ({} patches, all single-advisory)",
+            coverage_seen.len()
+        );
+    } else {
+        eprintln!("[info] production now publishes merged patches: {merged:?}");
+    }
+}
+
+/// Canary: production's `publishedAt` must stay a **per-patch** date.
+///
+/// Patch selection ranks by recency (`socket_patch_core::api::ranking`), and
+/// that rung is only meaningful if `publishedAt` describes the patch rather
+/// than the upstream package release. If the server ever started emitting the
+/// package's release date, every patch for a given PURL would collapse to one
+/// value, recency would silently stop discriminating, and selection would
+/// quietly fall through to the UUID tiebreak — a wrong answer with no error
+/// anywhere. Nothing else in the suite would catch that.
+///
+/// `PYPI_PURL` is the probe because production publishes three patches for
+/// it (see [`PYPI_UUIDS`]). Two assertions:
+///
+///  1. the dates are not all identical — impossible for a package-level date;
+///  2. no patch date equals the package's own upload time on PyPI.
+///
+/// (2) is skipped, with a note, if pypi.org is unreachable — a PyPI outage is
+/// not a socket-patch regression. (1) is unconditional.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "live production API: contacts patches-api.socket.dev + pypi.org. Run with --ignored."]
+async fn canary_published_at_is_a_patch_date_not_a_package_date() {
+    let patches = published_patch_dates(PYPI_PURL)
+        .await
+        .unwrap_or_else(|e| panic!("production probe failed for {PYPI_PURL}: {e}"));
+
+    assert!(
+        patches.len() >= 2,
+        "{PYPI_PURL} must publish >=2 patches for this canary to have teeth; \
+         production returned {}. Re-pick a multi-patch PURL and update this test.",
+        patches.len()
+    );
+
+    let distinct: std::collections::HashSet<&str> =
+        patches.iter().map(|(_, d)| d.as_str()).collect();
+    assert!(
+        distinct.len() > 1,
+        "all {} patches for {PYPI_PURL} share one publishedAt ({:?}). That is the \
+         signature of a PACKAGE-level date: recency ranking has stopped \
+         discriminating and selection is falling through to the UUID tiebreak.\n\
+         patches: {patches:#?}",
+        patches.len(),
+        distinct
+    );
+
+    // (2) Cross-check against the real upstream release date.
+    let pypi_url = format!("https://pypi.org/pypi/{PYPI_NAME}/json");
+    let Ok(resp) = reqwest::Client::new().get(&pypi_url).send().await else {
+        eprintln!("[skip] pypi.org unreachable; distinct-dates assertion still enforced");
+        return;
+    };
+    let Ok(body) = resp.text().await else {
+        eprintln!("[skip] pypi.org body unreadable; distinct-dates assertion still enforced");
+        return;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) else {
+        eprintln!("[skip] pypi.org returned non-JSON; distinct-dates assertion still enforced");
+        return;
+    };
+    let uploads: Vec<String> = v["releases"][PYPI_VERSION]
+        .as_array()
+        .map(|files| {
+            files
+                .iter()
+                .filter_map(|f| f["upload_time_iso_8601"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    if uploads.is_empty() {
+        eprintln!("[skip] pypi.org listed no upload times for {PYPI_NAME} {PYPI_VERSION}");
+        return;
+    }
+    // PyPI stamps ISO-8601; the patch API stamps RFC 2822. They cannot be
+    // compared as strings, so compare the calendar DATE via the same parser
+    // the ranking uses.
+    use socket_patch_core::utils::date::parse_timestamp_secs;
+    let upload_days: std::collections::HashSet<u64> = uploads
+        .iter()
+        .filter_map(|u| parse_timestamp_secs(u))
+        .map(|s| s / 86_400)
+        .collect();
+    for (uuid, published) in &patches {
+        let Some(secs) = parse_timestamp_secs(published) else {
+            panic!(
+                "production publishedAt {published:?} (patch {uuid}) does not parse — \
+                    utils::date must handle every format the API emits"
+            );
+        };
+        assert!(
+            !upload_days.contains(&(secs / 86_400)),
+            "patch {uuid} reports publishedAt {published:?}, which falls on the same day \
+             {PYPI_NAME} {PYPI_VERSION} was uploaded to PyPI ({uploads:?}). That strongly \
+             suggests the field switched to the PACKAGE release date."
+        );
+    }
 }
 
 // ===========================================================================
