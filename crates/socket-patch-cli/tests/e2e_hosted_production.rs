@@ -558,6 +558,41 @@ async fn published_patch_dates(purl: &str) -> Result<Vec<(String, String)>, Stri
         .unwrap_or_default())
 }
 
+/// The Socket patch-registry base URL the gem rewriter pinned into `Gemfile`
+/// as `source "<base>" do`, or `None` when no Socket source block is present.
+///
+/// Read back out of the rewritten file rather than rebuilt from constants on
+/// purpose: the probe must interrogate the *exact* registry bundler was told
+/// to use, so a rewriter that emits the wrong base cannot be papered over by a
+/// probe that guesses the right one.
+fn gem_registry_base(gemfile: &str) -> Option<String> {
+    const OPEN: &str = "source \"";
+    let marker = format!("{OPEN}https://{PATCH_HOST}/patch-registry/gem/");
+    let at = gemfile.find(&marker)?;
+    let rest = &gemfile[at + OPEN.len()..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+/// `GET <url>` → `(status, body_len)`, or `Err` on a transport failure.
+///
+/// Sends a bundler-shaped `User-Agent` so the probe observes whatever a real
+/// `bundle install` would be served.
+async fn http_probe(url: &str) -> Result<(u16, usize), String> {
+    let resp = reqwest::Client::new()
+        .get(url)
+        .header("User-Agent", "bundler/2.6.9 rubygems/3.6.9")
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    let status = resp.status().as_u16();
+    let body = resp
+        .bytes()
+        .await
+        .map_err(|e| format!("reading body: {e}"))?;
+    Ok((status, body.len()))
+}
+
 /// Percent-encode a PURL for use as a single path segment. `reqwest` will not
 /// do this for us — a raw `pkg:npm/...` would be split into path segments and
 /// 404.
@@ -1523,9 +1558,41 @@ fn cargo_hosted_install_proof() {
 /// leg reports loudly but does not fail the suite; set
 /// `SOCKET_PATCH_HOSTED_E2E_GEM_STRICT=1` to promote it to a hard failure
 /// (do that as the regression guard once the server is fixed).
-#[test]
+///
+/// # Why the tolerance probes the server instead of matching the error text
+///
+/// This leg used to accept the install failure by string-matching bundler's
+/// message. That couples a CI check to one particular *symptom* of the server
+/// bug, and the symptom is a function of which fetcher bundler lands on —
+/// which the server keeps changing. Bundler selects one via
+/// `available_fetchers.drop_while {|f| !f.available? }` over `[CompactIndex,
+/// Dependency, Index]`, so:
+///
+/// | server state | `/versions` | `/api/v1/dependencies` | bundler raises |
+/// |---|---|---|---|
+/// | originally | 200, empty dep segment | — | `Bundler::APIResponseMismatchError` |
+/// | after depscan#23630 | 404 `not_built` | **200, zero-byte body** | `ArgumentError: marshal data too short` (classic Marshal) / `NoMethodError: undefined method 'bytes' for nil` (SafeMarshal, ruby 3.4+) |
+/// | after the empty-body fix | 404 `not_built` | 404 | `Could not fetch specs from …` |
+///
+/// Three different strings for one unchanged server condition. A whitelist of
+/// them goes stale on every server deploy and reds the check for a reason that
+/// has nothing to do with socket-patch.
+///
+/// So the tolerance is decided by the **condition**, not the symptom: probe
+/// the pinned registry's `/versions` — the URL bundler was actually given,
+/// read back out of the rewritten `Gemfile`.
+///
+/// * non-2xx → the documented server defect. The install failure is expected;
+///   report loudly and pass (unless `SOCKET_PATCH_HOSTED_E2E_GEM_STRICT=1`).
+/// * 2xx → the compact index is **built**, so hosted gem mode MUST work. An
+///   install failure is then a real regression and fails the suite.
+///
+/// That is symptom-independent, and it **auto-retires itself**: the moment the
+/// server is healthy the 2xx branch starts enforcing a real success assertion,
+/// with no stale whitelist and no `NOTE` asking a human to clean up.
+#[tokio::test(flavor = "multi_thread")]
 #[ignore = "live production API + real rubygems.org. Run with --ignored."]
-fn gem_bundler_hosted_redirect_and_known_install_defect() {
+async fn gem_bundler_hosted_redirect_and_known_install_defect() {
     const LEG: &str = "gem_bundler_hosted_redirect_and_known_install_defect";
     if !has_command("ruby") || !has_command("bundle") {
         soft_skip!(LEG, "`ruby` and/or `bundle` not on PATH");
@@ -1594,44 +1661,68 @@ fn gem_bundler_hosted_redirect_and_known_install_defect() {
         return;
     }
     let detail = dump(&reinstall);
-    let is_known_defect = detail.contains("APIResponseMismatchError")
-        || detail.contains("revealed dependencies not in the API")
-        // depscan#23630 (deployed 2026-08-02) made the compact-index routes
-        // fail closed: they 404 with `{"error":"not_built"}` until the
-        // requeued gem-package rebuild populates `package_gem_index_deps`,
-        // and bundler's /api/v1/dependencies fallback then gets HTTP 200
-        // with a ZERO-byte body, so unmarshalling dies. Same server defect
-        // saga, new signature — and the exact error text depends on the
-        // bundler generation: classic Marshal (bundler 2.x) raises
-        // `ArgumentError: marshal data too short`, while SafeMarshal
-        // (ruby 3.4+/bundler 4) raises `NoMethodError: undefined method
-        // 'bytes' for nil` reading the empty header ("bytes' for nil"
-        // matches both the old backtick and new ASCII-quote rubies). The
-        // conjunction with the dependency-api retry line is required so a
-        // generic marshal/corruption error from any other source cannot
-        // hide behind this branch.
-        || (detail.contains("Retrying dependency api due to error")
-            && (detail.contains("marshal data too short")
-                || detail.contains("bytes' for nil")));
+
+    // Ask the SERVER what state it is in, rather than guessing from bundler's
+    // error text (see the doc comment above for why the text is untrustworthy).
+    // The base is read back out of the rewritten Gemfile, so this probes the
+    // exact registry bundler was pointed at.
+    let index_base = gem_registry_base(&gemfile).unwrap_or_else(|| {
+        panic!(
+            "{LEG}: could not read the Socket registry base back out of the \
+             rewritten Gemfile, so the install failure cannot be attributed. \
+             The redirect assertions above passed, so the `source \"…\" do` \
+             block shape must have changed:\n{gemfile}"
+        )
+    });
+    let versions_url = format!("{}/versions", index_base.trim_end_matches('/'));
+    let probe = http_probe(&versions_url).await;
+    let probe_note = match &probe {
+        Ok((status, len)) => {
+            format!("GET {versions_url} -> HTTP {status}, {len}-byte body")
+        }
+        Err(e) => format!("GET {versions_url} -> transport error: {e}"),
+    };
+
+    // Strict mode promotes ANY install failure to a hard failure, whatever the
+    // server state — that is its whole purpose as the regression guard.
     assert!(
         !gem_strict,
         "{LEG}: SOCKET_PATCH_HOSTED_E2E_GEM_STRICT=1 and `bundle install` from \
-         the redirected Gemfile failed:\n{detail}"
+         the redirected Gemfile failed.\n  registry probe: {probe_note}\n{detail}"
     );
-    assert!(
-        is_known_defect,
-        "{LEG}: `bundle install` from the redirected Gemfile failed for an \
-         UNEXPECTED reason (not the known compact-index dependency defect). \
-         This is a new regression:\n{detail}"
-    );
+
+    // A 2xx `/versions` means the compact index is BUILT and bundler was
+    // served a usable index. The documented server defect therefore does NOT
+    // apply, and tolerating the failure here would hide a real regression.
+    if let Ok((status, _)) = probe {
+        assert!(
+            !(200..300).contains(&status),
+            "{LEG}: `bundle install` from the redirected Gemfile FAILED even \
+             though the pinned registry's compact index is SERVING.\n  \
+             registry probe: {probe_note}\n\
+             A 2xx /versions means `package_gem_index_deps` is populated and \
+             the index is built, so this is NOT the known server defect \
+             (which 404s that route) — it is a real regression in hosted gem \
+             mode. The redirect assertions above all passed, so the rewrite \
+             itself is fine and the failure is in the install leg.\n{detail}"
+        );
+    }
+
+    // Non-2xx (or an unreachable registry): the documented server defect.
+    // A transport error is tolerated rather than failed because a network
+    // blip is the most likely explanation for BOTH the probe and the install
+    // failing, and a required check must not go red for one.
     println!(
-        "KNOWN PRODUCTION DEFECT {LEG}: the Socket gem patch-registry either \
-         omits runtime dependencies from the compact index \
-         (APIResponseMismatchError) or, since depscan#23630, 404s the \
-         compact-index routes as not_built and serves an empty body from the \
-         dependency-API fallback (marshal data too short). Hosted gem mode is \
-         unusable for gems with dependencies until the registry rebuild \
-         completes. Redirect assertions above all passed."
+        "KNOWN PRODUCTION DEFECT {LEG}: the Socket gem patch-registry's \
+         compact index is not being served for this patch, so `bundle \
+         install` from the redirected Gemfile cannot succeed.\n  registry \
+         probe: {probe_note}\n\
+         Since depscan#23630 the compact-index routes fail closed with 404 \
+         `not_built` until the requeued rebuild populates \
+         `package_gem_index_deps`. Hosted gem mode stays unusable for gems \
+         with dependencies until that completes. Redirect assertions above \
+         all passed; this leg will start asserting a real successful install \
+         automatically once /versions returns 2xx."
     );
 }
 
