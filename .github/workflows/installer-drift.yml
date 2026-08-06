@@ -1,0 +1,97 @@
+name: Installer drift
+
+# install.socket.dev/patch is supposed to be a byte-for-byte copy of
+# scripts/install.sh — the README says so, and the whole point of hosting the
+# installer on a Socket domain is that the bytes are auditable against this
+# repository. Nothing enforces that at publish time from this side: the copy is
+# published out of depscan's vendored `submodules/socket-patch` pin, so an
+# installer change merged here is not live until that pin is bumped and depscan
+# deploys (see docs/installer-hosting.md).
+#
+# This job is the watchdog for that gap. It is deliberately NOT part of CI: it
+# checks a deployed artifact, not the diff, and a red run here means "go bump
+# the pin", not "this PR is broken".
+on:
+  schedule:
+    # Mondays, 07:00 UTC.
+    - cron: '0 7 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Fetch the hosted installer
+        id: fetch
+        # Not `curl -f`: a non-200 body and its headers are the diagnostic.
+        run: |
+          url=https://install.socket.dev/patch
+          set +e
+          http=$(curl -sS -D headers.txt -o hosted-install.sh -w '%{http_code}' --max-time 30 "$url")
+          rc=$?
+          set -e
+
+          # curl exit 6 is "could not resolve host": the domain has not been
+          # stood up yet, so there is nothing to be in drift with. Report and
+          # pass, rather than being red from the day this workflow merges.
+          if [ "$rc" -eq 6 ]; then
+            echo "::notice::install.socket.dev does not resolve yet — skipping the drift check."
+            echo 'deployed=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::curl exited $rc fetching $url"
+            exit 1
+          fi
+
+          if [ "$http" != '200' ]; then
+            echo "::error::$url returned HTTP $http"
+            # The failure mode this host is most exposed to: Cloudflare's bot
+            # challenge answers plain curl with a 403 and an HTML interstitial,
+            # which `curl | sh` would pipe straight into a shell.
+            if grep -qi '^cf-mitigated:' headers.txt; then
+              echo "::error::Cloudflare is challenging plain HTTP clients for install.socket.dev. The DNS record needs the same bot-challenge exemption patch.socket.dev has, or the documented one-liner feeds an HTML challenge page to sh."
+            fi
+            sed -n '1,40p' headers.txt
+            exit 1
+          fi
+
+          echo 'deployed=true' >> "$GITHUB_OUTPUT"
+
+      - name: Compare against scripts/install.sh
+        if: steps.fetch.outputs.deployed == 'true'
+        run: |
+          if ! diff -u scripts/install.sh hosted-install.sh; then
+            echo "::error::install.socket.dev/patch has drifted from scripts/install.sh. Fix: bump submodules/socket-patch in depscan to this commit and deploy — see docs/installer-hosting.md."
+            exit 1
+          fi
+          echo "install.socket.dev/patch matches scripts/install.sh"
+
+      - name: Check the hosted copy is a usable script
+        if: steps.fetch.outputs.deployed == 'true'
+        # Belt and braces: even with matching bytes, verify what is served is
+        # something a shell will accept. Catches a publish that mangled line
+        # endings or content-encoding in a way diff -u glosses over.
+        run: |
+          shellcheck --shell=sh hosted-install.sh
+          sh -n hosted-install.sh
+
+      - name: Check the published checksum
+        if: steps.fetch.outputs.deployed == 'true'
+        run: |
+          served=$(curl -fsSL --max-time 30 https://install.socket.dev/patch.sha256 | tr -d '[:space:]')
+          expected=$(sha256sum scripts/install.sh | awk '{print $1}')
+          if [ "$served" != "$expected" ]; then
+            echo "::error::install.socket.dev/patch.sha256 is $served, expected $expected"
+            exit 1
+          fi
+          echo "published checksum matches: $expected"
