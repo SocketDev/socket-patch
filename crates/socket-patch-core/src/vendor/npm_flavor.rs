@@ -57,7 +57,7 @@ impl NpmLockFlavor {
 
 /// Yarn berry Plug'n'Play loaders: packages live inside `.yarn/cache/` zips,
 /// so there is nothing on disk to stage and no lockfile entry to rewire.
-const PNP_MARKERS: [&str; 3] = [".pnp.cjs", ".pnp.js", ".pnp.loader.mjs"];
+use crate::constants::npm_family::PNP_MARKERS;
 
 /// How many head lines the yarn content sniff reads (the v1 header sits in
 /// the leading comment block; berry's `__metadata:` is the first top-level
@@ -397,6 +397,23 @@ pub async fn revert_npm_any(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn probe_lockfile_names_match_the_shared_npm_family_table() {
+        // Drift guard: the probe's wiring families and the shared
+        // constants::npm_family table must agree on which file names the
+        // vendor probe recognizes. A new lockfile spelling added in one
+        // place must show up in the other (and in every other consumer's
+        // guard test) instead of drifting silently.
+        let mut from_families: Vec<&str> = LOCKFILE_FAMILIES
+            .iter()
+            .flat_map(|(_, names)| names.iter().copied())
+            .collect();
+        from_families.sort_unstable();
+        let mut from_table = crate::constants::npm_family::names_with(|r| r.vendor_probe);
+        from_table.sort_unstable();
+        assert_eq!(from_families, from_table);
+    }
+
     use super::*;
     use crate::hash::git_sha256::compute_git_sha256_from_bytes;
     use crate::manifest::schema::PatchFileInfo;
