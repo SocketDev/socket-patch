@@ -195,7 +195,7 @@ const VENDOR_UUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
 /// ledger entry binding the purl to it, and a manifest record whose
 /// afterHash is the hash of `patched`.
 fn setup_vendored_fixture(proj: &Path, home: &Path, installed: &[u8], vendored: &[u8]) {
-    use socket_patch_core::patch::vendor::state::{VendorArtifact, VendorEntry, VendorState};
+    use socket_patch_core::vendor::state::{VendorArtifact, VendorEntry, VendorState};
 
     write(
         &proj.join("package.json"),

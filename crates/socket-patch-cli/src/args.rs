@@ -20,7 +20,7 @@ use clap::Args;
 use socket_patch_core::api::client::ApiClientEnvOverrides;
 use socket_patch_core::constants::DEFAULT_PATCH_MANIFEST_PATH;
 use socket_patch_core::crawlers::Ecosystem;
-use socket_patch_core::patch::vendor::VendorSource;
+use socket_patch_core::vendor::VendorSource;
 
 /// clap value-parser for each `--ecosystems` / `SOCKET_ECOSYSTEMS` token.
 ///

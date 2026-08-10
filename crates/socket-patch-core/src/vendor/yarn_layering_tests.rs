@@ -39,12 +39,12 @@ use crate::hash::git_sha256::compute_git_sha256_from_bytes;
 use crate::manifest::schema::{PatchFileInfo, PatchRecord};
 use crate::patch::apply::PatchSources;
 use crate::patch::redirect::{rewrite_registry_redirect, DepOverride, Integrity};
-use crate::patch::vendor::lock_inventory::{inventory_npm_lock, LockIntegrity};
-use crate::patch::vendor::npm_flavor::NpmLockFlavor;
-use crate::patch::vendor::yarn_berry_lock::{revert_yarn_berry, vendor_yarn_berry};
-use crate::patch::vendor::yarn_classic_lock::{revert_yarn_classic, vendor_yarn_classic};
-use crate::patch::vendor::{RevertOutcome, VendorEntry, VendorOutcome};
 use crate::utils::uri::encode_uri_component;
+use crate::vendor::lock_inventory::{inventory_npm_lock, LockIntegrity};
+use crate::vendor::npm_flavor::NpmLockFlavor;
+use crate::vendor::yarn_berry_lock::{revert_yarn_berry, vendor_yarn_berry};
+use crate::vendor::yarn_classic_lock::{revert_yarn_classic, vendor_yarn_classic};
+use crate::vendor::{RevertOutcome, VendorEntry, VendorOutcome};
 
 /// Canonical-grammar patch uuid (the vendor path layer validates the shape
 /// fail-closed, so fixtures must use the real grammar).

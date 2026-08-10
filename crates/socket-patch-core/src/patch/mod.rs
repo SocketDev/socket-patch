@@ -16,7 +16,6 @@ pub mod sidecars;
 // for external consumers of the published crate. Internal code must import
 // the new canonical paths (`crate::vendor::*`, `redirect::golang_local`);
 // CI greps reject new uses of the old ones. Drop these aliases at 4.0.
-pub(crate) use crate::vendor::bun_lock_text;
-pub use crate::vendor::go_mod_edit;
 pub use crate::vendor;
+pub use crate::vendor::go_mod_edit;
 pub use redirect::golang_local as go_redirect;

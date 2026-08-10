@@ -97,7 +97,7 @@ pub async fn detect_python_pm(cwd: &Path) -> PythonPackageManager {
 }
 
 /// True if a `[prefix]` or `[prefix.*]` table header appears in the TOML text.
-/// Also used by the pypi vendor flavor router (`patch::vendor::pypi`).
+/// Also used by the pypi vendor flavor router (`vendor::pypi`).
 pub(crate) fn has_table(content: &str, prefix: &str) -> bool {
     content.lines().any(|line| {
         let l = line.trim();

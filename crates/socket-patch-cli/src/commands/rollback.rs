@@ -97,8 +97,8 @@ async fn try_rollback_local_go(
     patch: &PatchRecord,
     common: &GlobalArgs,
 ) -> Option<RollbackResult> {
-    use socket_patch_core::patch::go_mod_edit::{ReplaceOwner, GO_PATCHES_DIR};
-    use socket_patch_core::patch::go_redirect::remove_go_redirect;
+    use socket_patch_core::patch::redirect::golang_local::remove_go_redirect;
+    use socket_patch_core::vendor::go_mod_edit::{ReplaceOwner, GO_PATCHES_DIR};
     if !is_local_go(purl, common) {
         return None;
     }
@@ -511,8 +511,7 @@ async fn rollback_patches_inner(
     // `vendor --revert` undoes it wholesale. Matching mirrors apply's
     // ledger-key / base-purl / qualifier-stripped triple; unreadable state
     // degrades to "nothing vendored".
-    let vendored_keys =
-        socket_patch_core::patch::vendor::vendored_purl_keys(&args.common.cwd).await;
+    let vendored_keys = socket_patch_core::vendor::vendored_purl_keys(&args.common.cwd).await;
     let is_vendored =
         |p: &str| vendored_keys.contains(p) || vendored_keys.contains(strip_purl_qualifiers(p));
     let (vendored_targets, patches_to_rollback): (Vec<_>, Vec<_>) = patches_to_rollback
@@ -1246,7 +1245,7 @@ mod tests {
     /// kept using the patched copy.
     #[tokio::test]
     async fn try_rollback_local_go_drops_redirect_and_copy() {
-        use socket_patch_core::patch::go_mod_edit::{
+        use socket_patch_core::vendor::go_mod_edit::{
             ensure_replace_entry, read_replace_entries, GO_PATCHES_DIR,
         };
 
@@ -1331,7 +1330,7 @@ mod tests {
     /// that mutated nothing.
     #[tokio::test]
     async fn try_rollback_local_go_dry_run_reports_no_files_rolled_back() {
-        use socket_patch_core::patch::go_mod_edit::{
+        use socket_patch_core::vendor::go_mod_edit::{
             ensure_replace_entry, read_replace_entries, GO_PATCHES_DIR,
         };
 
@@ -1423,7 +1422,7 @@ mod tests {
     /// record deleted, i.e. an active patch nothing tracks.
     #[tokio::test]
     async fn rollback_drops_local_go_redirect_when_module_cache_has_no_copy() {
-        use socket_patch_core::patch::go_mod_edit::{
+        use socket_patch_core::vendor::go_mod_edit::{
             ensure_replace_entry, read_replace_entries, GO_PATCHES_DIR,
         };
 
@@ -1520,7 +1519,7 @@ mod tests {
     /// filter's back.
     #[tokio::test]
     async fn undiscovered_local_go_redirect_respects_ecosystem_filter() {
-        use socket_patch_core::patch::go_mod_edit::{
+        use socket_patch_core::vendor::go_mod_edit::{
             ensure_replace_entry, read_replace_entries, GO_PATCHES_DIR,
         };
 

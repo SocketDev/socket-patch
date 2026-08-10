@@ -270,7 +270,7 @@ async fn get_composer_home() -> Option<PathBuf> {
 /// `dev-main`, `1.0.x-dev`) are returned untouched.
 ///
 /// Also used by the composer vendor backend
-/// (`patch::vendor::composer_lock`) to match lock versions against PURL
+/// (`vendor::composer_lock`) to match lock versions against PURL
 /// versions through the same normalization.
 pub(crate) fn normalize_version(version: &str) -> &str {
     let mut chars = version.chars();

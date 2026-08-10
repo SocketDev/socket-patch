@@ -869,7 +869,7 @@ pub(crate) async fn download_patch_records(
     let (selected, narrow_warnings) =
         filter_to_installed_releases(selected, params, &api_client).await;
 
-    let vendor_state = socket_patch_core::patch::vendor::load_state(&params.cwd)
+    let vendor_state = socket_patch_core::vendor::load_state(&params.cwd)
         .await
         .unwrap_or_default();
 
@@ -882,11 +882,9 @@ pub(crate) async fn download_patch_records(
     for search_result in &selected {
         // Idempotency: a detached entry already at this uuid carries its
         // own record — no view fetch needed.
-        let existing = socket_patch_core::patch::vendor::lookup_entry(
-            &vendor_state.entries,
-            &search_result.purl,
-        )
-        .filter(|e| e.detached && e.uuid == search_result.uuid);
+        let existing =
+            socket_patch_core::vendor::lookup_entry(&vendor_state.entries, &search_result.purl)
+                .filter(|e| e.detached && e.uuid == search_result.uuid);
         if let Some(record) = existing.and_then(|e| e.record.clone()) {
             if !params.json && !params.silent {
                 eprintln!("  [skip] {} (already vendored)", search_result.purl);
@@ -993,7 +991,7 @@ async fn warn_on_vendored_uuid_drift(
     downloaded_patches: &[serde_json::Value],
     warnings: &mut Vec<String>,
 ) {
-    let Ok(vendor_state) = socket_patch_core::patch::vendor::load_state(cwd).await else {
+    let Ok(vendor_state) = socket_patch_core::vendor::load_state(cwd).await else {
         return;
     };
     if vendor_state.entries.is_empty() {
@@ -1006,7 +1004,7 @@ async fn warn_on_vendored_uuid_drift(
         if !matches!(rec["action"].as_str(), Some("added" | "updated")) {
             continue;
         }
-        let entry = socket_patch_core::patch::vendor::lookup_entry(&vendor_state.entries, purl);
+        let entry = socket_patch_core::vendor::lookup_entry(&vendor_state.entries, purl);
         if let Some(entry) = entry.filter(|e| e.uuid != uuid) {
             let w = format!(
                 "{purl} is vendored at patch {} but the manifest now records {uuid}; \

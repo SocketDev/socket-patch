@@ -309,7 +309,7 @@ fn verify_member_map(
 mod tests {
     use super::*;
     use crate::manifest::schema::PatchFileInfo;
-    use crate::patch::vendor::state::VendorArtifact;
+    use crate::vendor::state::VendorArtifact;
     use flate2::write::GzEncoder;
     use std::io::Write;
 

@@ -468,7 +468,7 @@ fn to_canonical_json(value: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::patch::vendor::state::VendorArtifact;
+    use crate::vendor::state::VendorArtifact;
 
     const UUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
     const REL_WHEEL: &str =

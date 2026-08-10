@@ -23,13 +23,13 @@ use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
 use socket_patch_core::patch::apply::{verify_file_patch, PatchSources};
 use socket_patch_core::patch::copy_tree::remove_tree;
-use socket_patch_core::patch::vendor::{
+use socket_patch_core::utils::purl::{normalize_purl, strip_purl_qualifiers};
+use socket_patch_core::utils::telemetry::{track_patch_vendor_failed, track_patch_vendored};
+use socket_patch_core::vendor::{
     self, ecosystem_dir_for_purl, load_state, lock_inventory, lookup_entry, registry_fetch,
     save_state, RevertOutcome, VendorEntry, VendorOutcome, VendorServiceConfig, VendorSource,
     VendorState, VendorWarning,
 };
-use socket_patch_core::utils::purl::{normalize_purl, strip_purl_qualifiers};
-use socket_patch_core::utils::telemetry::{track_patch_vendor_failed, track_patch_vendored};
 use socket_patch_core::vex::time::now_rfc3339;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -1400,7 +1400,7 @@ pub(crate) async fn run_vendor_gc(
 #[cfg(test)]
 mod dispatch_tests {
     use super::*;
-    use socket_patch_core::patch::vendor::VendorSource;
+    use socket_patch_core::vendor::VendorSource;
 
     /// Fail-closed `--vendor-source=service` must not refuse maven at the
     /// dispatch gate: the maven backend has a full service path (prebuilt
@@ -1582,7 +1582,7 @@ mod variant_probe_tests {
 #[cfg(test)]
 mod gc_tests {
     use super::*;
-    use socket_patch_core::patch::vendor::state::VendorArtifact;
+    use socket_patch_core::vendor::state::VendorArtifact;
     use std::path::PathBuf;
 
     const UUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";

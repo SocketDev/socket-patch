@@ -1,4 +1,4 @@
-use crate::patch::vendor::common::{detect_indent, serialize_json};
+use crate::vendor::common::{detect_indent, serialize_json};
 
 /// Package manager type for selecting the correct command prefix.
 #[derive(Debug, Clone, Copy, PartialEq)]

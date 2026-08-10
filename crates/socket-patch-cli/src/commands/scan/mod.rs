@@ -560,8 +560,7 @@ pub async fn run(mut args: ScanArgs) -> i32 {
     // exemption (a vendored package is consumed from the committed
     // artifact, so "absent from the crawl" is its normal state, not
     // grounds for pruning) and the vendored-skip in the apply path.
-    let vendored_purls =
-        socket_patch_core::patch::vendor::vendored_purl_keys(&args.common.cwd).await;
+    let vendored_purls = socket_patch_core::vendor::vendored_purl_keys(&args.common.cwd).await;
 
     // Filter by --ecosystems if provided
     let filtered_crawled: Vec<_> = if let Some(ref allowed) = args.common.ecosystems {

@@ -17,8 +17,8 @@ use tokio::fs;
 use toml_edit::{Array, DocumentMut, InlineTable, Item, Table, Value};
 
 use super::detect::{deps_contain_hook, HOOK_DEP};
-use crate::patch::vendor::common::detect_eol;
 use crate::utils::fs::atomic_write_bytes_preserving_mode;
+use crate::vendor::common::detect_eol;
 
 /// Which manifest format a path is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -242,7 +242,7 @@ fn pyproject_remove(content: &str) -> Result<Option<String>, String> {
 
 /// Ensure `parent[key]` is a table, creating it if absent. Errors if present
 /// but a non-table. Also used by the vendor backends' TOML editing
-/// (`patch::vendor::cargo_config`, `patch::vendor::pypi_uv`).
+/// (`vendor::cargo_config`, `vendor::pypi_uv`).
 pub(crate) fn ensure_table<'a>(
     parent: &'a mut Table,
     key: &str,

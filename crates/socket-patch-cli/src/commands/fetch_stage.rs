@@ -353,11 +353,8 @@ pub(crate) async fn stage_vendor_sources_in_memory(
         // The committed vendor artifact IS the patched content: harvest its
         // afterHash blobs into memory so in-sync re-runs and fresh clones of
         // already-vendored projects stage with no network and no disk blobs.
-        mem = socket_patch_core::patch::vendor::harvest_artifact_blobs(
-            project_root,
-            &manifest.patches,
-        )
-        .await;
+        mem = socket_patch_core::vendor::harvest_artifact_blobs(project_root, &manifest.patches)
+            .await;
         if !mem.is_empty() {
             to_fetch.retain(|(purl, _)| {
                 manifest.patches.get(*purl).is_none_or(|record| {

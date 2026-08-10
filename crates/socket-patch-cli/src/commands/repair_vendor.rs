@@ -26,13 +26,13 @@ use socket_patch_core::api::client::get_api_client_with_overrides;
 use socket_patch_core::crawlers::CrawlerOptions;
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
 use socket_patch_core::patch::copy_tree::remove_tree;
-use socket_patch_core::patch::vendor::state::VendorArtifact;
-use socket_patch_core::patch::vendor::{
-    self, check_vendored_artifact, file_sha256_hex, load_state, lock_inventory, parse_vendor_path,
-    registry_fetch, ArtifactHealth, VendorEntry, VendorOutcome,
-};
 use socket_patch_core::utils::purl::{
     normalize_purl, percent_decode_purl_component, strip_purl_qualifiers,
+};
+use socket_patch_core::vendor::state::VendorArtifact;
+use socket_patch_core::vendor::{
+    self, check_vendored_artifact, file_sha256_hex, load_state, lock_inventory, parse_vendor_path,
+    registry_fetch, ArtifactHealth, VendorEntry, VendorOutcome,
 };
 use socket_patch_core::vex::time::now_rfc3339;
 

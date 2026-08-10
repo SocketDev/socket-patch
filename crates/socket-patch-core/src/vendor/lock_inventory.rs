@@ -23,9 +23,9 @@ use std::path::Path;
 use serde_json::Value;
 
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
-use crate::patch::bun_lock_text;
 use crate::patch::path_safety;
 use crate::utils::purl::{percent_decode_purl_component, strip_purl_qualifiers};
+use crate::vendor::bun_lock_text;
 
 use super::npm_common::is_safe_npm_name;
 use super::npm_flavor::{detect_npm_lock_flavor, NpmLockFlavor};

@@ -400,7 +400,7 @@ mod tests {
     use super::*;
     use crate::hash::git_sha256::compute_git_sha256_from_bytes;
     use crate::manifest::schema::PatchFileInfo;
-    use crate::patch::vendor::state::VendorArtifact;
+    use crate::vendor::state::VendorArtifact;
     use std::collections::HashMap;
 
     const UUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";

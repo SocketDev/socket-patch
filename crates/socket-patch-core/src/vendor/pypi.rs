@@ -869,7 +869,7 @@ mod tests {
     use super::*;
     use crate::hash::git_sha256::compute_git_sha256_from_bytes;
     use crate::manifest::schema::PatchFileInfo;
-    use crate::patch::vendor::state::VENDOR_MARKER_FILE;
+    use crate::vendor::state::VENDOR_MARKER_FILE;
     use std::collections::HashMap;
     use std::path::PathBuf;
 
@@ -1615,7 +1615,7 @@ wheels = [
     // local-build fallback are exercised.
 
     use crate::api::client::{ApiClient, ApiClientOptions};
-    use crate::patch::vendor::{VendorServiceConfig, VendorSource};
+    use crate::vendor::{VendorServiceConfig, VendorSource};
 
     const WHEEL_NAME: &str = "six-1.16.0-py2.py3-none-any.whl";
 

@@ -40,7 +40,7 @@
 //! this Socket-vendored, by which patch" recoverable from the lockfile
 //! string alone ([`path`]).
 //!
-//! [`ReplaceOwner::Vendor`]: crate::patch::go_mod_edit::ReplaceOwner
+//! [`ReplaceOwner::Vendor`]: crate::vendor::go_mod_edit::ReplaceOwner
 
 pub mod path;
 pub mod state;

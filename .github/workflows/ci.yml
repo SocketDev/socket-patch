@@ -55,6 +55,21 @@ jobs:
 
       - name: Run clippy
         run: cargo clippy --workspace --all-features -- -D warnings
+      # Moved-module aliases (patch::vendor → vendor, patch::go_mod_edit →
+      # vendor::go_mod_edit, patch::go_redirect → patch::redirect::golang_local)
+      # exist only for external consumers of the published core crate.
+      # #[deprecated] on a `pub use` re-export emits no warnings
+      # (rust-lang/rust#30827), so the compiler cannot pressure internal code
+      # off the old paths — this grep is the guard instead.
+      - name: Reject internal uses of moved-module alias paths
+        run: |
+          if grep -rn --include='*.rs' \
+              -e 'patch::vendor' -e 'patch::go_mod_edit' \
+              -e 'patch::go_redirect' -e 'patch::bun_lock_text' \
+              crates; then
+            echo '::error::use the canonical module paths (crate::vendor, patch::redirect::golang_local); the patch::* aliases exist only for external consumers'
+            exit 1
+          fi
 
   # Lint the out-of-workspace packaging artifacts for the ecosystems whose setup
   # / CLI-distribution we added: the RubyGems CLI launcher gem + the Bundler

@@ -1008,7 +1008,7 @@ async fn remove_detached_only_purl_reverts() {
 /// exact state `vendor` persists) so the test needs no full go vendor run.
 #[tokio::test]
 async fn vendored_golang_purl_skipped_by_apply() {
-    use socket_patch_core::patch::vendor::state::{VendorArtifact, VendorEntry, VendorState};
+    use socket_patch_core::vendor::state::{VendorArtifact, VendorEntry, VendorState};
 
     const MODULE: &str = "github.com/foo/bar";
     const VERSION: &str = "v1.4.2";
@@ -1088,7 +1088,7 @@ async fn vendored_golang_purl_skipped_by_apply() {
             pipenv: None,
         },
     );
-    socket_patch_core::patch::vendor::save_state(root, &state)
+    socket_patch_core::vendor::save_state(root, &state)
         .await
         .expect("seed state.json");
 

@@ -33,12 +33,12 @@ use serde_json::Value;
 
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::PatchSources;
-use crate::patch::bun_lock_text::{
+use crate::patch::copy_tree::remove_tree;
+use crate::utils::fs::atomic_write_bytes;
+use crate::vendor::bun_lock_text::{
     check_lock_version, decode_json_string, packages_bounds, parse_entry_line,
     parse_packages_section, split_name_spec, BunEntry,
 };
-use crate::patch::copy_tree::remove_tree;
-use crate::utils::fs::atomic_write_bytes;
 
 use super::common::{already_patched_result, refused};
 use super::npm_common::{done_failure, guard_coordinates, guard_revert_uuid_dir, stage_patch_pack};
@@ -409,7 +409,7 @@ fn revert_one_record(
 
 // ───────────────────────── vendor-specific classification ─────────────────
 // The conservative line grammar (`BunEntry`, `parse_*`, `scan_*`, …) lives in
-// `crate::patch::bun_lock_text`; this module keeps only the vendor tuple
+// `crate::vendor::bun_lock_text`; this module keeps only the vendor tuple
 // classification that decides which parsed entries to rewrite.
 
 /// What a matching entry's tuple looks like.

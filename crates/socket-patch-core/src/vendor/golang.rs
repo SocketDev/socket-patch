@@ -1,7 +1,7 @@
 //! The golang vendor backend: committable `replace`-directive vendoring.
 //!
 //! Wraps the project-local Go redirect engine
-//! ([`crate::patch::go_redirect`]) with a vendor copy base: the patched module
+//! ([`crate::patch::redirect::golang_local`]) with a vendor copy base: the patched module
 //! copy lands under `.socket/vendor/golang/<patch-uuid>/<module>@<version>/`
 //! and the `go.mod` `replace` points at it ([`ReplaceOwner::Vendor`]). A
 //! directory `replace` target bypasses the module cache, sumdb, and `go.sum`
@@ -21,13 +21,13 @@ use std::path::Path;
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::{MismatchPolicy, PatchSources};
 use crate::patch::copy_tree::remove_tree;
-use crate::patch::go_mod_edit::{
-    self, read_replace_entries, replace_target_path, ReplaceOwner, GO_PATCHES_DIR,
-};
-use crate::patch::go_redirect::{
+use crate::patch::redirect::golang_local::{
     apply_go_redirect, are_safe_redirect_coords, copy_dir_for, ensure_module_go_mod,
 };
 use crate::utils::purl::{parse_golang_purl, strip_purl_qualifiers};
+use crate::vendor::go_mod_edit::{
+    self, read_replace_entries, replace_target_path, ReplaceOwner, GO_PATCHES_DIR,
+};
 
 use super::common::{
     already_patched_result, copy_matches_after_hashes, done, failed_result, refused,
@@ -574,7 +574,7 @@ mod tests {
     use crate::hash::git_sha256::compute_git_sha256_from_bytes;
     use crate::manifest::schema::{PatchFileInfo, VulnerabilityInfo};
     use crate::patch::apply::ApplyResult;
-    use crate::patch::vendor::state::VENDOR_MARKER_FILE;
+    use crate::vendor::state::VENDOR_MARKER_FILE;
     use std::collections::HashMap;
     use std::path::PathBuf;
 
@@ -1157,7 +1157,7 @@ mod tests {
     // the `h1:` dirhash), extracts it into the copy dir, and wires the replace.
 
     use crate::api::client::{ApiClient, ApiClientOptions};
-    use crate::patch::vendor::{VendorServiceConfig, VendorSource};
+    use crate::vendor::{VendorServiceConfig, VendorSource};
 
     fn sri_sha512(bytes: &[u8]) -> String {
         use base64::Engine as _;

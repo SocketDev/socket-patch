@@ -39,7 +39,7 @@ pub(super) async fn lockfile_supplement(
     common: &GlobalArgs,
     crawled: &[socket_patch_core::crawlers::types::CrawledPackage],
 ) -> LockfileSupplement {
-    use socket_patch_core::patch::vendor::lock_inventory;
+    use socket_patch_core::vendor::lock_inventory;
 
     let mut out = LockfileSupplement::default();
     if common.global || common.global_prefix.is_some() {
@@ -99,7 +99,7 @@ pub(super) async fn vendored_ledger_supplement(
     if common.global || common.global_prefix.is_some() {
         return Vec::new();
     }
-    let Ok(state) = socket_patch_core::patch::vendor::load_state(&common.cwd).await else {
+    let Ok(state) = socket_patch_core::vendor::load_state(&common.cwd).await else {
         return Vec::new();
     };
     let crawled_norm: HashSet<String> = crawled

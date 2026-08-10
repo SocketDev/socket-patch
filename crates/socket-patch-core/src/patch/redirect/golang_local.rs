@@ -31,17 +31,17 @@ use crate::patch::apply::{
     MismatchPolicy, PatchSources,
 };
 use crate::patch::file_hash::compute_file_git_sha256;
-use crate::patch::vendor::common::{
+use crate::utils::purl::{build_golang_purl, parse_golang_purl, strip_purl_qualifiers};
+use crate::vendor::common::{
     already_patched_result, copy_matches_after_hashes, synthesized_result,
 };
-use crate::utils::purl::{build_golang_purl, parse_golang_purl, strip_purl_qualifiers};
 
 use crate::patch::copy_tree::{fresh_copy, remove_tree};
+use crate::patch::path_safety;
 use crate::vendor::go_mod_edit::{
     self, read_replace_entries, read_required_versions, replace_target_path, ReplaceOwner,
     GO_PATCHES_DIR,
 };
-use crate::patch::path_safety;
 
 /// A discrepancy between the committed redirect artifacts and the manifest,
 /// reported by [`verify_go_redirect_state`].

@@ -1,4 +1,4 @@
-//! Leaf helpers shared by the vendor backends (and [`crate::patch::go_redirect`]).
+//! Leaf helpers shared by the vendor backends (and [`crate::patch::redirect::golang_local`]).
 //!
 //! Each backend used to carry a private, byte-identical copy of these; they
 //! are hoisted here so the shapes stay in lockstep.

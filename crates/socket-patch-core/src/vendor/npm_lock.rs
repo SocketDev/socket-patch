@@ -1822,7 +1822,7 @@ mod tests {
     // patch.socket.dev two-step (package-reference POST + serve GET).
 
     use crate::api::client::{ApiClient, ApiClientOptions};
-    use crate::patch::vendor::{VendorServiceConfig, VendorSource};
+    use crate::vendor::{VendorServiceConfig, VendorSource};
 
     const SERVE_PATH: &str = "/patch/npm/left-pad/1.3.0/grant-tok/uuid/left-pad-1.3.0.tgz";
 

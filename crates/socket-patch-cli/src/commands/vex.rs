@@ -314,14 +314,14 @@ async fn generate_vex(
         // not whether this run hashed it. The committed ledger is as
         // trustworthy as the manifest beside it, and reading it hashes
         // nothing. An unreadable ledger degrades to "nothing vendored".
-        let entries = socket_patch_core::patch::vendor::load_state(&common.cwd)
+        let entries = socket_patch_core::vendor::load_state(&common.cwd)
             .await
             .map(|state| state.entries)
             .unwrap_or_default();
         let vendored = manifest
             .patches
             .keys()
-            .filter(|purl| socket_patch_core::patch::vendor::lookup_entry(&entries, purl).is_some())
+            .filter(|purl| socket_patch_core::vendor::lookup_entry(&entries, purl).is_some())
             .cloned()
             .collect();
         VerifyOutcome {
@@ -537,7 +537,7 @@ pub(crate) async fn generate_vex_from_manifest_path(
 /// still fails closed per-entry downstream, and `load_vendor_context`
 /// already warns about the unreadable state.
 async fn augment_with_detached(common: &GlobalArgs, mut manifest: PatchManifest) -> PatchManifest {
-    if let Ok(state) = socket_patch_core::patch::vendor::load_state(&common.cwd).await {
+    if let Ok(state) = socket_patch_core::vendor::load_state(&common.cwd).await {
         for (key, entry) in state.entries {
             if !entry.detached {
                 continue;
@@ -633,7 +633,7 @@ pub(crate) async fn load_vendor_context(
     common: &GlobalArgs,
     manifest: &PatchManifest,
 ) -> Option<VendorContext> {
-    let entries = match socket_patch_core::patch::vendor::load_state(&common.cwd).await {
+    let entries = match socket_patch_core::vendor::load_state(&common.cwd).await {
         Ok(state) => state.entries,
         Err(e) => {
             if !common.silent {
@@ -665,13 +665,15 @@ pub(crate) async fn load_vendor_context(
 async fn synthesize_go_patches(
     common: &GlobalArgs,
     manifest: &PatchManifest,
-    entries: &HashMap<String, socket_patch_core::patch::vendor::VendorEntry>,
+    entries: &HashMap<String, socket_patch_core::vendor::VendorEntry>,
 ) -> HashMap<String, PathBuf> {
-    use socket_patch_core::patch::go_mod_edit::{
+    use socket_patch_core::patch::redirect::golang_local::{
+        are_safe_redirect_coords, copy_dir_for,
+    };
+    use socket_patch_core::utils::purl::build_golang_purl;
+    use socket_patch_core::vendor::go_mod_edit::{
         read_replace_entries, ReplaceOwner, GO_PATCHES_DIR,
     };
-    use socket_patch_core::patch::go_redirect::{are_safe_redirect_coords, copy_dir_for};
-    use socket_patch_core::utils::purl::build_golang_purl;
 
     let mut go_patches = HashMap::new();
     for entry in read_replace_entries(&common.cwd).await {
@@ -687,7 +689,7 @@ async fn synthesize_go_patches(
         }
         // Explicit vendor entries take precedence over the synthesis
         // (vendor may have taken over an apply redirect).
-        if socket_patch_core::patch::vendor::lookup_entry(entries, &purl).is_some() {
+        if socket_patch_core::vendor::lookup_entry(entries, &purl).is_some() {
             continue;
         }
         // SECURITY: module/version come from a committed (tamper-able)
@@ -813,7 +815,7 @@ mod tests {
     /// an out-of-tree path into the go-patches verification map.
     #[test]
     fn go_redirect_coord_guard_matches_core_rules() {
-        use socket_patch_core::patch::go_redirect::are_safe_redirect_coords;
+        use socket_patch_core::patch::redirect::golang_local::are_safe_redirect_coords;
 
         assert!(are_safe_redirect_coords("github.com/foo/bar", "v1.4.2"));
         assert!(are_safe_redirect_coords("gopkg.in/inf.v0", "v0.9.1"));

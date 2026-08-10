@@ -751,7 +751,7 @@ mod tests {
     use crate::hash::git_sha256::compute_git_sha256_from_bytes;
     use crate::manifest::schema::PatchFileInfo;
     use crate::patch::apply::{ApplyResult, VerifyStatus};
-    use crate::patch::vendor::state::VENDOR_MARKER_FILE;
+    use crate::vendor::state::VENDOR_MARKER_FILE;
     use std::collections::HashMap;
     use std::path::PathBuf;
 
@@ -1372,7 +1372,7 @@ mod tests {
     // ─────────────── service-download path (Tier B: composer) ───────────────
 
     use crate::api::client::{ApiClient, ApiClientOptions};
-    use crate::patch::vendor::{VendorServiceConfig, VendorSource};
+    use crate::vendor::{VendorServiceConfig, VendorSource};
 
     fn sri_sha512(bytes: &[u8]) -> String {
         use base64::Engine as _;

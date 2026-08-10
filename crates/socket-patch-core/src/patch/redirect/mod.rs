@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
-use crate::patch::vendor::yarn_berry_lock::yarnrc_compression_level;
+use crate::vendor::yarn_berry_lock::yarnrc_compression_level;
 
 pub mod golang_local;
 mod state;
@@ -1078,7 +1078,7 @@ fn rewrite_bun_lock(
     overrides: &[DepOverride],
     result: &mut RewriteResult,
 ) {
-    use crate::patch::bun_lock_text::{
+    use crate::vendor::bun_lock_text::{
         check_lock_version, decode_json_string, parse_packages_section,
     };
 
@@ -1653,7 +1653,7 @@ fn rewrite_nuget(
 /// options (`require: false`, `group: :test`, …) that must survive the move
 /// into the source block. Empty when the line carries none; bails to empty on
 /// an unparseable tail (unbalanced quote), matching the previous behavior.
-/// Shared with the vendor backend's Gemfile rewrite (`patch::vendor::gem`),
+/// Shared with the vendor backend's Gemfile rewrite (`vendor::gem`),
 /// which has the same drop-the-options failure mode.
 pub(crate) fn gem_line_trailing_options(tail: &str) -> String {
     let mut rest = tail.trim_start();

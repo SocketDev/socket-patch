@@ -9,10 +9,10 @@
 //! extract it into the vendor directory) and the build-vs-service policy.
 
 use crate::api::client::{SecondaryArtifact, VendorServiceOutcome};
-use crate::patch::vendor::lock_inventory::LockIntegrity;
-use crate::patch::vendor::registry_fetch::{artifact_matches_integrity, verify_go_h1};
-use crate::patch::vendor::VendorServiceConfig;
-use crate::patch::vendor::{
+use crate::vendor::lock_inventory::LockIntegrity;
+use crate::vendor::registry_fetch::{artifact_matches_integrity, verify_go_h1};
+use crate::vendor::VendorServiceConfig;
+use crate::vendor::{
     common::{refused, service_offline_conflict},
     VendorOutcome, VendorWarning,
 };
@@ -251,8 +251,8 @@ pub(crate) async fn fetch_verified_secondary(
 mod tests {
     use super::*;
     use crate::api::client::{ApiClient, ApiClientOptions};
-    use crate::patch::vendor::npm_pack::PackedTarball;
-    use crate::patch::vendor::VendorSource;
+    use crate::vendor::npm_pack::PackedTarball;
+    use crate::vendor::VendorSource;
     use serde_json::json;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};

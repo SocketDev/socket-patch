@@ -1,5 +1,5 @@
 //! Shared tree-copy helpers used by the Go `replace`-redirect backend
-//! ([`crate::patch::go_redirect`]) and the vendor backends. They materialise a
+//! ([`crate::patch::redirect::golang_local`]) and the vendor backends. They materialise a
 //! project-local **patched copy** of a package by copying its pristine source
 //! out of a read-only registry/module cache into a writable dir under
 //! `.socket/`, then patching the copy in place.

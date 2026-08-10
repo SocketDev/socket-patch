@@ -1563,7 +1563,7 @@ mod tests {
     use crate::hash::git_sha256::compute_git_sha256_from_bytes;
     use crate::manifest::schema::PatchFileInfo;
     use crate::patch::apply::VerifyStatus;
-    use crate::patch::vendor::state::VENDOR_MARKER_FILE;
+    use crate::vendor::state::VENDOR_MARKER_FILE;
     use std::collections::HashMap;
     use std::path::PathBuf;
 
@@ -2912,7 +2912,7 @@ mod tests {
     // and the local-build fallback are exercised.
 
     use crate::api::client::{ApiClient, ApiClientOptions};
-    use crate::patch::vendor::VendorSource;
+    use crate::vendor::VendorSource;
 
     /// A valid path-source stub (no native extensions).
     const SERVICE_STUB: &[u8] = b"# -*- encoding: utf-8 -*-\n# stub: rack 3.2.6 ruby lib\n\nGem::Specification.new do |s|\n  s.name = \"rack\".freeze\n  s.version = \"3.2.6\".freeze\n  s.require_paths = [\"lib\".freeze]\nend\n";

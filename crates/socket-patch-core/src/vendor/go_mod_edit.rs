@@ -28,7 +28,7 @@
 //! patched bytes build cleanly under the default `-mod=readonly`. The directive
 //! is keyed by *module + version*: a stale pin (the graph resolved a different
 //! version) is silently ignored and the build links the UNPATCHED module —
-//! hence the version cross-check in [`crate::patch::go_redirect`].
+//! hence the version cross-check in [`crate::patch::redirect::golang_local`].
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
