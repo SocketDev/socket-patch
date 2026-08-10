@@ -132,7 +132,7 @@ impl RubyCrawler {
     /// `Gemfile`/`Gemfile.lock` and the alternate `gems.rb`/`gems.locked`
     /// (`Bundler::SharedHelpers.default_gemfile`). Both count: the project
     /// gate must recognize every project `setup` can wire, and
-    /// `gem_setup::discover_bundler_project` already walks up for `gems.rb`.
+    /// `setup::gem::discover_bundler_project` already walks up for `gems.rb`.
     /// Gating on `Gemfile` alone left a `gems.rb` project with a
     /// non-deployment `bundle install` undiscoverable — the bundler plugin
     /// `setup` installs would run `apply` on every `bundle install` and

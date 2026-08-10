@@ -1,7 +1,5 @@
 use clap::Args;
-use socket_patch_core::composer_setup::{self, ComposerSetupStatus};
 use socket_patch_core::crawlers::python_crawler::is_python_project;
-use socket_patch_core::gem_setup::{self, GemSetupStatus};
 use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
 use socket_patch_core::manifest::schema::{PatchManifest, SetupConfig};
 use socket_patch_core::package_json::detect::{is_setup_configured_str, PackageManager};
@@ -12,10 +10,12 @@ use socket_patch_core::package_json::update::{
     remove_package_json, update_package_json, RemoveResult, RemoveStatus, UpdateResult,
     UpdateStatus,
 };
-use socket_patch_core::pth_hook::detect::{
+use socket_patch_core::setup::composer::{self, ComposerSetupStatus};
+use socket_patch_core::setup::gem::{self, GemSetupStatus};
+use socket_patch_core::setup::pypi::detect::{
     deps_contain_hook, detect_python_pm, PythonPackageManager,
 };
-use socket_patch_core::pth_hook::edit::{
+use socket_patch_core::setup::pypi::edit::{
     add_hook_dependency, pyproject_contains_hook, remove_hook_dependency, ManifestKind,
     PthEditResult, PthStatus,
 };
@@ -356,17 +356,17 @@ pub(crate) async fn configured_ecosystems(
     }
 
     // gem: the managed plugin directive is present in the Gemfile.
-    if let Some(project) = gem_setup::discover_bundler_project(&common.cwd).await {
+    if let Some(project) = gem::discover_bundler_project(&common.cwd).await {
         if let Ok(content) = tokio::fs::read_to_string(&project.gemfile).await {
-            if gem_setup::is_plugin_directive_present(&content) {
+            if gem::is_plugin_directive_present(&content) {
                 set.insert(Ecosystem::Gem);
             }
         }
     }
 
-    if let Some(composer_json) = composer_setup::discover_composer_project(&common.cwd).await {
+    if let Some(composer_json) = composer::discover_composer_project(&common.cwd).await {
         if let Ok(content) = tokio::fs::read_to_string(&composer_json).await {
-            if composer_setup::is_hook_present(&content) {
+            if composer::is_hook_present(&content) {
                 set.insert(Ecosystem::Composer);
             }
         }
@@ -576,7 +576,7 @@ async fn build_gem_outcome(common: &GlobalArgs, remove: bool, dry_run: bool) -> 
     if !eco_in_scope(common, ECO_GEM) {
         return SetupOutcome::default();
     }
-    let project = match gem_setup::discover_bundler_project(&common.cwd).await {
+    let project = match gem::discover_bundler_project(&common.cwd).await {
         Some(p) => p,
         None => return SetupOutcome::default(),
     };
@@ -587,9 +587,9 @@ async fn build_gem_outcome(common: &GlobalArgs, remove: bool, dry_run: bool) -> 
     };
 
     let results = if remove {
-        gem_setup::remove_plugin_directive(&project, dry_run).await
+        gem::remove_plugin_directive(&project, dry_run).await
     } else {
-        gem_setup::add_plugin_directive(&project, dry_run).await
+        gem::add_plugin_directive(&project, dry_run).await
     };
 
     let mut added_paths: Vec<String> = Vec::new();
@@ -647,7 +647,7 @@ async fn build_composer_outcome(common: &GlobalArgs, remove: bool, dry_run: bool
     if !eco_in_scope(common, ECO_COMPOSER) {
         return SetupOutcome::default();
     }
-    let composer_json = match composer_setup::discover_composer_project(&common.cwd).await {
+    let composer_json = match composer::discover_composer_project(&common.cwd).await {
         Some(p) => p,
         None => return SetupOutcome::default(),
     };
@@ -658,9 +658,9 @@ async fn build_composer_outcome(common: &GlobalArgs, remove: bool, dry_run: bool
     };
 
     let r = if remove {
-        composer_setup::remove_hook(&composer_json, dry_run).await
+        composer::remove_hook(&composer_json, dry_run).await
     } else {
-        composer_setup::add_hook(&composer_json, dry_run).await
+        composer::add_hook(&composer_json, dry_run).await
     };
 
     let mut added_paths: Vec<String> = Vec::new();
@@ -716,13 +716,13 @@ async fn append_composer_check_entries(
     if !eco_in_scope(common, ECO_COMPOSER) {
         return false;
     }
-    let composer_json = match composer_setup::discover_composer_project(&common.cwd).await {
+    let composer_json = match composer::discover_composer_project(&common.cwd).await {
         Some(p) => p,
         None => return false,
     };
     let (state, err) = match tokio::fs::read_to_string(&composer_json).await {
         Ok(content) => {
-            if composer_setup::is_hook_present(&content) {
+            if composer::is_hook_present(&content) {
                 (CheckState::Configured, None)
             } else {
                 (CheckState::NeedsConfiguration, None)
@@ -798,13 +798,13 @@ async fn append_gem_check_entries(
     if !eco_in_scope(common, ECO_GEM) {
         return false;
     }
-    let project = match gem_setup::discover_bundler_project(&common.cwd).await {
+    let project = match gem::discover_bundler_project(&common.cwd).await {
         Some(p) => p,
         None => return false,
     };
     let (state, err) = match tokio::fs::read_to_string(&project.gemfile).await {
         Ok(content) => {
-            if gem_setup::is_plugin_directive_present(&content) {
+            if gem::is_plugin_directive_present(&content) {
                 (CheckState::Configured, None)
             } else {
                 (CheckState::NeedsConfiguration, None)
@@ -813,14 +813,14 @@ async fn append_gem_check_entries(
         Err(e) => (CheckState::Error, Some(e.to_string())),
     };
     entries.push(("gemfile", project.gemfile.display().to_string(), state, err));
-    let dir_state = if gem_setup::plugin_files_present(&project.root).await {
+    let dir_state = if gem::plugin_files_present(&project.root).await {
         CheckState::Configured
     } else {
         CheckState::NeedsConfiguration
     };
     entries.push((
         "gem_plugin",
-        gem_setup::plugin_dir(&project.root).display().to_string(),
+        gem::plugin_dir(&project.root).display().to_string(),
         dir_state,
         None,
     ));

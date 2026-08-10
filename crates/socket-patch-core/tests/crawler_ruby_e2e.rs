@@ -385,7 +385,7 @@ async fn get_gem_paths_with_gemfile_lock_only_returns_gemdir() {
 
 /// Bundler accepts `gems.rb` as the alternate spelling of `Gemfile`
 /// (`Bundler::SharedHelpers.default_gemfile`), and
-/// `gem_setup::discover_bundler_project` already walks up for it — so
+/// `setup::gem::discover_bundler_project` already walks up for it — so
 /// `setup` will wire a `gems.rb` project with the bundler plugin that runs
 /// `apply` on every `bundle install`. The crawler's project gate must
 /// recognize the same spelling; otherwise that project's non-deployment

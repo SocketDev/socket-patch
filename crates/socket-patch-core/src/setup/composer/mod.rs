@@ -36,7 +36,7 @@ const HOOK_EVENTS: &[&str] = &["post-install-cmd", "post-update-cmd"];
 /// a slightly different flag set still reads as configured.
 const HOOK_MARKER: &str = "socket-patch apply";
 
-/// Outcome of one setup edit. Mirrors `gem_setup::GemSetupStatus`.
+/// Outcome of one setup edit. Mirrors `setup::gem::GemSetupStatus`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ComposerSetupStatus {
     Updated,

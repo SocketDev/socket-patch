@@ -68,6 +68,7 @@ jobs:
               -e 'patch::go_redirect' -e 'patch::bun_lock_text' \
               -e 'utils::telemetry' -e 'utils::cleanup_blobs' \
               -e 'utils::date' -e 'utils::fuzzy_match' \
+              -e 'gem_setup::' -e 'composer_setup::' -e 'pth_hook::' \
               crates; then
             echo '::error::use the canonical module paths (crate::vendor, patch::redirect::golang_local, crate::telemetry, manifest::cleanup_blobs, api::date, crawlers::fuzzy_match); the old-path aliases exist only for external consumers'
             exit 1

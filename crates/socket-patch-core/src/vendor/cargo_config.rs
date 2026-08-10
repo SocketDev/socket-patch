@@ -1,7 +1,7 @@
 //! Read / write `<project_root>/.cargo/config.toml` for the cargo vendor
 //! backend's `[patch.crates-io]` wiring.
 //!
-//! Mirrors the contract style of [`crate::pth_hook::edit`]: pure
+//! Mirrors the contract style of [`crate::setup::pypi::edit`]: pure
 //! `fn(&str) -> Result<Option<String>, String>` transforms (`Some(new)` =
 //! changed, `None` = already in the desired state) wrapped by async
 //! read-or-create / write helpers that honour `dry_run` and preserve the

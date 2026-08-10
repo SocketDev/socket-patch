@@ -1,6 +1,6 @@
 //! Small structured-TOML helpers shared by every module that edits or sniffs
-//! TOML (`pth_hook`, `vendor::cargo_config`, `vendor::pypi`,
-//! `vendor::pypi_uv`). Extracted from `pth_hook` so the pypi setup backend no
+//! TOML (`setup::pypi`, `vendor::cargo_config`, `vendor::pypi`,
+//! `vendor::pypi_uv`). Extracted from the pypi setup backend (now `setup::pypi`) so it no
 //! longer owns the crate's generic TOML seam.
 
 use toml_edit::{Item, Table};
