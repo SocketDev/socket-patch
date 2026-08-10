@@ -66,8 +66,10 @@ jobs:
           if grep -rn --include='*.rs' \
               -e 'patch::vendor' -e 'patch::go_mod_edit' \
               -e 'patch::go_redirect' -e 'patch::bun_lock_text' \
+              -e 'utils::telemetry' -e 'utils::cleanup_blobs' \
+              -e 'utils::date' -e 'utils::fuzzy_match' \
               crates; then
-            echo '::error::use the canonical module paths (crate::vendor, patch::redirect::golang_local); the patch::* aliases exist only for external consumers'
+            echo '::error::use the canonical module paths (crate::vendor, patch::redirect::golang_local, crate::telemetry, manifest::cleanup_blobs, api::date, crawlers::fuzzy_match); the old-path aliases exist only for external consumers'
             exit 1
           fi
 

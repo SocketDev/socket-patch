@@ -7,15 +7,15 @@ use socket_patch_core::api::ranking::{cmp_search_results, severity_order};
 use socket_patch_core::api::types::{
     PatchResponse, PatchSearchResult, SearchResponse, VulnerabilityResponse,
 };
+use socket_patch_core::crawlers::fuzzy_match::fuzzy_match_packages;
 use socket_patch_core::crawlers::{CrawlerOptions, Ecosystem};
 use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
 use socket_patch_core::manifest::schema::{
     PatchFileInfo, PatchManifest, PatchRecord, VulnerabilityInfo,
 };
 use socket_patch_core::patch::apply::select_installed_variants;
-use socket_patch_core::utils::fuzzy_match::fuzzy_match_packages;
+use socket_patch_core::telemetry::{track_patch_fetch_failed, track_patch_fetched};
 use socket_patch_core::utils::purl::{is_purl, normalize_purl, strip_purl_qualifiers};
-use socket_patch_core::utils::telemetry::{track_patch_fetch_failed, track_patch_fetched};
 use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};

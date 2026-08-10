@@ -1,4 +1,4 @@
-//! Integration coverage for `socket_patch_core::utils::fuzzy_match`.
+//! Integration coverage for `socket_patch_core::crawlers::fuzzy_match`.
 //!
 //! `fuzzy_match_packages` powers `socket-patch get <identifier>`'s
 //! "did you mean…" fallback when the caller's identifier doesn't
@@ -7,8 +7,8 @@
 
 use std::path::PathBuf;
 
+use socket_patch_core::crawlers::fuzzy_match::fuzzy_match_packages;
 use socket_patch_core::crawlers::types::CrawledPackage;
-use socket_patch_core::utils::fuzzy_match::fuzzy_match_packages;
 
 fn pkg(name: &str, version: &str, namespace: Option<&str>) -> CrawledPackage {
     let ns = namespace.map(str::to_string);

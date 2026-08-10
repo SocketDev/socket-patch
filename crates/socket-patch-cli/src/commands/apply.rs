@@ -11,9 +11,9 @@ use socket_patch_core::patch::apply::{
 use socket_patch_core::patch::redirect::golang_local::{
     apply_go_redirect, reconcile_go_redirects, verify_go_redirect_state,
 };
+use socket_patch_core::telemetry::{track_patch_applied, track_patch_apply_failed};
 use socket_patch_core::utils::purl::parse_golang_purl;
 use socket_patch_core::utils::purl::{normalize_purl, strip_purl_qualifiers};
-use socket_patch_core::utils::telemetry::{track_patch_applied, track_patch_apply_failed};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;

@@ -23,8 +23,8 @@ use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
 use socket_patch_core::patch::apply::{verify_file_patch, PatchSources};
 use socket_patch_core::patch::copy_tree::remove_tree;
+use socket_patch_core::telemetry::{track_patch_vendor_failed, track_patch_vendored};
 use socket_patch_core::utils::purl::{normalize_purl, strip_purl_qualifiers};
-use socket_patch_core::utils::telemetry::{track_patch_vendor_failed, track_patch_vendored};
 use socket_patch_core::vendor::{
     self, ecosystem_dir_for_purl, load_state, lock_inventory, lookup_entry, registry_fetch,
     save_state, RevertOutcome, VendorEntry, VendorOutcome, VendorServiceConfig, VendorSource,

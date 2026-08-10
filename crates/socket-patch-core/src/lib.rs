@@ -8,6 +8,7 @@ pub mod manifest;
 pub mod package_json;
 pub mod patch;
 pub mod pth_hook;
+pub mod telemetry;
 pub mod update;
 pub mod utils;
 pub mod vendor;

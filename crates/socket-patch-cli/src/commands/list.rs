@@ -1,8 +1,8 @@
 use clap::Args;
 use socket_patch_core::manifest::operations::read_manifest;
 use socket_patch_core::manifest::schema::PatchManifest;
+use socket_patch_core::telemetry::track_patch_listed;
 use socket_patch_core::utils::socket_cli_config;
-use socket_patch_core::utils::telemetry::track_patch_listed;
 
 use crate::args::{apply_env_toggles, GlobalArgs};
 use crate::json_envelope::{

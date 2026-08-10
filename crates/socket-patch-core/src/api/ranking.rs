@@ -45,8 +45,8 @@
 
 use std::cmp::{Ordering, Reverse};
 
+use crate::api::date::parse_timestamp_secs;
 use crate::api::types::{BatchPatchInfo, PatchSearchResult};
-use crate::utils::date::parse_timestamp_secs;
 
 /// Severity ordering for sorting: **most severe = lowest number**.
 ///
@@ -117,7 +117,7 @@ struct RankKey<'a> {
     /// package's release date. Unparseable or absent timestamps collapse
     /// to 0 and therefore sort last: the right treatment for a date we
     /// cannot trust, and the reason this is epoch seconds rather than the
-    /// raw string (see [`crate::utils::date`]).
+    /// raw string (see [`crate::api::date`]).
     patch_published: Reverse<u64>,
     /// `false` sorts first, so paid leads. A tiebreak only: it can never
     /// override severity or recency.

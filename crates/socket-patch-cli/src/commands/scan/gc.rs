@@ -2,11 +2,11 @@
 //! orphan blob/diff/package-archive sweeps, in both mutating (apply) and
 //! read-only (preview) forms.
 
-use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
-use socket_patch_core::manifest::schema::PatchManifest;
-use socket_patch_core::utils::cleanup_blobs::{
+use socket_patch_core::manifest::cleanup_blobs::{
     cleanup_unused_archives, cleanup_unused_blobs, CleanupResult,
 };
+use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
+use socket_patch_core::manifest::schema::PatchManifest;
 use socket_patch_core::utils::purl::{normalize_purl, strip_purl_qualifiers};
 use std::collections::HashSet;
 use std::path::Path;
@@ -86,7 +86,7 @@ impl GcSummary {
 
 /// Compute GC actions without performing them. `dry_run = true` for the
 /// preview path; `dry_run = false` for the apply path. The cleanup helpers
-/// from `socket_patch_core::utils::cleanup_blobs` natively support dry-run,
+/// from `socket_patch_core::manifest::cleanup_blobs` natively support dry-run,
 /// so the same function works for both.
 async fn run_gc(
     manifest: &PatchManifest,

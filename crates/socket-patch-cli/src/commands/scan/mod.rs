@@ -14,8 +14,8 @@ use socket_patch_core::api::types::{BatchPackagePatches, PatchSearchResult};
 use socket_patch_core::crawlers::{CrawlerOptions, Ecosystem};
 use socket_patch_core::manifest::operations::read_manifest;
 use socket_patch_core::manifest::schema::PatchManifest;
+use socket_patch_core::telemetry::{track_patch_scan_failed, track_patch_scanned};
 use socket_patch_core::utils::purl::{normalize_purl, strip_purl_qualifiers};
-use socket_patch_core::utils::telemetry::{track_patch_scan_failed, track_patch_scanned};
 use std::collections::HashSet;
 use std::io::IsTerminal;
 use std::path::Path;
@@ -1546,7 +1546,7 @@ pub async fn run(mut args: ScanArgs) -> i32 {
                 if gc.pruned.len() == 1 { "y" } else { "ies" },
                 total,
                 if total == 1 { "" } else { "s" },
-                socket_patch_core::utils::cleanup_blobs::format_bytes(gc.total_bytes()),
+                socket_patch_core::manifest::cleanup_blobs::format_bytes(gc.total_bytes()),
             );
         }
         if !args.common.silent {

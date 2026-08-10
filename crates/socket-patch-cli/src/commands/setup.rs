@@ -19,7 +19,7 @@ use socket_patch_core::pth_hook::edit::{
     add_hook_dependency, pyproject_contains_hook, remove_hook_dependency, ManifestKind,
     PthEditResult, PthStatus,
 };
-use socket_patch_core::utils::telemetry::track_patch_setup;
+use socket_patch_core::telemetry::track_patch_setup;
 use socket_patch_core::vex::applied_patches_with_vendor;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};

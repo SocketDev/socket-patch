@@ -8,7 +8,7 @@ use socket_patch_core::api::types::{BatchPackagePatches, PatchSearchResult};
 use socket_patch_core::manifest::operations::read_manifest;
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
 use socket_patch_core::patch::apply_lock;
-use socket_patch_core::utils::telemetry::track_patch_vendor_failed;
+use socket_patch_core::telemetry::track_patch_vendor_failed;
 use socket_patch_core::vendor::{load_state, lookup_entry};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;

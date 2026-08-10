@@ -39,7 +39,7 @@ pub struct PatchResponse {
     /// `Fri, 27 Mar 2026 19:12:42 GMT` (verified across npm, PyPI, cargo
     /// and gem), while this repo's fixtures use RFC 3339. Never compare
     /// these as raw strings; route through
-    /// [`crate::utils::date::parse_timestamp_secs`], which handles both.
+    /// [`crate::api::date::parse_timestamp_secs`], which handles both.
     pub published_at: String,
     pub files: HashMap<String, PatchFileResponse>,
     pub vulnerabilities: HashMap<String, VulnerabilityResponse>,

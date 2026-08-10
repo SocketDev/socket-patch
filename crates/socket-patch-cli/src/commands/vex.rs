@@ -20,7 +20,7 @@ use clap::Args;
 use socket_patch_core::crawlers::Ecosystem;
 use socket_patch_core::manifest::operations::read_manifest;
 use socket_patch_core::manifest::schema::PatchManifest;
-use socket_patch_core::utils::telemetry::{track_vex_failed, track_vex_generated};
+use socket_patch_core::telemetry::{track_vex_failed, track_vex_generated};
 use socket_patch_core::vex::{
     build_document, detect_product, BuildOptions, Document, FailedPatch, VendorContext,
     VerifyOutcome,

@@ -317,7 +317,7 @@ impl GlobalArgs {
 /// flags are off.
 ///
 /// `offline` matters most: the telemetry kill-switch
-/// (`socket_patch_core::utils::telemetry::is_telemetry_disabled`) honors the
+/// (`socket_patch_core::telemetry::is_telemetry_disabled`) honors the
 /// strict-airgap contract by reading `SOCKET_OFFLINE` from the env, so
 /// without this mirror a bare `--offline` flag (or a truthy spelling like
 /// `SOCKET_OFFLINE=yes` that core's `"1" | "true"` match doesn't recognize)
@@ -503,7 +503,7 @@ mod tests {
     }
 
     /// `--offline` promises "never contact the network", but the telemetry
-    /// kill-switch (`socket_patch_core::utils::telemetry::is_telemetry_disabled`)
+    /// kill-switch (`socket_patch_core::telemetry::is_telemetry_disabled`)
     /// reads the `SOCKET_OFFLINE` env var directly — it never sees the parsed
     /// flag. `apply_env_toggles` must therefore mirror `--offline` into the
     /// env exactly like `--debug` / `--no-telemetry`, or an airgapped
@@ -520,7 +520,7 @@ mod tests {
                 apply_env_toggles(&args);
                 assert_eq!(std::env::var("SOCKET_OFFLINE").as_deref(), Ok("1"));
                 assert!(
-                    socket_patch_core::utils::telemetry::is_telemetry_disabled(),
+                    socket_patch_core::telemetry::is_telemetry_disabled(),
                     "--offline must disable telemetry (strict airgap: never contact the network)",
                 );
             });
@@ -541,7 +541,7 @@ mod tests {
                 assert!(cli.common.offline, "SOCKET_OFFLINE=yes parses as offline");
                 apply_env_toggles(&cli.common);
                 assert!(
-                    socket_patch_core::utils::telemetry::is_telemetry_disabled(),
+                    socket_patch_core::telemetry::is_telemetry_disabled(),
                     "SOCKET_OFFLINE=yes must disable telemetry like SOCKET_OFFLINE=1",
                 );
             });
@@ -1082,7 +1082,7 @@ mod tests {
                 };
 
                 // Guard against a vacuous pass: the gate must start open.
-                assert!(!socket_patch_core::utils::telemetry::is_telemetry_disabled());
+                assert!(!socket_patch_core::telemetry::is_telemetry_disabled());
 
                 let tmp = tempfile::tempdir().unwrap();
                 rt.block_on(crate::commands::list::run(
@@ -1091,7 +1091,7 @@ mod tests {
                     },
                 ));
                 assert!(
-                    socket_patch_core::utils::telemetry::is_telemetry_disabled(),
+                    socket_patch_core::telemetry::is_telemetry_disabled(),
                     "`list --offline --no-telemetry` must mirror the toggles into the \
                      env — its telemetry kill-switch reads only SOCKET_OFFLINE / \
                      SOCKET_TELEMETRY_DISABLED",
@@ -1115,7 +1115,7 @@ mod tests {
                     },
                 ));
                 assert!(
-                    socket_patch_core::utils::telemetry::is_telemetry_disabled(),
+                    socket_patch_core::telemetry::is_telemetry_disabled(),
                     "`setup --offline --no-telemetry` must mirror the toggles into the env",
                 );
             });

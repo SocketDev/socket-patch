@@ -4,12 +4,12 @@ use socket_patch_core::api::blob_fetcher::{
     DownloadMode,
 };
 use socket_patch_core::api::client::get_api_client_with_overrides;
-use socket_patch_core::manifest::operations::read_manifest;
-use socket_patch_core::patch::apply::PatchSources;
-use socket_patch_core::utils::cleanup_blobs::{
+use socket_patch_core::manifest::cleanup_blobs::{
     cleanup_unused_archives, cleanup_unused_blobs, format_cleanup_result,
 };
-use socket_patch_core::utils::telemetry::{track_patch_repair_failed, track_patch_repaired};
+use socket_patch_core::manifest::operations::read_manifest;
+use socket_patch_core::patch::apply::PatchSources;
+use socket_patch_core::telemetry::{track_patch_repair_failed, track_patch_repaired};
 use std::path::Path;
 use std::time::Duration;
 

@@ -1,6 +1,7 @@
 pub mod cargo_crawler;
 pub mod composer_crawler;
 pub mod deno_crawler;
+pub mod fuzzy_match;
 pub mod go_crawler;
 pub mod maven_crawler;
 pub mod npm_crawler;

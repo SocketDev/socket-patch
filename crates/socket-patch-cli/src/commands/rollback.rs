@@ -8,8 +8,8 @@ use socket_patch_core::patch::apply::select_installed_variants;
 use socket_patch_core::patch::rollback::{
     rollback_package_patch, RollbackResult, VerifyRollbackStatus,
 };
+use socket_patch_core::telemetry::{track_patch_rollback_failed, track_patch_rolled_back};
 use socket_patch_core::utils::purl::strip_purl_qualifiers;
-use socket_patch_core::utils::telemetry::{track_patch_rollback_failed, track_patch_rolled_back};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;

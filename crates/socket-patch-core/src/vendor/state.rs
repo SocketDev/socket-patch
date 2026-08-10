@@ -205,8 +205,8 @@ pub struct VendorEntry {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub took_over_go_patches: bool,
     /// Which wiring flavor was used, for the multi-flavor ecosystems —
-    /// npm: `package-lock` | `yarn-classic` | `pnpm` | `bun` (absent on
-    /// pre-flavor entries ⇒ `package-lock`); pypi: `uv` | `requirements` |
+    /// npm: `package-lock` | `yarn-classic` | `yarn-berry` | `pnpm` | `bun`
+    /// (absent on pre-flavor entries ⇒ `package-lock`); pypi: `uv` | `requirements` |
     /// `poetry` | `pdm` | `pipenv`. Reverts route on this and fail closed
     /// on flavors this build has no backend for.
     #[serde(default, skip_serializing_if = "Option::is_none")]

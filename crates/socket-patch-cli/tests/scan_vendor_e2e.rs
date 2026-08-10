@@ -664,7 +664,7 @@ async fn scan_vendor_flag_conflicts_are_clap_errors() {
 
 /// No invocation in this suite may emit telemetry. Telemetry resolves its
 /// endpoint from `SOCKET_API_URL` / `SOCKET_PROXY_URL` env ONLY (the
-/// `--api-url` flag is invisible to it — utils::telemetry), so the
+/// `--api-url` flag is invisible to it — telemetry), so the
 /// unhardened harness sent every successful run's `patch_vendored` event to
 /// the LIVE `/v0/orgs/test-org/telemetry` with the fake bearer token. Seed
 /// the child env with a reachable endpoint (worst case for the kill-switch)
