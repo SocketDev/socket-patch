@@ -204,7 +204,18 @@ jobs:
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
       - name: Run tests
-        run: cargo test --workspace --all-features
+        # `--all-features` would also RUN the docker-e2e / setup-e2e suites,
+        # which soft-skip as "ok" in this job (no images are built here, and
+        # macOS/Windows have no Docker at all) — dozens of fake greens per OS
+        # that would hide a broken skip-guard behind a passing checkmark.
+        # Build them with --all-features (compile rot is real coverage), but
+        # run only the default-feature suites; the dedicated e2e-docker and
+        # setup-matrix jobs run the gated suites for real.
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --workspace --all-features --no-run
+          cargo test --workspace
 
   test-release:
     runs-on: ubuntu-latest
@@ -238,7 +249,13 @@ jobs:
         # `ci-release` = [profile.release] minus the full-LTO link (see the
         # profile's comment in Cargo.toml). Same opt-level/debug-assertion
         # semantics this job exists to validate; ~23m of LTO relinking gone.
-        run: cargo test --workspace --all-features --profile ci-release
+        # Build/run split for the same reason as the `test` job: the gated
+        # docker-e2e / setup-e2e suites only soft-skip here — compile them,
+        # don't count their skips as passes.
+        run: |
+          set -euo pipefail
+          cargo test --workspace --all-features --profile ci-release --no-run
+          cargo test --workspace --profile ci-release
 
   coverage:
     # Code coverage via cargo-llvm-cov (LLVM source-based instrumentation).
