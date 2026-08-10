@@ -1706,3 +1706,114 @@ async fn cargo_redirect_writes_the_legacy_dot_cargo_config() {
         "anchor: the Cargo.toml dep must name the managed registry: {manifest}"
     );
 }
+
+/// `scan --redirect --json` must emit a machine-readable error envelope on
+/// stdout for EVERY failure exit, never empty stdout plus an exit code.
+///
+/// Regression pin for the long-open hosted-mode JSON gap: the early
+/// bail-outs (discovery-detail failure, reference-resolve failure) returned
+/// with the message on stderr only, so a `--json` consumer saw exit 1 with
+/// nothing to parse. Two legs, one per bail-out.
+#[tokio::test]
+#[serial]
+async fn redirect_json_mode_failures_emit_error_envelope() {
+    let assert_error_envelope = |out: &std::process::Output, leg: &str| {
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "{leg}: failure exit; stdout=\n{stdout}\nstderr=\n{stderr}"
+        );
+        let v: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+            panic!("{leg}: --json stdout must be a parseable envelope even on failure ({e}); stdout=\n{stdout}")
+        });
+        assert_eq!(
+            v["status"], "error",
+            "{leg}: envelope status; stdout=\n{stdout}"
+        );
+        assert!(
+            v["error"].as_str().is_some_and(|m| !m.is_empty()),
+            "{leg}: envelope must carry the error message; stdout=\n{stdout}"
+        );
+        assert_eq!(
+            v["redirect"]["mode"], "hosted",
+            "{leg}: envelope must identify the mode; stdout=\n{stdout}"
+        );
+    };
+
+    // Leg 1 — batch discovery succeeds, every patch-detail query fails →
+    // `discover_selected` bails with (1, message).
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/batch")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "packages": [{
+                "purl": PURL,
+                "patches": [{
+                    "uuid": UUID, "purl": PURL, "tier": "free",
+                    "cveIds": [], "ghsaIds": [], "severity": "high",
+                    "title": "redirect fixture"
+                }]
+            }],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex(format!(
+            "^/v0/orgs/{ORG}/patches/by-package/.+$"
+        )))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_project(tmp.path());
+    let out = scrubbed_cli()
+        .args([
+            "scan",
+            "--redirect",
+            "--yes",
+            "--json",
+            "--cwd",
+            tmp.path().to_str().unwrap(),
+            "--api-url",
+            &server.uri(),
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+        ])
+        .output()
+        .expect("run socket-patch");
+    assert_error_envelope(&out, "discovery-detail failure");
+
+    // Leg 2 — discovery + selection succeed, the reference resolve fails.
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/package")))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_project(tmp.path());
+    let out = scrubbed_cli()
+        .args([
+            "scan",
+            "--redirect",
+            "--yes",
+            "--json",
+            "--cwd",
+            tmp.path().to_str().unwrap(),
+            "--api-url",
+            &server.uri(),
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+        ])
+        .output()
+        .expect("run socket-patch");
+    assert_error_envelope(&out, "reference-resolve failure");
+}

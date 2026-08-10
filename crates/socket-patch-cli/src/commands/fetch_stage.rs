@@ -438,3 +438,221 @@ pub(crate) async fn stage_vendor_sources_in_memory(
         mem,
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use socket_patch_core::manifest::schema::{PatchFileInfo, PatchRecord};
+
+    const UUID: &str = "11111111-1111-4111-8111-111111111111";
+    // 64 ascii-hex, the shape `is_valid_blob_hash` accepts.
+    const HASH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    fn manifest_with_one_patch() -> PatchManifest {
+        let mut files = HashMap::new();
+        files.insert(
+            "index.js".to_string(),
+            PatchFileInfo {
+                before_hash: "b".repeat(64),
+                after_hash: HASH.to_string(),
+            },
+        );
+        let mut manifest = PatchManifest::new();
+        manifest.patches.insert(
+            "pkg:npm/left-pad@1.3.0".to_string(),
+            PatchRecord {
+                uuid: UUID.to_string(),
+                exported_at: "2026-01-01T00:00:00Z".to_string(),
+                files,
+                vulnerabilities: HashMap::new(),
+                description: String::new(),
+                license: "MIT".to_string(),
+                tier: "free".to_string(),
+            },
+        );
+        manifest
+    }
+
+    fn offline_args() -> GlobalArgs {
+        GlobalArgs {
+            offline: true,
+            silent: true,
+            ..GlobalArgs::default()
+        }
+    }
+
+    /// Everything cached → read `.socket/` in place: no overlay tempdir, and
+    /// the returned paths are the persistent cache dirs themselves.
+    #[tokio::test]
+    async fn stage_reads_socket_dir_in_place_when_fully_cached() {
+        let tmp = tempfile::tempdir().unwrap();
+        let socket_dir = tmp.path().join(".socket");
+        std::fs::create_dir_all(socket_dir.join("blobs")).unwrap();
+        std::fs::write(socket_dir.join("blobs").join(HASH), b"patched").unwrap();
+
+        let outcome = stage_patch_sources(&offline_args(), &manifest_with_one_patch(), &socket_dir)
+            .await
+            .expect("no hard failure");
+        let StageOutcome::Ready(staged) = outcome else {
+            panic!("fully-cached staging must be Ready");
+        };
+        assert!(staged._stage.is_none(), "no overlay when nothing to fetch");
+        assert_eq!(staged.blobs, socket_dir.join("blobs"));
+    }
+
+    /// Offline with no usable source → Unavailable, and the read-only
+    /// contract holds: staging must not create or write `.socket/`.
+    #[tokio::test]
+    async fn stage_offline_with_missing_sources_is_unavailable_and_writes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let socket_dir = tmp.path().join(".socket");
+
+        let outcome = stage_patch_sources(&offline_args(), &manifest_with_one_patch(), &socket_dir)
+            .await
+            .expect("no hard failure");
+        assert!(
+            matches!(outcome, StageOutcome::Unavailable),
+            "offline + no local source must be Unavailable"
+        );
+        assert!(
+            !socket_dir.exists(),
+            "the stager is read-only against .socket/ — it must not create it"
+        );
+    }
+
+    /// A diff archive alone satisfies the disk stager (the pipeline can apply
+    /// via the diff path), even with every blob missing.
+    #[tokio::test]
+    async fn stage_offline_accepts_diff_archive_as_sole_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let socket_dir = tmp.path().join(".socket");
+        std::fs::create_dir_all(socket_dir.join("diffs")).unwrap();
+        std::fs::write(
+            socket_dir.join("diffs").join(format!("{UUID}.tar.gz")),
+            b"x",
+        )
+        .unwrap();
+
+        let outcome = stage_patch_sources(&offline_args(), &manifest_with_one_patch(), &socket_dir)
+            .await
+            .expect("no hard failure");
+        assert!(
+            matches!(outcome, StageOutcome::Ready(_)),
+            "a present diff archive is a usable source for the disk stager"
+        );
+    }
+
+    /// The vendor (in-memory) stager documents the opposite policy: a diff
+    /// archive is NOT sufficient (auto-force can need the full after-blob),
+    /// so the same fixture that satisfies the disk stager is Unavailable
+    /// offline here. Pins the asymmetry both module docs describe.
+    #[tokio::test]
+    async fn mem_stage_offline_rejects_diff_archive_as_sole_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let socket_dir = tmp.path().join(".socket");
+        std::fs::create_dir_all(socket_dir.join("diffs")).unwrap();
+        std::fs::write(
+            socket_dir.join("diffs").join(format!("{UUID}.tar.gz")),
+            b"x",
+        )
+        .unwrap();
+        let project_root = tmp.path().join("proj");
+        std::fs::create_dir_all(&project_root).unwrap();
+
+        let outcome = stage_vendor_sources_in_memory(
+            &offline_args(),
+            &manifest_with_one_patch(),
+            &socket_dir,
+            &project_root,
+        )
+        .await
+        .expect("no hard failure");
+        assert!(
+            matches!(outcome, MemStageOutcome::Unavailable),
+            "vendor staging must not treat a diff archive as a usable source"
+        );
+    }
+
+    /// An unknown `--download-mode` is a hard setup failure (Err), not a
+    /// soft Unavailable.
+    #[tokio::test]
+    async fn stage_rejects_unknown_download_mode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let args = GlobalArgs {
+            download_mode: "bogus".to_string(),
+            silent: true,
+            ..GlobalArgs::default()
+        };
+        let Err(err) = stage_patch_sources(&args, &manifest_with_one_patch(), tmp.path()).await
+        else {
+            panic!("an unparseable download mode is a hard failure");
+        };
+        assert!(
+            err.contains("bogus"),
+            "diagnostic names the bad mode: {err}"
+        );
+    }
+
+    /// `writable_blobs` promotes an in-place (no-overlay) source set to a
+    /// transient overlay: the returned dir is NOT `.socket/blobs`, existing
+    /// blobs are pre-seeded into it, and a late download that lands there
+    /// leaves the persistent cache untouched.
+    #[tokio::test]
+    async fn writable_blobs_promotes_to_overlay_and_preserves_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let socket_dir = tmp.path().join(".socket");
+        std::fs::create_dir_all(socket_dir.join("blobs")).unwrap();
+        std::fs::write(socket_dir.join("blobs").join(HASH), b"cached").unwrap();
+
+        let outcome = stage_patch_sources(&offline_args(), &manifest_with_one_patch(), &socket_dir)
+            .await
+            .expect("no hard failure");
+        let StageOutcome::Ready(mut staged) = outcome else {
+            panic!("fully-cached staging must be Ready");
+        };
+
+        let writable = staged.writable_blobs().await.expect("overlay created");
+        assert_ne!(
+            writable,
+            socket_dir.join("blobs"),
+            "late downloads must never target the persistent cache"
+        );
+        assert!(
+            writable.join(HASH).exists(),
+            "the overlay is pre-seeded with the cached blobs"
+        );
+
+        std::fs::write(writable.join("late-download"), b"new").unwrap();
+        assert!(
+            !socket_dir.join("blobs").join("late-download").exists(),
+            "a write into the overlay must not appear in .socket/blobs"
+        );
+        // Stable across calls: a second call reuses the same overlay.
+        let again = staged.writable_blobs().await.unwrap().to_path_buf();
+        assert!(again.join("late-download").exists());
+    }
+
+    /// `overlay_dir` mirrors regular files only, and never clobbers a file
+    /// already present at the destination.
+    #[tokio::test]
+    async fn overlay_dir_mirrors_files_skips_dirs_and_existing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        std::fs::create_dir_all(src.join("subdir")).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        std::fs::write(src.join("a"), b"from-src").unwrap();
+        std::fs::write(src.join("b"), b"from-src").unwrap();
+        std::fs::write(dst.join("b"), b"already-there").unwrap();
+
+        overlay_dir(&src, &dst).await;
+
+        assert_eq!(std::fs::read(dst.join("a")).unwrap(), b"from-src");
+        assert_eq!(
+            std::fs::read(dst.join("b")).unwrap(),
+            b"already-there",
+            "existing destination files are never overwritten"
+        );
+        assert!(!dst.join("subdir").exists(), "directories are not mirrored");
+    }
+}

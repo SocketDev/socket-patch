@@ -65,6 +65,22 @@ fn parse_purl_simple(purl: &str) -> Option<(String, String, String)> {
     Some((typ.to_string(), name, version.to_string()))
 }
 
+/// The hosted-mode JSON error envelope, for bail-outs that return before the
+/// result envelope at the bottom of [`run_redirect`] is built. A `--json`
+/// consumer must always get parseable stdout — `status`/`error` mirror the
+/// success envelope's error fold — never empty output plus an exit code.
+fn emit_json_error(message: &str) {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "status": "error",
+            "error": message,
+            "redirect": { "mode": "hosted" },
+        }))
+        .unwrap()
+    );
+}
+
 /// `scan --redirect`: resolve hosted-patch references for the selected patches,
 /// then rewrite ONLY those dependencies' lockfile/registry-config entries to
 /// point at the hosted vendored patches (the byte-identical counterpart of the
@@ -92,11 +108,16 @@ pub(super) async fn run_redirect(
     {
         Ok(s) => s,
         // Hosted mode has no discovery envelope to fold the message into at
-        // this point (it builds its `redirect` result further down) and its
-        // other bail-outs — e.g. the reference resolve below — report on
-        // stderr the same way. `discover_selected` already printed the
-        // message; behavior here is unchanged.
-        Err((code, _message)) => return code,
+        // this point (it builds its `redirect` result further down).
+        // `discover_selected` already printed the message to stderr; a
+        // `--json` run additionally gets the machine-readable envelope so
+        // stdout is never empty on failure.
+        Err((code, message)) => {
+            if args.common.json {
+                emit_json_error(&message);
+            }
+            return code;
+        }
     };
 
     let mut skipped: Vec<serde_json::Value> = Vec::new();
@@ -114,7 +135,11 @@ pub(super) async fn run_redirect(
         let references = match api_client.fetch_registry_references(&uuids).await {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("failed to resolve patch references: {e}");
+                let message = format!("failed to resolve patch references: {e}");
+                eprintln!("{message}");
+                if args.common.json {
+                    emit_json_error(&message);
+                }
                 return 1;
             }
         };
@@ -391,7 +416,11 @@ pub(super) async fn run_redirect(
                 let _ = std::fs::create_dir_all(parent);
             }
             if let Err(e) = std::fs::write(&path, content) {
-                eprintln!("failed to write {rel}: {e}");
+                let message = format!("failed to write {rel}: {e}");
+                eprintln!("{message}");
+                if args.common.json {
+                    emit_json_error(&message);
+                }
                 return 1;
             }
         }
@@ -427,7 +456,11 @@ pub(super) async fn run_redirect(
                 vendor_dir.join("redirect-state.json"),
                 format!("{}\n", serde_json::to_string_pretty(&ledger).unwrap()),
             ) {
-                eprintln!("failed to write .socket/vendor/redirect-state.json: {e}");
+                let message = format!("failed to write .socket/vendor/redirect-state.json: {e}");
+                eprintln!("{message}");
+                if args.common.json {
+                    emit_json_error(&message);
+                }
                 return 1;
             }
         }

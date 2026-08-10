@@ -288,7 +288,23 @@ async fn persist_setup_excludes(common: &GlobalArgs, excludes: &[String]) {
         return;
     }
     let path = common.resolved_manifest_path();
-    let existing = read_manifest(&path).await.ok().flatten();
+    // Fail closed on a manifest that exists but cannot be read or parsed: it
+    // may still hold recoverable patch records, and flattening the error to
+    // "no manifest yet" would rewrite the file down to a bare setup block —
+    // destroying them for the sake of persisting an exclude list. Skip
+    // persistence loudly instead; nothing else in this run needs the file.
+    let existing = match read_manifest(&path).await {
+        Ok(existing) => existing,
+        Err(e) => {
+            if !common.silent {
+                eprintln!(
+                    "Warning: not persisting --exclude: cannot read {}: {e}",
+                    path.display()
+                );
+            }
+            return;
+        }
+    };
     let mut merged: Vec<String> = excludes.to_vec();
     merged.sort();
     merged.dedup();
