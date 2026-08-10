@@ -2,6 +2,8 @@
 
 use std::path::Path;
 
+use crate::utils::toml_edit_ext::has_table;
+
 /// The dependency `setup` adds (PEP 508 form, used for `requirements.txt` and
 /// PEP 621 `[project].dependencies`): the `socket-patch[hook]` extra, which
 /// pulls both the socket-patch CLI and the socket-patch-hook wheel (the `.pth`
@@ -94,27 +96,6 @@ pub async fn detect_python_pm(cwd: &Path) -> PythonPackageManager {
         }
     }
     PythonPackageManager::Pip
-}
-
-/// True if a `[prefix]` or `[prefix.*]` table header appears in the TOML text.
-/// Also used by the pypi vendor flavor router (`vendor::pypi`).
-pub(crate) fn has_table(content: &str, prefix: &str) -> bool {
-    content.lines().any(|line| {
-        let l = line.trim();
-        let Some(rest) = l.strip_prefix('[') else {
-            return false;
-        };
-        // Tolerate array-of-tables (`[[..]]`) by dropping a second opening
-        // bracket, then take everything up to the closing `]` so a trailing
-        // inline comment (`[tool.uv] # note`) or interior padding
-        // (`[ tool.uv ]`) — both valid TOML — doesn't defeat the match.
-        let rest = rest.trim_start_matches('[');
-        let Some(end) = rest.find(']') else {
-            return false;
-        };
-        let header = rest[..end].trim();
-        header == prefix || header.starts_with(&format!("{prefix}."))
-    })
 }
 
 /// True if the given manifest text already declares the hook dependency, in any

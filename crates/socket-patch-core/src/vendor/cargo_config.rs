@@ -30,8 +30,8 @@ use std::path::{Path, PathBuf};
 use tokio::fs;
 use toml_edit::{DocumentMut, InlineTable, Item, Table, Value};
 
-use crate::pth_hook::edit::ensure_table;
 use crate::utils::fs::atomic_write_bytes_preserving_mode;
+use crate::utils::toml_edit_ext::ensure_table;
 
 /// Project-relative root of the vendor backend's committed crate copies. An
 /// entry whose `path` is under this prefix is socket-owned.

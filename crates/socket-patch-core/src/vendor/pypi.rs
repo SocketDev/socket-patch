@@ -13,9 +13,9 @@ use sha2::{Digest as _, Sha256};
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::{ApplyResult, PatchSources};
-use crate::pth_hook::detect::has_table;
 use crate::utils::fs::atomic_write_bytes;
 use crate::utils::purl::{parse_pypi_purl, strip_purl_qualifiers};
+use crate::utils::toml_edit_ext::has_table;
 
 use super::common::{already_patched_result, done, refused, service_offline_conflict};
 use super::path::vendor_uuid_dir_rel;

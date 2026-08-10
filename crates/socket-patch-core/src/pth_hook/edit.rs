@@ -18,6 +18,7 @@ use toml_edit::{Array, DocumentMut, InlineTable, Item, Table, Value};
 
 use super::detect::{deps_contain_hook, HOOK_DEP};
 use crate::utils::fs::atomic_write_bytes_preserving_mode;
+use crate::utils::toml_edit_ext::ensure_table;
 use crate::vendor::common::detect_eol;
 
 /// Which manifest format a path is.
@@ -238,25 +239,6 @@ fn pyproject_remove(content: &str) -> Result<Option<String>, String> {
     changed |= poetry_remove(&mut doc);
 
     Ok(if changed { Some(doc.to_string()) } else { None })
-}
-
-/// Ensure `parent[key]` is a table, creating it if absent. Errors if present
-/// but a non-table. Also used by the vendor backends' TOML editing
-/// (`vendor::cargo_config`, `vendor::pypi_uv`).
-pub(crate) fn ensure_table<'a>(
-    parent: &'a mut Table,
-    key: &str,
-    implicit: bool,
-) -> Result<&'a mut Table, String> {
-    if !parent.contains_key(key) {
-        let mut t = Table::new();
-        t.set_implicit(implicit);
-        parent.insert(key, Item::Table(t));
-    }
-    parent
-        .get_mut(key)
-        .and_then(Item::as_table_mut)
-        .ok_or_else(|| format!("`{key}` is not a table"))
 }
 
 fn pep621_add(doc: &mut DocumentMut) -> Result<bool, String> {

@@ -717,7 +717,7 @@ fn ensure_table<'a>(
 ) -> Result<&'a mut Table, (&'static str, String)> {
     let mut table: &mut Table = doc.as_table_mut();
     for key in path {
-        table = crate::pth_hook::edit::ensure_table(table, key, true).map_err(|_| {
+        table = crate::utils::toml_edit_ext::ensure_table(table, key, true).map_err(|_| {
             (
                 "pypi_uv_lock_parse_failed",
                 format!(

@@ -9,4 +9,5 @@ pub mod purl;
 pub(crate) mod serde;
 pub mod socket_cli_config;
 pub mod telemetry;
+pub(crate) mod toml_edit_ext;
 pub mod uri;
