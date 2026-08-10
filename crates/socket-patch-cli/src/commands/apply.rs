@@ -650,7 +650,10 @@ pub async fn run(args: ApplyArgs) -> i32 {
             // install cache by default. The CoW guard handles the
             // safety; this is informational only.
         }
-        _ => {}
+        // Exhaustive on purpose (no `_`): a new package-manager layout must
+        // make an explicit appearance here — silence is a decision, not a
+        // default.
+        NpmPkgManager::Npm | NpmPkgManager::YarnClassic | NpmPkgManager::Unknown => {}
     }
 
     match apply_patches_inner(&args, &manifest_path).await {

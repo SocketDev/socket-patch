@@ -79,9 +79,9 @@ pub fn detect_npm_pkg_manager(project_root: &Path) -> NpmPkgManager {
     //    mean "packages aren't on disk" — refuse rather than silently
     //    fall through to Unknown (a Yarn 2 PnP tree has no
     //    `node_modules/`, so it would otherwise escape the refusal).
-    if project_root.join(".pnp.cjs").is_file()
-        || project_root.join(".pnp.js").is_file()
-        || project_root.join(".pnp.loader.mjs").is_file()
+    if crate::constants::npm_family::PNP_MARKERS
+        .iter()
+        .any(|m| project_root.join(m).is_file())
     {
         return NpmPkgManager::YarnBerryPnP;
     }

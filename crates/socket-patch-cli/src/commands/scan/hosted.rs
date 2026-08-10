@@ -47,6 +47,9 @@ const REDIRECT_CANDIDATE_FILES: &[&str] = &[
     "settings.gradle.kts",
     "build.gradle",
     "build.gradle.kts",
+    // deno.lock is knowingly absent: deno is its own ecosystem and no
+    // redirect rewriter edits its integrity entries today — recording the
+    // decision here so the omission reads as deliberate, not forgotten.
 ];
 
 /// `pkg:<type>/<coordinate>@<version>` → `(type, coordinate, version)`. The
@@ -259,7 +262,7 @@ pub(super) async fn run_redirect(
     let mut rush_warnings: Vec<serde_json::Value> = Vec::new();
     let mut rush_lock_keys: Vec<String> = Vec::new();
     if args.common.cwd.join("rush.json").is_file() {
-        let common_lock = "common/config/rush/pnpm-lock.yaml";
+        let common_lock = socket_patch_core::constants::npm_family::RUSH_COMMON_LOCK_REL;
         if let Ok(content) = std::fs::read_to_string(args.common.cwd.join(common_lock)) {
             files.insert(common_lock.to_string(), content);
             rush_lock_keys.push(common_lock.to_string());
@@ -552,4 +555,33 @@ pub(super) async fn run_redirect(
         }
     }
     vex_code
+}
+
+#[cfg(test)]
+mod tests {
+    use super::REDIRECT_CANDIDATE_FILES;
+    use socket_patch_core::constants::npm_family;
+
+    #[test]
+    fn redirect_candidates_match_the_shared_npm_family_table() {
+        // Drift guard, both directions, without classifying the non-npm
+        // rows: every table row flagged redirect_candidate must be in the
+        // candidate list, and no npm-family row NOT so flagged may appear
+        // (bun.lockb's absence is deliberate — run_redirect auto-migrates
+        // it before rewriting).
+        for name in npm_family::names_with(|r| r.redirect_candidate) {
+            assert!(
+                REDIRECT_CANDIDATE_FILES.contains(&name),
+                "{name} is flagged redirect_candidate but missing from \
+                 REDIRECT_CANDIDATE_FILES"
+            );
+        }
+        for name in npm_family::names_with(|r| !r.redirect_candidate) {
+            assert!(
+                !REDIRECT_CANDIDATE_FILES.contains(&name),
+                "{name} is deliberately NOT a redirect candidate (see the \
+                 npm_family table) but appears in REDIRECT_CANDIDATE_FILES"
+            );
+        }
+    }
 }

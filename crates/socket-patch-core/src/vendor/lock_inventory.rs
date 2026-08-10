@@ -476,7 +476,7 @@ async fn inventory_rush_pnpm_locks(project_root: &Path) -> Vec<LockfileEntry> {
     let mut out = Vec::new();
 
     // The single source-of-truth lock.
-    let common_lock = project_root.join("common/config/rush/pnpm-lock.yaml");
+    let common_lock = project_root.join(crate::constants::npm_family::RUSH_COMMON_LOCK_REL);
     if let Some(entries) = inventory_pnpm_lock_at(&common_lock).await {
         out.extend(entries);
     }

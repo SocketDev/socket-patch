@@ -5,9 +5,11 @@ use super::detect::{strip_bom, PackageManager};
 use crate::utils::fs::{entry_file_type, is_dir, list_dir_entries};
 
 /// Detect the package manager based on lockfiles in the project root.
-/// Checks for pnpm-lock.yaml, pnpm-lock.yml, and pnpm-workspace.yaml.
+/// The accepted pnpm marker spellings (including the `pnpm-lock.yml`
+/// variant no other subsystem accepts) live in the shared
+/// [`npm_family`](crate::constants::npm_family) table.
 pub async fn detect_package_manager(start_path: &Path) -> PackageManager {
-    for name in &["pnpm-lock.yaml", "pnpm-lock.yml", "pnpm-workspace.yaml"] {
+    for name in crate::constants::npm_family::names_with(|r| r.detects_pnpm) {
         if fs::metadata(start_path.join(name)).await.is_ok() {
             return PackageManager::Pnpm;
         }
@@ -526,6 +528,30 @@ mod tests {
             parse_pnpm_workspace_patterns("packages: ['{apps,libs}/*', '!**/test/**']"),
             vec!["{apps,libs}/*", "!**/test/**"]
         );
+    }
+
+    #[tokio::test]
+    async fn detect_package_manager_accepts_every_table_flagged_pnpm_marker() {
+        // Behavioral pin on the shared npm_family table wiring: every row
+        // flagged detects_pnpm (including the `pnpm-lock.yml` spelling no
+        // other subsystem accepts) flips detection to Pnpm; an empty root
+        // stays Npm.
+        for name in crate::constants::npm_family::names_with(|r| r.detects_pnpm) {
+            let dir = tempfile::tempdir().unwrap();
+            fs::write(dir.path().join(name), "").await.unwrap();
+            assert!(
+                matches!(
+                    detect_package_manager(dir.path()).await,
+                    PackageManager::Pnpm
+                ),
+                "{name} must flip detection to pnpm"
+            );
+        }
+        let dir = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            detect_package_manager(dir.path()).await,
+            PackageManager::Npm
+        ));
     }
 
     // ── Group 2: workspace detection + file discovery ────────────────
