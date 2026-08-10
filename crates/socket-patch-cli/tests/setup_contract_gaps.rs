@@ -466,6 +466,58 @@ fn setup_honors_exclude_for_a_workspace_member() {
     );
 }
 
+/// `--exclude` persistence must fail closed on a manifest it cannot parse.
+///
+/// Regression pin: `persist_setup_excludes` flattened a read/parse error to
+/// `None` ("no manifest yet") and rewrote the file as a fresh manifest
+/// holding only the setup block — silently destroying every patch record a
+/// merely-corrupt (and possibly hand-recoverable) manifest still held. The
+/// load-bearing assertion is bytes-unchanged; setup itself still exits 0
+/// (the hooks were written), it just skips persisting and says so on stderr.
+#[test]
+fn exclude_persistence_fails_closed_on_corrupt_manifest() {
+    let proj = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    write(
+        &proj.path().join("package.json"),
+        r#"{ "name": "root", "version": "1.0.0" }"#,
+    );
+    let manifest_path = proj.path().join(".socket/manifest.json");
+    let corrupt = r#"{ "patches": { "pkg:npm/left-pad@1.3.0": TRUNCATED-MID-WRITE"#;
+    write(&manifest_path, corrupt);
+
+    let mut cmd = Command::new(binary());
+    cmd.args(["setup", "--json", "--yes", "--exclude", "packages/b"])
+        .current_dir(proj.path());
+    for (name, _) in std::env::vars() {
+        if name.starts_with("SOCKET_") && name != "SOCKET_NO_CONFIG" {
+            cmd.env_remove(name);
+        }
+    }
+    cmd.env("HOME", home.path());
+    cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
+    let out = cmd.output().expect("run socket-patch");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "setup itself succeeds (hooks written); only the persistence step is \
+         skipped; stderr=\n{stderr}"
+    );
+    let after = std::fs::read_to_string(&manifest_path).expect("manifest still present");
+    assert_eq!(
+        after, corrupt,
+        "a corrupt manifest must survive `setup --exclude` byte-identical — \
+         rewriting it destroys every patch record it may still hold; \
+         stderr=\n{stderr}"
+    );
+    assert!(
+        stderr.contains("not persisting --exclude"),
+        "skipping persistence must be loud, not silent: {stderr}"
+    );
+}
+
 /// Property 9, CSV spelling: `--exclude` is comma-delimited, so
 /// `--exclude "packages/a, packages/b"` (and the `SOCKET_SETUP_EXCLUDE=a, b`
 /// form CI YAML produces) must exclude BOTH members.
