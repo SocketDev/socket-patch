@@ -23,6 +23,7 @@ use serde_json::{json, Value};
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::patch::vendor::yarn_berry_lock::yarnrc_compression_level;
 
+pub mod golang_local;
 mod state;
 pub use state::{load_redirect_state, RedirectState, REDIRECT_STATE_REL};
 

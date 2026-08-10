@@ -10,4 +10,5 @@ pub mod patch;
 pub mod pth_hook;
 pub mod update;
 pub mod utils;
+pub mod vendor;
 pub mod vex;

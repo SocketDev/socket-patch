@@ -36,12 +36,12 @@ use crate::patch::vendor::common::{
 };
 use crate::utils::purl::{build_golang_purl, parse_golang_purl, strip_purl_qualifiers};
 
-use super::copy_tree::{fresh_copy, remove_tree};
-use super::go_mod_edit::{
+use crate::patch::copy_tree::{fresh_copy, remove_tree};
+use crate::vendor::go_mod_edit::{
     self, read_replace_entries, read_required_versions, replace_target_path, ReplaceOwner,
     GO_PATCHES_DIR,
 };
-use super::path_safety;
+use crate::patch::path_safety;
 
 /// A discrepancy between the committed redirect artifacts and the manifest,
 /// reported by [`verify_go_redirect_state`].
