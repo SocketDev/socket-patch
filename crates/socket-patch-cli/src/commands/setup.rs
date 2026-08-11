@@ -283,9 +283,14 @@ async fn effective_excludes(common: &GlobalArgs, flag: &[String]) -> Vec<String>
 /// without re-passing `--exclude`. No-op when the set is empty or already
 /// exactly persisted (keeps the manifest byte-stable). Never called under
 /// `--dry-run`.
-async fn persist_setup_excludes(common: &GlobalArgs, excludes: &[String]) {
+/// Returns a warning string when persistence was SKIPPED (fail-closed) —
+/// the caller folds it into the run's warnings so it reaches the human
+/// summary AND the `--json` envelope; a `--silent`/`--json` automation run
+/// must not see a fully-successful setup whose excludes silently evaporate
+/// on the next flag-less invocation.
+async fn persist_setup_excludes(common: &GlobalArgs, excludes: &[String]) -> Option<String> {
     if excludes.is_empty() {
-        return;
+        return None;
     }
     let path = common.resolved_manifest_path();
     // Fail closed on a manifest that exists but cannot be read or parsed: it
@@ -296,13 +301,11 @@ async fn persist_setup_excludes(common: &GlobalArgs, excludes: &[String]) {
     let existing = match read_manifest(&path).await {
         Ok(existing) => existing,
         Err(e) => {
-            if !common.silent {
-                eprintln!(
-                    "Warning: not persisting --exclude: cannot read {}: {e}",
-                    path.display()
-                );
-            }
-            return;
+            return Some(format!(
+                "not persisting --exclude: cannot read {}: {e} — the exclude list will \
+                 need re-passing until the manifest is repaired",
+                path.display()
+            ));
         }
     };
     let mut merged: Vec<String> = excludes.to_vec();
@@ -314,7 +317,7 @@ async fn persist_setup_excludes(common: &GlobalArgs, excludes: &[String]) {
         .map(|s| &s.exclude)
         == Some(&merged)
     {
-        return; // already persisted exactly — don't rewrite
+        return None; // already persisted exactly — don't rewrite
     }
     // Preserve any existing `manual` declarations (property 7) when rewriting.
     let manual = existing
@@ -331,6 +334,7 @@ async fn persist_setup_excludes(common: &GlobalArgs, excludes: &[String]) {
         let _ = tokio::fs::create_dir_all(parent).await;
     }
     let _ = write_manifest(&path, &manifest).await;
+    None
 }
 
 /// Which ecosystems are **actually set up** at `cwd` — i.e. their auto-repatch
@@ -1511,9 +1515,11 @@ async fn run_setup(args: &SetupArgs) -> i32 {
     // Dry-run never writes the manifest. Excluded members are then skipped by
     // discovery.
     let excludes = effective_excludes(common, &args.exclude).await;
-    if !common.dry_run {
-        persist_setup_excludes(common, &excludes).await;
-    }
+    let persist_warning = if !common.dry_run {
+        persist_setup_excludes(common, &excludes).await
+    } else {
+        None
+    };
     let npm_files = discover(args, &excludes).await;
     let py_plan = plan_python(common).await;
     // Gem + Composer previews (dry-run); `.present` also tells us each project exists.
@@ -1663,6 +1669,9 @@ async fn run_setup(args: &SetupArgs) -> i32 {
         py_results = edit_python_manifests(plan, false, false).await;
         warnings = finalize_python(plan, &py_results, &common.cwd).await;
     }
+    // A skipped (fail-closed) --exclude persistence rides the same warnings
+    // channel: human summary line + `--json` envelope `warnings` array.
+    warnings.extend(persist_warning);
     // Real gem + composer edits (gem Gemfile `plugin` block + generated plugin
     // dir; composer.json script-event command).
     let extra_results = merge_outcomes(

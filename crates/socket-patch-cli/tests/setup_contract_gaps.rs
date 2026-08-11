@@ -512,9 +512,59 @@ fn exclude_persistence_fails_closed_on_corrupt_manifest() {
          rewriting it destroys every patch record it may still hold; \
          stderr=\n{stderr}"
     );
+    // Machine-visible marker: the skip rides the envelope's warnings array,
+    // so `--json` automation cannot mistake this for a fully-persisted run.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("setup --json must emit valid JSON ({e}); stdout=\n{stdout}"));
     assert!(
-        stderr.contains("not persisting --exclude"),
-        "skipping persistence must be loud, not silent: {stderr}"
+        v["warnings"].as_array().is_some_and(|w| w.iter().any(|x| x
+            .as_str()
+            .is_some_and(|x| x.contains("not persisting --exclude")))),
+        "the skipped persistence must appear in the --json warnings; stdout=\n{stdout}"
+    );
+}
+
+/// The `--silent` contract ("errors only") suppresses the human warning —
+/// pinned here so the suppression is a decision, not an accident — while
+/// the fail-closed behavior itself must hold identically: exit 0, corrupt
+/// bytes untouched.
+#[test]
+fn exclude_persistence_fails_closed_silently_under_silent() {
+    let proj = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    write(
+        &proj.path().join("package.json"),
+        r#"{ "name": "root", "version": "1.0.0" }"#,
+    );
+    let manifest_path = proj.path().join(".socket/manifest.json");
+    let corrupt = r#"{ "patches": { "pkg:npm/left-pad@1.3.0": TRUNCATED-MID-WRITE"#;
+    write(&manifest_path, corrupt);
+
+    let mut cmd = Command::new(binary());
+    cmd.args(["setup", "--silent", "--yes", "--exclude", "packages/b"])
+        .current_dir(proj.path());
+    for (name, _) in std::env::vars() {
+        if name.starts_with("SOCKET_") && name != "SOCKET_NO_CONFIG" {
+            cmd.env_remove(name);
+        }
+    }
+    cmd.env("HOME", home.path());
+    cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
+    let out = cmd.output().expect("run socket-patch");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert_eq!(out.status.code(), Some(0), "stderr=\n{stderr}");
+    let after = std::fs::read_to_string(&manifest_path).expect("manifest still present");
+    assert_eq!(
+        after, corrupt,
+        "fail-closed must hold under --silent too; stderr=\n{stderr}"
+    );
+    assert!(
+        !stdout.contains("not persisting") && !stderr.contains("not persisting"),
+        "--silent is errors-only: the skip warning stays quiet; \
+         stdout=\n{stdout}\nstderr=\n{stderr}"
     );
 }
 
