@@ -105,3 +105,14 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package.suffix_array]
 opt-level = 3
+
+# macOS debug builds use unpacked split-debuginfo: every linked binary —
+# including each of the ~90 e2e test executables — pins its per-codegen-unit
+# .o files in target/debug/deps, and cargo never garbage-collects the
+# generations superseded by lockfile/toolchain bumps (this grew target/ to
+# 99 GB). Line tables keep panic backtraces readable while dropping the bulk
+# of the retained DWARF; for a full-fidelity debugger session, override with
+# CARGO_PROFILE_DEV_DEBUG=full. Applies to test/bench profiles via
+# inheritance.
+[profile.dev]
+debug = "line-tables-only"
