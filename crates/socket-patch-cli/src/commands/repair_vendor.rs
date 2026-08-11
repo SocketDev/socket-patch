@@ -455,8 +455,8 @@ pub(crate) async fn repair_vendored_artifacts(
     };
     let staged = match stage_vendor_sources_in_memory(common, &synth, socket_dir, &common.cwd).await
     {
-        Ok(MemStageOutcome::Ready(s)) => s,
-        Ok(MemStageOutcome::Unavailable) => {
+        MemStageOutcome::Ready(s) => s,
+        MemStageOutcome::Unavailable => {
             for c in &candidates {
                 fail(
                     env,
@@ -475,11 +475,6 @@ pub(crate) async fn repair_vendored_artifacts(
                     ),
                 );
             }
-            return rebuilt;
-        }
-        Err(e) => {
-            env.record(PatchEvent::artifact(PatchAction::Failed).with_error("stage_failed", e));
-            env.mark_partial_failure();
             return rebuilt;
         }
     };

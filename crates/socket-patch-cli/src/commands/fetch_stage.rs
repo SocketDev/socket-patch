@@ -310,13 +310,16 @@ pub(crate) enum MemStageOutcome {
 /// reproduce); anything else has its full per-file content fetched into
 /// memory from the patch view endpoint (`blobContent`), preceded by the
 /// committed-artifact harvest. Offline runs with missing sources are
-/// `Unavailable` with the same diagnostics as the disk stager.
+/// `Unavailable` with the same diagnostics as the disk stager. Unlike the
+/// disk stager there is no hard-failure mode (no download-mode parse, no
+/// tempdir), so this returns the outcome directly — every failure is the
+/// soft `Unavailable`.
 pub(crate) async fn stage_vendor_sources_in_memory(
     common: &GlobalArgs,
     manifest: &PatchManifest,
     socket_dir: &Path,
     project_root: &Path,
-) -> Result<MemStageOutcome, String> {
+) -> MemStageOutcome {
     let quiet = common.silent || common.json;
     let blobs = socket_dir.join("blobs");
     let diffs = socket_dir.join("diffs");
@@ -370,7 +373,7 @@ pub(crate) async fn stage_vendor_sources_in_memory(
         if common.offline {
             let purls: Vec<&str> = to_fetch.iter().map(|(purl, _)| *purl).collect();
             report_offline_missing(common, &purls);
-            return Ok(MemStageOutcome::Unavailable);
+            return MemStageOutcome::Unavailable;
         }
 
         if !quiet {
@@ -427,16 +430,16 @@ pub(crate) async fn stage_vendor_sources_in_memory(
                     eprintln!("  - {}", purl);
                 }
             }
-            return Ok(MemStageOutcome::Unavailable);
+            return MemStageOutcome::Unavailable;
         }
     }
 
-    Ok(MemStageOutcome::Ready(MemStagedSources {
+    MemStageOutcome::Ready(MemStagedSources {
         blobs,
         diffs,
         packages,
         mem,
-    }))
+    })
 }
 
 #[cfg(test)]
@@ -565,8 +568,7 @@ mod tests {
             &socket_dir,
             &project_root,
         )
-        .await
-        .expect("no hard failure");
+        .await;
         assert!(
             matches!(outcome, MemStageOutcome::Unavailable),
             "vendor staging must not treat a diff archive as a usable source"

@@ -1817,3 +1817,86 @@ async fn redirect_json_mode_failures_emit_error_envelope() {
         .expect("run socket-patch");
     assert_error_envelope(&out, "reference-resolve failure");
 }
+
+/// The write-failure bail-outs (legs 3-4 of the four `--json` failure
+/// exits) must also emit the machine-readable envelope: a rewritten
+/// lockfile that cannot be written back, and a revert ledger that cannot
+/// be persisted. Both are driven with real filesystem obstructions so the
+/// run reaches the write in question and fails there. (Legs 1-2 — the
+/// discovery-detail and reference-resolve failures — are pinned by
+/// `redirect_json_mode_failures_emit_error_envelope` above.)
+#[tokio::test]
+#[serial]
+async fn redirect_json_mode_write_failures_emit_error_envelope() {
+    fn assert_error_envelope(out: &std::process::Output, leg: &str) {
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "{leg}: failure exit; stdout=\n{stdout}\nstderr=\n{stderr}"
+        );
+        let v: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+            panic!(
+                "{leg}: --json stdout must be a parseable envelope even on failure ({e}); \
+                 stdout=\n{stdout}"
+            )
+        });
+        assert_eq!(v["status"], "error", "{leg}: status; stdout=\n{stdout}");
+        assert!(
+            v["error"].as_str().is_some_and(|m| !m.is_empty()),
+            "{leg}: envelope must carry the error message; stdout=\n{stdout}"
+        );
+        assert_eq!(
+            v["redirect"]["mode"], "hosted",
+            "{leg}: envelope must identify the mode; stdout=\n{stdout}"
+        );
+    }
+    async fn run_leg(tmp: &std::path::Path, server: &MockServer) -> std::process::Output {
+        scrubbed_cli()
+            .args([
+                "scan",
+                "--redirect",
+                "--yes",
+                "--json",
+                "--cwd",
+                tmp.to_str().unwrap(),
+                "--api-url",
+                &server.uri(),
+                "--org",
+                ORG,
+                "--api-token",
+                "fake",
+            ])
+            .output()
+            .expect("run socket-patch")
+    }
+
+    // Leg 3 — the rewritten lockfile cannot be written back (read-only
+    // file; the rewriter read it fine moments earlier).
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_project(tmp.path());
+    let lock = tmp.path().join("package-lock.json");
+    let mut perms = std::fs::metadata(&lock).unwrap().permissions();
+    perms.set_readonly(true);
+    std::fs::set_permissions(&lock, perms).unwrap();
+    let out = run_leg(tmp.path(), &server).await;
+    assert_error_envelope(&out, "lockfile-write failure");
+
+    // Leg 4 — the revert ledger cannot be persisted: a DIRECTORY squats on
+    // `.socket/vendor/redirect-state.json`, so `fs::write` fails after the
+    // lockfile rewrite succeeded.
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_project(tmp.path());
+    std::fs::create_dir_all(tmp.path().join(".socket/vendor/redirect-state.json")).unwrap();
+    let out = run_leg(tmp.path(), &server).await;
+    assert_error_envelope(&out, "ledger-write failure");
+}

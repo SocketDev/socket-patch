@@ -218,6 +218,15 @@ async fn scan_vendor_staging_error_still_reports_the_reconcile() {
          and rewritten the ledger; envelope={v}"
     );
 
+    // The carried envelope must not claim the vendor step succeeded: the
+    // run aborted at staging, so a consumer reading `.vendor.status` inside
+    // a `"status":"error"` result must see the demoted status, not the
+    // fresh-envelope default of "success".
+    assert_eq!(
+        v["vendor"]["status"], "partialFailure",
+        "the carried envelope's own status must be demoted; envelope={v}"
+    );
+
     // The point: that on-disk mutation must be visible to the JSON consumer.
     let events = v["vendor"]["events"].as_array().unwrap_or_else(|| {
         panic!(

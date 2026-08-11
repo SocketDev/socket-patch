@@ -457,16 +457,12 @@ async fn run_vendor(
     // writes blobs or temp files (the committed artifact is the patch).
     let staged =
         match stage_vendor_sources_in_memory(common, &manifest, socket_dir, &common.cwd).await {
-            Ok(MemStageOutcome::Ready(s)) => s,
-            Ok(MemStageOutcome::Unavailable) => {
+            MemStageOutcome::Ready(s) => s,
+            MemStageOutcome::Unavailable => {
                 env.mark_error(EnvelopeError::new(
                     "no_local_source",
                     "patch artifacts unavailable (offline or download failure)",
                 ));
-                return 1;
-            }
-            Err(e) => {
-                env.mark_error(EnvelopeError::new("stage_failed", e));
                 return 1;
             }
         };

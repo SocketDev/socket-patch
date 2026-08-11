@@ -249,3 +249,85 @@ async fn get_by_purl_nested_apply_uses_api_flags_not_env() {
     );
     assert_blob_was_fetched(&mock, &after_hash).await;
 }
+
+/// Token-less public-proxy leg: with no `--api-token` anywhere, a flag-only
+/// `--proxy-url` is the ONLY route to patches — the client consults
+/// `proxy_url` exclusively on its token-less branch, so the two
+/// authenticated legs above stay green even if `run_nested_apply` drops the
+/// `proxy_url` field. This leg goes red for exactly that regression: the
+/// nested apply's blob fetch must hit the flag proxy, not the dead env one.
+#[tokio::test]
+async fn get_by_uuid_nested_apply_uses_proxy_url_flag_when_tokenless() {
+    let before_hash = common::git_sha256(BEFORE);
+    let after_hash = common::git_sha256(AFTER);
+
+    let mock = MockServer::start().await;
+    // Proxy-shaped endpoints: no org scope.
+    Mock::given(method("GET"))
+        .and(path(format!("/patch/view/{UUID}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "uuid": UUID,
+            "purl": PURL,
+            "publishedAt": "2024-01-01T00:00:00Z",
+            "files": {
+                "package/index.js": {
+                    "beforeHash": before_hash,
+                    "afterHash": after_hash,
+                }
+            },
+            "vulnerabilities": {},
+            "description": "nested-apply proxy-flag fixture",
+            "license": "MIT",
+            "tier": "free",
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/patch/blob/{after_hash}")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(AFTER.to_vec()))
+        .mount(&mock)
+        .await;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    install_npm_package(tmp.path());
+
+    let uri = mock.uri();
+    let (code, stdout, stderr) = common::run_with_env(
+        tmp.path(),
+        &[
+            "get",
+            UUID,
+            "--yes",
+            "--json",
+            "--download-mode",
+            "file",
+            "--proxy-url",
+            &uri,
+        ],
+        &dead_env(),
+    );
+
+    assert_eq!(
+        code, 0,
+        "token-less get must reach the flag proxy end to end; \
+         stdout={stdout}\nstderr={stderr}"
+    );
+    let v: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("valid JSON expected: {e}\nstdout={stdout}"));
+    assert_eq!(v["status"], "success", "stdout={stdout}");
+
+    let requests = mock
+        .received_requests()
+        .await
+        .expect("wiremock records requests");
+    let want = format!("/patch/blob/{after_hash}");
+    assert!(
+        requests.iter().any(|r| r.url.path() == want),
+        "the nested apply's blob fetch must ride the --proxy-url flag \
+         (token-less branch); got requests={:?}",
+        requests
+            .iter()
+            .map(|r| r.url.path().to_string())
+            .collect::<Vec<_>>()
+    );
+}

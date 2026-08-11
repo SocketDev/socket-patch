@@ -126,17 +126,22 @@ async fn run_scan_vendor_step(
     };
     let staged =
         match stage_vendor_sources_in_memory(common, &manifest, socket_dir, &common.cwd).await {
-            Ok(MemStageOutcome::Ready(s)) => s,
-            Ok(MemStageOutcome::Unavailable) => {
+            MemStageOutcome::Ready(s) => s,
+            MemStageOutcome::Unavailable => {
                 // The reconcile above may have already reverted dropped
                 // entries on disk — hand its envelope to the error fold.
+                // Demote its status first: a fresh Envelope starts at
+                // Success and a clean reconcile leaves it there, but this
+                // run is aborting — a consumer reading `.vendor.status`
+                // inside a `"status":"error"` result must not see
+                // "success".
+                env.mark_partial_failure();
                 return Err((
                     "no_local_source",
                     "patch artifacts unavailable (offline or download failure)".to_string(),
                     Some(Box::new(env)),
                 ));
             }
-            Err(e) => return Err(("stage_failed", e, Some(Box::new(env)))),
         };
     let sources = staged.as_patch_sources();
     has_errors |=
