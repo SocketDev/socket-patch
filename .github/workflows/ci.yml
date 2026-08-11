@@ -94,8 +94,8 @@ jobs:
           ( cd gem/socket-patch && ruby -c lib/socket_patch/launcher.rb && ruby -c exe/socket-patch && gem build socket-patch.gemspec )
           ( cd gem/socket-patch-bundler && ruby -c plugins.rb && gem build socket-patch-bundler.gemspec )
           # The generated-plugin templates are pure Ruby — keep them parseable.
-          ruby -c crates/socket-patch-core/src/gem_setup/templates/plugins.rb.tmpl
-          ruby -c crates/socket-patch-core/src/gem_setup/templates/gemspec.tmpl
+          ruby -c crates/socket-patch-core/src/setup/gem/templates/plugins.rb.tmpl
+          ruby -c crates/socket-patch-core/src/setup/gem/templates/gemspec.tmpl
 
       - name: PHP — lint the Composer launcher + validate composer.json
         # composer.json lives at the repo root (Packagist requires the

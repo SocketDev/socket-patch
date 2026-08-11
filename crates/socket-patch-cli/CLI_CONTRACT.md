@@ -731,7 +731,7 @@ Contract properties:
 
 ### Registry override env vars
 
-Env-only knobs (no CLI flag) read by the vendor auto-fetch / artifact-rebuild paths in `socket-patch-core` (`src/patch/vendor/registry_fetch.rs`, `src/patch/vendor/maven_repo.rs`). Each is the enterprise-mirror / test escape hatch for one registry base; trailing slashes are trimmed and an exported-but-empty value falls back to the default. Lock-recorded URLs (npm/yarn/composer/gem/uv `resolved`/dist URLs) are used verbatim and bypass these.
+Env-only knobs (no CLI flag) read by the vendor auto-fetch / artifact-rebuild paths in `socket-patch-core` (`src/vendor/registry_fetch.rs`, `src/vendor/maven_repo.rs`). Each is the enterprise-mirror / test escape hatch for one registry base; trailing slashes are trimmed and an exported-but-empty value falls back to the default. Lock-recorded URLs (npm/yarn/composer/gem/uv `resolved`/dist URLs) are used verbatim and bypass these.
 
 | Env var | Default | Notes |
 |---|---|---|
