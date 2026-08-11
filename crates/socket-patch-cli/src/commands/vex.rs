@@ -435,12 +435,8 @@ async fn generate_vex(
     ) {
         Some(doc) => doc,
         None => {
-            track_vex_failed(
-                "no_applicable_patches",
-                common.api_token.as_deref(),
-                common.org.as_deref(),
-            )
-            .await;
+            let (token, org) = crate::commands::list::telemetry_credentials(common);
+            track_vex_failed("no_applicable_patches", token.as_deref(), org.as_deref()).await;
             return Err(VexGenError {
                 code: "no_applicable_patches",
                 message: "No applied patches with vulnerability metadata to attest.".to_string(),
@@ -473,12 +469,13 @@ async fn generate_vex(
         }
     };
 
+    let (token, org) = crate::commands::list::telemetry_credentials(common);
     track_vex_generated(
         doc.statements.len(),
         "openvex-0.2.0",
         if wrote_to_file { "file" } else { "stdout" },
-        common.api_token.as_deref(),
-        common.org.as_deref(),
+        token.as_deref(),
+        org.as_deref(),
     )
     .await;
 
@@ -574,8 +571,12 @@ async fn augment_with_redirect(
 
 /// Fire `vex_failed` telemetry and build the matching [`VexGenError`].
 /// Centralizes the "track then return error" pattern in [`generate_vex`].
+/// Attribution goes through the same layered credential chain as
+/// `list`/`setup` (flag / env / socket-cli `config.json`), not the raw
+/// flags — a `socket login`-only user must not report anonymously.
 async fn fail(common: &GlobalArgs, code: &'static str, message: String) -> VexGenError {
-    track_vex_failed(code, common.api_token.as_deref(), common.org.as_deref()).await;
+    let (token, org) = crate::commands::list::telemetry_credentials(common);
+    track_vex_failed(code, token.as_deref(), org.as_deref()).await;
     VexGenError {
         code,
         message,

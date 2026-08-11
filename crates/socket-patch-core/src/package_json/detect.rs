@@ -177,9 +177,13 @@ fn update_package_json_object(
 /// The split ignores the whitespace around `&&`: a hand-wired
 /// `"socket-patch apply&&npm run build"` is two commands, and treating it as
 /// one patch-containing segment would delete the user's `npm run build` along
-/// with the patch invocation. Survivors are re-joined with the canonical
-/// `" && "`, so a `&&` that was quoted rather than an operator comes back
-/// spaced — cosmetic, and only in scripts that also carry a patch command.
+/// with the patch invocation. Surviving segments are kept VERBATIM and
+/// re-joined with the bare `&&` separator they were split on: a `&&` inside
+/// a quoted argument of a surviving user command also splits here, and
+/// canonically respacing it would rewrite the user's bytes
+/// (`grep "a&&b"` → `grep "a && b"` greps a different pattern — not
+/// cosmetic). Only the seams adjacent to REMOVED segments collapse, and the
+/// result's outer edges are trimmed.
 ///
 /// Returns `(changed, new_value)`:
 /// - `(false, Some(original))` — no socket-patch segment found; leave as-is.
@@ -202,21 +206,28 @@ fn remove_socket_patch_from_script(script: &str) -> (bool, Option<String>) {
     // violating this function's documented `(false, ..)`/`(true, ..)` contract.
     let had_patch = segments.iter().any(|s| script_is_configured(s.trim()));
 
-    let kept: Vec<&str> = segments
-        .iter()
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty() && !script_is_configured(s))
-        .collect();
-
     if !had_patch {
         // No socket-patch pattern present — leave the script as-is.
         return (false, Some(trimmed.to_string()));
     }
 
+    // Keep surviving segments verbatim (inner spacing, quoted `&&` halves
+    // and all) so the reconstruction reproduces the user's original bytes;
+    // only removed segments and stray empty segments (double separators)
+    // drop out.
+    let kept: Vec<&str> = segments
+        .iter()
+        .copied()
+        .filter(|s| {
+            let t = s.trim();
+            !t.is_empty() && !script_is_configured(t)
+        })
+        .collect();
+
     if kept.is_empty() {
         (true, None)
     } else {
-        (true, Some(kept.join(" && ")))
+        (true, Some(kept.join("&&").trim().to_string()))
     }
 }
 
@@ -872,6 +883,32 @@ mod tests {
             remove_socket_patch_from_script("echo a &&socket-patch apply&& echo b && echo c");
         assert!(changed);
         assert_eq!(new.as_deref(), Some("echo a && echo b && echo c"));
+    }
+
+    /// A `&&` inside a QUOTED argument of a surviving user command also
+    /// splits at the operator scan, and the old canonical `" && "` rejoin
+    /// rewrote the user's bytes — `grep "a&&b"` became `grep "a && b"`,
+    /// which greps a different pattern. Survivors must come back verbatim.
+    #[test]
+    fn test_remove_script_preserves_quoted_ampersands_in_survivors() {
+        let (changed, new) = remove_socket_patch_from_script(
+            r#"socket-patch apply --silent && grep "a&&b" app.log"#,
+        );
+        assert!(changed);
+        assert_eq!(new.as_deref(), Some(r#"grep "a&&b" app.log"#));
+
+        // Same with the patch segment in the middle: the seam next to the
+        // removed segment collapses to a single `&&`, everything else is
+        // byte-identical.
+        let (changed, new) = remove_socket_patch_from_script(
+            r#"echo start && socket-patch apply && grep "x&&y" out.txt &&  tail -1"#,
+        );
+        assert!(changed);
+        assert_eq!(
+            new.as_deref(),
+            Some(r#"echo start && grep "x&&y" out.txt &&  tail -1"#),
+            "surviving segments keep their original inner spacing too"
+        );
     }
 
     #[test]
