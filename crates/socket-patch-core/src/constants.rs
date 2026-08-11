@@ -71,10 +71,16 @@ mod tests {
 /// INTENTIONALLY divergent subsets: hosted redirect deliberately omits
 /// `bun.lockb` (it auto-migrates it to `bun.lock` before rewriting), and the
 /// `pnpm-lock.yml` spelling is accepted only by setup detection. This table
-/// encodes each divergence once, visibly, instead of homogenizing them —
-/// guard tests beside each consumer assert its list equals the rows flagged
-/// for its role, so a new lockfile spelling added in one place fails the
-/// other sites' tests instead of drifting silently.
+/// encodes each divergence once, visibly, instead of homogenizing them.
+///
+/// What is actually guard-tested (equality against the flagged rows):
+/// `vendor::npm_flavor`'s wiring-family list, `scan::hosted`'s
+/// REDIRECT_CANDIDATE_FILES npm subset, and `package_json::find`'s pnpm
+/// markers (plus a hardcoded pin so the table and its consumers cannot
+/// shrink together). NOT table-guarded: `crawlers::pkg_managers`' own
+/// bun/yarn lockfile literals and `npm_flavor`'s probe decision literals —
+/// those are pinned behaviorally by their unit tests instead; only
+/// PNP_MARKERS is shared with the crawler.
 pub mod npm_family {
     /// One file-name row and the roles in which consumers accept it.
     pub struct FileRow {
@@ -171,8 +177,4 @@ pub mod npm_family {
     /// Rush monorepos keep the single pnpm source-of-truth lock here,
     /// relative to the repo root (no root package.json/lock pair).
     pub const RUSH_COMMON_LOCK_REL: &str = "common/config/rush/pnpm-lock.yaml";
-
-    /// The bun.lockb → bun.lock migration command, spliced into every
-    /// user-facing message that recommends it.
-    pub const BUN_MIGRATE_CMD: &str = "bun install --save-text-lockfile";
 }

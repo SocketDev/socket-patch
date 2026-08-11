@@ -167,13 +167,15 @@ pub(crate) async fn detect_npm_lock_flavor(
         if exists("rush.json").await {
             return Err((
                 "vendor_rush_unsupported",
-                "found rush.json: this is a Rush monorepo — its single pnpm lockfile lives at \
-                 common/config/rush/pnpm-lock.yaml, overrides are declared in \
-                 common/config/rush/pnpm-config.json (globalOverrides), and `rush install` \
-                 copies the lock into common/temp and runs pnpm there, so vendor's relative \
-                 file: specs cannot survive the copy; use `socket-patch scan --mode hosted`, \
-                 which edits common/config/rush/pnpm-lock.yaml in place"
-                    .to_string(),
+                format!(
+                    "found rush.json: this is a Rush monorepo — its single pnpm lockfile \
+                     lives at {lock}, overrides are declared in \
+                     common/config/rush/pnpm-config.json (globalOverrides), and `rush \
+                     install` copies the lock into common/temp and runs pnpm there, so \
+                     vendor's relative file: specs cannot survive the copy; use \
+                     `socket-patch scan --mode hosted`, which edits {lock} in place",
+                    lock = crate::constants::npm_family::RUSH_COMMON_LOCK_REL
+                ),
             ));
         }
 

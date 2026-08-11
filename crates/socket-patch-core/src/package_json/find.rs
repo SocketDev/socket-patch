@@ -554,6 +554,21 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn pnpm_marker_spellings_are_pinned_by_value() {
+        // Hardcoded on purpose, breaking the self-reference: production code
+        // iterates the same names_with(detects_pnpm) expression the guard
+        // test above does, so a row deleted from the table would shrink code
+        // and guard together while `.yml` detection silently vanished. This
+        // list cannot shrink with them.
+        let mut spellings = crate::constants::npm_family::names_with(|r| r.detects_pnpm);
+        spellings.sort_unstable();
+        assert_eq!(
+            spellings,
+            ["pnpm-lock.yaml", "pnpm-lock.yml", "pnpm-workspace.yaml"]
+        );
+    }
+
     // ── Group 2: workspace detection + file discovery ────────────────
 
     #[tokio::test]
