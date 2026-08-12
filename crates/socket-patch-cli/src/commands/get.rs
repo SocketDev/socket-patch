@@ -343,13 +343,13 @@ fn build_patch_record(patch: &PatchResponse, files: HashMap<String, PatchFileInf
     }
 }
 
-/// Build the manifest-shaped `files` map from a fetched patch view,
-/// keeping only files that carry BOTH hashes — the download-flow rule
-/// shared by the record builders and installed-distribution matching
-/// (new files with no `beforeHash` are excluded; `save_and_apply_patch`
-/// has the new-file-tolerant variant). A file with an empty-string
-/// `beforeHash` is still kept so first-file verification can treat it
-/// as Ready.
+/// Build a file map keyed by path, keeping only files that carry BOTH
+/// hashes — the rule used ONLY for installed-distribution matching in
+/// [`filter_to_installed_releases`]. New files (no `beforeHash`) can
+/// neither identify nor disqualify an installed variant, so they are
+/// excluded here; [`select_installed_variants`] then discriminates on a
+/// non-empty `beforeHash`. Do NOT use this to build manifest records —
+/// see [`files_for_manifest`], which retains patch-added files.
 fn files_with_both_hashes(patch: &PatchResponse) -> HashMap<String, PatchFileInfo> {
     let mut files = HashMap::new();
     for (file_path, file_info) in &patch.files {
@@ -366,13 +366,43 @@ fn files_with_both_hashes(patch: &PatchResponse) -> HashMap<String, PatchFileInf
     files
 }
 
-/// `(purl, manifest record)` from a fetched patch view — the both-hashes
-/// file rule shared with the download flows (new files with no beforeHash
-/// are not part of the record).
+/// Build the manifest-shaped `files` map from a fetched patch view,
+/// keeping EVERY file the patch touches — including net-new files the
+/// patch ADDS, which carry an `afterHash` but no `beforeHash`. A new
+/// file is recorded with an empty-string `beforeHash` sentinel, the same
+/// convention `save_and_apply_patch`'s by-uuid path relies on: apply
+/// treats an empty `beforeHash` as "create this file" and
+/// [`select_installed_variants`] treats it as non-discriminating.
+///
+/// This is the shared record-building rule for the scan/download/vendor
+/// flows AND the single-uuid apply path, so `get <uuid>` and
+/// `scan`/`apply`/`vendor` all record and write the same set of files.
+/// The previous both-hashes-only rule silently dropped every added file,
+/// e.g. the whole-crate cargo export where ALL files lack a `beforeHash`
+/// (recorded `files:{}` → reported `applied:1` while writing nothing) and
+/// a gem patch's genuinely-new runtime-guard file.
+fn files_for_manifest(patch: &PatchResponse) -> HashMap<String, PatchFileInfo> {
+    let mut files = HashMap::new();
+    for (file_path, file_info) in &patch.files {
+        if let Some(after) = &file_info.after_hash {
+            files.insert(
+                file_path.clone(),
+                PatchFileInfo {
+                    before_hash: file_info.before_hash.clone().unwrap_or_default(),
+                    after_hash: after.clone(),
+                },
+            );
+        }
+    }
+    files
+}
+
+/// `(purl, manifest record)` from a fetched patch view — retains
+/// patch-added new files via [`files_for_manifest`].
 pub(crate) fn record_from_patch_response(patch: &PatchResponse) -> (String, PatchRecord) {
     (
         patch.purl.clone(),
-        build_patch_record(patch, files_with_both_hashes(patch)),
+        build_patch_record(patch, files_for_manifest(patch)),
     )
 }
 
@@ -902,9 +932,30 @@ pub(crate) async fn download_patch_records(
         // org slug is already stored in the client.
         match api_client.fetch_patch(None, &search_result.uuid).await {
             Ok(Some(patch)) => {
-                // Same both-hashes rule as the download flow: new files
-                // (no beforeHash) are skipped from the record.
-                let files = files_with_both_hashes(&patch);
+                // Record every file the patch touches, added files
+                // included (empty-beforeHash sentinel); see
+                // `files_for_manifest`.
+                let files = files_for_manifest(&patch);
+                // GUARDRAIL: a patch that yields NO recordable files
+                // cannot be vendored — recording an empty `files` map and
+                // reporting the purl as vendored would claim protection
+                // while writing nothing. Fail loudly instead.
+                if files.is_empty() {
+                    if !params.json && !params.silent {
+                        eprintln!(
+                            "  [fail] {} (patch has no applicable files)",
+                            search_result.purl
+                        );
+                    }
+                    failed += 1;
+                    patch_records_json.push(serde_json::json!({
+                        "purl": patch.purl,
+                        "uuid": patch.uuid,
+                        "action": "failed",
+                        "error": "patch has no applicable files",
+                    }));
+                    continue;
+                }
                 let quiet = params.json || params.silent;
                 // Vendor flows keep blob content in memory (the vendor
                 // step re-fetches what it needs); persisting blobs here
@@ -1169,10 +1220,32 @@ pub async fn download_and_apply_patches(
                     continue;
                 }
 
-                // Build the manifest `files` map. Download flow requires
-                // BOTH before+after hash (skips new files); see
-                // `save_and_apply_patch` for the new-file-tolerant variant.
-                let files = files_with_both_hashes(&patch);
+                // Build the manifest `files` map. Retains patch-added new
+                // files (empty-beforeHash sentinel) so scan/apply/vendor
+                // record and write them; see `files_for_manifest`.
+                let files = files_for_manifest(&patch);
+
+                // GUARDRAIL: a patch that yields NO recordable files
+                // cannot be applied — recording an empty `files` map and
+                // then reporting `applied` would tell the user we protected
+                // them while writing nothing. Count it as a failure so the
+                // status/exit code degrade and it is never auto-applied.
+                if files.is_empty() {
+                    if !params.json && !params.silent {
+                        eprintln!(
+                            "  [fail] {} (patch has no applicable files)",
+                            patch.purl
+                        );
+                    }
+                    downloaded_patches.push(serde_json::json!({
+                        "purl": patch.purl,
+                        "uuid": patch.uuid,
+                        "action": "failed",
+                        "error": "patch has no applicable files",
+                    }));
+                    patches_failed += 1;
+                    continue;
+                }
 
                 let quiet = params.json || params.silent;
                 // Vendor flows keep blob content in memory (the vendor
@@ -1849,21 +1922,24 @@ async fn save_and_apply_patch(args: &GetArgs, patch: &PatchResponse) -> i32 {
         }
     };
 
-    // Build the manifest `files` map. UUID flow is more permissive than
-    // the download flow: a file with after_hash but no before_hash is a
-    // new file; we record an empty `before_hash` and let apply treat it
-    // as a new-file insert.
-    let mut files = HashMap::new();
-    for (file_path, file_info) in &patch.files {
-        if let Some(after) = &file_info.after_hash {
-            files.insert(
-                file_path.clone(),
-                PatchFileInfo {
-                    before_hash: file_info.before_hash.clone().unwrap_or_default(),
-                    after_hash: after.clone(),
-                },
-            );
-        }
+    // Build the manifest `files` map, retaining patch-added new files
+    // (a file with after_hash but no before_hash records an empty
+    // `before_hash` sentinel, which apply treats as a new-file insert).
+    let files = files_for_manifest(patch);
+
+    // GUARDRAIL: a patch that yields NO recordable files cannot be
+    // applied — recording an empty `files` map and reporting the patch
+    // as applied would claim protection while writing nothing. Fail
+    // loudly instead of counting a defective patch as `applied:1`.
+    if files.is_empty() {
+        report_error(
+            args.common.json,
+            format!(
+                "Patch {} has no applicable files; nothing to apply",
+                patch.purl
+            ),
+        );
+        return 1;
     }
 
     if write_all_patch_blobs(&blobs_dir, patch, args.common.json)
@@ -2038,7 +2114,7 @@ pub(crate) fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use socket_patch_core::api::types::VulnerabilityResponse;
+    use socket_patch_core::api::types::{PatchFileResponse, VulnerabilityResponse};
     use std::collections::HashMap;
 
     // --- detect_identifier_type -------------------------------------------
@@ -2920,5 +2996,121 @@ mod tests {
         // A value where byte 8 splits the trailing multibyte char.
         let s2 = "abcdef€"; // 6 ascii + 3-byte '€' = 9 bytes; byte 8 mid-char
         assert_eq!(short_uuid(s2), s2);
+    }
+
+    // --- files_for_manifest / files_with_both_hashes ---------------------
+    // Regression guards for the download/scan/vendor record builder: a
+    // net-new file (afterHash, NO beforeHash) that the patch ADDS must be
+    // retained in the manifest record, not silently dropped. Real prod
+    // repro: the whole-crate cargo export for `pkg:cargo/traitobject@0.1.1`
+    // publishes ALL files with only an afterHash — the old both-hashes rule
+    // recorded `files:{}` and reported `applied:1` while writing nothing.
+
+    fn file_resp(before: Option<&str>, after: Option<&str>) -> PatchFileResponse {
+        PatchFileResponse {
+            before_hash: before.map(|s| s.to_string()),
+            after_hash: after.map(|s| s.to_string()),
+            socket_blob: None,
+            blob_content: None,
+            before_blob_content: None,
+        }
+    }
+
+    fn patch_with_files(files: HashMap<String, PatchFileResponse>) -> PatchResponse {
+        PatchResponse {
+            uuid: "cf2e6f58-0000-4000-8000-000000000000".into(),
+            purl: "pkg:cargo/traitobject@0.1.1".into(),
+            published_at: "Fri, 27 Mar 2026 19:12:42 GMT".into(),
+            files,
+            vulnerabilities: HashMap::new(),
+            description: "desc".into(),
+            license: "MIT".into(),
+            tier: "free".into(),
+        }
+    }
+
+    #[test]
+    fn files_for_manifest_retains_new_file_without_before_hash() {
+        // A patch that ADDS a new file (afterHash, no beforeHash) — e.g.
+        // the gem `lib/rubygems_plugin.rb` runtime guard — must be kept.
+        let mut files = HashMap::new();
+        files.insert(
+            "lib/rubygems_plugin.rb".to_string(),
+            file_resp(None, Some("a".repeat(64).as_str())),
+        );
+        files.insert(
+            "lib/existing.rb".to_string(),
+            file_resp(Some(&"b".repeat(64)), Some(&"c".repeat(64))),
+        );
+        let patch = patch_with_files(files);
+
+        let kept = files_for_manifest(&patch);
+        // Both files retained: the modified one AND the added one.
+        assert_eq!(kept.len(), 2);
+        let added = kept
+            .get("lib/rubygems_plugin.rb")
+            .expect("new file must be retained in the manifest record");
+        // New files record an empty-string beforeHash sentinel.
+        assert_eq!(added.before_hash, "");
+        assert_eq!(added.after_hash, "a".repeat(64));
+
+        // The old both-hashes rule (still used for installed-variant
+        // matching) DROPS the added file — this is the behavior we fixed.
+        let strict = files_with_both_hashes(&patch);
+        assert_eq!(strict.len(), 1);
+        assert!(!strict.contains_key("lib/rubygems_plugin.rb"));
+    }
+
+    #[test]
+    fn files_for_manifest_keeps_all_new_file_whole_crate_export() {
+        // The P0 cargo case: EVERY file is a whole-crate export with only
+        // an afterHash. The old rule produced `files:{}`; the fix retains
+        // all 9 so the record is non-empty and can actually be applied.
+        let mut files = HashMap::new();
+        for i in 0..9 {
+            files.insert(
+                format!("src/file{i}.rs"),
+                file_resp(None, Some(&format!("{i:064x}"))),
+            );
+        }
+        let patch = patch_with_files(files);
+
+        let kept = files_for_manifest(&patch);
+        assert_eq!(kept.len(), 9, "all whole-crate-export files must be kept");
+        assert!(kept.values().all(|f| f.before_hash.is_empty()));
+
+        // Guardrail precondition: with the old rule this map was empty.
+        assert!(files_with_both_hashes(&patch).is_empty());
+    }
+
+    #[test]
+    fn build_patch_record_from_new_files_is_not_empty() {
+        // The record built from a new-files-only patch must carry files —
+        // an empty `files` map is what the guardrail treats as a
+        // non-applicable (failed), never a successful `applied:1`, patch.
+        let mut files = HashMap::new();
+        files.insert(
+            "src/lib.rs".to_string(),
+            file_resp(None, Some(&"d".repeat(64))),
+        );
+        let patch = patch_with_files(files);
+
+        let (purl, record) = record_from_patch_response(&patch);
+        assert_eq!(purl, "pkg:cargo/traitobject@0.1.1");
+        assert!(
+            !record.files.is_empty(),
+            "record_from_patch_response must retain patch-added files"
+        );
+
+        // A genuinely empty patch (no afterHash anywhere) yields an empty
+        // record — the guardrail-triggering condition the download/apply
+        // flows now count as failed rather than applied.
+        let mut broken = HashMap::new();
+        broken.insert("src/lib.rs".to_string(), file_resp(Some(&"e".repeat(64)), None));
+        let broken_patch = patch_with_files(broken);
+        assert!(
+            files_for_manifest(&broken_patch).is_empty(),
+            "a patch with no afterHash produces an empty (guardrail) files map"
+        );
     }
 }
