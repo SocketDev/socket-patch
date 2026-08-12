@@ -343,6 +343,33 @@ pub(super) async fn run_redirect(
         }));
     }
 
+    // pnpm >=11 enforces a lockfile supply-chain policy: it compares each
+    // resolution's tarball URL against the registry's published metadata and
+    // REFUSES the lock when they differ
+    // (`ERR_PNPM_TARBALL_URL_MISMATCH … has a tarball URL (https://patch.socket.dev/…)
+    // that does not match the registry's published metadata`). The hosted
+    // rewrite deliberately repoints tarball URLs at patch.socket.dev, so a
+    // pnpm >=11 install rejects the rewritten lock until the user opts in with
+    // `pnpm install --trust-lockfile` (which installs the patched artifact
+    // cleanly). Warn whenever the rewrite actually landed in ANY pnpm-lock.yaml
+    // — the plain root lock or a Rush nested/subspace lock (basename check).
+    let mut pnpm_warnings: Vec<serde_json::Value> = Vec::new();
+    if rewrite.files.keys().any(|key| {
+        std::path::Path::new(key)
+            .file_name()
+            .and_then(|n| n.to_str())
+            == Some("pnpm-lock.yaml")
+    }) {
+        pnpm_warnings.push(serde_json::json!({
+            "code": "redirect_pnpm_trust_lockfile",
+            "detail":
+                "pnpm-lock.yaml was repointed at patch.socket.dev; pnpm >=11 rejects \
+                 the rewritten lock with ERR_PNPM_TARBALL_URL_MISMATCH (its tarball \
+                 URL no longer matches the registry's published metadata). Install \
+                 with `pnpm install --trust-lockfile` to accept the patched artifacts",
+        }));
+    }
+
     // A dep counts as REDIRECTED only if its hosted-artifact URL (or its
     // per-dependency registry index URL) actually landed in the project's
     // files — either written by this run or already present from an earlier
@@ -506,6 +533,7 @@ pub(super) async fn run_redirect(
         warnings.extend(record_warnings.iter().cloned());
         warnings.extend(migration_warnings.iter().cloned());
         warnings.extend(rush_warnings.iter().cloned());
+        warnings.extend(pnpm_warnings.iter().cloned());
         let mut result = serde_json::json!({
             "status": "success",
             "redirect": {
@@ -566,6 +594,9 @@ pub(super) async fn run_redirect(
                 eprintln!("  warning: {}", w["detail"].as_str().unwrap_or_default());
             }
             for w in &rush_warnings {
+                eprintln!("  warning: {}", w["detail"].as_str().unwrap_or_default());
+            }
+            for w in &pnpm_warnings {
                 eprintln!("  warning: {}", w["detail"].as_str().unwrap_or_default());
             }
             if let Some(statements) = vex_statements {
