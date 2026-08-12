@@ -4,12 +4,12 @@ use socket_patch_core::api::blob_fetcher::{
     DownloadMode,
 };
 use socket_patch_core::api::client::get_api_client_with_overrides;
-use socket_patch_core::manifest::operations::read_manifest;
-use socket_patch_core::patch::apply::PatchSources;
-use socket_patch_core::utils::cleanup_blobs::{
+use socket_patch_core::manifest::cleanup_blobs::{
     cleanup_unused_archives, cleanup_unused_blobs, format_cleanup_result,
 };
-use socket_patch_core::utils::telemetry::{track_patch_repair_failed, track_patch_repaired};
+use socket_patch_core::manifest::operations::read_manifest;
+use socket_patch_core::patch::apply::PatchSources;
+use socket_patch_core::telemetry::{track_patch_repair_failed, track_patch_repaired};
 use std::path::Path;
 use std::time::Duration;
 
@@ -83,7 +83,7 @@ pub async fn run(args: RepairArgs) -> i32 {
         let state_file = args
             .common
             .cwd
-            .join(socket_patch_core::patch::vendor::VENDOR_STATE_REL);
+            .join(socket_patch_core::vendor::VENDOR_STATE_REL);
         let has_vendor_traces = tokio::fs::metadata(&state_file).await.is_ok()
             || !crate::commands::repair_vendor::scan_vendor_references(&args.common.cwd)
                 .await
@@ -272,7 +272,7 @@ async fn repair_inner(
     // packages` — repair must not re-litter them (or fail trying). The
     // cleanup phase below still uses the FULL manifest, so it never sweeps
     // sources an in-place apply may need for rollback.
-    let vendor_state = socket_patch_core::patch::vendor::load_state(&args.common.cwd)
+    let vendor_state = socket_patch_core::vendor::load_state(&args.common.cwd)
         .await
         .unwrap_or_default();
     // Lockfile vendor references count as vendored even before the ledger
@@ -290,7 +290,7 @@ async fn repair_inner(
             .iter()
             .filter(|(purl, rec)| {
                 !referenced_uuids.contains(&rec.uuid)
-                    && socket_patch_core::patch::vendor::lookup_entry(&vendor_state.entries, purl)
+                    && socket_patch_core::vendor::lookup_entry(&vendor_state.entries, purl)
                         .is_none_or(|e| e.uuid != rec.uuid)
             })
             .map(|(k, v)| (k.clone(), v.clone()))

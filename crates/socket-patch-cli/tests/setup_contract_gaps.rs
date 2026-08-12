@@ -195,7 +195,7 @@ const VENDOR_UUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
 /// ledger entry binding the purl to it, and a manifest record whose
 /// afterHash is the hash of `patched`.
 fn setup_vendored_fixture(proj: &Path, home: &Path, installed: &[u8], vendored: &[u8]) {
-    use socket_patch_core::patch::vendor::state::{VendorArtifact, VendorEntry, VendorState};
+    use socket_patch_core::vendor::state::{VendorArtifact, VendorEntry, VendorState};
 
     write(
         &proj.join("package.json"),
@@ -463,5 +463,246 @@ fn setup_honors_exclude_for_a_workspace_member() {
             .iter()
             .any(|f| f["path"].as_str().is_some_and(|p| p.contains("packages/b"))),
         "the excluded member must not appear among the checked files:\n{stdout}"
+    );
+}
+
+/// `--exclude` persistence must fail closed on a manifest it cannot parse.
+///
+/// Regression pin: `persist_setup_excludes` flattened a read/parse error to
+/// `None` ("no manifest yet") and rewrote the file as a fresh manifest
+/// holding only the setup block — silently destroying every patch record a
+/// merely-corrupt (and possibly hand-recoverable) manifest still held. The
+/// load-bearing assertion is bytes-unchanged; setup itself still exits 0
+/// (the hooks were written), it just skips persisting and says so on stderr.
+#[test]
+fn exclude_persistence_fails_closed_on_corrupt_manifest() {
+    let proj = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    write(
+        &proj.path().join("package.json"),
+        r#"{ "name": "root", "version": "1.0.0" }"#,
+    );
+    let manifest_path = proj.path().join(".socket/manifest.json");
+    let corrupt = r#"{ "patches": { "pkg:npm/left-pad@1.3.0": TRUNCATED-MID-WRITE"#;
+    write(&manifest_path, corrupt);
+
+    let mut cmd = Command::new(binary());
+    cmd.args(["setup", "--json", "--yes", "--exclude", "packages/b"])
+        .current_dir(proj.path());
+    for (name, _) in std::env::vars() {
+        if name.starts_with("SOCKET_") && name != "SOCKET_NO_CONFIG" {
+            cmd.env_remove(name);
+        }
+    }
+    cmd.env("HOME", home.path());
+    cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
+    let out = cmd.output().expect("run socket-patch");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "setup itself succeeds (hooks written); only the persistence step is \
+         skipped; stderr=\n{stderr}"
+    );
+    let after = std::fs::read_to_string(&manifest_path).expect("manifest still present");
+    assert_eq!(
+        after, corrupt,
+        "a corrupt manifest must survive `setup --exclude` byte-identical — \
+         rewriting it destroys every patch record it may still hold; \
+         stderr=\n{stderr}"
+    );
+    // Machine-visible marker: the skip rides the envelope's warnings array,
+    // so `--json` automation cannot mistake this for a fully-persisted run.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("setup --json must emit valid JSON ({e}); stdout=\n{stdout}"));
+    assert!(
+        v["warnings"].as_array().is_some_and(|w| w.iter().any(|x| x
+            .as_str()
+            .is_some_and(|x| x.contains("not persisting --exclude")))),
+        "the skipped persistence must appear in the --json warnings; stdout=\n{stdout}"
+    );
+}
+
+/// The `--silent` contract ("errors only") suppresses the human warning —
+/// pinned here so the suppression is a decision, not an accident — while
+/// the fail-closed behavior itself must hold identically: exit 0, corrupt
+/// bytes untouched.
+#[test]
+fn exclude_persistence_fails_closed_silently_under_silent() {
+    let proj = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    write(
+        &proj.path().join("package.json"),
+        r#"{ "name": "root", "version": "1.0.0" }"#,
+    );
+    let manifest_path = proj.path().join(".socket/manifest.json");
+    let corrupt = r#"{ "patches": { "pkg:npm/left-pad@1.3.0": TRUNCATED-MID-WRITE"#;
+    write(&manifest_path, corrupt);
+
+    let mut cmd = Command::new(binary());
+    cmd.args(["setup", "--silent", "--yes", "--exclude", "packages/b"])
+        .current_dir(proj.path());
+    for (name, _) in std::env::vars() {
+        if name.starts_with("SOCKET_") && name != "SOCKET_NO_CONFIG" {
+            cmd.env_remove(name);
+        }
+    }
+    cmd.env("HOME", home.path());
+    cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
+    let out = cmd.output().expect("run socket-patch");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert_eq!(out.status.code(), Some(0), "stderr=\n{stderr}");
+    let after = std::fs::read_to_string(&manifest_path).expect("manifest still present");
+    assert_eq!(
+        after, corrupt,
+        "fail-closed must hold under --silent too; stderr=\n{stderr}"
+    );
+    assert!(
+        !stdout.contains("not persisting") && !stderr.contains("not persisting"),
+        "--silent is errors-only: the skip warning stays quiet; \
+         stdout=\n{stdout}\nstderr=\n{stderr}"
+    );
+}
+
+/// Property 9, CSV spelling: `--exclude` is comma-delimited, so
+/// `--exclude "packages/a, packages/b"` (and the `SOCKET_SETUP_EXCLUDE=a, b`
+/// form CI YAML produces) must exclude BOTH members.
+///
+/// Regression: clap splits on the comma only, so the second value reached
+/// `normalize_rel_path` as `" packages/b"`. Untrimmed it equalled no member's
+/// relative path, so the member was configured anyway — silently, with no
+/// warning that an exclusion had missed — and the unmatchable spelling was
+/// then persisted under `setup.exclude`, where every later run and every clone
+/// inherited a dead entry.
+#[test]
+fn setup_exclude_tolerates_spaces_in_the_csv_list() {
+    let proj = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    write(
+        &proj.path().join("package.json"),
+        r#"{ "name": "root", "workspaces": ["packages/*"] }"#,
+    );
+    for member in ["a", "b", "keep"] {
+        write(
+            &proj.path().join(format!("packages/{member}/package.json")),
+            &format!(r#"{{ "name": "{member}", "version": "1.0.0" }}"#),
+        );
+    }
+
+    let read = |p: PathBuf| std::fs::read_to_string(p).unwrap();
+
+    let (code, stdout) = run(
+        proj.path(),
+        home.path(),
+        &[
+            "setup",
+            "--json",
+            "--yes",
+            "--exclude",
+            "packages/a, packages/b",
+        ],
+    );
+    assert_eq!(code, 0, "scoped setup should succeed:\n{stdout}");
+
+    // Control: the run really did configure things (root + the member that was
+    // never excluded), so the assertions below cannot pass vacuously.
+    assert!(
+        read(proj.path().join("package.json")).contains("socket-patch"),
+        "the root must be configured (never excludable):\n{stdout}"
+    );
+    assert!(
+        read(proj.path().join("packages/keep/package.json")).contains("socket-patch"),
+        "the non-excluded member must be configured:\n{stdout}"
+    );
+
+    for member in ["a", "b"] {
+        let content = read(proj.path().join(format!("packages/{member}/package.json")));
+        assert!(
+            !content.contains("socket-patch"),
+            "packages/{member} was excluded on the CSV list and must NOT be \
+             configured; got:\n{content}\nstdout:\n{stdout}"
+        );
+    }
+
+    // Both spellings persist in normalized (matchable) form, so the next run
+    // and a fresh clone honor them without re-passing the flag.
+    let manifest = read(proj.path().join(".socket/manifest.json"));
+    let mv: serde_json::Value = serde_json::from_str(&manifest).expect("manifest is JSON");
+    let excl: Vec<&str> = mv["setup"]["exclude"]
+        .as_array()
+        .unwrap_or_else(|| panic!("manifest must carry setup.exclude:\n{manifest}"))
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(
+        excl,
+        vec!["packages/a", "packages/b"],
+        "the persisted set must be normalized, not the raw CSV fragments:\n{manifest}"
+    );
+}
+
+/// Property 9, subtree semantics: excluding a member excludes everything
+/// *inside* it. Discovery reaches nested manifests — a member that is itself a
+/// workspace root has its own members configured (the nested-workspace
+/// sub-property) — so an exclusion that only matched the member's own
+/// `package.json` still wired install hooks into the subtree the user asked
+/// `setup` to keep out of.
+#[test]
+fn setup_exclude_covers_manifests_nested_below_the_excluded_member() {
+    let proj = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    write(
+        &proj.path().join("package.json"),
+        r#"{ "name": "root", "workspaces": ["packages/*"] }"#,
+    );
+    // The excluded member is itself a workspace root with a nested member.
+    write(
+        &proj.path().join("packages/legacy/package.json"),
+        r#"{ "name": "legacy", "version": "1.0.0", "workspaces": ["sub/*"] }"#,
+    );
+    write(
+        &proj.path().join("packages/legacy/sub/deep/package.json"),
+        r#"{ "name": "deep", "version": "1.0.0" }"#,
+    );
+    write(
+        &proj.path().join("packages/keep/package.json"),
+        r#"{ "name": "keep", "version": "1.0.0" }"#,
+    );
+
+    let read = |p: PathBuf| std::fs::read_to_string(p).unwrap();
+
+    let (code, stdout) = run(
+        proj.path(),
+        home.path(),
+        &["setup", "--json", "--yes", "--exclude", "packages/legacy"],
+    );
+    assert_eq!(code, 0, "scoped setup should succeed:\n{stdout}");
+
+    // Control: the root and the sibling member ARE configured — proof the
+    // nested walk ran and the assertions below are not vacuous.
+    assert!(
+        read(proj.path().join("package.json")).contains("socket-patch"),
+        "the root must be configured (never excludable):\n{stdout}"
+    );
+    assert!(
+        read(proj.path().join("packages/keep/package.json")).contains("socket-patch"),
+        "the non-excluded member must be configured:\n{stdout}"
+    );
+
+    for member in ["packages/legacy", "packages/legacy/sub/deep"] {
+        let content = read(proj.path().join(member).join("package.json"));
+        assert!(
+            !content.contains("socket-patch"),
+            "{member} lies in the excluded member and must NOT be configured; \
+             got:\n{content}\nstdout:\n{stdout}"
+        );
+    }
+    assert!(
+        !stdout.contains("packages/legacy"),
+        "no manifest under the excluded member may appear in the envelope:\n{stdout}"
     );
 }

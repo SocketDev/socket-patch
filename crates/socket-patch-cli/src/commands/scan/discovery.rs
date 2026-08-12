@@ -39,7 +39,7 @@ pub(super) async fn lockfile_supplement(
     common: &GlobalArgs,
     crawled: &[socket_patch_core::crawlers::types::CrawledPackage],
 ) -> LockfileSupplement {
-    use socket_patch_core::patch::vendor::lock_inventory;
+    use socket_patch_core::vendor::lock_inventory;
 
     let mut out = LockfileSupplement::default();
     if common.global || common.global_prefix.is_some() {
@@ -99,7 +99,7 @@ pub(super) async fn vendored_ledger_supplement(
     if common.global || common.global_prefix.is_some() {
         return Vec::new();
     }
-    let Ok(state) = socket_patch_core::patch::vendor::load_state(&common.cwd).await else {
+    let Ok(state) = socket_patch_core::vendor::load_state(&common.cwd).await else {
         return Vec::new();
     };
     let crawled_norm: HashSet<String> = crawled
@@ -190,9 +190,6 @@ pub(super) fn detect_updates(
     };
     let mut updates = Vec::new();
     for pkg in packages {
-        let Some(existing) = manifest.patches.get(&pkg.purl) else {
-            continue;
-        };
         // The candidate is the top-ranked patch — the one the apply path
         // resolves to. Both sides rank with `api::ranking`, so the
         // `[UPDATE]` marker and the JSON `updates` array track what
@@ -213,6 +210,39 @@ pub(super) fn detect_updates(
         // is load-bearing for callers that build a `BatchPackagePatches`
         // themselves rather than getting one from the client.
         let Some(candidate) = pkg.patches.iter().min_by(|a, b| cmp_batch_infos(a, b)) else {
+            continue;
+        };
+        // Manifest keys are written verbatim from the *patch* purl, which
+        // the API serves percent-encoded (`pkg:npm/%40scope/...`) and, for
+        // artifact-pinned ecosystems, qualified (`?artifact_id=...`); the
+        // batch *package* purl is the crawler's literal spelling. Bridge
+        // both divergences like the lockfile-only partition does: exact hit
+        // first, then a normalized qualifier-stripped comparison.
+        //
+        // Qualifier TWINS (one package recorded under two artifact-pinned
+        // keys, e.g. a pypi wheel + sdist pair) both match the stripped
+        // comparison. `manifest.patches` is a HashMap, so a bare `find`
+        // would pick a per-process-random twin; instead: any stale twin
+        // means an update is available, so prefer the first twin (in
+        // sorted-key order, for run-to-run stability) whose uuid differs
+        // from the candidate, and fall back to the first twin when all
+        // agree.
+        let existing = manifest.patches.get(&pkg.purl).or_else(|| {
+            let want = normalize_purl(strip_purl_qualifiers(&pkg.purl));
+            let mut twins: Vec<(&String, &socket_patch_core::manifest::schema::PatchRecord)> =
+                manifest
+                    .patches
+                    .iter()
+                    .filter(|(k, _)| normalize_purl(strip_purl_qualifiers(k)) == want)
+                    .collect();
+            twins.sort_by(|a, b| a.0.cmp(b.0));
+            twins
+                .iter()
+                .find(|(_, v)| v.uuid != candidate.uuid)
+                .or_else(|| twins.first())
+                .map(|(_, v)| *v)
+        });
+        let Some(existing) = existing else {
             continue;
         };
         if candidate.uuid != existing.uuid {
@@ -382,6 +412,53 @@ mod tests {
         assert_eq!(updates[0].purl, "pkg:npm/foo@1.0");
         assert_eq!(updates[0].old_uuid, "uuid-a");
         assert_eq!(updates[0].new_uuid, "uuid-b");
+    }
+
+    #[test]
+    fn detect_updates_bridges_qualified_manifest_keys() {
+        // Manifest keys for artifact-pinned ecosystems carry qualifiers
+        // (`?artifact_id=...`); the batch purl is bare. The stripped-purl
+        // bridge must match them — decode-only would silently drop these
+        // packages from `updates[]` again.
+        let m = manifest_with(&[("pkg:pypi/foo@1.0?artifact_id=foo-1.0.tar.gz", "uuid-a")]);
+        let pkgs = vec![batch_with("pkg:pypi/foo@1.0", &["uuid-b"])];
+        let updates = detect_updates(Some(&m), &pkgs);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].old_uuid, "uuid-a");
+        assert_eq!(updates[0].new_uuid, "uuid-b");
+    }
+
+    #[test]
+    fn detect_updates_qualifier_twins_are_deterministic_any_stale_wins() {
+        // One package recorded under two artifact-pinned keys (wheel +
+        // sdist). `manifest.patches` is a HashMap, so an unordered `find`
+        // would flip between the twins per process; the contract is: any
+        // stale twin means an update, `old_uuid` names the stale one, and
+        // repeated calls agree.
+        let m = manifest_with(&[
+            (
+                "pkg:pypi/foo@1.0?artifact_id=foo-1.0-py3-none-any.whl",
+                "uuid-new",
+            ),
+            ("pkg:pypi/foo@1.0?artifact_id=foo-1.0.tar.gz", "uuid-old"),
+        ]);
+        let pkgs = vec![batch_with("pkg:pypi/foo@1.0", &["uuid-new"])];
+        for _ in 0..16 {
+            let updates = detect_updates(Some(&m), &pkgs);
+            assert_eq!(updates.len(), 1, "a stale twin means an update");
+            assert_eq!(updates[0].old_uuid, "uuid-old");
+            assert_eq!(updates[0].new_uuid, "uuid-new");
+        }
+
+        // Both twins current -> no update, regardless of iteration order.
+        let m = manifest_with(&[
+            (
+                "pkg:pypi/foo@1.0?artifact_id=foo-1.0-py3-none-any.whl",
+                "uuid-new",
+            ),
+            ("pkg:pypi/foo@1.0?artifact_id=foo-1.0.tar.gz", "uuid-new"),
+        ]);
+        assert!(detect_updates(Some(&m), &pkgs).is_empty());
     }
 
     #[test]

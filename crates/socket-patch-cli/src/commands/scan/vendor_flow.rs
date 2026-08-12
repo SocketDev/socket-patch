@@ -8,8 +8,8 @@ use socket_patch_core::api::types::{BatchPackagePatches, PatchSearchResult};
 use socket_patch_core::manifest::operations::read_manifest;
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
 use socket_patch_core::patch::apply_lock;
-use socket_patch_core::patch::vendor::{load_state, lookup_entry};
-use socket_patch_core::utils::telemetry::track_patch_vendor_failed;
+use socket_patch_core::telemetry::track_patch_vendor_failed;
+use socket_patch_core::vendor::{load_state, lookup_entry};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Duration;
@@ -23,7 +23,9 @@ use crate::commands::vendor::{
 use crate::json_envelope::{Command as EnvelopeCommand, Envelope};
 
 use super::gc::{gc_json, print_gc_vendored_line, run_apply_gc};
-use super::{discover_selected, download_params, embed_vex_into_json, ScanArgs};
+use super::{
+    discover_selected, download_params, embed_vex_into_json, emit_discovery_error_json, ScanArgs,
+};
 
 /// Dry-run preview for `scan --vendor`: classify each selected patch
 /// against the vendor ledger without touching disk or the network beyond
@@ -59,19 +61,23 @@ async fn preview_vendor_json(cwd: &Path, selected: &[PatchSearchResult]) -> serd
 /// [`download_patch_records`]; no manifest involvement at all).
 ///
 /// `Ok((has_errors, envelope))` on a run that reached the engine;
-/// `Err((code, message))` for the lock/stage/manifest failures the
-/// caller folds into its own output shape (scan's ad-hoc JSON can't use
-/// `acquire_or_emit`, which prints an Envelope).
+/// `Err((code, message, envelope))` for the lock/stage/manifest failures
+/// the caller folds into its own output shape (scan's ad-hoc JSON can't
+/// use `acquire_or_emit`, which prints an Envelope). The error carries
+/// the envelope built so far when the failure happened AFTER
+/// `reconcile_dropped` ran — the reconcile mutates the on-disk ledger,
+/// and its events must survive the error fold or the JSON consumer
+/// never learns about the mutation.
 async fn run_scan_vendor_step(
     common: &GlobalArgs,
     manifest_path: &Path,
     socket_dir: &Path,
     detached_records: Option<&HashMap<String, PatchRecord>>,
-) -> Result<(bool, Envelope), (&'static str, String)> {
+) -> Result<(bool, Envelope), (&'static str, String, Option<Box<Envelope>>)> {
     // The download phase created `.socket/` already in every flow that
     // reaches here, but `acquire` deliberately refuses to mkdir.
     if let Err(e) = tokio::fs::create_dir_all(socket_dir).await {
-        return Err(("socket_dir_unwritable", e.to_string()));
+        return Err(("socket_dir_unwritable", e.to_string(), None));
     }
     let guard = apply_lock::acquire(
         socket_dir,
@@ -81,8 +87,9 @@ async fn run_scan_vendor_step(
         apply_lock::LockError::Held => (
             "lock_held",
             "another socket-patch process is operating in this directory".to_string(),
+            None,
         ),
-        apply_lock::LockError::Io { .. } => ("lock_io", e.to_string()),
+        apply_lock::LockError::Io { .. } => ("lock_io", e.to_string(), None),
     })?;
 
     let mut env = Envelope::new(EnvelopeCommand::Vendor);
@@ -109,7 +116,7 @@ async fn run_scan_vendor_step(
                     drop(guard);
                     return Ok((false, env));
                 }
-                Err(e) => return Err(("invalid_manifest", e.to_string())),
+                Err(e) => return Err(("invalid_manifest", e.to_string(), None)),
             };
             // Same placement as the `vendor` command: dropped entries
             // are reverted even when zero in-scope patches remain.
@@ -119,14 +126,22 @@ async fn run_scan_vendor_step(
     };
     let staged =
         match stage_vendor_sources_in_memory(common, &manifest, socket_dir, &common.cwd).await {
-            Ok(MemStageOutcome::Ready(s)) => s,
-            Ok(MemStageOutcome::Unavailable) => {
+            MemStageOutcome::Ready(s) => s,
+            MemStageOutcome::Unavailable => {
+                // The reconcile above may have already reverted dropped
+                // entries on disk — hand its envelope to the error fold.
+                // Demote its status first: a fresh Envelope starts at
+                // Success and a clean reconcile leaves it there, but this
+                // run is aborting — a consumer reading `.vendor.status`
+                // inside a `"status":"error"` result must not see
+                // "success".
+                env.mark_partial_failure();
                 return Err((
                     "no_local_source",
                     "patch artifacts unavailable (offline or download failure)".to_string(),
-                ))
+                    Some(Box::new(env)),
+                ));
             }
-            Err(e) => return Err(("stage_failed", e)),
         };
     let sources = staged.as_patch_sources();
     has_errors |=
@@ -175,7 +190,10 @@ async fn run_vendor_json_path(
     .await
     {
         Ok(s) => s,
-        Err(code) => return code,
+        Err((code, message)) => {
+            emit_discovery_error_json(result, &message);
+            return code;
+        }
     };
 
     if args.common.dry_run {
@@ -275,7 +293,7 @@ async fn run_vendor_json_path(
                 serde_json::to_value(&venv).unwrap_or_else(|_| serde_json::json!({}));
             i32::from(has_errors)
         }
-        Err((code, message)) => {
+        Err((code, message, venv)) => {
             track_patch_vendor_failed(
                 &message,
                 args.common.dry_run,
@@ -283,6 +301,13 @@ async fn run_vendor_json_path(
                 telemetry_org,
             )
             .await;
+            // A pre-failure reconcile already mutated the ledger on disk;
+            // its envelope (events included) must reach the JSON consumer
+            // even though the run aborts here.
+            if let Some(venv) = venv {
+                result["vendor"] =
+                    serde_json::to_value(&*venv).unwrap_or_else(|_| serde_json::json!({}));
+            }
             result["status"] = serde_json::json!("error");
             result["error"] = serde_json::json!({
                 "code": code,
@@ -373,7 +398,10 @@ async fn run_vendor_interactive_path(
             .await;
             i32::from(has_errors)
         }
-        Err((code, message)) => {
+        // Human mode prints no per-event lines even on success, so the
+        // carried envelope has no human rendering to feed — JSON mode is
+        // where the reconcile events must survive (see the JSON fold above).
+        Err((code, message, _venv)) => {
             track_patch_vendor_failed(
                 &message,
                 args.common.dry_run,
@@ -529,7 +557,11 @@ fn boxed_scan_vendor_step<'a>(
     socket_dir: &'a Path,
     detached_records: Option<&'a HashMap<String, PatchRecord>>,
 ) -> std::pin::Pin<
-    Box<dyn std::future::Future<Output = Result<(bool, Envelope), (&'static str, String)>> + 'a>,
+    Box<
+        dyn std::future::Future<
+                Output = Result<(bool, Envelope), (&'static str, String, Option<Box<Envelope>>)>,
+            > + 'a,
+    >,
 > {
     Box::pin(run_scan_vendor_step(
         common,

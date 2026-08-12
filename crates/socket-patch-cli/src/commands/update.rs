@@ -16,7 +16,7 @@ use socket_patch_core::update::{
 
 use crate::args::{apply_env_toggles, parse_bool_flag, GlobalArgs};
 use crate::commands::lock_cli::error_envelope;
-use crate::json_envelope::{Command, Envelope, PatchAction, PatchEvent};
+use crate::json_envelope::{Command, Envelope, PatchAction, PatchEvent, RunWarning};
 use crate::output;
 
 /// The target triple this binary was compiled for, embedded by `build.rs`.
@@ -77,9 +77,32 @@ fn fail(args: &UpdateArgs, code: &str, message: &str) -> i32 {
     1
 }
 
+/// Record a non-fatal advisory: stderr for humans, `warnings[]` on the
+/// envelope for machines. `--json` suppresses the stderr line (stdout is
+/// the machine channel and stderr must stay clean), so a warning that only
+/// ever went to stderr would vanish entirely for JSON consumers — the
+/// managed-install override in particular is the "your package manager
+/// will silently revert this" signal, and a silent override is the bug
+/// class the channel suite exists to catch. Same stderr-or-envelope
+/// split `vendor`/`remove` use for their run-level advisories (the
+/// rendered stderr line keeps update's own `Warning: <detail>` wording).
+fn note_warning(warnings: &mut Vec<RunWarning>, quiet: bool, code: &str, detail: String) {
+    if !quiet {
+        eprintln!("Warning: {detail}");
+    }
+    warnings.push(RunWarning {
+        code: code.to_string(),
+        detail,
+    });
+}
+
 pub async fn run(args: UpdateArgs) -> i32 {
     apply_env_toggles(&args.common);
     let quiet = args.common.json || args.common.silent;
+    // Advisories collected as the run proceeds; attached to whichever
+    // envelope is emitted (the managed-install one lands long before the
+    // envelope exists).
+    let mut warnings: Vec<RunWarning> = Vec::new();
 
     // 1. Offline gate first — strict airgap refuses before any client
     //    exists, and --force does not bypass it (matching scan/get).
@@ -100,13 +123,16 @@ pub async fn run(args: UpdateArgs) -> i32 {
     let channel = detect_channel(&install_path, &ChannelEnv::from_env());
     if channel != InstallChannel::Standalone {
         if args.force {
-            if !quiet {
-                eprintln!(
-                    "Warning: this install is managed by {} — its next upgrade will overwrite \
+            note_warning(
+                &mut warnings,
+                quiet,
+                "managed_install_override",
+                format!(
+                    "this install is managed by {} — its next upgrade will overwrite \
                      the updated binary.",
                     channel_label(channel)
-                );
-            }
+                ),
+            );
         } else {
             return fail(
                 &args,
@@ -183,6 +209,7 @@ pub async fn run(args: UpdateArgs) -> i32 {
                         "path": install_path.display().to_string(),
                     })),
             );
+            env.warnings = warnings;
             println!("{}", env.to_pretty_json());
         } else if !args.common.silent {
             println!("{msg}");
@@ -210,6 +237,7 @@ pub async fn run(args: UpdateArgs) -> i32 {
                         "latest": target_version.to_string(),
                     })),
             );
+            env.warnings = warnings;
             println!("{}", env.to_pretty_json());
         } else if !args.common.silent {
             println!("{msg}");
@@ -250,10 +278,8 @@ pub async fn run(args: UpdateArgs) -> i32 {
         }
     };
 
-    if !quiet {
-        for warning in &outcome.warnings {
-            eprintln!("Warning: {warning}");
-        }
+    for warning in &outcome.warnings {
+        note_warning(&mut warnings, quiet, "update_warning", warning.clone());
     }
 
     if args.common.json {
@@ -273,6 +299,7 @@ pub async fn run(args: UpdateArgs) -> i32 {
                 "target": UPDATE_TARGET,
             })),
         );
+        env.warnings = warnings;
         println!("{}", env.to_pretty_json());
     } else if !args.common.silent {
         println!(

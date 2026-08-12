@@ -8,12 +8,12 @@ use socket_patch_core::manifest::schema::{PatchFileInfo, PatchManifest, PatchRec
 use socket_patch_core::patch::apply::{
     apply_package_patch, verify_file_patch, ApplyResult, MismatchPolicy, PatchSources, VerifyStatus,
 };
-use socket_patch_core::patch::go_redirect::{
+use socket_patch_core::patch::redirect::golang_local::{
     apply_go_redirect, reconcile_go_redirects, verify_go_redirect_state,
 };
+use socket_patch_core::telemetry::{track_patch_applied, track_patch_apply_failed};
 use socket_patch_core::utils::purl::parse_golang_purl;
 use socket_patch_core::utils::purl::{normalize_purl, strip_purl_qualifiers};
-use socket_patch_core::utils::telemetry::{track_patch_applied, track_patch_apply_failed};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -268,7 +268,7 @@ async fn try_local_go_apply(
             version,
             pkg_path,
             &common.cwd,
-            socket_patch_core::patch::go_mod_edit::GO_PATCHES_DIR,
+            socket_patch_core::vendor::go_mod_edit::GO_PATCHES_DIR,
             &patch.files,
             sources,
             Some(&patch.uuid),
@@ -339,12 +339,12 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
     let mut checked: usize = 0;
 
     {
-        use socket_patch_core::patch::go_redirect::Drift as GoDrift;
+        use socket_patch_core::patch::redirect::golang_local::Drift as GoDrift;
         if go_in_local_scope(&args.common) {
             // Vendored modules are excluded: their replace directives point at
             // `.socket/vendor/golang/` (the verify engine skips Vendor-owned
             // entries) and their state is audited by `vendor`, not `--check`.
-            let vendored = socket_patch_core::patch::vendor::load_state(&args.common.cwd)
+            let vendored = socket_patch_core::vendor::load_state(&args.common.cwd)
                 .await
                 .map(|s| {
                     s.entries
@@ -474,7 +474,7 @@ pub(crate) fn variant_matches_installed(first_file_status: Option<&VerifyStatus>
 /// files) means nothing can disqualify the variant. Mirrors the
 /// representative pick in core's
 /// [`select_installed_variants`](socket_patch_core::patch::apply::select_installed_variants).
-fn representative_file(
+pub(crate) fn representative_file(
     files: &HashMap<String, PatchFileInfo>,
 ) -> Option<(&String, &PatchFileInfo)> {
     files
@@ -650,7 +650,10 @@ pub async fn run(args: ApplyArgs) -> i32 {
             // install cache by default. The CoW guard handles the
             // safety; this is informational only.
         }
-        _ => {}
+        // Exhaustive on purpose (no `_`): a new package-manager layout must
+        // make an explicit appearance here — silence is a decision, not a
+        // default.
+        NpmPkgManager::Npm | NpmPkgManager::YarnClassic | NpmPkgManager::Unknown => {}
     }
 
     match apply_patches_inner(&args, &manifest_path).await {
@@ -1002,8 +1005,7 @@ async fn apply_patches_inner(
     // by ledger key, resolved base purl, or qualifier-stripped key so
     // release-variant manifest keys (pypi `?artifact_id=`…) hit too;
     // unreadable state degrades to "nothing vendored" (fail-open).
-    let vendored_purls =
-        socket_patch_core::patch::vendor::vendored_purl_keys(&args.common.cwd).await;
+    let vendored_purls = socket_patch_core::vendor::vendored_purl_keys(&args.common.cwd).await;
     let is_vendored =
         |p: &str| vendored_purls.contains(p) || vendored_purls.contains(strip_purl_qualifiers(p));
     let (mut results, mut matched_manifest_purls, vendored_bases) =

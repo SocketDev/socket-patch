@@ -120,7 +120,9 @@ fn in_ci() -> bool {
     if !ci.is_empty() && !matches!(ci.trim().to_ascii_lowercase().as_str(), "0" | "false") {
         return true;
     }
-    !std::env::var("GITHUB_ACTIONS").unwrap_or_default().is_empty()
+    !std::env::var("GITHUB_ACTIONS")
+        .unwrap_or_default()
+        .is_empty()
 }
 
 impl GuardCtx {
@@ -295,19 +297,30 @@ pub async fn finish(notifier: Option<Notifier>) {
     }
     let now = core_update::unix_now();
     if !core_update::notice_is_due(notifier.last_notified_at, now) {
-        debug_log(notifier.debug, "update pending but notice already shown today");
+        debug_log(
+            notifier.debug,
+            "update pending but notice already shown today",
+        );
         return;
     }
 
     eprintln!(
         "{}",
-        format_notice(&current, &latest, upgrade_command(), output::stderr_is_tty())
+        format_notice(
+            &current,
+            &latest,
+            upgrade_command(),
+            output::stderr_is_tty()
+        )
     );
 
     let mut state = core_update::load_state();
     state.last_notified_at = Some(now);
     if let Err(e) = core_update::save_state(&state).await {
-        debug_log(notifier.debug, &format!("could not persist notice time: {e}"));
+        debug_log(
+            notifier.debug,
+            &format!("could not persist notice time: {e}"),
+        );
     }
 }
 
@@ -332,7 +345,8 @@ mod tests {
     fn guard_precedence_table() {
         // (mutation, expected outcome) — the full precedence contract in
         // one table. e2e spot-checks a subset of rows end-to-end.
-        let cases: &[(&str, fn(&mut GuardCtx), Result<(), SkipReason>)] = &[
+        type GuardCase = (&'static str, fn(&mut GuardCtx), Result<(), SkipReason>);
+        let cases: &[GuardCase] = &[
             ("all open", |_| {}, Ok(())),
             ("opt-out", |c| c.opted_out = true, Err(SkipReason::OptedOut)),
             (

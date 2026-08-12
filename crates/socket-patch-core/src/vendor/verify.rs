@@ -1,0 +1,789 @@
+//! Verification of vendored patches for VEX attestation and drift audits.
+//!
+//! A vendored patch is attested only on **positive file-level evidence**: the
+//! committed artifact must exist at its uuid-keyed path and every file the
+//! manifest claims the patch modified must hash (git-blob sha256) to its
+//! `afterHash` inside that artifact — the same standard `vex::verify` applies
+//! to installed trees. Dir-shaped ecosystems are hashed in place; npm
+//! tarballs and pypi wheels are decoded in memory (bounded — the artifacts
+//! are committed and tamper-able, so a crafted archive must not OOM an
+//! audit).
+//!
+//! Fail-closed order (each failure is a stable snake_case routing tag):
+//! `no_files` → `vendor_path_unsafe` → `vendor_uuid_mismatch` →
+//! `vendor_artifact_missing` → `vendor_artifact_unreadable` /
+//! `file_not_found` / `vendor_hash_mismatch`.
+
+use std::collections::HashMap;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+
+use crate::hash::git_sha256::compute_git_sha256_from_bytes;
+use crate::manifest::schema::PatchRecord;
+use crate::patch::apply::{normalize_file_path, verify_file_patch, VerifyStatus};
+use crate::patch::package::read_archive_to_map;
+
+use super::path::parse_vendor_path;
+use super::state::VendorEntry;
+
+/// Hard cap on decompressed wheel bytes, mirroring
+/// `patch::package`'s bomb posture for patch archives.
+const MAX_WHEEL_DECOMPRESSED_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_WHEEL_ENTRIES: usize = 10_000;
+
+/// Validate `entry.artifact.path` and resolve it under `project_root`.
+///
+/// SECURITY: state.json is committed and tamper-able. The artifact path is
+/// about to be stat'd/read/hashed, so it must (a) parse as a canonical
+/// vendored path (which validates the uuid grammar), (b) be relative with no
+/// `..`/absolute/NUL components, and (c) carry the uuid of the patch record
+/// being attested — a poisoned path must neither read outside the project
+/// tree nor launder one patch's artifact into another's attestation.
+fn checked_artifact_path(
+    project_root: &Path,
+    entry: &VendorEntry,
+    record: &PatchRecord,
+) -> Result<PathBuf, String> {
+    let rel = &entry.artifact.path;
+    let parts = parse_vendor_path(rel).ok_or_else(|| "vendor_path_unsafe".to_string())?;
+    let norm = rel.replace('\\', "/");
+    if norm.starts_with('/')
+        || norm.contains('\0')
+        || !norm.starts_with(".socket/vendor/")
+        || norm.split('/').any(|seg| seg == ".." || seg.is_empty())
+    {
+        return Err("vendor_path_unsafe".to_string());
+    }
+    // Stale-vendor detection: the path-level uuid IS the staleness signal —
+    // a patch update changes record.uuid, so an artifact still sitting at the
+    // old uuid path must not attest the new patch.
+    if parts.uuid != record.uuid || entry.uuid != record.uuid {
+        return Err("vendor_uuid_mismatch".to_string());
+    }
+    Ok(project_root.join(norm))
+}
+
+/// `Ok(())` iff every `record.files` entry hashes to its `afterHash` inside
+/// the vendored artifact named by `entry`. The error is a stable routing tag
+/// (see module docs) compatible with `vex::verify::FailedPatch.reason`.
+pub async fn verify_vendored_patch_record(
+    project_root: &Path,
+    entry: &VendorEntry,
+    record: &PatchRecord,
+) -> Result<(), String> {
+    if record.files.is_empty() {
+        // Same contract as vex::verify: nothing to hash ⇒ never attested.
+        return Err("no_files".to_string());
+    }
+
+    let artifact = checked_artifact_path(project_root, entry, record)?;
+    if tokio::fs::metadata(&artifact).await.is_err() {
+        return Err("vendor_artifact_missing".to_string());
+    }
+
+    // Archive-shaped artifacts are decoded in memory and their members hashed:
+    // npm tarballs via the bomb-capped patch-archive reader (it strips the
+    // `package/` prefix, matching `normalize_file_path`'d keys); `.whl` /
+    // `.nupkg` (a plain OPC zip) / `.jar` (a plain zip) via the bounded zip
+    // reader — their member paths are package-relative, exactly the manifest
+    // key space. Everything else is a dir-shaped copy hashed in place.
+    let path_str = artifact.to_string_lossy();
+    let is_tarball = path_str.ends_with(".tgz") || path_str.ends_with(".tar.gz");
+    let is_zip =
+        path_str.ends_with(".whl") || path_str.ends_with(".nupkg") || path_str.ends_with(".jar");
+    if !is_tarball && !is_zip {
+        return verify_dir_members(&artifact, record).await;
+    }
+    let map = tokio::task::spawn_blocking(move || {
+        if is_tarball {
+            read_archive_to_map(&artifact).map_err(|_| "vendor_artifact_unreadable".to_string())
+        } else {
+            read_wheel_to_map(&artifact)
+        }
+    })
+    .await
+    .map_err(|_| "vendor_artifact_unreadable".to_string())??;
+    verify_member_map(&map, record)
+}
+
+/// Dir-shaped ecosystems (cargo/golang/composer/gem): hash files in place,
+/// reusing the hardened per-file verifier (it normalizes manifest keys and
+/// fail-closes on path-escaping keys).
+async fn verify_dir_members(dir: &Path, record: &PatchRecord) -> Result<(), String> {
+    for (file_name, info) in &record.files {
+        let result = verify_file_patch(dir, file_name, info).await;
+        match result.status {
+            VerifyStatus::AlreadyPatched => continue,
+            VerifyStatus::Ready | VerifyStatus::HashMismatch => {
+                return Err("vendor_hash_mismatch".to_string())
+            }
+            VerifyStatus::NotFound => return Err("file_not_found".to_string()),
+        }
+    }
+    Ok(())
+}
+
+fn read_wheel_to_map(whl: &Path) -> Result<HashMap<String, Vec<u8>>, String> {
+    // Open non-blockingly and require a regular file: a FIFO planted at the
+    // artifact path would otherwise wedge the audit in `open(2)` waiting for
+    // a writer that never comes (mirrors `read_archive_to_map`; O_NONBLOCK
+    // has no effect on regular-file reads).
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(whl)
+            .map_err(|_| "vendor_artifact_unreadable".to_string())?
+    };
+    #[cfg(not(unix))]
+    let file = std::fs::File::open(whl).map_err(|_| "vendor_artifact_unreadable".to_string())?;
+    if !file.metadata().map(|m| m.is_file()).unwrap_or(false) {
+        return Err("vendor_artifact_unreadable".to_string());
+    }
+    let mut zip =
+        zip::ZipArchive::new(file).map_err(|_| "vendor_artifact_unreadable".to_string())?;
+    if zip.len() > MAX_WHEEL_ENTRIES {
+        return Err("vendor_artifact_unreadable".to_string());
+    }
+    let mut out = HashMap::new();
+    let mut declared: u64 = 0;
+    let mut actual: u64 = 0;
+    for i in 0..zip.len() {
+        let mut entry = zip
+            .by_index(i)
+            .map_err(|_| "vendor_artifact_unreadable".to_string())?;
+        if !entry.is_file() {
+            continue;
+        }
+        // SECURITY: bound the cumulative decompressed size — a
+        // committed-but-tampered wheel must not balloon an audit's memory.
+        // The declared `entry.size()` is header data the attacker controls
+        // and the zip reader never enforces, so the binding budget is bytes
+        // ACTUALLY decompressed; the declared check just fails honest
+        // oversized wheels before reading anything.
+        declared = declared.saturating_add(entry.size());
+        if declared > MAX_WHEEL_DECOMPRESSED_BYTES {
+            return Err("vendor_artifact_unreadable".to_string());
+        }
+        let name = entry.name().to_string();
+        let mut bytes = Vec::new();
+        // +1 so an entry that would exceed the remaining budget reads one
+        // byte past it and is rejected, rather than truncating silently.
+        entry
+            .by_ref()
+            .take(MAX_WHEEL_DECOMPRESSED_BYTES - actual + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| "vendor_artifact_unreadable".to_string())?;
+        actual = actual.saturating_add(bytes.len() as u64);
+        if actual > MAX_WHEEL_DECOMPRESSED_BYTES {
+            return Err("vendor_artifact_unreadable".to_string());
+        }
+        out.insert(name, bytes);
+    }
+    Ok(out)
+}
+
+/// Hard cap on whole-artifact bytes hashed by the health check — committed
+/// artifacts are small (a package tarball/wheel); a tampered multi-GiB file
+/// must not stall `repair`.
+const MAX_HEALTH_HASH_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Classified health of one ledger entry's committed artifact, for
+/// `repair`-style callers that need a DECISION (rebuild or not), not just a
+/// routing tag.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArtifactHealth {
+    /// Exists and every record file hashes to its afterHash (and, for
+    /// file-shaped artifacts, the whole file matches the ledger sha256).
+    Healthy,
+    /// Nothing at the artifact path: rebuildable.
+    Missing,
+    /// Present but failing verification: rebuildable. `reason` is the
+    /// stable routing tag (`vendor_hash_mismatch`, `file_not_found`,
+    /// `vendor_artifact_unreadable`, `vendor_sha256_mismatch`).
+    Corrupt { reason: String },
+    /// The ledger/artifact uuid doesn't match the record: a re-vendor is
+    /// pending — not repair's job.
+    StaleUuid,
+    /// The entry can't be judged (poisoned path, empty record): fail
+    /// closed, never rebuild from it.
+    Unverifiable { reason: String },
+}
+
+/// Health-check one vendored artifact against its patch record: the
+/// per-file afterHash verification of [`verify_vendored_patch_record`]
+/// plus, for file-shaped artifacts (`.tgz`/`.tar.gz`/`.whl`) with a
+/// recorded ledger sha256, a whole-file hash cross-check — the rewired
+/// lockfile integrity references those exact bytes, so silent drift breaks
+/// the package manager even when the patched members still verify.
+pub async fn check_vendored_artifact(
+    project_root: &Path,
+    entry: &VendorEntry,
+    record: &PatchRecord,
+) -> ArtifactHealth {
+    match verify_vendored_patch_record(project_root, entry, record).await {
+        Err(tag) => match tag.as_str() {
+            "vendor_artifact_missing" => ArtifactHealth::Missing,
+            "vendor_uuid_mismatch" => ArtifactHealth::StaleUuid,
+            "vendor_hash_mismatch" | "file_not_found" | "vendor_artifact_unreadable" => {
+                ArtifactHealth::Corrupt { reason: tag }
+            }
+            _ => ArtifactHealth::Unverifiable { reason: tag },
+        },
+        Ok(()) => {
+            let norm = entry.artifact.path.replace('\\', "/");
+            // `.nupkg` (NuGet) and `.jar` (Maven) are single committed files
+            // whose recorded ledger sha256 the rewired lockfile / `.sha1`
+            // sidecar references, so they get the same whole-file drift
+            // cross-check as tarballs/wheels.
+            let file_shaped = norm.ends_with(".tgz")
+                || norm.ends_with(".tar.gz")
+                || norm.ends_with(".whl")
+                || norm.ends_with(".nupkg")
+                || norm.ends_with(".jar");
+            if !file_shaped || entry.artifact.sha256.is_empty() {
+                return ArtifactHealth::Healthy;
+            }
+            // The path already passed checked_artifact_path inside the
+            // verification above.
+            match file_sha256_hex(&project_root.join(&norm)).await {
+                Some(hex) if hex.eq_ignore_ascii_case(&entry.artifact.sha256) => {
+                    ArtifactHealth::Healthy
+                }
+                Some(_) => ArtifactHealth::Corrupt {
+                    reason: "vendor_sha256_mismatch".to_string(),
+                },
+                None => ArtifactHealth::Corrupt {
+                    reason: "vendor_artifact_unreadable".to_string(),
+                },
+            }
+        }
+    }
+}
+
+/// Plain sha256 hex of a regular file, size-capped; `None` on any read
+/// failure or cap breach. Public for repair's ledger re-synthesis (the
+/// rebuilt artifact's recorded sha).
+pub async fn file_sha256_hex(path: &Path) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    use tokio::io::AsyncReadExt;
+
+    let meta = tokio::fs::metadata(path).await.ok()?;
+    if !meta.is_file() || meta.len() > MAX_HEALTH_HASH_BYTES {
+        return None;
+    }
+    let mut file = tokio::fs::File::open(path).await.ok()?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf).await.ok()?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Some(hex::encode(hasher.finalize()))
+}
+
+fn verify_member_map(
+    members: &HashMap<String, Vec<u8>>,
+    record: &PatchRecord,
+) -> Result<(), String> {
+    for (file_name, info) in &record.files {
+        let key = normalize_file_path(file_name);
+        let bytes = members
+            .get(key)
+            .or_else(|| members.get(file_name.as_str()))
+            .ok_or_else(|| "file_not_found".to_string())?;
+        let hash = compute_git_sha256_from_bytes(bytes);
+        if !hash.eq_ignore_ascii_case(&info.after_hash) {
+            return Err("vendor_hash_mismatch".to_string());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::manifest::schema::PatchFileInfo;
+    use crate::vendor::state::VendorArtifact;
+    use flate2::write::GzEncoder;
+    use std::io::Write;
+
+    const UUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
+    const PATCHED: &[u8] = b"patched bytes\n";
+
+    fn record(uuid: &str, file_key: &str) -> PatchRecord {
+        let mut files = HashMap::new();
+        files.insert(
+            file_key.to_string(),
+            PatchFileInfo {
+                before_hash: "b".into(),
+                after_hash: compute_git_sha256_from_bytes(PATCHED),
+            },
+        );
+        PatchRecord {
+            uuid: uuid.to_string(),
+            exported_at: "t".into(),
+            files,
+            vulnerabilities: HashMap::new(),
+            description: String::new(),
+            license: String::new(),
+            tier: String::new(),
+        }
+    }
+
+    fn entry(eco: &str, uuid: &str, rel_path: &str) -> VendorEntry {
+        VendorEntry {
+            ecosystem: eco.into(),
+            base_purl: "pkg:npm/x@1.0.0".into(),
+            uuid: uuid.into(),
+            artifact: VendorArtifact {
+                path: rel_path.into(),
+                sha256: String::new(),
+                size: None,
+                platform_locked: None,
+            },
+            wiring: Vec::new(),
+            lock: None,
+            took_over_go_patches: false,
+            detached: false,
+            record: None,
+            flavor: None,
+            uv: None,
+            pnpm: None,
+            poetry: None,
+            pdm: None,
+            pipenv: None,
+        }
+    }
+
+    fn write_tgz(dest: &Path, member: &str, bytes: &[u8]) {
+        let mut builder = tar::Builder::new(GzEncoder::new(
+            std::fs::File::create(dest).unwrap(),
+            flate2::Compression::new(6),
+        ));
+        let mut header = tar::Header::new_gnu();
+        header.set_size(bytes.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder.append_data(&mut header, member, bytes).unwrap();
+        builder.into_inner().unwrap().finish().unwrap();
+    }
+
+    fn write_whl(dest: &Path, member: &str, bytes: &[u8]) {
+        let file = std::fs::File::create(dest).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file::<_, ()>(member, Default::default()).unwrap();
+        zip.write_all(bytes).unwrap();
+        zip.finish().unwrap();
+    }
+
+    #[tokio::test]
+    async fn dir_artifact_verifies_and_detects_tamper() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let rel = format!(".socket/vendor/cargo/{UUID}/serde-1.0.0");
+        let dir = root.join(&rel);
+        tokio::fs::create_dir_all(dir.join("src")).await.unwrap();
+        tokio::fs::write(dir.join("src/lib.rs"), PATCHED)
+            .await
+            .unwrap();
+
+        let rec = record(UUID, "src/lib.rs");
+        let ent = entry("cargo", UUID, &rel);
+        assert!(verify_vendored_patch_record(root, &ent, &rec).await.is_ok());
+
+        tokio::fs::write(dir.join("src/lib.rs"), b"tampered")
+            .await
+            .unwrap();
+        assert_eq!(
+            verify_vendored_patch_record(root, &ent, &rec)
+                .await
+                .unwrap_err(),
+            "vendor_hash_mismatch"
+        );
+
+        tokio::fs::remove_file(dir.join("src/lib.rs"))
+            .await
+            .unwrap();
+        assert_eq!(
+            verify_vendored_patch_record(root, &ent, &rec)
+                .await
+                .unwrap_err(),
+            "file_not_found"
+        );
+    }
+
+    #[tokio::test]
+    async fn tarball_members_verified_with_package_prefix_keys() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let rel = format!(".socket/vendor/npm/{UUID}/x-1.0.0.tgz");
+        tokio::fs::create_dir_all(root.join(format!(".socket/vendor/npm/{UUID}")))
+            .await
+            .unwrap();
+        write_tgz(&root.join(&rel), "package/index.js", PATCHED);
+
+        // Manifest npm keys carry the package/ prefix.
+        let rec = record(UUID, "package/index.js");
+        let ent = entry("npm", UUID, &rel);
+        assert!(verify_vendored_patch_record(root, &ent, &rec).await.is_ok());
+
+        // One tampered byte inside the archive flips the verdict.
+        write_tgz(&root.join(&rel), "package/index.js", b"tampered");
+        assert_eq!(
+            verify_vendored_patch_record(root, &ent, &rec)
+                .await
+                .unwrap_err(),
+            "vendor_hash_mismatch"
+        );
+
+        // Member missing entirely.
+        write_tgz(&root.join(&rel), "package/other.js", PATCHED);
+        assert_eq!(
+            verify_vendored_patch_record(root, &ent, &rec)
+                .await
+                .unwrap_err(),
+            "file_not_found"
+        );
+
+        // Truncated/corrupt gzip is unreadable, not a crash.
+        tokio::fs::write(root.join(&rel), b"\x1f\x8b00garbage")
+            .await
+            .unwrap();
+        assert_eq!(
+            verify_vendored_patch_record(root, &ent, &rec)
+                .await
+                .unwrap_err(),
+            "vendor_artifact_unreadable"
+        );
+    }
+
+    #[tokio::test]
+    async fn wheel_members_verified() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let rel = format!(".socket/vendor/pypi/{UUID}/six-1.16.0-py2.py3-none-any.whl");
+        tokio::fs::create_dir_all(root.join(format!(".socket/vendor/pypi/{UUID}")))
+            .await
+            .unwrap();
+        write_whl(&root.join(&rel), "six.py", PATCHED);
+
+        let rec = record(UUID, "six.py");
+        let ent = entry("pypi", UUID, &rel);
+        assert!(verify_vendored_patch_record(root, &ent, &rec).await.is_ok());
+
+        write_whl(&root.join(&rel), "six.py", b"tampered");
+        assert_eq!(
+            verify_vendored_patch_record(root, &ent, &rec)
+                .await
+                .unwrap_err(),
+            "vendor_hash_mismatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn nupkg_and_jar_members_verified_as_zip() {
+        // `.nupkg` (NuGet) and `.jar` (Maven) are single committed zip files
+        // routed through the wheel zip reader. Exercise both suffix arms:
+        // member verify + tamper detection + the file-shaped sha256 drift
+        // cross-check in check_vendored_artifact.
+        let cases: &[(&str, &str, &str)] = &[
+            ("nuget", "newtonsoft.json.13.0.3.nupkg", "LICENSE.md"),
+            ("maven", "commons-text-1.10.0.jar", "META-INF/NOTICE.txt"),
+        ];
+        for (eco, leaf, member) in cases {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path();
+            let rel = format!(".socket/vendor/{eco}/{UUID}/{leaf}");
+            tokio::fs::create_dir_all(root.join(format!(".socket/vendor/{eco}/{UUID}")))
+                .await
+                .unwrap();
+            write_whl(&root.join(&rel), member, PATCHED);
+
+            let rec = record(UUID, member);
+            let ent = entry(eco, UUID, &rel);
+            assert!(
+                verify_vendored_patch_record(root, &ent, &rec).await.is_ok(),
+                "{eco}: patched member verifies"
+            );
+
+            // A matching ledger sha256 → Healthy through the file-shaped path.
+            let bytes = tokio::fs::read(root.join(&rel)).await.unwrap();
+            let mut ent_sha = entry(eco, UUID, &rel);
+            ent_sha.artifact.sha256 = {
+                use sha2::{Digest, Sha256};
+                hex::encode(Sha256::digest(&bytes))
+            };
+            assert_eq!(
+                check_vendored_artifact(root, &ent_sha, &rec).await,
+                ArtifactHealth::Healthy,
+                "{eco}: matching ledger sha256 is Healthy"
+            );
+
+            // Whole-file drift the member check can't see (members still
+            // verify, but the recorded sha differs).
+            ent_sha.artifact.sha256 = "0".repeat(64);
+            assert_eq!(
+                check_vendored_artifact(root, &ent_sha, &rec).await,
+                ArtifactHealth::Corrupt {
+                    reason: "vendor_sha256_mismatch".to_string()
+                },
+                "{eco}: file-shaped sha256 drift is Corrupt"
+            );
+
+            // Member tamper flips the per-file verdict.
+            write_whl(&root.join(&rel), member, b"tampered");
+            assert_eq!(
+                verify_vendored_patch_record(root, &ent, &rec)
+                    .await
+                    .unwrap_err(),
+                "vendor_hash_mismatch",
+                "{eco}: tampered member detected"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn fail_closed_ordering_and_guards() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let rel = format!(".socket/vendor/npm/{UUID}/x-1.0.0.tgz");
+
+        // no_files first.
+        let mut rec = record(UUID, "package/index.js");
+        rec.files.clear();
+        let ent = entry("npm", UUID, &rel);
+        assert_eq!(
+            verify_vendored_patch_record(root, &ent, &rec)
+                .await
+                .unwrap_err(),
+            "no_files"
+        );
+
+        // SECURITY: poisoned state.json paths never stat/read outside the
+        // project tree — rejected before any disk access.
+        let rec = record(UUID, "package/index.js");
+        let escape = format!(".socket/vendor/npm/{UUID}/../../../escape.tgz");
+        for bad in [
+            "/etc/passwd",
+            "../../outside.tgz",
+            escape.as_str(),
+            ".socket/vendor/npm/not-a-uuid/x.tgz",
+        ] {
+            let ent = entry("npm", UUID, bad);
+            assert_eq!(
+                verify_vendored_patch_record(root, &ent, &rec)
+                    .await
+                    .unwrap_err(),
+                "vendor_path_unsafe",
+                "path {bad} must be rejected"
+            );
+        }
+
+        // Stale vendor: artifact still at the OLD uuid while the record moved on.
+        let new_uuid = "11111111-2222-4333-8444-555555555555";
+        let rec_new = record(new_uuid, "package/index.js");
+        let ent_old = entry("npm", UUID, &rel);
+        assert_eq!(
+            verify_vendored_patch_record(root, &ent_old, &rec_new)
+                .await
+                .unwrap_err(),
+            "vendor_uuid_mismatch"
+        );
+
+        // Missing artifact (path fine, uuid fine, nothing on disk).
+        let ent = entry("npm", UUID, &rel);
+        let rec = record(UUID, "package/index.js");
+        assert_eq!(
+            verify_vendored_patch_record(root, &ent, &rec)
+                .await
+                .unwrap_err(),
+            "vendor_artifact_missing"
+        );
+    }
+
+    /// Rewrite every declared uncompressed size in `zip_path` (central
+    /// directory AND local headers) to 0, leaving compressed data and CRCs
+    /// intact — the header lie a tampered wheel uses to slip a decompression
+    /// bomb past size accounting that trusts `entry.size()`.
+    fn zero_declared_sizes(zip_path: &Path) {
+        let mut bytes = std::fs::read(zip_path).unwrap();
+        let eocd = bytes.len() - 22;
+        assert_eq!(&bytes[eocd..eocd + 4], b"PK\x05\x06", "EOCD not found");
+        let cd_count = u16::from_le_bytes([bytes[eocd + 10], bytes[eocd + 11]]) as usize;
+        let mut off = u32::from_le_bytes(bytes[eocd + 16..eocd + 20].try_into().unwrap()) as usize;
+        for _ in 0..cd_count {
+            assert_eq!(
+                &bytes[off..off + 4],
+                b"PK\x01\x02",
+                "central header not found"
+            );
+            let name_len = u16::from_le_bytes([bytes[off + 28], bytes[off + 29]]) as usize;
+            let extra_len = u16::from_le_bytes([bytes[off + 30], bytes[off + 31]]) as usize;
+            let comment_len = u16::from_le_bytes([bytes[off + 32], bytes[off + 33]]) as usize;
+            let lho = u32::from_le_bytes(bytes[off + 42..off + 46].try_into().unwrap()) as usize;
+            bytes[off + 24..off + 28].fill(0);
+            assert_eq!(
+                &bytes[lho..lho + 4],
+                b"PK\x03\x04",
+                "local header not found"
+            );
+            bytes[lho + 22..lho + 26].fill(0);
+            off += 46 + name_len + extra_len + comment_len;
+        }
+        std::fs::write(zip_path, bytes).unwrap();
+    }
+
+    /// SECURITY: the declared `entry.size()` is attacker-controlled header
+    /// data the zip reader never enforces — accounting must budget by bytes
+    /// ACTUALLY decompressed, or a wheel declaring 0 everywhere buffers up to
+    /// 64 MiB × 10_000 entries into the audit's memory.
+    #[test]
+    fn wheel_bomb_with_lying_declared_sizes_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let whl = tmp.path().join("bomb-1.0.0-py3-none-any.whl");
+        // 5 × 16 MiB of zeros = 80 MiB actual (over the 64 MiB cap), a few
+        // KiB compressed; every header then claims 0 uncompressed bytes.
+        let file = std::fs::File::create(&whl).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let member = vec![0u8; 16 * 1024 * 1024];
+        for i in 0..5 {
+            zip.start_file::<_, ()>(format!("pad{i}.bin"), Default::default())
+                .unwrap();
+            zip.write_all(&member).unwrap();
+        }
+        zip.finish().unwrap();
+        zero_declared_sizes(&whl);
+
+        assert!(
+            read_wheel_to_map(&whl).is_err(),
+            "an 80 MiB-actual wheel declaring 0 bytes must not be buffered past the cap"
+        );
+    }
+
+    /// SECURITY: a FIFO planted at the artifact path must fail verification,
+    /// not wedge the audit in `open(2)` waiting for a writer that never
+    /// comes (the tarball reader and file hasher already guard this).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fifo_wheel_artifact_fails_instead_of_wedging() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let rel = format!(".socket/vendor/pypi/{UUID}/six-1.16.0-py2.py3-none-any.whl");
+        tokio::fs::create_dir_all(root.join(format!(".socket/vendor/pypi/{UUID}")))
+            .await
+            .unwrap();
+        let fifo = root.join(&rel);
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) }, 0);
+
+        let rec = record(UUID, "six.py");
+        let ent = entry("pypi", UUID, &rel);
+        let verdict = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            verify_vendored_patch_record(root, &ent, &rec),
+        )
+        .await;
+        // Release any opener still blocked on the FIFO (the buggy case) so
+        // runtime shutdown doesn't hang on its spawn_blocking thread.
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            let _ = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&fifo);
+        }
+        let verdict = verdict.expect("a planted FIFO must not wedge verification");
+        assert_eq!(verdict.unwrap_err(), "vendor_artifact_unreadable");
+    }
+
+    /// Full classification matrix for the repair-facing health check.
+    #[tokio::test]
+    async fn artifact_health_classification_matrix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let rel = format!(".socket/vendor/npm/{UUID}/x-1.0.0.tgz");
+        let rec = record(UUID, "package/index.js");
+
+        // Missing.
+        let ent = entry("npm", UUID, &rel);
+        assert_eq!(
+            check_vendored_artifact(root, &ent, &rec).await,
+            ArtifactHealth::Missing
+        );
+
+        // Healthy (no ledger sha recorded → member verification only).
+        tokio::fs::create_dir_all(root.join(format!(".socket/vendor/npm/{UUID}")))
+            .await
+            .unwrap();
+        write_tgz(&root.join(&rel), "package/index.js", PATCHED);
+        assert_eq!(
+            check_vendored_artifact(root, &ent, &rec).await,
+            ArtifactHealth::Healthy
+        );
+
+        // Healthy with a MATCHING ledger sha256.
+        let tgz_bytes = tokio::fs::read(root.join(&rel)).await.unwrap();
+        let mut ent_sha = entry("npm", UUID, &rel);
+        ent_sha.artifact.sha256 = {
+            use sha2::{Digest, Sha256};
+            hex::encode(Sha256::digest(&tgz_bytes))
+        };
+        assert_eq!(
+            check_vendored_artifact(root, &ent_sha, &rec).await,
+            ArtifactHealth::Healthy
+        );
+
+        // Whole-file drift the member check can't see: members verify, but
+        // the bytes differ from what the lockfile integrity references
+        // (re-compressed archive → different sha).
+        ent_sha.artifact.sha256 = "0".repeat(64);
+        assert_eq!(
+            check_vendored_artifact(root, &ent_sha, &rec).await,
+            ArtifactHealth::Corrupt {
+                reason: "vendor_sha256_mismatch".to_string()
+            }
+        );
+
+        // Member tamper.
+        write_tgz(&root.join(&rel), "package/index.js", b"tampered");
+        assert_eq!(
+            check_vendored_artifact(root, &ent, &rec).await,
+            ArtifactHealth::Corrupt {
+                reason: "vendor_hash_mismatch".to_string()
+            }
+        );
+
+        // Unreadable.
+        tokio::fs::write(root.join(&rel), b"\x1f\x8b00garbage")
+            .await
+            .unwrap();
+        assert_eq!(
+            check_vendored_artifact(root, &ent, &rec).await,
+            ArtifactHealth::Corrupt {
+                reason: "vendor_artifact_unreadable".to_string()
+            }
+        );
+
+        // Stale uuid → not repair's job.
+        let rec_new = record("11111111-2222-4333-8444-555555555555", "package/index.js");
+        assert_eq!(
+            check_vendored_artifact(root, &ent, &rec_new).await,
+            ArtifactHealth::StaleUuid
+        );
+
+        // Poisoned path → fail closed.
+        let ent_bad = entry("npm", UUID, "../../outside.tgz");
+        assert_eq!(
+            check_vendored_artifact(root, &ent_bad, &rec).await,
+            ArtifactHealth::Unverifiable {
+                reason: "vendor_path_unsafe".to_string()
+            }
+        );
+    }
+}

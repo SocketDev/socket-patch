@@ -63,11 +63,11 @@ pub fn acquire_update_lock() -> Result<Option<UpdateLock>, UpdateError> {
 /// exec), and the swap must replace the real file rather than turning a
 /// symlink into a regular binary.
 pub fn resolve_install_path() -> Result<PathBuf, UpdateError> {
-    let exe = std::env::current_exe()
-        .map_err(|e| UpdateError::SwapFailed(format!("cannot determine current executable: {e}")))?;
-    std::fs::canonicalize(&exe).map_err(|e| {
-        UpdateError::SwapFailed(format!("cannot canonicalize {}: {e}", exe.display()))
-    })
+    let exe = std::env::current_exe().map_err(|e| {
+        UpdateError::SwapFailed(format!("cannot determine current executable: {e}"))
+    })?;
+    std::fs::canonicalize(&exe)
+        .map_err(|e| UpdateError::SwapFailed(format!("cannot canonicalize {}: {e}", exe.display())))
 }
 
 /// Atomically replace `dest` with the staged binary at `staged`.
@@ -114,9 +114,8 @@ fn has_file_capabilities(_path: &Path) -> bool {
 fn swap_binary_inner(staged: &Path, dest: &Path) -> Result<(), UpdateError> {
     use std::os::unix::fs::PermissionsExt;
 
-    let dest_meta = std::fs::metadata(dest).map_err(|e| {
-        UpdateError::SwapFailed(format!("cannot stat {}: {e}", dest.display()))
-    })?;
+    let dest_meta = std::fs::metadata(dest)
+        .map_err(|e| UpdateError::SwapFailed(format!("cannot stat {}: {e}", dest.display())))?;
     let mode = dest_meta.permissions().mode();
     if mode & 0o6000 != 0 {
         return Err(UpdateError::SwapFailed(format!(
@@ -134,9 +133,8 @@ fn swap_binary_inner(staged: &Path, dest: &Path) -> Result<(), UpdateError> {
     }
     // Carry the destination's exact mode onto the staged inode before the
     // rename so a 0555 install never appears 0755, even briefly.
-    std::fs::set_permissions(staged, std::fs::Permissions::from_mode(mode)).map_err(|e| {
-        UpdateError::SwapFailed(format!("cannot set mode on staged binary: {e}"))
-    })?;
+    std::fs::set_permissions(staged, std::fs::Permissions::from_mode(mode))
+        .map_err(|e| UpdateError::SwapFailed(format!("cannot set mode on staged binary: {e}")))?;
     std::fs::rename(staged, dest).map_err(|e| {
         if e.kind() == std::io::ErrorKind::PermissionDenied {
             UpdateError::PermissionDenied {

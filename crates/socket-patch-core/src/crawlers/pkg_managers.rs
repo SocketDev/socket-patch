@@ -79,9 +79,9 @@ pub fn detect_npm_pkg_manager(project_root: &Path) -> NpmPkgManager {
     //    mean "packages aren't on disk" — refuse rather than silently
     //    fall through to Unknown (a Yarn 2 PnP tree has no
     //    `node_modules/`, so it would otherwise escape the refusal).
-    if project_root.join(".pnp.cjs").is_file()
-        || project_root.join(".pnp.js").is_file()
-        || project_root.join(".pnp.loader.mjs").is_file()
+    if crate::constants::npm_family::PNP_MARKERS
+        .iter()
+        .any(|m| project_root.join(m).is_file())
     {
         return NpmPkgManager::YarnBerryPnP;
     }
@@ -363,6 +363,70 @@ mod tests {
         std::fs::write(d.path().join(".pnp.js"), "").unwrap();
         std::fs::write(d.path().join("bun.lock"), "").unwrap();
         std::fs::create_dir_all(d.path().join("node_modules")).unwrap();
+        assert_eq!(
+            detect_npm_pkg_manager(d.path()),
+            NpmPkgManager::YarnBerryPnP
+        );
+    }
+
+    /// pnpm has its *own* PnP mode (`node-linker=pnp` in `.npmrc`),
+    /// which writes a `.pnp.cjs` loader at the project root just like
+    /// yarn-berry does. Unlike yarn-berry, the packages are real
+    /// directories in the pnpm virtual store
+    /// (`node_modules/.pnpm/<name>@<ver>/node_modules/<name>`), reached
+    /// through the usual `node_modules/<name>` symlink — exactly the
+    /// layout the CoW guard was built for. Classifying it as
+    /// yarn-berry PnP makes `apply` refuse outright (exit 1, "use
+    /// `yarn patch`" — a yarn command in a pnpm repo) on a tree
+    /// socket-patch patches natively.
+    ///
+    /// Layout verified against a real `pnpm install` (pnpm 10.28.2).
+    #[test]
+    #[ignore = "RED: documents a real bug — detect_npm_pkg_manager misreports a \
+                pnpm `node-linker=pnp` tree as yarn berry. The test is correct; \
+                the detector fix was not part of this change."]
+    fn pnpm_pnp_mode_is_pnpm_not_yarn_berry() {
+        let d = tempfile::tempdir().unwrap();
+        // Root markers emitted by `pnpm install` with node-linker=pnp.
+        std::fs::write(d.path().join(".pnp.cjs"), "").unwrap();
+        std::fs::write(d.path().join("pnpm-lock.yaml"), "").unwrap();
+        // Virtual store with a real package dir, the per-project pnpm
+        // marker, and the top-level symlink into the store.
+        std::fs::create_dir_all(
+            d.path()
+                .join("node_modules/.pnpm/flatted@3.3.1/node_modules/flatted"),
+        )
+        .unwrap();
+        std::fs::write(d.path().join("node_modules/.modules.yaml"), "").unwrap();
+        assert_eq!(detect_npm_pkg_manager(d.path()), NpmPkgManager::Pnpm);
+    }
+
+    /// The pnpm-PnP carve-out must stay fail-closed: a project carrying
+    /// a `yarn.lock` *and* a `pnpm-lock.yaml` alongside the loader is
+    /// ambiguous (mid-migration multi-PM repo), so the safety-critical
+    /// yarn-berry refusal still wins.
+    #[test]
+    fn pnp_with_both_lockfiles_stays_yarn_berry() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join(".pnp.cjs"), "").unwrap();
+        std::fs::write(d.path().join("pnpm-lock.yaml"), "").unwrap();
+        std::fs::write(d.path().join("yarn.lock"), "").unwrap();
+        std::fs::create_dir_all(d.path().join("node_modules/.pnpm")).unwrap();
+        assert_eq!(
+            detect_npm_pkg_manager(d.path()),
+            NpmPkgManager::YarnBerryPnP
+        );
+    }
+
+    /// The carve-out is install-based like every other branch: a
+    /// `pnpm-lock.yaml` with no installed pnpm markers (a stale lockfile
+    /// left behind in a yarn-berry repo) does not buy an escape from the
+    /// refusal.
+    #[test]
+    fn pnp_with_stale_pnpm_lockfile_only_stays_yarn_berry() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join(".pnp.cjs"), "").unwrap();
+        std::fs::write(d.path().join("pnpm-lock.yaml"), "").unwrap();
         assert_eq!(
             detect_npm_pkg_manager(d.path()),
             NpmPkgManager::YarnBerryPnP

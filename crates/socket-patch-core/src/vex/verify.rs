@@ -17,8 +17,8 @@ use std::path::{Path, PathBuf};
 
 use crate::manifest::schema::{PatchManifest, PatchRecord};
 use crate::patch::apply::{verify_file_patch, VerifyStatus};
-use crate::patch::vendor::state::{lookup_entry, VendorEntry};
-use crate::patch::vendor::verify::verify_vendored_patch_record;
+use crate::vendor::state::{lookup_entry, VendorEntry};
+use crate::vendor::verify::verify_vendored_patch_record;
 
 /// One entry per manifest PURL that did NOT pass verification. The
 /// `reason` is a short snake_case tag the CLI can route on (matches
@@ -899,7 +899,7 @@ mod tests {
 
     // ── Vendored-patch awareness (`applied_patches_with_vendor`) ──
 
-    use crate::patch::vendor::state::{VendorArtifact, VendorEntry};
+    use crate::vendor::state::{VendorArtifact, VendorEntry};
 
     /// Canonical-grammar patch UUID — `verify_vendored_patch_record`
     /// validates the uuid path level, so vendor fixtures must use a real

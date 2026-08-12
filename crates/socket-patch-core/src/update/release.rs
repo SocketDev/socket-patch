@@ -240,9 +240,7 @@ pub fn sha256sums_entry(sums: &str, file: &str) -> Result<String, UpdateError> {
 /// integrity root, so it needs this exactly as much as the archive leg).
 /// Overridden bases (wiremock fixtures, mirrors) are plain-`http` loopback
 /// by design, so there the policy is only hop-count-limited.
-pub(crate) fn follow_redirect_policy(
-    endpoints: &UpdateEndpoints,
-) -> reqwest::redirect::Policy {
+pub(crate) fn follow_redirect_policy(endpoints: &UpdateEndpoints) -> reqwest::redirect::Policy {
     if endpoints.is_default() {
         reqwest::redirect::Policy::custom(|attempt| {
             if attempt.previous().len() > 10 {
@@ -345,9 +343,7 @@ async fn fetch_latest_via_api(
     let tag = json
         .get("tag_name")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| {
-            UpdateError::CheckFailed(format!("GET {url}: response has no tag_name"))
-        })?;
+        .ok_or_else(|| UpdateError::CheckFailed(format!("GET {url}: response has no tag_name")))?;
     parse_release_tag(tag)
 }
 
@@ -536,10 +532,7 @@ mod tests {
 
     #[test]
     fn sums_digest_compare_is_case_insensitive() {
-        let sums = format!(
-            "{}  socket-patch-x.tar.gz\n",
-            DIGEST_A.to_ascii_uppercase()
-        );
+        let sums = format!("{}  socket-patch-x.tar.gz\n", DIGEST_A.to_ascii_uppercase());
         assert_eq!(
             sha256sums_entry(&sums, "socket-patch-x.tar.gz").unwrap(),
             DIGEST_A,
@@ -561,15 +554,13 @@ mod tests {
 
     #[test]
     fn sums_conflicting_duplicates_refused() {
-        let sums = format!(
-            "{DIGEST_A}  socket-patch-x.tar.gz\n{DIGEST_B}  socket-patch-x.tar.gz\n"
-        );
+        let sums =
+            format!("{DIGEST_A}  socket-patch-x.tar.gz\n{DIGEST_B}  socket-patch-x.tar.gz\n");
         let err = sha256sums_entry(&sums, "socket-patch-x.tar.gz").unwrap_err();
         assert!(err.to_string().contains("conflicting"), "{err}");
         // Agreeing duplicates are harmless.
-        let sums = format!(
-            "{DIGEST_A}  socket-patch-x.tar.gz\n{DIGEST_A}  socket-patch-x.tar.gz\n"
-        );
+        let sums =
+            format!("{DIGEST_A}  socket-patch-x.tar.gz\n{DIGEST_A}  socket-patch-x.tar.gz\n");
         assert_eq!(
             sha256sums_entry(&sums, "socket-patch-x.tar.gz").unwrap(),
             DIGEST_A

@@ -359,6 +359,27 @@ pub async fn get_global_python_site_packages() -> Vec<PathBuf> {
         for m in fw_matches {
             add_path(m, &mut seen, &mut results);
         }
+
+        // pip --user on macOS. Framework builds (Apple's /usr/bin/python3 AND
+        // Homebrew's python3) use the `osx_framework_user` install scheme:
+        // ~/Library/Python/<X.Y>/lib/python/site-packages — one tree per
+        // interpreter MINOR VERSION, with a BARE `python` leaf, so the version
+        // segment needs `*` and the leaf must NOT be matched with `python3.*`.
+        // This is the macOS counterpart of the `~/.local` (Unix) and
+        // `%APPDATA%\Python` (Windows) user scans; without it the only thing
+        // that ever surfaced a `pip3 install --user` package was the
+        // `site.getusersitepackages()` query above, which reports just the one
+        // interpreter first on PATH — so on a stock Mac with both Apple's
+        // python3 and a Homebrew/pyenv python3, user installs under every
+        // other interpreter were invisible.
+        let user_fw_matches = find_python_dirs(
+            &home_dir.join("Library").join("Python"),
+            &["*", "lib", "python", "site-packages"],
+        )
+        .await;
+        for m in user_fw_matches {
+            add_path(m, &mut seen, &mut results);
+        }
     }
 
     // Windows-specific

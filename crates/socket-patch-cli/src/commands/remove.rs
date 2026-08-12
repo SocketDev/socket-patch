@@ -1,11 +1,11 @@
 use clap::Args;
 use socket_patch_core::api::client::get_api_client_with_overrides;
+use socket_patch_core::manifest::cleanup_blobs::{cleanup_unused_blobs, format_cleanup_result};
 use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
 use socket_patch_core::manifest::schema::PatchManifest;
-use socket_patch_core::patch::vendor::{load_state, save_state, VendorEntry, VendorState};
-use socket_patch_core::utils::cleanup_blobs::{cleanup_unused_blobs, format_cleanup_result};
+use socket_patch_core::telemetry::{track_patch_remove_failed, track_patch_removed};
 use socket_patch_core::utils::purl::purl_matches_identifier;
-use socket_patch_core::utils::telemetry::{track_patch_remove_failed, track_patch_removed};
+use socket_patch_core::vendor::{load_state, save_state, VendorEntry, VendorState};
 use std::path::Path;
 use std::time::Duration;
 

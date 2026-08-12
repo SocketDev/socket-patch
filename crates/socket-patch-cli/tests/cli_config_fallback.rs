@@ -415,3 +415,231 @@ async fn missing_config_is_silent() {
     );
     assert!(out.stderr.contains(PROXY_NOTICE));
 }
+
+// ---------------------------------------------------------------------------
+// `list` — the config layer must reach the commands that only fire telemetry
+// ---------------------------------------------------------------------------
+
+/// An empty manifest, so `list` exits 0 without needing anything but the
+/// telemetry call under test.
+fn write_empty_manifest(root: &Path) {
+    let dir = root.join(".socket");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("manifest.json"), r#"{ "patches": {} }"#).unwrap();
+}
+
+/// `socket-patch list` against `project`, with the same hermetic env as
+/// [`scan_cmd`]: every ambient `SOCKET_*` scrubbed, the data dir pointed at
+/// the fixture, the config layer re-enabled, telemetry off by default.
+fn list_cmd(project: &Path, data_dir: &Path) -> Command {
+    let mut cmd = Command::new(BINARY);
+    cmd.arg("list").arg("--cwd").arg(project);
+    for (key, _) in std::env::vars_os() {
+        let name = key.to_string_lossy();
+        if name.starts_with("SOCKET_") {
+            cmd.env_remove(&key);
+        }
+    }
+    cmd.env(DATA_DIR_VAR, data_dir);
+    cmd.env("SOCKET_NO_CONFIG", "0");
+    cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
+    // The scrub above also dropped the workspace-level notifier guard; keep
+    // the passive update check off so the only request a run can make is the
+    // telemetry POST under test.
+    cmd.env("SOCKET_NO_UPDATE_CHECK", "1");
+    cmd
+}
+
+/// `list` fires `patch_listed`, and that event must be attributed to the
+/// caller's org like every other command's. The credentials come from the
+/// same layered chain as client construction — flag / env / socket-cli
+/// `config.json` — so a caller authenticated by `socket login` alone POSTs
+/// to `/v0/orgs/<slug>/telemetry` on the config `apiBaseUrl`, never to the
+/// anonymous public proxy.
+///
+/// Regression: `list` handed the tracker its raw `--api-token` / `--org`
+/// flag values, skipping the config layer entirely (`apply` / `repair` /
+/// `remove` / `rollback` resolve theirs through
+/// `get_api_client_with_overrides`). A `socket login` user's every `list`
+/// was therefore reported anonymously — and, with an on-prem `apiBaseUrl`,
+/// to the public Socket proxy instead of their own host. The `scan` twin is
+/// `config_default_org_skips_auto_resolve_and_telemetry_follows`.
+#[tokio::test]
+async fn list_telemetry_follows_socket_cli_login() {
+    let server = MockServer::start().await;
+    let data = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    write_empty_manifest(project.path());
+    write_config(
+        data.path(),
+        &serde_json::json!({
+            "apiToken": token('c'),
+            "apiBaseUrl": server.uri(),
+            "defaultOrg": "cfg-org"
+        }),
+    );
+
+    let mut cmd = list_cmd(project.path(), data.path());
+    cmd.env("SOCKET_TELEMETRY_DISABLED", "0");
+    // Pin the anonymous fallback at the fixture too, so a run that skips the
+    // config layer is caught by the assertions below instead of escaping to
+    // the real public proxy.
+    cmd.env("SOCKET_PROXY_URL", server.uri());
+    let out = run(cmd);
+    assert_eq!(out.code, Some(0), "stderr:\n{}", out.stderr);
+
+    let reqs = server.received_requests().await.unwrap_or_default();
+    let paths: Vec<&str> = reqs.iter().map(|r| r.url.path()).collect();
+    let telemetry = reqs
+        .iter()
+        .find(|r| r.url.path() == "/v0/orgs/cfg-org/telemetry")
+        .unwrap_or_else(|| {
+            panic!(
+                "`list` telemetry must POST to the org endpoint resolved from the \
+                 socket-cli login; requests seen: {paths:?}"
+            )
+        });
+    assert_eq!(
+        telemetry
+            .headers
+            .get("authorization")
+            .map(|v| v.to_str().unwrap_or_default().to_string())
+            .as_deref(),
+        Some(format!("Bearer {}", token('c')).as_str()),
+        "list telemetry must carry the config token"
+    );
+    assert!(
+        !paths.contains(&"/patch/telemetry"),
+        "list must not report anonymously when a login is configured; \
+         requests seen: {paths:?}"
+    );
+}
+
+/// The veto still wins for `list`: `SOCKET_NO_API_TOKEN` suppresses the
+/// *ambient* config token, so the event falls back to the anonymous proxy
+/// rather than authenticating off a login the user asked to be ignored.
+#[tokio::test]
+async fn list_telemetry_honors_no_api_token_veto() {
+    let server = MockServer::start().await;
+    let data = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    write_empty_manifest(project.path());
+    write_config(
+        data.path(),
+        &serde_json::json!({
+            "apiToken": token('c'),
+            "apiBaseUrl": server.uri(),
+            "defaultOrg": "cfg-org"
+        }),
+    );
+
+    let mut cmd = list_cmd(project.path(), data.path());
+    cmd.env("SOCKET_TELEMETRY_DISABLED", "0");
+    cmd.env("SOCKET_NO_API_TOKEN", "1");
+    cmd.env("SOCKET_PROXY_URL", server.uri());
+    let out = run(cmd);
+    assert_eq!(out.code, Some(0), "stderr:\n{}", out.stderr);
+
+    let reqs = server.received_requests().await.unwrap_or_default();
+    let paths: Vec<&str> = reqs.iter().map(|r| r.url.path()).collect();
+    assert!(
+        paths.contains(&"/patch/telemetry"),
+        "a vetoed run must report to the anonymous proxy; requests seen: {paths:?}"
+    );
+    assert!(
+        !paths.contains(&"/v0/orgs/cfg-org/telemetry"),
+        "SOCKET_NO_API_TOKEN must veto the config token for telemetry too; \
+         requests seen: {paths:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `setup` — the other command that only fires telemetry
+// ---------------------------------------------------------------------------
+
+/// `socket-patch setup --json --yes` against `project`, with the same hermetic
+/// env as [`list_cmd`]. `--json` also skips the confirmation prompt.
+fn setup_cmd(project: &Path, data_dir: &Path) -> Command {
+    let mut cmd = Command::new(BINARY);
+    cmd.args(["setup", "--json", "--yes", "--cwd"]).arg(project);
+    for (key, _) in std::env::vars_os() {
+        let name = key.to_string_lossy();
+        if name.starts_with("SOCKET_") {
+            cmd.env_remove(&key);
+        }
+    }
+    cmd.env(DATA_DIR_VAR, data_dir);
+    cmd.env("SOCKET_NO_CONFIG", "0");
+    cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
+    cmd.env("SOCKET_NO_UPDATE_CHECK", "1");
+    cmd
+}
+
+/// `setup` fires `patch_setup`, and — like `list` — it builds no API client, so
+/// it has to consult the socket-cli config layer itself. A caller
+/// authenticated by `socket login` alone must have the event POSTed to
+/// `/v0/orgs/<slug>/telemetry` on the config `apiBaseUrl`, never anonymously
+/// to the public proxy.
+///
+/// Regression: `setup` handed the tracker its raw `--api-token` / `--org` flag
+/// values (both `None` here), so the event went out unauthenticated to
+/// `patches-api.socket.dev` — a different host than the one the caller's
+/// client talks to, which for an on-prem `apiBaseUrl` egresses the event
+/// entirely. Exact twin of `list_telemetry_follows_socket_cli_login`.
+#[tokio::test]
+async fn setup_telemetry_follows_socket_cli_login() {
+    let server = MockServer::start().await;
+    let data = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    // A plain npm project: setup has real work to do, so telemetry fires.
+    write_empty_project(project.path());
+    write_config(
+        data.path(),
+        &serde_json::json!({
+            "apiToken": token('c'),
+            "apiBaseUrl": server.uri(),
+            "defaultOrg": "cfg-org"
+        }),
+    );
+
+    let mut cmd = setup_cmd(project.path(), data.path());
+    cmd.env("SOCKET_TELEMETRY_DISABLED", "0");
+    // Pin the anonymous fallback at the fixture too, so a run that skips the
+    // config layer is caught here instead of escaping to the real proxy.
+    cmd.env("SOCKET_PROXY_URL", server.uri());
+    let out = run(cmd);
+    assert_eq!(out.code, Some(0), "stderr:\n{}", out.stderr);
+    assert!(
+        std::fs::read_to_string(project.path().join("package.json"))
+            .unwrap()
+            .contains("socket-patch"),
+        "control: the run must actually have configured the project, or the \
+         telemetry event under test never fires"
+    );
+
+    let reqs = server.received_requests().await.unwrap_or_default();
+    let paths: Vec<&str> = reqs.iter().map(|r| r.url.path()).collect();
+    let telemetry = reqs
+        .iter()
+        .find(|r| r.url.path() == "/v0/orgs/cfg-org/telemetry")
+        .unwrap_or_else(|| {
+            panic!(
+                "`setup` telemetry must POST to the org endpoint resolved from \
+                 the socket-cli login; requests seen: {paths:?}"
+            )
+        });
+    assert_eq!(
+        telemetry
+            .headers
+            .get("authorization")
+            .map(|v| v.to_str().unwrap_or_default().to_string())
+            .as_deref(),
+        Some(format!("Bearer {}", token('c')).as_str()),
+        "setup telemetry must carry the config token"
+    );
+    assert!(
+        !paths.contains(&"/patch/telemetry"),
+        "setup must not report anonymously when a login is configured; \
+         requests seen: {paths:?}"
+    );
+}

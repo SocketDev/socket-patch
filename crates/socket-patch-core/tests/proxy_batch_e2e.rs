@@ -264,3 +264,57 @@ async fn proxy_batch_429_surfaces_as_rate_limited_without_fallback() {
         "429 must be RateLimited; got: {err:?}"
     );
 }
+
+#[tokio::test]
+async fn proxy_batch_fallback_preserves_requested_purl_order() {
+    // Regression: the per-package fallback runs each chunk's GETs
+    // concurrently and used to collect them in *completion* order, so the
+    // assembled `packages` list was ordered by whichever response came back
+    // first. That order is user-visible — `scan --json` emits `packages`
+    // verbatim and the human table / interactive picker index it — so two
+    // identical scans of an unchanged project could disagree. The order must
+    // follow the requested PURLs, matching what the batch endpoint returns.
+    //
+    // The mock makes the race deterministic: the FIRST requested PURL is
+    // served with a delay, so completion order is the exact reverse of
+    // request order.
+    let first = "pkg:npm/alpha@1.0.0";
+    let second = "pkg:npm/omega@1.0.0";
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/patch/batch"))
+        .respond_with(ResponseTemplate::new(405))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/patch/by-package/.*alpha.*$"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(by_package_response_body())
+                .set_delay(std::time::Duration::from_millis(400)),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/patch/by-package/.*omega.*$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(by_package_response_body()))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = proxy_client(&server.uri());
+    let resp = client
+        .search_patches_batch(None, &[first.to_string(), second.to_string()])
+        .await
+        .expect("legacy proxy must degrade to per-package GETs");
+
+    let order: Vec<&str> = resp.packages.iter().map(|p| p.purl.as_str()).collect();
+    assert_eq!(
+        order,
+        vec![first, second],
+        "assembled packages must follow the requested PURL order, not response-completion order"
+    );
+}

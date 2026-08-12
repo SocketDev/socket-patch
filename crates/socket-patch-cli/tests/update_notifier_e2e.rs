@@ -63,8 +63,8 @@ fn write_state(
 }
 
 fn read_state(state_dir: &Path) -> serde_json::Value {
-    let raw = std::fs::read(state_dir.join("update-check.json"))
-        .expect("update-check.json must exist");
+    let raw =
+        std::fs::read(state_dir.join("update-check.json")).expect("update-check.json must exist");
     serde_json::from_slice(&raw).unwrap_or_else(|e| {
         panic!(
             "update-check.json must be valid JSON: {e}\nraw:\n{}",
@@ -122,7 +122,10 @@ async fn first_eligible_run_checks_and_notices() {
     );
 
     let state = read_state(&install.state_dir);
-    assert_eq!(state["latestSeen"], "9.9.9", "check must persist what it saw");
+    assert_eq!(
+        state["latestSeen"], "9.9.9",
+        "check must persist what it saw"
+    );
     assert!(
         state["lastCheckAt"].as_i64().is_some(),
         "check must record when it ran: {state}"
@@ -145,8 +148,7 @@ async fn fresh_state_notices_from_cache_with_zero_network() {
     let release = FakeReleaseBuilder::new("9.9.9").mount().await;
     write_state(&install.state_dir, FRESH, Some("9.9.9"), None);
 
-    let (code, _, stderr) =
-        run_installed(&install, &["apply"], &eligible_kit(&release.base_url));
+    let (code, _, stderr) = run_installed(&install, &["apply"], &eligible_kit(&release.base_url));
     assert_eq!(code, 0);
     assert!(
         stderr.contains("Update available") && stderr.contains("9.9.9"),
@@ -200,8 +202,7 @@ async fn up_to_date_prints_nothing() {
         .await;
     write_state(&install.state_dir, STALE, Some(CURRENT), None);
 
-    let (code, _, stderr) =
-        run_installed(&install, &["apply"], &eligible_kit(&release.base_url));
+    let (code, _, stderr) = run_installed(&install, &["apply"], &eligible_kit(&release.base_url));
     assert_eq!(code, 0);
     assert!(
         !stderr.contains("Update available"),
@@ -218,8 +219,7 @@ async fn notice_rate_limited_to_daily() {
     let release = FakeReleaseBuilder::new("9.9.9").mount().await;
     write_state(&install.state_dir, FRESH, Some("9.9.9"), Some(FRESH));
 
-    let (code, _, stderr) =
-        run_installed(&install, &["apply"], &eligible_kit(&release.base_url));
+    let (code, _, stderr) = run_installed(&install, &["apply"], &eligible_kit(&release.base_url));
     assert_eq!(code, 0);
     assert!(
         !stderr.contains("Update available"),
@@ -237,8 +237,7 @@ async fn notice_returns_after_a_day() {
     let release = FakeReleaseBuilder::new("9.9.9").mount().await;
     write_state(&install.state_dir, FRESH, Some("9.9.9"), Some(STALE));
 
-    let (code, _, stderr) =
-        run_installed(&install, &["apply"], &eligible_kit(&release.base_url));
+    let (code, _, stderr) = run_installed(&install, &["apply"], &eligible_kit(&release.base_url));
     assert_eq!(code, 0);
     assert!(
         stderr.contains("Update available"),
@@ -433,7 +432,7 @@ async fn guard_json_flag_silences() {
     // parse_json_envelope panics on trailing/leading garbage — this IS the
     // purity assertion for stdout.
     let env = common::parse_json_envelope(&stdout);
-    assert_eq!(common::json_string(&env, "command").as_deref(), Some("apply"));
+    assert_eq!(common::json_string(&env, "command"), Some("apply"));
     assert_eq!(release.received_request_count().await, 0);
     assert!(
         !stderr.contains("Update available"),
@@ -469,11 +468,8 @@ async fn dead_endpoint_never_fails_the_command() {
     let install = staged_install();
     write_state(&install.state_dir, STALE, Some(CURRENT), None);
 
-    let (code, stdout, stderr) = run_installed(
-        &install,
-        &["apply"],
-        &eligible_kit("http://127.0.0.1:1"),
-    );
+    let (code, stdout, stderr) =
+        run_installed(&install, &["apply"], &eligible_kit("http://127.0.0.1:1"));
     assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
     assert!(!stderr.contains("Update available"), "{stderr}");
 
@@ -619,7 +615,10 @@ mod pty {
         let status = child.wait().expect("child.wait");
         drop(pair.master);
         let output = reader_handle.join().expect("reader join");
-        (status.exit_code() as i32, String::from_utf8_lossy(&output).to_string())
+        (
+            status.exit_code() as i32,
+            String::from_utf8_lossy(&output).to_string(),
+        )
     }
 
     #[tokio::test]

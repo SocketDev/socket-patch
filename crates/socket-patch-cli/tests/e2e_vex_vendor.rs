@@ -30,7 +30,7 @@ use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
 use socket_patch_core::manifest::schema::{
     PatchFileInfo, PatchManifest, PatchRecord, SetupConfig, VulnerabilityInfo,
 };
-use socket_patch_core::patch::vendor::state::{VendorArtifact, VendorEntry, VendorState};
+use socket_patch_core::vendor::state::{VendorArtifact, VendorEntry, VendorState};
 
 /// Canonical-grammar patch UUID — the vendored-artifact verifier validates
 /// the uuid path level, so fixtures must use the real shape.
@@ -486,13 +486,15 @@ fn golang_go_patches_redirect_attested_without_module_cache() {
     .unwrap();
     tokio::runtime::Runtime::new()
         .unwrap()
-        .block_on(socket_patch_core::patch::go_mod_edit::ensure_replace_entry(
-            cwd,
-            module,
-            version,
-            socket_patch_core::patch::go_mod_edit::GO_PATCHES_DIR,
-            false,
-        ))
+        .block_on(
+            socket_patch_core::vendor::go_mod_edit::ensure_replace_entry(
+                cwd,
+                module,
+                version,
+                socket_patch_core::vendor::go_mod_edit::GO_PATCHES_DIR,
+                false,
+            ),
+        )
         .expect("write go.mod replace");
 
     // The patched copy dir the redirect points at.

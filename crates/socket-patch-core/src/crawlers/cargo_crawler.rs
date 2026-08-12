@@ -395,12 +395,15 @@ impl CargoCrawler {
         Some((name.to_string(), version.to_string()))
     }
 
-    /// Get `CARGO_HOME`, defaulting to `$HOME/.cargo`.
+    /// Get `CARGO_HOME`, defaulting to `$HOME/.cargo`. An empty value means
+    /// unset (the env_non_empty convention) — `PathBuf::from("")` would
+    /// otherwise resolve `registry/src` against the CWD and silently crawl
+    /// nothing.
     fn cargo_home() -> PathBuf {
-        if let Ok(cargo_home) = std::env::var("CARGO_HOME") {
-            return PathBuf::from(cargo_home);
+        match std::env::var("CARGO_HOME") {
+            Ok(v) if !v.trim().is_empty() => PathBuf::from(v),
+            _ => crate::utils::fs::home_dir().join(".cargo"),
         }
-        crate::utils::fs::home_dir().join(".cargo")
     }
 }
 

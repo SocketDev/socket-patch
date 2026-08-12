@@ -1,7 +1,5 @@
 use clap::Args;
-use socket_patch_core::composer_setup::{self, ComposerSetupStatus};
 use socket_patch_core::crawlers::python_crawler::is_python_project;
-use socket_patch_core::gem_setup::{self, GemSetupStatus};
 use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
 use socket_patch_core::manifest::schema::{PatchManifest, SetupConfig};
 use socket_patch_core::package_json::detect::{is_setup_configured_str, PackageManager};
@@ -12,14 +10,16 @@ use socket_patch_core::package_json::update::{
     remove_package_json, update_package_json, RemoveResult, RemoveStatus, UpdateResult,
     UpdateStatus,
 };
-use socket_patch_core::pth_hook::detect::{
+use socket_patch_core::setup::composer::{self, ComposerSetupStatus};
+use socket_patch_core::setup::gem::{self, GemSetupStatus};
+use socket_patch_core::setup::pypi::detect::{
     deps_contain_hook, detect_python_pm, PythonPackageManager,
 };
-use socket_patch_core::pth_hook::edit::{
+use socket_patch_core::setup::pypi::edit::{
     add_hook_dependency, pyproject_contains_hook, remove_hook_dependency, ManifestKind,
     PthEditResult, PthStatus,
 };
-use socket_patch_core::utils::telemetry::track_patch_setup;
+use socket_patch_core::telemetry::track_patch_setup;
 use socket_patch_core::vex::applied_patches_with_vendor;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -209,10 +209,17 @@ fn eco_in_scope(common: &GlobalArgs, names: &[&str]) -> bool {
     }
 }
 
-/// Normalize a workspace-member / exclude path for comparison: forward slashes,
-/// no leading `./`, no trailing slash.
+/// Normalize a workspace-member / exclude path for comparison: trimmed,
+/// forward slashes, no leading `./`, no trailing slash.
+///
+/// The trim is load-bearing for the CSV spellings of `--exclude`: clap splits
+/// `--exclude "packages/a, packages/b"` (and `SOCKET_SETUP_EXCLUDE=a, b`, the
+/// idiomatic CI-YAML form) on the comma only, so the second value arrives with
+/// a leading space. Untrimmed it matches no member — the exclusion silently
+/// does nothing — and the unmatchable spelling is then persisted into
+/// `.socket/manifest.json`, where every later run and every clone inherits it.
 fn normalize_rel_path(p: &str) -> String {
-    let p = p.replace('\\', "/");
+    let p = p.trim().replace('\\', "/");
     let p = p.strip_prefix("./").unwrap_or(&p);
     p.trim_end_matches('/').to_string()
 }
@@ -236,7 +243,15 @@ fn is_member_excluded(manifest_path: &Path, cwd: &Path, excludes: &[String]) -> 
     if rel.is_empty() {
         return false;
     }
-    excludes.iter().any(|e| normalize_rel_path(e) == rel)
+    excludes.iter().any(|e| {
+        let e = normalize_rel_path(e);
+        // An exclusion covers the named directory AND everything below it. The
+        // walk finds nested manifests (`tools/inner/package.json`, and members
+        // of a member that is itself a workspace root), and those lie *inside*
+        // the excluded member — an exact-match-only test wired install hooks
+        // into a subtree the user asked setup to keep out of.
+        !e.is_empty() && (rel == e || rel.starts_with(&format!("{e}/")))
+    })
 }
 
 /// The exclude set in effect for this run: the persisted `setup.exclude` list
@@ -268,12 +283,31 @@ async fn effective_excludes(common: &GlobalArgs, flag: &[String]) -> Vec<String>
 /// without re-passing `--exclude`. No-op when the set is empty or already
 /// exactly persisted (keeps the manifest byte-stable). Never called under
 /// `--dry-run`.
-async fn persist_setup_excludes(common: &GlobalArgs, excludes: &[String]) {
+/// Returns a warning string when persistence was SKIPPED (fail-closed) —
+/// the caller folds it into the run's warnings so it reaches the human
+/// summary AND the `--json` envelope; a `--silent`/`--json` automation run
+/// must not see a fully-successful setup whose excludes silently evaporate
+/// on the next flag-less invocation.
+async fn persist_setup_excludes(common: &GlobalArgs, excludes: &[String]) -> Option<String> {
     if excludes.is_empty() {
-        return;
+        return None;
     }
     let path = common.resolved_manifest_path();
-    let existing = read_manifest(&path).await.ok().flatten();
+    // Fail closed on a manifest that exists but cannot be read or parsed: it
+    // may still hold recoverable patch records, and flattening the error to
+    // "no manifest yet" would rewrite the file down to a bare setup block —
+    // destroying them for the sake of persisting an exclude list. Skip
+    // persistence loudly instead; nothing else in this run needs the file.
+    let existing = match read_manifest(&path).await {
+        Ok(existing) => existing,
+        Err(e) => {
+            return Some(format!(
+                "not persisting --exclude: cannot read {}: {e} — the exclude list will \
+                 need re-passing until the manifest is repaired",
+                path.display()
+            ));
+        }
+    };
     let mut merged: Vec<String> = excludes.to_vec();
     merged.sort();
     merged.dedup();
@@ -283,7 +317,7 @@ async fn persist_setup_excludes(common: &GlobalArgs, excludes: &[String]) {
         .map(|s| &s.exclude)
         == Some(&merged)
     {
-        return; // already persisted exactly — don't rewrite
+        return None; // already persisted exactly — don't rewrite
     }
     // Preserve any existing `manual` declarations (property 7) when rewriting.
     let manual = existing
@@ -300,6 +334,7 @@ async fn persist_setup_excludes(common: &GlobalArgs, excludes: &[String]) {
         let _ = tokio::fs::create_dir_all(parent).await;
     }
     let _ = write_manifest(&path, &manifest).await;
+    None
 }
 
 /// Which ecosystems are **actually set up** at `cwd` — i.e. their auto-repatch
@@ -341,17 +376,17 @@ pub(crate) async fn configured_ecosystems(
     }
 
     // gem: the managed plugin directive is present in the Gemfile.
-    if let Some(project) = gem_setup::discover_bundler_project(&common.cwd).await {
+    if let Some(project) = gem::discover_bundler_project(&common.cwd).await {
         if let Ok(content) = tokio::fs::read_to_string(&project.gemfile).await {
-            if gem_setup::is_plugin_directive_present(&content) {
+            if gem::is_plugin_directive_present(&content) {
                 set.insert(Ecosystem::Gem);
             }
         }
     }
 
-    if let Some(composer_json) = composer_setup::discover_composer_project(&common.cwd).await {
+    if let Some(composer_json) = composer::discover_composer_project(&common.cwd).await {
         if let Ok(content) = tokio::fs::read_to_string(&composer_json).await {
-            if composer_setup::is_hook_present(&content) {
+            if composer::is_hook_present(&content) {
                 set.insert(Ecosystem::Composer);
             }
         }
@@ -561,7 +596,7 @@ async fn build_gem_outcome(common: &GlobalArgs, remove: bool, dry_run: bool) -> 
     if !eco_in_scope(common, ECO_GEM) {
         return SetupOutcome::default();
     }
-    let project = match gem_setup::discover_bundler_project(&common.cwd).await {
+    let project = match gem::discover_bundler_project(&common.cwd).await {
         Some(p) => p,
         None => return SetupOutcome::default(),
     };
@@ -572,9 +607,9 @@ async fn build_gem_outcome(common: &GlobalArgs, remove: bool, dry_run: bool) -> 
     };
 
     let results = if remove {
-        gem_setup::remove_plugin_directive(&project, dry_run).await
+        gem::remove_plugin_directive(&project, dry_run).await
     } else {
-        gem_setup::add_plugin_directive(&project, dry_run).await
+        gem::add_plugin_directive(&project, dry_run).await
     };
 
     let mut added_paths: Vec<String> = Vec::new();
@@ -632,7 +667,7 @@ async fn build_composer_outcome(common: &GlobalArgs, remove: bool, dry_run: bool
     if !eco_in_scope(common, ECO_COMPOSER) {
         return SetupOutcome::default();
     }
-    let composer_json = match composer_setup::discover_composer_project(&common.cwd).await {
+    let composer_json = match composer::discover_composer_project(&common.cwd).await {
         Some(p) => p,
         None => return SetupOutcome::default(),
     };
@@ -643,9 +678,9 @@ async fn build_composer_outcome(common: &GlobalArgs, remove: bool, dry_run: bool
     };
 
     let r = if remove {
-        composer_setup::remove_hook(&composer_json, dry_run).await
+        composer::remove_hook(&composer_json, dry_run).await
     } else {
-        composer_setup::add_hook(&composer_json, dry_run).await
+        composer::add_hook(&composer_json, dry_run).await
     };
 
     let mut added_paths: Vec<String> = Vec::new();
@@ -701,13 +736,13 @@ async fn append_composer_check_entries(
     if !eco_in_scope(common, ECO_COMPOSER) {
         return false;
     }
-    let composer_json = match composer_setup::discover_composer_project(&common.cwd).await {
+    let composer_json = match composer::discover_composer_project(&common.cwd).await {
         Some(p) => p,
         None => return false,
     };
     let (state, err) = match tokio::fs::read_to_string(&composer_json).await {
         Ok(content) => {
-            if composer_setup::is_hook_present(&content) {
+            if composer::is_hook_present(&content) {
                 (CheckState::Configured, None)
             } else {
                 (CheckState::NeedsConfiguration, None)
@@ -734,8 +769,27 @@ async fn finalize_gem(common: &GlobalArgs) -> Vec<String> {
         }
     };
     let root = common.cwd.display().to_string();
+    // Forward the manifest location: the nested `apply` re-resolves a relative
+    // `--manifest-path` against ITS OWN `--cwd`, so hand it the absolutized,
+    // already-cwd-resolved path (the `get::run_nested_apply` rule). Dropping
+    // the flag made this run read the default `.socket/manifest.json`, so a
+    // project whose patches live anywhere else materialized nothing here —
+    // silently, since a missing manifest is a clean exit-0 no-op for `apply`.
+    let manifest = common.resolved_manifest_path();
+    let manifest = std::path::absolute(&manifest).unwrap_or(manifest);
+    let manifest = manifest.display().to_string();
     match tokio::process::Command::new(&exe)
-        .args(["apply", "--offline", "--ecosystems", "gem", "--cwd", &root, "--silent"])
+        .args([
+            "apply",
+            "--offline",
+            "--ecosystems",
+            "gem",
+            "--cwd",
+            &root,
+            "--manifest-path",
+            &manifest,
+            "--silent",
+        ])
         .output()
         .await
     {
@@ -764,13 +818,13 @@ async fn append_gem_check_entries(
     if !eco_in_scope(common, ECO_GEM) {
         return false;
     }
-    let project = match gem_setup::discover_bundler_project(&common.cwd).await {
+    let project = match gem::discover_bundler_project(&common.cwd).await {
         Some(p) => p,
         None => return false,
     };
     let (state, err) = match tokio::fs::read_to_string(&project.gemfile).await {
         Ok(content) => {
-            if gem_setup::is_plugin_directive_present(&content) {
+            if gem::is_plugin_directive_present(&content) {
                 (CheckState::Configured, None)
             } else {
                 (CheckState::NeedsConfiguration, None)
@@ -779,14 +833,14 @@ async fn append_gem_check_entries(
         Err(e) => (CheckState::Error, Some(e.to_string())),
     };
     entries.push(("gemfile", project.gemfile.display().to_string(), state, err));
-    let dir_state = if gem_setup::plugin_files_present(&project.root).await {
+    let dir_state = if gem::plugin_files_present(&project.root).await {
         CheckState::Configured
     } else {
         CheckState::NeedsConfiguration
     };
     entries.push((
         "gem_plugin",
-        gem_setup::plugin_dir(&project.root).display().to_string(),
+        gem::plugin_dir(&project.root).display().to_string(),
         dir_state,
         None,
     ));
@@ -1461,9 +1515,11 @@ async fn run_setup(args: &SetupArgs) -> i32 {
     // Dry-run never writes the manifest. Excluded members are then skipped by
     // discovery.
     let excludes = effective_excludes(common, &args.exclude).await;
-    if !common.dry_run {
-        persist_setup_excludes(common, &excludes).await;
-    }
+    let persist_warning = if !common.dry_run {
+        persist_setup_excludes(common, &excludes).await
+    } else {
+        None
+    };
     let npm_files = discover(args, &excludes).await;
     let py_plan = plan_python(common).await;
     // Gem + Composer previews (dry-run); `.present` also tells us each project exists.
@@ -1494,10 +1550,19 @@ async fn run_setup(args: &SetupArgs) -> i32 {
         composer_present,
         npm_pm,
     );
+    // Attribute the event through the same layered credential chain as every
+    // other command — flag / env / socket-cli `config.json` — not the raw flag
+    // values. `setup` builds no API client (it is a purely local edit), so the
+    // config layer has to be consulted explicitly, exactly as `list` does:
+    // otherwise a caller authenticated by `socket login` alone reports
+    // anonymously to the public patch proxy, which with an on-prem
+    // `apiBaseUrl` also sends the event to a different host than the one the
+    // client would talk to.
+    let (telemetry_token, telemetry_org) = crate::commands::list::telemetry_credentials(common);
     track_patch_setup(
         &telemetry_manager,
-        common.api_token.as_deref(),
-        common.org.as_deref(),
+        telemetry_token.as_deref(),
+        telemetry_org.as_deref(),
     )
     .await;
 
@@ -1604,6 +1669,9 @@ async fn run_setup(args: &SetupArgs) -> i32 {
         py_results = edit_python_manifests(plan, false, false).await;
         warnings = finalize_python(plan, &py_results, &common.cwd).await;
     }
+    // A skipped (fail-closed) --exclude persistence rides the same warnings
+    // channel: human summary line + `--json` envelope `warnings` array.
+    warnings.extend(persist_warning);
     // Real gem + composer edits (gem Gemfile `plugin` block + generated plugin
     // dir; composer.json script-event command).
     let extra_results = merge_outcomes(

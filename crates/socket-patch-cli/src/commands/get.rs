@@ -7,15 +7,15 @@ use socket_patch_core::api::ranking::{cmp_search_results, severity_order};
 use socket_patch_core::api::types::{
     PatchResponse, PatchSearchResult, SearchResponse, VulnerabilityResponse,
 };
+use socket_patch_core::crawlers::fuzzy_match::fuzzy_match_packages;
 use socket_patch_core::crawlers::{CrawlerOptions, Ecosystem};
 use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
 use socket_patch_core::manifest::schema::{
     PatchFileInfo, PatchManifest, PatchRecord, VulnerabilityInfo,
 };
 use socket_patch_core::patch::apply::select_installed_variants;
-use socket_patch_core::utils::fuzzy_match::fuzzy_match_packages;
+use socket_patch_core::telemetry::{track_patch_fetch_failed, track_patch_fetched};
 use socket_patch_core::utils::purl::{is_purl, normalize_purl, strip_purl_qualifiers};
-use socket_patch_core::utils::telemetry::{track_patch_fetch_failed, track_patch_fetched};
 use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -808,14 +808,27 @@ async fn filter_to_installed_releases(
     (kept, warnings)
 }
 
-/// Build the API client for a download run, defaulting the override org
-/// slug to the caller's `--org` when no explicit override was given.
-async fn api_client_for(params: &DownloadParams) -> socket_patch_core::api::client::ApiClient {
+/// The API-client overrides for a download run: the caller's CLI flags with
+/// the override org slug defaulted to `--org` when none was given.
+///
+/// Shared by the client built here AND by the nested `apply` step, which
+/// constructs its own client and must resolve to the same endpoint/token —
+/// see [`run_nested_apply`].
+fn resolved_api_overrides(
+    params: &DownloadParams,
+) -> socket_patch_core::api::client::ApiClientEnvOverrides {
     let mut overrides = params.api_overrides.clone();
     if overrides.org_slug.is_none() {
         overrides.org_slug = params.org.clone();
     }
-    get_api_client_with_overrides(overrides).await.0
+    overrides
+}
+
+/// Build the API client for a download run.
+async fn api_client_for(params: &DownloadParams) -> socket_patch_core::api::client::ApiClient {
+    get_api_client_with_overrides(resolved_api_overrides(params))
+        .await
+        .0
 }
 
 /// Download and apply a set of selected patches.
@@ -856,7 +869,7 @@ pub(crate) async fn download_patch_records(
     let (selected, narrow_warnings) =
         filter_to_installed_releases(selected, params, &api_client).await;
 
-    let vendor_state = socket_patch_core::patch::vendor::load_state(&params.cwd)
+    let vendor_state = socket_patch_core::vendor::load_state(&params.cwd)
         .await
         .unwrap_or_default();
 
@@ -869,11 +882,9 @@ pub(crate) async fn download_patch_records(
     for search_result in &selected {
         // Idempotency: a detached entry already at this uuid carries its
         // own record — no view fetch needed.
-        let existing = socket_patch_core::patch::vendor::lookup_entry(
-            &vendor_state.entries,
-            &search_result.purl,
-        )
-        .filter(|e| e.detached && e.uuid == search_result.uuid);
+        let existing =
+            socket_patch_core::vendor::lookup_entry(&vendor_state.entries, &search_result.purl)
+                .filter(|e| e.detached && e.uuid == search_result.uuid);
         if let Some(record) = existing.and_then(|e| e.record.clone()) {
             if !params.json && !params.silent {
                 eprintln!("  [skip] {} (already vendored)", search_result.purl);
@@ -980,7 +991,7 @@ async fn warn_on_vendored_uuid_drift(
     downloaded_patches: &[serde_json::Value],
     warnings: &mut Vec<String>,
 ) {
-    let Ok(vendor_state) = socket_patch_core::patch::vendor::load_state(cwd).await else {
+    let Ok(vendor_state) = socket_patch_core::vendor::load_state(cwd).await else {
         return;
     };
     if vendor_state.entries.is_empty() {
@@ -993,7 +1004,7 @@ async fn warn_on_vendored_uuid_drift(
         if !matches!(rec["action"].as_str(), Some("added" | "updated")) {
             continue;
         }
-        let entry = socket_patch_core::patch::vendor::lookup_entry(&vendor_state.entries, purl);
+        let entry = socket_patch_core::vendor::lookup_entry(&vendor_state.entries, purl);
         if let Some(entry) = entry.filter(|e| e.uuid != uuid) {
             let w = format!(
                 "{purl} is vendored at patch {} but the manifest now records {uuid}; \
@@ -1014,6 +1025,19 @@ async fn warn_on_vendored_uuid_drift(
 /// the read-only cargo-redirect verifier stays off and embedded VEX is
 /// opt-in on the top-level command only, never on this internal
 /// invocation.
+///
+/// `api` carries the caller's API-client flags and is NOT optional: apply
+/// builds its own clients from the `GlobalArgs` handed to it (its telemetry
+/// client, and `fetch_stage`'s artifact fetcher), and those only ever see
+/// this struct. Leaving the fields at their `GlobalArgs::default()` `None`
+/// dropped `--api-url` / `--api-token` / `--org` / `--proxy-url` on the
+/// floor, so a token supplied purely as a CLI flag fell through to env →
+/// socket-cli config → the token-less public proxy. That breaks the flow
+/// for real: a patch view that omits `blobContent` for a file (`Option` on
+/// the wire, which is why `--download-mode diff` exists) leaves `get` with
+/// no blob to write, and the nested apply must download it — with the wrong
+/// client, against the wrong host.
+#[allow(clippy::too_many_arguments)]
 async fn run_nested_apply(
     cwd: &Path,
     manifest_path: &Path,
@@ -1022,6 +1046,7 @@ async fn run_nested_apply(
     quiet: bool,
     download_mode: String,
     strict: bool,
+    api: socket_patch_core::api::client::ApiClientEnvOverrides,
 ) -> bool {
     // Apply re-resolves a relative manifest path against ITS `--cwd`
     // (`resolved_manifest_path`), but ours is already cwd-resolved —
@@ -1039,6 +1064,10 @@ async fn run_nested_apply(
             silent: quiet,
             download_mode,
             strict,
+            api_url: api.api_url,
+            api_token: api.api_token,
+            org: api.org_slug,
+            proxy_url: api.proxy_url,
             ..crate::args::GlobalArgs::default()
         },
         force: false,
@@ -1101,10 +1130,19 @@ pub async fn download_and_apply_patches(
         eprintln!("\nDownloading {} patch(es)...", selected.len());
     }
 
+    // `patches_added` and `patches_updated` are DISJOINT — one patch lands in
+    // exactly one of them, matching the per-patch `action` vocabulary
+    // (CLI_CONTRACT.md: `added` | `updated` | ...) and the single-UUID flow's
+    // summary in `save_and_apply_patch`. `patches_downloaded` is their sum:
+    // the JSON `downloaded` / `applied` counts cover both (a replacement was
+    // fetched and applied just like a new record), and it gates the apply
+    // step. Counting an update in `patches_added` too made the human summary
+    // print `Added: 1` AND `Updated: 1` for the one entry it had swapped.
     let mut patches_added = 0;
     let mut patches_skipped = 0;
     let mut patches_failed = 0;
     let mut patches_updated = 0;
+    let mut patches_downloaded = 0;
     let mut downloaded_patches: Vec<serde_json::Value> = Vec::new();
 
     for search_result in &selected {
@@ -1180,6 +1218,7 @@ pub async fn download_and_apply_patches(
                         })
                     }
                     _ => {
+                        patches_added += 1;
                         if !params.json && !params.silent {
                             eprintln!("  [add] {}", patch.purl);
                         }
@@ -1196,7 +1235,7 @@ pub async fn download_and_apply_patches(
                 // round-trip to the API.
                 merge_metadata(&mut action_record, patch_event_metadata(&patch));
                 downloaded_patches.push(action_record);
-                patches_added += 1;
+                patches_downloaded += 1;
             }
             Ok(None) => {
                 if !params.json && !params.silent {
@@ -1268,7 +1307,7 @@ pub async fn download_and_apply_patches(
 
     // Auto-apply unless --save-only
     let mut apply_succeeded = false;
-    if !params.save_only && patches_added > 0 {
+    if !params.save_only && patches_downloaded > 0 {
         if !params.json && !params.silent {
             eprintln!("\nApplying patches...");
         }
@@ -1280,6 +1319,7 @@ pub async fn download_and_apply_patches(
             params.json || params.silent,
             params.download_mode.clone(),
             params.strict,
+            resolved_api_overrides(params),
         )
         .await;
     }
@@ -1290,15 +1330,15 @@ pub async fn download_and_apply_patches(
     // alongside a non-zero exit code misleads JSON consumers (the scan
     // wrapper recomputes status from the exit code for exactly this
     // reason, but `get` surfaces this envelope directly).
-    let apply_failed = !apply_succeeded && patches_added > 0 && !params.save_only;
+    let apply_failed = !apply_succeeded && patches_downloaded > 0 && !params.save_only;
     let (status, exit_code) = run_outcome(patches_failed > 0, apply_failed);
     let mut result_json = serde_json::json!({
         "status": status,
         "found": selected.len(),
-        "downloaded": patches_added,
+        "downloaded": patches_downloaded,
         "skipped": patches_skipped,
         "failed": patches_failed,
-        "applied": if apply_succeeded { patches_added } else { 0 },
+        "applied": if apply_succeeded { patches_downloaded } else { 0 },
         "updated": patches_updated,
         "patches": downloaded_patches,
     });
@@ -1917,6 +1957,7 @@ async fn save_and_apply_patch(args: &GetArgs, patch: &PatchResponse) -> i32 {
             quiet,
             args.common.download_mode.clone(),
             args.common.strict,
+            args.common.api_client_overrides(),
         )
         .await;
     }

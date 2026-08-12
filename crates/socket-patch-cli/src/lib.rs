@@ -154,12 +154,40 @@ pub fn parse_with_uuid_fallback(argv: Vec<String>) -> Result<Cli, clap::Error> {
             // (including its errors) is surfaced; anywhere else a genuine
             // rewrite failure falls back to the original error, mirroring
             // the UUID shortcut below.
-            if let Some(pos) = argv.iter().skip(1).position(|a| a == "--update") {
-                let pos = pos + 1; // undo the skip(1) offset
+            //
+            // `--` ends the option list, so only a `--update` before it is
+            // the flag — after it the token is an escaped operand and the
+            // original error stands.
+            let opts_end = argv
+                .iter()
+                .skip(1)
+                .position(|a| a == "--")
+                .map_or(argv.len(), |i| i + 1);
+            // Both spellings clap gives a value-taking long flag are
+            // recognized: the space form (`--update 3.4.0`, whose VERSION
+            // reaches the synthesized subcommand as its positional) and the
+            // inline `--update=3.4.0`, whose value is spliced in where the
+            // flag token was. Without the inline arm clap rejects it as
+            // "unexpected value '3.4.0' for '--update'" — the root flag is a
+            // bool, so the `=` form never reaches the VERSION at all.
+            let update_flag = argv
+                .iter()
+                .enumerate()
+                .take(opts_end)
+                .skip(1)
+                .find_map(|(i, a)| match a.strip_prefix("--update") {
+                    Some("") => Some((i, None)),
+                    Some(rest) => rest.strip_prefix('=').map(|v| (i, Some(v))),
+                    None => None,
+                });
+            if let Some((pos, inline_version)) = update_flag {
                 let mut new_args = Vec::with_capacity(argv.len() + 1);
                 new_args.push(argv[0].clone());
                 new_args.push("self-update".to_string());
                 new_args.extend_from_slice(&argv[1..pos]);
+                if let Some(version) = inline_version {
+                    new_args.push(version.to_string());
+                }
                 new_args.extend_from_slice(&argv[pos + 1..]);
                 return match Cli::try_parse_from(&new_args) {
                     Ok(cli) => Ok(cli),
@@ -513,19 +541,14 @@ mod tests {
     fn update_flag_is_position_independent() {
         // The flag needn't come first: every other arg is preserved in
         // order around the dropped `--update` token.
-        let cli =
-            parse_with_uuid_fallback(argv(&["socket-patch", "--json", "--update"])).unwrap();
+        let cli = parse_with_uuid_fallback(argv(&["socket-patch", "--json", "--update"])).unwrap();
         match cli.command {
             Commands::SelfUpdate(args) => assert!(args.common.json),
             _ => panic!("expected Commands::SelfUpdate"),
         }
-        let cli = parse_with_uuid_fallback(argv(&[
-            "socket-patch",
-            "--update",
-            "--force",
-            "--silent",
-        ]))
-        .unwrap();
+        let cli =
+            parse_with_uuid_fallback(argv(&["socket-patch", "--update", "--force", "--silent"]))
+                .unwrap();
         match cli.command {
             Commands::SelfUpdate(args) => {
                 assert!(args.force);
@@ -587,6 +610,86 @@ mod tests {
     }
 
     #[test]
+    fn update_flag_accepts_the_inline_equals_version() {
+        // `--update <VERSION>` is what the flag's own help advertises, and
+        // clap accepts `--flag=value` for every value-taking long flag. But
+        // the root `--update` is a `bool`, so clap rejects the `=` spelling
+        // outright — "unexpected value '3.4.0' for '--update' found; no more
+        // were expected", i.e. "this flag takes no value at all". The VERSION
+        // only exists on the synthesized subcommand, so the rewrite has to
+        // recognize `--update=<VERSION>` itself.
+        let cli = parse_with_uuid_fallback(argv(&["socket-patch", "--update=3.4.0"])).unwrap();
+        match cli.command {
+            Commands::SelfUpdate(args) => assert_eq!(args.pin_version.as_deref(), Some("3.4.0")),
+            _ => panic!("expected Commands::SelfUpdate"),
+        }
+    }
+
+    #[test]
+    fn update_inline_equals_version_normalizes_and_keeps_neighbours() {
+        // Same leading-`v` normalization as the space form, and the inline
+        // value is spliced in where the flag token was, so the args on either
+        // side keep both their order and their meaning.
+        let cli = parse_with_uuid_fallback(argv(&[
+            "socket-patch",
+            "--json",
+            "--update=v3.4.0",
+            "--force",
+        ]))
+        .unwrap();
+        match cli.command {
+            Commands::SelfUpdate(args) => {
+                assert_eq!(args.pin_version.as_deref(), Some("3.4.0"));
+                assert!(args.common.json, "--json before the flag must survive");
+                assert!(args.force, "--force after the flag must survive");
+            }
+            _ => panic!("expected Commands::SelfUpdate"),
+        }
+    }
+
+    #[test]
+    fn update_inline_equals_garbage_version_is_a_usage_error() {
+        // The inline form validates its VERSION exactly like the space form:
+        // a usage error naming the bad value (exit 2), never a silent
+        // fall-through to a latest-release install.
+        let err = match parse_with_uuid_fallback(argv(&["socket-patch", "--update=latest"])) {
+            Ok(_) => panic!("expected parse to fail"),
+            Err(e) => e,
+        };
+        assert!(err.use_stderr());
+        assert_eq!(err.exit_code(), 2);
+        assert!(err.to_string().contains("not a valid version"), "{err}");
+    }
+
+    #[test]
+    fn update_after_a_double_dash_is_an_operand_not_the_flag() {
+        // `--` ends the option list, so a following `--update` is an escaped
+        // operand. The root command takes no positional, so this is a usage
+        // error — it must NOT be rewritten into a binary-replacing
+        // self-update. (`socket-patch list -- --update` already errors, only
+        // because the rewrite happens to fail there; the root form has to
+        // fail for the right reason.)
+        let err = match parse_with_uuid_fallback(argv(&["socket-patch", "--", "--update"])) {
+            Ok(_) => panic!("`--update` after `--` is an operand, not the flag"),
+            Err(e) => e,
+        };
+        assert!(err.use_stderr(), "a usage error, not a display request");
+        assert_eq!(err.exit_code(), 2);
+    }
+
+    #[test]
+    fn double_dash_after_the_update_flag_still_rewrites() {
+        // Counter-guard for the test above: only a `--` that PRECEDES the
+        // flag ends the option list, so `--update -- 3.4.0` still pins.
+        let cli =
+            parse_with_uuid_fallback(argv(&["socket-patch", "--update", "--", "3.4.0"])).unwrap();
+        match cli.command {
+            Commands::SelfUpdate(args) => assert_eq!(args.pin_version.as_deref(), Some("3.4.0")),
+            _ => panic!("expected Commands::SelfUpdate"),
+        }
+    }
+
+    #[test]
     fn root_help_documents_the_update_flag() {
         let err = match parse_with_uuid_fallback(argv(&["socket-patch", "--help"])) {
             Ok(_) => panic!("clap surfaces --help as an Err"),
@@ -594,7 +697,10 @@ mod tests {
         };
         assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelp);
         let help = err.to_string();
-        assert!(help.contains("--update"), "root help must advertise --update");
+        assert!(
+            help.contains("--update"),
+            "root help must advertise --update"
+        );
         assert!(
             !help.contains("self-update"),
             "the internal subcommand stays hidden from root help"

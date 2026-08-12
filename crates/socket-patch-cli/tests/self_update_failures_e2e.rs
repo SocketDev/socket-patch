@@ -504,7 +504,10 @@ async fn concurrent_update_lock_held() {
     );
     assert_eq!(code, 1, "stdout:\n{stdout}\nstderr:\n{stderr}");
     let env = common::parse_json_envelope(&stdout);
-    assert_eq!(common::envelope_error_code(&env), Some("update_in_progress"));
+    assert_eq!(
+        common::envelope_error_code(&env),
+        Some("update_in_progress")
+    );
     install.assert_binary_intact();
 
     // Release the lock: the very next run must go all the way through.

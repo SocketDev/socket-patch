@@ -39,7 +39,7 @@ pub struct PatchResponse {
     /// `Fri, 27 Mar 2026 19:12:42 GMT` (verified across npm, PyPI, cargo
     /// and gem), while this repo's fixtures use RFC 3339. Never compare
     /// these as raw strings; route through
-    /// [`crate::utils::date::parse_timestamp_secs`], which handles both.
+    /// [`crate::api::date::parse_timestamp_secs`], which handles both.
     pub published_at: String,
     pub files: HashMap<String, PatchFileResponse>,
     pub vulnerabilities: HashMap<String, VulnerabilityResponse>,
@@ -178,7 +178,10 @@ pub struct PackageVendorArtifact {
     /// Every ecosystem's tarball populates `sha512` (npm SRI form
     /// `sha512-<b64>`) + `sha1` + `md5`; golang additionally `dirhash_h1`
     /// (`h1:<b64>`); the npm yarn-berry zip carries only `yarn_berry10c0`
-    /// (`10c0/<sha512-hex>`). No ecosystem exposes a plain sha256.
+    /// (`10c0/<sha512-hex>`). A plain `sha256` IS served and is load-bearing
+    /// for `scan --redirect`: the pypi (`requirements.txt` / `uv.lock`) and
+    /// maven rewriters pin it directly, and cargo / gem fall back to it when
+    /// the `registry_override` identifiers carry no checksum.
     #[serde(default)]
     pub integrity: Integrity,
 }

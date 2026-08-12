@@ -14,8 +14,8 @@ use socket_patch_core::api::types::{BatchPackagePatches, PatchSearchResult};
 use socket_patch_core::crawlers::{CrawlerOptions, Ecosystem};
 use socket_patch_core::manifest::operations::read_manifest;
 use socket_patch_core::manifest::schema::PatchManifest;
+use socket_patch_core::telemetry::{track_patch_scan_failed, track_patch_scanned};
 use socket_patch_core::utils::purl::{normalize_purl, strip_purl_qualifiers};
-use socket_patch_core::utils::telemetry::{track_patch_scan_failed, track_patch_scanned};
 use std::collections::HashSet;
 use std::io::IsTerminal;
 use std::path::Path;
@@ -345,13 +345,16 @@ async fn embed_vex_human(
 /// with the failure on stderr. Passes `is_json = false` to
 /// `select_patches`: scan-driven workflows have no "specify --id" option,
 /// so non-TTY runs auto-select the newest patch rather than erroring with
-/// `selection_required`. `Err` carries the exit code.
+/// `selection_required`. `Err` carries the exit code AND the message: the
+/// JSON callers must fold it into their envelope (every `--json`
+/// invocation emits exactly one JSON object — see CLI_CONTRACT.md), so
+/// the stderr line alone is not enough.
 async fn discover_selected(
     api_client: &socket_patch_core::api::client::ApiClient,
     org_slug: Option<&str>,
     packages: &[BatchPackagePatches],
     can_access_paid_patches: bool,
-) -> Result<Vec<PatchSearchResult>, i32> {
+) -> Result<Vec<PatchSearchResult>, (i32, String)> {
     let mut all_search_results: Vec<PatchSearchResult> = Vec::new();
     let mut error_count = 0usize;
     let mut last_error: Option<String> = None;
@@ -369,13 +372,26 @@ async fn discover_selected(
     }
     if error_count > 0 && error_count == packages.len() {
         let err = last_error.unwrap_or_else(|| "all patch-detail queries failed".to_string());
-        eprintln!("Error: all {error_count} patch-detail queries failed: {err}");
-        return Err(1);
+        let message = format!("all {error_count} patch-detail queries failed: {err}");
+        eprintln!("Error: {message}");
+        return Err((1, message));
     }
     if all_search_results.is_empty() {
         return Ok(Vec::new());
     }
     select_patches(&all_search_results, can_access_paid_patches, false)
+        .map_err(|code| (code, "patch selection failed".to_string()))
+}
+
+/// Fold a [`discover_selected`] failure into a JSON caller's `result` and
+/// print it. The discovery counts already in `result` stay — they were
+/// computed from the (successful) batch phase — while `status`/`error`
+/// mirror the all-batches-failed envelope so JSON consumers see one
+/// consistent scan-error schema instead of empty stdout.
+fn emit_discovery_error_json(result: &mut serde_json::Value, message: &str) {
+    result["status"] = serde_json::json!("error");
+    result["error"] = serde_json::json!(message);
+    println!("{}", serde_json::to_string_pretty(result).unwrap());
 }
 
 /// The `DownloadParams` every scan-driven download shares. Only the output
@@ -544,8 +560,7 @@ pub async fn run(mut args: ScanArgs) -> i32 {
     // exemption (a vendored package is consumed from the committed
     // artifact, so "absent from the crawl" is its normal state, not
     // grounds for pruning) and the vendored-skip in the apply path.
-    let vendored_purls =
-        socket_patch_core::patch::vendor::vendored_purl_keys(&args.common.cwd).await;
+    let vendored_purls = socket_patch_core::vendor::vendored_purl_keys(&args.common.cwd).await;
 
     // Filter by --ecosystems if provided
     let filtered_crawled: Vec<_> = if let Some(ref allowed) = args.common.ecosystems {
@@ -907,7 +922,10 @@ pub async fn run(mut args: ScanArgs) -> i32 {
             .await
             {
                 Ok(s) => s,
-                Err(code) => return code,
+                Err((code, message)) => {
+                    emit_discovery_error_json(&mut result, &message);
+                    return code;
+                }
             };
 
             // Vendor-owned purls are skipped BEFORE download (any uuid);
@@ -1061,13 +1079,24 @@ pub async fn run(mut args: ScanArgs) -> i32 {
         if !args.common.silent {
             println!("\nNo patches available for installed packages.");
         }
-        return embed_vex_human(&args.common, &args.vex, &manifest_path, 0).await;
+        // Vendored mode still has work to do on an empty discovery: the
+        // committed manifest is re-vendored wholesale, which is how a
+        // fresh clone (or a wiped `.socket/vendor/`) gets its artifacts
+        // back. The JSON arm states this outright — "the vendor step
+        // still runs when zero patches were downloaded (re-vendor after a
+        // wipe)" — and `selected.is_empty() && !vendor` below encodes the
+        // same rule; without this the interactive arm never reaches it.
+        if !vendor {
+            return embed_vex_human(&args.common, &args.vex, &manifest_path, 0).await;
+        }
     }
 
     // The whole table + summary section is presentational only (nothing
     // computed inside is consumed downstream), so `--silent` skips it
-    // wholesale.
-    if !args.common.silent {
+    // wholesale — as does an empty discovery, which vendored mode now
+    // falls through with (an all-header, no-row table plus a "0 package(s)"
+    // summary is noise, not information).
+    if !args.common.silent && !all_packages_with_patches.is_empty() {
         let mut updates_available = 0usize;
 
         // Canonical set of PURLs with a newer patch available, computed once via
@@ -1225,14 +1254,21 @@ pub async fn run(mut args: ScanArgs) -> i32 {
     };
 
     if downloadable_count == 0 {
-        if !args.common.silent {
+        // The paid-plan nudge only makes sense when the API DID return
+        // patches; with an empty discovery (vendored mode falls through
+        // the guard above) there is no gated catalog to point at.
+        if !args.common.silent && !all_packages_with_patches.is_empty() {
             println!("\nNo downloadable patches (paid subscription required).");
         }
-        return embed_vex_human(&args.common, &args.vex, &manifest_path, 0).await;
+        // Same reason as above: vendored mode re-vendors the committed
+        // manifest regardless of what discovery turned up.
+        if !vendor {
+            return embed_vex_human(&args.common, &args.vex, &manifest_path, 0).await;
+        }
     }
 
     // Fetch full PatchSearchResult for each package that has patches
-    if show_progress {
+    if show_progress && !all_packages_with_patches.is_empty() {
         eprint!("\nFetching patch details...");
     }
 
@@ -1260,11 +1296,15 @@ pub async fn run(mut args: ScanArgs) -> i32 {
         }
     }
 
-    if show_progress {
+    if show_progress && !all_packages_with_patches.is_empty() {
         eprintln!();
     }
 
-    if all_search_results.is_empty() {
+    // Empty details are a failure only when there WERE packages to fetch
+    // details for. Vendored mode now reaches here with nothing discovered
+    // (see the two guards above) and must fall through to the vendor step
+    // rather than report a fetch failure that never happened.
+    if all_search_results.is_empty() && !all_packages_with_patches.is_empty() {
         eprintln!("Could not fetch patch details.");
         return 1;
     }
@@ -1506,7 +1546,7 @@ pub async fn run(mut args: ScanArgs) -> i32 {
                 if gc.pruned.len() == 1 { "y" } else { "ies" },
                 total,
                 if total == 1 { "" } else { "s" },
-                socket_patch_core::utils::cleanup_blobs::format_bytes(gc.total_bytes()),
+                socket_patch_core::manifest::cleanup_blobs::format_bytes(gc.total_bytes()),
             );
         }
         if !args.common.silent {

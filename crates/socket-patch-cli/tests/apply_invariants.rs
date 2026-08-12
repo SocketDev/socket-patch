@@ -509,3 +509,56 @@ fn apply_with_no_socket_dir_silent_emits_nothing() {
         "non-silent no-manifest run must print the skip message; got {loud_stdout:?}"
     );
 }
+
+/// Regression: only a genuine NotFound means "no `.socket/` set up". Any
+/// other stat error — an unreadable `.socket/` (root-owned directory,
+/// restrictive ACL), a plain file where `.socket/` should be, a symlink
+/// loop — used to take the very same `status: noManifest` / exit-0 path.
+/// A project whose patches were never even read then reported "nothing to
+/// apply", which the install hook and CI both read as success. Fail closed.
+#[cfg(unix)]
+#[test]
+#[ignore = "RED: apply's manifest probe is `tokio::fs::metadata(..).is_err()`, so \
+            an UNREADABLE manifest is reported as the clean `noManifest` no-op \
+            (exit 0) exactly like a missing one — the install hook and CI both \
+            read that as success. The fail-closed fix was not part of this change."]
+fn apply_with_unreadable_socket_dir_fails_closed() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_project(tmp.path());
+    let socket = tmp.path().join(".socket");
+    let manifest = socket.join("manifest.json");
+    let restore = || {
+        let _ = std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o755));
+    };
+
+    // Drop the search bit: the manifest is still there, apply just cannot
+    // stat it.
+    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o000))
+        .expect("chmod .socket");
+    // In-test control: as root (or on a filesystem that ignores mode bits)
+    // the stat still succeeds and there is no fail-open case to exercise.
+    if std::fs::metadata(&manifest).is_ok() {
+        restore();
+        eprintln!("SKIP: .socket/ still readable after chmod 000 (running as root?)");
+        return;
+    }
+
+    let (code, stdout) = run_apply(tmp.path(), &[]);
+    restore();
+
+    assert_ne!(
+        code, 0,
+        "an unreadable manifest must not report success; stdout=\n{stdout}"
+    );
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("envelope must be valid JSON");
+    assert_ne!(
+        v["status"], "noManifest",
+        "\"cannot read\" is not \"not set up\"; envelope: {v}"
+    );
+    assert_eq!(
+        v["error"]["code"], "manifest_unreadable",
+        "expected the manifest_unreadable envelope error; envelope: {v}"
+    );
+}

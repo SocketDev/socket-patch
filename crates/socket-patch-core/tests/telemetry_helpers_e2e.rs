@@ -1,4 +1,4 @@
-//! Integration coverage for `utils::telemetry`'s pub helpers
+//! Integration coverage for `telemetry`'s pub helpers
 //! (`is_telemetry_disabled`, `sanitize_error_message`). These are
 //! exposed for tests + future external callers; the apply/scan
 //! suites never invoke them directly, so the env-var-branch logic
@@ -14,7 +14,7 @@
 //!      that no other ambient var was secretly carrying the assertion).
 
 use serial_test::serial;
-use socket_patch_core::utils::telemetry::{is_telemetry_disabled, sanitize_error_message};
+use socket_patch_core::telemetry::{is_telemetry_disabled, sanitize_error_message};
 
 /// Every environment variable that can independently disable telemetry.
 /// Scrubbing the full set is what makes the per-var causation asserts honest.

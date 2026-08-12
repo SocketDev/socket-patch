@@ -25,6 +25,11 @@ const REDIRECT_CANDIDATE_FILES: &[&str] = &[
     "Cargo.toml",
     "Cargo.lock",
     ".cargo/config.toml",
+    // The LEGACY extensionless spelling: cargo reads `.cargo/config` in
+    // preference to `config.toml` when both exist, so the rewriter must see
+    // it (it wires the managed registry into whichever one is present) —
+    // otherwise the `[registries.…]` block lands in a file cargo ignores.
+    ".cargo/config",
     "composer.lock",
     "nuget.config",
     "packages.lock.json",
@@ -42,6 +47,9 @@ const REDIRECT_CANDIDATE_FILES: &[&str] = &[
     "settings.gradle.kts",
     "build.gradle",
     "build.gradle.kts",
+    // deno.lock is knowingly absent: deno is its own ecosystem and no
+    // redirect rewriter edits its integrity entries today — recording the
+    // decision here so the omission reads as deliberate, not forgotten.
 ];
 
 /// `pkg:<type>/<coordinate>@<version>` → `(type, coordinate, version)`. The
@@ -55,6 +63,22 @@ fn parse_purl_simple(purl: &str) -> Option<(String, String, String)> {
     let (coord, version) = after.rsplit_once('@')?;
     let name = socket_patch_core::utils::purl::percent_decode_purl_component(coord).into_owned();
     Some((typ.to_string(), name, version.to_string()))
+}
+
+/// The hosted-mode JSON error envelope, for bail-outs that return before the
+/// result envelope at the bottom of [`run_redirect`] is built. A `--json`
+/// consumer must always get parseable stdout — `status`/`error` mirror the
+/// success envelope's error fold — never empty output plus an exit code.
+fn emit_json_error(message: &str) {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "status": "error",
+            "error": message,
+            "redirect": { "mode": "hosted" },
+        }))
+        .unwrap()
+    );
 }
 
 /// `scan --redirect`: resolve hosted-patch references for the selected patches,
@@ -83,7 +107,17 @@ pub(super) async fn run_redirect(
     .await
     {
         Ok(s) => s,
-        Err(code) => return code,
+        // Hosted mode has no discovery envelope to fold the message into at
+        // this point (it builds its `redirect` result further down).
+        // `discover_selected` already printed the message to stderr; a
+        // `--json` run additionally gets the machine-readable envelope so
+        // stdout is never empty on failure.
+        Err((code, message)) => {
+            if args.common.json {
+                emit_json_error(&message);
+            }
+            return code;
+        }
     };
 
     let mut skipped: Vec<serde_json::Value> = Vec::new();
@@ -101,7 +135,11 @@ pub(super) async fn run_redirect(
         let references = match api_client.fetch_registry_references(&uuids).await {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("failed to resolve patch references: {e}");
+                let message = format!("failed to resolve patch references: {e}");
+                eprintln!("{message}");
+                if args.common.json {
+                    emit_json_error(&message);
+                }
                 return 1;
             }
         };
@@ -249,7 +287,7 @@ pub(super) async fn run_redirect(
     let mut rush_warnings: Vec<serde_json::Value> = Vec::new();
     let mut rush_lock_keys: Vec<String> = Vec::new();
     if args.common.cwd.join("rush.json").is_file() {
-        let common_lock = "common/config/rush/pnpm-lock.yaml";
+        let common_lock = socket_patch_core::constants::npm_family::RUSH_COMMON_LOCK_REL;
         if let Ok(content) = std::fs::read_to_string(args.common.cwd.join(common_lock)) {
             files.insert(common_lock.to_string(), content);
             rush_lock_keys.push(common_lock.to_string());
@@ -378,7 +416,11 @@ pub(super) async fn run_redirect(
                 let _ = std::fs::create_dir_all(parent);
             }
             if let Err(e) = std::fs::write(&path, content) {
-                eprintln!("failed to write {rel}: {e}");
+                let message = format!("failed to write {rel}: {e}");
+                eprintln!("{message}");
+                if args.common.json {
+                    emit_json_error(&message);
+                }
                 return 1;
             }
         }
@@ -414,7 +456,11 @@ pub(super) async fn run_redirect(
                 vendor_dir.join("redirect-state.json"),
                 format!("{}\n", serde_json::to_string_pretty(&ledger).unwrap()),
             ) {
-                eprintln!("failed to write .socket/vendor/redirect-state.json: {e}");
+                let message = format!("failed to write .socket/vendor/redirect-state.json: {e}");
+                eprintln!("{message}");
+                if args.common.json {
+                    emit_json_error(&message);
+                }
                 return 1;
             }
         }
@@ -498,8 +544,14 @@ pub(super) async fn run_redirect(
                 confirmed.len(),
                 rewritten.len()
             );
+            // Human output prints the bare strings — `Value`'s `Display`
+            // would JSON-quote them (`skipped "pkg:npm/x" ("forbidden")`).
             for s in &skipped {
-                eprintln!("  skipped {} ({})", s["purl"], s["reason"]);
+                eprintln!(
+                    "  skipped {} ({})",
+                    s["purl"].as_str().unwrap_or_default(),
+                    s["reason"].as_str().unwrap_or_default()
+                );
             }
             // Same warning set as the JSON envelope, same order: the
             // rewriter's own warnings first (e.g. `no package-lock.json`),
@@ -508,13 +560,13 @@ pub(super) async fn run_redirect(
                 eprintln!("  warning: {}", w.detail);
             }
             for w in &record_warnings {
-                eprintln!("  warning: {}", w["detail"]);
+                eprintln!("  warning: {}", w["detail"].as_str().unwrap_or_default());
             }
             for w in &migration_warnings {
-                eprintln!("  warning: {}", w["detail"]);
+                eprintln!("  warning: {}", w["detail"].as_str().unwrap_or_default());
             }
             for w in &rush_warnings {
-                eprintln!("  warning: {}", w["detail"]);
+                eprintln!("  warning: {}", w["detail"].as_str().unwrap_or_default());
             }
             if let Some(statements) = vex_statements {
                 eprintln!(
@@ -536,4 +588,33 @@ pub(super) async fn run_redirect(
         }
     }
     vex_code
+}
+
+#[cfg(test)]
+mod tests {
+    use super::REDIRECT_CANDIDATE_FILES;
+    use socket_patch_core::constants::npm_family;
+
+    #[test]
+    fn redirect_candidates_match_the_shared_npm_family_table() {
+        // Drift guard, both directions, without classifying the non-npm
+        // rows: every table row flagged redirect_candidate must be in the
+        // candidate list, and no npm-family row NOT so flagged may appear
+        // (bun.lockb's absence is deliberate — run_redirect auto-migrates
+        // it before rewriting).
+        for name in npm_family::names_with(|r| r.redirect_candidate) {
+            assert!(
+                REDIRECT_CANDIDATE_FILES.contains(&name),
+                "{name} is flagged redirect_candidate but missing from \
+                 REDIRECT_CANDIDATE_FILES"
+            );
+        }
+        for name in npm_family::names_with(|r| !r.redirect_candidate) {
+            assert!(
+                !REDIRECT_CANDIDATE_FILES.contains(&name),
+                "{name} is deliberately NOT a redirect candidate (see the \
+                 npm_family table) but appears in REDIRECT_CANDIDATE_FILES"
+            );
+        }
+    }
 }

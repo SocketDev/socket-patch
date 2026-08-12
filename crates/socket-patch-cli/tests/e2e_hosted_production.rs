@@ -793,7 +793,7 @@ async fn canary_published_at_is_a_patch_date_not_a_package_date() {
     // PyPI stamps ISO-8601; the patch API stamps RFC 2822. They cannot be
     // compared as strings, so compare the calendar DATE via the same parser
     // the ranking uses.
-    use socket_patch_core::utils::date::parse_timestamp_secs;
+    use socket_patch_core::api::date::parse_timestamp_secs;
     let upload_days: std::collections::HashSet<u64> = uploads
         .iter()
         .filter_map(|u| parse_timestamp_secs(u))
@@ -803,7 +803,7 @@ async fn canary_published_at_is_a_patch_date_not_a_package_date() {
         let Some(secs) = parse_timestamp_secs(published) else {
             panic!(
                 "production publishedAt {published:?} (patch {uuid}) does not parse — \
-                    utils::date must handle every format the API emits"
+                    api::date must handle every format the API emits"
             );
         };
         assert!(

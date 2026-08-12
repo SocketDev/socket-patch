@@ -50,7 +50,10 @@ async fn update_force_swaps_binary_end_to_end() {
             ("SOCKET_API_TOKEN", "secret-canary"),
         ],
     );
-    assert_eq!(code, 0, "update must succeed.\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(
+        code, 0,
+        "update must succeed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
     assert!(
         stdout.contains("Updated socket-patch"),
         "human output must report the update: {stdout}"
@@ -81,7 +84,11 @@ async fn update_force_swaps_binary_end_to_end() {
         );
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(
-            std::fs::metadata(&install.bin).unwrap().permissions().mode() & 0o777,
+            std::fs::metadata(&install.bin)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
             0o755,
             "destination mode must be preserved"
         );
@@ -142,6 +149,51 @@ async fn update_upgrade_branch_swaps() {
     update_fixture::StagedInstall::assert_build_artifact_untouched(&real_hash);
 }
 
+/// The relaxed version self-check's warning must survive `--json`. Human
+/// mode prints it to stderr, but `--json` deliberately silences stderr, so
+/// without `warnings[]` on the envelope a machine consumer is handed a
+/// plain `status: "success"` with no hint that the binary it just
+/// installed reports a different version than the release it was fetched
+/// as — the one signal that says "this mirror served something other than
+/// what you asked for". Regression: the advisories were printed only under
+/// `!json && !silent` and dropped on the floor otherwise.
+#[tokio::test]
+async fn update_json_envelope_carries_version_self_check_warning() {
+    let install = staged_install();
+    let (served, _) = make_served_binary();
+
+    let release = FakeReleaseBuilder::new("9.9.9")
+        .asset_for_current_target(&served)
+        .mount()
+        .await;
+
+    let (code, stdout, stderr) = run_installed(
+        &install,
+        &["--update", "--yes", "--json"],
+        &[("SOCKET_UPDATE_BASE_URL", &release.base_url)],
+    );
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    let env = common::parse_json_envelope(&stdout);
+    let warnings = env["warnings"].as_array().cloned().unwrap_or_default();
+    let advisory = warnings
+        .iter()
+        .find(|w| w["code"] == "update_warning")
+        .unwrap_or_else(|| {
+            panic!("--json must carry the self-check advisory in warnings[]: {stdout}")
+        });
+    let detail = advisory["detail"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains("9.9.9") && detail.contains(CURRENT),
+        "the advisory must name both the requested release and what the \
+         downloaded binary actually reports: {detail}"
+    );
+    // stdout stays a single machine-readable object; stderr stays clean.
+    assert!(
+        !stderr.contains("Warning"),
+        "--json must route the advisory to the envelope, not stderr: {stderr}"
+    );
+}
+
 /// `--dry-run` is check-only: one resolve, zero downloads, zero mutation,
 /// exit 0 — the cheap scriptable "is an update available" probe.
 #[tokio::test]
@@ -165,7 +217,7 @@ async fn update_dry_run_checks_without_downloading() {
     );
     assert_eq!(code, 0);
     let env = common::parse_json_envelope(&stdout);
-    assert_eq!(common::json_string(&env, "command").as_deref(), Some("update"));
+    assert_eq!(common::json_string(&env, "command"), Some("update"));
     assert_eq!(env["dryRun"], true);
     let details = &env["events"][0]["details"];
     assert_eq!(details["updateAvailable"], true);
@@ -260,8 +312,8 @@ async fn update_json_success_envelope_shape() {
     );
     assert_eq!(code, 0, "{stdout}");
     let env = common::parse_json_envelope(&stdout);
-    assert_eq!(common::json_string(&env, "command").as_deref(), Some("update"));
-    assert_eq!(common::json_string(&env, "status").as_deref(), Some("success"));
+    assert_eq!(common::json_string(&env, "command"), Some("update"));
+    assert_eq!(common::json_string(&env, "status"), Some("success"));
     let actions: Vec<&str> = env["events"]
         .as_array()
         .unwrap()

@@ -1167,6 +1167,96 @@ async fn scan_prune_with_ecosystem_filter_keeps_other_ecosystem() {
 }
 
 // ---------------------------------------------------------------------------
+// Regression: --prune must not delete manifest entries of ecosystems this
+// build never crawled.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[serial]
+async fn scan_prune_keeps_entry_of_uncrawled_ecosystem() {
+    // `.socket/manifest.json` is a COMMITTED, shared file. A teammate on a
+    // newer CLI can add a patch for an ecosystem this binary has no crawler
+    // for (here `pkg:hex/…`; the runtime-gated maven/nuget crawlers behave
+    // the same way with their gate off). That purl is never looked for, so
+    // its absence from the crawl says nothing about whether it is installed
+    // — yet prune treated "not in scanned_purls" as "uninstalled" and
+    // deleted both the entry and its blob: silent, cross-machine patch loss.
+    let server = MockServer::start().await;
+    mock_batch_empty(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_root_package_json(tmp.path());
+    write_npm_package(tmp.path(), "live-npm", "1.0.0");
+
+    let socket = tmp.path().join(".socket");
+    let blobs = socket.join("blobs");
+    std::fs::create_dir_all(&blobs).unwrap();
+    let after_hash = "a".repeat(64);
+    let blob = blobs.join(&after_hash);
+    std::fs::write(&blob, vec![0u8; 64]).unwrap();
+    std::fs::write(
+        socket.join("manifest.json"),
+        format!(
+            r#"{{ "patches": {{
+            "pkg:npm/live-npm@1.0.0": {{
+                "uuid": "11111111-1111-4111-8111-111111111111",
+                "exportedAt": "2024-01-01T00:00:00Z",
+                "files": {{}}, "vulnerabilities": {{}},
+                "description": "live npm", "license": "MIT", "tier": "free"
+            }},
+            "pkg:npm/orphan-npm@9.9.9": {{
+                "uuid": "22222222-2222-4222-8222-222222222222",
+                "exportedAt": "2024-01-01T00:00:00Z",
+                "files": {{}}, "vulnerabilities": {{}},
+                "description": "orphan npm", "license": "MIT", "tier": "free"
+            }},
+            "pkg:hex/plug@1.14.0": {{
+                "uuid": "33333333-3333-4333-8333-333333333333",
+                "exportedAt": "2024-01-01T00:00:00Z",
+                "files": {{
+                    "lib/plug.ex": {{
+                        "beforeHash": "{zeros}",
+                        "afterHash": "{after_hash}"
+                    }}
+                }},
+                "vulnerabilities": {{}},
+                "description": "unsupported ecosystem", "license": "MIT", "tier": "free"
+            }}
+        }}}}"#,
+            zeros = "0".repeat(64),
+        ),
+    )
+    .unwrap();
+
+    let mut args = default_args(tmp.path());
+    args.common.api_url = Some(server.uri());
+    args.prune = true;
+
+    assert_eq!(run_scrubbed(args).await, 0);
+
+    let body = std::fs::read_to_string(socket.join("manifest.json")).unwrap();
+    let m: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let patches = m["patches"].as_object().unwrap();
+
+    assert!(
+        !patches.contains_key("pkg:npm/orphan-npm@9.9.9"),
+        "the genuinely-uninstalled npm orphan must still be pruned; got {m}"
+    );
+    assert!(
+        patches.contains_key("pkg:npm/live-npm@1.0.0"),
+        "the installed npm entry must be kept; got {m}"
+    );
+    assert!(
+        patches.contains_key("pkg:hex/plug@1.14.0"),
+        "an entry of an ecosystem this build never crawled must NOT be pruned; got {m}"
+    );
+    assert!(
+        blob.exists(),
+        "the uncrawled entry's blob must survive the orphan sweep"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Regression: ambient VIRTUAL_ENV must not leak into the scan.
 // ---------------------------------------------------------------------------
 

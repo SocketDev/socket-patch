@@ -23,20 +23,20 @@ use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
 use socket_patch_core::patch::apply::{verify_file_patch, PatchSources};
 use socket_patch_core::patch::copy_tree::remove_tree;
-use socket_patch_core::patch::vendor::{
+use socket_patch_core::telemetry::{track_patch_vendor_failed, track_patch_vendored};
+use socket_patch_core::utils::purl::{normalize_purl, strip_purl_qualifiers};
+use socket_patch_core::vendor::{
     self, ecosystem_dir_for_purl, load_state, lock_inventory, lookup_entry, registry_fetch,
     save_state, RevertOutcome, VendorEntry, VendorOutcome, VendorServiceConfig, VendorSource,
     VendorState, VendorWarning,
 };
-use socket_patch_core::utils::purl::{normalize_purl, strip_purl_qualifiers};
-use socket_patch_core::utils::telemetry::{track_patch_vendor_failed, track_patch_vendored};
 use socket_patch_core::vex::time::now_rfc3339;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Duration;
 
 use crate::args::{apply_env_toggles, GlobalArgs};
-use crate::commands::apply::{result_to_event, variant_matches_installed};
+use crate::commands::apply::{representative_file, result_to_event, variant_matches_installed};
 use crate::commands::fetch_stage::{stage_vendor_sources_in_memory, MemStageOutcome};
 use crate::commands::lock_cli::acquire_or_emit;
 use crate::commands::vex::{generate_vex_from_manifest_path, VexEmbedArgs};
@@ -321,15 +321,27 @@ pub async fn run(args: VendorArgs) -> i32 {
 
     // Same lock as apply/rollback: vendor mutates the same lockfiles and
     // `.socket/` tree, so a separate lock would allow an apply↔vendor race.
-    let _lock = match acquire_or_emit(
-        &socket_dir,
-        Command::Vendor,
-        args.common.json,
-        args.common.dry_run,
-        Duration::from_secs(args.common.lock_timeout.unwrap_or(0)),
-    ) {
-        Ok(guard) => guard,
-        Err(code) => return code,
+    //
+    // The lock file lives INSIDE `.socket/`, and `acquire` creates the file
+    // but never its parent. `--revert` skipped the manifest check above, so
+    // it is the one path that can reach here with no `.socket/` dir at all —
+    // the documented clean no-op ("a missing ledger is an empty ledger").
+    // Locking first would turn that into a `lock_io` failure, so skip it:
+    // with no `.socket/` there is no ledger to read and nothing to write,
+    // hence nothing to serialize against.
+    let _lock = if args.revert && tokio::fs::metadata(&socket_dir).await.is_err() {
+        None
+    } else {
+        match acquire_or_emit(
+            &socket_dir,
+            Command::Vendor,
+            args.common.json,
+            args.common.dry_run,
+            Duration::from_secs(args.common.lock_timeout.unwrap_or(0)),
+        ) {
+            Ok(guard) => Some(guard),
+            Err(code) => return code,
+        }
     };
 
     let mut env = Envelope::new(Command::Vendor);
@@ -445,16 +457,12 @@ async fn run_vendor(
     // writes blobs or temp files (the committed artifact is the patch).
     let staged =
         match stage_vendor_sources_in_memory(common, &manifest, socket_dir, &common.cwd).await {
-            Ok(MemStageOutcome::Ready(s)) => s,
-            Ok(MemStageOutcome::Unavailable) => {
+            MemStageOutcome::Ready(s) => s,
+            MemStageOutcome::Unavailable => {
                 env.mark_error(EnvelopeError::new(
                     "no_local_source",
                     "patch artifacts unavailable (offline or download failure)",
                 ));
-                return 1;
-            }
-            Err(e) => {
-                env.mark_error(EnvelopeError::new("stage_failed", e));
                 return 1;
             }
         };
@@ -883,7 +891,12 @@ pub(crate) async fn vendor_records(
             let probe_applicable = is_variant_eco
                 && !matches!(Ecosystem::from_purl(candidate), Some(Ecosystem::Maven));
             if probe_applicable && !force {
-                let first = match record.files.iter().next() {
+                // The representative must be a file that MODIFIES existing
+                // content: a new file (empty beforeHash) verifies `Ready`
+                // against any environment, so it can neither identify nor
+                // disqualify a variant. Same deterministic pick as apply /
+                // core's `select_installed_variants`.
+                let first = match representative_file(&record.files) {
                     Some((f, info)) => Some(verify_file_patch(pkg_path, f, info).await.status),
                     None => None,
                 };
@@ -1383,7 +1396,7 @@ pub(crate) async fn run_vendor_gc(
 #[cfg(test)]
 mod dispatch_tests {
     use super::*;
-    use socket_patch_core::patch::vendor::VendorSource;
+    use socket_patch_core::vendor::VendorSource;
 
     /// Fail-closed `--vendor-source=service` must not refuse maven at the
     /// dispatch gate: the maven backend has a full service path (prebuilt
@@ -1431,12 +1444,133 @@ mod dispatch_tests {
         .await;
         // The backend itself may refuse (nothing is installed in the
         // fixture) — the gate just must not be what stops it.
-        match outcome {
-            Some(VendorOutcome::Refused { code, .. }) => assert_ne!(
+        if let Some(VendorOutcome::Refused { code, .. }) = outcome {
+            assert_ne!(
                 code, "vendor_service_unsupported_ecosystem",
                 "maven has a service backend; the dispatch gate must admit it"
-            ),
-            _ => {}
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod variant_probe_tests {
+    use super::*;
+    use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
+    use socket_patch_core::manifest::schema::PatchFileInfo;
+
+    const UUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
+    const WHEEL: &str = "pkg:pypi/foo@1.0.0?artifact_id=foo-1.0.0-py3-none-any.whl";
+    const SDIST: &str = "pkg:pypi/foo@1.0.0?artifact_id=foo-1.0.0.tar.gz";
+
+    fn record(files: &[(&str, &str, &str)]) -> PatchRecord {
+        PatchRecord {
+            uuid: UUID.to_string(),
+            exported_at: String::new(),
+            files: files
+                .iter()
+                .map(|(name, before, after)| {
+                    (
+                        (*name).to_string(),
+                        PatchFileInfo {
+                            before_hash: (*before).to_string(),
+                            after_hash: (*after).to_string(),
+                        },
+                    )
+                })
+                .collect(),
+            vulnerabilities: HashMap::new(),
+            description: String::new(),
+            license: String::new(),
+            tier: String::new(),
+        }
+    }
+
+    /// The release-variant probe must never pick a NEW file (empty
+    /// `beforeHash`) as the representative that decides whether a variant
+    /// describes the installed distribution: a new file verifies `Ready`
+    /// against *any* environment, so it can neither identify nor
+    /// disqualify a variant.
+    ///
+    /// Fixture: an installed wheel of `foo@1.0.0` (its `foo/__init__.py`
+    /// matches the wheel variant's `beforeHash`) plus a manifest sdist
+    /// variant that is NOT installed — it patches `setup.py` (absent from
+    /// the wheel install → `NotFound`) and adds one new file. With the
+    /// representative taken from `HashMap::iter().next()` the sdist's new
+    /// file comes up first roughly half the time, `Ready` admits the
+    /// not-installed variant, and `vendor` attempts to vendor it — the
+    /// same nondeterminism that was fixed in core's
+    /// `select_installed_variants` and in `apply`'s variant loop.
+    #[tokio::test]
+    async fn variant_probe_never_picks_a_new_file_as_representative() {
+        let tmp = tempfile::tempdir().unwrap();
+        let site = tmp.path().join("site-packages");
+        tokio::fs::create_dir_all(site.join("foo-1.0.0.dist-info"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            site.join("foo-1.0.0.dist-info").join("METADATA"),
+            "Name: foo\nVersion: 1.0.0\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::create_dir_all(site.join("foo")).await.unwrap();
+        let installed = b"print('hi')\n";
+        tokio::fs::write(site.join("foo").join("__init__.py"), installed)
+            .await
+            .unwrap();
+        let before = compute_git_sha256_from_bytes(installed);
+        let elsewhere = compute_git_sha256_from_bytes(b"setup(name='foo')\n");
+        let after = compute_git_sha256_from_bytes(b"patched\n");
+
+        let common = GlobalArgs {
+            cwd: tmp.path().to_path_buf(),
+            // Aim the pypi crawler at the fixture site-packages: hermetic,
+            // and no real interpreter needed.
+            global_prefix: Some(site.clone()),
+            ecosystems: Some(vec!["pypi".to_string()]),
+            dry_run: true,
+            offline: true,
+            json: true,
+            silent: true,
+            ..GlobalArgs::default()
+        };
+        let sources = PatchSources {
+            blobs_path: tmp.path(),
+            packages_path: None,
+            diffs_path: None,
+            mem_blobs: None,
+        };
+
+        // `HashMap` iteration order is randomized per instance, so build a
+        // fresh `records` map (and hence fresh per-record `files` maps)
+        // every round.
+        for round in 0..32 {
+            let mut records: HashMap<String, PatchRecord> = HashMap::new();
+            records.insert(
+                WHEEL.to_string(),
+                record(&[("foo/__init__.py", &before, &after)]),
+            );
+            records.insert(
+                SDIST.to_string(),
+                record(&[
+                    // Sorts before `setup.py`, so a lex-only representative
+                    // pick would still be caught.
+                    ("aaa_added_by_the_sdist.py", "", &after),
+                    ("setup.py", &elsewhere, &after),
+                ]),
+            );
+
+            let mut env = Envelope::new(Command::Vendor);
+            vendor_records(&common, &records, &sources, false, false, &mut env, None).await;
+
+            assert!(
+                !env.events.iter().any(|e| e.purl.as_deref() == Some(SDIST)),
+                "round {round}: the sdist variant is not the installed distribution \
+                 (its only discriminating file, setup.py, is absent) — vendor must not \
+                 act on it; events: {:?}",
+                env.events
+            );
         }
     }
 }
@@ -1444,7 +1578,7 @@ mod dispatch_tests {
 #[cfg(test)]
 mod gc_tests {
     use super::*;
-    use socket_patch_core::patch::vendor::state::VendorArtifact;
+    use socket_patch_core::vendor::state::VendorArtifact;
     use std::path::PathBuf;
 
     const UUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
