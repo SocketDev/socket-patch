@@ -17,8 +17,16 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
 
 # Install bun. Default install of latest stable. The script sets
 # BUN_INSTALL=~/.bun by default; we symlink the binary onto PATH so
-# every test can call it directly.
-RUN curl -fsSL https://bun.sh/install | bash \
+# every test can call it directly. Retried: the script downloads the
+# release zip from GitHub with NO retry of its own, and a transient
+# CDN drop ("curl: (56) Connection died") has failed whole CI image
+# builds over a single blip.
+RUN for i in 1 2 3; do \
+      curl -fsSL https://bun.sh/install | bash && break; \
+      [ "$i" = 3 ] && exit 1; \
+      echo "bun install attempt $i failed; retrying in $((i * 10))s"; \
+      sleep $((i * 10)); \
+    done \
  && ln -s /root/.bun/bin/bun /usr/local/bin/bun
 
 # Enable pnpm and yarn via corepack (bundled with Node 20). The
