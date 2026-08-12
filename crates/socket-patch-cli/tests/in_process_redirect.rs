@@ -1579,6 +1579,76 @@ async fn rush_stale_warning_requires_an_actual_lock_edit() {
     );
 }
 
+/// A plain (non-Rush) pnpm project whose only lockfile is a root
+/// `pnpm-lock.yaml` (lockfileVersion 9.0) resolving the patched package, plus
+/// the installed `node_modules/<NAME>` copy the crawler discovers.
+fn write_pnpm_project(root: &Path) {
+    std::fs::write(
+        root.join("package.json"),
+        format!(
+            r#"{{ "name": "consumer", "version": "0.0.0", "dependencies": {{ "{NAME}": "{VERSION}" }} }}"#
+        ),
+    )
+    .unwrap();
+    write_installed(root, NAME, VERSION, b"unpatched installed bytes\n");
+    std::fs::write(root.join("pnpm-lock.yaml"), rush_pnpm_lock(NAME)).unwrap();
+}
+
+/// A hosted redirect that rewrites a `pnpm-lock.yaml` must warn that pnpm >=11's
+/// lockfile supply-chain policy will REJECT the rewritten lock
+/// (`ERR_PNPM_TARBALL_URL_MISMATCH` — the repointed tarball URL no longer
+/// matches the registry's published metadata) and name the documented
+/// `pnpm install --trust-lockfile` opt-out — the same way the Rush repo-state
+/// case surfaces its own post-rewrite install caveat. The npm twin
+/// (package-lock.json, no pnpm lock) rewrites identically but emits no such
+/// warning. Subprocess so the `--json` `warnings[]` array can be read back.
+#[tokio::test]
+#[serial]
+async fn pnpm_lock_redirect_warns_to_trust_lockfile() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+
+    // pnpm project: the root pnpm-lock.yaml is rewritten → the warning fires.
+    let pnpm = tempfile::tempdir().unwrap();
+    write_pnpm_project(pnpm.path());
+    let env = run_redirect_subprocess(pnpm.path(), &server.uri());
+    assert_eq!(env["status"], "success", "envelope: {env}");
+    assert_eq!(
+        env["redirect"]["redirected"], 1,
+        "anchor: the pnpm lock must have been redirected: {env}"
+    );
+    assert!(
+        warning_codes(&env).contains(&"redirect_pnpm_trust_lockfile".to_string()),
+        "a rewritten pnpm-lock.yaml must warn about the pnpm >=11 policy; got warnings {:?}",
+        warning_codes(&env)
+    );
+    // The warning must NAME the documented opt-out flag.
+    let detail = env["redirect"]["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["code"] == "redirect_pnpm_trust_lockfile")
+        .and_then(|w| w["detail"].as_str())
+        .unwrap_or_default();
+    assert!(
+        detail.contains("--trust-lockfile"),
+        "the warning must name `pnpm install --trust-lockfile`; got: {detail}"
+    );
+
+    // npm twin: only a package-lock.json is rewritten → no pnpm warning.
+    let npm = tempfile::tempdir().unwrap();
+    write_project(npm.path());
+    let env = run_redirect_subprocess(npm.path(), &server.uri());
+    assert_eq!(env["status"], "success", "envelope: {env}");
+    assert!(
+        !warning_codes(&env).contains(&"redirect_pnpm_trust_lockfile".to_string()),
+        "an npm-only redirect must not emit the pnpm trust-lockfile warning; got warnings {:?}",
+        warning_codes(&env)
+    );
+}
+
 /// Cargo's hosted redirect wires the managed sparse registry into
 /// `.cargo/config.toml` — but a project carrying the LEGACY extensionless
 /// `.cargo/config` is one cargo READS INSTEAD (it warns about the duplicate
