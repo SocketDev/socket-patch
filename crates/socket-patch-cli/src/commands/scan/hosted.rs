@@ -518,6 +518,21 @@ pub(super) async fn run_redirect(
         }
     }
 
+    // Cross-mode takeover: this hosted redirect rewired the lockfile, but a
+    // committed vendored ledger (`.socket/vendor/state.json`) may still claim
+    // the same package(s) — their tarballs are now orphaned and that ledger is
+    // stale. Detect + warn (JSON `warnings[]` and stderr) WITHOUT deleting the
+    // other mode's ledger; full reconciliation is deferred (see PR Scope).
+    // Read after the ledger write above so a non-dry-run reflects this run.
+    let mut takeover_warnings: Vec<serde_json::Value> = Vec::new();
+    let superseded = super::overlapping_ledger_purls(&args.common.cwd).await;
+    if !superseded.is_empty() {
+        takeover_warnings.push(serde_json::json!({
+            "code": super::REDIRECT_SUPERSEDES_VENDORED,
+            "detail": super::mode_takeover_detail(&superseded, /*current_is_hosted=*/ true),
+        }));
+    }
+
     // Emit an OpenVEX attestation when `--vex` was requested. The redirected
     // bytes are fetched from the hosted patch server at install time, so the
     // PURLs CONFIRMED REDIRECTED BY THIS RUN are attested from the ledger
@@ -559,6 +574,7 @@ pub(super) async fn run_redirect(
         warnings.extend(migration_warnings.iter().cloned());
         warnings.extend(rush_warnings.iter().cloned());
         warnings.extend(pnpm_warnings.iter().cloned());
+        warnings.extend(takeover_warnings.iter().cloned());
         // Nest the redirect result under `redirect` inside the classic scan
         // object (built by `run`, threaded in via `scan_result`), mirroring
         // vendored mode's nested `vendor` block. This keeps the hosted `--json`
@@ -627,6 +643,9 @@ pub(super) async fn run_redirect(
                 eprintln!("  warning: {}", w["detail"].as_str().unwrap_or_default());
             }
             for w in &pnpm_warnings {
+                eprintln!("  warning: {}", w["detail"].as_str().unwrap_or_default());
+            }
+            for w in &takeover_warnings {
                 eprintln!("  warning: {}", w["detail"].as_str().unwrap_or_default());
             }
             if let Some(statements) = vex_statements {

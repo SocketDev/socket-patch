@@ -415,6 +415,93 @@ fn download_params(args: &ScanArgs, save_only: bool, json: bool, silent: bool) -
     }
 }
 
+// ---------------------------------------------------------------------------
+// Cross-mode ledger takeover detection (hosted ⇄ vendored)
+// ---------------------------------------------------------------------------
+//
+// Hosted mode writes `.socket/vendor/redirect-state.json`; vendored mode
+// writes `.socket/vendor/state.json` (+ committed tarballs). Switching a
+// project's mode rewires the lockfile to the NEW mode but leaves the OLD
+// mode's ledger on disk asserting wiring that is no longer live (and, for
+// vendored→hosted, the orphaned tarball behind). Anything auditing a ledger
+// as "what is live" (including `vex`) is then misled. Detect the overlap so
+// each flow can warn; reconciliation (removing the stale ledger / orphaned
+// artifacts) is deliberately deferred so neither mode silently mutates the
+// other's ledger.
+
+/// Warning code emitted by the HOSTED flow when it just redirected package(s)
+/// a committed vendored ledger still claims (its tarballs are now orphaned).
+pub(super) const REDIRECT_SUPERSEDES_VENDORED: &str = "redirect_supersedes_vendored";
+
+/// Warning code emitted by the VENDORED flow when it just vendored package(s)
+/// a committed hosted redirect ledger still claims.
+pub(super) const VENDOR_SUPERSEDES_REDIRECT: &str = "vendor_supersedes_redirect";
+
+/// The PURLs claimed by BOTH the hosted redirect ledger
+/// (`.socket/vendor/redirect-state.json`) and the vendored state ledger
+/// (`.socket/vendor/state.json`) in `cwd`, sorted. A non-empty result means
+/// one mode has taken the lockfile over from the other for these package(s)
+/// while the displaced mode's ledger stayed on disk — exactly one of the two
+/// ledgers is stale for each PURL (a package's lockfile entry can point only
+/// one way). Empty when either ledger is missing/empty/unreadable, or when the
+/// two ledgers describe disjoint packages (a legitimate split: some redirected,
+/// others vendored) — so there are no false positives.
+pub(super) async fn overlapping_ledger_purls(cwd: &Path) -> Vec<String> {
+    let Some(redirect) = socket_patch_core::patch::redirect::load_redirect_state(cwd).await else {
+        return Vec::new();
+    };
+    let Ok(vendor) = socket_patch_core::vendor::load_state(cwd).await else {
+        return Vec::new();
+    };
+    if redirect.records.is_empty() || vendor.entries.is_empty() {
+        return Vec::new();
+    }
+    // Canonicalize both sides (drop qualifiers, percent-decode) so the API
+    // purl form the redirect records carry matches the vendor entry's base
+    // purl — mirrors `vendored_ledger_supplement`.
+    let canon = |p: &str| normalize_purl(strip_purl_qualifiers(p)).into_owned();
+    let redirect_purls: std::collections::BTreeSet<String> =
+        redirect.records.keys().map(|p| canon(p)).collect();
+    let mut vendor_purls: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for (key, entry) in &vendor.entries {
+        vendor_purls.insert(canon(key));
+        vendor_purls.insert(canon(&entry.base_purl));
+    }
+    redirect_purls
+        .intersection(&vendor_purls)
+        .cloned()
+        .collect()
+}
+
+/// Human-readable detail for a mode-takeover warning naming the displaced
+/// package(s). `current_is_hosted` selects the direction: `true` when a
+/// hosted redirect displaced a vendored ledger, `false` when a vendored run
+/// displaced a hosted redirect ledger.
+pub(super) fn mode_takeover_detail(superseded: &[String], current_is_hosted: bool) -> String {
+    let list = superseded.join(", ");
+    if current_is_hosted {
+        format!(
+            "hosted redirect superseded the vendored ledger for: {list}. \
+             `.socket/vendor/state.json` still claims these package(s) and their \
+             committed tarball(s) under `.socket/vendor/` are now orphaned — the \
+             lockfile points at the hosted patch server, not the vendored files. \
+             Remove the stale vendored ledger and orphaned artifacts (run \
+             `socket-patch vendor --revert` before redirecting, or delete the \
+             orphaned `.socket/vendor/<eco>/` tree) so audits and VEX do not read \
+             superseded wiring."
+        )
+    } else {
+        format!(
+            "vendored artifacts superseded the hosted redirect ledger for: {list}. \
+             `.socket/vendor/redirect-state.json` still records a hosted redirect for \
+             these package(s), but the lockfile now points at the committed \
+             `.socket/vendor/` files. Remove the stale redirect ledger \
+             (`.socket/vendor/redirect-state.json`) so audits and VEX do not read \
+             superseded wiring."
+        )
+    }
+}
+
 pub async fn run(mut args: ScanArgs) -> i32 {
     apply_env_toggles(&args.common);
 
@@ -1651,5 +1738,134 @@ mod tests {
         let out = truncate_with_ellipsis(&summary, 76);
         assert_eq!(out.chars().count(), 76);
         assert!(out.ends_with("..."));
+    }
+
+    // ---- cross-mode ledger takeover (hosted ⇄ vendored) --------------------
+    // Switching a project's patch mode rewires the lockfile to the new mode
+    // but leaves the OLD mode's ledger on disk asserting stale wiring. These
+    // pin the detection + warning that flags it (the sweep's
+    // stale-ledger-on-mode-takeover finding).
+
+    const TAKEOVER_UUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
+
+    fn takeover_record() -> PatchRecord {
+        PatchRecord {
+            uuid: TAKEOVER_UUID.to_string(),
+            exported_at: "2026-01-01T00:00:00Z".to_string(),
+            files: HashMap::new(),
+            vulnerabilities: HashMap::new(),
+            description: String::new(),
+            license: "MIT".to_string(),
+            tier: "free".to_string(),
+        }
+    }
+
+    /// Write a hosted redirect ledger (`.socket/vendor/redirect-state.json`)
+    /// recording a redirect for each PURL.
+    async fn write_redirect_ledger(root: &Path, purls: &[&str]) {
+        use socket_patch_core::patch::redirect::RedirectState;
+        let mut state = RedirectState::new();
+        for purl in purls {
+            state.records.insert((*purl).to_string(), takeover_record());
+        }
+        let dir = root.join(".socket/vendor");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(
+            dir.join("redirect-state.json"),
+            serde_json::to_string_pretty(&state).unwrap(),
+        )
+        .await
+        .unwrap();
+    }
+
+    /// Write a vendored state ledger (`.socket/vendor/state.json`) with one
+    /// entry per PURL, in the committed camelCase wire shape.
+    async fn write_vendor_ledger(root: &Path, purls: &[&str]) {
+        let entries: serde_json::Map<String, serde_json::Value> = purls
+            .iter()
+            .map(|purl| {
+                (
+                    (*purl).to_string(),
+                    serde_json::json!({
+                        "ecosystem": "npm",
+                        "basePurl": purl,
+                        "uuid": TAKEOVER_UUID,
+                        "artifact": {
+                            "path": format!(".socket/vendor/npm/{TAKEOVER_UUID}/pkg.tgz"),
+                        },
+                        "wiring": [],
+                    }),
+                )
+            })
+            .collect();
+        let state = serde_json::json!({ "version": 1, "entries": entries });
+        let dir = root.join(".socket/vendor");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(
+            dir.join("state.json"),
+            serde_json::to_string_pretty(&state).unwrap(),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn overlapping_ledgers_flag_the_taken_over_package() {
+        // Both ledgers claim minimist ⇒ one mode took the lockfile over from
+        // the other and the displaced ledger is stale. The detection names
+        // exactly the overlapping PURL.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_redirect_ledger(root, &["pkg:npm/minimist@1.2.2"]).await;
+        write_vendor_ledger(root, &["pkg:npm/minimist@1.2.2"]).await;
+
+        let superseded = overlapping_ledger_purls(root).await;
+        assert_eq!(superseded, vec!["pkg:npm/minimist@1.2.2".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn single_ledger_present_flags_nothing() {
+        // A first-time redirect (only the redirect ledger, no vendored ledger)
+        // displaces nothing — no warning. Guards against warning on the FIRST
+        // scan of a fresh project.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_redirect_ledger(root, &["pkg:npm/minimist@1.2.2"]).await;
+        assert!(overlapping_ledger_purls(root).await.is_empty());
+
+        // And a project with no ledgers at all.
+        let tmp2 = tempfile::tempdir().unwrap();
+        assert!(overlapping_ledger_purls(tmp2.path()).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn disjoint_ledgers_are_not_a_takeover() {
+        // A legitimate split — one package redirected, a DIFFERENT one
+        // vendored — is not a takeover: neither ledger's wiring is stale.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_redirect_ledger(root, &["pkg:npm/minimist@1.2.2"]).await;
+        write_vendor_ledger(root, &["pkg:npm/lodash@4.17.21"]).await;
+        assert!(overlapping_ledger_purls(root).await.is_empty());
+    }
+
+    #[test]
+    fn takeover_detail_names_direction_package_and_remediation() {
+        let purls = vec!["pkg:npm/minimist@1.2.2".to_string()];
+
+        // Vendored displaced a hosted redirect: point at the redirect ledger.
+        let vendored = mode_takeover_detail(&purls, /*current_is_hosted=*/ false);
+        assert!(vendored.contains("pkg:npm/minimist@1.2.2"));
+        assert!(vendored.contains("redirect-state.json"));
+
+        // Hosted displaced a vendored ledger: point at the vendored ledger +
+        // orphaned artifacts.
+        let hosted = mode_takeover_detail(&purls, /*current_is_hosted=*/ true);
+        assert!(hosted.contains("pkg:npm/minimist@1.2.2"));
+        assert!(hosted.contains("state.json"));
+        assert!(hosted.contains("orphaned"));
+
+        // The two warning codes are distinct routing tags.
+        assert_ne!(VENDOR_SUPERSEDES_REDIRECT, REDIRECT_SUPERSEDES_VENDORED);
     }
 }
