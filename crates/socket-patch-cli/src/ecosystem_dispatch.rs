@@ -34,6 +34,18 @@ fn warn_maven_disabled(skipped: usize) {
     eprintln!("  Set SOCKET_EXPERIMENTAL_MAVEN=1 to enable at your own risk.");
 }
 
+/// Discovery-path counterpart to [`warn_maven_disabled`]. `scan --mode
+/// vendored`/`hosted` reaches the Maven repo through `crawl_all_ecosystems`,
+/// not the partitioned-apply path, so the apply-time warning never fires
+/// there. When a Maven project is present but the experimental flag is off,
+/// discovery is skipped silently and the scan reports zero Maven packages
+/// with no explanation — surface the skip so the user knows why.
+fn warn_maven_discovery_gated() {
+    eprintln!("Warning: Maven project detected but not scanned — Maven support is experimental.");
+    eprintln!("  Maven patches corrupt jar sidecar checksums (sha1/md5).");
+    eprintln!("  Set SOCKET_EXPERIMENTAL_MAVEN=1 to enable Maven discovery.");
+}
+
 /// Runtime opt-in gate for experimental NuGet support. Same shape as
 /// the Maven gate. Even with the sidecar fixup deleting
 /// `.nupkg.metadata`, signed packages still carry a `.nupkg.sha512`
@@ -55,10 +67,46 @@ fn warn_nuget_disabled(skipped: usize) {
     eprintln!("  Set SOCKET_EXPERIMENTAL_NUGET=1 to enable at your own risk.");
 }
 
+/// Discovery-path counterpart to [`warn_nuget_disabled`]; see
+/// [`warn_maven_discovery_gated`] for why the apply-time warning is not
+/// enough on the crawl path.
+fn warn_nuget_discovery_gated() {
+    eprintln!("Warning: NuGet project detected but not scanned — NuGet support is experimental.");
+    eprintln!("  NuGet patches corrupt the .nupkg.sha512 signature sidecar that");
+    eprintln!("  `dotnet restore` reads as tamper-evidence.");
+    eprintln!("  Set SOCKET_EXPERIMENTAL_NUGET=1 to enable NuGet discovery.");
+}
+
 fn env_truthy(name: &str) -> bool {
     std::env::var(name)
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
+}
+
+/// Should [`crawl_all_ecosystems`] warn that a Maven project on disk was
+/// skipped? True only when the experimental runtime flag is OFF *and* the
+/// crawler would actually have found Maven sources (a Maven/Gradle project
+/// plus its local repository). Reusing the crawler's own path discovery
+/// keeps the signal aligned with exactly what an opted-in scan would crawl,
+/// and guards the warning against firing on non-Maven projects (one warning
+/// per run, only when something was really skipped).
+async fn maven_discovery_gated_off(options: &CrawlerOptions) -> bool {
+    !maven_runtime_enabled()
+        && !MavenCrawler
+            .get_maven_repo_paths(options)
+            .await
+            .unwrap_or_default()
+            .is_empty()
+}
+
+/// NuGet counterpart to [`maven_discovery_gated_off`].
+async fn nuget_discovery_gated_off(options: &CrawlerOptions) -> bool {
+    !nuget_runtime_enabled()
+        && !NuGetCrawler
+            .get_nuget_package_paths(options)
+            .await
+            .unwrap_or_default()
+            .is_empty()
 }
 
 /// Whether [`crawl_all_ecosystems`] actually visits this PURL's ecosystem
@@ -454,10 +502,17 @@ pub async fn crawl_all_ecosystems(
         // walks the Maven repo only when the operator has explicitly
         // opted into experimental support.
         crawl!(Ecosystem::Maven, MavenCrawler);
+    } else if maven_discovery_gated_off(options).await {
+        // A Maven/Gradle project is present on disk but discovery is gated
+        // off; without this the scan silently reports zero Maven packages.
+        warn_maven_discovery_gated();
     }
     crawl!(Ecosystem::Composer, ComposerCrawler);
     if nuget_runtime_enabled() {
         crawl!(Ecosystem::Nuget, NuGetCrawler);
+    } else if nuget_discovery_gated_off(options).await {
+        // A .NET project is present on disk but discovery is gated off.
+        warn_nuget_discovery_gated();
     }
     crawl!(Ecosystem::Deno, DenoCrawler);
 
@@ -1040,5 +1095,102 @@ mod tests {
         assert!(counts.contains_key(&Ecosystem::Npm));
         assert!(counts.contains_key(&Ecosystem::Pypi));
         assert!(counts.contains_key(&Ecosystem::Gem));
+    }
+
+    // ---- gated-off discovery warning signal ------------------------------
+    //
+    // `scan --mode vendored`/`hosted` reaches Maven/NuGet through
+    // `crawl_all_ecosystems`, which skips them when the experimental flag is
+    // off. `*_discovery_gated_off` is the decision that drives the one-time
+    // "project detected but not scanned" warning, so a project on disk with
+    // the flag off no longer produces a silent `scannedPackages: 0`. These
+    // assert the decision fires exactly when a project IS present and the
+    // flag IS off — and NOT otherwise (no warning noise).
+
+    #[tokio::test]
+    #[serial_test::serial(experimental_gate_env)]
+    async fn maven_discovery_gated_off_warns_for_pom_project_when_flag_off() {
+        let cwd = tempfile::tempdir().unwrap();
+        std::fs::write(cwd.path().join("pom.xml"), "<project/>").unwrap();
+        // A real (existing) local Maven repo so discovery yields a path.
+        let repo = tempfile::tempdir().unwrap();
+        std::env::set_var("MAVEN_REPO_LOCAL", repo.path());
+        let opts = local_options(cwd.path().to_path_buf());
+
+        std::env::remove_var("SOCKET_EXPERIMENTAL_MAVEN");
+        let gated_off = maven_discovery_gated_off(&opts).await;
+
+        // With the flag ON the same project is crawled, not warned about.
+        std::env::set_var("SOCKET_EXPERIMENTAL_MAVEN", "1");
+        let gated_on = maven_discovery_gated_off(&opts).await;
+
+        std::env::remove_var("SOCKET_EXPERIMENTAL_MAVEN");
+        std::env::remove_var("MAVEN_REPO_LOCAL");
+
+        assert!(
+            gated_off,
+            "a Maven project with the experimental flag off must be flagged as gated"
+        );
+        assert!(
+            !gated_on,
+            "with the experimental flag on the project is crawled, so no warning"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(experimental_gate_env)]
+    async fn maven_discovery_not_gated_without_java_project() {
+        // No pom.xml/build.gradle marker: nothing to scan, so no warning even
+        // though the flag is off (guards against warning noise).
+        let cwd = tempfile::tempdir().unwrap();
+        std::env::remove_var("SOCKET_EXPERIMENTAL_MAVEN");
+        let gated = maven_discovery_gated_off(&local_options(cwd.path().to_path_buf())).await;
+        assert!(
+            !gated,
+            "a non-Maven project must not produce a gated-discovery warning"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(experimental_gate_env)]
+    async fn nuget_discovery_gated_off_warns_for_dotnet_project_when_flag_off() {
+        let cwd = tempfile::tempdir().unwrap();
+        std::fs::write(cwd.path().join("App.csproj"), "<Project/>").unwrap();
+        // A real (existing) global NuGet cache so discovery yields a path.
+        let cache = tempfile::tempdir().unwrap();
+        std::env::set_var("NUGET_PACKAGES", cache.path());
+        let opts = local_options(cwd.path().to_path_buf());
+
+        std::env::remove_var("SOCKET_EXPERIMENTAL_NUGET");
+        let gated_off = nuget_discovery_gated_off(&opts).await;
+
+        std::env::set_var("SOCKET_EXPERIMENTAL_NUGET", "1");
+        let gated_on = nuget_discovery_gated_off(&opts).await;
+
+        std::env::remove_var("SOCKET_EXPERIMENTAL_NUGET");
+        std::env::remove_var("NUGET_PACKAGES");
+
+        assert!(
+            gated_off,
+            "a .NET project with the experimental flag off must be flagged as gated"
+        );
+        assert!(
+            !gated_on,
+            "with the experimental flag on the project is crawled, so no warning"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(experimental_gate_env)]
+    async fn nuget_discovery_not_gated_without_dotnet_project() {
+        // No .csproj/.sln/packages.config marker: nothing to scan, so no
+        // warning even though the flag is off (guards against warning noise).
+        let cwd = tempfile::tempdir().unwrap();
+        std::env::remove_var("SOCKET_EXPERIMENTAL_NUGET");
+        let gated = nuget_discovery_gated_off(&local_options(cwd.path().to_path_buf())).await;
+        assert!(
+            !gated,
+            "a non-.NET project must not produce a gated-discovery warning"
+        );
     }
 }
