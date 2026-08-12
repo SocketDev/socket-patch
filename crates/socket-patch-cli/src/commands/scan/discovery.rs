@@ -3,7 +3,7 @@
 //! baseline pre-verification, and the table's vuln-ID / severity helpers.
 
 use socket_patch_core::api::ranking::cmp_batch_infos;
-use socket_patch_core::api::types::{BatchPackagePatches, PatchSearchResult};
+use socket_patch_core::api::types::{BatchPackagePatches, BatchPatchInfo, PatchSearchResult};
 use socket_patch_core::manifest::schema::PatchManifest;
 use socket_patch_core::utils::purl::{normalize_purl, strip_purl_qualifiers};
 use std::collections::HashSet;
@@ -245,15 +245,93 @@ pub(super) fn detect_updates(
         let Some(existing) = existing else {
             continue;
         };
-        if candidate.uuid != existing.uuid {
-            updates.push(UpdateInfo {
-                purl: pkg.purl.clone(),
-                old_uuid: existing.uuid.clone(),
-                new_uuid: candidate.uuid.clone(),
-            });
+        // (a) Same patch already recorded — never an update.
+        if candidate.uuid == existing.uuid {
+            continue;
         }
+        // (b) The candidate out*ranks* the recorded patch, but "outranks"
+        // includes the pure tier/uuid tiebreaks and — because the batch
+        // endpoint routinely omits `publishedAt` — an epoch-0 date that is
+        // NOT real evidence of recency. When the recorded patch is still
+        // among the offered patches, `cmp_batch_infos` can crown an
+        // equal-or-older sibling as the "top" candidate purely on the uuid
+        // tiebreak, which used to nag a vendored project forever with a patch
+        // no newer than the one already committed. Only surface an update
+        // when the candidate GENUINELY supersedes the applied patch on a
+        // meaningful axis (severity, merge coverage, or a real,
+        // strictly-greater publish date).
+        //
+        // If the recorded patch is no longer offered at all, we cannot
+        // compare ages; a different, currently-available candidate is the
+        // best signal we have, so flag it (this is also the only behavior a
+        // manifest-only, no-batch record can produce).
+        if let Some(applied) = pkg.patches.iter().find(|p| p.uuid == existing.uuid) {
+            if !candidate_supersedes(candidate, applied) {
+                continue;
+            }
+        }
+        updates.push(UpdateInfo {
+            purl: pkg.purl.clone(),
+            old_uuid: existing.uuid.clone(),
+            new_uuid: candidate.uuid.clone(),
+        });
     }
     updates
+}
+
+/// Whether `candidate` genuinely supersedes the already-applied `applied`
+/// patch — strictly better on a MEANINGFUL ranking axis (severity, merge
+/// coverage, or a real, strictly-greater publish date), never on the pure
+/// tier/uuid tiebreaks or an absent-date (epoch-0) artifact.
+///
+/// This is the guard that kills the false `[UPDATE]` nag. Batch responses
+/// omit `publishedAt`, so [`cmp_batch_infos`] falls through to the uuid
+/// tiebreak and can rank an equal-or-older sibling above the applied patch;
+/// flagging that as an update perpetually nags a vendored project. Both
+/// patches are batch-shaped and drawn from the SAME package response, so this
+/// compares like with like, mirroring `api::ranking::rank_batch_info`.
+fn candidate_supersedes(candidate: &BatchPatchInfo, applied: &BatchPatchInfo) -> bool {
+    use socket_patch_core::api::date::parse_timestamp_secs;
+    use socket_patch_core::api::ranking::{merged_coverage, severity_order};
+
+    // Advisory count = inferred merge state: prefer GHSA ids, fall back to
+    // CVE ids only when no GHSA is named (so CVE aliases can't inflate it).
+    let advisories = |p: &BatchPatchInfo| {
+        if p.ghsa_ids.is_empty() {
+            p.cve_ids.len()
+        } else {
+            p.ghsa_ids.len()
+        }
+    };
+
+    // Severity: lower rank number = worse vulnerability. A candidate fixing a
+    // strictly worse advisory supersedes; a less-severe one never does.
+    let cand_sev = severity_order(candidate.severity.as_deref());
+    let applied_sev = severity_order(applied.severity.as_deref());
+    if cand_sev != applied_sev {
+        return cand_sev < applied_sev;
+    }
+
+    // Merge coverage: a patch folding in more advisories is broader.
+    let cand_cov = merged_coverage(advisories(candidate));
+    let applied_cov = merged_coverage(advisories(applied));
+    if cand_cov != applied_cov {
+        return cand_cov > applied_cov;
+    }
+
+    // Recency: only a REAL, strictly-greater publishedAt counts. A missing
+    // date (the batch norm) parses to `None` and is NOT treated as newer, so
+    // an equal-or-older sibling is never surfaced as an update. Parsing stays
+    // on the RFC-2822-aware `api::date` helper.
+    let cand_date = candidate
+        .published_at
+        .as_deref()
+        .and_then(parse_timestamp_secs);
+    let applied_date = applied
+        .published_at
+        .as_deref()
+        .and_then(parse_timestamp_secs);
+    matches!((cand_date, applied_date), (Some(c), Some(a)) if c > a)
 }
 
 /// Collect the deduplicated CVE and GHSA identifiers across every patch of
@@ -543,6 +621,65 @@ mod tests {
             detect_updates(Some(&m), &pkgs).is_empty(),
             "manifest already holds the ranked candidate — no update"
         );
+    }
+
+    #[test]
+    fn detect_updates_no_nag_when_applied_patch_still_offered_and_batch_omits_dates() {
+        // Regression (false-update-nag-batch-ranking / -older-uuid): after
+        // vendoring, the batch endpoint re-lists BOTH the applied patch and a
+        // sibling and OMITS `publishedAt`. With no real date, `cmp_batch_infos`
+        // collapses to the uuid tiebreak and crowns whichever sibling sorts
+        // first. `uuid-a` sorts before the applied `uuid-b`, so it becomes the
+        // ranked candidate — but it is no genuine improvement (same severity,
+        // same coverage, no newer date), so it must NOT be surfaced as an
+        // update. Before the fix this flagged a perpetual `[UPDATE]` pointing
+        // at an equal-or-older patch.
+        let m = manifest_with(&[("pkg:npm/foo@1.0", "uuid-b")]);
+        let pkgs = vec![batch_with("pkg:npm/foo@1.0", &["uuid-a", "uuid-b"])];
+        assert!(
+            detect_updates(Some(&m), &pkgs).is_empty(),
+            "an equal-or-older sibling with no real date must not be an update"
+        );
+    }
+
+    #[test]
+    fn detect_updates_still_flags_a_higher_severity_candidate_offered_alongside_applied() {
+        // Guard against over-suppression: the applied `uuid-low` is still
+        // offered, but a CRITICAL sibling supersedes it on severity. That is a
+        // genuine update and must still be surfaced.
+        let m = manifest_with(&[("pkg:npm/foo@1.0", "uuid-low")]);
+        let pkgs = vec![batch_ranked(
+            "pkg:npm/foo@1.0",
+            &[
+                ("uuid-low", "low", "2026-06-01T00:00:00Z"),
+                ("uuid-crit", "critical", "2024-01-01T00:00:00Z"),
+            ],
+        )];
+        let updates = detect_updates(Some(&m), &pkgs);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].old_uuid, "uuid-low");
+        assert_eq!(updates[0].new_uuid, "uuid-crit");
+    }
+
+    #[test]
+    fn detect_updates_flags_a_genuinely_newer_candidate_when_batch_supplies_dates() {
+        // The date rung is real evidence when the batch supplies it: a
+        // strictly-newer sibling the apply path would install IS an update,
+        // even though it sits alongside the applied patch. `uuid-new` sorts
+        // LAST by uuid, so only its real 2026 date can make it the winner —
+        // and the recency guard must accept that as a genuine supersede.
+        let m = manifest_with(&[("pkg:npm/foo@1.0", "uuid-aold")]);
+        let pkgs = vec![batch_ranked(
+            "pkg:npm/foo@1.0",
+            &[
+                ("uuid-aold", "high", "2024-01-01T00:00:00Z"),
+                ("uuid-new", "high", "2026-06-01T00:00:00Z"),
+            ],
+        )];
+        let updates = detect_updates(Some(&m), &pkgs);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].old_uuid, "uuid-aold");
+        assert_eq!(updates[0].new_uuid, "uuid-new");
     }
 
     // ---- collect_vuln_ids --------------------------------------------------
