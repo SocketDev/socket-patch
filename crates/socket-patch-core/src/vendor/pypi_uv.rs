@@ -34,6 +34,11 @@ use super::{RevertOutcome, VendorWarning};
 /// stable across revisions and `uv lock --check` will catch a real mismatch.
 const HIGHEST_TESTED_LOCK_REVISION: u64 = 3;
 
+/// Cap on the wheel `*.dist-info/METADATA` we read to reconstruct a path
+/// source's `[package.metadata]` block — a sane ceiling for a core-metadata
+/// header block (real ones are a few KiB).
+const MAX_WHEEL_METADATA_BYTES: u64 = 4 * 1024 * 1024;
+
 /// How the target package is declared, which picks the wiring strategy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UvDepClass {
@@ -490,6 +495,15 @@ pub(super) async fn wire_uv(
     // ── uv.lock text surgery (fully computed before any write) ────────────
     let mut new_lock = p.lock_text.clone();
 
+    // A path source has no registry index behind it, so uv records the
+    // package's own requires-dist + provides-extras inline as a
+    // `[package.metadata]` block. The registry lock we're rewriting omits it
+    // (registry packages fetch metadata from the index), so we reconstruct it
+    // from the vendored wheel's core METADATA. Without it `uv lock --check`
+    // reports the lock stale and a plain `uv sync` silently rewrites the block
+    // back in — lock churn that also defeats a byte-exact `vendor --revert`.
+    let metadata_block = wheel_metadata_block(&root.join(rel_wheel)).await;
+
     let (old_unit, new_unit) = rewrite_target_package_unit(
         &new_lock,
         canon_name,
@@ -497,6 +511,7 @@ pub(super) async fn wire_uv(
         rel_wheel,
         wheel_file_name,
         wheel_sha256_hex,
+        metadata_block.as_deref(),
     )?;
     new_lock = new_lock.replacen(&old_unit, &new_unit, 1);
     wiring.push(record(
@@ -765,7 +780,12 @@ fn unit_is_root(lines: &[&str]) -> bool {
 /// Rewrite the target `[[package]]` unit to the path-wheel shape proven by
 /// the fixtures: `source = { path = ... }`, `sdist` dropped, `wheels` becomes
 /// the single `{ filename, hash }` element, `version` pinned to the vendored
-/// version. Returns `(old_unit, new_unit)` verbatim for the wiring record.
+/// version. `metadata_block`, when present, is the reconstructed
+/// `[package.metadata]` section a path source needs (registry packages omit
+/// it — see [`wheel_metadata_block`]); it is appended after the unit so the
+/// whole rewrite stays inside the single `uv_lock_package` wiring record and
+/// reverts as one byte-exact fragment. Returns `(old_unit, new_unit)`
+/// verbatim for the wiring record.
 fn rewrite_target_package_unit(
     lock_text: &str,
     canon: &str,
@@ -773,6 +793,7 @@ fn rewrite_target_package_unit(
     rel_wheel: &str,
     wheel_file_name: &str,
     wheel_sha256_hex: &str,
+    metadata_block: Option<&str>,
 ) -> Result<(String, String), (&'static str, String)> {
     let span = find_unit_span(lock_text, |lines| unit_has_name(lines, canon)).ok_or_else(|| {
         (
@@ -828,7 +849,14 @@ fn rewrite_target_package_unit(
         }
         out.splice(pos..pos, wheels_lines.iter().cloned());
     }
-    Ok((old_unit, out.join("\n")))
+    let mut new_unit = out.join("\n");
+    if let Some(block) = metadata_block {
+        // uv emits [package.metadata] as a sub-table after the [[package]]
+        // body, separated by one blank line (fixture shape: `]\n\n[package…`).
+        new_unit.push_str("\n\n");
+        new_unit.push_str(block);
+    }
+    Ok((old_unit, new_unit))
 }
 
 /// One planned requires-dist entry rewrite: the absolute byte span plus the
@@ -1025,6 +1053,216 @@ fn add_manifest_override(
         ),
         text,
     ))
+}
+
+// ── path-source [package.metadata] reconstruction ──────────────────────────
+
+/// One `requires-dist` dependency parsed from a wheel's core METADATA, in the
+/// pieces uv serializes into an inline table.
+#[derive(Debug, PartialEq, Eq)]
+struct MetaDep {
+    /// PEP 503-canonical distribution name.
+    name: String,
+    /// PEP 685-canonical extras (`requests[socks]` → `["socks"]`).
+    extras: Vec<String>,
+    /// Version specifier with whitespace stripped, parens removed (`None` when
+    /// the requirement pins no version).
+    specifier: Option<String>,
+    /// Environment marker verbatim from METADATA (`None` when unconditional).
+    marker: Option<String>,
+}
+
+/// Best-effort: read the vendored wheel's core METADATA and render the
+/// `[package.metadata]` block a uv path source needs. `None` when the wheel
+/// can't be read, has no `*.dist-info/METADATA`, or (like `six`) declares no
+/// requires-dist / provides-extras — uv omits the block in that case too, so
+/// the fixtures that pass no block stay byte-exact.
+async fn wheel_metadata_block(wheel_path: &Path) -> Option<String> {
+    let bytes = tokio::fs::read(wheel_path).await.ok()?;
+    let text = wheel_metadata_text(&bytes)?;
+    render_package_metadata_block(&text)
+}
+
+/// Extract the top-level `*.dist-info/METADATA` text from a wheel zip.
+fn wheel_metadata_text(bytes: &[u8]) -> Option<String> {
+    use std::io::Read as _;
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).ok()?;
+    let mut metadata_name: Option<String> = None;
+    for i in 0..archive.len() {
+        let entry = archive.by_index(i).ok()?;
+        let name = entry.name();
+        // A wheel's metadata lives at `<dist>-<ver>.dist-info/METADATA`, one
+        // level below the root — never nested inside another directory.
+        if let Some(stem) = name.strip_suffix("/METADATA") {
+            if stem.ends_with(".dist-info") && !stem.contains('/') {
+                metadata_name = Some(name.to_string());
+                break;
+            }
+        }
+    }
+    let metadata_name = metadata_name?;
+    let mut entry = archive.by_name(&metadata_name).ok()?;
+    if entry.size() > MAX_WHEEL_METADATA_BYTES {
+        return None;
+    }
+    let mut text = String::new();
+    entry.read_to_string(&mut text).ok()?;
+    Some(text)
+}
+
+/// Collect the `Requires-Dist` / `Provides-Extra` header values from a wheel's
+/// core METADATA. Only the header block (up to the first blank line) is
+/// scanned, so a `Requires-Dist:` line quoted inside the long-description body
+/// can never be mistaken for a real requirement.
+fn parse_core_metadata_fields(text: &str) -> (Vec<String>, Vec<String>) {
+    let mut requires_dist = Vec::new();
+    let mut provides_extra = Vec::new();
+    for line in text.lines() {
+        if line.is_empty() {
+            break; // end of the RFC822 header block
+        }
+        if line.starts_with(' ') || line.starts_with('\t') {
+            continue; // folded continuation (never used for these fields)
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let value = value.trim();
+        if name.eq_ignore_ascii_case("Requires-Dist") {
+            requires_dist.push(value.to_string());
+        } else if name.eq_ignore_ascii_case("Provides-Extra") {
+            provides_extra.push(value.to_string());
+        }
+    }
+    (requires_dist, provides_extra)
+}
+
+/// Parse one PEP 508 `Requires-Dist` value into its uv inline-table pieces.
+/// `None` when the leading distribution name is missing (a malformed line) —
+/// the caller then drops the whole block rather than emit partial TOML.
+fn parse_requires_dist(raw: &str) -> Option<MetaDep> {
+    let raw = raw.trim();
+    let (req, marker) = match raw.split_once(';') {
+        Some((r, m)) => (r.trim(), Some(m.trim().to_string())),
+        None => (raw, None),
+    };
+    let marker = marker.filter(|m| !m.is_empty());
+
+    let name_end = req
+        .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')))
+        .unwrap_or(req.len());
+    if name_end == 0 {
+        return None;
+    }
+    let name = canonicalize_pypi_name(&req[..name_end]);
+    let mut rest = req[name_end..].trim_start();
+
+    let mut extras = Vec::new();
+    if let Some(after_open) = rest.strip_prefix('[') {
+        let close = after_open.find(']')?;
+        extras = after_open[..close]
+            .split(',')
+            .map(str::trim)
+            .filter(|e| !e.is_empty())
+            .map(canonicalize_pypi_name)
+            .collect();
+        rest = after_open[close + 1..].trim_start();
+    }
+
+    // The version specifier may be wrapped in parens (older METADATA style,
+    // e.g. `six (>=1.5)`); strip them, then drop all interior whitespace
+    // (uv serializes specifiers compactly).
+    let mut spec = rest.trim();
+    if let Some(inner) = spec.strip_prefix('(').and_then(|s| s.strip_suffix(')')) {
+        spec = inner.trim();
+    }
+    let specifier =
+        (!spec.is_empty()).then(|| spec.chars().filter(|c| !c.is_whitespace()).collect());
+
+    Some(MetaDep {
+        name,
+        extras,
+        specifier,
+        marker,
+    })
+}
+
+/// Escape a string for a TOML basic (double-quoted) string.
+fn toml_basic_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Render one parsed dependency as a uv `requires-dist` inline table
+/// (`{ name = …, extras = […], marker = "…", specifier = "…" }`, key order
+/// matching uv's serializer).
+fn render_requires_dist_entry(dep: &MetaDep) -> String {
+    let mut parts = vec![format!("name = \"{}\"", dep.name)];
+    if !dep.extras.is_empty() {
+        let extras = dep
+            .extras
+            .iter()
+            .map(|e| format!("\"{e}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        parts.push(format!("extras = [{extras}]"));
+    }
+    if let Some(marker) = &dep.marker {
+        parts.push(format!("marker = \"{}\"", toml_basic_escape(marker)));
+    }
+    if let Some(specifier) = &dep.specifier {
+        parts.push(format!("specifier = \"{specifier}\""));
+    }
+    format!("{{ {} }}", parts.join(", "))
+}
+
+/// Reconstruct uv's `[package.metadata]` block for a path source from its
+/// wheel core METADATA text. Returns the block (no leading/trailing newline)
+/// or `None` when there is nothing to record (no requires-dist AND no
+/// provides-extras) or a `Requires-Dist` line fails to parse — in which case
+/// we emit no block rather than risk malformed TOML (`uv sync` then heals it,
+/// the pre-fix behavior, instead of failing to parse the lock).
+fn render_package_metadata_block(metadata_text: &str) -> Option<String> {
+    let (requires_raw, provides_raw) = parse_core_metadata_fields(metadata_text);
+    if requires_raw.is_empty() && provides_raw.is_empty() {
+        return None;
+    }
+
+    let mut entries = Vec::with_capacity(requires_raw.len());
+    for raw in &requires_raw {
+        entries.push(render_requires_dist_entry(&parse_requires_dist(raw)?));
+    }
+
+    let mut block = String::from("[package.metadata]\n");
+    match entries.len() {
+        0 => block.push_str("requires-dist = []"),
+        1 => {
+            block.push_str("requires-dist = [");
+            block.push_str(&entries[0]);
+            block.push(']');
+        }
+        _ => {
+            block.push_str("requires-dist = [\n");
+            for entry in &entries {
+                block.push_str("    ");
+                block.push_str(entry);
+                block.push_str(",\n");
+            }
+            block.push(']');
+        }
+    }
+
+    if !provides_raw.is_empty() {
+        let extras = provides_raw
+            .iter()
+            .map(|e| format!("\"{}\"", canonicalize_pypi_name(e)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        block.push_str("\nprovides-extras = [");
+        block.push_str(&extras);
+        block.push(']');
+    }
+
+    Some(block)
 }
 
 #[cfg(test)]
@@ -1829,5 +2067,241 @@ wheels = [
             )
         );
         assert_eq!(spec.as_deref(), Some(">=1"));
+    }
+
+    // ── path-source [package.metadata] reconstruction ──────────────────
+
+    #[test]
+    fn parse_requires_dist_pulls_apart_name_extras_specifier_marker() {
+        // extra-gated dep with a bare specifier
+        assert_eq!(
+            parse_requires_dist("leftpad >=1.0 ; extra == 'fast'"),
+            Some(MetaDep {
+                name: "leftpad".into(),
+                extras: vec![],
+                specifier: Some(">=1.0".into()),
+                marker: Some("extra == 'fast'".into()),
+            })
+        );
+        // legacy parenthesized specifier, no marker (uv strips the parens)
+        assert_eq!(
+            parse_requires_dist("six (>=1.5)"),
+            Some(MetaDep {
+                name: "six".into(),
+                extras: vec![],
+                specifier: Some(">=1.5".into()),
+                marker: None,
+            })
+        );
+        // extras in the name, name canonicalized, multi-constraint specifier
+        assert_eq!(
+            parse_requires_dist("PySocks[Fast,Slow] !=1.5.7,<2.0,>=1.5.6 ; extra == 'socks'"),
+            Some(MetaDep {
+                name: "pysocks".into(),
+                extras: vec!["fast".into(), "slow".into()],
+                specifier: Some("!=1.5.7,<2.0,>=1.5.6".into()),
+                marker: Some("extra == 'socks'".into()),
+            })
+        );
+        // no specifier at all
+        assert_eq!(
+            parse_requires_dist("certifi ; extra == 'secure'"),
+            Some(MetaDep {
+                name: "certifi".into(),
+                extras: vec![],
+                specifier: None,
+                marker: Some("extra == 'secure'".into()),
+            })
+        );
+        // a line with no leading name is rejected (fail-closed)
+        assert_eq!(parse_requires_dist(">=1.0"), None);
+    }
+
+    #[test]
+    fn core_metadata_fields_stop_at_the_header_block() {
+        let text = "Metadata-Version: 2.1\n\
+                    Name: widget\n\
+                    Provides-Extra: fast\n\
+                    Requires-Dist: leftpad >=1.0 ; extra == 'fast'\n\
+                    \n\
+                    Long description follows.\n\
+                    Requires-Dist: not-a-real-dep ==9.9\n\
+                    Provides-Extra: bogus\n";
+        let (requires, provides) = parse_core_metadata_fields(text);
+        // body lines after the blank separator are never scanned
+        assert_eq!(requires, vec!["leftpad >=1.0 ; extra == 'fast'"]);
+        assert_eq!(provides, vec!["fast"]);
+    }
+
+    #[test]
+    fn render_block_reconstructs_requires_dist_and_provides_extras() {
+        let text = "Name: widget\n\
+                    Provides-Extra: fast\n\
+                    Requires-Dist: leftpad >=1.0 ; extra == 'fast'\n\
+                    Requires-Dist: rightpad (>=2.0)\n\
+                    \n\
+                    body\n";
+        assert_eq!(
+            render_package_metadata_block(text).as_deref(),
+            Some(
+                "[package.metadata]\n\
+                 requires-dist = [\n    \
+                 { name = \"leftpad\", marker = \"extra == 'fast'\", specifier = \">=1.0\" },\n    \
+                 { name = \"rightpad\", specifier = \">=2.0\" },\n\
+                 ]\n\
+                 provides-extras = [\"fast\"]"
+            )
+        );
+
+        // one requires-dist, no extras → uv's single-line array form
+        let single = "Name: x\nRequires-Dist: six (>=1.5)\n\n";
+        assert_eq!(
+            render_package_metadata_block(single).as_deref(),
+            Some("[package.metadata]\nrequires-dist = [{ name = \"six\", specifier = \">=1.5\" }]")
+        );
+
+        // a package with no requires-dist / provides-extras (like `six`) gets
+        // NO block, so the fixtures that pass no block stay byte-exact.
+        assert_eq!(render_package_metadata_block("Name: six\n\n"), None);
+    }
+
+    #[test]
+    fn render_block_escapes_double_quoted_markers_for_toml() {
+        let text = "Name: x\n\
+                    Requires-Dist: brotlicffi >=0.8.0 ; os_name != \"nt\" and extra == 'brotli'\n\
+                    Provides-Extra: brotli\n\n";
+        let block = render_package_metadata_block(text).unwrap();
+        assert!(
+            block.contains("marker = \"os_name != \\\"nt\\\" and extra == 'brotli'\""),
+            "double quotes in the marker must be TOML-escaped: {block}"
+        );
+    }
+
+    // A registry-sourced package with extras/deps has NO [package.metadata] in
+    // the lock (uv fetches it from the index); the path source uv rewrites it
+    // to DOES need one. Reconstruct it from the vendored wheel's METADATA so
+    // `uv lock --check` stays green and `vendor --revert` byte-restores.
+    const WIDGET_REGISTRY_PYPROJECT: &str = r#"[project]
+name = "proj"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = ["widget==1.0.0"]
+"#;
+
+    const WIDGET_REGISTRY_LOCK: &str = r#"version = 1
+revision = 3
+requires-python = ">=3.10"
+
+[[package]]
+name = "proj"
+version = "0.1.0"
+source = { virtual = "." }
+dependencies = [
+    { name = "widget" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "widget", specifier = "==1.0.0" }]
+
+[[package]]
+name = "widget"
+version = "1.0.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://example.invalid/widget-1.0.0.tar.gz", hash = "sha256:aaaa", size = 10 }
+wheels = [
+    { url = "https://example.invalid/widget-1.0.0-py3-none-any.whl", hash = "sha256:bbbb", size = 10 },
+]
+"#;
+
+    const WIDGET_WHEEL_NAME: &str = "widget-1.0.0-py3-none-any.whl";
+    const WIDGET_WHEEL_SHA: &str =
+        "1111111111111111111111111111111111111111111111111111111111111111";
+
+    /// Build a minimal wheel whose only entry is the core METADATA, and drop
+    /// it at `rel` under `root` (parents created).
+    async fn write_widget_wheel(root: &Path, rel: &str, metadata: &str) {
+        let entries = vec![(
+            "widget-1.0.0.dist-info/METADATA".to_string(),
+            metadata.as_bytes().to_vec(),
+            0o644,
+        )];
+        let bytes = crate::vendor::common::write_zip_entries(&entries).unwrap();
+        let path = root.join(rel);
+        tokio::fs::create_dir_all(path.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&path, &bytes).await.unwrap();
+    }
+
+    /// The core defect: after wiring, the path-sourced package must carry the
+    /// reconstructed `[package.metadata]` block (it was dropped before the
+    /// fix, leaving `uv lock --check` red), and `vendor --revert` must
+    /// byte-restore the original registry lock.
+    #[tokio::test]
+    async fn direct_wiring_reconstructs_package_metadata_block_and_reverts() {
+        let rel_wheel = format!(".socket/vendor/pypi/{UUID}/{WIDGET_WHEEL_NAME}");
+        let tmp = write_pair(WIDGET_REGISTRY_PYPROJECT, WIDGET_REGISTRY_LOCK).await;
+        // Header block declares the deps; a poisoned body must be ignored.
+        let metadata = "Metadata-Version: 2.1\n\
+                        Name: widget\n\
+                        Version: 1.0.0\n\
+                        Provides-Extra: fast\n\
+                        Requires-Dist: leftpad >=1.0 ; extra == 'fast'\n\
+                        Requires-Dist: rightpad (>=2.0)\n\
+                        \n\
+                        Long description.\n\
+                        Requires-Dist: not-a-real-dep ==9.9\n";
+        write_widget_wheel(tmp.path(), &rel_wheel, metadata).await;
+
+        let p = load_uv_project(tmp.path()).await.unwrap();
+        assert_eq!(classify_dependency(&p, "widget"), UvDepClass::Direct);
+        let (wiring, meta) = wire_uv(
+            &p,
+            tmp.path(),
+            "widget",
+            "1.0.0",
+            &rel_wheel,
+            WIDGET_WHEEL_NAME,
+            WIDGET_WHEEL_SHA,
+            UUID,
+        )
+        .await
+        .unwrap();
+
+        let (_, lock) = read_pair(tmp.path()).await;
+        // The path-sourced `widget` unit now carries its reconstructed metadata.
+        assert!(
+            lock.contains(
+                "source = { path = \".socket/vendor/pypi/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/widget-1.0.0-py3-none-any.whl\" }\n\
+                 wheels = [\n    \
+                 { filename = \"widget-1.0.0-py3-none-any.whl\", hash = \"sha256:1111111111111111111111111111111111111111111111111111111111111111\" },\n\
+                 ]\n\
+                 \n\
+                 [package.metadata]\n\
+                 requires-dist = [\n    \
+                 { name = \"leftpad\", marker = \"extra == 'fast'\", specifier = \">=1.0\" },\n    \
+                 { name = \"rightpad\", specifier = \">=2.0\" },\n\
+                 ]\n\
+                 provides-extras = [\"fast\"]"
+            ),
+            "reconstructed [package.metadata] block missing:\n{lock}"
+        );
+        // The description-body line must never leak into the lock.
+        assert!(
+            !lock.contains("not-a-real-dep"),
+            "body line leaked:\n{lock}"
+        );
+
+        // revert byte-restores the original registry lock + pyproject.
+        let entry = entry_for(wiring, meta);
+        let outcome = revert_uv(&entry, tmp.path(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        let (pyproject, lock) = read_pair(tmp.path()).await;
+        assert_eq!(pyproject, WIDGET_REGISTRY_PYPROJECT);
+        assert_eq!(
+            lock, WIDGET_REGISTRY_LOCK,
+            "revert must byte-restore uv.lock"
+        );
     }
 }
