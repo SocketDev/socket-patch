@@ -965,6 +965,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn find_packages_for_rollback_resolves_installed_qualified_gem() {
+        // Regression for the vendor lookup path (vendor.rs): every real
+        // production gem/pypi patch PURL is QUALIFIED (`?platform=` /
+        // `?artifact_id=`), but the crawler only knows the BASE PURL.
+        // `vendor` must resolve installed packages via the qualified-aware
+        // rollback resolver so its `all_packages.contains_key(qualified)`
+        // check recognizes the installed gem. Using `find_packages_for_purls`
+        // (base-keyed) misses the qualified key, falsely classifying the
+        // installed gem "not installed" — the bug that produced spurious
+        // `vendor_fetched_missing` events and the gem platform coin-flip.
+        let tmp = tempfile::tempdir().unwrap();
+        // A platform gem installs into a `<name>-<version>` dir (with an
+        // optional `-<platform>` suffix); lay down the plain-platform case.
+        let gem_dir = tmp.path().join("activestorage-7.0.2.2");
+        std::fs::create_dir_all(gem_dir.join("lib")).unwrap();
+
+        // `global_prefix` makes the gem crawler treat `tmp` as the gems root
+        // directly (same shortcut the ruby crawler's own tests use).
+        let options = CrawlerOptions {
+            cwd: tmp.path().to_path_buf(),
+            global: false,
+            global_prefix: Some(tmp.path().to_path_buf()),
+        };
+
+        let qualified = "pkg:gem/activestorage@7.0.2.2?platform=ruby".to_string();
+        let partitioned = partition_purls(std::slice::from_ref(&qualified), None);
+
+        // The vendor lookup path: the qualified manifest PURL is resolved to
+        // the installed dir under its EXACT qualified key.
+        let rollback = find_packages_for_rollback(&partitioned, &options, true).await;
+        assert_eq!(
+            rollback.get(&qualified),
+            Some(&gem_dir),
+            "installed qualified gem must resolve under its qualified key"
+        );
+
+        // The old resolver keyed by the BASE PURL only, so a `contains_key`
+        // on the qualified PURL missed — the exact false "not installed".
+        let base_keyed = find_packages_for_purls(&partitioned, &options, true).await;
+        assert!(
+            !base_keyed.contains_key(&qualified),
+            "find_packages_for_purls must NOT be used by vendor: it keys by \
+             the base PURL, so the qualified lookup falsely misses"
+        );
+    }
+
+    #[tokio::test]
     async fn dispatch_find_empty_partition_yields_empty_map() {
         let tmp = tempfile::tempdir().unwrap();
         let empty: HashMap<Ecosystem, Vec<String>> = HashMap::new();
