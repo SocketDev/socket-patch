@@ -1,0 +1,9 @@
+# Commits for `git blame --ignore-revs-file` / blame.ignoreRevsFile:
+# mechanical churn that would otherwise bury real authorship.
+# Enable locally with:
+#   git config blame.ignoreRevsFile .git-blame-ignore-revs
+
+# Structure-review batch (#150), squash-merged: contains the pure-rename
+# taxonomy moves (patch/vendor -> vendor/, setup/ umbrella, utils dissolve)
+# plus their mechanical import repoints across ~50 files.
+08ea9ba93a7c4c449640b4e39f37915ddfe035b8
