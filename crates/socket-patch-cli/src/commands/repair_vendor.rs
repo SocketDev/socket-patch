@@ -532,9 +532,17 @@ pub(crate) async fn repair_vendored_artifacts(
             unrebuildable.insert(c.purl.clone());
             continue;
         }
-        match fetch_pristine_package(&common.cwd, &inventory, &client, &c.purl, Some(&c.entry))
-            .await
-        {
+        let pristine =
+            fetch_pristine_package(&common.cwd, &inventory, &client, &c.purl, Some(&c.entry)).await;
+        // The `Unverifiable` reason carries the precise, fragment-aware cause
+        // (e.g. a pdm/poetry/pipenv lock records the wheel hash but no fetchable
+        // registry URL) — surface it instead of the blanket "no recoverable
+        // registry fragment", which falsely implies the ledger recorded nothing.
+        let unverifiable_reason = match &pristine {
+            PristineFetch::Unverifiable(d) => Some(d.clone()),
+            _ => None,
+        };
+        match pristine {
             PristineFetch::Fetched(fetched) => {
                 all_packages.insert(c.purl.clone(), fetched.dir().to_path_buf());
                 holders.push(fetched);
@@ -576,8 +584,10 @@ pub(crate) async fn repair_vendored_artifacts(
                      package on this platform and re-run repair, or run `socket-patch \
                      vendor` to rebuild it"
                         .to_string()
+                } else if let Some(reason) = unverifiable_reason {
+                    reason
                 } else {
-                    "no verifiable pristine source: the package is not installed, the \
+                    "no verifiable pristine source: no installed copy was found, the \
                      lockfile is rewired to the (broken) vendored artifact, and the \
                      ledger records no recoverable registry fragment"
                         .to_string()
