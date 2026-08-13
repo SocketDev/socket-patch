@@ -76,6 +76,10 @@ fn go(dir: &Path, machine: &Machine, args: &[&str], env: &[(&str, &str)]) -> std
     cmd.env("GOMODCACHE", &machine.modcache);
     cmd.env("GOCACHE", &machine.gocache);
     cmd.env("GOTOOLCHAIN", "local");
+    // Empty env-var pins do NOT defeat `go env -w` config — go treats an
+    // empty variable as unset and falls back to the env FILE. GOENV=off is
+    // the only switch that ignores it entirely.
+    cmd.env("GOENV", "off");
     for (k, v) in env {
         cmd.env(k, v);
     }
@@ -99,6 +103,19 @@ fn day2_env(proxy_url: &str) -> Vec<(&'static str, String)> {
 
 fn as_pairs<'a>(env: &'a [(&'static str, String)]) -> Vec<(&'a str, &'a str)> {
     env.iter().map(|(k, v)| (*k, v.as_str())).collect()
+}
+
+/// Go writes extracted modules into GOMODCACHE with read-only dirs, which
+/// makes `TempDir::drop`'s remove fail silently — and a panicking assertion
+/// would skip any trailing chmod. Restore write bits on EVERY exit path.
+struct ChmodGuard(PathBuf);
+impl Drop for ChmodGuard {
+    fn drop(&mut self) {
+        let _ = Command::new("chmod")
+            .args(["-R", "u+w"])
+            .arg(&self.0)
+            .status();
+    }
 }
 
 /// Stage a module dir and zip it into the file-proxy under `mod_path@ver/`.
@@ -182,6 +199,7 @@ fn day2_machine_builds_patched_module_from_committed_files_alone() {
     std::env::set_var("GOFLAGS", "-mod=mod");
     std::env::set_var("GONOSUMDB", "*");
     let tmp = tempfile::tempdir().unwrap();
+    let _cleanup = ChmodGuard(tmp.path().to_path_buf());
     let proxy_url = format!("file://{}", tmp.path().join("proxy").display());
     let smod = socket_module();
 
@@ -343,9 +361,35 @@ fn day2_machine_builds_patched_module_from_committed_files_alone() {
     );
     std::fs::write(consumer.join("go.sum"), &before_sum).unwrap();
 
-    // Best-effort: the go module cache is written read-only; relax perms so
-    // the tempdir cleans up.
-    let _ = Command::new("chmod")
-        .args(["-R", "u+w", tmp.path().to_str().unwrap()])
-        .status();
+    // ── positive tripwire control ────────────────────────────────────────
+    // Prove the bogus GOSUMDB actually fires when consulted: with the socket
+    // zip h1 line REMOVED, resolving the module needs the checksum database,
+    // and the bogus name must fail loudly — this is what makes every green
+    // assertion above meaningful (the tripwire is demonstrably armed).
+    let without_h1: String = before_sum
+        .lines()
+        .filter(|l| !l.starts_with(&format!("{smod} {SVER} h1:")))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    std::fs::write(consumer.join("go.sum"), &without_h1).unwrap();
+    let m4 = Machine::new(tmp.path(), "machine4");
+    let dl = go(
+        &consumer,
+        &m4,
+        &["mod", "download", &format!("{smod}@{SVER}")],
+        &as_pairs(&env),
+    );
+    let dl_err = String::from_utf8_lossy(&dl.stderr);
+    assert!(
+        !dl.status.success(),
+        "a missing go.sum line must force a checksum-DB lookup that fails, got: {}",
+        String::from_utf8_lossy(&dl.stdout)
+    );
+    assert!(
+        dl_err.contains("GOSUMDB")
+            || dl_err.contains("verifier")
+            || dl_err.contains("sum.invalid.example"),
+        "failure must come from the bogus checksum DB (tripwire armed), got: {dl_err}"
+    );
+    std::fs::write(consumer.join("go.sum"), &before_sum).unwrap();
 }

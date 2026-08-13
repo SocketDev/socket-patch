@@ -485,8 +485,10 @@ fn inspect_existing(
 }
 
 /// Remove `owner`'s `replace` directive(s) for `module`, pruning an emptied
-/// `replace ( … )` block. The other owner's directives are left untouched.
-fn remove_replace_entry(
+/// `replace ( … )` block. The other owners' directives are left untouched.
+/// Pure — exposed so the hosted rewriter can reconcile away its own stale
+/// (require-version-mismatched, silently inert) directive.
+pub fn remove_replace_entry(
     content: &str,
     module: &str,
     owner: ReplaceOwner,
