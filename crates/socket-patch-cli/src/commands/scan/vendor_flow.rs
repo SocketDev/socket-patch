@@ -4,12 +4,13 @@
 //! transient-frame constructors that keep the never-taken vendor branches
 //! out of `run`'s poll frame (Windows 1 MiB main-thread stack).
 
+use socket_patch_core::api::client::get_api_client_with_overrides;
 use socket_patch_core::api::types::{BatchPackagePatches, PatchSearchResult};
 use socket_patch_core::manifest::operations::read_manifest;
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
 use socket_patch_core::patch::apply_lock;
 use socket_patch_core::telemetry::track_patch_vendor_failed;
-use socket_patch_core::vendor::{load_state, lookup_entry};
+use socket_patch_core::vendor::{load_state, lookup_entry, VendorServiceConfig, VendorSource};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Duration;
@@ -51,6 +52,32 @@ async fn preview_vendor_json(cwd: &Path, selected: &[PatchSearchResult]) -> serd
         .collect();
     patches.sort_by(|a, b| a["purl"].as_str().cmp(&b["purl"].as_str()));
     serde_json::json!({ "dryRun": true, "patches": patches })
+}
+
+/// Build the vendoring-service config for scan's vendored flow — the SAME
+/// shape the standalone `vendor` command builds (see `vendor::run`), so both
+/// entry points honor `--vendor-source` / `--vendor-url` /
+/// `--patch-server-url` and commit byte-identical artifacts + lock integrity
+/// for the same patch. `vendor_source` was validated by clap, so the parse
+/// cannot fail; fall back to the `auto` default defensively — the SAME
+/// default as the `vendor` command (service download), not build-only.
+///
+/// `client` / `use_public_proxy` come from the run-level API client. A pure
+/// assembler (no async, no network) so the flow's byte-for-byte parity with
+/// the `vendor` command is unit-testable without a live client.
+fn scan_vendor_service_config(
+    common: &GlobalArgs,
+    client: Option<socket_patch_core::api::client::ApiClient>,
+    use_public_proxy: bool,
+) -> VendorServiceConfig {
+    VendorServiceConfig {
+        source: VendorSource::parse(&common.vendor_source).unwrap_or_default(),
+        client,
+        use_public_proxy,
+        vendor_url: common.vendor_url.clone(),
+        patch_server_url: common.patch_server_url.clone(),
+        offline: common.offline,
+    }
 }
 
 /// The vendor step shared by `scan --vendor`'s JSON and interactive
@@ -144,8 +171,25 @@ async fn run_scan_vendor_step(
             }
         };
     let sources = staged.as_patch_sources();
-    has_errors |=
-        boxed_vendor_records(common, &manifest.patches, &sources, detached, &mut env).await;
+    // Honor `--vendor-source` (and `--vendor-url` / `--patch-server-url`)
+    // exactly as the `vendor` command does: build the SAME service config so
+    // `scan --mode vendored` and a plain `vendor` commit byte-identical
+    // artifacts by default (both service-download under `auto`) instead of
+    // scan silently building locally. Built here (once, from the run-level
+    // flags) on the already-boxed scan-vendored frame; dry runs never reach
+    // this step, so there is no wasted client build in preview mode.
+    let (client, use_public_proxy) =
+        get_api_client_with_overrides(common.api_client_overrides()).await;
+    let service = scan_vendor_service_config(common, Some(client), use_public_proxy);
+    has_errors |= boxed_vendor_records(
+        common,
+        &manifest.patches,
+        &sources,
+        detached,
+        Some(&service),
+        &mut env,
+    )
+    .await;
     drop(guard);
     if has_errors {
         env.mark_partial_failure();
@@ -604,11 +648,85 @@ fn boxed_vendor_records<'a>(
     records: &'a HashMap<String, PatchRecord>,
     sources: &'a socket_patch_core::patch::apply::PatchSources<'a>,
     detached: bool,
+    service: Option<&'a VendorServiceConfig>,
     env: &'a mut Envelope,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + 'a>> {
-    // `scan --vendor` builds locally (no vendoring-service config); the
-    // `vendor` command is the service-download entry point.
+    // `scan --vendor` threads the SAME service config the `vendor` command
+    // builds (honoring `--vendor-source`), so both entry points vendor the
+    // same bytes by default. See `run_scan_vendor_step`.
     Box::pin(vendor_records(
-        common, records, sources, detached, false, env, None,
+        common, records, sources, detached, false, env, service,
     ))
+}
+
+#[cfg(test)]
+mod service_config_tests {
+    use super::*;
+    use crate::args::GlobalArgs;
+
+    fn common_with_source(source: &str) -> GlobalArgs {
+        GlobalArgs {
+            vendor_source: source.to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// Regression: scan's vendored flow must build its service config FROM
+    /// `--vendor-source`, not hardcode build-only (the pre-fix `service =
+    /// None`). Under the default (`auto`), the config must permit the
+    /// vendoring service exactly as the `vendor` command's default does —
+    /// otherwise `scan --mode vendored` silently builds locally while a
+    /// plain `vendor` service-downloads, and the two commit different bytes /
+    /// lock integrity for the same patch (lock churn / merge conflicts).
+    #[test]
+    fn default_source_permits_service_like_vendor_command() {
+        let common = common_with_source("auto");
+        let cfg = scan_vendor_service_config(&common, None, false);
+        assert_eq!(cfg.source, VendorSource::Auto);
+        assert!(
+            cfg.source.may_use_service(),
+            "default scan --vendor must be able to use the service (matching `vendor`)"
+        );
+        assert!(!cfg.source.requires_service());
+    }
+
+    /// `--vendor-source service` must reach the fail-closed service path,
+    /// exactly as the `vendor` command interprets the same flag.
+    #[test]
+    fn service_source_requires_service() {
+        let common = common_with_source("service");
+        let cfg = scan_vendor_service_config(&common, None, false);
+        assert_eq!(cfg.source, VendorSource::Service);
+        assert!(cfg.source.requires_service());
+    }
+
+    /// `--vendor-source build` stays build-only (never contacts the service).
+    #[test]
+    fn build_source_never_uses_service() {
+        let common = common_with_source("build");
+        let cfg = scan_vendor_service_config(&common, None, false);
+        assert_eq!(cfg.source, VendorSource::Build);
+        assert!(!cfg.source.may_use_service());
+    }
+
+    /// The service overrides (`--vendor-url` / `--patch-server-url` /
+    /// `--offline`) thread through unchanged, so scan and `vendor` target the
+    /// same hosts.
+    #[test]
+    fn overrides_thread_through() {
+        let common = GlobalArgs {
+            vendor_source: "service".to_string(),
+            vendor_url: Some("https://vendor.example".to_string()),
+            patch_server_url: Some("https://patch.example".to_string()),
+            offline: true,
+            ..Default::default()
+        };
+        let cfg = scan_vendor_service_config(&common, None, false);
+        assert_eq!(cfg.vendor_url.as_deref(), Some("https://vendor.example"));
+        assert_eq!(
+            cfg.patch_server_url.as_deref(),
+            Some("https://patch.example")
+        );
+        assert!(cfg.offline);
+    }
 }

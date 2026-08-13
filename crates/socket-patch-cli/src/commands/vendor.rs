@@ -633,8 +633,8 @@ pub(crate) async fn vendor_records(
     detached: bool,
     force: bool,
     env: &mut Envelope,
-    // Vendoring-service config (`None` = build-only). The `vendor` command
-    // passes `Some(_)`; `scan --vendor` passes `None` today.
+    // Vendoring-service config (`None` = build-only). Both the `vendor`
+    // command and `scan --vendor` pass `Some(_)`, honoring `--vendor-source`.
     service: Option<&VendorServiceConfig>,
 ) -> bool {
     let mut has_errors = false;
