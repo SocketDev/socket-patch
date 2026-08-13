@@ -237,8 +237,23 @@ pub(crate) fn ecosystem_in_scope(common: &GlobalArgs, eco: &str) -> bool {
     }
 }
 
-/// Surface a backend warning: stderr line for humans, a Skipped event with
-/// the stable code for JSON consumers (Skipped never flips the status).
+/// Surface a backend vendor ADVISORY: a stderr line for humans, and a
+/// `Skipped` event carrying the stable code/detail for JSON consumers.
+///
+/// A vendor warning is a per-package advisory ABOUT how the package was
+/// vendored — a successful `vendor_prebuilt_downloaded` service fetch, an
+/// artifact rebuild, a content-mismatch overwrite — NOT a package that was
+/// skipped. The package's genuine `Applied`/`Skipped`/`Failed` outcome is
+/// recorded separately (via [`Envelope::record`]) alongside this advisory.
+///
+/// The event is therefore pushed DIRECTLY onto `events` rather than through
+/// [`Envelope::record`], so it stays visible to JSON consumers but does NOT
+/// bump `summary.skipped`. That counter must report packages that were
+/// genuinely skipped, not the number of advisory events — routing every
+/// warning through `record` made a single SUCCESSFUL service vendor report
+/// `applied:1 skipped:1`, let a 1-package project print "2 skipped", and
+/// counted "1 skipped" on a refresh that skipped nothing. `Skipped` never
+/// flips the run status, so pushing it directly loses no status signal.
 pub(crate) fn record_warning(
     env: &mut Envelope,
     purl: &str,
@@ -248,7 +263,7 @@ pub(crate) fn record_warning(
     if !common.silent && !common.json {
         eprintln!("Warning ({}): {}", warning.code, warning.detail);
     }
-    env.record(
+    env.events.push(
         PatchEvent::new(PatchAction::Skipped, purl.to_string())
             .with_reason(warning.code, warning.detail.clone()),
     );
@@ -1450,6 +1465,110 @@ mod dispatch_tests {
                 "maven has a service backend; the dispatch gate must admit it"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod warning_counting_tests {
+    use super::*;
+
+    /// `record_warning` must not print (so the test captures no stderr) —
+    /// `json = true` suppresses the human line; every other field defaults.
+    fn quiet_common() -> GlobalArgs {
+        GlobalArgs {
+            json: true,
+            ..GlobalArgs::default()
+        }
+    }
+
+    /// A vendor advisory (e.g. a SUCCESSFUL `vendor_prebuilt_downloaded`
+    /// service fetch) must NOT inflate `summary.skipped`: that counter counts
+    /// packages that were genuinely skipped, not the number of advisory
+    /// events. Regression: every warning was routed through
+    /// `Envelope::record` as a `Skipped` event, so a single service vendor
+    /// reported `applied:1 skipped:1` and a 1-package project could print
+    /// "2 skipped". The advisory must still remain visible in `events[]`.
+    #[test]
+    fn advisory_warning_does_not_bump_skipped_summary() {
+        let common = quiet_common();
+        let purl = "pkg:cargo/cfg-if@1.0.4";
+        let mut env = Envelope::new(Command::Vendor);
+        // The package's real outcome: it WAS vendored (applied).
+        env.record(PatchEvent::new(PatchAction::Applied, purl));
+        // The service-download advisory rides alongside that outcome.
+        record_warning(
+            &mut env,
+            purl,
+            &VendorWarning::new(
+                "vendor_prebuilt_downloaded",
+                "vendored cfg-if from the patch service",
+            ),
+            &common,
+        );
+
+        assert_eq!(
+            env.summary.applied, 1,
+            "the vendored package is counted as applied"
+        );
+        assert_eq!(
+            env.summary.skipped, 0,
+            "a per-package advisory is not a skipped package: {:?}",
+            env.summary
+        );
+        // The advisory is still emitted for JSON consumers.
+        assert!(
+            env.events
+                .iter()
+                .any(|e| e.error_code.as_deref() == Some("vendor_prebuilt_downloaded")),
+            "advisory stays visible in events[]"
+        );
+    }
+
+    /// Two advisories on a single 1-package vendor must still leave
+    /// `summary.skipped` at zero — directly reproduces the "2 skipped" report
+    /// the sweep observed for a one-package project.
+    #[test]
+    fn multiple_advisories_do_not_accumulate_skips() {
+        let common = quiet_common();
+        let purl = "pkg:npm/minimist@1.2.2";
+        let mut env = Envelope::new(Command::Vendor);
+        env.record(PatchEvent::new(PatchAction::Applied, purl));
+        record_warning(
+            &mut env,
+            purl,
+            &VendorWarning::new("vendor_prebuilt_downloaded", "from the service"),
+            &common,
+        );
+        record_warning(
+            &mut env,
+            purl,
+            &VendorWarning::new("vendor_fetched_missing", "fetched the pristine artifact"),
+            &common,
+        );
+        assert_eq!(
+            env.summary.skipped, 0,
+            "advisories never count as skipped packages: {:?}",
+            env.summary
+        );
+    }
+
+    /// A genuinely-skipped PACKAGE (recorded via `Envelope::record`, e.g.
+    /// `already_vendored` or `package_not_installed`) must still bump
+    /// `summary.skipped` — the fix narrows the counter to real skips, it does
+    /// not zero it out.
+    #[test]
+    fn genuine_package_skip_still_counts() {
+        let mut env = Envelope::new(Command::Vendor);
+        env.record(
+            PatchEvent::new(PatchAction::Skipped, "pkg:cargo/cfg-if@1.0.4").with_reason(
+                "already_vendored",
+                "artifact and lockfile wiring already in sync",
+            ),
+        );
+        assert_eq!(
+            env.summary.skipped, 1,
+            "an already_vendored package is a genuine skip"
+        );
     }
 }
 
