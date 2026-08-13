@@ -141,6 +141,16 @@ all — the patched graph builds even if the upstream registry is down.)
 - Wire schema — `Integrity.goModH1` (new) alongside `dirhashH1`;
   `RegistryOverrideIdentifiers.goModuleVersion` (new) alongside the
   previously-reserved `goModulePath`.
+- Cross-mode policy (adversarially reviewed): takeover into hosted (from a
+  local `.socket/go-patches/` or vendored replace) and vendor-takes-over-hosted
+  are supported, in-place, and ledger-recorded with the replaced directive in
+  `original`; **local apply refuses** a Hosted-owned replace (taking it over
+  would strand the pruned go.sum lines) and `apply --check` exempts
+  hosted-owned modules from MissingReplace drift. A committed pin whose
+  version `require` no longer selects is reconciled away (directive + go.sum
+  lines removed) rather than left to confirm a redirect it no longer performs.
+  `vendor --revert` after a hosted takeover warns to re-run
+  `scan --mode hosted` or `go mod tidy`.
 - Tests — unit suite in `redirect/mod.rs`; golden fixture
   `tests/fixtures/redirect/golang/gomod/basic/` (the cross-language contract
   the depscan TS twin must match byte-identically); capstone
