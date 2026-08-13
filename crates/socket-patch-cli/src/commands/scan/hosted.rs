@@ -66,19 +66,39 @@ fn parse_purl_simple(purl: &str) -> Option<(String, String, String)> {
 }
 
 /// The hosted-mode JSON error envelope, for bail-outs that return before the
-/// result envelope at the bottom of [`run_redirect`] is built. A `--json`
-/// consumer must always get parseable stdout — `status`/`error` mirror the
-/// success envelope's error fold — never empty output plus an exit code.
-fn emit_json_error(message: &str) {
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&serde_json::json!({
-            "status": "error",
-            "error": message,
-            "redirect": { "mode": "hosted" },
-        }))
-        .unwrap()
-    );
+/// success envelope at the bottom of [`run_redirect`] is built. When the
+/// classic scan object (`scan_result`, threaded in from `run`) is present it
+/// is reused so the error envelope carries the SAME top-level scan keys as
+/// the success path — folding in `status`/`error` and a minimal `redirect`
+/// block — instead of a bare shape that flips the schema. When absent (never
+/// in JSON mode today) the bare envelope is emitted. A `--json` consumer must
+/// always get parseable stdout — never empty output plus an exit code.
+fn emit_json_error(scan_result: Option<serde_json::Value>, message: &str) {
+    let mut result = scan_result.unwrap_or_else(|| serde_json::json!({ "status": "error" }));
+    result["status"] = serde_json::json!("error");
+    result["error"] = serde_json::json!(message);
+    if !result.get("redirect").is_some_and(|r| r.is_object()) {
+        result["redirect"] = serde_json::json!({ "mode": "hosted" });
+    }
+    println!("{}", serde_json::to_string_pretty(&result).unwrap());
+}
+
+/// Build the hosted `--json` success envelope: the classic scan object
+/// (`scan_result`, built by `run` — scannedPackages / totalPatches /
+/// canAccessPaidPatches plus the `packages` enumeration) with the redirect
+/// summary NESTED under `redirect`, mirroring vendored mode's nested `vendor`
+/// block. Extracted so the schema (classic scan keys + nested `redirect`) is
+/// unit-testable without a live API. When `scan_result` is absent (never in
+/// JSON mode today) a minimal `{status:"success"}` base is used so stdout is
+/// still parseable.
+fn build_redirect_json_envelope(
+    scan_result: Option<serde_json::Value>,
+    redirect: serde_json::Value,
+) -> serde_json::Value {
+    let mut result = scan_result.unwrap_or_else(|| serde_json::json!({ "status": "success" }));
+    result["status"] = serde_json::json!("success");
+    result["redirect"] = redirect;
+    result
 }
 
 /// `scan --redirect`: resolve hosted-patch references for the selected patches,
@@ -91,6 +111,11 @@ pub(super) async fn run_redirect(
     effective_org_slug: Option<&str>,
     all_packages_with_patches: &[BatchPackagePatches],
     can_access_paid_patches: bool,
+    // The classic scan object `run` builds for the `--json` path (`Some` in
+    // JSON mode, `None` for human output). The redirect result is NESTED into
+    // it so the hosted `--json` envelope stays schema-consistent with every
+    // other scan; `.take()` at each terminal (error or success) folds it in.
+    mut scan_result: Option<serde_json::Value>,
 ) -> i32 {
     use socket_patch_core::manifest::schema::PatchRecord;
     use socket_patch_core::patch::redirect::{
@@ -114,7 +139,7 @@ pub(super) async fn run_redirect(
         // stdout is never empty on failure.
         Err((code, message)) => {
             if args.common.json {
-                emit_json_error(&message);
+                emit_json_error(scan_result.take(), &message);
             }
             return code;
         }
@@ -138,7 +163,7 @@ pub(super) async fn run_redirect(
                 let message = format!("failed to resolve patch references: {e}");
                 eprintln!("{message}");
                 if args.common.json {
-                    emit_json_error(&message);
+                    emit_json_error(scan_result.take(), &message);
                 }
                 return 1;
             }
@@ -446,7 +471,7 @@ pub(super) async fn run_redirect(
                 let message = format!("failed to write {rel}: {e}");
                 eprintln!("{message}");
                 if args.common.json {
-                    emit_json_error(&message);
+                    emit_json_error(scan_result.take(), &message);
                 }
                 return 1;
             }
@@ -486,7 +511,7 @@ pub(super) async fn run_redirect(
                 let message = format!("failed to write .socket/vendor/redirect-state.json: {e}");
                 eprintln!("{message}");
                 if args.common.json {
-                    emit_json_error(&message);
+                    emit_json_error(scan_result.take(), &message);
                 }
                 return 1;
             }
@@ -534,20 +559,25 @@ pub(super) async fn run_redirect(
         warnings.extend(migration_warnings.iter().cloned());
         warnings.extend(rush_warnings.iter().cloned());
         warnings.extend(pnpm_warnings.iter().cloned());
-        let mut result = serde_json::json!({
-            "status": "success",
-            "redirect": {
-                // Final mode naming: `--redirect` IS hosted mode. Additive
-                // key so JSON consumers can dispatch on the mode without
-                // inferring it from which sub-object is present.
-                "mode": "hosted",
-                "redirected": confirmed.len(),
-                "rewrittenFiles": rewritten,
-                "skipped": skipped,
-                "warnings": warnings,
-                "dryRun": args.common.dry_run,
-            }
+        // Nest the redirect result under `redirect` inside the classic scan
+        // object (built by `run`, threaded in via `scan_result`), mirroring
+        // vendored mode's nested `vendor` block. This keeps the hosted `--json`
+        // envelope schema-consistent with the zero-discovery and non-hosted
+        // scan envelopes — same top-level scan keys (scannedPackages,
+        // totalPatches, canAccessPaidPatches) plus the `packages` enumeration —
+        // instead of the bare `{status, redirect}` it used to emit.
+        let redirect = serde_json::json!({
+            // Final mode naming: `--redirect` IS hosted mode. Additive key so
+            // JSON consumers can dispatch on the mode without inferring it from
+            // which sub-object is present.
+            "mode": "hosted",
+            "redirected": confirmed.len(),
+            "rewrittenFiles": rewritten,
+            "skipped": skipped,
+            "warnings": warnings,
+            "dryRun": args.common.dry_run,
         });
+        let mut result = build_redirect_json_envelope(scan_result.take(), redirect);
         if let Some(statements) = vex_statements {
             result["vex"] = serde_json::json!({
                 "path": args.vex.vex.as_ref().unwrap().display().to_string(),
@@ -623,8 +653,72 @@ pub(super) async fn run_redirect(
 
 #[cfg(test)]
 mod tests {
-    use super::REDIRECT_CANDIDATE_FILES;
+    use super::{build_redirect_json_envelope, REDIRECT_CANDIDATE_FILES};
     use socket_patch_core::constants::npm_family;
+
+    /// The classic scan object `run` builds for the `--json` path with ≥1
+    /// discovered package (scannedPackages/totalPatches/… + the `packages`
+    /// enumeration). Mirrors the `serde_json::json!` in `scan::run`.
+    fn classic_scan_result() -> serde_json::Value {
+        serde_json::json!({
+            "status": "success",
+            "scannedPackages": 3,
+            "lockfileOnlyPackages": 0,
+            "packagesWithPatches": 1,
+            "totalPatches": 2,
+            "freePatches": 2,
+            "paidPatches": 0,
+            "canAccessPaidPatches": false,
+            "packages": [
+                { "purl": "pkg:npm/minimist@1.2.2", "patches": [ { "uuid": "abc-123" } ] }
+            ],
+            "updates": [],
+        })
+    }
+
+    #[test]
+    fn hosted_json_envelope_nests_redirect_into_classic_scan_object() {
+        // Regression for hosted-scan-json-schema-flips-with-discovery /
+        // hosted-scan-json-omits-enumeration: with ≥1 package, the hosted
+        // `--json` envelope must carry the SAME top-level scan keys as a
+        // zero-discovery / non-hosted scan (the old bare `{status, redirect}`
+        // dropped them) AND nest the redirect summary under `redirect`.
+        let redirect = serde_json::json!({
+            "mode": "hosted",
+            "redirected": 1,
+            "rewrittenFiles": ["package-lock.json"],
+            "skipped": [],
+            "warnings": [],
+            "dryRun": false,
+        });
+        let envelope = build_redirect_json_envelope(Some(classic_scan_result()), redirect);
+
+        // Classic scan keys survive — the bug was that they did not.
+        assert_eq!(envelope["status"], "success");
+        assert_eq!(envelope["scannedPackages"], 3);
+        assert_eq!(envelope["packagesWithPatches"], 1);
+        assert_eq!(envelope["totalPatches"], 2);
+        assert_eq!(envelope["freePatches"], 2);
+        assert_eq!(envelope["paidPatches"], 0);
+        assert_eq!(envelope["canAccessPaidPatches"], false);
+        assert!(envelope["updates"].is_array());
+
+        // Per-package / patch-uuid enumeration is present (the omission).
+        assert!(envelope["packages"].is_array());
+        assert_eq!(envelope["packages"][0]["purl"], "pkg:npm/minimist@1.2.2");
+        assert_eq!(envelope["packages"][0]["patches"][0]["uuid"], "abc-123");
+
+        // Redirect result is NESTED, preserving every sub-field, not replacing
+        // the whole envelope.
+        let r = &envelope["redirect"];
+        assert!(r.is_object());
+        assert_eq!(r["mode"], "hosted");
+        assert_eq!(r["redirected"], 1);
+        assert_eq!(r["rewrittenFiles"][0], "package-lock.json");
+        assert!(r["skipped"].is_array());
+        assert!(r["warnings"].is_array());
+        assert_eq!(r["dryRun"], false);
+    }
 
     #[test]
     fn redirect_candidates_match_the_shared_npm_family_table() {

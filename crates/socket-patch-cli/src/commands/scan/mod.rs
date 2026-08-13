@@ -619,6 +619,19 @@ pub async fn run(mut args: ScanArgs) -> i32 {
                 "packages": [],
                 "updates": [],
             });
+            // Hosted mode: keep the `--json` envelope schema-consistent with
+            // the ≥1-package path by including a (no-op) nested `redirect`
+            // block — nothing was discovered, so nothing is redirected.
+            if hosted {
+                result["redirect"] = serde_json::json!({
+                    "mode": "hosted",
+                    "redirected": 0,
+                    "rewrittenFiles": [],
+                    "skipped": [],
+                    "warnings": [],
+                    "dryRun": args.common.dry_run,
+                });
+            }
             let code =
                 embed_vex_into_json(&args.common, &args.vex, &manifest_path, 0, &mut result).await;
             println!("{}", serde_json::to_string_pretty(&result).unwrap());
@@ -848,16 +861,23 @@ pub async fn run(mut args: ScanArgs) -> i32 {
     )
     .await;
 
-    // Registry-redirect mode is a distinct, self-contained flow (rewrite
-    // lockfiles → hosted vendored patches). It reuses discovery above, then
-    // returns — it must NOT fall through to the apply/vendor branches.
-    if hosted {
+    // Registry-redirect (hosted) mode is a distinct, self-contained flow
+    // (rewrite lockfiles → hosted vendored patches). It reuses discovery
+    // above, then returns — it must NOT fall through to the apply/vendor
+    // branches. The HUMAN path returns here; the `--json` path returns from
+    // inside the JSON block below (after building the classic scan object)
+    // so the redirect result can be NESTED under a `redirect` key — keeping
+    // the hosted `--json` envelope schema-consistent with the zero-discovery
+    // and non-hosted paths (mirroring vendored mode's nested `vendor` block)
+    // rather than replacing the whole envelope with a bare `{status, redirect}`.
+    if hosted && !args.common.json {
         return run_redirect(
             &args,
             &api_client,
             effective_org_slug,
             &all_packages_with_patches,
             can_access_paid_patches,
+            None,
         )
         .await;
     }
@@ -902,6 +922,24 @@ pub async fn run(mut args: ScanArgs) -> i32 {
                     pkg["notInstalled"] = serde_json::json!(true);
                 }
             }
+        }
+
+        // Hosted mode: NEST the redirect result under `redirect` in the classic
+        // scan object just built above (mirrors vendored mode's nested `vendor`
+        // block), so the hosted `--json` envelope carries the same top-level
+        // scan keys and `packages` enumeration as every other scan plus the
+        // redirect summary. Returns before the apply/vendor/prune branches,
+        // which are mutually exclusive with hosted mode.
+        if hosted {
+            return run_redirect(
+                &args,
+                &api_client,
+                effective_org_slug,
+                &all_packages_with_patches,
+                can_access_paid_patches,
+                Some(result),
+            )
+            .await;
         }
 
         // `apply` and `prune` are computed once at the top of run()
