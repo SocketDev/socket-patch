@@ -518,14 +518,18 @@ pub(super) async fn run_redirect(
         }
     }
 
-    // Cross-mode takeover: this hosted redirect rewired the lockfile, but a
-    // committed vendored ledger (`.socket/vendor/state.json`) may still claim
-    // the same package(s) — their tarballs are now orphaned and that ledger is
-    // stale. Detect + warn (JSON `warnings[]` and stderr) WITHOUT deleting the
-    // other mode's ledger; full reconciliation is deferred (see PR Scope).
+    // Cross-mode takeover: a committed vendored ledger (`.socket/vendor/state.json`)
+    // may still claim package(s) this project also has a hosted redirect ledger
+    // for — their tarballs would then be orphaned and that ledger stale. But the
+    // overlap alone does NOT prove hosted won: only warn for the package(s) the
+    // LIVE lockfile actually routes to `patch.socket.dev` (see
+    // `classify_overlap_takeover`), so a dry-run / no-op over a lock that still
+    // points at the vendored files stays silent instead of pointing cleanup at
+    // the live vendored ledger. Warn (JSON `warnings[]` and stderr) WITHOUT
+    // deleting the other mode's ledger; reconciliation is deferred (see PR Scope).
     // Read after the ledger write above so a non-dry-run reflects this run.
     let mut takeover_warnings: Vec<serde_json::Value> = Vec::new();
-    let superseded = super::overlapping_ledger_purls(&args.common.cwd).await;
+    let superseded = super::classify_overlap_takeover(&args.common.cwd).await.redirect;
     if !superseded.is_empty() {
         takeover_warnings.push(serde_json::json!({
             "code": super::REDIRECT_SUPERSEDES_VENDORED,

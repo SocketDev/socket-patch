@@ -89,7 +89,12 @@ fn scan_vendor_service_config(
 /// [`note_classic_migration_risk`]; the stale ledger is NOT deleted here
 /// (reconciliation is deferred — see the redirect twin in `hosted.rs`).
 async fn note_vendor_supersedes_redirect(env: &mut Envelope, cwd: &Path, common: &GlobalArgs) {
-    let superseded = super::overlapping_ledger_purls(cwd).await;
+    // Only warn for the package(s) the LIVE lockfile actually routes to the
+    // committed `.socket/vendor/` files — the direction the lock proves, not the
+    // fact that this happens to be the vendored flow. A dry-run / no-op over a
+    // lock that still points at the hosted patch server stays silent instead of
+    // pointing cleanup at the live redirect ledger.
+    let superseded = super::classify_overlap_takeover(cwd).await.vendored;
     if superseded.is_empty() {
         return;
     }
