@@ -994,8 +994,14 @@ fn rollback_dispatch_branch_nuget() {
     let root = tmp.path();
     write_root_package_json(root);
     std::fs::write(root.join("app.csproj"), "<Project></Project>\n").unwrap();
-    // Legacy packages.config layout: <cwd>/packages/<Name>/<Version>/.
-    let pkg = root.join("packages").join("Foo").join("1.0.0");
+    // Legacy packages.config layout: <cwd>/packages/<Name>.<Version>/
+    // (dotted, case-preserved — what nuget.exe actually writes there).
+    // The old `<Name>/<Version>` nesting this fixture used was neither
+    // the legacy layout nor the global-cache one (which lowercases both
+    // segments), so the crawler's lowercase probe only matched it on
+    // case-INSENSITIVE filesystems — the reason this test was red on
+    // Linux CI while it was `#[ignore]`d.
+    let pkg = root.join("packages").join("Foo.1.0.0");
     std::fs::create_dir_all(pkg.join("lib")).unwrap();
     let verify_file = pkg.join("lib").join("foo.dll");
     std::fs::write(&verify_file, PATCHED).unwrap();
