@@ -85,12 +85,22 @@ fn env_truthy(name: &str) -> bool {
 
 /// Should [`crawl_all_ecosystems`] warn that a Maven project on disk was
 /// skipped? True only when the experimental runtime flag is OFF *and* the
-/// crawler would actually have found Maven sources (a Maven/Gradle project
-/// plus its local repository). Reusing the crawler's own path discovery
-/// keeps the signal aligned with exactly what an opted-in scan would crawl,
-/// and guards the warning against firing on non-Maven projects (one warning
-/// per run, only when something was really skipped).
+/// crawler would actually have found a *local* Maven project (a Maven/Gradle
+/// marker plus its local repository). Reusing the crawler's own path
+/// discovery keeps the signal aligned with exactly what an opted-in scan
+/// would crawl, and guards the warning against firing on non-Maven projects
+/// (one warning per run, only when something was really skipped).
+///
+/// The warning only makes sense for a *local project* scan. In `--global` /
+/// `--global-prefix` mode `get_maven_repo_paths` returns the shared cache
+/// path with NO project-marker check (`global_prefix` skips even the `is_dir`
+/// check), so a non-empty result there says nothing about a project being
+/// present — a global scan of the `~/.m2` cache would otherwise falsely warn
+/// "Maven project detected but gated". Suppress it in those modes.
 async fn maven_discovery_gated_off(options: &CrawlerOptions) -> bool {
+    if options.global || options.global_prefix.is_some() {
+        return false;
+    }
     !maven_runtime_enabled()
         && !MavenCrawler
             .get_maven_repo_paths(options)
@@ -99,8 +109,13 @@ async fn maven_discovery_gated_off(options: &CrawlerOptions) -> bool {
             .is_empty()
 }
 
-/// NuGet counterpart to [`maven_discovery_gated_off`].
+/// NuGet counterpart to [`maven_discovery_gated_off`]. Likewise suppressed in
+/// `--global` / `--global-prefix` mode, where `get_nuget_package_paths`
+/// returns the shared cache path without a .NET-project-marker check.
 async fn nuget_discovery_gated_off(options: &CrawlerOptions) -> bool {
+    if options.global || options.global_prefix.is_some() {
+        return false;
+    }
     !nuget_runtime_enabled()
         && !NuGetCrawler
             .get_nuget_package_paths(options)
@@ -1191,6 +1206,87 @@ mod tests {
         assert!(
             !gated,
             "a non-.NET project must not produce a gated-discovery warning"
+        );
+    }
+
+    // The gated-off warning is about a LOCAL project being silently skipped.
+    // A `--global` / `--global-prefix` scan reads the shared cache directly:
+    // `get_maven_repo_paths` / `get_nuget_package_paths` return the cache path
+    // with NO project-marker check (`global_prefix` skips even the `is_dir`
+    // check), so a non-empty result there says nothing about a local project
+    // being present. The decision must stay FALSE in those modes — otherwise
+    // an ordinary global scan emits a false "project detected but gated"
+    // warning for a project that was never there.
+
+    #[tokio::test]
+    #[serial_test::serial(experimental_gate_env)]
+    async fn maven_discovery_not_gated_in_global_or_prefix_mode() {
+        // A real (existing) local Maven repo so global discovery yields a path.
+        let repo = tempfile::tempdir().unwrap();
+        std::env::set_var("MAVEN_REPO_LOCAL", repo.path());
+        std::env::remove_var("SOCKET_EXPERIMENTAL_MAVEN");
+        // A cwd with no Java project marker anywhere.
+        let cwd = tempfile::tempdir().unwrap();
+
+        let global = CrawlerOptions {
+            cwd: cwd.path().to_path_buf(),
+            global: true,
+            global_prefix: None,
+        };
+        let global_gated = maven_discovery_gated_off(&global).await;
+
+        let prefix = CrawlerOptions {
+            cwd: cwd.path().to_path_buf(),
+            global: false,
+            global_prefix: Some(repo.path().to_path_buf()),
+        };
+        let prefix_gated = maven_discovery_gated_off(&prefix).await;
+
+        std::env::remove_var("MAVEN_REPO_LOCAL");
+
+        assert!(
+            !global_gated,
+            "--global scan hits the shared cache, not a local project — must not warn as gated"
+        );
+        assert!(
+            !prefix_gated,
+            "--global-prefix scan targets an explicit cache path — must not warn as gated"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(experimental_gate_env)]
+    async fn nuget_discovery_not_gated_in_global_or_prefix_mode() {
+        // A real (existing) global NuGet cache so global discovery yields a path.
+        let cache = tempfile::tempdir().unwrap();
+        std::env::set_var("NUGET_PACKAGES", cache.path());
+        std::env::remove_var("SOCKET_EXPERIMENTAL_NUGET");
+        // A cwd with no .NET project marker anywhere.
+        let cwd = tempfile::tempdir().unwrap();
+
+        let global = CrawlerOptions {
+            cwd: cwd.path().to_path_buf(),
+            global: true,
+            global_prefix: None,
+        };
+        let global_gated = nuget_discovery_gated_off(&global).await;
+
+        let prefix = CrawlerOptions {
+            cwd: cwd.path().to_path_buf(),
+            global: false,
+            global_prefix: Some(cache.path().to_path_buf()),
+        };
+        let prefix_gated = nuget_discovery_gated_off(&prefix).await;
+
+        std::env::remove_var("NUGET_PACKAGES");
+
+        assert!(
+            !global_gated,
+            "--global scan hits the shared cache, not a local project — must not warn as gated"
+        );
+        assert!(
+            !prefix_gated,
+            "--global-prefix scan targets an explicit cache path — must not warn as gated"
         );
     }
 }
