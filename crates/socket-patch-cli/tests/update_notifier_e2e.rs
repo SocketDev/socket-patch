@@ -87,6 +87,29 @@ fn eligible_kit(base_url: &str) -> Vec<(&str, &str)> {
     ]
 }
 
+/// [`eligible_kit`] plus a lifted join grace, for every row that asserts on
+/// the background check's *observable effect* — a rewritten `latestSeen`, a
+/// notice on stderr, or a request an `expect_resolves` mock counts.
+///
+/// The notifier's fetch runs in a detached task, and the child calls
+/// `std::process::exit` the instant the notifier's `finish` returns. Under
+/// the production 500 ms grace that is a genuine race: on a fast host the
+/// loopback fetch lands its state write / request in a few ms and wins, but
+/// on a slow one (a loaded Windows CI runner) it can miss the window, get
+/// killed at exit, and never write `latestSeen` or reach the mock at all —
+/// the "reads the STALE version" / "expect(1) unmet" Windows flake. Lifting
+/// the ceiling via `SOCKET_UPDATE_GRACE_MS` makes `finish` await the fetch to
+/// completion instead of racing it, so the effect is deterministic. It does
+/// NOT weaken any assertion: the fetch still completes in milliseconds, only
+/// the artificial cutoff is gone (`grace_budget_bounds_command_latency`
+/// keeps the real 500 ms ceiling, since testing that cutoff is its whole
+/// point).
+fn eligible_kit_await_fetch(base_url: &str) -> Vec<(&str, &str)> {
+    let mut kit = eligible_kit(base_url);
+    kit.push(("SOCKET_UPDATE_GRACE_MS", "30000"));
+    kit
+}
+
 /// The notifier must never mutate the install or the project dir, on any
 /// path — every row re-proves it.
 fn assert_install_pristine(install: &StagedInstall) {
@@ -110,7 +133,7 @@ async fn first_eligible_run_checks_and_notices() {
         .await;
 
     let (code, stdout, stderr) =
-        run_installed(&install, &["apply"], &eligible_kit(&release.base_url));
+        run_installed(&install, &["apply"], &eligible_kit_await_fetch(&release.base_url));
     assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
     assert!(
         stderr.contains("Update available") && stderr.contains("9.9.9"),
@@ -174,7 +197,7 @@ async fn stale_state_rechecks() {
     write_state(&install.state_dir, STALE, Some(CURRENT), None);
 
     let (code, stdout, stderr) =
-        run_installed(&install, &["apply"], &eligible_kit(&release.base_url));
+        run_installed(&install, &["apply"], &eligible_kit_await_fetch(&release.base_url));
     assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
 
     let state = read_state(&install.state_dir);
@@ -202,7 +225,8 @@ async fn up_to_date_prints_nothing() {
         .await;
     write_state(&install.state_dir, STALE, Some(CURRENT), None);
 
-    let (code, _, stderr) = run_installed(&install, &["apply"], &eligible_kit(&release.base_url));
+    let (code, _, stderr) =
+        run_installed(&install, &["apply"], &eligible_kit_await_fetch(&release.base_url));
     assert_eq!(code, 0);
     assert!(
         !stderr.contains("Update available"),
@@ -265,7 +289,7 @@ async fn corrupt_state_recovers() {
     .unwrap();
 
     let (code, stdout, stderr) =
-        run_installed(&install, &["apply"], &eligible_kit(&release.base_url));
+        run_installed(&install, &["apply"], &eligible_kit_await_fetch(&release.base_url));
     assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
     assert!(
         !stderr.contains("panicked"),
@@ -293,7 +317,7 @@ async fn future_timestamp_tolerated() {
     write_state(&install.state_dir, -48 * HOUR, Some("9.9.9"), None);
 
     let (code, stdout, stderr) =
-        run_installed(&install, &["apply"], &eligible_kit(&release.base_url));
+        run_installed(&install, &["apply"], &eligible_kit_await_fetch(&release.base_url));
     assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
     assert_install_pristine(&install);
 }
@@ -636,6 +660,10 @@ mod pty {
             ("CI", ""),
             ("GITHUB_ACTIONS", ""),
             ("SOCKET_UPDATE_BASE_URL", &release.base_url),
+            // Await the background fetch rather than race the child's exit —
+            // the notice only appears once the check lands (see
+            // `eligible_kit_await_fetch`).
+            ("SOCKET_UPDATE_GRACE_MS", "30000"),
         ];
         let (code, output) = run_in_pty(
             &install.bin,

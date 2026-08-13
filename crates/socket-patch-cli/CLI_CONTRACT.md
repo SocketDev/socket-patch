@@ -753,6 +753,7 @@ These exist for staged rollouts and the launcher wrappers. They are **internal**
 | `SOCKET_UPDATE_STATE_DIR` | Overrides the per-user dir holding `update-check.json` + `update.lock` (tests point it into a tempdir). |
 | `SOCKET_UPDATE_TIMEOUT_MS` | Caps the update fetches' connect/metadata/download budgets (defaults 10 s / 30 s / 300 s; the notice's fetch defaults to 2 s). Doubles as the slow-network escape hatch. |
 | `SOCKET_UPDATE_NOTIFIER_FORCE` | Test hook: bypasses the update notice's stderr-TTY guard — and nothing else (opt-out, offline, `--silent`, `--json`, CI all still win). |
+| `SOCKET_UPDATE_GRACE_MS` | Test hook: overrides the notice's post-command join grace (default 500 ms — how long the run waits for the background check before abandoning it and exiting). Lets the e2e suite await the loopback fetch to completion so its observable effect is deterministic; production keeps the tight 500 ms ceiling. |
 
 ### Deprecated env vars
 
