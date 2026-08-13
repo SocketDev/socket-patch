@@ -40,7 +40,7 @@ use crate::commands::apply::{representative_file, result_to_event, variant_match
 use crate::commands::fetch_stage::{stage_vendor_sources_in_memory, MemStageOutcome};
 use crate::commands::lock_cli::acquire_or_emit;
 use crate::commands::vex::{generate_vex_from_manifest_path, VexEmbedArgs};
-use crate::ecosystem_dispatch::{find_packages_for_purls, partition_purls};
+use crate::ecosystem_dispatch::{find_packages_for_rollback, partition_purls};
 use crate::json_envelope::{
     Command, Envelope, EnvelopeError, PatchAction, PatchEvent, RunWarning, Status, VexSummary,
 };
@@ -696,7 +696,18 @@ pub(crate) async fn vendor_records(
         global: common.global,
         global_prefix: common.global_prefix.clone(),
     };
-    let mut all_packages = find_packages_for_purls(
+    // Resolve installed packages with the qualified-purl-aware resolver, NOT
+    // `find_packages_for_purls`: the manifest keys release-variant ecosystems
+    // (gem `?platform=`, pypi `?artifact_id=`, maven `?classifier=&ext=`) by
+    // *qualified* purls, but the crawler only knows the *base* purl.
+    // `find_packages_for_purls` keys the result map by the base purl, so the
+    // `missing`/`contains_key` check below would miss every installed
+    // qualified-purl package and falsely classify it "not installed" —
+    // triggering a spurious `vendor_fetched_missing`, a redundant per-run
+    // registry download, and (for gem) a HashMap-order platform coin-flip.
+    // The rollback variant fans each base path back out to every qualified
+    // manifest purl (same invariant as `find_manifest_package_paths`).
+    let mut all_packages = find_packages_for_rollback(
         &vendorable_partition,
         &crawler_options,
         common.silent || common.json,
