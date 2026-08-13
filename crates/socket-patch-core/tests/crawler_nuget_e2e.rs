@@ -1,6 +1,6 @@
 //! Integration coverage for `crawlers::nuget_crawler`. The
 //! apply-CLI suite drives the global-cache `find_by_purls` happy
-//! path with `SOCKET_EXPERIMENTAL_NUGET=1`; everything else here —
+//! path; everything else here —
 //! legacy `Packages/<Name>.<Version>` layout, case-insensitive
 //! lookup, `crawl_all` directory scanning, `scan_package_dir`'s
 //! hidden-dir skip, `get_nuget_package_paths` discovery branches —

@@ -1,7 +1,5 @@
-//! setup-matrix: maven ecosystem (mvn). No native post-install hook,
-//! `setup` is a no-op, and apply is additionally gated behind
-//! `SOCKET_EXPERIMENTAL_MAVEN` (the driver sets it). The with-setup
-//! cases are an EXPECTED BASELINE GAP.
+//! setup-matrix: maven ecosystem (mvn). No native post-install hook and
+//! `setup` is a no-op. The with-setup cases are an EXPECTED BASELINE GAP.
 //!
 //! IMPORTANT — why this file carries a real assertion of its own:
 //! `smc::run_pm("maven", "mvn")` routes maven through the shared Docker
@@ -101,16 +99,13 @@ mod host_guard {
     /// runs; a (perfectly valid!) ambient `SOCKET_SETUP_EXCLUDE` stands in for
     /// `setup --exclude`, which a real `setup` run PERSISTS — creating
     /// `.socket/manifest.json` inside the maven fixture and failing
-    /// `assert_pristine`; and an enabled `SOCKET_EXPERIMENTAL_MAVEN` gate in
-    /// the shell/CI could quietly change maven's surface behind the test's
-    /// back. (Safe to set process-wide: the only other test in this binary is
-    /// the `#[ignore]`d matrix pass, which routes through
+    /// `assert_pristine`. (Safe to set process-wide: the only other test in
+    /// this binary is the `#[ignore]`d matrix pass, which routes through
     /// `smc::host_driver_command`'s own `SOCKET_*` prefix scrub.)
     const HOSTILE_DECOYS: &[(&str, &str)] = &[
         ("SOCKET_STRICT", "banana"),
         ("SOCKET_VENDOR_SOURCE", "bogus-decoy"),
         ("SOCKET_SETUP_EXCLUDE", "decoy-member"),
-        ("SOCKET_EXPERIMENTAL_MAVEN", "true"),
     ];
 
     /// Absolute path to the binary under test, via cargo's `CARGO_BIN_EXE_*`.

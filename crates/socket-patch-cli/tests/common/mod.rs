@@ -60,8 +60,7 @@ pub fn run(cwd: &Path, args: &[&str]) -> (i32, String, String) {
 }
 
 /// `run` + child-only env-var injection. Useful for tests that need
-/// to flip the per-ecosystem runtime gates (`SOCKET_EXPERIMENTAL_NUGET`)
-/// or override discovery roots (`NUGET_PACKAGES`, `GOMODCACHE`) without
+/// to override discovery roots (`NUGET_PACKAGES`, `GOMODCACHE`) without
 /// touching the parent process's environment — keeps tests parallel-safe.
 pub fn run_with_env(cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> (i32, String, String) {
     run_bin_with_env(&binary(), cwd, args, env)

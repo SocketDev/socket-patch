@@ -13,8 +13,8 @@
 //!     (`$M2`, bind-mounted) with commons-text + commons-lang3 + the plugin
 //!     machinery → a marker patch on the extracted-jar's `META-INF/NOTICE.txt`
 //!     is hand-staged (manifest + blob; git-blob sha256 from the ACTUAL cached
-//!     bytes) → `socket-patch vendor --json --offline` (baked binary,
-//!     `SOCKET_EXPERIMENTAL_MAVEN=1`) → asserts: the rebuilt `.jar` under the
+//!     bytes) → `socket-patch vendor --json --offline` (baked binary) →
+//!     asserts: the rebuilt `.jar` under the
 //!     maven2 leaf `.socket/vendor/maven/<uuid>/…`, the verbatim upstream pom
 //!     beside it (carrying the commons-lang3 transitive), the `.sha1` sidecars,
 //!     `socket-patch.vendor.json`, `state.json`, the `<repository>` inserted
@@ -93,10 +93,8 @@ const STAGE1: &str = r#"
 # point at it so warming, vendoring, and consumption all agree on one cache.
 export M2=/workspace/m2
 export MAVEN_REPO_LOCAL="$M2"
-# Keep socket-patch fully offline (also gates telemetry) + opt into the
-# experimental Maven dispatch tier (the crawler is runtime-gated).
+# Keep socket-patch fully offline (also gates telemetry).
 export SOCKET_OFFLINE=1
-export SOCKET_EXPERIMENTAL_MAVEN=1
 MVN="mvn -q -Dmaven.repo.local=$M2 -Dmaven.test.skip=true -Dstyle.color=never"
 
 mkdir -p /workspace/proj && cd /workspace/proj
@@ -288,7 +286,6 @@ const STAGE3: &str = r#"
 export M2=/workspace/m2
 export MAVEN_REPO_LOCAL="$M2"
 export SOCKET_OFFLINE=1
-export SOCKET_EXPERIMENTAL_MAVEN=1
 MVN="mvn -q -Dmaven.repo.local=$M2 -Dmaven.test.skip=true -Dstyle.color=never"
 cd /workspace/proj
 LEAF=".socket/vendor/maven/__UUID__/org/apache/commons/commons-text/1.10.0"

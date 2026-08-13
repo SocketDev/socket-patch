@@ -1367,3 +1367,69 @@ async fn scan_non_json_dry_run_does_not_mutate() {
         "non-JSON scan must fetch patch details before the dry-run stop"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Maven/NuGet are first-class: every scan mode discovers them.
+// ---------------------------------------------------------------------------
+
+/// Maven and NuGet used to sit behind `SOCKET_EXPERIMENTAL_MAVEN` /
+/// `SOCKET_EXPERIMENTAL_NUGET` runtime gates that silently dropped them
+/// from discovery. The gates are retired: every scan mode (default,
+/// `--mode hosted`, `--mode vendored`) must crawl both with no opt-in of
+/// any kind. The oracle is the batch POST body — it carries exactly the
+/// purls the crawl discovered, so a resurrected gate shows up as the
+/// purls (the only installed packages) going missing.
+#[tokio::test]
+#[serial]
+async fn scan_discovers_maven_and_nuget_in_every_mode() {
+    use socket_patch_cli::commands::scan::ScanMode;
+
+    const MAVEN_PURL: &str = "pkg:maven/org.example/foo@1.0.0";
+    const NUGET_PURL: &str = "pkg:nuget/Foo@1.0.0";
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_root_package_json(tmp.path());
+    // Maven: java-project marker + a local repository the crawler reaches
+    // via MAVEN_REPO_LOCAL (verified by the version dir's `.pom`).
+    std::fs::write(tmp.path().join("pom.xml"), "<project></project>\n").unwrap();
+    let artifact_dir = tmp.path().join("m2repo/org/example/foo/1.0.0");
+    std::fs::create_dir_all(&artifact_dir).unwrap();
+    std::fs::write(artifact_dir.join("foo-1.0.0.pom"), "<project/>").unwrap();
+    // NuGet: project marker + legacy `packages/<Name>.<Version>/` layout
+    // (verified by the `.nuspec`) — reachable without any env override.
+    std::fs::write(tmp.path().join("app.csproj"), "<Project></Project>\n").unwrap();
+    let nupkg_dir = tmp.path().join("packages/Foo.1.0.0");
+    std::fs::create_dir_all(&nupkg_dir).unwrap();
+    std::fs::write(nupkg_dir.join("Foo.nuspec"), "<package/>").unwrap();
+
+    std::env::set_var("MAVEN_REPO_LOCAL", tmp.path().join("m2repo"));
+
+    for mode in [None, Some(ScanMode::Hosted), Some(ScanMode::Vendored)] {
+        let server = MockServer::start().await;
+        mock_batch_empty(&server).await;
+
+        let mut args = default_args(tmp.path());
+        args.common.api_url = Some(server.uri());
+        args.mode = mode;
+
+        assert_eq!(run_scrubbed(args).await, 0, "mode {mode:?} must exit 0");
+
+        let reqs = recorded(&server).await;
+        let posts = batch_posts(&reqs);
+        assert_eq!(
+            posts.len(),
+            1,
+            "mode {mode:?} must query the batch API once for the crawled packages"
+        );
+        let body = req_body(posts[0]);
+        assert!(
+            body.contains(MAVEN_PURL),
+            "mode {mode:?} must discover maven with no opt-in; body: {body}"
+        );
+        assert!(
+            body.contains(NUGET_PURL),
+            "mode {mode:?} must discover nuget with no opt-in; body: {body}"
+        );
+    }
+    std::env::remove_var("MAVEN_REPO_LOCAL");
+}

@@ -289,10 +289,6 @@ fn dispatch_branch_golang() {
 }
 
 #[test]
-// Experimental ecosystem: the maven backend is unfinished, so this dispatch
-// e2e is kept OFF the blocking CI suite (it must not gate progress on maven).
-// Still compiled, and runnable on demand with `-- --ignored`.
-#[ignore = "experimental ecosystem (maven): not gating CI until the maven backend is implemented; run with --ignored"]
 fn dispatch_branch_maven() {
     let tmp = tempfile::tempdir().unwrap();
     write_root_package_json(tmp.path());
@@ -313,10 +309,6 @@ fn dispatch_branch_composer() {
 }
 
 #[test]
-// Experimental ecosystem: the nuget backend is unfinished, so this dispatch
-// e2e is kept OFF the blocking CI suite (it must not gate progress on nuget).
-// Still compiled, and runnable on demand with `-- --ignored`.
-#[ignore = "experimental ecosystem (nuget): not gating CI until the nuget backend is implemented; run with --ignored"]
 fn dispatch_branch_nuget() {
     let tmp = tempfile::tempdir().unwrap();
     write_root_package_json(tmp.path());
@@ -482,9 +474,9 @@ fn run_rollback(
         cmd.arg("--global");
     }
     cmd.current_dir(cwd);
-    // Scrub BEFORE seeding fixture envs: the fixture list includes
-    // SOCKET_-prefixed vars (SOCKET_EXPERIMENTAL_MAVEN/NUGET) that the
-    // prefix sweep would otherwise wipe (last env call per key wins).
+    // Scrub BEFORE seeding fixture envs, so a fixture-supplied
+    // SOCKET_-prefixed var survives the prefix sweep (last env call
+    // per key wins).
     scrub_socket_env(&mut cmd);
     for (k, v) in envs {
         cmd.env(k, v);
@@ -779,9 +771,6 @@ fn rollback_dispatch_branch_golang() {
 }
 
 #[test]
-// Experimental ecosystem (maven), kept OFF the blocking CI suite — see the
-// note on `dispatch_branch_maven`. Run with `-- --ignored`.
-#[ignore = "experimental ecosystem (maven): not gating CI until the maven backend is implemented; run with --ignored"]
 fn rollback_dispatch_branch_maven() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
@@ -799,10 +788,10 @@ fn rollback_dispatch_branch_maven() {
     let fixture = RollbackFixture {
         purl: purl.to_string(),
         verify_file,
-        envs: vec![
-            ("MAVEN_REPO_LOCAL".to_string(), repo.display().to_string()),
-            ("SOCKET_EXPERIMENTAL_MAVEN".to_string(), "1".to_string()),
-        ],
+        envs: vec![(
+            "MAVEN_REPO_LOCAL".to_string(),
+            repo.display().to_string(),
+        )],
         global: false,
     };
     assert_rollback_restored(root, "maven", &fixture);
@@ -1000,18 +989,19 @@ fn setup_check_json_global_prefix_stdout_is_pure_json() {
 }
 
 #[test]
-// Experimental ecosystem (nuget), kept OFF the blocking CI suite — see the
-// note on `dispatch_branch_nuget`. This is the test that was failing in CI
-// (the nuget rollback crawler discovers 0 packages). Run with
-// `-- --ignored`.
-#[ignore = "experimental ecosystem (nuget): not gating CI until the nuget backend is implemented; run with --ignored"]
 fn rollback_dispatch_branch_nuget() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     write_root_package_json(root);
     std::fs::write(root.join("app.csproj"), "<Project></Project>\n").unwrap();
-    // Legacy packages.config layout: <cwd>/packages/<Name>/<Version>/.
-    let pkg = root.join("packages").join("Foo").join("1.0.0");
+    // Legacy packages.config layout: <cwd>/packages/<Name>.<Version>/
+    // (dotted, case-preserved — what nuget.exe actually writes there).
+    // The old `<Name>/<Version>` nesting this fixture used was neither
+    // the legacy layout nor the global-cache one (which lowercases both
+    // segments), so the crawler's lowercase probe only matched it on
+    // case-INSENSITIVE filesystems — the reason this test was red on
+    // Linux CI while it was `#[ignore]`d.
+    let pkg = root.join("packages").join("Foo.1.0.0");
     std::fs::create_dir_all(pkg.join("lib")).unwrap();
     let verify_file = pkg.join("lib").join("foo.dll");
     std::fs::write(&verify_file, PATCHED).unwrap();
@@ -1020,7 +1010,7 @@ fn rollback_dispatch_branch_nuget() {
     let fixture = RollbackFixture {
         purl: purl.to_string(),
         verify_file,
-        envs: vec![("SOCKET_EXPERIMENTAL_NUGET".to_string(), "1".to_string())],
+        envs: vec![],
         global: false,
     };
     assert_rollback_restored(root, "nuget", &fixture);

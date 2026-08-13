@@ -64,13 +64,6 @@ async fn run(args: &[&str], cwd: &Path, m2_repo: &Path, proxy_url: &str) -> Outp
             .current_dir(&cwd)
             // Point the crawler at the fake local repo.
             .env("MAVEN_REPO_LOCAL", &m2_repo)
-            // The Maven crawler is gated behind a runtime opt-in
-            // (`maven_runtime_enabled` in ecosystem_dispatch.rs); without
-            // this the crawl short-circuits to zero packages and the scan
-            // prints "No packages found." These tests are named for Maven
-            // *discovery*, so they must enable the real crawl path — otherwise
-            // they only ever exercise the disabled stub and pass vacuously.
-            .env("SOCKET_EXPERIMENTAL_MAVEN", "1")
             // Keep the run hermetic: no ambient token, no inherited repo path.
             .env_remove("SOCKET_API_TOKEN")
             .env_remove("SOCKET_CLI_API_TOKEN")

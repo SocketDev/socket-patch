@@ -129,10 +129,7 @@ the edit.
 
 > If it prints `No patches available for installed packages.`, none of your installed
 > dependency versions currently has a Socket patch — the good outcome, with nothing to
-> apply. (One exception: Maven and NuGet installed-package discovery is experimental and
-> off by default — `scan` silently skips them unless `SOCKET_EXPERIMENTAL_MAVEN=1` /
-> `SOCKET_EXPERIMENTAL_NUGET=1` is set; see the
-> [mode × ecosystem matrix](docs/ecosystems.md#mode--ecosystem-matrix).)
+> apply.
 > To walk the rest of the loop anyway, make a scratch project pinned to a version
 > that has a free patch — at the time of writing, `flatted@3.3.1`:
 >
@@ -727,10 +724,12 @@ What gets wired, per ecosystem:
   `"setup": { "manual": ["deno"] }`) so [`vex`](#vex) still attests the hand-applied
   patches — this matters most for Deno, which has no vendored or hosted alternative.
   For Maven
-  and NuGet, discovery of installed packages is experimental and off by default (opt in
-  with `SOCKET_EXPERIMENTAL_MAVEN=1` / `SOCKET_EXPERIMENTAL_NUGET=1`), and in-place
-  patching corrupts their cache checksum sidecars — prefer `--mode vendored` or
-  `--mode hosted`; see [ecosystems.md](docs/ecosystems.md#maven--nuget-caveats).
+  and NuGet, note that in-place patching leaves the caches' own checksum sidecars stale
+  (NuGet's fixup deletes `.nupkg.metadata` and raises an advisory for the signed-package
+  `.nupkg.sha512` marker; Maven's `.jar.sha1`/`.jar.md5` are left as-is) — the copy-out
+  modes, `scan --mode vendored` and `scan --mode hosted`, never touch the caches and
+  avoid the issue entirely. See
+  [ecosystems.md](docs/ecosystems.md#maven--nuget-caveats).
 
 **Usage:**
 ```bash

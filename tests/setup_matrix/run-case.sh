@@ -657,10 +657,8 @@ fi
 # NOTE: SOCKET_OFFLINE/SOCKET_FORCE must be "true"/"false" — the apply
 # `--force` flag (unlike its siblings) has no boolish value parser, so
 # SOCKET_FORCE=1 is rejected with "invalid value '1' for '--force'".
-# The SOCKET_EXPERIMENTAL_* gates are read directly from the env and use
-# "1".
 export SOCKET_OFFLINE=true SOCKET_FORCE=true SOCKET_API_TOKEN=fake SOCKET_ORG_SLUG=test-org
-export SOCKET_TELEMETRY_DISABLED=1 SOCKET_EXPERIMENTAL_MAVEN=1 SOCKET_EXPERIMENTAL_NUGET=1
+export SOCKET_TELEMETRY_DISABLED=1
 # Isolate the pypi `.pth` hook's change-detection stamp per case so runs
 # don't bleed into each other (the stamp lives under XDG_CACHE_HOME).
 export XDG_CACHE_HOME="$WORKDIR/.cache"
