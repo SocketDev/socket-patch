@@ -264,6 +264,38 @@ fn format_notice(
     )
 }
 
+const DEFAULT_GRACE_MS: u64 = 500;
+
+/// How long `finish` waits for the background fetch before abandoning it.
+///
+/// 500 ms in production — deliberately tight so a real command never stalls
+/// on the notifier. The catch: `main` calls `std::process::exit` the instant
+/// `finish` returns, which kills a still-running detached fetch before its
+/// state write (or even its outbound request) can land. On a fast host the
+/// loopback fetch finishes in milliseconds and comfortably beats the ceiling;
+/// on a slow one (a loaded Windows CI runner, fsync latency, a cold TLS/HTTP
+/// client) the fetch can miss the 500 ms window, the task is killed, and its
+/// `latestSeen` write / `expect`-counted request simply never happens — an
+/// e2e that asserts on that observable effect then fails intermittently.
+///
+/// `SOCKET_UPDATE_GRACE_MS` lets the e2e suite lift the ceiling so the fetch
+/// is awaited to completion instead of raced. Same shape as the
+/// `SOCKET_UPDATE_TIMEOUT_MS` fetch-budget hook; the default is preserved, so
+/// production behavior is byte-identical.
+fn grace_budget() -> Duration {
+    grace_budget_from(std::env::var("SOCKET_UPDATE_GRACE_MS").ok().as_deref())
+}
+
+/// Pure core of [`grace_budget`]: parse the raw env value, falling back to
+/// the production default on absence, emptiness, or garbage.
+fn grace_budget_from(raw: Option<&str>) -> Duration {
+    let ms = raw
+        .filter(|v| !v.is_empty())
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_GRACE_MS);
+    Duration::from_millis(ms)
+}
+
 /// Join the background fetch within the grace budget and print the notice
 /// if one is warranted. Runs after all command output; never touches
 /// stdout or the exit code.
@@ -273,7 +305,7 @@ pub async fn finish(notifier: Option<Notifier>) {
     };
     let fetched = match notifier.task {
         Some(handle) => {
-            match tokio::time::timeout(Duration::from_millis(500), handle).await {
+            match tokio::time::timeout(grace_budget(), handle).await {
                 Ok(Ok(result)) => result,
                 // Timed out (the task keeps running until process exit —
                 // its own state write may still land) or panicked; either
@@ -405,6 +437,18 @@ mod tests {
             mutate(&mut ctx);
             assert_eq!(&should_check(&ctx), expected, "case: {name}");
         }
+    }
+
+    #[test]
+    fn grace_budget_defaults_preserved_and_override_honored() {
+        // Absence, emptiness, and garbage all keep the tight production
+        // ceiling — the override never silently changes shipped behavior.
+        assert_eq!(grace_budget_from(None), Duration::from_millis(500));
+        assert_eq!(grace_budget_from(Some("")), Duration::from_millis(500));
+        assert_eq!(grace_budget_from(Some("not-a-number")), Duration::from_millis(500));
+        // A valid value lifts the ceiling (the e2e suite's escape hatch).
+        assert_eq!(grace_budget_from(Some("30000")), Duration::from_millis(30_000));
+        assert_eq!(grace_budget_from(Some("0")), Duration::from_millis(0));
     }
 
     #[test]
