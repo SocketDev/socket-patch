@@ -169,9 +169,9 @@ into the new version's section — see docs/releasing.md.
   silently shadows any repository). Both are proven by docker capstones
   against the real .NET SDK / Apache Maven (cold-cache, `--network none`,
   RED + TAMPER probes). `nuget` and `maven` are now DEFAULT compile features;
-  in-place agent apply for both remains runtime-gated
-  (`SOCKET_EXPERIMENTAL_NUGET=1` / `SOCKET_EXPERIMENTAL_MAVEN=1` — sidecar
-  corruption risk) while the committable vendor path is safe. The vendored
+  the `SOCKET_EXPERIMENTAL_NUGET` / `SOCKET_EXPERIMENTAL_MAVEN` runtime
+  opt-ins that briefly gated in-place agent apply were retired later in this
+  cycle (see the "promoted to fully available" entry under Changed). The vendored
   path convention + uuid recovery rule now covers `nuget` and `maven` dirs,
   and `--vendor-source` prebuilt downloads cover nuget.
 - **Maven hosted rewriter (pom projects) — fail-closed version suffixing +
@@ -337,6 +337,24 @@ into the new version's section — see docs/releasing.md.
 
 ### Changed
 
+- **Maven and NuGet promoted to fully available — the
+  `SOCKET_EXPERIMENTAL_MAVEN` / `SOCKET_EXPERIMENTAL_NUGET` runtime gates
+  are retired.** Every flow (`scan` in all modes, `apply`, `get`,
+  `rollback`, `vendor`, `repair`, `vex`, `setup`) now discovers and
+  patches installed Maven and NuGet packages unconditionally; the
+  "N patch(es) skipped — support is experimental" warnings are gone, and
+  the previously `#[ignore]`d maven/nuget dispatch e2e tests now gate CI.
+  Setting the old env vars is harmless but does nothing. Behavior notes:
+  a default `scan` now walks the local Maven repository (`~/.m2` /
+  `MAVEN_REPO_LOCAL`) and the NuGet caches, and `scan --prune`/`--sync`
+  now judges maven/nuget manifest entries like any other ecosystem's
+  (previously they were exempt from pruning while the gate was closed).
+  The in-place sidecar caveat is unchanged and now documented per mode in
+  `docs/ecosystems.md`: agent-mode patching leaves Maven's
+  `.jar.sha1`/`.jar.md5` stale and NuGet's fixup deletes
+  `.nupkg.metadata` + advises on `.nupkg.sha512`; the vendored/hosted
+  modes never touch the caches.
+
 - **Release workflow consolidated into a single `release.yml`.** One
   dispatch now publishes every ecosystem package — crates.io, npm, PyPI,
   RubyGems (both gems, via OIDC trusted publishing), Packagist, Maven
@@ -361,9 +379,10 @@ into the new version's section — see docs/releasing.md.
   Maven, Composer, and Deno support is now unconditional. Builds that passed
   `--features <eco>` will get an "unknown feature" error and should simply
   drop the flag; `--no-default-features` no longer produces a minimal binary
-  (there is nothing left to strip). The runtime gates are unchanged:
-  Maven/NuGet crawling and apply still require `SOCKET_EXPERIMENTAL_MAVEN=1` /
-  `SOCKET_EXPERIMENTAL_NUGET=1`. The only remaining features are the
+  (there is nothing left to strip). The `SOCKET_EXPERIMENTAL_MAVEN` /
+  `SOCKET_EXPERIMENTAL_NUGET` runtime gates outlived this entry only briefly —
+  they are retired in the same release (see the "promoted to fully available"
+  entry under Changed). The only remaining features are the
   test-suite gates `docker-e2e` and `setup-e2e` on `socket-patch-cli`. (MAJOR
   for anyone scripting `--features`; no behavior change for default builds
   beyond composer/deno support now being present.)

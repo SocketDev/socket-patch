@@ -279,10 +279,6 @@ async fn maven_handcrafted_install_apply_patches_file() {
     let after_hash = git_sha256(&patched);
 
     std::env::set_var("MAVEN_REPO_LOCAL", &repo);
-    // Maven crawler is runtime-gated behind this env var (see
-    // `ecosystem_dispatch::maven_runtime_enabled`). The test
-    // deliberately exercises the Maven apply path, so opt in.
-    std::env::set_var("SOCKET_EXPERIMENTAL_MAVEN", "1");
 
     let server = MockServer::start().await;
     setup_apply_mock(
@@ -312,7 +308,6 @@ async fn maven_handcrafted_install_apply_patches_file() {
     );
 
     std::env::remove_var("MAVEN_REPO_LOCAL");
-    std::env::remove_var("SOCKET_EXPERIMENTAL_MAVEN");
 }
 
 /// Maven is the one release-variant ecosystem where multiple variants
@@ -347,7 +342,6 @@ async fn maven_multi_classifier_patches_every_present_jar() {
     patched_b.extend_from_slice(b"\n# MARKER-B\n");
 
     std::env::set_var("MAVEN_REPO_LOCAL", &repo);
-    std::env::set_var("SOCKET_EXPERIMENTAL_MAVEN", "1");
 
     let base = "pkg:maven/org.example/native-lib@1.0.0";
     let purl_a = format!("{base}?classifier=linux-x86_64&ext=jar");
@@ -434,7 +428,6 @@ async fn maven_multi_classifier_patches_every_present_jar() {
     );
 
     std::env::remove_var("MAVEN_REPO_LOCAL");
-    std::env::remove_var("SOCKET_EXPERIMENTAL_MAVEN");
 }
 
 // ---------------------------------------------------------------------------
@@ -536,7 +529,6 @@ async fn nuget_handcrafted_install_apply_patches_file() {
     // NuGet crawler is runtime-gated behind this env var (see
     // `ecosystem_dispatch::nuget_runtime_enabled`). The test
     // deliberately exercises the NuGet apply path, so opt in.
-    std::env::set_var("SOCKET_EXPERIMENTAL_NUGET", "1");
 
     let server = MockServer::start().await;
     setup_apply_mock(
@@ -566,7 +558,6 @@ async fn nuget_handcrafted_install_apply_patches_file() {
     );
 
     std::env::remove_var("NUGET_PACKAGES");
-    std::env::remove_var("SOCKET_EXPERIMENTAL_NUGET");
 }
 
 // ---------------------------------------------------------------------------
@@ -615,7 +606,6 @@ async fn maven_handcrafted_discovery() {
     std::fs::create_dir_all(&version_dir).unwrap();
     std::fs::write(version_dir.join("foo-1.0.0.pom"), "<project/>").unwrap();
     std::env::set_var("MAVEN_REPO_LOCAL", &repo);
-    std::env::set_var("SOCKET_EXPERIMENTAL_MAVEN", "1");
 
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -633,7 +623,6 @@ async fn maven_handcrafted_discovery() {
     // PURL queried — not that the crawler silently found nothing.
     assert_discovered_purl(&server, "pkg:maven/org.example/foo@1.0.0").await;
     std::env::remove_var("MAVEN_REPO_LOCAL");
-    std::env::remove_var("SOCKET_EXPERIMENTAL_MAVEN");
 }
 
 #[tokio::test]
@@ -645,7 +634,6 @@ async fn nuget_handcrafted_discovery() {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("foo.nuspec"), "<package/>").unwrap();
     std::env::set_var("NUGET_PACKAGES", &pkgs);
-    std::env::set_var("SOCKET_EXPERIMENTAL_NUGET", "1");
 
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -663,7 +651,6 @@ async fn nuget_handcrafted_discovery() {
     // its PURL queried — exit 0 alone would also pass an empty crawl.
     assert_discovered_purl(&server, "pkg:nuget/foo@1.0.0").await;
     std::env::remove_var("NUGET_PACKAGES");
-    std::env::remove_var("SOCKET_EXPERIMENTAL_NUGET");
 }
 
 // ---------------------------------------------------------------------------
@@ -822,7 +809,6 @@ async fn maven_handcrafted_scan_apply_writes_manifest() {
     let after_hash = git_sha256(&patched);
 
     std::env::set_var("MAVEN_REPO_LOCAL", &repo);
-    std::env::set_var("SOCKET_EXPERIMENTAL_MAVEN", "1");
 
     let purl = "pkg:maven/org.apache.commons/commons-lang3@3.12.0";
     let uuid = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
@@ -856,7 +842,6 @@ async fn maven_handcrafted_scan_apply_writes_manifest() {
     assert_manifest_records(tmp.path(), purl, uuid);
 
     std::env::remove_var("MAVEN_REPO_LOCAL");
-    std::env::remove_var("SOCKET_EXPERIMENTAL_MAVEN");
 }
 
 #[tokio::test]
@@ -881,7 +866,6 @@ async fn nuget_handcrafted_scan_apply_writes_manifest() {
     let after_hash = git_sha256(&patched);
 
     std::env::set_var("NUGET_PACKAGES", &packages);
-    std::env::set_var("SOCKET_EXPERIMENTAL_NUGET", "1");
 
     let purl = "pkg:nuget/Newtonsoft.Json@13.0.3";
     let uuid = "dfdfdfdf-dfdf-4fdf-8fdf-dfdfdfdfdfdf";
@@ -914,7 +898,6 @@ async fn nuget_handcrafted_scan_apply_writes_manifest() {
     assert_manifest_records(tmp.path(), purl, uuid);
 
     std::env::remove_var("NUGET_PACKAGES");
-    std::env::remove_var("SOCKET_EXPERIMENTAL_NUGET");
 }
 
 // Helper kept around so `PathBuf` import is used in case of future tests.

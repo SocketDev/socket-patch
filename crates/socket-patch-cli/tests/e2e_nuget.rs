@@ -63,12 +63,6 @@ async fn run(args: &[&str], cwd: &Path, nuget_packages: &Path, proxy_url: &str) 
             .args(&arg_refs)
             .current_dir(&cwd)
             .env("NUGET_PACKAGES", &nuget_packages)
-            // The NuGet crawler is gated behind a runtime opt-in
-            // (`nuget_runtime_enabled()` → `SOCKET_EXPERIMENTAL_NUGET`). Without
-            // this, `scan` skips NuGet entirely and reports "No packages found.",
-            // which would silently defeat any discovery assertion. Enabling it here
-            // is what makes these tests actually exercise the NuGet code path.
-            .env("SOCKET_EXPERIMENTAL_NUGET", "1")
             .env_remove("SOCKET_API_TOKEN")
             .env_remove("SOCKET_CLI_API_TOKEN")
             .env_remove("SOCKET_API_URL")

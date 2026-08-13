@@ -1,7 +1,5 @@
-//! setup-matrix: nuget ecosystem (dotnet). No native post-install hook,
-//! `setup` is a no-op, and apply is additionally gated behind
-//! `SOCKET_EXPERIMENTAL_NUGET` (the driver sets it). The with-setup
-//! cases are an EXPECTED BASELINE GAP.
+//! setup-matrix: nuget ecosystem (dotnet). No native post-install hook and
+//! `setup` is a no-op. The with-setup cases are an EXPECTED BASELINE GAP.
 //!
 //! IMPORTANT — why this file carries a real assertion of its own:
 //! `smc::run_pm("nuget", "dotnet")` routes nuget through the shared Docker
@@ -94,17 +92,14 @@ mod host_guard {
     /// runs; and a (perfectly valid!) ambient `SOCKET_SETUP_EXCLUDE` stands
     /// in for `setup --exclude`, which a real `setup` run PERSISTS —
     /// creating `.socket/manifest.json` inside the dotnet fixture and
-    /// failing the final only-the-csproj assertion. `SOCKET_EXPERIMENTAL_NUGET`
-    /// rides along so the experimental gate can never quietly change nuget's
-    /// surface behind the test's back. (Safe to set process-wide: the only
-    /// other test in this binary is the `#[ignore]`d matrix pass, which
-    /// routes through `smc::host_driver_command`'s own `SOCKET_*` prefix
-    /// scrub.)
+    /// failing the final only-the-csproj assertion. (Safe to set
+    /// process-wide: the only other test in this binary is the `#[ignore]`d
+    /// matrix pass, which routes through `smc::host_driver_command`'s own
+    /// `SOCKET_*` prefix scrub.)
     const HOSTILE_DECOYS: &[(&str, &str)] = &[
         ("SOCKET_STRICT", "banana"),
         ("SOCKET_VENDOR_SOURCE", "bogus-decoy"),
         ("SOCKET_SETUP_EXCLUDE", "decoy-member"),
-        ("SOCKET_EXPERIMENTAL_NUGET", "true"),
     ];
 
     /// Absolute path to the binary under test, via cargo's `CARGO_BIN_EXE_*`.

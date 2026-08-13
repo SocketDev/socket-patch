@@ -746,8 +746,6 @@ These exist for staged rollouts and the launcher wrappers. They are **internal**
 
 | Env var | Purpose |
 |---|---|
-| `SOCKET_EXPERIMENTAL_MAVEN` | Opt-in gate (`=1`) for the maven installed-package crawl behind `scan`/`apply`/`vendor` — agent-mode in-place jar patching corrupts the `~/.m2` checksum sidecars, so discovery stays off by default (`src/ecosystem_dispatch.rs`). |
-| `SOCKET_EXPERIMENTAL_NUGET` | Same gate for nuget — in-place patching breaks the `.nupkg.sha512` tamper-evidence sidecar. |
 | `SOCKET_PATCH_BIN` | Points the CLI launcher wrappers (RubyGems / Composer / Maven / NuGet) and the gem Bundler plugin at an existing `socket-patch` binary (skips the download-on-first-run); also the escape hatch `apply` names when a golang-featureless binary is asked to audit Go redirects. |
 | `SOCKET_UPDATE_BASE_URL` | Points BOTH the release-metadata and asset-download routes of `--update`/the update notice at one base (mirror or test fixture) instead of `github.com` + `api.github.com`. Overriding it relaxes the downloaded binary's version self-check from hard-fail to warning. |
 | `SOCKET_UPDATE_STATE_DIR` | Overrides the per-user dir holding `update-check.json` + `update.lock` (tests point it into a tempdir). |

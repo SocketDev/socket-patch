@@ -273,13 +273,13 @@ pub(super) fn print_gc_vendored_line(gc: &GcSummary) {
 /// `--sync` would GC the very patch it just downloaded.
 ///
 /// Entries the crawl never even looked for are exempt too
-/// (`crawl_covers_purl`): the runtime-gated maven/nuget crawlers with their
-/// gate off, and any `pkg:<type>/` this build has no crawler for. The
-/// manifest is a committed, shared file, so a newer CLI's ecosystem can
-/// legitimately appear in it — "absent from the crawl" then says nothing
-/// about whether the package is installed, and pruning would silently
-/// delete a teammate's patch (plus its blobs). Same fail-safe reasoning as
-/// capturing `scanned_purls` before the `--ecosystems` filter.
+/// (`crawl_covers_purl`): any `pkg:<type>/` this build has no crawler
+/// for. The manifest is a committed, shared file, so a newer CLI's
+/// ecosystem can legitimately appear in it — "absent from the crawl"
+/// then says nothing about whether the package is installed, and pruning
+/// would silently delete a teammate's patch (plus its blobs). Same
+/// fail-safe reasoning as capturing `scanned_purls` before the
+/// `--ecosystems` filter.
 fn detect_prunable(
     manifest: &PatchManifest,
     scanned_purls: &HashSet<String>,
@@ -455,40 +455,27 @@ mod tests {
     }
 
     #[test]
-    fn detect_prunable_keeps_runtime_gated_ecosystem_entries() {
-        // Maven/NuGet crawlers only run under their experimental opt-in
-        // env gates, so with the gate OFF their packages are invisible to
-        // the crawl — "absent" must not mean "uninstalled". (An ambient
-        // opt-in makes them genuinely crawled, which is a different
-        // scenario; skip rather than mutate the shared process env.)
+    fn detect_prunable_judges_maven_and_nuget_like_any_ecosystem() {
+        // Maven/NuGet are first-class ecosystems: every scan crawls them,
+        // so their manifest entries ARE judged — absent from the scan
+        // means genuinely uninstalled, and they prune like any other
+        // ecosystem. (They used to be exempt behind the retired
+        // `SOCKET_EXPERIMENTAL_*` runtime gates.)
         let m = manifest_with(&[
             ("pkg:maven/com.example/lib@1.0.0", "uuid-a"),
             ("pkg:nuget/Some.Package@1.0.0", "uuid-b"),
             ("pkg:npm/gone@1.0.0", "uuid-c"),
         ]);
-        // Mirror `ecosystem_dispatch::env_truthy` exactly — the gate opens
-        // only on `1`/`true` (any case), so a merely-PRESENT but falsy
-        // `SOCKET_EXPERIMENTAL_MAVEN=0` leaves the ecosystem uncrawled and
-        // therefore exempt. Testing presence instead of truthiness made this
-        // expectation disagree with the code under test and fail spuriously.
-        let gate_open = |name: &str| {
-            std::env::var(name)
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(false)
-        };
-        let mut expected = vec!["pkg:npm/gone@1.0.0".to_string()];
-        if gate_open("SOCKET_EXPERIMENTAL_MAVEN") {
-            expected.push("pkg:maven/com.example/lib@1.0.0".to_string());
-        }
-        if gate_open("SOCKET_EXPERIMENTAL_NUGET") {
-            expected.push("pkg:nuget/Some.Package@1.0.0".to_string());
-        }
-        expected.sort();
         let mut out = detect_prunable(&m, &scanned(&[]), &no_vendored());
         out.sort();
         assert_eq!(
-            out, expected,
-            "a runtime-gated ecosystem that was never crawled must not prune"
+            out,
+            vec![
+                "pkg:maven/com.example/lib@1.0.0".to_string(),
+                "pkg:npm/gone@1.0.0".to_string(),
+                "pkg:nuget/Some.Package@1.0.0".to_string(),
+            ],
+            "maven/nuget orphans must prune like any other ecosystem's"
         );
     }
 

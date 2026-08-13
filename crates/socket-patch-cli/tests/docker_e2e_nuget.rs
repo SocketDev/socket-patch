@@ -301,9 +301,8 @@ echo "===PATCH VERIFIED===" >&2
 # the patch view); vex verifies the patched LICENSE.md in the NUGET_PACKAGES
 # tree and attests it with PLAIN agent provenance. --ecosystems nuget (no
 # --global, matching the local apply; the crawler honors NUGET_PACKAGES exported
-# above and is gated by SOCKET_EXPERIMENTAL_NUGET=1 from the docker run env);
-# --offline keeps vex local. The doc is emitted between markers for the host
-# oracle (no bind mount here).
+# above); --offline keeps vex local. The doc is emitted between markers for the
+# host oracle (no bind mount here).
 echo "===VEX OUTPUT===" >&2
 socket-patch vex --offline --cwd "$PWD" --output /tmp/out.vex.json \
   --product 'pkg:nuget/e2e-app@1.0.0' --ecosystems nuget >/tmp/vex.out 2>/tmp/vex.err
@@ -527,15 +526,6 @@ fn run_container(script: &str) -> std::process::Output {
         "--rm",
         "--add-host=host.docker.internal:host-gateway",
         "-i",
-        // NuGet crawler is gated by `SOCKET_EXPERIMENTAL_NUGET=1` at
-        // runtime (see ecosystem_dispatch::nuget_runtime_enabled).
-        // Signed .nupkg packages carry a `.nupkg.sha512` tamper-marker
-        // the sidecar can't honestly rewrite without the original
-        // `.nupkg` bytes; the gate makes operators opt in to that
-        // tradeoff. Tests opt in explicitly so docker actually
-        // exercises the nuget scan / apply path.
-        "-e",
-        "SOCKET_EXPERIMENTAL_NUGET=1",
     ])
     .args(cov_docker_args())
     .args(["socket-patch-test-nuget:latest", "bash", "-c", script]);
