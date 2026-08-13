@@ -30,7 +30,7 @@ GitHub's two asset paths, `<base>/latest/download/<file>` and
 
 ```sh
 curl -fsSL https://install.socket.dev/patch \
-  | SOCKET_PATCH_BASE_URL=https://install.socket.dev/SocketDev/socket-patch/releases sh
+  | SOCKET_PATCH_BASE_URL=https://install.socket.dev/patch/SocketDev/socket-patch/releases sh
 ```
 
 `install.socket.dev` relays those exact paths from the GitHub release, which is
@@ -51,7 +51,7 @@ request against the upstream release, so cutting 3.4.0 makes it installable from
 via the endpoint override it already has:
 
 ```sh
-SOCKET_UPDATE_BASE_URL=https://install.socket.dev socket-patch --update
+SOCKET_UPDATE_BASE_URL=https://install.socket.dev/patch socket-patch --update
 ```
 
 One caveat worth knowing before standardizing on that: a non-default

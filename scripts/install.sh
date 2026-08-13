@@ -17,7 +17,7 @@ set -eu
 # and `<base>/download/v<ver>/<file>`. Use it to install without reaching
 # github.com at all:
 #
-#   … | SOCKET_PATCH_BASE_URL=https://install.socket.dev/SocketDev/socket-patch/releases sh
+#   … | SOCKET_PATCH_BASE_URL=https://install.socket.dev/patch/SocketDev/socket-patch/releases sh
 #
 # install.socket.dev relays those exact paths from the GitHub release, which is
 # why one template covers both origins. Whichever origin is used, the archive is

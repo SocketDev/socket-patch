@@ -159,7 +159,7 @@ jobs:
           fi
           latest=$(curl -fsSL -m 20 https://install.socket.dev/patch/latest)
           echo "install.socket.dev reports latest=$latest"
-          SOCKET_PATCH_BASE_URL=https://install.socket.dev/SocketDev/socket-patch/releases \
+          SOCKET_PATCH_BASE_URL=https://install.socket.dev/patch/SocketDev/socket-patch/releases \
           SOCKET_PATCH_INSTALL_DIR="$RUNNER_TEMP/socket-origin" \
             sh scripts/install.sh
           installed=$("$RUNNER_TEMP/socket-origin/socket-patch" --version | awk '{print $NF}')

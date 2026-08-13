@@ -340,7 +340,7 @@ into the new version's section — see docs/releasing.md.
 - **`install.sh` can install without reaching github.com.** New
   `SOCKET_PATCH_BASE_URL` points the archive downloads at any releases base that
   answers GitHub's two asset paths — notably
-  `https://install.socket.dev/SocketDev/socket-patch/releases`, which relays them
+  `https://install.socket.dev/patch/SocketDev/socket-patch/releases`, which relays them
   from the GitHub release, so one URL template covers either origin. A new
   release needs no publish for this: the origin resolves "latest" per request.
   `socket-patch --update` can use the same host today through the
