@@ -518,6 +518,25 @@ pub(super) async fn run_redirect(
         }
     }
 
+    // Cross-mode takeover: a committed vendored ledger (`.socket/vendor/state.json`)
+    // may still claim package(s) this project also has a hosted redirect ledger
+    // for — their tarballs would then be orphaned and that ledger stale. But the
+    // overlap alone does NOT prove hosted won: only warn for the package(s) the
+    // LIVE lockfile actually routes to `patch.socket.dev` (see
+    // `classify_overlap_takeover`), so a dry-run / no-op over a lock that still
+    // points at the vendored files stays silent instead of pointing cleanup at
+    // the live vendored ledger. Warn (JSON `warnings[]` and stderr) WITHOUT
+    // deleting the other mode's ledger; reconciliation is deferred (see PR Scope).
+    // Read after the ledger write above so a non-dry-run reflects this run.
+    let mut takeover_warnings: Vec<serde_json::Value> = Vec::new();
+    let superseded = super::classify_overlap_takeover(&args.common.cwd).await.redirect;
+    if !superseded.is_empty() {
+        takeover_warnings.push(serde_json::json!({
+            "code": super::REDIRECT_SUPERSEDES_VENDORED,
+            "detail": super::mode_takeover_detail(&superseded, /*current_is_hosted=*/ true),
+        }));
+    }
+
     // Emit an OpenVEX attestation when `--vex` was requested. The redirected
     // bytes are fetched from the hosted patch server at install time, so the
     // PURLs CONFIRMED REDIRECTED BY THIS RUN are attested from the ledger
@@ -559,6 +578,7 @@ pub(super) async fn run_redirect(
         warnings.extend(migration_warnings.iter().cloned());
         warnings.extend(rush_warnings.iter().cloned());
         warnings.extend(pnpm_warnings.iter().cloned());
+        warnings.extend(takeover_warnings.iter().cloned());
         // Nest the redirect result under `redirect` inside the classic scan
         // object (built by `run`, threaded in via `scan_result`), mirroring
         // vendored mode's nested `vendor` block. This keeps the hosted `--json`
@@ -627,6 +647,9 @@ pub(super) async fn run_redirect(
                 eprintln!("  warning: {}", w["detail"].as_str().unwrap_or_default());
             }
             for w in &pnpm_warnings {
+                eprintln!("  warning: {}", w["detail"].as_str().unwrap_or_default());
+            }
+            for w in &takeover_warnings {
                 eprintln!("  warning: {}", w["detail"].as_str().unwrap_or_default());
             }
             if let Some(statements) = vex_statements {
