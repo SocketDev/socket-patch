@@ -190,10 +190,16 @@ What the free-tier Go redirect needs:
    `proxy.golang.org` itself can resolve it (validated end-to-end with the
    `mod` VCS type; `sum.golang.org`'s own lookup does the same discovery).
 4. **Reference API**: populate `registryOverride.kind = "goproxy"`,
-   `indexUrl` = the proxy base, `identifiers.goModulePath` /
-   `goModuleVersion` (`<version>-socketpatch.<n>`, always v0/v1-range), and
-   both integrity hashes (`dirhashH1` = the gopatch-flavor zip h1, `goModH1`).
-   FREE patches only — never emit a `goproxy` override for a paid-tier grant.
+   `indexUrl` = the proxy base (the server origin), and on `identifiers`:
+   `goModulePath` / `goModuleVersion` (`<version>-socketpatch.<n>`, always
+   v0/v1-range) plus the hash pair `goZipDirhashH1` (the gopatch-flavor
+   zip h1) and `goModH1`. The pair rides **identifiers**, not the tarball
+   artifact's integrity — the tarball `dirhashH1` must stay the
+   original-path flavor, which released CLIs verify vendor-mode downloads
+   against. DepOverride builders (this CLI's `scan/hosted.rs` and the
+   backend's hosted PR flow) merge the pair into the normalized
+   `integrity.dirhashH1`/`goModH1` that the rewriters read. FREE patches
+   only — never emit a `goproxy` override for a paid-tier grant.
 5. **Write-once invariant (the kill-shot risk)**: once a
    `gopatch/<uuid>@<version>` is fetchable, `proxy.golang.org` caches its
    bytes immutably and consumers commit its hashes. Any rebuild that changes

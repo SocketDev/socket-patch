@@ -228,6 +228,26 @@ pub(super) async fn run_redirect(
             if let Some(c) = berry_zip.and_then(|a| a.integrity.yarn_berry10c0.clone()) {
                 integrity.yarn_berry10c0 = Some(c);
             }
+            // goproxy: the hosted-Go hash pair rides the override's
+            // identifiers (the tarball's dirhashH1 is the original-path
+            // flavor, kept for vendor-mode verification); the golang
+            // rewriter reads the normalized integrity, so merge — the
+            // gopatch-flavor zip h1 REPLACES dirhashH1 here. Only both
+            // together: a half-merged pair would trip the rewriter's
+            // fail-closed integrity check by design.
+            if let Some(ov) = reference
+                .registry_override
+                .as_ref()
+                .filter(|o| o.kind == "goproxy")
+            {
+                if let (Some(zip_h1), Some(gomod_h1)) = (
+                    ov.identifiers.go_zip_dirhash_h1.clone(),
+                    ov.identifiers.go_mod_h1.clone(),
+                ) {
+                    integrity.dirhash_h1 = Some(zip_h1);
+                    integrity.go_mod_h1 = Some(gomod_h1);
+                }
+            }
             candidates.push((
                 purl.to_string(),
                 sel.uuid.clone(),

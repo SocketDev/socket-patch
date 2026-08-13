@@ -67,6 +67,17 @@ pub struct RegistryOverrideIdentifiers {
     /// original's major version — a v2+ RHS would force a `/v2` module-path
     /// suffix, and the RHS version need not relate to the original's.
     pub go_module_version: Option<String>,
+    /// `h1:` dirhash of the gopatch-flavor module zip. Rides the override's
+    /// identifiers — NOT the tarball artifact's integrity, whose `dirhashH1`
+    /// stays the original-path flavor for vendor-mode verification (the h1
+    /// hashes entry NAMES, so the two flavors hash differently). The
+    /// DepOverride builder merges it into `integrity.dirhash_h1` for the
+    /// rewriter.
+    pub go_zip_dirhash_h1: Option<String>,
+    /// `h1:` dirhash of the served `.mod` bytes (x/mod `HashGoMod`) — the
+    /// consumer's `/go.mod h1:` go.sum line. Merged into
+    /// `integrity.go_mod_h1` alongside [`Self::go_zip_dirhash_h1`].
+    pub go_mod_h1: Option<String>,
     pub nuget_id_lower: Option<String>,
     pub nuget_version_norm: Option<String>,
     pub maven_group_id: Option<String>,
