@@ -1109,12 +1109,33 @@ pub async fn recover_lock_entry(
                         .to_string(),
                 );
             }
-            let unit = wiring_original(entry, &["uv_lock_package"])
-                .and_then(|v| v.as_str().map(str::to_string))
-                .ok_or_else(|| "no pre-vendor uv.lock fragment recorded".to_string())?;
-            let (url, sha) = pure_wheel_from_uv_unit(&unit).ok_or_else(|| {
-                "the pre-vendor uv.lock fragment lists no verifiable pure wheel".to_string()
-            })?;
+            // Every pypi package manager records the pre-vendor resolution under
+            // its own wiring kind — uv writes `uv_lock_package`, pdm
+            // `pdm_lock_package`, poetry `poetry_lock_package`, pipenv
+            // `pipenv_lock_entry`, bare pip `requirements_line`. Accept them all
+            // so recovery is not blind to non-uv projects.
+            let fragment = wiring_original(
+                entry,
+                &[
+                    "uv_lock_package",
+                    "pdm_lock_package",
+                    "poetry_lock_package",
+                    "pipenv_lock_entry",
+                    "requirements_line",
+                ],
+            )
+            .ok_or_else(|| "no pre-vendor pypi lock fragment recorded".to_string())?;
+            // Only uv.lock and pdm's `static_urls` locks inline the wheel's
+            // registry URL (`url = "…", hash = "sha256:…"`), which is all a
+            // registry rebuild can fetch from. Default pdm/poetry (`file = …`),
+            // pipenv (`hashes` only) and pip (`--hash=`) record the hash but no
+            // fetchable URL — an honest, actionable message, not the false
+            // "not installed / no recoverable fragment".
+            const NO_URL: &str = "the pre-vendor pypi lock fragment records the wheel hash but \
+                 no fetchable registry URL (only uv.lock and pdm `static_urls` locks carry wheel \
+                 URLs); reinstall the package so repair can rebuild from the installed copy";
+            let unit = fragment.as_str().ok_or_else(|| NO_URL.to_string())?;
+            let (url, sha) = pure_wheel_from_uv_unit(unit).ok_or_else(|| NO_URL.to_string())?;
             Ok(LockfileEntry {
                 ecosystem: "pypi",
                 purl: format!("pkg:pypi/{name}@{version}"),
@@ -2403,6 +2424,76 @@ mod recover_tests {
         let mut locked = entry("pypi", "pkg:pypi/six@1.16.0", vec![]);
         locked.artifact.platform_locked = Some(true);
         assert!(recover_lock_entry(tmp.path(), &locked).await.is_err());
+    }
+
+    // A pdm.lock produced with the `static_urls` strategy inlines the wheel
+    // URL exactly like uv.lock, but records it under the `pdm_lock_package`
+    // wiring kind. Recovery used to look only at `uv_lock_package`, so it was
+    // blind to pdm/poetry/pipenv projects; it now accepts every pypi kind.
+    #[tokio::test]
+    async fn recover_pypi_pdm_static_urls_recovers_pure_wheel() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wheel_sha = "a".repeat(64);
+        let unit = format!(
+            "[[package]]\nname = \"six\"\nversion = \"1.16.0\"\nfiles = [\n    {{url = \"https://files.pythonhosted.org/packages/71/39/six-1.16.0.tar.gz\", hash = \"sha256:{}\"}},\n    {{url = \"https://files.pythonhosted.org/packages/d9/5a/six-1.16.0-py2.py3-none-any.whl\", hash = \"sha256:{wheel_sha}\"}},\n]\n",
+            "b".repeat(64)
+        );
+        let pdm = entry(
+            "pypi",
+            "pkg:pypi/six@1.16.0",
+            vec![rec("pdm_lock_package", serde_json::json!(unit))],
+        );
+        let got = recover_lock_entry(tmp.path(), &pdm).await.unwrap();
+        assert_eq!(got.ecosystem, "pypi");
+        assert_eq!(got.name, "six");
+        assert_eq!(got.integrity, LockIntegrity::Sha256Hex(wheel_sha));
+        assert!(got.resolved.unwrap().ends_with("py2.py3-none-any.whl"));
+    }
+
+    // Default pdm/poetry (`file = …`), pipenv (`hashes` only) and pip
+    // (`--hash=`) locks record the wheel hash but no fetchable URL. Recovery
+    // now RECOGNIZES those fragments (previously they fell through to the
+    // uv-specific "no uv.lock fragment recorded" error) and returns an
+    // accurate, actionable message instead of the false "not installed / no
+    // recoverable fragment".
+    #[tokio::test]
+    async fn recover_pypi_urlless_locks_report_no_fetchable_url() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // poetry / default-pdm shape: `files = [{file = …, hash = …}]`.
+        let poetry_unit = format!(
+            "[[package]]\nname = \"six\"\nversion = \"1.16.0\"\nfiles = [\n    {{file = \"six-1.16.0-py2.py3-none-any.whl\", hash = \"sha256:{}\"}},\n]\n",
+            "a".repeat(64)
+        );
+        for kind in ["poetry_lock_package", "pdm_lock_package"] {
+            let e = entry(
+                "pypi",
+                "pkg:pypi/six@1.16.0",
+                vec![rec(kind, serde_json::json!(poetry_unit))],
+            );
+            let err = recover_lock_entry(tmp.path(), &e).await.unwrap_err();
+            assert!(err.contains("no fetchable registry URL"), "{kind}: {err}");
+            assert!(!err.contains("uv.lock fragment recorded"), "{kind}: {err}");
+        }
+
+        // pipenv records a JSON object (hashes + version), not a string unit.
+        let pipenv = entry(
+            "pypi",
+            "pkg:pypi/six@1.16.0",
+            vec![rec(
+                "pipenv_lock_entry",
+                serde_json::json!({
+                    "hashes": [format!("sha256:{}", "a".repeat(64))],
+                    "version": "==1.16.0",
+                }),
+            )],
+        );
+        let err = recover_lock_entry(tmp.path(), &pipenv).await.unwrap_err();
+        assert!(err.contains("no fetchable registry URL"), "pipenv: {err}");
+
+        // A ledger with no pypi fragment at all is still a hard error.
+        let bare = entry("pypi", "pkg:pypi/six@1.16.0", vec![]);
+        assert!(recover_lock_entry(tmp.path(), &bare).await.is_err());
     }
 
     #[tokio::test]
