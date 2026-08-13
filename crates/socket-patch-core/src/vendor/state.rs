@@ -137,15 +137,24 @@ pub struct UvMeta {
 
 /// npm/pnpm bookkeeping: which `pnpm-workspace.yaml`/`package.json` tables
 /// the wiring had to create (revert then removes the emptied tables too).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct PnpmMeta {
-    /// Vendor created the `overrides` table itself.
+    /// Vendor created the package.json `pnpm.overrides` table itself.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub created_overrides_table: bool,
-    /// Vendor created the enclosing `pnpm` table itself.
+    /// Vendor created the enclosing package.json `pnpm` table itself.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub created_pnpm_table: bool,
+    /// Vendor created the `pnpm-workspace.yaml` file itself (pnpm >= 11 reads
+    /// `overrides` only from there); revert deletes it when it still holds
+    /// only the vendoring scaffold.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub created_workspace_file: bool,
+    /// Vendor created the `overrides:` section in a pre-existing
+    /// `pnpm-workspace.yaml`; revert removes just that section once emptied.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub created_workspace_overrides: bool,
 }
 
 /// pypi/poetry bookkeeping.
@@ -551,7 +560,8 @@ mod tests {
         entry.flavor = Some("pnpm".into());
         entry.pnpm = Some(PnpmMeta {
             created_overrides_table: true,
-            created_pnpm_table: false,
+            created_workspace_file: true,
+            ..Default::default()
         });
         entry.poetry = Some(PoetryMeta {
             dep_class: "direct".into(),
@@ -578,6 +588,7 @@ mod tests {
         // camelCase keys on the wire.
         for key in [
             "\"createdOverridesTable\"",
+            "\"createdWorkspaceFile\"",
             "\"depClass\"",
             "\"lockVersion\"",
             "\"strategy\"",
@@ -585,20 +596,20 @@ mod tests {
         ] {
             assert!(text.contains(key), "{key} missing: {text}");
         }
-        // Skip-empty inner fields: the false bool and any empty vec vanish.
+        // Skip-empty inner fields: the false bools and any empty vec vanish.
         assert!(
             !text.contains("createdPnpmTable"),
+            "false bool omitted: {text}"
+        );
+        assert!(
+            !text.contains("createdWorkspaceOverrides"),
             "false bool omitted: {text}"
         );
     }
 
     #[test]
     fn v2_meta_empty_inner_fields_do_not_serialize() {
-        let pnpm = serde_json::to_string(&PnpmMeta {
-            created_overrides_table: false,
-            created_pnpm_table: false,
-        })
-        .unwrap();
+        let pnpm = serde_json::to_string(&PnpmMeta::default()).unwrap();
         assert_eq!(pnpm, "{}", "all-default PnpmMeta serializes empty");
 
         let pipenv = serde_json::to_string(&PipenvMeta {
@@ -617,13 +628,7 @@ mod tests {
 
         // And the omitted spellings deserialize back to the defaults.
         let back: PnpmMeta = serde_json::from_str("{}").unwrap();
-        assert_eq!(
-            back,
-            PnpmMeta {
-                created_overrides_table: false,
-                created_pnpm_table: false
-            }
-        );
+        assert_eq!(back, PnpmMeta::default());
         let back: PipenvMeta = serde_json::from_str("{}").unwrap();
         assert!(back.sections.is_empty());
     }
