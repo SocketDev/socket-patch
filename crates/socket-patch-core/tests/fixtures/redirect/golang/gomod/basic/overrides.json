@@ -1,0 +1,24 @@
+[
+  {
+    "ecosystem": "golang",
+    "name": "github.com/foo/bar",
+    "version": "v1.4.2",
+    "token": "11111111-1111-1111-1111-111111111111",
+    "patchUuid": "55555555-5555-5555-5555-555555555555",
+    "artifactUrl": "https://patch.socket.dev/patch-registry/golang/patch.socket.dev/gopatch/55555555-5555-5555-5555-555555555555/@v/v1.4.2-socketpatch.1.zip",
+    "registryOverride": {
+      "kind": "goproxy",
+      "indexUrl": "https://patch.socket.dev/patch-registry/golang",
+      "identifiers": {
+        "name": "github.com/foo/bar",
+        "version": "v1.4.2",
+        "goModulePath": "patch.socket.dev/gopatch/55555555-5555-5555-5555-555555555555",
+        "goModuleVersion": "v1.4.2-socketpatch.1"
+      }
+    },
+    "integrity": {
+      "dirhashH1": "h1:mU9vN/n1hbXktM62lJ6MbRKOk3aI8NDH+szCf62RXtE=",
+      "goModH1": "h1:XgagPTRZSCprrzR+3Ro36/XJpibdovhAbsKThYI8bxg="
+    }
+  }
+]

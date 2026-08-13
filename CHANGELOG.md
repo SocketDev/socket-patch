@@ -47,6 +47,26 @@ into the new version's section — see docs/releasing.md.
 
 ### Added
 
+- **Hosted mode for Go (free tier).** `scan --mode hosted` now redirects
+  golang dependencies when the reference carries a `goproxy` registry
+  override: a fork-style
+  `replace <mod> <ver> => patch.socket.dev/gopatch/<uuid> <ver>-socketpatch.<n>`
+  in `go.mod` plus the socket module's two `h1:` lines in `go.sum` (and the
+  replaced original's lines pruned — the tidy-stable state). Day-2 machines
+  need no configuration: go consults the checksum database only for modules
+  absent from `go.sum`, so the committed pair is the whole redirect —
+  validated end-to-end in `e2e_golang_hosted_build.rs` (fresh caches, bogus
+  `GOSUMDB` tripwire, `go mod tidy` byte-level no-op, tampered-hash
+  `SECURITY ERROR`). Fails closed (per-dep `redirect_golang_*` warnings, no
+  partial writes) on missing hashes, an out-of-namespace module path, a
+  require-version mismatch, or a user-authored replace conflict; references
+  without the override keep the historical `redirect_golang_unsupported`
+  warning (paid tier stays vendored — see `docs/design/golang-hosted.md`).
+  Wire schema gains `integrity.goModH1` and
+  `registryOverride.identifiers.goModuleVersion` (additive). Requires
+  server-side publication of the grant-free `gopatch` artifact flavor —
+  production publishes no golang hosted modules yet, so behavior is unchanged
+  until it does.
 - **Version-bump automation + release-readiness gate.**
   `scripts/bump-version.sh <X.Y.Z> --pr` performs the whole bump chore —
   stamps every packaging site via `version-sync.sh`, rolls `[Unreleased]`

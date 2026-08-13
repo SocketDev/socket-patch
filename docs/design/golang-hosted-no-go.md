@@ -1,10 +1,24 @@
 # Hosted redirect for Go: a deliberate no-go
 
-**Status:** decided — golang is excluded from HOSTED (registry-redirect) mode.
+> **SUPERSEDED for the FREE tier (2026-08-13)** by
+> [golang-hosted.md](golang-hosted.md): a fork-style `replace` onto a
+> grant-free, content-addressed `patch.socket.dev/gopatch/<uuid>` module plus
+> committed `go.sum` lines dissolves all three blockers below — empirically,
+> go consults the checksum database only for modules *absent* from `go.sum`,
+> so committed hashes ARE the committable per-module exemption Blocker 1 said
+> Go lacked, and a token-free module path defuses Blockers 2 and 3. **The
+> analysis below still governs the PAID tier** (tokened URLs re-trigger
+> Blockers 2 and 3), whose remedy remains vendored mode or the
+> [ephemeral-CI recipe](#sanctioned-exception-ephemeral-ci-goproxy).
+
+**Status:** paid tier only — free-tier golang HOSTED mode is designed in
+[golang-hosted.md](golang-hosted.md).
 **Remedy:** `socket-patch vendor` (VENDORED mode: bytes committed to
 `.socket/vendor/`, offline-verified, `replace => ./path` in `go.mod`).
-**Warning code:** `redirect_golang_unsupported` (emitted by both the Rust
-CLI rewriter and the depscan backend's TS twin,
+**Warning code:** `redirect_golang_unsupported` (emitted for golang references
+that carry no `goproxy` override — paid grants, or free patches the server has
+not yet published a hosted Go module for — by both the Rust CLI rewriter and
+the depscan backend's TS twin,
 `workspaces/app/src/patches/registry-rewrite/golang.ts`).
 
 HOSTED mode's contract is a *committable, per-dependency* lockfile/registry

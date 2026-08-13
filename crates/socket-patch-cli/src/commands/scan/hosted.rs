@@ -40,6 +40,11 @@ const REDIRECT_CANDIDATE_FILES: &[&str] = &[
     // on diverging spellings).
     "gems.rb",
     "gems.locked",
+    // The golang rewriter edits the main module's go.mod (fork-style
+    // `replace`) and go.sum (the socket module's two h1: lines). go.sum may
+    // legitimately be absent — the rewriter creates it in that case.
+    "go.mod",
+    "go.sum",
     "pom.xml",
     // Maven Trusted Checksums files the fail-closed maven rewriter merges into
     // (read so an existing user config / checksum set is preserved, not
@@ -152,12 +157,22 @@ pub(super) async fn run_redirect(
 
     let mut skipped: Vec<serde_json::Value> = Vec::new();
     let mut overrides: Vec<DepOverride> = Vec::new();
-    // (purl, uuid, artifact_url, registry index_url, maven suffixed version)
-    // per granted reference — used AFTER the rewrite to decide which deps were
-    // actually redirected (their target URL / index / suffixed version landed
-    // in a file) before persisting records or attesting anything. The last
-    // element is Some only for fail-closed maven overrides.
-    type RedirectCandidate = (String, String, String, Option<String>, Option<String>);
+    // (purl, uuid, artifact_url, registry index_url, maven suffixed version,
+    // go module path) per granted reference — used AFTER the rewrite to decide
+    // which deps were actually redirected (their target URL / index / suffixed
+    // version / socket module path landed in a file) before persisting records
+    // or attesting anything. The fifth element is Some only for fail-closed
+    // maven overrides; the sixth only for golang (whose go.mod/go.sum edits
+    // carry the content-addressed `patch.socket.dev/gopatch/<uuid>` module
+    // path, never the artifact or index URL).
+    type RedirectCandidate = (
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
     let mut candidates: Vec<RedirectCandidate> = Vec::new();
 
     if !selected.is_empty() {
@@ -225,6 +240,10 @@ pub(super) async fn run_redirect(
                     .registry_override
                     .as_ref()
                     .and_then(|o| o.identifiers.maven_suffixed_version.clone()),
+                reference
+                    .registry_override
+                    .as_ref()
+                    .and_then(|o| o.identifiers.go_module_path.clone()),
             ));
             overrides.push(DepOverride {
                 ecosystem,
@@ -484,39 +503,47 @@ pub(super) async fn run_redirect(
         .collect();
     let confirmed: Vec<(String, String)> = candidates
         .iter()
-        .filter(|(purl, uuid, artifact_url, index_url, suffixed_version)| {
-            // Cargo is transactional: the rewriter reports exactly which
-            // patch uuids FULLY landed (manifest pin + lock + registry
-            // block). Substring presence must never confirm a cargo dep —
-            // the `[registries.…]` config block contains the index URL while
-            // pinning nothing, so a config-block-only rewrite would be
-            // attested with zero enforcement in any build.
-            if purl.starts_with("pkg:cargo/") {
-                return rewrite.confirmed_cargo_uuids.contains(uuid);
-            }
-            let encoded = socket_patch_core::utils::uri::encode_uri_component(artifact_url);
-            final_texts.iter().any(|text| {
-                // The rewriters' own predicate — raw, or the `\/`-escaped
-                // slashes an old composer.lock spells them with — so a
-                // writer's spelling can never be one this probe misses. It
-                // was: the composer rewriter emitted `\/`-escaped urls this
-                // probe never looked for, so a fully successful composer
-                // redirect reported `redirected: 0`, fetched no patch record
-                // into the ledger, and left the patch unattestable by `vex`.
-                socket_patch_core::patch::redirect::artifact_url_present(text, artifact_url)
-                    // The berry rewriter writes the URL percent-encoded into the
-                    // lock's `::__archiveUrl=` binding, so the raw form is absent.
-                    || text.contains(encoded.as_str())
-                    || index_url.as_deref().is_some_and(|iu| text.contains(iu))
-                    // Fail-closed maven pins the globally-unique
-                    // `-socket.<hex8>` suffixed version (never the `.pom` URL),
-                    // so match on that string.
-                    || suffixed_version
-                        .as_deref()
-                        .is_some_and(|sv| text.contains(sv))
-            })
-        })
-        .map(|(purl, uuid, _, _, _)| (purl.clone(), uuid.clone()))
+        .filter(
+            |(purl, uuid, artifact_url, index_url, suffixed_version, go_module_path)| {
+                // Cargo is transactional: the rewriter reports exactly which
+                // patch uuids FULLY landed (manifest pin + lock + registry
+                // block). Substring presence must never confirm a cargo dep —
+                // the `[registries.…]` config block contains the index URL while
+                // pinning nothing, so a config-block-only rewrite would be
+                // attested with zero enforcement in any build.
+                if purl.starts_with("pkg:cargo/") {
+                    return rewrite.confirmed_cargo_uuids.contains(uuid);
+                }
+                let encoded = socket_patch_core::utils::uri::encode_uri_component(artifact_url);
+                final_texts.iter().any(|text| {
+                    // The rewriters' own predicate — raw, or the `\/`-escaped
+                    // slashes an old composer.lock spells them with — so a
+                    // writer's spelling can never be one this probe misses. It
+                    // was: the composer rewriter emitted `\/`-escaped urls this
+                    // probe never looked for, so a fully successful composer
+                    // redirect reported `redirected: 0`, fetched no patch record
+                    // into the ledger, and left the patch unattestable by `vex`.
+                    socket_patch_core::patch::redirect::artifact_url_present(text, artifact_url)
+                        // The berry rewriter writes the URL percent-encoded into the
+                        // lock's `::__archiveUrl=` binding, so the raw form is absent.
+                        || text.contains(encoded.as_str())
+                        || index_url.as_deref().is_some_and(|iu| text.contains(iu))
+                        // Fail-closed maven pins the globally-unique
+                        // `-socket.<hex8>` suffixed version (never the `.pom` URL),
+                        // so match on that string.
+                        || suffixed_version
+                            .as_deref()
+                            .is_some_and(|sv| text.contains(sv))
+                        // golang pins the content-addressed
+                        // `patch.socket.dev/gopatch/<uuid>` module path into
+                        // go.mod + go.sum (no URL ever lands in either file).
+                        || go_module_path
+                            .as_deref()
+                            .is_some_and(|gm| text.contains(gm))
+                })
+            },
+        )
+        .map(|(purl, uuid, _, _, _, _)| (purl.clone(), uuid.clone()))
         .collect();
 
     // Fetch the full patch view (file hashes + vulnerabilities) for each
