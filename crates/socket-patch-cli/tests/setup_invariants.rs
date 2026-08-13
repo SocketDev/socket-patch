@@ -1010,3 +1010,59 @@ fn setup_configures_gem_alongside_npm() {
         .unwrap()
         .contains("socket-patch"));
 }
+
+/// After wiring the Bundler plugin, `setup` materializes gem patches by
+/// spawning `apply` — and that nested run must read the manifest THIS run was
+/// pointed at, not the default `.socket/manifest.json`.
+///
+/// Regression: the spawned command passed `--cwd` but dropped
+/// `--manifest-path`, so a project keeping its patches anywhere else had the
+/// nested run open the wrong file. Both directions of that are silent (a
+/// missing manifest is a clean exit-0 no-op for `apply`), so the observable
+/// pin uses an unparseable manifest at the DEFAULT path: reading it fails the
+/// nested run and surfaces the "materializing gem patches" warning. With
+/// `--manifest-path` honored, the run reads the (valid, empty) manifest it was
+/// given and warns about nothing.
+#[test]
+fn setup_gem_materialization_honors_manifest_path() {
+    // Control first: with no `--manifest-path`, the poisoned default manifest
+    // IS what the nested apply reads, so the warning must appear. Without this
+    // the assertion below could pass for the wrong reason (e.g. the warning
+    // vanishing for some unrelated change).
+    let control = tempfile::tempdir().expect("tempdir");
+    write(&control.path().join("Gemfile"), GEMFILE_FIXTURE);
+    write(
+        &control.path().join(".socket/manifest.json"),
+        "not json {{{",
+    );
+    let (code, stdout) = run_setup(control.path(), &["--yes"]);
+    assert_eq!(code, 0, "gem setup should succeed; stdout=\n{stdout}");
+    assert!(
+        stdout.contains("materializing gem patches"),
+        "control: an unreadable default manifest must make the materialization \
+         step warn — otherwise this test proves nothing; stdout=\n{stdout}"
+    );
+
+    // Same fixture, but the run is pointed at a valid manifest elsewhere. The
+    // nested apply must use it, so no materialization warning is emitted.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write(&tmp.path().join("Gemfile"), GEMFILE_FIXTURE);
+    write(&tmp.path().join(".socket/manifest.json"), "not json {{{");
+    write(&tmp.path().join("custom/patches.json"), r#"{"patches":{}}"#);
+
+    let (code, stdout) = run_setup(
+        tmp.path(),
+        &["--yes", "--manifest-path", "custom/patches.json"],
+    );
+    assert_eq!(code, 0, "gem setup should succeed; stdout=\n{stdout}");
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert_eq!(v["status"], "success");
+    assert!(
+        // Every materialization-warning variant carries "gem patches", so this
+        // also catches the spawn-failed spellings rather than just the
+        // nonzero-exit one the control pins.
+        !stdout.contains("gem patches"),
+        "the nested apply must read the manifest `--manifest-path` names, not \
+         the default `.socket/manifest.json`; stdout=\n{stdout}"
+    );
+}

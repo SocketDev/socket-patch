@@ -8,8 +8,8 @@ use socket_patch_core::patch::apply::select_installed_variants;
 use socket_patch_core::patch::rollback::{
     rollback_package_patch, RollbackResult, VerifyRollbackStatus,
 };
+use socket_patch_core::telemetry::{track_patch_rollback_failed, track_patch_rolled_back};
 use socket_patch_core::utils::purl::strip_purl_qualifiers;
-use socket_patch_core::utils::telemetry::{track_patch_rollback_failed, track_patch_rolled_back};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -97,8 +97,8 @@ async fn try_rollback_local_go(
     patch: &PatchRecord,
     common: &GlobalArgs,
 ) -> Option<RollbackResult> {
-    use socket_patch_core::patch::go_mod_edit::{ReplaceOwner, GO_PATCHES_DIR};
-    use socket_patch_core::patch::go_redirect::remove_go_redirect;
+    use socket_patch_core::patch::redirect::golang_local::remove_go_redirect;
+    use socket_patch_core::vendor::go_mod_edit::{ReplaceOwner, GO_PATCHES_DIR};
     if !is_local_go(purl, common) {
         return None;
     }
@@ -511,8 +511,7 @@ async fn rollback_patches_inner(
     // `vendor --revert` undoes it wholesale. Matching mirrors apply's
     // ledger-key / base-purl / qualifier-stripped triple; unreadable state
     // degrades to "nothing vendored".
-    let vendored_keys =
-        socket_patch_core::patch::vendor::vendored_purl_keys(&args.common.cwd).await;
+    let vendored_keys = socket_patch_core::vendor::vendored_purl_keys(&args.common.cwd).await;
     let is_vendored =
         |p: &str| vendored_keys.contains(p) || vendored_keys.contains(strip_purl_qualifiers(p));
     let (vendored_targets, patches_to_rollback): (Vec<_>, Vec<_>) = patches_to_rollback
@@ -653,7 +652,26 @@ async fn rollback_patches_inner(
     )
     .await;
 
-    if all_packages.is_empty() {
+    // Local-redirect rollback (local-mode go) drops a project-local redirect
+    // and reads nothing out of the ecosystem's package store, so — unlike an
+    // in-place restore — it must NOT depend on the crawler finding the package
+    // there. A directory `replace` makes go skip downloading the replaced
+    // module entirely, so a clone of a repo that committed `go.mod` +
+    // `.socket/go-patches/` + `.socket/manifest.json` (the documented golang
+    // workflow) has no module-cache copy for discovery to find. Without this
+    // fallback the redirect silently survived the rollback: `rollback`
+    // reported success while the build kept linking the patched copy, and
+    // `remove` (which delegates here) then deleted the manifest record,
+    // leaving an active patch nothing tracks. Scoped to `scoped_manifest` so
+    // `--ecosystems` still applies.
+    let undiscovered_redirects: Vec<String> = scoped_manifest
+        .patches
+        .keys()
+        .filter(|purl| is_local_redirect(purl, &args.common) && !all_packages.contains_key(*purl))
+        .cloned()
+        .collect();
+
+    if all_packages.is_empty() && undiscovered_redirects.is_empty() {
         if !args.common.silent && !args.common.json {
             println!("No packages found that match patches to rollback");
         }
@@ -753,6 +771,33 @@ async fn rollback_patches_inner(
             }
             results.push(result);
         }
+    }
+
+    // Redirects the crawler never saw (see `undiscovered_redirects` above):
+    // roll the redirect back from the manifest alone. `package_path` is the
+    // project root — what gets dropped is the `go.mod` directive + the
+    // project-local copy, not anything under a package store.
+    for purl in &undiscovered_redirects {
+        let Some(patch) = scoped_manifest.patches.get(purl) else {
+            continue;
+        };
+        let Some(result) = try_rollback_local_go(purl, &args.common.cwd, patch, &args.common).await
+        else {
+            continue;
+        };
+        if !result.success {
+            has_errors = true;
+            // Errors print even under --silent — same contract as the
+            // in-place loop above.
+            if !args.common.json {
+                eprintln!(
+                    "Failed to rollback {}: {}",
+                    purl,
+                    result.error.as_deref().unwrap_or("unknown error")
+                );
+            }
+        }
+        results.push(result);
     }
 
     Ok((!has_errors, results, vendored_skipped))
@@ -1200,7 +1245,7 @@ mod tests {
     /// kept using the patched copy.
     #[tokio::test]
     async fn try_rollback_local_go_drops_redirect_and_copy() {
-        use socket_patch_core::patch::go_mod_edit::{
+        use socket_patch_core::vendor::go_mod_edit::{
             ensure_replace_entry, read_replace_entries, GO_PATCHES_DIR,
         };
 
@@ -1285,7 +1330,7 @@ mod tests {
     /// that mutated nothing.
     #[tokio::test]
     async fn try_rollback_local_go_dry_run_reports_no_files_rolled_back() {
-        use socket_patch_core::patch::go_mod_edit::{
+        use socket_patch_core::vendor::go_mod_edit::{
             ensure_replace_entry, read_replace_entries, GO_PATCHES_DIR,
         };
 
@@ -1363,6 +1408,187 @@ mod tests {
             result.is_none(),
             "global go must not use the redirect backend"
         );
+    }
+
+    /// Regression: a local-GO rollback must NOT depend on the module still
+    /// sitting in the Go module cache. A directory `replace` makes go skip the
+    /// download of the replaced module entirely, so on a fresh clone of a repo
+    /// that committed `go.mod` + `.socket/go-patches/` + `.socket/manifest.json`
+    /// (the documented golang workflow) the cache holds no copy of the module —
+    /// the crawler finds nothing and the redirect rollback was skipped
+    /// altogether. `rollback` (and `remove`, which delegates here) then reported
+    /// success while leaving the `replace` directive + patched copy in place, so
+    /// the build kept linking patched bytes — for `remove`, with the manifest
+    /// record deleted, i.e. an active patch nothing tracks.
+    #[tokio::test]
+    async fn rollback_drops_local_go_redirect_when_module_cache_has_no_copy() {
+        use socket_patch_core::vendor::go_mod_edit::{
+            ensure_replace_entry, read_replace_entries, GO_PATCHES_DIR,
+        };
+
+        // A module path no real module cache can hold.
+        const MODULE: &str = "github.com/socket-patch-test/never-cached";
+        const VERSION: &str = "v1.4.2";
+        const PURL: &str = "pkg:golang/github.com/socket-patch-test/never-cached@v1.4.2";
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        tokio::fs::write(
+            root.join("go.mod"),
+            format!("module myproj\n\ngo 1.21\n\nrequire {MODULE} {VERSION}\n"),
+        )
+        .await
+        .unwrap();
+        assert!(
+            ensure_replace_entry(root, MODULE, VERSION, GO_PATCHES_DIR, false)
+                .await
+                .unwrap(),
+            "fixture must install a socket-owned replace"
+        );
+        let copy_dir = root
+            .join(GO_PATCHES_DIR)
+            .join(format!("{MODULE}@{VERSION}"));
+        tokio::fs::create_dir_all(&copy_dir).await.unwrap();
+        tokio::fs::write(copy_dir.join("errors.go"), b"// patched\n")
+            .await
+            .unwrap();
+
+        let mut patches = HashMap::new();
+        patches.insert(
+            PURL.to_string(),
+            record_with_file("uuid-go", "errors.go", "go_before"),
+        );
+        let manifest = PatchManifest {
+            patches,
+            setup: None,
+        };
+        let socket = root.join(".socket");
+        tokio::fs::create_dir_all(&socket).await.unwrap();
+        let manifest_path = socket.join("manifest.json");
+        tokio::fs::write(&manifest_path, serde_json::to_string(&manifest).unwrap())
+            .await
+            .unwrap();
+
+        // `--offline`: the redirect rollback reads no blobs, so it must not
+        // need the network either.
+        let common = crate::args::GlobalArgs {
+            cwd: root.to_path_buf(),
+            offline: true,
+            ..crate::args::GlobalArgs::default()
+        };
+        let (success, results, _vendored) = rollback_patches(
+            &common,
+            &manifest_path,
+            None,
+            false, // dry_run
+            true,  // silent
+            Some(vec!["golang".to_string()]),
+        )
+        .await
+        .expect("rollback must not error");
+
+        assert!(success, "local-go redirect rollback must succeed");
+        assert_eq!(
+            results.len(),
+            1,
+            "the local-go redirect must be rolled back even though the module \
+             cache holds no copy of the module, got {results:?}"
+        );
+        assert!(
+            results[0]
+                .files_rolled_back
+                .contains(&"errors.go".to_string()),
+            "the patched file must be reported rolled back, got {:?}",
+            results[0].files_rolled_back
+        );
+        assert!(
+            read_replace_entries(root)
+                .await
+                .iter()
+                .all(|e| !(e.module == MODULE && e.socket_owned())),
+            "socket-owned replace directive must be dropped"
+        );
+        assert!(
+            !copy_dir.exists(),
+            "patched copy under .socket/go-patches must be removed"
+        );
+    }
+
+    /// The undiscovered-redirect fallback must stay scoped: a local-go PURL
+    /// filtered out by `--ecosystems` must not be rolled back behind the
+    /// filter's back.
+    #[tokio::test]
+    async fn undiscovered_local_go_redirect_respects_ecosystem_filter() {
+        use socket_patch_core::vendor::go_mod_edit::{
+            ensure_replace_entry, read_replace_entries, GO_PATCHES_DIR,
+        };
+
+        const MODULE: &str = "github.com/socket-patch-test/never-cached";
+        const VERSION: &str = "v1.4.2";
+        const PURL: &str = "pkg:golang/github.com/socket-patch-test/never-cached@v1.4.2";
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        tokio::fs::write(
+            root.join("go.mod"),
+            format!("module myproj\n\ngo 1.21\n\nrequire {MODULE} {VERSION}\n"),
+        )
+        .await
+        .unwrap();
+        assert!(
+            ensure_replace_entry(root, MODULE, VERSION, GO_PATCHES_DIR, false)
+                .await
+                .unwrap()
+        );
+        let copy_dir = root
+            .join(GO_PATCHES_DIR)
+            .join(format!("{MODULE}@{VERSION}"));
+        tokio::fs::create_dir_all(&copy_dir).await.unwrap();
+
+        let mut patches = HashMap::new();
+        patches.insert(
+            PURL.to_string(),
+            record_with_file("uuid-go", "errors.go", "go_before"),
+        );
+        let manifest = PatchManifest {
+            patches,
+            setup: None,
+        };
+        let socket = root.join(".socket");
+        tokio::fs::create_dir_all(&socket).await.unwrap();
+        let manifest_path = socket.join("manifest.json");
+        tokio::fs::write(&manifest_path, serde_json::to_string(&manifest).unwrap())
+            .await
+            .unwrap();
+
+        let common = crate::args::GlobalArgs {
+            cwd: root.to_path_buf(),
+            offline: true,
+            ..crate::args::GlobalArgs::default()
+        };
+        let (success, results, _vendored) = rollback_patches(
+            &common,
+            &manifest_path,
+            None,
+            false,
+            true,
+            Some(vec!["npm".to_string()]), // golang out of scope
+        )
+        .await
+        .expect("rollback must not error");
+        assert!(success);
+        assert!(
+            results.is_empty(),
+            "golang is out of scope — nothing may be rolled back, got {results:?}"
+        );
+        assert!(
+            read_replace_entries(root)
+                .await
+                .iter()
+                .any(|e| e.module == MODULE && e.socket_owned()),
+            "an out-of-scope redirect must survive"
+        );
+        assert!(copy_dir.exists(), "an out-of-scope copy must survive");
     }
 
     // --- Before-blob gate `--ecosystems` scoping --------------------------

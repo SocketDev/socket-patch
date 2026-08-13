@@ -1,7 +1,8 @@
 use clap::Args;
 use socket_patch_core::manifest::operations::read_manifest;
 use socket_patch_core::manifest::schema::PatchManifest;
-use socket_patch_core::utils::telemetry::track_patch_listed;
+use socket_patch_core::telemetry::track_patch_listed;
+use socket_patch_core::utils::socket_cli_config;
 
 use crate::args::{apply_env_toggles, GlobalArgs};
 use crate::json_envelope::{
@@ -80,6 +81,62 @@ fn build_list_envelope(manifest: &PatchManifest) -> Envelope {
     env
 }
 
+/// Resolve the credentials the `patch_listed` telemetry event is attributed
+/// to: `--api-token` / `--org` (clap already folds in `SOCKET_API_TOKEN` /
+/// `SOCKET_ORG_SLUG` and their promoted `SOCKET_CLI_*` aliases), then the
+/// socket-cli `config.json` written by `socket login`.
+///
+/// The config layer is part of the contract for both settings ("Persisted
+/// configuration" in CLI_CONTRACT.md), and
+/// `telemetry::resolve_telemetry_endpoint` only uses the org-scoped
+/// `/v0/orgs/<slug>/telemetry` endpoint when BOTH a token and a slug reach
+/// it. Passing the raw flag values here skipped the config layer, so a
+/// caller authenticated by `socket login` alone had every `list` reported
+/// anonymously to the public patch proxy — while `apply`/`repair`/`remove`/
+/// `rollback` (which take theirs from `get_api_client_with_overrides`)
+/// reported to that caller's org. With an on-prem `apiBaseUrl` that also
+/// broke the "telemetry can never target a different host than the client"
+/// property, sending the event off to `patches-api.socket.dev` instead.
+///
+/// The API client is deliberately NOT built to get these: `list` is a purely
+/// local read, and constructing one would add the org-slug auto-resolve
+/// round-trip and the "No SOCKET_API_TOKEN set" advisory to a command that
+/// needs neither. Only the two credential lookups are mirrored — including
+/// the `SOCKET_NO_API_TOKEN` veto over *ambient* tokens (`main` scrubs the
+/// env var for the flag layer; core applies the same veto to the config
+/// layer) and the `--debug` echo naming the resolution source.
+pub(crate) fn telemetry_credentials(common: &GlobalArgs) -> (Option<String>, Option<String>) {
+    let api_token = common
+        .api_token
+        .clone()
+        .filter(|t| !t.is_empty())
+        .or_else(|| {
+            if socket_cli_config::no_api_token_veto() {
+                return None;
+            }
+            socket_cli_config::load()
+                .and_then(|c| c.api_token.clone())
+                .inspect(|_| {
+                    if common.debug {
+                        eprintln!(
+                            "[socket-patch debug] api token: from socket-cli config \
+                             (`socket login`)"
+                        );
+                    }
+                })
+        });
+    let org_slug = common.org.clone().filter(|s| !s.is_empty()).or_else(|| {
+        socket_cli_config::load()
+            .and_then(|c| c.default_org.clone())
+            .inspect(|slug| {
+                if common.debug {
+                    eprintln!("[socket-patch debug] org slug: `{slug}` from socket-cli config");
+                }
+            })
+    });
+    (api_token, org_slug)
+}
+
 /// Emit the top-level envelope for `list` in error states. Used for the
 /// "manifest not found" and "manifest unreadable" paths so they share
 /// the same JSON shape as a successful list.
@@ -112,12 +169,8 @@ pub async fn run(args: ListArgs) -> i32 {
             let mut patch_entries: Vec<_> = manifest.patches.iter().collect();
             patch_entries.sort_by(|a, b| a.0.cmp(b.0));
             let patches_count = patch_entries.len();
-            track_patch_listed(
-                patches_count,
-                args.common.api_token.as_deref(),
-                args.common.org.as_deref(),
-            )
-            .await;
+            let (api_token, org_slug) = telemetry_credentials(&args.common);
+            track_patch_listed(patches_count, api_token.as_deref(), org_slug.as_deref()).await;
 
             if args.common.json {
                 println!("{}", build_list_envelope(&manifest).to_pretty_json());
@@ -415,6 +468,45 @@ mod tests {
             .map(|f| f["path"].as_str().unwrap())
             .collect();
         assert_eq!(paths, vec!["z/a.js", "z/b.js"]);
+    }
+
+    // -- Telemetry credential resolution ---------------------------------
+    // The socket-cli `config.json` layer is exercised end-to-end (it is read
+    // once per process, so it needs a subprocess) by
+    // `tests/cli_config_fallback.rs::list_telemetry_follows_socket_cli_login`.
+    // These pin the two layers above it, which need no fixture.
+
+    /// Explicit values — the flag, or the env var clap folds into the same
+    /// field — are used verbatim, never overridden by a lower layer.
+    #[test]
+    fn telemetry_credentials_prefer_explicit_values() {
+        let common = GlobalArgs {
+            api_token: Some("sktsec_flag_api".to_string()),
+            org: Some("flag-org".to_string()),
+            ..GlobalArgs::default()
+        };
+        assert_eq!(
+            telemetry_credentials(&common),
+            (
+                Some("sktsec_flag_api".to_string()),
+                Some("flag-org".to_string())
+            )
+        );
+    }
+
+    /// Empty means "unset" repo-wide, so an empty value must never be
+    /// forwarded: `Some("")` would build a malformed `/v0/orgs//telemetry`
+    /// URL and an empty `Bearer ` header.
+    #[test]
+    fn telemetry_credentials_treat_empty_as_unset() {
+        let common = GlobalArgs {
+            api_token: Some(String::new()),
+            org: Some(String::new()),
+            ..GlobalArgs::default()
+        };
+        let (api_token, org_slug) = telemetry_credentials(&common);
+        assert_ne!(api_token.as_deref(), Some(""));
+        assert_ne!(org_slug.as_deref(), Some(""));
     }
 
     #[test]

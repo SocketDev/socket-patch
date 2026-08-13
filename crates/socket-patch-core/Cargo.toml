@@ -40,10 +40,9 @@ libc = { workspace = true }
 self-replace = { workspace = true }
 
 # All ecosystems (npm, PyPI, Ruby gems, Go, Cargo, NuGet, Maven, Composer,
-# Deno) are unconditionally compiled in — there are no ecosystem feature
-# gates. Maven `apply` stays runtime-gated behind `SOCKET_EXPERIMENTAL_MAVEN=1`
-# (in-place jar patching corrupts sidecars); committable `vendor` is safe (it
-# never touches ~/.m2).
+# Deno) are unconditionally compiled in AND enabled at runtime — there are
+# no ecosystem feature gates and no runtime env gates (the old
+# SOCKET_EXPERIMENTAL_MAVEN/NUGET opt-ins are retired).
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -3,18 +3,19 @@ use regex::Regex;
 use socket_patch_core::api::client::{
     build_proxy_fallback_client, get_api_client_with_overrides, is_fallback_candidate,
 };
+use socket_patch_core::api::ranking::{cmp_search_results, severity_order};
 use socket_patch_core::api::types::{
     PatchResponse, PatchSearchResult, SearchResponse, VulnerabilityResponse,
 };
+use socket_patch_core::crawlers::fuzzy_match::fuzzy_match_packages;
 use socket_patch_core::crawlers::{CrawlerOptions, Ecosystem};
 use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
 use socket_patch_core::manifest::schema::{
     PatchFileInfo, PatchManifest, PatchRecord, VulnerabilityInfo,
 };
 use socket_patch_core::patch::apply::select_installed_variants;
-use socket_patch_core::utils::fuzzy_match::fuzzy_match_packages;
+use socket_patch_core::telemetry::{track_patch_fetch_failed, track_patch_fetched};
 use socket_patch_core::utils::purl::{is_purl, normalize_purl, strip_purl_qualifiers};
-use socket_patch_core::utils::telemetry::{track_patch_fetch_failed, track_patch_fetched};
 use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -82,18 +83,14 @@ pub(crate) fn decide_patch_action(
     }
 }
 
-/// Ordinal rank for severity strings. Higher = worse. Unknown labels
-/// (including GHSA's `moderate` which maps to `medium`) get sensible
-/// defaults so the max-severity selector still works.
+/// Ordinal rank for severity strings. Higher = worse — the inverse of
+/// core's [`severity_order`], which this derives from so the two ladders
+/// cannot drift. Unknown labels (including GHSA's `moderate`, which maps to
+/// `medium`) get sensible defaults so the max-severity selector still works.
 fn severity_rank(severity: &str) -> u8 {
-    match severity.to_ascii_lowercase().as_str() {
-        "critical" => 4,
-        "high" => 3,
-        // GHSA emits `moderate`; treat it as the medium-tier signal.
-        "moderate" | "medium" => 2,
-        "low" => 1,
-        _ => 0,
-    }
+    // severity_order: 0 = critical … 4 = unknown. Flip it so 4 = critical
+    // and unknown lands at 0, which callers below treat as "no signal".
+    4 - severity_order(Some(severity))
 }
 
 /// Return the highest-severity label from a vulnerabilities map.
@@ -346,13 +343,13 @@ fn build_patch_record(patch: &PatchResponse, files: HashMap<String, PatchFileInf
     }
 }
 
-/// Build the manifest-shaped `files` map from a fetched patch view,
-/// keeping only files that carry BOTH hashes — the download-flow rule
-/// shared by the record builders and installed-distribution matching
-/// (new files with no `beforeHash` are excluded; `save_and_apply_patch`
-/// has the new-file-tolerant variant). A file with an empty-string
-/// `beforeHash` is still kept so first-file verification can treat it
-/// as Ready.
+/// Build a file map keyed by path, keeping only files that carry BOTH
+/// hashes — the rule used ONLY for installed-distribution matching in
+/// [`filter_to_installed_releases`]. New files (no `beforeHash`) can
+/// neither identify nor disqualify an installed variant, so they are
+/// excluded here; [`select_installed_variants`] then discriminates on a
+/// non-empty `beforeHash`. Do NOT use this to build manifest records —
+/// see [`files_for_manifest`], which retains patch-added files.
 fn files_with_both_hashes(patch: &PatchResponse) -> HashMap<String, PatchFileInfo> {
     let mut files = HashMap::new();
     for (file_path, file_info) in &patch.files {
@@ -369,13 +366,43 @@ fn files_with_both_hashes(patch: &PatchResponse) -> HashMap<String, PatchFileInf
     files
 }
 
-/// `(purl, manifest record)` from a fetched patch view — the both-hashes
-/// file rule shared with the download flows (new files with no beforeHash
-/// are not part of the record).
+/// Build the manifest-shaped `files` map from a fetched patch view,
+/// keeping EVERY file the patch touches — including net-new files the
+/// patch ADDS, which carry an `afterHash` but no `beforeHash`. A new
+/// file is recorded with an empty-string `beforeHash` sentinel, the same
+/// convention `save_and_apply_patch`'s by-uuid path relies on: apply
+/// treats an empty `beforeHash` as "create this file" and
+/// [`select_installed_variants`] treats it as non-discriminating.
+///
+/// This is the shared record-building rule for the scan/download/vendor
+/// flows AND the single-uuid apply path, so `get <uuid>` and
+/// `scan`/`apply`/`vendor` all record and write the same set of files.
+/// The previous both-hashes-only rule silently dropped every added file,
+/// e.g. the whole-crate cargo export where ALL files lack a `beforeHash`
+/// (recorded `files:{}` → reported `applied:1` while writing nothing) and
+/// a gem patch's genuinely-new runtime-guard file.
+fn files_for_manifest(patch: &PatchResponse) -> HashMap<String, PatchFileInfo> {
+    let mut files = HashMap::new();
+    for (file_path, file_info) in &patch.files {
+        if let Some(after) = &file_info.after_hash {
+            files.insert(
+                file_path.clone(),
+                PatchFileInfo {
+                    before_hash: file_info.before_hash.clone().unwrap_or_default(),
+                    after_hash: after.clone(),
+                },
+            );
+        }
+    }
+    files
+}
+
+/// `(purl, manifest record)` from a fetched patch view — retains
+/// patch-added new files via [`files_for_manifest`].
 pub(crate) fn record_from_patch_response(patch: &PatchResponse) -> (String, PatchRecord) {
     (
         patch.purl.clone(),
-        build_patch_record(patch, files_with_both_hashes(patch)),
+        build_patch_record(patch, files_for_manifest(patch)),
     )
 }
 
@@ -489,10 +516,22 @@ fn detect_identifier_type(identifier: &str) -> Option<IdentifierType> {
 
 /// Select one patch per PURL from available patches.
 ///
-/// - Paid users: auto-select the most recent paid patch per PURL.
+/// Within a PURL, candidates are ranked by [`cmp_search_results`]: merged
+/// patches first, then by severity (critical → low), then most recently
+/// published. `tier` is an access filter here, not a ranking signal — a
+/// free critical patch outranks a paid low one.
+///
+/// - Users with paid access: auto-select the top-ranked patch per PURL.
 /// - Free users with one patch: auto-select it.
-/// - Free users with multiple patches: interactive selection via dialoguer.
+/// - Free users with multiple patches: interactive selection via dialoguer,
+///   with the options presented in ranked order so the best patch is both
+///   the highlighted default and what a non-TTY run auto-picks.
 /// - JSON mode with multiple free patches: returns an error with options list.
+///
+/// The returned vec is sorted by PURL. It is assembled from a `HashMap`,
+/// whose iteration order is randomized per process; without the sort the
+/// download order — and every `--json` array derived from it — would differ
+/// run to run.
 ///
 /// Returns `Ok(selected_patches)` or `Err(exit_code)` if selection fails.
 pub(crate) fn select_patches(
@@ -510,18 +549,23 @@ pub(crate) fn select_patches(
 
     let mut selected = Vec::new();
 
-    for (purl, mut group) in by_purl {
-        // Sort by published_at descending (most recent first)
-        group.sort_by(|a, b| b.published_at.cmp(&a.published_at));
+    // Iterate PURLs in a fixed order too: the interactive prompts below are
+    // presented to a human one after another, and a randomized sequence
+    // would be disorienting across otherwise identical runs.
+    let mut groups: Vec<(String, Vec<&PatchSearchResult>)> = by_purl.into_iter().collect();
+    groups.sort_by(|a, b| a.0.cmp(&b.0));
+
+    for (purl, mut group) in groups {
+        // Canonical best-first order (see `api::ranking`). The API client
+        // already sorts each response, but this call site merges results
+        // across several queries, so re-sort the assembled group.
+        group.sort_by(|a, b| cmp_search_results(a, b));
 
         if can_access_paid {
-            // Paid user: prefer most recent paid patch, fallback to most recent free
-            let choice = group
-                .iter()
-                .find(|p| p.tier == "paid")
-                .or_else(|| group.first())
-                .unwrap();
-            selected.push((*choice).clone());
+            // Take the top-ranked patch. Note this is NOT "prefer paid":
+            // tier only breaks ties once merge status, severity and recency
+            // have all tied.
+            selected.push(group[0].clone());
         } else if group.len() == 1 {
             selected.push(group[0].clone());
         } else {
@@ -603,6 +647,8 @@ pub(crate) fn select_patches(
         }
     }
 
+    // PURL-sorted by construction: `groups` was sorted above and this loop
+    // pushes at most one entry per group.
     Ok(selected)
 }
 
@@ -792,14 +838,27 @@ async fn filter_to_installed_releases(
     (kept, warnings)
 }
 
-/// Build the API client for a download run, defaulting the override org
-/// slug to the caller's `--org` when no explicit override was given.
-async fn api_client_for(params: &DownloadParams) -> socket_patch_core::api::client::ApiClient {
+/// The API-client overrides for a download run: the caller's CLI flags with
+/// the override org slug defaulted to `--org` when none was given.
+///
+/// Shared by the client built here AND by the nested `apply` step, which
+/// constructs its own client and must resolve to the same endpoint/token —
+/// see [`run_nested_apply`].
+fn resolved_api_overrides(
+    params: &DownloadParams,
+) -> socket_patch_core::api::client::ApiClientEnvOverrides {
     let mut overrides = params.api_overrides.clone();
     if overrides.org_slug.is_none() {
         overrides.org_slug = params.org.clone();
     }
-    get_api_client_with_overrides(overrides).await.0
+    overrides
+}
+
+/// Build the API client for a download run.
+async fn api_client_for(params: &DownloadParams) -> socket_patch_core::api::client::ApiClient {
+    get_api_client_with_overrides(resolved_api_overrides(params))
+        .await
+        .0
 }
 
 /// Download and apply a set of selected patches.
@@ -840,7 +899,7 @@ pub(crate) async fn download_patch_records(
     let (selected, narrow_warnings) =
         filter_to_installed_releases(selected, params, &api_client).await;
 
-    let vendor_state = socket_patch_core::patch::vendor::load_state(&params.cwd)
+    let vendor_state = socket_patch_core::vendor::load_state(&params.cwd)
         .await
         .unwrap_or_default();
 
@@ -853,11 +912,9 @@ pub(crate) async fn download_patch_records(
     for search_result in &selected {
         // Idempotency: a detached entry already at this uuid carries its
         // own record — no view fetch needed.
-        let existing = socket_patch_core::patch::vendor::lookup_entry(
-            &vendor_state.entries,
-            &search_result.purl,
-        )
-        .filter(|e| e.detached && e.uuid == search_result.uuid);
+        let existing =
+            socket_patch_core::vendor::lookup_entry(&vendor_state.entries, &search_result.purl)
+                .filter(|e| e.detached && e.uuid == search_result.uuid);
         if let Some(record) = existing.and_then(|e| e.record.clone()) {
             if !params.json && !params.silent {
                 eprintln!("  [skip] {} (already vendored)", search_result.purl);
@@ -875,9 +932,30 @@ pub(crate) async fn download_patch_records(
         // org slug is already stored in the client.
         match api_client.fetch_patch(None, &search_result.uuid).await {
             Ok(Some(patch)) => {
-                // Same both-hashes rule as the download flow: new files
-                // (no beforeHash) are skipped from the record.
-                let files = files_with_both_hashes(&patch);
+                // Record every file the patch touches, added files
+                // included (empty-beforeHash sentinel); see
+                // `files_for_manifest`.
+                let files = files_for_manifest(&patch);
+                // GUARDRAIL: a patch that yields NO recordable files
+                // cannot be vendored — recording an empty `files` map and
+                // reporting the purl as vendored would claim protection
+                // while writing nothing. Fail loudly instead.
+                if files.is_empty() {
+                    if !params.json && !params.silent {
+                        eprintln!(
+                            "  [fail] {} (patch has no applicable files)",
+                            search_result.purl
+                        );
+                    }
+                    failed += 1;
+                    patch_records_json.push(serde_json::json!({
+                        "purl": patch.purl,
+                        "uuid": patch.uuid,
+                        "action": "failed",
+                        "error": "patch has no applicable files",
+                    }));
+                    continue;
+                }
                 let quiet = params.json || params.silent;
                 // Vendor flows keep blob content in memory (the vendor
                 // step re-fetches what it needs); persisting blobs here
@@ -964,7 +1042,7 @@ async fn warn_on_vendored_uuid_drift(
     downloaded_patches: &[serde_json::Value],
     warnings: &mut Vec<String>,
 ) {
-    let Ok(vendor_state) = socket_patch_core::patch::vendor::load_state(cwd).await else {
+    let Ok(vendor_state) = socket_patch_core::vendor::load_state(cwd).await else {
         return;
     };
     if vendor_state.entries.is_empty() {
@@ -977,7 +1055,7 @@ async fn warn_on_vendored_uuid_drift(
         if !matches!(rec["action"].as_str(), Some("added" | "updated")) {
             continue;
         }
-        let entry = socket_patch_core::patch::vendor::lookup_entry(&vendor_state.entries, purl);
+        let entry = socket_patch_core::vendor::lookup_entry(&vendor_state.entries, purl);
         if let Some(entry) = entry.filter(|e| e.uuid != uuid) {
             let w = format!(
                 "{purl} is vendored at patch {} but the manifest now records {uuid}; \
@@ -998,6 +1076,19 @@ async fn warn_on_vendored_uuid_drift(
 /// the read-only cargo-redirect verifier stays off and embedded VEX is
 /// opt-in on the top-level command only, never on this internal
 /// invocation.
+///
+/// `api` carries the caller's API-client flags and is NOT optional: apply
+/// builds its own clients from the `GlobalArgs` handed to it (its telemetry
+/// client, and `fetch_stage`'s artifact fetcher), and those only ever see
+/// this struct. Leaving the fields at their `GlobalArgs::default()` `None`
+/// dropped `--api-url` / `--api-token` / `--org` / `--proxy-url` on the
+/// floor, so a token supplied purely as a CLI flag fell through to env →
+/// socket-cli config → the token-less public proxy. That breaks the flow
+/// for real: a patch view that omits `blobContent` for a file (`Option` on
+/// the wire, which is why `--download-mode diff` exists) leaves `get` with
+/// no blob to write, and the nested apply must download it — with the wrong
+/// client, against the wrong host.
+#[allow(clippy::too_many_arguments)]
 async fn run_nested_apply(
     cwd: &Path,
     manifest_path: &Path,
@@ -1006,6 +1097,7 @@ async fn run_nested_apply(
     quiet: bool,
     download_mode: String,
     strict: bool,
+    api: socket_patch_core::api::client::ApiClientEnvOverrides,
 ) -> bool {
     // Apply re-resolves a relative manifest path against ITS `--cwd`
     // (`resolved_manifest_path`), but ours is already cwd-resolved —
@@ -1023,6 +1115,10 @@ async fn run_nested_apply(
             silent: quiet,
             download_mode,
             strict,
+            api_url: api.api_url,
+            api_token: api.api_token,
+            org: api.org_slug,
+            proxy_url: api.proxy_url,
             ..crate::args::GlobalArgs::default()
         },
         force: false,
@@ -1085,10 +1181,19 @@ pub async fn download_and_apply_patches(
         eprintln!("\nDownloading {} patch(es)...", selected.len());
     }
 
+    // `patches_added` and `patches_updated` are DISJOINT — one patch lands in
+    // exactly one of them, matching the per-patch `action` vocabulary
+    // (CLI_CONTRACT.md: `added` | `updated` | ...) and the single-UUID flow's
+    // summary in `save_and_apply_patch`. `patches_downloaded` is their sum:
+    // the JSON `downloaded` / `applied` counts cover both (a replacement was
+    // fetched and applied just like a new record), and it gates the apply
+    // step. Counting an update in `patches_added` too made the human summary
+    // print `Added: 1` AND `Updated: 1` for the one entry it had swapped.
     let mut patches_added = 0;
     let mut patches_skipped = 0;
     let mut patches_failed = 0;
     let mut patches_updated = 0;
+    let mut patches_downloaded = 0;
     let mut downloaded_patches: Vec<serde_json::Value> = Vec::new();
 
     for search_result in &selected {
@@ -1115,10 +1220,32 @@ pub async fn download_and_apply_patches(
                     continue;
                 }
 
-                // Build the manifest `files` map. Download flow requires
-                // BOTH before+after hash (skips new files); see
-                // `save_and_apply_patch` for the new-file-tolerant variant.
-                let files = files_with_both_hashes(&patch);
+                // Build the manifest `files` map. Retains patch-added new
+                // files (empty-beforeHash sentinel) so scan/apply/vendor
+                // record and write them; see `files_for_manifest`.
+                let files = files_for_manifest(&patch);
+
+                // GUARDRAIL: a patch that yields NO recordable files
+                // cannot be applied — recording an empty `files` map and
+                // then reporting `applied` would tell the user we protected
+                // them while writing nothing. Count it as a failure so the
+                // status/exit code degrade and it is never auto-applied.
+                if files.is_empty() {
+                    if !params.json && !params.silent {
+                        eprintln!(
+                            "  [fail] {} (patch has no applicable files)",
+                            patch.purl
+                        );
+                    }
+                    downloaded_patches.push(serde_json::json!({
+                        "purl": patch.purl,
+                        "uuid": patch.uuid,
+                        "action": "failed",
+                        "error": "patch has no applicable files",
+                    }));
+                    patches_failed += 1;
+                    continue;
+                }
 
                 let quiet = params.json || params.silent;
                 // Vendor flows keep blob content in memory (the vendor
@@ -1164,6 +1291,7 @@ pub async fn download_and_apply_patches(
                         })
                     }
                     _ => {
+                        patches_added += 1;
                         if !params.json && !params.silent {
                             eprintln!("  [add] {}", patch.purl);
                         }
@@ -1180,7 +1308,7 @@ pub async fn download_and_apply_patches(
                 // round-trip to the API.
                 merge_metadata(&mut action_record, patch_event_metadata(&patch));
                 downloaded_patches.push(action_record);
-                patches_added += 1;
+                patches_downloaded += 1;
             }
             Ok(None) => {
                 if !params.json && !params.silent {
@@ -1252,7 +1380,7 @@ pub async fn download_and_apply_patches(
 
     // Auto-apply unless --save-only
     let mut apply_succeeded = false;
-    if !params.save_only && patches_added > 0 {
+    if !params.save_only && patches_downloaded > 0 {
         if !params.json && !params.silent {
             eprintln!("\nApplying patches...");
         }
@@ -1264,6 +1392,7 @@ pub async fn download_and_apply_patches(
             params.json || params.silent,
             params.download_mode.clone(),
             params.strict,
+            resolved_api_overrides(params),
         )
         .await;
     }
@@ -1274,15 +1403,15 @@ pub async fn download_and_apply_patches(
     // alongside a non-zero exit code misleads JSON consumers (the scan
     // wrapper recomputes status from the exit code for exactly this
     // reason, but `get` surfaces this envelope directly).
-    let apply_failed = !apply_succeeded && patches_added > 0 && !params.save_only;
+    let apply_failed = !apply_succeeded && patches_downloaded > 0 && !params.save_only;
     let (status, exit_code) = run_outcome(patches_failed > 0, apply_failed);
     let mut result_json = serde_json::json!({
         "status": status,
         "found": selected.len(),
-        "downloaded": patches_added,
+        "downloaded": patches_downloaded,
         "skipped": patches_skipped,
         "failed": patches_failed,
-        "applied": if apply_succeeded { patches_added } else { 0 },
+        "applied": if apply_succeeded { patches_downloaded } else { 0 },
         "updated": patches_updated,
         "patches": downloaded_patches,
     });
@@ -1707,8 +1836,16 @@ pub async fn run(args: GetArgs) -> i32 {
     code
 }
 
+/// Print the patches a search turned up, grouped by PURL and best-first
+/// within each PURL — the same order [`select_patches`] resolves in, so the
+/// listing's first entry for a package is the one that will be applied.
+/// A `by-cve` / `by-ghsa` search can span several packages, hence the PURL
+/// grouping.
 fn display_search_results(patches: &[PatchSearchResult], can_access_paid: bool) {
     println!("\nFound patches:\n");
+
+    let mut patches: Vec<&PatchSearchResult> = patches.iter().collect();
+    patches.sort_by(|a, b| a.purl.cmp(&b.purl).then_with(|| cmp_search_results(a, b)));
 
     for (i, patch) in patches.iter().enumerate() {
         let tier_label = if patch.tier == "paid" {
@@ -1785,21 +1922,24 @@ async fn save_and_apply_patch(args: &GetArgs, patch: &PatchResponse) -> i32 {
         }
     };
 
-    // Build the manifest `files` map. UUID flow is more permissive than
-    // the download flow: a file with after_hash but no before_hash is a
-    // new file; we record an empty `before_hash` and let apply treat it
-    // as a new-file insert.
-    let mut files = HashMap::new();
-    for (file_path, file_info) in &patch.files {
-        if let Some(after) = &file_info.after_hash {
-            files.insert(
-                file_path.clone(),
-                PatchFileInfo {
-                    before_hash: file_info.before_hash.clone().unwrap_or_default(),
-                    after_hash: after.clone(),
-                },
-            );
-        }
+    // Build the manifest `files` map, retaining patch-added new files
+    // (a file with after_hash but no before_hash records an empty
+    // `before_hash` sentinel, which apply treats as a new-file insert).
+    let files = files_for_manifest(patch);
+
+    // GUARDRAIL: a patch that yields NO recordable files cannot be
+    // applied — recording an empty `files` map and reporting the patch
+    // as applied would claim protection while writing nothing. Fail
+    // loudly instead of counting a defective patch as `applied:1`.
+    if files.is_empty() {
+        report_error(
+            args.common.json,
+            format!(
+                "Patch {} has no applicable files; nothing to apply",
+                patch.purl
+            ),
+        );
+        return 1;
     }
 
     if write_all_patch_blobs(&blobs_dir, patch, args.common.json)
@@ -1893,6 +2033,7 @@ async fn save_and_apply_patch(args: &GetArgs, patch: &PatchResponse) -> i32 {
             quiet,
             args.common.download_mode.clone(),
             args.common.strict,
+            args.common.api_client_overrides(),
         )
         .await;
     }
@@ -1973,7 +2114,7 @@ pub(crate) fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use socket_patch_core::api::types::VulnerabilityResponse;
+    use socket_patch_core::api::types::{PatchFileResponse, VulnerabilityResponse};
     use std::collections::HashMap;
 
     // --- detect_identifier_type -------------------------------------------
@@ -2068,6 +2209,28 @@ mod tests {
         }
     }
 
+    /// `mk_patch` with a single vulnerability at the given severity, so the
+    /// severity rung of the ranking is exercised.
+    fn mk_patch_sev(
+        uuid: &str,
+        purl: &str,
+        tier: &str,
+        published_at: &str,
+        severity: &str,
+    ) -> PatchSearchResult {
+        let mut p = mk_patch(uuid, purl, tier, published_at);
+        p.vulnerabilities.insert(
+            format!("GHSA-{uuid}"),
+            VulnerabilityResponse {
+                cves: vec![],
+                summary: String::new(),
+                severity: severity.into(),
+                description: String::new(),
+            },
+        );
+        p
+    }
+
     #[test]
     fn select_free_user_one_free_patch_returns_it() {
         let patches = vec![mk_patch("u1", "pkg:npm/foo@1.0", "free", "2024-01-01")];
@@ -2077,14 +2240,201 @@ mod tests {
     }
 
     #[test]
-    fn select_paid_user_prefers_paid_over_free_same_purl() {
+    fn select_paid_user_picks_highest_severity_not_most_recent() {
+        // The reported bug. An authorized user's package has a fresh `low`
+        // patch and an older `critical` one; the old selector took the
+        // newest and silently left the critical unfixed.
         let patches = vec![
-            mk_patch("free1", "pkg:npm/foo@1.0", "free", "2024-06-01"),
+            mk_patch_sev("new_low", "pkg:npm/foo@1.0", "paid", "2026-06-01", "low"),
+            mk_patch_sev(
+                "old_crit",
+                "pkg:npm/foo@1.0",
+                "paid",
+                "2024-01-01",
+                "critical",
+            ),
+        ];
+        let out = select_patches(&patches, true, false).expect("ok");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].uuid, "old_crit");
+    }
+
+    #[test]
+    fn select_paid_user_picks_free_critical_over_paid_low() {
+        // Severity outranks tier: `tier` gates *access*, it does not rank.
+        // A paid subscriber must not be handed a low-severity paid patch
+        // when a critical free one exists for the same package.
+        let patches = vec![
+            mk_patch_sev("paid_low", "pkg:npm/foo@1.0", "paid", "2026-06-01", "low"),
+            mk_patch_sev(
+                "free_crit",
+                "pkg:npm/foo@1.0",
+                "free",
+                "2024-01-01",
+                "critical",
+            ),
+        ];
+        let out = select_patches(&patches, true, false).expect("ok");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].uuid, "free_crit");
+        assert_eq!(out[0].tier, "free");
+    }
+
+    /// `mk_patch_sev` with one advisory per severity — two or more makes it
+    /// a *merged* patch (see `api::ranking::merged_coverage`), which is
+    /// inferred from the advisory count, not from any API flag.
+    fn mk_patch_multi(
+        uuid: &str,
+        purl: &str,
+        tier: &str,
+        published_at: &str,
+        severities: &[&str],
+    ) -> PatchSearchResult {
+        let mut p = mk_patch(uuid, purl, tier, published_at);
+        for (i, sev) in severities.iter().enumerate() {
+            p.vulnerabilities.insert(
+                format!("GHSA-{uuid}-{i}"),
+                VulnerabilityResponse {
+                    cves: vec![],
+                    summary: String::new(),
+                    severity: (*sev).into(),
+                    description: String::new(),
+                },
+            );
+        }
+        p
+    }
+
+    #[test]
+    fn select_prefers_merged_patch_when_severities_tie() {
+        // The general preference: `z_merged` remediates two HIGH advisories
+        // in one blob, `a_single` only one. Severities tie, so breadth
+        // decides. `a_single` is both newer AND earlier by uuid, so only
+        // the coverage rung can produce this result.
+        let patches = vec![
+            mk_patch_sev("a_single", "pkg:npm/foo@1.0", "paid", "2026-06-01", "high"),
+            mk_patch_multi(
+                "z_merged",
+                "pkg:npm/foo@1.0",
+                "free",
+                "2020-01-01",
+                &["high", "high"],
+            ),
+        ];
+        let out = select_patches(&patches, true, false).expect("ok");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].uuid, "z_merged");
+    }
+
+    #[test]
+    fn select_prefers_a_higher_severity_patch_over_the_merged_one() {
+        // The exception. A merged patch must not shadow a worse
+        // vulnerability: `z_critical` addresses a CRITICAL the merged patch
+        // does not cover, so it wins despite being older, single-advisory,
+        // and last by uuid.
+        let patches = vec![
+            mk_patch_multi(
+                "a_merged",
+                "pkg:npm/foo@1.0",
+                "free",
+                "2026-06-01",
+                &["high", "high"],
+            ),
+            mk_patch_sev(
+                "z_critical",
+                "pkg:npm/foo@1.0",
+                "free",
+                "2020-01-01",
+                "critical",
+            ),
+        ];
+        let out = select_patches(&patches, true, false).expect("ok");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].uuid, "z_critical");
+    }
+
+    #[test]
+    fn select_recency_is_chronological_not_lexicographic() {
+        // `publishedAt` is RFC 2822 on the wire, so the old raw-string
+        // compare ordered by weekday name. With equal severities the newer
+        // patch must win regardless of which weekday it fell on.
+        let older = "Wed, 01 Jan 2025 00:00:00 GMT";
+        let newer = "Fri, 01 Aug 2026 00:00:00 GMT";
+        assert!(older > newer, "precondition: raw strings sort backwards");
+        // Adversarial UUIDs: `a_older` sorts first, so the final uuid
+        // tiebreak points at the wrong patch and cannot rescue this test if
+        // the date rung breaks.
+        let patches = vec![
+            mk_patch_sev("a_older", "pkg:npm/foo@1.0", "paid", older, "high"),
+            mk_patch_sev("z_newer", "pkg:npm/foo@1.0", "paid", newer, "high"),
+        ];
+        let out = select_patches(&patches, true, false).expect("ok");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].uuid, "z_newer");
+    }
+
+    #[test]
+    fn select_recency_uses_the_patch_date_not_the_package_release_date() {
+        // Real production pair: both patches are for `axios@1.6.0` — one
+        // package version, one upstream release date (2023-10-26) — yet
+        // they carry different publish dates because the field describes
+        // the PATCH. Severities tie, so the date is the deciding rung.
+        //
+        // Non-vacuity: `0bc312a6` < `83f5a654`, so if the ranking ever fell
+        // back to the UUID tiebreak (which is what a package-level date
+        // would cause, both keys being equal) this would select the OLDER
+        // patch and fail.
+        let patches = vec![
+            mk_patch_sev(
+                "0bc312a6",
+                "pkg:npm/axios@1.6.0",
+                "free",
+                "Fri, 27 Mar 2026 19:12:42 GMT",
+                "HIGH",
+            ),
+            mk_patch_sev(
+                "83f5a654",
+                "pkg:npm/axios@1.6.0",
+                "free",
+                "Mon, 03 Aug 2026 20:23:06 GMT",
+                "HIGH",
+            ),
+        ];
+        let out = select_patches(&patches, true, false).expect("ok");
+        assert_eq!(out.len(), 1, "one patch per PURL");
+        assert_eq!(out[0].uuid, "83f5a654");
+    }
+
+    #[test]
+    fn select_returns_purl_sorted_output() {
+        // The grouping map has randomized iteration order; without an
+        // explicit sort the download sequence (and every JSON array derived
+        // from it) would differ run to run.
+        let patches = vec![
+            mk_patch("c", "pkg:npm/ccc@1.0", "paid", "2024-01-01"),
+            mk_patch("a", "pkg:npm/aaa@1.0", "paid", "2024-01-01"),
+            mk_patch("b", "pkg:npm/bbb@1.0", "paid", "2024-01-01"),
+        ];
+        for _ in 0..8 {
+            let out = select_patches(&patches, true, false).expect("ok");
+            let purls: Vec<&str> = out.iter().map(|p| p.purl.as_str()).collect();
+            assert_eq!(
+                purls,
+                ["pkg:npm/aaa@1.0", "pkg:npm/bbb@1.0", "pkg:npm/ccc@1.0"]
+            );
+        }
+    }
+
+    #[test]
+    fn select_paid_user_prefers_paid_when_everything_else_ties() {
+        // Tier survives only as a late tiebreak: same merge status, same
+        // (absent) severity, same publish date → paid wins.
+        let patches = vec![
+            mk_patch("free1", "pkg:npm/foo@1.0", "free", "2024-01-01"),
             mk_patch("paid1", "pkg:npm/foo@1.0", "paid", "2024-01-01"),
         ];
         let out = select_patches(&patches, true, false).expect("ok");
         assert_eq!(out.len(), 1);
-        // Paid wins even if free is more recent.
         assert_eq!(out[0].uuid, "paid1");
         assert_eq!(out[0].tier, "paid");
     }
@@ -2646,5 +2996,121 @@ mod tests {
         // A value where byte 8 splits the trailing multibyte char.
         let s2 = "abcdef€"; // 6 ascii + 3-byte '€' = 9 bytes; byte 8 mid-char
         assert_eq!(short_uuid(s2), s2);
+    }
+
+    // --- files_for_manifest / files_with_both_hashes ---------------------
+    // Regression guards for the download/scan/vendor record builder: a
+    // net-new file (afterHash, NO beforeHash) that the patch ADDS must be
+    // retained in the manifest record, not silently dropped. Real prod
+    // repro: the whole-crate cargo export for `pkg:cargo/traitobject@0.1.1`
+    // publishes ALL files with only an afterHash — the old both-hashes rule
+    // recorded `files:{}` and reported `applied:1` while writing nothing.
+
+    fn file_resp(before: Option<&str>, after: Option<&str>) -> PatchFileResponse {
+        PatchFileResponse {
+            before_hash: before.map(|s| s.to_string()),
+            after_hash: after.map(|s| s.to_string()),
+            socket_blob: None,
+            blob_content: None,
+            before_blob_content: None,
+        }
+    }
+
+    fn patch_with_files(files: HashMap<String, PatchFileResponse>) -> PatchResponse {
+        PatchResponse {
+            uuid: "cf2e6f58-0000-4000-8000-000000000000".into(),
+            purl: "pkg:cargo/traitobject@0.1.1".into(),
+            published_at: "Fri, 27 Mar 2026 19:12:42 GMT".into(),
+            files,
+            vulnerabilities: HashMap::new(),
+            description: "desc".into(),
+            license: "MIT".into(),
+            tier: "free".into(),
+        }
+    }
+
+    #[test]
+    fn files_for_manifest_retains_new_file_without_before_hash() {
+        // A patch that ADDS a new file (afterHash, no beforeHash) — e.g.
+        // the gem `lib/rubygems_plugin.rb` runtime guard — must be kept.
+        let mut files = HashMap::new();
+        files.insert(
+            "lib/rubygems_plugin.rb".to_string(),
+            file_resp(None, Some("a".repeat(64).as_str())),
+        );
+        files.insert(
+            "lib/existing.rb".to_string(),
+            file_resp(Some(&"b".repeat(64)), Some(&"c".repeat(64))),
+        );
+        let patch = patch_with_files(files);
+
+        let kept = files_for_manifest(&patch);
+        // Both files retained: the modified one AND the added one.
+        assert_eq!(kept.len(), 2);
+        let added = kept
+            .get("lib/rubygems_plugin.rb")
+            .expect("new file must be retained in the manifest record");
+        // New files record an empty-string beforeHash sentinel.
+        assert_eq!(added.before_hash, "");
+        assert_eq!(added.after_hash, "a".repeat(64));
+
+        // The old both-hashes rule (still used for installed-variant
+        // matching) DROPS the added file — this is the behavior we fixed.
+        let strict = files_with_both_hashes(&patch);
+        assert_eq!(strict.len(), 1);
+        assert!(!strict.contains_key("lib/rubygems_plugin.rb"));
+    }
+
+    #[test]
+    fn files_for_manifest_keeps_all_new_file_whole_crate_export() {
+        // The P0 cargo case: EVERY file is a whole-crate export with only
+        // an afterHash. The old rule produced `files:{}`; the fix retains
+        // all 9 so the record is non-empty and can actually be applied.
+        let mut files = HashMap::new();
+        for i in 0..9 {
+            files.insert(
+                format!("src/file{i}.rs"),
+                file_resp(None, Some(&format!("{i:064x}"))),
+            );
+        }
+        let patch = patch_with_files(files);
+
+        let kept = files_for_manifest(&patch);
+        assert_eq!(kept.len(), 9, "all whole-crate-export files must be kept");
+        assert!(kept.values().all(|f| f.before_hash.is_empty()));
+
+        // Guardrail precondition: with the old rule this map was empty.
+        assert!(files_with_both_hashes(&patch).is_empty());
+    }
+
+    #[test]
+    fn build_patch_record_from_new_files_is_not_empty() {
+        // The record built from a new-files-only patch must carry files —
+        // an empty `files` map is what the guardrail treats as a
+        // non-applicable (failed), never a successful `applied:1`, patch.
+        let mut files = HashMap::new();
+        files.insert(
+            "src/lib.rs".to_string(),
+            file_resp(None, Some(&"d".repeat(64))),
+        );
+        let patch = patch_with_files(files);
+
+        let (purl, record) = record_from_patch_response(&patch);
+        assert_eq!(purl, "pkg:cargo/traitobject@0.1.1");
+        assert!(
+            !record.files.is_empty(),
+            "record_from_patch_response must retain patch-added files"
+        );
+
+        // A genuinely empty patch (no afterHash anywhere) yields an empty
+        // record — the guardrail-triggering condition the download/apply
+        // flows now count as failed rather than applied.
+        let mut broken = HashMap::new();
+        broken.insert("src/lib.rs".to_string(), file_resp(Some(&"e".repeat(64)), None));
+        let broken_patch = patch_with_files(broken);
+        assert!(
+            files_for_manifest(&broken_patch).is_empty(),
+            "a patch with no afterHash produces an empty (guardrail) files map"
+        );
     }
 }

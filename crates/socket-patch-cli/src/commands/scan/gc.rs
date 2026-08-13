@@ -2,11 +2,11 @@
 //! orphan blob/diff/package-archive sweeps, in both mutating (apply) and
 //! read-only (preview) forms.
 
-use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
-use socket_patch_core::manifest::schema::PatchManifest;
-use socket_patch_core::utils::cleanup_blobs::{
+use socket_patch_core::manifest::cleanup_blobs::{
     cleanup_unused_archives, cleanup_unused_blobs, CleanupResult,
 };
+use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
+use socket_patch_core::manifest::schema::PatchManifest;
 use socket_patch_core::utils::purl::{normalize_purl, strip_purl_qualifiers};
 use std::collections::HashSet;
 use std::path::Path;
@@ -86,7 +86,7 @@ impl GcSummary {
 
 /// Compute GC actions without performing them. `dry_run = true` for the
 /// preview path; `dry_run = false` for the apply path. The cleanup helpers
-/// from `socket_patch_core::utils::cleanup_blobs` natively support dry-run,
+/// from `socket_patch_core::manifest::cleanup_blobs` natively support dry-run,
 /// so the same function works for both.
 async fn run_gc(
     manifest: &PatchManifest,
@@ -271,6 +271,15 @@ pub(super) fn print_gc_vendored_line(gc: &GcSummary) {
 /// crawler purls carry the literal `@scope` — comparing the raw strings
 /// would make every encoded scoped entry look prunable and `--prune`/
 /// `--sync` would GC the very patch it just downloaded.
+///
+/// Entries the crawl never even looked for are exempt too
+/// (`crawl_covers_purl`): any `pkg:<type>/` this build has no crawler
+/// for. The manifest is a committed, shared file, so a newer CLI's
+/// ecosystem can legitimately appear in it — "absent from the crawl"
+/// then says nothing about whether the package is installed, and pruning
+/// would silently delete a teammate's patch (plus its blobs). Same
+/// fail-safe reasoning as capturing `scanned_purls` before the
+/// `--ecosystems` filter.
 fn detect_prunable(
     manifest: &PatchManifest,
     scanned_purls: &HashSet<String>,
@@ -288,6 +297,7 @@ fn detect_prunable(
             !scanned_bases.contains(base.as_ref())
                 && !vendored.contains(p.as_str())
                 && !vendored.contains(strip_purl_qualifiers(p))
+                && crate::ecosystem_dispatch::crawl_covers_purl(p.as_str())
         })
         .cloned()
         .collect()
@@ -422,6 +432,51 @@ mod tests {
         // A genuinely-gone encoded entry still prunes.
         let out = detect_prunable(&m, &scanned(&[]), &no_vendored());
         assert_eq!(out, vec!["pkg:npm/%40scope/x@1.0.0".to_string()]);
+    }
+
+    #[test]
+    fn detect_prunable_keeps_entries_of_uncrawled_ecosystems() {
+        // A manifest key whose `pkg:<type>/` this build has no crawler for
+        // (a newer CLI's ecosystem in a COMMITTED manifest, read by an older
+        // binary) is never looked for by the crawl, so its absence from
+        // `scanned_purls` says nothing about whether it is installed.
+        // Pruning it silently deletes a teammate's patch (plus its blobs)
+        // from the shared manifest.
+        let m = manifest_with(&[
+            ("pkg:hex/plug@1.14.0", "uuid-a"),
+            ("pkg:npm/gone@1.0.0", "uuid-b"),
+        ]);
+        let out = detect_prunable(&m, &scanned(&[]), &no_vendored());
+        assert_eq!(
+            out,
+            vec!["pkg:npm/gone@1.0.0".to_string()],
+            "only the crawled-ecosystem orphan may prune; got {out:?}"
+        );
+    }
+
+    #[test]
+    fn detect_prunable_judges_maven_and_nuget_like_any_ecosystem() {
+        // Maven/NuGet are first-class ecosystems: every scan crawls them,
+        // so their manifest entries ARE judged — absent from the scan
+        // means genuinely uninstalled, and they prune like any other
+        // ecosystem. (They used to be exempt behind the retired
+        // `SOCKET_EXPERIMENTAL_*` runtime gates.)
+        let m = manifest_with(&[
+            ("pkg:maven/com.example/lib@1.0.0", "uuid-a"),
+            ("pkg:nuget/Some.Package@1.0.0", "uuid-b"),
+            ("pkg:npm/gone@1.0.0", "uuid-c"),
+        ]);
+        let mut out = detect_prunable(&m, &scanned(&[]), &no_vendored());
+        out.sort();
+        assert_eq!(
+            out,
+            vec![
+                "pkg:maven/com.example/lib@1.0.0".to_string(),
+                "pkg:npm/gone@1.0.0".to_string(),
+                "pkg:nuget/Some.Package@1.0.0".to_string(),
+            ],
+            "maven/nuget orphans must prune like any other ecosystem's"
+        );
     }
 
     #[test]

@@ -639,7 +639,7 @@ jobs:
       # Phase 2 scaffolding (CLI_CONTRACT "gem" support matrix): publish the
       # `socket-patch-bundler` gem — the published form of the Bundler plugin
       # that `socket-patch setup` currently wires via an in-tree `git:`
-      # reference. This gem is NOT yet the active mechanism (gem_setup still
+      # reference. This gem is NOT yet the active mechanism (setup::gem still
       # emits the in-tree plugin), so the push is **non-blocking**
       # (`continue-on-error`). A follow-up switches the generated Gemfile
       # directive to `plugin "socket-patch-bundler"` and drops

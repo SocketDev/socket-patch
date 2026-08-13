@@ -9,8 +9,8 @@
 //!     `dotnet restore` resolves it from nuget.org and writes
 //!     `packages.lock.json` → a marker patch on the extracted `LICENSE.md` is
 //!     hand-staged (manifest + blob; git-blob sha256 from the ACTUAL installed
-//!     bytes) → `socket-patch vendor --json --offline` (the baked binary, with
-//!     `SOCKET_EXPERIMENTAL_NUGET=1`) → asserts: the rebuilt `.nupkg` under
+//!     bytes) → `socket-patch vendor --json --offline` (the baked binary) →
+//!     asserts: the rebuilt `.nupkg` under
 //!     `.socket/vendor/nuget/<uuid>/`, `socket-patch.vendor.json`, `state.json`,
 //!     the created `nuget.config` (our source + a `packageSourceMapping` for
 //!     the id), and `packages.lock.json` repinned to `base64(sha512(nupkg))`;
@@ -66,10 +66,8 @@ fn render(stage_body: &str) -> String {
 /// staging of ONLY the committable files.
 const STAGE1: &str = r#"
 mkdir -p /workspace/proj && cd /workspace/proj
-# Keep the in-container socket-patch fully offline (also gates telemetry) and
-# opt in to the experimental NuGet dispatch tier.
+# Keep the in-container socket-patch fully offline (also gates telemetry).
 export SOCKET_OFFLINE=1
-export SOCKET_EXPERIMENTAL_NUGET=1
 # Project-local global package cache so the crawler + rebuild find the nupkg
 # deterministically; stage 2 uses a DIFFERENT cold dir.
 export NUGET_PACKAGES="$PWD/.nuget-packages"
@@ -230,7 +228,6 @@ exit 0
 const STAGE3: &str = r#"
 cd /workspace/proj
 export SOCKET_OFFLINE=1
-export SOCKET_EXPERIMENTAL_NUGET=1
 export NUGET_PACKAGES="$PWD/.nuget-packages"
 NUPKG=".socket/vendor/nuget/__UUID__/newtonsoft.json.13.0.3.nupkg"
 

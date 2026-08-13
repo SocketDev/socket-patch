@@ -86,7 +86,7 @@ Beyond the globals above, each subcommand defines a small set of local arguments
 
 `scan --apply` opts JSON callers into the full discover → select → apply pipeline. Without it, `scan --json` stays read-only (discovery + `updates` array only). No effect outside `--json` mode — the non-JSON path always prompts the user interactively.
 
-`scan --prune` opts into garbage collection. When set, `scan` removes manifest entries for packages no longer present in the crawl, then deletes orphan blob, diff, and package-archive files from `.socket/`. Off by default (v3.0) so a temporary uninstall doesn't silently destroy manifest state. The pass also reconciles vendored state (runs FIRST, under the apply lock — lock contention skips it without failing the scan): vendored entries whose patch is gone from the manifest are reverted, vendored entries whose dependency is no longer in the lockfile graph are reverted AND their manifest entries dropped (detached entries are exempt from both — they are manifest- and lockfile-invisible by design; a missing or undeterminable lockfile keeps the entry, fail-safe), and orphan `.socket/vendor/<eco>/<uuid>` dirs with no ledger entry are swept. The JSON `gc` sub-object gains `revertedVendoredEntries` + `removedVendorOrphanDirs` (wet) / `revertableVendoredEntries` + `vendorOrphanDirs` (preview).
+`scan --prune` opts into garbage collection. When set, `scan` removes manifest entries for packages no longer present in the crawl, then deletes orphan blob, diff, and package-archive files from `.socket/`. Off by default (v3.0) so a temporary uninstall doesn't silently destroy manifest state. Only entries whose ecosystem this run actually crawled are eligible: a `pkg:<type>/` with no crawler in this build (a newer CLI's ecosystem in the committed manifest) and the runtime-gated maven/nuget crawlers with their gate off are exempt — the crawl never looked for them, so their absence is not evidence of removal (same fail-safe as the `--ecosystems` filter, which narrows the query but never the prune's installed set). The pass also reconciles vendored state (runs FIRST, under the apply lock — lock contention skips it without failing the scan): vendored entries whose patch is gone from the manifest are reverted, vendored entries whose dependency is no longer in the lockfile graph are reverted AND their manifest entries dropped (detached entries are exempt from both — they are manifest- and lockfile-invisible by design; a missing or undeterminable lockfile keeps the entry, fail-safe), and orphan `.socket/vendor/<eco>/<uuid>` dirs with no ledger entry are swept. The JSON `gc` sub-object gains `revertedVendoredEntries` + `removedVendorOrphanDirs` (wet) / `revertableVendoredEntries` + `vendorOrphanDirs` (preview).
 
 `scan` queries the patch API in `--batch-size` chunks. Authenticated runs POST `/v0/orgs/{slug}/patches/batch`; token-less runs POST `{proxy}/patch/batch` on the public proxy and degrade to per-package `GET /patch/by-package/:purl` requests in two cases: the deployed proxy predates the batch endpoint (legacy proxies answer the POST with their `400 "Unsupported endpoint"` catch-all), or the all-or-nothing batch validation rejects the chunk (e.g. a crawled PURL type the server doesn't recognize, such as `pkg:jsr/…` — the per-package path tolerates those individually, preserving the pre-batch scan semantics). Rate limits and over-capacity 503s surface instead of silently degrading.
 
@@ -102,7 +102,7 @@ Beyond the globals above, each subcommand defines a small set of local arguments
 
 `scan --mode hosted` (== `--redirect`) swaps the in-place apply for the registry-redirect pipeline: discover → resolve hosted-patch references (grant token + integrity + per-dep registry override) → rewrite ONLY the patched dependencies' lockfile / registry-config entries to point at the hosted packages. A dep counts as **redirected** only when its hosted-artifact URL (or per-dep registry index URL) actually landed in a project file — a granted reference whose rewriter found nothing to edit is neither recorded nor attested. Re-runs over already-rewritten output record zero new edits. JSON output gains a `redirect` sub-object: `{ mode: "hosted", redirected, rewrittenFiles, skipped, warnings, dryRun }` (`mode` is additive so consumers can dispatch without inferring it). Rewriter warnings carry stable `redirect_*` codes (e.g. `redirect_npm_no_lockfile`, `redirect_gradle_manual_snippet`, `redirect_golang_unsupported`); new codes are additive (MINOR).
 
-The rewriter reads a fixed set of candidate files from the project root: the npm-family locks (`package-lock.json`, `npm-shrinkwrap.json`, `pnpm-lock.yaml`, `yarn.lock`, plus `.yarnrc.yml` for the berry cache-config gate and `bun.lock`), `requirements.txt` / `uv.lock`, `Cargo.toml` / `Cargo.lock` / `.cargo/config.toml`, `composer.lock`, `nuget.config` / `packages.lock.json`, `Gemfile` / `Gemfile.lock`, `pom.xml` (+ `.mvn/maven.config` / `.mvn/checksums/checksums.sha256` for maven Trusted Checksums merge, and the Gradle build scripts read only to trigger the manual-snippet warning). **npm-family flavor coverage**: package-lock / npm-shrinkwrap, pnpm (root OR any nested `*/pnpm-lock.yaml`), yarn classic, **yarn berry** (`yarn.lock` entry only — `resolution: ::__archiveUrl=` + `yarnBerry10c0` checksum; cacheKey `10c0` and `.yarnrc.yml compressionLevel 0` gated by `redirect_yarn_berry_cache_unsupported`), and **bun** (text `bun.lock` v1 — a binary `bun.lockb` with no text lock is auto-migrated to text via `bun install --save-text-lockfile --frozen-lockfile --lockfile-only` before the read, recorded as a `removed` FileEdit; `redirect_bun_lockb_would_migrate` on `--dry-run`, `redirect_bun_lockb_unsupported` when the migration is unavailable). **Rush monorepos**: when `rush.json` is present the rewriter also reads `common/config/rush/pnpm-lock.yaml` and each `common/config/subspaces/<name>/pnpm-lock.yaml` (sorted for determinism) under their repo-relative keys and repoints them in place; editing them emits `redirect_rush_repo_state_stale` when `common/config/rush/repo-state.json` exists (the `pnpmShrinkwrapHash` desync is refreshed by `rush update`, which the redirect survives). **maven** is fail-closed via version suffixing: a `mavenSuffixedVersion` + `mavenPomSha256` override pins the Socket-only `<version>-socket.<hex8>` by rewriting the literal `<version>` (`redirect_maven_dep_version`) or adding a `<dependencyManagement>` entry (`redirect_maven_dep_management_added`), plus optional Trusted Checksums (`redirect_maven_trusted_checksums`, conflicts as `redirect_maven_trusted_checksums_conflict`); a `${property}` version is refused (`redirect_maven_dep_unpinned`), a non-matching literal skipped (`redirect_maven_dep_version_mismatch`), and an override without a suffixed version falls back to same-GAV repository injection (`redirect_maven_same_gav_fallback`, NOT fail-closed).
+The rewriter reads a fixed set of candidate files from the project root: the npm-family locks (`package-lock.json`, `npm-shrinkwrap.json`, `pnpm-lock.yaml`, `yarn.lock`, plus `.yarnrc.yml` for the berry cache-config gate and `bun.lock`), `requirements.txt` / `uv.lock`, `Cargo.toml` / `Cargo.lock` / `.cargo/config.toml` (plus the legacy extensionless `.cargo/config` — cargo reads that spelling in preference when both exist, so the managed `[registries.…]` block is written into whichever one is present), `composer.lock`, `nuget.config` / `packages.lock.json`, `Gemfile` / `Gemfile.lock`, `pom.xml` (+ `.mvn/maven.config` / `.mvn/checksums/checksums.sha256` for maven Trusted Checksums merge, and the Gradle build scripts read only to trigger the manual-snippet warning). **npm-family flavor coverage**: package-lock / npm-shrinkwrap, pnpm (root OR any nested `*/pnpm-lock.yaml`), yarn classic, **yarn berry** (`yarn.lock` entry only — `resolution: ::__archiveUrl=` + `yarnBerry10c0` checksum; cacheKey `10c0` and `.yarnrc.yml compressionLevel 0` gated by `redirect_yarn_berry_cache_unsupported`), and **bun** (text `bun.lock` v1 — a binary `bun.lockb` with no text lock is auto-migrated to text via `bun install --save-text-lockfile --frozen-lockfile --lockfile-only` before the read, recorded as a `removed` FileEdit; `redirect_bun_lockb_would_migrate` on `--dry-run`, `redirect_bun_lockb_unsupported` when the migration is unavailable). **Rush monorepos**: when `rush.json` is present the rewriter also reads `common/config/rush/pnpm-lock.yaml` and each `common/config/subspaces/<name>/pnpm-lock.yaml` (sorted for determinism) under their repo-relative keys and repoints them in place; editing them emits `redirect_rush_repo_state_stale` when `common/config/rush/repo-state.json` exists (the `pnpmShrinkwrapHash` desync is refreshed by `rush update`, which the redirect survives). **maven** is fail-closed via version suffixing: a `mavenSuffixedVersion` + `mavenPomSha256` override pins the Socket-only `<version>-socket.<hex8>` by rewriting the literal `<version>` (`redirect_maven_dep_version`) or adding a `<dependencyManagement>` entry (`redirect_maven_dep_management_added`), plus optional Trusted Checksums (`redirect_maven_trusted_checksums`, conflicts as `redirect_maven_trusted_checksums_conflict`); a `${property}` version is refused (`redirect_maven_dep_unpinned`), a non-matching literal skipped (`redirect_maven_dep_version_mismatch`), and an override without a suffixed version falls back to same-GAV repository injection (`redirect_maven_same_gav_fallback`, NOT fail-closed).
 
 **Mode ledgers (contract surfaces).** Each committable mode persists its state at a stable repo-relative path; external tools (and the depscan backend's GitHub-app PR flows) read and write these files, so path + schema are part of the contract:
 
@@ -605,7 +605,7 @@ Synopsis and behavior:
 | Invocation | Behavior |
 |---|---|
 | `--update` | Resolve the latest release; install it if newer than the running version. Already-newest (including a dev build newer than any release): informational no-op, exit 0. `latest` never downgrades. |
-| `--update 3.4.0` | Install exactly that version, **up or down** — an explicit pin is explicit intent, no `--force` needed. Pin == current: no-op, exit 0. Also settable via `SOCKET_PATCH_VERSION` (the same pin env `install.sh` and the gem/composer launchers honor); a malformed version is a usage error (exit 2). |
+| `--update 3.4.0` | Install exactly that version, **up or down** — an explicit pin is explicit intent, no `--force` needed. Pin == current: no-op, exit 0. The inline `--update=3.4.0` spelling is equivalent. Also settable via `SOCKET_PATCH_VERSION` (the same pin env `install.sh` and the gem/composer launchers honor); a malformed version is a usage error (exit 2). |
 | `--update --force` | Reinstall/downgrade even when already at the target version, and proceed past a managed-install refusal (with a warning that the owning manager's next upgrade will overwrite the binary). Env: `SOCKET_FORCE`. |
 | `--update --dry-run` | **Check-only**: one metadata request, zero downloads, zero mutation, exit 0 — and always the `verified`/`update_check` event shape, whether or not an update exists. `--json` details carry `{current, latest, updateAvailable, target, asset, path}` — the cheap scriptable "is an update available" probe. |
 | `--update --offline` | Refused up front (strict airgap, before any client exists), exit 1. `--force` does **not** bypass it. |
@@ -624,7 +624,7 @@ Honored global flags: `--json`, `--silent` (errors only), `--yes` (skip the conf
 
 **Pipeline order** (each step gates the next; a failure at any point leaves the installed binary untouched): fetch `SHA256SUMS` → fetch the archive (`socket-patch-<target-triple>.tar.gz`/`.zip`, explicit timeouts, size caps) → verify the SHA-256 **before** extraction → extract the single expected member → stage as an executable sibling **in the install directory** (`EACCES` here is the permissions preflight → exit 1 with a sudo hint; system temp is never used, so `noexec` mounts don't matter) → run the staged binary's `--version` self-check (against real GitHub the reported version must equal the release tag; under a `SOCKET_UPDATE_BASE_URL` override a mismatch only warns) → one atomic rename over the install path (mode-preserving; a **setuid/setgid** target — or, on Linux, one carrying **file capabilities** (`setcap`) — is refused, since an unprivileged swap cannot restore those grants; Windows uses the rename-dance via `self-replace`). Concurrent updates are single-flighted per environment by an advisory lock at `<state dir>/update.lock` (`errorCode: update_in_progress`; the OS releases a dead holder's lock, so there is no stale-lock state). Two updaters whose state dirs diverge (e.g. different `$HOME`s targeting one shared `/usr/local/bin`) are not serialized, but every path to the destination is a whole-file rename and stage cleanup is age-gated — the worst case is duplicated work, never a torn binary.
 
-**Envelope.** `command: "update"`. Success events: `downloaded` (`details: {asset, bytes, sha256}`) then `updated` (`details: {from, to, path, target}`). No-op: `skipped` with reason `already_latest`. Dry-run: `verified` with reason `update_check`. Top-level `errorCode` values (stable): `offline`, `managed_install`, `check_failed`, `asset_not_found`, `download_failed`, `checksum_mismatch`, `verify_failed`, `swap_failed`, `permission_denied`, `update_in_progress`. Exit codes: 0 success / no-op / dry-run; 1 operational failure; 2 usage.
+**Envelope.** `command: "update"`. Success events: `downloaded` (`details: {asset, bytes, sha256}`) then `updated` (`details: {from, to, path, target}`). No-op: `skipped` with reason `already_latest`. Dry-run: `verified` with reason `update_check`. Non-fatal advisories ride the run-level `warnings[]` (`{code, detail}`, omitted when empty) — human runs print the same text to stderr as `Warning: <detail>`, and `--json` (which silences stderr) carries them here instead so an override is never silent: `managed_install_override` (a `--force` run replaced a package-manager-owned binary that manager's next upgrade will overwrite) and `update_warning` (a non-fatal note from the update engine, today the relaxed version self-check under a `SOCKET_UPDATE_BASE_URL` override). Top-level `errorCode` values (stable): `offline`, `managed_install`, `check_failed`, `asset_not_found`, `download_failed`, `checksum_mismatch`, `verify_failed`, `swap_failed`, `permission_denied`, `update_in_progress`. Exit codes: 0 success / no-op / dry-run; 1 operational failure; 2 usage.
 
 **Trust model.** Checksum-only, rooted in HTTPS + GitHub (identical to install.sh and the launcher wrappers): `SHA256SUMS` is served from the same origin as the archives, there are no signatures yet. Downloads are credential-free — the Socket API bearer is never sent to the release host — and non-HTTPS redirect hops are refused when talking to the default endpoints.
 
@@ -731,7 +731,7 @@ Contract properties:
 
 ### Registry override env vars
 
-Env-only knobs (no CLI flag) read by the vendor auto-fetch / artifact-rebuild paths in `socket-patch-core` (`src/patch/vendor/registry_fetch.rs`, `src/patch/vendor/maven_repo.rs`). Each is the enterprise-mirror / test escape hatch for one registry base; trailing slashes are trimmed and an exported-but-empty value falls back to the default. Lock-recorded URLs (npm/yarn/composer/gem/uv `resolved`/dist URLs) are used verbatim and bypass these.
+Env-only knobs (no CLI flag) read by the vendor auto-fetch / artifact-rebuild paths in `socket-patch-core` (`src/vendor/registry_fetch.rs`, `src/vendor/maven_repo.rs`). Each is the enterprise-mirror / test escape hatch for one registry base; trailing slashes are trimmed and an exported-but-empty value falls back to the default. Lock-recorded URLs (npm/yarn/composer/gem/uv `resolved`/dist URLs) are used verbatim and bypass these.
 
 | Env var | Default | Notes |
 |---|---|---|
@@ -746,13 +746,12 @@ These exist for staged rollouts and the launcher wrappers. They are **internal**
 
 | Env var | Purpose |
 |---|---|
-| `SOCKET_EXPERIMENTAL_MAVEN` | Opt-in gate (`=1`) for the maven installed-package crawl behind `scan`/`apply`/`vendor` — agent-mode in-place jar patching corrupts the `~/.m2` checksum sidecars, so discovery stays off by default (`src/ecosystem_dispatch.rs`). |
-| `SOCKET_EXPERIMENTAL_NUGET` | Same gate for nuget — in-place patching breaks the `.nupkg.sha512` tamper-evidence sidecar. |
 | `SOCKET_PATCH_BIN` | Points the CLI launcher wrappers (RubyGems / Composer / Maven / NuGet) and the gem Bundler plugin at an existing `socket-patch` binary (skips the download-on-first-run); also the escape hatch `apply` names when a golang-featureless binary is asked to audit Go redirects. |
 | `SOCKET_UPDATE_BASE_URL` | Points BOTH the release-metadata and asset-download routes of `--update`/the update notice at one base (mirror or test fixture) instead of `github.com` + `api.github.com`. Overriding it relaxes the downloaded binary's version self-check from hard-fail to warning. |
 | `SOCKET_UPDATE_STATE_DIR` | Overrides the per-user dir holding `update-check.json` + `update.lock` (tests point it into a tempdir). |
 | `SOCKET_UPDATE_TIMEOUT_MS` | Caps the update fetches' connect/metadata/download budgets (defaults 10 s / 30 s / 300 s; the notice's fetch defaults to 2 s). Doubles as the slow-network escape hatch. |
 | `SOCKET_UPDATE_NOTIFIER_FORCE` | Test hook: bypasses the update notice's stderr-TTY guard — and nothing else (opt-out, offline, `--silent`, `--json`, CI all still win). |
+| `SOCKET_UPDATE_GRACE_MS` | Test hook: overrides the notice's post-command join grace (default 500 ms — how long the run waits for the background check before abandoning it and exiting). Lets the e2e suite await the loopback fetch to completion so its observable effect is deterministic; production keeps the tight 500 ms ceiling. |
 
 ### Deprecated env vars
 
@@ -938,7 +937,7 @@ rely on these keys.
   "description": "Fixes prototype pollution in minimist",
   "license":     "MIT",
   "tier":        "free" | "paid",
-  "exportedAt":  "2024-01-01T00:00:00Z",     // publishedAt from API
+  "exportedAt":  "2024-01-01T00:00:00Z",     // publishedAt from API — when the PATCH was published
   "severity":    "critical" | "high" | "medium" | "low",  // max across all vulnerabilities; omitted when no vulns
   "vulnerabilities": [
     {
@@ -965,6 +964,106 @@ added. It's also omitted on `failed`.
 `vulnerabilities[]` is always sorted by `id` so consumer diffs and
 test snapshots are stable. `severity` at the top level is the max
 across the array using the ordering `critical > high > medium = moderate > low > (unknown)`.
+
+`exportedAt` is the API's `publishedAt` **verbatim**: the date **the
+patch** was published, *not* the date the upstream package version was
+released. The two are unrelated — a package from 2020 routinely carries
+a patch published last week, and two patches for one package version
+carry two different dates. Note the wire format is RFC 2822 / HTTP-date
+(`Fri, 27 Mar 2026 19:12:42 GMT`), not ISO 8601 — do not compare these
+as raw strings, they sort by weekday name.
+
+### Which patch gets selected
+
+A package can have several available patches; the manifest holds one
+record per PURL, so exactly one is chosen. Both `get` and every `scan`
+mode rank candidates identically (`socket_patch_core::api::ranking`),
+best first:
+
+1. **Severity** — `critical > high > medium = moderate > low > (unknown)`,
+   taken as the worst severity across everything the patch fixes.
+2. **Merge state** — a patch that remediates *more* advisories in one blob
+   leads. Inferred, not flagged: see below.
+3. **Patch publish date**, most recent first — when the *patch* was
+   published, never the upstream package's release date. Unparseable or
+   absent dates sort last.
+4. `tier` (paid first), then `uuid` — tiebreaks only, present so the
+   order is total and therefore reproducible across runs.
+
+`tier` is an **access filter, not a ranking signal**: a free `critical`
+patch outranks a paid `low` one. Paid patches are excluded outright for
+callers whose `canAccessPaidPatches` is false.
+
+#### Merge state is inferred, not reported
+
+There is no `merged` field on the wire and none is required. A merged
+patch is by definition one that folds several fixes into a single blob,
+so it **names several advisories** — which every endpoint already tells
+us. Merge state is therefore the count of distinct advisories a patch
+remediates: `vulnerabilities` map keys on `by-package` / `view`,
+`ghsaIds` on `batch` (falling back to `cveIds` only when no GHSA is
+named). `1` is an ordinary patch, `>= 2` is merged.
+
+Advisories are counted, **not** CVE ids: one advisory routinely carries
+several CVE aliases, and counting those would inflate a single-fix patch
+into a phantom merged one.
+
+As of 2026-08-05 production publishes no merged patches — all 28 patches
+sampled across npm/PyPI/gem/cargo covered exactly one advisory each — so
+this rung is currently inert and ranking falls through to recency. The
+moment a consolidated patch is published it is preferred automatically,
+with no client *or* server change.
+
+#### Why severity sits above merge state
+
+The merged patch is the general preference: it fixes the most in one
+shot, and only one patch per PURL can be applied, so breadth is what an
+operator wants. But it must never shadow a *worse* vulnerability. If a
+patch addresses a higher-severity advisory than anything the merged patch
+covers, that one wins — you do not leave a critical unfixed to pick up
+two extra mediums. Severity on the top rung expresses exactly that,
+because a patch's severity is the worst advisory it fixes:
+
+| merged patch | rival patch | winner | why |
+|---|---|---|---|
+| high     | critical | rival  | higher severity available |
+| critical | high     | merged | merged already covers the worst |
+| high     | high     | merged | severities tie → breadth decides |
+
+This ordering is also the presentation order everywhere patches are
+listed — `scan --json`'s `packages[].patches[]`, `get`'s "Found
+patches:" listing, and the `selection_required` `options[]` array — so
+`patches[0]` for a package is the patch that would be applied, and
+`updates[].newUuid` names that same patch.
+
+Free/unauthorized callers with more than one candidate for a PURL still
+get the interactive picker (or `selection_required` in `--json`); the
+ranking decides the presented order and hence the highlighted default,
+not the outcome.
+
+One additive key may appear on `scan --json`'s `packages[].patches[]`
+entries, omitted when absent: `publishedAt`, present whenever the server
+supplies it (the public-proxy fallback path fills it in from the
+per-package results).
+
+> **Known gap — batch responses without `publishedAt`.** `scan`'s
+> discovery (`packages[]`, the table, `updates[]`) is built from the
+> **batch** endpoint, whose response shape currently omits `publishedAt`;
+> the selection that `--apply` performs is built from the **by-package**
+> endpoint, which carries it. Ranks 1, 2 and 4 agree across both, so the
+> two only diverge for a package whose top candidates tie on severity
+> *and* merge state — there the batch side falls through to the UUID
+> tiebreak while apply correctly uses the date.
+>
+> Live example: `pkg:npm/axios@1.6.0` has two free `HIGH` patches;
+> `packages[0].patches[0]` reports `0bc312a6…` (2026-03-27) while
+> `--apply` installs the newer `83f5a654…` (2026-08-03), which is the
+> correct choice. Only the reported ordering is affected — never which
+> patch lands on disk.
+>
+> The client already deserializes `publishedAt` on the batch shape
+> (`#[serde(default)]`), so this closes with no client change the moment
+> the batch endpoint emits it.
 
 ### `jq` recipes for PR-comment bots
 

@@ -40,7 +40,6 @@ semver = "=1.0.27"
 self-replace = "=1.5.0"
 wiremock = "=0.6.5"
 portable-pty = "=0.9.0"
-testcontainers = "=0.27.3"
 base64 = "=0.22.1"
 serial_test = "=3.4.0"
 
@@ -48,3 +47,72 @@ serial_test = "=3.4.0"
 strip = true
 lto = true
 opt-level = "s"
+
+# CI-only profile for the test-release job. Inherits the shipped profile's
+# semantics (opt-level = "s", debug-assertions off, overflow-checks off) —
+# which is what test-release exists to validate (commit b96a13f) — but drops
+# the full-LTO link: ~23m of that job's ~29m was LTO-relinking 159 test
+# binaries, and LTO relinks are structurally uncacheable. release.yml still
+# builds the real full-LTO [profile.release] for every shipped target.
+[profile.ci-release]
+inherits = "release"
+lto = false
+strip = "none" # unstripped test binaries => usable backtraces on failure
+
+# Test-execution speed: `cargo test` builds dependencies with the dev
+# profile; at opt-level 0 the hash/compression/bsdiff hot loops are 10-100x
+# slower (the self_update fixture family measured 403s debug vs ~2s release
+# on CI run 30289993021 — it gzips and sha256-hashes the multi-MB debug CLI
+# binary per test). Workspace members are NOT matched by "*" — they stay
+# opt-level 0, so incremental compile speed, debugging, and llvm-cov line
+# fidelity (reports filter to workspace crates) are unchanged. Dependencies
+# keep debug-assertions and overflow-checks ON — only codegen opt changes.
+[profile.dev.package."*"]
+opt-level = 1
+
+# The measured hot path gets full optimization: archive building
+# (flate2/zip over multi-MB payloads), SHA hashing in fixtures and in the
+# CLI's own verify paths, and qbsdiff bspatch in every apply test.
+[profile.dev.package.sha2]
+opt-level = 3
+[profile.dev.package.sha1]
+opt-level = 3
+[profile.dev.package.digest]
+opt-level = 3
+[profile.dev.package.block-buffer]
+opt-level = 3
+[profile.dev.package.cpufeatures]
+opt-level = 3
+[profile.dev.package.crc32fast]
+opt-level = 3
+[profile.dev.package.flate2]
+opt-level = 3
+[profile.dev.package.miniz_oxide]
+opt-level = 3
+[profile.dev.package.zlib-rs]
+opt-level = 3
+[profile.dev.package.adler2]
+opt-level = 3
+[profile.dev.package.simd-adler32]
+opt-level = 3
+[profile.dev.package.zip]
+opt-level = 3
+[profile.dev.package.qbsdiff]
+opt-level = 3
+[profile.dev.package.bzip2]
+opt-level = 3
+[profile.dev.package.libbz2-rs-sys]
+opt-level = 3
+[profile.dev.package.suffix_array]
+opt-level = 3
+
+# macOS debug builds use unpacked split-debuginfo: every linked binary —
+# including each of the ~90 e2e test executables — pins its per-codegen-unit
+# .o files in target/debug/deps, and cargo never garbage-collects the
+# generations superseded by lockfile/toolchain bumps (this grew target/ to
+# 99 GB). Line tables keep panic backtraces readable while dropping the bulk
+# of the retained DWARF; for a full-fidelity debugger session, override with
+# CARGO_PROFILE_DEV_DEBUG=full. Applies to test/bench profiles via
+# inheritance.
+[profile.dev]
+debug = "line-tables-only"

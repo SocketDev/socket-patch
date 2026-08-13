@@ -456,12 +456,33 @@ impl MavenCrawler {
     /// Get the Maven local repository path.
     ///
     /// Checks `$MAVEN_REPO_LOCAL`, `$M2_HOME/repository`, `$HOME/.m2/repository`.
+    ///
+    /// A set-but-EMPTY variable counts as unset. `std::env::var` yields
+    /// `Ok("")` for `export MAVEN_REPO_LOCAL="$M2"` with `$M2` undefined —
+    /// a shape this repo's own container scripts use — and honoring `""`
+    /// breaks both arms:
+    ///
+    /// - `MAVEN_REPO_LOCAL=""` returns `PathBuf::from("")`, whose `is_dir`
+    ///   is false, so global discovery finds NO repo and every Maven patch
+    ///   is silently skipped — while Maven itself would have used the
+    ///   default local repo.
+    /// - `M2_HOME=""` returns the RELATIVE path `repository`, which
+    ///   resolves against the process CWD: the crawl (and Maven's in-place
+    ///   patching) would target a `repository/` directory inside the user's
+    ///   own project instead of a real local repo.
+    ///
+    /// Same rule as `nuget_home()`, `deno_dir()`, `go_crawler`'s
+    /// `get_gomodcache`, and `utils::fs::home_dir`.
     fn m2_repo_path() -> PathBuf {
         if let Ok(repo_local) = std::env::var("MAVEN_REPO_LOCAL") {
-            return PathBuf::from(repo_local);
+            if !repo_local.is_empty() {
+                return PathBuf::from(repo_local);
+            }
         }
         if let Ok(m2_home) = std::env::var("M2_HOME") {
-            return PathBuf::from(m2_home).join("repository");
+            if !m2_home.is_empty() {
+                return PathBuf::from(m2_home).join("repository");
+            }
         }
         crate::utils::fs::home_dir().join(".m2").join("repository")
     }
@@ -1219,6 +1240,80 @@ mod tests {
         // an absolute or deeper path via `group_id_to_path`.
         assert!(!is_safe_maven_coordinate("/etc", "a", "1.0.0"));
         assert!(!is_safe_maven_coordinate("com/evil", "a", "1.0.0"));
+    }
+
+    // ---- m2_repo_path env tests ----
+
+    /// Save and restore an env var around a test body.
+    struct EnvGuard {
+        key: &'static str,
+        prev: Option<String>,
+    }
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let prev = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self { key, prev }
+        }
+        fn unset(key: &'static str) -> Self {
+            let prev = std::env::var(key).ok();
+            std::env::remove_var(key);
+            Self { key, prev }
+        }
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn m2_repo_path_treats_empty_maven_repo_local_as_unset() {
+        // REGRESSION: `std::env::var` yields `Ok("")` for a set-but-empty
+        // var, so an empty `MAVEN_REPO_LOCAL` (a CI script exporting an
+        // unset variable) returned `PathBuf::from("")`. `is_dir("")` is
+        // false, so global discovery silently found NO repo and every
+        // Maven patch was skipped — while Maven itself would have used the
+        // default local repo. Empty must fall through, exactly as
+        // `nuget_home()` treats an empty `NUGET_PACKAGES`.
+        let m2_home = tempfile::tempdir().unwrap();
+        let _local = EnvGuard::set("MAVEN_REPO_LOCAL", "");
+        let _m2 = EnvGuard::set("M2_HOME", m2_home.path().to_str().unwrap());
+
+        let repo = MavenCrawler::m2_repo_path();
+        assert_eq!(
+            repo,
+            m2_home.path().join("repository"),
+            "empty MAVEN_REPO_LOCAL must fall through to the M2_HOME arm, got {repo:?}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn m2_repo_path_treats_empty_m2_home_as_unset() {
+        // REGRESSION: an empty `M2_HOME` produced `PathBuf::from("")
+        // .join("repository")` == the RELATIVE path `repository`. That
+        // resolves against the process CWD, so the crawler would scan — and
+        // Maven's in-place patcher would write into — a `repository/`
+        // directory inside the user's own project. Same CWD-relative hazard
+        // the `utils::fs::home_dir` and `go_crawler` empty-HOME fixes closed.
+        let _local = EnvGuard::unset("MAVEN_REPO_LOCAL");
+        let _m2 = EnvGuard::set("M2_HOME", "");
+
+        let repo = MavenCrawler::m2_repo_path();
+        assert_ne!(
+            repo,
+            PathBuf::from("repository"),
+            "empty M2_HOME must not yield a CWD-relative repo path"
+        );
+        assert!(
+            repo.ends_with(".m2/repository"),
+            "empty M2_HOME must fall through to the ~/.m2/repository default, got {repo:?}"
+        );
     }
 
     // ---- crawl_all tests ----

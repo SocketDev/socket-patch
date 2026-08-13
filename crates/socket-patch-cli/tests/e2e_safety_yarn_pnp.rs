@@ -21,7 +21,7 @@ mod common;
 
 use common::{
     assert_run_ok, envelope_error_code, envelope_error_message, git_sha256, json_string,
-    parse_json_envelope, run, write_blob, write_minimal_manifest, PatchEntry,
+    parse_json_envelope, run, run_with_env, write_blob, write_minimal_manifest, PatchEntry,
 };
 
 const PURL: &str = "pkg:npm/dummy@1.0.0";
@@ -490,5 +490,330 @@ fn synthetic_manifest_is_discovered_by_cli() {
     assert!(
         found,
         "list should surface our synthetic manifest entry (purl + uuid).\nenvelope: {env}"
+    );
+}
+
+// ── refusal scope ────────────────────────────────────────────────────────────
+//
+// The refusal above is about ONE thing: the packages this run would patch
+// live inside `.yarn/cache/*.zip` instead of the project's `node_modules`.
+// It must therefore only fire for runs that actually crawl `--cwd`'s
+// `node_modules` for an npm patch. The three tests below pin the runs it
+// must NOT hijack — each was exit-1 / `yarn_pnp_unsupported` /
+// nothing-patched before the scope fix — followed by the control proving
+// the refusal itself still fires.
+
+/// Regression: a `--global-prefix` (or `--global`) apply patches a
+/// completely different tree — the global npm prefix — so `--cwd`'s PnP
+/// markers say nothing about what it will touch. The detector ran
+/// unconditionally against `--cwd`, so running global-mode apply from
+/// inside any PnP checkout refused and patched nothing.
+#[test]
+#[ignore = "RED: apply::run calls detect_npm_pkg_manager(&args.common.cwd) \
+            unconditionally, so the yarn_pnp_unsupported refusal is not scoped to \
+            runs that actually touch npm packages. The scoping fix was not part of \
+            this change (see pnp_project_still_refuses_when_an_npm_patch_is_in_scope \
+            for the counter-guard, which stays live)."]
+fn global_prefix_apply_is_not_refused_from_a_pnp_cwd() {
+    let dir = tempfile::tempdir().unwrap();
+    make_yarn_berry_project(dir.path());
+
+    // `.socket/` (manifest + after-blob) lives in the PnP checkout — that's
+    // what `--cwd` resolves — while the package to patch lives in the
+    // "global" tree `--global-prefix` points at.
+    let socket = dir.path().join(".socket");
+    let before_hash = git_sha256(ORIGINAL_BYTES);
+    let after_hash = git_sha256(PATCHED_BYTES);
+    write_minimal_manifest(
+        &socket,
+        PURL,
+        UUID,
+        &[PatchEntry {
+            file_name: "package/index.js",
+            before_hash: &before_hash,
+            after_hash: &after_hash,
+        }],
+    );
+    write_blob(&socket, &after_hash, PATCHED_BYTES);
+
+    let global_root = dir.path().join("global-node-modules");
+    let pkg = global_root.join("dummy");
+    std::fs::create_dir_all(&pkg).expect("create global dummy dir");
+    std::fs::write(
+        pkg.join("package.json"),
+        r#"{"name":"dummy","version":"1.0.0"}"#,
+    )
+    .expect("write global package.json");
+    let index = pkg.join("index.js");
+    std::fs::write(&index, ORIGINAL_BYTES).expect("write global index.js");
+
+    let (code, stdout, stderr) = run(
+        dir.path(),
+        &[
+            "apply",
+            "--json",
+            "--offline",
+            "--global-prefix",
+            global_root.to_str().unwrap(),
+        ],
+    );
+    let env = parse_json_envelope(&stdout);
+    assert_ne!(
+        envelope_error_code(&env),
+        Some("yarn_pnp_unsupported"),
+        "a --global-prefix run never crawls the PnP checkout's node_modules, so the \
+         cwd's layout must not refuse it.\nenvelope: {env}\nstderr:\n{stderr}"
+    );
+    // Non-vacuous: the global copy must actually be patched, so a fix that
+    // merely swallowed the refusal (and then patched nothing) still fails.
+    assert_eq!(
+        code, 0,
+        "global-prefix apply should run to completion.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert_eq!(
+        json_string(&env, "status"),
+        Some("success"),
+        "global-prefix apply should report success.\nenvelope: {env}"
+    );
+    assert_eq!(
+        env.get("summary")
+            .and_then(|s| s.get("applied"))
+            .and_then(|v| v.as_u64()),
+        Some(1),
+        "global-prefix apply should patch exactly the one global package.\nenvelope: {env}"
+    );
+    assert_eq!(
+        std::fs::read(&index).unwrap(),
+        PATCHED_BYTES,
+        "the global tree's copy must carry the patched bytes"
+    );
+}
+
+const PY_PURL: &str = "pkg:pypi/dummypkg@1.0.0";
+const PY_UUID: &str = "22222222-2222-4222-8222-222222222222";
+const PY_ORIGINAL_BYTES: &[u8] = b"def f():\n    return 'before'\n";
+const PY_PATCHED_BYTES: &[u8] = b"def f():\n    return 'after'\n";
+
+/// Synthetic venv `site-packages` path for `cwd` — no real python needed:
+/// the crawler globs `.venv/lib/python3.*/site-packages` (unix) or
+/// `.venv/Lib/site-packages` (Windows).
+fn site_packages_dir(cwd: &Path) -> PathBuf {
+    if cfg!(windows) {
+        cwd.join(".venv").join("Lib").join("site-packages")
+    } else {
+        cwd.join(".venv")
+            .join("lib")
+            .join("python3.11")
+            .join("site-packages")
+    }
+}
+
+/// Stage an installed pypi distribution matching [`PY_PURL`] in a synthetic
+/// venv under `cwd`: the patch target at its ORIGINAL bytes plus the
+/// `.dist-info/METADATA` the crawler resolves name@version from. Returns the
+/// path to the patch target. Pair with a staged after-blob for a fully
+/// offline-appliable pypi patch.
+fn stage_applicable_pypi_package(cwd: &Path) -> PathBuf {
+    let site_packages = site_packages_dir(cwd);
+    std::fs::create_dir_all(site_packages.join("dummypkg")).expect("create dummypkg dir");
+    let py_file = site_packages.join("dummypkg").join("__init__.py");
+    std::fs::write(&py_file, PY_ORIGINAL_BYTES).expect("write __init__.py");
+    let dist_info = site_packages.join("dummypkg-1.0.0.dist-info");
+    std::fs::create_dir_all(&dist_info).expect("create dist-info");
+    std::fs::write(
+        dist_info.join("METADATA"),
+        "Metadata-Version: 2.1\nName: dummypkg\nVersion: 1.0.0\n\nSynthetic fixture.\n",
+    )
+    .expect("write METADATA");
+    py_file
+}
+
+/// One manifest patch record, shaped like `write_minimal_manifest`'s but
+/// composable so a manifest can carry two ecosystems at once.
+fn patch_record(uuid: &str, file: &str, before: &str, after: &str) -> serde_json::Value {
+    let mut files = serde_json::Map::new();
+    files.insert(
+        file.to_string(),
+        serde_json::json!({ "beforeHash": before, "afterHash": after }),
+    );
+    serde_json::json!({
+        "uuid": uuid,
+        "exportedAt": "2026-01-01T00:00:00Z",
+        "files": files,
+        "vulnerabilities": {},
+        "description": "synthetic test patch",
+        "license": "MIT",
+        "tier": "free",
+    })
+}
+
+/// Manifest carrying BOTH the npm patch of [`stage_applicable_package`] and
+/// a pypi patch, i.e. the polyglot repo shape (JS frontend + python
+/// backend). Overwrites the single-patch manifest that helper wrote.
+fn write_polyglot_manifest(socket_dir: &Path, py_before: &str, py_after: &str) {
+    let mut patches = serde_json::Map::new();
+    patches.insert(
+        PURL.to_string(),
+        patch_record(
+            UUID,
+            "package/index.js",
+            &git_sha256(ORIGINAL_BYTES),
+            &git_sha256(PATCHED_BYTES),
+        ),
+    );
+    patches.insert(
+        PY_PURL.to_string(),
+        patch_record(PY_UUID, "dummypkg/__init__.py", py_before, py_after),
+    );
+    std::fs::write(
+        socket_dir.join("manifest.json"),
+        serde_json::to_string_pretty(&serde_json::json!({ "patches": patches })).unwrap(),
+    )
+    .expect("write polyglot manifest.json");
+}
+
+/// Regression: a polyglot repo (yarn-berry PnP frontend + a python venv)
+/// running `apply --ecosystems pypi` never looks at `node_modules` at all,
+/// so the PnP layout is irrelevant — yet the unconditional detector refused
+/// the whole command, leaving the perfectly appliable pypi patch unapplied.
+#[test]
+#[ignore = "RED: same unscoped yarn_pnp_unsupported refusal — a pypi-only apply in \
+            a PnP checkout is refused even though no npm package is involved."]
+fn non_npm_ecosystem_apply_is_not_refused_in_a_pnp_project() {
+    let dir = tempfile::tempdir().unwrap();
+    make_yarn_berry_project(dir.path());
+    // The npm side: installed, patchable, and deliberately OUT of scope —
+    // asserted untouched below so the ecosystems filter stays honest.
+    let index = stage_applicable_package(dir.path());
+
+    let socket = dir.path().join(".socket");
+    let py_before = git_sha256(PY_ORIGINAL_BYTES);
+    let py_after = git_sha256(PY_PATCHED_BYTES);
+    write_polyglot_manifest(&socket, &py_before, &py_after);
+    write_blob(&socket, &py_after, PY_PATCHED_BYTES);
+    let py_file = stage_applicable_pypi_package(dir.path());
+
+    // An ambient VIRTUAL_ENV would send the crawler to the developer's own
+    // venv instead of this fixture's; blank it for the child.
+    let (code, stdout, stderr) = run_with_env(
+        dir.path(),
+        &["apply", "--json", "--offline", "--ecosystems", "pypi"],
+        &[("VIRTUAL_ENV", "")],
+    );
+    let env = parse_json_envelope(&stdout);
+    assert_ne!(
+        envelope_error_code(&env),
+        Some("yarn_pnp_unsupported"),
+        "an --ecosystems pypi run never touches node_modules, so the PnP layout must \
+         not refuse it.\nenvelope: {env}\nstderr:\n{stderr}"
+    );
+    assert_eq!(
+        code, 0,
+        "the pypi patch is fully appliable offline.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert_eq!(
+        env.get("summary")
+            .and_then(|s| s.get("applied"))
+            .and_then(|v| v.as_u64()),
+        Some(1),
+        "exactly the one in-scope pypi patch should apply.\nenvelope: {env}"
+    );
+    assert_eq!(
+        std::fs::read(&py_file).unwrap(),
+        PY_PATCHED_BYTES,
+        "the site-packages file must carry the patched bytes"
+    );
+    // The out-of-scope npm patch must NOT have been applied — otherwise this
+    // test would pass for the wrong reason (npm crawled after all).
+    assert_eq!(
+        std::fs::read(&index).unwrap(),
+        ORIGINAL_BYTES,
+        "the npm patch was filtered out by --ecosystems and must stay unapplied"
+    );
+}
+
+/// The same scope bug without any `--ecosystems` flag — the realistic
+/// shape, since almost nobody passes one: a repo whose manifest carries
+/// only non-npm patches (python backend) but whose frontend is yarn-berry
+/// PnP. No npm patch is in scope, so `node_modules` is never crawled and
+/// the PnP layout is irrelevant; the unconditional detector refused the
+/// whole command anyway.
+#[test]
+#[ignore = "RED: same unscoped yarn_pnp_unsupported refusal — a PnP project whose \
+            manifest holds no npm patches has its other ecosystems' patches \
+            refused too."]
+fn pnp_project_with_no_npm_patches_still_applies_its_other_patches() {
+    let dir = tempfile::tempdir().unwrap();
+    make_yarn_berry_project(dir.path());
+
+    let socket = dir.path().join(".socket");
+    let py_before = git_sha256(PY_ORIGINAL_BYTES);
+    let py_after = git_sha256(PY_PATCHED_BYTES);
+    // pypi ONLY — no npm patch anywhere in the manifest.
+    write_minimal_manifest(
+        &socket,
+        PY_PURL,
+        PY_UUID,
+        &[PatchEntry {
+            file_name: "dummypkg/__init__.py",
+            before_hash: &py_before,
+            after_hash: &py_after,
+        }],
+    );
+    write_blob(&socket, &py_after, PY_PATCHED_BYTES);
+    let py_file = stage_applicable_pypi_package(dir.path());
+
+    let (code, stdout, stderr) = run_with_env(
+        dir.path(),
+        &["apply", "--json", "--offline"],
+        &[("VIRTUAL_ENV", "")],
+    );
+    let env = parse_json_envelope(&stdout);
+    assert_ne!(
+        envelope_error_code(&env),
+        Some("yarn_pnp_unsupported"),
+        "with no npm patch in the manifest the PnP layout is irrelevant and must not \
+         refuse the run.\nenvelope: {env}\nstderr:\n{stderr}"
+    );
+    assert_eq!(
+        code, 0,
+        "the pypi patch is fully appliable offline.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert_eq!(
+        std::fs::read(&py_file).unwrap(),
+        PY_PATCHED_BYTES,
+        "the site-packages file must carry the patched bytes"
+    );
+}
+
+/// Control for the two tests above: an in-scope npm patch in the SAME
+/// polyglot manifest still refuses. Without this, scoping the detector down
+/// to nothing at all would leave every positive test in this file passing
+/// only because they happen to use npm-only manifests.
+#[test]
+fn pnp_project_still_refuses_when_an_npm_patch_is_in_scope() {
+    let dir = tempfile::tempdir().unwrap();
+    make_yarn_berry_project(dir.path());
+    let index = stage_applicable_package(dir.path());
+    let py_before = git_sha256(PY_ORIGINAL_BYTES);
+    let py_after = git_sha256(PY_PATCHED_BYTES);
+    write_polyglot_manifest(&dir.path().join(".socket"), &py_before, &py_after);
+
+    let (code, stdout, stderr) = run(dir.path(), &["apply", "--json"]);
+    assert_eq!(
+        code, 1,
+        "an in-scope npm patch in a PnP checkout must still refuse.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let env = parse_json_envelope(&stdout);
+    assert_eq!(
+        envelope_error_code(&env),
+        Some("yarn_pnp_unsupported"),
+        "the refusal must still fire for the npm patch.\nenvelope: {env}"
+    );
+    assert_no_work_done(&env);
+    assert_eq!(
+        std::fs::read(&index).unwrap(),
+        ORIGINAL_BYTES,
+        "the refusal must still be a pre-apply bail"
     );
 }

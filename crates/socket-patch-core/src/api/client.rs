@@ -4,6 +4,11 @@ use reqwest::header::{self, HeaderMap, HeaderValue};
 use reqwest::StatusCode;
 use serde::Serialize;
 
+// Severity order for sorting (most severe = lowest number). This file used
+// to carry its own copy of the ladder, which is how three slightly
+// different ones came to exist; there is now exactly one, in `api::ranking`.
+use crate::api::ranking::severity_order as get_severity_order;
+use crate::api::ranking::{cmp_batch_infos, cmp_search_results};
 use crate::api::types::*;
 use crate::constants::USER_AGENT as USER_AGENT_VALUE;
 use crate::utils::env_compat::{is_debug_enabled, proxy_url_from_env};
@@ -13,18 +18,6 @@ use crate::utils::socket_cli_config;
 fn debug_log(message: &str) {
     if is_debug_enabled() {
         eprintln!("[socket-patch debug] {}", message);
-    }
-}
-
-/// Severity order for sorting (most severe = lowest number).
-fn get_severity_order(severity: Option<&str>) -> u8 {
-    match severity.map(|s| s.to_lowercase()).as_deref() {
-        Some("critical") => 0,
-        Some("high") => 1,
-        // GHSA emits `moderate` for the medium tier.
-        Some("medium") | Some("moderate") => 2,
-        Some("low") => 3,
-        _ => 4,
     }
 }
 
@@ -226,11 +219,15 @@ impl ApiClient {
             let slug = org_slug.or(self.org_slug.as_deref()).unwrap_or("default");
             format!("/v0/orgs/{slug}/patches/{route}/{encoded}")
         };
-        let result = self.get_json::<SearchResponse>(&path).await?;
-        Ok(result.unwrap_or_else(|| SearchResponse {
-            patches: Vec::new(),
-            can_access_paid_patches: false,
-        }))
+        let mut result = self
+            .get_json::<SearchResponse>(&path)
+            .await?
+            .unwrap_or_else(|| SearchResponse {
+                patches: Vec::new(),
+                can_access_paid_patches: false,
+            });
+        result.patches.sort_by(cmp_search_results);
+        Ok(result)
     }
 
     /// Search patches by CVE ID.
@@ -275,6 +272,9 @@ impl ApiClient {
     /// when the deployed proxy predates the batch endpoint.
     ///
     /// Maximum 500 PURLs per request.
+    ///
+    /// Every return path is normalized through [`sort_batch_response`], so
+    /// callers may rely on each package's `patches` being best-first.
     pub async fn search_patches_batch(
         &self,
         org_slug: Option<&str>,
@@ -287,23 +287,27 @@ impl ApiClient {
             let result = self
                 .post_json::<BatchSearchResponse, _>(&path, &body)
                 .await?;
-            return Ok(result.unwrap_or_else(|| BatchSearchResponse {
+            let mut result = result.unwrap_or_else(|| BatchSearchResponse {
                 packages: Vec::new(),
                 can_access_paid_patches: false,
-            }));
+            });
+            sort_batch_response(&mut result);
+            return Ok(result);
         }
 
         // Public proxy: prefer the POST /patch/batch endpoint; degrade to
         // individual per-package GET requests when the deployed proxy
         // predates it or when batch validation rejects the chunk (see
         // `proxy_batch_post` for the decision table).
-        match self.proxy_batch_post(purls).await? {
-            Some(response) => Ok(response),
+        let mut response = match self.proxy_batch_post(purls).await? {
+            Some(response) => response,
             None => {
                 self.search_patches_batch_via_individual_queries(purls)
-                    .await
+                    .await?
             }
-        }
+        };
+        sort_batch_response(&mut response);
+        Ok(response)
     }
 
     /// Resolve hosted-patch references for a set of published-patch UUIDs
@@ -877,12 +881,8 @@ impl ApiClient {
                 )));
             }
         }
-        match crate::utils::http::read_capped(
-            resp,
-            MAX_VENDOR_PACKAGE_BYTES,
-            "vendor package",
-        )
-        .await
+        match crate::utils::http::read_capped(resp, MAX_VENDOR_PACKAGE_BYTES, "vendor package")
+            .await
         {
             Ok(bytes) => ServeDownload::Ok(bytes),
             Err(e) => ServeDownload::Failed(ApiError::Network(e)),
@@ -1476,7 +1476,26 @@ fn convert_search_result_to_batch_info(patch: PatchSearchResult) -> BatchPatchIn
         ghsa_ids,
         severity: highest_severity,
         title,
+        // Carry the timestamp through. The batch shape does not require it,
+        // but dropping it here would cost this path the recency tiebreak in
+        // `ranking` — and it is the one path where we definitely have it.
+        published_at: Some(patch.published_at),
     }
+}
+
+/// Put every package's patch list into canonical best-first order, and the
+/// packages themselves into PURL order.
+///
+/// Applied to every [`BatchSearchResponse`] the client returns, so server
+/// ordering — or, on the fallback path, `JoinSet` completion order — never
+/// reaches a caller. `scan` renders `packages[].patches` straight to the
+/// operator and treats the leading entry as the patch apply will install;
+/// both only hold because of this.
+fn sort_batch_response(response: &mut BatchSearchResponse) {
+    for pkg in &mut response.packages {
+        pkg.patches.sort_by(cmp_batch_infos);
+    }
+    response.packages.sort_by(|a, b| a.purl.cmp(&b.purl));
 }
 
 /// Assemble a [`BatchSearchResponse`] from the per-PURL [`SearchResponse`]s

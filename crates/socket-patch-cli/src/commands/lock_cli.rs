@@ -160,8 +160,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let _first =
             acquire_or_emit(dir.path(), Command::Apply, false, false, Duration::ZERO).unwrap();
-        let code = acquire_or_emit(dir.path(), Command::Apply, false, false, Duration::ZERO)
-            .unwrap_err();
+        let code =
+            acquire_or_emit(dir.path(), Command::Apply, false, false, Duration::ZERO).unwrap_err();
         assert_eq!(code, 1);
     }
 

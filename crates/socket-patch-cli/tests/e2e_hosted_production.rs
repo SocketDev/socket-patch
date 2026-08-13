@@ -82,6 +82,9 @@ use std::process::{Command, Output};
 
 use socket_patch_cli::args::{GLOBAL_ARG_ENV_VARS, LOCAL_ARG_ENV_VARS};
 
+#[path = "common/cache_env.rs"]
+mod cache_env;
+
 // ---------------------------------------------------------------------------
 // Production endpoints + required-patch catalog
 // ---------------------------------------------------------------------------
@@ -215,13 +218,17 @@ fn has_command(cmd: &str) -> bool {
     } else {
         &["--version"]
     };
-    Command::new(cmd)
+    let mut probe_cmd = Command::new(cmd);
+    probe_cmd
         .args(probe)
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+        .stderr(std::process::Stdio::null());
+    // Where pnpm/yarn are corepack shims, this probe is what actually
+    // downloads the package manager — keep that out of the real
+    // COREPACK_HOME, and let the probe answer for the same environment
+    // the leg's `tool()` invocations run in.
+    cache_env::isolate(&mut probe_cmd);
+    probe_cmd.status().map(|s| s.success()).unwrap_or(false)
 }
 
 /// The three legacy `SOCKET_PATCH_*` names still honored at runtime via
@@ -358,6 +365,10 @@ fn redirected_count(env: &serde_json::Value) -> u64 {
 fn tool(cwd: &Path, program: &str, args: &[&str], env: &[(&str, &str)]) -> Output {
     let mut cmd = Command::new(program);
     cmd.args(args).current_dir(cwd);
+    // Sandbox everything the per-leg `env` below does not name — corepack's
+    // downloaded package managers most of all — so a run leaves the caller's
+    // home alone.
+    cache_env::isolate(&mut cmd);
     // Keep every toolchain's cache inside the fixture so the reinstall leg
     // starts genuinely cold and cannot be satisfied from a warm host cache
     // holding the *pristine* artifact.
@@ -480,6 +491,108 @@ async fn published_uuids(purl: &str) -> Result<Vec<String>, String> {
         .unwrap_or_default())
 }
 
+/// `GET /patch/by-package/<purl>` returning, per patch, the `(uuid,
+/// advisory_count)` pair that drives merge-state inference.
+async fn published_patch_advisory_counts(purl: &str) -> Result<Vec<(String, usize)>, String> {
+    let url = format!("{PROXY}/patch/by-package/{}", urlencode(purl));
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .header("Accept", "application/json")
+        .send()
+        .await
+        .map_err(|e| format!("GET {url}: {e}"))?;
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| format!("GET {url}: reading body: {e}"))?;
+    let v: serde_json::Value =
+        serde_json::from_str(&body).map_err(|e| format!("GET {url}: bad JSON ({e}):\n{body}"))?;
+    Ok(v["patches"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|p| {
+                    Some((
+                        p["uuid"].as_str()?.to_string(),
+                        p["vulnerabilities"].as_object()?.len(),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+/// `GET /patch/by-package/<purl>` returning `(uuid, publishedAt)` pairs.
+/// Sibling of [`published_uuids`] for tests that care about patch metadata
+/// rather than just which UUIDs exist.
+async fn published_patch_dates(purl: &str) -> Result<Vec<(String, String)>, String> {
+    let url = format!("{PROXY}/patch/by-package/{}", urlencode(purl));
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .header("Accept", "application/json")
+        .send()
+        .await
+        .map_err(|e| format!("GET {url}: {e}"))?;
+    let status = resp.status();
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| format!("GET {url}: reading body: {e}"))?;
+    if !status.is_success() {
+        return Err(format!("GET {url}: HTTP {status}\n{body}"));
+    }
+    let v: serde_json::Value =
+        serde_json::from_str(&body).map_err(|e| format!("GET {url}: bad JSON ({e}):\n{body}"))?;
+    Ok(v["patches"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|p| {
+                    Some((
+                        p["uuid"].as_str()?.to_string(),
+                        p["publishedAt"].as_str()?.to_string(),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+/// The Socket patch-registry base URL the gem rewriter pinned into `Gemfile`
+/// as `source "<base>" do`, or `None` when no Socket source block is present.
+///
+/// Read back out of the rewritten file rather than rebuilt from constants on
+/// purpose: the probe must interrogate the *exact* registry bundler was told
+/// to use, so a rewriter that emits the wrong base cannot be papered over by a
+/// probe that guesses the right one.
+fn gem_registry_base(gemfile: &str) -> Option<String> {
+    const OPEN: &str = "source \"";
+    let marker = format!("{OPEN}https://{PATCH_HOST}/patch-registry/gem/");
+    let at = gemfile.find(&marker)?;
+    let rest = &gemfile[at + OPEN.len()..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+/// `GET <url>` → `(status, body_len)`, or `Err` on a transport failure.
+///
+/// Sends a bundler-shaped `User-Agent` so the probe observes whatever a real
+/// `bundle install` would be served.
+async fn http_probe(url: &str) -> Result<(u16, usize), String> {
+    let resp = reqwest::Client::new()
+        .get(url)
+        .header("User-Agent", "bundler/2.6.9 rubygems/3.6.9")
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    let status = resp.status().as_u16();
+    let body = resp
+        .bytes()
+        .await
+        .map_err(|e| format!("reading body: {e}"))?;
+    Ok((status, body.len()))
+}
+
 /// Percent-encode a PURL for use as a single path segment. `reqwest` will not
 /// do this for us — a raw `pkg:npm/...` would be split into path segments and
 /// 404.
@@ -543,6 +656,163 @@ async fn preflight_required_patches_are_published() {
         "required production patches are no longer available:\n  - {}",
         failures.join("\n  - ")
     );
+}
+
+/// Canary: production must keep naming advisories, because merge state is
+/// **inferred** from the advisory count rather than read off a flag.
+///
+/// `api::ranking` ranks a patch that remediates several advisories above one
+/// that remediates a single advisory. The whole signal is the size of the
+/// `vulnerabilities` map. If production ever stopped populating it — shipping
+/// patches with an empty map, or moving advisory ids somewhere else — every
+/// patch would collapse to coverage 0, the merge rung would go permanently
+/// inert, and selection would silently fall through to recency with no error
+/// anywhere.
+///
+/// This asserts only that the signal EXISTS (every patch names >= 1
+/// advisory), never how many. Production publishes no merged patches today —
+/// all patches sampled cover exactly one advisory — and the day that changes
+/// is not a regression, so a count of >= 2 must not fail this test.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "live production API: contacts patches-api.socket.dev. Run with --ignored."]
+async fn canary_patches_name_advisories_so_merge_state_is_inferable() {
+    let mut failures: Vec<String> = Vec::new();
+    let mut coverage_seen: Vec<(String, String, usize)> = Vec::new();
+
+    for purl in [NPM_PURL, PYPI_PURL, CARGO_PURL, GEM_PURL] {
+        match published_patch_advisory_counts(purl).await {
+            Err(e) => failures.push(format!("{purl}: production probe failed: {e}")),
+            Ok(patches) if patches.is_empty() => {
+                failures.push(format!("{purl}: production publishes no patches"))
+            }
+            Ok(patches) => {
+                for (uuid, count) in patches {
+                    if count == 0 {
+                        failures.push(format!(
+                            "{purl}: patch {uuid} names ZERO advisories — merge-state \
+                             inference has no signal to work with, so the merge rung in \
+                             api::ranking is dead for this patch"
+                        ));
+                    }
+                    coverage_seen.push((purl.to_string(), uuid, count));
+                }
+            }
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "merge-state inference signal is missing from production:\n  - {}",
+        failures.join("\n  - ")
+    );
+
+    // Informational: surfaces the day production starts publishing merged
+    // patches, without failing when it does.
+    let merged: Vec<_> = coverage_seen.iter().filter(|(_, _, c)| *c >= 2).collect();
+    if merged.is_empty() {
+        eprintln!(
+            "[info] production publishes no merged patches yet ({} patches, all single-advisory)",
+            coverage_seen.len()
+        );
+    } else {
+        eprintln!("[info] production now publishes merged patches: {merged:?}");
+    }
+}
+
+/// Canary: production's `publishedAt` must stay a **per-patch** date.
+///
+/// Patch selection ranks by recency (`socket_patch_core::api::ranking`), and
+/// that rung is only meaningful if `publishedAt` describes the patch rather
+/// than the upstream package release. If the server ever started emitting the
+/// package's release date, every patch for a given PURL would collapse to one
+/// value, recency would silently stop discriminating, and selection would
+/// quietly fall through to the UUID tiebreak — a wrong answer with no error
+/// anywhere. Nothing else in the suite would catch that.
+///
+/// `PYPI_PURL` is the probe because production publishes three patches for
+/// it (see [`PYPI_UUIDS`]). Two assertions:
+///
+///  1. the dates are not all identical — impossible for a package-level date;
+///  2. no patch date equals the package's own upload time on PyPI.
+///
+/// (2) is skipped, with a note, if pypi.org is unreachable — a PyPI outage is
+/// not a socket-patch regression. (1) is unconditional.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "live production API: contacts patches-api.socket.dev + pypi.org. Run with --ignored."]
+async fn canary_published_at_is_a_patch_date_not_a_package_date() {
+    let patches = published_patch_dates(PYPI_PURL)
+        .await
+        .unwrap_or_else(|e| panic!("production probe failed for {PYPI_PURL}: {e}"));
+
+    assert!(
+        patches.len() >= 2,
+        "{PYPI_PURL} must publish >=2 patches for this canary to have teeth; \
+         production returned {}. Re-pick a multi-patch PURL and update this test.",
+        patches.len()
+    );
+
+    let distinct: std::collections::HashSet<&str> =
+        patches.iter().map(|(_, d)| d.as_str()).collect();
+    assert!(
+        distinct.len() > 1,
+        "all {} patches for {PYPI_PURL} share one publishedAt ({:?}). That is the \
+         signature of a PACKAGE-level date: recency ranking has stopped \
+         discriminating and selection is falling through to the UUID tiebreak.\n\
+         patches: {patches:#?}",
+        patches.len(),
+        distinct
+    );
+
+    // (2) Cross-check against the real upstream release date.
+    let pypi_url = format!("https://pypi.org/pypi/{PYPI_NAME}/json");
+    let Ok(resp) = reqwest::Client::new().get(&pypi_url).send().await else {
+        eprintln!("[skip] pypi.org unreachable; distinct-dates assertion still enforced");
+        return;
+    };
+    let Ok(body) = resp.text().await else {
+        eprintln!("[skip] pypi.org body unreadable; distinct-dates assertion still enforced");
+        return;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) else {
+        eprintln!("[skip] pypi.org returned non-JSON; distinct-dates assertion still enforced");
+        return;
+    };
+    let uploads: Vec<String> = v["releases"][PYPI_VERSION]
+        .as_array()
+        .map(|files| {
+            files
+                .iter()
+                .filter_map(|f| f["upload_time_iso_8601"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    if uploads.is_empty() {
+        eprintln!("[skip] pypi.org listed no upload times for {PYPI_NAME} {PYPI_VERSION}");
+        return;
+    }
+    // PyPI stamps ISO-8601; the patch API stamps RFC 2822. They cannot be
+    // compared as strings, so compare the calendar DATE via the same parser
+    // the ranking uses.
+    use socket_patch_core::api::date::parse_timestamp_secs;
+    let upload_days: std::collections::HashSet<u64> = uploads
+        .iter()
+        .filter_map(|u| parse_timestamp_secs(u))
+        .map(|s| s / 86_400)
+        .collect();
+    for (uuid, published) in &patches {
+        let Some(secs) = parse_timestamp_secs(published) else {
+            panic!(
+                "production publishedAt {published:?} (patch {uuid}) does not parse — \
+                    api::date must handle every format the API emits"
+            );
+        };
+        assert!(
+            !upload_days.contains(&(secs / 86_400)),
+            "patch {uuid} reports publishedAt {published:?}, which falls on the same day \
+             {PYPI_NAME} {PYPI_VERSION} was uploaded to PyPI ({uploads:?}). That strongly \
+             suggests the field switched to the PACKAGE release date."
+        );
+    }
 }
 
 // ===========================================================================
@@ -1288,9 +1558,41 @@ fn cargo_hosted_install_proof() {
 /// leg reports loudly but does not fail the suite; set
 /// `SOCKET_PATCH_HOSTED_E2E_GEM_STRICT=1` to promote it to a hard failure
 /// (do that as the regression guard once the server is fixed).
-#[test]
+///
+/// # Why the tolerance probes the server instead of matching the error text
+///
+/// This leg used to accept the install failure by string-matching bundler's
+/// message. That couples a CI check to one particular *symptom* of the server
+/// bug, and the symptom is a function of which fetcher bundler lands on —
+/// which the server keeps changing. Bundler selects one via
+/// `available_fetchers.drop_while {|f| !f.available? }` over `[CompactIndex,
+/// Dependency, Index]`, so:
+///
+/// | server state | `/versions` | `/api/v1/dependencies` | bundler raises |
+/// |---|---|---|---|
+/// | originally | 200, empty dep segment | — | `Bundler::APIResponseMismatchError` |
+/// | after depscan#23630 | 404 `not_built` | **200, zero-byte body** | `ArgumentError: marshal data too short` (classic Marshal) / `NoMethodError: undefined method 'bytes' for nil` (SafeMarshal, ruby 3.4+) |
+/// | after the empty-body fix | 404 `not_built` | 404 | `Could not fetch specs from …` |
+///
+/// Three different strings for one unchanged server condition. A whitelist of
+/// them goes stale on every server deploy and reds the check for a reason that
+/// has nothing to do with socket-patch.
+///
+/// So the tolerance is decided by the **condition**, not the symptom: probe
+/// the pinned registry's `/versions` — the URL bundler was actually given,
+/// read back out of the rewritten `Gemfile`.
+///
+/// * non-2xx → the documented server defect. The install failure is expected;
+///   report loudly and pass (unless `SOCKET_PATCH_HOSTED_E2E_GEM_STRICT=1`).
+/// * 2xx → the compact index is **built**, so hosted gem mode MUST work. An
+///   install failure is then a real regression and fails the suite.
+///
+/// That is symptom-independent, and it **auto-retires itself**: the moment the
+/// server is healthy the 2xx branch starts enforcing a real success assertion,
+/// with no stale whitelist and no `NOTE` asking a human to clean up.
+#[tokio::test(flavor = "multi_thread")]
 #[ignore = "live production API + real rubygems.org. Run with --ignored."]
-fn gem_bundler_hosted_redirect_and_known_install_defect() {
+async fn gem_bundler_hosted_redirect_and_known_install_defect() {
     const LEG: &str = "gem_bundler_hosted_redirect_and_known_install_defect";
     if !has_command("ruby") || !has_command("bundle") {
         soft_skip!(LEG, "`ruby` and/or `bundle` not on PATH");
@@ -1359,25 +1661,68 @@ fn gem_bundler_hosted_redirect_and_known_install_defect() {
         return;
     }
     let detail = dump(&reinstall);
-    let is_known_defect = detail.contains("APIResponseMismatchError")
-        || detail.contains("revealed dependencies not in the API");
+
+    // Ask the SERVER what state it is in, rather than guessing from bundler's
+    // error text (see the doc comment above for why the text is untrustworthy).
+    // The base is read back out of the rewritten Gemfile, so this probes the
+    // exact registry bundler was pointed at.
+    let index_base = gem_registry_base(&gemfile).unwrap_or_else(|| {
+        panic!(
+            "{LEG}: could not read the Socket registry base back out of the \
+             rewritten Gemfile, so the install failure cannot be attributed. \
+             The redirect assertions above passed, so the `source \"…\" do` \
+             block shape must have changed:\n{gemfile}"
+        )
+    });
+    let versions_url = format!("{}/versions", index_base.trim_end_matches('/'));
+    let probe = http_probe(&versions_url).await;
+    let probe_note = match &probe {
+        Ok((status, len)) => {
+            format!("GET {versions_url} -> HTTP {status}, {len}-byte body")
+        }
+        Err(e) => format!("GET {versions_url} -> transport error: {e}"),
+    };
+
+    // Strict mode promotes ANY install failure to a hard failure, whatever the
+    // server state — that is its whole purpose as the regression guard.
     assert!(
         !gem_strict,
         "{LEG}: SOCKET_PATCH_HOSTED_E2E_GEM_STRICT=1 and `bundle install` from \
-         the redirected Gemfile failed:\n{detail}"
+         the redirected Gemfile failed.\n  registry probe: {probe_note}\n{detail}"
     );
-    assert!(
-        is_known_defect,
-        "{LEG}: `bundle install` from the redirected Gemfile failed for an \
-         UNEXPECTED reason (not the known compact-index dependency defect). \
-         This is a new regression:\n{detail}"
-    );
+
+    // A 2xx `/versions` means the compact index is BUILT and bundler was
+    // served a usable index. The documented server defect therefore does NOT
+    // apply, and tolerating the failure here would hide a real regression.
+    if let Ok((status, _)) = probe {
+        assert!(
+            !(200..300).contains(&status),
+            "{LEG}: `bundle install` from the redirected Gemfile FAILED even \
+             though the pinned registry's compact index is SERVING.\n  \
+             registry probe: {probe_note}\n\
+             A 2xx /versions means `package_gem_index_deps` is populated and \
+             the index is built, so this is NOT the known server defect \
+             (which 404s that route) — it is a real regression in hosted gem \
+             mode. The redirect assertions above all passed, so the rewrite \
+             itself is fine and the failure is in the install leg.\n{detail}"
+        );
+    }
+
+    // Non-2xx (or an unreachable registry): the documented server defect.
+    // A transport error is tolerated rather than failed because a network
+    // blip is the most likely explanation for BOTH the probe and the install
+    // failing, and a required check must not go red for one.
     println!(
-        "KNOWN PRODUCTION DEFECT {LEG}: the Socket gem patch-registry compact \
-         index omits runtime dependencies, so bundler refuses the download \
-         (APIResponseMismatchError). Hosted gem mode is unusable for gems with \
-         dependencies until the server emits them. Redirect assertions above \
-         all passed."
+        "KNOWN PRODUCTION DEFECT {LEG}: the Socket gem patch-registry's \
+         compact index is not being served for this patch, so `bundle \
+         install` from the redirected Gemfile cannot succeed.\n  registry \
+         probe: {probe_note}\n\
+         Since depscan#23630 the compact-index routes fail closed with 404 \
+         `not_built` until the requeued rebuild populates \
+         `package_gem_index_deps`. Hosted gem mode stays unusable for gems \
+         with dependencies until that completes. Redirect assertions above \
+         all passed; this leg will start asserting a real successful install \
+         automatically once /versions returns 2xx."
     );
 }
 

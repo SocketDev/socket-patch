@@ -20,7 +20,7 @@ use clap::Args;
 use socket_patch_core::crawlers::Ecosystem;
 use socket_patch_core::manifest::operations::read_manifest;
 use socket_patch_core::manifest::schema::PatchManifest;
-use socket_patch_core::utils::telemetry::{track_vex_failed, track_vex_generated};
+use socket_patch_core::telemetry::{track_vex_failed, track_vex_generated};
 use socket_patch_core::vex::{
     build_document, detect_product, BuildOptions, Document, FailedPatch, VendorContext,
     VerifyOutcome,
@@ -314,14 +314,14 @@ async fn generate_vex(
         // not whether this run hashed it. The committed ledger is as
         // trustworthy as the manifest beside it, and reading it hashes
         // nothing. An unreadable ledger degrades to "nothing vendored".
-        let entries = socket_patch_core::patch::vendor::load_state(&common.cwd)
+        let entries = socket_patch_core::vendor::load_state(&common.cwd)
             .await
             .map(|state| state.entries)
             .unwrap_or_default();
         let vendored = manifest
             .patches
             .keys()
-            .filter(|purl| socket_patch_core::patch::vendor::lookup_entry(&entries, purl).is_some())
+            .filter(|purl| socket_patch_core::vendor::lookup_entry(&entries, purl).is_some())
             .cloned()
             .collect();
         VerifyOutcome {
@@ -414,9 +414,13 @@ async fn generate_vex(
     // Build the document.
     let opts = BuildOptions {
         product_id,
+        // Same "empty means unset" rule as the product override above: the
+        // document `@id` is a required field with no `skip_serializing_if`,
+        // so `--doc-id "$UNSET_VAR"` emitted a literal `"@id": ""`.
         doc_id: params
             .doc_id
             .clone()
+            .filter(|d| !d.trim().is_empty())
             .unwrap_or_else(|| format!("urn:uuid:{}", uuid::Uuid::new_v4())),
         author: "Socket".to_string(),
         tooling: Some(format!("socket-patch {}", env!("CARGO_PKG_VERSION"))),
@@ -431,12 +435,8 @@ async fn generate_vex(
     ) {
         Some(doc) => doc,
         None => {
-            track_vex_failed(
-                "no_applicable_patches",
-                common.api_token.as_deref(),
-                common.org.as_deref(),
-            )
-            .await;
+            let (token, org) = crate::commands::list::telemetry_credentials(common);
+            track_vex_failed("no_applicable_patches", token.as_deref(), org.as_deref()).await;
             return Err(VexGenError {
                 code: "no_applicable_patches",
                 message: "No applied patches with vulnerability metadata to attest.".to_string(),
@@ -469,12 +469,13 @@ async fn generate_vex(
         }
     };
 
+    let (token, org) = crate::commands::list::telemetry_credentials(common);
     track_vex_generated(
         doc.statements.len(),
         "openvex-0.2.0",
         if wrote_to_file { "file" } else { "stdout" },
-        common.api_token.as_deref(),
-        common.org.as_deref(),
+        token.as_deref(),
+        org.as_deref(),
     )
     .await;
 
@@ -533,7 +534,7 @@ pub(crate) async fn generate_vex_from_manifest_path(
 /// still fails closed per-entry downstream, and `load_vendor_context`
 /// already warns about the unreadable state.
 async fn augment_with_detached(common: &GlobalArgs, mut manifest: PatchManifest) -> PatchManifest {
-    if let Ok(state) = socket_patch_core::patch::vendor::load_state(&common.cwd).await {
+    if let Ok(state) = socket_patch_core::vendor::load_state(&common.cwd).await {
         for (key, entry) in state.entries {
             if !entry.detached {
                 continue;
@@ -570,8 +571,12 @@ async fn augment_with_redirect(
 
 /// Fire `vex_failed` telemetry and build the matching [`VexGenError`].
 /// Centralizes the "track then return error" pattern in [`generate_vex`].
+/// Attribution goes through the same layered credential chain as
+/// `list`/`setup` (flag / env / socket-cli `config.json`), not the raw
+/// flags — a `socket login`-only user must not report anonymously.
 async fn fail(common: &GlobalArgs, code: &'static str, message: String) -> VexGenError {
-    track_vex_failed(code, common.api_token.as_deref(), common.org.as_deref()).await;
+    let (token, org) = crate::commands::list::telemetry_credentials(common);
+    track_vex_failed(code, token.as_deref(), org.as_deref()).await;
     VexGenError {
         code,
         message,
@@ -582,7 +587,14 @@ async fn fail(common: &GlobalArgs, code: &'static str, message: String) -> VexGe
 /// Pick the product PURL from an explicit override or by filesystem
 /// auto-detect.
 async fn resolve_product_id(common: &GlobalArgs, product: Option<&str>) -> Result<String, String> {
-    if let Some(p) = product {
+    // An empty (or whitespace-only) override means "unset" — the semantics
+    // `scrub_empty_env_vars` already gives the `SOCKET_VEX_PRODUCT=` twin and
+    // `api_client_overrides` gives `--api-url ""`. Without the filter,
+    // `--product "$UNSET_VAR"` sailed through to `BuildOptions::product_id`,
+    // and `Product::id` is `skip_serializing_if = "String::is_empty"` — so the
+    // run wrote a spec-invalid document whose statements claim `not_affected`
+    // about a product carrying NO identifier at all, and exited 0.
+    if let Some(p) = product.filter(|p| !p.trim().is_empty()) {
         return Ok(p.to_string());
     }
     let detect = detect_product(&common.cwd).await;
@@ -622,7 +634,7 @@ pub(crate) async fn load_vendor_context(
     common: &GlobalArgs,
     manifest: &PatchManifest,
 ) -> Option<VendorContext> {
-    let entries = match socket_patch_core::patch::vendor::load_state(&common.cwd).await {
+    let entries = match socket_patch_core::vendor::load_state(&common.cwd).await {
         Ok(state) => state.entries,
         Err(e) => {
             if !common.silent {
@@ -654,13 +666,15 @@ pub(crate) async fn load_vendor_context(
 async fn synthesize_go_patches(
     common: &GlobalArgs,
     manifest: &PatchManifest,
-    entries: &HashMap<String, socket_patch_core::patch::vendor::VendorEntry>,
+    entries: &HashMap<String, socket_patch_core::vendor::VendorEntry>,
 ) -> HashMap<String, PathBuf> {
-    use socket_patch_core::patch::go_mod_edit::{
+    use socket_patch_core::patch::redirect::golang_local::{
+        are_safe_redirect_coords, copy_dir_for,
+    };
+    use socket_patch_core::utils::purl::build_golang_purl;
+    use socket_patch_core::vendor::go_mod_edit::{
         read_replace_entries, ReplaceOwner, GO_PATCHES_DIR,
     };
-    use socket_patch_core::patch::go_redirect::{are_safe_redirect_coords, copy_dir_for};
-    use socket_patch_core::utils::purl::build_golang_purl;
 
     let mut go_patches = HashMap::new();
     for entry in read_replace_entries(&common.cwd).await {
@@ -676,7 +690,7 @@ async fn synthesize_go_patches(
         }
         // Explicit vendor entries take precedence over the synthesis
         // (vendor may have taken over an apply redirect).
-        if socket_patch_core::patch::vendor::lookup_entry(entries, &purl).is_some() {
+        if socket_patch_core::vendor::lookup_entry(entries, &purl).is_some() {
             continue;
         }
         // SECURITY: module/version come from a committed (tamper-able)
@@ -802,7 +816,7 @@ mod tests {
     /// an out-of-tree path into the go-patches verification map.
     #[test]
     fn go_redirect_coord_guard_matches_core_rules() {
-        use socket_patch_core::patch::go_redirect::are_safe_redirect_coords;
+        use socket_patch_core::patch::redirect::golang_local::are_safe_redirect_coords;
 
         assert!(are_safe_redirect_coords("github.com/foo/bar", "v1.4.2"));
         assert!(are_safe_redirect_coords("gopkg.in/inf.v0", "v0.9.1"));

@@ -382,6 +382,152 @@ fn remove_blob_sweep_does_not_inflate_removed_count() {
 }
 
 // ---------------------------------------------------------------------------
+// Vendored patches: the wiring must never outlive the manifest entry
+// ---------------------------------------------------------------------------
+
+const VENDORED_PURL: &str = "pkg:npm/__remove_vendored__@1.0.0";
+/// The manifest's current patch generation.
+const MANIFEST_UUID: &str = "55555555-5555-4555-8555-555555555555";
+/// The generation that was actually vendored — one behind the manifest.
+/// This is the documented `vendor_uuid_mismatch` state: `get` / `scan
+/// --apply` refreshed the manifest record while the re-vendor is still
+/// pending (repair reports it and declines to cross patch generations).
+const LEDGER_UUID: &str = "66666666-6666-4666-8666-666666666666";
+
+/// Manifest with a single vendored npm patch. `files: {}` keeps the run
+/// offline — the internal rollback needs no before-blobs.
+fn write_vendored_manifest(root: &Path, patch_uuid: &str) -> PathBuf {
+    let socket = root.join(".socket");
+    std::fs::create_dir_all(&socket).expect("create .socket");
+    let manifest = format!(
+        r#"{{
+  "patches": {{
+    "{VENDORED_PURL}": {{
+      "uuid": "{patch_uuid}",
+      "exportedAt": "2024-01-01T00:00:00Z",
+      "files": {{}},
+      "vulnerabilities": {{}},
+      "description": "synthetic vendored remove test patch",
+      "license": "MIT",
+      "tier": "free"
+    }}
+  }}
+}}"#
+    );
+    std::fs::write(socket.join("manifest.json"), manifest).expect("write manifest");
+    socket
+}
+
+/// Vendor ledger with one npm entry for [`VENDORED_PURL`] at `ledger_uuid`
+/// (empty wiring, so the revert is a pure offline artifact-dir delete),
+/// plus the artifact dir it names.
+fn write_vendored_ledger(root: &Path, ledger_uuid: &str) -> PathBuf {
+    let vendor = root.join(".socket/vendor");
+    let artifact_dir = vendor.join("npm").join(ledger_uuid);
+    std::fs::create_dir_all(&artifact_dir).expect("create artifact dir");
+    std::fs::write(artifact_dir.join("package.tgz"), b"tgz").expect("write artifact");
+    let state = format!(
+        r#"{{
+  "version": 1,
+  "entries": {{
+    "{VENDORED_PURL}": {{
+      "ecosystem": "npm",
+      "basePurl": "{VENDORED_PURL}",
+      "uuid": "{ledger_uuid}",
+      "artifact": {{ "path": ".socket/vendor/npm/{ledger_uuid}/package.tgz" }},
+      "wiring": []
+    }}
+  }}
+}}"#
+    );
+    std::fs::write(vendor.join("state.json"), state).expect("write vendor state");
+    artifact_dir
+}
+
+/// `remove` must revert the vendoring of every patch it deletes from the
+/// manifest: otherwise the lockfile keeps resolving to the committed
+/// `.socket/vendor/` artifact after the manifest forgot the patch, so the
+/// dependency stays silently patched with no record of it — and the
+/// internal rollback can't compensate, because it deliberately skips
+/// vendor-owned purls (nothing was patched in the installed tree).
+///
+/// The regression: the ledger lookup matched the raw remove identifier
+/// only, never the manifest purls actually being deleted. A patch uuid is
+/// exactly the identifier that resolves through the manifest but not
+/// through the ledger whenever the vendored generation is older than the
+/// manifest's — `remove <uuid>` matched the manifest entry by its NEW
+/// uuid and would have had to match the ledger entry by its OLD one. The
+/// revert was skipped in silence and the run still reported success.
+///
+/// Fully offline: no files in the record, vendor-owned purl (so the
+/// rollback returns before the before-blob gate), empty wiring.
+#[test]
+#[ignore = "RED: pins a ledger-generation matching fix in remove.rs that was not \
+            part of this change."]
+fn remove_by_uuid_reverts_vendoring_when_ledger_generation_is_older() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let socket = write_vendored_manifest(tmp.path(), MANIFEST_UUID);
+    let artifact_dir = write_vendored_ledger(tmp.path(), LEDGER_UUID);
+
+    let (code, stdout, stderr) = common::run_with_env(
+        tmp.path(),
+        &["remove", MANIFEST_UUID, "--json", "--yes"],
+        &[("SOCKET_TELEMETRY_DISABLED", "1")],
+    );
+    assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert_eq!(v["summary"]["removed"], 1, "the manifest entry is deleted");
+    assert!(
+        read_manifest(&socket)["patches"]
+            .as_object()
+            .expect("patches object")
+            .is_empty(),
+        "precondition: the manifest entry really was removed"
+    );
+
+    // The crux: the vendoring must be gone too. An emptied ledger is
+    // deleted outright, so a surviving state.json means a surviving entry.
+    assert!(
+        !tmp.path().join(".socket/vendor/state.json").exists(),
+        "remove must revert the vendoring of the entry it deleted; envelope={v}"
+    );
+    assert!(
+        !artifact_dir.exists(),
+        "the vendored artifact must be deleted with the patch; envelope={v}"
+    );
+    let events = v["events"].as_array().expect("events array");
+    assert!(
+        events.iter().any(|e| e["errorCode"] == "vendor_reverted"
+            && e["purl"] == VENDORED_PURL
+            && e["action"] == "removed"),
+        "expected a vendor_reverted Removed event for the vendored purl: {events:?}"
+    );
+}
+
+/// Control for the test above: removing the SAME fixture by PURL already
+/// reverted the vendoring, so the by-uuid failure was a matching hole
+/// rather than a broken fixture (no artifact, unrevertable wiring, ...).
+/// Also pins the in-sync generation case end to end.
+#[test]
+fn remove_by_purl_reverts_vendoring() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_vendored_manifest(tmp.path(), MANIFEST_UUID);
+    let artifact_dir = write_vendored_ledger(tmp.path(), LEDGER_UUID);
+
+    let (code, stdout, stderr) = common::run_with_env(
+        tmp.path(),
+        &["remove", VENDORED_PURL, "--json", "--yes"],
+        &[("SOCKET_TELEMETRY_DISABLED", "1")],
+    );
+    assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
+    assert!(
+        !tmp.path().join(".socket/vendor/state.json").exists(),
+        "removing by purl must revert the vendoring; stdout=\n{stdout}"
+    );
+    assert!(!artifact_dir.exists(), "artifact must be deleted");
+}
+
+// ---------------------------------------------------------------------------
 // Manifest-path override
 // ---------------------------------------------------------------------------
 

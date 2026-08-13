@@ -19,15 +19,19 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
 | Cargo (`cargo`) | ✅ in-place + `.cargo-checksum.json` rewrite (shared registry-cache caveat — see [Cargo: shared registry cache](#cargo-shared-registry-cache)) | ✅ `[patch.crates-io]` path entry | ✅ per-patch sparse registry (`[registries.socket-patch-<uuid>]` + Cargo.lock source/checksum) |
 | RubyGems (`gem`) | ✅ Bundler plugin via `setup` | ✅ Gemfile + Gemfile.lock path pair | ✅ per-dep `source` block; the `CHECKSUMS` pin needs bundler ≥ 2.6 (older locks get a `redirect_gem_no_checksums_section` warning) |
 | Go (`golang`) | ✅ `go.mod` `replace` → `.socket/go-patches/` — see [Go: directory replaces and go.sum](#go-directory-replaces-and-gosum) | ✅ `replace` → the committed vendor tree | ❌ **not possible** — sumdb, module-path identity, and default-GOPROXY leakage each rule it out; see [golang-hosted-no-go.md](design/golang-hosted-no-go.md). **Use vendored** (`redirect_golang_unsupported` names the remedy) |
-| Maven (`maven`) | ⚠️ experimental, apply-only (no `setup` hook — reports `no_files`) — gated behind `SOCKET_EXPERIMENTAL_MAVEN=1` (in-place jar patching corrupts the `~/.m2` checksum sidecars); prefer vendored / hosted | ✅ committed maven2 `file://` repository. A root pom declaring `<modules>` (multi-module aggregator) is refused (`vendor_maven_multimodule_unsupported`), and a gradle-only project is refused (`vendor_gradle_unsupported`) | ✅ **pom projects only, fail-closed** — the patched jar is pinned at a Socket-only `<version>-socket.<hex8>` suffix; `${property}` versions are refused; Gradle gets a manual `exclusiveContent` snippet — see [Maven & NuGet caveats](#maven--nuget-caveats) |
-| NuGet (`nuget`) | ⚠️ experimental, apply-only (no `setup` hook — reports `no_files`) — gated behind `SOCKET_EXPERIMENTAL_NUGET=1` (in-place patching breaks the `.nupkg.sha512` tamper-evidence sidecar); prefer vendored / hosted | ✅ committed folder feed + `packageSourceMapping` + `packages.lock.json` contentHash pin | ✅ `nuget.config` source + source-mapping, `packages.lock.json` contentHash rewrite. See the locked-mode note in [Maven & NuGet caveats](#maven--nuget-caveats) |
+| Maven (`maven`) | ✅ apply-only (no `setup` hook — reports `no_files`); in-place jar patching leaves the `~/.m2` checksum sidecars stale — prefer vendored / hosted, see [Maven & NuGet caveats](#maven--nuget-caveats) | ✅ committed maven2 `file://` repository. A root pom declaring `<modules>` (multi-module aggregator) is refused (`vendor_maven_multimodule_unsupported`), and a gradle-only project is refused (`vendor_gradle_unsupported`) | ✅ **pom projects only, fail-closed** — the patched jar is pinned at a Socket-only `<version>-socket.<hex8>` suffix; `${property}` versions are refused; Gradle gets a manual `exclusiveContent` snippet — see [Maven & NuGet caveats](#maven--nuget-caveats) |
+| NuGet (`nuget`) | ✅ apply-only (no `setup` hook — reports `no_files`); in-place patching deletes `.nupkg.metadata` and advises on the `.nupkg.sha512` tamper-evidence sidecar — prefer vendored / hosted, see [Maven & NuGet caveats](#maven--nuget-caveats) | ✅ committed folder feed + `packageSourceMapping` + `packages.lock.json` contentHash pin | ✅ `nuget.config` source + source-mapping, `packages.lock.json` contentHash rewrite. See the locked-mode note in [Maven & NuGet caveats](#maven--nuget-caveats) |
 | Composer (`composer`) | ✅ post-install script events | ✅ `composer.lock` `dist: path` rewrite | ✅ `composer.lock` dist url + shasum rewrite |
 | Deno (`deno`) | ✅ apply-only — no install hook (`setup` reports `no_files`); declare in `setup.manual` for VEX coverage | ❌ refused (`vendor_unsupported_ecosystem`) | ❌ not supported |
 
-> **Maven / NuGet discovery gate**: discovering *installed* Maven and NuGet packages (the
-> crawl behind `scan` / `apply` / `vendor`) currently requires the same
-> `SOCKET_EXPERIMENTAL_MAVEN=1` / `SOCKET_EXPERIMENTAL_NUGET=1` opt-in in every mode. The
-> vendored/hosted wiring itself is safe — the gate guards the agent-mode sidecar risk.
+> **Maven / NuGet sidecar caveat**: Maven and NuGet are fully enabled in every mode (the
+> old `SOCKET_EXPERIMENTAL_MAVEN` / `SOCKET_EXPERIMENTAL_NUGET` opt-ins are retired).
+> In-place (agent-mode) patching leaves the caches' own checksum sidecars stale: NuGet's
+> post-apply fixup deletes `.nupkg.metadata` and raises an advisory for the
+> signed-package `.nupkg.sha512` tamper marker it cannot honestly rewrite; Maven's
+> `.jar.sha1`/`.jar.md5` are left as-is. The copy-out modes — `vendor`,
+> `scan --mode vendored`, `scan --mode hosted` — never write into the caches and avoid
+> the issue entirely.
 
 ## npm hosted-mode notes
 

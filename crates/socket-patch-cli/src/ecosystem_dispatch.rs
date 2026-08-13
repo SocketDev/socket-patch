@@ -14,51 +14,14 @@ use socket_patch_core::crawlers::GoCrawler;
 use socket_patch_core::crawlers::MavenCrawler;
 use socket_patch_core::crawlers::NuGetCrawler;
 
-/// Runtime opt-in gate for experimental Maven support.
-///
-/// The Maven crawler does NOT run unless `SOCKET_EXPERIMENTAL_MAVEN=1` (or
-/// `=true`). Applying a Maven patch corrupts the jar sidecar
-/// checksums (`<jar>.jar.sha1`, `<jar>.jar.md5`) that the local
-/// Maven repository keeps next to each artifact, and there is no
-/// recovery — the user has to re-download the jar.
-fn maven_runtime_enabled() -> bool {
-    env_truthy("SOCKET_EXPERIMENTAL_MAVEN")
-}
-
-fn warn_maven_disabled(skipped: usize) {
-    eprintln!(
-        "Warning: {} Maven patch(es) skipped — Maven support is experimental.",
-        skipped
-    );
-    eprintln!("  Maven patches corrupt jar sidecar checksums (sha1/md5).");
-    eprintln!("  Set SOCKET_EXPERIMENTAL_MAVEN=1 to enable at your own risk.");
-}
-
-/// Runtime opt-in gate for experimental NuGet support. Same shape as
-/// the Maven gate. Even with the sidecar fixup deleting
-/// `.nupkg.metadata`, signed packages still carry a `.nupkg.sha512`
-/// marker that NuGet treats as tamper-evidence at restore time. The
-/// fixup cannot honestly rewrite this without the original `.nupkg`
-/// (which we don't have post-extraction). Refuse to dispatch unless
-/// the operator has explicitly opted in to the experimental tier.
-fn nuget_runtime_enabled() -> bool {
-    env_truthy("SOCKET_EXPERIMENTAL_NUGET")
-}
-
-fn warn_nuget_disabled(skipped: usize) {
-    eprintln!(
-        "Warning: {} NuGet patch(es) skipped — NuGet support is experimental.",
-        skipped
-    );
-    eprintln!("  NuGet patches corrupt the .nupkg.sha512 signature sidecar that");
-    eprintln!("  `dotnet restore` reads as tamper-evidence.");
-    eprintln!("  Set SOCKET_EXPERIMENTAL_NUGET=1 to enable at your own risk.");
-}
-
-fn env_truthy(name: &str) -> bool {
-    std::env::var(name)
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+/// Whether [`crawl_all_ecosystems`] actually visits this PURL's ecosystem
+/// in THIS process. An unrecognized `pkg:<type>/` (a newer CLI's ecosystem
+/// in a committed manifest) has no crawler at all — for those, absence
+/// from the crawl carries no information about whether the package is
+/// installed. Callers that read "not in the crawl" as "no longer
+/// installed" (scan's prune GC) must not judge them.
+pub fn crawl_covers_purl(purl: &str) -> bool {
+    Ecosystem::from_purl(purl).is_some()
 }
 
 /// Partition PURLs by ecosystem, filtering by the `--ecosystems` flag if set.
@@ -285,31 +248,23 @@ async fn dispatch_find(
         on_match = merge_first_wins,
     );
 
-    if let Some(maven_purls) = partitioned.get(&Ecosystem::Maven) {
-        if !maven_purls.is_empty() && !maven_runtime_enabled() {
-            if !silent {
-                warn_maven_disabled(maven_purls.len());
-            }
-        } else {
-            scan_ecosystem!(
-                out = out,
-                partitioned = partitioned,
-                eco = Ecosystem::Maven,
-                options = options,
-                silent = silent,
-                crawler = MavenCrawler,
-                get_paths = get_maven_repo_paths,
-                using_label = "Maven repository",
-                err_label = "Maven packages",
-                // Maven has per-classifier release variants
-                // (`?classifier=&ext=`) that coexist as distinct jars in
-                // one version dir; the crawler emits the base PURL and
-                // each variant is resolved by hashing its jar file.
-                purls_override = dedup_qualified_purls,
-                on_match = variant_merge,
-            );
-        }
-    }
+    scan_ecosystem!(
+        out = out,
+        partitioned = partitioned,
+        eco = Ecosystem::Maven,
+        options = options,
+        silent = silent,
+        crawler = MavenCrawler,
+        get_paths = get_maven_repo_paths,
+        using_label = "Maven repository",
+        err_label = "Maven packages",
+        // Maven has per-classifier release variants
+        // (`?classifier=&ext=`) that coexist as distinct jars in
+        // one version dir; the crawler emits the base PURL and
+        // each variant is resolved by hashing its jar file.
+        purls_override = dedup_qualified_purls,
+        on_match = variant_merge,
+    );
 
     scan_ecosystem!(
         out = out,
@@ -325,27 +280,19 @@ async fn dispatch_find(
         on_match = merge_first_wins,
     );
 
-    if let Some(nuget_purls) = partitioned.get(&Ecosystem::Nuget) {
-        if !nuget_purls.is_empty() && !nuget_runtime_enabled() {
-            if !silent {
-                warn_nuget_disabled(nuget_purls.len());
-            }
-        } else {
-            scan_ecosystem!(
-                out = out,
-                partitioned = partitioned,
-                eco = Ecosystem::Nuget,
-                options = options,
-                silent = silent,
-                crawler = NuGetCrawler,
-                get_paths = get_nuget_package_paths,
-                using_label = "NuGet packages",
-                err_label = "NuGet packages",
-                purls_override = passthrough_purls,
-                on_match = merge_first_wins,
-            );
-        }
-    }
+    scan_ecosystem!(
+        out = out,
+        partitioned = partitioned,
+        eco = Ecosystem::Nuget,
+        options = options,
+        silent = silent,
+        crawler = NuGetCrawler,
+        get_paths = get_nuget_package_paths,
+        using_label = "NuGet packages",
+        err_label = "NuGet packages",
+        purls_override = passthrough_purls,
+        on_match = merge_first_wins,
+    );
 
     scan_ecosystem!(
         out = out,
@@ -413,7 +360,7 @@ pub async fn find_manifest_package_paths(
     find_packages_for_rollback(&partitioned, &crawler_options, quiet).await
 }
 
-/// Crawl all enabled ecosystems and return all packages plus per-ecosystem counts.
+/// Crawl all ecosystems and return all packages plus per-ecosystem counts.
 pub async fn crawl_all_ecosystems(
     options: &CrawlerOptions,
 ) -> (Vec<CrawledPackage>, HashMap<Ecosystem, usize>) {
@@ -433,16 +380,9 @@ pub async fn crawl_all_ecosystems(
     crawl!(Ecosystem::Cargo, CargoCrawler);
     crawl!(Ecosystem::Gem, RubyCrawler);
     crawl!(Ecosystem::Golang, GoCrawler);
-    if maven_runtime_enabled() {
-        // Same runtime gate as `find_packages_for_purls` — `scan`
-        // walks the Maven repo only when the operator has explicitly
-        // opted into experimental support.
-        crawl!(Ecosystem::Maven, MavenCrawler);
-    }
+    crawl!(Ecosystem::Maven, MavenCrawler);
     crawl!(Ecosystem::Composer, ComposerCrawler);
-    if nuget_runtime_enabled() {
-        crawl!(Ecosystem::Nuget, NuGetCrawler);
-    }
+    crawl!(Ecosystem::Nuget, NuGetCrawler);
     crawl!(Ecosystem::Deno, DenoCrawler);
 
     (all_packages, counts)
@@ -703,36 +643,6 @@ mod tests {
     }
 
     #[test]
-    fn env_truthy_accepts_one_and_true_case_insensitive() {
-        let key = "SOCKET_TEST_ENV_TRUTHY";
-        std::env::set_var(key, "1");
-        assert!(env_truthy(key));
-        std::env::set_var(key, "TrUe");
-        assert!(env_truthy(key));
-        std::env::set_var(key, "0");
-        assert!(!env_truthy(key));
-        std::env::set_var(key, "yes");
-        assert!(!env_truthy(key));
-        std::env::remove_var(key);
-        assert!(!env_truthy(key));
-    }
-
-    #[test]
-    fn env_truthy_rejects_empty_and_padded_values() {
-        // The experimental gates must NOT open on an empty assignment
-        // (`SOCKET_EXPERIMENTAL_MAVEN=`) or on whitespace-padded values —
-        // only the exact tokens `1` / `true` (any case) enable them.
-        let key = "SOCKET_TEST_ENV_TRUTHY_EDGE";
-        for falsey in ["", " ", "1 ", " 1", "1\n", "true ", "tru", "11", "01"] {
-            std::env::set_var(key, falsey);
-            assert!(!env_truthy(key), "{falsey:?} must not be truthy");
-        }
-        std::env::set_var(key, "TRUE");
-        assert!(env_truthy(key));
-        std::env::remove_var(key);
-    }
-
-    #[test]
     fn partition_purls_no_filter_single_npm() {
         let purls = vec!["pkg:npm/foo@1.0".to_string()];
         let map = partition_purls(&purls, None);
@@ -949,6 +859,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn find_packages_for_rollback_resolves_installed_qualified_gem() {
+        // Regression for the vendor lookup path (vendor.rs): every real
+        // production gem/pypi patch PURL is QUALIFIED (`?platform=` /
+        // `?artifact_id=`), but the crawler only knows the BASE PURL.
+        // `vendor` must resolve installed packages via the qualified-aware
+        // rollback resolver so its `all_packages.contains_key(qualified)`
+        // check recognizes the installed gem. Using `find_packages_for_purls`
+        // (base-keyed) misses the qualified key, falsely classifying the
+        // installed gem "not installed" — the bug that produced spurious
+        // `vendor_fetched_missing` events and the gem platform coin-flip.
+        let tmp = tempfile::tempdir().unwrap();
+        // A platform gem installs into a `<name>-<version>` dir (with an
+        // optional `-<platform>` suffix); lay down the plain-platform case.
+        let gem_dir = tmp.path().join("activestorage-7.0.2.2");
+        std::fs::create_dir_all(gem_dir.join("lib")).unwrap();
+
+        // `global_prefix` makes the gem crawler treat `tmp` as the gems root
+        // directly (same shortcut the ruby crawler's own tests use).
+        let options = CrawlerOptions {
+            cwd: tmp.path().to_path_buf(),
+            global: false,
+            global_prefix: Some(tmp.path().to_path_buf()),
+        };
+
+        let qualified = "pkg:gem/activestorage@7.0.2.2?platform=ruby".to_string();
+        let partitioned = partition_purls(std::slice::from_ref(&qualified), None);
+
+        // The vendor lookup path: the qualified manifest PURL is resolved to
+        // the installed dir under its EXACT qualified key.
+        let rollback = find_packages_for_rollback(&partitioned, &options, true).await;
+        assert_eq!(
+            rollback.get(&qualified),
+            Some(&gem_dir),
+            "installed qualified gem must resolve under its qualified key"
+        );
+
+        // The old resolver keyed by the BASE PURL only, so a `contains_key`
+        // on the qualified PURL missed — the exact false "not installed".
+        let base_keyed = find_packages_for_purls(&partitioned, &options, true).await;
+        assert!(
+            !base_keyed.contains_key(&qualified),
+            "find_packages_for_purls must NOT be used by vendor: it keys by \
+             the base PURL, so the qualified lookup falsely misses"
+        );
+    }
+
+    #[tokio::test]
     async fn dispatch_find_empty_partition_yields_empty_map() {
         let tmp = tempfile::tempdir().unwrap();
         let empty: HashMap<Ecosystem, Vec<String>> = HashMap::new();
@@ -961,68 +918,72 @@ mod tests {
             .is_empty());
     }
 
-    // ---- experimental Maven/NuGet runtime gates --------------------------
+    // ---- Maven/NuGet are first-class ecosystems ---------------------------
     //
-    // `crawl_all_ecosystems` only walks Maven / NuGet when the operator has
-    // opted in via `SOCKET_EXPERIMENTAL_*`. The gate's observable effect is
-    // whether the ecosystem appears in the returned per-ecosystem `counts`
-    // map at all: a crawled-but-empty ecosystem gets a `0` entry; a gated-off
-    // one gets no entry. That distinction lets us test the gate without a
-    // real Maven repo / NuGet cache fixture.
+    // Maven and NuGet used to sit behind `SOCKET_EXPERIMENTAL_MAVEN` /
+    // `SOCKET_EXPERIMENTAL_NUGET` runtime gates. The gates are gone: every
+    // ecosystem is crawled unconditionally in every flow. The observable
+    // pin is the per-ecosystem `counts` map — a crawled-but-empty ecosystem
+    // gets a `0` entry, so presence proves the crawler ran without needing
+    // a real Maven repo / NuGet cache fixture.
 
+    /// Every ecosystem must appear in `counts` unconditionally — guards
+    /// against one being accidentally moved behind a runtime gate (the
+    /// regression this test replaces: maven/nuget were env-gated).
     #[tokio::test]
-    #[serial_test::serial(experimental_gate_env)]
-    async fn crawl_all_gates_maven_on_runtime_flag() {
-        let tmp = tempfile::tempdir().unwrap();
-        let opts = local_options(tmp.path().to_path_buf());
-
-        std::env::remove_var("SOCKET_EXPERIMENTAL_MAVEN");
-        let (_, counts) = crawl_all_ecosystems(&opts).await;
-        assert!(
-            !counts.contains_key(&Ecosystem::Maven),
-            "Maven must not be crawled when the experimental flag is unset"
-        );
-
-        std::env::set_var("SOCKET_EXPERIMENTAL_MAVEN", "1");
-        let (_, counts) = crawl_all_ecosystems(&opts).await;
-        assert!(
-            counts.contains_key(&Ecosystem::Maven),
-            "Maven must be crawled once the experimental flag is set"
-        );
-        std::env::remove_var("SOCKET_EXPERIMENTAL_MAVEN");
-    }
-
-    #[tokio::test]
-    #[serial_test::serial(experimental_gate_env)]
-    async fn crawl_all_gates_nuget_on_runtime_flag() {
-        let tmp = tempfile::tempdir().unwrap();
-        let opts = local_options(tmp.path().to_path_buf());
-
-        std::env::remove_var("SOCKET_EXPERIMENTAL_NUGET");
-        let (_, counts) = crawl_all_ecosystems(&opts).await;
-        assert!(
-            !counts.contains_key(&Ecosystem::Nuget),
-            "NuGet must not be crawled when the experimental flag is unset"
-        );
-
-        std::env::set_var("SOCKET_EXPERIMENTAL_NUGET", "1");
-        let (_, counts) = crawl_all_ecosystems(&opts).await;
-        assert!(
-            counts.contains_key(&Ecosystem::Nuget),
-            "NuGet must be crawled once the experimental flag is set"
-        );
-        std::env::remove_var("SOCKET_EXPERIMENTAL_NUGET");
-    }
-
-    /// The always-on ecosystems must appear in `counts` unconditionally —
-    /// guards against one being accidentally moved behind a runtime gate.
-    #[tokio::test]
-    #[serial_test::serial(experimental_gate_env)]
-    async fn crawl_all_always_includes_core_ecosystems() {
+    async fn crawl_all_includes_every_ecosystem_unconditionally() {
         let tmp = tempfile::tempdir().unwrap();
         let (_, counts) = crawl_all_ecosystems(&local_options(tmp.path().to_path_buf())).await;
-        assert!(counts.contains_key(&Ecosystem::Npm));
-        assert!(counts.contains_key(&Ecosystem::Pypi));
-        assert!(counts.contains_key(&Ecosystem::Gem));
+        for eco in [
+            Ecosystem::Npm,
+            Ecosystem::Pypi,
+            Ecosystem::Cargo,
+            Ecosystem::Gem,
+            Ecosystem::Golang,
+            Ecosystem::Maven,
+            Ecosystem::Composer,
+            Ecosystem::Nuget,
+            Ecosystem::Deno,
+        ] {
+            assert!(
+                counts.contains_key(&eco),
+                "{eco:?} must be crawled unconditionally — no runtime gates"
+            );
+        }
+    }
+
+    /// The PURL-lookup path (`find_packages_for_purls` — apply/vendor's
+    /// resolver) must resolve a maven package from a local repository with
+    /// no env opt-in of any kind.
+    #[tokio::test]
+    #[serial_test::serial(maven_repo_env)]
+    async fn find_packages_resolves_maven_without_any_opt_in() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Minimal local Maven repository layout the crawler recognizes:
+        // <repo>/org/example/foo/1.0.0/foo-1.0.0.pom (+ project marker).
+        std::fs::write(tmp.path().join("pom.xml"), "<project></project>\n").unwrap();
+        let artifact_dir = tmp
+            .path()
+            .join("m2repo")
+            .join("org")
+            .join("example")
+            .join("foo")
+            .join("1.0.0");
+        std::fs::create_dir_all(&artifact_dir).unwrap();
+        std::fs::write(artifact_dir.join("foo-1.0.0.pom"), "<project/>").unwrap();
+        std::env::set_var("MAVEN_REPO_LOCAL", tmp.path().join("m2repo"));
+
+        let purl = "pkg:maven/org.example/foo@1.0.0".to_string();
+        let partitioned = partition_purls(std::slice::from_ref(&purl), None);
+        let opts = local_options(tmp.path().to_path_buf());
+
+        let out = find_packages_for_purls(&partitioned, &opts, true).await;
+        std::env::remove_var("MAVEN_REPO_LOCAL");
+        assert_eq!(
+            out.get(&purl),
+            Some(&artifact_dir),
+            "maven lookup must resolve without any experimental opt-in"
+        );
     }
 }

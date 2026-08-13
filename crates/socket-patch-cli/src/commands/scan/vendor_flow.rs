@@ -4,12 +4,13 @@
 //! transient-frame constructors that keep the never-taken vendor branches
 //! out of `run`'s poll frame (Windows 1 MiB main-thread stack).
 
+use socket_patch_core::api::client::get_api_client_with_overrides;
 use socket_patch_core::api::types::{BatchPackagePatches, PatchSearchResult};
 use socket_patch_core::manifest::operations::read_manifest;
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
 use socket_patch_core::patch::apply_lock;
-use socket_patch_core::patch::vendor::{load_state, lookup_entry};
-use socket_patch_core::utils::telemetry::track_patch_vendor_failed;
+use socket_patch_core::telemetry::track_patch_vendor_failed;
+use socket_patch_core::vendor::{load_state, lookup_entry, VendorServiceConfig, VendorSource};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Duration;
@@ -20,10 +21,12 @@ use crate::commands::get::{download_and_apply_patches, download_patch_records, D
 use crate::commands::vendor::{
     note_classic_migration_risk, reconcile_dropped, track_outcomes_for_vendor, vendor_records,
 };
-use crate::json_envelope::{Command as EnvelopeCommand, Envelope};
+use crate::json_envelope::{Command as EnvelopeCommand, Envelope, RunWarning};
 
 use super::gc::{gc_json, print_gc_vendored_line, run_apply_gc};
-use super::{discover_selected, download_params, embed_vex_into_json, ScanArgs};
+use super::{
+    discover_selected, download_params, embed_vex_into_json, emit_discovery_error_json, ScanArgs,
+};
 
 /// Dry-run preview for `scan --vendor`: classify each selected patch
 /// against the vendor ledger without touching disk or the network beyond
@@ -51,6 +54,60 @@ async fn preview_vendor_json(cwd: &Path, selected: &[PatchSearchResult]) -> serd
     serde_json::json!({ "dryRun": true, "patches": patches })
 }
 
+/// Build the vendoring-service config for scan's vendored flow — the SAME
+/// shape the standalone `vendor` command builds (see `vendor::run`), so both
+/// entry points honor `--vendor-source` / `--vendor-url` /
+/// `--patch-server-url` and commit byte-identical artifacts + lock integrity
+/// for the same patch. `vendor_source` was validated by clap, so the parse
+/// cannot fail; fall back to the `auto` default defensively — the SAME
+/// default as the `vendor` command (service download), not build-only.
+///
+/// `client` / `use_public_proxy` come from the run-level API client. A pure
+/// assembler (no async, no network) so the flow's byte-for-byte parity with
+/// the `vendor` command is unit-testable without a live client.
+fn scan_vendor_service_config(
+    common: &GlobalArgs,
+    client: Option<socket_patch_core::api::client::ApiClient>,
+    use_public_proxy: bool,
+) -> VendorServiceConfig {
+    VendorServiceConfig {
+        source: VendorSource::parse(&common.vendor_source).unwrap_or_default(),
+        client,
+        use_public_proxy,
+        vendor_url: common.vendor_url.clone(),
+        patch_server_url: common.patch_server_url.clone(),
+        offline: common.offline,
+    }
+}
+
+/// Cross-mode takeover advisory for the scan-driven vendor step: when this
+/// vendored run's ledger (`.socket/vendor/state.json`) and a committed hosted
+/// redirect ledger (`.socket/vendor/redirect-state.json`) both claim the same
+/// package(s), the redirect ledger is now stale — the lockfile points at the
+/// committed `.socket/vendor/` files, not the hosted patch server. Warn once
+/// at the envelope level (JSON `warnings[]` and stderr), mirroring
+/// [`note_classic_migration_risk`]; the stale ledger is NOT deleted here
+/// (reconciliation is deferred — see the redirect twin in `hosted.rs`).
+async fn note_vendor_supersedes_redirect(env: &mut Envelope, cwd: &Path, common: &GlobalArgs) {
+    // Only warn for the package(s) the LIVE lockfile actually routes to the
+    // committed `.socket/vendor/` files — the direction the lock proves, not the
+    // fact that this happens to be the vendored flow. A dry-run / no-op over a
+    // lock that still points at the hosted patch server stays silent instead of
+    // pointing cleanup at the live redirect ledger.
+    let superseded = super::classify_overlap_takeover(cwd).await.vendored;
+    if superseded.is_empty() {
+        return;
+    }
+    let detail = super::mode_takeover_detail(&superseded, /*current_is_hosted=*/ false);
+    if !common.silent && !common.json {
+        eprintln!("Warning ({}): {detail}", super::VENDOR_SUPERSEDES_REDIRECT);
+    }
+    env.warnings.push(RunWarning {
+        code: super::VENDOR_SUPERSEDES_REDIRECT.to_string(),
+        detail,
+    });
+}
+
 /// The vendor step shared by `scan --vendor`'s JSON and interactive
 /// paths: acquire the apply lock, stage patch sources, and drive
 /// [`vendor_records`] — manifest mode (`detached_records: None`, records
@@ -59,19 +116,23 @@ async fn preview_vendor_json(cwd: &Path, selected: &[PatchSearchResult]) -> serd
 /// [`download_patch_records`]; no manifest involvement at all).
 ///
 /// `Ok((has_errors, envelope))` on a run that reached the engine;
-/// `Err((code, message))` for the lock/stage/manifest failures the
-/// caller folds into its own output shape (scan's ad-hoc JSON can't use
-/// `acquire_or_emit`, which prints an Envelope).
+/// `Err((code, message, envelope))` for the lock/stage/manifest failures
+/// the caller folds into its own output shape (scan's ad-hoc JSON can't
+/// use `acquire_or_emit`, which prints an Envelope). The error carries
+/// the envelope built so far when the failure happened AFTER
+/// `reconcile_dropped` ran — the reconcile mutates the on-disk ledger,
+/// and its events must survive the error fold or the JSON consumer
+/// never learns about the mutation.
 async fn run_scan_vendor_step(
     common: &GlobalArgs,
     manifest_path: &Path,
     socket_dir: &Path,
     detached_records: Option<&HashMap<String, PatchRecord>>,
-) -> Result<(bool, Envelope), (&'static str, String)> {
+) -> Result<(bool, Envelope), (&'static str, String, Option<Box<Envelope>>)> {
     // The download phase created `.socket/` already in every flow that
     // reaches here, but `acquire` deliberately refuses to mkdir.
     if let Err(e) = tokio::fs::create_dir_all(socket_dir).await {
-        return Err(("socket_dir_unwritable", e.to_string()));
+        return Err(("socket_dir_unwritable", e.to_string(), None));
     }
     let guard = apply_lock::acquire(
         socket_dir,
@@ -81,8 +142,9 @@ async fn run_scan_vendor_step(
         apply_lock::LockError::Held => (
             "lock_held",
             "another socket-patch process is operating in this directory".to_string(),
+            None,
         ),
-        apply_lock::LockError::Io { .. } => ("lock_io", e.to_string()),
+        apply_lock::LockError::Io { .. } => ("lock_io", e.to_string(), None),
     })?;
 
     let mut env = Envelope::new(EnvelopeCommand::Vendor);
@@ -106,10 +168,11 @@ async fn run_scan_vendor_step(
                     // previous run may still sit in the lockfile, so the
                     // state-based migration-risk advisory still applies.
                     note_classic_migration_risk(&mut env, &common.cwd, common);
+                    note_vendor_supersedes_redirect(&mut env, &common.cwd, common).await;
                     drop(guard);
                     return Ok((false, env));
                 }
-                Err(e) => return Err(("invalid_manifest", e.to_string())),
+                Err(e) => return Err(("invalid_manifest", e.to_string(), None)),
             };
             // Same placement as the `vendor` command: dropped entries
             // are reverted even when zero in-scope patches remain.
@@ -119,23 +182,49 @@ async fn run_scan_vendor_step(
     };
     let staged =
         match stage_vendor_sources_in_memory(common, &manifest, socket_dir, &common.cwd).await {
-            Ok(MemStageOutcome::Ready(s)) => s,
-            Ok(MemStageOutcome::Unavailable) => {
+            MemStageOutcome::Ready(s) => s,
+            MemStageOutcome::Unavailable => {
+                // The reconcile above may have already reverted dropped
+                // entries on disk — hand its envelope to the error fold.
+                // Demote its status first: a fresh Envelope starts at
+                // Success and a clean reconcile leaves it there, but this
+                // run is aborting — a consumer reading `.vendor.status`
+                // inside a `"status":"error"` result must not see
+                // "success".
+                env.mark_partial_failure();
                 return Err((
                     "no_local_source",
                     "patch artifacts unavailable (offline or download failure)".to_string(),
-                ))
+                    Some(Box::new(env)),
+                ));
             }
-            Err(e) => return Err(("stage_failed", e)),
         };
     let sources = staged.as_patch_sources();
-    has_errors |=
-        boxed_vendor_records(common, &manifest.patches, &sources, detached, &mut env).await;
+    // Honor `--vendor-source` (and `--vendor-url` / `--patch-server-url`)
+    // exactly as the `vendor` command does: build the SAME service config so
+    // `scan --mode vendored` and a plain `vendor` commit byte-identical
+    // artifacts by default (both service-download under `auto`) instead of
+    // scan silently building locally. Built here (once, from the run-level
+    // flags) on the already-boxed scan-vendored frame; dry runs never reach
+    // this step, so there is no wasted client build in preview mode.
+    let (client, use_public_proxy) =
+        get_api_client_with_overrides(common.api_client_overrides()).await;
+    let service = scan_vendor_service_config(common, Some(client), use_public_proxy);
+    has_errors |= boxed_vendor_records(
+        common,
+        &manifest.patches,
+        &sources,
+        detached,
+        Some(&service),
+        &mut env,
+    )
+    .await;
     drop(guard);
     if has_errors {
         env.mark_partial_failure();
     }
     note_classic_migration_risk(&mut env, &common.cwd, common);
+    note_vendor_supersedes_redirect(&mut env, &common.cwd, common).await;
     Ok((has_errors, env))
 }
 
@@ -175,7 +264,10 @@ async fn run_vendor_json_path(
     .await
     {
         Ok(s) => s,
-        Err(code) => return code,
+        Err((code, message)) => {
+            emit_discovery_error_json(result, &message);
+            return code;
+        }
     };
 
     if args.common.dry_run {
@@ -275,7 +367,7 @@ async fn run_vendor_json_path(
                 serde_json::to_value(&venv).unwrap_or_else(|_| serde_json::json!({}));
             i32::from(has_errors)
         }
-        Err((code, message)) => {
+        Err((code, message, venv)) => {
             track_patch_vendor_failed(
                 &message,
                 args.common.dry_run,
@@ -283,6 +375,13 @@ async fn run_vendor_json_path(
                 telemetry_org,
             )
             .await;
+            // A pre-failure reconcile already mutated the ledger on disk;
+            // its envelope (events included) must reach the JSON consumer
+            // even though the run aborts here.
+            if let Some(venv) = venv {
+                result["vendor"] =
+                    serde_json::to_value(&*venv).unwrap_or_else(|_| serde_json::json!({}));
+            }
             result["status"] = serde_json::json!("error");
             result["error"] = serde_json::json!({
                 "code": code,
@@ -373,7 +472,10 @@ async fn run_vendor_interactive_path(
             .await;
             i32::from(has_errors)
         }
-        Err((code, message)) => {
+        // Human mode prints no per-event lines even on success, so the
+        // carried envelope has no human rendering to feed — JSON mode is
+        // where the reconcile events must survive (see the JSON fold above).
+        Err((code, message, _venv)) => {
             track_patch_vendor_failed(
                 &message,
                 args.common.dry_run,
@@ -529,7 +631,11 @@ fn boxed_scan_vendor_step<'a>(
     socket_dir: &'a Path,
     detached_records: Option<&'a HashMap<String, PatchRecord>>,
 ) -> std::pin::Pin<
-    Box<dyn std::future::Future<Output = Result<(bool, Envelope), (&'static str, String)>> + 'a>,
+    Box<
+        dyn std::future::Future<
+                Output = Result<(bool, Envelope), (&'static str, String, Option<Box<Envelope>>)>,
+            > + 'a,
+    >,
 > {
     Box::pin(run_scan_vendor_step(
         common,
@@ -572,11 +678,85 @@ fn boxed_vendor_records<'a>(
     records: &'a HashMap<String, PatchRecord>,
     sources: &'a socket_patch_core::patch::apply::PatchSources<'a>,
     detached: bool,
+    service: Option<&'a VendorServiceConfig>,
     env: &'a mut Envelope,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + 'a>> {
-    // `scan --vendor` builds locally (no vendoring-service config); the
-    // `vendor` command is the service-download entry point.
+    // `scan --vendor` threads the SAME service config the `vendor` command
+    // builds (honoring `--vendor-source`), so both entry points vendor the
+    // same bytes by default. See `run_scan_vendor_step`.
     Box::pin(vendor_records(
-        common, records, sources, detached, false, env, None,
+        common, records, sources, detached, false, env, service,
     ))
+}
+
+#[cfg(test)]
+mod service_config_tests {
+    use super::*;
+    use crate::args::GlobalArgs;
+
+    fn common_with_source(source: &str) -> GlobalArgs {
+        GlobalArgs {
+            vendor_source: source.to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// Regression: scan's vendored flow must build its service config FROM
+    /// `--vendor-source`, not hardcode build-only (the pre-fix `service =
+    /// None`). Under the default (`auto`), the config must permit the
+    /// vendoring service exactly as the `vendor` command's default does —
+    /// otherwise `scan --mode vendored` silently builds locally while a
+    /// plain `vendor` service-downloads, and the two commit different bytes /
+    /// lock integrity for the same patch (lock churn / merge conflicts).
+    #[test]
+    fn default_source_permits_service_like_vendor_command() {
+        let common = common_with_source("auto");
+        let cfg = scan_vendor_service_config(&common, None, false);
+        assert_eq!(cfg.source, VendorSource::Auto);
+        assert!(
+            cfg.source.may_use_service(),
+            "default scan --vendor must be able to use the service (matching `vendor`)"
+        );
+        assert!(!cfg.source.requires_service());
+    }
+
+    /// `--vendor-source service` must reach the fail-closed service path,
+    /// exactly as the `vendor` command interprets the same flag.
+    #[test]
+    fn service_source_requires_service() {
+        let common = common_with_source("service");
+        let cfg = scan_vendor_service_config(&common, None, false);
+        assert_eq!(cfg.source, VendorSource::Service);
+        assert!(cfg.source.requires_service());
+    }
+
+    /// `--vendor-source build` stays build-only (never contacts the service).
+    #[test]
+    fn build_source_never_uses_service() {
+        let common = common_with_source("build");
+        let cfg = scan_vendor_service_config(&common, None, false);
+        assert_eq!(cfg.source, VendorSource::Build);
+        assert!(!cfg.source.may_use_service());
+    }
+
+    /// The service overrides (`--vendor-url` / `--patch-server-url` /
+    /// `--offline`) thread through unchanged, so scan and `vendor` target the
+    /// same hosts.
+    #[test]
+    fn overrides_thread_through() {
+        let common = GlobalArgs {
+            vendor_source: "service".to_string(),
+            vendor_url: Some("https://vendor.example".to_string()),
+            patch_server_url: Some("https://patch.example".to_string()),
+            offline: true,
+            ..Default::default()
+        };
+        let cfg = scan_vendor_service_config(&common, None, false);
+        assert_eq!(cfg.vendor_url.as_deref(), Some("https://vendor.example"));
+        assert_eq!(
+            cfg.patch_server_url.as_deref(),
+            Some("https://patch.example")
+        );
+        assert!(cfg.offline);
+    }
 }

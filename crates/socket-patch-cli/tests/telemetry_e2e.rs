@@ -301,7 +301,16 @@ async fn get_emits_patch_fetched_telemetry_on_uuid_lookup_success() {
         "publishedAt": "2024-06-01T00:00:00Z",
         "license": "MIT",
         "description": "test patch",
-        "files": {},
+        // A recordable new-file patch (afterHash is the git-blob sha256 of
+        // the decoded blobContent "patched\n"). Post-#158, a patch whose
+        // applicable-files map is empty is a hard failure ("no applicable
+        // files"), so the success path this test asserts needs a real file.
+        "files": {
+            "package/index.js": {
+                "afterHash": "d2802877eb1c2f442d30d18abcb281cb2830875571624544f2f1acb36480997e",
+                "blobContent": "cGF0Y2hlZAo=",
+            }
+        },
         "vulnerabilities": {},
     });
     let mock = setup_mock(

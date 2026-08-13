@@ -31,7 +31,7 @@ fn format_unix_secs_rfc3339(secs: u64) -> String {
 /// Adapted to operate on a non-negative second count — socket-patch only
 /// ever stamps "now", so pre-1970 inputs are out of scope.
 ///
-/// Also the date backbone of `utils::telemetry`'s millisecond-precision
+/// Also the date backbone of `telemetry`'s millisecond-precision
 /// timestamps, so this is the single civil-date implementation in the crate.
 pub(crate) fn unix_to_ymdhms(secs: u64) -> (i32, u32, u32, u32, u32, u32) {
     let days = (secs / 86_400) as i64;

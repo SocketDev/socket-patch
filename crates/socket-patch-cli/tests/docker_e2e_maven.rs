@@ -303,9 +303,8 @@ echo "===PATCH VERIFIED===" >&2
 # Agent-mode VEX leg. The manifest scan --sync wrote carries {GHSA} (served in
 # the patch view); vex verifies the patched .pom on disk and attests it with
 # PLAIN agent provenance. --global/--ecosystems maven mirror the apply (the
-# maven crawler probes ~/.m2, gated by SOCKET_EXPERIMENTAL_MAVEN=1 from the
-# docker run env); --offline keeps vex local. The doc is emitted between
-# markers for the host-side oracle (no bind mount here).
+# maven crawler probes ~/.m2); --offline keeps vex local. The doc is emitted
+# between markers for the host-side oracle (no bind mount here).
 echo "===VEX OUTPUT===" >&2
 socket-patch vex --offline --cwd "$PWD" --output /tmp/out.vex.json \
   --product 'pkg:maven/org.test/e2e@1.0.0' --global --ecosystems maven >/tmp/vex.out 2>/tmp/vex.err
@@ -408,14 +407,6 @@ async fn maven_install_full_apply_chain() {
         "--rm",
         "--add-host=host.docker.internal:host-gateway",
         "-i",
-        // Maven crawler is gated by `SOCKET_EXPERIMENTAL_MAVEN=1` at
-        // runtime (see ecosystem_dispatch::maven_runtime_enabled).
-        // The gate exists because Maven apply corrupts jar sidecar
-        // checksums — operators have to opt in. Tests opt in
-        // explicitly so the docker run actually exercises the
-        // maven scan / apply path.
-        "-e",
-        "SOCKET_EXPERIMENTAL_MAVEN=1",
     ])
     .args(cov_docker_args())
     .args([

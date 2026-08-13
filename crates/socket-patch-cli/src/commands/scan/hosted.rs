@@ -25,6 +25,11 @@ const REDIRECT_CANDIDATE_FILES: &[&str] = &[
     "Cargo.toml",
     "Cargo.lock",
     ".cargo/config.toml",
+    // The LEGACY extensionless spelling: cargo reads `.cargo/config` in
+    // preference to `config.toml` when both exist, so the rewriter must see
+    // it (it wires the managed registry into whichever one is present) —
+    // otherwise the `[registries.…]` block lands in a file cargo ignores.
+    ".cargo/config",
     "composer.lock",
     "nuget.config",
     "packages.lock.json",
@@ -42,6 +47,9 @@ const REDIRECT_CANDIDATE_FILES: &[&str] = &[
     "settings.gradle.kts",
     "build.gradle",
     "build.gradle.kts",
+    // deno.lock is knowingly absent: deno is its own ecosystem and no
+    // redirect rewriter edits its integrity entries today — recording the
+    // decision here so the omission reads as deliberate, not forgotten.
 ];
 
 /// `pkg:<type>/<coordinate>@<version>` → `(type, coordinate, version)`. The
@@ -57,6 +65,42 @@ fn parse_purl_simple(purl: &str) -> Option<(String, String, String)> {
     Some((typ.to_string(), name, version.to_string()))
 }
 
+/// The hosted-mode JSON error envelope, for bail-outs that return before the
+/// success envelope at the bottom of [`run_redirect`] is built. When the
+/// classic scan object (`scan_result`, threaded in from `run`) is present it
+/// is reused so the error envelope carries the SAME top-level scan keys as
+/// the success path — folding in `status`/`error` and a minimal `redirect`
+/// block — instead of a bare shape that flips the schema. When absent (never
+/// in JSON mode today) the bare envelope is emitted. A `--json` consumer must
+/// always get parseable stdout — never empty output plus an exit code.
+fn emit_json_error(scan_result: Option<serde_json::Value>, message: &str) {
+    let mut result = scan_result.unwrap_or_else(|| serde_json::json!({ "status": "error" }));
+    result["status"] = serde_json::json!("error");
+    result["error"] = serde_json::json!(message);
+    if !result.get("redirect").is_some_and(|r| r.is_object()) {
+        result["redirect"] = serde_json::json!({ "mode": "hosted" });
+    }
+    println!("{}", serde_json::to_string_pretty(&result).unwrap());
+}
+
+/// Build the hosted `--json` success envelope: the classic scan object
+/// (`scan_result`, built by `run` — scannedPackages / totalPatches /
+/// canAccessPaidPatches plus the `packages` enumeration) with the redirect
+/// summary NESTED under `redirect`, mirroring vendored mode's nested `vendor`
+/// block. Extracted so the schema (classic scan keys + nested `redirect`) is
+/// unit-testable without a live API. When `scan_result` is absent (never in
+/// JSON mode today) a minimal `{status:"success"}` base is used so stdout is
+/// still parseable.
+fn build_redirect_json_envelope(
+    scan_result: Option<serde_json::Value>,
+    redirect: serde_json::Value,
+) -> serde_json::Value {
+    let mut result = scan_result.unwrap_or_else(|| serde_json::json!({ "status": "success" }));
+    result["status"] = serde_json::json!("success");
+    result["redirect"] = redirect;
+    result
+}
+
 /// `scan --redirect`: resolve hosted-patch references for the selected patches,
 /// then rewrite ONLY those dependencies' lockfile/registry-config entries to
 /// point at the hosted vendored patches (the byte-identical counterpart of the
@@ -67,6 +111,11 @@ pub(super) async fn run_redirect(
     effective_org_slug: Option<&str>,
     all_packages_with_patches: &[BatchPackagePatches],
     can_access_paid_patches: bool,
+    // The classic scan object `run` builds for the `--json` path (`Some` in
+    // JSON mode, `None` for human output). The redirect result is NESTED into
+    // it so the hosted `--json` envelope stays schema-consistent with every
+    // other scan; `.take()` at each terminal (error or success) folds it in.
+    mut scan_result: Option<serde_json::Value>,
 ) -> i32 {
     use socket_patch_core::manifest::schema::PatchRecord;
     use socket_patch_core::patch::redirect::{
@@ -83,7 +132,17 @@ pub(super) async fn run_redirect(
     .await
     {
         Ok(s) => s,
-        Err(code) => return code,
+        // Hosted mode has no discovery envelope to fold the message into at
+        // this point (it builds its `redirect` result further down).
+        // `discover_selected` already printed the message to stderr; a
+        // `--json` run additionally gets the machine-readable envelope so
+        // stdout is never empty on failure.
+        Err((code, message)) => {
+            if args.common.json {
+                emit_json_error(scan_result.take(), &message);
+            }
+            return code;
+        }
     };
 
     let mut skipped: Vec<serde_json::Value> = Vec::new();
@@ -101,7 +160,11 @@ pub(super) async fn run_redirect(
         let references = match api_client.fetch_registry_references(&uuids).await {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("failed to resolve patch references: {e}");
+                let message = format!("failed to resolve patch references: {e}");
+                eprintln!("{message}");
+                if args.common.json {
+                    emit_json_error(scan_result.take(), &message);
+                }
                 return 1;
             }
         };
@@ -249,7 +312,7 @@ pub(super) async fn run_redirect(
     let mut rush_warnings: Vec<serde_json::Value> = Vec::new();
     let mut rush_lock_keys: Vec<String> = Vec::new();
     if args.common.cwd.join("rush.json").is_file() {
-        let common_lock = "common/config/rush/pnpm-lock.yaml";
+        let common_lock = socket_patch_core::constants::npm_family::RUSH_COMMON_LOCK_REL;
         if let Ok(content) = std::fs::read_to_string(args.common.cwd.join(common_lock)) {
             files.insert(common_lock.to_string(), content);
             rush_lock_keys.push(common_lock.to_string());
@@ -302,6 +365,33 @@ pub(super) async fn run_redirect(
                  preventManualShrinkwrapChanges is enabled, `rush install` fails until \
                  `rush update` refreshes repo-state.json (the redirect survives `rush \
                  update`)",
+        }));
+    }
+
+    // pnpm >=11 enforces a lockfile supply-chain policy: it compares each
+    // resolution's tarball URL against the registry's published metadata and
+    // REFUSES the lock when they differ
+    // (`ERR_PNPM_TARBALL_URL_MISMATCH … has a tarball URL (https://patch.socket.dev/…)
+    // that does not match the registry's published metadata`). The hosted
+    // rewrite deliberately repoints tarball URLs at patch.socket.dev, so a
+    // pnpm >=11 install rejects the rewritten lock until the user opts in with
+    // `pnpm install --trust-lockfile` (which installs the patched artifact
+    // cleanly). Warn whenever the rewrite actually landed in ANY pnpm-lock.yaml
+    // — the plain root lock or a Rush nested/subspace lock (basename check).
+    let mut pnpm_warnings: Vec<serde_json::Value> = Vec::new();
+    if rewrite.files.keys().any(|key| {
+        std::path::Path::new(key)
+            .file_name()
+            .and_then(|n| n.to_str())
+            == Some("pnpm-lock.yaml")
+    }) {
+        pnpm_warnings.push(serde_json::json!({
+            "code": "redirect_pnpm_trust_lockfile",
+            "detail":
+                "pnpm-lock.yaml was repointed at patch.socket.dev; pnpm >=11 rejects \
+                 the rewritten lock with ERR_PNPM_TARBALL_URL_MISMATCH (its tarball \
+                 URL no longer matches the registry's published metadata). Install \
+                 with `pnpm install --trust-lockfile` to accept the patched artifacts",
         }));
     }
 
@@ -378,7 +468,11 @@ pub(super) async fn run_redirect(
                 let _ = std::fs::create_dir_all(parent);
             }
             if let Err(e) = std::fs::write(&path, content) {
-                eprintln!("failed to write {rel}: {e}");
+                let message = format!("failed to write {rel}: {e}");
+                eprintln!("{message}");
+                if args.common.json {
+                    emit_json_error(scan_result.take(), &message);
+                }
                 return 1;
             }
         }
@@ -414,10 +508,33 @@ pub(super) async fn run_redirect(
                 vendor_dir.join("redirect-state.json"),
                 format!("{}\n", serde_json::to_string_pretty(&ledger).unwrap()),
             ) {
-                eprintln!("failed to write .socket/vendor/redirect-state.json: {e}");
+                let message = format!("failed to write .socket/vendor/redirect-state.json: {e}");
+                eprintln!("{message}");
+                if args.common.json {
+                    emit_json_error(scan_result.take(), &message);
+                }
                 return 1;
             }
         }
+    }
+
+    // Cross-mode takeover: a committed vendored ledger (`.socket/vendor/state.json`)
+    // may still claim package(s) this project also has a hosted redirect ledger
+    // for — their tarballs would then be orphaned and that ledger stale. But the
+    // overlap alone does NOT prove hosted won: only warn for the package(s) the
+    // LIVE lockfile actually routes to `patch.socket.dev` (see
+    // `classify_overlap_takeover`), so a dry-run / no-op over a lock that still
+    // points at the vendored files stays silent instead of pointing cleanup at
+    // the live vendored ledger. Warn (JSON `warnings[]` and stderr) WITHOUT
+    // deleting the other mode's ledger; reconciliation is deferred (see PR Scope).
+    // Read after the ledger write above so a non-dry-run reflects this run.
+    let mut takeover_warnings: Vec<serde_json::Value> = Vec::new();
+    let superseded = super::classify_overlap_takeover(&args.common.cwd).await.redirect;
+    if !superseded.is_empty() {
+        takeover_warnings.push(serde_json::json!({
+            "code": super::REDIRECT_SUPERSEDES_VENDORED,
+            "detail": super::mode_takeover_detail(&superseded, /*current_is_hosted=*/ true),
+        }));
     }
 
     // Emit an OpenVEX attestation when `--vex` was requested. The redirected
@@ -460,20 +577,27 @@ pub(super) async fn run_redirect(
         warnings.extend(record_warnings.iter().cloned());
         warnings.extend(migration_warnings.iter().cloned());
         warnings.extend(rush_warnings.iter().cloned());
-        let mut result = serde_json::json!({
-            "status": "success",
-            "redirect": {
-                // Final mode naming: `--redirect` IS hosted mode. Additive
-                // key so JSON consumers can dispatch on the mode without
-                // inferring it from which sub-object is present.
-                "mode": "hosted",
-                "redirected": confirmed.len(),
-                "rewrittenFiles": rewritten,
-                "skipped": skipped,
-                "warnings": warnings,
-                "dryRun": args.common.dry_run,
-            }
+        warnings.extend(pnpm_warnings.iter().cloned());
+        warnings.extend(takeover_warnings.iter().cloned());
+        // Nest the redirect result under `redirect` inside the classic scan
+        // object (built by `run`, threaded in via `scan_result`), mirroring
+        // vendored mode's nested `vendor` block. This keeps the hosted `--json`
+        // envelope schema-consistent with the zero-discovery and non-hosted
+        // scan envelopes — same top-level scan keys (scannedPackages,
+        // totalPatches, canAccessPaidPatches) plus the `packages` enumeration —
+        // instead of the bare `{status, redirect}` it used to emit.
+        let redirect = serde_json::json!({
+            // Final mode naming: `--redirect` IS hosted mode. Additive key so
+            // JSON consumers can dispatch on the mode without inferring it from
+            // which sub-object is present.
+            "mode": "hosted",
+            "redirected": confirmed.len(),
+            "rewrittenFiles": rewritten,
+            "skipped": skipped,
+            "warnings": warnings,
+            "dryRun": args.common.dry_run,
         });
+        let mut result = build_redirect_json_envelope(scan_result.take(), redirect);
         if let Some(statements) = vex_statements {
             result["vex"] = serde_json::json!({
                 "path": args.vex.vex.as_ref().unwrap().display().to_string(),
@@ -498,8 +622,14 @@ pub(super) async fn run_redirect(
                 confirmed.len(),
                 rewritten.len()
             );
+            // Human output prints the bare strings — `Value`'s `Display`
+            // would JSON-quote them (`skipped "pkg:npm/x" ("forbidden")`).
             for s in &skipped {
-                eprintln!("  skipped {} ({})", s["purl"], s["reason"]);
+                eprintln!(
+                    "  skipped {} ({})",
+                    s["purl"].as_str().unwrap_or_default(),
+                    s["reason"].as_str().unwrap_or_default()
+                );
             }
             // Same warning set as the JSON envelope, same order: the
             // rewriter's own warnings first (e.g. `no package-lock.json`),
@@ -508,13 +638,19 @@ pub(super) async fn run_redirect(
                 eprintln!("  warning: {}", w.detail);
             }
             for w in &record_warnings {
-                eprintln!("  warning: {}", w["detail"]);
+                eprintln!("  warning: {}", w["detail"].as_str().unwrap_or_default());
             }
             for w in &migration_warnings {
-                eprintln!("  warning: {}", w["detail"]);
+                eprintln!("  warning: {}", w["detail"].as_str().unwrap_or_default());
             }
             for w in &rush_warnings {
-                eprintln!("  warning: {}", w["detail"]);
+                eprintln!("  warning: {}", w["detail"].as_str().unwrap_or_default());
+            }
+            for w in &pnpm_warnings {
+                eprintln!("  warning: {}", w["detail"].as_str().unwrap_or_default());
+            }
+            for w in &takeover_warnings {
+                eprintln!("  warning: {}", w["detail"].as_str().unwrap_or_default());
             }
             if let Some(statements) = vex_statements {
                 eprintln!(
@@ -536,4 +672,97 @@ pub(super) async fn run_redirect(
         }
     }
     vex_code
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_redirect_json_envelope, REDIRECT_CANDIDATE_FILES};
+    use socket_patch_core::constants::npm_family;
+
+    /// The classic scan object `run` builds for the `--json` path with ≥1
+    /// discovered package (scannedPackages/totalPatches/… + the `packages`
+    /// enumeration). Mirrors the `serde_json::json!` in `scan::run`.
+    fn classic_scan_result() -> serde_json::Value {
+        serde_json::json!({
+            "status": "success",
+            "scannedPackages": 3,
+            "lockfileOnlyPackages": 0,
+            "packagesWithPatches": 1,
+            "totalPatches": 2,
+            "freePatches": 2,
+            "paidPatches": 0,
+            "canAccessPaidPatches": false,
+            "packages": [
+                { "purl": "pkg:npm/minimist@1.2.2", "patches": [ { "uuid": "abc-123" } ] }
+            ],
+            "updates": [],
+        })
+    }
+
+    #[test]
+    fn hosted_json_envelope_nests_redirect_into_classic_scan_object() {
+        // Regression for hosted-scan-json-schema-flips-with-discovery /
+        // hosted-scan-json-omits-enumeration: with ≥1 package, the hosted
+        // `--json` envelope must carry the SAME top-level scan keys as a
+        // zero-discovery / non-hosted scan (the old bare `{status, redirect}`
+        // dropped them) AND nest the redirect summary under `redirect`.
+        let redirect = serde_json::json!({
+            "mode": "hosted",
+            "redirected": 1,
+            "rewrittenFiles": ["package-lock.json"],
+            "skipped": [],
+            "warnings": [],
+            "dryRun": false,
+        });
+        let envelope = build_redirect_json_envelope(Some(classic_scan_result()), redirect);
+
+        // Classic scan keys survive — the bug was that they did not.
+        assert_eq!(envelope["status"], "success");
+        assert_eq!(envelope["scannedPackages"], 3);
+        assert_eq!(envelope["packagesWithPatches"], 1);
+        assert_eq!(envelope["totalPatches"], 2);
+        assert_eq!(envelope["freePatches"], 2);
+        assert_eq!(envelope["paidPatches"], 0);
+        assert_eq!(envelope["canAccessPaidPatches"], false);
+        assert!(envelope["updates"].is_array());
+
+        // Per-package / patch-uuid enumeration is present (the omission).
+        assert!(envelope["packages"].is_array());
+        assert_eq!(envelope["packages"][0]["purl"], "pkg:npm/minimist@1.2.2");
+        assert_eq!(envelope["packages"][0]["patches"][0]["uuid"], "abc-123");
+
+        // Redirect result is NESTED, preserving every sub-field, not replacing
+        // the whole envelope.
+        let r = &envelope["redirect"];
+        assert!(r.is_object());
+        assert_eq!(r["mode"], "hosted");
+        assert_eq!(r["redirected"], 1);
+        assert_eq!(r["rewrittenFiles"][0], "package-lock.json");
+        assert!(r["skipped"].is_array());
+        assert!(r["warnings"].is_array());
+        assert_eq!(r["dryRun"], false);
+    }
+
+    #[test]
+    fn redirect_candidates_match_the_shared_npm_family_table() {
+        // Drift guard, both directions, without classifying the non-npm
+        // rows: every table row flagged redirect_candidate must be in the
+        // candidate list, and no npm-family row NOT so flagged may appear
+        // (bun.lockb's absence is deliberate — run_redirect auto-migrates
+        // it before rewriting).
+        for name in npm_family::names_with(|r| r.redirect_candidate) {
+            assert!(
+                REDIRECT_CANDIDATE_FILES.contains(&name),
+                "{name} is flagged redirect_candidate but missing from \
+                 REDIRECT_CANDIDATE_FILES"
+            );
+        }
+        for name in npm_family::names_with(|r| !r.redirect_candidate) {
+            assert!(
+                !REDIRECT_CANDIDATE_FILES.contains(&name),
+                "{name} is deliberately NOT a redirect candidate (see the \
+                 npm_family table) but appears in REDIRECT_CANDIDATE_FILES"
+            );
+        }
+    }
 }

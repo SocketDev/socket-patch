@@ -38,6 +38,9 @@ use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+#[path = "common/cache_env.rs"]
+mod cache_env;
+
 const ORG: &str = "test-org";
 const DEP: &str = "left-pad";
 const DEP_VERSION: &str = "1.3.0";
@@ -59,8 +62,10 @@ fn binary() -> PathBuf {
 }
 
 fn has_command(cmd: &str) -> bool {
-    Command::new(cmd)
-        .arg("--version")
+    let mut probe = Command::new(cmd);
+    probe.arg("--version");
+    cache_env::isolate(&mut probe);
+    probe
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
@@ -88,11 +93,10 @@ fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
 }
 
 fn npm(cwd: &Path, args: &[&str]) -> Output {
-    Command::new("npm")
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .expect("failed to run npm")
+    let mut cmd = Command::new("npm");
+    cmd.args(args).current_dir(cwd);
+    cache_env::isolate(&mut cmd);
+    cmd.output().expect("failed to run npm")
 }
 
 /// Standard-base64-encoded sha512 of `bytes` — the body of the npm-family
@@ -407,6 +411,7 @@ fn fresh_checkout_npm_ci(fx: &RedirectFixture) -> (PathBuf, Output) {
 // multi_thread: the CLI/npm subprocesses block a worker thread while wiremock
 // keeps serving the API + tarball routes on the others.
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "wall-bound real-npm install (~150s); runs on all 3 OSes as an e2e CI matrix leg"]
 async fn npm_redirect_fresh_checkout_npm_ci_installs_patched_bytes_and_vex_verifies() {
     let Some(fx) = redirect_scanned_project("main", false).await else {
         return;
@@ -474,6 +479,7 @@ async fn npm_redirect_fresh_checkout_npm_ci_installs_patched_bytes_and_vex_verif
 /// install. This is what makes the redirect safe to commit: a compromised or
 /// swapped hosted artifact cannot slip past the pin.
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "wall-bound real-npm install (~150s); runs on all 3 OSes as an e2e CI matrix leg"]
 async fn npm_redirect_tampered_hosted_tarball_fails_fresh_npm_ci() {
     let Some(fx) = redirect_scanned_project("tampered", true).await else {
         return;

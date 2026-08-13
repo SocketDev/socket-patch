@@ -35,9 +35,9 @@ libc = { workspace = true }
 
 [features]
 # Every ecosystem (npm, PyPI, Ruby gems, Go, Cargo, NuGet, Maven, Composer,
-# Deno) is unconditionally compiled in — there are no ecosystem feature gates.
-# Maven `apply` stays runtime-gated behind `SOCKET_EXPERIMENTAL_MAVEN=1`
-# (in-place jar patching corrupts sidecars); committable `vendor` is safe.
+# Deno) is unconditionally compiled in AND enabled at runtime — there are no
+# ecosystem feature gates and no runtime env gates (the old
+# SOCKET_EXPERIMENTAL_MAVEN/NUGET opt-ins are retired).
 # The only features left gate opt-in test suites:
 #
 # Enables the Docker-driven real-package e2e test suite under
@@ -67,7 +67,6 @@ zip = { workspace = true }
 hex = { workspace = true }
 wiremock = { workspace = true }
 portable-pty = { workspace = true }
-testcontainers = { workspace = true }
 base64 = { workspace = true }
 reqwest = { workspace = true }
 tempfile = { workspace = true }

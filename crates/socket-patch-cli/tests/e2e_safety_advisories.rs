@@ -11,8 +11,7 @@
 //!      apply runs fully offline.
 //!   4. Invoke `socket-patch apply --json` with `--global-prefix`
 //!      pointed at the package root, plus any per-ecosystem env
-//!      gates (e.g. `SOCKET_EXPERIMENTAL_NUGET=1`,
-//!      `NUGET_PACKAGES=<path>`, `GOMODCACHE=<path>`).
+//!      overrides (e.g. `NUGET_PACKAGES=<path>`, `GOMODCACHE=<path>`).
 //!   5. Parse the JSON envelope and assert the structured
 //!      `envelope.sidecars[]` record matches the ecosystem's
 //!      expected `code` / `severity` / `files[]` contract.
@@ -448,10 +447,7 @@ fn nuget_apply_deletes_metadata_and_records_files() {
     let env = apply_and_parse(
         cwd,
         &packages,
-        &[
-            ("NUGET_PACKAGES", packages.to_str().unwrap()),
-            ("SOCKET_EXPERIMENTAL_NUGET", "1"),
-        ],
+        &[("NUGET_PACKAGES", packages.to_str().unwrap())],
     );
 
     // Patch landed.
@@ -563,10 +559,7 @@ fn nuget_apply_with_non_utf8_filename_in_pkg_dir() {
     let env = apply_and_parse(
         cwd,
         &packages,
-        &[
-            ("NUGET_PACKAGES", packages.to_str().unwrap()),
-            ("SOCKET_EXPERIMENTAL_NUGET", "1"),
-        ],
+        &[("NUGET_PACKAGES", packages.to_str().unwrap())],
     );
 
     // Patch landed and .nupkg.metadata removal succeeded; the
@@ -648,10 +641,7 @@ fn nuget_apply_with_metadata_directory_reports_sidecar_fixup_failed() {
     let env = apply_and_parse(
         cwd,
         &packages,
-        &[
-            ("NUGET_PACKAGES", packages.to_str().unwrap()),
-            ("SOCKET_EXPERIMENTAL_NUGET", "1"),
-        ],
+        &[("NUGET_PACKAGES", packages.to_str().unwrap())],
     );
 
     // Patch landed (atomic write commits before the sidecar runs).
@@ -731,10 +721,7 @@ fn nuget_apply_signed_package_emits_files_and_advisory() {
     let env = apply_and_parse(
         cwd,
         &packages,
-        &[
-            ("NUGET_PACKAGES", packages.to_str().unwrap()),
-            ("SOCKET_EXPERIMENTAL_NUGET", "1"),
-        ],
+        &[("NUGET_PACKAGES", packages.to_str().unwrap())],
     );
 
     // Patch landed and the signature marker did NOT get clobbered.

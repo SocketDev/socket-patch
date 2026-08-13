@@ -2,7 +2,8 @@
 //! supplements, update detection against the existing manifest, vendor
 //! baseline pre-verification, and the table's vuln-ID / severity helpers.
 
-use socket_patch_core::api::types::{BatchPackagePatches, PatchSearchResult};
+use socket_patch_core::api::ranking::cmp_batch_infos;
+use socket_patch_core::api::types::{BatchPackagePatches, BatchPatchInfo, PatchSearchResult};
 use socket_patch_core::manifest::schema::PatchManifest;
 use socket_patch_core::utils::purl::{normalize_purl, strip_purl_qualifiers};
 use std::collections::HashSet;
@@ -38,7 +39,7 @@ pub(super) async fn lockfile_supplement(
     common: &GlobalArgs,
     crawled: &[socket_patch_core::crawlers::types::CrawledPackage],
 ) -> LockfileSupplement {
-    use socket_patch_core::patch::vendor::lock_inventory;
+    use socket_patch_core::vendor::lock_inventory;
 
     let mut out = LockfileSupplement::default();
     if common.global || common.global_prefix.is_some() {
@@ -98,7 +99,7 @@ pub(super) async fn vendored_ledger_supplement(
     if common.global || common.global_prefix.is_some() {
         return Vec::new();
     }
-    let Ok(state) = socket_patch_core::patch::vendor::load_state(&common.cwd).await else {
+    let Ok(state) = socket_patch_core::vendor::load_state(&common.cwd).await else {
         return Vec::new();
     };
     let crawled_norm: HashSet<String> = crawled
@@ -189,24 +190,148 @@ pub(super) fn detect_updates(
     };
     let mut updates = Vec::new();
     for pkg in packages {
-        let Some(existing) = manifest.patches.get(&pkg.purl) else {
+        // The candidate is the top-ranked patch — the one the apply path
+        // resolves to. Both sides rank with `api::ranking`, so the
+        // `[UPDATE]` marker and the JSON `updates` array track what
+        // `--apply` installs.
+        //
+        // Caveat, and the one place the two can still disagree: we rank
+        // BATCH-shaped patches here, while apply ranks the richer
+        // by-package shape. The batch response currently omits
+        // `publishedAt`, so when a package's top candidates tie on merge
+        // status AND severity, this falls through to the UUID tiebreak
+        // while apply correctly uses the date. `BatchPatchInfo` already
+        // deserializes `publishedAt` when present, so the divergence
+        // disappears the moment the endpoint emits it — no client change.
+        // (Verified live on pkg:npm/axios@1.6.0, two free HIGH patches.)
+        //
+        // `ApiClient` already returns each package's patches best-first, so
+        // `min_by` here is a cheap guard rather than a correction — but it
+        // is load-bearing for callers that build a `BatchPackagePatches`
+        // themselves rather than getting one from the client.
+        let Some(candidate) = pkg.patches.iter().min_by(|a, b| cmp_batch_infos(a, b)) else {
             continue;
         };
-        // Treat the first patch in the batch as the candidate the apply path
-        // would resolve to (mirrors `select_patches` ordering — newest-first
-        // for paid users, single-patch auto-select for free).
-        let Some(candidate) = pkg.patches.first() else {
+        // Manifest keys are written verbatim from the *patch* purl, which
+        // the API serves percent-encoded (`pkg:npm/%40scope/...`) and, for
+        // artifact-pinned ecosystems, qualified (`?artifact_id=...`); the
+        // batch *package* purl is the crawler's literal spelling. Bridge
+        // both divergences like the lockfile-only partition does: exact hit
+        // first, then a normalized qualifier-stripped comparison.
+        //
+        // Qualifier TWINS (one package recorded under two artifact-pinned
+        // keys, e.g. a pypi wheel + sdist pair) both match the stripped
+        // comparison. `manifest.patches` is a HashMap, so a bare `find`
+        // would pick a per-process-random twin; instead: any stale twin
+        // means an update is available, so prefer the first twin (in
+        // sorted-key order, for run-to-run stability) whose uuid differs
+        // from the candidate, and fall back to the first twin when all
+        // agree.
+        let existing = manifest.patches.get(&pkg.purl).or_else(|| {
+            let want = normalize_purl(strip_purl_qualifiers(&pkg.purl));
+            let mut twins: Vec<(&String, &socket_patch_core::manifest::schema::PatchRecord)> =
+                manifest
+                    .patches
+                    .iter()
+                    .filter(|(k, _)| normalize_purl(strip_purl_qualifiers(k)) == want)
+                    .collect();
+            twins.sort_by(|a, b| a.0.cmp(b.0));
+            twins
+                .iter()
+                .find(|(_, v)| v.uuid != candidate.uuid)
+                .or_else(|| twins.first())
+                .map(|(_, v)| *v)
+        });
+        let Some(existing) = existing else {
             continue;
         };
-        if candidate.uuid != existing.uuid {
-            updates.push(UpdateInfo {
-                purl: pkg.purl.clone(),
-                old_uuid: existing.uuid.clone(),
-                new_uuid: candidate.uuid.clone(),
-            });
+        // (a) Same patch already recorded — never an update.
+        if candidate.uuid == existing.uuid {
+            continue;
         }
+        // (b) The candidate out*ranks* the recorded patch, but "outranks"
+        // includes the pure tier/uuid tiebreaks and — because the batch
+        // endpoint routinely omits `publishedAt` — an epoch-0 date that is
+        // NOT real evidence of recency. When the recorded patch is still
+        // among the offered patches, `cmp_batch_infos` can crown an
+        // equal-or-older sibling as the "top" candidate purely on the uuid
+        // tiebreak, which used to nag a vendored project forever with a patch
+        // no newer than the one already committed. Only surface an update
+        // when the candidate GENUINELY supersedes the applied patch on a
+        // meaningful axis (severity, merge coverage, or a real,
+        // strictly-greater publish date).
+        //
+        // If the recorded patch is no longer offered at all, we cannot
+        // compare ages; a different, currently-available candidate is the
+        // best signal we have, so flag it (this is also the only behavior a
+        // manifest-only, no-batch record can produce).
+        if let Some(applied) = pkg.patches.iter().find(|p| p.uuid == existing.uuid) {
+            if !candidate_supersedes(candidate, applied) {
+                continue;
+            }
+        }
+        updates.push(UpdateInfo {
+            purl: pkg.purl.clone(),
+            old_uuid: existing.uuid.clone(),
+            new_uuid: candidate.uuid.clone(),
+        });
     }
     updates
+}
+
+/// Whether `candidate` genuinely supersedes the already-applied `applied`
+/// patch — strictly better on a MEANINGFUL ranking axis (severity, merge
+/// coverage, or a real, strictly-greater publish date), never on the pure
+/// tier/uuid tiebreaks or an absent-date (epoch-0) artifact.
+///
+/// This is the guard that kills the false `[UPDATE]` nag. Batch responses
+/// omit `publishedAt`, so [`cmp_batch_infos`] falls through to the uuid
+/// tiebreak and can rank an equal-or-older sibling above the applied patch;
+/// flagging that as an update perpetually nags a vendored project. Both
+/// patches are batch-shaped and drawn from the SAME package response, so this
+/// compares like with like, mirroring `api::ranking::rank_batch_info`.
+fn candidate_supersedes(candidate: &BatchPatchInfo, applied: &BatchPatchInfo) -> bool {
+    use socket_patch_core::api::date::parse_timestamp_secs;
+    use socket_patch_core::api::ranking::{merged_coverage, severity_order};
+
+    // Advisory count = inferred merge state: prefer GHSA ids, fall back to
+    // CVE ids only when no GHSA is named (so CVE aliases can't inflate it).
+    let advisories = |p: &BatchPatchInfo| {
+        if p.ghsa_ids.is_empty() {
+            p.cve_ids.len()
+        } else {
+            p.ghsa_ids.len()
+        }
+    };
+
+    // Severity: lower rank number = worse vulnerability. A candidate fixing a
+    // strictly worse advisory supersedes; a less-severe one never does.
+    let cand_sev = severity_order(candidate.severity.as_deref());
+    let applied_sev = severity_order(applied.severity.as_deref());
+    if cand_sev != applied_sev {
+        return cand_sev < applied_sev;
+    }
+
+    // Merge coverage: a patch folding in more advisories is broader.
+    let cand_cov = merged_coverage(advisories(candidate));
+    let applied_cov = merged_coverage(advisories(applied));
+    if cand_cov != applied_cov {
+        return cand_cov > applied_cov;
+    }
+
+    // Recency: only a REAL, strictly-greater publishedAt counts. A missing
+    // date (the batch norm) parses to `None` and is NOT treated as newer, so
+    // an equal-or-older sibling is never surfaced as an update. Parsing stays
+    // on the RFC-2822-aware `api::date` helper.
+    let cand_date = candidate
+        .published_at
+        .as_deref()
+        .and_then(parse_timestamp_secs);
+    let applied_date = applied
+        .published_at
+        .as_deref()
+        .and_then(parse_timestamp_secs);
+    matches!((cand_date, applied_date), (Some(c), Some(a)) if c > a)
 }
 
 /// Collect the deduplicated CVE and GHSA identifiers across every patch of
@@ -232,15 +357,11 @@ pub(super) fn collect_vuln_ids(pkg: &BatchPackagePatches) -> Vec<String> {
     cves.into_iter().chain(ghsas).collect()
 }
 
+/// Severity ordering for the scan table's SEVERITY column: lower = worse.
+/// Delegates to the workspace-wide ladder so the table, the selector and
+/// the API client can never disagree about what `moderate` means.
 pub(super) fn severity_order(s: &str) -> u8 {
-    match s.to_lowercase().as_str() {
-        "critical" => 0,
-        "high" => 1,
-        // GHSA emits `moderate`; same tier as medium (see get.rs severity_rank).
-        "medium" | "moderate" => 2,
-        "low" => 3,
-        _ => 4,
-    }
+    socket_patch_core::api::ranking::severity_order(Some(s))
 }
 
 #[cfg(test)]
@@ -306,6 +427,29 @@ mod tests {
                     ghsa_ids: Vec::new(),
                     severity: None,
                     title: String::new(),
+                    published_at: None,
+                })
+                .collect(),
+        }
+    }
+
+    /// `batch_with`, but each patch carries an explicit severity and
+    /// publish date so the ranking rungs above the uuid tiebreak are
+    /// actually exercised.
+    fn batch_ranked(purl: &str, patches: &[(&str, &str, &str)]) -> BatchPackagePatches {
+        BatchPackagePatches {
+            purl: purl.to_string(),
+            patches: patches
+                .iter()
+                .map(|(uuid, severity, published)| BatchPatchInfo {
+                    uuid: (*uuid).to_string(),
+                    purl: purl.to_string(),
+                    tier: "free".to_string(),
+                    cve_ids: Vec::new(),
+                    ghsa_ids: Vec::new(),
+                    severity: Some((*severity).to_string()),
+                    title: String::new(),
+                    published_at: Some((*published).to_string()),
                 })
                 .collect(),
         }
@@ -349,6 +493,53 @@ mod tests {
     }
 
     #[test]
+    fn detect_updates_bridges_qualified_manifest_keys() {
+        // Manifest keys for artifact-pinned ecosystems carry qualifiers
+        // (`?artifact_id=...`); the batch purl is bare. The stripped-purl
+        // bridge must match them — decode-only would silently drop these
+        // packages from `updates[]` again.
+        let m = manifest_with(&[("pkg:pypi/foo@1.0?artifact_id=foo-1.0.tar.gz", "uuid-a")]);
+        let pkgs = vec![batch_with("pkg:pypi/foo@1.0", &["uuid-b"])];
+        let updates = detect_updates(Some(&m), &pkgs);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].old_uuid, "uuid-a");
+        assert_eq!(updates[0].new_uuid, "uuid-b");
+    }
+
+    #[test]
+    fn detect_updates_qualifier_twins_are_deterministic_any_stale_wins() {
+        // One package recorded under two artifact-pinned keys (wheel +
+        // sdist). `manifest.patches` is a HashMap, so an unordered `find`
+        // would flip between the twins per process; the contract is: any
+        // stale twin means an update, `old_uuid` names the stale one, and
+        // repeated calls agree.
+        let m = manifest_with(&[
+            (
+                "pkg:pypi/foo@1.0?artifact_id=foo-1.0-py3-none-any.whl",
+                "uuid-new",
+            ),
+            ("pkg:pypi/foo@1.0?artifact_id=foo-1.0.tar.gz", "uuid-old"),
+        ]);
+        let pkgs = vec![batch_with("pkg:pypi/foo@1.0", &["uuid-new"])];
+        for _ in 0..16 {
+            let updates = detect_updates(Some(&m), &pkgs);
+            assert_eq!(updates.len(), 1, "a stale twin means an update");
+            assert_eq!(updates[0].old_uuid, "uuid-old");
+            assert_eq!(updates[0].new_uuid, "uuid-new");
+        }
+
+        // Both twins current -> no update, regardless of iteration order.
+        let m = manifest_with(&[
+            (
+                "pkg:pypi/foo@1.0?artifact_id=foo-1.0-py3-none-any.whl",
+                "uuid-new",
+            ),
+            ("pkg:pypi/foo@1.0?artifact_id=foo-1.0.tar.gz", "uuid-new"),
+        ]);
+        assert!(detect_updates(Some(&m), &pkgs).is_empty());
+    }
+
+    #[test]
     fn detect_updates_reports_multiple_updates() {
         let m = manifest_with(&[("pkg:npm/foo@1.0", "uuid-a"), ("pkg:npm/bar@2.0", "uuid-c")]);
         let pkgs = vec![
@@ -370,35 +561,125 @@ mod tests {
     }
 
     #[test]
-    fn detect_updates_uses_first_patch_as_candidate() {
-        // `detect_updates` mirrors `select_patches` by picking the first
-        // patch in the batch as the candidate UUID. Locking this in so a
-        // future select_patches refactor doesn't silently drift the two.
+    fn detect_updates_uses_the_highest_ranked_patch_as_candidate() {
+        // `detect_updates` must name the UUID the apply path will actually
+        // install, which is the top-ranked patch (`api::ranking`), NOT
+        // whatever the server happened to list first. Here the critical
+        // patch is listed last and is the older of the two.
         let m = manifest_with(&[("pkg:npm/foo@1.0", "uuid-a")]);
-        let pkgs = vec![batch_with("pkg:npm/foo@1.0", &["uuid-b", "uuid-c"])];
+        let pkgs = vec![batch_ranked(
+            "pkg:npm/foo@1.0",
+            &[
+                ("uuid-low-new", "low", "2026-06-01T00:00:00Z"),
+                ("uuid-crit-old", "critical", "2024-01-01T00:00:00Z"),
+            ],
+        )];
         let updates = detect_updates(Some(&m), &pkgs);
         assert_eq!(updates.len(), 1);
-        assert_eq!(updates[0].new_uuid, "uuid-b");
+        assert_eq!(updates[0].new_uuid, "uuid-crit-old");
+    }
+
+    #[test]
+    fn detect_updates_candidate_ordering_ignores_incoming_list_order() {
+        // Same input, reversed. A positional `.first()` would flip its
+        // answer; a ranked candidate must not.
+        let m = manifest_with(&[("pkg:npm/foo@1.0", "uuid-a")]);
+        let forward = batch_ranked(
+            "pkg:npm/foo@1.0",
+            &[
+                ("uuid-crit", "critical", "2024-01-01T00:00:00Z"),
+                ("uuid-high", "high", "2026-06-01T00:00:00Z"),
+            ],
+        );
+        let mut reversed = forward.clone();
+        reversed.patches.reverse();
+        assert_eq!(
+            detect_updates(Some(&m), &[forward])[0].new_uuid,
+            detect_updates(Some(&m), &[reversed])[0].new_uuid,
+        );
     }
 
     #[test]
     fn detect_updates_no_update_when_manifest_holds_candidate_despite_other_patches() {
         // Regression: the human-readable table once flagged `[UPDATE]` (and
         // bumped `updates_available`) whenever *any* batch patch differed from
-        // the manifest UUID. But the apply path resolves to the FIRST patch,
-        // so a manifest already holding that candidate is up to date even when
-        // the batch also lists older patches. The table and the JSON `updates`
-        // array must agree; both derive from this function, which compares the
-        // candidate (first) patch only.
-        let m = manifest_with(&[("pkg:npm/foo@1.0", "uuid-newest")]);
-        let pkgs = vec![batch_with(
+        // the manifest UUID. But the apply path resolves to the top-ranked
+        // patch, so a manifest already holding that candidate is up to date
+        // even when the batch also lists lesser patches. The table and the
+        // JSON `updates` array must agree; both derive from this function,
+        // which compares the ranked candidate only.
+        let m = manifest_with(&[("pkg:npm/foo@1.0", "uuid-critical")]);
+        let pkgs = vec![batch_ranked(
             "pkg:npm/foo@1.0",
-            &["uuid-newest", "uuid-older", "uuid-oldest"],
+            &[
+                ("uuid-low", "low", "2026-08-01T00:00:00Z"),
+                ("uuid-critical", "critical", "2024-01-01T00:00:00Z"),
+                ("uuid-medium", "medium", "2026-07-01T00:00:00Z"),
+            ],
         )];
         assert!(
             detect_updates(Some(&m), &pkgs).is_empty(),
-            "manifest already holds the candidate (first) patch — no update"
+            "manifest already holds the ranked candidate — no update"
         );
+    }
+
+    #[test]
+    fn detect_updates_no_nag_when_applied_patch_still_offered_and_batch_omits_dates() {
+        // Regression (false-update-nag-batch-ranking / -older-uuid): after
+        // vendoring, the batch endpoint re-lists BOTH the applied patch and a
+        // sibling and OMITS `publishedAt`. With no real date, `cmp_batch_infos`
+        // collapses to the uuid tiebreak and crowns whichever sibling sorts
+        // first. `uuid-a` sorts before the applied `uuid-b`, so it becomes the
+        // ranked candidate — but it is no genuine improvement (same severity,
+        // same coverage, no newer date), so it must NOT be surfaced as an
+        // update. Before the fix this flagged a perpetual `[UPDATE]` pointing
+        // at an equal-or-older patch.
+        let m = manifest_with(&[("pkg:npm/foo@1.0", "uuid-b")]);
+        let pkgs = vec![batch_with("pkg:npm/foo@1.0", &["uuid-a", "uuid-b"])];
+        assert!(
+            detect_updates(Some(&m), &pkgs).is_empty(),
+            "an equal-or-older sibling with no real date must not be an update"
+        );
+    }
+
+    #[test]
+    fn detect_updates_still_flags_a_higher_severity_candidate_offered_alongside_applied() {
+        // Guard against over-suppression: the applied `uuid-low` is still
+        // offered, but a CRITICAL sibling supersedes it on severity. That is a
+        // genuine update and must still be surfaced.
+        let m = manifest_with(&[("pkg:npm/foo@1.0", "uuid-low")]);
+        let pkgs = vec![batch_ranked(
+            "pkg:npm/foo@1.0",
+            &[
+                ("uuid-low", "low", "2026-06-01T00:00:00Z"),
+                ("uuid-crit", "critical", "2024-01-01T00:00:00Z"),
+            ],
+        )];
+        let updates = detect_updates(Some(&m), &pkgs);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].old_uuid, "uuid-low");
+        assert_eq!(updates[0].new_uuid, "uuid-crit");
+    }
+
+    #[test]
+    fn detect_updates_flags_a_genuinely_newer_candidate_when_batch_supplies_dates() {
+        // The date rung is real evidence when the batch supplies it: a
+        // strictly-newer sibling the apply path would install IS an update,
+        // even though it sits alongside the applied patch. `uuid-new` sorts
+        // LAST by uuid, so only its real 2026 date can make it the winner —
+        // and the recency guard must accept that as a genuine supersede.
+        let m = manifest_with(&[("pkg:npm/foo@1.0", "uuid-aold")]);
+        let pkgs = vec![batch_ranked(
+            "pkg:npm/foo@1.0",
+            &[
+                ("uuid-aold", "high", "2024-01-01T00:00:00Z"),
+                ("uuid-new", "high", "2026-06-01T00:00:00Z"),
+            ],
+        )];
+        let updates = detect_updates(Some(&m), &pkgs);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].old_uuid, "uuid-aold");
+        assert_eq!(updates[0].new_uuid, "uuid-new");
     }
 
     // ---- collect_vuln_ids --------------------------------------------------
@@ -416,6 +697,7 @@ mod tests {
                 ghsa_ids: ghsas.iter().map(|s| (*s).to_string()).collect(),
                 severity: None,
                 title: String::new(),
+                published_at: None,
             }],
         }
     }
@@ -461,6 +743,7 @@ mod tests {
                     ghsa_ids: vec![],
                     severity: None,
                     title: String::new(),
+                    published_at: None,
                 },
                 BatchPatchInfo {
                     uuid: "u2".to_string(),
@@ -470,6 +753,7 @@ mod tests {
                     ghsa_ids: vec!["GHSA-aaaa-aaaa-aaaa".to_string()],
                     severity: None,
                     title: String::new(),
+                    published_at: None,
                 },
             ],
         };
