@@ -32,6 +32,31 @@ async fn received_paths(mock: &MockServer) -> Vec<String> {
         .collect()
 }
 
+/// A single-file patch-view `files` map that survives PR #158's
+/// "patch has no applicable files" guardrail (5d7eb6f): a fetched view
+/// whose `files_for_manifest` map is empty is now an exit-1 failure, not a
+/// silent `applied:1`. The tests below assert SELECTION / paid-token /
+/// drift-warning / manifest-replacement behavior — the empty `"files": {}`
+/// they used to carry was only ever a lazy stand-in, never the point.
+///
+/// Modeled on the passing `get_invariants::patch_response_json` fixture: a
+/// net-new file with an all-zero `beforeHash`, a real git-blob `afterHash`
+/// (via the shared `common::git_sha256` oracle over the decoded blob), and
+/// the matching base64 `blobContent`. These tests all pass `--save-only`,
+/// which records without verifying content on disk, so one recordable file
+/// is enough to make `files_for_manifest` non-empty and clear the guard.
+fn single_file_view() -> serde_json::Value {
+    // base64 "cGF0Y2hlZAo=" decodes to exactly these bytes.
+    let blob_bytes = b"patched\n";
+    serde_json::json!({
+        "package/index.js": {
+            "beforeHash": "0000000000000000000000000000000000000000000000000000000000000000",
+            "afterHash":  common::git_sha256(blob_bytes),
+            "blobContent": "cGF0Y2hlZAo=",
+        }
+    })
+}
+
 #[test]
 fn get_one_off_and_save_only_together_errors() {
     // The two flags are mutually exclusive — using both must fail.
@@ -100,7 +125,7 @@ async fn get_with_id_flag_selects_specific_patch() {
             "uuid": UUID_B,
             "purl": purl,
             "publishedAt": "2024-02-01T00:00:00Z",
-            "files": {},
+            "files": single_file_view(),
             "vulnerabilities": {},
             "description": "Second patch",
             "license": "MIT",
@@ -405,7 +430,7 @@ async fn get_uuid_returns_paid_patch_with_token_succeeds() {
             "uuid": UUID_A,
             "purl": purl,
             "publishedAt": "2024-01-01T00:00:00Z",
-            "files": {},
+            "files": single_file_view(),
             "vulnerabilities": {},
             "description": "Paid patch with token access",
             "license": "MIT",
@@ -496,7 +521,7 @@ async fn get_on_vendored_purl_warns_about_uuid_drift() {
             "uuid": UUID_B,
             "purl": purl,
             "publishedAt": "2024-02-01T00:00:00Z",
-            "files": {},
+            "files": single_file_view(),
             "vulnerabilities": {},
             "description": "Newer patch",
             "license": "MIT",
@@ -583,7 +608,7 @@ async fn get_uuid_replacing_existing_manifest_entry_reports_updated() {
             "uuid": UUID_B,
             "purl": purl,
             "publishedAt": "2024-02-01T00:00:00Z",
-            "files": {},
+            "files": single_file_view(),
             "vulnerabilities": {},
             "description": "Newer patch for the same purl",
             "license": "MIT",
