@@ -411,6 +411,7 @@ fn download_params(args: &ScanArgs, save_only: bool, json: bool, silent: bool) -
         api_overrides: args.common.api_client_overrides(),
         all_releases: args.all_releases,
         strict: args.common.strict,
+        ecosystems: args.common.ecosystems.clone(),
         persist_blobs: args.mode != Some(ScanMode::Vendored),
     }
 }
