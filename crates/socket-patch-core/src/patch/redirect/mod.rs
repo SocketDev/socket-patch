@@ -175,10 +175,25 @@ fn rewrite_npm_lock(
         .into_iter()
         .find(|f| files.contains_key(*f));
     let Some(lockfile) = lockfile else {
-        result.warnings.push(RewriteWarning {
-            code: "redirect_npm_no_lockfile".into(),
-            detail: "no package-lock.json / npm-shrinkwrap.json present".into(),
+        // Another npm-family lock (pnpm — root or nested Rush —, yarn, bun)
+        // owns the redirect for these deps and its rewriter emits its own
+        // per-dep diagnostics; warning "no package-lock.json" on every
+        // successful pnpm/yarn/bun/Rush run is pure noise that trains users
+        // to ignore the warnings channel. Only warn when NO npm-family
+        // lockfile exists at all.
+        let sibling_lock_present = files.keys().any(|k| {
+            k == "yarn.lock"
+                || k == "bun.lock"
+                || k == "bun.lockb"
+                || k == "pnpm-lock.yaml"
+                || k.ends_with("/pnpm-lock.yaml")
         });
+        if !sibling_lock_present {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_npm_no_lockfile".into(),
+                detail: "no package-lock.json / npm-shrinkwrap.json present".into(),
+            });
+        }
         return;
     };
     let Ok(mut lock) = serde_json::from_str::<Value>(&files[lockfile]) else {
@@ -672,11 +687,30 @@ fn rewrite_pnpm_lock(
         return;
     }
     // Work on an editable copy of each lock so a single dep can be rewritten
-    // in whichever locks contain it.
-    let mut contents: Vec<(&String, String, bool)> = lock_keys
-        .iter()
-        .map(|k| (*k, files[*k].clone(), false))
-        .collect();
+    // in whichever locks contain it. A CRLF lock can never match the rewrite
+    // grammar (its pattern anchors on `):\n`, but every CRLF line puts a `\r`
+    // byte before the `\n`), so the miss used to surface per-dep as a
+    // misleading `redirect_pnpm_entry_not_found`. Name the real cause instead
+    // and skip the lock (fail-closed, as before).
+    let mut contents: Vec<(&String, String, bool)> = Vec::new();
+    for k in &lock_keys {
+        let content = files[*k].clone();
+        if content.contains("\r\n") {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_pnpm_crlf_unsupported".into(),
+                detail: format!(
+                    "{k} has CRLF (Windows) line endings; the redirect's \
+                     byte-surgical rewrite only supports LF — normalize the \
+                     file to LF line endings and re-run"
+                ),
+            });
+            continue;
+        }
+        contents.push((*k, content, false));
+    }
+    if contents.is_empty() {
+        return;
+    }
     for dep in &npm {
         let fname = full_name(dep);
         let Some(sha512) = dep.integrity.sha512.clone() else {
@@ -910,7 +944,23 @@ fn rewrite_yarn_berry(
         return;
     }
 
-    // Whole-file gates: refuse any lock whose cache checksum we can't reproduce
+    // Whole-file gates. A CRLF lock collapses the `\n\n` block grammar (a
+    // `\r\n\r\n` file contains no `\n\n`), so `berry_cache_key` used to come
+    // back None and the refusal below misdiagnosed a perfectly good
+    // `cacheKey: 10c0` lock as "cacheKey is `(missing)`" — sending Windows
+    // users chasing yarn cache config instead of line endings. Same
+    // fail-closed outcome, honest diagnosis.
+    if content.contains("\r\n") {
+        result.warnings.push(RewriteWarning {
+            code: "redirect_yarn_berry_crlf_unsupported".into(),
+            detail: "yarn.lock has CRLF (Windows) line endings; the redirect's \
+                     byte-surgical rewrite only supports LF — normalize the \
+                     file to LF line endings and re-run"
+                .into(),
+        });
+        return;
+    }
+    // Refuse any lock whose cache checksum we can't reproduce
     // offline. A guessed `checksum:` bricks installs (YN0018).
     let key = berry_cache_key(content);
     if key.as_deref() != Some(YARN_BERRY_SUPPORTED_CACHE_KEY) {
@@ -4266,6 +4316,211 @@ snapshots:
             "re-run over a redirected scoped entry must be a no-op: files={:?} edits={:?}",
             second.files.keys(),
             second.edits
+        );
+    }
+
+    fn pnpm_v9_lock(name: &str, version: &str) -> String {
+        format!(
+            "lockfileVersion: '9.0'
+
+importers:
+  .:
+    dependencies:
+      {name}:
+        specifier: {version}
+        version: {version}
+
+packages:
+  {name}@{version}:
+    resolution: {{integrity: sha512-UPSTREAM==}}
+
+snapshots:
+  {name}@{version}: {{}}
+"
+        )
+    }
+
+    /// A clean, fully-successful redirect must emit EXACTLY zero rewrite
+    /// warnings — for the npm lock AND for a pnpm-only project. The pnpm leg
+    /// regressed silently for a long time: `rewrite_npm_lock` pushed a
+    /// spurious `redirect_npm_no_lockfile` onto every pnpm/yarn/bun/Rush run
+    /// because those projects (correctly) have no package-lock.json.
+    #[test]
+    fn clean_success_run_emits_no_warnings_for_npm_and_pnpm() {
+        let ovr = npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://patch.test/left-pad-1.3.0.tgz",
+            "sha512-PATCHED==",
+        );
+
+        // npm: package-lock.json only.
+        let mut files = BTreeMap::new();
+        files.insert(
+            "package-lock.json".to_string(),
+            r#"{
+  "name": "app",
+  "lockfileVersion": 3,
+  "packages": {
+    "": { "name": "app", "version": "0.0.0" },
+    "node_modules/left-pad": {
+      "version": "1.3.0",
+      "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+      "integrity": "sha512-UPSTREAM=="
+    }
+  }
+}
+"#
+            .to_string(),
+        );
+        let r = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        assert!(
+            r.files.contains_key("package-lock.json"),
+            "anchor: the npm lock must have been rewritten"
+        );
+        assert_eq!(
+            warning_codes(&r),
+            Vec::<&str>::new(),
+            "a clean npm success must emit NO warnings"
+        );
+
+        // pnpm: pnpm-lock.yaml only — no package-lock.json exists, by design.
+        let mut files = BTreeMap::new();
+        files.insert(
+            "pnpm-lock.yaml".to_string(),
+            pnpm_v9_lock("left-pad", "1.3.0"),
+        );
+        let r = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        assert!(
+            r.files.contains_key("pnpm-lock.yaml"),
+            "anchor: the pnpm lock must have been rewritten"
+        );
+        assert_eq!(
+            warning_codes(&r),
+            Vec::<&str>::new(),
+            "a clean pnpm success must emit NO warnings (regression: spurious \
+             redirect_npm_no_lockfile)"
+        );
+    }
+
+    /// The `redirect_npm_no_lockfile` warning is gated on NO npm-family lock
+    /// being present at all: yarn-only and Rush nested-pnpm-only projects are
+    /// handled by their own rewriters and must not carry npm noise, while a
+    /// genuinely lockfile-less project still gets the warning.
+    #[test]
+    fn npm_no_lockfile_warning_gated_on_sibling_npm_family_locks() {
+        let ovr = npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://patch.test/left-pad-1.3.0.tgz",
+            "sha512-PATCHED==",
+        );
+
+        // yarn classic only: rewritten by the yarn rewriter, zero warnings.
+        let mut files = BTreeMap::new();
+        files.insert(
+            "yarn.lock".to_string(),
+            "left-pad@^1.3.0:\n  version \"1.3.0\"\n  resolved \
+             \"https://registry.yarnpkg.com/left-pad/-/left-pad-1.3.0.tgz#ab\"\n  \
+             integrity sha512-UPSTREAM==\n"
+                .to_string(),
+        );
+        let r = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        assert!(
+            r.files.contains_key("yarn.lock"),
+            "anchor: yarn.lock must have been rewritten"
+        );
+        assert_eq!(
+            warning_codes(&r),
+            Vec::<&str>::new(),
+            "a clean yarn-classic success must emit NO warnings"
+        );
+
+        // Rush: only a NESTED pnpm lock (no root lock of any kind).
+        let mut files = BTreeMap::new();
+        files.insert(
+            "common/config/rush/pnpm-lock.yaml".to_string(),
+            pnpm_v9_lock("left-pad", "1.3.0"),
+        );
+        let r = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        assert!(
+            r.files.contains_key("common/config/rush/pnpm-lock.yaml"),
+            "anchor: the nested Rush lock must have been rewritten"
+        );
+        assert_eq!(
+            warning_codes(&r),
+            Vec::<&str>::new(),
+            "a clean Rush success must emit NO warnings"
+        );
+
+        // No lockfile anywhere: the warning still fires (unchanged contract).
+        let files = BTreeMap::new();
+        let r = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        assert!(
+            warning_codes(&r).contains(&"redirect_npm_no_lockfile"),
+            "a lockfile-less project must still warn: {:?}",
+            r.warnings
+        );
+    }
+
+    /// A CRLF berry lock must be diagnosed as a line-ending problem, not as
+    /// `cacheKey is \`(missing)\`` — the lock's cacheKey IS 10c0; only the
+    /// `\n\n` block grammar fails on `\r\n\r\n`. Fail-closed either way.
+    #[test]
+    fn berry_crlf_lock_diagnosed_as_crlf_not_missing_cache_key() {
+        let checksum = format!("10c0/{}", "7".repeat(128));
+        let ovr = berry_override("left-pad", "1.3.0", "http://p.test/lp.tgz", &checksum);
+        let mut files = BTreeMap::new();
+        files.insert(
+            "yarn.lock".to_string(),
+            berry_lock("10c0").replace('\n', "\r\n"),
+        );
+        let mut r = RewriteResult::default();
+        rewrite_yarn_berry(&files, std::slice::from_ref(&ovr), &mut r);
+        assert!(r.files.is_empty(), "CRLF lock must not be rewritten");
+        assert_eq!(
+            warning_codes(&r),
+            vec!["redirect_yarn_berry_crlf_unsupported"],
+            "the refusal must name CRLF, not the cache key: {:?}",
+            r.warnings
+        );
+        assert!(
+            r.warnings[0].detail.contains("CRLF"),
+            "detail must name the line endings: {}",
+            r.warnings[0].detail
+        );
+    }
+
+    /// A CRLF pnpm lock gets a dedicated CRLF warning instead of the
+    /// misleading per-dep `redirect_pnpm_entry_not_found` (the entry exists;
+    /// only the LF-anchored grammar cannot see it). Fail-closed either way.
+    #[test]
+    fn pnpm_crlf_lock_gets_dedicated_crlf_warning() {
+        let ovr = npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://patch.test/left-pad-1.3.0.tgz",
+            "sha512-PATCHED==",
+        );
+        let mut files = BTreeMap::new();
+        files.insert(
+            "pnpm-lock.yaml".to_string(),
+            pnpm_v9_lock("left-pad", "1.3.0").replace('\n', "\r\n"),
+        );
+        let mut r = RewriteResult::default();
+        rewrite_pnpm_lock(&files, std::slice::from_ref(&ovr), &mut r);
+        assert!(r.files.is_empty(), "CRLF lock must not be rewritten");
+        assert_eq!(
+            warning_codes(&r),
+            vec!["redirect_pnpm_crlf_unsupported"],
+            "the refusal must name CRLF, not entry-not-found: {:?}",
+            r.warnings
+        );
+        assert!(
+            r.warnings[0].detail.contains("pnpm-lock.yaml")
+                && r.warnings[0].detail.contains("CRLF"),
+            "detail must name the file and the line endings: {}",
+            r.warnings[0].detail
         );
     }
 }

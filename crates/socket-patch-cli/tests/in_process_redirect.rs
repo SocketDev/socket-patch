@@ -1649,6 +1649,54 @@ async fn pnpm_lock_redirect_warns_to_trust_lockfile() {
     );
 }
 
+/// A clean, fully-successful hosted run must carry an EXACT warning set — not
+/// merely "contains X". Presence-only assertions let spurious warnings ride
+/// along unnoticed: every pnpm/yarn/bun/Rush run shipped a bogus
+/// `redirect_npm_no_lockfile` ("no package-lock.json present") because the
+/// npm rewriter warned whenever ITS lock was absent, with no regard for the
+/// sibling lock that was successfully rewritten. npm success = zero warnings;
+/// pnpm success = exactly the trust-lockfile install caveat.
+#[tokio::test]
+#[serial]
+async fn clean_success_warning_set_is_exact_for_npm_and_pnpm() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+
+    // npm project (package-lock.json): NO warnings of any kind.
+    let npm = tempfile::tempdir().unwrap();
+    write_project(npm.path());
+    let env = run_redirect_subprocess(npm.path(), &server.uri());
+    assert_eq!(env["status"], "success", "envelope: {env}");
+    assert_eq!(
+        env["redirect"]["redirected"], 1,
+        "anchor: the npm lock must have been redirected: {env}"
+    );
+    assert_eq!(
+        warning_codes(&env),
+        Vec::<String>::new(),
+        "a clean npm success must emit an EMPTY warning set: {env}"
+    );
+
+    // pnpm project (pnpm-lock.yaml only — no package-lock.json, by design):
+    // EXACTLY the pnpm >=11 trust-lockfile caveat, nothing else.
+    let pnpm = tempfile::tempdir().unwrap();
+    write_pnpm_project(pnpm.path());
+    let env = run_redirect_subprocess(pnpm.path(), &server.uri());
+    assert_eq!(env["status"], "success", "envelope: {env}");
+    assert_eq!(
+        env["redirect"]["redirected"], 1,
+        "anchor: the pnpm lock must have been redirected: {env}"
+    );
+    assert_eq!(
+        warning_codes(&env),
+        vec!["redirect_pnpm_trust_lockfile".to_string()],
+        "a clean pnpm success must emit EXACTLY the trust-lockfile caveat \
+         (regression: spurious redirect_npm_no_lockfile): {env}"
+    );
+}
+
 /// Cargo's hosted redirect wires the managed sparse registry into
 /// `.cargo/config.toml` — but a project carrying the LEGACY extensionless
 /// `.cargo/config` is one cargo READS INSTEAD (it warns about the duplicate
