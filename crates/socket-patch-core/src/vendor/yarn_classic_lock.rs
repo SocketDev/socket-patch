@@ -701,7 +701,7 @@ pub(super) fn classic_field<'a>(lines: &'a [String], field: &str) -> Option<&'a 
 
 /// Split a comma-joined key into its patterns, honoring quoting; the
 /// surrounding quotes are dropped from each pattern.
-pub(super) fn split_key_patterns(key: &str) -> Vec<String> {
+pub(crate) fn split_key_patterns(key: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut in_quotes = false;
@@ -726,7 +726,7 @@ pub(super) fn split_key_patterns(key: &str) -> Vec<String> {
 }
 
 /// Split `name@range` at the first `@` past a leading `@scope/` marker.
-pub(super) fn split_pattern(pattern: &str) -> Option<(&str, &str)> {
+pub(crate) fn split_pattern(pattern: &str) -> Option<(&str, &str)> {
     let from = usize::from(pattern.starts_with('@'));
     let at = pattern[from..].find('@')? + from;
     let (name, range) = (&pattern[..at], &pattern[at + 1..]);
@@ -738,7 +738,7 @@ pub(super) fn split_pattern(pattern: &str) -> Option<(&str, &str)> {
 
 /// The real package a key pattern stands for: its name, unless the range is
 /// an `npm:` alias — then the aliased target's name.
-pub(super) fn pattern_real_name(pattern: &str) -> Option<&str> {
+pub(crate) fn pattern_real_name(pattern: &str) -> Option<&str> {
     let (name, range) = split_pattern(pattern)?;
     if let Some(aliased) = range.strip_prefix("npm:") {
         return match split_pattern(aliased) {

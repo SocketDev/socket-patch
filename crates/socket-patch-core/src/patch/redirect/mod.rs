@@ -792,14 +792,40 @@ fn rewrite_yarn_classic(
     overrides: &[DepOverride],
     result: &mut RewriteResult,
 ) {
+    use crate::vendor::yarn_classic_lock::{pattern_real_name, split_key_patterns, split_pattern};
+
     let npm: Vec<&DepOverride> = overrides.iter().filter(|o| o.ecosystem == "npm").collect();
     if npm.is_empty() || !files.contains_key("yarn.lock") {
         return;
     }
-    let content = &files["yarn.lock"];
-    if Regex::new(r"(?m)^__metadata:").unwrap().is_match(content) {
+    let raw = &files["yarn.lock"];
+    if Regex::new(r"(?m)^__metadata:").unwrap().is_match(raw) {
         return; // yarn-berry — not classic
     }
+    // CRLF locks (core.autocrlf Windows checkouts — yarn v1 parses them fine)
+    // are processed LF-normalized and re-expanded on output, so untouched
+    // lines round-trip byte-identically. Without this, `split("\n\n")` never
+    // splits a CRLF file: the whole lock becomes ONE block and the
+    // leftmost-match replaces below would rewrite the FIRST entry in the
+    // file, not the target's. Bare `\r`s outside a CRLF pair make the
+    // round-trip lossy, so such a lock is refused untouched.
+    let crlf = raw.contains('\r');
+    let normalized: String;
+    let content: &str = if crlf {
+        normalized = raw.replace("\r\n", "\n");
+        if normalized.contains('\r') {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_yarn_classic_unsupported_line_endings".into(),
+                detail: "yarn.lock contains bare carriage returns (mixed line endings); \
+                         leaving it untouched"
+                    .into(),
+            });
+            return;
+        }
+        &normalized
+    } else {
+        raw
+    };
     let mut blocks: Vec<String> = content.split("\n\n").map(String::from).collect();
     let resolved_re = Regex::new(r#"\n {2}resolved "[^"]*""#).unwrap();
     let integrity_re = Regex::new(r"\n {2}integrity [^\n]*").unwrap();
@@ -813,15 +839,59 @@ fn rewrite_yarn_classic(
             });
             continue;
         };
-        let header_re =
-            Regex::new(&(String::from(r#"(?m)^ *"?"#) + &regex::escape(&fname) + "@")).unwrap();
         let version_re =
             Regex::new(&(String::from(r#"\n {2}version ""#) + &regex::escape(&dep.version) + "\""))
                 .unwrap();
+        let mut matched_any = false;
+        let mut alias_skipped = false;
         for block in blocks.iter_mut() {
-            if !header_re.is_match(block) || !version_re.is_match(block) {
+            // The block's key line names its consumers; resolve every
+            // comma-joined pattern to the REAL package it stands for
+            // (`alias@npm:target@range` → target). A key like
+            // `<fname>@npm:<other-pkg>@…` — yarn v1's fork-substitution
+            // idiom — resolves to <other-pkg>, so it is NOT ours to touch:
+            // matching on the alias name alone would hijack the fork.
+            let Some(key_line) = block
+                .lines()
+                .find(|l| !l.is_empty() && !l.starts_with([' ', '\t', '#']))
+            else {
+                continue;
+            };
+            let Some(key) = key_line.strip_suffix(':') else {
+                continue;
+            };
+            let patterns = split_key_patterns(key);
+            if patterns.is_empty()
+                || !patterns
+                    .iter()
+                    .all(|p| pattern_real_name(p) == Some(fname.as_str()))
+            {
                 continue;
             }
+            if !version_re.is_match(block) {
+                continue;
+            }
+            // A block reached only through `alias@npm:<fname>@range`
+            // descriptors is left byte-identical (mirroring the berry
+            // rewriter), but never silently: that copy keeps installing the
+            // unpatched artifact.
+            if !patterns
+                .iter()
+                .any(|p| split_pattern(p).is_some_and(|(n, _)| n == fname))
+            {
+                alias_skipped = true;
+                result.warnings.push(RewriteWarning {
+                    code: "redirect_yarn_classic_alias_skipped".into(),
+                    detail: format!(
+                        "lock entry `{key}` consumes {fname}@{} only through npm: alias \
+                         descriptors; the hosted redirect does not rewrite alias entries, \
+                         so this copy stays unpatched",
+                        dep.version
+                    ),
+                });
+                continue;
+            }
+            matched_any = true;
             let frag = dep
                 .integrity
                 .sha1
@@ -852,21 +922,38 @@ fn rewrite_yarn_classic(
                     .to_string();
             }
             if rewritten != *block {
+                // Ledger originals record the on-disk byte form, so a future
+                // revert of a CRLF lock can match what the file really held.
+                let (edit_original, edit_new) = if crlf {
+                    (block.replace('\n', "\r\n"), rewritten.replace('\n', "\r\n"))
+                } else {
+                    (block.clone(), rewritten.clone())
+                };
                 result.edits.push(FileEdit {
                     path: "yarn.lock".into(),
                     kind: "redirect_yarn_classic_entry".into(),
                     action: "rewritten".into(),
                     key: Some(format!("{fname}@{}", dep.version)),
-                    original: Some(Value::String(block.clone())),
-                    new: Some(Value::String(rewritten.clone())),
+                    original: Some(Value::String(edit_original)),
+                    new: Some(Value::String(edit_new)),
                 });
                 *block = rewritten;
                 changed = true;
             }
         }
+        if !matched_any && !alias_skipped {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_yarn_classic_entry_not_found".into(),
+                detail: format!("no yarn.lock entry resolving {fname}@{}", dep.version),
+            });
+        }
     }
     if changed {
-        result.files.insert("yarn.lock".into(), blocks.join("\n\n"));
+        let mut out = blocks.join("\n\n");
+        if crlf {
+            out = out.replace('\n', "\r\n");
+        }
+        result.files.insert("yarn.lock".into(), out);
     }
 }
 
@@ -1013,6 +1100,7 @@ fn rewrite_yarn_berry(
             Regex::new(&(String::from(r"\n {2}version: ") + &regex::escape(&dep.version) + "\n"))
                 .unwrap();
         let mut matched_any = false;
+        let mut alias_skipped = false;
         for block in blocks.iter_mut() {
             // A block's key is its first line up to a trailing colon; skip
             // header comment blocks and the leading `__metadata` block.
@@ -1036,6 +1124,31 @@ fn rewrite_yarn_berry(
             let names: std::collections::BTreeSet<&str> =
                 parsed.iter().map(|p| p.unwrap().0).collect();
             if !names.contains(fname.as_str()) {
+                // An `alias@npm:<fname>@range` descriptor resolves the
+                // patched package under a different ident. The redirect
+                // never rewrites those, but that must not be silent — this
+                // copy keeps installing the unpatched artifact, and the
+                // generic not-found warning would point at the wrong cause.
+                if version_re.is_match(block)
+                    && parsed.iter().any(|p| {
+                        p.unwrap()
+                            .1
+                            .strip_prefix("npm:")
+                            .and_then(split_berry_descriptor)
+                            .is_some_and(|(real, _)| real == fname)
+                    })
+                {
+                    alias_skipped = true;
+                    result.warnings.push(RewriteWarning {
+                        code: "redirect_yarn_berry_alias_skipped".into(),
+                        detail: format!(
+                            "lock entry `{raw_key}` consumes {fname}@{} only through an \
+                             npm: alias descriptor; the hosted redirect does not rewrite \
+                             alias entries, so this copy stays unpatched",
+                            dep.version
+                        ),
+                    });
+                }
                 continue;
             }
             if names.len() > 1 {
@@ -1107,7 +1220,7 @@ fn rewrite_yarn_berry(
                 changed = true;
             }
         }
-        if !matched_any {
+        if !matched_any && !alias_skipped {
             result.warnings.push(RewriteWarning {
                 code: "redirect_yarn_berry_entry_not_found".into(),
                 detail: format!("no npm: lock entry resolving {fname}@{}", dep.version),
@@ -3590,6 +3703,269 @@ mod tests {
             .warnings
             .iter()
             .any(|w| w.code == "redirect_yarn_berry_ambiguous_entry"));
+    }
+
+    /// Two-entry classic lock: a decoy entry FIRST, the target second — the
+    /// shape that exposed the CRLF wrong-entry rewrite.
+    fn classic_lock_two_entries() -> String {
+        "# THIS IS AN AUTOGENERATED FILE. DO NOT EDIT THIS FILE DIRECTLY.\n\
+         # yarn lockfile v1\n\n\n\
+         abbrev@^1.0.0:\n  version \"1.1.1\"\n  \
+         resolved \"https://registry.yarnpkg.com/abbrev/-/abbrev-1.1.1.tgz#aaaa\"\n  \
+         integrity sha512-DECOYdecoy==\n\n\
+         left-pad@^1.3.0:\n  version \"1.3.0\"\n  \
+         resolved \"https://registry.yarnpkg.com/left-pad/-/left-pad-1.3.0.tgz#bbbb\"\n  \
+         integrity sha512-UPSTREAMupstream==\n"
+            .to_string()
+    }
+
+    /// A CRLF classic lock (Windows `core.autocrlf` checkout) must rewrite
+    /// the TARGET entry, not whichever entry happens to come first, and every
+    /// untouched line must keep its CRLF ending byte-exactly. Regression:
+    /// `split("\n\n")` never matched in a CRLF file, so the whole lock was
+    /// one block and the leftmost `resolved`/`integrity` — the decoy's —
+    /// were rewritten (then confirmed and attested downstream).
+    #[test]
+    fn yarn_classic_crlf_lock_rewrites_only_the_target_entry() {
+        let ovr = npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://p.test/lp.tgz",
+            "sha512-PATCHED==",
+        );
+
+        let mut files = BTreeMap::new();
+        files.insert(
+            "yarn.lock".to_string(),
+            classic_lock_two_entries().replace('\n', "\r\n"),
+        );
+        let mut r = RewriteResult::default();
+        rewrite_yarn_classic(&files, std::slice::from_ref(&ovr), &mut r);
+        assert!(r.warnings.is_empty(), "clean rewrite: {:?}", r.warnings);
+        let out = r
+            .files
+            .get("yarn.lock")
+            .expect("yarn.lock must be rewritten");
+        assert!(
+            out.contains(
+                "abbrev@^1.0.0:\r\n  version \"1.1.1\"\r\n  \
+                 resolved \"https://registry.yarnpkg.com/abbrev/-/abbrev-1.1.1.tgz#aaaa\"\r\n  \
+                 integrity sha512-DECOYdecoy==\r\n"
+            ),
+            "the decoy entry must stay byte-identical: {out}"
+        );
+        assert!(
+            out.contains(
+                "left-pad@^1.3.0:\r\n  version \"1.3.0\"\r\n  \
+                 resolved \"http://p.test/lp.tgz\"\r\n  integrity sha512-PATCHED==\r\n"
+            ),
+            "the target entry must pin the hosted artifact: {out}"
+        );
+        assert_eq!(
+            out.matches('\n').count(),
+            out.matches("\r\n").count(),
+            "every line must keep its CRLF ending: {out}"
+        );
+
+        // The CRLF output is exactly the LF rewrite re-expanded.
+        let mut lf_files = BTreeMap::new();
+        lf_files.insert("yarn.lock".to_string(), classic_lock_two_entries());
+        let mut lf_r = RewriteResult::default();
+        rewrite_yarn_classic(&lf_files, std::slice::from_ref(&ovr), &mut lf_r);
+        assert_eq!(
+            out,
+            &lf_r.files["yarn.lock"].replace('\n', "\r\n"),
+            "CRLF rewrite must equal the LF rewrite modulo line endings"
+        );
+
+        // Ledger originals carry the on-disk (CRLF) byte form for revert.
+        assert_eq!(r.edits.len(), 1);
+        let original = r.edits[0].original.as_ref().unwrap().as_str().unwrap();
+        assert!(
+            original.contains("\r\n") && original.contains("left-pad@^1.3.0:"),
+            "edit original must record the CRLF bytes: {original:?}"
+        );
+    }
+
+    /// Bare carriage returns outside a CRLF pair make the normalize/expand
+    /// round-trip lossy — the lock is refused untouched with a warning.
+    #[test]
+    fn yarn_classic_mixed_line_endings_are_refused() {
+        let mixed =
+            classic_lock_two_entries()
+                .replace('\n', "\r\n")
+                .replacen("UPSTREAM", "UP\rSTREAM", 1);
+        let mut files = BTreeMap::new();
+        files.insert("yarn.lock".to_string(), mixed);
+        let ovr = npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://p.test/lp.tgz",
+            "sha512-PATCHED==",
+        );
+        let mut r = RewriteResult::default();
+        rewrite_yarn_classic(&files, std::slice::from_ref(&ovr), &mut r);
+        assert!(
+            r.files.is_empty() && r.edits.is_empty(),
+            "mixed-EOL lock must stay untouched: {:?}",
+            r.files
+        );
+        assert_eq!(
+            r.warnings[0].code,
+            "redirect_yarn_classic_unsupported_line_endings"
+        );
+    }
+
+    /// `"<fname>@npm:<other-pkg>@…"` is yarn v1's fork-substitution idiom:
+    /// the block resolves a DIFFERENT package that merely tracks the patched
+    /// version. It must never be hijacked onto the upstream patched artifact;
+    /// the dep surfaces as not-found instead.
+    #[test]
+    fn yarn_classic_fork_alias_block_is_not_hijacked() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "yarn.lock".to_string(),
+            "# yarn lockfile v1\n\n\n\
+             \"left-pad@npm:totally-other@^1.3.0\":\n  version \"1.3.0\"\n  \
+             resolved \"https://registry.yarnpkg.com/totally-other/-/totally-other-1.3.0.tgz#cccc\"\n  \
+             integrity sha512-FORKfork==\n"
+                .to_string(),
+        );
+        let ovr = npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://p.test/lp.tgz",
+            "sha512-PATCHED==",
+        );
+        let mut r = RewriteResult::default();
+        rewrite_yarn_classic(&files, std::slice::from_ref(&ovr), &mut r);
+        assert!(
+            r.files.is_empty() && r.edits.is_empty(),
+            "the fork block must stay byte-identical: {:?}",
+            r.files
+        );
+        assert_eq!(r.warnings[0].code, "redirect_yarn_classic_entry_not_found");
+    }
+
+    /// The opposite alias direction — `"alias@npm:<fname>@…"` consuming the
+    /// patched package under another name — is skipped with a SPECIFIC
+    /// warning (not silence, not a misleading not-found).
+    #[test]
+    fn yarn_classic_alias_only_consumer_warns_specifically() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "yarn.lock".to_string(),
+            "# yarn lockfile v1\n\n\n\
+             \"safe-pad@npm:left-pad@^1.3.0\":\n  version \"1.3.0\"\n  \
+             resolved \"https://registry.yarnpkg.com/left-pad/-/left-pad-1.3.0.tgz#bbbb\"\n  \
+             integrity sha512-UPSTREAMupstream==\n"
+                .to_string(),
+        );
+        let ovr = npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://p.test/lp.tgz",
+            "sha512-PATCHED==",
+        );
+        let mut r = RewriteResult::default();
+        rewrite_yarn_classic(&files, std::slice::from_ref(&ovr), &mut r);
+        assert!(r.files.is_empty() && r.edits.is_empty());
+        assert_eq!(r.warnings[0].code, "redirect_yarn_classic_alias_skipped");
+        assert!(
+            !r.warnings
+                .iter()
+                .any(|w| w.code == "redirect_yarn_classic_entry_not_found"),
+            "the alias warning replaces the generic not-found: {:?}",
+            r.warnings
+        );
+    }
+
+    /// A merged key serving BOTH a direct and an alias descriptor of the
+    /// patched package (yarn v1 merges patterns resolving identically) is
+    /// still rewritten — every pattern resolves to the patched package.
+    #[test]
+    fn yarn_classic_merged_direct_and_alias_key_is_rewritten() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "yarn.lock".to_string(),
+            "# yarn lockfile v1\n\n\n\
+             left-pad@^1.3.0, \"safe-pad@npm:left-pad@^1.3.0\":\n  version \"1.3.0\"\n  \
+             resolved \"https://registry.yarnpkg.com/left-pad/-/left-pad-1.3.0.tgz#bbbb\"\n  \
+             integrity sha512-UPSTREAMupstream==\n"
+                .to_string(),
+        );
+        let ovr = npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://p.test/lp.tgz",
+            "sha512-PATCHED==",
+        );
+        let mut r = RewriteResult::default();
+        rewrite_yarn_classic(&files, std::slice::from_ref(&ovr), &mut r);
+        assert!(r.warnings.is_empty(), "no warnings: {:?}", r.warnings);
+        let out = r.files.get("yarn.lock").expect("must rewrite");
+        assert!(
+            out.contains("resolved \"http://p.test/lp.tgz\"")
+                && out.contains("left-pad@^1.3.0, \"safe-pad@npm:left-pad@^1.3.0\":"),
+            "merged key preserved, resolution repointed: {out}"
+        );
+    }
+
+    /// A granted dep with no matching lock entry (version drift, not
+    /// installed) must warn instead of vanishing silently — every sibling
+    /// npm-family rewriter already surfaces this.
+    #[test]
+    fn yarn_classic_entry_not_found_warns() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "yarn.lock".to_string(),
+            "# yarn lockfile v1\n\n\n\
+             left-pad@^1.2.0:\n  version \"1.2.0\"\n  \
+             resolved \"https://registry.yarnpkg.com/left-pad/-/left-pad-1.2.0.tgz#dddd\"\n  \
+             integrity sha512-OLDold==\n"
+                .to_string(),
+        );
+        let ovr = npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://p.test/lp.tgz",
+            "sha512-PATCHED==",
+        );
+        let mut r = RewriteResult::default();
+        rewrite_yarn_classic(&files, std::slice::from_ref(&ovr), &mut r);
+        assert!(r.files.is_empty() && r.edits.is_empty());
+        assert_eq!(r.warnings[0].code, "redirect_yarn_classic_entry_not_found");
+    }
+
+    /// Berry flavor of the alias hole: the lock key's descriptor ident is the
+    /// alias, but the entry plainly resolves the patched package — the skip
+    /// must name the alias cause, not claim the entry is missing.
+    #[test]
+    fn yarn_berry_alias_only_consumer_warns_specifically() {
+        let checksum = format!("10c0/{}", "7".repeat(128));
+        let ovr = berry_override("left-pad", "1.3.0", "http://p.test/lp.tgz", &checksum);
+        let mut files = BTreeMap::new();
+        files.insert(
+            "yarn.lock".to_string(),
+            format!(
+                "# header\n\n__metadata:\n  version: 8\n  cacheKey: 10c0\n\n\
+                 \"safe-pad@npm:left-pad@^1.3.0\":\n  version: 1.3.0\n  \
+                 resolution: \"left-pad@npm:1.3.0\"\n  checksum: 10c0/{}\n  \
+                 languageName: node\n  linkType: hard\n",
+                "3".repeat(128)
+            ),
+        );
+        let mut r = RewriteResult::default();
+        rewrite_yarn_berry(&files, std::slice::from_ref(&ovr), &mut r);
+        assert!(r.files.is_empty() && r.edits.is_empty());
+        assert_eq!(r.warnings[0].code, "redirect_yarn_berry_alias_skipped");
+        assert!(
+            !r.warnings
+                .iter()
+                .any(|w| w.code == "redirect_yarn_berry_entry_not_found"),
+            "the alias warning replaces the generic not-found: {:?}",
+            r.warnings
+        );
     }
 
     fn bun_lock_file(entry: &str, version: u64) -> String {
