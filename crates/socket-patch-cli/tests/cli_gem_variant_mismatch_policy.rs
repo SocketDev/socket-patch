@@ -7,15 +7,21 @@
 //! Release-variant ecosystems (gem/pypi/maven) route through the variant
 //! loop instead, whose installed-distribution gate used to skip ANY
 //! variant whose representative file mismatched — making the default
-//! policy unreachable for them: a SINGLETON base (one manifest record for
-//! the `package@version`, the common case) with a locally-modified file
-//! failed with "no matching variant found" instead of warn-overwriting.
+//! policy unreachable for them: an UNQUALIFIED SINGLETON base (one bare
+//! manifest record for the `package@version`, the common case) with a
+//! locally-modified file failed with "no matching variant found" instead
+//! of warn-overwriting.
 //!
 //! Behaviors pinned (all offline, real binary, synthetic gem trees):
-//!   * singleton + locally-modified file: default apply warns
+//!   * unqualified singleton + locally-modified file: default apply warns
 //!     (`content_mismatch_overwritten`) AND applies the full afterHash
 //!     bytes; `--strict` refuses (file untouched, exit 1); `--force`
 //!     keeps applying as before.
+//!   * QUALIFIED singleton (`?platform=`…): UNCHANGED — it names one
+//!     specific distribution and the representative-hash gate is the only
+//!     platform resolution (the crawler drops the gem dir's platform
+//!     suffix), so a wrong-platform install still fails closed with
+//!     "no matching variant found" and the file stays untouched.
 //!   * multi-variant base: UNCHANGED — only the installed variant is
 //!     applied; the mismatched sibling is skipped, never warn-overwritten
 //!     (a sibling mismatch means "different distribution", not "locally
@@ -266,6 +272,66 @@ fn singleton_mismatch_force_still_applies() {
 
 fn multi_purl(platform: &str) -> String {
     format!("pkg:gem/{MULTI_NAME}@{MULTI_VERSION}?platform={platform}")
+}
+
+/// A QUALIFIED singleton keeps the fail-closed gate: a lone
+/// `?platform=x86_64-linux` record names one specific distribution, and
+/// the representative-hash check is the ONLY thing resolving whether that
+/// distribution is the one on disk (the crawler drops the gem dir's
+/// platform suffix). With an arm64-darwin gem installed, the default
+/// apply must NOT overwrite it with the linux variant's bytes — the
+/// Bundler plugin auto-applies with `--silent`, where the warn half of
+/// warn-and-apply is invisible, and a later rollback would restore the
+/// LINUX before-bytes onto the darwin install. It fails exactly like a
+/// multi-variant base with no matching variant.
+#[test]
+fn qualified_singleton_wrong_platform_fails_closed() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let linux_patched = with_marker(LINUX_PRISTINE, LINUX_MARKER);
+    // On disk: the arm64-darwin gem, whose bytes match NEITHER of the
+    // linux record's hashes.
+    let file = install_gem(
+        tmp.path(),
+        &format!("{MULTI_NAME}-{MULTI_VERSION}-arm64-darwin"),
+        &format!("lib/{MULTI_NAME}.rb"),
+        DARWIN_BEFORE,
+    );
+    write_socket_dir(
+        tmp.path(),
+        serde_json::json!({
+            multi_purl("x86_64-linux"): patch_record(
+                UUID_LINUX,
+                "lib/nokogiri.rb",
+                &git_sha256(LINUX_PRISTINE),
+                &git_sha256(&linux_patched),
+            ),
+        }),
+        &[(&git_sha256(&linux_patched), linux_patched.as_slice())],
+    );
+    // Fixture sanity: the darwin bytes must match neither hash, or the
+    // wrong-platform path under test is never taken.
+    assert_ne!(git_sha256(DARWIN_BEFORE), git_sha256(LINUX_PRISTINE));
+    assert_ne!(git_sha256(DARWIN_BEFORE), git_sha256(&linux_patched));
+
+    let (code, _stdout, stderr) = run_apply(tmp.path(), &[]);
+    assert_eq!(
+        code, 1,
+        "a qualified singleton whose distribution is not on disk must fail closed; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("no matching variant found"),
+        "the failure must stay the no-matching-variant error; stderr={stderr}"
+    );
+    assert!(
+        !stderr.contains("content_mismatch_overwritten"),
+        "a wrong-distribution record must never be surfaced as a \
+         local-modification overwrite; stderr={stderr}"
+    );
+    assert_eq!(
+        std::fs::read(&file).expect("read file"),
+        DARWIN_BEFORE,
+        "the installed distribution's bytes must be untouched"
+    );
 }
 
 /// Multi-variant fixture: the x86_64-linux variant is installed (its

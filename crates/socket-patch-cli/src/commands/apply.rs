@@ -69,12 +69,20 @@ async fn ensure_blobs_for_mismatches(
     args: &ApplyArgs,
     manifest: &PatchManifest,
     all_packages: &HashMap<String, PathBuf>,
+    vendored_purls: &HashSet<String>,
     staged: &mut StagedSources,
 ) {
     if args.common.strict && !args.force {
         return; // strict fails on mismatch — nothing to fetch
     }
-    let needed = mismatch_blob_gaps(manifest, all_packages, &staged.blobs, args.force).await;
+    let needed = mismatch_blob_gaps(
+        manifest,
+        all_packages,
+        vendored_purls,
+        &staged.blobs,
+        args.force,
+    )
+    .await;
     if needed.is_empty() {
         return;
     }
@@ -124,14 +132,18 @@ async fn ensure_blobs_for_mismatches(
 /// exact-key lookup misses every one of them. Match records by
 /// qualifier-stripped key, and probe only the variants the apply loop
 /// will actually attempt (its representative-file installed-distribution
-/// gate, applied to multi-variant bases only and bypassed by `--force`)
-/// so a skipped sibling variant's files don't trigger spurious fetches
-/// or `--offline` warnings. A SINGLETON base is always attempted (the
-/// mismatch-policy fall-through), so its mismatched files are probed
-/// unconditionally.
+/// gate, bypassed by `--force`) so a skipped sibling variant's files
+/// don't trigger spurious fetches or `--offline` warnings. An UNQUALIFIED
+/// singleton base is always attempted (the mismatch-policy fall-through),
+/// so its mismatched files are probed unconditionally; a QUALIFIED
+/// singleton keeps the gate, mirroring the apply loop. Vendor-owned bases
+/// are skipped outright: the apply loop never attempts them (their
+/// results are synthesized up front), so their drifted files must not
+/// queue fetches either.
 async fn mismatch_blob_gaps(
     manifest: &PatchManifest,
     all_packages: &HashMap<String, PathBuf>,
+    vendored_purls: &HashSet<String>,
     blobs_path: &Path,
     force: bool,
 ) -> HashSet<String> {
@@ -139,14 +151,26 @@ async fn mismatch_blob_gaps(
     for (purl, pkg_path) in all_packages {
         let variant_eco = Ecosystem::from_purl(purl).is_some_and(|e| e.supports_release_variants());
         let stripped = strip_purl_qualifiers(purl);
-        let records: Vec<&PatchRecord> = manifest
+        let records: Vec<(&String, &PatchRecord)> = manifest
             .patches
             .iter()
             .filter(|(key, _)| *key == purl || strip_purl_qualifiers(key) == stripped)
-            .map(|(_, record)| record)
             .collect();
-        let gated = variant_eco && !force && records.len() > 1;
-        for record in records {
+        if vendored_purls.contains(purl.as_str())
+            || vendored_purls.contains(stripped)
+            || records
+                .iter()
+                .any(|(key, _)| vendored_purls.contains(key.as_str()))
+        {
+            continue;
+        }
+        let gated = variant_eco
+            && !force
+            && (records.len() > 1
+                || records
+                    .first()
+                    .is_some_and(|(key, _)| key.as_str() != stripped));
+        for (_, record) in records {
             if gated {
                 if let Some((file_name, file_info)) = representative_file(&record.files) {
                     let status = verify_file_patch(pkg_path, file_name, file_info)
@@ -1075,7 +1099,7 @@ async fn apply_patches_inner(
     }
 
     // Apply patches
-    ensure_blobs_for_mismatches(args, &manifest, &all_packages, &mut staged).await;
+    ensure_blobs_for_mismatches(args, &manifest, &all_packages, &vendored_purls, &mut staged).await;
     let sources = staged.as_patch_sources();
     let policy = mismatch_policy(args.force, args.common.strict);
     let mut has_errors = false;
@@ -1141,18 +1165,26 @@ async fn apply_patches_inner(
                 // attempting it would only produce a spurious failure.
                 // Mirrors `select_installed_variants`, used by rollback/get.
                 //
-                // Multi-variant bases ONLY: siblings are what make a
-                // mismatch mean "different distribution". A SINGLETON base
-                // (the common bare `pkg:gem/name@ver` manifest key) has no
-                // sibling to disambiguate against — a mismatch there is
-                // locally-modified bytes on the only candidate, exactly what
-                // the default mismatch policy covers (warn + apply the full
-                // verified patched content; `--strict` refuses). Gating the
-                // singleton made that documented policy unreachable for
-                // gem/pypi/maven, so it falls through to
-                // `apply_package_patch`, whose `MismatchPolicy` handles it
-                // like the npm branch below.
-                if !args.force && variants.len() > 1 {
+                // Exempt only an UNQUALIFIED singleton (the common bare
+                // `pkg:gem/name@ver` manifest key): it names no
+                // distribution, so a mismatch there is locally-modified
+                // bytes on the only candidate — exactly what the default
+                // mismatch policy covers (warn + apply the full verified
+                // patched content; `--strict` refuses). Gating it made that
+                // documented policy unreachable for gem/pypi/maven, so it
+                // falls through to `apply_package_patch`, whose
+                // `MismatchPolicy` handles it like the npm branch below.
+                // A QUALIFIED singleton (`?platform=`…) stays gated: it
+                // names one specific distribution, and — because the
+                // crawler drops the installed dir's platform suffix (see
+                // ruby_crawler's `parse_dir_name_version`) — this hash
+                // check is the ONLY thing resolving whether that
+                // distribution is the one on disk. Falling through would
+                // let a lone x86_64-linux record silently overwrite a
+                // darwin install in the Bundler plugin's `--silent`
+                // auto-apply, where the warn half of warn-and-apply is
+                // invisible.
+                if !args.force && (variants.len() > 1 || variants[0] != base_purl) {
                     let first_status = match representative_file(&patch.files) {
                         Some((file_name, file_info)) => Some(
                             verify_file_patch(pkg_path, file_name, file_info)
@@ -1675,7 +1707,8 @@ mod tests {
         let mut all_packages = HashMap::new();
         all_packages.insert("pkg:pypi/foo@1.0.0".to_string(), pkg.clone());
 
-        let needed = mismatch_blob_gaps(&manifest, &all_packages, &blobs, false).await;
+        let needed =
+            mismatch_blob_gaps(&manifest, &all_packages, &HashSet::new(), &blobs, false).await;
         assert_eq!(
             needed,
             HashSet::from(["3".repeat(64)]),
@@ -1687,11 +1720,11 @@ mod tests {
     /// installed distribution (its representative file mismatches) is
     /// skipped by the apply loop, so its blobs must not be queued — that
     /// would mean spurious downloads and spurious `--offline` "will fail
-    /// to apply" warnings on every run. The gate only exists for
-    /// multi-variant bases (a singleton is always attempted — see the
-    /// singleton test below), so the group carries an installed wheel
-    /// sibling alongside the non-installed sdist. Under `--force` every
-    /// variant IS attempted, so then its blob must be queued.
+    /// to apply" warnings on every run. An unqualified singleton is
+    /// always attempted (see the singleton test below), so the group
+    /// carries an installed wheel sibling alongside the non-installed
+    /// sdist. Under `--force` every variant IS attempted, so then its
+    /// blob must be queued.
     #[tokio::test]
     async fn mismatch_blob_gaps_skips_non_installed_variant_unless_forced() {
         use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
@@ -1744,13 +1777,15 @@ mod tests {
         let mut all_packages = HashMap::new();
         all_packages.insert("pkg:pypi/foo@1.0.0".to_string(), pkg.clone());
 
-        let needed = mismatch_blob_gaps(&manifest, &all_packages, &blobs, false).await;
+        let needed =
+            mismatch_blob_gaps(&manifest, &all_packages, &HashSet::new(), &blobs, false).await;
         assert!(
             needed.is_empty(),
             "a non-installed sibling variant is never attempted, so its blobs must not be queued: {needed:?}"
         );
 
-        let needed = mismatch_blob_gaps(&manifest, &all_packages, &blobs, true).await;
+        let needed =
+            mismatch_blob_gaps(&manifest, &all_packages, &HashSet::new(), &blobs, true).await;
         assert_eq!(
             needed,
             HashSet::from(["5".repeat(64)]),
@@ -1758,13 +1793,13 @@ mod tests {
         );
     }
 
-    /// A SINGLETON release-variant base is always attempted by the apply
-    /// loop (the mismatch-policy fall-through: no sibling exists to make a
-    /// mismatch mean "different distribution"), so its mismatched file's
-    /// afterHash blob must be queued even though the representative file
-    /// mismatches — otherwise the default Warn policy has no bytes to
-    /// overwrite with under `--download-mode diff` and the apply fails
-    /// instead of warn-overwriting.
+    /// An UNQUALIFIED singleton release-variant base is always attempted
+    /// by the apply loop (the mismatch-policy fall-through: it names no
+    /// distribution, so a mismatch means locally-modified bytes), so its
+    /// mismatched file's afterHash blob must be queued even though the
+    /// representative file mismatches — otherwise the default Warn policy
+    /// has no bytes to overwrite with under `--download-mode diff` and
+    /// the apply fails instead of warn-overwriting.
     #[tokio::test]
     async fn mismatch_blob_gaps_singleton_mismatch_queued() {
         let dir = tempfile::tempdir().unwrap();
@@ -1788,11 +1823,112 @@ mod tests {
         let mut all_packages = HashMap::new();
         all_packages.insert("pkg:gem/foo@1.0.0".to_string(), pkg.clone());
 
-        let needed = mismatch_blob_gaps(&manifest, &all_packages, &blobs, false).await;
+        let needed =
+            mismatch_blob_gaps(&manifest, &all_packages, &HashSet::new(), &blobs, false).await;
         assert_eq!(
             needed,
             HashSet::from(["5".repeat(64)]),
             "a singleton base falls through to the mismatch policy, so its blob is needed"
+        );
+    }
+
+    /// A QUALIFIED singleton (`?platform=`…) keeps the
+    /// installed-distribution gate — it names one specific distribution,
+    /// and the apply loop skips it when the representative file
+    /// mismatches (the crawler drops the gem dir's platform suffix, so
+    /// this hash check is the only platform resolution). Its blobs must
+    /// not be queued: that would mean spurious downloads and spurious
+    /// `--offline` warnings for a variant the loop never attempts. Under
+    /// `--force` it IS attempted, so then the blob is needed.
+    #[tokio::test]
+    async fn mismatch_blob_gaps_qualified_singleton_gated_unless_forced() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("pkg");
+        tokio::fs::create_dir_all(&pkg).await.unwrap();
+        tokio::fs::write(pkg.join("aaa.rb"), b"darwin bytes\n")
+            .await
+            .unwrap();
+        let blobs = dir.path().join("blobs");
+        tokio::fs::create_dir_all(&blobs).await.unwrap();
+
+        let mut files = HashMap::new();
+        files.insert(
+            "aaa.rb".to_string(),
+            PatchFileInfo {
+                before_hash: "4".repeat(64),
+                after_hash: "5".repeat(64),
+            },
+        );
+        let manifest = manifest_with_record("pkg:gem/foo@1.0.0?platform=x86_64-linux", files);
+        let mut all_packages = HashMap::new();
+        all_packages.insert("pkg:gem/foo@1.0.0".to_string(), pkg.clone());
+
+        let needed =
+            mismatch_blob_gaps(&manifest, &all_packages, &HashSet::new(), &blobs, false).await;
+        assert!(
+            needed.is_empty(),
+            "a qualified singleton whose distribution is not on disk is never attempted, \
+             so its blobs must not be queued: {needed:?}"
+        );
+
+        let needed =
+            mismatch_blob_gaps(&manifest, &all_packages, &HashSet::new(), &blobs, true).await;
+        assert_eq!(
+            needed,
+            HashSet::from(["5".repeat(64)]),
+            "--force attempts the qualified singleton, so the mismatch blob is needed"
+        );
+    }
+
+    /// A vendor-owned base is unconditionally skipped by the apply loop
+    /// (its result is synthesized up front), so its drifted installed
+    /// files must not queue blobs — that meant a spurious "Downloading N
+    /// full patched blob(s)" fetch online and a spurious "will fail to
+    /// apply" warning under `--offline` for a package apply never
+    /// touches. The same fixture queues without the vendor claim
+    /// (anti-vacuity: the mismatch is real).
+    #[tokio::test]
+    async fn mismatch_blob_gaps_vendored_base_never_queued() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("pkg");
+        tokio::fs::create_dir_all(&pkg).await.unwrap();
+        tokio::fs::write(pkg.join("aaa.rb"), b"drifted\n")
+            .await
+            .unwrap();
+        let blobs = dir.path().join("blobs");
+        tokio::fs::create_dir_all(&blobs).await.unwrap();
+
+        let mut files = HashMap::new();
+        files.insert(
+            "aaa.rb".to_string(),
+            PatchFileInfo {
+                before_hash: "4".repeat(64),
+                after_hash: "5".repeat(64),
+            },
+        );
+        let manifest = manifest_with_record("pkg:gem/foo@1.0.0", files);
+        let mut all_packages = HashMap::new();
+        all_packages.insert("pkg:gem/foo@1.0.0".to_string(), pkg.clone());
+
+        let needed =
+            mismatch_blob_gaps(&manifest, &all_packages, &HashSet::new(), &blobs, false).await;
+        assert_eq!(
+            needed,
+            HashSet::from(["5".repeat(64)]),
+            "without a vendor claim the drifted singleton must queue (fixture sanity)"
+        );
+
+        let vendored = HashSet::from(["pkg:gem/foo@1.0.0".to_string()]);
+        let needed = mismatch_blob_gaps(&manifest, &all_packages, &vendored, &blobs, false).await;
+        assert!(
+            needed.is_empty(),
+            "a vendor-owned base is never attempted, so its blobs must not be queued: {needed:?}"
+        );
+
+        let needed = mismatch_blob_gaps(&manifest, &all_packages, &vendored, &blobs, true).await;
+        assert!(
+            needed.is_empty(),
+            "--force does not override vendor ownership in the apply loop, so nothing is queued: {needed:?}"
         );
     }
 
@@ -1822,7 +1958,8 @@ mod tests {
         let mut all_packages = HashMap::new();
         all_packages.insert("pkg:npm/foo@1.0.0".to_string(), pkg.clone());
 
-        let needed = mismatch_blob_gaps(&manifest, &all_packages, &blobs, false).await;
+        let needed =
+            mismatch_blob_gaps(&manifest, &all_packages, &HashSet::new(), &blobs, false).await;
         assert_eq!(needed, HashSet::from(["7".repeat(64)]));
     }
 
