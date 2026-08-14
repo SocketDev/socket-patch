@@ -64,6 +64,30 @@ pub async fn load_redirect_state(project_root: &Path) -> Option<RedirectState> {
     serde_json::from_slice(&bytes).ok()
 }
 
+/// Persist the redirect ledger — pretty JSON + trailing newline, matching the
+/// hosted flow's writer. An EMPTY ledger (no edits, no records) is DELETED
+/// instead: a residual empty file would keep takeover-overlap detection and
+/// VEX reading a ledger that asserts nothing.
+pub async fn persist_redirect_state(
+    project_root: &Path,
+    state: &RedirectState,
+) -> std::io::Result<()> {
+    let path = project_root.join(REDIRECT_STATE_REL);
+    if state.edits.is_empty() && state.records.is_empty() {
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let json = serde_json::to_string_pretty(state).map_err(std::io::Error::other)?;
+    tokio::fs::write(&path, format!("{json}\n")).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
