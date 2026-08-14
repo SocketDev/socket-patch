@@ -1970,3 +1970,66 @@ async fn redirect_json_mode_write_failures_emit_error_envelope() {
     let out = run_leg(tmp.path(), &server).await;
     assert_error_envelope(&out, "ledger-write failure");
 }
+
+/// `scan --mode hosted --prune` must not silently drop `--prune`: both
+/// hosted terminals return before the GC blocks, so a bot migrating its sync
+/// job from `--mode agent --prune` would otherwise stop pruning forever with
+/// exit 0 and no signal. The envelope must carry an explicit
+/// `redirect_prune_ignored` warning (and, unchanged, no `gc` object —
+/// hosted mode runs no GC).
+#[tokio::test]
+#[serial]
+async fn hosted_prune_emits_explicit_ignored_warning() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_project(tmp.path());
+
+    let out = scrubbed_cli()
+        .args([
+            "scan",
+            "--mode",
+            "hosted",
+            "--prune",
+            "--json",
+            "--yes",
+            "--cwd",
+            tmp.path().to_str().unwrap(),
+            "--api-url",
+            &server.uri(),
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+        ])
+        .output()
+        .expect("run socket-patch");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "scan --mode hosted --prune must still succeed; stdout=\n{}\nstderr=\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let env_json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "--json stdout must be a JSON envelope: {e}\nstdout:\n{}",
+            String::from_utf8_lossy(&out.stdout)
+        )
+    });
+    assert!(
+        warning_codes(&env_json)
+            .iter()
+            .any(|c| c == "redirect_prune_ignored"),
+        "hosted --prune must warn that the flag is ignored; envelope: {env_json}"
+    );
+    assert!(
+        env_json.get("gc").is_none(),
+        "hosted mode must not run (or claim to run) GC: {env_json}"
+    );
+    // The redirect itself is unaffected by the ignored flag.
+    assert_eq!(env_json["redirect"]["redirected"], 1, "{env_json}");
+}
