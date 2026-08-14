@@ -15,8 +15,8 @@
 #
 #   * plugin registration — the FIRST `bundle install` evaluates this file
 #     BEFORE any project gem is installed, so the load-time trigger is
-#     stamp-gated and quietly no-ops there; the install hooks below re-apply
-#     once the gems land.
+#     bootstrap-gated (no patch target exists yet) and quietly no-ops there;
+#     the install hooks below re-apply once the gems land.
 #   * every `bundle install` — fresh AND fully cached — fires the per-gem
 #     `after-install` events and then `after-install-all`; the forced
 #     `after-install-all` re-apply is the actual patch point.
@@ -31,10 +31,13 @@
 #
 # A digest of (manifest + every committed file under .socket/ + Gemfile.lock +
 # the on-disk content of every gem-patch target file) gates the non-forced
-# triggers. The stamp lives at .socket/gem-plugin-stamp — project-local state,
-# safe to gitignore or delete. Older plugin versions stamped a fixed-name file
-# under Bundler.bundle_path (machine-global when no bundle path is
-# configured); that legacy stamp is deleted best-effort when seen.
+# triggers. The stamp is a pure digest cache at .socket/gem-plugin-stamp —
+# machine-local state, safe to gitignore or delete (deleting only forces one
+# re-probe); a stale copy that reaches version control anyway is harmless on
+# a fresh clone, because the bootstrap gate keys on the patch targets
+# existing on disk, never on the stamp. Older plugin versions stamped a
+# fixed-name file under Bundler.bundle_path (machine-global when no bundle
+# path is configured); that legacy stamp is deleted best-effort when seen.
 #
 # A patch failure NEVER breaks `bundle install`: it prints a warning naming
 # what failed and the remediation. Set SOCKET_PATCH_STRICT=1 to restore
@@ -199,8 +202,20 @@ module SocketPatch
   # gem exists, and raising there deadlocks the project on its own bootstrap
   # (plugin registration fails, so every retry fails identically). Warn once
   # per process with the remediation; SOCKET_PATCH_STRICT=1 restores the raise
-  # for builds that must not proceed unpatched.
+  # for builds that must not proceed unpatched. The trailer states what the
+  # ACTIVE mode does — the strict raise must not claim the install continues.
+  def failure_trailer
+    if strict?
+      "Failing `bundle install` because #{STRICT_ENV} is set; unset it to " \
+        "warn and continue instead."
+    else
+      "`bundle install` continues; set #{STRICT_ENV}=1 to make patch " \
+        "failures fatal."
+    end
+  end
+
   def report_failure(message)
+    message = "#{message} #{failure_trailer}"
     if strict?
       raise(defined?(Bundler::BundlerError) ? Bundler::BundlerError.new(message) : message)
     end
@@ -212,16 +227,20 @@ module SocketPatch
   # Idempotent applier behind every trigger. No manifest -> the project does
   # not use socket-patch, nothing to do.
   # force: skip the digest gate (the installer just changed the gem set).
-  # require_stamp: bail unless a previous apply stamped this project — the
-  # load-time trigger and the per-gem after-install hook use it so a
-  # bootstrap install's early evaluations don't shell out (and warn) before
-  # the target gems even exist; the forced after-install-all pass does the
-  # first real apply and lays down the stamp.
-  def apply!(force: false, require_stamp: false)
+  # bootstrap_gate: bail while NONE of the manifest's gem-patch targets exist
+  # on disk. The load-time trigger and the per-gem after-install hook use it
+  # so a bootstrap install's early evaluations (plugin REGISTRATION runs
+  # before any project gem lands) never shell out, warn, or — in strict mode —
+  # raise while there is nothing to patch; the forced after-install-all pass
+  # does the first real apply once the gems exist. The gate reads only the
+  # live gem tree, never the stamp: a stale stamp committed by mistake cannot
+  # re-open the bootstrap deadlock on a fresh clone, and deleting the stamp
+  # costs one re-probe instead of disabling these triggers.
+  def apply!(force: false, bootstrap_gate: false)
     APPLY_LOCK.synchronize do
       return unless File.file?(manifest_path)
       remove_legacy_stamp
-      return if require_stamp && !File.file?(stamp_path)
+      return if bootstrap_gate && patch_target_files.none? { |t| File.file?(t) }
       return if !force && stamped?(current_digest)
 
       ok = system(
@@ -235,15 +254,14 @@ module SocketPatch
           "socket-patch: could not run `#{socket_bin} apply` — the gem patches in " \
           ".socket/manifest.json are NOT applied. Install the socket-patch CLI (or set " \
           "#{BIN_ENV} to its path), then run `socket-patch apply --ecosystems gem` " \
-          "manually. `bundle install` continues; set #{STRICT_ENV}=1 to make this fatal."
+          "manually."
         )
         return
       elsif !ok
         report_failure(
           "socket-patch: `#{socket_bin} apply --ecosystems gem` failed — the gem patches " \
           "in .socket/manifest.json may NOT be applied. Run `socket-patch apply " \
-          "--ecosystems gem` in #{project_root} to apply them manually. " \
-          "`bundle install` continues; set #{STRICT_ENV}=1 to make patch failures fatal."
+          "--ecosystems gem` in #{project_root} to apply them manually."
         )
         return
       end
@@ -259,23 +277,25 @@ module SocketPatch
 end
 
 # Trigger 1 — load time. Runs at plugin registration and whenever a subscribed
-# hook event first loads the plugin in a bundle process. Stamp-gated: on the
-# bootstrap install nothing is stamped yet (and no gems exist to patch), so
-# this quietly defers to Trigger 3. In strict mode a genuine patch failure
-# (Bundler::BundlerError) still propagates.
+# hook event first loads the plugin in a bundle process. Bootstrap-gated on
+# the patch targets existing on disk (never on the stamp — a committed stale
+# stamp must not re-open the registration deadlock): on the bootstrap install
+# no gems exist to patch, so this quietly defers to Trigger 3. In strict mode
+# a genuine patch failure (Bundler::BundlerError) still propagates.
 begin
-  SocketPatch.apply!(require_stamp: true)
+  SocketPatch.apply!(bootstrap_gate: true)
 rescue StandardError => e
   raise if defined?(Bundler::BundlerError) && e.is_a?(Bundler::BundlerError)
 end
 
 # Trigger 2 — after each individual gem (re)install. The only event bundler
 # fires during `bundle pristine`, so this is what catches pristine's patch
-# reversion in the same run. Digest- and stamp-gated: on a fresh install's
-# per-gem events the project is not stamped yet and Trigger 3 is about to do
-# the real work.
+# reversion in the same run — even when the stamp was deleted, since the gate
+# reads the gem tree, not the stamp. Digest- and bootstrap-gated: on a fresh
+# install's per-gem events the targets are only just landing and Trigger 3 is
+# about to do the real work.
 Bundler::Plugin.add_hook("after-install") do |_spec_install|
-  SocketPatch.apply!(require_stamp: true)
+  SocketPatch.apply!(bootstrap_gate: true)
 end
 
 # Trigger 3 — after the installer finishes (fresh AND fully-cached installs).

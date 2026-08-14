@@ -273,6 +273,15 @@ mod host_guard {
             rb.contains("BundlerError"),
             "plugins.rb must still raise Bundler::BundlerError in strict mode:\n{rb}"
         );
+        // The plugin's digest stamp is machine-local, but it lives in the
+        // otherwise-committed .socket/ — setup must gitignore it, or every
+        // install litters `git status` and a blanket `git add .socket`
+        // commits one machine's stamp to every clone.
+        let gitignore = std::fs::read_to_string(root.join(".socket/.gitignore")).unwrap();
+        assert!(
+            gitignore.lines().any(|l| l == "/gem-plugin-stamp"),
+            ".socket/.gitignore must carry the stamp entry:\n{gitignore}"
+        );
 
         // ── check (after setup): configured, exit 0 ─────────────────────────
         let (code, out, err) = run(root, &["setup", "--check", "--cwd", root_s, "--json"]);
@@ -301,6 +310,9 @@ mod host_guard {
         );
 
         // ── remove: byte-for-byte restore + plugin dir gone ─────────────────
+        // A stamp left behind by a previous apply: `--remove`'s no-residue
+        // contract covers it (it sits in the committed .socket/ dir).
+        std::fs::write(root.join(".socket/gem-plugin-stamp"), "e".repeat(64)).unwrap();
         let (code, out, err) = run(
             root,
             &["setup", "--remove", "--cwd", root_s, "--yes", "--json"],
@@ -320,6 +332,15 @@ mod host_guard {
         assert!(
             !root.join(PLUGIN_DIR).exists(),
             "remove must delete the generated plugin dir"
+        );
+        assert!(
+            !root.join(".socket/gem-plugin-stamp").exists(),
+            "remove must delete the plugin's digest stamp — unwiring must not \
+             orphan it in the committed .socket/"
+        );
+        assert!(
+            !root.join(".socket/.gitignore").exists(),
+            "remove must delete the .gitignore setup created (it held only our line)"
         );
 
         // ── check (after remove): needs_configuration again, exit 1 ─────────
@@ -626,6 +647,146 @@ mod plugin_runtime {
             err.contains("socket-patch"),
             "the strict failure must carry the socket-patch message:\n{err}"
         );
+        // The strict raise must tell the truth about the active mode: the
+        // tolerant trailer ("`bundle install` continues; set
+        // SOCKET_PATCH_STRICT=1 ...") is false on both counts while the
+        // install is failing and the var is already set.
+        assert!(
+            err.contains("because SOCKET_PATCH_STRICT is set"),
+            "the strict failure must say WHY the install is failing:\n{err}"
+        );
+        assert!(
+            !err.contains("`bundle install` continues"),
+            "the strict failure must not claim the install continues:\n{err}"
+        );
+    }
+
+    /// [P0 regression: committed stale stamp] `.socket/` is a committed
+    /// directory, so a stamp that reaches version control (a blanket
+    /// `git add .socket`) arrives on every fresh clone BEFORE the first
+    /// `bundle install`. If the bootstrap gate keyed on the stamp's
+    /// existence, plugin REGISTRATION would shell the applier (targets
+    /// absent -> apply fails) and a strict-mode raise there resurrects the
+    /// exact deadlock this plugin exists to avoid — exit 29, "Failed to
+    /// install plugin", every retry identical (reproduced on bundler
+    /// 4.0.15). The gate must key on the patch targets existing on disk:
+    /// registration completes, strict enforcement waits for the
+    /// post-install hooks.
+    #[test]
+    fn committed_stale_stamp_does_not_deadlock_strict_fresh_clone() {
+        if !have("bundle") {
+            eprintln!("skip plugin_runtime: bundler not on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        scaffold(root);
+        // The stale stamp a teammate committed, exactly as a fresh clone sees it.
+        std::fs::write(root.join(STAMP_REL), "a".repeat(64)).unwrap();
+        let (fake, log) = write_fake_apply(root, 1);
+
+        let (code, out, err) = bundle_install(root, &fake, &[("SOCKET_PATCH_STRICT", "1")]);
+        // Registration must complete — the strict failure may only come from
+        // the post-install hooks, never from plugin registration.
+        assert!(
+            !err.contains("Failed to install plugin"),
+            "a committed stale stamp must not fail plugin REGISTRATION.\n{out}\n{err}"
+        );
+        assert!(
+            root.join(".bundle/plugin/index").is_file(),
+            "registration must be recorded despite the strict failure.\n{out}\n{err}"
+        );
+        assert_ne!(
+            code, 0,
+            "strict mode still fails the install — from the hook.\n{out}\n{err}"
+        );
+        assert!(
+            !apply_calls(&log).is_empty(),
+            "anti-vacuity: the forced post-install apply ran (and failed)"
+        );
+
+        // The deadlock is gone: with apply working, the SAME checkout (stale
+        // stamp still in place) converges on retry.
+        let (fake, _log) = write_fake_apply(root, 0);
+        let (code, out, err) = bundle_install(root, &fake, &[("SOCKET_PATCH_STRICT", "1")]);
+        assert_eq!(
+            code, 0,
+            "retry with a working apply must succeed — registration was never \
+             poisoned.\n{out}\n{err}"
+        );
+    }
+
+    /// The bootstrap gate reads the LIVE gem tree, never the stamp. Both
+    /// directions matter: with no patch target on disk the gated triggers
+    /// must not shell out no matter what a (stale, possibly committed) stamp
+    /// says; with the target present they must re-apply even when the stamp
+    /// is missing — a `bundle pristine` run after deleting the stamp used to
+    /// leave the patches silently reverted until the next `bundle install`
+    /// (reproduced on bundler 4.0.15).
+    #[test]
+    fn bootstrap_gate_keys_on_target_presence_not_stamp() {
+        if !have("ruby") {
+            eprintln!("skip plugin_runtime: ruby not on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        scaffold(root);
+        let (fake, log) = write_fake_apply(root, 0);
+
+        // Drive the gated path exactly as the load-time / per-gem hooks do.
+        let drive = |label: &str| {
+            let mut cmd = Command::new("ruby");
+            cmd.args([
+                "-e",
+                "require \"bundler\"; load ARGV[0]; SocketPatch.apply!(bootstrap_gate: true)",
+                "--",
+            ])
+            .arg(root.join(".socket/bundler-plugin/plugins.rb"))
+            .current_dir(root);
+            scrub(&mut cmd);
+            cmd.env("BUNDLE_PATH", "vendor/bundle");
+            cmd.env("SOCKET_PATCH_BIN", &fake);
+            let (code, out, err) = run(cmd);
+            assert_eq!(code, 0, "{label}: gated drive failed.\n{out}\n{err}");
+        };
+
+        // Fresh clone: no target on disk, stale stamp committed.
+        std::fs::write(root.join(STAMP_REL), "b".repeat(64)).unwrap();
+        drive("no target, stale stamp");
+        assert_eq!(
+            apply_calls(&log).len(),
+            0,
+            "no target on disk -> the gated trigger must not shell out, \
+             whatever the stamp says"
+        );
+
+        // Target installed, stamp deleted: the pristine-heal case.
+        let mut cmd = Command::new("ruby");
+        cmd.args(["-e", "require \"bundler\"; print Bundler.bundle_path"])
+            .current_dir(root);
+        scrub(&mut cmd);
+        cmd.env("BUNDLE_PATH", "vendor/bundle");
+        let (code, bundle_path, err) = run(cmd);
+        assert_eq!(code, 0, "Bundler.bundle_path probe failed: {err}");
+        let target = PathBuf::from(bundle_path.trim()).join("gems/colorize-1.1.0/lib/colorize.rb");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, "REVERTED BY PRISTINE\n").unwrap();
+        std::fs::remove_file(root.join(STAMP_REL)).unwrap();
+
+        drive("target present, no stamp");
+        assert_eq!(
+            apply_calls(&log).len(),
+            1,
+            "with the target on disk and nothing validly stamped, the gated \
+             trigger must re-apply — deleting the stamp defers nothing"
+        );
+        drive("digest-gated no-op");
+        assert_eq!(
+            apply_calls(&log).len(),
+            1,
+            "the re-apply stamped the state; the next gated probe is a no-op"
+        );
     }
 
     /// [P2 stamp location] A successful apply stamps the PROJECT
@@ -816,12 +977,30 @@ mod launcher_guard {
             .expect("launcher.rb must exist in the workspace")
     }
 
+    /// Strip the ambient vars that could flip a verdict, mirroring
+    /// `plugin_runtime::scrub`: the CLI's SOCKET_* surface, and the
+    /// bundler/rubygems config a `bundle exec cargo test` run injects
+    /// (RUBYOPT=-rbundler/setup, BUNDLE_*, GEM_*) — which would activate a
+    /// foreign bundle inside the child ruby under test.
+    fn scrub(cmd: &mut Command) {
+        for (key, _) in std::env::vars_os() {
+            let name = key.to_string_lossy().into_owned();
+            let hit = (name.starts_with("SOCKET_") && name != "SOCKET_NO_CONFIG")
+                || name.starts_with("BUNDLE_")
+                || name.starts_with("GEM_")
+                || name == "RUBYOPT";
+            if hit {
+                cmd.env_remove(&name);
+            }
+        }
+    }
+
     /// Run `script` (which `load`s the launcher via the SP_LAUNCHER env) with
     /// a scratch HOME/cache so no real launcher cache is consulted.
     fn run_ruby(script: &Path, cache: &Path, envs: &[(&str, &str)]) -> (i32, String, String) {
         let mut cmd = Command::new("ruby");
         cmd.arg(script);
-        cmd.env_remove("SOCKET_PATCH_BIN");
+        scrub(&mut cmd);
         cmd.env("SP_LAUNCHER", launcher_path());
         cmd.env("XDG_CACHE_HOME", cache);
         for (k, v) in envs {
@@ -966,6 +1145,7 @@ mod launcher_guard {
 
         let mut cmd = Command::new("ruby");
         cmd.arg(&script).arg(&src).arg(&dest);
+        scrub(&mut cmd);
         cmd.env("SP_LAUNCHER", launcher_path());
         let out = cmd.output().expect("spawn ruby");
         assert!(
