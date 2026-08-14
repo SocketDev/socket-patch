@@ -1030,6 +1030,48 @@ async fn mount_gem_patch_api(mock: &MockServer) {
         .await;
 }
 
+const CARGO_UUID: &str = "33333333-3333-4333-8333-333333333333";
+const CARGO_PURL: &str = "pkg:cargo/padcrate@1.0.0";
+
+/// Synthesize a healthy, detached, DIR-shaped cargo ledger entry with no
+/// fileInventory into an existing project: artifact dir + embedded record
+/// whose afterHash matches the tree. The cargo backend records no
+/// inventories (yet), so this is exactly the population the
+/// vendor_inventory_missing warning must NOT nag about.
+fn add_healthy_cargo_dir_entry(root: &Path) -> PathBuf {
+    let rel = format!(".socket/vendor/cargo/{CARGO_UUID}/padcrate-1.0.0");
+    let dir = root.join(&rel);
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("src/lib.rs"), AFTER).unwrap();
+    let state_path = root.join(".socket/vendor/state.json");
+    let mut state: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
+    state["entries"][CARGO_PURL] = serde_json::json!({
+        "ecosystem": "cargo",
+        "basePurl": CARGO_PURL,
+        "uuid": CARGO_UUID,
+        "artifact": { "path": rel },
+        "wiring": [],
+        "detached": true,
+        "record": {
+            "uuid": CARGO_UUID,
+            "exportedAt": "2026-01-01T00:00:00Z",
+            "files": {
+                "src/lib.rs": {
+                    "beforeHash": git_sha256(BEFORE),
+                    "afterHash": git_sha256(AFTER),
+                }
+            },
+            "vulnerabilities": {},
+            "description": "cargo dir fixture",
+            "license": "MIT",
+            "tier": "free",
+        }
+    });
+    std::fs::write(&state_path, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+    dir
+}
+
 /// `scan --vendor --yes` the gem fixture; returns the vendored copy dir.
 fn vendor_gem_project(root: &Path, mock_uri: &str) -> PathBuf {
     let (code, stdout, stderr) = run_cli(root, mock_uri, &["scan", "--vendor", "--yes"]);
@@ -1220,6 +1262,64 @@ async fn revert_of_empty_wiring_gem_entry_fails_loudly() {
     );
 }
 
+/// G2b. The same empty-wiring population, healed at the repair seam: a
+///     LEDGERED gem entry whose wiring is empty (pre-reconstruction repairs
+///     persisted exactly these) gets full revert-capable wiring backfilled
+///     from the live pair while the artifact is healthy — byte-identical to
+///     the original ledger for the exact-pin fixture — and the revert that
+///     used to refuse (G2) byte-restores both files. RED without the pass-1
+///     backfill: repair exits 0 leaving `"wiring": []`, no wiringRestored
+///     event, and the revert fails.
+#[tokio::test]
+async fn repair_backfills_wiring_for_empty_wiring_gem_entry() {
+    let mock = MockServer::start().await;
+    mount_gem_patch_api(&mock).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_gem_fixture(tmp.path(), false);
+    let gemfile_before = std::fs::read(tmp.path().join("Gemfile")).unwrap();
+    let lock_before = std::fs::read(tmp.path().join("Gemfile.lock")).unwrap();
+    let copy = vendor_gem_project(tmp.path(), &mock.uri());
+    let state_path = tmp.path().join(".socket/vendor/state.json");
+    let state_before = std::fs::read(&state_path).unwrap();
+
+    let mut state: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
+    state["entries"][GEM_PURL]["wiring"] = serde_json::json!([]);
+    std::fs::write(&state_path, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+
+    let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair"]);
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    let v = parse_env(&stdout);
+    assert!(
+        events_of(&v).iter().any(|e| e["action"] == "rebuilt"
+            && e["purl"] == GEM_PURL
+            && e["details"]["wiringRestored"] == true
+            && e["details"]["artifactRebuilt"] == false),
+        "envelope={v}"
+    );
+    // THE oracle: the backfilled ledger equals the original byte-for-byte
+    // (the exact-pin fixture reconstructs losslessly).
+    assert_eq!(
+        std::fs::read(&state_path).unwrap(),
+        state_before,
+        "backfilled state.json must be byte-identical to the original"
+    );
+
+    let (code, stdout, _) = run_cli(tmp.path(), &mock.uri(), &["vendor", "--revert"]);
+    assert_eq!(code, 0, "revert after backfill: {stdout}");
+    assert_eq!(
+        std::fs::read(tmp.path().join("Gemfile")).unwrap(),
+        gemfile_before,
+        "Gemfile byte-restored"
+    );
+    assert_eq!(
+        std::fs::read(tmp.path().join("Gemfile.lock")).unwrap(),
+        lock_before,
+        "Gemfile.lock byte-restored"
+    );
+    assert!(!copy.exists(), "artifact dir removed");
+}
+
 /// G3. Dir-shaped tamper matrix: an altered UNPATCHED file (the stub
 ///     gemspec), a deleted file, and a planted extra file must each flip
 ///     the health check to Corrupt — repair rebuilds the exact recorded
@@ -1323,10 +1423,102 @@ async fn repair_gem_dir_tamper_matrix_and_vex_refusal() {
     }
 }
 
+/// G3c. A service-vendored entry records the SERVICE tree's inventory (its
+///     converter-generated stub gemspec differs byte-wise from the local
+///     stub), but repair always rebuilds LOCALLY. The member-verified local
+///     rebuild must refresh the stale inventory — loudly, with the
+///     provenance named — instead of deleting the rebuild and stranding the
+///     wired pair on a dead dir. RED without the refresh: exit 1
+///     vendor_artifact_rebuild_failed, artifact gone, and every subsequent
+///     repair loops the same failure.
+#[tokio::test]
+async fn repair_refreshes_stale_inventory_from_service_provenance() {
+    const SERVICE_STUB: &[u8] = b"# converter-generated stub\nGem::Specification.new do |s|\n  s.name = \"padlock\"\n  s.version = \"1.2.0\"\n  s.require_paths = [\"lib\"]\nend\n";
+    let mock = MockServer::start().await;
+    mount_gem_patch_api(&mock).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_gem_fixture(tmp.path(), false);
+    let copy = vendor_gem_project(tmp.path(), &mock.uri());
+
+    // Simulate service provenance: the on-disk stub and the recorded
+    // inventory BOTH carry the converter-generated form (they agree), which
+    // a LOCAL rebuild cannot reproduce.
+    std::fs::write(copy.join("padlock.gemspec"), SERVICE_STUB).unwrap();
+    let state_path = tmp.path().join(".socket/vendor/state.json");
+    let mut state: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
+    state["entries"][GEM_PURL]["artifact"]["fileInventory"]["padlock.gemspec"] =
+        serde_json::json!(sha256_hex(SERVICE_STUB));
+    std::fs::write(&state_path, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+
+    // Anti-vacuity: the simulated service state is self-consistent.
+    let (code, stdout, _) = run_cli(tmp.path(), &mock.uri(), &["repair"]);
+    assert_eq!(code, 0, "{stdout}");
+    let v = parse_env(&stdout);
+    assert!(
+        v["summary"]["rebuilt"].is_null() || v["summary"]["rebuilt"] == 0,
+        "the simulated service tree must be healthy: {v}"
+    );
+
+    std::fs::remove_dir_all(&copy).unwrap();
+
+    // THE pin: the local rebuild's stub differs from the recorded
+    // inventory; repair keeps the member-verified rebuild and refreshes
+    // the inventory rather than deleting it and failing forever.
+    let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair"]);
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    let v = parse_env(&stdout);
+    assert!(
+        events_of(&v)
+            .iter()
+            .any(|e| e["action"] == "rebuilt" && e["purl"] == GEM_PURL),
+        "envelope={v}"
+    );
+    assert!(
+        events_of(&v).iter().any(|e| e["action"] == "skipped"
+            && e["errorCode"] == "vendor_inventory_refreshed"
+            && e["purl"] == GEM_PURL),
+        "the provenance switch must be surfaced: {v}"
+    );
+    assert_eq!(
+        std::fs::read(copy.join("padlock.gemspec")).unwrap(),
+        GEMSPEC_STUB,
+        "the local rebuild's stub is kept"
+    );
+    assert_eq!(
+        std::fs::read(copy.join("lib/padlock.rb")).unwrap(),
+        AFTER,
+        "patched member intact"
+    );
+    let state: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
+    assert_eq!(
+        state["entries"][GEM_PURL]["artifact"]["fileInventory"]["padlock.gemspec"],
+        serde_json::json!(sha256_hex(GEMSPEC_STUB)),
+        "inventory refreshed from the verified rebuild: {state}"
+    );
+
+    // The loop is dead: the next repair is clean.
+    let (code, stdout, _) = run_cli(tmp.path(), &mock.uri(), &["repair"]);
+    assert_eq!(code, 0, "{stdout}");
+    let v = parse_env(&stdout);
+    assert!(
+        v["summary"]["rebuilt"].is_null() || v["summary"]["rebuilt"] == 0,
+        "no repair loop: {v}"
+    );
+    assert!(
+        !events_of(&v).iter().any(|e| e["action"] == "failed"),
+        "no repair loop: {v}"
+    );
+}
+
 /// G3b. Backward tolerance: a pre-inventory ledger entry (fileInventory
 ///      stripped) keeps today's member-only verdict on the same tamper —
 ///      no rebuild, exit 0 — but repair names the gap
-///      (vendor_inventory_missing) instead of staying silent.
+///      (vendor_inventory_missing) instead of staying silent. The warning
+///      is GEM-only: a healthy inventory-less cargo dir entry (that backend
+///      records no inventories, so "re-vendor" could never silence it) must
+///      produce no events at all.
 #[tokio::test]
 async fn repair_warns_on_legacy_gem_entry_without_inventory() {
     let mock = MockServer::start().await;
@@ -1344,6 +1536,7 @@ async fn repair_warns_on_legacy_gem_entry_without_inventory() {
         .remove("fileInventory")
         .expect("the fixture entry must have recorded an inventory");
     std::fs::write(&state_path, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+    let cargo_dir = add_healthy_cargo_dir_entry(tmp.path());
 
     std::fs::write(copy.join("padlock.gemspec"), b"tampered stub\n").unwrap();
 
@@ -1354,16 +1547,37 @@ async fn repair_warns_on_legacy_gem_entry_without_inventory() {
         v["summary"]["rebuilt"].is_null() || v["summary"]["rebuilt"] == 0,
         "legacy entries keep member-only behavior (no rebuild): {v}"
     );
+    let missing: Vec<_> = events_of(&v)
+        .into_iter()
+        .filter(|e| e["errorCode"] == "vendor_inventory_missing")
+        .collect();
+    assert_eq!(
+        missing.len(),
+        1,
+        "only the gem entry warns about the inventory gap: {v}"
+    );
+    assert_eq!(missing[0]["purl"], GEM_PURL, "envelope={v}");
     assert!(
-        events_of(&v).iter().any(|e| e["action"] == "skipped"
-            && e["errorCode"] == "vendor_inventory_missing"
-            && e["purl"] == GEM_PURL),
-        "the verification gap must be named: {v}"
+        !events_of(&v).iter().any(|e| e["purl"] == CARGO_PURL),
+        "the healthy inventory-less cargo entry stays silent: {v}"
     );
     assert_eq!(
         std::fs::read(copy.join("padlock.gemspec")).unwrap(),
         b"tampered stub\n",
         "member-only verification cannot see the tamper (documented legacy gap)"
+    );
+
+    // Anti-vacuity for the silence above: the cargo entry IS health-checked
+    // — break its artifact and the same repair pipeline must surface it.
+    std::fs::remove_dir_all(&cargo_dir).unwrap();
+    let (code, stdout, _) = run_cli(tmp.path(), &mock.uri(), &["repair"]);
+    assert_eq!(code, 1, "a missing cargo artifact must fail: {stdout}");
+    let v = parse_env(&stdout);
+    assert!(
+        events_of(&v)
+            .iter()
+            .any(|e| e["action"] == "failed" && e["purl"] == CARGO_PURL),
+        "the cargo entry is live in pass 1: {v}"
     );
 }
 

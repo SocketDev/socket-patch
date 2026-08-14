@@ -21,7 +21,17 @@
 //! ecosystems' pre-vendor originals are registry integrity material no
 //! offline source can reproduce, so their entries keep empty wiring and the
 //! gap is surfaced loudly (`vendor_wiring_unknown`) — a gem `--revert` of
-//! such an entry refuses instead of stranding the pair edit.
+//! such an entry refuses instead of stranding the pair edit. Existing gem
+//! entries with EMPTY wiring (persisted by pre-reconstruction repairs) are
+//! backfilled the same way during the ledger-driven pass while healthy.
+//!
+//! Dir-shaped rebuilds are always LOCAL (the pristine ladder + the recorded
+//! patch), while `vendor` may have used the patch service's prebuilt
+//! artifact (a converter-generated stub gemspec the local build cannot
+//! reproduce): a rebuild whose patched members verify but whose tree
+//! differs from the recorded fileInventory refreshes the inventory from
+//! the verified rebuild (`vendor_inventory_refreshed`) instead of failing
+//! deterministically on every repair.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -289,8 +299,13 @@ pub(crate) async fn repair_vendored_artifacts(
                 // Dir-shaped artifacts from pre-inventory vendors: the
                 // health check above could only verify the PATCHED members
                 // — unpatched-file drift is invisible until a re-vendor
-                // records the whole-tree inventory. Name the gap.
-                if !artifact_is_file_shaped(&entry.artifact.path)
+                // records the whole-tree inventory. Name the gap — for gem
+                // only, the one backend that records inventories; the other
+                // dir-shaped backends (cargo/golang/composer) don't yet, so
+                // a re-vendor there records nothing and the advice would be
+                // permanent per-run noise.
+                if entry.ecosystem == "gem"
+                    && !artifact_is_file_shaped(&entry.artifact.path)
                     && entry.artifact.file_inventory.is_none()
                 {
                     record_warning(
@@ -308,6 +323,66 @@ pub(crate) async fn repair_vendored_artifacts(
                         ),
                         common,
                     );
+                }
+                // Empty-wiring gem entries (pre-reconstruction repairs
+                // persisted these): backfill full revert-capable wiring
+                // from the live pair via the same recognizers the
+                // no-ledger reconstruction trusts, so `vendor --revert`
+                // stops refusing with manual cleanup steps.
+                if entry.ecosystem == "gem" && entry.wiring.is_empty() {
+                    match vendor::gem::reconstruct_gem_wiring(&common.cwd, &entry).await {
+                        Ok((wiring, notes)) => {
+                            if common.dry_run {
+                                env.record(
+                                    PatchEvent::new(PatchAction::Verified, purl.clone())
+                                        .with_details(serde_json::json!({
+                                            "vendorArtifact": true,
+                                            "wouldRestoreWiring": true,
+                                        })),
+                                );
+                                continue;
+                            }
+                            for w in &notes {
+                                record_warning(env, purl, w, common);
+                            }
+                            let mut healed = entry.clone();
+                            healed.wiring = wiring;
+                            let detached = healed.detached;
+                            if persist_vendor_entry(
+                                common, env, &mut state, purl, healed, detached, &record,
+                            )
+                            .await
+                            {
+                                continue;
+                            }
+                            env.record(
+                                PatchEvent::new(PatchAction::Rebuilt, purl.clone()).with_details(
+                                    serde_json::json!({
+                                        "path": entry.artifact.path,
+                                        "wiringRestored": true,
+                                        "artifactRebuilt": false,
+                                    }),
+                                ),
+                            );
+                            rebuilt += 1;
+                        }
+                        Err(detail) => {
+                            record_warning(
+                                env,
+                                purl,
+                                &VendorWarning::new(
+                                    "vendor_wiring_unknown",
+                                    format!(
+                                        "the ledger entry records no pre-vendor wiring \
+                                         originals and they cannot be reconstructed from \
+                                         the live files ({detail}); `vendor --revert` \
+                                         cannot restore the project files for this entry"
+                                    ),
+                                ),
+                                common,
+                            );
+                        }
+                    }
                 }
             }
             ArtifactHealth::StaleUuid => {
@@ -832,7 +907,62 @@ pub(crate) async fn repair_vendored_artifacts(
                     continue;
                 }
                 // ── Fail-closed post-verify ──────────────────────────────
-                match check_vendored_artifact(&common.cwd, &check_entry, &c.record).await {
+                let mut health =
+                    check_vendored_artifact(&common.cwd, &check_entry, &c.record).await;
+                // A dir-shaped rebuild whose PATCHED members all verify but
+                // whose tree differs from the recorded inventory: the entry
+                // recorded the OTHER build source's tree (the patch
+                // service's prebuilt artifact carries a converter-generated
+                // stub gemspec; repair always rebuilds locally). Failing
+                // here would delete the rebuild, strand the wired pair on a
+                // dead dir, and deterministically re-fail every later
+                // repair — so refresh the inventory from the verified
+                // rebuild instead, loudly.
+                if !from_backend
+                    && !c.reconstructed
+                    && matches!(&health, ArtifactHealth::Corrupt { reason }
+                        if reason == "vendor_inventory_mismatch")
+                {
+                    let abs = common
+                        .cwd
+                        .join(check_entry.artifact.path.replace('\\', "/"));
+                    if let Ok(inv) = compute_dir_inventory(&abs).await {
+                        check_entry.artifact.file_inventory = Some(inv);
+                        health =
+                            check_vendored_artifact(&common.cwd, &check_entry, &c.record).await;
+                        if health == ArtifactHealth::Healthy {
+                            record_warning(
+                                env,
+                                &c.purl,
+                                &VendorWarning::new(
+                                    "vendor_inventory_refreshed",
+                                    "the rebuilt artifact's patched files verify but its \
+                                     tree differs from the recorded file inventory (the \
+                                     entry was likely vendored from the patch service's \
+                                     prebuilt artifact; repair rebuilds locally); the \
+                                     inventory was refreshed from the verified rebuild — \
+                                     run `socket-patch vendor` to restore the \
+                                     service-built tree",
+                                ),
+                                common,
+                            );
+                            if persist_vendor_entry(
+                                common,
+                                env,
+                                &mut state,
+                                &c.purl,
+                                check_entry.clone(),
+                                c.detached,
+                                &c.record,
+                            )
+                            .await
+                            {
+                                continue;
+                            }
+                        }
+                    }
+                }
+                match health {
                     ArtifactHealth::Healthy => {
                         if !quiet {
                             println!(

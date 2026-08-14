@@ -1116,7 +1116,15 @@ pub async fn recover_lock_entry(
                 })?;
             let base = match gem_remotes(project_root).await.as_slice() {
                 [] => "https://rubygems.org".to_string(),
-                [one] => one.clone(),
+                [one] => http_url(one).ok_or_else(|| {
+                    // A lone non-http remote (file:// gem repo): the registry
+                    // conventions cannot reproduce its bytes, and defaulting
+                    // to rubygems.org would leak the gem name off-site.
+                    format!(
+                        "the Gemfile.lock's GEM remote ({one}) is not an http(s) registry; \
+                         refusing to fetch from a guessed remote"
+                    )
+                })?,
                 several => {
                     // The vendored spec's own GEM section is gone (it moved
                     // into the PATH section), so with several sources its
@@ -1435,11 +1443,17 @@ fn inline_yaml_field(line: &str, field: &str) -> Option<String> {
     (!v.is_empty()).then_some(v)
 }
 
-/// The DISTINCT http(s) `GEM remote:` bases across ALL GEM sections of the
+/// The DISTINCT `GEM remote:` bases across ALL GEM sections of the
 /// Gemfile.lock (trailing `/` trimmed), in first-appearance order. A
 /// vendored gem's spec block moved into its PATH section, so which GEM
 /// section it came from is unrecoverable — ledger recovery may only build
 /// a download URL when the lock's GEM sources agree on a single remote.
+/// Collected scheme-AGNOSTICALLY: a non-http remote (a `file://` gem repo —
+/// bundler 4.0.15 locks one GEM section per `source "file://…" do` block)
+/// still counts toward the ambiguity decision; filtering it out first would
+/// collapse a mixed http+file lock to one "agreed" remote and send the
+/// file-sourced gem's name to the http one. The caller requires the single
+/// survivor to be http(s).
 async fn gem_remotes(project_root: &Path) -> Vec<String> {
     let Ok(text) = tokio::fs::read_to_string(project_root.join("Gemfile.lock")).await else {
         return Vec::new();
@@ -1456,11 +1470,9 @@ async fn gem_remotes(project_root: &Path) -> Vec<String> {
         }
         if in_gem {
             if let Some(rest) = line.trim().strip_prefix("remote:") {
-                if let Some(url) = http_url(rest.trim()) {
-                    let url = url.trim_end_matches('/').to_string();
-                    if !out.contains(&url) {
-                        out.push(url);
-                    }
+                let url = rest.trim().trim_end_matches('/').to_string();
+                if !url.is_empty() && !out.contains(&url) {
+                    out.push(url);
                 }
             }
         }
@@ -2663,6 +2675,54 @@ mod recover_tests {
             "the agreed remote is used, not a rubygems.org guess"
         );
         assert_eq!(got.integrity, LockIntegrity::Sha256Hex(sha256));
+    }
+
+    /// The ambiguity count must see NON-http remotes too (a `source
+    /// "file://…" do` block locks its own GEM section with a `file:///`
+    /// remote — real bundler 4.0.15 output). Filtering to http(s) first
+    /// would collapse a mixed http+file lock to one "agreed" remote and
+    /// send a possibly-file-sourced gem's name to the http registry — the
+    /// same leak class the multi-http refusal closes. A lock whose ONLY
+    /// remote is non-http must refuse too, never default to rubygems.org.
+    #[tokio::test]
+    async fn gem_recovery_counts_non_http_remotes_as_ambiguity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gem = entry(
+            "gem",
+            "pkg:gem/rack@3.0.0",
+            vec![rec(
+                "gemfile_lock_checksum",
+                serde_json::json!(format!("  rack (3.0.0) sha256={}", "d".repeat(64))),
+            )],
+        );
+
+        // Mixed schemes: one file:// section + one https section → ambiguous.
+        tokio::fs::write(
+            tmp.path().join("Gemfile.lock"),
+            "GEM\n  remote: file:///srv/gems/\n  specs:\n    private-gem (1.0.0)\n\n\
+             GEM\n  remote: https://rubygems.org/\n  specs:\n    rake (13.3.1)\n",
+        )
+        .await
+        .unwrap();
+        let err = recover_lock_entry(tmp.path(), &gem).await.unwrap_err();
+        assert!(
+            err.contains("multiple GEM sources"),
+            "a file:// section must count toward the ambiguity refusal: {err}"
+        );
+
+        // A single file:// remote: not fetchable, and never a rubygems.org
+        // fallback (that would leak the private repo's gem name off-site).
+        tokio::fs::write(
+            tmp.path().join("Gemfile.lock"),
+            "GEM\n  remote: file:///srv/gems/\n  specs:\n    private-gem (1.0.0)\n",
+        )
+        .await
+        .unwrap();
+        let err = recover_lock_entry(tmp.path(), &gem).await.unwrap_err();
+        assert!(
+            err.contains("file:///srv/gems") && err.contains("not an http(s) registry"),
+            "a lone non-http remote must refuse, not guess: {err}"
+        );
     }
 
     #[tokio::test]

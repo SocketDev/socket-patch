@@ -981,19 +981,28 @@ pub async fn revert_gem(entry: &VendorEntry, project_root: &Path, dry_run: bool)
 /// `Err` and the caller keeps an empty-wiring entry (whose revert then
 /// refuses loudly) instead of guessing.
 ///
-/// Two documented degradations, both inherent to a lost ledger:
+/// Three documented degradations, all inherent to a lost ledger:
 ///
 /// * a REWRITTEN declaration's pre-vendor line is reconstructed in the
 ///   canonical exact-pin form (`gem "<name>", "<version>"` + preserved
 ///   trailing options) — the user's original version constraint lived only
 ///   in the lost ledger, and the exact pin restores a consistent,
 ///   installable pair resolving to the same version;
+/// * a trailing `#` comment on the pre-vendor gem line is unrecoverable:
+///   vendor's exact-pin rewrite drops it (the verbatim line lived only in
+///   the lost ledger), so the reconstructed original restores the line
+///   comment-less;
 /// * a CHECKSUMS `sha256=` token is NOT recomputable offline, so no
 ///   checksum record is emitted: revert leaves bundler's bare path-gem
 ///   entry, which a non-frozen `bundle install` refills byte-identically
 ///   (bundler 4.0.15 verified; frozen installs fail with a self-explanatory
 ///   `empty CHECKSUMS entry` message until then) — surfaced as the
-///   `vendor_checksum_unrecoverable` warning.
+///   `vendor_checksum_unrecoverable` warning. The warning is deliberately
+///   conservative: a gem whose PRE-vendor CHECKSUMS entry was already bare
+///   (real for file-sourced gems — bundler 4.0.15 writes no `sha256=` for
+///   them; vendor then records no checksum wiring at all and the bare-line
+///   revert is byte-perfect) is indistinguishable from a lost token, so it
+///   warns too.
 ///
 /// The transitive-vs-declared split is recovered from the Gemfile form:
 /// vendor appends the managed fence exactly when the gem was undeclared,
