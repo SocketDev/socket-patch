@@ -584,6 +584,12 @@ jobs:
             suite: e2e_maven
           - os: ubuntu-latest
             suite: e2e_composer
+            # composer is a shipped ecosystem, so e2e_composer's tests are
+            # NOT `#[ignore]`-gated the way the experimental-ecosystem suites
+            # (maven, nuget) are — the matrix default `--ignored` filter
+            # selected zero tests here and the leg passed vacuously.
+            # `--include-ignored` runs them, plus any capstone added later.
+            test_filter: --include-ignored
           - os: ubuntu-latest
             suite: e2e_nuget
           # Host vendor build-proof capstones: fresh-checkout install +
@@ -741,7 +747,10 @@ jobs:
           tools: composer:2
 
       - name: Run e2e tests
-        run: cargo test -p socket-patch-cli --all-features --test ${{ matrix.suite }} -- --ignored
+        # Suites are `#[ignore]`-gated out of the unpinned `test` job by
+        # default, hence `--ignored`; an entry that sets `test_filter`
+        # overrides the selector for itself only.
+        run: cargo test -p socket-patch-cli --all-features --test ${{ matrix.suite }} -- ${{ matrix.test_filter || '--ignored' }}
 
   # ----------------------------------------------------------------------
   # Docker-driven real-package e2e suite.
