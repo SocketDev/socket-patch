@@ -543,3 +543,309 @@ fn gem_vendor_fresh_checkout_bundle_install_and_revert() {
         ".socket/vendor must be fully removed after revert"
     );
 }
+
+/// TRANSITIVE-dep capstone: vendoring a gem the Gemfile never declares
+/// (`rack`, pulled in by `rack-test`) appends the managed block + the sorted
+/// `rack (= <ver>)!` DEPENDENCIES pin — a wiring shape the direct-dep
+/// capstone never produces — and a REAL frozen `bundle install` of a fresh
+/// checkout must accept that pair byte-stably, load the patched bytes from
+/// the vendored path through the rack-test require chain, and revert must
+/// byte-restore both files (managed block gone, DEPENDENCIES entry deleted).
+#[test]
+#[ignore = "host capstone: shells out to a real bundler >= 2.5; the unpinned `test` job \
+            skips it, the e2e job runs it with a pinned toolchain via --ignored"]
+fn gem_vendor_transitive_dep_fresh_checkout_and_revert() {
+    if !has_command("ruby") {
+        println!("SKIP e2e_vendor_gem_build (transitive): `ruby` not installed");
+        return;
+    }
+    let Some((major, minor)) = bundler_version() else {
+        println!(
+            "SKIP e2e_vendor_gem_build (transitive): `bundle` not installed (or version \
+             unparseable)"
+        );
+        return;
+    };
+    if major < 2 || (major == 2 && minor < 5) {
+        println!(
+            "SKIP e2e_vendor_gem_build (transitive): host bundler {major}.{minor} predates \
+             the spike-verified 2.5 floor"
+        );
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::write(
+        proj.join("Gemfile"),
+        "source \"https://rubygems.org\"\n\ngem \"rack-test\", \"~> 2.1\"\n",
+    )
+    .unwrap();
+
+    let config = bundle(
+        &proj,
+        &["config", "set", "--local", "path", "vendor/bundle"],
+        false,
+    );
+    if !config.status.success() {
+        println!(
+            "SKIP e2e_vendor_gem_build (transitive): `bundle config set --local path` failed:\n{}",
+            String::from_utf8_lossy(&config.stderr)
+        );
+        return;
+    }
+    // Pin the no-CHECKSUMS lock shape on every host (bundler >= 4 writes a
+    // CHECKSUMS section by default; 2.5–3.x never do) — the CHECKSUMS-lock
+    // vendoring flavor is covered by docker_e2e_vendor_gem's twin.
+    let no_ck = bundle(
+        &proj,
+        &["config", "set", "--local", "lockfile_checksums", "false"],
+        false,
+    );
+    assert!(
+        no_ck.status.success(),
+        "bundle config set --local lockfile_checksums failed:\n{}",
+        String::from_utf8_lossy(&no_ck.stderr)
+    );
+    let install = bundle(&proj, &["install"], false);
+    if !install.status.success() {
+        println!(
+            "SKIP e2e_vendor_gem_build (transitive): `bundle install` failed (registry \
+             unreachable, or host ruby too old for rack-test ~> 2.1?):\n{}",
+            String::from_utf8_lossy(&install.stderr)
+        );
+        return;
+    }
+
+    let lock_path = proj.join("Gemfile.lock");
+    let lock_before = std::fs::read(&lock_path).expect("Gemfile.lock after bundle install");
+    let lock_before_text = String::from_utf8_lossy(&lock_before).into_owned();
+    let version = locked_gem_version(&lock_before_text, DEP)
+        .unwrap_or_else(|| panic!("rack-test must resolve rack into Gemfile.lock"));
+
+    // Anti-vacuity: rack really is transitive — undeclared in the Gemfile
+    // and absent from the lock's DEPENDENCIES section (which does list
+    // `  rack-test (~> 2.1)`, so the probe pins the exact token).
+    let gemfile_path = proj.join("Gemfile");
+    let gemfile_before = std::fs::read(&gemfile_path).unwrap();
+    assert!(
+        !String::from_utf8_lossy(&gemfile_before).contains("\"rack\""),
+        "fixture bug: rack must not be Gemfile-declared"
+    );
+    assert!(
+        !lock_before_text.contains("\nCHECKSUMS\n"),
+        "fixture bug: this capstone pins the no-CHECKSUMS lock shape: {lock_before_text}"
+    );
+    let deps_section = lock_before_text
+        .split("DEPENDENCIES\n")
+        .nth(1)
+        .and_then(|rest| rest.split("\n\n").next())
+        .expect("lock has a DEPENDENCIES section");
+    assert!(
+        !deps_section
+            .lines()
+            .any(|l| l == "  rack" || l.starts_with("  rack (") || l.starts_with("  rack!")),
+        "fixture bug: rack must not appear in DEPENDENCIES: {deps_section}"
+    );
+
+    // The installed transitive gem, marker patch on its ACTUAL bytes.
+    let mut ruby = Command::new("ruby");
+    ruby.args(["-e", "puts Gem.ruby_api_version"]);
+    cache_env::isolate(&mut ruby);
+    let api = ruby.output().expect("failed to run ruby");
+    assert!(api.status.success(), "ruby api version probe failed");
+    let api = String::from_utf8_lossy(&api.stdout).trim().to_string();
+    let installed_rb = proj
+        .join("vendor/bundle/ruby")
+        .join(&api)
+        .join("gems")
+        .join(format!("{DEP}-{version}"))
+        .join("lib/rack.rb");
+    let orig = std::fs::read(&installed_rb).expect("installed lib/rack.rb");
+    assert!(
+        !String::from_utf8_lossy(&orig).contains("SOCKET_PATCH_VENDOR_E2E"),
+        "pristine install must not carry the probe constant"
+    );
+    let marker = format!(
+        "\n# SOCKET-PATCH-VENDOR-E2E-MARKER\nmodule Rack\n  SOCKET_PATCH_VENDOR_E2E = \"{UUID}\"\nend\n"
+    );
+    let patched: Vec<u8> = [orig.as_slice(), marker.as_bytes()].concat();
+    let purl = format!("pkg:gem/{DEP}@{version}");
+    stage_patch_with_vuln(&proj, &purl, "lib/rack.rb", &orig, &patched);
+
+    // Vendor (offline). The transitive branch appends the managed block.
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &[
+            "vendor",
+            "--json",
+            "--offline",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(
+        code, 0,
+        "vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let env = parse_envelope(&stdout);
+    assert_eq!(env["summary"]["applied"], 1, "one package vendored: {env}");
+    assert_eq!(env["summary"]["failed"], 0, "no failures: {env}");
+
+    // The appended managed block, byte-exact (hand-pinned marker lines — the
+    // block delimits what revert may delete, so its shape is contract).
+    let copy_rel = format!(".socket/vendor/gem/{UUID}/{DEP}-{version}");
+    let gemfile = std::fs::read_to_string(&gemfile_path).unwrap();
+    let expected_gemfile = format!(
+        "{}# >>> socket-patch vendor (managed) >>>\ngem \"{DEP}\", \"{version}\", \
+         path: \"{copy_rel}\"\n# <<< socket-patch vendor (managed) <<<\n",
+        String::from_utf8_lossy(&gemfile_before)
+    );
+    assert_eq!(
+        gemfile, expected_gemfile,
+        "transitive vendor must append exactly the managed block"
+    );
+
+    // The lock pair: canonical PATH section before GEM, and the DEPENDENCIES
+    // pin inserted at bundler's sorted position (rack before rack-test).
+    let lock = std::fs::read_to_string(&lock_path).unwrap();
+    assert!(
+        lock.contains(&format!(
+            "PATH\n  remote: {copy_rel}\n  specs:\n    {DEP} ({version})"
+        )),
+        "canonical PATH section missing:\n{lock}"
+    );
+    assert!(
+        lock.contains(&format!(
+            "DEPENDENCIES\n  {DEP} (= {version})!\n  rack-test (~> 2.1)\n"
+        )),
+        "DEPENDENCIES pin must insert at bundler's sorted position:\n{lock}"
+    );
+
+    // FRESH-CHECKOUT PROOF: committable files only, frozen install (bundler
+    // validates the Gemfile↔lock dependency sets — an unsorted or malformed
+    // insert fails here), byte-stable lock, patched bytes reached THROUGH the
+    // rack-test require chain.
+    let fresh = tmp.path().join("fresh");
+    std::fs::create_dir_all(&fresh).unwrap();
+    std::fs::copy(&gemfile_path, fresh.join("Gemfile")).unwrap();
+    std::fs::copy(&lock_path, fresh.join("Gemfile.lock")).unwrap();
+    copy_dir_recursive(&proj.join(".socket"), &fresh.join(".socket"));
+    copy_dir_recursive(&proj.join(".bundle"), &fresh.join(".bundle"));
+    assert!(
+        !fresh.join("vendor").exists(),
+        "fresh checkout must not carry an installed tree (test bug)"
+    );
+
+    let lock_wired = std::fs::read(&lock_path).unwrap();
+    let ci = bundle(&fresh, &["install"], true);
+    assert!(
+        ci.status.success(),
+        "fresh-checkout frozen `bundle install` must accept the managed-block pair.\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&ci.stdout),
+        String::from_utf8_lossy(&ci.stderr),
+    );
+    assert_eq!(
+        std::fs::read(fresh.join("Gemfile.lock")).unwrap(),
+        lock_wired,
+        "frozen install must leave the committed Gemfile.lock byte-identical"
+    );
+
+    // `require "rack/test"` proves the direct dep still resolves alongside
+    // the vendored transitive; it does not itself load `lib/rack.rb`, so the
+    // marker is probed through an explicit `require "rack"` in the same VM.
+    let probe = bundle(
+        &fresh,
+        &[
+            "exec",
+            "ruby",
+            "-e",
+            "require \"rack/test\"\n\
+             require \"rack\"\n\
+             abort \"probe constant missing after require\" unless defined?(Rack::SOCKET_PATCH_VENDOR_E2E)\n\
+             puts Rack::SOCKET_PATCH_VENDOR_E2E\n\
+             puts $LOADED_FEATURES.grep(%r{/rack\\.rb\\z})",
+        ],
+        false,
+    );
+    assert!(
+        probe.status.success(),
+        "bundle exec runtime probe failed.\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&probe.stdout),
+        String::from_utf8_lossy(&probe.stderr),
+    );
+    let probe_out = String::from_utf8_lossy(&probe.stdout).into_owned();
+    assert!(
+        probe_out.contains(UUID),
+        "probe constant must carry the patch uuid:\n{probe_out}"
+    );
+    assert!(
+        probe_out.contains(&format!("{copy_rel}/lib/rack.rb")),
+        "rack must be loaded from the vendored path via rack-test:\n{probe_out}"
+    );
+
+    // Idempotency: a re-run leaves both files byte-identical (a second
+    // managed block or a duplicated DEPENDENCIES pin breaks bundler).
+    let gemfile_wired = std::fs::read(&gemfile_path).unwrap();
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &[
+            "vendor",
+            "--json",
+            "--offline",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(
+        code, 0,
+        "re-vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let env2 = parse_envelope(&stdout);
+    assert_eq!(env2["summary"]["failed"], 0, "re-run must not fail: {env2}");
+    assert_eq!(
+        std::fs::read(&gemfile_path).unwrap(),
+        gemfile_wired,
+        "re-vendor must leave the Gemfile byte-identical"
+    );
+    assert_eq!(
+        std::fs::read(&lock_path).unwrap(),
+        lock_wired,
+        "re-vendor must leave Gemfile.lock byte-identical"
+    );
+
+    // REVERT PROOF: the managed block and the DEPENDENCIES pin are deletions
+    // (no pre-vendor original exists for either) — both files must come back
+    // byte-identical to the pre-vendor snapshots.
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &[
+            "vendor",
+            "--revert",
+            "--json",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(
+        code, 0,
+        "revert failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let renv = parse_envelope(&stdout);
+    assert_eq!(renv["summary"]["removed"], 1, "one entry reverted: {renv}");
+    assert_eq!(
+        std::fs::read(&gemfile_path).unwrap(),
+        gemfile_before,
+        "revert must restore the Gemfile byte-identical (managed block gone)"
+    );
+    assert_eq!(
+        std::fs::read(&lock_path).unwrap(),
+        lock_before,
+        "revert must restore Gemfile.lock byte-identical (PATH + pin gone)"
+    );
+    assert!(
+        !proj.join(".socket/vendor").exists(),
+        ".socket/vendor must be fully removed after revert"
+    );
+}

@@ -188,6 +188,16 @@ pub async fn revert_cargo_redirect_purl(
                 if referenced {
                     continue;
                 }
+                // A REGENERATED block (`action: "rewritten"` — the rewriter
+                // replaced a degraded/commented region in place and recorded
+                // it as `original`) restores that pre-existing region instead
+                // of deleting it: the original bytes are the user's.
+                if let Some(orig) = edit.original.as_ref().and_then(Value::as_str) {
+                    let reverted = content.replacen(block, orig, 1);
+                    write_rel(project_root, &edit.path, &reverted).await?;
+                    out.reverted_files.push(edit.path.clone());
+                    continue;
+                }
                 let mut trimmed = content.replacen(block, "", 1);
                 // Collapse the blank separator the rewrite inserted.
                 while trimmed.contains("\n\n\n") {

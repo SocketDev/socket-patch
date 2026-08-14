@@ -272,7 +272,8 @@ fn rollback_offline_with_missing_before_blob_partial_failure() {
     assert_eq!(v["dryRun"], false, "not a dry-run");
     // Known design gap (see memory `apply-invariants-test-hardened`): the
     // offline missing-blob bail returns a *contentless* partial_failure — it
-    // aborts before crawling, so `failed` stays 0 and `results` is empty even
+    // aborts after discovery but before the rollback loop produces any
+    // per-package results, so `failed` stays 0 and `results` is empty even
     // though the run did not succeed. Pin that exact shape so the bail can't
     // silently morph into either a real failure count or a spurious success.
     assert_eq!(

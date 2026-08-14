@@ -1,0 +1,29 @@
+{
+    "_readme": [
+        "This file locks the dependencies of your project to a known state"
+    ],
+    "content-hash": "abc123def456abc123def456abc1",
+    "packages": [
+        {
+            "name": "monolog/monolog",
+            "version": "2.0.0",
+            "dist": {
+                "type": "zip",
+                "url": "https:\/\/api.github.com\/repos\/Seldaek\/monolog\/zipball\/abc123",
+                "reference": "abc123def456",
+                "shasum": ""
+            }
+        },
+        {
+            "name": "psr/log",
+            "version": "1.1.4",
+            "dist": {
+                "type": "zip",
+                "url": "https:\/\/api.github.com\/repos\/php-fig\/log\/zipball\/d49695b909c3b7628b6289db5479a1c204601f11",
+                "reference": "d49695b909c3b7628b6289db5479a1c204601f11",
+                "shasum": ""
+            }
+        }
+    ],
+    "packages-dev": []
+}

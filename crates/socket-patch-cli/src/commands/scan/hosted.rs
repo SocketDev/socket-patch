@@ -35,6 +35,11 @@ const REDIRECT_CANDIDATE_FILES: &[&str] = &[
     "packages.lock.json",
     "Gemfile",
     "Gemfile.lock",
+    // Bundler's modern manifest spelling — preferred over Gemfile when both
+    // exist (the gem rewriter picks the pair bundler reads and fails closed
+    // on diverging spellings).
+    "gems.rb",
+    "gems.locked",
     "pom.xml",
     // Maven Trusted Checksums files the fail-closed maven rewriter merges into
     // (read so an existing user config / checksum set is preserved, not
@@ -639,10 +644,26 @@ pub(super) async fn run_redirect(
         .collect();
     let confirmed: Vec<(String, String)> = candidates
         .iter()
-        .filter(|(_, _, artifact_url, index_url, suffixed_version)| {
+        .filter(|(purl, uuid, artifact_url, index_url, suffixed_version)| {
+            // Cargo is transactional: the rewriter reports exactly which
+            // patch uuids FULLY landed (manifest pin + lock + registry
+            // block). Substring presence must never confirm a cargo dep —
+            // the `[registries.…]` config block contains the index URL while
+            // pinning nothing, so a config-block-only rewrite would be
+            // attested with zero enforcement in any build.
+            if purl.starts_with("pkg:cargo/") {
+                return rewrite.confirmed_cargo_uuids.contains(uuid);
+            }
             let encoded = socket_patch_core::utils::uri::encode_uri_component(artifact_url);
             final_texts.iter().any(|text| {
-                text.contains(artifact_url.as_str())
+                // The rewriters' own predicate — raw, or the `\/`-escaped
+                // slashes an old composer.lock spells them with — so a
+                // writer's spelling can never be one this probe misses. It
+                // was: the composer rewriter emitted `\/`-escaped urls this
+                // probe never looked for, so a fully successful composer
+                // redirect reported `redirected: 0`, fetched no patch record
+                // into the ledger, and left the patch unattestable by `vex`.
+                socket_patch_core::patch::redirect::artifact_url_present(text, artifact_url)
                     // The berry rewriter writes the URL percent-encoded into the
                     // lock's `::__archiveUrl=` binding, so the raw form is absent.
                     || text.contains(encoded.as_str())
