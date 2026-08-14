@@ -156,6 +156,34 @@ pub async fn vendor_npm(
         }
     };
     if matches.is_empty() {
+        // Every instance the scan saw was skipped (bundled inside a parent's
+        // tarball, or a link): the entry IS in the lock, so the generic
+        // "not found / run `npm install`" advice would be wrong twice over.
+        // Refuse with the real reason and carry the stays-UNPATCHED
+        // advisories in the detail — a Refused outcome has no warnings
+        // channel, and silently dropping them would hide a security-critical
+        // fact.
+        let skipped: Vec<&str> = warnings
+            .iter()
+            .filter(|w| {
+                matches!(
+                    w.code,
+                    "vendor_bundled_instance_skipped" | "vendor_link_entry_skipped"
+                )
+            })
+            .map(|w| w.detail.as_str())
+            .collect();
+        if !skipped.is_empty() {
+            return refused(
+                "vendor_lock_entry_not_rewritable",
+                format!(
+                    "every {lock_name} entry for {name}@{version} is bundled inside a \
+                     parent's tarball or a link and cannot be rewritten — those copies \
+                     stay UNPATCHED and `npm install` will not help: {}",
+                    skipped.join("; ")
+                ),
+            );
+        }
         return refused(
             "vendor_lock_entry_not_found",
             format!(
@@ -267,6 +295,7 @@ pub async fn vendor_npm(
                 &lock_name,
                 &mut wiring,
                 &mut changed,
+                &mut warnings,
             );
         }
     }
@@ -573,14 +602,45 @@ fn rewrite_legacy_tree(
     lock_name: &str,
     wiring: &mut Vec<WiringRecord>,
     changed: &mut bool,
+    warnings: &mut Vec<VendorWarning>,
 ) {
+    // npm 6 spells an alias install `"<alias>": {"version": "npm:real@ver"}`
+    // in the legacy tree (no `name` field like the `packages` entries carry).
+    let alias_version = format!("npm:{name}@{version}");
     for (dep_name, node) in deps.iter_mut() {
         let Some(obj) = node.as_object_mut() else {
             continue;
         };
         let pointer = format!("{pointer_base}/{}", escape_json_pointer_token(dep_name));
+        let node_version = obj.get("version").and_then(Value::as_str);
+        if node_version == Some(alias_version.as_str()) {
+            // An aliased consumer of the patched package. The modern
+            // `packages` twin was rewritten via its `name` field, but this
+            // legacy spelling has no proven equivalent rewrite — LOUD: an
+            // npm 6 client reading the v2 mirror still installs the
+            // UNPATCHED registry bytes through the alias (npm >= 7 is
+            // unaffected).
+            warnings.push(VendorWarning::new(
+                "vendor_legacy_alias_skipped",
+                format!(
+                    "legacy `dependencies` node `{pointer}` aliases {name}@{version} \
+                     (`{alias_version}`) and was NOT rewritten — npm 6 clients reading \
+                     the v2 legacy mirror still install the UNPATCHED registry bytes \
+                     through it"
+                ),
+            ));
+        }
         if dep_name == name
-            && obj.get("version").and_then(Value::as_str) == Some(version)
+            && node_version == Some(version)
+            && obj.get("bundled").and_then(Value::as_bool) == Some(true)
+        {
+            // Parity with the `packages` scan's inBundle skip: this copy
+            // ships inside its parent's tarball, npm never installs it from
+            // `resolved`, and rewriting it would desync the two lock halves.
+            // (The `packages` twin carries `inBundle` and already pushed the
+            // stays-UNPATCHED warning.)
+        } else if dep_name == name
+            && node_version == Some(version)
             && !entry_in_sync(obj, resolved, integrity)
         {
             let was_vendored = entry_points_into_vendor(obj);
@@ -611,6 +671,7 @@ fn rewrite_legacy_tree(
                 lock_name,
                 wiring,
                 changed,
+                warnings,
             );
         }
     }
@@ -1331,6 +1392,60 @@ mod tests {
         );
     }
 
+    /// When EVERY lock instance of the target is bundled or a link, the
+    /// refusal must state the real reason (the entry IS in the lock and
+    /// `npm install` will not help) and keep the stays-UNPATCHED advisory —
+    /// not the generic `vendor_lock_entry_not_found`.
+    #[tokio::test]
+    async fn all_bundled_or_link_instances_refuse_with_accurate_reason() {
+        let lock = json!({
+            "name": "fixture",
+            "version": "1.0.0",
+            "lockfileVersion": 3,
+            "packages": {
+                "": { "name": "fixture", "version": "1.0.0" },
+                "node_modules/bundler": {
+                    "version": "2.0.0",
+                    "resolved": "https://registry.npmjs.org/bundler/-/bundler-2.0.0.tgz",
+                    "integrity": "sha512-bundler=="
+                },
+                "node_modules/bundler/node_modules/left-pad": {
+                    "version": "1.3.0",
+                    "resolved": REG_RESOLVED,
+                    "integrity": "sha512-orig==",
+                    "inBundle": true
+                },
+                "node_modules/linked-pad": {
+                    "name": "left-pad",
+                    "version": "1.3.0",
+                    "resolved": "projects/left-pad",
+                    "link": true
+                }
+            }
+        });
+        let fx = fixture_with("left-pad", "1.3.0", lock).await;
+        let detail = expect_refused(fx.vendor(false).await, "vendor_lock_entry_not_rewritable");
+        assert!(detail.contains("UNPATCHED"), "loud advisory kept: {detail}");
+        assert!(detail.contains("bundled"), "{detail}");
+        assert!(
+            detail.contains("node_modules/bundler/node_modules/left-pad"),
+            "names the bundled instance: {detail}"
+        );
+        assert!(
+            !detail.contains("make sure the package is installed"),
+            "no misleading `npm install` remedy: {detail}"
+        );
+        assert_eq!(
+            tokio::fs::read(fx.lock_path()).await.unwrap(),
+            fx.lock_bytes,
+            "lock untouched by the refusal"
+        );
+        assert!(
+            !fx.root().join(".socket/vendor").exists(),
+            "refusal writes nothing"
+        );
+    }
+
     #[tokio::test]
     async fn workspace_member_is_refused() {
         let lock = json!({
@@ -1550,6 +1665,164 @@ mod tests {
             tokio::fs::read(fx.lock_path()).await.unwrap(),
             fx.lock_bytes
         );
+    }
+
+    /// v2 legacy mirror parity with the `packages` scan: a `bundled: true`
+    /// legacy node ships inside its parent's tarball, npm never installs it
+    /// from `resolved`, so rewriting it would desync the two lock halves.
+    #[tokio::test]
+    async fn v2_legacy_bundled_node_is_not_rewritten() {
+        let lock = json!({
+            "name": "fixture",
+            "version": "1.0.0",
+            "lockfileVersion": 2,
+            "requires": true,
+            "packages": {
+                "": { "name": "fixture", "version": "1.0.0" },
+                "node_modules/left-pad": {
+                    "version": "1.3.0",
+                    "resolved": REG_RESOLVED,
+                    "integrity": "sha512-orig=="
+                },
+                "node_modules/bundler": {
+                    "version": "2.0.0",
+                    "resolved": "https://registry.npmjs.org/bundler/-/bundler-2.0.0.tgz",
+                    "integrity": "sha512-bundler=="
+                },
+                "node_modules/bundler/node_modules/left-pad": {
+                    "version": "1.3.0",
+                    "resolved": REG_RESOLVED,
+                    "integrity": "sha512-orig==",
+                    "inBundle": true
+                }
+            },
+            "dependencies": {
+                "bundler": {
+                    "version": "2.0.0",
+                    "resolved": "https://registry.npmjs.org/bundler/-/bundler-2.0.0.tgz",
+                    "integrity": "sha512-bundler==",
+                    "requires": { "left-pad": "^1.3.0" },
+                    "dependencies": {
+                        "left-pad": {
+                            "version": "1.3.0",
+                            "resolved": REG_RESOLVED,
+                            "integrity": "sha512-orig==",
+                            "bundled": true
+                        }
+                    }
+                },
+                "left-pad": {
+                    "version": "1.3.0",
+                    "resolved": REG_RESOLVED,
+                    "integrity": "sha512-orig=="
+                }
+            }
+        });
+        let fx = fixture_with("left-pad", "1.3.0", lock.clone()).await;
+        let (result, entry, _) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        let entry = entry.unwrap();
+
+        let legacy_keys: Vec<&str> = entry
+            .wiring
+            .iter()
+            .filter(|r| r.kind == KIND_LOCK_LEGACY_ENTRY)
+            .map(|r| r.key.as_deref().unwrap())
+            .collect();
+        assert_eq!(
+            legacy_keys,
+            vec!["/dependencies/left-pad"],
+            "only the plain legacy node is rewritten"
+        );
+
+        let live = fx.read_lock().await;
+        assert_eq!(
+            live["dependencies"]["bundler"]["dependencies"]["left-pad"],
+            lock["dependencies"]["bundler"]["dependencies"]["left-pad"],
+            "bundled legacy node byte-untouched"
+        );
+        assert_eq!(
+            live["dependencies"]["left-pad"]["resolved"],
+            json!(format!("file:{}", fx.expected_rel_tgz()))
+        );
+    }
+
+    /// v2 legacy mirror: an alias consumer (`"aliased": {"version":
+    /// "npm:left-pad@1.3.0"}`) has no proven equivalent rewrite — it must be
+    /// left untouched AND loudly warned, since npm 6 reading the mirror
+    /// still installs the unpatched registry bytes through it.
+    #[tokio::test]
+    async fn v2_legacy_alias_node_warns_and_keeps_registry_resolution() {
+        let lock = json!({
+            "name": "fixture",
+            "version": "1.0.0",
+            "lockfileVersion": 2,
+            "requires": true,
+            "packages": {
+                "": { "name": "fixture", "version": "1.0.0" },
+                "node_modules/aliased": {
+                    "name": "left-pad",
+                    "version": "1.3.0",
+                    "resolved": REG_RESOLVED,
+                    "integrity": "sha512-orig=="
+                },
+                "node_modules/left-pad": {
+                    "version": "1.3.0",
+                    "resolved": REG_RESOLVED,
+                    "integrity": "sha512-orig=="
+                }
+            },
+            "dependencies": {
+                "aliased": {
+                    "version": "npm:left-pad@1.3.0",
+                    "resolved": REG_RESOLVED,
+                    "integrity": "sha512-orig=="
+                },
+                "left-pad": {
+                    "version": "1.3.0",
+                    "resolved": REG_RESOLVED,
+                    "integrity": "sha512-orig=="
+                }
+            }
+        });
+        let fx = fixture_with("left-pad", "1.3.0", lock.clone()).await;
+        let (result, entry, warnings) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        let entry = entry.unwrap();
+
+        let alias_warning = warnings
+            .iter()
+            .find(|w| w.code == "vendor_legacy_alias_skipped")
+            .unwrap_or_else(|| panic!("missing alias warning: {warnings:?}"));
+        assert!(
+            alias_warning.detail.contains("UNPATCHED"),
+            "loud advisory: {}",
+            alias_warning.detail
+        );
+        assert!(
+            alias_warning.detail.contains("/dependencies/aliased"),
+            "names the node: {}",
+            alias_warning.detail
+        );
+
+        // The modern `packages` alias entry IS rewritten (name-field match);
+        // the legacy alias node stays at the registry resolution.
+        let live = fx.read_lock().await;
+        assert_eq!(
+            live["packages"]["node_modules/aliased"]["resolved"],
+            json!(format!("file:{}", fx.expected_rel_tgz()))
+        );
+        assert_eq!(
+            live["dependencies"]["aliased"], lock["dependencies"]["aliased"],
+            "legacy alias node byte-untouched"
+        );
+        let legacy_keys: Vec<&str> = entry
+            .wiring
+            .iter()
+            .filter(|r| r.kind == KIND_LOCK_LEGACY_ENTRY)
+            .map(|r| r.key.as_deref().unwrap())
+            .collect();
+        assert_eq!(legacy_keys, vec!["/dependencies/left-pad"]);
     }
 
     #[tokio::test]
