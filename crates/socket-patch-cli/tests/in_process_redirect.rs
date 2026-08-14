@@ -1970,3 +1970,270 @@ async fn redirect_json_mode_write_failures_emit_error_envelope() {
     let out = run_leg(tmp.path(), &server).await;
     assert_error_envelope(&out, "ledger-write failure");
 }
+
+/// Mount the full cargo hosted-mock set (discovery + reference + view) for
+/// one patch over `purl`.
+async fn mock_cargo_patch(
+    server: &MockServer,
+    purl: &str,
+    uuid: &str,
+    name: &str,
+    version: &str,
+    index_url: &str,
+    cksum: &str,
+    ghsa: &str,
+) {
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/batch")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "packages": [{
+                "purl": purl,
+                "patches": [{
+                    "uuid": uuid, "purl": purl, "tier": "free",
+                    "cveIds": [], "ghsaIds": [ghsa], "severity": "high",
+                    "title": "cargo redirect fixture"
+                }]
+            }],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex(format!(
+            "^/v0/orgs/{ORG}/patches/by-package/.+$"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "patches": [{
+                "uuid": uuid, "purl": purl,
+                "publishedAt": "2024-01-01T00:00:00Z",
+                "description": "x", "license": "MIT", "tier": "free",
+                "vulnerabilities": {}
+            }],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/package")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "results": {
+                uuid: {
+                    "status": "granted",
+                    "url": format!("http://patch.test/{name}-{version}.crate"),
+                    "purl": purl,
+                    "artifacts": [{
+                        "kind": "tarball",
+                        "url": format!("http://patch.test/{name}-{version}.crate"),
+                        "integrity": { "sha256": cksum }
+                    }],
+                    "registryOverride": {
+                        "kind": "cargo-sparse",
+                        "indexUrl": index_url,
+                        "identifiers": {
+                            "name": name,
+                            "version": version,
+                            "cargoCksumSha256": cksum,
+                        }
+                    }
+                }
+            }
+        })))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/view/{uuid}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "uuid": uuid,
+            "purl": purl,
+            "publishedAt": "2024-01-01T00:00:00Z",
+            "files": {
+                "src/lib.rs": {
+                    "beforeHash": "a".repeat(64),
+                    "afterHash": "b".repeat(64),
+                }
+            },
+            "vulnerabilities": {
+                ghsa: {
+                    "cves": ["CVE-2024-99999"],
+                    "summary": "cargo redirect vex fixture",
+                    "severity": "high",
+                    "description": "d"
+                }
+            },
+            "description": "x", "license": "MIT", "tier": "free"
+        })))
+        .mount(server)
+        .await;
+}
+
+/// Write a vendored crate dir so the cargo crawler discovers `name@version`
+/// without the project's manifest/lock referencing it.
+fn write_vendored_crate(root: &Path, name: &str, version: &str) {
+    let dir = root.join("vendor").join(name);
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        format!("[package]\nname = \"{name}\"\nversion = \"{version}\"\nedition = \"2021\"\n"),
+    )
+    .unwrap();
+    std::fs::write(dir.join("src/lib.rs"), b"// unpatched\n").unwrap();
+}
+
+/// AUDIT A3/A3b — the cargo analogue of `no_lockfile_redirect_is_not_attested`:
+/// a granted cargo patch whose crate the project does not declare (surfaced by
+/// the crawler from a vendor dir) must confirm NOTHING. The old behavior wrote
+/// an inert `[registries.…]` block to `.cargo/config.toml`, whose index URL
+/// then satisfied the substring confirmed check: the run reported
+/// `redirected: 1`, persisted a ledger record, and emitted an `assume_applied`
+/// VEX statement while no build anywhere used the patched bytes.
+#[tokio::test]
+#[serial]
+async fn cargo_granted_but_nothing_pinned_is_not_confirmed_or_attested() {
+    const CARGO_PURL: &str = "pkg:cargo/cfg-if@1.0.0";
+    const CARGO_UUID: &str = "11111111-1111-4111-8111-111111111111";
+    let cksum = "cd".repeat(32);
+    let index_url = format!("sparse+http://patch.test/registry/cargo/{CARGO_UUID}/index/");
+
+    let server = MockServer::start().await;
+    mock_cargo_patch(
+        &server,
+        CARGO_PURL,
+        CARGO_UUID,
+        "cfg-if",
+        "1.0.0",
+        &index_url,
+        &cksum,
+        "GHSA-carg-aaaa-bbbb",
+    )
+    .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    // Manifest + lock reference ONLY serde; cfg-if exists solely in vendor/.
+    std::fs::write(
+        tmp.path().join("Cargo.toml"),
+        "[package]\nname = \"consumer\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[dependencies]\nserde = \"1.0\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("Cargo.lock"),
+        "version = 3\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"ee\"\n",
+    )
+    .unwrap();
+    write_vendored_crate(tmp.path(), "cfg-if", "1.0.0");
+    let toml_before = std::fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+    let lock_before = std::fs::read_to_string(tmp.path().join("Cargo.lock")).unwrap();
+
+    let vex_path = tmp.path().join("out.vex.json");
+    let mut args = redirect_args(tmp.path(), server.uri());
+    args.vex = socket_patch_cli::commands::vex::VexEmbedArgs {
+        vex: Some(vex_path.clone()),
+        vex_product: Some("pkg:cargo/consumer@0.0.0".to_string()),
+        ..Default::default()
+    };
+    let code = run(args).await;
+
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap(),
+        toml_before,
+        "Cargo.toml must be untouched (no dep entry for cfg-if)"
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("Cargo.lock")).unwrap(),
+        lock_before,
+        "Cargo.lock must be untouched (no [[package]] for cfg-if)"
+    );
+    assert!(
+        !tmp.path().join(".cargo/config.toml").exists()
+            && !tmp.path().join(".cargo/config").exists(),
+        "NO inert [registries] block may be written when nothing pins the patch"
+    );
+    assert!(
+        !tmp.path()
+            .join(".socket/vendor/redirect-state.json")
+            .exists(),
+        "no ledger may be written when nothing was redirected"
+    );
+    assert!(
+        !vex_path.exists(),
+        "NO OpenVEX document may exist for a tree where nothing pins the patch"
+    );
+    assert_eq!(
+        code, 1,
+        "nothing was redirected, so the requested attestation must fail"
+    );
+}
+
+/// AUDIT A2 (green side): the multi-line `[dependencies.<name>]` table form —
+/// with NO Cargo.lock — is fully pinned: the manifest entry gains a registry
+/// line, the managed registry block is wired in, and the patch is recorded +
+/// attested (the manifest pin forces the next resolution through the managed
+/// registry, which serves the patched checksum).
+#[tokio::test]
+#[serial]
+async fn cargo_table_form_without_lock_is_pinned_and_attested() {
+    const CARGO_PURL: &str = "pkg:cargo/serde@1.0.190";
+    const CARGO_UUID: &str = "55555555-5555-4555-8555-555555555555";
+    let cksum = "11".repeat(32);
+    let index_url = format!("sparse+http://patch.test/registry/cargo/{CARGO_UUID}/index/");
+
+    let server = MockServer::start().await;
+    mock_cargo_patch(
+        &server,
+        CARGO_PURL,
+        CARGO_UUID,
+        "serde",
+        "1.0.190",
+        &index_url,
+        &cksum,
+        "GHSA-carg-cccc-dddd",
+    )
+    .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    // Table-form dependency; NO Cargo.lock. The crawler discovers the version
+    // from the vendored crate dir.
+    std::fs::write(
+        tmp.path().join("Cargo.toml"),
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies.serde]\nversion = \"1.0.190\"\n",
+    )
+    .unwrap();
+    write_vendored_crate(tmp.path(), "serde", "1.0.190");
+
+    let vex_path = tmp.path().join("out.vex.json");
+    let mut args = redirect_args(tmp.path(), server.uri());
+    args.vex = socket_patch_cli::commands::vex::VexEmbedArgs {
+        vex: Some(vex_path.clone()),
+        vex_product: Some("pkg:cargo/app@0.1.0".to_string()),
+        ..Default::default()
+    };
+    let code = run(args).await;
+    assert_eq!(code, 0, "the table-form pin must land and attest");
+
+    let manifest = std::fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+    assert!(
+        manifest.contains(&format!(
+            "[dependencies.serde]\nregistry = \"socket-patch-{CARGO_UUID}\"\nversion = \"1.0.190\""
+        )),
+        "the table entry must gain the registry line: {manifest}"
+    );
+    let cfg = std::fs::read_to_string(tmp.path().join(".cargo/config.toml")).unwrap();
+    assert!(
+        cfg.contains(&index_url),
+        "the managed registry block must be wired in: {cfg}"
+    );
+    assert!(
+        !tmp.path().join("Cargo.lock").exists(),
+        "no lockfile may be invented"
+    );
+    let ledger =
+        std::fs::read_to_string(tmp.path().join(".socket/vendor/redirect-state.json")).unwrap();
+    assert!(
+        ledger.contains(CARGO_UUID) && ledger.contains("GHSA-carg-cccc-dddd"),
+        "the ledger must record the landed redirect: {ledger}"
+    );
+    let doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&vex_path).unwrap()).unwrap();
+    let stmts = doc["statements"].as_array().unwrap();
+    assert_eq!(stmts.len(), 1, "the landed redirect is attested: {doc}");
+    assert_eq!(stmts[0]["vulnerability"]["name"], "GHSA-carg-cccc-dddd");
+}
