@@ -18,6 +18,10 @@
 //!   * `remove <base PURL>` over a broad manifest removes ALL platform
 //!     variants and rolls back the file without spurious failure.
 //!   * `rollback` (no id) over a broad manifest exits 0.
+//!   * `rollback`/`remove` over a broad manifest succeed even when the
+//!     UNINSTALLED sibling variant's before-blob is missing and
+//!     unfetchable — the gate covers only the narrowed (installed)
+//!     variant, online and `--offline`.
 
 use std::path::{Path, PathBuf};
 
@@ -497,6 +501,213 @@ async fn remove_base_purl_clears_all_platforms_and_rolls_back() {
         read_file(&gem_file),
         ORIGINAL_BYTES,
         "remove must roll the gem file back to exactly its original bytes"
+    );
+}
+
+/// Delete the uninstalled (darwin) sibling's cached before-blob,
+/// returning its hash. Asserts the blob was actually cached by the broad
+/// scan first — without that, the "unfetchable sibling blob" scenario
+/// below would pass vacuously (nothing missing, nothing gated).
+fn delete_darwin_before_blob(cwd: &Path) -> String {
+    let hash = git_sha256(DARWIN_BEFORE_BYTES);
+    let blob = cwd.join(".socket").join("blobs").join(&hash);
+    assert!(
+        blob.exists(),
+        "broad scan must have cached the darwin before-blob at {}",
+        blob.display()
+    );
+    std::fs::remove_file(&blob).expect("delete darwin before-blob");
+    hash
+}
+
+fn rollback_args(cwd: &Path, api_url: String, offline: bool) -> RollbackArgs {
+    RollbackArgs {
+        identifier: None,
+        common: socket_patch_cli::args::GlobalArgs {
+            cwd: cwd.to_path_buf(),
+            org: Some(ORG.to_string()),
+            api_url: Some(api_url),
+            api_token: Some("fake".to_string()),
+            json: true,
+            offline,
+            ecosystems: Some(vec!["gem".to_string()]),
+            ..socket_patch_cli::args::GlobalArgs::default()
+        },
+        one_off: false,
+    }
+}
+
+/// A broad manifest's UNINSTALLED sibling variant resolves to the same
+/// installed dir but is narrowed away by `select_installed_variants`, so
+/// its before-blob is never read. With that blob missing and unfetchable
+/// (the mock serves no blob endpoint — every fetch 404s), rollback must
+/// still restore the installed variant. Before the fix the before-blob
+/// gate ran over the whole ecosystem-scoped manifest BEFORE narrowing, so
+/// the sibling's 404 aborted the entire rollback ("1 blob(s) could not be
+/// downloaded. Cannot rollback.") with the installed file left patched.
+#[tokio::test]
+#[serial]
+async fn rollback_succeeds_when_uninstalled_sibling_before_blob_unfetchable() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (gem_file, server) = fixture(tmp.path()).await;
+
+    assert_eq!(
+        scan_run(scan_args(tmp.path(), server.uri(), true)).await,
+        0,
+        "broad scan+apply must exit 0 before rollback"
+    );
+    assert_eq!(
+        read_file(&gem_file),
+        patched_bytes(),
+        "gem must be patched before rollback"
+    );
+    let darwin_hash = delete_darwin_before_blob(tmp.path());
+
+    let code = rollback_run(rollback_args(tmp.path(), server.uri(), false)).await;
+    assert_eq!(
+        code, 0,
+        "an unfetchable before-blob for the narrowed-away sibling variant must not abort rollback"
+    );
+    assert_eq!(
+        read_file(&gem_file),
+        ORIGINAL_BYTES,
+        "the installed variant must be restored to exactly its original bytes"
+    );
+    // The sibling never gates, so its blob must not even be requested.
+    let reqs = recorded(&server).await;
+    assert!(
+        !reqs
+            .iter()
+            .any(|r| r.url.path().contains(darwin_hash.as_str())),
+        "rollback must not fetch the narrowed-away sibling's before-blob; paths={:?}",
+        reqs.iter()
+            .map(|r| r.url.path().to_string())
+            .collect::<Vec<_>>()
+    );
+    // Rollback is not remove: both variants stay recorded.
+    let mut keys = manifest_keys(tmp.path());
+    keys.sort();
+    let mut expected = vec![qualified(PLATFORM_INSTALLED), qualified(PLATFORM_OTHER)];
+    expected.sort();
+    assert_eq!(
+        keys, expected,
+        "rollback must leave both variants in the manifest"
+    );
+}
+
+/// The `--offline` twin: with only the INSTALLED variant's blobs cached,
+/// an offline rollback of the broad manifest must succeed without any
+/// blob fetch. Before the fix the pre-narrowing gate counted the missing
+/// sibling blob and bailed ("blob(s) are missing and --offline mode is
+/// enabled") before restoring anything.
+#[tokio::test]
+#[serial]
+async fn rollback_offline_succeeds_with_only_installed_variant_blobs_cached() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (gem_file, server) = fixture(tmp.path()).await;
+
+    assert_eq!(
+        scan_run(scan_args(tmp.path(), server.uri(), true)).await,
+        0,
+        "broad scan+apply must exit 0 before rollback"
+    );
+    assert_eq!(
+        read_file(&gem_file),
+        patched_bytes(),
+        "gem must be patched before rollback"
+    );
+    delete_darwin_before_blob(tmp.path());
+
+    // `rollback --offline` mirrors the flag into SOCKET_OFFLINE for the
+    // process (apply_env_toggles); save/restore it so this #[serial]
+    // binary's later tests don't inherit an offline environment.
+    let prev_offline = std::env::var("SOCKET_OFFLINE").ok();
+    let code = rollback_run(rollback_args(tmp.path(), server.uri(), true)).await;
+    match prev_offline {
+        Some(v) => std::env::set_var("SOCKET_OFFLINE", v),
+        None => std::env::remove_var("SOCKET_OFFLINE"),
+    }
+
+    assert_eq!(
+        code, 0,
+        "--offline rollback needs only the installed variant's cached blobs"
+    );
+    assert_eq!(
+        read_file(&gem_file),
+        ORIGINAL_BYTES,
+        "the installed variant must be restored to exactly its original bytes"
+    );
+    // No blob endpoint may be hit at all: everything needed was cached.
+    let reqs = recorded(&server).await;
+    assert!(
+        !reqs.iter().any(|r| r.url.path().contains("/patches/blob/")),
+        "--offline rollback must not fetch any blob; paths={:?}",
+        reqs.iter()
+            .map(|r| r.url.path().to_string())
+            .collect::<Vec<_>>()
+    );
+}
+
+/// `remove <base PURL>` delegates to the same rollback path: with the
+/// uninstalled sibling's before-blob missing and unfetchable (404), the
+/// remove must still roll back the installed variant and clear BOTH
+/// manifest records. Before the fix it aborted with `rollback_failed`,
+/// leaving the file patched and the manifest intact.
+#[tokio::test]
+#[serial]
+async fn remove_succeeds_when_uninstalled_sibling_before_blob_unfetchable() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (gem_file, server) = fixture(tmp.path()).await;
+
+    assert_eq!(
+        scan_run(scan_args(tmp.path(), server.uri(), true)).await,
+        0,
+        "broad scan+apply must exit 0 before remove"
+    );
+    assert_eq!(
+        read_file(&gem_file),
+        patched_bytes(),
+        "gem must be patched before remove"
+    );
+    let darwin_hash = delete_darwin_before_blob(tmp.path());
+
+    let code = remove_run(RemoveArgs {
+        identifier: base_purl(),
+        common: socket_patch_cli::args::GlobalArgs {
+            cwd: tmp.path().to_path_buf(),
+            org: Some(ORG.to_string()),
+            api_url: Some(server.uri()),
+            api_token: Some("fake".to_string()),
+            json: true,
+            yes: true,
+            ecosystems: Some(vec!["gem".to_string()]),
+            ..socket_patch_cli::args::GlobalArgs::default()
+        },
+        skip_rollback: false,
+    })
+    .await;
+    assert_eq!(
+        code, 0,
+        "an unfetchable before-blob for the narrowed-away sibling variant must not abort remove"
+    );
+    assert!(
+        manifest_keys(tmp.path()).is_empty(),
+        "remove must clear every platform variant from the manifest"
+    );
+    assert_eq!(
+        read_file(&gem_file),
+        ORIGINAL_BYTES,
+        "remove must roll the gem file back to exactly its original bytes"
+    );
+    let reqs = recorded(&server).await;
+    assert!(
+        !reqs
+            .iter()
+            .any(|r| r.url.path().contains(darwin_hash.as_str())),
+        "remove must not fetch the narrowed-away sibling's before-blob; paths={:?}",
+        reqs.iter()
+            .map(|r| r.url.path().to_string())
+            .collect::<Vec<_>>()
     );
 }
 

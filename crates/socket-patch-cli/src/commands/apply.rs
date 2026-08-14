@@ -124,8 +124,11 @@ async fn ensure_blobs_for_mismatches(
 /// exact-key lookup misses every one of them. Match records by
 /// qualifier-stripped key, and probe only the variants the apply loop
 /// will actually attempt (its representative-file installed-distribution
-/// gate, bypassed by `--force`) so a skipped sibling variant's files
-/// don't trigger spurious fetches or `--offline` warnings.
+/// gate, applied to multi-variant bases only and bypassed by `--force`)
+/// so a skipped sibling variant's files don't trigger spurious fetches
+/// or `--offline` warnings. A SINGLETON base is always attempted (the
+/// mismatch-policy fall-through), so its mismatched files are probed
+/// unconditionally.
 async fn mismatch_blob_gaps(
     manifest: &PatchManifest,
     all_packages: &HashMap<String, PathBuf>,
@@ -136,11 +139,15 @@ async fn mismatch_blob_gaps(
     for (purl, pkg_path) in all_packages {
         let variant_eco = Ecosystem::from_purl(purl).is_some_and(|e| e.supports_release_variants());
         let stripped = strip_purl_qualifiers(purl);
-        for (key, record) in &manifest.patches {
-            if key != purl && strip_purl_qualifiers(key) != stripped {
-                continue;
-            }
-            if variant_eco && !force {
+        let records: Vec<&PatchRecord> = manifest
+            .patches
+            .iter()
+            .filter(|(key, _)| *key == purl || strip_purl_qualifiers(key) == stripped)
+            .map(|(_, record)| record)
+            .collect();
+        let gated = variant_eco && !force && records.len() > 1;
+        for record in records {
+            if gated {
                 if let Some((file_name, file_info)) = representative_file(&record.files) {
                     let status = verify_file_patch(pkg_path, file_name, file_info)
                         .await
@@ -1133,7 +1140,19 @@ async fn apply_patches_inner(
                 // variant's distribution isn't the one on disk, so skip it —
                 // attempting it would only produce a spurious failure.
                 // Mirrors `select_installed_variants`, used by rollback/get.
-                if !args.force {
+                //
+                // Multi-variant bases ONLY: siblings are what make a
+                // mismatch mean "different distribution". A SINGLETON base
+                // (the common bare `pkg:gem/name@ver` manifest key) has no
+                // sibling to disambiguate against — a mismatch there is
+                // locally-modified bytes on the only candidate, exactly what
+                // the default mismatch policy covers (warn + apply the full
+                // verified patched content; `--strict` refuses). Gating the
+                // singleton made that documented policy unreachable for
+                // gem/pypi/maven, so it falls through to
+                // `apply_package_patch`, whose `MismatchPolicy` handles it
+                // like the npm branch below.
+                if !args.force && variants.len() > 1 {
                     let first_status = match representative_file(&patch.files) {
                         Some((file_name, file_info)) => Some(
                             verify_file_patch(pkg_path, file_name, file_info)
@@ -1668,10 +1687,15 @@ mod tests {
     /// installed distribution (its representative file mismatches) is
     /// skipped by the apply loop, so its blobs must not be queued — that
     /// would mean spurious downloads and spurious `--offline` "will fail
-    /// to apply" warnings on every run. Under `--force` every variant IS
-    /// attempted, so then its blob must be queued.
+    /// to apply" warnings on every run. The gate only exists for
+    /// multi-variant bases (a singleton is always attempted — see the
+    /// singleton test below), so the group carries an installed wheel
+    /// sibling alongside the non-installed sdist. Under `--force` every
+    /// variant IS attempted, so then its blob must be queued.
     #[tokio::test]
     async fn mismatch_blob_gaps_skips_non_installed_variant_unless_forced() {
+        use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
+
         let dir = tempfile::tempdir().unwrap();
         let pkg = dir.path().join("pkg");
         tokio::fs::create_dir_all(&pkg).await.unwrap();
@@ -1681,25 +1705,49 @@ mod tests {
         let blobs = dir.path().join("blobs");
         tokio::fs::create_dir_all(&blobs).await.unwrap();
 
-        // The sdist variant's only file has a different base than the
+        // Installed wheel variant: representative matches the on-disk
+        // bytes (Ready — no mismatch, so nothing to queue for it).
+        let mut wheel_files = HashMap::new();
+        wheel_files.insert(
+            "aaa.py".to_string(),
+            PatchFileInfo {
+                before_hash: compute_git_sha256_from_bytes(b"pristine\n"),
+                after_hash: "1".repeat(64),
+            },
+        );
+        let mut manifest = manifest_with_record(
+            "pkg:pypi/foo@1.0.0?artifact_id=foo-1.0.0-py3-none-any.whl",
+            wheel_files,
+        );
+        // The sdist sibling's only file has a different base than the
         // on-disk bytes: representative mismatch → not installed.
-        let mut files = HashMap::new();
-        files.insert(
+        let mut sdist_files = HashMap::new();
+        sdist_files.insert(
             "aaa.py".to_string(),
             PatchFileInfo {
                 before_hash: "4".repeat(64),
                 after_hash: "5".repeat(64),
             },
         );
-        let manifest =
-            manifest_with_record("pkg:pypi/foo@1.0.0?artifact_id=foo-1.0.0.tar.gz", files);
+        manifest.patches.insert(
+            "pkg:pypi/foo@1.0.0?artifact_id=foo-1.0.0.tar.gz".to_string(),
+            PatchRecord {
+                uuid: "22222222-2222-4222-8222-222222222222".to_string(),
+                exported_at: "2024-01-01T00:00:00Z".to_string(),
+                files: sdist_files,
+                vulnerabilities: HashMap::new(),
+                description: "fixture".to_string(),
+                license: "MIT".to_string(),
+                tier: "free".to_string(),
+            },
+        );
         let mut all_packages = HashMap::new();
         all_packages.insert("pkg:pypi/foo@1.0.0".to_string(), pkg.clone());
 
         let needed = mismatch_blob_gaps(&manifest, &all_packages, &blobs, false).await;
         assert!(
             needed.is_empty(),
-            "a non-installed variant is never attempted, so its blobs must not be queued: {needed:?}"
+            "a non-installed sibling variant is never attempted, so its blobs must not be queued: {needed:?}"
         );
 
         let needed = mismatch_blob_gaps(&manifest, &all_packages, &blobs, true).await;
@@ -1707,6 +1755,44 @@ mod tests {
             needed,
             HashSet::from(["5".repeat(64)]),
             "--force attempts every variant, so the mismatch blob is needed"
+        );
+    }
+
+    /// A SINGLETON release-variant base is always attempted by the apply
+    /// loop (the mismatch-policy fall-through: no sibling exists to make a
+    /// mismatch mean "different distribution"), so its mismatched file's
+    /// afterHash blob must be queued even though the representative file
+    /// mismatches — otherwise the default Warn policy has no bytes to
+    /// overwrite with under `--download-mode diff` and the apply fails
+    /// instead of warn-overwriting.
+    #[tokio::test]
+    async fn mismatch_blob_gaps_singleton_mismatch_queued() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("pkg");
+        tokio::fs::create_dir_all(&pkg).await.unwrap();
+        tokio::fs::write(pkg.join("aaa.rb"), b"locally modified\n")
+            .await
+            .unwrap();
+        let blobs = dir.path().join("blobs");
+        tokio::fs::create_dir_all(&blobs).await.unwrap();
+
+        let mut files = HashMap::new();
+        files.insert(
+            "aaa.rb".to_string(),
+            PatchFileInfo {
+                before_hash: "4".repeat(64),
+                after_hash: "5".repeat(64),
+            },
+        );
+        let manifest = manifest_with_record("pkg:gem/foo@1.0.0", files);
+        let mut all_packages = HashMap::new();
+        all_packages.insert("pkg:gem/foo@1.0.0".to_string(), pkg.clone());
+
+        let needed = mismatch_blob_gaps(&manifest, &all_packages, &blobs, false).await;
+        assert_eq!(
+            needed,
+            HashSet::from(["5".repeat(64)]),
+            "a singleton base falls through to the mismatch policy, so its blob is needed"
         );
     }
 
