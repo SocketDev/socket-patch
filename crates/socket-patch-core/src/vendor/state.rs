@@ -273,6 +273,81 @@ impl Default for VendorState {
     }
 }
 
+/// Carry a re-vendor's ledger entry forward from the one it replaces so a
+/// later `--revert` can still undo every surface an *earlier* vendoring of
+/// the same package touched.
+///
+/// A backend rebuilds `entry.wiring` from only the surfaces it changed THIS
+/// run. When a re-vendor adds a NEW surface while the others are already in
+/// sync — e.g. a project vendored before pnpm >= 11 support, whose
+/// `package.json` + `pnpm-lock.yaml` already carry the override, gaining the
+/// `pnpm-workspace.yaml` mirror on re-vendor — the fresh entry names ONLY the
+/// new surface. Replacing the prior ledger entry wholesale would then drop
+/// the pre-vendor originals the FIRST vendoring recorded for the untouched
+/// surfaces, and revert could no longer restore them (it would undo only the
+/// newly added surface). This reconciles the two:
+///
+///   * fills a `Rewritten` record's missing `original` from the prior entry —
+///     a re-vendor rewrites its OWN stale `.socket/vendor/` pointer and so
+///     records `original: None` (it must never record a vendored pointer as
+///     the pre-vendor fragment); the true original lives in the entry being
+///     replaced (matched by file+kind+key);
+///   * carries forward any prior wiring record for a surface THIS run did not
+///     re-touch (union by file+kind+key), so revert still restores it;
+///   * OR-merges the pnpm "created this table/file/section" bookkeeping so a
+///     create recorded by the first vendoring is not lost when a re-vendor
+///     finds the surface already present (revert byte-restores an emptied
+///     table/file only when it knows vendor created it);
+///   * preserves the go-patch-takeover flag.
+///
+/// The union + meta merge are scoped to a re-vendor of the SAME patch
+/// generation (`prev.uuid == entry.uuid`): a new-uuid re-vendor rewires every
+/// surface fresh under the new uuid, so the prior uuid's records name nothing
+/// the new entry left behind and carrying them forward would only dangle.
+/// The original-fill and takeover flag are safe (identity-matched) either way
+/// and run unconditionally.
+pub fn carry_forward_wiring(prev: &VendorEntry, entry: &mut VendorEntry) {
+    entry.took_over_go_patches = entry.took_over_go_patches || prev.took_over_go_patches;
+
+    for rec in &mut entry.wiring {
+        if rec.action == WiringAction::Rewritten && rec.original.is_none() {
+            if let Some(prev_rec) = prev
+                .wiring
+                .iter()
+                .find(|p| p.file == rec.file && p.kind == rec.kind && p.key == rec.key)
+            {
+                rec.original = prev_rec.original.clone();
+            }
+        }
+    }
+
+    if prev.uuid != entry.uuid {
+        return;
+    }
+
+    for prev_rec in &prev.wiring {
+        let present = entry
+            .wiring
+            .iter()
+            .any(|r| r.file == prev_rec.file && r.kind == prev_rec.kind && r.key == prev_rec.key);
+        if !present {
+            entry.wiring.push(prev_rec.clone());
+        }
+    }
+
+    if let Some(prev_meta) = prev.pnpm.as_ref() {
+        match entry.pnpm.as_mut() {
+            Some(meta) => {
+                meta.created_overrides_table |= prev_meta.created_overrides_table;
+                meta.created_pnpm_table |= prev_meta.created_pnpm_table;
+                meta.created_workspace_file |= prev_meta.created_workspace_file;
+                meta.created_workspace_overrides |= prev_meta.created_workspace_overrides;
+            }
+            None => entry.pnpm = Some(prev_meta.clone()),
+        }
+    }
+}
+
 /// The ledger entry addressable as `purl`: the exact map key first, then
 /// any entry whose resolved `base_purl` equals it (a qualified manifest
 /// key resolves to the entry recorded under the base PURL).

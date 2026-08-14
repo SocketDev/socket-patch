@@ -3892,4 +3892,74 @@ snapshots:
         write_ws(&fx, "overrides:\n  left-pad: 1.4.0\n").await;
         expect_refused(fx.vendor(false).await, "vendor_override_conflict");
     }
+
+    /// The pnpm >= 11 UPGRADE path: a project vendored by the pre-workspace
+    /// code (package.json + pnpm-lock.yaml already overridden, NO
+    /// pnpm-workspace.yaml) is re-vendored under the current code, which adds
+    /// only the workspace mirror. The re-vendor's fresh entry names ONLY the
+    /// workspace surface, so replacing the ledger entry wholesale would lose
+    /// the package.json + lock originals the first vendoring recorded and
+    /// `--revert` could restore only the workspace file. `carry_forward_wiring`
+    /// (which `persist_vendor_entry` runs on every re-vendor) reconciles the
+    /// two so revert byte-restores ALL THREE surfaces.
+    #[tokio::test]
+    async fn revendor_upgrade_adds_workspace_and_revert_restores_all_three_surfaces() {
+        let fx = fixture_with(P1_BEFORE_PKG, P1_BEFORE_LOCK).await;
+
+        // 1. First vendoring, then downgrade the recorded state to what the
+        //    pre-workspace code would have left: no pnpm-workspace.yaml, and a
+        //    ledger entry carrying only the package.json + lock wiring.
+        let (_, prev, _) = expect_done(fx.vendor(false).await);
+        let mut prev = prev.unwrap();
+        tokio::fs::remove_file(fx.root().join(PNPM_WORKSPACE))
+            .await
+            .unwrap();
+        prev.wiring.retain(|r| r.file != PNPM_WORKSPACE);
+        if let Some(meta) = prev.pnpm.as_mut() {
+            meta.created_workspace_file = false;
+            meta.created_workspace_overrides = false;
+        }
+        // Pre-workspace code created the pnpm/overrides tables (the fixture's
+        // package.json had no `pnpm` field), and left both surfaces wired.
+        let pnpm_meta = prev.pnpm.clone().unwrap();
+        assert!(pnpm_meta.created_pnpm_table && pnpm_meta.created_overrides_table);
+        assert!(prev.wiring.iter().any(|r| r.file == PACKAGE_JSON));
+        assert!(prev.wiring.iter().any(|r| r.file == PNPM_LOCK));
+        assert!(!ws_exists(&fx).await, "downgraded state has no workspace file");
+
+        // 2. Re-vendor under the current code: package.json + lock are already
+        //    in sync, so ONLY the workspace mirror is written and the fresh
+        //    entry names ONLY that surface (the bug's precondition).
+        let (_, revendored, _) = expect_done(fx.vendor(false).await);
+        let mut merged = revendored.unwrap();
+        assert!(ws_exists(&fx).await, "re-vendor added the workspace file");
+        assert!(
+            merged.wiring.iter().all(|r| r.file == PNPM_WORKSPACE),
+            "the fresh re-vendor entry names only the workspace surface: {:?}",
+            merged.wiring
+        );
+
+        // 3. Reconcile with the entry being replaced (as persist_vendor_entry
+        //    does), then revert.
+        super::super::state::carry_forward_wiring(&prev, &mut merged);
+        let outcome = revert_pnpm(&merged, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+
+        // All three surfaces byte-restored to their pre-vendor originals.
+        assert_eq!(
+            fx.read(PACKAGE_JSON).await,
+            P1_BEFORE_PKG,
+            "package.json byte-restored"
+        );
+        assert_eq!(fx.read(PNPM_LOCK).await, P1_BEFORE_LOCK, "lock byte-restored");
+        assert!(
+            !ws_exists(&fx).await,
+            "the workspace file the re-vendor created is deleted"
+        );
+        assert!(!fx
+            .root()
+            .join(format!(".socket/vendor/npm/{UUID}"))
+            .exists());
+    }
 }

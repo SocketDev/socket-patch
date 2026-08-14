@@ -520,34 +520,19 @@ pub(crate) async fn persist_vendor_entry(
     let candidate = candidate.to_string();
     entry.detached = detached;
     entry.record = detached.then(|| record.clone());
-    // A re-vendor run re-derives the entry from current
-    // disk state, where the takeover already happened —
-    // preserve the prior flag or the revert-time
-    // "takeover_not_restored" hint is lost.
+    // A re-vendor run re-derives the entry from current disk state, where
+    // the takeover / earlier wiring already happened. Reconcile the fresh
+    // entry with the one it replaces so `--revert` still knows how to undo
+    // every surface any earlier vendoring touched: carry forward the true
+    // pre-vendor originals (a re-vendor records `original: None` for its own
+    // stale `.socket/vendor/` pointer), the wiring records for surfaces this
+    // run left in sync (e.g. package.json + pnpm-lock.yaml when only the new
+    // pnpm-workspace.yaml override was added on a pnpm >= 11 upgrade), the
+    // pnpm created-surface bookkeeping, and the takeover flag. See
+    // [`vendor::carry_forward_wiring`].
     let prev = state.entries.get(&candidate).cloned();
     if let Some(prev) = &prev {
-        entry.took_over_go_patches = entry.took_over_go_patches || prev.took_over_go_patches;
-        // A re-vendor (new patch uuid) rewrites our own
-        // stale wiring, so the backend records
-        // `original: None` (it must never record a
-        // dangling `.socket/vendor/` pointer as the
-        // pre-vendor fragment). The TRUE pre-vendor
-        // original lives in the entry being replaced —
-        // carry it forward by wiring identity, or a
-        // later `--revert` can only shrug
-        // (`vendor_lock_entry_drifted`) instead of
-        // restoring the registry fragment.
-        for rec in &mut entry.wiring {
-            if rec.action == vendor::state::WiringAction::Rewritten && rec.original.is_none() {
-                if let Some(prev_rec) = prev
-                    .wiring
-                    .iter()
-                    .find(|p| p.file == rec.file && p.kind == rec.kind && p.key == rec.key)
-                {
-                    rec.original = prev_rec.original.clone();
-                }
-            }
-        }
+        vendor::carry_forward_wiring(prev, &mut entry);
     }
     let new_uuid = entry.uuid.clone();
     state.entries.insert(candidate.clone(), entry);
