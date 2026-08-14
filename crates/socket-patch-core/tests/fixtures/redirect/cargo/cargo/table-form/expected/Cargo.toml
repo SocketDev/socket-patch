@@ -1,0 +1,9 @@
+[package]
+name = "myapp"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies.serde]
+registry = "socket-patch-55555555-5555-5555-5555-555555555555"
+version = "1.0.190"
+features = ["derive"]
