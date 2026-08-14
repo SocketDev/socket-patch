@@ -177,6 +177,32 @@ pub(super) async fn preverify_vendor_baselines(
     mismatched
 }
 
+/// Fold the hosted redirect ledger's patch records into the manifest view
+/// update detection consults. Hosted mode persists its purl→uuid records ONLY
+/// in `.socket/vendor/redirect-state.json` — it never writes
+/// `.socket/manifest.json` — so without this fold a pure hosted project's
+/// `updates[]` (the documented CI signal, see CLI_CONTRACT.md) is structurally
+/// empty and a superseding patch is never reported. An existing manifest entry
+/// wins a collision (that PURL is manifest-owned), matching VEX's
+/// `augment_with_redirect`. Pure / no I/O so it's unit-testable.
+pub(super) fn merge_redirect_records_for_updates(
+    manifest: Option<PatchManifest>,
+    redirect: Option<&socket_patch_core::patch::redirect::RedirectState>,
+) -> Option<PatchManifest> {
+    let records = redirect.map(|s| &s.records).filter(|r| !r.is_empty());
+    let Some(records) = records else {
+        return manifest;
+    };
+    let mut merged = manifest.unwrap_or_default();
+    for (purl, record) in records {
+        merged
+            .patches
+            .entry(purl.clone())
+            .or_insert_with(|| record.clone());
+    }
+    Some(merged)
+}
+
 /// Cross-reference an existing manifest against discovery results to find
 /// PURLs whose newest available patch UUID differs from the locally-recorded
 /// one. Used by both the discovery JSON path and the table-print path.
@@ -680,6 +706,91 @@ mod tests {
         assert_eq!(updates.len(), 1);
         assert_eq!(updates[0].old_uuid, "uuid-aold");
         assert_eq!(updates[0].new_uuid, "uuid-new");
+    }
+
+    // ---- merge_redirect_records_for_updates ---------------------------------
+    // Hosted mode records patches ONLY in the redirect ledger — these pin that
+    // ledger-only projects still surface `updates[]` (the documented CI
+    // signal) through the merged manifest view.
+
+    fn ledger_with(entries: &[(&str, &str)]) -> socket_patch_core::patch::redirect::RedirectState {
+        let mut state = socket_patch_core::patch::redirect::RedirectState::new();
+        let manifest = crate::commands::scan::tests::manifest_with(entries);
+        state.records.extend(manifest.patches);
+        state
+    }
+
+    #[test]
+    fn ledger_only_project_reports_superseding_patch_in_updates() {
+        // Pure hosted project: NO .socket/manifest.json, one redirected patch
+        // recorded in the ledger; discovery now offers a different (newer)
+        // uuid. The merged view must make detect_updates flag it — this was
+        // structurally impossible before the fold (manifest-only detection).
+        let ledger = ledger_with(&[("pkg:npm/foo@1.0", "uuid-old")]);
+        let merged = merge_redirect_records_for_updates(None, Some(&ledger));
+        let pkgs = vec![batch_with("pkg:npm/foo@1.0", &["uuid-new"])];
+        let updates = detect_updates(merged.as_ref(), &pkgs);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].purl, "pkg:npm/foo@1.0");
+        assert_eq!(updates[0].old_uuid, "uuid-old");
+        assert_eq!(updates[0].new_uuid, "uuid-new");
+    }
+
+    #[test]
+    fn ledger_record_matching_the_candidate_is_not_an_update() {
+        // The redirected patch is still the top offer — no nag.
+        let ledger = ledger_with(&[("pkg:npm/foo@1.0", "uuid-a")]);
+        let merged = merge_redirect_records_for_updates(None, Some(&ledger));
+        let pkgs = vec![batch_with("pkg:npm/foo@1.0", &["uuid-a"])];
+        assert!(detect_updates(merged.as_ref(), &pkgs).is_empty());
+    }
+
+    #[test]
+    fn manifest_entry_wins_a_collision_with_a_ledger_record() {
+        // A PURL present in both stores is manifest-owned (same precedence as
+        // VEX's augment_with_redirect): the manifest's uuid is the "old" side.
+        let manifest =
+            crate::commands::scan::tests::manifest_with(&[("pkg:npm/foo@1.0", "uuid-manifest")]);
+        let ledger = ledger_with(&[("pkg:npm/foo@1.0", "uuid-ledger")]);
+        let merged = merge_redirect_records_for_updates(Some(manifest), Some(&ledger));
+        let pkgs = vec![batch_with("pkg:npm/foo@1.0", &["uuid-new"])];
+        let updates = detect_updates(merged.as_ref(), &pkgs);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].old_uuid, "uuid-manifest");
+    }
+
+    #[test]
+    fn ledger_and_manifest_cover_disjoint_purls() {
+        // A mixed project (some deps applied via manifest, some hosted via
+        // ledger) gets update detection across BOTH stores.
+        let manifest =
+            crate::commands::scan::tests::manifest_with(&[("pkg:npm/foo@1.0", "uuid-f1")]);
+        let ledger = ledger_with(&[("pkg:npm/bar@2.0", "uuid-b1")]);
+        let merged = merge_redirect_records_for_updates(Some(manifest), Some(&ledger));
+        let pkgs = vec![
+            batch_with("pkg:npm/foo@1.0", &["uuid-f2"]),
+            batch_with("pkg:npm/bar@2.0", &["uuid-b2"]),
+        ];
+        let mut updates = detect_updates(merged.as_ref(), &pkgs);
+        updates.sort_by(|a, b| a.purl.cmp(&b.purl));
+        assert_eq!(updates.len(), 2);
+        assert_eq!(updates[0].old_uuid, "uuid-b1");
+        assert_eq!(updates[1].old_uuid, "uuid-f1");
+    }
+
+    #[test]
+    fn absent_or_empty_ledger_leaves_the_manifest_view_untouched() {
+        assert!(merge_redirect_records_for_updates(None, None).is_none());
+        let empty = socket_patch_core::patch::redirect::RedirectState::new();
+        assert!(merge_redirect_records_for_updates(None, Some(&empty)).is_none());
+        let manifest =
+            crate::commands::scan::tests::manifest_with(&[("pkg:npm/foo@1.0", "uuid-a")]);
+        let merged = merge_redirect_records_for_updates(Some(manifest.clone()), Some(&empty));
+        assert_eq!(
+            merged.unwrap().patches.len(),
+            manifest.patches.len(),
+            "an empty ledger adds nothing"
+        );
     }
 
     // ---- collect_vuln_ids --------------------------------------------------

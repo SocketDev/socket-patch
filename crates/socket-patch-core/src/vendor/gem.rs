@@ -38,7 +38,11 @@
 //! trailing options like `require: false` preserved) or, for a transitive
 //! dependency, a managed block appended at EOF. Anything
 //! the conservative line grammar cannot prove safe to rewrite is REFUSED —
-//! never guessed at.
+//! never guessed at. The one exception is OUR OWN previous wiring: a patch
+//! update moves the manifest to a new uuid (same purl), and a `path:` that
+//! parses as the socket vendor dir for exactly this gem is repointed in
+//! place (the older patch uuid is re-vendored automatically, like the
+//! npm/cargo/golang backends — no revert-first).
 //!
 //! The stub gemspec from `<gem_home>/specifications/` is copied into the
 //! vendored dir as `<name>.gemspec` (a path source needs one; the spike showed
@@ -63,7 +67,7 @@ use super::common::{
     already_patched_result, copy_matches_after_hashes, done, refused, service_offline_conflict,
     synthesized_result,
 };
-use super::path::vendor_uuid_dir_rel;
+use super::path::{parse_vendor_path, vendor_uuid_dir_rel};
 use super::registry_fetch::extract_gem_data;
 use super::service_fetch::{
     fetch_verified_archive, fetch_verified_secondary, SecondaryArtifactResult, ServiceArtifact,
@@ -459,15 +463,50 @@ pub async fn vendor_gem(
             original: None,
             new: Some(Value::String(block.clone())),
         },
+        // Re-vendor over our own wiring (see `GemfilePlan::RewireOurs`):
+        // `original: None`, carried forward by the caller. The managed-fence
+        // form stays `Added` with the whole updated block so revert deletes
+        // the fence too.
+        GemfilePlan::RewireOurs {
+            new_line,
+            managed_block,
+            ..
+        } => match managed_block {
+            Some(block) => WiringRecord {
+                file: GEMFILE.to_string(),
+                kind: GEMFILE_WIRING_KIND.to_string(),
+                action: WiringAction::Added,
+                key: Some(name.to_string()),
+                original: None,
+                new: Some(Value::String(block.clone())),
+            },
+            None => WiringRecord {
+                file: GEMFILE.to_string(),
+                kind: GEMFILE_WIRING_KIND.to_string(),
+                action: WiringAction::Rewritten,
+                key: Some(name.to_string()),
+                original: None,
+                new: Some(Value::String(new_line.clone())),
+            },
+        },
     };
-    let mut original_lines: Vec<Value> = lock_edit
-        .removed_spec_block
-        .iter()
-        .map(|l| Value::String(l.clone()))
-        .collect();
-    if let Some(dep) = &lock_edit.old_dep_line {
-        original_lines.push(Value::String(dep.clone()));
-    }
+    // A rewire lifted OUR OWN previous PATH section, not pre-vendor
+    // fragments: record `original: None` — the true originals live in the
+    // ledger entry being replaced, which the caller carries forward by
+    // wiring identity (`persist_vendor_entry`).
+    let lock_original = if lock_edit.rewired_ours {
+        None
+    } else {
+        let mut original_lines: Vec<Value> = lock_edit
+            .removed_spec_block
+            .iter()
+            .map(|l| Value::String(l.clone()))
+            .collect();
+        if let Some(dep) = &lock_edit.old_dep_line {
+            original_lines.push(Value::String(dep.clone()));
+        }
+        Some(Value::Array(original_lines))
+    };
     let mut new_lines: Vec<Value> = lock_edit
         .path_section
         .iter()
@@ -479,7 +518,7 @@ pub async fn vendor_gem(
         kind: LOCK_WIRING_KIND.to_string(),
         action: WiringAction::Rewritten,
         key: Some(name.to_string()),
-        original: Some(Value::Array(original_lines)),
+        original: lock_original,
         new: Some(Value::Array(new_lines)),
     };
     let mut wiring = vec![gemfile_record, lock_record];
@@ -496,6 +535,23 @@ pub async fn vendor_gem(
             original: Some(Value::String(orig_line.clone())),
             new: Some(Value::String(new_line.clone())),
         });
+    } else if lock_edit.rewired_ours {
+        // Re-vendor with the bare path-form line already in place (our
+        // previous run stripped the registry token): the record must ride
+        // again with `original: None` — dropped, the first run's registry
+        // `sha256=` line would vanish from the ledger with the entry being
+        // replaced, and a later --revert could no longer restore it (a bare
+        // leftover on a registry gem hard-fails frozen installs, exit 16).
+        if let Some(bare) = &lock_edit.checksum_bare {
+            wiring.push(WiringRecord {
+                file: GEMFILE_LOCK.to_string(),
+                kind: LOCK_CHECKSUM_WIRING_KIND.to_string(),
+                action: WiringAction::Rewritten,
+                key: Some(name.to_string()),
+                original: None,
+                new: Some(Value::String(bare.clone())),
+            });
+        }
     }
 
     let entry = VendorEntry {
@@ -882,6 +938,22 @@ enum GemfilePlan {
         original_line: String,
         new_line: String,
     },
+    /// The declaration already carries OUR OWN `path:` wiring from an older
+    /// patch uuid (a patch update changes the uuid, never the purl):
+    /// repoint it at the new copy in place, everything else on the line
+    /// byte-preserved. The wiring record carries `original: None` — the true
+    /// pre-vendor line lives in the ledger entry being replaced and the
+    /// caller carries it forward by wiring identity (`persist_vendor_entry`);
+    /// recording the old-uuid line would make a later revert "restore" a
+    /// dangling vendor pointer. `managed_block` is `Some(updated block)` when
+    /// the line sits inside our managed fence (the transitive-gem form): the
+    /// record then stays `Added` with the whole block, so revert still
+    /// deletes the fence.
+    RewireOurs {
+        original_line: String,
+        new_line: String,
+        managed_block: Option<String>,
+    },
     /// The gem is transitive (not declared): append a fenced managed block.
     Append { block: String },
 }
@@ -893,7 +965,9 @@ enum GemfilePlan {
 /// (inside a `group`/`platforms`/conditional block), parenthesized,
 /// continued onto the next line, conditional, or already carrying a
 /// `path:`/`git:`/`github:` source — is refused rather than guessed at: a
-/// wrong Gemfile rewrite executes on every `bundle` invocation.
+/// wrong Gemfile rewrite executes on every `bundle` invocation. The one
+/// `path:` exception is our own vendored dir for this gem (an older patch
+/// uuid), which is repointed in place — see [`GemfilePlan::RewireOurs`].
 fn plan_gemfile_edit(
     text: &str,
     name: &str,
@@ -934,6 +1008,30 @@ fn plan_gemfile_edit(
         return Err(format!(
             "the `gem \"{name}\"` declaration uses a parenthesized call"
         ));
+    }
+    // Our own wiring from an older patch uuid: the `path:` value parses as
+    // the socket vendor dir for exactly this gem. Repoint it in place —
+    // refusing here (the source-option blocklist below) would make every
+    // patch update demand a manual `vendor --revert` first. A path that
+    // parses as anything else (a user fork, another gem's dir) still refuses.
+    if let Some(prev_rel) = gem_line_path_value(&rest) {
+        if is_our_vendor_rel(prev_rel, name, version) {
+            let original_line = lines[idx].to_string();
+            // The rel appears exactly once (its charset excludes quotes and
+            // `#`, and the code before `path:` cannot contain a `/`-bearing
+            // token); swapping just the value preserves quote style and
+            // trailing options verbatim.
+            let new_line = original_line.replacen(prev_rel, rel, 1);
+            let managed_block = (idx > 0
+                && lines[idx - 1] == MANAGED_OPEN
+                && lines.get(idx + 1).is_some_and(|l| *l == MANAGED_CLOSE))
+            .then(|| format!("{MANAGED_OPEN}\n{new_line}\n{MANAGED_CLOSE}\n"));
+            return Ok(GemfilePlan::RewireOurs {
+                original_line,
+                new_line,
+                managed_block,
+            });
+        }
     }
     if let Some(reason) = rest_blocks_edit(&rest) {
         return Err(format!(
@@ -1025,11 +1123,45 @@ fn rest_blocks_edit(rest: &str) -> Option<String> {
     None
 }
 
+/// The quoted `path:` option value on a gem line's argument tail (only the
+/// code before any `#` comment counts) — the form our own rewrite emits.
+/// `None` for anything else (`:path =>`, interpolation, no `path:` at all):
+/// those fall through to [`rest_blocks_edit`]'s refusal, fail-closed.
+fn gem_line_path_value(rest: &str) -> Option<&str> {
+    let code = rest.split('#').next().unwrap_or("");
+    let idx = code.find("path:")?;
+    if idx > 0 && !matches!(code.as_bytes()[idx - 1], b' ' | b'\t' | b',') {
+        return None;
+    }
+    let after = code[idx + "path:".len()..].trim_start();
+    let q = after.chars().next()?;
+    if q != '"' && q != '\'' {
+        return None;
+    }
+    let value = &after[1..];
+    let end = value.find(q)?;
+    Some(&value[..end])
+}
+
+/// True when a `path:`/`remote:` value is OUR vendored dir for exactly this
+/// gem (`.socket/vendor/gem/<any-uuid>/<name>-<version>`) — the shape
+/// [`vendor_gem`] wires, and the only wiring a patch UPDATE (new uuid, same
+/// purl) may rewire.
+fn is_our_vendor_rel(value: &str, name: &str, version: &str) -> bool {
+    parse_vendor_path(value)
+        .is_some_and(|p| p.eco == "gem" && p.leaf == format!("{name}-{version}"))
+}
+
 fn apply_gemfile_plan(text: &str, plan: &GemfilePlan) -> String {
     match plan {
         GemfilePlan::Rewrite {
             original_line,
             new_line,
+        }
+        | GemfilePlan::RewireOurs {
+            original_line,
+            new_line,
+            ..
         } => {
             let mut lines: Vec<&str> = text.split('\n').collect();
             if let Some(i) = lines.iter().position(|l| *l == original_line) {
@@ -1068,6 +1200,17 @@ struct LockEdit {
     /// "original" — reverting it onto a registry-sourced lock would break
     /// frozen installs).
     checksum_rewrite: Option<(String, String)>,
+    /// The spec block was lifted from OUR OWN previous PATH section (a
+    /// re-vendor to a newer patch uuid), not from GEM/specs: the lifted
+    /// fragments are this backend's own prior wiring, so the caller records
+    /// `original: None` and the true pre-vendor originals ride forward from
+    /// the ledger entry being replaced (`persist_vendor_entry`).
+    rewired_ours: bool,
+    /// The already-bare CHECKSUMS line for the gem, when one is present.
+    /// Only consulted on a re-vendor (`rewired_ours`): the checksum record
+    /// must ride again or the first run's registry `sha256=` restore line
+    /// drops out of the ledger with the entry being replaced.
+    checksum_bare: Option<String>,
 }
 
 /// Produce the pair-edited lock text (see the module doc for the canonical
@@ -1077,21 +1220,86 @@ struct LockEdit {
 fn edit_lock(text: &str, name: &str, version: &str, rel: &str) -> Result<LockEdit, String> {
     let mut lines: Vec<String> = text.split('\n').map(str::to_string).collect();
 
-    // 1. Lift the gem's spec block out of GEM/specs.
+    // 1. Lift the gem's spec block out of GEM/specs — or, on a re-vendor to
+    // a newer patch uuid (same purl), out of the PATH section our previous
+    // run emitted.
     let (gem_start, gem_end) =
         section_span(&lines, "GEM").ok_or_else(|| "Gemfile.lock has no GEM section".to_string())?;
     if !(gem_start..gem_end).any(|i| lines[i] == "  specs:") {
         return Err("Gemfile.lock GEM section has no specs: stanza".to_string());
     }
-    let target = format!("    {name} ({version})");
-    let block_start = (gem_start..gem_end)
-        .find(|&i| lines[i] == target)
-        .ok_or_else(|| format!("Gemfile.lock GEM specs has no entry `{name} ({version})`"))?;
-    let mut block_end = block_start + 1;
-    while block_end < gem_end && lines[block_end].starts_with("      ") {
-        block_end += 1;
+    // SECURITY/fail-closed: platform-suffixed installs were refused
+    // (`platform_gem_unsupported`) before this point, so a platform-suffixed
+    // GEM spec sibling means the lock disagrees with the installed tree —
+    // and lifting only the plain entry would leave the sibling behind as a
+    // stale registry spec. The CHECKSUMS branch below refuses the same
+    // shape, but only bundler ≥ 2.6 locks have a CHECKSUMS section to catch
+    // it in.
+    let platform_prefix = format!("{version}-");
+    for line in lines.iter().take(gem_end).skip(gem_start + 1) {
+        if let Some((n, v)) = spec_entry(line) {
+            if n == name && v.starts_with(&platform_prefix) {
+                return Err(format!(
+                    "Gemfile.lock GEM specs has a platform-suffixed entry `{n} ({v})` but the installed gem is not platform-specific; the lock disagrees with the install (re-resolve it before vendoring)"
+                ));
+            }
+        }
     }
-    let removed_spec_block: Vec<String> = lines.drain(block_start..block_end).collect();
+    let target = format!("    {name} ({version})");
+    let mut rewired_ours = false;
+    let removed_spec_block: Vec<String> = match (gem_start..gem_end).find(|&i| lines[i] == target) {
+        Some(block_start) => {
+            let mut block_end = block_start + 1;
+            while block_end < gem_end && lines[block_end].starts_with("      ") {
+                block_end += 1;
+            }
+            lines.drain(block_start..block_end).collect()
+        }
+        None => {
+            // Re-vendor: the entry lives in the PATH section our previous
+            // run emitted (remote parses as our vendored dir for exactly
+            // this gem). Lift the block and drop the old section — step 3
+            // re-emits it at the NEW uuid's sorted position. The lifted
+            // lines are our own wiring, not pre-vendor originals: flagged
+            // via `rewired_ours` (see the `LockEdit` field docs).
+            let Some((ps, pe)) = find_our_path_section(&lines, name, version) else {
+                return Err(format!(
+                    "Gemfile.lock GEM specs has no entry `{name} ({version})`"
+                ));
+            };
+            let block_start = (ps..pe).find(|&i| lines[i] == target).ok_or_else(|| {
+                format!(
+                    "Gemfile.lock PATH section for `{name}` lost its `{name} ({version})` spec entry"
+                )
+            })?;
+            let mut block_end = block_start + 1;
+            while block_end < pe && lines[block_end].starts_with("      ") {
+                block_end += 1;
+            }
+            // Grammar-strict: besides the block, the section must be exactly
+            // what vendor wrote (header, one remote, specs:, blank
+            // separators). Anything extra — a hand edit, a merged-in second
+            // spec — would be destroyed by the drain below; never guess.
+            let non_block: Vec<&str> = (ps..pe)
+                .filter(|i| !(block_start..block_end).contains(i))
+                .map(|i| lines[i].as_str())
+                .filter(|l| !l.is_empty())
+                .collect();
+            if non_block.len() != 3
+                || non_block[0] != "PATH"
+                || !non_block[1].starts_with("  remote: ")
+                || non_block[2] != "  specs:"
+            {
+                return Err(format!(
+                    "Gemfile.lock PATH section for `{name} ({version})` is not the shape vendor wrote; refusing to rewire it"
+                ));
+            }
+            let block: Vec<String> = lines[block_start..block_end].to_vec();
+            lines.drain(ps..pe);
+            rewired_ours = true;
+            block
+        }
+    };
 
     // 2. DEPENDENCIES: exact pin + `!` path-source marker. A transitive gem
     // (absent pre-vendor) is inserted at bundler's sorted position — it is a
@@ -1122,8 +1330,16 @@ fn edit_lock(text: &str, name: &str, version: &str, rel: &str) -> Result<LockEdi
         None => lines.insert(insert_at, new_dep_line.clone()),
     }
 
-    // 3. PATH section directly above the GEM section (bundler's canonical
-    // placement; spike claim 2). `remote:` is the bare relative path.
+    // 3. PATH section above the GEM section, at bundler's SORTED position
+    // among any existing PATH sections: bundler emits path/git/plugin
+    // sources sorted by identifier (source_list.rb `lock_other_sources`,
+    // verified against bundler 4.0.15) — `source at `<path>`` for a path
+    // source, so PATH sections order by their remote path and all sit in one
+    // contiguous run (no other source's identifier can start with that
+    // prefix). Splicing at invocation order instead churns the committed
+    // lock on the next `bundle lock`. Non-PATH leading sections keep the
+    // legacy insert-before-GEM fallback. `remote:` is the bare relative
+    // path (spike claim 2).
     let mut path_section = vec![
         "PATH".to_string(),
         format!("  remote: {rel}"),
@@ -1134,9 +1350,29 @@ fn edit_lock(text: &str, name: &str, version: &str, rel: &str) -> Result<LockEdi
         .iter()
         .position(|l| l.as_str() == "GEM")
         .ok_or_else(|| "Gemfile.lock lost its GEM section".to_string())?;
+    let our_ident = path_source_identifier(rel);
+    let mut at = gem_hdr;
+    let mut i = 0;
+    while i < gem_hdr {
+        if lines[i].as_str() == "PATH" {
+            let end = section_end(&lines, i);
+            match path_section_remote(&lines[i..end]) {
+                Some(existing) if path_source_identifier(existing) > our_ident => {
+                    at = i;
+                    break;
+                }
+                // Ours sorts after this section (a remote-less section is
+                // grammar-degenerate; keep the legacy after-everything spot).
+                _ => at = end.min(gem_hdr),
+            }
+            i = end;
+        } else {
+            i += 1;
+        }
+    }
     let mut insert = path_section.clone();
-    insert.push(String::new()); // blank separator before GEM
-    lines.splice(gem_hdr..gem_hdr, insert);
+    insert.push(String::new()); // blank separator before the next section
+    lines.splice(at..at, insert);
 
     // 4. CHECKSUMS (bundler ≥ 2.6 `lockfile_checksums`): a path-sourced gem
     // keeps a BARE `  <name> (<version>)` entry — bundler's own re-lock emits
@@ -1147,9 +1383,9 @@ fn edit_lock(text: &str, name: &str, version: &str, rel: &str) -> Result<LockEdi
     // by nothing. Re-found via section_span because the PATH splice above
     // shifted every index.
     let mut checksum_rewrite: Option<(String, String)> = None;
+    let mut checksum_bare: Option<String> = None;
     if let Some((ck_start, ck_end)) = section_span(&lines, "CHECKSUMS") {
         let bare = format!("  {name} ({version})");
-        let platform_prefix = format!("{version}-");
         let mut plain_at: Option<usize> = None;
         for (i, line) in lines.iter().enumerate().take(ck_end).skip(ck_start + 1) {
             match checksum_entry(line) {
@@ -1190,6 +1426,8 @@ fn edit_lock(text: &str, name: &str, version: &str, rel: &str) -> Result<LockEdi
             if lines[i] != bare {
                 checksum_rewrite = Some((lines[i].clone(), bare.clone()));
                 lines[i] = bare;
+            } else {
+                checksum_bare = Some(bare);
             }
         }
     }
@@ -1201,6 +1439,8 @@ fn edit_lock(text: &str, name: &str, version: &str, rel: &str) -> Result<LockEdi
         path_section,
         new_dep_line,
         checksum_rewrite,
+        rewired_ours,
+        checksum_bare,
     })
 }
 
@@ -1209,6 +1449,12 @@ fn edit_lock(text: &str, name: &str, version: &str, rel: &str) -> Result<LockEdi
 /// section they follow.
 fn section_span(lines: &[String], header: &str) -> Option<(usize, usize)> {
     let start = lines.iter().position(|l| l.as_str() == header)?;
+    Some((start, section_end(lines, start)))
+}
+
+/// End (exclusive) of the section whose column-0 header sits at `start` —
+/// the [`section_span`] rule for a known header position.
+fn section_end(lines: &[String], start: usize) -> usize {
     let mut end = start + 1;
     while end < lines.len() {
         let l = &lines[end];
@@ -1217,7 +1463,39 @@ fn section_span(lines: &[String], header: &str) -> Option<(usize, usize)> {
         }
         end += 1;
     }
-    Some((start, end))
+    end
+}
+
+/// Bundler's lock-sort identifier for a path source — `source at `<path>``
+/// (`Source::Path#to_s`, aliased as `identifier`); sections order by a
+/// byte-wise comparison of these, which Rust's `str` ordering matches.
+fn path_source_identifier(path: &str) -> String {
+    format!("source at `{path}`")
+}
+
+/// The `  remote: ` value of the section slice starting at its header line.
+fn path_section_remote(section: &[String]) -> Option<&str> {
+    section.iter().find_map(|l| l.strip_prefix("  remote: "))
+}
+
+/// Find the PATH section whose `remote:` is OUR vendored dir for this gem —
+/// any patch uuid (the previous run's wiring, sought during a re-vendor).
+fn find_our_path_section(lines: &[String], name: &str, version: &str) -> Option<(usize, usize)> {
+    let mut i = 0;
+    while i < lines.len() {
+        if lines[i].as_str() == "PATH" {
+            let end = section_end(lines, i);
+            if path_section_remote(&lines[i..end])
+                .is_some_and(|p| is_our_vendor_rel(p, name, version))
+            {
+                return Some((i, end));
+            }
+            i = end;
+        } else {
+            i += 1;
+        }
+    }
+    None
 }
 
 /// Name of a 2-space DEPENDENCIES entry (`  rack (~> 3.1)` / `  rack!`).
@@ -1237,6 +1515,25 @@ fn spec_entry_name(line: &str) -> Option<&str> {
         return None;
     }
     Some(rest.split(' ').next().unwrap_or(rest))
+}
+
+/// Parse a 4-space specs entry line: `    <name> (<token>)`, nothing after
+/// the closing paren. Returns `(name, parenthesized token)` — the platform
+/// suffix stays inside the token, mirroring [`checksum_entry`]'s grammar at
+/// specs indentation (`    ffi (1.17.2-aarch64-linux-gnu)`).
+fn spec_entry(line: &str) -> Option<(&str, &str)> {
+    let rest = line.strip_prefix("    ")?;
+    if rest.is_empty() || rest.starts_with(' ') {
+        return None;
+    }
+    let open = rest.find(" (")?;
+    let after = &rest[open + 2..];
+    let close = after.find(')')?;
+    let (name, ver, tail) = (&rest[..open], &after[..close], &after[close + 1..]);
+    if name.is_empty() || ver.is_empty() || !tail.is_empty() {
+        return None;
+    }
+    Some((name, ver))
 }
 
 /// Parse a CHECKSUMS entry line: two-space indent, `<name> (<version>)` or
@@ -1666,9 +1963,20 @@ mod tests {
         record: &PatchRecord,
         dry_run: bool,
     ) -> VendorOutcome {
+        run_vendor_purl(PURL, root, blobs, installed, record, dry_run).await
+    }
+
+    async fn run_vendor_purl(
+        purl: &str,
+        root: &Path,
+        blobs: &Path,
+        installed: &Path,
+        record: &PatchRecord,
+        dry_run: bool,
+    ) -> VendorOutcome {
         let sources = PatchSources::blobs_only(blobs);
         vendor_gem(
-            PURL,
+            purl,
             installed,
             root,
             record,
@@ -1679,6 +1987,23 @@ mod tests {
             None,
         )
         .await
+    }
+
+    /// Simulate the CLI caller's `persist_vendor_entry` carry-forward: fill
+    /// the replacement entry's `original: None` holes from the entry being
+    /// replaced, by wiring identity (file, kind, key).
+    fn carry_forward_originals(prev: &VendorEntry, next: &mut VendorEntry) {
+        for rec in &mut next.wiring {
+            if rec.action == WiringAction::Rewritten && rec.original.is_none() {
+                if let Some(p) = prev
+                    .wiring
+                    .iter()
+                    .find(|p| p.file == rec.file && p.kind == rec.kind && p.key == rec.key)
+                {
+                    rec.original = p.original.clone();
+                }
+            }
+        }
     }
 
     fn expected_lock_direct() -> String {
@@ -2775,6 +3100,360 @@ mod tests {
                 .unwrap(),
             v1
         );
+    }
+
+    // ── multiple vendored gems: PATH sections sort like bundler's ────────────
+
+    /// Second gem for multi-PATH tests. Its uuid sorts BEFORE rack's
+    /// (`1a…` < `9f…`), so vendoring rack first is the order a naive
+    /// insert-before-GEM splice would leave unsorted.
+    const UUID_PUMA: &str = "1a2b3c4d-5e6f-4a1b-8c2d-3e4f5a6b7c8d";
+    const PURL_PUMA: &str = "pkg:gem/puma@6.4.2";
+    const PRISTINE_PUMA: &[u8] = b"module Puma\n  VERSION = \"6.4.2\"\nend\n";
+    const PATCHED_PUMA: &[u8] =
+        b"module Puma\n  SOCKET_PATCHED = true\n  VERSION = \"6.4.2\"\nend\n";
+    const GEMSPEC_PUMA: &str = "Gem::Specification.new do |s|\n  s.name = \"puma\"\n  s.version = \"6.4.2\"\n  s.require_paths = [\"lib\"]\nend\n";
+
+    fn puma_rel() -> String {
+        format!(".socket/vendor/gem/{UUID_PUMA}/puma-6.4.2")
+    }
+
+    /// Add a puma install + blob + record alongside [`fixture`]'s rack, so a
+    /// test can vendor TWO gems into one project.
+    async fn add_puma_fixture(installed_rack: &Path, blobs: &Path) -> (PathBuf, PatchRecord) {
+        let gems = installed_rack.parent().unwrap();
+        let installed = gems.join("puma-6.4.2");
+        tokio::fs::create_dir_all(installed.join("lib"))
+            .await
+            .unwrap();
+        tokio::fs::write(installed.join("lib/puma.rb"), PRISTINE_PUMA)
+            .await
+            .unwrap();
+        let specs = gems.parent().unwrap().join("specifications");
+        tokio::fs::write(specs.join("puma-6.4.2.gemspec"), GEMSPEC_PUMA)
+            .await
+            .unwrap();
+        let before = compute_git_sha256_from_bytes(PRISTINE_PUMA);
+        let after = compute_git_sha256_from_bytes(PATCHED_PUMA);
+        tokio::fs::write(blobs.join(&after), PATCHED_PUMA)
+            .await
+            .unwrap();
+        let mut files = HashMap::new();
+        files.insert(
+            "lib/puma.rb".to_string(),
+            PatchFileInfo {
+                before_hash: before,
+                after_hash: after,
+            },
+        );
+        let record = PatchRecord {
+            uuid: UUID_PUMA.to_string(),
+            exported_at: "2026-06-09T00:00:00Z".to_string(),
+            files,
+            vulnerabilities: HashMap::new(),
+            description: String::new(),
+            license: String::new(),
+            tier: String::new(),
+        };
+        (installed, record)
+    }
+
+    fn expected_lock_two_path() -> String {
+        format!(
+            "PATH\n  remote: {puma}\n  specs:\n    puma (6.4.2)\n      nio4r (~> 2.0)\n\nPATH\n  remote: {rack}\n  specs:\n    rack (3.2.6)\n      base64 (>= 0.1.0)\n\nGEM\n  remote: https://rubygems.org/\n  specs:\n\nPLATFORMS\n  arm64-darwin-23\n  ruby\n\nDEPENDENCIES\n  puma (= 6.4.2)!\n  rack (= 3.2.6)!\n\nBUNDLED WITH\n   2.5.22\n",
+            puma = puma_rel(),
+            rack = copy_rel()
+        )
+    }
+
+    /// Bundler regenerates PATH sections sorted by source identifier — by
+    /// remote path, the uuid level deciding here (verified against a real
+    /// bundler 4.0.15 `bundle lock` over this exact two-PATH shape). The
+    /// splice must land each new section at that sorted position no matter
+    /// the vendor invocation order, or the committed lock churns on the
+    /// next `bundle lock`/`bundle install`.
+    #[tokio::test]
+    async fn test_two_path_sections_sorted_regardless_of_vendor_order() {
+        for rack_first in [true, false] {
+            let (_tmp, root, installed_rack, blobs, record_rack) =
+                fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
+            let (installed_puma, record_puma) = add_puma_fixture(&installed_rack, &blobs).await;
+            let runs: [(&str, &Path, &PatchRecord); 2] = if rack_first {
+                [
+                    (PURL, &installed_rack, &record_rack),
+                    (PURL_PUMA, &installed_puma, &record_puma),
+                ]
+            } else {
+                [
+                    (PURL_PUMA, &installed_puma, &record_puma),
+                    (PURL, &installed_rack, &record_rack),
+                ]
+            };
+            for (purl, installed, record) in runs {
+                let (result, _e, _w) = unwrap_done(
+                    run_vendor_purl(purl, &root, &blobs, installed, record, false).await,
+                );
+                assert!(result.success, "vendor {purl} failed: {:?}", result.error);
+            }
+            let lock = tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                .await
+                .unwrap();
+            assert_eq!(lock, expected_lock_two_path(), "rack_first={rack_first}");
+        }
+    }
+
+    // ── re-vendor: a patch update (new uuid, same purl) ──────────────────────
+
+    /// Re-vendor uuid; sorts BEFORE `UUID_PUMA`'s (`0e…` < `1a…`).
+    const UUID2: &str = "0e1f2a3b-4c5d-4e6f-8a7b-9c0d1e2f3a4b";
+
+    /// A patch update moves the manifest to a NEW uuid for the same gem. The
+    /// CLI re-vendors straight over the first run's live wiring (originals
+    /// carried forward and the old uuid dir swept by the caller — no
+    /// revert-first; the cargo backend pins the same design). Both pair
+    /// files must be repointed in place, with `original: None` on the
+    /// rewired records.
+    #[tokio::test]
+    async fn test_revendor_new_uuid_direct_rewires_in_place() {
+        let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
+        let (r1, e1, _) = unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
+        assert!(r1.success);
+        let entry1 = e1.unwrap();
+
+        let mut record2 = record.clone();
+        record2.uuid = UUID2.to_string();
+        let (r2, e2, _) = unwrap_done(run_vendor(&root, &blobs, &installed, &record2, false).await);
+        assert!(r2.success, "re-vendor must succeed: {:?}", r2.error);
+
+        let new_rel = format!(".socket/vendor/gem/{UUID2}/rack-3.2.6");
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
+            format!(
+                "source \"https://rubygems.org\"\n\ngem \"puma\"\ngem \"rack\", \"3.2.6\", path: \"{new_rel}\"\n"
+            ),
+            "Gemfile repointed in place"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                .await
+                .unwrap(),
+            expected_lock_direct().replace(UUID, UUID2),
+            "lock repointed in place"
+        );
+        // New copy built; the old uuid dir is left for the caller's
+        // stale-artifact sweep (the caller owns the ledger).
+        assert_eq!(
+            tokio::fs::read(root.join(&new_rel).join("lib/rack.rb"))
+                .await
+                .unwrap(),
+            PATCHED
+        );
+        assert!(root.join(format!(".socket/vendor/gem/{UUID}")).exists());
+
+        // The rewired records carry `original: None` — never the old-uuid
+        // lines (reverting those would "restore" a dangling vendor pointer).
+        let mut entry2 = e2.expect("re-vendor emits the new ledger entry");
+        assert_eq!(entry2.uuid, UUID2);
+        assert_eq!(entry2.wiring.len(), 2);
+        for rec in &entry2.wiring {
+            assert_eq!(rec.action, WiringAction::Rewritten);
+            assert!(rec.original.is_none(), "{rec:?}");
+        }
+
+        // With the caller's carry-forward applied, revert restores the
+        // PRE-VENDOR files byte-exactly.
+        carry_forward_originals(&entry1, &mut entry2);
+        let outcome = revert_gem(&entry2, &root, false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(
+            !outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_lock_entry_drifted"),
+            "clean revert must not report drift: {:?}",
+            outcome.warnings
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
+            GEMFILE_DIRECT
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                .await
+                .unwrap(),
+            LOCK_DIRECT
+        );
+    }
+
+    /// Transitive form: the managed block is repointed in place (never
+    /// duplicated) and the record stays `Added` with the WHOLE updated block,
+    /// so a later revert deletes the fence.
+    #[tokio::test]
+    async fn test_revendor_new_uuid_transitive_updates_managed_block() {
+        let (_tmp, root, installed, blobs, record) =
+            fixture(GEMFILE_TRANSITIVE, LOCK_TRANSITIVE).await;
+        let (r1, e1, _) = unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
+        assert!(r1.success);
+        let entry1 = e1.unwrap();
+
+        let mut record2 = record.clone();
+        record2.uuid = UUID2.to_string();
+        let (r2, e2, _) = unwrap_done(run_vendor(&root, &blobs, &installed, &record2, false).await);
+        assert!(r2.success, "re-vendor must succeed: {:?}", r2.error);
+
+        let new_rel = format!(".socket/vendor/gem/{UUID2}/rack-3.2.6");
+        let new_block = format!(
+            "{MANAGED_OPEN}\ngem \"rack\", \"3.2.6\", path: \"{new_rel}\"\n{MANAGED_CLOSE}\n"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
+            format!("source \"https://rubygems.org\"\n\ngem \"puma\"\n{new_block}"),
+            "ONE managed block, repointed — never a duplicate declaration"
+        );
+
+        let mut entry2 = e2.unwrap();
+        assert_eq!(entry2.wiring[0].action, WiringAction::Added);
+        assert!(entry2.wiring[0].original.is_none());
+        assert_eq!(
+            entry2.wiring[0].new.as_ref().unwrap(),
+            &Value::String(new_block)
+        );
+
+        carry_forward_originals(&entry1, &mut entry2);
+        let outcome = revert_gem(&entry2, &root, false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(
+            !outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_lock_entry_drifted"),
+            "clean revert must not report drift: {:?}",
+            outcome.warnings
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
+            GEMFILE_TRANSITIVE
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                .await
+                .unwrap(),
+            LOCK_TRANSITIVE
+        );
+    }
+
+    /// A re-vendor must RE-SORT: the replacement PATH section lands wherever
+    /// the NEW uuid sorts among the other vendored gems' sections, not where
+    /// the old one sat.
+    #[tokio::test]
+    async fn test_revendor_new_uuid_resorts_path_sections() {
+        let (_tmp, root, installed_rack, blobs, record_rack) =
+            fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
+        let (installed_puma, record_puma) = add_puma_fixture(&installed_rack, &blobs).await;
+        for (purl, installed, record) in [
+            (PURL, &installed_rack, &record_rack),
+            (PURL_PUMA, &installed_puma, &record_puma),
+        ] {
+            let (result, _e, _w) =
+                unwrap_done(run_vendor_purl(purl, &root, &blobs, installed, record, false).await);
+            assert!(result.success, "vendor {purl} failed: {:?}", result.error);
+        }
+
+        // The patch update moves rack to a uuid sorting BEFORE puma's.
+        let mut rack2 = record_rack.clone();
+        rack2.uuid = UUID2.to_string();
+        let (result, _e, _w) =
+            unwrap_done(run_vendor(&root, &blobs, &installed_rack, &rack2, false).await);
+        assert!(result.success, "re-vendor must succeed: {:?}", result.error);
+
+        let lock = tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+            .await
+            .unwrap();
+        assert_eq!(
+            lock,
+            expected_lock_two_path()
+                .replace(
+                    &format!("PATH\n  remote: {puma}\n  specs:\n    puma (6.4.2)\n      nio4r (~> 2.0)\n\nPATH\n  remote: {rack}\n  specs:\n    rack (3.2.6)\n      base64 (>= 0.1.0)\n\n", puma = puma_rel(), rack = copy_rel()),
+                    &format!("PATH\n  remote: {rack}\n  specs:\n    rack (3.2.6)\n      base64 (>= 0.1.0)\n\nPATH\n  remote: {puma}\n  specs:\n    puma (6.4.2)\n      nio4r (~> 2.0)\n\n", puma = puma_rel(), rack = copy_rel().replace(UUID, UUID2)),
+                ),
+            "rack's section moved to the new uuid's sorted position"
+        );
+    }
+
+    /// On a re-vendor over a CHECKSUMS lock the checksum record must ride
+    /// AGAIN with `original: None`: dropped, the first run's registry
+    /// `sha256=` line would vanish from the ledger with the replaced entry,
+    /// and a post-update revert would leave a bare CHECKSUMS entry on a
+    /// registry gem (frozen installs exit 16).
+    #[tokio::test]
+    async fn test_revendor_new_uuid_checksums_keeps_restore_data() {
+        let (_tmp, root, installed, blobs, record) =
+            fixture_318(SPIKE_GEMFILE_CHECKSUMS, SPIKE_LOCK_CHECKSUMS_BEFORE).await;
+        let (r1, e1, _) =
+            unwrap_done(run_vendor_318(&root, &blobs, &installed, &record, false).await);
+        assert!(r1.success);
+        let entry1 = e1.unwrap();
+
+        let mut record2 = record.clone();
+        record2.uuid = UUID2.to_string();
+        let (r2, e2, _) =
+            unwrap_done(run_vendor_318(&root, &blobs, &installed, &record2, false).await);
+        assert!(r2.success, "re-vendor must succeed: {:?}", r2.error);
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                .await
+                .unwrap(),
+            expected_lock_checksums().replace(UUID, UUID2)
+        );
+
+        let mut entry2 = e2.unwrap();
+        assert_eq!(entry2.wiring.len(), 3, "{:?}", entry2.wiring);
+        let ck = &entry2.wiring[2];
+        assert_eq!(ck.kind, LOCK_CHECKSUM_WIRING_KIND);
+        assert!(ck.original.is_none(), "{:?}", ck.original);
+        assert_eq!(
+            ck.new.as_ref().unwrap(),
+            &Value::String("  rack (3.1.8)".to_string())
+        );
+
+        carry_forward_originals(&entry1, &mut entry2);
+        let outcome = revert_gem(&entry2, &root, false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(
+            !outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_lock_entry_drifted"),
+            "clean revert must not report drift: {:?}",
+            outcome.warnings
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                .await
+                .unwrap(),
+            SPIKE_LOCK_CHECKSUMS_BEFORE,
+            "registry sha256 line restored"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
+            SPIKE_GEMFILE_CHECKSUMS
+        );
+    }
+
+    /// The GEM-specs twin of `test_checksums_platform_sibling_fails_closed`:
+    /// on a bundler < 2.6 lock (no CHECKSUMS section to catch it in) a
+    /// platform-suffixed sibling spec must fail the lift closed — lifting
+    /// only the plain entry would leave the sibling behind as a stale
+    /// registry spec.
+    #[test]
+    fn test_gem_specs_platform_sibling_fails_closed() {
+        let lock = "GEM\n  remote: https://rubygems.org/\n  specs:\n    nokogiri (1.16.0)\n      racc (~> 1.4)\n    nokogiri (1.16.0-arm64-darwin)\n      racc (~> 1.4)\n\nPLATFORMS\n  arm64-darwin\n  ruby\n\nDEPENDENCIES\n  nokogiri\n\nBUNDLED WITH\n   2.5.22\n";
+        let rel = format!(".socket/vendor/gem/{UUID}/nokogiri-1.16.0");
+        let err = match edit_lock(lock, "nokogiri", "1.16.0", &rel) {
+            Err(e) => e,
+            Ok(_) => panic!("a platform-suffixed GEM specs sibling must fail closed"),
+        };
+        assert!(err.contains("platform-suffixed"), "{err}");
     }
 
     /// Trailing options on the declaration (`require: false`, `group: :test`,

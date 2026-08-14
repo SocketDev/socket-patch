@@ -26,6 +26,7 @@ use sha2::{Digest, Sha256, Sha384, Sha512};
 use crate::constants::USER_AGENT;
 use crate::crawlers::go_crawler::encode_module_path;
 use crate::patch::apply::is_safe_relative_subpath;
+use crate::patch::path_safety::is_safe_single_segment;
 
 use super::lock_inventory::{LockIntegrity, LockfileEntry};
 
@@ -237,6 +238,18 @@ async fn fetch_gem(
     entry: &LockfileEntry,
     client: &reqwest::Client,
 ) -> Result<FetchedPackage, FetchError> {
+    // The staged leaf must be the canonical `{name}-{version}`: the gem
+    // vendor backend refuses any other leaf as a platform-suffixed install
+    // (`platform_gem_unsupported`), so a generic name would kill the whole
+    // auto-fetch path. The coordinates thereby become a tempdir path
+    // component — `inventory_gemfile_lock` already filters both, but
+    // re-assert locally (defense in depth), before any network I/O.
+    if !is_safe_single_segment(&entry.name) || !is_safe_single_segment(&entry.version) {
+        return Err(FetchError::Failed(format!(
+            "unsafe gem coordinates `{}` @ `{}` — refusing to stage",
+            entry.name, entry.version
+        )));
+    }
     let Some(url) = entry.resolved.clone() else {
         return Err(FetchError::Unverifiable(format!(
             "no download URL for {}@{}",
@@ -248,7 +261,7 @@ async fn fetch_gem(
 
     let tmp = tempfile::tempdir()
         .map_err(|e| FetchError::Failed(format!("cannot create fetch tempdir: {e}")))?;
-    let dir = tmp.path().join("gem");
+    let dir = tmp.path().join(format!("{}-{}", entry.name, entry.version));
     extract_gem_data(&bytes, &dir).map_err(FetchError::Failed)?;
     Ok(FetchedPackage {
         dir,
@@ -1482,6 +1495,36 @@ mod tests {
             "data.tar.gz content extracts at the root (no strip)"
         );
         assert!(fetched.dir().join("README.md").is_file());
+        // The staged leaf must be the canonical `{name}-{version}`:
+        // vendor_gem's platform-suffix guard refuses any other leaf
+        // (`platform_gem_unsupported`), which killed lockfile auto-fetch
+        // when this dir was named `gem`.
+        assert_eq!(
+            fetched.dir().file_name().unwrap().to_string_lossy(),
+            "rails-7.1.0",
+            "staged dir leaf must satisfy vendor_gem's `{{name}}-{{version}}` check"
+        );
+    }
+
+    #[tokio::test]
+    async fn gem_fetch_refuses_unsafe_coordinates_without_network() {
+        // The coordinates become the staged-dir leaf, so a separator-bearing
+        // name must refuse — and BEFORE any I/O (the URL would hard-fail if
+        // contacted).
+        let entry = LockfileEntry {
+            ecosystem: "gem",
+            name: "ra/ils".into(),
+            version: "7.1.0".into(),
+            purl: "pkg:gem/ra/ils@7.1.0".into(),
+            resolved: Some("http://127.0.0.1:1/nope.gem".into()),
+            integrity: LockIntegrity::Sha256Hex("0".repeat(64)),
+        };
+        match fetch_and_stage(&entry, &build_registry_client()).await {
+            Err(FetchError::Failed(msg)) => {
+                assert!(msg.contains("unsafe gem coordinates"), "{msg}")
+            }
+            other => panic!("expected coordinate refusal, got {other:?}"),
+        }
     }
 
     #[tokio::test]

@@ -42,15 +42,15 @@ use crate::utils::uri::encode_uri_component;
 use super::berry_zip::berry_cache_checksum_10c0;
 use super::common::{already_patched_result, detect_eol, detect_indent, refused, serialize_json};
 use super::npm_common::{
-    done_failure, guard_coordinates, guard_revert_uuid_dir, stage_patch_pack, tgz_rel_leaf,
+    done_failure_unstage, guard_coordinates, guard_revert_uuid_dir, stage_patch_pack, tgz_rel_leaf,
 };
 use super::path::parse_vendor_path;
 use super::state::{
     write_marker, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
 };
 use super::yarn_classic_lock::{
-    body_field_line, lines_to_json, read_yarn_lock, replace_block, revert_recorded_block,
-    scan_blocks, split_key_patterns, split_pattern, LockBlock,
+    body_field_line, lines_to_json, pattern_real_name, read_yarn_lock, replace_block,
+    revert_recorded_block, scan_blocks, split_key_patterns, split_pattern, LockBlock,
 };
 use super::{RevertOutcome, VendorOutcome, VendorWarning};
 
@@ -229,9 +229,39 @@ pub async fn vendor_yarn_berry(
     }
 
     // ── 6. The single replaceable lock entry ──────────────────────────────
-    let (target, target_is_ours) = match scan_berry_target(&blocks, name, version) {
-        Ok(Some((idx, is_ours))) => (&blocks[idx], is_ours),
-        Ok(None) => {
+    let scan = match scan_berry_target(&blocks, name, version) {
+        Ok(scan) => scan,
+        Err((code, detail)) => return refused(code, detail),
+    };
+    // An `alias@npm:<name>@…` descriptor consumes the patched package under
+    // a different ident; the bare-name resolutions entry vendoring writes
+    // can never move it, so that copy keeps installing the UNPATCHED bytes.
+    // Surface every such entry loudly instead of silently part-patching.
+    for key in &scan.alias_keys {
+        warnings.push(VendorWarning::new(
+            "vendor_alias_entry_skipped",
+            format!(
+                "{YARN_LOCK} entry `{key}` consumes {name}@{version} through an npm: alias; \
+                 the bare-name resolutions entry vendoring writes cannot move aliased \
+                 descriptors, so that copy keeps installing the UNPATCHED registry bytes"
+            ),
+        ));
+    }
+    let (target, target_is_ours) = match scan.target {
+        Some((idx, is_ours)) => (&blocks[idx], is_ours),
+        None => {
+            if !scan.alias_keys.is_empty() {
+                return refused(
+                    "vendor_lock_entry_not_found",
+                    format!(
+                        "{YARN_LOCK} resolves {name}@{version} only through npm: alias \
+                         descriptors ({}); berry resolutions are name-keyed and cannot \
+                         reach aliased descriptors, so vendoring cannot rewire this \
+                         project's copy",
+                        scan.alias_keys.join(", ")
+                    ),
+                );
+            }
             return refused(
                 "vendor_lock_entry_not_found",
                 format!(
@@ -240,7 +270,6 @@ pub async fn vendor_yarn_berry(
                 ),
             );
         }
-        Err((code, detail)) => return refused(code, detail),
     };
     let patches_manifest = record
         .files
@@ -248,6 +277,12 @@ pub async fn vendor_yarn_berry(
         .any(|k| normalize_file_path(k) == "package.json");
 
     // ── 7. Stage → patch → pack (shared flavor-agnostic pipeline) ─────────
+    // A wiring failure past this point must unwind the uuid dir staging is
+    // about to create — but never one that already existed (a same-uuid
+    // re-vendor's dir may still be referenced by live wiring).
+    let uuid_dir_preexisted = tokio::fs::metadata(project_root.join(&uuid_dir_rel))
+        .await
+        .is_ok();
     let (staged, result) = match stage_patch_pack(
         purl,
         installed_dir,
@@ -279,7 +314,16 @@ pub async fn vendor_yarn_berry(
     // ── 8. Berry identity facts of the packed tarball ─────────────────────
     let tgz_bytes = match tokio::fs::read(&dest).await {
         Ok(b) => b,
-        Err(e) => return done_failure(purl, format!("cannot re-read the packed tarball: {e}")),
+        Err(e) => {
+            return done_failure_unstage(
+                purl,
+                format!("cannot re-read the packed tarball: {e}"),
+                project_root,
+                &uuid_dir_rel,
+                uuid_dir_preexisted,
+            )
+            .await
+        }
     };
     let tgz_sha512 = hex::encode(Sha512::digest(&tgz_bytes));
     // `hash=` — the first 6 hex chars of sha512(tgz): the lock-committed
@@ -288,10 +332,14 @@ pub async fn vendor_yarn_berry(
     let checksum = match berry_cache_checksum_10c0(&tgz_bytes, name) {
         Ok(c) => c,
         Err(e) => {
-            return done_failure(
+            return done_failure_unstage(
                 purl,
                 format!("cannot compute the berry cache checksum for {name}: {e}"),
+                project_root,
+                &uuid_dir_rel,
+                uuid_dir_preexisted,
             )
+            .await
         }
     };
 
@@ -345,14 +393,30 @@ pub async fn vendor_yarn_berry(
             .entry("resolutions".to_string())
             .or_insert_with(|| Value::Object(serde_json::Map::new()));
         let Some(res_obj) = res.as_object_mut() else {
-            return done_failure(purl, "resolutions table vanished mid-edit".to_string());
+            return done_failure_unstage(
+                purl,
+                "resolutions table vanished mid-edit".to_string(),
+                project_root,
+                &uuid_dir_rel,
+                uuid_dir_preexisted,
+            )
+            .await;
         };
         res_obj.insert(name.to_string(), Value::String(spec.clone()));
     }
     let pkg_indent = detect_indent(&String::from_utf8_lossy(&pkg_bytes));
     let new_pkg_bytes = match serialize_json(&new_pkg, &pkg_indent) {
         Ok(b) => b,
-        Err(e) => return done_failure(purl, format!("cannot serialize {PACKAGE_JSON}: {e}")),
+        Err(e) => {
+            return done_failure_unstage(
+                purl,
+                format!("cannot serialize {PACKAGE_JSON}: {e}"),
+                project_root,
+                &uuid_dir_rel,
+                uuid_dir_preexisted,
+            )
+            .await
+        }
     };
     let new_lock_text = replace_block(&lock_text, target, &new_lines, detect_eol(&lock_text));
     if let Err(e) = commit_pair(
@@ -363,7 +427,8 @@ pub async fn vendor_yarn_berry(
     )
     .await
     {
-        return done_failure(purl, e);
+        return done_failure_unstage(purl, e, project_root, &uuid_dir_rel, uuid_dir_preexisted)
+            .await;
     }
 
     // ── 12. Marker + ledger entry ─────────────────────────────────────────
@@ -667,17 +732,31 @@ async fn commit_pair(
     Ok(())
 }
 
-/// Find the one replaceable entry for `name@version` — `(index into blocks,
-/// is_ours)`, where `is_ours` means the entry is already one of our `file:`
-/// entries (stale uuid or current) — refusing fail-closed on anything a
-/// bare-name resolutions entry would also move (other versions of the name,
-/// non-npm protocols, ambiguous duplicates).
+/// The result of [`scan_berry_target`]: the one replaceable entry (when
+/// present) plus every alias-descriptor entry a bare-name resolutions entry
+/// cannot reach.
+struct BerryTargetScan {
+    /// `(index into blocks, is_ours)`, where `is_ours` means the entry is
+    /// already one of our `file:` entries (stale uuid or current).
+    target: Option<(usize, bool)>,
+    /// Lock keys of `alias@npm:<name>@…` entries resolving the patched
+    /// version — semantically out of reach for a name-keyed resolutions
+    /// entry, so the caller must surface them instead of silently skipping.
+    alias_keys: Vec<String>,
+}
+
+/// Find the one replaceable entry for `name@version` — refusing fail-closed
+/// on anything a bare-name resolutions entry would also move (other versions
+/// of the name, non-npm protocols, ambiguous duplicates) — and collect the
+/// npm-alias descriptor entries of the same package that vendoring can never
+/// rewire.
 fn scan_berry_target(
     blocks: &[LockBlock],
     name: &str,
     version: &str,
-) -> Result<Option<(usize, bool)>, (&'static str, String)> {
+) -> Result<BerryTargetScan, (&'static str, String)> {
     let mut found: Vec<(usize, bool)> = Vec::new();
+    let mut alias_keys: Vec<String> = Vec::new();
     for (idx, block) in blocks.iter().enumerate() {
         if block.key == "__metadata" {
             continue;
@@ -688,6 +767,13 @@ fn scan_berry_target(
             continue; // not a descriptor key we understand; not ours to touch
         }
         if !parsed.iter().any(|(n, _)| *n == name) {
+            // `alias@npm:<name>@…` descriptors carry the real name inside
+            // the range; a name-keyed resolutions entry cannot move them.
+            if berry_field(&block.lines, "version") == Some(version)
+                && patterns.iter().any(|p| pattern_real_name(p) == Some(name))
+            {
+                alias_keys.push(block.key.clone());
+            }
             continue;
         }
         if !parsed.iter().all(|(n, _)| *n == name) {
@@ -735,17 +821,19 @@ fn scan_berry_target(
             ));
         }
     }
-    match found.len() {
-        0 => Ok(None),
-        1 => Ok(found.into_iter().next()),
-        _ => Err((
+    if found.len() > 1 {
+        return Err((
             "vendor_override_conflict",
             format!(
                 "multiple yarn.lock entries resolve {name}@{version}; refusing the \
                      ambiguous rewrite"
             ),
-        )),
+        ));
     }
+    Ok(BerryTargetScan {
+        target: found.into_iter().next(),
+        alias_keys,
+    })
 }
 
 /// Body sections of a lock entry that are NOT the five scalar fields we own
@@ -1301,6 +1389,97 @@ __metadata:
             detail.contains("1.2.0"),
             "names the other version: {detail}"
         );
+        fx.assert_untouched().await;
+    }
+
+    /// An `alias@npm:left-pad@…` descriptor consumes the patched package
+    /// under a different ident; the name-keyed resolutions entry can never
+    /// move it, so vendoring must warn loudly about the unpatched copy
+    /// instead of silently part-patching.
+    #[tokio::test]
+    async fn alias_descriptor_entry_warns_and_stays_untouched() {
+        const ALIAS_BLOCK: &str = "\"safe-pad@npm:left-pad@1.3.0\":\n  version: 1.3.0\n  resolution: \"left-pad@npm:1.3.0\"\n  checksum: 10c0/aa\n  languageName: node\n  linkType: hard\n";
+        let lock = format!("{B3_BEFORE_LOCK}\n{ALIAS_BLOCK}");
+        let fx = fixture_with(B3_BEFORE_PKG, &lock).await;
+
+        let (result, entry, warnings) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        assert!(entry.is_some(), "the plain entry still vendors");
+        let warning = warnings
+            .iter()
+            .find(|w| w.code == "vendor_alias_entry_skipped")
+            .unwrap_or_else(|| panic!("expected the alias skip warning: {warnings:?}"));
+        assert!(
+            warning.detail.contains("safe-pad@npm:left-pad@1.3.0"),
+            "names the alias entry: {}",
+            warning.detail
+        );
+
+        let text = tokio::fs::read_to_string(fx.lock_path()).await.unwrap();
+        assert!(
+            text.contains("left-pad@file:./"),
+            "plain entry rewired: {text}"
+        );
+        assert!(
+            text.contains(ALIAS_BLOCK),
+            "alias entry byte-untouched: {text}"
+        );
+
+        // An alias of ANOTHER version is out of the patch's scope: no noise.
+        let other = ALIAS_BLOCK.replace("1.3.0", "1.2.0");
+        let lock = format!("{B3_BEFORE_LOCK}\n{other}");
+        let fx = fixture_with(B3_BEFORE_PKG, &lock).await;
+        let (result, _, warnings) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| w.code == "vendor_alias_entry_skipped"),
+            "{warnings:?}"
+        );
+    }
+
+    /// When the ONLY entry for the patched version is an alias descriptor,
+    /// the refusal must say so — the generic "make sure the package is
+    /// installed" detail would send the user to a `yarn install` that
+    /// changes nothing.
+    #[tokio::test]
+    async fn alias_only_lock_refuses_with_alias_detail() {
+        let lock = B3_BEFORE_LOCK.replace(
+            "\"left-pad@npm:1.3.0\":",
+            "\"safe-pad@npm:left-pad@1.3.0\":",
+        );
+        let fx = fixture_with(B3_BEFORE_PKG, &lock).await;
+        let detail = expect_refused(fx.vendor(false).await, "vendor_lock_entry_not_found");
+        assert!(detail.contains("alias"), "{detail}");
+        assert!(detail.contains("safe-pad@npm:left-pad@1.3.0"), "{detail}");
+        fx.assert_untouched().await;
+    }
+
+    /// A wiring failure AFTER the tarball is packed (here: the fail-closed
+    /// berry cache checksum refusing a non-ASCII filename) must unwind the
+    /// freshly created uuid dir — no ledger entry exists for it, so
+    /// `--revert` could never clean it up and the user would commit an
+    /// unwired artifact.
+    #[tokio::test]
+    async fn post_pack_wiring_failure_unwinds_the_staged_artifact() {
+        let fx = fixture().await;
+        tokio::fs::write(fx.installed().join("café.js"), b"x")
+            .await
+            .unwrap();
+
+        let (result, entry, _) = expect_done(fx.vendor(false).await);
+        assert!(!result.success, "non-ASCII filename must fail the wiring");
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("berry cache checksum"),
+            "{:?}",
+            result.error
+        );
+        assert!(entry.is_none());
         fx.assert_untouched().await;
     }
 

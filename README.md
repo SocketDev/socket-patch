@@ -531,6 +531,10 @@ socket-patch scan --json --mode hosted --yes
 > Already-vendored packages are **skipped by plain `--mode agent`** (the committed
 > artifact is the patch); a newer available patch still appears in the JSON `updates[]`
 > array — re-run `scan --mode vendored` to take it.
+>
+> Hosted-managed dependencies get the same signal: `updates[]` also consults the
+> `.socket/vendor/redirect-state.json` ledger, so a superseded hosted patch shows up in
+> read-only `scan --json` — re-run `scan --mode hosted` to take it.
 
 ### `apply`
 
