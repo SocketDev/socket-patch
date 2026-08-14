@@ -138,6 +138,23 @@ pub async fn vendor_pnpm(
     if let Err(detail) = check_lock_version(&lock_text) {
         return refused("vendor_lockfile_version_unsupported", detail);
     }
+    // CRLF line endings (Windows autocrlf checkouts) break every structural
+    // probe below — `split_lines` keeps the trailing `\r`, so section headers
+    // like `packages:` never match — which would otherwise surface as a
+    // misleading "no packages entry … run `pnpm install`" refusal. pnpm
+    // itself tolerates CRLF, so name the real cause and fail closed before
+    // any probe runs.
+    if lock_text.contains('\r') {
+        return refused(
+            "vendor_lockfile_crlf_unsupported",
+            format!(
+                "{PNPM_LOCK} has CRLF line endings, which this rewriter cannot edit \
+                 byte-faithfully — normalize the file to LF (re-run `pnpm install`, \
+                 or add `pnpm-lock.yaml text eol=lf` to .gitattributes and re-checkout) \
+                 and retry"
+            ),
+        );
+    }
     let mut lines = split_lines(&lock_text);
 
     // ── 3. Pre-flight refusals (override conflicts, entry present) ───────
@@ -3090,6 +3107,28 @@ snapshots:
             !fx.root()
                 .join(format!(".socket/vendor/npm/{UUID}"))
                 .exists(),
+            "refusal stages no artifact"
+        );
+    }
+
+    /// A CRLF pnpm-lock.yaml (Windows autocrlf checkout) passes the version
+    /// sniff (`str::lines` strips `\r`) but breaks every structural probe —
+    /// the refusal must name the line endings as the cause, not the
+    /// misleading "no packages entry … run `pnpm install`".
+    #[tokio::test]
+    async fn crlf_lock_refuses_naming_line_endings() {
+        let crlf_lock = P1_BEFORE_LOCK.replace('\n', "\r\n");
+        let fx = fixture_with(P1_BEFORE_PKG, &crlf_lock).await;
+        let detail = expect_refused(fx.vendor(false).await, "vendor_lockfile_crlf_unsupported");
+        assert!(detail.contains("CRLF"), "{detail}");
+        assert!(
+            !detail.contains("make sure the package is installed"),
+            "no misleading install remedy: {detail}"
+        );
+        assert_eq!(fx.read(PNPM_LOCK).await, crlf_lock, "lock untouched");
+        assert_eq!(fx.read(PACKAGE_JSON).await, P1_BEFORE_PKG, "pkg untouched");
+        assert!(
+            !fx.root().join(".socket/vendor").exists(),
             "refusal stages no artifact"
         );
     }
