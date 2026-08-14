@@ -1313,6 +1313,84 @@ fn warning_codes(env: &serde_json::Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// A patched dep whose ONLY lock instance is bundled (`inBundle: true`)
+/// must not be redirected: npm extracts that copy from its parent's tarball
+/// and ignores the entry's resolved/integrity, so a rewrite would confirm —
+/// and VEX-attest — a patch whose bytes never install. The run must report
+/// `redirected: 0`, leave the lockfile byte-identical, and carry the loud
+/// stays-UNPATCHED warning. Subprocess so the `--json` envelope's
+/// `redirected` count and `warnings[]` can be read back.
+#[tokio::test]
+#[serial]
+async fn redirect_inbundle_only_dep_is_skipped_not_confirmed() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("package.json"),
+        r#"{ "name": "consumer", "version": "0.0.0", "dependencies": { "parent": "2.0.0" } }"#,
+    )
+    .unwrap();
+    // Installed tree: the patched package exists only as parent's bundled
+    // nested copy — the crawler still discovers it there.
+    let parent = tmp.path().join("node_modules").join("parent");
+    std::fs::create_dir_all(&parent).unwrap();
+    std::fs::write(
+        parent.join("package.json"),
+        r#"{ "name": "parent", "version": "2.0.0", "bundleDependencies": ["in-proc-redirect"] }"#,
+    )
+    .unwrap();
+    let nested = parent.join("node_modules").join(NAME);
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::write(
+        nested.join("package.json"),
+        format!(r#"{{ "name": "{NAME}", "version": "{VERSION}" }}"#),
+    )
+    .unwrap();
+    let lock = format!(
+        r#"{{
+  "name": "consumer",
+  "version": "0.0.0",
+  "lockfileVersion": 3,
+  "requires": true,
+  "packages": {{
+    "": {{ "name": "consumer", "version": "0.0.0", "dependencies": {{ "parent": "2.0.0" }} }},
+    "node_modules/parent": {{
+      "version": "2.0.0",
+      "resolved": "https://registry.npmjs.org/parent/-/parent-2.0.0.tgz",
+      "integrity": "sha512-PARENT=="
+    }},
+    "node_modules/parent/node_modules/{NAME}": {{
+      "version": "{VERSION}",
+      "inBundle": true,
+      "integrity": "sha512-UPSTREAMupstream=="
+    }}
+  }}
+}}
+"#
+    );
+    std::fs::write(tmp.path().join("package-lock.json"), &lock).unwrap();
+
+    let env = run_redirect_subprocess(tmp.path(), &server.uri());
+    assert_eq!(
+        env["redirect"]["redirected"], 0,
+        "a bundled-only dep must NOT be counted redirected: {env}"
+    );
+    let codes = warning_codes(&env);
+    assert!(
+        codes.contains(&"redirect_npm_bundled_instance_skipped".to_string()),
+        "the stays-UNPATCHED warning must reach the envelope: {env}"
+    );
+    let after = std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap();
+    assert_eq!(after, lock, "the lockfile must be byte-untouched");
+    assert!(
+        !after.contains(HOSTED_URL),
+        "the hosted URL must never appear (it would confirm + attest): {after}"
+    );
+}
+
 /// The rewriters' own warnings must reach HUMAN mode too, not just the
 /// `--json` envelope: they carry the load-bearing "why nothing happened /
 /// what you must do" guidance (`redirect_npm_no_lockfile`,
