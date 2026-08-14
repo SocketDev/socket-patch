@@ -1,0 +1,2 @@
+[registries.socket-patch-00000000-0000-0000-0000-000000000000]
+index = "sparse+https://patch.socket.dev/patch-registry/cargo/11111111-1111-1111-1111-111111111111/00000000-0000-0000-0000-000000000000/index/"

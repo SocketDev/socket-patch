@@ -122,6 +122,15 @@ pub struct RewriteResult {
     pub files: BTreeMap<String, String>,
     pub edits: Vec<FileEdit>,
     pub warnings: Vec<RewriteWarning>,
+    /// Patch uuids whose cargo redirect FULLY landed — the Cargo.toml pin plus
+    /// (when a Cargo.lock is present) the lock repoint, with the registry
+    /// block wired in — whether written by this run or already in place from
+    /// an earlier one. The cargo rewrite is transactional per dependency:
+    /// a dep that is not in this set had NOTHING written for it. Hosted-mode
+    /// confirmation MUST key off this set for cargo deps, never off substring
+    /// presence in rewritten files (a `[registries.…]` config block alone
+    /// pins nothing).
+    pub confirmed_cargo_uuids: std::collections::BTreeSet<String>,
 }
 
 /// Combined name as it appears in registry coordinates / lock keys.
@@ -398,6 +407,17 @@ fn rewrite_pypi_requirements(
 }
 
 // ── cargo (Cargo.toml + .cargo/config.toml + Cargo.lock) ─────────────────────
+//
+// TRANSACTIONAL per dependency: a dep is redirected ONLY if its Cargo.toml pin
+// fully lands across EVERY occurrence ([dependencies], [dev-dependencies],
+// [build-dependencies], target-specific tables, [workspace.dependencies], and
+// the multi-line `[dependencies.<name>]` table form). If any occurrence cannot
+// be rewritten — a foreign registry pin, a path/git dependency, an unsupported
+// spelling — the dep is skipped ENTIRELY (no lock edit, no config block, no
+// confirmation) with one clear warning. A partial edit set (lock repointed
+// while the manifest still says crates.io, or an inert `[registries.…]` block
+// with nothing referencing it) breaks `--locked` builds or silently drops the
+// patch while attesting it — the exact failure mode this shape forbids.
 fn rewrite_cargo(
     files: &BTreeMap<String, String>,
     overrides: &[DepOverride],
@@ -435,13 +455,48 @@ fn rewrite_cargo(
             continue;
         };
         if ov.kind != "cargo-sparse" {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_cargo_missing_override".into(),
+                detail: format!("{} has no cargo-sparse registry override", dep.name),
+            });
             continue;
         }
+        // Service-supplied strings are interpolated into raw TOML (a section
+        // header, a quoted value) and into Cargo.lock — validate them against
+        // their exact expected grammars BEFORE any write, mirroring the
+        // vendored path's fail-closed uuid/path checks. A `]`+newline in a
+        // patch uuid or a quote in an index URL would otherwise inject
+        // arbitrary TOML (e.g. a `[source.crates-io]` replace-with hijacking
+        // every crate in the project).
+        if !crate::patch::path_safety::is_canonical_uuid(&dep.patch_uuid) {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_cargo_invalid_uuid".into(),
+                detail: format!(
+                    "{} has a malformed patch uuid; dependency skipped",
+                    dep.name
+                ),
+            });
+            continue;
+        }
+        if !is_valid_cargo_index_url(&ov.index_url) {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_cargo_invalid_index_url".into(),
+                detail: format!(
+                    "{} has a malformed sparse index URL; dependency skipped",
+                    dep.name
+                ),
+            });
+            continue;
+        }
+        // An empty-string cksum is MISSING (the TS twin's falsy check), not a
+        // value to write into Cargo.lock — `checksum = ""` hard-fails the next
+        // `cargo fetch --locked`.
         let Some(cksum) = ov
             .identifiers
             .cargo_cksum_sha256
             .clone()
-            .or_else(|| dep.integrity.sha256.clone())
+            .filter(|s| !s.is_empty())
+            .or_else(|| dep.integrity.sha256.clone().filter(|s| !s.is_empty()))
         else {
             result.warnings.push(RewriteWarning {
                 code: "redirect_cargo_missing_cksum".into(),
@@ -449,68 +504,116 @@ fn rewrite_cargo(
             });
             continue;
         };
+        if !is_hex64_lower(&cksum) {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_cargo_invalid_cksum".into(),
+                detail: format!(
+                    "{} has a malformed sha256 cksum; dependency skipped",
+                    dep.name
+                ),
+            });
+            continue;
+        }
         let reg = format!("socket-patch-{}", dep.patch_uuid);
         let index_url = &ov.index_url;
 
-        // 1. .cargo/config.toml registry definition (idempotent).
-        if !cargo_config.contains(&format!("[registries.{reg}]")) {
-            let block = format!("[registries.{reg}]\nindex = \"{index_url}\"\n");
-            let sep = if !cargo_config.is_empty() && !cargo_config.ends_with('\n') {
-                "\n"
-            } else {
-                ""
-            };
-            let prefix = if cargo_config.is_empty() { "" } else { "\n" };
-            cargo_config = format!("{cargo_config}{sep}{prefix}{block}");
-            config_changed = true;
-            result.edits.push(FileEdit {
-                path: cargo_config_key.into(),
-                kind: "redirect_cargo_registry".into(),
-                action: "added".into(),
-                key: Some(reg.clone()),
-                original: None,
-                new: Some(Value::String(block)),
+        // 1. Plan the Cargo.toml pin FIRST — it is the gate for everything
+        // else. Without a manifest pin nothing forces resolution through the
+        // managed registry, so no other file may be touched for this dep.
+        let Some(toml_text) = cargo_toml.as_ref() else {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_cargo_toml_dep_not_found".into(),
+                detail: format!(
+                    "no Cargo.toml present to pin {}; dependency skipped (nothing rewritten)",
+                    dep.name
+                ),
             });
-        }
-
-        // 2. Cargo.toml dep → add `registry = "<reg>"`.
-        if let Some(toml) = cargo_toml.as_mut() {
-            match add_cargo_toml_registry(toml, &dep.name, &reg) {
-                CargoTomlRewrite::Rewritten(edit) => {
-                    result.edits.push(*edit);
-                    toml_changed = true;
-                }
-                // Re-run over an already-redirected Cargo.toml: not missing.
-                CargoTomlRewrite::AlreadyRedirected => {}
-                CargoTomlRewrite::NotFound => {
-                    result.warnings.push(RewriteWarning {
-                        code: "redirect_cargo_toml_dep_not_found".into(),
-                        detail: format!("no [dependencies] entry for {} in Cargo.toml", dep.name),
-                    });
-                }
+            continue;
+        };
+        let toml_plan = match plan_cargo_toml(toml_text, &dep.name, &reg) {
+            Ok(plan) => plan,
+            Err(CargoTomlPlanError::NotFound) => {
+                result.warnings.push(RewriteWarning {
+                    code: "redirect_cargo_toml_dep_not_found".into(),
+                    detail: format!(
+                        "no [dependencies] entry for {} in Cargo.toml; dependency skipped \
+                         (nothing rewritten)",
+                        dep.name
+                    ),
+                });
+                continue;
             }
-        }
+            Err(CargoTomlPlanError::Refused(reason)) => {
+                result.warnings.push(RewriteWarning {
+                    code: "redirect_cargo_toml_dep_unrewritable".into(),
+                    detail: format!(
+                        "{} in Cargo.toml cannot be pinned ({reason}); dependency skipped \
+                         (nothing rewritten)",
+                        dep.name
+                    ),
+                });
+                continue;
+            }
+        };
 
-        // 3. Cargo.lock [[package]] → set source + checksum.
-        if let Some(lock) = cargo_lock.as_mut() {
-            match set_cargo_lock_source(lock, &dep.name, &dep.version, index_url, &cksum) {
-                CargoLockRewrite::Rewritten(edit) => {
-                    result.edits.push(*edit);
-                    lock_changed = true;
-                }
-                // Re-run over an already-redirected lock: nothing to record.
-                CargoLockRewrite::AlreadyRedirected => {}
-                CargoLockRewrite::NotFound => {
+        // 2. Plan the Cargo.lock repoint. A lock that exists but has no
+        // [[package]] for the dep means the project does not actually resolve
+        // it — rewriting the manifest anyway would desync manifest and lock.
+        // Skip the dep entirely (discarding the manifest plan). A project
+        // with NO lockfile is fine: the manifest pin alone forces the next
+        // resolution through the managed registry, which serves the patched
+        // checksum.
+        enum LockCommit {
+            Write(String, Box<FileEdit>),
+            InPlace,
+            Absent,
+        }
+        let lock_commit = if let Some(lock_text) = cargo_lock.as_ref() {
+            match plan_cargo_lock(lock_text, &dep.name, &dep.version, index_url, &cksum) {
+                CargoLockPlan::Rewritten { content, edit } => LockCommit::Write(content, edit),
+                CargoLockPlan::AlreadyRedirected => LockCommit::InPlace,
+                CargoLockPlan::NotFound => {
                     result.warnings.push(RewriteWarning {
                         code: "redirect_cargo_lock_pkg_not_found".into(),
                         detail: format!(
-                            "no [[package]] for {}@{} in Cargo.lock",
+                            "no [[package]] for {}@{} in Cargo.lock; dependency skipped \
+                             (nothing rewritten)",
                             dep.name, dep.version
                         ),
                     });
+                    continue;
                 }
             }
+        } else {
+            LockCommit::Absent
+        };
+
+        // 3. Plan the managed `[registries.…]` block (never fails; `None`
+        // when a healthy block is already wired in).
+        let config_plan = plan_cargo_config(&cargo_config, cargo_config_key, &reg, index_url);
+
+        // COMMIT — everything planned, nothing can fail past this point, so
+        // the three files change together or not at all. Edit order matches
+        // the historical ledger order: config, manifest, lock.
+        if let Some(plan) = config_plan {
+            cargo_config = plan.content;
+            result.edits.push(plan.edit);
+            config_changed = true;
         }
+        if toml_plan.changed {
+            cargo_toml = Some(toml_plan.content);
+            result.edits.extend(toml_plan.edits);
+            toml_changed = true;
+        }
+        match lock_commit {
+            LockCommit::Write(content, edit) => {
+                cargo_lock = Some(content);
+                result.edits.push(*edit);
+                lock_changed = true;
+            }
+            LockCommit::InPlace | LockCommit::Absent => {}
+        }
+        result.confirmed_cargo_uuids.insert(dep.patch_uuid.clone());
     }
 
     if toml_changed {
@@ -528,89 +631,549 @@ fn rewrite_cargo(
     }
 }
 
-/// Outcome of the Cargo.toml dependency rewrite — a re-run over an entry that
-/// already carries OUR `registry = "socket-patch-…"` is "already redirected"
-/// (silent), not "dependency not found" (caller warns).
-enum CargoTomlRewrite {
-    Rewritten(Box<FileEdit>),
-    AlreadyRedirected,
+/// Sparse index URLs land verbatim inside quoted TOML strings in both
+/// `.cargo/config.toml` and `Cargo.lock` — refuse anything that could break
+/// out of the string (quote, backslash escape, control chars) or that is not
+/// a sparse+http(s) URL at all.
+fn is_valid_cargo_index_url(url: &str) -> bool {
+    (url.starts_with("sparse+https://") || url.starts_with("sparse+http://"))
+        && !url.contains('"')
+        && !url.contains('\\')
+        && !url.chars().any(char::is_control)
+}
+
+/// The exact shape `hex::encode(sha256)` / the TS `Buffer.toString('hex')`
+/// produce: 64 lowercase hex chars. Anything else written as a Cargo.lock
+/// `checksum` breaks the next fetch.
+fn is_hex64_lower(s: &str) -> bool {
+    s.len() == 64
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// A registry name THIS rewriter owns: `socket-patch-<canonical-uuid>`. An
+/// existing pin matching this grammar was written by a previous run and may be
+/// superseded in place; any other registry pin is the user's and is refused.
+fn is_socket_patch_registry_name(value: &str) -> bool {
+    value
+        .strip_prefix("socket-patch-")
+        .is_some_and(crate::patch::path_safety::is_canonical_uuid)
+}
+
+/// Split a TOML table-header path into dot segments, respecting quoted
+/// segments (`target.'cfg(unix)'.dependencies`). `None` on unbalanced quotes.
+fn split_toml_header_segments(inner: &str) -> Option<Vec<String>> {
+    let mut segs = Vec::new();
+    let mut cur = String::new();
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '.' => {
+                segs.push(cur.trim().to_string());
+                cur = String::new();
+            }
+            '"' | '\'' => {
+                cur.push(c);
+                let mut closed = false;
+                for c2 in chars.by_ref() {
+                    cur.push(c2);
+                    if c2 == c {
+                        closed = true;
+                        break;
+                    }
+                }
+                if !closed {
+                    return None;
+                }
+            }
+            _ => cur.push(c),
+        }
+    }
+    segs.push(cur.trim().to_string());
+    Some(segs)
+}
+
+fn strip_toml_key_quotes(s: &str) -> String {
+    let b = s.as_bytes();
+    if b.len() >= 2 && (b[0] == b'"' || b[0] == b'\'') && b[b.len() - 1] == b[0] {
+        s[1..s.len() - 1].to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum CargoTomlSection {
+    /// `[dependencies]` & friends (dev/build/target-specific) plus
+    /// `[workspace.dependencies]` — entries are `key = value` lines.
+    DepTable { workspace: bool },
+    /// The multi-line table form `[dependencies.<key>]` (all variants).
+    DepEntry { key: String, workspace: bool },
+    Other,
+}
+
+fn is_cargo_dep_kind(seg: &str) -> bool {
+    matches!(
+        seg,
+        "dependencies" | "dev-dependencies" | "build-dependencies"
+    )
+}
+
+fn classify_cargo_section(header_inner: &str) -> CargoTomlSection {
+    let Some(segs) = split_toml_header_segments(header_inner) else {
+        return CargoTomlSection::Other;
+    };
+    let s: Vec<&str> = segs.iter().map(String::as_str).collect();
+    match s.as_slice() {
+        [k] if is_cargo_dep_kind(k) => CargoTomlSection::DepTable { workspace: false },
+        ["workspace", "dependencies"] => CargoTomlSection::DepTable { workspace: true },
+        [k, key] if is_cargo_dep_kind(k) => CargoTomlSection::DepEntry {
+            key: strip_toml_key_quotes(key),
+            workspace: false,
+        },
+        ["workspace", "dependencies", key] => CargoTomlSection::DepEntry {
+            key: strip_toml_key_quotes(key),
+            workspace: true,
+        },
+        ["target", .., k] if is_cargo_dep_kind(k) => CargoTomlSection::DepTable { workspace: false },
+        ["target", mid @ .., key] if mid.len() >= 2 && is_cargo_dep_kind(mid[mid.len() - 1]) => {
+            CargoTomlSection::DepEntry {
+                key: strip_toml_key_quotes(key),
+                workspace: false,
+            }
+        }
+        _ => CargoTomlSection::Other,
+    }
+}
+
+/// Parse the key at the start of a table-entry line: bare (`[A-Za-z0-9_-]+`)
+/// or single/double quoted. Returns `(key, rest-after-key)`.
+fn parse_cargo_entry_key(line: &str) -> Option<(String, &str)> {
+    let b = line.as_bytes();
+    match b.first()? {
+        b'"' | b'\'' => {
+            let quote = b[0] as char;
+            let end = line[1..].find(quote)? + 1;
+            Some((line[1..end].to_string(), &line[end + 1..]))
+        }
+        _ => {
+            let end = line
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+                .unwrap_or(line.len());
+            if end == 0 {
+                return None;
+            }
+            Some((line[..end].to_string(), &line[end..]))
+        }
+    }
+}
+
+struct CargoTomlPlan {
+    content: String,
+    edits: Vec<FileEdit>,
+    /// `false` when every occurrence already carried our registry (idempotent
+    /// re-run) — the pin is in place, nothing to write.
+    changed: bool,
+}
+
+enum CargoTomlPlanError {
+    /// The crate is not declared anywhere in this manifest (rename-aware:
+    /// a key that matches but has `package = "<other>"` is NOT the crate).
     NotFound,
+    /// At least one occurrence exists that cannot be pinned to the managed
+    /// registry — the whole dep must be skipped.
+    Refused(String),
 }
 
-fn add_cargo_toml_registry(content: &mut String, crate_name: &str, reg: &str) -> CargoTomlRewrite {
-    let c = regex::escape(crate_name);
-    // Inline table: `crate = { version = "…", … }`.
-    let table_re = Regex::new(&format!(r"(?m)^({c}\s*=\s*\{{)([^}}\n]*)(\}})")).unwrap();
-    if let Some(m) = table_re.captures(content) {
-        let inner = m.get(2).unwrap().as_str();
-        if Regex::new(&format!(r#"\bregistry\s*=\s*"{}""#, regex::escape(reg)))
-            .unwrap()
-            .is_match(inner)
-        {
-            return CargoTomlRewrite::AlreadyRedirected;
+/// How one occurrence of the dep will be handled.
+enum CargoTomlAction {
+    /// `key = "1.0"` → `key = { version = "1.0", registry = "<reg>" }`.
+    ReplaceLine { idx: usize, new_text: String },
+    /// `[dependencies.key]` table gains a `registry = "<reg>"` line after the
+    /// header (recorded as a rewrite of the header line so revert-by-string
+    /// replacement restores it).
+    InsertAfterHeader { idx: usize, inserted: String },
+    /// Already pinned to our registry — nothing to write.
+    Already,
+    /// `key.workspace = true` / `{ workspace = true }`: satisfied by the
+    /// `[workspace.dependencies]` pin in this same manifest.
+    InheritsWorkspace,
+}
+
+/// Plan the full-manifest pin: EVERY occurrence of `crate_name` across every
+/// dependency table gains `registry = "<reg>"`, an existing
+/// `socket-patch-<uuid>` pin is superseded in place, and any occurrence that
+/// cannot be handled refuses the whole dep. Nothing is applied unless every
+/// occurrence resolves.
+fn plan_cargo_toml(
+    content: &str,
+    crate_name: &str,
+    reg: &str,
+) -> Result<CargoTomlPlan, CargoTomlPlanError> {
+    let lines: Vec<&str> = content.split('\n').collect();
+    let header_re = Regex::new(r"^\[([^\]]+)\]\s*(?:#.*)?$").unwrap();
+    let package_re = Regex::new(r#"\bpackage\s*=\s*"([^"]*)""#).unwrap();
+    let registry_val_re = Regex::new(r#"\bregistry\s*=\s*"([^"]*)""#).unwrap();
+    let registry_key_re = Regex::new(r"\bregistry\s*=").unwrap();
+    let registry_index_re = Regex::new(r"\bregistry-index\s*=").unwrap();
+    let workspace_key_re = Regex::new(r"\bworkspace\s*=").unwrap();
+    let path_git_re = Regex::new(r"\b(?:path|git)\s*=").unwrap();
+
+    // A pending occurrence: what was found, resolved to an action in pass 2
+    // (workspace-inheriting entries need the whole file scanned first).
+    enum Pending {
+        Action(CargoTomlAction),
+        NeedsWorkspacePin,
+        Refuse(String),
+    }
+    let mut pending: Vec<Pending> = Vec::new();
+    // Whether the `[workspace.dependencies]` entry for the crate lands (or
+    // already carries) the pin — satisfies `workspace = true` inheritors.
+    let mut workspace_pinned = false;
+
+    let mut section = CargoTomlSection::Other;
+    for (idx, raw) in lines.iter().enumerate() {
+        let trimmed = raw.trim_start();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
         }
-        if Regex::new(r"\bregistry\s*=").unwrap().is_match(inner) {
-            // Pinned to some OTHER registry — leave it alone; the caller's
-            // warning surfaces that the redirect did not land.
-            return CargoTomlRewrite::NotFound;
+        if trimmed.starts_with('[') && !trimmed.starts_with("[[") {
+            section = match header_re.captures(trimmed) {
+                Some(c) => classify_cargo_section(c.get(1).unwrap().as_str()),
+                None => CargoTomlSection::Other,
+            };
+            if let CargoTomlSection::DepEntry { key, workspace } = section.clone() {
+                let ws = workspace;
+                // Table form: examine the whole block now.
+                let mut end = lines.len();
+                for (j, l) in lines.iter().enumerate().skip(idx + 1) {
+                    if l.trim_start().starts_with('[') {
+                        end = j;
+                        break;
+                    }
+                }
+                let block: Vec<(usize, &str)> = (idx + 1..end)
+                    .map(|j| (j, lines[j].trim_start()))
+                    .filter(|(_, t)| !t.is_empty() && !t.starts_with('#'))
+                    .collect();
+                let find_value = |key_name: &str| -> Option<(usize, String)> {
+                    for (j, t) in &block {
+                        if let Some((k, rest)) = parse_cargo_entry_key(t) {
+                            if k == key_name {
+                                let rest = rest.trim_start();
+                                if let Some(v) = rest.strip_prefix('=') {
+                                    let v = v.trim();
+                                    let v = v
+                                        .strip_prefix('"')
+                                        .and_then(|s| s.split('"').next())
+                                        .unwrap_or(v);
+                                    return Some((*j, v.to_string()));
+                                }
+                            }
+                        }
+                    }
+                    None
+                };
+                let package_val = find_value("package").map(|(_, v)| v);
+                let is_ours = match &package_val {
+                    Some(p) => p == crate_name,
+                    None => key == crate_name,
+                };
+                if !is_ours {
+                    continue;
+                }
+                let has = |name: &str| {
+                    block.iter().any(|(_, t)| {
+                        parse_cargo_entry_key(t).is_some_and(|(k, rest)| {
+                            k == name && rest.trim_start().starts_with('=')
+                        })
+                    })
+                };
+                if has("workspace") {
+                    pending.push(Pending::NeedsWorkspacePin);
+                } else if has("path") || has("git") {
+                    pending.push(Pending::Refuse(
+                        "declared as a path/git dependency".to_string(),
+                    ));
+                } else if has("registry-index") {
+                    // Inserting `registry = …` next to `registry-index` makes
+                    // cargo reject the manifest as ambiguous — refuse, like
+                    // the inline-table branch does.
+                    pending.push(Pending::Refuse(
+                        "pinned to another registry".to_string(),
+                    ));
+                } else if let Some((line_idx, value)) = find_value("registry") {
+                    if value == reg {
+                        pending.push(Pending::Action(CargoTomlAction::Already));
+                        if ws {
+                            workspace_pinned = true;
+                        }
+                    } else if is_socket_patch_registry_name(&value) {
+                        let old_line = lines[line_idx];
+                        let new_text = registry_val_re
+                            .replace(old_line, format!("registry = \"{reg}\"").as_str())
+                            .into_owned();
+                        pending.push(Pending::Action(CargoTomlAction::ReplaceLine {
+                            idx: line_idx,
+                            new_text,
+                        }));
+                        if ws {
+                            workspace_pinned = true;
+                        }
+                    } else {
+                        pending.push(Pending::Refuse(format!(
+                            "pinned to another registry (\"{value}\")"
+                        )));
+                    }
+                } else {
+                    let indent = &raw[..raw.len() - trimmed.len()];
+                    pending.push(Pending::Action(CargoTomlAction::InsertAfterHeader {
+                        idx,
+                        inserted: format!("{indent}registry = \"{reg}\""),
+                    }));
+                    if ws {
+                        workspace_pinned = true;
+                    }
+                }
+            }
+            continue;
         }
-        let whole = m.get(0).unwrap().as_str().to_string();
-        let inner_trim = inner.trim_end();
-        let sep = if inner_trim.trim().ends_with(',') || inner_trim.trim().is_empty() {
-            ""
-        } else {
-            ","
+        let CargoTomlSection::DepTable { workspace } = section else {
+            continue;
         };
-        let rebuilt = format!(
-            "{}{inner_trim}{sep} registry = \"{reg}\" {}",
-            m.get(1).unwrap().as_str(),
-            m.get(3).unwrap().as_str()
-        );
-        *content = content.replacen(&whole, &rebuilt, 1);
-        return CargoTomlRewrite::Rewritten(Box::new(FileEdit {
-            path: "Cargo.toml".into(),
-            kind: "redirect_cargo_toml_dep".into(),
-            action: "rewritten".into(),
-            key: Some(crate_name.into()),
-            original: Some(Value::String(whole)),
-            new: Some(Value::String(rebuilt)),
-        }));
+        let Some((key, rest)) = parse_cargo_entry_key(trimmed) else {
+            continue;
+        };
+        let rest_trim = rest.trim_start();
+        if let Some(dotted) = rest_trim.strip_prefix('.') {
+            // Dotted entry (`serde.workspace = true`, `serde.version = "1"`,
+            // `alias.package = "serde"`, …).
+            let sub = parse_cargo_entry_key(dotted).map(|(k, _)| k);
+            if key == crate_name {
+                if sub.as_deref() == Some("workspace") {
+                    pending.push(Pending::NeedsWorkspacePin);
+                } else {
+                    pending.push(Pending::Refuse(
+                        "declared with dotted keys this rewriter does not edit".to_string(),
+                    ));
+                }
+            } else if sub.as_deref() == Some("package")
+                && package_re
+                    .captures(trimmed)
+                    .is_some_and(|c| &c[1] == crate_name)
+            {
+                pending.push(Pending::Refuse(
+                    "declared with dotted keys this rewriter does not edit".to_string(),
+                ));
+            }
+            continue;
+        }
+        let Some(value) = rest_trim.strip_prefix('=') else {
+            continue;
+        };
+        let value = value.trim_start();
+        if value.starts_with('{') {
+            // Inline table. Rename-aware: `package = "<other>"` under our key
+            // means this entry is NOT the patched crate; `package =
+            // "<crate>"` under any key means it IS.
+            let Some(close) = value.find('}') else {
+                if key == crate_name {
+                    pending.push(Pending::Refuse(
+                        "inline table does not close on its line".to_string(),
+                    ));
+                }
+                continue;
+            };
+            let inner = &value[1..close];
+            let package_val = package_re.captures(inner).map(|c| c[1].to_string());
+            let is_ours = match &package_val {
+                Some(p) => p == crate_name,
+                None => key == crate_name,
+            };
+            if !is_ours {
+                continue;
+            }
+            if workspace_key_re.is_match(inner) {
+                pending.push(Pending::NeedsWorkspacePin);
+            } else if path_git_re.is_match(inner) {
+                pending.push(Pending::Refuse(
+                    "declared as a path/git dependency".to_string(),
+                ));
+            } else if let Some(c) = registry_val_re.captures(inner) {
+                let value = c[1].to_string();
+                if value == reg {
+                    pending.push(Pending::Action(CargoTomlAction::Already));
+                    if workspace {
+                        workspace_pinned = true;
+                    }
+                } else if is_socket_patch_registry_name(&value) {
+                    let new_text = registry_val_re
+                        .replace(raw, format!("registry = \"{reg}\"").as_str())
+                        .into_owned();
+                    pending.push(Pending::Action(CargoTomlAction::ReplaceLine { idx, new_text }));
+                    if workspace {
+                        workspace_pinned = true;
+                    }
+                } else {
+                    pending.push(Pending::Refuse(format!(
+                        "pinned to another registry (\"{value}\")"
+                    )));
+                }
+            } else if registry_key_re.is_match(inner) || registry_index_re.is_match(inner) {
+                pending.push(Pending::Refuse(
+                    "pinned to another registry".to_string(),
+                ));
+            } else {
+                // Rebuild the line: everything through `{`, the trimmed
+                // inner, the registry pin, then `}` + any trailing bytes
+                // (e.g. a comment). First `{`/`}` in the raw line are the
+                // inline table's — keys and indents cannot contain braces.
+                let inner_trim = inner.trim_end();
+                let sep = if inner_trim.trim().ends_with(',') || inner_trim.trim().is_empty() {
+                    ""
+                } else {
+                    ","
+                };
+                let brace = raw.find('{').unwrap_or_default();
+                let close_raw = raw[brace..].find('}').unwrap_or_default() + brace;
+                let new_text = format!(
+                    "{}{inner_trim}{sep} registry = \"{reg}\" {}",
+                    &raw[..=brace],
+                    &raw[close_raw..]
+                );
+                pending.push(Pending::Action(CargoTomlAction::ReplaceLine { idx, new_text }));
+                if workspace {
+                    workspace_pinned = true;
+                }
+            }
+        } else if value.starts_with('"') {
+            if key != crate_name {
+                continue;
+            }
+            // Plain version: `crate = "1.0"` (+ optional trailing comment).
+            // The rewrite is line-scoped, so the trailing newline / blank
+            // line after the entry is untouched (the old `\s*$` regex
+            // swallowed it).
+            let c = regex::escape(crate_name);
+            let line_re =
+                Regex::new(&format!(r#"^(\s*(?:{c}|"{c}")\s*=\s*)"([^"]+)"([ \t]*(?:#.*)?)$"#))
+                    .unwrap();
+            let Some(m) = line_re.captures(raw) else {
+                pending.push(Pending::Refuse(
+                    "unsupported version-entry spelling".to_string(),
+                ));
+                continue;
+            };
+            let new_text = format!(
+                "{}{{ version = \"{}\", registry = \"{reg}\" }}{}",
+                m.get(1).unwrap().as_str(),
+                m.get(2).unwrap().as_str(),
+                m.get(3).unwrap().as_str()
+            );
+            pending.push(Pending::Action(CargoTomlAction::ReplaceLine { idx, new_text }));
+            if workspace {
+                workspace_pinned = true;
+            }
+        } else if key == crate_name {
+            pending.push(Pending::Refuse(
+                "unsupported dependency-entry spelling".to_string(),
+            ));
+        }
     }
-    // Plain version: `crate = "1.0"`.
-    let ver_re = Regex::new(&format!(r#"(?m)^({c}\s*=\s*)"([^"]+)"\s*$"#)).unwrap();
-    if let Some(m) = ver_re.captures(content) {
-        let whole = m.get(0).unwrap().as_str().to_string();
-        let rebuilt = format!(
-            "{}{{ version = \"{}\", registry = \"{reg}\" }}",
-            m.get(1).unwrap().as_str(),
-            m.get(2).unwrap().as_str()
-        );
-        *content = content.replacen(&whole, &rebuilt, 1);
-        return CargoTomlRewrite::Rewritten(Box::new(FileEdit {
-            path: "Cargo.toml".into(),
-            kind: "redirect_cargo_toml_dep".into(),
-            action: "rewritten".into(),
-            key: Some(crate_name.into()),
-            original: Some(Value::String(whole)),
-            new: Some(Value::String(rebuilt)),
-        }));
+
+    if pending.is_empty() {
+        return Err(CargoTomlPlanError::NotFound);
     }
-    CargoTomlRewrite::NotFound
+    // Resolve: any refusal (including an unsatisfiable `workspace = true`
+    // inheritor) refuses the WHOLE dep — no partial pin is ever applied.
+    let mut actions: Vec<CargoTomlAction> = Vec::new();
+    for p in pending {
+        match p {
+            Pending::Action(a) => actions.push(a),
+            Pending::NeedsWorkspacePin => {
+                if workspace_pinned {
+                    actions.push(CargoTomlAction::InheritsWorkspace);
+                } else {
+                    return Err(CargoTomlPlanError::Refused(
+                        "inherits from [workspace.dependencies] with no rewritable entry \
+                         in this manifest"
+                            .to_string(),
+                    ));
+                }
+            }
+            Pending::Refuse(reason) => return Err(CargoTomlPlanError::Refused(reason)),
+        }
+    }
+
+    // Apply bottom-up so line indices stay valid; record edits top-down.
+    let mut new_lines: Vec<String> = lines.iter().map(|s| s.to_string()).collect();
+    let mut edits: Vec<FileEdit> = Vec::new();
+    let mut writes: Vec<(usize, &CargoTomlAction)> = actions
+        .iter()
+        .filter_map(|a| match a {
+            CargoTomlAction::ReplaceLine { idx, .. } => Some((*idx, a)),
+            CargoTomlAction::InsertAfterHeader { idx, .. } => Some((*idx, a)),
+            CargoTomlAction::Already | CargoTomlAction::InheritsWorkspace => None,
+        })
+        .collect();
+    writes.sort_by_key(|(idx, _)| *idx);
+    for (idx, action) in &writes {
+        match action {
+            CargoTomlAction::ReplaceLine { new_text, .. } => {
+                edits.push(FileEdit {
+                    path: "Cargo.toml".into(),
+                    kind: "redirect_cargo_toml_dep".into(),
+                    action: "rewritten".into(),
+                    key: Some(crate_name.into()),
+                    original: Some(Value::String(lines[*idx].to_string())),
+                    new: Some(Value::String(new_text.clone())),
+                });
+            }
+            CargoTomlAction::InsertAfterHeader { inserted, .. } => {
+                edits.push(FileEdit {
+                    path: "Cargo.toml".into(),
+                    kind: "redirect_cargo_toml_dep".into(),
+                    action: "rewritten".into(),
+                    key: Some(crate_name.into()),
+                    original: Some(Value::String(lines[*idx].to_string())),
+                    new: Some(Value::String(format!("{}\n{inserted}", lines[*idx]))),
+                });
+            }
+            CargoTomlAction::Already | CargoTomlAction::InheritsWorkspace => {}
+        }
+    }
+    for (idx, action) in writes.iter().rev() {
+        match action {
+            CargoTomlAction::ReplaceLine { new_text, .. } => {
+                new_lines[*idx] = new_text.clone();
+            }
+            CargoTomlAction::InsertAfterHeader { inserted, .. } => {
+                new_lines.insert(idx + 1, inserted.clone());
+            }
+            CargoTomlAction::Already | CargoTomlAction::InheritsWorkspace => {}
+        }
+    }
+    let changed = !edits.is_empty();
+    Ok(CargoTomlPlan {
+        content: new_lines.join("\n"),
+        edits,
+        changed,
+    })
 }
 
-fn set_cargo_lock_source(
-    content: &mut String,
+fn plan_cargo_lock(
+    content: &str,
     crate_name: &str,
     version: &str,
     index_url: &str,
     cksum: &str,
-) -> CargoLockRewrite {
+) -> CargoLockPlan {
     // Rust's regex has NO lookahead, so bound the [[package]] block by string
     // search: from its header to the next `\n[[package]]` (or EOF), so the
     // trailing bytes after the block (incl. the final newline) are preserved.
     let head = format!("[[package]]\nname = \"{crate_name}\"\nversion = \"{version}\"\n");
     let Some(block_start) = content.find(&head) else {
-        return CargoLockRewrite::NotFound;
+        return CargoLockPlan::NotFound;
     };
     let body_start = block_start + head.len();
     let mut block_end = match content[body_start..].find("\n[[package]]") {
@@ -649,26 +1212,105 @@ fn set_cargo_lock_source(
     // Already redirected (re-run): the block is at the target values; a
     // recorded edit would have original == new and grow the ledger forever.
     if rebuilt == original {
-        return CargoLockRewrite::AlreadyRedirected;
+        return CargoLockPlan::AlreadyRedirected;
     }
-    *content = content.replacen(&original, &rebuilt, 1);
-    CargoLockRewrite::Rewritten(Box::new(FileEdit {
-        path: "Cargo.lock".into(),
-        kind: "redirect_cargo_lock_entry".into(),
-        action: "rewritten".into(),
-        key: Some(format!("{crate_name}@{version}")),
-        original: Some(Value::String(original)),
-        new: Some(Value::String(rebuilt)),
-    }))
+    let new_content = content.replacen(&original, &rebuilt, 1);
+    CargoLockPlan::Rewritten {
+        content: new_content,
+        edit: Box::new(FileEdit {
+            path: "Cargo.lock".into(),
+            kind: "redirect_cargo_lock_entry".into(),
+            action: "rewritten".into(),
+            key: Some(format!("{crate_name}@{version}")),
+            original: Some(Value::String(original)),
+            new: Some(Value::String(rebuilt)),
+        }),
+    }
 }
 
-/// Outcome of the Cargo.lock `[[package]]` rewrite — distinguishes a re-run
+/// Outcome of the Cargo.lock `[[package]]` plan — distinguishes a re-run
 /// over an already-redirected block (no edit, no warning) from a genuinely
-/// missing package (caller warns).
-enum CargoLockRewrite {
-    Rewritten(Box<FileEdit>),
+/// missing package (the caller warns AND skips the dep entirely).
+enum CargoLockPlan {
+    Rewritten { content: String, edit: Box<FileEdit> },
     AlreadyRedirected,
     NotFound,
+}
+
+struct CargoConfigPlan {
+    content: String,
+    edit: FileEdit,
+}
+
+/// Plan the managed `[registries.socket-patch-<uuid>]` block. `None` when a
+/// HEALTHY block is already wired in — an uncommented header with an
+/// uncommented `index = "<index_url>"` line. Comments never satisfy the
+/// check: a user who commented the managed block out gets it restored on the
+/// next run (the old substring test matched the commented text, reported
+/// success, and left `registry = "socket-patch-…"` in Cargo.toml naming an
+/// undefined registry). A degraded block (missing/stale index line) is
+/// regenerated in place — it is ours, the header grammar proves it.
+fn plan_cargo_config(
+    config: &str,
+    config_key: &str,
+    reg: &str,
+    index_url: &str,
+) -> Option<CargoConfigPlan> {
+    let header = format!("[registries.{reg}]");
+    let index_line = format!("index = \"{index_url}\"");
+    let lines: Vec<&str> = config.split('\n').collect();
+    let header_idx = lines.iter().position(|l| l.trim() == header);
+    if let Some(i) = header_idx {
+        let mut end = lines.len();
+        for (j, l) in lines.iter().enumerate().skip(i + 1) {
+            if l.trim_start().starts_with('[') {
+                end = j;
+                break;
+            }
+        }
+        // Keep trailing blank separator lines out of the managed region.
+        while end > i + 1 && lines[end - 1].trim().is_empty() {
+            end -= 1;
+        }
+        let healthy = lines[i + 1..end].iter().any(|l| l.trim() == index_line);
+        if healthy {
+            return None;
+        }
+        let original_region = lines[i..end].join("\n");
+        let replacement = format!("{header}\n{index_line}");
+        let mut new_lines: Vec<String> = lines.iter().map(|s| s.to_string()).collect();
+        new_lines.splice(i..end, [header.clone(), index_line.clone()]);
+        return Some(CargoConfigPlan {
+            content: new_lines.join("\n"),
+            edit: FileEdit {
+                path: config_key.into(),
+                kind: "redirect_cargo_registry".into(),
+                action: "rewritten".into(),
+                key: Some(reg.to_string()),
+                original: Some(Value::String(original_region)),
+                new: Some(Value::String(replacement)),
+            },
+        });
+    }
+    // Absent (or surviving only in comments): append a fresh block.
+    let block = format!("{header}\n{index_line}\n");
+    let sep = if !config.is_empty() && !config.ends_with('\n') {
+        "\n"
+    } else {
+        ""
+    };
+    let prefix = if config.is_empty() { "" } else { "\n" };
+    Some(CargoConfigPlan {
+        content: format!("{config}{sep}{prefix}{block}"),
+        edit: FileEdit {
+            path: config_key.into(),
+            kind: "redirect_cargo_registry".into(),
+            action: "added".into(),
+            key: Some(reg.to_string()),
+            original: None,
+            new: Some(Value::String(block)),
+        },
+    })
 }
 
 // ── pnpm-lock.yaml ───────────────────────────────────────────────────────────
@@ -728,6 +1370,47 @@ fn rewrite_pnpm_lock(
         // that begin with `@` (`'@scope/name@1.0.0':` — YAML forbids a plain
         // scalar starting with `@`); v6 keys start with `/` and are unquoted.
         let key = regex::escape(&fname) + "@" + &regex::escape(&dep.version);
+        // Legacy pnpm lock grammars this rewriter cannot repoint: lockfile-
+        // Version 6 embeds resolved peers in the `packages:` key itself
+        // (`/name@1.0.0(peer@2.0.0):`) and v5.x separates the version with a
+        // slash (`/name/1.0.0:`, peers suffixed `_peer@2.0.0`). Both carry
+        // their own `resolution:` block the pattern below never matches.
+        // Rewriting AROUND them is fail-open: a v6 lock holding both
+        // `/pkg@1.0.0:` and `/pkg@1.0.0(peer@2.0.0):` would get the plain
+        // entry rewritten — confirming and attesting the dep — while every
+        // dependent resolving through the peered entry still installs the
+        // unpatched upstream tarball. So when ANY such key exists for this
+        // dep in ANY lock, refuse the dep outright (no rewrite anywhere),
+        // naming the unmatched keys. v9 is unaffected: its peer-suffixed
+        // `snapshots:` keys never start with `/` (and carry no resolution).
+        let legacy_pat = String::from(r"(?m)^ {2}(/")
+            + &key
+            + r"\([^:\n]*|/"
+            + &regex::escape(&fname)
+            + "/"
+            + &regex::escape(&dep.version)
+            + r"(?:[_(][^:\n]*)?):";
+        let legacy_re = Regex::new(&legacy_pat).unwrap();
+        let mut legacy_keys: Vec<String> = Vec::new();
+        for (lock_key, content, _) in &contents {
+            for caps in legacy_re.captures_iter(content) {
+                legacy_keys.push(format!("{} in {lock_key}", &caps[1]));
+            }
+        }
+        if !legacy_keys.is_empty() {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_pnpm_unsupported_lock_key".into(),
+                detail: format!(
+                    "{fname}@{} resolves through pnpm v5/v6 lock key(s) the \
+                     redirect grammar cannot repoint: {}; left unredirected — \
+                     regenerate the lock with pnpm >=9 (lockfileVersion 9) \
+                     and re-run",
+                    dep.version,
+                    legacy_keys.join(", ")
+                ),
+            });
+            continue;
+        }
         let pat = String::from(r"(?m)(^ {2}(?:'")
             + &key
             + r"'|/?"
@@ -1923,6 +2606,61 @@ fn gem_tail_source_option(tail: &str) -> Option<&'static str> {
     .find(|tok| code.contains(tok))
 }
 
+/// A dep's Socket index URL as a regex source with the per-request rotating
+/// segments (grant token, patch uuid) wildcarded — an exact-URL pattern
+/// misses the URL a previous run wrote under an older grant.
+fn gem_index_url_pattern(dep: &DepOverride, index_url: &str) -> String {
+    let mut url_pat = regex::escape(index_url);
+    for rotating in [&dep.token, &dep.patch_uuid] {
+        if !rotating.is_empty() {
+            url_pat = url_pat.replace(&regex::escape(&format!("/{rotating}/")), "/[^/\"]+/");
+        }
+    }
+    url_pat
+}
+
+/// A gemfile spelling with the redirect's own footprint erased: every managed
+/// Socket `source "…" do … end` block for a redirected dep (rotating grant
+/// segments wildcarded) and the dep's own `gem` declaration line. The
+/// gems.rb/Gemfile divergence guard compares these residues rather than raw
+/// bytes: run 1 on byte-identical twins edits only gems.rb (the file bundler
+/// reads), so a raw comparison would trap every later run — the rotated-grant
+/// URL refresh included — behind `redirect_gem_gemfile_spellings_diverge`, a
+/// divergence the rewriter itself created. Trailing whitespace is trimmed (a
+/// block appended to a newline-less file adds a final newline the other
+/// spelling never had). `\r?` mirrors the block recognizer in `rewrite_gem`:
+/// a `core.autocrlf` checkout rewrites run 1's LF block to CRLF, and a block
+/// the recognizer accepts must also be erased here or the re-run is trapped
+/// behind the divergence warning before it can reach the recognizer.
+fn gem_spelling_residue(content: &str, deps: &[&DepOverride]) -> String {
+    let mut residue = content.to_string();
+    for dep in deps {
+        let Some(ov) = &dep.registry_override else {
+            continue;
+        };
+        if ov.kind != "rubygems-compact-index" {
+            continue;
+        }
+        let block_re = Regex::new(
+            &(String::from(r#"(?m)^source ""#)
+                + &gem_index_url_pattern(dep, &ov.index_url)
+                + r#"" do\r?\n  gem ["']"#
+                + &regex::escape(&dep.name)
+                + r#"["'][^\n]*\nend\r?\n?"#),
+        )
+        .unwrap();
+        residue = block_re.replace_all(&residue, "").into_owned();
+        let decl_re = Regex::new(
+            &(String::from(r#"(?m)^[ \t]*gem\b[^\n]*["']"#)
+                + &regex::escape(&dep.name)
+                + r#"["'][^\n]*\n?"#),
+        )
+        .unwrap();
+        residue = decl_re.replace_all(&residue, "").into_owned();
+    }
+    residue.trim_end().to_string()
+}
+
 fn rewrite_gem(
     files: &BTreeMap<String, String>,
     overrides: &[DepOverride],
@@ -1932,12 +2670,49 @@ fn rewrite_gem(
     if gem.is_empty() {
         return;
     }
-    let mut gemfile = files.get("Gemfile").cloned();
+    // Bundler's modern manifest spelling: `gems.rb`/`gems.locked` wins over
+    // `Gemfile`/`Gemfile.lock` when both sit in one directory (bundler's
+    // `default_gemfile` tries gems.rb first — verified on bundler 4.0.15,
+    // which warns "Multiple gemfiles (gems.rb and Gemfile) detected ...
+    // bundler is ignoring them in favor of gems.rb and gems.locked"; same
+    // order as `setup::gem::discover_bundler_project`). DIVERGING spellings
+    // are ambiguous — the redirect would land in the file bundler reads while
+    // tooling pinned to the other keeps resolving upstream — so fail closed
+    // on the whole gem set. Divergence is judged on the redirect-footprint
+    // residue (`gem_spelling_residue`), NOT raw bytes: run 1 on identical
+    // twins edits only gems.rb (following bundler), so a raw comparison would
+    // trap every later run behind the divergence the rewriter itself created.
+    // Identical spellings follow bundler: edit gems.rb.
+    let modern = files.contains_key("gems.rb");
+    if modern
+        && files.get("Gemfile").is_some_and(|c| {
+            gem_spelling_residue(&files["gems.rb"], &gem) != gem_spelling_residue(c, &gem)
+        })
+    {
+        result.warnings.push(RewriteWarning {
+            code: "redirect_gem_gemfile_spellings_diverge".into(),
+            detail: "both gems.rb and Gemfile are present with different contents; bundler \
+                     reads gems.rb but the redirect cannot safely pick one — reconcile the \
+                     two spellings and re-run"
+                .into(),
+        });
+        return;
+    }
+    let (gemfile_name, lock_name) = if modern {
+        ("gems.rb", "gems.locked")
+    } else {
+        ("Gemfile", "Gemfile.lock")
+    };
+    let mut gemfile = files.get(gemfile_name).cloned();
     let mut gemfile_changed = false;
-    let mut lock = files.get("Gemfile.lock").cloned();
+    let mut lock = files.get(lock_name).cloned();
     let mut lock_changed = false;
     // Static regex — compile once, not per-dependency (clippy: regex-in-loop).
-    let checksums_re = Regex::new(r"(?m)^CHECKSUMS$").unwrap();
+    // `\r?` throughout the lock handling: a CRLF Gemfile.lock is legal to
+    // bundler (verified: `bundle check`/frozen install both accept one on
+    // 4.0.15), and without the tolerance the CHECKSUMS header never matched,
+    // misdiagnosing the lock as bundler <2.6.
+    let checksums_re = Regex::new(r"(?m)^CHECKSUMS(\r?)$").unwrap();
 
     for dep in &gem {
         let Some(ov) = &dep.registry_override else {
@@ -1982,7 +2757,7 @@ fn rewrite_gem(
                 result.warnings.push(RewriteWarning {
                     code: "redirect_gem_platform_unsupported".into(),
                     detail: format!(
-                        "Gemfile.lock CHECKSUMS carries platform-specific entries for {} {} — \
+                        "{lock_name} CHECKSUMS carries platform-specific entries for {} {} — \
                          the patch registry serves only the ruby platform gem; redirect skipped",
                         dep.name, dep.version
                     ),
@@ -2001,13 +2776,7 @@ fn rewrite_gem(
             // run would wrap the gem line inside it — nesting source blocks.
             // Wildcard the rotating segments instead (mirrors the CHECKSUMS
             // at-target guard below).
-            let mut url_pat = regex::escape(&ov.index_url);
-            for rotating in [&dep.token, &dep.patch_uuid] {
-                if !rotating.is_empty() {
-                    url_pat =
-                        url_pat.replace(&regex::escape(&format!("/{rotating}/")), "/[^/\"]+/");
-                }
-            }
+            let url_pat = gem_index_url_pattern(dep, &ov.index_url);
             // `\r?\n`: the rewriter emits LF, but a `core.autocrlf` checkout
             // rewrites the working tree to CRLF — the guard must still
             // recognize the block there, or the indented `gem` line inside
@@ -2030,7 +2799,7 @@ fn rewrite_gem(
                     gf.replace_range(range, &ov.index_url);
                     gemfile_changed = true;
                     result.edits.push(FileEdit {
-                        path: "Gemfile".into(),
+                        path: gemfile_name.into(),
                         kind: "redirect_gemfile_source_url".into(),
                         action: "rewritten".into(),
                         key: Some(dep.name.clone()),
@@ -2122,7 +2891,7 @@ fn rewrite_gem(
                     gf.replace_range(range, &block);
                     gemfile_changed = true;
                     result.edits.push(FileEdit {
-                        path: "Gemfile".into(),
+                        path: gemfile_name.into(),
                         kind: "redirect_gemfile_source_block".into(),
                         action: "rewritten".into(),
                         key: Some(dep.name.clone()),
@@ -2150,7 +2919,7 @@ fn rewrite_gem(
                     *gf = format!("{gf}{sep}{block}\n");
                     gemfile_changed = true;
                     result.edits.push(FileEdit {
-                        path: "Gemfile".into(),
+                        path: gemfile_name.into(),
                         kind: "redirect_gemfile_source_block".into(),
                         action: "added".into(),
                         key: Some(dep.name.clone()),
@@ -2171,7 +2940,8 @@ fn rewrite_gem(
                 result.warnings.push(RewriteWarning {
                     code: "redirect_gem_lock_without_source".into(),
                     detail: format!(
-                        "no Gemfile source redirect is in place for {} — CHECKSUMS pin skipped",
+                        "no {gemfile_name} source redirect is in place for {} — CHECKSUMS pin \
+                         skipped",
                         dep.name
                     ),
                 });
@@ -2182,13 +2952,16 @@ fn rewrite_gem(
                     + &regex::escape(&dep.name)
                     + r" \("
                     + &regex::escape(&dep.version)
-                    + r"\)) sha256=([0-9a-f]+)$"),
+                    + r"\)) sha256=([0-9a-f]+)(\r?)$"),
             )
             .unwrap();
             let new_val = format!("{} ({}) sha256={sha256}", dep.name, dep.version);
             // Already redirected (re-run): the CHECKSUMS line is at the
             // target value; recording an edit would grow the ledger forever.
-            if lk.contains(&format!("\n  {new_val}\n")) || lk.ends_with(&format!("\n  {new_val}")) {
+            let already_re =
+                Regex::new(&(String::from(r"(?m)^  ") + &regex::escape(&new_val) + r"\r?$"))
+                    .unwrap();
+            if already_re.is_match(lk) {
                 // no-op
             } else if let Some(m) = sum_line_re.captures(lk) {
                 // The pre-edit line goes into the ledger as `original` so a
@@ -2200,11 +2973,11 @@ fn rewrite_gem(
                     m.get(2).unwrap().as_str()
                 );
                 *lk = sum_line_re
-                    .replace(lk, format!("${{1}} sha256={sha256}").as_str())
+                    .replace(lk, format!("${{1}} sha256={sha256}${{3}}").as_str())
                     .to_string();
                 lock_changed = true;
                 result.edits.push(FileEdit {
-                    path: "Gemfile.lock".into(),
+                    path: lock_name.into(),
                     kind: "redirect_gemfile_lock_checksum".into(),
                     action: "rewritten".into(),
                     key: Some(dep.name.clone()),
@@ -2216,7 +2989,7 @@ fn rewrite_gem(
                     .replace(
                         lk,
                         format!(
-                            "CHECKSUMS\n  {} ({}) sha256={sha256}",
+                            "CHECKSUMS${{1}}\n  {} ({}) sha256={sha256}${{1}}",
                             dep.name, dep.version
                         )
                         .as_str(),
@@ -2224,7 +2997,7 @@ fn rewrite_gem(
                     .to_string();
                 lock_changed = true;
                 result.edits.push(FileEdit {
-                    path: "Gemfile.lock".into(),
+                    path: lock_name.into(),
                     kind: "redirect_gemfile_lock_checksum".into(),
                     action: "added".into(),
                     key: Some(dep.name.clone()),
@@ -2235,7 +3008,7 @@ fn rewrite_gem(
                 result.warnings.push(RewriteWarning {
                     code: "redirect_gem_no_checksums_section".into(),
                     detail: format!(
-                        "Gemfile.lock has no CHECKSUMS section (bundler <2.6) — cannot pin {}",
+                        "{lock_name} has no CHECKSUMS section (bundler <2.6) — cannot pin {}",
                         dep.name
                     ),
                 });
@@ -2250,22 +3023,23 @@ fn rewrite_gem(
     if gemfile_changed || lock_changed {
         result.warnings.push(RewriteWarning {
             code: "redirect_gem_frozen_install".into(),
-            detail: "Gemfile was repointed at the Socket patch registry but Gemfile.lock's \
-                     GEM section still records the upstream source; bundler rejects the pair \
-                     under frozen/deployment mode — run `bundle install` (unfrozen) once to \
-                     record the new source in Gemfile.lock"
-                .into(),
+            detail: format!(
+                "{gemfile_name} was repointed at the Socket patch registry but {lock_name}'s \
+                 GEM section still records the upstream source; bundler rejects the pair \
+                 under frozen/deployment mode — run `bundle install` (unfrozen) once to \
+                 record the new source in {lock_name}"
+            ),
         });
     }
 
     if gemfile_changed {
         if let Some(gf) = gemfile {
-            result.files.insert("Gemfile".into(), gf);
+            result.files.insert(gemfile_name.into(), gf);
         }
     }
     if lock_changed {
         if let Some(lk) = lock {
-            result.files.insert("Gemfile.lock".into(), lk);
+            result.files.insert(lock_name.into(), lk);
         }
     }
 }
@@ -4267,6 +5041,18 @@ mod tests {
         );
     }
 
+    /// Canonical lowercase patch uuid — the rewriter validates the uuid
+    /// grammar fail-closed before interpolating it into TOML.
+    const CARGO_UUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
+
+    fn cargo_reg() -> String {
+        format!("socket-patch-{CARGO_UUID}")
+    }
+
+    fn cargo_index_url() -> String {
+        format!("sparse+https://patch.test/cargo/{CARGO_UUID}/index/")
+    }
+
     fn cargo_sparse_override() -> DepOverride {
         DepOverride {
             ecosystem: "cargo".into(),
@@ -4274,12 +5060,12 @@ mod tests {
             namespace: None,
             version: "1.0.190".into(),
             token: "tok".into(),
-            patch_uuid: "uuid".into(),
+            patch_uuid: CARGO_UUID.into(),
             artifact_url: "https://patch.test/serde-1.0.190.crate".into(),
             berry_zip_url: None,
             registry_override: Some(RegistryOverride {
                 kind: "cargo-sparse".into(),
-                index_url: "sparse+https://patch.test/cargo/uuid/".into(),
+                index_url: cargo_index_url(),
                 identifiers: RegistryOverrideIdentifiers {
                     name: "serde".into(),
                     version: "1.0.190".into(),
@@ -4366,7 +5152,7 @@ mod tests {
             )
         });
         assert!(
-            written.contains("[registries.socket-patch-uuid]"),
+            written.contains(&format!("[registries.{}]", cargo_reg())),
             "registry definition must land in the legacy config: {written}"
         );
         assert!(
@@ -4388,6 +5174,9 @@ mod tests {
     }
 
     /// The default (no legacy file) shape is unchanged: `.cargo/config.toml`.
+    /// With no Cargo.lock at all the manifest pin alone forces the next
+    /// resolution through the managed registry, so the dep still counts as
+    /// fully landed.
     #[test]
     fn cargo_config_toml_is_the_default_target() {
         let mut files = BTreeMap::new();
@@ -4399,6 +5188,633 @@ mod tests {
         let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
         assert!(r.files.contains_key(".cargo/config.toml"));
         assert!(!r.files.contains_key(".cargo/config"));
+        assert!(r.confirmed_cargo_uuids.contains(CARGO_UUID));
+    }
+
+    fn cargo_lock_with(name: &str, version: &str) -> String {
+        format!(
+            "# This file is automatically @generated by Cargo.\n\
+             version = 3\n\
+             \n\
+             [[package]]\n\
+             name = \"{name}\"\n\
+             version = \"{version}\"\n\
+             source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
+             checksum = \"91f70896d6720bc714a4a57d22fc91f1db634680e65c8efe13323f1fa38d53f5\"\n"
+        )
+    }
+
+    fn cargo_files(toml: &str) -> BTreeMap<String, String> {
+        let mut files = BTreeMap::new();
+        files.insert("Cargo.toml".to_string(), toml.to_string());
+        files.insert(
+            "Cargo.lock".to_string(),
+            cargo_lock_with("serde", "1.0.190"),
+        );
+        files
+    }
+
+    /// AUDIT A1+A7: a crate declared in BOTH [dev-dependencies] and
+    /// [dependencies] must gain the registry pin in BOTH sections — a
+    /// first-match-only rewrite gives the two sections different sources for
+    /// the same dep, which cargo rejects at manifest-parse time, bricking
+    /// every cargo command. The blank separator line after each entry must
+    /// survive (the old `\s*$` regex swallowed it).
+    #[test]
+    fn cargo_two_sections_rewrites_all_occurrences_and_preserves_blank_lines() {
+        let files = cargo_files(
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+             [dev-dependencies]\nserde = \"1.0.190\"\n\n\
+             [dependencies]\nserde = \"1.0.190\"\n",
+        );
+        let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+        let toml = r.files.get("Cargo.toml").expect("Cargo.toml rewritten");
+        let pinned = format!("serde = {{ version = \"1.0.190\", registry = \"{}\" }}", cargo_reg());
+        assert_eq!(
+            toml.matches(&pinned).count(),
+            2,
+            "BOTH sections must be pinned: {toml}"
+        );
+        assert!(
+            toml.contains(&format!("{pinned}\n\n[dependencies]")),
+            "the blank line before [dependencies] must be preserved: {toml}"
+        );
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert!(r.confirmed_cargo_uuids.contains(CARGO_UUID));
+        // One manifest edit per occurrence.
+        assert_eq!(
+            r.edits
+                .iter()
+                .filter(|e| e.kind == "redirect_cargo_toml_dep")
+                .count(),
+            2
+        );
+    }
+
+    /// AUDIT A2: the multi-line `[dependencies.<name>]` table form is a
+    /// completely standard manifest shape — it gains a `registry = "…"` line
+    /// instead of being reported not-found (which used to leave the lock
+    /// repointed while the manifest still said crates.io: `--locked` builds
+    /// broke, unlocked builds silently dropped the patch).
+    #[test]
+    fn cargo_table_form_dep_gains_registry_line() {
+        let files = cargo_files(
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+             [dependencies.serde]\nversion = \"1.0.190\"\nfeatures = [\"derive\"]\n",
+        );
+        let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+        let toml = r.files.get("Cargo.toml").expect("Cargo.toml rewritten");
+        assert!(
+            toml.contains(&format!(
+                "[dependencies.serde]\nregistry = \"{}\"\nversion = \"1.0.190\"",
+                cargo_reg()
+            )),
+            "the table must gain a registry line: {toml}"
+        );
+        assert!(r.files.contains_key("Cargo.lock"));
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert!(r.confirmed_cargo_uuids.contains(CARGO_UUID));
+
+        // Idempotent re-run over the rewritten output: silent no-op.
+        let mut again = files.clone();
+        for (name, content) in &r.files {
+            again.insert(name.clone(), content.clone());
+        }
+        let second = rewrite_registry_redirect(&again, &[cargo_sparse_override()]);
+        assert!(
+            second.files.is_empty() && second.edits.is_empty() && second.warnings.is_empty(),
+            "re-run must be a silent no-op: files={:?} warnings={:?}",
+            second.files.keys(),
+            second.warnings
+        );
+        assert!(second.confirmed_cargo_uuids.contains(CARGO_UUID));
+    }
+
+    /// AUDIT A5: rename-aware matching. An entry whose KEY matches the
+    /// patched crate but whose `package = "<other>"` names a different crate
+    /// is NOT the patched crate (pinning it would point a foreign package at
+    /// the single-crate socket registry — resolution hard-fails); the patched
+    /// crate consumed under an ALIAS key (`iffy = { package = "serde" }`) IS.
+    #[test]
+    fn cargo_rename_aware_matching() {
+        let files = cargo_files(
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+             [dependencies]\n\
+             serde = { package = \"leftpad\", version = \"1.0.0\" }\n\
+             iffy = { package = \"serde\", version = \"1.0.190\" }\n",
+        );
+        let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+        let toml = r.files.get("Cargo.toml").expect("Cargo.toml rewritten");
+        assert!(
+            toml.contains("serde = { package = \"leftpad\", version = \"1.0.0\" }"),
+            "the key-colliding entry for a DIFFERENT crate must be untouched: {toml}"
+        );
+        assert!(
+            toml.contains(&format!(
+                "iffy = {{ package = \"serde\", version = \"1.0.190\", registry = \"{}\" }}",
+                cargo_reg()
+            )),
+            "the aliased entry for the patched crate must be pinned: {toml}"
+        );
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert!(r.confirmed_cargo_uuids.contains(CARGO_UUID));
+    }
+
+    /// AUDIT A5(a) alone: when the ONLY key match renames a different crate,
+    /// the dep is genuinely not declared → not-found, and NOTHING is written
+    /// (no config block, no lock repoint).
+    #[test]
+    fn cargo_key_collision_only_is_not_found_and_writes_nothing() {
+        let mut files = cargo_files(
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+             [dependencies]\nserde = { package = \"leftpad\", version = \"1.0.0\" }\n",
+        );
+        files.insert(
+            "Cargo.lock".to_string(),
+            cargo_lock_with("leftpad", "1.0.0"),
+        );
+        let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+        assert!(
+            r.files.is_empty(),
+            "nothing may be written: {:?}",
+            r.files.keys()
+        );
+        assert!(r
+            .warnings
+            .iter()
+            .any(|w| w.code == "redirect_cargo_toml_dep_not_found"));
+        assert!(r.confirmed_cargo_uuids.is_empty());
+    }
+
+    /// AUDIT A4: a re-scan that selects a NEWER patch uuid over an existing
+    /// redirect must supersede the old `registry = "socket-patch-<old>"` pin
+    /// in place — the old code classified it as a foreign registry and left
+    /// the manifest on the OLD uuid while moving the lock to the NEW one
+    /// (broken `--locked` builds, unlocked builds resolving the superseded
+    /// patch, VEX attesting the new one).
+    #[test]
+    fn cargo_supersede_replaces_previous_socket_registry_pin() {
+        const OLD_UUID: &str = "0a1b2c3d-4e5f-4a7b-8c9d-0e1f2a3b4c5d";
+        let old_reg = format!("socket-patch-{OLD_UUID}");
+        let old_index = format!("sparse+https://patch.test/cargo/{OLD_UUID}/index/");
+        let mut files = BTreeMap::new();
+        files.insert(
+            "Cargo.toml".to_string(),
+            format!(
+                "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+                 [dependencies]\nserde = {{ version = \"1.0.190\", registry = \"{old_reg}\" }}\n"
+            ),
+        );
+        files.insert(
+            "Cargo.lock".to_string(),
+            cargo_lock_with("serde", "1.0.190").replace(
+                "registry+https://github.com/rust-lang/crates.io-index",
+                &old_index,
+            ),
+        );
+        files.insert(
+            ".cargo/config.toml".to_string(),
+            format!("[registries.{old_reg}]\nindex = \"{old_index}\"\n"),
+        );
+        let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+        let toml = r.files.get("Cargo.toml").expect("manifest re-pinned");
+        assert!(
+            toml.contains(&format!("registry = \"{}\"", cargo_reg())) && !toml.contains(&old_reg),
+            "the manifest must move to the NEW registry: {toml}"
+        );
+        let lock = r.files.get("Cargo.lock").expect("lock re-pinned");
+        assert!(lock.contains(&cargo_index_url()), "{lock}");
+        let cfg = r.files.get(".cargo/config.toml").expect("config updated");
+        assert!(cfg.contains(&format!("[registries.{}]", cargo_reg())), "{cfg}");
+        assert!(
+            !r.warnings
+                .iter()
+                .any(|w| w.code == "redirect_cargo_toml_dep_not_found"),
+            "supersession is not 'dependency missing': {:?}",
+            r.warnings
+        );
+        assert!(r.confirmed_cargo_uuids.contains(CARGO_UUID));
+    }
+
+    /// A pin to a registry this rewriter does NOT own is the user's — refuse
+    /// the whole dep (no lock edit, no config block) with one clear warning.
+    #[test]
+    fn cargo_foreign_registry_pin_refuses_whole_dep() {
+        let files = cargo_files(
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+             [dependencies]\nserde = { version = \"1.0.190\", registry = \"corp\" }\n",
+        );
+        let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+        assert!(
+            r.files.is_empty(),
+            "nothing may be written: {:?}",
+            r.files.keys()
+        );
+        assert!(
+            r.warnings
+                .iter()
+                .any(|w| w.code == "redirect_cargo_toml_dep_unrewritable"),
+            "{:?}",
+            r.warnings
+        );
+        assert!(r.confirmed_cargo_uuids.is_empty());
+    }
+
+    /// A table-form block that carries `registry-index` cannot take a
+    /// `registry` pin — cargo rejects a dependency naming both keys as
+    /// ambiguous, so inserting the pin bricks every cargo command. Refuse
+    /// the whole dep (zero writes, no confirmation), like the inline-table
+    /// branch already does.
+    #[test]
+    fn cargo_table_form_registry_index_refuses_whole_dep() {
+        let files = cargo_files(
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+             [dependencies.serde]\nversion = \"1.0.190\"\n\
+             registry-index = \"sparse+https://index.crates.io/\"\n",
+        );
+        let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+        assert!(
+            r.files.is_empty(),
+            "nothing may be written: {:?}",
+            r.files.keys()
+        );
+        assert!(
+            r.warnings
+                .iter()
+                .any(|w| w.code == "redirect_cargo_toml_dep_unrewritable"),
+            "{:?}",
+            r.warnings
+        );
+        assert!(r.confirmed_cargo_uuids.is_empty());
+    }
+
+    /// AUDIT A2/A3 (transactionality): when ONE occurrence is rewritable but
+    /// ANOTHER is not, the dep is skipped ENTIRELY — a partial pin (one
+    /// section redirected, one not) gives the dep two different sources and
+    /// cargo refuses the manifest.
+    #[test]
+    fn cargo_unrewritable_occurrence_skips_dep_entirely() {
+        let files = cargo_files(
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+             [dependencies]\nserde = \"1.0.190\"\n\n\
+             [dev-dependencies]\nserde.version = \"1.0.190\"\n",
+        );
+        let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+        assert!(
+            r.files.is_empty(),
+            "no partial pin may be written: {:?}",
+            r.files.keys()
+        );
+        assert!(r
+            .warnings
+            .iter()
+            .any(|w| w.code == "redirect_cargo_toml_dep_unrewritable"));
+        assert!(r.confirmed_cargo_uuids.is_empty());
+    }
+
+    /// AUDIT A3 (the cargo analogue of npm's
+    /// `no_lockfile_redirect_is_not_attested`): a granted dep the project
+    /// does not declare at all (e.g. surfaced by the machine-wide
+    /// $CARGO_HOME crawl) must produce NO writes — the old code still wrote
+    /// the inert `[registries.…]` block, whose index URL then satisfied the
+    /// hosted confirmed check and produced a false VEX attestation.
+    #[test]
+    fn cargo_undeclared_dep_writes_nothing_not_even_the_config_block() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "Cargo.toml".to_string(),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\nanyhow = \"1.0\"\n"
+                .to_string(),
+        );
+        files.insert("Cargo.lock".to_string(), cargo_lock_with("anyhow", "1.0.0"));
+        let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+        assert!(
+            r.files.is_empty(),
+            "no file (config block included) may be written: {:?}",
+            r.files.keys()
+        );
+        assert!(r
+            .warnings
+            .iter()
+            .any(|w| w.code == "redirect_cargo_toml_dep_not_found"));
+        assert!(r.confirmed_cargo_uuids.is_empty());
+    }
+
+    /// A Cargo.lock that exists but has no [[package]] for the dep means the
+    /// project does not resolve it — pinning the manifest anyway desyncs
+    /// manifest and lock. Skip the dep entirely.
+    #[test]
+    fn cargo_missing_lock_entry_skips_dep_entirely() {
+        let mut files = cargo_files(
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1.0.190\"\n",
+        );
+        files.insert("Cargo.lock".to_string(), cargo_lock_with("anyhow", "1.0.0"));
+        let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+        assert!(
+            r.files.is_empty(),
+            "no partial edit set may be written: {:?}",
+            r.files.keys()
+        );
+        assert!(r
+            .warnings
+            .iter()
+            .any(|w| w.code == "redirect_cargo_lock_pkg_not_found"));
+        assert!(r.confirmed_cargo_uuids.is_empty());
+    }
+
+    /// AUDIT A6: a user who commented the managed [registries] block out (to
+    /// debug an install) and re-runs the scan gets the block RESTORED. The
+    /// old substring idempotence check matched the commented text, wrote
+    /// nothing, and the run still reported the dep redirected while every
+    /// cargo command failed on the undefined registry.
+    #[test]
+    fn cargo_commented_config_block_is_restored() {
+        // First run to produce the redirected state.
+        let files = cargo_files(
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1.0.190\"\n",
+        );
+        let first = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+        let mut redirected = files.clone();
+        for (name, content) in &first.files {
+            redirected.insert(name.clone(), content.clone());
+        }
+        // Comment out every line of the managed config block.
+        let commented = redirected[".cargo/config.toml"]
+            .lines()
+            .map(|l| {
+                if l.is_empty() {
+                    l.to_string()
+                } else {
+                    format!("#{l}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        redirected.insert(".cargo/config.toml".to_string(), commented.clone());
+
+        let second = rewrite_registry_redirect(&redirected, &[cargo_sparse_override()]);
+        let cfg = second
+            .files
+            .get(".cargo/config.toml")
+            .expect("the managed block must be restored");
+        assert!(
+            cfg.contains(&format!(
+                "[registries.{}]\nindex = \"{}\"",
+                cargo_reg(),
+                cargo_index_url()
+            )),
+            "an UNCOMMENTED block must exist after the re-run: {cfg}"
+        );
+        assert!(
+            cfg.contains(&format!("#[registries.{}]", cargo_reg())),
+            "the user's commented lines are preserved: {cfg}"
+        );
+        assert!(second.confirmed_cargo_uuids.contains(CARGO_UUID));
+    }
+
+    /// A degraded managed block (header intact, index line commented or
+    /// stale) is regenerated in place rather than trusted.
+    #[test]
+    fn cargo_degraded_config_block_is_regenerated() {
+        let mut files = cargo_files(
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+             [dependencies]\nserde = { version = \"1.0.190\", registry = \"socket-patch-9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f\" }\n",
+        );
+        files.insert(
+            "Cargo.lock".to_string(),
+            cargo_lock_with("serde", "1.0.190").replace(
+                "registry+https://github.com/rust-lang/crates.io-index",
+                &cargo_index_url(),
+            ),
+        );
+        files.insert(
+            ".cargo/config.toml".to_string(),
+            format!(
+                "[registries.{}]\n#index = \"{}\"\n",
+                cargo_reg(),
+                cargo_index_url()
+            ),
+        );
+        // The lock checksum still differs from the override's — rewritten.
+        let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+        let cfg = r
+            .files
+            .get(".cargo/config.toml")
+            .expect("degraded block regenerated");
+        assert!(
+            cfg.contains(&format!("\nindex = \"{}\"", cargo_index_url())),
+            "an uncommented index line must exist: {cfg}"
+        );
+        assert!(r.confirmed_cargo_uuids.contains(CARGO_UUID));
+    }
+
+    /// AUDIT A9: an empty-string `cargoCksumSha256` is MISSING (the TS twin's
+    /// falsy check), never written as `checksum = ""` into Cargo.lock — that
+    /// hard-fails the next `cargo fetch --locked`.
+    #[test]
+    fn cargo_empty_string_cksum_skips_dep() {
+        let files = cargo_files(
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1.0.190\"\n",
+        );
+        let mut dep = cargo_sparse_override();
+        if let Some(ov) = dep.registry_override.as_mut() {
+            ov.identifiers.cargo_cksum_sha256 = Some(String::new());
+        }
+        dep.integrity = Integrity::default();
+        let r = rewrite_registry_redirect(&files, &[dep]);
+        assert!(
+            r.files.is_empty(),
+            "nothing may be written: {:?}",
+            r.files.keys()
+        );
+        assert!(
+            r.warnings
+                .iter()
+                .any(|w| w.code == "redirect_cargo_missing_cksum"),
+            "{:?}",
+            r.warnings
+        );
+        assert!(r.confirmed_cargo_uuids.is_empty());
+    }
+
+    /// AUDIT A8: service-supplied strings are validated against their exact
+    /// grammars before interpolation into raw TOML — a hostile patch uuid,
+    /// index URL, or cksum must be refused, never written (TOML injection:
+    /// a `]`+newline uuid can define `[source.crates-io] replace-with = …`
+    /// redirecting EVERY crate).
+    #[test]
+    fn cargo_hostile_service_inputs_are_refused() {
+        let files = cargo_files(
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1.0.190\"\n",
+        );
+        // Hostile uuid.
+        let mut dep = cargo_sparse_override();
+        dep.patch_uuid = "x]\n[source.crates-io]\nreplace-with = \"evil\"\n[registries.y".into();
+        let r = rewrite_registry_redirect(&files, &[dep]);
+        assert!(r.files.is_empty(), "{:?}", r.files.keys());
+        assert!(r
+            .warnings
+            .iter()
+            .any(|w| w.code == "redirect_cargo_invalid_uuid"));
+        assert!(r.confirmed_cargo_uuids.is_empty());
+
+        // Hostile index URL (quote breaks out of the TOML string).
+        let mut dep = cargo_sparse_override();
+        if let Some(ov) = dep.registry_override.as_mut() {
+            ov.index_url = "sparse+https://x/\"\nreplace-with = \"evil\"".into();
+        }
+        let r = rewrite_registry_redirect(&files, &[dep]);
+        assert!(r.files.is_empty(), "{:?}", r.files.keys());
+        assert!(r
+            .warnings
+            .iter()
+            .any(|w| w.code == "redirect_cargo_invalid_index_url"));
+
+        // Non-sparse index URL.
+        let mut dep = cargo_sparse_override();
+        if let Some(ov) = dep.registry_override.as_mut() {
+            ov.index_url = "https://patch.test/cargo/index/".into();
+        }
+        let r = rewrite_registry_redirect(&files, &[dep]);
+        assert!(r.files.is_empty(), "{:?}", r.files.keys());
+        assert!(r
+            .warnings
+            .iter()
+            .any(|w| w.code == "redirect_cargo_invalid_index_url"));
+
+        // Malformed cksum (not 64 lowercase hex).
+        let mut dep = cargo_sparse_override();
+        if let Some(ov) = dep.registry_override.as_mut() {
+            ov.identifiers.cargo_cksum_sha256 = Some("\"\nevil = 1\n".into());
+        }
+        let r = rewrite_registry_redirect(&files, &[dep]);
+        assert!(r.files.is_empty(), "{:?}", r.files.keys());
+        assert!(r
+            .warnings
+            .iter()
+            .any(|w| w.code == "redirect_cargo_invalid_cksum"));
+    }
+
+    /// Workspace inheritance: the pin lands on the [workspace.dependencies]
+    /// entry (which member `workspace = true` entries inherit), and the
+    /// inheriting occurrences are then satisfied.
+    #[test]
+    fn cargo_workspace_inheritance_pins_the_workspace_table() {
+        let files = cargo_files(
+            "[workspace]\nmembers = [\"member\"]\n\n\
+             [workspace.dependencies]\nserde = \"1.0.190\"\n\n\
+             [dependencies]\nserde.workspace = true\n",
+        );
+        let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+        let toml = r.files.get("Cargo.toml").expect("workspace table pinned");
+        assert!(
+            toml.contains(&format!(
+                "[workspace.dependencies]\nserde = {{ version = \"1.0.190\", registry = \"{}\" }}",
+                cargo_reg()
+            )),
+            "{toml}"
+        );
+        assert!(
+            toml.contains("serde.workspace = true"),
+            "the inheriting entry is untouched: {toml}"
+        );
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert!(r.confirmed_cargo_uuids.contains(CARGO_UUID));
+    }
+
+    /// `workspace = true` with NO [workspace.dependencies] entry in this
+    /// manifest (deps declared in member manifests the rewriter cannot see)
+    /// must refuse the whole dep — fail closed, nothing written.
+    #[test]
+    fn cargo_workspace_inheritance_without_entry_refuses() {
+        let files = cargo_files(
+            "[package]\nname = \"member\"\nversion = \"0.1.0\"\n\n\
+             [dependencies]\nserde = { workspace = true }\n",
+        );
+        let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+        assert!(r.files.is_empty(), "{:?}", r.files.keys());
+        assert!(r
+            .warnings
+            .iter()
+            .any(|w| w.code == "redirect_cargo_toml_dep_unrewritable"));
+        assert!(r.confirmed_cargo_uuids.is_empty());
+    }
+
+    /// A plain-version entry with a trailing comment keeps the comment.
+    #[test]
+    fn cargo_plain_version_trailing_comment_preserved() {
+        let files = cargo_files(
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+             [dependencies]\nserde = \"1.0.190\" # pinned for CVE-2024-XXXX\n",
+        );
+        let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+        let toml = r.files.get("Cargo.toml").expect("rewritten");
+        assert!(
+            toml.contains(&format!(
+                "serde = {{ version = \"1.0.190\", registry = \"{}\" }} # pinned for CVE-2024-XXXX",
+                cargo_reg()
+            )),
+            "{toml}"
+        );
+        assert!(r.confirmed_cargo_uuids.contains(CARGO_UUID));
+    }
+
+    /// A path/git dependency never resolves through a registry — pinning it
+    /// would be a lie; refuse the whole dep.
+    #[test]
+    fn cargo_path_dep_is_refused() {
+        let files = cargo_files(
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+             [dependencies]\nserde = { path = \"../serde\" }\n",
+        );
+        let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+        assert!(r.files.is_empty(), "{:?}", r.files.keys());
+        assert!(r
+            .warnings
+            .iter()
+            .any(|w| w.code == "redirect_cargo_toml_dep_unrewritable"));
+        assert!(r.confirmed_cargo_uuids.is_empty());
+    }
+
+    /// A cargo dep whose override kind is not `cargo-sparse` warns (the TS
+    /// twin's behavior) instead of vanishing silently.
+    #[test]
+    fn cargo_kind_mismatch_warns() {
+        let files = cargo_files(
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1.0.190\"\n",
+        );
+        let mut dep = cargo_sparse_override();
+        if let Some(ov) = dep.registry_override.as_mut() {
+            ov.kind = "goproxy".into();
+        }
+        let r = rewrite_registry_redirect(&files, &[dep]);
+        assert!(r.files.is_empty(), "{:?}", r.files.keys());
+        assert!(r
+            .warnings
+            .iter()
+            .any(|w| w.code == "redirect_cargo_missing_override"));
+        assert!(r.confirmed_cargo_uuids.is_empty());
+    }
+
+    /// A target-specific dependency table is a rewrite target like the plain
+    /// sections.
+    #[test]
+    fn cargo_target_specific_table_is_rewritten() {
+        let files = cargo_files(
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+             [target.'cfg(unix)'.dependencies]\nserde = \"1.0.190\"\n",
+        );
+        let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+        let toml = r.files.get("Cargo.toml").expect("rewritten");
+        assert!(
+            toml.contains(&format!(
+                "[target.'cfg(unix)'.dependencies]\nserde = {{ version = \"1.0.190\", registry = \"{}\" }}",
+                cargo_reg()
+            )),
+            "{toml}"
+        );
+        assert!(r.confirmed_cargo_uuids.contains(CARGO_UUID));
     }
 
     fn gem_override(name: &str, version: &str) -> DepOverride {
@@ -4824,6 +6240,439 @@ mod tests {
         );
     }
 
+    /// Bundler's modern `gems.rb`/`gems.locked` spelling must be redirected
+    /// exactly like the classic pair — before this, a gems.rb project was a
+    /// silent no-op (the rewriter keyed on the literal "Gemfile" names).
+    #[test]
+    fn gems_rb_pair_is_rewritten_with_modern_paths() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "gems.rb".to_string(),
+            "source \"https://rubygems.org\"\n\ngem \"rails\", \"7.0.0\"\n".to_string(),
+        );
+        files.insert(
+            "gems.locked".to_string(),
+            gem_lock(&format!("  rails (7.0.0) sha256={}", "2".repeat(64))),
+        );
+        let r = rewrite_registry_redirect(&files, &[gem_override("rails", "7.0.0")]);
+        let gf = r.files.get("gems.rb").expect("gems.rb rewritten");
+        assert!(
+            gf.contains(
+                "source \"https://patch.test/gem/tok/uuid/\" do\n  gem \"rails\", \"7.0.0\"\nend"
+            ),
+            "source block lands in gems.rb: {gf}"
+        );
+        let lk = r.files.get("gems.locked").expect("gems.locked rewritten");
+        assert!(
+            lk.contains(&format!("  rails (7.0.0) sha256={}", "f".repeat(64))),
+            "CHECKSUMS pin lands in gems.locked: {lk}"
+        );
+        assert!(
+            !r.files.contains_key("Gemfile") && !r.files.contains_key("Gemfile.lock"),
+            "classic spellings must not be invented: {:?}",
+            r.files.keys()
+        );
+        // The ledger edits must name the files actually written, or a future
+        // revert restores the wrong pair.
+        assert!(
+            r.edits
+                .iter()
+                .any(|e| e.kind == "redirect_gemfile_source_block" && e.path == "gems.rb"),
+            "source-block edit keyed to gems.rb: {:?}",
+            r.edits
+        );
+        assert!(
+            r.edits
+                .iter()
+                .any(|e| e.kind == "redirect_gemfile_lock_checksum" && e.path == "gems.locked"),
+            "lock edit keyed to gems.locked: {:?}",
+            r.edits
+        );
+    }
+
+    /// Both spellings present and byte-identical: follow bundler (which reads
+    /// gems.rb and ignores the Gemfile) — edit gems.rb, leave Gemfile alone.
+    #[test]
+    fn gems_rb_beats_identical_gemfile() {
+        let gemfile = "source \"https://rubygems.org\"\n\ngem \"rails\", \"7.0.0\"\n".to_string();
+        let mut files = BTreeMap::new();
+        files.insert("gems.rb".to_string(), gemfile.clone());
+        files.insert("Gemfile".to_string(), gemfile);
+        let r = rewrite_registry_redirect(&files, &[gem_override("rails", "7.0.0")]);
+        assert!(
+            r.files.contains_key("gems.rb") && !r.files.contains_key("Gemfile"),
+            "bundler reads gems.rb, so only gems.rb may be edited: {:?}",
+            r.files.keys()
+        );
+    }
+
+    /// Both spellings present and DIVERGING outside the redirect's own
+    /// footprint (an unrelated gem only one file declares): editing either is
+    /// a guess (the redirect could land in the file bundler ignores, or
+    /// tooling pinned to the classic name keeps resolving upstream). Fail
+    /// closed with a warning.
+    #[test]
+    fn gems_rb_and_gemfile_diverging_fail_closed() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "gems.rb".to_string(),
+            "source \"https://rubygems.org\"\n\ngem \"rails\", \"7.0.0\"\ngem \"puma\", \"6.0.0\"\n"
+                .to_string(),
+        );
+        files.insert(
+            "Gemfile".to_string(),
+            "source \"https://rubygems.org\"\n\ngem \"rails\", \"7.0.0\"\n".to_string(),
+        );
+        let r = rewrite_registry_redirect(&files, &[gem_override("rails", "7.0.0")]);
+        assert!(
+            r.files.is_empty() && r.edits.is_empty(),
+            "diverging spellings must not be edited: files={:?} edits={:?}",
+            r.files.keys(),
+            r.edits
+        );
+        assert!(
+            r.warnings
+                .iter()
+                .any(|w| w.code == "redirect_gem_gemfile_spellings_diverge"),
+            "fail-closed skip must warn: {:?}",
+            r.warnings
+        );
+    }
+
+    /// Divergence confined to the redirected dep's OWN declaration line is
+    /// tolerated: the rewriter canonicalizes that line into the managed block
+    /// either way, and bundler reads gems.rb regardless (verified on 4.0.15,
+    /// which warns it is ignoring the Gemfile). Only divergence outside the
+    /// redirect's footprint is ambiguous enough to fail closed on.
+    #[test]
+    fn gems_rb_divergence_only_in_redirected_dep_line_proceeds() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "gems.rb".to_string(),
+            "source \"https://rubygems.org\"\n\ngem \"rails\", \"7.0.0\"\n".to_string(),
+        );
+        files.insert(
+            "Gemfile".to_string(),
+            "source \"https://rubygems.org\"\n\ngem \"rails\", \"6.1.0\"\n".to_string(),
+        );
+        let r = rewrite_registry_redirect(&files, &[gem_override("rails", "7.0.0")]);
+        assert!(
+            !r.warnings
+                .iter()
+                .any(|w| w.code == "redirect_gem_gemfile_spellings_diverge"),
+            "the redirected dep's own line is not ambient divergence: {:?}",
+            r.warnings
+        );
+        assert!(
+            r.files.contains_key("gems.rb") && !r.files.contains_key("Gemfile"),
+            "redirect proceeds on the file bundler reads: {:?}",
+            r.files.keys()
+        );
+    }
+
+    /// Run 1 on byte-identical twins edits only gems.rb (bundler's file),
+    /// which makes the pair diverge on raw bytes. The divergence guard judges
+    /// the redirect-footprint residue instead: feeding run 1's output back
+    /// must be a plain no-op re-run, not a
+    /// `redirect_gem_gemfile_spellings_diverge` trap that blocks every later
+    /// run against the state run 1 itself created.
+    #[test]
+    fn gems_rb_identical_twins_rerun_is_a_no_op_not_a_diverge_trap() {
+        let gemfile = "source \"https://rubygems.org\"\n\ngem \"rails\", \"7.0.0\"\n".to_string();
+        let mut files = BTreeMap::new();
+        files.insert("gems.rb".to_string(), gemfile.clone());
+        files.insert("Gemfile".to_string(), gemfile);
+        files.insert(
+            "gems.locked".to_string(),
+            gem_lock(&format!("  rails (7.0.0) sha256={}", "2".repeat(64))),
+        );
+        let ovr = gem_override("rails", "7.0.0");
+        let first = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        assert!(
+            first.files.contains_key("gems.rb") && first.files.contains_key("gems.locked"),
+            "run 1 lands on the modern pair: files={:?} warnings={:?}",
+            first.files.keys(),
+            first.warnings
+        );
+        for (name, content) in first.files {
+            files.insert(name, content);
+        }
+        let second = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        assert!(
+            !second
+                .warnings
+                .iter()
+                .any(|w| w.code == "redirect_gem_gemfile_spellings_diverge"),
+            "the divergence run 1 itself created must not trap run 2: {:?}",
+            second.warnings
+        );
+        assert!(
+            second.files.is_empty() && second.edits.is_empty(),
+            "same-grant re-run is a no-op: files={:?} edits={:?}",
+            second.files.keys(),
+            second.edits
+        );
+    }
+
+    /// The identical-twins re-run with a ROTATED grant (the token/uuid URL
+    /// segments rotate per request) must still reach the in-place URL
+    /// refresh — with a raw-byte divergence guard, run 1's edit tripped the
+    /// trap and the redirect went permanently stale under the old grant.
+    #[test]
+    fn gems_rb_identical_twins_rerun_refreshes_rotated_grant_url() {
+        fn ov(token: &str) -> DepOverride {
+            let mut o = gem_override("rails", "7.0.0");
+            o.token = token.into();
+            if let Some(r) = o.registry_override.as_mut() {
+                r.index_url = format!("https://patch.test/gem/{token}/uuid/");
+            }
+            o
+        }
+        let gemfile = "source \"https://rubygems.org\"\n\ngem \"rails\", \"7.0.0\"\n".to_string();
+        let mut files = BTreeMap::new();
+        files.insert("gems.rb".to_string(), gemfile.clone());
+        files.insert("Gemfile".to_string(), gemfile);
+        let first = rewrite_registry_redirect(&files, &[ov("tok-one")]);
+        for (name, content) in first.files {
+            files.insert(name, content);
+        }
+        let second = rewrite_registry_redirect(&files, &[ov("tok-two")]);
+        assert!(
+            !second
+                .warnings
+                .iter()
+                .any(|w| w.code == "redirect_gem_gemfile_spellings_diverge"),
+            "run 1's own edit must not read as divergence: {:?}",
+            second.warnings
+        );
+        let out = second
+            .files
+            .get("gems.rb")
+            .expect("rotated grant refreshes gems.rb");
+        assert!(
+            out.contains(
+                "source \"https://patch.test/gem/tok-two/uuid/\" do\n  gem \"rails\", \"7.0.0\"\nend"
+            ),
+            "URL refreshed in place: {out}"
+        );
+        assert!(!out.contains("tok-one"), "old grant token gone: {out}");
+        assert!(
+            second
+                .edits
+                .iter()
+                .any(|e| e.kind == "redirect_gemfile_source_url" && e.path == "gems.rb"),
+            "refresh recorded against gems.rb: {:?}",
+            second.edits
+        );
+    }
+
+    /// Twins where the redirected dep is TRANSITIVE (undeclared): run 1
+    /// appends a source block to gems.rb — a footprint shape the residue
+    /// comparison must also erase, including the final newline the append
+    /// adds to a newline-less file.
+    #[test]
+    fn gems_rb_identical_twins_rerun_after_appended_block_is_no_op() {
+        let gemfile = "source \"https://rubygems.org\"\n\ngem \"rack\", \"3.0.0\"".to_string();
+        let mut files = BTreeMap::new();
+        files.insert("gems.rb".to_string(), gemfile.clone());
+        files.insert("Gemfile".to_string(), gemfile);
+        let ovr = gem_override("rails", "7.0.0");
+        let first = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        assert!(
+            first
+                .files
+                .get("gems.rb")
+                .is_some_and(|gf| gf.contains("source \"https://patch.test/gem/tok/uuid/\" do")),
+            "run 1 appends the block for the undeclared dep: {:?}",
+            first.files
+        );
+        for (name, content) in first.files {
+            files.insert(name, content);
+        }
+        let second = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        assert!(
+            !second
+                .warnings
+                .iter()
+                .any(|w| w.code == "redirect_gem_gemfile_spellings_diverge"),
+            "an appended block is the redirect's own footprint, not divergence: {:?}",
+            second.warnings
+        );
+        assert!(
+            second.files.is_empty() && second.edits.is_empty(),
+            "re-run is a no-op: files={:?} edits={:?}",
+            second.files.keys(),
+            second.edits
+        );
+    }
+
+    /// The block recognizer accepts a CRLF Socket source block (a
+    /// `core.autocrlf` checkout rewrites run 1's LF output), so the residue
+    /// comparison must erase that CRLF spelling too: after the checkout
+    /// rewrites BOTH twins to CRLF, only gems.rb carries the block — if the
+    /// residue regex stays LF-only the block survives into gems.rb's residue
+    /// and every later run (the rotated-grant URL refresh included) is
+    /// trapped behind `redirect_gem_gemfile_spellings_diverge`.
+    #[test]
+    fn gems_rb_crlf_twins_rerun_is_no_op_and_rotated_grant_refreshes() {
+        fn ov(token: &str) -> DepOverride {
+            let mut o = gem_override("rails", "7.0.0");
+            o.token = token.into();
+            if let Some(r) = o.registry_override.as_mut() {
+                r.index_url = format!("https://patch.test/gem/{token}/uuid/");
+            }
+            o
+        }
+        // gems.rb exactly as run 1 wrote it, after a CRLF checkout; the
+        // Gemfile twin got the same CRLF treatment but never had the block.
+        let mut files = BTreeMap::new();
+        files.insert(
+            "gems.rb".to_string(),
+            "source \"https://rubygems.org\"\r\n\r\n\
+             source \"https://patch.test/gem/tok-one/uuid/\" do\r\n  \
+             gem \"rails\", \"7.0.0\"\r\nend\r\n"
+                .to_string(),
+        );
+        files.insert(
+            "Gemfile".to_string(),
+            "source \"https://rubygems.org\"\r\n\r\ngem \"rails\", \"7.0.0\"\r\n".to_string(),
+        );
+
+        // Same grant: recognized in place, a true no-op — not a diverge trap.
+        let same = rewrite_registry_redirect(&files, &[ov("tok-one")]);
+        assert!(
+            !same
+                .warnings
+                .iter()
+                .any(|w| w.code == "redirect_gem_gemfile_spellings_diverge"),
+            "the CRLF block is the redirect's own footprint, not divergence: {:?}",
+            same.warnings
+        );
+        assert!(
+            same.files.is_empty() && same.edits.is_empty(),
+            "same-grant re-run on CRLF twins is a no-op: files={:?} edits={:?}",
+            same.files.keys(),
+            same.edits
+        );
+
+        // Rotated grant: URL refreshed in place inside gems.rb, never nested.
+        let rotated = rewrite_registry_redirect(&files, &[ov("tok-two")]);
+        assert!(
+            !rotated
+                .warnings
+                .iter()
+                .any(|w| w.code == "redirect_gem_gemfile_spellings_diverge"),
+            "rotated grant must reach the refresh, not the diverge trap: {:?}",
+            rotated.warnings
+        );
+        let out = rotated
+            .files
+            .get("gems.rb")
+            .expect("rotated grant refreshes gems.rb on a CRLF checkout");
+        assert_eq!(
+            out.matches("source \"https://patch.test/gem/").count(),
+            1,
+            "exactly one Socket source block, never nested: {out}"
+        );
+        assert!(!out.contains("tok-one"), "old grant token gone: {out}");
+        assert!(
+            out.contains("source \"https://patch.test/gem/tok-two/uuid/\" do\r\n"),
+            "existing CRLF block body left intact: {out}"
+        );
+        assert!(
+            !rotated.files.contains_key("Gemfile"),
+            "bundler reads gems.rb; the Gemfile twin stays untouched: {:?}",
+            rotated.files.keys()
+        );
+    }
+
+    /// A CRLF Gemfile.lock is legal to bundler (`bundle check` and a frozen
+    /// install both accept one — verified on 4.0.15). The CHECKSUMS pin must
+    /// land in place, byte-preserving the `\r\n` endings — before this, the
+    /// `(?m)^…$` matchers never saw the `\r`-terminated lines and the lock
+    /// was misdiagnosed as bundler <2.6 (`redirect_gem_no_checksums_section`).
+    #[test]
+    fn gem_crlf_lock_checksum_pinned_preserving_crlf() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "Gemfile".to_string(),
+            "source \"https://rubygems.org\"\n\ngem \"rails\", \"7.0.0\"\n".to_string(),
+        );
+        files.insert(
+            "Gemfile.lock".to_string(),
+            gem_lock(&format!("  rails (7.0.0) sha256={}", "2".repeat(64))).replace('\n', "\r\n"),
+        );
+        let r = rewrite_registry_redirect(&files, &[gem_override("rails", "7.0.0")]);
+        assert!(
+            !r.warnings
+                .iter()
+                .any(|w| w.code == "redirect_gem_no_checksums_section"),
+            "a CRLF CHECKSUMS section must be recognized: {:?}",
+            r.warnings
+        );
+        let expected =
+            gem_lock(&format!("  rails (7.0.0) sha256={}", "f".repeat(64))).replace('\n', "\r\n");
+        assert_eq!(
+            r.files.get("Gemfile.lock"),
+            Some(&expected),
+            "pin rewritten in place with every \\r\\n preserved"
+        );
+        let edit = r
+            .edits
+            .iter()
+            .find(|e| e.kind == "redirect_gemfile_lock_checksum")
+            .expect("lock checksum edit recorded");
+        assert_eq!(
+            edit.original,
+            Some(Value::String(format!(
+                "rails (7.0.0) sha256={}",
+                "2".repeat(64)
+            ))),
+            "recorded original carries no line-ending bytes"
+        );
+    }
+
+    /// CRLF lock whose CHECKSUMS section has no entry for the gem yet: the
+    /// added pin line must use the file's `\r\n` endings, not introduce a
+    /// lone `\n` into an otherwise-CRLF file.
+    #[test]
+    fn gem_crlf_lock_checksums_header_gains_crlf_entry() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "Gemfile".to_string(),
+            "source \"https://rubygems.org\"\n\ngem \"rails\", \"7.0.0\"\n".to_string(),
+        );
+        files.insert(
+            "Gemfile.lock".to_string(),
+            gem_lock(&format!("  nokogiri (1.16.0) sha256={}", "4".repeat(64)))
+                .replace('\n', "\r\n"),
+        );
+        let r = rewrite_registry_redirect(&files, &[gem_override("rails", "7.0.0")]);
+        let lk = r.files.get("Gemfile.lock").expect("lock rewritten");
+        assert!(
+            lk.contains(&format!(
+                "CHECKSUMS\r\n  rails (7.0.0) sha256={}\r\n",
+                "f".repeat(64)
+            )),
+            "added pin keeps the CRLF endings: {lk:?}"
+        );
+
+        // Re-run on the rewritten pair: recognizing the at-target CRLF line
+        // must be a no-op (the ledger would otherwise grow forever).
+        files.insert("Gemfile.lock".to_string(), lk.clone());
+        files.insert(
+            "Gemfile".to_string(),
+            r.files.get("Gemfile").expect("Gemfile rewritten").clone(),
+        );
+        let second = rewrite_registry_redirect(&files, &[gem_override("rails", "7.0.0")]);
+        assert!(
+            second.files.is_empty() && second.edits.is_empty(),
+            "CRLF re-run must be a no-op: files={:?} edits={:?}",
+            second.files.keys(),
+            second.edits
+        );
+    }
+
     /// An unparseable package-lock.json must surface a warning, not silently
     /// skip the npm redirect entirely (missing-lockfile already warns; a
     /// corrupt lockfile is strictly worse and was silent).
@@ -4918,6 +6767,258 @@ snapshots:
             "re-run over a redirected scoped entry must be a no-op: files={:?} edits={:?}",
             second.files.keys(),
             second.edits
+        );
+    }
+
+    /// pnpm lockfileVersion 6 embeds resolved peers in the `packages:` key
+    /// itself, so one name@version can appear as BOTH `/pkg@1.0.0:` and
+    /// `/pkg@1.0.0(peer@2.0.0):`. Rewriting only the plain entry is silent
+    /// fail-open: the dep is confirmed and attested while every dependent
+    /// resolving through the peered entry still installs the unpatched
+    /// upstream tarball. The whole dep must be refused with a warning naming
+    /// the unmatched key — nothing rewritten, nothing confirmed.
+    #[test]
+    fn pnpm_v6_mixed_plain_and_peered_is_refused() {
+        let lock = "lockfileVersion: '6.0'
+
+dependencies:
+  left-pad:
+    specifier: 1.3.0
+    version: 1.3.0
+
+packages:
+
+  /left-pad@1.3.0:
+    resolution: {integrity: sha512-UPSTREAM==}
+    dev: false
+
+  /left-pad@1.3.0(react@18.2.0):
+    resolution: {integrity: sha512-UPSTREAM==}
+    peerDependencies:
+      react: '*'
+    dev: false
+";
+        let mut files = BTreeMap::new();
+        files.insert("pnpm-lock.yaml".to_string(), lock.to_string());
+        let url = "http://patch.test/left-pad-1.3.0.tgz";
+        let overrides = vec![npm_override("left-pad", "1.3.0", url, "sha512-PATCHED==")];
+        let r = rewrite_registry_redirect(&files, &overrides);
+        assert!(
+            r.files.is_empty() && r.edits.is_empty(),
+            "a partially-matchable v6 lock must not be rewritten at all: files={:?} edits={:?}",
+            r.files.keys(),
+            r.edits
+        );
+        let warning = r
+            .warnings
+            .iter()
+            .find(|w| w.code == "redirect_pnpm_unsupported_lock_key")
+            .unwrap_or_else(|| panic!("refusal warning expected: {:?}", r.warnings));
+        assert!(
+            warning.detail.contains("/left-pad@1.3.0(react@18.2.0)"),
+            "warning must name the unmatched peered key: {}",
+            warning.detail
+        );
+        assert!(
+            !r.warnings
+                .iter()
+                .any(|w| w.code == "redirect_pnpm_entry_not_found"),
+            "the refusal replaces entry-not-found, not stacks on it: {:?}",
+            r.warnings
+        );
+    }
+
+    /// A v6 dep resolved ONLY through peer-suffixed keys previously degraded
+    /// to a bare `entry_not_found`; the refusal must instead name the exact
+    /// key the grammar cannot repoint so the operator knows the lock (not the
+    /// dep) is the problem.
+    #[test]
+    fn pnpm_v6_pure_peered_key_is_refused_by_name() {
+        let lock = "lockfileVersion: '6.0'
+
+packages:
+
+  /@socktest/pkg@1.0.0(react@18.2.0):
+    resolution: {integrity: sha512-UPSTREAM==}
+    dev: false
+";
+        let mut files = BTreeMap::new();
+        files.insert("pnpm-lock.yaml".to_string(), lock.to_string());
+        let overrides = vec![npm_override(
+            "@socktest/pkg",
+            "1.0.0",
+            "http://patch.test/socktest-pkg-1.0.0.tgz",
+            "sha512-PATCHED==",
+        )];
+        let r = rewrite_registry_redirect(&files, &overrides);
+        assert!(r.files.is_empty() && r.edits.is_empty());
+        let warning = r
+            .warnings
+            .iter()
+            .find(|w| w.code == "redirect_pnpm_unsupported_lock_key")
+            .unwrap_or_else(|| panic!("refusal warning expected: {:?}", r.warnings));
+        assert!(
+            warning
+                .detail
+                .contains("/@socktest/pkg@1.0.0(react@18.2.0)"),
+            "warning must name the unmatched key: {}",
+            warning.detail
+        );
+        assert!(
+            !r.warnings
+                .iter()
+                .any(|w| w.code == "redirect_pnpm_entry_not_found"),
+            "{:?}",
+            r.warnings
+        );
+    }
+
+    /// pnpm lockfileVersion 5.x keys are path-style (`/name/version:`, peers
+    /// suffixed `_peer@ver`) — the rewrite grammar never matches them, so the
+    /// dep must be refused with the keys named rather than silently reported
+    /// as a missing entry.
+    #[test]
+    fn pnpm_v5_path_style_keys_are_refused_by_name() {
+        let lock = "lockfileVersion: 5.4
+
+specifiers:
+  left-pad: 1.3.0
+
+dependencies:
+  left-pad: 1.3.0
+
+packages:
+
+  /left-pad/1.3.0:
+    resolution: {integrity: sha512-UPSTREAM==}
+    dev: false
+
+  /left-pad/1.3.0_react@18.2.0:
+    resolution: {integrity: sha512-UPSTREAM==}
+    dev: false
+";
+        let mut files = BTreeMap::new();
+        files.insert("pnpm-lock.yaml".to_string(), lock.to_string());
+        let overrides = vec![npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://patch.test/left-pad-1.3.0.tgz",
+            "sha512-PATCHED==",
+        )];
+        let r = rewrite_registry_redirect(&files, &overrides);
+        assert!(r.files.is_empty() && r.edits.is_empty());
+        let warning = r
+            .warnings
+            .iter()
+            .find(|w| w.code == "redirect_pnpm_unsupported_lock_key")
+            .unwrap_or_else(|| panic!("refusal warning expected: {:?}", r.warnings));
+        assert!(
+            warning.detail.contains("/left-pad/1.3.0")
+                && warning.detail.contains("/left-pad/1.3.0_react@18.2.0"),
+            "warning must name both v5 keys: {}",
+            warning.detail
+        );
+        assert!(
+            !r.warnings
+                .iter()
+                .any(|w| w.code == "redirect_pnpm_entry_not_found"),
+            "{:?}",
+            r.warnings
+        );
+    }
+
+    /// When a dep lives in a rewritable v9 lock AND a legacy lock in the same
+    /// set (e.g. a Rush nested lock still on pnpm 7), rewriting just the v9
+    /// lock would confirm the dep while the legacy lock keeps installing
+    /// upstream. The refusal must cover the WHOLE set: no lock rewritten.
+    #[test]
+    fn pnpm_legacy_lock_in_set_refuses_the_dep_everywhere() {
+        let v9_lock = "lockfileVersion: '9.0'
+
+packages:
+
+  left-pad@1.3.0:
+    resolution: {integrity: sha512-UPSTREAM==}
+";
+        let v5_lock = "lockfileVersion: 5.4
+
+packages:
+
+  /left-pad/1.3.0:
+    resolution: {integrity: sha512-UPSTREAM==}
+";
+        let mut files = BTreeMap::new();
+        files.insert("pnpm-lock.yaml".to_string(), v9_lock.to_string());
+        files.insert(
+            "common/config/rush/pnpm-lock.yaml".to_string(),
+            v5_lock.to_string(),
+        );
+        let overrides = vec![npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://patch.test/left-pad-1.3.0.tgz",
+            "sha512-PATCHED==",
+        )];
+        let r = rewrite_registry_redirect(&files, &overrides);
+        assert!(
+            r.files.is_empty() && r.edits.is_empty(),
+            "no lock in the set may be rewritten while a legacy key survives: files={:?}",
+            r.files.keys()
+        );
+        let warning = r
+            .warnings
+            .iter()
+            .find(|w| w.code == "redirect_pnpm_unsupported_lock_key")
+            .unwrap_or_else(|| panic!("refusal warning expected: {:?}", r.warnings));
+        assert!(
+            warning
+                .detail
+                .contains("/left-pad/1.3.0 in common/config/rush/pnpm-lock.yaml"),
+            "warning must name the key AND the lock it lives in: {}",
+            warning.detail
+        );
+    }
+
+    /// A v6 lock whose target dep has ONLY a plain `/name@version:` key (no
+    /// peered sibling anywhere) stays rewritable — the refusal must not
+    /// overreach to every v6 lock.
+    #[test]
+    fn pnpm_v6_plain_key_without_peered_sibling_still_rewrites() {
+        let lock = "lockfileVersion: '6.0'
+
+packages:
+
+  /left-pad@1.3.0:
+    resolution: {integrity: sha512-UPSTREAM==}
+    dev: false
+
+  /other-dep@2.0.0(react@18.2.0):
+    resolution: {integrity: sha512-OTHER==}
+    dev: false
+";
+        let mut files = BTreeMap::new();
+        files.insert("pnpm-lock.yaml".to_string(), lock.to_string());
+        let url = "http://patch.test/left-pad-1.3.0.tgz";
+        let overrides = vec![npm_override("left-pad", "1.3.0", url, "sha512-PATCHED==")];
+        let r = rewrite_registry_redirect(&files, &overrides);
+        let out = r.files.get("pnpm-lock.yaml").unwrap_or_else(|| {
+            panic!(
+                "plain v6 key must still be rewritten; warnings={:?}",
+                r.warnings
+            )
+        });
+        assert!(
+            out.contains(&format!(
+                "  /left-pad@1.3.0:\n    resolution: {{integrity: sha512-PATCHED==, tarball: {url}}}"
+            )),
+            "{out}"
+        );
+        assert!(
+            !r.warnings
+                .iter()
+                .any(|w| w.code.starts_with("redirect_pnpm_")),
+            "an unrelated dep's peered key must not trip the refusal: {:?}",
+            r.warnings
         );
     }
 

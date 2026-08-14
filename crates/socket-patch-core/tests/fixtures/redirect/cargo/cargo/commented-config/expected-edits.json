@@ -1,0 +1,9 @@
+[
+  {
+    "path": ".cargo/config.toml",
+    "kind": "redirect_cargo_registry",
+    "action": "added",
+    "key": "socket-patch-55555555-5555-5555-5555-555555555555",
+    "new": "[registries.socket-patch-55555555-5555-5555-5555-555555555555]\nindex = \"sparse+https://patch.socket.dev/patch-registry/cargo/11111111-1111-1111-1111-111111111111/55555555-5555-5555-5555-555555555555/index/\"\n"
+  }
+]
