@@ -353,12 +353,35 @@ async fn resolve_local_vendor_dir(cwd: &Path) -> Option<PathBuf> {
     }
 
     match read_config_vendor_dir(&cwd.join("composer.json")).await {
-        Some(configured) if path_safety::is_safe_multi_segment(&configured) => {
-            Some(cwd.join(configured))
-        }
-        Some(_) => None,
+        Some(configured) => normalize_config_vendor_dir(&configured)
+            .filter(|normalized| path_safety::is_safe_multi_segment(normalized))
+            .map(|normalized| cwd.join(normalized)),
         None => Some(cwd.join("vendor")),
     }
+}
+
+/// Reduce a `config.vendor-dir` value to plain `a/b` segments before the
+/// safety gate. Composer accepts `./`-prefixed and `.`-interleaved values
+/// (`./vendor`, `lib/./deps`) and either separator; refusing those shapes
+/// outright regressed projects that previously resolved fine at the
+/// hardcoded `vendor/`. `..` is resolved lexically the way Composer's own
+/// path resolution does; a value that climbs above the project root (or
+/// reduces to it) fails closed as `None`.
+fn normalize_config_vendor_dir(raw: &str) -> Option<String> {
+    if raw.starts_with(['/', '\\']) {
+        return None;
+    }
+    let mut segments: Vec<&str> = Vec::new();
+    for segment in raw.split(['/', '\\']) {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                segments.pop()?;
+            }
+            other => segments.push(other),
+        }
+    }
+    (!segments.is_empty()).then(|| segments.join("/"))
 }
 
 /// Read `config.vendor-dir` from a composer.json on disk. Opened with
@@ -1330,6 +1353,36 @@ mod tests {
             None
         );
         assert_eq!(parse_config_vendor_dir("{ not json"), None);
+    }
+
+    #[test]
+    fn test_normalize_config_vendor_dir() {
+        let n = normalize_config_vendor_dir;
+        // Composer-legal `./` prefixes and `.` segments reduce to the
+        // plain path; either separator is accepted.
+        assert_eq!(n("./vendor").as_deref(), Some("vendor"));
+        assert_eq!(n("./lib/deps").as_deref(), Some("lib/deps"));
+        assert_eq!(n("lib/./deps").as_deref(), Some("lib/deps"));
+        assert_eq!(n("lib\\deps").as_deref(), Some("lib/deps"));
+        assert_eq!(n("lib/../deps").as_deref(), Some("deps"));
+        assert_eq!(n("vendor").as_deref(), Some("vendor"));
+        // Escaping the project, reducing to it, or absolute — fail closed.
+        assert_eq!(n(".."), None);
+        assert_eq!(n("../elsewhere"), None);
+        assert_eq!(n("lib/../.."), None);
+        assert_eq!(n("."), None);
+        assert_eq!(n("a/.."), None);
+        assert_eq!(n("/etc/vendor"), None);
+        assert_eq!(n("\\\\share\\vendor"), None);
+        // A drive-letter segment survives normalization; the
+        // `is_safe_multi_segment` gate downstream rejects the colon.
+        assert_eq!(
+            n("C:\\Users\\x\\vendor").as_deref(),
+            Some("C:/Users/x/vendor")
+        );
+        assert!(!crate::patch::path_safety::is_safe_multi_segment(
+            "C:/Users/x/vendor"
+        ));
     }
 
     #[test]

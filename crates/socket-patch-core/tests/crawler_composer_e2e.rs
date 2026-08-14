@@ -773,6 +773,33 @@ async fn config_vendor_dir_relocates_discovery() {
     assert_eq!(packages[0].path, vendor.join("monolog").join("monolog"));
 }
 
+/// Composer accepts `./`-prefixed vendor-dir values (`./lib/deps`); refusing
+/// the `.` segment outright regressed such projects to zero discovery, worse
+/// than the old hardcoded `vendor/`. The normalizer reduces the value before
+/// the safety gate.
+#[tokio::test]
+#[serial_test::parallel]
+async fn config_vendor_dir_dot_prefix_is_normalized() {
+    let tmp = tempfile::tempdir().unwrap();
+    let vendor = stage_relocated_project(tmp.path(), "lib/deps", Some("./lib/deps")).await;
+    assert!(!tmp.path().join("vendor").exists());
+
+    let crawler = ComposerCrawler;
+    let paths = crawler
+        .get_vendor_paths(&options_at(tmp.path()))
+        .await
+        .unwrap();
+    assert_eq!(paths, vec![vendor.clone()]);
+
+    let packages = crawler.crawl_all(&options_at(tmp.path())).await;
+    assert_eq!(
+        packages.len(),
+        1,
+        "./-prefixed vendor-dir must be crawled; got {packages:?}"
+    );
+    assert_eq!(packages[0].purl, ORG_PURL);
+}
+
 /// A trailing separator is legal in `config.vendor-dir` (Composer rtrims it
 /// before use), so `"vendor-dir": "lib/deps/"` must resolve the same as
 /// `"lib/deps"` — a naive join would produce an empty final segment and
@@ -915,7 +942,13 @@ async fn absolute_config_vendor_dir_is_refused() {
     let absolute = stage_relocated_project(outer.path(), "abs-vendor", None).await;
     tokio::fs::write(
         root.join("composer.json"),
-        format!(r#"{{"config":{{"vendor-dir":"{}"}}}}"#, absolute.display()),
+        // Backslashes JSON-escaped so the manifest stays parseable on
+        // Windows — an unparseable manifest would fall back to `vendor/`
+        // and pass this refusal test vacuously.
+        format!(
+            r#"{{"config":{{"vendor-dir":"{}"}}}}"#,
+            absolute.display().to_string().replace('\\', "\\\\")
+        ),
     )
     .await
     .unwrap();
@@ -1026,7 +1059,10 @@ async fn install_path_escaping_project_root_is_rejected() {
               {{"name":"relative/evil","version":"1.0.0","install-path":"../../../evil/pkg"}},
               {{"name":"absolute/evil","version":"1.0.0","install-path":"{}"}}
             ]}}"#,
-            outside.display()
+            // JSON-escape Windows path separators: raw backslashes made the
+            // whole installed.json unparseable there, so even the in-project
+            // package vanished and the test failed for the wrong reason.
+            outside.display().to_string().replace('\\', "\\\\")
         ),
     )
     .await
