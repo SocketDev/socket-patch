@@ -20,6 +20,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::crawlers::composer_crawler::normalize_version;
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::vendor::yarn_berry_lock::yarnrc_compression_level;
 
@@ -1309,6 +1310,125 @@ fn rewrite_uv_lock(
 }
 
 // ── composer.lock ────────────────────────────────────────────────────────────
+/// Whether `text` points at `artifact_url` in any spelling a rewritten file may
+/// carry: the raw url every rewriter emits — composer.lock included, since
+/// composer writes its lock through PHP's `JSON_UNESCAPED_SLASHES` — or the
+/// `\/`-escaped slashes an older composer wrote, which redirect the install just
+/// as well. Shared by the composer rewriter's already-redirected check and the
+/// CLI's post-rewrite confirmation probe so the writer's spelling and the
+/// probe's cannot drift: the probe searched only raw and percent-encoded urls
+/// while the composer rewriter emitted `\/`, so a fully successful composer
+/// redirect reported nothing redirected — no patch record reached the ledger and
+/// `vex` had nothing to attest.
+pub fn artifact_url_present(text: &str, artifact_url: &str) -> bool {
+    text.contains(artifact_url) || text.contains(&artifact_url.replace('/', "\\/"))
+}
+
+/// Byte offset of the `}` closing the JSON object that CONTAINS `from`, which
+/// must be a position inside that object. Brace counting skips string literals,
+/// so a brace inside a description or URL cannot move the boundary.
+fn json_object_end_from(text: &str, from: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (offset, ch) in text[from..].char_indices() {
+        if in_string {
+            match ch {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' if depth == 0 => return Some(from + offset),
+            '}' => depth -= 1,
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Value of the first `"<key>": "<value>"` pair in `text` (composer writes its
+/// lock with exactly one space after the colon, the same shape the surgical
+/// `dist` regexes below assume).
+fn json_string_field<'a>(text: &'a str, key: &str) -> Option<&'a str> {
+    let pattern = format!("\"{key}\": \"");
+    let start = text.find(&pattern)? + pattern.len();
+    let end = text[start..].find('"')? + start;
+    Some(&text[start..end])
+}
+
+/// Outcome of locating a package entry in a composer.lock.
+enum ComposerEntry {
+    /// Inclusive byte range from the entry's `"name"` key to the `}` closing
+    /// the entry — composer writes `name` first, so this covers every key the
+    /// rewriter edits.
+    Found(usize, usize),
+    /// The name matched but the lock pins this OTHER version.
+    VersionMismatch(String),
+    NotFound,
+}
+
+/// Locate `pkg`'s entry in a composer.lock (either `packages[]` or
+/// `packages-dev[]` — the scan is over the whole file).
+///
+/// Names match CASE-INSENSITIVELY, the way the composer crawler and the vendor
+/// backend already match them: packagist canonicalizes to lowercase, but
+/// hand-written mixed-case locks install fine and would otherwise silently miss
+/// the redirect. The locked version must match the patched one through
+/// composer's leading-`v` normalization (locks carry the pretty `v6.4.1`, PURLs
+/// the bare `6.4.1`); matching on name alone repointed whatever version the
+/// lock happened to hold at a patch built for a different one.
+fn find_composer_entry(content: &str, pkg: &str, version: &str) -> ComposerEntry {
+    let mut mismatched: Option<String> = None;
+    for (name_idx, _) in content.match_indices("\"name\": \"") {
+        let Some(end) = json_object_end_from(content, name_idx) else {
+            continue;
+        };
+        let entry = &content[name_idx..=end];
+        if !json_string_field(entry, "name").is_some_and(|n| n.eq_ignore_ascii_case(pkg)) {
+            continue;
+        }
+        // Every package entry carries `version`; an `authors[]`/`support`
+        // object that happens to have a matching `name` does not.
+        let Some(locked) = json_string_field(entry, "version") else {
+            continue;
+        };
+        if normalize_version(locked) == normalize_version(version) {
+            return ComposerEntry::Found(name_idx, end);
+        }
+        mismatched = Some(locked.to_string());
+    }
+    match mismatched {
+        Some(locked) => ComposerEntry::VersionMismatch(locked),
+        None => ComposerEntry::NotFound,
+    }
+}
+
+/// Append `"shasum": "<sha1>"` as the last key of a `"dist": { … }` block,
+/// indented like the keys already in it. VCS/zipball dists omit `shasum`
+/// entirely; redirecting such a block without inserting the pin left the hosted
+/// artifact unverified, so composer would install whatever the URL returned.
+/// `block` is the whole dist object and already holds at least a `url`.
+fn append_composer_shasum(block: &str, sha1: &str) -> String {
+    let Some(close) = block.rfind('}') else {
+        return block.to_string();
+    };
+    let head = block[..close].trim_end();
+    let indent: String = head[head.rfind('\n').map_or(0, |i| i + 1)..]
+        .chars()
+        .take_while(|c| c.is_whitespace())
+        .collect();
+    format!(
+        "{head},\n{indent}\"shasum\": \"{sha1}\"{}",
+        &block[head.len()..]
+    )
+}
+
 fn rewrite_composer_lock(
     files: &BTreeMap<String, String>,
     overrides: &[DepOverride],
@@ -1321,6 +1441,7 @@ fn rewrite_composer_lock(
     if composer.is_empty() || !files.contains_key("composer.lock") {
         return;
     }
+    const DIST_KEY: &str = "\"dist\": {";
     let mut content = files["composer.lock"].clone();
     let type_re = Regex::new(r#"("type": ")[^"]*(")"#).unwrap();
     let url_re = Regex::new(r#"("url": ")[^"]*(")"#).unwrap();
@@ -1335,16 +1456,38 @@ fn rewrite_composer_lock(
             });
             continue;
         };
-        let Some(name_idx) = content.find(&format!("\"name\": \"{composer_name}\"")) else {
-            result.warnings.push(RewriteWarning {
-                code: "redirect_composer_pkg_not_found".into(),
-                detail: format!("no composer.lock package named {composer_name}"),
-            });
-            continue;
-        };
-        let Some(dist_start) = content[name_idx..]
-            .find("\"dist\": {")
-            .map(|r| name_idx + r)
+        let (entry_start, entry_end) =
+            match find_composer_entry(&content, &composer_name, &dep.version) {
+                ComposerEntry::Found(start, end) => (start, end),
+                ComposerEntry::VersionMismatch(locked) => {
+                    result.warnings.push(RewriteWarning {
+                        code: "redirect_composer_version_mismatch".into(),
+                        detail: format!(
+                            "composer.lock pins {composer_name}@{locked}, not the patched {}",
+                            dep.version
+                        ),
+                    });
+                    continue;
+                }
+                ComposerEntry::NotFound => {
+                    result.warnings.push(RewriteWarning {
+                        code: "redirect_composer_pkg_not_found".into(),
+                        detail: format!(
+                            "no composer.lock package named {composer_name}@{}",
+                            dep.version
+                        ),
+                    });
+                    continue;
+                }
+            };
+        // The dist block MUST belong to the located entry. Scanning forward
+        // from the name for the next `"dist": {` walked into the FOLLOWING
+        // package whenever the target was installed from source, repointing a
+        // bystander's url + shasum — a checksum-clean install of the wrong
+        // code. A target with no dist of its own pins nothing: fail closed.
+        let Some(dist_start) = content[entry_start..=entry_end]
+            .find(DIST_KEY)
+            .map(|offset| entry_start + offset)
         else {
             result.warnings.push(RewriteWarning {
                 code: "redirect_composer_no_dist".into(),
@@ -1352,20 +1495,41 @@ fn rewrite_composer_lock(
             });
             continue;
         };
-        let Some(dist_end) = content[dist_start..].find('}').map(|r| dist_start + r) else {
+        let Some(dist_end) = json_object_end_from(&content, dist_start + DIST_KEY.len()) else {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_composer_lock_malformed".into(),
+                detail: format!("{composer_name}'s dist block is unterminated"),
+            });
             continue;
         };
         let block = content[dist_start..=dist_end].to_string();
-        let escaped_url = dep.artifact_url.replace('/', "\\/");
+        // Already redirected (either slash spelling): recording an edit whose
+        // `original` IS the hosted url would grow the ledger on every re-run
+        // and poison a future revert.
+        if artifact_url_present(&block, &dep.artifact_url) && block.contains(&sha1) {
+            continue;
+        }
+        if !block.contains("\"url\": \"") {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_composer_no_dist_url".into(),
+                detail: format!("{composer_name}'s dist block has no url to redirect"),
+            });
+            continue;
+        }
         let mut rewritten = type_re.replace(&block, "${1}zip${2}").to_string();
         rewritten = url_re
-            .replace(&rewritten, format!("${{1}}{escaped_url}${{2}}").as_str())
+            .replace(
+                &rewritten,
+                format!("${{1}}{}${{2}}", dep.artifact_url).as_str(),
+            )
             .to_string();
-        if rewritten.contains("\"shasum\": \"") {
-            rewritten = shasum_re
+        rewritten = if rewritten.contains("\"shasum\": \"") {
+            shasum_re
                 .replace(&rewritten, format!("${{1}}{sha1}${{2}}").as_str())
-                .to_string();
-        }
+                .to_string()
+        } else {
+            append_composer_shasum(&rewritten, &sha1)
+        };
         if rewritten != block {
             content = format!(
                 "{}{}{}",
@@ -3681,5 +3845,205 @@ snapshots:
             second.files.keys(),
             second.edits
         );
+    }
+
+    const COMPOSER_ARTIFACT_URL: &str =
+        "https://patch.socket.dev/patch/composer/acme/target/1.0.0/\
+                                         11111111-1111-1111-1111-111111111111/\
+                                         44444444-4444-4444-4444-444444444444/target-1.0.0.zip";
+    const COMPOSER_SHA1: &str = "abcdef0123456789abcdef0123456789abcdef01";
+
+    fn composer_override(version: &str) -> DepOverride {
+        DepOverride {
+            ecosystem: "composer".into(),
+            name: "target".into(),
+            namespace: Some("acme".into()),
+            version: version.into(),
+            token: String::new(),
+            patch_uuid: "44444444-4444-4444-4444-444444444444".into(),
+            artifact_url: COMPOSER_ARTIFACT_URL.into(),
+            berry_zip_url: None,
+            registry_override: None,
+            integrity: Integrity {
+                sha1: Some(COMPOSER_SHA1.into()),
+                ..Default::default()
+            },
+        }
+    }
+
+    /// A composer.lock holding `acme/target` (dist shaped by `target_dist`)
+    /// followed by an untouchable bystander that DOES have a dist.
+    fn composer_lock_with(target_dist: &str) -> String {
+        format!(
+            "{{
+    \"packages\": [
+        {{
+            \"name\": \"acme/target\",
+            \"version\": \"1.0.0\",{target_dist}
+        }},
+        {{
+            \"name\": \"innocent/bystander\",
+            \"version\": \"2.0.0\",
+            \"dist\": {{
+                \"type\": \"zip\",
+                \"url\": \"https://api.github.com/repos/innocent/bystander/zipball/beef\",
+                \"reference\": \"beef\",
+                \"shasum\": \"\"
+            }}
+        }}
+    ],
+    \"packages-dev\": []
+}}
+"
+        )
+    }
+
+    fn composer_result(lock: &str, version: &str) -> RewriteResult {
+        let mut files = BTreeMap::new();
+        files.insert("composer.lock".to_string(), lock.to_string());
+        rewrite_registry_redirect(&files, &[composer_override(version)])
+    }
+
+    /// A source-only target (composer.lock records `source`, no `dist` — a VCS
+    /// install) must fail closed. The rewriter used to find the package by name
+    /// and then scan FORWARD for the next `"dist": {` with no package boundary,
+    /// so it repointed the FOLLOWING package's url AND shasum at the target's
+    /// patch: a checksum-clean install of the wrong code.
+    #[test]
+    fn composer_source_only_target_never_touches_the_next_package() {
+        let lock = composer_lock_with(
+            "
+            \"source\": {
+                \"type\": \"git\",
+                \"url\": \"https://github.com/acme/target.git\",
+                \"reference\": \"cafe\"
+            }",
+        );
+        let r = composer_result(&lock, "1.0.0");
+        assert!(
+            r.files.is_empty() && r.edits.is_empty(),
+            "no dist belongs to acme/target, so nothing may be rewritten: files={:?} edits={:?}",
+            r.files.keys(),
+            r.edits
+        );
+        assert_eq!(warning_codes(&r), vec!["redirect_composer_no_dist"]);
+    }
+
+    /// A dist block with NO `shasum` key (VCS/zipball dists omit it) must get
+    /// the pin inserted, not redirected unpinned: composer would otherwise
+    /// install whatever the hosted url returned with nothing verifying it.
+    #[test]
+    fn composer_dist_without_shasum_key_gets_the_pin_inserted() {
+        let lock = composer_lock_with(
+            "
+            \"dist\": {
+                \"type\": \"zip\",
+                \"url\": \"https://example.test/vcs/acme/target/zipball/cafe\",
+                \"reference\": \"cafe\"
+            }",
+        );
+        let r = composer_result(&lock, "1.0.0");
+        let out = r
+            .files
+            .get("composer.lock")
+            .unwrap_or_else(|| panic!("the dist must be redirected; warnings={:?}", r.warnings));
+        assert!(
+            out.contains(&format!(
+                "\"reference\": \"cafe\",\n                \"shasum\": \"{COMPOSER_SHA1}\""
+            )),
+            "the sha1 must be pinned as the dist's last key, at the block's own indent: {out}"
+        );
+        assert!(
+            serde_json::from_str::<Value>(out).is_ok(),
+            "the surgical insertion must leave valid JSON: {out}"
+        );
+        assert!(
+            out.contains("zipball/beef") && !out.contains("bystander/zipball/cafe"),
+            "the bystander's dist must be untouched: {out}"
+        );
+        assert!(r.warnings.is_empty(), "no warnings: {:?}", r.warnings);
+
+        // Re-run over the pinned output: nothing left to change.
+        let mut again = BTreeMap::new();
+        again.insert("composer.lock".to_string(), out.clone());
+        let second = rewrite_registry_redirect(&again, &[composer_override("1.0.0")]);
+        assert!(
+            second.files.is_empty() && second.edits.is_empty(),
+            "re-run must be a no-op: files={:?} edits={:?}",
+            second.files.keys(),
+            second.edits
+        );
+    }
+
+    /// The locked version must match the patched one. Matching on name alone
+    /// repointed whichever version the lock happened to hold at a patch built
+    /// for a different one.
+    #[test]
+    fn composer_version_mismatch_fails_closed() {
+        let lock = composer_lock_with(
+            "
+            \"dist\": {
+                \"type\": \"zip\",
+                \"url\": \"https://example.test/acme/target/zipball/cafe\",
+                \"reference\": \"cafe\",
+                \"shasum\": \"\"
+            }",
+        );
+        let r = composer_result(&lock, "9.9.9");
+        assert!(
+            r.files.is_empty() && r.edits.is_empty(),
+            "a lock pinning another version must not be rewritten: {:?}",
+            r.files.keys()
+        );
+        assert_eq!(
+            warning_codes(&r),
+            vec!["redirect_composer_version_mismatch"]
+        );
+    }
+
+    /// An already-redirected lock is left alone whichever way it spells the
+    /// hosted url — a lock written by older composer carries `\/`-escaped
+    /// slashes. Re-recording an edit whose `original` IS the hosted url would
+    /// grow the committed ledger on every run and poison a future revert.
+    #[test]
+    fn composer_rerun_over_an_escaped_slash_redirect_is_a_noop() {
+        let escaped = COMPOSER_ARTIFACT_URL.replace('/', "\\/");
+        let lock = composer_lock_with(&format!(
+            "
+            \"dist\": {{
+                \"type\": \"zip\",
+                \"url\": \"{escaped}\",
+                \"reference\": \"cafe\",
+                \"shasum\": \"{COMPOSER_SHA1}\"
+            }}"
+        ));
+        let r = composer_result(&lock, "1.0.0");
+        assert!(
+            r.files.is_empty() && r.edits.is_empty() && r.warnings.is_empty(),
+            "an already-redirected lock must be a no-op: files={:?} edits={:?} warnings={:?}",
+            r.files.keys(),
+            r.edits,
+            r.warnings
+        );
+    }
+
+    /// A dist block with no `url` has nothing to redirect: pinning a shasum
+    /// onto it would claim a redirect that cannot happen.
+    #[test]
+    fn composer_dist_without_url_fails_closed() {
+        let lock = composer_lock_with(
+            "
+            \"dist\": {
+                \"type\": \"path\",
+                \"reference\": \"cafe\"
+            }",
+        );
+        let r = composer_result(&lock, "1.0.0");
+        assert!(
+            r.files.is_empty() && r.edits.is_empty(),
+            "nothing may be rewritten: {:?}",
+            r.files.keys()
+        );
+        assert_eq!(warning_codes(&r), vec!["redirect_composer_no_dist_url"]);
     }
 }

@@ -1970,3 +1970,192 @@ async fn redirect_json_mode_write_failures_emit_error_envelope() {
     let out = run_leg(tmp.path(), &server).await;
     assert_error_envelope(&out, "ledger-write failure");
 }
+
+// ── composer ─────────────────────────────────────────────────────────────
+
+const COMPOSER_PURL: &str = "pkg:composer/monolog/monolog@2.0.0";
+const COMPOSER_UUID: &str = "66666666-6666-4666-8666-666666666666";
+const COMPOSER_URL: &str = "http://patch.test/patch/composer/monolog/monolog/2.0.0/\
+                            77777777-7777-4777-8777-777777777777/\
+                            66666666-6666-4666-8666-666666666666/monolog-2.0.0.zip";
+const COMPOSER_SHA1: &str = "abcdef0123456789abcdef0123456789abcdef01";
+
+/// A composer project discovered through `vendor/composer/installed.json`,
+/// with the lock the redirect rewriter edits. The lock is composer-native:
+/// `JSON_UNESCAPED_SLASHES`, 4-space indent.
+fn write_composer_project(root: &Path) {
+    std::fs::write(
+        root.join("composer.json"),
+        "{ \"require\": { \"monolog/monolog\": \"2.0.0\" } }\n",
+    )
+    .unwrap();
+    let installed = root.join("vendor").join("composer");
+    std::fs::create_dir_all(&installed).unwrap();
+    std::fs::write(
+        installed.join("installed.json"),
+        r#"{ "packages": [ { "name": "monolog/monolog", "version": "2.0.0" } ] }
+"#,
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.join("vendor/monolog/monolog")).unwrap();
+    std::fs::write(
+        root.join("composer.lock"),
+        r#"{
+    "content-hash": "abc123def456abc123def456abc1",
+    "packages": [
+        {
+            "name": "monolog/monolog",
+            "version": "2.0.0",
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/Seldaek/monolog/zipball/abc123",
+                "reference": "abc123def456",
+                "shasum": ""
+            }
+        }
+    ],
+    "packages-dev": []
+}
+"#,
+    )
+    .unwrap();
+}
+
+async fn mock_composer_api(server: &MockServer) {
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/batch")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "packages": [{
+                "purl": COMPOSER_PURL,
+                "patches": [{
+                    "uuid": COMPOSER_UUID, "purl": COMPOSER_PURL, "tier": "free",
+                    "cveIds": [], "ghsaIds": [], "severity": "high",
+                    "title": "composer redirect fixture"
+                }]
+            }],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex(format!(
+            "^/v0/orgs/{ORG}/patches/by-package/.+$"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "patches": [{
+                "uuid": COMPOSER_UUID, "purl": COMPOSER_PURL,
+                "publishedAt": "2024-01-01T00:00:00Z",
+                "description": "x", "license": "MIT", "tier": "free",
+                "vulnerabilities": {}
+            }],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(server)
+        .await;
+    // composer pins `dist.shasum` — a sha1, not npm's sha512.
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/package")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "results": {
+                COMPOSER_UUID: {
+                    "status": "granted",
+                    "url": COMPOSER_URL,
+                    "purl": COMPOSER_PURL,
+                    "artifacts": [{
+                        "kind": "tarball",
+                        "url": COMPOSER_URL,
+                        "integrity": { "sha1": COMPOSER_SHA1 }
+                    }],
+                    "registryOverride": null
+                }
+            }
+        })))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/view/{COMPOSER_UUID}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "uuid": COMPOSER_UUID,
+            "purl": COMPOSER_PURL,
+            "publishedAt": "2024-01-01T00:00:00Z",
+            "files": {
+                "src/Logger.php": {
+                    "beforeHash": "a".repeat(64),
+                    "afterHash": "b".repeat(64),
+                }
+            },
+            "vulnerabilities": {
+                GHSA: {
+                    "cves": ["CVE-2024-9"],
+                    "summary": "composer redirect fixture",
+                    "severity": "high",
+                    "description": "d"
+                }
+            },
+            "description": "x", "license": "MIT", "tier": "free"
+        })))
+        .mount(server)
+        .await;
+}
+
+/// End-to-end regression for the composer redirect that reported itself as
+/// having done nothing: the rewriter wrote the hosted url with `\/`-escaped
+/// slashes while the post-rewrite confirmation probe searched only the raw and
+/// percent-encoded spellings, so a fully successful rewrite yielded
+/// `redirected: 0`, no patch record in the ledger, and nothing for `vex` to
+/// attest. The rewriter now emits composer-native raw slashes and the probe
+/// asks the rewriter's own predicate, so the lock edit and the confirmation
+/// cannot disagree. Subprocess so the `--json` envelope can be read back.
+#[tokio::test]
+#[serial]
+async fn composer_redirect_is_confirmed_and_recorded() {
+    let server = MockServer::start().await;
+    mock_composer_api(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_composer_project(tmp.path());
+
+    let env = run_redirect_subprocess(tmp.path(), &server.uri());
+    assert_eq!(env["status"], "success", "envelope: {env}");
+    assert_eq!(
+        env["redirect"]["redirected"], 1,
+        "the composer redirect must be CONFIRMED, not silently unconfirmed: {env}"
+    );
+    assert_eq!(
+        env["redirect"]["rewrittenFiles"][0], "composer.lock",
+        "composer.lock must be the rewritten file: {env}"
+    );
+    assert!(
+        warning_codes(&env).is_empty(),
+        "a clean composer redirect emits no warnings; got {:?}",
+        warning_codes(&env)
+    );
+
+    let lock = std::fs::read_to_string(tmp.path().join("composer.lock")).unwrap();
+    assert!(
+        lock.contains(&format!("\"url\": \"{COMPOSER_URL}\"")),
+        "dist.url must be the hosted patch with composer-native raw slashes; got:\n{lock}"
+    );
+    assert!(
+        !lock.contains("\\/"),
+        "composer writes lock JSON with JSON_UNESCAPED_SLASHES — no escaped slashes may \
+         be introduced; got:\n{lock}"
+    );
+    assert!(
+        lock.contains(&format!("\"shasum\": \"{COMPOSER_SHA1}\"")),
+        "dist.shasum must pin the patched artifact's sha1; got:\n{lock}"
+    );
+
+    // The confirmation is what drives the record fetch: no confirmation, no
+    // record, and `socket-patch vex` can never attest the patch.
+    let ledger =
+        std::fs::read_to_string(tmp.path().join(".socket/vendor/redirect-state.json")).unwrap();
+    assert!(
+        ledger.contains(COMPOSER_PURL) && ledger.contains(GHSA),
+        "the ledger must carry the fetched patch record for the redirected purl: {ledger}"
+    );
+    assert!(
+        ledger.contains("redirect_composer_dist"),
+        "the ledger must carry the revert edit for the lock rewrite: {ledger}"
+    );
+}
