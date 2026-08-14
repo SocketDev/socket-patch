@@ -5,8 +5,11 @@
 //! a `pnpm-lock.yaml` only routes to the pnpm backend when its
 //! `lockfileVersion` is one we have fixtures for, and a `yarn.lock` routes
 //! to classic or berry by its header (the v1 comment vs a top-level
-//! `__metadata:` key). Only yarn PnP projects (`.pnp.*` loaders) are
-//! refused outright — their packages never land on disk to stage.
+//! `__metadata:` key). Only PnP projects (`.pnp.*` loaders) are refused
+//! outright: yarn-berry PnP because its packages never land on disk to
+//! stage, and pnpm's own `node-linker=pnp` mode (same loader file, real
+//! package dirs) because the file: rewiring is unvalidated under that
+//! linker — each with its own code and remedy.
 //!
 //! The router fans `vendor`/`revert` out per detected flavor. All five
 //! flavors have real backends: package-lock ([`super::npm_lock`]),
@@ -83,7 +86,11 @@ const LOCKFILE_FAMILIES: [(NpmLockFlavor, &[&str]); 4] = [
 /// Probe the project root for the lockfile flavor that drives npm installs.
 ///
 /// Decision table, first match wins:
-/// 1. a PnP loader file → Err `vendor_yarn_berry_unsupported`;
+/// 1. a PnP loader file → Err `vendor_yarn_berry_unsupported` — unless the
+///    tree is pnpm's own `node-linker=pnp` layout (pnpm-lock.yaml + installed
+///    pnpm store + no yarn.lock, see
+///    [`crate::crawlers::pkg_managers::pnpm_pnp_layout`]) → Err
+///    `vendor_pnpm_pnp_unsupported` with a pnpm remedy;
 /// 2. `bun.lock` → Bun; else `bun.lockb` → Err `vendor_bun_lockb_unsupported`;
 /// 3. `pnpm-lock.yaml` → head-sniff `lockfileVersion` (only `'9.0'`) → Pnpm,
 ///    else Err `vendor_lockfile_version_unsupported`;
@@ -109,9 +116,28 @@ pub(crate) async fn detect_npm_lock_flavor(
     };
 
     // 1. Yarn berry PnP — checked first because it means packages are not on
-    //    disk at all, whatever lockfiles are also lying around.
+    //    disk at all, whatever lockfiles are also lying around. Carve-out:
+    //    pnpm's own PnP mode (`node-linker=pnp` in `.npmrc`) writes the same
+    //    loader but is a pnpm project — recommending `yarn patch` there is
+    //    wrong twice over. Vendor still refuses (the file: rewiring has no
+    //    fixtures under pnpm's PnP linker — fail closed), but with a pnpm
+    //    diagnosis and remedy.
     for marker in PNP_MARKERS {
         if exists(marker).await {
+            if crate::crawlers::pkg_managers::pnpm_pnp_layout(project_root) {
+                return Err((
+                    "vendor_pnpm_pnp_unsupported",
+                    format!(
+                        "found `{marker}` alongside pnpm-lock.yaml and an installed pnpm \
+                         store: this is a pnpm project using `node-linker=pnp` (.npmrc), \
+                         not yarn berry — vendor's relative file: rewiring is not \
+                         validated under pnpm's Plug'n'Play linker; use `socket-patch \
+                         scan --mode hosted` (which edits pnpm-lock.yaml in place), or \
+                         switch .npmrc to `node-linker=isolated`, run `pnpm install`, \
+                         and re-run vendor"
+                    ),
+                ));
+            }
             return Err((
                 "vendor_yarn_berry_unsupported",
                 format!(
@@ -456,6 +482,56 @@ mod tests {
             assert!(detail.contains(marker), "{detail}");
             assert!(detail.contains("yarn patch"), "{detail}");
         }
+    }
+
+    /// Stage the root markers a real `pnpm install` with
+    /// `node-linker=pnp` emits (layout verified against pnpm 10.28.2):
+    /// the `.pnp.cjs` loader, pnpm-lock.yaml, and an installed virtual
+    /// store with the per-project pnpm marker.
+    async fn stage_pnpm_pnp_layout(root: &Path) {
+        touch(root, ".pnp.cjs", "/* pnp */").await;
+        touch(root, "pnpm-lock.yaml", PNPM_9).await;
+        tokio::fs::create_dir_all(
+            root.join("node_modules/.pnpm/flatted@3.3.1/node_modules/flatted"),
+        )
+        .await
+        .unwrap();
+        touch(&root.join("node_modules"), ".modules.yaml", "").await;
+    }
+
+    /// pnpm's own PnP mode (`node-linker=pnp`) writes a `.pnp.cjs` just
+    /// like yarn-berry — the probe must refuse with a pnpm diagnosis and
+    /// remedy, never `vendor_yarn_berry_unsupported` / "use yarn patch"
+    /// (a yarn command in a pnpm repo).
+    #[tokio::test]
+    async fn pnpm_pnp_layout_refuses_with_pnpm_remedy() {
+        let tmp = tempfile::tempdir().unwrap();
+        stage_pnpm_pnp_layout(tmp.path()).await;
+        let (code, detail) = detect_npm_lock_flavor(tmp.path()).await.unwrap_err();
+        assert_eq!(code, "vendor_pnpm_pnp_unsupported");
+        assert!(detail.contains("node-linker=pnp"), "{detail}");
+        assert!(detail.contains("scan --mode hosted"), "{detail}");
+        assert!(!detail.contains("yarn patch"), "{detail}");
+    }
+
+    /// The pnpm-PnP carve-out stays fail-closed: a yarn.lock alongside
+    /// the loader (ambiguous multi-PM tree), or a stale pnpm-lock.yaml
+    /// with no installed pnpm store, keeps the yarn-berry refusal.
+    #[tokio::test]
+    async fn pnpm_pnp_carve_out_stays_yarn_berry_when_ambiguous() {
+        // Both lockfiles present: ambiguous, yarn-berry refusal wins.
+        let tmp = tempfile::tempdir().unwrap();
+        stage_pnpm_pnp_layout(tmp.path()).await;
+        touch(tmp.path(), "yarn.lock", YARN_BERRY).await;
+        let (code, _) = detect_npm_lock_flavor(tmp.path()).await.unwrap_err();
+        assert_eq!(code, "vendor_yarn_berry_unsupported");
+
+        // Stale pnpm-lock.yaml, no installed store: no escape either.
+        let tmp = tempfile::tempdir().unwrap();
+        touch(tmp.path(), ".pnp.cjs", "/* pnp */").await;
+        touch(tmp.path(), "pnpm-lock.yaml", PNPM_9).await;
+        let (code, _) = detect_npm_lock_flavor(tmp.path()).await.unwrap_err();
+        assert_eq!(code, "vendor_yarn_berry_unsupported");
     }
 
     #[tokio::test]

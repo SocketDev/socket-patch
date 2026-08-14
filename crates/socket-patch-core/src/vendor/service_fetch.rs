@@ -171,10 +171,16 @@ pub(crate) async fn service_archive_copy(
             ));
             ServiceCopy::Used(archive.bytes)
         }
-        ServiceArtifact::IntegrityMismatch(reason) => miss(
-            warnings,
+        // Bytes that fail integrity verification are an active tamper signal:
+        // ALWAYS a hard error, in `auto` exactly as in `service` — never a
+        // quiet local-build fallback ([`ServiceArtifact`]'s documented
+        // contract).
+        ServiceArtifact::IntegrityMismatch(reason) => hard(
             "vendor_prebuilt_integrity_mismatch",
-            format!("prebuilt {noun} failed integrity ({reason})"),
+            format!(
+                "prebuilt {noun} failed integrity verification ({reason}); \
+                 refusing to fall back to a local build on tampered bytes"
+            ),
         ),
         ServiceArtifact::Pending => miss(
             warnings,
@@ -328,6 +334,32 @@ mod tests {
             fetch_verified_archive(&cfg_for(&server), UUID).await,
             ServiceArtifact::IntegrityMismatch(_)
         ));
+    }
+
+    /// AUDIT B3: IntegrityMismatch is a hard error in EVERY mode — under the
+    /// default `auto` the Tier-A copy must refuse, never fall back to a local
+    /// rebuild on tampered bytes (the enum's own contract: "never fall back").
+    #[tokio::test]
+    async fn service_copy_integrity_mismatch_auto_hard_fails() {
+        let server = MockServer::start().await;
+        let body = b"the real bytes";
+        let wrong = PackedTarball::from_bytes(b"completely different bytes").integrity;
+        mount_granted(&server, &wrong, body).await;
+        let mut cfg = cfg_for(&server);
+        cfg.source = VendorSource::Auto;
+        let mut warnings = Vec::new();
+        match service_archive_copy(Some(&cfg), UUID, "x", ".jar", &mut warnings).await {
+            ServiceCopy::HardFail(outcome) => match *outcome {
+                VendorOutcome::Refused { code, .. } => {
+                    assert_eq!(code, "vendor_prebuilt_integrity_mismatch");
+                }
+                other => panic!("expected Refused, got {other:?}"),
+            },
+            ServiceCopy::Used(_) => panic!("tampered bytes must never be used"),
+            ServiceCopy::FallBack => {
+                panic!("auto fell back to a local build on tampered bytes")
+            }
+        }
     }
 
     /// `--vendor-source=service --offline` is a fail-closed refusal (the same
