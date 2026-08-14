@@ -316,7 +316,9 @@ fn scan_vendored(cwd: &Path, extra: &[&str]) -> serde_json::Value {
         "scan --mode vendored failed (exit {code}).\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     let env: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
-        panic!("scan --mode vendored did not emit JSON ({e}).\nstdout:\n{stdout}\nstderr:\n{stderr}")
+        panic!(
+            "scan --mode vendored did not emit JSON ({e}).\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        )
     });
     assert_eq!(
         env["status"].as_str(),
@@ -385,8 +387,16 @@ fn assert_download_uuid(env: &serde_json::Value, uuids: &[&str], leg: &str) {
 /// `vendor --revert --json` in `cwd`, asserting success and returning the
 /// number of reverted entries.
 fn vendor_revert(cwd: &Path, leg: &str) -> u64 {
-    let (code, stdout, stderr) =
-        run_socket(cwd, &["vendor", "--revert", "--json", "--cwd", cwd.to_str().unwrap()]);
+    let (code, stdout, stderr) = run_socket(
+        cwd,
+        &[
+            "vendor",
+            "--revert",
+            "--json",
+            "--cwd",
+            cwd.to_str().unwrap(),
+        ],
+    );
     assert_eq!(
         code, 0,
         "{leg}: vendor --revert failed (exit {code}).\nstdout:\n{stdout}\nstderr:\n{stderr}"
@@ -730,7 +740,11 @@ fn npm_package_lock_vendored_install_proof() {
     let fresh = tmp.path().join("fresh");
     std::fs::create_dir_all(&fresh).unwrap();
     std::fs::copy(proj.join("package.json"), fresh.join("package.json")).unwrap();
-    std::fs::copy(proj.join("package-lock.json"), fresh.join("package-lock.json")).unwrap();
+    std::fs::copy(
+        proj.join("package-lock.json"),
+        fresh.join("package-lock.json"),
+    )
+    .unwrap();
     copy_dir_recursive(&proj.join(".socket"), &fresh.join(".socket"));
 
     let fresh_cache = tmp.path().join("fresh-npm-cache").display().to_string();
@@ -1327,7 +1341,11 @@ fn pypi_requirements_txt_vendored_install_proof() {
     // from the project root (bare relative paths resolve against the CWD).
     let fresh = tmp.path().join("fresh");
     std::fs::create_dir_all(&fresh).unwrap();
-    std::fs::copy(proj.join("requirements.txt"), fresh.join("requirements.txt")).unwrap();
+    std::fs::copy(
+        proj.join("requirements.txt"),
+        fresh.join("requirements.txt"),
+    )
+    .unwrap();
     copy_dir_recursive(&proj.join(".socket"), &fresh.join(".socket"));
     let fresh_venv = fresh.join(".venv");
     assert!(
@@ -1415,7 +1433,11 @@ fn pypi_uv_lock_vendored_install_proof() {
     }
     let venv = proj.join(".venv");
     let Some(site) = site_packages(&venv) else {
-        soft_skip!(LEG, "could not locate site-packages under {}", venv.display());
+        soft_skip!(
+            LEG,
+            "could not locate site-packages under {}",
+            venv.display()
+        );
     };
     assert!(
         !urllib3_patched(&site),
@@ -1551,7 +1573,9 @@ fn cargo_vendored_install_proof() {
 
     // Vendored directory carries the patch; the registry source stays pristine.
     let vendored_lib = proj
-        .join(format!(".socket/vendor/cargo/{CARGO_UUID}/{CARGO_NAME}-{CARGO_VERSION}"))
+        .join(format!(
+            ".socket/vendor/cargo/{CARGO_UUID}/{CARGO_NAME}-{CARGO_VERSION}"
+        ))
         .join("src/lib.rs");
     assert_patched(&vendored_lib, CARGO_MARKER, LEG);
     if let Some(ref lib) = registry_lib {
@@ -1745,7 +1769,9 @@ fn gem_bundler_vendored_known_platform_defect() {
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
 
-    let applied = env_json["vendor"]["summary"]["applied"].as_u64().unwrap_or(0);
+    let applied = env_json["vendor"]["summary"]["applied"]
+        .as_u64()
+        .unwrap_or(0);
     if code == 0 && applied >= 1 {
         // The CLI now vendors platform gems. Say so loudly — this leg should be
         // promoted to a full delivery proof (bundle install frozen) and this
@@ -1759,10 +1785,13 @@ fn gem_bundler_vendored_known_platform_defect() {
     }
 
     // Otherwise: it must be exactly the known `platform_gem_unsupported` failure.
-    let events = env_json["vendor"]["events"].as_array().cloned().unwrap_or_default();
-    let is_known = events.iter().any(|e| {
-        e["action"] == "failed" && e["errorCode"] == "platform_gem_unsupported"
-    });
+    let events = env_json["vendor"]["events"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let is_known = events
+        .iter()
+        .any(|e| e["action"] == "failed" && e["errorCode"] == "platform_gem_unsupported");
     assert!(
         !gem_strict,
         "{LEG}: SOCKET_PATCH_VENDORED_E2E_GEM_STRICT=1 and vendoring {GEM_PURL} did not succeed \
@@ -1809,7 +1838,9 @@ fn golang_vendored_finds_no_free_patches() {
     .expect("write go.mod");
 
     let env_json = scan_vendored(&proj, &["--ecosystems", "golang"]);
-    let applied = env_json["vendor"]["summary"]["applied"].as_u64().unwrap_or(0);
+    let applied = env_json["vendor"]["summary"]["applied"]
+        .as_u64()
+        .unwrap_or(0);
     assert_eq!(
         applied, 0,
         "{LEG}: golang vendored something, but production publishes no free golang patches. \
@@ -1849,7 +1880,9 @@ fn deno_vendored_is_unsupported() {
     .expect("write deno.json");
 
     let env_json = scan_vendored(&proj, &["--ecosystems", "deno"]);
-    let applied = env_json["vendor"]["summary"]["applied"].as_u64().unwrap_or(0);
+    let applied = env_json["vendor"]["summary"]["applied"]
+        .as_u64()
+        .unwrap_or(0);
     assert_eq!(
         applied, 0,
         "{LEG}: deno vendored something, but vendored mode is not supported for deno:\n{env_json:#}"

@@ -543,6 +543,22 @@ pub fn remove_replace_entry(
                     if e.module == module && e.owner == Some(owner) {
                         keep[i] = false;
                         changed = true;
+                        // The upsert appends its single-line directive behind
+                        // ONE blank separator (the gofmt stanza shape `go mod
+                        // tidy` itself produces). Removal must be its exact
+                        // inverse or a vendor/apply→revert round-trip strands
+                        // a blank line and the restored go.mod is no longer
+                        // byte-identical. Drop the preceding blank only when
+                        // it isn't doing separation work for what FOLLOWS
+                        // (next line is EOF or itself blank) — a blank
+                        // between the directive and real user content below
+                        // stays.
+                        if i > 0
+                            && lines[i - 1].trim().is_empty()
+                            && (i + 1 >= lines.len() || lines[i + 1].trim().is_empty())
+                        {
+                            keep[i - 1] = false;
+                        }
                     }
                 }
             }
@@ -1035,6 +1051,54 @@ replace (
             remove_replace_entry(gomod, "github.com/foo/bar", ReplaceOwner::GoPatches)
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    /// ensure→drop must restore go.mod BYTE-IDENTICAL: the upsert appends a
+    /// blank stanza separator before its directive (the tidy-stable shape),
+    /// so removal must take that blank back out — vendor/apply revert pins
+    /// the round-trip byte-for-byte (e2e_vendor_golang_build). A blank that
+    /// separates the directive from real user content below must survive.
+    #[test]
+    fn test_upsert_then_remove_round_trips_byte_identical() {
+        for original in [
+            "module m\n\ngo 1.21\n\nrequire github.com/foo/bar v1.4.2\n",
+            // No trailing blank structure at all.
+            "module m\n",
+        ] {
+            let upserted =
+                upsert_replace_entry(original, "github.com/foo/bar", "v1.4.2", GO_PATCHES_DIR)
+                    .unwrap()
+                    .unwrap();
+            let restored =
+                remove_replace_entry(&upserted, "github.com/foo/bar", ReplaceOwner::GoPatches)
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(restored, original, "byte-identical round-trip");
+            // Hosted flavor too (module-target directive).
+            let upserted = upsert_hosted_replace_entry(
+                original,
+                "github.com/foo/bar",
+                "v1.4.2",
+                HOSTED_MOD,
+                "v1.4.2-socketpatch.1",
+            )
+            .unwrap()
+            .unwrap();
+            let restored =
+                remove_replace_entry(&upserted, "github.com/foo/bar", ReplaceOwner::Hosted)
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(restored, original, "hosted byte-identical round-trip");
+        }
+        // User content BELOW the directive: the separating blank stays.
+        let with_tail = "module m\n\nreplace github.com/foo/bar v1.4.2 => ./.socket/go-patches/github.com/foo/bar@v1.4.2\n// user note\n";
+        let out = remove_replace_entry(with_tail, "github.com/foo/bar", ReplaceOwner::GoPatches)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            out, "module m\n\n// user note\n",
+            "blank separating user content below survives"
         );
     }
 
