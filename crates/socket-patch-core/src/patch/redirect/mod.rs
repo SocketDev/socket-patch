@@ -1783,10 +1783,14 @@ fn rewrite_gem(
                         url_pat.replace(&regex::escape(&format!("/{rotating}/")), "/[^/\"]+/");
                 }
             }
+            // `\r?\n`: the rewriter emits LF, but a `core.autocrlf` checkout
+            // rewrites the working tree to CRLF — the guard must still
+            // recognize the block there, or the indented `gem` line inside
+            // it falls through to `gem_line_re` and gets wrapped again.
             let block_re = Regex::new(
                 &(String::from(r#"(?m)^source "("#)
                     + &url_pat
-                    + r#")" do\n  gem ["']"#
+                    + r#")" do\r?\n  gem ["']"#
                     + &regex::escape(&dep.name)
                     + r#"["']"#),
             )
@@ -3885,6 +3889,53 @@ mod tests {
             "same-grant re-run must be a no-op: files={:?} edits={:?}",
             third.files.keys(),
             third.edits
+        );
+    }
+
+    /// A `core.autocrlf` checkout rewrites a previously-redirected Gemfile to
+    /// CRLF. The block recognizer must still see the Socket source block
+    /// there: if it misses, the indented `gem` line inside the block matches
+    /// `gem_line_re` and gets wrapped in a second, nested source block.
+    #[test]
+    fn gemfile_rerun_on_crlf_checkout_never_nests() {
+        fn ov(token: &str) -> DepOverride {
+            let mut o = gem_override("rails", "7.0.0");
+            o.token = token.into();
+            if let Some(r) = o.registry_override.as_mut() {
+                r.index_url = format!("https://patch.test/gem/{token}/uuid/");
+            }
+            o
+        }
+        // The block exactly as run 1 writes it, after a CRLF checkout.
+        let crlf_gemfile = "source \"https://rubygems.org\"\r\n\r\n\
+             source \"https://patch.test/gem/tok-one/uuid/\" do\r\n  \
+             gem \"rails\", \"7.0.0\"\r\nend\r\n";
+        let mut files = BTreeMap::new();
+        files.insert("Gemfile".to_string(), crlf_gemfile.to_string());
+
+        // Same grant: recognized in place, a true no-op.
+        let same = rewrite_registry_redirect(&files, &[ov("tok-one")]);
+        assert!(
+            !same.files.contains_key("Gemfile"),
+            "same-grant re-run on a CRLF checkout must not rewrite the Gemfile: {:?}",
+            same.files.get("Gemfile")
+        );
+
+        // Rotated grant: URL refreshed inside the existing block, never nested.
+        let rotated = rewrite_registry_redirect(&files, &[ov("tok-two")]);
+        let out = rotated
+            .files
+            .get("Gemfile")
+            .expect("rotated grant refreshes the URL on a CRLF checkout");
+        assert_eq!(
+            out.matches("source \"https://patch.test/gem/").count(),
+            1,
+            "exactly one Socket source block, never nested: {out}"
+        );
+        assert!(!out.contains("tok-one"), "old grant token gone: {out}");
+        assert!(
+            out.contains("source \"https://patch.test/gem/tok-two/uuid/\" do\r\n"),
+            "existing CRLF block body left intact: {out}"
         );
     }
 

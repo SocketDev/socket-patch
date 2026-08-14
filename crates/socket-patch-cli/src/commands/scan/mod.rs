@@ -280,6 +280,15 @@ async fn embed_vex_into_json(
     if vex_args.vex.is_none() || base_code != 0 {
         return base_code;
     }
+    // A dry run is a non-mutating preview: generating here would verify the
+    // deliberately untouched tree (failing outright on a not-yet-vendored
+    // project) and write an attestation file to disk. The marker keeps the
+    // request visible to JSON consumers instead of silently dropping it
+    // (same shape as the vendor JSON arm's early return).
+    if common.dry_run {
+        result["vex"] = serde_json::json!({ "skipped": true, "reason": "dry_run" });
+        return base_code;
+    }
     let params = vex_args.to_build_params();
     match generate_vex_from_manifest_path(common, &params, manifest_path).await {
         Ok(summary) => {
@@ -312,6 +321,13 @@ async fn embed_vex_human(
     base_code: i32,
 ) -> i32 {
     if vex_args.vex.is_none() || base_code != 0 {
+        return base_code;
+    }
+    // Dry-run twin of the JSON guard above: no generation, no file write.
+    if common.dry_run {
+        if !common.silent {
+            println!("[dry-run] VEX generation skipped. No attestation written.");
+        }
         return base_code;
     }
     let params = vex_args.to_build_params();
