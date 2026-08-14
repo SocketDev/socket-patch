@@ -14,7 +14,7 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
 
 | Ecosystem | agent (`--mode agent`) | vendored (`--mode vendored`) | hosted (`--mode hosted`) |
 |-----------|------------------------|------------------------------|--------------------------|
-| npm (`npm`) — pnpm / yarn / berry / bun | ✅ any install layout; `setup` postinstall hook | ✅ five lockfile flavors: package-lock, yarn classic, yarn berry (node-modules linker; PnP refused), pnpm v9, bun `bun.lock` (binary `bun.lockb` refused with a `--save-text-lockfile` pointer). Rush monorepos refused (`vendor_rush_unsupported`) — see [Rush notes](#npm-rush-monorepos) | ✅ package-lock / npm-shrinkwrap, pnpm-lock.yaml, yarn classic, yarn berry, bun — berry and bun carry constraints, see [npm hosted-mode notes](#npm-hosted-mode-notes) |
+| npm (`npm`) — pnpm / yarn / berry / bun | ✅ any install layout; `setup` postinstall hook | ✅ five lockfile flavors: package-lock, yarn classic, yarn berry (node-modules linker; PnP refused), pnpm v9, bun `bun.lock` (binary `bun.lockb` refused with a `--save-text-lockfile` pointer). Rush monorepos refused (`vendor_rush_unsupported`) — see [Rush notes](#npm-rush-monorepos) | ✅ package-lock / npm-shrinkwrap, pnpm-lock.yaml (pnpm v9), yarn classic, yarn berry, bun — pnpm, berry, and bun carry constraints, see [npm hosted-mode notes](#npm-hosted-mode-notes) |
 | PyPI (`pypi`) — uv / poetry / pdm / pipenv / pip | ✅ `.pth` startup hook via `setup` | ✅ five lockfile flavors: uv, poetry, pdm, pipenv (lock rewired, but pipenv doesn't hash-check file entries — `vendor_integrity_unverified` warning; the committed wheel bytes are the protection), and requirements.txt (consumed by pip or `uv pip`) | ✅ requirements.txt + uv.lock. **poetry / pdm / pipenv locks are not rewritten** — use vendored |
 | Cargo (`cargo`) | ✅ in-place + `.cargo-checksum.json` rewrite (shared registry-cache caveat — see [Cargo: shared registry cache](#cargo-shared-registry-cache)) | ✅ `[patch.crates-io]` path entry | ✅ per-patch sparse registry (`[registries.socket-patch-<uuid>]` + Cargo.lock source/checksum) |
 | RubyGems (`gem`) | ✅ Bundler plugin via `setup` | ✅ Gemfile + Gemfile.lock path pair | ✅ per-dep `source` block; the `CHECKSUMS` pin needs bundler ≥ 2.6 (older locks get a `redirect_gem_no_checksums_section` warning) |
@@ -35,6 +35,12 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
 
 ## npm hosted-mode notes
 
+- **pnpm** — lockfileVersion 9 (`pnpm >=9`). Older lock grammars carry `packages:` keys
+  the rewrite cannot repoint — v6 embeds resolved peers in the key itself
+  (`/name@1.0.0(peer@2.0.0)`) and v5.x is path-style (`/name/1.0.0`). A dep that
+  resolves through any such key is refused outright
+  (`redirect_pnpm_unsupported_lock_key` names the key and the lock), never partially
+  rewritten: regenerate the lock with pnpm ≥ 9 and re-run.
 - **yarn berry** — the redirect edits the `yarn.lock` entry only (cacheKey `10c0` /
   yarn 4), and `.yarnrc.yml`'s `compressionLevel` must stay 0. The node-modules linker
   is e2e-covered; PnP is untested for hosted — the lock rewrite fires, but PnP's

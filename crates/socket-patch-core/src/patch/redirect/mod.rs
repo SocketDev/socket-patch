@@ -691,6 +691,47 @@ fn rewrite_pnpm_lock(
         // that begin with `@` (`'@scope/name@1.0.0':` — YAML forbids a plain
         // scalar starting with `@`); v6 keys start with `/` and are unquoted.
         let key = regex::escape(&fname) + "@" + &regex::escape(&dep.version);
+        // Legacy pnpm lock grammars this rewriter cannot repoint: lockfile-
+        // Version 6 embeds resolved peers in the `packages:` key itself
+        // (`/name@1.0.0(peer@2.0.0):`) and v5.x separates the version with a
+        // slash (`/name/1.0.0:`, peers suffixed `_peer@2.0.0`). Both carry
+        // their own `resolution:` block the pattern below never matches.
+        // Rewriting AROUND them is fail-open: a v6 lock holding both
+        // `/pkg@1.0.0:` and `/pkg@1.0.0(peer@2.0.0):` would get the plain
+        // entry rewritten — confirming and attesting the dep — while every
+        // dependent resolving through the peered entry still installs the
+        // unpatched upstream tarball. So when ANY such key exists for this
+        // dep in ANY lock, refuse the dep outright (no rewrite anywhere),
+        // naming the unmatched keys. v9 is unaffected: its peer-suffixed
+        // `snapshots:` keys never start with `/` (and carry no resolution).
+        let legacy_pat = String::from(r"(?m)^ {2}(/")
+            + &key
+            + r"\([^:\n]*|/"
+            + &regex::escape(&fname)
+            + "/"
+            + &regex::escape(&dep.version)
+            + r"(?:[_(][^:\n]*)?):";
+        let legacy_re = Regex::new(&legacy_pat).unwrap();
+        let mut legacy_keys: Vec<String> = Vec::new();
+        for (lock_key, content, _) in &contents {
+            for caps in legacy_re.captures_iter(content) {
+                legacy_keys.push(format!("{} in {lock_key}", &caps[1]));
+            }
+        }
+        if !legacy_keys.is_empty() {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_pnpm_unsupported_lock_key".into(),
+                detail: format!(
+                    "{fname}@{} resolves through pnpm v5/v6 lock key(s) the \
+                     redirect grammar cannot repoint: {}; left unredirected — \
+                     regenerate the lock with pnpm >=9 (lockfileVersion 9) \
+                     and re-run",
+                    dep.version,
+                    legacy_keys.join(", ")
+                ),
+            });
+            continue;
+        }
         let pat = String::from(r"(?m)(^ {2}(?:'")
             + &key
             + r"'|/?"
@@ -3680,6 +3721,258 @@ snapshots:
             "re-run over a redirected scoped entry must be a no-op: files={:?} edits={:?}",
             second.files.keys(),
             second.edits
+        );
+    }
+
+    /// pnpm lockfileVersion 6 embeds resolved peers in the `packages:` key
+    /// itself, so one name@version can appear as BOTH `/pkg@1.0.0:` and
+    /// `/pkg@1.0.0(peer@2.0.0):`. Rewriting only the plain entry is silent
+    /// fail-open: the dep is confirmed and attested while every dependent
+    /// resolving through the peered entry still installs the unpatched
+    /// upstream tarball. The whole dep must be refused with a warning naming
+    /// the unmatched key — nothing rewritten, nothing confirmed.
+    #[test]
+    fn pnpm_v6_mixed_plain_and_peered_is_refused() {
+        let lock = "lockfileVersion: '6.0'
+
+dependencies:
+  left-pad:
+    specifier: 1.3.0
+    version: 1.3.0
+
+packages:
+
+  /left-pad@1.3.0:
+    resolution: {integrity: sha512-UPSTREAM==}
+    dev: false
+
+  /left-pad@1.3.0(react@18.2.0):
+    resolution: {integrity: sha512-UPSTREAM==}
+    peerDependencies:
+      react: '*'
+    dev: false
+";
+        let mut files = BTreeMap::new();
+        files.insert("pnpm-lock.yaml".to_string(), lock.to_string());
+        let url = "http://patch.test/left-pad-1.3.0.tgz";
+        let overrides = vec![npm_override("left-pad", "1.3.0", url, "sha512-PATCHED==")];
+        let r = rewrite_registry_redirect(&files, &overrides);
+        assert!(
+            r.files.is_empty() && r.edits.is_empty(),
+            "a partially-matchable v6 lock must not be rewritten at all: files={:?} edits={:?}",
+            r.files.keys(),
+            r.edits
+        );
+        let warning = r
+            .warnings
+            .iter()
+            .find(|w| w.code == "redirect_pnpm_unsupported_lock_key")
+            .unwrap_or_else(|| panic!("refusal warning expected: {:?}", r.warnings));
+        assert!(
+            warning.detail.contains("/left-pad@1.3.0(react@18.2.0)"),
+            "warning must name the unmatched peered key: {}",
+            warning.detail
+        );
+        assert!(
+            !r.warnings
+                .iter()
+                .any(|w| w.code == "redirect_pnpm_entry_not_found"),
+            "the refusal replaces entry-not-found, not stacks on it: {:?}",
+            r.warnings
+        );
+    }
+
+    /// A v6 dep resolved ONLY through peer-suffixed keys previously degraded
+    /// to a bare `entry_not_found`; the refusal must instead name the exact
+    /// key the grammar cannot repoint so the operator knows the lock (not the
+    /// dep) is the problem.
+    #[test]
+    fn pnpm_v6_pure_peered_key_is_refused_by_name() {
+        let lock = "lockfileVersion: '6.0'
+
+packages:
+
+  /@socktest/pkg@1.0.0(react@18.2.0):
+    resolution: {integrity: sha512-UPSTREAM==}
+    dev: false
+";
+        let mut files = BTreeMap::new();
+        files.insert("pnpm-lock.yaml".to_string(), lock.to_string());
+        let overrides = vec![npm_override(
+            "@socktest/pkg",
+            "1.0.0",
+            "http://patch.test/socktest-pkg-1.0.0.tgz",
+            "sha512-PATCHED==",
+        )];
+        let r = rewrite_registry_redirect(&files, &overrides);
+        assert!(r.files.is_empty() && r.edits.is_empty());
+        let warning = r
+            .warnings
+            .iter()
+            .find(|w| w.code == "redirect_pnpm_unsupported_lock_key")
+            .unwrap_or_else(|| panic!("refusal warning expected: {:?}", r.warnings));
+        assert!(
+            warning
+                .detail
+                .contains("/@socktest/pkg@1.0.0(react@18.2.0)"),
+            "warning must name the unmatched key: {}",
+            warning.detail
+        );
+        assert!(
+            !r.warnings
+                .iter()
+                .any(|w| w.code == "redirect_pnpm_entry_not_found"),
+            "{:?}",
+            r.warnings
+        );
+    }
+
+    /// pnpm lockfileVersion 5.x keys are path-style (`/name/version:`, peers
+    /// suffixed `_peer@ver`) — the rewrite grammar never matches them, so the
+    /// dep must be refused with the keys named rather than silently reported
+    /// as a missing entry.
+    #[test]
+    fn pnpm_v5_path_style_keys_are_refused_by_name() {
+        let lock = "lockfileVersion: 5.4
+
+specifiers:
+  left-pad: 1.3.0
+
+dependencies:
+  left-pad: 1.3.0
+
+packages:
+
+  /left-pad/1.3.0:
+    resolution: {integrity: sha512-UPSTREAM==}
+    dev: false
+
+  /left-pad/1.3.0_react@18.2.0:
+    resolution: {integrity: sha512-UPSTREAM==}
+    dev: false
+";
+        let mut files = BTreeMap::new();
+        files.insert("pnpm-lock.yaml".to_string(), lock.to_string());
+        let overrides = vec![npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://patch.test/left-pad-1.3.0.tgz",
+            "sha512-PATCHED==",
+        )];
+        let r = rewrite_registry_redirect(&files, &overrides);
+        assert!(r.files.is_empty() && r.edits.is_empty());
+        let warning = r
+            .warnings
+            .iter()
+            .find(|w| w.code == "redirect_pnpm_unsupported_lock_key")
+            .unwrap_or_else(|| panic!("refusal warning expected: {:?}", r.warnings));
+        assert!(
+            warning.detail.contains("/left-pad/1.3.0")
+                && warning.detail.contains("/left-pad/1.3.0_react@18.2.0"),
+            "warning must name both v5 keys: {}",
+            warning.detail
+        );
+        assert!(
+            !r.warnings
+                .iter()
+                .any(|w| w.code == "redirect_pnpm_entry_not_found"),
+            "{:?}",
+            r.warnings
+        );
+    }
+
+    /// When a dep lives in a rewritable v9 lock AND a legacy lock in the same
+    /// set (e.g. a Rush nested lock still on pnpm 7), rewriting just the v9
+    /// lock would confirm the dep while the legacy lock keeps installing
+    /// upstream. The refusal must cover the WHOLE set: no lock rewritten.
+    #[test]
+    fn pnpm_legacy_lock_in_set_refuses_the_dep_everywhere() {
+        let v9_lock = "lockfileVersion: '9.0'
+
+packages:
+
+  left-pad@1.3.0:
+    resolution: {integrity: sha512-UPSTREAM==}
+";
+        let v5_lock = "lockfileVersion: 5.4
+
+packages:
+
+  /left-pad/1.3.0:
+    resolution: {integrity: sha512-UPSTREAM==}
+";
+        let mut files = BTreeMap::new();
+        files.insert("pnpm-lock.yaml".to_string(), v9_lock.to_string());
+        files.insert(
+            "common/config/rush/pnpm-lock.yaml".to_string(),
+            v5_lock.to_string(),
+        );
+        let overrides = vec![npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://patch.test/left-pad-1.3.0.tgz",
+            "sha512-PATCHED==",
+        )];
+        let r = rewrite_registry_redirect(&files, &overrides);
+        assert!(
+            r.files.is_empty() && r.edits.is_empty(),
+            "no lock in the set may be rewritten while a legacy key survives: files={:?}",
+            r.files.keys()
+        );
+        let warning = r
+            .warnings
+            .iter()
+            .find(|w| w.code == "redirect_pnpm_unsupported_lock_key")
+            .unwrap_or_else(|| panic!("refusal warning expected: {:?}", r.warnings));
+        assert!(
+            warning
+                .detail
+                .contains("/left-pad/1.3.0 in common/config/rush/pnpm-lock.yaml"),
+            "warning must name the key AND the lock it lives in: {}",
+            warning.detail
+        );
+    }
+
+    /// A v6 lock whose target dep has ONLY a plain `/name@version:` key (no
+    /// peered sibling anywhere) stays rewritable — the refusal must not
+    /// overreach to every v6 lock.
+    #[test]
+    fn pnpm_v6_plain_key_without_peered_sibling_still_rewrites() {
+        let lock = "lockfileVersion: '6.0'
+
+packages:
+
+  /left-pad@1.3.0:
+    resolution: {integrity: sha512-UPSTREAM==}
+    dev: false
+
+  /other-dep@2.0.0(react@18.2.0):
+    resolution: {integrity: sha512-OTHER==}
+    dev: false
+";
+        let mut files = BTreeMap::new();
+        files.insert("pnpm-lock.yaml".to_string(), lock.to_string());
+        let url = "http://patch.test/left-pad-1.3.0.tgz";
+        let overrides = vec![npm_override("left-pad", "1.3.0", url, "sha512-PATCHED==")];
+        let r = rewrite_registry_redirect(&files, &overrides);
+        let out = r.files.get("pnpm-lock.yaml").unwrap_or_else(|| {
+            panic!(
+                "plain v6 key must still be rewritten; warnings={:?}",
+                r.warnings
+            )
+        });
+        assert!(
+            out.contains(&format!(
+                "  /left-pad@1.3.0:\n    resolution: {{integrity: sha512-PATCHED==, tarball: {url}}}"
+            )),
+            "{out}"
+        );
+        assert!(
+            !r.warnings
+                .iter()
+                .any(|w| w.code.starts_with("redirect_pnpm_")),
+            "an unrelated dep's peered key must not trip the refusal: {:?}",
+            r.warnings
         );
     }
 }
