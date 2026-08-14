@@ -31,7 +31,9 @@ use crate::patch::copy_tree::remove_tree;
 use crate::utils::fs::atomic_write_bytes_preserving_mode;
 
 use super::common::{already_patched_result, detect_eol, refused};
-use super::npm_common::{done_failure, guard_coordinates, guard_revert_uuid_dir, stage_patch_pack};
+use super::npm_common::{
+    done_failure_unstage, guard_coordinates, guard_revert_uuid_dir, stage_patch_pack,
+};
 use super::path::parse_vendor_path;
 use super::state::{
     write_marker, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
@@ -113,6 +115,12 @@ pub async fn vendor_yarn_classic(
     }
 
     // ── 4–7. Stage → patch → pack (shared flavor-agnostic pipeline) ───────
+    // A wiring failure past this point must unwind the uuid dir staging is
+    // about to create — but never one that already existed (a same-uuid
+    // re-vendor's dir may still be referenced by live wiring).
+    let uuid_dir_preexisted = tokio::fs::metadata(project_root.join(&uuid_dir_rel))
+        .await
+        .is_ok();
     let (staged, result) = match stage_patch_pack(
         purl,
         installed_dir,
@@ -153,7 +161,14 @@ pub async fn vendor_yarn_classic(
         let edit = {
             let blocks = scan_blocks(&new_text);
             let Some(block) = blocks.iter().find(|b| &b.key == key) else {
-                return done_failure(purl, format!("lock block `{key}` vanished mid-rewrite"));
+                return done_failure_unstage(
+                    purl,
+                    format!("lock block `{key}` vanished mid-rewrite"),
+                    project_root,
+                    &uuid_dir_rel,
+                    uuid_dir_preexisted,
+                )
+                .await;
             };
             let new_lines = rewrite_classic_block(
                 &block.lines,
@@ -213,7 +228,14 @@ pub async fn vendor_yarn_classic(
     }
 
     if let Err(e) = atomic_write_bytes_preserving_mode(&lock_path, new_text.as_bytes()).await {
-        return done_failure(purl, format!("cannot write {YARN_LOCK}: {e}"));
+        return done_failure_unstage(
+            purl,
+            format!("cannot write {YARN_LOCK}: {e}"),
+            project_root,
+            &uuid_dir_rel,
+            uuid_dir_preexisted,
+        )
+        .await;
     }
 
     // ── 9. Marker + ledger entry ──────────────────────────────────────────
@@ -1260,6 +1282,54 @@ left-pad@^1.3.0:
         assert!(
             !fx.root().join(".socket/vendor").exists(),
             "refusal writes nothing"
+        );
+        assert_eq!(
+            tokio::fs::read(fx.lock_path()).await.unwrap(),
+            fx.lock_bytes
+        );
+    }
+
+    /// A lock-write failure AFTER the tarball is packed must unwind the
+    /// freshly created uuid dir — no ledger entry exists for it, so
+    /// `--revert` could never clean it up and the user would commit an
+    /// unwired artifact (contract: a failure leaves the project
+    /// byte-untouched).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn lock_write_failure_unwinds_the_staged_artifact() {
+        use std::os::unix::fs::PermissionsExt;
+        let fx = fixture_with_lock(Y2_BEFORE).await;
+        // Pre-create the eco level so staging only creates the uuid dir.
+        tokio::fs::create_dir_all(fx.root().join(".socket/vendor/npm"))
+            .await
+            .unwrap();
+        // A read-only project root: yarn.lock still reads and the tarball
+        // still packs (into the writable .socket/ subtree), but the atomic
+        // lock write (temp file in the root) fails.
+        let orig_mode = tokio::fs::metadata(fx.root()).await.unwrap().permissions();
+        tokio::fs::set_permissions(fx.root(), std::fs::Permissions::from_mode(0o555))
+            .await
+            .unwrap();
+        let outcome = fx.vendor(false).await;
+        tokio::fs::set_permissions(fx.root(), orig_mode)
+            .await
+            .unwrap();
+
+        let (result, entry, _) = expect_done(outcome);
+        assert!(!result.success, "the lock write must fail");
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("cannot write yarn.lock"),
+            "{:?}",
+            result.error
+        );
+        assert!(entry.is_none());
+        assert!(
+            !fx.root().join(".socket/vendor").exists(),
+            "the staged uuid dir (and its empty parents) must be unwound"
         );
         assert_eq!(
             tokio::fs::read(fx.lock_path()).await.unwrap(),
