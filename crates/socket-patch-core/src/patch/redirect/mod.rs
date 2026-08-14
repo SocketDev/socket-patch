@@ -25,7 +25,9 @@ use crate::vendor::yarn_berry_lock::yarnrc_compression_level;
 
 pub mod golang_local;
 mod state;
-pub use state::{load_redirect_state, RedirectState, REDIRECT_STATE_REL};
+pub use state::{
+    load_redirect_state, load_redirect_state_strict, RedirectState, REDIRECT_STATE_REL,
+};
 
 /// One ecosystem's integrity hashes (mirrors the TS `PatchArtifactIntegrity`).
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -94,7 +96,10 @@ pub struct DepOverride {
 
 /// One recorded file edit (mirrors the TS `FileEdit`). `Deserialize` so the
 /// persisted `redirect-state.json` ledger round-trips (see `redirect::state`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// `PartialEq` so the ledger merge can skip byte-identical edits a retried
+/// run re-plans (the ledger persists BEFORE the lockfile writes, so a
+/// failed write's edit is re-planned by the retry).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FileEdit {
     pub path: String,
     pub kind: String,

@@ -62,7 +62,13 @@ fn parse_purl_simple(purl: &str) -> Option<(String, String, String)> {
     let (typ, after) = rest.split_once('/')?;
     let (coord, version) = after.rsplit_once('@')?;
     let name = socket_patch_core::utils::purl::percent_decode_purl_component(coord).into_owned();
-    Some((typ.to_string(), name, version.to_string()))
+    // The API serves canonical percent-encoded purls, so the version needs
+    // decoding just like the coordinate — npm build metadata arrives as
+    // `1.2.3%2Bbuild` while lockfiles store `1.2.3+build`; an undecoded
+    // version would silently match no lock entry.
+    let version =
+        socket_patch_core::utils::purl::percent_decode_purl_component(version).into_owned();
+    Some((typ.to_string(), name, version))
 }
 
 /// The hosted-mode JSON error envelope, for bail-outs that return before the
@@ -462,35 +468,51 @@ pub(super) async fn run_redirect(
     }
 
     if !args.common.dry_run {
-        for (rel, content) in &rewrite.files {
-            let path = args.common.cwd.join(rel);
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            if let Err(e) = std::fs::write(&path, content) {
-                let message = format!("failed to write {rel}: {e}");
-                eprintln!("{message}");
-                if args.common.json {
-                    emit_json_error(scan_result.take(), &message);
-                }
-                return 1;
-            }
-        }
-        // Ledger (mirrors the vendor state.json shape): recorded edits for a
-        // future revert + the patch records (file hashes + vulnerabilities) so
-        // a post-install `socket-patch vex` can attest the redirected patches.
-        // MERGE with any existing ledger rather than overwriting: an idempotent
-        // re-run produces no new edits (the lockfile already points at the
-        // hosted patch), and clobbering the file would lose the original
-        // pre-redirect values a future revert needs. New edits APPEND (revert
-        // walks them in reverse); records are keyed by PURL, newest wins.
+        // Ledger FIRST (mirrors the vendor state.json shape): recorded edits
+        // for a future revert + the patch records (file hashes +
+        // vulnerabilities) so a post-install `socket-patch vex` can attest the
+        // redirected patches. The ledger is the only revert path, so it must
+        // be durable BEFORE any lockfile is mutated: were the lockfiles
+        // written first, a mid-loop write failure would leave the
+        // already-written files redirected with their pre-redirect originals
+        // never persisted anywhere — and a re-run cannot recapture them (an
+        // already-redirected entry produces no new edit). Recording a planned
+        // edit whose lockfile write then fails is harmless in the other
+        // direction: revert would restore bytes the file already has.
+        // MERGE with any existing ledger rather than overwriting: an
+        // idempotent re-run produces no new edits (the lockfile already
+        // points at the hosted patch), and clobbering the file would lose the
+        // original pre-redirect values a future revert needs. New edits
+        // APPEND (revert walks them in reverse), skipping byte-identical
+        // re-plans from a retried partial failure; records are keyed by PURL,
+        // newest wins.
         if !rewrite.edits.is_empty() || !records.is_empty() || !migration_edits.is_empty() {
             let vendor_dir = args.common.cwd.join(".socket").join("vendor");
             let _ = std::fs::create_dir_all(&vendor_dir);
-            let mut ledger =
-                socket_patch_core::patch::redirect::load_redirect_state(&args.common.cwd)
-                    .await
-                    .unwrap_or_else(RedirectState::new);
+            // Fail CLOSED on an existing-but-corrupt ledger (e.g. an
+            // unresolved merge conflict): silently replacing it would discard
+            // the recorded originals forever. Refusing HERE — before any
+            // lockfile write — leaves the project byte-untouched.
+            let mut ledger = match socket_patch_core::patch::redirect::load_redirect_state_strict(
+                &args.common.cwd,
+            )
+            .await
+            {
+                Ok(Some(ledger)) => ledger,
+                Ok(None) => RedirectState::new(),
+                Err(e) => {
+                    let message = format!(
+                        ".socket/vendor/redirect-state.json {e}; refusing to overwrite it \
+                             — the ledger records the pre-redirect originals a revert needs. \
+                             Repair or remove the file, then re-run"
+                    );
+                    eprintln!("{message}");
+                    if args.common.json {
+                        emit_json_error(scan_result.take(), &message);
+                    }
+                    return 1;
+                }
+            };
             // Ledgers written before the mode-string rename carry
             // `"mode": "redirect"`; normalize on rewrite so the on-disk
             // ledger converges on the documented "hosted" name (the
@@ -498,17 +520,43 @@ pub(super) async fn run_redirect(
             ledger.mode = "hosted".to_string();
             // The bun.lockb→bun.lock migration removal precedes the rewrite
             // edits so `--revert` unwinds it last (after restoring bun.lock).
-            ledger.edits.extend(migration_edits.iter().cloned());
-            ledger.edits.extend(rewrite.edits.iter().cloned());
+            for edit in migration_edits.iter().chain(rewrite.edits.iter()) {
+                if !ledger.edits.contains(edit) {
+                    ledger.edits.push(edit.clone());
+                }
+            }
             ledger.records.extend(records.clone());
-            // The ledger is the only revert path and the VEX record store —
-            // a swallowed write failure would leave the rewritten lockfiles
-            // unrevertable while reporting success.
-            if let Err(e) = std::fs::write(
-                vendor_dir.join("redirect-state.json"),
-                format!("{}\n", serde_json::to_string_pretty(&ledger).unwrap()),
-            ) {
+            // A swallowed write failure would let the lockfile writes below
+            // proceed with no revert data persisted while reporting success.
+            if let Err(e) = socket_patch_core::utils::fs::atomic_write_bytes_preserving_mode(
+                &vendor_dir.join("redirect-state.json"),
+                format!("{}\n", serde_json::to_string_pretty(&ledger).unwrap()).as_bytes(),
+            )
+            .await
+            {
                 let message = format!("failed to write .socket/vendor/redirect-state.json: {e}");
+                eprintln!("{message}");
+                if args.common.json {
+                    emit_json_error(scan_result.take(), &message);
+                }
+                return 1;
+            }
+        }
+        for (rel, content) in &rewrite.files {
+            let path = args.common.cwd.join(rel);
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            // Atomic stage+rename, mode-preserving (the vendored backend's
+            // writer): a bare `fs::write` truncates first, so a crash
+            // mid-write could leave a torn lockfile behind.
+            if let Err(e) = socket_patch_core::utils::fs::atomic_write_bytes_preserving_mode(
+                &path,
+                content.as_bytes(),
+            )
+            .await
+            {
+                let message = format!("failed to write {rel}: {e}");
                 eprintln!("{message}");
                 if args.common.json {
                     emit_json_error(scan_result.take(), &message);
@@ -529,7 +577,9 @@ pub(super) async fn run_redirect(
     // deleting the other mode's ledger; reconciliation is deferred (see PR Scope).
     // Read after the ledger write above so a non-dry-run reflects this run.
     let mut takeover_warnings: Vec<serde_json::Value> = Vec::new();
-    let superseded = super::classify_overlap_takeover(&args.common.cwd).await.redirect;
+    let superseded = super::classify_overlap_takeover(&args.common.cwd)
+        .await
+        .redirect;
     if !superseded.is_empty() {
         takeover_warnings.push(serde_json::json!({
             "code": super::REDIRECT_SUPERSEDES_VENDORED,
@@ -676,8 +726,41 @@ pub(super) async fn run_redirect(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_redirect_json_envelope, REDIRECT_CANDIDATE_FILES};
+    use super::{build_redirect_json_envelope, parse_purl_simple, REDIRECT_CANDIDATE_FILES};
     use socket_patch_core::constants::npm_family;
+
+    #[test]
+    fn parse_purl_simple_percent_decodes_name_and_version() {
+        // The API serves canonical percent-encoded purls: npm build metadata
+        // `1.2.3+build` arrives as `1.2.3%2Bbuild`. Lock entries store the
+        // decoded form, so an undecoded version silently matches nothing.
+        assert_eq!(
+            parse_purl_simple("pkg:npm/foo@1.2.3%2Bbuild"),
+            Some((
+                "npm".to_string(),
+                "foo".to_string(),
+                "1.2.3+build".to_string()
+            ))
+        );
+        // The coordinate keeps decoding too (scoped npm name).
+        assert_eq!(
+            parse_purl_simple("pkg:npm/%40scope/name@1.0.0"),
+            Some((
+                "npm".to_string(),
+                "@scope/name".to_string(),
+                "1.0.0".to_string()
+            ))
+        );
+        // Plain versions pass through unchanged.
+        assert_eq!(
+            parse_purl_simple("pkg:npm/left-pad@1.3.0"),
+            Some((
+                "npm".to_string(),
+                "left-pad".to_string(),
+                "1.3.0".to_string()
+            ))
+        );
+    }
 
     /// The classic scan object `run` builds for the `--json` path with ≥1
     /// discovered package (scannedPackages/totalPatches/… + the `packages`

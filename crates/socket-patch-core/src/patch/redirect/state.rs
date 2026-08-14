@@ -57,11 +57,37 @@ impl Default for RedirectState {
 
 /// Load the redirect ledger. Missing OR malformed → `None` (VEX then simply
 /// has nothing extra to attest, and per-entry verification still fails closed
-/// downstream) rather than aborting the command.
+/// downstream) rather than aborting the command. READ-ONLY consumers only —
+/// a writer about to merge-and-rewrite the file must use
+/// [`load_redirect_state_strict`] so a corrupt ledger is refused, not
+/// silently replaced.
 pub async fn load_redirect_state(project_root: &Path) -> Option<RedirectState> {
+    load_redirect_state_strict(project_root)
+        .await
+        .ok()
+        .flatten()
+}
+
+/// Load the redirect ledger, distinguishing ABSENT (`Ok(None)`) from
+/// EXISTING-but-unusable (`Err`, with the reason). The hosted writer merges
+/// into the existing ledger before rewriting it; treating a corrupt file
+/// (e.g. an unresolved git merge conflict) as "absent" would replace it with
+/// a fresh ledger, and — because an already-redirected lockfile produces no
+/// new edits on a re-run — permanently discard the pre-redirect originals a
+/// future revert needs. Writers must refuse on `Err`.
+pub async fn load_redirect_state_strict(
+    project_root: &Path,
+) -> Result<Option<RedirectState>, String> {
     let path = project_root.join(REDIRECT_STATE_REL);
-    let bytes = tokio::fs::read(&path).await.ok()?;
-    serde_json::from_slice(&bytes).ok()
+    let bytes = match tokio::fs::read(&path).await {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("cannot be read: {e}")),
+    };
+    match serde_json::from_slice(&bytes) {
+        Ok(state) => Ok(Some(state)),
+        Err(e) => Err(format!("is not a valid redirect ledger: {e}")),
+    }
 }
 
 #[cfg(test)]
@@ -169,5 +195,44 @@ mod tests {
             .await
             .unwrap();
         assert!(load_redirect_state(tmp.path()).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn strict_load_distinguishes_missing_from_malformed() {
+        // Missing → Ok(None): a first hosted run starts a fresh ledger.
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            load_redirect_state_strict(tmp.path()).await,
+            Ok(None)
+        ));
+
+        // Malformed (e.g. an unresolved merge conflict) → Err: the writer
+        // must REFUSE rather than replace the file — replacement would
+        // discard the pre-redirect originals a future revert needs.
+        let dir = tmp.path().join(".socket/vendor");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(
+            dir.join("redirect-state.json"),
+            b"<<<<<<< HEAD\n{ \"version\": 1 }\n=======\n",
+        )
+        .await
+        .unwrap();
+        let err = load_redirect_state_strict(tmp.path()).await.unwrap_err();
+        assert!(
+            err.contains("not a valid redirect ledger"),
+            "the refusal must say the file is corrupt, got: {err}"
+        );
+
+        // Valid → Ok(Some), same as the lenient loader.
+        tokio::fs::write(
+            dir.join("redirect-state.json"),
+            serde_json::to_string_pretty(&RedirectState::new()).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            load_redirect_state_strict(tmp.path()).await,
+            Ok(Some(_))
+        ));
     }
 }

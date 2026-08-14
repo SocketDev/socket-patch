@@ -1132,11 +1132,12 @@ async fn no_redirectable_patch_leaves_bun_lockb_alone() {
     );
 }
 
-/// A ledger that cannot be written is an ERROR, not a silent success: the
-/// lockfile has already been rewritten, and
+/// A ledger that cannot be persisted is an ERROR, not a silent success — and
+/// it must fail BEFORE any lockfile is mutated:
 /// `.socket/vendor/redirect-state.json` is the only revert path (and the VEX
-/// record store), so swallowing the write failure would leave the repo
-/// redirected with no way back while reporting success.
+/// record store), so the write path persists the ledger FIRST and only then
+/// rewrites lockfiles. When the ledger cannot be persisted the project stays
+/// byte-untouched.
 #[tokio::test]
 #[serial]
 async fn unwritable_ledger_fails_the_run() {
@@ -1152,12 +1153,118 @@ async fn unwritable_ledger_fails_the_run() {
 
     let code = run(redirect_args(tmp.path(), server.uri())).await;
     assert_eq!(code, 1, "a failed ledger write must flip the exit code");
-    // The failure is about the ledger, not the rewrite: the lockfile edit
-    // landed before the ledger write was attempted.
+    // Ledger-first ordering: no lockfile may be rewritten when the revert
+    // data could not be persisted — a rewritten lock with no recorded
+    // originals would be unrevertable.
     let lock = std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap();
     assert!(
-        lock.contains(HOSTED_URL),
-        "the lockfile rewrite precedes the ledger write; got:\n{lock}"
+        !lock.contains(HOSTED_URL) && lock.contains("registry.npmjs.org"),
+        "the ledger write precedes the lockfile rewrite, so a ledger failure \
+         must leave the lockfile untouched; got:\n{lock}"
+    );
+}
+
+/// Findings hosted-atomicity 1+2: a MID-RUN lockfile write failure (second of
+/// two locks unwritable) must never leave the successfully-written first lock
+/// redirected with no ledger record of its pre-redirect originals. The ledger
+/// is persisted BEFORE the lockfile loop, so every planned edit's original is
+/// durable even when a later write fails; the failed lock itself stays
+/// byte-untouched (atomic stage+rename, no truncation).
+///
+/// unix-only: a read-only directory does not block file creation on Windows.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn partial_lockfile_write_failure_persists_ledger_originals() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    // Rush repo: two pnpm locks, both resolving the patched package. The
+    // rewriter output map is a BTreeMap, so the common lock
+    // (common/config/rush/…) is written before the subspace lock
+    // (common/config/subspaces/…).
+    write_rush_project(tmp.path(), false);
+    let subspace_dir = tmp.path().join("common/config/subspaces/frontend");
+    let before_subspace = std::fs::read_to_string(subspace_dir.join("pnpm-lock.yaml")).unwrap();
+    std::fs::set_permissions(&subspace_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    let code = run(redirect_args(tmp.path(), server.uri())).await;
+
+    std::fs::set_permissions(&subspace_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(code, 1, "a mid-run lockfile write failure must exit 1");
+
+    // The first lock landed before the failure…
+    let common =
+        std::fs::read_to_string(tmp.path().join("common/config/rush/pnpm-lock.yaml")).unwrap();
+    assert!(
+        common.contains(HOSTED_URL),
+        "the common lock was written before the subspace failure; got:\n{common}"
+    );
+    // …so its pre-redirect originals MUST already be in the ledger: without
+    // them a revert is impossible, and a re-run cannot recapture them (the
+    // entry is already redirected and produces no new edit).
+    let ledger = std::fs::read_to_string(tmp.path().join(".socket/vendor/redirect-state.json"))
+        .expect("the ledger must be persisted before any lockfile is mutated");
+    assert!(
+        ledger.contains("UPSTREAMupstream"),
+        "the ledger must record the pre-redirect original integrity: {ledger}"
+    );
+    assert!(
+        ledger.contains("common/config/rush/pnpm-lock.yaml"),
+        "the ledger must record the edit for the lock that WAS written: {ledger}"
+    );
+
+    // The failed lock is byte-untouched — no partial/truncated write.
+    assert_eq!(
+        std::fs::read_to_string(subspace_dir.join("pnpm-lock.yaml")).unwrap(),
+        before_subspace,
+        "the unwritable lock must stay byte-identical (atomic writes)"
+    );
+}
+
+/// Finding hosted-atomicity 3: an EXISTING-but-corrupt redirect ledger (e.g.
+/// an unresolved git merge conflict) must be refused, not silently replaced —
+/// replacing it discards the pre-redirect originals a future revert needs.
+/// The refusal happens before any lockfile write, so the project stays
+/// byte-untouched.
+#[tokio::test]
+#[serial]
+async fn corrupt_ledger_is_refused_not_replaced() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_project(tmp.path());
+    let vendor_dir = tmp.path().join(".socket/vendor");
+    std::fs::create_dir_all(&vendor_dir).unwrap();
+    let garbage = "<<<<<<< HEAD\n{ \"version\": 1, \"mode\": \"hosted\" }\n=======\n";
+    std::fs::write(vendor_dir.join("redirect-state.json"), garbage).unwrap();
+
+    let code = run(redirect_args(tmp.path(), server.uri())).await;
+    assert_eq!(
+        code, 1,
+        "a corrupt ledger must fail the run, not be replaced"
+    );
+
+    // The corrupt file is preserved for the user to repair (it may still
+    // hold recoverable originals inside the conflict markers).
+    assert_eq!(
+        std::fs::read_to_string(vendor_dir.join("redirect-state.json")).unwrap(),
+        garbage,
+        "the corrupt ledger must not be overwritten"
+    );
+    // Fail-closed ordering: nothing was rewritten either.
+    let lock = std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap();
+    assert!(
+        !lock.contains(HOSTED_URL) && lock.contains("registry.npmjs.org"),
+        "the refusal must precede any lockfile write; got:\n{lock}"
     );
 }
 
@@ -1942,24 +2049,31 @@ async fn redirect_json_mode_write_failures_emit_error_envelope() {
             .expect("run socket-patch")
     }
 
-    // Leg 3 — the rewritten lockfile cannot be written back (read-only
-    // file; the rewriter read it fine moments earlier).
-    let server = MockServer::start().await;
-    mock_discovery(&server).await;
-    mock_reference(&server).await;
-    mock_view(&server).await;
-    let tmp = tempfile::tempdir().unwrap();
-    write_project(tmp.path());
-    let lock = tmp.path().join("package-lock.json");
-    let mut perms = std::fs::metadata(&lock).unwrap().permissions();
-    perms.set_readonly(true);
-    std::fs::set_permissions(&lock, perms).unwrap();
-    let out = run_leg(tmp.path(), &server).await;
-    assert_error_envelope(&out, "lockfile-write failure");
+    // Leg 3 — the rewritten lockfile cannot be written back (its DIRECTORY
+    // is read-only, so the atomic stage file cannot be created; the rewriter
+    // read the lock fine moments earlier). A read-only lock FILE no longer
+    // fails this leg: the atomic stage+rename replaces it mode-preserved,
+    // like the vendored backend's writer. unix-only: a read-only directory
+    // does not block file creation on Windows.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let server = MockServer::start().await;
+        mock_discovery(&server).await;
+        mock_reference(&server).await;
+        mock_view(&server).await;
+        let tmp = tempfile::tempdir().unwrap();
+        write_rush_project(tmp.path(), false);
+        let lock_dir = tmp.path().join("common/config/rush");
+        std::fs::set_permissions(&lock_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let out = run_leg(tmp.path(), &server).await;
+        std::fs::set_permissions(&lock_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_error_envelope(&out, "lockfile-write failure");
+    }
 
     // Leg 4 — the revert ledger cannot be persisted: a DIRECTORY squats on
-    // `.socket/vendor/redirect-state.json`, so `fs::write` fails after the
-    // lockfile rewrite succeeded.
+    // `.socket/vendor/redirect-state.json`. The ledger is written BEFORE the
+    // lockfiles, so the run refuses with the project untouched.
     let server = MockServer::start().await;
     mock_discovery(&server).await;
     mock_reference(&server).await;
