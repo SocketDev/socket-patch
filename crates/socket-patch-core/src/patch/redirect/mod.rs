@@ -1184,6 +1184,7 @@ fn rewrite_bun_lock(
         };
         let target_spec = format!("{fname}@{}", dep.version);
         let url_spec = format!("{fname}@{}", dep.artifact_url);
+        let mut matched_any = false;
         for entry in &entries {
             let Some(spec) = entry.elems.first().and_then(|e| decode_json_string(e)) else {
                 continue;
@@ -1200,15 +1201,31 @@ fn rewrite_bun_lock(
             } else if entry.elems.len() == 3 && spec == url_spec {
                 // Already one of our URL 3-tuples for this exact URL. Idempotent
                 // if the integrity already matches; otherwise refresh it.
+                matched_any = true;
                 if entry.elems[2] == format!("\"{sha512}\"") {
                     continue;
                 }
+                deps_verbatim = entry.elems[1].clone();
+            } else if entry.elems.len() == 3
+                && entry.elems[1].starts_with('{')
+                && is_prior_hosted_bun_spec(&spec, &fname, &dep.artifact_url)
+            {
+                // A URL 3-tuple written by an EARLIER redirect whose artifact
+                // URL has since changed (a patch republish rotates the uuid
+                // path segment; grant-token rotation changes the token — the
+                // registry `name@version` spec was destroyed by that first
+                // rewrite, so exact-URL matching alone would strand the stale
+                // pin forever). Re-pin to the current URL. Ownership is
+                // claimed narrowly — same origin and same `<name>-<version>
+                // .tgz` leaf as the CURRENT artifact URL — so user URL deps
+                // and other-version entries never match (fail-closed).
                 deps_verbatim = entry.elems[1].clone();
             } else {
                 // Same-name-but-unowned entry (user file:/URL dep, other
                 // version) — never touched.
                 continue;
             }
+            matched_any = true;
             let original = lines[entry.line_idx].clone();
             let rebuilt = format!(
                 "{indent}{key}: [{url}, {deps}, {integrity}]{comma}",
@@ -1233,9 +1250,51 @@ fn rewrite_bun_lock(
             });
             changed = true;
         }
+        if !matched_any {
+            // Mirrors the pnpm/berry/uv rewriters: a granted dep that matched
+            // no rewritable tuple (lock re-resolved to another version, entry
+            // occupied by an unowned URL/file: spec) must be diagnosable, not
+            // a silent drop from the `redirected` count.
+            result.warnings.push(RewriteWarning {
+                code: "redirect_bun_entry_not_found".into(),
+                detail: format!("no rewritable bun.lock entry for {fname}@{}", dep.version),
+            });
+        }
     }
     if changed {
         result.files.insert("bun.lock".into(), lines.join("\n"));
+    }
+}
+
+/// True when a bun.lock 3-tuple spec (`name@<url>`) was written by an earlier
+/// hosted redirect of this same dependency: the spec's URL shares both the
+/// origin (`scheme://host[:port]`) and the trailing `<name>-<version>.tgz`
+/// path leaf with the CURRENT artifact URL. Both halves come from the live
+/// override — nothing about the patch server's URL layout is assumed — and
+/// anything that fails to parse fails the match (closed): user URL deps live
+/// on other origins, and another version's artifact has a different leaf.
+fn is_prior_hosted_bun_spec(spec: &str, fname: &str, current_url: &str) -> bool {
+    let Some(old_url) = spec
+        .strip_prefix(fname)
+        .and_then(|rest| rest.strip_prefix('@'))
+    else {
+        return false;
+    };
+    fn origin_and_leaf(url: &str) -> Option<(&str, &str)> {
+        if !url.starts_with("https://") && !url.starts_with("http://") {
+            return None;
+        }
+        let scheme_end = url.find("://").unwrap() + 3;
+        let path_start = url[scheme_end..].find('/')? + scheme_end;
+        let leaf = url[path_start..]
+            .rsplit('/')
+            .next()
+            .filter(|l| !l.is_empty())?;
+        Some((&url[..path_start], leaf))
+    }
+    match (origin_and_leaf(old_url), origin_and_leaf(current_url)) {
+        (Some(old), Some(new)) => old == new,
+        _ => false,
     }
 }
 
@@ -3611,6 +3670,170 @@ mod tests {
         rewrite_bun_lock(&files, &[no_sha], &mut r);
         assert!(r.files.is_empty());
         assert_eq!(r.warnings[0].code, "redirect_bun_missing_sha512");
+        assert_eq!(
+            r.warnings.len(),
+            1,
+            "the sha512 refusal must not double-warn entry-not-found"
+        );
+    }
+
+    /// A bun.lock already redirected by an earlier run holds a URL 3-tuple —
+    /// the registry `name@version` spec is gone — so when the artifact URL
+    /// changes (patch republish rotates the uuid segment, token rotation
+    /// changes the token) the entry MUST still be re-pinned to the new URL;
+    /// exact-URL matching alone stranded the stale pin forever. Ownership is
+    /// origin + `<name>-<version>.tgz` leaf, so user URL deps and
+    /// other-version artifacts stay untouched.
+    #[test]
+    fn bun_lock_re_redirects_stale_hosted_url() {
+        let old_sha = format!("sha512-{}==", "O".repeat(86));
+        let new_sha = format!("sha512-{}==", "N".repeat(86));
+        let old_url = "https://patch.socket.dev/patch/npm/oldtoken-1111/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/left-pad-1.3.0.tgz";
+        let new_url = "https://patch.socket.dev/patch/npm/newtoken-2222/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb/left-pad-1.3.0.tgz";
+        let ovr = npm_override("left-pad", "1.3.0", new_url, &new_sha);
+
+        let mut files = BTreeMap::new();
+        files.insert(
+            "bun.lock".to_string(),
+            bun_lock_file(
+                &format!("\"left-pad\": [\"left-pad@{old_url}\", {{}}, \"{old_sha}\"],"),
+                1,
+            ),
+        );
+        let mut r = RewriteResult::default();
+        rewrite_bun_lock(&files, std::slice::from_ref(&ovr), &mut r);
+        let out = r
+            .files
+            .get("bun.lock")
+            .expect("stale URL must be re-pinned");
+        assert!(
+            out.contains(&format!("\"left-pad@{new_url}\"")) && !out.contains(old_url),
+            "entry must carry the NEW artifact URL: {out}"
+        );
+        assert!(out.contains(&new_sha) && !out.contains(&old_sha));
+        assert!(
+            r.warnings.is_empty(),
+            "re-pin is not a warning case: {:?}",
+            r.warnings
+        );
+        assert_eq!(r.edits.len(), 1);
+
+        // Idempotent: a second run over the re-pinned lock is a no-op.
+        let mut files = BTreeMap::new();
+        files.insert("bun.lock".to_string(), out.clone());
+        let mut r = RewriteResult::default();
+        rewrite_bun_lock(&files, std::slice::from_ref(&ovr), &mut r);
+        assert!(r.files.is_empty(), "same-URL rerun must stay a no-op");
+        assert!(r.warnings.is_empty());
+
+        // A user's own URL dep (different origin, same leaf) is never claimed.
+        let mut files = BTreeMap::new();
+        files.insert(
+            "bun.lock".to_string(),
+            bun_lock_file(
+                &format!(
+                    "\"left-pad\": [\"left-pad@https://example.com/mirror/left-pad-1.3.0.tgz\", {{}}, \"{old_sha}\"],"
+                ),
+                1,
+            ),
+        );
+        let mut r = RewriteResult::default();
+        rewrite_bun_lock(&files, std::slice::from_ref(&ovr), &mut r);
+        assert!(
+            r.files.is_empty(),
+            "foreign-origin URL dep must not be touched"
+        );
+        assert_eq!(r.warnings[0].code, "redirect_bun_entry_not_found");
+
+        // Our origin but ANOTHER version's leaf is never claimed either.
+        let other_version_url = "https://patch.socket.dev/patch/npm/oldtoken-1111/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/left-pad-1.2.0.tgz";
+        let mut files = BTreeMap::new();
+        files.insert(
+            "bun.lock".to_string(),
+            bun_lock_file(
+                &format!("\"left-pad\": [\"left-pad@{other_version_url}\", {{}}, \"{old_sha}\"],"),
+                1,
+            ),
+        );
+        let mut r = RewriteResult::default();
+        rewrite_bun_lock(&files, std::slice::from_ref(&ovr), &mut r);
+        assert!(
+            r.files.is_empty(),
+            "other-version tuple must not be touched"
+        );
+        assert_eq!(r.warnings[0].code, "redirect_bun_entry_not_found");
+    }
+
+    /// A granted dep that matches no rewritable tuple (lock re-resolved to a
+    /// different version) must warn — mirroring pnpm/berry/uv — instead of
+    /// silently dropping out of the `redirected` count.
+    #[test]
+    fn bun_lock_entry_not_found_warns() {
+        let sha512 = format!("sha512-{}==", "A".repeat(86));
+        let ovr = npm_override("left-pad", "1.3.0", "http://p.test/lp.tgz", &sha512);
+
+        let mut files = BTreeMap::new();
+        files.insert(
+            "bun.lock".to_string(),
+            bun_lock_file(
+                "\"left-pad\": [\"left-pad@1.2.0\", \"\", {}, \"sha512-OLD==\"],",
+                1,
+            ),
+        );
+        let mut r = RewriteResult::default();
+        rewrite_bun_lock(&files, std::slice::from_ref(&ovr), &mut r);
+        assert!(r.files.is_empty() && r.edits.is_empty());
+        assert_eq!(r.warnings[0].code, "redirect_bun_entry_not_found");
+        assert!(
+            r.warnings[0].detail.contains("left-pad@1.3.0"),
+            "the warning must name the missing dep: {}",
+            r.warnings[0].detail
+        );
+
+        // A successful rewrite emits NO warning.
+        let mut files = BTreeMap::new();
+        files.insert(
+            "bun.lock".to_string(),
+            bun_lock_file(
+                "\"left-pad\": [\"left-pad@1.3.0\", \"\", {}, \"sha512-OLD==\"],",
+                1,
+            ),
+        );
+        let mut r = RewriteResult::default();
+        rewrite_bun_lock(&files, std::slice::from_ref(&ovr), &mut r);
+        assert!(r.files.contains_key("bun.lock"));
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+    }
+
+    /// A packages header spelled any way other than bun's byte-exact emitted
+    /// shape must fail CLOSED with the unsupported warning — not parse as an
+    /// empty lock and silently skip the dep.
+    #[test]
+    fn bun_lock_noncanonical_packages_header_fails_closed() {
+        let sha512 = format!("sha512-{}==", "A".repeat(86));
+        let ovr = npm_override("left-pad", "1.3.0", "http://p.test/lp.tgz", &sha512);
+
+        for lock in [
+            // Tab-indented header.
+            "{\n  \"lockfileVersion\": 1,\n\t\"packages\": {\n    \
+             \"left-pad\": [\"left-pad@1.3.0\", \"\", {}, \"sha512-OLD==\"],\n\t}\n}\n",
+            // 4-space re-indent.
+            "{\n  \"lockfileVersion\": 1,\n    \"packages\": {\n    \
+             \"left-pad\": [\"left-pad@1.3.0\", \"\", {}, \"sha512-OLD==\"],\n    }\n}\n",
+            // Space before the colon.
+            "{\n  \"lockfileVersion\": 1,\n  \"packages\" : {\n    \
+             \"left-pad\": [\"left-pad@1.3.0\", \"\", {}, \"sha512-OLD==\"],\n  }\n}\n",
+        ] {
+            let mut files = BTreeMap::new();
+            files.insert("bun.lock".to_string(), lock.to_string());
+            let mut r = RewriteResult::default();
+            rewrite_bun_lock(&files, std::slice::from_ref(&ovr), &mut r);
+            assert!(r.files.is_empty(), "must not rewrite: {lock}");
+            assert_eq!(
+                r.warnings[0].code, "redirect_bun_lock_unsupported",
+                "non-canonical header must refuse, not read as empty: {lock}"
+            );
+        }
     }
 
     /// A realistic uv.lock block carries BOTH an `sdist` entry and a `wheels`
