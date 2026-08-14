@@ -1,5 +1,7 @@
 //! In-process + envelope contract tests for `socket-patch vendor` (npm
-//! backend, plus the golang apply-yields-to-vendor handshake).
+//! backend, plus the golang apply-yields-to-vendor handshake, plus the gem
+//! backend's `scan --vendor` arm — the one route into the vendor engine no
+//! gem project had ever been driven through).
 //!
 //! The lifecycle tests call `socket_patch_cli::commands::vendor::run(args)`
 //! directly (the in-process convention of `in_process_cargo_apply.rs` /
@@ -1619,4 +1621,337 @@ async fn offline_service_mode_refuses_instead_of_building() {
         "service mode must not silently build a local artifact"
     );
     assert_eq!(fx.lock_bytes(), fx.original_lock, "lock untouched");
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// 13. gem through `scan --vendor` (mock-proxy API, hermetic bundler layout)
+// ─────────────────────────────────────────────────────────────────────
+
+const GEM_UUID: &str = "35353535-3535-4335-8335-353535353535";
+const GEM_PURL: &str = "pkg:gem/demo-gem@1.0.0";
+const GEM_ORIG: &[u8] = b"module DemoGem\n  STATUS = \"orig\"\nend\n";
+const GEM_PATCHED: &[u8] = b"module DemoGem\n  STATUS = \"patched\"\nend\n";
+const GEM_GEMSPEC: &str = "Gem::Specification.new do |s|\n  s.name = \"demo-gem\"\n  s.version = \"1.0.0\"\n  s.summary = \"in-process scan --vendor fixture\"\n  s.require_paths = [\"lib\"]\nend\n";
+const GEM_GEMFILE: &str = "source \"https://rubygems.org\"\n\ngem \"demo-gem\", \"~> 1.0\"\n";
+/// Hand-pinned bundler lock grammar (no CHECKSUMS — the 2.x/3.x default).
+const GEM_LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    demo-gem (1.0.0)\n\nPLATFORMS\n  ruby\n\nDEPENDENCIES\n  demo-gem (~> 1.0)\n\nBUNDLED WITH\n   2.6.2\n";
+
+/// A vendorable gem project in bundler's deployment layout — no real ruby
+/// needed: the crawler discovers `vendor/bundle/<engine>/<ver>/gems/` under a
+/// project with a Gemfile, and the vendor backend reads the stub gemspec from
+/// the sibling `specifications/` dir.
+struct GemFixture {
+    tmp: tempfile::TempDir,
+}
+
+impl GemFixture {
+    fn root(&self) -> &Path {
+        self.tmp.path()
+    }
+    fn gemfile_path(&self) -> PathBuf {
+        self.root().join("Gemfile")
+    }
+    fn lock_path(&self) -> PathBuf {
+        self.root().join("Gemfile.lock")
+    }
+    fn installed_lib(&self) -> PathBuf {
+        self.root()
+            .join("vendor/bundle/ruby/3.4.0/gems/demo-gem-1.0.0/lib/demo_gem.rb")
+    }
+    fn copy_rel() -> String {
+        format!(".socket/vendor/gem/{GEM_UUID}/demo-gem-1.0.0")
+    }
+    fn vendored_lib(&self) -> PathBuf {
+        self.root().join(Self::copy_rel()).join("lib/demo_gem.rb")
+    }
+    fn state_path(&self) -> PathBuf {
+        self.root().join(".socket/vendor/state.json")
+    }
+}
+
+fn gem_fixture() -> GemFixture {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    std::fs::write(root.join("Gemfile"), GEM_GEMFILE).unwrap();
+    std::fs::write(root.join("Gemfile.lock"), GEM_LOCK).unwrap();
+    let home = root.join("vendor/bundle/ruby/3.4.0");
+    std::fs::create_dir_all(home.join("gems/demo-gem-1.0.0/lib")).unwrap();
+    std::fs::write(home.join("gems/demo-gem-1.0.0/lib/demo_gem.rb"), GEM_ORIG).unwrap();
+    std::fs::create_dir_all(home.join("specifications")).unwrap();
+    std::fs::write(
+        home.join("specifications/demo-gem-1.0.0.gemspec"),
+        GEM_GEMSPEC,
+    )
+    .unwrap();
+    GemFixture { tmp }
+}
+
+/// Mount discovery (batch), per-package search, and the full view (inline
+/// `blobContent`, so `scan --vendor` runs against the mock alone) for the
+/// demo gem — the gem mirror of `scan_vendor_e2e::mount_patch_api`.
+async fn mount_gem_patch_api(mock: &wiremock::MockServer) {
+    use base64::Engine as _;
+    use wiremock::matchers::{method, path, path_regex};
+    use wiremock::{Mock, ResponseTemplate};
+
+    const ORG_SLUG: &str = "test-org";
+    let before_hash = compute_git_sha256_from_bytes(GEM_ORIG);
+    let after_hash = compute_git_sha256_from_bytes(GEM_PATCHED);
+    let blob_b64 = base64::engine::general_purpose::STANDARD.encode(GEM_PATCHED);
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/batch")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "packages": [{
+                "purl": GEM_PURL,
+                "patches": [{
+                    "uuid": GEM_UUID,
+                    "purl": GEM_PURL,
+                    "tier": "free",
+                    "cveIds": ["CVE-2026-0002"],
+                    "ghsaIds": [],
+                    "severity": "high",
+                    "title": "gem vendor target"
+                }]
+            }],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex(format!(
+            "^/v0/orgs/{ORG_SLUG}/patches/by-package/.+$"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "patches": [{
+                "uuid": GEM_UUID,
+                "purl": GEM_PURL,
+                "publishedAt": "2026-01-01T00:00:00Z",
+                "description": "gem vendor patch",
+                "license": "MIT",
+                "tier": "free",
+                "vulnerabilities": {}
+            }],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/view/{GEM_UUID}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "uuid": GEM_UUID,
+            "purl": GEM_PURL,
+            "publishedAt": "2026-01-01T00:00:00Z",
+            "files": {
+                "lib/demo_gem.rb": {
+                    "beforeHash": before_hash,
+                    "afterHash": after_hash,
+                    "blobContent": blob_b64,
+                }
+            },
+            "vulnerabilities": {
+                "GHSA-gem-vendor-test": {
+                    "cves": ["CVE-2026-0002"],
+                    "summary": "gem vendor vuln",
+                    "severity": "high",
+                    "description": "details"
+                }
+            },
+            "description": "gem vendor patch",
+            "license": "MIT",
+            "tier": "free",
+        })))
+        .mount(mock)
+        .await;
+}
+
+fn run_scan_vendor(root: &Path, mock_uri: &str, extra: &[&str]) -> (i32, Value) {
+    let mut argv = vec![
+        "scan",
+        "--json",
+        "--vendor",
+        "--yes",
+        "--api-url",
+        mock_uri,
+        "--api-token",
+        "fake-token",
+        "--org",
+        "test-org",
+        "--cwd",
+        root.to_str().unwrap(),
+    ];
+    argv.extend_from_slice(extra);
+    let (code, stdout, stderr) = run_cli(root, &argv, &[]);
+    let env: Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!("scan --vendor --json must emit JSON: {e}\nstdout:\n{stdout}\nstderr:\n{stderr}")
+    });
+    (code, env)
+}
+
+/// `scan --vendor` end to end on a gem project: discover → download
+/// (manifest written) → vendor lands the gem pair edit (Gemfile pin +
+/// `path:`, lock PATH section + `(= …)!` DEPENDENCIES pin) and the patched
+/// artifact dir — then reconcile auto-reverts once the manifest drops the
+/// patch, byte-restoring both halves.
+#[tokio::test]
+async fn scan_vendor_gem_end_to_end_and_reconcile() {
+    let mock = wiremock::MockServer::start().await;
+    mount_gem_patch_api(&mock).await;
+    let fx = gem_fixture();
+
+    let (code, env) = run_scan_vendor(fx.root(), &mock.uri(), &[]);
+    assert_eq!(code, 0, "scan --vendor must succeed: {env:#}");
+    assert_eq!(env["status"], "success", "envelope: {env:#}");
+    assert_eq!(env["download"]["downloaded"], 1, "envelope: {env:#}");
+    assert_eq!(env["vendor"]["summary"]["applied"], 1, "envelope: {env:#}");
+    assert_eq!(env["vendor"]["summary"]["failed"], 0, "envelope: {env:#}");
+
+    // Manifest written by the download phase, keyed by the gem purl.
+    let manifest: Value =
+        serde_json::from_slice(&std::fs::read(fx.root().join(".socket/manifest.json")).unwrap())
+            .unwrap();
+    assert_eq!(manifest["patches"][GEM_PURL]["uuid"], GEM_UUID);
+
+    // Artifact: patched bytes + the stub gemspec a path source needs.
+    assert_eq!(
+        std::fs::read(fx.vendored_lib()).unwrap(),
+        GEM_PATCHED,
+        "vendored lib must hold the patched bytes"
+    );
+    assert_eq!(
+        std::fs::read_to_string(
+            fx.root()
+                .join(GemFixture::copy_rel())
+                .join("demo-gem.gemspec")
+        )
+        .unwrap(),
+        GEM_GEMSPEC,
+        "stub gemspec materialized from specifications/"
+    );
+
+    // The MANDATORY pair edit.
+    let gemfile = std::fs::read_to_string(fx.gemfile_path()).unwrap();
+    assert!(
+        gemfile.contains(&format!(
+            "gem \"demo-gem\", \"1.0.0\", path: \"{}\"",
+            GemFixture::copy_rel()
+        )),
+        "Gemfile line not rewritten to the exact-pin + path: form:\n{gemfile}"
+    );
+    let lock = std::fs::read_to_string(fx.lock_path()).unwrap();
+    assert!(
+        lock.contains(&format!(
+            "PATH\n  remote: {}\n  specs:\n    demo-gem (1.0.0)",
+            GemFixture::copy_rel()
+        )),
+        "canonical PATH section missing:\n{lock}"
+    );
+    assert!(
+        lock.contains("\n  demo-gem (= 1.0.0)!"),
+        "DEPENDENCIES pin missing:\n{lock}"
+    );
+
+    // The installed tree stays pristine (vendoring is not an in-place apply)
+    // and the ledger entry is manifest-tracked (not detached).
+    assert_eq!(std::fs::read(fx.installed_lib()).unwrap(), GEM_ORIG);
+    let state: Value = serde_json::from_slice(&std::fs::read(fx.state_path()).unwrap()).unwrap();
+    assert_eq!(state["entries"][GEM_PURL]["ecosystem"], "gem");
+    assert_eq!(state["entries"][GEM_PURL]["uuid"], GEM_UUID);
+    assert!(
+        state["entries"][GEM_PURL]["detached"].is_null(),
+        "manifest-mode entries are not detached: {state:#}"
+    );
+
+    // Idempotent re-run through the same JSON arm.
+    let gemfile_wired = std::fs::read(fx.gemfile_path()).unwrap();
+    let lock_wired = std::fs::read(fx.lock_path()).unwrap();
+    let (code, env2) = run_scan_vendor(fx.root(), &mock.uri(), &[]);
+    assert_eq!(code, 0, "re-run must succeed: {env2:#}");
+    assert_eq!(env2["vendor"]["summary"]["applied"], 0, "{env2:#}");
+    assert!(
+        env2["vendor"]["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["action"] == "skipped" && e["errorCode"] == "already_vendored"),
+        "re-run must be an already_vendored skip: {env2:#}"
+    );
+    assert_eq!(std::fs::read(fx.gemfile_path()).unwrap(), gemfile_wired);
+    assert_eq!(std::fs::read(fx.lock_path()).unwrap(), lock_wired);
+
+    // Reconcile: the patch dropped from the manifest is auto-reverted by the
+    // next plain vendor run — BOTH pair-edit halves byte-restored.
+    std::fs::write(
+        fx.root().join(".socket/manifest.json"),
+        b"{\"patches\": {}}\n",
+    )
+    .unwrap();
+    let (code, renv) = vendor_cli(fx.root(), &[]);
+    assert_eq!(code, 0, "reconcile-only run must exit 0: {renv:#}");
+    let removed = find_event(&renv, "removed", Some("vendor_reconciled"));
+    assert_eq!(removed["purl"], GEM_PURL);
+    assert_eq!(
+        std::fs::read(fx.gemfile_path()).unwrap(),
+        GEM_GEMFILE.as_bytes(),
+        "reconcile must byte-restore the Gemfile"
+    );
+    assert_eq!(
+        std::fs::read(fx.lock_path()).unwrap(),
+        GEM_LOCK.as_bytes(),
+        "reconcile must byte-restore Gemfile.lock"
+    );
+    assert!(
+        !fx.root().join(".socket/vendor").exists(),
+        "the reconciled vendor tree must be fully pruned"
+    );
+}
+
+/// `scan --vendor --detached` on the gem project: no manifest is written,
+/// the ledger entry is detached with the patch record embedded, the pair
+/// edit still lands — and `vendor --revert` (the detached entry's only exit
+/// path) byte-restores both files.
+#[tokio::test]
+async fn scan_vendor_gem_detached_writes_no_manifest_and_reverts() {
+    let mock = wiremock::MockServer::start().await;
+    mount_gem_patch_api(&mock).await;
+    let fx = gem_fixture();
+
+    let (code, env) = run_scan_vendor(fx.root(), &mock.uri(), &["--detached"]);
+    assert_eq!(code, 0, "scan --vendor --detached must succeed: {env:#}");
+    assert_eq!(env["vendor"]["summary"]["applied"], 1, "envelope: {env:#}");
+
+    assert!(
+        !fx.root().join(".socket/manifest.json").exists(),
+        "detached mode must not write a manifest"
+    );
+    assert!(
+        !fx.root().join(".socket/blobs").exists(),
+        "detached vendoring holds content in memory, never .socket/blobs"
+    );
+    let state: Value = serde_json::from_slice(&std::fs::read(fx.state_path()).unwrap()).unwrap();
+    assert_eq!(state["entries"][GEM_PURL]["detached"], json!(true));
+    assert!(
+        state["entries"][GEM_PURL]["record"].is_object(),
+        "detached entries embed the patch record: {state:#}"
+    );
+    assert_eq!(std::fs::read(fx.vendored_lib()).unwrap(), GEM_PATCHED);
+    let lock = std::fs::read_to_string(fx.lock_path()).unwrap();
+    assert!(
+        lock.contains("\n  demo-gem (= 1.0.0)!"),
+        "detached vendoring still lands the pair edit:\n{lock}"
+    );
+
+    // `--revert` is the detached entry's exit path: byte-restoration.
+    let (code, renv) = vendor_cli(fx.root(), &["--revert"]);
+    assert_eq!(code, 0, "revert must undo the detached entry: {renv:#}");
+    assert_eq!(
+        std::fs::read(fx.gemfile_path()).unwrap(),
+        GEM_GEMFILE.as_bytes(),
+        "revert must byte-restore the Gemfile"
+    );
+    assert_eq!(
+        std::fs::read(fx.lock_path()).unwrap(),
+        GEM_LOCK.as_bytes(),
+        "revert must byte-restore Gemfile.lock"
+    );
+    assert!(!fx.root().join(".socket/vendor").exists());
 }
