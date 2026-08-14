@@ -39,6 +39,13 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
   yarn 4), and `.yarnrc.yml`'s `compressionLevel` must stay 0. The node-modules linker
   is e2e-covered; PnP is untested for hosted — the lock rewrite fires, but PnP's
   `.yarn/cache` resolution isn't exercised.
+- **yarn `npm:` aliases (classic & berry)** — a lock entry that consumes the patched
+  package only through an alias descriptor (`"safe-pad@npm:left-pad@^1.3.0"`) is left
+  untouched, with a `redirect_yarn_classic_alias_skipped` /
+  `redirect_yarn_berry_alias_skipped` warning naming the entry — that copy keeps the
+  unpatched artifact. The reverse shape — an alias of the patched NAME pointing at a
+  different package (`"left-pad@npm:some-fork@^1.3.0"`, the fork-substitution idiom) —
+  is never rewritten: it resolves a different package.
 - **bun** — text `bun.lock` v1 only. A binary `bun.lockb` with no text lock beside it
   is auto-migrated first: the CLI runs your installed `bun`
   (`bun install --save-text-lockfile --frozen-lockfile --lockfile-only`) before reading

@@ -78,10 +78,22 @@ pub(crate) fn packages_bounds(lines: &[String]) -> Option<(usize, usize)> {
 /// is neither blank nor a single-line `"key": [tuple]` entry fails CLOSED.
 pub(crate) fn parse_packages_section(lines: &[String]) -> Result<Vec<BunEntry>, String> {
     let Some((start, end)) = packages_bounds(lines) else {
-        // No (or unterminated) packages section: an empty lock simply has
-        // no entries; an unterminated one is malformed.
+        // Only a lock with NO `"packages"` object at all is an empty lock.
+        // Everything else fails CLOSED: an unterminated canonical section is
+        // malformed, and a header spelled ANY other way than bun's byte-exact
+        // emitted shape (tab/4-space re-indent, `"packages" : {`) must refuse
+        // rather than read as "no entries" — treating it as empty would make
+        // the caller silently skip a lock bun itself parses fine.
         return if lines.iter().any(|l| l.trim_end() == "  \"packages\": {") {
             Err("unterminated \"packages\" section".to_string())
+        } else if lines.iter().any(|l| {
+            l.trim_start()
+                .strip_prefix("\"packages\"")
+                .map(str::trim_start)
+                .and_then(|rest| rest.strip_prefix(':'))
+                .is_some_and(|rest| rest.trim_start().starts_with('{'))
+        }) {
+            Err("\"packages\" section header is not in bun's emitted shape".to_string())
         } else {
             Ok(Vec::new())
         };
@@ -301,5 +313,48 @@ mod tests {
             parse_entry_line("    \"k\": [\"a\"], junk").is_err(),
             "trailing junk"
         );
+    }
+
+    fn to_lines(text: &str) -> Vec<String> {
+        text.split('\n').map(str::to_string).collect()
+    }
+
+    /// A `"packages"` header spelled any way other than bun's byte-exact
+    /// emitted shape must parse as an ERROR (fail closed), never as an empty
+    /// lock — "empty" made the rewriters silently skip locks bun itself
+    /// parses fine.
+    #[test]
+    fn noncanonical_packages_header_is_an_error_not_empty() {
+        let entry = r#""left-pad": ["left-pad@1.3.0", "", {}, "sha512-X=="],"#;
+        for lock in [
+            format!("{{\n  \"lockfileVersion\": 1,\n\t\"packages\": {{\n    {entry}\n\t}}\n}}\n"),
+            format!(
+                "{{\n  \"lockfileVersion\": 1,\n    \"packages\": {{\n    {entry}\n    }}\n}}\n"
+            ),
+            format!("{{\n  \"lockfileVersion\": 1,\n  \"packages\" : {{\n    {entry}\n  }}\n}}\n"),
+        ] {
+            assert!(
+                parse_packages_section(&to_lines(&lock)).is_err(),
+                "must fail closed, not read as empty: {lock}"
+            );
+        }
+
+        // Truly absent packages section: an empty lock, no error.
+        let empty = "{\n  \"lockfileVersion\": 1,\n  \"workspaces\": {\n  }\n}\n";
+        assert!(parse_packages_section(&to_lines(empty)).unwrap().is_empty());
+
+        // A dependency literally named "packages" in another section must not
+        // trip the fail-closed header detection (its value is a string, not
+        // an object opener).
+        let dep_named_packages = "{\n  \"lockfileVersion\": 1,\n  \"workspaces\": {\n    \
+                                  \"\": {\n      \"dependencies\": {\n        \
+                                  \"packages\": \"^1.0.0\",\n      },\n    },\n  }\n}\n";
+        assert!(parse_packages_section(&to_lines(dep_named_packages))
+            .unwrap()
+            .is_empty());
+
+        // The canonical-but-unterminated case still errors.
+        let unterminated = "{\n  \"lockfileVersion\": 1,\n  \"packages\": {\n";
+        assert!(parse_packages_section(&to_lines(unterminated)).is_err());
     }
 }
