@@ -7,11 +7,10 @@
         {
             "name": "monolog/monolog",
             "version": "2.0.0",
-            "dist": {
-                "type": "zip",
-                "url": "https://api.github.com/repos/Seldaek/monolog/zipball/abc123",
-                "reference": "abc123def456",
-                "shasum": ""
+            "source": {
+                "type": "git",
+                "url": "https://github.com/Seldaek/monolog.git",
+                "reference": "abc123def456"
             }
         },
         {

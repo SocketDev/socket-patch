@@ -10,12 +10,18 @@ use crate::utils::process::{CommandRunner, SystemCommandRunner};
 /// vendor directories.
 pub struct ComposerCrawler;
 
-/// A single package entry distilled from installed.json. Only the two
+/// A single package entry distilled from installed.json. Only the three
 /// fields the crawler needs are retained; everything else (source,
 /// dist, autoload, ...) is ignored.
 struct ComposerPackageEntry {
     name: String,
     version: String,
+    /// `install-path` as recorded, relative to the `vendor/composer/`
+    /// directory that holds installed.json (`../monolog/monolog` for a
+    /// conventional install, `../../web/app/plugins/x` for a
+    /// composer/installers target). `None` for Composer 1 entries and any
+    /// entry that omits it.
+    install_path: Option<String>,
 }
 
 impl ComposerCrawler {
@@ -29,9 +35,11 @@ impl ComposerCrawler {
     /// In global mode, checks `$COMPOSER_HOME/vendor/` (env var, command
     /// fallback, or platform defaults).
     ///
-    /// In local mode, checks `<cwd>/vendor/` but only if the directory
-    /// contains `composer/installed.json` and the cwd looks like a PHP
-    /// project (`composer.json` or `composer.lock` present).
+    /// In local mode, checks the project's vendor directory
+    /// (`COMPOSER_VENDOR_DIR` / composer.json `config.vendor-dir` /
+    /// `vendor`, see [`resolve_local_vendor_dir`]) but only if the
+    /// directory contains `composer/installed.json` and the cwd looks like
+    /// a PHP project (`composer.json` or `composer.lock` present).
     pub async fn get_vendor_paths(
         &self,
         options: &CrawlerOptions,
@@ -51,7 +59,9 @@ impl ComposerCrawler {
         }
 
         // Local mode
-        let vendor_dir = options.cwd.join("vendor");
+        let Some(vendor_dir) = resolve_local_vendor_dir(&options.cwd).await else {
+            return Ok(Vec::new());
+        };
         let installed_json = vendor_dir.join("composer").join("installed.json");
 
         if !is_dir(&vendor_dir).await || !is_file(&installed_json).await {
@@ -77,15 +87,18 @@ impl ComposerCrawler {
         let vendor_paths = self.get_vendor_paths(options).await.unwrap_or_default();
 
         for vendor_path in &vendor_paths {
+            let project_root = resolve_project_root(vendor_path).await;
             let entries = read_installed_json(vendor_path).await;
             for entry in entries {
                 if let Some((namespace, name)) = entry.name.split_once('/') {
                     // Skip packages that installed.json lists but that are
-                    // not actually on disk (stale metadata, custom install
-                    // paths). This keeps crawl_all consistent with
-                    // find_by_purls, which only returns packages whose
-                    // vendor directory exists.
-                    let pkg_path = vendor_path.join(namespace).join(name);
+                    // not actually on disk (stale metadata, a metapackage).
+                    // This keeps crawl_all consistent with find_by_purls,
+                    // which only returns packages whose directory exists.
+                    let Some(pkg_path) = resolve_package_dir(vendor_path, &project_root, &entry)
+                    else {
+                        continue;
+                    };
                     if !is_dir(&pkg_path).await {
                         continue;
                     }
@@ -138,14 +151,15 @@ impl ComposerCrawler {
         // package names are case-insensitive and the canonical PURL is
         // lowercase, but installed.json records the *pretty* (case-preserved)
         // name and Composer writes the vendor directory with that same
-        // casing. Key the map by the lowercased name and carry the original
-        // name so the real on-disk path can be reconstructed even on
+        // casing. Key the map by the lowercased name and carry the whole
+        // entry so the real on-disk path can be reconstructed even on
         // case-sensitive filesystems.
         let entries = read_installed_json(vendor_path).await;
-        let installed: HashMap<String, (String, String)> = entries
+        let installed: HashMap<String, ComposerPackageEntry> = entries
             .into_iter()
-            .map(|e| (e.name.to_ascii_lowercase(), (e.name, e.version)))
+            .map(|e| (e.name.to_ascii_lowercase(), e))
             .collect();
+        let project_root = resolve_project_root(vendor_path).await;
 
         for purl in purls {
             if let Some(((namespace, name), version)) =
@@ -153,7 +167,7 @@ impl ComposerCrawler {
             {
                 let full_name = format!("{namespace}/{name}").to_ascii_lowercase();
 
-                let Some((installed_name, installed_version)) = installed.get(&full_name) else {
+                let Some(entry) = installed.get(&full_name) else {
                     continue;
                 };
 
@@ -161,17 +175,17 @@ impl ComposerCrawler {
                 // normalized version so a `v`-prefixed installed.json
                 // version (`v6.4.1`) matches a bare PURL version (`6.4.1`)
                 // and vice versa.
-                if normalize_version(installed_version) != normalize_version(version) {
+                if normalize_version(&entry.version) != normalize_version(version) {
                     continue;
                 }
 
-                // Resolve the on-disk directory using the original casing
-                // recorded in installed.json, which is what Composer wrote to
-                // disk — the canonical (lowercase) PURL name would miss it on
-                // a case-sensitive filesystem.
-                let pkg_dir = match installed_name.split_once('/') {
-                    Some((ns, n)) => vendor_path.join(ns).join(n),
-                    None => continue,
+                // Resolve the on-disk directory from installed.json's own
+                // record — its `install-path` when present, else the
+                // conventional layout under the original (case-preserved)
+                // casing Composer wrote to disk; the canonical (lowercase)
+                // PURL name would miss it on a case-sensitive filesystem.
+                let Some(pkg_dir) = resolve_package_dir(vendor_path, &project_root, entry) else {
+                    continue;
                 };
 
                 if !is_dir(&pkg_dir).await {
@@ -282,6 +296,222 @@ pub(crate) fn normalize_version(version: &str) -> &str {
     version
 }
 
+/// How far above the vendor directory [`resolve_project_root`] looks for
+/// the composer manifest. `config.vendor-dir` may nest the vendor tree
+/// (`lib/deps`), so the project root is not always the immediate parent;
+/// the walk is bounded so an unrelated `composer.json` far up the
+/// filesystem can't widen the write boundary.
+const PROJECT_ROOT_SEARCH_DEPTH: usize = 3;
+
+/// Read `config.vendor-dir` out of a composer.json body, mirroring the
+/// slice of Composer's `Config::get('vendor-dir')` that matters here:
+/// trailing separators are trimmed (`"vendor/"` is legal) and an empty
+/// value counts as unset.
+///
+/// Composer additionally expands `$HOME`/`~`/`%VAR%` placeholders
+/// (`Platform::expandPath`); that is deliberately NOT implemented — an
+/// unexpanded value simply resolves to a directory that does not exist,
+/// so discovery reports nothing rather than guessing at a path.
+fn parse_config_vendor_dir(composer_json: &str) -> Option<String> {
+    let doc: serde_json::Value = serde_json::from_str(composer_json).ok()?;
+    let raw = doc.get("config")?.get("vendor-dir")?.as_str()?;
+    let trimmed = raw.trim_end_matches(['/', '\\']);
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+/// Resolve the vendor directory of a local project the way Composer does:
+/// `COMPOSER_VENDOR_DIR` wins, else composer.json `config.vendor-dir`
+/// (relative to the manifest directory), else `vendor`.
+///
+/// Composer relocates the WHOLE vendor tree — `composer/installed.json`
+/// included — so assuming `<cwd>/vendor` makes every installed package
+/// invisible: scan reports them as lockfile-only ("not yet installed")
+/// and apply resolves them as `package_not_found`.
+///
+/// Returns `None` when composer.json configures a value that is not a
+/// plain relative subpath. That value comes from the project being
+/// scanned and names the directory apply later WRITES patch content into,
+/// so `../../elsewhere` or `/etc` is refused outright rather than
+/// silently downgraded to `vendor/` (which would patch an unrelated
+/// tree). Absolute paths are legal in Composer but are refused for the
+/// same reason; a project using one discovers nothing, exactly as today.
+/// `COMPOSER_VENDOR_DIR` is not gated — it comes from the invoking
+/// environment, the same trust level as `CARGO_HOME` / `NUGET_PACKAGES` /
+/// `MAVEN_REPO_LOCAL`, which are all honored verbatim.
+async fn resolve_local_vendor_dir(cwd: &Path) -> Option<PathBuf> {
+    // A set-but-empty value counts as unset (twin of the MAVEN_REPO_LOCAL
+    // and NUGET_PACKAGES rules): honoring `""` would resolve the vendor
+    // tree to the project root itself.
+    if let Some(from_env) = std::env::var("COMPOSER_VENDOR_DIR")
+        .ok()
+        .map(|v| v.trim_end_matches(['/', '\\']).to_string())
+        .filter(|v| !v.is_empty())
+    {
+        // `join` substitutes an absolute value for the base, matching
+        // Composer's own relative-to-the-manifest-dir resolution.
+        return Some(cwd.join(from_env));
+    }
+
+    match read_config_vendor_dir(&cwd.join("composer.json")).await {
+        Some(configured) => normalize_config_vendor_dir(&configured)
+            .filter(|normalized| path_safety::is_safe_multi_segment(normalized))
+            .map(|normalized| cwd.join(normalized)),
+        None => Some(cwd.join("vendor")),
+    }
+}
+
+/// Reduce a `config.vendor-dir` value to plain `a/b` segments before the
+/// safety gate. Composer accepts `./`-prefixed and `.`-interleaved values
+/// (`./vendor`, `lib/./deps`) and either separator; refusing those shapes
+/// outright regressed projects that previously resolved fine at the
+/// hardcoded `vendor/`. `..` is resolved lexically the way Composer's own
+/// path resolution does; a value that climbs above the project root (or
+/// reduces to it) fails closed as `None`.
+fn normalize_config_vendor_dir(raw: &str) -> Option<String> {
+    if raw.starts_with(['/', '\\']) {
+        return None;
+    }
+    let mut segments: Vec<&str> = Vec::new();
+    for segment in raw.split(['/', '\\']) {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                segments.pop()?;
+            }
+            other => segments.push(other),
+        }
+    }
+    (!segments.is_empty()).then(|| segments.join("/"))
+}
+
+/// Read `config.vendor-dir` from a composer.json on disk. Opened with
+/// [`crate::utils::fs::open_regular_file`] for the same reason
+/// installed.json is: the manifest belongs to the untrusted project, and
+/// a FIFO planted at that path would wedge a plain read forever.
+async fn read_config_vendor_dir(manifest_path: &Path) -> Option<String> {
+    use tokio::io::AsyncReadExt;
+
+    let (mut file, metadata) = crate::utils::fs::open_regular_file(manifest_path)
+        .await
+        .ok()?;
+    let mut content = String::with_capacity(metadata.len() as usize);
+    file.read_to_string(&mut content).await.ok()?;
+    parse_config_vendor_dir(&content)
+}
+
+/// The directory an installed.json `install-path` may not escape.
+///
+/// `install-path` legitimately points OUTSIDE the vendor tree — that is
+/// the entire point of composer/installers (`extra.installer-paths`,
+/// `type: wordpress-plugin`) — so the boundary cannot be the vendor root.
+/// But installed.json is untrusted, tamperable input and the resolved
+/// directory is a patch WRITE target, so it must stay inside the project:
+/// the nearest ancestor of the vendor directory carrying a composer
+/// manifest, else the vendor directory's immediate parent.
+///
+/// Derived from the vendor path alone so scan (`crawl_all`) and apply
+/// (`find_by_purls`, which is only ever handed the vendor directory)
+/// agree on the boundary; disagreeing would surface packages in scan that
+/// apply then refuses to resolve.
+async fn resolve_project_root(vendor_path: &Path) -> PathBuf {
+    let mut fallback = None;
+    for ancestor in vendor_path
+        .ancestors()
+        .skip(1)
+        .take(PROJECT_ROOT_SEARCH_DEPTH)
+    {
+        if fallback.is_none() {
+            fallback = Some(ancestor.to_path_buf());
+        }
+        if is_file(&ancestor.join("composer.json")).await
+            || is_file(&ancestor.join("composer.lock")).await
+        {
+            return normalize_lexically(ancestor).unwrap_or_else(|| ancestor.to_path_buf());
+        }
+    }
+    let root = fallback.unwrap_or_else(|| vendor_path.to_path_buf());
+    normalize_lexically(&root).unwrap_or(root)
+}
+
+/// Resolve `.`/`..` without touching the filesystem, so a path can be
+/// containment-checked BEFORE it is opened (a canonicalizing check would
+/// have to stat the very path being validated, and would fail on
+/// not-yet-existing directories). Returns `None` when `..` pops above the
+/// path's own root — nothing legitimate does that, so it fails closed.
+///
+/// Symlinks are not resolved: a symlink INSIDE the project pointing out
+/// of it is a pre-existing trust decision of the project's own tree, the
+/// same assumption the rest of the crawler layer makes.
+fn normalize_lexically(path: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+
+    let mut out = PathBuf::new();
+    let mut depth = 0usize;
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir => out.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if depth == 0 {
+                    return None;
+                }
+                out.pop();
+                depth -= 1;
+            }
+            Component::Normal(segment) => {
+                out.push(segment);
+                depth += 1;
+            }
+        }
+    }
+    Some(out)
+}
+
+/// Resolve an installed.json `install-path` against the vendor tree.
+///
+/// Composer records it relative to `vendor/composer/` (the directory
+/// holding installed.json), not to the vendor root. Returns `None` when
+/// the resolved directory leaves `project_root`
+/// ([`resolve_project_root`]) — fail closed, no fallback to
+/// `vendor/<ns>/<name>`: an entry that claims to live somewhere out of
+/// tree must not redirect the patch onto an unrelated directory.
+fn resolve_install_path(
+    vendor_path: &Path,
+    project_root: &Path,
+    install_path: &str,
+) -> Option<PathBuf> {
+    if install_path.contains('\0') {
+        return None;
+    }
+    // `join` substitutes an absolute `install-path` (Composer writes one
+    // for some path repositories) for the base; the containment check
+    // below is what keeps it in bounds either way.
+    let joined = vendor_path.join("composer").join(install_path);
+    let resolved = normalize_lexically(&joined)?;
+    resolved.starts_with(project_root).then_some(resolved)
+}
+
+/// The on-disk directory of an installed.json entry.
+///
+/// `install-path` is authoritative when recorded: Composer 2 writes it for
+/// every package, and for composer/installers targets (WordPress plugins,
+/// Drupal modules, `extra.installer-paths`) it is the ONLY record of where
+/// the package really lives. Entries without one (Composer 1, hand-written
+/// metadata) keep the conventional `vendor/<namespace>/<name>` layout.
+fn resolve_package_dir(
+    vendor_path: &Path,
+    project_root: &Path,
+    entry: &ComposerPackageEntry,
+) -> Option<PathBuf> {
+    match entry.install_path.as_deref() {
+        Some(install_path) => resolve_install_path(vendor_path, project_root, install_path),
+        None => {
+            let (namespace, name) = entry.name.split_once('/')?;
+            Some(vendor_path.join(namespace).join(name))
+        }
+    }
+}
+
 /// Whether an installed.json package name is safe to join onto the
 /// vendor root. Both `crawl_all` and `find_by_purls` split the recorded
 /// name at `/` and join the pieces onto the vendor directory, and the
@@ -351,9 +581,19 @@ async fn read_installed_json(vendor_path: &Path) -> Vec<ComposerPackageEntry> {
             if name.is_empty() || version.is_empty() || !is_safe_composer_name(name) {
                 return None;
             }
+            // `install-path` is NOT gated here: it is legitimately a
+            // `..`-prefixed path out of `vendor/composer/`, so the
+            // coordinate gate cannot be a per-segment one. It is validated
+            // when resolved instead ([`resolve_install_path`]).
+            let install_path = entry
+                .get("install-path")
+                .and_then(|p| p.as_str())
+                .filter(|p| !p.is_empty())
+                .map(str::to_string);
             Some(ComposerPackageEntry {
                 name: name.to_string(),
                 version: version.to_string(),
+                install_path,
             })
         })
         .collect()
@@ -1083,6 +1323,143 @@ mod tests {
             found.unwrap().is_empty(),
             "a FIFO installed.json must resolve no package"
         );
+    }
+
+    #[test]
+    fn test_parse_config_vendor_dir() {
+        assert_eq!(
+            parse_config_vendor_dir(r#"{"config":{"vendor-dir":"lib/deps"}}"#).as_deref(),
+            Some("lib/deps")
+        );
+        // Composer rtrims trailing separators before using the value.
+        assert_eq!(
+            parse_config_vendor_dir(r#"{"config":{"vendor-dir":"lib/deps/"}}"#).as_deref(),
+            Some("lib/deps")
+        );
+        // No config block, no key, wrong type, empty value, malformed JSON —
+        // all "unset", so the caller falls back to `vendor`.
+        assert_eq!(parse_config_vendor_dir("{}"), None);
+        assert_eq!(parse_config_vendor_dir(r#"{"config":{}}"#), None);
+        assert_eq!(
+            parse_config_vendor_dir(r#"{"config":{"vendor-dir":7}}"#),
+            None
+        );
+        assert_eq!(
+            parse_config_vendor_dir(r#"{"config":{"vendor-dir":""}}"#),
+            None
+        );
+        assert_eq!(
+            parse_config_vendor_dir(r#"{"config":{"vendor-dir":"/"}}"#),
+            None
+        );
+        assert_eq!(parse_config_vendor_dir("{ not json"), None);
+    }
+
+    #[test]
+    fn test_normalize_config_vendor_dir() {
+        let n = normalize_config_vendor_dir;
+        // Composer-legal `./` prefixes and `.` segments reduce to the
+        // plain path; either separator is accepted.
+        assert_eq!(n("./vendor").as_deref(), Some("vendor"));
+        assert_eq!(n("./lib/deps").as_deref(), Some("lib/deps"));
+        assert_eq!(n("lib/./deps").as_deref(), Some("lib/deps"));
+        assert_eq!(n("lib\\deps").as_deref(), Some("lib/deps"));
+        assert_eq!(n("lib/../deps").as_deref(), Some("deps"));
+        assert_eq!(n("vendor").as_deref(), Some("vendor"));
+        // Escaping the project, reducing to it, or absolute — fail closed.
+        assert_eq!(n(".."), None);
+        assert_eq!(n("../elsewhere"), None);
+        assert_eq!(n("lib/../.."), None);
+        assert_eq!(n("."), None);
+        assert_eq!(n("a/.."), None);
+        assert_eq!(n("/etc/vendor"), None);
+        assert_eq!(n("\\\\share\\vendor"), None);
+        // A drive-letter segment survives normalization; the
+        // `is_safe_multi_segment` gate downstream rejects the colon.
+        assert_eq!(
+            n("C:\\Users\\x\\vendor").as_deref(),
+            Some("C:/Users/x/vendor")
+        );
+        assert!(!crate::patch::path_safety::is_safe_multi_segment(
+            "C:/Users/x/vendor"
+        ));
+    }
+
+    #[test]
+    fn test_normalize_lexically() {
+        let n = |p: &str| normalize_lexically(Path::new(p));
+        // `.` drops out, `..` pops the previous segment.
+        assert_eq!(
+            n("/a/b/composer/../monolog/monolog").unwrap(),
+            PathBuf::from("/a/b/monolog/monolog")
+        );
+        assert_eq!(
+            n("/a/b/composer/./installers").unwrap(),
+            PathBuf::from("/a/b/composer/installers")
+        );
+        assert_eq!(n("/a/b/c/../../../web/x").unwrap(), PathBuf::from("/web/x"));
+        // Popping above the path's own root fails closed.
+        assert_eq!(n("/a/../.."), None);
+        assert_eq!(n("../x"), None);
+        // Relative paths stay relative.
+        assert_eq!(n("a/b/../c").unwrap(), PathBuf::from("a/c"));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_project_root_finds_manifest_above_nested_vendor() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("proj");
+        let vendor = root.join("lib").join("deps");
+        tokio::fs::create_dir_all(&vendor).await.unwrap();
+        tokio::fs::write(root.join("composer.json"), "{}")
+            .await
+            .unwrap();
+
+        // A `config.vendor-dir` can nest the vendor tree, so the project root
+        // is not the vendor dir's parent — it is the nearest ancestor holding
+        // the manifest.
+        assert_eq!(resolve_project_root(&vendor).await, root);
+
+        // With no manifest anywhere above, the immediate parent is the
+        // boundary rather than an unbounded walk up the filesystem.
+        let orphan = dir.path().join("orphan").join("vendor");
+        tokio::fs::create_dir_all(&orphan).await.unwrap();
+        assert_eq!(
+            resolve_project_root(&orphan).await,
+            dir.path().join("orphan")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_crawl_all_without_install_path_uses_conventional_layout() {
+        // Composer 1 (and hand-written metadata) records no install-path;
+        // those entries must keep resolving to vendor/<namespace>/<name>.
+        let dir = tempfile::tempdir().unwrap();
+        let vendor_dir = dir.path().join("vendor");
+        let composer_dir = vendor_dir.join("composer");
+        tokio::fs::create_dir_all(&composer_dir).await.unwrap();
+        tokio::fs::write(
+            composer_dir.join("installed.json"),
+            r#"[{"name": "monolog/monolog", "version": "3.5.0"}]"#,
+        )
+        .await
+        .unwrap();
+        tokio::fs::create_dir_all(vendor_dir.join("monolog").join("monolog"))
+            .await
+            .unwrap();
+        tokio::fs::write(dir.path().join("composer.json"), "{}")
+            .await
+            .unwrap();
+
+        let crawler = ComposerCrawler::new();
+        let options = CrawlerOptions {
+            cwd: dir.path().to_path_buf(),
+            global: false,
+            global_prefix: None,
+        };
+        let packages = crawler.crawl_all(&options).await;
+        assert_eq!(packages.len(), 1);
+        assert_eq!(packages[0].path, vendor_dir.join("monolog").join("monolog"));
     }
 
     #[tokio::test]

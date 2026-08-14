@@ -22,6 +22,7 @@ use std::path::Path;
 
 use serde_json::Value;
 
+use crate::crawlers::composer_crawler::normalize_version;
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::patch::path_safety;
 use crate::utils::purl::{percent_decode_purl_component, strip_purl_qualifiers};
@@ -637,7 +638,8 @@ async fn inventory_bun(root: &Path) -> Option<Vec<LockfileEntry>> {
 /// Inventory `composer.lock` `packages`/`packages-dev`. The `dist.shasum`
 /// (sha1 of the dist zip) is frequently empty — such entries stay
 /// discovery-only. Names lowercase to the canonical packagist form;
-/// versions drop the pretty leading `v`.
+/// versions drop the pretty leading `v`/`V` through the crawler's
+/// [`normalize_version`], so installed and lockfile rows agree.
 async fn inventory_composer_lock(project_root: &Path) -> Option<Vec<LockfileEntry>> {
     let bytes = tokio::fs::read(project_root.join("composer.lock"))
         .await
@@ -656,11 +658,12 @@ async fn inventory_composer_lock(project_root: &Path) -> Option<Vec<LockfileEntr
                 continue;
             };
             let name = name.to_ascii_lowercase();
-            let version = version
-                .strip_prefix('v')
-                .filter(|r| r.chars().next().is_some_and(|c| c.is_ascii_digit()))
-                .unwrap_or(version)
-                .to_string();
+            // Share the crawler's normalization rather than re-deriving it:
+            // it strips `v` AND `V` (both are legal Composer tags), and a
+            // lockfile row that normalizes differently from the installed
+            // row double-counts the package — one installed `@1.2.3` plus a
+            // phantom lockfile-only `@V1.2.3`, both POSTed.
+            let version = normalize_version(version).to_string();
             if !path_safety::is_safe_multi_segment(&name)
                 || name.split('/').count() != 2
                 || !path_safety::is_safe_single_segment(&version)

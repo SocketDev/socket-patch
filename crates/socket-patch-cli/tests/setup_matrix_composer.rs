@@ -48,8 +48,11 @@ mod host_guard {
 
     /// A realistic composer-only project: a PHP manifest requiring the
     /// same package the matrix targets, and nothing the npm/Python/Cargo
-    /// detectors would recognise.
-    const COMPOSER_JSON: &str = "{\n  \"name\": \"acme/widget\",\n  \"require\": {\n    \"monolog/monolog\": \"3.5.0\"\n  }\n}\n";
+    /// detectors would recognise. Indented with 4 spaces, the way composer
+    /// itself writes the file (PHP `JSON_PRETTY_PRINT`) — so the
+    /// byte-for-byte restore below also pins that `setup` does not reformat
+    /// a composer-authored manifest to serde's 2-space default.
+    const COMPOSER_JSON: &str = "{\n    \"name\": \"acme/widget\",\n    \"require\": {\n        \"monolog/monolog\": \"3.5.0\"\n    }\n}\n";
 
     /// Run the CLI with `args` in `cwd`; returns `(exit_code, stdout, stderr)`.
     /// Delegates to the shared `common::run_with_env`, which seeds-then-scrubs
