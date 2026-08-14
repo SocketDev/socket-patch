@@ -236,6 +236,31 @@ pub(super) async fn run_redirect(
         }
     }
 
+    // Load the existing redirect ledger BEFORE any file is written — bun
+    // migration included. The ledger is the only store of the pre-redirect
+    // originals a future revert needs, so a malformed (torn/hand-mangled)
+    // ledger must abort the run while the project is still untouched: the old
+    // tolerant load treated it as "no ledger" and the merge below would have
+    // started fresh, silently overwriting that revert data. The malformed
+    // file is moved aside to redirect-state.json.corrupt (never clobbered)
+    // so recovery stays possible; a dry-run reports the same hard error but
+    // moves nothing.
+    let existing_ledger =
+        match socket_patch_core::patch::redirect::load_redirect_state(&args.common.cwd).await {
+            Ok(state) => state,
+            Err(mut corrupt) => {
+                if !args.common.dry_run {
+                    corrupt.quarantine().await;
+                }
+                let message = corrupt.to_string();
+                eprintln!("{message}");
+                if args.common.json {
+                    emit_json_error(scan_result.take(), &message);
+                }
+                return 1;
+            }
+        };
+
     // bun.lockb auto-migration: the redirect rewriter only edits the TEXT
     // lockfile, so a project locked to a binary `bun.lockb` must be re-locked
     // to `bun.lock` first. `bun install --save-text-lockfile --frozen-lockfile
@@ -247,6 +272,12 @@ pub(super) async fn run_redirect(
     // re-lock (and delete) the user's lockfile as a side effect of a no-op run.
     let mut migration_warnings: Vec<serde_json::Value> = Vec::new();
     let mut migration_edits: Vec<socket_patch_core::patch::redirect::FileEdit> = Vec::new();
+    // The pre-migration bun.lockb bytes, held so the migration can be undone
+    // when the subsequent rewrite lands NOTHING in the migrated bun.lock: an
+    // npm override whose version doesn't match the lock (or whose entry is
+    // refused) must not permanently convert the user's lockfile format as a
+    // side effect of a zero-redirect run.
+    let mut lockb_backup: Option<Vec<u8>> = None;
     let has_lockb = args.common.cwd.join("bun.lockb").exists();
     let has_bun_lock = args.common.cwd.join("bun.lock").exists();
     let has_npm_override = overrides.iter().any(|o| o.ecosystem == "npm");
@@ -259,6 +290,9 @@ pub(super) async fn run_redirect(
                            re-run without --dry-run to apply",
             }));
         } else {
+            // Read the binary lock BEFORE bun deletes it, so a zero-rewrite
+            // run can restore it below.
+            let lockb_bytes = std::fs::read(args.common.cwd.join("bun.lockb")).ok();
             // `.output()` (not `.status()`): bun's install chatter must not
             // interleave with the machine `--json` envelope on stdout.
             let output = std::process::Command::new("bun")
@@ -273,6 +307,7 @@ pub(super) async fn run_redirect(
             let migrated = matches!(output, Ok(o) if o.status.success())
                 && args.common.cwd.join("bun.lock").exists();
             if migrated {
+                lockb_backup = lockb_bytes;
                 // bun deleted bun.lockb itself. Record the removal so `--revert`
                 // knows the file was replaced (binary — git history is the
                 // restore path, so no `original` bytes are captured).
@@ -341,6 +376,37 @@ pub(super) async fn run_redirect(
 
     let rewrite = rewrite_registry_redirect(&files, &overrides);
     let rewritten: Vec<String> = rewrite.files.keys().cloned().collect();
+
+    // The lockb→text migration is only KEPT when the rewrite actually landed
+    // in the migrated bun.lock. Otherwise nothing was redirected there and the
+    // migration was pure side effect: restore the saved bun.lockb bytes,
+    // remove the generated text lock, and drop the ledger removal record so
+    // the no-op run leaves the lockfile format untouched. The rewriter's own
+    // warning (entry-not-found / unsupported) explains WHY nothing landed.
+    if !migration_edits.is_empty() && !rewrite.files.contains_key("bun.lock") {
+        let restored = lockb_backup
+            .as_deref()
+            .is_some_and(|bytes| std::fs::write(args.common.cwd.join("bun.lockb"), bytes).is_ok());
+        if restored {
+            let _ = std::fs::remove_file(args.common.cwd.join("bun.lock"));
+            migration_edits.clear();
+            migration_warnings.push(serde_json::json!({
+                "code": "redirect_bun_lockb_migration_reverted",
+                "detail": "bun.lockb was migrated to a text bun.lock but no redirect landed \
+                           in it; the original bun.lockb was restored",
+            }));
+        } else {
+            // Restore failed (unreadable pre-migration or unwritable now):
+            // keep the migration record and say loudly that the format was
+            // converted by a run that redirected nothing.
+            migration_warnings.push(serde_json::json!({
+                "code": "redirect_bun_lockb_migrated_without_redirect",
+                "detail": "bun.lockb was migrated to a text bun.lock but no redirect landed \
+                           in it, and the original bun.lockb could not be restored; git \
+                           history is the restore path",
+            }));
+        }
+    }
 
     // Editing a Rush lock outside `rush update` desyncs the
     // pnpmShrinkwrapHash recorded in repo-state.json. When
@@ -462,20 +528,6 @@ pub(super) async fn run_redirect(
     }
 
     if !args.common.dry_run {
-        for (rel, content) in &rewrite.files {
-            let path = args.common.cwd.join(rel);
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            if let Err(e) = std::fs::write(&path, content) {
-                let message = format!("failed to write {rel}: {e}");
-                eprintln!("{message}");
-                if args.common.json {
-                    emit_json_error(scan_result.take(), &message);
-                }
-                return 1;
-            }
-        }
         // Ledger (mirrors the vendor state.json shape): recorded edits for a
         // future revert + the patch records (file hashes + vulnerabilities) so
         // a post-install `socket-patch vex` can attest the redirected patches.
@@ -484,13 +536,15 @@ pub(super) async fn run_redirect(
         // hosted patch), and clobbering the file would lose the original
         // pre-redirect values a future revert needs. New edits APPEND (revert
         // walks them in reverse); records are keyed by PURL, newest wins.
+        //
+        // Persisted BEFORE the project files, and atomically (stage + fsync +
+        // rename, like the sibling vendor ledger): a crash between the two
+        // then leaves a complete ledger whose recorded originals simply match
+        // files that were never rewritten — instead of rewritten files whose
+        // pre-redirect originals never reached any ledger (a healing re-run
+        // records no edits for already-redirected entries).
         if !rewrite.edits.is_empty() || !records.is_empty() || !migration_edits.is_empty() {
-            let vendor_dir = args.common.cwd.join(".socket").join("vendor");
-            let _ = std::fs::create_dir_all(&vendor_dir);
-            let mut ledger =
-                socket_patch_core::patch::redirect::load_redirect_state(&args.common.cwd)
-                    .await
-                    .unwrap_or_else(RedirectState::new);
+            let mut ledger = existing_ledger.unwrap_or_else(RedirectState::new);
             // Ledgers written before the mode-string rename carry
             // `"mode": "redirect"`; normalize on rewrite so the on-disk
             // ledger converges on the documented "hosted" name (the
@@ -504,11 +558,25 @@ pub(super) async fn run_redirect(
             // The ledger is the only revert path and the VEX record store —
             // a swallowed write failure would leave the rewritten lockfiles
             // unrevertable while reporting success.
-            if let Err(e) = std::fs::write(
-                vendor_dir.join("redirect-state.json"),
-                format!("{}\n", serde_json::to_string_pretty(&ledger).unwrap()),
-            ) {
+            if let Err(e) =
+                socket_patch_core::patch::redirect::save_redirect_state(&args.common.cwd, &ledger)
+                    .await
+            {
                 let message = format!("failed to write .socket/vendor/redirect-state.json: {e}");
+                eprintln!("{message}");
+                if args.common.json {
+                    emit_json_error(scan_result.take(), &message);
+                }
+                return 1;
+            }
+        }
+        for (rel, content) in &rewrite.files {
+            let path = args.common.cwd.join(rel);
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Err(e) = std::fs::write(&path, content) {
+                let message = format!("failed to write {rel}: {e}");
                 eprintln!("{message}");
                 if args.common.json {
                     emit_json_error(scan_result.take(), &message);

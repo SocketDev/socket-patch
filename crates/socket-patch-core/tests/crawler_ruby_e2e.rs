@@ -290,6 +290,47 @@ async fn get_gem_paths_vendor_bundle_takes_precedence_over_global() {
     );
 }
 
+/// A JRuby deployment (`bundle install --deployment` under JRuby) puts
+/// gems in `vendor/bundle/jruby/<version>/gems` — Bundler scopes the path
+/// by `Gem.ruby_engine`, not the literal `ruby`. The crawler must discover
+/// that layout end-to-end; hardcoding the `ruby` engine dir made JRuby and
+/// TruffleRuby deployments silently yield zero gems. No Gemfile is staged,
+/// so a regression cannot green via the `gem env` fallback.
+#[tokio::test]
+#[serial_test::parallel]
+async fn get_gem_paths_vendor_bundle_jruby_engine_layout() {
+    let tmp = tempfile::tempdir().unwrap();
+    let jruby_gems = tmp
+        .path()
+        .join("vendor")
+        .join("bundle")
+        .join("jruby")
+        .join("3.1.4.0")
+        .join("gems");
+    tokio::fs::create_dir_all(jruby_gems.join("rails-7.1.0").join("lib"))
+        .await
+        .unwrap();
+
+    let crawler = RubyCrawler;
+    let paths = crawler
+        .get_gem_paths(&options_at(tmp.path()))
+        .await
+        .unwrap();
+    assert_eq!(
+        paths,
+        vec![jruby_gems.clone()],
+        "vendor/bundle/jruby/*/gems must be discovered; got {paths:?}"
+    );
+
+    // End-to-end: the gem inside the jruby scope is crawled.
+    let crawled = crawler.crawl_all(&options_at(tmp.path())).await;
+    let purls: Vec<&str> = crawled.iter().map(|p| p.purl.as_str()).collect();
+    assert!(
+        purls.contains(&"pkg:gem/rails@7.1.0"),
+        "gem in a jruby vendor scope must be crawled; got {purls:?}"
+    );
+}
+
 #[tokio::test]
 #[serial_test::parallel]
 async fn get_gem_paths_no_gemfile_returns_empty() {

@@ -536,14 +536,21 @@ pub(crate) async fn persist_vendor_entry(
         // carry it forward by wiring identity, or a
         // later `--revert` can only shrug
         // (`vendor_lock_entry_drifted`) instead of
-        // restoring the registry fragment.
+        // restoring the registry fragment. Identity is
+        // uuid-agnostic (`wiring_key_matches`): berry's
+        // lock key embeds the vendored path, so the
+        // uuid change that CAUSED the re-vendor changes
+        // the key too.
         for rec in &mut entry.wiring {
             if rec.action == vendor::state::WiringAction::Rewritten && rec.original.is_none() {
-                if let Some(prev_rec) = prev
-                    .wiring
-                    .iter()
-                    .find(|p| p.file == rec.file && p.kind == rec.kind && p.key == rec.key)
-                {
+                if let Some(prev_rec) = prev.wiring.iter().find(|p| {
+                    p.file == rec.file
+                        && p.kind == rec.kind
+                        && match (p.key.as_deref(), rec.key.as_deref()) {
+                            (Some(a), Some(b)) => vendor::path::wiring_key_matches(a, b),
+                            (a, b) => a == b,
+                        }
+                }) {
                     rec.original = prev_rec.original.clone();
                 }
             }

@@ -683,6 +683,11 @@ pub struct DownloadParams {
     /// `--strict` forwarded to the nested apply (a beforeHash mismatch
     /// fails instead of warn-and-overwrite).
     pub strict: bool,
+    /// `--ecosystems` forwarded to the nested apply. Without this the
+    /// nested apply ran UNSCOPED over the whole manifest, so
+    /// `scan --ecosystems gem --sync` could mutate other ecosystems'
+    /// packages the user had explicitly filtered out.
+    pub ecosystems: Option<Vec<String>>,
     /// Persist downloaded blob content into `.socket/blobs` (the apply
     /// flows need it for later hook/rollback runs). Vendor flows pass
     /// `false`: their patch content is staged in memory and the committed
@@ -1098,6 +1103,7 @@ async fn run_nested_apply(
     download_mode: String,
     strict: bool,
     api: socket_patch_core::api::client::ApiClientEnvOverrides,
+    ecosystems: Option<Vec<String>>,
 ) -> bool {
     // Apply re-resolves a relative manifest path against ITS `--cwd`
     // (`resolved_manifest_path`), but ours is already cwd-resolved —
@@ -1119,6 +1125,11 @@ async fn run_nested_apply(
             api_token: api.api_token,
             org: api.org_slug,
             proxy_url: api.proxy_url,
+            // Scope the nested apply like the caller was scoped: leaving
+            // this at the default `None` made `scan --ecosystems gem --sync`
+            // apply the WHOLE manifest, mutating other ecosystems' packages
+            // the user filtered out.
+            ecosystems,
             ..crate::args::GlobalArgs::default()
         },
         force: false,
@@ -1232,10 +1243,7 @@ pub async fn download_and_apply_patches(
                 // status/exit code degrade and it is never auto-applied.
                 if files.is_empty() {
                     if !params.json && !params.silent {
-                        eprintln!(
-                            "  [fail] {} (patch has no applicable files)",
-                            patch.purl
-                        );
+                        eprintln!("  [fail] {} (patch has no applicable files)", patch.purl);
                     }
                     downloaded_patches.push(serde_json::json!({
                         "purl": patch.purl,
@@ -1393,6 +1401,7 @@ pub async fn download_and_apply_patches(
             params.download_mode.clone(),
             params.strict,
             resolved_api_overrides(params),
+            params.ecosystems.clone(),
         )
         .await;
     }
@@ -1824,6 +1833,7 @@ pub async fn run(args: GetArgs) -> i32 {
         api_overrides: args.common.api_client_overrides(),
         all_releases: args.all_releases,
         strict: args.common.strict,
+        ecosystems: args.common.ecosystems.clone(),
         persist_blobs: true,
     };
 
@@ -2034,6 +2044,7 @@ async fn save_and_apply_patch(args: &GetArgs, patch: &PatchResponse) -> i32 {
             args.common.download_mode.clone(),
             args.common.strict,
             args.common.api_client_overrides(),
+            args.common.ecosystems.clone(),
         )
         .await;
     }
@@ -3106,7 +3117,10 @@ mod tests {
         // record — the guardrail-triggering condition the download/apply
         // flows now count as failed rather than applied.
         let mut broken = HashMap::new();
-        broken.insert("src/lib.rs".to_string(), file_resp(Some(&"e".repeat(64)), None));
+        broken.insert(
+            "src/lib.rs".to_string(),
+            file_resp(Some(&"e".repeat(64)), None),
+        );
         let broken_patch = patch_with_files(broken);
         assert!(
             files_for_manifest(&broken_patch).is_empty(),

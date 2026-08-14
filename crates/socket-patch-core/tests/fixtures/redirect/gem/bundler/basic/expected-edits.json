@@ -12,6 +12,7 @@
     "kind": "redirect_gemfile_lock_checksum",
     "action": "rewritten",
     "key": "rails",
+    "original": "rails (7.0.0) sha256=2222222222222222222222222222222222222222222222222222222222222222",
     "new": "rails (7.0.0) sha256=deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
   }
 ]
