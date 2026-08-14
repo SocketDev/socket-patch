@@ -291,7 +291,10 @@ impl Default for VendorState {
 ///     a re-vendor rewrites its OWN stale `.socket/vendor/` pointer and so
 ///     records `original: None` (it must never record a vendored pointer as
 ///     the pre-vendor fragment); the true original lives in the entry being
-///     replaced (matched by file+kind+key);
+///     replaced (matched by file+kind+key, with the key compared
+///     uuid-agnostically via [`super::path::wiring_key_matches`] — berry's
+///     lock key embeds the vendored path, so the uuid change that CAUSED the
+///     re-vendor changes the key too);
 ///   * carries forward any prior wiring record for a surface THIS run did not
 ///     re-touch (union by file+kind+key), so revert still restores it;
 ///   * OR-merges the pnpm "created this table/file/section" bookkeeping so a
@@ -311,11 +314,14 @@ pub fn carry_forward_wiring(prev: &VendorEntry, entry: &mut VendorEntry) {
 
     for rec in &mut entry.wiring {
         if rec.action == WiringAction::Rewritten && rec.original.is_none() {
-            if let Some(prev_rec) = prev
-                .wiring
-                .iter()
-                .find(|p| p.file == rec.file && p.kind == rec.kind && p.key == rec.key)
-            {
+            if let Some(prev_rec) = prev.wiring.iter().find(|p| {
+                p.file == rec.file
+                    && p.kind == rec.kind
+                    && match (p.key.as_deref(), rec.key.as_deref()) {
+                        (Some(a), Some(b)) => super::path::wiring_key_matches(a, b),
+                        (a, b) => a == b,
+                    }
+            }) {
                 rec.original = prev_rec.original.clone();
             }
         }

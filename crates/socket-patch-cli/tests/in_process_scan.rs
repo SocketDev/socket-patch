@@ -1433,3 +1433,196 @@ async fn scan_discovers_maven_and_nuget_in_every_mode() {
     }
     std::env::remove_var("MAVEN_REPO_LOCAL");
 }
+
+// ---------------------------------------------------------------------------
+// Regression: `scan --vendor --dry-run --vex` must skip the embedded VEX.
+//
+// The vendor JSON dry-run arm handed base_code 0 straight to
+// `embed_vex_into_json`, which generated the document for real: on a
+// not-yet-vendored project (no manifest) generation failed and flipped the
+// whole dry run to exit 1; with attestable state it wrote the VEX file to
+// disk — a mutation during --dry-run. Both must be skipped instead
+// (apply.rs's precedent: a dry run has no just-vendored state to attest).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[serial]
+async fn scan_vendor_dry_run_with_vex_does_not_fail_on_not_yet_vendored() {
+    let server = MockServer::start().await;
+    mock_batch_one(&server).await;
+    mock_by_package(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_root_package_json(tmp.path());
+    write_npm_package(tmp.path(), "in-proc-scan", "1.0.0");
+
+    let vex_path = tmp.path().join("vendor-dry.vex.json");
+    let mut args = default_args(tmp.path());
+    args.common.api_url = Some(server.uri());
+    args.vendor = true;
+    args.common.dry_run = true;
+    args.vex.vex = Some(vex_path.clone());
+
+    let code = run_scrubbed(args).await;
+    // Nothing is vendored yet (no manifest, no ledger) — that is the normal
+    // state a vendor dry run previews from, not an error. The old behavior
+    // generated the VEX for real, hit `manifest_not_found`, and exited 1.
+    assert_eq!(
+        code, 0,
+        "a vendor dry run must not fail for not-yet-vendored state"
+    );
+    assert!(!vex_path.exists(), "dry run must not write the VEX file");
+    // Prove the vendor dry-run path was actually entered (not
+    // short-circuited before discovery): batch + patch details were queried.
+    let reqs = recorded(&server).await;
+    assert!(
+        batch_posts(&reqs).len() == 1 && by_package_gets(&reqs) >= 1,
+        "vendor dry run must query batch + patch details; batch={}, by_package={}",
+        batch_posts(&reqs).len(),
+        by_package_gets(&reqs),
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn scan_vendor_dry_run_with_vex_does_not_write_attestation_file() {
+    let server = MockServer::start().await;
+    mock_batch_one(&server).await;
+    mock_by_package(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_root_package_json(tmp.path());
+    write_npm_package(tmp.path(), "in-proc-scan", "1.0.0");
+
+    // A manifest whose sole record WOULD attest successfully: vulnerability
+    // metadata for the statement, `setup.manual: ["npm"]` to pass the
+    // property-7 ecosystem filter, and `--vex-no-verify` below to skip the
+    // on-disk hash check. Under the old behavior the dry run generated the
+    // document for real and wrote it to disk.
+    let socket = tmp.path().join(".socket");
+    std::fs::create_dir_all(&socket).unwrap();
+    std::fs::write(
+        socket.join("manifest.json"),
+        r#"{ "patches": {
+            "pkg:npm/in-proc-scan@1.0.0": {
+                "uuid": "11111111-1111-4111-8111-111111111111",
+                "exportedAt": "2024-01-01T00:00:00Z",
+                "files": {},
+                "vulnerabilities": { "GHSA-aaaa-bbbb-cccc": {
+                    "cves": ["CVE-2024-0001"], "summary": "s",
+                    "severity": "HIGH", "description": "d"
+                }},
+                "description": "x", "license": "MIT", "tier": "free"
+            }
+        }, "setup": { "manual": ["npm"] } }"#,
+    )
+    .unwrap();
+    let before = std::fs::read_to_string(socket.join("manifest.json")).unwrap();
+
+    let vex_path = tmp.path().join("vendor-dry.vex.json");
+    let mut args = default_args(tmp.path());
+    args.common.api_url = Some(server.uri());
+    args.vendor = true;
+    args.common.dry_run = true;
+    args.vex.vex = Some(vex_path.clone());
+    args.vex.vex_no_verify = true;
+
+    let code = run_scrubbed(args).await;
+    assert_eq!(code, 0, "vendor dry run with attestable state must exit 0");
+    assert!(
+        !vex_path.exists(),
+        "dry run must not write the VEX file even when generation would succeed"
+    );
+    // The dry run's non-mutation contract extends to the manifest.
+    let after = std::fs::read_to_string(socket.join("manifest.json")).unwrap();
+    assert_eq!(
+        after, before,
+        "vendor dry run must leave the manifest byte-for-byte unchanged"
+    );
+}
+
+/// The INTERACTIVE arm's twin: `scan --vendor --dry-run --vex` without
+/// `--json` returns through `embed_vex_human`, which generated (and wrote)
+/// the document for real — exit 1 on a not-yet-vendored project, an
+/// attestation file on disk otherwise. The dry-run guard lives in the embed
+/// helpers, so both output modes must skip.
+#[tokio::test]
+#[serial]
+async fn scan_vendor_dry_run_with_vex_interactive_does_not_fail_or_write() {
+    let server = MockServer::start().await;
+    mock_batch_one(&server).await;
+    mock_by_package(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_root_package_json(tmp.path());
+    write_npm_package(tmp.path(), "in-proc-scan", "1.0.0");
+
+    let vex_path = tmp.path().join("vendor-dry-interactive.vex.json");
+    let mut args = default_args(tmp.path());
+    args.common.api_url = Some(server.uri());
+    args.common.json = false;
+    args.vendor = true;
+    args.common.dry_run = true;
+    args.vex.vex = Some(vex_path.clone());
+
+    let code = run_scrubbed(args).await;
+    assert_eq!(
+        code, 0,
+        "an interactive vendor dry run must not fail for not-yet-vendored state"
+    );
+    assert!(
+        !vex_path.exists(),
+        "interactive dry run must not write the VEX file"
+    );
+}
+
+/// `scan --apply --json --dry-run --vex`: the JSON apply arm synthesizes its
+/// preview and falls through to `embed_vex_into_json` with apply_code 0, so
+/// without the guard the dry run generated and wrote the attestation.
+#[tokio::test]
+#[serial]
+async fn scan_apply_json_dry_run_with_vex_does_not_write_attestation() {
+    let server = MockServer::start().await;
+    mock_batch_one(&server).await;
+    mock_by_package(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_root_package_json(tmp.path());
+    write_npm_package(tmp.path(), "in-proc-scan", "1.0.0");
+
+    // Attestable manifest (same fixture as the vendor twin above): metadata
+    // for the statement, `setup.manual: ["npm"]`, `--vex-no-verify` below.
+    let socket = tmp.path().join(".socket");
+    std::fs::create_dir_all(&socket).unwrap();
+    std::fs::write(
+        socket.join("manifest.json"),
+        r#"{ "patches": {
+            "pkg:npm/in-proc-scan@1.0.0": {
+                "uuid": "11111111-1111-4111-8111-111111111111",
+                "exportedAt": "2024-01-01T00:00:00Z",
+                "files": {},
+                "vulnerabilities": { "GHSA-aaaa-bbbb-cccc": {
+                    "cves": ["CVE-2024-0001"], "summary": "s",
+                    "severity": "HIGH", "description": "d"
+                }},
+                "description": "x", "license": "MIT", "tier": "free"
+            }
+        }, "setup": { "manual": ["npm"] } }"#,
+    )
+    .unwrap();
+
+    let vex_path = tmp.path().join("apply-dry.vex.json");
+    let mut args = default_args(tmp.path());
+    args.common.api_url = Some(server.uri());
+    args.apply = true;
+    args.common.dry_run = true;
+    args.vex.vex = Some(vex_path.clone());
+    args.vex.vex_no_verify = true;
+
+    let code = run_scrubbed(args).await;
+    assert_eq!(code, 0, "apply dry run with attestable state must exit 0");
+    assert!(
+        !vex_path.exists(),
+        "apply dry run must not write the VEX file even when generation would succeed"
+    );
+}
