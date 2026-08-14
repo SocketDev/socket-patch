@@ -23,7 +23,7 @@
 //! flavor strings they have no backend for. Both keep an old binary safe
 //! against a newer project checkout.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -59,6 +59,17 @@ pub struct VendorArtifact {
     /// replacing multi-platform registry wheels).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub platform_locked: Option<bool>,
+    /// Full-file inventory of a DIR-shaped artifact: relative forward-slashed
+    /// path inside the artifact dir → plain sha256 hex, sorted (the dir
+    /// counterpart of `sha256` — no lockfile integrity covers a path-source
+    /// dir's bytes, so without this only the patched members are verifiable
+    /// and drifted/tampered UNPATCHED files pass every audit). Recorded at
+    /// vendor time; verification compares the whole tree against it
+    /// (missing, extra and modified files all fail). Absent on file-shaped
+    /// artifacts and on pre-inventory ledger entries — those keep member-only
+    /// verification, and `repair` warns about the gap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_inventory: Option<BTreeMap<String, String>>,
 }
 
 /// How a wiring edit changed a file.
@@ -405,6 +416,7 @@ mod tests {
                 sha256: "ab".repeat(32),
                 size: Some(3668),
                 platform_locked: None,
+                file_inventory: None,
             },
             wiring: vec![WiringRecord {
                 file: "package-lock.json".into(),
@@ -466,6 +478,7 @@ mod tests {
             "\"pipenv\"",
             "\"detached\"",
             "\"record\"",
+            "\"fileInventory\"",
         ] {
             assert!(
                 !text.contains(absent),
@@ -473,6 +486,57 @@ mod tests {
             );
         }
         assert!(text.contains("\"basePurl\""), "camelCase keys: {text}");
+    }
+
+    /// The dir-shaped full-file inventory: camelCase wire key, sorted map
+    /// order on the wire, lossless round trip, and absent-key tolerance
+    /// (a pre-inventory ledger deserializes to `None` — the additive-fields
+    /// forward-compat contract).
+    #[tokio::test]
+    async fn file_inventory_round_trips_sorted_camel_case() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let mut entry = sample_entry();
+        entry.ecosystem = "gem".into();
+        entry.artifact.path = format!(".socket/vendor/gem/{UUID}/rack-3.2.6");
+        entry.artifact.sha256 = String::new();
+        entry.artifact.size = None;
+        entry.artifact.file_inventory = Some(BTreeMap::from([
+            ("rack.gemspec".to_string(), "cd".repeat(32)),
+            ("lib/rack.rb".to_string(), "ab".repeat(32)),
+        ]));
+        let mut state = VendorState::new();
+        state
+            .entries
+            .insert("pkg:gem/rack@3.2.6".into(), entry.clone());
+
+        save_state(root, &state).await.unwrap();
+        let loaded = load_state(root).await.unwrap();
+        assert_eq!(loaded, state, "inventory survives the round trip");
+
+        let text = tokio::fs::read_to_string(root.join(VENDOR_STATE_REL))
+            .await
+            .unwrap();
+        assert!(text.contains("\"fileInventory\""), "camelCase key: {text}");
+        let lib_at = text.find("lib/rack.rb").unwrap();
+        let spec_at = text.find("rack.gemspec").unwrap();
+        assert!(
+            lib_at < spec_at,
+            "inventory keys serialize sorted (BTreeMap): {text}"
+        );
+
+        // A pre-inventory ledger (no `fileInventory` key) deserializes to
+        // `None`, keeping member-only verification.
+        let mut legacy = serde_json::to_value(&state).unwrap();
+        legacy["entries"]["pkg:gem/rack@3.2.6"]["artifact"]
+            .as_object_mut()
+            .unwrap()
+            .remove("fileInventory");
+        let back: VendorState = serde_json::from_value(legacy).unwrap();
+        assert!(back.entries["pkg:gem/rack@3.2.6"]
+            .artifact
+            .file_inventory
+            .is_none());
     }
 
     #[tokio::test]

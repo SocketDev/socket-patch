@@ -15,9 +15,13 @@
 //! from the lockfile path itself (the contract's uuid-in-path rule), the
 //! record from the manifest (or the patch API, yielding a detached entry),
 //! and a fresh ledger entry is re-synthesized so sweep/GC/revert know the
-//! artifact again. Reconstructed entries carry no pre-vendor wiring
-//! originals — `--revert` degrades to its documented
-//! `vendor_lock_entry_drifted` re-resolve guidance.
+//! artifact again. WIRING reconstruction is per-ecosystem: gem recognizes
+//! its own Gemfile/lock wiring and rebuilds full revert-capable records
+//! ([`socket_patch_core::vendor::gem::reconstruct_gem_wiring`]); the other
+//! ecosystems' pre-vendor originals are registry integrity material no
+//! offline source can reproduce, so their entries keep empty wiring and the
+//! gap is surfaced loudly (`vendor_wiring_unknown`) — a gem `--revert` of
+//! such an entry refuses instead of stranding the pair edit.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -29,10 +33,11 @@ use socket_patch_core::patch::copy_tree::remove_tree;
 use socket_patch_core::utils::purl::{
     normalize_purl, percent_decode_purl_component, strip_purl_qualifiers,
 };
-use socket_patch_core::vendor::state::VendorArtifact;
+use socket_patch_core::vendor::state::{VendorArtifact, WiringRecord};
 use socket_patch_core::vendor::{
-    self, check_vendored_artifact, file_sha256_hex, load_state, lock_inventory, parse_vendor_path,
-    registry_fetch, ArtifactHealth, VendorEntry, VendorOutcome,
+    self, artifact_is_file_shaped, check_vendored_artifact, compute_dir_inventory, file_sha256_hex,
+    load_state, lock_inventory, parse_vendor_path, registry_fetch, ArtifactHealth, VendorEntry,
+    VendorOutcome, VendorWarning,
 };
 use socket_patch_core::vex::time::now_rfc3339;
 
@@ -131,6 +136,7 @@ fn synth_entry(eco: &str, uuid: &str, artifact_path: &str, base_purl: &str) -> V
             sha256: String::new(),
             size: None,
             platform_locked: None,
+            file_inventory: None,
         },
         wiring: Vec::new(),
         lock: None,
@@ -143,6 +149,37 @@ fn synth_entry(eco: &str, uuid: &str, artifact_path: &str, base_purl: &str) -> V
         poetry: None,
         pdm: None,
         pipenv: None,
+    }
+}
+
+/// What wiring a re-synthesized ledger entry could recover.
+enum WiringReconstruction {
+    /// The backend recognized its own wiring in the live project files:
+    /// full revert-capable records, plus any degradation notes to surface.
+    Wired(Vec<WiringRecord>, Vec<VendorWarning>),
+    /// No wiring recoverable — unsupported ecosystem, or files vendor's
+    /// grammar does not recognize. The entry keeps empty wiring and the
+    /// gap is surfaced loudly.
+    Unknown(String),
+}
+
+/// Per-ecosystem wiring reconstruction for a no-ledger repair. gem is the
+/// one ecosystem whose wiring is fully self-describing (the pair edit's
+/// originals are derivable from its own emitted forms); the npm family and
+/// the rest record pre-vendor REGISTRY integrity fragments that no offline
+/// source can reproduce — never guessed at.
+async fn reconstruct_entry_wiring(
+    project_root: &Path,
+    entry: &VendorEntry,
+) -> WiringReconstruction {
+    match entry.ecosystem.as_str() {
+        "gem" => match vendor::gem::reconstruct_gem_wiring(project_root, entry).await {
+            Ok((wiring, notes)) => WiringReconstruction::Wired(wiring, notes),
+            Err(detail) => WiringReconstruction::Unknown(detail),
+        },
+        _ => WiringReconstruction::Unknown(
+            "this ecosystem's pre-vendor lock fragments are not offline-recoverable".to_string(),
+        ),
     }
 }
 
@@ -248,7 +285,31 @@ pub(crate) async fn repair_vendored_artifacts(
             continue;
         }
         match check_vendored_artifact(&common.cwd, &entry, &record).await {
-            ArtifactHealth::Healthy => {}
+            ArtifactHealth::Healthy => {
+                // Dir-shaped artifacts from pre-inventory vendors: the
+                // health check above could only verify the PATCHED members
+                // — unpatched-file drift is invisible until a re-vendor
+                // records the whole-tree inventory. Name the gap.
+                if !artifact_is_file_shaped(&entry.artifact.path)
+                    && entry.artifact.file_inventory.is_none()
+                {
+                    record_warning(
+                        env,
+                        purl,
+                        &VendorWarning::new(
+                            "vendor_inventory_missing",
+                            format!(
+                                "the ledger entry for {} records no file inventory \
+                                 (pre-inventory vendor); only the patched members were \
+                                 verified — re-vendor to make unpatched-file drift \
+                                 detectable",
+                                normalize_purl(purl)
+                            ),
+                        ),
+                        common,
+                    );
+                }
+            }
             ArtifactHealth::StaleUuid => {
                 env.record(
                     PatchEvent::new(PatchAction::Skipped, purl.clone()).with_reason(
@@ -323,6 +384,33 @@ pub(crate) async fn repair_vendored_artifacts(
         entry.detached = detached;
         if detached {
             entry.record = Some(record.clone());
+        }
+        // Wiring reconstruction (fail-closed): gem rebuilds full
+        // revert-capable records from its own recognizable pair edit; the
+        // rest keep empty wiring with the gap surfaced loudly — reverting
+        // such an entry cannot restore the project files.
+        match reconstruct_entry_wiring(&common.cwd, &entry).await {
+            WiringReconstruction::Wired(wiring, notes) => {
+                entry.wiring = wiring;
+                for w in &notes {
+                    record_warning(env, &purl, w, common);
+                }
+            }
+            WiringReconstruction::Unknown(detail) => {
+                record_warning(
+                    env,
+                    &purl,
+                    &VendorWarning::new(
+                        "vendor_wiring_unknown",
+                        format!(
+                            "the ledger entry was reconstructed without pre-vendor wiring \
+                             originals ({detail}); `vendor --revert` cannot restore the \
+                             project files for this entry"
+                        ),
+                    ),
+                    common,
+                );
+            }
         }
         match check_vendored_artifact(&common.cwd, &entry, &record).await {
             ArtifactHealth::Healthy => {
@@ -789,14 +877,17 @@ pub(crate) async fn repair_vendored_artifacts(
     rebuilt
 }
 
-/// Compute and record the artifact fingerprint (sha256 + size for
-/// file-shaped artifacts) on a re-synthesized ledger entry.
+/// Compute and record the artifact fingerprint on a re-synthesized ledger
+/// entry: sha256 + size for file-shaped artifacts, the whole-tree file
+/// inventory for dir-shaped ones. An uninventoriable dir stays `None` —
+/// the entry then behaves as pre-inventory (member-only verification).
 async fn fill_artifact_fingerprint(project_root: &Path, entry: &mut VendorEntry) {
     let norm = entry.artifact.path.replace('\\', "/");
-    if !(norm.ends_with(".tgz") || norm.ends_with(".tar.gz") || norm.ends_with(".whl")) {
-        return; // dir-shaped: integrity is per-file afterHashes
-    }
     let abs = project_root.join(&norm);
+    if !artifact_is_file_shaped(&norm) {
+        entry.artifact.file_inventory = compute_dir_inventory(&abs).await.ok();
+        return;
+    }
     if let Some(hex) = file_sha256_hex(&abs).await {
         entry.artifact.sha256 = hex;
     }

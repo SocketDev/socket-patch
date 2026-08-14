@@ -297,6 +297,7 @@ pub async fn vendor_pnpm(
             sha256: packed.sha256_hex,
             size: Some(packed.size),
             platform_locked: None,
+            file_inventory: None,
         },
         wiring,
         lock: None,

@@ -328,6 +328,7 @@ pub async fn vendor_composer(
             sha256: String::new(), // dir-shaped: integrity is per-file afterHashes
             size: None,
             platform_locked: None,
+            file_inventory: None,
         },
         wiring: vec![WiringRecord {
             file: COMPOSER_LOCK.to_string(),

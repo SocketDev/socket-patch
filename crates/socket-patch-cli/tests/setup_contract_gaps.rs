@@ -233,6 +233,7 @@ fn setup_vendored_fixture(proj: &Path, home: &Path, installed: &[u8], vendored: 
                 sha256: String::new(),
                 size: None,
                 platform_locked: None,
+                file_inventory: None,
             },
             wiring: Vec::new(),
             lock: None,

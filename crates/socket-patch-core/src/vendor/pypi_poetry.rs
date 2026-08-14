@@ -714,6 +714,7 @@ content-hash = "09f98227642bff952b3df8f8fcc74f1538c091a3ac3ed0031500188347ecb3ca
                 sha256: WHEEL_SHA.into(),
                 size: Some(11053),
                 platform_locked: None,
+                file_inventory: None,
             },
             wiring,
             lock: None,

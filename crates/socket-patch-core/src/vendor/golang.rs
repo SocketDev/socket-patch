@@ -292,6 +292,7 @@ pub async fn vendor_go_module(
             sha256: String::new(), // dir-shaped: integrity is per-file afterHashes
             size: None,
             platform_locked: None,
+            file_inventory: None,
         },
         wiring: vec![WiringRecord {
             file: "go.mod".to_string(),

@@ -718,13 +718,23 @@ async fn inventory_composer_lock(project_root: &Path) -> Option<Vec<LockfileEntr
 /// `CHECKSUMS` section's sha256 values when present (older locks stay
 /// discovery-only). Platform-suffixed specs (`nokogiri (1.16.5-arm64-…)`)
 /// are skipped — platform gems are unsupported for vendoring anyway.
+///
+/// Multi-source locks: bundler ≥ 2 emits ONE GEM section per source
+/// (Gemfile `source … do` blocks; verified against bundler 4.0.15) and
+/// hard-errors on multiple global sources, so each spec resolves against
+/// its OWN section's remote — never the first remote in the file, which
+/// for a private-server section would 404 at best and leak private gem
+/// names to the public registry at worst. A section carrying SEVERAL
+/// distinct `remote:` lines is a legacy bundler 1.x multisource lock whose
+/// per-spec origin is genuinely ambiguous: its specs stay discovery-only
+/// (no resolved URL — the fetch layer then refuses), fail-closed.
 async fn inventory_gemfile_lock(project_root: &Path) -> Option<Vec<LockfileEntry>> {
     let text = tokio::fs::read_to_string(project_root.join("Gemfile.lock"))
         .await
         .ok()?;
-    let mut remote: Option<String> = None;
+    let mut section_remotes: Vec<Vec<String>> = Vec::new();
     let mut checksums: HashMap<(String, String), String> = HashMap::new();
-    let mut specs: Vec<(String, String)> = Vec::new();
+    let mut specs: Vec<(String, String, usize)> = Vec::new();
 
     let mut section = "";
     let mut in_specs = false;
@@ -732,6 +742,9 @@ async fn inventory_gemfile_lock(project_root: &Path) -> Option<Vec<LockfileEntry
         if !line.starts_with(' ') {
             section = line.trim();
             in_specs = false;
+            if section == "GEM" {
+                section_remotes.push(Vec::new());
+            }
             continue;
         }
         let trimmed = line.trim_start();
@@ -741,14 +754,16 @@ async fn inventory_gemfile_lock(project_root: &Path) -> Option<Vec<LockfileEntry
                 if indent == 2 {
                     if let Some(r) = trimmed.strip_prefix("remote:") {
                         let r = r.trim().trim_end_matches('/');
-                        if remote.is_none() && !r.is_empty() {
-                            remote = Some(r.to_string());
+                        if !r.is_empty() {
+                            if let Some(remotes) = section_remotes.last_mut() {
+                                remotes.push(r.to_string());
+                            }
                         }
                     }
                     in_specs = trimmed == "specs:";
                 } else if in_specs && indent == 4 {
                     if let Some((name, version)) = parse_gem_spec_line(trimmed) {
-                        specs.push((name, version));
+                        specs.push((name, version, section_remotes.len() - 1));
                     }
                 }
             }
@@ -770,9 +785,8 @@ async fn inventory_gemfile_lock(project_root: &Path) -> Option<Vec<LockfileEntry
     if specs.is_empty() {
         return None;
     }
-    let base = remote.unwrap_or_else(|| "https://rubygems.org".to_string());
     let mut out = Vec::new();
-    for (name, version) in specs {
+    for (name, version, sec) in specs {
         if !path_safety::is_safe_single_segment(&name)
             || !path_safety::is_safe_single_segment(&version)
         {
@@ -782,10 +796,20 @@ async fn inventory_gemfile_lock(project_root: &Path) -> Option<Vec<LockfileEntry
             .get(&(name.clone(), version.clone()))
             .map(|h| LockIntegrity::Sha256Hex(h.clone()))
             .unwrap_or(LockIntegrity::None);
+        let resolved = match section_remotes.get(sec).map(Vec::as_slice) {
+            Some([base]) => http_url(&format!("{base}/downloads/{name}-{version}.gem")),
+            // No remote (a missing `remote:` line defaults to rubygems.org
+            // ONLY when the whole lock has one remote-less GEM section —
+            // the pre-multisource shape) or several remotes: fail closed.
+            Some([]) if section_remotes.len() == 1 => http_url(&format!(
+                "https://rubygems.org/downloads/{name}-{version}.gem"
+            )),
+            _ => None,
+        };
         out.push(LockfileEntry {
             ecosystem: "gem",
             purl: format!("pkg:gem/{name}@{version}"),
-            resolved: http_url(&format!("{base}/downloads/{name}-{version}.gem")),
+            resolved,
             name,
             version,
             integrity,
@@ -1090,16 +1114,27 @@ pub async fn recover_lock_entry(
                     "the pre-vendor checksum line has no sha256; refusing an unverifiable fetch"
                         .to_string()
                 })?;
-            let base = gem_remote_base(project_root)
-                .await
-                .unwrap_or_else(|| "https://rubygems.org".to_string());
+            let base = match gem_remotes(project_root).await.as_slice() {
+                [] => "https://rubygems.org".to_string(),
+                [one] => one.clone(),
+                several => {
+                    // The vendored spec's own GEM section is gone (it moved
+                    // into the PATH section), so with several sources its
+                    // origin is genuinely ambiguous — a guessed remote
+                    // would 404 at best and leak a private gem name to the
+                    // public registry at worst.
+                    return Err(format!(
+                        "Gemfile.lock lists multiple GEM sources ({}); the vendored gem's \
+                         pre-vendor source is ambiguous — refusing to fetch from a guessed \
+                         remote",
+                        several.join(", ")
+                    ));
+                }
+            };
             Ok(LockfileEntry {
                 ecosystem: "gem",
                 purl: format!("pkg:gem/{name}@{version}"),
-                resolved: http_url(&format!(
-                    "{}/downloads/{name}-{version}.gem",
-                    base.trim_end_matches('/')
-                )),
+                resolved: http_url(&format!("{base}/downloads/{name}-{version}.gem")),
                 name,
                 version,
                 integrity: LockIntegrity::Sha256Hex(sha.to_ascii_lowercase()),
@@ -1400,27 +1435,37 @@ fn inline_yaml_field(line: &str, field: &str) -> Option<String> {
     (!v.is_empty()).then_some(v)
 }
 
-/// The `GEM remote:` base of the (unrewired) Gemfile.lock.
-async fn gem_remote_base(project_root: &Path) -> Option<String> {
-    let text = tokio::fs::read_to_string(project_root.join("Gemfile.lock"))
-        .await
-        .ok()?;
+/// The DISTINCT http(s) `GEM remote:` bases across ALL GEM sections of the
+/// Gemfile.lock (trailing `/` trimmed), in first-appearance order. A
+/// vendored gem's spec block moved into its PATH section, so which GEM
+/// section it came from is unrecoverable — ledger recovery may only build
+/// a download URL when the lock's GEM sources agree on a single remote.
+async fn gem_remotes(project_root: &Path) -> Vec<String> {
+    let Ok(text) = tokio::fs::read_to_string(project_root.join("Gemfile.lock")).await else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = Vec::new();
     let mut in_gem = false;
     for line in text.lines() {
-        if line.trim_end() == "GEM" {
-            in_gem = true;
+        if line.trim().is_empty() {
+            continue;
+        }
+        if !line.starts_with(' ') {
+            in_gem = line.trim_end() == "GEM";
             continue;
         }
         if in_gem {
             if let Some(rest) = line.trim().strip_prefix("remote:") {
-                return http_url(rest.trim());
-            }
-            if !line.starts_with(' ') && !line.trim().is_empty() {
-                in_gem = false;
+                if let Some(url) = http_url(rest.trim()) {
+                    let url = url.trim_end_matches('/').to_string();
+                    if !out.contains(&url) {
+                        out.push(url);
+                    }
+                }
             }
         }
     }
-    None
+    out
 }
 
 /// First `{ url = "…", hash = "sha256:…" }` wheel in a uv.lock `[[package]]`
@@ -2059,6 +2104,77 @@ checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         assert!(!entries.iter().any(|e| e.name == "actionpack"));
     }
 
+    /// Multi-source lock (two GEM sections, the exact shape bundler 4.0.15
+    /// writes for a Gemfile `source … do` block — fixture mirrors a real
+    /// `bundle lock --add-checksums` run): each spec must resolve against
+    /// its OWN section's remote, never the first remote in the file.
+    #[tokio::test]
+    async fn gemfile_lock_multi_source_resolves_each_spec_against_its_own_remote() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "Gemfile.lock",
+            &format!(
+                "GEM\n  remote: https://gems.corp.example/\n  specs:\n    private-gem (1.0.0)\n\n\
+                 GEM\n  remote: https://rubygems.org/\n  specs:\n    rack (3.2.6)\n\n\
+                 PLATFORMS\n  ruby\n\nDEPENDENCIES\n  private-gem (= 1.0.0)!\n  rack (= 3.2.6)\n\n\
+                 CHECKSUMS\n  private-gem (1.0.0) sha256={}\n  rack (3.2.6) sha256={}\n\n\
+                 BUNDLED WITH\n   4.0.15\n",
+                "a".repeat(64),
+                "b".repeat(64),
+            ),
+        )
+        .await;
+
+        let entries = inventory_gemfile_lock(tmp.path()).await.unwrap();
+        assert_eq!(
+            entry(&entries, "private-gem").resolved.as_deref(),
+            Some("https://gems.corp.example/downloads/private-gem-1.0.0.gem"),
+            "first section's spec resolves against its own remote"
+        );
+        assert_eq!(
+            entry(&entries, "rack").resolved.as_deref(),
+            Some("https://rubygems.org/downloads/rack-3.2.6.gem"),
+            "second section's spec must NOT inherit the first section's remote"
+        );
+        // Both keep their CHECKSUMS integrity.
+        assert_eq!(
+            entry(&entries, "rack").integrity,
+            LockIntegrity::Sha256Hex("b".repeat(64))
+        );
+    }
+
+    /// A GEM section with SEVERAL `remote:` lines is a legacy bundler 1.x
+    /// multisource lock (bundler ≥ 2 hard-errors on multiple global
+    /// sources — verified against 4.0.15): per-spec origin is ambiguous,
+    /// so its specs stay discovery-only — no guessed download URL, which
+    /// would leak private gem names to the public registry.
+    #[tokio::test]
+    async fn gemfile_lock_legacy_multi_remote_section_is_discovery_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "Gemfile.lock",
+            &format!(
+                "GEM\n  remote: https://rubygems.org/\n  remote: https://gems.corp.example/\n  \
+                 specs:\n    rack (3.0.8)\n\nPLATFORMS\n  ruby\n\nDEPENDENCIES\n  rack\n\n\
+                 CHECKSUMS\n  rack (3.0.8) sha256={}\n",
+                "c".repeat(64),
+            ),
+        )
+        .await;
+
+        let entries = inventory_gemfile_lock(tmp.path()).await.unwrap();
+        let rack = entry(&entries, "rack");
+        assert_eq!(
+            rack.resolved, None,
+            "ambiguous origin must never guess a remote: {rack:?}"
+        );
+        // Discovery + integrity survive; only the URL is withheld.
+        assert_eq!(rack.purl, "pkg:gem/rack@3.0.8");
+        assert_eq!(rack.integrity, LockIntegrity::Sha256Hex("c".repeat(64)));
+    }
+
     #[tokio::test]
     async fn uv_lock_inventories_pure_wheels() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2200,6 +2316,7 @@ mod recover_tests {
                 sha256: String::new(),
                 size: None,
                 platform_locked: None,
+                file_inventory: None,
             },
             wiring,
             lock: None,
@@ -2497,6 +2614,55 @@ mod recover_tests {
         // A ledger with no pypi fragment at all is still a hard error.
         let bare = entry("pypi", "pkg:pypi/six@1.16.0", vec![]);
         assert!(recover_lock_entry(tmp.path(), &bare).await.is_err());
+    }
+
+    /// Ledger recovery cannot know which GEM section a vendored gem came
+    /// from (its spec moved into the PATH section), so a multi-source lock
+    /// makes the download origin ambiguous: refuse rather than guess (a
+    /// wrong remote 404s at best and leaks a private gem name at worst).
+    /// Sections that AGREE on one remote stay recoverable.
+    #[tokio::test]
+    async fn gem_recovery_refuses_ambiguous_multi_source_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sha256 = "d".repeat(64);
+        let gem = entry(
+            "gem",
+            "pkg:gem/rack@3.0.0",
+            vec![rec(
+                "gemfile_lock_checksum",
+                serde_json::json!(format!("  rack (3.0.0) sha256={sha256}")),
+            )],
+        );
+
+        // Two GEM sections, two different remotes → ambiguous, fail closed.
+        tokio::fs::write(
+            tmp.path().join("Gemfile.lock"),
+            "GEM\n  remote: https://gems.corp.example/\n  specs:\n    private-gem (1.0.0)\n\n\
+             GEM\n  remote: https://rubygems.org/\n  specs:\n",
+        )
+        .await
+        .unwrap();
+        let err = recover_lock_entry(tmp.path(), &gem).await.unwrap_err();
+        assert!(
+            err.contains("multiple GEM sources"),
+            "ambiguity must be named: {err}"
+        );
+
+        // Two GEM sections agreeing on ONE remote (dedup) → recoverable.
+        tokio::fs::write(
+            tmp.path().join("Gemfile.lock"),
+            "GEM\n  remote: https://gems.corp.example/\n  specs:\n    other (1.0.0)\n\n\
+             GEM\n  remote: https://gems.corp.example/\n  specs:\n",
+        )
+        .await
+        .unwrap();
+        let got = recover_lock_entry(tmp.path(), &gem).await.unwrap();
+        assert_eq!(
+            got.resolved.as_deref(),
+            Some("https://gems.corp.example/downloads/rack-3.0.0.gem"),
+            "the agreed remote is used, not a rubygems.org guess"
+        );
+        assert_eq!(got.integrity, LockIntegrity::Sha256Hex(sha256));
     }
 
     #[tokio::test]

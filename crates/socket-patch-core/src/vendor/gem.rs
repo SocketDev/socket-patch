@@ -554,15 +554,36 @@ pub async fn vendor_gem(
         }
     }
 
+    // Whole-tree inventory of the committed copy (stub gemspec included):
+    // no lockfile integrity covers a path source's bytes, so this is the
+    // only whole-artifact drift/tamper anchor verify/VEX/repair have for a
+    // dir-shaped artifact. Fail-soft: an uninventoriable copy (symlink,
+    // non-UTF-8 name) vendors like a pre-inventory entry, with the gap
+    // surfaced here and again at repair time.
+    let file_inventory = match super::verify::compute_dir_inventory(&copy_dir).await {
+        Ok(inv) => Some(inv),
+        Err(detail) => {
+            warnings.push(VendorWarning::new(
+                "vendor_inventory_unrecorded",
+                format!(
+                    "could not inventory the vendored copy for {name}@{version} ({detail}); \
+                     drift in its unpatched files will not be detectable"
+                ),
+            ));
+            None
+        }
+    };
+
     let entry = VendorEntry {
         ecosystem: "gem".to_string(),
         base_purl,
         uuid: record.uuid.clone(),
         artifact: VendorArtifact {
             path: copy_rel,
-            sha256: String::new(), // dir-shaped: integrity is per-file afterHashes
+            sha256: String::new(), // dir-shaped: whole-tree integrity is the inventory
             size: None,
             platform_locked: None,
+            file_inventory,
         },
         wiring,
         lock: None,
@@ -870,6 +891,28 @@ pub async fn revert_gem(entry: &VendorEntry, project_root: &Path, dry_run: bool)
     let uuid_dir = project_root.join(&uuid_dir_rel);
     let mut warnings = Vec::new();
 
+    // Fail-closed guard: an entry with NO wiring records (a ledger repair
+    // reconstructed without recoverable wiring, or a hand-stripped
+    // state.json) must not "succeed" by deleting the artifact — the
+    // Gemfile `path:` and the lock's PATH section would keep pointing at
+    // the removed dir and the next `bundle install` hard-fails. Refuse
+    // loudly with the manual cleanup steps instead. (Every entry
+    // `vendor_gem` records carries at least the Gemfile + lock records.)
+    if entry.wiring.is_empty() {
+        let name = parse_gem_purl(&entry.base_purl)
+            .map(|(n, _)| n)
+            .unwrap_or("<unknown>");
+        return RevertOutcome::failed(format!(
+            "vendor_wiring_unknown: the ledger records no wiring for `{name}` (a \
+             reconstructed entry without recoverable originals); refusing to delete {} and \
+             strand the pair edit — manually remove the `path:` option (or the socket-patch \
+             managed block) for `{name}` from the Gemfile, restore its registry entry in \
+             Gemfile.lock (or delete the lock and re-run `bundle install`), then delete \
+             {uuid_dir_rel} and this state.json entry",
+            entry.artifact.path
+        ));
+    }
+
     // Wiring is restored in reverse application order: lock first, Gemfile
     // last (the mirror image of vendor's Gemfile-then-lock).
     for w in entry.wiring.iter().rev() {
@@ -926,6 +969,255 @@ pub async fn revert_gem(entry: &VendorEntry, project_root: &Path, dry_run: bool)
         warnings,
         error: None,
     }
+}
+
+// ── ledger reconstruction ───────────────────────────────────────────────────
+
+/// Re-synthesize the wiring records for a gem entry whose ledger was lost
+/// (`repair`'s no-ledger reconstruction), by recognizing this backend's OWN
+/// emitted wiring in the live Gemfile + Gemfile.lock pair — the same
+/// recognizers the re-vendor-new-uuid path trusts. Everything is
+/// grammar-strict and fail-closed: any shape vendor does not write yields
+/// `Err` and the caller keeps an empty-wiring entry (whose revert then
+/// refuses loudly) instead of guessing.
+///
+/// Two documented degradations, both inherent to a lost ledger:
+///
+/// * a REWRITTEN declaration's pre-vendor line is reconstructed in the
+///   canonical exact-pin form (`gem "<name>", "<version>"` + preserved
+///   trailing options) — the user's original version constraint lived only
+///   in the lost ledger, and the exact pin restores a consistent,
+///   installable pair resolving to the same version;
+/// * a CHECKSUMS `sha256=` token is NOT recomputable offline, so no
+///   checksum record is emitted: revert leaves bundler's bare path-gem
+///   entry, which a non-frozen `bundle install` refills byte-identically
+///   (bundler 4.0.15 verified; frozen installs fail with a self-explanatory
+///   `empty CHECKSUMS entry` message until then) — surfaced as the
+///   `vendor_checksum_unrecoverable` warning.
+///
+/// The transitive-vs-declared split is recovered from the Gemfile form:
+/// vendor appends the managed fence exactly when the gem was undeclared,
+/// which is also exactly when the pre-vendor DEPENDENCIES entry was absent.
+pub async fn reconstruct_gem_wiring(
+    project_root: &Path,
+    entry: &VendorEntry,
+) -> Result<(Vec<WiringRecord>, Vec<VendorWarning>), String> {
+    let Some((name, version)) = parse_gem_purl(&entry.base_purl) else {
+        return Err(format!("not a gem purl: {}", entry.base_purl));
+    };
+    // SECURITY: the coordinates come from a re-synthesized entry
+    // (manifest/API purl) and are matched against Gemfile/lock line
+    // grammar — the same fail-closed token guard as `vendor_gem`.
+    if !is_safe_single_segment(name)
+        || !is_safe_single_segment(version)
+        || !is_plain_gem_token(name)
+        || !is_plain_gem_token(version)
+    {
+        return Err(format!("unsafe gem coordinates `{name}` @ `{version}`"));
+    }
+    let rel = entry.artifact.path.replace('\\', "/");
+    let leaf = format!("{name}-{version}");
+    match parse_vendor_path(&rel) {
+        Some(p) if p.eco == "gem" && p.uuid == entry.uuid && p.leaf == leaf => {}
+        _ => {
+            return Err(format!(
+                "artifact path `{rel}` is not this entry's canonical vendored dir"
+            ));
+        }
+    }
+
+    // ── Gemfile: exactly one declaration, carrying OUR `path:` ───────────
+    let gemfile_text = tokio::fs::read_to_string(project_root.join(GEMFILE))
+        .await
+        .map_err(|e| format!("unreadable Gemfile: {e}"))?;
+    let lines: Vec<&str> = gemfile_text.split('\n').collect();
+    let mut found: Option<usize> = None;
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('#') {
+            continue;
+        }
+        if gem_declaration(trimmed, name).is_some() && found.replace(i).is_some() {
+            return Err(format!(
+                "`gem \"{name}\"` is declared more than once in the Gemfile"
+            ));
+        }
+    }
+    let Some(idx) = found else {
+        return Err(format!("the Gemfile does not declare `{name}`"));
+    };
+    let line = lines[idx];
+    if line.trim_start().len() != line.len() {
+        return Err(format!(
+            "the `gem \"{name}\"` declaration is indented — not the wiring vendor writes"
+        ));
+    }
+    let managed = idx > 0
+        && lines[idx - 1] == MANAGED_OPEN
+        && lines.get(idx + 1).is_some_and(|l| *l == MANAGED_CLOSE);
+    let gemfile_record = if managed {
+        // The Append plan always emits exactly this double-quoted,
+        // option-free line; revert deletes the whole fenced block.
+        if line != format!("gem \"{name}\", \"{version}\", path: \"{rel}\"") {
+            return Err(format!(
+                "the managed block line for `{name}` is not the form vendor writes"
+            ));
+        }
+        WiringRecord {
+            file: GEMFILE.to_string(),
+            kind: GEMFILE_WIRING_KIND.to_string(),
+            action: WiringAction::Added,
+            key: Some(name.to_string()),
+            original: None,
+            new: Some(Value::String(format!(
+                "{MANAGED_OPEN}\n{line}\n{MANAGED_CLOSE}\n"
+            ))),
+        }
+    } else {
+        let de_vendored = devendored_gem_line(line, name, version, &rel).ok_or_else(|| {
+            format!(
+                "the `gem \"{name}\"` line is not the exact-pin + `path:` form vendor \
+                 writes; its pre-vendor original cannot be reconstructed"
+            )
+        })?;
+        WiringRecord {
+            file: GEMFILE.to_string(),
+            kind: GEMFILE_WIRING_KIND.to_string(),
+            action: WiringAction::Rewritten,
+            key: Some(name.to_string()),
+            original: Some(Value::String(de_vendored)),
+            new: Some(Value::String(line.to_string())),
+        }
+    };
+
+    // ── Gemfile.lock: our PATH section + the `!` DEPENDENCIES pin ────────
+    let lock_text = tokio::fs::read_to_string(project_root.join(GEMFILE_LOCK))
+        .await
+        .map_err(|e| format!("unreadable Gemfile.lock: {e}"))?;
+    let lock_lines: Vec<String> = lock_text.split('\n').map(str::to_string).collect();
+    let (ps, pe) = find_our_path_section(&lock_lines, name, version)
+        .ok_or_else(|| format!("Gemfile.lock has no PATH section wiring `{name}`"))?;
+    let remote_line = format!("  remote: {rel}");
+    let target = format!("    {name} ({version})");
+    let block_start = (ps..pe)
+        .find(|&i| lock_lines[i] == target)
+        .ok_or_else(|| format!("the PATH section for `{name}` lost its spec entry"))?;
+    let mut block_end = block_start + 1;
+    while block_end < pe && lock_lines[block_end].starts_with("      ") {
+        block_end += 1;
+    }
+    // Grammar-strict, mirroring the re-vendor rewire guard: besides the
+    // spec block, the section must be exactly what vendor wrote — and its
+    // remote must be THIS entry's uuid dir, not some other patch's.
+    let non_block: Vec<&str> = (ps..pe)
+        .filter(|i| !(block_start..block_end).contains(i))
+        .map(|i| lock_lines[i].as_str())
+        .filter(|l| !l.is_empty())
+        .collect();
+    if non_block.len() != 3
+        || non_block[0] != "PATH"
+        || non_block[1] != remote_line
+        || non_block[2] != "  specs:"
+    {
+        return Err(format!(
+            "the Gemfile.lock PATH section for `{name} ({version})` is not the shape \
+             vendor writes"
+        ));
+    }
+    let new_dep_line = format!("  {name} (= {version})!");
+    let (ds, de) = section_span(&lock_lines, "DEPENDENCIES")
+        .ok_or_else(|| "Gemfile.lock has no DEPENDENCIES section".to_string())?;
+    if !(ds..de).any(|i| lock_lines[i] == new_dep_line) {
+        return Err(format!(
+            "Gemfile.lock DEPENDENCIES lacks the `{name} (= {version})!` pin vendor writes"
+        ));
+    }
+
+    let block = &lock_lines[block_start..block_end];
+    let mut new_lines: Vec<Value> = vec![
+        Value::String("PATH".to_string()),
+        Value::String(remote_line),
+        Value::String("  specs:".to_string()),
+    ];
+    new_lines.extend(block.iter().map(|l| Value::String(l.clone())));
+    new_lines.push(Value::String(new_dep_line));
+    let mut original_lines: Vec<Value> = block.iter().map(|l| Value::String(l.clone())).collect();
+    if !managed {
+        // Declared gem ⇒ DEPENDENCIES carried an entry pre-vendor. The
+        // canonical exact-pin form pairs with the reconstructed Gemfile
+        // line (see the function docs for the degradation contract).
+        original_lines.push(Value::String(format!("  {name} (= {version})")));
+    }
+    let lock_record = WiringRecord {
+        file: GEMFILE_LOCK.to_string(),
+        kind: LOCK_WIRING_KIND.to_string(),
+        action: WiringAction::Rewritten,
+        key: Some(name.to_string()),
+        original: Some(Value::Array(original_lines)),
+        new: Some(Value::Array(new_lines)),
+    };
+
+    // ── CHECKSUMS: bare path-form entry expected; sha256 unrecoverable ───
+    let mut warnings: Vec<VendorWarning> = Vec::new();
+    if let Some((cs, ce)) = section_span(&lock_lines, "CHECKSUMS") {
+        let bare = format!("  {name} ({version})");
+        for line in &lock_lines[cs + 1..ce] {
+            match checksum_entry(line) {
+                Some((n, v)) if n == name && v == version => {
+                    if line.as_str() != bare {
+                        return Err(format!(
+                            "Gemfile.lock CHECKSUMS still carries a registry `sha256=` \
+                             entry for `{name} ({version})` while the lock is path-wired \
+                             — not a state vendor writes; re-resolve the lock before \
+                             repairing"
+                        ));
+                    }
+                    warnings.push(VendorWarning::new(
+                        "vendor_checksum_unrecoverable",
+                        format!(
+                            "the pre-vendor CHECKSUMS `sha256=` line for {name} ({version}) \
+                             is not recoverable from a reconstructed ledger; after `vendor \
+                             --revert`, run a non-frozen `bundle install` once to refill it \
+                             (frozen installs fail on the empty entry until then)"
+                        ),
+                    ));
+                }
+                Some(_) => {}
+                None if checksum_line_names_gem(line, name) => {
+                    return Err(format!(
+                        "Gemfile.lock CHECKSUMS entry for `{name}` is not parseable: {line:?}"
+                    ));
+                }
+                None => {}
+            }
+        }
+    }
+
+    Ok((vec![gemfile_record, lock_record], warnings))
+}
+
+/// Strip our `path:` option back out of a line the exact-pin rewrite
+/// emitted: `gem {q}{name}{q}, {q}{version}{q}, path: {q}{rel}{q}[, opts]` →
+/// `gem {q}{name}{q}, {q}{version}{q}[, opts]`. `None` for any other shape
+/// (fail-closed), including trailing options that would re-select a source.
+fn devendored_gem_line(line: &str, name: &str, version: &str, rel: &str) -> Option<String> {
+    for q in ['"', '\''] {
+        let head = format!("gem {q}{name}{q}, {q}{version}{q}");
+        let with_path = format!("{head}, path: {q}{rel}{q}");
+        if line == with_path {
+            return Some(head);
+        }
+        if let Some(opts) = line
+            .strip_prefix(with_path.as_str())
+            .and_then(|t| t.strip_prefix(", "))
+        {
+            if opts.is_empty() || rest_blocks_edit(&format!(", {opts}")).is_some() {
+                return None;
+            }
+            return Some(format!("{head}, {opts}"));
+        }
+    }
+    None
 }
 
 // ── Gemfile editing ──────────────────────────────────────────────────────────
@@ -4005,5 +4297,297 @@ mod tests {
         .await;
         let (code, _) = unwrap_refused(outcome);
         assert_eq!(code, "vendor_service_offline_conflict");
+    }
+
+    // ── ledger reconstruction ────────────────────────────────────────────
+
+    const GEMFILE_PINNED: &str =
+        "source \"https://rubygems.org\"\n\ngem \"puma\"\ngem \"rack\", \"3.2.6\"\n";
+    const LOCK_PINNED: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    puma (6.4.2)\n      nio4r (~> 2.0)\n    rack (3.2.6)\n      base64 (>= 0.1.0)\n\nPLATFORMS\n  arm64-darwin-23\n  ruby\n\nDEPENDENCIES\n  puma\n  rack (= 3.2.6)\n\nBUNDLED WITH\n   2.5.22\n";
+
+    /// STRONG oracle for an exact-pin declaration: reconstruction from the
+    /// live wired pair must reproduce vendor's own recorded wiring
+    /// byte-for-byte — and reverting with the reconstructed records must
+    /// byte-restore both files, exactly like the real ledger would.
+    #[tokio::test]
+    async fn reconstruction_reproduces_vendor_wiring_for_pinned_declaration() {
+        let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_PINNED, LOCK_PINNED).await;
+        let (result, entry, _w) =
+            unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
+        assert!(result.success, "vendor failed: {:?}", result.error);
+        let entry = entry.expect("wired entry");
+
+        let (wiring, warnings) = reconstruct_gem_wiring(&root, &entry).await.unwrap();
+        assert_eq!(
+            wiring, entry.wiring,
+            "reconstructed wiring must equal what vendor recorded"
+        );
+        assert!(
+            warnings.is_empty(),
+            "no CHECKSUMS section, no degradation notes: {warnings:?}"
+        );
+
+        // Revert with ONLY the reconstructed records: byte-restored pair,
+        // artifact gone.
+        let mut synth = entry.clone();
+        synth.wiring = wiring;
+        let outcome = revert_gem(&synth, &root, false).await;
+        assert!(outcome.success, "revert failed: {:?}", outcome.error);
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
+            GEMFILE_PINNED
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                .await
+                .unwrap(),
+            LOCK_PINNED
+        );
+        assert!(!root.join(copy_rel()).exists(), "artifact removed");
+    }
+
+    /// Transitive gem (managed fence): the reconstructed Added record must
+    /// equal vendor's, and the lock original must carry NO dependencies
+    /// entry (revert deletes the added pin).
+    #[tokio::test]
+    async fn reconstruction_reproduces_vendor_wiring_for_managed_block() {
+        let (_tmp, root, installed, blobs, record) =
+            fixture(GEMFILE_TRANSITIVE, LOCK_TRANSITIVE).await;
+        let (result, entry, _w) =
+            unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
+        assert!(result.success, "vendor failed: {:?}", result.error);
+        let entry = entry.expect("wired entry");
+
+        let (wiring, _) = reconstruct_gem_wiring(&root, &entry).await.unwrap();
+        assert_eq!(wiring, entry.wiring);
+
+        let mut synth = entry.clone();
+        synth.wiring = wiring;
+        let outcome = revert_gem(&synth, &root, false).await;
+        assert!(outcome.success, "revert failed: {:?}", outcome.error);
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
+            GEMFILE_TRANSITIVE
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                .await
+                .unwrap(),
+            LOCK_TRANSITIVE
+        );
+    }
+
+    /// The documented degradation: a RANGE constraint (`~> 3.1`) lived only
+    /// in the lost ledger, so the reconstructed originals pin the exact
+    /// locked version — a consistent, installable pair, hand-pinned here.
+    #[tokio::test]
+    async fn reconstruction_degrades_range_constraint_to_exact_pin() {
+        let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
+        let (result, entry, _w) =
+            unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
+        assert!(result.success, "vendor failed: {:?}", result.error);
+        let entry = entry.expect("wired entry");
+
+        let (wiring, _) = reconstruct_gem_wiring(&root, &entry).await.unwrap();
+        assert_eq!(
+            wiring[0].original,
+            Some(Value::String("gem \"rack\", \"3.2.6\"".to_string())),
+            "canonical exact pin, NOT the unrecoverable `~> 3.1`"
+        );
+        let lock_original = wiring[1].original.as_ref().unwrap().as_array().unwrap();
+        assert_eq!(
+            lock_original.last().unwrap(),
+            &Value::String("  rack (= 3.2.6)".to_string()),
+            "the DEPENDENCIES restore pairs with the pinned Gemfile line"
+        );
+
+        // The reverted pair is CONSISTENT (both halves pin 3.2.6).
+        let mut synth = entry.clone();
+        synth.wiring = wiring;
+        let outcome = revert_gem(&synth, &root, false).await;
+        assert!(outcome.success, "revert failed: {:?}", outcome.error);
+        let gemfile = tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap();
+        assert!(gemfile.contains("gem \"rack\", \"3.2.6\"\n"), "{gemfile}");
+        assert!(!gemfile.contains("path:"), "{gemfile}");
+        let lock = tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+            .await
+            .unwrap();
+        assert!(lock.contains("\n  rack (= 3.2.6)\n"), "{lock}");
+        assert!(!lock.contains("PATH"), "{lock}");
+    }
+
+    /// Trailing options ride the reconstruction (`require: false` dropped
+    /// on restore would auto-require the gem at boot).
+    #[tokio::test]
+    async fn reconstruction_preserves_trailing_options() {
+        let gemfile =
+            "source \"https://rubygems.org\"\n\ngem \"puma\"\ngem \"rack\", \"3.2.6\", require: false\n";
+        let (_tmp, root, installed, blobs, record) = fixture(gemfile, LOCK_PINNED).await;
+        let (result, entry, _w) =
+            unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
+        assert!(result.success, "vendor failed: {:?}", result.error);
+        let entry = entry.expect("wired entry");
+
+        let (wiring, _) = reconstruct_gem_wiring(&root, &entry).await.unwrap();
+        assert_eq!(
+            wiring[0].original,
+            Some(Value::String(
+                "gem \"rack\", \"3.2.6\", require: false".to_string()
+            ))
+        );
+    }
+
+    /// A bare CHECKSUMS entry (bundler ≥ 2.6 lock): the `sha256=` token is
+    /// not offline-recoverable, so reconstruction emits NO checksum record
+    /// (revert leaves the bare line for a plain `bundle install` to refill
+    /// — bundler 4.0.15 verified) and surfaces the gap as a warning.
+    #[tokio::test]
+    async fn reconstruction_flags_unrecoverable_checksum() {
+        let lock = format!(
+            "GEM\n  remote: https://rubygems.org/\n  specs:\n    puma (6.4.2)\n      nio4r (~> 2.0)\n    rack (3.2.6)\n      base64 (>= 0.1.0)\n\nPLATFORMS\n  arm64-darwin-23\n  ruby\n\nDEPENDENCIES\n  puma\n  rack (= 3.2.6)\n\nCHECKSUMS\n  puma (6.4.2) sha256={}\n  rack (3.2.6) sha256={}\n\nBUNDLED WITH\n   2.5.22\n",
+            "a".repeat(64),
+            "b".repeat(64),
+        );
+        let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_PINNED, &lock).await;
+        let (result, entry, _w) =
+            unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
+        assert!(result.success, "vendor failed: {:?}", result.error);
+        let entry = entry.expect("wired entry");
+        assert_eq!(entry.wiring.len(), 3, "vendor recorded a checksum record");
+
+        let (wiring, warnings) = reconstruct_gem_wiring(&root, &entry).await.unwrap();
+        assert_eq!(
+            wiring.len(),
+            2,
+            "no checksum record — the sha256 is unrecoverable: {wiring:?}"
+        );
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert_eq!(warnings[0].code, "vendor_checksum_unrecoverable");
+    }
+
+    /// Fail-closed refusals: anything that is not vendor's own emitted
+    /// wiring yields `Err`, never guessed-at records.
+    #[tokio::test]
+    async fn reconstruction_refuses_foreign_or_mismatched_wiring() {
+        let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_PINNED, LOCK_PINNED).await;
+        let (result, entry, _w) =
+            unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
+        assert!(result.success, "vendor failed: {:?}", result.error);
+        let entry = entry.expect("wired entry");
+
+        // A user fork's path: (not our vendored dir) in place of ours.
+        let gemfile_path = root.join(GEMFILE);
+        let wired = tokio::fs::read_to_string(&gemfile_path).await.unwrap();
+        tokio::fs::write(
+            &gemfile_path,
+            wired.replace(&copy_rel(), "vendor/forks/rack"),
+        )
+        .await
+        .unwrap();
+        let err = reconstruct_gem_wiring(&root, &entry).await.unwrap_err();
+        assert!(err.contains("exact-pin"), "{err}");
+        tokio::fs::write(&gemfile_path, &wired).await.unwrap();
+
+        // A DIFFERENT patch uuid's dir wired in the pair: not this entry's.
+        let mut other = entry.clone();
+        other.uuid = "11111111-2222-4333-8444-555555555555".to_string();
+        other.artifact.path =
+            ".socket/vendor/gem/11111111-2222-4333-8444-555555555555/rack-3.2.6".to_string();
+        let err = reconstruct_gem_wiring(&root, &other).await.unwrap_err();
+        assert!(
+            err.contains("exact-pin") || err.contains("PATH section"),
+            "{err}"
+        );
+
+        // The lock lost the `!` pin.
+        let lock_path = root.join(GEMFILE_LOCK);
+        let wired_lock = tokio::fs::read_to_string(&lock_path).await.unwrap();
+        tokio::fs::write(
+            &lock_path,
+            wired_lock.replace("  rack (= 3.2.6)!", "  rack (= 3.2.6)"),
+        )
+        .await
+        .unwrap();
+        let err = reconstruct_gem_wiring(&root, &entry).await.unwrap_err();
+        assert!(err.contains("(= 3.2.6)!"), "{err}");
+        tokio::fs::write(&lock_path, &wired_lock).await.unwrap();
+
+        // A registry `sha256=` CHECKSUMS entry while path-wired (the stale
+        // pre-CHECKSUMS-aware state): never silently blessed.
+        let stale = format!(
+            "{wired_lock}\nCHECKSUMS\n  rack (3.2.6) sha256={}\n",
+            "c".repeat(64)
+        );
+        tokio::fs::write(&lock_path, stale).await.unwrap();
+        let err = reconstruct_gem_wiring(&root, &entry).await.unwrap_err();
+        assert!(err.contains("sha256"), "{err}");
+    }
+
+    /// The empty-wiring revert guard: a reconstructed entry without
+    /// recoverable wiring must FAIL loudly — deleting the artifact would
+    /// strand the Gemfile `path:` + lock PATH section on a dead dir. The
+    /// files and the artifact stay untouched.
+    #[tokio::test]
+    async fn revert_refuses_empty_wiring_entry() {
+        let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_PINNED, LOCK_PINNED).await;
+        let (result, entry, _w) =
+            unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
+        assert!(result.success, "vendor failed: {:?}", result.error);
+        let mut entry = entry.expect("wired entry");
+        entry.wiring = Vec::new();
+
+        let gemfile_before = tokio::fs::read(root.join(GEMFILE)).await.unwrap();
+        let lock_before = tokio::fs::read(root.join(GEMFILE_LOCK)).await.unwrap();
+        for dry_run in [true, false] {
+            let outcome = revert_gem(&entry, &root, dry_run).await;
+            assert!(!outcome.success, "dry_run={dry_run}: must fail loudly");
+            let err = outcome.error.expect("error detail");
+            assert!(err.contains("vendor_wiring_unknown"), "{err}");
+            assert!(err.contains("Gemfile"), "names the files to clean: {err}");
+        }
+        assert!(
+            root.join(copy_rel()).join("lib/rack.rb").is_file(),
+            "the artifact must NOT be deleted"
+        );
+        assert_eq!(
+            tokio::fs::read(root.join(GEMFILE)).await.unwrap(),
+            gemfile_before
+        );
+        assert_eq!(
+            tokio::fs::read(root.join(GEMFILE_LOCK)).await.unwrap(),
+            lock_before
+        );
+    }
+
+    /// vendor records the whole-tree file inventory (patched lib + stub
+    /// gemspec) with hand-pinned plain-sha256 values.
+    #[tokio::test]
+    async fn vendor_records_dir_file_inventory() {
+        use sha2::{Digest, Sha256};
+
+        let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_PINNED, LOCK_PINNED).await;
+        let (result, entry, _w) =
+            unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
+        assert!(result.success, "vendor failed: {:?}", result.error);
+        let entry = entry.expect("wired entry");
+
+        let inventory = entry
+            .artifact
+            .file_inventory
+            .as_ref()
+            .expect("dir-shaped entries record an inventory");
+        assert_eq!(
+            inventory.keys().collect::<Vec<_>>(),
+            ["lib/rack.rb", "rack.gemspec"],
+            "sorted keys, gemspec included"
+        );
+        assert_eq!(
+            inventory["lib/rack.rb"],
+            hex::encode(Sha256::digest(PATCHED))
+        );
+        assert_eq!(
+            inventory["rack.gemspec"],
+            hex::encode(Sha256::digest(GEMSPEC.as_bytes()))
+        );
     }
 }
