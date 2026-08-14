@@ -616,10 +616,11 @@ pub(super) async fn classify_overlap_takeover(cwd: &Path) -> OverlapTakeover {
     }
     // The hosted proof needs the redirect ledger too: each record's patch
     // uuid (embedded in every hosted artifact URL, whatever the host) and
-    // the lockfiles the redirect actually edited. A malformed ledger reads as
-    // a missing one, exactly as in `overlapping_ledger_purls` — and that
-    // non-empty overlap is this function's precondition, so the corrupt shape
-    // cannot reach here anyway.
+    // the lockfiles the redirect actually edited. A malformed ledger
+    // classifies like a missing one, matching `overlapping_ledger_purls`
+    // (this path only feeds takeover warnings; corruption is a hard error
+    // on the write/attest paths) — and that guard already returned empty
+    // overlap for the corrupt case, so this consult never runs then.
     let redirect_state = socket_patch_core::patch::redirect::load_redirect_state(cwd)
         .await
         .ok()
