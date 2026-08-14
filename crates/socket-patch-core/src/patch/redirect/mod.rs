@@ -729,6 +729,47 @@ fn rewrite_pnpm_lock(
         // that begin with `@` (`'@scope/name@1.0.0':` — YAML forbids a plain
         // scalar starting with `@`); v6 keys start with `/` and are unquoted.
         let key = regex::escape(&fname) + "@" + &regex::escape(&dep.version);
+        // Legacy pnpm lock grammars this rewriter cannot repoint: lockfile-
+        // Version 6 embeds resolved peers in the `packages:` key itself
+        // (`/name@1.0.0(peer@2.0.0):`) and v5.x separates the version with a
+        // slash (`/name/1.0.0:`, peers suffixed `_peer@2.0.0`). Both carry
+        // their own `resolution:` block the pattern below never matches.
+        // Rewriting AROUND them is fail-open: a v6 lock holding both
+        // `/pkg@1.0.0:` and `/pkg@1.0.0(peer@2.0.0):` would get the plain
+        // entry rewritten — confirming and attesting the dep — while every
+        // dependent resolving through the peered entry still installs the
+        // unpatched upstream tarball. So when ANY such key exists for this
+        // dep in ANY lock, refuse the dep outright (no rewrite anywhere),
+        // naming the unmatched keys. v9 is unaffected: its peer-suffixed
+        // `snapshots:` keys never start with `/` (and carry no resolution).
+        let legacy_pat = String::from(r"(?m)^ {2}(/")
+            + &key
+            + r"\([^:\n]*|/"
+            + &regex::escape(&fname)
+            + "/"
+            + &regex::escape(&dep.version)
+            + r"(?:[_(][^:\n]*)?):";
+        let legacy_re = Regex::new(&legacy_pat).unwrap();
+        let mut legacy_keys: Vec<String> = Vec::new();
+        for (lock_key, content, _) in &contents {
+            for caps in legacy_re.captures_iter(content) {
+                legacy_keys.push(format!("{} in {lock_key}", &caps[1]));
+            }
+        }
+        if !legacy_keys.is_empty() {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_pnpm_unsupported_lock_key".into(),
+                detail: format!(
+                    "{fname}@{} resolves through pnpm v5/v6 lock key(s) the \
+                     redirect grammar cannot repoint: {}; left unredirected — \
+                     regenerate the lock with pnpm >=9 (lockfileVersion 9) \
+                     and re-run",
+                    dep.version,
+                    legacy_keys.join(", ")
+                ),
+            });
+            continue;
+        }
         let pat = String::from(r"(?m)(^ {2}(?:'")
             + &key
             + r"'|/?"
@@ -2087,6 +2128,61 @@ fn gem_tail_source_option(tail: &str) -> Option<&'static str> {
     .find(|tok| code.contains(tok))
 }
 
+/// A dep's Socket index URL as a regex source with the per-request rotating
+/// segments (grant token, patch uuid) wildcarded — an exact-URL pattern
+/// misses the URL a previous run wrote under an older grant.
+fn gem_index_url_pattern(dep: &DepOverride, index_url: &str) -> String {
+    let mut url_pat = regex::escape(index_url);
+    for rotating in [&dep.token, &dep.patch_uuid] {
+        if !rotating.is_empty() {
+            url_pat = url_pat.replace(&regex::escape(&format!("/{rotating}/")), "/[^/\"]+/");
+        }
+    }
+    url_pat
+}
+
+/// A gemfile spelling with the redirect's own footprint erased: every managed
+/// Socket `source "…" do … end` block for a redirected dep (rotating grant
+/// segments wildcarded) and the dep's own `gem` declaration line. The
+/// gems.rb/Gemfile divergence guard compares these residues rather than raw
+/// bytes: run 1 on byte-identical twins edits only gems.rb (the file bundler
+/// reads), so a raw comparison would trap every later run — the rotated-grant
+/// URL refresh included — behind `redirect_gem_gemfile_spellings_diverge`, a
+/// divergence the rewriter itself created. Trailing whitespace is trimmed (a
+/// block appended to a newline-less file adds a final newline the other
+/// spelling never had). `\r?` mirrors the block recognizer in `rewrite_gem`:
+/// a `core.autocrlf` checkout rewrites run 1's LF block to CRLF, and a block
+/// the recognizer accepts must also be erased here or the re-run is trapped
+/// behind the divergence warning before it can reach the recognizer.
+fn gem_spelling_residue(content: &str, deps: &[&DepOverride]) -> String {
+    let mut residue = content.to_string();
+    for dep in deps {
+        let Some(ov) = &dep.registry_override else {
+            continue;
+        };
+        if ov.kind != "rubygems-compact-index" {
+            continue;
+        }
+        let block_re = Regex::new(
+            &(String::from(r#"(?m)^source ""#)
+                + &gem_index_url_pattern(dep, &ov.index_url)
+                + r#"" do\r?\n  gem ["']"#
+                + &regex::escape(&dep.name)
+                + r#"["'][^\n]*\nend\r?\n?"#),
+        )
+        .unwrap();
+        residue = block_re.replace_all(&residue, "").into_owned();
+        let decl_re = Regex::new(
+            &(String::from(r#"(?m)^[ \t]*gem\b[^\n]*["']"#)
+                + &regex::escape(&dep.name)
+                + r#"["'][^\n]*\n?"#),
+        )
+        .unwrap();
+        residue = decl_re.replace_all(&residue, "").into_owned();
+    }
+    residue.trim_end().to_string()
+}
+
 fn rewrite_gem(
     files: &BTreeMap<String, String>,
     overrides: &[DepOverride],
@@ -2096,12 +2192,49 @@ fn rewrite_gem(
     if gem.is_empty() {
         return;
     }
-    let mut gemfile = files.get("Gemfile").cloned();
+    // Bundler's modern manifest spelling: `gems.rb`/`gems.locked` wins over
+    // `Gemfile`/`Gemfile.lock` when both sit in one directory (bundler's
+    // `default_gemfile` tries gems.rb first — verified on bundler 4.0.15,
+    // which warns "Multiple gemfiles (gems.rb and Gemfile) detected ...
+    // bundler is ignoring them in favor of gems.rb and gems.locked"; same
+    // order as `setup::gem::discover_bundler_project`). DIVERGING spellings
+    // are ambiguous — the redirect would land in the file bundler reads while
+    // tooling pinned to the other keeps resolving upstream — so fail closed
+    // on the whole gem set. Divergence is judged on the redirect-footprint
+    // residue (`gem_spelling_residue`), NOT raw bytes: run 1 on identical
+    // twins edits only gems.rb (following bundler), so a raw comparison would
+    // trap every later run behind the divergence the rewriter itself created.
+    // Identical spellings follow bundler: edit gems.rb.
+    let modern = files.contains_key("gems.rb");
+    if modern
+        && files.get("Gemfile").is_some_and(|c| {
+            gem_spelling_residue(&files["gems.rb"], &gem) != gem_spelling_residue(c, &gem)
+        })
+    {
+        result.warnings.push(RewriteWarning {
+            code: "redirect_gem_gemfile_spellings_diverge".into(),
+            detail: "both gems.rb and Gemfile are present with different contents; bundler \
+                     reads gems.rb but the redirect cannot safely pick one — reconcile the \
+                     two spellings and re-run"
+                .into(),
+        });
+        return;
+    }
+    let (gemfile_name, lock_name) = if modern {
+        ("gems.rb", "gems.locked")
+    } else {
+        ("Gemfile", "Gemfile.lock")
+    };
+    let mut gemfile = files.get(gemfile_name).cloned();
     let mut gemfile_changed = false;
-    let mut lock = files.get("Gemfile.lock").cloned();
+    let mut lock = files.get(lock_name).cloned();
     let mut lock_changed = false;
     // Static regex — compile once, not per-dependency (clippy: regex-in-loop).
-    let checksums_re = Regex::new(r"(?m)^CHECKSUMS$").unwrap();
+    // `\r?` throughout the lock handling: a CRLF Gemfile.lock is legal to
+    // bundler (verified: `bundle check`/frozen install both accept one on
+    // 4.0.15), and without the tolerance the CHECKSUMS header never matched,
+    // misdiagnosing the lock as bundler <2.6.
+    let checksums_re = Regex::new(r"(?m)^CHECKSUMS(\r?)$").unwrap();
 
     for dep in &gem {
         let Some(ov) = &dep.registry_override else {
@@ -2146,7 +2279,7 @@ fn rewrite_gem(
                 result.warnings.push(RewriteWarning {
                     code: "redirect_gem_platform_unsupported".into(),
                     detail: format!(
-                        "Gemfile.lock CHECKSUMS carries platform-specific entries for {} {} — \
+                        "{lock_name} CHECKSUMS carries platform-specific entries for {} {} — \
                          the patch registry serves only the ruby platform gem; redirect skipped",
                         dep.name, dep.version
                     ),
@@ -2165,13 +2298,7 @@ fn rewrite_gem(
             // run would wrap the gem line inside it — nesting source blocks.
             // Wildcard the rotating segments instead (mirrors the CHECKSUMS
             // at-target guard below).
-            let mut url_pat = regex::escape(&ov.index_url);
-            for rotating in [&dep.token, &dep.patch_uuid] {
-                if !rotating.is_empty() {
-                    url_pat =
-                        url_pat.replace(&regex::escape(&format!("/{rotating}/")), "/[^/\"]+/");
-                }
-            }
+            let url_pat = gem_index_url_pattern(dep, &ov.index_url);
             // `\r?\n`: the rewriter emits LF, but a `core.autocrlf` checkout
             // rewrites the working tree to CRLF — the guard must still
             // recognize the block there, or the indented `gem` line inside
@@ -2194,7 +2321,7 @@ fn rewrite_gem(
                     gf.replace_range(range, &ov.index_url);
                     gemfile_changed = true;
                     result.edits.push(FileEdit {
-                        path: "Gemfile".into(),
+                        path: gemfile_name.into(),
                         kind: "redirect_gemfile_source_url".into(),
                         action: "rewritten".into(),
                         key: Some(dep.name.clone()),
@@ -2286,7 +2413,7 @@ fn rewrite_gem(
                     gf.replace_range(range, &block);
                     gemfile_changed = true;
                     result.edits.push(FileEdit {
-                        path: "Gemfile".into(),
+                        path: gemfile_name.into(),
                         kind: "redirect_gemfile_source_block".into(),
                         action: "rewritten".into(),
                         key: Some(dep.name.clone()),
@@ -2314,7 +2441,7 @@ fn rewrite_gem(
                     *gf = format!("{gf}{sep}{block}\n");
                     gemfile_changed = true;
                     result.edits.push(FileEdit {
-                        path: "Gemfile".into(),
+                        path: gemfile_name.into(),
                         kind: "redirect_gemfile_source_block".into(),
                         action: "added".into(),
                         key: Some(dep.name.clone()),
@@ -2335,7 +2462,8 @@ fn rewrite_gem(
                 result.warnings.push(RewriteWarning {
                     code: "redirect_gem_lock_without_source".into(),
                     detail: format!(
-                        "no Gemfile source redirect is in place for {} — CHECKSUMS pin skipped",
+                        "no {gemfile_name} source redirect is in place for {} — CHECKSUMS pin \
+                         skipped",
                         dep.name
                     ),
                 });
@@ -2346,13 +2474,16 @@ fn rewrite_gem(
                     + &regex::escape(&dep.name)
                     + r" \("
                     + &regex::escape(&dep.version)
-                    + r"\)) sha256=([0-9a-f]+)$"),
+                    + r"\)) sha256=([0-9a-f]+)(\r?)$"),
             )
             .unwrap();
             let new_val = format!("{} ({}) sha256={sha256}", dep.name, dep.version);
             // Already redirected (re-run): the CHECKSUMS line is at the
             // target value; recording an edit would grow the ledger forever.
-            if lk.contains(&format!("\n  {new_val}\n")) || lk.ends_with(&format!("\n  {new_val}")) {
+            let already_re =
+                Regex::new(&(String::from(r"(?m)^  ") + &regex::escape(&new_val) + r"\r?$"))
+                    .unwrap();
+            if already_re.is_match(lk) {
                 // no-op
             } else if let Some(m) = sum_line_re.captures(lk) {
                 // The pre-edit line goes into the ledger as `original` so a
@@ -2364,11 +2495,11 @@ fn rewrite_gem(
                     m.get(2).unwrap().as_str()
                 );
                 *lk = sum_line_re
-                    .replace(lk, format!("${{1}} sha256={sha256}").as_str())
+                    .replace(lk, format!("${{1}} sha256={sha256}${{3}}").as_str())
                     .to_string();
                 lock_changed = true;
                 result.edits.push(FileEdit {
-                    path: "Gemfile.lock".into(),
+                    path: lock_name.into(),
                     kind: "redirect_gemfile_lock_checksum".into(),
                     action: "rewritten".into(),
                     key: Some(dep.name.clone()),
@@ -2380,7 +2511,7 @@ fn rewrite_gem(
                     .replace(
                         lk,
                         format!(
-                            "CHECKSUMS\n  {} ({}) sha256={sha256}",
+                            "CHECKSUMS${{1}}\n  {} ({}) sha256={sha256}${{1}}",
                             dep.name, dep.version
                         )
                         .as_str(),
@@ -2388,7 +2519,7 @@ fn rewrite_gem(
                     .to_string();
                 lock_changed = true;
                 result.edits.push(FileEdit {
-                    path: "Gemfile.lock".into(),
+                    path: lock_name.into(),
                     kind: "redirect_gemfile_lock_checksum".into(),
                     action: "added".into(),
                     key: Some(dep.name.clone()),
@@ -2399,7 +2530,7 @@ fn rewrite_gem(
                 result.warnings.push(RewriteWarning {
                     code: "redirect_gem_no_checksums_section".into(),
                     detail: format!(
-                        "Gemfile.lock has no CHECKSUMS section (bundler <2.6) — cannot pin {}",
+                        "{lock_name} has no CHECKSUMS section (bundler <2.6) — cannot pin {}",
                         dep.name
                     ),
                 });
@@ -2414,22 +2545,23 @@ fn rewrite_gem(
     if gemfile_changed || lock_changed {
         result.warnings.push(RewriteWarning {
             code: "redirect_gem_frozen_install".into(),
-            detail: "Gemfile was repointed at the Socket patch registry but Gemfile.lock's \
-                     GEM section still records the upstream source; bundler rejects the pair \
-                     under frozen/deployment mode — run `bundle install` (unfrozen) once to \
-                     record the new source in Gemfile.lock"
-                .into(),
+            detail: format!(
+                "{gemfile_name} was repointed at the Socket patch registry but {lock_name}'s \
+                 GEM section still records the upstream source; bundler rejects the pair \
+                 under frozen/deployment mode — run `bundle install` (unfrozen) once to \
+                 record the new source in {lock_name}"
+            ),
         });
     }
 
     if gemfile_changed {
         if let Some(gf) = gemfile {
-            result.files.insert("Gemfile".into(), gf);
+            result.files.insert(gemfile_name.into(), gf);
         }
     }
     if lock_changed {
         if let Some(lk) = lock {
-            result.files.insert("Gemfile.lock".into(), lk);
+            result.files.insert(lock_name.into(), lk);
         }
     }
 }
@@ -4988,6 +5120,439 @@ mod tests {
         );
     }
 
+    /// Bundler's modern `gems.rb`/`gems.locked` spelling must be redirected
+    /// exactly like the classic pair — before this, a gems.rb project was a
+    /// silent no-op (the rewriter keyed on the literal "Gemfile" names).
+    #[test]
+    fn gems_rb_pair_is_rewritten_with_modern_paths() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "gems.rb".to_string(),
+            "source \"https://rubygems.org\"\n\ngem \"rails\", \"7.0.0\"\n".to_string(),
+        );
+        files.insert(
+            "gems.locked".to_string(),
+            gem_lock(&format!("  rails (7.0.0) sha256={}", "2".repeat(64))),
+        );
+        let r = rewrite_registry_redirect(&files, &[gem_override("rails", "7.0.0")]);
+        let gf = r.files.get("gems.rb").expect("gems.rb rewritten");
+        assert!(
+            gf.contains(
+                "source \"https://patch.test/gem/tok/uuid/\" do\n  gem \"rails\", \"7.0.0\"\nend"
+            ),
+            "source block lands in gems.rb: {gf}"
+        );
+        let lk = r.files.get("gems.locked").expect("gems.locked rewritten");
+        assert!(
+            lk.contains(&format!("  rails (7.0.0) sha256={}", "f".repeat(64))),
+            "CHECKSUMS pin lands in gems.locked: {lk}"
+        );
+        assert!(
+            !r.files.contains_key("Gemfile") && !r.files.contains_key("Gemfile.lock"),
+            "classic spellings must not be invented: {:?}",
+            r.files.keys()
+        );
+        // The ledger edits must name the files actually written, or a future
+        // revert restores the wrong pair.
+        assert!(
+            r.edits
+                .iter()
+                .any(|e| e.kind == "redirect_gemfile_source_block" && e.path == "gems.rb"),
+            "source-block edit keyed to gems.rb: {:?}",
+            r.edits
+        );
+        assert!(
+            r.edits
+                .iter()
+                .any(|e| e.kind == "redirect_gemfile_lock_checksum" && e.path == "gems.locked"),
+            "lock edit keyed to gems.locked: {:?}",
+            r.edits
+        );
+    }
+
+    /// Both spellings present and byte-identical: follow bundler (which reads
+    /// gems.rb and ignores the Gemfile) — edit gems.rb, leave Gemfile alone.
+    #[test]
+    fn gems_rb_beats_identical_gemfile() {
+        let gemfile = "source \"https://rubygems.org\"\n\ngem \"rails\", \"7.0.0\"\n".to_string();
+        let mut files = BTreeMap::new();
+        files.insert("gems.rb".to_string(), gemfile.clone());
+        files.insert("Gemfile".to_string(), gemfile);
+        let r = rewrite_registry_redirect(&files, &[gem_override("rails", "7.0.0")]);
+        assert!(
+            r.files.contains_key("gems.rb") && !r.files.contains_key("Gemfile"),
+            "bundler reads gems.rb, so only gems.rb may be edited: {:?}",
+            r.files.keys()
+        );
+    }
+
+    /// Both spellings present and DIVERGING outside the redirect's own
+    /// footprint (an unrelated gem only one file declares): editing either is
+    /// a guess (the redirect could land in the file bundler ignores, or
+    /// tooling pinned to the classic name keeps resolving upstream). Fail
+    /// closed with a warning.
+    #[test]
+    fn gems_rb_and_gemfile_diverging_fail_closed() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "gems.rb".to_string(),
+            "source \"https://rubygems.org\"\n\ngem \"rails\", \"7.0.0\"\ngem \"puma\", \"6.0.0\"\n"
+                .to_string(),
+        );
+        files.insert(
+            "Gemfile".to_string(),
+            "source \"https://rubygems.org\"\n\ngem \"rails\", \"7.0.0\"\n".to_string(),
+        );
+        let r = rewrite_registry_redirect(&files, &[gem_override("rails", "7.0.0")]);
+        assert!(
+            r.files.is_empty() && r.edits.is_empty(),
+            "diverging spellings must not be edited: files={:?} edits={:?}",
+            r.files.keys(),
+            r.edits
+        );
+        assert!(
+            r.warnings
+                .iter()
+                .any(|w| w.code == "redirect_gem_gemfile_spellings_diverge"),
+            "fail-closed skip must warn: {:?}",
+            r.warnings
+        );
+    }
+
+    /// Divergence confined to the redirected dep's OWN declaration line is
+    /// tolerated: the rewriter canonicalizes that line into the managed block
+    /// either way, and bundler reads gems.rb regardless (verified on 4.0.15,
+    /// which warns it is ignoring the Gemfile). Only divergence outside the
+    /// redirect's footprint is ambiguous enough to fail closed on.
+    #[test]
+    fn gems_rb_divergence_only_in_redirected_dep_line_proceeds() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "gems.rb".to_string(),
+            "source \"https://rubygems.org\"\n\ngem \"rails\", \"7.0.0\"\n".to_string(),
+        );
+        files.insert(
+            "Gemfile".to_string(),
+            "source \"https://rubygems.org\"\n\ngem \"rails\", \"6.1.0\"\n".to_string(),
+        );
+        let r = rewrite_registry_redirect(&files, &[gem_override("rails", "7.0.0")]);
+        assert!(
+            !r.warnings
+                .iter()
+                .any(|w| w.code == "redirect_gem_gemfile_spellings_diverge"),
+            "the redirected dep's own line is not ambient divergence: {:?}",
+            r.warnings
+        );
+        assert!(
+            r.files.contains_key("gems.rb") && !r.files.contains_key("Gemfile"),
+            "redirect proceeds on the file bundler reads: {:?}",
+            r.files.keys()
+        );
+    }
+
+    /// Run 1 on byte-identical twins edits only gems.rb (bundler's file),
+    /// which makes the pair diverge on raw bytes. The divergence guard judges
+    /// the redirect-footprint residue instead: feeding run 1's output back
+    /// must be a plain no-op re-run, not a
+    /// `redirect_gem_gemfile_spellings_diverge` trap that blocks every later
+    /// run against the state run 1 itself created.
+    #[test]
+    fn gems_rb_identical_twins_rerun_is_a_no_op_not_a_diverge_trap() {
+        let gemfile = "source \"https://rubygems.org\"\n\ngem \"rails\", \"7.0.0\"\n".to_string();
+        let mut files = BTreeMap::new();
+        files.insert("gems.rb".to_string(), gemfile.clone());
+        files.insert("Gemfile".to_string(), gemfile);
+        files.insert(
+            "gems.locked".to_string(),
+            gem_lock(&format!("  rails (7.0.0) sha256={}", "2".repeat(64))),
+        );
+        let ovr = gem_override("rails", "7.0.0");
+        let first = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        assert!(
+            first.files.contains_key("gems.rb") && first.files.contains_key("gems.locked"),
+            "run 1 lands on the modern pair: files={:?} warnings={:?}",
+            first.files.keys(),
+            first.warnings
+        );
+        for (name, content) in first.files {
+            files.insert(name, content);
+        }
+        let second = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        assert!(
+            !second
+                .warnings
+                .iter()
+                .any(|w| w.code == "redirect_gem_gemfile_spellings_diverge"),
+            "the divergence run 1 itself created must not trap run 2: {:?}",
+            second.warnings
+        );
+        assert!(
+            second.files.is_empty() && second.edits.is_empty(),
+            "same-grant re-run is a no-op: files={:?} edits={:?}",
+            second.files.keys(),
+            second.edits
+        );
+    }
+
+    /// The identical-twins re-run with a ROTATED grant (the token/uuid URL
+    /// segments rotate per request) must still reach the in-place URL
+    /// refresh — with a raw-byte divergence guard, run 1's edit tripped the
+    /// trap and the redirect went permanently stale under the old grant.
+    #[test]
+    fn gems_rb_identical_twins_rerun_refreshes_rotated_grant_url() {
+        fn ov(token: &str) -> DepOverride {
+            let mut o = gem_override("rails", "7.0.0");
+            o.token = token.into();
+            if let Some(r) = o.registry_override.as_mut() {
+                r.index_url = format!("https://patch.test/gem/{token}/uuid/");
+            }
+            o
+        }
+        let gemfile = "source \"https://rubygems.org\"\n\ngem \"rails\", \"7.0.0\"\n".to_string();
+        let mut files = BTreeMap::new();
+        files.insert("gems.rb".to_string(), gemfile.clone());
+        files.insert("Gemfile".to_string(), gemfile);
+        let first = rewrite_registry_redirect(&files, &[ov("tok-one")]);
+        for (name, content) in first.files {
+            files.insert(name, content);
+        }
+        let second = rewrite_registry_redirect(&files, &[ov("tok-two")]);
+        assert!(
+            !second
+                .warnings
+                .iter()
+                .any(|w| w.code == "redirect_gem_gemfile_spellings_diverge"),
+            "run 1's own edit must not read as divergence: {:?}",
+            second.warnings
+        );
+        let out = second
+            .files
+            .get("gems.rb")
+            .expect("rotated grant refreshes gems.rb");
+        assert!(
+            out.contains(
+                "source \"https://patch.test/gem/tok-two/uuid/\" do\n  gem \"rails\", \"7.0.0\"\nend"
+            ),
+            "URL refreshed in place: {out}"
+        );
+        assert!(!out.contains("tok-one"), "old grant token gone: {out}");
+        assert!(
+            second
+                .edits
+                .iter()
+                .any(|e| e.kind == "redirect_gemfile_source_url" && e.path == "gems.rb"),
+            "refresh recorded against gems.rb: {:?}",
+            second.edits
+        );
+    }
+
+    /// Twins where the redirected dep is TRANSITIVE (undeclared): run 1
+    /// appends a source block to gems.rb — a footprint shape the residue
+    /// comparison must also erase, including the final newline the append
+    /// adds to a newline-less file.
+    #[test]
+    fn gems_rb_identical_twins_rerun_after_appended_block_is_no_op() {
+        let gemfile = "source \"https://rubygems.org\"\n\ngem \"rack\", \"3.0.0\"".to_string();
+        let mut files = BTreeMap::new();
+        files.insert("gems.rb".to_string(), gemfile.clone());
+        files.insert("Gemfile".to_string(), gemfile);
+        let ovr = gem_override("rails", "7.0.0");
+        let first = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        assert!(
+            first
+                .files
+                .get("gems.rb")
+                .is_some_and(|gf| gf.contains("source \"https://patch.test/gem/tok/uuid/\" do")),
+            "run 1 appends the block for the undeclared dep: {:?}",
+            first.files
+        );
+        for (name, content) in first.files {
+            files.insert(name, content);
+        }
+        let second = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        assert!(
+            !second
+                .warnings
+                .iter()
+                .any(|w| w.code == "redirect_gem_gemfile_spellings_diverge"),
+            "an appended block is the redirect's own footprint, not divergence: {:?}",
+            second.warnings
+        );
+        assert!(
+            second.files.is_empty() && second.edits.is_empty(),
+            "re-run is a no-op: files={:?} edits={:?}",
+            second.files.keys(),
+            second.edits
+        );
+    }
+
+    /// The block recognizer accepts a CRLF Socket source block (a
+    /// `core.autocrlf` checkout rewrites run 1's LF output), so the residue
+    /// comparison must erase that CRLF spelling too: after the checkout
+    /// rewrites BOTH twins to CRLF, only gems.rb carries the block — if the
+    /// residue regex stays LF-only the block survives into gems.rb's residue
+    /// and every later run (the rotated-grant URL refresh included) is
+    /// trapped behind `redirect_gem_gemfile_spellings_diverge`.
+    #[test]
+    fn gems_rb_crlf_twins_rerun_is_no_op_and_rotated_grant_refreshes() {
+        fn ov(token: &str) -> DepOverride {
+            let mut o = gem_override("rails", "7.0.0");
+            o.token = token.into();
+            if let Some(r) = o.registry_override.as_mut() {
+                r.index_url = format!("https://patch.test/gem/{token}/uuid/");
+            }
+            o
+        }
+        // gems.rb exactly as run 1 wrote it, after a CRLF checkout; the
+        // Gemfile twin got the same CRLF treatment but never had the block.
+        let mut files = BTreeMap::new();
+        files.insert(
+            "gems.rb".to_string(),
+            "source \"https://rubygems.org\"\r\n\r\n\
+             source \"https://patch.test/gem/tok-one/uuid/\" do\r\n  \
+             gem \"rails\", \"7.0.0\"\r\nend\r\n"
+                .to_string(),
+        );
+        files.insert(
+            "Gemfile".to_string(),
+            "source \"https://rubygems.org\"\r\n\r\ngem \"rails\", \"7.0.0\"\r\n".to_string(),
+        );
+
+        // Same grant: recognized in place, a true no-op — not a diverge trap.
+        let same = rewrite_registry_redirect(&files, &[ov("tok-one")]);
+        assert!(
+            !same
+                .warnings
+                .iter()
+                .any(|w| w.code == "redirect_gem_gemfile_spellings_diverge"),
+            "the CRLF block is the redirect's own footprint, not divergence: {:?}",
+            same.warnings
+        );
+        assert!(
+            same.files.is_empty() && same.edits.is_empty(),
+            "same-grant re-run on CRLF twins is a no-op: files={:?} edits={:?}",
+            same.files.keys(),
+            same.edits
+        );
+
+        // Rotated grant: URL refreshed in place inside gems.rb, never nested.
+        let rotated = rewrite_registry_redirect(&files, &[ov("tok-two")]);
+        assert!(
+            !rotated
+                .warnings
+                .iter()
+                .any(|w| w.code == "redirect_gem_gemfile_spellings_diverge"),
+            "rotated grant must reach the refresh, not the diverge trap: {:?}",
+            rotated.warnings
+        );
+        let out = rotated
+            .files
+            .get("gems.rb")
+            .expect("rotated grant refreshes gems.rb on a CRLF checkout");
+        assert_eq!(
+            out.matches("source \"https://patch.test/gem/").count(),
+            1,
+            "exactly one Socket source block, never nested: {out}"
+        );
+        assert!(!out.contains("tok-one"), "old grant token gone: {out}");
+        assert!(
+            out.contains("source \"https://patch.test/gem/tok-two/uuid/\" do\r\n"),
+            "existing CRLF block body left intact: {out}"
+        );
+        assert!(
+            !rotated.files.contains_key("Gemfile"),
+            "bundler reads gems.rb; the Gemfile twin stays untouched: {:?}",
+            rotated.files.keys()
+        );
+    }
+
+    /// A CRLF Gemfile.lock is legal to bundler (`bundle check` and a frozen
+    /// install both accept one — verified on 4.0.15). The CHECKSUMS pin must
+    /// land in place, byte-preserving the `\r\n` endings — before this, the
+    /// `(?m)^…$` matchers never saw the `\r`-terminated lines and the lock
+    /// was misdiagnosed as bundler <2.6 (`redirect_gem_no_checksums_section`).
+    #[test]
+    fn gem_crlf_lock_checksum_pinned_preserving_crlf() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "Gemfile".to_string(),
+            "source \"https://rubygems.org\"\n\ngem \"rails\", \"7.0.0\"\n".to_string(),
+        );
+        files.insert(
+            "Gemfile.lock".to_string(),
+            gem_lock(&format!("  rails (7.0.0) sha256={}", "2".repeat(64))).replace('\n', "\r\n"),
+        );
+        let r = rewrite_registry_redirect(&files, &[gem_override("rails", "7.0.0")]);
+        assert!(
+            !r.warnings
+                .iter()
+                .any(|w| w.code == "redirect_gem_no_checksums_section"),
+            "a CRLF CHECKSUMS section must be recognized: {:?}",
+            r.warnings
+        );
+        let expected =
+            gem_lock(&format!("  rails (7.0.0) sha256={}", "f".repeat(64))).replace('\n', "\r\n");
+        assert_eq!(
+            r.files.get("Gemfile.lock"),
+            Some(&expected),
+            "pin rewritten in place with every \\r\\n preserved"
+        );
+        let edit = r
+            .edits
+            .iter()
+            .find(|e| e.kind == "redirect_gemfile_lock_checksum")
+            .expect("lock checksum edit recorded");
+        assert_eq!(
+            edit.original,
+            Some(Value::String(format!(
+                "rails (7.0.0) sha256={}",
+                "2".repeat(64)
+            ))),
+            "recorded original carries no line-ending bytes"
+        );
+    }
+
+    /// CRLF lock whose CHECKSUMS section has no entry for the gem yet: the
+    /// added pin line must use the file's `\r\n` endings, not introduce a
+    /// lone `\n` into an otherwise-CRLF file.
+    #[test]
+    fn gem_crlf_lock_checksums_header_gains_crlf_entry() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "Gemfile".to_string(),
+            "source \"https://rubygems.org\"\n\ngem \"rails\", \"7.0.0\"\n".to_string(),
+        );
+        files.insert(
+            "Gemfile.lock".to_string(),
+            gem_lock(&format!("  nokogiri (1.16.0) sha256={}", "4".repeat(64)))
+                .replace('\n', "\r\n"),
+        );
+        let r = rewrite_registry_redirect(&files, &[gem_override("rails", "7.0.0")]);
+        let lk = r.files.get("Gemfile.lock").expect("lock rewritten");
+        assert!(
+            lk.contains(&format!(
+                "CHECKSUMS\r\n  rails (7.0.0) sha256={}\r\n",
+                "f".repeat(64)
+            )),
+            "added pin keeps the CRLF endings: {lk:?}"
+        );
+
+        // Re-run on the rewritten pair: recognizing the at-target CRLF line
+        // must be a no-op (the ledger would otherwise grow forever).
+        files.insert("Gemfile.lock".to_string(), lk.clone());
+        files.insert(
+            "Gemfile".to_string(),
+            r.files.get("Gemfile").expect("Gemfile rewritten").clone(),
+        );
+        let second = rewrite_registry_redirect(&files, &[gem_override("rails", "7.0.0")]);
+        assert!(
+            second.files.is_empty() && second.edits.is_empty(),
+            "CRLF re-run must be a no-op: files={:?} edits={:?}",
+            second.files.keys(),
+            second.edits
+        );
+    }
+
     /// An unparseable package-lock.json must surface a warning, not silently
     /// skip the npm redirect entirely (missing-lockfile already warns; a
     /// corrupt lockfile is strictly worse and was silent).
@@ -5265,6 +5830,64 @@ snapshots:
         );
     }
 
+    /// pnpm lockfileVersion 6 embeds resolved peers in the `packages:` key
+    /// itself, so one name@version can appear as BOTH `/pkg@1.0.0:` and
+    /// `/pkg@1.0.0(peer@2.0.0):`. Rewriting only the plain entry is silent
+    /// fail-open: the dep is confirmed and attested while every dependent
+    /// resolving through the peered entry still installs the unpatched
+    /// upstream tarball. The whole dep must be refused with a warning naming
+    /// the unmatched key — nothing rewritten, nothing confirmed.
+    #[test]
+    fn pnpm_v6_mixed_plain_and_peered_is_refused() {
+        let lock = "lockfileVersion: '6.0'
+
+dependencies:
+  left-pad:
+    specifier: 1.3.0
+    version: 1.3.0
+
+packages:
+
+  /left-pad@1.3.0:
+    resolution: {integrity: sha512-UPSTREAM==}
+    dev: false
+
+  /left-pad@1.3.0(react@18.2.0):
+    resolution: {integrity: sha512-UPSTREAM==}
+    peerDependencies:
+      react: '*'
+    dev: false
+";
+        let mut files = BTreeMap::new();
+        files.insert("pnpm-lock.yaml".to_string(), lock.to_string());
+        let url = "http://patch.test/left-pad-1.3.0.tgz";
+        let overrides = vec![npm_override("left-pad", "1.3.0", url, "sha512-PATCHED==")];
+        let r = rewrite_registry_redirect(&files, &overrides);
+        assert!(
+            r.files.is_empty() && r.edits.is_empty(),
+            "a partially-matchable v6 lock must not be rewritten at all: files={:?} edits={:?}",
+            r.files.keys(),
+            r.edits
+        );
+        let warning = r
+            .warnings
+            .iter()
+            .find(|w| w.code == "redirect_pnpm_unsupported_lock_key")
+            .unwrap_or_else(|| panic!("refusal warning expected: {:?}", r.warnings));
+        assert!(
+            warning.detail.contains("/left-pad@1.3.0(react@18.2.0)"),
+            "warning must name the unmatched peered key: {}",
+            warning.detail
+        );
+        assert!(
+            !r.warnings
+                .iter()
+                .any(|w| w.code == "redirect_pnpm_entry_not_found"),
+            "the refusal replaces entry-not-found, not stacks on it: {:?}",
+            r.warnings
+        );
+    }
+
     /// A dist block with no `url` has nothing to redirect: pinning a shasum
     /// onto it would claim a redirect that cannot happen.
     #[test]
@@ -5283,6 +5906,200 @@ snapshots:
             r.files.keys()
         );
         assert_eq!(warning_codes(&r), vec!["redirect_composer_no_dist_url"]);
+    }
+
+    /// A v6 dep resolved ONLY through peer-suffixed keys previously degraded
+    /// to a bare `entry_not_found`; the refusal must instead name the exact
+    /// key the grammar cannot repoint so the operator knows the lock (not the
+    /// dep) is the problem.
+    #[test]
+    fn pnpm_v6_pure_peered_key_is_refused_by_name() {
+        let lock = "lockfileVersion: '6.0'
+
+packages:
+
+  /@socktest/pkg@1.0.0(react@18.2.0):
+    resolution: {integrity: sha512-UPSTREAM==}
+    dev: false
+";
+        let mut files = BTreeMap::new();
+        files.insert("pnpm-lock.yaml".to_string(), lock.to_string());
+        let overrides = vec![npm_override(
+            "@socktest/pkg",
+            "1.0.0",
+            "http://patch.test/socktest-pkg-1.0.0.tgz",
+            "sha512-PATCHED==",
+        )];
+        let r = rewrite_registry_redirect(&files, &overrides);
+        assert!(r.files.is_empty() && r.edits.is_empty());
+        let warning = r
+            .warnings
+            .iter()
+            .find(|w| w.code == "redirect_pnpm_unsupported_lock_key")
+            .unwrap_or_else(|| panic!("refusal warning expected: {:?}", r.warnings));
+        assert!(
+            warning
+                .detail
+                .contains("/@socktest/pkg@1.0.0(react@18.2.0)"),
+            "warning must name the unmatched key: {}",
+            warning.detail
+        );
+        assert!(
+            !r.warnings
+                .iter()
+                .any(|w| w.code == "redirect_pnpm_entry_not_found"),
+            "{:?}",
+            r.warnings
+        );
+    }
+
+    /// pnpm lockfileVersion 5.x keys are path-style (`/name/version:`, peers
+    /// suffixed `_peer@ver`) — the rewrite grammar never matches them, so the
+    /// dep must be refused with the keys named rather than silently reported
+    /// as a missing entry.
+    #[test]
+    fn pnpm_v5_path_style_keys_are_refused_by_name() {
+        let lock = "lockfileVersion: 5.4
+
+specifiers:
+  left-pad: 1.3.0
+
+dependencies:
+  left-pad: 1.3.0
+
+packages:
+
+  /left-pad/1.3.0:
+    resolution: {integrity: sha512-UPSTREAM==}
+    dev: false
+
+  /left-pad/1.3.0_react@18.2.0:
+    resolution: {integrity: sha512-UPSTREAM==}
+    dev: false
+";
+        let mut files = BTreeMap::new();
+        files.insert("pnpm-lock.yaml".to_string(), lock.to_string());
+        let overrides = vec![npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://patch.test/left-pad-1.3.0.tgz",
+            "sha512-PATCHED==",
+        )];
+        let r = rewrite_registry_redirect(&files, &overrides);
+        assert!(r.files.is_empty() && r.edits.is_empty());
+        let warning = r
+            .warnings
+            .iter()
+            .find(|w| w.code == "redirect_pnpm_unsupported_lock_key")
+            .unwrap_or_else(|| panic!("refusal warning expected: {:?}", r.warnings));
+        assert!(
+            warning.detail.contains("/left-pad/1.3.0")
+                && warning.detail.contains("/left-pad/1.3.0_react@18.2.0"),
+            "warning must name both v5 keys: {}",
+            warning.detail
+        );
+        assert!(
+            !r.warnings
+                .iter()
+                .any(|w| w.code == "redirect_pnpm_entry_not_found"),
+            "{:?}",
+            r.warnings
+        );
+    }
+
+    /// When a dep lives in a rewritable v9 lock AND a legacy lock in the same
+    /// set (e.g. a Rush nested lock still on pnpm 7), rewriting just the v9
+    /// lock would confirm the dep while the legacy lock keeps installing
+    /// upstream. The refusal must cover the WHOLE set: no lock rewritten.
+    #[test]
+    fn pnpm_legacy_lock_in_set_refuses_the_dep_everywhere() {
+        let v9_lock = "lockfileVersion: '9.0'
+
+packages:
+
+  left-pad@1.3.0:
+    resolution: {integrity: sha512-UPSTREAM==}
+";
+        let v5_lock = "lockfileVersion: 5.4
+
+packages:
+
+  /left-pad/1.3.0:
+    resolution: {integrity: sha512-UPSTREAM==}
+";
+        let mut files = BTreeMap::new();
+        files.insert("pnpm-lock.yaml".to_string(), v9_lock.to_string());
+        files.insert(
+            "common/config/rush/pnpm-lock.yaml".to_string(),
+            v5_lock.to_string(),
+        );
+        let overrides = vec![npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://patch.test/left-pad-1.3.0.tgz",
+            "sha512-PATCHED==",
+        )];
+        let r = rewrite_registry_redirect(&files, &overrides);
+        assert!(
+            r.files.is_empty() && r.edits.is_empty(),
+            "no lock in the set may be rewritten while a legacy key survives: files={:?}",
+            r.files.keys()
+        );
+        let warning = r
+            .warnings
+            .iter()
+            .find(|w| w.code == "redirect_pnpm_unsupported_lock_key")
+            .unwrap_or_else(|| panic!("refusal warning expected: {:?}", r.warnings));
+        assert!(
+            warning
+                .detail
+                .contains("/left-pad/1.3.0 in common/config/rush/pnpm-lock.yaml"),
+            "warning must name the key AND the lock it lives in: {}",
+            warning.detail
+        );
+    }
+
+    /// A v6 lock whose target dep has ONLY a plain `/name@version:` key (no
+    /// peered sibling anywhere) stays rewritable — the refusal must not
+    /// overreach to every v6 lock.
+    #[test]
+    fn pnpm_v6_plain_key_without_peered_sibling_still_rewrites() {
+        let lock = "lockfileVersion: '6.0'
+
+packages:
+
+  /left-pad@1.3.0:
+    resolution: {integrity: sha512-UPSTREAM==}
+    dev: false
+
+  /other-dep@2.0.0(react@18.2.0):
+    resolution: {integrity: sha512-OTHER==}
+    dev: false
+";
+        let mut files = BTreeMap::new();
+        files.insert("pnpm-lock.yaml".to_string(), lock.to_string());
+        let url = "http://patch.test/left-pad-1.3.0.tgz";
+        let overrides = vec![npm_override("left-pad", "1.3.0", url, "sha512-PATCHED==")];
+        let r = rewrite_registry_redirect(&files, &overrides);
+        let out = r.files.get("pnpm-lock.yaml").unwrap_or_else(|| {
+            panic!(
+                "plain v6 key must still be rewritten; warnings={:?}",
+                r.warnings
+            )
+        });
+        assert!(
+            out.contains(&format!(
+                "  /left-pad@1.3.0:\n    resolution: {{integrity: sha512-PATCHED==, tarball: {url}}}"
+            )),
+            "{out}"
+        );
+        assert!(
+            !r.warnings
+                .iter()
+                .any(|w| w.code.starts_with("redirect_pnpm_")),
+            "an unrelated dep's peered key must not trip the refusal: {:?}",
+            r.warnings
+        );
     }
 
     fn pnpm_v9_lock(name: &str, version: &str) -> String {

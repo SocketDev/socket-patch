@@ -35,6 +35,11 @@ const REDIRECT_CANDIDATE_FILES: &[&str] = &[
     "packages.lock.json",
     "Gemfile",
     "Gemfile.lock",
+    // Bundler's modern manifest spelling — preferred over Gemfile when both
+    // exist (the gem rewriter picks the pair bundler reads and fails closed
+    // on diverging spellings).
+    "gems.rb",
+    "gems.locked",
     "pom.xml",
     // Maven Trusted Checksums files the fail-closed maven rewriter merges into
     // (read so an existing user config / checksum set is preserved, not
