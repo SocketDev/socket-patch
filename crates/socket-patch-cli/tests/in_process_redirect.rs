@@ -1219,11 +1219,12 @@ async fn no_redirectable_patch_leaves_bun_lockb_alone() {
     );
 }
 
-/// A ledger that cannot be written is an ERROR, not a silent success: the
-/// lockfile has already been rewritten, and
+/// An unusable ledger is an ERROR, not a silent success:
 /// `.socket/vendor/redirect-state.json` is the only revert path (and the VEX
-/// record store), so swallowing the write failure would leave the repo
-/// redirected with no way back while reporting success.
+/// record store). A DIRECTORY squatting on the ledger path makes it
+/// unloadable, so the run must fail closed BEFORE rewriting anything — the
+/// old flow rewrote the lockfile first and only then discovered the ledger
+/// could not be persisted, leaving the repo redirected with no way back.
 #[tokio::test]
 #[serial]
 async fn unwritable_ledger_fails_the_run() {
@@ -1234,17 +1235,18 @@ async fn unwritable_ledger_fails_the_run() {
 
     let tmp = tempfile::tempdir().unwrap();
     write_project(tmp.path());
-    // Occupy the ledger path with a DIRECTORY so the ledger write must fail.
+    // Occupy the ledger path with a DIRECTORY so the ledger cannot be loaded
+    // (or written).
     std::fs::create_dir_all(tmp.path().join(".socket/vendor/redirect-state.json")).unwrap();
 
     let code = run(redirect_args(tmp.path(), server.uri())).await;
-    assert_eq!(code, 1, "a failed ledger write must flip the exit code");
-    // The failure is about the ledger, not the rewrite: the lockfile edit
-    // landed before the ledger write was attempted.
+    assert_eq!(code, 1, "an unusable ledger must flip the exit code");
+    // Fail-closed ordering: the ledger problem surfaces before any project
+    // file is touched, so the lockfile still points at the upstream registry.
     let lock = std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap();
     assert!(
-        lock.contains(HOSTED_URL),
-        "the lockfile rewrite precedes the ledger write; got:\n{lock}"
+        !lock.contains(HOSTED_URL),
+        "an unusable ledger must abort before the lockfile rewrite; got:\n{lock}"
     );
 }
 
@@ -2023,62 +2025,67 @@ async fn redirect_json_mode_failures_emit_error_envelope() {
     assert_error_envelope(&out, "reference-resolve failure");
 }
 
-/// The write-failure bail-outs (legs 3-4 of the four `--json` failure
-/// exits) must also emit the machine-readable envelope: a rewritten
-/// lockfile that cannot be written back, and a revert ledger that cannot
-/// be persisted. Both are driven with real filesystem obstructions so the
-/// run reaches the write in question and fails there. (Legs 1-2 — the
-/// discovery-detail and reference-resolve failures — are pinned by
-/// `redirect_json_mode_failures_emit_error_envelope` above.)
+/// Shared by the write-failure envelope tests below: even a run that dies on
+/// a filesystem obstruction must exit 1 with a machine-readable `--json`
+/// error envelope on stdout.
+fn assert_write_failure_envelope(out: &std::process::Output, leg: &str) {
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "{leg}: failure exit; stdout=\n{stdout}\nstderr=\n{stderr}"
+    );
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!(
+            "{leg}: --json stdout must be a parseable envelope even on failure ({e}); \
+             stdout=\n{stdout}"
+        )
+    });
+    assert_eq!(v["status"], "error", "{leg}: status; stdout=\n{stdout}");
+    assert!(
+        v["error"].as_str().is_some_and(|m| !m.is_empty()),
+        "{leg}: envelope must carry the error message; stdout=\n{stdout}"
+    );
+    assert_eq!(
+        v["redirect"]["mode"], "hosted",
+        "{leg}: envelope must identify the mode; stdout=\n{stdout}"
+    );
+}
+
+/// Shared driver for the write-failure legs: a hosted `scan --redirect --json`
+/// subprocess against the obstructed project in `tmp`.
+async fn run_hosted_json_scan(tmp: &std::path::Path, server: &MockServer) -> std::process::Output {
+    scrubbed_cli()
+        .args([
+            "scan",
+            "--redirect",
+            "--yes",
+            "--json",
+            "--cwd",
+            tmp.to_str().unwrap(),
+            "--api-url",
+            &server.uri(),
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+        ])
+        .output()
+        .expect("run socket-patch")
+}
+
+/// Leg 3 of the four `--json` failure exits: the rewritten lockfile cannot
+/// be written back (read-only file; the rewriter read it fine moments
+/// earlier). A real filesystem obstruction drives the run to the write in
+/// question and fails it there. (Legs 1-2 — the discovery-detail and
+/// reference-resolve failures — are pinned by
+/// `redirect_json_mode_failures_emit_error_envelope` above; leg 4 — the
+/// ledger write — is pinned by the unix-only
+/// `redirect_ledger_write_failure_leaves_project_files_untouched` below.)
 #[tokio::test]
 #[serial]
 async fn redirect_json_mode_write_failures_emit_error_envelope() {
-    fn assert_error_envelope(out: &std::process::Output, leg: &str) {
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert_eq!(
-            out.status.code(),
-            Some(1),
-            "{leg}: failure exit; stdout=\n{stdout}\nstderr=\n{stderr}"
-        );
-        let v: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
-            panic!(
-                "{leg}: --json stdout must be a parseable envelope even on failure ({e}); \
-                 stdout=\n{stdout}"
-            )
-        });
-        assert_eq!(v["status"], "error", "{leg}: status; stdout=\n{stdout}");
-        assert!(
-            v["error"].as_str().is_some_and(|m| !m.is_empty()),
-            "{leg}: envelope must carry the error message; stdout=\n{stdout}"
-        );
-        assert_eq!(
-            v["redirect"]["mode"], "hosted",
-            "{leg}: envelope must identify the mode; stdout=\n{stdout}"
-        );
-    }
-    async fn run_leg(tmp: &std::path::Path, server: &MockServer) -> std::process::Output {
-        scrubbed_cli()
-            .args([
-                "scan",
-                "--redirect",
-                "--yes",
-                "--json",
-                "--cwd",
-                tmp.to_str().unwrap(),
-                "--api-url",
-                &server.uri(),
-                "--org",
-                ORG,
-                "--api-token",
-                "fake",
-            ])
-            .output()
-            .expect("run socket-patch")
-    }
-
-    // Leg 3 — the rewritten lockfile cannot be written back (read-only
-    // file; the rewriter read it fine moments earlier).
     let server = MockServer::start().await;
     mock_discovery(&server).await;
     mock_reference(&server).await;
@@ -2089,19 +2096,242 @@ async fn redirect_json_mode_write_failures_emit_error_envelope() {
     let mut perms = std::fs::metadata(&lock).unwrap().permissions();
     perms.set_readonly(true);
     std::fs::set_permissions(&lock, perms).unwrap();
-    let out = run_leg(tmp.path(), &server).await;
-    assert_error_envelope(&out, "lockfile-write failure");
+    let out = run_hosted_json_scan(tmp.path(), &server).await;
+    assert_write_failure_envelope(&out, "lockfile-write failure");
+}
 
-    // Leg 4 — the revert ledger cannot be persisted: a DIRECTORY squats on
-    // `.socket/vendor/redirect-state.json`, so `fs::write` fails after the
-    // lockfile rewrite succeeded.
+/// Leg 4 of the four `--json` failure exits: the revert ledger cannot be
+/// persisted — `.socket/vendor` is read-only, so the atomic writer's stage
+/// file cannot be created. The ledger is written BEFORE the project files
+/// (its recorded originals are the only revert path), so the failure must
+/// also leave the lockfile untouched — not rewritten-but-unrevertable.
+///
+/// unix-only: the obstruction is a read-only DIRECTORY, and Windows ignores
+/// FILE_ATTRIBUTE_READONLY on directories for file creation, so the stage
+/// file would be created fine there (leg 3's read-only FILE does obstruct on
+/// Windows and stays cross-platform).
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn redirect_ledger_write_failure_leaves_project_files_untouched() {
     let server = MockServer::start().await;
     mock_discovery(&server).await;
     mock_reference(&server).await;
     mock_view(&server).await;
     let tmp = tempfile::tempdir().unwrap();
     write_project(tmp.path());
-    std::fs::create_dir_all(tmp.path().join(".socket/vendor/redirect-state.json")).unwrap();
-    let out = run_leg(tmp.path(), &server).await;
-    assert_error_envelope(&out, "ledger-write failure");
+    let lock_before = std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap();
+    let vendor_dir = tmp.path().join(".socket/vendor");
+    std::fs::create_dir_all(&vendor_dir).unwrap();
+    let mut perms = std::fs::metadata(&vendor_dir).unwrap().permissions();
+    perms.set_readonly(true);
+    std::fs::set_permissions(&vendor_dir, perms.clone()).unwrap();
+    let out = run_hosted_json_scan(tmp.path(), &server).await;
+    // Restore writability so the tempdir can be cleaned up.
+    perms.set_readonly(false);
+    std::fs::set_permissions(&vendor_dir, perms).unwrap();
+    assert_write_failure_envelope(&out, "ledger-write failure");
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap(),
+        lock_before,
+        "a failed ledger write must leave the project files untouched \
+         (ledger-before-files ordering)"
+    );
+}
+
+/// A MALFORMED redirect ledger (torn write, truncation, bad hand-edit) must
+/// abort a hosted run before anything is written. The old tolerant load
+/// returned `None` for it, so `run_redirect` started a FRESH ledger and
+/// overwrote the corrupt file — permanently destroying every previously
+/// recorded pre-redirect original (the only revert path) with exit 0.
+#[tokio::test]
+#[serial]
+async fn corrupt_ledger_fails_closed_and_preserves_the_bytes() {
+    const TORN: &[u8] = b"{ \"version\": 1, \"mode\": \"hosted\", \"edits\": [ { \"path\": \"packa";
+
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_project(tmp.path());
+    let lock_before = std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap();
+    let vendor_dir = tmp.path().join(".socket/vendor");
+    std::fs::create_dir_all(&vendor_dir).unwrap();
+    std::fs::write(vendor_dir.join("redirect-state.json"), TORN).unwrap();
+
+    let out = scrubbed_cli()
+        .args([
+            "scan",
+            "--redirect",
+            "--yes",
+            "--json",
+            "--cwd",
+            tmp.path().to_str().unwrap(),
+            "--api-url",
+            &server.uri(),
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+        ])
+        .output()
+        .expect("run socket-patch");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a corrupt ledger must be a hard error, not a silent fresh start; \
+         stdout=\n{stdout}"
+    );
+    let v: serde_json::Value =
+        serde_json::from_str(&stdout).expect("--json stdout must stay parseable on failure");
+    assert_eq!(v["status"], "error");
+    let message = v["error"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("redirect-state.json"),
+        "error must name the ledger file: {message}"
+    );
+    assert!(
+        message.contains("redirect-state.json.corrupt"),
+        "error must point at the moved-aside file: {message}"
+    );
+
+    // Nothing was rewritten, and the corrupt bytes survived verbatim in the
+    // quarantine file — never overwritten by a fresh ledger.
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap(),
+        lock_before,
+        "the project must be untouched"
+    );
+    assert_eq!(
+        std::fs::read(vendor_dir.join("redirect-state.json.corrupt")).unwrap(),
+        TORN,
+        "the corrupt ledger bytes must be preserved for recovery"
+    );
+    assert!(
+        !vendor_dir.join("redirect-state.json").exists(),
+        "no fresh ledger may be written over the failure"
+    );
+}
+
+/// `--dry-run` over a corrupt ledger reports the same hard error but moves
+/// nothing: a dry run must not mutate the project, quarantine included.
+#[tokio::test]
+#[serial]
+async fn corrupt_ledger_dry_run_errors_without_moving_the_file() {
+    const TORN: &[u8] = b"{ not json";
+
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_project(tmp.path());
+    let vendor_dir = tmp.path().join(".socket/vendor");
+    std::fs::create_dir_all(&vendor_dir).unwrap();
+    std::fs::write(vendor_dir.join("redirect-state.json"), TORN).unwrap();
+
+    let out = scrubbed_cli()
+        .args([
+            "scan",
+            "--redirect",
+            "--yes",
+            "--json",
+            "--dry-run",
+            "--cwd",
+            tmp.path().to_str().unwrap(),
+            "--api-url",
+            &server.uri(),
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+        ])
+        .output()
+        .expect("run socket-patch");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "dry-run must report the corruption a real run would refuse on; \
+         stdout=\n{stdout}"
+    );
+    assert_eq!(
+        std::fs::read(vendor_dir.join("redirect-state.json")).unwrap(),
+        TORN,
+        "dry-run must not move or rewrite the malformed ledger"
+    );
+    assert!(
+        !vendor_dir.join("redirect-state.json.corrupt").exists(),
+        "dry-run must not quarantine"
+    );
+}
+
+/// D2 regression: hosted mode records patches ONLY in the redirect ledger —
+/// it never writes `.socket/manifest.json` — so `updates[]` (the documented
+/// read-only CI signal) must consult the ledger too. A pure hosted project
+/// whose redirected patch has been superseded used to report `updates: []`
+/// forever.
+#[tokio::test]
+#[serial]
+async fn scan_updates_reports_superseding_patch_for_ledger_only_project() {
+    const OLD_UUID: &str = "99999999-9999-4999-8999-999999999999";
+
+    let server = MockServer::start().await;
+    // Discovery offers ONLY the new uuid; the ledger records the old one.
+    mock_discovery(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_project(tmp.path());
+    // Ledger-only persistence, exactly as a previous hosted run left it.
+    let mut ledger = socket_patch_core::patch::redirect::RedirectState::new();
+    ledger.records.insert(
+        PURL.to_string(),
+        PatchRecord {
+            uuid: OLD_UUID.to_string(),
+            exported_at: "2024-01-01T00:00:00Z".to_string(),
+            files: HashMap::new(),
+            vulnerabilities: HashMap::new(),
+            description: String::new(),
+            license: "MIT".to_string(),
+            tier: "free".to_string(),
+        },
+    );
+    let vendor_dir = tmp.path().join(".socket/vendor");
+    std::fs::create_dir_all(&vendor_dir).unwrap();
+    std::fs::write(
+        vendor_dir.join("redirect-state.json"),
+        format!("{}\n", serde_json::to_string_pretty(&ledger).unwrap()),
+    )
+    .unwrap();
+
+    // Plain read-only `scan --json` — the nightly CI shape from the finding.
+    let out = scrubbed_cli()
+        .args([
+            "scan",
+            "--json",
+            "--cwd",
+            tmp.path().to_str().unwrap(),
+            "--api-url",
+            &server.uri(),
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+        ])
+        .output()
+        .expect("run socket-patch");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "stdout=\n{stdout}");
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("parseable envelope");
+    let updates = v["updates"].as_array().expect("updates array");
+    assert_eq!(
+        updates.len(),
+        1,
+        "the ledger-recorded patch was superseded — updates[] must say so; \
+         stdout=\n{stdout}"
+    );
+    assert_eq!(updates[0]["purl"], PURL);
+    assert_eq!(updates[0]["oldUuid"], OLD_UUID);
+    assert_eq!(updates[0]["newUuid"], UUID);
 }

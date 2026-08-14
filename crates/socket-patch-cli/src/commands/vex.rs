@@ -505,7 +505,12 @@ pub(crate) async fn generate_vex_from_manifest_path(
     // redirect ledgers' embedded copies must still attest.
     let manifest =
         augment_with_detached(common, manifest_file.unwrap_or_else(PatchManifest::new)).await;
-    let (manifest, redirected) = augment_with_redirect(common, manifest).await;
+    let (manifest, redirected) = match augment_with_redirect(common, manifest).await {
+        Ok(augmented) => augmented,
+        Err(corrupt) => {
+            return Err(fail(common, "redirect_ledger_corrupt", corrupt.to_string()).await);
+        }
+    };
     if manifest.patches.is_empty() {
         if !had_manifest_file {
             return Err(fail(
@@ -551,22 +556,25 @@ async fn augment_with_detached(common: &GlobalArgs, mut manifest: PatchManifest)
 /// `(redirected)`). Redirected patches have no `.socket/manifest.json` record
 /// by design — the lockfile rewrite + this ledger IS the persistence — so,
 /// like detached vendored patches, they must still be attestable. An existing
-/// manifest entry wins a collision (that PURL is manifest-owned). A missing or
-/// unreadable ledger leaves the manifest unchanged and returns no redirected
-/// PURLs.
+/// manifest entry wins a collision (that PURL is manifest-owned). A missing
+/// ledger leaves the manifest unchanged and returns no redirected PURLs; a
+/// MALFORMED ledger is a hard error — attesting with its records silently
+/// dropped would produce a false document.
 async fn augment_with_redirect(
     common: &GlobalArgs,
     mut manifest: PatchManifest,
-) -> (PatchManifest, Vec<String>) {
+) -> Result<(PatchManifest, Vec<String>), socket_patch_core::patch::redirect::CorruptRedirectState>
+{
     let mut redirected = Vec::new();
-    if let Some(state) = socket_patch_core::patch::redirect::load_redirect_state(&common.cwd).await
+    if let Some(state) =
+        socket_patch_core::patch::redirect::load_redirect_state(&common.cwd).await?
     {
         for (purl, record) in state.records {
             redirected.push(purl.clone());
             manifest.patches.entry(purl).or_insert(record);
         }
     }
-    (manifest, redirected)
+    Ok((manifest, redirected))
 }
 
 /// Fire `vex_failed` telemetry and build the matching [`VexGenError`].
