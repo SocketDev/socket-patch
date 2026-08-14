@@ -1698,6 +1698,61 @@ fn gem_tail_source_option(tail: &str) -> Option<&'static str> {
     .find(|tok| code.contains(tok))
 }
 
+/// A dep's Socket index URL as a regex source with the per-request rotating
+/// segments (grant token, patch uuid) wildcarded — an exact-URL pattern
+/// misses the URL a previous run wrote under an older grant.
+fn gem_index_url_pattern(dep: &DepOverride, index_url: &str) -> String {
+    let mut url_pat = regex::escape(index_url);
+    for rotating in [&dep.token, &dep.patch_uuid] {
+        if !rotating.is_empty() {
+            url_pat = url_pat.replace(&regex::escape(&format!("/{rotating}/")), "/[^/\"]+/");
+        }
+    }
+    url_pat
+}
+
+/// A gemfile spelling with the redirect's own footprint erased: every managed
+/// Socket `source "…" do … end` block for a redirected dep (rotating grant
+/// segments wildcarded) and the dep's own `gem` declaration line. The
+/// gems.rb/Gemfile divergence guard compares these residues rather than raw
+/// bytes: run 1 on byte-identical twins edits only gems.rb (the file bundler
+/// reads), so a raw comparison would trap every later run — the rotated-grant
+/// URL refresh included — behind `redirect_gem_gemfile_spellings_diverge`, a
+/// divergence the rewriter itself created. Trailing whitespace is trimmed (a
+/// block appended to a newline-less file adds a final newline the other
+/// spelling never had). `\r?` mirrors the block recognizer in `rewrite_gem`:
+/// a `core.autocrlf` checkout rewrites run 1's LF block to CRLF, and a block
+/// the recognizer accepts must also be erased here or the re-run is trapped
+/// behind the divergence warning before it can reach the recognizer.
+fn gem_spelling_residue(content: &str, deps: &[&DepOverride]) -> String {
+    let mut residue = content.to_string();
+    for dep in deps {
+        let Some(ov) = &dep.registry_override else {
+            continue;
+        };
+        if ov.kind != "rubygems-compact-index" {
+            continue;
+        }
+        let block_re = Regex::new(
+            &(String::from(r#"(?m)^source ""#)
+                + &gem_index_url_pattern(dep, &ov.index_url)
+                + r#"" do\r?\n  gem ["']"#
+                + &regex::escape(&dep.name)
+                + r#"["'][^\n]*\nend\r?\n?"#),
+        )
+        .unwrap();
+        residue = block_re.replace_all(&residue, "").into_owned();
+        let decl_re = Regex::new(
+            &(String::from(r#"(?m)^[ \t]*gem\b[^\n]*["']"#)
+                + &regex::escape(&dep.name)
+                + r#"["'][^\n]*\n?"#),
+        )
+        .unwrap();
+        residue = decl_re.replace_all(&residue, "").into_owned();
+    }
+    residue.trim_end().to_string()
+}
+
 fn rewrite_gem(
     files: &BTreeMap<String, String>,
     overrides: &[DepOverride],
@@ -1715,9 +1770,17 @@ fn rewrite_gem(
     // order as `setup::gem::discover_bundler_project`). DIVERGING spellings
     // are ambiguous — the redirect would land in the file bundler reads while
     // tooling pinned to the other keeps resolving upstream — so fail closed
-    // on the whole gem set. Identical spellings follow bundler: edit gems.rb.
+    // on the whole gem set. Divergence is judged on the redirect-footprint
+    // residue (`gem_spelling_residue`), NOT raw bytes: run 1 on identical
+    // twins edits only gems.rb (following bundler), so a raw comparison would
+    // trap every later run behind the divergence the rewriter itself created.
+    // Identical spellings follow bundler: edit gems.rb.
     let modern = files.contains_key("gems.rb");
-    if modern && files.get("Gemfile").is_some_and(|c| files["gems.rb"] != *c) {
+    if modern
+        && files.get("Gemfile").is_some_and(|c| {
+            gem_spelling_residue(&files["gems.rb"], &gem) != gem_spelling_residue(c, &gem)
+        })
+    {
         result.warnings.push(RewriteWarning {
             code: "redirect_gem_gemfile_spellings_diverge".into(),
             detail: "both gems.rb and Gemfile are present with different contents; bundler \
@@ -1805,13 +1868,7 @@ fn rewrite_gem(
             // run would wrap the gem line inside it — nesting source blocks.
             // Wildcard the rotating segments instead (mirrors the CHECKSUMS
             // at-target guard below).
-            let mut url_pat = regex::escape(&ov.index_url);
-            for rotating in [&dep.token, &dep.patch_uuid] {
-                if !rotating.is_empty() {
-                    url_pat =
-                        url_pat.replace(&regex::escape(&format!("/{rotating}/")), "/[^/\"]+/");
-                }
-            }
+            let url_pat = gem_index_url_pattern(dep, &ov.index_url);
             // `\r?\n`: the rewriter emits LF, but a `core.autocrlf` checkout
             // rewrites the working tree to CRLF — the guard must still
             // recognize the block there, or the indented `gem` line inside
@@ -4272,19 +4329,22 @@ mod tests {
         );
     }
 
-    /// Both spellings present and DIVERGING: editing either is a guess (the
-    /// redirect could land in the file bundler ignores, or tooling pinned to
-    /// the classic name keeps resolving upstream). Fail closed with a warning.
+    /// Both spellings present and DIVERGING outside the redirect's own
+    /// footprint (an unrelated gem only one file declares): editing either is
+    /// a guess (the redirect could land in the file bundler ignores, or
+    /// tooling pinned to the classic name keeps resolving upstream). Fail
+    /// closed with a warning.
     #[test]
     fn gems_rb_and_gemfile_diverging_fail_closed() {
         let mut files = BTreeMap::new();
         files.insert(
             "gems.rb".to_string(),
-            "source \"https://rubygems.org\"\n\ngem \"rails\", \"7.0.0\"\n".to_string(),
+            "source \"https://rubygems.org\"\n\ngem \"rails\", \"7.0.0\"\ngem \"puma\", \"6.0.0\"\n"
+                .to_string(),
         );
         files.insert(
             "Gemfile".to_string(),
-            "source \"https://rubygems.org\"\n\ngem \"rails\", \"6.1.0\"\n".to_string(),
+            "source \"https://rubygems.org\"\n\ngem \"rails\", \"7.0.0\"\n".to_string(),
         );
         let r = rewrite_registry_redirect(&files, &[gem_override("rails", "7.0.0")]);
         assert!(
@@ -4299,6 +4359,253 @@ mod tests {
                 .any(|w| w.code == "redirect_gem_gemfile_spellings_diverge"),
             "fail-closed skip must warn: {:?}",
             r.warnings
+        );
+    }
+
+    /// Divergence confined to the redirected dep's OWN declaration line is
+    /// tolerated: the rewriter canonicalizes that line into the managed block
+    /// either way, and bundler reads gems.rb regardless (verified on 4.0.15,
+    /// which warns it is ignoring the Gemfile). Only divergence outside the
+    /// redirect's footprint is ambiguous enough to fail closed on.
+    #[test]
+    fn gems_rb_divergence_only_in_redirected_dep_line_proceeds() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "gems.rb".to_string(),
+            "source \"https://rubygems.org\"\n\ngem \"rails\", \"7.0.0\"\n".to_string(),
+        );
+        files.insert(
+            "Gemfile".to_string(),
+            "source \"https://rubygems.org\"\n\ngem \"rails\", \"6.1.0\"\n".to_string(),
+        );
+        let r = rewrite_registry_redirect(&files, &[gem_override("rails", "7.0.0")]);
+        assert!(
+            !r.warnings
+                .iter()
+                .any(|w| w.code == "redirect_gem_gemfile_spellings_diverge"),
+            "the redirected dep's own line is not ambient divergence: {:?}",
+            r.warnings
+        );
+        assert!(
+            r.files.contains_key("gems.rb") && !r.files.contains_key("Gemfile"),
+            "redirect proceeds on the file bundler reads: {:?}",
+            r.files.keys()
+        );
+    }
+
+    /// Run 1 on byte-identical twins edits only gems.rb (bundler's file),
+    /// which makes the pair diverge on raw bytes. The divergence guard judges
+    /// the redirect-footprint residue instead: feeding run 1's output back
+    /// must be a plain no-op re-run, not a
+    /// `redirect_gem_gemfile_spellings_diverge` trap that blocks every later
+    /// run against the state run 1 itself created.
+    #[test]
+    fn gems_rb_identical_twins_rerun_is_a_no_op_not_a_diverge_trap() {
+        let gemfile = "source \"https://rubygems.org\"\n\ngem \"rails\", \"7.0.0\"\n".to_string();
+        let mut files = BTreeMap::new();
+        files.insert("gems.rb".to_string(), gemfile.clone());
+        files.insert("Gemfile".to_string(), gemfile);
+        files.insert(
+            "gems.locked".to_string(),
+            gem_lock(&format!("  rails (7.0.0) sha256={}", "2".repeat(64))),
+        );
+        let ovr = gem_override("rails", "7.0.0");
+        let first = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        assert!(
+            first.files.contains_key("gems.rb") && first.files.contains_key("gems.locked"),
+            "run 1 lands on the modern pair: files={:?} warnings={:?}",
+            first.files.keys(),
+            first.warnings
+        );
+        for (name, content) in first.files {
+            files.insert(name, content);
+        }
+        let second = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        assert!(
+            !second
+                .warnings
+                .iter()
+                .any(|w| w.code == "redirect_gem_gemfile_spellings_diverge"),
+            "the divergence run 1 itself created must not trap run 2: {:?}",
+            second.warnings
+        );
+        assert!(
+            second.files.is_empty() && second.edits.is_empty(),
+            "same-grant re-run is a no-op: files={:?} edits={:?}",
+            second.files.keys(),
+            second.edits
+        );
+    }
+
+    /// The identical-twins re-run with a ROTATED grant (the token/uuid URL
+    /// segments rotate per request) must still reach the in-place URL
+    /// refresh — with a raw-byte divergence guard, run 1's edit tripped the
+    /// trap and the redirect went permanently stale under the old grant.
+    #[test]
+    fn gems_rb_identical_twins_rerun_refreshes_rotated_grant_url() {
+        fn ov(token: &str) -> DepOverride {
+            let mut o = gem_override("rails", "7.0.0");
+            o.token = token.into();
+            if let Some(r) = o.registry_override.as_mut() {
+                r.index_url = format!("https://patch.test/gem/{token}/uuid/");
+            }
+            o
+        }
+        let gemfile = "source \"https://rubygems.org\"\n\ngem \"rails\", \"7.0.0\"\n".to_string();
+        let mut files = BTreeMap::new();
+        files.insert("gems.rb".to_string(), gemfile.clone());
+        files.insert("Gemfile".to_string(), gemfile);
+        let first = rewrite_registry_redirect(&files, &[ov("tok-one")]);
+        for (name, content) in first.files {
+            files.insert(name, content);
+        }
+        let second = rewrite_registry_redirect(&files, &[ov("tok-two")]);
+        assert!(
+            !second
+                .warnings
+                .iter()
+                .any(|w| w.code == "redirect_gem_gemfile_spellings_diverge"),
+            "run 1's own edit must not read as divergence: {:?}",
+            second.warnings
+        );
+        let out = second
+            .files
+            .get("gems.rb")
+            .expect("rotated grant refreshes gems.rb");
+        assert!(
+            out.contains(
+                "source \"https://patch.test/gem/tok-two/uuid/\" do\n  gem \"rails\", \"7.0.0\"\nend"
+            ),
+            "URL refreshed in place: {out}"
+        );
+        assert!(!out.contains("tok-one"), "old grant token gone: {out}");
+        assert!(
+            second
+                .edits
+                .iter()
+                .any(|e| e.kind == "redirect_gemfile_source_url" && e.path == "gems.rb"),
+            "refresh recorded against gems.rb: {:?}",
+            second.edits
+        );
+    }
+
+    /// Twins where the redirected dep is TRANSITIVE (undeclared): run 1
+    /// appends a source block to gems.rb — a footprint shape the residue
+    /// comparison must also erase, including the final newline the append
+    /// adds to a newline-less file.
+    #[test]
+    fn gems_rb_identical_twins_rerun_after_appended_block_is_no_op() {
+        let gemfile = "source \"https://rubygems.org\"\n\ngem \"rack\", \"3.0.0\"".to_string();
+        let mut files = BTreeMap::new();
+        files.insert("gems.rb".to_string(), gemfile.clone());
+        files.insert("Gemfile".to_string(), gemfile);
+        let ovr = gem_override("rails", "7.0.0");
+        let first = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        assert!(
+            first
+                .files
+                .get("gems.rb")
+                .is_some_and(|gf| gf.contains("source \"https://patch.test/gem/tok/uuid/\" do")),
+            "run 1 appends the block for the undeclared dep: {:?}",
+            first.files
+        );
+        for (name, content) in first.files {
+            files.insert(name, content);
+        }
+        let second = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        assert!(
+            !second
+                .warnings
+                .iter()
+                .any(|w| w.code == "redirect_gem_gemfile_spellings_diverge"),
+            "an appended block is the redirect's own footprint, not divergence: {:?}",
+            second.warnings
+        );
+        assert!(
+            second.files.is_empty() && second.edits.is_empty(),
+            "re-run is a no-op: files={:?} edits={:?}",
+            second.files.keys(),
+            second.edits
+        );
+    }
+
+    /// The block recognizer accepts a CRLF Socket source block (a
+    /// `core.autocrlf` checkout rewrites run 1's LF output), so the residue
+    /// comparison must erase that CRLF spelling too: after the checkout
+    /// rewrites BOTH twins to CRLF, only gems.rb carries the block — if the
+    /// residue regex stays LF-only the block survives into gems.rb's residue
+    /// and every later run (the rotated-grant URL refresh included) is
+    /// trapped behind `redirect_gem_gemfile_spellings_diverge`.
+    #[test]
+    fn gems_rb_crlf_twins_rerun_is_no_op_and_rotated_grant_refreshes() {
+        fn ov(token: &str) -> DepOverride {
+            let mut o = gem_override("rails", "7.0.0");
+            o.token = token.into();
+            if let Some(r) = o.registry_override.as_mut() {
+                r.index_url = format!("https://patch.test/gem/{token}/uuid/");
+            }
+            o
+        }
+        // gems.rb exactly as run 1 wrote it, after a CRLF checkout; the
+        // Gemfile twin got the same CRLF treatment but never had the block.
+        let mut files = BTreeMap::new();
+        files.insert(
+            "gems.rb".to_string(),
+            "source \"https://rubygems.org\"\r\n\r\n\
+             source \"https://patch.test/gem/tok-one/uuid/\" do\r\n  \
+             gem \"rails\", \"7.0.0\"\r\nend\r\n"
+                .to_string(),
+        );
+        files.insert(
+            "Gemfile".to_string(),
+            "source \"https://rubygems.org\"\r\n\r\ngem \"rails\", \"7.0.0\"\r\n".to_string(),
+        );
+
+        // Same grant: recognized in place, a true no-op — not a diverge trap.
+        let same = rewrite_registry_redirect(&files, &[ov("tok-one")]);
+        assert!(
+            !same
+                .warnings
+                .iter()
+                .any(|w| w.code == "redirect_gem_gemfile_spellings_diverge"),
+            "the CRLF block is the redirect's own footprint, not divergence: {:?}",
+            same.warnings
+        );
+        assert!(
+            same.files.is_empty() && same.edits.is_empty(),
+            "same-grant re-run on CRLF twins is a no-op: files={:?} edits={:?}",
+            same.files.keys(),
+            same.edits
+        );
+
+        // Rotated grant: URL refreshed in place inside gems.rb, never nested.
+        let rotated = rewrite_registry_redirect(&files, &[ov("tok-two")]);
+        assert!(
+            !rotated
+                .warnings
+                .iter()
+                .any(|w| w.code == "redirect_gem_gemfile_spellings_diverge"),
+            "rotated grant must reach the refresh, not the diverge trap: {:?}",
+            rotated.warnings
+        );
+        let out = rotated
+            .files
+            .get("gems.rb")
+            .expect("rotated grant refreshes gems.rb on a CRLF checkout");
+        assert_eq!(
+            out.matches("source \"https://patch.test/gem/").count(),
+            1,
+            "exactly one Socket source block, never nested: {out}"
+        );
+        assert!(!out.contains("tok-one"), "old grant token gone: {out}");
+        assert!(
+            out.contains("source \"https://patch.test/gem/tok-two/uuid/\" do\r\n"),
+            "existing CRLF block body left intact: {out}"
+        );
+        assert!(
+            !rotated.files.contains_key("Gemfile"),
+            "bundler reads gems.rb; the Gemfile twin stays untouched: {:?}",
+            rotated.files.keys()
         );
     }
 
