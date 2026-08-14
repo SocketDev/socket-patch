@@ -877,6 +877,13 @@ fn plan_cargo_toml(
                     pending.push(Pending::Refuse(
                         "declared as a path/git dependency".to_string(),
                     ));
+                } else if has("registry-index") {
+                    // Inserting `registry = …` next to `registry-index` makes
+                    // cargo reject the manifest as ambiguous — refuse, like
+                    // the inline-table branch does.
+                    pending.push(Pending::Refuse(
+                        "pinned to another registry".to_string(),
+                    ));
                 } else if let Some((line_idx, value)) = find_value("registry") {
                     if value == reg {
                         pending.push(Pending::Action(CargoTomlAction::Already));
@@ -4405,6 +4412,34 @@ mod tests {
         let files = cargo_files(
             "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
              [dependencies]\nserde = { version = \"1.0.190\", registry = \"corp\" }\n",
+        );
+        let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+        assert!(
+            r.files.is_empty(),
+            "nothing may be written: {:?}",
+            r.files.keys()
+        );
+        assert!(
+            r.warnings
+                .iter()
+                .any(|w| w.code == "redirect_cargo_toml_dep_unrewritable"),
+            "{:?}",
+            r.warnings
+        );
+        assert!(r.confirmed_cargo_uuids.is_empty());
+    }
+
+    /// A table-form block that carries `registry-index` cannot take a
+    /// `registry` pin — cargo rejects a dependency naming both keys as
+    /// ambiguous, so inserting the pin bricks every cargo command. Refuse
+    /// the whole dep (zero writes, no confirmation), like the inline-table
+    /// branch already does.
+    #[test]
+    fn cargo_table_form_registry_index_refuses_whole_dep() {
+        let files = cargo_files(
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+             [dependencies.serde]\nversion = \"1.0.190\"\n\
+             registry-index = \"sparse+https://index.crates.io/\"\n",
         );
         let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
         assert!(
