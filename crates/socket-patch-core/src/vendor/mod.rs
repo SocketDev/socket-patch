@@ -76,7 +76,7 @@ pub(crate) mod service_fetch;
 mod toml_surgery;
 pub(crate) mod verify;
 pub(crate) mod yarn_berry_lock;
-mod yarn_classic_lock;
+pub(crate) mod yarn_classic_lock;
 #[cfg(test)]
 mod yarn_layering_tests;
 

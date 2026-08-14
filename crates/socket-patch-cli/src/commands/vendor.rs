@@ -549,14 +549,21 @@ pub(crate) async fn persist_vendor_entry(
         // carry it forward by wiring identity, or a
         // later `--revert` can only shrug
         // (`vendor_lock_entry_drifted`) instead of
-        // restoring the registry fragment.
+        // restoring the registry fragment. Identity is
+        // uuid-agnostic (`wiring_key_matches`): berry's
+        // lock key embeds the vendored path, so the
+        // uuid change that CAUSED the re-vendor changes
+        // the key too.
         for rec in &mut entry.wiring {
             if rec.action == vendor::state::WiringAction::Rewritten && rec.original.is_none() {
-                if let Some(prev_rec) = prev
-                    .wiring
-                    .iter()
-                    .find(|p| p.file == rec.file && p.kind == rec.kind && p.key == rec.key)
-                {
+                if let Some(prev_rec) = prev.wiring.iter().find(|p| {
+                    p.file == rec.file
+                        && p.kind == rec.kind
+                        && match (p.key.as_deref(), rec.key.as_deref()) {
+                            (Some(a), Some(b)) => vendor::path::wiring_key_matches(a, b),
+                            (a, b) => a == b,
+                        }
+                }) {
                     rec.original = prev_rec.original.clone();
                 }
             }
@@ -909,9 +916,16 @@ pub(crate) async fn vendor_records(
     // The hosted redirect ledger, for cross-mode takeovers: vendoring a purl
     // it still claims must revert the hosted edits FIRST (see the hook in the
     // dispatch loop below). Loaded once; mutated + persisted per reverted
-    // purl.
-    let mut redirect_ledger =
-        socket_patch_core::patch::redirect::load_redirect_state(&common.cwd).await;
+    // purl. A MALFORMED ledger is held as the hard error it is: this loop
+    // WRITES the ledger for cargo takeovers, and with its records unreadable
+    // a claimed purl is indistinguishable from an unclaimed one — so every
+    // cargo purl fails closed with the corruption surfaced (non-cargo purls
+    // never touch the redirect ledger here and proceed).
+    let (mut redirect_ledger, redirect_ledger_corrupt) =
+        match socket_patch_core::patch::redirect::load_redirect_state(&common.cwd).await {
+            Ok(state) => (state, None),
+            Err(corrupt) => (None, Some(corrupt)),
+        };
 
     for (purl, pkg_path) in &all_packages {
         let is_variant_eco =
@@ -974,6 +988,22 @@ pub(crate) async fn vendor_records(
             // the backend's own fail-closed guard (`hosted_redirect_live`)
             // backstops states with no usable ledger at all.
             if candidate.starts_with("pkg:cargo/") {
+                if let Some(corrupt) = &redirect_ledger_corrupt {
+                    has_errors = true;
+                    env.record(
+                        PatchEvent::new(PatchAction::Failed, candidate.clone()).with_error(
+                            "redirect_ledger_corrupt",
+                            format!(
+                                "cannot vendor over a possibly-live hosted redirect: \
+                                 {corrupt}"
+                            ),
+                        ),
+                    );
+                    if !common.silent && !common.json {
+                        eprintln!("Cannot vendor {}: {corrupt}", normalize_purl(candidate));
+                    }
+                    continue;
+                }
                 let canon = |p: &str| normalize_purl(strip_purl_qualifiers(p)).into_owned();
                 let claimed = redirect_ledger
                     .as_ref()

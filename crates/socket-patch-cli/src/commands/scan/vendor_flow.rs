@@ -202,7 +202,9 @@ async fn run_scan_vendor_step(
 }
 
 /// The `scan --vendor` JSON path: discovery → (dry-run preview | download
-/// → GC → vendor engine) → embedded VEX → print `result` → exit code.
+/// → GC → vendor engine → embedded VEX) → print `result` → exit code.
+/// The dry-run arm skips the VEX embed (emitting a `vex.skipped` marker
+/// instead): a dry run vendors nothing, so there is no state to attest.
 ///
 /// Extracted from `run` (and called through `Box::pin`) so its sizeable
 /// temporaries get their own poll frame, entered only when `--vendor` is
@@ -258,10 +260,17 @@ async fn run_vendor_json_path(
             )
             .await;
         }
-        let final_code =
-            embed_vex_into_json(&args.common, &args.vex, manifest_path, 0, result).await;
+        // Embedded VEX is skipped on a dry run (apply.rs's precedent):
+        // nothing was vendored, so there is no just-vendored state to
+        // attest — generating here would verify the deliberately untouched
+        // tree (failing outright on a not-yet-vendored project) and write
+        // an attestation file during --dry-run. The marker keeps the
+        // request visible to JSON consumers instead of silently dropping it.
+        if args.vex.vex.is_some() {
+            result["vex"] = serde_json::json!({ "skipped": true, "reason": "dry_run" });
+        }
         println!("{}", serde_json::to_string_pretty(&result).unwrap());
-        return final_code;
+        return 0;
     }
 
     // 1) Download phase. Manifest mode reuses the `--apply`
