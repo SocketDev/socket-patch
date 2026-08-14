@@ -113,6 +113,55 @@ pub fn parse_vendor_path(s: &str) -> Option<VendorPathParts> {
     })
 }
 
+/// Do two wiring-record keys name the same lockfile fragment across a patch
+/// update? Byte-equal keys always match. Keys that embed a
+/// `.socket/vendor/<eco>/<uuid>/` path (yarn berry's `file:` locator lock
+/// key) additionally match when they are equal with every uuid level
+/// normalized away — updating a patch changes the uuid, which changes the
+/// embedded path, but the record still names the same lock entry. The
+/// re-vendor carry-forward relies on this to keep the pre-vendor `original`
+/// across patch updates; keys without a recognizable vendored path only ever
+/// match byte-equal.
+pub fn wiring_key_matches(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    match (normalize_vendor_uuids(a), normalize_vendor_uuids(b)) {
+        (Some(na), Some(nb)) => na == nb,
+        _ => false,
+    }
+}
+
+/// Replace every embedded `.socket/vendor/<eco>/<uuid>` uuid level with `*`;
+/// `None` when the string embeds no recognizable vendored path.
+fn normalize_vendor_uuids(s: &str) -> Option<String> {
+    let anchor = format!("{VENDOR_DIR}/");
+    let mut out = String::new();
+    let mut rest = s;
+    let mut replaced = false;
+    while let Some(idx) = rest.find(&anchor) {
+        let head_end = idx + anchor.len();
+        out.push_str(&rest[..head_end]);
+        rest = &rest[head_end..];
+        let Some((eco, tail)) = rest.split_once('/') else {
+            break;
+        };
+        if !ECOSYSTEM_DIRS.contains(&eco) {
+            continue;
+        }
+        let uuid_end = tail.find('/').unwrap_or(tail.len());
+        if !is_canonical_uuid(&tail[..uuid_end]) {
+            continue;
+        }
+        out.push_str(eco);
+        out.push_str("/*");
+        rest = &tail[uuid_end..];
+        replaced = true;
+    }
+    out.push_str(rest);
+    replaced.then_some(out)
+}
+
 /// Split a `<name>-<version>` leaf at the version boundary: the version is
 /// the suffix after the LAST `-` that is immediately followed by a digit
 /// (versions always start with a digit; names may contain digit-bearing
@@ -446,6 +495,42 @@ mod tests {
         assert!(parse_vendor_path(".socket/vendor/npm/not-a-uuid/x.tgz").is_none());
         assert!(parse_vendor_path(&format!(".socket/vendor/jsr/{UUID}/x")).is_none());
         assert!(parse_vendor_path(&format!("x.socket/vendor/npm/{UUID}/y.tgz")).is_none());
+    }
+
+    /// The re-vendor carry-forward matches wiring keys ACROSS a patch-uuid
+    /// change when the key embeds the vendored path (berry's `file:` locator
+    /// key), and only byte-equal otherwise.
+    #[test]
+    fn wiring_key_matching_is_uuid_agnostic_for_vendored_paths() {
+        const UUID2: &str = "0a1b2c3d-4e5f-6a7b-8c9d-0e1f2a3b4c5d";
+        let berry_key = |uuid: &str| {
+            format!(
+                "\"left-pad@file:./.socket/vendor/npm/{uuid}/left-pad-1.3.0.tgz\
+                 ::locator=vendor-spike%40workspace%3A.\""
+            )
+        };
+        // Same key always matches; uuid-only difference matches too.
+        assert!(wiring_key_matches(&berry_key(UUID), &berry_key(UUID)));
+        assert!(wiring_key_matches(&berry_key(UUID), &berry_key(UUID2)));
+        // A different package leaf (other name/version) never matches.
+        assert!(!wiring_key_matches(
+            &berry_key(UUID),
+            &format!(
+                "\"is-odd@file:./.socket/vendor/npm/{UUID2}/is-odd-1.0.0.tgz\
+                 ::locator=vendor-spike%40workspace%3A.\""
+            )
+        ));
+        // Keys with no vendored path only match byte-equal (classic block
+        // keys, npm lock paths, bare names).
+        assert!(wiring_key_matches("left-pad@^1.3.0", "left-pad@^1.3.0"));
+        assert!(!wiring_key_matches("left-pad@^1.3.0", "left-pad@~1.3.0"));
+        // A vendored-path key never matches a non-vendored one.
+        assert!(!wiring_key_matches(&berry_key(UUID), "left-pad@^1.3.0"));
+        // Non-canonical uuid levels are not normalized (fail-closed).
+        assert!(!wiring_key_matches(
+            ".socket/vendor/npm/not-a-uuid/x.tgz",
+            &format!(".socket/vendor/npm/{UUID}/x.tgz")
+        ));
     }
 
     #[test]

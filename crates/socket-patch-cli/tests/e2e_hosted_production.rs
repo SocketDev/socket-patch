@@ -558,6 +558,82 @@ async fn published_patch_dates(purl: &str) -> Result<Vec<(String, String)>, Stri
         .unwrap_or_default())
 }
 
+/// `GET /patch/view/<uuid>` against the real proxy — the same route the
+/// CLI's free-proxy client fetches patch content from. Returns, per file the
+/// patch touches, the `(path, beforeHash, afterHash)` triple (hashes are
+/// git-blob sha256, `None` for pure additions/deletions respectively).
+async fn published_patch_files(
+    uuid: &str,
+) -> Result<Vec<(String, Option<String>, Option<String>)>, String> {
+    let url = format!("{PROXY}/patch/view/{uuid}");
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .header("Accept", "application/json")
+        .send()
+        .await
+        .map_err(|e| format!("GET {url}: {e}"))?;
+    let status = resp.status();
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| format!("GET {url}: reading body: {e}"))?;
+    if !status.is_success() {
+        return Err(format!("GET {url}: HTTP {status}\n{body}"));
+    }
+    let v: serde_json::Value =
+        serde_json::from_str(&body).map_err(|e| format!("GET {url}: bad JSON ({e}):\n{body}"))?;
+    Ok(v["files"]
+        .as_object()
+        .map(|m| {
+            m.iter()
+                .map(|(path, f)| {
+                    (
+                        path.clone(),
+                        f["beforeHash"].as_str().map(str::to_string),
+                        f["afterHash"].as_str().map(str::to_string),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+/// The `sha256=` hex value the lock's CHECKSUMS section pins for
+/// `<name> (<version>)`, or `None` when the entry is absent. Bundler >= 2.6
+/// writes one two-space-indented `  name (version) sha256=<hex>` line per
+/// resolved gem.
+fn gem_lock_checksum(lock: &str, name: &str, version: &str) -> Option<String> {
+    let prefix = format!("  {name} ({version}) sha256=");
+    lock.lines()
+        .find_map(|l| l.strip_prefix(&prefix).map(|h| h.trim().to_string()))
+}
+
+/// Locate the bundler-installed `gems/<name>-<version>` directory under a
+/// `BUNDLE_PATH` root. The `ruby/<x.y.z>` segment in between varies by host
+/// interpreter, so walk for it (depth-bounded — the layout is only a few
+/// levels deep) instead of hardcoding the version.
+fn installed_gem_dir(root: &Path, dir_name: &str, depth: usize) -> Option<PathBuf> {
+    for entry in std::fs::read_dir(root).ok()?.flatten() {
+        let p = entry.path();
+        if !p.is_dir() {
+            continue;
+        }
+        if p.file_name().is_some_and(|n| n == dir_name)
+            && p.parent()
+                .and_then(|d| d.file_name())
+                .is_some_and(|n| n == "gems")
+        {
+            return Some(p);
+        }
+        if depth > 0 {
+            if let Some(found) = installed_gem_dir(&p, dir_name, depth - 1) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
 /// The Socket patch-registry base URL the gem rewriter pinned into `Gemfile`
 /// as `source "<base>" do`, or `None` when no Socket source block is present.
 ///
@@ -1621,6 +1697,19 @@ async fn gem_bundler_hosted_redirect_and_known_install_defect() {
              CHECKSUMS section)"
         );
     }
+    // Capture the UPSTREAM checksum pin before any redirect. Bundler installs
+    // whatever matches this pin, so the redirect must replace it with the
+    // patched artifact's digest — the assertion after the redirect below is
+    // what makes an inert rewrite (URL repointed, upstream digest kept, so
+    // bundler verify-and-installs the UNPATCHED gem) go red instead of green.
+    let pristine_lock = read(&proj.join("Gemfile.lock"));
+    let upstream_sha =
+        gem_lock_checksum(&pristine_lock, GEM_NAME, GEM_VERSION).unwrap_or_else(|| {
+            panic!(
+                "{LEG}: `bundle lock --add-checksums` wrote no sha256 CHECKSUMS \
+                 entry for {GEM_NAME} ({GEM_VERSION}):\n{pristine_lock}"
+            )
+        });
     let install = tool(&proj, "bundle", &["install", "--quiet"], &env);
     if !ok(&install) {
         soft_skip!(LEG, "upstream `bundle install` failed:\n{}", dump(&install));
@@ -1642,6 +1731,19 @@ async fn gem_bundler_hosted_redirect_and_known_install_defect() {
         lock.contains("CHECKSUMS"),
         "{LEG}: Gemfile.lock lost its CHECKSUMS section:\n{lock}"
     );
+    let redirected_sha = gem_lock_checksum(&lock, GEM_NAME, GEM_VERSION).unwrap_or_else(|| {
+        panic!(
+            "{LEG}: redirected Gemfile.lock carries no sha256 CHECKSUMS entry \
+             for {GEM_NAME} ({GEM_VERSION}):\n{lock}"
+        )
+    });
+    assert_ne!(
+        redirected_sha, upstream_sha,
+        "{LEG}: the redirect left {GEM_NAME}'s CHECKSUMS pin at the UPSTREAM \
+         sha256 — bundler would verify and install the unpatched artifact, so \
+         the hosted patch is inert (the same blindspot that let an inert npm \
+         patch stay green).\nGemfile.lock:\n{lock}"
+    );
 
     // Known-broken leg: reinstall from the redirected Gemfile.
     std::fs::remove_dir_all(&bundle_path).ok();
@@ -1657,6 +1759,73 @@ async fn gem_bundler_hosted_redirect_and_known_install_defect() {
              SUCCEEDS. The gem patch-registry compact-index dependency defect \
              appears to be FIXED — delete the tolerance branch in this test and \
              assert unconditionally."
+        );
+        // Exit 0 proves only that bundler fetched an artifact matching the
+        // CHECKSUMS pin. Close the loop on CONTENT: fetch the patch's file
+        // manifest from the proxy and assert every file it rewrites landed
+        // on disk byte-exact (afterHash is the git-blob sha256 the patch
+        // service publishes — the same digest the CLI's apply verifies).
+        let patch_files = published_patch_files(GEM_UUID).await.unwrap_or_else(|e| {
+            panic!(
+                "{LEG}: `bundle install` from the redirected Gemfile succeeded \
+                 but the patch file manifest could not be fetched to verify \
+                 the installed content: {e}"
+            )
+        });
+        let gem_dir = installed_gem_dir(
+            Path::new(&bundle_path),
+            &format!("{GEM_NAME}-{GEM_VERSION}"),
+            4,
+        )
+        .unwrap_or_else(|| {
+            panic!(
+                "{LEG}: `bundle install` succeeded but no \
+                 gems/{GEM_NAME}-{GEM_VERSION} directory exists under \
+                 {bundle_path}"
+            )
+        });
+        use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
+        let mut verified = 0usize;
+        let mut rewritten = 0usize;
+        for (path, before, after) in &patch_files {
+            // No afterHash = the patch deletes the file; nothing to hash.
+            let Some(after) = after else { continue };
+            let rel = path.strip_prefix("package/").unwrap_or(path.as_str());
+            let installed = gem_dir.join(rel);
+            let bytes = std::fs::read(&installed).unwrap_or_else(|e| {
+                panic!(
+                    "{LEG}: patch {GEM_UUID} rewrites `{path}` but the \
+                     installed gem has no readable {}: {e}",
+                    installed.display()
+                )
+            });
+            assert_eq!(
+                compute_git_sha256_from_bytes(&bytes),
+                *after,
+                "{LEG}: installed {} does not hash to the patch's afterHash — \
+                 bundler fetched an artifact whose content is NOT the \
+                 published patch",
+                installed.display()
+            );
+            verified += 1;
+            if before.as_deref() != Some(after.as_str()) {
+                rewritten += 1;
+            }
+        }
+        assert!(
+            verified >= 1,
+            "{LEG}: patch {GEM_UUID} names no files with an afterHash, so \
+             nothing was content-verified — the install success is vacuous"
+        );
+        assert!(
+            rewritten >= 1,
+            "{LEG}: every file in patch {GEM_UUID} has afterHash == \
+             beforeHash — the published patch is inert and this install \
+             proved nothing"
+        );
+        println!(
+            "{LEG}: verified {verified} patched file(s) on disk against the \
+             published afterHash ({rewritten} differ from upstream)"
         );
         return;
     }
