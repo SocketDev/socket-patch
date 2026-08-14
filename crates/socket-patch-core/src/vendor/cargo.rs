@@ -80,31 +80,68 @@ async fn wiring_in_sync(project_root: &Path, name: &str, version: &str, copy_rel
     )
 }
 
-/// The staging sibling for a copy dir: `<uuid>/<name>-<version>.socket-stage`.
-/// Rebuilds are materialised here and swapped into place only on success, so
-/// a failure can never destroy a pre-existing (possibly live-wired) copy.
-/// Same directory as the copy → the swap is a real rename, never a cross-
-/// device copy. The `.socket-stage` suffix can never collide with a copy dir:
+/// A swap sibling for a copy dir: `<uuid>/<name>-<version><suffix>`. Same
+/// directory as the copy → every swap step is a real rename, never a
+/// cross-device copy. The suffixes can never collide with a copy dir:
 /// `<version>` is a validated single segment and cargo versions never end in
-/// `.socket-stage`.
-fn stage_dir_for(copy_dir: &Path) -> std::path::PathBuf {
+/// `.socket-stage` / `.socket-old`.
+fn swap_sibling_for(copy_dir: &Path, suffix: &str) -> std::path::PathBuf {
     let name = copy_dir
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "copy".to_string());
     match copy_dir.parent() {
-        Some(parent) => parent.join(format!("{name}.socket-stage")),
-        None => copy_dir.join(".socket-stage"),
+        Some(parent) => parent.join(format!("{name}{suffix}")),
+        None => copy_dir.join(suffix),
     }
 }
 
-/// Swap a fully-built stage into place: remove the old copy (if any), then
-/// rename the stage over it. The rename is same-directory and only happens
-/// after the stage passed every check, so the destroy-then-replace window is
-/// as small as the filesystem allows.
+/// The staging sibling for a copy dir: `<uuid>/<name>-<version>.socket-stage`.
+/// Rebuilds are materialised here and swapped into place only on success, so
+/// a failure can never destroy a pre-existing (possibly live-wired) copy.
+fn stage_dir_for(copy_dir: &Path) -> std::path::PathBuf {
+    swap_sibling_for(copy_dir, ".socket-stage")
+}
+
+/// The backup sibling the old copy is parked at mid-swap:
+/// `<uuid>/<name>-<version>.socket-old`.
+fn backup_dir_for(copy_dir: &Path) -> std::path::PathBuf {
+    swap_sibling_for(copy_dir, ".socket-old")
+}
+
+/// Swap a fully-built stage into place without a destructive window: park the
+/// old copy (if any) at `<copy>.socket-old` with a same-dir rename, rename the
+/// stage over the now-vacant copy path, and only then delete the backup. Every
+/// step is a single atomic rename — unlike a remove-then-rename swap (where a
+/// partial `remove_dir_all`, realistic under Windows file locks, strands a
+/// half-deleted copy) no step can leave less recoverable state than it started
+/// with. If the stage rename fails the backup is renamed straight back; should
+/// even that restore fail (an external process racing the uuid dir), the old
+/// copy still exists intact at `<copy>.socket-old` instead of being destroyed.
 async fn swap_stage_into_place(stage: &Path, copy_dir: &Path) -> std::io::Result<()> {
-    remove_tree(copy_dir).await?;
-    tokio::fs::rename(stage, copy_dir).await
+    let backup = backup_dir_for(copy_dir);
+    // A stale backup (crash mid-swap on an earlier run) would make the
+    // park rename fail; `remove_tree` is a no-op when it is absent.
+    remove_tree(&backup).await?;
+    let had_old = match tokio::fs::rename(copy_dir, &backup).await {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => return Err(e),
+    };
+    match tokio::fs::rename(stage, copy_dir).await {
+        Ok(()) => {
+            if had_old {
+                let _ = remove_tree(&backup).await;
+            }
+            Ok(())
+        }
+        Err(e) => {
+            if had_old {
+                let _ = tokio::fs::rename(&backup, copy_dir).await;
+            }
+            Err(e)
+        }
+    }
 }
 
 /// Best-effort removal of an EMPTY `<uuid>/` dir plus the empty
@@ -1314,13 +1351,88 @@ mod tests {
             lock1,
             "lock untouched"
         );
-        // And the failed rebuild's stage never leaks into the uuid dir.
+        // And the failed rebuild's swap siblings never leak into the uuid dir.
         let uuid_dir = root.join(format!(".socket/vendor/cargo/{UUID}"));
         let mut rd = tokio::fs::read_dir(&uuid_dir).await.unwrap();
         while let Some(e) = rd.next_entry().await.unwrap() {
             let n = e.file_name().to_string_lossy().into_owned();
             assert!(!n.contains("socket-stage"), "stage litter: {n}");
+            assert!(!n.contains("socket-old"), "backup litter: {n}");
         }
+    }
+
+    /// REVIEW must-fix (B1 follow-up): the swap itself must never leave less
+    /// recoverable state than it started with. Force the stage rename to fail
+    /// (stage absent — the same io::Error surface as a Windows file lock)
+    /// with a live copy in place: the old copy must be restored
+    /// byte-identical, with no backup parked beside it.
+    #[tokio::test]
+    async fn test_swap_failure_restores_previous_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let copy = dir.path().join("cfg-if-1.0.4");
+        tokio::fs::create_dir_all(copy.join("src")).await.unwrap();
+        tokio::fs::write(copy.join("src/lib.rs"), b"live\n")
+            .await
+            .unwrap();
+
+        let stage = stage_dir_for(&copy);
+        assert!(
+            swap_stage_into_place(&stage, &copy).await.is_err(),
+            "swapping a missing stage must fail"
+        );
+        assert_eq!(
+            tokio::fs::read(copy.join("src/lib.rs")).await.unwrap(),
+            b"live\n",
+            "the previous copy must be restored after a failed swap"
+        );
+        assert!(!backup_dir_for(&copy).exists(), "no parked backup litter");
+    }
+
+    /// A successful swap replaces the old copy with the stage and leaves
+    /// neither a stage nor a parked backup behind — including when a stale
+    /// backup from an earlier interrupted swap is already parked there.
+    #[tokio::test]
+    async fn test_swap_success_replaces_copy_without_litter() {
+        let dir = tempfile::tempdir().unwrap();
+        let copy = dir.path().join("cfg-if-1.0.4");
+        tokio::fs::create_dir_all(copy.join("src")).await.unwrap();
+        tokio::fs::write(copy.join("src/lib.rs"), b"old\n")
+            .await
+            .unwrap();
+        let stage = stage_dir_for(&copy);
+        tokio::fs::create_dir_all(stage.join("src")).await.unwrap();
+        tokio::fs::write(stage.join("src/lib.rs"), b"new\n")
+            .await
+            .unwrap();
+        let stale_backup = backup_dir_for(&copy);
+        tokio::fs::create_dir_all(&stale_backup).await.unwrap();
+        tokio::fs::write(stale_backup.join("husk.rs"), b"stale\n")
+            .await
+            .unwrap();
+
+        swap_stage_into_place(&stage, &copy).await.unwrap();
+        assert_eq!(
+            tokio::fs::read(copy.join("src/lib.rs")).await.unwrap(),
+            b"new\n"
+        );
+        assert!(!stage.exists(), "stage consumed by the swap");
+        assert!(!stale_backup.exists(), "backup removed after the swap");
+    }
+
+    /// First-time swap: no pre-existing copy to park. The stage still lands
+    /// at the copy path.
+    #[tokio::test]
+    async fn test_swap_into_vacant_copy_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let copy = dir.path().join("cfg-if-1.0.4");
+        let stage = stage_dir_for(&copy);
+        tokio::fs::create_dir_all(&stage).await.unwrap();
+        tokio::fs::write(stage.join("lib.rs"), b"new\n").await.unwrap();
+
+        swap_stage_into_place(&stage, &copy).await.unwrap();
+        assert_eq!(tokio::fs::read(copy.join("lib.rs")).await.unwrap(), b"new\n");
+        assert!(!backup_dir_for(&copy).exists());
+        assert!(!stage.exists());
     }
 
     /// AUDIT B1 (same destroy class, fresh path): when the pre-existing
