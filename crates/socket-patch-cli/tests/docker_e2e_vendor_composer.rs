@@ -84,8 +84,15 @@ cat > composer.json <<'EOF'
 EOF
 
 # 1. REAL fixture: composer update resolves + installs psr/log from packagist.
-composer update --no-interaction > /tmp/install.log 2>&1 || {
-  cat /tmp/install.log >&2; fail "composer update (fixture install) failed"; }
+# psr/log arrives over the real network (packagist metadata + the GitHub
+# zipball); transient stream/connection errors are the dominant flake in this
+# suite — retry with backoff before declaring the fixture broken.
+for attempt in 1 2 3; do
+  composer update --no-interaction > /tmp/install.log 2>&1 && break
+  if [ "$attempt" = 3 ]; then cat /tmp/install.log >&2; fail "composer update (fixture install) failed"; fi
+  echo "composer update attempt $attempt failed; retrying" >&2
+  sleep $((attempt * 5))
+done
 
 PSR_VER=$(php -r '
   $l = json_decode(file_get_contents("composer.lock"), true);

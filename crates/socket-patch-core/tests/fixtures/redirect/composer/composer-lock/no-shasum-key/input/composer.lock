@@ -9,9 +9,8 @@
             "version": "2.0.0",
             "dist": {
                 "type": "zip",
-                "url": "https://api.github.com/repos/Seldaek/monolog/zipball/abc123",
-                "reference": "abc123def456",
-                "shasum": ""
+                "url": "https://example.test/vcs/monolog/monolog/zipball/abc123",
+                "reference": "abc123def456"
             }
         },
         {

@@ -306,7 +306,23 @@ EOF
       ;;
     go)
       printf 'module sm-proj\n\ngo 1.21\n' > go.mod ;;
-    mvn|composer|dotnet) : ;;
+    composer)
+      # `setup` wires its hook into composer.json's script events, so the
+      # manifest must exist BEFORE setup runs — without it setup reports
+      # `no_files`, the hook is never written, and `composer require` below
+      # can't re-apply the patch. The dependency is left to `composer require`
+      # (same division of labour as npm/yarn/bun above). 4-space indent is
+      # what composer itself writes, so a reformat by setup would show up as
+      # a diff here too.
+      cat > composer.json <<EOF
+{
+    "name": "socket/sm-proj",
+    "description": "setup-matrix fixture",
+    "require": {}
+}
+EOF
+      ;;
+    mvn|dotnet) : ;;
   esac
 }
 

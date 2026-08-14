@@ -11,15 +11,17 @@
 //!
 //! `composer.json` is JSON, so — like the npm `package_json` backend — edits go
 //! through `serde_json` (with the workspace's `preserve_order` feature, so the
-//! user's key order survives) and are written back with
-//! `to_string_pretty(..) + "\n"`. The contract mirrors the other backends:
-//! idempotent, `dry_run`-aware, `Updated`/`AlreadyConfigured`/`Error`, and a
-//! `--remove` that strips exactly what `setup` added.
+//! user's key order survives) and are written back in the file's own
+//! formatting (see [`serialize_like_input`]). The contract mirrors the other
+//! backends: idempotent, `dry_run`-aware, `Updated`/`AlreadyConfigured`/
+//! `Error`, and a `--remove` that strips exactly what `setup` added.
 
 use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
 use tokio::fs;
+
+use crate::vendor::common::{detect_indent, serialize_json};
 
 /// The command `setup` appends to each composer script event. The socket-patch
 /// CLI is invoked from `PATH` (composer has no `npx`-style fetch), offline (the
@@ -113,6 +115,29 @@ fn parse_checked(content: &str) -> Result<Value, String> {
     Ok(doc)
 }
 
+/// Re-serialize the edited document in the formatting the file already used.
+///
+/// Composer writes `composer.json` through PHP's `JSON_PRETTY_PRINT`, which
+/// indents with 4 spaces, while serde's `to_string_pretty` is hard-wired to 2 —
+/// so re-serializing turned a two-key edit into a whole-file diff and left
+/// `--remove` unable to restore the original bytes. `detect_indent` /
+/// `serialize_json` are the same helpers the vendor backends use when they
+/// rewrite composer.json and the lockfiles. A file saved without a trailing
+/// newline keeps that too, since `serialize_json` always appends one.
+fn serialize_like_input(doc: &Value, original: &str) -> String {
+    let indent = detect_indent(original);
+    let mut text = match serialize_json(doc, &indent) {
+        // Always valid UTF-8: serde_json emits escaped ASCII/UTF-8 only.
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        // Serializing a `Value` cannot fail; fall back to the 2-space form.
+        Err(_) => serde_json::to_string_pretty(doc).unwrap_or_default() + "\n",
+    };
+    if !original.ends_with('\n') {
+        text.pop();
+    }
+    text
+}
+
 /// Append [`APPLY_COMMAND`] to both hook events, normalising each to an array.
 /// `None` if already present in every event (idempotent no-op).
 fn composer_add(content: &str) -> Result<Option<String>, String> {
@@ -141,7 +166,7 @@ fn composer_add(content: &str) -> Result<Option<String>, String> {
         }
         return Ok(None);
     }
-    Ok(Some(serde_json::to_string_pretty(&doc).unwrap() + "\n"))
+    Ok(Some(serialize_like_input(&doc, content)))
 }
 
 /// Strip [`APPLY_COMMAND`] from both hook events, pruning emptied events and an
@@ -167,7 +192,7 @@ fn composer_remove(content: &str) -> Result<Option<String>, String> {
         // would teleport the last root key into this slot.
         root.shift_remove("scripts");
     }
-    Ok(Some(serde_json::to_string_pretty(&doc).unwrap() + "\n"))
+    Ok(Some(serialize_like_input(&doc, content)))
 }
 
 /// Add [`APPLY_COMMAND`] to one event, normalising string → array. Returns
@@ -257,12 +282,17 @@ async fn edit(
             None => Ok(false),
             Some(new) => {
                 if !dry_run {
-                    // The crate-wide atomic writer (stage+fsync+rename): the
-                    // user's committed composer.json must never be left torn
-                    // by a crash mid-write.
-                    crate::utils::fs::atomic_write_bytes(composer_json, new.as_bytes())
-                        .await
-                        .map_err(|e| e.to_string())?;
+                    // Atomic (stage+fsync+rename), so the user's committed
+                    // composer.json is never left torn by a crash mid-write,
+                    // and mode-preserving, because the rename swaps in a fresh
+                    // inode that would otherwise take umask defaults — the
+                    // same writer every sibling manifest editor uses.
+                    crate::utils::fs::atomic_write_bytes_preserving_mode(
+                        composer_json,
+                        new.as_bytes(),
+                    )
+                    .await
+                    .map_err(|e| e.to_string())?;
                 }
                 Ok(true)
             }
@@ -380,6 +410,70 @@ mod tests {
         let added = composer_add(BASIC).unwrap().unwrap();
         let removed = composer_remove(&added).unwrap().unwrap();
         assert_eq!(removed, BASIC, "add→remove restores the original bytes");
+    }
+
+    /// Composer writes `composer.json` with PHP's `JSON_PRETTY_PRINT`, i.e.
+    /// 4-space indent — the shape virtually every real-world manifest has.
+    const COMPOSER_AUTHORED: &str =
+        "{\n    \"name\": \"acme/app\",\n    \"require\": {\n        \"php\": \">=8.1\"\n    }\n}\n";
+
+    #[test]
+    fn test_add_preserves_composer_four_space_indent() {
+        // Regression: re-serializing at serde's fixed 2-space indent reformatted
+        // a composer-authored manifest top to bottom, turning a one-key edit
+        // into a whole-file diff.
+        let out = composer_add(COMPOSER_AUTHORED).unwrap().unwrap();
+        assert!(
+            out.contains("\n    \"name\": \"acme/app\","),
+            "depth-1 indent not preserved:\n{out}"
+        );
+        assert!(
+            out.contains("\n        \"php\": \">=8.1\""),
+            "depth-2 indent not preserved:\n{out}"
+        );
+        assert!(
+            out.contains("\n    \"scripts\": {"),
+            "our own added key must use the file's indent:\n{out}"
+        );
+        assert!(is_hook_present(&out));
+    }
+
+    #[test]
+    fn test_round_trip_restores_composer_authored_manifest() {
+        // The whole point of preserving the indent: `--remove` must give the
+        // user back the exact bytes composer wrote, not a reformatted file.
+        let added = composer_add(COMPOSER_AUTHORED).unwrap().unwrap();
+        let removed = composer_remove(&added).unwrap().unwrap();
+        assert_eq!(
+            removed, COMPOSER_AUTHORED,
+            "add→remove must restore composer's own formatting"
+        );
+    }
+
+    #[test]
+    fn test_round_trip_preserves_tab_indent() {
+        let inp =
+            "{\n\t\"name\": \"acme/app\",\n\t\"require\": {\n\t\t\"php\": \">=8.1\"\n\t}\n}\n";
+        let added = composer_add(inp).unwrap().unwrap();
+        assert!(
+            added.contains("\n\t\"scripts\": {"),
+            "tab indent not preserved:\n{added}"
+        );
+        assert_eq!(composer_remove(&added).unwrap().unwrap(), inp);
+    }
+
+    #[test]
+    fn test_round_trip_preserves_absent_trailing_newline() {
+        // `serialize_json` always appends a trailing newline, so a manifest
+        // saved without one would gain a phantom last-line diff that `--remove`
+        // could never take back.
+        let inp = COMPOSER_AUTHORED.trim_end_matches('\n');
+        let added = composer_add(inp).unwrap().unwrap();
+        assert!(
+            !added.ends_with('\n'),
+            "must not add a trailing newline the file did not have:\n{added:?}"
+        );
+        assert_eq!(composer_remove(&added).unwrap().unwrap(), inp);
     }
 
     #[test]
@@ -606,11 +700,6 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    #[ignore = "RED: `edit()` uses the plain `atomic_write_bytes`, so the stage \
-                inode is created with umask defaults and the rename resets the \
-                user's composer.json mode (0o744 -> 0o644). Every sibling manifest \
-                editor uses `atomic_write_bytes_preserving_mode`; switching this \
-                call over is the one-line fix, which was not part of this change."]
     async fn test_edit_preserves_manifest_permissions() {
         use std::os::unix::fs::PermissionsExt;
         // Regression: `composer.json` is a file the *user* owns and we merely

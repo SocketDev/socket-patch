@@ -496,7 +496,14 @@ pub(super) async fn run_redirect(
             }
             let encoded = socket_patch_core::utils::uri::encode_uri_component(artifact_url);
             final_texts.iter().any(|text| {
-                text.contains(artifact_url.as_str())
+                // The rewriters' own predicate — raw, or the `\/`-escaped
+                // slashes an old composer.lock spells them with — so a
+                // writer's spelling can never be one this probe misses. It
+                // was: the composer rewriter emitted `\/`-escaped urls this
+                // probe never looked for, so a fully successful composer
+                // redirect reported `redirected: 0`, fetched no patch record
+                // into the ledger, and left the patch unattestable by `vex`.
+                socket_patch_core::patch::redirect::artifact_url_present(text, artifact_url)
                     // The berry rewriter writes the URL percent-encoded into the
                     // lock's `::__archiveUrl=` binding, so the raw form is absent.
                     || text.contains(encoded.as_str())

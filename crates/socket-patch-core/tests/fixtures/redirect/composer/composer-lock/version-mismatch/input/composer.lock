@@ -1,0 +1,19 @@
+{
+    "_readme": [
+        "This file locks the dependencies of your project to a known state"
+    ],
+    "content-hash": "abc123def456abc123def456abc1",
+    "packages": [
+        {
+            "name": "monolog/monolog",
+            "version": "1.9.0",
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/Seldaek/monolog/zipball/999999",
+                "reference": "999999aaaaaa",
+                "shasum": ""
+            }
+        }
+    ],
+    "packages-dev": []
+}
