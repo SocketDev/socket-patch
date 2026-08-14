@@ -236,6 +236,31 @@ pub(super) async fn run_redirect(
         }
     }
 
+    // Load the existing redirect ledger BEFORE any file is written — bun
+    // migration included. The ledger is the only store of the pre-redirect
+    // originals a future revert needs, so a malformed (torn/hand-mangled)
+    // ledger must abort the run while the project is still untouched: the old
+    // tolerant load treated it as "no ledger" and the merge below would have
+    // started fresh, silently overwriting that revert data. The malformed
+    // file is moved aside to redirect-state.json.corrupt (never clobbered)
+    // so recovery stays possible; a dry-run reports the same hard error but
+    // moves nothing.
+    let existing_ledger =
+        match socket_patch_core::patch::redirect::load_redirect_state(&args.common.cwd).await {
+            Ok(state) => state,
+            Err(mut corrupt) => {
+                if !args.common.dry_run {
+                    corrupt.quarantine().await;
+                }
+                let message = corrupt.to_string();
+                eprintln!("{message}");
+                if args.common.json {
+                    emit_json_error(scan_result.take(), &message);
+                }
+                return 1;
+            }
+        };
+
     // bun.lockb auto-migration: the redirect rewriter only edits the TEXT
     // lockfile, so a project locked to a binary `bun.lockb` must be re-locked
     // to `bun.lock` first. `bun install --save-text-lockfile --frozen-lockfile
@@ -462,20 +487,6 @@ pub(super) async fn run_redirect(
     }
 
     if !args.common.dry_run {
-        for (rel, content) in &rewrite.files {
-            let path = args.common.cwd.join(rel);
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            if let Err(e) = std::fs::write(&path, content) {
-                let message = format!("failed to write {rel}: {e}");
-                eprintln!("{message}");
-                if args.common.json {
-                    emit_json_error(scan_result.take(), &message);
-                }
-                return 1;
-            }
-        }
         // Ledger (mirrors the vendor state.json shape): recorded edits for a
         // future revert + the patch records (file hashes + vulnerabilities) so
         // a post-install `socket-patch vex` can attest the redirected patches.
@@ -484,13 +495,15 @@ pub(super) async fn run_redirect(
         // hosted patch), and clobbering the file would lose the original
         // pre-redirect values a future revert needs. New edits APPEND (revert
         // walks them in reverse); records are keyed by PURL, newest wins.
+        //
+        // Persisted BEFORE the project files, and atomically (stage + fsync +
+        // rename, like the sibling vendor ledger): a crash between the two
+        // then leaves a complete ledger whose recorded originals simply match
+        // files that were never rewritten — instead of rewritten files whose
+        // pre-redirect originals never reached any ledger (a healing re-run
+        // records no edits for already-redirected entries).
         if !rewrite.edits.is_empty() || !records.is_empty() || !migration_edits.is_empty() {
-            let vendor_dir = args.common.cwd.join(".socket").join("vendor");
-            let _ = std::fs::create_dir_all(&vendor_dir);
-            let mut ledger =
-                socket_patch_core::patch::redirect::load_redirect_state(&args.common.cwd)
-                    .await
-                    .unwrap_or_else(RedirectState::new);
+            let mut ledger = existing_ledger.unwrap_or_else(RedirectState::new);
             // Ledgers written before the mode-string rename carry
             // `"mode": "redirect"`; normalize on rewrite so the on-disk
             // ledger converges on the documented "hosted" name (the
@@ -504,11 +517,25 @@ pub(super) async fn run_redirect(
             // The ledger is the only revert path and the VEX record store —
             // a swallowed write failure would leave the rewritten lockfiles
             // unrevertable while reporting success.
-            if let Err(e) = std::fs::write(
-                vendor_dir.join("redirect-state.json"),
-                format!("{}\n", serde_json::to_string_pretty(&ledger).unwrap()),
-            ) {
+            if let Err(e) =
+                socket_patch_core::patch::redirect::save_redirect_state(&args.common.cwd, &ledger)
+                    .await
+            {
                 let message = format!("failed to write .socket/vendor/redirect-state.json: {e}");
+                eprintln!("{message}");
+                if args.common.json {
+                    emit_json_error(scan_result.take(), &message);
+                }
+                return 1;
+            }
+        }
+        for (rel, content) in &rewrite.files {
+            let path = args.common.cwd.join(rel);
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Err(e) = std::fs::write(&path, content) {
+                let message = format!("failed to write {rel}: {e}");
                 eprintln!("{message}");
                 if args.common.json {
                     emit_json_error(scan_result.take(), &message);
@@ -529,7 +556,9 @@ pub(super) async fn run_redirect(
     // deleting the other mode's ledger; reconciliation is deferred (see PR Scope).
     // Read after the ledger write above so a non-dry-run reflects this run.
     let mut takeover_warnings: Vec<serde_json::Value> = Vec::new();
-    let superseded = super::classify_overlap_takeover(&args.common.cwd).await.redirect;
+    let superseded = super::classify_overlap_takeover(&args.common.cwd)
+        .await
+        .redirect;
     if !superseded.is_empty() {
         takeover_warnings.push(serde_json::json!({
             "code": super::REDIRECT_SUPERSEDES_VENDORED,
