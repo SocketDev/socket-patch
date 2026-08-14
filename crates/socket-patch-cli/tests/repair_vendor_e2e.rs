@@ -1209,6 +1209,144 @@ async fn repair_reconstruction_flags_unrecoverable_gem_checksum() {
     );
 }
 
+/// G1c. No-ledger restore must NEVER canonize a tampered tree
+///      (trust-on-first-use): an UNPATCHED file in the vendored gem dir is
+///      tampered and the ledger deleted. The re-synthesized entry has no
+///      fileInventory, so the health check sees only the patched members
+///      (Healthy) — and no npm-family lock records an integrity for a gem
+///      dir. Repair must derive the canonical fingerprint from a
+///      member-verified LOCAL REBUILD (installed copy + recorded patch),
+///      healing the tamper; the restored ledger is byte-identical to the
+///      pre-tamper original. RED without the fix: the LIVE dir was
+///      fingerprinted into the restored ledger — the tampered gemspec
+///      survives as the canonical tree later repairs enforce and VEX
+///      attests.
+#[tokio::test]
+async fn repair_no_ledger_restore_never_canonizes_tampered_gem_tree() {
+    let mock = MockServer::start().await;
+    mount_gem_patch_api(&mock).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_gem_fixture(tmp.path(), false);
+    let copy = vendor_gem_project(tmp.path(), &mock.uri());
+    let state_path = tmp.path().join(".socket/vendor/state.json");
+    let state_before = std::fs::read(&state_path).unwrap();
+
+    // Tamper an UNPATCHED member (the stub gemspec); the patched member
+    // keeps its AFTER bytes so member-only verification still passes.
+    let tampered = b"Gem::Specification.new do |s|\n  s.name = \"padlock\"\n  s.version = \"1.2.0\"\n  s.require_paths = [\"lib\", \"exfil\"]\nend\n";
+    std::fs::write(copy.join("padlock.gemspec"), tampered).unwrap();
+    std::fs::remove_file(&state_path).unwrap();
+
+    mount_blob(&mock).await;
+    let (code, stdout, stderr) = run_cli(
+        tmp.path(),
+        &mock.uri(),
+        &["repair", "--download-mode", "file"],
+    );
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    let v = parse_env(&stdout);
+    // The tamper is healed: the rebuild reproduced the pristine stub...
+    assert_eq!(
+        std::fs::read(copy.join("padlock.gemspec")).unwrap(),
+        GEMSPEC_STUB,
+        "the tampered unpatched file must be rebuilt, not kept: {v}"
+    );
+    assert_eq!(std::fs::read(copy.join("lib/padlock.rb")).unwrap(), AFTER);
+    // ...and the restored ledger equals the pre-tamper original — the
+    // tampered tree was never fingerprinted in.
+    assert_eq!(
+        std::fs::read(&state_path).unwrap(),
+        state_before,
+        "reconstructed state.json must equal the pre-tamper original"
+    );
+    // A later repair finds the canonical tree healthy — nothing to rebuild.
+    let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair"]);
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    let v2 = parse_env(&stdout);
+    assert!(
+        !events_of(&v2).iter().any(|e| e["action"] == "rebuilt"),
+        "second repair must find nothing to rebuild: {v2}"
+    );
+}
+
+/// G1d. Same no-ledger tamper, but NO trustworthy rebuild source exists
+///      (the installed copy is gone, and a reconstructed gem entry records
+///      no pre-vendor registry checksum to fetch by): repair must restore
+///      the ledger entry WITHOUT a fileInventory — surfacing
+///      `vendor_inventory_unverified` — so later runs stay in the legacy
+///      member-only-warn state (`vendor_inventory_missing`) instead of
+///      enforcing the tampered live tree as canonical. RED without the
+///      fix: the entry carries an inventory hashing the tampered bytes,
+///      no warning fires, and later repairs report fully Healthy.
+#[tokio::test]
+async fn repair_no_ledger_restore_without_pristine_source_stays_unverified() {
+    let mock = MockServer::start().await;
+    mount_gem_patch_api(&mock).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_gem_fixture(tmp.path(), false);
+    let copy = vendor_gem_project(tmp.path(), &mock.uri());
+
+    let tampered = b"tampered unpatched member\n";
+    std::fs::write(copy.join("padlock.gemspec"), tampered).unwrap();
+    std::fs::remove_file(tmp.path().join(".socket/vendor/state.json")).unwrap();
+    // No pristine source: the installed copy is gone, and the reconstructed
+    // wiring carries no CHECKSUMS sha256 (offline-unrecoverable, see G1b).
+    std::fs::remove_dir_all(tmp.path().join("vendor/bundle")).unwrap();
+
+    mount_blob(&mock).await;
+    let (code, stdout, stderr) = run_cli(
+        tmp.path(),
+        &mock.uri(),
+        &["repair", "--download-mode", "file"],
+    );
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    let v = parse_env(&stdout);
+    assert!(
+        events_of(&v)
+            .iter()
+            .any(|e| e["errorCode"] == "vendor_inventory_unverified"),
+        "the unverifiable fingerprint must be surfaced: {v}"
+    );
+    assert!(
+        events_of(&v)
+            .iter()
+            .any(|e| e["action"] == "rebuilt" && e["details"]["ledgerRestored"] == true),
+        "the ledger entry is still restored: {v}"
+    );
+    let state: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(tmp.path().join(".socket/vendor/state.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        state["entries"][GEM_PURL]["artifact"]["fileInventory"].is_null(),
+        "the tampered live tree must NOT be fingerprinted into the ledger: {state}"
+    );
+    assert!(
+        !state["entries"][GEM_PURL]["wiring"]
+            .as_array()
+            .unwrap_or(&Vec::new())
+            .is_empty(),
+        "the reconstructed wiring is still persisted: {state}"
+    );
+    // No pristine source: repair must not have invented bytes either.
+    assert_eq!(
+        std::fs::read(copy.join("padlock.gemspec")).unwrap(),
+        tampered.as_slice(),
+        "the artifact is left as-is in the legacy member-only state"
+    );
+    // Later repairs keep naming the gap instead of enforcing the tampered
+    // tree as canonical.
+    let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair"]);
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    let v2 = parse_env(&stdout);
+    assert!(
+        events_of(&v2)
+            .iter()
+            .any(|e| e["errorCode"] == "vendor_inventory_missing"),
+        "later repairs stay in the legacy-warn state: {v2}"
+    );
+}
+
 /// G2. Empty-wiring gem entry (a reconstructed ledger without recoverable
 ///     originals, synthesized here): `vendor --revert` must FAIL loudly —
 ///     naming vendor_wiring_unknown — and keep the artifact and both files

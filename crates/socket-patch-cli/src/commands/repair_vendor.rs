@@ -32,6 +32,16 @@
 //! differs from the recorded fileInventory refreshes the inventory from
 //! the verified rebuild (`vendor_inventory_refreshed`) instead of failing
 //! deterministically on every repair.
+//!
+//! Reconstruction never fingerprints the LIVE artifact into the restored
+//! ledger (trust-on-first-use: a tampered unpatched file would become the
+//! canonical tree later repairs enforce and VEX attests). A surviving
+//! artifact is only restored as-is when an independent anchor vouches for
+//! its exact bytes (the rewired npm-family lockfile integrity); otherwise
+//! its fingerprint is derived from a member-verified local rebuild, and
+//! when no trustworthy pristine source exists the entry is restored
+//! fingerprint-less with `vendor_inventory_unverified` — the legacy
+//! member-only state — never from the unverifiable live tree.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -70,6 +80,15 @@ struct Candidate {
     /// reference (it must be persisted after a successful rebuild).
     reconstructed: bool,
     reason: &'static str,
+    /// True for a healthy-by-members RECONSTRUCTED entry with no
+    /// independent integrity anchor (dir-shaped trees; file artifacts no
+    /// npm-family lock records an integrity for): the live bytes must never
+    /// be fingerprinted into the restored ledger (trust-on-first-use), so
+    /// the fingerprint is derived from a member-verified local rebuild —
+    /// and every pre-rebuild failure falls back to a fingerprint-less
+    /// restore plus a `vendor_inventory_unverified` warning instead of a
+    /// hard failure (the artifact itself still verifies member-wise).
+    soft: bool,
 }
 
 /// Files the vendor backends rewire — the search space for
@@ -202,6 +221,42 @@ fn fail(env: &mut Envelope, quiet: bool, purl: &str, code: &str, detail: String)
     }
     env.record(PatchEvent::new(PatchAction::Failed, purl.to_string()).with_error(code, detail));
     env.mark_partial_failure();
+}
+
+/// A soft (healthy-by-members, unanchored) reconstruction whose trustworthy
+/// rebuild cannot proceed: the entry stays restored WITHOUT a whole-file
+/// fingerprint — the legacy member-only state pass 1 keeps warning about
+/// (`vendor_inventory_missing` for gems) — and the gap is surfaced, instead
+/// of either failing the repair or canonizing the unverifiable live tree.
+/// The entry itself was already persisted by the pre-rebuild restore.
+fn soft_restore_without_fingerprint(
+    env: &mut Envelope,
+    common: &GlobalArgs,
+    purl: &str,
+    artifact_path: &str,
+    why: &str,
+) {
+    record_warning(
+        env,
+        purl,
+        &VendorWarning::new(
+            "vendor_inventory_unverified",
+            format!(
+                "the ledger entry was reconstructed but its artifact has no independent \
+                 integrity anchor and {why}; the entry was restored without a whole-file \
+                 fingerprint (only the patched members were verified) — run `socket-patch \
+                 vendor` to re-vendor and record one"
+            ),
+        ),
+        common,
+    );
+    env.record(
+        PatchEvent::new(PatchAction::Rebuilt, purl.to_string()).with_details(serde_json::json!({
+            "path": artifact_path,
+            "ledgerRestored": true,
+            "artifactRebuilt": false,
+        })),
+    );
 }
 
 /// Best-effort removal of a vendored uuid dir — ahead of a rebuild (corrupt
@@ -416,6 +471,7 @@ pub(crate) async fn repair_vendored_artifacts(
                     detached,
                     reconstructed: false,
                     reason,
+                    soft: false,
                 });
             }
         }
@@ -489,13 +545,19 @@ pub(crate) async fn repair_vendored_artifacts(
         }
         match check_vendored_artifact(&common.cwd, &entry, &record).await {
             ArtifactHealth::Healthy => {
-                // The re-synthesized entry records no sha256, so the health
-                // check above verified only the patched members — whole-file
-                // drift (an altered UNPATCHED member) is invisible to it.
-                // The rewired lockfile integrity is the trust anchor for
-                // these exact bytes: a "surviving" artifact that no longer
-                // matches it leaves the package manager broken, so it must
-                // be rebuilt, never blessed into the reconstructed ledger.
+                // The re-synthesized entry records no sha256/fileInventory,
+                // so the health check above verified only the patched
+                // members — whole-file drift (an altered UNPATCHED member)
+                // is invisible to it. The live bytes must therefore NEVER be
+                // fingerprinted into the restored ledger: that would be
+                // trust-on-first-use, canonizing a tampered tree that later
+                // repairs enforce and VEX attests. Only an INDEPENDENT
+                // anchor can vouch for the exact bytes — the rewired
+                // npm-family lockfile integrity, when one records this
+                // artifact. A "surviving" artifact that no longer matches it
+                // leaves the package manager broken, so it must be rebuilt,
+                // never blessed into the reconstructed ledger.
+                let mut anchored = false;
                 if let Some(wired) =
                     lock_inventory::wired_vendor_integrity(&common.cwd, &entry.artifact.path).await
                 {
@@ -518,43 +580,73 @@ pub(crate) async fn repair_vendored_artifacts(
                             detached,
                             reconstructed: true,
                             reason: "vendor_artifact_corrupt",
+                            soft: false,
                         });
                         continue;
                     }
+                    anchored = true;
                 }
-                // The artifact survived; only the ledger was lost. Restore
-                // the entry (sha/size recomputed) so GC/sweep/revert know
-                // the artifact again — without it the next `scan --prune`
-                // would sweep the uuid dir as an orphan.
                 if common.dry_run {
+                    let mut details = serde_json::json!({
+                        "vendorArtifact": true,
+                        "wouldRestoreLedgerEntry": true,
+                        "path": relpath,
+                    });
+                    if !anchored {
+                        // The fingerprint would come from a rebuild, never
+                        // the live tree.
+                        details["wouldRebuild"] = serde_json::Value::Bool(true);
+                    }
                     env.record(
-                        PatchEvent::new(PatchAction::Verified, purl.clone()).with_details(
-                            serde_json::json!({
-                                "vendorArtifact": true,
-                                "wouldRestoreLedgerEntry": true,
-                                "path": relpath,
-                            }),
-                        ),
+                        PatchEvent::new(PatchAction::Verified, purl.clone()).with_details(details),
                     );
                     continue;
                 }
-                fill_artifact_fingerprint(&common.cwd, &mut entry).await;
-                let save_failed =
-                    persist_vendor_entry(common, env, &mut state, &purl, entry, detached, &record)
-                        .await;
-                if save_failed {
+                if anchored {
+                    // The artifact bytes are exactly what the rewired
+                    // lockfile's integrity records; only the ledger was
+                    // lost. Restore the entry (sha/size recomputed from the
+                    // VERIFIED bytes) so GC/sweep/revert know the artifact
+                    // again — without it the next `scan --prune` would sweep
+                    // the uuid dir as an orphan.
+                    fill_artifact_fingerprint(&common.cwd, &mut entry).await;
+                    let save_failed = persist_vendor_entry(
+                        common, env, &mut state, &purl, entry, detached, &record,
+                    )
+                    .await;
+                    if save_failed {
+                        continue;
+                    }
+                    env.record(
+                        PatchEvent::new(PatchAction::Rebuilt, purl.clone()).with_details(
+                            serde_json::json!({
+                                "path": relpath,
+                                "ledgerRestored": true,
+                                "artifactRebuilt": false,
+                            }),
+                        ),
+                    );
+                    rebuilt += 1;
                     continue;
                 }
-                env.record(
-                    PatchEvent::new(PatchAction::Rebuilt, purl.clone()).with_details(
-                        serde_json::json!({
-                            "path": relpath,
-                            "ledgerRestored": true,
-                            "artifactRebuilt": false,
-                        }),
-                    ),
-                );
-                rebuilt += 1;
+                // No anchor (dir-shaped trees — gem, cargo —, file
+                // artifacts absent from every npm-family lock): queue a
+                // SOFT rebuild. The canonical fingerprint is derived from a
+                // member-verified local rebuild (pristine source + the
+                // recorded patch, the same dispatch as every other rebuild
+                // here); when no trustworthy pristine source exists the
+                // entry is restored WITHOUT a fingerprint — the legacy
+                // member-only state pass 1 keeps warning about — instead of
+                // canonizing the live tree.
+                candidates.push(Candidate {
+                    purl,
+                    entry,
+                    record,
+                    detached,
+                    reconstructed: true,
+                    reason: "vendor_inventory_unverified",
+                    soft: true,
+                });
             }
             _ => {
                 candidates.push(Candidate {
@@ -564,6 +656,7 @@ pub(crate) async fn repair_vendored_artifacts(
                     detached,
                     reconstructed: true,
                     reason: "vendor_artifact_missing",
+                    soft: false,
                 });
             }
         }
@@ -597,6 +690,32 @@ pub(crate) async fn repair_vendored_artifacts(
         );
     }
 
+    // ── Soft reconstructions: restore the ledger entry FIRST ─────────────
+    // Fingerprint-less: the restore must survive even when no trustworthy
+    // rebuild source turns up below, and the fingerprint slot is only ever
+    // refilled from a member-verified rebuild — never the live tree. The
+    // early persist also lets the rebuild's own persist carry the
+    // reconstructed wiring originals forward by identity.
+    let mut unrebuildable: HashSet<String> = HashSet::new();
+    for c in &candidates {
+        if c.soft
+            && persist_vendor_entry(
+                common,
+                env,
+                &mut state,
+                &c.purl,
+                c.entry.clone(),
+                c.detached,
+                &c.record,
+            )
+            .await
+        {
+            // The state write failed (Failed event already recorded):
+            // nothing below could persist either.
+            unrebuildable.insert(c.purl.clone());
+        }
+    }
+
     // ── Corrupt artifacts are deleted first ──────────────────────────────
     // The backends' wired hot paths rebuild on MISSING; turning corrupt
     // into missing gives every ecosystem one uniform rebuild trigger (and
@@ -621,6 +740,20 @@ pub(crate) async fn repair_vendored_artifacts(
         MemStageOutcome::Ready(s) => s,
         MemStageOutcome::Unavailable => {
             for c in &candidates {
+                if unrebuildable.contains(&c.purl) {
+                    continue;
+                }
+                if c.soft {
+                    soft_restore_without_fingerprint(
+                        env,
+                        common,
+                        &c.purl,
+                        &c.entry.artifact.path,
+                        "its patch content has no local source to rebuild from",
+                    );
+                    rebuilt += 1;
+                    continue;
+                }
                 fail(
                     env,
                     quiet,
@@ -655,12 +788,14 @@ pub(crate) async fn repair_vendored_artifacts(
     let inventory = lock_inventory::inventory_project(&common.cwd).await;
     let client = registry_fetch::build_registry_client();
     let mut holders: Vec<registry_fetch::FetchedPackage> = Vec::new();
-    let mut unrebuildable: HashSet<String> = HashSet::new();
     // Reconstructed npm candidates fetched UNVERIFIED from the conventional
     // registry: their rebuilt tarball MUST match the integrity the rewired
     // lockfile records (the trust anchor) before anything is persisted.
     let mut must_verify: HashMap<String, lock_inventory::LockIntegrity> = HashMap::new();
     for c in &candidates {
+        if unrebuildable.contains(&c.purl) {
+            continue;
+        }
         if all_packages.contains_key(&c.purl) {
             // Installed copy: works offline too. But for a RECONSTRUCTED
             // entry the copy is an unverified source — the ledger that
@@ -681,17 +816,29 @@ pub(crate) async fn repair_vendored_artifacts(
             continue;
         }
         if common.offline {
-            fail(
-                env,
-                quiet,
-                &c.purl,
-                c.reason,
-                format!(
-                    "the vendored artifact at {} is broken, the package is not installed, \
-                     and --offline prevents fetching a pristine copy",
-                    c.entry.artifact.path
-                ),
-            );
+            if c.soft {
+                soft_restore_without_fingerprint(
+                    env,
+                    common,
+                    &c.purl,
+                    &c.entry.artifact.path,
+                    "the package is not installed and --offline prevents fetching a \
+                     pristine copy to rebuild from",
+                );
+                rebuilt += 1;
+            } else {
+                fail(
+                    env,
+                    quiet,
+                    &c.purl,
+                    c.reason,
+                    format!(
+                        "the vendored artifact at {} is broken, the package is not installed, \
+                         and --offline prevents fetching a pristine copy",
+                        c.entry.artifact.path
+                    ),
+                );
+            }
             unrebuildable.insert(c.purl.clone());
             continue;
         }
@@ -742,6 +889,21 @@ pub(crate) async fn repair_vendored_artifacts(
                         }
                     }
                 }
+                if c.soft {
+                    soft_restore_without_fingerprint(
+                        env,
+                        common,
+                        &c.purl,
+                        &c.entry.artifact.path,
+                        "no verifiable pristine source exists to rebuild from (the package \
+                         is not installed, the lockfile is rewired to the vendored artifact, \
+                         and the reconstructed entry records no recoverable registry \
+                         fragment)",
+                    );
+                    rebuilt += 1;
+                    unrebuildable.insert(c.purl.clone());
+                    continue;
+                }
                 let detail = if c.entry.artifact.platform_locked == Some(true) {
                     "the vendored wheel is platform-locked (compiled); reinstall the \
                      package on this platform and re-run repair, or run `socket-patch \
@@ -759,7 +921,18 @@ pub(crate) async fn repair_vendored_artifacts(
                 unrebuildable.insert(c.purl.clone());
             }
             PristineFetch::Failed(detail) => {
-                fail(env, quiet, &c.purl, "vendor_fetch_failed", detail);
+                if c.soft {
+                    soft_restore_without_fingerprint(
+                        env,
+                        common,
+                        &c.purl,
+                        &c.entry.artifact.path,
+                        &format!("the pristine fetch failed ({detail})"),
+                    );
+                    rebuilt += 1;
+                } else {
+                    fail(env, quiet, &c.purl, "vendor_fetch_failed", detail);
+                }
                 unrebuildable.insert(c.purl.clone());
             }
         }
@@ -774,6 +947,15 @@ pub(crate) async fn repair_vendored_artifacts(
         let Some(pkg_path) = all_packages.get(&c.purl).cloned() else {
             continue; // failed above
         };
+        if c.soft {
+            // The healthy-by-members live tree is exactly what cannot be
+            // trusted; with a pristine source secured, clear it so the
+            // backend's wired hot path materialises a fresh copy — the
+            // fingerprint below then derives from the member-verified
+            // rebuild, never the live bytes. (Deleted only now, after the
+            // patch sources and the pristine source are both in hand.)
+            remove_vendor_dir(&common.cwd, &c.entry.ecosystem, &c.entry.uuid).await;
+        }
         // For an unverified-source rebuild the rewired lockfile is the trust
         // anchor: snapshot the wiring files so a failed post-verify can put
         // them back byte-for-byte. The backend's re-wire may refresh the
@@ -976,6 +1158,7 @@ pub(crate) async fn repair_vendored_artifacts(
                                 serde_json::json!({
                                     "path": check_entry.artifact.path,
                                     "reason": c.reason,
+                                    "ledgerRestored": c.reconstructed,
                                 }),
                             ),
                         );
