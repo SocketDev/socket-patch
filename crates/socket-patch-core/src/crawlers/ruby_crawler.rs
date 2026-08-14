@@ -22,7 +22,7 @@ impl RubyCrawler {
 
     /// Get gem installation paths based on options.
     ///
-    /// In local mode, checks `vendor/bundle/ruby/*/gems/` first (Bundler
+    /// In local mode, checks `vendor/bundle/<engine>/*/gems/` first (Bundler
     /// deployment layout), then — only if the cwd holds a Bundler manifest
     /// or lockfile — falls back to the gem homes `gem env` reports.
     ///
@@ -178,18 +178,31 @@ impl RubyCrawler {
         paths
     }
 
-    /// Find `vendor/bundle/ruby/*/gems/` directories.
+    /// Find `vendor/bundle/<engine>/*/gems/` directories.
+    ///
+    /// Bundler's deployment scope is `#{Gem.ruby_engine}/#{ruby_version}`
+    /// (`Bundler.ruby_scope`) — `ruby` under MRI, but `jruby`/`truffleruby`
+    /// under the alternative engines. Hardcoding `ruby` made JRuby and
+    /// TruffleRuby deployments discover zero gems, so enumerate every
+    /// engine dir that holds `<version>/gems/` children; non-engine
+    /// clutter is filtered by that shape.
     async fn get_vendor_bundle_paths(cwd: &Path) -> Vec<PathBuf> {
-        let vendor_ruby = cwd.join("vendor").join("bundle").join("ruby");
+        let vendor_bundle = cwd.join("vendor").join("bundle");
         let mut paths = Vec::new();
 
-        for entry in list_dir_entries(&vendor_ruby).await {
-            if !entry_is_dir(&entry).await {
+        for engine_entry in list_dir_entries(&vendor_bundle).await {
+            if !entry_is_dir(&engine_entry).await {
                 continue;
             }
-            let gems_dir = vendor_ruby.join(entry.file_name()).join("gems");
-            if is_dir(&gems_dir).await {
-                paths.push(gems_dir);
+            let engine_dir = vendor_bundle.join(engine_entry.file_name());
+            for entry in list_dir_entries(&engine_dir).await {
+                if !entry_is_dir(&entry).await {
+                    continue;
+                }
+                let gems_dir = engine_dir.join(entry.file_name()).join("gems");
+                if is_dir(&gems_dir).await {
+                    paths.push(gems_dir);
+                }
             }
         }
         paths
@@ -338,22 +351,41 @@ impl RubyCrawler {
     ///
     /// Gem directories follow `<name>-<version>` (ruby-platform gems) or
     /// `<name>-<version>-<platform>` (platform gems, e.g.
-    /// `nokogiri-1.16.5-x86_64-linux`). The name/version boundary is the
-    /// **first** `-` followed by a digit. A RubyGems version is dash-free
-    /// (prerelease dashes render as `.pre.`), so the version is the run up
-    /// to the next `-`; anything after that is the platform suffix, which
-    /// we drop — the installed platform is resolved later by hashing the
-    /// gem's files (the same model as PyPI's `artifact_id`). The qualified
-    /// `?platform=` PURL is only ever carried in the manifest/API.
+    /// `nokogiri-1.16.5-x86_64-linux`). A RubyGems version is dash-free
+    /// (prerelease dashes render as `.pre.`), so every `-` followed by a
+    /// digit is a candidate name/version boundary and the version is the
+    /// dash-free token after it; anything past that is the platform
+    /// suffix, which we drop — the installed platform is resolved later by
+    /// hashing the gem's files (the same model as PyPI's `artifact_id`).
+    /// The qualified `?platform=` PURL is only ever carried in the
+    /// manifest/API.
+    ///
+    /// Names may themselves contain `-<digit>` runs (`http-2`,
+    /// `http-2-next`), so the first candidate boundary is not always
+    /// right: `http-2-1.0.1` must parse as `("http-2", "1.0.1")`, not the
+    /// ghost `("http", "2")`. Real versions are almost always dotted while
+    /// digit runs embedded in names (`-2-`) and trailing platform OS
+    /// revisions (`-darwin-21`) are not, so prefer the LAST boundary whose
+    /// version token contains a `.`; fall back to the first dash-digit
+    /// boundary only when no dotted candidate exists (a bare
+    /// single-segment version like `g-1` is legal but vanishingly rare).
     fn parse_dir_name_version(dir_name: &str) -> Option<(String, String)> {
-        let idx = dir_name
+        let candidates: Vec<usize> = dir_name
             .match_indices('-')
-            .find(|(i, _)| dir_name[i + 1..].starts_with(|c: char| c.is_ascii_digit()))
-            .map(|(i, _)| i)?;
-        let name = &dir_name[..idx];
-        let rest = &dir_name[idx + 1..];
+            .filter(|(i, _)| dir_name[i + 1..].starts_with(|c: char| c.is_ascii_digit()))
+            .map(|(i, _)| i)
+            .collect();
         // Version is the leading dash-free token; drop any `-<platform>`.
-        let version = rest.split('-').next().unwrap_or(rest);
+        let version_token = |i: usize| {
+            let rest = &dir_name[i + 1..];
+            rest.split('-').next().unwrap_or(rest)
+        };
+        let idx = *candidates
+            .iter()
+            .rfind(|&&i| version_token(i).contains('.'))
+            .or_else(|| candidates.first())?;
+        let name = &dir_name[..idx];
+        let version = version_token(idx);
         if name.is_empty() || version.is_empty() {
             return None;
         }
@@ -554,6 +586,34 @@ mod tests {
         let paths = RubyCrawler::get_vendor_bundle_paths(dir.path()).await;
         assert_eq!(paths.len(), 1);
         assert_eq!(paths[0], vendor_gems);
+    }
+
+    /// Bundler's deployment scope is `<engine>/<version>` — `jruby` and
+    /// `truffleruby` deployments live beside `ruby` under `vendor/bundle`
+    /// and must be discovered too (hardcoding `ruby` found zero gems
+    /// there). Non-engine clutter — files, and dirs whose children hold no
+    /// `gems/` — must not produce paths.
+    #[tokio::test]
+    async fn test_get_vendor_bundle_paths_alternative_engines() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("vendor").join("bundle");
+        let ruby_gems = bundle.join("ruby").join("3.2.0").join("gems");
+        let jruby_gems = bundle.join("jruby").join("3.1.4.0").join("gems");
+        let truffle_gems = bundle.join("truffleruby").join("3.2.2").join("gems");
+        for gems in [&ruby_gems, &jruby_gems, &truffle_gems] {
+            tokio::fs::create_dir_all(gems).await.unwrap();
+        }
+        tokio::fs::write(bundle.join("install.log"), b"x")
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(bundle.join("cache").join("3.2.0"))
+            .await
+            .unwrap();
+
+        let paths = RubyCrawler::get_vendor_bundle_paths(dir.path()).await;
+        assert_eq!(paths.len(), 3, "one gems dir per engine; got {paths:?}");
+        let found: HashSet<PathBuf> = paths.into_iter().collect();
+        assert_eq!(found, HashSet::from([ruby_gems, jruby_gems, truffle_gems]));
     }
 
     #[tokio::test]
@@ -980,9 +1040,65 @@ mod tests {
         assert!(!is_safe_gem_coordinate("rails", "C:1.0.0"));
     }
 
+    /// Names with embedded `-<digit>` runs (`http-2`, `http-2-next`) must
+    /// keep the digits in the name: the boundary is the LAST dash-digit
+    /// whose version token is dotted, not the first dash-digit. Without
+    /// that preference `http-2-1.0.1` parsed as `("http", "2")` — a ghost
+    /// PURL — and the real gem was never discovered.
+    #[test]
+    fn parse_dir_name_version_prefers_last_dotted_boundary() {
+        assert_eq!(
+            RubyCrawler::parse_dir_name_version("http-2-1.0.1"),
+            Some(("http-2".to_string(), "1.0.1".to_string()))
+        );
+        assert_eq!(
+            RubyCrawler::parse_dir_name_version("http-2-next-1.0.3"),
+            Some(("http-2-next".to_string(), "1.0.3".to_string()))
+        );
+        // A platform suffix after the real version still drops.
+        assert_eq!(
+            RubyCrawler::parse_dir_name_version("http-2-1.0.1-java"),
+            Some(("http-2".to_string(), "1.0.1".to_string()))
+        );
+    }
+
+    /// The dotted-boundary preference must not regress the plain shapes:
+    /// dotted versions, prereleases, platform dirs, and — via the
+    /// first-boundary fallback — bare single-segment versions (legal per
+    /// RubyGems, just vanishingly rare).
+    #[test]
+    fn parse_dir_name_version_boundary_shapes() {
+        assert_eq!(
+            RubyCrawler::parse_dir_name_version("rack-3.1.0"),
+            Some(("rack".to_string(), "3.1.0".to_string()))
+        );
+        assert_eq!(
+            RubyCrawler::parse_dir_name_version("aws-sdk-s3-1.140.0"),
+            Some(("aws-sdk-s3".to_string(), "1.140.0".to_string()))
+        );
+        assert_eq!(
+            RubyCrawler::parse_dir_name_version("gem2-1.0"),
+            Some(("gem2".to_string(), "1.0".to_string()))
+        );
+        // No dotted candidate → first dash-digit boundary fallback.
+        assert_eq!(
+            RubyCrawler::parse_dir_name_version("g-1"),
+            Some(("g".to_string(), "1".to_string()))
+        );
+        // Prerelease dashes render as dots, so the token stays dotted.
+        assert_eq!(
+            RubyCrawler::parse_dir_name_version("rails-7.1.0.beta1"),
+            Some(("rails".to_string(), "7.1.0.beta1".to_string()))
+        );
+        assert_eq!(
+            RubyCrawler::parse_dir_name_version("nokogiri-1.16.0-arm64-darwin"),
+            Some(("nokogiri".to_string(), "1.16.0".to_string()))
+        );
+    }
+
     /// Gem names with embedded underscores/digits and multi-dash names
-    /// must keep their full name; the version starts at the first
-    /// dash-then-digit boundary.
+    /// must keep their full name; the version starts at the dash-then-digit
+    /// boundary that opens the dotted version token.
     #[test]
     fn parse_dir_name_version_name_shapes() {
         assert_eq!(

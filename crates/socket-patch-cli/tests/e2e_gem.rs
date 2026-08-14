@@ -94,6 +94,11 @@ fn assert_run_ok(cwd: &Path, args: &[&str], context: &str) -> (String, String) {
 fn bundle_run(cwd: &Path, args: &[&str]) {
     let mut cmd = Command::new("bundle");
     cmd.args(args).current_dir(cwd);
+    // Bundler 4 removed `bundle install --path`; BUNDLE_PATH is honored by
+    // bundler 2 through 4 and keeps the vendor/bundle/ruby/*/gems layout
+    // `find_gem_dir` expects. It also upholds cache_env's hermeticity
+    // invariant that every `bundle install` pins its gem tree to the fixture.
+    cmd.env("BUNDLE_PATH", "vendor/bundle");
     cache_env::isolate(&mut cmd);
     let out = cmd.output().expect("failed to run bundle");
     assert!(
@@ -449,7 +454,7 @@ fn test_gem_full_lifecycle() {
 
     // -- Setup: create project and install activestorage@5.2.0 ----------------
     write_gemfile(cwd);
-    bundle_run(cwd, &["install", "--path", "vendor/bundle"]);
+    bundle_run(cwd, &["install"]);
 
     let gem_dir = find_gem_dir(cwd);
 
@@ -540,7 +545,7 @@ fn test_gem_dry_run() {
     let cwd = dir.path();
 
     write_gemfile(cwd);
-    bundle_run(cwd, &["install", "--path", "vendor/bundle"]);
+    bundle_run(cwd, &["install"]);
 
     let gem_dir = find_gem_dir(cwd);
 
@@ -579,7 +584,7 @@ fn test_gem_save_only() {
     let cwd = dir.path();
 
     write_gemfile(cwd);
-    bundle_run(cwd, &["install", "--path", "vendor/bundle"]);
+    bundle_run(cwd, &["install"]);
 
     let gem_dir = find_gem_dir(cwd);
 

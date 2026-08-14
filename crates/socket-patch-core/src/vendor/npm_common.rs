@@ -575,6 +575,34 @@ pub(super) fn done_failure(purl: &str, error: String) -> VendorOutcome {
     done(failed_result(purl, Path::new(""), error), None, Vec::new())
 }
 
+/// [`done_failure`] for a wiring failure AFTER the shared pipeline packed
+/// the artifact into `<project>/.socket/vendor/<eco>/<uuid>/`: unless the
+/// uuid dir already existed before this run (a same-uuid re-vendor may still
+/// be referenced by live wiring), best-effort remove it — no ledger entry is
+/// ever persisted for a failed wiring, so `--revert` could never clean it up
+/// and the module contract ("a failure leaves the project byte-untouched")
+/// would be broken by an orphaned, possibly defective artifact dir. Empty
+/// parent dirs are pruned non-recursively (a sibling artifact keeps them).
+pub(super) async fn done_failure_unstage(
+    purl: &str,
+    error: String,
+    project_root: &Path,
+    uuid_dir_rel: &str,
+    uuid_dir_preexisted: bool,
+) -> VendorOutcome {
+    if !uuid_dir_preexisted {
+        let uuid_dir = project_root.join(uuid_dir_rel);
+        let _ = remove_tree(&uuid_dir).await;
+        if let Some(eco_dir) = uuid_dir.parent() {
+            let _ = tokio::fs::remove_dir(eco_dir).await;
+            if let Some(vendor_dir) = eco_dir.parent() {
+                let _ = tokio::fs::remove_dir(vendor_dir).await;
+            }
+        }
+    }
+    done_failure(purl, error)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

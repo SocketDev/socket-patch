@@ -9,6 +9,15 @@
 //! - `gem_global_install_full_apply_chain` — `gem install` without
 //!   --install-dir, installs to the system gem directory; socket-patch
 //!   scans + applies with `--global`.
+//!
+//! The fixture serves the TRUE git-blob sha256 of the installed
+//! `lib/colorize.rb` as `beforeHash` (computed once by a probe container
+//! from the real upstream artifact — see [`upstream_before_hash`]), so
+//! both apply paths run gated, without `--force`: `scan --sync`'s own
+//! nested apply must patch the file in the same run, and the explicit
+//! `apply` (against restored pristine bytes) must pass the variant gate.
+//! With the old all-zeros placeholder the nested apply failed invisibly
+//! and only the `--force` escape hatch was ever exercised.
 
 #![cfg(feature = "docker-e2e")]
 
@@ -69,6 +78,52 @@ fn plain_sha256(content: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// Probe: install colorize 1.1.0 from the real registry and emit the
+/// git-blob sha256 of the exact `lib/colorize.rb` bytes `gem install`
+/// lays down — the value the fixture must serve as `beforeHash` for the
+/// default (no `--force`) apply path to pass the variant gate.
+const BEFORE_HASH_PROBE_SCRIPT: &str = r#"#!/usr/bin/env bash
+set -uo pipefail
+gem install --no-document --install-dir /tmp/probe colorize -v 1.1.0 > /tmp/install.log 2>&1 || {
+  cat /tmp/install.log >&2; exit 1
+}
+F=/tmp/probe/gems/colorize-1.1.0/lib/colorize.rb
+[ -f "$F" ] || { echo "FAIL: $F missing" >&2; exit 1; }
+{ printf 'blob %d\0' "$(wc -c < "$F")"; cat "$F"; } | sha256sum | cut -d' ' -f1
+"#;
+
+/// True git-blob sha256 of the colorize-1.1.0 `lib/colorize.rb` that
+/// `gem install` produces, computed once per process by
+/// [`BEFORE_HASH_PROBE_SCRIPT`] in a probe container. Serving this as the
+/// fixture's `beforeHash` — instead of an all-zeros placeholder — is what
+/// lets the gated apply paths run: with the placeholder, `scan --sync`'s
+/// nested apply hit the variant gate and failed invisibly, so the chain
+/// only ever proved the `--force` path.
+fn upstream_before_hash() -> String {
+    static HASH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    HASH.get_or_init(|| {
+        let out = run_container(BEFORE_HASH_PROBE_SCRIPT);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "beforeHash probe container failed:\nstdout=\n{stdout}\nstderr=\n{stderr}"
+        );
+        stdout
+            .lines()
+            .rev()
+            .map(str::trim)
+            .find(|l| l.len() == 64 && l.bytes().all(|b| b.is_ascii_hexdigit()))
+            .unwrap_or_else(|| {
+                panic!(
+                    "beforeHash probe emitted no 64-hex git-blob sha256:\nstdout=\n{stdout}\nstderr=\n{stderr}"
+                )
+            })
+            .to_string()
+    })
+    .clone()
+}
+
 /// Shared verification block for both scripts. Expects `GEM_FILE`,
 /// `EXPECTED_SHA`, and `APPLY_EXIT` to be set, plus the JSON captured in
 /// `/tmp/scan.json` and `/tmp/apply.json`.
@@ -123,7 +178,7 @@ exit 0
 "#
 }
 
-async fn make_mock_server(after_hash: &str) -> MockServer {
+async fn make_mock_server(before_hash: &str, after_hash: &str) -> MockServer {
     let listener = std::net::TcpListener::bind("0.0.0.0:0").expect("bind wiremock");
     let server = MockServer::builder().listener(listener).start().await;
 
@@ -169,9 +224,12 @@ async fn make_mock_server(after_hash: &str) -> MockServer {
             "publishedAt": "2024-01-01T00:00:00Z",
             "files": {
                 // gem uses `package/<rel>` (npm-style) — apply strips
-                // the prefix and joins with the gem dir.
+                // the prefix and joins with the gem dir. beforeHash is
+                // the TRUE git-blob sha256 of the installed upstream
+                // file so the default (gated, no --force) apply path is
+                // what the chain exercises.
                 "package/lib/colorize.rb": {
-                    "beforeHash": "0000000000000000000000000000000000000000000000000000000000000000",
+                    "beforeHash": before_hash,
                     "afterHash":  after_hash,
                     "blobContent": blob_b64,
                 }
@@ -213,6 +271,9 @@ gem install --no-document --install-dir "$INSTALL_DIR" colorize -v 1.1.0 > /tmp/
 GEM_FILE="$INSTALL_DIR/gems/colorize-1.1.0/lib/colorize.rb"
 [ -f "$GEM_FILE" ] || {{ echo "FAIL: $GEM_FILE missing" >&2; exit 1; }}
 echo "Installed to: $GEM_FILE" >&2
+# Keep a pristine copy: the explicit apply below is exercised against it
+# after scan --sync's own nested apply has already patched the live file.
+cp "$GEM_FILE" /tmp/pristine.rb
 
 # Pre-seed setup.manual so the agent-mode VEX leg keeps the gem patch through
 # property 7 (this project isn't `socket-patch setup`-configured; agent patches
@@ -229,7 +290,19 @@ socket-patch scan --json --sync --yes \
   --ecosystems gem > /tmp/scan.json 2>/tmp/sync.err
 cat /tmp/sync.err >&2
 
-socket-patch apply --json --force --offline --ecosystems gem > /tmp/apply.json 2>/tmp/apply.err
+# The fixture serves the TRUE beforeHash, so scan --sync's own nested apply
+# (which never uses --force) must pass the variant gate and patch the file
+# in the same run — with an all-zeros placeholder this failed invisibly.
+grep -q 'SOCKET-PATCH-E2E-MARKER' "$GEM_FILE" || {{
+  echo "FAIL: scan --sync's nested apply left $GEM_FILE unpatched" >&2
+  cat /tmp/scan.json >&2; head -3 "$GEM_FILE" >&2; exit 1; }}
+
+# Restore the pristine file so the explicit apply below exercises the
+# default (gated, no --force) path end to end instead of short-circuiting
+# on an already-patched file.
+cp /tmp/pristine.rb "$GEM_FILE"
+
+socket-patch apply --json --offline --ecosystems gem > /tmp/apply.json 2>/tmp/apply.err
 APPLY_EXIT=$?
 cat /tmp/apply.err >&2
 
@@ -276,6 +349,9 @@ GEM_DIR=$(gem env gemdir)
 GEM_FILE="$GEM_DIR/gems/colorize-1.1.0/lib/colorize.rb"
 [ -f "$GEM_FILE" ] || {{ echo "FAIL: $GEM_FILE missing" >&2; exit 1; }}
 echo "Global-installed at: $GEM_FILE" >&2
+# Keep a pristine copy: the explicit apply below is exercised against it
+# after scan --sync's own nested apply has already patched the live file.
+cp "$GEM_FILE" /tmp/pristine.rb
 
 mkdir -p /workspace/proj && cd /workspace/proj
 
@@ -285,7 +361,19 @@ socket-patch scan --json --sync --yes --global \
   --ecosystems gem > /tmp/scan.json 2>/tmp/sync.err
 cat /tmp/sync.err >&2
 
-socket-patch apply --json --force --offline --global --ecosystems gem > /tmp/apply.json 2>/tmp/apply.err
+# The fixture serves the TRUE beforeHash, so scan --sync's own nested apply
+# (which never uses --force) must pass the variant gate and patch the file
+# in the same run — with an all-zeros placeholder this failed invisibly.
+grep -q 'SOCKET-PATCH-E2E-MARKER' "$GEM_FILE" || {{
+  echo "FAIL: scan --sync's nested apply left $GEM_FILE unpatched" >&2
+  cat /tmp/scan.json >&2; head -3 "$GEM_FILE" >&2; exit 1; }}
+
+# Restore the pristine file so the explicit apply below exercises the
+# default (gated, no --force) path end to end instead of short-circuiting
+# on an already-patched file.
+cp /tmp/pristine.rb "$GEM_FILE"
+
+socket-patch apply --json --offline --global --ecosystems gem > /tmp/apply.json 2>/tmp/apply.err
 APPLY_EXIT=$?
 cat /tmp/apply.err >&2
 {verify}"#
@@ -390,12 +478,13 @@ async fn assert_api_path_exercised(server: &MockServer) {
 
 #[tokio::test]
 async fn gem_local_install_full_apply_chain() {
-    let after_hash = git_sha256(PATCHED_RB);
-    let server = make_mock_server(&after_hash).await;
-    let api_url = format!("http://host.docker.internal:{}", server.address().port());
     if skip_if_no_image() {
         return;
     }
+    let before_hash = upstream_before_hash();
+    let after_hash = git_sha256(PATCHED_RB);
+    let server = make_mock_server(&before_hash, &after_hash).await;
+    let api_url = format!("http://host.docker.internal:{}", server.address().port());
     let expected_sha = plain_sha256(PATCHED_RB);
     let out = run_container(&local_script(&api_url, &expected_sha));
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -418,12 +507,13 @@ async fn gem_local_install_full_apply_chain() {
 
 #[tokio::test]
 async fn gem_global_install_full_apply_chain() {
-    let after_hash = git_sha256(PATCHED_RB);
-    let server = make_mock_server(&after_hash).await;
-    let api_url = format!("http://host.docker.internal:{}", server.address().port());
     if skip_if_no_image() {
         return;
     }
+    let before_hash = upstream_before_hash();
+    let after_hash = git_sha256(PATCHED_RB);
+    let server = make_mock_server(&before_hash, &after_hash).await;
+    let api_url = format!("http://host.docker.internal:{}", server.address().port());
     let expected_sha = plain_sha256(PATCHED_RB);
     let out = run_container(&global_script(&api_url, &expected_sha));
     let stdout = String::from_utf8_lossy(&out.stdout);

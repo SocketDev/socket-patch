@@ -11,12 +11,13 @@
 //! key the manifest and VEX use).
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use super::FileEdit;
 use crate::manifest::schema::PatchRecord;
+use crate::utils::fs::atomic_write_bytes;
 
 /// Repo-relative path of the redirect ledger.
 pub const REDIRECT_STATE_REL: &str = ".socket/vendor/redirect-state.json";
@@ -55,39 +56,119 @@ impl Default for RedirectState {
     }
 }
 
-/// Load the redirect ledger. Missing OR malformed → `None` (VEX then simply
-/// has nothing extra to attest, and per-entry verification still fails closed
-/// downstream) rather than aborting the command. READ-ONLY consumers only —
-/// a writer about to merge-and-rewrite the file must use
-/// [`load_redirect_state_strict`] so a corrupt ledger is refused, not
-/// silently replaced.
-pub async fn load_redirect_state(project_root: &Path) -> Option<RedirectState> {
-    load_redirect_state_strict(project_root)
-        .await
-        .ok()
-        .flatten()
+/// A redirect ledger that exists on disk but cannot be loaded (torn write,
+/// truncation, hand-editing gone wrong, or an unreadable file). The ledger is
+/// the ONLY store of the pre-redirect lockfile originals a future revert
+/// needs, so a loader that shrugged this off as "no ledger" would let the
+/// next hosted run start fresh and silently overwrite that revert data.
+/// Instead every load distinguishes absent (fine, fresh start) from malformed
+/// (this error), and the hosted writer refuses to proceed.
+#[derive(Debug)]
+pub struct CorruptRedirectState {
+    /// Absolute path of the malformed ledger.
+    pub path: PathBuf,
+    /// What went wrong reading/parsing it.
+    pub detail: String,
+    /// Where [`CorruptRedirectState::quarantine`] moved the file, when it did.
+    pub quarantined_to: Option<PathBuf>,
 }
 
-/// Load the redirect ledger, distinguishing ABSENT (`Ok(None)`) from
-/// EXISTING-but-unusable (`Err`, with the reason). The hosted writer merges
-/// into the existing ledger before rewriting it; treating a corrupt file
-/// (e.g. an unresolved git merge conflict) as "absent" would replace it with
-/// a fresh ledger, and — because an already-redirected lockfile produces no
-/// new edits on a re-run — permanently discard the pre-redirect originals a
-/// future revert needs. Writers must refuse on `Err`.
-pub async fn load_redirect_state_strict(
+impl CorruptRedirectState {
+    /// Move the malformed ledger aside to `redirect-state.json.corrupt` so no
+    /// later run can overwrite the revert data it may still hold. Never
+    /// clobbers an existing `.corrupt` file (an earlier quarantine may hold
+    /// older revert data); on any failure the original file simply stays put
+    /// — the caller's hard error already prevents overwriting it.
+    pub async fn quarantine(&mut self) {
+        let target = match self.path.parent() {
+            Some(parent) => parent.join("redirect-state.json.corrupt"),
+            None => return,
+        };
+        if !matches!(tokio::fs::try_exists(&target).await, Ok(false)) {
+            return;
+        }
+        if tokio::fs::rename(&self.path, &target).await.is_ok() {
+            self.quarantined_to = Some(target);
+        }
+    }
+}
+
+impl std::fmt::Display for CorruptRedirectState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the redirect ledger {} is malformed ({}); it records the \
+             pre-redirect lockfile values a future revert needs, so it will \
+             not be overwritten. ",
+            self.path.display(),
+            self.detail
+        )?;
+        match &self.quarantined_to {
+            Some(target) => write!(
+                f,
+                "The unreadable file was moved aside to {}; to recover, repair \
+                 its JSON and rename it back to redirect-state.json, or restore \
+                 the ledger and the rewritten files from version control. If \
+                 the revert data is expendable, delete the moved-aside file and \
+                 re-run.",
+                target.display()
+            ),
+            None => write!(
+                f,
+                "To recover, repair its JSON, restore it from version control, \
+                 or move it aside if the revert data is expendable, then re-run."
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CorruptRedirectState {}
+
+/// Load the redirect ledger. Missing → `Ok(None)` (a fresh start is fine).
+/// Present but unreadable/malformed → [`CorruptRedirectState`], so no caller
+/// can mistake a torn ledger for "no ledger" and overwrite the revert data it
+/// still holds (see the type's docs). Read-only consumers may degrade a
+/// malformed ledger to "nothing to consult", but must surface it; the hosted
+/// writer must abort.
+pub async fn load_redirect_state(
     project_root: &Path,
-) -> Result<Option<RedirectState>, String> {
+) -> Result<Option<RedirectState>, CorruptRedirectState> {
     let path = project_root.join(REDIRECT_STATE_REL);
     let bytes = match tokio::fs::read(&path).await {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(format!("cannot be read: {e}")),
+        Err(e) => {
+            return Err(CorruptRedirectState {
+                path,
+                detail: format!("unreadable: {e}"),
+                quarantined_to: None,
+            });
+        }
     };
     match serde_json::from_slice(&bytes) {
         Ok(state) => Ok(Some(state)),
-        Err(e) => Err(format!("is not a valid redirect ledger: {e}")),
+        Err(e) => Err(CorruptRedirectState {
+            path,
+            detail: format!("invalid JSON: {e}"),
+            quarantined_to: None,
+        }),
     }
+}
+
+/// Persist the redirect ledger atomically (stage + fsync + rename, the same
+/// hardened writer the sibling vendor ledger uses). A bare `fs::write`
+/// truncates the target first, so a crash or `ENOSPC` mid-write would tear
+/// the only store of the pre-redirect originals a future revert needs.
+pub async fn save_redirect_state(
+    project_root: &Path,
+    state: &RedirectState,
+) -> std::io::Result<()> {
+    let path = project_root.join(REDIRECT_STATE_REL);
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let json = serde_json::to_string_pretty(state).map_err(std::io::Error::other)?;
+    atomic_write_bytes(&path, format!("{json}\n").as_bytes()).await
 }
 
 #[cfg(test)]
@@ -144,7 +225,7 @@ mod tests {
     #[tokio::test]
     async fn load_missing_ledger_is_none() {
         let tmp = tempfile::tempdir().unwrap();
-        assert!(load_redirect_state(tmp.path()).await.is_none());
+        assert!(load_redirect_state(tmp.path()).await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -163,7 +244,7 @@ mod tests {
         .await
         .unwrap();
 
-        let loaded = load_redirect_state(tmp.path()).await.unwrap();
+        let loaded = load_redirect_state(tmp.path()).await.unwrap().unwrap();
         assert!(loaded.records.contains_key("pkg:npm/left-pad@1.3.0"));
     }
 
@@ -182,57 +263,121 @@ mod tests {
         )
         .await
         .unwrap();
-        let loaded = load_redirect_state(tmp.path()).await.unwrap();
+        let loaded = load_redirect_state(tmp.path()).await.unwrap().unwrap();
         assert_eq!(loaded.mode, "redirect");
     }
 
     #[tokio::test]
-    async fn load_malformed_ledger_is_none() {
+    async fn load_malformed_ledger_is_a_hard_error_naming_the_file() {
+        // A torn/hand-mangled ledger must NOT load as "no ledger": the old
+        // tolerant `None` let the next hosted run start a fresh ledger and
+        // silently overwrite the only copy of the pre-redirect revert data.
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join(".socket/vendor");
         tokio::fs::create_dir_all(&dir).await.unwrap();
         tokio::fs::write(dir.join("redirect-state.json"), b"{ not json")
             .await
             .unwrap();
-        assert!(load_redirect_state(tmp.path()).await.is_none());
+        let err = load_redirect_state(tmp.path()).await.unwrap_err();
+        assert_eq!(err.path, dir.join("redirect-state.json"));
+        let message = err.to_string();
+        assert!(
+            message.contains("redirect-state.json"),
+            "error must name the file: {message}"
+        );
+        assert!(
+            message.contains("revert"),
+            "error must explain what is at stake: {message}"
+        );
+        // The pure load never mutates the project.
+        assert!(dir.join("redirect-state.json").exists());
+        assert!(!dir.join("redirect-state.json.corrupt").exists());
     }
 
     #[tokio::test]
-    async fn strict_load_distinguishes_missing_from_malformed() {
-        // Missing → Ok(None): a first hosted run starts a fresh ledger.
+    async fn quarantine_moves_the_malformed_ledger_aside_preserving_bytes() {
         let tmp = tempfile::tempdir().unwrap();
-        assert!(matches!(
-            load_redirect_state_strict(tmp.path()).await,
-            Ok(None)
-        ));
+        let dir = tmp.path().join(".socket/vendor");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("redirect-state.json"), b"{ torn ledger")
+            .await
+            .unwrap();
+        let mut err = load_redirect_state(tmp.path()).await.unwrap_err();
+        err.quarantine().await;
+        assert_eq!(
+            err.quarantined_to.as_deref(),
+            Some(dir.join("redirect-state.json.corrupt").as_path())
+        );
+        assert!(
+            err.to_string().contains("redirect-state.json.corrupt"),
+            "error must point at the moved-aside file: {err}"
+        );
+        assert!(!dir.join("redirect-state.json").exists());
+        assert_eq!(
+            tokio::fs::read(dir.join("redirect-state.json.corrupt"))
+                .await
+                .unwrap(),
+            b"{ torn ledger",
+            "quarantine must preserve the corrupt bytes verbatim"
+        );
+    }
 
-        // Malformed (e.g. an unresolved merge conflict) → Err: the writer
-        // must REFUSE rather than replace the file — replacement would
-        // discard the pre-redirect originals a future revert needs.
+    #[tokio::test]
+    async fn quarantine_never_clobbers_an_earlier_corrupt_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join(".socket/vendor");
         tokio::fs::create_dir_all(&dir).await.unwrap();
         tokio::fs::write(
-            dir.join("redirect-state.json"),
-            b"<<<<<<< HEAD\n{ \"version\": 1 }\n=======\n",
+            dir.join("redirect-state.json.corrupt"),
+            b"older revert data",
         )
         .await
         .unwrap();
-        let err = load_redirect_state_strict(tmp.path()).await.unwrap_err();
-        assert!(
-            err.contains("not a valid redirect ledger"),
-            "the refusal must say the file is corrupt, got: {err}"
+        tokio::fs::write(dir.join("redirect-state.json"), b"{ newer torn")
+            .await
+            .unwrap();
+        let mut err = load_redirect_state(tmp.path()).await.unwrap_err();
+        err.quarantine().await;
+        assert!(err.quarantined_to.is_none());
+        assert_eq!(
+            tokio::fs::read(dir.join("redirect-state.json.corrupt"))
+                .await
+                .unwrap(),
+            b"older revert data",
+            "an earlier quarantine snapshot must never be overwritten"
         );
+        assert!(
+            dir.join("redirect-state.json").exists(),
+            "with the quarantine slot taken the malformed file stays put"
+        );
+    }
 
-        // Valid → Ok(Some), same as the lenient loader.
-        tokio::fs::write(
-            dir.join("redirect-state.json"),
-            serde_json::to_string_pretty(&RedirectState::new()).unwrap(),
-        )
-        .await
-        .unwrap();
-        assert!(matches!(
-            load_redirect_state_strict(tmp.path()).await,
-            Ok(Some(_))
-        ));
+    #[tokio::test]
+    async fn save_writes_atomically_and_round_trips() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = RedirectState::new();
+        state
+            .records
+            .insert("pkg:npm/left-pad@1.3.0".to_string(), sample_record());
+        // Creates `.socket/vendor` itself.
+        save_redirect_state(tmp.path(), &state).await.unwrap();
+
+        let loaded = load_redirect_state(tmp.path()).await.unwrap().unwrap();
+        assert!(loaded.records.contains_key("pkg:npm/left-pad@1.3.0"));
+        let text = tokio::fs::read_to_string(tmp.path().join(REDIRECT_STATE_REL))
+            .await
+            .unwrap();
+        assert!(text.ends_with('\n'), "ledger keeps its trailing newline");
+        // The atomic writer must not leave its stage file behind.
+        let mut entries = tokio::fs::read_dir(tmp.path().join(".socket/vendor"))
+            .await
+            .unwrap();
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            assert!(
+                !name.starts_with(".socket-stage-"),
+                "stage litter left behind: {name}"
+            );
+        }
     }
 }
