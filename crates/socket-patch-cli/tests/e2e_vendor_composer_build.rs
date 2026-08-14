@@ -47,6 +47,8 @@ const GHSA: &str = "GHSA-vend-composer-host";
 /// The dependency under test — dep-free, tiny, and the same fixture the
 /// docker twin uses.
 const DEP: &str = "psr/log";
+/// Version the hand-written (composer-free) revert fixtures below pin.
+const FIXTURE_VERSION: &str = "3.0.2";
 
 // ── self-contained helpers ────────────────────────────────────────────
 
@@ -474,5 +476,236 @@ fn composer_vendor_fresh_checkout_install_and_revert() {
     assert!(
         !proj.join(".socket/vendor").exists(),
         ".socket/vendor must be fully removed after revert"
+    );
+}
+
+// ── revert against ledger state the capstone above never produces ─────
+//
+// Both regressions below are about `.socket/vendor/` state that outlived (or
+// was rebuilt without) its wiring record, which the capstone's clean
+// vendor→revert round trip cannot reach. They hand-write the wired lock +
+// artifact instead of driving composer, so they need neither the toolchain
+// nor the network and run in the normal `test` job (no `#[ignore]`).
+
+/// `repair`-reconstructed ledger entry: recovered from the lockfile path, so
+/// it owns the artifact but records NO pre-vendor wiring (see
+/// `repair_vendor.rs`'s `synth_entry`).
+const UUID_RECONSTRUCTED: &str = "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d";
+/// Un-ledgered artifact dir that composer.lock still points at.
+const UUID_ORPHAN_WIRED: &str = "2b3c4d5e-6f7a-4b8c-9d0e-1f2a3b4c5d6e";
+/// Un-ledgered artifact dir nothing references.
+const UUID_ORPHAN_DEAD: &str = "3c4d5e6f-7a8b-4c9d-8e0f-2a3b4c5d6e7f";
+
+const FIXTURE_PHP: &[u8] =
+    b"<?php\n// SOCKET-PATCH-VENDOR-E2E-MARKER\ninterface LoggerInterface {}\n";
+
+/// Write the vendored copy for `uuid` (dir-shaped, as the composer backend
+/// materializes it) and return its project-relative path.
+fn write_vendored_copy(proj: &Path, uuid: &str) -> String {
+    let copy_rel = format!(".socket/vendor/composer/{uuid}/{DEP}@{FIXTURE_VERSION}");
+    let src = proj.join(&copy_rel).join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("LoggerInterface.php"), FIXTURE_PHP).unwrap();
+    copy_rel
+}
+
+/// composer.json + a composer.lock ALREADY wired to `uuid`'s copy — the
+/// exact surgery `vendor` writes (path dist, uuid `reference`, `symlink:
+/// false`, `source` gone) and what a fresh clone of a vendored project has.
+fn write_wired_project(proj: &Path, uuid: &str) -> String {
+    let copy_rel = write_vendored_copy(proj, uuid);
+    std::fs::write(
+        proj.join("composer.json"),
+        r#"{
+    "name": "socket/vendor-revert-fixture",
+    "require": {
+        "psr/log": "3.0.*"
+    }
+}
+"#,
+    )
+    .unwrap();
+    let lock = serde_json::json!({
+        "_readme": ["This file locks the dependencies of your project to a known state"],
+        "content-hash": "7a59d114f58e9b02546b21d7e57430d3",
+        "packages": [{
+            "name": DEP,
+            "version": FIXTURE_VERSION,
+            "dist": { "type": "path", "url": copy_rel, "reference": uuid },
+            "transport-options": { "symlink": false },
+            "type": "library",
+        }],
+        "packages-dev": [],
+        "minimum-stability": "stable",
+        "plugin-api-version": "2.6.0",
+    });
+    std::fs::write(
+        proj.join("composer.lock"),
+        format!("{}\n", serde_json::to_string_pretty(&lock).unwrap()),
+    )
+    .unwrap();
+    copy_rel
+}
+
+/// The `.socket/vendor/state.json` a `repair` reconstruction leaves: artifact
+/// + uuid recovered from the lock path, `wiring` empty.
+fn write_reconstructed_ledger(proj: &Path, uuid: &str, copy_rel: &str) {
+    let purl = format!("pkg:composer/{DEP}@{FIXTURE_VERSION}");
+    let state = serde_json::json!({
+        "version": 1,
+        "entries": { purl.clone(): {
+            "ecosystem": "composer",
+            "basePurl": purl,
+            "uuid": uuid,
+            "artifact": { "path": copy_rel },
+            "wiring": [],
+        }}
+    });
+    std::fs::write(
+        proj.join(".socket/vendor/state.json"),
+        serde_json::to_string_pretty(&state).unwrap(),
+    )
+    .unwrap();
+}
+
+fn events(env: &serde_json::Value) -> &Vec<serde_json::Value> {
+    env["events"].as_array().expect("events[]")
+}
+
+/// REGRESSION: reverting a `repair`-reconstructed entry must not strand
+/// composer.lock. There is no recorded registry `dist` to put back, so the
+/// revert has to REFUSE and keep the artifacts — deleting them while the lock
+/// still points at them made the next `composer install` fail with "Source
+/// path … is not found", and the run reported success.
+#[test]
+fn revert_of_reconstructed_entry_refuses_and_keeps_artifacts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let copy_rel = write_wired_project(&proj, UUID_RECONSTRUCTED);
+    write_reconstructed_ledger(&proj, UUID_RECONSTRUCTED, &copy_rel);
+
+    let lock_path = proj.join("composer.lock");
+    let lock_before = std::fs::read(&lock_path).unwrap();
+    let state_before = std::fs::read(proj.join(".socket/vendor/state.json")).unwrap();
+
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &[
+            "vendor",
+            "--revert",
+            "--json",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(
+        code, 1,
+        "an unrestorable entry must fail the revert.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let env = parse_envelope(&stdout);
+    assert_eq!(env["status"], "partialFailure", "envelope: {env}");
+    assert_eq!(env["summary"]["removed"], 0, "nothing reverted: {env}");
+    let failed = events(&env)
+        .iter()
+        .find(|e| e["action"] == "failed")
+        .unwrap_or_else(|| panic!("expected a failed event: {env}"));
+    assert_eq!(failed["errorCode"], "revert_failed", "{failed}");
+    let detail = failed["error"].as_str().expect("error detail");
+    assert!(
+        detail.contains(DEP) && detail.contains("composer update"),
+        "the refusal must name the package and the re-resolve escape hatch: {detail}"
+    );
+
+    assert!(
+        proj.join(&copy_rel)
+            .join("src/LoggerInterface.php")
+            .exists(),
+        "a refused revert must NOT delete the artifacts the lock still consumes"
+    );
+    assert_eq!(
+        std::fs::read(&lock_path).unwrap(),
+        lock_before,
+        "composer.lock must be left exactly as it was"
+    );
+    assert_eq!(
+        std::fs::read(proj.join(".socket/vendor/state.json")).unwrap(),
+        state_before,
+        "the entry must stay in the ledger so a later repair/revert can retry"
+    );
+}
+
+/// REGRESSION: with state.json gone, the orphan sweep must not delete a uuid
+/// dir composer.lock still points at — un-ledgered does not mean un-wired
+/// (that is exactly the state `repair` reconstructs from). A genuinely
+/// unreferenced dir in the same run must still be swept.
+#[test]
+fn orphan_sweep_keeps_lock_referenced_dir_when_ledger_is_gone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let wired_rel = write_wired_project(&proj, UUID_ORPHAN_WIRED);
+    let dead_rel = write_vendored_copy(&proj, UUID_ORPHAN_DEAD);
+    assert!(
+        !proj.join(".socket/vendor/state.json").exists(),
+        "fixture models a project whose ledger was deleted"
+    );
+
+    let lock_before = std::fs::read(proj.join("composer.lock")).unwrap();
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &[
+            "vendor",
+            "--revert",
+            "--json",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(
+        code, 0,
+        "sweeping is not a failure.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let env = parse_envelope(&stdout);
+
+    assert!(
+        proj.join(&wired_rel)
+            .join("src/LoggerInterface.php")
+            .exists(),
+        "the lock-referenced artifact must survive the sweep: {env}"
+    );
+    assert!(
+        !proj
+            .join(format!(".socket/vendor/composer/{UUID_ORPHAN_DEAD}"))
+            .exists(),
+        "the unreferenced orphan must still be swept: {env}"
+    );
+    assert_eq!(
+        std::fs::read(proj.join("composer.lock")).unwrap(),
+        lock_before,
+        "the sweep must not touch composer.lock"
+    );
+    assert!(
+        events(&env)
+            .iter()
+            .any(|e| e["errorCode"] == "vendor_orphan_still_wired"
+                && e["reason"]
+                    .as_str()
+                    .is_some_and(|r| r.contains(UUID_ORPHAN_WIRED))),
+        "the kept dir must be surfaced as an advisory: {env}"
+    );
+    assert!(
+        events(&env).iter().any(|e| e["action"] == "removed"
+            && e["errorCode"] == "vendor_orphan_removed"
+            && e["purl"]
+                .as_str()
+                .is_some_and(|p| p.contains(&format!("{DEP}@{FIXTURE_VERSION}"))
+                    || p.contains(UUID_ORPHAN_DEAD))),
+        "the swept dir must be reported: {env}"
+    );
+    assert_eq!(
+        dead_rel,
+        format!(".socket/vendor/composer/{UUID_ORPHAN_DEAD}/{DEP}@{FIXTURE_VERSION}"),
+        "fixture path convention"
     );
 }
