@@ -812,6 +812,14 @@ fn lock_has_target_package(lines: &[String], name: &str, version: &str) -> bool 
 /// packages entry no longer exists) — so refuse before anything is staged
 /// or written. The spike has no pnpm-blessed fixtures for either shape;
 /// guessing their rewritten spelling risks worse corruption than refusing.
+///
+/// CATALOG-consumed deps (pnpm >= 9.5: importer `specifier: catalog:…` plus
+/// a top-level `catalogs:` snapshot section) also refuse: the real range
+/// lives in pnpm-workspace.yaml — a file outside the package.json + lock
+/// PAIR this surgery owns — and package.json keeps its `catalog:`
+/// specifier, so rewriting the importer entry to `file:` desyncs the lock
+/// from the manifest and `pnpm install --frozen-lockfile` rejects it with
+/// ERR_PNPM_OUTDATED_LOCKFILE (verified against real pnpm).
 fn check_rewritable_refs(lines: &[String], name: &str, version: &str) -> Result<(), String> {
     let reg_key = format!("{name}@{version}");
     let key_peer_prefix = format!("{reg_key}(");
@@ -823,6 +831,47 @@ fn check_rewritable_refs(lines: &[String], name: &str, version: &str) -> Result<
              pnpm rejects; this lock shape is not supported yet"
         ))
     };
+    let refuse_catalog = |where_: &str, spelling: &str| {
+        Err(format!(
+            "{PNPM_LOCK} resolves {reg_key} through a pnpm catalog ({where_}: \
+             `{spelling}`) that the pair surgery cannot rewrite — the catalog range \
+             lives in pnpm-workspace.yaml and package.json keeps its `catalog:` \
+             specifier, so a rewritten lock fails `pnpm install --frozen-lockfile`; \
+             this lock shape is not supported yet"
+        ))
+    };
+    if let Some((start, end)) = section_bounds(lines, "catalogs") {
+        let mut i = start + 1;
+        while let Some(catalog) = next_block(lines, i, end) {
+            let mut k = catalog.header + 1;
+            while k < catalog.end {
+                let Some((dep, _repr, rest)) = parse_key_line(&lines[k], 4) else {
+                    k += 1;
+                    continue;
+                };
+                if dep != name || !rest.is_empty() {
+                    k += 1;
+                    continue;
+                }
+                let mut f = k + 1;
+                while f < catalog.end {
+                    let Some((field, _repr, fval)) = parse_key_line(&lines[f], 6) else {
+                        break;
+                    };
+                    if field == "version" && (fval == version || fval.starts_with(&val_peer_prefix))
+                    {
+                        return refuse_catalog(
+                            "catalogs: entry",
+                            &format!("{}/{name}", catalog.key),
+                        );
+                    }
+                    f += 1;
+                }
+                k = f;
+            }
+            i = catalog.end;
+        }
+    }
     if let Some((start, end)) = section_bounds(lines, "snapshots") {
         let mut i = start + 1;
         while let Some(block) = next_block(lines, i, end) {
@@ -856,13 +905,25 @@ fn check_rewritable_refs(lines: &[String], name: &str, version: &str) -> Result<
                     k += 1;
                     continue;
                 }
-                let (_, ver, f) = dep_field_lines(lines, k + 1, importer.end);
+                let (spec, ver, f) = dep_field_lines(lines, k + 1, importer.end);
                 if let Some((_, v)) = ver {
                     if v == reg_key || v.starts_with(&key_peer_prefix) {
                         return refuse("an aliased importer version", &v);
                     }
                     if dep == name && v.starts_with(&val_peer_prefix) {
                         return refuse("a peer-suffixed importer version", &v);
+                    }
+                    if dep == name && v == version {
+                        if let Some((_, s)) = spec {
+                            // pnpm spells the default catalog `'catalog:'`
+                            // (quoted) and named ones `catalog:<name>` (bare).
+                            if unquote_value(&s).starts_with("catalog:") {
+                                return refuse_catalog(
+                                    &format!("importer `{}` specifier", importer.key),
+                                    &s,
+                                );
+                            }
+                        }
                     }
                 }
                 k = f;
@@ -1819,6 +1880,21 @@ fn parse_key_line(line: &str, indent: usize) -> Option<(String, String, String)>
         }
     }
     None
+}
+
+/// Strip one matching pair of surrounding quotes from a mapping VALUE
+/// (pnpm quotes values that would misparse as plain YAML scalars, e.g. the
+/// default-catalog specifier `'catalog:'`).
+fn unquote_value(value: &str) -> &str {
+    let bytes = value.as_bytes();
+    if bytes.len() >= 2
+        && (bytes[0] == b'\'' || bytes[0] == b'"')
+        && bytes[bytes.len() - 1] == bytes[0]
+    {
+        &value[1..value.len() - 1]
+    } else {
+        value
+    }
 }
 
 /// pnpm quotes `@`-leading keys with single quotes; everything we write is
@@ -3055,6 +3131,205 @@ snapshots:
         assert!(detail.contains("left-pad@1.3.0"), "{detail}");
         assert_eq!(fx.read(PNPM_LOCK).await, snapshot_alias_lock);
         assert!(!fx.root().join(".socket/vendor").exists());
+    }
+
+    /// package.json declaring the dep through a pnpm catalog. Lock oracles
+    /// generated by real pnpm (v11.21.0) from `"left-pad": "catalog:"` +
+    /// pnpm-workspace.yaml `catalog:` — the importer carries
+    /// `specifier: 'catalog:'` and the lock a top-level `catalogs:`
+    /// snapshot. The surgery cannot rewrite these (the range lives in
+    /// pnpm-workspace.yaml, outside the pair): rewriting the importer to
+    /// `file:` was empirically confirmed to make `pnpm install
+    /// --frozen-lockfile` fail with ERR_PNPM_OUTDATED_LOCKFILE. Must refuse
+    /// fail-closed BEFORE anything is staged or written.
+    #[tokio::test]
+    async fn catalog_consumed_target_refuses_fail_closed() {
+        let catalog_pkg = r#"{
+  "name": "vendor-spike",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "left-pad": "catalog:"
+  }
+}
+"#;
+        // Default catalog (importer specifier is the quoted `'catalog:'`).
+        let default_catalog_lock = "lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+catalogs:
+  default:
+    left-pad:
+      specifier: ^1.3.0
+      version: 1.3.0
+
+importers:
+
+  .:
+    dependencies:
+      left-pad:
+        specifier: 'catalog:'
+        version: 1.3.0
+
+packages:
+
+  left-pad@1.3.0:
+    resolution: {integrity: sha512-XI5MPzVNApjAyhQzphX8BkmKsKUxD4LdyK24iZeQGinBN9yTQT3bFlCBy/aVx2HrNcqQGsdot8ghrjyrvMCoEA==}
+    deprecated: use String.prototype.padStart()
+
+snapshots:
+
+  left-pad@1.3.0: {}
+";
+        let fx = fixture_with(catalog_pkg, default_catalog_lock).await;
+        let detail = expect_refused(fx.vendor(false).await, "vendor_lock_entry_unsupported");
+        assert!(detail.contains("catalog"), "{detail}");
+        assert!(detail.contains("pnpm-workspace.yaml"), "{detail}");
+        assert_eq!(
+            fx.read(PNPM_LOCK).await,
+            default_catalog_lock,
+            "lock untouched"
+        );
+        assert_eq!(fx.read(PACKAGE_JSON).await, catalog_pkg, "pkg untouched");
+        assert!(
+            !fx.root().join(".socket/vendor").exists(),
+            "refusal stages nothing"
+        );
+
+        // Named catalog (bare `catalog:tools` specifier, real-pnpm spelling).
+        let named_catalog_lock = "lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+catalogs:
+  tools:
+    left-pad:
+      specifier: ^1.3.0
+      version: 1.3.0
+
+importers:
+
+  .:
+    dependencies:
+      left-pad:
+        specifier: catalog:tools
+        version: 1.3.0
+
+packages:
+
+  left-pad@1.3.0:
+    resolution: {integrity: sha512-XI5MPzVNApjAyhQzphX8BkmKsKUxD4LdyK24iZeQGinBN9yTQT3bFlCBy/aVx2HrNcqQGsdot8ghrjyrvMCoEA==}
+    deprecated: use String.prototype.padStart()
+
+snapshots:
+
+  left-pad@1.3.0: {}
+";
+        let fx = fixture_with(catalog_pkg, named_catalog_lock).await;
+        let detail = expect_refused(fx.vendor(false).await, "vendor_lock_entry_unsupported");
+        assert!(detail.contains("catalog"), "{detail}");
+        assert_eq!(
+            fx.read(PNPM_LOCK).await,
+            named_catalog_lock,
+            "lock untouched"
+        );
+        assert!(!fx.root().join(".socket/vendor").exists());
+
+        // Drifted shape: catalog importer specifier WITHOUT a `catalogs:`
+        // section — the importer-side guard must refuse on its own.
+        let importer_only_lock = "lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+importers:
+
+  .:
+    dependencies:
+      left-pad:
+        specifier: 'catalog:'
+        version: 1.3.0
+
+packages:
+
+  left-pad@1.3.0:
+    resolution: {integrity: sha512-XI5MPzVNApjAyhQzphX8BkmKsKUxD4LdyK24iZeQGinBN9yTQT3bFlCBy/aVx2HrNcqQGsdot8ghrjyrvMCoEA==}
+    deprecated: use String.prototype.padStart()
+
+snapshots:
+
+  left-pad@1.3.0: {}
+";
+        let fx = fixture_with(catalog_pkg, importer_only_lock).await;
+        let detail = expect_refused(fx.vendor(false).await, "vendor_lock_entry_unsupported");
+        assert!(detail.contains("catalog"), "{detail}");
+        assert_eq!(
+            fx.read(PNPM_LOCK).await,
+            importer_only_lock,
+            "lock untouched"
+        );
+        assert!(!fx.root().join(".socket/vendor").exists());
+    }
+
+    /// A catalog resolving a SIBLING version (1.2.0) must not block
+    /// vendoring 1.3.0 consumed through a plain specifier: the guard binds
+    /// to the exact target version, and the sibling's catalog wiring stays
+    /// valid because its `left-pad@1.2.0` packages entry is never rekeyed.
+    #[test]
+    fn sibling_version_catalog_entry_does_not_block_vendoring() {
+        let lock = "lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+catalogs:
+  default:
+    left-pad:
+      specifier: ^1.2.0
+      version: 1.2.0
+
+importers:
+
+  .:
+    dependencies:
+      left-pad:
+        specifier: 1.3.0
+        version: 1.3.0
+
+  packages/legacy:
+    dependencies:
+      left-pad:
+        specifier: 'catalog:'
+        version: 1.2.0
+
+packages:
+
+  left-pad@1.2.0:
+    resolution: {integrity: sha512-OQadpCyFCT/VLniZQgym8d3/ofIJtuZyw2ibsVeIUOexKgW/osn8+mMFJbwGMPeDC4GnLzD8q115WPCDx4YRWg==}
+
+  left-pad@1.3.0:
+    resolution: {integrity: sha512-XI5MPzVNApjAyhQzphX8BkmKsKUxD4LdyK24iZeQGinBN9yTQT3bFlCBy/aVx2HrNcqQGsdot8ghrjyrvMCoEA==}
+
+snapshots:
+
+  left-pad@1.2.0: {}
+
+  left-pad@1.3.0: {}
+";
+        assert!(
+            check_rewritable_refs(&split_lines(lock), "left-pad", "1.3.0").is_ok(),
+            "sibling-version catalog must not refuse the plain 1.3.0 target"
+        );
+        let refused = check_rewritable_refs(&split_lines(lock), "left-pad", "1.2.0")
+            .expect_err("the catalog-consumed 1.2.0 itself must refuse");
+        assert!(refused.contains("catalog"), "{refused}");
     }
 
     /// A lock whose ONLY same-name entry is a SIBLING version's vendored
