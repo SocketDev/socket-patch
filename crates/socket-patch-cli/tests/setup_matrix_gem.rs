@@ -2,8 +2,20 @@
 //! — it appends a managed `plugin "socket-patch"` block to the Gemfile and
 //! generates a committed in-tree Bundler plugin under `.socket/bundler-plugin/`
 //! whose `plugins.rb` re-runs `socket-patch apply --ecosystems gem` on every
-//! `bundle install` (load-time digest gate + `after-install-all` hook). So the
-//! with-setup cases are no longer a baseline gap.
+//! `bundle install` (load-time digest gate + `after-install-all` hook).
+//!
+//! The with-setup Docker cases (`baseline_with_setup`, `alt_content_patchset`)
+//! are still a [BASELINE GAP], for two structural reasons (verified
+//! 2026-08-13): (a) installing the plugin evaluates `plugins.rb` BEFORE any
+//! project gems land, and the load-time `SocketPatch.apply!` treats apply's
+//! exit 1 ("No packages found that match available patches") as a genuine
+//! failure and raises `Bundler::BundlerError`, so the FIRST `bundle install`
+//! after `setup` on a never-installed project always dies — this is the gem
+//! twin of the documented apply exit-semantics issue; (b) the matrix fixture's
+//! synthetic beforeHashes only pass hash-gated ecosystems via npm's
+//! mismatch-warn-and-apply path, which gem apply does not have. The
+//! `after-install-all` re-apply flow itself works (asserted in-container with
+//! realistic hashes).
 //!
 //! IMPORTANT — why this file carries a real assertion of its own:
 //! `smc::run_pm("gem", "bundler")` routes gem through the shared Docker

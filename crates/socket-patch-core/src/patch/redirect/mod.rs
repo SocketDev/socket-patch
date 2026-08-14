@@ -1673,6 +1673,31 @@ pub(crate) fn gem_line_trailing_options(tail: &str) -> String {
     }
 }
 
+/// The source-selecting option a `gem` line's argument tail carries, if any
+/// (only the code before any `#` comment counts). Bundler allows ONE source
+/// per gem, so an option like `git:` preserved into the Socket source block
+/// OVERRIDES the block and the redirect becomes a silent no-op. Mirrors the
+/// token list `vendor::gem::rest_blocks_edit` refuses for the same reason.
+fn gem_tail_source_option(tail: &str) -> Option<&'static str> {
+    let code = tail.split('#').next().unwrap_or("");
+    [
+        "path:",
+        ":path",
+        "git:",
+        ":git",
+        "github:",
+        ":github",
+        "source:",
+        ":source",
+        "gist:",
+        ":gist",
+        "bitbucket:",
+        ":bitbucket",
+    ]
+    .into_iter()
+    .find(|tok| code.contains(tok))
+}
+
 fn rewrite_gem(
     files: &BTreeMap<String, String>,
     overrides: &[DepOverride],
@@ -1713,35 +1738,163 @@ fn rewrite_gem(
             continue;
         };
 
+        // Platform-suffixed CHECKSUMS siblings (`name (version-arm64-darwin)
+        // sha256=`) mean bundler resolves platform-specific gems the patch
+        // registry does not serve — redirecting would pin the bare-platform
+        // sha while installs keep fetching the upstream platform gem
+        // (guaranteed mismatch or a silently unpatched install). Fail closed:
+        // skip the dep entirely.
+        if let Some(lk) = lock.as_deref() {
+            let platform_re = Regex::new(
+                &(String::from(r"(?m)^  ")
+                    + &regex::escape(&dep.name)
+                    + r" \("
+                    + &regex::escape(&dep.version)
+                    + r"-[^)]+\) sha256="),
+            )
+            .unwrap();
+            if platform_re.is_match(lk) {
+                result.warnings.push(RewriteWarning {
+                    code: "redirect_gem_platform_unsupported".into(),
+                    detail: format!(
+                        "Gemfile.lock CHECKSUMS carries platform-specific entries for {} {} — \
+                         the patch registry serves only the ruby platform gem; redirect skipped",
+                        dep.name, dep.version
+                    ),
+                });
+                continue;
+            }
+        }
+
+        // Whether THIS dep's Gemfile source redirect is in place (just
+        // written or already present) — the lock pin below is gated on it.
+        let mut source_placed = false;
         if let Some(gf) = gemfile.as_mut() {
-            if !gf.contains(&format!("source \"{}\"", ov.index_url)) {
+            // Grant-agnostic idempotency guard: the grant-token (and patch
+            // uuid) segments of the index URL rotate per request, so an
+            // exact-URL check misses the block a previous run wrote and this
+            // run would wrap the gem line inside it — nesting source blocks.
+            // Wildcard the rotating segments instead (mirrors the CHECKSUMS
+            // at-target guard below).
+            let mut url_pat = regex::escape(&ov.index_url);
+            for rotating in [&dep.token, &dep.patch_uuid] {
+                if !rotating.is_empty() {
+                    url_pat =
+                        url_pat.replace(&regex::escape(&format!("/{rotating}/")), "/[^/\"]+/");
+                }
+            }
+            // `\r?\n`: the rewriter emits LF, but a `core.autocrlf` checkout
+            // rewrites the working tree to CRLF — the guard must still
+            // recognize the block there, or the indented `gem` line inside
+            // it falls through to `gem_line_re` and gets wrapped again.
+            let block_re = Regex::new(
+                &(String::from(r#"(?m)^source "("#)
+                    + &url_pat
+                    + r#")" do\r?\n  gem ["']"#
+                    + &regex::escape(&dep.name)
+                    + r#"["']"#),
+            )
+            .unwrap();
+            if let Some(m) = block_re.captures(gf) {
+                let url = m.get(1).unwrap();
+                if url.as_str() == ov.index_url {
+                    source_placed = true;
+                } else {
+                    // Rotated grant: refresh the URL in place — never nest.
+                    let (range, old_url) = (url.range(), url.as_str().to_string());
+                    gf.replace_range(range, &ov.index_url);
+                    gemfile_changed = true;
+                    result.edits.push(FileEdit {
+                        path: "Gemfile".into(),
+                        kind: "redirect_gemfile_source_url".into(),
+                        action: "rewritten".into(),
+                        key: Some(dep.name.clone()),
+                        original: Some(Value::String(old_url)),
+                        new: Some(Value::String(ov.index_url.clone())),
+                    });
+                    source_placed = true;
+                }
+            } else {
+                // Tolerate the legal spellings of a declaration: tab / extra
+                // spaces after `gem`, and the parenthesized call form.
                 let gem_line_re = Regex::new(
-                    &(String::from(r#"(?m)^\s*gem ["']"#)
+                    &(String::from(r#"(?m)^\s*gem(?:[ \t]*(\()[ \t]*|[ \t]+)["']"#)
                         + &regex::escape(&dep.name)
                         + r#"["']([^\n]*)$"#),
                 )
                 .unwrap();
-                let block = format!(
-                    "source \"{}\" do\n  gem \"{}\", \"{}\"\nend",
-                    ov.index_url, dep.name, dep.version
-                );
+                // Looser "declared at all?" probe: gates the append branch —
+                // appending next to a declaration the recognizer above cannot
+                // parse would leave the gem declared twice (bundler
+                // hard-fails on the duplicate).
+                let declared_re = Regex::new(
+                    &(String::from(r#"(?m)^[ \t]*gem\b[^\n]*["']"#)
+                        + &regex::escape(&dep.name)
+                        + r#"["']"#),
+                )
+                .unwrap();
                 if let Some(m) = gem_line_re.captures(gf) {
+                    let range = m.get(0).unwrap().range();
                     let original = m.get(0).unwrap().as_str().to_string();
+                    let paren = m.get(1).is_some();
+                    let raw_tail = m.get(2).unwrap().as_str().to_string();
+                    // A parenthesized call keeps its closing `)` in the tail:
+                    // strip it (dropping any comment with it), or fail closed
+                    // when it is absent (the call continues past this line).
+                    let tail = if paren {
+                        let code = raw_tail.split('#').next().unwrap_or("").trim_end();
+                        match code.strip_suffix(')') {
+                            Some(t) => t.to_string(),
+                            None => {
+                                result.warnings.push(RewriteWarning {
+                                    code: "redirect_gem_unrecognized_declaration".into(),
+                                    detail: format!(
+                                        "the `gem \"{}\"` declaration is in a form the \
+                                         rewriter cannot safely edit; redirect skipped",
+                                        dep.name
+                                    ),
+                                });
+                                continue;
+                            }
+                        }
+                    } else {
+                        raw_tail
+                    };
+                    // A source-selecting option would move into the block and
+                    // OVERRIDE it in bundler's DSL, leaving the redirect a
+                    // silent no-op that still gets attested. Fail closed.
+                    if let Some(tok) = gem_tail_source_option(&tail) {
+                        result.warnings.push(RewriteWarning {
+                            code: "redirect_gem_source_option".into(),
+                            detail: format!(
+                                "the `gem \"{}\"` declaration carries `{tok}`, which would \
+                                 override the Socket source block; redirect skipped",
+                                dep.name
+                            ),
+                        });
+                        continue;
+                    }
                     // Trailing options (`require: false`, `group: …`) must
                     // survive the move into the source block — dropping
                     // `require: false` auto-requires the gem at boot.
-                    let opts = gem_line_trailing_options(m.get(1).unwrap().as_str());
+                    let opts = gem_line_trailing_options(&tail);
                     let block = if opts.is_empty() {
-                        block
+                        format!(
+                            "source \"{}\" do\n  gem \"{}\", \"{}\"\nend",
+                            ov.index_url, dep.name, dep.version
+                        )
                     } else {
                         format!(
                             "source \"{}\" do\n  gem \"{}\", \"{}\", {opts}\nend",
                             ov.index_url, dep.name, dep.version
                         )
                     };
-                    // Plain replacen: the block may carry user text (`opts`),
-                    // which a regex replacement would `$`-expand.
-                    *gf = gf.replacen(&original, &block, 1);
+                    // Splice by the match's byte range: a substring replace of
+                    // the line's TEXT would hit an identical commented-out
+                    // duplicate earlier in the file and corrupt it (and the
+                    // block may carry user text a regex replacement would
+                    // `$`-expand).
+                    gf.replace_range(range, &block);
                     gemfile_changed = true;
                     result.edits.push(FileEdit {
                         path: "Gemfile".into(),
@@ -1751,7 +1904,23 @@ fn rewrite_gem(
                         original: Some(Value::String(original)),
                         new: Some(Value::String(block)),
                     });
+                    source_placed = true;
+                } else if declared_re.is_match(gf) {
+                    result.warnings.push(RewriteWarning {
+                        code: "redirect_gem_unrecognized_declaration".into(),
+                        detail: format!(
+                            "the `gem \"{}\"` declaration is in a form the rewriter \
+                             cannot safely edit; redirect skipped",
+                            dep.name
+                        ),
+                    });
+                    continue;
                 } else {
+                    // Genuinely undeclared (a transitive dep): append a block.
+                    let block = format!(
+                        "source \"{}\" do\n  gem \"{}\", \"{}\"\nend",
+                        ov.index_url, dep.name, dep.version
+                    );
                     let sep = if gf.ends_with('\n') { "" } else { "\n" };
                     *gf = format!("{gf}{sep}{block}\n");
                     gemfile_changed = true;
@@ -1763,17 +1932,32 @@ fn rewrite_gem(
                         original: None,
                         new: Some(Value::String(block)),
                     });
+                    source_placed = true;
                 }
             }
         }
 
         if let Some(lk) = lock.as_mut() {
+            // The pin only makes sense once the source redirect is in place
+            // (just written or already present): pinning the patched sha
+            // while the gem still resolves upstream guarantees a checksum
+            // failure on the next install.
+            if !source_placed {
+                result.warnings.push(RewriteWarning {
+                    code: "redirect_gem_lock_without_source".into(),
+                    detail: format!(
+                        "no Gemfile source redirect is in place for {} — CHECKSUMS pin skipped",
+                        dep.name
+                    ),
+                });
+                continue;
+            }
             let sum_line_re = Regex::new(
                 &(String::from(r"(?m)^(  ")
                     + &regex::escape(&dep.name)
                     + r" \("
                     + &regex::escape(&dep.version)
-                    + r"\)) sha256=[0-9a-f]+$"),
+                    + r"\)) sha256=([0-9a-f]+)$"),
             )
             .unwrap();
             let new_val = format!("{} ({}) sha256={sha256}", dep.name, dep.version);
@@ -1781,7 +1965,15 @@ fn rewrite_gem(
             // target value; recording an edit would grow the ledger forever.
             if lk.contains(&format!("\n  {new_val}\n")) || lk.ends_with(&format!("\n  {new_val}")) {
                 // no-op
-            } else if sum_line_re.is_match(lk) {
+            } else if let Some(m) = sum_line_re.captures(lk) {
+                // The pre-edit line goes into the ledger as `original` so a
+                // future `--revert` can restore the upstream sha.
+                let old_val = format!(
+                    "{} ({}) sha256={}",
+                    dep.name,
+                    dep.version,
+                    m.get(2).unwrap().as_str()
+                );
                 *lk = sum_line_re
                     .replace(lk, format!("${{1}} sha256={sha256}").as_str())
                     .to_string();
@@ -1791,7 +1983,7 @@ fn rewrite_gem(
                     kind: "redirect_gemfile_lock_checksum".into(),
                     action: "rewritten".into(),
                     key: Some(dep.name.clone()),
-                    original: None,
+                    original: Some(Value::String(old_val)),
                     new: Some(Value::String(new_val)),
                 });
             } else if checksums_re.is_match(lk) {
@@ -1824,6 +2016,21 @@ fn rewrite_gem(
                 });
             }
         }
+    }
+
+    // The rewritten pair breaks bundler's frozen/deployment mode: the lock's
+    // GEM section still records the upstream source, so `bundle install` with
+    // `frozen`/`--deployment` set rejects the Gemfile's new source block.
+    // Mirror of the CLI's pnpm trust-lockfile warning.
+    if gemfile_changed || lock_changed {
+        result.warnings.push(RewriteWarning {
+            code: "redirect_gem_frozen_install".into(),
+            detail: "Gemfile was repointed at the Socket patch registry but Gemfile.lock's \
+                     GEM section still records the upstream source; bundler rejects the pair \
+                     under frozen/deployment mode — run `bundle install` (unfrozen) once to \
+                     record the new source in Gemfile.lock"
+                .into(),
+        });
     }
 
     if gemfile_changed {
@@ -3583,6 +3790,385 @@ mod tests {
         assert!(
             out.contains("  gem \"rack-mini-profiler\", \"3.1.0\", require: false\n"),
             "options preserved inside the source block: {out}"
+        );
+    }
+
+    /// A minimal Gemfile.lock with the given CHECKSUMS lines (rails 7.0.0).
+    fn gem_lock(checksums: &str) -> String {
+        format!(
+            "GEM\n  remote: https://rubygems.org/\n  specs:\n    rails (7.0.0)\n\n\
+             PLATFORMS\n  ruby\n\nDEPENDENCIES\n  rails (= 7.0.0)\n\n\
+             CHECKSUMS\n{checksums}\n\nBUNDLED WITH\n   2.6.2\n"
+        )
+    }
+
+    /// The edit must splice by the regex match's byte range: a substring
+    /// replace of the matched line's TEXT finds an identical commented-out
+    /// duplicate earlier in the file first and corrupts the comment while the
+    /// live line keeps resolving upstream.
+    #[test]
+    fn gemfile_rewrite_ignores_commented_duplicate() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "Gemfile".to_string(),
+            "source \"https://rubygems.org\"\n\
+             # gem \"rails\", \"7.0.0\" pinned during the 6.x upgrade\n\
+             gem \"rails\", \"7.0.0\"\n"
+                .to_string(),
+        );
+        let r = rewrite_registry_redirect(&files, &[gem_override("rails", "7.0.0")]);
+        let out = r.files.get("Gemfile").expect("Gemfile rewritten");
+        assert!(
+            out.contains("\n# gem \"rails\", \"7.0.0\" pinned during the 6.x upgrade\n"),
+            "commented-out duplicate left untouched: {out}"
+        );
+        assert!(
+            out.contains(
+                "\nsource \"https://patch.test/gem/tok/uuid/\" do\n  gem \"rails\", \"7.0.0\"\nend\n"
+            ),
+            "live line replaced by the source block: {out}"
+        );
+    }
+
+    /// The grant token in the index URL rotates per request, so a re-run must
+    /// recognize the source block a previous run wrote (token-wildcard match,
+    /// not exact URL) and refresh its URL in place — never wrap the block's
+    /// gem line inside a new nested block.
+    #[test]
+    fn gemfile_rerun_with_rotated_grant_updates_url_never_nests() {
+        fn ov(token: &str) -> DepOverride {
+            let mut o = gem_override("rails", "7.0.0");
+            o.token = token.into();
+            if let Some(r) = o.registry_override.as_mut() {
+                r.index_url = format!("https://patch.test/gem/{token}/uuid/");
+            }
+            o
+        }
+        let mut files = BTreeMap::new();
+        files.insert(
+            "Gemfile".to_string(),
+            "source \"https://rubygems.org\"\n\ngem \"rails\", \"7.0.0\"\n".to_string(),
+        );
+        let first = rewrite_registry_redirect(&files, &[ov("tok-one")]);
+        let redirected = first.files.get("Gemfile").expect("first run rewrites");
+        files.insert("Gemfile".to_string(), redirected.clone());
+
+        let second = rewrite_registry_redirect(&files, &[ov("tok-two")]);
+        let out = second
+            .files
+            .get("Gemfile")
+            .expect("rotated grant refreshes the URL");
+        assert_eq!(
+            out.matches("source \"https://patch.test/gem/").count(),
+            1,
+            "exactly one Socket source block, never nested: {out}"
+        );
+        assert!(
+            out.contains(
+                "source \"https://patch.test/gem/tok-two/uuid/\" do\n  gem \"rails\", \"7.0.0\"\nend"
+            ),
+            "URL refreshed in place: {out}"
+        );
+        assert!(!out.contains("tok-one"), "old grant token gone: {out}");
+        assert!(
+            second
+                .edits
+                .iter()
+                .any(|e| e.kind == "redirect_gemfile_source_url"
+                    && e.original
+                        == Some(Value::String("https://patch.test/gem/tok-one/uuid/".into()))),
+            "URL refresh recorded with the old URL as original: {:?}",
+            second.edits
+        );
+
+        // Same grant again: a true no-op.
+        files.insert("Gemfile".to_string(), out.clone());
+        let third = rewrite_registry_redirect(&files, &[ov("tok-two")]);
+        assert!(
+            third.files.is_empty() && third.edits.is_empty(),
+            "same-grant re-run must be a no-op: files={:?} edits={:?}",
+            third.files.keys(),
+            third.edits
+        );
+    }
+
+    /// A `core.autocrlf` checkout rewrites a previously-redirected Gemfile to
+    /// CRLF. The block recognizer must still see the Socket source block
+    /// there: if it misses, the indented `gem` line inside the block matches
+    /// `gem_line_re` and gets wrapped in a second, nested source block.
+    #[test]
+    fn gemfile_rerun_on_crlf_checkout_never_nests() {
+        fn ov(token: &str) -> DepOverride {
+            let mut o = gem_override("rails", "7.0.0");
+            o.token = token.into();
+            if let Some(r) = o.registry_override.as_mut() {
+                r.index_url = format!("https://patch.test/gem/{token}/uuid/");
+            }
+            o
+        }
+        // The block exactly as run 1 writes it, after a CRLF checkout.
+        let crlf_gemfile = "source \"https://rubygems.org\"\r\n\r\n\
+             source \"https://patch.test/gem/tok-one/uuid/\" do\r\n  \
+             gem \"rails\", \"7.0.0\"\r\nend\r\n";
+        let mut files = BTreeMap::new();
+        files.insert("Gemfile".to_string(), crlf_gemfile.to_string());
+
+        // Same grant: recognized in place, a true no-op.
+        let same = rewrite_registry_redirect(&files, &[ov("tok-one")]);
+        assert!(
+            !same.files.contains_key("Gemfile"),
+            "same-grant re-run on a CRLF checkout must not rewrite the Gemfile: {:?}",
+            same.files.get("Gemfile")
+        );
+
+        // Rotated grant: URL refreshed inside the existing block, never nested.
+        let rotated = rewrite_registry_redirect(&files, &[ov("tok-two")]);
+        let out = rotated
+            .files
+            .get("Gemfile")
+            .expect("rotated grant refreshes the URL on a CRLF checkout");
+        assert_eq!(
+            out.matches("source \"https://patch.test/gem/").count(),
+            1,
+            "exactly one Socket source block, never nested: {out}"
+        );
+        assert!(!out.contains("tok-one"), "old grant token gone: {out}");
+        assert!(
+            out.contains("source \"https://patch.test/gem/tok-two/uuid/\" do\r\n"),
+            "existing CRLF block body left intact: {out}"
+        );
+    }
+
+    /// A gem-level source option (`git:` / `path:` / `github:` / `source:`)
+    /// preserved into the Socket source block OVERRIDES it in bundler's DSL,
+    /// leaving the redirect a silent no-op that still gets attested. Fail
+    /// closed: warn and leave both files untouched.
+    #[test]
+    fn gemfile_gem_with_source_option_fails_closed() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "Gemfile".to_string(),
+            "source \"https://rubygems.org\"\n\n\
+             gem \"rails\", \"7.0.0\", git: \"https://github.com/rails/rails\"\n"
+                .to_string(),
+        );
+        files.insert(
+            "Gemfile.lock".to_string(),
+            gem_lock(&format!("  rails (7.0.0) sha256={}", "2".repeat(64))),
+        );
+        let r = rewrite_registry_redirect(&files, &[gem_override("rails", "7.0.0")]);
+        assert!(
+            r.files.is_empty() && r.edits.is_empty(),
+            "source-selecting option must skip the redirect: files={:?} edits={:?}",
+            r.files.keys(),
+            r.edits
+        );
+        assert!(
+            r.warnings
+                .iter()
+                .any(|w| w.code == "redirect_gem_source_option"),
+            "skip must warn: {:?}",
+            r.warnings
+        );
+    }
+
+    /// Platform-specific CHECKSUMS siblings (`rails (7.0.0-arm64-darwin)`)
+    /// mean bundler resolves a platform gem the patch registry does not
+    /// serve — the bare-platform pin would leave the platform line at the
+    /// upstream sha (or duplicate the bare line). Fail closed: skip the dep.
+    #[test]
+    fn gem_platform_checksums_fail_closed() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "Gemfile".to_string(),
+            "source \"https://rubygems.org\"\n\ngem \"rails\", \"7.0.0\"\n".to_string(),
+        );
+        files.insert(
+            "Gemfile.lock".to_string(),
+            gem_lock(&format!(
+                "  rails (7.0.0) sha256={}\n  rails (7.0.0-arm64-darwin) sha256={}",
+                "2".repeat(64),
+                "3".repeat(64)
+            )),
+        );
+        let r = rewrite_registry_redirect(&files, &[gem_override("rails", "7.0.0")]);
+        assert!(
+            r.files.is_empty() && r.edits.is_empty(),
+            "platform gems must skip the whole dep: files={:?} edits={:?}",
+            r.files.keys(),
+            r.edits
+        );
+        assert!(
+            r.warnings
+                .iter()
+                .any(|w| w.code == "redirect_gem_platform_unsupported"),
+            "skip must warn: {:?}",
+            r.warnings
+        );
+    }
+
+    /// Legal-but-non-canonical declarations (parenthesized call, tab / double
+    /// space after `gem`) must be recognized and rewritten in place — falling
+    /// through to the append branch declares the gem twice, which bundler
+    /// rejects.
+    #[test]
+    fn gemfile_paren_and_whitespace_declarations_are_rewritten_not_duplicated() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "Gemfile".to_string(),
+            "source \"https://rubygems.org\"\n\n\
+             gem(\"rails\", \"7.0.0\", require: false)\n\
+             gem\t\"puma\", \"6.0.0\"\n"
+                .to_string(),
+        );
+        let r = rewrite_registry_redirect(
+            &files,
+            &[
+                gem_override("rails", "7.0.0"),
+                gem_override("puma", "6.0.0"),
+            ],
+        );
+        let out = r.files.get("Gemfile").expect("Gemfile rewritten");
+        assert!(
+            out.contains(
+                "source \"https://patch.test/gem/tok/uuid/\" do\n  \
+                 gem \"rails\", \"7.0.0\", require: false\nend"
+            ),
+            "paren declaration rewritten with options kept, `)` stripped: {out}"
+        );
+        assert!(
+            !out.contains("gem(\"rails\"") && !out.contains("gem\t\"puma\""),
+            "original declarations replaced, not duplicated: {out}"
+        );
+        assert!(
+            out.contains(
+                "source \"https://patch.test/gem/tok/uuid/\" do\n  gem \"puma\", \"6.0.0\"\nend"
+            ),
+            "tab-separated declaration rewritten: {out}"
+        );
+    }
+
+    /// A declaration the recognizer cannot parse (`gem\"rails\"` — legal ruby,
+    /// no separator) must NOT fall through to the append branch: warn and skip
+    /// instead of declaring the gem twice.
+    #[test]
+    fn gemfile_unrecognizable_declaration_fails_closed_no_append() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "Gemfile".to_string(),
+            "source \"https://rubygems.org\"\n\ngem\"rails\", \"7.0.0\"\n".to_string(),
+        );
+        let r = rewrite_registry_redirect(&files, &[gem_override("rails", "7.0.0")]);
+        assert!(
+            r.files.is_empty() && r.edits.is_empty(),
+            "unrecognizable declaration must not append a duplicate: files={:?} edits={:?}",
+            r.files.keys(),
+            r.edits
+        );
+        assert!(
+            r.warnings
+                .iter()
+                .any(|w| w.code == "redirect_gem_unrecognized_declaration"),
+            "skip must warn: {:?}",
+            r.warnings
+        );
+    }
+
+    /// The CHECKSUMS pin is gated on the Gemfile source redirect being in
+    /// place: with no Gemfile in the candidate map, pinning the patched sha
+    /// while the gem still resolves upstream guarantees a checksum failure.
+    #[test]
+    fn gem_lock_pin_gated_on_source_redirect() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "Gemfile.lock".to_string(),
+            gem_lock(&format!("  rails (7.0.0) sha256={}", "2".repeat(64))),
+        );
+        let r = rewrite_registry_redirect(&files, &[gem_override("rails", "7.0.0")]);
+        assert!(
+            r.files.is_empty() && r.edits.is_empty(),
+            "lock pin without a source redirect must be skipped: files={:?} edits={:?}",
+            r.files.keys(),
+            r.edits
+        );
+        assert!(
+            r.warnings
+                .iter()
+                .any(|w| w.code == "redirect_gem_lock_without_source"),
+            "skip must warn: {:?}",
+            r.warnings
+        );
+    }
+
+    /// A landed gem redirect breaks bundler frozen/deployment installs (the
+    /// lock's GEM section still records the upstream source), so the rewrite
+    /// must say so — and only when it actually changed something.
+    #[test]
+    fn gem_redirect_warns_about_frozen_installs() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "Gemfile".to_string(),
+            "source \"https://rubygems.org\"\n\ngem \"rails\", \"7.0.0\"\n".to_string(),
+        );
+        files.insert(
+            "Gemfile.lock".to_string(),
+            gem_lock(&format!("  rails (7.0.0) sha256={}", "2".repeat(64))),
+        );
+        let ovr = gem_override("rails", "7.0.0");
+        let first = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        assert!(
+            first
+                .warnings
+                .iter()
+                .any(|w| w.code == "redirect_gem_frozen_install"),
+            "landed redirect must warn about frozen installs: {:?}",
+            first.warnings
+        );
+
+        // No-op re-run: nothing landed, so no frozen-install warning.
+        for (name, content) in first.files {
+            files.insert(name, content);
+        }
+        let second = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        assert!(
+            second.files.is_empty()
+                && !second
+                    .warnings
+                    .iter()
+                    .any(|w| w.code == "redirect_gem_frozen_install"),
+            "a no-op re-run must not warn: files={:?} warnings={:?}",
+            second.files.keys(),
+            second.warnings
+        );
+    }
+
+    /// The rewritten CHECKSUMS edit must carry the pre-edit line as
+    /// `original` — with `None` the ledger cannot restore the upstream sha on
+    /// a future revert.
+    #[test]
+    fn gem_lock_rewrite_records_original_checksum_line() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "Gemfile".to_string(),
+            "source \"https://rubygems.org\"\n\ngem \"rails\", \"7.0.0\"\n".to_string(),
+        );
+        files.insert(
+            "Gemfile.lock".to_string(),
+            gem_lock(&format!("  rails (7.0.0) sha256={}", "2".repeat(64))),
+        );
+        let r = rewrite_registry_redirect(&files, &[gem_override("rails", "7.0.0")]);
+        let edit = r
+            .edits
+            .iter()
+            .find(|e| e.kind == "redirect_gemfile_lock_checksum" && e.action == "rewritten")
+            .expect("lock checksum edit recorded");
+        assert_eq!(
+            edit.original,
+            Some(Value::String(format!(
+                "rails (7.0.0) sha256={}",
+                "2".repeat(64)
+            ))),
+            "pre-edit CHECKSUMS line captured for revert"
         );
     }
 
