@@ -380,7 +380,7 @@ per service outcome:
 | Service outcome | `auto` | `service` |
 |---|---|---|
 | granted/reused, integrity ok | **use service** | **use service** |
-| integrity mismatch | local build + `vendor_prebuilt_integrity_mismatch` | refuse (`vendor_prebuilt_required`) |
+| integrity mismatch | cargo/maven/nuget: **refuse** (`vendor_prebuilt_integrity_mismatch`) — tampered bytes never fall back; other ecosystems (to be aligned): local build + `vendor_prebuilt_integrity_mismatch` | refuse (cargo/maven/nuget: `vendor_prebuilt_integrity_mismatch`; others: `vendor_prebuilt_required`) |
 | still building (`pending_build` / serve 408) | local build + `vendor_prebuilt_pending` | refuse |
 | not built / withdrawn / not found / no usable artifact | local build (quiet) | refuse |
 | 401 / 403 grant / 5xx / network error | local build + `vendor_prebuilt_unavailable` | refuse |

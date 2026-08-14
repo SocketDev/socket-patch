@@ -1,0 +1,8 @@
+[package]
+name = "myapp"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { package = "leftpad", version = "1.0.0" }
+serde-alias = { package = "serde", version = "1.0.190" }

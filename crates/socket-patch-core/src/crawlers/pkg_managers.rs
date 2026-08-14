@@ -59,7 +59,10 @@ pub enum NpmPkgManager {
 ///
 /// Precedence (first match wins):
 ///
-/// 1. `.pnp.cjs`, `.pnp.js`, or `.pnp.loader.mjs` → yarn-berry PnP.
+/// 1. `.pnp.cjs`, `.pnp.js`, or `.pnp.loader.mjs` → yarn-berry PnP —
+///    unless the tree is pnpm's own `node-linker=pnp` layout (see
+///    [`pnpm_pnp_layout`]), which also writes a `.pnp.cjs` but keeps
+///    real package dirs in the pnpm virtual store → pnpm.
 /// 2. `bun.lock` or `bun.lockb` (+ `node_modules/`) → bun.
 /// 3. `node_modules/.modules.yaml` or `node_modules/.pnpm/` → pnpm.
 /// 4. `yarn.lock` (without PnP markers) + `node_modules/` → yarn classic.
@@ -83,6 +86,16 @@ pub fn detect_npm_pkg_manager(project_root: &Path) -> NpmPkgManager {
         .iter()
         .any(|m| project_root.join(m).is_file())
     {
+        // Carve-out: pnpm has its OWN PnP mode (`node-linker=pnp` in
+        // `.npmrc`) which also writes a `.pnp.cjs` loader at the root
+        // — but unlike yarn-berry the packages are real directories in
+        // the pnpm virtual store, exactly the layout the CoW guard
+        // patches natively. Reclassify as pnpm only on strong
+        // evidence; anything ambiguous stays the fail-closed
+        // yarn-berry refusal.
+        if pnpm_pnp_layout(project_root) {
+            return NpmPkgManager::Pnpm;
+        }
         return NpmPkgManager::YarnBerryPnP;
     }
 
@@ -116,6 +129,34 @@ pub fn detect_npm_pkg_manager(project_root: &Path) -> NpmPkgManager {
     }
 
     NpmPkgManager::Unknown
+}
+
+/// Is a PnP-marker-bearing project root actually pnpm's own PnP mode
+/// (`node-linker=pnp` in `.npmrc`) rather than yarn-berry?
+///
+/// pnpm's PnP mode writes a `.pnp.cjs` loader at the root just like
+/// yarn-berry does, but keeps real package directories in the pnpm
+/// virtual store (`node_modules/.pnpm/<name>@<ver>/node_modules/<name>`,
+/// verified against a real `pnpm install` with pnpm 10.28.2). The
+/// reclassification requires ALL of:
+///
+/// * an installed pnpm store (`node_modules/.modules.yaml` or
+///   `node_modules/.pnpm/`) — a bare `pnpm-lock.yaml` left behind in a
+///   yarn-berry repo must not escape the refusal;
+/// * `pnpm-lock.yaml` at the root — an installed store without pnpm's
+///   lockfile is not attributable to pnpm's PnP mode;
+/// * NO `yarn.lock` — a tree carrying both lockfiles alongside the
+///   loader is ambiguous (mid-migration multi-PM repo), so the
+///   safety-critical yarn-berry refusal still wins.
+///
+/// Shared with the vendor-side flavor probe
+/// (`crate::vendor::npm_flavor::detect_npm_lock_flavor`) so both
+/// detection sites agree on what counts as a pnpm-PnP tree.
+pub(crate) fn pnpm_pnp_layout(project_root: &Path) -> bool {
+    let node_modules = project_root.join("node_modules");
+    (node_modules.join(".modules.yaml").is_file() || node_modules.join(".pnpm").is_dir())
+        && project_root.join("pnpm-lock.yaml").is_file()
+        && !project_root.join("yarn.lock").is_file()
 }
 
 #[cfg(test)]
@@ -382,9 +423,6 @@ mod tests {
     ///
     /// Layout verified against a real `pnpm install` (pnpm 10.28.2).
     #[test]
-    #[ignore = "RED: documents a real bug — detect_npm_pkg_manager misreports a \
-                pnpm `node-linker=pnp` tree as yarn berry. The test is correct; \
-                the detector fix was not part of this change."]
     fn pnpm_pnp_mode_is_pnpm_not_yarn_berry() {
         let d = tempfile::tempdir().unwrap();
         // Root markers emitted by `pnpm install` with node-linker=pnp.
