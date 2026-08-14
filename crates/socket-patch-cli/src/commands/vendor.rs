@@ -198,33 +198,68 @@ async fn dispatch_in_use_one(entry: &VendorEntry, project_root: &Path) -> Option
     }
 }
 
+/// What the orphan sweep did with the uuid dirs no ledger entry owns.
+#[derive(Default)]
+struct OrphanSweep {
+    /// Un-ledgered AND unreferenced — deleted (unless `dry_run`).
+    removed: Vec<vendor::path::SweptVendorDir>,
+    /// Un-ledgered but a project lockfile still points into them — kept.
+    still_wired: Vec<vendor::path::SweptVendorDir>,
+}
+
 /// Uuid dirs under `.socket/vendor/<eco>/` with no owning `(eco, uuid)`
 /// ledger entry (a hand-edited state file, or artifacts left by an
-/// interrupted run). The lockfile wiring for these is already gone or
-/// owned by a recorded entry, so removal is safe; removed unless
-/// `dry_run`. Unparseable dirs are never returned (and never deleted).
-/// Returns the orphans so callers can emit events / counts.
-async fn sweep_orphan_vendor_dirs(
-    cwd: &Path,
-    state: &VendorState,
-    dry_run: bool,
-) -> Vec<vendor::path::SweptVendorDir> {
+/// interrupted run). Unparseable dirs are never returned (and never
+/// deleted). Returns the orphans so callers can emit events / counts.
+///
+/// A missing ledger entry does NOT prove missing wiring: `repair`
+/// reconstructs entries from lockfiles that still point into
+/// `.socket/vendor/` precisely because that state occurs (a deleted
+/// state.json, a partial commit). Deleting such a dir would break the next
+/// install, so every candidate is checked against the wiring-bearing files
+/// first — the same lockfile scan `repair` reconstructs from — and a
+/// referenced dir is kept for the caller to warn about.
+async fn sweep_orphan_vendor_dirs(cwd: &Path, state: &VendorState, dry_run: bool) -> OrphanSweep {
     let recorded_units: HashSet<(&str, &str)> = state
         .entries
         .values()
         .map(|e| (e.ecosystem.as_str(), e.uuid.as_str()))
         .collect();
-    let mut orphans = Vec::new();
-    for unit in vendor::path::sweep_vendor_dirs(cwd).await {
-        if recorded_units.contains(&(unit.eco.as_str(), unit.uuid.as_str())) {
+    let candidates: Vec<vendor::path::SweptVendorDir> = vendor::path::sweep_vendor_dirs(cwd)
+        .await
+        .into_iter()
+        .filter(|unit| !recorded_units.contains(&(unit.eco.as_str(), unit.uuid.as_str())))
+        .collect();
+    let mut out = OrphanSweep::default();
+    if candidates.is_empty() {
+        return out;
+    }
+    let wired: HashSet<(String, String)> =
+        crate::commands::repair_vendor::scan_vendor_references(cwd)
+            .await
+            .into_iter()
+            .map(|(eco, uuid, _path)| (eco, uuid))
+            .collect();
+    for unit in candidates {
+        if wired.contains(&(unit.eco.clone(), unit.uuid.clone())) {
+            out.still_wired.push(unit);
             continue;
         }
         if !dry_run {
             let _ = remove_tree(&unit.dir).await;
         }
-        orphans.push(unit);
+        out.removed.push(unit);
     }
-    orphans
+    out
+}
+
+/// How an orphan uuid dir is named in events: the PURL recovered from its
+/// leaf when the layout is recognizable, else `<eco>/<uuid>`.
+fn orphan_label(unit: &vendor::path::SweptVendorDir) -> String {
+    unit.purls
+        .first()
+        .cloned()
+        .unwrap_or_else(|| format!("{}/{}", unit.eco, unit.uuid))
 }
 
 /// Does `eco` fall inside this run's `--ecosystems` scope?
@@ -1221,17 +1256,30 @@ async fn run_revert(args: &VendorArgs, env: &mut Envelope) -> i32 {
     }
 
     // Orphan sweep: uuid dirs on disk with no ledger entry (a hand-edited
-    // state file, or artifacts left by an interrupted run). The lockfile
-    // wiring for these is already gone or owned by a recorded entry, so
-    // removal is safe; unparseable dirs are reported, never deleted.
-    for unit in sweep_orphan_vendor_dirs(&common.cwd, &state, common.dry_run).await {
-        let label = unit
-            .purls
-            .first()
-            .cloned()
-            .unwrap_or_else(|| format!("{}/{}", unit.eco, unit.uuid));
+    // state file, or artifacts left by an interrupted run). Unparseable dirs
+    // are reported, never deleted — and neither are dirs a lockfile still
+    // points at (their wiring outlived the ledger).
+    let sweep = sweep_orphan_vendor_dirs(&common.cwd, &state, common.dry_run).await;
+    for unit in &sweep.still_wired {
+        let label = orphan_label(unit);
+        record_warning(
+            env,
+            &label,
+            &VendorWarning::new(
+                "vendor_orphan_still_wired",
+                format!(
+                    "a project lockfile still points at .socket/vendor/{}/{}, which no ledger \
+                     entry owns; the artifacts were kept (run `socket-patch repair` to re-adopt \
+                     them into the ledger, then revert again)",
+                    unit.eco, unit.uuid
+                ),
+            ),
+            common,
+        );
+    }
+    for unit in &sweep.removed {
         env.record(
-            PatchEvent::new(PatchAction::Removed, label)
+            PatchEvent::new(PatchAction::Removed, orphan_label(unit))
                 .with_reason("vendor_orphan_removed", "vendored dir had no ledger entry"),
         );
     }
@@ -1412,9 +1460,11 @@ pub(crate) async fn run_vendor_gc(
         }
     }
 
-    // (c) orphan uuid dirs, against the post-removal ledger.
+    // (c) orphan uuid dirs, against the post-removal ledger. Dirs a lockfile
+    // still points at are kept, so they are not counted as reclaimed.
     out.orphan_dirs = sweep_orphan_vendor_dirs(&common.cwd, &state, dry_run)
         .await
+        .removed
         .len();
     out
 }
