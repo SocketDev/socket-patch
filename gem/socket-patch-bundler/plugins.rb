@@ -121,6 +121,14 @@ module SocketPatch
     end
     return [] unless records.is_a?(Hash)
     gems_dir = File.join(bundle_path, "gems")
+    # Dir.glob treats `\` as an escape on EVERY platform, so a Windows-style
+    # bundle path (Bundler.bundle_path carries backslash separators through
+    # verbatim) would never match the platform-gem wildcard below: platform
+    # installs (nokogiri-1.15.0-x64-mingw-ucrt) drop out of the digest and a
+    # `bundle pristine` reversion of them leaves the stamp matching. Forward
+    # slashes are valid separators on Windows, so normalize the GLOB BASE
+    # only — the direct join below is not a pattern and stays byte-faithful.
+    glob_gems_dir = gems_dir.tr("\\", "/")
     targets = []
     records.each do |purl, record|
       next unless purl.is_a?(String) && purl.start_with?("pkg:gem/")
@@ -132,7 +140,7 @@ module SocketPatch
       files.each_key do |key|
         rel = key.to_s.sub(%r{\Apackage/}, "")
         targets << File.join(gems_dir, "#{name}-#{version}", rel)
-        targets.concat(Dir.glob(File.join(gems_dir, "#{name}-#{version}-*", rel)))
+        targets.concat(Dir.glob(File.join(glob_gems_dir, "#{name}-#{version}-*", rel)))
       end
     end
     targets.uniq.sort

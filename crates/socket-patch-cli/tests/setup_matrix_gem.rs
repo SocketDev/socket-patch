@@ -932,6 +932,122 @@ mod plugin_runtime {
         );
     }
 
+    /// [P2 Windows platform-gem glob] `Bundler.bundle_path` carries
+    /// backslash separators through verbatim (Windows spelling), and
+    /// `Dir.glob` treats `\` as an escape on EVERY platform — so the
+    /// platform-install wildcard (`<gems>/<name>-<version>-*/<rel>`) built
+    /// from that base escape-eats the separator, matches nothing, and
+    /// platform installs (colorize-1.1.0-x64-mingw-ucrt) silently drop out
+    /// of the digest: a `bundle pristine` reversion of them leaves the stamp
+    /// matching and the re-apply skipped. Simulated on this host by feeding
+    /// bundler a backslash-bearing BUNDLE_PATH while the real tree lives at
+    /// the forward-slash spelling — exactly the two-spellings-one-directory
+    /// situation Windows creates (glob escape semantics are identical
+    /// everywhere). The plugin must glob a slash-normalized base; forward
+    /// slashes are valid separators on Windows.
+    #[test]
+    fn backslash_bundle_path_still_digests_platform_gem_files() {
+        if !have("ruby") {
+            eprintln!("skip plugin_runtime: ruby not on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        scaffold(root);
+        let (fake, log) = write_fake_apply(root, 0);
+
+        // Where bundler puts this project's gems under the backslash spelling.
+        let mut cmd = Command::new("ruby");
+        cmd.args(["-e", "require \"bundler\"; print Bundler.bundle_path"])
+            .current_dir(root);
+        scrub(&mut cmd);
+        cmd.env("BUNDLE_PATH", "vendor\\bundle");
+        let (code, bundle_path, err) = run(cmd);
+        assert_eq!(code, 0, "Bundler.bundle_path probe failed: {err}");
+        let bundle_path = bundle_path.trim().to_string();
+        assert!(
+            bundle_path.contains('\\'),
+            "precondition: bundler must carry the backslash spelling through \
+             verbatim (the Windows behavior this test simulates), got: \
+             {bundle_path:?}"
+        );
+
+        // On Windows both spellings denote the SAME directory; materialize
+        // the real tree at the slash spelling — the one the normalized glob
+        // must reach from the backslash-bearing base. Only a PLATFORM install
+        // exists: the plain `colorize-1.1.0` direct join never globs and is
+        // not at issue.
+        let target = PathBuf::from(bundle_path.replace('\\', "/"))
+            .join("gems/colorize-1.1.0-x64-mingw-ucrt/lib/colorize.rb");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, "PATCHED PLATFORM CONTENT\n").unwrap();
+
+        let drive = |label: &str| {
+            let mut cmd = Command::new("ruby");
+            cmd.args([
+                "-e",
+                "require \"bundler\"; load ARGV[0]; SocketPatch.apply!",
+                "--",
+            ])
+            .arg(root.join(".socket/bundler-plugin/plugins.rb"))
+            .current_dir(root);
+            scrub(&mut cmd);
+            cmd.env("BUNDLE_PATH", "vendor\\bundle");
+            cmd.env("SOCKET_PATCH_BIN", &fake);
+            let (code, out, err) = run(cmd);
+            assert_eq!(
+                code, 0,
+                "{label}: driving the applier failed.\n{out}\n{err}"
+            );
+        };
+
+        drive("initial apply");
+        assert_eq!(
+            apply_calls(&log).len(),
+            1,
+            "first drive must shell apply (nothing stamped yet)"
+        );
+        assert!(root.join(STAMP_REL).is_file(), "stamp written");
+        drive("stamped no-op");
+        assert_eq!(
+            apply_calls(&log).len(),
+            1,
+            "unchanged state must be digest-gated to a no-op"
+        );
+
+        // The pristine reversion the digest exists to catch — of the
+        // PLATFORM install this time.
+        std::fs::write(&target, "REVERTED BY PRISTINE\n").unwrap();
+        drive("after platform-install reversion");
+        assert_eq!(
+            apply_calls(&log).len(),
+            2,
+            "reverting the platform gem install must flip the digest and \
+             re-run apply — an escape-eaten glob omits platform installs \
+             from the digest and skips this re-apply"
+        );
+
+        // And directly: the platform install is enumerated as a patch target.
+        let mut cmd = Command::new("ruby");
+        cmd.args([
+            "-e",
+            "require \"bundler\"; load ARGV[0]; puts SocketPatch.patch_target_files",
+            "--",
+        ])
+        .arg(root.join(".socket/bundler-plugin/plugins.rb"))
+        .current_dir(root);
+        scrub(&mut cmd);
+        cmd.env("BUNDLE_PATH", "vendor\\bundle");
+        cmd.env("SOCKET_PATCH_BIN", &fake);
+        let (code, out, err) = run(cmd);
+        assert_eq!(code, 0, "patch_target_files probe failed.\n{out}\n{err}");
+        assert!(
+            out.contains("colorize-1.1.0-x64-mingw-ucrt"),
+            "patch_target_files must enumerate the platform install under a \
+             backslash-bearing bundle path:\n{out}"
+        );
+    }
+
     fn walk(dir: &Path) -> Vec<PathBuf> {
         let mut out = Vec::new();
         let Ok(entries) = std::fs::read_dir(dir) else {

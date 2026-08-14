@@ -507,6 +507,11 @@ mod tests {
         assert!(PLUGINS_RB.contains("Gemfile.lock"));
         assert!(PLUGINS_RB.contains("manifest.json"));
         assert!(PLUGINS_RB.contains("def patch_target_files"));
+        // The platform-gem wildcard must glob a forward-slash base: Dir.glob
+        // treats `\` as an escape on every platform, so a Windows bundle path
+        // (backslash separators) would otherwise never match platform installs
+        // and they would silently drop out of the digest.
+        assert!(PLUGINS_RB.contains(r#"glob_gems_dir = gems_dir.tr("\\", "/")"#));
         // The gemspec names the plugin the Gemfile directive references.
         assert!(GEMSPEC.starts_with(GENERATED_MARKER));
         assert!(GEMSPEC.contains("\"socket-patch\""));
@@ -583,6 +588,7 @@ mod tests {
             "STAMP_NAME = \"gem-plugin-stamp\"",
             "def remove_legacy_stamp",
             "def patch_target_files",
+            r#"glob_gems_dir = gems_dir.tr("\\", "/")"#,
             "bootstrap_gate && patch_target_files.none?",
             "Bundler::Plugin.add_hook(\"after-install\")",
             "Bundler::Plugin.add_hook(\"after-install-all\")",
