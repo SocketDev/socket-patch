@@ -247,6 +247,12 @@ pub(super) async fn run_redirect(
     // re-lock (and delete) the user's lockfile as a side effect of a no-op run.
     let mut migration_warnings: Vec<serde_json::Value> = Vec::new();
     let mut migration_edits: Vec<socket_patch_core::patch::redirect::FileEdit> = Vec::new();
+    // The pre-migration bun.lockb bytes, held so the migration can be undone
+    // when the subsequent rewrite lands NOTHING in the migrated bun.lock: an
+    // npm override whose version doesn't match the lock (or whose entry is
+    // refused) must not permanently convert the user's lockfile format as a
+    // side effect of a zero-redirect run.
+    let mut lockb_backup: Option<Vec<u8>> = None;
     let has_lockb = args.common.cwd.join("bun.lockb").exists();
     let has_bun_lock = args.common.cwd.join("bun.lock").exists();
     let has_npm_override = overrides.iter().any(|o| o.ecosystem == "npm");
@@ -259,6 +265,9 @@ pub(super) async fn run_redirect(
                            re-run without --dry-run to apply",
             }));
         } else {
+            // Read the binary lock BEFORE bun deletes it, so a zero-rewrite
+            // run can restore it below.
+            let lockb_bytes = std::fs::read(args.common.cwd.join("bun.lockb")).ok();
             // `.output()` (not `.status()`): bun's install chatter must not
             // interleave with the machine `--json` envelope on stdout.
             let output = std::process::Command::new("bun")
@@ -273,6 +282,7 @@ pub(super) async fn run_redirect(
             let migrated = matches!(output, Ok(o) if o.status.success())
                 && args.common.cwd.join("bun.lock").exists();
             if migrated {
+                lockb_backup = lockb_bytes;
                 // bun deleted bun.lockb itself. Record the removal so `--revert`
                 // knows the file was replaced (binary — git history is the
                 // restore path, so no `original` bytes are captured).
@@ -341,6 +351,37 @@ pub(super) async fn run_redirect(
 
     let rewrite = rewrite_registry_redirect(&files, &overrides);
     let rewritten: Vec<String> = rewrite.files.keys().cloned().collect();
+
+    // The lockb→text migration is only KEPT when the rewrite actually landed
+    // in the migrated bun.lock. Otherwise nothing was redirected there and the
+    // migration was pure side effect: restore the saved bun.lockb bytes,
+    // remove the generated text lock, and drop the ledger removal record so
+    // the no-op run leaves the lockfile format untouched. The rewriter's own
+    // warning (entry-not-found / unsupported) explains WHY nothing landed.
+    if !migration_edits.is_empty() && !rewrite.files.contains_key("bun.lock") {
+        let restored = lockb_backup
+            .as_deref()
+            .is_some_and(|bytes| std::fs::write(args.common.cwd.join("bun.lockb"), bytes).is_ok());
+        if restored {
+            let _ = std::fs::remove_file(args.common.cwd.join("bun.lock"));
+            migration_edits.clear();
+            migration_warnings.push(serde_json::json!({
+                "code": "redirect_bun_lockb_migration_reverted",
+                "detail": "bun.lockb was migrated to a text bun.lock but no redirect landed \
+                           in it; the original bun.lockb was restored",
+            }));
+        } else {
+            // Restore failed (unreadable pre-migration or unwritable now):
+            // keep the migration record and say loudly that the format was
+            // converted by a run that redirected nothing.
+            migration_warnings.push(serde_json::json!({
+                "code": "redirect_bun_lockb_migrated_without_redirect",
+                "detail": "bun.lockb was migrated to a text bun.lock but no redirect landed \
+                           in it, and the original bun.lockb could not be restored; git \
+                           history is the restore path",
+            }));
+        }
+    }
 
     // Editing a Rush lock outside `rush update` desyncs the
     // pnpmShrinkwrapHash recorded in repo-state.json. When
@@ -529,7 +570,9 @@ pub(super) async fn run_redirect(
     // deleting the other mode's ledger; reconciliation is deferred (see PR Scope).
     // Read after the ledger write above so a non-dry-run reflects this run.
     let mut takeover_warnings: Vec<serde_json::Value> = Vec::new();
-    let superseded = super::classify_overlap_takeover(&args.common.cwd).await.redirect;
+    let superseded = super::classify_overlap_takeover(&args.common.cwd)
+        .await
+        .redirect;
     if !superseded.is_empty() {
         takeover_warnings.push(serde_json::json!({
             "code": super::REDIRECT_SUPERSEDES_VENDORED,

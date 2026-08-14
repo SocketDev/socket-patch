@@ -910,6 +910,93 @@ async fn scan_redirect_migrates_bun_lockb_then_redirects() {
     );
 }
 
+/// The lockb migration must be UNDONE when the rewrite lands nothing in the
+/// migrated bun.lock: here the shim's re-locked text lock holds a DIFFERENT
+/// version of the dep than the granted override, so nothing is redirectable —
+/// the run must restore the original bun.lockb bytes, remove the generated
+/// bun.lock, and write no ledger, instead of permanently converting the
+/// user's lockfile format as a side effect of a zero-redirect scan.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn zero_redirect_restores_bun_lockb_after_migration() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("package.json"),
+        format!(
+            r#"{{ "name": "consumer", "version": "0.0.0", "dependencies": {{ "{NAME}": "^{VERSION}" }} }}"#
+        ),
+    )
+    .unwrap();
+    let pkg = tmp.path().join("node_modules").join(NAME);
+    std::fs::create_dir_all(&pkg).unwrap();
+    std::fs::write(
+        pkg.join("package.json"),
+        format!(r#"{{ "name": "{NAME}", "version": "{VERSION}" }}"#),
+    )
+    .unwrap();
+    let lockb_bytes: &[u8] = b"BUN-BINARY-PLACEHOLDER";
+    std::fs::write(tmp.path().join("bun.lockb"), lockb_bytes).unwrap();
+
+    // The shim's text lock resolves the dep to a version the override does
+    // NOT target, so the bun rewriter finds no rewritable tuple.
+    let bin_dir = tmp.path().join("fakebin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let shim = bin_dir.join("bun");
+    let bun_lock_body = format!(
+        "{{\n  \"lockfileVersion\": 1,\n  \"packages\": {{\n    \
+         \"{NAME}\": [\"{NAME}@2.0.0\", \"\", {{}}, \"sha512-UPSTREAMupstream==\"],\n  \
+         }}\n}}\n"
+    );
+    std::fs::write(
+        &shim,
+        format!(
+            "#!/bin/sh\n\
+             cat > bun.lock <<'LOCK'\n{bun_lock_body}LOCK\n\
+             rm -f bun.lockb\n\
+             exit 0\n"
+        ),
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let orig_path = std::env::var("PATH").unwrap_or_default();
+    // SAFETY: single-threaded #[serial] test; PATH restored below.
+    unsafe {
+        std::env::set_var("PATH", format!("{}:{orig_path}", bin_dir.display()));
+    }
+
+    let code = run(redirect_args(tmp.path(), server.uri())).await;
+
+    unsafe {
+        std::env::set_var("PATH", orig_path);
+    }
+    assert_eq!(code, 0, "a zero-redirect run is not an error");
+
+    let restored = std::fs::read(tmp.path().join("bun.lockb"))
+        .expect("bun.lockb must be restored after a zero-redirect migration");
+    assert_eq!(
+        restored, lockb_bytes,
+        "restored bun.lockb must carry the original bytes"
+    );
+    assert!(
+        !tmp.path().join("bun.lock").exists(),
+        "the generated text lock must be removed with the migration undone"
+    );
+    assert!(
+        !tmp.path()
+            .join(".socket/vendor/redirect-state.json")
+            .exists(),
+        "no ledger may record a migration that was undone"
+    );
+}
+
 /// A `socket-patch` Command with the ambient `SOCKET_*` env surface scrubbed,
 /// for the subprocess tests below: the binary binds a wide clap env surface
 /// (SOCKET_DRY_RUN, SOCKET_OFFLINE, SOCKET_ECOSYSTEMS, SOCKET_PROXY_URL, ...),
