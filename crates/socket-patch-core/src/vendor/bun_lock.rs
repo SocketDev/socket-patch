@@ -41,7 +41,9 @@ use crate::vendor::bun_lock_text::{
 };
 
 use super::common::{already_patched_result, refused};
-use super::npm_common::{done_failure, guard_coordinates, guard_revert_uuid_dir, stage_patch_pack};
+use super::npm_common::{
+    done_failure, guard_coordinates, guard_revert_uuid_dir, stage_patch_pack, tgz_rel_leaf,
+};
 use super::path::parse_vendor_path;
 use super::state::{
     write_marker, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
@@ -107,9 +109,10 @@ pub(crate) async fn vendor_bun(
 
     // ── 3. Pre-flight: at least one rewritable instance ──────────────────
     let target_spec = format!("{name}@{version}");
+    let target_leaf = tgz_rel_leaf(name, version);
     let has_match = entries
         .iter()
-        .any(|e| classify(e, &target_spec, name).is_some());
+        .any(|e| classify(e, &target_spec, name, &target_leaf).is_some());
     if !has_match {
         return refused(
             "vendor_lock_entry_not_found",
@@ -166,7 +169,7 @@ pub(crate) async fn vendor_bun(
     let mut wiring: Vec<WiringRecord> = Vec::new();
     let mut changed = false;
     for entry in &entries {
-        let Some(shape) = classify(entry, &target_spec, name) else {
+        let Some(shape) = classify(entry, &target_spec, name, &target_leaf) else {
             continue;
         };
         let (deps_verbatim, was_ours) = match shape {
@@ -181,8 +184,16 @@ pub(crate) async fn vendor_bun(
             }
         };
         let original_line = lines[entry.line_idx].clone();
+        // Lines come from a bare `split('\n')`, so a CRLF lock's lines carry
+        // a trailing `\r` (the grammar trims it away when parsing). Re-emit
+        // it verbatim: the surgery must never mix line endings.
+        let cr = if original_line.ends_with('\r') {
+            "\r"
+        } else {
+            ""
+        };
         let new_line = format!(
-            "{indent}{key}: [\"{name}@{rel_tgz}\", {deps}, \"{integrity}\"]{comma}",
+            "{indent}{key}: [\"{name}@{rel_tgz}\", {deps}, \"{integrity}\"]{comma}{cr}",
             indent = entry.indent,
             key = entry.key_raw,
             deps = deps_verbatim,
@@ -422,8 +433,17 @@ enum TupleShape {
 
 /// Classify an entry against the target: `Some(Registry)` for the exact
 /// `name@version` registry tuple, `Some(Ours{..})` for one of our own
-/// `.socket/vendor/npm/` tuples for the same package, `None` otherwise.
-fn classify(entry: &BunEntry, target_spec: &str, name: &str) -> Option<TupleShape> {
+/// `.socket/vendor/npm/` tuples for the same `name@version` (any uuid),
+/// `None` otherwise. The Ours arm matches on the uuid-independent tarball
+/// leaf, NOT the name alone: a vendored tuple for ANOTHER version of the
+/// same package is someone else's edit (two patched versions can coexist in
+/// one lock — nested instances) and must never be cross-clobbered.
+fn classify(
+    entry: &BunEntry,
+    target_spec: &str,
+    name: &str,
+    target_leaf: &str,
+) -> Option<TupleShape> {
     let spec = decode_json_string(entry.elems.first()?)?;
     match entry.elems.len() {
         4 if spec == target_spec
@@ -439,7 +459,7 @@ fn classify(entry: &BunEntry, target_spec: &str, name: &str) -> Option<TupleShap
                 return None;
             }
             let parts = parse_vendor_path(path)?;
-            (parts.eco == "npm").then(|| TupleShape::Ours {
+            (parts.eco == "npm" && parts.leaf == target_leaf).then(|| TupleShape::Ours {
                 path: path.to_string(),
             })
         }
@@ -842,6 +862,179 @@ mod tests {
                 .iter()
                 .any(|w| w.code == "vendor_dep_manifest_stale" && w.detail.contains("bun install")),
             "loud note that the deps mirror was NOT recomputed: {warnings:?}"
+        );
+    }
+
+    const UUID_B: &str = "aaaaaaaa-1111-4111-8111-111111111111";
+
+    /// Two patched versions of ONE package must vendor independently: the
+    /// second pass must never classify the first pass's vendored tuple (same
+    /// name, OTHER version) as its own stale edit and cross-clobber it.
+    #[tokio::test]
+    async fn two_vendored_versions_of_one_package_do_not_cross_clobber() {
+        // Nested haspad/left-pad@1.3.0 (fx.record, UUID) + root left-pad@1.2.0
+        // (record_b, UUID_B), each installed where its lock entry says.
+        let fx = fixture_with(
+            BN4C_BEFORE_LOCK,
+            "node_modules/haspad/node_modules/left-pad",
+        )
+        .await;
+        let root_installed = fx.root().join("node_modules/left-pad");
+        tokio::fs::create_dir_all(&root_installed).await.unwrap();
+        tokio::fs::write(
+            root_installed.join("package.json"),
+            br#"{"name":"left-pad","version":"1.2.0"}"#,
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(root_installed.join("index.js"), ORIG_INDEX)
+            .await
+            .unwrap();
+        let mut record_b = fx.record.clone();
+        record_b.uuid = UUID_B.to_string();
+
+        let (result_a, entry_a, _) = expect_done(fx.vendor(false).await);
+        assert!(result_a.success, "{:?}", result_a.error);
+        let entry_a = entry_a.unwrap();
+
+        let blobs = fx.root().join(".socket/blobs");
+        let sources = PatchSources::blobs_only(&blobs);
+        let (result_b, entry_b, _) = expect_done(
+            vendor_bun(
+                "pkg:npm/left-pad@1.2.0",
+                &root_installed,
+                fx.root(),
+                &record_b,
+                &sources,
+                "2026-06-09T00:00:00Z",
+                false,
+                false,
+                None,
+            )
+            .await,
+        );
+        assert!(result_b.success, "{:?}", result_b.error);
+        let entry_b = entry_b.unwrap();
+
+        // Each instance points at ITS version's tarball under ITS uuid.
+        let live = fx.read_lock().await;
+        assert!(
+            live.contains(&format!(
+                "\"haspad/left-pad\": [\"left-pad@.socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz\""
+            )),
+            "the 1.3.0 instance must survive the 1.2.0 pass untouched: {live}"
+        );
+        assert!(
+            live.contains(&format!(
+                "\"left-pad\": [\"left-pad@.socket/vendor/npm/{UUID_B}/left-pad-1.2.0.tgz\""
+            )),
+            "the 1.2.0 instance lands under its own uuid: {live}"
+        );
+        // The second pass edits exactly ONE entry and keeps its true
+        // pre-vendor registry original (revert data).
+        assert_eq!(entry_b.wiring.len(), 1, "{:?}", entry_b.wiring);
+        assert_eq!(entry_b.wiring[0].key.as_deref(), Some("left-pad"));
+        assert!(
+            entry_b.wiring[0]
+                .original
+                .as_ref()
+                .and_then(Value::as_str)
+                .is_some_and(|o| o.contains("\"left-pad@1.2.0\"")),
+            "original = the registry 1.2.0 tuple: {:?}",
+            entry_b.wiring[0].original
+        );
+
+        // Full revert round-trips the lock byte-exactly, no drift warnings.
+        for entry in [&entry_b, &entry_a] {
+            let outcome = revert_bun(entry, fx.root(), false).await;
+            assert!(outcome.success, "{:?}", outcome.error);
+            assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        }
+        assert_eq!(fx.read_lock().await, BN4C_BEFORE_LOCK, "lock byte-restored");
+        assert!(!fx
+            .root()
+            .join(format!(".socket/vendor/npm/{UUID}"))
+            .exists());
+        assert!(!fx
+            .root()
+            .join(format!(".socket/vendor/npm/{UUID_B}"))
+            .exists());
+    }
+
+    /// Pre-flight: a lock whose only same-name entries are vendored tuples
+    /// for ANOTHER version has nothing rewritable — refuse, never rewrite.
+    #[tokio::test]
+    async fn preflight_refuses_when_only_other_version_vendored_tuples_exist() {
+        // BN3_AFTER_LOCK's only left-pad entry is a vendored 1.3.0 3-tuple;
+        // target 1.2.0.
+        let fx = fixture_with(BN3_AFTER_LOCK, "node_modules/left-pad").await;
+        tokio::fs::write(
+            fx.installed.join("package.json"),
+            br#"{"name":"left-pad","version":"1.2.0"}"#,
+        )
+        .await
+        .unwrap();
+        let mut record = fx.record.clone();
+        record.uuid = UUID_B.to_string();
+        let blobs = fx.root().join(".socket/blobs");
+        let sources = PatchSources::blobs_only(&blobs);
+        let outcome = vendor_bun(
+            "pkg:npm/left-pad@1.2.0",
+            &fx.installed,
+            fx.root(),
+            &record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            None,
+        )
+        .await;
+        expect_refused(outcome, "vendor_lock_entry_not_found");
+        assert_eq!(
+            fx.read_lock().await,
+            BN3_AFTER_LOCK,
+            "the other version's vendored tuple is never touched"
+        );
+        assert!(!fx
+            .root()
+            .join(format!(".socket/vendor/npm/{UUID_B}"))
+            .exists());
+    }
+
+    /// A CRLF lock must stay CRLF: the rewritten entry line re-emits its
+    /// trailing `\r`, and revert byte-restores the CRLF original.
+    #[tokio::test]
+    async fn crlf_lock_keeps_crlf_on_rewritten_lines_and_reverts_byte_exact() {
+        let crlf_before = BN3_BEFORE_LOCK.replace('\n', "\r\n");
+        let fx = fixture_with(&crlf_before, "node_modules/left-pad").await;
+        let (result, entry, _) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        let entry = entry.unwrap();
+
+        let actual = fx.actual_integrity().await;
+        assert_eq!(
+            fx.read_lock().await,
+            BN3_AFTER_LOCK
+                .replace(SPIKE_INTEGRITY, &actual)
+                .replace('\n', "\r\n"),
+            "every line — including the rewritten one — still ends \\r\\n"
+        );
+
+        // In-sync re-run stays byte-stable.
+        let lock_first = fx.read_lock().await;
+        let (result, rerun_entry, _) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        assert!(rerun_entry.is_none(), "in-sync re-run records nothing");
+        assert_eq!(fx.read_lock().await, lock_first);
+
+        let outcome = revert_bun(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        assert_eq!(
+            fx.read_lock().await,
+            crlf_before,
+            "CRLF original byte-restored"
         );
     }
 
