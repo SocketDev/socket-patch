@@ -1,15 +1,20 @@
 //! Gem (Bundler) `setup` support: wire a Ruby project for automatic patching.
 //!
-//! Bundler has no after-each-install hook that survives a cached/no-op
-//! `bundle install`, but it loads any declared **plugin** during the Gemfile
-//! pass on every `bundle` invocation. So setup delivers the gate as a
-//! generated, git-committed Bundler plugin plus a `plugin` directive in the
-//! Gemfile:
+//! Bundler loads a declared **plugin** whenever one of its subscribed hook
+//! events fires — on every `bundle install`, fresh AND fully cached (verified
+//! against bundler 2.7 and 4.0). So setup delivers the gate as a generated,
+//! git-committed Bundler plugin plus a `plugin` directive in the Gemfile:
 //!
 //!   * `.socket/bundler-plugin/{plugins.rb, socket-patch.gemspec}` — a generated
 //!     plugin whose `plugins.rb` re-runs `socket-patch apply --ecosystems gem`
-//!     on every `bundle install` (load-time digest gate + `after-install-all`
-//!     hook), failing the build loudly on a patch failure;
+//!     on every `bundle install` (digest-gated load-time + per-gem
+//!     `after-install` triggers, forced `after-install-all` re-apply). A patch
+//!     failure warns with a remediation and lets the install continue —
+//!     bundler evaluates `plugins.rb` at plugin REGISTRATION, before any
+//!     project gem is installed, so raising there would deadlock a fresh
+//!     clone on its own first `bundle install` (plugin registration fails and
+//!     every retry fails identically). `SOCKET_PATCH_STRICT=1` restores
+//!     raise-on-failure (`Bundler::BundlerError`);
 //!   * a managed block appended to the `Gemfile` that references the plugin via
 //!     `plugin "socket-patch", path: File.expand_path(".socket/bundler-plugin",
 //!     __dir__)`. The source must be `path:` — Bundler fetches `git:` plugin
@@ -405,21 +410,22 @@ mod tests {
 
     #[test]
     fn test_templates_are_well_formed() {
-        // The plugin must carry the ownership marker and both triggers.
+        // The plugin must carry the ownership marker and all three triggers.
         assert!(PLUGINS_RB.starts_with(GENERATED_MARKER));
         assert!(PLUGINS_RB.contains("def apply!"));
-        // Load-time trigger + after-install-all hook.
+        // Load-time trigger + the per-gem after-install hook (the only event
+        // bundler fires during `bundle pristine`) + after-install-all hook.
         assert!(PLUGINS_RB.contains("SocketPatch.apply!"));
+        assert!(PLUGINS_RB.contains("Bundler::Plugin.add_hook(\"after-install\")"));
         assert!(PLUGINS_RB.contains("Bundler::Plugin.add_hook(\"after-install-all\")"));
-        // The applier shells the gem-scoped offline apply and fails loud.
+        // The applier shells the gem-scoped offline apply.
         assert!(PLUGINS_RB.contains("\"apply\""));
         assert!(PLUGINS_RB.contains("\"--ecosystems\", \"gem\", \"--offline\""));
-        assert!(PLUGINS_RB.contains("BundlerError"));
-        // Stamp travels with the gems (under Bundler.bundle_path).
-        assert!(PLUGINS_RB.contains("Bundler.bundle_path"));
-        // Digest folds in Gemfile.lock + the manifest.
+        // Digest folds in Gemfile.lock + the manifest + the on-disk state of
+        // the patch target files (so an out-of-band reversion is detected).
         assert!(PLUGINS_RB.contains("Gemfile.lock"));
         assert!(PLUGINS_RB.contains("manifest.json"));
+        assert!(PLUGINS_RB.contains("def patch_target_files"));
         // The gemspec names the plugin the Gemfile directive references.
         assert!(GEMSPEC.starts_with(GENERATED_MARKER));
         assert!(GEMSPEC.contains("\"socket-patch\""));
@@ -428,6 +434,68 @@ mod tests {
         // refuses to load the plugin ("plugin paths don't exist: .../lib")
         // and silently continues without it.
         assert!(GEMSPEC.contains("s.require_paths = [\".\"]"));
+    }
+
+    #[test]
+    fn test_plugin_template_failure_policy_and_stamp_location() {
+        // Failure policy: tolerant by default — a patch failure WARNS (with
+        // the manual-apply remediation) and lets `bundle install` continue.
+        // Bundler evaluates plugins.rb at plugin REGISTRATION, before any
+        // project gem is installed; a raise there deadlocks a fresh clone on
+        // its own first `bundle install` (plugin registration fails, every
+        // retry fails identically — reproduced against bundler 2.7 and 4.0).
+        assert!(
+            PLUGINS_RB.contains("def report_failure"),
+            "the applier must route failures through the tolerant reporter"
+        );
+        assert!(
+            !PLUGINS_RB.contains("def fail!"),
+            "the unconditional raise helper must be gone — it is what \
+             deadlocked bootstrap installs"
+        );
+        assert!(
+            PLUGINS_RB.contains("warn(message)"),
+            "tolerant mode must surface the failure as a stderr warning"
+        );
+        assert!(
+            PLUGINS_RB.contains("socket-patch apply --ecosystems gem"),
+            "the warning must name the manual remediation command"
+        );
+        // Strict escape hatch: SOCKET_PATCH_STRICT=1 restores raise-on-failure.
+        assert!(PLUGINS_RB.contains("SOCKET_PATCH_STRICT"));
+        assert!(
+            PLUGINS_RB.contains("BundlerError"),
+            "strict mode must still raise Bundler::BundlerError"
+        );
+        // Stamp location: project-scoped under .socket/, NOT a fixed-name file
+        // in Bundler.bundle_path (machine-global with no bundle path
+        // configured, shared and clobbered across every project on the host).
+        assert!(PLUGINS_RB.contains("STAMP_NAME = \"gem-plugin-stamp\""));
+        assert!(PLUGINS_RB.contains("File.join(socket_dir, STAMP_NAME)"));
+        // The legacy global stamp is cleaned up, never read.
+        assert!(PLUGINS_RB.contains("LEGACY_STAMP_NAME = \".socket-patch-gem-stamp\""));
+        assert!(PLUGINS_RB.contains("def remove_legacy_stamp"));
+        // The stamp must be excluded from its own digest inputs, or every
+        // write would invalidate the digest it records.
+        assert!(PLUGINS_RB.contains("p != stamp_path"));
+
+        // The published-gem twin must carry the same applier contract.
+        let published = include_str!("../../../../../gem/socket-patch-bundler/plugins.rb");
+        for needle in [
+            "def report_failure",
+            "SOCKET_PATCH_STRICT",
+            "STAMP_NAME = \"gem-plugin-stamp\"",
+            "def remove_legacy_stamp",
+            "def patch_target_files",
+            "Bundler::Plugin.add_hook(\"after-install\")",
+            "Bundler::Plugin.add_hook(\"after-install-all\")",
+        ] {
+            assert!(
+                published.contains(needle),
+                "published plugins.rb drifted from the template: missing {needle:?}"
+            );
+        }
+        assert!(!published.contains("def fail!"));
     }
 
     #[tokio::test]
