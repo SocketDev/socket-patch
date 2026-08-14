@@ -27,7 +27,7 @@ pub mod golang_local;
 mod state;
 pub use state::{
     load_redirect_state, save_redirect_state, CorruptRedirectState, RedirectState,
-    REDIRECT_STATE_CORRUPT_REL, REDIRECT_STATE_REL,
+    REDIRECT_STATE_REL,
 };
 
 /// One ecosystem's integrity hashes (mirrors the TS `PatchArtifactIntegrity`).

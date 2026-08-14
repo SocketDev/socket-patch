@@ -1890,62 +1890,67 @@ async fn redirect_json_mode_failures_emit_error_envelope() {
     assert_error_envelope(&out, "reference-resolve failure");
 }
 
-/// The write-failure bail-outs (legs 3-4 of the four `--json` failure
-/// exits) must also emit the machine-readable envelope: a rewritten
-/// lockfile that cannot be written back, and a revert ledger that cannot
-/// be persisted. Both are driven with real filesystem obstructions so the
-/// run reaches the write in question and fails there. (Legs 1-2 — the
-/// discovery-detail and reference-resolve failures — are pinned by
-/// `redirect_json_mode_failures_emit_error_envelope` above.)
+/// Shared by the write-failure envelope tests below: even a run that dies on
+/// a filesystem obstruction must exit 1 with a machine-readable `--json`
+/// error envelope on stdout.
+fn assert_write_failure_envelope(out: &std::process::Output, leg: &str) {
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "{leg}: failure exit; stdout=\n{stdout}\nstderr=\n{stderr}"
+    );
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!(
+            "{leg}: --json stdout must be a parseable envelope even on failure ({e}); \
+             stdout=\n{stdout}"
+        )
+    });
+    assert_eq!(v["status"], "error", "{leg}: status; stdout=\n{stdout}");
+    assert!(
+        v["error"].as_str().is_some_and(|m| !m.is_empty()),
+        "{leg}: envelope must carry the error message; stdout=\n{stdout}"
+    );
+    assert_eq!(
+        v["redirect"]["mode"], "hosted",
+        "{leg}: envelope must identify the mode; stdout=\n{stdout}"
+    );
+}
+
+/// Shared driver for the write-failure legs: a hosted `scan --redirect --json`
+/// subprocess against the obstructed project in `tmp`.
+async fn run_hosted_json_scan(tmp: &std::path::Path, server: &MockServer) -> std::process::Output {
+    scrubbed_cli()
+        .args([
+            "scan",
+            "--redirect",
+            "--yes",
+            "--json",
+            "--cwd",
+            tmp.to_str().unwrap(),
+            "--api-url",
+            &server.uri(),
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+        ])
+        .output()
+        .expect("run socket-patch")
+}
+
+/// Leg 3 of the four `--json` failure exits: the rewritten lockfile cannot
+/// be written back (read-only file; the rewriter read it fine moments
+/// earlier). A real filesystem obstruction drives the run to the write in
+/// question and fails it there. (Legs 1-2 — the discovery-detail and
+/// reference-resolve failures — are pinned by
+/// `redirect_json_mode_failures_emit_error_envelope` above; leg 4 — the
+/// ledger write — is pinned by the unix-only
+/// `redirect_ledger_write_failure_leaves_project_files_untouched` below.)
 #[tokio::test]
 #[serial]
 async fn redirect_json_mode_write_failures_emit_error_envelope() {
-    fn assert_error_envelope(out: &std::process::Output, leg: &str) {
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert_eq!(
-            out.status.code(),
-            Some(1),
-            "{leg}: failure exit; stdout=\n{stdout}\nstderr=\n{stderr}"
-        );
-        let v: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
-            panic!(
-                "{leg}: --json stdout must be a parseable envelope even on failure ({e}); \
-                 stdout=\n{stdout}"
-            )
-        });
-        assert_eq!(v["status"], "error", "{leg}: status; stdout=\n{stdout}");
-        assert!(
-            v["error"].as_str().is_some_and(|m| !m.is_empty()),
-            "{leg}: envelope must carry the error message; stdout=\n{stdout}"
-        );
-        assert_eq!(
-            v["redirect"]["mode"], "hosted",
-            "{leg}: envelope must identify the mode; stdout=\n{stdout}"
-        );
-    }
-    async fn run_leg(tmp: &std::path::Path, server: &MockServer) -> std::process::Output {
-        scrubbed_cli()
-            .args([
-                "scan",
-                "--redirect",
-                "--yes",
-                "--json",
-                "--cwd",
-                tmp.to_str().unwrap(),
-                "--api-url",
-                &server.uri(),
-                "--org",
-                ORG,
-                "--api-token",
-                "fake",
-            ])
-            .output()
-            .expect("run socket-patch")
-    }
-
-    // Leg 3 — the rewritten lockfile cannot be written back (read-only
-    // file; the rewriter read it fine moments earlier).
     let server = MockServer::start().await;
     mock_discovery(&server).await;
     mock_reference(&server).await;
@@ -1956,14 +1961,24 @@ async fn redirect_json_mode_write_failures_emit_error_envelope() {
     let mut perms = std::fs::metadata(&lock).unwrap().permissions();
     perms.set_readonly(true);
     std::fs::set_permissions(&lock, perms).unwrap();
-    let out = run_leg(tmp.path(), &server).await;
-    assert_error_envelope(&out, "lockfile-write failure");
+    let out = run_hosted_json_scan(tmp.path(), &server).await;
+    assert_write_failure_envelope(&out, "lockfile-write failure");
+}
 
-    // Leg 4 — the revert ledger cannot be persisted: `.socket/vendor` is
-    // read-only, so the atomic writer's stage file cannot be created. The
-    // ledger is written BEFORE the project files (its recorded originals are
-    // the only revert path), so the failure must also leave the lockfile
-    // untouched — not rewritten-but-unrevertable.
+/// Leg 4 of the four `--json` failure exits: the revert ledger cannot be
+/// persisted — `.socket/vendor` is read-only, so the atomic writer's stage
+/// file cannot be created. The ledger is written BEFORE the project files
+/// (its recorded originals are the only revert path), so the failure must
+/// also leave the lockfile untouched — not rewritten-but-unrevertable.
+///
+/// unix-only: the obstruction is a read-only DIRECTORY, and Windows ignores
+/// FILE_ATTRIBUTE_READONLY on directories for file creation, so the stage
+/// file would be created fine there (leg 3's read-only FILE does obstruct on
+/// Windows and stays cross-platform).
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn redirect_ledger_write_failure_leaves_project_files_untouched() {
     let server = MockServer::start().await;
     mock_discovery(&server).await;
     mock_reference(&server).await;
@@ -1976,11 +1991,11 @@ async fn redirect_json_mode_write_failures_emit_error_envelope() {
     let mut perms = std::fs::metadata(&vendor_dir).unwrap().permissions();
     perms.set_readonly(true);
     std::fs::set_permissions(&vendor_dir, perms.clone()).unwrap();
-    let out = run_leg(tmp.path(), &server).await;
+    let out = run_hosted_json_scan(tmp.path(), &server).await;
     // Restore writability so the tempdir can be cleaned up.
     perms.set_readonly(false);
     std::fs::set_permissions(&vendor_dir, perms).unwrap();
-    assert_error_envelope(&out, "ledger-write failure");
+    assert_write_failure_envelope(&out, "ledger-write failure");
     assert_eq!(
         std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap(),
         lock_before,

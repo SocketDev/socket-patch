@@ -22,10 +22,6 @@ use crate::utils::fs::atomic_write_bytes;
 /// Repo-relative path of the redirect ledger.
 pub const REDIRECT_STATE_REL: &str = ".socket/vendor/redirect-state.json";
 
-/// Repo-relative path a malformed ledger is quarantined to (see
-/// [`CorruptRedirectState::quarantine`]).
-pub const REDIRECT_STATE_CORRUPT_REL: &str = ".socket/vendor/redirect-state.json.corrupt";
-
 /// On-disk schema for the redirect ledger.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RedirectState {
