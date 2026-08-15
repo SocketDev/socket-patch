@@ -154,7 +154,8 @@ fn report_no_files(args: &SetupArgs, counts: &[(&str, i64)]) -> i32 {
         map.insert("files".to_string(), serde_json::json!([]));
         println!(
             "{}",
-            serde_json::to_string_pretty(&serde_json::Value::Object(map)).unwrap()
+            serde_json::to_string_pretty(&serde_json::Value::Object(map))
+                .expect("serializing an in-memory JSON value cannot fail")
         );
     } else if !args.common.silent {
         println!("No package.json, Python, Bundler, or Composer project found");
@@ -180,7 +181,9 @@ fn confirm_proceed(prompt: &str) -> bool {
         return true;
     }
     print!("{prompt}");
-    io::stdout().flush().unwrap();
+    io::stdout()
+        .flush()
+        .expect("failed to write the confirmation prompt to stdout");
     let mut answer = String::new();
     if io::stdin().read_line(&mut answer).is_err() {
         // Terminals can deliver non-UTF-8 bytes (e.g. a Latin-1 paste);
@@ -1042,7 +1045,7 @@ async fn run_check(args: &SetupArgs) -> i32 {
                     })
                 }).collect::<Vec<_>>(),
             }))
-            .unwrap()
+            .expect("serializing an in-memory JSON value cannot fail")
         );
     } else if !args.common.silent {
         println!("\nConfiguration status:\n");
@@ -1493,7 +1496,11 @@ fn print_remove_envelope(
     if !warnings.is_empty() {
         obj["warnings"] = serde_json::json!(warnings);
     }
-    println!("{}", serde_json::to_string_pretty(&obj).unwrap());
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&obj)
+            .expect("serializing an in-memory JSON value cannot fail")
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1893,5 +1900,9 @@ fn print_setup_envelope(
     if !warnings.is_empty() {
         obj["warnings"] = serde_json::json!(warnings);
     }
-    println!("{}", serde_json::to_string_pretty(&obj).unwrap());
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&obj)
+            .expect("serializing an in-memory JSON value cannot fail")
+    );
 }

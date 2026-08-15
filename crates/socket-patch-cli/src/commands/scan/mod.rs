@@ -297,7 +297,7 @@ async fn embed_vex_into_json(
     match generate_vex_from_manifest_path(common, &params, manifest_path).await {
         Ok(summary) => {
             result["vex"] = serde_json::json!({
-                "path": vex_args.vex.as_ref().unwrap().display().to_string(),
+                "path": vex_args.vex.as_ref().expect("--vex is Some: guarded by the early return above").display().to_string(),
                 "statements": summary.statements,
                 "format": "openvex-0.2.0",
             });
@@ -341,7 +341,11 @@ async fn embed_vex_human(
                 println!(
                     "Wrote OpenVEX document with {} statement(s) to {}",
                     summary.statements,
-                    vex_args.vex.as_ref().unwrap().display(),
+                    vex_args
+                        .vex
+                        .as_ref()
+                        .expect("--vex is Some: guarded by the early return above")
+                        .display(),
                 );
             }
             0
@@ -411,7 +415,11 @@ async fn discover_selected(
 fn emit_discovery_error_json(result: &mut serde_json::Value, message: &str) {
     result["status"] = serde_json::json!("error");
     result["error"] = serde_json::json!(message);
-    println!("{}", serde_json::to_string_pretty(result).unwrap());
+    println!(
+        "{}",
+        serde_json::to_string_pretty(result)
+            .expect("serializing an in-memory JSON value cannot fail")
+    );
 }
 
 /// The `DownloadParams` every scan-driven download shares. Only the output
@@ -988,7 +996,11 @@ pub async fn run(mut args: ScanArgs) -> i32 {
                 "packages": [],
                 "updates": [],
             });
-            println!("{}", serde_json::to_string_pretty(&result).unwrap());
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&result)
+                    .expect("serializing an in-memory JSON value cannot fail")
+            );
         } else {
             eprintln!("Error: {err}");
         }
@@ -1024,7 +1036,10 @@ pub async fn run(mut args: ScanArgs) -> i32 {
     // `--vex` side-effect reads the manifest at several terminal returns,
     // including the early "no packages" exit before the GC block.
     let manifest_path = args.common.resolved_manifest_path();
-    let socket_dir = manifest_path.parent().unwrap().to_path_buf();
+    let socket_dir = manifest_path
+        .parent()
+        .expect("manifest path names a file, so it has a parent")
+        .to_path_buf();
 
     let overrides = args.common.api_client_overrides();
     let (mut api_client, mut use_public_proxy) =
@@ -1186,7 +1201,11 @@ pub async fn run(mut args: ScanArgs) -> i32 {
             }
             let code =
                 embed_vex_into_json(&args.common, &args.vex, &manifest_path, 0, &mut result).await;
-            println!("{}", serde_json::to_string_pretty(&result).unwrap());
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&result)
+                    .expect("serializing an in-memory JSON value cannot fail")
+            );
             return code;
         } else if args.common.silent {
             // Errors only: the empty-scan hint is informational.
@@ -1347,7 +1366,11 @@ pub async fn run(mut args: ScanArgs) -> i32 {
                 "packages": [],
                 "updates": [],
             });
-            println!("{}", serde_json::to_string_pretty(&result).unwrap());
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&result)
+                    .expect("serializing an in-memory JSON value cannot fail")
+            );
         } else {
             eprintln!("Error: all {total_batches} API batch queries failed: {err}");
         }
@@ -1676,7 +1699,11 @@ pub async fn run(mut args: ScanArgs) -> i32 {
             &mut result,
         )
         .await;
-        println!("{}", serde_json::to_string_pretty(&result).unwrap());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&result)
+                .expect("serializing an in-memory JSON value cannot fail")
+        );
         return final_code;
     }
 

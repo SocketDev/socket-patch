@@ -269,7 +269,11 @@ async fn run_vendor_json_path(
         if args.vex.vex.is_some() {
             result["vex"] = serde_json::json!({ "skipped": true, "reason": "dry_run" });
         }
-        println!("{}", serde_json::to_string_pretty(&result).unwrap());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&result)
+                .expect("serializing an in-memory JSON value cannot fail")
+        );
         return 0;
     }
 
@@ -369,7 +373,11 @@ async fn run_vendor_json_path(
                 "code": code,
                 "message": message,
             });
-            println!("{}", serde_json::to_string_pretty(&result).unwrap());
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&result)
+                    .expect("serializing an in-memory JSON value cannot fail")
+            );
             return 1;
         }
     };
@@ -379,7 +387,11 @@ async fn run_vendor_json_path(
 
     let final_code =
         embed_vex_into_json(&args.common, &args.vex, manifest_path, vendor_code, result).await;
-    println!("{}", serde_json::to_string_pretty(&result).unwrap());
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&result)
+            .expect("serializing an in-memory JSON value cannot fail")
+    );
     final_code
 }
 

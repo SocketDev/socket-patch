@@ -69,7 +69,11 @@ pub fn upsert_module_lines(
     let mut pending = want.iter().map(String::as_str).peekable();
     for line in lines {
         while pending.peek().is_some_and(|w| *w < line) {
-            out.push(pending.next().unwrap());
+            out.push(
+                pending
+                    .next()
+                    .expect("peek() just confirmed a pending element"),
+            );
         }
         out.push(line);
     }

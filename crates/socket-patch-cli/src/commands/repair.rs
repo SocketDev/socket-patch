@@ -234,7 +234,9 @@ async fn repair_inner(
         .await
         .map_err(|e| e.to_string())?;
 
-    let socket_dir = manifest_path.parent().unwrap();
+    let socket_dir = manifest_path
+        .parent()
+        .expect("manifest path names a file, so it has a parent");
     let blobs_path = socket_dir.join("blobs");
     let diffs_path = socket_dir.join("diffs");
     let packages_path = socket_dir.join("packages");

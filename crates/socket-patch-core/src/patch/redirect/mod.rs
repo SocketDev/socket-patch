@@ -443,7 +443,8 @@ fn rewrite_pypi_requirements(
     if pypi.is_empty() || !files.contains_key("requirements.txt") {
         return;
     }
-    let name_re = Regex::new(r"^([A-Za-z0-9._-]+)\s*(?:[=<>~!]=?|@|;|\s|$)").unwrap();
+    let name_re = Regex::new(r"^([A-Za-z0-9._-]+)\s*(?:[=<>~!]=?|@|;|\s|$)")
+        .expect("static requirements-name regex is valid");
     let mut lines: Vec<String> = files["requirements.txt"]
         .split('\n')
         .map(|s| s.to_string())
@@ -822,9 +823,14 @@ fn strip_toml_key_quotes(s: &str) -> String {
 enum CargoTomlSection {
     /// `[dependencies]` & friends (dev/build/target-specific) plus
     /// `[workspace.dependencies]` — entries are `key = value` lines.
-    DepTable { workspace: bool },
+    DepTable {
+        workspace: bool,
+    },
     /// The multi-line table form `[dependencies.<key>]` (all variants).
-    DepEntry { key: String, workspace: bool },
+    DepEntry {
+        key: String,
+        workspace: bool,
+    },
     Other,
 }
 
@@ -851,7 +857,9 @@ fn classify_cargo_section(header_inner: &str) -> CargoTomlSection {
             key: strip_toml_key_quotes(key),
             workspace: true,
         },
-        ["target", .., k] if is_cargo_dep_kind(k) => CargoTomlSection::DepTable { workspace: false },
+        ["target", .., k] if is_cargo_dep_kind(k) => {
+            CargoTomlSection::DepTable { workspace: false }
+        }
         ["target", mid @ .., key] if mid.len() >= 2 && is_cargo_dep_kind(mid[mid.len() - 1]) => {
             CargoTomlSection::DepEntry {
                 key: strip_toml_key_quotes(key),
@@ -927,13 +935,20 @@ fn plan_cargo_toml(
     reg: &str,
 ) -> Result<CargoTomlPlan, CargoTomlPlanError> {
     let lines: Vec<&str> = content.split('\n').collect();
-    let header_re = Regex::new(r"^\[([^\]]+)\]\s*(?:#.*)?$").unwrap();
-    let package_re = Regex::new(r#"\bpackage\s*=\s*"([^"]*)""#).unwrap();
-    let registry_val_re = Regex::new(r#"\bregistry\s*=\s*"([^"]*)""#).unwrap();
-    let registry_key_re = Regex::new(r"\bregistry\s*=").unwrap();
-    let registry_index_re = Regex::new(r"\bregistry-index\s*=").unwrap();
-    let workspace_key_re = Regex::new(r"\bworkspace\s*=").unwrap();
-    let path_git_re = Regex::new(r"\b(?:path|git)\s*=").unwrap();
+    let header_re =
+        Regex::new(r"^\[([^\]]+)\]\s*(?:#.*)?$").expect("static section-header regex is valid");
+    let package_re =
+        Regex::new(r#"\bpackage\s*=\s*"([^"]*)""#).expect("static package-key regex is valid");
+    let registry_val_re =
+        Regex::new(r#"\bregistry\s*=\s*"([^"]*)""#).expect("static registry-value regex is valid");
+    let registry_key_re =
+        Regex::new(r"\bregistry\s*=").expect("static registry-key probe regex is valid");
+    let registry_index_re =
+        Regex::new(r"\bregistry-index\s*=").expect("static registry-index probe regex is valid");
+    let workspace_key_re =
+        Regex::new(r"\bworkspace\s*=").expect("static workspace-key probe regex is valid");
+    let path_git_re =
+        Regex::new(r"\b(?:path|git)\s*=").expect("static path/git probe regex is valid");
 
     // A pending occurrence: what was found, resolved to an action in pass 2
     // (workspace-inheriting entries need the whole file scanned first).
@@ -955,7 +970,11 @@ fn plan_cargo_toml(
         }
         if trimmed.starts_with('[') && !trimmed.starts_with("[[") {
             section = match header_re.captures(trimmed) {
-                Some(c) => classify_cargo_section(c.get(1).unwrap().as_str()),
+                Some(c) => classify_cargo_section(
+                    c.get(1)
+                        .expect("header_re always captures group 1 (section name)")
+                        .as_str(),
+                ),
                 None => CargoTomlSection::Other,
             };
             if let CargoTomlSection::DepEntry { key, workspace } = section.clone() {
@@ -1015,9 +1034,7 @@ fn plan_cargo_toml(
                     // Inserting `registry = …` next to `registry-index` makes
                     // cargo reject the manifest as ambiguous — refuse, like
                     // the inline-table branch does.
-                    pending.push(Pending::Refuse(
-                        "pinned to another registry".to_string(),
-                    ));
+                    pending.push(Pending::Refuse("pinned to another registry".to_string()));
                 } else if let Some((line_idx, value)) = find_value("registry") {
                     if value == reg {
                         pending.push(Pending::Action(CargoTomlAction::Already));
@@ -1126,7 +1143,10 @@ fn plan_cargo_toml(
                     let new_text = registry_val_re
                         .replace(raw, format!("registry = \"{reg}\"").as_str())
                         .into_owned();
-                    pending.push(Pending::Action(CargoTomlAction::ReplaceLine { idx, new_text }));
+                    pending.push(Pending::Action(CargoTomlAction::ReplaceLine {
+                        idx,
+                        new_text,
+                    }));
                     if workspace {
                         workspace_pinned = true;
                     }
@@ -1136,9 +1156,7 @@ fn plan_cargo_toml(
                     )));
                 }
             } else if registry_key_re.is_match(inner) || registry_index_re.is_match(inner) {
-                pending.push(Pending::Refuse(
-                    "pinned to another registry".to_string(),
-                ));
+                pending.push(Pending::Refuse("pinned to another registry".to_string()));
             } else {
                 // Rebuild the line: everything through `{`, the trimmed
                 // inner, the registry pin, then `}` + any trailing bytes
@@ -1157,7 +1175,10 @@ fn plan_cargo_toml(
                     &raw[..=brace],
                     &raw[close_raw..]
                 );
-                pending.push(Pending::Action(CargoTomlAction::ReplaceLine { idx, new_text }));
+                pending.push(Pending::Action(CargoTomlAction::ReplaceLine {
+                    idx,
+                    new_text,
+                }));
                 if workspace {
                     workspace_pinned = true;
                 }
@@ -1171,9 +1192,10 @@ fn plan_cargo_toml(
             // line after the entry is untouched (the old `\s*$` regex
             // swallowed it).
             let c = regex::escape(crate_name);
-            let line_re =
-                Regex::new(&format!(r#"^(\s*(?:{c}|"{c}")\s*=\s*)"([^"]+)"([ \t]*(?:#.*)?)$"#))
-                    .unwrap();
+            let line_re = Regex::new(&format!(
+                r#"^(\s*(?:{c}|"{c}")\s*=\s*)"([^"]+)"([ \t]*(?:#.*)?)$"#
+            ))
+            .expect("line regex from the escaped crate name is valid");
             let Some(m) = line_re.captures(raw) else {
                 pending.push(Pending::Refuse(
                     "unsupported version-entry spelling".to_string(),
@@ -1182,11 +1204,20 @@ fn plan_cargo_toml(
             };
             let new_text = format!(
                 "{}{{ version = \"{}\", registry = \"{reg}\" }}{}",
-                m.get(1).unwrap().as_str(),
-                m.get(2).unwrap().as_str(),
-                m.get(3).unwrap().as_str()
+                m.get(1)
+                    .expect("line_re always captures group 1 (key prefix)")
+                    .as_str(),
+                m.get(2)
+                    .expect("line_re always captures group 2 (version)")
+                    .as_str(),
+                m.get(3)
+                    .expect("line_re always captures group 3 (trailing comment)")
+                    .as_str()
             );
-            pending.push(Pending::Action(CargoTomlAction::ReplaceLine { idx, new_text }));
+            pending.push(Pending::Action(CargoTomlAction::ReplaceLine {
+                idx,
+                new_text,
+            }));
             if workspace {
                 workspace_pinned = true;
             }
@@ -1305,7 +1336,8 @@ fn plan_cargo_lock(
     }
     let original = content[block_start..block_end].to_string();
     let mut body = content[body_start..block_end].to_string();
-    let source_re = Regex::new(r#"(?m)^source = "[^"]*"$"#).unwrap();
+    let source_re =
+        Regex::new(r#"(?m)^source = "[^"]*"$"#).expect("static lock source-line regex is valid");
     if source_re.is_match(&body) {
         body = source_re
             .replace(&body, format!("source = \"{index_url}\"").as_str())
@@ -1313,13 +1345,15 @@ fn plan_cargo_lock(
     } else {
         body = format!("source = \"{index_url}\"\n{body}");
     }
-    let checksum_re = Regex::new(r#"(?m)^checksum = "[^"]*"$"#).unwrap();
+    let checksum_re = Regex::new(r#"(?m)^checksum = "[^"]*"$"#)
+        .expect("static lock checksum-line regex is valid");
     if checksum_re.is_match(&body) {
         body = checksum_re
             .replace(&body, format!("checksum = \"{cksum}\"").as_str())
             .to_string();
     } else {
-        let after_source = Regex::new(r#"(?m)^(source = "[^"]*"\n)"#).unwrap();
+        let after_source = Regex::new(r#"(?m)^(source = "[^"]*"\n)"#)
+            .expect("static source-line anchor regex is valid");
         body = after_source
             .replace(&body, format!("${{1}}checksum = \"{cksum}\"\n").as_str())
             .to_string();
@@ -1348,7 +1382,10 @@ fn plan_cargo_lock(
 /// over an already-redirected block (no edit, no warning) from a genuinely
 /// missing package (the caller warns AND skips the dep entirely).
 enum CargoLockPlan {
-    Rewritten { content: String, edit: Box<FileEdit> },
+    Rewritten {
+        content: String,
+        edit: Box<FileEdit>,
+    },
     AlreadyRedirected,
     NotFound,
 }
@@ -1506,7 +1543,8 @@ fn rewrite_pnpm_lock(
             + "/"
             + &regex::escape(&dep.version)
             + r"(?:[_(][^:\n]*)?):";
-        let legacy_re = Regex::new(&legacy_pat).unwrap();
+        let legacy_re = Regex::new(&legacy_pat)
+            .expect("legacy-key regex from the escaped name and version is valid");
         let mut legacy_keys: Vec<String> = Vec::new();
         for (lock_key, content, _) in &contents {
             for caps in legacy_re.captures_iter(content) {
@@ -1532,16 +1570,29 @@ fn rewrite_pnpm_lock(
             + r"'|/?"
             + &key
             + r"):\n(?: {4,}.*\n)*? {4,}resolution: )\{([^}\n]*)\}";
-        let re = Regex::new(&pat).unwrap();
+        let re =
+            Regex::new(&pat).expect("resolution regex from the escaped name@version key is valid");
         let mut matched_any = false;
         for (key, content, changed) in &mut contents {
             let Some(caps) = re.captures(content) else {
                 continue;
             };
             matched_any = true;
-            let whole = caps.get(0).unwrap().as_str().to_string();
-            let prefix = caps.get(1).unwrap().as_str().to_string();
-            let inner = caps.get(2).unwrap().as_str().to_string();
+            let whole = caps
+                .get(0)
+                .expect("group 0 is the whole match")
+                .as_str()
+                .to_string();
+            let prefix = caps
+                .get(1)
+                .expect("resolution regex always captures group 1 (prefix)")
+                .as_str()
+                .to_string();
+            let inner = caps
+                .get(2)
+                .expect("resolution regex always captures group 2 (inner)")
+                .as_str()
+                .to_string();
             let original = format!("{{{inner}}}");
             let mut fields: Vec<String> = vec![
                 format!("integrity: {sha512}"),
@@ -1598,7 +1649,10 @@ fn rewrite_yarn_classic(
         return;
     }
     let raw = &files["yarn.lock"];
-    if Regex::new(r"(?m)^__metadata:").unwrap().is_match(raw) {
+    if Regex::new(r"(?m)^__metadata:")
+        .expect("static __metadata probe regex is valid")
+        .is_match(raw)
+    {
         return; // yarn-berry — not classic
     }
     // CRLF locks (core.autocrlf Windows checkouts — yarn v1 parses them fine)
@@ -1626,8 +1680,10 @@ fn rewrite_yarn_classic(
         raw
     };
     let mut blocks: Vec<String> = content.split("\n\n").map(String::from).collect();
-    let resolved_re = Regex::new(r#"\n {2}resolved "[^"]*""#).unwrap();
-    let integrity_re = Regex::new(r"\n {2}integrity [^\n]*").unwrap();
+    let resolved_re =
+        Regex::new(r#"\n {2}resolved "[^"]*""#).expect("static resolved-line regex is valid");
+    let integrity_re =
+        Regex::new(r"\n {2}integrity [^\n]*").expect("static integrity-line regex is valid");
     let mut changed = false;
     for dep in &npm {
         let fname = full_name(dep);
@@ -1640,7 +1696,7 @@ fn rewrite_yarn_classic(
         };
         let version_re =
             Regex::new(&(String::from(r#"\n {2}version ""#) + &regex::escape(&dep.version) + "\""))
-                .unwrap();
+                .expect("version regex from the escaped version is valid");
         let mut matched_any = false;
         let mut alias_skipped = false;
         for block in blocks.iter_mut() {
@@ -1829,7 +1885,10 @@ fn rewrite_yarn_berry(
     }
     let content = &files["yarn.lock"];
     // The classic rewriter handles a v1 lock; berry stays out of its way.
-    if !Regex::new(r"(?m)^__metadata:").unwrap().is_match(content) {
+    if !Regex::new(r"(?m)^__metadata:")
+        .expect("static __metadata probe regex is valid")
+        .is_match(content)
+    {
         return;
     }
 
@@ -1879,8 +1938,10 @@ fn rewrite_yarn_berry(
     }
 
     let mut blocks: Vec<String> = content.split("\n\n").map(String::from).collect();
-    let resolution_re = Regex::new(r#"\n {2}resolution: "[^"]*""#).unwrap();
-    let checksum_re = Regex::new(r"\n {2}checksum: [^\n]*").unwrap();
+    let resolution_re =
+        Regex::new(r#"\n {2}resolution: "[^"]*""#).expect("static resolution-line regex is valid");
+    let checksum_re =
+        Regex::new(r"\n {2}checksum: [^\n]*").expect("static checksum-line regex is valid");
     let mut changed = false;
     for dep in &npm {
         let fname = full_name(dep);
@@ -1897,7 +1958,7 @@ fn rewrite_yarn_berry(
         // Berry versions are UNQUOTED (`  version: 1.3.0`, spike B3 ground truth).
         let version_re =
             Regex::new(&(String::from(r"\n {2}version: ") + &regex::escape(&dep.version) + "\n"))
-                .unwrap();
+                .expect("version regex from the escaped version is valid");
         let mut matched_any = false;
         let mut alias_skipped = false;
         for block in blocks.iter_mut() {
@@ -1920,8 +1981,13 @@ fn rewrite_yarn_berry(
             if parsed.iter().any(Option::is_none) {
                 continue;
             }
-            let names: std::collections::BTreeSet<&str> =
-                parsed.iter().map(|p| p.unwrap().0).collect();
+            let names: std::collections::BTreeSet<&str> = parsed
+                .iter()
+                .map(|p| {
+                    p.expect("every pattern parsed — None-bearing keys are skipped above")
+                        .0
+                })
+                .collect();
             if !names.contains(fname.as_str()) {
                 // An `alias@npm:<fname>@range` descriptor resolves the
                 // patched package under a different ident. The redirect
@@ -1930,7 +1996,7 @@ fn rewrite_yarn_berry(
                 // generic not-found warning would point at the wrong cause.
                 if version_re.is_match(block)
                     && parsed.iter().any(|p| {
-                        p.unwrap()
+                        p.expect("every pattern parsed — None-bearing keys are skipped above")
                             .1
                             .strip_prefix("npm:")
                             .and_then(split_berry_descriptor)
@@ -1970,7 +2036,11 @@ fn rewrite_yarn_berry(
             // under such a key corrupts the key/resolution protocol pairing.
             // Mirrors the vendor backend's fail-closed gate
             // (vendor/yarn_berry_lock.rs).
-            if !parsed.iter().all(|p| p.unwrap().1.starts_with("npm:")) {
+            if !parsed.iter().all(|p| {
+                p.expect("every pattern parsed — None-bearing keys are skipped above")
+                    .1
+                    .starts_with("npm:")
+            }) {
                 result.warnings.push(RewriteWarning {
                     code: "redirect_yarn_berry_unsupported_protocol".into(),
                     detail: format!(
@@ -2146,9 +2216,11 @@ fn rewrite_bun_lock(
                 "{indent}{key}: [{url}, {deps}, {integrity}]{comma}",
                 indent = entry.indent,
                 key = entry.key_raw,
-                url = serde_json::to_string(&url_spec).unwrap(),
+                url = serde_json::to_string(&url_spec)
+                    .expect("a String serializes to JSON infallibly"),
                 deps = deps_verbatim,
-                integrity = serde_json::to_string(&sha512).unwrap(),
+                integrity =
+                    serde_json::to_string(&sha512).expect("a String serializes to JSON infallibly"),
                 comma = if entry.trailing_comma { "," } else { "" },
             );
             if rebuilt == original {
@@ -2199,7 +2271,10 @@ fn is_prior_hosted_bun_spec(spec: &str, fname: &str, current_url: &str) -> bool 
         if !url.starts_with("https://") && !url.starts_with("http://") {
             return None;
         }
-        let scheme_end = url.find("://").unwrap() + 3;
+        let scheme_end = url
+            .find("://")
+            .expect("url starts with http(s):// — checked above")
+            + 3;
         let path_start = url[scheme_end..].find('/')? + scheme_end;
         let leaf = url[path_start..]
             .rsplit('/')
@@ -2224,8 +2299,9 @@ fn rewrite_uv_lock(
         return;
     }
     let mut content = files["uv.lock"].clone();
-    let wheel_re = Regex::new(r#"\{ url = "[^"]*", hash = "sha256:[^"]*"([^}]*) \}"#).unwrap();
-    let name_re = Regex::new(r#"name = "([^"]+)""#).unwrap();
+    let wheel_re = Regex::new(r#"\{ url = "[^"]*", hash = "sha256:[^"]*"([^}]*) \}"#)
+        .expect("static uv wheel-entry regex is valid");
+    let name_re = Regex::new(r#"name = "([^"]+)""#).expect("static name-field regex is valid");
     let mut changed = false;
     for dep in &pypi {
         let Some(sha256) = dep.integrity.sha256.clone() else {
@@ -2466,9 +2542,10 @@ fn rewrite_composer_lock(
     }
     const DIST_KEY: &str = "\"dist\": {";
     let mut content = files["composer.lock"].clone();
-    let type_re = Regex::new(r#"("type": ")[^"]*(")"#).unwrap();
-    let url_re = Regex::new(r#"("url": ")[^"]*(")"#).unwrap();
-    let shasum_re = Regex::new(r#"("shasum": ")[^"]*(")"#).unwrap();
+    let type_re = Regex::new(r#"("type": ")[^"]*(")"#).expect("static dist type regex is valid");
+    let url_re = Regex::new(r#"("url": ")[^"]*(")"#).expect("static dist url regex is valid");
+    let shasum_re =
+        Regex::new(r#"("shasum": ")[^"]*(")"#).expect("static dist shasum regex is valid");
     let mut changed = false;
     for dep in &composer {
         let composer_name = full_name(dep);
@@ -2664,7 +2741,8 @@ fn insert_nuget_source(config: &str, key: &str, url: &str) -> String {
     // pair holding the new source. Matched before the open-tag check because a
     // `<packageSources/>` literal does not contain the `<packageSources>` open
     // tag.
-    let self_closing = Regex::new(r"<packageSources\s*/>").unwrap();
+    let self_closing = Regex::new(r"<packageSources\s*/>")
+        .expect("static self-closing packageSources regex is valid");
     if let Some(m) = self_closing.find(config) {
         let mut out = String::with_capacity(config.len() + source_line.len() + 40);
         out.push_str(&config[..m.start()]);
@@ -2692,13 +2770,18 @@ fn insert_nuget_source(config: &str, key: &str, url: &str) -> String {
 /// is no such element). Used to preserve resolution for non-patched packages
 /// when a `<packageSourceMapping>` is introduced.
 fn nuget_package_source_keys(config: &str) -> Vec<String> {
-    let region_re = Regex::new(r"(?s)<packageSources>(.*?)</packageSources>").unwrap();
+    let region_re = Regex::new(r"(?s)<packageSources>(.*?)</packageSources>")
+        .expect("static packageSources region regex is valid");
     let scope = region_re
         .captures(config)
-        .map(|c| c.get(1).unwrap().as_str())
+        .map(|c| {
+            c.get(1)
+                .expect("region_re always captures group 1")
+                .as_str()
+        })
         .unwrap_or("");
     Regex::new(r#"<add\s+key="([^"]+)""#)
-        .unwrap()
+        .expect("static add-key regex is valid")
         .captures_iter(scope)
         .map(|c| c[1].to_string())
         .collect()
@@ -2927,14 +3010,14 @@ fn gem_spelling_residue(content: &str, deps: &[&DepOverride]) -> String {
                 + &regex::escape(&dep.name)
                 + r#"["'][^\n]*\nend\r?\n?"#),
         )
-        .unwrap();
+        .expect("source-block regex from the escaped gem name is valid");
         residue = block_re.replace_all(&residue, "").into_owned();
         let decl_re = Regex::new(
             &(String::from(r#"(?m)^[ \t]*gem\b[^\n]*["']"#)
                 + &regex::escape(&dep.name)
                 + r#"["'][^\n]*\n?"#),
         )
-        .unwrap();
+        .expect("gem-declaration regex from the escaped gem name is valid");
         residue = decl_re.replace_all(&residue, "").into_owned();
     }
     residue.trim_end().to_string()
@@ -2991,7 +3074,8 @@ fn rewrite_gem(
     // bundler (verified: `bundle check`/frozen install both accept one on
     // 4.0.15), and without the tolerance the CHECKSUMS header never matched,
     // misdiagnosing the lock as bundler <2.6.
-    let checksums_re = Regex::new(r"(?m)^CHECKSUMS(\r?)$").unwrap();
+    let checksums_re =
+        Regex::new(r"(?m)^CHECKSUMS(\r?)$").expect("static CHECKSUMS header regex is valid");
 
     for dep in &gem {
         let Some(ov) = &dep.registry_override else {
@@ -3031,7 +3115,7 @@ fn rewrite_gem(
                     + &regex::escape(&dep.version)
                     + r"-[^)]+\) sha256="),
             )
-            .unwrap();
+            .expect("platform regex from the escaped name/version is valid");
             if platform_re.is_match(lk) {
                 result.warnings.push(RewriteWarning {
                     code: "redirect_gem_platform_unsupported".into(),
@@ -3067,9 +3151,11 @@ fn rewrite_gem(
                     + &regex::escape(&dep.name)
                     + r#"["']"#),
             )
-            .unwrap();
+            .expect("source-block regex from the escaped index URL is valid");
             if let Some(m) = block_re.captures(gf) {
-                let url = m.get(1).unwrap();
+                let url = m
+                    .get(1)
+                    .expect("block_re always captures group 1 (index URL)");
                 if url.as_str() == ov.index_url {
                     source_placed = true;
                 } else {
@@ -3095,7 +3181,7 @@ fn rewrite_gem(
                         + &regex::escape(&dep.name)
                         + r#"["']([^\n]*)$"#),
                 )
-                .unwrap();
+                .expect("gem-line regex from the escaped gem name is valid");
                 // Looser "declared at all?" probe: gates the append branch —
                 // appending next to a declaration the recognizer above cannot
                 // parse would leave the gem declared twice (bundler
@@ -3105,12 +3191,20 @@ fn rewrite_gem(
                         + &regex::escape(&dep.name)
                         + r#"["']"#),
                 )
-                .unwrap();
+                .expect("declaration probe regex from the escaped gem name is valid");
                 if let Some(m) = gem_line_re.captures(gf) {
-                    let range = m.get(0).unwrap().range();
-                    let original = m.get(0).unwrap().as_str().to_string();
+                    let range = m.get(0).expect("group 0 is the whole match").range();
+                    let original = m
+                        .get(0)
+                        .expect("group 0 is the whole match")
+                        .as_str()
+                        .to_string();
                     let paren = m.get(1).is_some();
-                    let raw_tail = m.get(2).unwrap().as_str().to_string();
+                    let raw_tail = m
+                        .get(2)
+                        .expect("gem_line_re always captures group 2 (tail)")
+                        .as_str()
+                        .to_string();
                     // A parenthesized call keeps its closing `)` in the tail:
                     // strip it (dropping any comment with it), or fail closed
                     // when it is absent (the call continues past this line).
@@ -3233,13 +3327,13 @@ fn rewrite_gem(
                     + &regex::escape(&dep.version)
                     + r"\)) sha256=([0-9a-f]+)(\r?)$"),
             )
-            .unwrap();
+            .expect("checksum-line regex from the escaped name/version is valid");
             let new_val = format!("{} ({}) sha256={sha256}", dep.name, dep.version);
             // Already redirected (re-run): the CHECKSUMS line is at the
             // target value; recording an edit would grow the ledger forever.
             let already_re =
                 Regex::new(&(String::from(r"(?m)^  ") + &regex::escape(&new_val) + r"\r?$"))
-                    .unwrap();
+                    .expect("already-redirected regex from the escaped line is valid");
             if already_re.is_match(lk) {
                 // no-op
             } else if let Some(m) = sum_line_re.captures(lk) {
@@ -3249,7 +3343,9 @@ fn rewrite_gem(
                     "{} ({}) sha256={}",
                     dep.name,
                     dep.version,
-                    m.get(2).unwrap().as_str()
+                    m.get(2)
+                        .expect("sum_line_re always captures group 2 (sha hex)")
+                        .as_str()
                 );
                 *lk = sum_line_re
                     .replace(lk, format!("${{1}} sha256={sha256}${{3}}").as_str())
@@ -3402,9 +3498,12 @@ struct MavenDependencyMatch {
 /// Inner-text byte range of the first `<tag>…</tag>` inside `pom[from, to)`, or
 /// None. Offsets are into the FULL `pom`.
 fn maven_tag_inner_range(pom: &str, tag: &str, from: usize, to: usize) -> Option<(usize, usize)> {
-    let re = Regex::new(&format!("(?s)<{tag}>(.*?)</{tag}>")).unwrap();
+    let re = Regex::new(&format!("(?s)<{tag}>(.*?)</{tag}>"))
+        .expect("tag regex is valid — callers pass literal tag names");
     let caps = re.captures(&pom[from..to])?;
-    let inner = caps.get(1).unwrap();
+    let inner = caps
+        .get(1)
+        .expect("tag regex always captures group 1 (inner text)");
     Some((from + inner.start(), from + inner.end()))
 }
 
@@ -3426,7 +3525,8 @@ fn find_maven_dependency_matches(
     group_id: &str,
     artifact_id: &str,
 ) -> Vec<MavenDependencyMatch> {
-    let dep_re = Regex::new(r"(?s)<dependency\b[^>]*>.*?</dependency>").unwrap();
+    let dep_re = Regex::new(r"(?s)<dependency\b[^>]*>.*?</dependency>")
+        .expect("static dependency-block regex is valid");
     let mut matches = vec![];
     for m in dep_re.find_iter(pom) {
         let (dep_open, dep_close) = (m.start(), m.end());
@@ -3520,7 +3620,9 @@ fn rewrite_maven_pom(
         // policy `fail`) exactly as before and warn that this is NOT
         // fail-closed.
         let Some(suffixed_version) = suffixed_version else {
-            let pom_text = pom.as_ref().unwrap();
+            let pom_text = pom
+                .as_ref()
+                .expect("pom is Some — the is_none() guard above continues");
             // Verify-only inspection: warn when the redirect can't take effect.
             // Only the FIRST match matters here (legacy behavior).
             let matches = find_maven_dependency_matches(pom_text, &group_id, &artifact_id);
@@ -3593,7 +3695,12 @@ fn rewrite_maven_pom(
         // FAIL-CLOSED: pin the suffixed version explicitly. Scan every matching
         // <dependency>, tracking depMgmt containment via the version presence
         // so we can tell a literal pin here from a version managed elsewhere.
-        let matches = find_maven_dependency_matches(pom.as_ref().unwrap(), &group_id, &artifact_id);
+        let matches = find_maven_dependency_matches(
+            pom.as_ref()
+                .expect("pom is Some — the is_none() guard above continues"),
+            &group_id,
+            &artifact_id,
+        );
 
         // An unsupported <type> on any match: the single-jar repo can't serve
         // it — skip the whole dep (no version edit, no repo, no checksum).
@@ -3647,7 +3754,10 @@ fn rewrite_maven_pom(
             .collect();
         to_rewrite.sort_by(|a, b| b.0.cmp(&a.0));
         for (start, end) in &to_rewrite {
-            let mut rebuilt = pom.as_ref().unwrap().clone();
+            let mut rebuilt = pom
+                .as_ref()
+                .expect("pom is Some — the is_none() guard above continues")
+                .clone();
             rebuilt.replace_range(*start..*end, &suffixed_version);
             pom = Some(rebuilt);
             pom_changed = true;
@@ -3684,7 +3794,8 @@ fn rewrite_maven_pom(
         // skipped (idempotent).
         if versioned.is_empty() {
             pom = Some(insert_maven_dependency_management(
-                pom.as_ref().unwrap(),
+                pom.as_ref()
+                    .expect("pom is Some — the is_none() guard above continues"),
                 &group_id,
                 &artifact_id,
                 &suffixed_version,
@@ -3718,11 +3829,12 @@ fn rewrite_maven_pom(
         }
         if !pom
             .as_ref()
-            .unwrap()
+            .expect("pom is Some — the is_none() guard above continues")
             .contains(&format!("<id>{repo_id}</id>"))
         {
             pom = Some(insert_maven_repository(
-                pom.as_ref().unwrap(),
+                pom.as_ref()
+                    .expect("pom is Some — the is_none() guard above continues"),
                 &repo_id,
                 &ov.index_url,
             ));
@@ -3840,7 +3952,8 @@ fn insert_maven_dependency_management(
     let block = format!(
         "      <dependency>\n        <groupId>{group_id}</groupId>\n        <artifactId>{artifact_id}</artifactId>\n        <version>{version}</version>\n      </dependency>"
     );
-    let dm_re = Regex::new(r"(?s)<dependencyManagement>\s*<dependencies>").unwrap();
+    let dm_re = Regex::new(r"(?s)<dependencyManagement>\s*<dependencies>")
+        .expect("static dependencyManagement regex is valid");
     if let Some(m) = dm_re.find(pom) {
         let matched = m.as_str();
         return pom.replacen(matched, &format!("{matched}\n{block}"), 1);
@@ -3873,7 +3986,7 @@ fn merge_mvn_config(existing: &str, coordinate: &str) -> (String, Vec<String>) {
     }
     let mut appended: Vec<&str> = vec![];
     for arg in MVN_CONFIG_ARGS {
-        let key = key_of(arg).unwrap();
+        let key = key_of(arg).expect("every MVN_CONFIG_ARGS entry contains '='");
         match present.get(&key) {
             None => {
                 appended.push(arg);
@@ -5795,7 +5908,10 @@ mod tests {
         );
         let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
         let toml = r.files.get("Cargo.toml").expect("Cargo.toml rewritten");
-        let pinned = format!("serde = {{ version = \"1.0.190\", registry = \"{}\" }}", cargo_reg());
+        let pinned = format!(
+            "serde = {{ version = \"1.0.190\", registry = \"{}\" }}",
+            cargo_reg()
+        );
         assert_eq!(
             toml.matches(&pinned).count(),
             2,
@@ -5951,7 +6067,10 @@ mod tests {
         let lock = r.files.get("Cargo.lock").expect("lock re-pinned");
         assert!(lock.contains(&cargo_index_url()), "{lock}");
         let cfg = r.files.get(".cargo/config.toml").expect("config updated");
-        assert!(cfg.contains(&format!("[registries.{}]", cargo_reg())), "{cfg}");
+        assert!(
+            cfg.contains(&format!("[registries.{}]", cargo_reg())),
+            "{cfg}"
+        );
         assert!(
             !r.warnings
                 .iter()
