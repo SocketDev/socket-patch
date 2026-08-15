@@ -1290,6 +1290,94 @@ async fn no_redirectable_patch_leaves_bun_lockb_alone() {
     );
 }
 
+/// The corrupt-ledger refusal must fire BEFORE the bun.lockb auto-migration,
+/// not after it. The migration deletes the binary lock and writes a text one,
+/// so running it ahead of the refusal would convert the project's lockfile
+/// format and then exit 1 without recording the migration or redirecting
+/// anything — the "byte-untouched on refusal" promise broken by the one write
+/// that precedes every rewriter. A redirectable npm override is granted here
+/// (the migration's gate) and a fake `bun` that WOULD migrate sits on PATH, so
+/// the surviving bun.lockb proves the ordering rather than a skipped gate.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn corrupt_ledger_refuses_before_the_bun_lockb_migration() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("package.json"),
+        format!(
+            r#"{{ "name": "consumer", "version": "0.0.0", "dependencies": {{ "{NAME}": "^{VERSION}" }} }}"#
+        ),
+    )
+    .unwrap();
+    let pkg = tmp.path().join("node_modules").join(NAME);
+    std::fs::create_dir_all(&pkg).unwrap();
+    std::fs::write(
+        pkg.join("package.json"),
+        format!(r#"{{ "name": "{NAME}", "version": "{VERSION}" }}"#),
+    )
+    .unwrap();
+    std::fs::write(tmp.path().join("bun.lockb"), b"BUN-BINARY-PLACEHOLDER").unwrap();
+
+    // A torn ledger: parseable as neither the vendor nor the redirect shape.
+    let ledger_path = tmp.path().join(".socket/vendor/redirect-state.json");
+    std::fs::create_dir_all(ledger_path.parent().unwrap()).unwrap();
+    let corrupt_bytes = b"{\"mode\":\"hosted\",\"edits\":[{\"path\":\"bun.lo";
+    std::fs::write(&ledger_path, corrupt_bytes).unwrap();
+
+    let bin_dir = tmp.path().join("fakebin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let shim = bin_dir.join("bun");
+    std::fs::write(
+        &shim,
+        "#!/bin/sh\n\
+         echo '{ \"lockfileVersion\": 1, \"packages\": {} }' > bun.lock\n\
+         rm -f bun.lockb\n\
+         exit 0\n",
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let orig_path = std::env::var("PATH").unwrap_or_default();
+    // SAFETY: single-threaded #[serial] test; PATH restored below.
+    unsafe {
+        std::env::set_var("PATH", format!("{}:{orig_path}", bin_dir.display()));
+    }
+
+    let code = run(redirect_args(tmp.path(), server.uri())).await;
+
+    unsafe {
+        std::env::set_var("PATH", orig_path);
+    }
+    assert_eq!(code, 1, "a corrupt ledger must flip the exit code");
+    assert_eq!(
+        std::fs::read(tmp.path().join("bun.lockb")).ok().as_deref(),
+        Some(b"BUN-BINARY-PLACEHOLDER".as_slice()),
+        "the binary lock must be byte-untouched: the refusal precedes the migration"
+    );
+    assert!(
+        !tmp.path().join("bun.lock").exists(),
+        "no text lock may be created by a run that refused before redirecting"
+    );
+    // The malformed ledger is quarantined (never deleted), so recovery of the
+    // pre-redirect originals it may still hold stays possible.
+    let quarantined = tmp
+        .path()
+        .join(".socket/vendor/redirect-state.json.corrupt");
+    assert_eq!(
+        std::fs::read(&quarantined).unwrap(),
+        corrupt_bytes,
+        "the malformed ledger is moved aside verbatim"
+    );
+}
+
 /// An unusable ledger is an ERROR, not a silent success:
 /// `.socket/vendor/redirect-state.json` is the only revert path (and the VEX
 /// record store). A DIRECTORY squatting on the ledger path makes it
