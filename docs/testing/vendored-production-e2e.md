@@ -61,7 +61,7 @@ hosted suite).
 | Package manager | Fixture | Delivery install (cold, offline, committable-only) | Status |
 |-----------------|---------|-----------------------------------------------------|--------|
 | npm | minimist@1.2.2 | `npm ci` | ✅ full |
-| pnpm | minimist@1.2.2 | `pnpm install --frozen-lockfile --offline` | ⚠️ pnpm 11 gap (below), delivery proven via workaround |
+| pnpm | minimist@1.2.2 | `pnpm install --frozen-lockfile --offline` | ✅ full |
 | yarn classic | minimist@1.2.2 | `yarn install --frozen-lockfile --offline` | ✅ full |
 | yarn berry (node-modules) | minimist@1.2.2 | `yarn install --immutable --check-cache` | ✅ full |
 | bun (text lockfile) | minimist@1.2.2 | `bun install --frozen-lockfile` | ✅ full |
@@ -85,19 +85,23 @@ directory.
 
 Both were found against real production + real toolchains; neither is a test bug.
 
-### 1. `pnpm` >= 11 — vendored `overrides` land in the wrong file (CLI)
+### 1. `pnpm` >= 11 — vendored `overrides` land in the wrong file (CLI) — FIXED
 
 pnpm 11 stopped reading `overrides` from `package.json`'s `pnpm` field — it
-moved to `pnpm-workspace.yaml` (https://pnpm.io/settings). The CLI still writes
-`package.json` `pnpm.overrides`, so pnpm 11 ignores it and a frozen install
-refuses with `ERR_PNPM_LOCKFILE_CONFIG_MISMATCH`, even though the vendored
-tarball and lock are correct (the lockfile passes pnpm's supply-chain policy).
+moved to `pnpm-workspace.yaml` (https://pnpm.io/settings). The CLI used to write
+only `package.json` `pnpm.overrides`, so pnpm 11 ignored it and a frozen install
+refused with `ERR_PNPM_LOCKFILE_CONFIG_MISMATCH`, even though the vendored
+tarball and lock were correct (the lockfile passes pnpm's supply-chain policy).
 
-**Fix belongs in the CLI**: the pnpm vendor rewriter should also emit a
-`pnpm-workspace.yaml` `overrides` block on pnpm >= 11. The leg reproduces that
-documented workaround (mirroring the override the CLI put in `package.json` into
-`pnpm-workspace.yaml`) to prove the vendored artifact IS installable, and fails
-loudly if the frozen install fails for any *other* reason.
+**Fixed** (`fix/pnpm11-overrides-location`): the pnpm vendor backend now
+mirrors the same versioned `<name>@<version>` → `file:` override into
+`pnpm-workspace.yaml` (creating the file with a root-only `packages: ['.']`
+list — pnpm 9 refuses a workspace file with no `packages` field — when the
+project has none), alongside the existing `package.json` `pnpm.overrides` for
+pnpm 9/10. The committable set installs cleanly on pnpm 9/10/11 with no config
+mismatch, and `vendor --revert` deletes a file it created (or splices its
+override back out of one it edited). This leg now asserts the frozen install
+succeeds directly, with no workaround.
 
 ### 2. `gem` — vendoring the platform-qualified purl is unsupported (CLI)
 

@@ -137,15 +137,24 @@ pub struct UvMeta {
 
 /// npm/pnpm bookkeeping: which `pnpm-workspace.yaml`/`package.json` tables
 /// the wiring had to create (revert then removes the emptied tables too).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct PnpmMeta {
-    /// Vendor created the `overrides` table itself.
+    /// Vendor created the package.json `pnpm.overrides` table itself.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub created_overrides_table: bool,
-    /// Vendor created the enclosing `pnpm` table itself.
+    /// Vendor created the enclosing package.json `pnpm` table itself.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub created_pnpm_table: bool,
+    /// Vendor created the `pnpm-workspace.yaml` file itself (pnpm >= 11 reads
+    /// `overrides` only from there); revert deletes it when it still holds
+    /// only the vendoring scaffold.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub created_workspace_file: bool,
+    /// Vendor created the `overrides:` section in a pre-existing
+    /// `pnpm-workspace.yaml`; revert removes just that section once emptied.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub created_workspace_overrides: bool,
 }
 
 /// pypi/poetry bookkeeping.
@@ -261,6 +270,87 @@ impl VendorState {
 impl Default for VendorState {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Carry a re-vendor's ledger entry forward from the one it replaces so a
+/// later `--revert` can still undo every surface an *earlier* vendoring of
+/// the same package touched.
+///
+/// A backend rebuilds `entry.wiring` from only the surfaces it changed THIS
+/// run. When a re-vendor adds a NEW surface while the others are already in
+/// sync — e.g. a project vendored before pnpm >= 11 support, whose
+/// `package.json` + `pnpm-lock.yaml` already carry the override, gaining the
+/// `pnpm-workspace.yaml` mirror on re-vendor — the fresh entry names ONLY the
+/// new surface. Replacing the prior ledger entry wholesale would then drop
+/// the pre-vendor originals the FIRST vendoring recorded for the untouched
+/// surfaces, and revert could no longer restore them (it would undo only the
+/// newly added surface). This reconciles the two:
+///
+///   * fills a `Rewritten` record's missing `original` from the prior entry —
+///     a re-vendor rewrites its OWN stale `.socket/vendor/` pointer and so
+///     records `original: None` (it must never record a vendored pointer as
+///     the pre-vendor fragment); the true original lives in the entry being
+///     replaced (matched by file+kind+key, with the key compared
+///     uuid-agnostically via [`super::path::wiring_key_matches`] — berry's
+///     lock key embeds the vendored path, so the uuid change that CAUSED the
+///     re-vendor changes the key too);
+///   * carries forward any prior wiring record for a surface THIS run did not
+///     re-touch (union by file+kind+key), so revert still restores it;
+///   * OR-merges the pnpm "created this table/file/section" bookkeeping so a
+///     create recorded by the first vendoring is not lost when a re-vendor
+///     finds the surface already present (revert byte-restores an emptied
+///     table/file only when it knows vendor created it);
+///   * preserves the go-patch-takeover flag.
+///
+/// The union + meta merge are scoped to a re-vendor of the SAME patch
+/// generation (`prev.uuid == entry.uuid`): a new-uuid re-vendor rewires every
+/// surface fresh under the new uuid, so the prior uuid's records name nothing
+/// the new entry left behind and carrying them forward would only dangle.
+/// The original-fill and takeover flag are safe (identity-matched) either way
+/// and run unconditionally.
+pub fn carry_forward_wiring(prev: &VendorEntry, entry: &mut VendorEntry) {
+    entry.took_over_go_patches = entry.took_over_go_patches || prev.took_over_go_patches;
+
+    for rec in &mut entry.wiring {
+        if rec.action == WiringAction::Rewritten && rec.original.is_none() {
+            if let Some(prev_rec) = prev.wiring.iter().find(|p| {
+                p.file == rec.file
+                    && p.kind == rec.kind
+                    && match (p.key.as_deref(), rec.key.as_deref()) {
+                        (Some(a), Some(b)) => super::path::wiring_key_matches(a, b),
+                        (a, b) => a == b,
+                    }
+            }) {
+                rec.original = prev_rec.original.clone();
+            }
+        }
+    }
+
+    if prev.uuid != entry.uuid {
+        return;
+    }
+
+    for prev_rec in &prev.wiring {
+        let present = entry
+            .wiring
+            .iter()
+            .any(|r| r.file == prev_rec.file && r.kind == prev_rec.kind && r.key == prev_rec.key);
+        if !present {
+            entry.wiring.push(prev_rec.clone());
+        }
+    }
+
+    if let Some(prev_meta) = prev.pnpm.as_ref() {
+        match entry.pnpm.as_mut() {
+            Some(meta) => {
+                meta.created_overrides_table |= prev_meta.created_overrides_table;
+                meta.created_pnpm_table |= prev_meta.created_pnpm_table;
+                meta.created_workspace_file |= prev_meta.created_workspace_file;
+                meta.created_workspace_overrides |= prev_meta.created_workspace_overrides;
+            }
+            None => entry.pnpm = Some(prev_meta.clone()),
+        }
     }
 }
 
@@ -551,7 +641,8 @@ mod tests {
         entry.flavor = Some("pnpm".into());
         entry.pnpm = Some(PnpmMeta {
             created_overrides_table: true,
-            created_pnpm_table: false,
+            created_workspace_file: true,
+            ..Default::default()
         });
         entry.poetry = Some(PoetryMeta {
             dep_class: "direct".into(),
@@ -578,6 +669,7 @@ mod tests {
         // camelCase keys on the wire.
         for key in [
             "\"createdOverridesTable\"",
+            "\"createdWorkspaceFile\"",
             "\"depClass\"",
             "\"lockVersion\"",
             "\"strategy\"",
@@ -585,20 +677,20 @@ mod tests {
         ] {
             assert!(text.contains(key), "{key} missing: {text}");
         }
-        // Skip-empty inner fields: the false bool and any empty vec vanish.
+        // Skip-empty inner fields: the false bools and any empty vec vanish.
         assert!(
             !text.contains("createdPnpmTable"),
+            "false bool omitted: {text}"
+        );
+        assert!(
+            !text.contains("createdWorkspaceOverrides"),
             "false bool omitted: {text}"
         );
     }
 
     #[test]
     fn v2_meta_empty_inner_fields_do_not_serialize() {
-        let pnpm = serde_json::to_string(&PnpmMeta {
-            created_overrides_table: false,
-            created_pnpm_table: false,
-        })
-        .unwrap();
+        let pnpm = serde_json::to_string(&PnpmMeta::default()).unwrap();
         assert_eq!(pnpm, "{}", "all-default PnpmMeta serializes empty");
 
         let pipenv = serde_json::to_string(&PipenvMeta {
@@ -617,13 +709,7 @@ mod tests {
 
         // And the omitted spellings deserialize back to the defaults.
         let back: PnpmMeta = serde_json::from_str("{}").unwrap();
-        assert_eq!(
-            back,
-            PnpmMeta {
-                created_overrides_table: false,
-                created_pnpm_table: false
-            }
-        );
+        assert_eq!(back, PnpmMeta::default());
         let back: PipenvMeta = serde_json::from_str("{}").unwrap();
         assert!(back.sections.is_empty());
     }
