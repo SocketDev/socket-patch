@@ -247,15 +247,15 @@ pub(super) async fn run_redirect(
         }
     }
 
-    // Load the existing redirect ledger BEFORE any file is written — bun
-    // migration included. The ledger is the only store of the pre-redirect
-    // originals a future revert needs, so a malformed (torn/hand-mangled)
-    // ledger must abort the run while the project is still untouched: the old
-    // tolerant load treated it as "no ledger" and the merge below would have
-    // started fresh, silently overwriting that revert data. The malformed
-    // file is moved aside to redirect-state.json.corrupt (never clobbered)
-    // so recovery stays possible; a dry-run reports the same hard error but
-    // moves nothing.
+    // Load the existing redirect ledger BEFORE any file is written — the
+    // cargo takeover reverts and the bun migration included. The ledger is
+    // the only store of the pre-redirect originals a future revert needs, so
+    // a malformed (torn/hand-mangled) ledger must abort the run while the
+    // project is still untouched: the old tolerant load treated it as "no
+    // ledger" and the merge below would have started fresh, silently
+    // overwriting that revert data. The malformed file is moved aside to
+    // redirect-state.json.corrupt (never clobbered) so recovery stays
+    // possible; a dry-run reports the same hard error but moves nothing.
     let existing_ledger =
         match socket_patch_core::patch::redirect::load_redirect_state(&args.common.cwd).await {
             Ok(state) => state,
@@ -271,6 +271,166 @@ pub(super) async fn run_redirect(
                 return 1;
             }
         };
+
+    // Cross-mode takeover (cargo): a purl this run is about to redirect may
+    // still be VENDORED — a committed `[patch.crates-io]` path entry, a
+    // detached Cargo.lock entry, a committed copy, and a vendored ledger
+    // entry. The hosted rewriters know nothing about that wiring, so
+    // redirecting on top of it would leave BOTH wirings in place and cargo
+    // then refuses every `--locked` build over the now-unused `[patch]`
+    // entry while this run reports success. A takeover must leave the
+    // project FULLY hosted: revert each such purl's vendored state first
+    // (the exact per-purl machinery `vendor --revert` runs — restore the
+    // lock originals from the ledger, drop the `[patch]` entry, remove the
+    // committed tree and the ledger entry), and only then redirect. This
+    // ordering also hands the redirect the PRISTINE crates.io lock fragment
+    // to record as its own revert original, keeping the originals chain
+    // intact across repeated mode migrations. A purl whose vendored state
+    // cannot be cleanly reverted (revert failure, or vendored wiring with a
+    // missing/corrupt ledger) is REFUSED — skipped with an actionable
+    // error — never half-migrated.
+    let mut takeover_pre_warnings: Vec<serde_json::Value> = Vec::new();
+    if !candidates.iter().any(|(p, ..)| p.starts_with("pkg:cargo/")) {
+        // No cargo candidates — nothing to reconcile.
+    } else {
+        use socket_patch_core::utils::purl::{normalize_purl, strip_purl_qualifiers};
+        let canon = |p: &str| normalize_purl(strip_purl_qualifiers(p)).into_owned();
+        let vendor_state = socket_patch_core::vendor::load_state(&args.common.cwd).await;
+        let patch_entries =
+            socket_patch_core::vendor::cargo_config::read_patch_entries(&args.common.cwd).await;
+        let mut refused: Vec<String> = Vec::new();
+        for (purl, _uuid, ..) in &candidates {
+            if !purl.starts_with("pkg:cargo/") {
+                continue;
+            }
+            let stripped = strip_purl_qualifiers(purl);
+            let ledger_entry = vendor_state
+                .as_ref()
+                .ok()
+                .and_then(|s| socket_patch_core::vendor::lookup_entry(&s.entries, stripped))
+                .cloned();
+            if let Some(entry) = ledger_entry {
+                if args.common.dry_run {
+                    takeover_pre_warnings.push(serde_json::json!({
+                        "code": "redirect_would_revert_vendored",
+                        "detail": format!(
+                            "{purl} is currently vendored; the hosted redirect will \
+                             revert its vendored wiring, ledger entry, and committed \
+                             artifact first, then redirect (mode takeover)"
+                        ),
+                    }));
+                    continue;
+                }
+                let outcome =
+                    crate::commands::vendor::dispatch_revert_one(&entry, &args.common.cwd, false)
+                        .await;
+                if !outcome.success {
+                    refused.push(purl.clone());
+                    takeover_pre_warnings.push(serde_json::json!({
+                        "code": "redirect_vendored_revert_failed",
+                        "detail": format!(
+                            "{purl} is vendored and its vendored state could not be \
+                             reverted ({}); NOT redirected — run `socket-patch vendor \
+                             --revert` to clean up, then re-run `scan --mode hosted`",
+                            outcome.error.as_deref().unwrap_or("unknown error")
+                        ),
+                    }));
+                    continue;
+                }
+                // Drop the reverted entry and persist per purl so a crash
+                // mid-run leaves a ledger matching the on-disk wiring.
+                // Re-loaded fresh each iteration (each iteration saves): the
+                // saved file is the truth.
+                let mut state = match socket_patch_core::vendor::load_state(&args.common.cwd).await
+                {
+                    Ok(s) => s,
+                    Err(e) => {
+                        refused.push(purl.clone());
+                        takeover_pre_warnings.push(serde_json::json!({
+                            "code": "redirect_vendored_revert_failed",
+                            "detail": format!(
+                                "{purl}: vendored wiring reverted but the vendored \
+                                 ledger could not be re-read ({e}); NOT redirected — \
+                                 fix .socket/vendor/state.json and re-run"
+                            ),
+                        }));
+                        continue;
+                    }
+                };
+                state
+                    .entries
+                    .retain(|k, e| canon(k) != canon(purl) && canon(&e.base_purl) != canon(purl));
+                if let Err(e) =
+                    socket_patch_core::vendor::save_state(&args.common.cwd, &state).await
+                {
+                    // The wiring is reverted but the ledger still claims it;
+                    // redirecting now would leave a ledger asserting wiring
+                    // that is gone. Fail closed for this purl.
+                    refused.push(purl.clone());
+                    takeover_pre_warnings.push(serde_json::json!({
+                        "code": "redirect_vendored_revert_failed",
+                        "detail": format!(
+                            "{purl}: vendored wiring reverted but the vendored ledger \
+                             could not be updated ({e}); NOT redirected — fix \
+                             .socket/vendor/state.json and re-run"
+                        ),
+                    }));
+                    continue;
+                }
+                takeover_pre_warnings.push(serde_json::json!({
+                    "code": "redirect_takeover_reverted_vendored",
+                    "detail": format!(
+                        "{purl} was vendored; reverted its vendored wiring, ledger \
+                         entry, and committed artifact before redirecting (mode \
+                         takeover: the project is now fully hosted for this package)"
+                    ),
+                }));
+            } else {
+                // No usable ledger entry. If socket-owned vendored wiring for
+                // this crate is nevertheless present, the ledger is missing or
+                // corrupt — the originals needed to revert are unrecoverable,
+                // so redirecting on top would wedge the project. Refuse.
+                let name = parse_purl_simple(purl).map(|(_, name, _)| name);
+                let wired = name
+                    .as_deref()
+                    .is_some_and(|n| patch_entries.get(n).is_some_and(|i| i.socket_owned));
+                if wired {
+                    refused.push(purl.clone());
+                    takeover_pre_warnings.push(serde_json::json!({
+                        "code": "redirect_vendored_revert_failed",
+                        "detail": format!(
+                            "{purl} has socket-owned vendored wiring in \
+                             .cargo/config.toml but no usable vendored ledger entry \
+                             (.socket/vendor/state.json is missing or corrupt); NOT \
+                             redirected — restore the ledger or remove the vendored \
+                             wiring manually, then re-run"
+                        ),
+                    }));
+                }
+            }
+        }
+        if !refused.is_empty() {
+            for purl in &refused {
+                if let Some((_, uuid, ..)) = candidates.iter().find(|(p, ..)| p == purl) {
+                    skipped.push(serde_json::json!({
+                        "purl": purl, "uuid": uuid, "reason": "vendored_revert_failed",
+                    }));
+                }
+            }
+            let refused_names: std::collections::HashSet<(String, String)> = candidates
+                .iter()
+                .filter(|(p, ..)| refused.contains(p))
+                .filter_map(|(p, ..)| {
+                    parse_purl_simple(p).map(|(_, name, version)| (name, version))
+                })
+                .collect();
+            candidates.retain(|(p, ..)| !refused.contains(p));
+            overrides.retain(|o| {
+                o.ecosystem != "cargo"
+                    || !refused_names.contains(&(o.name.clone(), o.version.clone()))
+            });
+        }
+    }
 
     // bun.lockb auto-migration: the redirect rewriter only edits the TEXT
     // lockfile, so a project locked to a binary `bun.lockb` must be re-locked
@@ -700,6 +860,7 @@ pub(super) async fn run_redirect(
         warnings.extend(migration_warnings.iter().cloned());
         warnings.extend(rush_warnings.iter().cloned());
         warnings.extend(pnpm_warnings.iter().cloned());
+        warnings.extend(takeover_pre_warnings.iter().cloned());
         warnings.extend(takeover_warnings.iter().cloned());
         warnings.extend(prune_warnings.iter().cloned());
         // Nest the redirect result under `redirect` inside the classic scan
@@ -770,6 +931,9 @@ pub(super) async fn run_redirect(
                 eprintln!("  warning: {}", w["detail"].as_str().unwrap_or_default());
             }
             for w in &pnpm_warnings {
+                eprintln!("  warning: {}", w["detail"].as_str().unwrap_or_default());
+            }
+            for w in &takeover_pre_warnings {
                 eprintln!("  warning: {}", w["detail"].as_str().unwrap_or_default());
             }
             for w in &takeover_warnings {

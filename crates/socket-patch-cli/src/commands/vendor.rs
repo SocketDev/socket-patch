@@ -194,6 +194,13 @@ pub(crate) async fn dispatch_revert_one(
 async fn dispatch_in_use_one(entry: &VendorEntry, project_root: &Path) -> Option<bool> {
     match entry.ecosystem.as_str() {
         "npm" => vendor::npm_flavor::vendored_entry_in_use(entry, project_root).await,
+        // Cargo probes the lock entry's shape: detached + `[patch]` pointing
+        // at this entry's copy = in use; a registry source (crates.io
+        // re-resolve or a hosted takeover) or a missing entry = reclaimable
+        // (the revert restores / keeps the registry resolution and drops the
+        // dead wiring). Without this, a vendored entry displaced by a hosted
+        // takeover survives every `scan --prune` forever.
+        "cargo" => vendor::cargo::vendored_entry_in_use(entry, project_root).await,
         _ => None,
     }
 }
@@ -442,6 +449,12 @@ pub async fn run(args: VendorArgs) -> i32 {
     }
 
     note_classic_migration_risk(&mut env, &args.common.cwd, &args.common);
+    // Same cross-mode takeover advisory the scan-driven vendored flow emits:
+    // the standalone `vendor` command is the PRIMARY hosted→vendored
+    // migration entry point, so it must surface a redirect ledger that this
+    // run (or an earlier one) superseded — silence here left the stale
+    // ledger feeding VEX indefinitely.
+    super::scan::note_vendor_supersedes_redirect(&mut env, &args.common.cwd, &args.common).await;
 
     if args.common.json {
         println!("{}", env.to_pretty_json());
@@ -563,8 +576,8 @@ pub(crate) async fn persist_vendor_entry(
     // stale `.socket/vendor/` pointer), the wiring records for surfaces this
     // run left in sync (e.g. package.json + pnpm-lock.yaml when only the new
     // pnpm-workspace.yaml override was added on a pnpm >= 11 upgrade), the
-    // pnpm created-surface bookkeeping, and the takeover flag. See
-    // [`vendor::carry_forward_wiring`].
+    // pnpm created-surface bookkeeping, the cargo lock originals, and the
+    // takeover flag. See [`vendor::carry_forward_wiring`].
     let prev = state.entries.get(&candidate).cloned();
     if let Some(prev) = &prev {
         vendor::carry_forward_wiring(prev, &mut entry);
@@ -903,6 +916,20 @@ pub(crate) async fn vendor_records(
     let mut matched: HashSet<String> = HashSet::new();
     let mut handled_bases: HashSet<String> = HashSet::new();
 
+    // The hosted redirect ledger, for cross-mode takeovers: vendoring a purl
+    // it still claims must revert the hosted edits FIRST (see the hook in the
+    // dispatch loop below). Loaded once; mutated + persisted per reverted
+    // purl. A MALFORMED ledger is held as the hard error it is: this loop
+    // WRITES the ledger for cargo takeovers, and with its records unreadable
+    // a claimed purl is indistinguishable from an unclaimed one — so every
+    // cargo purl fails closed with the corruption surfaced (non-cargo purls
+    // never touch the redirect ledger here and proceed).
+    let (mut redirect_ledger, redirect_ledger_corrupt) =
+        match socket_patch_core::patch::redirect::load_redirect_state(&common.cwd).await {
+            Ok(state) => (state, None),
+            Err(corrupt) => (None, Some(corrupt)),
+        };
+
     for (purl, pkg_path) in &all_packages {
         let is_variant_eco =
             Ecosystem::from_purl(purl).is_some_and(|e| e.supports_release_variants());
@@ -951,6 +978,128 @@ pub(crate) async fn vendor_records(
                 }
             }
             matched.insert(candidate.clone());
+
+            // Cross-mode takeover (cargo): vendoring over a LIVE hosted
+            // redirect must first revert the hosted edits from the redirect
+            // ledger — `[patch.crates-io]` only patches crates-io-sourced
+            // deps, so vendoring on top of the `registry = "socket-patch-…"`
+            // pin leaves the project unbuildable in BOTH modes while this
+            // run reports success — and the pre-revert also hands the vendor
+            // detach the PRISTINE crates.io lock fragment to record as the
+            // ledger's unrecoverable originals (not the hosted values). A
+            // purl whose hosted edits cannot be cleanly reverted is REFUSED;
+            // the backend's own fail-closed guard (`hosted_redirect_live`)
+            // backstops states with no usable ledger at all.
+            if candidate.starts_with("pkg:cargo/") {
+                if let Some(corrupt) = &redirect_ledger_corrupt {
+                    has_errors = true;
+                    env.record(
+                        PatchEvent::new(PatchAction::Failed, candidate.clone()).with_error(
+                            "redirect_ledger_corrupt",
+                            format!(
+                                "cannot vendor over a possibly-live hosted redirect: \
+                                 {corrupt}"
+                            ),
+                        ),
+                    );
+                    if !common.silent && !common.json {
+                        eprintln!("Cannot vendor {}: {corrupt}", normalize_purl(candidate));
+                    }
+                    continue;
+                }
+                let canon = |p: &str| normalize_purl(strip_purl_qualifiers(p)).into_owned();
+                let claimed = redirect_ledger
+                    .as_ref()
+                    .is_some_and(|l| l.records.keys().any(|k| canon(k) == canon(candidate)));
+                if claimed && common.dry_run {
+                    record_warning(
+                        env,
+                        candidate,
+                        &VendorWarning::new(
+                            "vendor_would_revert_redirect",
+                            format!(
+                                "{} is hosted-redirected; a non-dry-run vendor will \
+                                 revert the hosted redirect edits first, then vendor \
+                                 (mode takeover)",
+                                normalize_purl(candidate)
+                            ),
+                        ),
+                        common,
+                    );
+                } else if claimed {
+                    let ledger = redirect_ledger.as_mut().expect("claimed implies Some");
+                    match socket_patch_core::patch::redirect::revert_cargo_redirect_purl(
+                        &common.cwd,
+                        ledger,
+                        candidate,
+                    )
+                    .await
+                    {
+                        Ok(_) => {
+                            if let Err(e) =
+                                socket_patch_core::patch::redirect::persist_redirect_state(
+                                    &common.cwd,
+                                    ledger,
+                                )
+                                .await
+                            {
+                                // The hosted edits are reverted but the ledger
+                                // still claims them; vendoring now would leave
+                                // a ledger asserting wiring that is gone. Fail
+                                // closed for this purl.
+                                has_errors = true;
+                                env.record(
+                                    PatchEvent::new(PatchAction::Failed, candidate.clone())
+                                        .with_error(
+                                            "redirect_ledger_write_failed",
+                                            format!(
+                                                "reverted the hosted redirect but could not \
+                                                 update .socket/vendor/redirect-state.json: {e}"
+                                            ),
+                                        ),
+                                );
+                                continue;
+                            }
+                            record_warning(
+                                env,
+                                candidate,
+                                &VendorWarning::new(
+                                    "vendor_takeover_reverted_redirect",
+                                    format!(
+                                        "{} was hosted-redirected; reverted the hosted \
+                                         edits (Cargo.toml registry pin, Cargo.lock \
+                                         source/checksum, registries block) and dropped \
+                                         the redirect-ledger record before vendoring \
+                                         (mode takeover)",
+                                        normalize_purl(candidate)
+                                    ),
+                                ),
+                                common,
+                            );
+                        }
+                        Err(detail) => {
+                            has_errors = true;
+                            env.record(
+                                PatchEvent::new(PatchAction::Failed, candidate.clone()).with_error(
+                                    "redirect_revert_failed",
+                                    format!(
+                                        "cannot vendor over the live hosted redirect: \
+                                             {detail}"
+                                    ),
+                                ),
+                            );
+                            if !common.silent && !common.json {
+                                eprintln!(
+                                    "Cannot vendor {}: cannot revert the hosted redirect: \
+                                     {detail}",
+                                    normalize_purl(candidate)
+                                );
+                            }
+                            continue;
+                        }
+                    }
+                }
+            }
 
             let outcome = dispatch_vendor_one(
                 candidate,
@@ -1981,6 +2130,105 @@ mod gc_tests {
         let wet = run_vendor_gc(&common, &manifest_path, false).await;
         assert_eq!(wet.dropped_reverted, vec![PURL.to_string()], "{wet:?}");
         assert!(wet.unused_reverted.is_empty(), "{wet:?}");
+    }
+
+    /// A vendored CARGO entry displaced by a hosted takeover (its lock entry
+    /// re-sourced to a socket-patch sparse index) is reclaimable by the GC:
+    /// pre-fix, `dispatch_in_use_one` had no cargo probe (`None` = keep), so
+    /// the stale ledger entry, the committed tree, and the build-breaking
+    /// `[patch.crates-io]` entry survived every `scan --prune` forever.
+    #[tokio::test]
+    async fn vendor_gc_reclaims_cargo_entry_displaced_by_hosted_takeover() {
+        const CARGO_PURL: &str = "pkg:cargo/cfg-if@1.0.4";
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let socket = root.join(".socket");
+        tokio::fs::create_dir_all(socket.join(format!("vendor/cargo/{UUID}/cfg-if-1.0.4")))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            socket.join(format!("vendor/cargo/{UUID}/cfg-if-1.0.4/lib.rs")),
+            b"// patched",
+        )
+        .await
+        .unwrap();
+
+        // Manifest still carries the patch (so pass (a) keeps it; the
+        // lock-shape probe (b) is what must reclaim it).
+        let mut manifest = PatchManifest::new();
+        manifest.patches.insert(
+            CARGO_PURL.to_string(),
+            socket_patch_core::manifest::schema::PatchRecord {
+                uuid: UUID.to_string(),
+                exported_at: String::new(),
+                files: HashMap::new(),
+                vulnerabilities: HashMap::new(),
+                description: String::new(),
+                license: String::new(),
+                tier: String::new(),
+            },
+        );
+        let manifest_path = socket.join("manifest.json");
+        write_manifest(&manifest_path, &manifest).await.unwrap();
+
+        let mut state = VendorState::default();
+        let mut entry = entry(false);
+        entry.ecosystem = "cargo".into();
+        entry.base_purl = CARGO_PURL.into();
+        entry.artifact.path = format!(".socket/vendor/cargo/{UUID}/cfg-if-1.0.4");
+        state.entries.insert(CARGO_PURL.to_string(), entry);
+        save_state(root, &state).await.unwrap();
+
+        // The mixed hosted-takeover state: [patch] entry survives, lock
+        // re-sourced to the socket-patch sparse index.
+        tokio::fs::create_dir_all(root.join(".cargo"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            root.join(".cargo/config.toml"),
+            format!(
+                "[patch.crates-io]\ncfg-if = {{ path = \".socket/vendor/cargo/{UUID}/cfg-if-1.0.4\" }}\n"
+            ),
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            root.join("Cargo.lock"),
+            format!(
+                "version = 4\n\n[[package]]\nname = \"cfg-if\"\nversion = \"1.0.4\"\nsource = \"sparse+http://127.0.0.1:5555/index/\"\nchecksum = \"{}\"\n",
+                "a".repeat(64)
+            ),
+        )
+        .await
+        .unwrap();
+
+        let common = GlobalArgs {
+            cwd: root.to_path_buf(),
+            json: true,
+            silent: true,
+            ..GlobalArgs::default()
+        };
+        let out = run_vendor_gc(&common, &manifest_path, false).await;
+        assert_eq!(out.unused_reverted, vec![CARGO_PURL.to_string()], "{out:?}");
+        assert!(out.failed.is_empty(), "{out:?}");
+        assert!(load_state(root).await.unwrap().entries.is_empty());
+        assert!(
+            !root.join(format!(".socket/vendor/cargo/{UUID}")).exists(),
+            "committed tree reclaimed"
+        );
+        // The build-breaking leftover [patch.crates-io] entry is gone; the
+        // hosted lock wiring is left exactly as it was (still hosted-live).
+        let cfg = tokio::fs::read_to_string(root.join(".cargo/config.toml"))
+            .await
+            .unwrap_or_default();
+        assert!(!cfg.contains("patch.crates-io"), "{cfg}");
+        let lock = tokio::fs::read_to_string(root.join("Cargo.lock"))
+            .await
+            .unwrap();
+        assert!(
+            lock.contains("sparse+http://127.0.0.1:5555/index/"),
+            "{lock}"
+        );
     }
 
     /// (c) uuid dirs with no owning ledger entry are swept (wet) / counted

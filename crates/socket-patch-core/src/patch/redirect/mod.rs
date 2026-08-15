@@ -26,10 +26,12 @@ use crate::vendor::yarn_berry_lock::yarnrc_compression_level;
 
 pub mod golang_local;
 mod state;
+mod takeover;
 pub use state::{
-    load_redirect_state, save_redirect_state, CorruptRedirectState, RedirectState,
-    REDIRECT_STATE_REL,
+    load_redirect_state, persist_redirect_state, save_redirect_state, CorruptRedirectState,
+    RedirectState, REDIRECT_STATE_REL,
 };
+pub use takeover::{revert_cargo_redirect_purl, CargoRedirectRevert};
 
 /// One ecosystem's integrity hashes (mirrors the TS `PatchArtifactIntegrity`).
 #[derive(Debug, Clone, Default, Deserialize)]

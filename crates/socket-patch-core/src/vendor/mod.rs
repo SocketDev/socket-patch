@@ -50,7 +50,7 @@ pub mod bun_lock;
 pub(crate) mod bun_lock_text;
 pub mod cargo;
 pub mod cargo_config;
-pub(crate) mod cargo_lock;
+pub mod cargo_lock;
 pub(crate) mod common;
 pub mod composer_lock;
 pub mod gem;
