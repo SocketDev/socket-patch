@@ -629,7 +629,7 @@ pub(super) async fn run_redirect(
     // may still claim package(s) this project also has a hosted redirect ledger
     // for — their tarballs would then be orphaned and that ledger stale. But the
     // overlap alone does NOT prove hosted won: only warn for the package(s) the
-    // LIVE lockfile actually routes to `patch.socket.dev` (see
+    // LIVE lockfile actually routes to the hosted patch server (see
     // `classify_overlap_takeover`), so a dry-run / no-op over a lock that still
     // points at the vendored files stays silent instead of pointing cleanup at
     // the live vendored ledger. Warn (JSON `warnings[]` and stderr) WITHOUT
@@ -643,6 +643,19 @@ pub(super) async fn run_redirect(
         takeover_warnings.push(serde_json::json!({
             "code": super::REDIRECT_SUPERSEDES_VENDORED,
             "detail": super::mode_takeover_detail(&superseded, /*current_is_hosted=*/ true),
+        }));
+    }
+
+    // `--prune` is a no-op in hosted mode (both hosted terminals return
+    // before the GC blocks): make that explicit in the JSON `warnings[]`
+    // rather than silently dropping the flag — a bot migrating from
+    // `--mode agent --prune` must see WHY it stopped pruning. The human
+    // path warns once up front in `run` (before this flow is entered).
+    let mut prune_warnings: Vec<serde_json::Value> = Vec::new();
+    if args.prune || args.sync {
+        prune_warnings.push(serde_json::json!({
+            "code": super::REDIRECT_PRUNE_IGNORED,
+            "detail": super::REDIRECT_PRUNE_IGNORED_DETAIL,
         }));
     }
 
@@ -688,6 +701,7 @@ pub(super) async fn run_redirect(
         warnings.extend(rush_warnings.iter().cloned());
         warnings.extend(pnpm_warnings.iter().cloned());
         warnings.extend(takeover_warnings.iter().cloned());
+        warnings.extend(prune_warnings.iter().cloned());
         // Nest the redirect result under `redirect` inside the classic scan
         // object (built by `run`, threaded in via `scan_result`), mirroring
         // vendored mode's nested `vendor` block. This keeps the hosted `--json`
