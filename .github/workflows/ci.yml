@@ -1090,15 +1090,11 @@ jobs:
         if: steps.gate.outputs.run == 'true'
         run: python -m pip install --disable-pip-version-check uv && uv --version
 
-      - name: Setup Ruby
-        if: steps.gate.outputs.run == 'true'
-        uses: ruby/setup-ruby@319994f95fa847cf3fb3cd3dbe89f6dcde9f178f # v1.295.0
-        with:
-          ruby-version: '3.2.10'
-          # The gem hosted rewrite pins into the Gemfile.lock CHECKSUMS
-          # section, which `bundle lock --add-checksums` only emits on >= 2.6.
-          bundler: '2.6'
-          bundler-cache: false
+      # No Ruby setup: the bundler leg was retired in 2026-08 when production
+      # withdrew its last free-tier gem patch (see
+      # docs/testing/hosted-production-e2e.md). Reinstate ruby/setup-ruby
+      # (with bundler >= 2.6 for `bundle lock --add-checksums`) when the gem
+      # leg is restored.
 
       - name: Setup Go
         if: steps.gate.outputs.run == 'true'

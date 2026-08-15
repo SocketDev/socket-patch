@@ -41,14 +41,19 @@ from the child environment.
 | npm | `pkg:npm/minimist@1.2.2` | `80630680-4da6-45f9-bba8-b888e0ffd58c` | GHSA-xvch-5gv4-984h / CVE-2021-44906 | all five npm-family legs |
 | PyPI | `pkg:pypi/urllib3@1.26.18` | `de58c8b8-796c-4b6d-8a48-539b5563db76`, `26242e35-f867-4da8-8789-f0d2ea49e0f1`, `e828efa5-5c6d-43f3-9909-03f5ac232b98` | GHSA-38jv-5279-wg99, GHSA-2xpw-w6gg-jr37, GHSA-gm62-xv2j-4w53 | requirements.txt, uv.lock |
 | Cargo | `pkg:cargo/traitobject@0.1.1` | `cf2e6f58-d9fa-4096-9151-c34afa717f89` | GHSA-pp8r-vv2j-9j5v | cargo sparse-registry leg |
-| RubyGems | `pkg:gem/activestorage@7.0.2.2` | `2535d43d-67ce-4944-be27-c19e113997fb` | GHSA-w749-p3v6-hccq | bundler leg |
+
+RubyGems is no longer in the catalog: the suite was pinned to
+`pkg:gem/activestorage@7.0.2.2` (`2535d43d-67ce-4944-be27-c19e113997fb`,
+GHSA-w749-p3v6-hccq) until 2026-08, when production withdrew it — and with it
+the **last** free-tier gem patch. See
+[RubyGems: the retired bundler leg](#rubygems-the-retired-bundler-leg).
 
 urllib3 1.26.18 carries **three** distinct free patches, one per advisory. Which
 one the resolver returns is a server-side ordering detail, so the suite accepts
 any of the three rather than pinning one — pinning would go red on an unrelated
 server-side reorder.
 
-`preflight_required_patches_are_published` checks all four every run and fails
+`preflight_required_patches_are_published` checks all three every run and fails
 first with the offending PURL named, so a withdrawn patch produces one clear
 failure instead of N confusing ones that look like CLI regressions.
 
@@ -66,6 +71,13 @@ failure instead of N confusing ones that look like CLI regressions.
 3. If the new patch does not inject the `// Socket Community Patch` header
    (Cargo crates do not), pick a marker unique to the patch and set the
    ecosystem's `*_MARKER` constant.
+4. If the ecosystem has **no free patches left at all** (probe every plausible
+   candidate — for gems, every name in
+   [ruby-advisory-db](https://github.com/rubysec/ruby-advisory-db) is a decent
+   sweep), there is nothing honest to re-pin: retire the leg, move the
+   ecosystem into `UNPUBLISHED_ECOSYSTEMS` so `canary_unpublished_ecosystems`
+   reports the moment a patch reappears, and note the retirement here. That is
+   what happened to RubyGems in 2026-08.
 
 ## Ecosystem coverage, and the honest gaps
 
@@ -74,21 +86,48 @@ failure instead of N confusing ones that look like CLI regressions.
 | npm | ✅ | ✅ many | ✅ npm, npm-shrinkwrap, pnpm, yarn classic, yarn berry, bun |
 | PyPI | ✅ (requirements.txt + uv.lock only) | ✅ many | ✅ requirements.txt, uv.lock |
 | Cargo | ✅ | ✅ 1 crate | ✅ sparse registry |
-| RubyGems | ✅ | ✅ 1 gem | ⚠️ redirect asserted; install blocked by a **server defect** (below) |
+| RubyGems | ✅ | ❌ **none** — last one withdrawn 2026-08 | canary only; leg retired (below), mocked capstone `e2e_redirect_gem_build.rs` |
 | Maven | ✅ | ❌ **none** | canary only |
 | NuGet | ✅ | ❌ **none** | canary only |
 | Composer | ✅ | ❌ **none** | canary only |
 | Go | ❌ [by design](../design/golang-hosted-no-go.md) | ❌ none | negative assertion |
 | Deno | ❌ not supported | — | negative assertion |
 
-Maven, NuGet and Composer all *implement* hosted mode, but production publishes
-**zero** free-tier patches for them, so there is nothing real to redirect to.
-Rather than skipping silently, `canary_unpublished_ecosystems` probes production
-every run and reports the moment that changes, so coverage can be extended
-deliberately. It does not fail when patches appear — production publishing a
-patch is not a socket-patch regression — but
+RubyGems, Maven, NuGet and Composer all *implement* hosted mode, but production
+publishes **zero** free-tier patches for them, so there is nothing real to
+redirect to. Rather than skipping silently, `canary_unpublished_ecosystems`
+probes production every run and reports the moment that changes, so coverage
+can be extended deliberately. It does not fail when patches appear — production
+publishing a patch is not a socket-patch regression — but
 `SOCKET_PATCH_HOSTED_E2E_CANARY_STRICT=1` makes it fail, for use in a scheduled
 nag run.
+
+### RubyGems: the retired bundler leg
+
+Until 2026-08 the suite carried a real bundler leg
+(`gem_bundler_hosted_redirect_and_known_install_defect`): install
+activestorage 7.0.2.2 from rubygems.org, assert the hosted redirect rewrote the
+`Gemfile` source block and replaced the `Gemfile.lock` CHECKSUMS pin, then
+reinstall from the redirected Gemfile — tolerating (and loudly reporting) the
+known compact-index server defect below, and content-verifying the installed
+files against the patch's published `afterHash` whenever the install
+succeeded.
+
+Production then withdrew the `activestorage@7.0.2.2` patch. It was the last
+free-tier gem patch: as of 2026-08-13 a probe of **every** gem name in
+ruby-advisory-db (464 packages) returns zero free patches, and
+`/patch/view/2535d43d-67ce-4944-be27-c19e113997fb` 404s, so there was no
+honest replacement pin and the leg was retired rather than left red or made
+vacuous. The gem hosted rewrite grammar stays covered by
+`e2e_redirect_gem_build.rs` against a mock.
+
+**To restore it**: when the `gem` probes in `UNPUBLISHED_ECOSYSTEMS` light up,
+resurrect the leg, its helpers (`gem_lock_checksum`, `installed_gem_dir`,
+`gem_registry_base`, `http_probe`, `published_patch_files`), the `GEM_*`
+catalog constants, the `SOCKET_PATCH_HOSTED_E2E_GEM_STRICT` knob and CI's
+`ruby/setup-ruby` step from git history (the commit that landed this
+paragraph deleted all of them together), re-pin to the newly published patch,
+and re-add the catalog rows above.
 
 PyPI's poetry / pdm / pipenv locks are **not** rewritten by hosted mode (see the
 [matrix](../ecosystems.md#mode--ecosystem-matrix)); those flavors are vendored-mode
@@ -107,9 +146,15 @@ Two supported hosted shapes are deliberately **not** covered here:
 
 ## Known issues this suite surfaced
 
-Both were found by running against real production, and neither is a test bug.
+All were found by running against real production, and none is a test bug.
 
 ### 1. `gem` — hosted mode is unusable for gems with dependencies (SERVER)
+
+> **Status 2026-08**: the bundler leg that exercised this defect was retired
+> when production withdrew its last free-tier gem patch (see above). The
+> defect itself is still believed to stand server-side; nothing free-tier
+> remains to probe it against. Kept for the record and for the day the leg is
+> restored.
 
 Socket's gem patch-registry serves a compact index whose `/info/<gem>` line
 declares **no runtime dependencies**, while the `.gem` it serves declares six.
@@ -134,10 +179,11 @@ curl -s "https://patch.socket.dev/patch-registry/gem/<grant>/<uuid>/info/actives
 ```
 
 **Fix belongs on the server**: the compact-index generator must emit the
-gemspec's runtime dependencies. Until then the suite asserts the redirect (which
-is correct) and tolerates the install failure, failing loudly if it fails for
-any *other* reason. Set `SOCKET_PATCH_HOSTED_E2E_GEM_STRICT=1` to promote it to
-a hard failure — do that as the regression guard once the server is fixed.
+gemspec's runtime dependencies. While the leg existed, the suite asserted the
+redirect (which was correct) and tolerated the install failure, failing loudly
+if it failed for any *other* reason; `SOCKET_PATCH_HOSTED_E2E_GEM_STRICT=1`
+promoted it to a hard failure. Both the tolerance and the knob left with the
+leg.
 
 ### 2. `pnpm` — pnpm 11 rejects hosted lockfiles by default (CLI UX gap)
 
@@ -201,19 +247,18 @@ runs only where it is explicitly asked for.
 | Variable | Effect |
 |----------|--------|
 | `SOCKET_PATCH_HOSTED_E2E_STRICT=1` | Turn every "toolchain missing" soft-skip into a hard failure. **CI sets this** — a required check must never report green on an unexercised leg. |
-| `SOCKET_PATCH_HOSTED_E2E_GEM_STRICT=1` | Promote the known gem install defect to a hard failure. |
-| `SOCKET_PATCH_HOSTED_E2E_CANARY_STRICT=1` | Fail when maven/nuget/composer gain their first free published patch. |
+| `SOCKET_PATCH_HOSTED_E2E_CANARY_STRICT=1` | Fail when gem/maven/nuget/composer gain their first free published patch. |
 
 ### Toolchains
 
 `npm`, `corepack` (pnpm + yarn classic + yarn berry), `bun`, `uv`, `cargo`,
-`ruby` + `bundle` (**≥ 2.6** — `bundle lock --add-checksums` emits the CHECKSUMS
-section the gem rewrite pins into), `go`.
+`go`. (`ruby` + `bundle` ≥ 2.6 will be needed again when the retired gem leg
+is restored.)
 
 ### Network egress
 
 `patches-api.socket.dev`, `patch.socket.dev`, `registry.npmjs.org`, `pypi.org`,
-`files.pythonhosted.org`, `static.crates.io`, `index.crates.io`, `rubygems.org`.
+`files.pythonhosted.org`, `static.crates.io`, `index.crates.io`.
 
 ## CI: the `hosted-e2e` job
 
