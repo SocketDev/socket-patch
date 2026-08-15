@@ -231,30 +231,94 @@ fn rewrite_npm_lock(
             });
             continue;
         };
-        let suffix = format!("node_modules/{fname}");
+        let mut matched_any = false;
         if let Some(packages) = lock.get_mut("packages").and_then(Value::as_object_mut) {
             for (key, entry) in packages.iter_mut() {
-                let matches_key = key == &suffix || key.ends_with(&format!("/{suffix}"));
+                // Only `node_modules/` keys are installable dependencies:
+                // "" is the project root and other bare keys are workspace
+                // members — SOURCE dirs a resolved/integrity insert would
+                // corrupt.
+                let Some((_, key_name)) = key.rsplit_once("node_modules/") else {
+                    continue;
+                };
+                // The package a lock entry stands for: the explicit `name`
+                // field when present (npm writes it for aliases — `npm i
+                // alias@npm:real` keys the entry by the ALIAS), else the
+                // key's trailing path. Mirrors `vendor::npm_lock`'s
+                // `entry_name`, so an alias install of the patched package
+                // redirects and an entry that merely SHARES the key name
+                // (`npm i <fname>@npm:other`) is never hijacked.
+                let entry_nm = entry
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or(key_name);
                 let matches_ver =
                     entry.get("version").and_then(Value::as_str) == Some(dep.version.as_str());
-                if matches_key && matches_ver {
-                    if let Some(edit) = rewrite_npm_entry(
-                        entry,
-                        dep,
-                        &sha512,
-                        lockfile,
-                        "redirect_npm_lock_entry",
-                        key,
-                    ) {
-                        result.edits.push(edit);
-                        changed = true;
-                    }
+                if entry_nm != fname || !matches_ver {
+                    continue;
+                }
+                if entry.get("link").and_then(Value::as_bool) == Some(true) {
+                    matched_any = true;
+                    result.warnings.push(RewriteWarning {
+                        code: "redirect_npm_link_entry_skipped".into(),
+                        detail: format!(
+                            "lock entry `{key}` is a link (npm workspaces/file: dir); skipped"
+                        ),
+                    });
+                    continue;
+                }
+                // npm reify extracts a bundled copy from its PARENT's tarball
+                // and ignores the entry's resolved/integrity, so a rewrite
+                // here would put the hosted URL in the lockfile (confirming
+                // and VEX-attesting the patch) while the unpatched bundled
+                // bytes keep installing. Mirrors the vendored backend's
+                // `vendor_bundled_instance_skipped` refusal.
+                if entry.get("inBundle").and_then(Value::as_bool) == Some(true) {
+                    matched_any = true;
+                    result.warnings.push(RewriteWarning {
+                        code: "redirect_npm_bundled_instance_skipped".into(),
+                        detail: format!(
+                            "lock entry `{key}` is bundled inside its parent's tarball and \
+                             CANNOT be redirected — that copy stays UNPATCHED; vendor or \
+                             update the bundling parent to cover it"
+                        ),
+                    });
+                    continue;
+                }
+                matched_any = true;
+                if let Some(edit) = rewrite_npm_entry(
+                    entry,
+                    dep,
+                    &sha512,
+                    lockfile,
+                    "redirect_npm_lock_entry",
+                    key,
+                ) {
+                    result.edits.push(edit);
+                    changed = true;
                 }
             }
         }
         // v2 legacy `dependencies` tree (keyed by name), recursive.
         if let Some(deps) = lock.get_mut("dependencies").and_then(Value::as_object_mut) {
-            changed = rewrite_npm_v2_deps(deps, &fname, dep, &sha512, lockfile, result) || changed;
+            changed = rewrite_npm_v2_deps(
+                deps,
+                &fname,
+                dep,
+                &sha512,
+                lockfile,
+                result,
+                &mut matched_any,
+            ) || changed;
+        }
+        // Parity with the pnpm/berry/uv rewriters: a granted dep the
+        // lockfile cannot pin must be SAID, not silently dropped from the
+        // redirected count.
+        if !matched_any {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_npm_entry_not_found".into(),
+                detail: format!("no {lockfile} entry for {fname}@{}", dep.version),
+            });
         }
     }
     if changed {
@@ -301,21 +365,39 @@ fn rewrite_npm_v2_deps(
     sha512: &str,
     lockfile: &str,
     result: &mut RewriteResult,
+    matched_any: &mut bool,
 ) -> bool {
     let mut changed = false;
     for (name, entry) in deps.iter_mut() {
         if name == fname
             && entry.get("version").and_then(Value::as_str) == Some(dep.version.as_str())
         {
-            if let Some(edit) =
-                rewrite_npm_entry(entry, dep, sha512, lockfile, "redirect_npm_lock_dep", name)
-            {
-                result.edits.push(edit);
-                changed = true;
+            // Legacy spelling of `inBundle`: same npm-ignores-the-rewrite
+            // fail-open as the `packages` guard above.
+            if entry.get("bundled").and_then(Value::as_bool) == Some(true) {
+                *matched_any = true;
+                result.warnings.push(RewriteWarning {
+                    code: "redirect_npm_bundled_instance_skipped".into(),
+                    detail: format!(
+                        "legacy dependencies entry `{name}` is bundled inside its parent's \
+                         tarball and CANNOT be redirected — that copy stays UNPATCHED; vendor \
+                         or update the bundling parent to cover it"
+                    ),
+                });
+            } else {
+                *matched_any = true;
+                if let Some(edit) =
+                    rewrite_npm_entry(entry, dep, sha512, lockfile, "redirect_npm_lock_dep", name)
+                {
+                    result.edits.push(edit);
+                    changed = true;
+                }
             }
         }
         if let Some(nested) = entry.get_mut("dependencies").and_then(Value::as_object_mut) {
-            changed = rewrite_npm_v2_deps(nested, fname, dep, sha512, lockfile, result) || changed;
+            changed =
+                rewrite_npm_v2_deps(nested, fname, dep, sha512, lockfile, result, matched_any)
+                    || changed;
         }
     }
     changed
@@ -6861,6 +6943,320 @@ mod tests {
                 .any(|w| w.code == "redirect_npm_lock_unparseable"),
             "corrupt lockfile must warn: {:?}",
             r.warnings
+        );
+    }
+
+    /// A bundled (`inBundle: true`) lock entry must NOT be rewritten: npm
+    /// reify extracts that copy from its parent's tarball and ignores the
+    /// entry's resolved/integrity, so a rewrite would put the hosted URL in
+    /// the lockfile — confirming, ledger-recording, and VEX-attesting a patch
+    /// whose bytes never install. It must be skipped with a loud
+    /// stays-UNPATCHED warning instead (mirroring the vendored backend).
+    #[test]
+    fn npm_inbundle_entry_is_skipped_with_loud_warning() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "package-lock.json".to_string(),
+            r#"{
+  "name": "app",
+  "lockfileVersion": 3,
+  "packages": {
+    "": { "name": "app", "version": "0.0.0" },
+    "node_modules/parent": {
+      "version": "2.0.0",
+      "resolved": "https://registry.npmjs.org/parent/-/parent-2.0.0.tgz",
+      "integrity": "sha512-PARENT=="
+    },
+    "node_modules/parent/node_modules/left-pad": {
+      "version": "1.3.0",
+      "inBundle": true,
+      "integrity": "sha512-UPSTREAM=="
+    }
+  }
+}
+"#
+            .to_string(),
+        );
+        let overrides = vec![npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://patch.test/lp.tgz",
+            "sha512-PATCHED==",
+        )];
+        let r = rewrite_registry_redirect(&files, &overrides);
+        assert!(
+            r.files.is_empty() && r.edits.is_empty(),
+            "a bundled-only dep must change nothing: files={:?} edits={:?}",
+            r.files.keys(),
+            r.edits
+        );
+        let bundled = r
+            .warnings
+            .iter()
+            .find(|w| w.code == "redirect_npm_bundled_instance_skipped")
+            .unwrap_or_else(|| panic!("bundled skip must warn: {:?}", r.warnings));
+        assert!(
+            bundled.detail.contains("UNPATCHED")
+                && bundled
+                    .detail
+                    .contains("node_modules/parent/node_modules/left-pad"),
+            "the warning must say the copy stays unpatched and name the entry: {}",
+            bundled.detail
+        );
+        assert!(
+            !warning_codes(&r).contains(&"redirect_npm_entry_not_found"),
+            "a bundled skip is a MATCH — not-found must stay quiet: {:?}",
+            r.warnings
+        );
+    }
+
+    /// When the patched dep has both a regular entry and a bundled nested
+    /// copy, the regular entry is redirected and the bundled copy is left
+    /// byte-untouched behind the stays-UNPATCHED warning (partial coverage
+    /// must be surfaced, not silently absorbed).
+    #[test]
+    fn npm_inbundle_skip_leaves_sibling_rewrite_intact() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "package-lock.json".to_string(),
+            r#"{
+  "name": "app",
+  "lockfileVersion": 3,
+  "packages": {
+    "": { "name": "app", "version": "0.0.0" },
+    "node_modules/left-pad": {
+      "version": "1.3.0",
+      "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+      "integrity": "sha512-UPSTREAM=="
+    },
+    "node_modules/parent/node_modules/left-pad": {
+      "version": "1.3.0",
+      "inBundle": true,
+      "integrity": "sha512-UPSTREAM=="
+    }
+  }
+}
+"#
+            .to_string(),
+        );
+        let overrides = vec![npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://patch.test/lp.tgz",
+            "sha512-PATCHED==",
+        )];
+        let r = rewrite_registry_redirect(&files, &overrides);
+        assert_eq!(r.edits.len(), 1, "only the regular entry: {:?}", r.edits);
+        assert_eq!(
+            r.edits[0].key.as_deref(),
+            Some("node_modules/left-pad"),
+            "the rewritten entry is the non-bundled one"
+        );
+        let out = r.files.get("package-lock.json").expect("lock rewritten");
+        let lock: Value =
+            serde_json::from_str(out).expect("the rewritten lock must stay valid JSON");
+        let bundled_entry = &lock["packages"]["node_modules/parent/node_modules/left-pad"];
+        assert_eq!(
+            bundled_entry["integrity"], "sha512-UPSTREAM==",
+            "the bundled copy must keep its upstream pin: {out}"
+        );
+        assert!(
+            bundled_entry.get("resolved").is_none(),
+            "no resolved may be inserted into the bundled entry: {out}"
+        );
+        assert!(
+            warning_codes(&r).contains(&"redirect_npm_bundled_instance_skipped"),
+            "partial coverage must be surfaced: {:?}",
+            r.warnings
+        );
+    }
+
+    /// The v1/v2 legacy `dependencies` tree spells the bundled flag
+    /// `bundled: true` — same guard as `inBundle` in `packages`.
+    #[test]
+    fn npm_legacy_bundled_dependency_is_skipped() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "package-lock.json".to_string(),
+            r#"{
+  "name": "app",
+  "lockfileVersion": 1,
+  "dependencies": {
+    "parent": {
+      "version": "2.0.0",
+      "resolved": "https://registry.npmjs.org/parent/-/parent-2.0.0.tgz",
+      "integrity": "sha512-PARENT==",
+      "dependencies": {
+        "left-pad": {
+          "version": "1.3.0",
+          "bundled": true
+        }
+      }
+    }
+  }
+}
+"#
+            .to_string(),
+        );
+        let overrides = vec![npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://patch.test/lp.tgz",
+            "sha512-PATCHED==",
+        )];
+        let r = rewrite_registry_redirect(&files, &overrides);
+        assert!(
+            r.files.is_empty() && r.edits.is_empty(),
+            "legacy bundled dep must change nothing: files={:?} edits={:?}",
+            r.files.keys(),
+            r.edits
+        );
+        assert!(
+            warning_codes(&r).contains(&"redirect_npm_bundled_instance_skipped"),
+            "legacy bundled skip must warn: {:?}",
+            r.warnings
+        );
+    }
+
+    /// An alias install (`npm i my-alias@npm:left-pad@1.3.0`) keys the lock
+    /// entry by the ALIAS with the real package in `name`. Discovery is
+    /// alias-aware (the crawler reads the installed package.json name), so
+    /// the rewriter must be too — matching on the entry's `name`, mirroring
+    /// `vendor::npm_lock::entry_name`.
+    #[test]
+    fn npm_alias_entry_is_redirected() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "package-lock.json".to_string(),
+            r#"{
+  "name": "app",
+  "lockfileVersion": 3,
+  "packages": {
+    "": { "name": "app", "version": "0.0.0" },
+    "node_modules/my-alias": {
+      "name": "left-pad",
+      "version": "1.3.0",
+      "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+      "integrity": "sha512-UPSTREAM=="
+    }
+  }
+}
+"#
+            .to_string(),
+        );
+        let overrides = vec![npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://patch.test/lp.tgz",
+            "sha512-PATCHED==",
+        )];
+        let r = rewrite_registry_redirect(&files, &overrides);
+        assert_eq!(r.edits.len(), 1, "alias entry redirected: {:?}", r.warnings);
+        assert_eq!(r.edits[0].key.as_deref(), Some("node_modules/my-alias"));
+        let out = r.files.get("package-lock.json").expect("lock rewritten");
+        let lock: Value =
+            serde_json::from_str(out).expect("the rewritten lock must stay valid JSON");
+        assert_eq!(
+            lock["packages"]["node_modules/my-alias"]["resolved"],
+            "http://patch.test/lp.tgz"
+        );
+        assert_eq!(
+            lock["packages"]["node_modules/my-alias"]["integrity"],
+            "sha512-PATCHED=="
+        );
+        assert!(
+            !warning_codes(&r).contains(&"redirect_npm_entry_not_found"),
+            "{:?}",
+            r.warnings
+        );
+    }
+
+    /// The reverse alias direction: `npm i left-pad@npm:other-pkg` keys an
+    /// entry `node_modules/left-pad` whose `name` is the OTHER package. A
+    /// deliberate fork substitution must never be hijacked back to the
+    /// patched upstream artifact just because the versions coincide.
+    #[test]
+    fn npm_alias_of_other_package_is_not_hijacked() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "package-lock.json".to_string(),
+            r#"{
+  "name": "app",
+  "lockfileVersion": 3,
+  "packages": {
+    "": { "name": "app", "version": "0.0.0" },
+    "node_modules/left-pad": {
+      "name": "totally-other",
+      "version": "1.3.0",
+      "resolved": "https://registry.npmjs.org/totally-other/-/totally-other-1.3.0.tgz",
+      "integrity": "sha512-FORK=="
+    }
+  }
+}
+"#
+            .to_string(),
+        );
+        let overrides = vec![npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://patch.test/lp.tgz",
+            "sha512-PATCHED==",
+        )];
+        let r = rewrite_registry_redirect(&files, &overrides);
+        assert!(
+            r.files.is_empty() && r.edits.is_empty(),
+            "the fork substitution must survive: files={:?} edits={:?}",
+            r.files.keys(),
+            r.edits
+        );
+        assert!(
+            warning_codes(&r).contains(&"redirect_npm_entry_not_found"),
+            "nothing redirectable matched, which must be said: {:?}",
+            r.warnings
+        );
+    }
+
+    /// A granted npm override matching no lock entry (not installed, or the
+    /// lock drifted to another version) must warn — parity with
+    /// `redirect_pnpm_entry_not_found` / `redirect_yarn_berry_entry_not_found`.
+    /// Silence here made every npm redirect miss unreadable in CI.
+    #[test]
+    fn npm_entry_not_found_warns() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "package-lock.json".to_string(),
+            r#"{
+  "name": "app",
+  "lockfileVersion": 3,
+  "packages": {
+    "": { "name": "app", "version": "0.0.0" },
+    "node_modules/left-pad": {
+      "version": "1.2.0",
+      "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.2.0.tgz",
+      "integrity": "sha512-OLD=="
+    }
+  }
+}
+"#
+            .to_string(),
+        );
+        let overrides = vec![npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://patch.test/lp.tgz",
+            "sha512-PATCHED==",
+        )];
+        let r = rewrite_registry_redirect(&files, &overrides);
+        assert!(r.files.is_empty() && r.edits.is_empty());
+        let nf = r
+            .warnings
+            .iter()
+            .find(|w| w.code == "redirect_npm_entry_not_found")
+            .unwrap_or_else(|| panic!("version drift must warn: {:?}", r.warnings));
+        assert!(
+            nf.detail.contains("left-pad@1.3.0") && nf.detail.contains("package-lock.json"),
+            "the warning names the dep and the lockfile: {}",
+            nf.detail
         );
     }
 
