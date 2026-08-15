@@ -642,12 +642,12 @@ pub(super) async fn classify_overlap_takeover(cwd: &Path) -> OverlapTakeover {
     for purl in overlap {
         // Cargo needs its own probe: the scan inventory records `resolved:
         // None` for every cargo entry (a Cargo.lock `source` is an index URL,
-        // not a tarball URL), and the generic `vendored_wiring_live` substring
-        // scan keeps matching the leftover `[patch.crates-io]` marker after a
-        // hosted takeover — INVERTING the direction (the takeover-direction
-        // bug, cargo edition). The cargo classifier reads the lock entry's
-        // actual shape instead — the lock is the one file BOTH modes rewire,
-        // in mutually exclusive ways.
+        // not a tarball URL), so `hosted_wiring_live`'s inventory proof can
+        // never fire for cargo — and the vendored substring scan alone then
+        // INVERTS the direction after a hosted takeover (the
+        // takeover-direction bug, cargo edition). The cargo classifier reads
+        // the lock entry's actual shape instead — the lock is the truth
+        // source both modes rewire, in mutually exclusive ways.
         let (hosted_live, vendored_live) = if purl.starts_with("pkg:cargo/") {
             classify_cargo_overlap(cwd, &purl, vendor_by_purl.get(&purl).copied()).await
         } else {
@@ -864,10 +864,12 @@ async fn vendored_wiring_live(cwd: &Path, entry: &socket_patch_core::vendor::Ven
 pub(super) fn mode_takeover_detail(superseded: &[String], current_is_hosted: bool) -> String {
     let list = superseded.join(", ");
     if current_is_hosted {
-        // Deleting the `.socket/vendor/<eco>/` tree by hand is NEVER offered:
-        // for cargo a leftover `[patch.crates-io]` entry still points at that
+        // NEVER offer deleting the `.socket/vendor/<eco>/` tree here: for
+        // cargo the leftover `[patch.crates-io]` entry still points at that
         // tree, and deleting it hard-fails every cargo invocation ("failed to
-        // load source for dependency").
+        // load source for dependency"). Nor `vendor --revert`, which unwinds
+        // EVERY vendored package including the ones still live in the
+        // lockfile — `remove <purl>` is the per-package equivalent.
         format!(
             "hosted redirect superseded the vendored ledger for: {list}. \
              `.socket/vendor/state.json` still claims these package(s) and their \
@@ -888,22 +890,31 @@ pub(super) fn mode_takeover_detail(superseded: &[String], current_is_hosted: boo
              would break or be mass-reverted."
         )
     } else {
+        // NEVER advise deleting the redirect ledger by hand: it may hold the
+        // only revert data (FileEdit originals) and VEX records for OTHER
+        // packages that are still hosted-redirected. The vendored flows
+        // reconcile per package — reverting the stale hosted edits and
+        // dropping exactly the superseded ledger records.
         format!(
             "vendored artifacts superseded the hosted redirect ledger for: {list}. \
              `.socket/vendor/redirect-state.json` still records a hosted redirect for \
              these package(s), but the lockfile now points at the committed \
-             `.socket/vendor/` files. Clean up per package: edit \
-             `.socket/vendor/redirect-state.json` and delete only these package(s)' \
-             entries under `records` AND their matching entries under `edits`, so \
-             audits and VEX do not read superseded wiring. Both halves matter: the \
-             leftover `edits` are that package's stale pre-redirect originals, \
-             which a later redirect revert would replay over the live vendored \
-             wiring — and an `edits` entry left behind still names the package, so \
-             a ledger whose last record you just deleted keeps reading as \
-             superseded and this warning keeps firing. Do not delete the ledger \
-             file itself: it may still hold live redirect records for other \
-             package(s), plus the recorded pre-redirect lockfile originals \
-             (`edits`) a future revert needs for them."
+             `.socket/vendor/` files. Re-run `socket-patch vendor` (or `scan \
+             --mode vendored`) to reconcile these package(s) automatically: it \
+             reverts their stale hosted edits from the ledger and drops both \
+             halves of each superseded entry — the `records` entry AND its \
+             matching `edits`. To clean up by hand instead, delete only these \
+             package(s)' entries under `records` AND their matching entries \
+             under `edits`, so audits and VEX do not read superseded wiring. \
+             Both halves matter: the leftover `edits` are that package's stale \
+             pre-redirect originals, which a later redirect revert would replay \
+             over the live vendored wiring — and an `edits` entry left behind \
+             still names the package, so a ledger whose last record you just \
+             deleted keeps reading as superseded and this warning keeps firing. \
+             Do not delete the ledger file itself: it may still hold live \
+             redirect records for other package(s), plus the recorded \
+             pre-redirect lockfile originals (`edits`) a future revert needs \
+             for them."
         )
     }
 }
