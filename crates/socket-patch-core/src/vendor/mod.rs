@@ -81,7 +81,10 @@ pub(crate) mod yarn_classic_lock;
 mod yarn_layering_tests;
 
 pub use path::{ecosystem_dir_for_purl, parse_vendor_path};
-pub use state::{load_state, lookup_entry, save_state, VendorEntry, VendorState, VENDOR_STATE_REL};
+pub use state::{
+    carry_forward_wiring, load_state, lookup_entry, save_state, VendorEntry, VendorState,
+    VENDOR_STATE_REL,
+};
 pub use verify::{
     artifact_is_file_shaped, check_vendored_artifact, compute_dir_inventory, file_sha256_hex,
     ArtifactHealth,

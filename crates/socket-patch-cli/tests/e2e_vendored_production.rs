@@ -514,23 +514,6 @@ fn minimist_entry(proj: &Path) -> PathBuf {
     proj.join("node_modules").join(NPM_NAME).join("index.js")
 }
 
-/// Mirror the `pnpm.overrides` the CLI wrote into `package.json` over to a
-/// `pnpm-workspace.yaml` `overrides:` block — the location pnpm >= 11 actually
-/// reads (see [`pnpm_vendored_install_proof`]). Reads back exactly what the CLI
-/// produced rather than hardcoding a value, so it exercises the real wiring.
-fn write_pnpm_workspace_overrides(proj: &Path, leg: &str) {
-    let pkg: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(proj.join("package.json")).unwrap()).unwrap();
-    let overrides = pkg["pnpm"]["overrides"].as_object().unwrap_or_else(|| {
-        panic!("{leg}: package.json carries no `pnpm.overrides` to mirror into pnpm-workspace.yaml")
-    });
-    let mut yaml = String::from("overrides:\n");
-    for (k, v) in overrides {
-        yaml.push_str(&format!("  '{k}': '{}'\n", v.as_str().unwrap_or_default()));
-    }
-    std::fs::write(proj.join("pnpm-workspace.yaml"), yaml).unwrap();
-}
-
 /// Locate `site-packages` inside a venv, across platforms and Python minors.
 fn site_packages(venv: &Path) -> Option<PathBuf> {
     if cfg!(windows) {
@@ -836,15 +819,28 @@ fn pnpm_vendored_install_proof() {
         lock.contains(&tgz_rel),
         "{LEG}: pnpm-lock.yaml was not rewired to the vendored tarball:\n{lock}"
     );
+    // pnpm >= 11 reads `overrides` only from pnpm-workspace.yaml, so the CLI
+    // creates/updates it too. Assert it landed and points at the tarball.
+    let ws_path = proj.join("pnpm-workspace.yaml");
+    let ws = read(&ws_path);
+    assert!(
+        ws.contains(&tgz_rel),
+        "{LEG}: pnpm-workspace.yaml `overrides:` was not wired to the vendored tarball:\n{ws}"
+    );
     let lock_wired = std::fs::read(proj.join("pnpm-lock.yaml")).unwrap();
     let pkg_wired = std::fs::read(proj.join("package.json")).unwrap();
+    let ws_wired = std::fs::read(&ws_path).unwrap();
 
-    // DELIVERY PROOF: committable files only (pnpm also edits package.json —
-    // pnpm.overrides), empty store, frozen offline install.
+    // DELIVERY PROOF: committable files only (pnpm edits package.json's
+    // `pnpm.overrides` AND creates pnpm-workspace.yaml), empty store, frozen
+    // offline install. This must now succeed directly on pnpm >= 11 — the
+    // pnpm-workspace.yaml override is exactly what closes the old
+    // ERR_PNPM_LOCKFILE_CONFIG_MISMATCH gap.
     let fresh = tmp.path().join("fresh");
     std::fs::create_dir_all(&fresh).unwrap();
     std::fs::copy(proj.join("package.json"), fresh.join("package.json")).unwrap();
     std::fs::copy(proj.join("pnpm-lock.yaml"), fresh.join("pnpm-lock.yaml")).unwrap();
+    std::fs::copy(&ws_path, fresh.join("pnpm-workspace.yaml")).unwrap();
     copy_dir_recursive(&proj.join(".socket"), &fresh.join(".socket"));
 
     let fresh_store = tmp.path().join("fresh-pnpm-store").display().to_string();
@@ -862,55 +858,19 @@ fn pnpm_vendored_install_proof() {
     ];
     let ci = tool(&fresh, "pnpm", &install_args, &fresh_env);
     let entry = minimist_entry(&fresh);
-    if ok(&ci) {
-        // pnpm <= 10: the package.json `pnpm.overrides` the CLI wrote is honored.
-        assert_patched(&entry, PATCH_MARKER, LEG);
-        assert_ne!(
-            std::fs::read(&entry).unwrap(),
-            pristine,
-            "{LEG}: the reinstalled bytes equal the PRISTINE registry bytes"
-        );
-    } else {
-        // KNOWN CLI GAP (pnpm >= 11): pnpm no longer reads `overrides` from
-        // package.json's `pnpm` field — it moved to `pnpm-workspace.yaml`
-        // (https://pnpm.io/settings). The CLI still writes package.json
-        // `pnpm.overrides`, so pnpm 11 ignores it and the frozen install
-        // refuses with a lockfile/config mismatch even though the vendored
-        // tarball and lock are correct (the supply-chain policy passes). This
-        // is a real socket-patch compatibility gap, not a test bug: the pnpm
-        // vendor rewriter should also emit a `pnpm-workspace.yaml` `overrides`
-        // block on pnpm >= 11. Until it does, this leg reproduces the documented
-        // workaround (mirror the override into pnpm-workspace.yaml) to prove the
-        // vendored artifact IS installable, and fails loudly if the failure is
-        // anything OTHER than that known gap.
-        let detail = dump(&ci);
-        assert!(
-            detail.contains("ERR_PNPM_LOCKFILE_CONFIG_MISMATCH")
-                || detail.contains("no longer read by pnpm"),
-            "{LEG}: `pnpm install --frozen-lockfile --offline` failed for an UNEXPECTED reason \
-             (not the known pnpm 11 overrides-field-moved gap). This is a new regression:\n{detail}"
-        );
-        println!(
-            "KNOWN CLI GAP {LEG}: pnpm >= 11 ignores package.json `pnpm.overrides` (moved to \
-             pnpm-workspace.yaml), so the CLI's vendored wiring does not take effect on a frozen \
-             install. Retrying with the documented pnpm-workspace.yaml workaround. socket-patch \
-             should emit that file for pnpm >= 11 during `scan --mode vendored`."
-        );
-        write_pnpm_workspace_overrides(&fresh, LEG);
-        let retry = tool(&fresh, "pnpm", &install_args, &fresh_env);
-        assert!(
-            ok(&retry),
-            "{LEG}: even with the pnpm-workspace.yaml overrides workaround the vendored tarball \
-             did not install — the artifact itself is not installable:\n{}",
-            dump(&retry)
-        );
-        assert_patched(&entry, PATCH_MARKER, LEG);
-        assert_ne!(
-            std::fs::read(&entry).unwrap(),
-            pristine,
-            "{LEG}: the reinstalled bytes equal the PRISTINE registry bytes"
-        );
-    }
+    assert!(
+        ok(&ci),
+        "{LEG}: `pnpm install --frozen-lockfile --offline` must install the vendored tarball \
+         from the committable files (no ERR_PNPM_LOCKFILE_CONFIG_MISMATCH — the \
+         pnpm-workspace.yaml override is what makes pnpm >= 11 honor it):\n{}",
+        dump(&ci)
+    );
+    assert_patched(&entry, PATCH_MARKER, LEG);
+    assert_ne!(
+        std::fs::read(&entry).unwrap(),
+        pristine,
+        "{LEG}: the reinstalled bytes equal the PRISTINE registry bytes"
+    );
 
     let env2 = scan_vendored(&proj, &[]);
     assert_eq!(
@@ -928,6 +888,11 @@ fn pnpm_vendored_install_proof() {
         pkg_wired,
         "{LEG}: re-run must leave package.json byte-identical"
     );
+    assert_eq!(
+        std::fs::read(&ws_path).unwrap(),
+        ws_wired,
+        "{LEG}: re-run must leave pnpm-workspace.yaml byte-identical"
+    );
 
     assert_eq!(vendor_revert(&proj, LEG), 1, "{LEG}: one entry reverted");
     assert_eq!(
@@ -943,6 +908,10 @@ fn pnpm_vendored_install_proof() {
     assert!(
         !proj.join(".socket/vendor").exists(),
         "{LEG}: .socket/vendor must be gone after revert"
+    );
+    assert!(
+        !ws_path.exists(),
+        "{LEG}: revert must delete the pnpm-workspace.yaml vendoring created"
     );
 }
 

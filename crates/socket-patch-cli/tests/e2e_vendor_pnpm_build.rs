@@ -8,9 +8,11 @@
 //!      bytes (a marker comment prepended to `index.js`).
 //!   3. `socket-patch vendor --json --offline` — assert the deterministic
 //!      tarball lands at `.socket/vendor/npm/<uuid>/…`, the root package.json
-//!      gains `pnpm.overrides`, and pnpm-lock.yaml carries the file:
-//!      resolution (spike P1: importer specifier+version rewritten, packages
-//!      entry rekeyed with the recomputed integrity).
+//!      gains `pnpm.overrides`, a `pnpm-workspace.yaml` is created carrying
+//!      the same `overrides:` (where pnpm >= 11 reads them) plus a root-only
+//!      `packages:` list, and pnpm-lock.yaml carries the file: resolution
+//!      (spike P1: importer specifier+version rewritten, packages entry
+//!      rekeyed with the recomputed integrity).
 //!   4. **Fresh-checkout proof**: copy ONLY the committable files
 //!      (package.json + pnpm-lock.yaml + .socket/) to a new dir, an EMPTY
 //!      `--store-dir`, and run the spike's strictest invocation
@@ -368,6 +370,24 @@ fn run_pnpm_capstone(pm: &str) {
         ),
         "the inherited registry integrity must NOT survive the rewrite:\n{lock_after}"
     );
+
+    // pnpm >= 11 reads `overrides` only from pnpm-workspace.yaml, so vendoring
+    // mirrors the same versioned selector there. When the project had none
+    // (this fixture), it is CREATED with a root-only `packages:` list — pnpm 9
+    // refuses a workspace file whose `packages` field is missing/empty, and
+    // `.` cannot glob a stray subtree into the workspace the way `packages/*`
+    // could. That makes the committable set install on pnpm 9/10/11 alike.
+    let ws_path = proj.join("pnpm-workspace.yaml");
+    let ws_after =
+        std::fs::read_to_string(&ws_path).expect("vendoring must create pnpm-workspace.yaml");
+    assert!(
+        ws_after.contains(&format!("{DEP}@{DEP_VERSION}: file:{tgz_rel}")),
+        "pnpm-workspace.yaml `overrides:` must point at the vendored tarball; got:\n{ws_after}"
+    );
+    assert!(
+        ws_after.contains("packages:") && ws_after.contains("- '.'"),
+        "created pnpm-workspace.yaml must carry a root-only packages list; got:\n{ws_after}"
+    );
     eprintln!("VENDOR OK ({pm})");
 
     // 4. FRESH-CHECKOUT PROOF: committable files only, EMPTY store,
@@ -376,6 +396,7 @@ fn run_pnpm_capstone(pm: &str) {
     std::fs::create_dir_all(&fresh).unwrap();
     std::fs::copy(&pkg_path, fresh.join("package.json")).unwrap();
     std::fs::copy(&lock_path, fresh.join("pnpm-lock.yaml")).unwrap();
+    std::fs::copy(&ws_path, fresh.join("pnpm-workspace.yaml")).unwrap();
     copy_dir_recursive(&proj.join(".socket"), &fresh.join(".socket"));
 
     let fresh_store = tmp.path().join("fresh-pnpm-store");
@@ -410,9 +431,10 @@ fn run_pnpm_capstone(pm: &str) {
     );
     eprintln!("FRESH INSTALL OK ({pm})");
 
-    // 5. Idempotency: a re-run exits 0 and leaves BOTH files byte-stable.
+    // 5. Idempotency: a re-run exits 0 and leaves ALL THREE files byte-stable.
     let lock_wired = std::fs::read(&lock_path).unwrap();
     let pkg_wired = std::fs::read(&pkg_path).unwrap();
+    let ws_wired = std::fs::read(&ws_path).unwrap();
     let (code, stdout, stderr) = run_socket(
         &proj,
         &[
@@ -439,8 +461,14 @@ fn run_pnpm_capstone(pm: &str) {
         pkg_wired,
         "re-vendor must leave package.json byte-identical"
     );
+    assert_eq!(
+        std::fs::read(&ws_path).unwrap(),
+        ws_wired,
+        "re-vendor must leave pnpm-workspace.yaml byte-identical"
+    );
 
-    // 6. REVERT PROOF: package.json AND pnpm-lock.yaml restored byte-for-byte.
+    // 6. REVERT PROOF: package.json AND pnpm-lock.yaml restored byte-for-byte,
+    //    and the pnpm-workspace.yaml vendoring created is deleted.
     let (code, stdout, stderr) = run_socket(
         &proj,
         &[
@@ -472,6 +500,10 @@ fn run_pnpm_capstone(pm: &str) {
     assert!(
         !proj.join(".socket/vendor").exists(),
         ".socket/vendor must be fully removed after revert"
+    );
+    assert!(
+        !ws_path.exists(),
+        "revert must delete the pnpm-workspace.yaml vendoring created"
     );
     eprintln!("REVERT OK ({pm})");
 }
