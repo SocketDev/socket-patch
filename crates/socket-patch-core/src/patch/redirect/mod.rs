@@ -3799,7 +3799,8 @@ mod tests {
             "the rewritten entry is the non-bundled one"
         );
         let out = r.files.get("package-lock.json").expect("lock rewritten");
-        let lock: Value = serde_json::from_str(out).unwrap();
+        let lock: Value =
+            serde_json::from_str(out).expect("the rewritten lock must stay valid JSON");
         let bundled_entry = &lock["packages"]["node_modules/parent/node_modules/left-pad"];
         assert_eq!(
             bundled_entry["integrity"], "sha512-UPSTREAM==",
@@ -3899,7 +3900,8 @@ mod tests {
         assert_eq!(r.edits.len(), 1, "alias entry redirected: {:?}", r.warnings);
         assert_eq!(r.edits[0].key.as_deref(), Some("node_modules/my-alias"));
         let out = r.files.get("package-lock.json").expect("lock rewritten");
-        let lock: Value = serde_json::from_str(out).unwrap();
+        let lock: Value =
+            serde_json::from_str(out).expect("the rewritten lock must stay valid JSON");
         assert_eq!(
             lock["packages"]["node_modules/my-alias"]["resolved"],
             "http://patch.test/lp.tgz"

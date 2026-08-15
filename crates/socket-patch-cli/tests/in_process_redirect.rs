@@ -1327,28 +1327,28 @@ async fn redirect_inbundle_only_dep_is_skipped_not_confirmed() {
     mock_discovery(&server).await;
     mock_reference(&server).await;
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("create the fixture tempdir");
     std::fs::write(
         tmp.path().join("package.json"),
         r#"{ "name": "consumer", "version": "0.0.0", "dependencies": { "parent": "2.0.0" } }"#,
     )
-    .unwrap();
+    .expect("write the consumer package.json");
     // Installed tree: the patched package exists only as parent's bundled
     // nested copy — the crawler still discovers it there.
     let parent = tmp.path().join("node_modules").join("parent");
-    std::fs::create_dir_all(&parent).unwrap();
+    std::fs::create_dir_all(&parent).expect("create node_modules/parent");
     std::fs::write(
         parent.join("package.json"),
         r#"{ "name": "parent", "version": "2.0.0", "bundleDependencies": ["in-proc-redirect"] }"#,
     )
-    .unwrap();
+    .expect("write the bundling parent's package.json");
     let nested = parent.join("node_modules").join(NAME);
-    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::create_dir_all(&nested).expect("create the bundled nested copy's dir");
     std::fs::write(
         nested.join("package.json"),
         format!(r#"{{ "name": "{NAME}", "version": "{VERSION}" }}"#),
     )
-    .unwrap();
+    .expect("write the bundled nested copy's package.json");
     let lock = format!(
         r#"{{
   "name": "consumer",
@@ -1371,7 +1371,8 @@ async fn redirect_inbundle_only_dep_is_skipped_not_confirmed() {
 }}
 "#
     );
-    std::fs::write(tmp.path().join("package-lock.json"), &lock).unwrap();
+    std::fs::write(tmp.path().join("package-lock.json"), &lock)
+        .expect("write the bundled-instance package-lock.json");
 
     let env = run_redirect_subprocess(tmp.path(), &server.uri());
     assert_eq!(
@@ -1383,7 +1384,8 @@ async fn redirect_inbundle_only_dep_is_skipped_not_confirmed() {
         codes.contains(&"redirect_npm_bundled_instance_skipped".to_string()),
         "the stays-UNPATCHED warning must reach the envelope: {env}"
     );
-    let after = std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap();
+    let after = std::fs::read_to_string(tmp.path().join("package-lock.json"))
+        .expect("read back the package-lock.json the run must have left alone");
     assert_eq!(after, lock, "the lockfile must be byte-untouched");
     assert!(
         !after.contains(HOSTED_URL),
