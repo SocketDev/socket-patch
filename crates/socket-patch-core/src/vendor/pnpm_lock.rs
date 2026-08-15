@@ -1,14 +1,25 @@
-//! pnpm vendor backend: paired `package.json` + `pnpm-lock.yaml` surgery.
+//! pnpm vendor backend: `package.json` + `pnpm-workspace.yaml` +
+//! `pnpm-lock.yaml` surgery.
 //!
-//! pnpm resolves overrides from the ROOT package.json (`pnpm.overrides`) and
-//! cross-checks them against the lockfile's own `overrides:` section, so a
-//! lock-only edit is unsound: `--frozen-lockfile` fails with
-//! `ERR_PNPM_LOCKFILE_CONFIG_MISMATCH` and a plain `pnpm install` silently
-//! strips the section and reinstalls the unpatched registry bytes (spike P3,
-//! `spikes/PHASE0-V2-FINDINGS.txt`). Vendoring therefore writes the PAIR: a
-//! versioned `pnpm.overrides` selector (`<name>@<version>` — only that exact
-//! version moves, spike P6) pointing at the vendored tarball, plus the four
-//! lock fragments pnpm itself would emit. The surgery is a faithful port of
+//! pnpm cross-checks the overrides it reads from config against the
+//! lockfile's own `overrides:` section, so a lock-only edit is unsound:
+//! `--frozen-lockfile` fails with `ERR_PNPM_LOCKFILE_CONFIG_MISMATCH` and a
+//! plain `pnpm install` silently strips the section and reinstalls the
+//! unpatched registry bytes (spike P3, `spikes/PHASE0-V2-FINDINGS.txt`).
+//!
+//! WHERE pnpm reads overrides moved between majors: pnpm <= 10 reads
+//! package.json `pnpm.overrides`; pnpm >= 11 no longer reads the package.json
+//! `pnpm` field at all and reads `overrides:` from `pnpm-workspace.yaml`
+//! instead (https://pnpm.io/settings). Vendoring writes the override to BOTH
+//! surfaces (identical `<name>@<version>` → `file:` value) so the committable
+//! artifact installs cleanly on pnpm 9/10/11 without a lockfile/config
+//! mismatch: the versioned selector (`<name>@<version>` — only that exact
+//! version moves, spike P6) points at the vendored tarball. When the project
+//! has no `pnpm-workspace.yaml`, one is created carrying a root-only
+//! `packages:` list (pnpm 9 refuses a workspace file with no `packages`
+//! field) plus the `overrides:` block; `vendor --revert` deletes it again.
+//! The lock still gets the four fragments pnpm itself would emit. The surgery
+//! is a faithful port of
 //! `spikes/pnpm/edit_lock.py`, whose output was verified byte-identical to
 //! pnpm's own lock on BOTH supported majors (9.15.9 / 10.34.1 — they emit
 //! byte-identical `lockfileVersion: '9.0'` locks; fixtures in `spikes/pnpm/`):
@@ -54,6 +65,14 @@ use super::{RevertOutcome, VendorOutcome, VendorWarning};
 
 const PACKAGE_JSON: &str = "package.json";
 const PNPM_LOCK: &str = "pnpm-lock.yaml";
+const PNPM_WORKSPACE: &str = "pnpm-workspace.yaml";
+
+/// The root-only workspace member list written into a freshly created
+/// `pnpm-workspace.yaml`. pnpm 9 refuses a workspace file whose `packages`
+/// field is missing or empty; `.` (the root, already the sole importer) is a
+/// no-op that cannot accidentally glob a stray `packages/` subtree into a
+/// workspace the way `packages/*` would.
+const WS_SCAFFOLD_PACKAGES: [&str; 2] = ["packages:", "  - '.'"];
 
 /// The only lockfileVersion the surgery has byte-exact fixtures for (both
 /// pnpm 9 and 10 emit it).
@@ -61,6 +80,7 @@ const SUPPORTED_LOCK_VERSION: &str = "9.0";
 
 /// Wiring kinds (the `WiringRecord.kind` discriminators this backend owns).
 const KIND_PKG_OVERRIDE: &str = "pnpm_pkg_override";
+const KIND_WS_OVERRIDE: &str = "pnpm_ws_override";
 const KIND_LOCK_OVERRIDES: &str = "pnpm_lock_overrides";
 const KIND_LOCK_IMPORTER_DEP: &str = "pnpm_lock_importer_dep";
 const KIND_LOCK_PACKAGE: &str = "pnpm_lock_package";
@@ -71,7 +91,7 @@ const KIND_LOCK_SNAPSHOT_REF: &str = "pnpm_lock_snapshot_ref";
 /// a poisoned state.json must not be able to point the rewrite at an
 /// arbitrary project file. Records naming anything else are skipped with a
 /// warning (fail-closed).
-const REVERT_ALLOWLIST: [&str; 2] = [PNPM_LOCK, PACKAGE_JSON];
+const REVERT_ALLOWLIST: [&str; 3] = [PNPM_LOCK, PACKAGE_JSON, PNPM_WORKSPACE];
 
 /// Vendor one installed npm package into a pnpm project (see the module doc
 /// for the wiring shape). Same contract as `npm_lock::vendor_npm`:
@@ -156,6 +176,11 @@ pub async fn vendor_pnpm(
         );
     }
     let mut lines = split_lines(&lock_text);
+    // `pnpm-workspace.yaml` is optional (single-package projects have none);
+    // its `overrides:` is where pnpm >= 11 reads them.
+    let ws_text: Option<String> = tokio::fs::read_to_string(project_root.join(PNPM_WORKSPACE))
+        .await
+        .ok();
 
     // ── 3. Pre-flight refusals (override conflicts, entry present) ───────
     // A user-authored exact-version pin equal to `version` is TAKEN OVER
@@ -167,6 +192,11 @@ pub async fn vendor_pnpm(
     };
     let effective_key = disposition.effective_key(&override_key).to_string();
     if let Err(detail) = check_lock_override(&lines, name, version, &effective_key) {
+        return refused("vendor_override_conflict", detail);
+    }
+    if let Err(detail) =
+        check_workspace_override(ws_text.as_deref(), name, version, &effective_key)
+    {
         return refused("vendor_override_conflict", detail);
     }
     if !lock_has_target_package(&lines, name, version) {
@@ -249,7 +279,16 @@ pub async fn vendor_pnpm(
         }
     }
 
-    if !pkg_changed && !lock_changed {
+    // The pnpm >= 11 override surface. Mirrors the package.json override
+    // key-for-key so whichever surface the installed pnpm reads matches the
+    // lock's `overrides:` section.
+    let ws_edit = match apply_workspace_override(ws_text.as_deref(), &effective_key, &spec, &mut wiring)
+    {
+        Ok(edit) => edit,
+        Err(e) => return done_failure(purl, format!("{PNPM_WORKSPACE} surgery failed: {e}")),
+    };
+
+    if !pkg_changed && !lock_changed && ws_edit.new_text.is_none() {
         // Everything already carries this uuid + the packed integrity: the
         // project is in sync. The tarball re-pack above was byte-identical
         // by determinism; synthesize AlreadyPatched and record nothing (the
@@ -261,17 +300,21 @@ pub async fn vendor_pnpm(
         );
     }
 
-    // ── 6. Commit: package.json FIRST, lock second, unwind on failure ────
+    // ── 6. Commit: package.json + pnpm-workspace.yaml FIRST, lock second,
+    //    unwind the override surfaces on a lock failure (P3 desync safety).
     let pkg_indent = detect_indent(&String::from_utf8_lossy(&pkg_bytes));
     let new_pkg_bytes = match serialize_json(&pkg, &pkg_indent) {
         Ok(bytes) => bytes,
         Err(e) => return done_failure(purl, format!("cannot serialize {PACKAGE_JSON}: {e}")),
     };
     let lock_out = lines.join("\n");
-    if let Err(e) = commit_pair(
+    if let Err(e) = commit_surfaces(
         project_root,
         pkg_changed.then_some(new_pkg_bytes.as_slice()),
         &pkg_bytes,
+        ws_edit.new_text.as_deref().map(str::as_bytes),
+        ws_text.as_deref().map(str::as_bytes),
+        ws_edit.created_file,
         lock_changed.then_some(lock_out.as_bytes()),
     )
     .await
@@ -309,6 +352,8 @@ pub async fn vendor_pnpm(
         pnpm: Some(PnpmMeta {
             created_overrides_table,
             created_pnpm_table,
+            created_workspace_file: ws_edit.created_file,
+            created_workspace_overrides: ws_edit.created_overrides,
         }),
         poetry: None,
         pdm: None,
@@ -520,10 +565,156 @@ pub async fn revert_pnpm(entry: &VendorEntry, project_root: &Path, dry_run: bool
         }
     }
 
+    // pnpm-workspace.yaml override surface (pnpm >= 11): delete a file we
+    // created, or splice our override back out of one we edited.
+    if let Some(rec) = entry
+        .wiring
+        .iter()
+        .find(|r| r.file == PNPM_WORKSPACE && r.kind == KIND_WS_OVERRIDE)
+    {
+        let (created_file, created_overrides) = match &entry.pnpm {
+            Some(meta) => (meta.created_workspace_file, meta.created_workspace_overrides),
+            None => (false, false),
+        };
+        if let Err(e) = revert_workspace(
+            project_root,
+            rec,
+            created_file,
+            created_overrides,
+            &entry.uuid,
+            &mut outcome.warnings,
+        )
+        .await
+        {
+            return RevertOutcome::failed(e);
+        }
+    }
+
     if let Err(e) = remove_tree(&project_root.join(&uuid_dir_rel)).await {
         return RevertOutcome::failed(format!("cannot remove {uuid_dir_rel}: {e}"));
     }
     outcome
+}
+
+/// Undo the pnpm-workspace.yaml override: delete a file we created (when it
+/// still holds only the vendoring scaffold), or splice our override key back
+/// out of a file we edited (restoring the taken-over value, and dropping an
+/// `overrides:` section we created once it empties). Drift ⇒ warning, left
+/// alone. `Err` is a genuine write failure.
+async fn revert_workspace(
+    project_root: &Path,
+    rec: &WiringRecord,
+    created_file: bool,
+    created_overrides: bool,
+    entry_uuid: &str,
+    warnings: &mut Vec<VendorWarning>,
+) -> Result<(), String> {
+    let path = project_root.join(PNPM_WORKSPACE);
+    let text = match tokio::fs::read_to_string(&path).await {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            warnings.push(drifted(format!(
+                "{PNPM_WORKSPACE} is missing; the pnpm >= 11 override cannot be removed"
+            )));
+            return Ok(());
+        }
+        Err(e) => return Err(format!("cannot read {PNPM_WORKSPACE}: {e}")),
+    };
+
+    // Fast path: a file we created that is still byte-identical to the
+    // scaffold we wrote → delete it (byte-restore to "no file").
+    if created_file {
+        let scaffold = match (rec.key.as_deref(), rec.new.as_ref().and_then(Value::as_str)) {
+            (Some(key), Some(spec)) => Some(ws_scaffold_text(key, spec)),
+            _ => None,
+        };
+        if scaffold.as_deref() == Some(text.as_str()) {
+            return tokio::fs::remove_file(&path)
+                .await
+                .map_err(|e| format!("cannot remove {PNPM_WORKSPACE}: {e}"));
+        }
+        // Drifted since vendoring: keep the user's file, remove only our key.
+    }
+
+    let mut lines = split_lines(&text);
+    let mut dirty = false;
+    revert_ws_record(&mut lines, rec, entry_uuid, &mut dirty, warnings);
+    if dirty && created_overrides {
+        remove_empty_ws_overrides_section(&mut lines);
+    }
+    if dirty {
+        atomic_write_bytes_preserving_mode(&path, lines.join("\n").as_bytes())
+            .await
+            .map_err(|e| format!("cannot write {PNPM_WORKSPACE}: {e}"))?;
+    }
+    Ok(())
+}
+
+/// Remove our override key from the pnpm-workspace.yaml `overrides:` section
+/// (or restore a taken-over value in place). Fail-closed on drift.
+fn revert_ws_record(
+    lines: &mut Vec<String>,
+    rec: &WiringRecord,
+    entry_uuid: &str,
+    dirty: &mut bool,
+    warnings: &mut Vec<VendorWarning>,
+) {
+    let Some(key) = rec.key.as_deref() else {
+        warnings.push(drifted(format!(
+            "wiring record in {PNPM_WORKSPACE} has no key; left alone"
+        )));
+        return;
+    };
+    let Some((start, end, indent)) = ws_overrides_section(lines) else {
+        warnings.push(drifted(format!(
+            "{PNPM_WORKSPACE} overrides section is gone; `{key}` not removed"
+        )));
+        return;
+    };
+    for i in (start + 1)..end {
+        let Some((k, repr, rest)) = parse_key_line(&lines[i], indent) else {
+            continue;
+        };
+        if k != key {
+            continue;
+        }
+        let ours = Some(rest.as_str()) == rec.new.as_ref().and_then(Value::as_str)
+            || parse_vendor_path(&rest).is_some_and(|p| p.eco == "npm" && p.uuid == entry_uuid);
+        if !ours {
+            warnings.push(drifted(format!(
+                "{PNPM_WORKSPACE} override `{key}` was changed since vendoring ({rest}); left alone"
+            )));
+            return;
+        }
+        match rec.original.as_ref().and_then(Value::as_str) {
+            Some(orig) => {
+                lines[i] = format!("{}{}: {orig}", " ".repeat(indent), yaml_key_like(key, &repr));
+            }
+            None => {
+                lines.remove(i);
+            }
+        }
+        *dirty = true;
+        return;
+    }
+    warnings.push(drifted(format!(
+        "{PNPM_WORKSPACE} override `{key}` no longer exists; nothing to remove"
+    )));
+}
+
+/// Drop an `overrides:` section header we created once its last entry is
+/// gone (the append added no blank separator, so removing the header alone
+/// restores the file's original trailing bytes).
+fn remove_empty_ws_overrides_section(lines: &mut Vec<String>) {
+    let Some((start, end, indent)) = ws_overrides_section(lines) else {
+        return;
+    };
+    let still_has_entry = lines[start + 1..end]
+        .iter()
+        .any(|l| parse_key_line(l, indent).is_some());
+    if !still_has_entry {
+        lines.remove(start);
+    }
 }
 
 // ───────────────────────────── edit context ──────────────────────────────
@@ -987,6 +1178,198 @@ fn apply_pkg_override(
         new: Some(Value::String(spec.to_string())),
     });
     Ok((true, created_pnpm_table, created_overrides_table))
+}
+
+// ─────────────────────── pnpm-workspace.yaml override ─────────────────────
+// pnpm >= 11 reads `overrides:` only from pnpm-workspace.yaml, so the same
+// `<name>@<version>` → `file:` mapping is mirrored here. Edits are line
+// splices (never a YAML library) so untouched lines stay byte-identical and
+// revert restores the file byte-for-byte (or deletes a file we created).
+
+/// The bytes of a freshly created pnpm-workspace.yaml: a root-only
+/// `packages:` list (pnpm 9 refuses a workspace file with no `packages`
+/// field) plus the single `overrides:` entry. Kept in one place so the
+/// create edit and the revert equality-check cannot drift apart.
+fn ws_scaffold_text(key: &str, spec: &str) -> String {
+    format!(
+        "{}\n{}\noverrides:\n  {}: {spec}\n",
+        WS_SCAFFOLD_PACKAGES[0],
+        WS_SCAFFOLD_PACKAGES[1],
+        yaml_key(key),
+    )
+}
+
+/// The outcome of applying the override to pnpm-workspace.yaml.
+struct WorkspaceEdit {
+    /// New file content to write (`None` ⇒ already in sync, nothing to do).
+    new_text: Option<String>,
+    /// We created pnpm-workspace.yaml from scratch (revert deletes it).
+    created_file: bool,
+    /// We created the `overrides:` section in a pre-existing file (revert
+    /// removes just that section once emptied).
+    created_overrides: bool,
+}
+
+/// Locate the top-level `overrides:` block and the indent its entries use
+/// (pnpm's canonical is 2 spaces; a hand-authored file may differ). `None`
+/// when there is no block-style `overrides:` section.
+fn ws_overrides_section(lines: &[String]) -> Option<(usize, usize, usize)> {
+    let (start, end) = section_bounds(lines, "overrides")?;
+    let indent = lines[start + 1..end]
+        .iter()
+        .find(|l| !l.trim().is_empty())
+        .map(|l| indent_of(l))
+        .filter(|&n| n >= 1)
+        .unwrap_or(2);
+    Some((start, end, indent))
+}
+
+/// Pre-flight mirror check for pnpm-workspace.yaml (analogous to
+/// [`check_lock_override`]): a block-style `overrides:` section may only
+/// carry a same-name key equal to `effective_key` with an ownable value.
+/// A flow-style/inline `overrides:` mapping is refused (the line surgery
+/// cannot splice into it). A missing file/section is fine.
+fn check_workspace_override(
+    ws_text: Option<&str>,
+    name: &str,
+    version: &str,
+    effective_key: &str,
+) -> Result<(), String> {
+    let Some(text) = ws_text else {
+        return Ok(());
+    };
+    let lines = split_lines(text);
+    if lines
+        .iter()
+        .any(|l| l.starts_with("overrides:") && l.trim_end() != "overrides:")
+    {
+        return Err(format!(
+            "{PNPM_WORKSPACE} has an inline `overrides:` mapping the pair surgery cannot \
+             edit — rewrite it as a block mapping (`overrides:` then indented entries) \
+             and re-run"
+        ));
+    }
+    let Some((start, end, indent)) = ws_overrides_section(&lines) else {
+        return Ok(());
+    };
+    for line in &lines[start + 1..end] {
+        let Some((key, _repr, rest)) = parse_key_line(line, indent) else {
+            continue;
+        };
+        if override_key_name(&key) != name {
+            continue;
+        }
+        // A sibling version's vendored override coexists — skip it.
+        if is_vendor_value(&rest) && !vendor_value_is_for(&rest, name, version) {
+            continue;
+        }
+        if key != effective_key {
+            return Err(format!(
+                "{PNPM_WORKSPACE} carries an override key `{key}` for `{name}` that does not \
+                 match `{effective_key}` — remove it (or vendor --revert) first"
+            ));
+        }
+        if !(is_vendor_value(&rest) || rest == version) {
+            return Err(format!(
+                "{PNPM_WORKSPACE} already carries an override for `{key}` ({rest}); vendoring \
+                 would fight it — remove the override (or vendor --revert) first"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Add/refresh the `effective_key` → `file:<rel-tgz>` override in
+/// pnpm-workspace.yaml (creating the file, or the section, when absent).
+fn apply_workspace_override(
+    ws_text: Option<&str>,
+    our_key: &str,
+    spec: &str,
+    wiring: &mut Vec<WiringRecord>,
+) -> Result<WorkspaceEdit, String> {
+    let Some(text) = ws_text else {
+        // No workspace file: write the root-only scaffold + our override.
+        wiring.push(ws_record(our_key, spec, WiringAction::Added, None));
+        return Ok(WorkspaceEdit {
+            new_text: Some(ws_scaffold_text(our_key, spec)),
+            created_file: true,
+            created_overrides: false,
+        });
+    };
+    let mut lines = split_lines(text);
+
+    if let Some((start, end, indent)) = ws_overrides_section(&lines) {
+        let pad = " ".repeat(indent);
+        // Immutable scan: our line (if present) + the append anchor.
+        let mut ours = None;
+        let mut last_entry = start;
+        for (i, line) in lines.iter().enumerate().take(end).skip(start + 1) {
+            if let Some((key, repr, rest)) = parse_key_line(line, indent) {
+                last_entry = i;
+                if key == our_key {
+                    ours = Some((i, repr, rest));
+                    break;
+                }
+            }
+        }
+        if let Some((i, repr, rest)) = ours {
+            if rest == spec {
+                return Ok(WorkspaceEdit {
+                    new_text: None,
+                    created_file: false,
+                    created_overrides: false,
+                });
+            }
+            // Ours (stale uuid, no original) or the user's exact-version pin
+            // being TAKEN OVER (recorded, live quoting preserved).
+            let original = (!is_vendor_value(&rest)).then(|| rest.clone());
+            lines[i] = format!("{pad}{}: {spec}", yaml_key_like(our_key, &repr));
+            wiring.push(ws_record(our_key, spec, WiringAction::Rewritten, original));
+        } else {
+            lines.insert(last_entry + 1, format!("{pad}{}: {spec}", yaml_key(our_key)));
+            wiring.push(ws_record(our_key, spec, WiringAction::Added, None));
+        }
+        return Ok(WorkspaceEdit {
+            new_text: Some(lines.join("\n")),
+            created_file: false,
+            created_overrides: false,
+        });
+    }
+
+    // File exists without an `overrides:` section: append one after the last
+    // non-empty line (no blank separator, so revert removes exactly two
+    // lines and the file's trailing bytes stay put).
+    let anchor = lines
+        .iter()
+        .rposition(|l| !l.trim().is_empty())
+        .map(|i| i + 1)
+        .unwrap_or(lines.len());
+    lines.splice(
+        anchor..anchor,
+        ["overrides:".to_string(), format!("  {}: {spec}", yaml_key(our_key))],
+    );
+    wiring.push(ws_record(our_key, spec, WiringAction::Added, None));
+    Ok(WorkspaceEdit {
+        new_text: Some(lines.join("\n")),
+        created_file: false,
+        created_overrides: true,
+    })
+}
+
+fn ws_record(
+    key: &str,
+    spec: &str,
+    action: WiringAction,
+    original: Option<String>,
+) -> WiringRecord {
+    WiringRecord {
+        file: PNPM_WORKSPACE.to_string(),
+        kind: KIND_WS_OVERRIDE.to_string(),
+        action,
+        key: Some(key.to_string()),
+        original: original.map(Value::String),
+        new: Some(Value::String(spec.to_string())),
+    }
 }
 
 // ───────────────────────────── lock edits ─────────────────────────────────
@@ -1732,15 +2115,19 @@ fn drifted(detail: impl Into<String>) -> VendorWarning {
     VendorWarning::new("vendor_lock_entry_drifted", detail.into())
 }
 
-// ─────────────────────────── pair commit + unwind ─────────────────────────
+// ────────────────────────── surfaces commit + unwind ──────────────────────
 
-/// Write the pair: package.json FIRST, lock second; a lock failure restores
-/// the original package.json bytes so the P3 desync (override without lock
-/// entry or vice versa) is never left on disk.
-async fn commit_pair(
+/// Write the override surfaces FIRST (package.json, then pnpm-workspace.yaml),
+/// the lock LAST; a lock failure unwinds both override surfaces so the P3
+/// desync (an override with no matching lock entry, which pnpm silently
+/// unpatches or rejects as a config mismatch) is never left on disk.
+async fn commit_surfaces(
     project_root: &Path,
     new_pkg: Option<&[u8]>,
     original_pkg: &[u8],
+    new_ws: Option<&[u8]>,
+    original_ws: Option<&[u8]>,
+    ws_created: bool,
     new_lock: Option<&[u8]>,
 ) -> Result<(), String> {
     if let Some(bytes) = new_pkg {
@@ -1748,26 +2135,63 @@ async fn commit_pair(
             .await
             .map_err(|e| format!("cannot write {PACKAGE_JSON}: {e}"))?;
     }
+    if let Some(bytes) = new_ws {
+        if let Err(e) =
+            atomic_write_bytes_preserving_mode(&project_root.join(PNPM_WORKSPACE), bytes).await
+        {
+            unwind_override_surfaces(project_root, new_pkg, original_pkg, false, None, false).await;
+            return Err(format!(
+                "cannot write {PNPM_WORKSPACE}: {e} ({PACKAGE_JSON} restored to its original bytes)"
+            ));
+        }
+    }
     if let Some(bytes) = new_lock {
         if let Err(e) =
             atomic_write_bytes_preserving_mode(&project_root.join(PNPM_LOCK), bytes).await
         {
-            if new_pkg.is_some() {
-                // Unwind (best effort): a failure here leaves the desync pair
-                // anyway, but the lock write failing usually means the
-                // restore fails identically loudly.
-                let _ = atomic_write_bytes_preserving_mode(
-                    &project_root.join(PACKAGE_JSON),
-                    original_pkg,
-                )
-                .await;
-            }
+            // Best effort: a lock write failing usually means the restores
+            // fail identically loudly, but we still try so the override
+            // surfaces do not outlive the lock they depend on.
+            unwind_override_surfaces(
+                project_root,
+                new_pkg,
+                original_pkg,
+                new_ws.is_some(),
+                original_ws,
+                ws_created,
+            )
+            .await;
             return Err(format!(
-                "cannot write {PNPM_LOCK}: {e} ({PACKAGE_JSON} restored to its original bytes)"
+                "cannot write {PNPM_LOCK}: {e} (override surfaces restored to their original state)"
             ));
         }
     }
     Ok(())
+}
+
+/// Best-effort restore of the already-written override surfaces after a
+/// downstream write failure: package.json back to its original bytes; a
+/// created pnpm-workspace.yaml deleted, an edited one rewritten.
+async fn unwind_override_surfaces(
+    project_root: &Path,
+    new_pkg: Option<&[u8]>,
+    original_pkg: &[u8],
+    ws_written: bool,
+    original_ws: Option<&[u8]>,
+    ws_created: bool,
+) {
+    if new_pkg.is_some() {
+        let _ = atomic_write_bytes_preserving_mode(&project_root.join(PACKAGE_JSON), original_pkg)
+            .await;
+    }
+    if ws_written {
+        let ws_path = project_root.join(PNPM_WORKSPACE);
+        if ws_created {
+            let _ = tokio::fs::remove_file(&ws_path).await;
+        } else if let Some(orig) = original_ws {
+            let _ = atomic_write_bytes_preserving_mode(&ws_path, orig).await;
+        }
+    }
 }
 
 // ─────────────────────── yaml-ish line-block helpers ──────────────────────
@@ -2304,7 +2728,9 @@ snapshots:
             entry.pnpm,
             Some(PnpmMeta {
                 created_overrides_table: true,
-                created_pnpm_table: true
+                created_pnpm_table: true,
+                created_workspace_file: true,
+                ..Default::default()
             })
         );
         assert_eq!(entry.artifact.path, fx.rel_tgz());
@@ -2318,6 +2744,7 @@ snapshots:
                 KIND_LOCK_PACKAGE,
                 KIND_LOCK_SNAPSHOT,
                 KIND_LOCK_SNAPSHOT_REF,
+                KIND_WS_OVERRIDE,
             ],
             "{:?}",
             entry.wiring
@@ -2417,8 +2844,8 @@ snapshots:
         assert_eq!(
             entry.pnpm,
             Some(PnpmMeta {
-                created_overrides_table: false,
-                created_pnpm_table: false
+                created_workspace_file: true,
+                ..Default::default()
             })
         );
         // Our entry extends the existing overrides section, theirs intact.
@@ -2526,8 +2953,8 @@ snapshots:
         assert_eq!(
             entry.pnpm,
             Some(PnpmMeta {
-                created_overrides_table: false,
-                created_pnpm_table: false
+                created_workspace_file: true,
+                ..Default::default()
             })
         );
 
@@ -2681,7 +3108,8 @@ snapshots:
             entry.pnpm,
             Some(PnpmMeta {
                 created_overrides_table: true,
-                created_pnpm_table: false
+                created_workspace_file: true,
+                ..Default::default()
             })
         );
 
@@ -2706,20 +3134,24 @@ snapshots:
     }
 
     #[tokio::test]
-    async fn commit_pair_unwinds_package_json_on_lock_write_failure() {
+    async fn commit_surfaces_unwinds_override_surfaces_on_lock_write_failure() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         tokio::fs::write(root.join(PACKAGE_JSON), P1_BEFORE_PKG)
             .await
             .unwrap();
         // A directory where the lock should be makes the atomic rename fail
-        // AFTER package.json was already written.
+        // AFTER package.json and a freshly created pnpm-workspace.yaml were
+        // written.
         tokio::fs::create_dir(root.join(PNPM_LOCK)).await.unwrap();
 
-        let err = commit_pair(
+        let err = commit_surfaces(
             root,
             Some(P1_AFTER_PKG.as_bytes()),
             P1_BEFORE_PKG.as_bytes(),
+            Some(b"overrides:\n  x: y\n"),
+            None,
+            true, // ws created from scratch → unwind deletes it
             Some(b"lock bytes"),
         )
         .await
@@ -2731,6 +3163,10 @@ snapshots:
                 .unwrap(),
             P1_BEFORE_PKG,
             "package.json restored byte-for-byte after the lock failure"
+        );
+        assert!(
+            !root.join(PNPM_WORKSPACE).exists(),
+            "the created pnpm-workspace.yaml is deleted on unwind"
         );
     }
 
@@ -3648,5 +4084,197 @@ snapshots:
         assert_eq!(yaml_key("left-pad@1.3.0"), "left-pad@1.3.0");
         assert_eq!(yaml_key_like("k", "'orig'"), "'k'");
         assert_eq!(yaml_key_like("k", "orig"), "k");
+    }
+
+    // ── pnpm-workspace.yaml override surface (pnpm >= 11) ─────────────────
+
+    async fn write_ws(fx: &Fixture, body: &str) {
+        tokio::fs::write(fx.root().join(PNPM_WORKSPACE), body)
+            .await
+            .unwrap();
+    }
+    async fn ws_exists(fx: &Fixture) -> bool {
+        fx.root().join(PNPM_WORKSPACE).exists()
+    }
+
+    /// No workspace file: vendor creates the root-only scaffold + our
+    /// override; the lock's `overrides:` value equals it (map parity that
+    /// pnpm >= 11 hard-checks); revert deletes the file again.
+    #[tokio::test]
+    async fn workspace_file_is_created_with_root_scaffold_and_revert_deletes_it() {
+        let fx = fixture_with(P1_BEFORE_PKG, P1_BEFORE_LOCK).await;
+        assert!(!ws_exists(&fx).await, "fixture starts with no workspace file");
+
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+        let spec = format!("file:{}", fx.rel_tgz());
+        assert_eq!(
+            fx.read(PNPM_WORKSPACE).await,
+            ws_scaffold_text("left-pad@1.3.0", &spec),
+            "created workspace carries `packages: ['.']` + the override"
+        );
+        // The three surfaces agree on the same key → value (no config mismatch).
+        assert!(fx.read(PNPM_WORKSPACE).await.contains(&format!(
+            "overrides:\n  left-pad@1.3.0: {spec}"
+        )));
+        assert!(fx
+            .read(PNPM_LOCK)
+            .await
+            .contains(&format!("overrides:\n  left-pad@1.3.0: {spec}")));
+        assert!(entry.pnpm.as_ref().unwrap().created_workspace_file);
+        assert!(!entry.pnpm.as_ref().unwrap().created_workspace_overrides);
+
+        let outcome = revert_pnpm(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(
+            !ws_exists(&fx).await,
+            "revert deletes the workspace file it created"
+        );
+    }
+
+    /// Existing workspace file WITHOUT an `overrides:` section: vendor
+    /// appends one, leaving the `packages:` list untouched; revert restores
+    /// the file byte-for-byte.
+    #[tokio::test]
+    async fn workspace_overrides_section_is_appended_and_revert_restores_bytes() {
+        let fx = fixture_with(P1_BEFORE_PKG, P1_BEFORE_LOCK).await;
+        let original = "packages:\n  - 'packages/*'\n";
+        write_ws(&fx, original).await;
+
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+        let spec = format!("file:{}", fx.rel_tgz());
+        assert_eq!(
+            fx.read(PNPM_WORKSPACE).await,
+            format!("{original}overrides:\n  left-pad@1.3.0: {spec}\n"),
+            "override block appended after the existing packages list"
+        );
+        assert!(!entry.pnpm.as_ref().unwrap().created_workspace_file);
+        assert!(entry.pnpm.as_ref().unwrap().created_workspace_overrides);
+
+        let outcome = revert_pnpm(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert_eq!(
+            fx.read(PNPM_WORKSPACE).await,
+            original,
+            "revert removes the appended section byte-for-byte"
+        );
+    }
+
+    /// Existing workspace file WITH an `overrides:` section: vendor inserts
+    /// our key beside the user's, leaving theirs intact; revert removes only
+    /// our key.
+    #[tokio::test]
+    async fn workspace_override_inserted_beside_existing_and_revert_removes_only_ours() {
+        let fx = fixture_with(P1_BEFORE_PKG, P1_BEFORE_LOCK).await;
+        let original = "packages:\n  - 'packages/*'\noverrides:\n  other-pkg: 2.0.0\n";
+        write_ws(&fx, original).await;
+
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+        let spec = format!("file:{}", fx.rel_tgz());
+        assert_eq!(
+            fx.read(PNPM_WORKSPACE).await,
+            format!("packages:\n  - 'packages/*'\noverrides:\n  other-pkg: 2.0.0\n  left-pad@1.3.0: {spec}\n"),
+        );
+        assert!(!entry.pnpm.as_ref().unwrap().created_workspace_file);
+        assert!(!entry.pnpm.as_ref().unwrap().created_workspace_overrides);
+
+        let outcome = revert_pnpm(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert_eq!(
+            fx.read(PNPM_WORKSPACE).await,
+            original,
+            "revert leaves the user's override intact and drops only ours"
+        );
+    }
+
+    /// A flow-style/inline `overrides:` mapping the line surgery cannot
+    /// splice into is refused before any write.
+    #[tokio::test]
+    async fn inline_workspace_overrides_mapping_is_refused() {
+        let fx = fixture_with(P1_BEFORE_PKG, P1_BEFORE_LOCK).await;
+        write_ws(&fx, "overrides: {other-pkg: 2.0.0}\n").await;
+        let detail = expect_refused(fx.vendor(false).await, "vendor_override_conflict");
+        assert!(detail.contains("inline"), "{detail}");
+    }
+
+    /// A conflicting same-name override already in the workspace file is a
+    /// fail-closed refusal.
+    #[tokio::test]
+    async fn workspace_conflicting_same_name_override_is_refused() {
+        let fx = fixture_with(P1_BEFORE_PKG, P1_BEFORE_LOCK).await;
+        write_ws(&fx, "overrides:\n  left-pad: 1.4.0\n").await;
+        expect_refused(fx.vendor(false).await, "vendor_override_conflict");
+    }
+
+    /// The pnpm >= 11 UPGRADE path: a project vendored by the pre-workspace
+    /// code (package.json + pnpm-lock.yaml already overridden, NO
+    /// pnpm-workspace.yaml) is re-vendored under the current code, which adds
+    /// only the workspace mirror. The re-vendor's fresh entry names ONLY the
+    /// workspace surface, so replacing the ledger entry wholesale would lose
+    /// the package.json + lock originals the first vendoring recorded and
+    /// `--revert` could restore only the workspace file. `carry_forward_wiring`
+    /// (which `persist_vendor_entry` runs on every re-vendor) reconciles the
+    /// two so revert byte-restores ALL THREE surfaces.
+    #[tokio::test]
+    async fn revendor_upgrade_adds_workspace_and_revert_restores_all_three_surfaces() {
+        let fx = fixture_with(P1_BEFORE_PKG, P1_BEFORE_LOCK).await;
+
+        // 1. First vendoring, then downgrade the recorded state to what the
+        //    pre-workspace code would have left: no pnpm-workspace.yaml, and a
+        //    ledger entry carrying only the package.json + lock wiring.
+        let (_, prev, _) = expect_done(fx.vendor(false).await);
+        let mut prev = prev.unwrap();
+        tokio::fs::remove_file(fx.root().join(PNPM_WORKSPACE))
+            .await
+            .unwrap();
+        prev.wiring.retain(|r| r.file != PNPM_WORKSPACE);
+        if let Some(meta) = prev.pnpm.as_mut() {
+            meta.created_workspace_file = false;
+            meta.created_workspace_overrides = false;
+        }
+        // Pre-workspace code created the pnpm/overrides tables (the fixture's
+        // package.json had no `pnpm` field), and left both surfaces wired.
+        let pnpm_meta = prev.pnpm.clone().unwrap();
+        assert!(pnpm_meta.created_pnpm_table && pnpm_meta.created_overrides_table);
+        assert!(prev.wiring.iter().any(|r| r.file == PACKAGE_JSON));
+        assert!(prev.wiring.iter().any(|r| r.file == PNPM_LOCK));
+        assert!(!ws_exists(&fx).await, "downgraded state has no workspace file");
+
+        // 2. Re-vendor under the current code: package.json + lock are already
+        //    in sync, so ONLY the workspace mirror is written and the fresh
+        //    entry names ONLY that surface (the bug's precondition).
+        let (_, revendored, _) = expect_done(fx.vendor(false).await);
+        let mut merged = revendored.unwrap();
+        assert!(ws_exists(&fx).await, "re-vendor added the workspace file");
+        assert!(
+            merged.wiring.iter().all(|r| r.file == PNPM_WORKSPACE),
+            "the fresh re-vendor entry names only the workspace surface: {:?}",
+            merged.wiring
+        );
+
+        // 3. Reconcile with the entry being replaced (as persist_vendor_entry
+        //    does), then revert.
+        super::super::state::carry_forward_wiring(&prev, &mut merged);
+        let outcome = revert_pnpm(&merged, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+
+        // All three surfaces byte-restored to their pre-vendor originals.
+        assert_eq!(
+            fx.read(PACKAGE_JSON).await,
+            P1_BEFORE_PKG,
+            "package.json byte-restored"
+        );
+        assert_eq!(fx.read(PNPM_LOCK).await, P1_BEFORE_LOCK, "lock byte-restored");
+        assert!(
+            !ws_exists(&fx).await,
+            "the workspace file the re-vendor created is deleted"
+        );
+        assert!(!fx
+            .root()
+            .join(format!(".socket/vendor/npm/{UUID}"))
+            .exists());
     }
 }

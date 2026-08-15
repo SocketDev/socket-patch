@@ -189,8 +189,9 @@ pub(crate) async fn atomic_write_bytes(path: &Path, content: &[u8]) -> std::io::
 /// this variant for files the *user* owns and we merely edit (package.json,
 /// Gemfile, …), matching npm's write-file-atomic. The patch engine keeps the
 /// plain writer: `restore_file_permissions` re-applies pre-patch mode + uid/gid
-/// itself after the rename.
-pub(crate) async fn atomic_write_bytes_preserving_mode(
+/// itself after the rename. `pub` (not `pub(crate)`): the CLI's hosted
+/// redirect writes user-owned lockfiles through it too.
+pub async fn atomic_write_bytes_preserving_mode(
     path: &Path,
     content: &[u8],
 ) -> std::io::Result<()> {

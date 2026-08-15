@@ -67,7 +67,13 @@ fn parse_purl_simple(purl: &str) -> Option<(String, String, String)> {
     let (typ, after) = rest.split_once('/')?;
     let (coord, version) = after.rsplit_once('@')?;
     let name = socket_patch_core::utils::purl::percent_decode_purl_component(coord).into_owned();
-    Some((typ.to_string(), name, version.to_string()))
+    // The API serves canonical percent-encoded purls, so the version needs
+    // decoding just like the coordinate — npm build metadata arrives as
+    // `1.2.3%2Bbuild` while lockfiles store `1.2.3+build`; an undecoded
+    // version would silently match no lock entry.
+    let version =
+        socket_patch_core::utils::purl::percent_decode_purl_component(version).into_owned();
+    Some((typ.to_string(), name, version))
 }
 
 /// The hosted-mode JSON error envelope, for bail-outs that return before the
@@ -556,7 +562,8 @@ pub(super) async fn run_redirect(
         // re-run produces no new edits (the lockfile already points at the
         // hosted patch), and clobbering the file would lose the original
         // pre-redirect values a future revert needs. New edits APPEND (revert
-        // walks them in reverse); records are keyed by PURL, newest wins.
+        // walks them in reverse), skipping byte-identical re-plans from a
+        // retried partial failure; records are keyed by PURL, newest wins.
         //
         // Persisted BEFORE the project files, and atomically (stage + fsync +
         // rename, like the sibling vendor ledger): a crash between the two
@@ -573,12 +580,15 @@ pub(super) async fn run_redirect(
             ledger.mode = "hosted".to_string();
             // The bun.lockb→bun.lock migration removal precedes the rewrite
             // edits so `--revert` unwinds it last (after restoring bun.lock).
-            ledger.edits.extend(migration_edits.iter().cloned());
-            ledger.edits.extend(rewrite.edits.iter().cloned());
+            for edit in migration_edits.iter().chain(rewrite.edits.iter()) {
+                if !ledger.edits.contains(edit) {
+                    ledger.edits.push(edit.clone());
+                }
+            }
             ledger.records.extend(records.clone());
             // The ledger is the only revert path and the VEX record store —
-            // a swallowed write failure would leave the rewritten lockfiles
-            // unrevertable while reporting success.
+            // a swallowed write failure would let the lockfile writes below
+            // proceed with no revert data persisted while reporting success.
             if let Err(e) =
                 socket_patch_core::patch::redirect::save_redirect_state(&args.common.cwd, &ledger)
                     .await
@@ -596,7 +606,15 @@ pub(super) async fn run_redirect(
             if let Some(parent) = path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
-            if let Err(e) = std::fs::write(&path, content) {
+            // Atomic stage+rename, mode-preserving (the vendored backend's
+            // writer): a bare `fs::write` truncates first, so a crash
+            // mid-write could leave a torn lockfile behind.
+            if let Err(e) = socket_patch_core::utils::fs::atomic_write_bytes_preserving_mode(
+                &path,
+                content.as_bytes(),
+            )
+            .await
+            {
                 let message = format!("failed to write {rel}: {e}");
                 eprintln!("{message}");
                 if args.common.json {
@@ -611,7 +629,7 @@ pub(super) async fn run_redirect(
     // may still claim package(s) this project also has a hosted redirect ledger
     // for — their tarballs would then be orphaned and that ledger stale. But the
     // overlap alone does NOT prove hosted won: only warn for the package(s) the
-    // LIVE lockfile actually routes to `patch.socket.dev` (see
+    // LIVE lockfile actually routes to the hosted patch server (see
     // `classify_overlap_takeover`), so a dry-run / no-op over a lock that still
     // points at the vendored files stays silent instead of pointing cleanup at
     // the live vendored ledger. Warn (JSON `warnings[]` and stderr) WITHOUT
@@ -625,6 +643,19 @@ pub(super) async fn run_redirect(
         takeover_warnings.push(serde_json::json!({
             "code": super::REDIRECT_SUPERSEDES_VENDORED,
             "detail": super::mode_takeover_detail(&superseded, /*current_is_hosted=*/ true),
+        }));
+    }
+
+    // `--prune` is a no-op in hosted mode (both hosted terminals return
+    // before the GC blocks): make that explicit in the JSON `warnings[]`
+    // rather than silently dropping the flag — a bot migrating from
+    // `--mode agent --prune` must see WHY it stopped pruning. The human
+    // path warns once up front in `run` (before this flow is entered).
+    let mut prune_warnings: Vec<serde_json::Value> = Vec::new();
+    if args.prune || args.sync {
+        prune_warnings.push(serde_json::json!({
+            "code": super::REDIRECT_PRUNE_IGNORED,
+            "detail": super::REDIRECT_PRUNE_IGNORED_DETAIL,
         }));
     }
 
@@ -670,6 +701,7 @@ pub(super) async fn run_redirect(
         warnings.extend(rush_warnings.iter().cloned());
         warnings.extend(pnpm_warnings.iter().cloned());
         warnings.extend(takeover_warnings.iter().cloned());
+        warnings.extend(prune_warnings.iter().cloned());
         // Nest the redirect result under `redirect` inside the classic scan
         // object (built by `run`, threaded in via `scan_result`), mirroring
         // vendored mode's nested `vendor` block. This keeps the hosted `--json`
@@ -767,8 +799,41 @@ pub(super) async fn run_redirect(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_redirect_json_envelope, REDIRECT_CANDIDATE_FILES};
+    use super::{build_redirect_json_envelope, parse_purl_simple, REDIRECT_CANDIDATE_FILES};
     use socket_patch_core::constants::npm_family;
+
+    #[test]
+    fn parse_purl_simple_percent_decodes_name_and_version() {
+        // The API serves canonical percent-encoded purls: npm build metadata
+        // `1.2.3+build` arrives as `1.2.3%2Bbuild`. Lock entries store the
+        // decoded form, so an undecoded version silently matches nothing.
+        assert_eq!(
+            parse_purl_simple("pkg:npm/foo@1.2.3%2Bbuild"),
+            Some((
+                "npm".to_string(),
+                "foo".to_string(),
+                "1.2.3+build".to_string()
+            ))
+        );
+        // The coordinate keeps decoding too (scoped npm name).
+        assert_eq!(
+            parse_purl_simple("pkg:npm/%40scope/name@1.0.0"),
+            Some((
+                "npm".to_string(),
+                "@scope/name".to_string(),
+                "1.0.0".to_string()
+            ))
+        );
+        // Plain versions pass through unchanged.
+        assert_eq!(
+            parse_purl_simple("pkg:npm/left-pad@1.3.0"),
+            Some((
+                "npm".to_string(),
+                "left-pad".to_string(),
+                "1.3.0".to_string()
+            ))
+        );
+    }
 
     /// The classic scan object `run` builds for the `--json` path with ≥1
     /// discovered package (scannedPackages/totalPatches/… + the `packages`
