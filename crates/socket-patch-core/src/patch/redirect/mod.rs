@@ -100,7 +100,10 @@ pub struct DepOverride {
 
 /// One recorded file edit (mirrors the TS `FileEdit`). `Deserialize` so the
 /// persisted `redirect-state.json` ledger round-trips (see `redirect::state`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// `PartialEq` so the ledger merge can skip byte-identical edits a retried
+/// run re-plans (the ledger persists BEFORE the lockfile writes, so a
+/// failed write's edit is re-planned by the retry).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FileEdit {
     pub path: String,
     pub kind: String,
