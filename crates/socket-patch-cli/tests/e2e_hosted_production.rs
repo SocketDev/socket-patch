@@ -38,6 +38,10 @@
 //! | Cargo  | `pkg:cargo/traitobject@0.1.1`   | `cf2e6f58-d9fa-4096-9151-c34afa717f89` | GHSA-pp8r-vv2j-9j5v |
 //! | gem    | `pkg:gem/activestorage@7.0.2.2` | `2535d43d-67ce-4944-be27-c19e113997fb` | GHSA-w749-p3v6-hccq |
 //!
+//! > **gem is TEMPORARILY DISABLED** (see [`GEM_E2E_DISABLED`]): the pinned
+//! > gem patch was intentionally unpublished on 2026-08-14 pending a corrected
+//! > republish, so its three legs skip until the switch is flipped back.
+//!
 //! `docs/testing/hosted-production-e2e.md` explains how these were chosen and
 //! how to re-pick one if it is ever withdrawn.
 //!
@@ -130,6 +134,26 @@ const GEM_PURL: &str = "pkg:gem/activestorage@7.0.2.2";
 const GEM_NAME: &str = "activestorage";
 const GEM_VERSION: &str = "7.0.2.2";
 const GEM_UUID: &str = "2535d43d-67ce-4944-be27-c19e113997fb";
+
+/// TEMPORARY kill switch for the ruby-gem hosted legs.
+///
+/// The pinned gem patch `activestorage@7.0.2.2` (`GEM_UUID`) was
+/// **intentionally unpublished on 2026-08-14** pending a corrected republish
+/// (the compact-index dependency metadata was wrong). Its record still
+/// resolves via `/patch/view/<uuid>`, but the discovery endpoints
+/// (`/patch/batch`, `/patch/by-package`) now return zero patches for the gem,
+/// so `preflight_required_patches_are_published`, the advisory canary, and the
+/// gem redirect leg fail for a reason that has nothing to do with the CLI.
+///
+/// While this is `true`, those three gem legs are skipped so the required
+/// `hosted-e2e` check stays green for npm/PyPI/cargo. This is a plain
+/// unconditional skip (NOT `soft_skip!`, which panics under STRICT) — it does
+/// not depend on any env var and applies in CI too.
+///
+/// **RE-ENABLE** by flipping this to `false` once the corrected gem patch is
+/// published on `patches-api.socket.dev` (and update `GEM_UUID` if the
+/// replacement has a new uuid). Tracked in `docs/testing/hosted-production-e2e.md`.
+const GEM_E2E_DISABLED: bool = true;
 
 /// Header the patch service injects into patched npm / PyPI source files.
 const PATCH_MARKER: &str = "Socket Community Patch";
@@ -698,12 +722,16 @@ fn urlencode(s: &str) -> String {
 #[ignore = "live production API: contacts patches-api.socket.dev. Run with --ignored."]
 async fn preflight_required_patches_are_published() {
     // (purl, acceptable uuids)
-    let required: Vec<(&str, Vec<&str>)> = vec![
+    let mut required: Vec<(&str, Vec<&str>)> = vec![
         (NPM_PURL, vec![NPM_UUID]),
         (PYPI_PURL, PYPI_UUIDS.to_vec()),
         (CARGO_PURL, vec![CARGO_UUID]),
-        (GEM_PURL, vec![GEM_UUID]),
     ];
+    // The gem pin is temporarily unpublished (see `GEM_E2E_DISABLED`); don't
+    // require it while the switch is on.
+    if !GEM_E2E_DISABLED {
+        required.push((GEM_PURL, vec![GEM_UUID]));
+    }
 
     let mut failures: Vec<String> = Vec::new();
     for (purl, expected) in &required {
@@ -755,7 +783,12 @@ async fn canary_patches_name_advisories_so_merge_state_is_inferable() {
     let mut failures: Vec<String> = Vec::new();
     let mut coverage_seen: Vec<(String, String, usize)> = Vec::new();
 
-    for purl in [NPM_PURL, PYPI_PURL, CARGO_PURL, GEM_PURL] {
+    let mut canary_purls = vec![NPM_PURL, PYPI_PURL, CARGO_PURL];
+    // Skip the gem while its pin is temporarily unpublished (see `GEM_E2E_DISABLED`).
+    if !GEM_E2E_DISABLED {
+        canary_purls.push(GEM_PURL);
+    }
+    for purl in canary_purls {
         match published_patch_advisory_counts(purl).await {
             Err(e) => failures.push(format!("{purl}: production probe failed: {e}")),
             Ok(patches) if patches.is_empty() => {
@@ -1670,6 +1703,16 @@ fn cargo_hosted_install_proof() {
 #[ignore = "live production API + real rubygems.org. Run with --ignored."]
 async fn gem_bundler_hosted_redirect_and_known_install_defect() {
     const LEG: &str = "gem_bundler_hosted_redirect_and_known_install_defect";
+    // Unconditional skip while the pinned gem patch is unpublished (see
+    // `GEM_E2E_DISABLED`). Deliberately NOT `soft_skip!` — that panics under
+    // STRICT, and this skip is intentional in CI too, not a missing toolchain.
+    if GEM_E2E_DISABLED {
+        println!(
+            "SKIP {LEG}: gem patch {GEM_UUID} temporarily unpublished \
+             (GEM_E2E_DISABLED); re-enable when the corrected patch is published"
+        );
+        return;
+    }
     if !has_command("ruby") || !has_command("bundle") {
         soft_skip!(LEG, "`ruby` and/or `bundle` not on PATH");
     }

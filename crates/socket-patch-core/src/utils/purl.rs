@@ -108,6 +108,27 @@ pub fn purl_eq(a: &str, b: &str) -> bool {
     normalize_purl(a) == normalize_purl(b)
 }
 
+/// Extract the value of a single PURL qualifier (`?key=value&…`), if present.
+///
+/// The PURL grammar places qualifiers after the base as `?k1=v1&k2=v2`,
+/// optionally followed by a `#subpath`. Keys are matched case-insensitively
+/// (per the PURL spec); the value is returned verbatim (callers
+/// percent-decode if they need to). A malformed `k` with no `=` is skipped,
+/// not fatal. Returns `None` when the purl has no qualifier string or none
+/// of them match `key`.
+///
+/// e.g. `purl_qualifier("pkg:gem/nokogiri@1.16.5?platform=java", "platform")`
+/// -> `Some("java")`.
+pub fn purl_qualifier<'a>(purl: &'a str, key: &str) -> Option<&'a str> {
+    let after_q = purl.split_once('?')?.1;
+    // Qualifiers end at the optional `#subpath`.
+    let quals = after_q.split('#').next().unwrap_or(after_q);
+    quals.split('&').find_map(|pair| {
+        let (k, v) = pair.split_once('=')?;
+        k.eq_ignore_ascii_case(key).then_some(v)
+    })
+}
+
 /// Shared split for `pkg:<type>/<name>@<version>` purls: strip
 /// `?qualifiers`/`#subpath` FIRST (a qualifier value can itself embed an
 /// `@`, e.g. a `git@github.com` source URL), require `prefix`, then split
@@ -639,6 +660,45 @@ mod tests {
         assert_eq!(
             parse_gem_purl("pkg:gem/nokogiri@1.16.5?platform=java"),
             Some(("nokogiri", "1.16.5"))
+        );
+    }
+
+    #[test]
+    fn test_purl_qualifier() {
+        // Single qualifier.
+        assert_eq!(
+            purl_qualifier("pkg:gem/nokogiri@1.16.5?platform=java", "platform"),
+            Some("java")
+        );
+        // Portable default and bare purl.
+        assert_eq!(
+            purl_qualifier("pkg:gem/activestorage@7.0.2.2?platform=ruby", "platform"),
+            Some("ruby")
+        );
+        assert_eq!(
+            purl_qualifier("pkg:gem/activestorage@7.0.2.2", "platform"),
+            None
+        );
+        // Case-insensitive key match; value returned verbatim.
+        assert_eq!(
+            purl_qualifier("pkg:gem/nokogiri@1.16.5?Platform=x86_64-linux", "platform"),
+            Some("x86_64-linux")
+        );
+        // Picks the right one out of several, and stops at `#subpath`.
+        assert_eq!(
+            purl_qualifier("pkg:gem/x@1?arch=arm&platform=x64-mingw32#lib", "platform"),
+            Some("x64-mingw32")
+        );
+        assert_eq!(
+            purl_qualifier("pkg:gem/x@1?platform=ruby#lib/x.rb", "platform"),
+            Some("ruby")
+        );
+        // Missing key among present qualifiers, and a malformed pair is
+        // skipped rather than aborting the scan.
+        assert_eq!(purl_qualifier("pkg:gem/x@1?arch=arm", "platform"), None);
+        assert_eq!(
+            purl_qualifier("pkg:gem/x@1?bogus&platform=java", "platform"),
+            Some("java")
         );
     }
 
