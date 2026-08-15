@@ -776,6 +776,20 @@ async fn vendored_wiring_live(cwd: &Path, entry: &socket_patch_core::vendor::Ven
 /// records (VEX reads them) plus the recorded pre-redirect lockfile originals
 /// (the only revert data), and the `<eco>/` tree holds every vendored uuid
 /// dir, including packages the hosted run skipped.
+///
+/// Per package also has to mean COMPLETE per package, or the remediation does
+/// not converge:
+///
+/// * The vendored direction names the package's `edits` entry alongside its
+///   `records` entry. `overlapping_ledger_purls` falls back to matching edit
+///   KEYS once `records` is empty (the degraded-ledger blind spot), so a
+///   records-only cleanup that happened to delete the last record left the
+///   package still matching and this warning firing on every later run —
+///   repeating advice the operator had already carried out.
+/// * The hosted direction describes `socket-patch remove`'s full blast radius.
+///   It deletes the package's `.socket/manifest.json` entry too, not just the
+///   vendor ledger entry and artifact dir, and a reader who budgeted for a
+///   ledger-only edit needs to know that before running it with `--yes`.
 pub(super) fn mode_takeover_detail(superseded: &[String], current_is_hosted: bool) -> String {
     let list = superseded.join(", ");
     if current_is_hosted {
@@ -785,9 +799,15 @@ pub(super) fn mode_takeover_detail(superseded: &[String], current_is_hosted: boo
              committed tarball(s) under `.socket/vendor/` are now orphaned — the \
              lockfile points at the hosted patch server, not the vendored files. \
              Clean up per package: run `socket-patch remove <purl>` for each \
-             package listed above (it drops only that entry and its own \
-             `.socket/vendor/<eco>/<uuid>/` artifact directory), so audits and \
-             VEX do not read superseded wiring. Do not delete the whole \
+             package listed above, so audits and VEX do not read superseded \
+             wiring. It drops that package's vendored ledger entry and its own \
+             `.socket/vendor/<eco>/<uuid>/` artifact directory, AND deletes that \
+             package's now-superseded `.socket/manifest.json` entry — that entry \
+             describes the vendored delivery, while the live hosted patch is \
+             recorded in `.socket/vendor/redirect-state.json`, which `remove` \
+             never touches. In-place file rollback is skipped for vendor-owned \
+             package(s), so the installed tree is left as the lockfile wires it; \
+             preview with `--dry-run` first. Do not delete the whole \
              `.socket/vendor/<eco>/` tree and do not run `vendor --revert`: \
              other vendored package(s) may still be live in the lockfile and \
              would break or be mass-reverted."
@@ -799,10 +819,16 @@ pub(super) fn mode_takeover_detail(superseded: &[String], current_is_hosted: boo
              these package(s), but the lockfile now points at the committed \
              `.socket/vendor/` files. Clean up per package: edit \
              `.socket/vendor/redirect-state.json` and delete only these package(s)' \
-             entries under `records`, so audits and VEX do not read superseded \
-             wiring. Do not delete the ledger file itself: it may still hold live \
-             redirect records for other package(s), plus the recorded pre-redirect \
-             lockfile originals (`edits`) a future revert needs."
+             entries under `records` AND their matching entries under `edits`, so \
+             audits and VEX do not read superseded wiring. Both halves matter: the \
+             leftover `edits` are that package's stale pre-redirect originals, \
+             which a later redirect revert would replay over the live vendored \
+             wiring — and an `edits` entry left behind still names the package, so \
+             a ledger whose last record you just deleted keeps reading as \
+             superseded and this warning keeps firing. Do not delete the ledger \
+             file itself: it may still hold live redirect records for other \
+             package(s), plus the recorded pre-redirect lockfile originals \
+             (`edits`) a future revert needs for them."
         )
     }
 }
@@ -2425,6 +2451,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn hosted_remediation_states_removes_full_blast_radius() {
+        // Regression: the hosted text said `socket-patch remove <purl>` "drops
+        // only that entry and its own `.socket/vendor/<eco>/<uuid>/` artifact
+        // directory". It also deletes the package's `.socket/manifest.json`
+        // entry, so a reader budgeting for a ledger-scoped edit — a bot passing
+        // `--yes`, especially — was mis-told what the command does.
+        let purls = vec!["pkg:npm/minimist@1.2.2".to_string()];
+        let hosted = mode_takeover_detail(&purls, /*current_is_hosted=*/ true);
+
+        assert!(
+            !hosted.contains("drops only that entry"),
+            "hosted remediation must not understate `remove`: {hosted}"
+        );
+        assert!(
+            hosted.contains("`.socket/manifest.json`"),
+            "hosted remediation must name the manifest entry `remove` deletes: {hosted}"
+        );
+        // …and must place the LIVE hosted patch, so "manifest entry deleted"
+        // does not read as "the hosted patch was dropped too".
+        assert!(
+            hosted.contains("redirect-state.json"),
+            "hosted remediation must say where the live hosted patch lives: {hosted}"
+        );
+    }
+
     // ---- takeover blind spots: degraded ledgers and hosted-proof gaps ------
 
     fn redirect_edit(path: &str, key: &str) -> socket_patch_core::patch::redirect::FileEdit {
@@ -2492,6 +2544,56 @@ mod tests {
             "the vendored takeover of a degraded redirect ledger must be flagged"
         );
         assert!(takeover.redirect.is_empty(), "{takeover:?}");
+    }
+
+    #[tokio::test]
+    async fn following_the_vendored_remediation_clears_the_warning() {
+        // Regression (sticky warning): the vendored remediation used to name
+        // only the `records` entries. When the takeover cleared the LAST
+        // record, the leftover `edits` still matched the package through the
+        // degraded-ledger fallback above, so the identical warning fired on
+        // every later run — and repeated advice that could no longer be
+        // followed, since `records` was already empty. The remediation now
+        // names the matching `edits` entries too; carrying it out in full has
+        // to leave nothing to warn about.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_redirect_ledger_with_edits(
+            root,
+            &["pkg:npm/minimist@1.2.2"],
+            vec![redirect_edit("package-lock.json", "node_modules/minimist")],
+        )
+        .await;
+        write_vendor_ledger_wired(root, &["pkg:npm/minimist@1.2.2"]).await;
+        write_lock_pointing_at_vendored(root, "minimist", "1.2.2").await;
+
+        let before = classify_overlap_takeover(root).await;
+        assert_eq!(
+            before.vendored,
+            vec!["pkg:npm/minimist@1.2.2".to_string()],
+            "the vendored takeover must be flagged first: {before:?}"
+        );
+        let detail = mode_takeover_detail(&before.vendored, /*current_is_hosted=*/ false);
+        assert!(
+            detail.contains("`edits`"),
+            "the remediation must name the edits entries: {detail}"
+        );
+
+        // Exactly what the remediation prescribes for this ledger: the
+        // package's `records` entry AND its matching `edits` entry gone, the
+        // ledger file itself left in place.
+        write_redirect_ledger_with_edits(root, &[], Vec::new()).await;
+
+        let after = classify_overlap_takeover(root).await;
+        assert_eq!(
+            after,
+            OverlapTakeover::default(),
+            "following the remediation must clear the warning: {after:?}"
+        );
+        assert!(
+            overlapping_ledger_purls(root).await.is_empty(),
+            "no residue may keep the ledgers reading as overlapping"
+        );
     }
 
     /// A grant token as it appears between the host and the patch uuid in
