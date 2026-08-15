@@ -14,8 +14,15 @@
 //! FAIL CLOSED: a file that matches neither the recorded redirected fragment
 //! nor the recorded original has drifted — the revert refuses (`Err`) rather
 //! than half-applying, and the caller must then refuse to vendor that purl.
+//! Refusing has to leave the project byte-identical across ALL the files the
+//! ledger claims, not just the one that drifted: the caller reports the purl
+//! as untouched ("cannot vendor over the live hosted redirect"), so an
+//! already-rewritten Cargo.lock behind that message would be a half-hosted
+//! project nobody is told about, and every retry refuses on the same drift.
+//! So each inverse is resolved against a staged view and NOTHING reaches disk
+//! until all of them have resolved.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
 use serde_json::Value;
@@ -45,6 +52,50 @@ async fn write_rel(project_root: &Path, rel: &str, content: &str) -> Result<(), 
     tokio::fs::write(project_root.join(rel), content)
         .await
         .map_err(|e| format!("write {rel}: {e}"))
+}
+
+/// Files the unwind has decided but not yet written: `Some(content)` to
+/// write, `None` to remove.
+type Staged = BTreeMap<String, Option<String>>;
+
+/// Read a project file through the staged writes, so each unwind step sees
+/// what the earlier steps decided. Both the re-redirect chain (a step's
+/// `original` is the previous step's `new`) and the registry block's
+/// still-referenced probe depend on that view, and neither may depend on the
+/// bytes having landed.
+async fn staged_read(
+    staged: &Staged,
+    project_root: &Path,
+    rel: &str,
+) -> Result<Option<String>, String> {
+    match staged.get(rel) {
+        Some(pending) => Ok(pending.clone()),
+        None => read_rel(project_root, rel).await,
+    }
+}
+
+/// Write the staged files. Only reached once every inverse resolved, so a
+/// drift refusal never gets here; an I/O fault partway through is the one
+/// remaining way to stop mid-set, and it surfaces as `Err` with the write
+/// already reported by path.
+async fn flush_staged(project_root: &Path, staged: &Staged) -> Result<(), String> {
+    for (rel, pending) in staged {
+        let Some(content) = pending else {
+            let path = project_root.join(rel);
+            match tokio::fs::remove_file(&path).await {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(format!("remove {rel}: {e}")),
+            }
+            // Best-effort: prune a now-empty `.cargo/` dir.
+            if let Some(parent) = path.parent() {
+                let _ = tokio::fs::remove_dir(parent).await;
+            }
+            continue;
+        };
+        write_rel(project_root, rel, content).await?;
+    }
+    Ok(())
 }
 
 /// Revert every hosted-redirect edit the ledger records for `purl` (a cargo
@@ -113,6 +164,7 @@ pub async fn revert_cargo_redirect_purl(
         .collect();
 
     let mut out = CargoRedirectRevert::default();
+    let mut staged: Staged = Staged::new();
     // Newest-first: the hosted flow appends edits, so reverse index order
     // unwinds re-redirect chains correctly (each step's `original` is the
     // previous step's `new`), and the registry-block removals — recorded
@@ -131,7 +183,7 @@ pub async fn revert_cargo_redirect_purl(
                         name, edit.path
                     ));
                 };
-                let Some(content) = read_rel(project_root, &edit.path).await? else {
+                let Some(content) = staged_read(&staged, project_root, &edit.path).await? else {
                     return Err(format!(
                         "{} no longer exists; cannot revert the recorded hosted \
                          redirect for {name}@{version}",
@@ -140,7 +192,7 @@ pub async fn revert_cargo_redirect_purl(
                 };
                 if content.contains(new) {
                     let reverted = content.replacen(new, orig, 1);
-                    write_rel(project_root, &edit.path, &reverted).await?;
+                    staged.insert(edit.path.clone(), Some(reverted));
                     out.reverted_files.push(edit.path.clone());
                 } else if content.contains(orig) {
                     // Already at (or unwound to) the pre-redirect fragment.
@@ -159,7 +211,7 @@ pub async fn revert_cargo_redirect_purl(
                 let Some(block) = edit.new.as_ref().and_then(Value::as_str) else {
                     continue; // nothing recorded to remove — leave the config
                 };
-                let Some(content) = read_rel(project_root, &edit.path).await? else {
+                let Some(content) = staged_read(&staged, project_root, &edit.path).await? else {
                     continue; // config already gone
                 };
                 if !content.contains(block) {
@@ -176,7 +228,7 @@ pub async fn revert_cargo_redirect_purl(
                     .unwrap_or_default();
                 let mut referenced = false;
                 for probe in ["Cargo.toml", "Cargo.lock"] {
-                    if let Some(text) = read_rel(project_root, probe).await? {
+                    if let Some(text) = staged_read(&staged, project_root, probe).await? {
                         if (!reg.is_empty() && text.contains(reg))
                             || (!index.is_empty() && text.contains(&index))
                         {
@@ -194,7 +246,7 @@ pub async fn revert_cargo_redirect_purl(
                 // of deleting it: the original bytes are the user's.
                 if let Some(orig) = edit.original.as_ref().and_then(Value::as_str) {
                     let reverted = content.replacen(block, orig, 1);
-                    write_rel(project_root, &edit.path, &reverted).await?;
+                    staged.insert(edit.path.clone(), Some(reverted));
                     out.reverted_files.push(edit.path.clone());
                     continue;
                 }
@@ -205,24 +257,19 @@ pub async fn revert_cargo_redirect_purl(
                 }
                 let trimmed = trimmed.trim_start_matches('\n').to_string();
                 if trimmed.trim().is_empty() {
-                    let path = project_root.join(&edit.path);
-                    match tokio::fs::remove_file(&path).await {
-                        Ok(()) => {}
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(e) => return Err(format!("remove {}: {e}", edit.path)),
-                    }
-                    // Best-effort: prune a now-empty `.cargo/` dir.
-                    if let Some(parent) = path.parent() {
-                        let _ = tokio::fs::remove_dir(parent).await;
-                    }
+                    staged.insert(edit.path.clone(), None);
                 } else {
-                    write_rel(project_root, &edit.path, &trimmed).await?;
+                    staged.insert(edit.path.clone(), Some(trimmed));
                 }
                 out.reverted_files.push(edit.path.clone());
             }
             _ => {}
         }
     }
+
+    // Every inverse resolved — only now does any of it reach disk, so a
+    // refusal above left the project exactly as it was found.
+    flush_staged(project_root, &staged).await?;
 
     // Only after every inverse applied cleanly: drop this purl's edits and
     // record from the ledger (the caller persists it).
@@ -399,6 +446,63 @@ mod tests {
         // The ledger keeps everything on refusal.
         assert_eq!(state.records.len(), records_before);
         assert_eq!(state.edits.len(), edits_before);
+    }
+
+    /// The unwind runs newest-first (edits are recorded config, manifest,
+    /// lock), so Cargo.lock's inverse resolves BEFORE Cargo.toml's. Drifting
+    /// only Cargo.toml therefore refuses at a point where the lock's inverse
+    /// has already been decided — and the caller reports the purl as
+    /// untouched ("cannot vendor over the live hosted redirect"), so a
+    /// revert that had written the lock by then would leave the project
+    /// half-hosted behind a message saying nothing happened.
+    #[tokio::test]
+    async fn a_later_drifted_edit_leaves_every_earlier_file_untouched() {
+        let (tmp, mut state) = redirected_fixture().await;
+        let root = tmp.path();
+        let drifted_toml =
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\ncfg-if = { version = \"1.0\", registry = \"corp-mirror\" }\n";
+        tokio::fs::write(root.join("Cargo.toml"), drifted_toml)
+            .await
+            .unwrap();
+        let lock_before = tokio::fs::read_to_string(root.join("Cargo.lock"))
+            .await
+            .unwrap();
+        let cfg_before = tokio::fs::read_to_string(root.join(".cargo/config.toml"))
+            .await
+            .unwrap();
+        assert!(
+            lock_before.contains("sparse+"),
+            "fixture is hosted-wired: {lock_before}"
+        );
+
+        let err = revert_cargo_redirect_purl(root, &mut state, PURL)
+            .await
+            .expect_err("drifted manifest must refuse");
+        assert!(err.contains("drifted"), "{err}");
+
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("Cargo.lock"))
+                .await
+                .unwrap(),
+            lock_before,
+            "Cargo.lock must be untouched — its inverse resolved before the refusal"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("Cargo.toml"))
+                .await
+                .unwrap(),
+            drifted_toml,
+            "Cargo.toml untouched"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(".cargo/config.toml"))
+                .await
+                .unwrap(),
+            cfg_before,
+            ".cargo/config.toml untouched"
+        );
+        assert!(!state.records.is_empty(), "ledger keeps the record");
+        assert!(!state.edits.is_empty(), "ledger keeps the edits");
     }
 
     #[tokio::test]
