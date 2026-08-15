@@ -213,14 +213,17 @@ pub async fn vendor_gem(
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    // A dir named `<name>-<version>-<suffix>` is a precompiled platform
-    // install; the auto-fetch staging dir (`gem`) is NOT such a suffix and
-    // passes.
-    if dir_name != leaf && dir_name.starts_with(&format!("{leaf}-")) {
+    // Fail closed: only two dir names are legitimate here — the installed
+    // gem's own `<name>-<version>` leaf, and the literal `gem` staging dir
+    // created by the registry auto-fetch ladder (registry_fetch::fetch_gem).
+    // Everything else is refused, including a `<name>-<version>-<platform>`
+    // precompiled build; an allowlist (not a suffix match) means an unexpected
+    // install dir name can never slip through into a vendored copy.
+    if dir_name != leaf && dir_name != "gem" {
         return refused(
             "platform_gem_unsupported",
             format!(
-                "installed dir `{dir_name}` is a platform-suffixed build of `{leaf}` (platform-specific gem builds cannot be vendored portably)"
+                "installed dir `{dir_name}` is not the portable `{leaf}` gem (platform-specific or unexpected gem builds cannot be vendored portably)"
             ),
         );
     }
@@ -2269,6 +2272,24 @@ mod tests {
         assert!(!root.join(".socket").exists());
     }
 
+    /// Fail-closed allowlist regression: an install dir whose name is neither
+    /// the `<name>-<version>` leaf nor the `gem` auto-fetch staging dir is
+    /// refused — even though it is NOT a `<leaf>-<platform>` suffix, so the old
+    /// suffix-only check (`dir_name.starts_with("{leaf}-")`) would have ADMITTED
+    /// it. Only the two legitimate dir names may pass.
+    #[tokio::test]
+    async fn test_refuses_unexpected_install_dir_name() {
+        let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
+        // A wholly-unexpected dir name: not `rack-3.2.6`, not `gem`, and not a
+        // `rack-3.2.6-<suffix>` platform build (which the old suffix check caught).
+        let odd_dir = installed.parent().unwrap().join("random-unrelated");
+        tokio::fs::rename(&installed, &odd_dir).await.unwrap();
+
+        let (code, _d) = unwrap_refused(run_vendor(&root, &blobs, &odd_dir, &record, false).await);
+        assert_eq!(code, "platform_gem_unsupported");
+        assert!(!root.join(".socket").exists());
+    }
+
     /// A native `?platform=` qualifier (e.g. `x86_64-linux`) is refused as a
     /// platform-specific build EVEN when the resolved install dir is the clean
     /// portable leaf — the purl qualifier is the authoritative signal.
@@ -3051,7 +3072,7 @@ mod tests {
                 .error
                 .as_deref()
                 .unwrap_or("")
-                .contains("platform-suffixed"),
+                .contains("platform-specific"),
             "{:?}",
             result.error
         );
