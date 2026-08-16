@@ -52,8 +52,10 @@
 //!   patches for them, so there is nothing real to redirect to. Rather than
 //!   silently skipping, [`canary_unpublished_ecosystems`] probes production
 //!   every run and tells us the moment that changes.
-//! * **golang** — hosted mode is refused **by design**
-//!   (`docs/design/golang-hosted-no-go.md`). Covered as a negative assertion.
+//! * **golang** — hosted mode is supported for free-tier references carrying
+//!   a `goproxy` override (`docs/design/golang-hosted.md`), but production
+//!   publishes no golang hosted modules yet. Covered as a shape guard that
+//!   holds in both worlds.
 //! * **deno** — hosted mode is not supported. Covered as a negative assertion.
 //!
 //! # Prerequisites
@@ -1942,17 +1944,20 @@ async fn gem_bundler_hosted_redirect_and_known_install_defect() {
 // Documented negative cases
 // ===========================================================================
 
-/// Go hosted mode is refused by design (`docs/design/golang-hosted-no-go.md`).
+/// Go hosted mode: supported for free-tier references that carry a `goproxy`
+/// override (`docs/design/golang-hosted.md`); refused with
+/// `redirect_golang_unsupported` otherwise (`golang-hosted-no-go.md`, the
+/// paid-tier analysis).
 ///
-/// This asserts the *documented* shape of the refusal rather than a specific
-/// warning payload, because production publishes no free golang patches today,
-/// so there is nothing for the rewriter to refuse. If that ever changes, the
-/// `redirect_golang_unsupported` branch below starts exercising and this test
-/// becomes a real guard with no edit needed.
+/// Production publishes no golang hosted modules today, so this guards BOTH
+/// worlds without edits: while prod ships no `goproxy` overrides, nothing may
+/// be redirected (an empty-project scan must not invent a redirect); the day
+/// prod starts shipping them, any redirect this scan performs must be the
+/// documented shape — a socket-namespace replace in go.mod plus go.sum lines.
 #[test]
 #[ignore = "live production API. Run with --ignored."]
-fn golang_hosted_is_refused_by_design() {
-    const LEG: &str = "golang_hosted_is_refused_by_design";
+fn golang_hosted_redirects_only_via_goproxy_override() {
+    const LEG: &str = "golang_hosted_redirects_only_via_goproxy_override";
     if !has_command("go") {
         soft_skip!(LEG, "`go` not on PATH");
     }
@@ -1966,27 +1971,27 @@ fn golang_hosted_is_refused_by_design() {
     .expect("write go.mod");
 
     let env_json = scan_hosted(&proj, &["--ecosystems", "golang"]);
-    assert_eq!(
-        redirected_count(&env_json),
-        0,
-        "{LEG}: golang hosted mode redirected something — it is documented as \
-         impossible (sumdb + module-path identity + GOPROXY leakage). Either \
-         the design changed or this is a real bug:\n{env_json:#}"
-    );
-    let warnings = env_json["redirect"]["warnings"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
-    if warnings
-        .iter()
-        .any(|w| w["code"].as_str() == Some("redirect_golang_unsupported"))
-    {
-        println!("{LEG}: production now publishes golang patches; the documented refusal fired.");
-    } else {
+    let redirected = redirected_count(&env_json);
+    if redirected == 0 {
         println!(
-            "{LEG}: no golang patches published, so the refusal path is inert. \
-             Asserted only that hosted mode redirected nothing."
+            "{LEG}: production publishes no golang hosted modules (or none \
+             matched an empty project); nothing redirected, as documented."
         );
+    } else {
+        // The moment prod ships goproxy overrides, every golang redirect must
+        // be the committable fork-replace shape.
+        let go_mod = std::fs::read_to_string(proj.join("go.mod")).expect("read go.mod");
+        assert!(
+            go_mod.contains("patch.socket.dev/gopatch/"),
+            "{LEG}: {redirected} golang redirect(s) reported but go.mod has no \
+             socket-namespace replace:\n{go_mod}\n{env_json:#}"
+        );
+        assert!(
+            proj.join("go.sum").is_file(),
+            "{LEG}: golang redirect without a go.sum pin bricks -mod=readonly \
+             builds:\n{env_json:#}"
+        );
+        println!("{LEG}: production now serves golang hosted modules; shape verified.");
     }
 }
 

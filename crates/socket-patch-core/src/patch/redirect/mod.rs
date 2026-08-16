@@ -42,6 +42,12 @@ pub struct Integrity {
     pub sha1: Option<String>,
     pub md5: Option<String>,
     pub dirhash_h1: Option<String>,
+    /// go.sum's second line for a Go module: `h1:` dirhash of the SERVED
+    /// `/@v/<version>.mod` bytes (x/mod `HashGoMod`, i.e. `Hash1` over the
+    /// single entry `go.mod`). Both this and `dirhash_h1` are required before
+    /// the golang rewriter will touch anything — under `-mod=readonly` a
+    /// missing go.sum line is a hard build error on every other machine.
+    pub go_mod_h1: Option<String>,
     pub yarn_berry10c0: Option<String>,
 }
 
@@ -51,7 +57,29 @@ pub struct RegistryOverrideIdentifiers {
     pub name: String,
     pub version: String,
     pub cargo_cksum_sha256: Option<String>,
+    /// Module path of the Socket-published patched Go module — grant-free and
+    /// content-addressed under `go_mod_edit::HOSTED_GO_MODULE_PREFIX`
+    /// (`patch.socket.dev/gopatch/<patch-uuid>`), served over the standard
+    /// GOPROXY protocol. The rewriter fails closed on any path outside that
+    /// namespace: the prefix is the only ownership signal a module-to-module
+    /// `replace` (and its go.sum lines) carries.
     pub go_module_path: Option<String>,
+    /// Version the Socket Go module is published under (the replace RHS,
+    /// `<base>-socketpatch.<n>`). Always in the v0/v1 range regardless of the
+    /// original's major version — a v2+ RHS would force a `/v2` module-path
+    /// suffix, and the RHS version need not relate to the original's.
+    pub go_module_version: Option<String>,
+    /// `h1:` dirhash of the gopatch-flavor module zip. Rides the override's
+    /// identifiers — NOT the tarball artifact's integrity, whose `dirhashH1`
+    /// stays the original-path flavor for vendor-mode verification (the h1
+    /// hashes entry NAMES, so the two flavors hash differently). The
+    /// DepOverride builder merges it into `integrity.dirhash_h1` for the
+    /// rewriter.
+    pub go_zip_dirhash_h1: Option<String>,
+    /// `h1:` dirhash of the served `.mod` bytes (x/mod `HashGoMod`) — the
+    /// consumer's `/go.mod h1:` go.sum line. Merged into
+    /// `integrity.go_mod_h1` alongside [`Self::go_zip_dirhash_h1`].
+    pub go_mod_h1: Option<String>,
     pub nuget_id_lower: Option<String>,
     pub nuget_version_norm: Option<String>,
     pub maven_group_id: Option<String>,
@@ -175,7 +203,7 @@ pub fn rewrite_registry_redirect(
     rewrite_nuget(files, overrides, &mut result);
     rewrite_gem(files, overrides, &mut result);
     rewrite_maven_pom(files, overrides, &mut result);
-    rewrite_golang(overrides, &mut result);
+    rewrite_golang(files, overrides, &mut result);
     result
 }
 
@@ -3936,22 +3964,309 @@ fn gradle_snippet(
     )
 }
 
-// ── golang (documented limitation) ──────────────────────────────────────────
-// Hosted redirect for Go is a deliberate no-go: every workable shape needs
-// machine-local GOPROXY/GOPRIVATE configuration that can't be committed to the
-// repo as a per-dependency edit. The full analysis (sumdb hard-fail, module-
-// path identity vs the build-once converter, GOPROXY leaking licensed bytes to
-// the public mirror) lives in `docs/design/golang-hosted-no-go.md`.
-fn rewrite_golang(overrides: &[DepOverride], result: &mut RewriteResult) {
-    for dep in overrides.iter().filter(|o| o.ecosystem == "golang") {
+// ── golang (go.mod fork-replace + go.sum pin) ────────────────────────────────
+/// go.mod and go.sum are whitespace-delimited line formats, and the golang
+/// rewriter interpolates server-controlled strings into both — any embedded
+/// whitespace/control character would split tokens or inject whole directives
+/// (`"foo v1.0.0 => evil.example/x v1\nreplace …"`). Fail-closed token guard.
+fn go_token_safe(s: &str) -> bool {
+    !s.is_empty() && !s.chars().any(|c| c.is_whitespace() || c.is_control())
+}
+
+/// Strict `h1:` dirhash shape: exactly `h1:` + the 44-char standard-base64 of
+/// a sha256. Anything else (wrong algorithm, embedded whitespace, truncation)
+/// must not reach go.sum — a malformed line poisons the whole file.
+fn go_h1_shape(s: &str) -> bool {
+    s.strip_prefix("h1:").is_some_and(|b| {
+        b.len() == 44
+            && b.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '=')
+    })
+}
+
+// The committable shape (validated empirically — `docs/design/golang-hosted.md`):
+//
+//   go.mod:  replace <orig> <ver> => patch.socket.dev/gopatch/<uuid> <sver>
+//   go.sum:  patch.socket.dev/gopatch/<uuid> <sver> h1:…          (zip dirhash)
+//            patch.socket.dev/gopatch/<uuid> <sver>/go.mod h1:…   (served .mod)
+//
+// Day-2 machines need NO machine-local configuration: go consults the checksum
+// database only for modules ABSENT from go.sum, the Socket module path is
+// grant-free/content-addressed (one build-once artifact per patch, public on
+// the free tier), and with the pinned replace in force go never fetches or
+// verifies the original module at all. A dep whose reference carries no
+// `goproxy` override falls back to the historical `redirect_golang_unsupported`
+// warning (the paid tier's tokened URLs remain a genuine no-go — see the
+// design doc's paid-tier analysis).
+fn rewrite_golang(
+    files: &BTreeMap<String, String>,
+    overrides: &[DepOverride],
+    result: &mut RewriteResult,
+) {
+    use crate::vendor::go_mod_edit::{self, HOSTED_GO_MODULE_PREFIX};
+    use crate::vendor::go_sum_edit;
+
+    let golang: Vec<&DepOverride> = overrides
+        .iter()
+        .filter(|o| o.ecosystem == "golang")
+        .collect();
+    if golang.is_empty() {
+        return;
+    }
+    // The replace directive can only live in the MAIN module's go.mod.
+    let Some(orig_go_mod) = files.get("go.mod") else {
         result.warnings.push(RewriteWarning {
-            code: "redirect_golang_unsupported".into(),
-            detail: format!(
-                "{}@{}: hosted redirect for Go is not possible without machine-local GOPROXY/GOPRIVATE configuration; run `socket-patch vendor` (committable, offline-verified) instead",
-                full_name(dep),
-                dep.version
-            ),
+            code: "redirect_golang_no_go_mod".into(),
+            detail: "no go.mod present; golang redirect skipped".into(),
         });
+        return;
+    };
+    let mut go_mod = orig_go_mod.clone();
+    // An absent go.sum starts empty: the fully-replaced original needs no
+    // lines of its own, so the two socket lines alone are a complete pin.
+    let mut go_sum = files.get("go.sum").cloned().unwrap_or_default();
+    let (mut mod_changed, mut sum_changed) = (false, false);
+
+    for dep in &golang {
+        let fname = full_name(dep);
+        let Some(ov) = &dep.registry_override else {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_golang_unsupported".into(),
+                detail: format!(
+                    "{fname}@{}: no hosted Go module is published for this patch; run \
+                     `socket-patch vendor` (committable, offline-verified) instead",
+                    dep.version
+                ),
+            });
+            continue;
+        };
+        if ov.kind != "goproxy" {
+            continue;
+        }
+        let (Some(rhs_module), Some(rhs_version)) = (
+            &ov.identifiers.go_module_path,
+            &ov.identifiers.go_module_version,
+        ) else {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_golang_missing_module".into(),
+                detail: format!(
+                    "{fname}@{} goproxy override lacks goModulePath/goModuleVersion",
+                    dep.version
+                ),
+            });
+            continue;
+        };
+        // Fail closed on a module path outside the socket namespace: the
+        // prefix is the ONLY ownership signal — a directive we couldn't
+        // recognize later would be unremovable, and go.sum removal keys on it.
+        if !rhs_module.starts_with(HOSTED_GO_MODULE_PREFIX) {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_golang_untrusted_module_path".into(),
+                detail: format!(
+                    "{fname}@{}: refusing hosted module path `{rhs_module}` outside \
+                     `{HOSTED_GO_MODULE_PREFIX}`",
+                    dep.version
+                ),
+            });
+            continue;
+        }
+        // Every string interpolated into go.mod/go.sum must be a single clean
+        // token — whitespace or control characters would inject directives.
+        if [fname.as_str(), &dep.version, rhs_module, rhs_version]
+            .iter()
+            .any(|s| !go_token_safe(s))
+        {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_golang_unsafe_coords".into(),
+                detail: format!(
+                    "{fname}@{}: module/version tokens contain whitespace or control \
+                     characters; refusing to write them into go.mod/go.sum",
+                    dep.version
+                ),
+            });
+            continue;
+        }
+        // BOTH go.sum hashes must be pinnable up front — a replace without
+        // them (or with a malformed hash) bricks every `-mod=readonly` build.
+        let (Some(zip_h1), Some(gomod_h1)) = (&dep.integrity.dirhash_h1, &dep.integrity.go_mod_h1)
+        else {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_golang_missing_integrity".into(),
+                detail: format!(
+                    "{fname}@{} has no dirhashH1/goModH1 integrity pair",
+                    dep.version
+                ),
+            });
+            continue;
+        };
+        if !go_h1_shape(zip_h1) || !go_h1_shape(gomod_h1) {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_golang_missing_integrity".into(),
+                detail: format!(
+                    "{fname}@{}: integrity hashes must be `h1:` + 44-char base64 dirhashes",
+                    dep.version
+                ),
+            });
+            continue;
+        }
+        // Any pre-existing socket-owned directive for the module (this run is
+        // a refresh, or a takeover of a local/vendored redirect): capture its
+        // text — the ledger's `original` is the only pre-redirect record.
+        let prior = go_mod_edit::parse_replace_entries(&go_mod)
+            .into_iter()
+            .find(|e| e.module == fname && e.socket_owned());
+        let prior_text = prior.as_ref().map(|e| {
+            let target = e.path.clone().unwrap_or_else(|| match &e.rhs_version {
+                Some(v) => format!("{} {v}", e.rhs_module.as_deref().unwrap_or_default()),
+                None => e.rhs_module.clone().unwrap_or_default(),
+            });
+            let ver = e
+                .version
+                .as_deref()
+                .map(|v| format!(" {v}"))
+                .unwrap_or_default();
+            format!("replace {}{ver} => {target}", e.module)
+        });
+
+        // Stale-pin cross-check: `replace` is keyed on module+version, and a
+        // pin the graph no longer selects is SILENTLY inert (the build links
+        // the unpatched module with zero warning) — refuse to write one, and
+        // reconcile away OUR OWN inert directive if one is already committed:
+        // left in place, its module path keeps confirming the dep as
+        // redirected (ledger + VEX attestation) while go links the unpatched
+        // version.
+        if let Some(required) = go_mod_edit::parse_required_versions(&go_mod).get(&fname) {
+            if required != &dep.version {
+                result.warnings.push(RewriteWarning {
+                    code: "redirect_golang_version_mismatch".into(),
+                    detail: format!(
+                        "{fname}: go.mod requires {required} but the patch targets {} — \
+                         a version-pinned replace would be silently ignored",
+                        dep.version
+                    ),
+                });
+                let stale_hosted = prior
+                    .as_ref()
+                    .filter(|e| e.owner == Some(go_mod_edit::ReplaceOwner::Hosted));
+                if let Some(stale) = stale_hosted {
+                    if let Ok(Some(new)) = go_mod_edit::remove_replace_entry(
+                        &go_mod,
+                        &fname,
+                        go_mod_edit::ReplaceOwner::Hosted,
+                    ) {
+                        go_mod = new;
+                        mod_changed = true;
+                        result.edits.push(FileEdit {
+                            path: "go.mod".into(),
+                            kind: "redirect_golang_stale_replace_removed".into(),
+                            action: "removed".into(),
+                            key: Some(fname.clone()),
+                            original: prior_text.clone().map(Value::String),
+                            new: None,
+                        });
+                    }
+                    if let Some(stale_rhs) = stale.rhs_module.as_deref() {
+                        if let Some(new) =
+                            go_sum_edit::remove_module_prefix_lines(&go_sum, stale_rhs)
+                        {
+                            go_sum = new;
+                            sum_changed = true;
+                            result.edits.push(FileEdit {
+                                path: "go.sum".into(),
+                                kind: "redirect_golang_stale_gosum_removed".into(),
+                                action: "removed".into(),
+                                key: Some(stale_rhs.to_string()),
+                                original: None,
+                                new: None,
+                            });
+                        }
+                    }
+                }
+                continue;
+            }
+        }
+
+        match go_mod_edit::upsert_hosted_replace_entry(
+            &go_mod,
+            &fname,
+            &dep.version,
+            rhs_module,
+            rhs_version,
+        ) {
+            Err(e) => {
+                result.warnings.push(RewriteWarning {
+                    code: "redirect_golang_replace_conflict".into(),
+                    detail: format!("{fname}@{}: {e}", dep.version),
+                });
+                continue;
+            }
+            // Re-run over an already-redirected go.mod: nothing to record.
+            Ok(None) => {}
+            Ok(Some(new)) => {
+                go_mod = new;
+                mod_changed = true;
+                result.edits.push(FileEdit {
+                    path: "go.mod".into(),
+                    kind: "redirect_golang_replace".into(),
+                    // A takeover/refresh of an existing socket directive must
+                    // keep its text in `original` — the ledger is the only
+                    // pre-redirect record a future revert can restore from.
+                    action: if prior_text.is_some() {
+                        "updated".into()
+                    } else {
+                        "added".into()
+                    },
+                    key: Some(fname.clone()),
+                    original: prior_text.map(Value::String),
+                    new: Some(Value::String(format!(
+                        "replace {fname} {} => {rhs_module} {rhs_version}",
+                        dep.version
+                    ))),
+                });
+            }
+        }
+        if let Some(new) =
+            go_sum_edit::upsert_module_lines(&go_sum, rhs_module, rhs_version, zip_h1, gomod_h1)
+        {
+            go_sum = new;
+            sum_changed = true;
+            result.edits.push(FileEdit {
+                path: "go.sum".into(),
+                kind: "redirect_golang_gosum".into(),
+                action: "added".into(),
+                key: Some(format!("{rhs_module}@{rhs_version}")),
+                original: None,
+                new: Some(Value::String(format!(
+                    "{rhs_module} {rhs_version} {zip_h1}\n{rhs_module} {rhs_version}/go.mod {gomod_h1}"
+                ))),
+            });
+        }
+        // Prune the replaced original's lines: with the pinned replace in
+        // force go never fetches or verifies the original, and `go mod tidy`
+        // prunes exactly these — writing the tidy-stable state up front keeps
+        // the first day-2 tidy a byte-level no-op. The removed lines ride in
+        // `original` so the ledger can restore them on revert.
+        if let Some((new, removed)) =
+            go_sum_edit::remove_exact_module_version_lines(&go_sum, &fname, &dep.version)
+        {
+            go_sum = new;
+            sum_changed = true;
+            result.edits.push(FileEdit {
+                path: "go.sum".into(),
+                kind: "redirect_golang_gosum_prune".into(),
+                action: "removed".into(),
+                key: Some(format!("{fname}@{}", dep.version)),
+                original: Some(Value::String(removed.join("\n"))),
+                new: None,
+            });
+        }
+    }
+
+    if mod_changed {
+        result.files.insert("go.mod".into(), go_mod);
+    }
+    if sum_changed {
+        result.files.insert("go.sum".into(), go_sum);
     }
 }
 
@@ -7990,5 +8305,405 @@ snapshots:
             "detail must name the file and the line endings: {}",
             r.warnings[0].detail
         );
+    }
+
+    // ── golang ───────────────────────────────────────────────────────────────
+
+    const GO_UUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
+    const GO_ZIP_H1: &str = "h1:mU9vN/n1hbXktM62lJ6MbRKOk3aI8NDH+szCf62RXtE=";
+    const GO_GOMOD_H1: &str = "h1:XgagPTRZSCprrzR+3Ro36/XJpibdovhAbsKThYI8bxg=";
+
+    fn golang_socket_module() -> String {
+        format!("patch.socket.dev/gopatch/{GO_UUID}")
+    }
+
+    /// A hosted golang reference for `github.com/foo/bar@v1.4.2`, patched
+    /// module published at `patch.socket.dev/gopatch/<uuid> v1.4.2-socketpatch.1`.
+    fn golang_override() -> DepOverride {
+        DepOverride {
+            ecosystem: "golang".into(),
+            name: "github.com/foo/bar".into(),
+            namespace: None,
+            version: "v1.4.2".into(),
+            token: String::new(),
+            patch_uuid: GO_UUID.into(),
+            artifact_url: format!(
+                "https://patch.socket.dev/patch-registry/golang/{}/@v/v1.4.2-socketpatch.1.zip",
+                golang_socket_module()
+            ),
+            berry_zip_url: None,
+            registry_override: Some(RegistryOverride {
+                kind: "goproxy".into(),
+                index_url: "https://patch.socket.dev/patch-registry/golang".into(),
+                identifiers: RegistryOverrideIdentifiers {
+                    name: "github.com/foo/bar".into(),
+                    version: "v1.4.2".into(),
+                    go_module_path: Some(golang_socket_module()),
+                    go_module_version: Some("v1.4.2-socketpatch.1".into()),
+                    ..Default::default()
+                },
+            }),
+            integrity: Integrity {
+                dirhash_h1: Some(GO_ZIP_H1.into()),
+                go_mod_h1: Some(GO_GOMOD_H1.into()),
+                ..Default::default()
+            },
+        }
+    }
+
+    fn golang_files() -> BTreeMap<String, String> {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "go.mod".to_string(),
+            "module example.com/app\n\ngo 1.21\n\nrequire github.com/foo/bar v1.4.2\n".to_string(),
+        );
+        files.insert(
+            "go.sum".to_string(),
+            "github.com/foo/bar v1.4.2 h1:UPSTREAM=\ngithub.com/foo/bar v1.4.2/go.mod h1:UPSTREAMM=\n".to_string(),
+        );
+        files
+    }
+
+    #[test]
+    fn golang_writes_replace_and_gosum_pair() {
+        let files = golang_files();
+        let ovr = golang_override();
+        let out = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+
+        assert!(out.warnings.is_empty(), "warnings: {:?}", out.warnings);
+        let go_mod = &out.files["go.mod"];
+        assert!(go_mod.contains(&format!(
+            "replace github.com/foo/bar v1.4.2 => {} v1.4.2-socketpatch.1",
+            golang_socket_module()
+        )));
+        assert!(
+            go_mod.contains("require github.com/foo/bar v1.4.2"),
+            "user content preserved"
+        );
+        let go_sum = &out.files["go.sum"];
+        assert!(go_sum.contains(&format!(
+            "{} v1.4.2-socketpatch.1 {GO_ZIP_H1}",
+            golang_socket_module()
+        )));
+        assert!(go_sum.contains(&format!(
+            "{} v1.4.2-socketpatch.1/go.mod {GO_GOMOD_H1}",
+            golang_socket_module()
+        )));
+        // The replaced original's lines are PRUNED (the tidy-stable state: go
+        // never fetches the fully-replaced version, and the first `go mod
+        // tidy` would remove exactly these lines otherwise).
+        assert!(!go_sum.contains("h1:UPSTREAM="));
+        let prune = out
+            .edits
+            .iter()
+            .find(|e| e.kind == "redirect_golang_gosum_prune")
+            .expect("prune edit recorded");
+        assert_eq!(prune.action, "removed");
+        assert!(
+            prune
+                .original
+                .as_ref()
+                .is_some_and(|o| o.as_str().unwrap_or_default().contains("h1:UPSTREAM=")),
+            "removed lines ride in `original` for revert"
+        );
+        // Replace + go.sum add + prune, informatively keyed.
+        assert_eq!(out.edits.len(), 3);
+        assert!(out.edits.iter().any(|e| e.path == "go.mod"
+            && e.kind == "redirect_golang_replace"
+            && e.key.as_deref() == Some("github.com/foo/bar")));
+        assert!(out
+            .edits
+            .iter()
+            .any(|e| e.path == "go.sum" && e.kind == "redirect_golang_gosum"));
+    }
+
+    #[test]
+    fn golang_second_pass_is_noop() {
+        let files = golang_files();
+        let ovr = golang_override();
+        let first = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        let mut again = files.clone();
+        again.extend(first.files.clone());
+        let second = rewrite_registry_redirect(&again, std::slice::from_ref(&ovr));
+        assert!(
+            second.files.is_empty() && second.edits.is_empty() && second.warnings.is_empty(),
+            "re-run must be a no-op: files={:?} edits={:?} warnings={:?}",
+            second.files.keys(),
+            second.edits,
+            second.warnings
+        );
+    }
+
+    #[test]
+    fn golang_creates_go_sum_when_absent() {
+        let mut files = golang_files();
+        files.remove("go.sum");
+        let ovr = golang_override();
+        let out = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        assert!(out.warnings.is_empty(), "warnings: {:?}", out.warnings);
+        let go_sum = &out.files["go.sum"];
+        assert_eq!(
+            go_sum.lines().count(),
+            2,
+            "fresh go.sum carries exactly the socket module's two lines"
+        );
+    }
+
+    #[test]
+    fn golang_without_override_falls_back_to_unsupported_warning() {
+        let files = golang_files();
+        let mut ovr = golang_override();
+        ovr.registry_override = None;
+        let out = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        assert!(out.files.is_empty() && out.edits.is_empty());
+        assert_eq!(out.warnings.len(), 1);
+        assert_eq!(out.warnings[0].code, "redirect_golang_unsupported");
+        assert!(out.warnings[0].detail.contains("socket-patch vendor"));
+    }
+
+    #[test]
+    fn golang_no_go_mod_warns_and_skips() {
+        let mut files = golang_files();
+        files.remove("go.mod");
+        let ovr = golang_override();
+        let out = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        assert!(out.files.is_empty());
+        assert_eq!(out.warnings[0].code, "redirect_golang_no_go_mod");
+    }
+
+    /// Both go.sum hashes are load-bearing: a replace committed without them
+    /// bricks every `-mod=readonly` build downstream. Missing either one must
+    /// fail closed — warning, zero file changes.
+    #[test]
+    fn golang_missing_either_hash_fails_closed() {
+        for strip in ["zip", "gomod"] {
+            let files = golang_files();
+            let mut ovr = golang_override();
+            match strip {
+                "zip" => ovr.integrity.dirhash_h1 = None,
+                _ => ovr.integrity.go_mod_h1 = None,
+            }
+            let out = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+            assert!(
+                out.files.is_empty() && out.edits.is_empty(),
+                "{strip}: must not write a partial redirect"
+            );
+            assert_eq!(out.warnings[0].code, "redirect_golang_missing_integrity");
+        }
+    }
+
+    #[test]
+    fn golang_malformed_hash_fails_closed() {
+        let files = golang_files();
+        let mut ovr = golang_override();
+        ovr.integrity.dirhash_h1 = Some("sha256:nope".into());
+        let out = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        assert!(out.files.is_empty());
+        assert_eq!(out.warnings[0].code, "redirect_golang_missing_integrity");
+    }
+
+    /// The hosted namespace prefix is the ONLY ownership signal a
+    /// module-to-module replace carries — a server handing us any other path
+    /// must be refused (we could never recognize or remove the directive).
+    #[test]
+    fn golang_module_path_outside_namespace_refused() {
+        let files = golang_files();
+        let mut ovr = golang_override();
+        ovr.registry_override
+            .as_mut()
+            .unwrap()
+            .identifiers
+            .go_module_path = Some("evil.example/gopatch/x".into());
+        let out = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        assert!(out.files.is_empty());
+        assert_eq!(
+            out.warnings[0].code,
+            "redirect_golang_untrusted_module_path"
+        );
+    }
+
+    /// `replace` is keyed on module+version and goes SILENTLY inert when the
+    /// graph resolves a different version (validated empirically) — writing
+    /// one against a mismatched require would claim protection it doesn't
+    /// deliver.
+    #[test]
+    fn golang_require_version_mismatch_skips() {
+        let mut files = golang_files();
+        files.insert(
+            "go.mod".to_string(),
+            "module example.com/app\n\ngo 1.21\n\nrequire github.com/foo/bar v1.5.0\n".to_string(),
+        );
+        let ovr = golang_override();
+        let out = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        assert!(out.files.is_empty());
+        assert_eq!(out.warnings[0].code, "redirect_golang_version_mismatch");
+        assert!(out.warnings[0].detail.contains("v1.5.0"));
+    }
+
+    /// A module NOT in the main go.mod's require block may still be resolved
+    /// (transitively) at the patched version — the cross-check only fires on a
+    /// positive mismatch, never on absence.
+    #[test]
+    fn golang_transitive_dep_absent_from_require_still_redirects() {
+        let mut files = golang_files();
+        files.insert(
+            "go.mod".to_string(),
+            "module example.com/app\n\ngo 1.21\n\nrequire example.com/direct v2.0.0\n".to_string(),
+        );
+        let ovr = golang_override();
+        let out = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        assert!(out.warnings.is_empty(), "warnings: {:?}", out.warnings);
+        assert!(out.files["go.mod"].contains("replace github.com/foo/bar v1.4.2 =>"));
+    }
+
+    #[test]
+    fn golang_user_authored_replace_conflict_warns() {
+        let mut files = golang_files();
+        files.insert(
+            "go.mod".to_string(),
+            "module example.com/app\n\ngo 1.21\n\nrequire github.com/foo/bar v1.4.2\n\nreplace github.com/foo/bar v1.4.2 => ../my-fork\n"
+                .to_string(),
+        );
+        let ovr = golang_override();
+        let out = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        assert!(out.files.is_empty(), "must not override the user's fork");
+        assert_eq!(out.warnings[0].code, "redirect_golang_replace_conflict");
+        // go.sum must not gain socket lines for a redirect that wasn't written.
+        assert!(out.edits.is_empty());
+    }
+
+    /// Mode takeover: a local `.socket/go-patches/` replace from `apply` is
+    /// rewritten in place to the hosted module — one directive, no duplicate.
+    #[test]
+    fn golang_takes_over_local_redirect_in_place() {
+        let mut files = golang_files();
+        files.insert(
+            "go.mod".to_string(),
+            "module example.com/app\n\ngo 1.21\n\nrequire github.com/foo/bar v1.4.2\n\nreplace github.com/foo/bar v1.4.2 => ./.socket/go-patches/github.com/foo/bar@v1.4.2\n"
+                .to_string(),
+        );
+        let ovr = golang_override();
+        let out = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        assert!(out.warnings.is_empty(), "warnings: {:?}", out.warnings);
+        let go_mod = &out.files["go.mod"];
+        assert!(!go_mod.contains("go-patches"), "local target gone");
+        assert_eq!(
+            go_mod.matches("replace github.com/foo/bar").count(),
+            1,
+            "exactly one directive for the module: {go_mod}"
+        );
+        // The takeover is recorded faithfully: the replaced local directive's
+        // text rides in `original` (the ledger is the only pre-redirect
+        // record), and the action says updated, not added.
+        let edit = out
+            .edits
+            .iter()
+            .find(|e| e.kind == "redirect_golang_replace")
+            .unwrap();
+        assert_eq!(edit.action, "updated");
+        assert!(
+            edit.original
+                .as_ref()
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| s.contains(".socket/go-patches/")),
+            "taken-over directive captured: {:?}",
+            edit.original
+        );
+    }
+
+    /// Server-controlled tokens with embedded whitespace would inject whole
+    /// directives into the line-oriented go.mod/go.sum — refuse them all.
+    #[test]
+    fn golang_whitespace_in_tokens_fails_closed() {
+        for (mutate, what) in [
+            (
+                Box::new(|o: &mut DepOverride| o.name = "github.com/foo/bar v0 => x".into())
+                    as Box<dyn Fn(&mut DepOverride)>,
+                "name",
+            ),
+            (
+                Box::new(|o: &mut DepOverride| o.version = "v1.4.2\nreplace evil".into()),
+                "version",
+            ),
+            (
+                Box::new(|o: &mut DepOverride| {
+                    o.registry_override
+                        .as_mut()
+                        .unwrap()
+                        .identifiers
+                        .go_module_version = Some("v1.0.0 h1:evil".into())
+                }),
+                "rhs version",
+            ),
+        ] {
+            let files = golang_files();
+            let mut ovr = golang_override();
+            mutate(&mut ovr);
+            let out = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+            assert!(
+                out.files.is_empty(),
+                "{what}: nothing may be written for a hostile token"
+            );
+            assert!(
+                out.warnings
+                    .iter()
+                    .any(|w| w.code == "redirect_golang_unsafe_coords"
+                        || w.code == "redirect_golang_version_mismatch"),
+                "{what}: expected a refusal warning, got {:?}",
+                out.warnings
+            );
+        }
+        // Hash with embedded newline: strict h1 shape refuses it.
+        let files = golang_files();
+        let mut ovr = golang_override();
+        ovr.integrity.dirhash_h1 = Some("h1:AAAA\nBBBB".into());
+        let out = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        assert!(out.files.is_empty());
+        assert_eq!(out.warnings[0].code, "redirect_golang_missing_integrity");
+    }
+
+    /// A committed socket pin whose version the graph no longer selects is
+    /// silently inert — the rewriter must reconcile it away (and its go.sum
+    /// lines), otherwise the stale module path keeps confirming the dep as
+    /// redirected while go links the unpatched version.
+    #[test]
+    fn golang_version_mismatch_reconciles_stale_pin() {
+        let mut files = golang_files();
+        files.insert(
+            "go.mod".to_string(),
+            format!(
+                "module example.com/app\n\ngo 1.21\n\nrequire github.com/foo/bar v1.5.0\n\n\
+                 replace github.com/foo/bar v1.4.2 => {} v1.4.2-socketpatch.1\n",
+                golang_socket_module()
+            ),
+        );
+        files.insert(
+            "go.sum".to_string(),
+            format!(
+                "{} v1.4.2-socketpatch.1 h1:{}\n",
+                golang_socket_module(),
+                "A".repeat(43) + "="
+            ),
+        );
+        let ovr = golang_override();
+        let out = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        assert_eq!(out.warnings[0].code, "redirect_golang_version_mismatch");
+        let go_mod = &out.files["go.mod"];
+        assert!(
+            !go_mod.contains("gopatch"),
+            "stale inert directive reconciled away: {go_mod}"
+        );
+        assert!(
+            !out.files["go.sum"].contains("gopatch"),
+            "stale go.sum lines reconciled away"
+        );
+        assert!(out
+            .edits
+            .iter()
+            .any(|e| e.kind == "redirect_golang_stale_replace_removed"
+                && e.original.as_ref().is_some_and(|v| v
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("v1.4.2-socketpatch.1"))));
     }
 }

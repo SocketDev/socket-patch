@@ -788,10 +788,7 @@ fn rollback_dispatch_branch_maven() {
     let fixture = RollbackFixture {
         purl: purl.to_string(),
         verify_file,
-        envs: vec![(
-            "MAVEN_REPO_LOCAL".to_string(),
-            repo.display().to_string(),
-        )],
+        envs: vec![("MAVEN_REPO_LOCAL".to_string(), repo.display().to_string())],
         global: false,
     };
     assert_rollback_restored(root, "maven", &fixture);

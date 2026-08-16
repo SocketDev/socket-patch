@@ -1,0 +1,23 @@
+[
+  {
+    "path": "go.mod",
+    "kind": "redirect_golang_replace",
+    "action": "added",
+    "key": "github.com/foo/bar",
+    "new": "replace github.com/foo/bar v1.4.2 => patch.socket.dev/gopatch/55555555-5555-5555-5555-555555555555 v1.4.2-socketpatch.1"
+  },
+  {
+    "path": "go.sum",
+    "kind": "redirect_golang_gosum",
+    "action": "added",
+    "key": "patch.socket.dev/gopatch/55555555-5555-5555-5555-555555555555@v1.4.2-socketpatch.1",
+    "new": "patch.socket.dev/gopatch/55555555-5555-5555-5555-555555555555 v1.4.2-socketpatch.1 h1:mU9vN/n1hbXktM62lJ6MbRKOk3aI8NDH+szCf62RXtE=\npatch.socket.dev/gopatch/55555555-5555-5555-5555-555555555555 v1.4.2-socketpatch.1/go.mod h1:XgagPTRZSCprrzR+3Ro36/XJpibdovhAbsKThYI8bxg="
+  },
+  {
+    "path": "go.sum",
+    "kind": "redirect_golang_gosum_prune",
+    "action": "removed",
+    "key": "github.com/foo/bar@v1.4.2",
+    "original": "github.com/foo/bar v1.4.2 h1:2l9cOKZSVXK6d5nzJoRDWXvUqAqLz0RmJdY6spCZ6q4=\ngithub.com/foo/bar v1.4.2/go.mod h1:o4QpFlOhKfazXNvOG5FLDBCyo/oOCcSwSPGMnLXG9e0="
+  }
+]

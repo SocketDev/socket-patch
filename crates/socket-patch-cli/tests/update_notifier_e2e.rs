@@ -132,8 +132,11 @@ async fn first_eligible_run_checks_and_notices() {
         .mount()
         .await;
 
-    let (code, stdout, stderr) =
-        run_installed(&install, &["apply"], &eligible_kit_await_fetch(&release.base_url));
+    let (code, stdout, stderr) = run_installed(
+        &install,
+        &["apply"],
+        &eligible_kit_await_fetch(&release.base_url),
+    );
     assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
     assert!(
         stderr.contains("Update available") && stderr.contains("9.9.9"),
@@ -196,8 +199,11 @@ async fn stale_state_rechecks() {
         .await;
     write_state(&install.state_dir, STALE, Some(CURRENT), None);
 
-    let (code, stdout, stderr) =
-        run_installed(&install, &["apply"], &eligible_kit_await_fetch(&release.base_url));
+    let (code, stdout, stderr) = run_installed(
+        &install,
+        &["apply"],
+        &eligible_kit_await_fetch(&release.base_url),
+    );
     assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
 
     let state = read_state(&install.state_dir);
@@ -225,8 +231,11 @@ async fn up_to_date_prints_nothing() {
         .await;
     write_state(&install.state_dir, STALE, Some(CURRENT), None);
 
-    let (code, _, stderr) =
-        run_installed(&install, &["apply"], &eligible_kit_await_fetch(&release.base_url));
+    let (code, _, stderr) = run_installed(
+        &install,
+        &["apply"],
+        &eligible_kit_await_fetch(&release.base_url),
+    );
     assert_eq!(code, 0);
     assert!(
         !stderr.contains("Update available"),
@@ -288,8 +297,11 @@ async fn corrupt_state_recovers() {
     )
     .unwrap();
 
-    let (code, stdout, stderr) =
-        run_installed(&install, &["apply"], &eligible_kit_await_fetch(&release.base_url));
+    let (code, stdout, stderr) = run_installed(
+        &install,
+        &["apply"],
+        &eligible_kit_await_fetch(&release.base_url),
+    );
     assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
     assert!(
         !stderr.contains("panicked"),
@@ -316,8 +328,11 @@ async fn future_timestamp_tolerated() {
         .await;
     write_state(&install.state_dir, -48 * HOUR, Some("9.9.9"), None);
 
-    let (code, stdout, stderr) =
-        run_installed(&install, &["apply"], &eligible_kit_await_fetch(&release.base_url));
+    let (code, stdout, stderr) = run_installed(
+        &install,
+        &["apply"],
+        &eligible_kit_await_fetch(&release.base_url),
+    );
     assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
     assert_install_pristine(&install);
 }
