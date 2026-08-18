@@ -1281,6 +1281,391 @@ async fn read_package_json_rejects_fifo_without_hanging() {
     );
 }
 
+// ── pnpm isolated-linker virtual store (.pnpm) ─────────────────
+
+/// Hand-build the tree `pnpm install` (isolated linker) produces for a
+/// project depending on mkdirp@0.5.5 (whose dep is minimist), plus a second
+/// minimist version and a scoped transitive package:
+///
+/// ```text
+/// node_modules/
+///   mkdirp -> .pnpm/mkdirp@0.5.5/node_modules/mkdirp   (direct dep)
+///   .pnpm/
+///     mkdirp@0.5.5/node_modules/
+///       mkdirp/                                        (real dir)
+///       minimist -> ../../minimist@1.2.8/node_modules/minimist
+///     minimist@1.2.8/node_modules/minimist/            (real dir)
+///     minimist@0.0.8/node_modules/minimist/            (real dir)
+///     @scope+leaf@2.0.0/node_modules/@scope/leaf/      (real dir)
+///     node_modules/                                    (internal hoist dir)
+///     .hidden-meta@1.0.0/…                             (store metadata)
+/// ```
+///
+/// minimist (both versions) and @scope/leaf are *transitive-only*: their
+/// sole physical home is the hidden `.pnpm` virtual store, with no
+/// importer-root entry at all — yet they are runtime-loaded. Decoy packages
+/// are planted where the traversal must NOT look (the internal hoist dir,
+/// a hidden store child) so a policy regression turns the tests red.
+#[cfg(unix)]
+async fn stage_pnpm_isolated_tree(root: &Path) -> std::path::PathBuf {
+    use std::os::unix::fs::symlink;
+
+    let nm = root.join("node_modules");
+    let store = nm.join(".pnpm");
+
+    stage_npm_pkg(
+        &store.join("mkdirp@0.5.5").join("node_modules"),
+        "mkdirp",
+        "0.5.5",
+    )
+    .await;
+    stage_npm_pkg(
+        &store.join("minimist@1.2.8").join("node_modules"),
+        "minimist",
+        "1.2.8",
+    )
+    .await;
+    stage_npm_pkg(
+        &store.join("minimist@0.0.8").join("node_modules"),
+        "minimist",
+        "0.0.8",
+    )
+    .await;
+    stage_npm_pkg(
+        &store.join("@scope+leaf@2.0.0").join("node_modules"),
+        "@scope/leaf",
+        "2.0.0",
+    )
+    .await;
+
+    // mkdirp's dependency: a sibling symlink inside its own store entry.
+    symlink(
+        store.join("minimist@1.2.8/node_modules/minimist"),
+        store.join("mkdirp@0.5.5/node_modules/minimist"),
+    )
+    .unwrap();
+
+    // Importer root: the direct dep is a symlink into the store.
+    symlink(
+        store.join("mkdirp@0.5.5/node_modules/mkdirp"),
+        nm.join("mkdirp"),
+    )
+    .unwrap();
+
+    // pnpm's internal hoist dir `.pnpm/node_modules`: symlinks into sibling
+    // entries. A REAL decoy package is planted where the traversal would
+    // land if the hoist-dir skip were dropped.
+    let hoist = store.join("node_modules");
+    tokio::fs::create_dir_all(&hoist).await.unwrap();
+    symlink(
+        store.join("minimist@1.2.8/node_modules/minimist"),
+        hoist.join("minimist"),
+    )
+    .unwrap();
+    stage_npm_pkg(&hoist.join("node_modules"), "hoist-decoy", "9.9.9").await;
+
+    // Hidden store child (metadata): must never be probed.
+    stage_npm_pkg(
+        &store.join(".hidden-meta@1.0.0").join("node_modules"),
+        "hidden-decoy",
+        "9.9.9",
+    )
+    .await;
+    // A plain file at the store top level (pnpm writes lock.yaml here).
+    tokio::fs::write(store.join("lock.yaml"), b"lockfileVersion: 9\n")
+        .await
+        .unwrap();
+
+    nm
+}
+
+/// Regression (pnpm 7–12, empirically confirmed): a transitive-only
+/// dependency living solely at `.pnpm/<x>/node_modules/<name>` was invisible
+/// to `find_by_purls` — apply reported `package_not_installed` for a package
+/// that is installed and runtime-loaded. The virtual store must be probed;
+/// the name@version match keeps two store versions of one package distinct;
+/// the root-linked direct dep must still resolve at its importer-root path
+/// (BFS root-first); and the hoist-dir/hidden decoys must stay unreachable.
+#[cfg(unix)]
+#[tokio::test]
+#[serial_test::parallel]
+async fn find_by_purls_resolves_pnpm_virtual_store_transitives() {
+    let tmp = tempfile::tempdir().unwrap();
+    let nm = stage_pnpm_isolated_tree(tmp.path()).await;
+    let store = nm.join(".pnpm");
+
+    let crawler = NpmCrawler;
+    let purls = vec![
+        "pkg:npm/mkdirp@0.5.5".to_string(),
+        "pkg:npm/minimist@1.2.8".to_string(),
+        "pkg:npm/minimist@0.0.8".to_string(),
+        "pkg:npm/@scope/leaf@2.0.0".to_string(),
+        "pkg:npm/hoist-decoy@9.9.9".to_string(),
+        "pkg:npm/hidden-decoy@9.9.9".to_string(),
+    ];
+    let result = crawler.find_by_purls(&nm, &purls).await.unwrap();
+
+    // The direct dep resolves at the importer root (probed before any
+    // .pnpm entry is dequeued), not at its store home.
+    let mkdirp = result
+        .get("pkg:npm/mkdirp@0.5.5")
+        .expect("root-linked direct dep must resolve");
+    assert_eq!(
+        mkdirp.path,
+        nm.join("mkdirp"),
+        "root-linked install must win over the store copy"
+    );
+
+    // Transitive-only: reachable only via the virtual store. It may be
+    // found through mkdirp's sibling symlink or its own store entry —
+    // both name the same physical package.
+    let m1 = result
+        .get("pkg:npm/minimist@1.2.8")
+        .expect("transitive-only minimist@1.2.8 must resolve via .pnpm");
+    assert_eq!(
+        std::fs::canonicalize(&m1.path).unwrap(),
+        std::fs::canonicalize(store.join("minimist@1.2.8/node_modules/minimist")).unwrap(),
+        "resolved path must be the store's physical minimist@1.2.8"
+    );
+
+    // Second store version of the same package stays distinct.
+    let m0 = result
+        .get("pkg:npm/minimist@0.0.8")
+        .expect("second store version must resolve independently");
+    assert_eq!(
+        m0.path,
+        store.join("minimist@0.0.8/node_modules/minimist"),
+        "version match must bind each purl to its own store entry"
+    );
+
+    // Scoped transitive-only package.
+    let leaf = result
+        .get("pkg:npm/@scope/leaf@2.0.0")
+        .expect("scoped transitive-only package must resolve via .pnpm");
+    assert_eq!(
+        leaf.path,
+        store.join("@scope+leaf@2.0.0/node_modules/@scope/leaf")
+    );
+
+    // The hoist dir and hidden store children are never probed.
+    assert!(
+        !result.contains_key("pkg:npm/hoist-decoy@9.9.9"),
+        "`.pnpm/node_modules` (internal hoist dir) must not be probed"
+    );
+    assert!(
+        !result.contains_key("pkg:npm/hidden-decoy@9.9.9"),
+        "hidden store children must not be probed"
+    );
+    assert_eq!(result.len(), 4, "exactly the four real packages resolve");
+}
+
+/// Scan twin of the resolver regression: `crawl_all` skipped `.pnpm` as
+/// just-another-hidden-dir, so a transitive-only install never reached the
+/// batch API request. Each package must be inventoried exactly once (the
+/// root pass wins the `seen` dedup for the root-linked direct dep; store
+/// entries are accepted only as real dirs so a sibling symlink cannot
+/// double-count), both store versions surface, and the decoys stay out.
+#[cfg(unix)]
+#[tokio::test]
+#[serial_test::parallel]
+async fn crawl_all_inventories_pnpm_virtual_store_exactly_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let nm = stage_pnpm_isolated_tree(tmp.path()).await;
+    let store = nm.join(".pnpm");
+
+    let crawler = NpmCrawler;
+    let result = crawler.crawl_all(&options_at(tmp.path())).await;
+
+    let purls: Vec<&str> = result.iter().map(|p| p.purl.as_str()).collect();
+    assert_eq!(
+        result.len(),
+        4,
+        "exactly the four real packages, each once — no symlink double-hits, \
+         no hoist/hidden decoys; got {purls:?}"
+    );
+
+    let by_purl = |purl: &str| -> &socket_patch_core::crawlers::types::CrawledPackage {
+        result
+            .iter()
+            .find(|p| p.purl == purl)
+            .unwrap_or_else(|| panic!("{purl} must be inventoried; got {purls:?}"))
+    };
+
+    // Root-linked direct dep is recorded at its importer-root path (the
+    // root pass runs before the deferred store pass).
+    assert_eq!(by_purl("pkg:npm/mkdirp@0.5.5").path, nm.join("mkdirp"));
+    // Transitive-only packages are recorded at their physical store homes.
+    assert_eq!(
+        by_purl("pkg:npm/minimist@1.2.8").path,
+        store.join("minimist@1.2.8/node_modules/minimist"),
+        "store entry must be recorded at its real dir, not a sibling symlink"
+    );
+    assert_eq!(
+        by_purl("pkg:npm/minimist@0.0.8").path,
+        store.join("minimist@0.0.8/node_modules/minimist")
+    );
+    let leaf = by_purl("pkg:npm/@scope/leaf@2.0.0");
+    assert_eq!(leaf.namespace.as_deref(), Some("@scope"));
+    assert_eq!(
+        leaf.path,
+        store.join("@scope+leaf@2.0.0/node_modules/@scope/leaf")
+    );
+}
+
+/// Perf/scope pin: with a pending target, `find_by_purls` enqueues only
+/// `.pnpm` store entries whose dir name decodes to a PENDING package name
+/// (a manifest routinely lists packages that simply aren't installed, and
+/// probing a large monorepo store for them would be a readdir+stat storm
+/// on every apply/rollback). Observable via a decoy: a store entry whose
+/// *inner* package matches the requested name@version, but whose entry
+/// name decodes to a different package, must never be probed — the result
+/// set is unchanged by its presence.
+#[tokio::test]
+#[serial_test::parallel]
+async fn find_by_purls_skips_pnpm_store_entry_decoding_to_non_pending_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let nm = tmp.path().join("node_modules");
+    let store = nm.join(".pnpm");
+
+    // Entry advertises `decoy@1.0.0`, but its node_modules holds a package
+    // that would match the pending target `wanted@1.0.0` if probed.
+    stage_npm_pkg(
+        &store.join("decoy@1.0.0").join("node_modules"),
+        "wanted",
+        "1.0.0",
+    )
+    .await;
+    // Scoped twin.
+    stage_npm_pkg(
+        &store.join("@other+decoy@1.0.0").join("node_modules"),
+        "@s/wanted",
+        "1.0.0",
+    )
+    .await;
+
+    let crawler = NpmCrawler;
+    let purls = vec![
+        "pkg:npm/wanted@1.0.0".to_string(),
+        "pkg:npm/@s/wanted@1.0.0".to_string(),
+    ];
+    let result = crawler.find_by_purls(&nm, &purls).await.unwrap();
+
+    assert!(
+        result.is_empty(),
+        "store entries decoding to non-pending names must not be probed; \
+         got {result:?}"
+    );
+}
+
+/// The name filter's positive half: an entry whose (peer-suffixed) dir
+/// name decodes to a pending target's name IS enqueued and its package
+/// resolves. Uses a pnpm-9 paren peer suffix so the decode path — not a
+/// literal string match — is what admits the entry.
+#[tokio::test]
+#[serial_test::parallel]
+async fn find_by_purls_resolves_pnpm_store_entry_with_peer_suffix() {
+    let tmp = tempfile::tempdir().unwrap();
+    let nm = tmp.path().join("node_modules");
+    let store = nm.join(".pnpm");
+
+    let entry_nm = store.join("wanted@1.0.0(peer@2.0.0)").join("node_modules");
+    stage_npm_pkg(&entry_nm, "wanted", "1.0.0").await;
+
+    let crawler = NpmCrawler;
+    let result = crawler
+        .find_by_purls(&nm, &["pkg:npm/wanted@1.0.0".to_string()])
+        .await
+        .unwrap();
+
+    let pkg = result
+        .get("pkg:npm/wanted@1.0.0")
+        .expect("peer-suffixed store entry for a pending name must be probed");
+    assert_eq!(pkg.path, entry_nm.join("wanted"));
+}
+
+/// The conservative fallback: pnpm truncates over-long dir names (the cut
+/// can land anywhere) and appends `_<hash>`, so such an entry's identity
+/// is unknowable from its name — it must STAY probeable, and a pending
+/// target living inside it must resolve.
+#[tokio::test]
+#[serial_test::parallel]
+async fn find_by_purls_probes_undecodable_pnpm_store_entry() {
+    let tmp = tempfile::tempdir().unwrap();
+    let nm = tmp.path().join("node_modules");
+    let store = nm.join(".pnpm");
+
+    // No `@X.Y.Z` tail survives the `_<hash>` strip → undecodable.
+    let entry_nm = store
+        .join("wanted-with-a-very-long-truncated_abc123def456")
+        .join("node_modules");
+    stage_npm_pkg(&entry_nm, "wanted2", "1.0.0").await;
+
+    let crawler = NpmCrawler;
+    let result = crawler
+        .find_by_purls(&nm, &["pkg:npm/wanted2@1.0.0".to_string()])
+        .await
+        .unwrap();
+
+    let pkg = result
+        .get("pkg:npm/wanted2@1.0.0")
+        .expect("undecodable (truncated/hash-suffixed) store entries must remain probeable");
+    assert_eq!(pkg.path, entry_nm.join("wanted2"));
+}
+
+/// The store pass skips re-reading a root-linked direct dep's own
+/// package.json (its decoded name@version already won the `seen` dedup at
+/// the importer root), but must still walk INTO the entry: bundled
+/// dependencies are real dirs nested inside the package itself, physically
+/// present only there.
+#[cfg(unix)]
+#[tokio::test]
+#[serial_test::parallel]
+async fn crawl_all_inventories_bundled_dep_under_seen_store_entry() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let nm = tmp.path().join("node_modules");
+    let store = nm.join(".pnpm");
+
+    let host_store_nm = store.join("host@1.0.0").join("node_modules");
+    stage_npm_pkg(&host_store_nm, "host", "1.0.0").await;
+    // Bundled dep: a REAL dir inside the package's own node_modules.
+    stage_npm_pkg(
+        &host_store_nm.join("host").join("node_modules"),
+        "bundled",
+        "3.3.3",
+    )
+    .await;
+    // Root-linked direct dep (importer pass inventories it first).
+    symlink(host_store_nm.join("host"), nm.join("host")).unwrap();
+
+    let crawler = NpmCrawler;
+    let result = crawler.crawl_all(&options_at(tmp.path())).await;
+
+    let host = result
+        .iter()
+        .find(|p| p.name == "host")
+        .expect("root-linked host must be inventoried");
+    assert_eq!(
+        host.path,
+        nm.join("host"),
+        "importer-root path wins the seen dedup"
+    );
+    let bundled = result
+        .iter()
+        .find(|p| p.name == "bundled")
+        .expect("bundled dep must be inventoried via the store walk even when its host's identity is already seen");
+    assert_eq!(
+        bundled.path,
+        host_store_nm
+            .join("host")
+            .join("node_modules")
+            .join("bundled")
+    );
+    let names: Vec<&str> = result.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(result.len(), 2, "exactly host + bundled; got {names:?}");
+}
+
 /// When the same `name@version` exists at the root *and* nested, the root
 /// copy must win (shallowest-first), preserving the pre-existing behavior
 /// for everything resolvable at the root.

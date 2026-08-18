@@ -300,6 +300,163 @@ async fn pnpm_install_then_apply_patches_file() {
 }
 
 // ---------------------------------------------------------------------------
+// pnpm isolated linker: transitive-only dependency in the virtual store
+// ---------------------------------------------------------------------------
+
+/// Under pnpm's isolated linker a *transitive-only* dependency has no
+/// importer-root entry at all: `node_modules/<dep>` does not exist, and the
+/// only physical install lives at `node_modules/.pnpm/<x>/node_modules/<dep>`
+/// — runtime-loaded, yet invisible to any walk that skips the hidden `.pnpm`
+/// virtual store (apply reported `package_not_installed` on pnpm 7–12).
+/// mkdirp@0.5.5 depends on minimist, giving a real pnpm install with exactly
+/// that shape. Apply must resolve minimist inside the store and patch the
+/// canonical file — while a sibling project sharing the same store stays
+/// pristine: the file is hardlink-imported, so only a CoW break (not an
+/// in-place write) keeps the store and every other consumer untouched.
+#[tokio::test]
+#[serial]
+async fn pnpm_transitive_only_dep_apply_patches_virtual_store() {
+    if !has("pnpm") {
+        println!("SKIP: pnpm not on PATH");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = tmp.path().join("store");
+
+    let stage_project = |name: &str| -> std::path::PathBuf {
+        let proj = tmp.path().join(name);
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(
+            proj.join("package.json"),
+            format!(
+                r#"{{ "name": "{name}", "version": "0.0.0", "dependencies": {{ "mkdirp": "0.5.5" }} }}"#
+            ),
+        )
+        .unwrap();
+        proj
+    };
+    let proj_a = stage_project("pnpm-iso-a");
+    let proj_b = stage_project("pnpm-iso-b");
+
+    for proj in [&proj_a, &proj_b] {
+        // Both projects share one store; hardlink import (instead of the
+        // APFS-clone default) makes each project file share the store
+        // file's inode — the layout the CoW assertions below are about.
+        // CLI flags, not project `.npmrc`: pnpm 11 no longer reads these
+        // settings from `.npmrc` (silently — config get returns undefined).
+        let out = pm_command("pnpm", &["npm_config_"])
+            .args([
+                "install",
+                "--silent",
+                "--no-frozen-lockfile",
+                "--store-dir",
+                store.to_str().unwrap(),
+                "--config.package-import-method=hardlink",
+            ])
+            .current_dir(proj)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .expect("pnpm install");
+        if !out.status.success() {
+            println!(
+                "SKIP: pnpm install failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+    }
+
+    // Premise: minimist is transitive-only — no importer-root entry (not
+    // even a symlink). If pnpm ever hoisted it, this test would silently
+    // stop exercising the virtual-store path and must say so.
+    assert!(
+        std::fs::symlink_metadata(proj_a.join("node_modules/minimist")).is_err(),
+        "pnpm test premise broken: minimist appeared at the importer root; \
+         the transitive-only virtual-store path is not being exercised"
+    );
+
+    // The lock-resolved minimist lives next to the real mkdirp inside its
+    // own store entry; canonicalize resolves that (possibly symlinked)
+    // sibling to its physical store home.
+    let locate = |proj: &Path| -> std::path::PathBuf {
+        let mkdirp_real =
+            std::fs::canonicalize(proj.join("node_modules/mkdirp")).expect("canonicalize mkdirp");
+        std::fs::canonicalize(mkdirp_real.parent().unwrap().join("minimist"))
+            .expect("minimist must be installed beside mkdirp in its store entry")
+    };
+    let minimist_a = locate(&proj_a);
+    assert!(
+        minimist_a.components().any(|c| c.as_os_str() == ".pnpm"),
+        "premise: minimist's canonical home must be inside the virtual store: {minimist_a:?}"
+    );
+    let meta: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(minimist_a.join("package.json")).unwrap()).unwrap();
+    let version = meta["version"].as_str().expect("version field").to_string();
+
+    let target = minimist_a.join("index.js");
+    let original = std::fs::read(&target).expect("read minimist index.js");
+    let before_hash = git_sha256(&original);
+    let mut patched = original.clone();
+    patched.extend_from_slice(b"\n// SOCKET-PATCH-PNPM-TRANSITIVE-MARKER\n");
+    let after_hash = git_sha256(&patched);
+
+    // The sibling project's canonical copy of the same file.
+    let target_b = locate(&proj_b).join("index.js");
+    assert_eq!(
+        std::fs::read(&target_b).unwrap(),
+        original,
+        "both projects must start from identical store-imported bytes"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().ino(),
+            std::fs::metadata(&target_b).unwrap().ino(),
+            "hardlink-import premise: both projects' copies must share the store inode"
+        );
+    }
+
+    let socket = proj_a.join(".socket");
+    write_manifest(
+        &socket,
+        &format!("pkg:npm/minimist@{version}"),
+        &before_hash,
+        &after_hash,
+    );
+    let blobs = socket.join("blobs");
+    std::fs::create_dir_all(&blobs).unwrap();
+    std::fs::write(blobs.join(&after_hash), &patched).unwrap();
+
+    let code = apply_run(default_apply(&proj_a)).await;
+    assert_eq!(
+        code, 0,
+        "apply must resolve the transitive-only dep inside .pnpm and succeed"
+    );
+    assert_patched(&target, &patched, &before_hash, &after_hash);
+
+    // CoW safety: the sibling project sharing the store is untouched, and
+    // the patched file no longer shares the store inode.
+    let after_b = std::fs::read(&target_b).unwrap();
+    assert_eq!(
+        git_sha256(&after_b),
+        before_hash,
+        "sibling project sharing the store must keep the original bytes"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        assert_ne!(
+            std::fs::metadata(&target).unwrap().ino(),
+            std::fs::metadata(&target_b).unwrap().ino(),
+            "apply must break the hardlink (CoW) instead of writing through the store inode"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Monorepo workspace (npm workspaces)
 // ---------------------------------------------------------------------------
 

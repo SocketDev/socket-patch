@@ -90,6 +90,70 @@ pub fn build_npm_purl(namespace: Option<&str>, name: &str, version: &str) -> Str
 }
 
 // ---------------------------------------------------------------------------
+// Helper: decode a pnpm virtual-store entry directory name
+// ---------------------------------------------------------------------------
+
+/// Decode a `.pnpm` virtual-store entry directory name into the
+/// `(package_name, version)` it advertises.
+///
+/// Store entry names follow `<escaped-name>@<version><suffix>` where:
+/// - a scoped name's `/` is written as `+` (`@scope+leaf@2.0.0`),
+/// - pnpm 9+ appends peer/qualifier suffixes in parentheses
+///   (`foo@1.0.0(bar@2.0.0)(@babel+core@7.21.0)`),
+/// - pnpm 6–8 appended peer suffixes after `_` (`foo@1.0.0_bar@2.0.0`),
+/// - over-long names are truncated (the cut can land ANYWHERE, even
+///   mid-name or mid-version) and end in `_<hash>`.
+///
+/// Returns `None` for anything that does not cleanly parse as
+/// `name@X.Y.Z…`: store metadata files (`lock.yaml`), git/URL dependency
+/// entries (`foo@github.com+user+repo@<sha>` — a sha is not a semver
+/// triple), truncated long-name dirs, and names containing a literal `_`
+/// (indistinguishable from a legacy peer suffix). Callers MUST treat
+/// `None` as "identity unknowable from the dir name", not "no package
+/// here", and keep such entries probeable/scannable. A `Some` can still
+/// be a truncation artifact (a cut that happens to land after a
+/// `name@X.Y.Z` prefix is undetectable), so the decoded pair is
+/// advisory: resolution authority stays with the package.json probe.
+pub fn decode_pnpm_store_entry_name(entry_name: &str) -> Option<(String, String)> {
+    // pnpm 9+ peer/qualifier suffix: everything from the first `(`.
+    let base = &entry_name[..entry_name.find('(').unwrap_or(entry_name.len())];
+    // Legacy (pnpm 6–8) `_` peer suffix, doubling as the long-name
+    // truncation hash separator. Real package names may contain `_` too
+    // — those then fail the version parse below and fall to the
+    // conservative `None` path, which is the safe direction.
+    let base = &base[..base.find('_').unwrap_or(base.len())];
+
+    let at = base.rfind('@')?;
+    // `at == 0` would leave an empty name (`@1.0.0`).
+    if at == 0 {
+        return None;
+    }
+    let version = &base[at + 1..];
+    if !is_semver_triple(version) {
+        return None;
+    }
+    // Scope escaping: `/` in the (possibly scoped) name is written `+`.
+    // `+` cannot appear in a real npm name, so a bare replace is exact.
+    let name = base[..at].replace('+', "/");
+    Some((name, version.to_string()))
+}
+
+/// Whether `v` starts with a numeric `MAJOR.MINOR.PATCH` triple
+/// (pre-release/build tails allowed). Registry versions — the only kind
+/// pnpm writes into decodable store entry names — always do; git shas
+/// and URL fragments never do, so requiring the triple keeps those
+/// entries on `decode_pnpm_store_entry_name`'s conservative `None` path.
+fn is_semver_triple(v: &str) -> bool {
+    let mut parts = v.splitn(3, '.');
+    let (Some(major), Some(minor), Some(rest)) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    let patch = &rest[..rest.find(['-', '+']).unwrap_or(rest.len())];
+    let all_digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    all_digits(major) && all_digits(minor) && all_digits(patch)
+}
+
+// ---------------------------------------------------------------------------
 // Global prefix detection helpers
 // ---------------------------------------------------------------------------
 
@@ -276,6 +340,28 @@ fn find_node_dirs_sync(base: &Path, segments: &[&str]) -> Vec<PathBuf> {
 /// NPM ecosystem crawler for discovering packages in `node_modules`.
 pub struct NpmCrawler;
 
+/// Which kind of `node_modules` directory a scan pass is walking — the one
+/// traversal-policy bit that differs between them.
+#[derive(Clone, Copy)]
+enum ScanPolicy<'a> {
+    /// An importer's or package's `node_modules`: symlinked entries are
+    /// recorded (pnpm links direct deps; `npm link` targets) but never
+    /// traversed into, and a `.pnpm` child is the virtual store, scanned
+    /// in a deferred pass.
+    Importer,
+    /// One pnpm virtual-store entry's `node_modules`: only REAL
+    /// directories are inventoried — a symlinked entry here is the
+    /// package's dependency pointing at a sibling `.pnpm` store entry,
+    /// which is inventoried via that entry; following it would record the
+    /// same package under a path owned by a different store entry.
+    /// `identity_seen` optionally carries the entry's own package name
+    /// (what the store dir name decodes to) when its name@version is
+    /// already inventoried — the importer pass wins the `seen` dedup for
+    /// every root-linked direct dep — so that child's package.json is not
+    /// read a second time; everything below it is still scanned.
+    StoreEntry { identity_seen: Option<&'a str> },
+}
+
 impl NpmCrawler {
     /// Create a new `NpmCrawler`.
     pub fn new() -> Self {
@@ -316,7 +402,7 @@ impl NpmCrawler {
             .unwrap_or_default();
 
         for nm_path in &nm_paths {
-            let found = Self::scan_node_modules(nm_path, &mut seen).await;
+            let found = Self::scan_node_modules(nm_path, &mut seen, ScanPolicy::Importer).await;
             packages.extend(found);
         }
 
@@ -429,7 +515,13 @@ impl NpmCrawler {
             }
             pending = unresolved;
             if !pending.is_empty() {
-                Self::collect_nested_node_modules(&nm_path, &mut queue).await;
+                // The still-unresolved names bound which `.pnpm` store
+                // entries are worth enqueuing (see the store branch of
+                // `collect_nested_node_modules`). Rebuilt per level:
+                // targets resolved at shallower depths drop out.
+                let pending_names: HashSet<&str> =
+                    pending.iter().map(|t| t.dir_key.as_str()).collect();
+                Self::collect_nested_node_modules(&nm_path, &pending_names, &mut queue).await;
             }
         }
 
@@ -441,11 +533,62 @@ impl NpmCrawler {
     /// Mirrors `scan_node_modules`' traversal policy: hidden entries are
     /// skipped and symlinked packages are never traversed — a symlink here
     /// points into pnpm's content-addressed store or an `npm link` target
-    /// outside the project.
-    async fn collect_nested_node_modules(nm_path: &Path, queue: &mut VecDeque<PathBuf>) {
+    /// outside the project. The one exception is pnpm's `.pnpm` virtual
+    /// store (see below); `pending_names` — the still-unresolved targets'
+    /// full package names — bounds which store entries get enqueued.
+    async fn collect_nested_node_modules(
+        nm_path: &Path,
+        pending_names: &HashSet<&str>,
+        queue: &mut VecDeque<PathBuf>,
+    ) {
         for entry in crate::utils::fs::list_dir_entries(nm_path).await {
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
+            // pnpm's virtual store. Under the isolated linker the store is
+            // the ONLY physical home of transitive dependencies: the
+            // importer's node_modules holds symlinks for direct deps only,
+            // so a transitive-only target (installed at
+            // `.pnpm/<x>/node_modules/<name>`, runtime-loaded) is
+            // unreachable through the symlink-free walk above — invisible
+            // to apply despite being importable. Probe REAL store entries'
+            // `node_modules`; the name+version match in `find_by_purls`
+            // keeps aliases and multi-version store entries distinct, and
+            // BFS order guarantees a root-linked install has already been
+            // probed (and removed from `pending`) before these are
+            // dequeued, so a package is never resolved twice.
+            if name_str == ".pnpm" {
+                let Some(file_type) = crate::utils::fs::entry_file_type(&entry).await else {
+                    continue;
+                };
+                if !file_type.is_dir() {
+                    continue;
+                }
+                let store_path = nm_path.join(&name);
+                for (entry_name, entry_nm) in Self::list_pnpm_store_entries(&store_path).await {
+                    // Enqueue only entries that can still hold a pending
+                    // target. A manifest routinely lists packages that
+                    // simply aren't installed here, and probing every
+                    // entry of a large monorepo store for them would add
+                    // a readdir+stat storm to every apply/rollback run.
+                    // The dir name advertises the entry's package, so
+                    // filter by PENDING NAME only — the version is
+                    // deliberately NOT matched at this stage (dir-name
+                    // versions can carry peer/build decorations; the
+                    // package.json probe stays the authority). An
+                    // undecodable name (truncated/hash-suffixed dirs,
+                    // git/URL deps, `_`-bearing names) reveals nothing
+                    // about what's inside, so it stays probeable.
+                    if let Some((entry_pkg, _version)) = decode_pnpm_store_entry_name(&entry_name) {
+                        if !pending_names.contains(entry_pkg.as_str()) {
+                            continue;
+                        }
+                    }
+                    if is_dir(&entry_nm).await {
+                        queue.push_back(entry_nm);
+                    }
+                }
+                continue;
+            }
             if name_str.starts_with('.') || name_str == "node_modules" {
                 continue;
             }
@@ -616,17 +759,45 @@ impl NpmCrawler {
     // ------------------------------------------------------------------
 
     /// Scan a `node_modules` directory, returning all valid packages found.
-    /// Recurses into each package's own nested `node_modules`.
+    /// Recurses into each package's own nested `node_modules`. The one
+    /// policy bit distinguishing an importer/package tree from a pnpm
+    /// virtual-store entry is carried by [`ScanPolicy`].
     fn scan_node_modules<'a>(
         node_modules_path: &'a Path,
         seen: &'a mut HashSet<String>,
+        policy: ScanPolicy<'a>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<CrawledPackage>> + 'a>> {
         Box::pin(async move {
             let mut results = Vec::new();
+            let mut pnpm_store: Option<PathBuf> = None;
+            let (store_entry, identity_seen) = match policy {
+                ScanPolicy::Importer => (false, None),
+                ScanPolicy::StoreEntry { identity_seen } => (true, identity_seen),
+            };
 
             for entry in crate::utils::fs::list_dir_entries(node_modules_path).await {
                 let name = entry.file_name();
                 let name_str = name.to_string_lossy().to_string();
+
+                // pnpm's virtual store: under the isolated linker it is the
+                // ONLY physical home of transitive dependencies (the
+                // importer's node_modules symlinks direct deps only), so
+                // skipping it as just-another-hidden-dir leaves every
+                // transitive-only install invisible to scan. Deferred until
+                // after this loop so root-level entries are inventoried
+                // first and win the `seen` name@version dedup at their
+                // importer-root paths. (A store entry's own children never
+                // include a nested `.pnpm`; under `StoreEntry` policy the
+                // name falls through to the hidden-entry skip below.)
+                if !store_entry && name_str == ".pnpm" {
+                    let Some(file_type) = crate::utils::fs::entry_file_type(&entry).await else {
+                        continue;
+                    };
+                    if file_type.is_dir() {
+                        pnpm_store = Some(node_modules_path.join(&name_str));
+                    }
+                    continue;
+                }
 
                 // Skip hidden files and node_modules
                 if name_str.starts_with('.') || name_str == "node_modules" {
@@ -637,8 +808,15 @@ impl NpmCrawler {
                     continue;
                 };
 
-                // Allow both directories and symlinks (pnpm uses symlinks)
-                if !file_type.is_dir() && !file_type.is_symlink() {
+                // Importer trees allow both directories and symlinks (pnpm
+                // links direct deps); a store entry accepts REAL dirs only
+                // (see `ScanPolicy::StoreEntry`).
+                let acceptable = if store_entry {
+                    file_type.is_dir()
+                } else {
+                    file_type.is_dir() || file_type.is_symlink()
+                };
+                if !acceptable {
                     continue;
                 }
 
@@ -646,36 +824,126 @@ impl NpmCrawler {
 
                 if name_str.starts_with('@') {
                     // Scoped packages
-                    let scoped = Self::scan_scoped_packages(&entry_path, seen).await;
+                    let scoped = Self::scan_scoped_packages(&entry_path, seen, policy).await;
                     results.extend(scoped);
                 } else {
-                    // Regular package
-                    if let Some(pkg) = Self::check_package(&entry_path, seen).await {
-                        results.push(pkg);
+                    // Regular package. `identity_seen` marks this exact dir
+                    // as already inventoried by the importer pass — skip
+                    // the redundant package.json read, but still descend
+                    // below: bundled dependencies are real dirs nested
+                    // inside the package itself (pnpm cannot link them
+                    // out), physically present only here.
+                    if identity_seen != Some(name_str.as_str()) {
+                        if let Some(pkg) = Self::check_package(&entry_path, seen).await {
+                            results.push(pkg);
+                        }
                     }
                     // Recurse into nested node_modules only for real
                     // directories (not symlinks). Following a symlink here
                     // would walk into pnpm's content-addressed store (or an
                     // `npm link` target outside the project).
                     if file_type.is_dir() {
-                        let nested =
-                            Self::scan_node_modules(&entry_path.join("node_modules"), seen).await;
+                        let nested = Self::scan_node_modules(
+                            &entry_path.join("node_modules"),
+                            seen,
+                            ScanPolicy::Importer,
+                        )
+                        .await;
                         results.extend(nested);
                     }
                 }
+            }
+
+            if let Some(store_path) = pnpm_store {
+                let found = Self::scan_pnpm_virtual_store(&store_path, seen).await;
+                results.extend(found);
             }
 
             results
         })
     }
 
-    /// Scan a scoped packages directory (`@scope/`).
+    /// Enumerate pnpm virtual-store (`node_modules/.pnpm`) entries,
+    /// yielding each REAL directory child's `(dir_name, <child>/node_modules)`.
+    /// The child literally named `node_modules` is pnpm's internal hoist
+    /// dir (nothing but symlinks into sibling entries) and hidden children
+    /// are store metadata — both skipped. Shared by the resolver
+    /// (`collect_nested_node_modules`) and the scan pass
+    /// (`scan_pnpm_virtual_store`) so the store-layout policy lives once.
+    async fn list_pnpm_store_entries(store_path: &Path) -> Vec<(String, PathBuf)> {
+        let mut entries = Vec::new();
+        for entry in crate::utils::fs::list_dir_entries(store_path).await {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.starts_with('.') || name_str == "node_modules" {
+                continue;
+            }
+            let Some(file_type) = crate::utils::fs::entry_file_type(&entry).await else {
+                continue;
+            };
+            if !file_type.is_dir() {
+                continue;
+            }
+            let entry_nm = store_path.join(&name).join("node_modules");
+            entries.push((name_str.into_owned(), entry_nm));
+        }
+        entries
+    }
+
+    /// Scan pnpm's virtual store (`node_modules/.pnpm`): inventory the
+    /// packages under each store entry's `node_modules`. An entry whose
+    /// dir name decodes to a name@version the importer pass already
+    /// inventoried (every root-linked direct dep) skips the redundant
+    /// package.json re-read via `identity_seen` — the entry is still
+    /// walked, because bundled/injected dependencies are real dirs that
+    /// physically live only inside the store entry.
+    async fn scan_pnpm_virtual_store(
+        store_path: &Path,
+        seen: &mut HashSet<String>,
+    ) -> Vec<CrawledPackage> {
+        let mut results = Vec::new();
+
+        for (entry_name, entry_nm) in Self::list_pnpm_store_entries(store_path).await {
+            let identity_seen = decode_pnpm_store_entry_name(&entry_name)
+                .filter(|(full_name, version)| {
+                    let (ns, bare) = parse_package_name(full_name);
+                    seen.contains(&build_npm_purl(ns.as_deref(), &bare, version))
+                })
+                .map(|(full_name, _version)| full_name);
+            let found = Self::scan_node_modules(
+                &entry_nm,
+                seen,
+                ScanPolicy::StoreEntry {
+                    identity_seen: identity_seen.as_deref(),
+                },
+            )
+            .await;
+            results.extend(found);
+        }
+
+        results
+    }
+
+    /// Scan a scoped packages directory (`@scope/`). `policy` carries the
+    /// caller's traversal rules (see [`ScanPolicy`]); nested `node_modules`
+    /// below a scoped package are always regular importer-style trees.
     fn scan_scoped_packages<'a>(
         scope_path: &'a Path,
         seen: &'a mut HashSet<String>,
+        policy: ScanPolicy<'a>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<CrawledPackage>> + 'a>> {
         Box::pin(async move {
             let mut results = Vec::new();
+            let (store_entry, identity_seen) = match policy {
+                ScanPolicy::Importer => (false, None),
+                ScanPolicy::StoreEntry { identity_seen } => (true, identity_seen),
+            };
+            // `identity_seen` names the full `@scope/name`; this dir is the
+            // `@scope` half.
+            let scope_name = scope_path
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
 
             for entry in crate::utils::fs::list_dir_entries(scope_path).await {
                 let name = entry.file_name();
@@ -689,19 +957,32 @@ impl NpmCrawler {
                     continue;
                 };
 
-                if !file_type.is_dir() && !file_type.is_symlink() {
+                let acceptable = if store_entry {
+                    file_type.is_dir()
+                } else {
+                    file_type.is_dir() || file_type.is_symlink()
+                };
+                if !acceptable {
                     continue;
                 }
 
                 let pkg_path = scope_path.join(&name_str);
-                if let Some(pkg) = Self::check_package(&pkg_path, seen).await {
-                    results.push(pkg);
+                let already_inventoried =
+                    identity_seen.is_some_and(|full| full == format!("{scope_name}/{name_str}"));
+                if !already_inventoried {
+                    if let Some(pkg) = Self::check_package(&pkg_path, seen).await {
+                        results.push(pkg);
+                    }
                 }
 
                 // Nested node_modules only for real directories
                 if file_type.is_dir() {
-                    let nested =
-                        Self::scan_node_modules(&pkg_path.join("node_modules"), seen).await;
+                    let nested = Self::scan_node_modules(
+                        &pkg_path.join("node_modules"),
+                        seen,
+                        ScanPolicy::Importer,
+                    )
+                    .await;
                     results.extend(nested);
                 }
             }
@@ -1343,6 +1624,124 @@ mod tests {
         // joined path absolute under `Path::join`.
         assert!(!is_safe_npm_component("C:evil"));
         assert!(!is_safe_npm_component("c:"));
+    }
+
+    // ── decode_pnpm_store_entry_name ───────────────────────────────
+
+    /// Helper: decode and unwrap into owned strings for terse asserts.
+    fn decoded(entry: &str) -> Option<(String, String)> {
+        decode_pnpm_store_entry_name(entry)
+    }
+
+    #[test]
+    fn test_decode_pnpm_store_entry_plain() {
+        assert_eq!(
+            decoded("mkdirp@0.5.5"),
+            Some(("mkdirp".into(), "0.5.5".into()))
+        );
+    }
+
+    #[test]
+    fn test_decode_pnpm_store_entry_scoped_plus_escape() {
+        assert_eq!(
+            decoded("@scope+leaf@2.0.0"),
+            Some(("@scope/leaf".into(), "2.0.0".into()))
+        );
+    }
+
+    #[test]
+    fn test_decode_pnpm_store_entry_v9_peer_parens() {
+        // Single and stacked peer suffixes, including a scoped peer whose
+        // own name carries `@`/`+` — everything from the first `(` goes.
+        assert_eq!(
+            decoded("foo@1.0.0(bar@2.0.0)"),
+            Some(("foo".into(), "1.0.0".into()))
+        );
+        assert_eq!(
+            decoded("foo@1.0.0(bar@2.0.0)(@babel+core@7.21.0)"),
+            Some(("foo".into(), "1.0.0".into()))
+        );
+        assert_eq!(
+            decoded("@scope+leaf@2.0.0(@peer+dep@3.0.0)"),
+            Some(("@scope/leaf".into(), "2.0.0".into()))
+        );
+    }
+
+    #[test]
+    fn test_decode_pnpm_store_entry_legacy_underscore_suffix() {
+        // pnpm 6–8 peer suffix — everything from the first `_` goes, even
+        // when the suffix itself carries `@version` fragments that would
+        // otherwise confuse the rfind('@') split.
+        assert_eq!(
+            decoded("foo@1.0.0_bar@2.0.0"),
+            Some(("foo".into(), "1.0.0".into()))
+        );
+        assert_eq!(
+            decoded("@scope+name@1.0.0_@peer+dep@2.0.0"),
+            Some(("@scope/name".into(), "1.0.0".into()))
+        );
+    }
+
+    #[test]
+    fn test_decode_pnpm_store_entry_prerelease_version() {
+        assert_eq!(
+            decoded("foo@1.0.0-rc.1(bar@2.0.0)"),
+            Some(("foo".into(), "1.0.0-rc.1".into()))
+        );
+    }
+
+    /// pnpm truncates over-long dir names ANYWHERE and appends `_<hash>`.
+    /// A cut mid-name leaves no `@X.Y.Z` tail → None (conservative: the
+    /// entry stays probeable). A cut that lands after a `name@X.Y.Z`
+    /// prefix is an undetectable artifact — it decodes, pinned here so
+    /// the contract ("decoded is advisory, probe is authority") is
+    /// explicit. A cut mid-version (`@1.2`) fails the semver-triple
+    /// check → None.
+    #[test]
+    fn test_decode_pnpm_store_entry_truncation_hash_tail() {
+        assert_eq!(decoded("some-truncated-name-prefix_abc123def456"), None);
+        assert_eq!(decoded("foo@1.2_abc123def456"), None);
+        assert_eq!(
+            decoded("foo@1.2.3_abc123def456"),
+            Some(("foo".into(), "1.2.3".into())),
+            "truncation after a full name@X.Y.Z prefix is indistinguishable \
+             from a legacy peer suffix — decodes, and that is acceptable \
+             because the package.json probe stays the authority"
+        );
+    }
+
+    /// Names that are not registry package entries at all.
+    #[test]
+    fn test_decode_pnpm_store_entry_non_package_names() {
+        // Store metadata file.
+        assert_eq!(decoded("lock.yaml"), None);
+        // The internal hoist dir (also skipped by the enumerator).
+        assert_eq!(decoded("node_modules"), None);
+        // No version at all.
+        assert_eq!(decoded("foo"), None);
+        // Empty name half.
+        assert_eq!(decoded("@1.0.0"), None);
+        // Empty version half.
+        assert_eq!(decoded("foo@"), None);
+    }
+
+    /// A real npm name containing `_` is indistinguishable from a legacy
+    /// peer suffix, so it must fall to the conservative None (the entry
+    /// stays reachable via the fallback rule).
+    #[test]
+    fn test_decode_pnpm_store_entry_underscore_name_falls_back() {
+        assert_eq!(decoded("lodash._baseclone@1.0.0"), None);
+    }
+
+    /// Git/URL dependency entries carry a sha or URL fragment where the
+    /// version would be — not a semver triple → None → still probeable.
+    #[test]
+    fn test_decode_pnpm_store_entry_git_url_deps_fall_back() {
+        assert_eq!(decoded("foo@github.com+user+repo@4a3b2c1d9e8f"), None);
+        assert_eq!(
+            decoded("foo@https+++codeload.github.com+x+tar.gz+abc"),
+            None
+        );
     }
 
     /// A PURL whose version is not the one on disk must be skipped, while a
