@@ -78,7 +78,7 @@ failure instead of N confusing ones that look like CLI regressions.
 | Maven | ✅ | ❌ **none** | canary only |
 | NuGet | ✅ | ❌ **none** | canary only |
 | Composer | ✅ | ❌ **none** | canary only |
-| Go | ❌ [by design](../design/golang-hosted-no-go.md) | ❌ none | negative assertion |
+| Go | ✅ free tier [by design](../design/golang-hosted.md) (paid: ❌ [analysis](../design/golang-hosted-no-go.md)) | ❌ none published yet | shape guard (redirects only via `goproxy` override) |
 | Deno | ❌ not supported | — | negative assertion |
 
 Maven, NuGet and Composer all *implement* hosted mode, but production publishes

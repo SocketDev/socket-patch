@@ -1228,5 +1228,6 @@ by `setup --exclude`).
   surface: exact JSON shapes, exit codes, flag/env bindings, and the semver policy that
   governs them.
 - **[Design notes](docs/design/)** — e.g. [the configuration model](docs/design/configuration.md)
-  and [why hosted mode is impossible for Go](docs/design/golang-hosted-no-go.md).
+  and [hosted mode for Go](docs/design/golang-hosted.md) (free tier; the
+  [paid-tier no-go analysis](docs/design/golang-hosted-no-go.md) it supersedes).
 - **[Changelog](CHANGELOG.md)**

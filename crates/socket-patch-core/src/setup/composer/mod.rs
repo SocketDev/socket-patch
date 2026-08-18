@@ -142,13 +142,19 @@ fn serialize_like_input(doc: &Value, original: &str) -> String {
 /// `None` if already present in every event (idempotent no-op).
 fn composer_add(content: &str) -> Result<Option<String>, String> {
     let mut doc = parse_checked(content)?;
-    let root = doc.as_object_mut().unwrap();
+    let root = doc
+        .as_object_mut()
+        .expect("parse_checked guarantees an object root");
 
     // Get-or-create the `scripts` object (replacing a `null`).
     if !root.get("scripts").map(Value::is_object).unwrap_or(false) {
         root.insert("scripts".to_string(), Value::Object(Map::new()));
     }
-    let scripts = root.get_mut("scripts").unwrap().as_object_mut().unwrap();
+    let scripts = root
+        .get_mut("scripts")
+        .expect("the guard above inserts `scripts` when absent")
+        .as_object_mut()
+        .expect("the guard above replaces a non-object `scripts`");
 
     let mut changed = false;
     for event in HOOK_EVENTS {
@@ -173,7 +179,9 @@ fn composer_add(content: &str) -> Result<Option<String>, String> {
 /// emptied `scripts` object. `None` if our command is absent everywhere.
 fn composer_remove(content: &str) -> Result<Option<String>, String> {
     let mut doc = parse_checked(content)?;
-    let root = doc.as_object_mut().unwrap();
+    let root = doc
+        .as_object_mut()
+        .expect("parse_checked guarantees an object root");
     // An absent (or `null`) `scripts` is a legitimate no-op: nothing of ours.
     let scripts = match root.get_mut("scripts").and_then(Value::as_object_mut) {
         Some(s) => s,

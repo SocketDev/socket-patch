@@ -250,7 +250,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
                     "status": "error",
                     "error": msg,
                 }))
-                .unwrap()
+                .expect("serializing an in-memory JSON value cannot fail")
             );
         } else {
             eprintln!("Error: {msg}");
@@ -274,7 +274,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
                     "error": "Manifest not found",
                     "path": manifest_path.display().to_string(),
                 }))
-                .unwrap()
+                .expect("serializing an in-memory JSON value cannot fail")
             );
         } else {
             // Errors print even under --silent ("errors only", never
@@ -331,7 +331,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
                         "vendored": vendored,
                         "results": results.iter().map(result_to_json).collect::<Vec<_>>(),
                     }))
-                    .unwrap()
+                    .expect("serializing an in-memory JSON value cannot fail")
                 );
             } else if !args.common.silent && !results.is_empty() {
                 let rolled_back: Vec<_> = results
@@ -458,7 +458,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
                         "vendored": [],
                         "results": [],
                     }))
-                    .unwrap()
+                    .expect("serializing an in-memory JSON value cannot fail")
                 );
             } else {
                 // Errors print even under --silent ("errors only", never
@@ -479,7 +479,9 @@ async fn rollback_patches_inner(
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "Invalid manifest".to_string())?;
 
-    let socket_dir = manifest_path.parent().unwrap();
+    let socket_dir = manifest_path
+        .parent()
+        .expect("manifest path names a file, so it has a parent");
     let mut blobs_path = socket_dir.join("blobs");
     // `--dry-run` must not mutate `.socket/` ("Preview, no mutations"):
     // don't create the blobs dir; a throwaway stage replaces it below.
@@ -495,7 +497,9 @@ async fn rollback_patches_inner(
         if args.identifier.is_some() {
             return Err(format!(
                 "No patch found matching identifier: {}",
-                args.identifier.as_deref().unwrap()
+                args.identifier
+                    .as_deref()
+                    .expect("is_some checked by the enclosing if")
             ));
         }
         if !args.common.silent && !args.common.json {

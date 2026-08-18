@@ -40,6 +40,11 @@ const REDIRECT_CANDIDATE_FILES: &[&str] = &[
     // on diverging spellings).
     "gems.rb",
     "gems.locked",
+    // The golang rewriter edits the main module's go.mod (fork-style
+    // `replace`) and go.sum (the socket module's two h1: lines). go.sum may
+    // legitimately be absent — the rewriter creates it in that case.
+    "go.mod",
+    "go.sum",
     "pom.xml",
     // Maven Trusted Checksums files the fail-closed maven rewriter merges into
     // (read so an existing user config / checksum set is preserved, not
@@ -91,7 +96,11 @@ fn emit_json_error(scan_result: Option<serde_json::Value>, message: &str) {
     if !result.get("redirect").is_some_and(|r| r.is_object()) {
         result["redirect"] = serde_json::json!({ "mode": "hosted" });
     }
-    println!("{}", serde_json::to_string_pretty(&result).unwrap());
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&result)
+            .expect("serializing an in-memory JSON value cannot fail")
+    );
 }
 
 /// Build the hosted `--json` success envelope: the classic scan object
@@ -158,12 +167,22 @@ pub(super) async fn run_redirect(
 
     let mut skipped: Vec<serde_json::Value> = Vec::new();
     let mut overrides: Vec<DepOverride> = Vec::new();
-    // (purl, uuid, artifact_url, registry index_url, maven suffixed version)
-    // per granted reference — used AFTER the rewrite to decide which deps were
-    // actually redirected (their target URL / index / suffixed version landed
-    // in a file) before persisting records or attesting anything. The last
-    // element is Some only for fail-closed maven overrides.
-    type RedirectCandidate = (String, String, String, Option<String>, Option<String>);
+    // (purl, uuid, artifact_url, registry index_url, maven suffixed version,
+    // go module path) per granted reference — used AFTER the rewrite to decide
+    // which deps were actually redirected (their target URL / index / suffixed
+    // version / socket module path landed in a file) before persisting records
+    // or attesting anything. The fifth element is Some only for fail-closed
+    // maven overrides; the sixth only for golang (whose go.mod/go.sum edits
+    // carry the content-addressed `patch.socket.dev/gopatch/<uuid>` module
+    // path, never the artifact or index URL).
+    type RedirectCandidate = (
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
     let mut candidates: Vec<RedirectCandidate> = Vec::new();
 
     if !selected.is_empty() {
@@ -219,6 +238,26 @@ pub(super) async fn run_redirect(
             if let Some(c) = berry_zip.and_then(|a| a.integrity.yarn_berry10c0.clone()) {
                 integrity.yarn_berry10c0 = Some(c);
             }
+            // goproxy: the hosted-Go hash pair rides the override's
+            // identifiers (the tarball's dirhashH1 is the original-path
+            // flavor, kept for vendor-mode verification); the golang
+            // rewriter reads the normalized integrity, so merge — the
+            // gopatch-flavor zip h1 REPLACES dirhashH1 here. Only both
+            // together: a half-merged pair would trip the rewriter's
+            // fail-closed integrity check by design.
+            if let Some(ov) = reference
+                .registry_override
+                .as_ref()
+                .filter(|o| o.kind == "goproxy")
+            {
+                if let (Some(zip_h1), Some(gomod_h1)) = (
+                    ov.identifiers.go_zip_dirhash_h1.clone(),
+                    ov.identifiers.go_mod_h1.clone(),
+                ) {
+                    integrity.dirhash_h1 = Some(zip_h1);
+                    integrity.go_mod_h1 = Some(gomod_h1);
+                }
+            }
             candidates.push((
                 purl.to_string(),
                 sel.uuid.clone(),
@@ -231,6 +270,10 @@ pub(super) async fn run_redirect(
                     .registry_override
                     .as_ref()
                     .and_then(|o| o.identifiers.maven_suffixed_version.clone()),
+                reference
+                    .registry_override
+                    .as_ref()
+                    .and_then(|o| o.identifiers.go_module_path.clone()),
             ));
             overrides.push(DepOverride {
                 ecosystem,
@@ -247,15 +290,15 @@ pub(super) async fn run_redirect(
         }
     }
 
-    // Load the existing redirect ledger BEFORE any file is written — bun
-    // migration included. The ledger is the only store of the pre-redirect
-    // originals a future revert needs, so a malformed (torn/hand-mangled)
-    // ledger must abort the run while the project is still untouched: the old
-    // tolerant load treated it as "no ledger" and the merge below would have
-    // started fresh, silently overwriting that revert data. The malformed
-    // file is moved aside to redirect-state.json.corrupt (never clobbered)
-    // so recovery stays possible; a dry-run reports the same hard error but
-    // moves nothing.
+    // Load the existing redirect ledger BEFORE any file is written — the
+    // cargo takeover reverts and the bun migration included. The ledger is
+    // the only store of the pre-redirect originals a future revert needs, so
+    // a malformed (torn/hand-mangled) ledger must abort the run while the
+    // project is still untouched: the old tolerant load treated it as "no
+    // ledger" and the merge below would have started fresh, silently
+    // overwriting that revert data. The malformed file is moved aside to
+    // redirect-state.json.corrupt (never clobbered) so recovery stays
+    // possible; a dry-run reports the same hard error but moves nothing.
     let existing_ledger =
         match socket_patch_core::patch::redirect::load_redirect_state(&args.common.cwd).await {
             Ok(state) => state,
@@ -271,6 +314,166 @@ pub(super) async fn run_redirect(
                 return 1;
             }
         };
+
+    // Cross-mode takeover (cargo): a purl this run is about to redirect may
+    // still be VENDORED — a committed `[patch.crates-io]` path entry, a
+    // detached Cargo.lock entry, a committed copy, and a vendored ledger
+    // entry. The hosted rewriters know nothing about that wiring, so
+    // redirecting on top of it would leave BOTH wirings in place and cargo
+    // then refuses every `--locked` build over the now-unused `[patch]`
+    // entry while this run reports success. A takeover must leave the
+    // project FULLY hosted: revert each such purl's vendored state first
+    // (the exact per-purl machinery `vendor --revert` runs — restore the
+    // lock originals from the ledger, drop the `[patch]` entry, remove the
+    // committed tree and the ledger entry), and only then redirect. This
+    // ordering also hands the redirect the PRISTINE crates.io lock fragment
+    // to record as its own revert original, keeping the originals chain
+    // intact across repeated mode migrations. A purl whose vendored state
+    // cannot be cleanly reverted (revert failure, or vendored wiring with a
+    // missing/corrupt ledger) is REFUSED — skipped with an actionable
+    // error — never half-migrated.
+    let mut takeover_pre_warnings: Vec<serde_json::Value> = Vec::new();
+    if !candidates.iter().any(|(p, ..)| p.starts_with("pkg:cargo/")) {
+        // No cargo candidates — nothing to reconcile.
+    } else {
+        use socket_patch_core::utils::purl::{normalize_purl, strip_purl_qualifiers};
+        let canon = |p: &str| normalize_purl(strip_purl_qualifiers(p)).into_owned();
+        let vendor_state = socket_patch_core::vendor::load_state(&args.common.cwd).await;
+        let patch_entries =
+            socket_patch_core::vendor::cargo_config::read_patch_entries(&args.common.cwd).await;
+        let mut refused: Vec<String> = Vec::new();
+        for (purl, _uuid, ..) in &candidates {
+            if !purl.starts_with("pkg:cargo/") {
+                continue;
+            }
+            let stripped = strip_purl_qualifiers(purl);
+            let ledger_entry = vendor_state
+                .as_ref()
+                .ok()
+                .and_then(|s| socket_patch_core::vendor::lookup_entry(&s.entries, stripped))
+                .cloned();
+            if let Some(entry) = ledger_entry {
+                if args.common.dry_run {
+                    takeover_pre_warnings.push(serde_json::json!({
+                        "code": "redirect_would_revert_vendored",
+                        "detail": format!(
+                            "{purl} is currently vendored; the hosted redirect will \
+                             revert its vendored wiring, ledger entry, and committed \
+                             artifact first, then redirect (mode takeover)"
+                        ),
+                    }));
+                    continue;
+                }
+                let outcome =
+                    crate::commands::vendor::dispatch_revert_one(&entry, &args.common.cwd, false)
+                        .await;
+                if !outcome.success {
+                    refused.push(purl.clone());
+                    takeover_pre_warnings.push(serde_json::json!({
+                        "code": "redirect_vendored_revert_failed",
+                        "detail": format!(
+                            "{purl} is vendored and its vendored state could not be \
+                             reverted ({}); NOT redirected — run `socket-patch vendor \
+                             --revert` to clean up, then re-run `scan --mode hosted`",
+                            outcome.error.as_deref().unwrap_or("unknown error")
+                        ),
+                    }));
+                    continue;
+                }
+                // Drop the reverted entry and persist per purl so a crash
+                // mid-run leaves a ledger matching the on-disk wiring.
+                // Re-loaded fresh each iteration (each iteration saves): the
+                // saved file is the truth.
+                let mut state = match socket_patch_core::vendor::load_state(&args.common.cwd).await
+                {
+                    Ok(s) => s,
+                    Err(e) => {
+                        refused.push(purl.clone());
+                        takeover_pre_warnings.push(serde_json::json!({
+                            "code": "redirect_vendored_revert_failed",
+                            "detail": format!(
+                                "{purl}: vendored wiring reverted but the vendored \
+                                 ledger could not be re-read ({e}); NOT redirected — \
+                                 fix .socket/vendor/state.json and re-run"
+                            ),
+                        }));
+                        continue;
+                    }
+                };
+                state
+                    .entries
+                    .retain(|k, e| canon(k) != canon(purl) && canon(&e.base_purl) != canon(purl));
+                if let Err(e) =
+                    socket_patch_core::vendor::save_state(&args.common.cwd, &state).await
+                {
+                    // The wiring is reverted but the ledger still claims it;
+                    // redirecting now would leave a ledger asserting wiring
+                    // that is gone. Fail closed for this purl.
+                    refused.push(purl.clone());
+                    takeover_pre_warnings.push(serde_json::json!({
+                        "code": "redirect_vendored_revert_failed",
+                        "detail": format!(
+                            "{purl}: vendored wiring reverted but the vendored ledger \
+                             could not be updated ({e}); NOT redirected — fix \
+                             .socket/vendor/state.json and re-run"
+                        ),
+                    }));
+                    continue;
+                }
+                takeover_pre_warnings.push(serde_json::json!({
+                    "code": "redirect_takeover_reverted_vendored",
+                    "detail": format!(
+                        "{purl} was vendored; reverted its vendored wiring, ledger \
+                         entry, and committed artifact before redirecting (mode \
+                         takeover: the project is now fully hosted for this package)"
+                    ),
+                }));
+            } else {
+                // No usable ledger entry. If socket-owned vendored wiring for
+                // this crate is nevertheless present, the ledger is missing or
+                // corrupt — the originals needed to revert are unrecoverable,
+                // so redirecting on top would wedge the project. Refuse.
+                let name = parse_purl_simple(purl).map(|(_, name, _)| name);
+                let wired = name
+                    .as_deref()
+                    .is_some_and(|n| patch_entries.get(n).is_some_and(|i| i.socket_owned));
+                if wired {
+                    refused.push(purl.clone());
+                    takeover_pre_warnings.push(serde_json::json!({
+                        "code": "redirect_vendored_revert_failed",
+                        "detail": format!(
+                            "{purl} has socket-owned vendored wiring in \
+                             .cargo/config.toml but no usable vendored ledger entry \
+                             (.socket/vendor/state.json is missing or corrupt); NOT \
+                             redirected — restore the ledger or remove the vendored \
+                             wiring manually, then re-run"
+                        ),
+                    }));
+                }
+            }
+        }
+        if !refused.is_empty() {
+            for purl in &refused {
+                if let Some((_, uuid, ..)) = candidates.iter().find(|(p, ..)| p == purl) {
+                    skipped.push(serde_json::json!({
+                        "purl": purl, "uuid": uuid, "reason": "vendored_revert_failed",
+                    }));
+                }
+            }
+            let refused_names: std::collections::HashSet<(String, String)> = candidates
+                .iter()
+                .filter(|(p, ..)| refused.contains(p))
+                .filter_map(|(p, ..)| {
+                    parse_purl_simple(p).map(|(_, name, version)| (name, version))
+                })
+                .collect();
+            candidates.retain(|(p, ..)| !refused.contains(p));
+            overrides.retain(|o| {
+                o.ecosystem != "cargo"
+                    || !refused_names.contains(&(o.name.clone(), o.version.clone()))
+            });
+        }
+    }
 
     // bun.lockb auto-migration: the redirect rewriter only edits the TEXT
     // lockfile, so a project locked to a binary `bun.lockb` must be re-locked
@@ -490,39 +693,47 @@ pub(super) async fn run_redirect(
         .collect();
     let confirmed: Vec<(String, String)> = candidates
         .iter()
-        .filter(|(purl, uuid, artifact_url, index_url, suffixed_version)| {
-            // Cargo is transactional: the rewriter reports exactly which
-            // patch uuids FULLY landed (manifest pin + lock + registry
-            // block). Substring presence must never confirm a cargo dep —
-            // the `[registries.…]` config block contains the index URL while
-            // pinning nothing, so a config-block-only rewrite would be
-            // attested with zero enforcement in any build.
-            if purl.starts_with("pkg:cargo/") {
-                return rewrite.confirmed_cargo_uuids.contains(uuid);
-            }
-            let encoded = socket_patch_core::utils::uri::encode_uri_component(artifact_url);
-            final_texts.iter().any(|text| {
-                // The rewriters' own predicate — raw, or the `\/`-escaped
-                // slashes an old composer.lock spells them with — so a
-                // writer's spelling can never be one this probe misses. It
-                // was: the composer rewriter emitted `\/`-escaped urls this
-                // probe never looked for, so a fully successful composer
-                // redirect reported `redirected: 0`, fetched no patch record
-                // into the ledger, and left the patch unattestable by `vex`.
-                socket_patch_core::patch::redirect::artifact_url_present(text, artifact_url)
-                    // The berry rewriter writes the URL percent-encoded into the
-                    // lock's `::__archiveUrl=` binding, so the raw form is absent.
-                    || text.contains(encoded.as_str())
-                    || index_url.as_deref().is_some_and(|iu| text.contains(iu))
-                    // Fail-closed maven pins the globally-unique
-                    // `-socket.<hex8>` suffixed version (never the `.pom` URL),
-                    // so match on that string.
-                    || suffixed_version
-                        .as_deref()
-                        .is_some_and(|sv| text.contains(sv))
-            })
-        })
-        .map(|(purl, uuid, _, _, _)| (purl.clone(), uuid.clone()))
+        .filter(
+            |(purl, uuid, artifact_url, index_url, suffixed_version, go_module_path)| {
+                // Cargo is transactional: the rewriter reports exactly which
+                // patch uuids FULLY landed (manifest pin + lock + registry
+                // block). Substring presence must never confirm a cargo dep —
+                // the `[registries.…]` config block contains the index URL while
+                // pinning nothing, so a config-block-only rewrite would be
+                // attested with zero enforcement in any build.
+                if purl.starts_with("pkg:cargo/") {
+                    return rewrite.confirmed_cargo_uuids.contains(uuid);
+                }
+                let encoded = socket_patch_core::utils::uri::encode_uri_component(artifact_url);
+                final_texts.iter().any(|text| {
+                    // The rewriters' own predicate — raw, or the `\/`-escaped
+                    // slashes an old composer.lock spells them with — so a
+                    // writer's spelling can never be one this probe misses. It
+                    // was: the composer rewriter emitted `\/`-escaped urls this
+                    // probe never looked for, so a fully successful composer
+                    // redirect reported `redirected: 0`, fetched no patch record
+                    // into the ledger, and left the patch unattestable by `vex`.
+                    socket_patch_core::patch::redirect::artifact_url_present(text, artifact_url)
+                        // The berry rewriter writes the URL percent-encoded into the
+                        // lock's `::__archiveUrl=` binding, so the raw form is absent.
+                        || text.contains(encoded.as_str())
+                        || index_url.as_deref().is_some_and(|iu| text.contains(iu))
+                        // Fail-closed maven pins the globally-unique
+                        // `-socket.<hex8>` suffixed version (never the `.pom` URL),
+                        // so match on that string.
+                        || suffixed_version
+                            .as_deref()
+                            .is_some_and(|sv| text.contains(sv))
+                        // golang pins the content-addressed
+                        // `patch.socket.dev/gopatch/<uuid>` module path into
+                        // go.mod + go.sum (no URL ever lands in either file).
+                        || go_module_path
+                            .as_deref()
+                            .is_some_and(|gm| text.contains(gm))
+                })
+            },
+        )
+        .map(|(purl, uuid, _, _, _, _)| (purl.clone(), uuid.clone()))
         .collect();
 
     // Fetch the full patch view (file hashes + vulnerabilities) for each
@@ -700,6 +911,7 @@ pub(super) async fn run_redirect(
         warnings.extend(migration_warnings.iter().cloned());
         warnings.extend(rush_warnings.iter().cloned());
         warnings.extend(pnpm_warnings.iter().cloned());
+        warnings.extend(takeover_pre_warnings.iter().cloned());
         warnings.extend(takeover_warnings.iter().cloned());
         warnings.extend(prune_warnings.iter().cloned());
         // Nest the redirect result under `redirect` inside the classic scan
@@ -723,7 +935,7 @@ pub(super) async fn run_redirect(
         let mut result = build_redirect_json_envelope(scan_result.take(), redirect);
         if let Some(statements) = vex_statements {
             result["vex"] = serde_json::json!({
-                "path": args.vex.vex.as_ref().unwrap().display().to_string(),
+                "path": args.vex.vex.as_ref().expect("vex_statements is Some only when --vex was given").display().to_string(),
                 "statements": statements,
                 "format": "openvex-0.2.0",
                 "verified": false,
@@ -732,7 +944,11 @@ pub(super) async fn run_redirect(
             result["status"] = serde_json::json!("error");
             result["error"] = serde_json::json!({ "code": code, "message": message });
         }
-        println!("{}", serde_json::to_string_pretty(&result).unwrap());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&result)
+                .expect("serializing an in-memory JSON value cannot fail")
+        );
     } else {
         if !args.common.silent {
             let verb = if args.common.dry_run {
@@ -772,6 +988,9 @@ pub(super) async fn run_redirect(
             for w in &pnpm_warnings {
                 eprintln!("  warning: {}", w["detail"].as_str().unwrap_or_default());
             }
+            for w in &takeover_pre_warnings {
+                eprintln!("  warning: {}", w["detail"].as_str().unwrap_or_default());
+            }
             for w in &takeover_warnings {
                 eprintln!("  warning: {}", w["detail"].as_str().unwrap_or_default());
             }
@@ -782,7 +1001,11 @@ pub(super) async fn run_redirect(
                      install time; run `socket-patch vex` after installing to verify against \
                      the installed tree).",
                     statements,
-                    args.vex.vex.as_ref().unwrap().display(),
+                    args.vex
+                        .vex
+                        .as_ref()
+                        .expect("vex_statements is Some only when --vex was given")
+                        .display(),
                 );
             } else if args.vex.vex.is_some() && args.common.dry_run {
                 eprintln!("Skipping VEX generation (--dry-run).");

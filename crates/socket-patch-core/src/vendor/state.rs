@@ -312,16 +312,24 @@ impl Default for VendorState {
 ///     create recorded by the first vendoring is not lost when a re-vendor
 ///     finds the surface already present (revert byte-restores an emptied
 ///     table/file only when it knows vendor created it);
+///   * carries forward the cargo lock originals — the removed
+///     `source`/`checksum` pair is NOT recoverable offline, so the ledger
+///     entry is its only home. A re-vendor over already-detached wiring
+///     records `lock: None` (there was nothing left to detach), and taking
+///     the fresh entry verbatim would destroy the first run's originals;
 ///   * preserves the go-patch-takeover flag.
 ///
 /// The union + meta merge are scoped to a re-vendor of the SAME patch
 /// generation (`prev.uuid == entry.uuid`): a new-uuid re-vendor rewires every
 /// surface fresh under the new uuid, so the prior uuid's records name nothing
 /// the new entry left behind and carrying them forward would only dangle.
-/// The original-fill and takeover flag are safe (identity-matched) either way
-/// and run unconditionally.
+/// The original-fill, lock originals, and takeover flag are safe
+/// (identity-matched) either way and run unconditionally.
 pub fn carry_forward_wiring(prev: &VendorEntry, entry: &mut VendorEntry) {
     entry.took_over_go_patches = entry.took_over_go_patches || prev.took_over_go_patches;
+    if entry.lock.is_none() {
+        entry.lock = prev.lock.clone();
+    }
 
     for rec in &mut entry.wiring {
         if rec.action == WiringAction::Rewritten && rec.original.is_none() {

@@ -98,6 +98,41 @@ pub async fn read_patch_entries(project_root: &Path) -> HashMap<String, PatchEnt
     }
 }
 
+/// The hosted-mode `[registries.socket-patch-<uuid>]` sparse-index URLs
+/// declared in the project's cargo config, as `(registry_name, index_url)`
+/// pairs. Reads BOTH `.cargo/config` and `.cargo/config.toml` (a mixed /
+/// legacy state may hold blocks in either file). Read-only; missing or
+/// malformed files contribute nothing. This is how takeover logic proves a
+/// `Cargo.lock` `source` points at Socket's hosted patch registry without
+/// depending on the index URL's host (test registries are localhost).
+pub async fn socket_registry_indexes(project_root: &Path) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for file in [".cargo/config", ".cargo/config.toml"] {
+        let Ok(content) = fs::read_to_string(project_root.join(file)).await else {
+            continue;
+        };
+        let Ok(doc) = content.parse::<DocumentMut>() else {
+            continue;
+        };
+        let Some(registries) = doc.get("registries").and_then(Item::as_table_like) else {
+            continue;
+        };
+        for (name, item) in registries.iter() {
+            if !name.starts_with("socket-patch-") {
+                continue;
+            }
+            let index = item
+                .as_table_like()
+                .and_then(|t| t.get("index"))
+                .and_then(Item::as_str);
+            if let Some(index) = index {
+                out.push((name.to_string(), index.to_string()));
+            }
+        }
+    }
+    out
+}
+
 // ── config-file resolution + read-or-create write ────────────────────────────
 
 /// Resolve the config file under `<project_root>/.cargo/`. Prefers an existing

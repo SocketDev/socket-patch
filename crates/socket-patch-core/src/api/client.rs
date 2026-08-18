@@ -541,7 +541,10 @@ impl ApiClient {
     /// proxy) do we re-derive the proxy base from the environment.
     fn binary_url(&self, kind: &str, identifier: &str) -> (String, bool) {
         if self.api_token.is_some() && self.org_slug.is_some() && !self.use_public_proxy {
-            let slug = self.org_slug.as_deref().unwrap();
+            let slug = self
+                .org_slug
+                .as_deref()
+                .expect("org_slug is_some checked in this branch's condition");
             let u = format!(
                 "{}/v0/orgs/{}/patches/{}/{}",
                 self.api_url, slug, kind, identifier
@@ -776,7 +779,10 @@ impl ApiClient {
             None => proxy_url_from_env().trim_end_matches('/').to_string(),
         };
         if use_auth {
-            let slug = self.org_slug.as_deref().unwrap();
+            let slug = self
+                .org_slug
+                .as_deref()
+                .expect("use_auth requires org_slug.is_some()");
             (format!("{base}/v0/orgs/{slug}/patches/package"), true)
         } else {
             (format!("{base}/patch/package"), false)
@@ -1358,7 +1364,11 @@ fn select_org_slug(mut orgs: Vec<crate::api::types::OrganizationInfo>) -> Result
         0 => Err(ApiError::Other(
             "No organizations found for this API token.".into(),
         )),
-        1 => Ok(orgs.into_iter().next().unwrap().slug),
+        1 => Ok(orgs
+            .into_iter()
+            .next()
+            .expect("this match arm guarantees exactly one org")
+            .slug),
         _ => {
             let slugs: Vec<_> = orgs.iter().map(|o| o.slug.as_str()).collect();
             let first = orgs[0].slug.clone();

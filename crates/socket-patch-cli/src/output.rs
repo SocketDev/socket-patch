@@ -62,7 +62,9 @@ pub(crate) fn confirm(prompt: &str, default_yes: bool, skip_prompt: bool, is_jso
     }
     let hint = if default_yes { "[Y/n]" } else { "[y/N]" };
     eprint!("{prompt} {hint} ");
-    io::stderr().flush().unwrap();
+    io::stderr()
+        .flush()
+        .expect("stderr is unbuffered, so flush cannot fail");
     let mut answer = String::new();
     if io::stdin().read_line(&mut answer).is_err() {
         // Terminals can deliver non-UTF-8 bytes (e.g. a Latin-1 paste);

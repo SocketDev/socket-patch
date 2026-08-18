@@ -759,7 +759,13 @@ pub async fn run(args: ApplyArgs) -> i32 {
                 match &vex_result {
                     Some(Ok(summary)) => {
                         env.vex = Some(VexSummary {
-                            path: args.vex.vex.as_ref().unwrap().display().to_string(),
+                            path: args
+                                .vex
+                                .vex
+                                .as_ref()
+                                .expect("vex_result is Some only when --vex was given")
+                                .display()
+                                .to_string(),
                             statements: summary.statements,
                             format: "openvex-0.2.0".to_string(),
                         });
@@ -860,7 +866,11 @@ pub async fn run(args: ApplyArgs) -> i32 {
                             println!(
                                 "Wrote OpenVEX document with {} statement(s) to {}",
                                 summary.statements,
-                                args.vex.vex.as_ref().unwrap().display(),
+                                args.vex
+                                    .vex
+                                    .as_ref()
+                                    .expect("vex_result is Some only when --vex was given")
+                                    .display(),
                             );
                         }
                     }
@@ -1001,7 +1011,9 @@ async fn apply_patches_inner(
 
     // Resolve patch sources (read `.socket/` directly, or stage an overlay
     // tempdir + download the gap). Shared with `vendor` via fetch_stage.
-    let socket_dir = manifest_path.parent().unwrap();
+    let socket_dir = manifest_path
+        .parent()
+        .expect("manifest path names a file, so it has a parent");
     // Partition manifest PURLs by ecosystem up front. The source probes,
     // the offline guard, and the download planner in `fetch_stage` must only
     // consider patches this run can actually apply — the `--ecosystems`

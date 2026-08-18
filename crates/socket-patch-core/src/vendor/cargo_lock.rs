@@ -209,6 +209,39 @@ pub async fn read_locked_versions(project_root: &Path) -> Option<HashMap<String,
     Some(map)
 }
 
+/// Read-only shape of the `[[package]]` entry for `name`+`version` — the
+/// lock-level truth source cross-mode takeover logic keys off (which mode a
+/// crate's resolution actually points at right now).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LockEntryProbe {
+    /// No readable/parseable `Cargo.lock`.
+    NoLockfile,
+    /// The lock parses but has no entry at this name+version.
+    EntryMissing,
+    /// Entry present with no `source` — the vendored detached shape (the
+    /// `[patch.crates-io]` path copy is the lock's sole provider).
+    Detached,
+    /// Entry present with this registry `source` (crates.io, a hosted
+    /// socket-patch sparse index, or any other registry).
+    Source(String),
+}
+
+/// Probe the `[[package]]` entry for `name`+`version` without editing
+/// anything. Unreadable/unparseable locks read as [`LockEntryProbe::NoLockfile`]
+/// so callers stay fail-safe (cannot determine ⇒ keep / stay silent).
+pub async fn probe_lock_entry(project_root: &Path, name: &str, version: &str) -> LockEntryProbe {
+    let Ok((_path, mut doc)) = read_lock(project_root).await else {
+        return LockEntryProbe::NoLockfile;
+    };
+    let Some(table) = find_package_mut(&mut doc, name, version) else {
+        return LockEntryProbe::EntryMissing;
+    };
+    match table.get("source").and_then(Item::as_str) {
+        Some(s) => LockEntryProbe::Source(s.to_string()),
+        None => LockEntryProbe::Detached,
+    }
+}
+
 /// Number of `[[package]]` entries matching `name`+`version`. More than one
 /// means the lock resolves the same name+version from multiple sources (e.g.
 /// registry + git fork), the shape whose `dependencies` arrays use full

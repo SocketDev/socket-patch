@@ -64,6 +64,73 @@ fn is_legacy_redirect_path(path: &str) -> bool {
     norm.starts_with(&format!("{LEGACY_CARGO_PATCHES_DIR}/"))
 }
 
+/// Is this vendored cargo entry still consumed by the project's `Cargo.lock`
+/// dependency graph? The lock is the truth source:
+///
+/// * entry absent from the lock → `Some(false)` (the dependency left the
+///   graph; the `[patch]` would be unused);
+/// * entry carries a registry `source` (crates.io re-resolve or a hosted
+///   socket-patch takeover) → `Some(false)` — the committed copy is NOT what
+///   the lock consumes, so GC may reclaim the entry (its revert restores /
+///   keeps the registry resolution and drops the dead `[patch]` wiring);
+/// * entry detached AND the `[patch.crates-io]` entry points at THIS entry's
+///   committed copy → `Some(true)` (the wired vendored shape);
+/// * detached but the `[patch]` points elsewhere / is gone → `Some(false)`
+///   (nothing consumes the copy; the revert re-attaches the recorded
+///   registry originals, repairing the half-wired lock);
+/// * no readable lock → `None` (cannot determine — callers keep, fail-safe).
+pub async fn vendored_entry_in_use(entry: &VendorEntry, project_root: &Path) -> Option<bool> {
+    let (name, version) = parse_cargo_purl(&entry.base_purl)?;
+    match cargo_lock::probe_lock_entry(project_root, name, version).await {
+        cargo_lock::LockEntryProbe::NoLockfile => None,
+        cargo_lock::LockEntryProbe::EntryMissing => Some(false),
+        cargo_lock::LockEntryProbe::Source(_) => Some(false),
+        cargo_lock::LockEntryProbe::Detached => {
+            let marker = vendor_uuid_dir_rel("cargo", &entry.uuid)?;
+            let entries = cargo_config::read_patch_entries(project_root).await;
+            let wired = entries
+                .get(name)
+                .and_then(|i| i.path.as_deref())
+                .is_some_and(|p| p.replace('\\', "/").starts_with(&format!("{marker}/")));
+            Some(wired)
+        }
+    }
+}
+
+/// A LIVE hosted-redirect wiring for `name`+`version`: the lock resolves it
+/// from a Socket hosted patch registry, or Cargo.toml pins it to a
+/// `socket-patch-<uuid>` registry (the shapes `scan --mode hosted` writes).
+/// Registry indexes are matched against the config-declared
+/// `[registries.socket-patch-*]` URLs, not a hardcoded host, so test
+/// registries are recognised too. `Some(description)` when residue is found.
+async fn hosted_redirect_residue(project_root: &Path, name: &str, version: &str) -> Option<String> {
+    let socket_indexes = cargo_config::socket_registry_indexes(project_root).await;
+    if let cargo_lock::LockEntryProbe::Source(src) =
+        cargo_lock::probe_lock_entry(project_root, name, version).await
+    {
+        if src.contains("patch.socket.dev") || socket_indexes.iter().any(|(_, index)| *index == src)
+        {
+            return Some(format!(
+                "Cargo.lock resolves {name}@{version} from the Socket hosted patch \
+                 registry ({src})"
+            ));
+        }
+    }
+    if let Ok(toml) = tokio::fs::read_to_string(project_root.join("Cargo.toml")).await {
+        let c = regex::escape(name);
+        let re = regex::Regex::new(&format!(
+            r#"(?m)^\s*{c}\s*=\s*\{{[^}}\n]*registry\s*=\s*"socket-patch-[0-9a-fA-F-]{{36}}""#
+        ))
+        .expect("static regex");
+        if re.is_match(&toml) {
+            return Some(format!(
+                "Cargo.toml pins `{name}` to a socket-patch hosted registry"
+            ));
+        }
+    }
+    None
+}
+
 /// The config `[patch]` entry points at THIS copy and the lock entry no
 /// longer needs detaching: either there is no lockfile (nothing to edit — the
 /// first build generates a path-form lock), or the entry exists with no
@@ -532,6 +599,30 @@ pub async fn vendor_cargo_crate(
         result.package_path = copy_dir.display().to_string();
         result.sidecar = None;
         return done(result, None, dry_warnings);
+    }
+
+    // Cross-mode takeover guard (fail-closed): a LIVE hosted-redirect wiring
+    // for this crate must be reverted from the redirect ledger BEFORE
+    // vendoring — the CLI vendored flows do exactly that. Reaching this point
+    // with the residue still present means the redirect ledger is missing or
+    // corrupt (no recorded originals to revert with); proceeding would bake
+    // the hosted registry values into this entry's lock originals as if they
+    // were pristine, leave Cargo.toml pinned to the hosted registry, and
+    // report success on an unbuildable half-migrated project. Refuse with the
+    // manual remediation instead. Runs after the dry-run branch: a preview
+    // must not report the wet run's ledger-driven revert as a failure.
+    if let Some(residue) = hosted_redirect_residue(project_root, name, version).await {
+        return refused(
+            "hosted_redirect_live",
+            format!(
+                "{residue}, but no redirect ledger record can revert it \
+                 (.socket/vendor/redirect-state.json is missing or does not \
+                 record this package); restore the ledger, or manually remove \
+                 the `registry = \"socket-patch-…\"` key from Cargo.toml, \
+                 restore the crates.io source/checksum in Cargo.lock, and drop \
+                 the `[registries.socket-patch-…]` block, then re-run"
+            ),
+        );
     }
 
     // Hot path: already in sync → touch nothing (entry stays with the caller's
@@ -2310,5 +2401,159 @@ mod tests {
         )
         .await;
         expect_refused(outcome, "vendor_service_offline_conflict");
+    }
+
+    // ── cross-mode takeover: in-use probe + fail-closed hosted guard ─────
+
+    fn ledger_entry_for(uuid: &str) -> VendorEntry {
+        VendorEntry {
+            ecosystem: "cargo".into(),
+            base_purl: PURL.into(),
+            uuid: uuid.into(),
+            artifact: VendorArtifact {
+                path: format!(".socket/vendor/cargo/{uuid}/cfg-if-1.0.4"),
+                sha256: String::new(),
+                size: None,
+                platform_locked: None,
+                file_inventory: None,
+            },
+            wiring: Vec::new(),
+            lock: None,
+            took_over_go_patches: false,
+            detached: false,
+            record: None,
+            flavor: None,
+            uv: None,
+            pnpm: None,
+            poetry: None,
+            pdm: None,
+            pipenv: None,
+        }
+    }
+
+    /// The lockfile-in-use probe for cargo (GC/prune reclaim): detached lock
+    /// + our `[patch]` = in use; a registry source (hosted takeover or a
+    /// crates.io re-resolve), a missing entry, or a foreign `[patch]` target
+    /// = reclaimable; no lock = undeterminable (keep, fail-safe).
+    #[tokio::test]
+    async fn test_vendored_entry_in_use_probe() {
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        let entry_probe = ledger_entry_for(UUID);
+
+        // No lockfile: undeterminable.
+        tokio::fs::remove_file(root.join("Cargo.lock"))
+            .await
+            .unwrap();
+        assert_eq!(vendored_entry_in_use(&entry_probe, root).await, None);
+        tokio::fs::write(root.join("Cargo.lock"), lock_body())
+            .await
+            .unwrap();
+
+        // Registry-sourced (pre-vendor / re-resolved): not consumed.
+        assert_eq!(vendored_entry_in_use(&entry_probe, root).await, Some(false));
+
+        // Fully vendored: detached lock + our [patch] entry ⇒ in use.
+        let (result, entry, _w) =
+            expect_done(run_vendor(PURL, root, &blobs, &pristine, &record, false).await);
+        assert!(result.success, "{:?}", result.error);
+        let entry = entry.unwrap();
+        assert_eq!(vendored_entry_in_use(&entry, root).await, Some(true));
+
+        // Hosted takeover shape: the lock re-sourced to a socket-patch sparse
+        // index (the [patch] entry survives, but nothing consumes the copy).
+        tokio::fs::write(
+            root.join("Cargo.lock"),
+            format!(
+                "version = 4\n\n[[package]]\nname = \"cfg-if\"\nversion = \"1.0.4\"\nsource = \"sparse+http://127.0.0.1:5555/index/\"\nchecksum = \"{}\"\n",
+                "a".repeat(64)
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(vendored_entry_in_use(&entry, root).await, Some(false));
+
+        // Dependency left the lock graph entirely: reclaimable.
+        tokio::fs::write(
+            root.join("Cargo.lock"),
+            "version = 4\n\n[[package]]\nname = \"app\"\nversion = \"0.1.0\"\n",
+        )
+        .await
+        .unwrap();
+        assert_eq!(vendored_entry_in_use(&entry, root).await, Some(false));
+
+        // Detached lock but the [patch] points at ANOTHER uuid's copy: this
+        // entry's artifact is not what the lock consumes.
+        tokio::fs::write(
+            root.join("Cargo.lock"),
+            "version = 4\n\n[[package]]\nname = \"cfg-if\"\nversion = \"1.0.4\"\n",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            vendored_entry_in_use(&ledger_entry_for(UUID2), root).await,
+            Some(false)
+        );
+    }
+
+    /// FAIL CLOSED: vendoring over a LIVE hosted redirect with no ledger to
+    /// revert it must refuse — proceeding would record the hosted registry
+    /// values as the entry's "originals" and leave Cargo.toml pinned to the
+    /// hosted registry (unbuildable in both modes) while reporting success.
+    #[tokio::test]
+    async fn test_refuses_live_hosted_redirect_without_ledger() {
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        let index = "sparse+http://127.0.0.1:5555/index/";
+        // The hosted rewriter's output shapes: registry pin in Cargo.toml,
+        // socket-patch registries block, lock re-sourced to the index.
+        tokio::fs::write(
+            root.join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\ncfg-if = {{ version = \"1\", registry = \"socket-patch-{UUID}\" }}\n"
+            ),
+        )
+        .await
+        .unwrap();
+        tokio::fs::create_dir_all(root.join(".cargo"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            root.join(".cargo/config.toml"),
+            format!("[registries.socket-patch-{UUID}]\nindex = \"{index}\"\n"),
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            root.join("Cargo.lock"),
+            format!(
+                "version = 4\n\n[[package]]\nname = \"cfg-if\"\nversion = \"1.0.4\"\nsource = \"{index}\"\nchecksum = \"{}\"\n",
+                "a".repeat(64)
+            ),
+        )
+        .await
+        .unwrap();
+
+        let detail = expect_refused(
+            run_vendor(PURL, root, &blobs, &pristine, &record, false).await,
+            "hosted_redirect_live",
+        );
+        assert!(detail.contains("redirect-state.json"), "{detail}");
+        // Nothing was half-vendored.
+        assert!(!root.join(format!(".socket/vendor/cargo/{UUID}")).exists());
+
+        // The Cargo.toml pin ALONE (lock already detached — the legacy
+        // hosted→vendored terminal state) is refused too: the in-sync hot
+        // path must not report already_vendored over a broken manifest pin.
+        tokio::fs::write(
+            root.join("Cargo.lock"),
+            "version = 4\n\n[[package]]\nname = \"cfg-if\"\nversion = \"1.0.4\"\n",
+        )
+        .await
+        .unwrap();
+        expect_refused(
+            run_vendor(PURL, root, &blobs, &pristine, &record, false).await,
+            "hosted_redirect_live",
+        );
     }
 }
