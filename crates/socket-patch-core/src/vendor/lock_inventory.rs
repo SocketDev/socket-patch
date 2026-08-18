@@ -97,18 +97,46 @@ impl LockfileEntry {
 }
 
 /// Inventory the project's npm-family lockfile. Routes by
-/// [`detect_npm_lock_flavor`] (PnP markers, bun.lockb, unsupported lock
-/// versions, and a missing lockfile all yield `None`).
+/// [`detect_npm_lock_flavor`]; the two PNPM-SPECIFIC probe refusals
+/// (legacy lockfileVersion, pnpm node-linker=pnp) fall back to reading a
+/// root `pnpm-lock.yaml` directly, and any probe failure falls back to
+/// Rush's common lock when `rush.json` is present. All other refusals
+/// (yarn-berry PnP markers, bun locks, unrecognizable yarn locks, a
+/// missing lockfile) yield `None`.
 pub(crate) async fn inventory_npm_lock(
     project_root: &Path,
 ) -> Option<(NpmLockFlavor, Vec<LockfileEntry>)> {
-    // Rush monorepos have no root package.json/lock pair; their single
-    // pnpm source-of-truth lives under common/config/rush/. The flavor
-    // probe (root-relative) can't see it, so fall back explicitly when the
-    // root lock is absent but rush.json is present.
     let (flavor, _warnings) = match detect_npm_lock_flavor(project_root).await {
         Ok(found) => found,
-        Err(_) => {
+        Err((code, _detail)) => {
+            // The flavor probe passes only pnpm locks the WIRING backend
+            // supports (lockfileVersion 9.0) and refuses PnP layouts, but
+            // inventory is read-only discovery — a legacy v5.4/v6.0 (pnpm
+            // 7/8) or pnpm-PnP-linked lock still names the resolved set, so
+            // on the probe's two PNPM-SPECIFIC refusals a present root lock
+            // is read directly rather than leaving fresh clones of such
+            // projects blind. Only those two codes: on any other refusal
+            // (yarn-berry PnP marker, bun locks) a root pnpm-lock.yaml is
+            // stale debris from a pnpm→yarn/bun migration, and inventorying
+            // it would present dead resolutions as the live dependency set.
+            // (`vendor_lockfile_version_unsupported` also covers the
+            // unrecognizable-yarn.lock refusal, but the probe only sniffs
+            // yarn.lock when no root pnpm-lock.yaml exists, so the direct
+            // read is a no-op there.)
+            if matches!(
+                code,
+                "vendor_lockfile_version_unsupported" | "vendor_pnpm_pnp_unsupported"
+            ) {
+                let pnpm = inventory_pnpm_lock(project_root).await.unwrap_or_default();
+                if !pnpm.is_empty() {
+                    return Some((NpmLockFlavor::Pnpm, finalize_npm(pnpm)));
+                }
+            }
+            // Rush monorepos have no root package.json/lock pair; their
+            // single pnpm source-of-truth lives under common/config/rush/.
+            // The flavor probe (root-relative) can't see it, so fall back
+            // explicitly when the root lock is absent but rush.json is
+            // present.
             let rush = inventory_rush_pnpm_locks(project_root).await;
             return (!rush.is_empty()).then(|| (NpmLockFlavor::Pnpm, finalize_npm(rush)));
         }
@@ -393,7 +421,7 @@ async fn inventory_package_lock(root: &Path) -> Option<Vec<LockfileEntry>> {
     Some(out)
 }
 
-// ─────────────────────────── pnpm-lock.yaml v9 ───────────────────────────
+// ────────────────────────────── pnpm-lock.yaml ──────────────────────────────
 
 async fn inventory_pnpm_lock(root: &Path) -> Option<Vec<LockfileEntry>> {
     inventory_pnpm_lock_at(&root.join("pnpm-lock.yaml")).await
@@ -410,16 +438,22 @@ async fn inventory_pnpm_lock_at(lock_path: &Path) -> Option<Vec<LockfileEntry>> 
     let mut i = start + 1;
     while let Some(block) = pnpm_lock::next_block(&lines, i, end) {
         i = block.end;
-        // Key grammar: `name@version` (name may be `@scope/name`), with
-        // optional peer-dep suffixes `(peer@1.2.3)…` after the version.
-        let base = match block.key.find('(') {
+        // Key grammar by lock generation: v9 `name@version`, v6 (pnpm 8)
+        // the same behind a leading `/`, v5.4 (pnpm 7) `/name/version` —
+        // names may be scoped (`@scope/name`) in all three. Peer suffixes:
+        // v6/v9 append `(peer@1.2.3)…` after the version; v5 appends
+        // `_peer@x`/`_<hash>` to the version itself.
+        let trimmed = match block.key.find('(') {
             Some(p) => block.key[..p].trim_end(),
             None => block.key.as_str(),
         };
-        let Some(at) = base.rfind('@').filter(|&p| p > 0) else {
+        let (base, legacy) = match trimmed.strip_prefix('/') {
+            Some(stripped) => (stripped, true),
+            None => (trimmed, false),
+        };
+        let Some((name, version)) = split_pnpm_key(base, legacy) else {
             continue;
         };
-        let (name, version) = (&base[..at], &base[at + 1..]);
         // Only plain registry versions: `file:`/`link:`/`https:`/git specs
         // are not registry-resolvable.
         if !version.chars().next().is_some_and(|c| c.is_ascii_digit()) {
@@ -452,6 +486,32 @@ async fn inventory_pnpm_lock_at(lock_path: &Path) -> Option<Vec<LockfileEntry>> 
         ));
     }
     Some(out)
+}
+
+/// Split a peer-paren-stripped, slash-stripped pnpm packages key into
+/// `(name, version)`; `None` is skipped by the caller, never guessed.
+/// `legacy` marks a key that carried the v5/v6 leading `/` — only those may
+/// use the v5 `name/version` grammar. What tells v5 `/@scope/name/1.2.3`
+/// apart from v6 `/@scope/name@1.2.3` is the segment after the last `/`:
+/// a v5 version (its `_peer`/`_hash` suffix dropped) starts with a digit
+/// and never contains `@`, while a v6 scoped key's trailing segment is
+/// `name@version`. v5 non-default-registry keys (`example.com/name/1.2.3`)
+/// carry no leading `/` and fall through to the `@` split, where they are
+/// dropped fail-closed downstream.
+fn split_pnpm_key(base: &str, legacy: bool) -> Option<(&str, &str)> {
+    if legacy {
+        if let Some((name, rest)) = base.rsplit_once('/') {
+            let version = rest.split('_').next().unwrap_or(rest);
+            if !name.is_empty()
+                && version.chars().next().is_some_and(|c| c.is_ascii_digit())
+                && !version.contains('@')
+            {
+                return Some((name, version));
+            }
+        }
+    }
+    let at = base.rfind('@').filter(|&p| p > 0)?;
+    Some((&base[..at], &base[at + 1..]))
 }
 
 // ─────────────────────────────── Rush monorepo ───────────────────────────────
@@ -1681,9 +1741,203 @@ snapshots:
         assert_eq!(entry(&entries, "peer-user").version, "4.0.0");
         // registry entries carry no URL in v9 — constructed at fetch time.
         assert_eq!(entry(&entries, "left-pad").resolved, None);
-        for absent in ["local-thing", "vendored"] {
-            assert!(!entries.iter().any(|e| e.name == absent), "{entries:?}");
-        }
+        // Exact set: the legacy v5/v6 grammars must not add or reshape v9
+        // entries (local-thing and vendored stay skipped).
+        assert_eq!(
+            sorted_pairs(&entries),
+            vec![
+                ("@scope/pkg".into(), "2.0.0".into()),
+                ("left-pad".into(), "1.3.0".into()),
+                ("peer-user".into(), "4.0.0".into()),
+            ]
+        );
+    }
+
+    fn sorted_pairs(entries: &[LockfileEntry]) -> Vec<(String, String)> {
+        let mut pairs: Vec<(String, String)> = entries
+            .iter()
+            .map(|e| (e.name.clone(), e.version.clone()))
+            .collect();
+        pairs.sort();
+        pairs
+    }
+
+    // Real pnpm 7 shapes (lockfileVersion 5.4, captured from a pnpm 7.33.5
+    // install: slash-separated `/name/version` keys, no `@` at all), plus
+    // synthetic keys in the same grammar: scoped, `_peer@x`-suffixed,
+    // `_<hash>`-suffixed, and a non-default-registry key (no leading `/`)
+    // that must stay out fail-closed.
+    const PNPM_LOCK_V5: &str = "lockfileVersion: 5.4
+
+specifiers:
+  mkdirp: 0.5.5
+
+dependencies:
+  mkdirp: 0.5.5
+
+packages:
+
+  /minimist/1.2.8:
+    resolution: {integrity: sha512-2yyAR8qBkN3YuheJanUpWC5U3bb5osDywNB8RzDVlDwDHbocAJveqqj1u8+SVD7jkWT4yvsHCpWqqWqAxb0zCA==}
+    dev: false
+
+  /mkdirp/0.5.5:
+    resolution: {integrity: sha512-NKmAlESf6jMGym1++R0Ra7wvhV+wFW63FaSOFPwRahvea0gMUcGUhVeAg/0BC0wiv9ih5NYPB1Wn1UEI1/L+xQ==}
+    hasBin: true
+    dependencies:
+      minimist: 1.2.8
+    dev: false
+
+  /@scope/pkg/2.0.0:
+    resolution: {integrity: sha512-scoped==}
+    dev: false
+
+  /styled-thing/5.3.3_react@17.0.2:
+    resolution: {integrity: sha512-peered==}
+    dev: false
+
+  /hashed-thing/1.0.0_abc123deadbeef:
+    resolution: {integrity: sha512-hashed==}
+    dev: false
+
+  example.com/private-pkg/1.0.0:
+    resolution: {integrity: sha512-registry==}
+    dev: false
+";
+
+    #[tokio::test]
+    async fn pnpm_v5_slash_keys_inventory_with_peer_and_hash_suffixes() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), "pnpm-lock.yaml", PNPM_LOCK_V5).await;
+
+        let (flavor, entries) = inventory_npm_lock(tmp.path()).await.unwrap();
+        assert_eq!(flavor, NpmLockFlavor::Pnpm);
+        assert_eq!(
+            sorted_pairs(&entries),
+            vec![
+                ("@scope/pkg".into(), "2.0.0".into()),
+                ("hashed-thing".into(), "1.0.0".into()),
+                ("minimist".into(), "1.2.8".into()),
+                ("mkdirp".into(), "0.5.5".into()),
+                ("styled-thing".into(), "5.3.3".into()),
+            ]
+        );
+        assert_eq!(
+            entry(&entries, "minimist").integrity,
+            LockIntegrity::Sri(
+                "sha512-2yyAR8qBkN3YuheJanUpWC5U3bb5osDywNB8RzDVlDwDHbocAJveqqj1u8+SVD7jkWT4yvsHCpWqqWqAxb0zCA=="
+                    .into()
+            )
+        );
+        assert_eq!(entry(&entries, "minimist").purl, "pkg:npm/minimist@1.2.8");
+    }
+
+    // Real pnpm 8 shapes (lockfileVersion 6.0, captured from a pnpm 8.15.9
+    // install: v9's `name@version` behind a leading `/`), plus synthetic
+    // scoped and peer-parenthesized keys in the same grammar.
+    const PNPM_LOCK_V6: &str = "lockfileVersion: '6.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+dependencies:
+  mkdirp:
+    specifier: 0.5.5
+    version: 0.5.5
+
+packages:
+
+  /minimist@1.2.8:
+    resolution: {integrity: sha512-2yyAR8qBkN3YuheJanUpWC5U3bb5osDywNB8RzDVlDwDHbocAJveqqj1u8+SVD7jkWT4yvsHCpWqqWqAxb0zCA==}
+    dev: false
+
+  /mkdirp@0.5.5:
+    resolution: {integrity: sha512-NKmAlESf6jMGym1++R0Ra7wvhV+wFW63FaSOFPwRahvea0gMUcGUhVeAg/0BC0wiv9ih5NYPB1Wn1UEI1/L+xQ==}
+    hasBin: true
+    dependencies:
+      minimist: 1.2.8
+    dev: false
+
+  /@scope/pkg@2.0.0:
+    resolution: {integrity: sha512-scoped==}
+    dev: false
+
+  /peer-user@4.0.0(left-pad@1.3.0):
+    resolution: {integrity: sha512-peer==}
+    dev: false
+";
+
+    #[tokio::test]
+    async fn pnpm_v6_leading_slash_keys_inventory_with_peer_parens() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), "pnpm-lock.yaml", PNPM_LOCK_V6).await;
+
+        let (flavor, entries) = inventory_npm_lock(tmp.path()).await.unwrap();
+        assert_eq!(flavor, NpmLockFlavor::Pnpm);
+        assert_eq!(
+            sorted_pairs(&entries),
+            vec![
+                ("@scope/pkg".into(), "2.0.0".into()),
+                ("minimist".into(), "1.2.8".into()),
+                ("mkdirp".into(), "0.5.5".into()),
+                ("peer-user".into(), "4.0.0".into()),
+            ]
+        );
+        assert_eq!(
+            entry(&entries, "mkdirp").integrity,
+            LockIntegrity::Sri(
+                "sha512-NKmAlESf6jMGym1++R0Ra7wvhV+wFW63FaSOFPwRahvea0gMUcGUhVeAg/0BC0wiv9ih5NYPB1Wn1UEI1/L+xQ=="
+                    .into()
+            )
+        );
+        assert_eq!(
+            entry(&entries, "@scope/pkg").purl,
+            "pkg:npm/@scope/pkg@2.0.0"
+        );
+    }
+
+    /// A pnpm→yarn-berry migration leaves a stale root pnpm-lock.yaml behind
+    /// a `.pnp.cjs` loader. The probe's refusal there is a yarn refusal, not
+    /// a pnpm one — the legacy-lock fallback must NOT inventory the stale
+    /// lock as the live dependency set.
+    #[tokio::test]
+    async fn stale_pnpm_lock_behind_yarn_berry_pnp_marker_is_not_inventoried() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), "pnpm-lock.yaml", PNPM_LOCK).await;
+        write(tmp.path(), ".pnp.cjs", "/* yarn berry PnP loader */").await;
+        assert!(
+            inventory_npm_lock(tmp.path()).await.is_none(),
+            "a stale pnpm-lock.yaml behind a yarn-berry PnP marker must not be inventoried"
+        );
+    }
+
+    /// Same stale-lock hazard for a pnpm→bun migration: bun.lockb refuses
+    /// with a bun-specific code, so the pnpm fallback must stay out.
+    #[tokio::test]
+    async fn stale_pnpm_lock_behind_bun_lockb_is_not_inventoried() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), "pnpm-lock.yaml", PNPM_LOCK).await;
+        write(tmp.path(), "bun.lockb", "\0binary").await;
+        assert!(
+            inventory_npm_lock(tmp.path()).await.is_none(),
+            "a stale pnpm-lock.yaml behind bun.lockb must not be inventoried"
+        );
+    }
+
+    /// pnpm's own `node-linker=pnp` layout (`.pnp.cjs` + pnpm store + lock,
+    /// no yarn.lock) refuses with the pnpm-specific PnP code — the fallback
+    /// exists for exactly this project shape and must still read the lock.
+    #[tokio::test]
+    async fn pnpm_pnp_layout_still_inventories_root_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), "pnpm-lock.yaml", PNPM_LOCK).await;
+        write(tmp.path(), ".pnp.cjs", "/* pnpm node-linker=pnp loader */").await;
+        write_nested(tmp.path(), "node_modules/.modules.yaml", "").await;
+
+        let (flavor, entries) = inventory_npm_lock(tmp.path()).await.unwrap();
+        assert_eq!(flavor, NpmLockFlavor::Pnpm);
+        assert_eq!(entry(&entries, "left-pad").version, "1.3.0");
     }
 
     // ── Rush monorepo ───────────────────────────────────────────────────────
@@ -2299,7 +2553,9 @@ source = { editable = "." }
         write(tmp.path(), "package-lock.json", PACKAGE_LOCK).await;
         assert!(inventory_npm_lock(tmp.path()).await.is_none());
 
-        // pnpm v6.
+        // A legacy pnpm lock fails the flavor probe and is read directly by
+        // the discovery fallback — with no packages section that finds
+        // nothing, so the result stays None rather than Some(empty).
         let tmp = tempfile::tempdir().unwrap();
         write(tmp.path(), "pnpm-lock.yaml", "lockfileVersion: '6.0'\n").await;
         assert!(inventory_npm_lock(tmp.path()).await.is_none());
