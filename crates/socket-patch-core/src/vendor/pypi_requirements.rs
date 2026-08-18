@@ -789,6 +789,7 @@ mod tests {
                 sha256: SHA.into(),
                 size: Some(11053),
                 platform_locked: None,
+                file_inventory: None,
             },
             wiring,
             lock: None,

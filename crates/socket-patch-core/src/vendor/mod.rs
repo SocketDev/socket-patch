@@ -86,7 +86,10 @@ pub use state::{
     carry_forward_wiring, load_state, lookup_entry, save_state, VendorEntry, VendorState,
     VENDOR_STATE_REL,
 };
-pub use verify::{check_vendored_artifact, file_sha256_hex, ArtifactHealth};
+pub use verify::{
+    artifact_is_file_shaped, check_vendored_artifact, compute_dir_inventory, file_sha256_hex,
+    ArtifactHealth,
+};
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;

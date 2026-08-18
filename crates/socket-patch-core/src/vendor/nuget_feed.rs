@@ -519,6 +519,7 @@ pub async fn vendor_nuget(
             sha256: hex::encode(sha2::Sha256::digest(&nupkg_bytes)),
             size: Some(nupkg_bytes.len() as u64),
             platform_locked: None,
+            file_inventory: None,
         },
         wiring,
         lock: None,
@@ -2427,6 +2428,7 @@ mod tests {
                 sha256: String::new(),
                 size: None,
                 platform_locked: None,
+                file_inventory: None,
             },
             wiring: vec![WiringRecord {
                 file: "../outside.txt".to_string(),

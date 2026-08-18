@@ -1207,6 +1207,7 @@ async fn vendored_golang_purl_skipped_by_apply() {
                 sha256: String::new(),
                 size: None,
                 platform_locked: None,
+                file_inventory: None,
             },
             wiring: Vec::new(),
             lock: None,

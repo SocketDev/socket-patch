@@ -868,6 +868,7 @@ pub async fn vendor_cargo_crate(
             sha256: String::new(), // dir-shaped: integrity is per-file afterHashes
             size: None,
             platform_locked: None,
+            file_inventory: None,
         },
         wiring,
         lock: lock_original,
@@ -2414,6 +2415,7 @@ mod tests {
                 sha256: String::new(),
                 size: None,
                 platform_locked: None,
+                file_inventory: None,
             },
             wiring: Vec::new(),
             lock: None,

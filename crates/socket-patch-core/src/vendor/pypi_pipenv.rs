@@ -658,6 +658,7 @@ mod tests {
                 sha256: WHEEL_SHA.into(),
                 size: Some(11053),
                 platform_locked: None,
+                file_inventory: None,
             },
             wiring,
             lock: None,

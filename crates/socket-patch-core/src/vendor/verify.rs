@@ -12,9 +12,14 @@
 //! Fail-closed order (each failure is a stable snake_case routing tag):
 //! `no_files` → `vendor_path_unsafe` → `vendor_uuid_mismatch` →
 //! `vendor_artifact_missing` → `vendor_artifact_unreadable` /
-//! `file_not_found` / `vendor_hash_mismatch`.
+//! `file_not_found` / `vendor_hash_mismatch` / `vendor_inventory_mismatch`
+//! (dir-shaped artifacts with a recorded [`file_inventory`] additionally
+//! verify their FULL file tree — missing, extra and modified unpatched
+//! files all fail; entries without one keep member-only verification).
+//!
+//! [`file_inventory`]: super::state::VendorArtifact::file_inventory
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -92,7 +97,17 @@ pub async fn verify_vendored_patch_record(
     let is_zip =
         path_str.ends_with(".whl") || path_str.ends_with(".nupkg") || path_str.ends_with(".jar");
     if !is_tarball && !is_zip {
-        return verify_dir_members(&artifact, record).await;
+        verify_dir_members(&artifact, record).await?;
+        // Whole-tree cross-check: a dir-shaped artifact's bytes are covered
+        // by NO lockfile integrity (bundler path sources, cargo path deps,
+        // …), so the members above are the only thing the record can vouch
+        // for — a recorded inventory extends the verdict to every file
+        // (missing / extra / modified unpatched files, the stub gemspec).
+        // Pre-inventory entries carry `None` and keep member-only behavior.
+        if let Some(inventory) = &entry.artifact.file_inventory {
+            verify_dir_inventory(&artifact, inventory).await?;
+        }
+        return Ok(());
     }
     let map = tokio::task::spawn_blocking(move || {
         if is_tarball {
@@ -190,6 +205,110 @@ fn read_wheel_to_map(whl: &Path) -> Result<HashMap<String, Vec<u8>>, String> {
 /// must not stall `repair`.
 const MAX_HEALTH_HASH_BYTES: u64 = 512 * 1024 * 1024;
 
+/// Hard cap on inventoried files, mirroring the zip reader's entry cap — a
+/// committed artifact dir is one package; a tampered dir must not stall an
+/// audit with a million planted files.
+const MAX_INVENTORY_ENTRIES: usize = 10_000;
+
+/// Is this artifact path a single committed FILE (tarball/wheel/nupkg/jar)
+/// — whose whole-file drift check is the ledger `sha256` — as opposed to a
+/// dir-shaped copy whose counterpart is the `fileInventory`? One suffix
+/// rule shared by the health check, repair's fingerprint fill, and the
+/// inventory-gap warning.
+pub fn artifact_is_file_shaped(path: &str) -> bool {
+    let norm = path.replace('\\', "/");
+    norm.ends_with(".tgz")
+        || norm.ends_with(".tar.gz")
+        || norm.ends_with(".whl")
+        || norm.ends_with(".nupkg")
+        || norm.ends_with(".jar")
+}
+
+/// Full-file inventory of a dir-shaped artifact: every regular file under
+/// `dir`, as `relative forward-slashed path → plain sha256 hex` (sorted —
+/// the exact shape [`super::state::VendorArtifact::file_inventory`]
+/// records). Fail-closed `Err` on anything that cannot be faithfully
+/// inventoried: a non-regular entry (symlink/FIFO — hashing through one
+/// could escape the artifact dir or wedge the audit), a non-UTF-8 name, an
+/// unreadable file, or a tree past the entry cap.
+pub async fn compute_dir_inventory(dir: &Path) -> Result<BTreeMap<String, String>, String> {
+    let root = dir.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        use sha2::{Digest, Sha256};
+
+        let mut out = BTreeMap::new();
+        let mut stack: Vec<(PathBuf, String)> = vec![(root, String::new())];
+        while let Some((abs, rel)) = stack.pop() {
+            let entries = std::fs::read_dir(&abs)
+                .map_err(|e| format!("unreadable artifact dir `{rel}`: {e}"))?;
+            for entry in entries {
+                let entry = entry.map_err(|e| format!("unreadable artifact dir `{rel}`: {e}"))?;
+                let name = entry
+                    .file_name()
+                    .to_str()
+                    .ok_or_else(|| format!("non-UTF-8 file name under `{rel}`"))?
+                    .to_string();
+                let child_rel = if rel.is_empty() {
+                    name
+                } else {
+                    format!("{rel}/{name}")
+                };
+                // symlink_metadata: never follow links — a planted symlink
+                // must fail the inventory, not hash bytes outside the dir.
+                let meta = std::fs::symlink_metadata(entry.path())
+                    .map_err(|e| format!("unreadable `{child_rel}`: {e}"))?;
+                if meta.is_dir() {
+                    stack.push((entry.path(), child_rel));
+                    continue;
+                }
+                if !meta.is_file() {
+                    return Err(format!("`{child_rel}` is not a regular file"));
+                }
+                if meta.len() > MAX_HEALTH_HASH_BYTES {
+                    return Err(format!("`{child_rel}` exceeds the inventory size cap"));
+                }
+                if out.len() >= MAX_INVENTORY_ENTRIES {
+                    return Err(format!(
+                        "artifact dir exceeds {MAX_INVENTORY_ENTRIES} files"
+                    ));
+                }
+                let mut file = std::fs::File::open(entry.path())
+                    .map_err(|e| format!("unreadable `{child_rel}`: {e}"))?;
+                let mut hasher = Sha256::new();
+                std::io::copy(&mut file, &mut hasher)
+                    .map_err(|e| format!("unreadable `{child_rel}`: {e}"))?;
+                out.insert(child_rel, hex::encode(hasher.finalize()));
+            }
+        }
+        Ok(out)
+    })
+    .await
+    .map_err(|_| "artifact inventory task failed".to_string())?
+}
+
+/// Compare the live tree under `dir` against the recorded inventory:
+/// missing, extra and modified files all fail with the
+/// `vendor_inventory_mismatch` routing tag; a tree that cannot be walked
+/// (planted symlink/FIFO, unreadable file) is `vendor_artifact_unreadable`.
+async fn verify_dir_inventory(
+    dir: &Path,
+    inventory: &BTreeMap<String, String>,
+) -> Result<(), String> {
+    let actual = compute_dir_inventory(dir)
+        .await
+        .map_err(|_| "vendor_artifact_unreadable".to_string())?;
+    if actual.len() != inventory.len() {
+        return Err("vendor_inventory_mismatch".to_string());
+    }
+    for (rel, recorded) in inventory {
+        match actual.get(rel) {
+            Some(live) if live.eq_ignore_ascii_case(recorded) => {}
+            _ => return Err("vendor_inventory_mismatch".to_string()),
+        }
+    }
+    Ok(())
+}
+
 /// Classified health of one ledger entry's committed artifact, for
 /// `repair`-style callers that need a DECISION (rebuild or not), not just a
 /// routing tag.
@@ -202,7 +321,8 @@ pub enum ArtifactHealth {
     Missing,
     /// Present but failing verification: rebuildable. `reason` is the
     /// stable routing tag (`vendor_hash_mismatch`, `file_not_found`,
-    /// `vendor_artifact_unreadable`, `vendor_sha256_mismatch`).
+    /// `vendor_artifact_unreadable`, `vendor_sha256_mismatch`,
+    /// `vendor_inventory_mismatch`).
     Corrupt { reason: String },
     /// The ledger/artifact uuid doesn't match the record: a re-vendor is
     /// pending — not repair's job.
@@ -214,10 +334,12 @@ pub enum ArtifactHealth {
 
 /// Health-check one vendored artifact against its patch record: the
 /// per-file afterHash verification of [`verify_vendored_patch_record`]
-/// plus, for file-shaped artifacts (`.tgz`/`.tar.gz`/`.whl`) with a
-/// recorded ledger sha256, a whole-file hash cross-check — the rewired
-/// lockfile integrity references those exact bytes, so silent drift breaks
-/// the package manager even when the patched members still verify.
+/// (which for dir-shaped artifacts includes the whole-tree fileInventory
+/// cross-check) plus, for file-shaped artifacts (`.tgz`/`.tar.gz`/`.whl`)
+/// with a recorded ledger sha256, a whole-file hash cross-check — the
+/// rewired lockfile integrity references those exact bytes, so silent
+/// drift breaks the package manager even when the patched members still
+/// verify.
 pub async fn check_vendored_artifact(
     project_root: &Path,
     entry: &VendorEntry,
@@ -227,9 +349,10 @@ pub async fn check_vendored_artifact(
         Err(tag) => match tag.as_str() {
             "vendor_artifact_missing" => ArtifactHealth::Missing,
             "vendor_uuid_mismatch" => ArtifactHealth::StaleUuid,
-            "vendor_hash_mismatch" | "file_not_found" | "vendor_artifact_unreadable" => {
-                ArtifactHealth::Corrupt { reason: tag }
-            }
+            "vendor_hash_mismatch"
+            | "file_not_found"
+            | "vendor_artifact_unreadable"
+            | "vendor_inventory_mismatch" => ArtifactHealth::Corrupt { reason: tag },
             _ => ArtifactHealth::Unverifiable { reason: tag },
         },
         Ok(()) => {
@@ -237,13 +360,10 @@ pub async fn check_vendored_artifact(
             // `.nupkg` (NuGet) and `.jar` (Maven) are single committed files
             // whose recorded ledger sha256 the rewired lockfile / `.sha1`
             // sidecar references, so they get the same whole-file drift
-            // cross-check as tarballs/wheels.
-            let file_shaped = norm.ends_with(".tgz")
-                || norm.ends_with(".tar.gz")
-                || norm.ends_with(".whl")
-                || norm.ends_with(".nupkg")
-                || norm.ends_with(".jar");
-            if !file_shaped || entry.artifact.sha256.is_empty() {
+            // cross-check as tarballs/wheels. (Dir-shaped artifacts got the
+            // fileInventory whole-tree cross-check inside the verification
+            // above.)
+            if !artifact_is_file_shaped(&norm) || entry.artifact.sha256.is_empty() {
                 return ArtifactHealth::Healthy;
             }
             // The path already passed checked_artifact_path inside the
@@ -346,6 +466,7 @@ mod tests {
                 sha256: String::new(),
                 size: None,
                 platform_locked: None,
+                file_inventory: None,
             },
             wiring: Vec::new(),
             lock: None,
@@ -380,6 +501,169 @@ mod tests {
         zip.start_file::<_, ()>(member, Default::default()).unwrap();
         zip.write_all(bytes).unwrap();
         zip.finish().unwrap();
+    }
+
+    /// The whole-tree inventory closes the dir-shaped blindspot: with only
+    /// afterHashes, a tampered UNPATCHED file (or stub gemspec), a deleted
+    /// file, or a planted extra file were all blessed Healthy. Each arm of
+    /// the tamper matrix is hand-pinned; the legacy no-inventory entry keeps
+    /// member-only behavior (backward tolerance).
+    #[tokio::test]
+    async fn dir_inventory_detects_unpatched_tamper_missing_and_extra_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let rel = format!(".socket/vendor/gem/{UUID}/rack-3.2.6");
+        let dir = root.join(&rel);
+        tokio::fs::create_dir_all(dir.join("lib")).await.unwrap();
+        tokio::fs::write(dir.join("lib/rack.rb"), PATCHED)
+            .await
+            .unwrap();
+        tokio::fs::write(dir.join("rack.gemspec"), b"stub gemspec\n")
+            .await
+            .unwrap();
+
+        let rec = record(UUID, "lib/rack.rb");
+        let mut ent = entry("gem", UUID, &rel);
+        ent.artifact.file_inventory = Some(compute_dir_inventory(&dir).await.unwrap());
+        // Anti-vacuity: the recorded inventory names both files with real
+        // plain-sha256 values, and the pristine tree verifies end to end.
+        {
+            let inv = ent.artifact.file_inventory.as_ref().unwrap();
+            assert_eq!(
+                inv.keys().collect::<Vec<_>>(),
+                ["lib/rack.rb", "rack.gemspec"]
+            );
+            use sha2::{Digest, Sha256};
+            assert_eq!(inv["lib/rack.rb"], hex::encode(Sha256::digest(PATCHED)));
+        }
+        assert!(verify_vendored_patch_record(root, &ent, &rec).await.is_ok());
+        assert_eq!(
+            check_vendored_artifact(root, &ent, &rec).await,
+            ArtifactHealth::Healthy
+        );
+
+        // 1. Tampered UNPATCHED file: afterHashes still verify, the
+        //    inventory flips the verdict.
+        tokio::fs::write(dir.join("rack.gemspec"), b"tampered gemspec\n")
+            .await
+            .unwrap();
+        assert_eq!(
+            verify_vendored_patch_record(root, &ent, &rec)
+                .await
+                .unwrap_err(),
+            "vendor_inventory_mismatch",
+            "modified unpatched file"
+        );
+        assert_eq!(
+            check_vendored_artifact(root, &ent, &rec).await,
+            ArtifactHealth::Corrupt {
+                reason: "vendor_inventory_mismatch".to_string()
+            },
+            "Corrupt (rebuildable), never Unverifiable"
+        );
+
+        // 2. Missing unpatched file.
+        tokio::fs::remove_file(dir.join("rack.gemspec"))
+            .await
+            .unwrap();
+        assert_eq!(
+            verify_vendored_patch_record(root, &ent, &rec)
+                .await
+                .unwrap_err(),
+            "vendor_inventory_mismatch",
+            "deleted unpatched file"
+        );
+
+        // 3. Extra planted file (count parity restored: gemspec back, plus
+        //    a file the inventory never recorded).
+        tokio::fs::write(dir.join("rack.gemspec"), b"stub gemspec\n")
+            .await
+            .unwrap();
+        tokio::fs::write(dir.join("lib/evil.rb"), b"payload\n")
+            .await
+            .unwrap();
+        assert_eq!(
+            verify_vendored_patch_record(root, &ent, &rec)
+                .await
+                .unwrap_err(),
+            "vendor_inventory_mismatch",
+            "extra file"
+        );
+        tokio::fs::remove_file(dir.join("lib/evil.rb"))
+            .await
+            .unwrap();
+
+        // 4. Same count, swapped identity: one recorded file replaced by a
+        //    differently-named one (len-only comparison would miss it).
+        tokio::fs::remove_file(dir.join("rack.gemspec"))
+            .await
+            .unwrap();
+        tokio::fs::write(dir.join("rack.gemspec2"), b"stub gemspec\n")
+            .await
+            .unwrap();
+        assert_eq!(
+            verify_vendored_patch_record(root, &ent, &rec)
+                .await
+                .unwrap_err(),
+            "vendor_inventory_mismatch",
+            "renamed file at equal count"
+        );
+        tokio::fs::remove_file(dir.join("rack.gemspec2"))
+            .await
+            .unwrap();
+        tokio::fs::write(dir.join("rack.gemspec"), b"stub gemspec\n")
+            .await
+            .unwrap();
+
+        // 5. LEGACY entry (no inventory recorded): the same unpatched-file
+        //    tamper keeps today's member-only Healthy verdict.
+        tokio::fs::write(dir.join("rack.gemspec"), b"tampered gemspec\n")
+            .await
+            .unwrap();
+        let legacy = entry("gem", UUID, &rel);
+        assert!(legacy.artifact.file_inventory.is_none());
+        assert!(
+            verify_vendored_patch_record(root, &legacy, &rec)
+                .await
+                .is_ok(),
+            "pre-inventory entries keep member-only verification"
+        );
+        assert_eq!(
+            check_vendored_artifact(root, &legacy, &rec).await,
+            ArtifactHealth::Healthy
+        );
+    }
+
+    /// SECURITY: a symlink planted inside a vendored dir must fail the
+    /// inventory walk (never hash through it — the target may live outside
+    /// the artifact dir), surfacing as unreadable/Corrupt.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dir_inventory_refuses_planted_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let rel = format!(".socket/vendor/gem/{UUID}/rack-3.2.6");
+        let dir = root.join(&rel);
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("lib.rb"), PATCHED).await.unwrap();
+
+        let rec = record(UUID, "lib.rb");
+        let mut ent = entry("gem", UUID, &rel);
+        ent.artifact.file_inventory = Some(compute_dir_inventory(&dir).await.unwrap());
+
+        let outside = root.join("outside.txt");
+        tokio::fs::write(&outside, b"outside\n").await.unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("link.rb")).unwrap();
+        assert!(
+            compute_dir_inventory(&dir).await.is_err(),
+            "symlinks are not inventoriable"
+        );
+        assert_eq!(
+            verify_vendored_patch_record(root, &ent, &rec)
+                .await
+                .unwrap_err(),
+            "vendor_artifact_unreadable"
+        );
     }
 
     #[tokio::test]

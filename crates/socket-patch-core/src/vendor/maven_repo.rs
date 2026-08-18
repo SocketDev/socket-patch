@@ -387,6 +387,7 @@ pub async fn vendor_maven(
             sha256: hex::encode(Sha256::digest(&jar_bytes)),
             size: Some(jar_bytes.len() as u64),
             platform_locked: None,
+            file_inventory: None,
         },
         wiring: vec![WiringRecord {
             file: PROJECT_POM.to_string(),
