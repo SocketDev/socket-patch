@@ -150,14 +150,15 @@ marker_blob() { # $1 = marker  -> runnable payload on stdout
   esac
 }
 
-write_manifest() { # $1=purl $2=key $3=afterHash
+write_manifest() { # $1=purl $2=key $3=afterHash $4=beforeHash (default: zero)
+  local before="${4:-$ZEROHASH}"
   cat > .socket/manifest.json <<EOF
 {
   "patches": {
     "$1": {
       "uuid": "$UUID",
       "exportedAt": "2026-01-01T00:00:00Z",
-      "files": { "$2": { "beforeHash": "$ZEROHASH", "afterHash": "$3" } },
+      "files": { "$2": { "beforeHash": "$before", "afterHash": "$3" } },
       "vulnerabilities": {},
       "description": "setup-matrix synthetic patch",
       "license": "MIT",
@@ -166,6 +167,35 @@ write_manifest() { # $1=purl $2=key $3=afterHash
   }
 }
 EOF
+}
+
+# gem only: the real git-blob sha256 of the target file inside the published
+# .gem, probed via `gem fetch` + `gem unpack` (mirrors docker_e2e_gem's
+# beforeHash probe). gem apply is hash-gated with no npm-style
+# mismatch-warn-and-apply fallback, so the all-zeros placeholder makes the
+# variant gate drop the package and the install hook's apply no-ops. Every
+# other ecosystem keeps the zero hash — their fixtures are byte-identical to
+# before this helper existed.
+resolve_before_hash() {
+  if [ "$SM_ECOSYSTEM" != gem ]; then
+    printf '%s' "$ZEROHASH"
+    return
+  fi
+  local dir rel target
+  dir="$(mktemp -d)"
+  rel="${SM_MANIFEST_KEY#package/}"
+  target="$dir/${SM_PACKAGE}-${SM_VERSION}/$rel"
+  if (cd "$dir" \
+        && gem fetch "$SM_PACKAGE" -v "$SM_VERSION" >/dev/null 2>&1 \
+        && gem unpack "${SM_PACKAGE}-${SM_VERSION}.gem" >/dev/null 2>&1) \
+      && [ -f "$target" ]; then
+    git_sha256 "$target"
+  else
+    # The function runs inside $(...): route the log PAST the capture pipe.
+    log "gem beforeHash probe failed; falling back to the zero placeholder" >&2
+    printf '%s' "$ZEROHASH"
+  fi
+  rm -rf "$dir"
 }
 
 build_fixture() {
@@ -196,11 +226,11 @@ build_fixture() {
     alt)
       marker_blob "$SM_ALT_MARKER" > "$blob_tmp"
       local h; h="$(git_sha256 "$blob_tmp")"; cp "$blob_tmp" ".socket/blobs/$h"
-      write_manifest "$SM_PURL" "$SM_MANIFEST_KEY" "$h" ;;
+      write_manifest "$SM_PURL" "$SM_MANIFEST_KEY" "$h" "$(resolve_before_hash)" ;;
     *) # primary
       marker_blob "$SM_MARKER" > "$blob_tmp"
       local h; h="$(git_sha256 "$blob_tmp")"; cp "$blob_tmp" ".socket/blobs/$h"
-      write_manifest "$SM_PURL" "$SM_MANIFEST_KEY" "$h" ;;
+      write_manifest "$SM_PURL" "$SM_MANIFEST_KEY" "$h" "$(resolve_before_hash)" ;;
   esac
   rm -f "$blob_tmp"
 }

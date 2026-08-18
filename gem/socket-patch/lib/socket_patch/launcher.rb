@@ -31,13 +31,23 @@ module SocketPatch
       bin = resolve_binary
       if Gem.win_platform?
         # Windows has no exec() that replaces the process cleanly for console
-        # apps; spawn + wait and propagate the child's exit status.
-        exit(system(bin, *argv) ? $?.exitstatus : 1)
+        # apps; spawn + wait and propagate the child's real exit status (a
+        # blanket 1 would erase the CLI's meaningful non-zero codes, e.g.
+        # `setup --check`'s needs-configuration signal).
+        ok = system(bin, *argv)
+        raise LauncherError, "could not run #{bin}" if ok.nil?
+        exit($?.exitstatus || 1)
       else
         exec([bin, bin], *argv)
       end
     rescue LauncherError => e
       warn("socket-patch: #{e.message}")
+      exit(1)
+    rescue StandardError => e
+      # First-run download/extract failures outside our own error type (DNS
+      # outages, TLS errors, ...) must exit cleanly, not escape as raw
+      # backtraces.
+      warn("socket-patch: #{e.class}: #{e.message}")
       exit(1)
     end
 
@@ -74,7 +84,10 @@ module SocketPatch
         return spec.version.to_s
       end
       Gem::Specification.find_by_name("socket-patch").version.to_s
-    rescue StandardError
+    rescue StandardError, Gem::LoadError
+      # Gem::MissingSpecError (the gem isn't installed at all — running from
+      # a checkout) is a Gem::LoadError, which is NOT a StandardError; without
+      # naming it the documented fallback never engaged.
       VERSION
     end
 
@@ -152,9 +165,33 @@ module SocketPatch
           raise LauncherError, "release archive #{archive} did not contain #{exe}"
         end
 
-        FileUtils.mkdir_p(File.dirname(dest))
-        FileUtils.cp(extracted, dest)
-        File.chmod(0o755, dest) unless Gem.win_platform?
+        install_executable(extracted, dest)
+      end
+    end
+
+    # Publish the verified binary into the cache atomically: copy to a temp
+    # file in the destination dir, set the exec bit, then rename over the
+    # final path — a concurrent first run can only ever see a complete,
+    # executable binary, never a torn or not-yet-chmodded one.
+    def install_executable(src, dest)
+      FileUtils.mkdir_p(File.dirname(dest))
+      tmp = File.join(File.dirname(dest), ".#{File.basename(dest)}.#{Process.pid}.tmp")
+      begin
+        FileUtils.cp(src, tmp)
+        File.chmod(0o755, tmp) unless Gem.win_platform?
+        begin
+          File.rename(tmp, dest)
+        rescue SystemCallError
+          # Windows rename cannot replace an existing file: a concurrent
+          # first run already published the (identical, verified) binary.
+          raise unless File.exist?(dest)
+        end
+      ensure
+        begin
+          File.delete(tmp) if File.file?(tmp)
+        rescue StandardError
+          # Leftover temp cleanup is best-effort.
+        end
       end
     end
 
@@ -223,6 +260,14 @@ module SocketPatch
       raise LauncherError, "checksum mismatch for #{archive} (expected #{expected}, got #{actual})"
     end
 
+    # Quote a value for interpolation into a PowerShell command: single-quoted
+    # strings are literal except for embedded single quotes, which are escaped
+    # by doubling them (paths like `it's here` would otherwise break the
+    # command).
+    def powershell_quote(value)
+      "'#{value.gsub("'", "''")}'"
+    end
+
     def extract(archive_path, ext, dir)
       ok =
         if ext == "zip"
@@ -230,7 +275,8 @@ module SocketPatch
           # PowerShell Expand-Archive.
           system("tar", "-xf", archive_path, "-C", dir) ||
             system("powershell", "-NoProfile", "-Command",
-                   "Expand-Archive -Force -LiteralPath '#{archive_path}' -DestinationPath '#{dir}'")
+                   "Expand-Archive -Force -LiteralPath #{powershell_quote(archive_path)} " \
+                   "-DestinationPath #{powershell_quote(dir)}")
         else
           system("tar", "xzf", archive_path, "-C", dir)
         end

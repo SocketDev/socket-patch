@@ -2,7 +2,7 @@
 
 # Published form of the socket-patch Bundler plugin (CLI_CONTRACT property:
 # "gem" support matrix, Phase 2). `socket-patch setup` today references the
-# in-tree plugin under `.socket/bundler-plugin/` via `git:`; once this gem is
+# in-tree plugin under `.socket/bundler-plugin/` via `path:`; once this gem is
 # published, a follow-up switches the Gemfile directive to
 # `plugin "socket-patch-bundler", "~> <major.minor>"`. The version is kept in
 # sync with the workspace by `scripts/version-sync.sh`.
