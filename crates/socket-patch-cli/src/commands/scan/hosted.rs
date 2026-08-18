@@ -96,7 +96,11 @@ fn emit_json_error(scan_result: Option<serde_json::Value>, message: &str) {
     if !result.get("redirect").is_some_and(|r| r.is_object()) {
         result["redirect"] = serde_json::json!({ "mode": "hosted" });
     }
-    println!("{}", serde_json::to_string_pretty(&result).unwrap());
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&result)
+            .expect("serializing an in-memory JSON value cannot fail")
+    );
 }
 
 /// Build the hosted `--json` success envelope: the classic scan object
@@ -931,7 +935,7 @@ pub(super) async fn run_redirect(
         let mut result = build_redirect_json_envelope(scan_result.take(), redirect);
         if let Some(statements) = vex_statements {
             result["vex"] = serde_json::json!({
-                "path": args.vex.vex.as_ref().unwrap().display().to_string(),
+                "path": args.vex.vex.as_ref().expect("vex_statements is Some only when --vex was given").display().to_string(),
                 "statements": statements,
                 "format": "openvex-0.2.0",
                 "verified": false,
@@ -940,7 +944,11 @@ pub(super) async fn run_redirect(
             result["status"] = serde_json::json!("error");
             result["error"] = serde_json::json!({ "code": code, "message": message });
         }
-        println!("{}", serde_json::to_string_pretty(&result).unwrap());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&result)
+                .expect("serializing an in-memory JSON value cannot fail")
+        );
     } else {
         if !args.common.silent {
             let verb = if args.common.dry_run {
@@ -993,7 +1001,11 @@ pub(super) async fn run_redirect(
                      install time; run `socket-patch vex` after installing to verify against \
                      the installed tree).",
                     statements,
-                    args.vex.vex.as_ref().unwrap().display(),
+                    args.vex
+                        .vex
+                        .as_ref()
+                        .expect("vex_statements is Some only when --vex was given")
+                        .display(),
                 );
             } else if args.vex.vex.is_some() && args.common.dry_run {
                 eprintln!("Skipping VEX generation (--dry-run).");

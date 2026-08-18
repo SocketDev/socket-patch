@@ -178,7 +178,10 @@ fn merge_metadata(record: &mut serde_json::Value, meta: serde_json::Value) {
 
 /// Print a `serde_json::Value` as pretty JSON to stdout.
 fn print_json(v: &serde_json::Value) {
-    println!("{}", serde_json::to_string_pretty(v).unwrap());
+    println!(
+        "{}",
+        serde_json::to_string_pretty(v).expect("serializing an in-memory JSON value cannot fail")
+    );
 }
 
 /// Truncate `s` to at most `limit` displayed characters, appending an
@@ -496,10 +499,11 @@ impl fmt::Display for IdentifierType {
 }
 
 fn detect_identifier_type(identifier: &str) -> Option<IdentifierType> {
-    let uuid_re =
-        Regex::new(r"(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$").unwrap();
-    let cve_re = Regex::new(r"(?i)^CVE-\d{4}-\d+$").unwrap();
-    let ghsa_re = Regex::new(r"(?i)^GHSA-[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4}$").unwrap();
+    let uuid_re = Regex::new(r"(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+        .expect("hardcoded UUID regex must compile");
+    let cve_re = Regex::new(r"(?i)^CVE-\d{4}-\d+$").expect("hardcoded CVE regex must compile");
+    let ghsa_re = Regex::new(r"(?i)^GHSA-[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4}$")
+        .expect("hardcoded GHSA regex must compile");
 
     if uuid_re.is_match(identifier) {
         Some(IdentifierType::Uuid)
@@ -635,7 +639,7 @@ pub(crate) fn select_patches(
                             "purl": purl,
                             "options": options_json,
                         }))
-                        .unwrap()
+                        .expect("serializing an in-memory JSON value cannot fail")
                     );
                     return Err(1);
                 }
@@ -1840,7 +1844,11 @@ pub async fn run(args: GetArgs) -> i32 {
     let (code, result_json) = download_and_apply_patches(&selected, &params).await;
 
     if args.common.json {
-        println!("{}", serde_json::to_string_pretty(&result_json).unwrap());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&result_json)
+                .expect("serializing an in-memory JSON value cannot fail")
+        );
     }
 
     code
@@ -2083,7 +2091,11 @@ async fn save_and_apply_patch(args: &GetArgs, patch: &PatchResponse) -> i32 {
         if !warnings.is_empty() {
             result_json["warnings"] = serde_json::json!(warnings);
         }
-        println!("{}", serde_json::to_string_pretty(&result_json).unwrap());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&result_json)
+                .expect("serializing an in-memory JSON value cannot fail")
+        );
     }
 
     exit_code
