@@ -18,8 +18,9 @@
 //! (all three modes), `apply` (`--silent`/`--check` mutes), and `remove`.
 //!
 //! Stderr assertions ignore the "No SOCKET_API_TOKEN set" client warning:
-//! it's printed unconditionally by `get_api_client_with_overrides` in core
-//! for every command and is out of scope for `rollback`'s `--silent` gating.
+//! it's printed by `get_api_client_with_overrides` in core for every ONLINE
+//! command (offline runs suppress it) and is out of scope for `rollback`'s
+//! `--silent` gating.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -144,8 +145,9 @@ fn rollback_silent_unknown_identifier_keeps_error_output() {
 }
 
 /// `rollback --silent --offline` with a missing before-blob (the offline
-/// bail) must still print the error. This path returns a contentless
-/// partial_failure — the eprintln IS the only diagnostic.
+/// bail) must still print the error. In human mode the eprintln IS the
+/// only diagnostic — the bail's synthesized per-package failure records
+/// surface only in the `--json` envelope.
 #[test]
 fn rollback_silent_offline_missing_blob_keeps_error_output() {
     let tmp = tempfile::tempdir().unwrap();

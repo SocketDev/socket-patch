@@ -253,11 +253,20 @@ fn rollback_unknown_identifier_emits_error() {
     );
 }
 
+/// The beforeHash pinned in `MANIFEST_JSON` (deliberately not staged on
+/// disk by the missing-blob tests).
+const MISSING_BEFORE_HASH: &str =
+    "0000000000000000000000000000000000000000000000000000000000000000";
+
 #[test]
 fn rollback_offline_with_missing_before_blob_partial_failure() {
     // Manifest has a patch whose beforeHash is NOT on disk; --offline
-    // means we won't fetch. Rollback should fail out before touching
-    // anything.
+    // means we won't fetch. Rollback must fail out before touching
+    // anything — and the JSON envelope must SAY so. The bail fires before
+    // the rollback loop produces any per-package results, so the failures
+    // are synthesized: before the fix the envelope claimed `failed: 0`
+    // with empty `results[]` on an exit-1 run, and `--json` mutes the
+    // stderr explanation, leaving machine consumers zero diagnostic.
     let tmp = tempfile::tempdir().expect("tempdir");
     make_socket_dir(tmp.path());
     let (code, stdout) = run(tmp.path(), &["--json", "--offline"]);
@@ -270,20 +279,162 @@ fn rollback_offline_with_missing_before_blob_partial_failure() {
     assert_eq!(v["rolledBack"], 0);
     assert_eq!(v["alreadyOriginal"], 0);
     assert_eq!(v["dryRun"], false, "not a dry-run");
-    // Known design gap (see memory `apply-invariants-test-hardened`): the
-    // offline missing-blob bail returns a *contentless* partial_failure — it
-    // aborts after discovery but before the rollback loop produces any
-    // per-package results, so `failed` stays 0 and `results` is empty even
-    // though the run did not succeed. Pin that exact shape so the bail can't
-    // silently morph into either a real failure count or a spurious success.
+    // The gated package is counted as failed — same per-package counter
+    // semantics as a mid-run failure. A `failed: 0` partial_failure is
+    // self-contradictory.
     assert_eq!(
-        v["failed"], 0,
-        "contentless bail records no per-package failure"
+        v["failed"], 1,
+        "the blob-gated package must be counted as failed; stdout=\n{stdout}"
+    );
+    let results = v["results"].as_array().expect("results array");
+    assert_eq!(
+        results.len(),
+        1,
+        "the bail must synthesize one failed result per gated package; stdout=\n{stdout}"
+    );
+    let entry = &results[0];
+    assert_eq!(entry["purl"], "pkg:npm/__rollback_test__@1.0.0");
+    assert_eq!(entry["success"], false);
+    assert_eq!(
+        entry["filesRolledBack"]
+            .as_array()
+            .expect("filesRolledBack array")
+            .len(),
+        0,
+        "nothing was restored on the bail"
+    );
+    // The error names the remedy; the per-file record names the blob.
+    let err = entry["error"].as_str().expect("error message string");
+    assert!(
+        err.contains("socket-patch repair"),
+        "error must carry the repair remedy; got: {err}"
+    );
+    let verified = entry["filesVerified"]
+        .as_array()
+        .expect("filesVerified array");
+    let file = verified
+        .iter()
+        .find(|f| f["file"] == "package/index.js")
+        .unwrap_or_else(|| panic!("gated file must appear in filesVerified; stdout=\n{stdout}"));
+    assert_eq!(
+        file["status"], "missing_blob",
+        "the engine's missing_blob vocabulary; stdout=\n{stdout}"
     );
     assert_eq!(
-        v["results"].as_array().expect("results array").len(),
-        0,
-        "offline bail must abort before producing any per-package results"
+        file["targetHash"], MISSING_BEFORE_HASH,
+        "the missing blob hash must be machine-readable"
+    );
+    let msg = file["message"].as_str().expect("message string");
+    assert!(
+        msg.contains(MISSING_BEFORE_HASH),
+        "message must name the missing hash; got: {msg}"
+    );
+    assert!(
+        msg.contains("--offline") && msg.contains("socket-patch repair"),
+        "message must name the offline gate and the repair remedy; got: {msg}"
+    );
+}
+
+/// Human-mode parity for the offline missing-blob bail: stderr explains
+/// the gate (count + repair hint) and the stdout summary names the failed
+/// package — the same information the JSON envelope now carries.
+#[test]
+fn rollback_offline_missing_blob_human_names_package_and_remedy() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    make_socket_dir(tmp.path());
+    let out = rollback_cmd(tmp.path())
+        .args(["--offline"])
+        .output()
+        .expect("run socket-patch");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "offline + missing blob must exit 1"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("blob(s) are missing") && stderr.contains("--offline"),
+        "stderr must explain the offline gate; stderr=\n{stderr}"
+    );
+    assert!(
+        stderr.contains("socket-patch repair"),
+        "stderr must carry the repair remedy; stderr=\n{stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("Failed to rollback:")
+            && stdout.contains("pkg:npm/__rollback_test__@1.0.0"),
+        "the human summary must name the failed package; stdout=\n{stdout}"
+    );
+}
+
+/// Online counterpart: the blob download fires (against an unroutable
+/// localhost port, so the failure is instant and nothing leaves the
+/// machine), the still-missing re-check aborts, and the envelope carries
+/// the same synthesized per-package failures with the download reason.
+///
+/// Also pins the client-notice dedupe: building an API client per internal
+/// phase (telemetry client in `run()`, then a second one for this download)
+/// printed the core "No SOCKET_API_TOKEN set" notice twice in a single
+/// rollback invocation.
+#[test]
+fn rollback_undownloadable_blob_envelope_names_blob_and_remedy() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    make_socket_dir(tmp.path());
+    let out = rollback_cmd(tmp.path())
+        .env("SOCKET_TELEMETRY_DISABLED", "1")
+        .args([
+            "--json",
+            "--api-url",
+            "http://127.0.0.1:1/",
+            "--proxy-url",
+            "http://127.0.0.1:1/",
+        ])
+        .output()
+        .expect("run socket-patch");
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "undownloadable blob must exit 1; stdout=\n{stdout}\nstderr=\n{stderr}"
+    );
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert_eq!(v["status"], "partial_failure");
+    assert_eq!(v["failed"], 1, "stdout=\n{stdout}");
+    let results = v["results"].as_array().expect("results array");
+    assert_eq!(results.len(), 1, "stdout=\n{stdout}");
+    let entry = &results[0];
+    assert_eq!(entry["purl"], "pkg:npm/__rollback_test__@1.0.0");
+    assert_eq!(entry["success"], false);
+    let err = entry["error"].as_str().expect("error message string");
+    assert!(
+        err.contains("socket-patch repair"),
+        "error must carry the repair remedy; got: {err}"
+    );
+    let verified = entry["filesVerified"]
+        .as_array()
+        .expect("filesVerified array");
+    let file = verified
+        .iter()
+        .find(|f| f["file"] == "package/index.js")
+        .unwrap_or_else(|| panic!("gated file must appear in filesVerified; stdout=\n{stdout}"));
+    assert_eq!(file["status"], "missing_blob");
+    assert_eq!(file["targetHash"], MISSING_BEFORE_HASH);
+    let msg = file["message"].as_str().expect("message string");
+    assert!(
+        msg.contains("could not be downloaded") && msg.contains(MISSING_BEFORE_HASH),
+        "message must name the download failure and the hash; got: {msg}"
+    );
+
+    // The env is scrubbed (no SOCKET_API_TOKEN) and socket-cli config is
+    // vetoed by the workspace-pinned SOCKET_NO_CONFIG=1, so every client
+    // build prints the no-token notice — it must appear exactly once per
+    // invocation, not once per internal phase.
+    let notes = stderr.matches("No SOCKET_API_TOKEN set").count();
+    assert_eq!(
+        notes, 1,
+        "the no-token notice must print exactly once per run; stderr=\n{stderr}"
     );
 }
 

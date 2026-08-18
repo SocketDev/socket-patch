@@ -1,12 +1,13 @@
 use clap::Args;
 use socket_patch_core::api::blob_fetcher::{fetch_blobs_by_hash, format_fetch_result};
-use socket_patch_core::api::client::get_api_client_with_overrides;
+use socket_patch_core::api::client::{get_api_client_with_overrides, ApiClient};
 use socket_patch_core::crawlers::CrawlerOptions;
 use socket_patch_core::manifest::operations::{get_before_hash_blobs, read_manifest};
 use socket_patch_core::manifest::schema::{PatchFileInfo, PatchManifest, PatchRecord};
 use socket_patch_core::patch::apply::select_installed_variants;
 use socket_patch_core::patch::rollback::{
-    rollback_package_patch, RollbackResult, VerifyRollbackStatus,
+    cannot_rollback_error, rollback_package_patch, RollbackResult, VerifyRollbackResult,
+    VerifyRollbackStatus,
 };
 use socket_patch_core::telemetry::{track_patch_rollback_failed, track_patch_rolled_back};
 use socket_patch_core::utils::purl::strip_purl_qualifiers;
@@ -230,6 +231,83 @@ fn result_to_json(result: &RollbackResult) -> serde_json::Value {
     })
 }
 
+/// Per-package failure results for the pre-flight before-blob abort.
+///
+/// The abort fires before the rollback loop produces any per-package
+/// results, so without these the `--json` envelope claimed `failed: 0`
+/// with empty `results[]` on an exit-1 run — contentless and
+/// self-contradictory, and `--json` mutes the stderr explanation the
+/// human path gets. One failed result per affected package keeps the
+/// `failed` counter meaning "packages that failed" (the same per-package
+/// semantics as a mid-run failure) and names each missing blob hash plus
+/// the `socket-patch repair` remedy in machine-readable form, using the
+/// engine's own `missing_blob` verify vocabulary. `reason_for` renders
+/// the per-hash diagnostic (offline gate vs. download failure).
+fn missing_blob_abort_results(
+    gate_manifest: &PatchManifest,
+    missing_blobs: &HashSet<String>,
+    all_packages: &HashMap<String, PathBuf>,
+    reason_for: impl Fn(&str) -> String,
+) -> Vec<RollbackResult> {
+    // The manifest map is a HashMap — sort so the envelope is deterministic.
+    let mut purls: Vec<&String> = gate_manifest.patches.keys().collect();
+    purls.sort();
+    let mut results = Vec::new();
+    for purl in purls {
+        let patch = &gate_manifest.patches[purl];
+        let mut files: Vec<(&String, &PatchFileInfo)> = patch
+            .files
+            .iter()
+            .filter(|(_, info)| {
+                // Empty beforeHash is the created-by-patch sentinel: no
+                // blob backs it, so it can never be "missing".
+                !info.before_hash.is_empty() && missing_blobs.contains(&info.before_hash)
+            })
+            .collect();
+        if files.is_empty() {
+            continue;
+        }
+        files.sort_by(|a, b| a.0.cmp(b.0));
+        let files_verified: Vec<VerifyRollbackResult> = files
+            .iter()
+            .map(|(file, info)| VerifyRollbackResult {
+                file: (*file).clone(),
+                status: VerifyRollbackStatus::MissingBlob,
+                message: Some(reason_for(&info.before_hash)),
+                current_hash: None,
+                expected_hash: None,
+                target_hash: Some(info.before_hash.clone()),
+            })
+            .collect();
+        // The engine's own first-blocking-file error constructor, so this
+        // synthesized abort is byte-identical to a mid-run missing-blob
+        // failure.
+        let first = &files_verified[0];
+        let error = cannot_rollback_error(
+            &first.file,
+            first
+                .message
+                .as_deref()
+                .expect("message is set for every synthesized entry above"),
+        );
+        results.push(RollbackResult {
+            package_key: purl.clone(),
+            // In-scope purls the crawler could not resolve are still gated
+            // fail-closed but have no installed path to report.
+            package_path: all_packages
+                .get(purl)
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+            success: false,
+            files_verified,
+            files_rolled_back: Vec::new(),
+            error: Some(error),
+            sidecar: None,
+        });
+    }
+    results
+}
+
 pub async fn run(args: RollbackArgs) -> i32 {
     apply_env_toggles(&args.common);
 
@@ -299,7 +377,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
         Err(code) => return code,
     };
 
-    match rollback_patches_inner(&args, &manifest_path).await {
+    match rollback_patches_inner(&args, &manifest_path, Some(&telemetry_client)).await {
         Ok((success, results, vendored)) => {
             let rolled_back_count = results
                 .iter()
@@ -473,6 +551,12 @@ pub async fn run(args: RollbackArgs) -> i32 {
 async fn rollback_patches_inner(
     args: &RollbackArgs,
     manifest_path: &Path,
+    // The client `run()` already built. Constructing one per phase printed
+    // the core client's "No SOCKET_API_TOKEN set" notice once per
+    // construction — twice in a single rollback. `None` (the `remove`
+    // delegation path) builds one on demand, only when the blob download
+    // below actually fires.
+    api_client: Option<&ApiClient>,
 ) -> Result<(bool, Vec<RollbackResult>, Vec<String>), String> {
     let manifest = read_manifest(manifest_path)
         .await
@@ -710,8 +794,9 @@ async fn rollback_patches_inner(
     if !missing_blobs.is_empty() {
         if args.common.offline {
             // Errors print even under --silent ("errors only", never
-            // "nothing"): this bail is the run's ONLY diagnostic — the JSON
-            // envelope carries a contentless partial_failure.
+            // "nothing"): in human mode this bail is the run's only
+            // stderr diagnostic; `--json` mutes it and instead carries
+            // the synthesized per-package failures below.
             if !args.common.json {
                 eprintln!(
                     "Error: {} blob(s) are missing and --offline mode is enabled.",
@@ -719,15 +804,31 @@ async fn rollback_patches_inner(
                 );
                 eprintln!("Run \"socket-patch repair\" to download missing blobs.");
             }
-            return Ok((false, Vec::new(), vendored_skipped));
+            let results =
+                missing_blob_abort_results(&gate_manifest, &missing_blobs, &all_packages, |hash| {
+                    format!(
+                        "Before blob not found: {hash} and --offline prevents fetching. \
+                         Run \"socket-patch repair\" to download missing blobs."
+                    )
+                });
+            return Ok((false, results, vendored_skipped));
         }
 
         if !args.common.silent && !args.common.json {
             println!("Downloading {} missing blob(s)...", missing_blobs.len());
         }
 
-        let (client, _) = get_api_client_with_overrides(args.common.api_client_overrides()).await;
-        let fetch_result = fetch_blobs_by_hash(&missing_blobs, &blobs_path, &client, None).await;
+        let built_client;
+        let client = match api_client {
+            Some(c) => c,
+            None => {
+                built_client = get_api_client_with_overrides(args.common.api_client_overrides())
+                    .await
+                    .0;
+                &built_client
+            }
+        };
+        let fetch_result = fetch_blobs_by_hash(&missing_blobs, &blobs_path, client, None).await;
 
         if !args.common.silent && !args.common.json {
             println!("{}", format_fetch_result(&fetch_result));
@@ -741,14 +842,38 @@ async fn rollback_patches_inner(
         let still_missing = get_missing_before_blobs(&gate_manifest, &blobs_path).await;
         if !still_missing.is_empty() {
             // Errors print even under --silent — same contract as the
-            // offline bail above.
+            // offline bail above (and same `--json` carrier).
             if !args.common.json {
                 eprintln!(
                     "{} blob(s) could not be downloaded. Cannot rollback.",
                     still_missing.len()
                 );
             }
-            return Ok((false, Vec::new(), vendored_skipped));
+            // Per-hash download outcomes; a hash the fetch never reported
+            // on still fails closed with the generic reason.
+            let download_errors: HashMap<&str, &str> = fetch_result
+                .results
+                .iter()
+                .filter(|r| !r.success)
+                .map(|r| {
+                    (
+                        r.hash.as_str(),
+                        r.error.as_deref().unwrap_or("unknown error"),
+                    )
+                })
+                .collect();
+            let results =
+                missing_blob_abort_results(&gate_manifest, &still_missing, &all_packages, |hash| {
+                    let why = download_errors
+                        .get(hash)
+                        .copied()
+                        .unwrap_or("download failed");
+                    format!(
+                        "Before blob could not be downloaded: {hash} - {why}. \
+                         Run \"socket-patch repair\" to download missing blobs."
+                    )
+                });
+            return Ok((false, results, vendored_skipped));
         }
     }
 
@@ -862,7 +987,7 @@ pub(crate) async fn rollback_patches(
         },
         one_off: false,
     };
-    rollback_patches_inner(&args, manifest_path).await
+    rollback_patches_inner(&args, manifest_path, None).await
 }
 
 #[cfg(test)]
@@ -1151,6 +1276,97 @@ mod tests {
         assert!(
             missing.is_empty(),
             "a new-file-only patch needs no before-blobs, got {missing:?}"
+        );
+    }
+
+    /// The pre-flight bail must map each missing blob back to its package:
+    /// one failed result per affected package (that's what the envelope's
+    /// `failed` counter counts), files carrying the engine's `missing_blob`
+    /// status + the missing hash, packages whose blobs are all present left
+    /// untouched, and created-by-patch sentinels (empty beforeHash) never
+    /// counted — they are backed by no blob.
+    #[test]
+    fn missing_blob_abort_results_map_hashes_to_packages() {
+        let mut patches = HashMap::new();
+        patches.insert(
+            "pkg:npm/foo@1.0.0".to_string(),
+            record_with_file("uuid-foo", "a.js", "missing_a"),
+        );
+        patches.insert(
+            "pkg:npm/bar@1.0.0".to_string(),
+            record_with_file("uuid-bar", "b.js", "present_b"),
+        );
+        patches.insert(
+            "pkg:npm/baz@1.0.0".to_string(),
+            record_with_file("uuid-baz", "c.js", ""),
+        );
+        let gate = PatchManifest {
+            patches,
+            setup: None,
+        };
+        let missing: HashSet<String> = ["missing_a".to_string(), "".to_string()]
+            .into_iter()
+            .collect();
+        let mut all_packages = HashMap::new();
+        all_packages.insert("pkg:npm/foo@1.0.0".to_string(), PathBuf::from("/tmp/foo"));
+
+        let results =
+            missing_blob_abort_results(&gate, &missing, &all_packages, |h| format!("gone: {h}"));
+
+        assert_eq!(
+            results.len(),
+            1,
+            "only the package referencing a genuinely missing blob fails, got {results:?}"
+        );
+        let r = &results[0];
+        assert_eq!(r.package_key, "pkg:npm/foo@1.0.0");
+        assert_eq!(r.package_path, "/tmp/foo");
+        assert!(!r.success);
+        assert!(r.files_rolled_back.is_empty());
+        assert_eq!(
+            r.error.as_deref(),
+            Some("Cannot rollback: a.js - gone: missing_a"),
+            "error mirrors the engine's first-blocking-file shape"
+        );
+        assert_eq!(r.files_verified.len(), 1);
+        let f = &r.files_verified[0];
+        assert_eq!(f.file, "a.js");
+        assert_eq!(f.status, VerifyRollbackStatus::MissingBlob);
+        assert_eq!(f.target_hash.as_deref(), Some("missing_a"));
+        assert_eq!(f.message.as_deref(), Some("gone: missing_a"));
+    }
+
+    /// Undiscovered packages (crawler found no installed copy — their blobs
+    /// still gate the run fail-closed) synthesize with an empty path, and
+    /// multiple affected packages come out purl-sorted so the envelope is
+    /// deterministic across the manifest HashMap's iteration order.
+    #[test]
+    fn missing_blob_abort_results_sorted_and_pathless_when_undiscovered() {
+        let mut patches = HashMap::new();
+        patches.insert(
+            "pkg:npm/zeta@1.0.0".to_string(),
+            record_with_file("uuid-zeta", "z.js", "missing_z"),
+        );
+        patches.insert(
+            "pkg:npm/alpha@1.0.0".to_string(),
+            record_with_file("uuid-alpha", "a.js", "missing_a"),
+        );
+        let gate = PatchManifest {
+            patches,
+            setup: None,
+        };
+        let missing: HashSet<String> = ["missing_a".to_string(), "missing_z".to_string()]
+            .into_iter()
+            .collect();
+
+        let results =
+            missing_blob_abort_results(&gate, &missing, &HashMap::new(), |h| h.to_string());
+
+        let keys: Vec<&str> = results.iter().map(|r| r.package_key.as_str()).collect();
+        assert_eq!(keys, ["pkg:npm/alpha@1.0.0", "pkg:npm/zeta@1.0.0"]);
+        assert!(
+            results.iter().all(|r| r.package_path.is_empty()),
+            "no discovered install path to report, got {results:?}"
         );
     }
 
@@ -1730,10 +1946,22 @@ mod tests {
         )
         .await
         .expect("rollback must not error");
-        assert!(results.is_empty());
         assert!(
             !success,
             "an in-scope missing before-blob must still abort the offline run"
+        );
+        // The abort synthesizes the per-package failure the JSON envelope
+        // reports (`failed` would otherwise claim 0 on this exit-1 path).
+        assert_eq!(results.len(), 1, "got {results:?}");
+        assert_eq!(results[0].package_key, "pkg:npm/foo@1.0.0");
+        assert!(!results[0].success);
+        assert!(
+            results[0]
+                .files_verified
+                .iter()
+                .any(|f| f.status == VerifyRollbackStatus::MissingBlob
+                    && f.target_hash.as_deref() == Some("npm_before_hash")),
+            "the missing blob must be named, got {results:?}"
         );
     }
 }
