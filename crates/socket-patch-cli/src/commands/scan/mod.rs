@@ -36,7 +36,8 @@ mod vendor_flow;
 
 use self::discovery::{
     collect_vuln_ids, detect_updates, lockfile_supplement, merge_redirect_records_for_updates,
-    preverify_vendor_baselines, severity_order, vendored_ledger_supplement,
+    preverify_vendor_baselines, severity_order, unsupported_layout_warnings,
+    vendored_ledger_supplement,
 };
 use self::gc::{gc_json, print_gc_vendored_line, run_apply_gc};
 use self::hosted::run_redirect;
@@ -957,6 +958,18 @@ pub(super) async fn note_vendor_supersedes_redirect(
     });
 }
 
+/// Top-level `warnings[]` JSON for scan's envelope from `(code, detail)`
+/// pairs (see [`unsupported_layout_warnings`]). Same `{code, detail}` object
+/// shape as the run-level `warnings[]` on the unified envelope.
+fn layout_refusal_json(refusals: &[(String, String)]) -> serde_json::Value {
+    serde_json::Value::Array(
+        refusals
+            .iter()
+            .map(|(code, detail)| serde_json::json!({ "code": code, "detail": detail }))
+            .collect(),
+    )
+}
+
 pub async fn run(mut args: ScanArgs) -> i32 {
     apply_env_toggles(&args.common);
 
@@ -1085,6 +1098,16 @@ pub async fn run(mut args: ScanArgs) -> i32 {
     // discovery — counts, API lookup, table, the prune "scanned" set — and
     // are flagged "not yet installed" everywhere a user could act on them.
     let lockfile_only = lockfile_supplement(&args.common, &all_crawled).await;
+    // Explicit refusals for npm layouts whose packages are structurally
+    // unreachable (yarn PnP, pnpm node-linker=pnp). Under yarn PnP the
+    // crawler leg above is ALSO empty (no `node_modules/`), so without this
+    // channel every mode used to print a clean success with
+    // `scannedPackages: 0` — a silent no-op the user read as "protected".
+    // Surfaced as run-level `warnings[]` in the JSON envelope (omitted when
+    // empty) and a stderr line on the human path; exit code and `status`
+    // stay deliberately unchanged (same posture as hosted refusals, which
+    // exit 0 with `redirected: 0`).
+    let layout_refusals = unsupported_layout_warnings(&lockfile_only);
     if !lockfile_only.packages.is_empty() {
         for pkg in &lockfile_only.packages {
             if let Some(eco) = Ecosystem::from_purl(&pkg.purl) {
@@ -1143,6 +1166,11 @@ pub async fn run(mut args: ScanArgs) -> i32 {
         if show_progress {
             eprintln!();
         }
+        if !args.common.json && !args.common.silent {
+            for (code, detail) in &layout_refusals {
+                eprintln!("Warning ({code}): {detail}");
+            }
+        }
         // Telemetry: empty-scan still counts as a successful scan.
         track_patch_scanned(
             0,
@@ -1177,6 +1205,14 @@ pub async fn run(mut args: ScanArgs) -> i32 {
                 "packages": [],
                 "updates": [],
             });
+            // PnP layout refusals: additive top-level `warnings` (omitted
+            // when empty — run-level warnings precedent) so a JSON consumer
+            // can tell "structurally unscannable project" apart from a
+            // genuinely-empty one. This is the loud half of the fix for the
+            // yarn-PnP silent success-0 no-op.
+            if !layout_refusals.is_empty() {
+                result["warnings"] = layout_refusal_json(&layout_refusals);
+            }
             // Hosted mode: keep the `--json` envelope schema-consistent with
             // the ≥1-package path by including a (no-op) nested `redirect`
             // block — nothing was discovered, so nothing is redirected. The
@@ -1256,6 +1292,12 @@ pub async fn run(mut args: ScanArgs) -> i32 {
                 "Note: {} package(s) from project lockfiles are not yet installed (lockfile-only).",
                 lockfile_only.purls.len(),
             );
+        }
+        // Polyglot PnP repos (e.g. a PnP frontend + a python venv) reach
+        // this non-empty path: the refusal still prints so the invisible
+        // npm half is never silently blessed by the other ecosystems' scan.
+        for (code, detail) in &layout_refusals {
+            eprintln!("Warning ({code}): {detail}");
         }
     }
 
@@ -1498,6 +1540,13 @@ pub async fn run(mut args: ScanArgs) -> i32 {
                 "newUuid": u.new_uuid,
             })).collect::<Vec<_>>(),
         });
+        // PnP layout refusals ride the non-empty envelope too (polyglot
+        // repos: the OTHER ecosystems' discovery being non-empty must not
+        // silently bless the structurally-invisible npm half). Additive,
+        // omitted when empty.
+        if !layout_refusals.is_empty() {
+            result["warnings"] = layout_refusal_json(&layout_refusals);
+        }
         // Flag lockfile-only packages so JSON consumers can tell "patch
         // available but not installed" from the installed case. Additive
         // field; absent means installed. Matching bridges the API's

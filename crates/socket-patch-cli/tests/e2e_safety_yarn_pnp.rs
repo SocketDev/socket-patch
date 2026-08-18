@@ -805,7 +805,8 @@ fn pnp_project_with_no_npm_patches_still_applies_its_other_patches() {
 /// sha256, for whole-tree no-mutation assertions.
 fn snapshot_tree(root: &Path) -> std::collections::BTreeMap<String, String> {
     fn walk(root: &Path, dir: &Path, out: &mut std::collections::BTreeMap<String, String>) {
-        for entry in std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()))
+        for entry in
+            std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()))
         {
             let entry = entry.unwrap();
             let path = entry.path();
@@ -862,9 +863,7 @@ fn assert_scan_pnp_refusal_warning(env: &serde_json::Value, code: &str, ctx: &st
     let w = warnings
         .iter()
         .find(|w| json_string(w, "code") == Some(code))
-        .unwrap_or_else(|| {
-            panic!("{ctx}: warnings[] must contain code={code}.\nenvelope: {env}")
-        });
+        .unwrap_or_else(|| panic!("{ctx}: warnings[] must contain code={code}.\nenvelope: {env}"));
     let detail = json_string(w, "detail")
         .unwrap_or_else(|| panic!("{ctx}: refusal warning must carry a detail.\nenvelope: {env}"));
     assert!(
@@ -951,11 +950,8 @@ fn scan_human_mode_on_pnp_project_prints_refusal_to_stderr() {
     let dir = tempfile::tempdir().unwrap();
     make_yarn_berry_scan_fixture(dir.path());
 
-    let (code, stdout, stderr) = run_with_env(
-        dir.path(),
-        &["scan"],
-        &[("SOCKET_TELEMETRY_DISABLED", "1")],
-    );
+    let (code, stdout, stderr) =
+        run_with_env(dir.path(), &["scan"], &[("SOCKET_TELEMETRY_DISABLED", "1")]);
     assert_eq!(
         code, 0,
         "human scan stays exit 0.\nstdout:\n{stdout}\nstderr:\n{stderr}"
