@@ -21,11 +21,12 @@ use crate::commands::get::{download_and_apply_patches, download_patch_records, D
 use crate::commands::vendor::{
     note_classic_migration_risk, reconcile_dropped, track_outcomes_for_vendor, vendor_records,
 };
-use crate::json_envelope::{Command as EnvelopeCommand, Envelope, RunWarning};
+use crate::json_envelope::{Command as EnvelopeCommand, Envelope};
 
 use super::gc::{gc_json, print_gc_vendored_line, run_apply_gc};
 use super::{
-    discover_selected, download_params, embed_vex_into_json, emit_discovery_error_json, ScanArgs,
+    discover_selected, download_params, embed_vex_into_json, emit_discovery_error_json,
+    note_vendor_supersedes_redirect, ScanArgs,
 };
 
 /// Dry-run preview for `scan --vendor`: classify each selected patch
@@ -78,34 +79,6 @@ fn scan_vendor_service_config(
         patch_server_url: common.patch_server_url.clone(),
         offline: common.offline,
     }
-}
-
-/// Cross-mode takeover advisory for the scan-driven vendor step: when this
-/// vendored run's ledger (`.socket/vendor/state.json`) and a committed hosted
-/// redirect ledger (`.socket/vendor/redirect-state.json`) both claim the same
-/// package(s), the redirect ledger is now stale — the lockfile points at the
-/// committed `.socket/vendor/` files, not the hosted patch server. Warn once
-/// at the envelope level (JSON `warnings[]` and stderr), mirroring
-/// [`note_classic_migration_risk`]; the stale ledger is NOT deleted here
-/// (reconciliation is deferred — see the redirect twin in `hosted.rs`).
-async fn note_vendor_supersedes_redirect(env: &mut Envelope, cwd: &Path, common: &GlobalArgs) {
-    // Only warn for the package(s) the LIVE lockfile actually routes to the
-    // committed `.socket/vendor/` files — the direction the lock proves, not the
-    // fact that this happens to be the vendored flow. A dry-run / no-op over a
-    // lock that still points at the hosted patch server stays silent instead of
-    // pointing cleanup at the live redirect ledger.
-    let superseded = super::classify_overlap_takeover(cwd).await.vendored;
-    if superseded.is_empty() {
-        return;
-    }
-    let detail = super::mode_takeover_detail(&superseded, /*current_is_hosted=*/ false);
-    if !common.silent && !common.json {
-        eprintln!("Warning ({}): {detail}", super::VENDOR_SUPERSEDES_REDIRECT);
-    }
-    env.warnings.push(RunWarning {
-        code: super::VENDOR_SUPERSEDES_REDIRECT.to_string(),
-        detail,
-    });
 }
 
 /// The vendor step shared by `scan --vendor`'s JSON and interactive
@@ -296,7 +269,11 @@ async fn run_vendor_json_path(
         if args.vex.vex.is_some() {
             result["vex"] = serde_json::json!({ "skipped": true, "reason": "dry_run" });
         }
-        println!("{}", serde_json::to_string_pretty(&result).unwrap());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&result)
+                .expect("serializing an in-memory JSON value cannot fail")
+        );
         return 0;
     }
 
@@ -396,7 +373,11 @@ async fn run_vendor_json_path(
                 "code": code,
                 "message": message,
             });
-            println!("{}", serde_json::to_string_pretty(&result).unwrap());
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&result)
+                    .expect("serializing an in-memory JSON value cannot fail")
+            );
             return 1;
         }
     };
@@ -406,7 +387,11 @@ async fn run_vendor_json_path(
 
     let final_code =
         embed_vex_into_json(&args.common, &args.vex, manifest_path, vendor_code, result).await;
-    println!("{}", serde_json::to_string_pretty(&result).unwrap());
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&result)
+            .expect("serializing an in-memory JSON value cannot fail")
+    );
     final_code
 }
 

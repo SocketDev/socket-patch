@@ -64,6 +64,73 @@ fn is_legacy_redirect_path(path: &str) -> bool {
     norm.starts_with(&format!("{LEGACY_CARGO_PATCHES_DIR}/"))
 }
 
+/// Is this vendored cargo entry still consumed by the project's `Cargo.lock`
+/// dependency graph? The lock is the truth source:
+///
+/// * entry absent from the lock → `Some(false)` (the dependency left the
+///   graph; the `[patch]` would be unused);
+/// * entry carries a registry `source` (crates.io re-resolve or a hosted
+///   socket-patch takeover) → `Some(false)` — the committed copy is NOT what
+///   the lock consumes, so GC may reclaim the entry (its revert restores /
+///   keeps the registry resolution and drops the dead `[patch]` wiring);
+/// * entry detached AND the `[patch.crates-io]` entry points at THIS entry's
+///   committed copy → `Some(true)` (the wired vendored shape);
+/// * detached but the `[patch]` points elsewhere / is gone → `Some(false)`
+///   (nothing consumes the copy; the revert re-attaches the recorded
+///   registry originals, repairing the half-wired lock);
+/// * no readable lock → `None` (cannot determine — callers keep, fail-safe).
+pub async fn vendored_entry_in_use(entry: &VendorEntry, project_root: &Path) -> Option<bool> {
+    let (name, version) = parse_cargo_purl(&entry.base_purl)?;
+    match cargo_lock::probe_lock_entry(project_root, name, version).await {
+        cargo_lock::LockEntryProbe::NoLockfile => None,
+        cargo_lock::LockEntryProbe::EntryMissing => Some(false),
+        cargo_lock::LockEntryProbe::Source(_) => Some(false),
+        cargo_lock::LockEntryProbe::Detached => {
+            let marker = vendor_uuid_dir_rel("cargo", &entry.uuid)?;
+            let entries = cargo_config::read_patch_entries(project_root).await;
+            let wired = entries
+                .get(name)
+                .and_then(|i| i.path.as_deref())
+                .is_some_and(|p| p.replace('\\', "/").starts_with(&format!("{marker}/")));
+            Some(wired)
+        }
+    }
+}
+
+/// A LIVE hosted-redirect wiring for `name`+`version`: the lock resolves it
+/// from a Socket hosted patch registry, or Cargo.toml pins it to a
+/// `socket-patch-<uuid>` registry (the shapes `scan --mode hosted` writes).
+/// Registry indexes are matched against the config-declared
+/// `[registries.socket-patch-*]` URLs, not a hardcoded host, so test
+/// registries are recognised too. `Some(description)` when residue is found.
+async fn hosted_redirect_residue(project_root: &Path, name: &str, version: &str) -> Option<String> {
+    let socket_indexes = cargo_config::socket_registry_indexes(project_root).await;
+    if let cargo_lock::LockEntryProbe::Source(src) =
+        cargo_lock::probe_lock_entry(project_root, name, version).await
+    {
+        if src.contains("patch.socket.dev") || socket_indexes.iter().any(|(_, index)| *index == src)
+        {
+            return Some(format!(
+                "Cargo.lock resolves {name}@{version} from the Socket hosted patch \
+                 registry ({src})"
+            ));
+        }
+    }
+    if let Ok(toml) = tokio::fs::read_to_string(project_root.join("Cargo.toml")).await {
+        let c = regex::escape(name);
+        let re = regex::Regex::new(&format!(
+            r#"(?m)^\s*{c}\s*=\s*\{{[^}}\n]*registry\s*=\s*"socket-patch-[0-9a-fA-F-]{{36}}""#
+        ))
+        .expect("static regex");
+        if re.is_match(&toml) {
+            return Some(format!(
+                "Cargo.toml pins `{name}` to a socket-patch hosted registry"
+            ));
+        }
+    }
+    None
+}
+
 /// The config `[patch]` entry points at THIS copy and the lock entry no
 /// longer needs detaching: either there is no lockfile (nothing to edit — the
 /// first build generates a path-form lock), or the entry exists with no
@@ -78,6 +145,102 @@ async fn wiring_in_sync(project_root: &Path, name: &str, version: &str, copy_rel
         cargo_lock::detach_lock_entry(project_root, name, version, true).await,
         Err(LockEditError::NotRegistry) | Err(LockEditError::NoLockfile)
     )
+}
+
+/// A swap sibling for a copy dir: `<uuid>/<name>-<version><suffix>`. Same
+/// directory as the copy → every swap step is a real rename, never a
+/// cross-device copy. The suffixes can never collide with a copy dir:
+/// `<version>` is a validated single segment and cargo versions never end in
+/// `.socket-stage` / `.socket-old`.
+fn swap_sibling_for(copy_dir: &Path, suffix: &str) -> std::path::PathBuf {
+    let name = copy_dir
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "copy".to_string());
+    match copy_dir.parent() {
+        Some(parent) => parent.join(format!("{name}{suffix}")),
+        None => copy_dir.join(suffix),
+    }
+}
+
+/// The staging sibling for a copy dir: `<uuid>/<name>-<version>.socket-stage`.
+/// Rebuilds are materialised here and swapped into place only on success, so
+/// a failure can never destroy a pre-existing (possibly live-wired) copy.
+fn stage_dir_for(copy_dir: &Path) -> std::path::PathBuf {
+    swap_sibling_for(copy_dir, ".socket-stage")
+}
+
+/// The backup sibling the old copy is parked at mid-swap:
+/// `<uuid>/<name>-<version>.socket-old`.
+fn backup_dir_for(copy_dir: &Path) -> std::path::PathBuf {
+    swap_sibling_for(copy_dir, ".socket-old")
+}
+
+/// Swap a fully-built stage into place without a destructive window: park the
+/// old copy (if any) at `<copy>.socket-old` with a same-dir rename, rename the
+/// stage over the now-vacant copy path, and only then delete the backup. Every
+/// step is a single atomic rename — unlike a remove-then-rename swap (where a
+/// partial `remove_dir_all`, realistic under Windows file locks, strands a
+/// half-deleted copy) no step can leave less recoverable state than it started
+/// with. If the stage rename fails the backup is renamed straight back; should
+/// even that restore fail (an external process racing the uuid dir), the old
+/// copy still exists intact at `<copy>.socket-old` instead of being destroyed.
+async fn swap_stage_into_place(stage: &Path, copy_dir: &Path) -> std::io::Result<()> {
+    let backup = backup_dir_for(copy_dir);
+    // A stale backup (crash mid-swap on an earlier run) would make the
+    // park rename fail; `remove_tree` is a no-op when it is absent.
+    remove_tree(&backup).await?;
+    let had_old = match tokio::fs::rename(copy_dir, &backup).await {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => return Err(e),
+    };
+    match tokio::fs::rename(stage, copy_dir).await {
+        Ok(()) => {
+            if had_old {
+                let _ = remove_tree(&backup).await;
+            }
+            Ok(())
+        }
+        Err(e) => {
+            if had_old {
+                let _ = tokio::fs::rename(&backup, copy_dir).await;
+            }
+            Err(e)
+        }
+    }
+}
+
+/// Best-effort removal of an EMPTY `<uuid>/` dir plus the empty
+/// `.socket/vendor/cargo/` and `.socket/vendor/` levels a failed run may have
+/// created, so a hard failure leaves no husk for the user to commit.
+/// `remove_dir` refuses non-empty dirs, so live copies, markers, and other
+/// crates' vendor dirs always survive.
+async fn prune_empty_vendor_dirs(uuid_dir: &Path) {
+    if tokio::fs::remove_dir(uuid_dir).await.is_err() {
+        return;
+    }
+    let Some(eco_dir) = uuid_dir.parent() else {
+        return;
+    };
+    if tokio::fs::remove_dir(eco_dir).await.is_err() {
+        return;
+    }
+    if let Some(vendor_dir) = eco_dir.parent() {
+        let _ = tokio::fs::remove_dir(vendor_dir).await;
+    }
+}
+
+/// Failure cleanup for a staged (re)build: always remove the stage, then
+/// either unwind the whole `<uuid>/` dir (`unwind_uuid_dir` — a fresh vendor
+/// with no pre-existing state worth keeping) or leave existing state
+/// untouched; either way prune any empty-husk dirs left behind.
+async fn cleanup_failed_stage(stage: &Path, uuid_dir: &Path, unwind_uuid_dir: bool) {
+    let _ = remove_tree(stage).await;
+    if unwind_uuid_dir {
+        let _ = remove_tree(uuid_dir).await;
+    }
+    prune_empty_vendor_dirs(uuid_dir).await;
 }
 
 /// Outcome of attempting to materialise the cargo copy from the patch service.
@@ -125,23 +288,27 @@ async fn cargo_service_copy(
     };
     match fetch_verified_archive(cfg, &record.uuid).await {
         ServiceArtifact::Ready(archive) => {
-            // Clean copy dir, then extract the `.crate` (tar.gz; strip its
-            // single `{name}-{version}/` top-level dir) into it.
-            let _ = remove_tree(copy_dir).await;
-            if let Err(e) = tokio::fs::create_dir_all(copy_dir).await {
+            // Extract the `.crate` (tar.gz; strip its single
+            // `{name}-{version}/` top-level dir) into a STAGE sibling and
+            // swap it into the copy dir only once fully verified — a failure
+            // then leaves any pre-existing copy untouched and no husk behind.
+            let stage = stage_dir_for(copy_dir);
+            let _ = remove_tree(&stage).await;
+            if let Err(e) = tokio::fs::create_dir_all(&stage).await {
+                cleanup_failed_stage(&stage, uuid_dir, false).await;
                 return hard(
                     "vendor_prebuilt_write_failed",
-                    format!("cannot create {}: {e}", copy_dir.display()),
+                    format!("cannot create {}: {e}", stage.display()),
                 );
             }
-            if let Err(e) = extract_tgz(&archive.bytes, copy_dir) {
-                let _ = remove_tree(uuid_dir).await;
+            if let Err(e) = extract_tgz(&archive.bytes, &stage) {
+                cleanup_failed_stage(&stage, uuid_dir, false).await;
                 return hard(
                     "vendor_prebuilt_extract_failed",
                     format!("cannot extract the prebuilt crate: {e}"),
                 );
             }
-            let _ = tokio::fs::remove_file(copy_dir.join(".cargo-checksum.json")).await;
+            let _ = tokio::fs::remove_file(stage.join(".cargo-checksum.json")).await;
             // Verify the EXTRACTED TREE, not just the archive bytes: the SRI
             // proves the download is intact, but an unexpected internal
             // layout (the single `{name}-{version}/` strip leaving an extra
@@ -149,8 +316,8 @@ async fn cargo_service_copy(
             // paths and the caller would synthesize success from
             // `record.files` while the copy is wrong. Fail closed → `auto`
             // falls back to the local build. (Mirrors composer_lock.rs.)
-            if !copy_matches_after_hashes(copy_dir, &record.files).await {
-                let _ = remove_tree(copy_dir).await;
+            if !copy_matches_after_hashes(&stage, &record.files).await {
+                cleanup_failed_stage(&stage, uuid_dir, false).await;
                 return miss(
                     warnings,
                     "vendor_prebuilt_layout_mismatch",
@@ -158,6 +325,13 @@ async fn cargo_service_copy(
                         "prebuilt crate for {name} extracted to an unexpected \
                          layout (patched files absent at their recorded paths)"
                     ),
+                );
+            }
+            if let Err(e) = swap_stage_into_place(&stage, copy_dir).await {
+                cleanup_failed_stage(&stage, uuid_dir, false).await;
+                return hard(
+                    "vendor_prebuilt_write_failed",
+                    format!("cannot move the extracted crate into place: {e}"),
                 );
             }
             warnings.push(VendorWarning::new(
@@ -169,10 +343,16 @@ async fn cargo_service_copy(
             ));
             CargoServiceCopy::Used
         }
-        ServiceArtifact::IntegrityMismatch(reason) => miss(
-            warnings,
+        // Bytes that fail integrity verification are an active tamper signal:
+        // ALWAYS a hard error, in `auto` exactly as in `service` — never a
+        // quiet local-build fallback (`ServiceArtifact`'s documented
+        // contract; nothing was extracted, so there is nothing to clean up).
+        ServiceArtifact::IntegrityMismatch(reason) => hard(
             "vendor_prebuilt_integrity_mismatch",
-            format!("prebuilt crate failed integrity ({reason})"),
+            format!(
+                "prebuilt crate for {name} failed integrity verification ({reason}); \
+                 refusing to fall back to a local build on tampered bytes"
+            ),
         ),
         ServiceArtifact::Pending => miss(
             warnings,
@@ -197,15 +377,18 @@ async fn cargo_service_copy(
     }
 }
 
-/// Copy the pristine source into `copy_dir` and run the hardened apply
-/// pipeline against it (vendor auto-force policy — see
-/// [`super::force_apply_staged`]). On failure the whole uuid dir is removed —
-/// a partial copy (or an empty `<uuid>/` husk) under `.socket/vendor/` would
-/// be misjudged by verify/sweep — and the failed [`ApplyResult`] is the `Err`
-/// for the caller to bubble. On success the copy carries no
-/// `.cargo-checksum.json` (a path-dep copy must never have one; the fresh
-/// copy excludes it, and it is re-removed defensively in case the patch
-/// recreated it).
+/// Copy the pristine source into a STAGE sibling of `copy_dir`, run the
+/// hardened apply pipeline against it (vendor auto-force policy — see
+/// [`super::force_apply_staged`]), and swap the stage into `copy_dir` only on
+/// success. A failed (re)build therefore never destroys a pre-existing copy:
+/// with `unwind_uuid_dir` (a fresh vendor — nothing pre-existing to keep) the
+/// whole uuid dir is removed, without it (a live-wired rebuild) the previous
+/// copy, marker, and wiring are left exactly as they were; either way no
+/// partial copy or empty `<uuid>/` husk — which verify/sweep would misjudge —
+/// survives, and the failed [`ApplyResult`] is the `Err` for the caller to
+/// bubble. On success the copy carries no `.cargo-checksum.json` (a path-dep
+/// copy must never have one; the fresh copy excludes it, and it is re-removed
+/// defensively in case the patch recreated it).
 #[allow(clippy::too_many_arguments)]
 async fn copy_and_patch(
     purl: &str,
@@ -215,12 +398,15 @@ async fn copy_and_patch(
     record: &PatchRecord,
     sources: &PatchSources<'_>,
     force: bool,
+    unwind_uuid_dir: bool,
     name: &str,
     version: &str,
     warnings: &mut Vec<VendorWarning>,
 ) -> Result<ApplyResult, ApplyResult> {
-    if let Err(e) = fresh_copy(pristine_src, copy_dir, Some(".cargo-checksum.json")).await {
-        let _ = remove_tree(uuid_dir).await;
+    let stage = stage_dir_for(copy_dir);
+    // `fresh_copy` removes + recreates the stage itself.
+    if let Err(e) = fresh_copy(pristine_src, &stage, Some(".cargo-checksum.json")).await {
+        cleanup_failed_stage(&stage, uuid_dir, unwind_uuid_dir).await;
         return Err(synthesized_result(
             purl,
             copy_dir,
@@ -230,15 +416,21 @@ async fn copy_and_patch(
         ));
     }
     let mut result = super::force_apply_staged(
-        purl, copy_dir, record, sources, false, force, name, version, warnings,
+        purl, &stage, record, sources, false, force, name, version, warnings,
     )
     .await;
     result.package_path = copy_dir.display().to_string();
     if !result.success {
-        let _ = remove_tree(uuid_dir).await;
+        cleanup_failed_stage(&stage, uuid_dir, unwind_uuid_dir).await;
         return Err(result);
     }
-    let _ = tokio::fs::remove_file(copy_dir.join(".cargo-checksum.json")).await;
+    let _ = tokio::fs::remove_file(stage.join(".cargo-checksum.json")).await;
+    if let Err(e) = swap_stage_into_place(&stage, copy_dir).await {
+        cleanup_failed_stage(&stage, uuid_dir, unwind_uuid_dir).await;
+        result.success = false;
+        result.error = Some(format!("failed to move the rebuilt copy into place: {e}"));
+        return Err(result);
+    }
     debug_assert!(
         result.sidecar.is_none(),
         "vendor copy must not produce a cargo sidecar"
@@ -335,6 +527,24 @@ pub async fn vendor_cargo_crate(
             }
         }
     }
+    // (b2) The lock must resolve name+version from a SINGLE entry. A second
+    // same-name+version entry (registry + a git fork — a legal,
+    // cargo-generated shape) means consumers' `dependencies` arrays
+    // disambiguate with full package-id strings, which the detach surgery
+    // would dangle: vendor would "succeed" while the committed lock breaks
+    // every `cargo build --locked` (real-cargo verified). Refuse up front.
+    if cargo_lock::count_lock_entries(project_root, name, version).await > 1 {
+        return refused(
+            "locked_multi_source_conflict",
+            format!(
+                "Cargo.lock resolves `{name}@{version}` from multiple sources \
+                 (e.g. the registry plus a git fork); detaching the registry \
+                 entry would corrupt the full package-id references in the \
+                 lock's dependencies arrays, so this crate cannot be vendored \
+                 in this project"
+            ),
+        );
+    }
     // (c) A user-authored same-name `[patch.crates-io]` entry is never
     // overwritten. (`ensure_patch_entry` would also refuse, but pre-flighting
     // it keeps the refusal ahead of any write.)
@@ -391,6 +601,30 @@ pub async fn vendor_cargo_crate(
         return done(result, None, dry_warnings);
     }
 
+    // Cross-mode takeover guard (fail-closed): a LIVE hosted-redirect wiring
+    // for this crate must be reverted from the redirect ledger BEFORE
+    // vendoring — the CLI vendored flows do exactly that. Reaching this point
+    // with the residue still present means the redirect ledger is missing or
+    // corrupt (no recorded originals to revert with); proceeding would bake
+    // the hosted registry values into this entry's lock originals as if they
+    // were pristine, leave Cargo.toml pinned to the hosted registry, and
+    // report success on an unbuildable half-migrated project. Refuse with the
+    // manual remediation instead. Runs after the dry-run branch: a preview
+    // must not report the wet run's ledger-driven revert as a failure.
+    if let Some(residue) = hosted_redirect_residue(project_root, name, version).await {
+        return refused(
+            "hosted_redirect_live",
+            format!(
+                "{residue}, but no redirect ledger record can revert it \
+                 (.socket/vendor/redirect-state.json is missing or does not \
+                 record this package); restore the ledger, or manually remove \
+                 the `registry = \"socket-patch-…\"` key from Cargo.toml, \
+                 restore the crates.io source/checksum in Cargo.lock, and drop \
+                 the `[registries.socket-patch-…]` block, then re-run"
+            ),
+        );
+    }
+
     // Hot path: already in sync → touch nothing (entry stays with the caller's
     // existing ledger record, which holds the unrecoverable lock originals).
     if wiring_in_sync(project_root, name, version, &copy_rel).await {
@@ -404,7 +638,10 @@ pub async fn vendor_cargo_crate(
         // Wired but the committed copy is missing/stale: rebuild the
         // ARTIFACT only — config + lock are already correct, and the full
         // path's surgery would re-record live vendored state over the
-        // first run's unrecoverable lock originals.
+        // first run's unrecoverable lock originals. The rebuild is staged: a
+        // failure must leave the previous (drifted-but-buildable) copy and
+        // the live wiring exactly as they were, never a deleted copy under a
+        // still-pointing `[patch]` entry.
         let mut warnings: Vec<VendorWarning> = Vec::new();
         let result = match copy_and_patch(
             purl,
@@ -414,6 +651,7 @@ pub async fn vendor_cargo_crate(
             record,
             sources,
             force,
+            false, // live-wired: never unwind the uuid dir on failure
             name,
             version,
             &mut warnings,
@@ -461,6 +699,13 @@ pub async fn vendor_cargo_crate(
     if let Some(refusal) = service_offline_conflict(service) {
         return refusal;
     }
+    // When the pre-existing config entry already points at THIS copy (wiring
+    // out of sync only because of the lock — e.g. it was re-resolved or went
+    // corrupt post-vendor), a failure must not delete the copy that entry
+    // points at: the unwind restores the entry, and removing the uuid dir
+    // would dangle it and break every build.
+    let prior_points_here =
+        prior_entry.as_ref().and_then(|i| i.path.as_deref()) == Some(copy_rel.as_str());
     let mut result = match cargo_service_copy(
         service,
         record,
@@ -486,6 +731,7 @@ pub async fn vendor_cargo_crate(
                 record,
                 sources,
                 force,
+                !prior_points_here,
                 name,
                 version,
                 &mut warnings,
@@ -501,8 +747,13 @@ pub async fn vendor_cargo_crate(
     // ── wire the config entry ─────────────────────────────────────────────
     if let Err(e) = cargo_config::ensure_patch_entry(project_root, name, &copy_rel, false).await {
         // The config was left untouched on refusal; unwind the copy so no
-        // unwired artifact lingers under .socket/vendor/.
-        let _ = remove_tree(&uuid_dir).await;
+        // unwired artifact lingers under .socket/vendor/ — unless the
+        // existing config entry points at this very copy, which deleting
+        // would dangle.
+        if !prior_points_here {
+            let _ = remove_tree(&uuid_dir).await;
+        }
+        prune_empty_vendor_dirs(&uuid_dir).await;
         result.success = false;
         result.error = Some(format!("failed to update .cargo/config.toml: {e}"));
         return done(result, None, warnings);
@@ -544,8 +795,10 @@ pub async fn vendor_cargo_crate(
                 // config edit so the project is back where it started:
                 // restore the prior socket-owned entry when this was a
                 // re-vendor (dropping it would destroy the first run's live
-                // wiring), else drop the entry we just added. Either way
-                // remove this run's copy.
+                // wiring), else drop the entry we just added. Remove this
+                // run's copy — unless the restored entry points at it, in
+                // which case deleting it would dangle that entry and break
+                // every build.
                 match prior_path.as_deref() {
                     Some(p) => {
                         let _ =
@@ -555,11 +808,14 @@ pub async fn vendor_cargo_crate(
                         let _ = cargo_config::drop_patch_entry(project_root, name, false).await;
                     }
                 }
-                let _ = remove_tree(&uuid_dir).await;
+                if !prior_points_here {
+                    let _ = remove_tree(&uuid_dir).await;
+                }
+                prune_empty_vendor_dirs(&uuid_dir).await;
                 result.success = false;
                 result.error = Some(format!(
                     "failed to detach the Cargo.lock entry for {name}@{version}: {e} \
-                     (config entry and copy were unwound; nothing was vendored)"
+                     (the config edit was unwound and nothing new was vendored)"
                 ));
                 return done(result, None, warnings);
             }
@@ -1132,6 +1388,245 @@ mod tests {
                 .await
                 .unwrap(),
             "version = 4\n\n[[package]]\nname = \"cfg-if\"\nversion = \"1.0.4\"\n"
+        );
+    }
+
+    /// AUDIT B1: a failed hot-path artifact rebuild must never destroy the
+    /// live-wired vendored copy. Drift the committed copy (bad merge /
+    /// formatter), then re-run with the patch content unavailable (empty
+    /// blobs dir — the offline shape: a drifted file harvests no blob): the
+    /// rebuild fails, but the previous — drifted yet buildable — copy, the
+    /// marker, the config entry, and the detached lock must all be left
+    /// exactly as they were. (Adapted from the audit probe
+    /// `audit_failed_rebuild_deletes_wired_artifact`.)
+    #[tokio::test]
+    async fn test_failed_rebuild_preserves_live_wired_copy() {
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        expect_done(run_vendor(PURL, root, &blobs, &pristine, &record, false).await);
+
+        let lib = root.join(copy_rel()).join("src/lib.rs");
+        tokio::fs::write(&lib, b"drifted but buildable\n")
+            .await
+            .unwrap();
+        let cfg1 = tokio::fs::read(root.join(".cargo/config.toml"))
+            .await
+            .unwrap();
+        let lock1 = tokio::fs::read(root.join("Cargo.lock")).await.unwrap();
+
+        let empty = root.join(".socket/empty-blobs");
+        tokio::fs::create_dir_all(&empty).await.unwrap();
+        let (result, entry, _warnings) =
+            expect_done(run_vendor(PURL, root, &empty, &pristine, &record, false).await);
+        assert!(!result.success, "rebuild must fail without patch content");
+        assert!(entry.is_none());
+
+        // The live-wired state is untouched: copy, marker, config, lock.
+        assert_eq!(
+            tokio::fs::read(&lib).await.unwrap(),
+            b"drifted but buildable\n",
+            "the previous committed copy must survive a failed rebuild"
+        );
+        assert!(
+            root.join(format!(".socket/vendor/cargo/{UUID}/{VENDOR_MARKER_FILE}"))
+                .exists(),
+            "marker must survive"
+        );
+        assert_eq!(
+            tokio::fs::read(root.join(".cargo/config.toml")).await.unwrap(),
+            cfg1,
+            "config untouched"
+        );
+        assert_eq!(
+            tokio::fs::read(root.join("Cargo.lock")).await.unwrap(),
+            lock1,
+            "lock untouched"
+        );
+        // And the failed rebuild's swap siblings never leak into the uuid dir.
+        let uuid_dir = root.join(format!(".socket/vendor/cargo/{UUID}"));
+        let mut rd = tokio::fs::read_dir(&uuid_dir).await.unwrap();
+        while let Some(e) = rd.next_entry().await.unwrap() {
+            let n = e.file_name().to_string_lossy().into_owned();
+            assert!(!n.contains("socket-stage"), "stage litter: {n}");
+            assert!(!n.contains("socket-old"), "backup litter: {n}");
+        }
+    }
+
+    /// REVIEW must-fix (B1 follow-up): the swap itself must never leave less
+    /// recoverable state than it started with. Force the stage rename to fail
+    /// (stage absent — the same io::Error surface as a Windows file lock)
+    /// with a live copy in place: the old copy must be restored
+    /// byte-identical, with no backup parked beside it.
+    #[tokio::test]
+    async fn test_swap_failure_restores_previous_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let copy = dir.path().join("cfg-if-1.0.4");
+        tokio::fs::create_dir_all(copy.join("src")).await.unwrap();
+        tokio::fs::write(copy.join("src/lib.rs"), b"live\n")
+            .await
+            .unwrap();
+
+        let stage = stage_dir_for(&copy);
+        assert!(
+            swap_stage_into_place(&stage, &copy).await.is_err(),
+            "swapping a missing stage must fail"
+        );
+        assert_eq!(
+            tokio::fs::read(copy.join("src/lib.rs")).await.unwrap(),
+            b"live\n",
+            "the previous copy must be restored after a failed swap"
+        );
+        assert!(!backup_dir_for(&copy).exists(), "no parked backup litter");
+    }
+
+    /// A successful swap replaces the old copy with the stage and leaves
+    /// neither a stage nor a parked backup behind — including when a stale
+    /// backup from an earlier interrupted swap is already parked there.
+    #[tokio::test]
+    async fn test_swap_success_replaces_copy_without_litter() {
+        let dir = tempfile::tempdir().unwrap();
+        let copy = dir.path().join("cfg-if-1.0.4");
+        tokio::fs::create_dir_all(copy.join("src")).await.unwrap();
+        tokio::fs::write(copy.join("src/lib.rs"), b"old\n")
+            .await
+            .unwrap();
+        let stage = stage_dir_for(&copy);
+        tokio::fs::create_dir_all(stage.join("src")).await.unwrap();
+        tokio::fs::write(stage.join("src/lib.rs"), b"new\n")
+            .await
+            .unwrap();
+        let stale_backup = backup_dir_for(&copy);
+        tokio::fs::create_dir_all(&stale_backup).await.unwrap();
+        tokio::fs::write(stale_backup.join("husk.rs"), b"stale\n")
+            .await
+            .unwrap();
+
+        swap_stage_into_place(&stage, &copy).await.unwrap();
+        assert_eq!(
+            tokio::fs::read(copy.join("src/lib.rs")).await.unwrap(),
+            b"new\n"
+        );
+        assert!(!stage.exists(), "stage consumed by the swap");
+        assert!(!stale_backup.exists(), "backup removed after the swap");
+    }
+
+    /// First-time swap: no pre-existing copy to park. The stage still lands
+    /// at the copy path.
+    #[tokio::test]
+    async fn test_swap_into_vacant_copy_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let copy = dir.path().join("cfg-if-1.0.4");
+        let stage = stage_dir_for(&copy);
+        tokio::fs::create_dir_all(&stage).await.unwrap();
+        tokio::fs::write(stage.join("lib.rs"), b"new\n").await.unwrap();
+
+        swap_stage_into_place(&stage, &copy).await.unwrap();
+        assert_eq!(tokio::fs::read(copy.join("lib.rs")).await.unwrap(), b"new\n");
+        assert!(!backup_dir_for(&copy).exists());
+        assert!(!stage.exists());
+    }
+
+    /// AUDIT B1 (same destroy class, fresh path): when the pre-existing
+    /// config entry already points at THIS copy (wiring out of sync only
+    /// because the lock went corrupt post-vendor), a detach failure's unwind
+    /// restores that entry — so the uuid dir it points at must survive, or
+    /// the restored entry dangles and every build breaks.
+    #[tokio::test]
+    async fn test_detach_failure_keeps_copy_the_config_points_at() {
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        expect_done(run_vendor(PURL, root, &blobs, &pristine, &record, false).await);
+        // The lock went corrupt post-vendor (the preflight cross-check
+        // deliberately skips an unparseable lock).
+        tokio::fs::write(root.join("Cargo.lock"), "not = = toml [[[")
+            .await
+            .unwrap();
+
+        let (result, entry, _warnings) =
+            expect_done(run_vendor(PURL, root, &blobs, &pristine, &record, false).await);
+        assert!(!result.success);
+        assert!(entry.is_none());
+        // The restored prior entry still points at a live copy.
+        assert_eq!(
+            cargo_config::read_patch_entries(root).await["cfg-if"]
+                .path
+                .as_deref(),
+            Some(copy_rel().as_str())
+        );
+        assert!(
+            root.join(copy_rel()).join("src/lib.rs").exists(),
+            "the copy the restored config entry points at must survive the unwind"
+        );
+    }
+
+    /// AUDIT B2: a lock resolving the SAME name+version from multiple sources
+    /// (registry + same-version git fork — a legal, cargo-generated shape)
+    /// must be refused: consumers' `dependencies` arrays disambiguate those
+    /// entries with full package-id strings, which detaching
+    /// `source`/`checksum` dangles (real-cargo verified: the next
+    /// `cargo build --locked` fails with "cannot update the lock file").
+    #[tokio::test]
+    async fn test_refuses_same_version_multi_source_lock() {
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        let lock = format!(
+            "version = 4\n\n\
+             [[package]]\nname = \"a\"\nversion = \"0.1.0\"\ndependencies = [\n \"cfg-if 1.0.4 (registry+https://github.com/rust-lang/crates.io-index)\",\n]\n\n\
+             [[package]]\nname = \"cfg-if\"\nversion = \"1.0.4\"\nsource = \"{SOURCE}\"\nchecksum = \"{CHECKSUM}\"\n\n\
+             [[package]]\nname = \"cfg-if\"\nversion = \"1.0.4\"\nsource = \"git+https://example.com/fork/cfg-if#abcdef\"\n"
+        );
+        tokio::fs::write(root.join("Cargo.lock"), &lock).await.unwrap();
+
+        let detail = expect_refused(
+            run_vendor(PURL, root, &blobs, &pristine, &record, false).await,
+            "locked_multi_source_conflict",
+        );
+        assert!(detail.contains("cfg-if"), "{detail}");
+        // Refused before any write.
+        assert!(!root.join(format!(".socket/vendor/cargo/{UUID}")).exists());
+        assert!(!root.join(".cargo").exists());
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("Cargo.lock"))
+                .await
+                .unwrap(),
+            lock,
+            "the multi-source lock must be byte-identical after the refusal"
+        );
+    }
+
+    /// AUDIT B4 (security_scratch_audit.rs REPRO 3): a user-authored entry
+    /// whose path merely TRAVERSES a foreign checkout's
+    /// `.socket/vendor/cargo/` is user-authored — vendor must refuse up
+    /// front, never silently rewrite (or later delete) it.
+    #[tokio::test]
+    async fn test_refuses_user_entry_through_foreign_socket_dir() {
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        tokio::fs::create_dir_all(root.join(".cargo")).await.unwrap();
+        let user_cfg = format!(
+            "[patch.crates-io]\ncfg-if = {{ path = \"../shared-fork/.socket/vendor/cargo/{UUID2}/cfg-if-1.0.4\" }}\n"
+        );
+        tokio::fs::write(root.join(".cargo/config.toml"), &user_cfg)
+            .await
+            .unwrap();
+
+        expect_refused(
+            run_vendor(PURL, root, &blobs, &pristine, &record, false).await,
+            "user_authored_patch_entry",
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(".cargo/config.toml"))
+                .await
+                .unwrap(),
+            user_cfg,
+            "the user's entry must be byte-identical after the refusal"
+        );
+        assert!(!root.join(format!(".socket/vendor/cargo/{UUID}")).exists());
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("Cargo.lock"))
+                .await
+                .unwrap(),
+            lock_body()
         );
     }
 
@@ -1767,8 +2262,86 @@ mod tests {
             )),
         )
         .await;
-        expect_refused(outcome, "vendor_prebuilt_required");
+        expect_refused(outcome, "vendor_prebuilt_integrity_mismatch");
         assert!(!root.join(format!(".socket/vendor/cargo/{UUID}")).exists());
+    }
+
+    /// AUDIT B3: bytes that fail integrity verification are an active tamper
+    /// signal — the DEFAULT `auto` mode must hard-fail exactly like `service`
+    /// mode, never quietly warn and build locally (the module contract:
+    /// "IntegrityMismatch → ALWAYS a hard error regardless of mode").
+    #[tokio::test]
+    async fn service_integrity_mismatch_auto_mode_hard_fails() {
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        let crate_tgz = make_crate_tgz("cfg-if-1.0.4", &[("src/lib.rs", PATCHED)]);
+        let wrong = sri_sha512(b"different bytes");
+        let server = wiremock::MockServer::start().await;
+        mount_cargo_granted(&server, &wrong, &crate_tgz).await;
+        let sources = PatchSources::blobs_only(&blobs);
+
+        let outcome = vendor_cargo_crate(
+            PURL,
+            &pristine,
+            root,
+            &record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            Some(&cargo_service_cfg(&server.uri(), VendorSource::Auto, false)),
+        )
+        .await;
+        expect_refused(outcome, "vendor_prebuilt_integrity_mismatch");
+        assert!(
+            !copy_lib(root).exists(),
+            "must not fall back to a local build on tampered bytes"
+        );
+        assert!(!root.join(".socket/vendor").exists(), "no vendor debris");
+        assert!(!root.join(".cargo").exists(), "nothing wired");
+    }
+
+    /// AUDIT B5: the service-mode layout-mismatch hard failure must not leave
+    /// an empty `.socket/vendor/cargo/<uuid>/` husk (nor the vendor parents
+    /// this run created) behind for the user to commit.
+    #[tokio::test]
+    async fn service_layout_mismatch_service_mode_leaves_no_husk() {
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        // The crate extracts fine but carries the patched file at the wrong
+        // path → the extracted-tree afterHash check fails.
+        let crate_tgz = make_crate_tgz("cfg-if-1.0.4", &[("src/other.rs", PATCHED)]);
+        let sri = sri_sha512(&crate_tgz);
+        let server = wiremock::MockServer::start().await;
+        mount_cargo_granted(&server, &sri, &crate_tgz).await;
+        let sources = PatchSources::blobs_only(&blobs);
+
+        let outcome = vendor_cargo_crate(
+            PURL,
+            &pristine,
+            root,
+            &record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            Some(&cargo_service_cfg(
+                &server.uri(),
+                VendorSource::Service,
+                false,
+            )),
+        )
+        .await;
+        expect_refused(outcome, "vendor_prebuilt_required");
+        assert!(
+            !root.join(format!(".socket/vendor/cargo/{UUID}")).exists(),
+            "no empty uuid husk after the hard failure"
+        );
+        assert!(
+            !root.join(".socket/vendor").exists(),
+            "the vendor levels created by this failed run are pruned"
+        );
+        assert!(!root.join(".cargo").exists());
     }
 
     /// `auto` + a not-built service status falls back to the local build (which
@@ -1827,5 +2400,158 @@ mod tests {
         )
         .await;
         expect_refused(outcome, "vendor_service_offline_conflict");
+    }
+
+    // ── cross-mode takeover: in-use probe + fail-closed hosted guard ─────
+
+    fn ledger_entry_for(uuid: &str) -> VendorEntry {
+        VendorEntry {
+            ecosystem: "cargo".into(),
+            base_purl: PURL.into(),
+            uuid: uuid.into(),
+            artifact: VendorArtifact {
+                path: format!(".socket/vendor/cargo/{uuid}/cfg-if-1.0.4"),
+                sha256: String::new(),
+                size: None,
+                platform_locked: None,
+            },
+            wiring: Vec::new(),
+            lock: None,
+            took_over_go_patches: false,
+            detached: false,
+            record: None,
+            flavor: None,
+            uv: None,
+            pnpm: None,
+            poetry: None,
+            pdm: None,
+            pipenv: None,
+        }
+    }
+
+    /// The lockfile-in-use probe for cargo (GC/prune reclaim): detached lock
+    /// + our `[patch]` = in use; a registry source (hosted takeover or a
+    /// crates.io re-resolve), a missing entry, or a foreign `[patch]` target
+    /// = reclaimable; no lock = undeterminable (keep, fail-safe).
+    #[tokio::test]
+    async fn test_vendored_entry_in_use_probe() {
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        let entry_probe = ledger_entry_for(UUID);
+
+        // No lockfile: undeterminable.
+        tokio::fs::remove_file(root.join("Cargo.lock"))
+            .await
+            .unwrap();
+        assert_eq!(vendored_entry_in_use(&entry_probe, root).await, None);
+        tokio::fs::write(root.join("Cargo.lock"), lock_body())
+            .await
+            .unwrap();
+
+        // Registry-sourced (pre-vendor / re-resolved): not consumed.
+        assert_eq!(vendored_entry_in_use(&entry_probe, root).await, Some(false));
+
+        // Fully vendored: detached lock + our [patch] entry ⇒ in use.
+        let (result, entry, _w) =
+            expect_done(run_vendor(PURL, root, &blobs, &pristine, &record, false).await);
+        assert!(result.success, "{:?}", result.error);
+        let entry = entry.unwrap();
+        assert_eq!(vendored_entry_in_use(&entry, root).await, Some(true));
+
+        // Hosted takeover shape: the lock re-sourced to a socket-patch sparse
+        // index (the [patch] entry survives, but nothing consumes the copy).
+        tokio::fs::write(
+            root.join("Cargo.lock"),
+            format!(
+                "version = 4\n\n[[package]]\nname = \"cfg-if\"\nversion = \"1.0.4\"\nsource = \"sparse+http://127.0.0.1:5555/index/\"\nchecksum = \"{}\"\n",
+                "a".repeat(64)
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(vendored_entry_in_use(&entry, root).await, Some(false));
+
+        // Dependency left the lock graph entirely: reclaimable.
+        tokio::fs::write(
+            root.join("Cargo.lock"),
+            "version = 4\n\n[[package]]\nname = \"app\"\nversion = \"0.1.0\"\n",
+        )
+        .await
+        .unwrap();
+        assert_eq!(vendored_entry_in_use(&entry, root).await, Some(false));
+
+        // Detached lock but the [patch] points at ANOTHER uuid's copy: this
+        // entry's artifact is not what the lock consumes.
+        tokio::fs::write(
+            root.join("Cargo.lock"),
+            "version = 4\n\n[[package]]\nname = \"cfg-if\"\nversion = \"1.0.4\"\n",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            vendored_entry_in_use(&ledger_entry_for(UUID2), root).await,
+            Some(false)
+        );
+    }
+
+    /// FAIL CLOSED: vendoring over a LIVE hosted redirect with no ledger to
+    /// revert it must refuse — proceeding would record the hosted registry
+    /// values as the entry's "originals" and leave Cargo.toml pinned to the
+    /// hosted registry (unbuildable in both modes) while reporting success.
+    #[tokio::test]
+    async fn test_refuses_live_hosted_redirect_without_ledger() {
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        let index = "sparse+http://127.0.0.1:5555/index/";
+        // The hosted rewriter's output shapes: registry pin in Cargo.toml,
+        // socket-patch registries block, lock re-sourced to the index.
+        tokio::fs::write(
+            root.join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\ncfg-if = {{ version = \"1\", registry = \"socket-patch-{UUID}\" }}\n"
+            ),
+        )
+        .await
+        .unwrap();
+        tokio::fs::create_dir_all(root.join(".cargo"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            root.join(".cargo/config.toml"),
+            format!("[registries.socket-patch-{UUID}]\nindex = \"{index}\"\n"),
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            root.join("Cargo.lock"),
+            format!(
+                "version = 4\n\n[[package]]\nname = \"cfg-if\"\nversion = \"1.0.4\"\nsource = \"{index}\"\nchecksum = \"{}\"\n",
+                "a".repeat(64)
+            ),
+        )
+        .await
+        .unwrap();
+
+        let detail = expect_refused(
+            run_vendor(PURL, root, &blobs, &pristine, &record, false).await,
+            "hosted_redirect_live",
+        );
+        assert!(detail.contains("redirect-state.json"), "{detail}");
+        // Nothing was half-vendored.
+        assert!(!root.join(format!(".socket/vendor/cargo/{UUID}")).exists());
+
+        // The Cargo.toml pin ALONE (lock already detached — the legacy
+        // hosted→vendored terminal state) is refused too: the in-sync hot
+        // path must not report already_vendored over a broken manifest pin.
+        tokio::fs::write(
+            root.join("Cargo.lock"),
+            "version = 4\n\n[[package]]\nname = \"cfg-if\"\nversion = \"1.0.4\"\n",
+        )
+        .await
+        .unwrap();
+        expect_refused(
+            run_vendor(PURL, root, &blobs, &pristine, &record, false).await,
+            "hosted_redirect_live",
+        );
     }
 }

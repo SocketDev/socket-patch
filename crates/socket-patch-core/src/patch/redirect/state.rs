@@ -171,6 +171,26 @@ pub async fn save_redirect_state(
     atomic_write_bytes(&path, format!("{json}\n").as_bytes()).await
 }
 
+/// Persist the redirect ledger via [`save_redirect_state`]'s atomic writer.
+/// An EMPTY ledger (no edits, no records) is DELETED instead: a residual
+/// empty file would keep takeover-overlap detection and VEX reading a ledger
+/// that asserts nothing.
+pub async fn persist_redirect_state(
+    project_root: &Path,
+    state: &RedirectState,
+) -> std::io::Result<()> {
+    if state.edits.is_empty() && state.records.is_empty() {
+        let path = project_root.join(REDIRECT_STATE_REL);
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        return Ok(());
+    }
+    save_redirect_state(project_root, state).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

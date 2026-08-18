@@ -10,6 +10,14 @@
 //! unlocked, claims 2/4) and the `dependencies` arrays reference the crate by
 //! plain name, so nothing else needs rewriting (claim 8).
 //!
+//! Claim 8 holds only while `name`+`version` is unique in the lock. When the
+//! same name+version resolves from MULTIPLE sources (a registry entry plus a
+//! same-version git fork — a legal, cargo-generated shape), consumers'
+//! `dependencies` arrays disambiguate with FULL package-id strings
+//! (`"cfg-if 1.0.0 (registry+…)"`); detaching `source`/`checksum` from one
+//! entry dangles those references and breaks `--locked` builds. Vendor
+//! refuses that shape upstream via [`count_lock_entries`].
+//!
 //! The lock is generated-but-committed, so edits are text-preserving
 //! (`toml_edit`): untouched entries, the `@generated` header comment, and the
 //! `version = 4` line keep their exact bytes — zero formatting churn in the
@@ -199,6 +207,61 @@ pub async fn read_locked_versions(project_root: &Path) -> Option<HashMap<String,
         }
     }
     Some(map)
+}
+
+/// Read-only shape of the `[[package]]` entry for `name`+`version` — the
+/// lock-level truth source cross-mode takeover logic keys off (which mode a
+/// crate's resolution actually points at right now).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LockEntryProbe {
+    /// No readable/parseable `Cargo.lock`.
+    NoLockfile,
+    /// The lock parses but has no entry at this name+version.
+    EntryMissing,
+    /// Entry present with no `source` — the vendored detached shape (the
+    /// `[patch.crates-io]` path copy is the lock's sole provider).
+    Detached,
+    /// Entry present with this registry `source` (crates.io, a hosted
+    /// socket-patch sparse index, or any other registry).
+    Source(String),
+}
+
+/// Probe the `[[package]]` entry for `name`+`version` without editing
+/// anything. Unreadable/unparseable locks read as [`LockEntryProbe::NoLockfile`]
+/// so callers stay fail-safe (cannot determine ⇒ keep / stay silent).
+pub async fn probe_lock_entry(project_root: &Path, name: &str, version: &str) -> LockEntryProbe {
+    let Ok((_path, mut doc)) = read_lock(project_root).await else {
+        return LockEntryProbe::NoLockfile;
+    };
+    let Some(table) = find_package_mut(&mut doc, name, version) else {
+        return LockEntryProbe::EntryMissing;
+    };
+    match table.get("source").and_then(Item::as_str) {
+        Some(s) => LockEntryProbe::Source(s.to_string()),
+        None => LockEntryProbe::Detached,
+    }
+}
+
+/// Number of `[[package]]` entries matching `name`+`version`. More than one
+/// means the lock resolves the same name+version from multiple sources (e.g.
+/// registry + git fork), the shape whose `dependencies` arrays use full
+/// package-id strings that [`detach_lock_entry`]'s surgery would dangle —
+/// callers refuse to vendor it. A missing/unparseable lock (or one without a
+/// `[[package]]` array) counts zero: the same "no usable lock" treatment as
+/// [`read_locked_versions`].
+pub async fn count_lock_entries(project_root: &Path, name: &str, version: &str) -> usize {
+    let Ok((_path, doc)) = read_lock(project_root).await else {
+        return 0;
+    };
+    let Some(pkgs) = doc.get("package").and_then(Item::as_array_of_tables) else {
+        return 0;
+    };
+    pkgs.iter()
+        .filter(|t| {
+            t.get("name").and_then(Item::as_str) == Some(name)
+                && t.get("version").and_then(Item::as_str) == Some(version)
+        })
+        .count()
 }
 
 #[cfg(test)]
@@ -581,6 +644,37 @@ mod tests {
             after, body,
             "mid-file entry with dependencies must round-trip byte-identically"
         );
+    }
+
+    /// AUDIT B2 helper: the same name+version under multiple sources must be
+    /// counted, so vendor can refuse the lock shape whose `dependencies`
+    /// arrays reference entries by full package-id string.
+    #[tokio::test]
+    async fn count_lock_entries_sees_multi_source_duplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            dir.path().join("Cargo.lock"),
+            format!(
+                "version = 4\n\n\
+                 [[package]]\nname = \"cfg-if\"\nversion = \"1.0.4\"\nsource = \"{SOURCE}\"\nchecksum = \"{CHECKSUM}\"\n\n\
+                 [[package]]\nname = \"cfg-if\"\nversion = \"1.0.4\"\nsource = \"git+https://example.com/fork/cfg-if#abcdef\"\n\n\
+                 [[package]]\nname = \"cfg-if\"\nversion = \"0.1.10\"\nsource = \"{SOURCE}\"\n"
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(count_lock_entries(dir.path(), "cfg-if", "1.0.4").await, 2);
+        assert_eq!(count_lock_entries(dir.path(), "cfg-if", "0.1.10").await, 1);
+        assert_eq!(count_lock_entries(dir.path(), "cfg-if", "9.9.9").await, 0);
+
+        // Missing / unparseable locks count zero (the caller's cross-check is
+        // skipped, matching read_locked_versions).
+        let empty = tempfile::tempdir().unwrap();
+        assert_eq!(count_lock_entries(empty.path(), "cfg-if", "1.0.4").await, 0);
+        tokio::fs::write(empty.path().join("Cargo.lock"), "[[[ nope")
+            .await
+            .unwrap();
+        assert_eq!(count_lock_entries(empty.path(), "cfg-if", "1.0.4").await, 0);
     }
 
     #[tokio::test]

@@ -179,7 +179,7 @@
 
     {
       "ecosystem": "composer", "pm": "composer", "image": "composer", "hook_family": "composer-event",
-      "baseline_supported": false,
+      "baseline_supported": true,
       "package": "monolog/monolog", "version": "3.5.0", "purl": "pkg:composer/monolog/monolog@3.5.0",
       "manifest_key": "package/src/Monolog/Logger.php", "apply_ecosystems": "composer"
     },

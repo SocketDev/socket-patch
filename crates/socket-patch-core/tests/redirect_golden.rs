@@ -32,6 +32,7 @@ const RUST_IMPLEMENTED: &[&str] = &[
     "nuget/packages-lock",
     "gem/bundler",
     "maven/pom",
+    "golang/gomod",
 ];
 
 fn fixtures_root() -> PathBuf {

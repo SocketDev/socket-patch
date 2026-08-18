@@ -203,6 +203,34 @@ pub async fn apply_go_redirect(
         return synthesized_result(purl, &copy_dir, Vec::new(), true, None);
     }
 
+    // A hosted-mode `replace` (`scan --mode hosted`) owns this module. Taking
+    // it over here would silently discard the committed hosted redirect: the
+    // shared upsert would repoint the directive at the local copy while
+    // go.sum still carries the socket module's lines and is missing the
+    // original's (the hosted rewrite prunes them; they are only restorable
+    // from the redirect ledger, which this path does not read). The reverse
+    // direction — hosted taking over a local redirect — IS supported, because
+    // the hosted rewriter reconciles go.sum in the same pass. Fail closed and
+    // name the way out.
+    if read_replace_entries(project_root)
+        .await
+        .iter()
+        .any(|e| e.module == module && e.owner == Some(ReplaceOwner::Hosted))
+    {
+        return synthesized_result(
+            purl,
+            &copy_dir,
+            Vec::new(),
+            false,
+            Some(format!(
+                "go.mod holds a hosted-mode replace for {module} (written by `scan --mode \
+                 hosted`); refusing to overwrite it — revert the hosted redirect first \
+                 (restore go.mod/go.sum from version control, or drop the replace and run \
+                 `go mod tidy`), then re-run apply"
+            )),
+        );
+    }
+
     if dry_run {
         // Verify (read-only) against the pristine source for an accurate
         // "would patch" report, without creating the copy or editing go.mod.
@@ -410,14 +438,18 @@ pub async fn verify_go_redirect_state(
             continue;
         }
 
-        // A vendor-owned `replace` outranks the go-patches redirect: the module
-        // is managed by `socket-patch vendor`, so this audit must not demand a
-        // go-patches copy/directive for it (that would report MissingCopy/
-        // WrongReplacePath drift for every vendored module).
-        if entries
-            .iter()
-            .any(|e| e.module == module && e.owner == Some(ReplaceOwner::Vendor))
-        {
+        // A vendor- or hosted-owned `replace` outranks the go-patches
+        // redirect: the module is managed by `socket-patch vendor` /
+        // `scan --mode hosted`, so this audit must not demand a go-patches
+        // copy/directive for it (that would report MissingCopy/MissingReplace
+        // drift for every module another socket mode legitimately took over).
+        if entries.iter().any(|e| {
+            e.module == module
+                && matches!(
+                    e.owner,
+                    Some(ReplaceOwner::Vendor) | Some(ReplaceOwner::Hosted)
+                )
+        }) {
             continue;
         }
 

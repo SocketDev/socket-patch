@@ -96,8 +96,11 @@ pub async fn vendor_go_module(
     };
 
     // Detect an existing socket-owned directive BEFORE the engine rewrites it:
-    // a go-patches owner means vendor is taking over an `apply` redirect; any
-    // prior socket path becomes the wiring record's `original`.
+    // a go-patches owner means vendor is taking over an `apply` redirect, a
+    // hosted owner means it is taking over a `scan --mode hosted` fork-replace;
+    // the prior target (path, or `<module> <version>` for hosted) becomes the
+    // wiring record's `original` — revert keys its hosted-takeover warning on
+    // that text's namespace prefix, so it must be recorded faithfully.
     let prior = read_replace_entries(project_root)
         .await
         .into_iter()
@@ -105,15 +108,25 @@ pub async fn vendor_go_module(
     let takeover = prior
         .as_ref()
         .is_some_and(|e| e.owner == Some(ReplaceOwner::GoPatches));
-    let prior_path = prior.as_ref().and_then(|e| e.path.clone());
+    let hosted_takeover = prior
+        .as_ref()
+        .is_some_and(|e| e.owner == Some(ReplaceOwner::Hosted));
+    let prior_target = prior.as_ref().and_then(|e| {
+        e.path.clone().or_else(|| {
+            e.rhs_module.as_ref().map(|m| match &e.rhs_version {
+                Some(v) => format!("{m} {v}"),
+                None => m.clone(),
+            })
+        })
+    });
 
     // Re-run shape detection: the replace already points at THIS uuid's copy.
     // The engine rebuilds a missing/stale copy and its replace upsert is a
     // byte-stable no-op, so a wired re-run must return `entry: None` — the
     // first run's ledger entry holds the only pre-vendor original, and the
-    // `prior_path` recorded here would be our own vendored pointer.
+    // `prior_target` recorded here would be our own vendored pointer.
     let wired =
-        prior_path.as_deref() == Some(replace_target_path(&base_rel, module, version).as_str());
+        prior_target.as_deref() == Some(replace_target_path(&base_rel, module, version).as_str());
     let copy_dir = copy_dir_for(project_root, &base_rel, module, version);
     let copy_was_ok = wired && copy_matches_after_hashes(&copy_dir, &record.files).await;
 
@@ -271,6 +284,22 @@ pub async fn vendor_go_module(
         ));
     }
 
+    if hosted_takeover {
+        // The hosted rewrite pruned the original module's go.sum lines and
+        // added the socket module's. The vendored directory replace bypasses
+        // go.sum entirely, so the build stays green — but the go.sum state
+        // only matters again once the replace is dropped, so say NOW what
+        // `vendor --revert` will require.
+        warnings.push(VendorWarning::new(
+            "vendor_takeover",
+            format!(
+                "took over the hosted-mode replace for `{module}` (written by `scan --mode \
+                 hosted`); after `vendor --revert`, re-run `scan --mode hosted` or run \
+                 `go mod tidy` to regenerate the original module's go.sum lines"
+            ),
+        ));
+    }
+
     // ── marker + ledger entry ─────────────────────────────────────────────
     let base_purl = strip_purl_qualifiers(purl).to_string();
     let marker = VendorMarker::new("golang", &base_purl, record, vendored_at);
@@ -296,15 +325,16 @@ pub async fn vendor_go_module(
         wiring: vec![WiringRecord {
             file: "go.mod".to_string(),
             kind: "go_replace".to_string(),
-            // Rewritten whenever ANY socket-owned directive pre-existed (the
-            // go-patches takeover, or a re-vendor refreshing an older uuid).
-            action: if prior_path.is_some() {
+            // Rewritten whenever ANY socket-owned directive pre-existed (a
+            // go-patches or hosted takeover, or a re-vendor refreshing an
+            // older uuid).
+            action: if prior_target.is_some() {
                 WiringAction::Rewritten
             } else {
                 WiringAction::Added
             },
             key: Some(module.to_string()),
-            original: prior_path.map(serde_json::Value::from),
+            original: prior_target.map(serde_json::Value::from),
             new: Some(serde_json::Value::from(replace_target_path(
                 &base_rel, module, version,
             ))),
@@ -561,6 +591,27 @@ pub async fn revert_go_vendor(
             format!(
                 "the `.socket/go-patches/` redirect for `{module}` that vendoring \
                  took over was not restored; run `socket-patch apply` to restore it"
+            ),
+        ));
+    }
+
+    // A hosted-mode prior is recognizable from the wiring `original` (the
+    // hosted module-target text under the socket namespace) — the ledger
+    // schema carries no hosted flag. Dropping the vendor replace re-exposes
+    // the go.sum state the hosted rewrite left behind (original module's
+    // lines pruned), which breaks `-mod=readonly` builds until regenerated.
+    if entry.wiring.iter().any(|w| {
+        w.original
+            .as_ref()
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| s.starts_with(go_mod_edit::HOSTED_GO_MODULE_PREFIX))
+    }) {
+        out.warnings.push(VendorWarning::new(
+            "takeover_not_restored",
+            format!(
+                "the hosted-mode replace for `{module}` that vendoring took over was \
+                 not restored; re-run `scan --mode hosted`, or run `go mod tidy` to \
+                 regenerate the original module's go.sum lines"
             ),
         ));
     }

@@ -250,7 +250,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
                     "status": "error",
                     "error": msg,
                 }))
-                .unwrap()
+                .expect("serializing an in-memory JSON value cannot fail")
             );
         } else {
             eprintln!("Error: {msg}");
@@ -274,7 +274,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
                     "error": "Manifest not found",
                     "path": manifest_path.display().to_string(),
                 }))
-                .unwrap()
+                .expect("serializing an in-memory JSON value cannot fail")
             );
         } else {
             // Errors print even under --silent ("errors only", never
@@ -331,7 +331,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
                         "vendored": vendored,
                         "results": results.iter().map(result_to_json).collect::<Vec<_>>(),
                     }))
-                    .unwrap()
+                    .expect("serializing an in-memory JSON value cannot fail")
                 );
             } else if !args.common.silent && !results.is_empty() {
                 let rolled_back: Vec<_> = results
@@ -458,7 +458,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
                         "vendored": [],
                         "results": [],
                     }))
-                    .unwrap()
+                    .expect("serializing an in-memory JSON value cannot fail")
                 );
             } else {
                 // Errors print even under --silent ("errors only", never
@@ -479,7 +479,9 @@ async fn rollback_patches_inner(
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "Invalid manifest".to_string())?;
 
-    let socket_dir = manifest_path.parent().unwrap();
+    let socket_dir = manifest_path
+        .parent()
+        .expect("manifest path names a file, so it has a parent");
     let mut blobs_path = socket_dir.join("blobs");
     // `--dry-run` must not mutate `.socket/` ("Preview, no mutations"):
     // don't create the blobs dir; a throwaway stage replaces it below.
@@ -495,7 +497,9 @@ async fn rollback_patches_inner(
         if args.identifier.is_some() {
             return Err(format!(
                 "No patch found matching identifier: {}",
-                args.identifier.as_deref().unwrap()
+                args.identifier
+                    .as_deref()
+                    .expect("is_some checked by the enclosing if")
             ));
         }
         if !args.common.silent && !args.common.json {
@@ -552,11 +556,120 @@ async fn rollback_patches_inner(
         .patches
         .retain(|purl, _| in_scope.contains(purl));
 
-    // Check for missing beforeHash blobs. Local-redirect PURLs (local-mode go)
-    // are excluded: their rollback just drops the project-local redirect + copy
-    // and reads no blobs, so a missing before-blob must not block an offline
-    // redirect rollback.
-    let gate_manifest = exclude_local_redirects(&scoped_manifest, &args.common);
+    let crawler_options = CrawlerOptions {
+        cwd: args.common.cwd.clone(),
+        global: args.common.global,
+        global_prefix: args.common.global_prefix.clone(),
+    };
+
+    let all_packages = find_packages_for_rollback(
+        &partitioned,
+        &crawler_options,
+        args.common.silent || args.common.json,
+    )
+    .await;
+
+    // Local-redirect rollback (local-mode go) drops a project-local redirect
+    // and reads nothing out of the ecosystem's package store, so — unlike an
+    // in-place restore — it must NOT depend on the crawler finding the package
+    // there. A directory `replace` makes go skip downloading the replaced
+    // module entirely, so a clone of a repo that committed `go.mod` +
+    // `.socket/go-patches/` + `.socket/manifest.json` (the documented golang
+    // workflow) has no module-cache copy for discovery to find. Without this
+    // fallback the redirect silently survived the rollback: `rollback`
+    // reported success while the build kept linking the patched copy, and
+    // `remove` (which delegates here) then deleted the manifest record,
+    // leaving an active patch nothing tracks. Scoped to `scoped_manifest` so
+    // `--ecosystems` still applies.
+    let undiscovered_redirects: Vec<String> = scoped_manifest
+        .patches
+        .keys()
+        .filter(|purl| is_local_redirect(purl, &args.common) && !all_packages.contains_key(*purl))
+        .cloned()
+        .collect();
+
+    // Group discovered packages by base PURL. A release-variant
+    // `package@version` (PyPI/RubyGems/Maven) may have several variants
+    // in the manifest that `merge_qualified` resolves to the same
+    // installed package dir. Rolling back a variant that is *not* present
+    // on disk would HashMismatch and report a spurious failure, so —
+    // mirroring apply — we collapse each group to the variant(s) whose
+    // hashes actually match the installed bytes. PyPI/RubyGems yield one
+    // such variant; Maven's coexisting classifier jars may yield several.
+    let mut groups: HashMap<String, Vec<(&String, &PathBuf)>> = HashMap::new();
+    for (purl, pkg_path) in &all_packages {
+        groups
+            .entry(strip_purl_qualifiers(purl).to_string())
+            .or_default()
+            .push((purl, pkg_path));
+    }
+
+    // Resolve which variant(s) each base PURL will actually roll back,
+    // BEFORE the before-blob gate below, so the gate covers only them.
+    let mut rollback_targets: Vec<(&String, &PathBuf)> = Vec::new();
+    for (_base, entries) in groups {
+        let to_rollback: Vec<(&String, &PathBuf)> = if entries.len() == 1 {
+            entries
+        } else {
+            // All variants in a group resolve to the same installed path.
+            let pkg_path = entries[0].1;
+            let candidates: Vec<(&str, &HashMap<String, PatchFileInfo>)> = entries
+                .iter()
+                .filter_map(|(purl, _)| {
+                    filtered_manifest
+                        .patches
+                        .get(*purl)
+                        .map(|p| (purl.as_str(), &p.files))
+                })
+                .collect();
+            let matched = select_installed_variants(pkg_path, &candidates).await;
+            if matched.is_empty() {
+                // No variant matches the installed distribution (e.g. a
+                // locally-modified file). Fall back to attempting every
+                // variant so the per-file verification surfaces the
+                // mismatch rather than silently skipping the package.
+                entries
+            } else {
+                let winners: HashSet<String> = matched
+                    .iter()
+                    .map(|&i| candidates[i].0.to_string())
+                    .collect();
+                entries
+                    .into_iter()
+                    .filter(|(p, _)| winners.contains(*p))
+                    .collect()
+            }
+        };
+        rollback_targets.extend(to_rollback);
+    }
+
+    // Check for missing beforeHash blobs — AFTER discovery and variant
+    // narrowing, so a broad manifest's sibling variants that resolved to
+    // the same installed package but were narrowed away (they describe a
+    // distribution that is not on disk) don't gate the run: an
+    // unfetchable sibling before-blob used to abort the WHOLE rollback
+    // (`--offline`: wholesale; online: on any download failure) even
+    // though that variant was never going to be attempted. In-scope
+    // purls the crawler could NOT resolve keep the fail-closed gate
+    // (their blobs are still fetched up front). Local-redirect PURLs
+    // (local-mode go) are excluded as before: their rollback just drops
+    // the project-local redirect + copy and reads no blobs, so a missing
+    // before-blob must not block an offline redirect rollback.
+    let attempted_purls: HashSet<&str> = rollback_targets.iter().map(|(p, _)| p.as_str()).collect();
+    let gate_manifest = exclude_local_redirects(
+        &PatchManifest {
+            patches: scoped_manifest
+                .patches
+                .iter()
+                .filter(|(purl, _)| {
+                    attempted_purls.contains(purl.as_str()) || !all_packages.contains_key(*purl)
+                })
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            setup: None,
+        },
+        &args.common,
+    );
 
     // `--dry-run`: verification needs real blob content for an accurate
     // preview, but the preview must not leave new files in the committable
@@ -639,38 +752,6 @@ async fn rollback_patches_inner(
         }
     }
 
-    let crawler_options = CrawlerOptions {
-        cwd: args.common.cwd.clone(),
-        global: args.common.global,
-        global_prefix: args.common.global_prefix.clone(),
-    };
-
-    let all_packages = find_packages_for_rollback(
-        &partitioned,
-        &crawler_options,
-        args.common.silent || args.common.json,
-    )
-    .await;
-
-    // Local-redirect rollback (local-mode go) drops a project-local redirect
-    // and reads nothing out of the ecosystem's package store, so — unlike an
-    // in-place restore — it must NOT depend on the crawler finding the package
-    // there. A directory `replace` makes go skip downloading the replaced
-    // module entirely, so a clone of a repo that committed `go.mod` +
-    // `.socket/go-patches/` + `.socket/manifest.json` (the documented golang
-    // workflow) has no module-cache copy for discovery to find. Without this
-    // fallback the redirect silently survived the rollback: `rollback`
-    // reported success while the build kept linking the patched copy, and
-    // `remove` (which delegates here) then deleted the manifest record,
-    // leaving an active patch nothing tracks. Scoped to `scoped_manifest` so
-    // `--ecosystems` still applies.
-    let undiscovered_redirects: Vec<String> = scoped_manifest
-        .patches
-        .keys()
-        .filter(|purl| is_local_redirect(purl, &args.common) && !all_packages.contains_key(*purl))
-        .cloned()
-        .collect();
-
     if all_packages.is_empty() && undiscovered_redirects.is_empty() {
         if !args.common.silent && !args.common.json {
             println!("No packages found that match patches to rollback");
@@ -678,99 +759,47 @@ async fn rollback_patches_inner(
         return Ok((true, Vec::new(), vendored_skipped));
     }
 
-    // Group discovered packages by base PURL. A release-variant
-    // `package@version` (PyPI/RubyGems/Maven) may have several variants
-    // in the manifest that `merge_qualified` resolves to the same
-    // installed package dir. Rolling back a variant that is *not* present
-    // on disk would HashMismatch and report a spurious failure, so —
-    // mirroring apply — we collapse each group to the variant(s) whose
-    // hashes actually match the installed bytes. PyPI/RubyGems yield one
-    // such variant; Maven's coexisting classifier jars may yield several.
-    let mut groups: HashMap<String, Vec<(&String, &PathBuf)>> = HashMap::new();
-    for (purl, pkg_path) in &all_packages {
-        groups
-            .entry(strip_purl_qualifiers(purl).to_string())
-            .or_default()
-            .push((purl, pkg_path));
-    }
-
     // Rollback patches
     let mut results: Vec<RollbackResult> = Vec::new();
     let mut has_errors = false;
 
-    for (_base, entries) in groups {
-        // Resolve which variant(s) to roll back for this base PURL.
-        let to_rollback: Vec<(&String, &PathBuf)> = if entries.len() == 1 {
-            entries
-        } else {
-            // All variants in a group resolve to the same installed path.
-            let pkg_path = entries[0].1;
-            let candidates: Vec<(&str, &HashMap<String, PatchFileInfo>)> = entries
-                .iter()
-                .filter_map(|(purl, _)| {
-                    filtered_manifest
-                        .patches
-                        .get(*purl)
-                        .map(|p| (purl.as_str(), &p.files))
-                })
-                .collect();
-            let matched = select_installed_variants(pkg_path, &candidates).await;
-            if matched.is_empty() {
-                // No variant matches the installed distribution (e.g. a
-                // locally-modified file). Fall back to attempting every
-                // variant so the per-file verification surfaces the
-                // mismatch rather than silently skipping the package.
-                entries
-            } else {
-                let winners: HashSet<String> = matched
-                    .iter()
-                    .map(|&i| candidates[i].0.to_string())
-                    .collect();
-                entries
-                    .into_iter()
-                    .filter(|(p, _)| winners.contains(*p))
-                    .collect()
+    for (purl, pkg_path) in rollback_targets {
+        let patch = match filtered_manifest.patches.get(purl) {
+            Some(p) => p,
+            None => continue,
+        };
+
+        // Local go drops the project-local `replace`-redirect; everything
+        // else — npm/pypi/gem and cargo (vendored or registry cache) —
+        // restores in place from before-blobs.
+        let result = match try_rollback_local_go(purl, pkg_path, patch, &args.common).await {
+            Some(r) => r,
+            None => {
+                rollback_package_patch(
+                    purl,
+                    pkg_path,
+                    &patch.files,
+                    &blobs_path,
+                    args.common.dry_run,
+                )
+                .await
             }
         };
 
-        for (purl, pkg_path) in to_rollback {
-            let patch = match filtered_manifest.patches.get(purl) {
-                Some(p) => p,
-                None => continue,
-            };
-
-            // Local go drops the project-local `replace`-redirect; everything
-            // else — npm/pypi/gem and cargo (vendored or registry cache) —
-            // restores in place from before-blobs.
-            let result = match try_rollback_local_go(purl, pkg_path, patch, &args.common).await {
-                Some(r) => r,
-                None => {
-                    rollback_package_patch(
-                        purl,
-                        pkg_path,
-                        &patch.files,
-                        &blobs_path,
-                        args.common.dry_run,
-                    )
-                    .await
-                }
-            };
-
-            if !result.success {
-                has_errors = true;
-                // Errors print even under --silent ("errors only", never
-                // "nothing"): with the summary muted, this line is the
-                // silent run's only failure diagnostic.
-                if !args.common.json {
-                    eprintln!(
-                        "Failed to rollback {}: {}",
-                        purl,
-                        result.error.as_deref().unwrap_or("unknown error")
-                    );
-                }
+        if !result.success {
+            has_errors = true;
+            // Errors print even under --silent ("errors only", never
+            // "nothing"): with the summary muted, this line is the
+            // silent run's only failure diagnostic.
+            if !args.common.json {
+                eprintln!(
+                    "Failed to rollback {}: {}",
+                    purl,
+                    result.error.as_deref().unwrap_or("unknown error")
+                );
             }
-            results.push(result);
         }
+        results.push(result);
     }
 
     // Redirects the crawler never saw (see `undiscovered_redirects` above):

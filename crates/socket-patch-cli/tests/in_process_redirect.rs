@@ -1290,6 +1290,94 @@ async fn no_redirectable_patch_leaves_bun_lockb_alone() {
     );
 }
 
+/// The corrupt-ledger refusal must fire BEFORE the bun.lockb auto-migration,
+/// not after it. The migration deletes the binary lock and writes a text one,
+/// so running it ahead of the refusal would convert the project's lockfile
+/// format and then exit 1 without recording the migration or redirecting
+/// anything — the "byte-untouched on refusal" promise broken by the one write
+/// that precedes every rewriter. A redirectable npm override is granted here
+/// (the migration's gate) and a fake `bun` that WOULD migrate sits on PATH, so
+/// the surviving bun.lockb proves the ordering rather than a skipped gate.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn corrupt_ledger_refuses_before_the_bun_lockb_migration() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("package.json"),
+        format!(
+            r#"{{ "name": "consumer", "version": "0.0.0", "dependencies": {{ "{NAME}": "^{VERSION}" }} }}"#
+        ),
+    )
+    .unwrap();
+    let pkg = tmp.path().join("node_modules").join(NAME);
+    std::fs::create_dir_all(&pkg).unwrap();
+    std::fs::write(
+        pkg.join("package.json"),
+        format!(r#"{{ "name": "{NAME}", "version": "{VERSION}" }}"#),
+    )
+    .unwrap();
+    std::fs::write(tmp.path().join("bun.lockb"), b"BUN-BINARY-PLACEHOLDER").unwrap();
+
+    // A torn ledger: parseable as neither the vendor nor the redirect shape.
+    let ledger_path = tmp.path().join(".socket/vendor/redirect-state.json");
+    std::fs::create_dir_all(ledger_path.parent().unwrap()).unwrap();
+    let corrupt_bytes = b"{\"mode\":\"hosted\",\"edits\":[{\"path\":\"bun.lo";
+    std::fs::write(&ledger_path, corrupt_bytes).unwrap();
+
+    let bin_dir = tmp.path().join("fakebin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let shim = bin_dir.join("bun");
+    std::fs::write(
+        &shim,
+        "#!/bin/sh\n\
+         echo '{ \"lockfileVersion\": 1, \"packages\": {} }' > bun.lock\n\
+         rm -f bun.lockb\n\
+         exit 0\n",
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let orig_path = std::env::var("PATH").unwrap_or_default();
+    // SAFETY: single-threaded #[serial] test; PATH restored below.
+    unsafe {
+        std::env::set_var("PATH", format!("{}:{orig_path}", bin_dir.display()));
+    }
+
+    let code = run(redirect_args(tmp.path(), server.uri())).await;
+
+    unsafe {
+        std::env::set_var("PATH", orig_path);
+    }
+    assert_eq!(code, 1, "a corrupt ledger must flip the exit code");
+    assert_eq!(
+        std::fs::read(tmp.path().join("bun.lockb")).ok().as_deref(),
+        Some(b"BUN-BINARY-PLACEHOLDER".as_slice()),
+        "the binary lock must be byte-untouched: the refusal precedes the migration"
+    );
+    assert!(
+        !tmp.path().join("bun.lock").exists(),
+        "no text lock may be created by a run that refused before redirecting"
+    );
+    // The malformed ledger is quarantined (never deleted), so recovery of the
+    // pre-redirect originals it may still hold stays possible.
+    let quarantined = tmp
+        .path()
+        .join(".socket/vendor/redirect-state.json.corrupt");
+    assert_eq!(
+        std::fs::read(&quarantined).unwrap(),
+        corrupt_bytes,
+        "the malformed ledger is moved aside verbatim"
+    );
+}
+
 /// An unusable ledger is an ERROR, not a silent success:
 /// `.socket/vendor/redirect-state.json` is the only revert path (and the VEX
 /// record store). A DIRECTORY squatting on the ledger path makes it
@@ -1318,6 +1406,69 @@ async fn unwritable_ledger_fails_the_run() {
     assert!(
         !lock.contains(HOSTED_URL),
         "an unusable ledger must abort before the lockfile rewrite; got:\n{lock}"
+    );
+}
+
+/// Findings hosted-atomicity 1+2: a MID-RUN lockfile write failure (second of
+/// two locks unwritable) must never leave the successfully-written first lock
+/// redirected with no ledger record of its pre-redirect originals. The ledger
+/// is persisted BEFORE the lockfile loop, so every planned edit's original is
+/// durable even when a later write fails; the failed lock itself stays
+/// byte-untouched (atomic stage+rename, no truncation).
+///
+/// unix-only: a read-only directory does not block file creation on Windows.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn partial_lockfile_write_failure_persists_ledger_originals() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    // Rush repo: two pnpm locks, both resolving the patched package. The
+    // rewriter output map is a BTreeMap, so the common lock
+    // (common/config/rush/…) is written before the subspace lock
+    // (common/config/subspaces/…).
+    write_rush_project(tmp.path(), false);
+    let subspace_dir = tmp.path().join("common/config/subspaces/frontend");
+    let before_subspace = std::fs::read_to_string(subspace_dir.join("pnpm-lock.yaml")).unwrap();
+    std::fs::set_permissions(&subspace_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    let code = run(redirect_args(tmp.path(), server.uri())).await;
+
+    std::fs::set_permissions(&subspace_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(code, 1, "a mid-run lockfile write failure must exit 1");
+
+    // The first lock landed before the failure…
+    let common =
+        std::fs::read_to_string(tmp.path().join("common/config/rush/pnpm-lock.yaml")).unwrap();
+    assert!(
+        common.contains(HOSTED_URL),
+        "the common lock was written before the subspace failure; got:\n{common}"
+    );
+    // …so its pre-redirect originals MUST already be in the ledger: without
+    // them a revert is impossible, and a re-run cannot recapture them (the
+    // entry is already redirected and produces no new edit).
+    let ledger = std::fs::read_to_string(tmp.path().join(".socket/vendor/redirect-state.json"))
+        .expect("the ledger must be persisted before any lockfile is mutated");
+    assert!(
+        ledger.contains("UPSTREAMupstream"),
+        "the ledger must record the pre-redirect original integrity: {ledger}"
+    );
+    assert!(
+        ledger.contains("common/config/rush/pnpm-lock.yaml"),
+        "the ledger must record the edit for the lock that WAS written: {ledger}"
+    );
+
+    // The failed lock is byte-untouched — no partial/truncated write.
+    assert_eq!(
+        std::fs::read_to_string(subspace_dir.join("pnpm-lock.yaml")).unwrap(),
+        before_subspace,
+        "the unwritable lock must stay byte-identical (atomic writes)"
     );
 }
 
@@ -1471,6 +1622,86 @@ fn warning_codes(env: &serde_json::Value) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// A patched dep whose ONLY lock instance is bundled (`inBundle: true`)
+/// must not be redirected: npm extracts that copy from its parent's tarball
+/// and ignores the entry's resolved/integrity, so a rewrite would confirm —
+/// and VEX-attest — a patch whose bytes never install. The run must report
+/// `redirected: 0`, leave the lockfile byte-identical, and carry the loud
+/// stays-UNPATCHED warning. Subprocess so the `--json` envelope's
+/// `redirected` count and `warnings[]` can be read back.
+#[tokio::test]
+#[serial]
+async fn redirect_inbundle_only_dep_is_skipped_not_confirmed() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+
+    let tmp = tempfile::tempdir().expect("create the fixture tempdir");
+    std::fs::write(
+        tmp.path().join("package.json"),
+        r#"{ "name": "consumer", "version": "0.0.0", "dependencies": { "parent": "2.0.0" } }"#,
+    )
+    .expect("write the consumer package.json");
+    // Installed tree: the patched package exists only as parent's bundled
+    // nested copy — the crawler still discovers it there.
+    let parent = tmp.path().join("node_modules").join("parent");
+    std::fs::create_dir_all(&parent).expect("create node_modules/parent");
+    std::fs::write(
+        parent.join("package.json"),
+        r#"{ "name": "parent", "version": "2.0.0", "bundleDependencies": ["in-proc-redirect"] }"#,
+    )
+    .expect("write the bundling parent's package.json");
+    let nested = parent.join("node_modules").join(NAME);
+    std::fs::create_dir_all(&nested).expect("create the bundled nested copy's dir");
+    std::fs::write(
+        nested.join("package.json"),
+        format!(r#"{{ "name": "{NAME}", "version": "{VERSION}" }}"#),
+    )
+    .expect("write the bundled nested copy's package.json");
+    let lock = format!(
+        r#"{{
+  "name": "consumer",
+  "version": "0.0.0",
+  "lockfileVersion": 3,
+  "requires": true,
+  "packages": {{
+    "": {{ "name": "consumer", "version": "0.0.0", "dependencies": {{ "parent": "2.0.0" }} }},
+    "node_modules/parent": {{
+      "version": "2.0.0",
+      "resolved": "https://registry.npmjs.org/parent/-/parent-2.0.0.tgz",
+      "integrity": "sha512-PARENT=="
+    }},
+    "node_modules/parent/node_modules/{NAME}": {{
+      "version": "{VERSION}",
+      "inBundle": true,
+      "integrity": "sha512-UPSTREAMupstream=="
+    }}
+  }}
+}}
+"#
+    );
+    std::fs::write(tmp.path().join("package-lock.json"), &lock)
+        .expect("write the bundled-instance package-lock.json");
+
+    let env = run_redirect_subprocess(tmp.path(), &server.uri());
+    assert_eq!(
+        env["redirect"]["redirected"], 0,
+        "a bundled-only dep must NOT be counted redirected: {env}"
+    );
+    let codes = warning_codes(&env);
+    assert!(
+        codes.contains(&"redirect_npm_bundled_instance_skipped".to_string()),
+        "the stays-UNPATCHED warning must reach the envelope: {env}"
+    );
+    let after = std::fs::read_to_string(tmp.path().join("package-lock.json"))
+        .expect("read back the package-lock.json the run must have left alone");
+    assert_eq!(after, lock, "the lockfile must be byte-untouched");
+    assert!(
+        !after.contains(HOSTED_URL),
+        "the hosted URL must never appear (it would confirm + attest): {after}"
+    );
 }
 
 /// The rewriters' own warnings must reach HUMAN mode too, not just the
@@ -2147,27 +2378,34 @@ async fn run_hosted_json_scan(tmp: &std::path::Path, server: &MockServer) -> std
 }
 
 /// Leg 3 of the four `--json` failure exits: the rewritten lockfile cannot
-/// be written back (read-only file; the rewriter read it fine moments
-/// earlier). A real filesystem obstruction drives the run to the write in
-/// question and fails it there. (Legs 1-2 — the discovery-detail and
-/// reference-resolve failures — are pinned by
+/// be written back — its DIRECTORY is read-only, so the atomic stage file
+/// cannot be created (the rewriter read the lock fine moments earlier). A
+/// read-only lock FILE no longer fails this leg: the atomic stage+rename
+/// replaces it mode-preserved, like the vendored backend's writer. (Legs 1-2
+/// — the discovery-detail and reference-resolve failures — are pinned by
 /// `redirect_json_mode_failures_emit_error_envelope` above; leg 4 — the
 /// ledger write — is pinned by the unix-only
 /// `redirect_ledger_write_failure_leaves_project_files_untouched` below.)
+///
+/// unix-only: a read-only directory does not block file creation on Windows.
+#[cfg(unix)]
 #[tokio::test]
 #[serial]
 async fn redirect_json_mode_write_failures_emit_error_envelope() {
+    use std::os::unix::fs::PermissionsExt;
+
     let server = MockServer::start().await;
     mock_discovery(&server).await;
     mock_reference(&server).await;
     mock_view(&server).await;
     let tmp = tempfile::tempdir().unwrap();
-    write_project(tmp.path());
-    let lock = tmp.path().join("package-lock.json");
-    let mut perms = std::fs::metadata(&lock).unwrap().permissions();
-    perms.set_readonly(true);
-    std::fs::set_permissions(&lock, perms).unwrap();
+    // Rush project: the lock lives in a subdirectory, so obstructing it does
+    // not also block the (earlier) `.socket/vendor` ledger write at the root.
+    write_rush_project(tmp.path(), false);
+    let lock_dir = tmp.path().join("common/config/rush");
+    std::fs::set_permissions(&lock_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
     let out = run_hosted_json_scan(tmp.path(), &server).await;
+    std::fs::set_permissions(&lock_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
     assert_write_failure_envelope(&out, "lockfile-write failure");
 }
 
@@ -2179,8 +2417,7 @@ async fn redirect_json_mode_write_failures_emit_error_envelope() {
 ///
 /// unix-only: the obstruction is a read-only DIRECTORY, and Windows ignores
 /// FILE_ATTRIBUTE_READONLY on directories for file creation, so the stage
-/// file would be created fine there (leg 3's read-only FILE does obstruct on
-/// Windows and stays cross-platform).
+/// file would be created fine there.
 #[cfg(unix)]
 #[tokio::test]
 #[serial]
@@ -2405,4 +2642,523 @@ async fn scan_updates_reports_superseding_patch_for_ledger_only_project() {
     assert_eq!(updates[0]["purl"], PURL);
     assert_eq!(updates[0]["oldUuid"], OLD_UUID);
     assert_eq!(updates[0]["newUuid"], UUID);
+}
+
+/// `scan --mode hosted --prune` must not silently drop `--prune`: both
+/// hosted terminals return before the GC blocks, so a bot migrating its sync
+/// job from `--mode agent --prune` would otherwise stop pruning forever with
+/// exit 0 and no signal. The envelope must carry an explicit
+/// `redirect_prune_ignored` warning (and, unchanged, no `gc` object —
+/// hosted mode runs no GC).
+#[tokio::test]
+#[serial]
+async fn hosted_prune_emits_explicit_ignored_warning() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_project(tmp.path());
+
+    let out = scrubbed_cli()
+        .args([
+            "scan",
+            "--mode",
+            "hosted",
+            "--prune",
+            "--json",
+            "--yes",
+            "--cwd",
+            tmp.path().to_str().unwrap(),
+            "--api-url",
+            &server.uri(),
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+        ])
+        .output()
+        .expect("run socket-patch");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "scan --mode hosted --prune must still succeed; stdout=\n{}\nstderr=\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let env_json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "--json stdout must be a JSON envelope: {e}\nstdout:\n{}",
+            String::from_utf8_lossy(&out.stdout)
+        )
+    });
+    assert!(
+        warning_codes(&env_json)
+            .iter()
+            .any(|c| c == "redirect_prune_ignored"),
+        "hosted --prune must warn that the flag is ignored; envelope: {env_json}"
+    );
+    assert!(
+        env_json.get("gc").is_none(),
+        "hosted mode must not run (or claim to run) GC: {env_json}"
+    );
+    // The redirect itself is unaffected by the ignored flag.
+    assert_eq!(env_json["redirect"]["redirected"], 1, "{env_json}");
+}
+
+// ── composer ─────────────────────────────────────────────────────────────
+
+const COMPOSER_PURL: &str = "pkg:composer/monolog/monolog@2.0.0";
+const COMPOSER_UUID: &str = "66666666-6666-4666-8666-666666666666";
+const COMPOSER_URL: &str = "http://patch.test/patch/composer/monolog/monolog/2.0.0/\
+                            77777777-7777-4777-8777-777777777777/\
+                            66666666-6666-4666-8666-666666666666/monolog-2.0.0.zip";
+const COMPOSER_SHA1: &str = "abcdef0123456789abcdef0123456789abcdef01";
+
+/// A composer project discovered through `vendor/composer/installed.json`,
+/// with the lock the redirect rewriter edits. The lock is composer-native:
+/// `JSON_UNESCAPED_SLASHES`, 4-space indent.
+fn write_composer_project(root: &Path) {
+    std::fs::write(
+        root.join("composer.json"),
+        "{ \"require\": { \"monolog/monolog\": \"2.0.0\" } }\n",
+    )
+    .unwrap();
+    let installed = root.join("vendor").join("composer");
+    std::fs::create_dir_all(&installed).unwrap();
+    std::fs::write(
+        installed.join("installed.json"),
+        r#"{ "packages": [ { "name": "monolog/monolog", "version": "2.0.0" } ] }
+"#,
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.join("vendor/monolog/monolog")).unwrap();
+    std::fs::write(
+        root.join("composer.lock"),
+        r#"{
+    "content-hash": "abc123def456abc123def456abc1",
+    "packages": [
+        {
+            "name": "monolog/monolog",
+            "version": "2.0.0",
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/Seldaek/monolog/zipball/abc123",
+                "reference": "abc123def456",
+                "shasum": ""
+            }
+        }
+    ],
+    "packages-dev": []
+}
+"#,
+    )
+    .unwrap();
+}
+
+async fn mock_composer_api(server: &MockServer) {
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/batch")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "packages": [{
+                "purl": COMPOSER_PURL,
+                "patches": [{
+                    "uuid": COMPOSER_UUID, "purl": COMPOSER_PURL, "tier": "free",
+                    "cveIds": [], "ghsaIds": [], "severity": "high",
+                    "title": "composer redirect fixture"
+                }]
+            }],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex(format!(
+            "^/v0/orgs/{ORG}/patches/by-package/.+$"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "patches": [{
+                "uuid": COMPOSER_UUID, "purl": COMPOSER_PURL,
+                "publishedAt": "2024-01-01T00:00:00Z",
+                "description": "x", "license": "MIT", "tier": "free",
+                "vulnerabilities": {}
+            }],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(server)
+        .await;
+    // composer pins `dist.shasum` — a sha1, not npm's sha512.
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/package")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "results": {
+                COMPOSER_UUID: {
+                    "status": "granted",
+                    "url": COMPOSER_URL,
+                    "purl": COMPOSER_PURL,
+                    "artifacts": [{
+                        "kind": "tarball",
+                        "url": COMPOSER_URL,
+                        "integrity": { "sha1": COMPOSER_SHA1 }
+                    }],
+                    "registryOverride": null
+                }
+            }
+        })))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/view/{COMPOSER_UUID}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "uuid": COMPOSER_UUID,
+            "purl": COMPOSER_PURL,
+            "publishedAt": "2024-01-01T00:00:00Z",
+            "files": {
+                "src/Logger.php": {
+                    "beforeHash": "a".repeat(64),
+                    "afterHash": "b".repeat(64),
+                }
+            },
+            "vulnerabilities": {
+                GHSA: {
+                    "cves": ["CVE-2024-9"],
+                    "summary": "composer redirect fixture",
+                    "severity": "high",
+                    "description": "d"
+                }
+            },
+            "description": "x", "license": "MIT", "tier": "free"
+        })))
+        .mount(server)
+        .await;
+}
+
+/// End-to-end regression for the composer redirect that reported itself as
+/// having done nothing: the rewriter wrote the hosted url with `\/`-escaped
+/// slashes while the post-rewrite confirmation probe searched only the raw and
+/// percent-encoded spellings, so a fully successful rewrite yielded
+/// `redirected: 0`, no patch record in the ledger, and nothing for `vex` to
+/// attest. The rewriter now emits composer-native raw slashes and the probe
+/// asks the rewriter's own predicate, so the lock edit and the confirmation
+/// cannot disagree. Subprocess so the `--json` envelope can be read back.
+#[tokio::test]
+#[serial]
+async fn composer_redirect_is_confirmed_and_recorded() {
+    let server = MockServer::start().await;
+    mock_composer_api(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_composer_project(tmp.path());
+
+    let env = run_redirect_subprocess(tmp.path(), &server.uri());
+    assert_eq!(env["status"], "success", "envelope: {env}");
+    assert_eq!(
+        env["redirect"]["redirected"], 1,
+        "the composer redirect must be CONFIRMED, not silently unconfirmed: {env}"
+    );
+    assert_eq!(
+        env["redirect"]["rewrittenFiles"][0], "composer.lock",
+        "composer.lock must be the rewritten file: {env}"
+    );
+    assert!(
+        warning_codes(&env).is_empty(),
+        "a clean composer redirect emits no warnings; got {:?}",
+        warning_codes(&env)
+    );
+
+    let lock = std::fs::read_to_string(tmp.path().join("composer.lock")).unwrap();
+    assert!(
+        lock.contains(&format!("\"url\": \"{COMPOSER_URL}\"")),
+        "dist.url must be the hosted patch with composer-native raw slashes; got:\n{lock}"
+    );
+    assert!(
+        !lock.contains("\\/"),
+        "composer writes lock JSON with JSON_UNESCAPED_SLASHES — no escaped slashes may \
+         be introduced; got:\n{lock}"
+    );
+    assert!(
+        lock.contains(&format!("\"shasum\": \"{COMPOSER_SHA1}\"")),
+        "dist.shasum must pin the patched artifact's sha1; got:\n{lock}"
+    );
+
+    // The confirmation is what drives the record fetch: no confirmation, no
+    // record, and `socket-patch vex` can never attest the patch.
+    let ledger =
+        std::fs::read_to_string(tmp.path().join(".socket/vendor/redirect-state.json")).unwrap();
+    assert!(
+        ledger.contains(COMPOSER_PURL) && ledger.contains(GHSA),
+        "the ledger must carry the fetched patch record for the redirected purl: {ledger}"
+    );
+    assert!(
+        ledger.contains("redirect_composer_dist"),
+        "the ledger must carry the revert edit for the lock rewrite: {ledger}"
+    );
+}
+
+/// Mount the full cargo hosted-mock set (discovery + reference + view) for
+/// one patch over `purl`.
+async fn mock_cargo_patch(
+    server: &MockServer,
+    purl: &str,
+    uuid: &str,
+    name: &str,
+    version: &str,
+    index_url: &str,
+    cksum: &str,
+    ghsa: &str,
+) {
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/batch")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "packages": [{
+                "purl": purl,
+                "patches": [{
+                    "uuid": uuid, "purl": purl, "tier": "free",
+                    "cveIds": [], "ghsaIds": [ghsa], "severity": "high",
+                    "title": "cargo redirect fixture"
+                }]
+            }],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex(format!(
+            "^/v0/orgs/{ORG}/patches/by-package/.+$"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "patches": [{
+                "uuid": uuid, "purl": purl,
+                "publishedAt": "2024-01-01T00:00:00Z",
+                "description": "x", "license": "MIT", "tier": "free",
+                "vulnerabilities": {}
+            }],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/package")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "results": {
+                uuid: {
+                    "status": "granted",
+                    "url": format!("http://patch.test/{name}-{version}.crate"),
+                    "purl": purl,
+                    "artifacts": [{
+                        "kind": "tarball",
+                        "url": format!("http://patch.test/{name}-{version}.crate"),
+                        "integrity": { "sha256": cksum }
+                    }],
+                    "registryOverride": {
+                        "kind": "cargo-sparse",
+                        "indexUrl": index_url,
+                        "identifiers": {
+                            "name": name,
+                            "version": version,
+                            "cargoCksumSha256": cksum,
+                        }
+                    }
+                }
+            }
+        })))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/view/{uuid}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "uuid": uuid,
+            "purl": purl,
+            "publishedAt": "2024-01-01T00:00:00Z",
+            "files": {
+                "src/lib.rs": {
+                    "beforeHash": "a".repeat(64),
+                    "afterHash": "b".repeat(64),
+                }
+            },
+            "vulnerabilities": {
+                ghsa: {
+                    "cves": ["CVE-2024-99999"],
+                    "summary": "cargo redirect vex fixture",
+                    "severity": "high",
+                    "description": "d"
+                }
+            },
+            "description": "x", "license": "MIT", "tier": "free"
+        })))
+        .mount(server)
+        .await;
+}
+
+/// Write a vendored crate dir so the cargo crawler discovers `name@version`
+/// without the project's manifest/lock referencing it.
+fn write_vendored_crate(root: &Path, name: &str, version: &str) {
+    let dir = root.join("vendor").join(name);
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        format!("[package]\nname = \"{name}\"\nversion = \"{version}\"\nedition = \"2021\"\n"),
+    )
+    .unwrap();
+    std::fs::write(dir.join("src/lib.rs"), b"// unpatched\n").unwrap();
+}
+
+/// AUDIT A3/A3b — the cargo analogue of `no_lockfile_redirect_is_not_attested`:
+/// a granted cargo patch whose crate the project does not declare (surfaced by
+/// the crawler from a vendor dir) must confirm NOTHING. The old behavior wrote
+/// an inert `[registries.…]` block to `.cargo/config.toml`, whose index URL
+/// then satisfied the substring confirmed check: the run reported
+/// `redirected: 1`, persisted a ledger record, and emitted an `assume_applied`
+/// VEX statement while no build anywhere used the patched bytes.
+#[tokio::test]
+#[serial]
+async fn cargo_granted_but_nothing_pinned_is_not_confirmed_or_attested() {
+    const CARGO_PURL: &str = "pkg:cargo/cfg-if@1.0.0";
+    const CARGO_UUID: &str = "11111111-1111-4111-8111-111111111111";
+    let cksum = "cd".repeat(32);
+    let index_url = format!("sparse+http://patch.test/registry/cargo/{CARGO_UUID}/index/");
+
+    let server = MockServer::start().await;
+    mock_cargo_patch(
+        &server,
+        CARGO_PURL,
+        CARGO_UUID,
+        "cfg-if",
+        "1.0.0",
+        &index_url,
+        &cksum,
+        "GHSA-carg-aaaa-bbbb",
+    )
+    .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    // Manifest + lock reference ONLY serde; cfg-if exists solely in vendor/.
+    std::fs::write(
+        tmp.path().join("Cargo.toml"),
+        "[package]\nname = \"consumer\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[dependencies]\nserde = \"1.0\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("Cargo.lock"),
+        "version = 3\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"ee\"\n",
+    )
+    .unwrap();
+    write_vendored_crate(tmp.path(), "cfg-if", "1.0.0");
+    let toml_before = std::fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+    let lock_before = std::fs::read_to_string(tmp.path().join("Cargo.lock")).unwrap();
+
+    let vex_path = tmp.path().join("out.vex.json");
+    let mut args = redirect_args(tmp.path(), server.uri());
+    args.vex = socket_patch_cli::commands::vex::VexEmbedArgs {
+        vex: Some(vex_path.clone()),
+        vex_product: Some("pkg:cargo/consumer@0.0.0".to_string()),
+        ..Default::default()
+    };
+    let code = run(args).await;
+
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap(),
+        toml_before,
+        "Cargo.toml must be untouched (no dep entry for cfg-if)"
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("Cargo.lock")).unwrap(),
+        lock_before,
+        "Cargo.lock must be untouched (no [[package]] for cfg-if)"
+    );
+    assert!(
+        !tmp.path().join(".cargo/config.toml").exists()
+            && !tmp.path().join(".cargo/config").exists(),
+        "NO inert [registries] block may be written when nothing pins the patch"
+    );
+    assert!(
+        !tmp.path()
+            .join(".socket/vendor/redirect-state.json")
+            .exists(),
+        "no ledger may be written when nothing was redirected"
+    );
+    assert!(
+        !vex_path.exists(),
+        "NO OpenVEX document may exist for a tree where nothing pins the patch"
+    );
+    assert_eq!(
+        code, 1,
+        "nothing was redirected, so the requested attestation must fail"
+    );
+}
+
+/// AUDIT A2 (green side): the multi-line `[dependencies.<name>]` table form —
+/// with NO Cargo.lock — is fully pinned: the manifest entry gains a registry
+/// line, the managed registry block is wired in, and the patch is recorded +
+/// attested (the manifest pin forces the next resolution through the managed
+/// registry, which serves the patched checksum).
+#[tokio::test]
+#[serial]
+async fn cargo_table_form_without_lock_is_pinned_and_attested() {
+    const CARGO_PURL: &str = "pkg:cargo/serde@1.0.190";
+    const CARGO_UUID: &str = "55555555-5555-4555-8555-555555555555";
+    let cksum = "11".repeat(32);
+    let index_url = format!("sparse+http://patch.test/registry/cargo/{CARGO_UUID}/index/");
+
+    let server = MockServer::start().await;
+    mock_cargo_patch(
+        &server,
+        CARGO_PURL,
+        CARGO_UUID,
+        "serde",
+        "1.0.190",
+        &index_url,
+        &cksum,
+        "GHSA-carg-cccc-dddd",
+    )
+    .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    // Table-form dependency; NO Cargo.lock. The crawler discovers the version
+    // from the vendored crate dir.
+    std::fs::write(
+        tmp.path().join("Cargo.toml"),
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies.serde]\nversion = \"1.0.190\"\n",
+    )
+    .unwrap();
+    write_vendored_crate(tmp.path(), "serde", "1.0.190");
+
+    let vex_path = tmp.path().join("out.vex.json");
+    let mut args = redirect_args(tmp.path(), server.uri());
+    args.vex = socket_patch_cli::commands::vex::VexEmbedArgs {
+        vex: Some(vex_path.clone()),
+        vex_product: Some("pkg:cargo/app@0.1.0".to_string()),
+        ..Default::default()
+    };
+    let code = run(args).await;
+    assert_eq!(code, 0, "the table-form pin must land and attest");
+
+    let manifest = std::fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+    assert!(
+        manifest.contains(&format!(
+            "[dependencies.serde]\nregistry = \"socket-patch-{CARGO_UUID}\"\nversion = \"1.0.190\""
+        )),
+        "the table entry must gain the registry line: {manifest}"
+    );
+    let cfg = std::fs::read_to_string(tmp.path().join(".cargo/config.toml")).unwrap();
+    assert!(
+        cfg.contains(&index_url),
+        "the managed registry block must be wired in: {cfg}"
+    );
+    assert!(
+        !tmp.path().join("Cargo.lock").exists(),
+        "no lockfile may be invented"
+    );
+    let ledger =
+        std::fs::read_to_string(tmp.path().join(".socket/vendor/redirect-state.json")).unwrap();
+    assert!(
+        ledger.contains(CARGO_UUID) && ledger.contains("GHSA-carg-cccc-dddd"),
+        "the ledger must record the landed redirect: {ledger}"
+    );
+    let doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&vex_path).unwrap()).unwrap();
+    let stmts = doc["statements"].as_array().unwrap();
+    assert_eq!(stmts.len(), 1, "the landed redirect is attested: {doc}");
+    assert_eq!(stmts[0]["vulnerability"]["name"], "GHSA-carg-cccc-dddd");
 }

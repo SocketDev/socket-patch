@@ -1,0 +1,14 @@
+[
+  {
+    "ecosystem": "composer",
+    "name": "monolog",
+    "namespace": "monolog",
+    "version": "2.0.0",
+    "token": "11111111-1111-1111-1111-111111111111",
+    "patchUuid": "44444444-4444-4444-4444-444444444444",
+    "artifactUrl": "https://patch.socket.dev/patch/composer/monolog/monolog/2.0.0/11111111-1111-1111-1111-111111111111/44444444-4444-4444-4444-444444444444/monolog-2.0.0.zip",
+    "integrity": {
+      "sha1": "abcdef0123456789abcdef0123456789abcdef01"
+    }
+  }
+]

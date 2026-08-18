@@ -445,9 +445,15 @@ mod tests {
         // ceiling — the override never silently changes shipped behavior.
         assert_eq!(grace_budget_from(None), Duration::from_millis(500));
         assert_eq!(grace_budget_from(Some("")), Duration::from_millis(500));
-        assert_eq!(grace_budget_from(Some("not-a-number")), Duration::from_millis(500));
+        assert_eq!(
+            grace_budget_from(Some("not-a-number")),
+            Duration::from_millis(500)
+        );
         // A valid value lifts the ceiling (the e2e suite's escape hatch).
-        assert_eq!(grace_budget_from(Some("30000")), Duration::from_millis(30_000));
+        assert_eq!(
+            grace_budget_from(Some("30000")),
+            Duration::from_millis(30_000)
+        );
         assert_eq!(grace_budget_from(Some("0")), Duration::from_millis(0));
     }
 

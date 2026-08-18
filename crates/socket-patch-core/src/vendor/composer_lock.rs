@@ -27,6 +27,7 @@
 //! (`JSON_PRETTY_PRINT`) + trailing newline; serde_json does not escape `/`
 //! (matching `JSON_UNESCAPED_SLASHES`).
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use serde_json::{json, Map, Value};
@@ -357,6 +358,15 @@ pub async fn vendor_composer(
 /// update`, a hand edit, or a newer vendor run — is left alone with a
 /// `vendor_lock_entry_drifted` warning.
 ///
+/// Refused fail-closed when composer.lock still wires a package to our uuid
+/// dir that NO wiring record can restore (a `repair`-reconstructed entry
+/// carries no pre-vendor fragment): the registry `dist` the surgery replaced
+/// exists nowhere else — not in the lock (we overwrote it), not in the
+/// artifact — so an un-rewrite is impossible offline, and deleting the
+/// artifacts anyway would leave the lock pointing at a gone path (`composer
+/// install` then dies with "Source path … is not found"). Nothing is deleted
+/// in that case; the error names the re-resolve escape hatch.
+///
 /// Note: the *installed* `vendor/<v>/<n>` keeps the patched bytes until the
 /// next `composer install` re-mirrors from the registry; revert surfaces that
 /// as the `vendor_installed_copy_stale` advisory.
@@ -377,6 +387,24 @@ pub async fn revert_composer(
     let uuid_dir = project_root.join(&uuid_dir_rel);
     let lock_path = project_root.join(COMPOSER_LOCK);
     let mut warnings = Vec::new();
+
+    // Nothing may be deleted while composer.lock still consumes it. Checked
+    // BEFORE the restore loop (and before any write) so the answer is the
+    // same for `--dry-run` and a wet run.
+    let stranded = stranded_wired_packages(&lock_path, &entry.uuid, &restorable_keys(entry)).await;
+    if !stranded.is_empty() {
+        let listed = stranded.join(", ");
+        let args = stranded.join(" ");
+        return RevertOutcome::failed(format!(
+            "refusing revert: composer.lock still points {listed} at {uuid_dir_rel}, but the \
+             ledger entry records no pre-vendor lock fragment to restore (an entry \
+             reconstructed by `socket-patch repair` recovers the artifact, never the \
+             registry dist the surgery replaced). The vendored artifacts were LEFT IN \
+             PLACE so the project still installs. To undo the vendoring, re-resolve the \
+             package from the registry first (`composer update --no-install {args}`), then \
+             re-run `socket-patch vendor --revert`"
+        ));
+    }
 
     // Wiring is restored in reverse application order (one record today).
     for w in entry.wiring.iter().rev() {
@@ -677,6 +705,69 @@ fn rewrite_lock_entry(
 /// matching `JSON_UNESCAPED_SLASHES`.
 fn composer_json_bytes(value: &Value) -> std::io::Result<Vec<u8>> {
     serialize_json(value, "    ")
+}
+
+/// The `<section>:<lowercase pkg>` keys this entry can actually put back:
+/// a recognized wiring kind, a well-formed key, and a recorded `original`.
+fn restorable_keys(entry: &VendorEntry) -> HashSet<String> {
+    entry
+        .wiring
+        .iter()
+        .filter(|w| w.kind == WIRING_KIND && w.original.is_some())
+        .filter_map(|w| w.key.as_deref())
+        .filter_map(|k| k.split_once(':'))
+        .filter(|(section, _)| *section == "packages" || *section == "packages-dev")
+        .map(|(section, pkg)| format!("{section}:{}", pkg.to_lowercase()))
+        .collect()
+}
+
+/// Lock packages still wired to `uuid` that `restorable` cannot un-rewrite —
+/// the set that a delete-the-artifacts revert would strand. Names are
+/// returned lowercase and deduped (composer package names are canonically
+/// lowercase; the lock's own casing is display-only).
+///
+/// A missing or unparseable composer.lock yields none: no install can be
+/// consuming a lock nothing can read, and the restore loop already degrades
+/// to `vendor_lock_entry_drifted` for it.
+async fn stranded_wired_packages(
+    lock_path: &Path,
+    uuid: &str,
+    restorable: &HashSet<String>,
+) -> Vec<String> {
+    let Ok(text) = tokio::fs::read_to_string(lock_path).await else {
+        return Vec::new();
+    };
+    let Ok(lock) = serde_json::from_str::<Value>(&text) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = Vec::new();
+    for section in ["packages", "packages-dev"] {
+        let Some(arr) = lock.get(section).and_then(Value::as_array) else {
+            continue;
+        };
+        for e in arr {
+            let wired_to_us = e
+                .get("dist")
+                .and_then(|d| d.get("url"))
+                .and_then(Value::as_str)
+                .and_then(parse_vendor_path)
+                .is_some_and(|p| p.eco == "composer" && p.uuid == uuid);
+            if !wired_to_us {
+                continue;
+            }
+            let Some(name) = e.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            let name = name.to_lowercase();
+            // Section-qualified: `restore_lock_entry` only searches the
+            // section the wiring recorded, so an entry that moved between
+            // packages[] and packages-dev[] is unrestorable too.
+            if !restorable.contains(&format!("{section}:{name}")) && !out.contains(&name) {
+                out.push(name);
+            }
+        }
+    }
+    out
 }
 
 /// Restore one `composer_lock_package` wiring record. `Ok(true)` = restored

@@ -47,6 +47,26 @@ into the new version's section — see docs/releasing.md.
 
 ### Added
 
+- **Hosted mode for Go (free tier).** `scan --mode hosted` now redirects
+  golang dependencies when the reference carries a `goproxy` registry
+  override: a fork-style
+  `replace <mod> <ver> => patch.socket.dev/gopatch/<uuid> <ver>-socketpatch.<n>`
+  in `go.mod` plus the socket module's two `h1:` lines in `go.sum` (and the
+  replaced original's lines pruned — the tidy-stable state). Day-2 machines
+  need no configuration: go consults the checksum database only for modules
+  absent from `go.sum`, so the committed pair is the whole redirect —
+  validated end-to-end in `e2e_golang_hosted_build.rs` (fresh caches, bogus
+  `GOSUMDB` tripwire, `go mod tidy` byte-level no-op, tampered-hash
+  `SECURITY ERROR`). Fails closed (per-dep `redirect_golang_*` warnings, no
+  partial writes) on missing hashes, an out-of-namespace module path, a
+  require-version mismatch, or a user-authored replace conflict; references
+  without the override keep the historical `redirect_golang_unsupported`
+  warning (paid tier stays vendored — see `docs/design/golang-hosted.md`).
+  Wire schema gains `integrity.goModH1` and
+  `registryOverride.identifiers.goModuleVersion` (additive). Requires
+  server-side publication of the grant-free `gopatch` artifact flavor —
+  production publishes no golang hosted modules yet, so behavior is unchanged
+  until it does.
 - **Version-bump automation + release-readiness gate.**
   `scripts/bump-version.sh <X.Y.Z> --pr` performs the whole bump chore —
   stamps every packaging site via `version-sync.sh`, rolls `[Unreleased]`
@@ -336,6 +356,31 @@ into the new version's section — see docs/releasing.md.
   stable error code in the envelope.
 
 ### Changed
+
+- **`install.sh` can install without reaching github.com.** New
+  `SOCKET_PATCH_BASE_URL` points the archive downloads at any releases base that
+  answers GitHub's two asset paths — notably
+  `https://install.socket.dev/patch/SocketDev/socket-patch/releases`, which relays them
+  from the GitHub release, so one URL template covers either origin. A new
+  release needs no publish for this: the origin resolves "latest" per request.
+  `socket-patch --update` can use the same host today through the
+  `SOCKET_UPDATE_BASE_URL` override it already has. Also new:
+  `SOCKET_PATCH_INSTALL_DIR` to choose the install directory explicitly instead
+  of taking `/usr/local/bin` or `~/.local/bin`. The default download origin is
+  still GitHub — see `docs/installer-hosting.md`.
+
+- **The documented one-liner installs from `https://install.socket.dev/patch`.**
+  The previous URL was `raw.githubusercontent.com`, which asks users to trust a
+  third-party CDN for a script they pipe into a shell and is the first URL a
+  locked-down egress policy blocks. The hosted copy is byte-for-byte
+  `scripts/install.sh`, with its SHA-256 published at
+  `install.socket.dev/patch.sha256`; the GitHub raw URL keeps working and serves
+  the same bytes. Binaries are still downloaded from the GitHub release and
+  verified against its `SHA256SUMS` — the trust model is unchanged, only the
+  script's origin moved. New: `docs/installer-hosting.md` (how the copy is
+  published), a CI step that runs the installer end to end instead of only
+  linting it, and an `installer-drift` workflow that checks the hosted copy
+  against this repository weekly.
 
 - **Maven and NuGet promoted to fully available — the
   `SOCKET_EXPERIMENTAL_MAVEN` / `SOCKET_EXPERIMENTAL_NUGET` runtime gates

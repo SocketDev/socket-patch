@@ -61,7 +61,7 @@ use crate::patch::copy_tree::{fresh_copy, remove_tree};
 use crate::patch::path_safety::is_safe_single_segment;
 use crate::patch::redirect::gem_line_trailing_options;
 use crate::utils::fs::atomic_write_bytes_preserving_mode;
-use crate::utils::purl::{build_gem_purl, parse_gem_purl};
+use crate::utils::purl::{build_gem_purl, parse_gem_purl, purl_qualifier};
 
 use super::common::{
     already_patched_result, copy_matches_after_hashes, done, refused, service_offline_conflict,
@@ -177,18 +177,53 @@ pub async fn vendor_gem(
         );
     }
 
-    // Platform-suffixed installs (`<name>-<version>-x86_64-linux`) ship
-    // precompiled artifacts that are machine-specific — committing one would
-    // break every other platform, so they are refused, not guessed at.
+    // Platform-specific (precompiled) gem builds ship machine-specific
+    // artifacts — committing one would break every other platform — so they
+    // are refused, not guessed at. Two independent signals decide this:
+    //
+    //   1. The purl's own `?platform=` qualifier (the AUTHORITATIVE production
+    //      key). RubyGems' default portable platform is `ruby`; a bare purl
+    //      (no qualifier) is likewise the portable build. Only a *native*
+    //      platform value (`x86_64-linux`, `arm64-darwin`, `java`,
+    //      `x64-mingw32`, …) is refused.
+    //   2. Defense in depth: the resolved install dir's own name. A
+    //      locally-installed native variant is `<name>-<version>-<platform>`
+    //      even when the manifest purl looked portable (the crawler strips the
+    //      suffix to the base purl, so a `?platform=ruby` lookup can still land
+    //      on a native install dir).
+    //
+    // The old gate tested only `dir_name != leaf`, which spuriously refused
+    // EVERY pure-ruby gem fetched via the registry auto-fetch ladder: that
+    // path stages the pristine `.gem` into a private tempdir named literally
+    // `gem` (see registry_fetch::fetch_gem), so `dir_name` was `gem`, never
+    // `<name>-<version>`. Gating on the platform (not the staging dir name)
+    // lets `?platform=ruby` and bare purls vendor while still refusing true
+    // native builds by either signal.
+    if let Some(platform) = purl_qualifier(purl, "platform") {
+        if !platform.is_empty() && !platform.eq_ignore_ascii_case("ruby") {
+            return refused(
+                "platform_gem_unsupported",
+                format!(
+                    "`{name}@{version}` is a platform-specific gem build (`platform={platform}`); precompiled platform gems cannot be vendored portably"
+                ),
+            );
+        }
+    }
     let dir_name = installed_dir
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    if dir_name != leaf {
+    // Fail closed: only two dir names are legitimate here — the installed
+    // gem's own `<name>-<version>` leaf, and the literal `gem` staging dir
+    // created by the registry auto-fetch ladder (registry_fetch::fetch_gem).
+    // Everything else is refused, including a `<name>-<version>-<platform>`
+    // precompiled build; an allowlist (not a suffix match) means an unexpected
+    // install dir name can never slip through into a vendored copy.
+    if dir_name != leaf && dir_name != "gem" {
         return refused(
             "platform_gem_unsupported",
             format!(
-                "installed dir `{dir_name}` does not equal `{leaf}` (platform-specific gem builds cannot be vendored portably)"
+                "installed dir `{dir_name}` is not the portable `{leaf}` gem (platform-specific or unexpected gem builds cannot be vendored portably)"
             ),
         );
     }
@@ -1966,6 +2001,7 @@ mod tests {
         run_vendor_purl(PURL, root, blobs, installed, record, dry_run).await
     }
 
+    /// [`run_vendor`] with a caller-chosen purl (e.g. a `?platform=` variant).
     async fn run_vendor_purl(
         purl: &str,
         root: &Path,
@@ -2234,6 +2270,75 @@ mod tests {
             unwrap_refused(run_vendor(&root, &blobs, &platform_dir, &record, false).await);
         assert_eq!(code, "platform_gem_unsupported");
         assert!(!root.join(".socket").exists());
+    }
+
+    /// Fail-closed allowlist regression: an install dir whose name is neither
+    /// the `<name>-<version>` leaf nor the `gem` auto-fetch staging dir is
+    /// refused — even though it is NOT a `<leaf>-<platform>` suffix, so the old
+    /// suffix-only check (`dir_name.starts_with("{leaf}-")`) would have ADMITTED
+    /// it. Only the two legitimate dir names may pass.
+    #[tokio::test]
+    async fn test_refuses_unexpected_install_dir_name() {
+        let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
+        // A wholly-unexpected dir name: not `rack-3.2.6`, not `gem`, and not a
+        // `rack-3.2.6-<suffix>` platform build (which the old suffix check caught).
+        let odd_dir = installed.parent().unwrap().join("random-unrelated");
+        tokio::fs::rename(&installed, &odd_dir).await.unwrap();
+
+        let (code, _d) = unwrap_refused(run_vendor(&root, &blobs, &odd_dir, &record, false).await);
+        assert_eq!(code, "platform_gem_unsupported");
+        assert!(!root.join(".socket").exists());
+    }
+
+    /// A native `?platform=` qualifier (e.g. `x86_64-linux`) is refused as a
+    /// platform-specific build EVEN when the resolved install dir is the clean
+    /// portable leaf — the purl qualifier is the authoritative signal.
+    #[tokio::test]
+    async fn test_refuses_native_platform_qualifier() {
+        let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
+        // installed dir is the pristine `rack-3.2.6` leaf; only the purl says
+        // this is a native build.
+        let purl = "pkg:gem/rack@3.2.6?platform=x86_64-linux";
+        let (code, detail) =
+            unwrap_refused(run_vendor_purl(purl, &root, &blobs, &installed, &record, false).await);
+        assert_eq!(code, "platform_gem_unsupported");
+        assert!(
+            detail.contains("x86_64-linux"),
+            "refusal names the offending platform: {detail}"
+        );
+        assert!(!root.join(".socket").exists(), "refusal must write nothing");
+    }
+
+    /// Regression: a pure-ruby gem fetched via the registry auto-fetch ladder
+    /// is staged into a private tempdir named literally `gem` (NOT
+    /// `<name>-<version>`). The old gate refused every such gem with
+    /// `platform_gem_unsupported` because `dir_name != leaf`. With the purl's
+    /// `?platform=ruby` (the portable default) the vendor must now SUCCEED —
+    /// the staging dir name is not a platform signal.
+    #[tokio::test]
+    async fn test_platform_ruby_gem_from_autofetch_staging_dir_vendors() {
+        let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
+        // Rename the install dir to `gem`, mirroring registry_fetch::fetch_gem's
+        // staging leaf. The sibling `specifications/rack-3.2.6.gemspec` (needed
+        // by the local build) is derived from installed_dir.parent().parent(),
+        // so keeping the dir under the same gem_home preserves it.
+        let staged = installed.parent().unwrap().join("gem");
+        tokio::fs::rename(&installed, &staged).await.unwrap();
+
+        let purl = "pkg:gem/rack@3.2.6?platform=ruby";
+        let (result, _entry, _w) =
+            unwrap_done(run_vendor_purl(purl, &root, &blobs, &staged, &record, false).await);
+        assert!(
+            result.success,
+            "pure-ruby (?platform=ruby) gem from an auto-fetch `gem` staging dir must vendor: {:?}",
+            result.error
+        );
+        // The patched copy landed under the leaf, not the staging dir name.
+        let copy = root.join(copy_rel());
+        assert_eq!(
+            tokio::fs::read(copy.join("lib/rack.rb")).await.unwrap(),
+            PATCHED
+        );
     }
 
     #[tokio::test]
@@ -2967,7 +3072,7 @@ mod tests {
                 .error
                 .as_deref()
                 .unwrap_or("")
-                .contains("platform-suffixed"),
+                .contains("platform-specific"),
             "{:?}",
             result.error
         );

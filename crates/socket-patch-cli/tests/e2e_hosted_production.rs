@@ -38,6 +38,10 @@
 //! | Cargo  | `pkg:cargo/traitobject@0.1.1`   | `cf2e6f58-d9fa-4096-9151-c34afa717f89` | GHSA-pp8r-vv2j-9j5v |
 //! | gem    | `pkg:gem/activestorage@7.0.2.2` | `2535d43d-67ce-4944-be27-c19e113997fb` | GHSA-w749-p3v6-hccq |
 //!
+//! > **gem is TEMPORARILY DISABLED** (see [`GEM_E2E_DISABLED`]): the pinned
+//! > gem patch was intentionally unpublished on 2026-08-14 pending a corrected
+//! > republish, so its three legs skip until the switch is flipped back.
+//!
 //! `docs/testing/hosted-production-e2e.md` explains how these were chosen and
 //! how to re-pick one if it is ever withdrawn.
 //!
@@ -48,8 +52,10 @@
 //!   patches for them, so there is nothing real to redirect to. Rather than
 //!   silently skipping, [`canary_unpublished_ecosystems`] probes production
 //!   every run and tells us the moment that changes.
-//! * **golang** — hosted mode is refused **by design**
-//!   (`docs/design/golang-hosted-no-go.md`). Covered as a negative assertion.
+//! * **golang** — hosted mode is supported for free-tier references carrying
+//!   a `goproxy` override (`docs/design/golang-hosted.md`), but production
+//!   publishes no golang hosted modules yet. Covered as a shape guard that
+//!   holds in both worlds.
 //! * **deno** — hosted mode is not supported. Covered as a negative assertion.
 //!
 //! # Prerequisites
@@ -130,6 +136,26 @@ const GEM_PURL: &str = "pkg:gem/activestorage@7.0.2.2";
 const GEM_NAME: &str = "activestorage";
 const GEM_VERSION: &str = "7.0.2.2";
 const GEM_UUID: &str = "2535d43d-67ce-4944-be27-c19e113997fb";
+
+/// TEMPORARY kill switch for the ruby-gem hosted legs.
+///
+/// The pinned gem patch `activestorage@7.0.2.2` (`GEM_UUID`) was
+/// **intentionally unpublished on 2026-08-14** pending a corrected republish
+/// (the compact-index dependency metadata was wrong). Its record still
+/// resolves via `/patch/view/<uuid>`, but the discovery endpoints
+/// (`/patch/batch`, `/patch/by-package`) now return zero patches for the gem,
+/// so `preflight_required_patches_are_published`, the advisory canary, and the
+/// gem redirect leg fail for a reason that has nothing to do with the CLI.
+///
+/// While this is `true`, those three gem legs are skipped so the required
+/// `hosted-e2e` check stays green for npm/PyPI/cargo. This is a plain
+/// unconditional skip (NOT `soft_skip!`, which panics under STRICT) — it does
+/// not depend on any env var and applies in CI too.
+///
+/// **RE-ENABLE** by flipping this to `false` once the corrected gem patch is
+/// published on `patches-api.socket.dev` (and update `GEM_UUID` if the
+/// replacement has a new uuid). Tracked in `docs/testing/hosted-production-e2e.md`.
+const GEM_E2E_DISABLED: bool = true;
 
 /// Header the patch service injects into patched npm / PyPI source files.
 const PATCH_MARKER: &str = "Socket Community Patch";
@@ -698,12 +724,16 @@ fn urlencode(s: &str) -> String {
 #[ignore = "live production API: contacts patches-api.socket.dev. Run with --ignored."]
 async fn preflight_required_patches_are_published() {
     // (purl, acceptable uuids)
-    let required: Vec<(&str, Vec<&str>)> = vec![
+    let mut required: Vec<(&str, Vec<&str>)> = vec![
         (NPM_PURL, vec![NPM_UUID]),
         (PYPI_PURL, PYPI_UUIDS.to_vec()),
         (CARGO_PURL, vec![CARGO_UUID]),
-        (GEM_PURL, vec![GEM_UUID]),
     ];
+    // The gem pin is temporarily unpublished (see `GEM_E2E_DISABLED`); don't
+    // require it while the switch is on.
+    if !GEM_E2E_DISABLED {
+        required.push((GEM_PURL, vec![GEM_UUID]));
+    }
 
     let mut failures: Vec<String> = Vec::new();
     for (purl, expected) in &required {
@@ -755,7 +785,12 @@ async fn canary_patches_name_advisories_so_merge_state_is_inferable() {
     let mut failures: Vec<String> = Vec::new();
     let mut coverage_seen: Vec<(String, String, usize)> = Vec::new();
 
-    for purl in [NPM_PURL, PYPI_PURL, CARGO_PURL, GEM_PURL] {
+    let mut canary_purls = vec![NPM_PURL, PYPI_PURL, CARGO_PURL];
+    // Skip the gem while its pin is temporarily unpublished (see `GEM_E2E_DISABLED`).
+    if !GEM_E2E_DISABLED {
+        canary_purls.push(GEM_PURL);
+    }
+    for purl in canary_purls {
         match published_patch_advisory_counts(purl).await {
             Err(e) => failures.push(format!("{purl}: production probe failed: {e}")),
             Ok(patches) if patches.is_empty() => {
@@ -1670,6 +1705,16 @@ fn cargo_hosted_install_proof() {
 #[ignore = "live production API + real rubygems.org. Run with --ignored."]
 async fn gem_bundler_hosted_redirect_and_known_install_defect() {
     const LEG: &str = "gem_bundler_hosted_redirect_and_known_install_defect";
+    // Unconditional skip while the pinned gem patch is unpublished (see
+    // `GEM_E2E_DISABLED`). Deliberately NOT `soft_skip!` — that panics under
+    // STRICT, and this skip is intentional in CI too, not a missing toolchain.
+    if GEM_E2E_DISABLED {
+        println!(
+            "SKIP {LEG}: gem patch {GEM_UUID} temporarily unpublished \
+             (GEM_E2E_DISABLED); re-enable when the corrected patch is published"
+        );
+        return;
+    }
     if !has_command("ruby") || !has_command("bundle") {
         soft_skip!(LEG, "`ruby` and/or `bundle` not on PATH");
     }
@@ -1899,17 +1944,20 @@ async fn gem_bundler_hosted_redirect_and_known_install_defect() {
 // Documented negative cases
 // ===========================================================================
 
-/// Go hosted mode is refused by design (`docs/design/golang-hosted-no-go.md`).
+/// Go hosted mode: supported for free-tier references that carry a `goproxy`
+/// override (`docs/design/golang-hosted.md`); refused with
+/// `redirect_golang_unsupported` otherwise (`golang-hosted-no-go.md`, the
+/// paid-tier analysis).
 ///
-/// This asserts the *documented* shape of the refusal rather than a specific
-/// warning payload, because production publishes no free golang patches today,
-/// so there is nothing for the rewriter to refuse. If that ever changes, the
-/// `redirect_golang_unsupported` branch below starts exercising and this test
-/// becomes a real guard with no edit needed.
+/// Production publishes no golang hosted modules today, so this guards BOTH
+/// worlds without edits: while prod ships no `goproxy` overrides, nothing may
+/// be redirected (an empty-project scan must not invent a redirect); the day
+/// prod starts shipping them, any redirect this scan performs must be the
+/// documented shape — a socket-namespace replace in go.mod plus go.sum lines.
 #[test]
 #[ignore = "live production API. Run with --ignored."]
-fn golang_hosted_is_refused_by_design() {
-    const LEG: &str = "golang_hosted_is_refused_by_design";
+fn golang_hosted_redirects_only_via_goproxy_override() {
+    const LEG: &str = "golang_hosted_redirects_only_via_goproxy_override";
     if !has_command("go") {
         soft_skip!(LEG, "`go` not on PATH");
     }
@@ -1923,27 +1971,27 @@ fn golang_hosted_is_refused_by_design() {
     .expect("write go.mod");
 
     let env_json = scan_hosted(&proj, &["--ecosystems", "golang"]);
-    assert_eq!(
-        redirected_count(&env_json),
-        0,
-        "{LEG}: golang hosted mode redirected something — it is documented as \
-         impossible (sumdb + module-path identity + GOPROXY leakage). Either \
-         the design changed or this is a real bug:\n{env_json:#}"
-    );
-    let warnings = env_json["redirect"]["warnings"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
-    if warnings
-        .iter()
-        .any(|w| w["code"].as_str() == Some("redirect_golang_unsupported"))
-    {
-        println!("{LEG}: production now publishes golang patches; the documented refusal fired.");
-    } else {
+    let redirected = redirected_count(&env_json);
+    if redirected == 0 {
         println!(
-            "{LEG}: no golang patches published, so the refusal path is inert. \
-             Asserted only that hosted mode redirected nothing."
+            "{LEG}: production publishes no golang hosted modules (or none \
+             matched an empty project); nothing redirected, as documented."
         );
+    } else {
+        // The moment prod ships goproxy overrides, every golang redirect must
+        // be the committable fork-replace shape.
+        let go_mod = std::fs::read_to_string(proj.join("go.mod")).expect("read go.mod");
+        assert!(
+            go_mod.contains("patch.socket.dev/gopatch/"),
+            "{LEG}: {redirected} golang redirect(s) reported but go.mod has no \
+             socket-namespace replace:\n{go_mod}\n{env_json:#}"
+        );
+        assert!(
+            proj.join("go.sum").is_file(),
+            "{LEG}: golang redirect without a go.sum pin bricks -mod=readonly \
+             builds:\n{env_json:#}"
+        );
+        println!("{LEG}: production now serves golang hosted modules; shape verified.");
     }
 }
 

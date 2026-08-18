@@ -8,12 +8,14 @@
 //! user's existing formatting + comments via `toml_edit`.
 //!
 //! ## Ownership model (no sidecar manifest)
-//! A `[patch.crates-io]` entry is *socket-owned* iff its `path` value lies
-//! under `.socket/vendor/cargo/` (this backend's committed copies) **or** the
+//! A `[patch.crates-io]` entry is *socket-owned* iff its `path` value is a
+//! root-anchored relative path (not absolute, no `..`) under THIS project's
+//! `.socket/vendor/cargo/` (this backend's committed copies) **or** the
 //! legacy `.socket/cargo-patches/` (the retired `[patch]`-redirect backend) —
 //! recognising the legacy prefix lets vendor take over / clean up entries left
 //! by old releases instead of refusing them as user-authored. Anything else —
-//! a `git`/`registry` source, or a `path` pointing elsewhere — is
+//! a `git`/`registry` source, or a `path` pointing elsewhere (including one
+//! that merely traverses a *foreign* checkout's `.socket/vendor/cargo/`) — is
 //! user-authored and is never modified or removed. The path prefix is the
 //! entire ownership signal; there is no `managed.json`.
 //!
@@ -96,6 +98,41 @@ pub async fn read_patch_entries(project_root: &Path) -> HashMap<String, PatchEnt
     }
 }
 
+/// The hosted-mode `[registries.socket-patch-<uuid>]` sparse-index URLs
+/// declared in the project's cargo config, as `(registry_name, index_url)`
+/// pairs. Reads BOTH `.cargo/config` and `.cargo/config.toml` (a mixed /
+/// legacy state may hold blocks in either file). Read-only; missing or
+/// malformed files contribute nothing. This is how takeover logic proves a
+/// `Cargo.lock` `source` points at Socket's hosted patch registry without
+/// depending on the index URL's host (test registries are localhost).
+pub async fn socket_registry_indexes(project_root: &Path) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for file in [".cargo/config", ".cargo/config.toml"] {
+        let Ok(content) = fs::read_to_string(project_root.join(file)).await else {
+            continue;
+        };
+        let Ok(doc) = content.parse::<DocumentMut>() else {
+            continue;
+        };
+        let Some(registries) = doc.get("registries").and_then(Item::as_table_like) else {
+            continue;
+        };
+        for (name, item) in registries.iter() {
+            if !name.starts_with("socket-patch-") {
+                continue;
+            }
+            let index = item
+                .as_table_like()
+                .and_then(|t| t.get("index"))
+                .and_then(Item::as_str);
+            if let Some(index) = index {
+                out.push((name.to_string(), index.to_string()));
+            }
+        }
+    }
+    out
+}
+
 // ── config-file resolution + read-or-create write ────────────────────────────
 
 /// Resolve the config file under `<project_root>/.cargo/`. Prefers an existing
@@ -175,17 +212,34 @@ async fn edit_config(
 
 // ── pure transforms ──────────────────────────────────────────────────────────
 
-/// True if a `[patch]` `path` value lies under a socket-owned prefix
-/// ([`CARGO_VENDOR_DIR`] or the legacy [`LEGACY_CARGO_PATCHES_DIR`]).
+/// True if a `[patch]` `path` value denotes one of THIS project's
+/// socket-owned copies: a relative path that escapes nothing (not absolute,
+/// no `..` segment) and sits under [`CARGO_VENDOR_DIR`] or the legacy
+/// [`LEGACY_CARGO_PATCHES_DIR`]. Cargo resolves relative `[patch]` paths
+/// against the project root, so only a root-anchored relative prefix can be a
+/// copy this backend wrote — a path that merely *traverses* some other
+/// checkout's `.socket/vendor/cargo/` (`../shared/.socket/vendor/cargo/…`,
+/// `/abs/.socket/vendor/cargo/…`, `sub/.socket/vendor/cargo/…`) is
+/// user-authored and must never be rewritten or removed.
 fn path_is_socket_owned(path: &str) -> bool {
     let norm = path.replace('\\', "/");
-    for dir in [CARGO_VENDOR_DIR, LEGACY_CARGO_PATCHES_DIR] {
-        let prefix = format!("{dir}/");
-        if norm.starts_with(&prefix) || norm.contains(&format!("/{prefix}")) {
-            return true;
-        }
+    if norm.starts_with('/') {
+        return false; // absolute (also covers //unc-style prefixes)
     }
-    false
+    if norm.as_bytes().get(1) == Some(&b':') {
+        return false; // Windows drive-letter absolute (C:/…)
+    }
+    let segments: Vec<&str> = norm
+        .split('/')
+        .filter(|s| !s.is_empty() && *s != ".")
+        .collect();
+    if segments.contains(&"..") {
+        return false;
+    }
+    [CARGO_VENDOR_DIR, LEGACY_CARGO_PATCHES_DIR].iter().any(|dir| {
+        let prefix: Vec<&str> = dir.split('/').collect();
+        segments.len() > prefix.len() && segments[..prefix.len()] == prefix[..]
+    })
 }
 
 /// The `path` string of a `[patch]` entry (inline table or sub-table), if any.
@@ -297,8 +351,7 @@ mod tests {
     #[test]
     fn test_is_socket_owned() {
         assert!(path_is_socket_owned(&vendor_path("cfg-if", "1.0.4")));
-        assert!(path_is_socket_owned("./.socket/vendor/cargo/u/x-1.0.0")); // contains "/.socket/…"
-        assert!(path_is_socket_owned("sub/.socket/vendor/cargo/u/x-1.0.0"));
+        assert!(path_is_socket_owned("./.socket/vendor/cargo/u/x-1.0.0")); // "." segment normalised
         assert!(path_is_socket_owned(r".socket\vendor\cargo\u\x-1.0.0")); // backslash normalised
                                                                           // Legacy redirect copies are recognised as ours (takeover / cleanup).
         assert!(path_is_socket_owned(".socket/cargo-patches/cfg-if-1.0.0"));
@@ -309,6 +362,62 @@ mod tests {
         assert!(!path_is_socket_owned("/abs/.socketX/vendor/cargo/x"));
         // Other ecosystems' vendor dirs are not cargo-owned entries.
         assert!(!path_is_socket_owned(".socket/vendor/npm/u/x.tgz"));
+    }
+
+    /// AUDIT B4: only a root-anchored relative path can be a copy this
+    /// backend wrote (cargo resolves relative `[patch]` paths against the
+    /// project root). A path that merely TRAVERSES some other checkout's
+    /// `.socket/vendor/cargo/` — via `..`, an absolute prefix, or a nested
+    /// sub-checkout — is user-authored and must never be classified ours.
+    #[test]
+    fn test_foreign_socket_paths_are_user_authored() {
+        // Sibling checkout, reached with `..`.
+        assert!(!path_is_socket_owned(
+            "../other-checkout/.socket/vendor/cargo/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/x-1.0.0"
+        ));
+        // Absolute paths (unix, and Windows drive-letter form).
+        assert!(!path_is_socket_owned(
+            "/home/u/shared/.socket/vendor/cargo/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/x-1.0.0"
+        ));
+        assert!(!path_is_socket_owned(
+            r"C:\shared\.socket\vendor\cargo\u\x-1.0.0"
+        ));
+        // A `..` INSIDE the owned prefix escapes it.
+        assert!(!path_is_socket_owned(".socket/vendor/cargo/../../../etc"));
+        assert!(!path_is_socket_owned(
+            ".socket/cargo-patches/../../secrets"
+        ));
+        // A nested sub-checkout's socket dir is not THIS project's.
+        assert!(!path_is_socket_owned("sub/.socket/vendor/cargo/u/x-1.0.0"));
+        // The bare owned dir itself (no copy segment) is not an entry we write.
+        assert!(!path_is_socket_owned(".socket/vendor/cargo"));
+    }
+
+    /// AUDIT B4: a user-authored entry pointing through a foreign checkout's
+    /// socket dir must be a remove no-op — never deleted on revert.
+    #[test]
+    fn test_remove_foreign_socket_path_entry_is_noop() {
+        let toml = "[patch.crates-io]\ncfg-if = { path = \"../other-checkout/.socket/vendor/cargo/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/cfg-if-1.0.4\" }\n";
+        let out = remove_patch_entry(toml, "cfg-if").unwrap();
+        assert!(
+            out.is_none(),
+            "user entry must be a no-op, but it was removed: {out:?}"
+        );
+    }
+
+    /// AUDIT B4: ...and an upsert over it must refuse, never overwrite.
+    #[test]
+    fn test_upsert_refuses_foreign_socket_path_entry() {
+        let toml = "[patch.crates-io]\ncfg-if = { path = \"../shared-fork/.socket/vendor/cargo/99999999-9999-9999-9999-999999999999/cfg-if-1.0.4\" }\n";
+        assert!(
+            upsert_patch_entry(toml, "cfg-if", &vendor_path("cfg-if", "1.0.4")).is_err(),
+            "foreign-checkout entry must refuse the overwrite"
+        );
+        let toml = "[patch.crates-io]\ncfg-if = { path = \"/abs/.socket/vendor/cargo/99999999-9999-9999-9999-999999999999/cfg-if-1.0.4\" }\n";
+        assert!(
+            upsert_patch_entry(toml, "cfg-if", &vendor_path("cfg-if", "1.0.4")).is_err(),
+            "absolute-path entry must refuse the overwrite"
+        );
     }
 
     // ── upsert ───────────────────────────────────────────────────────

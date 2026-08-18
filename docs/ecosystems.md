@@ -14,11 +14,11 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
 
 | Ecosystem | agent (`--mode agent`) | vendored (`--mode vendored`) | hosted (`--mode hosted`) |
 |-----------|------------------------|------------------------------|--------------------------|
-| npm (`npm`) — pnpm / yarn / berry / bun | ✅ any install layout; `setup` postinstall hook | ✅ five lockfile flavors: package-lock, yarn classic, yarn berry (node-modules linker; PnP refused), pnpm v9, bun `bun.lock` (binary `bun.lockb` refused with a `--save-text-lockfile` pointer). Rush monorepos refused (`vendor_rush_unsupported`) — see [Rush notes](#npm-rush-monorepos) | ✅ package-lock / npm-shrinkwrap, pnpm-lock.yaml, yarn classic, yarn berry, bun — berry and bun carry constraints, see [npm hosted-mode notes](#npm-hosted-mode-notes) |
+| npm (`npm`) — pnpm / yarn / berry / bun | ✅ any install layout; `setup` postinstall hook | ✅ five lockfile flavors: package-lock, yarn classic, yarn berry (node-modules linker; PnP refused), pnpm v9, bun `bun.lock` (binary `bun.lockb` refused with a `--save-text-lockfile` pointer). Rush monorepos refused (`vendor_rush_unsupported`) — see [Rush notes](#npm-rush-monorepos) | ✅ package-lock / npm-shrinkwrap, pnpm-lock.yaml (pnpm v9), yarn classic, yarn berry, bun — pnpm, berry, and bun carry constraints, see [npm hosted-mode notes](#npm-hosted-mode-notes) |
 | PyPI (`pypi`) — uv / poetry / pdm / pipenv / pip | ✅ `.pth` startup hook via `setup` | ✅ five lockfile flavors: uv, poetry, pdm, pipenv (lock rewired, but pipenv doesn't hash-check file entries — `vendor_integrity_unverified` warning; the committed wheel bytes are the protection), and requirements.txt (consumed by pip or `uv pip`) | ✅ requirements.txt + uv.lock. **poetry / pdm / pipenv locks are not rewritten** — use vendored |
 | Cargo (`cargo`) | ✅ in-place + `.cargo-checksum.json` rewrite (shared registry-cache caveat — see [Cargo: shared registry cache](#cargo-shared-registry-cache)) | ✅ `[patch.crates-io]` path entry | ✅ per-patch sparse registry (`[registries.socket-patch-<uuid>]` + Cargo.lock source/checksum) |
-| RubyGems (`gem`) | ✅ Bundler plugin via `setup` | ✅ Gemfile + Gemfile.lock path pair | ✅ per-dep `source` block; the `CHECKSUMS` pin needs bundler ≥ 2.6 (older locks get a `redirect_gem_no_checksums_section` warning) |
-| Go (`golang`) | ✅ `go.mod` `replace` → `.socket/go-patches/` — see [Go: directory replaces and go.sum](#go-directory-replaces-and-gosum) | ✅ `replace` → the committed vendor tree | ❌ **not possible** — sumdb, module-path identity, and default-GOPROXY leakage each rule it out; see [golang-hosted-no-go.md](design/golang-hosted-no-go.md). **Use vendored** (`redirect_golang_unsupported` names the remedy) |
+| RubyGems (`gem`) | ✅ Bundler plugin via `setup` | ✅ Gemfile + Gemfile.lock path pair (`Gemfile` spelling only — a `gems.rb` project cannot vendor yet) | ✅ per-dep `source` block — edits `gems.rb` + `gems.locked` when present (bundler prefers them over `Gemfile`; spellings that diverge beyond Socket's own edits fail closed with `redirect_gem_gemfile_spellings_diverge`); the `CHECKSUMS` pin needs bundler ≥ 2.6 (older locks get a `redirect_gem_no_checksums_section` warning) |
+| Go (`golang`) | ✅ `go.mod` `replace` → `.socket/go-patches/` — see [Go: directory replaces and go.sum](#go-directory-replaces-and-gosum) | ✅ `replace` → the committed vendor tree | ✅ (free tier) fork-style `replace` → `patch.socket.dev/gopatch/<uuid>` + committed `go.sum` pin; see [golang-hosted.md](design/golang-hosted.md). Paid tier stays ❌ ([golang-hosted-no-go.md](design/golang-hosted-no-go.md)); `redirect_golang_unsupported` names the vendored remedy |
 | Maven (`maven`) | ✅ apply-only (no `setup` hook — reports `no_files`); in-place jar patching leaves the `~/.m2` checksum sidecars stale — prefer vendored / hosted, see [Maven & NuGet caveats](#maven--nuget-caveats) | ✅ committed maven2 `file://` repository. A root pom declaring `<modules>` (multi-module aggregator) is refused (`vendor_maven_multimodule_unsupported`), and a gradle-only project is refused (`vendor_gradle_unsupported`) | ✅ **pom projects only, fail-closed** — the patched jar is pinned at a Socket-only `<version>-socket.<hex8>` suffix; `${property}` versions are refused; Gradle gets a manual `exclusiveContent` snippet — see [Maven & NuGet caveats](#maven--nuget-caveats) |
 | NuGet (`nuget`) | ✅ apply-only (no `setup` hook — reports `no_files`); in-place patching deletes `.nupkg.metadata` and advises on the `.nupkg.sha512` tamper-evidence sidecar — prefer vendored / hosted, see [Maven & NuGet caveats](#maven--nuget-caveats) | ✅ committed folder feed + `packageSourceMapping` + `packages.lock.json` contentHash pin | ✅ `nuget.config` source + source-mapping, `packages.lock.json` contentHash rewrite. See the locked-mode note in [Maven & NuGet caveats](#maven--nuget-caveats) |
 | Composer (`composer`) | ✅ post-install script events | ✅ `composer.lock` `dist: path` rewrite | ✅ `composer.lock` dist url + shasum rewrite |
@@ -35,6 +35,12 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
 
 ## npm hosted-mode notes
 
+- **pnpm** — lockfileVersion 9 (`pnpm >=9`). Older lock grammars carry `packages:` keys
+  the rewrite cannot repoint — v6 embeds resolved peers in the key itself
+  (`/name@1.0.0(peer@2.0.0)`) and v5.x is path-style (`/name/1.0.0`). A dep that
+  resolves through any such key is refused outright
+  (`redirect_pnpm_unsupported_lock_key` names the key and the lock), never partially
+  rewritten: regenerate the lock with pnpm ≥ 9 and re-run.
 - **yarn berry** — the redirect edits the `yarn.lock` entry only (cacheKey `10c0` /
   yarn 4), and `.yarnrc.yml`'s `compressionLevel` must stay 0. The node-modules linker
   is e2e-covered; PnP is untested for hosted — the lock rewrite fires, but PnP's
@@ -155,9 +161,17 @@ commit it, and review it like any other vendored code. The wiring survives
 `go mod tidy`, and `apply --check` gives CI a read-only audit that the committed
 redirects still match the manifest.
 
-Hosted mode is a hard ❌ for Go — sumdb verification, module-path identity, and
-default-GOPROXY leakage each independently rule it out; the full analysis is in
-[golang-hosted-no-go.md](design/golang-hosted-no-go.md).
+Hosted mode uses Go's other native `replace` form — a fork-style
+module-to-module directive onto a Socket-published, content-addressed module
+(`replace <mod> <ver> => patch.socket.dev/gopatch/<uuid> <ver>-socketpatch.<n>`)
+plus the module's two committed `go.sum` lines. Because go consults the
+checksum database only for modules *absent* from `go.sum`, the committed pair
+is the complete day-2 state: fresh clones and CI build the patched module with
+no machine-local configuration, and a tampered hash still fails closed with
+go's checksum `SECURITY ERROR`. Free tier only; the paid-tier analysis (and
+the ephemeral-CI workaround) is in
+[golang-hosted-no-go.md](design/golang-hosted-no-go.md), the full free-tier
+design in [golang-hosted.md](design/golang-hosted.md).
 
 ## Supported platforms
 

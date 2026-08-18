@@ -50,11 +50,12 @@ pub mod bun_lock;
 pub(crate) mod bun_lock_text;
 pub mod cargo;
 pub mod cargo_config;
-pub(crate) mod cargo_lock;
+pub mod cargo_lock;
 pub(crate) mod common;
 pub mod composer_lock;
 pub mod gem;
 pub mod go_mod_edit;
+pub mod go_sum_edit;
 pub mod golang;
 pub mod lock_inventory;
 pub mod maven_repo;
@@ -81,7 +82,10 @@ pub(crate) mod yarn_classic_lock;
 mod yarn_layering_tests;
 
 pub use path::{ecosystem_dir_for_purl, parse_vendor_path};
-pub use state::{load_state, lookup_entry, save_state, VendorEntry, VendorState, VENDOR_STATE_REL};
+pub use state::{
+    carry_forward_wiring, load_state, lookup_entry, save_state, VendorEntry, VendorState,
+    VENDOR_STATE_REL,
+};
 pub use verify::{check_vendored_artifact, file_sha256_hex, ArtifactHealth};
 
 use std::collections::{HashMap, HashSet};
