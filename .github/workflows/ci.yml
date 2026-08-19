@@ -74,12 +74,9 @@ jobs:
             exit 1
           fi
 
-  # Lint the out-of-workspace packaging artifacts for the ecosystems whose setup
-  # / CLI-distribution we added: the RubyGems CLI launcher gem + the Bundler
-  # plugin gem (Ruby), the Composer CLI launcher (PHP), the Maven Central
-  # launcher jar (Java), and the NuGet .NET-tool launcher. Ruby, PHP, Composer,
-  # a Temurin JDK + Maven, and the .NET SDK are all pre-installed on the
-  # ubuntu-latest runner.
+  # Lint the out-of-workspace packaging artifacts: the RubyGems CLI launcher
+  # gem + the Bundler plugin gem (Ruby), and the curl|sh installer. Ruby is
+  # pre-installed on the ubuntu-latest runner.
   lint-ecosystems:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -97,27 +94,8 @@ jobs:
           ruby -c crates/socket-patch-core/src/setup/gem/templates/plugins.rb.tmpl
           ruby -c crates/socket-patch-core/src/setup/gem/templates/gemspec.tmpl
 
-      - name: PHP — lint the Composer launcher + validate composer.json
-        # composer.json lives at the repo root (Packagist requires the
-        # manifest at the VCS root), so validate runs from there; the
-        # launcher script itself stays under composer/socket-patch/bin.
-        run: |
-          php -l composer/socket-patch/bin/socket-patch
-          composer validate --no-check-publish
-
-      - name: Java — build the Maven Central launcher jar
-        # `package` exercises compile + jar + the -sources/-javadoc plugins
-        # Central mandates; -Dgpg.skip because CI has no release signing key.
-        run: mvn --batch-mode --no-transfer-progress -f maven/socket-patch/pom.xml package -Dgpg.skip=true
-
-      - name: .NET — pack the NuGet tool launcher
-        # `pack` (not just build) so the PackAsTool/ToolCommandName metadata
-        # is validated too. Output goes to RUNNER_TEMP to keep the checkout
-        # clean.
-        run: dotnet pack nuget/socket-patch -c Release -o "$RUNNER_TEMP/nupkg"
-
       - name: Shell — shellcheck the curl|sh installer
-        # install.sh is the third distribution artifact this job lints; it
+        # install.sh is the other distribution artifact this job lints; it
         # had no coverage anywhere before the self-update work touched the
         # same surface. shellcheck is pre-installed on ubuntu-latest.
         run: shellcheck --shell=sh scripts/install.sh

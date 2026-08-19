@@ -70,7 +70,7 @@ Unchanged by the hosting move, and worth being precise about:
 - **The binary** is fetched from the GitHub release and verified against that
   release's `SHA256SUMS` before it is unpacked. Neither the script nor the
   checksums are signed — this is checksum integrity rooted in HTTPS plus GitHub,
-  the same model `--update` and the gem/composer launchers use (see
+  the same model `--update` and the gem launcher use (see
   [CLI_CONTRACT.md](../crates/socket-patch-cli/CLI_CONTRACT.md)).
 - Nothing in the install path sends a Socket API token anywhere.
 

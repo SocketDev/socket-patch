@@ -6,9 +6,6 @@
 #   - pypi/socket-patch/pyproject.toml + pypi/socket-patch-hook/pyproject.toml
 #   - gem/socket-patch-bundler/socket-patch-bundler.gemspec
 #   - gem/socket-patch/socket-patch.gemspec + lib/socket_patch/launcher.rb
-#   - composer/socket-patch/bin/socket-patch (SP_VERSION constant)
-#   - maven/socket-patch/pom.xml + src/main/java/dev/socket/socketpatch/Launcher.java
-#   - nuget/socket-patch/SocketSecurity.SocketPatch.csproj + Program.cs
 set -euo pipefail
 
 VERSION="${1:?Usage: version-sync.sh <version>}"
@@ -91,51 +88,6 @@ ruby_cli_launcher="$REPO_ROOT/gem/socket-patch/lib/socket_patch/launcher.rb"
 if [ -f "$ruby_cli_launcher" ]; then
   sed -i.bak "s/VERSION = \".*\"/VERSION = \"$VERSION\"/" "$ruby_cli_launcher"
   rm -f "$ruby_cli_launcher.bak"
-fi
-
-# Update the Composer CLI launcher's baked-in version (the release it fetches).
-# Packagist derives the package version from the git tag, so composer.json has
-# no version field — only the launcher constant needs syncing.
-composer_cli_bin="$REPO_ROOT/composer/socket-patch/bin/socket-patch"
-if [ -f "$composer_cli_bin" ]; then
-  sed -i.bak "s/const SP_VERSION = '.*';/const SP_VERSION = '$VERSION';/" "$composer_cli_bin"
-  rm -f "$composer_cli_bin.bak"
-fi
-
-# Update the Maven Central launcher pom. The sed is anchored on the literal
-# x-version-sync marker comment so ONLY the project's own <version> line is
-# rewritten — the pom carries other <version> elements for build plugins.
-maven_pom="$REPO_ROOT/maven/socket-patch/pom.xml"
-if [ -f "$maven_pom" ]; then
-  sed -i.bak "s|<version>.*</version><!-- x-version-sync -->|<version>$VERSION</version><!-- x-version-sync -->|" "$maven_pom"
-  rm -f "$maven_pom.bak"
-fi
-
-# Update the Maven launcher's fallback VERSION constant (the launcher prefers
-# the jar manifest's Implementation-Version; this constant covers running from
-# exploded classes, where no manifest is available).
-maven_launcher="$REPO_ROOT/maven/socket-patch/src/main/java/dev/socket/socketpatch/Launcher.java"
-if [ -f "$maven_launcher" ]; then
-  sed -i.bak "s/VERSION = \".*\"/VERSION = \"$VERSION\"/" "$maven_launcher"
-  rm -f "$maven_launcher.bak"
-fi
-
-# Update the NuGet .NET-tool launcher package version. The csproj has exactly
-# one <Version> element; the informational version derives from it, so a
-# single stamp keeps package and assembly versions equal.
-nuget_csproj="$REPO_ROOT/nuget/socket-patch/SocketSecurity.SocketPatch.csproj"
-if [ -f "$nuget_csproj" ]; then
-  sed -i.bak "s|<Version>.*</Version>|<Version>$VERSION</Version>|" "$nuget_csproj"
-  rm -f "$nuget_csproj.bak"
-fi
-
-# Update the NuGet launcher's fallback version constant (the launcher prefers
-# the assembly's informational version; this constant covers builds where the
-# attribute is unavailable).
-nuget_program="$REPO_ROOT/nuget/socket-patch/Program.cs"
-if [ -f "$nuget_program" ]; then
-  sed -i.bak "s/FallbackVersion = \".*\"/FallbackVersion = \"$VERSION\"/" "$nuget_program"
-  rm -f "$nuget_program.bak"
 fi
 
 echo "Synced version to $VERSION"

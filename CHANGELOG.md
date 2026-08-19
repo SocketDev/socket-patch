@@ -79,16 +79,6 @@ into the new version's section — see docs/releasing.md.
   the workspace version. The `Release` workflow's `version` job now runs the
   same script, so the publish gate and the PR gate cannot drift. Playbook:
   docs/releasing.md.
-- **Maven Central and NuGet distribution.** Two new install channels for the
-  CLI. Maven Central: `dev.socket:socket-patch`, a dependency-free launcher
-  jar — run via `java -jar` (fetch it with `mvn dependency:copy`) or in one
-  shot with JBang. NuGet: `SocketSecurity.SocketPatch`, a .NET tool —
-  `dotnet tool install -g SocketSecurity.SocketPatch` puts `socket-patch`
-  on `PATH`. Both behave like the existing gem/composer launchers: on first
-  run they download the version-matched prebuilt binary from the GitHub
-  release, verify it against the published `SHA256SUMS` (HTTPS-only,
-  including redirects), cache it per-user, and run it; `SOCKET_PATCH_BIN`
-  points them at an existing binary instead.
 - **`socket-patch --update` — self-update.** Downloads the release for the
   compiled target from GitHub Releases, verifies it against the published
   `SHA256SUMS` before extraction, sanity-execs the staged binary, and
@@ -97,8 +87,8 @@ into the new version's section — see docs/releasing.md.
   (or `SOCKET_PATCH_VERSION`) pins a version, up or down; bare `--update`
   never downgrades; `--force` reinstalls. `--dry-run` is a check-only
   probe (zero downloads, `updateAvailable` in the `--json` details).
-  Package-manager-managed installs (npm, pip, cargo, the gem/composer
-  launcher cache, Homebrew) are detected from the canonicalized executable
+  Package-manager-managed installs (npm, pip, cargo, the gem launcher
+  cache, Homebrew) are detected from the canonicalized executable
   path and refused with that manager's own upgrade command; `--force`
   overrides. `--offline` refuses up front and `--force` cannot bypass it.
   Concurrent updates are single-flighted via an advisory lock; every
@@ -401,18 +391,15 @@ into the new version's section — see docs/releasing.md.
   modes never touch the caches.
 
 - **Release workflow consolidated into a single `release.yml`.** One
-  dispatch now publishes every ecosystem package — crates.io, npm, PyPI,
-  RubyGems (both gems, via OIDC trusted publishing), Packagist, Maven
-  Central, and NuGet — with the launcher-package jobs gated on the GitHub
-  release existing. The separate `release-ecosystems.yml` workflow is
-  removed (its `release: published` trigger never fired: the release is
-  created with `GITHUB_TOKEN`, which suppresses downstream workflow
-  events). `composer.json` moved to the repository root — a Packagist
-  requirement — with a fail-closed `.gitattributes` `export-ignore` set,
-  so Packagist can publish `socketsecurity/socket-patch`. Note the
-  `export-ignore` allowlist applies to every `git archive` consumer, so
-  GitHub's auto-generated "Source code" release assets now contain only
-  the Composer package files — clone the repo for full source.
+  dispatch now publishes every package — crates.io, npm, PyPI, and
+  RubyGems (both gems), all via OIDC trusted publishing — with the
+  launcher-gem job gated on the GitHub release existing. The separate
+  `release-ecosystems.yml` workflow is removed (its `release: published`
+  trigger never fired: the release is created with `GITHUB_TOKEN`, which
+  suppresses downstream workflow events). The CLI is distributed via
+  GitHub releases, npm, PyPI, crates.io, and RubyGems only — the
+  Composer/Packagist, Maven Central, and NuGet launcher channels drafted
+  earlier in this cycle were dropped before ever shipping in a release.
 - `--api-url` / `--proxy-url` no longer carry clap-level defaults: with
   neither flag nor env var set they parse as unset and the documented
   default URLs are applied at API-client construction (after the

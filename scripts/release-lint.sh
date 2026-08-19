@@ -7,7 +7,7 @@
 # Checks (all failures are collected and reported together):
 #   1. The version is a plain X.Y.Z release version and matches Cargo.toml.
 #   2. Version coherence: `scripts/version-sync.sh <version>` is a no-op —
-#      every stamped site (npm/pypi/gem/composer/maven/nuget/cargo) already
+#      every stamped site (npm/pypi/gem/cargo) already
 #      carries the workspace version. Catches hand-edited drift in any single
 #      site. NOTE: this runs version-sync, which refreshes the npm lockfile
 #      (network); files the sync touches are restored afterwards, so the tree

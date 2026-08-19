@@ -5,8 +5,8 @@
 //! replace. npm and PyPI bundle the binary inside a version-pinned package
 //! directory — swapping it there desyncs the package manager's metadata and
 //! the next `npm install` / `pip install` silently reverts the update. The
-//! gem and Composer launchers exec a per-version cached binary they
-//! re-resolve on every run, so replacing the cache entry is meaningless.
+//! gem launcher execs a per-version cached binary it re-resolves on every
+//! run, so replacing the cache entry is meaningless.
 //! For all of those, `--update` refuses and prints the channel's own
 //! upgrade command instead (`--force` overrides).
 //!
@@ -30,9 +30,8 @@ pub enum InstallChannel {
     Pypi,
     /// Under `$CARGO_HOME/bin` — managed by `cargo install`.
     Cargo,
-    /// Under the shared launcher cache (`<cache>/socket-patch/bin/…`) used
-    /// by both the RubyGems and Composer launchers. The two share one
-    /// layout and cannot be told apart from the path alone.
+    /// Under the launcher cache (`<cache>/socket-patch/bin/…`) used by the
+    /// RubyGems launcher.
     LauncherCache,
     /// Under a Homebrew prefix (`Cellar`, `/opt/homebrew`).
     Homebrew,
@@ -108,9 +107,7 @@ pub fn upgrade_hint(channel: InstallChannel) -> &'static str {
         InstallChannel::Npm => "npm update -g @socketsecurity/socket-patch",
         InstallChannel::Pypi => "pip install --upgrade socket-patch",
         InstallChannel::Cargo => "cargo install socket-patch-cli",
-        InstallChannel::LauncherCache => {
-            "gem update socket-patch (RubyGems) or composer update socketsecurity/socket-patch"
-        }
+        InstallChannel::LauncherCache => "gem update socket-patch",
         InstallChannel::Homebrew => "brew upgrade socket-patch",
     }
 }
@@ -122,7 +119,7 @@ pub fn channel_label(channel: InstallChannel) -> &'static str {
         InstallChannel::Npm => "npm",
         InstallChannel::Pypi => "pip",
         InstallChannel::Cargo => "cargo install",
-        InstallChannel::LauncherCache => "the RubyGems/Composer launcher",
+        InstallChannel::LauncherCache => "the RubyGems launcher",
         InstallChannel::Homebrew => "Homebrew",
     }
 }
@@ -139,7 +136,7 @@ fn cargo_bin_dir(env: &ChannelEnv) -> Option<PathBuf> {
     env.home.as_ref().map(|h| h.join(".cargo").join("bin"))
 }
 
-/// Cache roots the gem/composer launchers resolve, in their probe order:
+/// Cache roots the gem launcher resolves, in its probe order:
 /// `$XDG_CACHE_HOME`, `~/.cache`, `%LOCALAPPDATA%`.
 fn launcher_cache_roots(env: &ChannelEnv) -> Vec<PathBuf> {
     let mut roots = Vec::new();
@@ -353,7 +350,6 @@ mod tests {
         assert!(upgrade_hint(InstallChannel::Pypi).contains("pip install --upgrade"));
         assert!(upgrade_hint(InstallChannel::Cargo).contains("cargo install"));
         assert!(upgrade_hint(InstallChannel::LauncherCache).contains("gem update"));
-        assert!(upgrade_hint(InstallChannel::LauncherCache).contains("composer update"));
         assert!(upgrade_hint(InstallChannel::Homebrew).contains("brew upgrade"));
         assert!(upgrade_hint(InstallChannel::Standalone).contains("--update"));
     }

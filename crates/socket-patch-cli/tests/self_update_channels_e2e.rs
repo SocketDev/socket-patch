@@ -151,14 +151,14 @@ async fn cargo_install_refuses_with_cargo_hint() {
     install.assert_only_binary_present();
 }
 
-/// The gem/composer launchers exec a per-version cached binary under
+/// The gem launcher execs a per-version cached binary under
 /// `<cache>/socket-patch/bin/<version>/<triple>/`; replacing the cache
 /// entry is meaningless (the launcher re-resolves every run), so the
-/// refusal points at BOTH managers — the path can't tell them apart.
+/// refusal points at the gem's own upgrade command.
 /// Unix resolution goes through XDG_CACHE_HOME.
 #[cfg(unix)]
 #[tokio::test]
-async fn launcher_cache_refuses_with_gem_composer_hint() {
+async fn launcher_cache_refuses_with_gem_hint() {
     let install = staged_install_at("cache/socket-patch/bin/3.3.0/x86_64-unknown-linux-gnu");
     let cache_root = install
         .root
@@ -181,9 +181,9 @@ async fn launcher_cache_refuses_with_gem_composer_hint() {
         "launcher-cache install must refuse.\nstderr:\n{stderr}"
     );
     assert!(
-        stderr.contains("gem update") && stderr.contains("composer update"),
-        "the shared cache layout can't distinguish gem from composer, so \
-         the hint must name both: {stderr}"
+        stderr.contains("gem update"),
+        "the launcher-cache refusal must point at the gem's own upgrade \
+         command: {stderr}"
     );
 
     install.assert_binary_intact();
@@ -194,7 +194,7 @@ async fn launcher_cache_refuses_with_gem_composer_hint() {
 /// %LOCALAPPDATA% there (no ~/.cache convention).
 #[cfg(windows)]
 #[tokio::test]
-async fn launcher_cache_refuses_with_gem_composer_hint_windows() {
+async fn launcher_cache_refuses_with_gem_hint_windows() {
     let install = staged_install_at("cache/socket-patch/bin/3.3.0/x86_64-pc-windows-msvc");
     // Canonicalized for the same reason as the unix rows: the exe path is
     // canonicalized (verbatim \\?\ form on Windows), so the root must be
@@ -220,9 +220,9 @@ async fn launcher_cache_refuses_with_gem_composer_hint_windows() {
         "launcher-cache install must refuse.\nstderr:\n{stderr}"
     );
     assert!(
-        stderr.contains("gem update") && stderr.contains("composer update"),
-        "the shared cache layout can't distinguish gem from composer, so \
-         the hint must name both: {stderr}"
+        stderr.contains("gem update"),
+        "the launcher-cache refusal must point at the gem's own upgrade \
+         command: {stderr}"
     );
 
     install.assert_binary_intact();
