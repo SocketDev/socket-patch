@@ -647,4 +647,3 @@ jobs:
             exit 0
           fi
           gem push "socket-patch-bundler-${VERSION}.gem"
-

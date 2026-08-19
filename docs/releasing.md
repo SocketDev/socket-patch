@@ -73,6 +73,7 @@ gh release view "v$V" --repo SocketDev/socket-patch          # binaries + SHA256
 cargo info socket-patch-cli | grep "$V"                      # crates.io
 npm view "@socketsecurity/socket-patch@$V" version           # npm (after approval)
 curl -sf "https://pypi.org/pypi/socket-patch/$V/json" >/dev/null && echo pypi ok
+curl -sf "https://pypi.org/pypi/socket-patch-hook/$V/json" >/dev/null && echo hook ok
 gem list --remote --exact --all socket-patch | grep "$V"     # rubygems
 ```
 
@@ -94,6 +95,9 @@ and skips it. A partial release never requires deleting tags or re-bumping.
 Deployment environments (`pypi`, `rubygems`) and each registry's trusted
 publisher (repo `SocketDev/socket-patch` + workflow `release.yml`, plus the
 environment where one is named above) are listed in the checklist of
-[PR #138](https://github.com/SocketDev/socket-patch/pull/138). Until a
-registry's credentials exist, its job skips with a `::notice` instead of
-failing the release.
+[PR #138](https://github.com/SocketDev/socket-patch/pull/138). All four
+registry channels authenticate via OIDC trusted publishing, so a missing or
+misconfigured trusted publisher (or environment) **fails that channel's
+job** — configure it before dispatching a real release. The one
+non-blocking push is the `socket-patch-bundler` gem (`continue-on-error`
+Phase-2 scaffolding).
