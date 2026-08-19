@@ -6645,6 +6645,133 @@ mod tests {
         );
     }
 
+    /// The CLI's ONLY production `DepOverride` construction site
+    /// (`scan/hosted.rs`) builds every override with an EMPTY `token` — the
+    /// reference endpoint hands the grant token back only inside the URLs it
+    /// returns. The rotated-grant idempotency guard must therefore never
+    /// depend on the caller populating `token`: a re-scan under a rotated
+    /// grant must still recognize the source block a previous run wrote and
+    /// refresh its URL in place. With a token-dependent guard the recognizer
+    /// misses the old block, `gem_line_re` matches the INDENTED gem line
+    /// inside it, and every re-scan wraps it in one more nested source block
+    /// while keeping the stale (soon-dead) token URL live and reporting
+    /// success.
+    #[test]
+    fn gemfile_rerun_with_rotated_grant_and_cli_empty_token_never_nests() {
+        const PATCH_UUID: &str = "7c8d9e0f-1a2b-4a1b-8c2d-3e4f5a6b7c8d";
+        fn ov(token: &str) -> DepOverride {
+            let mut o = gem_override("rails", "7.0.0");
+            // Exactly as the CLI builds it: the grant token never populated.
+            o.token = String::new();
+            o.patch_uuid = PATCH_UUID.into();
+            if let Some(r) = o.registry_override.as_mut() {
+                r.index_url =
+                    format!("https://patch.test/patch-registry/gem/{token}/{PATCH_UUID}/");
+            }
+            o
+        }
+        let mut files = BTreeMap::new();
+        files.insert(
+            "Gemfile".to_string(),
+            "source \"https://rubygems.org\"\n\ngem \"rails\", \"7.0.0\"\n".to_string(),
+        );
+        let first = rewrite_registry_redirect(&files, &[ov("tok-one")]);
+        files.insert(
+            "Gemfile".to_string(),
+            first
+                .files
+                .get("Gemfile")
+                .expect("first run rewrites")
+                .clone(),
+        );
+
+        let second = rewrite_registry_redirect(&files, &[ov("tok-two")]);
+        let out = second
+            .files
+            .get("Gemfile")
+            .expect("rotated grant refreshes the URL");
+        assert_eq!(
+            out.matches("source \"https://patch.test/patch-registry/gem/")
+                .count(),
+            1,
+            "exactly one Socket source block, never nested: {out}"
+        );
+        assert!(!out.contains("tok-one"), "old grant token gone: {out}");
+        assert!(
+            out.contains(&format!(
+                "source \"https://patch.test/patch-registry/gem/tok-two/{PATCH_UUID}/\" do\n  gem \"rails\", \"7.0.0\"\nend"
+            )),
+            "URL refreshed in place: {out}"
+        );
+        assert!(
+            second
+                .edits
+                .iter()
+                .any(|e| e.kind == "redirect_gemfile_source_url"),
+            "the refresh must be recorded as a redirect_gemfile_source_url edit: {:?}",
+            second.edits
+        );
+
+        // Same grant again: a true no-op.
+        files.insert("Gemfile".to_string(), out.clone());
+        let third = rewrite_registry_redirect(&files, &[ov("tok-two")]);
+        assert!(
+            third.files.is_empty() && third.edits.is_empty(),
+            "same-grant re-run must be a no-op: files={:?} edits={:?}",
+            third.files.keys(),
+            third.edits
+        );
+    }
+
+    /// The gems.rb/Gemfile divergence guard erases the redirect's own
+    /// footprint with the same token-wildcard pattern, so it too must not
+    /// depend on `DepOverride.token` being populated: identical twins
+    /// re-scanned under a rotated grant with the CLI's empty token must reach
+    /// the in-place refresh, not be trapped behind
+    /// `redirect_gem_gemfile_spellings_diverge` by run 1's own edit.
+    #[test]
+    fn gems_rb_twins_rotated_grant_with_cli_empty_token_refreshes() {
+        const PATCH_UUID: &str = "7c8d9e0f-1a2b-4a1b-8c2d-3e4f5a6b7c8d";
+        fn ov(token: &str) -> DepOverride {
+            let mut o = gem_override("rails", "7.0.0");
+            o.token = String::new();
+            o.patch_uuid = PATCH_UUID.into();
+            if let Some(r) = o.registry_override.as_mut() {
+                r.index_url =
+                    format!("https://patch.test/patch-registry/gem/{token}/{PATCH_UUID}/");
+            }
+            o
+        }
+        let gemfile = "source \"https://rubygems.org\"\n\ngem \"rails\", \"7.0.0\"\n".to_string();
+        let mut files = BTreeMap::new();
+        files.insert("gems.rb".to_string(), gemfile.clone());
+        files.insert("Gemfile".to_string(), gemfile);
+        let first = rewrite_registry_redirect(&files, &[ov("tok-one")]);
+        for (name, content) in first.files {
+            files.insert(name, content);
+        }
+        let second = rewrite_registry_redirect(&files, &[ov("tok-two")]);
+        assert!(
+            !second
+                .warnings
+                .iter()
+                .any(|w| w.code == "redirect_gem_gemfile_spellings_diverge"),
+            "run 1's own edit must not read as divergence: {:?}",
+            second.warnings
+        );
+        let out = second
+            .files
+            .get("gems.rb")
+            .expect("rotated grant refreshes gems.rb");
+        assert_eq!(
+            out.matches("source \"https://patch.test/patch-registry/gem/")
+                .count(),
+            1,
+            "exactly one Socket source block, never nested: {out}"
+        );
+        assert!(!out.contains("tok-one"), "old grant token gone: {out}");
+    }
+
     /// A `core.autocrlf` checkout rewrites a previously-redirected Gemfile to
     /// CRLF. The block recognizer must still see the Socket source block
     /// there: if it misses, the indented `gem` line inside the block matches
