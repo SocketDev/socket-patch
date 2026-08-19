@@ -277,7 +277,9 @@ struct IndexSection {
 fn unquote(s: &str) -> &str {
     let s = s.trim();
     let b = s.as_bytes();
-    if s.len() >= 2 && ((b[0] == b'"' && b[s.len() - 1] == b'"') || (b[0] == b'\'' && b[s.len() - 1] == b'\'')) {
+    if s.len() >= 2
+        && ((b[0] == b'"' && b[s.len() - 1] == b'"') || (b[0] == b'\'' && b[s.len() - 1] == b'\''))
+    {
         &s[1..s.len() - 1]
     } else {
         s
@@ -1331,9 +1333,7 @@ mod tests {
         let index = "---\ncommands:\nhooks:\n  after-install:\n  - \"other\"\nload_paths:\n  \
              other:\n  - \"/mono/socket-patch-fork/other/.\"\nplugin_paths:\n  \
              other: \"/mono/socket-patch-fork/other\"\nsources:\n";
-        assert!(strip_plugin_registration(index)
-            .expect("parses")
-            .is_none());
+        assert!(strip_plugin_registration(index).expect("parses").is_none());
     }
 
     #[test]
@@ -1351,7 +1351,10 @@ mod tests {
         use std::ffi::OsStr;
         let root = Path::new("/proj");
         // Unset / empty → <root>/.bundle.
-        assert_eq!(bundler_app_config_dir(root, None), Path::new("/proj/.bundle"));
+        assert_eq!(
+            bundler_app_config_dir(root, None),
+            Path::new("/proj/.bundle")
+        );
         assert_eq!(
             bundler_app_config_dir(root, Some(OsStr::new(""))),
             Path::new("/proj/.bundle")
@@ -1399,7 +1402,11 @@ mod tests {
         // the emptied plugin dir) go, the user's config survives.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        write(&root.join(".bundle/config"), "---\nBUNDLE_PATH: \"vendor/bundle\"\n").await;
+        write(
+            &root.join(".bundle/config"),
+            "---\nBUNDLE_PATH: \"vendor/bundle\"\n",
+        )
+        .await;
         let index = root.join(".bundle/plugin/index");
         write(&index, &solo_index(&root.display().to_string())).await;
 
@@ -1461,12 +1468,9 @@ mod tests {
         let decoy = root.join(".bundle/plugin/index");
         write(&decoy, &solo_index("/elsewhere")).await;
 
-        let r = remove_plugin_registration_at(
-            root,
-            Some(std::ffi::OsStr::new("bundle-config")),
-            false,
-        )
-        .await;
+        let r =
+            remove_plugin_registration_at(root, Some(std::ffi::OsStr::new("bundle-config")), false)
+                .await;
         assert!(matches!(r, GemRegistrationCleanup::Cleaned { .. }), "{r:?}");
         assert!(!index.exists(), "the app-config index is the one cleared");
         assert!(
