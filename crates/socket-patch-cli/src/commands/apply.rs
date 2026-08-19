@@ -22,7 +22,7 @@ use crate::args::{apply_env_toggles, GlobalArgs};
 use crate::commands::fetch_stage::{stage_patch_sources, StageOutcome, StagedSources};
 use crate::commands::lock_cli::acquire_or_emit;
 use crate::commands::vex::{generate_vex_from_manifest_path, VexEmbedArgs};
-use crate::ecosystem_dispatch::{find_packages_for_purls, partition_purls};
+use crate::ecosystem_dispatch::{find_all_packages_for_purls, partition_purls};
 use crate::json_envelope::{
     AppliedVia, Command, Envelope, EnvelopeError, PatchAction, PatchEvent, PatchEventFile, Status,
     VexSummary,
@@ -1093,12 +1093,25 @@ async fn apply_patches_inner(
         global_prefix: args.common.global_prefix.clone(),
     };
 
-    let all_packages = find_packages_for_purls(
+    // Multi-copy aware: npm nests genuine duplicates of one `name@version`
+    // (nested dupes, diamonds, `file:` dups), so the resolver returns EVERY
+    // physical copy per PURL. Patching only one would leave a live,
+    // vulnerable copy while reporting success (the multi-copy silent
+    // partial). The apply loop below iterates every copy.
+    let all_packages = find_all_packages_for_purls(
         &partitioned,
         &crawler_options,
         args.common.silent || args.common.json,
     )
     .await;
+
+    // One representative path per PURL, for the mismatch-blob gate and the
+    // pre-attempt checks that only need "is it installed / a sample copy"
+    // (the gate's fetch decision is per-hash, identical across copies).
+    let first_paths: HashMap<String, PathBuf> = all_packages
+        .iter()
+        .filter_map(|(purl, paths)| paths.first().map(|p| (purl.clone(), p.clone())))
+        .collect();
 
     if all_packages.is_empty() && partitioned.is_empty() {
         // Nothing in scope: the manifest lists no patches (or every patch was
@@ -1137,7 +1150,7 @@ async fn apply_patches_inner(
     }
 
     // Apply patches
-    ensure_blobs_for_mismatches(args, &manifest, &all_packages, &vendored_purls, &mut staged).await;
+    ensure_blobs_for_mismatches(args, &manifest, &first_paths, &vendored_purls, &mut staged).await;
     let sources = staged.as_patch_sources();
     let policy = mismatch_policy(args.force, args.common.strict);
     let mut has_errors = false;
@@ -1161,7 +1174,14 @@ async fn apply_patches_inner(
 
     let mut applied_base_purls: HashSet<String> = HashSet::new();
 
-    for (purl, pkg_path) in &all_packages {
+    for (purl, pkg_paths) in &all_packages {
+        // Release-variant ecosystems install exactly one directory per
+        // `package@version` (the variants are jars/wheels inside it), so a
+        // representative path is all the variant branch needs. npm's branch
+        // below iterates every physical copy.
+        let pkg_path = pkg_paths
+            .first()
+            .expect("all_packages only holds PURLs with at least one resolved copy");
         if Ecosystem::from_purl(purl).is_some_and(|e| e.supports_release_variants()) {
             let base_purl = strip_purl_qualifiers(purl).to_string();
             if applied_base_purls.contains(&base_purl) {
@@ -1316,42 +1336,52 @@ async fn apply_patches_inner(
                 None => continue,
             };
 
-            // Local go redirects to a project-local patched copy under
-            // `.socket/go-patches/` wired via a `go.mod` `replace` (the module
-            // cache is `go.sum`-verified, so in-place patching can't build).
-            // Everything else — npm/pypi/gem and cargo (vendored or registry
-            // cache) — patches in place via `apply_package_patch`.
-            let result =
-                match try_local_go_apply(purl, pkg_path, patch, &sources, &args.common, policy)
-                    .await
-                {
-                    Some(r) => r,
-                    None => {
-                        apply_package_patch(
-                            purl,
-                            pkg_path,
-                            &patch.files,
-                            &sources,
-                            Some(&patch.uuid),
-                            args.common.dry_run,
-                            policy,
-                        )
+            // Patch EVERY physical copy of this PURL. npm materializes more
+            // than one on-disk copy of a single `name@version` (nested
+            // dupes, diamonds, `file:` dups); the resolver returns them all
+            // (root copy first). A per-copy result means the JSON summary
+            // counts each copy — the signal a second copy exists — and a
+            // failure on any copy fails the run. (Non-npm single-copy
+            // ecosystems simply have a one-element list here.)
+            for pkg_path in pkg_paths {
+                // Local go redirects to a project-local patched copy under
+                // `.socket/go-patches/` wired via a `go.mod` `replace` (the
+                // module cache is `go.sum`-verified, so in-place patching
+                // can't build). Everything else — npm/pypi/gem and cargo
+                // (vendored or registry cache) — patches in place via
+                // `apply_package_patch`.
+                let result =
+                    match try_local_go_apply(purl, pkg_path, patch, &sources, &args.common, policy)
                         .await
-                    }
-                };
+                    {
+                        Some(r) => r,
+                        None => {
+                            apply_package_patch(
+                                purl,
+                                pkg_path,
+                                &patch.files,
+                                &sources,
+                                Some(&patch.uuid),
+                                args.common.dry_run,
+                                policy,
+                            )
+                            .await
+                        }
+                    };
 
-            warn_mismatch_overwrites(&result, &args.common);
-            if !result.success {
-                has_errors = true;
-                if !args.common.silent && !args.common.json {
-                    eprintln!(
-                        "Failed to patch {}: {}",
-                        purl,
-                        result.error.as_deref().unwrap_or("unknown error")
-                    );
+                warn_mismatch_overwrites(&result, &args.common);
+                if !result.success {
+                    has_errors = true;
+                    if !args.common.silent && !args.common.json {
+                        eprintln!(
+                            "Failed to patch {}: {}",
+                            purl,
+                            result.error.as_deref().unwrap_or("unknown error")
+                        );
+                    }
                 }
+                results.push(result);
             }
-            results.push(result);
             matched_manifest_purls.insert(purl.clone());
         }
     }

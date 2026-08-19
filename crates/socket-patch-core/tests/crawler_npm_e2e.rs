@@ -451,10 +451,13 @@ async fn find_by_purls_unscoped_package() {
         .unwrap();
     assert_eq!(result.len(), 1, "exactly one match expected");
     // Map MUST be keyed by the requested purl, and the resolved package
-    // must describe lodash@4.17.21 (not some other staged dir).
-    let pkg = result
+    // must describe lodash@4.17.21 (not some other staged dir). A single
+    // install resolves to a one-element copy list.
+    let copies = result
         .get("pkg:npm/lodash@4.17.21")
         .expect("result must be keyed by the requested purl");
+    assert_eq!(copies.len(), 1, "single install => one copy");
+    let pkg = &copies[0];
     assert_eq!(pkg.name, "lodash");
     assert_eq!(pkg.version, "4.17.21");
     assert_eq!(pkg.namespace, None);
@@ -479,9 +482,9 @@ async fn find_by_purls_scoped_package() {
         .await
         .unwrap();
     assert_eq!(result.len(), 1, "exactly one match expected");
-    let pkg = result
+    let pkg = &result
         .get("pkg:npm/@types/node@20.0.0")
-        .expect("result must be keyed by the requested scoped purl");
+        .expect("result must be keyed by the requested scoped purl")[0];
     assert_eq!(pkg.name, "node");
     assert_eq!(pkg.version, "20.0.0");
     assert_eq!(pkg.namespace.as_deref(), Some("@types"));
@@ -531,9 +534,9 @@ async fn find_by_purls_resolves_qualified_purl_keyed_by_input() {
     // Resolved, keyed by the verbatim qualified input, and the stored
     // package carries that same verbatim PURL.
     assert_eq!(result.len(), 1, "qualified PURL must resolve");
-    let pkg = result
+    let pkg = &result
         .get(&qualified)
-        .expect("result must be keyed by the verbatim input PURL");
+        .expect("result must be keyed by the verbatim input PURL")[0];
     assert_eq!(pkg.name, "lodash");
     assert_eq!(pkg.version, "4.17.21");
     assert_eq!(pkg.purl, qualified);
@@ -566,16 +569,16 @@ async fn find_by_purls_qualifier_containing_at_does_not_corrupt_version() {
         .unwrap();
 
     assert_eq!(result.len(), 2, "both @-bearing qualifiers must resolve");
-    let foo = result
+    let foo = &result
         .get(&unscoped_q)
-        .expect("@-in-qualifier unscoped PURL must resolve to foo@1.0.0");
+        .expect("@-in-qualifier unscoped PURL must resolve to foo@1.0.0")[0];
     assert_eq!(foo.name, "foo");
     assert_eq!(foo.version, "1.0.0");
     assert_eq!(foo.purl, unscoped_q);
 
-    let node = result
+    let node = &result
         .get(&scoped_q)
-        .expect("@-in-qualifier scoped PURL must resolve to @types/node@20.0.0");
+        .expect("@-in-qualifier scoped PURL must resolve to @types/node@20.0.0")[0];
     assert_eq!(node.namespace.as_deref(), Some("@types"));
     assert_eq!(node.name, "node");
     assert_eq!(node.version, "20.0.0");
@@ -1190,18 +1193,20 @@ async fn find_by_purls_resolves_nested_only_install() {
     ];
     let result = crawler.find_by_purls(&nm, &purls).await.unwrap();
 
+    // Each of b/c/d is installed exactly once (nested-only), so one copy.
     let b = result
         .get("pkg:npm/b@2.0.0")
         .expect("nested-only b@2.0.0 must resolve (root b@3.0.0 shadows it)");
-    assert_eq!(b.path, a_nm.join("b"), "must point at the nested copy");
+    assert_eq!(b.len(), 1, "b@2.0.0 has one physical copy");
+    assert_eq!(b[0].path, a_nm.join("b"), "must point at the nested copy");
     let c = result
         .get("pkg:npm/c@5.0.0")
         .expect("depth-3 transitive c@5.0.0 must resolve");
-    assert_eq!(c.path, b_nm.join("c"));
+    assert_eq!(c[0].path, b_nm.join("c"));
     let d = result
         .get("pkg:npm/@s/d@1.0.0")
         .expect("nested scoped @s/d@1.0.0 must resolve");
-    assert_eq!(d.path, a_nm.join("@s").join("d"));
+    assert_eq!(d[0].path, a_nm.join("@s").join("d"));
 }
 
 /// Regression: a FIFO planted at a `package.json` path must be skipped
@@ -1407,11 +1412,15 @@ async fn find_by_purls_resolves_pnpm_virtual_store_transitives() {
 
     // The direct dep resolves at the importer root (probed before any
     // .pnpm entry is dequeued), not at its store home.
+    // The root-linked direct dep resolves to exactly one importer-root
+    // copy; its store peer-variants are the apply engine's fan-out job, not
+    // the resolver's, so they are NOT enumerated here.
     let mkdirp = result
         .get("pkg:npm/mkdirp@0.5.5")
         .expect("root-linked direct dep must resolve");
+    assert_eq!(mkdirp.len(), 1, "one importer-root copy for the direct dep");
     assert_eq!(
-        mkdirp.path,
+        mkdirp[0].path,
         nm.join("mkdirp"),
         "root-linked install must win over the store copy"
     );
@@ -1423,7 +1432,7 @@ async fn find_by_purls_resolves_pnpm_virtual_store_transitives() {
         .get("pkg:npm/minimist@1.2.8")
         .expect("transitive-only minimist@1.2.8 must resolve via .pnpm");
     assert_eq!(
-        std::fs::canonicalize(&m1.path).unwrap(),
+        std::fs::canonicalize(&m1[0].path).unwrap(),
         std::fs::canonicalize(store.join("minimist@1.2.8/node_modules/minimist")).unwrap(),
         "resolved path must be the store's physical minimist@1.2.8"
     );
@@ -1433,7 +1442,7 @@ async fn find_by_purls_resolves_pnpm_virtual_store_transitives() {
         .get("pkg:npm/minimist@0.0.8")
         .expect("second store version must resolve independently");
     assert_eq!(
-        m0.path,
+        m0[0].path,
         store.join("minimist@0.0.8/node_modules/minimist"),
         "version match must bind each purl to its own store entry"
     );
@@ -1443,7 +1452,7 @@ async fn find_by_purls_resolves_pnpm_virtual_store_transitives() {
         .get("pkg:npm/@scope/leaf@2.0.0")
         .expect("scoped transitive-only package must resolve via .pnpm");
     assert_eq!(
-        leaf.path,
+        leaf[0].path,
         store.join("@scope+leaf@2.0.0/node_modules/@scope/leaf")
     );
 
@@ -1550,7 +1559,9 @@ async fn find_by_purls_fallback_pass_probes_store_entries_decoding_to_other_name
     let result = crawler.find_by_purls(&nm, &purls).await.unwrap();
 
     assert_eq!(
-        result.get("pkg:npm/wanted@1.0.0").map(|p| p.path.clone()),
+        result
+            .get("pkg:npm/wanted@1.0.0")
+            .map(|v| v[0].path.clone()),
         Some(store.join("decoy@1.0.0/node_modules/wanted")),
         "a target hidden behind another entry's name must resolve via the \
          fallback pass; got {result:?}"
@@ -1558,7 +1569,7 @@ async fn find_by_purls_fallback_pass_probes_store_entries_decoding_to_other_name
     assert_eq!(
         result
             .get("pkg:npm/@s/wanted@1.0.0")
-            .map(|p| p.path.clone()),
+            .map(|v| v[0].path.clone()),
         Some(store.join("@other+decoy@1.0.0/node_modules/@s/wanted")),
         "scoped twin must resolve via the fallback pass; got {result:?}"
     );
@@ -1587,7 +1598,7 @@ async fn find_by_purls_resolves_pnpm_store_entry_with_peer_suffix() {
     let pkg = result
         .get("pkg:npm/wanted@1.0.0")
         .expect("peer-suffixed store entry for a pending name must be probed");
-    assert_eq!(pkg.path, entry_nm.join("wanted"));
+    assert_eq!(pkg[0].path, entry_nm.join("wanted"));
 }
 
 /// The conservative fallback: pnpm truncates over-long dir names (the cut
@@ -1616,7 +1627,7 @@ async fn find_by_purls_probes_undecodable_pnpm_store_entry() {
     let pkg = result
         .get("pkg:npm/wanted2@1.0.0")
         .expect("undecodable (truncated/hash-suffixed) store entries must remain probeable");
-    assert_eq!(pkg.path, entry_nm.join("wanted2"));
+    assert_eq!(pkg[0].path, entry_nm.join("wanted2"));
 }
 
 /// The store pass skips re-reading a root-linked direct dep's own
@@ -1673,12 +1684,15 @@ async fn crawl_all_inventories_bundled_dep_under_seen_store_entry() {
     assert_eq!(result.len(), 2, "exactly host + bundled; got {names:?}");
 }
 
-/// When the same `name@version` exists at the root *and* nested, the root
-/// copy must win (shallowest-first), preserving the pre-existing behavior
-/// for everything resolvable at the root.
+/// Multi-copy P0: when the same `name@version` exists at the root *and*
+/// nested, BOTH physical copies must be returned (patching only one leaves
+/// a live vulnerable copy — the silent partial). Root preference survives
+/// as ORDERING ONLY — the root copy leads the list so a caller needing one
+/// representative keeps the old behavior — never as a stop condition that
+/// drops the nested duplicate.
 #[tokio::test]
 #[serial_test::parallel]
-async fn find_by_purls_prefers_root_copy_over_nested_duplicate() {
+async fn find_by_purls_returns_root_and_nested_duplicate_root_first() {
     let tmp = tempfile::tempdir().unwrap();
     let nm = tmp.path().join("node_modules");
     stage_npm_pkg(&nm, "a", "1.0.0").await;
@@ -1690,10 +1704,20 @@ async fn find_by_purls_prefers_root_copy_over_nested_duplicate() {
         .find_by_purls(&nm, &["pkg:npm/dup@1.0.0".to_string()])
         .await
         .unwrap();
+    let copies = result
+        .get("pkg:npm/dup@1.0.0")
+        .expect("dup@1.0.0 must resolve");
+    assert_eq!(copies.len(), 2, "BOTH copies must be returned; got {copies:?}");
     assert_eq!(
-        result.get("pkg:npm/dup@1.0.0").map(|p| p.path.clone()),
-        Some(nm.join("dup")),
-        "root copy must be preferred over the nested duplicate"
+        copies[0].path,
+        nm.join("dup"),
+        "root copy must lead (ordering, not a stop condition)"
+    );
+    let paths: std::collections::HashSet<_> = copies.iter().map(|c| c.path.clone()).collect();
+    assert!(paths.contains(&nm.join("dup")), "root copy present");
+    assert!(
+        paths.contains(&nm.join("a").join("node_modules").join("dup")),
+        "nested duplicate must ALSO be returned"
     );
 }
 
@@ -1820,7 +1844,9 @@ async fn find_by_purls_resolves_pnpm4_nested_store_transitives() {
 
     // Root-linked direct dep still wins at the importer root.
     assert_eq!(
-        result.get("pkg:npm/mkdirp@0.5.5").map(|p| p.path.clone()),
+        result
+            .get("pkg:npm/mkdirp@0.5.5")
+            .map(|v| v[0].path.clone()),
         Some(nm.join("mkdirp")),
         "root-linked install must win over the store copy"
     );
@@ -1829,7 +1855,7 @@ async fn find_by_purls_resolves_pnpm4_nested_store_transitives() {
         .get("pkg:npm/minimist@1.2.8")
         .expect("transitive-only dep must resolve through the nested (pnpm 4/5) store layout");
     assert_eq!(
-        minimist.path,
+        minimist[0].path,
         host.join("minimist/1.2.8/node_modules/minimist")
     );
     // Scoped transitive-only dep: the deepest nesting the layout produces.
@@ -1837,14 +1863,14 @@ async fn find_by_purls_resolves_pnpm4_nested_store_transitives() {
         .get("pkg:npm/@scope/leaf@2.0.0")
         .expect("scoped transitive-only dep must resolve through the nested store layout");
     assert_eq!(
-        leaf.path,
+        leaf[0].path,
         host.join("@scope/leaf/2.0.0/node_modules/@scope/leaf")
     );
     // The nested entry advertising a different name is skipped by the
     // filtered pass, but its inner package — the only physical home of
     // `wanted@1.0.0` — must still resolve via the unfiltered fallback.
     assert_eq!(
-        result.get("pkg:npm/wanted@1.0.0").map(|p| p.path.clone()),
+        result.get("pkg:npm/wanted@1.0.0").map(|v| v[0].path.clone()),
         Some(host.join("decoy/1.0.0/node_modules/wanted")),
         "a target hidden behind a nested entry's advertised name must \
          resolve via the fallback pass"
@@ -2003,7 +2029,9 @@ async fn find_by_purls_resolves_pnpm3_legacy_registry_store_transitive() {
     let result = crawler.find_by_purls(&nm, &purls).await.unwrap();
 
     assert_eq!(
-        result.get("pkg:npm/mkdirp@0.5.5").map(|p| p.path.clone()),
+        result
+            .get("pkg:npm/mkdirp@0.5.5")
+            .map(|v| v[0].path.clone()),
         Some(nm.join("mkdirp")),
         "root-linked install must win over the store copy"
     );
@@ -2011,7 +2039,7 @@ async fn find_by_purls_resolves_pnpm3_legacy_registry_store_transitive() {
         .get("pkg:npm/minimist@1.2.8")
         .expect("transitive-only dep must resolve through the pnpm<=3 `.registry.*` store");
     assert_eq!(
-        minimist.path,
+        minimist[0].path,
         store.join("minimist/1.2.8/node_modules/minimist")
     );
     assert!(
@@ -2139,7 +2167,7 @@ async fn apply_and_rollback_reach_every_pnpm_peer_variant_copy() {
         .unwrap();
     let primary = resolved
         .get("pkg:npm/foo@1.0.0")
-        .expect("root-linked copy must resolve")
+        .expect("root-linked copy must resolve")[0]
         .path
         .clone();
     assert_eq!(primary, nm.join("foo"), "root install stays the primary");
@@ -2308,7 +2336,7 @@ async fn find_by_purls_resolves_bundled_only_target_via_fallback_pass() {
         .get("pkg:npm/leaf@2.0.0")
         .expect("bundled-only target must resolve via the unfiltered fallback pass");
     assert_eq!(
-        leaf.path,
+        leaf[0].path,
         host_nm.join("host").join("node_modules").join("leaf")
     );
 }

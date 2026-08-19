@@ -77,9 +77,9 @@ async fn npm_crawler_find_by_purls_with_empty_purls_returns_empty_map() {
         .await
         .unwrap();
     assert_eq!(hit.len(), 1, "control: matching PURL must be found");
-    let pkg = hit
+    let pkg = &hit
         .get("pkg:npm/lodash@4.17.21")
-        .expect("control: lodash key present");
+        .expect("control: lodash key present")[0];
     assert_eq!(pkg.name, "lodash");
     assert_eq!(pkg.version, "4.17.21");
     assert!(pkg.namespace.is_none());

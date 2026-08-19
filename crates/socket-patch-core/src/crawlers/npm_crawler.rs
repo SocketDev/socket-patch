@@ -469,15 +469,29 @@ impl NpmCrawler {
 
     /// Find specific packages by PURL inside a single `node_modules` tree.
     ///
-    /// This is an efficient O(n) lookup where n = number of PURLs: we parse
-    /// each PURL to derive the expected directory path, then do a direct stat
-    /// + `package.json` read.
+    /// Returns **every** physical copy of each PURL, keyed by the verbatim
+    /// input PURL. npm genuinely materializes more than one on-disk copy of
+    /// a single `name@version` — a nested duplicate (npm 2's always-nested
+    /// layout), a diamond dependency that cannot hoist past a conflicting
+    /// top slot, or a `file:` dup — and a security tool MUST patch (and
+    /// later restore) all of them: patching only one leaves a live,
+    /// vulnerable copy while reporting success (a silent partial). The
+    /// per-PURL `Vec` is ordered root-copy-first (breadth-first), so callers
+    /// that only need one representative (`vendor`, `vex`, `setup`) can take
+    /// the first and preserve the old root-preference.
+    ///
+    /// pnpm's virtual-store peer-variant copies are deliberately NOT
+    /// enumerated here for a copy already found in an importer tree (a
+    /// symlinked direct dep): those are handled by the apply engine's
+    /// [`find_pnpm_peer_variant_copies`] fan-out. A transitive-only package
+    /// that lives ONLY in the store is still resolved (its store copies are
+    /// probed because no importer-tree copy was found).
     pub async fn find_by_purls(
         &self,
         node_modules_path: &Path,
         purls: &[String],
-    ) -> Result<HashMap<String, CrawledPackage>, std::io::Error> {
-        let mut result: HashMap<String, CrawledPackage> = HashMap::new();
+    ) -> Result<HashMap<String, Vec<CrawledPackage>>, std::io::Error> {
+        let mut result: HashMap<String, Vec<CrawledPackage>> = HashMap::new();
 
         let mut pending: Vec<Target> = Vec::new();
         for purl in purls {
@@ -547,23 +561,27 @@ impl NpmCrawler {
     /// deps, and `crawl_all` (scan) already discovers them at unbounded
     /// depth.
     ///
-    /// Resolved targets land in `result`; the still-unresolved remainder
-    /// is returned. `filter_store_entries` selects whether pnpm
-    /// virtual-store entries are bounded by the pending-name filter (pass
-    /// 1) or all probed (the pass-2 fallback) — see `find_by_purls`.
+    /// EVERY matching physical copy of each target lands in `result`
+    /// (keyed by the target's verbatim PURL, root-copy-first). Targets are
+    /// kept live across the whole walk — a duplicate copy can live at any
+    /// depth — so the traversal continues past the first match rather than
+    /// stopping. Targets for which NO copy was found anywhere are returned
+    /// (the pass-2 fallback re-probes them with the unfiltered store walk).
+    /// `filter_store_entries` selects whether pnpm virtual-store entries are
+    /// bounded by the still-unmatched-name filter (pass 1) or all probed
+    /// (the pass-2 fallback) — see `find_by_purls`.
     async fn resolve_pending_targets(
         node_modules_path: &Path,
         mut pending: Vec<Target>,
-        result: &mut HashMap<String, CrawledPackage>,
+        result: &mut HashMap<String, Vec<CrawledPackage>>,
         filter_store_entries: bool,
     ) -> Vec<Target> {
+        if pending.is_empty() {
+            return pending;
+        }
         let mut queue: VecDeque<PathBuf> = VecDeque::from([node_modules_path.to_path_buf()]);
         while let Some(nm_path) = queue.pop_front() {
-            if pending.is_empty() {
-                break;
-            }
-            let mut unresolved = Vec::with_capacity(pending.len());
-            for target in pending {
+            for target in &pending {
                 let pkg_path = nm_path.join(&target.dir_key);
                 let pkg_json_path = pkg_path.join("package.json");
 
@@ -576,32 +594,40 @@ impl NpmCrawler {
                     Some((found_name, found_version))
                         if found_name == target.dir_key && found_version == target.version =>
                     {
-                        result.insert(
-                            target.purl.clone(),
-                            CrawledPackage {
-                                name: target.name,
+                        let copies = result.entry(target.purl.clone()).or_default();
+                        // Record each physical copy once — a path reached
+                        // twice (defensive against overlapping walks) is not
+                        // double-counted.
+                        if !copies.iter().any(|c| c.path == pkg_path) {
+                            copies.push(CrawledPackage {
+                                name: target.name.clone(),
                                 version: found_version,
-                                namespace: target.namespace,
-                                purl: target.purl,
+                                namespace: target.namespace.clone(),
+                                purl: target.purl.clone(),
                                 path: pkg_path,
-                            },
-                        );
+                            });
+                        }
                     }
-                    _ => unresolved.push(target),
+                    _ => {}
                 }
             }
-            pending = unresolved;
-            if !pending.is_empty() {
-                // The still-unresolved names bound which `.pnpm` store
-                // entries are worth enqueuing (see the store branch of
-                // `collect_nested_node_modules`). Rebuilt per level:
-                // targets resolved at shallower depths drop out.
-                let pending_names: HashSet<&str> =
-                    pending.iter().map(|t| t.dir_key.as_str()).collect();
-                let filter = filter_store_entries.then_some(&pending_names);
-                Self::collect_nested_node_modules(&nm_path, filter, &mut queue).await;
-            }
+            // Descend importer-tree nested `node_modules` for ALL targets
+            // (a duplicate copy lives at an unknown depth), but probe the
+            // pnpm virtual store only for targets NOT YET found anywhere: a
+            // matched direct dep's store peer-variants are the apply
+            // engine's fan-out job, and re-probing the store for it would
+            // add a readdir storm. A target with no importer-tree copy
+            // (transitive-only) still gets its store entries probed.
+            let unmatched_names: HashSet<&str> = pending
+                .iter()
+                .filter(|t| !result.contains_key(&t.purl))
+                .map(|t| t.dir_key.as_str())
+                .collect();
+            let filter = filter_store_entries.then_some(&unmatched_names);
+            Self::collect_nested_node_modules(&nm_path, filter, &mut queue).await;
         }
+        // Only the targets with zero copies remain "pending" for pass 2.
+        pending.retain(|t| !result.contains_key(&t.purl));
         pending
     }
 
@@ -1743,9 +1769,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.len(), 1, "encoded scope must resolve: {result:?}");
-        let pkg = result
+        let pkg = &result
             .get(&encoded)
-            .expect("result keyed by the verbatim encoded input purl");
+            .expect("result keyed by the verbatim encoded input purl")[0];
         assert_eq!(pkg.path, sdk_dir);
         assert_eq!(pkg.name, "sdk");
         assert_eq!(pkg.namespace.as_deref(), Some("@modelcontextprotocol"));
@@ -1825,14 +1851,14 @@ mod tests {
 
         assert_eq!(result.len(), 2);
         // Keyed by the verbatim qualified input, and the stored PURL matches.
-        let foo = result
+        let foo = &result
             .get(&unscoped_q)
-            .expect("qualified unscoped resolved");
+            .expect("qualified unscoped resolved")[0];
         assert_eq!(foo.purl, unscoped_q);
         assert_eq!(foo.name, "foo");
         assert_eq!(foo.version, "1.0.0");
 
-        let node = result.get(&scoped_q).expect("qualified scoped resolved");
+        let node = &result.get(&scoped_q).expect("qualified scoped resolved")[0];
         assert_eq!(node.purl, scoped_q);
         assert_eq!(node.namespace.as_deref(), Some("@types"));
         assert_eq!(node.name, "node");
@@ -1863,8 +1889,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.len(), 2);
-        assert_eq!(result.get(&q1).unwrap().path, foo_dir);
-        assert_eq!(result.get(&q2).unwrap().path, foo_dir);
+        assert_eq!(result.get(&q1).unwrap()[0].path, foo_dir);
+        assert_eq!(result.get(&q2).unwrap()[0].path, foo_dir);
     }
 
     /// SECURITY regression: a tampered manifest PURL whose *name* carries a
@@ -2108,5 +2134,87 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert!(result.contains_key("pkg:npm/foo@1.0.0"));
         assert!(!result.contains_key("pkg:npm/foo@9.9.9"));
+    }
+
+    /// Multi-copy P0: two REAL on-disk copies of the SAME `name@version`
+    /// (a root/hoisted copy and a nested duplicate) must BOTH be returned
+    /// under the one PURL, root-copy-first. Returning only the root copy is
+    /// the silent partial that leaves a live vulnerable copy on disk.
+    #[tokio::test]
+    async fn test_find_by_purls_returns_every_copy_root_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let nm = dir.path().join("node_modules");
+
+        // Root/hoisted copy.
+        let root_copy = nm.join("dup");
+        tokio::fs::create_dir_all(&root_copy).await.unwrap();
+        tokio::fs::write(
+            root_copy.join("package.json"),
+            r#"{"name": "dup", "version": "1.0.0"}"#,
+        )
+        .await
+        .unwrap();
+
+        // Nested duplicate under another package (npm's conflict-nesting).
+        let nested_copy = nm.join("parent").join("node_modules").join("dup");
+        tokio::fs::create_dir_all(&nested_copy).await.unwrap();
+        tokio::fs::write(
+            nested_copy.join("package.json"),
+            r#"{"name": "dup", "version": "1.0.0"}"#,
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            nm.join("parent").join("package.json"),
+            r#"{"name": "parent", "version": "1.0.0"}"#,
+        )
+        .await
+        .unwrap();
+
+        let crawler = NpmCrawler::new();
+        let purl = "pkg:npm/dup@1.0.0".to_string();
+        let result = crawler
+            .find_by_purls(&nm, std::slice::from_ref(&purl))
+            .await
+            .unwrap();
+
+        let copies = result.get(&purl).expect("dup must resolve");
+        assert_eq!(
+            copies.len(),
+            2,
+            "both physical copies must be returned; got {copies:?}"
+        );
+        // Root-copy-first ordering (breadth-first): callers needing one
+        // representative take [0] and keep the old root-preference.
+        assert_eq!(copies[0].path, root_copy, "root copy must be first");
+        let paths: HashSet<&Path> = copies.iter().map(|c| c.path.as_path()).collect();
+        assert!(paths.contains(root_copy.as_path()));
+        assert!(paths.contains(nested_copy.as_path()));
+    }
+
+    /// A single (non-duplicated) install resolves to a one-element Vec — the
+    /// common case must not regress into a spurious duplicate.
+    #[tokio::test]
+    async fn test_find_by_purls_single_copy_is_one_element() {
+        let dir = tempfile::tempdir().unwrap();
+        let nm = dir.path().join("node_modules");
+        let foo = nm.join("solo");
+        tokio::fs::create_dir_all(&foo).await.unwrap();
+        tokio::fs::write(
+            foo.join("package.json"),
+            r#"{"name": "solo", "version": "2.0.0"}"#,
+        )
+        .await
+        .unwrap();
+
+        let crawler = NpmCrawler::new();
+        let purl = "pkg:npm/solo@2.0.0".to_string();
+        let result = crawler
+            .find_by_purls(&nm, std::slice::from_ref(&purl))
+            .await
+            .unwrap();
+        let copies = result.get(&purl).expect("solo must resolve");
+        assert_eq!(copies.len(), 1, "single install must be one copy");
+        assert_eq!(copies[0].path, foo);
     }
 }

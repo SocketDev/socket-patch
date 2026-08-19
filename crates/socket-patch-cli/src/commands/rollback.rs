@@ -1,7 +1,7 @@
 use clap::Args;
 use socket_patch_core::api::blob_fetcher::{fetch_blobs_by_hash, format_fetch_result};
 use socket_patch_core::api::client::{get_api_client_with_overrides, ApiClient};
-use socket_patch_core::crawlers::CrawlerOptions;
+use socket_patch_core::crawlers::{CrawlerOptions, Ecosystem};
 use socket_patch_core::manifest::operations::{get_before_hash_blobs, read_manifest};
 use socket_patch_core::manifest::schema::{PatchFileInfo, PatchManifest, PatchRecord};
 use socket_patch_core::patch::apply::select_installed_variants;
@@ -19,7 +19,7 @@ use crate::args::{apply_env_toggles, parse_bool_flag, GlobalArgs};
 use crate::commands::apply::is_local_go;
 use crate::commands::lock_cli::acquire_or_emit;
 use crate::commands::remove::patch_matches;
-use crate::ecosystem_dispatch::{find_packages_for_rollback, partition_purls};
+use crate::ecosystem_dispatch::{find_all_packages_for_rollback, partition_purls};
 use crate::json_envelope::Command as EnvelopeCommand;
 
 #[derive(Args)]
@@ -730,12 +730,25 @@ async fn rollback_patches_inner(
         global_prefix: args.common.global_prefix.clone(),
     };
 
-    let all_packages = find_packages_for_rollback(
+    // Multi-copy aware: npm nests genuine duplicates of one `name@version`,
+    // so the resolver returns EVERY physical copy per PURL. Restoring only
+    // one would leave the other copy still patched (silently divergent from
+    // the manifest's rolled-back state). The rollback loop below restores
+    // every copy.
+    let all_packages_multi = find_all_packages_for_rollback(
         &partitioned,
         &crawler_options,
         args.common.silent || args.common.json,
     )
     .await;
+
+    // One representative path per PURL for the "is it installed" checks and
+    // the before-blob gate (the gate's fetch decision is per-hash, identical
+    // across copies). The per-copy restore uses `all_packages_multi`.
+    let all_packages: HashMap<String, PathBuf> = all_packages_multi
+        .iter()
+        .filter_map(|(purl, paths)| paths.first().map(|p| (purl.clone(), p.clone())))
+        .collect();
 
     // Local-redirect rollback (local-mode go) drops a project-local redirect
     // and reads nothing out of the ecosystem's package store, so — unlike an
@@ -764,17 +777,33 @@ async fn rollback_patches_inner(
     // mirroring apply — we collapse each group to the variant(s) whose
     // hashes actually match the installed bytes. PyPI/RubyGems yield one
     // such variant; Maven's coexisting classifier jars may yield several.
+    //
+    // Non-variant ecosystems (npm/cargo/go/…) have no qualifiers, but npm
+    // does have genuine MULTIPLE physical copies of one `name@version`
+    // (nested dupes, diamonds, `file:` dups). Those must NOT be collapsed
+    // into a release-variant group — each copy is restored independently —
+    // so they are pushed straight to `rollback_targets`. Only the
+    // release-variant ecosystems (whose multiple qualified PURLs share ONE
+    // install dir) go through the group + narrow path.
+    let mut rollback_targets: Vec<(&String, &PathBuf)> = Vec::new();
     let mut groups: HashMap<String, Vec<(&String, &PathBuf)>> = HashMap::new();
-    for (purl, pkg_path) in &all_packages {
-        groups
-            .entry(strip_purl_qualifiers(purl).to_string())
-            .or_default()
-            .push((purl, pkg_path));
+    for (purl, pkg_paths) in &all_packages_multi {
+        if Ecosystem::from_purl(purl).is_some_and(|e| e.supports_release_variants()) {
+            for pkg_path in pkg_paths {
+                groups
+                    .entry(strip_purl_qualifiers(purl).to_string())
+                    .or_default()
+                    .push((purl, pkg_path));
+            }
+        } else {
+            for pkg_path in pkg_paths {
+                rollback_targets.push((purl, pkg_path));
+            }
+        }
     }
 
     // Resolve which variant(s) each base PURL will actually roll back,
     // BEFORE the before-blob gate below, so the gate covers only them.
-    let mut rollback_targets: Vec<(&String, &PathBuf)> = Vec::new();
     for (_base, entries) in groups {
         let to_rollback: Vec<(&String, &PathBuf)> = if entries.len() == 1 {
             entries

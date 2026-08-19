@@ -109,17 +109,64 @@ macro_rules! scan_ecosystem {
 
 /// Signature shared by `merge_first_wins` and `merge_qualified`.
 /// `dispatch_find` swaps between them so the rollback path can fan one
-/// crawler result back out to every caller-supplied qualified PURL.
-type MergeFn = fn(&mut HashMap<String, PathBuf>, &[String], HashMap<String, CrawledPackage>);
+/// crawler result back out to every caller-supplied qualified PURL. The
+/// output map holds a `Vec` of paths per PURL: most ecosystems install one
+/// physical copy of a `name@version`, but npm genuinely nests duplicates
+/// (see `merge_npm_copies`), so the type itself must be able to carry more
+/// than one.
+type MergeFn = fn(&mut HashMap<String, Vec<PathBuf>>, &[String], HashMap<String, CrawledPackage>);
 
-/// Default merge: insert the crawler-returned PURL → first wins.
+/// Push `path` under `purl` unless that exact path is already recorded —
+/// keeps discovery order (root/first-found first) while deduping a path
+/// reached twice across the macro's per-source-path calls.
+fn push_path(out: &mut HashMap<String, Vec<PathBuf>>, purl: String, path: PathBuf) {
+    let paths = out.entry(purl).or_default();
+    if !paths.contains(&path) {
+        paths.push(path);
+    }
+}
+
+/// Default merge for the single-copy ecosystems (cargo / go / composer /
+/// nuget / deno): keep the FIRST path discovered per PURL, matching the
+/// historical `HashMap<String, PathBuf>` first-wins contract exactly. These
+/// ecosystems resolve one logical install per `name@version`, but the same
+/// install is legitimately reachable from several source roots (e.g. NuGet's
+/// global cache *and* a project-local packages folder). Patching each root
+/// would re-apply to what is effectively the same package — a scope-expanding
+/// behavior change that is out of scope for the npm multi-copy fix and would,
+/// for a shared global cache, mutate state other projects rely on. Fanning out
+/// to genuinely-distinct installs is npm-only (`merge_npm_copies`); if a
+/// per-root fan-out is ever wanted for these ecosystems it must be an explicit,
+/// separately-tested decision.
 fn merge_first_wins(
-    out: &mut HashMap<String, PathBuf>,
+    out: &mut HashMap<String, Vec<PathBuf>>,
     _purls: &[String],
     packages: HashMap<String, CrawledPackage>,
 ) {
     for (purl, pkg) in packages {
-        out.entry(purl).or_insert(pkg.path);
+        // First source root to resolve this PURL wins; later roots that
+        // resolve the same PURL are ignored (true first-wins).
+        let paths = out.entry(purl).or_default();
+        if paths.is_empty() {
+            paths.push(pkg.path);
+        }
+    }
+}
+
+/// npm merge: the npm crawler returns EVERY physical copy of each PURL
+/// (nested duplicates, diamonds, `file:` dups), so fold every path in.
+/// This is the type shape that carries the second copy the old
+/// `HashMap<String, PathBuf>` could not — the fix for the multi-copy silent
+/// partial P0.
+fn merge_npm_copies(
+    out: &mut HashMap<String, Vec<PathBuf>>,
+    _purls: &[String],
+    packages: HashMap<String, Vec<CrawledPackage>>,
+) {
+    for (purl, pkgs) in packages {
+        for pkg in pkgs {
+            push_path(out, purl.clone(), pkg.path);
+        }
     }
 }
 
@@ -130,14 +177,14 @@ fn merge_first_wins(
 /// installed package directory is mapped to every manifest variant for
 /// later hash-based selection.
 fn merge_qualified(
-    out: &mut HashMap<String, PathBuf>,
+    out: &mut HashMap<String, Vec<PathBuf>>,
     purls: &[String],
     packages: HashMap<String, CrawledPackage>,
 ) {
     for (base_purl, pkg) in packages {
         for qualified in purls {
-            if strip_purl_qualifiers(qualified) == base_purl && !out.contains_key(qualified) {
-                out.insert(qualified.clone(), pkg.path.clone());
+            if strip_purl_qualifiers(qualified) == base_purl {
+                push_path(out, qualified.clone(), pkg.path.clone());
             }
         }
     }
@@ -172,8 +219,8 @@ async fn dispatch_find(
     options: &CrawlerOptions,
     silent: bool,
     variant_merge: MergeFn,
-) -> HashMap<String, PathBuf> {
-    let mut out: HashMap<String, PathBuf> = HashMap::new();
+) -> HashMap<String, Vec<PathBuf>> {
+    let mut out: HashMap<String, Vec<PathBuf>> = HashMap::new();
 
     scan_ecosystem!(
         out = out,
@@ -186,7 +233,9 @@ async fn dispatch_find(
         using_label = "global npm packages",
         err_label = "npm packages",
         purls_override = passthrough_purls,
-        on_match = merge_first_wins,
+        // npm's crawler returns EVERY physical copy per PURL; fold them all
+        // in (multi-copy silent-partial fix) rather than first-wins.
+        on_match = merge_npm_copies,
     );
 
     scan_ecosystem!(
@@ -311,27 +360,63 @@ async fn dispatch_find(
     out
 }
 
+/// Collapse a multi-copy map to one representative path per PURL (the
+/// first-discovered — root-copy-first for npm). Consumers that only need
+/// "is it installed / where is a representative copy" (`vendor`, `vex`,
+/// `setup`, `get`, `repair vendor`) use the collapsing wrappers below and
+/// keep the old `HashMap<String, PathBuf>` contract unchanged. `apply` and
+/// `rollback` — which must touch EVERY copy — use the `_all` variants.
+fn collapse_to_first(multi: HashMap<String, Vec<PathBuf>>) -> HashMap<String, PathBuf> {
+    multi
+        .into_iter()
+        .filter_map(|(purl, paths)| paths.into_iter().next().map(|p| (purl, p)))
+        .collect()
+}
+
+/// For each ecosystem in the partitioned map, create the crawler, discover
+/// source paths, and look up the given PURLs. Returns a unified `purl ->
+/// [paths]` map carrying EVERY physical copy (npm nests duplicates). Used
+/// by `apply`, which patches all copies.
+pub async fn find_all_packages_for_purls(
+    partitioned: &HashMap<Ecosystem, Vec<String>>,
+    options: &CrawlerOptions,
+    silent: bool,
+) -> HashMap<String, Vec<PathBuf>> {
+    dispatch_find(partitioned, options, silent, merge_first_wins).await
+}
+
+/// Multi-copy variant of `find_packages_for_rollback` (qualified-aware
+/// merge). Used by `rollback`, which restores every physical copy.
+pub async fn find_all_packages_for_rollback(
+    partitioned: &HashMap<Ecosystem, Vec<String>>,
+    options: &CrawlerOptions,
+    silent: bool,
+) -> HashMap<String, Vec<PathBuf>> {
+    dispatch_find(partitioned, options, silent, merge_qualified).await
+}
+
 /// For each ecosystem in the partitioned map, create the crawler, discover
 /// source paths, and look up the given PURLs. Returns a unified
-/// `purl -> path` map.
+/// `purl -> path` map (one representative copy per PURL).
 pub async fn find_packages_for_purls(
     partitioned: &HashMap<Ecosystem, Vec<String>>,
     options: &CrawlerOptions,
     silent: bool,
 ) -> HashMap<String, PathBuf> {
-    dispatch_find(partitioned, options, silent, merge_first_wins).await
+    collapse_to_first(find_all_packages_for_purls(partitioned, options, silent).await)
 }
 
 /// Variant of `find_packages_for_purls` for rollback and narrow-release
 /// resolution, which needs to remap qualified PURLs (PyPI
 /// `?artifact_id=`, RubyGems `?platform=`, Maven `?classifier=&ext=`) to
-/// the base PURL found by the crawler.
+/// the base PURL found by the crawler. Returns one representative copy per
+/// PURL.
 pub async fn find_packages_for_rollback(
     partitioned: &HashMap<Ecosystem, Vec<String>>,
     options: &CrawlerOptions,
     silent: bool,
 ) -> HashMap<String, PathBuf> {
-    dispatch_find(partitioned, options, silent, merge_qualified).await
+    collapse_to_first(find_all_packages_for_rollback(partitioned, options, silent).await)
 }
 
 /// Resolve manifest PURLs to their installed on-disk paths (partition,
@@ -415,36 +500,92 @@ mod tests {
 
     #[test]
     fn merge_first_wins_inserts_crawler_keyed_purls() {
-        let mut out: HashMap<String, PathBuf> = HashMap::new();
+        let mut out: HashMap<String, Vec<PathBuf>> = HashMap::new();
         merge_first_wins(
             &mut out,
             &[],
             packages(&[("pkg:npm/foo@1.0", "/a"), ("pkg:npm/bar@2.0", "/b")]),
         );
         assert_eq!(out.len(), 2);
-        assert_eq!(out.get("pkg:npm/foo@1.0"), Some(&PathBuf::from("/a")));
-        assert_eq!(out.get("pkg:npm/bar@2.0"), Some(&PathBuf::from("/b")));
+        assert_eq!(out.get("pkg:npm/foo@1.0"), Some(&vec![PathBuf::from("/a")]));
+        assert_eq!(out.get("pkg:npm/bar@2.0"), Some(&vec![PathBuf::from("/b")]));
     }
 
     #[test]
-    fn merge_first_wins_keeps_first_path_across_calls() {
-        // Simulates the macro calling on_match once per discovered path:
-        // the first path that yields a given PURL wins.
-        let mut out: HashMap<String, PathBuf> = HashMap::new();
-        merge_first_wins(&mut out, &[], packages(&[("pkg:npm/foo@1.0", "/first")]));
-        merge_first_wins(&mut out, &[], packages(&[("pkg:npm/foo@1.0", "/second")]));
-        assert_eq!(out.get("pkg:npm/foo@1.0"), Some(&PathBuf::from("/first")));
+    fn merge_first_wins_keeps_first_path_across_source_roots() {
+        // The macro calls on_match once per discovered source path. A
+        // single-copy ecosystem that resolves the same PURL from two source
+        // roots (e.g. NuGet's global cache + a project-local packages folder)
+        // keeps ONLY the first — matching the historical first-wins contract.
+        // Fanning out to every root re-patches what is effectively one install
+        // (the docker_e2e_nuget `already_patched` regression); genuine
+        // multi-copy fan-out is npm-only via `merge_npm_copies`.
+        let mut out: HashMap<String, Vec<PathBuf>> = HashMap::new();
+        merge_first_wins(&mut out, &[], packages(&[("pkg:cargo/foo@1.0", "/first")]));
+        merge_first_wins(&mut out, &[], packages(&[("pkg:cargo/foo@1.0", "/second")]));
+        assert_eq!(
+            out.get("pkg:cargo/foo@1.0"),
+            Some(&vec![PathBuf::from("/first")])
+        );
+    }
+
+    #[test]
+    fn merge_first_wins_dedups_identical_path() {
+        // The same physical path re-observed across calls is recorded once.
+        let mut out: HashMap<String, Vec<PathBuf>> = HashMap::new();
+        merge_first_wins(&mut out, &[], packages(&[("pkg:cargo/foo@1.0", "/same")]));
+        merge_first_wins(&mut out, &[], packages(&[("pkg:cargo/foo@1.0", "/same")]));
+        assert_eq!(out.get("pkg:cargo/foo@1.0"), Some(&vec![PathBuf::from("/same")]));
+    }
+
+    #[test]
+    fn merge_first_wins_keeps_only_first_of_two_distinct_paths() {
+        // A single-copy ecosystem (e.g. NuGet) reaches the same logical
+        // install from two source roots — global cache + project-local. Only
+        // the first is kept, so apply does not double-patch (the regression
+        // that broke docker_e2e_nuget with a spurious `already_patched` skip).
+        let mut out: HashMap<String, Vec<PathBuf>> = HashMap::new();
+        merge_first_wins(&mut out, &[], packages(&[("pkg:nuget/foo@1.0", "/global/foo")]));
+        merge_first_wins(&mut out, &[], packages(&[("pkg:nuget/foo@1.0", "/local/foo")]));
+        assert_eq!(out.get("pkg:nuget/foo@1.0"), Some(&vec![PathBuf::from("/global/foo")]));
     }
 
     #[test]
     fn merge_first_wins_ignores_purls_arg() {
         // The `purls` slice must not influence first-wins merging — only
         // the crawler-returned keys matter.
-        let mut out: HashMap<String, PathBuf> = HashMap::new();
+        let mut out: HashMap<String, Vec<PathBuf>> = HashMap::new();
         let unrelated = vec!["pkg:npm/unrelated@9.9".to_string()];
         merge_first_wins(&mut out, &unrelated, packages(&[("pkg:npm/foo@1.0", "/a")]));
         assert_eq!(out.len(), 1);
         assert!(out.contains_key("pkg:npm/foo@1.0"));
+    }
+
+    // ---- merge_npm_copies -------------------------------------------------
+
+    #[test]
+    fn merge_npm_copies_carries_every_copy_per_purl() {
+        // The npm crawler returns EVERY physical copy of a PURL; the merge
+        // must carry them all (root-first ordering preserved) so apply
+        // patches each — the multi-copy silent-partial fix.
+        let mut out: HashMap<String, Vec<PathBuf>> = HashMap::new();
+        let mut packages: HashMap<String, Vec<CrawledPackage>> = HashMap::new();
+        packages.insert(
+            "pkg:npm/dup@1.0.0".to_string(),
+            vec![
+                pkg("pkg:npm/dup@1.0.0", "/nm/dup"),
+                pkg("pkg:npm/dup@1.0.0", "/nm/parent/node_modules/dup"),
+            ],
+        );
+        merge_npm_copies(&mut out, &[], packages);
+        assert_eq!(
+            out.get("pkg:npm/dup@1.0.0"),
+            Some(&vec![
+                PathBuf::from("/nm/dup"),
+                PathBuf::from("/nm/parent/node_modules/dup"),
+            ]),
+            "both physical copies must be carried, root-first"
+        );
     }
 
     // ---- merge_qualified --------------------------------------------------
@@ -454,7 +595,7 @@ mod tests {
         // Crawler is queried with the base PURL and returns it keyed to a
         // single install dir; every caller-supplied qualified variant that
         // strips to that base must map to the same path.
-        let mut out: HashMap<String, PathBuf> = HashMap::new();
+        let mut out: HashMap<String, Vec<PathBuf>> = HashMap::new();
         let qualified = vec![
             "pkg:pypi/requests@2.28.0?artifact_id=wheel".to_string(),
             "pkg:pypi/requests@2.28.0?artifact_id=sdist".to_string(),
@@ -467,11 +608,11 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert_eq!(
             out.get("pkg:pypi/requests@2.28.0?artifact_id=wheel"),
-            Some(&PathBuf::from("/site-packages"))
+            Some(&vec![PathBuf::from("/site-packages")])
         );
         assert_eq!(
             out.get("pkg:pypi/requests@2.28.0?artifact_id=sdist"),
-            Some(&PathBuf::from("/site-packages"))
+            Some(&vec![PathBuf::from("/site-packages")])
         );
     }
 
@@ -479,7 +620,7 @@ mod tests {
     fn merge_qualified_matches_bare_base_identifier() {
         // A caller may supply the bare base PURL (no `?`); it strips to
         // itself and must still map to the crawler result.
-        let mut out: HashMap<String, PathBuf> = HashMap::new();
+        let mut out: HashMap<String, Vec<PathBuf>> = HashMap::new();
         let purls = vec!["pkg:pypi/requests@2.28.0".to_string()];
         merge_qualified(
             &mut out,
@@ -488,7 +629,7 @@ mod tests {
         );
         assert_eq!(
             out.get("pkg:pypi/requests@2.28.0"),
-            Some(&PathBuf::from("/sp"))
+            Some(&vec![PathBuf::from("/sp")])
         );
     }
 
@@ -496,7 +637,7 @@ mod tests {
     fn merge_qualified_does_not_cross_versions() {
         // A variant of a *different* version must not be mapped to the
         // crawler result for 2.28.0.
-        let mut out: HashMap<String, PathBuf> = HashMap::new();
+        let mut out: HashMap<String, Vec<PathBuf>> = HashMap::new();
         let purls = vec!["pkg:pypi/requests@2.29.0?artifact_id=wheel".to_string()];
         merge_qualified(
             &mut out,
@@ -513,7 +654,7 @@ mod tests {
         // with no qualified caller variant that strips to it must be
         // dropped, never inserted under its bare base key. Guards against
         // a regression that leaks the raw crawler key into the output.
-        let mut out: HashMap<String, PathBuf> = HashMap::new();
+        let mut out: HashMap<String, Vec<PathBuf>> = HashMap::new();
         let purls = vec!["pkg:pypi/flask@3.0.0?artifact_id=wheel".to_string()];
         merge_qualified(
             &mut out,
@@ -528,7 +669,7 @@ mod tests {
     fn merge_qualified_isolates_distinct_bases_in_one_call() {
         // Two unrelated installed packages returned together must each map
         // only to their own qualified variant — no cross-base bleed.
-        let mut out: HashMap<String, PathBuf> = HashMap::new();
+        let mut out: HashMap<String, Vec<PathBuf>> = HashMap::new();
         let purls = vec![
             "pkg:pypi/requests@2.28.0?artifact_id=wheel".to_string(),
             "pkg:pypi/flask@3.0.0?artifact_id=sdist".to_string(),
@@ -544,19 +685,21 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert_eq!(
             out.get("pkg:pypi/requests@2.28.0?artifact_id=wheel"),
-            Some(&PathBuf::from("/req"))
+            Some(&vec![PathBuf::from("/req")])
         );
         assert_eq!(
             out.get("pkg:pypi/flask@3.0.0?artifact_id=sdist"),
-            Some(&PathBuf::from("/flask"))
+            Some(&vec![PathBuf::from("/flask")])
         );
     }
 
     #[test]
     fn merge_qualified_keeps_first_path_per_qualified_key() {
-        // First discovered path wins for a given qualified key, mirroring
-        // the per-path iteration in the scan macro.
-        let mut out: HashMap<String, PathBuf> = HashMap::new();
+        // First discovered path leads for a given qualified key, mirroring
+        // the per-path iteration in the scan macro. A distinct second path
+        // accumulates after it (release-variant ecosystems install one dir,
+        // so in practice the second is the same path and dedups away).
+        let mut out: HashMap<String, Vec<PathBuf>> = HashMap::new();
         let purls = vec!["pkg:gem/nokogiri@1.16.5?platform=arm64-darwin".to_string()];
         merge_qualified(
             &mut out,
@@ -568,10 +711,10 @@ mod tests {
             &purls,
             packages(&[("pkg:gem/nokogiri@1.16.5", "/second")]),
         );
-        assert_eq!(
-            out.get("pkg:gem/nokogiri@1.16.5?platform=arm64-darwin"),
-            Some(&PathBuf::from("/first"))
-        );
+        let paths = out
+            .get("pkg:gem/nokogiri@1.16.5?platform=arm64-darwin")
+            .expect("qualified key present");
+        assert_eq!(paths.first(), Some(&PathBuf::from("/first")));
     }
 
     // ---- purls_override helpers ------------------------------------------
@@ -609,14 +752,14 @@ mod tests {
     fn merge_first_wins_accumulates_distinct_keys_across_calls() {
         // The shared `out` map is fed once per discovered path and once per
         // ecosystem; distinct keys from separate calls must all survive.
-        let mut out: HashMap<String, PathBuf> = HashMap::new();
+        let mut out: HashMap<String, Vec<PathBuf>> = HashMap::new();
         merge_first_wins(&mut out, &[], packages(&[("pkg:npm/foo@1.0", "/a")]));
         merge_first_wins(&mut out, &[], packages(&[("pkg:cargo/bar@2.0", "/b")]));
         merge_first_wins(&mut out, &[], packages(&[("pkg:gem/baz@3.0", "/c")]));
         assert_eq!(out.len(), 3);
-        assert_eq!(out.get("pkg:npm/foo@1.0"), Some(&PathBuf::from("/a")));
-        assert_eq!(out.get("pkg:cargo/bar@2.0"), Some(&PathBuf::from("/b")));
-        assert_eq!(out.get("pkg:gem/baz@3.0"), Some(&PathBuf::from("/c")));
+        assert_eq!(out.get("pkg:npm/foo@1.0"), Some(&vec![PathBuf::from("/a")]));
+        assert_eq!(out.get("pkg:cargo/bar@2.0"), Some(&vec![PathBuf::from("/b")]));
+        assert_eq!(out.get("pkg:gem/baz@3.0"), Some(&vec![PathBuf::from("/c")]));
     }
 
     #[test]
@@ -821,6 +964,50 @@ mod tests {
         // The unified map must key the result by the exact PURL handed in
         // (npm = passthrough + first-wins) and point at the install dir.
         assert_eq!(out.get("pkg:npm/foo@1.0.0"), Some(&pkg_dir));
+    }
+
+    /// Multi-copy P0 at the dispatch layer: `find_all_packages_for_purls`
+    /// must carry EVERY physical copy of a duplicated npm PURL (a root copy
+    /// plus a nested duplicate), root-copy-first — the second path the old
+    /// `HashMap<String, PathBuf>` return type could not hold. `apply`
+    /// iterates this to patch both copies.
+    #[tokio::test]
+    async fn find_all_packages_for_purls_carries_every_duplicate_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root_copy = write_npm_package(tmp.path(), "dup", "1.0.0");
+        // A genuine second physical copy nested under `parent`.
+        let parent_nm = tmp.path().join("node_modules").join("parent");
+        write_npm_package(&parent_nm, "dup", "1.0.0");
+        let nested_copy = parent_nm.join("node_modules").join("dup");
+        // `parent`'s own package.json so the nested node_modules has an owner.
+        std::fs::write(
+            parent_nm.join("package.json"),
+            r#"{"name":"parent","version":"1.0.0"}"#,
+        )
+        .unwrap();
+
+        let partitioned = partition_purls(&["pkg:npm/dup@1.0.0".to_string()], None);
+        let out = find_all_packages_for_purls(
+            &partitioned,
+            &local_options(tmp.path().to_path_buf()),
+            true,
+        )
+        .await;
+
+        let copies = out.get("pkg:npm/dup@1.0.0").expect("dup resolves");
+        assert_eq!(copies.len(), 2, "both copies must be carried; got {copies:?}");
+        assert_eq!(copies[0], root_copy, "root copy first");
+        assert!(copies.contains(&nested_copy), "nested copy must be present");
+
+        // The collapsing wrapper (used by vendor/vex/setup/get) keeps the
+        // old one-path contract: exactly the root-preferred representative.
+        let single = find_packages_for_purls(
+            &partitioned,
+            &local_options(tmp.path().to_path_buf()),
+            true,
+        )
+        .await;
+        assert_eq!(single.get("pkg:npm/dup@1.0.0"), Some(&root_copy));
     }
 
     #[tokio::test]
