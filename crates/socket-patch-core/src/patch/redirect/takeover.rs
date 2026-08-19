@@ -1,15 +1,28 @@
-//! Cross-mode takeover: per-purl revert of a HOSTED cargo redirect, driven by
-//! the redirect ledger's recorded [`FileEdit`]s.
+//! Cross-mode takeover: per-purl revert of a HOSTED redirect, driven by the
+//! redirect ledger's recorded [`FileEdit`]s.
 //!
 //! The vendored flows (`vendor`, `scan --mode vendored`) call this BEFORE
 //! vendoring a package the hosted redirect ledger still claims, so a
-//! hosted→vendored migration leaves the project FULLY in vendored mode:
-//! Cargo.toml loses its `registry = "socket-patch-…"` pin, Cargo.lock gets its
-//! original crates.io `source`/`checksum` back (so the subsequent vendor
-//! detach records the PRISTINE originals in the vendor ledger, not the hosted
-//! values), and the now-unused `[registries.socket-patch-…]` block is dropped.
-//! Without this, `[patch.crates-io]` cannot even apply (it only patches
-//! crates-io-sourced deps) and the project is unbuildable in both modes.
+//! hosted→vendored migration leaves the project FULLY in vendored mode.
+//!
+//! Cargo: Cargo.toml loses its `registry = "socket-patch-…"` pin, Cargo.lock
+//! gets its original crates.io `source`/`checksum` back (so the subsequent
+//! vendor detach records the PRISTINE originals in the vendor ledger, not the
+//! hosted values), and the now-unused `[registries.socket-patch-…]` block is
+//! dropped. Without this, `[patch.crates-io]` cannot even apply (it only
+//! patches crates-io-sourced deps) and the project is unbuildable in both
+//! modes.
+//!
+//! npm family (package-lock/npm-shrinkwrap, yarn classic, yarn berry, pnpm):
+//! each recorded lock edit's `original` fragment is replayed over its `new`
+//! fragment. Here the follow-up vendor rewire happens to succeed either way
+//! (the vendored wiring replaces whatever resolution is present), but
+//! WITHOUT the pre-revert the vendor ledger records the grant-tokenized
+//! hosted fragment as its unrecoverable pre-vendor "original" (so `vendor
+//! --revert` restores an expiring hosted URL with no CLI path back to
+//! registry state), and the superseded redirect records/edits survive
+//! forever — a stale ledger that VEX/audits keep reading and a replay hazard
+//! for any later redirect revert.
 //!
 //! FAIL CLOSED: a file that matches neither the recorded redirected fragment
 //! nor the recorded original has drifted — the revert refuses (`Err`) rather
@@ -32,11 +45,41 @@ use crate::utils::purl::{normalize_purl, parse_cargo_purl, strip_purl_qualifiers
 use super::state::RedirectState;
 use super::FileEdit;
 
-/// What [`revert_cargo_redirect_purl`] rewrote.
+/// What a redirect revert rewrote.
 #[derive(Debug, Default)]
-pub struct CargoRedirectRevert {
+pub struct RedirectRevert {
     /// Repo-relative files this revert actually rewrote or removed.
     pub reverted_files: Vec<String>,
+}
+
+/// Pre-rename alias (the struct was cargo-only before the npm-family port).
+pub type CargoRedirectRevert = RedirectRevert;
+
+/// Does [`revert_redirect_purl`] have an implementation for this purl's
+/// ecosystem? Callers (the vendor dispatch loop's cross-mode takeover gate)
+/// must consult this instead of hardcoding `pkg:cargo/`.
+pub fn redirect_revert_supported(purl: &str) -> bool {
+    purl.starts_with("pkg:cargo/") || purl.starts_with("pkg:npm/")
+}
+
+/// Revert every hosted-redirect edit the ledger records for `purl`, then
+/// drop that purl's record and edits from `state`. The caller persists the
+/// mutated ledger (see `persist_redirect_state`). Dispatches per ecosystem;
+/// purls outside [`redirect_revert_supported`] are refused (fail closed).
+pub async fn revert_redirect_purl(
+    project_root: &Path,
+    state: &mut RedirectState,
+    purl: &str,
+) -> Result<RedirectRevert, String> {
+    if purl.starts_with("pkg:cargo/") {
+        revert_cargo_redirect_purl(project_root, state, purl).await
+    } else if purl.starts_with("pkg:npm/") {
+        revert_npm_redirect_purl(project_root, state, purl).await
+    } else {
+        Err(format!(
+            "no hosted-redirect revert implementation for {purl}"
+        ))
+    }
 }
 
 /// Read a project file, distinguishing missing (`Ok(None)`) from unreadable.
@@ -111,7 +154,7 @@ pub async fn revert_cargo_redirect_purl(
     project_root: &Path,
     state: &mut RedirectState,
     purl: &str,
-) -> Result<CargoRedirectRevert, String> {
+) -> Result<RedirectRevert, String> {
     let canon = |p: &str| normalize_purl(strip_purl_qualifiers(p)).into_owned();
     let target = canon(purl);
     let Some(record_key) = state.records.keys().find(|k| canon(k) == target).cloned() else {
@@ -163,7 +206,7 @@ pub async fn revert_cargo_redirect_purl(
         .map(|(i, _)| i)
         .collect();
 
-    let mut out = CargoRedirectRevert::default();
+    let mut out = RedirectRevert::default();
     let mut staged: Staged = Staged::new();
     // Newest-first: the hosted flow appends edits, so reverse index order
     // unwinds re-redirect chains correctly (each step's `original` is the
@@ -282,6 +325,387 @@ pub async fn revert_cargo_redirect_purl(
     });
     state.records.remove(&record_key);
     Ok(out)
+}
+
+/// `pkg:npm/<name>@<version>` (canonical, percent-decoded form) →
+/// `(name, version)`; the name keeps its `@scope/` namespace.
+fn parse_npm_purl(canon: &str) -> Option<(&str, &str)> {
+    let rest = canon.strip_prefix("pkg:npm/")?;
+    let (name, version) = rest.rsplit_once('@')?;
+    (!name.is_empty() && !version.is_empty()).then_some((name, version))
+}
+
+/// The npm-family text-fragment edit kinds: `original`/`new` hold the whole
+/// lock fragment as a string, and the revert is a `replacen(new, original)`.
+const NPM_TEXT_KINDS: [&str; 3] = [
+    "redirect_yarn_classic_entry",
+    "redirect_yarn_berry_entry",
+    "redirect_pnpm_resolution",
+];
+
+/// Revert every hosted-redirect edit the ledger records for `purl` (an npm
+/// package), then drop that purl's record and edits from `state`. The caller
+/// persists the mutated ledger (see `persist_redirect_state`).
+///
+/// Same fail-closed contract as [`revert_cargo_redirect_purl`]: every inverse
+/// is resolved against a staged view and NOTHING reaches disk until all of
+/// them have resolved, so a drift refusal leaves the project byte-identical
+/// across ALL the files the ledger claims.
+pub async fn revert_npm_redirect_purl(
+    project_root: &Path,
+    state: &mut RedirectState,
+    purl: &str,
+) -> Result<RedirectRevert, String> {
+    let canon = |p: &str| normalize_purl(strip_purl_qualifiers(p)).into_owned();
+    let target = canon(purl);
+    let Some(record_key) = state.records.keys().find(|k| canon(k) == target).cloned() else {
+        return Err(format!(
+            "the redirect ledger records no hosted redirect for {purl}"
+        ));
+    };
+    let Some((name, version)) = parse_npm_purl(&target) else {
+        return Err(format!("not an npm purl: {purl}"));
+    };
+    let (name, version) = (name.to_string(), version.to_string());
+    let lock_key = format!("{name}@{version}");
+
+    // The package-lock/shrinkwrap files any `redirect_npm_lock_entry` edits
+    // touch, parsed once from disk: an ALIAS install (`npm i alias@npm:name`)
+    // keys its entry by the alias, so ownership is resolved through the
+    // entry's `name` field — exactly how the rewriter matched it (the rewrite
+    // never touches name/version, so the probe is symmetric).
+    let mut disk_locks: BTreeMap<String, Option<Value>> = BTreeMap::new();
+    for e in &state.edits {
+        if e.kind == "redirect_npm_lock_entry" && !disk_locks.contains_key(&e.path) {
+            let parsed = read_rel(project_root, &e.path)
+                .await?
+                .and_then(|c| serde_json::from_str::<Value>(&c).ok());
+            disk_locks.insert(e.path.clone(), parsed);
+        }
+    }
+
+    // Claim this purl's edits. Text-fragment kinds and the berry/classic/pnpm
+    // rewriters key edits by `<name>@<version>`; the legacy npm v2
+    // `dependencies` tree keys by bare name; the v3 `packages` map keys by
+    // the lock path. The package-lock JSON kinds carry no version in their
+    // key, so ownership is version-discriminated the way the rewriter
+    // matched (entry `name`+`version`, mod.rs) — name-only would claim a
+    // SIBLING purl's edits (left-pad@1.2.0 vs @1.3.0 both hosted-redirected,
+    // or `npm i name@npm:other` aliasing another package onto this key path)
+    // and replaying those silently un-hosts the other purl while dropping
+    // its edits. A bun.lock edit that may belong to this purl is a hard
+    // refusal: bun edits key by the lock's package key (not name@version)
+    // and their revert is not implemented, so vendoring over one would drop
+    // the record while stranding its edits — half a takeover.
+    let mut mine: Vec<usize> = Vec::new();
+    for (i, e) in state.edits.iter().enumerate() {
+        let key = e.key.as_deref().unwrap_or_default();
+        let claimed = match e.kind.as_str() {
+            k if NPM_TEXT_KINDS.contains(&k) => key == lock_key,
+            "redirect_npm_lock_dep" => key == name && edit_references_version(e, &version),
+            "redirect_npm_lock_entry" => {
+                let key_name = key
+                    .rsplit_once("node_modules/")
+                    .map(|(_, n)| n)
+                    .unwrap_or(key);
+                match disk_locks
+                    .get(&e.path)
+                    .and_then(|l| l.as_ref())
+                    .and_then(|l| l.get("packages"))
+                    .and_then(|p| p.get(key))
+                {
+                    // The entry is live: attribute it exactly the way the
+                    // rewriter matched it — effective name (the `name` field
+                    // npm writes for alias installs, else the key's trailing
+                    // path; the rewrite never touches either, so the probe
+                    // is symmetric) AND version.
+                    Some(entry) => {
+                        let entry_name = entry
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or(key_name);
+                        entry_name == name
+                            && match entry.get("version").and_then(Value::as_str) {
+                                Some(v) => v == version,
+                                // Version field gone (hand-edited lock): fall
+                                // back to the recorded URLs, erring toward
+                                // claiming — the replay itself fails closed
+                                // on any value mismatch.
+                                None => edit_references_version(e, &version),
+                            }
+                    }
+                    // Entry (or the whole lock) gone: keep the fail-closed
+                    // "no longer exists" refusal for edits attributable to
+                    // this purl by key path + recorded URLs; a sibling
+                    // version's edit is not ours to claim.
+                    None => key_name == name && edit_references_version(e, &version),
+                }
+            }
+            "redirect_bun_lock_package" => {
+                let probe = format!("\"{name}@");
+                let holds = |v: &Option<Value>| {
+                    v.as_ref()
+                        .and_then(Value::as_str)
+                        .is_some_and(|s| s.contains(&probe))
+                };
+                if holds(&e.new) || holds(&e.original) {
+                    return Err(format!(
+                        "the redirect ledger records a bun.lock hosted redirect \
+                         for {name}, which this revert cannot replay yet; \
+                         restore the registry wiring manually (or re-lock with \
+                         `bun install`), remove the ledger entry, then re-run"
+                    ));
+                }
+                false
+            }
+            _ => false,
+        };
+        if claimed {
+            mine.push(i);
+        }
+    }
+
+    let mut out = RedirectRevert::default();
+    let mut staged: Staged = Staged::new();
+    // Newest-first: the hosted flow appends edits, so reverse index order
+    // unwinds re-redirect chains correctly (each step's `original` is the
+    // previous step's `new`).
+    for &i in mine.iter().rev() {
+        let edit = state.edits[i].clone();
+        if NPM_TEXT_KINDS.contains(&edit.kind.as_str()) {
+            let (Some(new), Some(orig)) = (
+                edit.new.as_ref().and_then(Value::as_str),
+                edit.original.as_ref().and_then(Value::as_str),
+            ) else {
+                return Err(format!(
+                    "the redirect ledger edit for {name} in {} records no \
+                     original fragment; cannot revert the hosted redirect",
+                    edit.path
+                ));
+            };
+            let Some(content) = staged_read(&staged, project_root, &edit.path).await? else {
+                return Err(format!(
+                    "{} no longer exists; cannot revert the recorded hosted \
+                     redirect for {lock_key}",
+                    edit.path
+                ));
+            };
+            if content.contains(new) {
+                staged.insert(edit.path.clone(), Some(content.replacen(new, orig, 1)));
+                out.reverted_files.push(edit.path.clone());
+            } else if content.contains(orig) {
+                // Already at (or unwound to) the pre-redirect fragment.
+            } else {
+                return Err(format!(
+                    "the {} entry for {lock_key} has drifted from the recorded \
+                     hosted redirect (neither the redirected nor the original \
+                     fragment is present); refusing to touch it — re-run \
+                     `scan --mode hosted` to normalize the redirect, or \
+                     restore the registry wiring manually, then re-run",
+                    edit.path
+                ));
+            }
+        } else {
+            revert_npm_json_edit(project_root, &mut staged, &edit, &name, &version, &mut out)
+                .await?;
+        }
+    }
+
+    // Every inverse resolved — only now does any of it reach disk, so a
+    // refusal above left the project exactly as it was found.
+    flush_staged(project_root, &staged).await?;
+
+    // Only after every inverse applied cleanly: drop this purl's edits and
+    // record from the ledger (the caller persists it).
+    let drop: HashSet<usize> = mine.into_iter().collect();
+    let mut idx = 0usize;
+    state.edits.retain(|_| {
+        let keep = !drop.contains(&idx);
+        idx += 1;
+        keep
+    });
+    state.records.remove(&record_key);
+    Ok(out)
+}
+
+/// Does one of this edit's recorded `resolved` URLs reference `version`?
+///
+/// Version discriminator for the package-lock JSON edit kinds, whose keys
+/// carry no version (`redirect_npm_lock_dep` keys by bare name,
+/// `redirect_npm_lock_entry` by lock path): both the hosted artifact URL
+/// (`…/npm/<name>/<version>/…/<name>-<version>.tgz`) and the registry
+/// tarball URL (`…/-/<name>-<version>.tgz`) embed the version behind a
+/// `/<version>/` or `-<version>.tgz` delimiter, so sibling versions of the
+/// same package never
+/// match each other (`/1.3.0/` is not a substring of `/11.3.0/`, nor
+/// `-1.3.0.tgz` of `-11.3.0.tgz`). Checked against `new` and `original` so
+/// every link of a re-redirect chain (each hosted URL names this purl's
+/// version) attributes correctly. A false positive here is safe — the
+/// replay itself fails closed on any value mismatch — while name-only
+/// claiming silently un-hosts the sibling purl.
+fn edit_references_version(edit: &FileEdit, version: &str) -> bool {
+    let path_seg = format!("/{version}/");
+    let tarball = format!("-{version}.tgz");
+    [&edit.new, &edit.original].into_iter().any(|v| {
+        v.as_ref()
+            .and_then(|o| o.get("resolved"))
+            .and_then(Value::as_str)
+            .is_some_and(|s| s.contains(&path_seg) || s.contains(&tarball))
+    })
+}
+
+/// Replay one recorded package-lock JSON edit (`redirect_npm_lock_entry` /
+/// `redirect_npm_lock_dep`) through the staged view.
+async fn revert_npm_json_edit(
+    project_root: &Path,
+    staged: &mut Staged,
+    edit: &FileEdit,
+    name: &str,
+    version: &str,
+    out: &mut RedirectRevert,
+) -> Result<(), String> {
+    let Some(content) = staged_read(staged, project_root, &edit.path).await? else {
+        return Err(format!(
+            "{} no longer exists; cannot revert the recorded hosted redirect \
+             for {name}@{version}",
+            edit.path
+        ));
+    };
+    let mut lock: Value = serde_json::from_str(&content).map_err(|e| {
+        format!(
+            "{} is not valid JSON ({e}); cannot revert the recorded hosted \
+             redirect for {name}@{version}",
+            edit.path
+        )
+    })?;
+    let key = edit.key.as_deref().unwrap_or_default();
+    let changed = match edit.kind.as_str() {
+        "redirect_npm_lock_entry" => {
+            let Some(entry) = lock.get_mut("packages").and_then(|p| p.get_mut(key)) else {
+                return Err(format!(
+                    "the {} entry `{key}` for {name}@{version} no longer \
+                     exists; cannot revert the recorded hosted redirect",
+                    edit.path
+                ));
+            };
+            replay_resolved_integrity(entry, edit, &edit.path, key)?
+        }
+        "redirect_npm_lock_dep" => {
+            let Some(deps) = lock.get_mut("dependencies").and_then(Value::as_object_mut) else {
+                return Err(format!(
+                    "{} no longer holds a `dependencies` tree; cannot revert \
+                     the recorded hosted redirect for {name}@{version}",
+                    edit.path
+                ));
+            };
+            let mut any_found = false;
+            let mut changed = false;
+            revert_v2_deps(
+                deps,
+                name,
+                version,
+                edit,
+                &edit.path,
+                &mut any_found,
+                &mut changed,
+            )?;
+            if !any_found {
+                return Err(format!(
+                    "the {} `dependencies` entry for {name}@{version} no \
+                     longer exists; cannot revert the recorded hosted redirect",
+                    edit.path
+                ));
+            }
+            changed
+        }
+        other => {
+            return Err(format!(
+                "no revert implementation for redirect edit kind `{other}`"
+            ));
+        }
+    };
+    if changed {
+        staged.insert(edit.path.clone(), Some(super::serialize_json(&lock)));
+        out.reverted_files.push(edit.path.clone());
+    }
+    Ok(())
+}
+
+/// Replace an entry's `resolved`/`integrity` with the edit's recorded
+/// originals. `Ok(false)` when the entry already holds the originals;
+/// `Err` (drift, fail closed) when it holds neither the recorded redirected
+/// values nor the originals.
+fn replay_resolved_integrity(
+    entry: &mut Value,
+    edit: &FileEdit,
+    path: &str,
+    key: &str,
+) -> Result<bool, String> {
+    let field = |v: &Option<Value>, f: &str| -> Value {
+        v.as_ref()
+            .and_then(|o| o.get(f))
+            .cloned()
+            .unwrap_or(Value::Null)
+    };
+    let orig_res = field(&edit.original, "resolved");
+    let orig_int = field(&edit.original, "integrity");
+    let cur = |f: &str| entry.get(f).cloned().unwrap_or(Value::Null);
+    if cur("resolved") == orig_res && cur("integrity") == orig_int {
+        return Ok(false); // already at (or unwound to) the pre-redirect values
+    }
+    if cur("resolved") != field(&edit.new, "resolved")
+        || cur("integrity") != field(&edit.new, "integrity")
+    {
+        return Err(format!(
+            "the {path} entry `{key}` has drifted from the recorded hosted \
+             redirect (neither the redirected nor the original \
+             resolved/integrity is present); refusing to touch it — re-run \
+             `scan --mode hosted` to normalize the redirect, or restore the \
+             registry wiring manually, then re-run"
+        ));
+    }
+    let Some(obj) = entry.as_object_mut() else {
+        return Err(format!("the {path} entry `{key}` is not an object"));
+    };
+    for (f, orig) in [("resolved", orig_res), ("integrity", orig_int)] {
+        if orig.is_null() {
+            obj.remove(f);
+        } else {
+            obj.insert(f.to_string(), orig);
+        }
+    }
+    Ok(true)
+}
+
+/// Recursive twin of the rewriter's `rewrite_npm_v2_deps` walk: replay the
+/// edit's originals over every legacy `dependencies` node for this
+/// name+version. Bundled nodes mirror the rewriter's skip — they were never
+/// rewritten, so their registry-shaped (or absent) values must not read as
+/// drift.
+fn revert_v2_deps(
+    deps: &mut serde_json::Map<String, Value>,
+    name: &str,
+    version: &str,
+    edit: &FileEdit,
+    path: &str,
+    any_found: &mut bool,
+    changed: &mut bool,
+) -> Result<(), String> {
+    for (dep_name, entry) in deps.iter_mut() {
+        if dep_name == name
+            && entry.get("version").and_then(Value::as_str) == Some(version)
+            && entry.get("bundled").and_then(Value::as_bool) != Some(true)
+        {
+            *any_found = true;
+            if replay_resolved_integrity(entry, edit, path, dep_name)? {
+                *changed = true;
+            }
+        }
+        if let Some(nested) = entry.get_mut("dependencies").and_then(Value::as_object_mut) {
+            revert_v2_deps(nested, name, version, edit, path, any_found, changed)?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -513,5 +937,520 @@ mod tests {
             .await
             .expect_err("no record");
         assert!(err.contains("records no hosted redirect"), "{err}");
+    }
+
+    // ── npm family ───────────────────────────────────────────────────────
+
+    const NPM_PURL: &str = "pkg:npm/left-pad@1.3.0";
+    const NPM_URL: &str =
+        "http://127.0.0.1:5555/patch/npm/left-pad/1.3.0/tok/6b7c/left-pad-1.3.0.tgz";
+
+    fn npm_dep_for(name: &str, version: &str) -> crate::patch::redirect::DepOverride {
+        serde_json::from_value(serde_json::json!({
+            "ecosystem": "npm",
+            "name": name,
+            "version": version,
+            "token": "tok",
+            "patchUuid": UUID,
+            "artifactUrl": format!(
+                "http://127.0.0.1:5555/patch/npm/{name}/{version}/tok/6b7c/{name}-{version}.tgz"
+            ),
+            "integrity": {
+                "sha512": format!("sha512-{}==", "B".repeat(86)),
+                "sha1": "1".repeat(40),
+                "yarnBerry10c0": format!("10c0/{}", "b".repeat(128)),
+            },
+        }))
+        .unwrap()
+    }
+
+    fn npm_dep() -> crate::patch::redirect::DepOverride {
+        npm_dep_for("left-pad", "1.3.0")
+    }
+
+    /// Run the real hosted rewriter over one pristine lock (redirecting every
+    /// purl in `deps`), write its output to a tempdir, and return the
+    /// resulting ledger — the exact state the takeover revert consumes in
+    /// production.
+    async fn npm_redirected_fixture_multi(
+        rel: &str,
+        pristine: &str,
+        deps: &[(&str, crate::patch::redirect::DepOverride)],
+    ) -> (tempfile::TempDir, RedirectState) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let mut files: BTreeMap<String, String> = BTreeMap::new();
+        files.insert(rel.to_string(), pristine.to_string());
+        let overrides: Vec<_> = deps.iter().map(|(_, d)| d.clone()).collect();
+        let rewrite = crate::patch::redirect::rewrite_registry_redirect(&files, &overrides);
+        let rewritten = rewrite
+            .files
+            .get(rel)
+            .unwrap_or_else(|| panic!("rewriter must rewrite {rel}: {:?}", rewrite.warnings));
+        tokio::fs::write(root.join(rel), rewritten).await.unwrap();
+        let mut state = RedirectState::new();
+        state.edits = rewrite.edits;
+        for (purl, _) in deps {
+            state.records.insert(purl.to_string(), record());
+        }
+        (tmp, state)
+    }
+
+    /// Run the real hosted rewriter over one pristine lock, write its output
+    /// to a tempdir, and return the resulting ledger — the exact state the
+    /// takeover revert consumes in production.
+    async fn npm_redirected_fixture(
+        rel: &str,
+        pristine: &str,
+    ) -> (tempfile::TempDir, RedirectState) {
+        npm_redirected_fixture_multi(rel, pristine, &[(NPM_PURL, npm_dep())]).await
+    }
+
+    fn classic_pristine() -> String {
+        "# yarn lockfile v1\n\n\nleft-pad@1.3.0:\n  version \"1.3.0\"\n  resolved \
+         \"https://registry.yarnpkg.com/left-pad/-/left-pad-1.3.0.tgz#5b8a\"\n  \
+         integrity sha512-original==\n"
+            .to_string()
+    }
+
+    fn berry_pristine() -> String {
+        "# This file is generated by running \"yarn install\" inside your project.\n\n\
+         __metadata:\n  version: 8\n  cacheKey: 10c0\n\n\
+         \"left-pad@npm:1.3.0\":\n  version: 1.3.0\n  resolution: \"left-pad@npm:1.3.0\"\n  \
+         checksum: 10c0/cccc\n  languageName: node\n  linkType: hard\n"
+            .to_string()
+    }
+
+    /// Pristine package-lock (lockfileVersion 2: BOTH the v3 `packages` map
+    /// and the legacy v2 `dependencies` tree), serialized exactly as the
+    /// rewriter serializes, so the revert round-trip is byte-comparable.
+    fn package_lock_pristine() -> String {
+        let lock = serde_json::json!({
+            "name": "app",
+            "version": "1.0.0",
+            "lockfileVersion": 2,
+            "requires": true,
+            "packages": {
+                "": { "name": "app", "version": "1.0.0" },
+                "node_modules/left-pad": {
+                    "version": "1.3.0",
+                    "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+                    "integrity": "sha512-pristine=="
+                }
+            },
+            "dependencies": {
+                "left-pad": {
+                    "version": "1.3.0",
+                    "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+                    "integrity": "sha512-pristine=="
+                }
+            }
+        });
+        format!("{}\n", serde_json::to_string_pretty(&lock).unwrap())
+    }
+
+    #[test]
+    fn revert_supported_gate_covers_cargo_and_npm_only() {
+        assert!(redirect_revert_supported("pkg:cargo/cfg-if@1.0.4"));
+        assert!(redirect_revert_supported("pkg:npm/left-pad@1.3.0"));
+        assert!(redirect_revert_supported("pkg:npm/%40scope/x@1.0.0"));
+        assert!(!redirect_revert_supported("pkg:gem/rack@3.0.0"));
+        assert!(!redirect_revert_supported("pkg:pypi/flask@2.0.0"));
+    }
+
+    #[tokio::test]
+    async fn npm_classic_lock_round_trips_and_drops_ledger_entries() {
+        let (tmp, mut state) = npm_redirected_fixture("yarn.lock", &classic_pristine()).await;
+        let root = tmp.path();
+        let wired = tokio::fs::read_to_string(root.join("yarn.lock"))
+            .await
+            .unwrap();
+        assert!(wired.contains(NPM_URL), "fixture is hosted-wired: {wired}");
+
+        let out = revert_redirect_purl(root, &mut state, NPM_PURL)
+            .await
+            .expect("revert succeeds");
+        assert_eq!(out.reverted_files, vec!["yarn.lock".to_string()]);
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("yarn.lock"))
+                .await
+                .unwrap(),
+            classic_pristine(),
+            "yarn.lock restored byte-identical"
+        );
+        assert!(state.records.is_empty(), "record dropped");
+        assert!(state.edits.is_empty(), "edits dropped");
+    }
+
+    #[tokio::test]
+    async fn npm_berry_lock_round_trips_and_drops_ledger_entries() {
+        let (tmp, mut state) = npm_redirected_fixture("yarn.lock", &berry_pristine()).await;
+        let root = tmp.path();
+        let wired = tokio::fs::read_to_string(root.join("yarn.lock"))
+            .await
+            .unwrap();
+        assert!(
+            wired.contains("::__archiveUrl="),
+            "fixture is hosted-wired: {wired}"
+        );
+
+        revert_redirect_purl(root, &mut state, NPM_PURL)
+            .await
+            .expect("revert succeeds");
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("yarn.lock"))
+                .await
+                .unwrap(),
+            berry_pristine(),
+            "yarn.lock restored byte-identical"
+        );
+        assert!(state.records.is_empty(), "record dropped");
+        assert!(state.edits.is_empty(), "edits dropped");
+    }
+
+    #[tokio::test]
+    async fn npm_package_lock_v2_round_trips_both_trees() {
+        let (tmp, mut state) =
+            npm_redirected_fixture("package-lock.json", &package_lock_pristine()).await;
+        let root = tmp.path();
+        assert_eq!(state.edits.len(), 2, "packages + dependencies edits");
+        let wired = tokio::fs::read_to_string(root.join("package-lock.json"))
+            .await
+            .unwrap();
+        assert!(wired.contains(NPM_URL), "fixture is hosted-wired: {wired}");
+
+        revert_npm_redirect_purl(root, &mut state, NPM_PURL)
+            .await
+            .expect("revert succeeds");
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("package-lock.json"))
+                .await
+                .unwrap(),
+            package_lock_pristine(),
+            "package-lock.json restored byte-identical (both trees)"
+        );
+        assert!(state.records.is_empty(), "record dropped");
+        assert!(state.edits.is_empty(), "edits dropped");
+    }
+
+    /// Pristine package-lock (lockfileVersion 2, both trees) holding TWO
+    /// versions of left-pad — the sibling-purl fixture the claim matcher
+    /// must not cross-claim.
+    fn two_version_lock_pristine() -> String {
+        let lp = |v: &str| {
+            serde_json::json!({
+                "version": v,
+                "resolved": format!("https://registry.npmjs.org/left-pad/-/left-pad-{v}.tgz"),
+                "integrity": format!("sha512-pristine-{v}=="),
+            })
+        };
+        let lock = serde_json::json!({
+            "name": "app",
+            "version": "1.0.0",
+            "lockfileVersion": 2,
+            "requires": true,
+            "packages": {
+                "": { "name": "app", "version": "1.0.0" },
+                "node_modules/a": {
+                    "version": "1.0.0",
+                    "resolved": "https://registry.npmjs.org/a/-/a-1.0.0.tgz",
+                    "integrity": "sha512-a=="
+                },
+                "node_modules/a/node_modules/left-pad": lp("1.2.0"),
+                "node_modules/left-pad": lp("1.3.0"),
+            },
+            "dependencies": {
+                "a": {
+                    "version": "1.0.0",
+                    "resolved": "https://registry.npmjs.org/a/-/a-1.0.0.tgz",
+                    "integrity": "sha512-a==",
+                    "dependencies": { "left-pad": lp("1.2.0") }
+                },
+                "left-pad": lp("1.3.0"),
+            }
+        });
+        format!("{}\n", serde_json::to_string_pretty(&lock).unwrap())
+    }
+
+    /// Two hosted-redirected VERSIONS of the same package: taking over one
+    /// purl must not claim (and silently un-host) the sibling's lock edits —
+    /// the package-lock JSON edit keys carry no version, so a name-only
+    /// matcher replays the sibling's `original` back over its live hosted
+    /// wiring and drops its edits while its ledger record survives edit-less.
+    #[tokio::test]
+    async fn npm_two_versions_takeover_of_one_leaves_the_siblings_redirect_intact() {
+        let sibling_purl = "pkg:npm/left-pad@1.2.0";
+        let (tmp, mut state) = npm_redirected_fixture_multi(
+            "package-lock.json",
+            &two_version_lock_pristine(),
+            &[
+                (NPM_PURL, npm_dep()),
+                (sibling_purl, npm_dep_for("left-pad", "1.2.0")),
+            ],
+        )
+        .await;
+        let root = tmp.path();
+        // 2 edits per purl: one v3 `packages` entry + one v2 `dependencies`
+        // node each.
+        assert_eq!(state.edits.len(), 4, "{:?}", state.edits);
+        let sibling_url = npm_dep_for("left-pad", "1.2.0").artifact_url.clone();
+        let wired = tokio::fs::read_to_string(root.join("package-lock.json"))
+            .await
+            .unwrap();
+        assert!(wired.contains(NPM_URL) && wired.contains(&sibling_url));
+
+        revert_npm_redirect_purl(root, &mut state, NPM_PURL)
+            .await
+            .expect("takeover of 1.3.0 succeeds without touching 1.2.0");
+
+        let lock = tokio::fs::read_to_string(root.join("package-lock.json"))
+            .await
+            .unwrap();
+        assert!(!lock.contains(NPM_URL), "1.3.0 un-hosted: {lock}");
+        assert!(
+            lock.contains("left-pad/-/left-pad-1.3.0.tgz"),
+            "1.3.0 back on the registry: {lock}"
+        );
+        assert_eq!(
+            lock.matches(&sibling_url).count(),
+            2,
+            "1.2.0 still hosted-wired in BOTH trees: {lock}"
+        );
+        assert!(
+            state.records.contains_key(sibling_purl) && !state.records.contains_key(NPM_PURL),
+            "only 1.3.0's record dropped: {:?}",
+            state.records.keys()
+        );
+        assert_eq!(
+            state.edits.len(),
+            2,
+            "1.2.0 keeps its two edits: {:?}",
+            state.edits
+        );
+
+        // The sibling's own takeover still round-trips the file to pristine.
+        revert_npm_redirect_purl(root, &mut state, sibling_purl)
+            .await
+            .expect("takeover of 1.2.0 succeeds");
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("package-lock.json"))
+                .await
+                .unwrap(),
+            two_version_lock_pristine(),
+            "package-lock.json restored byte-identical"
+        );
+        assert!(state.records.is_empty() && state.edits.is_empty());
+    }
+
+    /// `npm i left-pad@npm:other` keys package `other` under the lock path
+    /// `node_modules/left-pad`: taking over left-pad must not claim that
+    /// entry's edit through the key name (the entry's `name` field exonerates
+    /// it, exactly as the rewriter matched), while an alias install OF
+    /// left-pad (`npm i mylp@npm:left-pad`) must still be claimed through
+    /// the `name` field.
+    #[tokio::test]
+    async fn npm_alias_collision_takeover_claims_by_entry_name_not_key_path() {
+        let other_purl = "pkg:npm/other@1.3.0";
+        let lock = serde_json::json!({
+            "name": "app",
+            "version": "1.0.0",
+            "lockfileVersion": 3,
+            "requires": true,
+            "packages": {
+                "": { "name": "app", "version": "1.0.0" },
+                // Alias of ANOTHER package onto this key path — same version
+                // on purpose, so only the name field can exonerate it.
+                "node_modules/left-pad": {
+                    "name": "other",
+                    "version": "1.3.0",
+                    "resolved": "https://registry.npmjs.org/other/-/other-1.3.0.tgz",
+                    "integrity": "sha512-pristine-other=="
+                },
+                // Alias OF the target package: claimed via the name field.
+                "node_modules/mylp": {
+                    "name": "left-pad",
+                    "version": "1.3.0",
+                    "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+                    "integrity": "sha512-pristine-1.3.0=="
+                },
+                "node_modules/b/node_modules/left-pad": {
+                    "version": "1.3.0",
+                    "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+                    "integrity": "sha512-pristine-1.3.0=="
+                },
+            },
+        });
+        let pristine = format!("{}\n", serde_json::to_string_pretty(&lock).unwrap());
+        let (tmp, mut state) = npm_redirected_fixture_multi(
+            "package-lock.json",
+            &pristine,
+            &[
+                (NPM_PURL, npm_dep()),
+                (other_purl, npm_dep_for("other", "1.3.0")),
+            ],
+        )
+        .await;
+        let root = tmp.path();
+        assert_eq!(state.edits.len(), 3, "{:?}", state.edits);
+        let other_url = npm_dep_for("other", "1.3.0").artifact_url.clone();
+
+        revert_npm_redirect_purl(root, &mut state, NPM_PURL)
+            .await
+            .expect("takeover of left-pad succeeds without touching `other`");
+
+        let lock = tokio::fs::read_to_string(root.join("package-lock.json"))
+            .await
+            .unwrap();
+        assert!(
+            !lock.contains(NPM_URL),
+            "both left-pad entries (path-keyed AND alias-keyed) un-hosted: {lock}"
+        );
+        assert!(
+            lock.contains(&other_url),
+            "`other` (aliased onto node_modules/left-pad) still hosted-wired: {lock}"
+        );
+        assert!(
+            state.records.contains_key(other_purl) && !state.records.contains_key(NPM_PURL),
+            "{:?}",
+            state.records.keys()
+        );
+        assert_eq!(
+            state.edits.len(),
+            1,
+            "other keeps its edit: {:?}",
+            state.edits
+        );
+
+        revert_npm_redirect_purl(root, &mut state, other_purl)
+            .await
+            .expect("takeover of other succeeds");
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("package-lock.json"))
+                .await
+                .unwrap(),
+            pristine,
+            "package-lock.json restored byte-identical"
+        );
+        assert!(state.records.is_empty() && state.edits.is_empty());
+    }
+
+    /// The version-scoped claim must not soften the fail-closed contract: a
+    /// lock entry that VANISHED after being redirected still refuses (its
+    /// edit is attributed by key path + recorded URLs), never a silent
+    /// record-drop that strands the edit.
+    #[tokio::test]
+    async fn npm_missing_lock_entry_still_fails_closed() {
+        let lock = serde_json::json!({
+            "name": "app",
+            "version": "1.0.0",
+            "lockfileVersion": 3,
+            "requires": true,
+            "packages": {
+                "": { "name": "app", "version": "1.0.0" },
+                "node_modules/left-pad": {
+                    "version": "1.3.0",
+                    "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+                    "integrity": "sha512-pristine=="
+                },
+            },
+        });
+        let pristine = format!("{}\n", serde_json::to_string_pretty(&lock).unwrap());
+        let (tmp, mut state) = npm_redirected_fixture("package-lock.json", &pristine).await;
+        let root = tmp.path();
+        // A third party pruned the entry from the lock after the redirect.
+        let mut on_disk: Value = serde_json::from_str(
+            &tokio::fs::read_to_string(root.join("package-lock.json"))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        on_disk
+            .get_mut("packages")
+            .and_then(Value::as_object_mut)
+            .unwrap()
+            .remove("node_modules/left-pad")
+            .expect("fixture entry present");
+        tokio::fs::write(
+            root.join("package-lock.json"),
+            serde_json::to_string_pretty(&on_disk).unwrap(),
+        )
+        .await
+        .unwrap();
+        let edits_before = state.edits.len();
+
+        let err = revert_npm_redirect_purl(root, &mut state, NPM_PURL)
+            .await
+            .expect_err("vanished entry must refuse");
+        assert!(err.contains("no longer exists"), "{err}");
+        assert!(!state.records.is_empty(), "ledger keeps the record");
+        assert_eq!(state.edits.len(), edits_before, "ledger keeps the edits");
+    }
+
+    #[tokio::test]
+    async fn npm_refuses_on_drifted_lock_fail_closed() {
+        let (tmp, mut state) = npm_redirected_fixture("yarn.lock", &classic_pristine()).await;
+        let root = tmp.path();
+        // A third party re-resolved the entry to a shape the ledger never saw.
+        let drifted = classic_pristine().replace(
+            "https://registry.yarnpkg.com/left-pad/-/left-pad-1.3.0.tgz#5b8a",
+            "https://corp.example/left-pad-1.3.0.tgz#dead",
+        );
+        tokio::fs::write(root.join("yarn.lock"), &drifted)
+            .await
+            .unwrap();
+        let records_before = state.records.len();
+        let edits_before = state.edits.len();
+
+        let err = revert_npm_redirect_purl(root, &mut state, NPM_PURL)
+            .await
+            .expect_err("drifted lock must refuse");
+        assert!(err.contains("drifted"), "{err}");
+        // The ledger keeps everything on refusal, and the file is untouched.
+        assert_eq!(state.records.len(), records_before);
+        assert_eq!(state.edits.len(), edits_before);
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("yarn.lock"))
+                .await
+                .unwrap(),
+            drifted
+        );
+    }
+
+    #[tokio::test]
+    async fn npm_missing_record_is_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = RedirectState::new();
+        let err = revert_npm_redirect_purl(tmp.path(), &mut state, NPM_PURL)
+            .await
+            .expect_err("no record");
+        assert!(err.contains("records no hosted redirect"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn npm_bun_lock_edit_is_a_fail_closed_refusal() {
+        // The bun revert is not implemented; a ledger claiming this purl via
+        // a bun.lock edit must refuse rather than drop the record while
+        // stranding the edit.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = RedirectState::new();
+        state.records.insert(NPM_PURL.to_string(), record());
+        state.edits.push(FileEdit {
+            path: "bun.lock".into(),
+            kind: "redirect_bun_lock_package".into(),
+            action: "rewritten".into(),
+            key: Some("left-pad".into()),
+            original: Some(Value::String(
+                "    \"left-pad\": [\"left-pad@1.3.0\", \"reg\", {}, \"sha512-p==\"],".into(),
+            )),
+            new: Some(Value::String(format!(
+                "    \"left-pad\": [\"left-pad@{NPM_URL}\", {{}}, \"sha512-h==\"],"
+            ))),
+        });
+        let err = revert_npm_redirect_purl(tmp.path(), &mut state, NPM_PURL)
+            .await
+            .expect_err("bun edits must refuse");
+        assert!(err.contains("bun.lock"), "{err}");
+        assert!(!state.records.is_empty(), "ledger keeps the record");
+        assert!(!state.edits.is_empty(), "ledger keeps the edit");
     }
 }
