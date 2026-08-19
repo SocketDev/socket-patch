@@ -127,18 +127,29 @@ fn push_path(out: &mut HashMap<String, Vec<PathBuf>>, purl: String, path: PathBu
 }
 
 /// Default merge for the single-copy ecosystems (cargo / go / composer /
-/// nuget / deno): accumulate the crawler-returned PURL → path. These
-/// install exactly one copy per `name@version`, so the accumulated `Vec` is
-/// length 1 in practice; keeping a `Vec` (not first-wins) means a genuine
-/// second location — a workspace that installed the same crate twice —
-/// would also be patched rather than silently dropped.
+/// nuget / deno): keep the FIRST path discovered per PURL, matching the
+/// historical `HashMap<String, PathBuf>` first-wins contract exactly. These
+/// ecosystems resolve one logical install per `name@version`, but the same
+/// install is legitimately reachable from several source roots (e.g. NuGet's
+/// global cache *and* a project-local packages folder). Patching each root
+/// would re-apply to what is effectively the same package — a scope-expanding
+/// behavior change that is out of scope for the npm multi-copy fix and would,
+/// for a shared global cache, mutate state other projects rely on. Fanning out
+/// to genuinely-distinct installs is npm-only (`merge_npm_copies`); if a
+/// per-root fan-out is ever wanted for these ecosystems it must be an explicit,
+/// separately-tested decision.
 fn merge_first_wins(
     out: &mut HashMap<String, Vec<PathBuf>>,
     _purls: &[String],
     packages: HashMap<String, CrawledPackage>,
 ) {
     for (purl, pkg) in packages {
-        push_path(out, purl, pkg.path);
+        // First source root to resolve this PURL wins; later roots that
+        // resolve the same PURL are ignored (true first-wins).
+        let paths = out.entry(purl).or_default();
+        if paths.is_empty() {
+            paths.push(pkg.path);
+        }
     }
 }
 
@@ -501,17 +512,20 @@ mod tests {
     }
 
     #[test]
-    fn merge_first_wins_accumulates_distinct_paths_across_calls() {
+    fn merge_first_wins_keeps_first_path_across_source_roots() {
         // The macro calls on_match once per discovered source path. A
-        // single-copy ecosystem that resolved the same PURL at two distinct
-        // locations (e.g. a workspace with two crate source roots) keeps
-        // BOTH — first-discovered first — rather than dropping the second.
+        // single-copy ecosystem that resolves the same PURL from two source
+        // roots (e.g. NuGet's global cache + a project-local packages folder)
+        // keeps ONLY the first — matching the historical first-wins contract.
+        // Fanning out to every root re-patches what is effectively one install
+        // (the docker_e2e_nuget `already_patched` regression); genuine
+        // multi-copy fan-out is npm-only via `merge_npm_copies`.
         let mut out: HashMap<String, Vec<PathBuf>> = HashMap::new();
         merge_first_wins(&mut out, &[], packages(&[("pkg:cargo/foo@1.0", "/first")]));
         merge_first_wins(&mut out, &[], packages(&[("pkg:cargo/foo@1.0", "/second")]));
         assert_eq!(
             out.get("pkg:cargo/foo@1.0"),
-            Some(&vec![PathBuf::from("/first"), PathBuf::from("/second")])
+            Some(&vec![PathBuf::from("/first")])
         );
     }
 
@@ -522,6 +536,18 @@ mod tests {
         merge_first_wins(&mut out, &[], packages(&[("pkg:cargo/foo@1.0", "/same")]));
         merge_first_wins(&mut out, &[], packages(&[("pkg:cargo/foo@1.0", "/same")]));
         assert_eq!(out.get("pkg:cargo/foo@1.0"), Some(&vec![PathBuf::from("/same")]));
+    }
+
+    #[test]
+    fn merge_first_wins_keeps_only_first_of_two_distinct_paths() {
+        // A single-copy ecosystem (e.g. NuGet) reaches the same logical
+        // install from two source roots — global cache + project-local. Only
+        // the first is kept, so apply does not double-patch (the regression
+        // that broke docker_e2e_nuget with a spurious `already_patched` skip).
+        let mut out: HashMap<String, Vec<PathBuf>> = HashMap::new();
+        merge_first_wins(&mut out, &[], packages(&[("pkg:nuget/foo@1.0", "/global/foo")]));
+        merge_first_wins(&mut out, &[], packages(&[("pkg:nuget/foo@1.0", "/local/foo")]));
+        assert_eq!(out.get("pkg:nuget/foo@1.0"), Some(&vec![PathBuf::from("/global/foo")]));
     }
 
     #[test]
