@@ -603,6 +603,16 @@ impl RevertOutcome {
     /// every left-alone branch (ownership-gate drift, vanished block,
     /// missing pre-vendor original, unknown kind/key, allowlist skip)
     /// warns with the stable code `vendor_lock_entry_drifted`.
+    ///
+    /// LIVENESS CONTRACT: backends must NOT emit that code for a record
+    /// whose live state already equals its reverted state (the fragment
+    /// equals `rec.original`, or — for Added records with no original —
+    /// the key is absent). A previous partial revert leaves records in
+    /// exactly that state; re-classifying them as drift would keep the
+    /// artifacts and ledger entry forever, and the CLI's "undo the drift
+    /// and re-run `vendor --revert`" remediation could never be satisfied.
+    /// Such records are silent no-ops, so this gate fires only on genuine
+    /// third-party drift that the user can still undo.
     pub fn drift_skipped(&self) -> bool {
         self.warnings
             .iter()

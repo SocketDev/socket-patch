@@ -729,6 +729,15 @@ fn revert_one_record(
         return;
     };
 
+    // ALREADY CONVERGED: the live fragment equals the recorded pre-vendor
+    // original — an earlier partial revert (or the user, by hand) already
+    // restored this record. Not drift: stay silent so the drift-skip keep
+    // gate can converge (re-warning here would keep the artifacts + ledger
+    // entry forever, with remediation advice that can never be satisfied).
+    if rec.original.as_ref() == Some(&*live) {
+        return;
+    }
+
     // Ours iff resolved is exactly what we wrote, or still points into OUR
     // uuid dir (a re-serialized but unmoved entry).
     let live_resolved = live.get("resolved").and_then(Value::as_str);
@@ -1989,6 +1998,7 @@ mod tests {
 
         // The user re-resolved the DIRECT instance behind our back.
         let mut live = fx.read_lock().await;
+        let vendored_direct = live["packages"]["node_modules/left-pad"].clone();
         live["packages"]["node_modules/left-pad"]["resolved"] =
             json!("https://example.com/their-fork.tgz");
         tokio::fs::write(fx.lock_path(), serialize_json(&live, "  ").unwrap())
@@ -2032,6 +2042,33 @@ mod tests {
                 .any(|w| w.code == "vendor_artifact_kept"),
             "the keep must be surfaced: {:?}",
             outcome.warnings
+        );
+
+        // KEEP-GATE LIVENESS: undo ONLY the drift (repoint the direct
+        // instance back at the vendored tarball). The nested instance the
+        // first revert already restored must now read as CONVERGED, not
+        // drifted — otherwise every later revert would re-classify it as
+        // drift and keep the artifacts + ledger entry forever.
+        let mut healed = fx.read_lock().await;
+        healed["packages"]["node_modules/left-pad"] = vendored_direct;
+        tokio::fs::write(fx.lock_path(), serialize_json(&healed, "  ").unwrap())
+            .await
+            .unwrap();
+
+        let outcome = revert_npm(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(
+            outcome.warnings.is_empty(),
+            "the already-restored instance is converged, not drifted: {:?}",
+            outcome.warnings
+        );
+        assert!(!outcome.kept_artifact);
+        assert_eq!(fx.read_lock().await, default_lock(), "lock fully restored");
+        assert!(
+            !fx.root()
+                .join(format!(".socket/vendor/npm/{UUID}"))
+                .exists(),
+            "artifact pruned once the revert converges"
         );
     }
 

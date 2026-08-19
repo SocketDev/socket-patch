@@ -393,6 +393,14 @@ fn revert_one_record(
             (parsed.key == key).then_some((start + 1 + off, parsed))
         });
     if let Some((idx, parsed)) = located {
+        // ALREADY CONVERGED: the live line equals the recorded pre-vendor
+        // original — an earlier partial revert (or the user, by hand)
+        // already restored this record. Not drift: stay silent so the
+        // drift-skip keep gate can converge instead of re-flagging the
+        // restored line forever.
+        if rec.original.as_ref().and_then(Value::as_str) == Some(lines[idx].as_str()) {
+            return;
+        }
         // Ours iff the line is exactly what we wrote, or its tuple still
         // points into OUR uuid dir (a re-serialized but unmoved entry).
         let exact = Some(lines[idx].as_str()) == rec.new.as_ref().and_then(Value::as_str);
@@ -1373,6 +1381,30 @@ mod tests {
                 .any(|w| w.code == "vendor_artifact_kept"),
             "the keep must be surfaced: {:?}",
             outcome.warnings
+        );
+
+        // KEEP-GATE LIVENESS: undo the drift (repoint the entry back at the
+        // vendored tuple) — the same revert must then complete fully
+        // instead of ratcheting the keep forever.
+        let healed = fx.read_lock().await.replace(drifted_line, new_line);
+        tokio::fs::write(fx.root().join(BUN_LOCK), &healed)
+            .await
+            .unwrap();
+
+        let outcome = revert_bun(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(
+            outcome.warnings.is_empty(),
+            "no drift left after the undo: {:?}",
+            outcome.warnings
+        );
+        assert!(!outcome.kept_artifact);
+        assert_eq!(fx.read_lock().await, BN3_BEFORE_LOCK, "lock byte-restored");
+        assert!(
+            !fx.root()
+                .join(format!(".socket/vendor/npm/{UUID}"))
+                .exists(),
+            "artifact pruned once the revert converges"
         );
     }
 
