@@ -498,9 +498,17 @@ async fn remove_plugin_registration_at(
     // `path:`-sourced wiring that is the project's `.socket/bundler-plugin`
     // (already deleted by `remove_plugin_files`); a `bundler plugin install`ed
     // copy lives under the plugin root itself. Delete it only inside that
-    // root — never a recorded path elsewhere on the machine.
+    // root — never a recorded path elsewhere on the machine. The recorded
+    // path is attacker-authored input (the index can be committed), and
+    // `starts_with` compares components lexically, so a `..` traversal like
+    // `<plugin_root>/../../victim` would pass the prefix check while pointing
+    // anywhere on the machine: reject any `..` component outright (bundler
+    // never records traversal paths, so nothing legitimate is lost).
     if let Some(dir) = &stripped.installed_dir {
-        if dir.starts_with(&plugin_root) && dir != &plugin_root {
+        let traversal_free = dir
+            .components()
+            .all(|c| !matches!(c, std::path::Component::ParentDir));
+        if traversal_free && dir.starts_with(&plugin_root) && dir != &plugin_root {
             let _ = fs::remove_dir_all(dir).await;
         }
     }
