@@ -1728,6 +1728,10 @@ async fn offline_service_mode_refuses_instead_of_building() {
 
 const GEM_UUID: &str = "35353535-3535-4335-8335-353535353535";
 const GEM_PURL: &str = "pkg:gem/demo-gem@1.0.0";
+/// The platform-qualified spelling production publishes for pure-ruby gems
+/// (e.g. `pkg:gem/activestorage@6.0.3?platform=ruby`). `?platform=ruby` is
+/// the portable default and must vendor exactly like the bare purl.
+const GEM_PURL_QUALIFIED: &str = "pkg:gem/demo-gem@1.0.0?platform=ruby";
 const GEM_ORIG: &[u8] = b"module DemoGem\n  STATUS = \"orig\"\nend\n";
 const GEM_PATCHED: &[u8] = b"module DemoGem\n  STATUS = \"patched\"\nend\n";
 const GEM_GEMSPEC: &str = "Gem::Specification.new do |s|\n  s.name = \"demo-gem\"\n  s.version = \"1.0.0\"\n  s.summary = \"in-process scan --vendor fixture\"\n  s.require_paths = [\"lib\"]\nend\n";
@@ -1788,12 +1792,21 @@ fn gem_fixture() -> GemFixture {
 /// Mount discovery (batch), per-package search, and the full view (inline
 /// `blobContent`, so `scan --vendor` runs against the mock alone) for the
 /// demo gem — the gem mirror of `scan_vendor_e2e::mount_patch_api`.
-async fn mount_gem_patch_api(mock: &wiremock::MockServer) {
+///
+/// `patch_purl` is the purl the SERVED patch records carry ([`GEM_PURL`] or
+/// [`GEM_PURL_QUALIFIED`]); the batch response's outer package purl stays the
+/// bare purl the crawler requested, mirroring production.
+async fn mount_gem_patch_api(mock: &wiremock::MockServer, patch_purl: &str) {
     use base64::Engine as _;
-    use wiremock::matchers::{method, path, path_regex};
+    use wiremock::matchers::{method, path};
     use wiremock::{Mock, ResponseTemplate};
 
     const ORG_SLUG: &str = "test-org";
+    /// The exact percent-encoded by-package path segment for the BARE purl —
+    /// the spelling the crawler synthesizes and the CLI queries with (the
+    /// npm model in `scan_vendor_e2e`). Pinned exactly, not `path_regex(".+")`,
+    /// so a change in what spelling the CLI queries goes red here.
+    const GEM_ENCODED: &str = "pkg%3Agem%2Fdemo-gem%401.0.0";
     let before_hash = compute_git_sha256_from_bytes(GEM_ORIG);
     let after_hash = compute_git_sha256_from_bytes(GEM_PATCHED);
     let blob_b64 = base64::engine::general_purpose::STANDARD.encode(GEM_PATCHED);
@@ -1804,7 +1817,7 @@ async fn mount_gem_patch_api(mock: &wiremock::MockServer) {
                 "purl": GEM_PURL,
                 "patches": [{
                     "uuid": GEM_UUID,
-                    "purl": GEM_PURL,
+                    "purl": patch_purl,
                     "tier": "free",
                     "cveIds": ["CVE-2026-0002"],
                     "ghsaIds": [],
@@ -1817,13 +1830,13 @@ async fn mount_gem_patch_api(mock: &wiremock::MockServer) {
         .mount(mock)
         .await;
     Mock::given(method("GET"))
-        .and(path_regex(format!(
-            "^/v0/orgs/{ORG_SLUG}/patches/by-package/.+$"
+        .and(path(format!(
+            "/v0/orgs/{ORG_SLUG}/patches/by-package/{GEM_ENCODED}"
         )))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "patches": [{
                 "uuid": GEM_UUID,
-                "purl": GEM_PURL,
+                "purl": patch_purl,
                 "publishedAt": "2026-01-01T00:00:00Z",
                 "description": "gem vendor patch",
                 "license": "MIT",
@@ -1838,7 +1851,7 @@ async fn mount_gem_patch_api(mock: &wiremock::MockServer) {
         .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/view/{GEM_UUID}")))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "uuid": GEM_UUID,
-            "purl": GEM_PURL,
+            "purl": patch_purl,
             "publishedAt": "2026-01-01T00:00:00Z",
             "files": {
                 "lib/demo_gem.rb": {
@@ -1894,7 +1907,7 @@ fn run_scan_vendor(root: &Path, mock_uri: &str, extra: &[&str]) -> (i32, Value) 
 #[tokio::test]
 async fn scan_vendor_gem_end_to_end_and_reconcile() {
     let mock = wiremock::MockServer::start().await;
-    mount_gem_patch_api(&mock).await;
+    mount_gem_patch_api(&mock, GEM_PURL).await;
     let fx = gem_fixture();
 
     let (code, env) = run_scan_vendor(fx.root(), &mock.uri(), &[]);
@@ -2004,6 +2017,155 @@ async fn scan_vendor_gem_end_to_end_and_reconcile() {
     );
 }
 
+/// Same in-process flow as [`scan_vendor_gem_end_to_end_and_reconcile`], but
+/// the served patch records carry the QUALIFIED gem purl (`?platform=ruby`)
+/// — the spelling production has published since the 2026-08-18 gem catalog
+/// republish. `platform=ruby` is the portable default: the vendor gate
+/// refuses only non-empty, non-`ruby` platform qualifiers (#172), so this
+/// must vendor exactly like the bare purl. This is the CLI-level pin that
+/// keeps the old `platform_gem_unsupported` gap from silently reopening;
+/// the core-level twin is
+/// `vendor::gem::tests::test_platform_ruby_gem_from_autofetch_staging_dir_vendors`.
+#[tokio::test]
+async fn scan_vendor_gem_qualified_platform_ruby_purl_vendors() {
+    let mock = wiremock::MockServer::start().await;
+    mount_gem_patch_api(&mock, GEM_PURL_QUALIFIED).await;
+    let fx = gem_fixture();
+
+    let (code, env) = run_scan_vendor(fx.root(), &mock.uri(), &[]);
+    assert_eq!(
+        code, 0,
+        "scan --vendor must succeed on the qualified purl: {env:#}"
+    );
+    assert_eq!(env["status"], "success", "envelope: {env:#}");
+    assert_eq!(env["download"]["downloaded"], 1, "envelope: {env:#}");
+    assert_eq!(env["vendor"]["summary"]["applied"], 1, "envelope: {env:#}");
+    assert_eq!(env["vendor"]["summary"]["failed"], 0, "envelope: {env:#}");
+    // Positive assertion — an `applied` event for the qualified purl itself
+    // (a `.all(errorCode != platform_gem_unsupported)` check would pass
+    // vacuously on an empty event list).
+    assert!(
+        env["vendor"]["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["action"] == "applied" && e["purl"] == GEM_PURL_QUALIFIED),
+        "`platform=ruby` is the portable default and must vendor — expected \
+         an `applied` event for {GEM_PURL_QUALIFIED}: {env:#}"
+    );
+
+    // Manifest and ledger entry are keyed by the SERVED (qualified) purl;
+    // the ledger entry additionally records the qualifier-stripped
+    // `basePurl` (built by `build_gem_purl`) — both halves of the mapping.
+    let manifest: Value =
+        serde_json::from_slice(&std::fs::read(fx.root().join(".socket/manifest.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        manifest["patches"][GEM_PURL_QUALIFIED]["uuid"], GEM_UUID,
+        "manifest keys by the served purl: {manifest:#}"
+    );
+    let state: Value = serde_json::from_slice(&std::fs::read(fx.state_path()).unwrap()).unwrap();
+    assert_eq!(
+        state["entries"][GEM_PURL_QUALIFIED]["uuid"], GEM_UUID,
+        "ledger keys by the manifest (qualified) purl: {state:#}"
+    );
+    assert_eq!(
+        state["entries"][GEM_PURL_QUALIFIED]["basePurl"], GEM_PURL,
+        "ledger entry records the qualifier-stripped base purl: {state:#}"
+    );
+
+    // Artifact + pair edit land identically to the bare-purl flow. The
+    // vendored copy path is derived from name@version, so a qualifier
+    // leaking into it would surface in the lock's PATH remote below.
+    assert_eq!(
+        std::fs::read(fx.vendored_lib()).unwrap(),
+        GEM_PATCHED,
+        "vendored lib must hold the patched bytes"
+    );
+    assert_eq!(
+        std::fs::read_to_string(
+            fx.root()
+                .join(GemFixture::copy_rel())
+                .join("demo-gem.gemspec")
+        )
+        .unwrap(),
+        GEM_GEMSPEC,
+        "stub gemspec materialized from specifications/"
+    );
+    let gemfile = std::fs::read_to_string(fx.gemfile_path()).unwrap();
+    assert!(
+        gemfile.contains(&format!(
+            "gem \"demo-gem\", \"1.0.0\", path: \"{}\"",
+            GemFixture::copy_rel()
+        )),
+        "Gemfile line not rewritten to the exact-pin + path: form:\n{gemfile}"
+    );
+    let lock = std::fs::read_to_string(fx.lock_path()).unwrap();
+    assert!(
+        lock.contains(&format!(
+            "PATH\n  remote: {}\n  specs:\n    demo-gem (1.0.0)",
+            GemFixture::copy_rel()
+        )),
+        "canonical PATH section missing (or the qualifier leaked into the \
+         vendored path):\n{lock}"
+    );
+    assert!(
+        lock.contains("\n  demo-gem (= 1.0.0)!"),
+        "DEPENDENCIES pin missing:\n{lock}"
+    );
+}
+
+/// The QUALIFIED purl through `--detached` + `vendor --revert`: a detached
+/// ledger entry has NO manifest fallback, so the revert must find it via its
+/// own key/`basePurl` alone. The bare-purl detached shape is covered by
+/// [`scan_vendor_gem_detached_writes_no_manifest_and_reverts`]; this pins
+/// the qualified-key variant production publishes today.
+#[tokio::test]
+async fn scan_vendor_gem_detached_qualified_purl_reverts() {
+    let mock = wiremock::MockServer::start().await;
+    mount_gem_patch_api(&mock, GEM_PURL_QUALIFIED).await;
+    let fx = gem_fixture();
+
+    let (code, env) = run_scan_vendor(fx.root(), &mock.uri(), &["--detached"]);
+    assert_eq!(
+        code, 0,
+        "scan --vendor --detached must succeed on the qualified purl: {env:#}"
+    );
+    assert_eq!(env["vendor"]["summary"]["applied"], 1, "envelope: {env:#}");
+
+    assert!(
+        !fx.root().join(".socket/manifest.json").exists(),
+        "detached mode must not write a manifest"
+    );
+    let state: Value = serde_json::from_slice(&std::fs::read(fx.state_path()).unwrap()).unwrap();
+    assert_eq!(
+        state["entries"][GEM_PURL_QUALIFIED]["detached"],
+        json!(true),
+        "detached entry keyed by the qualified purl: {state:#}"
+    );
+    assert_eq!(
+        state["entries"][GEM_PURL_QUALIFIED]["basePurl"], GEM_PURL,
+        "detached entry records the base purl: {state:#}"
+    );
+    assert_eq!(std::fs::read(fx.vendored_lib()).unwrap(), GEM_PATCHED);
+
+    // `--revert` must locate the qualified-keyed detached entry (no manifest
+    // to fall back to) and byte-restore both pair-edit halves.
+    let (code, renv) = vendor_cli(fx.root(), &["--revert"]);
+    assert_eq!(code, 0, "revert must undo the detached entry: {renv:#}");
+    assert_eq!(
+        std::fs::read(fx.gemfile_path()).unwrap(),
+        GEM_GEMFILE.as_bytes(),
+        "revert must byte-restore the Gemfile"
+    );
+    assert_eq!(
+        std::fs::read(fx.lock_path()).unwrap(),
+        GEM_LOCK.as_bytes(),
+        "revert must byte-restore Gemfile.lock"
+    );
+    assert!(!fx.root().join(".socket/vendor").exists());
+}
+
 /// `scan --vendor --detached` on the gem project: no manifest is written,
 /// the ledger entry is detached with the patch record embedded, the pair
 /// edit still lands — and `vendor --revert` (the detached entry's only exit
@@ -2011,7 +2173,7 @@ async fn scan_vendor_gem_end_to_end_and_reconcile() {
 #[tokio::test]
 async fn scan_vendor_gem_detached_writes_no_manifest_and_reverts() {
     let mock = wiremock::MockServer::start().await;
-    mount_gem_patch_api(&mock).await;
+    mount_gem_patch_api(&mock, GEM_PURL).await;
     let fx = gem_fixture();
 
     let (code, env) = run_scan_vendor(fx.root(), &mock.uri(), &["--detached"]);
@@ -2332,8 +2494,7 @@ snapshots:
 
         // The lock is FULLY vendored: local wiring present, no hosted
         // residue.
-        let vendored_lock_text =
-            std::fs::read_to_string(root.join("pnpm-lock.yaml")).unwrap();
+        let vendored_lock_text = std::fs::read_to_string(root.join("pnpm-lock.yaml")).unwrap();
         assert!(
             !vendored_lock_text.contains(HOSTED_URL),
             "the hosted splice must be gone from the vendored lock:\n{vendored_lock_text}"
