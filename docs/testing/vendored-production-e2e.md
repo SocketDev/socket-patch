@@ -132,15 +132,23 @@ the gem-stub-gemspec artifact production serves is invalid — it is missing
 verbatim makes bundler reject the vendored `path:` source and
 `bundle install` exit 1 on every bundler major.
 
-**Mitigated CLI-side**: the gem vendor backend now validates the served stub
-(conservative textual check for the required assignment lines).
-`--vendor-source auto` detects the defect, warns
+**Mitigated CLI-side**: the gem vendor backend now validates BOTH stub sources
+at the write choke point (a conservative textual check matched to what
+rubygems 3.3–3.6 actually hard-fails — empirically verified in the bundler-era
+docker images). `--vendor-source auto` detects the served defect, warns
 (`vendor_prebuilt_stub_invalid`), and falls back to the local build — which is
 how `gem_bundler_vendored_install_proof` passes against production today —
 while explicit `--vendor-source service` refuses with
-`vendor_prebuilt_stub_invalid`. The server-side stub-generator fix plus the
-rebuild of all published gem artifacts are tracked in depscan; once deployed,
-the same leg exercises the service artifact directly.
+`vendor_prebuilt_stub_invalid`. When the gem is also not installed (no local
+stub to derive), `auto` refuses with the same code, the served defect named,
+and the install-the-gem remedy; a corrupted LOCAL `specifications/` stub
+refuses `gem_spec_invalid`. Re-vendoring a project that committed a defective
+stub pre-hardening re-validates the ON-DISK stub and rebuilds the artifact
+with a valid one. The leg's route-attribution assertion (exactly one of
+`vendor_prebuilt_downloaded` / `vendor_prebuilt_stub_invalid`) auto-retires
+the fallback expectation once the depscan stub-generator fix deploys and the
+rebuilt artifacts serve valid stubs — the same leg then exercises the service
+artifact directly.
 
 ## Running
 

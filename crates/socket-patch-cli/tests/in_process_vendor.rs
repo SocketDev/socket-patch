@@ -1734,7 +1734,7 @@ const GEM_PURL: &str = "pkg:gem/demo-gem@1.0.0";
 const GEM_PURL_QUALIFIED: &str = "pkg:gem/demo-gem@1.0.0?platform=ruby";
 const GEM_ORIG: &[u8] = b"module DemoGem\n  STATUS = \"orig\"\nend\n";
 const GEM_PATCHED: &[u8] = b"module DemoGem\n  STATUS = \"patched\"\nend\n";
-const GEM_GEMSPEC: &str = "Gem::Specification.new do |s|\n  s.name = \"demo-gem\"\n  s.version = \"1.0.0\"\n  s.summary = \"in-process scan --vendor fixture\"\n  s.require_paths = [\"lib\"]\nend\n";
+const GEM_GEMSPEC: &str = "Gem::Specification.new do |s|\n  s.name = \"demo-gem\"\n  s.version = \"1.0.0\"\n  s.summary = \"in-process scan --vendor fixture\"\n  s.authors = [\"socket-patch e2e\"]\n  s.require_paths = [\"lib\"]\nend\n";
 const GEM_GEMFILE: &str = "source \"https://rubygems.org\"\n\ngem \"demo-gem\", \"~> 1.0\"\n";
 /// Hand-pinned bundler lock grammar (no CHECKSUMS — the 2.x/3.x default).
 const GEM_LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    demo-gem (1.0.0)\n\nPLATFORMS\n  ruby\n\nDEPENDENCIES\n  demo-gem (~> 1.0)\n\nBUNDLED WITH\n   2.6.2\n";

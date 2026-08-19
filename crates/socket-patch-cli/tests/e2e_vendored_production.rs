@@ -54,7 +54,7 @@
 //! | Cargo  | `pkg:cargo/traitobject@0.1.1`   | `cf2e6f58-d9fa-4096-9151-c34afa717f89` | advisory id `GHSA-pp8r-vv2j-9j5v` |
 //! | gem    | `pkg:gem/activestorage@6.0.3`   | `15e960b5-f432-4b6c-b8aa-534a2b419323` | `Socket Community Patch` header |
 //!
-//! # Ecosystems with no full coverage, and why
+//! # Ecosystem coverage notes (gaps, and one resolved gap)
 //!
 //! * **gem** — RESOLVED: full coverage. The old `platform_gem_unsupported`
 //!   refusal for `?platform=ruby` purls was fixed in the CLI (#172 — only
@@ -341,9 +341,11 @@ fn scan_vendored(cwd: &Path, extra: &[&str]) -> serde_json::Value {
 ///
 /// `applied >= 1` is the anti-vacuity guard: a run that discovered nothing also
 /// exits 0 with `"status": "success"`, so without this a broken crawler would
-/// look identical to a working vendor. `failed == 0` catches partial failures
-/// (the gem leg deliberately does NOT go through here). The `applied` event's
-/// purl may carry qualifiers (`?artifact_id=…`), so a substring match is used.
+/// look identical to a working vendor. `failed == 0` catches partial failures.
+/// The gem leg uses the purl-SCOPED [`assert_vendor_applied_for`] instead: its
+/// fixture has many transitive gems, so run-wide counts would couple the leg
+/// to the production catalog's future patches. The `applied` event's purl may
+/// carry qualifiers (`?artifact_id=…`), so a substring match is used.
 fn assert_vendor_applied(env: &serde_json::Value, purl_needle: &str, leg: &str) {
     let vendor = &env["vendor"];
     assert!(
@@ -373,6 +375,52 @@ fn assert_vendor_applied(env: &serde_json::Value, purl_needle: &str, leg: &str) 
                     .unwrap_or(false)
         }),
         "{leg}: no `applied` event for a purl containing `{purl_needle}`.\nenvelope:\n{env:#}"
+    );
+}
+
+/// The events for purls containing `purl_needle` (substring — purls may carry
+/// qualifiers) with the given `action`.
+fn vendor_events_for<'a>(
+    env: &'a serde_json::Value,
+    purl_needle: &str,
+    action: &str,
+) -> Vec<&'a serde_json::Value> {
+    env["vendor"]["events"]
+        .as_array()
+        .map(|events| {
+            events
+                .iter()
+                .filter(|e| {
+                    e["action"] == action
+                        && e["purl"]
+                            .as_str()
+                            .map(|p| p.contains(purl_needle))
+                            .unwrap_or(false)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Purl-SCOPED variant of [`assert_vendor_applied`]: the named purl must have
+/// an `applied` event and NO `failed` event. Other purls' outcomes are the
+/// production catalog's business — a future free patch on a transitive gem of
+/// the fixture must not red this leg — so run-wide `summary` counts are
+/// deliberately not asserted.
+fn assert_vendor_applied_for(env: &serde_json::Value, purl_needle: &str, leg: &str) {
+    assert!(
+        !env["vendor"].is_null(),
+        "{leg}: scan --mode vendored emitted no `vendor` sub-object — the CLI omits it \
+         when discovery found nothing, so this means the crawler did not see the \
+         installed dependency.\nenvelope:\n{env:#}"
+    );
+    assert!(
+        !vendor_events_for(env, purl_needle, "applied").is_empty(),
+        "{leg}: no `applied` event for a purl containing `{purl_needle}`.\nenvelope:\n{env:#}"
+    );
+    assert!(
+        vendor_events_for(env, purl_needle, "failed").is_empty(),
+        "{leg}: a `failed` event for `{purl_needle}`.\nenvelope:\n{env:#}"
     );
 }
 
@@ -423,6 +471,29 @@ fn vendor_revert(cwd: &Path, leg: &str) -> u64 {
 // ---------------------------------------------------------------------------
 // Toolchain invocation
 // ---------------------------------------------------------------------------
+
+/// Run `bundle <args>` with the ambient `BUNDLE_*`/`GEM_*`/`RUBYOPT` state
+/// scrubbed first (a developer's global bundler config — frozen mode, a
+/// custom BUNDLE_PATH or gem home, a RUBYOPT require — must not leak into a
+/// leg that hard-asserts bundler outcomes; mirrors e2e_vendor_gem_build.rs).
+/// The cache sandbox re-pins its own BUNDLE_USER_HOME/GEM_SPEC_CACHE after
+/// the scrub, and the per-leg `env` is applied last so the leg's pins win.
+fn bundle(cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
+    let mut cmd = Command::new("bundle");
+    cmd.args(args).current_dir(cwd);
+    for (k, _) in std::env::vars_os() {
+        let key = k.to_string_lossy().into_owned();
+        if key.starts_with("BUNDLE_") || key.starts_with("GEM_") || key == "RUBYOPT" {
+            cmd.env_remove(&k);
+        }
+    }
+    cache_env::isolate(&mut cmd);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    cmd.output()
+        .unwrap_or_else(|e| panic!("failed to spawn `bundle`: {e}"))
+}
 
 /// Run an external package manager. Returns the `Output` without asserting, so
 /// callers can distinguish "the registry was unreachable" (soft-skip material
@@ -1725,9 +1796,13 @@ fn gem_bundler_vendored_install_proof() {
     // the project so no `.bundle/config` joins the committable set.
     let bundle_path = proj.join("vendor/bundle").display().to_string();
     let bundle_config = tmp.path().join("bundle-config").display().to_string();
+    // mimemagic (pulled via activestorage → marcel) builds against the system
+    // shared-mime-info DB, which not every host installs — use the gem's
+    // bundled placeholder instead of depending on a host package.
     let env = [
         ("BUNDLE_PATH", bundle_path.as_str()),
         ("BUNDLE_APP_CONFIG", bundle_config.as_str()),
+        ("USE_FREEDESKTOP_PLACEHOLDER", "true"),
     ];
 
     std::fs::write(
@@ -1736,28 +1811,26 @@ fn gem_bundler_vendored_install_proof() {
     )
     .expect("write Gemfile");
 
-    if !ok(&tool(&proj, "bundle", &["lock"], &env)) {
+    if !ok(&bundle(&proj, &["lock"], &env)) {
         soft_skip!(LEG, "`bundle lock` failed");
     }
-    let install = tool(&proj, "bundle", &["install", "--quiet"], &env);
+    let install = bundle(&proj, &["install", "--quiet"], &env);
     if !ok(&install) {
         soft_skip!(LEG, "upstream `bundle install` failed:\n{}", dump(&install));
     }
 
     // Anti-vacuity: the upstream install must be pristine. `bundle info
     // --path` reports the exact directory bundler resolved for the gem.
-    let info = tool(&proj, "bundle", &["info", GEM_NAME, "--path"], &env);
+    let info = bundle(&proj, &["info", GEM_NAME, "--path"], &env);
     assert!(
         ok(&info),
         "{LEG}: `bundle info {GEM_NAME} --path` failed after the upstream install:\n{}",
         dump(&info)
     );
     let installed_dir = PathBuf::from(String::from_utf8_lossy(&info.stdout).trim());
-    assert_pristine(
-        &installed_dir.join("lib/active_storage/service/s3_service.rb"),
-        PATCH_MARKER,
-        LEG,
-    );
+    let patched_file_rel = "lib/active_storage/service/s3_service.rb";
+    assert_pristine(&installed_dir.join(patched_file_rel), PATCH_MARKER, LEG);
+    let pristine = std::fs::read(installed_dir.join(patched_file_rel)).unwrap();
     let gemfile_before = std::fs::read(proj.join("Gemfile")).unwrap();
     let lock_before = std::fs::read(proj.join("Gemfile.lock")).unwrap();
 
@@ -1768,7 +1841,38 @@ fn gem_bundler_vendored_install_proof() {
         0,
         "{LEG}: the gem patch download failed.\nenvelope:\n{env_json:#}"
     );
-    assert_vendor_applied(&env_json, &format!("{GEM_NAME}@{GEM_VERSION}"), LEG);
+    // Purl-scoped (NOT run-wide counts): a future free patch on one of the
+    // fixture's transitive Rails gems must not red this leg.
+    assert_vendor_applied_for(&env_json, &format!("{GEM_NAME}@{GEM_VERSION}"), LEG);
+
+    // Route attribution: EXACTLY one of the two markers must be present for
+    // this purl — the service artifact was used (`vendor_prebuilt_downloaded`)
+    // or the invalid-served-stub fallback built locally
+    // (`vendor_prebuilt_stub_invalid`). Asserting exactly one auto-retires the
+    // fallback expectation the moment the depscan stub fix deploys and the
+    // rebuilt artifacts serve valid stubs (and catches both-or-neither as a
+    // defect either way).
+    let route_markers = env_json["vendor"]["events"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter(|e| {
+            e["purl"]
+                .as_str()
+                .map(|p| p.contains(GEM_NAME))
+                .unwrap_or(false)
+                && matches!(
+                    e["errorCode"].as_str(),
+                    Some("vendor_prebuilt_stub_invalid") | Some("vendor_prebuilt_downloaded")
+                )
+        })
+        .count();
+    assert_eq!(
+        route_markers, 1,
+        "{LEG}: expected exactly one route marker (vendor_prebuilt_downloaded XOR \
+         vendor_prebuilt_stub_invalid) for {GEM_NAME}.\nenvelope:\n{env_json:#}"
+    );
 
     // The committable artifact + the mandatory pair edit.
     let copy_rel = format!(".socket/vendor/gem/{GEM_UUID}/{GEM_NAME}-{GEM_VERSION}");
@@ -1817,9 +1921,11 @@ fn gem_bundler_vendored_install_proof() {
         ("BUNDLE_PATH", fresh_bundle.as_str()),
         ("BUNDLE_APP_CONFIG", fresh_bundle.as_str()),
         ("BUNDLE_FROZEN", "true"),
+        // Same shared-mime-info hazard as the upstream install above.
+        ("USE_FREEDESKTOP_PLACEHOLDER", "true"),
     ];
     let lock_committed = std::fs::read(fresh.join("Gemfile.lock")).unwrap();
-    let fresh_install = tool(&fresh, "bundle", &["install"], &fresh_env);
+    let fresh_install = bundle(&fresh, &["install"], &fresh_env);
     assert!(
         ok(&fresh_install),
         "{LEG}: frozen `bundle install` from the committable files failed:\n{}",
@@ -1830,9 +1936,13 @@ fn gem_bundler_vendored_install_proof() {
         lock_committed,
         "{LEG}: frozen `bundle install` churned the committed Gemfile.lock"
     );
-    // Bundler must have resolved the gem FROM the vendored path source, and
-    // the bytes it will load must carry the patch marker.
-    let fresh_info = tool(&fresh, "bundle", &["info", GEM_NAME, "--path"], &fresh_env);
+    // Bundler must have resolved the gem FROM the vendored path source INSIDE
+    // the fresh dir, and the bytes it will load must carry the patch marker
+    // and differ from the captured pristine registry bytes. (`contains`
+    // alone would also match the ORIGINAL project's vendored path;
+    // canonicalize both sides — macOS reports tempdirs via /var symlinked to
+    // /private/var.)
+    let fresh_info = bundle(&fresh, &["info", GEM_NAME, "--path"], &fresh_env);
     assert!(
         ok(&fresh_info),
         "{LEG}: `bundle info {GEM_NAME} --path` failed after the fresh install:\n{}",
@@ -1841,25 +1951,35 @@ fn gem_bundler_vendored_install_proof() {
     let resolved = String::from_utf8_lossy(&fresh_info.stdout)
         .trim()
         .to_string();
+    let resolved_canon = std::fs::canonicalize(&resolved)
+        .unwrap_or_else(|e| panic!("{LEG}: cannot canonicalize `{resolved}`: {e}"));
+    let fresh_canon = std::fs::canonicalize(&fresh).unwrap();
     assert!(
-        resolved.contains(&copy_rel),
+        resolved_canon.starts_with(&fresh_canon) && resolved.contains(&copy_rel),
         "{LEG}: bundler resolved {GEM_NAME} from `{resolved}`, not the vendored \
-         path `{copy_rel}` — the pair edit did not take effect in the fresh dir"
+         path `{copy_rel}` inside the fresh dir — the pair edit did not take \
+         effect in the fresh dir"
     );
     assert_patched(
-        &PathBuf::from(&resolved).join("lib/active_storage/service/s3_service.rb"),
+        &PathBuf::from(&resolved).join(patched_file_rel),
         PATCH_MARKER,
         LEG,
     );
+    assert_ne!(
+        std::fs::read(PathBuf::from(&resolved).join(patched_file_rel)).unwrap(),
+        pristine,
+        "{LEG}: the reinstalled bytes equal the PRISTINE registry bytes — the vendored \
+         artifact was not the one installed"
+    );
 
-    // Idempotency + revert (mirrors the pip/uv legs).
+    // Idempotency + revert (mirrors the pip/uv legs; purl-scoped so a future
+    // free patch on a transitive gem cannot red the leg).
     let gemfile_wired = std::fs::read(proj.join("Gemfile")).unwrap();
     let lock_wired = std::fs::read(proj.join("Gemfile.lock")).unwrap();
     let env2 = scan_vendored(&proj, &[]);
-    assert_eq!(
-        env2["vendor"]["summary"]["applied"].as_u64().unwrap_or(99),
-        0,
-        "{LEG}: re-run must vendor nothing new:\n{env2:#}"
+    assert!(
+        vendor_events_for(&env2, GEM_NAME, "applied").is_empty(),
+        "{LEG}: re-run must vendor nothing new for {GEM_NAME}:\n{env2:#}"
     );
     assert_eq!(
         std::fs::read(proj.join("Gemfile")).unwrap(),
@@ -1872,7 +1992,10 @@ fn gem_bundler_vendored_install_proof() {
         "{LEG}: re-run must leave Gemfile.lock byte-identical"
     );
 
-    assert_eq!(vendor_revert(&proj, LEG), 1, "{LEG}: one entry reverted");
+    assert!(
+        vendor_revert(&proj, LEG) >= 1,
+        "{LEG}: at least the {GEM_NAME} entry reverted"
+    );
     assert_eq!(
         std::fs::read(proj.join("Gemfile")).unwrap(),
         gemfile_before,
