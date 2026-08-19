@@ -96,21 +96,51 @@ impl LockfileEntry {
     }
 }
 
+/// A project layout whose npm-family packages the inventory structurally
+/// CANNOT serve — distinct from "no lockfile" (`Ok(None)`), which is a
+/// normal, silent state. Today: the Plug'n'Play loaders (yarn berry's PnP,
+/// and pnpm's own `node-linker=pnp` mode). Consumers surface this as an
+/// explicit refusal instead of a silent empty inventory: under yarn PnP the
+/// installed-tree crawl is ALSO structurally empty (no `node_modules/`), so
+/// swallowing this diagnosis used to turn `scan` into a silent
+/// success-0 no-op in every mode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsupportedNpmLayout {
+    /// Stable diagnosis code from the flavor probe:
+    /// `vendor_yarn_berry_unsupported` or `vendor_pnpm_pnp_unsupported`.
+    pub code: &'static str,
+    /// Human-readable diagnosis with remedy.
+    pub detail: String,
+}
+
 /// Inventory the project's npm-family lockfile. Routes by
-/// [`detect_npm_lock_flavor`] (PnP markers, bun.lockb, unsupported lock
-/// versions, and a missing lockfile all yield `None`).
+/// [`detect_npm_lock_flavor`]. `Ok(None)` means there is nothing to
+/// inventory (missing lockfile, bun.lockb, unsupported lock versions);
+/// `Err` propagates the probe's Plug'n'Play diagnosis — a layout whose
+/// packages the inventory can NEVER serve, which callers must not conflate
+/// with the calm no-lockfile case.
 pub(crate) async fn inventory_npm_lock(
     project_root: &Path,
-) -> Option<(NpmLockFlavor, Vec<LockfileEntry>)> {
+) -> Result<Option<(NpmLockFlavor, Vec<LockfileEntry>)>, UnsupportedNpmLayout> {
     // Rush monorepos have no root package.json/lock pair; their single
     // pnpm source-of-truth lives under common/config/rush/. The flavor
     // probe (root-relative) can't see it, so fall back explicitly when the
     // root lock is absent but rush.json is present.
     let (flavor, _warnings) = match detect_npm_lock_flavor(project_root).await {
         Ok(found) => found,
-        Err(_) => {
+        Err((code, detail)) => {
+            // The PnP loaders are a refusal, not an absence: propagate the
+            // diagnosis instead of discarding it. Every other probe error
+            // (missing lock, bun.lockb, unsupported versions) keeps the
+            // Rush fallback and the calm `Ok(None)`.
+            if matches!(
+                code,
+                "vendor_yarn_berry_unsupported" | "vendor_pnpm_pnp_unsupported"
+            ) {
+                return Err(UnsupportedNpmLayout { code, detail });
+            }
             let rush = inventory_rush_pnpm_locks(project_root).await;
-            return (!rush.is_empty()).then(|| (NpmLockFlavor::Pnpm, finalize_npm(rush)));
+            return Ok((!rush.is_empty()).then(|| (NpmLockFlavor::Pnpm, finalize_npm(rush))));
         }
     };
     let raw = match flavor {
@@ -119,8 +149,8 @@ pub(crate) async fn inventory_npm_lock(
         NpmLockFlavor::YarnClassic => inventory_yarn_classic(project_root).await,
         NpmLockFlavor::YarnBerry => inventory_yarn_berry(project_root).await,
         NpmLockFlavor::Bun => inventory_bun(project_root).await,
-    }?;
-    Some((flavor, finalize_npm(raw)))
+    };
+    Ok(raw.map(|raw| (flavor, finalize_npm(raw))))
 }
 
 /// Match a manifest/API purl (possibly percent-encoded, possibly carrying
@@ -151,11 +181,26 @@ pub fn lookup<'a>(entries: &'a [LockfileEntry], purl: &str) -> Option<&'a Lockfi
 }
 
 /// Everything every recognized lockfile in the project resolves — the
-/// union the scan supplement and the vendor auto-fetch consume.
+/// union the scan supplement and the vendor auto-fetch consume. Drops the
+/// npm-layout diagnosis; callers that must surface refusals (scan) use
+/// [`inventory_project_diagnosed`].
 pub async fn inventory_project(project_root: &Path) -> Vec<LockfileEntry> {
+    inventory_project_diagnosed(project_root).await.0
+}
+
+/// [`inventory_project`] plus the npm-family layout refusals it hit: a
+/// Plug'n'Play project yields no npm entries AND a diagnosis, so consumers
+/// can tell "nothing to inventory" from "packages structurally unreachable"
+/// and refuse explicitly instead of silently reporting an empty project.
+pub async fn inventory_project_diagnosed(
+    project_root: &Path,
+) -> (Vec<LockfileEntry>, Vec<UnsupportedNpmLayout>) {
     let mut out: Vec<LockfileEntry> = Vec::new();
-    if let Some((_, entries)) = inventory_npm_lock(project_root).await {
-        out.extend(entries);
+    let mut unsupported: Vec<UnsupportedNpmLayout> = Vec::new();
+    match inventory_npm_lock(project_root).await {
+        Ok(Some((_, entries))) => out.extend(entries),
+        Ok(None) => {}
+        Err(diag) => unsupported.push(diag),
     }
     if let Some(entries) = inventory_cargo_lock(project_root).await {
         out.extend(entries);
@@ -172,7 +217,7 @@ pub async fn inventory_project(project_root: &Path) -> Vec<LockfileEntry> {
     if let Some(entries) = inventory_pypi_locks(project_root).await {
         out.extend(entries);
     }
-    out
+    (out, unsupported)
 }
 
 /// Guard + dedup the raw npm entries: unsafe names/versions are dropped
@@ -1569,7 +1614,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         write(tmp.path(), "package-lock.json", PACKAGE_LOCK).await;
 
-        let (flavor, entries) = inventory_npm_lock(tmp.path()).await.unwrap();
+        let (flavor, entries) = inventory_npm_lock(tmp.path()).await.unwrap().unwrap();
         assert_eq!(flavor, NpmLockFlavor::PackageLock);
 
         let lp = entry(&entries, "left-pad");
@@ -1611,7 +1656,7 @@ mod tests {
         )
         .await;
 
-        let (_, entries) = inventory_npm_lock(tmp.path()).await.unwrap();
+        let (_, entries) = inventory_npm_lock(tmp.path()).await.unwrap().unwrap();
         assert!(entries.iter().any(|e| e.name == "only-in-shrinkwrap"));
         assert!(!entries.iter().any(|e| e.name == "left-pad"));
     }
@@ -1625,7 +1670,7 @@ mod tests {
             r#"{ "lockfileVersion": 1, "dependencies": { "left-pad": { "version": "1.3.0" } } }"#,
         )
         .await;
-        assert!(inventory_npm_lock(tmp.path()).await.is_none());
+        assert!(inventory_npm_lock(tmp.path()).await.unwrap().is_none());
     }
 
     // ── pnpm ──────────────────────────────────────────────────────────────
@@ -1670,7 +1715,7 @@ snapshots:
         let tmp = tempfile::tempdir().unwrap();
         write(tmp.path(), "pnpm-lock.yaml", PNPM_LOCK).await;
 
-        let (flavor, entries) = inventory_npm_lock(tmp.path()).await.unwrap();
+        let (flavor, entries) = inventory_npm_lock(tmp.path()).await.unwrap().unwrap();
         assert_eq!(flavor, NpmLockFlavor::Pnpm);
 
         assert_eq!(
@@ -1717,7 +1762,7 @@ packages:
         )
         .await;
 
-        let (flavor, entries) = inventory_npm_lock(tmp.path()).await.unwrap();
+        let (flavor, entries) = inventory_npm_lock(tmp.path()).await.unwrap().unwrap();
         assert_eq!(flavor, NpmLockFlavor::Pnpm);
         // Union across the common lock and the subspace lock.
         assert_eq!(entry(&entries, "left-pad").version, "1.3.0");
@@ -1729,7 +1774,7 @@ packages:
         // rush.json but no common/subspace lock at all: nothing to inventory.
         let tmp = tempfile::tempdir().unwrap();
         write(tmp.path(), "rush.json", r#"{"rushVersion":"5.0.0"}"#).await;
-        assert!(inventory_npm_lock(tmp.path()).await.is_none());
+        assert!(inventory_npm_lock(tmp.path()).await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -1752,7 +1797,7 @@ packages:
         )
         .await;
 
-        let (flavor, entries) = inventory_npm_lock(tmp.path()).await.unwrap();
+        let (flavor, entries) = inventory_npm_lock(tmp.path()).await.unwrap().unwrap();
         assert_eq!(flavor, NpmLockFlavor::Pnpm);
         assert!(entries.iter().any(|e| e.name == "left-pad"));
         assert!(
@@ -1792,7 +1837,7 @@ aliased@npm:real-name@^3.0.0:
         let tmp = tempfile::tempdir().unwrap();
         write(tmp.path(), "yarn.lock", YARN_CLASSIC).await;
 
-        let (flavor, entries) = inventory_npm_lock(tmp.path()).await.unwrap();
+        let (flavor, entries) = inventory_npm_lock(tmp.path()).await.unwrap().unwrap();
         assert_eq!(flavor, NpmLockFlavor::YarnClassic);
 
         let lp = entry(&entries, "left-pad");
@@ -1850,7 +1895,7 @@ __metadata:
         let tmp = tempfile::tempdir().unwrap();
         write(tmp.path(), "yarn.lock", YARN_BERRY).await;
 
-        let (flavor, entries) = inventory_npm_lock(tmp.path()).await.unwrap();
+        let (flavor, entries) = inventory_npm_lock(tmp.path()).await.unwrap().unwrap();
         assert_eq!(flavor, NpmLockFlavor::YarnBerry);
 
         let lp = entry(&entries, "left-pad");
@@ -1885,7 +1930,7 @@ __metadata:
         let tmp = tempfile::tempdir().unwrap();
         write(tmp.path(), "bun.lock", BUN_LOCK).await;
 
-        let (flavor, entries) = inventory_npm_lock(tmp.path()).await.unwrap();
+        let (flavor, entries) = inventory_npm_lock(tmp.path()).await.unwrap().unwrap();
         assert_eq!(flavor, NpmLockFlavor::Bun);
 
         assert_eq!(
@@ -2292,21 +2337,54 @@ source = { editable = "." }
     }
 
     #[tokio::test]
-    async fn unsupported_flavors_yield_none() {
-        // PnP marker wins over any lockfile.
+    async fn pnp_layouts_propagate_the_diagnosis_instead_of_yielding_none() {
+        // PnP marker wins over any lockfile — and the diagnosis must
+        // PROPAGATE, not collapse into the calm no-lockfile `None`. Under
+        // yarn PnP the installed-tree crawl is also structurally empty, so
+        // swallowing this here made `scan` a silent success-0 no-op in
+        // every mode (the P0 this pins).
         let tmp = tempfile::tempdir().unwrap();
         write(tmp.path(), ".pnp.cjs", "/* pnp */").await;
         write(tmp.path(), "package-lock.json", PACKAGE_LOCK).await;
-        assert!(inventory_npm_lock(tmp.path()).await.is_none());
+        let diag = inventory_npm_lock(tmp.path()).await.unwrap_err();
+        assert_eq!(diag.code, "vendor_yarn_berry_unsupported");
+        assert!(diag.detail.contains("Plug'n'Play"), "{}", diag.detail);
+        assert!(diag.detail.contains("yarn patch"), "{}", diag.detail);
 
-        // pnpm v6.
+        // pnpm's own `node-linker=pnp` twin (same loader, pnpm store):
+        // same channel, pnpm diagnosis.
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), ".pnp.cjs", "/* pnp */").await;
+        write(tmp.path(), "pnpm-lock.yaml", "lockfileVersion: '9.0'\n").await;
+        tokio::fs::create_dir_all(tmp.path().join("node_modules/.pnpm"))
+            .await
+            .unwrap();
+        write(&tmp.path().join("node_modules"), ".modules.yaml", "").await;
+        let diag = inventory_npm_lock(tmp.path()).await.unwrap_err();
+        assert_eq!(diag.code, "vendor_pnpm_pnp_unsupported");
+        assert!(diag.detail.contains("node-linker=pnp"), "{}", diag.detail);
+
+        // And the project-level union surfaces the same diagnosis while
+        // still serving the OTHER ecosystems' lockfiles.
+        let (entries, unsupported) = inventory_project_diagnosed(tmp.path()).await;
+        assert!(entries.is_empty(), "{entries:?}");
+        assert_eq!(unsupported.len(), 1, "{unsupported:?}");
+        assert_eq!(unsupported[0].code, "vendor_pnpm_pnp_unsupported");
+    }
+
+    #[tokio::test]
+    async fn unsupported_flavors_yield_none() {
+        // pnpm v6: no backend, but not a refusal — the calm None.
         let tmp = tempfile::tempdir().unwrap();
         write(tmp.path(), "pnpm-lock.yaml", "lockfileVersion: '6.0'\n").await;
-        assert!(inventory_npm_lock(tmp.path()).await.is_none());
+        assert!(inventory_npm_lock(tmp.path()).await.unwrap().is_none());
 
         // No lockfile at all.
         let tmp = tempfile::tempdir().unwrap();
-        assert!(inventory_npm_lock(tmp.path()).await.is_none());
+        assert!(inventory_npm_lock(tmp.path()).await.unwrap().is_none());
+        let (entries, unsupported) = inventory_project_diagnosed(tmp.path()).await;
+        assert!(entries.is_empty());
+        assert!(unsupported.is_empty(), "{unsupported:?}");
     }
 }
 
