@@ -57,6 +57,7 @@ const SOCKET_ENV_VARS: &[&str] = &[
     "SOCKET_TELEMETRY_DISABLED",
     "SOCKET_ONE_OFF",
     "SOCKET_SKIP_ROLLBACK",
+    "SOCKET_NO_TRUST_LOCKFILE_CONFIG",
 ];
 
 /// Drift guard: the scrub must cover every env var `GlobalArgs` binds — the
@@ -148,6 +149,8 @@ fn dead_port() -> u16 {
 fn remove_rollback_downloads_missing_blob_via_flag_overrides() {
     let before = b"original-content\n";
     let before_hash = git_sha256(before);
+    let after = b"patched-content\n";
+    let after_hash = git_sha256(after);
 
     let (port, seen_paths) = spawn_blob_server(before_hash.clone(), before.to_vec());
     let dead = dead_port();
@@ -155,6 +158,25 @@ fn remove_rollback_downloads_missing_blob_via_flag_overrides() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let socket = tmp.path().join(".socket");
     std::fs::create_dir_all(socket.join("blobs")).unwrap();
+    // The package must be INSTALLED, at its patched (afterHash) state:
+    // since the before-blob gate reorder, only installed packages whose
+    // files genuinely need their original bytes back enter the blob plan —
+    // a manifest-only entry is a benign `package_not_installed` skip that
+    // never downloads anything, and the restore below must succeed for
+    // `remove` to exit 0.
+    std::fs::write(
+        tmp.path().join("package.json"),
+        r#"{ "name": "ovr-root", "version": "0.0.0" }"#,
+    )
+    .unwrap();
+    let pkg_dir = tmp.path().join("node_modules/__ovr_test__");
+    std::fs::create_dir_all(&pkg_dir).unwrap();
+    std::fs::write(
+        pkg_dir.join("package.json"),
+        r#"{ "name": "__ovr_test__", "version": "1.0.0" }"#,
+    )
+    .unwrap();
+    std::fs::write(pkg_dir.join("index.js"), after).unwrap();
     // The before-blob is deliberately ABSENT from .socket/blobs: the
     // rollback gate must download it through the flag-configured client.
     let manifest = format!(
@@ -166,7 +188,7 @@ fn remove_rollback_downloads_missing_blob_via_flag_overrides() {
       "files": {{
         "package/index.js": {{
           "beforeHash": "{before_hash}",
-          "afterHash": "1111111111111111111111111111111111111111111111111111111111111111"
+          "afterHash": "{after_hash}"
         }}
       }},
       "vulnerabilities": {{}},

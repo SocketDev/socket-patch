@@ -75,6 +75,28 @@ fn make_socket_dir(root: &Path) -> PathBuf {
     socket
 }
 
+/// Install the `MANIFEST_JSON` package (`__rollback_test__@1.0.0`) as a fake
+/// npm package so the crawler discovers it. The installed `index.js` matches
+/// NEITHER manifest hash — the file exists and is not already original, so
+/// the engine genuinely needs the before-blob and the pre-flight gate must
+/// protect it. Since the gate reorder, only installed packages enter the
+/// before-blob plan: a manifest-only fixture no longer exercises the gate.
+fn install_manifest_package(root: &Path) {
+    std::fs::write(
+        root.join("package.json"),
+        r#"{ "name": "rollback-invariants-root", "version": "0.0.0" }"#,
+    )
+    .expect("write root package.json");
+    let pkg_dir = root.join("node_modules/__rollback_test__");
+    std::fs::create_dir_all(&pkg_dir).expect("create package dir");
+    std::fs::write(
+        pkg_dir.join("package.json"),
+        r#"{ "name": "__rollback_test__", "version": "1.0.0" }"#,
+    )
+    .expect("write package.json");
+    std::fs::write(pkg_dir.join("index.js"), b"installed-but-drifted\n").expect("write index.js");
+}
+
 fn run(cwd: &Path, args: &[&str]) -> (i32, String) {
     let out = rollback_cmd(cwd)
         .args(args)
@@ -260,15 +282,20 @@ const MISSING_BEFORE_HASH: &str =
 
 #[test]
 fn rollback_offline_with_missing_before_blob_partial_failure() {
-    // Manifest has a patch whose beforeHash is NOT on disk; --offline
+    // The package is INSTALLED (drifted bytes, so the before-blob is
+    // genuinely needed) but its beforeHash blob is NOT on disk; --offline
     // means we won't fetch. Rollback must fail out before touching
     // anything — and the JSON envelope must SAY so. The bail fires before
     // the rollback loop produces any per-package results, so the failures
     // are synthesized: before the fix the envelope claimed `failed: 0`
     // with empty `results[]` on an exit-1 run, and `--json` mutes the
     // stderr explanation, leaving machine consumers zero diagnostic.
+    // (Installing the package matters since the gate reorder: an entry
+    // with no installed package never enters the blob plan — see
+    // `rollback_only_not_installed_entry_is_never_blob_gated`.)
     let tmp = tempfile::tempdir().expect("tempdir");
     make_socket_dir(tmp.path());
+    install_manifest_package(tmp.path());
     let (code, stdout) = run(tmp.path(), &["--json", "--offline"]);
     assert_eq!(
         code, 1,
@@ -295,6 +322,10 @@ fn rollback_offline_with_missing_before_blob_partial_failure() {
     let entry = &results[0];
     assert_eq!(entry["purl"], "pkg:npm/__rollback_test__@1.0.0");
     assert_eq!(entry["success"], false);
+    assert!(
+        !entry["path"].as_str().expect("path string").is_empty(),
+        "a blob-gated package is installed, so its path must be reported; stdout=\n{stdout}"
+    );
     assert_eq!(
         entry["filesRolledBack"]
             .as_array()
@@ -342,6 +373,7 @@ fn rollback_offline_with_missing_before_blob_partial_failure() {
 fn rollback_offline_missing_blob_human_names_package_and_remedy() {
     let tmp = tempfile::tempdir().expect("tempdir");
     make_socket_dir(tmp.path());
+    install_manifest_package(tmp.path());
     let out = rollback_cmd(tmp.path())
         .args(["--offline"])
         .output()
@@ -381,6 +413,7 @@ fn rollback_offline_missing_blob_human_names_package_and_remedy() {
 fn rollback_undownloadable_blob_envelope_names_blob_and_remedy() {
     let tmp = tempfile::tempdir().expect("tempdir");
     make_socket_dir(tmp.path());
+    install_manifest_package(tmp.path());
     let out = rollback_cmd(tmp.path())
         .env("SOCKET_TELEMETRY_DISABLED", "1")
         .args([
@@ -439,13 +472,77 @@ fn rollback_undownloadable_blob_envelope_names_blob_and_remedy() {
 }
 
 // ---------------------------------------------------------------------------
-// No-package-installed happy path
+// Not-installed manifest entries (apply-mirrored contract)
 // ---------------------------------------------------------------------------
+
+/// Shared assertions for the "manifest holds ONLY a not-installed entry"
+/// envelope, blob staged or not — the two must be indistinguishable, because
+/// a not-installed entry never enters the before-blob plan at all.
+///
+/// CONTRACT (deliberately ASYMMETRIC with `apply`): a manifest whose
+/// in-scope entries ALL lack an installed package exits 0 with status
+/// `success`. Apply's job is "make the tree patched", so its all-unmatched
+/// run is a `partialFailure` — the job was NOT done; rollback's job is
+/// "make the tree unpatched", and a not-installed package already
+/// satisfies that end state. Each such entry is surfaced as one skipped
+/// marker appended to `results[]` — `path` null, `skipped:
+/// "package_not_installed"`, no `success`/`error` keys — NEVER as a failed
+/// result: `failed` stays 0 and no result ever carries `path: ""`. There
+/// is no top-level `notInstalled` key.
+fn assert_only_not_installed_envelope(code: i32, stdout: &str) {
+    assert_eq!(
+        code, 0,
+        "all-not-installed succeeds quietly (the tree is already unpatched; \
+         see the asymmetry contract above); stdout=\n{stdout}"
+    );
+    let v: serde_json::Value = serde_json::from_str(stdout).expect("valid JSON");
+    assert_eq!(v["status"], "success", "stdout=\n{stdout}");
+    assert_eq!(v["rolledBack"], 0);
+    assert_eq!(v["alreadyOriginal"], 0);
+    assert_eq!(
+        v["failed"], 0,
+        "nothing was attempted, so nothing failed — a not-installed entry \
+         is a skip, not a failure; stdout=\n{stdout}"
+    );
+    assert!(
+        v.get("notInstalled").is_none(),
+        "the top-level notInstalled key was dropped in favor of per-entry \
+         skipped markers in results[]; stdout=\n{stdout}"
+    );
+    let results = v["results"].as_array().expect("results array");
+    assert_eq!(
+        results.len(),
+        1,
+        "exactly one skipped marker for the one not-installed entry; \
+         stdout=\n{stdout}"
+    );
+    let marker = &results[0];
+    assert_eq!(marker["purl"], "pkg:npm/__rollback_test__@1.0.0");
+    assert!(
+        marker["path"].is_null(),
+        "no installed tree to name — path must be null, never \"\"; \
+         stdout=\n{stdout}"
+    );
+    assert_eq!(
+        marker["skipped"], "package_not_installed",
+        "stdout=\n{stdout}"
+    );
+    assert!(
+        marker.get("success").is_none() && marker.get("error").is_none(),
+        "a skipped marker is not a result record; stdout=\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("missing_blob") && !stdout.contains("Before blob not found"),
+        "a not-installed entry must never surface a blob problem; stdout=\n{stdout}"
+    );
+}
 
 #[test]
 fn rollback_with_no_installed_packages_succeeds_quietly() {
-    // beforeHash blob is on disk, no installed packages match — rollback
-    // succeeds with zero results.
+    // beforeHash blob IS on disk, no installed packages match. Nothing to
+    // roll back → exit 0: rollback's goal ("tree unpatched") is already
+    // met, unlike apply's all-unmatched partialFailure (see the asymmetry
+    // contract on `assert_only_not_installed_envelope`).
     let tmp = tempfile::tempdir().expect("tempdir");
     let socket = make_socket_dir(tmp.path());
     let before_hash = "0000000000000000000000000000000000000000000000000000000000000000";
@@ -453,16 +550,193 @@ fn rollback_with_no_installed_packages_succeeds_quietly() {
     std::fs::create_dir_all(&blobs).unwrap();
     std::fs::write(blobs.join(before_hash), b"original content").unwrap();
 
-    let (code, stdout) = run(tmp.path(), &["--json"]);
+    let (code, stdout) = run(tmp.path(), &["--json", "--offline"]);
+    assert_only_not_installed_envelope(code, &stdout);
+}
+
+/// Regression (rollback ordering, pnpm matrix legs): the SAME manifest with
+/// the before-blob MISSING must produce the identical envelope — the entry
+/// has no installed package, so its blob is never planned, probed, or
+/// fetched. Before the gate reorder this run hard-failed with exit 1,
+/// `failed: 1`, and a synthesized `Cannot rollback: ... Before blob not
+/// found` result carrying `path: ""` — a blob error for a package with
+/// nothing on disk to roll back.
+#[test]
+fn rollback_only_not_installed_entry_is_never_blob_gated() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    make_socket_dir(tmp.path());
+    // No node_modules, no .socket/blobs — nothing installed, no blobs.
+
+    let (code, stdout) = run(tmp.path(), &["--json", "--offline"]);
+    assert_only_not_installed_envelope(code, &stdout);
+}
+
+/// Online twin: a not-installed entry must not trigger a blob download
+/// either. Both endpoints are pinned to an unroutable localhost port — if
+/// the gate still planned this blob, the fetch would fail and the envelope
+/// would carry a `could not be downloaded` failure. Instead the run never
+/// fetches and reports the quiet not-installed success envelope.
+#[test]
+fn rollback_not_installed_entry_triggers_no_blob_download() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    make_socket_dir(tmp.path());
+
+    let out = rollback_cmd(tmp.path())
+        .env("SOCKET_TELEMETRY_DISABLED", "1")
+        .args([
+            "--json",
+            "--api-url",
+            "http://127.0.0.1:1/",
+            "--proxy-url",
+            "http://127.0.0.1:1/",
+        ])
+        .output()
+        .expect("run socket-patch");
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert_only_not_installed_envelope(out.status.code().unwrap_or(-1), &stdout);
+    assert!(
+        !stdout.contains("could not be downloaded") && !stderr.contains("could not be downloaded"),
+        "no download may be attempted for a not-installed entry's blob; \
+         stdout=\n{stdout}\nstderr=\n{stderr}"
+    );
+}
+
+/// Mixed manifest: one entry INSTALLED with its before-blob missing (must
+/// still fail with the pinned missing-blob abort envelope), one entry NOT
+/// installed (must surface as a skipped marker in `results[]`, never as a
+/// failed result, and never with `path: ""`). The failure comes solely
+/// from the installed package; the not-installed entry rides along as a
+/// skip.
+#[test]
+fn rollback_mixed_installed_gated_and_not_installed_entries() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let socket = tmp.path().join(".socket");
+    std::fs::create_dir_all(&socket).unwrap();
+    // Two patches: `installed-target` (on disk below) and
+    // `__ghost__` (nothing on disk). Both name missing before-blobs.
+    std::fs::write(
+        socket.join("manifest.json"),
+        r#"{ "patches": {
+            "pkg:npm/installed-target@1.0.0": {
+                "uuid": "66666666-6666-4666-8666-666666666666",
+                "exportedAt": "2024-01-01T00:00:00Z",
+                "files": { "package/index.js": {
+                    "beforeHash": "0000000000000000000000000000000000000000000000000000000000000000",
+                    "afterHash":  "1111111111111111111111111111111111111111111111111111111111111111"
+                }},
+                "vulnerabilities": {}, "description": "x",
+                "license": "MIT", "tier": "free"
+            },
+            "pkg:npm/__ghost__@2.0.0": {
+                "uuid": "77777777-7777-4777-8777-777777777777",
+                "exportedAt": "2024-01-01T00:00:00Z",
+                "files": { "package/index.js": {
+                    "beforeHash": "2222222222222222222222222222222222222222222222222222222222222222",
+                    "afterHash":  "3333333333333333333333333333333333333333333333333333333333333333"
+                }},
+                "vulnerabilities": {}, "description": "x",
+                "license": "MIT", "tier": "free"
+            }
+        }}"#,
+    )
+    .unwrap();
+    // Install ONLY `installed-target`, with drifted bytes so the engine
+    // genuinely needs the (absent) before-blob.
+    std::fs::write(
+        tmp.path().join("package.json"),
+        r#"{ "name": "mixed-root", "version": "0.0.0" }"#,
+    )
+    .unwrap();
+    let pkg_dir = tmp.path().join("node_modules/installed-target");
+    std::fs::create_dir_all(&pkg_dir).unwrap();
+    std::fs::write(
+        pkg_dir.join("package.json"),
+        r#"{ "name": "installed-target", "version": "1.0.0" }"#,
+    )
+    .unwrap();
+    std::fs::write(pkg_dir.join("index.js"), b"patched-ish\n").unwrap();
+
+    let (code, stdout) = run(tmp.path(), &["--json", "--offline"]);
     assert_eq!(
-        code, 0,
-        "no installed packages must exit 0; stdout=\n{stdout}"
+        code, 1,
+        "the installed package's missing blob must fail the run; stdout=\n{stdout}"
     );
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
-    assert_eq!(v["status"], "success");
-    assert_eq!(v["rolledBack"], 0);
-    assert_eq!(v["alreadyOriginal"], 0);
-    assert_eq!(v["failed"], 0);
+    assert_eq!(v["status"], "partial_failure");
+    assert_eq!(
+        v["failed"], 1,
+        "only the installed, blob-gated package counts as failed; stdout=\n{stdout}"
+    );
+    let results = v["results"].as_array().expect("results array");
+    assert_eq!(
+        results.len(),
+        2,
+        "one failed result for the installed package plus one skipped \
+         marker for the ghost — never a synthesized ghost failure; \
+         stdout=\n{stdout}"
+    );
+    let entry = &results[0];
+    assert_eq!(entry["purl"], "pkg:npm/installed-target@1.0.0");
+    assert_eq!(entry["success"], false);
+    assert!(
+        !entry["path"].as_str().expect("path string").is_empty(),
+        "the gated package is installed — path must be reported; stdout=\n{stdout}"
+    );
+    // The pinned missing-blob abort envelope survives for the installed
+    // package: engine vocabulary + repair remedy.
+    let err = entry["error"].as_str().expect("error message string");
+    assert!(
+        err.contains("Cannot rollback") && err.contains("socket-patch repair"),
+        "pinned abort error shape; got: {err}"
+    );
+    let verified = entry["filesVerified"]
+        .as_array()
+        .expect("filesVerified array");
+    assert!(
+        verified
+            .iter()
+            .any(|f| f["status"] == "missing_blob" && f["targetHash"] == MISSING_BEFORE_HASH),
+        "the missing blob must be named with the engine's vocabulary; stdout=\n{stdout}"
+    );
+    // The ghost entry is a skipped marker appended after the real results
+    // — not a failure — and its (equally missing) before-blob must appear
+    // nowhere in the failure output.
+    let marker = &results[1];
+    assert_eq!(
+        marker["purl"], "pkg:npm/__ghost__@2.0.0",
+        "stdout=\n{stdout}"
+    );
+    assert!(
+        marker["path"].is_null(),
+        "no installed tree to name — path must be null, never \"\"; \
+         stdout=\n{stdout}"
+    );
+    assert_eq!(
+        marker["skipped"], "package_not_installed",
+        "stdout=\n{stdout}"
+    );
+    assert!(
+        marker.get("success").is_none() && marker.get("error").is_none(),
+        "a skipped marker is not a result record; stdout=\n{stdout}"
+    );
+    assert!(
+        v.get("notInstalled").is_none(),
+        "the top-level notInstalled key was dropped in favor of per-entry \
+         skipped markers; stdout=\n{stdout}"
+    );
+    assert!(
+        results
+            .iter()
+            .filter(|r| r.get("skipped").is_none())
+            .all(|r| !r["path"].as_str().unwrap_or("").is_empty()),
+        "no result record may carry an empty path; stdout=\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("2222222222222222222222222222222222222222222222222222222222222222"),
+        "the not-installed entry's blob hash must never surface as a \
+         failure; stdout=\n{stdout}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -496,6 +770,12 @@ fn rollback_json_shape_has_documented_keys() {
     ] {
         assert!(keys.contains(key), "rollback JSON missing key: {key}");
     }
+    // Not-installed entries surface as per-entry `skipped` markers inside
+    // `results[]` — there is deliberately NO top-level `notInstalled` key.
+    assert!(
+        v.get("notInstalled").is_none(),
+        "notInstalled was dropped in favor of skipped markers in results[]"
+    );
     // `warnings` is documented as ALWAYS present (empty array when nothing
     // fired) so consumers can index `.warnings[]` without null-checking.
     assert!(
@@ -850,20 +1130,32 @@ fn rollback_honors_manifest_path_override() {
         .output()
         .expect("run socket-patch");
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    // There is NO default `.socket/manifest.json` here, so reaching the
+    // not-installed envelope (rather than the "Manifest not found" error)
+    // can only mean the override path was honored. The manifest's only
+    // entry has no installed package, so the run succeeds quietly (the
+    // tree is already unpatched): exit 0, success, failed 0, entry
+    // surfaced as a skipped marker in results[].
+    assert!(v["error"].is_null(), "no error expected; stdout={stdout}");
+    assert_eq!(v["status"], "success", "stdout={stdout}");
     assert_eq!(
         out.status.code(),
         Some(0),
-        "manifest-path override must load + succeed; stdout={stdout}; stderr={}",
+        "all-not-installed succeeds quietly; stdout={stdout}; stderr={}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
-    // There is NO default `.socket/manifest.json` here, so a "success" status
-    // can only mean the override path was honored — had it been ignored, the
-    // command would have hit the no-manifest error path instead.
-    assert_eq!(v["status"], "success", "stdout={stdout}");
-    assert!(v["error"].is_null(), "no error expected; stdout={stdout}");
-    // No installed packages match, so the run is a clean zero-work success.
     assert_eq!(v["rolledBack"], 0);
-    assert_eq!(v["failed"], 0);
+    assert_eq!(v["failed"], 0, "not-installed is a skip, not a failure");
     assert_eq!(v["alreadyOriginal"], 0);
+    let results = v["results"].as_array().expect("results array");
+    assert_eq!(
+        results.len(),
+        1,
+        "the override manifest's entry must be the one reported; stdout={stdout}"
+    );
+    assert_eq!(
+        results[0]["skipped"], "package_not_installed",
+        "stdout={stdout}"
+    );
 }

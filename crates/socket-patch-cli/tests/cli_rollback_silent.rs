@@ -78,8 +78,32 @@ fn git_sha256(content: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
-/// Manifest with one npm patch whose before-blob is NOT staged.
+/// Manifest with one npm patch whose before-blob is NOT staged — plus the
+/// package INSTALLED under `node_modules/` with its file off the original
+/// bytes. Installation matters: the before-blob gate covers only installed
+/// packages whose files genuinely need their original bytes back. A
+/// manifest entry with no installed package is a benign
+/// `package_not_installed` skip (nothing on disk to restore), which would
+/// never reach the missing-blob/undownloadable-blob error paths these
+/// tests pin.
 fn write_missing_blob_manifest(root: &Path) {
+    std::fs::write(
+        root.join("package.json"),
+        r#"{ "name": "rb-silent-root", "version": "0.0.0" }"#,
+    )
+    .unwrap();
+    let pkg_dir = root.join("node_modules/__rb_silent__");
+    std::fs::create_dir_all(&pkg_dir).unwrap();
+    std::fs::write(
+        pkg_dir.join("package.json"),
+        r#"{ "name": "__rb_silent__", "version": "1.0.0" }"#,
+    )
+    .unwrap();
+    // Any content that matches neither the (unsatisfiable all-zeros)
+    // beforeHash nor the afterHash: the file needs restoring, so the
+    // absent before-blob genuinely gates the rollback.
+    std::fs::write(pkg_dir.join("index.js"), b"patched-ish content\n").unwrap();
+
     let socket = root.join(".socket");
     std::fs::create_dir_all(&socket).unwrap();
     std::fs::write(

@@ -50,6 +50,32 @@ fn make_socket_dir(root: &Path) -> PathBuf {
     socket
 }
 
+/// Install `__remove_test_a__` under `node_modules/` with `a.js` matching
+/// neither the (unsatisfiable all-zeros) beforeHash nor the afterHash: the
+/// file genuinely needs its original bytes back, so an absent before-blob
+/// blocks the internal rollback.
+///
+/// The rollback-failure tests need this because the before-blob gate covers
+/// only INSTALLED packages whose files need restoring: a manifest entry with
+/// no installed package is a benign `package_not_installed` skip (nothing on
+/// disk to restore), which `remove` correctly proceeds past — it would never
+/// reach the `rollback_failed` paths those tests pin.
+fn install_remove_test_a(root: &Path) {
+    std::fs::write(
+        root.join("package.json"),
+        r#"{ "name": "remove-invariants-root", "version": "0.0.0" }"#,
+    )
+    .expect("write root package.json");
+    let pkg_dir = root.join("node_modules/__remove_test_a__");
+    std::fs::create_dir_all(&pkg_dir).expect("create package dir");
+    std::fs::write(
+        pkg_dir.join("package.json"),
+        r#"{ "name": "__remove_test_a__", "version": "1.0.0" }"#,
+    )
+    .expect("write package.json");
+    std::fs::write(pkg_dir.join("a.js"), b"patched-ish content\n").expect("write a.js");
+}
+
 /// All spawns go through `common::run_with_env`, which scrubs the ambient
 /// `SOCKET_*` environment: an inherited SOCKET_DRY_RUN=true silently turns
 /// every wet remove below into a no-op preview, and an inherited
@@ -258,11 +284,20 @@ fn remove_event_has_required_envelope_fields() {
 /// `--offline` is what keeps this hermetic: without it, rollback fetches the
 /// missing before-blob from the live proxy (`GET /patch/blob/<beforeHash>`)
 /// and the test only passes because that request 404s.
+///
+/// The package must be INSTALLED (with its file off the original bytes) for
+/// the missing before-blob to fail the rollback: since the before-blob gate
+/// reorder, a manifest entry with no installed package is a benign
+/// `package_not_installed` skip — nothing on disk to restore — and `remove`
+/// correctly proceeds to drop it (its "No packages found to rollback (not
+/// installed)" path). Only an installed, patched package with an absent
+/// before-blob still fails closed.
 #[test]
 fn remove_without_skip_rollback_fails_closed_and_keeps_manifest() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let socket = make_socket_dir(tmp.path());
     let before = std::fs::read(socket.join("manifest.json")).expect("read before");
+    install_remove_test_a(tmp.path());
 
     let (code, stdout, _stderr) = common::run_with_env(
         tmp.path(),
@@ -665,10 +700,16 @@ fn remove_dry_run_previews_blob_sweep_without_deleting() {
 /// would have deleted. Offline keeps this hermetic: the preview reports the
 /// missing-blob failure (accurate — a wet offline run fails the same way)
 /// without inventing directories.
+///
+/// The package is installed (see `install_remove_test_a`) so the missing
+/// before-blob genuinely fails the rollback preview — and the preview walks
+/// its full path, including the throwaway dry-run blob stage the litter
+/// check below covers.
 #[test]
 fn remove_dry_run_with_rollback_does_not_create_blobs_dir() {
     let tmp = tempfile::tempdir().unwrap();
     let socket = make_socket_dir(tmp.path());
+    install_remove_test_a(tmp.path());
     assert!(!socket.join("blobs").exists(), "precondition: no blobs dir");
 
     let (code, stdout, _stderr) = common::run_with_env(
