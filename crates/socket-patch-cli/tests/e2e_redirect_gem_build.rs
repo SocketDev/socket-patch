@@ -1124,10 +1124,12 @@ async fn gem_hosted_rotated_grant_rescan_refreshes_source_block_and_installs() {
     };
     let api = fx._server.uri();
     let index_url_b = format!("{api}/patch-registry/gem/{TOKEN_B}/{UUID}/");
-    let gemfile_after_run1 = std::fs::read_to_string(fx.proj.join("Gemfile")).unwrap();
+    let gemfile_after_run1 = std::fs::read_to_string(fx.proj.join("Gemfile"))
+        .expect("read Gemfile after initial hosted scan");
     let ledger_edits = |proj: &Path| -> Vec<serde_json::Value> {
         serde_json::from_str::<serde_json::Value>(
-            &std::fs::read_to_string(proj.join(".socket/vendor/redirect-state.json")).unwrap(),
+            &std::fs::read_to_string(proj.join(".socket/vendor/redirect-state.json"))
+                .expect("read redirect ledger"),
         )
         .expect("ledger is JSON")["edits"]
             .as_array()
@@ -1145,7 +1147,8 @@ async fn gem_hosted_rotated_grant_rescan_refreshes_source_block_and_installs() {
     let env: serde_json::Value = serde_json::from_str(&stdout).expect("re-scan envelope JSON");
     assert_eq!(env["redirect"]["redirected"], 1, "envelope: {env}");
     assert_eq!(
-        std::fs::read_to_string(fx.proj.join("Gemfile")).unwrap(),
+        std::fs::read_to_string(fx.proj.join("Gemfile"))
+            .expect("read Gemfile after same-grant re-scan"),
         gemfile_after_run1,
         "same-grant re-scan must leave the Gemfile byte-identical"
     );
@@ -1163,7 +1166,8 @@ async fn gem_hosted_rotated_grant_rescan_refreshes_source_block_and_installs() {
     );
     let env: serde_json::Value = serde_json::from_str(&stdout).expect("rotation envelope JSON");
     assert_eq!(env["redirect"]["redirected"], 1, "envelope: {env}");
-    let gemfile = std::fs::read_to_string(fx.proj.join("Gemfile")).unwrap();
+    let gemfile = std::fs::read_to_string(fx.proj.join("Gemfile"))
+        .expect("read Gemfile after rotated-grant re-scan");
     assert_eq!(
         gemfile.matches("/patch-registry/gem/").count(),
         1,
