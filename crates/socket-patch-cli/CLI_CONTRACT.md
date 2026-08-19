@@ -294,7 +294,10 @@ wins, pinned by `find_by_purls_prefers_root_copy_over_nested_duplicate`).
 
 `setup` predates the v3.0 unified envelope and emits its own three shapes. They are stable as of v3.0;
 consumers may rely on these keys. All three share a `files[*]` entry shape; `kind` is one of
-`package_json`, `pth`, `gemfile`, `gem_plugin`, `composer`.
+`package_json`, `pth`, `gemfile`, `gem_plugin`, `composer`, `gem_plugin_registration` (the last is
+`setup --remove`-only: clearing bundler's machine-local `.bundle/plugin` registration of the wired
+plugin — emitted only when a registration existed; `status: error` carries the
+`bundler plugin uninstall socket-patch` remedy when it could not be cleared safely).
 
 **`setup`:**
 
