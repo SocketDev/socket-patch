@@ -2968,12 +2968,45 @@ fn gem_tail_source_option(tail: &str) -> Option<&'static str> {
     .find(|tok| code.contains(tok))
 }
 
+/// The grant-token path segment of a hosted patch URL: the path level
+/// immediately preceding the patch-uuid level (production shape
+/// `…/patch-registry/gem/{token}/{uuid}/…`, same layout on the artifact
+/// URLs). The reference endpoint hands the token back only inside its URLs,
+/// so this is how a caller recovers it for `DepOverride.token`. Only path
+/// levels count — the scheme/host prefix is skipped so a uuid sitting in the
+/// first path segment can never elect the host as its "token". `None` when
+/// the uuid is absent or nothing precedes it.
+pub fn grant_token_path_segment(url: &str, patch_uuid: &str) -> Option<String> {
+    if patch_uuid.is_empty() {
+        return None;
+    }
+    let after_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
+    let (_, path) = after_scheme.split_once('/')?;
+    let before = path
+        .split_once(&format!("/{patch_uuid}/"))
+        .map(|(before, _)| before)
+        .or_else(|| path.strip_suffix(&format!("/{patch_uuid}")))?;
+    let token = before.rsplit('/').next().unwrap_or("");
+    (!token.is_empty()).then(|| token.to_string())
+}
+
 /// A dep's Socket index URL as a regex source with the per-request rotating
 /// segments (grant token, patch uuid) wildcarded — an exact-URL pattern
-/// misses the URL a previous run wrote under an older grant.
+/// misses the URL a previous run wrote under an older grant. The grant token
+/// is wildcarded even when the caller left `dep.token` empty (the CLI
+/// historically never populated it): the token path level is derived from
+/// the index URL itself as the segment immediately preceding the patch-uuid
+/// level, so the idempotency guard never silently degrades into the
+/// nesting-corruption failure mode when a caller forgets the token.
 fn gem_index_url_pattern(dep: &DepOverride, index_url: &str) -> String {
     let mut url_pat = regex::escape(index_url);
-    for rotating in [&dep.token, &dep.patch_uuid] {
+    let derived_token = grant_token_path_segment(index_url, &dep.patch_uuid);
+    let rotating = [
+        Some(dep.token.as_str()),
+        derived_token.as_deref(),
+        Some(dep.patch_uuid.as_str()),
+    ];
+    for rotating in rotating.into_iter().flatten() {
         if !rotating.is_empty() {
             url_pat = url_pat.replace(&regex::escape(&format!("/{rotating}/")), "/[^/\"]+/");
         }
@@ -3229,15 +3262,35 @@ fn rewrite_gem(
                     };
                     // A source-selecting option would move into the block and
                     // OVERRIDE it in bundler's DSL, leaving the redirect a
-                    // silent no-op that still gets attested. Fail closed.
+                    // silent no-op that still gets attested. Fail closed —
+                    // and when the blocking `path:` is socket-patch's OWN
+                    // vendored wiring, prescribe the eject path instead of
+                    // leaving the user to puzzle over their own Gemfile.
                     if let Some(tok) = gem_tail_source_option(&tail) {
-                        result.warnings.push(RewriteWarning {
-                            code: "redirect_gem_source_option".into(),
-                            detail: format!(
+                        let socket_vendored = matches!(tok, "path:" | ":path")
+                            && tail
+                                .split('#')
+                                .next()
+                                .unwrap_or("")
+                                .contains(".socket/vendor/");
+                        let detail = if socket_vendored {
+                            format!(
+                                "the `gem \"{}\"` declaration carries `{tok}` pointing into \
+                                 .socket/vendor — socket-patch's own vendored wiring, which \
+                                 would override the Socket source block; run `socket-patch \
+                                 vendor --revert` first, then re-run the hosted scan",
+                                dep.name
+                            )
+                        } else {
+                            format!(
                                 "the `gem \"{}\"` declaration carries `{tok}`, which would \
                                  override the Socket source block; redirect skipped",
                                 dep.name
-                            ),
+                            )
+                        };
+                        result.warnings.push(RewriteWarning {
+                            code: "redirect_gem_source_option".into(),
+                            detail,
                         });
                         continue;
                     }
@@ -6849,6 +6902,107 @@ mod tests {
                 .any(|w| w.code == "redirect_gem_source_option"),
             "skip must warn: {:?}",
             r.warnings
+        );
+    }
+
+    /// When the blocking `path:` option is socket-patch's OWN vendored wiring
+    /// (`.socket/vendor/gem/<uuid>/…`), the refusal must prescribe the eject
+    /// path (`socket-patch vendor --revert`) instead of pointing the user at
+    /// a Gemfile line the tool itself wrote.
+    #[test]
+    fn gemfile_source_option_refusal_prescribes_vendor_revert_for_own_wiring() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "Gemfile".to_string(),
+            "source \"https://rubygems.org\"\n\n\
+             gem \"rails\", \"7.0.0\", path: \".socket/vendor/gem/11111111-1111-4111-8111-111111111111/rails-7.0.0\"\n"
+                .to_string(),
+        );
+        let r = rewrite_registry_redirect(&files, &[gem_override("rails", "7.0.0")]);
+        assert!(r.files.is_empty() && r.edits.is_empty());
+        let warning = r
+            .warnings
+            .iter()
+            .find(|w| w.code == "redirect_gem_source_option")
+            .unwrap_or_else(|| panic!("skip must warn: {:?}", r.warnings));
+        assert!(
+            warning.detail.contains("socket-patch vendor --revert"),
+            "socket's own vendored wiring must prescribe the eject path: {}",
+            warning.detail
+        );
+        // A USER path: dep keeps the generic refusal — no bogus prescription.
+        files.insert(
+            "Gemfile".to_string(),
+            "source \"https://rubygems.org\"\n\n\
+             gem \"rails\", \"7.0.0\", path: \"../rails\"\n"
+                .to_string(),
+        );
+        let r = rewrite_registry_redirect(&files, &[gem_override("rails", "7.0.0")]);
+        let warning = r
+            .warnings
+            .iter()
+            .find(|w| w.code == "redirect_gem_source_option")
+            .unwrap_or_else(|| panic!("skip must warn: {:?}", r.warnings));
+        assert!(
+            !warning.detail.contains("vendor --revert"),
+            "a user path: dep is not socket wiring: {}",
+            warning.detail
+        );
+    }
+
+    /// `grant_token_path_segment` recovers the grant token from the hosted
+    /// URL shapes the reference endpoint hands back (the path level before
+    /// the patch uuid) and answers `None` — never a host or empty segment —
+    /// on anything else.
+    #[test]
+    fn grant_token_path_segment_shapes() {
+        let uuid = "7c8d9e0f-1a2b-4a1b-8c2d-3e4f5a6b7c8d";
+        assert_eq!(
+            grant_token_path_segment(
+                &format!("https://patch.socket.dev/patch-registry/gem/tok-a/{uuid}/"),
+                uuid
+            )
+            .as_deref(),
+            Some("tok-a"),
+            "index-url shape"
+        );
+        assert_eq!(
+            grant_token_path_segment(
+                &format!("https://patch.socket.dev/patch/gem/rails/7.0.0/tok-b/{uuid}/rails-7.0.0.gem"),
+                uuid
+            )
+            .as_deref(),
+            Some("tok-b"),
+            "artifact-url shape"
+        );
+        assert_eq!(
+            grant_token_path_segment(
+                &format!("https://patch.socket.dev/patch-registry/gem/tok-c/{uuid}"),
+                uuid
+            )
+            .as_deref(),
+            Some("tok-c"),
+            "no trailing slash"
+        );
+        assert_eq!(
+            grant_token_path_segment(&format!("https://patch.socket.dev/{uuid}/"), uuid),
+            None,
+            "uuid in the first path level has no token before it"
+        );
+        assert_eq!(
+            grant_token_path_segment("https://patch.socket.dev/gem/tok/other/", uuid),
+            None,
+            "uuid absent"
+        );
+        assert_eq!(
+            grant_token_path_segment(&format!("https://{uuid}/x/"), uuid),
+            None,
+            "a uuid-shaped HOST is not a path level"
+        );
+        assert_eq!(
+            grant_token_path_segment("https://patch.socket.dev/gem/tok/x/", ""),
+            None,
+            "empty uuid never matches"
         );
     }
 
