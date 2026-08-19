@@ -1138,7 +1138,9 @@ async fn rollback_patches_inner(
 }
 
 // Export for use by remove command. The third tuple element lists
-// vendor-owned purls that were excluded from in-place rollback (benign).
+// vendor-owned purls that were excluded from in-place rollback (benign);
+// the fourth is `RollbackOutcome::not_installed` — in-scope manifest
+// entries the crawler found no installed package for.
 //
 // The returned `bool` is `RollbackOutcome::success` — per-package semantics
 // only. Manifest entries whose package is not installed are NOT failures
@@ -1146,6 +1148,13 @@ async fn rollback_patches_inner(
 // them from the manifest; the CLI `rollback` boundary's apply-mirroring
 // "none matched → exit 1" rule deliberately does NOT apply to this
 // delegation (it would wedge `remove` for packages long uninstalled).
+//
+// The `not_installed` element exists because that drop is IRREVERSIBLE in a
+// way a genuine rollback is not: "not installed" can also mean "installed
+// but missed by the crawler" (layout gaps are a documented reality), in
+// which case the patched bytes are still on disk. `remove` uses the list to
+// warn and to keep those entries' beforeHash blobs out of its cleanup
+// sweep, so the revert data survives a crawler miss.
 //
 // Takes the caller's `GlobalArgs` as the base (only the per-call fields are
 // overridden): the nested missing-blob download builds its API client from
@@ -1162,7 +1171,7 @@ pub(crate) async fn rollback_patches(
     dry_run: bool,
     silent: bool,
     ecosystems: Option<Vec<String>>,
-) -> Result<(bool, Vec<RollbackResult>, Vec<String>), String> {
+) -> Result<(bool, Vec<RollbackResult>, Vec<String>, Vec<String>), String> {
     let args = RollbackArgs {
         identifier: identifier.map(String::from),
         common: crate::args::GlobalArgs {
@@ -1175,7 +1184,12 @@ pub(crate) async fn rollback_patches(
         one_off: false,
     };
     let outcome = rollback_patches_inner(&args, manifest_path, None).await?;
-    Ok((outcome.success, outcome.results, outcome.vendored_skipped))
+    Ok((
+        outcome.success,
+        outcome.results,
+        outcome.vendored_skipped,
+        outcome.not_installed,
+    ))
 }
 
 #[cfg(test)]
@@ -1912,7 +1926,7 @@ mod tests {
             offline: true,
             ..crate::args::GlobalArgs::default()
         };
-        let (success, results, _vendored) = rollback_patches(
+        let (success, results, _vendored, _not_installed) = rollback_patches(
             &common,
             &manifest_path,
             None,
@@ -2002,7 +2016,7 @@ mod tests {
             offline: true,
             ..crate::args::GlobalArgs::default()
         };
-        let (success, results, _vendored) = rollback_patches(
+        let (success, results, _vendored, _not_installed) = rollback_patches(
             &common,
             &manifest_path,
             None,
@@ -2078,7 +2092,7 @@ mod tests {
             offline: true,
             ..crate::args::GlobalArgs::default()
         };
-        let (success, results, _vendored_skipped) = rollback_patches(
+        let (success, results, _vendored_skipped, _not_installed) = rollback_patches(
             &common,
             &manifest_path,
             None,
@@ -2159,7 +2173,7 @@ mod tests {
             offline: true,
             ..crate::args::GlobalArgs::default()
         };
-        let (success, results, _vendored_skipped) = rollback_patches(
+        let (success, results, _vendored_skipped, _not_installed) = rollback_patches(
             &common,
             &manifest_path,
             None,
@@ -2229,7 +2243,7 @@ mod tests {
             offline: true,
             ..crate::args::GlobalArgs::default()
         };
-        let (success, results, vendored_skipped) = rollback_patches(
+        let (success, results, vendored_skipped, not_installed) = rollback_patches(
             &common,
             &manifest_path,
             None,
@@ -2248,6 +2262,14 @@ mod tests {
             "nothing installed, nothing attempted, got {results:?}"
         );
         assert!(vendored_skipped.is_empty());
+        // The skip is not silent to the delegation: `remove` needs to know
+        // this entry was never actually reverted (a crawler miss looks the
+        // same) so it can keep the before-blobs and warn.
+        assert_eq!(
+            not_installed,
+            vec!["pkg:npm/foo@1.0.0".to_string()],
+            "the delegation must surface the not-installed entry"
+        );
     }
 
     /// The needed-blob narrowing: an INSTALLED package whose file is already
@@ -2290,7 +2312,7 @@ mod tests {
             offline: true,
             ..crate::args::GlobalArgs::default()
         };
-        let (success, results, _vendored_skipped) = rollback_patches(
+        let (success, results, _vendored_skipped, not_installed) = rollback_patches(
             &common,
             &manifest_path,
             None,
@@ -2303,6 +2325,10 @@ mod tests {
         assert!(
             success,
             "a blob nothing will read must not gate the run, got {results:?}"
+        );
+        assert!(
+            not_installed.is_empty(),
+            "an installed already-original package is not a crawler miss"
         );
         assert_eq!(results.len(), 1, "got {results:?}");
         assert!(results[0].success);

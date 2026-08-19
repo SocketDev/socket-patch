@@ -694,6 +694,244 @@ fn remove_dry_run_previews_blob_sweep_without_deleting() {
     assert_eq!(manifest["patches"].as_object().unwrap().len(), 2);
 }
 
+// ---------------------------------------------------------------------------
+// Crawler-miss safety: a dropped entry whose rollback was skipped as
+// not-installed must keep its beforeHash blobs (the only local revert data)
+// ---------------------------------------------------------------------------
+
+/// beforeHash values distinct per entry (unlike TWO_PATCH_MANIFEST's shared
+/// all-zeros), so the sweep assertions can attribute each blob to one entry.
+const NI_BEFORE_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const NI_AFTER_A: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+const NI_BEFORE_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const NI_AFTER_B: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+
+fn make_distinct_blob_socket_dir(root: &Path) -> PathBuf {
+    let manifest = format!(
+        r#"{{
+  "patches": {{
+    "pkg:npm/__remove_test_a__@1.0.0": {{
+      "uuid": "11111111-1111-4111-8111-111111111111",
+      "exportedAt": "2024-01-01T00:00:00Z",
+      "files": {{
+        "package/a.js": {{ "beforeHash": "{NI_BEFORE_A}", "afterHash": "{NI_AFTER_A}" }}
+      }},
+      "vulnerabilities": {{}},
+      "description": "synthetic remove test patch A",
+      "license": "MIT",
+      "tier": "free"
+    }},
+    "pkg:npm/__remove_test_b__@2.0.0": {{
+      "uuid": "22222222-2222-4222-8222-222222222222",
+      "exportedAt": "2024-01-02T00:00:00Z",
+      "files": {{
+        "package/b.js": {{ "beforeHash": "{NI_BEFORE_B}", "afterHash": "{NI_AFTER_B}" }}
+      }},
+      "vulnerabilities": {{}},
+      "description": "synthetic remove test patch B",
+      "license": "MIT",
+      "tier": "free"
+    }}
+  }}
+}}"#
+    );
+    let socket = root.join(".socket");
+    std::fs::create_dir_all(&socket).expect("create .socket");
+    std::fs::write(socket.join("manifest.json"), manifest).expect("write manifest");
+    socket
+}
+
+/// The purls of events carrying `errorCode: rollback_not_installed`.
+fn not_installed_event_purls(v: &serde_json::Value) -> Vec<String> {
+    v["events"]
+        .as_array()
+        .map(|events| {
+            events
+                .iter()
+                .filter(|e| e["errorCode"] == "rollback_not_installed")
+                .filter_map(|e| e["purl"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// THE crawler-miss guard: entry A is in the manifest but NOT installed
+/// (nothing under `node_modules/`), so the nested rollback skips it as
+/// `not_installed` — nothing was actually reverted. A crawler layout gap
+/// looks exactly the same, with the patched bytes still on disk. `remove`
+/// still drops the manifest entry (the documented long-uninstalled
+/// contract), but it must (a) surface a machine-visible warning event and
+/// (b) keep A's beforeHash blob out of the sweep — destroying it would
+/// permanently lose the only local revert data.
+///
+/// `--offline` keeps this hermetic AND proves no download is needed: a
+/// not-installed entry never enters the before-blob plan.
+#[test]
+fn remove_not_installed_keeps_before_blob_and_warns() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let socket = make_distinct_blob_socket_dir(tmp.path());
+    let blobs = socket.join("blobs");
+    std::fs::create_dir_all(&blobs).expect("create blobs dir");
+    std::fs::write(blobs.join(NI_BEFORE_A), b"a-before").expect("stage A before blob");
+    std::fs::write(blobs.join(NI_AFTER_A), b"a-after").expect("stage A after blob");
+    std::fs::write(blobs.join(NI_AFTER_B), b"b-after").expect("stage B after blob");
+
+    let (code, stdout, _stderr) = common::run_with_env(
+        tmp.path(),
+        &[
+            "remove",
+            "pkg:npm/__remove_test_a__@1.0.0",
+            "--json",
+            "--yes",
+            "--offline",
+        ],
+        &[],
+    );
+    assert_eq!(
+        code, 0,
+        "removing a not-installed entry still succeeds; stdout=\n{stdout}"
+    );
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+
+    // The entry is dropped (long-uninstalled contract unchanged)...
+    let manifest = read_manifest(&socket);
+    let patches = manifest["patches"].as_object().expect("patches object");
+    assert!(!patches.contains_key("pkg:npm/__remove_test_a__@1.0.0"));
+    assert!(patches.contains_key("pkg:npm/__remove_test_b__@2.0.0"));
+
+    // (a) ...with a machine-visible warning naming the purl whose rollback
+    // was skipped as not-installed...
+    assert_eq!(
+        not_installed_event_purls(&v),
+        vec!["pkg:npm/__remove_test_a__@1.0.0"],
+        "expected a rollback_not_installed warning event; envelope={v}"
+    );
+
+    // (b) ...and A's beforeHash blob SURVIVES the sweep: it is the only
+    // local revert data for bytes that may still be patched on disk.
+    assert!(
+        blobs.join(NI_BEFORE_A).exists(),
+        "the not-installed entry's beforeHash blob must be excluded from \
+         the cleanup sweep; envelope={v}"
+    );
+    // The keep-set addition is scoped to REVERT data: A's afterHash blob is
+    // unreferenced patched bytes and is swept as before, and B's referenced
+    // afterHash blob survives as before.
+    assert!(
+        !blobs.join(NI_AFTER_A).exists(),
+        "A's orphaned afterHash blob is still swept"
+    );
+    assert!(
+        blobs.join(NI_AFTER_B).exists(),
+        "B's referenced afterHash blob must remain"
+    );
+}
+
+/// Control for the guard above: an entry whose files are INSTALLED and
+/// already at their original bytes really is reverted state — rollback
+/// reports it `already_original`, so its beforeHash blob is swept exactly
+/// as before and no `rollback_not_installed` warning fires. Guards the
+/// fail-closed keep-set from degrading into keep-everything.
+#[test]
+fn remove_already_original_sweeps_before_blob_without_warning() {
+    let original = b"original bytes\n";
+    let before_hash = common::git_sha256(original);
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let socket = tmp.path().join(".socket");
+    std::fs::create_dir_all(&socket).expect("create .socket");
+    let manifest = format!(
+        r#"{{
+  "patches": {{
+    "pkg:npm/__remove_test_a__@1.0.0": {{
+      "uuid": "11111111-1111-4111-8111-111111111111",
+      "exportedAt": "2024-01-01T00:00:00Z",
+      "files": {{
+        "package/a.js": {{ "beforeHash": "{before_hash}", "afterHash": "{NI_AFTER_A}" }}
+      }},
+      "vulnerabilities": {{}},
+      "description": "synthetic remove test patch A",
+      "license": "MIT",
+      "tier": "free"
+    }}
+  }}
+}}"#
+    );
+    std::fs::write(socket.join("manifest.json"), manifest).expect("write manifest");
+    let blobs = socket.join("blobs");
+    std::fs::create_dir_all(&blobs).expect("create blobs dir");
+    std::fs::write(blobs.join(&before_hash), original).expect("stage before blob");
+
+    // Installed at the BEFORE bytes: rollback verifies already-original.
+    std::fs::write(
+        tmp.path().join("package.json"),
+        r#"{ "name": "remove-invariants-root", "version": "0.0.0" }"#,
+    )
+    .expect("write root package.json");
+    let pkg_dir = tmp.path().join("node_modules/__remove_test_a__");
+    std::fs::create_dir_all(&pkg_dir).expect("create package dir");
+    std::fs::write(
+        pkg_dir.join("package.json"),
+        r#"{ "name": "__remove_test_a__", "version": "1.0.0" }"#,
+    )
+    .expect("write package.json");
+    std::fs::write(pkg_dir.join("a.js"), original).expect("write a.js");
+
+    let (code, stdout, _stderr) = common::run_with_env(
+        tmp.path(),
+        &[
+            "remove",
+            "pkg:npm/__remove_test_a__@1.0.0",
+            "--json",
+            "--yes",
+            "--offline",
+        ],
+        &[],
+    );
+    assert_eq!(code, 0, "stdout=\n{stdout}");
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert!(
+        not_installed_event_purls(&v).is_empty(),
+        "an already-original entry is not a crawler miss — no warning; envelope={v}"
+    );
+    assert!(
+        !blobs.join(&before_hash).exists(),
+        "an already-original entry's beforeHash blob is swept as before"
+    );
+    assert!(
+        !read_manifest(&socket)["patches"]
+            .as_object()
+            .expect("patches object")
+            .contains_key("pkg:npm/__remove_test_a__@1.0.0"),
+        "the entry is removed"
+    );
+}
+
+/// `--skip-rollback` semantics unchanged: no rollback runs, so there is no
+/// not-installed outcome to react to — the sweep and the (absent) warning
+/// behave exactly as before the crawler-miss guard.
+#[test]
+fn remove_skip_rollback_sweep_semantics_unchanged() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let socket = make_distinct_blob_socket_dir(tmp.path());
+    let blobs = socket.join("blobs");
+    std::fs::create_dir_all(&blobs).expect("create blobs dir");
+    std::fs::write(blobs.join(NI_BEFORE_A), b"a-before").expect("stage A before blob");
+
+    let (code, stdout) = run_remove(tmp.path(), "pkg:npm/__remove_test_a__@1.0.0", &[]);
+    assert_eq!(code, 0, "stdout=\n{stdout}");
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert!(
+        not_installed_event_purls(&v).is_empty(),
+        "--skip-rollback runs no rollback, so no not-installed warning; envelope={v}"
+    );
+    assert!(
+        !blobs.join(NI_BEFORE_A).exists(),
+        "--skip-rollback ('don't touch my tree') keeps the pre-guard sweep \
+         behavior: the dropped entry's beforeHash blob is swept"
+    );
+}
+
 /// The full-path preview (no --skip-rollback) must not create `.socket/blobs`
 /// either: rollback's preview previously `create_dir_all`'d it (and, online,
 /// downloaded before-blobs into it) — leaving new files a wet remove's sweep
