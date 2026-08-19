@@ -7208,6 +7208,209 @@ mod tests {
         );
     }
 
+    /// CHECKSUMS-era locks (bundler >= 4 writes the section by default) must
+    /// come out FULLY CONVERGED, not mixed-state: the dep's spec entry moves
+    /// out of the upstream GEM section into a patch-registry GEM section
+    /// (`remote: <index-url>`), DEPENDENCIES pins `<name> (= <ver>)!`, and
+    /// CHECKSUMS carries the patched sha. The old mixed rewrite (CHECKSUMS
+    /// pinned, GEM section left upstream) made bundler refuse the prescribed
+    /// unfrozen install with exit 37 "mismatched checksums" — and the
+    /// converged pair needs no frozen-install caveat at all.
+    #[test]
+    fn gem_checksums_lock_converges_gem_section_and_pins_dependency() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "Gemfile".to_string(),
+            "source \"https://rubygems.org\"\n\ngem \"rails\", \"7.0.0\"\n".to_string(),
+        );
+        files.insert(
+            "Gemfile.lock".to_string(),
+            gem_lock(&format!("  rails (7.0.0) sha256={}", "2".repeat(64))),
+        );
+        let r = rewrite_registry_redirect(&files, &[gem_override("rails", "7.0.0")]);
+        let expected = format!(
+            "GEM\n  remote: https://rubygems.org/\n  specs:\n\n\
+             GEM\n  remote: https://patch.test/gem/tok/uuid/\n  specs:\n    rails (7.0.0)\n\n\
+             PLATFORMS\n  ruby\n\nDEPENDENCIES\n  rails (= 7.0.0)!\n\n\
+             CHECKSUMS\n  rails (7.0.0) sha256={}\n\nBUNDLED WITH\n   2.6.2\n",
+            "f".repeat(64)
+        );
+        assert_eq!(
+            r.files.get("Gemfile.lock"),
+            Some(&expected),
+            "the lock must converge: patch-registry GEM section + dependency pin + patched sha"
+        );
+        let source_edit = r
+            .edits
+            .iter()
+            .find(|e| e.kind == "redirect_gemfile_lock_gem_source")
+            .unwrap_or_else(|| panic!("GEM-section move edit recorded: {:?}", r.edits));
+        assert_eq!(source_edit.path, "Gemfile.lock");
+        assert_eq!(
+            source_edit.original,
+            Some(Value::String("https://rubygems.org/".into())),
+            "the upstream remote is the revert original"
+        );
+        assert_eq!(
+            source_edit.new,
+            Some(Value::String("https://patch.test/gem/tok/uuid/".into()))
+        );
+        let dep_edit = r
+            .edits
+            .iter()
+            .find(|e| e.kind == "redirect_gemfile_lock_dependency_pin")
+            .unwrap_or_else(|| panic!("DEPENDENCIES pin edit recorded: {:?}", r.edits));
+        assert_eq!(
+            dep_edit.original,
+            Some(Value::String("rails (= 7.0.0)".into()))
+        );
+        assert_eq!(dep_edit.new, Some(Value::String("rails (= 7.0.0)!".into())));
+        assert!(
+            !r.warnings
+                .iter()
+                .any(|w| w.code == "redirect_gem_frozen_install"),
+            "a converged pair is frozen-install-ready — the caveat would be a lie: {:?}",
+            r.warnings
+        );
+    }
+
+    /// Feeding the converged pair back must be a true no-op (the ledger would
+    /// otherwise grow forever) — and the converged lock shape must be
+    /// RECOGNIZED, not re-converged into a duplicate section.
+    #[test]
+    fn gem_checksums_converged_lock_rerun_is_noop() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "Gemfile".to_string(),
+            "source \"https://rubygems.org\"\n\ngem \"rails\", \"7.0.0\"\n".to_string(),
+        );
+        files.insert(
+            "Gemfile.lock".to_string(),
+            gem_lock(&format!("  rails (7.0.0) sha256={}", "2".repeat(64))),
+        );
+        let ovr = gem_override("rails", "7.0.0");
+        let first = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        let lock = first
+            .files
+            .get("Gemfile.lock")
+            .expect("run 1 rewrites the lock");
+        assert!(
+            lock.contains("GEM\n  remote: https://patch.test/gem/tok/uuid/\n  specs:\n    rails (7.0.0)"),
+            "run 1 must converge the lock: {lock}"
+        );
+        for (name, content) in first.files {
+            files.insert(name, content);
+        }
+        let second = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        assert!(
+            second.files.is_empty() && second.edits.is_empty(),
+            "converged re-run must be a no-op: files={:?} edits={:?}",
+            second.files.keys(),
+            second.edits
+        );
+    }
+
+    /// A rotated grant must refresh the CONVERGED lock's GEM remote in place
+    /// (token-wildcard recognition, exactly like the Gemfile source block) —
+    /// leaving the stale remote live would send every install to the dead
+    /// grant URL.
+    #[test]
+    fn gem_checksums_converged_lock_rotated_grant_refreshes_remote() {
+        fn ov(token: &str) -> DepOverride {
+            let mut o = gem_override("rails", "7.0.0");
+            o.token = token.into();
+            if let Some(r) = o.registry_override.as_mut() {
+                r.index_url = format!("https://patch.test/gem/{token}/uuid/");
+            }
+            o
+        }
+        let mut files = BTreeMap::new();
+        files.insert(
+            "Gemfile".to_string(),
+            "source \"https://rubygems.org\"\n\ngem \"rails\", \"7.0.0\"\n".to_string(),
+        );
+        files.insert(
+            "Gemfile.lock".to_string(),
+            gem_lock(&format!("  rails (7.0.0) sha256={}", "2".repeat(64))),
+        );
+        let first = rewrite_registry_redirect(&files, &[ov("tok-one")]);
+        for (name, content) in first.files {
+            files.insert(name, content);
+        }
+        let second = rewrite_registry_redirect(&files, &[ov("tok-two")]);
+        let lock = second
+            .files
+            .get("Gemfile.lock")
+            .expect("rotated grant refreshes the lock remote");
+        assert_eq!(
+            lock.matches("remote: https://patch.test/gem/").count(),
+            1,
+            "exactly one Socket GEM section: {lock}"
+        );
+        assert!(
+            lock.contains("  remote: https://patch.test/gem/tok-two/uuid/\n"),
+            "lock remote refreshed in place: {lock}"
+        );
+        assert!(!lock.contains("tok-one"), "stale grant gone: {lock}");
+        assert!(
+            second
+                .edits
+                .iter()
+                .any(|e| e.kind == "redirect_gemfile_lock_source_url"
+                    && e.original
+                        == Some(Value::String("https://patch.test/gem/tok-one/uuid/".into()))
+                    && e.new
+                        == Some(Value::String("https://patch.test/gem/tok-two/uuid/".into()))),
+            "remote refresh recorded with the old URL as original: {:?}",
+            second.edits
+        );
+    }
+
+    /// A TRANSITIVE redirected dep (undeclared in the Gemfile, appended as a
+    /// source block) becomes a direct source-pinned dependency, so the
+    /// converged lock must gain its `<name> (= <ver>)!` DEPENDENCIES entry —
+    /// inserted in bundler's sorted position — and the spec's dependency
+    /// sublines must travel with the spec into the patch-registry section.
+    #[test]
+    fn gem_checksums_lock_transitive_dep_converges_with_sorted_dependency() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "Gemfile".to_string(),
+            "source \"https://rubygems.org\"\n\ngem \"rack\", \"3.0.0\"\n".to_string(),
+        );
+        files.insert(
+            "Gemfile.lock".to_string(),
+            format!(
+                "GEM\n  remote: https://rubygems.org/\n  specs:\n    rack (3.0.0)\n    rails (7.0.0)\n      rack (>= 2)\n\n\
+                 PLATFORMS\n  ruby\n\nDEPENDENCIES\n  rack (= 3.0.0)\n\n\
+                 CHECKSUMS\n  rack (3.0.0) sha256={}\n  rails (7.0.0) sha256={}\n\nBUNDLED WITH\n   2.6.2\n",
+                "4".repeat(64),
+                "2".repeat(64)
+            ),
+        );
+        let r = rewrite_registry_redirect(&files, &[gem_override("rails", "7.0.0")]);
+        let expected = format!(
+            "GEM\n  remote: https://rubygems.org/\n  specs:\n    rack (3.0.0)\n\n\
+             GEM\n  remote: https://patch.test/gem/tok/uuid/\n  specs:\n    rails (7.0.0)\n      rack (>= 2)\n\n\
+             PLATFORMS\n  ruby\n\nDEPENDENCIES\n  rack (= 3.0.0)\n  rails (= 7.0.0)!\n\n\
+             CHECKSUMS\n  rack (3.0.0) sha256={}\n  rails (7.0.0) sha256={}\n\nBUNDLED WITH\n   2.6.2\n",
+            "4".repeat(64),
+            "f".repeat(64)
+        );
+        assert_eq!(
+            r.files.get("Gemfile.lock"),
+            Some(&expected),
+            "spec + sublines moved, dependency added sorted, sibling gem untouched"
+        );
+        let dep_edit = r
+            .edits
+            .iter()
+            .find(|e| e.kind == "redirect_gemfile_lock_dependency_pin")
+            .unwrap_or_else(|| panic!("DEPENDENCIES pin edit recorded: {:?}", r.edits));
+        assert_eq!(dep_edit.action, "added");
+        assert_eq!(dep_edit.original, None);
+    }
+
     /// Bundler's modern `gems.rb`/`gems.locked` spelling must be redirected
     /// exactly like the classic pair — before this, a gems.rb project was a
     /// silent no-op (the rewriter keyed on the literal "Gemfile" names).
