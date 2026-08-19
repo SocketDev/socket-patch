@@ -430,6 +430,10 @@ pub async fn run(args: VendorArgs) -> i32 {
                             path: vex_path.display().to_string(),
                             statements: summary.statements,
                             format: "openvex-0.2.0".to_string(),
+                            // note_warning suppressed these on stderr under
+                            // --json; the envelope copy is their only
+                            // surviving channel.
+                            warnings: summary.warnings,
                         });
                     }
                     Err(e) => {

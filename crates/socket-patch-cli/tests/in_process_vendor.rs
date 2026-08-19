@@ -1608,6 +1608,93 @@ async fn dry_run_vex_is_skipped_not_generated() {
     assert!(!fx.vendor_dir().exists(), "no artifacts staged");
 }
 
+/// Embedded-VEX run advisories must ride the envelope's `vex.warnings`
+/// under `--json`: `note_warning` silences stderr there, so without this
+/// key the advisory has no channel at all. The vendor host populates
+/// `VexSummary.warnings` (the scan host's raw-json arm mirrors it); a
+/// clean product pins the skip-if-empty contract — no `warnings` key.
+#[tokio::test]
+async fn vendor_json_vex_warnings_ride_in_envelope() {
+    // The stock fixture manifest has no vulnerability metadata, and VEX
+    // refuses to attest a metadata-less patch (`no_applicable_patches`) —
+    // inject one so the embedded generation actually runs.
+    fn add_vulnerability(root: &Path) {
+        let manifest_path = root.join(".socket/manifest.json");
+        let mut m: Value = serde_json::from_str(
+            &std::fs::read_to_string(&manifest_path).expect("read fixture manifest"),
+        )
+        .expect("parse fixture manifest");
+        for (_, patch) in m["patches"].as_object_mut().expect("patches map") {
+            patch["vulnerabilities"] = serde_json::json!({
+                "GHSA-embd-warn-test": {
+                    "cves": ["CVE-2024-77777"],
+                    "summary": "embedded-vex warning fixture",
+                    "severity": "high",
+                    "description": "d",
+                }
+            });
+        }
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_string_pretty(&m).expect("serialize manifest"),
+        )
+        .expect("write fixture manifest");
+    }
+
+    let fx = npm_fixture();
+    add_vulnerability(fx.root());
+    let vex_path = fx.root().join("vendored.vex.json");
+    let (code, env) = vendor_cli(
+        fx.root(),
+        &[
+            "--vex",
+            vex_path.to_str().expect("vex path is UTF-8"),
+            "--vex-product",
+            "not an iri at all",
+        ],
+    );
+    assert_eq!(
+        code, 0,
+        "a non-IRI product warns, never hard-rejects: {env}"
+    );
+    let warnings = env["vex"]["warnings"]
+        .as_array()
+        .unwrap_or_else(|| panic!("vex.warnings must be present for a non-IRI product: {env}"));
+    assert!(
+        warnings.iter().any(|w| w["code"] == "product_not_iri"),
+        "vendor vex.warnings must carry product_not_iri, got {warnings:?}"
+    );
+
+    // Clean-product control on a fresh fixture: no product advisory — but
+    // the tree-sync disclosure legitimately fires (vendor rewires the
+    // lockfile only; the live node_modules keeps pre-vendor bytes until a
+    // reinstall), which doubles as a pin that the host folds EVERY
+    // advisory kind in, not just product_not_iri. The skip-if-empty
+    // contract (no key at all on a warning-free run) is pinned by the
+    // apply-side control in e2e_embedded_vex.rs.
+    let fx2 = npm_fixture();
+    add_vulnerability(fx2.root());
+    let vex2 = fx2.root().join("vendored2.vex.json");
+    let (code2, env2) = vendor_cli(
+        fx2.root(),
+        &["--vex", vex2.to_str().expect("vex path is UTF-8")],
+    );
+    assert_eq!(code2, 0, "clean embedded vex run must succeed: {env2}");
+    let warnings2 = env2["vex"]["warnings"]
+        .as_array()
+        .unwrap_or_else(|| panic!("out-of-sync disclosure must ride the envelope: {env2}"));
+    assert!(
+        warnings2.iter().all(|w| w["code"] != "product_not_iri"),
+        "auto-detected product must not warn: {warnings2:?}"
+    );
+    assert!(
+        warnings2
+            .iter()
+            .any(|w| w["code"] == "vendored_tree_out_of_sync"),
+        "the pre-reinstall tree must surface the sync disclosure: {warnings2:?}"
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // 12. fail-closed --vendor-source=service refuses --offline
 // ─────────────────────────────────────────────────────────────────────

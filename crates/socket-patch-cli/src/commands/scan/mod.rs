@@ -305,6 +305,13 @@ async fn embed_vex_into_json(
                 "statements": summary.statements,
                 "format": "openvex-0.2.0",
             });
+            // Same additive `warnings` key the envelope's `VexSummary`
+            // carries (skip-if-empty): note_warning suppressed these on
+            // stderr under --json, so this is their only surviving channel.
+            if !summary.warnings.is_empty() {
+                result["vex"]["warnings"] = serde_json::to_value(&summary.warnings)
+                    .expect("RunWarning is a plain string struct: serialization cannot fail");
+            }
             0
         }
         Err(e) => {
