@@ -3056,6 +3056,223 @@ fn gem_spelling_residue(content: &str, deps: &[&DepOverride]) -> String {
     residue.trim_end().to_string()
 }
 
+/// A lock line without its `\r?\n` ending (never more than one of each).
+fn gem_lock_line_content(line: &str) -> &str {
+    let line = line.strip_suffix('\n').unwrap_or(line);
+    line.strip_suffix('\r').unwrap_or(line)
+}
+
+/// The gem name of a 2-space DEPENDENCIES entry (`  rails`, `  rails!`,
+/// `  rails (= 7.0.0)!`) — the text before any constraint, sans source pin.
+fn gem_lock_dependency_name(entry: &str) -> &str {
+    let entry = entry.trim_start();
+    let entry = entry.split(" (").next().unwrap_or(entry);
+    entry.trim_end_matches('!')
+}
+
+/// One parsed `GEM` section of a Gemfile.lock: its `remote:` lines (index +
+/// URL) and the exclusive end index — the start of the next column-0 header
+/// (trailing blank separator included) or EOF.
+struct GemLockSection {
+    remotes: Vec<(usize, String)>,
+    end: usize,
+}
+
+/// Converge the lock's source attribution for one redirected dep so the
+/// Gemfile + lock pair is what bundler itself would write after an install
+/// from the redirected Gemfile (verified frozen-installable on bundler 4):
+/// the dep's spec entry (+ its dependency sublines) moves out of the
+/// upstream `GEM` section into a patch-registry `GEM` section
+/// (`remote: <index-url>`), and DEPENDENCIES pins `<name> (= <version>)!`
+/// (bundler's source-pin spelling for a block-scoped exact-version gem) —
+/// added in sorted position when the dep was transitive. Without this the
+/// CHECKSUMS pin leaves a MIXED state bundler refuses: the lock still
+/// attributes the gem to the upstream remote, so the prescribed unfrozen
+/// install exits 37 "mismatched checksums" and a frozen install exits 16.
+///
+/// Idempotent and rotation-aware: a section whose remote matches the
+/// token-wildcard pattern is recognized as ours (never duplicated) and its
+/// remote is refreshed in place under a rotated grant
+/// (`redirect_gemfile_lock_source_url`, mirroring the Gemfile refresh).
+///
+/// Returns true when the lock ends converged (already, or via edits recorded
+/// into `result`); false when the dep cannot be attributed safely — spec
+/// entry absent or duplicated, a legacy multi-remote `GEM` section, or no
+/// DEPENDENCIES section — in which case nothing is touched and the caller
+/// surfaces the frozen-install caveat exactly as before.
+fn converge_gem_lock_source(
+    lk: &mut String,
+    dep: &DepOverride,
+    index_url: &str,
+    lock_name: &str,
+    lock_changed: &mut bool,
+    result: &mut RewriteResult,
+) -> bool {
+    let eol = if lk.contains("\r\n") { "\r\n" } else { "\n" };
+    let mut lines: Vec<String> = lk.split_inclusive('\n').map(str::to_string).collect();
+    let is_header = |c: &str| !c.is_empty() && !c.starts_with(' ');
+
+    // Parse: GEM sections, the dep's 4-space spec entry, DEPENDENCIES range.
+    let spec_content = format!("    {} ({})", dep.name, dep.version);
+    let mut sections: Vec<GemLockSection> = Vec::new();
+    let mut spec_at: Vec<(usize, usize)> = Vec::new(); // (section idx, line idx)
+    let mut deps_range: Option<(usize, usize)> = None; // exclusive of header
+    let mut i = 0;
+    while i < lines.len() {
+        let c = gem_lock_line_content(&lines[i]);
+        if !is_header(c) {
+            i += 1;
+            continue;
+        }
+        let header_is_gem = c == "GEM";
+        let start = i;
+        let mut remotes = Vec::new();
+        let mut j = i + 1;
+        while j < lines.len() && !is_header(gem_lock_line_content(&lines[j])) {
+            let cj = gem_lock_line_content(&lines[j]);
+            if header_is_gem {
+                if let Some(url) = cj.strip_prefix("  remote: ") {
+                    remotes.push((j, url.to_string()));
+                }
+                if cj == spec_content {
+                    spec_at.push((sections.len(), j));
+                }
+            }
+            j += 1;
+        }
+        if header_is_gem {
+            sections.push(GemLockSection { remotes, end: j });
+        } else if c == "DEPENDENCIES" {
+            deps_range = Some((start + 1, j));
+        }
+        i = j;
+    }
+
+    let spec_pos = if spec_at.len() == 1 {
+        Some(spec_at[0])
+    } else {
+        None
+    };
+    let (Some((sec_idx, spec_idx)), Some((deps_start, deps_end))) = (spec_pos, deps_range) else {
+        return false;
+    };
+    if sections[sec_idx].remotes.len() != 1 {
+        return false;
+    }
+    let (remote_idx, remote_url) = sections[sec_idx].remotes[0].clone();
+    let socket_remote_re = Regex::new(&format!("^{}$", gem_index_url_pattern(dep, index_url)))
+        .expect("anchored index-url pattern from the escaped URL is valid");
+    let mut changed = false;
+
+    // DEPENDENCIES pin first — its lines sit AFTER the GEM sections, so the
+    // spec move below never invalidates these indices (and vice versa would).
+    let target = format!("  {} (= {})!", dep.name, dep.version);
+    let is_entry = |c: &str| c.starts_with("  ") && !c.starts_with("   ");
+    let entry_idx = (deps_start..deps_end).find(|&k| {
+        let ck = gem_lock_line_content(&lines[k]);
+        is_entry(ck) && gem_lock_dependency_name(ck) == dep.name
+    });
+    match entry_idx {
+        Some(k) if gem_lock_line_content(&lines[k]) == target => {}
+        Some(k) => {
+            let old = gem_lock_line_content(&lines[k]).trim_start().to_string();
+            let ending = lines[k][gem_lock_line_content(&lines[k]).len()..].to_string();
+            lines[k] = format!("{target}{ending}");
+            result.edits.push(FileEdit {
+                path: lock_name.into(),
+                kind: "redirect_gemfile_lock_dependency_pin".into(),
+                action: "rewritten".into(),
+                key: Some(dep.name.clone()),
+                original: Some(Value::String(old)),
+                new: Some(Value::String(target.trim_start().to_string())),
+            });
+            changed = true;
+        }
+        None => {
+            // Transitive dep: bundler keeps DEPENDENCIES sorted by name.
+            let mut at = deps_end;
+            for (k, line) in lines.iter().enumerate().take(deps_end).skip(deps_start) {
+                let ck = gem_lock_line_content(line);
+                if ck.is_empty()
+                    || (is_entry(ck) && gem_lock_dependency_name(ck) > dep.name.as_str())
+                {
+                    at = k;
+                    break;
+                }
+            }
+            lines.insert(at, format!("{target}{eol}"));
+            result.edits.push(FileEdit {
+                path: lock_name.into(),
+                kind: "redirect_gemfile_lock_dependency_pin".into(),
+                action: "added".into(),
+                key: Some(dep.name.clone()),
+                original: None,
+                new: Some(Value::String(target.trim_start().to_string())),
+            });
+            changed = true;
+        }
+    }
+
+    if socket_remote_re.is_match(&remote_url) {
+        // Already ours. Rotated grant: refresh the remote in place.
+        if remote_url != index_url {
+            let ending = lines[remote_idx][gem_lock_line_content(&lines[remote_idx]).len()..]
+                .to_string();
+            lines[remote_idx] = format!("  remote: {index_url}{ending}");
+            result.edits.push(FileEdit {
+                path: lock_name.into(),
+                kind: "redirect_gemfile_lock_source_url".into(),
+                action: "rewritten".into(),
+                key: Some(dep.name.clone()),
+                original: Some(Value::String(remote_url)),
+                new: Some(Value::String(index_url.to_string())),
+            });
+            changed = true;
+        }
+    } else {
+        // Move the spec (+ sublines) into a patch-registry section of its
+        // own, inserted where the section it leaves ends.
+        let mut last = spec_idx;
+        while last + 1 < lines.len()
+            && gem_lock_line_content(&lines[last + 1]).starts_with("      ")
+        {
+            last += 1;
+        }
+        let moved: Vec<String> = lines.drain(spec_idx..=last).collect();
+        let insert_at = sections[sec_idx].end - moved.len();
+        let mut block: Vec<String> = Vec::with_capacity(moved.len() + 4);
+        block.push(format!("GEM{eol}"));
+        block.push(format!("  remote: {index_url}{eol}"));
+        block.push(format!("  specs:{eol}"));
+        for line in moved {
+            // Moved lines keep their own bytes; only a final line that lacked
+            // a newline (EOF) gains the file's ending.
+            if line.ends_with('\n') {
+                block.push(line);
+            } else {
+                block.push(format!("{line}{eol}"));
+            }
+        }
+        block.push(eol.to_string());
+        lines.splice(insert_at..insert_at, block);
+        result.edits.push(FileEdit {
+            path: lock_name.into(),
+            kind: "redirect_gemfile_lock_gem_source".into(),
+            action: "rewritten".into(),
+            key: Some(dep.name.clone()),
+            original: Some(Value::String(remote_url)),
+            new: Some(Value::String(index_url.to_string())),
+        });
+        changed = true;
+    }
+
+    if changed {
+        *lk = lines.concat();
+        *lock_changed = true;
+    }
+    true
+}
+
 fn rewrite_gem(
     files: &BTreeMap<String, String>,
     overrides: &[DepOverride],
@@ -3109,6 +3326,12 @@ fn rewrite_gem(
     // misdiagnosing the lock as bundler <2.6.
     let checksums_re =
         Regex::new(r"(?m)^CHECKSUMS(\r?)$").expect("static CHECKSUMS header regex is valid");
+    // True once any redirected dep leaves the pair MIXED: the lock still
+    // attributes the dep to the upstream source (no CHECKSUMS section to key
+    // the convergence on, or a lock shape the convergence refused). Only
+    // that state earns the frozen-install caveat — a converged pair is
+    // frozen-installable as written.
+    let mut mixed_state = false;
 
     for dep in &gem {
         let Some(ov) = &dep.registry_override else {
@@ -3387,6 +3610,7 @@ fn rewrite_gem(
             let already_re =
                 Regex::new(&(String::from(r"(?m)^  ") + &regex::escape(&new_val) + r"\r?$"))
                     .expect("already-redirected regex from the escaped line is valid");
+            let mut checksums_era = true;
             if already_re.is_match(lk) {
                 // no-op
             } else if let Some(m) = sum_line_re.captures(lk) {
@@ -3440,15 +3664,35 @@ fn rewrite_gem(
                         dep.name
                     ),
                 });
+                checksums_era = false;
+            }
+            // A CHECKSUMS-era lock must end FULLY CONVERGED — with only the
+            // sha pinned, bundler still attributes the gem to the upstream
+            // remote and refuses the pair outright (unfrozen: exit 37
+            // "mismatched checksums"; frozen: exit 16). A pre-CHECKSUMS lock
+            // has no sha to converge around, so it keeps today's
+            // mixed-but-installable state + the frozen-install caveat.
+            if !checksums_era
+                || !converge_gem_lock_source(
+                    lk,
+                    dep,
+                    &ov.index_url,
+                    lock_name,
+                    &mut lock_changed,
+                    result,
+                )
+            {
+                mixed_state = true;
             }
         }
     }
 
-    // The rewritten pair breaks bundler's frozen/deployment mode: the lock's
-    // GEM section still records the upstream source, so `bundle install` with
+    // A MIXED pair breaks bundler's frozen/deployment mode: the lock's GEM
+    // section still records the upstream source, so `bundle install` with
     // `frozen`/`--deployment` set rejects the Gemfile's new source block.
-    // Mirror of the CLI's pnpm trust-lockfile warning.
-    if gemfile_changed || lock_changed {
+    // Mirror of the CLI's pnpm trust-lockfile warning. A converged pair (the
+    // CHECKSUMS-era path) is frozen-installable as written — no caveat.
+    if (gemfile_changed || lock_changed) && mixed_state {
         result.warnings.push(RewriteWarning {
             code: "redirect_gem_frozen_install".into(),
             detail: format!(
@@ -7136,9 +7380,13 @@ mod tests {
         );
     }
 
-    /// A landed gem redirect breaks bundler frozen/deployment installs (the
-    /// lock's GEM section still records the upstream source), so the rewrite
-    /// must say so — and only when it actually changed something.
+    /// A MIXED-state gem redirect breaks bundler frozen/deployment installs
+    /// (the lock's GEM section still records the upstream source), so the
+    /// rewrite must say so — and only when it actually changed something.
+    /// Only the pre-CHECKSUMS lock (bundler <2.6, or `lockfile_checksums
+    /// false`) stays mixed today; a CHECKSUMS-era lock converges instead and
+    /// must NOT carry the caveat (pinned in
+    /// `gem_checksums_lock_converges_gem_section_and_pins_dependency`).
     #[test]
     fn gem_redirect_warns_about_frozen_installs() {
         let mut files = BTreeMap::new();
@@ -7146,9 +7394,13 @@ mod tests {
             "Gemfile".to_string(),
             "source \"https://rubygems.org\"\n\ngem \"rails\", \"7.0.0\"\n".to_string(),
         );
+        // No CHECKSUMS section: nothing to converge around, GEM attribution
+        // stays upstream — the caveat is truthful here.
         files.insert(
             "Gemfile.lock".to_string(),
-            gem_lock(&format!("  rails (7.0.0) sha256={}", "2".repeat(64))),
+            "GEM\n  remote: https://rubygems.org/\n  specs:\n    rails (7.0.0)\n\n\
+             PLATFORMS\n  ruby\n\nDEPENDENCIES\n  rails (= 7.0.0)\n\nBUNDLED WITH\n   2.5.0\n"
+                .to_string(),
         );
         let ovr = gem_override("rails", "7.0.0");
         let first = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
@@ -7781,12 +8033,18 @@ mod tests {
             "a CRLF CHECKSUMS section must be recognized: {:?}",
             r.warnings
         );
-        let expected =
-            gem_lock(&format!("  rails (7.0.0) sha256={}", "f".repeat(64))).replace('\n', "\r\n");
+        let expected = format!(
+            "GEM\n  remote: https://rubygems.org/\n  specs:\n\n\
+             GEM\n  remote: https://patch.test/gem/tok/uuid/\n  specs:\n    rails (7.0.0)\n\n\
+             PLATFORMS\n  ruby\n\nDEPENDENCIES\n  rails (= 7.0.0)!\n\n\
+             CHECKSUMS\n  rails (7.0.0) sha256={}\n\nBUNDLED WITH\n   2.6.2\n",
+            "f".repeat(64)
+        )
+        .replace('\n', "\r\n");
         assert_eq!(
             r.files.get("Gemfile.lock"),
             Some(&expected),
-            "pin rewritten in place with every \\r\\n preserved"
+            "pin + convergence rewritten in place with every \\r\\n preserved"
         );
         let edit = r
             .edits

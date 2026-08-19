@@ -47,16 +47,19 @@
 //! exact live-CI signature — so any server or fixture that stops declaring
 //! runtime deps turns this suite red.
 //!
-//! KNOWN LIMITATION, pinned as a canary: on a lock that carries a CHECKSUMS
-//! section (bundler >= 4 writes one by default), today's rewrite (Gemfile
-//! block + CHECKSUMS pin, GEM section left on the upstream remote) makes the
-//! prescribed unfrozen install fail with "Bundler found mismatched checksums"
-//! — bundler still attributes the gem to the upstream source and refuses the
-//! lockfile-vs-API disagreement (exit 37, verified on bundler 4.0.15). The
-//! canary test pins that reality; the verified fix shape is the fully
-//! converged lock (patched-registry GEM section + `<name> (= <ver>)!`
-//! DEPENDENCIES pin + patched CHECKSUMS sha — a frozen install of that shape
-//! passes), which must land in the TS twin + golden fixtures together.
+//! CHECKSUMS locks (bundler >= 4 writes the section by default) come out
+//! FULLY CONVERGED: patch-registry GEM section holding the dep's spec,
+//! `<name> (= <ver>)!` DEPENDENCIES pin, patched CHECKSUMS sha. The flipped
+//! canary proves the converged pair installs patched bytes on a fresh
+//! checkout both FROZEN (`BUNDLE_FROZEN=true`, lock byte-identical — no
+//! unfrozen two-step) and unfrozen (the historical exit 37 "mismatched
+//! checksums" mixed-state refusal is gone; it was pinned here as a known
+//! limitation until the converged rewrite landed). The depscan TS twin
+//! (registry-rewrite gem.ts) must be ported to match.
+//!
+//! The grant-rotation capstone drives token A -> A -> B re-scans through the
+//! real binary: byte-idempotent under the same grant, in-place URL refresh
+//! (Gemfile source block + converged-lock remote) under a rotated one.
 //!
 //! Skips (with a println) when `ruby`/`gem`/`bundle` are missing or the host
 //! bundler predates 2.6 (the CHECKSUMS-aware floor); everything after that is
@@ -745,16 +748,23 @@ async fn redirect_scanned_project(
         .iter()
         .filter_map(|w| w["code"].as_str())
         .collect();
-    assert!(
-        warning_codes.contains(&"redirect_gem_frozen_install"),
-        "the frozen-install caveat must be surfaced: {env}"
-    );
     if checksums_lock {
+        // CHECKSUMS-era locks converge (patch-registry GEM section +
+        // dependency pin + patched sha), so the pair is frozen-installable
+        // as written — the caveat would be a lie.
+        assert!(
+            !warning_codes.contains(&"redirect_gem_frozen_install"),
+            "a converged CHECKSUMS pair must not carry the frozen-install caveat: {env}"
+        );
         assert!(
             rewritten.contains(&lock_name),
             "the CHECKSUMS pin must land in {lock_name}: {env}"
         );
     } else {
+        assert!(
+            warning_codes.contains(&"redirect_gem_frozen_install"),
+            "the frozen-install caveat must be surfaced on a mixed (no-CHECKSUMS) pair: {env}"
+        );
         assert!(
             warning_codes.contains(&"redirect_gem_no_checksums_section"),
             "a no-CHECKSUMS lock cannot be pinned and must say so: {env}"
