@@ -336,7 +336,8 @@ mod host_guard {
         // don't exist ... Continuing without installing plugin socket-patch"
         // block (with a misleading reinstall suggestion) forever.
         let plugin_reg_dir = root.join(".bundle").join("plugin");
-        std::fs::create_dir_all(&plugin_reg_dir).unwrap();
+        std::fs::create_dir_all(&plugin_reg_dir)
+            .expect("create the bundler plugin registration dir");
         let index_path = plugin_reg_dir.join("index");
         std::fs::write(
             &index_path,
@@ -347,7 +348,7 @@ mod host_guard {
                  socket-patch: \"{root_s}/.socket/bundler-plugin\"\nsources:\n"
             ),
         )
-        .unwrap();
+        .expect("write the bundler plugin index fixture");
         let (code, out, err) = run(
             root,
             &["setup", "--remove", "--cwd", root_s, "--yes", "--json"],
@@ -417,10 +418,10 @@ mod host_guard {
     /// the process cwd or a hardcoded `.bundle`.
     #[test]
     fn gem_setup_remove_strips_registration_surgically_under_bundle_app_config() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().expect("create tempdir for the test project");
         let root = tmp.path();
-        std::fs::write(root.join("Gemfile"), GEMFILE).unwrap();
-        let root_s = root.to_str().unwrap();
+        std::fs::write(root.join("Gemfile"), GEMFILE).expect("write the fixture Gemfile");
+        let root_s = root.to_str().expect("tempdir path is UTF-8");
 
         // Wire the project (the registration below is what bundler would
         // write on the first `bundle install` after this).
@@ -434,7 +435,8 @@ mod host_guard {
         // The registration lives under the RELATIVE app-config dir, resolved
         // against the project root — bundler's own resolution rule.
         let plugin_reg_dir = root.join("bundle-config").join("plugin");
-        std::fs::create_dir_all(&plugin_reg_dir).unwrap();
+        std::fs::create_dir_all(&plugin_reg_dir)
+            .expect("create the bundler plugin registration dir");
         let index_path = plugin_reg_dir.join("index");
         std::fs::write(
             &index_path,
@@ -448,7 +450,7 @@ mod host_guard {
                  socket-patch: \"{root_s}/.socket/bundler-plugin\"\nsources:\n"
             ),
         )
-        .unwrap();
+        .expect("write the bundler plugin index fixture");
 
         let (code, out, err) = run_env(
             root,
@@ -996,7 +998,7 @@ mod plugin_runtime {
             eprintln!("skip plugin_runtime: bundler not on PATH");
             return;
         }
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().expect("create tempdir for the test project");
         let root = tmp.path();
         scaffold(root);
         let (fake, _log) = write_fake_apply(root, 0);
