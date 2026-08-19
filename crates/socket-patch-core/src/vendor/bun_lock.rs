@@ -359,6 +359,16 @@ pub(crate) async fn revert_bun(
         }
     }
 
+    // LOSSINESS GUARD (residual #131): when any wiring record was left
+    // alone ("drifted; left alone"), the uuid dir may hold the only copy of
+    // what the lock — or the redirect ledger's recorded originals — still
+    // points at. Keep it (and let the CLI keep the ledger entry) instead of
+    // deleting evidence out from under a lock we just refused to touch.
+    if outcome.drift_skipped() {
+        outcome.keep_artifact(&uuid_dir_rel);
+        return outcome;
+    }
+
     if let Err(e) = remove_tree(&project_root.join(&uuid_dir_rel)).await {
         return RevertOutcome::failed(format!("cannot remove {uuid_dir_rel}: {e}"));
     }
@@ -400,6 +410,14 @@ fn revert_one_record(
             (parsed.key == key).then_some((start + 1 + off, parsed))
         });
     if let Some((idx, parsed)) = located {
+        // ALREADY CONVERGED: the live line equals the recorded pre-vendor
+        // original — an earlier partial revert (or the user, by hand)
+        // already restored this record. Not drift: stay silent so the
+        // drift-skip keep gate can converge instead of re-flagging the
+        // restored line forever.
+        if rec.original.as_ref().and_then(Value::as_str) == Some(lines[idx].as_str()) {
+            return;
+        }
         // Ours iff the line is exactly what we wrote, or its tuple still
         // points into OUR uuid dir (a re-serialized but unmoved entry).
         let exact = Some(lines[idx].as_str()) == rec.new.as_ref().and_then(Value::as_str);
@@ -1365,11 +1383,45 @@ mod tests {
             fx.read_lock().await.contains(drifted_line),
             "drifted entry left alone"
         );
+        // Residual #131: a drift-skip keeps the artifact dir (the drifted
+        // entry's recorded original may still be needed later) and says so.
+        assert!(
+            fx.root()
+                .join(format!(".socket/vendor/npm/{UUID}"))
+                .exists(),
+            "drift-skip must keep the artifact dir"
+        );
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_artifact_kept"),
+            "the keep must be surfaced: {:?}",
+            outcome.warnings
+        );
+
+        // KEEP-GATE LIVENESS: undo the drift (repoint the entry back at the
+        // vendored tuple) — the same revert must then complete fully
+        // instead of ratcheting the keep forever.
+        let healed = fx.read_lock().await.replace(drifted_line, new_line);
+        tokio::fs::write(fx.root().join(BUN_LOCK), &healed)
+            .await
+            .unwrap();
+
+        let outcome = revert_bun(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(
+            outcome.warnings.is_empty(),
+            "no drift left after the undo: {:?}",
+            outcome.warnings
+        );
+        assert!(!outcome.kept_artifact);
+        assert_eq!(fx.read_lock().await, BN3_BEFORE_LOCK, "lock byte-restored");
         assert!(
             !fx.root()
                 .join(format!(".socket/vendor/npm/{UUID}"))
                 .exists(),
-            "artifact still removed"
+            "artifact pruned once the revert converges"
         );
     }
 

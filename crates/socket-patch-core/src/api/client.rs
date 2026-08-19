@@ -11,7 +11,7 @@ use crate::api::ranking::severity_order as get_severity_order;
 use crate::api::ranking::{cmp_batch_infos, cmp_search_results};
 use crate::api::types::*;
 use crate::constants::USER_AGENT as USER_AGENT_VALUE;
-use crate::utils::env_compat::{is_debug_enabled, proxy_url_from_env};
+use crate::utils::env_compat::{is_debug_enabled, is_offline_env, proxy_url_from_env};
 use crate::utils::socket_cli_config;
 
 /// Log debug messages when debug mode is enabled.
@@ -1118,11 +1118,20 @@ pub async fn get_api_client_with_overrides(overrides: ApiClientEnvOverrides) -> 
             .proxy_url
             .filter(|u| !u.is_empty())
             .unwrap_or_else(proxy_url_from_env);
-        eprintln!(
-            "No SOCKET_API_TOKEN set (and no socket-cli login found) — using the \
-             public patch API proxy (free patches only). Run `socket login` or set \
-             SOCKET_API_TOKEN to access org patches."
-        );
+        // Offline runs still construct this client (commands build it up
+        // front for telemetry/staging plumbing) but never contact it — under
+        // the strict-airgap contract "using the public patch API proxy"
+        // would falsely claim network use, so the advisory is suppressed.
+        // Same gate as telemetry's airgap kill-switch; `--offline` is
+        // mirrored into SOCKET_OFFLINE (normalized to "1") before any
+        // client is built.
+        if !is_offline_env() {
+            eprintln!(
+                "No SOCKET_API_TOKEN set (and no socket-cli login found) — using the \
+                 public patch API proxy (free patches only). Run `socket login` or set \
+                 SOCKET_API_TOKEN to access org patches."
+            );
+        }
         let client = ApiClient::new(ApiClientOptions {
             api_url: proxy_url,
             api_token: None,
@@ -1150,10 +1159,7 @@ pub async fn get_api_client_with_overrides(overrides: ApiClientEnvOverrides) -> 
     // Auto-resolve org slug if not provided
     let final_org_slug = if resolved_org_slug.is_some() {
         resolved_org_slug
-    } else if matches!(
-        std::env::var("SOCKET_OFFLINE").unwrap_or_default().as_str(),
-        "1" | "true"
-    ) {
+    } else if is_offline_env() {
         // Strict airgap: `--offline` (mirrored into `SOCKET_OFFLINE` by the
         // CLI before any client is built — same vocabulary the telemetry
         // kill-switch matches) means zero network contact, so the org-slug

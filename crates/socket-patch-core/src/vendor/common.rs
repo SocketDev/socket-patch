@@ -440,6 +440,7 @@ pub(crate) async fn revert_lock_fragment_splice(
         // reset them to umask defaults.
         if let Err(e) = atomic_write_bytes_preserving_mode(&lock_path, lock_text.as_bytes()).await {
             return RevertOutcome {
+                kept_artifact: false,
                 success: false,
                 warnings,
                 error: Some(format!("cannot write {lock_file}: {e}")),
@@ -447,6 +448,7 @@ pub(crate) async fn revert_lock_fragment_splice(
         }
     }
     RevertOutcome {
+        kept_artifact: false,
         success: true,
         warnings,
         error: None,

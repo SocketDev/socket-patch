@@ -1083,6 +1083,164 @@ pub(super) async fn note_vendor_supersedes_redirect(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Agent-flow cross-mode visibility (hosted / vendored state left in place)
+// ---------------------------------------------------------------------------
+//
+// The takeover machinery above covers hosted ⇄ vendored — the two modes that
+// COMPETE for lockfile wiring. The agent flow competes with neither (it
+// patches installed trees in place), so running `scan --mode agent` over
+// another mode's live state is not a takeover: nothing goes stale, nothing
+// is mutated. But it IS a mode conversion that silently did not complete,
+// and the envelope said nothing:
+//
+// * over live HOSTED wiring, the agent apply succeeds against the already-
+//   patched bytes while the lockfile keeps resolving to the hosted patch
+//   server and the redirect ledger stays live — and no npm/yarn hosted
+//   revert exists, so the "conversion" can never complete without another
+//   mode run;
+// * over VENDORED ownership, the apply partitions the vendor-owned purls
+//   into `apply.patches[]` skip records (`skipped`/`vendored`) that a
+//   `--json` consumer only finds by digging into the per-patch array.
+//
+// Both get one additive run-level warning (top-level `warnings[]` on the
+// scan `--json` envelope + stderr when not silent). NEVER a status or
+// exit-code change — hosted refusals set that precedent (exit 0 + warning).
+
+/// Warning code: agent-mode scan ran over package(s) whose hosted redirect
+/// wiring is still LIVE (ledger record present AND the lock provably still
+/// routes the purl to the hosted artifact).
+pub(super) const HOSTED_WIRING_RETAINED: &str = "hosted_wiring_retained";
+
+/// Warning code: agent-mode apply yielded ownership of vendor-owned
+/// package(s) (the per-patch `skipped`/`vendored` records), so those
+/// package(s) did NOT convert to agent mode.
+pub(super) const VENDORED_OWNERSHIP_RETAINED: &str = "vendored_ownership_retained";
+
+/// The scanned purls whose HOSTED redirect wiring is still live: the
+/// redirect ledger records the purl AND [`hosted_wiring_live`] proves the
+/// current lockfile still routes it to the hosted artifact.
+///
+/// Deliberately NOT routed through [`classify_overlap_takeover`]: that
+/// classifier keys on purls present in BOTH ledgers (hosted ∩ vendored),
+/// so hosted-only wiring — the exact hosted→agent conversion state — can
+/// structurally never trigger it (pinned by
+/// `hosted_only_wiring_is_invisible_to_the_overlap_classifier`).
+///
+/// Silent-by-construction cases (each pinned by a test):
+/// * ledger absent/malformed or `records` empty — a hosted→vendored
+///   pre-revert that retired the records must retire this warning with
+///   them, even while the append-only `edits` (revert originals) remain;
+/// * purl not scanned this run — the warning only ever names packages the
+///   scan actually covered;
+/// * the live lock does not prove hosted wiring (registry-clean lock, an
+///   ecosystem whose lock we cannot read) — never guess from ledger
+///   presence alone.
+pub(super) async fn hosted_wiring_retained_purls(
+    cwd: &Path,
+    redirect_state: Option<&socket_patch_core::patch::redirect::RedirectState>,
+    scanned_purls: &HashSet<String>,
+) -> Vec<String> {
+    let Some(redirect) = redirect_state else {
+        return Vec::new();
+    };
+    if redirect.records.is_empty() {
+        return Vec::new();
+    }
+    let canon = |p: &str| normalize_purl(strip_purl_qualifiers(p)).into_owned();
+    let scanned: std::collections::BTreeSet<String> =
+        scanned_purls.iter().map(|p| canon(p)).collect();
+    let mut redirect_files: Vec<&str> = redirect.edits.iter().map(|e| e.path.as_str()).collect();
+    redirect_files.sort();
+    redirect_files.dedup();
+    let inventory = socket_patch_core::vendor::lock_inventory::inventory_project(cwd).await;
+    let mut out = Vec::new();
+    for (key, record) in &redirect.records {
+        let purl = canon(key);
+        if !scanned.contains(&purl) {
+            continue;
+        }
+        if hosted_wiring_live(
+            cwd,
+            &purl,
+            Some(record.uuid.as_str()),
+            &redirect_files,
+            &inventory,
+        )
+        .await
+        {
+            out.push(purl);
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Detail for [`HOSTED_WIRING_RETAINED`]. Names the package(s) and the two
+/// real options — stay hosted, or migrate via the vendored flow (which
+/// reconciles the superseded ledger entries per package). It must never
+/// advise hand-deleting the redirect ledger (the only store of the
+/// pre-redirect originals plus the records VEX reads) and never promise a
+/// hosted→agent unwind that does not exist for npm/yarn.
+pub(super) fn hosted_wiring_retained_detail(retained: &[String]) -> String {
+    let list = retained.join(", ");
+    format!(
+        "agent-mode scan left the hosted redirect wiring live for: {list}. \
+         The lockfile still resolves these package(s) to the hosted patch \
+         server and `.socket/vendor/redirect-state.json` still records the \
+         redirect — an agent run patches installed files in place but does \
+         NOT unwind hosted lockfile wiring (no hosted revert exists for \
+         this ecosystem yet), so installs keep fetching these package(s) \
+         from the patch server. Either keep the project in hosted mode \
+         (`scan --mode hosted`), or migrate to committed artifacts with \
+         `scan --mode vendored`, which takes these package(s) over in the \
+         lockfile and reconciles the superseded redirect ledger entries. \
+         Do not delete `.socket/vendor/redirect-state.json` by hand: it \
+         holds the recorded pre-redirect lockfile originals (the only \
+         revert data) and the redirect records VEX reads."
+    )
+}
+
+/// Detail for [`VENDORED_OWNERSHIP_RETAINED`]. Names the vendor-owned
+/// package(s) the agent apply skipped and the real migration path —
+/// per-package `remove <purl>` first (with `vendor --revert` named but
+/// scoped: it unwinds EVERY vendored package), then re-run.
+pub(super) fn vendored_ownership_retained_detail(purls: &[String]) -> String {
+    let list = purls
+        .iter()
+        .map(|p| normalize_purl(p).into_owned())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "agent-mode apply did not take over vendor-owned package(s): {list}. \
+         These package(s) are managed by `socket-patch vendor` (committed \
+         `.socket/vendor/` artifacts own their lockfile wiring), so they \
+         were skipped before download — recorded in `apply.patches[]` as \
+         `skipped`/`vendored` — and stay in vendored mode. To keep them \
+         vendored, no action is needed. To migrate a package to agent \
+         mode, first retire its vendored wiring: run `socket-patch remove \
+         <purl>` for that package (or `socket-patch vendor --revert`, \
+         which unwinds EVERY vendored package), then re-run `scan --mode \
+         agent`."
+    )
+}
+
+/// Append one `{code, detail}` entry to the scan `--json` result's
+/// top-level `warnings` array (created on first use — the key is additive
+/// and absent when no run-level warning fired), mirroring the
+/// [`crate::json_envelope::RunWarning`] wire shape.
+fn push_scan_json_warning(result: &mut serde_json::Value, code: &str, detail: &str) {
+    let warnings = result
+        .as_object_mut()
+        .expect("scan JSON result is an object")
+        .entry("warnings")
+        .or_insert_with(|| serde_json::json!([]));
+    if let Some(arr) = warnings.as_array_mut() {
+        arr.push(serde_json::json!({ "code": code, "detail": detail }));
+    }
+}
+
 pub async fn run(mut args: ScanArgs) -> i32 {
     apply_env_toggles(&args.common);
 
@@ -1692,6 +1850,14 @@ pub async fn run(mut args: ScanArgs) -> i32 {
                 |p| vendored_purls.contains(p) || vendored_purls.contains(strip_purl_qualifiers(p)),
                 "vendored",
             );
+            // Captured from the vendored partition ONLY (before the
+            // not-installed skips merge in below — those are a different,
+            // already-calm class): feeds the run-level
+            // `vendored_ownership_retained` warning emitted after apply.
+            let vendored_skip_purls: Vec<String> = vendored_records
+                .iter()
+                .filter_map(|r| r["purl"].as_str().map(str::to_string))
+                .collect();
             // Lockfile-only purls leave the apply selection here (calm
             // skip records, never an error); the union rides the same
             // bookkeeping as the vendored skips.
@@ -1777,6 +1943,36 @@ pub async fn run(mut args: ScanArgs) -> i32 {
                 if apply_code != 0 {
                     result["status"] = serde_json::json!("partial_failure");
                 }
+            }
+
+            // Cross-mode visibility (additive run-level warnings; never a
+            // status or exit-code change — see the constants' docs):
+            //
+            // * vendor-owned purls were partitioned out above — surface
+            //   them at the envelope level instead of only deep inside
+            //   `apply.patches[]`;
+            // * hosted redirect wiring the live lock still proves — the
+            //   agent run cannot unwind it, so silence here reads as a
+            //   completed conversion that never happened.
+            if !vendored_skip_purls.is_empty() {
+                let detail = vendored_ownership_retained_detail(&vendored_skip_purls);
+                if !args.common.silent {
+                    eprintln!("Warning ({VENDORED_OWNERSHIP_RETAINED}): {detail}");
+                }
+                push_scan_json_warning(&mut result, VENDORED_OWNERSHIP_RETAINED, &detail);
+            }
+            let hosted_retained = hosted_wiring_retained_purls(
+                &args.common.cwd,
+                redirect_state.as_ref(),
+                &scanned_purls,
+            )
+            .await;
+            if !hosted_retained.is_empty() {
+                let detail = hosted_wiring_retained_detail(&hosted_retained);
+                if !args.common.silent {
+                    eprintln!("Warning ({HOSTED_WIRING_RETAINED}): {detail}");
+                }
+                push_scan_json_warning(&mut result, HOSTED_WIRING_RETAINED, &detail);
             }
         // --- Vendor path (if requested; conflicts with --apply/--sync) ---
         } else if vendor {
@@ -2284,6 +2480,24 @@ pub async fn run(mut args: ScanArgs) -> i32 {
         code
     };
 
+    // Cross-mode visibility, mirroring the JSON apply path: after an
+    // in-place apply, warn when the hosted redirect wiring is still live
+    // for scanned package(s) — the apply cannot unwind it, and silence
+    // reads as a completed hosted→agent conversion that never happened.
+    // (The vendored-ownership counterpart is already printed per package
+    // by the `[skip] … (vendored …)` lines above.)
+    if !vendor && !args.common.silent {
+        let hosted_retained =
+            hosted_wiring_retained_purls(&args.common.cwd, redirect_state.as_ref(), &scanned_purls)
+                .await;
+        if !hosted_retained.is_empty() {
+            eprintln!(
+                "Warning ({HOSTED_WIRING_RETAINED}): {}",
+                hosted_wiring_retained_detail(&hosted_retained)
+            );
+        }
+    }
+
     // Post-apply GC: only runs when the user opted in via `--prune` or
     // `--sync`. Default `scan --yes` no longer touches the manifest
     // beyond what `--apply` added — users wanting to clean up should
@@ -2521,6 +2735,185 @@ mod tests {
 
         // The two warning codes are distinct routing tags.
         assert_ne!(VENDOR_SUPERSEDES_REDIRECT, REDIRECT_SUPERSEDES_VENDORED);
+    }
+
+    // ---- agent-flow hosted-wiring retention (hosted → agent conversion) ----
+    // The overlap classifier keys on purls present in BOTH ledgers, so
+    // hosted-ONLY wiring (the exact hosted→agent conversion state: redirect
+    // ledger live, no vendor state.json) can structurally never trigger it.
+    // The agent flow probes the redirect ledger + live lock directly and
+    // emits `hosted_wiring_retained`. These pin the trigger, every
+    // non-trigger, and the remediation wording.
+
+    /// Redirect ledger with one record per PURL AND a recorded `yarn.lock`
+    /// edit — the shape a real hosted run leaves behind (the edit is what
+    /// lets `hosted_wiring_live`'s text proof scan the lock).
+    async fn write_redirect_ledger_with_edit(root: &Path, purls: &[&str]) {
+        use socket_patch_core::patch::redirect::{FileEdit, RedirectState};
+        let mut state = RedirectState::new();
+        for purl in purls {
+            state.records.insert((*purl).to_string(), takeover_record());
+        }
+        state.edits.push(FileEdit {
+            path: "yarn.lock".to_string(),
+            kind: "redirect_yarn_entry".to_string(),
+            action: "rewritten".to_string(),
+            key: Some("minimist@1.2.2".to_string()),
+            original: Some(serde_json::Value::String("registry original".to_string())),
+            new: None,
+        });
+        let dir = root.join(".socket/vendor");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(
+            dir.join("redirect-state.json"),
+            serde_json::to_string_pretty(&state).unwrap(),
+        )
+        .await
+        .unwrap();
+    }
+
+    /// yarn classic lock whose resolved URL is the hosted artifact (carries
+    /// the record uuid) — the live-hosted-wiring proof.
+    async fn write_hosted_yarn_lock(root: &Path, uuid: &str) {
+        tokio::fs::write(
+            root.join("yarn.lock"),
+            format!(
+                "# yarn lockfile v1\n\n\nminimist@^1.2.2:\n  version \"1.2.2\"\n  \
+                 resolved \"https://patch.socket.dev/patch/npm/minimist/1.2.2/tok/{uuid}/minimist-1.2.2.tgz#aaaa\"\n  \
+                 integrity sha512-fake==\n"
+            ),
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn load_ledger(root: &Path) -> Option<socket_patch_core::patch::redirect::RedirectState> {
+        socket_patch_core::patch::redirect::load_redirect_state(root)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn hosted_only_wiring_fires_agent_probe_not_the_overlap_classifier() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let purl = "pkg:npm/minimist@1.2.2";
+        write_redirect_ledger_with_edit(root, &[purl]).await;
+        write_hosted_yarn_lock(root, TAKEOVER_UUID).await;
+
+        // Hosted-only wiring (no vendor state.json) is structurally
+        // invisible to the hosted⇄vendored overlap classifier…
+        assert!(overlapping_ledger_purls(root).await.is_empty());
+        assert_eq!(
+            classify_overlap_takeover(root).await,
+            OverlapTakeover::default()
+        );
+
+        // …but the agent flow's direct probe sees it for scanned purls.
+        let scanned: HashSet<String> = [purl.to_string()].into_iter().collect();
+        let ledger = load_ledger(root).await;
+        let retained = hosted_wiring_retained_purls(root, ledger.as_ref(), &scanned).await;
+        assert_eq!(retained, vec![purl.to_string()]);
+    }
+
+    #[tokio::test]
+    async fn hosted_retained_probe_is_silent_without_live_records_or_wiring() {
+        let purl = "pkg:npm/minimist@1.2.2";
+        let scanned: HashSet<String> = [purl.to_string()].into_iter().collect();
+
+        // (a) Records retired — the lane-B (hosted→vendored pre-revert)
+        // world: the pre-revert drops the ledger RECORDS while the
+        // append-only `edits` (revert originals) legitimately remain. The
+        // warning keys on records still live at scan time, so it must stay
+        // silent even with the uuid still present in the lock text.
+        let tmp = tempfile::tempdir().unwrap();
+        write_redirect_ledger_with_edit(tmp.path(), &[]).await;
+        write_hosted_yarn_lock(tmp.path(), TAKEOVER_UUID).await;
+        let ledger = load_ledger(tmp.path()).await;
+        assert!(
+            hosted_wiring_retained_purls(tmp.path(), ledger.as_ref(), &scanned)
+                .await
+                .is_empty(),
+            "records gone ⇒ silent (pre-reverted wiring must not re-warn)"
+        );
+
+        // (b) Registry-clean lock with a live record: the live lock is the
+        // truth source — never guess from ledger presence alone.
+        let tmp = tempfile::tempdir().unwrap();
+        write_redirect_ledger_with_edit(tmp.path(), &[purl]).await;
+        tokio::fs::write(
+            tmp.path().join("yarn.lock"),
+            "# yarn lockfile v1\n\n\nminimist@^1.2.2:\n  version \"1.2.2\"\n  \
+             resolved \"https://registry.yarnpkg.com/minimist/-/minimist-1.2.2.tgz#bbbb\"\n  \
+             integrity sha512-orig==\n",
+        )
+        .await
+        .unwrap();
+        let ledger = load_ledger(tmp.path()).await;
+        assert!(
+            hosted_wiring_retained_purls(tmp.path(), ledger.as_ref(), &scanned)
+                .await
+                .is_empty(),
+            "registry-clean lock ⇒ silent"
+        );
+
+        // (c) The purl was not scanned this run.
+        let tmp = tempfile::tempdir().unwrap();
+        write_redirect_ledger_with_edit(tmp.path(), &[purl]).await;
+        write_hosted_yarn_lock(tmp.path(), TAKEOVER_UUID).await;
+        let other: HashSet<String> = ["pkg:npm/lodash@4.17.21".to_string()].into_iter().collect();
+        let ledger = load_ledger(tmp.path()).await;
+        assert!(
+            hosted_wiring_retained_purls(tmp.path(), ledger.as_ref(), &other)
+                .await
+                .is_empty(),
+            "unscanned purl ⇒ silent"
+        );
+
+        // (d) No ledger at all.
+        let tmp = tempfile::tempdir().unwrap();
+        write_hosted_yarn_lock(tmp.path(), TAKEOVER_UUID).await;
+        assert!(
+            hosted_wiring_retained_purls(tmp.path(), None, &scanned)
+                .await
+                .is_empty(),
+            "no ledger ⇒ silent"
+        );
+    }
+
+    #[test]
+    fn agent_retention_details_name_packages_and_safe_remediation() {
+        let purls = vec!["pkg:npm/minimist@1.2.2".to_string()];
+
+        // hosted_wiring_retained: names the purl and both real options
+        // (stay hosted / migrate via vendored), never a hosted→agent
+        // unwind (none exists) and never hand-deleting the ledger (the
+        // only store of the pre-redirect revert originals).
+        let hosted = hosted_wiring_retained_detail(&purls);
+        assert!(hosted.contains("pkg:npm/minimist@1.2.2"));
+        assert!(hosted.contains("scan --mode hosted"));
+        assert!(hosted.contains("scan --mode vendored"));
+        assert!(
+            hosted.contains("Do not delete"),
+            "must warn against hand-deleting the ledger: {hosted}"
+        );
+
+        // vendored_ownership_retained: names the purl and the per-package
+        // migration path, with the mass-revert alternative scoped.
+        let vendored = vendored_ownership_retained_detail(&purls);
+        assert!(vendored.contains("pkg:npm/minimist@1.2.2"));
+        assert!(vendored.contains("socket-patch remove"));
+        assert!(vendored.contains("vendor --revert"));
+        assert!(
+            vendored.contains("EVERY vendored package"),
+            "the mass-revert blast radius must be called out: {vendored}"
+        );
+        assert!(vendored.contains("scan --mode agent"));
+
+        // Distinct routing tags, also distinct from the takeover family.
+        assert_ne!(HOSTED_WIRING_RETAINED, VENDORED_OWNERSHIP_RETAINED);
+        assert_ne!(HOSTED_WIRING_RETAINED, REDIRECT_SUPERSEDES_VENDORED);
+        assert_ne!(VENDORED_OWNERSHIP_RETAINED, VENDOR_SUPERSEDES_REDIRECT);
     }
 
     // ---- cargo takeover direction (lock-shape probe) ------------------------

@@ -31,7 +31,10 @@ pub use state::{
     drop_superseded_purl, load_redirect_state, persist_redirect_state, save_redirect_state,
     CorruptRedirectState, RedirectState, REDIRECT_STATE_REL,
 };
-pub use takeover::{revert_cargo_redirect_purl, CargoRedirectRevert};
+pub use takeover::{
+    redirect_revert_supported, revert_cargo_redirect_purl, revert_npm_redirect_purl,
+    revert_redirect_purl, CargoRedirectRevert, RedirectRevert,
+};
 
 /// One ecosystem's integrity hashes (mirrors the TS `PatchArtifactIntegrity`).
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -787,6 +790,18 @@ fn is_valid_cargo_index_url(url: &str) -> bool {
         && !url.contains('"')
         && !url.contains('\\')
         && !url.chars().any(char::is_control)
+}
+
+/// Gem index URLs land verbatim inside a quoted Ruby `source "<url>" do`
+/// Gemfile string and on unquoted Gemfile.lock `remote:` lines — refuse
+/// anything that could break out of either (quote, backslash, whitespace;
+/// control chars cover newline injection into the lock) or that is not an
+/// http(s) URL at all. Twin of [`is_valid_cargo_index_url`].
+fn is_valid_gem_index_url(url: &str) -> bool {
+    (url.starts_with("https://") || url.starts_with("http://"))
+        && !url.contains('"')
+        && !url.contains('\\')
+        && !url.chars().any(|c| c.is_control() || c == ' ')
 }
 
 /// The exact shape `hex::encode(sha256)` / the TS `Buffer.toString('hex')`
@@ -2262,13 +2277,68 @@ fn rewrite_yarn_berry(
                     .1
                     .starts_with("npm:")
             }) {
+                let ranges: Vec<&str> = parsed
+                    .iter()
+                    .map(|p| {
+                        p.expect("every pattern parsed — None-bearing keys are skipped above")
+                            .1
+                    })
+                    .collect();
+                // A `file:` range into `.socket/vendor/` is socket-patch's
+                // OWN vendored wiring (`scan --mode vendored`), not some
+                // third-party protocol: the refusal stays fail-closed
+                // (byte-identical — the vendored artifact is the live CVE
+                // protection), but it must say what the entry IS and name
+                // the real way out. `remove <purl>` is the per-package
+                // retirement; `vendor --revert` works too but unwinds EVERY
+                // vendored package, so it is scoped, not recommended. The
+                // remedy holds whether or not a vendored→hosted pre-revert
+                // ever lands for npm-family — today no berry counterpart of
+                // the cargo takeover exists.
+                if ranges
+                    .iter()
+                    .any(|r| r.starts_with("file:") && r.contains(".socket/vendor/"))
+                {
+                    result.warnings.push(RewriteWarning {
+                        code: "redirect_yarn_berry_vendored_entry".into(),
+                        detail: format!(
+                            "lock entry `{raw_key}` is socket-patch's own vendored wiring \
+                             for {fname}@{} (a committed `.socket/vendor/` artifact); the \
+                             hosted redirect does not take over a vendor-owned package — \
+                             leaving it byte-identical. To move this package to hosted \
+                             mode, first retire its vendored wiring: run `socket-patch \
+                             remove <purl>` for this package (or `socket-patch vendor \
+                             --revert`, which unwinds EVERY vendored package), then re-run \
+                             `scan --mode hosted`",
+                            dep.version
+                        ),
+                    });
+                    continue;
+                }
+                // Name the entry's ACTUAL protocol(s) — a hardcoded example
+                // list misdirects for anything outside it (`file:`, `exec:`,
+                // …). `workspace:`/`patch:`/`portal:`/`link:` stay the
+                // canonical examples of why the gate exists.
+                let mut protocols: Vec<String> = ranges
+                    .iter()
+                    .filter(|r| !r.starts_with("npm:"))
+                    .map(|r| match r.split_once(':') {
+                        Some((proto, _)) => format!("{proto}:"),
+                        None => "(none)".to_string(),
+                    })
+                    .collect();
+                protocols.sort();
+                protocols.dedup();
                 result.warnings.push(RewriteWarning {
                     code: "redirect_yarn_berry_unsupported_protocol".into(),
                     detail: format!(
-                        "lock entry `{raw_key}` resolves {fname}@{} through a protocol \
-                         the hosted redirect cannot own (workspace:/patch:/portal:/link:); \
-                         leaving it byte-identical",
-                        dep.version
+                        "lock entry `{raw_key}` resolves {fname}@{} through the `{}` \
+                         protocol, which the hosted redirect cannot own (only npm: \
+                         registry entries are rewritten; e.g. workspace:, patch:, \
+                         portal:, link: blocks must survive untouched); leaving it \
+                         byte-identical",
+                        dep.version,
+                        protocols.join("`/`")
                     ),
                 });
                 continue;
@@ -3189,12 +3259,45 @@ fn gem_tail_source_option(tail: &str) -> Option<&'static str> {
     .find(|tok| code.contains(tok))
 }
 
+/// The grant-token path segment of a hosted patch URL: the path level
+/// immediately preceding the patch-uuid level (production shape
+/// `…/patch-registry/gem/{token}/{uuid}/…`, same layout on the artifact
+/// URLs). The reference endpoint hands the token back only inside its URLs,
+/// so this is how a caller recovers it for `DepOverride.token`. Only path
+/// levels count — the scheme/host prefix is skipped so a uuid sitting in the
+/// first path segment can never elect the host as its "token". `None` when
+/// the uuid is absent or nothing precedes it.
+pub fn grant_token_path_segment(url: &str, patch_uuid: &str) -> Option<String> {
+    if patch_uuid.is_empty() {
+        return None;
+    }
+    let after_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
+    let (_, path) = after_scheme.split_once('/')?;
+    let before = path
+        .split_once(&format!("/{patch_uuid}/"))
+        .map(|(before, _)| before)
+        .or_else(|| path.strip_suffix(&format!("/{patch_uuid}")))?;
+    let token = before.rsplit('/').next().unwrap_or("");
+    (!token.is_empty()).then(|| token.to_string())
+}
+
 /// A dep's Socket index URL as a regex source with the per-request rotating
 /// segments (grant token, patch uuid) wildcarded — an exact-URL pattern
-/// misses the URL a previous run wrote under an older grant.
+/// misses the URL a previous run wrote under an older grant. The grant token
+/// is wildcarded even when the caller left `dep.token` empty (the CLI
+/// historically never populated it): the token path level is derived from
+/// the index URL itself as the segment immediately preceding the patch-uuid
+/// level, so the idempotency guard never silently degrades into the
+/// nesting-corruption failure mode when a caller forgets the token.
 fn gem_index_url_pattern(dep: &DepOverride, index_url: &str) -> String {
     let mut url_pat = regex::escape(index_url);
-    for rotating in [&dep.token, &dep.patch_uuid] {
+    let derived_token = grant_token_path_segment(index_url, &dep.patch_uuid);
+    let rotating = [
+        Some(dep.token.as_str()),
+        derived_token.as_deref(),
+        Some(dep.patch_uuid.as_str()),
+    ];
+    for rotating in rotating.into_iter().flatten() {
         if !rotating.is_empty() {
             url_pat = url_pat.replace(&regex::escape(&format!("/{rotating}/")), "/[^/\"]+/");
         }
@@ -3242,6 +3345,232 @@ fn gem_spelling_residue(content: &str, deps: &[&DepOverride]) -> String {
         residue = decl_re.replace_all(&residue, "").into_owned();
     }
     residue.trim_end().to_string()
+}
+
+/// A lock line without its `\r?\n` ending (never more than one of each).
+fn gem_lock_line_content(line: &str) -> &str {
+    let line = line.strip_suffix('\n').unwrap_or(line);
+    line.strip_suffix('\r').unwrap_or(line)
+}
+
+/// The gem name of a 2-space DEPENDENCIES entry (`  rails`, `  rails!`,
+/// `  rails (= 7.0.0)!`) — the text before any constraint, sans source pin.
+fn gem_lock_dependency_name(entry: &str) -> &str {
+    let entry = entry.trim_start();
+    let entry = entry.split(" (").next().unwrap_or(entry);
+    entry.trim_end_matches('!')
+}
+
+/// One parsed `GEM` section of a Gemfile.lock: its `remote:` lines (index +
+/// URL) and the exclusive end index — the start of the next column-0 header
+/// (trailing blank separator included) or EOF.
+struct GemLockSection {
+    remotes: Vec<(usize, String)>,
+    end: usize,
+}
+
+/// Converge the lock's source attribution for one redirected dep so the
+/// Gemfile + lock pair is what bundler itself would write after an install
+/// from the redirected Gemfile (verified frozen-installable on bundler 4):
+/// the dep's spec entry (+ its dependency sublines) moves out of the
+/// upstream `GEM` section into a patch-registry `GEM` section
+/// (`remote: <index-url>`), and DEPENDENCIES pins `<name> (= <version>)!`
+/// (bundler's source-pin spelling for a block-scoped exact-version gem) —
+/// added in sorted position when the dep was transitive. Without this the
+/// CHECKSUMS pin leaves a MIXED state bundler refuses: the lock still
+/// attributes the gem to the upstream remote, so the prescribed unfrozen
+/// install exits 37 "mismatched checksums" and a frozen install exits 16.
+///
+/// Idempotent and rotation-aware: a section whose remote matches the
+/// token-wildcard pattern is recognized as ours (never duplicated) and its
+/// remote is refreshed in place under a rotated grant
+/// (`redirect_gemfile_lock_source_url`, mirroring the Gemfile refresh).
+///
+/// Returns true when the lock ends converged (already, or via edits recorded
+/// into `result`); false when the dep cannot be attributed safely — spec
+/// entry absent or duplicated, a legacy multi-remote `GEM` section, or no
+/// DEPENDENCIES section — in which case nothing is touched and the caller
+/// surfaces the frozen-install caveat exactly as before.
+fn converge_gem_lock_source(
+    lk: &mut String,
+    dep: &DepOverride,
+    index_url: &str,
+    lock_name: &str,
+    lock_changed: &mut bool,
+    result: &mut RewriteResult,
+) -> bool {
+    let eol = if lk.contains("\r\n") { "\r\n" } else { "\n" };
+    let mut lines: Vec<String> = lk.split_inclusive('\n').map(str::to_string).collect();
+    let is_header = |c: &str| !c.is_empty() && !c.starts_with(' ');
+
+    // Parse: GEM sections, the dep's 4-space spec entry, DEPENDENCIES range.
+    let spec_content = format!("    {} ({})", dep.name, dep.version);
+    let mut sections: Vec<GemLockSection> = Vec::new();
+    let mut spec_at: Vec<(usize, usize)> = Vec::new(); // (section idx, line idx)
+    let mut deps_range: Option<(usize, usize)> = None; // exclusive of header
+    let mut i = 0;
+    while i < lines.len() {
+        let c = gem_lock_line_content(&lines[i]);
+        if !is_header(c) {
+            i += 1;
+            continue;
+        }
+        let header_is_gem = c == "GEM";
+        let start = i;
+        let mut remotes = Vec::new();
+        let mut j = i + 1;
+        while j < lines.len() && !is_header(gem_lock_line_content(&lines[j])) {
+            let cj = gem_lock_line_content(&lines[j]);
+            if header_is_gem {
+                if let Some(url) = cj.strip_prefix("  remote: ") {
+                    remotes.push((j, url.to_string()));
+                }
+                if cj == spec_content {
+                    spec_at.push((sections.len(), j));
+                }
+            }
+            j += 1;
+        }
+        if header_is_gem {
+            sections.push(GemLockSection { remotes, end: j });
+        } else if c == "DEPENDENCIES" {
+            deps_range = Some((start + 1, j));
+        }
+        i = j;
+    }
+
+    let spec_pos = if spec_at.len() == 1 {
+        Some(spec_at[0])
+    } else {
+        None
+    };
+    let (Some((sec_idx, spec_idx)), Some((deps_start, deps_end))) = (spec_pos, deps_range) else {
+        return false;
+    };
+    if sections[sec_idx].remotes.len() != 1 {
+        return false;
+    }
+    // Bundler always writes source sections before DEPENDENCIES — the pin
+    // edit below runs first on that premise (its lines sit after the parsed
+    // spec/remote/end indices, so they never shift). A hand-edited lock with
+    // DEPENDENCIES before the dep's GEM section breaks the premise: the
+    // transitive-dep pin INSERT would leave the spec-move splicing on stale
+    // indices. Fail soft to the mixed state instead.
+    if deps_start < sections[sec_idx].end {
+        return false;
+    }
+    let (remote_idx, remote_url) = sections[sec_idx].remotes[0].clone();
+    let socket_remote_re = Regex::new(&format!("^{}$", gem_index_url_pattern(dep, index_url)))
+        .expect("anchored index-url pattern from the escaped URL is valid");
+    let mut changed = false;
+
+    // DEPENDENCIES pin first — its lines sit AFTER the GEM sections, so the
+    // spec move below never invalidates these indices (and vice versa would).
+    let target = format!("  {} (= {})!", dep.name, dep.version);
+    let is_entry = |c: &str| c.starts_with("  ") && !c.starts_with("   ");
+    let entry_idx = (deps_start..deps_end).find(|&k| {
+        let ck = gem_lock_line_content(&lines[k]);
+        is_entry(ck) && gem_lock_dependency_name(ck) == dep.name
+    });
+    match entry_idx {
+        Some(k) if gem_lock_line_content(&lines[k]) == target => {}
+        Some(k) => {
+            let old = gem_lock_line_content(&lines[k]).trim_start().to_string();
+            let ending = lines[k][gem_lock_line_content(&lines[k]).len()..].to_string();
+            lines[k] = format!("{target}{ending}");
+            result.edits.push(FileEdit {
+                path: lock_name.into(),
+                kind: "redirect_gemfile_lock_dependency_pin".into(),
+                action: "rewritten".into(),
+                key: Some(dep.name.clone()),
+                original: Some(Value::String(old)),
+                new: Some(Value::String(target.trim_start().to_string())),
+            });
+            changed = true;
+        }
+        None => {
+            // Transitive dep: bundler keeps DEPENDENCIES sorted by name.
+            let mut at = deps_end;
+            for (k, line) in lines.iter().enumerate().take(deps_end).skip(deps_start) {
+                let ck = gem_lock_line_content(line);
+                if ck.is_empty()
+                    || (is_entry(ck) && gem_lock_dependency_name(ck) > dep.name.as_str())
+                {
+                    at = k;
+                    break;
+                }
+            }
+            lines.insert(at, format!("{target}{eol}"));
+            result.edits.push(FileEdit {
+                path: lock_name.into(),
+                kind: "redirect_gemfile_lock_dependency_pin".into(),
+                action: "added".into(),
+                key: Some(dep.name.clone()),
+                original: None,
+                new: Some(Value::String(target.trim_start().to_string())),
+            });
+            changed = true;
+        }
+    }
+
+    if socket_remote_re.is_match(&remote_url) {
+        // Already ours. Rotated grant: refresh the remote in place.
+        if remote_url != index_url {
+            let ending =
+                lines[remote_idx][gem_lock_line_content(&lines[remote_idx]).len()..].to_string();
+            lines[remote_idx] = format!("  remote: {index_url}{ending}");
+            result.edits.push(FileEdit {
+                path: lock_name.into(),
+                kind: "redirect_gemfile_lock_source_url".into(),
+                action: "rewritten".into(),
+                key: Some(dep.name.clone()),
+                original: Some(Value::String(remote_url)),
+                new: Some(Value::String(index_url.to_string())),
+            });
+            changed = true;
+        }
+    } else {
+        // Move the spec (+ sublines) into a patch-registry section of its
+        // own, inserted where the section it leaves ends.
+        let mut last = spec_idx;
+        while last + 1 < lines.len()
+            && gem_lock_line_content(&lines[last + 1]).starts_with("      ")
+        {
+            last += 1;
+        }
+        let moved: Vec<String> = lines.drain(spec_idx..=last).collect();
+        let insert_at = sections[sec_idx].end - moved.len();
+        let mut block: Vec<String> = Vec::with_capacity(moved.len() + 4);
+        block.push(format!("GEM{eol}"));
+        block.push(format!("  remote: {index_url}{eol}"));
+        block.push(format!("  specs:{eol}"));
+        for line in moved {
+            // Moved lines keep their own bytes; only a final line that lacked
+            // a newline (EOF) gains the file's ending.
+            if line.ends_with('\n') {
+                block.push(line);
+            } else {
+                block.push(format!("{line}{eol}"));
+            }
+        }
+        block.push(eol.to_string());
+        lines.splice(insert_at..insert_at, block);
+        result.edits.push(FileEdit {
+            path: lock_name.into(),
+            kind: "redirect_gemfile_lock_gem_source".into(),
+            action: "rewritten".into(),
+            key: Some(dep.name.clone()),
+            original: Some(Value::String(remote_url)),
+            new: Some(Value::String(index_url.to_string())),
+        });
+        changed = true;
+    }
+
+    if changed {
+        *lk = lines.concat();
+        *lock_changed = true;
+    }
+    true
 }
 
 fn rewrite_gem(
@@ -3297,6 +3626,12 @@ fn rewrite_gem(
     // misdiagnosing the lock as bundler <2.6.
     let checksums_re =
         Regex::new(r"(?m)^CHECKSUMS(\r?)$").expect("static CHECKSUMS header regex is valid");
+    // True once any redirected dep leaves the pair MIXED: the lock still
+    // attributes the dep to the upstream source (no CHECKSUMS section to key
+    // the convergence on, or a lock shape the convergence refused). Only
+    // that state earns the frozen-install caveat — a converged pair is
+    // frozen-installable as written.
+    let mut mixed_state = false;
 
     for dep in &gem {
         let Some(ov) = &dep.registry_override else {
@@ -3307,6 +3642,19 @@ fn rewrite_gem(
             continue;
         };
         if ov.kind != "rubygems-compact-index" {
+            continue;
+        }
+        // The URL is interpolated into the Gemfile's quoted source string and
+        // the lock's `remote:` lines — gate it before any write, like the
+        // cargo arm gates sparse index URLs.
+        if !is_valid_gem_index_url(&ov.index_url) {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_gem_invalid_index_url".into(),
+                detail: format!(
+                    "{} has a malformed patch-registry index URL; dependency skipped",
+                    dep.name
+                ),
+            });
             continue;
         }
         let Some(sha256) = ov
@@ -3450,15 +3798,37 @@ fn rewrite_gem(
                     };
                     // A source-selecting option would move into the block and
                     // OVERRIDE it in bundler's DSL, leaving the redirect a
-                    // silent no-op that still gets attested. Fail closed.
+                    // silent no-op that still gets attested. Fail closed —
+                    // and when the blocking `path:` is socket-patch's OWN
+                    // vendored wiring, prescribe the eject path instead of
+                    // leaving the user to puzzle over their own Gemfile.
                     if let Some(tok) = gem_tail_source_option(&tail) {
-                        result.warnings.push(RewriteWarning {
-                            code: "redirect_gem_source_option".into(),
-                            detail: format!(
+                        let socket_vendored = matches!(tok, "path:" | ":path")
+                            && tail
+                                .split('#')
+                                .next()
+                                .unwrap_or("")
+                                .contains(".socket/vendor/");
+                        let detail = if socket_vendored {
+                            format!(
+                                "the `gem \"{}\"` declaration carries `{tok}` pointing into \
+                                 .socket/vendor — socket-patch's own vendored wiring, which \
+                                 would override the Socket source block; un-vendor this gem \
+                                 first (`socket-patch remove pkg:gem/{}@{}`, or `socket-patch \
+                                 vendor --revert` to revert EVERY vendored dependency in the \
+                                 project), then re-run the hosted scan",
+                                dep.name, dep.name, dep.version
+                            )
+                        } else {
+                            format!(
                                 "the `gem \"{}\"` declaration carries `{tok}`, which would \
                                  override the Socket source block; redirect skipped",
                                 dep.name
-                            ),
+                            )
+                        };
+                        result.warnings.push(RewriteWarning {
+                            code: "redirect_gem_source_option".into(),
+                            detail,
                         });
                         continue;
                     }
@@ -3555,6 +3925,7 @@ fn rewrite_gem(
             let already_re =
                 Regex::new(&(String::from(r"(?m)^  ") + &regex::escape(&new_val) + r"\r?$"))
                     .expect("already-redirected regex from the escaped line is valid");
+            let mut checksums_era = true;
             if already_re.is_match(lk) {
                 // no-op
             } else if let Some(m) = sum_line_re.captures(lk) {
@@ -3608,15 +3979,35 @@ fn rewrite_gem(
                         dep.name
                     ),
                 });
+                checksums_era = false;
+            }
+            // A CHECKSUMS-era lock must end FULLY CONVERGED — with only the
+            // sha pinned, bundler still attributes the gem to the upstream
+            // remote and refuses the pair outright (unfrozen: exit 37
+            // "mismatched checksums"; frozen: exit 16). A pre-CHECKSUMS lock
+            // has no sha to converge around, so it keeps today's
+            // mixed-but-installable state + the frozen-install caveat.
+            if !checksums_era
+                || !converge_gem_lock_source(
+                    lk,
+                    dep,
+                    &ov.index_url,
+                    lock_name,
+                    &mut lock_changed,
+                    result,
+                )
+            {
+                mixed_state = true;
             }
         }
     }
 
-    // The rewritten pair breaks bundler's frozen/deployment mode: the lock's
-    // GEM section still records the upstream source, so `bundle install` with
+    // A MIXED pair breaks bundler's frozen/deployment mode: the lock's GEM
+    // section still records the upstream source, so `bundle install` with
     // `frozen`/`--deployment` set rejects the Gemfile's new source block.
-    // Mirror of the CLI's pnpm trust-lockfile warning.
-    if gemfile_changed || lock_changed {
+    // Mirror of the CLI's pnpm trust-lockfile warning. A converged pair (the
+    // CHECKSUMS-era path) is frozen-installable as written — no caveat.
+    if (gemfile_changed || lock_changed) && mixed_state {
         result.warnings.push(RewriteWarning {
             code: "redirect_gem_frozen_install".into(),
             detail: format!(
@@ -5379,6 +5770,160 @@ mod tests {
             .any(|w| w.code == "redirect_yarn_berry_ambiguous_entry"));
     }
 
+    /// A `file:` lock entry carrying the `.socket/vendor/` signature is
+    /// socket-patch's OWN vendored wiring (a `scan --mode vendored` project
+    /// being converted to hosted). Refusing it under the generic
+    /// `redirect_yarn_berry_unsupported_protocol` code misdiagnosed it —
+    /// the detail hardcoded "(workspace:/patch:/portal:/link:)" (`file:`
+    /// was not even listed) and named no way out. The refusal itself is
+    /// correct (fail-closed, byte-identical), but it must carry a DISTINCT
+    /// code and the real per-package remediation: retire the vendored
+    /// wiring first (`socket-patch remove <purl>`; `vendor --revert`
+    /// unwinds EVERY vendored package), then re-run `scan --mode hosted`.
+    /// That remedy holds whether or not a vendored→hosted pre-revert ever
+    /// lands for npm-family — today no berry counterpart of the cargo
+    /// takeover exists, so manual retirement is the only path.
+    #[test]
+    fn yarn_berry_vendored_file_entry_refused_with_distinct_code_and_remediation() {
+        let checksum = format!("10c0/{}", "7".repeat(128));
+        let ovr = berry_override("minimist", "1.2.2", "http://p.test/minimist.tgz", &checksum);
+        let uuid = "80630680-4da6-45f9-bba8-b888e0ffd58c";
+        let entry = format!(
+            "minimist@file:./.socket/vendor/npm/{uuid}/minimist-1.2.2.tgz::\
+             locator=root%40workspace%3A."
+        );
+        let mut files = BTreeMap::new();
+        files.insert(
+            "yarn.lock".to_string(),
+            format!(
+                "# header\n\n__metadata:\n  version: 8\n  cacheKey: 10c0\n\n\
+                 \"{entry}\":\n  version: 1.2.2\n  resolution: \"{entry}\"\n  \
+                 checksum: 10c0/{}\n  languageName: node\n  linkType: hard\n",
+                "3".repeat(128)
+            ),
+        );
+        let mut r = RewriteResult::default();
+        rewrite_yarn_berry(&files, std::slice::from_ref(&ovr), &mut r);
+        assert!(
+            r.files.is_empty() && r.edits.is_empty(),
+            "vendored entry must stay byte-identical: {:?}",
+            r.files
+        );
+        let w = r
+            .warnings
+            .iter()
+            .find(|w| w.code == "redirect_yarn_berry_vendored_entry")
+            .unwrap_or_else(|| {
+                panic!(
+                    "a vendored file: entry must get the distinct vendored-entry \
+                     code, not the generic protocol refusal: {:?}",
+                    r.warnings
+                )
+            });
+        // Names the refused entry and the real remediation sequence.
+        assert!(
+            w.detail.contains(&entry),
+            "must name the entry: {}",
+            w.detail
+        );
+        assert!(
+            w.detail.contains("socket-patch remove"),
+            "must name the per-package remediation: {}",
+            w.detail
+        );
+        assert!(
+            w.detail.contains("vendor --revert"),
+            "must name (and scope) the mass-revert alternative: {}",
+            w.detail
+        );
+        assert!(
+            w.detail.contains("scan --mode hosted"),
+            "must name the re-run step: {}",
+            w.detail
+        );
+        // The old misdiagnosis must be gone: no four-protocol list that
+        // does not even include `file:`.
+        assert!(
+            !w.detail.contains("(workspace:/patch:/portal:/link:)"),
+            "must not misdiagnose the vendored entry with the generic \
+             protocol list: {}",
+            w.detail
+        );
+    }
+
+    /// The generic unsupported-protocol refusal must name the entry's
+    /// ACTUAL protocol (backticked), not a hardcoded four-item list that
+    /// omits, e.g., `file:` — an operator debugging the refusal needs the
+    /// real cause, and the old list actively misdirected for any protocol
+    /// outside it.
+    #[test]
+    fn yarn_berry_unsupported_protocol_detail_names_actual_protocol() {
+        let checksum = format!("10c0/{}", "7".repeat(128));
+        let ovr = berry_override("left-pad", "1.3.0", "http://p.test/lp.tgz", &checksum);
+        let lock_with = |entry: &str| {
+            format!(
+                "# header\n\n__metadata:\n  version: 8\n  cacheKey: 10c0\n\n\
+                 \"{entry}\":\n  version: 1.3.0\n  resolution: \"{entry}\"\n  \
+                 checksum: 10c0/{}\n  languageName: node\n  linkType: hard\n",
+                "3".repeat(128)
+            )
+        };
+
+        // A portal: entry → generic code, detail names `portal:`.
+        let mut files = BTreeMap::new();
+        files.insert(
+            "yarn.lock".to_string(),
+            lock_with("left-pad@portal:./vendor/left-pad::locator=root%40workspace%3A."),
+        );
+        let mut r = RewriteResult::default();
+        rewrite_yarn_berry(&files, std::slice::from_ref(&ovr), &mut r);
+        assert!(r.files.is_empty());
+        let w = r
+            .warnings
+            .iter()
+            .find(|w| w.code == "redirect_yarn_berry_unsupported_protocol")
+            .expect("portal: entry keeps the generic refusal code");
+        assert!(
+            w.detail.contains("`portal:`"),
+            "detail must name the actual protocol: {}",
+            w.detail
+        );
+
+        // A user's own file: entry OUTSIDE `.socket/vendor/` → still the
+        // generic code (not vendored-entry), detail names `file:`.
+        let mut files = BTreeMap::new();
+        files.insert(
+            "yarn.lock".to_string(),
+            lock_with("left-pad@file:./local/left-pad.tgz::locator=root%40workspace%3A."),
+        );
+        let mut r = RewriteResult::default();
+        rewrite_yarn_berry(&files, std::slice::from_ref(&ovr), &mut r);
+        assert!(r.files.is_empty());
+        let w = r
+            .warnings
+            .iter()
+            .find(|w| w.code == "redirect_yarn_berry_unsupported_protocol")
+            .unwrap_or_else(|| {
+                panic!(
+                    "a non-vendored file: entry keeps the generic refusal \
+                     code: {:?}",
+                    r.warnings
+                )
+            });
+        assert!(
+            w.detail.contains("`file:`"),
+            "detail must name the actual protocol: {}",
+            w.detail
+        );
+        assert!(
+            !r.warnings
+                .iter()
+                .any(|w| w.code == "redirect_yarn_berry_vendored_entry"),
+            "vendored-entry code is reserved for `.socket/vendor/` wiring: {:?}",
+            r.warnings
+        );
+    }
+
     /// Two-entry classic lock: a decoy entry FIRST, the target second — the
     /// shape that exposed the CRLF wrong-entry rewrite.
     fn classic_lock_two_entries() -> String {
@@ -6747,6 +7292,52 @@ mod tests {
         }
     }
 
+    /// A service-supplied index URL is interpolated into the Gemfile's quoted
+    /// source string and the lock's `remote:` lines — a quote, backslash, or
+    /// control character (a newline would inject whole lock lines) must be
+    /// refused at intake with nothing written, like the cargo sparse gate.
+    #[test]
+    fn gem_malformed_index_url_is_refused_before_any_write() {
+        for bad in [
+            "https://patch.test/gem/tok\"/uuid/",
+            "https://patch.test/gem\\tok/uuid/",
+            "https://patch.test/gem/tok/uuid/\nGEM",
+            "https://patch.test/gem/t k/uuid/",
+            "ftp://patch.test/gem/tok/uuid/",
+        ] {
+            let mut files = BTreeMap::new();
+            files.insert(
+                "Gemfile".to_string(),
+                "source \"https://rubygems.org\"\n\ngem \"rails\", \"7.0.0\"\n".to_string(),
+            );
+            files.insert(
+                "Gemfile.lock".to_string(),
+                "GEM\n  remote: https://rubygems.org/\n  specs:\n    rails (7.0.0)\n\n\
+                 PLATFORMS\n  ruby\n\nDEPENDENCIES\n  rails (= 7.0.0)\n\n\
+                 BUNDLED WITH\n   2.6.2\n"
+                    .to_string(),
+            );
+            let mut ov = gem_override("rails", "7.0.0");
+            ov.registry_override
+                .as_mut()
+                .expect("gem_override always carries a registry override")
+                .index_url = bad.into();
+            let r = rewrite_registry_redirect(&files, &[ov]);
+            assert!(
+                r.files.is_empty() && r.edits.is_empty(),
+                "malformed index URL [{bad}] must write nothing: {:?}",
+                r.edits
+            );
+            assert!(
+                r.warnings
+                    .iter()
+                    .any(|w| w.code == "redirect_gem_invalid_index_url"),
+                "malformed index URL [{bad}] must warn: {:?}",
+                r.warnings
+            );
+        }
+    }
+
     /// Trailing options on the original `gem` line (`require: false`,
     /// `group: …`) must survive the move into the source block — dropping
     /// `require: false` auto-requires the gem at boot, changing app behavior
@@ -6866,6 +7457,133 @@ mod tests {
         );
     }
 
+    /// The CLI's ONLY production `DepOverride` construction site
+    /// (`scan/hosted.rs`) builds every override with an EMPTY `token` — the
+    /// reference endpoint hands the grant token back only inside the URLs it
+    /// returns. The rotated-grant idempotency guard must therefore never
+    /// depend on the caller populating `token`: a re-scan under a rotated
+    /// grant must still recognize the source block a previous run wrote and
+    /// refresh its URL in place. With a token-dependent guard the recognizer
+    /// misses the old block, `gem_line_re` matches the INDENTED gem line
+    /// inside it, and every re-scan wraps it in one more nested source block
+    /// while keeping the stale (soon-dead) token URL live and reporting
+    /// success.
+    #[test]
+    fn gemfile_rerun_with_rotated_grant_and_cli_empty_token_never_nests() {
+        const PATCH_UUID: &str = "7c8d9e0f-1a2b-4a1b-8c2d-3e4f5a6b7c8d";
+        fn ov(token: &str) -> DepOverride {
+            let mut o = gem_override("rails", "7.0.0");
+            // Exactly as the CLI builds it: the grant token never populated.
+            o.token = String::new();
+            o.patch_uuid = PATCH_UUID.into();
+            if let Some(r) = o.registry_override.as_mut() {
+                r.index_url =
+                    format!("https://patch.test/patch-registry/gem/{token}/{PATCH_UUID}/");
+            }
+            o
+        }
+        let mut files = BTreeMap::new();
+        files.insert(
+            "Gemfile".to_string(),
+            "source \"https://rubygems.org\"\n\ngem \"rails\", \"7.0.0\"\n".to_string(),
+        );
+        let first = rewrite_registry_redirect(&files, &[ov("tok-one")]);
+        files.insert(
+            "Gemfile".to_string(),
+            first
+                .files
+                .get("Gemfile")
+                .expect("first run rewrites")
+                .clone(),
+        );
+
+        let second = rewrite_registry_redirect(&files, &[ov("tok-two")]);
+        let out = second
+            .files
+            .get("Gemfile")
+            .expect("rotated grant refreshes the URL");
+        assert_eq!(
+            out.matches("source \"https://patch.test/patch-registry/gem/")
+                .count(),
+            1,
+            "exactly one Socket source block, never nested: {out}"
+        );
+        assert!(!out.contains("tok-one"), "old grant token gone: {out}");
+        assert!(
+            out.contains(&format!(
+                "source \"https://patch.test/patch-registry/gem/tok-two/{PATCH_UUID}/\" do\n  gem \"rails\", \"7.0.0\"\nend"
+            )),
+            "URL refreshed in place: {out}"
+        );
+        assert!(
+            second
+                .edits
+                .iter()
+                .any(|e| e.kind == "redirect_gemfile_source_url"),
+            "the refresh must be recorded as a redirect_gemfile_source_url edit: {:?}",
+            second.edits
+        );
+
+        // Same grant again: a true no-op.
+        files.insert("Gemfile".to_string(), out.clone());
+        let third = rewrite_registry_redirect(&files, &[ov("tok-two")]);
+        assert!(
+            third.files.is_empty() && third.edits.is_empty(),
+            "same-grant re-run must be a no-op: files={:?} edits={:?}",
+            third.files.keys(),
+            third.edits
+        );
+    }
+
+    /// The gems.rb/Gemfile divergence guard erases the redirect's own
+    /// footprint with the same token-wildcard pattern, so it too must not
+    /// depend on `DepOverride.token` being populated: identical twins
+    /// re-scanned under a rotated grant with the CLI's empty token must reach
+    /// the in-place refresh, not be trapped behind
+    /// `redirect_gem_gemfile_spellings_diverge` by run 1's own edit.
+    #[test]
+    fn gems_rb_twins_rotated_grant_with_cli_empty_token_refreshes() {
+        const PATCH_UUID: &str = "7c8d9e0f-1a2b-4a1b-8c2d-3e4f5a6b7c8d";
+        fn ov(token: &str) -> DepOverride {
+            let mut o = gem_override("rails", "7.0.0");
+            o.token = String::new();
+            o.patch_uuid = PATCH_UUID.into();
+            if let Some(r) = o.registry_override.as_mut() {
+                r.index_url =
+                    format!("https://patch.test/patch-registry/gem/{token}/{PATCH_UUID}/");
+            }
+            o
+        }
+        let gemfile = "source \"https://rubygems.org\"\n\ngem \"rails\", \"7.0.0\"\n".to_string();
+        let mut files = BTreeMap::new();
+        files.insert("gems.rb".to_string(), gemfile.clone());
+        files.insert("Gemfile".to_string(), gemfile);
+        let first = rewrite_registry_redirect(&files, &[ov("tok-one")]);
+        for (name, content) in first.files {
+            files.insert(name, content);
+        }
+        let second = rewrite_registry_redirect(&files, &[ov("tok-two")]);
+        assert!(
+            !second
+                .warnings
+                .iter()
+                .any(|w| w.code == "redirect_gem_gemfile_spellings_diverge"),
+            "run 1's own edit must not read as divergence: {:?}",
+            second.warnings
+        );
+        let out = second
+            .files
+            .get("gems.rb")
+            .expect("rotated grant refreshes gems.rb");
+        assert_eq!(
+            out.matches("source \"https://patch.test/patch-registry/gem/")
+                .count(),
+            1,
+            "exactly one Socket source block, never nested: {out}"
+        );
+        assert!(!out.contains("tok-one"), "old grant token gone: {out}");
+    }
+
     /// A `core.autocrlf` checkout rewrites a previously-redirected Gemfile to
     /// CRLF. The block recognizer must still see the Socket source block
     /// there: if it misses, the indented `gem` line inside the block matches
@@ -6943,6 +7661,113 @@ mod tests {
                 .any(|w| w.code == "redirect_gem_source_option"),
             "skip must warn: {:?}",
             r.warnings
+        );
+    }
+
+    /// When the blocking `path:` option is socket-patch's OWN vendored wiring
+    /// (`.socket/vendor/gem/<uuid>/…`), the refusal must prescribe the eject
+    /// paths instead of pointing the user at a Gemfile line the tool itself
+    /// wrote — and state their blast radius honestly: `remove <purl>` is the
+    /// per-gem undo, `vendor --revert` reverts EVERY vendored dependency.
+    #[test]
+    fn gemfile_source_option_refusal_prescribes_vendor_revert_for_own_wiring() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "Gemfile".to_string(),
+            "source \"https://rubygems.org\"\n\n\
+             gem \"rails\", \"7.0.0\", path: \".socket/vendor/gem/11111111-1111-4111-8111-111111111111/rails-7.0.0\"\n"
+                .to_string(),
+        );
+        let r = rewrite_registry_redirect(&files, &[gem_override("rails", "7.0.0")]);
+        assert!(r.files.is_empty() && r.edits.is_empty());
+        let warning = r
+            .warnings
+            .iter()
+            .find(|w| w.code == "redirect_gem_source_option")
+            .unwrap_or_else(|| panic!("skip must warn: {:?}", r.warnings));
+        assert!(
+            warning.detail.contains("socket-patch remove pkg:gem/rails@7.0.0")
+                && warning.detail.contains("socket-patch vendor --revert")
+                && warning.detail.contains("EVERY vendored dependency"),
+            "socket's own vendored wiring must prescribe the per-gem eject and \
+             state vendor --revert's whole-project blast radius: {}",
+            warning.detail
+        );
+        // A USER path: dep keeps the generic refusal — no bogus prescription.
+        files.insert(
+            "Gemfile".to_string(),
+            "source \"https://rubygems.org\"\n\n\
+             gem \"rails\", \"7.0.0\", path: \"../rails\"\n"
+                .to_string(),
+        );
+        let r = rewrite_registry_redirect(&files, &[gem_override("rails", "7.0.0")]);
+        let warning = r
+            .warnings
+            .iter()
+            .find(|w| w.code == "redirect_gem_source_option")
+            .unwrap_or_else(|| panic!("skip must warn: {:?}", r.warnings));
+        assert!(
+            !warning.detail.contains("vendor --revert"),
+            "a user path: dep is not socket wiring: {}",
+            warning.detail
+        );
+    }
+
+    /// `grant_token_path_segment` recovers the grant token from the hosted
+    /// URL shapes the reference endpoint hands back (the path level before
+    /// the patch uuid) and answers `None` — never a host or empty segment —
+    /// on anything else.
+    #[test]
+    fn grant_token_path_segment_shapes() {
+        let uuid = "7c8d9e0f-1a2b-4a1b-8c2d-3e4f5a6b7c8d";
+        assert_eq!(
+            grant_token_path_segment(
+                &format!("https://patch.socket.dev/patch-registry/gem/tok-a/{uuid}/"),
+                uuid
+            )
+            .as_deref(),
+            Some("tok-a"),
+            "index-url shape"
+        );
+        assert_eq!(
+            grant_token_path_segment(
+                &format!(
+                    "https://patch.socket.dev/patch/gem/rails/7.0.0/tok-b/{uuid}/rails-7.0.0.gem"
+                ),
+                uuid
+            )
+            .as_deref(),
+            Some("tok-b"),
+            "artifact-url shape"
+        );
+        assert_eq!(
+            grant_token_path_segment(
+                &format!("https://patch.socket.dev/patch-registry/gem/tok-c/{uuid}"),
+                uuid
+            )
+            .as_deref(),
+            Some("tok-c"),
+            "no trailing slash"
+        );
+        assert_eq!(
+            grant_token_path_segment(&format!("https://patch.socket.dev/{uuid}/"), uuid),
+            None,
+            "uuid in the first path level has no token before it"
+        );
+        assert_eq!(
+            grant_token_path_segment("https://patch.socket.dev/gem/tok/other/", uuid),
+            None,
+            "uuid absent"
+        );
+        assert_eq!(
+            grant_token_path_segment(&format!("https://{uuid}/x/"), uuid),
+            None,
+            "a uuid-shaped HOST is not a path level"
+        );
+        assert_eq!(
+            grant_token_path_segment("https://patch.socket.dev/gem/tok/x/", ""),
+            None,
+            "empty uuid never matches"
         );
     }
 
@@ -7074,9 +7899,13 @@ mod tests {
         );
     }
 
-    /// A landed gem redirect breaks bundler frozen/deployment installs (the
-    /// lock's GEM section still records the upstream source), so the rewrite
-    /// must say so — and only when it actually changed something.
+    /// A MIXED-state gem redirect breaks bundler frozen/deployment installs
+    /// (the lock's GEM section still records the upstream source), so the
+    /// rewrite must say so — and only when it actually changed something.
+    /// Only the pre-CHECKSUMS lock (bundler <2.6, or `lockfile_checksums
+    /// false`) stays mixed today; a CHECKSUMS-era lock converges instead and
+    /// must NOT carry the caveat (pinned in
+    /// `gem_checksums_lock_converges_gem_section_and_pins_dependency`).
     #[test]
     fn gem_redirect_warns_about_frozen_installs() {
         let mut files = BTreeMap::new();
@@ -7084,9 +7913,13 @@ mod tests {
             "Gemfile".to_string(),
             "source \"https://rubygems.org\"\n\ngem \"rails\", \"7.0.0\"\n".to_string(),
         );
+        // No CHECKSUMS section: nothing to converge around, GEM attribution
+        // stays upstream — the caveat is truthful here.
         files.insert(
             "Gemfile.lock".to_string(),
-            gem_lock(&format!("  rails (7.0.0) sha256={}", "2".repeat(64))),
+            "GEM\n  remote: https://rubygems.org/\n  specs:\n    rails (7.0.0)\n\n\
+             PLATFORMS\n  ruby\n\nDEPENDENCIES\n  rails (= 7.0.0)\n\nBUNDLED WITH\n   2.5.0\n"
+                .to_string(),
         );
         let ovr = gem_override("rails", "7.0.0");
         let first = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
@@ -7143,6 +7976,263 @@ mod tests {
                 "2".repeat(64)
             ))),
             "pre-edit CHECKSUMS line captured for revert"
+        );
+    }
+
+    /// CHECKSUMS-era locks (bundler >= 4 writes the section by default) must
+    /// come out FULLY CONVERGED, not mixed-state: the dep's spec entry moves
+    /// out of the upstream GEM section into a patch-registry GEM section
+    /// (`remote: <index-url>`), DEPENDENCIES pins `<name> (= <ver>)!`, and
+    /// CHECKSUMS carries the patched sha. The old mixed rewrite (CHECKSUMS
+    /// pinned, GEM section left upstream) made bundler refuse the prescribed
+    /// unfrozen install with exit 37 "mismatched checksums" — and the
+    /// converged pair needs no frozen-install caveat at all.
+    #[test]
+    fn gem_checksums_lock_converges_gem_section_and_pins_dependency() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "Gemfile".to_string(),
+            "source \"https://rubygems.org\"\n\ngem \"rails\", \"7.0.0\"\n".to_string(),
+        );
+        files.insert(
+            "Gemfile.lock".to_string(),
+            gem_lock(&format!("  rails (7.0.0) sha256={}", "2".repeat(64))),
+        );
+        let r = rewrite_registry_redirect(&files, &[gem_override("rails", "7.0.0")]);
+        let expected = format!(
+            "GEM\n  remote: https://rubygems.org/\n  specs:\n\n\
+             GEM\n  remote: https://patch.test/gem/tok/uuid/\n  specs:\n    rails (7.0.0)\n\n\
+             PLATFORMS\n  ruby\n\nDEPENDENCIES\n  rails (= 7.0.0)!\n\n\
+             CHECKSUMS\n  rails (7.0.0) sha256={}\n\nBUNDLED WITH\n   2.6.2\n",
+            "f".repeat(64)
+        );
+        assert_eq!(
+            r.files.get("Gemfile.lock"),
+            Some(&expected),
+            "the lock must converge: patch-registry GEM section + dependency pin + patched sha"
+        );
+        let source_edit = r
+            .edits
+            .iter()
+            .find(|e| e.kind == "redirect_gemfile_lock_gem_source")
+            .unwrap_or_else(|| panic!("GEM-section move edit recorded: {:?}", r.edits));
+        assert_eq!(source_edit.path, "Gemfile.lock");
+        assert_eq!(
+            source_edit.original,
+            Some(Value::String("https://rubygems.org/".into())),
+            "the upstream remote is the revert original"
+        );
+        assert_eq!(
+            source_edit.new,
+            Some(Value::String("https://patch.test/gem/tok/uuid/".into()))
+        );
+        let dep_edit = r
+            .edits
+            .iter()
+            .find(|e| e.kind == "redirect_gemfile_lock_dependency_pin")
+            .unwrap_or_else(|| panic!("DEPENDENCIES pin edit recorded: {:?}", r.edits));
+        assert_eq!(
+            dep_edit.original,
+            Some(Value::String("rails (= 7.0.0)".into()))
+        );
+        assert_eq!(dep_edit.new, Some(Value::String("rails (= 7.0.0)!".into())));
+        assert!(
+            !r.warnings
+                .iter()
+                .any(|w| w.code == "redirect_gem_frozen_install"),
+            "a converged pair is frozen-install-ready — the caveat would be a lie: {:?}",
+            r.warnings
+        );
+    }
+
+    /// Feeding the converged pair back must be a true no-op (the ledger would
+    /// otherwise grow forever) — and the converged lock shape must be
+    /// RECOGNIZED, not re-converged into a duplicate section.
+    #[test]
+    fn gem_checksums_converged_lock_rerun_is_noop() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "Gemfile".to_string(),
+            "source \"https://rubygems.org\"\n\ngem \"rails\", \"7.0.0\"\n".to_string(),
+        );
+        files.insert(
+            "Gemfile.lock".to_string(),
+            gem_lock(&format!("  rails (7.0.0) sha256={}", "2".repeat(64))),
+        );
+        let ovr = gem_override("rails", "7.0.0");
+        let first = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        let lock = first
+            .files
+            .get("Gemfile.lock")
+            .expect("run 1 rewrites the lock");
+        assert!(
+            lock.contains(
+                "GEM\n  remote: https://patch.test/gem/tok/uuid/\n  specs:\n    rails (7.0.0)"
+            ),
+            "run 1 must converge the lock: {lock}"
+        );
+        for (name, content) in first.files {
+            files.insert(name, content);
+        }
+        let second = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        assert!(
+            second.files.is_empty() && second.edits.is_empty(),
+            "converged re-run must be a no-op: files={:?} edits={:?}",
+            second.files.keys(),
+            second.edits
+        );
+    }
+
+    /// A rotated grant must refresh the CONVERGED lock's GEM remote in place
+    /// (token-wildcard recognition, exactly like the Gemfile source block) —
+    /// leaving the stale remote live would send every install to the dead
+    /// grant URL.
+    #[test]
+    fn gem_checksums_converged_lock_rotated_grant_refreshes_remote() {
+        fn ov(token: &str) -> DepOverride {
+            let mut o = gem_override("rails", "7.0.0");
+            o.token = token.into();
+            if let Some(r) = o.registry_override.as_mut() {
+                r.index_url = format!("https://patch.test/gem/{token}/uuid/");
+            }
+            o
+        }
+        let mut files = BTreeMap::new();
+        files.insert(
+            "Gemfile".to_string(),
+            "source \"https://rubygems.org\"\n\ngem \"rails\", \"7.0.0\"\n".to_string(),
+        );
+        files.insert(
+            "Gemfile.lock".to_string(),
+            gem_lock(&format!("  rails (7.0.0) sha256={}", "2".repeat(64))),
+        );
+        let first = rewrite_registry_redirect(&files, &[ov("tok-one")]);
+        for (name, content) in first.files {
+            files.insert(name, content);
+        }
+        let second = rewrite_registry_redirect(&files, &[ov("tok-two")]);
+        let lock = second
+            .files
+            .get("Gemfile.lock")
+            .expect("rotated grant refreshes the lock remote");
+        assert_eq!(
+            lock.matches("remote: https://patch.test/gem/").count(),
+            1,
+            "exactly one Socket GEM section: {lock}"
+        );
+        assert!(
+            lock.contains("  remote: https://patch.test/gem/tok-two/uuid/\n"),
+            "lock remote refreshed in place: {lock}"
+        );
+        assert!(!lock.contains("tok-one"), "stale grant gone: {lock}");
+        assert!(
+            second
+                .edits
+                .iter()
+                .any(|e| e.kind == "redirect_gemfile_lock_source_url"
+                    && e.original
+                        == Some(Value::String("https://patch.test/gem/tok-one/uuid/".into()))
+                    && e.new == Some(Value::String("https://patch.test/gem/tok-two/uuid/".into()))),
+            "remote refresh recorded with the old URL as original: {:?}",
+            second.edits
+        );
+    }
+
+    /// A TRANSITIVE redirected dep (undeclared in the Gemfile, appended as a
+    /// source block) becomes a direct source-pinned dependency, so the
+    /// converged lock must gain its `<name> (= <ver>)!` DEPENDENCIES entry —
+    /// inserted in bundler's sorted position — and the spec's dependency
+    /// sublines must travel with the spec into the patch-registry section.
+    #[test]
+    fn gem_checksums_lock_transitive_dep_converges_with_sorted_dependency() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "Gemfile".to_string(),
+            "source \"https://rubygems.org\"\n\ngem \"rack\", \"3.0.0\"\n".to_string(),
+        );
+        files.insert(
+            "Gemfile.lock".to_string(),
+            format!(
+                "GEM\n  remote: https://rubygems.org/\n  specs:\n    rack (3.0.0)\n    rails (7.0.0)\n      rack (>= 2)\n\n\
+                 PLATFORMS\n  ruby\n\nDEPENDENCIES\n  rack (= 3.0.0)\n\n\
+                 CHECKSUMS\n  rack (3.0.0) sha256={}\n  rails (7.0.0) sha256={}\n\nBUNDLED WITH\n   2.6.2\n",
+                "4".repeat(64),
+                "2".repeat(64)
+            ),
+        );
+        let r = rewrite_registry_redirect(&files, &[gem_override("rails", "7.0.0")]);
+        let expected = format!(
+            "GEM\n  remote: https://rubygems.org/\n  specs:\n    rack (3.0.0)\n\n\
+             GEM\n  remote: https://patch.test/gem/tok/uuid/\n  specs:\n    rails (7.0.0)\n      rack (>= 2)\n\n\
+             PLATFORMS\n  ruby\n\nDEPENDENCIES\n  rack (= 3.0.0)\n  rails (= 7.0.0)!\n\n\
+             CHECKSUMS\n  rack (3.0.0) sha256={}\n  rails (7.0.0) sha256={}\n\nBUNDLED WITH\n   2.6.2\n",
+            "4".repeat(64),
+            "f".repeat(64)
+        );
+        assert_eq!(
+            r.files.get("Gemfile.lock"),
+            Some(&expected),
+            "spec + sublines moved, dependency added sorted, sibling gem untouched"
+        );
+        let dep_edit = r
+            .edits
+            .iter()
+            .find(|e| e.kind == "redirect_gemfile_lock_dependency_pin")
+            .unwrap_or_else(|| panic!("DEPENDENCIES pin edit recorded: {:?}", r.edits));
+        assert_eq!(dep_edit.action, "added");
+        assert_eq!(dep_edit.original, None);
+    }
+
+    /// Convergence orders its edits on bundler's invariant that source
+    /// sections precede DEPENDENCIES (the pin insert runs first because its
+    /// lines sit after the spec-move indices). A hand-edited lock with
+    /// DEPENDENCIES before GEM breaks that premise — it must fail soft to the
+    /// mixed state (checksum pinned, GEM attribution untouched, frozen-install
+    /// caveat), never splice with stale indices and corrupt the lock.
+    #[test]
+    fn gem_checksums_lock_dependencies_before_gem_fails_soft_to_mixed() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "Gemfile".to_string(),
+            "source \"https://rubygems.org\"\n\ngem \"rails\", \"7.0.0\"\n".to_string(),
+        );
+        files.insert(
+            "Gemfile.lock".to_string(),
+            format!(
+                "DEPENDENCIES\n  rails (= 7.0.0)\n\n\
+                 GEM\n  remote: https://rubygems.org/\n  specs:\n    rails (7.0.0)\n\n\
+                 PLATFORMS\n  ruby\n\nCHECKSUMS\n  rails (7.0.0) sha256={}\n\n\
+                 BUNDLED WITH\n   2.6.2\n",
+                "2".repeat(64)
+            ),
+        );
+        let r = rewrite_registry_redirect(&files, &[gem_override("rails", "7.0.0")]);
+        let expected = format!(
+            "DEPENDENCIES\n  rails (= 7.0.0)\n\n\
+             GEM\n  remote: https://rubygems.org/\n  specs:\n    rails (7.0.0)\n\n\
+             PLATFORMS\n  ruby\n\nCHECKSUMS\n  rails (7.0.0) sha256={}\n\n\
+             BUNDLED WITH\n   2.6.2\n",
+            "f".repeat(64)
+        );
+        assert_eq!(
+            r.files.get("Gemfile.lock"),
+            Some(&expected),
+            "only the CHECKSUMS pin lands — the unconvergeable lock keeps its shape"
+        );
+        assert!(
+            !r.edits
+                .iter()
+                .any(|e| e.kind == "redirect_gemfile_lock_gem_source"
+                    || e.kind == "redirect_gemfile_lock_dependency_pin"),
+            "no convergence edits on the fail-soft path: {:?}",
+            r.edits
+        );
+        assert!(
+            r.warnings
+                .iter()
+                .any(|w| w.code == "redirect_gem_frozen_install"),
+            "the mixed pair keeps the frozen-install caveat: {:?}",
+            r.warnings
         );
     }
 
@@ -7516,12 +8606,18 @@ mod tests {
             "a CRLF CHECKSUMS section must be recognized: {:?}",
             r.warnings
         );
-        let expected =
-            gem_lock(&format!("  rails (7.0.0) sha256={}", "f".repeat(64))).replace('\n', "\r\n");
+        let expected = format!(
+            "GEM\n  remote: https://rubygems.org/\n  specs:\n\n\
+             GEM\n  remote: https://patch.test/gem/tok/uuid/\n  specs:\n    rails (7.0.0)\n\n\
+             PLATFORMS\n  ruby\n\nDEPENDENCIES\n  rails (= 7.0.0)!\n\n\
+             CHECKSUMS\n  rails (7.0.0) sha256={}\n\nBUNDLED WITH\n   2.6.2\n",
+            "f".repeat(64)
+        )
+        .replace('\n', "\r\n");
         assert_eq!(
             r.files.get("Gemfile.lock"),
             Some(&expected),
-            "pin rewritten in place with every \\r\\n preserved"
+            "pin + convergence rewritten in place with every \\r\\n preserved"
         );
         let edit = r
             .edits

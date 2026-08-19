@@ -645,6 +645,16 @@ pub async fn revert_yarn_berry(
         }
     }
 
+    // LOSSINESS GUARD (residual #131): when any wiring record was left
+    // alone ("drifted; left alone"), the uuid dir may hold the only copy of
+    // what the lock — or the redirect ledger's recorded originals — still
+    // points at. Keep it (and let the CLI keep the ledger entry) instead of
+    // deleting evidence out from under a lock we just refused to touch.
+    if outcome.drift_skipped() {
+        outcome.keep_artifact(&uuid_dir_rel);
+        return outcome;
+    }
+
     if let Err(e) = remove_tree(&project_root.join(&uuid_dir_rel)).await {
         return RevertOutcome::failed(format!("cannot remove {uuid_dir_rel}: {e}"));
     }
@@ -686,17 +696,38 @@ fn revert_resolution_record(
         return;
     };
     let Some(res_obj) = obj.get_mut("resolutions").and_then(Value::as_object_mut) else {
+        // ALREADY CONVERGED: for an Added entry (no recorded original) the
+        // reverted state IS "no resolutions entry" — an earlier partial
+        // revert already removed it (dropping the then-empty table). Not
+        // drift: stay silent so the drift-skip keep gate can converge.
+        if rec.original.is_none() {
+            return;
+        }
         warnings.push(VendorWarning::new(
             "vendor_lock_entry_drifted",
             format!("resolutions entry `{key}` no longer exists; nothing to remove"),
         ));
         return;
     };
-    let ours = res_obj
-        .get(key)
-        .and_then(Value::as_str)
-        .and_then(parse_vendor_path)
-        .is_some_and(|p| p.eco == "npm" && p.uuid == entry_uuid);
+    let live = res_obj.get(key).and_then(Value::as_str);
+    let Some(live) = live else {
+        // ALREADY CONVERGED (same as the missing-table case above): our
+        // Added entry is already gone.
+        if rec.original.is_none() {
+            return;
+        }
+        warnings.push(VendorWarning::new(
+            "vendor_lock_entry_drifted",
+            format!("resolutions entry `{key}` no longer exists; nothing to remove"),
+        ));
+        return;
+    };
+    // ALREADY CONVERGED: a takeover entry already restored to the user's
+    // recorded pin. Not drift.
+    if rec.original.as_ref().and_then(Value::as_str) == Some(live) {
+        return;
+    }
+    let ours = parse_vendor_path(live).is_some_and(|p| p.eco == "npm" && p.uuid == entry_uuid);
     if !ours {
         warnings.push(VendorWarning::new(
             "vendor_lock_entry_drifted",
@@ -1726,7 +1757,9 @@ __metadata:
             outcome.warnings
         );
         // The drifted lock entry stays; the (still-ours) resolutions entry
-        // was removed; the artifact is gone.
+        // was removed; the artifact is KEPT (residual #131: the drifted
+        // entry's recorded original may still be needed later) and the keep
+        // is surfaced.
         let after = tokio::fs::read_to_string(fx.lock_path()).await.unwrap();
         assert!(
             after.contains("left-pad@file:")
@@ -1736,7 +1769,50 @@ __metadata:
         let pkg: Value =
             serde_json::from_slice(&tokio::fs::read(fx.pkg_path()).await.unwrap()).unwrap();
         assert!(pkg.get("resolutions").is_none());
-        assert!(!fx.tgz_path().exists());
+        assert!(fx.tgz_path().exists(), "drift-skip must keep the artifact");
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_artifact_kept"),
+            "the keep must be surfaced: {:?}",
+            outcome.warnings
+        );
+
+        // KEEP-GATE LIVENESS: undo ONLY the lock drift (repoint the
+        // resolution line back at the vendored locator). The resolutions
+        // entry the first revert already removed must now read as CONVERGED
+        // (Added record + key absent), not drifted — otherwise every later
+        // revert would hit the "no longer exists; nothing to remove" branch
+        // and keep the artifacts + ledger entry forever.
+        let vendored_resolution = text
+            .lines()
+            .find(|l| l.starts_with("  resolution: \"left-pad@file:"))
+            .expect("the vendored lock must carry our resolution line")
+            .to_string();
+        let healed = after.replace("  resolution: \"left-pad@npm:1.3.0\"", &vendored_resolution);
+        assert_ne!(healed, after, "the undo edit must hit");
+        tokio::fs::write(fx.lock_path(), &healed).await.unwrap();
+
+        let outcome = revert_yarn_berry(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(
+            outcome.warnings.is_empty(),
+            "the already-removed resolutions entry is converged, not drifted: {:?}",
+            outcome.warnings
+        );
+        assert!(!outcome.kept_artifact);
+        assert_eq!(
+            tokio::fs::read(fx.lock_path()).await.unwrap(),
+            fx.lock_bytes,
+            "lock restored byte-for-byte"
+        );
+        assert!(
+            !fx.root()
+                .join(format!(".socket/vendor/npm/{UUID}"))
+                .exists(),
+            "artifact pruned once the revert converges"
+        );
 
         // Manifest drift: the user repointed the resolutions entry.
         let fx = fixture().await;
@@ -1774,6 +1850,8 @@ __metadata:
             tokio::fs::read(fx.lock_path()).await.unwrap(),
             fx.lock_bytes
         );
+        // The manifest drift-skip keeps the artifact too (residual #131).
+        assert!(fx.tgz_path().exists(), "drift-skip must keep the artifact");
     }
 
     #[tokio::test]

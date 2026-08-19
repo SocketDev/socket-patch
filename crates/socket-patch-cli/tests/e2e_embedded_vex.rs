@@ -481,6 +481,239 @@ fn apply_silent_vex_failure_keeps_error_output() {
     );
 }
 
+/// Failed-run hygiene: a `--vex` failure must remove a PRIOR run's OpenVEX
+/// document parked at the output path. Attestation semantics demand it — a
+/// pipeline reusing one path (`apply --vex out.json` on every CI run) must
+/// not ship yesterday's `not_affected` doc for a tree this run could no
+/// longer attest. Same `product_undetected` fixture as
+/// `apply_vex_failure_flips_exit_code`, plus a pre-seeded stale doc.
+#[test]
+fn apply_vex_failure_removes_stale_openvex_doc() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let cwd = tmp.path();
+    seed_offline_apply(cwd);
+    let vex_path = cwd.join("apply.vex.json");
+    std::fs::write(
+        &vex_path,
+        r#"{"@context":"https://openvex.dev/ns/v0.2.0","@id":"urn:uuid:stale","author":"Socket","timestamp":"2020-01-01T00:00:00Z","version":1,"statements":[]}"#,
+    )
+    .expect("seed stale OpenVEX doc");
+
+    let out = cli()
+        .args([
+            "apply",
+            "--cwd",
+            cwd.to_str().expect("tempdir path is UTF-8"),
+            "--offline",
+            "--json",
+            "--vex",
+            vex_path.to_str().expect("vex path is UTF-8"),
+        ])
+        .output()
+        .expect("invoke apply");
+    assert!(!out.status.success(), "VEX failure must flip the exit code");
+    let env: Value = serde_json::from_slice(&out.stdout).expect("apply envelope JSON");
+    assert_eq!(env["error"]["code"], "product_undetected");
+    assert!(
+        !vex_path.exists(),
+        "a failed run must remove the stale prior OpenVEX doc at --vex"
+    );
+}
+
+/// The stale-doc removal is guarded: only a file that is recognizably an
+/// OpenVEX document is deleted. A mistyped `--vex` pointing at an unrelated
+/// file must survive the failed run byte-identical — the cleanup exists to
+/// prevent stale attestations, not to destroy user data.
+#[test]
+fn apply_vex_failure_preserves_non_openvex_file() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let cwd = tmp.path();
+    seed_offline_apply(cwd);
+    let precious = cwd.join("precious.txt");
+    let original = b"not an openvex document {".to_vec();
+    std::fs::write(&precious, &original).expect("seed precious non-OpenVEX file");
+
+    let out = cli()
+        .args([
+            "apply",
+            "--cwd",
+            cwd.to_str().expect("tempdir path is UTF-8"),
+            "--offline",
+            "--json",
+            "--vex",
+            precious.to_str().expect("precious path is UTF-8"),
+        ])
+        .output()
+        .expect("invoke apply");
+    assert!(!out.status.success());
+    assert_eq!(
+        std::fs::read(&precious).expect("read precious file back"),
+        original,
+        "a non-OpenVEX file at the output path must survive a failed run"
+    );
+}
+
+/// An unwritable `--vex` path fails with `write_failed`, and the message
+/// must name the path and the operation — the bare io::Error ("No such file
+/// or directory (os error 2)") diagnosed nothing in a CI log.
+#[test]
+fn apply_vex_write_failure_names_path() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let cwd = tmp.path();
+    seed_offline_apply(cwd);
+    let bad_path = cwd.join("no-such-dir/apply.vex.json");
+
+    let out = cli()
+        .args([
+            "apply",
+            "--cwd",
+            cwd.to_str().expect("tempdir path is UTF-8"),
+            "--offline",
+            "--json",
+            "--vex",
+            bad_path.to_str().expect("vex path is UTF-8"),
+            "--vex-product",
+            "pkg:npm/my-app@1.0.0",
+        ])
+        .output()
+        .expect("invoke apply");
+    assert!(!out.status.success(), "write failure must flip the exit");
+    let env: Value = serde_json::from_slice(&out.stdout).expect("apply envelope JSON");
+    assert_eq!(env["error"]["code"], "write_failed", "{env}");
+    let msg = env["error"]["message"]
+        .as_str()
+        .expect("error.message is a string");
+    assert!(
+        msg.contains("failed to write VEX document") && msg.contains("no-such-dir"),
+        "the error must name the operation and the path; got {msg:?}"
+    );
+}
+
+/// A non-IRI `--vex-product` is honored verbatim (help text: "PURL /
+/// identifier") but must warn on stderr in human mode — the OpenVEX product
+/// @id is spec-typed as an IRI and strict consumers may reject a bare name.
+#[test]
+fn apply_vex_product_non_iri_warns_in_human_mode() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let cwd = tmp.path();
+    seed_offline_apply(cwd);
+    let vex_path = cwd.join("apply.vex.json");
+
+    let out = cli()
+        .args([
+            "apply",
+            "--cwd",
+            cwd.to_str().expect("tempdir path is UTF-8"),
+            "--offline",
+            "--vex",
+            vex_path.to_str().expect("vex path is UTF-8"),
+            "--vex-product",
+            "my app",
+        ])
+        .output()
+        .expect("invoke apply");
+    assert!(
+        out.status.success(),
+        "a non-IRI product is a warning, never a hard reject. stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("Warning:") && stderr.contains("IRI"),
+        "human mode must warn about the non-IRI product; got {stderr:?}"
+    );
+    // Honored verbatim in the written doc.
+    let doc: Value =
+        serde_json::from_str(&std::fs::read_to_string(&vex_path).expect("read written VEX doc"))
+            .expect("parse written VEX doc");
+    assert_eq!(doc["statements"][0]["products"][0]["@id"], "my app");
+}
+
+/// Under `--json` the run-level VEX advisories are silenced on stderr
+/// (`note_warning` skips the print), so the envelope's `vex.warnings` is
+/// the ONLY channel they reach a consumer on. Regression guard: the
+/// embedded hosts built their `vex` summary from `statements` alone, so a
+/// non-IRI product produced a warning that was invisible on exactly the
+/// machine channel — absent from the envelope AND absent from stderr.
+#[test]
+fn apply_json_vex_warnings_ride_in_envelope() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let cwd = tmp.path();
+    seed_offline_apply(cwd);
+    let vex_path = cwd.join("apply.vex.json");
+
+    let out = cli()
+        .args([
+            "apply",
+            "--cwd",
+            cwd.to_str().expect("tempdir path is UTF-8"),
+            "--offline",
+            "--json",
+            "--vex",
+            vex_path.to_str().expect("vex path is UTF-8"),
+            "--vex-product",
+            "my app",
+        ])
+        .output()
+        .expect("invoke apply");
+    assert!(
+        out.status.success(),
+        "a non-IRI product is a warning, never a hard reject. stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let env: Value = serde_json::from_slice(&out.stdout).expect("apply envelope JSON");
+    assert_eq!(env["vex"]["statements"], 1);
+    let warnings = env["vex"]["warnings"]
+        .as_array()
+        .expect("vex.warnings must be present for a non-IRI product");
+    assert!(
+        warnings.iter().any(|w| w["code"] == "product_not_iri"
+            && w["detail"]
+                .as_str()
+                .map(|d| d.contains("IRI"))
+                .unwrap_or(false)),
+        "vex.warnings must carry product_not_iri with a human detail, got {warnings:?}"
+    );
+    // --json silences the stderr copy — the envelope is the sole channel,
+    // so machine consumers must not need to also scrape stderr.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("Warning:"),
+        "--json must not duplicate the warning on stderr; got {stderr:?}"
+    );
+
+    // Control: a clean PURL product raises no advisory, and skip-if-empty
+    // pins the `warnings` key ABSENT (not `[]`) so pre-existing consumers
+    // see a byte-identical three-key vex object. Re-running on the patched
+    // tree is still a successful apply ("already patched"), so VEX runs.
+    let clean = cli()
+        .args([
+            "apply",
+            "--cwd",
+            cwd.to_str().expect("tempdir path is UTF-8"),
+            "--offline",
+            "--json",
+            "--vex",
+            vex_path.to_str().expect("vex path is UTF-8"),
+            "--vex-product",
+            "pkg:npm/my-app@1.0.0",
+        ])
+        .output()
+        .expect("invoke apply (clean product)");
+    assert!(clean.status.success());
+    let env: Value = serde_json::from_slice(&clean.stdout).expect("apply envelope JSON");
+    assert_eq!(env["vex"]["statements"], 1);
+    assert!(
+        !env["vex"]
+            .as_object()
+            .expect("vex summary object")
+            .contains_key("warnings"),
+        "a warning-free run must omit vex.warnings entirely, got {:?}",
+        env["vex"]
+    );
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // scan --vex (read-only; zero installed packages → no network)
 // ──────────────────────────────────────────────────────────────────────
@@ -534,6 +767,17 @@ fn scan_json_vex_no_verify_emits_summary() {
     assert_eq!(result["vex"]["statements"], 1);
     assert_eq!(result["vex"]["format"], "openvex-0.2.0");
     assert_eq!(result["vex"]["path"], vex_path.to_str().unwrap());
+    // A clean PURL product raises no advisory — skip-if-empty must keep the
+    // additive `warnings` key absent so pre-existing consumers see the
+    // unchanged three-key vex object.
+    assert!(
+        !result["vex"]
+            .as_object()
+            .expect("vex summary object")
+            .contains_key("warnings"),
+        "a warning-free scan run must omit vex.warnings, got {:?}",
+        result["vex"]
+    );
 
     let doc: Value = serde_json::from_str(&std::fs::read_to_string(&vex_path).unwrap()).unwrap();
     assert_eq!(doc["@context"], "https://openvex.dev/ns/v0.2.0");
@@ -562,6 +806,11 @@ fn scan_json_vex_no_verify_emits_summary() {
         "pkg:npm/my-app@1.0.0",
         "pkg:npm/vuln-pkg@1.0.0",
     );
+
+    // The scan host's warning-population arm (its raw-json! vex object)
+    // ships with the scan/vendor host changes and is pinned there
+    // (in_process_vendor.rs: vendor_json_vex_warnings_ride_in_envelope);
+    // this suite pins the apply host + the skip-if-empty control above.
 }
 
 #[test]

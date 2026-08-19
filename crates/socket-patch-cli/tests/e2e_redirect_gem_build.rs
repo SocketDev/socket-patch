@@ -47,16 +47,19 @@
 //! exact live-CI signature — so any server or fixture that stops declaring
 //! runtime deps turns this suite red.
 //!
-//! KNOWN LIMITATION, pinned as a canary: on a lock that carries a CHECKSUMS
-//! section (bundler >= 4 writes one by default), today's rewrite (Gemfile
-//! block + CHECKSUMS pin, GEM section left on the upstream remote) makes the
-//! prescribed unfrozen install fail with "Bundler found mismatched checksums"
-//! — bundler still attributes the gem to the upstream source and refuses the
-//! lockfile-vs-API disagreement (exit 37, verified on bundler 4.0.15). The
-//! canary test pins that reality; the verified fix shape is the fully
-//! converged lock (patched-registry GEM section + `<name> (= <ver>)!`
-//! DEPENDENCIES pin + patched CHECKSUMS sha — a frozen install of that shape
-//! passes), which must land in the TS twin + golden fixtures together.
+//! CHECKSUMS locks (bundler >= 4 writes the section by default) come out
+//! FULLY CONVERGED: patch-registry GEM section holding the dep's spec,
+//! `<name> (= <ver>)!` DEPENDENCIES pin, patched CHECKSUMS sha. The flipped
+//! canary proves the converged pair installs patched bytes on a fresh
+//! checkout both FROZEN (`BUNDLE_FROZEN=true`, lock byte-identical — no
+//! unfrozen two-step) and unfrozen (the historical exit 37 "mismatched
+//! checksums" mixed-state refusal is gone; it was pinned here as a known
+//! limitation until the converged rewrite landed). The depscan TS twin
+//! (registry-rewrite gem.ts) must be ported to match.
+//!
+//! The grant-rotation capstone drives token A -> A -> B re-scans through the
+//! real binary: byte-idempotent under the same grant, in-place URL refresh
+//! (Gemfile source block + converged-lock remote) under a rotated one.
 //!
 //! Skips (with a println) when `ruby`/`gem`/`bundle` are missing or the host
 //! bundler predates 2.6 (the CHECKSUMS-aware floor); everything after that is
@@ -168,6 +171,13 @@ fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
 /// cold (the fresh-checkout install must be forced through the wiremock
 /// registry, never satisfied from the scan project's cache).
 fn bundle(cwd: &Path, args: &[&str]) -> Output {
+    bundle_env(cwd, args, &[])
+}
+
+/// `bundle` with extra environment on top of the isolated surface — e.g.
+/// `BUNDLE_FROZEN=true` for bundler's frozen/deployment contract (exit 16 on
+/// any Gemfile-vs-lock drift, lock never written).
+fn bundle_env(cwd: &Path, args: &[&str], envs: &[(&str, &str)]) -> Output {
     let mut cmd = Command::new("bundle");
     cmd.args(args).current_dir(cwd);
     for (k, _) in std::env::vars_os() {
@@ -179,6 +189,9 @@ fn bundle(cwd: &Path, args: &[&str]) -> Output {
     cache_env::isolate(&mut cmd);
     cmd.env("BUNDLE_APP_CONFIG", cwd.join(".bundle"));
     cmd.env("BUNDLE_USER_HOME", cwd.join(".bundle-user-home"));
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
     cmd.output().expect("failed to run bundle")
 }
 
@@ -348,6 +361,77 @@ impl Spelling {
     }
 }
 
+/// The Socket patches API reference endpoint for one grant token: granted,
+/// carrying the rubygems-compact-index registry override (the identifier
+/// shape the TS reference builder emits — name / version /
+/// gemChecksumSha256). `limit` caps how many requests this grant answers
+/// (wiremock falls through to later-mounted mocks after that), which is how
+/// the rotation tests hand out token A first and the rotated token B after.
+async fn mount_reference_mock(
+    server: &MockServer,
+    token: &str,
+    patched_sha: &str,
+    limit: Option<u64>,
+) {
+    let hosted_url = format!(
+        "{}/patch/gem/{DEP}/{DEP_VERSION}/{token}/{UUID}/{DEP}-{DEP_VERSION}.gem",
+        server.uri()
+    );
+    let index_url = format!("{}/patch-registry/gem/{token}/{UUID}/", server.uri());
+    let mock = Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/package")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "results": {
+                UUID: {
+                    "status": "granted",
+                    "url": hosted_url,
+                    "purl": PURL,
+                    "artifacts": [{
+                        "kind": "tarball",
+                        "url": hosted_url,
+                        "integrity": { "sha256": patched_sha }
+                    }],
+                    "registryOverride": {
+                        "kind": "rubygems-compact-index",
+                        "indexUrl": index_url,
+                        "identifiers": {
+                            "name": DEP,
+                            "version": DEP_VERSION,
+                            "gemChecksumSha256": patched_sha,
+                        }
+                    }
+                }
+            }
+        })));
+    match limit {
+        Some(n) => mock.up_to_n_times(n).mount(server).await,
+        None => mock.mount(server).await,
+    }
+}
+
+/// A bare `scan --mode hosted --json` re-scan (no VEX legs) — what a periodic
+/// or CI re-run looks like.
+fn run_hosted_scan(proj: &Path, api: &str) -> (i32, String, String) {
+    run_socket(
+        proj,
+        &[
+            "scan",
+            "--mode",
+            "hosted",
+            "--json",
+            "--yes",
+            "--cwd",
+            proj.to_str().expect("utf8 tmp path"),
+            "--api-url",
+            api,
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+        ],
+    )
+}
+
 /// Build the hermetic fixture and run `scan --mode hosted` through the real
 /// binary: author + `gem build` the three gems, mount both compact indexes
 /// and the patches API, `bundle install` from the mock upstream, scan, and
@@ -355,12 +439,17 @@ impl Spelling {
 /// fixture lock into a CHECKSUMS section (`bundle lock --add-checksums`);
 /// `registry_declares_deps` toggles the patch registry's `/info` between the
 /// CORRECT contract (runtime deps declared) and today's production-like
-/// deps-less answer. `None` = skip (message already printed).
+/// deps-less answer. `rotated_token` = Some(token B) arms a grant-rotation
+/// plan: the `TOKEN` grant answers the first two reference calls, token B
+/// (same uuid) every later one, and the patch registry serves both token
+/// paths (production keeps a grant alive until it expires). `None` = skip
+/// (message already printed).
 async fn redirect_scanned_project(
     tag: &str,
     spelling: Spelling,
     checksums_lock: bool,
     registry_declares_deps: bool,
+    rotated_token: Option<&str>,
 ) -> Option<RedirectFixture> {
     for cmd in ["ruby", "gem", "bundle"] {
         if !has_command(cmd) {
@@ -444,17 +533,13 @@ async fn redirect_scanned_project(
             } else {
                 vec![]
             },
-            gem: patched_gem,
+            gem: patched_gem.clone(),
         }],
     )
     .await;
 
     let orig = orig_lib().into_bytes();
     let patched = patched_lib().into_bytes();
-    let hosted_url = format!(
-        "{}/patch/gem/{DEP}/{DEP_VERSION}/{TOKEN}/{UUID}/{DEP}-{DEP_VERSION}.gem",
-        server.uri()
-    );
     // Batch discovery: the crawled gem has one free patch.
     Mock::given(method("POST"))
         .and(path(format!("/v0/orgs/{ORG}/patches/batch")))
@@ -489,34 +574,29 @@ async fn redirect_scanned_project(
         .await;
     // Reference endpoint: granted, carrying the rubygems-compact-index
     // registry override (the identifier shape the TS reference builder
-    // emits — name / version / gemChecksumSha256).
-    Mock::given(method("POST"))
-        .and(path(format!("/v0/orgs/{ORG}/patches/package")))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "results": {
-                UUID: {
-                    "status": "granted",
-                    "url": hosted_url,
-                    "purl": PURL,
-                    "artifacts": [{
-                        "kind": "tarball",
-                        "url": hosted_url,
-                        "integrity": { "sha256": patched_sha }
-                    }],
-                    "registryOverride": {
-                        "kind": "rubygems-compact-index",
-                        "indexUrl": index_url,
-                        "identifiers": {
-                            "name": DEP,
-                            "version": DEP_VERSION,
-                            "gemChecksumSha256": patched_sha,
-                        }
-                    }
-                }
-            }
-        })))
-        .mount(&server)
+    // emits — name / version / gemChecksumSha256). With a rotation plan the
+    // first grant answers exactly twice (scan 1 + the same-grant re-scan),
+    // then the rotated grant takes over — production rotates the token path
+    // segment per request.
+    mount_reference_mock(&server, TOKEN, &patched_sha, rotated_token.map(|_| 2)).await;
+    if let Some(token_b) = rotated_token {
+        mount_compact_index(
+            &server,
+            &format!("/patch-registry/gem/{token_b}/{UUID}"),
+            &[IndexGem {
+                name: DEP,
+                version: DEP_VERSION,
+                deps: if registry_declares_deps {
+                    vec![format!("{TRANSITIVE}:>= 0")]
+                } else {
+                    vec![]
+                },
+                gem: patched_gem.clone(),
+            }],
+        )
         .await;
+        mount_reference_mock(&server, token_b, &patched_sha, None).await;
+    }
     // View endpoint: the patch record (REAL before/after hashes of the
     // authored vs patched lib) the redirect run persists for VEX.
     Mock::given(method("GET"))
@@ -668,16 +748,23 @@ async fn redirect_scanned_project(
         .iter()
         .filter_map(|w| w["code"].as_str())
         .collect();
-    assert!(
-        warning_codes.contains(&"redirect_gem_frozen_install"),
-        "the frozen-install caveat must be surfaced: {env}"
-    );
     if checksums_lock {
+        // CHECKSUMS-era locks converge (patch-registry GEM section +
+        // dependency pin + patched sha), so the pair is frozen-installable
+        // as written — the caveat would be a lie.
+        assert!(
+            !warning_codes.contains(&"redirect_gem_frozen_install"),
+            "a converged CHECKSUMS pair must not carry the frozen-install caveat: {env}"
+        );
         assert!(
             rewritten.contains(&lock_name),
             "the CHECKSUMS pin must land in {lock_name}: {env}"
         );
     } else {
+        assert!(
+            warning_codes.contains(&"redirect_gem_frozen_install"),
+            "the frozen-install caveat must be surfaced on a mixed (no-CHECKSUMS) pair: {env}"
+        );
         assert!(
             warning_codes.contains(&"redirect_gem_no_checksums_section"),
             "a no-CHECKSUMS lock cannot be pinned and must say so: {env}"
@@ -729,12 +816,10 @@ async fn redirect_scanned_project(
     })
 }
 
-/// New dir holding ONLY what a git checkout would carry — the manifest pair,
-/// `.socket/`, `.bundle/` — then the UNFROZEN `bundle install` the rewriter's
-/// `redirect_gem_frozen_install` warning prescribes, with a cold per-dir
-/// bundler home. Returns the fresh dir and the install output.
-fn fresh_checkout_bundle_install(fx: &RedirectFixture) -> (PathBuf, Output) {
-    let fresh = fx.tmp.path().join("fresh");
+/// New dir named `name` holding ONLY what a git checkout would carry — the
+/// manifest pair, `.socket/`, `.bundle/` — with a cold per-dir bundler home.
+fn stage_fresh_checkout(fx: &RedirectFixture, name: &str) -> PathBuf {
+    let fresh = fx.tmp.path().join(name);
     std::fs::create_dir_all(&fresh).unwrap();
     std::fs::copy(fx.proj.join(fx.gemfile_name), fresh.join(fx.gemfile_name)).unwrap();
     std::fs::copy(fx.proj.join(fx.lock_name), fresh.join(fx.lock_name)).unwrap();
@@ -744,6 +829,13 @@ fn fresh_checkout_bundle_install(fx: &RedirectFixture) -> (PathBuf, Output) {
         !fresh.join("vendor").exists(),
         "fresh checkout must not carry an installed tree (test bug)"
     );
+    fresh
+}
+
+/// Fresh checkout + the UNFROZEN `bundle install` the redirect prescribes on
+/// a not-yet-converged lock. Returns the fresh dir and the install output.
+fn fresh_checkout_bundle_install(fx: &RedirectFixture) -> (PathBuf, Output) {
+    let fresh = stage_fresh_checkout(fx, "fresh");
     let install = bundle(&fresh, &["install"]);
     (fresh, install)
 }
@@ -829,7 +921,8 @@ fn assert_patched_install(fx: &RedirectFixture, fresh: &Path) {
 #[ignore = "host capstone: shells out to a real ruby/gem/bundler >= 2.6; the unpinned `test` \
             job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
 async fn gem_hosted_fresh_checkout_bundle_install_installs_patched_bytes_and_vex_verifies() {
-    let Some(fx) = redirect_scanned_project("main", Spelling::Gemfile, false, true).await else {
+    let Some(fx) = redirect_scanned_project("main", Spelling::Gemfile, false, true, None).await
+    else {
         return;
     };
 
@@ -901,7 +994,8 @@ async fn gem_hosted_fresh_checkout_bundle_install_installs_patched_bytes_and_vex
 #[ignore = "host capstone: shells out to a real ruby/gem/bundler >= 2.6; the unpinned `test` \
             job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
 async fn gem_hosted_gems_rb_spelling_redirects_and_installs() {
-    let Some(fx) = redirect_scanned_project("gems.rb", Spelling::GemsRb, false, true).await else {
+    let Some(fx) = redirect_scanned_project("gems.rb", Spelling::GemsRb, false, true, None).await
+    else {
         return;
     };
     assert!(
@@ -934,7 +1028,8 @@ async fn gem_hosted_gems_rb_spelling_redirects_and_installs() {
 #[ignore = "host capstone: shells out to a real ruby/gem/bundler >= 2.6; the unpinned `test` \
             job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
 async fn gem_hosted_registry_info_without_deps_breaks_install_like_production() {
-    let Some(fx) = redirect_scanned_project("nodeps", Spelling::Gemfile, false, false).await else {
+    let Some(fx) = redirect_scanned_project("nodeps", Spelling::Gemfile, false, false, None).await
+    else {
         return;
     };
 
@@ -965,22 +1060,22 @@ async fn gem_hosted_registry_info_without_deps_breaks_install_like_production() 
     );
 }
 
-/// KNOWN-LIMITATION CANARY — CHECKSUMS locks (bundler >= 4 default): the
-/// current rewrite (source block + CHECKSUMS pin, GEM section left on the
-/// upstream remote) makes the prescribed unfrozen install FAIL: bundler
-/// still attributes the gem to the upstream source and refuses the
-/// lockfile-vs-upstream-API checksum disagreement ("Bundler found mismatched
-/// checksums", exit 37 — verified on bundler 4.0.15). This test pins the
-/// rewrite half (the pin lands, its ledger edit records the upstream sha for
-/// revert) AND the current install failure. When the rewriter learns the
-/// verified fix — the fully converged lock: patched-registry GEM section,
-/// `<name> (= <ver>)!` DEPENDENCIES pin, patched CHECKSUMS sha, which a
-/// FROZEN install accepts — this canary must flip to asserting success.
+/// FLIPPED CANARY — CHECKSUMS locks (bundler >= 4 default) must come out
+/// FULLY CONVERGED: patch-registry GEM section holding the dep's spec,
+/// `<name> (= <ver>)!` DEPENDENCIES pin, patched CHECKSUMS sha (upstream sha
+/// recorded in the ledger for revert). The old mixed-state rewrite (pin only,
+/// GEM section left upstream) made the prescribed unfrozen install fail with
+/// "Bundler found mismatched checksums" (exit 37 — the bundler-4 DEFAULT
+/// lock, i.e. the mainstream hosted-gem path) and forced a frozen-install
+/// two-step (exit 16) on deployment setups. The converged pair must now
+/// install patched bytes BOTH ways on a fresh checkout: under
+/// `BUNDLE_FROZEN=true` with the lock byte-untouched (no two-step), and
+/// unfrozen (no exit 37).
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "host capstone: shells out to a real ruby/gem/bundler >= 2.6; the unpinned `test` \
             job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
-async fn gem_hosted_checksums_lock_pins_patched_sha_but_bundler_refuses_mixed_state() {
-    let Some(fx) = redirect_scanned_project("checksums", Spelling::Gemfile, true, true).await
+async fn gem_hosted_checksums_lock_converges_and_installs_frozen_and_unfrozen() {
+    let Some(fx) = redirect_scanned_project("checksums", Spelling::Gemfile, true, true, None).await
     else {
         return;
     };
@@ -991,9 +1086,8 @@ async fn gem_hosted_checksums_lock_pins_patched_sha_but_bundler_refuses_mixed_st
         &std::fs::read_to_string(fx.proj.join(".socket/vendor/redirect-state.json")).unwrap(),
     )
     .unwrap();
-    let edit = ledger["edits"]
-        .as_array()
-        .expect("ledger edits")
+    let edits = ledger["edits"].as_array().expect("ledger edits");
+    let edit = edits
         .iter()
         .find(|e| e["kind"] == "redirect_gemfile_lock_checksum")
         .expect("CHECKSUMS pin edit recorded in the ledger");
@@ -1003,30 +1097,170 @@ async fn gem_hosted_checksums_lock_pins_patched_sha_but_bundler_refuses_mixed_st
         original.starts_with(&format!("{DEP} ({DEP_VERSION}) sha256=")),
         "original must be the pre-edit registry line: {original}"
     );
+    let lock = std::fs::read_to_string(fx.proj.join("Gemfile.lock")).unwrap();
     assert!(
-        !std::fs::read_to_string(fx.proj.join("Gemfile.lock"))
-            .unwrap()
-            .contains(original),
+        !lock.contains(original),
         "the upstream sha line must actually have been replaced (else the pin is vacuous)"
     );
 
-    // The install half — today's reality on a CHECKSUMS lock.
-    let (_fresh, install) = fresh_checkout_bundle_install(&fx);
+    // The converged half: GEM section attribution + bundler's own `!` pin,
+    // with the move and the pin recorded in the ledger.
     assert!(
-        !install.status.success(),
-        "KNOWN LIMITATION pinned: if this fresh install now SUCCEEDS, the mixed-state lock \
-         handling was fixed — flip this canary to assert success + patched bytes (see the \
-         test doc for the verified converged-lock shape).\nstdout:\n{}\nstderr:\n{}",
+        lock.contains(&format!(
+            "GEM\n  remote: {}\n  specs:\n    {DEP} ({DEP_VERSION})",
+            fx.index_url
+        )),
+        "the lock must attribute the dep to the patch-registry GEM section:\n{lock}"
+    );
+    assert!(
+        lock.contains(&format!("  {DEP} (= {DEP_VERSION})!")),
+        "DEPENDENCIES must carry the source-pinned entry:\n{lock}"
+    );
+    assert!(
+        edits
+            .iter()
+            .any(|e| e["kind"] == "redirect_gemfile_lock_gem_source"),
+        "the GEM-section move must be a ledger edit: {edits:?}"
+    );
+
+    // FROZEN fresh checkout: the converged pair needs no unfrozen two-step —
+    // bundler's deployment contract accepts it as-is and the lock stays
+    // byte-identical.
+    let frozen = stage_fresh_checkout(&fx, "fresh-frozen");
+    let lock_before = std::fs::read(frozen.join(fx.lock_name)).unwrap();
+    let install = bundle_env(&frozen, &["install"], &[("BUNDLE_FROZEN", "true")]);
+    assert!(
+        install.status.success(),
+        "FROZEN fresh-checkout install of the converged pair must succeed (the exit-16 \
+         two-step is gone).\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&install.stdout),
         String::from_utf8_lossy(&install.stderr),
     );
-    let chatter = format!(
-        "{}\n{}",
+    assert_eq!(
+        std::fs::read(frozen.join(fx.lock_name)).unwrap(),
+        lock_before,
+        "a frozen install must leave the lock byte-identical"
+    );
+    assert_patched_install(&fx, &frozen);
+
+    // UNFROZEN fresh checkout: the previously-pinned exit 37 "mismatched
+    // checksums" refusal is gone too.
+    let (fresh, install) = fresh_checkout_bundle_install(&fx);
+    assert!(
+        install.status.success(),
+        "unfrozen fresh-checkout install of the converged pair must succeed (the pinned \
+         exit-37 mixed-state refusal is fixed).\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&install.stdout),
-        String::from_utf8_lossy(&install.stderr)
+        String::from_utf8_lossy(&install.stderr),
+    );
+    assert_patched_install(&fx, &fresh);
+}
+
+/// GRANT ROTATION, end to end (token A -> A -> B, same patch uuid): the
+/// production reference endpoint rotates the grant-token path segment of the
+/// index URL per request, so a periodic/CI re-scan sees a NEW index URL for
+/// the SAME redirect. The re-scan must (1) be byte-idempotent under the same
+/// grant, (2) refresh the source block's URL IN PLACE under a rotated grant —
+/// exactly one Socket source block, a `redirect_gemfile_source_url` ledger
+/// edit, no stale token anywhere — and (3) leave a pair a fresh checkout
+/// installs the patched bytes from. Before the fix, the rotated re-scan
+/// wrapped the old block's indented gem line in a new NESTED source block
+/// (+1 nesting per re-scan), kept the stale token URL live, and still
+/// reported success.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "host capstone: shells out to a real ruby/gem/bundler >= 2.6; the unpinned `test` \
+            job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
+async fn gem_hosted_rotated_grant_rescan_refreshes_source_block_and_installs() {
+    const TOKEN_B: &str = "55555555-5555-4555-8555-555555555555";
+    let Some(fx) =
+        redirect_scanned_project("rotation", Spelling::Gemfile, false, true, Some(TOKEN_B)).await
+    else {
+        return;
+    };
+    let api = fx._server.uri();
+    let index_url_b = format!("{api}/patch-registry/gem/{TOKEN_B}/{UUID}/");
+    let gemfile_after_run1 = std::fs::read_to_string(fx.proj.join("Gemfile"))
+        .expect("read Gemfile after initial hosted scan");
+    let ledger_edits = |proj: &Path| -> Vec<serde_json::Value> {
+        serde_json::from_str::<serde_json::Value>(
+            &std::fs::read_to_string(proj.join(".socket/vendor/redirect-state.json"))
+                .expect("read redirect ledger"),
+        )
+        .expect("ledger is JSON")["edits"]
+            .as_array()
+            .expect("ledger edits array")
+            .clone()
+    };
+    let edits_after_run1 = ledger_edits(&fx.proj).len();
+
+    // Re-scan 2, SAME grant: byte-idempotent, no ledger growth.
+    let (code, stdout, stderr) = run_hosted_scan(&fx.proj, &api);
+    assert_eq!(
+        code, 0,
+        "same-grant re-scan failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let env: serde_json::Value = serde_json::from_str(&stdout).expect("re-scan envelope JSON");
+    assert_eq!(env["redirect"]["redirected"], 1, "envelope: {env}");
+    assert_eq!(
+        std::fs::read_to_string(fx.proj.join("Gemfile"))
+            .expect("read Gemfile after same-grant re-scan"),
+        gemfile_after_run1,
+        "same-grant re-scan must leave the Gemfile byte-identical"
+    );
+    assert_eq!(
+        ledger_edits(&fx.proj).len(),
+        edits_after_run1,
+        "same-grant re-scan must not grow the ledger"
+    );
+
+    // Re-scan 3, ROTATED grant (token B, same uuid): refresh in place.
+    let (code, stdout, stderr) = run_hosted_scan(&fx.proj, &api);
+    assert_eq!(
+        code, 0,
+        "rotated-grant re-scan failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let env: serde_json::Value = serde_json::from_str(&stdout).expect("rotation envelope JSON");
+    assert_eq!(env["redirect"]["redirected"], 1, "envelope: {env}");
+    let gemfile = std::fs::read_to_string(fx.proj.join("Gemfile"))
+        .expect("read Gemfile after rotated-grant re-scan");
+    assert_eq!(
+        gemfile.matches("/patch-registry/gem/").count(),
+        1,
+        "exactly one Socket source block, never nested:\n{gemfile}"
     );
     assert!(
-        chatter.to_lowercase().contains("mismatched checksums"),
-        "the refusal must be bundler's checksum-conflict check, not something incidental:\n{chatter}"
+        gemfile.contains(&format!(
+            "source \"{index_url_b}\" do\n  gem \"{DEP}\", \"{DEP_VERSION}\"\nend"
+        )),
+        "the block's URL must be refreshed to the rotated grant in place:\n{gemfile}"
     );
+    assert!(
+        !gemfile.contains(TOKEN),
+        "the stale grant token must be gone from the Gemfile:\n{gemfile}"
+    );
+    let refresh = ledger_edits(&fx.proj)
+        .into_iter()
+        .find(|e| e["kind"] == "redirect_gemfile_source_url")
+        .expect("rotation must be recorded as a redirect_gemfile_source_url ledger edit");
+    assert_eq!(
+        refresh["original"],
+        serde_json::Value::String(fx.index_url.clone()),
+        "refresh edit original: {refresh}"
+    );
+    assert_eq!(
+        refresh["new"],
+        serde_json::Value::String(index_url_b),
+        "refresh edit new: {refresh}"
+    );
+
+    // Fresh checkout of the rotated pair: the prescribed unfrozen install
+    // resolves the patched gem from the rotated registry path.
+    let (fresh, install) = fresh_checkout_bundle_install(&fx);
+    assert!(
+        install.status.success(),
+        "fresh-checkout `bundle install` after rotation must succeed.\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&install.stdout),
+        String::from_utf8_lossy(&install.stderr),
+    );
+    assert_patched_install(&fx, &fresh);
 }

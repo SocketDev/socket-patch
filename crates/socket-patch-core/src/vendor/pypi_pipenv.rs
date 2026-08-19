@@ -409,6 +409,7 @@ pub(super) async fn revert_pipenv(
         let new_text = to_canonical_json(&lock);
         if let Err(e) = atomic_write_bytes_preserving_mode(&lock_path, new_text.as_bytes()).await {
             return RevertOutcome {
+                kept_artifact: false,
                 success: false,
                 warnings,
                 error: Some(format!("cannot write {LOCK_FILE}: {e}")),
@@ -416,6 +417,7 @@ pub(super) async fn revert_pipenv(
         }
     }
     RevertOutcome {
+        kept_artifact: false,
         success: true,
         warnings,
         error: None,

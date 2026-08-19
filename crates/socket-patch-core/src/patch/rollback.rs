@@ -266,6 +266,15 @@ pub async fn verify_file_rollback(
     }
 }
 
+/// The first-blocking-file error line recorded on [`RollbackResult::error`]
+/// when a file cannot be rolled back. One constructor so the CLI's
+/// pre-flight missing-blob abort (which synthesizes per-package results
+/// before this engine runs) emits byte-identical errors — the string
+/// reaches users through both stderr and the `--json` envelope.
+pub fn cannot_rollback_error(file: &str, why: &str) -> String {
+    format!("Cannot rollback: {file} - {why}")
+}
+
 /// Verify and rollback patches for a single package.
 ///
 /// For each file in `files`, this function:
@@ -301,7 +310,7 @@ pub async fn rollback_package_patch(
                 .message
                 .clone()
                 .unwrap_or_else(|| format!("{:?}", verify_result.status));
-            result.error = Some(format!("Cannot rollback: {} - {}", verify_result.file, msg));
+            result.error = Some(cannot_rollback_error(&verify_result.file, &msg));
             result.files_verified.push(verify_result);
             return result;
         }
