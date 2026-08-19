@@ -87,8 +87,8 @@ into the new version's section — see docs/releasing.md.
   (or `SOCKET_PATCH_VERSION`) pins a version, up or down; bare `--update`
   never downgrades; `--force` reinstalls. `--dry-run` is a check-only
   probe (zero downloads, `updateAvailable` in the `--json` details).
-  Package-manager-managed installs (npm, pip, cargo, the gem/composer
-  launcher cache, Homebrew) are detected from the canonicalized executable
+  Package-manager-managed installs (npm, pip, cargo, the gem launcher
+  cache, Homebrew) are detected from the canonicalized executable
   path and refused with that manager's own upgrade command; `--force`
   overrides. `--offline` refuses up front and `--force` cannot bypass it.
   Concurrent updates are single-flighted via an advisory lock; every
