@@ -3,8 +3,8 @@
 //! notifier never nags about a version the user just installed).
 //!
 //! This is disposable *cache* state, not configuration: it lives under the
-//! per-user cache root (the same root the gem/composer launchers use for
-//! their binary cache) and every read tolerates absence, corruption, and
+//! per-user cache root (the same root the gem launcher uses for its
+//! binary cache) and every read tolerates absence, corruption, and
 //! clock skew by degrading to "never checked". Nothing in here may ever
 //! fail a command — callers treat all errors as "skip the check".
 

@@ -32,8 +32,8 @@ pub struct UpdateArgs {
     /// Exact version to install instead of the latest release (e.g.
     /// `socket-patch --update 3.4.0`). An explicit pin installs that
     /// version even if it is older than the current one. Also settable via
-    /// SOCKET_PATCH_VERSION — the same pin install.sh and the gem/composer
-    /// launchers honor.
+    /// SOCKET_PATCH_VERSION — the same pin install.sh and the gem launcher
+    /// honor.
     ///
     /// Not named `version`: under `propagate_version` clap already owns a
     /// `--version` arg id on every subcommand, and the collision panics at
