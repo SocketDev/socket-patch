@@ -1689,3 +1689,360 @@ async fn find_by_purls_prefers_root_copy_over_nested_duplicate() {
         "root copy must be preferred over the nested duplicate"
     );
 }
+
+// ── pnpm 4/5 NESTED virtual store (.pnpm/<registry-host>/…) ────
+
+/// Byte-accurate replica of a captured real `pnpm@4.14.4` install
+/// (layoutVersion 3, and the same shape synthetic pnpm-5 trees showed):
+/// store entries are nested by registry host —
+/// `.pnpm/registry.npmjs.org/<name>/<version>/node_modules/<name>` — so
+/// the `.pnpm` child (`registry.npmjs.org`) has NO `node_modules` of its
+/// own and the flat-entry walk finds nothing behind it:
+///
+/// ```text
+/// node_modules/
+///   mkdirp -> .pnpm/registry.npmjs.org/mkdirp/0.5.5/node_modules/mkdirp
+///   .pnpm/
+///     lock.yaml
+///     node_modules/minimist -> …            (internal hoist dir)
+///     registry.npmjs.org/
+///       mkdirp/0.5.5/node_modules/
+///         mkdirp/                            (real dir)
+///         minimist -> ../../../minimist/1.2.8/node_modules/minimist
+///       minimist/1.2.8/node_modules/minimist/   (real dir, TRANSITIVE-ONLY)
+///       @scope/leaf/2.0.0/node_modules/@scope/leaf/  (real, transitive-only)
+///       decoy/1.0.0/node_modules/wanted/     (advertises decoy, holds wanted)
+///       loop -> ../..                        (symlink cycle bait)
+/// ```
+#[cfg(unix)]
+async fn stage_pnpm4_nested_tree(root: &Path) -> std::path::PathBuf {
+    use std::os::unix::fs::symlink;
+
+    let nm = root.join("node_modules");
+    let store = nm.join(".pnpm");
+    let host = store.join("registry.npmjs.org");
+
+    stage_npm_pkg(&host.join("mkdirp/0.5.5/node_modules"), "mkdirp", "0.5.5").await;
+    stage_npm_pkg(
+        &host.join("minimist/1.2.8/node_modules"),
+        "minimist",
+        "1.2.8",
+    )
+    .await;
+    // Scoped transitive-only package: one nesting level deeper
+    // (host/@scope/name/version), the deepest shape the layout produces.
+    stage_npm_pkg(
+        &host.join("@scope/leaf/2.0.0/node_modules"),
+        "@scope/leaf",
+        "2.0.0",
+    )
+    .await;
+
+    // mkdirp's dependency: a sibling symlink inside its own store entry
+    // (relative, exactly as captured).
+    symlink(
+        Path::new("../../../minimist/1.2.8/node_modules/minimist"),
+        host.join("mkdirp/0.5.5/node_modules/minimist"),
+    )
+    .unwrap();
+
+    // Importer root: the direct dep is a symlink into the nested store.
+    symlink(
+        Path::new(".pnpm/registry.npmjs.org/mkdirp/0.5.5/node_modules/mkdirp"),
+        nm.join("mkdirp"),
+    )
+    .unwrap();
+
+    // pnpm 4's internal hoist dir `.pnpm/node_modules` (captured: symlinks
+    // into the nested entries), plus a REAL decoy planted where the walk
+    // would land if the hoist-dir skip were dropped.
+    let hoist = store.join("node_modules");
+    tokio::fs::create_dir_all(&hoist).await.unwrap();
+    symlink(
+        host.join("minimist/1.2.8/node_modules/minimist"),
+        hoist.join("minimist"),
+    )
+    .unwrap();
+    stage_npm_pkg(&hoist.join("node_modules"), "hoist-decoy", "9.9.9").await;
+
+    // Store metadata file at the top level (pnpm 4 writes lock.yaml).
+    tokio::fs::write(store.join("lock.yaml"), b"lockfileVersion: 5.1\n")
+        .await
+        .unwrap();
+
+    // Decoy: a nested entry advertising `decoy/1.0.0` whose INNER package
+    // is `wanted@1.0.0`. The resolver's pending-name filter must keep it
+    // unprobed (the entry name is the advertisement, exactly like a flat
+    // `decoy@1.0.0` entry).
+    stage_npm_pkg(&host.join("decoy/1.0.0/node_modules"), "wanted", "1.0.0").await;
+
+    // Symlink cycle inside the nested store: a link back up the tree. The
+    // descent must never traverse symlinks — following this one would
+    // recurse forever, so the tests *terminating* is itself the guard.
+    symlink(Path::new("../.."), host.join("loop")).unwrap();
+
+    nm
+}
+
+/// Regression (empirically confirmed on a real pnpm 4.14.4 tree, same on
+/// synthetic pnpm-5): the `.pnpm` walk handled FLAT `name@version` entries
+/// only. The nested `registry.npmjs.org` child has no `node_modules`, the
+/// conservative fallback enqueued exactly `.pnpm/<entry>/node_modules`
+/// (one level), so a transitive-only dep was silently skipped — apply
+/// exited 0 claiming success while the file was never written. The nested
+/// descent must find it; the pending-name filter must still hold (decoy);
+/// the cycle symlink must not hang the walk.
+#[cfg(unix)]
+#[tokio::test]
+#[serial_test::parallel]
+async fn find_by_purls_resolves_pnpm4_nested_store_transitives() {
+    let tmp = tempfile::tempdir().unwrap();
+    let nm = stage_pnpm4_nested_tree(tmp.path()).await;
+    let host = nm.join(".pnpm/registry.npmjs.org");
+
+    let crawler = NpmCrawler;
+    let purls = vec![
+        "pkg:npm/mkdirp@0.5.5".to_string(),
+        "pkg:npm/minimist@1.2.8".to_string(),
+        "pkg:npm/@scope/leaf@2.0.0".to_string(),
+        "pkg:npm/wanted@1.0.0".to_string(),
+        "pkg:npm/hoist-decoy@9.9.9".to_string(),
+    ];
+    let result = crawler.find_by_purls(&nm, &purls).await.unwrap();
+
+    // Root-linked direct dep still wins at the importer root.
+    assert_eq!(
+        result.get("pkg:npm/mkdirp@0.5.5").map(|p| p.path.clone()),
+        Some(nm.join("mkdirp")),
+        "root-linked install must win over the store copy"
+    );
+    // Transitive-only dep: physically present ONLY in the nested store.
+    let minimist = result
+        .get("pkg:npm/minimist@1.2.8")
+        .expect("transitive-only dep must resolve through the nested (pnpm 4/5) store layout");
+    assert_eq!(
+        minimist.path,
+        host.join("minimist/1.2.8/node_modules/minimist")
+    );
+    // Scoped transitive-only dep: the deepest nesting the layout produces.
+    let leaf = result
+        .get("pkg:npm/@scope/leaf@2.0.0")
+        .expect("scoped transitive-only dep must resolve through the nested store layout");
+    assert_eq!(
+        leaf.path,
+        host.join("@scope/leaf/2.0.0/node_modules/@scope/leaf")
+    );
+    // The nested entry advertising a non-pending name is never probed, and
+    // the hoist dir stays unreachable.
+    assert!(
+        !result.contains_key("pkg:npm/wanted@1.0.0"),
+        "nested store entries advertising non-pending names must not be probed"
+    );
+    assert!(
+        !result.contains_key("pkg:npm/hoist-decoy@9.9.9"),
+        "`.pnpm/node_modules` (internal hoist dir) must not be probed"
+    );
+    assert_eq!(result.len(), 3);
+}
+
+/// Scan twin: `crawl_all` must inventory the nested-store packages exactly
+/// once each. (`wanted` IS inventoried here — scan has no pending filter
+/// and the package is genuinely installed; only the resolver's name filter
+/// treats the advertising entry name as authoritative.)
+#[cfg(unix)]
+#[tokio::test]
+#[serial_test::parallel]
+async fn crawl_all_inventories_pnpm4_nested_store_exactly_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let nm = stage_pnpm4_nested_tree(tmp.path()).await;
+    let host = nm.join(".pnpm/registry.npmjs.org");
+
+    let crawler = NpmCrawler;
+    let result = crawler.crawl_all(&options_at(tmp.path())).await;
+
+    let purls: Vec<&str> = result.iter().map(|p| p.purl.as_str()).collect();
+    assert_eq!(
+        result.len(),
+        4,
+        "mkdirp + minimist + @scope/leaf + wanted, each exactly once — no \
+         symlink double-hits, no hoist decoy; got {purls:?}"
+    );
+    let by_purl = |purl: &str| -> &socket_patch_core::crawlers::types::CrawledPackage {
+        result
+            .iter()
+            .find(|p| p.purl == purl)
+            .unwrap_or_else(|| panic!("{purl} must be inventoried; got {purls:?}"))
+    };
+    // Root pass wins the seen dedup for the root-linked direct dep.
+    assert_eq!(by_purl("pkg:npm/mkdirp@0.5.5").path, nm.join("mkdirp"));
+    // Transitive-only packages surface at their physical store homes.
+    assert_eq!(
+        by_purl("pkg:npm/minimist@1.2.8").path,
+        host.join("minimist/1.2.8/node_modules/minimist")
+    );
+    assert_eq!(
+        by_purl("pkg:npm/@scope/leaf@2.0.0").path,
+        host.join("@scope/leaf/2.0.0/node_modules/@scope/leaf")
+    );
+    assert_eq!(
+        by_purl("pkg:npm/wanted@1.0.0").path,
+        host.join("decoy/1.0.0/node_modules/wanted")
+    );
+    assert!(
+        !purls.contains(&"pkg:npm/hoist-decoy@9.9.9"),
+        "the internal hoist dir must not be scanned"
+    );
+}
+
+// ── pnpm <=3 virtual store (node_modules/.registry.npmjs.org) ──
+
+/// Byte-accurate replica of a captured real `pnpm@3.8.1` install
+/// (layoutVersion 2 — pnpm 1.x and 2.x produce the identical shape): the
+/// virtual store is a hidden `.registry.npmjs.org` dir directly under
+/// `node_modules`, with NO `.pnpm` anywhere:
+///
+/// ```text
+/// node_modules/
+///   .modules.yaml, .pnpm-lock.yaml           (metadata FILES)
+///   mkdirp -> .registry.npmjs.org/mkdirp/0.5.5/node_modules/mkdirp
+///   .registry.npmjs.org/
+///     mkdirp/0.5.5/node_modules/
+///       mkdirp/                              (real dir)
+///       minimist -> ../../../minimist/1.2.8/node_modules/minimist
+///     minimist/1.2.8/node_modules/minimist/  (real dir, TRANSITIVE-ONLY)
+///     loop -> ..                             (symlink cycle bait)
+///   .not-a-store/wanted3/1.0.0/node_modules/wanted3/  (hidden decoy)
+/// ```
+///
+/// The `.not-a-store` decoy pins the recognition rule: only
+/// `.registry.*`-named hidden dirs are virtual stores; other hidden dirs
+/// (caches, tool state) must stay skipped.
+#[cfg(unix)]
+async fn stage_pnpm3_legacy_tree(root: &Path) -> std::path::PathBuf {
+    use std::os::unix::fs::symlink;
+
+    let nm = root.join("node_modules");
+    let store = nm.join(".registry.npmjs.org");
+
+    stage_npm_pkg(&store.join("mkdirp/0.5.5/node_modules"), "mkdirp", "0.5.5").await;
+    stage_npm_pkg(
+        &store.join("minimist/1.2.8/node_modules"),
+        "minimist",
+        "1.2.8",
+    )
+    .await;
+
+    // mkdirp's dependency: relative sibling symlink, exactly as captured.
+    symlink(
+        Path::new("../../../minimist/1.2.8/node_modules/minimist"),
+        store.join("mkdirp/0.5.5/node_modules/minimist"),
+    )
+    .unwrap();
+
+    // Importer root: relative symlink into the hidden store (as captured).
+    symlink(
+        Path::new(".registry.npmjs.org/mkdirp/0.5.5/node_modules/mkdirp"),
+        nm.join("mkdirp"),
+    )
+    .unwrap();
+
+    // Metadata FILES at the node_modules root, as captured.
+    tokio::fs::write(nm.join(".modules.yaml"), b"layoutVersion: 2\n")
+        .await
+        .unwrap();
+    tokio::fs::write(nm.join(".pnpm-lock.yaml"), b"shrinkwrapVersion: 4\n")
+        .await
+        .unwrap();
+
+    // Symlink cycle inside the store: never traversed (see pnpm4 stager).
+    symlink(Path::new(".."), store.join("loop")).unwrap();
+
+    // Hidden dir that is NOT a `.registry.*` store: must stay invisible.
+    stage_npm_pkg(
+        &nm.join(".not-a-store/wanted3/1.0.0/node_modules"),
+        "wanted3",
+        "1.0.0",
+    )
+    .await;
+
+    nm
+}
+
+/// Regression (empirically confirmed on a real pnpm 3.8.1 tree; pnpm 1/2
+/// captures show the identical layout): pre-`.pnpm` pnpm hides the virtual
+/// store at `node_modules/.registry.npmjs.org`, which the walk skipped as
+/// just-another-hidden-dir — a transitive-only dep was unresolvable, apply
+/// exited 0 claiming success with nothing written.
+#[cfg(unix)]
+#[tokio::test]
+#[serial_test::parallel]
+async fn find_by_purls_resolves_pnpm3_legacy_registry_store_transitive() {
+    let tmp = tempfile::tempdir().unwrap();
+    let nm = stage_pnpm3_legacy_tree(tmp.path()).await;
+    let store = nm.join(".registry.npmjs.org");
+
+    let crawler = NpmCrawler;
+    let purls = vec![
+        "pkg:npm/mkdirp@0.5.5".to_string(),
+        "pkg:npm/minimist@1.2.8".to_string(),
+        "pkg:npm/wanted3@1.0.0".to_string(),
+    ];
+    let result = crawler.find_by_purls(&nm, &purls).await.unwrap();
+
+    assert_eq!(
+        result.get("pkg:npm/mkdirp@0.5.5").map(|p| p.path.clone()),
+        Some(nm.join("mkdirp")),
+        "root-linked install must win over the store copy"
+    );
+    let minimist = result
+        .get("pkg:npm/minimist@1.2.8")
+        .expect("transitive-only dep must resolve through the pnpm<=3 `.registry.*` store");
+    assert_eq!(
+        minimist.path,
+        store.join("minimist/1.2.8/node_modules/minimist")
+    );
+    assert!(
+        !result.contains_key("pkg:npm/wanted3@1.0.0"),
+        "hidden dirs that are not `.registry.*` stores must stay unprobed"
+    );
+    assert_eq!(result.len(), 2);
+}
+
+/// Scan twin: `crawl_all` must inventory the legacy store's packages
+/// exactly once each — the root pass wins for the root-linked direct dep,
+/// the transitive-only dep surfaces at its physical store home, and
+/// non-store hidden dirs stay out of the inventory.
+#[cfg(unix)]
+#[tokio::test]
+#[serial_test::parallel]
+async fn crawl_all_inventories_pnpm3_legacy_registry_store_exactly_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let nm = stage_pnpm3_legacy_tree(tmp.path()).await;
+    let store = nm.join(".registry.npmjs.org");
+
+    let crawler = NpmCrawler;
+    let result = crawler.crawl_all(&options_at(tmp.path())).await;
+
+    let purls: Vec<&str> = result.iter().map(|p| p.purl.as_str()).collect();
+    assert_eq!(
+        result.len(),
+        2,
+        "exactly mkdirp + minimist, each once; got {purls:?}"
+    );
+    let by_purl = |purl: &str| -> &socket_patch_core::crawlers::types::CrawledPackage {
+        result
+            .iter()
+            .find(|p| p.purl == purl)
+            .unwrap_or_else(|| panic!("{purl} must be inventoried; got {purls:?}"))
+    };
+    assert_eq!(by_purl("pkg:npm/mkdirp@0.5.5").path, nm.join("mkdirp"));
+    assert_eq!(
+        by_purl("pkg:npm/minimist@1.2.8").path,
+        store.join("minimist/1.2.8/node_modules/minimist"),
+        "transitive-only dep must be inventoried at its physical store home"
+    );
+    assert!(
+        !purls.contains(&"pkg:npm/wanted3@1.0.0"),
+        "hidden dirs that are not `.registry.*` stores must stay unscanned"
+    );
+}

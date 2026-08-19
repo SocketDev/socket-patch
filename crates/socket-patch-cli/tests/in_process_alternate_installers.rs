@@ -457,6 +457,173 @@ async fn pnpm_transitive_only_dep_apply_patches_virtual_store() {
 }
 
 // ---------------------------------------------------------------------------
+// pnpm 4 (legacy NESTED virtual store): transitive-only dependency
+// ---------------------------------------------------------------------------
+
+/// REAL `corepack pnpm@4.14.4` install (pnpm 4 runs fine on modern Node).
+/// Its layoutVersion-3 virtual store is nested by registry host —
+/// `.pnpm/registry.npmjs.org/<name>/<version>/node_modules/<name>` — not
+/// the flat `.pnpm/<name>@<version>` shape of pnpm 6+, and the flat-entry
+/// walk was blind to it: apply exited 0 claiming success while the
+/// transitive dep's file was never written (empirically confirmed on a
+/// captured pnpm 4.14.4 tree). mkdirp@0.5.5 depends on minimist, giving a
+/// real install with exactly that shape. Two projects share one store via
+/// hardlink import, so the CoW asserts prove apply broke the link instead
+/// of writing through the store inode.
+#[tokio::test]
+#[serial]
+async fn pnpm4_nested_store_transitive_only_dep_apply_patches_file() {
+    if !has_corepack_pm("pnpm@4.14.4") {
+        println!("SKIP: corepack pnpm@4.14.4 unavailable");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = tmp.path().join("store");
+
+    let stage_project = |name: &str| -> std::path::PathBuf {
+        let proj = tmp.path().join(name);
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(
+            proj.join("package.json"),
+            format!(
+                r#"{{ "name": "{name}", "version": "0.0.0", "dependencies": {{ "mkdirp": "0.5.5" }} }}"#
+            ),
+        )
+        .unwrap();
+        proj
+    };
+    let proj_a = stage_project("pnpm4-nested-a");
+    let proj_b = stage_project("pnpm4-nested-b");
+
+    for proj in [&proj_a, &proj_b] {
+        // `--store-dir` + `--package-import-method hardlink` are the pnpm 4
+        // spellings (verified against `pnpm@4.14.4 install --help`); both
+        // projects share the store so the file is hardlink-imported and the
+        // CoW assertions below have teeth.
+        let out = pm_command("corepack", &["npm_config_"])
+            .args([
+                "pnpm@4.14.4",
+                "install",
+                "--store-dir",
+                store.to_str().unwrap(),
+                "--package-import-method",
+                "hardlink",
+            ])
+            .current_dir(proj)
+            .env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .expect("corepack pnpm@4.14.4 install");
+        if !out.status.success() {
+            println!(
+                "SKIP: pnpm@4.14.4 install failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+    }
+
+    // Layout premises — if any of these drift the test would silently stop
+    // exercising the nested-store path and must say so instead:
+    // the store is nested by registry host (layoutVersion 3), …
+    assert!(
+        proj_a
+            .join("node_modules/.pnpm/registry.npmjs.org")
+            .is_dir(),
+        "pnpm 4 premise broken: no nested `.pnpm/registry.npmjs.org` host dir"
+    );
+    // … and minimist is transitive-only: no importer-root entry at all.
+    assert!(
+        std::fs::symlink_metadata(proj_a.join("node_modules/minimist")).is_err(),
+        "pnpm 4 premise broken: minimist appeared at the importer root; \
+         the transitive-only nested-store path is not being exercised"
+    );
+
+    // The lock-resolved minimist lives next to the real mkdirp inside its
+    // own store entry; canonicalize resolves that sibling symlink to its
+    // physical nested-store home.
+    let locate = |proj: &Path| -> std::path::PathBuf {
+        let mkdirp_real =
+            std::fs::canonicalize(proj.join("node_modules/mkdirp")).expect("canonicalize mkdirp");
+        std::fs::canonicalize(mkdirp_real.parent().unwrap().join("minimist"))
+            .expect("minimist must be installed beside mkdirp in its store entry")
+    };
+    let minimist_a = locate(&proj_a);
+    assert!(
+        minimist_a
+            .components()
+            .any(|c| c.as_os_str() == "registry.npmjs.org"),
+        "premise: minimist's canonical home must be inside the NESTED store: {minimist_a:?}"
+    );
+    let meta: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(minimist_a.join("package.json")).unwrap()).unwrap();
+    let version = meta["version"].as_str().expect("version field").to_string();
+
+    let target = minimist_a.join("index.js");
+    let original = std::fs::read(&target).expect("read minimist index.js");
+    let before_hash = git_sha256(&original);
+    let mut patched = original.clone();
+    patched.extend_from_slice(b"\n// SOCKET-PATCH-PNPM4-NESTED-MARKER\n");
+    let after_hash = git_sha256(&patched);
+
+    // The sibling project's canonical copy of the same file.
+    let target_b = locate(&proj_b).join("index.js");
+    assert_eq!(
+        std::fs::read(&target_b).unwrap(),
+        original,
+        "both projects must start from identical store-imported bytes"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().ino(),
+            std::fs::metadata(&target_b).unwrap().ino(),
+            "hardlink-import premise: both projects' copies must share the store inode"
+        );
+    }
+
+    let socket = proj_a.join(".socket");
+    write_manifest(
+        &socket,
+        &format!("pkg:npm/minimist@{version}"),
+        &before_hash,
+        &after_hash,
+    );
+    let blobs = socket.join("blobs");
+    std::fs::create_dir_all(&blobs).unwrap();
+    std::fs::write(blobs.join(&after_hash), &patched).unwrap();
+
+    let code = apply_run(default_apply(&proj_a)).await;
+    assert_eq!(
+        code, 0,
+        "apply must resolve the transitive-only dep inside the nested \
+         `.pnpm/registry.npmjs.org` store and succeed"
+    );
+    assert_patched(&target, &patched, &before_hash, &after_hash);
+
+    // CoW safety: the sibling project sharing the store is untouched, and
+    // the patched file no longer shares the store inode.
+    let after_b = std::fs::read(&target_b).unwrap();
+    assert_eq!(
+        git_sha256(&after_b),
+        before_hash,
+        "sibling project sharing the store must keep the original bytes"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        assert_ne!(
+            std::fs::metadata(&target).unwrap().ino(),
+            std::fs::metadata(&target_b).unwrap().ino(),
+            "apply must break the hardlink (CoW) instead of writing through the store inode"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Monorepo workspace (npm workspaces)
 // ---------------------------------------------------------------------------
 

@@ -154,6 +154,44 @@ fn is_semver_triple(v: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Helpers: pnpm virtual-store layout knowledge
+// ---------------------------------------------------------------------------
+
+/// Maximum directory depth probed below a *nested* virtual-store host dir.
+/// pnpm 4/5 (layoutVersion 3) nest store entries by registry host —
+/// `.pnpm/<registry-host>/<name>/<version>/node_modules/<name>` — and
+/// pnpm <=3 (layoutVersion <=2) use the same shape directly under a hidden
+/// `node_modules/.<registry-host>` dir (both confirmed against captured
+/// real installs). Relative to the host dir the deepest package home is
+/// `@scope/<name>/<version>` — three levels.
+const NESTED_STORE_MAX_DEPTH: usize = 3;
+
+/// Upper bound on directories visited while descending one nested-store
+/// host, so a corrupted (or adversarial) tree cannot turn the bounded
+/// descent into an unbounded readdir storm. A real store holds one dir per
+/// scope/name and one per version — orders of magnitude below this.
+/// Hitting the cap can only make the walk miss packages (fail toward "not
+/// installed", the same answer the pre-descent code gave for every nested
+/// entry), never patch the wrong one: the package.json probe stays the
+/// authority.
+const NESTED_STORE_MAX_DIRS: usize = 16_384;
+
+/// Whether a hidden `node_modules` child is a pnpm <=3 virtual store.
+/// Before the `.pnpm` dir existed (layoutVersion <=2: pnpm 1/2/3) the
+/// store lived at `node_modules/.<registry-host>` — `.registry.npmjs.org`
+/// for the default registry (confirmed byte-for-byte in captured pnpm
+/// 1.x/2.x/3.8 trees, whose `.modules.yaml` names
+/// `registries.default: https://registry.npmjs.org/`). Matching the
+/// `.registry.` prefix also covers other `registry.*` hosts while never
+/// mistaking unrelated hidden dirs (`.bin`, `.cache`, `.git`) for a store;
+/// a custom registry on a host not starting with `registry.` would need
+/// its own entry here — deliberately NOT "any hidden dir", which would
+/// walk arbitrary tool caches.
+fn is_legacy_pnpm_store_dir_name(name: &str) -> bool {
+    name.starts_with(".registry.")
+}
+
+// ---------------------------------------------------------------------------
 // Global prefix detection helpers
 // ---------------------------------------------------------------------------
 
@@ -564,29 +602,26 @@ impl NpmCrawler {
                     continue;
                 }
                 let store_path = nm_path.join(&name);
-                for (entry_name, entry_nm) in Self::list_pnpm_store_entries(&store_path).await {
-                    // Enqueue only entries that can still hold a pending
-                    // target. A manifest routinely lists packages that
-                    // simply aren't installed here, and probing every
-                    // entry of a large monorepo store for them would add
-                    // a readdir+stat storm to every apply/rollback run.
-                    // The dir name advertises the entry's package, so
-                    // filter by PENDING NAME only — the version is
-                    // deliberately NOT matched at this stage (dir-name
-                    // versions can carry peer/build decorations; the
-                    // package.json probe stays the authority). An
-                    // undecodable name (truncated/hash-suffixed dirs,
-                    // git/URL deps, `_`-bearing names) reveals nothing
-                    // about what's inside, so it stays probeable.
-                    if let Some((entry_pkg, _version)) = decode_pnpm_store_entry_name(&entry_name) {
-                        if !pending_names.contains(entry_pkg.as_str()) {
-                            continue;
-                        }
-                    }
-                    if is_dir(&entry_nm).await {
-                        queue.push_back(entry_nm);
-                    }
+                let entries = Self::list_pnpm_store_entries(&store_path).await;
+                Self::enqueue_pending_store_entries(entries, pending_names, queue);
+                continue;
+            }
+            // pnpm <=3: the virtual store is a hidden `.<registry-host>` dir
+            // (there is no `.pnpm` at all) with the same
+            // transitive-only-deps property, so it gets the same probing.
+            // Must run before the generic hidden-entry skip below, which
+            // would otherwise swallow it — leaving every transitive-only
+            // install unpatchable on those layouts.
+            if is_legacy_pnpm_store_dir_name(&name_str) {
+                let Some(file_type) = crate::utils::fs::entry_file_type(&entry).await else {
+                    continue;
+                };
+                if !file_type.is_dir() {
+                    continue;
                 }
+                let mut entries = Vec::new();
+                Self::collect_nested_store_entries(&nm_path.join(&name), &mut entries).await;
+                Self::enqueue_pending_store_entries(entries, pending_names, queue);
                 continue;
             }
             if name_str.starts_with('.') || name_str == "node_modules" {
@@ -623,6 +658,33 @@ impl NpmCrawler {
                     queue.push_back(nested);
                 }
             }
+        }
+    }
+
+    /// Enqueue virtual-store entries that can still hold a pending target.
+    /// A manifest routinely lists packages that simply aren't installed
+    /// here, and probing every entry of a large monorepo store for them
+    /// would add a readdir+stat storm to every apply/rollback run. The
+    /// entry name advertises the entry's package, so filter by PENDING
+    /// NAME only — the version is deliberately NOT matched at this stage
+    /// (dir-name versions can carry peer/build decorations; the
+    /// package.json probe stays the authority). An undecodable name
+    /// (truncated/hash-suffixed dirs, git/URL deps, `_`-bearing names)
+    /// reveals nothing about what's inside, so it stays probeable. Both
+    /// enumerators only yield entries whose `node_modules` exists, so no
+    /// re-stat here.
+    fn enqueue_pending_store_entries(
+        entries: Vec<(String, PathBuf)>,
+        pending_names: &HashSet<&str>,
+        queue: &mut VecDeque<PathBuf>,
+    ) {
+        for (entry_name, entry_nm) in entries {
+            if let Some((entry_pkg, _version)) = decode_pnpm_store_entry_name(&entry_name) {
+                if !pending_names.contains(entry_pkg.as_str()) {
+                    continue;
+                }
+            }
+            queue.push_back(entry_nm);
         }
     }
 
@@ -770,6 +832,7 @@ impl NpmCrawler {
         Box::pin(async move {
             let mut results = Vec::new();
             let mut pnpm_store: Option<PathBuf> = None;
+            let mut legacy_stores: Vec<PathBuf> = Vec::new();
             let (store_entry, identity_seen) = match policy {
                 ScanPolicy::Importer => (false, None),
                 ScanPolicy::StoreEntry { identity_seen } => (true, identity_seen),
@@ -795,6 +858,22 @@ impl NpmCrawler {
                     };
                     if file_type.is_dir() {
                         pnpm_store = Some(node_modules_path.join(&name_str));
+                    }
+                    continue;
+                }
+
+                // pnpm <=3 virtual store (a hidden `.<registry-host>` dir;
+                // no `.pnpm` exists on those layouts): same
+                // transitive-only-home property, same deferred scan so
+                // root-level entries win the `seen` dedup. Must run before
+                // the hidden-entry skip below, which would otherwise leave
+                // every transitive-only install invisible to scan.
+                if !store_entry && is_legacy_pnpm_store_dir_name(&name_str) {
+                    let Some(file_type) = crate::utils::fs::entry_file_type(&entry).await else {
+                        continue;
+                    };
+                    if file_type.is_dir() {
+                        legacy_stores.push(node_modules_path.join(&name_str));
                     }
                     continue;
                 }
@@ -855,8 +934,13 @@ impl NpmCrawler {
             }
 
             if let Some(store_path) = pnpm_store {
-                let found = Self::scan_pnpm_virtual_store(&store_path, seen).await;
-                results.extend(found);
+                let entries = Self::list_pnpm_store_entries(&store_path).await;
+                results.extend(Self::scan_store_entries(entries, seen).await);
+            }
+            for store_path in legacy_stores {
+                let mut entries = Vec::new();
+                Self::collect_nested_store_entries(&store_path, &mut entries).await;
+                results.extend(Self::scan_store_entries(entries, seen).await);
             }
 
             results
@@ -864,12 +948,20 @@ impl NpmCrawler {
     }
 
     /// Enumerate pnpm virtual-store (`node_modules/.pnpm`) entries,
-    /// yielding each REAL directory child's `(dir_name, <child>/node_modules)`.
-    /// The child literally named `node_modules` is pnpm's internal hoist
-    /// dir (nothing but symlinks into sibling entries) and hidden children
-    /// are store metadata — both skipped. Shared by the resolver
+    /// yielding `(entry_name, <entry>/node_modules)` for every entry whose
+    /// `node_modules` actually exists. The child literally named
+    /// `node_modules` is pnpm's internal hoist dir (nothing but symlinks
+    /// into sibling entries) and hidden children are store metadata — both
+    /// skipped. A REAL directory child with a `node_modules` of its own is
+    /// a flat (pnpm 6+) entry; one *without* is the pnpm 4/5 nested layout
+    /// — the child is a registry-host dir
+    /// (`.pnpm/<registry-host>/<name>/<version>/node_modules/<name>`), so
+    /// treating it as an empty entry silently hid every transitive-only
+    /// install (apply exited 0 claiming success with nothing written) —
+    /// descend it instead. Shared by the resolver
     /// (`collect_nested_node_modules`) and the scan pass
-    /// (`scan_pnpm_virtual_store`) so the store-layout policy lives once.
+    /// (`scan_store_entries` callers) so the store-layout policy lives
+    /// once.
     async fn list_pnpm_store_entries(store_path: &Path) -> Vec<(String, PathBuf)> {
         let mut entries = Vec::new();
         for entry in crate::utils::fs::list_dir_entries(store_path).await {
@@ -884,26 +976,102 @@ impl NpmCrawler {
             if !file_type.is_dir() {
                 continue;
             }
-            let entry_nm = store_path.join(&name).join("node_modules");
-            entries.push((name_str.into_owned(), entry_nm));
+            let entry_path = store_path.join(&name);
+            let entry_nm = entry_path.join("node_modules");
+            if is_dir(&entry_nm).await {
+                entries.push((name_str.into_owned(), entry_nm));
+            } else {
+                Self::collect_nested_store_entries(&entry_path, &mut entries).await;
+            }
         }
         entries
     }
 
-    /// Scan pnpm's virtual store (`node_modules/.pnpm`): inventory the
-    /// packages under each store entry's `node_modules`. An entry whose
-    /// dir name decodes to a name@version the importer pass already
-    /// inventoried (every root-linked direct dep) skips the redundant
-    /// package.json re-read via `identity_seen` — the entry is still
-    /// walked, because bundled/injected dependencies are real dirs that
-    /// physically live only inside the store entry.
-    async fn scan_pnpm_virtual_store(
-        store_path: &Path,
+    /// Descend a *nested* virtual-store host dir, yielding
+    /// `(name@version, <version-dir>/node_modules)` for each package home
+    /// found. Covers the two pre-flat layouts (both confirmed against
+    /// captured real installs):
+    /// - pnpm 4/5: `.pnpm/<registry-host>/…` — called on a `.pnpm` child
+    ///   that has no `node_modules` of its own;
+    /// - pnpm <=3: `node_modules/.<registry-host>/…` — called on the
+    ///   hidden store root directly.
+    ///
+    /// Below the host, path components are registry coordinates (`@scope`,
+    /// name, version), NOT package dirs, so the importer-walk hidden-name
+    /// skip does not apply here — but symlinks are never traversed (a link
+    /// inside the store points at a sibling entry or out of tree, and
+    /// following one could cycle), and both depth and total fan-out are
+    /// bounded. Each found dir's host-relative path is synthesized into
+    /// the flat `name@version` entry-name form so downstream consumers
+    /// (the pending-name filter, the `identity_seen` dedup) treat nested
+    /// and flat entries identically; a shape that doesn't fit stays an
+    /// undecodable — always-probed — name, the conservative direction.
+    async fn collect_nested_store_entries(host_path: &Path, entries: &mut Vec<(String, PathBuf)>) {
+        let mut remaining = NESTED_STORE_MAX_DIRS;
+        let mut queue: VecDeque<(PathBuf, String, usize)> =
+            VecDeque::from([(host_path.to_path_buf(), String::new(), 0)]);
+        while let Some((dir, rel, depth)) = queue.pop_front() {
+            for entry in crate::utils::fs::list_dir_entries(&dir).await {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                // A `node_modules` here belongs to a parent entry (already
+                // yielded), never a name/version coordinate.
+                if name_str == "node_modules" {
+                    continue;
+                }
+                let Some(file_type) = crate::utils::fs::entry_file_type(&entry).await else {
+                    continue;
+                };
+                if !file_type.is_dir() {
+                    continue;
+                }
+                if remaining == 0 {
+                    return;
+                }
+                remaining -= 1;
+                let child = dir.join(&name);
+                let child_rel = if rel.is_empty() {
+                    name_str.into_owned()
+                } else {
+                    format!("{rel}/{name_str}")
+                };
+                let child_nm = child.join("node_modules");
+                if is_dir(&child_nm).await {
+                    // `<name>/<version>/node_modules` — a package home.
+                    // Anything deeper belongs to that package's own tree,
+                    // which the store-entry scan walks itself.
+                    let entry_name = match child_rel.rsplit_once('/') {
+                        Some((pkg, version)) => format!("{pkg}@{version}"),
+                        // Directly under the host there is no name/version
+                        // split; the raw component stays the entry name
+                        // (undecodable ⇒ probed).
+                        None => child_rel,
+                    };
+                    entries.push((entry_name, child_nm));
+                    continue;
+                }
+                if depth + 1 < NESTED_STORE_MAX_DEPTH {
+                    queue.push_back((child, child_rel, depth + 1));
+                }
+            }
+        }
+    }
+
+    /// Inventory the packages under each virtual-store entry's
+    /// `node_modules` (entries come from `list_pnpm_store_entries` or
+    /// `collect_nested_store_entries`). An entry whose name decodes to a
+    /// name@version the importer pass already inventoried (every
+    /// root-linked direct dep) skips the redundant package.json re-read
+    /// via `identity_seen` — the entry is still walked, because
+    /// bundled/injected dependencies are real dirs that physically live
+    /// only inside the store entry.
+    async fn scan_store_entries(
+        entries: Vec<(String, PathBuf)>,
         seen: &mut HashSet<String>,
     ) -> Vec<CrawledPackage> {
         let mut results = Vec::new();
 
-        for (entry_name, entry_nm) in Self::list_pnpm_store_entries(store_path).await {
+        for (entry_name, entry_nm) in entries {
             let identity_seen = decode_pnpm_store_entry_name(&entry_name)
                 .filter(|(full_name, version)| {
                     let (ns, bare) = parse_package_name(full_name);
