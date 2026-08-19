@@ -430,6 +430,7 @@ pub async fn run(args: VendorArgs) -> i32 {
                             path: vex_path.display().to_string(),
                             statements: summary.statements,
                             format: "openvex-0.2.0".to_string(),
+                            warnings: summary.warnings,
                         });
                     }
                     Err(e) => {

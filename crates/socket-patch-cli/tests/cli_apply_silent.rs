@@ -181,7 +181,7 @@ fn apply_check_silent_drift_keeps_error_output() {
 fn apply_offline_suppresses_public_proxy_notice() {
     // No .socket dir at all: apply exits 0 ("nothing to apply") either way,
     // so the only stderr difference is the advisory under test.
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("create tempdir");
 
     let (code, _stdout, stderr) = run_apply(tmp.path(), &["--offline"]);
     assert_eq!(code, 0, "no-manifest apply is a clean no-op: {stderr}");

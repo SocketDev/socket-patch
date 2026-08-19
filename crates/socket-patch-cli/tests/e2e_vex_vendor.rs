@@ -1048,7 +1048,7 @@ fn detached_vendor_matrix_attests_every_vendor_ecosystem() {
 /// `vendored_tree_out_of_sync` warning naming the purl.
 #[test]
 fn vendored_live_tree_out_of_sync_warns_but_attests() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("create tempdir");
     let cwd = tmp.path();
     let purl = "pkg:npm/lodash@4.17.21";
     let uuid = "0a0a0a0a-1111-4111-8111-0a0a0a0a0a0a";
@@ -1074,23 +1074,23 @@ fn vendored_live_tree_out_of_sync_warns_but_attests() {
         detached_matrix_entry("npm", purl, uuid, &rel, sha256, record),
     );
     let dir = cwd.join(".socket/vendor");
-    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::create_dir_all(&dir).expect("create .socket/vendor");
     std::fs::write(
         dir.join("state.json"),
-        serde_json::to_string_pretty(&state).unwrap(),
+        serde_json::to_string_pretty(&state).expect("serialize vendor state"),
     )
-    .unwrap();
+    .expect("write vendor state.json");
 
     // Installed tree: present and PRISTINE-UNPATCHED (the drift being
     // disclosed — e.g. a fresh `pnpm install` that bypassed the wiring).
     let nm = cwd.join("node_modules/lodash");
-    std::fs::create_dir_all(&nm).unwrap();
+    std::fs::create_dir_all(&nm).expect("create node_modules entry");
     std::fs::write(
         nm.join("package.json"),
         r#"{"name":"lodash","version":"4.17.21"}"#,
     )
-    .unwrap();
-    std::fs::write(nm.join("index.js"), b"original unpatched bytes\n").unwrap();
+    .expect("write package.json");
+    std::fs::write(nm.join("index.js"), b"original unpatched bytes\n").expect("write index.js");
 
     let vex_path = cwd.join("out.vex.json");
     let out = cli()
@@ -1127,7 +1127,9 @@ fn vendored_live_tree_out_of_sync_warns_but_attests() {
     );
 
     // The doc still attests, with the (vendored) provenance marker intact.
-    let doc: Value = serde_json::from_str(&std::fs::read_to_string(&vex_path).unwrap()).unwrap();
+    let doc: Value =
+        serde_json::from_str(&std::fs::read_to_string(&vex_path).expect("read emitted VEX doc"))
+            .expect("parse emitted VEX doc");
     let stmts = doc["statements"].as_array().unwrap();
     assert_eq!(stmts.len(), 1, "{doc}");
     assert_eq!(stmts[0]["status"], "not_affected");
@@ -1157,7 +1159,7 @@ fn vendored_live_tree_out_of_sync_warns_but_attests() {
 
     // Absent-tree control: remove node_modules — the expected post-vendor
     // state — and the warning must disappear while the attestation stays.
-    std::fs::remove_dir_all(cwd.join("node_modules")).unwrap();
+    std::fs::remove_dir_all(cwd.join("node_modules")).expect("remove node_modules");
     let absent = cli()
         .args([
             "vex",
@@ -1172,7 +1174,7 @@ fn vendored_live_tree_out_of_sync_warns_but_attests() {
         .output()
         .expect("invoke vex");
     assert!(absent.status.success());
-    let env: Value = serde_json::from_slice(&absent.stdout).unwrap();
+    let env: Value = serde_json::from_slice(&absent.stdout).expect("envelope JSON on stdout");
     assert!(
         env["warnings"].is_null(),
         "an absent installed tree is the expected post-vendor state — no warning: {env}"
@@ -1196,22 +1198,22 @@ fn vendored_live_tree_out_of_sync_warns_but_attests() {
 /// leaves no attestation behind.
 #[test]
 fn setup_filter_drop_surfaces_skipped_event_and_removes_stale_doc() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("create tempdir");
     let cwd = tmp.path();
     let purl = "pkg:npm/applied-pkg@1.0.0";
 
     // Applied + verifiable in node_modules; no root package.json → no npm
     // hook configured; manifest carries NO setup section.
     let nm = cwd.join("node_modules/applied-pkg");
-    std::fs::create_dir_all(&nm).unwrap();
+    std::fs::create_dir_all(&nm).expect("create node_modules entry");
     std::fs::write(
         nm.join("package.json"),
         r#"{"name":"applied-pkg","version":"1.0.0"}"#,
     )
-    .unwrap();
+    .expect("write package.json");
     let patched = b"patched npm index";
     let after = compute_git_sha256_from_bytes(patched);
-    std::fs::write(nm.join("index.js"), patched).unwrap();
+    std::fs::write(nm.join("index.js"), patched).expect("write patched index.js");
 
     let mut manifest = PatchManifest::new();
     manifest.patches.insert(
@@ -1232,7 +1234,7 @@ fn setup_filter_drop_surfaces_skipped_event_and_removes_stale_doc() {
         &vex_path,
         r#"{"@context":"https://openvex.dev/ns/v0.2.0","@id":"urn:uuid:stale","author":"Socket","timestamp":"2020-01-01T00:00:00Z","version":1,"statements":[]}"#,
     )
-    .unwrap();
+    .expect("write stale VEX doc");
 
     let out = cli()
         .args([
@@ -1286,7 +1288,7 @@ fn setup_filter_drop_surfaces_skipped_event_and_removes_stale_doc() {
 /// drop is a skipped event alongside the vendored purl's verified event.
 #[test]
 fn setup_filter_drop_alongside_success_is_partial_failure_event() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("create tempdir");
     let cwd = tmp.path();
     let vendored_purl = "pkg:cargo/serde@1.0.0";
     let dropped_purl = "pkg:npm/applied-pkg@1.0.0";
@@ -1297,15 +1299,15 @@ fn setup_filter_drop_alongside_success_is_partial_failure_event() {
     write_vendor_state(cwd, vendored_purl, &rel);
 
     let nm = cwd.join("node_modules/applied-pkg");
-    std::fs::create_dir_all(&nm).unwrap();
+    std::fs::create_dir_all(&nm).expect("create node_modules entry");
     std::fs::write(
         nm.join("package.json"),
         r#"{"name":"applied-pkg","version":"1.0.0"}"#,
     )
-    .unwrap();
+    .expect("write package.json");
     let npm_patched = b"patched npm index";
     let npm_after = compute_git_sha256_from_bytes(npm_patched);
-    std::fs::write(nm.join("index.js"), npm_patched).unwrap();
+    std::fs::write(nm.join("index.js"), npm_patched).expect("write patched index.js");
 
     let mut manifest = PatchManifest::new();
     manifest.patches.insert(
@@ -1369,7 +1371,9 @@ fn setup_filter_drop_alongside_success_is_partial_failure_event() {
     assert_eq!(skipped["errorCode"], "ecosystem_not_setup", "{skipped}");
 
     // The doc holds exactly the vendored statement.
-    let doc: Value = serde_json::from_str(&std::fs::read_to_string(&vex_path).unwrap()).unwrap();
+    let doc: Value =
+        serde_json::from_str(&std::fs::read_to_string(&vex_path).expect("read emitted VEX doc"))
+            .expect("parse emitted VEX doc");
     assert_eq!(doc["statements"].as_array().unwrap().len(), 1, "{doc}");
 }
 
@@ -1384,7 +1388,7 @@ fn setup_filter_drop_alongside_success_is_partial_failure_event() {
 /// override must stay silent.
 #[test]
 fn product_override_non_iri_warns_in_envelope() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("create tempdir");
     let cwd = tmp.path();
     let purl = "pkg:cargo/serde@1.0.0";
 
@@ -1424,7 +1428,7 @@ fn product_override_non_iri_warns_in_envelope() {
         "a non-IRI product is a warning, never a hard reject. stdout:\n{}",
         String::from_utf8_lossy(&out.stdout)
     );
-    let env: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let env: Value = serde_json::from_slice(&out.stdout).expect("envelope JSON on stdout");
     let warnings = env["warnings"]
         .as_array()
         .unwrap_or_else(|| panic!("expected warnings[]: {env}"));
@@ -1433,7 +1437,9 @@ fn product_override_non_iri_warns_in_envelope() {
         "non-IRI --product must warn: {env}"
     );
     // Emitted verbatim — the override is honored, only advised against.
-    let doc: Value = serde_json::from_str(&std::fs::read_to_string(&vex_path).unwrap()).unwrap();
+    let doc: Value =
+        serde_json::from_str(&std::fs::read_to_string(&vex_path).expect("read emitted VEX doc"))
+            .expect("parse emitted VEX doc");
     assert_eq!(
         doc["statements"][0]["products"][0]["@id"], "internal app name",
         "{doc}"
@@ -1454,7 +1460,7 @@ fn product_override_non_iri_warns_in_envelope() {
         .output()
         .expect("invoke vex");
     assert!(ok.status.success());
-    let env: Value = serde_json::from_slice(&ok.stdout).unwrap();
+    let env: Value = serde_json::from_slice(&ok.stdout).expect("envelope JSON on stdout");
     assert!(
         env["warnings"]
             .as_array()
@@ -1469,7 +1475,7 @@ fn product_override_non_iri_warns_in_envelope() {
 /// directory (os error 2)") diagnosed nothing.
 #[test]
 fn standalone_output_write_failure_names_path_and_exits_2() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("create tempdir");
     let cwd = tmp.path();
     let purl = "pkg:cargo/serde@1.0.0";
 
