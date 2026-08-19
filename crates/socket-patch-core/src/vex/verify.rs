@@ -158,7 +158,12 @@ pub async fn applied_patches_with_vendor(
 /// zero-file record offers nothing to hash, so — per the module's
 /// "omit when unconfirmed" contract — it is reported as `no_files` and
 /// dropped from the VEX document rather than vacuously attested.
-async fn verify_patch_record(pkg_path: &Path, record: &PatchRecord) -> Result<(), String> {
+///
+/// `pub`: this is the ONE "is this installed tree patched?" oracle — the
+/// CLI's gem stale-install probe (`scan --mode hosted`) reuses it rather
+/// than growing a second copy of the all-files-AlreadyPatched + zero-file
+/// semantics that would inevitably drift.
+pub async fn verify_patch_record(pkg_path: &Path, record: &PatchRecord) -> Result<(), String> {
     if record.files.is_empty() {
         return Err("no_files".to_string());
     }
