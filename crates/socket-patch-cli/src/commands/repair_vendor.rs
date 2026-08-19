@@ -15,12 +15,17 @@
 //! from the lockfile path itself (the contract's uuid-in-path rule), the
 //! record from the manifest (or the patch API, yielding a detached entry),
 //! and a fresh ledger entry is re-synthesized so sweep/GC/revert know the
-//! artifact again. WIRING reconstruction is per-ecosystem: gem recognizes
+//! artifact again — stamped with the npm lockfile FLAVOR the reference was
+//! found in, so a later `vendor --revert` routes to the backend whose
+//! unwired-revert guard probes the right lockfile. WIRING reconstruction is
+//! per-ecosystem: gem recognizes
 //! its own Gemfile/lock wiring and rebuilds full revert-capable records
 //! ([`socket_patch_core::vendor::gem::reconstruct_gem_wiring`]); the other
 //! ecosystems' pre-vendor originals are registry integrity material no
 //! offline source can reproduce, so their entries keep empty wiring and the
-//! gap is surfaced loudly (`vendor_wiring_unknown`) — a gem `--revert` of
+//! gap is surfaced loudly (`vendor_wiring_unknown`, riding the envelope's
+//! run-level `warnings[]` — the entry itself repaired fine, so it must not
+//! ride `events[]` as a `skipped` consumers count) — a gem `--revert` of
 //! such an entry refuses instead of stranding the pair edit. Existing gem
 //! entries with EMPTY wiring (persisted by pre-reconstruction repairs) are
 //! backfilled the same way during the ledger-driven pass while healthy.
@@ -46,7 +51,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use socket_patch_core::api::client::get_api_client_with_overrides;
+use socket_patch_core::api::client::{get_api_client_with_overrides, ApiClient};
 use socket_patch_core::crawlers::CrawlerOptions;
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
 use socket_patch_core::patch::copy_tree::remove_tree;
@@ -68,7 +73,7 @@ use crate::commands::vendor::{
     record_warning, PristineFetch,
 };
 use crate::ecosystem_dispatch::{find_packages_for_purls, partition_purls};
-use crate::json_envelope::{Envelope, PatchAction, PatchEvent};
+use crate::json_envelope::{Envelope, PatchAction, PatchEvent, RunWarning};
 
 /// One broken vendored unit queued for rebuild.
 struct Candidate {
@@ -181,6 +186,69 @@ fn synth_entry(eco: &str, uuid: &str, artifact_path: &str, base_purl: &str) -> V
     }
 }
 
+/// The npm lockfile FLAVOR whose lock carries the
+/// `.socket/vendor/npm/<uuid>/` reference, for stamping onto a
+/// re-synthesized ledger entry. The strings are `VendorEntry::flavor`'s
+/// stable vocabulary (guarded by npm_flavor's `flavor_strings_are_stable`
+/// test). Stamping matters: `revert_npm_any` routes by flavor, and each
+/// backend's unwired-revert guard probes ITS OWN lockfile — a
+/// pnpm-reconstructed entry left at flavor-None would be guarded against
+/// package-lock.json instead of pnpm-lock.yaml. Locks are checked in the
+/// vendor router's own precedence order (bun > pnpm > yarn > npm) for the
+/// pathological multi-lock case; content sniffs mirror
+/// `detect_npm_lock_flavor` (crate-private to core, so re-derived here).
+/// `None` when genuinely unknowable — no recognizable lock carries the
+/// reference, or the referencing lock's grammar is unrecognized — which
+/// routes to the package-lock backend, whose guard also fails closed on
+/// unwired entries.
+async fn detect_reference_flavor(project_root: &Path, eco: &str, uuid: &str) -> Option<String> {
+    if eco != "npm" {
+        return None;
+    }
+    let needle = format!(".socket/vendor/npm/{uuid}/");
+    let read = |name: &'static str| async move {
+        tokio::fs::read_to_string(project_root.join(name))
+            .await
+            .ok()
+    };
+    if read("bun.lock").await.is_some_and(|t| t.contains(&needle)) {
+        return Some("bun".to_string());
+    }
+    if let Some(text) = read("pnpm-lock.yaml").await {
+        if text.contains(&needle) {
+            // Same version allowlist as core's `sniff_lock_grammar`.
+            return match text
+                .lines()
+                .find_map(|l| l.strip_prefix("lockfileVersion:"))
+                .map(|v| v.trim().trim_matches(['\'', '"']))
+            {
+                Some("9.0") => Some("pnpm".to_string()),
+                Some("5.4") | Some("6.0") => Some("pnpm-legacy".to_string()),
+                _ => None,
+            };
+        }
+    }
+    if let Some(text) = read("yarn.lock").await {
+        if text.contains(&needle) {
+            // Same head sniff as core's `sniff_yarn_lock`; berry wins.
+            let head: Vec<&str> = text.lines().take(30).collect();
+            return if head.iter().any(|l| l.starts_with("__metadata:")) {
+                Some("yarn-berry".to_string())
+            } else if head.iter().any(|l| l.trim() == "# yarn lockfile v1") {
+                Some("yarn-classic".to_string())
+            } else {
+                None
+            };
+        }
+    }
+    for name in ["npm-shrinkwrap.json", "package-lock.json"] {
+        if read(name).await.is_some_and(|t| t.contains(&needle)) {
+            return Some("package-lock".to_string());
+        }
+    }
+    None
+}
+
 /// What wiring a re-synthesized ledger entry could recover.
 enum WiringReconstruction {
     /// The backend recognized its own wiring in the live project files:
@@ -259,6 +327,22 @@ fn soft_restore_without_fingerprint(
     );
 }
 
+/// `vendor_wiring_unknown` advises about what a FUTURE `vendor --revert`
+/// can restore — the entry itself was restored/verified fine, so the
+/// advisory rides the envelope's run-level `warnings[]` (the documented
+/// carrier for non-fatal advisories) rather than a per-purl `skipped`
+/// event, which consumers count as work not done. The purl is baked into
+/// `detail` by the callers so attribution survives the run-level move.
+fn warn_wiring_unknown(env: &mut Envelope, common: &GlobalArgs, detail: String) {
+    if !common.silent && !common.json {
+        eprintln!("Warning (vendor_wiring_unknown): {detail}");
+    }
+    env.warnings.push(RunWarning {
+        code: "vendor_wiring_unknown".to_string(),
+        detail,
+    });
+}
+
 /// Best-effort removal of a vendored uuid dir — ahead of a rebuild (corrupt
 /// bytes must never blend into one) or after a failed post-verify (never
 /// leave unverifiable bytes behind).
@@ -296,6 +380,9 @@ pub(crate) async fn repair_vendored_artifacts(
     };
 
     // ── Pass 1: ledger-driven health check ───────────────────────────────
+    // Shared across both passes so the API client (and its one-time
+    // token-shape stderr advisory) is constructed at most once per run.
+    let mut api_client: Option<ApiClient> = None;
     let mut candidates: Vec<Candidate> = Vec::new();
     let mut ledger_purls: Vec<String> = state.entries.keys().cloned().collect();
     ledger_purls.sort();
@@ -321,23 +408,25 @@ pub(crate) async fn repair_vendored_artifacts(
             }
             // Non-detached entry with no manifest at all: recover the
             // record from the API below, like a reconstruction.
-            (None, None) => match fetch_record_by_uuid(common, &entry.uuid).await {
-                Some((_, r)) => r,
-                None => {
-                    fail(
-                        env,
-                        quiet,
-                        purl,
-                        "vendor_artifact_unrepairable",
-                        format!(
-                            "no manifest record for patch {} and the patch view could not \
+            (None, None) => {
+                match fetch_record_by_uuid(common, &mut api_client, &entry.uuid).await {
+                    Some((_, r)) => r,
+                    None => {
+                        fail(
+                            env,
+                            quiet,
+                            purl,
+                            "vendor_artifact_unrepairable",
+                            format!(
+                                "no manifest record for patch {} and the patch view could not \
                              be fetched (offline or API failure)",
-                            entry.uuid
-                        ),
-                    );
-                    continue;
+                                entry.uuid
+                            ),
+                        );
+                        continue;
+                    }
                 }
-            },
+            }
         };
         if record.uuid != entry.uuid {
             env.record(
@@ -422,19 +511,16 @@ pub(crate) async fn repair_vendored_artifacts(
                             rebuilt += 1;
                         }
                         Err(detail) => {
-                            record_warning(
+                            warn_wiring_unknown(
                                 env,
-                                purl,
-                                &VendorWarning::new(
-                                    "vendor_wiring_unknown",
-                                    format!(
-                                        "the ledger entry records no pre-vendor wiring \
-                                         originals and they cannot be reconstructed from \
-                                         the live files ({detail}); `vendor --revert` \
-                                         cannot restore the project files for this entry"
-                                    ),
-                                ),
                                 common,
+                                format!(
+                                    "the ledger entry for {} records no pre-vendor wiring \
+                                     originals and they cannot be reconstructed from the \
+                                     live files ({detail}); `vendor --revert` cannot \
+                                     restore the project files for this entry",
+                                    normalize_purl(purl)
+                                ),
                             );
                         }
                     }
@@ -492,7 +578,7 @@ pub(crate) async fn repair_vendored_artifacts(
         let (purl, record, detached) =
             match manifest.and_then(|m| m.patches.iter().find(|(_, r)| r.uuid == uuid)) {
                 Some((p, r)) => (p.clone(), r.clone(), false),
-                None => match fetch_record_by_uuid(common, &uuid).await {
+                None => match fetch_record_by_uuid(common, &mut api_client, &uuid).await {
                     Some((purl, r)) => (purl, r, true),
                     None => {
                         fail(
@@ -512,6 +598,11 @@ pub(crate) async fn repair_vendored_artifacts(
                 },
             };
         let mut entry = synth_entry(&eco, &uuid, &relpath, strip_purl_qualifiers(&purl));
+        // Stamp the flavor the reference was found in (knowable right here:
+        // the scan above read specific lockfiles), so `vendor --revert`
+        // routes to the backend whose unwired-revert guard probes the RIGHT
+        // lockfile. Genuinely unknowable stays None (guarded fallback).
+        entry.flavor = detect_reference_flavor(&common.cwd, &eco, &uuid).await;
         entry.detached = detached;
         if detached {
             entry.record = Some(record.clone());
@@ -528,18 +619,15 @@ pub(crate) async fn repair_vendored_artifacts(
                 }
             }
             WiringReconstruction::Unknown(detail) => {
-                record_warning(
+                warn_wiring_unknown(
                     env,
-                    &purl,
-                    &VendorWarning::new(
-                        "vendor_wiring_unknown",
-                        format!(
-                            "the ledger entry was reconstructed without pre-vendor wiring \
-                             originals ({detail}); `vendor --revert` cannot restore the \
-                             project files for this entry"
-                        ),
-                    ),
                     common,
+                    format!(
+                        "the ledger entry for {} was reconstructed without pre-vendor \
+                         wiring originals ({detail}); `vendor --revert` cannot restore \
+                         the project files for this entry",
+                        normalize_purl(&purl)
+                    ),
                 );
             }
         }
@@ -716,15 +804,14 @@ pub(crate) async fn repair_vendored_artifacts(
         }
     }
 
-    // ── Corrupt artifacts are deleted first ──────────────────────────────
-    // The backends' wired hot paths rebuild on MISSING; turning corrupt
-    // into missing gives every ecosystem one uniform rebuild trigger (and
-    // never leaves tampered bytes to be blended into a rebuild).
-    for c in &candidates {
-        if c.reason == "vendor_artifact_corrupt" {
-            remove_vendor_dir(&common.cwd, &c.entry.ecosystem, &c.entry.uuid).await;
-        }
-    }
+    // NOTE: corrupt artifacts are NOT deleted here. Deletion waits until
+    // the rebuild loop below, where the patch sources and a pristine
+    // package source are both in hand — see the comment there. Destroying
+    // the corrupt copy before the rebuild-source ladder runs would, on any
+    // no-source outcome (--offline, node_modules gone, fetch failure),
+    // convert a corrupt-but-diagnosable integrity-mismatch state into a
+    // bare ENOENT on the next install (the lock still points at the
+    // artifact) and erase the forensic evidence of the tamper.
 
     // ── Patch content (in memory, like all vendor flows) ────────────────
     let records_map: HashMap<String, PatchRecord> = candidates
@@ -947,13 +1034,19 @@ pub(crate) async fn repair_vendored_artifacts(
         let Some(pkg_path) = all_packages.get(&c.purl).cloned() else {
             continue; // failed above
         };
-        if c.soft {
-            // The healthy-by-members live tree is exactly what cannot be
-            // trusted; with a pristine source secured, clear it so the
-            // backend's wired hot path materialises a fresh copy — the
-            // fingerprint below then derives from the member-verified
-            // rebuild, never the live bytes. (Deleted only now, after the
-            // patch sources and the pristine source are both in hand.)
+        // Clear the live uuid dir only NOW — the patch sources and the
+        // pristine source are both in hand, so a rebuild WILL replace it.
+        // The backends' wired hot paths rebuild on MISSING (one uniform
+        // trigger for every ecosystem), and the live bytes must never
+        // blend into the rebuild:
+        //  - corrupt: the recorded fingerprint already condemned them;
+        //  - soft: the healthy-by-members live tree is exactly what cannot
+        //    be trusted — the fingerprint below derives from the
+        //    member-verified rebuild, never the live bytes.
+        // Deleting any earlier destroys evidence: with no rebuild source
+        // the corrupt copy is all a human has left to diagnose (and the
+        // lock still points at it — see the NOTE above the staging step).
+        if c.soft || c.reason == "vendor_artifact_corrupt" {
             remove_vendor_dir(&common.cwd, &c.entry.ecosystem, &c.entry.uuid).await;
         }
         // For an unverified-source rebuild the rewired lockfile is the trust
@@ -1210,12 +1303,29 @@ async fn fill_artifact_fingerprint(project_root: &Path, entry: &mut VendorEntry)
 }
 
 /// Fetch one patch view by uuid (proxy-aware) and shape it as a manifest
-/// record; `None` offline or on any API failure.
-async fn fetch_record_by_uuid(common: &GlobalArgs, uuid: &str) -> Option<(String, PatchRecord)> {
+/// record; `None` offline or on any API failure. `client_cache` holds the
+/// one API client the whole vendored-artifact phase shares — construction
+/// re-prints the token-shape stderr advisory, so N uuid lookups must not
+/// print it N times. Built lazily: a run with nothing to look up never
+/// constructs (or warns) at all.
+async fn fetch_record_by_uuid(
+    common: &GlobalArgs,
+    client_cache: &mut Option<ApiClient>,
+    uuid: &str,
+) -> Option<(String, PatchRecord)> {
     if common.offline {
         return None;
     }
-    let (client, _) = get_api_client_with_overrides(common.api_client_overrides()).await;
+    if client_cache.is_none() {
+        *client_cache = Some(
+            get_api_client_with_overrides(common.api_client_overrides())
+                .await
+                .0,
+        );
+    }
+    let client = client_cache
+        .as_ref()
+        .expect("client_cache was just initialized above");
     let patch = client
         .fetch_patch(common.org.as_deref(), uuid)
         .await
@@ -1282,6 +1392,105 @@ mod tests {
             refs[0].2.ends_with("left-pad-1.3.0.tgz"),
             "trailing colon must be cut: {refs:?}"
         );
+    }
+
+    /// The reconstruction stamps [`VendorEntry::flavor`] from whichever
+    /// lockfile carries the vendored reference, so `vendor --revert` routes
+    /// to the backend whose unwired-revert guard probes the RIGHT lockfile.
+    /// The strings must stay npm_flavor's stable vocabulary; unknowable
+    /// shapes stay `None` (the guarded package-lock fallback route).
+    #[tokio::test]
+    async fn detect_reference_flavor_maps_referencing_lock_to_stable_flavor() {
+        let uuid = "11111111-1111-4111-8111-111111111111";
+        let mention = format!("resolved: file:.socket/vendor/npm/{uuid}/left-pad-1.3.0.tgz\n");
+        let case = |files: Vec<(&'static str, String)>, want: Option<&'static str>| async move {
+            let tmp = tempfile::tempdir().unwrap();
+            for (name, text) in &files {
+                tokio::fs::write(tmp.path().join(name), text).await.unwrap();
+            }
+            assert_eq!(
+                detect_reference_flavor(tmp.path(), "npm", uuid).await,
+                want.map(str::to_string),
+                "files: {:?}",
+                files.iter().map(|(n, _)| n).collect::<Vec<_>>()
+            );
+        };
+
+        // Each flavor's lock, referenced → its stable string.
+        case(
+            vec![("package-lock.json", mention.clone())],
+            Some("package-lock"),
+        )
+        .await;
+        case(
+            vec![("npm-shrinkwrap.json", mention.clone())],
+            Some("package-lock"),
+        )
+        .await;
+        case(
+            vec![(
+                "pnpm-lock.yaml",
+                format!("lockfileVersion: '9.0'\n{mention}"),
+            )],
+            Some("pnpm"),
+        )
+        .await;
+        case(
+            vec![("pnpm-lock.yaml", format!("lockfileVersion: 5.4\n{mention}"))],
+            Some("pnpm-legacy"),
+        )
+        .await;
+        case(
+            vec![(
+                "pnpm-lock.yaml",
+                format!("lockfileVersion: '6.0'\n{mention}"),
+            )],
+            Some("pnpm-legacy"),
+        )
+        .await;
+        case(
+            vec![("yarn.lock", format!("# yarn lockfile v1\n{mention}"))],
+            Some("yarn-classic"),
+        )
+        .await;
+        case(
+            vec![("yarn.lock", format!("__metadata:\n  version: 8\n{mention}"))],
+            Some("yarn-berry"),
+        )
+        .await;
+        case(vec![("bun.lock", mention.clone())], Some("bun")).await;
+
+        // Unknowable stays None: unrecognized grammars, or no referencing
+        // lock at all (an unreferenced lock must not claim the entry).
+        case(
+            vec![("pnpm-lock.yaml", format!("lockfileVersion: 5.3\n{mention}"))],
+            None,
+        )
+        .await;
+        case(vec![("yarn.lock", mention.clone())], None).await;
+        case(
+            vec![("package-lock.json", "no reference here".to_string())],
+            None,
+        )
+        .await;
+        case(vec![], None).await;
+
+        // The referencing lock wins over an unreferenced sibling.
+        case(
+            vec![
+                ("package-lock.json", "no reference here".to_string()),
+                ("yarn.lock", format!("# yarn lockfile v1\n{mention}")),
+            ],
+            Some("yarn-classic"),
+        )
+        .await;
+
+        // Non-npm ecosystems never carry an npm flavor.
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(tmp.path().join("package-lock.json"), &mention)
+            .await
+            .unwrap();
+        assert_eq!(detect_reference_flavor(tmp.path(), "gem", uuid).await, None);
     }
 
     /// `base_purl` is stored VERBATIM percent-encoded (`pkg:npm/%40scope/…`,

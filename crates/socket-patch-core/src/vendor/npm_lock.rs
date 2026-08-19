@@ -368,6 +368,78 @@ pub async fn vendor_npm(
     done(result, Some(entry), warnings)
 }
 
+/// FAIL-CLOSED revert guard for a ledger entry with NO wiring records,
+/// shared by the four TEXTUAL npm-family backends (npm / yarn classic /
+/// yarn berry / bun) — the flavor-parameterized sibling of
+/// [`super::pnpm_lock::guard_unwired_revert`].
+///
+/// Such entries come out of `repair`'s no-ledger reconstruction (the
+/// npm-family pre-vendor lock fragments are not offline-recoverable, so the
+/// restored entry carries empty wiring). Revert has nothing to replay for
+/// them — it cannot un-wire the lock — so removing the artifact while the
+/// lockfile still resolves through it bricks every subsequent install
+/// (ENOENT on the missing `file:` tarball), and used to do so silently.
+/// The in-use probe is textual and EXACT for these flavors (the uuid dir
+/// path appears iff some resolution still points at the artifact — see
+/// [`super::npm_flavor::vendored_entry_in_use`]), over `lock_names` in the
+/// caller's own precedence order (npm: shrinkwrap wins). Mentioned ⇒
+/// refuse; readable and provably absent ⇒ `None`, the caller's removal
+/// proceeds unchanged; no readable lock ⇒ refuse, fail-closed (it may still
+/// resolve through the artifact) UNLESS no lock file exists at all — a
+/// missing lock cannot reference the artifact, matching the wired revert's
+/// own missing-lock tolerance.
+pub(super) async fn guard_unwired_textual_revert(
+    project_root: &Path,
+    entry_uuid: &str,
+    uuid_dir_rel: &str,
+    lock_names: &[&str],
+) -> Option<RevertOutcome> {
+    let locks = lock_names.join("/");
+    let mentioned =
+        super::npm_flavor::lock_text_mentions_uuid(project_root, lock_names, entry_uuid).await;
+    let clause = match mentioned {
+        Some(false) => return None,
+        Some(true) => format!("{locks} still resolves through it"),
+        None => {
+            let mut unreadable = None;
+            for name in lock_names {
+                match tokio::fs::try_exists(project_root.join(name)).await {
+                    Ok(false) => {}
+                    // Fail-closed: a lock we cannot read may still resolve
+                    // through the artifact.
+                    _ => {
+                        unreadable = Some(*name);
+                        break;
+                    }
+                }
+            }
+            // No lock file at all: nothing can reference the artifact.
+            let name = unreadable?;
+            format!("{name} exists but could not be read to prove it no longer references it")
+        }
+    };
+    let detail = format!(
+        "refusing to remove {uuid_dir_rel}: the ledger entry records no pre-vendor wiring to \
+         replay (it was likely reconstructed by `socket-patch repair`; the npm-family \
+         pre-vendor lock fragments are not offline-recoverable) and {clause} — deleting the \
+         artifact would make every subsequent install fail; run `socket-patch repair` to keep \
+         the vendored artifact healthy, and revert by restoring the pre-vendor {locks} (or by \
+         removing the dependency and re-locking) before re-running `vendor --revert`"
+    );
+    Some(RevertOutcome {
+        success: false,
+        warnings: vec![VendorWarning::new(
+            "vendor_wiring_unknown_revert_blocked",
+            detail.clone(),
+        )],
+        error: Some(detail),
+        // Refusal, not a drift-skip: `kept_artifact` is never set on
+        // failure (the entry and artifact survive because the whole
+        // revert is blocked, not counted as a Skipped keep).
+        kept_artifact: false,
+    })
+}
+
 /// Undo one vendored npm package: restore the recorded lock fragments and
 /// remove the artifact dir.
 pub async fn revert_npm(entry: &VendorEntry, project_root: &Path, dry_run: bool) -> RevertOutcome {
@@ -379,6 +451,23 @@ pub async fn revert_npm(entry: &VendorEntry, project_root: &Path, dry_run: bool)
         Ok(d) => d,
         Err(outcome) => return outcome,
     };
+    // Nothing to replay (a `repair`-reconstructed entry): the artifact may
+    // only be removed when the lock provably no longer resolves through it —
+    // otherwise refuse, fail-closed, instead of silently bricking installs.
+    // Runs before the dry-run return so a preview never advertises a revert
+    // the wet run refuses (same precedent as the uuid guard above).
+    if entry.wiring.is_empty() {
+        if let Some(blocked) = guard_unwired_textual_revert(
+            project_root,
+            &entry.uuid,
+            &uuid_dir_rel,
+            &[SHRINKWRAP, PACKAGE_LOCK],
+        )
+        .await
+        {
+            return blocked;
+        }
+    }
     if dry_run {
         return RevertOutcome::ok();
     }
@@ -2070,6 +2159,105 @@ mod tests {
                 .exists(),
             "artifact pruned once the revert converges"
         );
+    }
+
+    // ── empty-wiring (reconstructed) revert guard ──────────────────────────
+    // Same brick as the pnpm backends' (empirically confirmed 2026-08-18):
+    // a `repair`-reconstructed entry carries no wiring records; revert used
+    // to remove the artifact dir unconditionally, leaving the lock resolving
+    // through a deleted tarball — every later `npm ci` failed ENOENT, and
+    // nothing said so.
+
+    /// Reshape a vendored entry into what `repair`'s no-ledger
+    /// reconstruction persists: same uuid/artifact, EMPTY wiring.
+    async fn reconstructed_fixture() -> (Fixture, VendorEntry) {
+        let fx = fixture().await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let mut entry = entry.unwrap();
+        entry.wiring.clear();
+        (fx, entry)
+    }
+
+    /// With nothing to replay, revert must refuse (fail-closed) while the
+    /// lock still resolves through the artifact — in the dry-run preview
+    /// too (never advertise a revert the wet run refuses).
+    #[tokio::test]
+    async fn empty_wiring_revert_refuses_while_lock_resolves_through_artifact() {
+        let (fx, entry) = reconstructed_fixture().await;
+        let tgz_path = fx.root().join(fx.expected_rel_tgz());
+        let lock_vendored = tokio::fs::read(fx.lock_path()).await.unwrap();
+
+        for dry_run in [true, false] {
+            let outcome = revert_npm(&entry, fx.root(), dry_run).await;
+            assert!(!outcome.success, "dry_run={dry_run}: must refuse");
+            let err = outcome.error.as_deref().unwrap_or_default();
+            assert!(err.contains("socket-patch repair"), "{err}");
+            assert!(
+                outcome
+                    .warnings
+                    .iter()
+                    .any(|w| w.code == "vendor_wiring_unknown_revert_blocked"),
+                "{:?}",
+                outcome.warnings
+            );
+            assert!(tgz_path.exists(), "the artifact must survive the refusal");
+            assert_eq!(
+                tokio::fs::read(fx.lock_path()).await.unwrap(),
+                lock_vendored,
+                "lock untouched"
+            );
+        }
+    }
+
+    /// The flip side: when the lock provably no longer resolves through the
+    /// artifact (re-locked away from it), the empty-wiring revert keeps its
+    /// pre-guard behavior and removes the genuinely orphaned artifact —
+    /// replaying nothing. A shrinkwrap wins the probe like it wins installs:
+    /// an uuid mention left behind in package-lock.json does not block.
+    #[tokio::test]
+    async fn empty_wiring_revert_removes_a_genuinely_orphaned_artifact() {
+        let (fx, entry) = reconstructed_fixture().await;
+        // npm installs from the shrinkwrap when both exist; the pre-vendor
+        // one carries no uuid reference while package-lock.json still does.
+        tokio::fs::write(fx.root().join(SHRINKWRAP), &fx.lock_bytes)
+            .await
+            .unwrap();
+        let lock_vendored = tokio::fs::read(fx.lock_path()).await.unwrap();
+
+        let outcome = revert_npm(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(
+            !fx.root()
+                .join(format!(".socket/vendor/npm/{UUID}"))
+                .exists(),
+            "orphaned artifact dir removed"
+        );
+        assert_eq!(
+            tokio::fs::read(fx.lock_path()).await.unwrap(),
+            lock_vendored,
+            "empty wiring replays nothing"
+        );
+    }
+
+    /// Undeterminable lock (present but unreadable — not UTF-8): fail
+    /// closed — it may still resolve through the artifact. A lock that is
+    /// absent altogether cannot reference anything, so removal proceeds.
+    #[tokio::test]
+    async fn empty_wiring_revert_fails_closed_on_unreadable_lock() {
+        let (fx, entry) = reconstructed_fixture().await;
+        let tgz_path = fx.root().join(fx.expected_rel_tgz());
+
+        tokio::fs::write(fx.lock_path(), [0xff, 0xfe, b'x'])
+            .await
+            .unwrap();
+        let outcome = revert_npm(&entry, fx.root(), false).await;
+        assert!(!outcome.success, "unreadable-lock revert must refuse");
+        assert!(tgz_path.exists());
+
+        tokio::fs::remove_file(fx.lock_path()).await.unwrap();
+        let outcome = revert_npm(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(!tgz_path.exists(), "no lock, no reference: removal is safe");
     }
 
     #[tokio::test]

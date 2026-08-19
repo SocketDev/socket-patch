@@ -430,6 +430,9 @@ pub async fn run(args: VendorArgs) -> i32 {
                             path: vex_path.display().to_string(),
                             statements: summary.statements,
                             format: "openvex-0.2.0".to_string(),
+                            // note_warning suppressed these on stderr under
+                            // --json; the envelope copy is their only
+                            // surviving channel.
                             warnings: summary.warnings,
                         });
                     }
@@ -544,6 +547,13 @@ async fn run_vendor(
     .await;
 
     if has_errors {
+        // A run where EVERY event failed still reads as "partialFailure":
+        // the envelope has no "completed with zero successes" status, and
+        // status=error is reserved for pre-event failures (it implies a
+        // top-level error payload and empty events[] — see json_envelope.rs).
+        // Escalating here without an envelope-level API broke that contract,
+        // and scan --vendor / vendor --revert report the same outcome as
+        // partialFailure, so this stays aligned with them.
         env.mark_partial_failure();
         1
     } else {
@@ -687,6 +697,11 @@ pub(crate) async fn vendor_records(
     service: Option<&VendorServiceConfig>,
 ) -> bool {
     let mut has_errors = false;
+    // Lockfile flavors the backends wired THIS run (from the returned ledger
+    // entries, not the whole ledger — an old pnpm entry must not re-flavor
+    // the hints of a run that vendored only cargo). Drives the human
+    // committable-files + reinstall hints below.
+    let mut wired_flavors: HashSet<String> = HashSet::new();
     let manifest_purls: Vec<String> = records.keys().cloned().collect();
     let partitioned = partition_purls(&manifest_purls, common.ecosystems.as_deref());
 
@@ -1208,6 +1223,9 @@ pub(crate) async fn vendor_records(
                         record_warning(env, candidate, w, common);
                     }
                     if let Some(entry) = entry {
+                        if let Some(flavor) = entry.flavor.as_deref() {
+                            wired_flavors.insert(flavor.to_string());
+                        }
                         has_errors |= persist_vendor_entry(
                             common, env, &mut state, candidate, entry, detached, record,
                         )
@@ -1248,11 +1266,16 @@ pub(crate) async fn vendor_records(
             HashSet::new()
         };
         for purl in &unmatched {
+            // Honesty order: every purl here is first and foremost a crawler
+            // miss — nothing on disk matched — so the on-disk cause leads.
+            // The --offline note is strictly secondary and only stated when
+            // it is actually what blocked the fallback (the lockfile resolves
+            // the package, so a non-offline run would have auto-fetched it).
             let detail = if lock_resolvable.contains(purl) {
-                "no installed package found; --offline prevents fetching it from the \
-                 registry (the lockfile resolves it)"
+                "no installed package found on disk; the lockfile resolves it, but \
+                 --offline prevents fetching the pristine artifact from the registry"
             } else {
-                "no installed package found"
+                "no installed package found on disk"
             };
             env.record(
                 PatchEvent::new(PatchAction::Skipped, purl.clone())
@@ -1275,13 +1298,57 @@ pub(crate) async fn vendor_records(
             env.summary.applied, env.summary.skipped, env.summary.failed
         );
         if env.summary.applied > 0 && !common.dry_run {
-            println!(
-                "Commit .socket/vendor/ and the updated lockfiles to make the patches portable."
-            );
+            // pnpm >=11 reads `overrides` ONLY from pnpm-workspace.yaml (the
+            // package.json `pnpm.overrides` mirror is ignored), so pnpm-wired
+            // runs must name that file among the committables: a checkout
+            // that loses it silently unvendors on the next install.
+            if wired_flavors.contains("pnpm") {
+                println!(
+                    "Commit .socket/vendor/, package.json, pnpm-lock.yaml, and \
+                     pnpm-workspace.yaml to make the patches portable (pnpm >=11 reads \
+                     the vendored override only from pnpm-workspace.yaml)."
+                );
+            } else {
+                println!(
+                    "Commit .socket/vendor/ and the updated lockfiles to make the patches \
+                     portable."
+                );
+            }
+            let mut installs: Vec<&str> = wired_flavors
+                .iter()
+                .filter_map(|f| flavor_install_command(f))
+                .collect();
+            installs.sort_unstable();
+            for cmd in installs {
+                println!(
+                    "Run `{cmd}` to update the installed tree — vendoring rewires the \
+                     lockfile only, so the current node_modules keeps the unpatched bytes \
+                     until reinstalled."
+                );
+            }
         }
     }
 
     has_errors
+}
+
+/// The install command that re-materializes the project tree from the wired
+/// lockfile, per npm-family flavor. Vendoring edits ONLY the lockfile/config
+/// wiring — the already-installed node_modules keeps its pre-vendor bytes
+/// until the package manager reinstalls from the rewired lock (verified
+/// against real pnpm installs) — so a successful vendor must say how to
+/// update it. `None` for flavors whose consuming step is not an install.
+fn flavor_install_command(flavor: &str) -> Option<&'static str> {
+    match flavor {
+        "package-lock" => Some("npm install"),
+        "yarn-classic" | "yarn-berry" => Some("yarn install"),
+        // pnpm-legacy (lockfileVersion 5.4/6.0): plain `pnpm install` is also
+        // the moved-checkout recovery — pnpm <= 8 absolutizes file: override
+        // specifiers, so `--frozen-lockfile` only passes at the vendoring path.
+        "pnpm" | "pnpm-legacy" => Some("pnpm install"),
+        "bun" => Some("bun install"),
+        _ => None,
+    }
 }
 
 /// Ledger entries whose patch is gone from the manifest — the stale test
@@ -2047,12 +2114,27 @@ mod gc_tests {
     }
 
     /// (a) the patch is gone from the manifest: revert + drop the entry.
+    ///
+    /// The fixture entry carries EMPTY wiring (a synthetic ledger, not a
+    /// vendor-produced one), so the lock must no longer resolve through
+    /// the artifact for the revert to proceed: the unwired-revert guard
+    /// refuses to delete an artifact a live lock still points at (the
+    /// repair-reconstruction brick; pinned end-to-end in
+    /// repair_vendor_e2e / repair_vendor_flavors_e2e). Re-lock the
+    /// fixture to the registry — the realistic reclaim shape.
     #[tokio::test]
     async fn vendor_gc_reverts_manifest_dropped_entry() {
         let (tmp, common, manifest_path) = gc_fixture(false).await;
         write_manifest(&manifest_path, &PatchManifest::new())
             .await
             .unwrap();
+        tokio::fs::write(
+            tmp.path().join("package-lock.json"),
+            "{\"packages\":{\"node_modules/left-pad\":{\"resolved\":\
+             \"https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz\"}}}",
+        )
+        .await
+        .unwrap();
 
         let out = run_vendor_gc(&common, &manifest_path, false).await;
         assert_eq!(out.dropped_reverted, vec![PURL.to_string()], "{out:?}");

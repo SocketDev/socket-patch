@@ -79,9 +79,9 @@ const WS_SCAFFOLD_PACKAGES: [&str; 2] = ["packages:", "  - '.'"];
 const SUPPORTED_LOCK_VERSION: &str = "9.0";
 
 /// Wiring kinds (the `WiringRecord.kind` discriminators this backend owns).
-const KIND_PKG_OVERRIDE: &str = "pnpm_pkg_override";
+pub(super) const KIND_PKG_OVERRIDE: &str = "pnpm_pkg_override";
 const KIND_WS_OVERRIDE: &str = "pnpm_ws_override";
-const KIND_LOCK_OVERRIDES: &str = "pnpm_lock_overrides";
+pub(super) const KIND_LOCK_OVERRIDES: &str = "pnpm_lock_overrides";
 const KIND_LOCK_IMPORTER_DEP: &str = "pnpm_lock_importer_dep";
 const KIND_LOCK_PACKAGE: &str = "pnpm_lock_package";
 const KIND_LOCK_SNAPSHOT: &str = "pnpm_lock_snapshot";
@@ -194,8 +194,7 @@ pub async fn vendor_pnpm(
     if let Err(detail) = check_lock_override(&lines, name, version, &effective_key) {
         return refused("vendor_override_conflict", detail);
     }
-    if let Err(detail) =
-        check_workspace_override(ws_text.as_deref(), name, version, &effective_key)
+    if let Err(detail) = check_workspace_override(ws_text.as_deref(), name, version, &effective_key)
     {
         return refused("vendor_override_conflict", detail);
     }
@@ -282,11 +281,11 @@ pub async fn vendor_pnpm(
     // The pnpm >= 11 override surface. Mirrors the package.json override
     // key-for-key so whichever surface the installed pnpm reads matches the
     // lock's `overrides:` section.
-    let ws_edit = match apply_workspace_override(ws_text.as_deref(), &effective_key, &spec, &mut wiring)
-    {
-        Ok(edit) => edit,
-        Err(e) => return done_failure(purl, format!("{PNPM_WORKSPACE} surgery failed: {e}")),
-    };
+    let ws_edit =
+        match apply_workspace_override(ws_text.as_deref(), &effective_key, &spec, &mut wiring) {
+            Ok(edit) => edit,
+            Err(e) => return done_failure(purl, format!("{PNPM_WORKSPACE} surgery failed: {e}")),
+        };
 
     if !pkg_changed && !lock_changed && ws_edit.new_text.is_none() {
         // Everything already carries this uuid + the packed integrity: the
@@ -402,6 +401,60 @@ pub async fn pnpm_entry_in_use(entry: &VendorEntry, project_root: &Path) -> Opti
     Some(false)
 }
 
+/// FAIL-CLOSED revert guard for a ledger entry with NO wiring records,
+/// shared by both pnpm backends.
+///
+/// Such entries come out of `repair`'s no-ledger reconstruction (the
+/// npm-family pre-vendor lock fragments are not offline-recoverable, so the
+/// restored entry carries empty wiring). Revert has nothing to replay for
+/// them — it cannot un-wire the lock — so removing the artifact while
+/// `pnpm-lock.yaml` still resolves through it bricks every subsequent
+/// install (ENOENT on the missing `file:` tarball), and used to do so
+/// silently. `in_use` is the calling backend's own lock probe result
+/// ([`pnpm_entry_in_use`] / its legacy twin): `Some(true)` refuses;
+/// `Some(false)` (provably orphaned) returns `None` and the caller's
+/// removal proceeds unchanged; undeterminable (`None`) refuses too UNLESS
+/// the lock is absent altogether — a missing lock cannot reference the
+/// artifact, matching the wired revert's own missing-lock tolerance.
+pub(super) async fn guard_unwired_revert(
+    project_root: &Path,
+    in_use: Option<bool>,
+    uuid_dir_rel: &str,
+) -> Option<RevertOutcome> {
+    let clause = match in_use {
+        Some(false) => return None,
+        Some(true) => format!("{PNPM_LOCK} still resolves through it"),
+        None => match tokio::fs::try_exists(project_root.join(PNPM_LOCK)).await {
+            Ok(false) => return None,
+            // Fail-closed: a lock we cannot read or parse may still
+            // resolve through the artifact.
+            _ => format!(
+                "{PNPM_LOCK} exists but could not be parsed to prove it no longer references it"
+            ),
+        },
+    };
+    let detail = format!(
+        "refusing to remove {uuid_dir_rel}: the ledger entry records no pre-vendor wiring to \
+         replay (it was likely reconstructed by `socket-patch repair`; pnpm's pre-vendor lock \
+         fragments are not offline-recoverable) and {clause} — deleting the artifact would make \
+         every subsequent install fail; run `socket-patch repair` to keep the vendored artifact \
+         healthy, and revert by restoring the pre-vendor {PNPM_LOCK}/{PACKAGE_JSON} (or by \
+         removing the override and re-locking) before re-running `vendor --revert`"
+    );
+    Some(RevertOutcome {
+        success: false,
+        warnings: vec![VendorWarning::new(
+            "vendor_wiring_unknown_revert_blocked",
+            detail.clone(),
+        )],
+        error: Some(detail),
+        // Refusal, not a drift-skip: `kept_artifact` is never set on
+        // failure (the entry and artifact survive because the whole
+        // revert is blocked, not counted as a Skipped keep).
+        kept_artifact: false,
+    })
+}
+
 /// Undo one pnpm-vendored package: restore the recorded pair fragments and
 /// remove the artifact dir. Reverse application order; per-record ownership
 /// is re-checked against the live fragment (drift ⇒ warning, left alone).
@@ -413,6 +466,17 @@ pub async fn revert_pnpm(entry: &VendorEntry, project_root: &Path, dry_run: bool
         Ok(d) => d,
         Err(outcome) => return outcome,
     };
+    // Nothing to replay (a `repair`-reconstructed entry): the artifact may
+    // only be removed when the lock provably no longer resolves through it —
+    // otherwise refuse, fail-closed, instead of silently bricking installs.
+    // Runs before the dry-run return so a preview never advertises a revert
+    // the wet run refuses (same precedent as the uuid guard above).
+    if entry.wiring.is_empty() {
+        let in_use = pnpm_entry_in_use(entry, project_root).await;
+        if let Some(blocked) = guard_unwired_revert(project_root, in_use, &uuid_dir_rel).await {
+            return blocked;
+        }
+    }
     if dry_run {
         return RevertOutcome::ok();
     }
@@ -573,7 +637,10 @@ pub async fn revert_pnpm(entry: &VendorEntry, project_root: &Path, dry_run: bool
         .find(|r| r.file == PNPM_WORKSPACE && r.kind == KIND_WS_OVERRIDE)
     {
         let (created_file, created_overrides) = match &entry.pnpm {
-            Some(meta) => (meta.created_workspace_file, meta.created_workspace_overrides),
+            Some(meta) => (
+                meta.created_workspace_file,
+                meta.created_workspace_overrides,
+            ),
             None => (false, false),
         };
         if let Err(e) = revert_workspace(
@@ -716,7 +783,11 @@ fn revert_ws_record(
         }
         match rec.original.as_ref().and_then(Value::as_str) {
             Some(orig) => {
-                lines[i] = format!("{}{}: {orig}", " ".repeat(indent), yaml_key_like(key, &repr));
+                lines[i] = format!(
+                    "{}{}: {orig}",
+                    " ".repeat(indent),
+                    yaml_key_like(key, &repr)
+                );
             }
             None => {
                 lines.remove(i);
@@ -813,7 +884,11 @@ impl EditCtx<'_> {
 // ─────────────────────────── pre-flight checks ───────────────────────────
 
 /// `lockfileVersion: '9.0'` head check (accept pnpm's single quotes plus
-/// double-quoted/bare spellings). Also serves as the flavor router's sniff.
+/// double-quoted/bare spellings) — the v9 BACKEND's own guard. The flavor
+/// router sniffs with [`super::pnpm_lock_legacy::sniff_lock_grammar`]
+/// instead, whose allowlist also routes the legacy 5.4/6.0 grammars to
+/// their backend; this check only fires if a non-9.0 lock reaches
+/// `vendor_pnpm` directly.
 pub(super) fn check_lock_version(text: &str) -> Result<(), String> {
     let version = text
         .lines()
@@ -822,10 +897,25 @@ pub(super) fn check_lock_version(text: &str) -> Result<(), String> {
         .map(|rest| rest.trim().trim_matches(['\'', '"']).to_string());
     match version {
         Some(v) if v == SUPPORTED_LOCK_VERSION => Ok(()),
-        Some(v) => Err(format!(
-            "{PNPM_LOCK} has lockfileVersion {v}; only {SUPPORTED_LOCK_VERSION} is \
-             supported — re-lock with pnpm >= 9"
-        )),
+        Some(v) => {
+            // The remedy must point the right way: 5.x (pnpm 7) / 6.x
+            // (pnpm 8) locks predate the v9 grammar and upgrading pnpm
+            // re-locks them, but a HIGHER version means the user's pnpm
+            // already outgrew this build — telling them "re-lock with
+            // pnpm >= 9" would loop them back to the lock they have.
+            let major = v.split('.').next().and_then(|m| m.parse::<u32>().ok());
+            Err(match major {
+                Some(m) if m < 9 => format!(
+                    "{PNPM_LOCK} has lockfileVersion {v}; only {SUPPORTED_LOCK_VERSION} is \
+                     supported — re-lock with pnpm >= 9"
+                ),
+                _ => format!(
+                    "{PNPM_LOCK} has lockfileVersion {v}; this socket-patch build supports \
+                     lockfileVersion {SUPPORTED_LOCK_VERSION} — re-lock with a pnpm release \
+                     that emits it, or update socket-patch"
+                ),
+            })
+        }
         None => Err(format!(
             "{PNPM_LOCK} has no lockfileVersion in its head; only \
              {SUPPORTED_LOCK_VERSION} is supported — re-lock with pnpm >= 9"
@@ -836,7 +926,7 @@ pub(super) fn check_lock_version(text: &str) -> Result<(), String> {
 /// The package-name component of a pnpm override key
 /// (`[@scope/]name[@range]`, possibly behind a `parent>child` selector
 /// chain — the override targets the LAST segment).
-fn override_key_name(key: &str) -> &str {
+pub(super) fn override_key_name(key: &str) -> &str {
     let last = key.rsplit('>').next().unwrap_or(key).trim();
     if let Some(rest) = last.strip_prefix('@') {
         match rest.find('@') {
@@ -852,7 +942,7 @@ fn override_key_name(key: &str) -> &str {
 }
 
 /// Does `value` point into `.socket/vendor/npm/` (ours — any uuid)?
-fn is_vendor_value(value: &str) -> bool {
+pub(super) fn is_vendor_value(value: &str) -> bool {
     parse_vendor_path(value).is_some_and(|p| p.eco == "npm")
 }
 
@@ -860,7 +950,7 @@ fn is_vendor_value(value: &str) -> bool {
 /// The leaf binding matters: a project can vendor the same package at
 /// several versions, and edits must never treat a SIBLING version's
 /// override/entry as their own.
-fn vendor_value_is_for(value: &str, name: &str, version: &str) -> bool {
+pub(super) fn vendor_value_is_for(value: &str, name: &str, version: &str) -> bool {
     parse_vendor_path(value)
         .is_some_and(|p| p.eco == "npm" && p.leaf == tgz_rel_leaf(name, version))
 }
@@ -870,7 +960,7 @@ fn vendor_value_is_for(value: &str, name: &str, version: &str) -> bool {
 /// key-for-key (pnpm hard-checks the two and fails
 /// `ERR_PNPM_LOCKFILE_CONFIG_MISMATCH` on any drift), so whichever key
 /// this classification yields is the one BOTH surfaces edit.
-enum OverrideDisposition {
+pub(super) enum OverrideDisposition {
     /// No same-name key: insert our canonical `name@version` key.
     Insert,
     /// A same-name key already points into `.socket/vendor/npm/` — ours
@@ -891,7 +981,7 @@ enum OverrideDisposition {
 impl OverrideDisposition {
     /// The override key both surfaces edit: the matched existing key, or
     /// our canonical `name@version` on a fresh insert.
-    fn effective_key<'a>(&'a self, our_key: &'a str) -> &'a str {
+    pub(super) fn effective_key<'a>(&'a self, our_key: &'a str) -> &'a str {
         match self {
             OverrideDisposition::Insert => our_key,
             OverrideDisposition::Ours { key } | OverrideDisposition::Takeover { key } => key,
@@ -904,7 +994,7 @@ impl OverrideDisposition {
 /// a range/different-version value, a `parent>child` selector chain
 /// (scoped to one dependent — our whole-graph rewrite has different
 /// semantics), a non-string value, or several same-name keys.
-fn classify_pkg_override(
+pub(super) fn classify_pkg_override(
     pkg: &Value,
     name: &str,
     version: &str,
@@ -963,7 +1053,7 @@ fn classify_pkg_override(
 /// drift means the pair is already desynced) with a value the edit can
 /// own: ours, the exact pinned `version` (takeover), or already our spec.
 /// A missing section/key is fine — the edit inserts it, restoring parity.
-fn check_lock_override(
+pub(super) fn check_lock_override(
     lines: &[String],
     name: &str,
     version: &str,
@@ -1164,7 +1254,7 @@ fn check_rewritable_refs(lines: &[String], name: &str, version: &str) -> Result<
 /// Add/refresh `pnpm.overrides[<name>@<version>] = file:<rel-tgz>` on the
 /// parsed (preserve_order) document. Returns
 /// `(changed, created_pnpm_table, created_overrides_table)`.
-fn apply_pkg_override(
+pub(super) fn apply_pkg_override(
     pkg: &mut Value,
     our_key: &str,
     spec: &str,
@@ -1359,7 +1449,10 @@ fn apply_workspace_override(
             lines[i] = format!("{pad}{}: {spec}", yaml_key_like(our_key, &repr));
             wiring.push(ws_record(our_key, spec, WiringAction::Rewritten, original));
         } else {
-            lines.insert(last_entry + 1, format!("{pad}{}: {spec}", yaml_key(our_key)));
+            lines.insert(
+                last_entry + 1,
+                format!("{pad}{}: {spec}", yaml_key(our_key)),
+            );
             wiring.push(ws_record(our_key, spec, WiringAction::Added, None));
         }
         return Ok(WorkspaceEdit {
@@ -1379,7 +1472,10 @@ fn apply_workspace_override(
         .unwrap_or(lines.len());
     lines.splice(
         anchor..anchor,
-        ["overrides:".to_string(), format!("  {}: {spec}", yaml_key(our_key))],
+        [
+            "overrides:".to_string(),
+            format!("  {}: {spec}", yaml_key(our_key)),
+        ],
     );
     wiring.push(ws_record(our_key, spec, WiringAction::Added, None));
     Ok(WorkspaceEdit {
@@ -1474,7 +1570,7 @@ fn edit_overrides(
     Ok(true)
 }
 
-fn overrides_record(
+pub(super) fn overrides_record(
     key: &str,
     spec: &str,
     action: WiringAction,
@@ -1796,7 +1892,7 @@ fn edit_snapshot_refs(
 
 // ───────────────────────────── revert helpers ─────────────────────────────
 
-fn revert_pkg_record(
+pub(super) fn revert_pkg_record(
     doc: &mut Value,
     rec: &WiringRecord,
     entry_uuid: &str,
@@ -1898,7 +1994,7 @@ fn revert_lock_record(
     }
 }
 
-fn revert_overrides_line(
+pub(super) fn revert_overrides_line(
     lines: &mut Vec<String>,
     rec: &WiringRecord,
     key: &str,
@@ -2209,7 +2305,7 @@ fn revert_snapshot_ref(
     )));
 }
 
-fn drifted(detail: impl Into<String>) -> VendorWarning {
+pub(super) fn drifted(detail: impl Into<String>) -> VendorWarning {
     VendorWarning::new("vendor_lock_entry_drifted", detail.into())
 }
 
@@ -2219,7 +2315,7 @@ fn drifted(detail: impl Into<String>) -> VendorWarning {
 /// the lock LAST; a lock failure unwinds both override surfaces so the P3
 /// desync (an override with no matching lock entry, which pnpm silently
 /// unpatches or rejects as a config mismatch) is never left on disk.
-async fn commit_surfaces(
+pub(super) async fn commit_surfaces(
     project_root: &Path,
     new_pkg: Option<&[u8]>,
     original_pkg: &[u8],
@@ -2362,7 +2458,7 @@ pub(super) fn next_block(lines: &[String], mut i: usize, end: usize) -> Option<Y
     None
 }
 
-fn indent_of(line: &str) -> usize {
+pub(super) fn indent_of(line: &str) -> usize {
     line.len() - line.trim_start_matches(' ').len()
 }
 
@@ -2371,7 +2467,7 @@ fn indent_of(line: &str) -> usize {
 /// and both quote styles (single quotes are what pnpm emits for `@`-leading
 /// keys); the value separator is the first `:` followed by a space or EOL
 /// (keys themselves contain `:` in `file:` specs).
-fn parse_key_line(line: &str, indent: usize) -> Option<(String, String, String)> {
+pub(super) fn parse_key_line(line: &str, indent: usize) -> Option<(String, String, String)> {
     if line.len() <= indent || !line.as_bytes()[..indent].iter().all(|&b| b == b' ') {
         return None;
     }
@@ -2422,7 +2518,7 @@ fn unquote_value(value: &str) -> &str {
 
 /// pnpm quotes `@`-leading keys with single quotes; everything we write is
 /// otherwise bare.
-fn yaml_key(key: &str) -> String {
+pub(super) fn yaml_key(key: &str) -> String {
     if key.starts_with('@') {
         format!("'{key}'")
     } else {
@@ -2431,7 +2527,7 @@ fn yaml_key(key: &str) -> String {
 }
 
 /// Re-spell `key` in the same quoting style as the original `repr`.
-fn yaml_key_like(key: &str, original_repr: &str) -> String {
+pub(super) fn yaml_key_like(key: &str, original_repr: &str) -> String {
     match original_repr.as_bytes().first() {
         Some(b'\'') => format!("'{key}'"),
         Some(b'"') => format!("\"{key}\""),
@@ -2439,11 +2535,11 @@ fn yaml_key_like(key: &str, original_repr: &str) -> String {
     }
 }
 
-fn lines_value(lines: &[String]) -> Value {
+pub(super) fn lines_value(lines: &[String]) -> Value {
     Value::Array(lines.iter().map(|l| Value::String(l.clone())).collect())
 }
 
-fn value_lines(v: &Value) -> Option<Vec<String>> {
+pub(super) fn value_lines(v: &Value) -> Option<Vec<String>> {
     v.as_array().map(|a| {
         a.iter()
             .filter_map(Value::as_str)
@@ -3009,6 +3105,109 @@ snapshots:
             .await
             .unwrap();
         assert_eq!(pnpm_entry_in_use(&entry, fx.root()).await, None);
+    }
+
+    // ── empty-wiring (reconstructed) revert guard ──────────────────────────
+
+    /// Vendor, then reshape the entry into what `repair`'s no-ledger
+    /// reconstruction persists: same uuid/artifact, EMPTY wiring, no meta.
+    async fn reconstructed_fixture() -> (Fixture, VendorEntry) {
+        let fx = fixture_with(P1_BEFORE_PKG, P1_BEFORE_LOCK).await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let mut entry = entry.unwrap();
+        entry.wiring.clear();
+        entry.pnpm = None;
+        (fx, entry)
+    }
+
+    /// P1 regression (empirically confirmed vs a real pnpm@10.34.5 project,
+    /// 2026-08-18): a `repair`-reconstructed entry carries no wiring
+    /// records; revert used to remove the artifact dir unconditionally,
+    /// leaving the lock resolving through a deleted tarball — every later
+    /// install failed ENOENT, and nothing said so. With nothing to replay,
+    /// revert must refuse (fail-closed) while the lock still resolves
+    /// through the artifact.
+    #[tokio::test]
+    async fn empty_wiring_revert_refuses_while_lock_resolves_through_artifact() {
+        let (fx, entry) = reconstructed_fixture().await;
+        let tgz_path = fx.root().join(fx.rel_tgz());
+        let lock_before = fx.read(PNPM_LOCK).await;
+
+        // The dry-run preview must refuse too (same precedent as the uuid
+        // grammar guard: never advertise a revert the wet run refuses).
+        for dry_run in [true, false] {
+            let outcome = revert_pnpm(&entry, fx.root(), dry_run).await;
+            assert!(!outcome.success, "dry_run={dry_run}: must refuse");
+            let err = outcome.error.as_deref().unwrap_or_default();
+            assert!(err.contains("socket-patch repair"), "{err}");
+            assert!(
+                outcome
+                    .warnings
+                    .iter()
+                    .any(|w| w.code == "vendor_wiring_unknown_revert_blocked"),
+                "{:?}",
+                outcome.warnings
+            );
+            assert!(tgz_path.exists(), "the artifact must survive the refusal");
+            assert_eq!(fx.read(PNPM_LOCK).await, lock_before, "lock untouched");
+        }
+    }
+
+    /// The flip side: when the lock provably no longer resolves through the
+    /// artifact (dependency removed and re-locked; only the mirrored
+    /// overrides declaration lingers), the empty-wiring revert keeps its
+    /// pre-guard behavior and removes the genuinely orphaned artifact.
+    #[tokio::test]
+    async fn empty_wiring_revert_removes_a_genuinely_orphaned_artifact() {
+        let (fx, entry) = reconstructed_fixture().await;
+        let removed_lock = format!(
+            "lockfileVersion: '9.0'\n\noverrides:\n  left-pad@1.3.0: file:{}\n\nimporters:\n\n  \
+             .:\n    dependencies:\n      consumer:\n        specifier: file:./consumer\n        \
+             version: file:consumer\n\npackages:\n\n  consumer@file:consumer:\n    \
+             resolution: {{directory: consumer, type: directory}}\n\nsnapshots:\n\n  \
+             consumer@file:consumer: {{}}\n",
+            fx.rel_tgz()
+        );
+        tokio::fs::write(fx.root().join(PNPM_LOCK), &removed_lock)
+            .await
+            .unwrap();
+
+        let outcome = revert_pnpm(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(
+            !fx.root()
+                .join(format!(".socket/vendor/npm/{UUID}"))
+                .exists(),
+            "orphaned artifact dir removed"
+        );
+        assert_eq!(
+            fx.read(PNPM_LOCK).await,
+            removed_lock,
+            "empty wiring replays nothing"
+        );
+    }
+
+    /// Undeterminable lock (present but unsupported grammar): fail closed —
+    /// it may still resolve through the artifact. A lock that is absent
+    /// altogether cannot reference anything, so removal proceeds.
+    #[tokio::test]
+    async fn empty_wiring_revert_fails_closed_on_undeterminable_lock() {
+        let (fx, entry) = reconstructed_fixture().await;
+        let tgz_path = fx.root().join(fx.rel_tgz());
+
+        tokio::fs::write(fx.root().join(PNPM_LOCK), "lockfileVersion: '6.0'\n")
+            .await
+            .unwrap();
+        let outcome = revert_pnpm(&entry, fx.root(), false).await;
+        assert!(!outcome.success, "unparseable-lock revert must refuse");
+        assert!(tgz_path.exists());
+
+        tokio::fs::remove_file(fx.root().join(PNPM_LOCK))
+            .await
+            .unwrap();
+        let outcome = revert_pnpm(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(!tgz_path.exists(), "no lock, no reference: removal is safe");
     }
 
     // ── exact-version pin takeover ─────────────────────────────────────────
@@ -4171,6 +4370,61 @@ snapshots:
         );
     }
 
+    /// The unsupported-version remedy must point the right way. The router
+    /// sniff is now the ALLOWLIST `sniff_lock_grammar` (5.4 / 6.0 / 9.0 —
+    /// the legacy grammars route to their own backend instead of refusing),
+    /// so the remedy assertions moved onto it: pre-allowlist locks (pnpm
+    /// <= 6's 5.x line) are fixed by upgrading pnpm, but a FUTURE lock
+    /// version means pnpm already outgrew this build — "re-lock with
+    /// pnpm >= 9" would loop those users back to the lock they have.
+    #[test]
+    fn lock_version_remedy_is_version_aware() {
+        use super::super::pnpm_lock_legacy::{sniff_lock_grammar, PnpmLockGrammar};
+
+        assert!(check_lock_version("lockfileVersion: '9.0'\n").is_ok());
+        assert_eq!(
+            sniff_lock_grammar("lockfileVersion: '9.0'\n"),
+            Ok(PnpmLockGrammar::V9)
+        );
+
+        // The legacy grammars are ALLOWLISTED now (pnpm 7's bare-float 5.4,
+        // pnpm 8's quoted 6.0): the router routes them to the legacy
+        // backend rather than refusing.
+        assert_eq!(
+            sniff_lock_grammar("lockfileVersion: 5.4\n"),
+            Ok(PnpmLockGrammar::V54)
+        );
+        assert_eq!(
+            sniff_lock_grammar("lockfileVersion: '6.0'\n"),
+            Ok(PnpmLockGrammar::V60)
+        );
+        // …while the v9 BACKEND's own guard still holds them out (they can
+        // only reach `vendor_pnpm` through a router bug).
+        for head in ["lockfileVersion: 5.4\n", "lockfileVersion: '6.0'\n"] {
+            assert!(check_lock_version(head).is_err(), "{head}");
+        }
+
+        // Too old for the allowlist (pnpm 6's 5.3): upgrade pnpm.
+        let err = sniff_lock_grammar("lockfileVersion: 5.3\n").unwrap_err();
+        assert!(err.contains("re-lock with pnpm >= 9"), "{err}");
+
+        // Future versions: the fix is an allowlisted-emitting pnpm or a
+        // newer build, never "pnpm >= 9" (the user's pnpm already is).
+        for head in ["lockfileVersion: '9.1'\n", "lockfileVersion: '10.0'\n"] {
+            let err = sniff_lock_grammar(head).unwrap_err();
+            assert!(err.contains("update socket-patch"), "{err}");
+            assert!(!err.contains("re-lock with pnpm >= 9"), "{err}");
+            // The v9 backend's guard agrees on the direction.
+            let err = check_lock_version(head).unwrap_err();
+            assert!(err.contains("update socket-patch"), "{err}");
+        }
+
+        // No version in the head: unrecognizably old — upgrade advice stands.
+        let err = sniff_lock_grammar("importers:\n").unwrap_err();
+        assert!(err.contains("re-lock with pnpm >= 9"), "{err}");
+        assert!(check_lock_version("importers:\n").is_err());
+    }
+
     #[test]
     fn override_key_name_grammar() {
         assert_eq!(override_key_name("left-pad"), "left-pad");
@@ -4256,7 +4510,10 @@ snapshots:
     #[tokio::test]
     async fn workspace_file_is_created_with_root_scaffold_and_revert_deletes_it() {
         let fx = fixture_with(P1_BEFORE_PKG, P1_BEFORE_LOCK).await;
-        assert!(!ws_exists(&fx).await, "fixture starts with no workspace file");
+        assert!(
+            !ws_exists(&fx).await,
+            "fixture starts with no workspace file"
+        );
 
         let (_, entry, _) = expect_done(fx.vendor(false).await);
         let entry = entry.unwrap();
@@ -4267,9 +4524,10 @@ snapshots:
             "created workspace carries `packages: ['.']` + the override"
         );
         // The three surfaces agree on the same key → value (no config mismatch).
-        assert!(fx.read(PNPM_WORKSPACE).await.contains(&format!(
-            "overrides:\n  left-pad@1.3.0: {spec}"
-        )));
+        assert!(fx
+            .read(PNPM_WORKSPACE)
+            .await
+            .contains(&format!("overrides:\n  left-pad@1.3.0: {spec}")));
         assert!(fx
             .read(PNPM_LOCK)
             .await
@@ -4393,7 +4651,10 @@ snapshots:
         assert!(pnpm_meta.created_pnpm_table && pnpm_meta.created_overrides_table);
         assert!(prev.wiring.iter().any(|r| r.file == PACKAGE_JSON));
         assert!(prev.wiring.iter().any(|r| r.file == PNPM_LOCK));
-        assert!(!ws_exists(&fx).await, "downgraded state has no workspace file");
+        assert!(
+            !ws_exists(&fx).await,
+            "downgraded state has no workspace file"
+        );
 
         // 2. Re-vendor under the current code: package.json + lock are already
         //    in sync, so ONLY the workspace mirror is written and the fresh
@@ -4420,7 +4681,11 @@ snapshots:
             P1_BEFORE_PKG,
             "package.json byte-restored"
         );
-        assert_eq!(fx.read(PNPM_LOCK).await, P1_BEFORE_LOCK, "lock byte-restored");
+        assert_eq!(
+            fx.read(PNPM_LOCK).await,
+            P1_BEFORE_LOCK,
+            "lock byte-restored"
+        );
         assert!(
             !ws_exists(&fx).await,
             "the workspace file the re-vendor created is deleted"

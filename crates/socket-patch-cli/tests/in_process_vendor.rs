@@ -1473,6 +1473,17 @@ fn vendor_missing_file_fails_closed_without_force() {
 
     let (code, env) = vendor_cli(fx.root(), &[]);
     assert_ne!(code, 0, "missing patch target must fail: {env:#}");
+    // CONTRACT: even a run where EVERY outcome failed reports
+    // "partialFailure". The envelope has no "completed with zero successes"
+    // status, and status=error is reserved for pre-event failures (it implies
+    // a top-level error payload and empty events[] — json_envelope.rs), so
+    // escalating this run to "error" would violate the contract and diverge
+    // from scan --vendor and vendor --revert, which report the same outcome
+    // as partialFailure. Exit code 1 carries the failure signal.
+    assert_eq!(
+        env["status"], "partialFailure",
+        "all-failed vendor runs report partialFailure per the envelope contract: {env:#}"
+    );
     let failed = find_event(&env, "failed", None);
     assert!(
         failed["error"]
@@ -1595,6 +1606,93 @@ async fn dry_run_vex_is_skipped_not_generated() {
     // The dry run itself stayed read-only.
     assert_eq!(fx.lock_bytes(), fx.original_lock, "lock untouched");
     assert!(!fx.vendor_dir().exists(), "no artifacts staged");
+}
+
+/// Embedded-VEX run advisories must ride the envelope's `vex.warnings`
+/// under `--json`: `note_warning` silences stderr there, so without this
+/// key the advisory has no channel at all. The vendor host populates
+/// `VexSummary.warnings` (the scan host's raw-json arm mirrors it); a
+/// clean product pins the skip-if-empty contract — no `warnings` key.
+#[tokio::test]
+async fn vendor_json_vex_warnings_ride_in_envelope() {
+    // The stock fixture manifest has no vulnerability metadata, and VEX
+    // refuses to attest a metadata-less patch (`no_applicable_patches`) —
+    // inject one so the embedded generation actually runs.
+    fn add_vulnerability(root: &Path) {
+        let manifest_path = root.join(".socket/manifest.json");
+        let mut m: Value = serde_json::from_str(
+            &std::fs::read_to_string(&manifest_path).expect("read fixture manifest"),
+        )
+        .expect("parse fixture manifest");
+        for (_, patch) in m["patches"].as_object_mut().expect("patches map") {
+            patch["vulnerabilities"] = serde_json::json!({
+                "GHSA-embd-warn-test": {
+                    "cves": ["CVE-2024-77777"],
+                    "summary": "embedded-vex warning fixture",
+                    "severity": "high",
+                    "description": "d",
+                }
+            });
+        }
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_string_pretty(&m).expect("serialize manifest"),
+        )
+        .expect("write fixture manifest");
+    }
+
+    let fx = npm_fixture();
+    add_vulnerability(fx.root());
+    let vex_path = fx.root().join("vendored.vex.json");
+    let (code, env) = vendor_cli(
+        fx.root(),
+        &[
+            "--vex",
+            vex_path.to_str().expect("vex path is UTF-8"),
+            "--vex-product",
+            "not an iri at all",
+        ],
+    );
+    assert_eq!(
+        code, 0,
+        "a non-IRI product warns, never hard-rejects: {env}"
+    );
+    let warnings = env["vex"]["warnings"]
+        .as_array()
+        .unwrap_or_else(|| panic!("vex.warnings must be present for a non-IRI product: {env}"));
+    assert!(
+        warnings.iter().any(|w| w["code"] == "product_not_iri"),
+        "vendor vex.warnings must carry product_not_iri, got {warnings:?}"
+    );
+
+    // Clean-product control on a fresh fixture: no product advisory — but
+    // the tree-sync disclosure legitimately fires (vendor rewires the
+    // lockfile only; the live node_modules keeps pre-vendor bytes until a
+    // reinstall), which doubles as a pin that the host folds EVERY
+    // advisory kind in, not just product_not_iri. The skip-if-empty
+    // contract (no key at all on a warning-free run) is pinned by the
+    // apply-side control in e2e_embedded_vex.rs.
+    let fx2 = npm_fixture();
+    add_vulnerability(fx2.root());
+    let vex2 = fx2.root().join("vendored2.vex.json");
+    let (code2, env2) = vendor_cli(
+        fx2.root(),
+        &["--vex", vex2.to_str().expect("vex path is UTF-8")],
+    );
+    assert_eq!(code2, 0, "clean embedded vex run must succeed: {env2}");
+    let warnings2 = env2["vex"]["warnings"]
+        .as_array()
+        .unwrap_or_else(|| panic!("out-of-sync disclosure must ride the envelope: {env2}"));
+    assert!(
+        warnings2.iter().all(|w| w["code"] != "product_not_iri"),
+        "auto-detected product must not warn: {warnings2:?}"
+    );
+    assert!(
+        warnings2
+            .iter()
+            .any(|w| w["code"] == "vendored_tree_out_of_sync"),
+        "the pre-reinstall tree must surface the sync disclosure: {warnings2:?}"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -1955,6 +2053,373 @@ async fn scan_vendor_gem_detached_writes_no_manifest_and_reverts() {
         "revert must byte-restore Gemfile.lock"
     );
     assert!(!fx.root().join(".socket/vendor").exists());
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// hosted → vendored mode conversion (takeover reconciliation, pnpm v9)
+// ─────────────────────────────────────────────────────────────────────
+//
+// The full migration a real project performs: `scan --mode hosted` first
+// (wiremock API, v9 pnpm root lock — the shapes of
+// `in_process_redirect_pnpm.rs`), then `vendor` over the hosted-redirected
+// lock. Pins the npm-family takeover pre-revert (the pnpm twin of
+// `mode_migration_npm.rs`):
+//
+//   * vendor PRE-REVERTS the live hosted redirect (surfaced as the
+//     `vendor_takeover_reverted_redirect` advisory) before rewiring, so the
+//     redirect ledger loses the converted purl's `records` entry AND its
+//     `redirect_pnpm_resolution` edits (stale halves fed VEX/updates and
+//     re-fired the takeover warning forever pre-fix) — the
+//     `vendor_supersedes_redirect` warning can never fire, on the takeover
+//     run or any later one,
+//   * the vendor wiring `original` embeds the PRISTINE registry fragment —
+//     not the grant-tokenized hosted splice — and a re-vendor
+//     (`already_vendored`) is silent,
+//   * `vendor --revert` therefore restores the REGISTRY lock byte-exactly
+//     (pre-#206 it restored an expiring hosted URL with no CLI path back to
+//     registry state).
+mod hosted_to_vendor_conversion {
+    use super::*;
+    use serial_test::serial;
+    use socket_patch_cli::commands::scan::{run as scan_run, ScanArgs, ScanMode};
+    use wiremock::matchers::{method, path, path_regex};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const ORG: &str = "test-org";
+    const CONV_NAME: &str = "conv-pnpm-takeover";
+    const CONV_VERSION: &str = "1.0.0";
+    const CONV_PURL: &str = "pkg:npm/conv-pnpm-takeover@1.0.0";
+    const CONV_UUID: &str = "44444444-4444-4444-8444-444444444444";
+    const HOSTED_URL: &str = "http://patch.test/patch/npm/conv-pnpm-takeover/1.0.0/55555555-5555-4555-8555-555555555555/44444444-4444-4444-8444-444444444444/conv-pnpm-takeover-1.0.0.tgz";
+    const PATCHED_SHA512: &str = "sha512-PATCHEDpatchedPATCHEDpatched0123456789==";
+    const UPSTREAM_SHA512: &str = "sha512-UPSTREAMupstream==";
+
+    async fn mock_hosted_api(server: &MockServer) {
+        Mock::given(method("POST"))
+            .and(path(format!("/v0/orgs/{ORG}/patches/batch")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "packages": [{
+                    "purl": CONV_PURL,
+                    "patches": [{
+                        "uuid": CONV_UUID, "purl": CONV_PURL, "tier": "free",
+                        "cveIds": [], "ghsaIds": [], "severity": "high",
+                        "title": "conversion fixture"
+                    }]
+                }],
+                "canAccessPaidPatches": false,
+            })))
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(format!(
+                "^/v0/orgs/{ORG}/patches/by-package/.+$"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "patches": [{
+                    "uuid": CONV_UUID, "purl": CONV_PURL,
+                    "publishedAt": "2024-01-01T00:00:00Z",
+                    "description": "x", "license": "MIT", "tier": "free",
+                    "vulnerabilities": {}
+                }],
+                "canAccessPaidPatches": false,
+            })))
+            .mount(server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(format!("/v0/orgs/{ORG}/patches/package")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": {
+                    CONV_UUID: {
+                        "status": "granted",
+                        "url": HOSTED_URL,
+                        "purl": CONV_PURL,
+                        "artifacts": [{
+                            "kind": "tarball",
+                            "url": HOSTED_URL,
+                            "integrity": { "sha512": PATCHED_SHA512 }
+                        }],
+                        "registryOverride": null
+                    }
+                }
+            })))
+            .mount(server)
+            .await;
+        // `view/{uuid}` — the record the redirect ledger persists (real file
+        // hashes, so the ledger record mirrors the manifest the vendor run
+        // uses later).
+        let before_hash = compute_git_sha256_from_bytes(ORIG_INDEX);
+        let after_hash = compute_git_sha256_from_bytes(PATCHED_INDEX);
+        Mock::given(method("GET"))
+            .and(path(format!("/v0/orgs/{ORG}/patches/view/{CONV_UUID}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "uuid": CONV_UUID,
+                "purl": CONV_PURL,
+                "publishedAt": "2024-01-01T00:00:00Z",
+                "files": {
+                    "package/index.js": {
+                        "beforeHash": before_hash,
+                        "afterHash": after_hash,
+                    }
+                },
+                "vulnerabilities": {},
+                "description": "x", "license": "MIT", "tier": "free"
+            })))
+            .mount(server)
+            .await;
+    }
+
+    /// The `in_process_redirect_pnpm.rs` project shape: v9 root pnpm lock
+    /// resolving the package under `packages:`, plus the installed
+    /// node_modules copy (with the real patch-target file, so the later
+    /// vendor run can pack the artifact).
+    fn write_pnpm_project(root: &Path) {
+        std::fs::write(
+            root.join("package.json"),
+            format!(
+                r#"{{ "name": "consumer", "version": "0.0.0", "dependencies": {{ "{CONV_NAME}": "{CONV_VERSION}" }} }}"#
+            ),
+        )
+        .unwrap();
+        let pkg = root.join("node_modules").join(CONV_NAME);
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(
+            pkg.join("package.json"),
+            format!(r#"{{ "name": "{CONV_NAME}", "version": "{CONV_VERSION}" }}"#),
+        )
+        .unwrap();
+        std::fs::write(pkg.join("index.js"), ORIG_INDEX).unwrap();
+        std::fs::write(
+            root.join("pnpm-lock.yaml"),
+            format!(
+                "lockfileVersion: '9.0'
+
+importers:
+  .:
+    dependencies:
+      {CONV_NAME}:
+        specifier: {CONV_VERSION}
+        version: {CONV_VERSION}
+
+packages:
+  {CONV_NAME}@{CONV_VERSION}:
+    resolution: {{integrity: {UPSTREAM_SHA512}}}
+
+snapshots:
+  {CONV_NAME}@{CONV_VERSION}: {{}}
+"
+            ),
+        )
+        .unwrap();
+    }
+
+    /// `--mode hosted` args against the wiremock API (the
+    /// `in_process_redirect_pnpm.rs` shape).
+    fn hosted_args(cwd: &Path, api_url: String) -> ScanArgs {
+        ScanArgs {
+            common: GlobalArgs {
+                cwd: cwd.to_path_buf(),
+                org: Some(ORG.to_string()),
+                api_token: Some("fake".to_string()),
+                api_url: Some(api_url),
+                json: true,
+                yes: true,
+                ..GlobalArgs::default()
+            },
+            batch_size: 100,
+            apply: false,
+            prune: false,
+            sync: false,
+            vendor: false,
+            detached: false,
+            redirect: false,
+            mode: Some(ScanMode::Hosted),
+            all_releases: false,
+            vex: Default::default(),
+        }
+    }
+
+    /// The manifest + staged blob the vendor run needs (vendor is driven
+    /// offline; hosted mode wrote no manifest — the ledger is its store).
+    fn seed_manifest_and_blob(root: &Path) {
+        let before_hash = compute_git_sha256_from_bytes(ORIG_INDEX);
+        let after_hash = compute_git_sha256_from_bytes(PATCHED_INDEX);
+        let manifest = json!({
+            "patches": {
+                CONV_PURL: {
+                    "uuid": CONV_UUID,
+                    "exportedAt": "2026-01-01T00:00:00Z",
+                    "files": {
+                        "package/index.js": {
+                            "beforeHash": before_hash,
+                            "afterHash": after_hash
+                        }
+                    },
+                    "vulnerabilities": {},
+                    "description": "conversion fixture",
+                    "license": "MIT",
+                    "tier": "free"
+                }
+            }
+        });
+        let socket = root.join(".socket");
+        std::fs::create_dir_all(socket.join("blobs")).unwrap();
+        let mut bytes = serde_json::to_vec_pretty(&manifest).unwrap();
+        bytes.push(b'\n');
+        std::fs::write(socket.join("manifest.json"), &bytes).unwrap();
+        std::fs::write(socket.join("blobs").join(after_hash), PATCHED_INDEX).unwrap();
+    }
+
+    fn takeover_warnings(envelope: &Value) -> Vec<&str> {
+        envelope["warnings"]
+            .as_array()
+            .map(|w| {
+                w.iter()
+                    .filter(|e| e["code"] == "vendor_supersedes_redirect")
+                    .map(|e| e["detail"].as_str().unwrap_or(""))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn hosted_then_vendor_takeover_pre_reverts_redirect_and_round_trips() {
+        let server = MockServer::start().await;
+        mock_hosted_api(&server).await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_pnpm_project(root);
+        let pristine_lock = std::fs::read(root.join("pnpm-lock.yaml")).unwrap();
+
+        // 1. Hosted redirect: the lock's resolution is spliced to the hosted
+        //    tarball and the redirect ledger claims the purl.
+        let code = scan_run(hosted_args(root, server.uri())).await;
+        assert_eq!(code, 0, "scan --mode hosted must succeed");
+        let hosted_lock_text = std::fs::read_to_string(root.join("pnpm-lock.yaml")).unwrap();
+        assert!(
+            hosted_lock_text.contains(&format!("tarball: {HOSTED_URL}")),
+            "hosted splice missing:\n{hosted_lock_text}"
+        );
+        let ledger_path = root.join(".socket/vendor/redirect-state.json");
+        let ledger: Value =
+            serde_json::from_str(&std::fs::read_to_string(&ledger_path).unwrap()).unwrap();
+        assert!(
+            ledger["records"].get(CONV_PURL).is_some(),
+            "hosted run must record the purl: {ledger}"
+        );
+
+        // 2. Vendor over the hosted-redirected lock (offline, staged blob).
+        //    The takeover PRE-REVERTS the hosted edits first — surfaced as
+        //    the `vendor_takeover_reverted_redirect` advisory — then vendors
+        //    from the clean registry baseline.
+        seed_manifest_and_blob(root);
+        let (code, env1) = vendor_cli(root, &[]);
+        assert_eq!(
+            code, 0,
+            "vendor over the hosted lock must succeed: {env1:#}"
+        );
+        find_event(&env1, "applied", None);
+        find_event(&env1, "skipped", Some("vendor_takeover_reverted_redirect"));
+
+        // The pre-revert leaves nothing to supersede, so the
+        // vendor_supersedes_redirect warning must not fire — not on this run
+        // (pre-#206 it fired here) and not on any later one.
+        assert!(
+            takeover_warnings(&env1).is_empty(),
+            "the pre-revert must preempt vendor_supersedes_redirect: {env1:#}"
+        );
+
+        // The lock is FULLY vendored: local wiring present, no hosted
+        // residue.
+        let vendored_lock_text =
+            std::fs::read_to_string(root.join("pnpm-lock.yaml")).unwrap();
+        assert!(
+            !vendored_lock_text.contains(HOSTED_URL),
+            "the hosted splice must be gone from the vendored lock:\n{vendored_lock_text}"
+        );
+        assert!(
+            vendored_lock_text.contains(".socket/vendor/"),
+            "the vendored wiring must be present:\n{vendored_lock_text}"
+        );
+
+        // The redirect ledger no longer carries the purl's halves: the
+        // takeover dropped its `records` entry and its
+        // `redirect_pnpm_resolution` edits (a residual non-package edit like
+        // the workspace-trust one may remain — it is the hosted flow's own
+        // config surface).
+        match std::fs::read_to_string(&ledger_path) {
+            Ok(text) => {
+                let after: Value = serde_json::from_str(&text).unwrap();
+                assert!(
+                    after["records"].get(CONV_PURL).is_none(),
+                    "the superseded record must be dropped: {after}"
+                );
+                let leftover: Vec<&Value> = after["edits"]
+                    .as_array()
+                    .map(|edits| {
+                        edits
+                            .iter()
+                            .filter(|e| e["key"].as_str().is_some_and(|k| k.contains(CONV_NAME)))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                assert!(
+                    leftover.is_empty(),
+                    "the superseded package edits must be dropped: {after}"
+                );
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Fully emptied ledgers are deleted — also a valid outcome.
+            }
+            Err(e) => panic!("unreadable redirect ledger: {e}"),
+        }
+
+        // The vendor ledger's wiring `original` embeds the PRISTINE registry
+        // fragment the pre-revert restored — never the grant-tokenized
+        // hosted splice (which would make `--revert` restore an expiring
+        // hosted URL with no CLI path back to registry state).
+        let state: Value = serde_json::from_str(
+            &std::fs::read_to_string(root.join(".socket/vendor/state.json")).unwrap(),
+        )
+        .unwrap();
+        let wiring = state["entries"][CONV_PURL]["wiring"].to_string();
+        assert!(
+            wiring.contains(UPSTREAM_SHA512),
+            "vendor wiring must embed the pristine registry original: {state:#}"
+        );
+        assert!(
+            !wiring.contains(HOSTED_URL),
+            "vendor wiring must NOT record the hosted fragment: {state:#}"
+        );
+
+        // 3. Re-vendor: an `already_vendored` no-op with NO takeover event
+        //    and NO supersede warning (pre-fix the stale ledger re-fired the
+        //    warning on every run).
+        let (code, env2) = vendor_cli(root, &[]);
+        assert_eq!(code, 0, "re-vendor must succeed: {env2:#}");
+        find_event(&env2, "skipped", Some("already_vendored"));
+        assert!(
+            takeover_warnings(&env2).is_empty(),
+            "a reconciled ledger must not re-fire the warning: {env2:#}"
+        );
+        assert!(
+            events(&env2)
+                .iter()
+                .all(|e| e["errorCode"] != "vendor_takeover_reverted_redirect"),
+            "a reconciled ledger must not re-fire the takeover: {env2:#}"
+        );
+
+        // 4. `vendor --revert` restores the REGISTRY lock byte-exactly — the
+        //    pre-redirect resolution, not the hosted splice.
+        let (code, renv) = vendor_cli(root, &["--revert"]);
+        assert_eq!(code, 0, "revert must succeed: {renv:#}");
+        assert_eq!(
+            std::fs::read(root.join("pnpm-lock.yaml")).unwrap(),
+            pristine_lock,
+            "revert must byte-restore the pristine registry lock"
+        );
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────

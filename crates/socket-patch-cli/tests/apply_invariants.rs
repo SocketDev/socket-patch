@@ -562,3 +562,129 @@ fn apply_with_unreadable_socket_dir_fails_closed() {
         "expected the manifest_unreadable envelope error; envelope: {v}"
     );
 }
+
+/// Lay down a project with TWO npm manifest patches, BOTH with their
+/// patched blobs staged (so the offline no-local-source guard never
+/// fires and the only difference between them is matchability):
+///   - `scopedpkg@1.0.0` is installed on disk and fully applicable;
+///   - `__ghost_pkg__@9.9.9` matches nothing on disk.
+fn write_partial_match_project(root: &Path) {
+    let before = git_sha256(SCOPED_ORIGINAL);
+    let after = git_sha256(SCOPED_PATCHED);
+    let ghost_after = git_sha256(b"ghost patched\n");
+
+    std::fs::write(
+        root.join("package.json"),
+        r#"{"name":"partial-match-test","version":"0.0.0"}"#,
+    )
+    .expect("write package.json");
+
+    let pkg = root.join("node_modules").join("scopedpkg");
+    std::fs::create_dir_all(&pkg).expect("create package dir");
+    std::fs::write(
+        pkg.join("package.json"),
+        r#"{"name":"scopedpkg","version":"1.0.0"}"#,
+    )
+    .expect("write pkg package.json");
+    std::fs::write(pkg.join("index.js"), SCOPED_ORIGINAL).expect("write index.js");
+
+    let socket = root.join(".socket");
+    std::fs::create_dir_all(socket.join("blobs")).expect("create blobs");
+    std::fs::write(socket.join("blobs").join(&after), SCOPED_PATCHED).expect("write blob");
+    std::fs::write(socket.join("blobs").join(&ghost_after), b"ghost patched\n")
+        .expect("write ghost blob");
+    let before_ghost = git_sha256(b"ghost original\n");
+    let manifest = format!(
+        r#"{{
+  "patches": {{
+    "{SCOPED_NPM_PURL}": {{
+      "uuid": "33333333-3333-4333-8333-333333333333",
+      "exportedAt": "2024-01-01T00:00:00Z",
+      "files": {{
+        "package/index.js": {{ "beforeHash": "{before}", "afterHash": "{after}" }}
+      }},
+      "vulnerabilities": {{}},
+      "description": "installed npm patch with local sources",
+      "license": "MIT",
+      "tier": "free"
+    }},
+    "pkg:npm/__ghost_pkg__@9.9.9": {{
+      "uuid": "44444444-4444-4444-8444-444444444444",
+      "exportedAt": "2024-01-01T00:00:00Z",
+      "files": {{
+        "package/index.js": {{ "beforeHash": "{before_ghost}", "afterHash": "{ghost_after}" }}
+      }},
+      "vulnerabilities": {{}},
+      "description": "npm patch whose package is not installed",
+      "license": "MIT",
+      "tier": "free"
+    }}
+  }}
+}}"#
+    );
+    std::fs::write(socket.join("manifest.json"), manifest).expect("write manifest");
+}
+
+/// PINS the current (asymmetric) unmatched-purl exit semantics so any
+/// change to them is deliberate. Today:
+///
+///   - a manifest whose patches ALL miss (no installed package matches)
+///     exits 1 with `status: partialFailure`, while
+///   - a MIXED manifest (one patch applied, one unmatched) exits 0 with
+///     `status: success` and only a per-purl `skipped` event
+///     (`errorCode: package_not_installed`) recording the miss.
+///
+/// The asymmetry is a known open decision, not an endorsement: CI that
+/// gates on the exit code reads the mixed run as fully patched even when
+/// a manifest-listed CVE patch was silently not applied (2026-08-18 pnpm
+/// matrix, apply-pnpm8 leg), while install hooks want the all-miss case
+/// to STOP exiting 1 (it fails `npm install` from the postinstall hook).
+/// Resolving either direction changes a documented contract for the
+/// other consumer — whoever does it must update BOTH halves of this test
+/// and the hook/CI guidance together.
+#[test]
+fn unmatched_purl_exit_semantics_are_pinned() {
+    // Mixed manifest: applied + unmatched → exit 0, status success,
+    // with the miss visible only as a skipped event.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_partial_match_project(tmp.path());
+    let (code, stdout) = run_apply(tmp.path(), &["--offline", "--silent"]);
+    let v: serde_json::Value =
+        serde_json::from_str(&stdout).expect("apply --json must emit valid JSON");
+    assert_eq!(code, 0, "mixed manifest pins exit 0 today; envelope:\n{v}");
+    assert_eq!(
+        v["status"], "success",
+        "mixed manifest pins status=success; {v}"
+    );
+    assert_eq!(v["summary"]["applied"], 1, "{v}");
+    let events = v["events"].as_array().expect("events array");
+    assert!(
+        events
+            .iter()
+            .any(|e| e["action"] == "applied" && e["purl"] == SCOPED_NPM_PURL),
+        "installed patch must be applied; {events:?}"
+    );
+    let ghost = events
+        .iter()
+        .find(|e| e["purl"] == "pkg:npm/__ghost_pkg__@9.9.9")
+        .unwrap_or_else(|| panic!("unmatched purl must surface as an event; {events:?}"));
+    assert_eq!(ghost["action"], "skipped", "{ghost}");
+    assert_eq!(
+        ghost["errorCode"], "package_not_installed",
+        "the miss must be machine-identifiable; {ghost}"
+    );
+
+    // All-miss manifest (same ghost patch alone, blob still staged so the
+    // offline source guard is not what fires) → exit 1, partialFailure.
+    let tmp2 = tempfile::tempdir().expect("tempdir");
+    write_partial_match_project(tmp2.path());
+    std::fs::remove_dir_all(tmp2.path().join("node_modules")).expect("uninstall scopedpkg");
+    let (code2, stdout2) = run_apply(tmp2.path(), &["--offline", "--silent"]);
+    let v2: serde_json::Value =
+        serde_json::from_str(&stdout2).expect("apply --json must emit valid JSON");
+    assert_eq!(
+        code2, 1,
+        "all-miss manifest pins exit 1 today; envelope:\n{v2}"
+    );
+    assert_eq!(v2["status"], "partialFailure", "{v2}");
+}

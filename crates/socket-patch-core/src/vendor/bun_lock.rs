@@ -290,6 +290,23 @@ pub(crate) async fn revert_bun(
         Ok(d) => d,
         Err(outcome) => return outcome,
     };
+    // Nothing to replay (a `repair`-reconstructed entry): the artifact may
+    // only be removed when bun.lock provably no longer resolves through it
+    // — otherwise refuse, fail-closed, instead of silently bricking
+    // installs. Runs before the dry-run return so a preview never
+    // advertises a revert the wet run refuses.
+    if entry.wiring.is_empty() {
+        if let Some(blocked) = super::npm_lock::guard_unwired_textual_revert(
+            project_root,
+            &entry.uuid,
+            &uuid_dir_rel,
+            &[BUN_LOCK],
+        )
+        .await
+        {
+            return blocked;
+        }
+    }
     if dry_run {
         return RevertOutcome::ok();
     }
@@ -1405,6 +1422,77 @@ mod tests {
                 .join(format!(".socket/vendor/npm/{UUID}"))
                 .exists(),
             "artifact pruned once the revert converges"
+        );
+    }
+
+    // ── empty-wiring (reconstructed) revert guard ──────────────────────────
+
+    /// Reshape a vendored entry into what `repair`'s no-ledger
+    /// reconstruction persists: same uuid/artifact, EMPTY wiring. With
+    /// nothing to replay, revert must refuse (fail-closed) while bun.lock
+    /// still resolves through the artifact — dry-run preview included —
+    /// still remove a genuinely orphaned artifact, fail closed on an
+    /// unreadable lock, and proceed when no lock exists at all.
+    #[tokio::test]
+    async fn empty_wiring_revert_guards_against_bricking_installs() {
+        let fx = fixture_with(BN3_BEFORE_LOCK, "node_modules/left-pad").await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let mut entry = entry.unwrap();
+        entry.wiring.clear();
+        let tgz_path = fx.root().join(fx.rel_tgz());
+        let lock_vendored = fx.read_lock().await;
+
+        // Still referenced: refuse, artifact and lock untouched.
+        for dry_run in [true, false] {
+            let outcome = revert_bun(&entry, fx.root(), dry_run).await;
+            assert!(!outcome.success, "dry_run={dry_run}: must refuse");
+            assert!(
+                outcome
+                    .warnings
+                    .iter()
+                    .any(|w| w.code == "vendor_wiring_unknown_revert_blocked"),
+                "{:?}",
+                outcome.warnings
+            );
+            assert!(tgz_path.exists(), "artifact survives the refusal");
+            assert_eq!(fx.read_lock().await, lock_vendored, "lock untouched");
+        }
+
+        // Unreadable lock (not UTF-8): undeterminable, fail closed.
+        tokio::fs::write(fx.root().join(BUN_LOCK), [0xff, 0xfe, b'x'])
+            .await
+            .unwrap();
+        let outcome = revert_bun(&entry, fx.root(), false).await;
+        assert!(!outcome.success, "unreadable-lock revert must refuse");
+        assert!(tgz_path.exists());
+
+        // Re-locked away from the artifact (provably orphaned): removal
+        // proceeds, replaying nothing.
+        tokio::fs::write(fx.root().join(BUN_LOCK), BN3_BEFORE_LOCK)
+            .await
+            .unwrap();
+        let outcome = revert_bun(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(!tgz_path.exists(), "orphaned artifact removed");
+        assert_eq!(
+            fx.read_lock().await,
+            BN3_BEFORE_LOCK,
+            "empty wiring replays nothing"
+        );
+
+        // No lock at all: nothing can reference the artifact — proceed.
+        let fx = fixture_with(BN3_BEFORE_LOCK, "node_modules/left-pad").await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let mut entry = entry.unwrap();
+        entry.wiring.clear();
+        tokio::fs::remove_file(fx.root().join(BUN_LOCK))
+            .await
+            .unwrap();
+        let outcome = revert_bun(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(
+            !fx.root().join(fx.rel_tgz()).exists(),
+            "no lock, no reference"
         );
     }
 
