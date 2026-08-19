@@ -153,6 +153,30 @@ fn merge_first_wins(
     }
 }
 
+/// Release-variant merge for the APPLY path: keyed by the crawler-returned
+/// base PURL (apply's variant loop groups by base), accumulating EVERY
+/// distinct path discovered across the ecosystem's source roots in
+/// discovery (precedence) order. The gem crawler legitimately discovers
+/// several coexisting stores holding REAL physical copies of one
+/// `gem@version` (bundler's scoped `<engine>/<abi>/gems` beside the flat
+/// `gems/` layout, or an env `BUNDLE_PATH` store) — first-wins here
+/// dropped the second copy, so apply patched one store and reported
+/// success while the other bundler loaded pristine bytes (the gem sibling
+/// of the npm multi-copy P0). Collapsing consumers still take the first
+/// (highest-precedence) path, so this changes nothing for
+/// vendor/vex/setup/get/repair-vendor; apply fans out per-copy for gem
+/// only (PyPI/Maven keep their one-install-dir contract — see the apply
+/// variant loop).
+fn merge_variant_copies(
+    out: &mut HashMap<String, Vec<PathBuf>>,
+    _purls: &[String],
+    packages: HashMap<String, CrawledPackage>,
+) {
+    for (purl, pkg) in packages {
+        push_path(out, purl, pkg.path);
+    }
+}
+
 /// npm merge: the npm crawler returns EVERY physical copy of each PURL
 /// (nested duplicates, diamonds, `file:` dups), so fold every path in.
 /// This is the type shape that carries the second copy the old
@@ -382,7 +406,14 @@ pub async fn find_all_packages_for_purls(
     options: &CrawlerOptions,
     silent: bool,
 ) -> HashMap<String, Vec<PathBuf>> {
-    dispatch_find(partitioned, options, silent, merge_first_wins).await
+    // Release-variant ecosystems accumulate every distinct discovered copy
+    // (base-PURL keyed) instead of first-wins: the gem crawler surfaces
+    // coexisting bundler stores whose copies apply must ALL patch. The
+    // rollback variant below gets the same multi-copy carry from
+    // `merge_qualified`'s `push_path`. Single-copy ecosystems keep true
+    // first-wins via their own `merge_first_wins` wiring in
+    // `dispatch_find`.
+    dispatch_find(partitioned, options, silent, merge_variant_copies).await
 }
 
 /// Multi-copy variant of `find_packages_for_rollback` (qualified-aware
@@ -535,7 +566,10 @@ mod tests {
         let mut out: HashMap<String, Vec<PathBuf>> = HashMap::new();
         merge_first_wins(&mut out, &[], packages(&[("pkg:cargo/foo@1.0", "/same")]));
         merge_first_wins(&mut out, &[], packages(&[("pkg:cargo/foo@1.0", "/same")]));
-        assert_eq!(out.get("pkg:cargo/foo@1.0"), Some(&vec![PathBuf::from("/same")]));
+        assert_eq!(
+            out.get("pkg:cargo/foo@1.0"),
+            Some(&vec![PathBuf::from("/same")])
+        );
     }
 
     #[test]
@@ -545,9 +579,20 @@ mod tests {
         // the first is kept, so apply does not double-patch (the regression
         // that broke docker_e2e_nuget with a spurious `already_patched` skip).
         let mut out: HashMap<String, Vec<PathBuf>> = HashMap::new();
-        merge_first_wins(&mut out, &[], packages(&[("pkg:nuget/foo@1.0", "/global/foo")]));
-        merge_first_wins(&mut out, &[], packages(&[("pkg:nuget/foo@1.0", "/local/foo")]));
-        assert_eq!(out.get("pkg:nuget/foo@1.0"), Some(&vec![PathBuf::from("/global/foo")]));
+        merge_first_wins(
+            &mut out,
+            &[],
+            packages(&[("pkg:nuget/foo@1.0", "/global/foo")]),
+        );
+        merge_first_wins(
+            &mut out,
+            &[],
+            packages(&[("pkg:nuget/foo@1.0", "/local/foo")]),
+        );
+        assert_eq!(
+            out.get("pkg:nuget/foo@1.0"),
+            Some(&vec![PathBuf::from("/global/foo")])
+        );
     }
 
     #[test]
@@ -585,6 +630,40 @@ mod tests {
                 PathBuf::from("/nm/parent/node_modules/dup"),
             ]),
             "both physical copies must be carried, root-first"
+        );
+    }
+
+    // ---- merge_variant_copies ----------------------------------------------
+
+    #[test]
+    fn merge_variant_copies_accumulates_distinct_store_copies() {
+        // The gem crawler resolves the same base PURL from two coexisting
+        // stores (scoped + flat) across the macro's per-source-path calls;
+        // both copies must be carried, discovery (precedence) order kept,
+        // and an identical re-observed path deduped.
+        let mut out: HashMap<String, Vec<PathBuf>> = HashMap::new();
+        merge_variant_copies(
+            &mut out,
+            &[],
+            packages(&[("pkg:gem/rack@3.1.0", "/scoped/rack-3.1.0")]),
+        );
+        merge_variant_copies(
+            &mut out,
+            &[],
+            packages(&[("pkg:gem/rack@3.1.0", "/flat/rack-3.1.0")]),
+        );
+        merge_variant_copies(
+            &mut out,
+            &[],
+            packages(&[("pkg:gem/rack@3.1.0", "/flat/rack-3.1.0")]),
+        );
+        assert_eq!(
+            out.get("pkg:gem/rack@3.1.0"),
+            Some(&vec![
+                PathBuf::from("/scoped/rack-3.1.0"),
+                PathBuf::from("/flat/rack-3.1.0"),
+            ]),
+            "every distinct copy carried, precedence order kept, dup deduped"
         );
     }
 
@@ -758,7 +837,10 @@ mod tests {
         merge_first_wins(&mut out, &[], packages(&[("pkg:gem/baz@3.0", "/c")]));
         assert_eq!(out.len(), 3);
         assert_eq!(out.get("pkg:npm/foo@1.0"), Some(&vec![PathBuf::from("/a")]));
-        assert_eq!(out.get("pkg:cargo/bar@2.0"), Some(&vec![PathBuf::from("/b")]));
+        assert_eq!(
+            out.get("pkg:cargo/bar@2.0"),
+            Some(&vec![PathBuf::from("/b")])
+        );
         assert_eq!(out.get("pkg:gem/baz@3.0"), Some(&vec![PathBuf::from("/c")]));
     }
 
@@ -995,19 +1077,66 @@ mod tests {
         .await;
 
         let copies = out.get("pkg:npm/dup@1.0.0").expect("dup resolves");
-        assert_eq!(copies.len(), 2, "both copies must be carried; got {copies:?}");
+        assert_eq!(
+            copies.len(),
+            2,
+            "both copies must be carried; got {copies:?}"
+        );
         assert_eq!(copies[0], root_copy, "root copy first");
         assert!(copies.contains(&nested_copy), "nested copy must be present");
 
         // The collapsing wrapper (used by vendor/vex/setup/get) keeps the
         // old one-path contract: exactly the root-preferred representative.
-        let single = find_packages_for_purls(
-            &partitioned,
-            &local_options(tmp.path().to_path_buf()),
-            true,
-        )
-        .await;
+        let single =
+            find_packages_for_purls(&partitioned, &local_options(tmp.path().to_path_buf()), true)
+                .await;
         assert_eq!(single.get("pkg:npm/dup@1.0.0"), Some(&root_copy));
+    }
+
+    /// Multi-copy P0 for gem (mirrors the npm test above): bundler's scoped
+    /// (`<engine>/<abi>/gems`) and flat (`gems/`) store layouts coexist under
+    /// one `vendor/bundle` root — a bundler-2 `--path` install beside a
+    /// bundler-1 env install — each holding a REAL physical copy of the same
+    /// `gem@version`. `find_all_packages_for_purls` (apply's resolver) must
+    /// carry BOTH copies, highest-precedence store first. First-wins merging
+    /// resolved ONE copy, apply patched it and reported success while the
+    /// other bundler loaded the pristine (vulnerable) sibling.
+    #[tokio::test]
+    async fn find_all_packages_for_purls_carries_every_gem_store_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        // No Gemfile on purpose: env/config bundle roots are manifest-gated,
+        // so an ambient BUNDLE_PATH on the dev machine cannot perturb this
+        // test; the implicit vendor/bundle probe is ungated.
+        let bundle = tmp.path().join("vendor").join("bundle");
+        let scoped_copy = bundle
+            .join("ruby")
+            .join("3.2.0")
+            .join("gems")
+            .join("rack-3.1.0");
+        let flat_copy = bundle.join("gems").join("rack-3.1.0");
+        std::fs::create_dir_all(scoped_copy.join("lib")).unwrap();
+        std::fs::create_dir_all(flat_copy.join("lib")).unwrap();
+        // The specifications/ sibling marks the flat layout as a real gem home.
+        std::fs::create_dir_all(bundle.join("specifications")).unwrap();
+
+        let purl = "pkg:gem/rack@3.1.0".to_string();
+        let partitioned = partition_purls(std::slice::from_ref(&purl), None);
+        let opts = local_options(tmp.path().to_path_buf());
+
+        let out = find_all_packages_for_purls(&partitioned, &opts, true).await;
+        let copies = out.get(&purl).expect("gem resolves");
+        assert_eq!(
+            copies.len(),
+            2,
+            "both coexisting store copies must be carried; got {copies:?}"
+        );
+        assert_eq!(copies[0], scoped_copy, "scoped store copy first");
+        assert!(copies.contains(&flat_copy), "flat store copy present");
+
+        // The collapsing wrapper (vendor/vex/setup/get/repair-vendor) keeps
+        // the one-representative contract: the first store's copy.
+        let single = find_packages_for_purls(&partitioned, &opts, true).await;
+        assert_eq!(single.get(&purl), Some(&scoped_copy));
     }
 
     #[tokio::test]

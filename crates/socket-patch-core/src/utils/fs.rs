@@ -166,6 +166,43 @@ pub(crate) fn home_dir() -> PathBuf {
     PathBuf::from(home)
 }
 
+/// Resolve `.`/`..` without touching the filesystem, so a path can be
+/// containment-checked BEFORE it is opened (a canonicalizing check would
+/// have to stat the very path being validated, and would fail on
+/// not-yet-existing directories). Returns `None` when `..` pops above the
+/// path's own root — nothing legitimate does that, so it fails closed.
+///
+/// Symlinks are not resolved: a symlink INSIDE the project pointing out
+/// of it is a pre-existing trust decision of the project's own tree, the
+/// same assumption the rest of the crawler layer makes.
+///
+/// Shared by the composer crawler's `install-path` containment guard and
+/// the ruby crawler's config-sourced `BUNDLE_PATH` containment guard.
+pub(crate) fn normalize_lexically(path: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+
+    let mut out = PathBuf::new();
+    let mut depth = 0usize;
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir => out.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if depth == 0 {
+                    return None;
+                }
+                out.pop();
+                depth -= 1;
+            }
+            Component::Normal(segment) => {
+                out.push(segment);
+                depth += 1;
+            }
+        }
+    }
+    Some(out)
+}
+
 /// Atomically commit `content` to `path` via stage + fsync + rename.
 ///
 /// The single shared implementation of the hardened-writer pattern used for

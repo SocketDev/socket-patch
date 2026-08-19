@@ -1227,10 +1227,13 @@ async fn apply_patches_inner(
     let mut applied_base_purls: HashSet<String> = HashSet::new();
 
     for (purl, pkg_paths) in &all_packages {
-        // Release-variant ecosystems install exactly one directory per
-        // `package@version` (the variants are jars/wheels inside it), so a
-        // representative path is all the variant branch needs. npm's branch
-        // below iterates every physical copy.
+        // The paths carry every resolved physical copy. Release-variant
+        // ecosystems install one directory per `package@version` (the
+        // variants are jars/wheels inside it) — EXCEPT gem, where bundler's
+        // coexisting store layouts (the scoped `<engine>/<abi>/gems` store
+        // bundler >= 2 loads beside the flat `gems/` store bundler 1 loads)
+        // hold genuinely distinct physical copies of one `gem@version`.
+        // npm's branch below iterates every physical copy.
         let pkg_path = pkg_paths
             .first()
             .expect("all_packages only holds PURLs with at least one resolved copy");
@@ -1253,128 +1256,158 @@ async fn apply_patches_inner(
             {
                 continue;
             }
-            let mut applied = false;
-            // Did at least one variant reach `apply_package_patch`? A
-            // variant reaches it only after passing the first-file
-            // installed-distribution check (or under `--force`), so an
-            // attempted variant *is* the installed distribution — it must
-            // not be reported as "package_not_installed" even if the patch
-            // itself then fails. Tracks the "matched but failed" case so the
-            // failure message is honest and `unmatched` stays accurate.
-            let mut attempted = false;
 
-            for variant_purl in &variants {
-                let patch = match manifest.patches.get(variant_purl) {
-                    Some(p) => p,
-                    None => continue,
+            // Patch EVERY coexisting gem store copy (the npm multi-copy
+            // precedent): leaving the other store pristine is a silent
+            // false "applied" for whichever bundler loads it, and the
+            // per-copy results below make the JSON summary count each
+            // patched copy — the signal a second copy exists. PyPI/Maven
+            // keep the one-representative contract: their crawlers resolve
+            // one install dir per version, and a second path can only
+            // alias the same logical install (re-patching it would produce
+            // the spurious `already_patched` double-patch the nuget
+            // first-wins restoration fixed).
+            let copy_paths: &[PathBuf] =
+                if matches!(Ecosystem::from_purl(purl), Some(Ecosystem::Gem)) {
+                    pkg_paths.as_slice()
+                } else {
+                    std::slice::from_ref(pkg_path)
                 };
 
-                // Check the representative file's status (skip when
-                // --force). A mismatch *or* a missing file means this
-                // variant's distribution isn't the one on disk, so skip it —
-                // attempting it would only produce a spurious failure.
-                // Mirrors `select_installed_variants`, used by rollback/get.
-                //
-                // Exempt only an UNQUALIFIED singleton (the common bare
-                // `pkg:gem/name@ver` manifest key): it names no
-                // distribution, so a mismatch there is locally-modified
-                // bytes on the only candidate — exactly what the default
-                // mismatch policy covers (warn + apply the full verified
-                // patched content; `--strict` refuses). Gating it made that
-                // documented policy unreachable for gem/pypi/maven, so it
-                // falls through to `apply_package_patch`, whose
-                // `MismatchPolicy` handles it like the npm branch below.
-                // A QUALIFIED singleton (`?platform=`…) stays gated: it
-                // names one specific distribution, and — because the
-                // crawler drops the installed dir's platform suffix (see
-                // ruby_crawler's `parse_dir_name_version`) — this hash
-                // check is the ONLY thing resolving whether that
-                // distribution is the one on disk. Falling through would
-                // let a lone x86_64-linux record silently overwrite a
-                // darwin install in the Bundler plugin's `--silent`
-                // auto-apply, where the warn half of warn-and-apply is
-                // invisible.
-                if !args.force && (variants.len() > 1 || variants[0] != base_purl) {
-                    let first_status = match representative_file(&patch.files) {
-                        Some((file_name, file_info)) => Some(
-                            verify_file_patch(pkg_path, file_name, file_info)
-                                .await
-                                .status,
-                        ),
-                        None => None,
+            let mut any_copy_applied = false;
+            for pkg_path in copy_paths {
+                let mut applied = false;
+                // Did at least one variant reach `apply_package_patch`? A
+                // variant reaches it only after passing the first-file
+                // installed-distribution check (or under `--force`), so an
+                // attempted variant *is* the installed distribution — it must
+                // not be reported as "package_not_installed" even if the patch
+                // itself then fails. Tracks the "matched but failed" case so the
+                // failure message is honest and `unmatched` stays accurate.
+                // Both are PER COPY: a copy that matches no variant must fail
+                // loudly even when a sibling copy applied cleanly — that copy
+                // is a real on-disk gem some bundler loads.
+                let mut attempted = false;
+
+                for variant_purl in &variants {
+                    let patch = match manifest.patches.get(variant_purl) {
+                        Some(p) => p,
+                        None => continue,
                     };
-                    if !variant_matches_installed(first_status.as_ref()) {
-                        continue;
+
+                    // Check the representative file's status (skip when
+                    // --force). A mismatch *or* a missing file means this
+                    // variant's distribution isn't the one on disk, so skip it —
+                    // attempting it would only produce a spurious failure.
+                    // Mirrors `select_installed_variants`, used by rollback/get.
+                    //
+                    // Exempt only an UNQUALIFIED singleton (the common bare
+                    // `pkg:gem/name@ver` manifest key): it names no
+                    // distribution, so a mismatch there is locally-modified
+                    // bytes on the only candidate — exactly what the default
+                    // mismatch policy covers (warn + apply the full verified
+                    // patched content; `--strict` refuses). Gating it made that
+                    // documented policy unreachable for gem/pypi/maven, so it
+                    // falls through to `apply_package_patch`, whose
+                    // `MismatchPolicy` handles it like the npm branch below.
+                    // A QUALIFIED singleton (`?platform=`…) stays gated: it
+                    // names one specific distribution, and — because the
+                    // crawler drops the installed dir's platform suffix (see
+                    // ruby_crawler's `parse_dir_name_version`) — this hash
+                    // check is the ONLY thing resolving whether that
+                    // distribution is the one on disk. Falling through would
+                    // let a lone x86_64-linux record silently overwrite a
+                    // darwin install in the Bundler plugin's `--silent`
+                    // auto-apply, where the warn half of warn-and-apply is
+                    // invisible.
+                    if !args.force && (variants.len() > 1 || variants[0] != base_purl) {
+                        let first_status = match representative_file(&patch.files) {
+                            Some((file_name, file_info)) => Some(
+                                verify_file_patch(pkg_path, file_name, file_info)
+                                    .await
+                                    .status,
+                            ),
+                            None => None,
+                        };
+                        if !variant_matches_installed(first_status.as_ref()) {
+                            continue;
+                        }
                     }
+
+                    attempted = true;
+                    let result = apply_package_patch(
+                        variant_purl,
+                        pkg_path,
+                        &patch.files,
+                        &sources,
+                        Some(&patch.uuid),
+                        args.common.dry_run,
+                        policy,
+                    )
+                    .await;
+
+                    warn_mismatch_overwrites(&result, &args.common);
+                    // A variant that reached apply is the installed distribution
+                    // (it passed the first-file check, or `--force` bypassed it),
+                    // so record it as matched whether or not the patch succeeded.
+                    // Otherwise a variant that matched on disk but failed to patch
+                    // would land in `unmatched` and be misreported by the run
+                    // loop as a `package_not_installed` Skipped event — on top of
+                    // the Failed event it already emits. Mirrors the npm branch
+                    // below, which always marks an attempted PURL matched.
+                    matched_manifest_purls.insert(variant_purl.clone());
+                    if result.success {
+                        applied = true;
+                        // No `break`: apply *every* matching variant. PyPI/gem
+                        // have exactly one installed distribution (the rest
+                        // hash-mismatch and were skipped above), so this
+                        // applies a single variant for them; Maven's coexisting
+                        // classifier jars each get patched.
+                    } else {
+                        // A variant that reached apply IS the installed
+                        // distribution, so a failure here is a real apply
+                        // failure — flag it even if a *sibling* variant of the
+                        // same base succeeds (Maven's coexisting classifier
+                        // jars, or any base where `--force` attempts every
+                        // variant). Mirrors the npm branch below and the
+                        // rollback loop, which mark `has_errors` on every failed
+                        // result; without this a partial multi-variant failure
+                        // would leave a `failed` event in the envelope while the
+                        // command still reported `success` / exit 0.
+                        has_errors = true;
+                        if !args.common.silent && !args.common.json {
+                            eprintln!(
+                                "Failed to patch {}: {}",
+                                variant_purl,
+                                result.error.as_deref().unwrap_or("unknown error")
+                            );
+                        }
+                    }
+                    results.push(result);
                 }
 
-                attempted = true;
-                let result = apply_package_patch(
-                    variant_purl,
-                    pkg_path,
-                    &patch.files,
-                    &sources,
-                    Some(&patch.uuid),
-                    args.common.dry_run,
-                    policy,
-                )
-                .await;
-
-                warn_mismatch_overwrites(&result, &args.common);
-                // A variant that reached apply is the installed distribution
-                // (it passed the first-file check, or `--force` bypassed it),
-                // so record it as matched whether or not the patch succeeded.
-                // Otherwise a variant that matched on disk but failed to patch
-                // would land in `unmatched` and be misreported by the run
-                // loop as a `package_not_installed` Skipped event — on top of
-                // the Failed event it already emits. Mirrors the npm branch
-                // below, which always marks an attempted PURL matched.
-                matched_manifest_purls.insert(variant_purl.clone());
-                if result.success {
-                    applied = true;
-                    // No `break`: apply *every* matching variant. PyPI/gem
-                    // have exactly one installed distribution (the rest
-                    // hash-mismatch and were skipped above), so this
-                    // applies a single variant for them; Maven's coexisting
-                    // classifier jars each get patched.
+                if applied {
+                    any_copy_applied = true;
                 } else {
-                    // A variant that reached apply IS the installed
-                    // distribution, so a failure here is a real apply
-                    // failure — flag it even if a *sibling* variant of the
-                    // same base succeeds (Maven's coexisting classifier
-                    // jars, or any base where `--force` attempts every
-                    // variant). Mirrors the npm branch below and the
-                    // rollback loop, which mark `has_errors` on every failed
-                    // result; without this a partial multi-variant failure
-                    // would leave a `failed` event in the envelope while the
-                    // command still reported `success` / exit 0.
+                    // Nothing applied for this copy. `has_errors` was already set
+                    // per-variant above when a variant was attempted-but-failed;
+                    // set it here too for the no-variant-attempted case so both
+                    // paths fail the command — per copy, so a second store copy
+                    // that matches no variant fails loudly instead of silently
+                    // staying vulnerable behind a sibling copy's success.
                     has_errors = true;
-                    if !args.common.silent && !args.common.json {
-                        eprintln!(
-                            "Failed to patch {}: {}",
-                            variant_purl,
-                            result.error.as_deref().unwrap_or("unknown error")
-                        );
+                    if !attempted && !args.common.silent && !args.common.json {
+                        // No variant matched the installed distribution at all —
+                        // the package on disk isn't any known release variant.
+                        // (Attempted-but-failed variants already printed their own
+                        // per-variant failure line above.)
+                        eprintln!("Failed to patch {base_purl}: no matching variant found");
                     }
                 }
-                results.push(result);
             }
 
-            if applied {
+            if any_copy_applied {
                 applied_base_purls.insert(base_purl.clone());
-            } else {
-                // Nothing applied for this base. `has_errors` was already set
-                // per-variant above when a variant was attempted-but-failed;
-                // set it here too for the no-variant-attempted case so both
-                // paths fail the command.
-                has_errors = true;
-                if !attempted && !args.common.silent && !args.common.json {
-                    // No variant matched the installed distribution at all —
-                    // the package on disk isn't any known release variant.
-                    // (Attempted-but-failed variants already printed their own
-                    // per-variant failure line above.)
-                    eprintln!("Failed to patch {base_purl}: no matching variant found");
-                }
             }
         } else {
             // Vendor-owned purl: already reported by the synthesized

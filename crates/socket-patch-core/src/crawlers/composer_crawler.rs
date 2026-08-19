@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use super::types::{CrawledPackage, CrawlerOptions};
 use crate::patch::path_safety;
-use crate::utils::fs::{is_dir, is_file};
+use crate::utils::fs::{is_dir, is_file, normalize_lexically};
 use crate::utils::process::{CommandRunner, SystemCommandRunner};
 
 /// PHP/Composer ecosystem crawler for discovering packages in Composer
@@ -433,39 +433,9 @@ async fn resolve_project_root(vendor_path: &Path) -> PathBuf {
     normalize_lexically(&root).unwrap_or(root)
 }
 
-/// Resolve `.`/`..` without touching the filesystem, so a path can be
-/// containment-checked BEFORE it is opened (a canonicalizing check would
-/// have to stat the very path being validated, and would fail on
-/// not-yet-existing directories). Returns `None` when `..` pops above the
-/// path's own root — nothing legitimate does that, so it fails closed.
-///
-/// Symlinks are not resolved: a symlink INSIDE the project pointing out
-/// of it is a pre-existing trust decision of the project's own tree, the
-/// same assumption the rest of the crawler layer makes.
-fn normalize_lexically(path: &Path) -> Option<PathBuf> {
-    use std::path::Component;
-
-    let mut out = PathBuf::new();
-    let mut depth = 0usize;
-    for component in path.components() {
-        match component {
-            Component::Prefix(_) | Component::RootDir => out.push(component.as_os_str()),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if depth == 0 {
-                    return None;
-                }
-                out.pop();
-                depth -= 1;
-            }
-            Component::Normal(segment) => {
-                out.push(segment);
-                depth += 1;
-            }
-        }
-    }
-    Some(out)
-}
+// `normalize_lexically` (resolve `.`/`..` without touching the filesystem)
+// lives in `crate::utils::fs` — shared with the ruby crawler's
+// config-sourced `BUNDLE_PATH` containment guard.
 
 /// Resolve an installed.json `install-path` against the vendor tree.
 ///
