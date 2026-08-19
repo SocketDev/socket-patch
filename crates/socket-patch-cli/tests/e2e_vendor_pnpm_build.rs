@@ -1021,20 +1021,26 @@ fn run_legacy_capstone(pm: &str, lock_head: &str) {
          passing --frozen-lockfile would invalidate the documented caveat ({pm})"
     );
 
+    // `--no-frozen-lockfile` is load-bearing, not belt-and-braces: pnpm
+    // defaults --frozen-lockfile ON when CI=true, and the moved-checkout
+    // recovery WORKS by re-resolving the path-bound absolute specifier —
+    // frozen semantics skip that re-resolution and fail (observed on CI:
+    // ERR_PNPM_OUTDATED_LOCKFILE on pnpm 8, stale-path install on pnpm 7).
     let plain = corepack(
         &fresh,
         pm,
         &[
             "install",
             "--offline",
+            "--no-frozen-lockfile",
             "--store-dir",
             fresh_store.to_str().unwrap(),
         ],
     );
     assert!(
         plain.status.success(),
-        "moved-checkout `install --offline` must succeed from the vendored tarball \
-         ({pm}).\nstdout:\n{}\nstderr:\n{}",
+        "moved-checkout `install --offline --no-frozen-lockfile` must succeed from the \
+         vendored tarball ({pm}).\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&plain.stdout),
         String::from_utf8_lossy(&plain.stderr),
     );

@@ -26,7 +26,7 @@
 //!    the captured locks carry `file:/abs/project/.socket/...`. This makes
 //!    the frozen check path-bound: `pnpm install --frozen-lockfile` only
 //!    passes in a checkout at that exact absolute path (spike probes A/B),
-//!    while a plain `pnpm install --offline` at any path installs the
+//!    while a `pnpm install --offline --no-frozen-lockfile` at any path installs the
 //!    patched tarball and re-resolves only that specifier line (probe C).
 //!    Vendoring writes the absolute spelling pnpm itself emits and surfaces
 //!    the portability limit as `vendor_pnpm_legacy_absolute_specifier`.
@@ -521,9 +521,10 @@ pub async fn vendor_pnpm_legacy(
                 "{} records the override specifier as an absolute path \
                  (pnpm <= 8 absolutizes file: overrides itself), so `pnpm install \
                  --frozen-lockfile` only passes in a checkout at exactly \
-                 {} — checkouts at other paths must run `pnpm install --offline` \
-                 once, which installs the vendored tarball and re-resolves only \
-                 that specifier line",
+                 {} — checkouts at other paths must run `pnpm install --offline \
+                 --no-frozen-lockfile` once (the flag matters on CI, where pnpm \
+                 defaults --frozen-lockfile on), which installs the vendored \
+                 tarball and re-resolves only that specifier line",
                 grammar.describe(),
                 abs_root
             ),
