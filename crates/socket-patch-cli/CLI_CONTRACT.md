@@ -397,6 +397,7 @@ per service outcome:
 | integrity mismatch | cargo/maven/nuget: **refuse** (`vendor_prebuilt_integrity_mismatch`) — tampered bytes never fall back; other ecosystems (to be aligned): local build + `vendor_prebuilt_integrity_mismatch` | refuse (cargo/maven/nuget: `vendor_prebuilt_integrity_mismatch`; others: `vendor_prebuilt_required`) |
 | still building (`pending_build` / serve 408) | local build + `vendor_prebuilt_pending` | refuse |
 | not built / withdrawn / not found / no usable artifact | local build (quiet) | refuse |
+| gem stub gemspec missing / invalid | local build + `vendor_prebuilt_stub_missing` / `vendor_prebuilt_stub_invalid` | refuse (`vendor_prebuilt_required` / `vendor_prebuilt_stub_invalid`) |
 | 401 / 403 grant / 5xx / network error | local build + `vendor_prebuilt_unavailable` | refuse |
 | `--offline` | local build | refuse (`vendor_service_offline_conflict`) |
 
@@ -416,7 +417,14 @@ needs an eval-able stub gemspec that the `.gem` archive doesn't carry in bundler
 alongside the `.gem`, and the gem backend downloads + integrity-verifies both. A served gem whose
 stub is missing (a native-extension gem, for which the converter emits no stub, or a patch built
 before the stub rollout) is treated as a service miss — `auto` falls back to the local build,
-`service` refuses (`vendor_prebuilt_required`). For any ecosystem with no service path at all
+`service` refuses (`vendor_prebuilt_required`). A served stub that is present but INVALID — it
+never assigns the rubygems-required `summary`/`authors`, so every bundler major would reject the
+vendored path source at install time (a defect the 2026-08-19 live matrix found in every
+then-published gem stub) — follows the same miss policy under its own code (additive/MINOR):
+`auto` falls back to the local build with a loud `vendor_prebuilt_stub_invalid` warning naming
+the missing attributes, `service` refuses with `vendor_prebuilt_stub_invalid`. The check is a
+conservative textual heuristic (assignment-line presence, no ruby parsing); a valid stub is
+still written byte-verbatim. For any ecosystem with no service path at all
 `auto`/`build` build locally as before, and `service` refuses with
 `vendor_service_unsupported_ecosystem`. A successful service vend emits `vendor_prebuilt_downloaded`.
 Unrelated to `--download-mode` (which selects the patch-CONTENT format for the local build).
@@ -894,6 +902,7 @@ Every `--json` invocation emits a single JSON object that follows the **unified 
 | `vendor_lock_checksums_unsupported` / `vendor_stale_lock_checksum` | `failed` | vendor (gem): an ambiguous/platform CHECKSUMS entry, or a v1-wired lock whose stale token blocks the hot path (run `vendor --revert` + re-vendor). |
 | `redirect_gem_stale_install` | `redirect.warnings[]` (warning) | scan `--mode hosted` (gem): a stale UNPATCHED materialization (installed gem, or committed `vendor/cache` archive) that `bundle install` will reuse instead of fetching the redirected patch; the detail carries the verified remedy. Full rules and flavors: the "Gem stale-install guard" section. |
 | `pypi_{poetry,pdm,pipenv}_no_lockfile` | `failed` | vendor (pypi): a lock-less tool marker with no `requirements.txt` fallback — run `<tool> lock`. |
+| `vendor_prebuilt_stub_invalid` | `failed` / `skipped` (warning) | vendor (gem, `--vendor-source`): the served stub gemspec never assigns the rubygems-required `summary`/`authors`, so bundler would refuse the vendored path source at install time. `service`: refusal naming the missing attributes; `auto`: loud warning + local-build fallback. |
 | `vendor_*` / `pypi_*` / `gemfile_*` / `lock_*` / `locked_version_mismatch` / `user_authored_*` / `native_extensions_unsupported` / `platform_gem_unsupported` | `failed`/`skipped` | vendor: per-ecosystem refusal + drift vocabulary; see the Vendor command contract section. New tags are additive (MINOR). |
 
 ### Top-level `EnvelopeError` codes

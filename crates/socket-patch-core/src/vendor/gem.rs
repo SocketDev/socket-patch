@@ -667,7 +667,10 @@ enum GemServiceCopy {
 /// emits no stub — bundler can't build extensions for a path source) or a gem
 /// patch built before the stub rollout (the invalidation migration rebuilds
 /// those). The downloaded stub is re-checked for native extensions as defense
-/// in depth.
+/// in depth, and an INVALID stub — one missing the rubygems-required
+/// `summary`/`authors` assignments, the D4 served-artifact defect — follows
+/// the same miss policy under its own `vendor_prebuilt_stub_invalid` code
+/// (always loud, even under `auto`).
 async fn gem_service_copy(
     service: Option<&VendorServiceConfig>,
     record: &PatchRecord,
@@ -771,6 +774,48 @@ async fn gem_service_copy(
                  not build extensions for path-sourced gems"
             ),
         );
+    }
+
+    // Defense in depth (D4, gem live matrix 2026-08-19): production's stub
+    // generator omitted the rubygems-required `summary`/`authors`, and every
+    // bundler major validates path-source gemspecs — writing such a stub
+    // verbatim makes every later `bundle install` exit 1 (`missing value for
+    // attribute summary`). An INVALID stub follows the MISSING-stub policy
+    // (fall back under `auto`, refuse under `service`) but under its own
+    // `vendor_prebuilt_stub_invalid` code, and always loudly — the served
+    // artifact is defective, not merely absent. Nothing has been written yet,
+    // so the refusal leaves no partial artifacts.
+    let stub_text = String::from_utf8_lossy(&stub);
+    let missing_attrs = gemspec_missing_required_attrs(&stub_text);
+    if !missing_attrs.is_empty() {
+        let licenses_note = if gemspec_assigns_attr(&stub_text, "licenses")
+            || gemspec_assigns_attr(&stub_text, "license")
+        {
+            ""
+        } else {
+            " (it also omits `licenses`, a rubygems warning)"
+        };
+        let reason = format!(
+            "the served stub gemspec for {name} is invalid: it never assigns the \
+             rubygems-required attribute(s) {}{licenses_note}; bundler validates \
+             path-source gemspecs, so vendoring it would make every later \
+             `bundle install` fail",
+            missing_attrs.join(", "),
+        );
+        if cfg.source.requires_service() {
+            return hard(
+                "vendor_prebuilt_stub_invalid",
+                format!(
+                    "{reason}. Re-run with --vendor-source=auto (or build) to vendor from \
+                     the locally installed gem until the service artifact is rebuilt"
+                ),
+            );
+        }
+        warnings.push(VendorWarning::new(
+            "vendor_prebuilt_stub_invalid",
+            format!("{reason}; building locally instead"),
+        ));
+        return GemServiceCopy::FallBack;
     }
 
     // Extract the patched `.gem`'s data.tar.gz into a clean copy dir, then add
@@ -2193,6 +2238,56 @@ fn gemspec_declares_extensions(spec_text: &str) -> bool {
     false
 }
 
+/// Textual heuristic: does any line (comment-stripped) assign a NON-EMPTY
+/// value to `.{attr}`? Same conservative bar as
+/// [`gemspec_declares_extensions`] — no real ruby parsing. "Non-empty" filters
+/// the obviously-empty spellings (`""`, `''`, `[]`, `nil`, any of them
+/// `.freeze`-d); anything else counts, so a legitimate assignment can never be
+/// missed by over-cleverness.
+fn gemspec_assigns_attr(spec_text: &str, attr: &str) -> bool {
+    let needle = format!(".{attr}");
+    for raw in spec_text.lines() {
+        let line = raw.split('#').next().unwrap_or("");
+        if let Some(idx) = line.find(&needle) {
+            let after = line[idx + needle.len()..].trim_start();
+            if after.starts_with('=') && !after.starts_with("==") {
+                let value: String = after[1..]
+                    .replace(".freeze", "")
+                    .chars()
+                    .filter(|c| !c.is_whitespace() && !matches!(c, '"' | '\'' | '[' | ']' | ','))
+                    .collect();
+                if !value.is_empty() && value != "nil" {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// The rubygems-REQUIRED attributes a served stub gemspec must assign for
+/// bundler to accept it as a path source, returned as the list it is missing
+/// (empty = valid). Every bundler major validates path-source gemspecs and
+/// hard-fails on a nil `summary` or `authors` (`missing value for attribute
+/// summary`), so a stub without them bricks every later `bundle install` —
+/// the D4 defect the 2026-08-19 gem live matrix found in ALL served stubs.
+/// `authors` also accepts rubygems' singular `author =` alias. A missing
+/// `licenses` is only a rubygems WARNING, so it is deliberately not checked
+/// here (callers may mention it in advisory text via
+/// [`gemspec_assigns_attr`]). Fail-open by construction: only a stub where
+/// the assignment lines are demonstrably absent is flagged, so a legitimate
+/// stub always passes and is written byte-verbatim.
+fn gemspec_missing_required_attrs(spec_text: &str) -> Vec<&'static str> {
+    let mut missing = Vec::new();
+    if !gemspec_assigns_attr(spec_text, "summary") {
+        missing.push("summary");
+    }
+    if !gemspec_assigns_attr(spec_text, "authors") && !gemspec_assigns_attr(spec_text, "author") {
+        missing.push("authors");
+    }
+    missing
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2527,6 +2622,58 @@ mod tests {
             unwrap_refused(run_vendor(&root, &blobs, &installed, &record, false).await);
         assert_eq!(code, "vendor_lockfile_missing");
         assert!(!root.join(".socket").exists());
+    }
+
+    /// The required-attribute heuristic ([`gemspec_missing_required_attrs`]):
+    /// flag ONLY a demonstrably-absent (or demonstrably-empty) assignment —
+    /// a legitimate stub must always pass, whatever its spelling.
+    #[test]
+    fn required_attrs_heuristic() {
+        // The D4 production shape: no summary, no authors.
+        assert_eq!(
+            gemspec_missing_required_attrs(
+                "Gem::Specification.new do |s|\n  s.name = \"rack\".freeze\n  s.version = \"3.2.6\".freeze\n  s.require_paths = [\"lib\".freeze]\nend\n"
+            ),
+            vec!["summary", "authors"]
+        );
+        // A real converter/to_ruby stub: `.freeze`-d scalar + array. Valid.
+        assert_eq!(
+            gemspec_missing_required_attrs(
+                "Gem::Specification.new do |s|\n  s.summary = \"web server interface\".freeze\n  s.authors = [\"A. Person\".freeze, \"B. Person\".freeze]\nend\n"
+            ),
+            Vec::<&str>::new()
+        );
+        // Alternate spellings a valid stub may use: another block variable,
+        // no space around `=`, the singular `author =` alias, %w arrays.
+        assert_eq!(
+            gemspec_missing_required_attrs(
+                "Gem::Specification.new do |spec|\n  spec.summary=\"x\"\n  spec.author = \"A. Person\"\nend\n"
+            ),
+            Vec::<&str>::new()
+        );
+        assert_eq!(
+            gemspec_missing_required_attrs("s.summary = \"x\"\ns.authors = %w[alice bob]\n"),
+            Vec::<&str>::new()
+        );
+        // One present, one absent → only the absent one is named.
+        assert_eq!(
+            gemspec_missing_required_attrs("s.summary = \"x\".freeze\n"),
+            vec!["authors"]
+        );
+        // Demonstrably-empty spellings count as missing…
+        assert_eq!(
+            gemspec_missing_required_attrs("s.summary = \"\".freeze\ns.authors = [].freeze\n"),
+            vec!["summary", "authors"]
+        );
+        assert_eq!(
+            gemspec_missing_required_attrs("s.summary = nil\ns.authors = [\"\"]\n"),
+            vec!["summary", "authors"]
+        );
+        // …and so do commented-out assignments and `==` comparisons.
+        assert_eq!(
+            gemspec_missing_required_attrs("# s.summary = \"x\"\nraise if s.authors == [\"x\"]\n"),
+            vec!["summary", "authors"]
+        );
     }
 
     #[tokio::test]
@@ -4002,10 +4149,17 @@ mod tests {
     use crate::api::client::{ApiClient, ApiClientOptions};
     use crate::vendor::VendorSource;
 
-    /// A valid path-source stub (no native extensions).
-    const SERVICE_STUB: &[u8] = b"# -*- encoding: utf-8 -*-\n# stub: rack 3.2.6 ruby lib\n\nGem::Specification.new do |s|\n  s.name = \"rack\".freeze\n  s.version = \"3.2.6\".freeze\n  s.require_paths = [\"lib\".freeze]\nend\n";
+    /// A valid path-source stub (no native extensions; assigns the
+    /// rubygems-required `summary` + `authors`, which every bundler major
+    /// validates on path-source gemspecs).
+    const SERVICE_STUB: &[u8] = b"# -*- encoding: utf-8 -*-\n# stub: rack 3.2.6 ruby lib\n\nGem::Specification.new do |s|\n  s.name = \"rack\".freeze\n  s.version = \"3.2.6\".freeze\n  s.summary = \"a modular Ruby web server interface\".freeze\n  s.authors = [\"Rack maintainers\".freeze]\n  s.licenses = [\"MIT\".freeze]\n  s.require_paths = [\"lib\".freeze]\nend\n";
     /// A stub that declares native extensions (must be refused).
     const SERVICE_STUB_NATIVE: &[u8] = b"Gem::Specification.new do |s|\n  s.name = \"rack\".freeze\n  s.version = \"3.2.6\".freeze\n  s.extensions = [\"ext/rack/extconf.rb\"]\nend\n";
+    /// The DEFECTIVE stub shape production served as of 2026-08-19 (gem
+    /// live-matrix defect D4): it never assigns the rubygems-required
+    /// `summary` / `authors` (nor `licenses`), so bundler's path-source
+    /// validation rejects it and every post-vendor `bundle install` exits 1.
+    const SERVICE_STUB_INVALID: &[u8] = b"# -*- encoding: utf-8 -*-\n# stub: rack 3.2.6 ruby lib\n\nGem::Specification.new do |s|\n  s.name = \"rack\".freeze\n  s.version = \"3.2.6\".freeze\n  s.require_paths = [\"lib\".freeze]\nend\n";
 
     fn sri_sha512(bytes: &[u8]) -> String {
         use base64::Engine as _;
@@ -4146,8 +4300,10 @@ mod tests {
     }
 
     /// Service success: the prebuilt `.gem` is extracted into the copy dir, the
-    /// served stub is written as `rack.gemspec`, the Gemfile + lock are wired,
-    /// and a `vendor_prebuilt_downloaded` advisory is emitted — WITHOUT a local
+    /// served stub is written as `rack.gemspec` BYTE-VERBATIM (a valid stub —
+    /// one assigning `summary`/`authors` — must pass the required-attribute
+    /// validation untouched), the Gemfile + lock are wired, and a
+    /// `vendor_prebuilt_downloaded` advisory is emitted — WITHOUT a local
     /// install (a deliberately-missing `installed_dir`).
     #[tokio::test]
     async fn service_success_extracts_gem_and_wires_lock() {
@@ -4330,6 +4486,103 @@ mod tests {
                 .await
                 .unwrap(),
             GEMSPEC
+        );
+    }
+
+    /// D4 (gem live-matrix 2026-08-19): explicit `service` mode + a served stub
+    /// that never assigns the rubygems-required `summary`/`authors` refuses
+    /// with its own `vendor_prebuilt_stub_invalid` code, naming the missing
+    /// attributes — writing it verbatim would make every later `bundle install`
+    /// exit 1 (all bundler majors validate path-source gemspecs). No partial
+    /// artifacts are left and the lock is untouched.
+    #[tokio::test]
+    async fn service_stub_invalid_service_mode_hard_fails() {
+        let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
+        let gem = make_gem(&[("lib/rack.rb", PATCHED)]);
+        let sri = sri_sha512(&gem);
+        let stub_sri = sri_sha512(SERVICE_STUB_INVALID);
+        let server = wiremock::MockServer::start().await;
+        mount_gem_granted(&server, &gem, &sri, Some((SERVICE_STUB_INVALID, &stub_sri))).await;
+        let sources = PatchSources::blobs_only(&blobs);
+
+        let outcome = vendor_gem(
+            PURL,
+            &installed,
+            &root,
+            &record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            Some(&gem_service_cfg(
+                &server.uri(),
+                VendorSource::Service,
+                false,
+            )),
+        )
+        .await;
+        let (code, detail) = unwrap_refused(outcome);
+        assert_eq!(code, "vendor_prebuilt_stub_invalid");
+        assert!(
+            detail.contains("summary") && detail.contains("authors"),
+            "the refusal must name the missing attributes: {detail}"
+        );
+        assert!(!root.join(format!(".socket/vendor/gem/{UUID}")).exists());
+        // The lock is untouched.
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                .await
+                .unwrap(),
+            LOCK_DIRECT
+        );
+    }
+
+    /// D4 under the default `auto`: an INVALID served stub is treated exactly
+    /// like a MISSING one — fall back to the LOCAL build (installed gem +
+    /// locally derived stub) — but with a LOUD `vendor_prebuilt_stub_invalid`
+    /// warning naming the served-stub defect. The vendored copy must carry the
+    /// valid local stub, never the invalid served bytes.
+    #[tokio::test]
+    async fn service_stub_invalid_auto_falls_back_to_build() {
+        let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
+        let gem = make_gem(&[("lib/rack.rb", PATCHED)]);
+        let sri = sri_sha512(&gem);
+        let stub_sri = sri_sha512(SERVICE_STUB_INVALID);
+        let server = wiremock::MockServer::start().await;
+        mount_gem_granted(&server, &gem, &sri, Some((SERVICE_STUB_INVALID, &stub_sri))).await;
+        let sources = PatchSources::blobs_only(&blobs);
+
+        let outcome = vendor_gem(
+            PURL,
+            &installed,
+            &root,
+            &record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            Some(&gem_service_cfg(&server.uri(), VendorSource::Auto, false)),
+        )
+        .await;
+        let (result, entry, warnings) = unwrap_done(outcome);
+        assert!(result.success, "auto must fall back: {:?}", result.error);
+        assert!(entry.is_some());
+        assert_eq!(tokio::fs::read(copy_lib(&root)).await.unwrap(), PATCHED);
+        assert_eq!(
+            tokio::fs::read_to_string(copy_gemspec(&root))
+                .await
+                .unwrap(),
+            GEMSPEC,
+            "the vendored gemspec must be the LOCAL stub, not the invalid served bytes"
+        );
+        let warning = warnings
+            .iter()
+            .find(|w| w.code == "vendor_prebuilt_stub_invalid")
+            .expect("auto fallback must warn loudly about the invalid served stub");
+        assert!(
+            warning.detail.contains("summary") && warning.detail.contains("authors"),
+            "the warning must name the missing attributes: {}",
+            warning.detail
         );
     }
 
