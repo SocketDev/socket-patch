@@ -1150,7 +1150,10 @@ const GEM_NAME: &str = "padlock";
 const GEM_VERSION: &str = "1.2.0";
 const GEM_PURL: &str = "pkg:gem/padlock@1.2.0";
 const GEM_ENCODED: &str = "pkg%3Agem%2Fpadlock%401.2.0";
-const GEMSPEC_STUB: &[u8] = b"Gem::Specification.new do |s|\n  s.name = \"padlock\"\n  s.version = \"1.2.0\"\n  s.require_paths = [\"lib\"]\nend\n";
+// Assigns the rubygems-required `summary` + `authors` (as every healthy
+// rubygems-written stub does): the vendor/rebuild write choke point validates
+// them since the D4 invalid-stub hardening.
+const GEMSPEC_STUB: &[u8] = b"Gem::Specification.new do |s|\n  s.name = \"padlock\"\n  s.version = \"1.2.0\"\n  s.summary = \"repair fixture\"\n  s.authors = [\"socket-patch e2e\"]\n  s.require_paths = [\"lib\"]\nend\n";
 
 fn gem_copy_rel() -> String {
     format!(".socket/vendor/gem/{GEM_UUID}/{GEM_NAME}-{GEM_VERSION}")
@@ -1811,7 +1814,7 @@ async fn repair_gem_dir_tamper_matrix_and_vex_refusal() {
 ///     repair loops the same failure.
 #[tokio::test]
 async fn repair_refreshes_stale_inventory_from_service_provenance() {
-    const SERVICE_STUB: &[u8] = b"# converter-generated stub\nGem::Specification.new do |s|\n  s.name = \"padlock\"\n  s.version = \"1.2.0\"\n  s.require_paths = [\"lib\"]\nend\n";
+    const SERVICE_STUB: &[u8] = b"# converter-generated stub\nGem::Specification.new do |s|\n  s.name = \"padlock\"\n  s.version = \"1.2.0\"\n  s.summary = \"repair fixture\"\n  s.authors = [\"socket-patch e2e\"]\n  s.require_paths = [\"lib\"]\nend\n";
     let mock = MockServer::start().await;
     mount_gem_patch_api(&mock).await;
     let tmp = tempfile::tempdir().unwrap();
