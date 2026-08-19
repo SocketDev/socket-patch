@@ -1,0 +1,45 @@
+# gem (Ruby) bundler-4 matrix image: Ruby 3.4 + bundler ~> 4.0 + socket-patch.
+#
+# Bundler 4 is the current major (3 was skipped). Ruby 3.4's default bundler
+# is 2.6.x; the binstub selects the newest installed version, so installing
+# any 4.x makes `bundle` resolve to it without extra pinning. Bundler 4 writes
+# a CHECKSUMS section into fresh locks by default — the flavor the hosted-mode
+# rewrite canary in e2e_redirect_gem_build.rs pins.
+#
+# webrick is baked in (removed from Ruby stdlib in 3.0) so matrix probe
+# scripts can run an in-container loopback mock server under `--network none`.
+#
+# Companion to Dockerfile.gem-b1 for bundler-version matrix runs (the plain
+# `gem` image pins bundler ~> 2.7; this one covers the current major). Not
+# built in CI — build locally:
+#
+#   docker build -f tests/docker/Dockerfile.base -t socket-patch-test-base:latest .
+#   docker build -f tests/docker/Dockerfile.gem-b4 -t socket-patch-test-gem-b4:latest .
+#
+# BASE_IMAGE is overridable so a fix under test can be verified without
+# touching the shared :latest tags:
+#   docker build --build-arg BASE_IMAGE=socket-patch-test-base:mytag \
+#     -f tests/docker/Dockerfile.gem-b4 -t socket-patch-test-gem-b4:mytag .
+ARG BASE_IMAGE=socket-patch-test-base:latest
+FROM ${BASE_IMAGE} AS sptool
+
+FROM ruby:3.4-slim-bookworm
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      build-essential \
+      ca-certificates \
+      curl \
+      git \
+ && rm -rf /var/lib/apt/lists/* \
+ && gem install bundler -v '~> 4.0' --no-document \
+ && gem install webrick --no-document
+
+COPY --from=sptool /usr/local/bin/socket-patch /usr/local/bin/socket-patch
+# bundler 4 dropped the "Bundler version " prefix from `bundle --version`
+# (it prints the bare version), so the sanity grep matches the bare form.
+RUN ruby --version && gem --version && bundle --version \
+ && bundle --version | grep -qE '^(Bundler version )?4\.' \
+ && socket-patch --version
+
+WORKDIR /workspace
