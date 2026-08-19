@@ -3,6 +3,8 @@
 //! Socket's hosted vendored patches. Self-contained — reuses `run`'s
 //! discovery, then returns without touching the apply/vendor branches.
 
+use std::path::Path;
+
 use socket_patch_core::api::types::BatchPackagePatches;
 
 use crate::commands::vex::generate_vex_from_manifest_path;
@@ -369,6 +371,154 @@ fn build_redirect_json_envelope(
     result["status"] = serde_json::json!("success");
     result["redirect"] = redirect;
     result
+}
+
+/// Build the `redirect_gem_stale_install` warning for one stale gem
+/// materialization. RubyGems lays down three artifacts per install under one
+/// gem home (`<home>/gems/<leaf>/`, `<home>/cache/<leaf>.gem`,
+/// `<home>/specifications/<leaf>.gemspec`) and bundler treats the CACHE copy
+/// as an install source: `bundle install --force`/`--redownload` re-install
+/// from the stale cached `.gem` instead of re-fetching (verified on bundler
+/// 1.17.3 / 2.7.2 / 4.0.18 — bundler 1 silently, bundler 4 with an exit-37
+/// checksum refusal that still leaves the upstream bytes installed), so the
+/// remedy must name all three paths and must NOT prescribe those flags.
+fn gem_stale_install_warning(purl: &str, gem_dir: &Path) -> serde_json::Value {
+    let leaf = gem_dir
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    // `<home>/gems/<leaf>` → `<home>`; the cache/specifications siblings.
+    let siblings = gem_dir.parent().and_then(Path::parent).map(|home| {
+        (
+            home.join("cache").join(format!("{leaf}.gem")),
+            home.join("specifications").join(format!("{leaf}.gemspec")),
+        )
+    });
+    let remove_list = match &siblings {
+        Some((cache, spec)) => format!(
+            "{}, {}, and {}",
+            gem_dir.display(),
+            cache.display(),
+            spec.display()
+        ),
+        // A rootless gem dir (no `<home>/gems/` above it) cannot happen via
+        // the crawler, but never emit a half-empty prescription.
+        None => format!(
+            "{} (plus its cache/{leaf}.gem and specifications/{leaf}.gemspec siblings)",
+            gem_dir.display()
+        ),
+    };
+    serde_json::json!({
+        "code": "redirect_gem_stale_install",
+        "detail": format!(
+            "{purl} was redirected to the Socket patch registry, but a stale \
+             UNPATCHED install is already materialized at {} — `bundle install` \
+             reuses the installed gem (and its cached .gem) and never refetches, \
+             so the vulnerable upstream code stays live and silent; `bundle \
+             install --force`/`--redownload` do NOT heal it either (they \
+             reinstall from the stale cache — verified on bundler 1.17/2.7/4.0). \
+             Remove the stale materialization — {remove_list} — then run \
+             `bundle install` so bundler fetches the patched gem",
+            gem_dir.display()
+        ),
+    })
+}
+
+/// Whether an installed gem dir already carries the patch: every file in the
+/// record's map hashes to its `afterHash`. This is the one check that cannot
+/// false-positive on an already-patched install — an agent-mode `apply`
+/// patches the installed tree in place while the cached `.gem` stays
+/// upstream, so a cache-sha comparison would cry wolf on every agent→hosted
+/// migration; the file-hash check stays quiet there by construction.
+async fn gem_install_matches_record(
+    gem_dir: &Path,
+    record: &socket_patch_core::manifest::schema::PatchRecord,
+) -> bool {
+    use socket_patch_core::patch::apply::{verify_file_patch, VerifyStatus};
+    for (file_name, info) in &record.files {
+        if !matches!(
+            verify_file_patch(gem_dir, file_name, info).await.status,
+            VerifyStatus::AlreadyPatched
+        ) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Post-rewrite stale-materialization probe for gem redirects (live-verified
+/// defect, 2026-08-19 gem matrix: bundler 1.17.3 / 2.7.2 / 4.0.18, fresh
+/// containers): the gem hosted rewrite is pure Gemfile/lock text, so a gem
+/// ALREADY materialized under the project's bundle paths keeps its upstream
+/// bytes — the next `bundle install` prints `Using <gem>` and never
+/// refetches, on EVERY bundler major (bundler 4's CHECKSUMS verify at
+/// download time only, and nothing is downloaded), leaving the CVE live
+/// while the Gemfile + lock claim the patched registry.
+///
+/// Probes the same installed-gem discovery the apply flow uses
+/// ([`socket_patch_core::crawlers::RubyCrawler`] — `vendor/bundle`
+/// deployment layouts, or the `gem env` homes for non-deployment installs;
+/// layouts the crawler grows into are covered automatically) and
+/// hash-compares each found materialization against the patch record's
+/// `afterHash` file map. Every-file-at-afterHash means already patched —
+/// never warned; anything else is stale and gets a loud, prescriptive
+/// warning. Read-only by contract: nothing is ever deleted — the verified
+/// remedy is prescribed to the user.
+async fn gem_stale_install_warnings(
+    cwd: &Path,
+    confirmed: &[(String, String)],
+    records: &std::collections::BTreeMap<String, socket_patch_core::manifest::schema::PatchRecord>,
+) -> Vec<serde_json::Value> {
+    use socket_patch_core::crawlers::types::CrawlerOptions;
+    use socket_patch_core::crawlers::RubyCrawler;
+
+    let gem_confirmed: Vec<&(String, String)> = confirmed
+        .iter()
+        .filter(|(purl, _)| purl.starts_with("pkg:gem/"))
+        .collect();
+    if gem_confirmed.is_empty() {
+        return Vec::new();
+    }
+    let crawler = RubyCrawler::new();
+    let options = CrawlerOptions {
+        cwd: cwd.to_path_buf(),
+        global: false,
+        global_prefix: None,
+    };
+    let gem_paths = crawler.get_gem_paths(&options).await.unwrap_or_default();
+    let mut warnings = Vec::new();
+    for (purl, uuid) in gem_confirmed {
+        // The record fetched for THIS confirmed redirect: keyed by the view
+        // response's purl (== the reference purl), with a uuid fallback in
+        // case the two spellings ever diverge. A missing record (fetch
+        // failure) already carries its own record_fetch_failed warning, and
+        // with no afterHash map there is no sound stale judgment — skip,
+        // never guess.
+        let Some(record) = records
+            .get(purl)
+            .or_else(|| records.values().find(|r| &r.uuid == uuid))
+        else {
+            continue;
+        };
+        if record.files.is_empty() {
+            continue; // nothing to hash — never judge on zero evidence
+        }
+        let stripped = socket_patch_core::utils::purl::strip_purl_qualifiers(purl).to_string();
+        for gems_dir in &gem_paths {
+            let found = crawler
+                .find_by_purls(gems_dir, std::slice::from_ref(&stripped))
+                .await
+                .unwrap_or_default();
+            let Some(pkg) = found.get(&stripped) else {
+                continue;
+            };
+            if gem_install_matches_record(&pkg.path, record).await {
+                continue; // already patched — must never warn
+            }
+            warnings.push(gem_stale_install_warning(purl, &pkg.path));
+        }
+    }
+    warnings
 }
 
 /// `scan --redirect`: resolve hosted-patch references for the selected patches,
@@ -1288,6 +1438,21 @@ pub(super) async fn run_redirect(
         }
     }
 
+    // Gem stale-install probe: the rewrite above is pure text, so a gem
+    // already materialized under the project's bundle paths still holds the
+    // UPSTREAM bytes and the next `bundle install` will NOT refetch it (see
+    // `gem_stale_install_warnings`). Runs after the writes so the warning
+    // describes the project as this run leaves it, and only when the records
+    // were fetched (`--dry-run` fetches none — and rewrites nothing, so
+    // there is no post-rewrite state to warn about yet). Idempotent re-scans
+    // re-confirm and re-probe, so the warning keeps firing until the stale
+    // materialization is actually gone.
+    let gem_stale_warnings: Vec<serde_json::Value> = if args.common.dry_run {
+        Vec::new()
+    } else {
+        gem_stale_install_warnings(&args.common.cwd, &confirmed, &records).await
+    };
+
     // Cross-mode takeover: a committed vendored ledger (`.socket/vendor/state.json`)
     // may still claim package(s) this project also has a hosted redirect ledger
     // for — their tarballs would then be orphaned and that ledger stale. But the
@@ -1363,6 +1528,7 @@ pub(super) async fn run_redirect(
         warnings.extend(migration_warnings.iter().cloned());
         warnings.extend(rush_warnings.iter().cloned());
         warnings.extend(pnpm_warnings.iter().cloned());
+        warnings.extend(gem_stale_warnings.iter().cloned());
         warnings.extend(takeover_pre_warnings.iter().cloned());
         warnings.extend(takeover_warnings.iter().cloned());
         warnings.extend(prune_warnings.iter().cloned());
@@ -1440,6 +1606,16 @@ pub(super) async fn run_redirect(
             for w in &pnpm_warnings {
                 eprintln!("  warning: {}", w["detail"].as_str().unwrap_or_default());
             }
+            for w in &gem_stale_warnings {
+                // Code included: the stale-install hazard is a silent-CVE
+                // state, so the stderr line must be greppable by its stable
+                // code in CI logs, same as the JSON envelope.
+                eprintln!(
+                    "  warning ({}): {}",
+                    w["code"].as_str().unwrap_or_default(),
+                    w["detail"].as_str().unwrap_or_default()
+                );
+            }
             for w in &takeover_pre_warnings {
                 eprintln!("  warning: {}", w["detail"].as_str().unwrap_or_default());
             }
@@ -1475,7 +1651,8 @@ pub(super) async fn run_redirect(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_redirect_json_envelope, parse_purl_simple, plan_workspace_trust, pnpm_heal_root,
+        build_redirect_json_envelope, gem_install_matches_record, gem_stale_install_warning,
+        gem_stale_install_warnings, parse_purl_simple, plan_workspace_trust, pnpm_heal_root,
         pnpm_lock_carries_hosted_redirect, pnpm_lock_version_major, pnpm_trust_configured_detail,
         pnpm_trust_legacy_detail, pnpm_trust_manual_guidance,
         pnpm_trust_workspace_unreadable_detail, read_workspace_for_trust, TrustPlan,
@@ -1936,6 +2113,213 @@ mod tests {
         assert!(r["skipped"].is_array());
         assert!(r["warnings"].is_array());
         assert_eq!(r["dryRun"], false);
+    }
+
+    // ── gem stale-install probe (redirect_gem_stale_install) ──────────
+
+    use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
+    use socket_patch_core::manifest::schema::{PatchFileInfo, PatchRecord};
+
+    const GEM_UUID: &str = "8a9b0c1d-2e3f-4a5b-8c6d-7e8f9a0b1c2d";
+    const GEM_PURL: &str = "pkg:gem/stale-unit@1.0.0";
+    const GEM_UPSTREAM: &[u8] = b"module StaleUnit; STATUS = :vulnerable; end\n";
+    const GEM_PATCHED: &[u8] = b"module StaleUnit; STATUS = :patched; end\n";
+
+    fn gem_record() -> PatchRecord {
+        let mut files = std::collections::HashMap::new();
+        files.insert(
+            "lib/stale_unit.rb".to_string(),
+            PatchFileInfo {
+                before_hash: compute_git_sha256_from_bytes(GEM_UPSTREAM),
+                after_hash: compute_git_sha256_from_bytes(GEM_PATCHED),
+            },
+        );
+        PatchRecord {
+            uuid: GEM_UUID.to_string(),
+            exported_at: "2026-01-01T00:00:00Z".to_string(),
+            files,
+            vulnerabilities: std::collections::HashMap::new(),
+            description: String::new(),
+            license: String::new(),
+            tier: "free".to_string(),
+        }
+    }
+
+    /// Materialize the gem in bundler's deployment layout under `cwd`
+    /// (installed dir + cached .gem + specifications entry — what a real
+    /// `bundle install` leaves, verified on bundler 1.17/2.7/4.0). Returns
+    /// the installed gem dir.
+    fn materialize_gem(cwd: &std::path::Path, lib: &[u8]) -> std::path::PathBuf {
+        let home = cwd.join("vendor/bundle/ruby/3.3.0");
+        let gem_dir = home.join("gems/stale-unit-1.0.0");
+        std::fs::create_dir_all(gem_dir.join("lib")).unwrap();
+        std::fs::write(gem_dir.join("lib/stale_unit.rb"), lib).unwrap();
+        std::fs::create_dir_all(home.join("cache")).unwrap();
+        std::fs::write(home.join("cache/stale-unit-1.0.0.gem"), b"upstream .gem").unwrap();
+        std::fs::create_dir_all(home.join("specifications")).unwrap();
+        std::fs::write(home.join("specifications/stale-unit-1.0.0.gemspec"), b"#").unwrap();
+        gem_dir
+    }
+
+    /// The warning must carry the stable code, name the purl and ALL THREE
+    /// stale paths (installed dir, cache .gem, specifications entry), steer
+    /// away from the empirically DISPROVEN `--force`/`--redownload` remedies
+    /// (they reinstall from the stale cache — verified on bundler
+    /// 1.17.3/2.7.2/4.0.18), and prescribe the verified removal +
+    /// `bundle install` recovery.
+    #[test]
+    fn gem_stale_install_warning_names_paths_and_verified_remedy() {
+        let gem_dir = std::path::Path::new("/proj/vendor/bundle/ruby/3.3.0/gems/stale-unit-1.0.0");
+        let w = gem_stale_install_warning(GEM_PURL, gem_dir);
+        assert_eq!(w["code"], "redirect_gem_stale_install");
+        let detail = w["detail"].as_str().expect("detail is a string");
+        assert!(detail.contains(GEM_PURL), "{detail}");
+        assert!(
+            detail.contains("/proj/vendor/bundle/ruby/3.3.0/gems/stale-unit-1.0.0"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("/proj/vendor/bundle/ruby/3.3.0/cache/stale-unit-1.0.0.gem"),
+            "{detail}"
+        );
+        assert!(
+            detail
+                .contains("/proj/vendor/bundle/ruby/3.3.0/specifications/stale-unit-1.0.0.gemspec"),
+            "{detail}"
+        );
+        assert!(detail.contains("UNPATCHED"), "{detail}");
+        assert!(detail.contains("never refetches"), "{detail}");
+        assert!(
+            detail.contains("--force") && detail.contains("--redownload"),
+            "the disproven flags must be called out as non-remedies: {detail}"
+        );
+        assert!(detail.contains("do NOT heal"), "{detail}");
+        assert!(
+            detail.contains("Remove the stale materialization")
+                && detail.contains("`bundle install`"),
+            "the verified remedy must be prescribed: {detail}"
+        );
+    }
+
+    /// afterHash-map judgment: all-files-patched → true (never warn);
+    /// upstream bytes, tampered bytes, or a missing file → false (stale).
+    #[tokio::test]
+    async fn gem_install_matches_record_judges_by_after_hash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let record = gem_record();
+
+        // Patched install → matches.
+        let patched = tmp.path().join("patched");
+        std::fs::create_dir_all(patched.join("lib")).unwrap();
+        std::fs::write(patched.join("lib/stale_unit.rb"), GEM_PATCHED).unwrap();
+        assert!(gem_install_matches_record(&patched, &record).await);
+
+        // Pristine upstream install → stale.
+        let upstream = tmp.path().join("upstream");
+        std::fs::create_dir_all(upstream.join("lib")).unwrap();
+        std::fs::write(upstream.join("lib/stale_unit.rb"), GEM_UPSTREAM).unwrap();
+        assert!(!gem_install_matches_record(&upstream, &record).await);
+
+        // Tampered bytes (neither hash) → stale.
+        let tampered = tmp.path().join("tampered");
+        std::fs::create_dir_all(tampered.join("lib")).unwrap();
+        std::fs::write(tampered.join("lib/stale_unit.rb"), b"something else").unwrap();
+        assert!(!gem_install_matches_record(&tampered, &record).await);
+
+        // Patched file missing entirely → stale.
+        let hollow = tmp.path().join("hollow");
+        std::fs::create_dir_all(hollow.join("lib")).unwrap();
+        assert!(!gem_install_matches_record(&hollow, &record).await);
+    }
+
+    /// The probe end to end over a real deployment layout: a STALE
+    /// materialization of a confirmed gem redirect produces exactly one
+    /// warning naming the on-disk paths; an already-patched materialization,
+    /// a missing record, a zero-file record, and a non-gem purl all stay
+    /// silent; and the probe never touches the tree (read-only contract —
+    /// no destructive deletion by default).
+    #[tokio::test]
+    async fn gem_stale_install_warnings_probe_end_to_end() {
+        let confirmed = vec![(GEM_PURL.to_string(), GEM_UUID.to_string())];
+        let mut records = std::collections::BTreeMap::new();
+        records.insert(GEM_PURL.to_string(), gem_record());
+
+        // STALE: upstream bytes materialized → one warning, real paths named.
+        let stale = tempfile::tempdir().unwrap();
+        let gem_dir = materialize_gem(stale.path(), GEM_UPSTREAM);
+        let warnings = gem_stale_install_warnings(stale.path(), &confirmed, &records).await;
+        assert_eq!(warnings.len(), 1, "one stale materialization, one warning");
+        assert_eq!(warnings[0]["code"], "redirect_gem_stale_install");
+        let detail = warnings[0]["detail"].as_str().unwrap();
+        assert!(detail.contains(&gem_dir.display().to_string()), "{detail}");
+        assert!(detail.contains("cache/stale-unit-1.0.0.gem"), "{detail}");
+        assert!(
+            detail.contains("specifications/stale-unit-1.0.0.gemspec"),
+            "{detail}"
+        );
+        // Read-only: the stale tree is intact after the probe.
+        assert_eq!(
+            std::fs::read(gem_dir.join("lib/stale_unit.rb")).unwrap(),
+            GEM_UPSTREAM
+        );
+
+        // PATCHED: every record file at afterHash → silent (the
+        // cannot-false-positive contract; agent-mode applies leave exactly
+        // this state with an upstream cache .gem beside it).
+        let patched = tempfile::tempdir().unwrap();
+        materialize_gem(patched.path(), GEM_PATCHED);
+        assert!(
+            gem_stale_install_warnings(patched.path(), &confirmed, &records)
+                .await
+                .is_empty(),
+            "an already-patched materialization must never warn"
+        );
+
+        // MISSING RECORD (fetch failed — record_fetch_failed already warned):
+        // no afterHash map, no sound judgment → silent.
+        let empty_records = std::collections::BTreeMap::new();
+        assert!(
+            gem_stale_install_warnings(stale.path(), &confirmed, &empty_records)
+                .await
+                .is_empty()
+        );
+
+        // ZERO-FILE RECORD: nothing to hash → silent, never a guess.
+        let mut hollow_records = std::collections::BTreeMap::new();
+        let mut hollow = gem_record();
+        hollow.files.clear();
+        hollow_records.insert(GEM_PURL.to_string(), hollow);
+        assert!(
+            gem_stale_install_warnings(stale.path(), &confirmed, &hollow_records)
+                .await
+                .is_empty()
+        );
+
+        // NON-GEM confirmed purls never engage the probe (no ruby crawl).
+        let npm_confirmed = vec![("pkg:npm/x@1.0.0".to_string(), GEM_UUID.to_string())];
+        assert!(
+            gem_stale_install_warnings(stale.path(), &npm_confirmed, &records)
+                .await
+                .is_empty()
+        );
+    }
+
+    /// The record lookup falls back to a uuid match when the view response's
+    /// purl spelling diverges from the reference purl (qualified vs bare).
+    #[tokio::test]
+    async fn gem_stale_probe_record_lookup_falls_back_to_uuid() {
+        let stale = tempfile::tempdir().unwrap();
+        materialize_gem(stale.path(), GEM_UPSTREAM);
+        // Record keyed under a DIFFERENT (qualified) purl spelling.
+        let mut records = std::collections::BTreeMap::new();
+        records.insert(format!("{GEM_PURL}?platform=ruby"), gem_record());
+        let confirmed = vec![(GEM_PURL.to_string(), GEM_UUID.to_string())];
+        let warnings = gem_stale_install_warnings(stale.path(), &confirmed, &records).await;
+        assert_eq!(
+            warnings.len(),
+            1,
+            "the uuid fallback must find the record under a diverged purl key"
+        );
     }
 
     #[test]
