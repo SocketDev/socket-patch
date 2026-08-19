@@ -190,6 +190,11 @@ fn assert_apply_applied(stdout: &str, purl: &str) {
 /// Parse `stdout` as the `rollback` JSON envelope and assert the exact
 /// "nothing to roll back" success outcome (no patches were applied, so
 /// none can be reverted, but the run is clean — not a failure).
+///
+/// A manifest entry with no matching installed package surfaces as an
+/// additive marker record in `results[]` — `{purl, path: null, skipped:
+/// "package_not_installed"}`, no `success`/`error` keys — and never
+/// counts toward `rolledBack`/`failed` or flips the status.
 fn assert_rollback_noop(stdout: &str) {
     let v: serde_json::Value =
         serde_json::from_str(stdout.trim()).expect("rollback --global must emit valid JSON");
@@ -201,14 +206,17 @@ fn assert_rollback_noop(stdout: &str) {
     assert_eq!(v["alreadyOriginal"], 0, "envelope={v}");
     assert_eq!(v["failed"], 0, "envelope={v}");
     assert_eq!(v["dryRun"], false, "envelope={v}");
-    assert_eq!(
-        v["results"]
-            .as_array()
-            .expect("results must be an array")
-            .len(),
-        0,
-        "no package was patched, so results must be empty; envelope={v}"
-    );
+    for r in v["results"].as_array().expect("results must be an array") {
+        assert_eq!(
+            r["skipped"], "package_not_installed",
+            "a no-op rollback may carry only not-installed markers; envelope={v}"
+        );
+        assert!(r["path"].is_null(), "marker path must be null; envelope={v}");
+        assert!(
+            r.get("success").is_none() && r.get("error").is_none(),
+            "markers carry no success/error keys; envelope={v}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

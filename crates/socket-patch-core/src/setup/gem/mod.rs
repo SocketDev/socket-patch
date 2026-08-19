@@ -33,6 +33,7 @@
 //! with a published `socket-patch-bundler` gem.
 
 mod update;
+mod version;
 
 use std::path::{Path, PathBuf};
 
@@ -42,6 +43,7 @@ pub use update::{
     add_plugin_directive, is_plugin_directive_present, remove_plugin_directive, GemEditResult,
     GemSetupStatus,
 };
+pub use version::{probe_bundler, unsupported_bundler_message, BundlerProbe, MIN_BUNDLER};
 
 /// The in-tree plugin directory, relative to the project root.
 const PLUGIN_DIR: &str = ".socket/bundler-plugin";
@@ -200,6 +202,348 @@ async fn remove_stamp_artifacts(root: &Path) {
     } else {
         let _ = fs::write(&path, format!("{}\n", kept.join("\n"))).await;
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Bundler's machine-local plugin registration (`.bundle/plugin/index`)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// The plugin name our Gemfile directive registers — the key/value bundler
+/// records in its machine-local plugin index at first install.
+const PLUGIN_NAME: &str = "socket-patch";
+
+/// Outcome of clearing bundler's machine-local plugin registration on
+/// `setup --remove`.
+#[derive(Debug)]
+pub enum GemRegistrationCleanup {
+    /// socket-patch entries were found and removed (or would be, on dry-run).
+    Cleaned {
+        /// The registration index that held (or holds, on dry-run) them.
+        index: PathBuf,
+    },
+    /// No socket-patch registration exists — nothing to clean.
+    NotRegistered,
+    /// A socket-patch registration is (probably) present but could not be
+    /// cleared safely; the human remedy must be surfaced.
+    Residue {
+        /// The registration index carrying the leftover entries.
+        index: PathBuf,
+        /// Why the surgical cleanup refused/failed.
+        reason: String,
+    },
+}
+
+/// Bundler's app-config dir for `root`, following `Bundler.app_config_path`
+/// exactly: `$BUNDLE_APP_CONFIG` when set (a relative value resolves against
+/// the project root, NOT the process cwd), else `<root>/.bundle`. The
+/// machine-local plugin registration lives at `<app config>/plugin/index`, so
+/// getting this resolution wrong means `--remove` cleans (or misses) the
+/// wrong directory — e.g. under the official ruby Docker images, which export
+/// `BUNDLE_APP_CONFIG=/usr/local/bundle`.
+fn bundler_app_config_dir(root: &Path, env_value: Option<&std::ffi::OsStr>) -> PathBuf {
+    match env_value {
+        Some(v) if !v.is_empty() => {
+            let p = PathBuf::from(v);
+            if p.is_absolute() {
+                p
+            } else {
+                root.join(p)
+            }
+        }
+        _ => root.join(".bundle"),
+    }
+}
+
+/// One `key:` entry of a section in bundler's plugin index, carrying the raw
+/// lines it spans so kept entries are rebuilt byte-verbatim.
+struct IndexEntry {
+    /// The entry key (unquoted): a plugin name, or a hook event name.
+    key: String,
+    key_line: String,
+    /// Inline scalar value (`plugin_paths`-style `key: "value"`), unquoted.
+    value: Option<String>,
+    /// `- "item"` lines under the key, with their unquoted values.
+    items: Vec<(String, String)>,
+}
+
+/// One top-level section (`commands` / `hooks` / `load_paths` /
+/// `plugin_paths` / `sources`) of the index.
+struct IndexSection {
+    name: String,
+    header_line: String,
+    entries: Vec<IndexEntry>,
+}
+
+/// Strip a matching pair of quotes, mirroring bundler's `YAMLSerializer`
+/// loader (its regexes accept an optional `'`/`"` wrapper around values).
+fn unquote(s: &str) -> &str {
+    let s = s.trim();
+    let b = s.as_bytes();
+    if s.len() >= 2
+        && ((b[0] == b'"' && b[s.len() - 1] == b'"') || (b[0] == b'\'' && b[s.len() - 1] == b'\''))
+    {
+        &s[1..s.len() - 1]
+    } else {
+        s
+    }
+}
+
+/// Parse bundler's plugin index into sections/entries, refusing anything
+/// outside the exact dialect bundler's `YAMLSerializer` writes (`---`, then
+/// two-level `key:` maps with 2-space indents and `- "item"` array lines).
+/// The refusal matters more than the acceptance: a hand-edited or
+/// future-format index must fall through to the "residue remains" remedy
+/// path, never be rewritten on a guess and corrupted.
+fn parse_plugin_index(content: &str) -> Result<Vec<IndexSection>, String> {
+    let mut sections: Vec<IndexSection> = Vec::new();
+    for (n, line) in content.lines().enumerate() {
+        let lineno = n + 1;
+        if n == 0 && line.trim_end() == "---" {
+            continue;
+        }
+        if let Some(body) = line.strip_prefix("  ") {
+            // Second level: an array item or an entry key.
+            if body.starts_with(' ') || body.starts_with('\t') {
+                return Err(format!("line {lineno}: unexpected indentation"));
+            }
+            let section = sections
+                .last_mut()
+                .ok_or_else(|| format!("line {lineno}: entry before any section"))?;
+            if let Some(item) = body.strip_prefix("- ") {
+                let entry = section
+                    .entries
+                    .last_mut()
+                    .ok_or_else(|| format!("line {lineno}: array item before any key"))?;
+                entry
+                    .items
+                    .push((line.to_string(), unquote(item).to_string()));
+            } else if let Some((key, value)) = body.split_once(": ") {
+                section.entries.push(IndexEntry {
+                    key: unquote(key).to_string(),
+                    key_line: line.to_string(),
+                    value: Some(unquote(value).to_string()),
+                    items: Vec::new(),
+                });
+            } else if let Some(key) = body.strip_suffix(':') {
+                section.entries.push(IndexEntry {
+                    key: unquote(key).to_string(),
+                    key_line: line.to_string(),
+                    value: None,
+                    items: Vec::new(),
+                });
+            } else {
+                return Err(format!("line {lineno}: unrecognized entry line"));
+            }
+        } else if let Some(name) = line.strip_suffix(':') {
+            if name.is_empty() || name.contains(' ') || line.starts_with(' ') {
+                return Err(format!("line {lineno}: unrecognized section line"));
+            }
+            sections.push(IndexSection {
+                name: name.to_string(),
+                header_line: line.to_string(),
+                entries: Vec::new(),
+            });
+        } else {
+            return Err(format!("line {lineno}: unrecognized line"));
+        }
+    }
+    Ok(sections)
+}
+
+/// The result of surgically removing socket-patch from a parsed index.
+struct StrippedIndex {
+    /// The index content with every socket-patch entry removed; kept lines
+    /// are byte-verbatim.
+    content: String,
+    /// Whether any OTHER plugin's registration remains (the index must then
+    /// survive; an all-empty index is deleted instead).
+    plugins_remain: bool,
+    /// The dir bundler recorded as the plugin's install location
+    /// (`plugin_paths`), if present.
+    installed_dir: Option<PathBuf>,
+}
+
+/// Pure transform: drop every socket-patch entry from the index — its
+/// `plugin_paths`/`load_paths` keys, its `hooks` subscriptions (removing an
+/// event key left with no subscribers), and any `commands`/`sources` mapping
+/// to it — while preserving every other plugin's lines byte-verbatim.
+/// `Ok(None)` when nothing of ours is registered; `Err` when the file is not
+/// in bundler's dialect (the caller must warn, never write).
+fn strip_plugin_registration(content: &str) -> Result<Option<StrippedIndex>, String> {
+    let mut sections = parse_plugin_index(content)?;
+    let mut changed = false;
+    let mut installed_dir = None;
+    for section in &mut sections {
+        match section.name.as_str() {
+            "plugin_paths" | "load_paths" => {
+                let is_plugin_paths = section.name == "plugin_paths";
+                section.entries.retain(|e| {
+                    if e.key != PLUGIN_NAME {
+                        return true;
+                    }
+                    if is_plugin_paths {
+                        if let Some(v) = &e.value {
+                            installed_dir = Some(PathBuf::from(v));
+                        }
+                    }
+                    changed = true;
+                    false
+                });
+            }
+            "hooks" => {
+                section.entries.retain_mut(|e| {
+                    let before = e.items.len();
+                    e.items.retain(|(_, v)| v != PLUGIN_NAME);
+                    let lost = e.items.len() != before;
+                    changed |= lost;
+                    // Drop an event key we just emptied — bundler never
+                    // writes a subscriber-less event, so leaving one behind
+                    // is not round-trippable. Entries empty on arrival are
+                    // not ours to judge and stay.
+                    !(lost && e.items.is_empty() && e.value.is_none())
+                });
+            }
+            "commands" | "sources" => {
+                section.entries.retain(|e| {
+                    if e.value.as_deref() == Some(PLUGIN_NAME) {
+                        changed = true;
+                        false
+                    } else {
+                        true
+                    }
+                });
+            }
+            // Unknown section (a future bundler's addition): keep verbatim.
+            _ => {}
+        }
+    }
+    if !changed {
+        return Ok(None);
+    }
+    let plugins_remain = sections.iter().any(|s| !s.entries.is_empty());
+    let mut out = String::from("---\n");
+    for section in &sections {
+        out.push_str(&section.header_line);
+        out.push('\n');
+        for entry in &section.entries {
+            out.push_str(&entry.key_line);
+            out.push('\n');
+            for (line, _) in &entry.items {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+    }
+    Ok(Some(StrippedIndex {
+        content: out,
+        plugins_remain,
+        installed_dir,
+    }))
+}
+
+/// Clear bundler's machine-local plugin registration for socket-patch on
+/// `setup --remove` — the `.bundle/plugin/index` entries (hook subscriptions
+/// and plugin/load paths) bundler wrote when the wired plugin first installed.
+/// `remove_plugin_files` deletes the plugin *source*; without this step the
+/// registration dangles and every later `bundle install` prints bundler's
+/// "The following plugin paths don't exist ... Continuing without installing
+/// plugin socket-patch" block (with a misleading reinstall suggestion)
+/// forever. Surgical: only socket-patch entries leave the index; another
+/// plugin's registration survives byte-verbatim, and an index in an
+/// unexpected format is never rewritten on a guess — that reports
+/// [`GemRegistrationCleanup::Residue`] so the caller surfaces the
+/// `bundler plugin uninstall socket-patch` remedy instead.
+pub async fn remove_plugin_registration(root: &Path, dry_run: bool) -> GemRegistrationCleanup {
+    let env = std::env::var_os("BUNDLE_APP_CONFIG");
+    remove_plugin_registration_at(root, env.as_deref(), dry_run).await
+}
+
+/// [`remove_plugin_registration`] with the `BUNDLE_APP_CONFIG` resolution
+/// input made explicit (tests inject it; the public entry reads the process
+/// env, exactly like bundler itself).
+async fn remove_plugin_registration_at(
+    root: &Path,
+    app_config_env: Option<&std::ffi::OsStr>,
+    dry_run: bool,
+) -> GemRegistrationCleanup {
+    let plugin_root = bundler_app_config_dir(root, app_config_env).join("plugin");
+    let index = plugin_root.join("index");
+    let content = match fs::read_to_string(&index).await {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return GemRegistrationCleanup::NotRegistered;
+        }
+        Err(e) => {
+            return GemRegistrationCleanup::Residue {
+                index,
+                reason: format!("could not read it: {e}"),
+            };
+        }
+    };
+    if !content.contains(PLUGIN_NAME) {
+        return GemRegistrationCleanup::NotRegistered;
+    }
+    let stripped = match strip_plugin_registration(&content) {
+        Ok(Some(s)) => s,
+        // Mentioned only incidentally (e.g. inside another plugin's path):
+        // nothing registered under our name.
+        Ok(None) => return GemRegistrationCleanup::NotRegistered,
+        Err(reason) => {
+            return GemRegistrationCleanup::Residue {
+                index,
+                reason: format!("unexpected index format ({reason})"),
+            };
+        }
+    };
+    if dry_run {
+        return GemRegistrationCleanup::Cleaned { index };
+    }
+    // The dir bundler recorded as the plugin's install location. For our
+    // `path:`-sourced wiring that is the project's `.socket/bundler-plugin`
+    // (already deleted by `remove_plugin_files`); a `bundler plugin install`ed
+    // copy lives under the plugin root itself. Delete it only inside that
+    // root — never a recorded path elsewhere on the machine. The recorded
+    // path is attacker-authored input (the index can be committed), and
+    // `starts_with` compares components lexically, so a `..` traversal like
+    // `<plugin_root>/../../victim` would pass the prefix check while pointing
+    // anywhere on the machine: reject any `..` component outright (bundler
+    // never records traversal paths, so nothing legitimate is lost).
+    if let Some(dir) = &stripped.installed_dir {
+        let traversal_free = dir
+            .components()
+            .all(|c| !matches!(c, std::path::Component::ParentDir));
+        if traversal_free && dir.starts_with(&plugin_root) && dir != &plugin_root {
+            let _ = fs::remove_dir_all(dir).await;
+        }
+    }
+    let write_result = if stripped.plugins_remain {
+        // Another plugin is still registered: rewrite the index without our
+        // entries (staged + renamed — a torn index would break EVERY plugin).
+        crate::utils::fs::atomic_write_bytes_preserving_mode(&index, stripped.content.as_bytes())
+            .await
+            .map_err(|e| format!("could not rewrite it: {e}"))
+    } else {
+        // Nothing registered anymore: delete the index outright (bundler
+        // treats a missing index as empty and regenerates it on demand).
+        match fs::remove_file(&index).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(format!("could not delete it: {e}")),
+        }
+    };
+    if let Err(reason) = write_result {
+        return GemRegistrationCleanup::Residue { index, reason };
+    }
+    if !stripped.plugins_remain {
+        // Prune the now-empty machine-local plugin dir (and an app-config dir
+        // that held nothing else). `remove_dir` refuses non-empty dirs, so a
+        // `.bundle/config` or another plugin's `gems/` cache keeps its parent.
+        let _ = fs::remove_dir(&plugin_root).await;
+        if let Some(parent) = plugin_root.parent() {
+            let _ = fs::remove_dir(parent).await;
+        }
+    }
+    GemRegistrationCleanup::Cleaned { index }
 }
 
 /// Whether the generated plugin files are present *and* match the templates the
@@ -924,6 +1268,317 @@ mod tests {
                 .unwrap(),
             "my-scratch-dir/\n",
             "only our line is stripped; the user's file survives"
+        );
+    }
+
+    // ── bundler machine-local plugin registration cleanup ────────────
+
+    /// The exact index bundler 4.0.18 wrote in the 2026-08 e2e campaign
+    /// repro (agent-b4/eject-setup-remove), path root substituted.
+    fn solo_index(root: &str) -> String {
+        format!(
+            "---\ncommands:\nhooks:\n  after-install:\n  - \"socket-patch\"\n  \
+             after-install-all:\n  - \"socket-patch\"\nload_paths:\n  socket-patch:\n  \
+             - \"{root}/.socket/bundler-plugin/.\"\nplugin_paths:\n  \
+             socket-patch: \"{root}/.socket/bundler-plugin\"\nsources:\n"
+        )
+    }
+
+    #[test]
+    fn test_strip_registration_solo_plugin_empties_index() {
+        let stripped = strip_plugin_registration(&solo_index("/proj"))
+            .expect("bundler's own dump must parse")
+            .expect("socket-patch entries must be found");
+        assert!(
+            !stripped.plugins_remain,
+            "socket-patch was the only plugin — nothing may remain"
+        );
+        assert!(
+            !stripped.content.contains(PLUGIN_NAME),
+            "no socket-patch line may survive:\n{}",
+            stripped.content
+        );
+        assert_eq!(
+            stripped.installed_dir.as_deref(),
+            Some(Path::new("/proj/.socket/bundler-plugin")),
+            "the recorded install dir is surfaced for containment-gated deletion"
+        );
+        // The emptied hook events are dropped with their subscribers.
+        assert!(!stripped.content.contains("after-install"));
+    }
+
+    #[test]
+    fn test_strip_registration_preserves_other_plugins_verbatim() {
+        let index = "---\ncommands:\n  mycmd: \"other-plugin\"\nhooks:\n  after-install:\n  \
+             - \"other-plugin\"\n  - \"socket-patch\"\n  after-install-all:\n  \
+             - \"socket-patch\"\nload_paths:\n  other-plugin:\n  - \"/x/other/.\"\n  \
+             socket-patch:\n  - \"/proj/.socket/bundler-plugin/.\"\nplugin_paths:\n  \
+             other-plugin: \"/x/other\"\n  socket-patch: \"/proj/.socket/bundler-plugin\"\nsources:\n";
+        let stripped = strip_plugin_registration(index)
+            .expect("parses")
+            .expect("has our entries");
+        assert!(stripped.plugins_remain, "other-plugin is still registered");
+        assert_eq!(
+            stripped.content,
+            "---\ncommands:\n  mycmd: \"other-plugin\"\nhooks:\n  after-install:\n  \
+             - \"other-plugin\"\nload_paths:\n  other-plugin:\n  - \"/x/other/.\"\n\
+             plugin_paths:\n  other-plugin: \"/x/other\"\nsources:\n",
+            "only socket-patch lines leave; every kept line is byte-verbatim, \
+             and the after-install-all event we emptied is dropped"
+        );
+    }
+
+    #[test]
+    fn test_strip_registration_none_when_not_ours() {
+        // Another plugin whose PATH merely mentions socket-patch: nothing
+        // registered under our name — nothing to strip, nothing to write.
+        let index = "---\ncommands:\nhooks:\n  after-install:\n  - \"other\"\nload_paths:\n  \
+             other:\n  - \"/mono/socket-patch-fork/other/.\"\nplugin_paths:\n  \
+             other: \"/mono/socket-patch-fork/other\"\nsources:\n";
+        assert!(strip_plugin_registration(index).expect("parses").is_none());
+    }
+
+    #[test]
+    fn test_strip_registration_refuses_unknown_shape() {
+        // Psych-style deeper nesting is NOT bundler's dialect: refuse rather
+        // than rewrite on a guess (the caller warns with the remedy).
+        let psych = "---\nhooks:\n  after-install:\n    - socket-patch\n";
+        assert!(strip_plugin_registration(psych).is_err());
+        let garbage = "socket-patch says hi\n";
+        assert!(strip_plugin_registration(garbage).is_err());
+    }
+
+    #[test]
+    fn test_bundler_app_config_dir_resolution() {
+        use std::ffi::OsStr;
+        let root = Path::new("/proj");
+        // Unset / empty → <root>/.bundle.
+        assert_eq!(
+            bundler_app_config_dir(root, None),
+            Path::new("/proj/.bundle")
+        );
+        assert_eq!(
+            bundler_app_config_dir(root, Some(OsStr::new(""))),
+            Path::new("/proj/.bundle")
+        );
+        // Relative → resolved against the PROJECT ROOT (Bundler.app_config_path).
+        assert_eq!(
+            bundler_app_config_dir(root, Some(OsStr::new("bundle-config"))),
+            Path::new("/proj/bundle-config")
+        );
+        // Absolute → taken as-is (the official ruby images' /usr/local/bundle).
+        assert_eq!(
+            bundler_app_config_dir(root, Some(OsStr::new("/usr/local/bundle"))),
+            Path::new("/usr/local/bundle")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_remove_registration_missing_index_is_not_registered() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            remove_plugin_registration_at(dir.path(), None, false).await,
+            GemRegistrationCleanup::NotRegistered
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_remove_registration_solo_deletes_index_and_prunes_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let index = root.join(".bundle/plugin/index");
+        write(&index, &solo_index(&root.display().to_string())).await;
+
+        let r = remove_plugin_registration_at(root, None, false).await;
+        assert!(matches!(r, GemRegistrationCleanup::Cleaned { .. }), "{r:?}");
+        assert!(!index.exists(), "emptied index deleted");
+        assert!(
+            !root.join(".bundle").exists(),
+            "the plugin dir and an app-config dir holding nothing else are pruned"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_remove_registration_keeps_nonempty_app_config_dir() {
+        // A real project's .bundle/ holds a config file too: the index (and
+        // the emptied plugin dir) go, the user's config survives.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(
+            &root.join(".bundle/config"),
+            "---\nBUNDLE_PATH: \"vendor/bundle\"\n",
+        )
+        .await;
+        let index = root.join(".bundle/plugin/index");
+        write(&index, &solo_index(&root.display().to_string())).await;
+
+        let r = remove_plugin_registration_at(root, None, false).await;
+        assert!(matches!(r, GemRegistrationCleanup::Cleaned { .. }), "{r:?}");
+        assert!(!root.join(".bundle/plugin").exists(), "plugin dir pruned");
+        assert!(
+            root.join(".bundle/config").is_file(),
+            "the user's bundler config must survive"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_remove_registration_rewrites_index_when_others_remain() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let index = root.join(".bundle/plugin/index");
+        write(
+            &index,
+            "---\ncommands:\nhooks:\n  after-install:\n  - \"other\"\n  - \"socket-patch\"\n\
+             load_paths:\n  other:\n  - \"/x/other/.\"\n  socket-patch:\n  - \"/proj/p/.\"\n\
+             plugin_paths:\n  other: \"/x/other\"\n  socket-patch: \"/proj/p\"\nsources:\n",
+        )
+        .await;
+
+        let r = remove_plugin_registration_at(root, None, false).await;
+        assert!(matches!(r, GemRegistrationCleanup::Cleaned { .. }), "{r:?}");
+        let body = fs::read_to_string(&index).await.unwrap();
+        assert!(!body.contains("socket-patch"), "ours gone:\n{body}");
+        assert!(body.contains("- \"other\""), "theirs kept:\n{body}");
+    }
+
+    #[tokio::test]
+    async fn test_remove_registration_dry_run_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let index = root.join(".bundle/plugin/index");
+        let body = solo_index(&root.display().to_string());
+        write(&index, &body).await;
+
+        let r = remove_plugin_registration_at(root, None, true).await;
+        assert!(matches!(r, GemRegistrationCleanup::Cleaned { .. }), "{r:?}");
+        assert_eq!(
+            fs::read_to_string(&index).await.unwrap(),
+            body,
+            "dry-run must not touch the index"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_remove_registration_honors_bundle_app_config() {
+        // Relative BUNDLE_APP_CONFIG resolves against the project root —
+        // the same rule bundler applies (`Bundler.app_config_path`).
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let index = root.join("bundle-config/plugin/index");
+        write(&index, &solo_index(&root.display().to_string())).await;
+        // A decoy at the default location must NOT be the one cleaned.
+        let decoy = root.join(".bundle/plugin/index");
+        write(&decoy, &solo_index("/elsewhere")).await;
+
+        let r =
+            remove_plugin_registration_at(root, Some(std::ffi::OsStr::new("bundle-config")), false)
+                .await;
+        assert!(matches!(r, GemRegistrationCleanup::Cleaned { .. }), "{r:?}");
+        assert!(!index.exists(), "the app-config index is the one cleared");
+        assert!(
+            decoy.is_file(),
+            "the default-location index is out of scope when BUNDLE_APP_CONFIG points elsewhere"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_remove_registration_unparseable_reports_residue() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let index = root.join(".bundle/plugin/index");
+        // Mentions socket-patch but is not bundler's dialect: never rewrite
+        // on a guess — report residue so the caller surfaces the remedy.
+        let body = "%TAG !u! tag:example\n---\nplugins: [socket-patch]\n";
+        write(&index, body).await;
+
+        let r = remove_plugin_registration_at(root, None, false).await;
+        assert!(matches!(r, GemRegistrationCleanup::Residue { .. }), "{r:?}");
+        assert_eq!(
+            fs::read_to_string(&index).await.unwrap(),
+            body,
+            "an unrecognized index must survive byte-identical"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_remove_registration_deletes_installed_dir_only_inside_plugin_root() {
+        // A `bundler plugin install`ed copy lives under .bundle/plugin — that
+        // dir goes. A recorded path OUTSIDE the plugin root (our path-sourced
+        // project dir, or anything else on the machine) is never touched here.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let inside = root.join(".bundle/plugin/gems/socket-patch-0.1.0");
+        fs::create_dir_all(&inside).await.unwrap();
+        write(&inside.join("plugins.rb"), "# installed copy\n").await;
+        let index = root.join(".bundle/plugin/index");
+        write(
+            &index,
+            &format!(
+                "---\ncommands:\nhooks:\n  after-install:\n  - \"socket-patch\"\n\
+                 load_paths:\n  socket-patch:\n  - \"{0}/.\"\nplugin_paths:\n  \
+                 socket-patch: \"{0}\"\nsources:\n",
+                inside.display()
+            ),
+        )
+        .await;
+        let r = remove_plugin_registration_at(root, None, false).await;
+        assert!(matches!(r, GemRegistrationCleanup::Cleaned { .. }), "{r:?}");
+        assert!(!inside.exists(), "the in-root installed copy is deleted");
+
+        // Outside the plugin root: left alone.
+        let outside = root.join("elsewhere/socket-patch");
+        fs::create_dir_all(&outside).await.unwrap();
+        let index2 = root.join(".bundle/plugin/index");
+        write(
+            &index2,
+            &format!(
+                "---\ncommands:\nhooks:\nload_paths:\n  socket-patch:\n  - \"{0}/.\"\n\
+                 plugin_paths:\n  socket-patch: \"{0}\"\nsources:\n",
+                outside.display()
+            ),
+        )
+        .await;
+        let r = remove_plugin_registration_at(root, None, false).await;
+        assert!(matches!(r, GemRegistrationCleanup::Cleaned { .. }), "{r:?}");
+        assert!(
+            outside.is_dir(),
+            "a recorded dir outside the plugin root must never be deleted"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_remove_registration_rejects_traversal_in_recorded_dir() {
+        // A committed `.bundle/plugin/index` is attacker-authored input: it
+        // can record ANY path as the plugin's install dir. `..` components
+        // let `<plugin_root>/../../victim` pass a purely lexical
+        // `starts_with(plugin_root)` check while pointing outside the plugin
+        // root — such a dir must never be deleted. Bundler itself never
+        // records traversal paths, so rejecting them loses nothing.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let victim = root.join("victim");
+        fs::create_dir_all(&victim).await.unwrap();
+        write(&victim.join("precious.txt"), "do not delete\n").await;
+        // Lexically under the plugin root, physically the victim dir.
+        let evil = root.join(".bundle/plugin/../../victim");
+        assert!(
+            evil.starts_with(root.join(".bundle/plugin")),
+            "precondition: the traversal path passes the lexical prefix check"
+        );
+        write(
+            &root.join(".bundle/plugin/index"),
+            &format!(
+                "---\ncommands:\nhooks:\nload_paths:\n  socket-patch:\n  - \"{0}/.\"\n\
+                 plugin_paths:\n  socket-patch: \"{0}\"\nsources:\n",
+                evil.display()
+            ),
+        )
+        .await;
+        let r = remove_plugin_registration_at(root, None, false).await;
+        assert!(matches!(r, GemRegistrationCleanup::Cleaned { .. }), "{r:?}");
+        assert!(
+            victim.join("precious.txt").is_file(),
+            "a recorded dir with `..` traversal must never be deleted"
         );
     }
 

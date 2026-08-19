@@ -933,6 +933,7 @@ pub async fn revert_cargo_vendor(
             // path-form) would break every --locked build with no breadcrumb.
             Err(e) => {
                 return RevertOutcome {
+                    kept_artifact: false,
                     success: false,
                     warnings: out.warnings,
                     error: Some(format!("failed to restore the Cargo.lock entry: {e}")),
@@ -943,6 +944,7 @@ pub async fn revert_cargo_vendor(
 
     if let Err(e) = cargo_config::drop_patch_entry(project_root, name, dry_run).await {
         return RevertOutcome {
+            kept_artifact: false,
             success: false,
             warnings: out.warnings,
             error: Some(format!("failed to update .cargo/config.toml: {e}")),

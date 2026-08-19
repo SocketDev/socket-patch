@@ -1,0 +1,46 @@
+# gem (Ruby) bundler-1 matrix image: Ruby 3.1 + bundler 1.17.3 + socket-patch.
+#
+# Bundler 1.17.3 is the last 1.x release. It calls `untaint`, which Ruby 3.2
+# removed, so this image pins ruby:3.1 (the newest Ruby that still carries the
+# method as a no-op) on bookworm so the socket-patch binary compiled against
+# the base image's glibc still runs. Ruby 3.1 ships a default bundler 2.3.x;
+# BUNDLER_VERSION forces the binstub to select 1.17.3 in every process.
+#
+# webrick is baked in (removed from Ruby stdlib in 3.0) so matrix probe
+# scripts can run an in-container loopback mock server under `--network none`.
+#
+# Used by the bundler-version legs in setup_matrix_gem.rs (the >= 2.2 plugin
+# floor: bundler 1.x cannot load `plugin ... path:` directives). These legs
+# do NOT run in CI (the CI setup-matrix job drives scripts/setup-matrix.sh
+# against the plain `gem` image only) — build locally:
+#
+#   docker build -f tests/docker/Dockerfile.base -t socket-patch-test-base:latest .
+#   docker build -f tests/docker/Dockerfile.gem-b1 -t socket-patch-test-gem-b1:latest .
+#
+# BASE_IMAGE is overridable so a fix under test can be verified without
+# touching the shared :latest tags:
+#   docker build --build-arg BASE_IMAGE=socket-patch-test-base:mytag \
+#     -f tests/docker/Dockerfile.gem-b1 -t socket-patch-test-gem-b1:mytag .
+ARG BASE_IMAGE=socket-patch-test-base:latest
+FROM ${BASE_IMAGE} AS sptool
+
+FROM ruby:3.1-slim-bookworm
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      build-essential \
+      ca-certificates \
+      curl \
+      git \
+ && rm -rf /var/lib/apt/lists/* \
+ && gem install bundler -v 1.17.3 --no-document \
+ && gem install webrick --no-document
+
+ENV BUNDLER_VERSION=1.17.3
+
+COPY --from=sptool /usr/local/bin/socket-patch /usr/local/bin/socket-patch
+RUN ruby --version && gem --version && bundle --version \
+ && bundle --version | grep -q 'Bundler version 1\.17\.3' \
+ && socket-patch --version
+
+WORKDIR /workspace

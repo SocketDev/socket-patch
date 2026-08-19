@@ -2,7 +2,7 @@ use clap::Args;
 use socket_patch_core::api::client::get_api_client_with_overrides;
 use socket_patch_core::manifest::cleanup_blobs::{cleanup_unused_blobs, format_cleanup_result};
 use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
-use socket_patch_core::manifest::schema::PatchManifest;
+use socket_patch_core::manifest::schema::{PatchFileInfo, PatchManifest};
 use socket_patch_core::telemetry::{track_patch_remove_failed, track_patch_removed};
 use socket_patch_core::utils::purl::purl_matches_identifier;
 use socket_patch_core::vendor::{load_state, save_state, VendorEntry, VendorState};
@@ -272,6 +272,16 @@ pub async fn run(args: RemoveArgs) -> i32 {
 
     // First, rollback the patch if not skipped
     let mut rollback_count = 0;
+    // In-scope manifest entries the nested rollback SKIPPED because the
+    // crawler found no installed package (`RollbackOutcome::not_installed`,
+    // sorted). These were NOT reverted — and "not installed" can also mean
+    // "installed but missed by the crawler" (layout gaps are a documented
+    // reality), leaving patched bytes on disk. The removal below still
+    // drops them from the manifest (the long-uninstalled contract), but
+    // their beforeHash blobs are kept out of the cleanup sweep and a
+    // warning event rides the envelope. Empty under `--skip-rollback`
+    // (no rollback ran, so nothing is known — semantics unchanged).
+    let mut rollback_not_installed: Vec<String> = Vec::new();
     if !args.skip_rollback {
         if !args.common.json && !args.common.silent {
             println!("Rolling back patch before removal...");
@@ -286,7 +296,8 @@ pub async fn run(args: RemoveArgs) -> i32 {
         )
         .await
         {
-            Ok((success, results, _vendored_skipped)) => {
+            Ok((success, results, _vendored_skipped, not_installed)) => {
+                rollback_not_installed = not_installed;
                 if !success {
                     track_patch_remove_failed(
                         "Rollback failed during patch removal",
@@ -471,7 +482,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
         remove_patch_from_manifest(&args.identifier, &manifest_path).await
     };
     match removal {
-        Ok((removed, manifest)) => {
+        Ok((removed, updated_manifest)) => {
             if removed.is_empty() {
                 emit_not_found(
                     args.common.json,
@@ -500,11 +511,71 @@ pub async fn run(args: RemoveArgs) -> i32 {
                 }
             }
 
+            // FAIL-CLOSED (crawler-miss guard): dropped entries whose nested
+            // rollback was skipped as not-installed were never actually
+            // reverted, and the miss may be a crawler layout gap with the
+            // patched bytes still on disk. Sweeping their beforeHash blobs
+            // would permanently destroy the only local revert data, so they
+            // are pinned into the sweep's keep set; a warning event + stderr
+            // line surface each one. Entries genuinely rolled back (or
+            // already original) appear in `results`, never here.
+            let retained_not_installed: Vec<&str> = rollback_not_installed
+                .iter()
+                .map(String::as_str)
+                .filter(|p| removed.iter().any(|r| r == p))
+                .collect();
+            if !args.common.json && !args.common.silent && !retained_not_installed.is_empty() {
+                eprintln!(
+                    "\nWarning: {} removed patch(es) had no matching installed package, so \
+                     their rollback was skipped (a crawler miss would look the same); their \
+                     revert data (beforeHash blobs) was kept in .socket/blobs:",
+                    retained_not_installed.len()
+                );
+                for purl in &retained_not_installed {
+                    eprintln!("  - {purl}");
+                }
+            }
+
             // Clean up unused blobs (previewed, not deleted, on --dry-run).
+            // The reference manifest is the post-removal manifest PLUS one
+            // synthetic keep record per retained entry above:
+            // `cleanup_unused_blobs` keeps only afterHash blobs (beforeHash
+            // blobs are normally re-downloadable on demand), so each pinned
+            // before-hash is listed in an afterHash slot. Scoped to REVERT
+            // data only — the retained entries' real afterHash blobs stay
+            // sweepable like any other orphan.
+            let mut cleanup_reference = updated_manifest.clone();
+            for purl in &retained_not_installed {
+                let Some(record) = manifest.patches.get(*purl) else {
+                    continue;
+                };
+                let pinned: std::collections::HashMap<String, PatchFileInfo> = record
+                    .files
+                    .iter()
+                    .filter(|(_, info)| !info.before_hash.is_empty())
+                    .map(|(file, info)| {
+                        (
+                            file.clone(),
+                            PatchFileInfo {
+                                before_hash: String::new(),
+                                after_hash: info.before_hash.clone(),
+                            },
+                        )
+                    })
+                    .collect();
+                if pinned.is_empty() {
+                    continue; // every file was created-by-patch: no revert blobs
+                }
+                let mut keep_record = record.clone();
+                keep_record.files = pinned;
+                cleanup_reference
+                    .patches
+                    .insert((*purl).to_string(), keep_record);
+            }
             let blobs_path = socket_dir.join("blobs");
             let mut blobs_removed = 0;
             if let Ok(cleanup_result) =
-                cleanup_unused_blobs(&manifest, &blobs_path, args.common.dry_run).await
+                cleanup_unused_blobs(&cleanup_reference, &blobs_path, args.common.dry_run).await
             {
                 blobs_removed = cleanup_result.blobs_removed;
                 if !args.common.json && !args.common.silent && cleanup_result.blobs_removed > 0 {
@@ -527,8 +598,40 @@ pub async fn run(args: RemoveArgs) -> i32 {
                 } else {
                     PatchAction::Removed
                 };
-                // Chronological: the vendor revert ran before the rollback
-                // and the manifest mutation. Reverted events bypass
+                // The crawler-miss warnings first (the rollback skip is the
+                // earliest outcome chronologically). Recorded — they bump
+                // `summary.skipped` like the vendor retained/warning events
+                // — and additive: runs with every target genuinely rolled
+                // back (or already original) emit none, leaving existing
+                // consumers byte-identical output.
+                for purl in &retained_not_installed {
+                    let mut kept: Vec<String> = manifest
+                        .patches
+                        .get(*purl)
+                        .map(|record| {
+                            record
+                                .files
+                                .values()
+                                .filter(|info| !info.before_hash.is_empty())
+                                .map(|info| info.before_hash.clone())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    kept.sort();
+                    kept.dedup();
+                    env.record(
+                        PatchEvent::new(PatchAction::Skipped, (*purl).to_string())
+                            .with_reason(
+                                "rollback_not_installed",
+                                "rollback skipped: no installed package found (a crawler \
+                                 miss would look the same); beforeHash blobs kept in \
+                                 .socket/blobs so a later rollback/repair can still restore",
+                            )
+                            .with_details(serde_json::json!({ "beforeBlobsRetained": kept })),
+                    );
+                }
+                // Chronological: the vendor revert ran before the manifest
+                // mutation. Reverted events bypass
                 // `record` so `summary.removed` stays equal to the number
                 // of manifest entries deleted (same rule as the blob-sweep
                 // carrier below); retained/warning Skipped events bump

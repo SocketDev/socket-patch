@@ -1,12 +1,13 @@
 use clap::Args;
 use socket_patch_core::api::blob_fetcher::{fetch_blobs_by_hash, format_fetch_result};
-use socket_patch_core::api::client::get_api_client_with_overrides;
+use socket_patch_core::api::client::{get_api_client_with_overrides, ApiClient};
 use socket_patch_core::crawlers::CrawlerOptions;
 use socket_patch_core::manifest::operations::{get_before_hash_blobs, read_manifest};
 use socket_patch_core::manifest::schema::{PatchFileInfo, PatchManifest, PatchRecord};
 use socket_patch_core::patch::apply::select_installed_variants;
 use socket_patch_core::patch::rollback::{
-    rollback_package_patch, RollbackResult, VerifyRollbackStatus,
+    cannot_rollback_error, rollback_package_patch, verify_file_rollback, RollbackResult,
+    VerifyRollbackResult, VerifyRollbackStatus,
 };
 use socket_patch_core::telemetry::{track_patch_rollback_failed, track_patch_rolled_back};
 use socket_patch_core::utils::purl::strip_purl_qualifiers;
@@ -49,6 +50,30 @@ pub struct RollbackArgs {
 struct PatchToRollback {
     purl: String,
     patch: PatchRecord,
+}
+
+/// Everything one rollback pass learned.
+///
+/// `success` means "no attempted rollback failed" — per-package semantics
+/// only. Entries whose package is not installed are NOT failures and never
+/// flip it: apply and rollback are deliberately asymmetric here. Apply's job
+/// is "make the tree patched", so an unmatched purl means the job was NOT
+/// done (apply's all-unmatched run exits 1 / `partialFailure`); rollback's
+/// job is "make the tree unpatched", and a not-installed package already
+/// satisfies that end state — so even a run whose in-scope targets ALL turn
+/// out not-installed exits 0 / `success`. Do not "fix" this into symmetry:
+/// `remove` also rides on it (it drops long-uninstalled entries from the
+/// manifest via its "No packages found to rollback" path).
+struct RollbackOutcome {
+    /// No attempted rollback failed (per-package; see above).
+    success: bool,
+    results: Vec<RollbackResult>,
+    /// Vendor-owned purls excluded from in-place rollback (benign).
+    vendored_skipped: Vec<String>,
+    /// In-scope manifest entries with no installed package on disk —
+    /// apply's `unmatched` twin (`package_not_installed`). Never in the
+    /// before-blob plan, never a failed result. Sorted for determinism.
+    not_installed: Vec<String>,
 }
 
 // ── local-redirect rollback helpers (go only) ────────────────────────────────
@@ -230,6 +255,99 @@ fn result_to_json(result: &RollbackResult) -> serde_json::Value {
     })
 }
 
+/// Skipped marker appended to `results[]` for an in-scope manifest entry
+/// with no installed package — apply's `package_not_installed` Skipped
+/// event, rollback-side. Deliberately NOT a result record: no `success`,
+/// no `error`, `path` null (there is no installed tree to name), and it
+/// never counts toward `rolledBack`/`failed` or flips the status —
+/// rollback exits 0 even when ALL in-scope targets land here (see
+/// `RollbackOutcome` for the apply/rollback asymmetry).
+fn skipped_not_installed_json(purl: &str) -> serde_json::Value {
+    serde_json::json!({
+        "purl": purl,
+        "path": null,
+        "skipped": "package_not_installed",
+    })
+}
+
+/// Per-package failure results for the pre-flight before-blob abort.
+///
+/// The abort fires before the rollback loop produces any per-package
+/// results, so without these the `--json` envelope claimed `failed: 0`
+/// with empty `results[]` on an exit-1 run — contentless and
+/// self-contradictory, and `--json` mutes the stderr explanation the
+/// human path gets. One failed result per affected package keeps the
+/// `failed` counter meaning "packages that failed" (the same per-package
+/// semantics as a mid-run failure) and names each missing blob hash plus
+/// the `socket-patch repair` remedy in machine-readable form, using the
+/// engine's own `missing_blob` verify vocabulary. `reason_for` renders
+/// the per-hash diagnostic (offline gate vs. download failure).
+fn missing_blob_abort_results(
+    gate_manifest: &PatchManifest,
+    missing_blobs: &HashSet<String>,
+    all_packages: &HashMap<String, PathBuf>,
+    reason_for: impl Fn(&str) -> String,
+) -> Vec<RollbackResult> {
+    // The manifest map is a HashMap — sort so the envelope is deterministic.
+    let mut purls: Vec<&String> = gate_manifest.patches.keys().collect();
+    purls.sort();
+    let mut results = Vec::new();
+    for purl in purls {
+        let patch = &gate_manifest.patches[purl];
+        let mut files: Vec<(&String, &PatchFileInfo)> = patch
+            .files
+            .iter()
+            .filter(|(_, info)| {
+                // Empty beforeHash is the created-by-patch sentinel: no
+                // blob backs it, so it can never be "missing".
+                !info.before_hash.is_empty() && missing_blobs.contains(&info.before_hash)
+            })
+            .collect();
+        if files.is_empty() {
+            continue;
+        }
+        files.sort_by(|a, b| a.0.cmp(b.0));
+        let files_verified: Vec<VerifyRollbackResult> = files
+            .iter()
+            .map(|(file, info)| VerifyRollbackResult {
+                file: (*file).clone(),
+                status: VerifyRollbackStatus::MissingBlob,
+                message: Some(reason_for(&info.before_hash)),
+                current_hash: None,
+                expected_hash: None,
+                target_hash: Some(info.before_hash.clone()),
+            })
+            .collect();
+        // The engine's own first-blocking-file error constructor, so this
+        // synthesized abort is byte-identical to a mid-run missing-blob
+        // failure.
+        let first = &files_verified[0];
+        let error = cannot_rollback_error(
+            &first.file,
+            first
+                .message
+                .as_deref()
+                .expect("message is set for every synthesized entry above"),
+        );
+        results.push(RollbackResult {
+            package_key: purl.clone(),
+            // The gate feeds only attempted (crawler-discovered) targets
+            // here, so a path is always present; the empty-string fallback
+            // is defensive against that invariant breaking upstream.
+            package_path: all_packages
+                .get(purl)
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+            success: false,
+            files_verified,
+            files_rolled_back: Vec::new(),
+            error: Some(error),
+            sidecar: None,
+        });
+    }
+    results
+}
+
 pub async fn run(args: RollbackArgs) -> i32 {
     apply_env_toggles(&args.common);
 
@@ -299,8 +417,20 @@ pub async fn run(args: RollbackArgs) -> i32 {
         Err(code) => return code,
     };
 
-    match rollback_patches_inner(&args, &manifest_path).await {
-        Ok((success, results, vendored)) => {
+    match rollback_patches_inner(&args, &manifest_path, Some(&telemetry_client)).await {
+        Ok(RollbackOutcome {
+            success: rollback_success,
+            results,
+            vendored_skipped: vendored,
+            not_installed,
+        }) => {
+            // Not-installed entries never flip the exit code — not even
+            // when ALL in-scope targets land there. Rollback's job is
+            // "make the tree unpatched", and a not-installed package
+            // already satisfies that end state, so the run is a success
+            // (exit 0); apply's all-unmatched `partialFailure` deliberately
+            // does NOT mirror over. See `RollbackOutcome`.
+            let success = rollback_success;
             let rolled_back_count = results
                 .iter()
                 .filter(|r| r.success && !r.files_rolled_back.is_empty())
@@ -329,7 +459,16 @@ pub async fn run(args: RollbackArgs) -> i32 {
                         // Vendor-owned purls excluded from in-place rollback
                         // (benign — `remove` or `vendor --revert` undo them).
                         "vendored": vendored,
-                        "results": results.iter().map(result_to_json).collect::<Vec<_>>(),
+                        // Real result records first, then one skipped marker
+                        // per in-scope entry with no installed package —
+                        // apply's `package_not_installed` Skipped event,
+                        // rollback-side. Markers never count toward
+                        // `rolledBack`/`failed` and never flip the status.
+                        "results": results
+                            .iter()
+                            .map(result_to_json)
+                            .chain(not_installed.iter().map(|p| skipped_not_installed_json(p)))
+                            .collect::<Vec<_>>(),
                     }))
                     .expect("serializing an in-memory JSON value cannot fail")
                 );
@@ -421,6 +560,19 @@ pub async fn run(args: RollbackArgs) -> i32 {
                 }
             }
 
+            // Apply's unmatched warning, rollback-side — informational only
+            // (the run still exits 0; see `RollbackOutcome`), so --silent
+            // mutes it like every other non-error notice.
+            if !args.common.json && !args.common.silent && !not_installed.is_empty() {
+                eprintln!(
+                    "\nWarning: {} manifest patch(es) had no matching installed package:",
+                    not_installed.len()
+                );
+                for purl in &not_installed {
+                    eprintln!("  - {purl}");
+                }
+            }
+
             if success {
                 track_patch_rolled_back(
                     rolled_back_count,
@@ -473,7 +625,13 @@ pub async fn run(args: RollbackArgs) -> i32 {
 async fn rollback_patches_inner(
     args: &RollbackArgs,
     manifest_path: &Path,
-) -> Result<(bool, Vec<RollbackResult>, Vec<String>), String> {
+    // The client `run()` already built. Constructing one per phase printed
+    // the core client's "No SOCKET_API_TOKEN set" notice once per
+    // construction — twice in a single rollback. `None` (the `remove`
+    // delegation path) builds one on demand, only when the blob download
+    // below actually fires.
+    api_client: Option<&ApiClient>,
+) -> Result<RollbackOutcome, String> {
     let manifest = read_manifest(manifest_path)
         .await
         .map_err(|e| e.to_string())?
@@ -505,7 +663,12 @@ async fn rollback_patches_inner(
         if !args.common.silent && !args.common.json {
             println!("No patches found in manifest");
         }
-        return Ok((true, Vec::new(), Vec::new()));
+        return Ok(RollbackOutcome {
+            success: true,
+            results: Vec::new(),
+            vendored_skipped: Vec::new(),
+            not_installed: Vec::new(),
+        });
     }
 
     // Vendor-owned purls are excluded from in-place rollback: their patch
@@ -526,7 +689,12 @@ async fn rollback_patches_inner(
     if patches_to_rollback.is_empty() {
         // Everything targeted is vendor-owned: a benign skip, not an error
         // (and not `not_found` — the identifier did match).
-        return Ok((true, Vec::new(), vendored_skipped));
+        return Ok(RollbackOutcome {
+            success: true,
+            results: Vec::new(),
+            vendored_skipped,
+            not_installed: Vec::new(),
+        });
     }
 
     // Create filtered manifest (a synthetic rollback-target subset, never
@@ -644,32 +812,51 @@ async fn rollback_patches_inner(
     }
 
     // Check for missing beforeHash blobs — AFTER discovery and variant
-    // narrowing, so a broad manifest's sibling variants that resolved to
-    // the same installed package but were narrowed away (they describe a
-    // distribution that is not on disk) don't gate the run: an
-    // unfetchable sibling before-blob used to abort the WHOLE rollback
-    // (`--offline`: wholesale; online: on any download failure) even
-    // though that variant was never going to be attempted. In-scope
-    // purls the crawler could NOT resolve keep the fail-closed gate
-    // (their blobs are still fetched up front). Local-redirect PURLs
-    // (local-mode go) are excluded as before: their rollback just drops
-    // the project-local redirect + copy and reads no blobs, so a missing
-    // before-blob must not block an offline redirect rollback.
+    // narrowing, so the gate covers ONLY the packages this run will
+    // actually attempt to restore in place:
+    //
+    //   * Narrowed-away sibling variants (they describe a distribution
+    //     that is not on disk) don't gate: an unfetchable sibling
+    //     before-blob used to abort the WHOLE rollback even though that
+    //     variant was never going to be attempted.
+    //   * In-scope purls the crawler could NOT resolve (package not
+    //     installed) don't gate either: there is nothing on disk to
+    //     restore, so no before-blob is ever read for them. They used to
+    //     be gated "fail-closed", which hard-failed the run (exit 1,
+    //     `Cannot rollback: ... Before blob not found`, `path: ""`) over
+    //     an entry that had nothing to roll back — the same entry apply
+    //     reports as a benign `package_not_installed` skip. They surface
+    //     via `not_installed` below instead.
+    //   * Local-redirect PURLs (local-mode go) are excluded as before:
+    //     their rollback just drops the project-local redirect + copy and
+    //     reads no blobs, so a missing before-blob must not block an
+    //     offline redirect rollback.
     let attempted_purls: HashSet<&str> = rollback_targets.iter().map(|(p, _)| p.as_str()).collect();
     let gate_manifest = exclude_local_redirects(
         &PatchManifest {
             patches: scoped_manifest
                 .patches
                 .iter()
-                .filter(|(purl, _)| {
-                    attempted_purls.contains(purl.as_str()) || !all_packages.contains_key(*purl)
-                })
+                .filter(|(purl, _)| attempted_purls.contains(purl.as_str()))
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
             setup: None,
         },
         &args.common,
     );
+
+    // Apply's `unmatched` twin: in-scope manifest entries the crawler found
+    // no installed package for. Undiscovered local redirects are NOT
+    // not-installed — their rollback runs from the manifest alone (the
+    // fallback loop below). Sorted so every consumer sees a deterministic
+    // order across the manifest HashMap's iteration order.
+    let mut not_installed: Vec<String> = scoped_manifest
+        .patches
+        .keys()
+        .filter(|purl| !all_packages.contains_key(*purl) && !undiscovered_redirects.contains(*purl))
+        .cloned()
+        .collect();
+    not_installed.sort();
 
     // `--dry-run`: verification needs real blob content for an accurate
     // preview, but the preview must not leave new files in the committable
@@ -706,12 +893,54 @@ async fn rollback_patches_inner(
         None
     };
 
-    let missing_blobs = get_missing_before_blobs(&gate_manifest, &blobs_path).await;
+    // Of the absent blobs, keep only those an installed file would actually
+    // READ: the engine restores from a before-blob only when the on-disk
+    // file exists and is not already at its original bytes —
+    // `verify_file_rollback` reports `MissingBlob` exactly then (and checks
+    // `AlreadyOriginal` BEFORE probing the blob). An absent blob for an
+    // already-original, deleted, or locally-drifted file is never read, so
+    // it must not abort the run or trigger a download; the rollback loop's
+    // own per-file verification still reports those states honestly
+    // (already_original / not_found / hash_mismatch).
+    let absent_blobs = get_missing_before_blobs(&gate_manifest, &blobs_path).await;
+    let mut missing_blobs: HashSet<String> = HashSet::new();
+    let mut blob_gated_purls: HashSet<String> = HashSet::new();
+    if !absent_blobs.is_empty() {
+        for (purl, patch) in &gate_manifest.patches {
+            let pkg_path = all_packages
+                .get(purl)
+                .expect("gate manifest holds only attempted targets, which the crawler discovered");
+            for (file, info) in &patch.files {
+                if info.before_hash.is_empty() || !absent_blobs.contains(&info.before_hash) {
+                    continue;
+                }
+                let v = verify_file_rollback(pkg_path, file, info, &blobs_path).await;
+                if v.status == VerifyRollbackStatus::MissingBlob {
+                    missing_blobs.insert(info.before_hash.clone());
+                    blob_gated_purls.insert(purl.clone());
+                }
+            }
+        }
+    }
     if !missing_blobs.is_empty() {
+        // Only the packages that genuinely need a missing blob enter the
+        // synthesized abort envelope — a gated sibling file that happens to
+        // share a needed hash rides along, but a package none of whose
+        // absent blobs are needed never fails here.
+        let abort_manifest = PatchManifest {
+            patches: gate_manifest
+                .patches
+                .iter()
+                .filter(|(purl, _)| blob_gated_purls.contains(purl.as_str()))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            setup: None,
+        };
         if args.common.offline {
             // Errors print even under --silent ("errors only", never
-            // "nothing"): this bail is the run's ONLY diagnostic — the JSON
-            // envelope carries a contentless partial_failure.
+            // "nothing"): in human mode this bail is the run's only
+            // stderr diagnostic; `--json` mutes it and instead carries
+            // the synthesized per-package failures below.
             if !args.common.json {
                 eprintln!(
                     "Error: {} blob(s) are missing and --offline mode is enabled.",
@@ -719,36 +948,99 @@ async fn rollback_patches_inner(
                 );
                 eprintln!("Run \"socket-patch repair\" to download missing blobs.");
             }
-            return Ok((false, Vec::new(), vendored_skipped));
+            let results = missing_blob_abort_results(
+                &abort_manifest,
+                &missing_blobs,
+                &all_packages,
+                |hash| {
+                    format!(
+                        "Before blob not found: {hash} and --offline prevents fetching. \
+                         Run \"socket-patch repair\" to download missing blobs."
+                    )
+                },
+            );
+            return Ok(RollbackOutcome {
+                success: false,
+                results,
+                vendored_skipped,
+                not_installed,
+            });
         }
 
         if !args.common.silent && !args.common.json {
             println!("Downloading {} missing blob(s)...", missing_blobs.len());
         }
 
-        let (client, _) = get_api_client_with_overrides(args.common.api_client_overrides()).await;
-        let fetch_result = fetch_blobs_by_hash(&missing_blobs, &blobs_path, &client, None).await;
+        let built_client;
+        let client = match api_client {
+            Some(c) => c,
+            None => {
+                built_client = get_api_client_with_overrides(args.common.api_client_overrides())
+                    .await
+                    .0;
+                &built_client
+            }
+        };
+        let fetch_result = fetch_blobs_by_hash(&missing_blobs, &blobs_path, client, None).await;
 
         if !args.common.silent && !args.common.json {
             println!("{}", format_fetch_result(&fetch_result));
         }
 
-        // Re-check against `gate_manifest` (NOT `filtered_manifest`): the
-        // download only targeted blobs from the local-go-excluded gate, so
-        // local-go before-hashes must stay excluded here too. Re-checking
-        // the full filtered manifest would re-introduce those never-needed
-        // blobs and spuriously abort a mixed local-go rollback.
-        let still_missing = get_missing_before_blobs(&gate_manifest, &blobs_path).await;
+        // Re-check ONLY the needed-missing set the download targeted (built
+        // from the local-go-excluded, installed-only gate above) — never the
+        // full filtered manifest, which would re-introduce never-needed
+        // blobs (local-go, not-installed, already-original) and spuriously
+        // abort the run over a blob nothing will read.
+        let mut still_missing: HashSet<String> = HashSet::new();
+        for hash in &missing_blobs {
+            if tokio::fs::metadata(blobs_path.join(hash)).await.is_err() {
+                still_missing.insert(hash.clone());
+            }
+        }
         if !still_missing.is_empty() {
             // Errors print even under --silent — same contract as the
-            // offline bail above.
+            // offline bail above (and same `--json` carrier).
             if !args.common.json {
                 eprintln!(
                     "{} blob(s) could not be downloaded. Cannot rollback.",
                     still_missing.len()
                 );
             }
-            return Ok((false, Vec::new(), vendored_skipped));
+            // Per-hash download outcomes; a hash the fetch never reported
+            // on still fails closed with the generic reason.
+            let download_errors: HashMap<&str, &str> = fetch_result
+                .results
+                .iter()
+                .filter(|r| !r.success)
+                .map(|r| {
+                    (
+                        r.hash.as_str(),
+                        r.error.as_deref().unwrap_or("unknown error"),
+                    )
+                })
+                .collect();
+            let results = missing_blob_abort_results(
+                &abort_manifest,
+                &still_missing,
+                &all_packages,
+                |hash| {
+                    let why = download_errors
+                        .get(hash)
+                        .copied()
+                        .unwrap_or("download failed");
+                    format!(
+                        "Before blob could not be downloaded: {hash} - {why}. \
+                         Run \"socket-patch repair\" to download missing blobs."
+                    )
+                },
+            );
+            return Ok(RollbackOutcome {
+                success: false,
+                results,
+                vendored_skipped,
+                not_installed,
+            });
         }
     }
 
@@ -756,7 +1048,15 @@ async fn rollback_patches_inner(
         if !args.common.silent && !args.common.json {
             println!("No packages found that match patches to rollback");
         }
-        return Ok((true, Vec::new(), vendored_skipped));
+        // `success: true` — per-package semantics for the `remove`
+        // delegation. The CLI boundary layers apply's "nothing matched at
+        // all" exit-1 on top via `not_installed`.
+        return Ok(RollbackOutcome {
+            success: true,
+            results: Vec::new(),
+            vendored_skipped,
+            not_installed,
+        });
     }
 
     // Rollback patches
@@ -829,11 +1129,32 @@ async fn rollback_patches_inner(
         results.push(result);
     }
 
-    Ok((!has_errors, results, vendored_skipped))
+    Ok(RollbackOutcome {
+        success: !has_errors,
+        results,
+        vendored_skipped,
+        not_installed,
+    })
 }
 
 // Export for use by remove command. The third tuple element lists
-// vendor-owned purls that were excluded from in-place rollback (benign).
+// vendor-owned purls that were excluded from in-place rollback (benign);
+// the fourth is `RollbackOutcome::not_installed` — in-scope manifest
+// entries the crawler found no installed package for.
+//
+// The returned `bool` is `RollbackOutcome::success` — per-package semantics
+// only. Manifest entries whose package is not installed are NOT failures
+// here (there is nothing on disk to restore), so `remove` proceeds to drop
+// them from the manifest; the CLI `rollback` boundary's apply-mirroring
+// "none matched → exit 1" rule deliberately does NOT apply to this
+// delegation (it would wedge `remove` for packages long uninstalled).
+//
+// The `not_installed` element exists because that drop is IRREVERSIBLE in a
+// way a genuine rollback is not: "not installed" can also mean "installed
+// but missed by the crawler" (layout gaps are a documented reality), in
+// which case the patched bytes are still on disk. `remove` uses the list to
+// warn and to keep those entries' beforeHash blobs out of its cleanup
+// sweep, so the revert data survives a crawler miss.
 //
 // Takes the caller's `GlobalArgs` as the base (only the per-call fields are
 // overridden): the nested missing-blob download builds its API client from
@@ -850,7 +1171,7 @@ pub(crate) async fn rollback_patches(
     dry_run: bool,
     silent: bool,
     ecosystems: Option<Vec<String>>,
-) -> Result<(bool, Vec<RollbackResult>, Vec<String>), String> {
+) -> Result<(bool, Vec<RollbackResult>, Vec<String>, Vec<String>), String> {
     let args = RollbackArgs {
         identifier: identifier.map(String::from),
         common: crate::args::GlobalArgs {
@@ -862,7 +1183,13 @@ pub(crate) async fn rollback_patches(
         },
         one_off: false,
     };
-    rollback_patches_inner(&args, manifest_path).await
+    let outcome = rollback_patches_inner(&args, manifest_path, None).await?;
+    Ok((
+        outcome.success,
+        outcome.results,
+        outcome.vendored_skipped,
+        outcome.not_installed,
+    ))
 }
 
 #[cfg(test)]
@@ -1151,6 +1478,100 @@ mod tests {
         assert!(
             missing.is_empty(),
             "a new-file-only patch needs no before-blobs, got {missing:?}"
+        );
+    }
+
+    /// The pre-flight bail must map each missing blob back to its package:
+    /// one failed result per affected package (that's what the envelope's
+    /// `failed` counter counts), files carrying the engine's `missing_blob`
+    /// status + the missing hash, packages whose blobs are all present left
+    /// untouched, and created-by-patch sentinels (empty beforeHash) never
+    /// counted — they are backed by no blob.
+    #[test]
+    fn missing_blob_abort_results_map_hashes_to_packages() {
+        let mut patches = HashMap::new();
+        patches.insert(
+            "pkg:npm/foo@1.0.0".to_string(),
+            record_with_file("uuid-foo", "a.js", "missing_a"),
+        );
+        patches.insert(
+            "pkg:npm/bar@1.0.0".to_string(),
+            record_with_file("uuid-bar", "b.js", "present_b"),
+        );
+        patches.insert(
+            "pkg:npm/baz@1.0.0".to_string(),
+            record_with_file("uuid-baz", "c.js", ""),
+        );
+        let gate = PatchManifest {
+            patches,
+            setup: None,
+        };
+        let missing: HashSet<String> = ["missing_a".to_string(), "".to_string()]
+            .into_iter()
+            .collect();
+        let mut all_packages = HashMap::new();
+        all_packages.insert("pkg:npm/foo@1.0.0".to_string(), PathBuf::from("/tmp/foo"));
+
+        let results =
+            missing_blob_abort_results(&gate, &missing, &all_packages, |h| format!("gone: {h}"));
+
+        assert_eq!(
+            results.len(),
+            1,
+            "only the package referencing a genuinely missing blob fails, got {results:?}"
+        );
+        let r = &results[0];
+        assert_eq!(r.package_key, "pkg:npm/foo@1.0.0");
+        assert_eq!(r.package_path, "/tmp/foo");
+        assert!(!r.success);
+        assert!(r.files_rolled_back.is_empty());
+        assert_eq!(
+            r.error.as_deref(),
+            Some("Cannot rollback: a.js - gone: missing_a"),
+            "error mirrors the engine's first-blocking-file shape"
+        );
+        assert_eq!(r.files_verified.len(), 1);
+        let f = &r.files_verified[0];
+        assert_eq!(f.file, "a.js");
+        assert_eq!(f.status, VerifyRollbackStatus::MissingBlob);
+        assert_eq!(f.target_hash.as_deref(), Some("missing_a"));
+        assert_eq!(f.message.as_deref(), Some("gone: missing_a"));
+    }
+
+    /// Helper-level determinism + tolerance pin: multiple affected packages
+    /// come out purl-sorted (stable envelope across the manifest HashMap's
+    /// iteration order), and a purl absent from `all_packages` degrades to
+    /// an empty path rather than panicking. Production can no longer feed
+    /// an undiscovered purl here — since the gate reorder, only attempted
+    /// (crawler-discovered) targets enter the blob plan, so `path` is
+    /// always populated in real envelopes; the tolerance is defensive.
+    #[test]
+    fn missing_blob_abort_results_sorted_and_pathless_when_undiscovered() {
+        let mut patches = HashMap::new();
+        patches.insert(
+            "pkg:npm/zeta@1.0.0".to_string(),
+            record_with_file("uuid-zeta", "z.js", "missing_z"),
+        );
+        patches.insert(
+            "pkg:npm/alpha@1.0.0".to_string(),
+            record_with_file("uuid-alpha", "a.js", "missing_a"),
+        );
+        let gate = PatchManifest {
+            patches,
+            setup: None,
+        };
+        let missing: HashSet<String> = ["missing_a".to_string(), "missing_z".to_string()]
+            .into_iter()
+            .collect();
+
+        let results =
+            missing_blob_abort_results(&gate, &missing, &HashMap::new(), |h| h.to_string());
+
+        let keys: Vec<&str> = results.iter().map(|r| r.package_key.as_str()).collect();
+        assert_eq!(keys, ["pkg:npm/alpha@1.0.0", "pkg:npm/zeta@1.0.0"]);
+        assert!(
+            results.iter().all(|r| r.package_path.is_empty()),
+            "no discovered install path to report, got {results:?}"
         );
     }
 
@@ -1505,7 +1926,7 @@ mod tests {
             offline: true,
             ..crate::args::GlobalArgs::default()
         };
-        let (success, results, _vendored) = rollback_patches(
+        let (success, results, _vendored, _not_installed) = rollback_patches(
             &common,
             &manifest_path,
             None,
@@ -1595,7 +2016,7 @@ mod tests {
             offline: true,
             ..crate::args::GlobalArgs::default()
         };
-        let (success, results, _vendored) = rollback_patches(
+        let (success, results, _vendored, _not_installed) = rollback_patches(
             &common,
             &manifest_path,
             None,
@@ -1671,7 +2092,7 @@ mod tests {
             offline: true,
             ..crate::args::GlobalArgs::default()
         };
-        let (success, results, _vendored_skipped) = rollback_patches(
+        let (success, results, _vendored_skipped, _not_installed) = rollback_patches(
             &common,
             &manifest_path,
             None,
@@ -1689,9 +2110,36 @@ mod tests {
         );
     }
 
-    /// The scoped gate still protects in-scope patches: with no
-    /// `--ecosystems` filter, a missing before-blob for an in-scope npm patch
-    /// must abort the offline run exactly as before.
+    /// Write a fake installed npm package so the crawler discovers it and
+    /// the before-blob gate has an attempted target to protect. `content`
+    /// is the installed `index.js` bytes (whose hash decides whether the
+    /// engine would actually need the before-blob).
+    async fn install_fake_npm_package(root: &Path, name: &str, version: &str, content: &[u8]) {
+        tokio::fs::write(
+            root.join("package.json"),
+            r#"{ "name": "gate-test-root", "version": "0.0.0" }"#,
+        )
+        .await
+        .unwrap();
+        let pkg_dir = root.join("node_modules").join(name);
+        tokio::fs::create_dir_all(&pkg_dir).await.unwrap();
+        tokio::fs::write(
+            pkg_dir.join("package.json"),
+            format!(r#"{{ "name": "{name}", "version": "{version}" }}"#),
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(pkg_dir.join("index.js"), content)
+            .await
+            .unwrap();
+    }
+
+    /// The scoped gate still protects in-scope INSTALLED patches: with no
+    /// `--ecosystems` filter, a missing before-blob for an installed npm
+    /// package whose file genuinely needs restoring must abort the offline
+    /// run exactly as before. (The package is installed here — since the
+    /// gate reorder a not-installed entry never enters the blob plan; see
+    /// `not_installed_entry_never_enters_blob_plan` below.)
     #[tokio::test]
     async fn before_blob_gate_still_blocks_in_scope_missing_blob() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1699,6 +2147,11 @@ mod tests {
         let socket = root.join(".socket");
         let blobs = socket.join("blobs");
         tokio::fs::create_dir_all(&blobs).await.unwrap();
+
+        // Installed, with bytes matching NEITHER beforeHash nor afterHash:
+        // the file exists and is not already original, so the engine would
+        // read the before-blob — the gate must fail closed on its absence.
+        install_fake_npm_package(root, "foo", "1.0.0", b"patched-ish content\n").await;
 
         let mut patches = HashMap::new();
         patches.insert(
@@ -1720,7 +2173,7 @@ mod tests {
             offline: true,
             ..crate::args::GlobalArgs::default()
         };
-        let (success, results, _vendored_skipped) = rollback_patches(
+        let (success, results, _vendored_skipped, _not_installed) = rollback_patches(
             &common,
             &manifest_path,
             None,
@@ -1730,10 +2183,158 @@ mod tests {
         )
         .await
         .expect("rollback must not error");
-        assert!(results.is_empty());
         assert!(
             !success,
             "an in-scope missing before-blob must still abort the offline run"
+        );
+        // The abort synthesizes the per-package failure the JSON envelope
+        // reports (`failed` would otherwise claim 0 on this exit-1 path).
+        assert_eq!(results.len(), 1, "got {results:?}");
+        assert_eq!(results[0].package_key, "pkg:npm/foo@1.0.0");
+        assert!(!results[0].success);
+        assert!(
+            !results[0].package_path.is_empty(),
+            "a gated package is installed, so its path must be reported, got {results:?}"
+        );
+        assert!(
+            results[0]
+                .files_verified
+                .iter()
+                .any(|f| f.status == VerifyRollbackStatus::MissingBlob
+                    && f.target_hash.as_deref() == Some("npm_before_hash")),
+            "the missing blob must be named, got {results:?}"
+        );
+    }
+
+    /// Regression (rollback ordering): a manifest entry whose package is
+    /// NOT installed must never enter the before-blob plan. Before the gate
+    /// reorder, its missing before-blob hard-failed the whole offline run
+    /// (exit 1, `Cannot rollback: ... Before blob not found`, `path: ""`)
+    /// even though there was nothing on disk to roll back. Through the
+    /// `remove`-facing delegation this is a benign no-op: success with zero
+    /// results, exactly as when the blob IS present — so `remove` can drop
+    /// the entry of a long-uninstalled package either way.
+    #[tokio::test]
+    async fn not_installed_entry_never_enters_blob_plan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let socket = root.join(".socket");
+        tokio::fs::create_dir_all(&socket).await.unwrap();
+        // No node_modules at all — the package is not installed, and the
+        // blobs dir does not even exist.
+
+        let mut patches = HashMap::new();
+        patches.insert(
+            "pkg:npm/foo@1.0.0".to_string(),
+            record_with_file("uuid-npm", "package/index.js", "npm_before_hash"),
+        );
+        let manifest = PatchManifest {
+            patches,
+            setup: None,
+        };
+        let manifest_path = socket.join("manifest.json");
+        tokio::fs::write(&manifest_path, serde_json::to_string(&manifest).unwrap())
+            .await
+            .unwrap();
+
+        // `--offline` proves no download is attempted for the unneeded blob.
+        let common = crate::args::GlobalArgs {
+            cwd: root.to_path_buf(),
+            offline: true,
+            ..crate::args::GlobalArgs::default()
+        };
+        let (success, results, vendored_skipped, not_installed) = rollback_patches(
+            &common,
+            &manifest_path,
+            None,
+            false, // dry_run
+            true,  // silent
+            None,
+        )
+        .await
+        .expect("rollback must not error");
+        assert!(
+            success,
+            "a not-installed entry's missing before-blob must not fail the run"
+        );
+        assert!(
+            results.is_empty(),
+            "nothing installed, nothing attempted, got {results:?}"
+        );
+        assert!(vendored_skipped.is_empty());
+        // The skip is not silent to the delegation: `remove` needs to know
+        // this entry was never actually reverted (a crawler miss looks the
+        // same) so it can keep the before-blobs and warn.
+        assert_eq!(
+            not_installed,
+            vec!["pkg:npm/foo@1.0.0".to_string()],
+            "the delegation must surface the not-installed entry"
+        );
+    }
+
+    /// The needed-blob narrowing: an INSTALLED package whose file is already
+    /// at its original bytes needs no before-blob (the engine checks
+    /// `AlreadyOriginal` before probing the blob), so a missing — e.g.
+    /// GC'd — blob must not abort the offline run. The rollback proceeds
+    /// and reports the no-op honestly.
+    #[tokio::test]
+    async fn missing_blob_for_already_original_file_does_not_gate() {
+        use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
+
+        let original = b"original content\n";
+        let before_hash = compute_git_sha256_from_bytes(original);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let socket = root.join(".socket");
+        tokio::fs::create_dir_all(&socket).await.unwrap();
+
+        // Installed at the BEFORE bytes — rollback is a no-op for it.
+        install_fake_npm_package(root, "foo", "1.0.0", original).await;
+
+        let mut patches = HashMap::new();
+        patches.insert(
+            "pkg:npm/foo@1.0.0".to_string(),
+            record_with_file("uuid-npm", "package/index.js", &before_hash),
+        );
+        let manifest = PatchManifest {
+            patches,
+            setup: None,
+        };
+        let manifest_path = socket.join("manifest.json");
+        tokio::fs::write(&manifest_path, serde_json::to_string(&manifest).unwrap())
+            .await
+            .unwrap();
+        // The before-blob is deliberately absent (e.g. garbage-collected).
+
+        let common = crate::args::GlobalArgs {
+            cwd: root.to_path_buf(),
+            offline: true,
+            ..crate::args::GlobalArgs::default()
+        };
+        let (success, results, _vendored_skipped, not_installed) = rollback_patches(
+            &common,
+            &manifest_path,
+            None,
+            false, // dry_run
+            true,  // silent
+            None,
+        )
+        .await
+        .expect("rollback must not error");
+        assert!(
+            success,
+            "a blob nothing will read must not gate the run, got {results:?}"
+        );
+        assert!(
+            not_installed.is_empty(),
+            "an installed already-original package is not a crawler miss"
+        );
+        assert_eq!(results.len(), 1, "got {results:?}");
+        assert!(results[0].success);
+        assert!(
+            all_files_already_original(&results[0]),
+            "the no-op must be reported as already original, got {results:?}"
         );
     }
 }

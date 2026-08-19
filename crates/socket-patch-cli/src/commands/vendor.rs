@@ -430,6 +430,7 @@ pub async fn run(args: VendorArgs) -> i32 {
                             path: vex_path.display().to_string(),
                             statements: summary.statements,
                             format: "openvex-0.2.0".to_string(),
+                            warnings: summary.warnings,
                         });
                     }
                     Err(e) => {
@@ -920,10 +921,11 @@ pub(crate) async fn vendor_records(
     // it still claims must revert the hosted edits FIRST (see the hook in the
     // dispatch loop below). Loaded once; mutated + persisted per reverted
     // purl. A MALFORMED ledger is held as the hard error it is: this loop
-    // WRITES the ledger for cargo takeovers, and with its records unreadable
-    // a claimed purl is indistinguishable from an unclaimed one — so every
-    // cargo purl fails closed with the corruption surfaced (non-cargo purls
-    // never touch the redirect ledger here and proceed).
+    // WRITES the ledger for takeovers, and with its records unreadable a
+    // claimed purl is indistinguishable from an unclaimed one — so every
+    // purl of a takeover-capable ecosystem (cargo, npm) fails closed with
+    // the corruption surfaced (other purls never touch the redirect ledger
+    // here and proceed).
     let (mut redirect_ledger, redirect_ledger_corrupt) =
         match socket_patch_core::patch::redirect::load_redirect_state(&common.cwd).await {
             Ok(state) => (state, None),
@@ -979,18 +981,24 @@ pub(crate) async fn vendor_records(
             }
             matched.insert(candidate.clone());
 
-            // Cross-mode takeover (cargo): vendoring over a LIVE hosted
-            // redirect must first revert the hosted edits from the redirect
-            // ledger — `[patch.crates-io]` only patches crates-io-sourced
+            // Cross-mode takeover: vendoring over a LIVE hosted redirect
+            // must first revert the hosted edits from the redirect ledger.
+            // Cargo: `[patch.crates-io]` only patches crates-io-sourced
             // deps, so vendoring on top of the `registry = "socket-patch-…"`
             // pin leaves the project unbuildable in BOTH modes while this
-            // run reports success — and the pre-revert also hands the vendor
-            // detach the PRISTINE crates.io lock fragment to record as the
-            // ledger's unrecoverable originals (not the hosted values). A
-            // purl whose hosted edits cannot be cleanly reverted is REFUSED;
-            // the backend's own fail-closed guard (`hosted_redirect_live`)
+            // run reports success. npm family: the vendor rewire happens to
+            // succeed either way, but without the pre-revert the vendor
+            // ledger records the grant-tokenized HOSTED lock fragment as its
+            // unrecoverable pre-vendor original (so `vendor --revert` lands
+            // back on an expiring hosted URL with no CLI path to registry
+            // state) and the superseded redirect records/edits survive
+            // forever as a stale-ledger replay hazard. In every ecosystem
+            // the pre-revert hands the vendor detach the PRISTINE registry
+            // lock fragment to record as the ledger's originals. A purl
+            // whose hosted edits cannot be cleanly reverted is REFUSED; the
+            // cargo backend's own fail-closed guard (`hosted_redirect_live`)
             // backstops states with no usable ledger at all.
-            if candidate.starts_with("pkg:cargo/") {
+            if socket_patch_core::patch::redirect::redirect_revert_supported(candidate) {
                 if let Some(corrupt) = &redirect_ledger_corrupt {
                     has_errors = true;
                     env.record(
@@ -1028,7 +1036,7 @@ pub(crate) async fn vendor_records(
                     );
                 } else if claimed {
                     let ledger = redirect_ledger.as_mut().expect("claimed implies Some");
-                    match socket_patch_core::patch::redirect::revert_cargo_redirect_purl(
+                    match socket_patch_core::patch::redirect::revert_redirect_purl(
                         &common.cwd,
                         ledger,
                         candidate,
@@ -1060,17 +1068,22 @@ pub(crate) async fn vendor_records(
                                 );
                                 continue;
                             }
+                            let reverted_what = if candidate.starts_with("pkg:cargo/") {
+                                "the hosted edits (Cargo.toml registry pin, Cargo.lock \
+                                 source/checksum, registries block)"
+                            } else {
+                                "the hosted lockfile edits back to their pre-redirect \
+                                 registry values"
+                            };
                             record_warning(
                                 env,
                                 candidate,
                                 &VendorWarning::new(
                                     "vendor_takeover_reverted_redirect",
                                     format!(
-                                        "{} was hosted-redirected; reverted the hosted \
-                                         edits (Cargo.toml registry pin, Cargo.lock \
-                                         source/checksum, registries block) and dropped \
-                                         the redirect-ledger record before vendoring \
-                                         (mode takeover)",
+                                        "{} was hosted-redirected; reverted {reverted_what} \
+                                         and dropped the redirect-ledger record before \
+                                         vendoring (mode takeover)",
                                         normalize_purl(candidate)
                                     ),
                                 ),
@@ -1317,6 +1330,20 @@ pub(crate) async fn reconcile_dropped(
             record_warning(env, &purl, w, common);
         }
         if outcome.success {
+            if outcome.kept_artifact {
+                // Drift-skip keep (residual #131): the backend left the
+                // drifted lock alone and kept the artifacts, so the ledger
+                // entry must survive too — and the genuine outcome is a
+                // COUNTED skip, not a removal.
+                env.record(
+                    PatchEvent::new(PatchAction::Skipped, purl.clone()).with_reason(
+                        "vendor_revert_kept",
+                        "patch no longer in manifest, but its lock entries drifted since \
+                         vendoring; artifacts and ledger entry kept",
+                    ),
+                );
+                continue;
+            }
             env.record(
                 PatchEvent::new(PatchAction::Removed, purl.clone())
                     .with_reason("vendor_reconciled", "patch no longer in manifest"),
@@ -1364,6 +1391,22 @@ async fn run_revert(args: &VendorArgs, env: &mut Envelope) -> i32 {
             record_warning(env, purl, w, common);
         }
         if outcome.success {
+            if outcome.kept_artifact {
+                // Drift-skip keep (residual #131): the backend left the
+                // drifted lock alone and kept the artifacts, so the ledger
+                // entry must survive too — and the genuine outcome is a
+                // COUNTED skip, not a removal. (`record_warning` above
+                // already surfaced the per-record details as uncounted
+                // advisory events.)
+                env.record(
+                    PatchEvent::new(PatchAction::Skipped, purl.clone()).with_reason(
+                        "vendor_revert_kept",
+                        "lock entries drifted since vendoring; artifacts and ledger entry kept \
+                         — undo the drift and re-run `vendor --revert` to finish",
+                    ),
+                );
+                continue;
+            }
             env.record(PatchEvent::new(PatchAction::Removed, purl.clone()));
             if !common.dry_run {
                 state.entries.remove(purl);
@@ -1435,6 +1478,16 @@ async fn run_revert(args: &VendorArgs, env: &mut Envelope) -> i32 {
             "{verb} {} vendored package(s); {} failed.",
             env.summary.removed, env.summary.failed
         );
+        // In this command summary.skipped counts only genuine drift-skip
+        // keeps (advisory warnings are pushed uncounted by record_warning).
+        if env.summary.skipped > 0 {
+            println!(
+                "Kept {} drifted package(s): lock entries were re-resolved since vendoring, so \
+                 their artifacts and ledger entries were retained — undo the drift and re-run \
+                 `vendor --revert` to finish.",
+                env.summary.skipped
+            );
+        }
     }
 
     if has_errors {

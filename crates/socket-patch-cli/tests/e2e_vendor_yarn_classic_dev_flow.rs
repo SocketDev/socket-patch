@@ -456,3 +456,230 @@ fn yarn_classic_vendored_lock_survives_dev_install_resave() {
     );
     eprintln!("FROZEN RE-ENTRY OK");
 }
+
+// ── drift-skipped revert keeps artifacts (residual #131, E1 flow) ─────
+
+/// The strapi E1 flow, end-to-end with real yarn classic: vendored wiring,
+/// then a hosted overlay re-resolves the lock block to a
+/// `patch.socket.dev` URL (any resolution outside our uuid dir fails the
+/// revert's ownership gate the same way), then `vendor --revert`.
+///
+/// Contract (residual #131 fixed): the revert drift-skips the lock restore
+/// — and must then ALSO keep the vendored artifacts and the ledger entry,
+/// reporting a counted `Skipped` (`vendor_revert_kept`) instead of a
+/// `Removed`. Previously it deleted `.socket/vendor/npm/<uuid>/` and pruned
+/// state.json while yarn.lock stayed pointed at the hosted URL, destroying
+/// the only copy of the tarball a recovery needs. The remediation legs
+/// prove the point: undo the drift (restore the vendored lock — what a
+/// future hosted revert would do by replaying its recorded originals) and
+/// (a) a plain `yarn install` still delivers the patched bytes from the
+/// KEPT tarball, (b) a second `vendor --revert` now completes fully and
+/// the pristine registry lock installs again.
+#[test]
+fn yarn_classic_drift_skipped_revert_keeps_artifacts_and_recovers() {
+    if !has_corepack_pm(YARN_CLASSIC) {
+        println!(
+            "SKIP yarn_classic_drift_skipped_revert_keeps_artifacts_and_recovers: \
+             `corepack {YARN_CLASSIC}` unavailable"
+        );
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::write(
+        proj.join("package.json"),
+        format!(
+            r#"{{"name":"yarn-classic-drift-revert","version":"0.0.0","private":true,"dependencies":{{"{DEP}":"{DEP_VERSION}"}}}}"#
+        ),
+    )
+    .unwrap();
+
+    // 1. Real fixture install (network allowed; private cache).
+    let cache = tmp.path().join("yarn-cache");
+    let install = corepack(
+        &proj,
+        YARN_CLASSIC,
+        &["install", "--no-progress"],
+        &[("YARN_CACHE_FOLDER", cache.to_str().unwrap())],
+    );
+    if !install.status.success() {
+        println!(
+            "SKIP yarn_classic_drift_skipped_revert_keeps_artifacts_and_recovers: fixture \
+             `yarn install` failed (registry unreachable?):\n{}",
+            String::from_utf8_lossy(&install.stderr)
+        );
+        return;
+    }
+
+    let installed_index = proj.join("node_modules").join(DEP).join("index.js");
+    let orig = std::fs::read(&installed_index).expect("installed index.js");
+    let patched: Vec<u8> = [MARKER.as_bytes(), orig.as_slice()].concat();
+    let purl = format!("pkg:npm/{DEP}@{DEP_VERSION}");
+    stage_patch(&proj, &purl, "package/index.js", &orig, &patched);
+
+    let lock_path = proj.join("yarn.lock");
+    let lock_pristine = std::fs::read_to_string(&lock_path).expect("yarn.lock after install");
+
+    // 2. Vendor (offline: blob staged locally).
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &[
+            "vendor",
+            "--json",
+            "--offline",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(
+        code, 0,
+        "vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let tgz_rel = format!(".socket/vendor/npm/{UUID}/{DEP}-{DEP_VERSION}.tgz");
+    assert!(proj.join(&tgz_rel).is_file(), "vendored tarball missing");
+    let lock_wired = std::fs::read_to_string(&lock_path).unwrap();
+
+    // 3. Simulate the hosted overlay: the wired `file:` resolution is
+    //    replaced by a hosted patch.socket.dev URL (byte-surgical, exactly
+    //    the strapi layering shape).
+    let wired_line = lock_wired
+        .lines()
+        .find(|l| {
+            l.trim_start()
+                .starts_with("resolved \"file:./.socket/vendor/")
+        })
+        .expect("wired lock must carry the vendored resolved line")
+        .to_owned();
+    let hosted_line = format!(
+        "  resolved \"https://patch.socket.dev/patch/npm/{DEP}/{DEP_VERSION}/\
+         11111111-1111-1111-1111-111111111111/{UUID}/{DEP}-{DEP_VERSION}.tgz\""
+    );
+    let lock_hosted = lock_wired.replace(&wired_line, &hosted_line);
+    assert_ne!(lock_hosted, lock_wired, "overlay edit must hit");
+    std::fs::write(&lock_path, &lock_hosted).unwrap();
+
+    // 4. `vendor --revert` over the hosted lock: drift-skip AND keep.
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &[
+            "vendor",
+            "--revert",
+            "--json",
+            "--offline",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(
+        code, 0,
+        "drift-skipped revert must exit 0.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let env: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("revert --json output is not JSON: {e}\nstdout:\n{stdout}"));
+    assert_eq!(
+        env["summary"]["skipped"], 1,
+        "the keep must be counted as one genuine skip: {env}"
+    );
+    assert_eq!(env["summary"]["removed"], 0, "nothing removed: {env}");
+    assert!(
+        env["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["action"] == "skipped" && e["errorCode"] == "vendor_revert_kept"),
+        "counted vendor_revert_kept event expected: {env}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&lock_path).unwrap(),
+        lock_hosted,
+        "the hosted lock must be left byte-identical"
+    );
+    assert!(
+        proj.join(&tgz_rel).is_file(),
+        "the vendored tarball must be KEPT — it is the only copy a recovery can use"
+    );
+    let state: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(proj.join(".socket/vendor/state.json"))
+            .expect("state.json must be kept alongside the artifacts"),
+    )
+    .unwrap();
+    assert!(
+        state["entries"][purl.as_str()].is_object(),
+        "the ledger entry must be kept: {state}"
+    );
+    eprintln!("DRIFT-SKIP KEEP OK");
+
+    // 5. Remediation A: undo the drift (restore the vendored lock) — a
+    //    fresh install must deliver the patched bytes from the KEPT tarball.
+    std::fs::write(&lock_path, &lock_wired).unwrap();
+    let nm = proj.join("node_modules");
+    std::fs::remove_dir_all(&nm).unwrap();
+    let reinstall = corepack(
+        &proj,
+        YARN_CLASSIC,
+        &["install", "--no-progress"],
+        &[("YARN_CACHE_FOLDER", cache.to_str().unwrap())],
+    );
+    assert!(
+        reinstall.status.success(),
+        "install from the kept vendored tarball must succeed.\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&reinstall.stdout),
+        String::from_utf8_lossy(&reinstall.stderr),
+    );
+    assert_eq!(
+        std::fs::read(&installed_index).unwrap(),
+        patched,
+        "the kept tarball must still deliver the patched bytes"
+    );
+    eprintln!("KEPT-TARBALL INSTALL OK");
+
+    // 6. Remediation B: the same `vendor --revert` now completes fully.
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &[
+            "vendor",
+            "--revert",
+            "--json",
+            "--offline",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(
+        code, 0,
+        "completing revert must exit 0.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let env: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(env["summary"]["removed"], 1, "revert completes: {env}");
+    assert_eq!(
+        std::fs::read_to_string(&lock_path).unwrap(),
+        lock_pristine,
+        "the pre-vendor registry lock must be restored byte-for-byte"
+    );
+    assert!(
+        !proj.join(".socket/vendor").exists(),
+        "the vendor tree is fully pruned once the revert completes"
+    );
+
+    // 7. The restored registry lock still installs cleanly (pristine bytes).
+    std::fs::remove_dir_all(&nm).unwrap();
+    let final_install = corepack(
+        &proj,
+        YARN_CLASSIC,
+        &["install", "--no-progress"],
+        &[("YARN_CACHE_FOLDER", cache.to_str().unwrap())],
+    );
+    assert!(
+        final_install.status.success(),
+        "post-revert registry install must succeed.\nstderr:\n{}",
+        String::from_utf8_lossy(&final_install.stderr),
+    );
+    assert_eq!(
+        std::fs::read(&installed_index).unwrap(),
+        orig,
+        "the completed revert returns the project to pristine registry bytes"
+    );
+    eprintln!("FULL RECOVERY OK");
+}

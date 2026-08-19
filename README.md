@@ -724,7 +724,10 @@ What gets wired, per ecosystem:
 - **RubyGems (Bundler)** — adds a managed `plugin "socket-patch"` block to the `Gemfile`
   and generates an in-tree Bundler plugin under `.socket/bundler-plugin/`. It re-applies
   patches on every `bundle install` (cached *and* fresh). (Requires the `socket-patch`
-  CLI on `PATH`.)
+  CLI on `PATH`, and **bundler >= 2.2**: bundler 1.x cannot load a `plugin ... path:`
+  directive — it resolves it as an ordinary gem and every later `bundle install` fails —
+  so `setup` refuses to wire a project whose lock or `bundle --version` reports an older
+  bundler, and `setup --check` red-flags a wired project that lands in that state.)
 - **Composer (PHP)** — appends `socket-patch apply` to `composer.json`'s
   `post-install-cmd` / `post-update-cmd` script events, so patches re-apply on every
   `composer install` / `composer update`. (Requires the `socket-patch` CLI on `PATH`.)
@@ -766,7 +769,7 @@ socket-patch setup --remove   # revert what setup added
 | Flag | Env var | Description |
 |------|---------|-------------|
 | `--check` | — | Read-only verification that every manifest is configured **and** every installed patch is still applied on disk (each file matches its recorded `afterHash`); exits non-zero if any manifest still needs setup or a patch has drifted. Never writes (safe in CI). Conflicts with `--remove`. |
-| `--remove` | — | Revert every install hook `setup` added (npm `package.json` scripts, the Python `socket-patch[hook]` dependency, the gem Bundler plugin wiring, and the Composer `post-install-cmd`/`post-update-cmd` script entries). |
+| `--remove` | — | Revert every install hook `setup` added (npm `package.json` scripts, the Python `socket-patch[hook]` dependency, the gem Bundler plugin wiring — including bundler's machine-local `.bundle/plugin` registration, so later `bundle install`s don't warn about the unwired plugin — and the Composer `post-install-cmd`/`post-update-cmd` script entries). If the registration can't be cleared automatically (unexpected index format), the error names the fallback: `bundler plugin uninstall socket-patch`. |
 | `--exclude <paths>` | `SOCKET_SETUP_EXCLUDE` | Workspace-member path(s) to exclude from setup (comma-separated, relative to the repo root). The exclusion is persisted in `.socket/manifest.json`, so `setup --check` and a fresh clone honor it without re-passing the flag. |
 
 #### Disabling / opting out (Python hook)

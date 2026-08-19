@@ -14,5 +14,21 @@
     "key": "rails",
     "original": "rails (7.0.0) sha256=2222222222222222222222222222222222222222222222222222222222222222",
     "new": "rails (7.0.0) sha256=deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+  },
+  {
+    "path": "Gemfile.lock",
+    "kind": "redirect_gemfile_lock_dependency_pin",
+    "action": "rewritten",
+    "key": "rails",
+    "original": "rails (= 7.0.0)",
+    "new": "rails (= 7.0.0)!"
+  },
+  {
+    "path": "Gemfile.lock",
+    "kind": "redirect_gemfile_lock_gem_source",
+    "action": "rewritten",
+    "key": "rails",
+    "original": "https://rubygems.org/",
+    "new": "https://patch.socket.dev/patch-registry/gem/11111111-1111-1111-1111-111111111111/77777777-7777-7777-7777-777777777777/"
   }
 ]
