@@ -2062,16 +2062,22 @@ async fn scan_vendor_gem_detached_writes_no_manifest_and_reverts() {
 // The full migration a real project performs: `scan --mode hosted` first
 // (wiremock API, v9 pnpm root lock — the shapes of
 // `in_process_redirect_pnpm.rs`), then `vendor` over the hosted-redirected
-// lock. Pins the npm-family takeover reconciliation:
+// lock. Pins the npm-family takeover pre-revert (the pnpm twin of
+// `mode_migration_npm.rs`):
 //
-//   * the redirect ledger loses the converted purl's `records` entry AND its
+//   * vendor PRE-REVERTS the live hosted redirect (surfaced as the
+//     `vendor_takeover_reverted_redirect` advisory) before rewiring, so the
+//     redirect ledger loses the converted purl's `records` entry AND its
 //     `redirect_pnpm_resolution` edits (stale halves fed VEX/updates and
-//     re-fired the takeover warning forever pre-fix),
-//   * the `vendor_supersedes_redirect` warning fires exactly ONCE — on the
-//     run that reconciles — and a re-vendor (`already_vendored`) is silent,
-//   * `vendor --revert` still restores the HOSTED-spliced lock byte-exactly
-//     (the hosted fragment is embedded as the vendor wiring `original`, so
-//     dropping the redirect ledger halves loses no revert data).
+//     re-fired the takeover warning forever pre-fix) — the
+//     `vendor_supersedes_redirect` warning can never fire, on the takeover
+//     run or any later one,
+//   * the vendor wiring `original` embeds the PRISTINE registry fragment —
+//     not the grant-tokenized hosted splice — and a re-vendor
+//     (`already_vendored`) is silent,
+//   * `vendor --revert` therefore restores the REGISTRY lock byte-exactly
+//     (pre-#206 it restored an expiring hosted URL with no CLI path back to
+//     registry state).
 mod hosted_to_vendor_conversion {
     use super::*;
     use serial_test::serial;
@@ -2277,20 +2283,20 @@ snapshots:
 
     #[tokio::test]
     #[serial]
-    async fn hosted_then_vendor_reconciles_ledger_warns_once_and_reverts_bytes() {
+    async fn hosted_then_vendor_takeover_pre_reverts_redirect_and_round_trips() {
         let server = MockServer::start().await;
         mock_hosted_api(&server).await;
 
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         write_pnpm_project(root);
+        let pristine_lock = std::fs::read(root.join("pnpm-lock.yaml")).unwrap();
 
         // 1. Hosted redirect: the lock's resolution is spliced to the hosted
         //    tarball and the redirect ledger claims the purl.
         let code = scan_run(hosted_args(root, server.uri())).await;
         assert_eq!(code, 0, "scan --mode hosted must succeed");
-        let hosted_lock = std::fs::read(root.join("pnpm-lock.yaml")).unwrap();
-        let hosted_lock_text = String::from_utf8(hosted_lock.clone()).unwrap();
+        let hosted_lock_text = std::fs::read_to_string(root.join("pnpm-lock.yaml")).unwrap();
         assert!(
             hosted_lock_text.contains(&format!("tarball: {HOSTED_URL}")),
             "hosted splice missing:\n{hosted_lock_text}"
@@ -2304,6 +2310,9 @@ snapshots:
         );
 
         // 2. Vendor over the hosted-redirected lock (offline, staged blob).
+        //    The takeover PRE-REVERTS the hosted edits first — surfaced as
+        //    the `vendor_takeover_reverted_redirect` advisory — then vendors
+        //    from the clean registry baseline.
         seed_manifest_and_blob(root);
         let (code, env1) = vendor_cli(root, &[]);
         assert_eq!(
@@ -2311,25 +2320,34 @@ snapshots:
             "vendor over the hosted lock must succeed: {env1:#}"
         );
         find_event(&env1, "applied", None);
+        find_event(&env1, "skipped", Some("vendor_takeover_reverted_redirect"));
 
-        // The takeover warning fired exactly once — on the reconciling run —
-        // and reports the reconciliation as DONE, not as advice to re-run.
-        let warns = takeover_warnings(&env1);
-        assert_eq!(
-            warns.len(),
-            1,
-            "vendor_supersedes_redirect must fire exactly once: {env1:#}"
+        // The pre-revert leaves nothing to supersede, so the
+        // vendor_supersedes_redirect warning must not fire — not on this run
+        // (pre-#206 it fired here) and not on any later one.
+        assert!(
+            takeover_warnings(&env1).is_empty(),
+            "the pre-revert must preempt vendor_supersedes_redirect: {env1:#}"
+        );
+
+        // The lock is FULLY vendored: local wiring present, no hosted
+        // residue.
+        let vendored_lock_text =
+            std::fs::read_to_string(root.join("pnpm-lock.yaml")).unwrap();
+        assert!(
+            !vendored_lock_text.contains(HOSTED_URL),
+            "the hosted splice must be gone from the vendored lock:\n{vendored_lock_text}"
         );
         assert!(
-            warns[0].contains("reconciled automatically"),
-            "the warning must state the reconciliation happened: {}",
-            warns[0]
+            vendored_lock_text.contains(".socket/vendor/"),
+            "the vendored wiring must be present:\n{vendored_lock_text}"
         );
 
-        // The redirect ledger no longer carries the purl's halves: its
-        // `records` entry and its `redirect_pnpm_resolution` edits are gone
-        // (a residual non-package edit like the workspace-trust one may
-        // remain — it is the hosted flow's own config surface).
+        // The redirect ledger no longer carries the purl's halves: the
+        // takeover dropped its `records` entry and its
+        // `redirect_pnpm_resolution` edits (a residual non-package edit like
+        // the workspace-trust one may remain — it is the hosted flow's own
+        // config surface).
         match std::fs::read_to_string(&ledger_path) {
             Ok(text) => {
                 let after: Value = serde_json::from_str(&text).unwrap();
@@ -2357,22 +2375,27 @@ snapshots:
             Err(e) => panic!("unreadable redirect ledger: {e}"),
         }
 
-        // The vendor ledger's wiring `original` embeds the HOSTED-spliced
-        // fragment — the revert data the dropped ledger halves would
-        // otherwise have been the last copy of.
+        // The vendor ledger's wiring `original` embeds the PRISTINE registry
+        // fragment the pre-revert restored — never the grant-tokenized
+        // hosted splice (which would make `--revert` restore an expiring
+        // hosted URL with no CLI path back to registry state).
         let state: Value = serde_json::from_str(
             &std::fs::read_to_string(root.join(".socket/vendor/state.json")).unwrap(),
         )
         .unwrap();
+        let wiring = state["entries"][CONV_PURL]["wiring"].to_string();
         assert!(
-            state["entries"][CONV_PURL]["wiring"]
-                .to_string()
-                .contains(HOSTED_URL),
-            "vendor wiring must embed the hosted-spliced original: {state:#}"
+            wiring.contains(UPSTREAM_SHA512),
+            "vendor wiring must embed the pristine registry original: {state:#}"
+        );
+        assert!(
+            !wiring.contains(HOSTED_URL),
+            "vendor wiring must NOT record the hosted fragment: {state:#}"
         );
 
-        // 3. Re-vendor: an `already_vendored` no-op with NO takeover warning
-        //    (pre-fix the stale ledger re-fired it on every run).
+        // 3. Re-vendor: an `already_vendored` no-op with NO takeover event
+        //    and NO supersede warning (pre-fix the stale ledger re-fired the
+        //    warning on every run).
         let (code, env2) = vendor_cli(root, &[]);
         assert_eq!(code, 0, "re-vendor must succeed: {env2:#}");
         find_event(&env2, "skipped", Some("already_vendored"));
@@ -2380,14 +2403,21 @@ snapshots:
             takeover_warnings(&env2).is_empty(),
             "a reconciled ledger must not re-fire the warning: {env2:#}"
         );
+        assert!(
+            events(&env2)
+                .iter()
+                .all(|e| e["errorCode"] != "vendor_takeover_reverted_redirect"),
+            "a reconciled ledger must not re-fire the takeover: {env2:#}"
+        );
 
-        // 4. `vendor --revert` restores the HOSTED-spliced lock byte-exactly.
+        // 4. `vendor --revert` restores the REGISTRY lock byte-exactly — the
+        //    pre-redirect resolution, not the hosted splice.
         let (code, renv) = vendor_cli(root, &["--revert"]);
         assert_eq!(code, 0, "revert must succeed: {renv:#}");
         assert_eq!(
             std::fs::read(root.join("pnpm-lock.yaml")).unwrap(),
-            hosted_lock,
-            "revert must byte-restore the hosted-spliced lock"
+            pristine_lock,
+            "revert must byte-restore the pristine registry lock"
         );
     }
 }
