@@ -47,16 +47,19 @@
 //! exact live-CI signature — so any server or fixture that stops declaring
 //! runtime deps turns this suite red.
 //!
-//! KNOWN LIMITATION, pinned as a canary: on a lock that carries a CHECKSUMS
-//! section (bundler >= 4 writes one by default), today's rewrite (Gemfile
-//! block + CHECKSUMS pin, GEM section left on the upstream remote) makes the
-//! prescribed unfrozen install fail with "Bundler found mismatched checksums"
-//! — bundler still attributes the gem to the upstream source and refuses the
-//! lockfile-vs-API disagreement (exit 37, verified on bundler 4.0.15). The
-//! canary test pins that reality; the verified fix shape is the fully
-//! converged lock (patched-registry GEM section + `<name> (= <ver>)!`
-//! DEPENDENCIES pin + patched CHECKSUMS sha — a frozen install of that shape
-//! passes), which must land in the TS twin + golden fixtures together.
+//! CHECKSUMS locks (bundler >= 4 writes the section by default) come out
+//! FULLY CONVERGED: patch-registry GEM section holding the dep's spec,
+//! `<name> (= <ver>)!` DEPENDENCIES pin, patched CHECKSUMS sha. The flipped
+//! canary proves the converged pair installs patched bytes on a fresh
+//! checkout both FROZEN (`BUNDLE_FROZEN=true`, lock byte-identical — no
+//! unfrozen two-step) and unfrozen (the historical exit 37 "mismatched
+//! checksums" mixed-state refusal is gone; it was pinned here as a known
+//! limitation until the converged rewrite landed). The depscan TS twin
+//! (registry-rewrite gem.ts) must be ported to match.
+//!
+//! The grant-rotation capstone drives token A -> A -> B re-scans through the
+//! real binary: byte-idempotent under the same grant, in-place URL refresh
+//! (Gemfile source block + converged-lock remote) under a rotated one.
 //!
 //! Skips (with a println) when `ruby`/`gem`/`bundle` are missing or the host
 //! bundler predates 2.6 (the CHECKSUMS-aware floor); everything after that is
@@ -168,6 +171,13 @@ fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
 /// cold (the fresh-checkout install must be forced through the wiremock
 /// registry, never satisfied from the scan project's cache).
 fn bundle(cwd: &Path, args: &[&str]) -> Output {
+    bundle_env(cwd, args, &[])
+}
+
+/// `bundle` with extra environment on top of the isolated surface — e.g.
+/// `BUNDLE_FROZEN=true` for bundler's frozen/deployment contract (exit 16 on
+/// any Gemfile-vs-lock drift, lock never written).
+fn bundle_env(cwd: &Path, args: &[&str], envs: &[(&str, &str)]) -> Output {
     let mut cmd = Command::new("bundle");
     cmd.args(args).current_dir(cwd);
     for (k, _) in std::env::vars_os() {
@@ -179,6 +189,9 @@ fn bundle(cwd: &Path, args: &[&str]) -> Output {
     cache_env::isolate(&mut cmd);
     cmd.env("BUNDLE_APP_CONFIG", cwd.join(".bundle"));
     cmd.env("BUNDLE_USER_HOME", cwd.join(".bundle-user-home"));
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
     cmd.output().expect("failed to run bundle")
 }
 
@@ -735,16 +748,23 @@ async fn redirect_scanned_project(
         .iter()
         .filter_map(|w| w["code"].as_str())
         .collect();
-    assert!(
-        warning_codes.contains(&"redirect_gem_frozen_install"),
-        "the frozen-install caveat must be surfaced: {env}"
-    );
     if checksums_lock {
+        // CHECKSUMS-era locks converge (patch-registry GEM section +
+        // dependency pin + patched sha), so the pair is frozen-installable
+        // as written — the caveat would be a lie.
+        assert!(
+            !warning_codes.contains(&"redirect_gem_frozen_install"),
+            "a converged CHECKSUMS pair must not carry the frozen-install caveat: {env}"
+        );
         assert!(
             rewritten.contains(&lock_name),
             "the CHECKSUMS pin must land in {lock_name}: {env}"
         );
     } else {
+        assert!(
+            warning_codes.contains(&"redirect_gem_frozen_install"),
+            "the frozen-install caveat must be surfaced on a mixed (no-CHECKSUMS) pair: {env}"
+        );
         assert!(
             warning_codes.contains(&"redirect_gem_no_checksums_section"),
             "a no-CHECKSUMS lock cannot be pinned and must say so: {env}"
@@ -796,12 +816,10 @@ async fn redirect_scanned_project(
     })
 }
 
-/// New dir holding ONLY what a git checkout would carry — the manifest pair,
-/// `.socket/`, `.bundle/` — then the UNFROZEN `bundle install` the rewriter's
-/// `redirect_gem_frozen_install` warning prescribes, with a cold per-dir
-/// bundler home. Returns the fresh dir and the install output.
-fn fresh_checkout_bundle_install(fx: &RedirectFixture) -> (PathBuf, Output) {
-    let fresh = fx.tmp.path().join("fresh");
+/// New dir named `name` holding ONLY what a git checkout would carry — the
+/// manifest pair, `.socket/`, `.bundle/` — with a cold per-dir bundler home.
+fn stage_fresh_checkout(fx: &RedirectFixture, name: &str) -> PathBuf {
+    let fresh = fx.tmp.path().join(name);
     std::fs::create_dir_all(&fresh).unwrap();
     std::fs::copy(fx.proj.join(fx.gemfile_name), fresh.join(fx.gemfile_name)).unwrap();
     std::fs::copy(fx.proj.join(fx.lock_name), fresh.join(fx.lock_name)).unwrap();
@@ -811,6 +829,13 @@ fn fresh_checkout_bundle_install(fx: &RedirectFixture) -> (PathBuf, Output) {
         !fresh.join("vendor").exists(),
         "fresh checkout must not carry an installed tree (test bug)"
     );
+    fresh
+}
+
+/// Fresh checkout + the UNFROZEN `bundle install` the redirect prescribes on
+/// a not-yet-converged lock. Returns the fresh dir and the install output.
+fn fresh_checkout_bundle_install(fx: &RedirectFixture) -> (PathBuf, Output) {
+    let fresh = stage_fresh_checkout(fx, "fresh");
     let install = bundle(&fresh, &["install"]);
     (fresh, install)
 }
@@ -1035,21 +1060,21 @@ async fn gem_hosted_registry_info_without_deps_breaks_install_like_production() 
     );
 }
 
-/// KNOWN-LIMITATION CANARY — CHECKSUMS locks (bundler >= 4 default): the
-/// current rewrite (source block + CHECKSUMS pin, GEM section left on the
-/// upstream remote) makes the prescribed unfrozen install FAIL: bundler
-/// still attributes the gem to the upstream source and refuses the
-/// lockfile-vs-upstream-API checksum disagreement ("Bundler found mismatched
-/// checksums", exit 37 — verified on bundler 4.0.15). This test pins the
-/// rewrite half (the pin lands, its ledger edit records the upstream sha for
-/// revert) AND the current install failure. When the rewriter learns the
-/// verified fix — the fully converged lock: patched-registry GEM section,
-/// `<name> (= <ver>)!` DEPENDENCIES pin, patched CHECKSUMS sha, which a
-/// FROZEN install accepts — this canary must flip to asserting success.
+/// FLIPPED CANARY — CHECKSUMS locks (bundler >= 4 default) must come out
+/// FULLY CONVERGED: patch-registry GEM section holding the dep's spec,
+/// `<name> (= <ver>)!` DEPENDENCIES pin, patched CHECKSUMS sha (upstream sha
+/// recorded in the ledger for revert). The old mixed-state rewrite (pin only,
+/// GEM section left upstream) made the prescribed unfrozen install fail with
+/// "Bundler found mismatched checksums" (exit 37 — the bundler-4 DEFAULT
+/// lock, i.e. the mainstream hosted-gem path) and forced a frozen-install
+/// two-step (exit 16) on deployment setups. The converged pair must now
+/// install patched bytes BOTH ways on a fresh checkout: under
+/// `BUNDLE_FROZEN=true` with the lock byte-untouched (no two-step), and
+/// unfrozen (no exit 37).
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "host capstone: shells out to a real ruby/gem/bundler >= 2.6; the unpinned `test` \
             job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
-async fn gem_hosted_checksums_lock_pins_patched_sha_but_bundler_refuses_mixed_state() {
+async fn gem_hosted_checksums_lock_converges_and_installs_frozen_and_unfrozen() {
     let Some(fx) = redirect_scanned_project("checksums", Spelling::Gemfile, true, true, None).await
     else {
         return;
@@ -1061,9 +1086,8 @@ async fn gem_hosted_checksums_lock_pins_patched_sha_but_bundler_refuses_mixed_st
         &std::fs::read_to_string(fx.proj.join(".socket/vendor/redirect-state.json")).unwrap(),
     )
     .unwrap();
-    let edit = ledger["edits"]
-        .as_array()
-        .expect("ledger edits")
+    let edits = ledger["edits"].as_array().expect("ledger edits");
+    let edit = edits
         .iter()
         .find(|e| e["kind"] == "redirect_gemfile_lock_checksum")
         .expect("CHECKSUMS pin edit recorded in the ledger");
@@ -1073,32 +1097,63 @@ async fn gem_hosted_checksums_lock_pins_patched_sha_but_bundler_refuses_mixed_st
         original.starts_with(&format!("{DEP} ({DEP_VERSION}) sha256=")),
         "original must be the pre-edit registry line: {original}"
     );
+    let lock = std::fs::read_to_string(fx.proj.join("Gemfile.lock")).unwrap();
     assert!(
-        !std::fs::read_to_string(fx.proj.join("Gemfile.lock"))
-            .unwrap()
-            .contains(original),
+        !lock.contains(original),
         "the upstream sha line must actually have been replaced (else the pin is vacuous)"
     );
 
-    // The install half — today's reality on a CHECKSUMS lock.
-    let (_fresh, install) = fresh_checkout_bundle_install(&fx);
+    // The converged half: GEM section attribution + bundler's own `!` pin,
+    // with the move and the pin recorded in the ledger.
     assert!(
-        !install.status.success(),
-        "KNOWN LIMITATION pinned: if this fresh install now SUCCEEDS, the mixed-state lock \
-         handling was fixed — flip this canary to assert success + patched bytes (see the \
-         test doc for the verified converged-lock shape).\nstdout:\n{}\nstderr:\n{}",
+        lock.contains(&format!(
+            "GEM\n  remote: {}\n  specs:\n    {DEP} ({DEP_VERSION})",
+            fx.index_url
+        )),
+        "the lock must attribute the dep to the patch-registry GEM section:\n{lock}"
+    );
+    assert!(
+        lock.contains(&format!("  {DEP} (= {DEP_VERSION})!")),
+        "DEPENDENCIES must carry the source-pinned entry:\n{lock}"
+    );
+    assert!(
+        edits
+            .iter()
+            .any(|e| e["kind"] == "redirect_gemfile_lock_gem_source"),
+        "the GEM-section move must be a ledger edit: {edits:?}"
+    );
+
+    // FROZEN fresh checkout: the converged pair needs no unfrozen two-step —
+    // bundler's deployment contract accepts it as-is and the lock stays
+    // byte-identical.
+    let frozen = stage_fresh_checkout(&fx, "fresh-frozen");
+    let lock_before = std::fs::read(frozen.join(fx.lock_name)).unwrap();
+    let install = bundle_env(&frozen, &["install"], &[("BUNDLE_FROZEN", "true")]);
+    assert!(
+        install.status.success(),
+        "FROZEN fresh-checkout install of the converged pair must succeed (the exit-16 \
+         two-step is gone).\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&install.stdout),
         String::from_utf8_lossy(&install.stderr),
     );
-    let chatter = format!(
-        "{}\n{}",
-        String::from_utf8_lossy(&install.stdout),
-        String::from_utf8_lossy(&install.stderr)
+    assert_eq!(
+        std::fs::read(frozen.join(fx.lock_name)).unwrap(),
+        lock_before,
+        "a frozen install must leave the lock byte-identical"
     );
+    assert_patched_install(&fx, &frozen);
+
+    // UNFROZEN fresh checkout: the previously-pinned exit 37 "mismatched
+    // checksums" refusal is gone too.
+    let (fresh, install) = fresh_checkout_bundle_install(&fx);
     assert!(
-        chatter.to_lowercase().contains("mismatched checksums"),
-        "the refusal must be bundler's checksum-conflict check, not something incidental:\n{chatter}"
+        install.status.success(),
+        "unfrozen fresh-checkout install of the converged pair must succeed (the pinned \
+         exit-37 mixed-state refusal is fixed).\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&install.stdout),
+        String::from_utf8_lossy(&install.stderr),
     );
+    assert_patched_install(&fx, &fresh);
 }
 
 /// GRANT ROTATION, end to end (token A -> A -> B, same patch uuid): the
