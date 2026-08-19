@@ -7664,6 +7664,59 @@ mod tests {
         assert_eq!(dep_edit.original, None);
     }
 
+    /// Convergence orders its edits on bundler's invariant that source
+    /// sections precede DEPENDENCIES (the pin insert runs first because its
+    /// lines sit after the spec-move indices). A hand-edited lock with
+    /// DEPENDENCIES before GEM breaks that premise — it must fail soft to the
+    /// mixed state (checksum pinned, GEM attribution untouched, frozen-install
+    /// caveat), never splice with stale indices and corrupt the lock.
+    #[test]
+    fn gem_checksums_lock_dependencies_before_gem_fails_soft_to_mixed() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "Gemfile".to_string(),
+            "source \"https://rubygems.org\"\n\ngem \"rails\", \"7.0.0\"\n".to_string(),
+        );
+        files.insert(
+            "Gemfile.lock".to_string(),
+            format!(
+                "DEPENDENCIES\n  rails (= 7.0.0)\n\n\
+                 GEM\n  remote: https://rubygems.org/\n  specs:\n    rails (7.0.0)\n\n\
+                 PLATFORMS\n  ruby\n\nCHECKSUMS\n  rails (7.0.0) sha256={}\n\n\
+                 BUNDLED WITH\n   2.6.2\n",
+                "2".repeat(64)
+            ),
+        );
+        let r = rewrite_registry_redirect(&files, &[gem_override("rails", "7.0.0")]);
+        let expected = format!(
+            "DEPENDENCIES\n  rails (= 7.0.0)\n\n\
+             GEM\n  remote: https://rubygems.org/\n  specs:\n    rails (7.0.0)\n\n\
+             PLATFORMS\n  ruby\n\nCHECKSUMS\n  rails (7.0.0) sha256={}\n\n\
+             BUNDLED WITH\n   2.6.2\n",
+            "f".repeat(64)
+        );
+        assert_eq!(
+            r.files.get("Gemfile.lock"),
+            Some(&expected),
+            "only the CHECKSUMS pin lands — the unconvergeable lock keeps its shape"
+        );
+        assert!(
+            !r.edits
+                .iter()
+                .any(|e| e.kind == "redirect_gemfile_lock_gem_source"
+                    || e.kind == "redirect_gemfile_lock_dependency_pin"),
+            "no convergence edits on the fail-soft path: {:?}",
+            r.edits
+        );
+        assert!(
+            r.warnings
+                .iter()
+                .any(|w| w.code == "redirect_gem_frozen_install"),
+            "the mixed pair keeps the frozen-install caveat: {:?}",
+            r.warnings
+        );
+    }
+
     /// Bundler's modern `gems.rb`/`gems.locked` spelling must be redirected
     /// exactly like the classic pair — before this, a gems.rb project was a
     /// silent no-op (the rewriter keyed on the literal "Gemfile" names).
