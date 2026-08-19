@@ -462,6 +462,7 @@ pub async fn revert_maven(
             )),
             Err(e) => {
                 return RevertOutcome {
+                    kept_artifact: false,
                     success: false,
                     warnings,
                     error: Some(e),
@@ -473,6 +474,7 @@ pub async fn revert_maven(
     if !dry_run {
         if let Err(e) = remove_tree(&uuid_dir).await {
             return RevertOutcome {
+                kept_artifact: false,
                 success: false,
                 warnings,
                 error: Some(format!("failed to remove {}: {e}", uuid_dir.display())),
@@ -481,6 +483,7 @@ pub async fn revert_maven(
     }
 
     RevertOutcome {
+        kept_artifact: false,
         success: true,
         warnings,
         error: None,

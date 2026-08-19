@@ -1956,3 +1956,169 @@ async fn scan_vendor_gem_detached_writes_no_manifest_and_reverts() {
     );
     assert!(!fx.root().join(".socket/vendor").exists());
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// 12. drift-skipped revert keeps artifacts + ledger (residual #131)
+// ─────────────────────────────────────────────────────────────────────
+
+/// `vendor --revert` when EVERY recorded lock entry has drifted (a hosted
+/// overlay or a registry re-resolve since vendoring — anything failing the
+/// uuid-dir ownership gate): the backend leaves the lock alone, so the
+/// orchestrator must ALSO keep the artifact dir and the state.json entry,
+/// and account for it honestly — a COUNTED `Skipped` (`vendor_revert_kept`),
+/// never a `Removed`. Undoing the drift and re-running `--revert` then
+/// completes the revert fully.
+///
+/// Previously (residual #131) this path deleted the artifact dir and pruned
+/// the ledger entry while the lock stayed pointed elsewhere — destroying the
+/// only pre-vendor originals a later restore (or the redirect ledger's
+/// recorded `original` fragments) could use — and reported plain success
+/// with `summary.skipped == 0`.
+#[tokio::test]
+async fn revert_after_drift_keeps_artifact_and_ledger_then_completes() {
+    let fx = npm_fixture();
+    assert_eq!(vendor_run(vendor_args(fx.root())).await, 0);
+    let vendored_lock = fx.lock_bytes();
+
+    // Third-party drift: the lock was re-resolved behind our back (same
+    // ownership-gate outcome as a hosted patch.socket.dev overlay). The
+    // drifted value must be neither ours nor the recorded pre-vendor
+    // original — a lock already back at the original is CONVERGED, and the
+    // revert completes instead of keeping (see
+    // `revert_completes_when_lock_already_matches_the_original`).
+    let mut drifted: Value = serde_json::from_slice(&vendored_lock).unwrap();
+    drifted["packages"]["node_modules/left-pad"]["resolved"] =
+        Value::String("https://example.com/their-fork.tgz".to_string());
+    let mut drifted_lock = serde_json::to_vec_pretty(&drifted).unwrap();
+    drifted_lock.push(b'\n');
+    std::fs::write(fx.lock_path(), &drifted_lock).unwrap();
+
+    let (code, env) = vendor_cli(fx.root(), &["--revert"]);
+    assert_eq!(
+        code, 0,
+        "a drift-skip keep is a warning, not an error: {env:#}"
+    );
+    let kept = find_event(&env, "skipped", Some("vendor_revert_kept"));
+    assert_eq!(kept["purl"], PURL, "{env:#}");
+    assert_eq!(
+        env["summary"]["skipped"], 1,
+        "the keep must be COUNTED (one genuine skip, advisory warnings \
+         excluded): {env:#}"
+    );
+    assert_eq!(
+        env["summary"]["removed"], 0,
+        "nothing was removed, so nothing may be counted removed: {env:#}"
+    );
+    assert!(
+        events(&env).iter().all(|e| e["action"] != "removed"),
+        "no Removed event for a kept entry: {env:#}"
+    );
+
+    // Artifacts + ledger survive; the drifted lock is left alone.
+    assert!(fx.tgz_path().is_file(), "artifact tarball must be kept");
+    assert!(fx.marker_path().is_file(), "vendor marker must be kept");
+    let state: Value = serde_json::from_slice(&std::fs::read(fx.state_path()).unwrap()).unwrap();
+    assert!(
+        state["entries"][PURL].is_object(),
+        "ledger entry must be kept: {state:#}"
+    );
+    assert_eq!(fx.lock_bytes(), drifted_lock, "drifted lock left alone");
+
+    // Undo the drift → the same command now completes the revert.
+    std::fs::write(fx.lock_path(), &vendored_lock).unwrap();
+    let (code, env) = vendor_cli(fx.root(), &["--revert"]);
+    assert_eq!(code, 0, "{env:#}");
+    assert_eq!(env["summary"]["removed"], 1, "{env:#}");
+    assert_eq!(
+        fx.lock_bytes(),
+        fx.original_lock,
+        "lock restored byte-for-byte"
+    );
+    assert!(
+        !fx.vendor_dir().exists(),
+        ".socket/vendor fully pruned once the revert completes"
+    );
+}
+
+/// The reconcile path (patch dropped from the manifest) runs the same
+/// backend revert: a drifted entry must be kept — ledger entry retained,
+/// counted `Skipped`, nothing removed — instead of silently pruning the
+/// ledger and artifacts out from under the drifted lock.
+#[tokio::test]
+async fn reconcile_keeps_drifted_entry() {
+    let fx = npm_fixture();
+    assert_eq!(vendor_run(vendor_args(fx.root())).await, 0);
+
+    // Drop the patch from the manifest AND drift the lock (to a value that
+    // is neither ours nor the recorded pre-vendor original — genuine
+    // third-party drift).
+    std::fs::write(fx.manifest_path(), b"{\"patches\": {}}\n").unwrap();
+    let mut drifted: Value = serde_json::from_slice(&fx.lock_bytes()).unwrap();
+    drifted["packages"]["node_modules/left-pad"]["resolved"] =
+        Value::String("https://example.com/their-fork.tgz".to_string());
+    let mut drifted_lock = serde_json::to_vec_pretty(&drifted).unwrap();
+    drifted_lock.push(b'\n');
+    std::fs::write(fx.lock_path(), &drifted_lock).unwrap();
+
+    let (code, env) = vendor_cli(fx.root(), &[]);
+    assert_eq!(code, 0, "reconcile keep must exit 0: {env:#}");
+    let kept = find_event(&env, "skipped", Some("vendor_revert_kept"));
+    assert_eq!(kept["purl"], PURL, "{env:#}");
+    assert_eq!(env["summary"]["removed"], 0, "{env:#}");
+    assert!(
+        !events(&env)
+            .iter()
+            .any(|e| e["errorCode"] == "vendor_reconciled"),
+        "a kept entry must not be reported reconciled: {env:#}"
+    );
+    assert!(fx.tgz_path().is_file(), "artifact must be kept");
+    let state: Value = serde_json::from_slice(&std::fs::read(fx.state_path()).unwrap()).unwrap();
+    assert!(
+        state["entries"][PURL].is_object(),
+        "ledger entry must be kept: {state:#}"
+    );
+    assert_eq!(fx.lock_bytes(), drifted_lock, "drifted lock left alone");
+}
+
+/// KEEP-GATE LIVENESS: a lock whose entry already equals the recorded
+/// pre-vendor original is CONVERGED, not drifted — the user (or an earlier
+/// partial revert) already restored it, e.g. via `git checkout`. The revert
+/// must complete fully — artifacts removed, ledger pruned, counted
+/// `Removed` — never keep the entry with "undo the drift" advice that can
+/// never be satisfied.
+#[tokio::test]
+async fn revert_completes_when_lock_already_matches_the_original() {
+    let fx = npm_fixture();
+    assert_eq!(vendor_run(vendor_args(fx.root())).await, 0);
+
+    // The user restored the pre-vendor lock by hand (git checkout).
+    std::fs::write(fx.lock_path(), &fx.original_lock).unwrap();
+
+    let (code, env) = vendor_cli(fx.root(), &["--revert"]);
+    assert_eq!(code, 0, "{env:#}");
+    assert_eq!(
+        env["summary"]["removed"], 1,
+        "the converged revert completes: {env:#}"
+    );
+    assert_eq!(
+        env["summary"]["skipped"], 0,
+        "nothing was kept, so nothing may be counted skipped: {env:#}"
+    );
+    assert!(
+        events(&env)
+            .iter()
+            .all(|e| e["errorCode"] != "vendor_revert_kept"
+                && e["errorCode"] != "vendor_lock_entry_drifted"),
+        "an already-restored entry is converged, not drifted: {env:#}"
+    );
+    assert_eq!(fx.lock_bytes(), fx.original_lock, "lock stays restored");
+    assert!(
+        !fx.vendor_dir().exists(),
+        ".socket/vendor fully pruned once the revert converges"
+    );
+    let state_gone = !fx.state_path().exists()
+        || serde_json::from_slice::<Value>(&std::fs::read(fx.state_path()).unwrap())
+            .map(|s| !s["entries"][PURL].is_object())
+            .unwrap_or(true);
+    assert!(state_gone, "ledger entry pruned once the revert converges");
+}

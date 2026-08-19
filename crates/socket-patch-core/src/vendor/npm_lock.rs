@@ -455,6 +455,16 @@ pub async fn revert_npm(entry: &VendorEntry, project_root: &Path, dry_run: bool)
         }
     }
 
+    // LOSSINESS GUARD (residual #131): when any wiring record was left
+    // alone ("drifted; left alone"), the uuid dir may hold the only copy of
+    // what the lock — or the redirect ledger's recorded originals — still
+    // points at. Keep it (and let the CLI keep the ledger entry) instead of
+    // deleting evidence out from under a lock we just refused to touch.
+    if outcome.drift_skipped() {
+        outcome.keep_artifact(&uuid_dir_rel);
+        return outcome;
+    }
+
     // Remove the whole validated uuid dir (tgz + marker + any @scope level)
     // in one tree delete — pruning by leaf would leave empty dirs behind.
     if let Err(e) = remove_tree(&project_root.join(&uuid_dir_rel)).await {
@@ -718,6 +728,15 @@ fn revert_one_record(
         ));
         return;
     };
+
+    // ALREADY CONVERGED: the live fragment equals the recorded pre-vendor
+    // original — an earlier partial revert (or the user, by hand) already
+    // restored this record. Not drift: stay silent so the drift-skip keep
+    // gate can converge (re-warning here would keep the artifacts + ledger
+    // entry forever, with remediation advice that can never be satisfied).
+    if rec.original.as_ref() == Some(&*live) {
+        return;
+    }
 
     // Ours iff resolved is exactly what we wrote, or still points into OUR
     // uuid dir (a re-serialized but unmoved entry).
@@ -1979,6 +1998,7 @@ mod tests {
 
         // The user re-resolved the DIRECT instance behind our back.
         let mut live = fx.read_lock().await;
+        let vendored_direct = live["packages"]["node_modules/left-pad"].clone();
         live["packages"]["node_modules/left-pad"]["resolved"] =
             json!("https://example.com/their-fork.tgz");
         tokio::fs::write(fx.lock_path(), serialize_json(&live, "  ").unwrap())
@@ -2007,10 +2027,49 @@ mod tests {
             default_lock()["packages"]["node_modules/foo/node_modules/left-pad"],
             "non-drifted instance restored"
         );
-        assert!(!fx
-            .root()
-            .join(format!(".socket/vendor/npm/{UUID}"))
-            .exists());
+        // Residual #131: a drift-skip keeps the artifact dir (the drifted
+        // entry's recorded original may still be needed later) and says so.
+        assert!(
+            fx.root()
+                .join(format!(".socket/vendor/npm/{UUID}"))
+                .exists(),
+            "drift-skip must keep the artifact dir"
+        );
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_artifact_kept"),
+            "the keep must be surfaced: {:?}",
+            outcome.warnings
+        );
+
+        // KEEP-GATE LIVENESS: undo ONLY the drift (repoint the direct
+        // instance back at the vendored tarball). The nested instance the
+        // first revert already restored must now read as CONVERGED, not
+        // drifted — otherwise every later revert would re-classify it as
+        // drift and keep the artifacts + ledger entry forever.
+        let mut healed = fx.read_lock().await;
+        healed["packages"]["node_modules/left-pad"] = vendored_direct;
+        tokio::fs::write(fx.lock_path(), serialize_json(&healed, "  ").unwrap())
+            .await
+            .unwrap();
+
+        let outcome = revert_npm(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(
+            outcome.warnings.is_empty(),
+            "the already-restored instance is converged, not drifted: {:?}",
+            outcome.warnings
+        );
+        assert!(!outcome.kept_artifact);
+        assert_eq!(fx.read_lock().await, default_lock(), "lock fully restored");
+        assert!(
+            !fx.root()
+                .join(format!(".socket/vendor/npm/{UUID}"))
+                .exists(),
+            "artifact pruned once the revert converges"
+        );
     }
 
     #[tokio::test]

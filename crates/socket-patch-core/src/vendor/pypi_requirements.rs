@@ -315,6 +315,7 @@ pub(super) async fn revert_requirements(
                 atomic_write_bytes_preserving_mode(&root.join(file), content.as_bytes()).await
             {
                 return RevertOutcome {
+                    kept_artifact: false,
                     success: false,
                     warnings,
                     error: Some(format!("cannot write {file}: {e}")),
@@ -336,6 +337,7 @@ pub(super) async fn revert_requirements(
     }
 
     RevertOutcome {
+        kept_artifact: false,
         success: true,
         warnings,
         error: None,

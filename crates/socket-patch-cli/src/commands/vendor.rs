@@ -1318,6 +1318,20 @@ pub(crate) async fn reconcile_dropped(
             record_warning(env, &purl, w, common);
         }
         if outcome.success {
+            if outcome.kept_artifact {
+                // Drift-skip keep (residual #131): the backend left the
+                // drifted lock alone and kept the artifacts, so the ledger
+                // entry must survive too — and the genuine outcome is a
+                // COUNTED skip, not a removal.
+                env.record(
+                    PatchEvent::new(PatchAction::Skipped, purl.clone()).with_reason(
+                        "vendor_revert_kept",
+                        "patch no longer in manifest, but its lock entries drifted since \
+                         vendoring; artifacts and ledger entry kept",
+                    ),
+                );
+                continue;
+            }
             env.record(
                 PatchEvent::new(PatchAction::Removed, purl.clone())
                     .with_reason("vendor_reconciled", "patch no longer in manifest"),
@@ -1365,6 +1379,22 @@ async fn run_revert(args: &VendorArgs, env: &mut Envelope) -> i32 {
             record_warning(env, purl, w, common);
         }
         if outcome.success {
+            if outcome.kept_artifact {
+                // Drift-skip keep (residual #131): the backend left the
+                // drifted lock alone and kept the artifacts, so the ledger
+                // entry must survive too — and the genuine outcome is a
+                // COUNTED skip, not a removal. (`record_warning` above
+                // already surfaced the per-record details as uncounted
+                // advisory events.)
+                env.record(
+                    PatchEvent::new(PatchAction::Skipped, purl.clone()).with_reason(
+                        "vendor_revert_kept",
+                        "lock entries drifted since vendoring; artifacts and ledger entry kept \
+                         — undo the drift and re-run `vendor --revert` to finish",
+                    ),
+                );
+                continue;
+            }
             env.record(PatchEvent::new(PatchAction::Removed, purl.clone()));
             if !common.dry_run {
                 state.entries.remove(purl);
@@ -1436,6 +1466,16 @@ async fn run_revert(args: &VendorArgs, env: &mut Envelope) -> i32 {
             "{verb} {} vendored package(s); {} failed.",
             env.summary.removed, env.summary.failed
         );
+        // In this command summary.skipped counts only genuine drift-skip
+        // keeps (advisory warnings are pushed uncounted by record_warning).
+        if env.summary.skipped > 0 {
+            println!(
+                "Kept {} drifted package(s): lock entries were re-resolved since vendoring, so \
+                 their artifacts and ledger entries were retained — undo the drift and re-run \
+                 `vendor --revert` to finish.",
+                env.summary.skipped
+            );
+        }
     }
 
     if has_errors {
