@@ -275,12 +275,33 @@ pub(super) async fn run_redirect(
                     .as_ref()
                     .and_then(|o| o.identifiers.go_module_path.clone()),
             ));
+            // The grant token is never a top-level reference field — it only
+            // rides the URLs the reference endpoint hands back, as the path
+            // level before the patch uuid. Recover it so the rewriters'
+            // rotation-idempotency guards (which wildcard the token path
+            // level of a previously-written URL) don't depend on it being
+            // derivable from the URL alone: with an empty token the gem
+            // guard used to miss the previous grant's source block and NEST
+            // a new one around it on every re-scan.
+            let token = reference
+                .registry_override
+                .as_ref()
+                .and_then(|o| {
+                    socket_patch_core::patch::redirect::grant_token_path_segment(
+                        &o.index_url,
+                        &sel.uuid,
+                    )
+                })
+                .or_else(|| {
+                    socket_patch_core::patch::redirect::grant_token_path_segment(&url, &sel.uuid)
+                })
+                .unwrap_or_default();
             overrides.push(DepOverride {
                 ecosystem,
                 name,
                 namespace: None,
                 version,
-                token: String::new(),
+                token,
                 patch_uuid: sel.uuid.clone(),
                 artifact_url: url,
                 berry_zip_url: berry_zip.and_then(|a| a.url.clone()),
