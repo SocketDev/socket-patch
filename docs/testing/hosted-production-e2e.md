@@ -74,7 +74,7 @@ failure instead of N confusing ones that look like CLI regressions.
 | npm | ✅ | ✅ many | ✅ npm, npm-shrinkwrap, pnpm, yarn classic, yarn berry, bun |
 | PyPI | ✅ (requirements.txt + uv.lock only) | ✅ many | ✅ requirements.txt, uv.lock |
 | Cargo | ✅ | ✅ 1 crate | ✅ sparse registry |
-| RubyGems | ✅ | ✅ 15 free patches (activestorage 5.2.0→6.0.3) | ✅ bundler install proof |
+| RubyGems | ✅ | ✅ (this suite pins one purl/UUID: `activestorage@6.0.3`; the 2026-08-18 republish covers more versions) | ✅ full bundler install proof |
 | Maven | ✅ | ❌ **none** | canary only |
 | NuGet | ✅ | ❌ **none** | canary only |
 | Composer | ✅ | ❌ **none** | canary only |

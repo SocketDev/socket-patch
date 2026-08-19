@@ -72,13 +72,20 @@ fn git_sha256_file(path: &Path) -> String {
 }
 
 fn run(cwd: &Path, args: &[&str]) -> (i32, String, String) {
-    let out: Output = Command::new(binary())
-        .args(args)
-        .current_dir(cwd)
-        .env_remove("SOCKET_API_TOKEN")
-        .env_remove("SOCKET_CLI_API_TOKEN")
-        .output()
-        .expect("failed to execute socket-patch binary");
+    let mut cmd = Command::new(binary());
+    cmd.args(args).current_dir(cwd);
+    // Hermeticity, mirroring the production e2e suites: scrub every ambient
+    // `SOCKET_*` (token, api/proxy URL, org, legacy aliases — not just the
+    // two token vars) and block the socket-cli config.json, so a developer's
+    // login or configured apiBaseUrl cannot silently repoint or re-tier
+    // these runs.
+    for (k, _) in std::env::vars_os() {
+        if k.to_string_lossy().starts_with("SOCKET_") {
+            cmd.env_remove(&k);
+        }
+    }
+    cmd.env("SOCKET_NO_CONFIG", "true");
+    let out: Output = cmd.output().expect("failed to execute socket-patch binary");
 
     let code = out.status.code().unwrap_or(-1);
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
@@ -103,6 +110,10 @@ fn bundle_run(cwd: &Path, args: &[&str]) {
     // `find_gem_dir` expects. It also upholds cache_env's hermeticity
     // invariant that every `bundle install` pins its gem tree to the fixture.
     cmd.env("BUNDLE_PATH", "vendor/bundle");
+    // mimemagic (pulled via activestorage → marcel) builds against the
+    // system shared-mime-info DB, which no workflow installs — use the gem's
+    // bundled placeholder instead of depending on a host package.
+    cmd.env("USE_FREEDESKTOP_PLACEHOLDER", "true");
     cache_env::isolate(&mut cmd);
     let out = cmd.output().expect("failed to run bundle");
     assert!(
@@ -148,23 +159,31 @@ fn read_patch_files(manifest_path: &Path) -> serde_json::Value {
     patch["files"].clone()
 }
 
-/// Verify all patched files match their afterHash from the manifest.
+/// Verify all patched files match their afterHash (or are absent if deleted).
 fn assert_after_hashes(gem_dir: &Path, files: &serde_json::Value) {
     for (rel_path, info) in files.as_object().expect("files object") {
-        let after_hash = info["afterHash"]
-            .as_str()
-            .expect("afterHash should be a string");
+        let after_hash = info["afterHash"].as_str().unwrap_or("");
         let full_path = gem_dir.join(rel_path);
-        assert!(
-            full_path.exists(),
-            "patched file should exist: {}",
-            full_path.display()
-        );
-        assert_eq!(
-            git_sha256_file(&full_path),
-            after_hash,
-            "hash mismatch for {rel_path} after patching"
-        );
+        if after_hash.is_empty() {
+            // No afterHash = the patch deletes the file; in the applied
+            // state it must be ABSENT (mirror of `assert_before_hashes`'
+            // new-file branch).
+            assert!(
+                !full_path.exists(),
+                "deleted file {rel_path} should be absent after patching"
+            );
+        } else {
+            assert!(
+                full_path.exists(),
+                "patched file should exist: {}",
+                full_path.display()
+            );
+            assert_eq!(
+                git_sha256_file(&full_path),
+                after_hash,
+                "hash mismatch for {rel_path} after patching"
+            );
+        }
     }
 }
 
@@ -509,12 +528,18 @@ fn test_gem_full_lifecycle() {
         "patch should report at least one vulnerability"
     );
 
-    let has_cve = vulns.iter().any(|v| {
-        v["cves"]
-            .as_array()
-            .is_some_and(|cves| cves.iter().any(|c| c == "CVE-2020-8162"))
+    // The advisory may be named either way: the vulnerability's map key (the
+    // `id` field) is the GHSA id, and production may leave `cves` empty.
+    let has_advisory = vulns.iter().any(|v| {
+        v["id"] == "GHSA-m42x-37p3-fv5w"
+            || v["cves"]
+                .as_array()
+                .is_some_and(|cves| cves.iter().any(|c| c == "CVE-2020-8162"))
     });
-    assert!(has_cve, "vulnerability list should include CVE-2020-8162");
+    assert!(
+        has_advisory,
+        "vulnerability list should include GHSA-m42x-37p3-fv5w / CVE-2020-8162: {vulns:?}"
+    );
 
     // -- ROLLBACK: restore original files -------------------------------------
     assert_run_ok(cwd, &["rollback"], "rollback");

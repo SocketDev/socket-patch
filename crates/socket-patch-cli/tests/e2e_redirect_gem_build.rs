@@ -1,9 +1,12 @@
 //! Real-bundler hosted-mode capstone e2e for gem — the full-chain proof for
 //! `scan --mode hosted` on the rubygems-compact-index override, and the
-//! executable pin on the compact-index DEPENDENCY contract the production
-//! server currently violates (its `/info` answers `{"error":"not_built"}` and
-//! the `/api/v1/dependencies` fallback returns a zero-byte body — see
-//! `e2e_hosted_production.rs`'s `is_known_defect` tolerance).
+//! executable pin on the compact-index DEPENDENCY contract. The production
+//! server HISTORICALLY violated that contract (its `/info` served no runtime
+//! deps, later answered `{"error":"not_built"}`, and the
+//! `/api/v1/dependencies` fallback returned a zero-byte body); the 2026-08-18
+//! gem catalog republish fixed the served index, and this hermetic suite pins
+//! the contract from both sides regardless of production's current state —
+//! see the history section of `docs/testing/hosted-production-e2e.md`.
 //!
 //! Unlike the npm/cargo siblings, this suite is FULLY hermetic: the fixture
 //! gems are authored here and built with the real `gem build`, and ONE
@@ -41,11 +44,11 @@
 //! `gems.rb`/`gems.locked` spelling (which bundler prefers over `Gemfile`
 //! when both exist — this pins the candidate-list + rewriter support).
 //!
-//! The deps red-arm serves a PRODUCTION-LIKE `/info` (checksum but NO
-//! dependencies): the fresh install must fail with bundler's
-//! `APIResponseMismatchError … revealed dependencies not in the API` — the
-//! exact live-CI signature — so any server or fixture that stops declaring
-//! runtime deps turns this suite red.
+//! The deps red-arm serves an `/info` shaped like production's HISTORICAL
+//! defect (checksum but NO dependencies): the fresh install must fail with
+//! bundler's `APIResponseMismatchError … revealed dependencies not in the
+//! API` — the signature live CI saw until the 2026-08-18 server fix — so any
+//! server or fixture that stops declaring runtime deps turns this suite red.
 //!
 //! CHECKSUMS locks (bundler >= 4 writes the section by default) come out
 //! FULLY CONVERGED: patch-registry GEM section holding the dep's spec,
@@ -1019,11 +1022,11 @@ async fn gem_hosted_gems_rb_spelling_redirects_and_installs() {
 }
 
 /// The compact-index DEPENDENCY contract, pinned from the red side: a patch
-/// registry whose `/info` omits the gem's runtime deps (today's production
-/// behavior — its sidecar index answers `not_built` and the dependency-API
-/// fallback is a zero-byte body) BREAKS the prescribed install with
-/// bundler's `APIResponseMismatchError`. If the CLI or fixture ever starts
-/// tolerating that silently, this turns red.
+/// registry whose `/info` omits the gem's runtime deps (production's
+/// HISTORICAL behavior until the 2026-08-18 republish fixed the served index
+/// — see docs/testing/hosted-production-e2e.md's history section) BREAKS the
+/// prescribed install with bundler's `APIResponseMismatchError`. If the CLI
+/// or fixture ever starts tolerating that silently, this turns red.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "host capstone: shells out to a real ruby/gem/bundler >= 2.6; the unpinned `test` \
             job skips it, an e2e job with a pinned toolchain runs it via --ignored"]

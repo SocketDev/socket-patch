@@ -151,9 +151,11 @@ const CARGO_UUID: &str = "cf2e6f58-d9fa-4096-9151-c34afa717f89";
 /// not `cargo build`; see [`cargo_vendored_install_proof`].)
 const CARGO_MARKER: &str = "GHSA-pp8r-vv2j-9j5v";
 
-/// The gem pin is deliberately UNQUALIFIED (`?platform=ruby` stripped): the
-/// preflight/by-package flows strip purl qualifiers before hitting the
-/// discovery endpoints.
+/// The gem pin is deliberately UNQUALIFIED. Production publishes the purl as
+/// `pkg:gem/activestorage@6.0.3?platform=ruby`, but nothing client-side
+/// strips qualifiers — the SERVER normalizes both spellings to the same
+/// patch set (verified live against `/patch/by-package`), so this pins the
+/// bare spelling the CLI's own crawler synthesizes.
 const GEM_PURL: &str = "pkg:gem/activestorage@6.0.3";
 const GEM_NAME: &str = "activestorage";
 const GEM_VERSION: &str = "6.0.3";

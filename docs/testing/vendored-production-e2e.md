@@ -114,9 +114,12 @@ the run exited non-zero with `"status": "partial_failure"`.
 
 **Fixed** (PR #172): the gate in `vendor/gem.rs` now refuses only non-empty,
 non-`ruby` platform qualifiers — `?platform=ruby` is the portable default and
-vendors like a bare purl. With the 2026-08-18 gem catalog republish restoring
-the pinned patch, the vendor now succeeds live and the leg's
-failure-tolerance branch is vestigial. The leg's upgrade to a full fresh-dir
+vendors like a bare purl. The suite's original pin
+(`activestorage@7.0.2.2` / `2535d43d-67ce-4944-be27-c19e113997fb`) was
+withdrawn on 2026-08-14; the 2026-08-18 catalog republish REPLACED it, and the
+suite was re-pinned to `activestorage@6.0.3` /
+`15e960b5-f432-4b6c-b8aa-534a2b419323`. The vendor now succeeds live and the
+leg's failure-tolerance branch is vestigial. The leg's upgrade to a full fresh-dir
 `bundle install` delivery proof is deferred to the stacked stub-hardening fix
 PR because of issue 3 below; until then the leg keeps its tolerant shape and
 its `SOCKET_PATCH_VENDORED_E2E_GEM_STRICT` knob.

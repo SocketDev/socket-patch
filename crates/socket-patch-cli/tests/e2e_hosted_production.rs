@@ -36,7 +36,7 @@
 //! | npm    | `pkg:npm/minimist@1.2.2`        | `80630680-4da6-45f9-bba8-b888e0ffd58c` | GHSA-xvch-5gv4-984h (CVE-2021-44906) |
 //! | PyPI   | `pkg:pypi/urllib3@1.26.18`      | *any of three* (see [`PYPI_UUIDS`])    | GHSA-gm62-xv2j-4w53 &co |
 //! | Cargo  | `pkg:cargo/traitobject@0.1.1`   | `cf2e6f58-d9fa-4096-9151-c34afa717f89` | GHSA-pp8r-vv2j-9j5v |
-//! | gem    | `pkg:gem/activestorage@6.0.3`   | `15e960b5-f432-4b6c-b8aa-534a2b419323` | GHSA-m42x-37p3-fv5w (CVE-2020-8162) |
+//! | gem    | `pkg:gem/activestorage@6.0.3`   | *any of* [`GEM_UUIDS`] (one today)     | GHSA-m42x-37p3-fv5w (CVE-2020-8162) |
 //!
 //! `docs/testing/hosted-production-e2e.md` explains how these were chosen and
 //! how to re-pick one if it is ever withdrawn.
@@ -128,13 +128,23 @@ const CARGO_UUID: &str = "cf2e6f58-d9fa-4096-9151-c34afa717f89";
 /// that npm/PyPI artifacts carry, so this is the marker to look for.
 const CARGO_MARKER: &str = "GHSA-pp8r-vv2j-9j5v";
 
-/// The gem pin is deliberately UNQUALIFIED (`?platform=ruby` stripped):
-/// the preflight/by-package/redirect flows all strip purl qualifiers before
-/// hitting the discovery endpoints.
+/// The gem pin is deliberately UNQUALIFIED. Production publishes the purl as
+/// `pkg:gem/activestorage@6.0.3?platform=ruby`, but nothing client-side
+/// strips qualifiers — the SERVER normalizes both spellings to the same
+/// patch set (verified live against `/patch/by-package`), so this pins the
+/// bare spelling the CLI's own crawler synthesizes.
 const GEM_PURL: &str = "pkg:gem/activestorage@6.0.3";
 const GEM_NAME: &str = "activestorage";
 const GEM_VERSION: &str = "6.0.3";
-const GEM_UUID: &str = "15e960b5-f432-4b6c-b8aa-534a2b419323";
+/// Acceptable patch UUIDs for [`GEM_PURL`] — an any-of set, mirroring
+/// [`PYPI_UUIDS`]: patch selection is server-ranked and the non-TTY scan
+/// auto-selects the top candidate, so pinning a single UUID would red the
+/// required check on a server-side reorder or a second published 6.0.3
+/// patch. The gem leg parses the UUID actually WIRED into the rewritten
+/// Gemfile, asserts it is one of these, and content-verifies against that
+/// exact patch's `/patch/view` manifest. When production publishes another
+/// acceptable 6.0.3 patch, verify it and append its UUID here.
+const GEM_UUIDS: &[&str] = &["15e960b5-f432-4b6c-b8aa-534a2b419323"];
 
 /// Header the patch service injects into patched npm / PyPI source files.
 const PATCH_MARKER: &str = "Socket Community Patch";
@@ -506,10 +516,15 @@ async fn published_patch_advisory_counts(purl: &str) -> Result<Vec<(String, usiz
         .send()
         .await
         .map_err(|e| format!("GET {url}: {e}"))?;
+    let status = resp.status();
     let body = resp
         .text()
         .await
         .map_err(|e| format!("GET {url}: reading body: {e}"))?;
+    if !status.is_success() {
+        // Without this, a 503/404 surfaces as a misleading "bad JSON" error.
+        return Err(format!("GET {url}: HTTP {status}\n{body}"));
+    }
     let v: serde_json::Value =
         serde_json::from_str(&body).map_err(|e| format!("GET {url}: bad JSON ({e}):\n{body}"))?;
     Ok(v["patches"]
@@ -613,6 +628,20 @@ fn gem_lock_checksum(lock: &str, name: &str, version: &str) -> Option<String> {
         .find_map(|l| l.strip_prefix(&prefix).map(|h| h.trim().to_string()))
 }
 
+/// The patch UUID the gem rewriter wired into `Gemfile`'s per-dep Socket
+/// source block. The block's URL shape is
+/// `https://<PATCH_HOST>/patch-registry/gem/<grant>/<patch-uuid>/`; the grant
+/// token is itself UUID-shaped, so this takes the SECOND path segment rather
+/// than scanning for "something UUID-like".
+fn wired_gem_registry_uuid(gemfile: &str) -> Option<String> {
+    let marker = format!("https://{PATCH_HOST}/patch-registry/gem/");
+    let rest = &gemfile[gemfile.find(&marker)? + marker.len()..];
+    let path = &rest[..rest.find('"')?];
+    let mut segments = path.split('/').filter(|s| !s.is_empty());
+    let _grant = segments.next()?;
+    segments.next().map(str::to_string)
+}
+
 /// Locate the bundler-installed `gems/<name>-<version>` directory under a
 /// `BUNDLE_PATH` root. The `ruby/<x.y.z>` segment in between varies by host
 /// interpreter, so walk for it (depth-bounded — the layout is only a few
@@ -672,7 +701,7 @@ async fn preflight_required_patches_are_published() {
         (NPM_PURL, vec![NPM_UUID]),
         (PYPI_PURL, PYPI_UUIDS.to_vec()),
         (CARGO_PURL, vec![CARGO_UUID]),
-        (GEM_PURL, vec![GEM_UUID]),
+        (GEM_PURL, GEM_UUIDS.to_vec()),
     ];
 
     let mut failures: Vec<String> = Vec::new();
@@ -1619,6 +1648,10 @@ async fn gem_bundler_hosted_install_proof() {
     let env = [
         ("BUNDLE_PATH", bundle_path.as_str()),
         ("BUNDLE_APP_CONFIG", bundle_path.as_str()),
+        // mimemagic (pulled via activestorage → marcel) builds against the
+        // system shared-mime-info DB, which no workflow installs — use the
+        // gem's bundled placeholder instead of depending on a host package.
+        ("USE_FREEDESKTOP_PLACEHOLDER", "true"),
     ];
 
     std::fs::write(
@@ -1657,18 +1690,46 @@ async fn gem_bundler_hosted_install_proof() {
     let env_json = scan_hosted(&proj, &[]);
     assert_redirected(&env_json, "Gemfile.lock");
 
-    // Hard assertions: the redirect itself must be correct.
+    // Hard assertions: the redirect itself must be correct. The wired patch
+    // UUID is parsed back out of the rewritten Gemfile rather than assumed:
+    // selection is server-ranked (the non-TTY scan auto-selects the top
+    // candidate), so the leg accepts any UUID in the pinned any-of set and
+    // then content-verifies against the one bundler was actually given.
     let gemfile = read(&proj.join("Gemfile"));
+    let wired_uuid = wired_gem_registry_uuid(&gemfile).unwrap_or_else(|| {
+        panic!(
+            "{LEG}: Gemfile carries no per-dep Socket source block \
+             (`source \"https://{PATCH_HOST}/patch-registry/gem/<grant>/<uuid>/\" do`):\n{gemfile}"
+        )
+    });
     assert!(
-        gemfile.contains(&format!("https://{PATCH_HOST}/patch-registry/gem/"))
-            && gemfile.contains(GEM_UUID),
-        "{LEG}: Gemfile carries no per-dep Socket source block for \
-         {GEM_UUID}:\n{gemfile}"
+        GEM_UUIDS.contains(&wired_uuid.as_str()),
+        "{LEG}: the redirect wired patch {wired_uuid}, which is not in the \
+         pinned any-of set {GEM_UUIDS:?}. If production replaced or extended \
+         the {GEM_VERSION} patches, verify the new patch and extend \
+         GEM_UUIDS.\n{gemfile}"
     );
     let lock = read(&proj.join("Gemfile.lock"));
     assert!(
         lock.contains("CHECKSUMS"),
         "{LEG}: Gemfile.lock lost its CHECKSUMS section:\n{lock}"
+    );
+    // Converged-lock proof (the #212 shape): a rewrite that only moved the
+    // CHECKSUMS pin would leave the lock's GEM section on rubygems.org — a
+    // mixed state an unfrozen install can silently paper over. The GEM
+    // section must carry a patch-registry remote and DEPENDENCIES must
+    // source-pin the gem.
+    assert!(
+        lock.contains(&format!(
+            "  remote: https://{PATCH_HOST}/patch-registry/gem/"
+        )),
+        "{LEG}: rewritten Gemfile.lock has no GEM-section `remote:` on the \
+         patch registry — the lock was not converged:\n{lock}"
+    );
+    assert!(
+        lock.contains(&format!("\n  {GEM_NAME} (= {GEM_VERSION})!")),
+        "{LEG}: DEPENDENCIES pin `  {GEM_NAME} (= {GEM_VERSION})!` missing — \
+         the lock does not source-pin the redirected gem:\n{lock}"
     );
     let redirected_sha = gem_lock_checksum(&lock, GEM_NAME, GEM_VERSION).unwrap_or_else(|| {
         panic!(
@@ -1686,15 +1747,34 @@ async fn gem_bundler_hosted_install_proof() {
 
     // THE point of the leg: reinstall from the redirected Gemfile alone,
     // letting bundler fetch through patch.socket.dev and verify the swapped
-    // CHECKSUMS pin itself.
-    std::fs::remove_dir_all(&bundle_path).ok();
-    let reinstall = tool(&proj, "bundle", &["install"], &env);
+    // CHECKSUMS pin itself. The wipe must be COMPLETE — a partial wipe lets
+    // bundler reuse the stale pristine install, and the leg would then
+    // misattribute that as a published-patch regression (seen under
+    // --test-threads=4).
+    std::fs::remove_dir_all(&bundle_path)
+        .unwrap_or_else(|e| panic!("{LEG}: wiping BUNDLE_PATH {bundle_path} failed: {e}"));
+    assert!(
+        !Path::new(&bundle_path).exists(),
+        "{LEG}: BUNDLE_PATH {bundle_path} still exists after the wipe"
+    );
+    // BUNDLE_FROZEN=true is the deployment-mode contract production users
+    // run under: the committed Gemfile + lock pair must satisfy bundler
+    // as-is. A rewrite that diverged the pair (Gemfile repointed, lock not
+    // converged, or vice versa) fails here instead of being silently
+    // re-resolved away.
+    let reinstall_env = [
+        ("BUNDLE_PATH", bundle_path.as_str()),
+        ("BUNDLE_APP_CONFIG", bundle_path.as_str()),
+        ("BUNDLE_FROZEN", "true"),
+        ("USE_FREEDESKTOP_PLACEHOLDER", "true"),
+    ];
+    let reinstall = tool(&proj, "bundle", &["install"], &reinstall_env);
     assert!(
         ok(&reinstall),
-        "{LEG}: `bundle install` from the redirected Gemfile failed — the \
-         redirect assertions above all passed, so the rewrite itself is fine \
-         and the regression is in the hosted install path (CLI rewrite shape \
-         or the gem patch-registry).\n{}",
+        "{LEG}: frozen `bundle install` from the redirected Gemfile failed — \
+         the redirect assertions above all passed, so the rewrite itself is \
+         fine and the regression is in the hosted install path (CLI rewrite \
+         shape or the gem patch-registry).\n{}",
         dump(&reinstall)
     );
 
@@ -1703,13 +1783,15 @@ async fn gem_bundler_hosted_install_proof() {
     // manifest from the proxy and assert every file it rewrites landed
     // on disk byte-exact (afterHash is the git-blob sha256 the patch
     // service publishes — the same digest the CLI's apply verifies).
-    let patch_files = published_patch_files(GEM_UUID).await.unwrap_or_else(|e| {
-        panic!(
-            "{LEG}: `bundle install` from the redirected Gemfile succeeded \
-             but the patch file manifest could not be fetched to verify \
-             the installed content: {e}"
-        )
-    });
+    let patch_files = published_patch_files(&wired_uuid)
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "{LEG}: `bundle install` from the redirected Gemfile succeeded \
+                 but the patch file manifest could not be fetched to verify \
+                 the installed content: {e}"
+            )
+        });
     let gem_dir = installed_gem_dir(
         Path::new(&bundle_path),
         &format!("{GEM_NAME}-{GEM_VERSION}"),
@@ -1732,7 +1814,7 @@ async fn gem_bundler_hosted_install_proof() {
         let installed = gem_dir.join(rel);
         let bytes = std::fs::read(&installed).unwrap_or_else(|e| {
             panic!(
-                "{LEG}: patch {GEM_UUID} rewrites `{path}` but the \
+                "{LEG}: patch {wired_uuid} rewrites `{path}` but the \
                  installed gem has no readable {}: {e}",
                 installed.display()
             )
@@ -1752,12 +1834,12 @@ async fn gem_bundler_hosted_install_proof() {
     }
     assert!(
         verified >= 1,
-        "{LEG}: patch {GEM_UUID} names no files with an afterHash, so \
+        "{LEG}: patch {wired_uuid} names no files with an afterHash, so \
          nothing was content-verified — the install success is vacuous"
     );
     assert!(
         rewritten >= 1,
-        "{LEG}: every file in patch {GEM_UUID} has afterHash == \
+        "{LEG}: every file in patch {wired_uuid} has afterHash == \
          beforeHash — the published patch is inert and this install \
          proved nothing"
     );
