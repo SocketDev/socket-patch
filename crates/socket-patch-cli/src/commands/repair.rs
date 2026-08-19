@@ -91,7 +91,8 @@ pub async fn run(args: RepairArgs) -> i32 {
         if !has_vendor_traces {
             if tokio::fs::metadata(&redirect_state).await.is_ok() {
                 let msg = "hosted redirects need no local repair; re-run \
-                           `scan --mode hosted` to refresh the lockfile redirects";
+                           `scan --mode hosted` to refresh the lockfile redirects \
+                           (it also re-checks for stale pre-redirect installs)";
                 if args.common.json {
                     let mut env = Envelope::new(Command::Repair);
                     env.dry_run = args.common.dry_run;
