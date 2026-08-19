@@ -3216,8 +3216,8 @@ fn converge_gem_lock_source(
     if socket_remote_re.is_match(&remote_url) {
         // Already ours. Rotated grant: refresh the remote in place.
         if remote_url != index_url {
-            let ending = lines[remote_idx][gem_lock_line_content(&lines[remote_idx]).len()..]
-                .to_string();
+            let ending =
+                lines[remote_idx][gem_lock_line_content(&lines[remote_idx]).len()..].to_string();
             lines[remote_idx] = format!("  remote: {index_url}{ending}");
             result.edits.push(FileEdit {
                 path: lock_name.into(),
@@ -7547,7 +7547,9 @@ mod tests {
             .get("Gemfile.lock")
             .expect("run 1 rewrites the lock");
         assert!(
-            lock.contains("GEM\n  remote: https://patch.test/gem/tok/uuid/\n  specs:\n    rails (7.0.0)"),
+            lock.contains(
+                "GEM\n  remote: https://patch.test/gem/tok/uuid/\n  specs:\n    rails (7.0.0)"
+            ),
             "run 1 must converge the lock: {lock}"
         );
         for (name, content) in first.files {
@@ -7611,8 +7613,7 @@ mod tests {
                 .any(|e| e.kind == "redirect_gemfile_lock_source_url"
                     && e.original
                         == Some(Value::String("https://patch.test/gem/tok-one/uuid/".into()))
-                    && e.new
-                        == Some(Value::String("https://patch.test/gem/tok-two/uuid/".into()))),
+                    && e.new == Some(Value::String("https://patch.test/gem/tok-two/uuid/".into()))),
             "remote refresh recorded with the old URL as original: {:?}",
             second.edits
         );
