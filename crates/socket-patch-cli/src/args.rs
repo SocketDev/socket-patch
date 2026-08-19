@@ -279,6 +279,21 @@ pub struct GlobalArgs {
         value_parser = parse_bool_flag,
     )]
     pub no_telemetry: bool,
+
+    /// Hosted mode (`scan --mode hosted`): do NOT auto-configure
+    /// `trustLockfile: true` in pnpm-workspace.yaml after a pnpm-lock.yaml
+    /// (lockfileVersion >= 9) is repointed at the hosted patch server.
+    /// pnpm >= 11 rejects the repointed lock without that trust grant, so
+    /// opting out means every install needs `pnpm install --trust-lockfile`
+    /// instead (the run's warning spells out both recoveries). Only `scan`
+    /// reads this; other subcommands accept it silently.
+    #[arg(
+        long = "no-trust-lockfile-config",
+        env = "SOCKET_NO_TRUST_LOCKFILE_CONFIG",
+        default_value_t = false,
+        value_parser = parse_bool_flag,
+    )]
+    pub no_trust_lockfile_config: bool,
 }
 
 impl GlobalArgs {
@@ -361,6 +376,7 @@ pub const GLOBAL_ARG_ENV_VARS: &[&str] = &[
     "SOCKET_LOCK_TIMEOUT",
     "SOCKET_DEBUG",
     "SOCKET_TELEMETRY_DISABLED",
+    "SOCKET_NO_TRUST_LOCKFILE_CONFIG",
 ];
 
 /// Every env var a **subcommand-local** flag binds (one per `env = "..."`
@@ -450,6 +466,7 @@ impl Default for GlobalArgs {
             lock_timeout: None,
             debug: false,
             no_telemetry: false,
+            no_trust_lockfile_config: false,
         }
     }
 }

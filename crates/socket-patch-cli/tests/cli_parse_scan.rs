@@ -42,6 +42,7 @@ const SCAN_ENV_VARS: &[&str] = &[
     "SOCKET_JSON",
     "SOCKET_LOCK_TIMEOUT",
     "SOCKET_MANIFEST_PATH",
+    "SOCKET_NO_TRUST_LOCKFILE_CONFIG",
     "SOCKET_OFFLINE",
     "SOCKET_ORG_SLUG",
     "SOCKET_PATCH_SERVER_URL",
@@ -764,12 +765,15 @@ fn scrub_covers_every_scan_env_var_clap_consults() {
     }
 }
 
-// --- hidden `--mode` value aliases ("vendor" / "host") ----------------------
+// --- hidden `--mode` value aliases ("vendor" / "host" / "redirect") ---------
 //
-// `--mode vendor` and `--mode host` are UNDOCUMENTED spellings accepted for
-// muscle-memory reasons (they match the boolean flag names). They are clap
-// value aliases on the `ScanMode` variants, which clap keeps out of help
-// output — the tests below lock in both the acceptance and the hiding.
+// `--mode vendor`, `--mode host`, and `--mode redirect` are UNDOCUMENTED
+// spellings accepted for muscle-memory reasons (they match the legacy
+// boolean flag names / the old mode name). They are clap value aliases on
+// the `ScanMode` variants, which clap keeps out of help output — the tests
+// below lock in both the acceptance and the hiding. `--mode apply` is
+// deliberately NOT an alias: applying is not a scan mode name anywhere
+// (the canonical name is `agent`), so it must stay rejected.
 
 #[test]
 #[serial_test::serial]
@@ -798,6 +802,46 @@ fn mode_alias_host_folds_to_redirect() {
         folded.mode,
         Some(ScanMode::Hosted),
         "--mode host (hidden alias) == --mode hosted"
+    );
+}
+
+#[test]
+#[serial_test::serial]
+fn mode_alias_redirect_folds_to_hosted() {
+    // `redirect` is the legacy FLAG spelling (`--redirect`); pre-fix the
+    // value aliases were asymmetric — `--mode vendor`/`--mode host` parsed
+    // while `--mode redirect` was rejected, even though `--redirect` itself
+    // still folds to hosted.
+    assert_eq!(
+        parse_scan(&["--mode", "redirect"]).mode,
+        Some(ScanMode::Hosted)
+    );
+    let folded = parse_and_resolve(&["--mode", "redirect"]).expect("fold ok");
+    assert_eq!(
+        folded.mode,
+        Some(ScanMode::Hosted),
+        "--mode redirect (hidden alias) == --mode hosted"
+    );
+    // The alias agrees with its own boolean: redundant, not contradictory.
+    let folded = parse_and_resolve(&["--mode", "redirect", "--redirect"]).expect("fold ok");
+    assert_eq!(folded.mode, Some(ScanMode::Hosted));
+}
+
+#[test]
+#[serial_test::serial]
+fn mode_apply_stays_rejected() {
+    // `apply` is NOT a scan mode name (canonical: `agent`); accepting it
+    // would mint a fourth spelling nothing else recognizes. Clap must
+    // reject it at parse time like any unknown value.
+    let parsed =
+        with_clean_env(|| Cli::try_parse_from(["socket-patch", "scan", "--mode", "apply"]));
+    let Err(err) = parsed else {
+        panic!("--mode apply must be rejected");
+    };
+    let rendered = err.to_string();
+    assert!(
+        rendered.contains("apply"),
+        "the error must echo the rejected value: {rendered}"
     );
 }
 
@@ -852,7 +896,7 @@ fn mode_aliases_hidden_from_help() {
             "scan --help must itemize `{canonical}`; help was:\n{long}"
         );
     }
-    for alias in ["host:", "vendor:"] {
+    for alias in ["host:", "vendor:", "redirect:"] {
         // "host:" is NOT a substring of "hosted:" (the canonical item has
         // 'e' after "host"), so any literal hit is a genuine leak.
         assert!(

@@ -54,8 +54,12 @@ const DEFAULT_BATCH_SIZE: usize = 100;
 pub enum ScanMode {
     /// Rewrite lockfiles so ONLY patched dependencies resolve to Socket's
     /// hosted patch server (== `--redirect`): no artifact bytes land in the
-    /// repo, but installs must reach the patch server.
-    #[value(alias = "host")]
+    /// repo, but installs must reach the patch server. Hidden value aliases
+    /// mirror the legacy flag spellings symmetrically: `host` matches the
+    /// old mode name, `redirect` matches the `--redirect` boolean (vendored
+    /// accepts `vendor` for the same reason; `apply` is NOT an alias of
+    /// agent — applying is not a scan mode name anywhere else).
+    #[value(alias = "host", alias = "redirect")]
     Hosted,
     /// Commit patched artifacts to `.socket/vendor/` (== `--vendor`):
     /// hermetic, offline-safe installs at the cost of repo size.
@@ -454,9 +458,13 @@ fn download_params(args: &ScanArgs, save_only: bool, json: bool, silent: bool) -
 // mode's ledger on disk asserting wiring that is no longer live (and, for
 // vendored→hosted, the orphaned tarball behind). Anything auditing a ledger
 // as "what is live" (including `vex`) is then misled. Detect the overlap so
-// each flow can warn; reconciliation (removing the stale ledger / orphaned
-// artifacts) is deliberately deferred so neither mode silently mutates the
-// other's ledger.
+// each flow can warn. Reconciliation is per direction: the VENDORED flows
+// clean the superseded redirect-ledger halves themselves (cargo via
+// `revert_cargo_redirect_purl` before vendoring, npm-family via
+// `note_vendor_supersedes_redirect` after — always announced by the
+// takeover warning, never silent); the HOSTED direction stays warn-only
+// (removing a vendored ledger entry means deleting committed artifacts —
+// `remove <purl>`'s job, on the operator's say-so).
 //
 // The overlap alone only proves BOTH ledgers name the same package(s) — NOT
 // which one won. The takeover DIRECTION is decided by the ACTUAL current
@@ -907,13 +915,15 @@ pub(super) fn mode_takeover_detail(superseded: &[String], current_is_hosted: boo
             "vendored artifacts superseded the hosted redirect ledger for: {list}. \
              `.socket/vendor/redirect-state.json` still records a hosted redirect for \
              these package(s), but the lockfile now points at the committed \
-             `.socket/vendor/` files. Re-run `socket-patch vendor` (or `scan \
-             --mode vendored`) to reconcile these package(s) automatically: it \
-             reverts their stale hosted edits from the ledger and drops both \
-             halves of each superseded entry — the `records` entry AND its \
-             matching `edits`. To clean up by hand instead, delete only these \
-             package(s)' entries under `records` AND their matching entries \
-             under `edits`, so audits and VEX do not read superseded wiring. \
+             `.socket/vendor/` files. The vendored flows (`socket-patch vendor`, \
+             `scan --mode vendored`) reconcile npm-family and cargo package(s) \
+             automatically on their next non-dry run, dropping both halves of \
+             each superseded entry — the `records` entry AND its matching \
+             `edits` (cargo additionally reverts the stale hosted edits on disk \
+             first). For other package(s), or if the automatic reconciliation \
+             could not run, clean up by hand: delete only these package(s)' \
+             entries under `records` AND their matching entries under `edits`, \
+             so audits and VEX do not read superseded wiring. \
              Both halves matter: the leftover `edits` are that package's stale \
              pre-redirect originals, which a later redirect revert would replay \
              over the live vendored wiring — and an `edits` entry left behind \
@@ -927,12 +937,76 @@ pub(super) fn mode_takeover_detail(superseded: &[String], current_is_hosted: boo
     }
 }
 
+/// Detail for the vendored-direction takeover warning on the run that
+/// RECONCILED the ledger in place (non-dry-run, npm-family): past tense —
+/// it states what was dropped and where the revert data now lives, so the
+/// operator is told the takeover happened without being handed remediation
+/// that is already done. The warning code stays `vendor_supersedes_redirect`
+/// (envelope contract: codes are additive and stable; only the free-text
+/// detail differs), and it fires exactly once — the reconciled ledger no
+/// longer overlaps, so re-runs stay silent.
+pub(super) fn mode_takeover_reconciled_detail(reconciled: &[String]) -> String {
+    let list = reconciled.join(", ");
+    format!(
+        "vendored artifacts superseded the hosted redirect ledger for: {list}; \
+         reconciled automatically. Both halves of each superseded entry — the \
+         package's `records` entry AND its matching `edits` — were dropped \
+         from `.socket/vendor/redirect-state.json` (an emptied ledger is \
+         deleted). The lockfile points at the committed `.socket/vendor/` \
+         files, and the pre-vendor lock values (including the hosted-spliced \
+         fragment) are preserved as the vendor ledger's wiring originals, so \
+         `vendor --revert` still restores the hosted wiring losslessly. \
+         Ledger data for other, still-redirected package(s) was left \
+         untouched. No action needed."
+    )
+}
+
+/// Drop the superseded purls' `records` + `edits` from the redirect ledger
+/// and persist it (atomic write; an emptied ledger is deleted — the same
+/// delete-when-empty contract every other persist follows). Called ONLY with
+/// purls [`classify_overlap_takeover`] proved vendored-live AND hosted-dead
+/// against the LIVE lockfile: the gate that makes the warning truthful is
+/// the one that makes the drop lossless (the vendor ledger's wiring
+/// `original` embeds the hosted-spliced fragment, so `vendor --revert` needs
+/// nothing from these records). `Ok(false)` when nothing matched (degenerate
+/// — the caller falls back to the manual advisory rather than claiming a
+/// reconciliation that did not happen); `Err` when the ledger could not be
+/// read back or persisted (fail closed: the atomic writer leaves the on-disk
+/// ledger either untouched or fully pre-drop, and the caller surfaces the
+/// failure inside the warning).
+async fn reconcile_superseded_redirect(cwd: &Path, purls: &[String]) -> Result<bool, String> {
+    let mut state = match socket_patch_core::patch::redirect::load_redirect_state(cwd).await {
+        Ok(Some(state)) => state,
+        Ok(None) => return Ok(false),
+        Err(corrupt) => return Err(corrupt.to_string()),
+    };
+    let mut dropped = false;
+    for purl in purls {
+        dropped |= socket_patch_core::patch::redirect::drop_superseded_purl(&mut state, purl);
+    }
+    if !dropped {
+        return Ok(false);
+    }
+    socket_patch_core::patch::redirect::persist_redirect_state(cwd, &state)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
 /// Cross-mode takeover advisory shared by every VENDORED flow (`vendor`,
 /// `scan --mode vendored`): when this ledger and a committed hosted redirect
 /// ledger both claim package(s) AND the live lockfile proves vendored won,
 /// the redirect ledger records for those package(s) are stale. Warn once at
-/// the envelope level (JSON `warnings[]` and stderr) without deleting
-/// anything — the per-package reconciliation lives in the vendor engine.
+/// the envelope level (JSON `warnings[]` and stderr) — and, for npm-family
+/// package(s) on a non-dry run, reconcile the ledger in place at the same
+/// time (mirroring the cargo branch in `vendor.rs`, which reverts + drops
+/// BEFORE vendoring because `[patch.crates-io]` cannot stack on the hosted
+/// registry pin; npm-family needs no on-disk revert — vendoring already
+/// overwrote the hosted splice and recorded it as the wiring `original`).
+/// Without the drop, the stale records fed VEX/updates forever and this
+/// warning re-fired on every subsequent run (`already_vendored` no-ops drop
+/// nothing). The reverse direction (`redirect_supersedes_vendored`) is
+/// deliberately untouched.
 pub(super) async fn note_vendor_supersedes_redirect(
     env: &mut crate::json_envelope::Envelope,
     cwd: &Path,
@@ -947,14 +1021,59 @@ pub(super) async fn note_vendor_supersedes_redirect(
     if superseded.is_empty() {
         return;
     }
-    let detail = mode_takeover_detail(&superseded, /*current_is_hosted=*/ false);
-    if !common.silent && !common.json {
-        eprintln!("Warning ({VENDOR_SUPERSEDES_REDIRECT}): {detail}");
+    fn push_warning(env: &mut crate::json_envelope::Envelope, common: &GlobalArgs, detail: String) {
+        if !common.silent && !common.json {
+            eprintln!("Warning ({VENDOR_SUPERSEDES_REDIRECT}): {detail}");
+        }
+        env.warnings.push(crate::json_envelope::RunWarning {
+            code: VENDOR_SUPERSEDES_REDIRECT.to_string(),
+            detail,
+        });
     }
-    env.warnings.push(crate::json_envelope::RunWarning {
-        code: VENDOR_SUPERSEDES_REDIRECT.to_string(),
-        detail,
-    });
+    // Reconciliation is gated three ways, each fail-closed to the manual
+    // advisory: never under --dry-run (this advisory runs even on preview
+    // flows, and a dry run must not mutate the ledger); only npm-family
+    // purls (cargo goes through `revert_cargo_redirect_purl`'s on-disk
+    // revert in vendor.rs, and other ecosystems' vendor wiring has not been
+    // verified to embed the hosted originals); and only purls the live-lock
+    // classification above already proved no longer resolve the hosted URL.
+    let (reconcilable, manual): (Vec<String>, Vec<String>) = if common.dry_run {
+        (Vec::new(), superseded)
+    } else {
+        superseded
+            .into_iter()
+            .partition(|purl| purl.starts_with("pkg:npm/"))
+    };
+    if !manual.is_empty() {
+        push_warning(
+            env,
+            common,
+            mode_takeover_detail(&manual, /*current_is_hosted=*/ false),
+        );
+    }
+    if reconcilable.is_empty() {
+        return;
+    }
+    match reconcile_superseded_redirect(cwd, &reconcilable).await {
+        Ok(true) => push_warning(env, common, mode_takeover_reconciled_detail(&reconcilable)),
+        // Nothing matched to drop — do not claim a reconciliation that did
+        // not happen; hand out the manual remediation instead.
+        Ok(false) => push_warning(
+            env,
+            common,
+            mode_takeover_detail(&reconcilable, /*current_is_hosted=*/ false),
+        ),
+        Err(e) => push_warning(
+            env,
+            common,
+            format!(
+                "{} Automatic reconciliation failed ({e}); the ledger was left \
+                 as it was, so this warning will fire again until the cleanup \
+                 above succeeds.",
+                mode_takeover_detail(&reconcilable, /*current_is_hosted=*/ false)
+            ),
+        ),
+    }
 }
 
 pub async fn run(mut args: ScanArgs) -> i32 {

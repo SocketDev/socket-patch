@@ -241,6 +241,11 @@ fn events_of(v: &serde_json::Value) -> Vec<serde_json::Value> {
     v["events"].as_array().cloned().unwrap_or_default()
 }
 
+/// Run-level `warnings[]` (`{code, detail}`); empty when omitted.
+fn warnings_of(v: &serde_json::Value) -> Vec<serde_json::Value> {
+    v["warnings"].as_array().cloned().unwrap_or_default()
+}
+
 /// 1. Deleted tarball → `repair` rebuilds it byte-identically (installed
 ///    copy + view-fetched patch content), lockfile and ledger untouched.
 #[tokio::test]
@@ -354,6 +359,92 @@ async fn repair_rebuilds_corrupt_vendored_tarball() {
         std::fs::read(&tgz).unwrap(),
         tgz_bytes,
         "rebuild restores the recorded bytes"
+    );
+}
+
+/// 3b. Corrupt tarball with NO rebuild source: the per-entry failure must
+///     PRESERVE the corrupt-but-diagnosable bytes. Deleting them (as the
+///     old delete-corrupt-first pass did) converts an integrity-mismatch
+///     state into a bare ENOENT on the next install — the lock still
+///     points at the tarball — and destroys the forensic evidence of the
+///     tamper. Both no-source rungs are pinned: patch content missing
+///     (staging unavailable) and patch content present but the pristine
+///     package unreachable (--offline, node_modules gone). RED before the
+///     rebuild-source-first ordering: the uuid dir was emptied up front
+///     and both arms left it bare.
+#[tokio::test]
+async fn repair_keeps_corrupt_artifact_when_no_rebuild_source_exists() {
+    let mock = MockServer::start().await;
+    mount_patch_api(&mock).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_fixture(
+        tmp.path(),
+        "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+        "sha512-orig==",
+    );
+    let tgz = vendor_project(tmp.path(), &mock.uri(), &[]);
+    let tgz_bytes = std::fs::read(&tgz).unwrap();
+
+    const GARBAGE: &[u8] = b"\x1f\x8bgarbage";
+    std::fs::write(&tgz, GARBAGE).unwrap();
+    std::fs::remove_dir_all(tmp.path().join("node_modules")).unwrap();
+
+    // Arm 1: no local patch sources either — the staging step itself has
+    // nothing to rebuild from.
+    let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair", "--offline"]);
+    assert_eq!(code, 1, "stdout={stdout} stderr={stderr}");
+    let v = parse_env(&stdout);
+    assert!(
+        events_of(&v).iter().any(|e| e["action"] == "failed"
+            && e["purl"] == PURL
+            && e["error"].as_str().unwrap_or("").contains("--offline")),
+        "the failure names the purl and the offline cause: {v}"
+    );
+    assert_eq!(
+        std::fs::read(&tgz).unwrap(),
+        GARBAGE,
+        "arm 1: an unrebuildable corrupt artifact must not be destroyed"
+    );
+
+    // Arm 2: patch content IS local (seeded after-blob), but the pristine
+    // package ladder still has no source — the corrupt copy must survive
+    // the deeper rung too.
+    let blobs = tmp.path().join(".socket/blobs");
+    std::fs::create_dir_all(&blobs).unwrap();
+    std::fs::write(blobs.join(git_sha256(AFTER)), AFTER).unwrap();
+    let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair", "--offline"]);
+    assert_eq!(code, 1, "stdout={stdout} stderr={stderr}");
+    let v = parse_env(&stdout);
+    assert!(
+        events_of(&v).iter().any(|e| e["action"] == "failed"
+            && e["purl"] == PURL
+            && e["error"].as_str().unwrap_or("").contains("--offline")),
+        "the failure names the purl and the offline cause: {v}"
+    );
+    assert_eq!(
+        std::fs::read(&tgz).unwrap(),
+        GARBAGE,
+        "arm 2: an unrebuildable corrupt artifact must not be destroyed"
+    );
+
+    // Heal: with the installed copy restored, the same repair rebuilds the
+    // recorded bytes — retention never wedges the corrupt→rebuild path.
+    let pkg = tmp.path().join("node_modules/left-pad");
+    std::fs::create_dir_all(&pkg).unwrap();
+    std::fs::write(
+        pkg.join("package.json"),
+        br#"{"name":"left-pad","version":"1.3.0"}"#,
+    )
+    .unwrap();
+    std::fs::write(pkg.join("index.js"), BEFORE).unwrap();
+    let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair", "--offline"]);
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    let v = parse_env(&stdout);
+    assert_eq!(v["summary"]["rebuilt"], 1, "envelope={v}");
+    assert_eq!(
+        std::fs::read(&tgz).unwrap(),
+        tgz_bytes,
+        "rebuild restores the recorded bytes once a source exists"
     );
 }
 
@@ -499,6 +590,24 @@ async fn repair_reconstructs_ledger_from_lockfile_references() {
         lock1,
         "lockfile untouched"
     );
+    // npm wiring originals are registry integrity material repair cannot
+    // reconstruct offline: the gap is a run-level ADVISORY (the entry
+    // itself repaired fine), so it rides `warnings[]` naming the purl —
+    // never `events[]` as a `skipped` a consumer would count as work not
+    // done.
+    assert!(
+        warnings_of(&v)
+            .iter()
+            .any(|w| w["code"] == "vendor_wiring_unknown"
+                && w["detail"].as_str().unwrap_or("").contains(PURL)),
+        "the wiring gap rides run-level warnings[] with the purl: {v}"
+    );
+    assert!(
+        !events_of(&v)
+            .iter()
+            .any(|e| e["errorCode"] == "vendor_wiring_unknown"),
+        "no skipped event for the run-level advisory: {v}"
+    );
 
     // The re-synthesized ledger entry: same uuid, fingerprint of the
     // rebuilt bytes, NOT detached (the manifest still has the record).
@@ -515,11 +624,23 @@ async fn repair_reconstructs_ledger_from_lockfile_references() {
         "recomputed fingerprint matches the rebuilt artifact: {state}"
     );
 
-    // Revert degrades gracefully (no recorded originals): exit 0, artifact
-    // removed, the drifted-entry guidance surfaced.
+    // Revert fails CLOSED: there are no recorded originals to replay and
+    // the rewired lock still resolves through the artifact — removing it
+    // would brick every later `npm ci` (see test 12 for the full recovery
+    // arc).
     let (code, stdout, _) = run_cli(tmp.path(), &mock.uri(), &["vendor", "--revert"]);
-    assert_eq!(code, 0, "revert of a reconstructed entry: {stdout}");
-    assert!(!tgz.exists(), "revert removed the artifact");
+    assert_ne!(
+        code, 0,
+        "revert of a still-wired reconstructed entry must refuse: {stdout}"
+    );
+    let v = parse_env(&stdout);
+    assert!(
+        events_of(&v)
+            .iter()
+            .any(|e| e["errorCode"] == "vendor_wiring_unknown_revert_blocked"),
+        "envelope={v}"
+    );
+    assert!(tgz.exists(), "the artifact the lock references survives");
 }
 
 /// 7b. Only `state.json` was lost; the committed artifact survived INTACT.
@@ -906,6 +1027,122 @@ async fn repair_dry_run_previews_rebuild() {
     assert!(!tgz.exists(), "dry run writes nothing");
 }
 
+/// 12. The flavor-None brick, exactly as observed empirically (real project,
+///     2026-08-18): only `state.json` is lost, the artifact and the rewired
+///     `package-lock.json` survive. `repair` reconstructs the entry with
+///     EMPTY wiring (npm pre-vendor lock fragments are not
+///     offline-recoverable) — and `vendor --revert` of that entry used to
+///     exit 0 while DELETING the tarball the lock still resolves through,
+///     silently bricking every later `npm ci` (ENOENT on the file: spec).
+///     Now: the revert fails closed (`vendor_wiring_unknown_revert_blocked`),
+///     the artifact and lock survive, `repair` stays idempotent, and once
+///     the pre-vendor lock is restored a normal revert removes the orphaned
+///     artifact cleanly. The reconstruction also stamps the flavor it found
+///     the reference in (`package-lock`), so revert routes to the backend
+///     whose guard probes the RIGHT lockfile.
+#[tokio::test]
+async fn revert_of_reconstructed_package_lock_entry_fails_closed_then_recovers() {
+    let mock = MockServer::start().await;
+    mount_patch_api(&mock).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_fixture(
+        tmp.path(),
+        "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+        "sha512-orig==",
+    );
+    let lock_pre = std::fs::read(tmp.path().join("package-lock.json")).unwrap();
+    let tgz = vendor_project(tmp.path(), &mock.uri(), &[]);
+    let lock_vendored = std::fs::read(tmp.path().join("package-lock.json")).unwrap();
+
+    // Ledger gone; artifact + rewired lock intact (the empirical shape).
+    // The anchored reconstruction restores the entry with wiring: [].
+    std::fs::remove_file(tmp.path().join(".socket/vendor/state.json")).unwrap();
+    mount_blob(&mock).await;
+    let (code, stdout, stderr) = run_cli(
+        tmp.path(),
+        &mock.uri(),
+        &["repair", "--download-mode", "file"],
+    );
+    assert_eq!(code, 0, "reconstruction: stdout={stdout} stderr={stderr}");
+    let state_path = tmp.path().join(".socket/vendor/state.json");
+    let state: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
+    assert_eq!(
+        state["entries"][PURL]["wiring"].as_array().map(Vec::len),
+        Some(0),
+        "npm wiring is not offline-recoverable: {state}"
+    );
+    let stamped_flavor = state["entries"][PURL]["flavor"].clone();
+
+    // Nothing to replay + the lock still resolves through the artifact:
+    // revert must refuse loudly instead of silently removing the tarball.
+    let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["vendor", "--revert"]);
+    assert_ne!(
+        code, 0,
+        "revert of an empty-wiring entry the lock still references must fail closed: \
+         stdout={stdout} stderr={stderr}"
+    );
+    let v = parse_env(&stdout);
+    assert!(
+        events_of(&v)
+            .iter()
+            .any(|e| e["errorCode"] == "vendor_wiring_unknown_revert_blocked"),
+        "envelope={v}"
+    );
+    assert!(
+        tgz.is_file(),
+        "the artifact the lock still references must survive the refusal"
+    );
+    assert_eq!(
+        std::fs::read(tmp.path().join("package-lock.json")).unwrap(),
+        lock_vendored,
+        "the lock stays untouched by the refusal"
+    );
+
+    // The reconstruction identified the referencing lockfile, so the entry
+    // carries the detected flavor — not None (which would depend on the
+    // flavor-None fallback route for its guard).
+    assert_eq!(
+        stamped_flavor,
+        serde_json::json!("package-lock"),
+        "reconstruction stamps the detected flavor"
+    );
+
+    // Recovery, exactly as the refusal advises: `repair` keeps the vendored
+    // artifact healthy (idempotent — the entry and tarball survive)...
+    let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair"]);
+    assert_eq!(
+        code, 0,
+        "repair after refusal: stdout={stdout} stderr={stderr}"
+    );
+    assert!(tgz.is_file(), "repair keeps the artifact");
+
+    // ...and once the pre-vendor lock is restored (the manual-restore arm —
+    // the wiring originals are unrecoverable by design), a normal revert
+    // removes the now-orphaned artifact cleanly.
+    std::fs::write(tmp.path().join("package-lock.json"), &lock_pre).unwrap();
+    let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["vendor", "--revert"]);
+    assert_eq!(code, 0, "final revert: stdout={stdout} stderr={stderr}");
+    let v = parse_env(&stdout);
+    assert!(
+        events_of(&v)
+            .iter()
+            .any(|e| e["action"] == "removed" && e["purl"] == PURL),
+        "envelope={v}"
+    );
+    assert!(
+        !tmp.path()
+            .join(format!(".socket/vendor/npm/{UUID}"))
+            .exists(),
+        "the orphaned artifact dir is removed"
+    );
+    assert_eq!(
+        std::fs::read(tmp.path().join("package-lock.json")).unwrap(),
+        lock_pre,
+        "clean end state: the restored pre-vendor lock is untouched"
+    );
+}
+
 // ────────────────────────────── gem rows ──────────────────────────────
 
 const GEM_UUID: &str = "22222222-2222-4222-8222-222222222222";
@@ -1129,7 +1366,10 @@ async fn repair_reconstructs_gem_wiring_and_revert_byte_restores() {
     assert!(
         !events_of(&v)
             .iter()
-            .any(|e| e["errorCode"] == "vendor_wiring_unknown"),
+            .any(|e| e["errorCode"] == "vendor_wiring_unknown")
+            && !warnings_of(&v)
+                .iter()
+                .any(|w| w["code"] == "vendor_wiring_unknown"),
         "gem wiring IS reconstructable — no unknown-wiring warning: {v}"
     );
     // THE oracle: the reconstructed ledger equals the original, wiring,

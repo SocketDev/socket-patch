@@ -290,6 +290,23 @@ pub async fn revert_yarn_classic(
         Ok(d) => d,
         Err(outcome) => return outcome,
     };
+    // Nothing to replay (a `repair`-reconstructed entry): the artifact may
+    // only be removed when yarn.lock provably no longer resolves through it
+    // — otherwise refuse, fail-closed, instead of silently bricking
+    // installs. Runs before the dry-run return so a preview never
+    // advertises a revert the wet run refuses.
+    if entry.wiring.is_empty() {
+        if let Some(blocked) = super::npm_lock::guard_unwired_textual_revert(
+            project_root,
+            &entry.uuid,
+            &uuid_dir_rel,
+            &[YARN_LOCK],
+        )
+        .await
+        {
+            return blocked;
+        }
+    }
     if dry_run {
         return RevertOutcome::ok();
     }
@@ -1457,6 +1474,75 @@ left-pad@^1.3.0:
         );
         assert!(!fx.root().join("package.json").exists());
         assert!(!fx.root().parent().unwrap().join("x").exists());
+    }
+
+    // ── empty-wiring (reconstructed) revert guard ──────────────────────────
+
+    /// Reshape a vendored entry into what `repair`'s no-ledger
+    /// reconstruction persists: same uuid/artifact, EMPTY wiring. With
+    /// nothing to replay, revert must refuse (fail-closed) while yarn.lock
+    /// still resolves through the artifact — dry-run preview included —
+    /// still remove a genuinely orphaned artifact, fail closed on an
+    /// unreadable lock, and proceed when no lock exists at all.
+    #[tokio::test]
+    async fn empty_wiring_revert_guards_against_bricking_installs() {
+        let fx = fixture_with_lock(Y2_BEFORE).await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let mut entry = entry.unwrap();
+        entry.wiring.clear();
+        let lock_vendored = tokio::fs::read(fx.lock_path()).await.unwrap();
+
+        // Still referenced: refuse, artifact and lock untouched.
+        for dry_run in [true, false] {
+            let outcome = revert_yarn_classic(&entry, fx.root(), dry_run).await;
+            assert!(!outcome.success, "dry_run={dry_run}: must refuse");
+            assert!(
+                outcome
+                    .warnings
+                    .iter()
+                    .any(|w| w.code == "vendor_wiring_unknown_revert_blocked"),
+                "{:?}",
+                outcome.warnings
+            );
+            assert!(fx.tgz_path().exists(), "artifact survives the refusal");
+            assert_eq!(
+                tokio::fs::read(fx.lock_path()).await.unwrap(),
+                lock_vendored,
+                "lock untouched"
+            );
+        }
+
+        // Unreadable lock (not UTF-8): undeterminable, fail closed.
+        tokio::fs::write(fx.lock_path(), [0xff, 0xfe, b'x'])
+            .await
+            .unwrap();
+        let outcome = revert_yarn_classic(&entry, fx.root(), false).await;
+        assert!(!outcome.success, "unreadable-lock revert must refuse");
+        assert!(fx.tgz_path().exists());
+
+        // Re-locked away from the artifact (provably orphaned): removal
+        // proceeds, replaying nothing.
+        tokio::fs::write(fx.lock_path(), &fx.lock_bytes)
+            .await
+            .unwrap();
+        let outcome = revert_yarn_classic(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(!fx.tgz_path().exists(), "orphaned artifact removed");
+        assert_eq!(
+            tokio::fs::read(fx.lock_path()).await.unwrap(),
+            fx.lock_bytes,
+            "empty wiring replays nothing"
+        );
+
+        // No lock at all: nothing can reference the artifact — proceed.
+        let fx = fixture_with_lock(Y2_BEFORE).await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let mut entry = entry.unwrap();
+        entry.wiring.clear();
+        tokio::fs::remove_file(fx.lock_path()).await.unwrap();
+        let outcome = revert_yarn_classic(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(!fx.tgz_path().exists(), "no lock, no reference");
     }
 
     #[tokio::test]

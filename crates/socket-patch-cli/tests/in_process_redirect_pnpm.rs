@@ -238,8 +238,30 @@ async fn hosted_rewrites_pnpm_root_lock_resolution() {
         "the ledger must preserve the original upstream integrity for revert: {first}"
     );
 
+    // Zero-touch trust config: a rewritten root v9 lock auto-creates
+    // pnpm-workspace.yaml with the root-only scaffold + `trustLockfile: true`
+    // (pnpm >=11 rejects the redirected lock without it; 9/10 ignore the
+    // key), and the ledger records the created-file edit for revert.
+    let ws_path = tmp.path().join("pnpm-workspace.yaml");
+    let ws = std::fs::read_to_string(&ws_path)
+        .expect("the redirect must auto-create pnpm-workspace.yaml");
+    assert_eq!(
+        ws, "packages:\n  - '.'\ntrustLockfile: true\n",
+        "created workspace file must be the scaffold + trust key"
+    );
+    assert!(
+        edits.iter().any(|e| {
+            e["kind"] == "redirect_pnpm_workspace_trust"
+                && e["action"] == "created"
+                && e["path"] == "pnpm-workspace.yaml"
+                && e["key"] == "trustLockfile"
+        }),
+        "the ledger must record the workspace-trust creation: {first}"
+    );
+
     // Idempotency: a second run rewrites nothing new — an already-redirected
-    // resolution must not append duplicate edits (which would poison a revert).
+    // resolution must not append duplicate edits (which would poison a revert),
+    // and the auto-created workspace file must stay byte-stable.
     let code = run(hosted_args(tmp.path(), server.uri())).await;
     assert_eq!(code, 0, "second scan --mode hosted should succeed");
     let second: serde_json::Value =
@@ -253,6 +275,162 @@ async fn hosted_rewrites_pnpm_root_lock_resolution() {
     assert_eq!(
         lock, lock_after_rerun,
         "the re-run must leave the lock byte-stable"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&ws_path).unwrap(),
+        ws,
+        "the re-run must leave pnpm-workspace.yaml byte-stable"
+    );
+}
+
+/// MERGE case: a pre-existing pnpm-workspace.yaml (comments, multi-glob
+/// packages, catalog — none of it ours) gains EXACTLY one appended
+/// `trustLockfile: true` line after its last non-empty line; every other
+/// byte survives verbatim, and the ledger records the `added` (not
+/// `created`) action so a revert removes just that line.
+#[tokio::test]
+#[serial]
+async fn hosted_merges_trust_key_into_existing_workspace_yaml_byte_exactly() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_pnpm_project(tmp.path());
+    let user_ws =
+        "# team workspace\npackages:\n  - '.'\n  - 'tools/*'\n\ncatalog:\n  react: ^18.0.0\n";
+    std::fs::write(tmp.path().join("pnpm-workspace.yaml"), user_ws).unwrap();
+
+    let code = run(hosted_args(tmp.path(), server.uri())).await;
+    assert_eq!(code, 0, "scan --mode hosted should succeed");
+
+    let ws = std::fs::read_to_string(tmp.path().join("pnpm-workspace.yaml")).unwrap();
+    assert_eq!(
+        ws,
+        "# team workspace\npackages:\n  - '.'\n  - 'tools/*'\n\ncatalog:\n  react: ^18.0.0\ntrustLockfile: true\n",
+        "the merge must preserve every user byte and append exactly one line"
+    );
+    let ledger: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(tmp.path().join(".socket/vendor/redirect-state.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        ledger["edits"].as_array().unwrap().iter().any(|e| {
+            e["kind"] == "redirect_pnpm_workspace_trust"
+                && e["action"] == "added"
+                && e["path"] == "pnpm-workspace.yaml"
+        }),
+        "the ledger must record the merged (added) trust edit: {ledger}"
+    );
+}
+
+/// `--dry-run` previews: NOTHING lands on disk — no lock rewrite, no
+/// pnpm-workspace.yaml, no ledger — while the envelope still reports both
+/// files as would-be-rewritten (`dryRun: true`).
+#[tokio::test]
+#[serial]
+async fn hosted_dry_run_writes_neither_lock_nor_workspace_trust() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_pnpm_project(tmp.path());
+    let lock_before = std::fs::read(tmp.path().join("pnpm-lock.yaml")).unwrap();
+
+    let mut args = hosted_args(tmp.path(), server.uri());
+    args.common.dry_run = true;
+    let code = run(args).await;
+    assert_eq!(code, 0, "dry-run scan --mode hosted should succeed");
+
+    assert_eq!(
+        std::fs::read(tmp.path().join("pnpm-lock.yaml")).unwrap(),
+        lock_before,
+        "dry-run must leave the lock byte-identical"
+    );
+    assert!(
+        !tmp.path().join("pnpm-workspace.yaml").exists(),
+        "dry-run must not create pnpm-workspace.yaml"
+    );
+    assert!(
+        !tmp.path()
+            .join(".socket/vendor/redirect-state.json")
+            .exists(),
+        "dry-run must not write the redirect ledger"
+    );
+}
+
+/// LEGACY lock (pnpm 8's lockfileVersion '6.0', byte-real matrix shape): the
+/// plain `/name@version:` key stays redirectable, but the trustLockfile
+/// auto-config must NOT fire — pnpm 7/8 have neither the >=11 policy nor the
+/// flag, so writing trust config for them would be pure noise. No
+/// pnpm-workspace.yaml appears and the ledger carries no workspace-trust
+/// edit.
+#[tokio::test]
+#[serial]
+async fn hosted_legacy_v6_lock_gets_no_workspace_trust_config() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::write(
+        root.join("package.json"),
+        format!(
+            r#"{{ "name": "consumer", "version": "0.0.0", "dependencies": {{ "{NAME}": "{VERSION}" }} }}"#
+        ),
+    )
+    .unwrap();
+    let pkg = root.join("node_modules").join(NAME);
+    std::fs::create_dir_all(&pkg).unwrap();
+    std::fs::write(
+        pkg.join("package.json"),
+        format!(r#"{{ "name": "{NAME}", "version": "{VERSION}" }}"#),
+    )
+    .unwrap();
+    // The v6 shape pnpm 8 emits (matrix hosted-pnpm8): quoted '6.0',
+    // `/name@version:` package key.
+    std::fs::write(
+        root.join("pnpm-lock.yaml"),
+        format!(
+            "lockfileVersion: '6.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+dependencies:
+  {NAME}:
+    specifier: {VERSION}
+    version: {VERSION}
+
+packages:
+
+  /{NAME}@{VERSION}:
+    resolution: {{integrity: {UPSTREAM_SHA512}}}
+    dev: false
+"
+        ),
+    )
+    .unwrap();
+
+    let code = run(hosted_args(root, server.uri())).await;
+    assert_eq!(code, 0, "scan --mode hosted should succeed on a v6 lock");
+
+    let lock = std::fs::read_to_string(root.join("pnpm-lock.yaml")).unwrap();
+    assert!(
+        lock.contains(&format!("tarball: {HOSTED_URL}")),
+        "anchor: the v6 lock must still be redirected; got:\n{lock}"
+    );
+    assert!(
+        !root.join("pnpm-workspace.yaml").exists(),
+        "a legacy v6 lock must not trigger the trustLockfile auto-config"
+    );
+    let ledger = std::fs::read_to_string(root.join(".socket/vendor/redirect-state.json")).unwrap();
+    assert!(
+        !ledger.contains("redirect_pnpm_workspace_trust"),
+        "no workspace-trust edit may be recorded for a legacy lock: {ledger}"
     );
 }
 
@@ -443,5 +621,253 @@ async fn hosted_pnpm_vex_emits_redirected_attestation() {
     assert!(
         impact.contains("(redirected)"),
         "the attestation must carry the (redirected) marker: {impact}"
+    );
+}
+
+/// The CLI binary with ambient SOCKET_* env scrubbed (same hermeticity rule
+/// as `in_process_redirect.rs`'s `scrubbed_cli`; duplicated because test
+/// binaries cannot share helpers). Subprocess (not in-process `run`) so the
+/// `--json` stdout envelope can be read back — the diagnostics under test
+/// ARE the envelope's `redirect.warnings`.
+fn scrubbed_cli() -> std::process::Command {
+    let cmd = std::process::Command::new(env!("CARGO_BIN_EXE_socket-patch"));
+    let mut cmd = cmd;
+    for (key, _) in std::env::vars_os() {
+        let name = key.to_string_lossy();
+        if name.starts_with("SOCKET_") && !name.contains("TELEMETRY") && name != "SOCKET_NO_CONFIG"
+        {
+            cmd.env_remove(&key);
+        }
+    }
+    cmd
+}
+
+/// Run `scan --mode hosted --json` as a subprocess against `cwd` and parse
+/// the stdout envelope (exit code, parsed JSON).
+fn run_hosted_json(cwd: &Path, api_url: &str) -> (Option<i32>, serde_json::Value) {
+    let out = scrubbed_cli()
+        .args([
+            "scan",
+            "--mode",
+            "hosted",
+            "--json",
+            "--yes",
+            "--cwd",
+            cwd.to_str().unwrap(),
+            "--api-url",
+            api_url,
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+        ])
+        .output()
+        .expect("run socket-patch");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let doc = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!("stdout must be the JSON envelope ({e});\nstdout=\n{stdout}\nstderr=\n{stderr}")
+    });
+    (out.status.code(), doc)
+}
+
+/// (c) pnpm 1/2 legacy project (the 2026-08-18 legacy-matrix layout:
+/// `shrinkwrap.yaml` + `node_modules/.modules.yaml`, no pnpm-lock.yaml and
+/// no package-lock.json): the no-lockfile diagnostic must be PNPM-flavored
+/// — `redirect_pnpm_legacy_lockfile` naming shrinkwrap.yaml and the pnpm
+/// upgrade path — never the npm `redirect_npm_no_lockfile` wording that
+/// dead-ends on a pnpm project. The legacy lock also feeds the
+/// lockfile-only supplement (shrinkwrap.yaml IS the v5 grammar under the
+/// pre-rename filename), and the run stays fail-closed: shrinkwrap.yaml is
+/// byte-untouched with zero redirects.
+#[tokio::test]
+#[serial]
+async fn hosted_legacy_shrinkwrap_project_diagnoses_pnpm_not_npm() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::write(
+        root.join("package.json"),
+        format!(
+            r#"{{ "name": "consumer", "version": "0.0.0", "dependencies": {{ "{NAME}": "{VERSION}" }} }}"#
+        ),
+    )
+    .unwrap();
+    let pkg = root.join("node_modules").join(NAME);
+    std::fs::create_dir_all(&pkg).unwrap();
+    std::fs::write(
+        pkg.join("package.json"),
+        format!(r#"{{ "name": "{NAME}", "version": "{VERSION}" }}"#),
+    )
+    .unwrap();
+    // pnpm layout marker (pnpm 1/2 writes it, modern pnpm still does).
+    std::fs::write(
+        root.join("node_modules/.modules.yaml"),
+        "packageManager: pnpm@2.17.0\n",
+    )
+    .unwrap();
+    // shrinkwrapVersion-3 grammar (real shape from the legacy matrix):
+    // v5-style `/name/version` keys, BLOCK-mapped resolution. One entry is
+    // installed (NAME), one is lock-only — the supplement must see it.
+    let shrinkwrap = format!(
+        "dependencies:
+  {NAME}: {VERSION}
+packages:
+  /{NAME}/{VERSION}:
+    dev: false
+    resolution:
+      integrity: {UPSTREAM_SHA512}
+  /legacy-only-dep/2.0.0:
+    dev: false
+    resolution:
+      integrity: sha512-LEGACYONLYlegacyonly==
+registry: 'https://registry.npmjs.org/'
+shrinkwrapMinorVersion: 9
+shrinkwrapVersion: 3
+specifiers:
+  {NAME}: {VERSION}
+"
+    );
+    std::fs::write(root.join("shrinkwrap.yaml"), &shrinkwrap).unwrap();
+
+    let (code, doc) = run_hosted_json(root, &server.uri());
+    assert_eq!(code, Some(0), "fail-closed diagnostics still exit 0: {doc}");
+
+    let warnings = doc["redirect"]["warnings"].as_array().unwrap();
+    assert_eq!(
+        warnings.len(),
+        1,
+        "exactly the pnpm-legacy diagnostic, no npm noise: {doc}"
+    );
+    assert_eq!(
+        warnings[0]["code"], "redirect_pnpm_legacy_lockfile",
+        "the family selection must be marker-aware: {doc}"
+    );
+    let detail = warnings[0]["detail"].as_str().unwrap();
+    assert!(
+        detail.contains("shrinkwrap.yaml") && detail.contains("pnpm"),
+        "detail must name the legacy lock and pnpm: {detail}"
+    );
+    assert!(
+        !doc.to_string().contains("redirect_npm_no_lockfile"),
+        "the npm wording must be gone: {doc}"
+    );
+    assert_eq!(doc["redirect"]["redirected"], 0, "nothing redirects: {doc}");
+
+    // The lockfile-only supplement reads shrinkwrap.yaml: the uninstalled
+    // `/legacy-only-dep/2.0.0` entry surfaces (it was 0 before the fix).
+    assert_eq!(
+        doc["lockfileOnlyPackages"], 1,
+        "shrinkwrap.yaml must feed the lockfile-only supplement: {doc}"
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(root.join("shrinkwrap.yaml")).unwrap(),
+        shrinkwrap,
+        "shrinkwrap.yaml must be byte-untouched (fail-closed)"
+    );
+}
+
+/// (d) hosted over a VENDORED pnpm lock (the mode-conversion matrix's projB
+/// shape: overrides + `<name>@file:.socket/vendor/…` packages/snapshots
+/// keys): the per-dep warning must be `redirect_pnpm_entry_vendored`
+/// pointing at `vendor --revert` — not the `redirect_pnpm_entry_not_found`
+/// wording that reads as "not locked" and invites a `pnpm install`
+/// wild-goose chase. Fail-closed unchanged: zero redirects, lock untouched,
+/// no redirect ledger.
+#[tokio::test]
+#[serial]
+async fn hosted_over_vendored_pnpm_lock_diagnoses_vendored_not_missing() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::write(
+        root.join("package.json"),
+        format!(
+            r#"{{ "name": "consumer", "version": "0.0.0", "dependencies": {{ "{NAME}": "{VERSION}" }} }}"#
+        ),
+    )
+    .unwrap();
+    let pkg = root.join("node_modules").join(NAME);
+    std::fs::create_dir_all(&pkg).unwrap();
+    std::fs::write(
+        pkg.join("package.json"),
+        format!(r#"{{ "name": "{NAME}", "version": "{VERSION}" }}"#),
+    )
+    .unwrap();
+    // Byte-real vendored v9 shape (mode-conversion snap-B, renamed to the
+    // fixture package).
+    let vendored_spec = format!(
+        "file:.socket/vendor/npm/1a2b3c4d-5e6f-4a1b-8c2d-0123456789ab/{NAME}-{VERSION}.tgz"
+    );
+    let lock = format!(
+        "lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+overrides:
+  {NAME}@{VERSION}: {vendored_spec}
+
+importers:
+
+  .:
+    dependencies:
+      {NAME}:
+        specifier: {vendored_spec}
+        version: {vendored_spec}
+
+packages:
+
+  {NAME}@{vendored_spec}:
+    resolution: {{integrity: {UPSTREAM_SHA512}, tarball: {vendored_spec}}}
+    version: {VERSION}
+
+snapshots:
+
+  {NAME}@{vendored_spec}: {{}}
+"
+    );
+    std::fs::write(root.join("pnpm-lock.yaml"), &lock).unwrap();
+
+    let (code, doc) = run_hosted_json(root, &server.uri());
+    assert_eq!(code, Some(0), "fail-closed diagnostics still exit 0: {doc}");
+
+    let warnings = doc["redirect"]["warnings"].as_array().unwrap();
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w["code"] == "redirect_pnpm_entry_vendored"),
+        "the vendored state must be named: {doc}"
+    );
+    let detail = warnings
+        .iter()
+        .find(|w| w["code"] == "redirect_pnpm_entry_vendored")
+        .and_then(|w| w["detail"].as_str())
+        .unwrap();
+    assert!(
+        detail.contains("vendor --revert"),
+        "detail must give the mode-switch path: {detail}"
+    );
+    assert!(
+        !doc.to_string().contains("redirect_pnpm_entry_not_found"),
+        "the not-locked wording must be gone for a vendored dep: {doc}"
+    );
+    assert_eq!(doc["redirect"]["redirected"], 0, "nothing redirects: {doc}");
+    assert_eq!(
+        std::fs::read_to_string(root.join("pnpm-lock.yaml")).unwrap(),
+        lock,
+        "the vendored lock must be byte-untouched (fail-closed)"
+    );
+    assert!(
+        !root.join(".socket/vendor/redirect-state.json").exists(),
+        "a zero-redirect run must not write a redirect ledger"
     );
 }

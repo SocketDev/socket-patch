@@ -65,6 +65,7 @@ pub mod npm_lock;
 mod npm_pack;
 pub mod nuget_feed;
 pub mod pnpm_lock;
+pub mod pnpm_lock_legacy;
 pub mod pypi;
 pub mod pypi_pdm;
 pub mod pypi_pipenv;

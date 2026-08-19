@@ -61,6 +61,7 @@ const SOCKET_ENV_VARS: &[&str] = &[
     "SOCKET_LOCK_TIMEOUT",
     "SOCKET_DEBUG",
     "SOCKET_TELEMETRY_DISABLED",
+    "SOCKET_NO_TRUST_LOCKFILE_CONFIG",
     // RepairArgs-specific
     "SOCKET_DOWNLOAD_ONLY",
 ];
