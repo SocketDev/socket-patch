@@ -1878,3 +1878,221 @@ async fn scan_agent_json_carries_redirect_state_alongside_warning() {
         "envelope={v}"
     );
 }
+
+/// Mount the hosted reference endpoint with NO grants: every uuid comes back
+/// missing, so each selected patch lands as a per-patch `not_found` skip and
+/// the hosted run still emits its full envelope — all the omission tests
+/// below need.
+async fn mount_empty_reference(mock: &MockServer) {
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/package")))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "results": {} })),
+        )
+        .mount(mock)
+        .await;
+}
+
+/// Hosted-mode envelopes never carry `redirectState`: the nested `redirect`
+/// block reports this run's own result and `run_redirect` re-persists the
+/// ledger mid-run, so a pre-run snapshot would go stale. Pinned on BOTH the
+/// zero-discovery and the ≥1-package paths.
+#[tokio::test]
+async fn hosted_mode_envelopes_omit_redirect_state() {
+    let mock = MockServer::start().await;
+    let purl = "pkg:npm/minimist@1.2.2";
+    let encoded = "pkg%3Anpm%2Fminimist%401.2.2";
+    mount_patch_discovery(&mock, purl, encoded, AGENT_WARN_UUID).await;
+    mount_empty_reference(&mock).await;
+
+    // Zero-discovery: ledger records present, nothing installed.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_root_package_json(tmp.path());
+    seed_live_hosted_wiring(
+        tmp.path(),
+        purl,
+        AGENT_WARN_UUID,
+        /*with_record=*/ true,
+    );
+    std::fs::remove_file(tmp.path().join("yarn.lock")).unwrap();
+    let (code, stdout, stderr) = run_scan(tmp.path(), &mock.uri(), &["--mode", "hosted", "--yes"]);
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert!(
+        v["redirect"].is_object(),
+        "hosted zero-discovery envelope keeps its no-op redirect block; \
+         envelope={v}"
+    );
+    assert!(
+        v.get("redirectState").is_none(),
+        "hosted-mode envelopes must not carry redirectState; envelope={v}"
+    );
+
+    // ≥1 package: the full hosted pipeline (empty grants ⇒ not_found skips).
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_root_package_json(tmp.path());
+    write_npm_package(tmp.path(), "minimist", "1.2.2");
+    seed_live_hosted_wiring(
+        tmp.path(),
+        purl,
+        AGENT_WARN_UUID,
+        /*with_record=*/ true,
+    );
+    let (code, stdout, stderr) = run_scan(tmp.path(), &mock.uri(), &["--mode", "hosted", "--yes"]);
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert!(
+        v["redirect"].is_object(),
+        "hosted run reports its own result under redirect; envelope={v}"
+    );
+    assert!(
+        v.get("redirectState").is_none(),
+        "hosted-mode envelopes must not carry redirectState; envelope={v}"
+    );
+}
+
+/// Vendored-mode envelopes never carry `redirectState` either: the vendored
+/// takeover reconciliation may retire ledger records mid-run (the
+/// `vendor_supersedes_redirect` warning covers that state), so a pre-run
+/// snapshot would go stale. The zero-discovery leg is the regression pin —
+/// the early-return used to gate the block on `!hosted` alone, leaking it
+/// into `scan --mode vendored --json` over an empty crawl.
+#[tokio::test]
+async fn vendored_mode_envelopes_omit_redirect_state() {
+    let mock = MockServer::start().await;
+    let purl = "pkg:npm/minimist@1.2.2";
+    let encoded = "pkg%3Anpm%2Fminimist%401.2.2";
+    mount_patch_discovery(&mock, purl, encoded, AGENT_WARN_UUID).await;
+
+    // Zero-discovery (the leak): ledger records present, nothing installed.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_root_package_json(tmp.path());
+    seed_live_hosted_wiring(
+        tmp.path(),
+        purl,
+        AGENT_WARN_UUID,
+        /*with_record=*/ true,
+    );
+    std::fs::remove_file(tmp.path().join("yarn.lock")).unwrap();
+    let (code, stdout, stderr) =
+        run_scan(tmp.path(), &mock.uri(), &["--mode", "vendored", "--yes"]);
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert!(
+        v.get("redirectState").is_none(),
+        "vendored-mode zero-discovery envelope must not carry redirectState; \
+         envelope={v}"
+    );
+
+    // ≥1 package (dry-run keeps it network-light past discovery).
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_root_package_json(tmp.path());
+    write_npm_package(tmp.path(), "minimist", "1.2.2");
+    seed_live_hosted_wiring(
+        tmp.path(),
+        purl,
+        AGENT_WARN_UUID,
+        /*with_record=*/ true,
+    );
+    let (code, stdout, stderr) = run_scan(
+        tmp.path(),
+        &mock.uri(),
+        &["--mode", "vendored", "--dry-run", "--yes"],
+    );
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert!(
+        v["vendor"].is_object(),
+        "vendored dry-run envelope carries its vendor block; envelope={v}"
+    );
+    assert!(
+        v.get("redirectState").is_none(),
+        "vendored-mode envelopes must not carry redirectState; envelope={v}"
+    );
+}
+
+/// The malformed-ledger degradation warning is advisory, so `--silent`
+/// ("errors only") must mute it — on the report-only path like everywhere
+/// else. The envelope itself is unchanged either way (no redirectState from
+/// a ledger that cannot be read).
+#[tokio::test]
+async fn silent_gates_scan_malformed_ledger_warning() {
+    let mock = MockServer::start().await;
+    let purl = "pkg:npm/minimist@1.2.2";
+    let encoded = "pkg%3Anpm%2Fminimist%401.2.2";
+    mount_patch_discovery(&mock, purl, encoded, AGENT_WARN_UUID).await;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_root_package_json(tmp.path());
+    write_npm_package(tmp.path(), "minimist", "1.2.2");
+    let vendor_dir = tmp.path().join(".socket/vendor");
+    std::fs::create_dir_all(&vendor_dir).unwrap();
+    std::fs::write(vendor_dir.join("redirect-state.json"), "{ torn ledger").unwrap();
+
+    // Control: without --silent the corruption is surfaced on stderr.
+    let (code, stdout, stderr) = run_scan(tmp.path(), &mock.uri(), &[]);
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    assert!(
+        stderr.contains("malformed"),
+        "a malformed ledger must be surfaced when not silent: {stderr}"
+    );
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert!(
+        v.get("redirectState").is_none(),
+        "an unreadable ledger asserts nothing; envelope={v}"
+    );
+
+    // --silent mutes the advisory warning; the run is otherwise identical.
+    let (code, stdout, stderr) = run_scan(tmp.path(), &mock.uri(), &["--silent"]);
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    assert!(
+        !stderr.contains("malformed"),
+        "--silent must mute the malformed-ledger warning: {stderr}"
+    );
+}
+
+/// `wiringLive` (like the agent warning) only ever names packages this run
+/// actually counted: an `--ecosystems` filter that excludes the hosted
+/// ecosystem leaves the records listed — the ledger is still real state —
+/// with an EMPTY wiringLive ("purl not crawled/queried this run" is a
+/// documented silent cause, distinct from "wiring unwound"). This also pins
+/// the zero-discovery envelope carrying the block at all.
+#[tokio::test]
+async fn ecosystems_filter_keeps_records_but_not_wiring_live() {
+    let mock = MockServer::start().await;
+    let purl = "pkg:npm/minimist@1.2.2";
+    let encoded = "pkg%3Anpm%2Fminimist%401.2.2";
+    mount_patch_discovery(&mock, purl, encoded, AGENT_WARN_UUID).await;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_root_package_json(tmp.path());
+    write_npm_package(tmp.path(), "minimist", "1.2.2");
+    // Live hosted wiring — provable, but out of this run's scope below.
+    seed_live_hosted_wiring(
+        tmp.path(),
+        purl,
+        AGENT_WARN_UUID,
+        /*with_record=*/ true,
+    );
+
+    let (code, stdout, stderr) = run_scan(tmp.path(), &mock.uri(), &["--ecosystems", "pypi"]);
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    let state = &v["redirectState"];
+    assert!(
+        state.is_object(),
+        "records exist ⇒ the block rides even the filtered/zero-discovery \
+         envelope; envelope={v}"
+    );
+    assert_eq!(
+        state["records"].as_array().map(Vec::len),
+        Some(1),
+        "envelope={v}"
+    );
+    assert_eq!(
+        state["wiringLive"],
+        serde_json::json!([]),
+        "a purl this run did not crawl/query must not be claimed live — \
+         even though the lock provably pins the patch server; envelope={v}"
+    );
+}

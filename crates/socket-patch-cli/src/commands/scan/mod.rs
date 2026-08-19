@@ -1163,25 +1163,26 @@ pub(super) async fn hosted_wiring_retained_purls(
     let canon = |p: &str| normalize_purl(strip_purl_qualifiers(p)).into_owned();
     let scanned: std::collections::BTreeSet<String> =
         scanned_purls.iter().map(|p| canon(p)).collect();
+    // Cheap no-I/O gate: only ledger records naming a scanned purl can ever
+    // prove live wiring, so when none do (a zero/filtered discovery, or a
+    // ledger about other packages) skip the lockfile inventory below — a
+    // full multi-file lock parse — entirely.
+    let candidates: Vec<(String, &str)> = redirect
+        .records
+        .iter()
+        .map(|(key, record)| (canon(key), record.uuid.as_str()))
+        .filter(|(purl, _)| scanned.contains(purl))
+        .collect();
+    if candidates.is_empty() {
+        return Vec::new();
+    }
     let mut redirect_files: Vec<&str> = redirect.edits.iter().map(|e| e.path.as_str()).collect();
     redirect_files.sort();
     redirect_files.dedup();
     let inventory = socket_patch_core::vendor::lock_inventory::inventory_project(cwd).await;
     let mut out = Vec::new();
-    for (key, record) in &redirect.records {
-        let purl = canon(key);
-        if !scanned.contains(&purl) {
-            continue;
-        }
-        if hosted_wiring_live(
-            cwd,
-            &purl,
-            Some(record.uuid.as_str()),
-            &redirect_files,
-            &inventory,
-        )
-        .await
-        {
+    for (purl, uuid) in candidates {
+        if hosted_wiring_live(cwd, &purl, Some(uuid), &redirect_files, &inventory).await {
             out.push(purl);
         }
     }
@@ -1251,32 +1252,47 @@ pub(super) fn vendored_ownership_retained_detail(purls: &[String]) -> String {
 /// hosted-mode run's. `None` (key omitted, additive contract) when the
 /// ledger is absent or its `records` are empty — an edits-only ledger
 /// (post-takeover / degraded) asserts no patches, mirroring the warning's
-/// records gate.
+/// records gate. This emptiness check is the block's ONE presence
+/// decision; the caller precomputes `wiring_live` (see below) whose own
+/// probe guards its inputs independently for its other callers.
 ///
-/// Shape: `{ mode, ledger, records: [{purl, uuid}], wiringLive: [purl] }`.
-/// `mode` is the ledger's own (opaque) mode string; `records` keeps the
-/// ledger's verbatim purl keys (BTreeMap order — sorted); `wiringLive` is
-/// [`hosted_wiring_retained_purls`]' canonicalized subset — records are the
-/// ledger's word, wiringLive is the live lock's proof, and consumers must
-/// treat them as exactly that split (a record with no proof means the
-/// wiring was unwound or the lock is unreadable, never "still live").
-pub(super) async fn redirect_state_json(
-    cwd: &Path,
+/// Shape: `{ mode, ledger, records: [{purl, ledgerKey, uuid}], wiringLive:
+/// [purl] }`. `mode` is the constant [`crate::commands::HOSTED_MODE_LABEL`]
+/// — never the ledger's own opaque `mode` string (pre-rename ledgers carry
+/// `"redirect"`; consumers dispatching on this key must not need that
+/// history). Each record's `purl` is CANONICALIZED (qualifiers stripped,
+/// percent-decoded) to the same spelling `wiringLive` carries, so the
+/// records↔proof join is a plain string compare; `ledgerKey` is the
+/// ledger's verbatim key (percent-encoded scoped names, `?platform=`
+/// qualifiers) for consumers that need to address the ledger itself.
+/// `wiring_live` is the caller's [`hosted_wiring_retained_purls`] result —
+/// computed ONCE per run (it parses the project's lockfiles) and shared
+/// with the agent-flow warning. Records are the ledger's word, wiringLive
+/// the live lock's proof: a record with no proof means the wiring was
+/// unwound, the lock is unreadable, or the purl was not crawled/queried
+/// this run — never "still live".
+pub(super) fn redirect_state_json(
     redirect_state: Option<&socket_patch_core::patch::redirect::RedirectState>,
-    scanned_purls: &HashSet<String>,
+    wiring_live: &[String],
 ) -> Option<serde_json::Value> {
     let redirect = redirect_state?;
     if redirect.records.is_empty() {
         return None;
     }
+    let canon = |p: &str| normalize_purl(strip_purl_qualifiers(p)).into_owned();
     let records: Vec<serde_json::Value> = redirect
         .records
         .iter()
-        .map(|(purl, record)| serde_json::json!({ "purl": purl, "uuid": record.uuid }))
+        .map(|(key, record)| {
+            serde_json::json!({
+                "purl": canon(key),
+                "ledgerKey": key,
+                "uuid": record.uuid,
+            })
+        })
         .collect();
-    let wiring_live = hosted_wiring_retained_purls(cwd, redirect_state, scanned_purls).await;
     Some(serde_json::json!({
-        "mode": redirect.mode,
+        "mode": crate::commands::HOSTED_MODE_LABEL,
         "ledger": socket_patch_core::patch::redirect::REDIRECT_STATE_REL,
         "records": records,
         "wiringLive": wiring_live,
@@ -1562,30 +1578,26 @@ pub async fn run(mut args: ScanArgs) -> i32 {
                     "warnings": warnings,
                     "dryRun": args.common.dry_run,
                 });
-            } else {
+            } else if !vendor {
                 // The `redirectState` block rides the empty-discovery
                 // envelope too (same rule as the ≥1-package path below:
-                // every non-hosted-mode `--json` envelope carries it when
-                // the ledger holds records) — an `--ecosystems` filter or a
-                // wiped tree must not blind a state-probing consumer. The
-                // ledger is loaded here because the main-path load sits
-                // after this early return; a malformed ledger degrades to
-                // "nothing to consult" with the corruption surfaced, the
-                // same read-only posture as the main path.
-                let redirect_state =
-                    match socket_patch_core::patch::redirect::load_redirect_state(&args.common.cwd)
-                        .await
-                    {
-                        Ok(state) => state,
-                        Err(corrupt) => {
-                            eprintln!("Warning: {corrupt}");
-                            None
-                        }
-                    };
-                if let Some(state) =
-                    redirect_state_json(&args.common.cwd, redirect_state.as_ref(), &scanned_purls)
-                        .await
-                {
+                // every non-hosted-mode, non-vendored-mode `--json` envelope
+                // carries it when the ledger holds records) — an
+                // `--ecosystems` filter or a wiped tree must not blind a
+                // state-probing consumer. The vendored gate mirrors the
+                // main path's: vendored runs may reconcile ledger records
+                // mid-run, so they never carry a pre-run snapshot. The
+                // ledger is loaded here (leniently, --silent-gated) because
+                // the main-path load sits after this early return.
+                // `wiringLive` is empty by construction: this run counted
+                // zero packages, and the block's contract scopes the proof
+                // to packages the run actually covered.
+                let redirect_state = crate::commands::load_redirect_state_lenient(
+                    &args.common.cwd,
+                    args.common.silent,
+                )
+                .await;
+                if let Some(state) = redirect_state_json(redirect_state.as_ref(), &[]) {
                     result["redirectState"] = state;
                 }
             }
@@ -1863,19 +1875,22 @@ pub async fn run(mut args: ScanArgs) -> i32 {
     // view update detection sees — otherwise a pure hosted project's
     // `updates[]` (the documented CI signal) stays structurally empty and a
     // superseding patch is never reported. The envelope schema is unchanged.
-    // A malformed ledger is only warned about here — this is a read-only
-    // consult, and the hosted write path hard-errors on it.
+    // A malformed ledger is only warned about here (and muted by --silent —
+    // the warning is advisory) — this is a read-only consult, and the hosted
+    // write path hard-errors on it.
     let redirect_state =
-        match socket_patch_core::patch::redirect::load_redirect_state(&args.common.cwd).await {
-            Ok(state) => state,
-            Err(corrupt) => {
-                eprintln!("Warning: {corrupt}");
-                None
-            }
-        };
+        crate::commands::load_redirect_state_lenient(&args.common.cwd, args.common.silent).await;
     let update_manifest =
         merge_redirect_records_for_updates(existing_manifest.clone(), redirect_state.as_ref());
     let updates = detect_updates(update_manifest.as_ref(), &all_packages_with_patches);
+
+    // Post-filter scanned set for the hosted-wiring probes: `wiringLive` and
+    // the agent-flow `hosted_wiring_retained` warning only ever name
+    // packages this run actually counted/queried (an `--ecosystems` filter
+    // narrows both — a filtered-out purl reads as "not covered this run",
+    // never as "wiring unwound"). Distinct from `scanned_purls` above, which
+    // deliberately stays PRE-filter for the GC prune (see its comment).
+    let wiring_scanned: HashSet<String> = all_purls.iter().cloned().collect();
 
     if args.common.json {
         let mut result = serde_json::json!({
@@ -1946,10 +1961,18 @@ pub async fn run(mut args: ScanArgs) -> i32 {
         // stale); the vendored path below is excluded for the same staleness
         // reason (its takeover reconciliation may retire ledger records
         // mid-run — the `vendor_supersedes_redirect` warning covers it).
+        //
+        // The live-wiring probe (a full lockfile-inventory parse behind its
+        // cheap no-I/O gate) runs ONCE here and is shared with the agent-flow
+        // warning in the apply branch below.
+        let hosted_retained = if vendor {
+            Vec::new()
+        } else {
+            hosted_wiring_retained_purls(&args.common.cwd, redirect_state.as_ref(), &wiring_scanned)
+                .await
+        };
         if !vendor {
-            if let Some(state) =
-                redirect_state_json(&args.common.cwd, redirect_state.as_ref(), &scanned_purls).await
-            {
+            if let Some(state) = redirect_state_json(redirect_state.as_ref(), &hosted_retained) {
                 result["redirectState"] = state;
             }
         }
@@ -2097,12 +2120,9 @@ pub async fn run(mut args: ScanArgs) -> i32 {
                 }
                 push_scan_json_warning(&mut result, VENDORED_OWNERSHIP_RETAINED, &detail);
             }
-            let hosted_retained = hosted_wiring_retained_purls(
-                &args.common.cwd,
-                redirect_state.as_ref(),
-                &scanned_purls,
-            )
-            .await;
+            // `hosted_retained` was computed once above (shared with the
+            // `redirectState` block) — same probe, same post-filter scanned
+            // set, no second lockfile-inventory parse.
             if !hosted_retained.is_empty() {
                 let detail = hosted_wiring_retained_detail(&hosted_retained);
                 if !args.common.silent {
@@ -2623,9 +2643,12 @@ pub async fn run(mut args: ScanArgs) -> i32 {
     // (The vendored-ownership counterpart is already printed per package
     // by the `[skip] … (vendored …)` lines above.)
     if !vendor && !args.common.silent {
-        let hosted_retained =
-            hosted_wiring_retained_purls(&args.common.cwd, redirect_state.as_ref(), &scanned_purls)
-                .await;
+        let hosted_retained = hosted_wiring_retained_purls(
+            &args.common.cwd,
+            redirect_state.as_ref(),
+            &wiring_scanned,
+        )
+        .await;
         if !hosted_retained.is_empty() {
             eprintln!(
                 "Warning ({HOSTED_WIRING_RETAINED}): {}",
@@ -3057,36 +3080,38 @@ mod tests {
     // hosted/vendored runs don't) is pinned by `tests/scan_invariants.rs`;
     // these pin the block builder's own gates and shape.
 
-    /// Records present ⇒ the block exists with the ledger's verbatim purl
-    /// keys, its mode string, and the (here unprovable ⇒ empty) wiringLive
-    /// split. Records absent (edits-only ledger, no ledger) ⇒ `None`, so the
-    /// envelope key stays additive.
+    /// Records present ⇒ the block exists with each record's canonicalized
+    /// purl + verbatim ledger key, the constant mode label, and the
+    /// caller-supplied wiringLive. Records absent (edits-only ledger, no
+    /// ledger) ⇒ `None`, so the envelope key stays additive.
     #[tokio::test]
     async fn redirect_state_block_gates_on_records_and_splits_live_proof() {
         let purl = "pkg:npm/minimist@1.2.2";
         let scanned: HashSet<String> = [purl.to_string()].into_iter().collect();
 
-        // Records, but no lockfile on disk: listed, with an EMPTY wiringLive
-        // (the ledger's word is never promoted to a live-lock proof).
+        // Records, but no lockfile on disk: listed, with the EMPTY wiringLive
+        // the probe computes (the ledger's word is never promoted to a
+        // live-lock proof).
         let tmp = tempfile::tempdir().unwrap();
         write_redirect_ledger_with_edit(tmp.path(), &[purl]).await;
         let ledger = load_ledger(tmp.path()).await;
-        let block = redirect_state_json(tmp.path(), ledger.as_ref(), &scanned)
-            .await
-            .expect("records present ⇒ block present");
+        let wiring = hosted_wiring_retained_purls(tmp.path(), ledger.as_ref(), &scanned).await;
+        assert_eq!(wiring, Vec::<String>::new());
+        let block =
+            redirect_state_json(ledger.as_ref(), &wiring).expect("records present ⇒ block present");
         assert_eq!(block["mode"], "hosted");
         assert_eq!(block["ledger"], ".socket/vendor/redirect-state.json");
         assert_eq!(
             block["records"],
-            serde_json::json!([{ "purl": purl, "uuid": TAKEOVER_UUID }])
+            serde_json::json!([{ "purl": purl, "ledgerKey": purl, "uuid": TAKEOVER_UUID }])
         );
         assert_eq!(block["wiringLive"], serde_json::json!([]));
 
         // Live lock present too: the same purl graduates into wiringLive.
         write_hosted_yarn_lock(tmp.path(), TAKEOVER_UUID).await;
-        let block = redirect_state_json(tmp.path(), ledger.as_ref(), &scanned)
-            .await
-            .expect("records present ⇒ block present");
+        let wiring = hosted_wiring_retained_purls(tmp.path(), ledger.as_ref(), &scanned).await;
+        let block =
+            redirect_state_json(ledger.as_ref(), &wiring).expect("records present ⇒ block present");
         assert_eq!(block["wiringLive"], serde_json::json!([purl]));
 
         // Edits-only ledger (records retired) ⇒ no block.
@@ -3094,16 +3119,111 @@ mod tests {
         write_redirect_ledger_with_edit(tmp.path(), &[]).await;
         let ledger = load_ledger(tmp.path()).await;
         assert!(
-            redirect_state_json(tmp.path(), ledger.as_ref(), &scanned)
-                .await
-                .is_none(),
+            redirect_state_json(ledger.as_ref(), &[]).is_none(),
             "an edits-only ledger asserts no records"
         );
 
         // No ledger ⇒ no block.
-        assert!(redirect_state_json(tmp.path(), None, &scanned)
-            .await
-            .is_none());
+        assert!(redirect_state_json(None, &[]).is_none());
+    }
+
+    /// The records↔wiringLive join is a plain string compare: each record's
+    /// `purl` is canonicalized to exactly the spelling the probe emits, with
+    /// the ledger's raw key preserved as `ledgerKey`. Pinned on the two key
+    /// shapes real ledgers carry — a percent-encoded scoped npm name (the
+    /// API spelling, the `drop_superseded_purl` fixture shape) and a
+    /// `?platform=`-qualified gem purl. Pre-fix, `records[].purl` kept the
+    /// verbatim key while `wiringLive` was canonical, so a LIVE redirect
+    /// read as "wiring unwound" to any consumer doing the documented join.
+    #[tokio::test]
+    async fn redirect_state_records_canonicalize_to_the_wiring_live_spelling() {
+        use socket_patch_core::patch::redirect::{FileEdit, RedirectState};
+
+        let scoped_key = "pkg:npm/%40scope%2Fpkg@1.0.0";
+        let scoped_canon = "pkg:npm/@scope/pkg@1.0.0";
+        let gem_key = "pkg:gem/nokogiri@1.13.3?platform=ruby";
+        let gem_canon = "pkg:gem/nokogiri@1.13.3";
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = RedirectState::new();
+        state
+            .records
+            .insert(scoped_key.to_string(), takeover_record());
+        state.records.insert(gem_key.to_string(), takeover_record());
+        // A recorded yarn.lock edit + the uuid in the lock text (outside any
+        // vendored path) — the text proof of live hosted wiring for the
+        // scoped purl.
+        state.edits.push(FileEdit {
+            path: "yarn.lock".to_string(),
+            kind: "redirect_yarn_entry".to_string(),
+            action: "rewritten".to_string(),
+            key: Some("@scope/pkg@1.0.0".to_string()),
+            original: Some(serde_json::Value::String("orig".to_string())),
+            new: None,
+        });
+        let dir = tmp.path().join(".socket/vendor");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(
+            dir.join("redirect-state.json"),
+            serde_json::to_string_pretty(&state).unwrap(),
+        )
+        .await
+        .unwrap();
+        write_hosted_yarn_lock(tmp.path(), TAKEOVER_UUID).await;
+
+        let scanned: HashSet<String> = [scoped_canon.to_string()].into_iter().collect();
+        let ledger = load_ledger(tmp.path()).await;
+        let wiring = hosted_wiring_retained_purls(tmp.path(), ledger.as_ref(), &scanned).await;
+        assert_eq!(
+            wiring,
+            vec![scoped_canon.to_string()],
+            "the text proof (uuid in the recorded lock) claims the scoped purl"
+        );
+
+        let block =
+            redirect_state_json(ledger.as_ref(), &wiring).expect("records present ⇒ block present");
+        assert_eq!(
+            block["records"],
+            serde_json::json!([
+                { "purl": gem_canon, "ledgerKey": gem_key, "uuid": TAKEOVER_UUID },
+                { "purl": scoped_canon, "ledgerKey": scoped_key, "uuid": TAKEOVER_UUID },
+            ]),
+            "records carry the canonical purl (wiringLive's spelling) plus \
+             the verbatim ledger key; block={block}"
+        );
+        let live: Vec<&str> = block["wiringLive"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p.as_str().unwrap())
+            .collect();
+        let record_purls: Vec<&str> = block["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["purl"].as_str().unwrap())
+            .collect();
+        for purl in live {
+            assert!(
+                record_purls.contains(&purl),
+                "every wiringLive purl must string-match a records[].purl \
+                 (the documented join); block={block}"
+            );
+        }
+    }
+
+    /// The block's `mode` is the constant label, not the ledger's opaque
+    /// `mode` string: a pre-rename ledger carrying `"redirect"` still labels
+    /// as `"hosted"`, so consumers dispatching on the key need no history.
+    #[tokio::test]
+    async fn redirect_state_mode_is_the_constant_label_for_legacy_ledgers() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_redirect_ledger_with_edit(tmp.path(), &["pkg:npm/minimist@1.2.2"]).await;
+        let mut ledger = load_ledger(tmp.path()).await.unwrap();
+        ledger.mode = "redirect".to_string();
+        let block =
+            redirect_state_json(Some(&ledger), &[]).expect("records present ⇒ block present");
+        assert_eq!(block["mode"], "hosted");
     }
 
     // ---- cargo takeover direction (lock-shape probe) ------------------------

@@ -1,3 +1,5 @@
+use std::path::{Path, PathBuf};
+
 use clap::Args;
 use socket_patch_core::manifest::operations::read_manifest;
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
@@ -61,16 +63,18 @@ fn combined_entries<'a>(
 /// Build the `list --json` envelope: one `Discovered` event per entry, with
 /// the rich metadata (vulnerabilities, tier, license, description,
 /// exportedAt) under `details` per the per-command extension convention.
-/// Hosted-ledger records additionally carry `details.mode: "hosted"` and
-/// `details.ledger` naming the redirect ledger (additive keys, absent on
-/// manifest entries), so consumers can tell the stores apart.
+/// Hosted-ledger records additionally carry `details.mode` (the constant
+/// [`crate::commands::HOSTED_MODE_LABEL`]) and `details.ledger` naming the
+/// redirect ledger (additive keys, absent on manifest entries), so
+/// consumers can tell the stores apart.
 ///
-/// Patches, vulnerabilities, and files are each emitted in a stable sorted
-/// order (by PURL / advisory ID / path). `HashMap` iteration is otherwise
-/// nondeterministic, so without this the event/vuln/file ordering would
-/// change run-to-run — breaking consumers that diff this output in CI logs.
-/// Mirrors the stable-ordering guarantee `get` already provides for its
-/// vulnerability lists.
+/// Events are emitted in the entries' given order — [`combined_entries`]
+/// owns the by-PURL event sort; this builder sorts each event's
+/// vulnerabilities (by advisory ID) and files (by path). `HashMap`
+/// iteration is otherwise nondeterministic, so without these sorts the
+/// vuln/file ordering would change run-to-run — breaking consumers that
+/// diff this output in CI logs. Mirrors the stable-ordering guarantee
+/// `get` already provides for its vulnerability lists.
 ///
 /// Shared by `run` and the unit tests so the tests exercise the exact code
 /// path `list --json` uses, rather than a hand-copied duplicate.
@@ -113,11 +117,10 @@ fn build_list_envelope(entries: &[ListEntry<'_>]) -> Envelope {
             "vulnerabilities": vulnerabilities,
         });
         if entry.hosted {
-            // The label is the constant "hosted" (the mode's documented
-            // name), not the ledger's own opaque `mode` string — pre-rename
-            // ledgers carry `"redirect"`, and a consumer dispatching on
-            // this key must not have to know that history.
-            details["mode"] = serde_json::json!("hosted");
+            // The shared constant label, never the ledger's own opaque
+            // `mode` string — see HOSTED_MODE_LABEL's docs (scan's
+            // `redirectState` block emits the same label, one owner).
+            details["mode"] = serde_json::json!(crate::commands::HOSTED_MODE_LABEL);
             details["ledger"] = serde_json::json!(REDIRECT_STATE_REL);
         }
 
@@ -201,6 +204,26 @@ fn emit_error(args: &ListArgs, code: &str, message: String) {
     }
 }
 
+/// The project root whose redirect ledger accompanies the manifest being
+/// listed. Both stores must come from the SAME project, so the root is
+/// derived from the RESOLVED manifest path rather than hardcoding cwd:
+/// the manifest's directory, stepping out of a standard `.socket/` layout
+/// when the manifest lives in one. For the default
+/// `<cwd>/.socket/manifest.json` this is exactly `cwd`; for a
+/// `--manifest-path` into another project it is that project's root (its
+/// `.socket` parent's parent), or — for a bare file like
+/// `--manifest-path /tmp/x/abs.json` — the file's own directory.
+fn ledger_root(common: &GlobalArgs, manifest_path: &Path) -> PathBuf {
+    match manifest_path.parent() {
+        Some(dir) if dir.file_name() == Some(std::ffi::OsStr::new(".socket")) => dir
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| common.cwd.clone()),
+        Some(dir) => dir.to_path_buf(),
+        None => common.cwd.clone(),
+    }
+}
+
 pub async fn run(args: ListArgs) -> i32 {
     apply_env_toggles(&args.common);
     let manifest_path = args.common.resolved_manifest_path();
@@ -235,25 +258,24 @@ pub async fn run(args: ListArgs) -> i32 {
     };
 
     // Hosted-mode patches live ONLY in the redirect ledger, so `list`
-    // consults it alongside the manifest. This is a read-only consult: a
-    // malformed ledger degrades to "nothing to consult" with the corruption
-    // surfaced on stderr (the hosted write path hard-errors on it instead —
-    // see `load_redirect_state`'s contract), never a hard failure here.
-    let redirect_state =
-        match socket_patch_core::patch::redirect::load_redirect_state(&args.common.cwd).await {
-            Ok(state) => state,
-            Err(corrupt) => {
-                eprintln!("Warning: {corrupt}");
-                None
-            }
-        };
-    // An edits-only ledger (post-takeover residue / a degraded
-    // record-fetch-failed run) asserts no patches — only `records` count.
-    let has_hosted_records = redirect_state
-        .as_ref()
-        .is_some_and(|state| !state.records.is_empty());
+    // consults it alongside the manifest — leniently (a malformed ledger
+    // degrades to "nothing to consult", surfaced on stderr unless --silent;
+    // the hosted write path hard-errors on it instead), and always from the
+    // SAME project as the manifest: with `--manifest-path` pointing at
+    // another project, reading the LOCAL cwd's ledger would interleave two
+    // projects' patch state (and a local ledger could suppress the flagged
+    // project's manifest_not_found).
+    let redirect_state = crate::commands::load_redirect_state_lenient(
+        &ledger_root(&args.common, &manifest_path),
+        args.common.silent,
+    )
+    .await;
 
-    if manifest.is_none() && !has_hosted_records {
+    // `combined_entries` folds only ledger RECORDS in (an edits-only ledger
+    // — post-takeover residue / a degraded record-fetch-failed run —
+    // asserts no patches), so entry emptiness is the whole exit predicate.
+    let entries = combined_entries(manifest.as_ref(), redirect_state.as_ref());
+    if manifest.is_none() && entries.is_empty() {
         // No manifest AND no hosted records: nothing is listable anywhere —
         // the classic missing-manifest error. `read_manifest` returns
         // `Ok(None)` only when the file does not exist (its documented
@@ -270,9 +292,21 @@ pub async fn run(args: ListArgs) -> i32 {
 
     // Records found (either store) ⇒ a successful list, exit 0 — including
     // the purely hosted-wired project that used to hard-fail here.
-    let entries = combined_entries(manifest.as_ref(), redirect_state.as_ref());
+    //
+    // Telemetry: `patch_listed`'s `patches_count` predates the hosted
+    // folding and its consumers read it as "manifest patches", so it keeps
+    // counting the manifest ONLY (0 on a hosted-only project) — folding the
+    // listed entries in would silently redefine the metric and double-count
+    // purls present in both stores. Hosted visibility, if wanted, belongs
+    // in a new dedicated field.
+    let manifest_patch_count = manifest.as_ref().map_or(0, |m| m.patches.len());
     let (api_token, org_slug) = telemetry_credentials(&args.common);
-    track_patch_listed(entries.len(), api_token.as_deref(), org_slug.as_deref()).await;
+    track_patch_listed(
+        manifest_patch_count,
+        api_token.as_deref(),
+        org_slug.as_deref(),
+    )
+    .await;
 
     if args.common.json {
         println!("{}", build_list_envelope(&entries).to_pretty_json());
@@ -293,7 +327,10 @@ pub async fn run(args: ListArgs) -> i32 {
                 // from the hosted redirect ledger — installs resolve this
                 // package to the hosted patch server; no manifest entry
                 // exists or is needed.
-                println!("  Mode: hosted (recorded in {REDIRECT_STATE_REL})");
+                println!(
+                    "  Mode: {} (recorded in {REDIRECT_STATE_REL})",
+                    crate::commands::HOSTED_MODE_LABEL
+                );
             }
             println!("  Tier: {}", patch.tier);
             println!("  License: {}", patch.license);
@@ -344,6 +381,13 @@ mod tests {
     use super::*;
     use socket_patch_core::manifest::schema::{PatchFileInfo, PatchRecord, VulnerabilityInfo};
     use std::collections::HashMap;
+
+    /// Envelope for a manifest-only listing (no redirect ledger) — the shape
+    /// most tests below need; the hosted tests call `combined_entries`
+    /// directly with a `RedirectState`.
+    fn manifest_envelope(manifest: &PatchManifest) -> Envelope {
+        build_list_envelope(&combined_entries(Some(manifest), None))
+    }
 
     fn sample_manifest() -> PatchManifest {
         let mut files = HashMap::new();
@@ -450,8 +494,7 @@ mod tests {
 
     #[test]
     fn list_emits_discovered_event_per_patch() {
-        let manifest = sample_manifest();
-        let env = build_list_envelope(&combined_entries(Some(&manifest), None));
+        let env = manifest_envelope(&sample_manifest());
         let v: serde_json::Value = serde_json::from_str(&env.to_pretty_json()).unwrap();
         assert_eq!(v["command"], "list");
         assert_eq!(v["status"], "success");
@@ -465,8 +508,7 @@ mod tests {
 
     #[test]
     fn list_event_carries_vulnerability_details() {
-        let manifest = sample_manifest();
-        let env = build_list_envelope(&combined_entries(Some(&manifest), None));
+        let env = manifest_envelope(&sample_manifest());
         let v: serde_json::Value = serde_json::from_str(&env.to_pretty_json()).unwrap();
         let event = &v["events"][0];
         assert_eq!(event["details"]["tier"], "free");
@@ -480,8 +522,7 @@ mod tests {
 
     #[test]
     fn empty_manifest_emits_empty_events() {
-        let manifest = PatchManifest::new();
-        let env = build_list_envelope(&combined_entries(Some(&manifest), None));
+        let env = manifest_envelope(&PatchManifest::new());
         let v: serde_json::Value = serde_json::from_str(&env.to_pretty_json()).unwrap();
         assert_eq!(v["status"], "success");
         assert_eq!(v["events"].as_array().unwrap().len(), 0);
@@ -496,8 +537,7 @@ mod tests {
 
     #[test]
     fn events_are_sorted_by_purl() {
-        let manifest = multi_entry_manifest();
-        let env = build_list_envelope(&combined_entries(Some(&manifest), None));
+        let env = manifest_envelope(&multi_entry_manifest());
         let v: serde_json::Value = serde_json::from_str(&env.to_pretty_json()).unwrap();
         let purls: Vec<&str> = v["events"]
             .as_array()
@@ -517,8 +557,7 @@ mod tests {
 
     #[test]
     fn vulnerabilities_are_sorted_by_id() {
-        let manifest = multi_entry_manifest();
-        let env = build_list_envelope(&combined_entries(Some(&manifest), None));
+        let env = manifest_envelope(&multi_entry_manifest());
         let v: serde_json::Value = serde_json::from_str(&env.to_pretty_json()).unwrap();
         // The zeta entry carries two advisories inserted out of order.
         let zeta = v["events"]
@@ -538,8 +577,7 @@ mod tests {
 
     #[test]
     fn files_are_sorted_by_path() {
-        let manifest = multi_entry_manifest();
-        let env = build_list_envelope(&combined_entries(Some(&manifest), None));
+        let env = manifest_envelope(&multi_entry_manifest());
         let v: serde_json::Value = serde_json::from_str(&env.to_pretty_json()).unwrap();
         let zeta = v["events"]
             .as_array()
@@ -667,8 +705,8 @@ mod tests {
     fn ordering_is_deterministic_across_builds() {
         // Two independent builds of the same manifest must be byte-identical.
         let manifest = multi_entry_manifest();
-        let a = build_list_envelope(&combined_entries(Some(&manifest), None)).to_pretty_json();
-        let b = build_list_envelope(&combined_entries(Some(&manifest), None)).to_pretty_json();
+        let a = manifest_envelope(&manifest).to_pretty_json();
+        let b = manifest_envelope(&manifest).to_pretty_json();
         assert_eq!(a, b);
     }
 }
