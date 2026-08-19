@@ -220,10 +220,20 @@ fn rewrite_npm_lock(
     if npm.is_empty() {
         return;
     }
-    let lockfile = ["npm-shrinkwrap.json", "package-lock.json"]
+    // BOTH npm locks can legitimately co-exist and BOTH must be rewritten.
+    // `npm shrinkwrap` was removed in npm 12, which now auto-creates a
+    // `package-lock.json` beside any committed `npm-shrinkwrap.json` on first
+    // install and reifies the install FROM `package-lock.json`. So the
+    // dual-lock state is the DEFAULT for a shrinkwrap repo under npm 12.
+    // Rewriting only the first present lock patched the file npm doesn't
+    // install from — a silent FALSE SUCCESS. Rewrite EVERY present npm lock so
+    // a fresh `npm install`/`npm ci` from EITHER is redirected (shrinkwrap-only
+    // repos on npm <= 6 keep working: only that one file is present).
+    let present: Vec<&str> = ["npm-shrinkwrap.json", "package-lock.json"]
         .into_iter()
-        .find(|f| files.contains_key(*f));
-    let Some(lockfile) = lockfile else {
+        .filter(|f| files.contains_key(*f))
+        .collect();
+    if present.is_empty() {
         // Another npm-family lock (pnpm — root or nested Rush —, yarn, bun)
         // owns the redirect for these deps and its rewriter emits its own
         // per-dep diagnostics; warning "no package-lock.json" on every
@@ -274,10 +284,24 @@ fn rewrite_npm_lock(
             result.warnings.push(warning);
         }
         return;
-    };
-    let Ok(mut lock) = serde_json::from_str::<Value>(&files[lockfile]) else {
+    }
+    for lockfile in present {
+        rewrite_one_npm_lock(&files[lockfile], lockfile, &npm, result);
+    }
+}
+
+/// Rewrite a single npm lockfile (`package-lock.json` or `npm-shrinkwrap.json`)
+/// in place. Factored out of `rewrite_npm_lock` so co-present locks each get
+/// the identical override rewrite (see the dual-lock note there).
+fn rewrite_one_npm_lock(
+    content: &str,
+    lockfile: &str,
+    npm: &[&DepOverride],
+    result: &mut RewriteResult,
+) {
+    let Ok(mut lock) = serde_json::from_str::<Value>(content) else {
         // A corrupt lockfile is strictly worse than a missing one (which
-        // warns above) — never skip the whole npm redirect silently.
+        // warns in the caller) — never skip the whole npm redirect silently.
         result.warnings.push(RewriteWarning {
             code: "redirect_npm_lock_unparseable".into(),
             detail: format!("{lockfile} is not valid JSON; npm redirect skipped"),
@@ -285,7 +309,7 @@ fn rewrite_npm_lock(
         return;
     };
     let mut changed = false;
-    for dep in &npm {
+    for dep in npm {
         let fname = full_name(dep);
         let Some(sha512) = dep.integrity.sha512.clone() else {
             result.warnings.push(RewriteWarning {
@@ -8672,6 +8696,156 @@ mod tests {
             "CRLF re-run must be a no-op: files={:?} edits={:?}",
             second.files.keys(),
             second.edits
+        );
+    }
+
+    /// npm 12 removed `npm shrinkwrap` and now auto-creates a
+    /// `package-lock.json` beside any committed `npm-shrinkwrap.json` on first
+    /// install — and reifies the install from `package-lock.json`. So a
+    /// shrinkwrap repo's DEFAULT state under npm 12 is BOTH locks present,
+    /// byte-divergent but pinning the same versions. The old rewriter rewrote
+    /// only the FIRST present lock (`npm-shrinkwrap.json`) and left
+    /// `package-lock.json` — the file npm actually installs from — pristine,
+    /// with no warning: a silent FALSE SUCCESS. EVERY present npm lock must be
+    /// rewritten so a fresh install/ci from EITHER is redirected.
+    #[test]
+    fn npm_dual_lock_shrinkwrap_and_package_lock_both_rewritten() {
+        let ovr = npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://patch.test/left-pad-1.3.0.tgz",
+            "sha512-PATCHED==",
+        );
+        // Same pinned dep in both locks, but byte-divergent (shrinkwrap carries
+        // the extra top-level `version`/`requires` fields npm 12 writes) —
+        // exactly the npm 12 shrinkwrap + auto-package-lock pair.
+        let shrinkwrap = r#"{
+  "name": "app",
+  "version": "0.0.0",
+  "lockfileVersion": 3,
+  "requires": true,
+  "packages": {
+    "": { "name": "app", "version": "0.0.0" },
+    "node_modules/left-pad": {
+      "version": "1.3.0",
+      "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+      "integrity": "sha512-UPSTREAM=="
+    }
+  }
+}
+"#;
+        let package_lock = r#"{
+  "name": "app",
+  "lockfileVersion": 3,
+  "packages": {
+    "": { "name": "app", "version": "0.0.0" },
+    "node_modules/left-pad": {
+      "version": "1.3.0",
+      "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+      "integrity": "sha512-UPSTREAM=="
+    }
+  }
+}
+"#;
+        let mut files = BTreeMap::new();
+        files.insert("npm-shrinkwrap.json".to_string(), shrinkwrap.to_string());
+        files.insert("package-lock.json".to_string(), package_lock.to_string());
+
+        let r = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+
+        for lock in ["npm-shrinkwrap.json", "package-lock.json"] {
+            let out = r.files.get(lock).unwrap_or_else(|| {
+                panic!(
+                    "{lock} must be rewritten in the dual-lock case; rewritten files={:?}",
+                    r.files.keys().collect::<Vec<_>>()
+                )
+            });
+            let v: Value = serde_json::from_str(out).expect("rewritten lock stays valid JSON");
+            assert_eq!(
+                v["packages"]["node_modules/left-pad"]["resolved"],
+                "http://patch.test/left-pad-1.3.0.tgz",
+                "{lock} left-pad must point at the hosted URL: {out}"
+            );
+            assert_eq!(
+                v["packages"]["node_modules/left-pad"]["integrity"],
+                "sha512-PATCHED==",
+                "{lock} left-pad must carry the patched integrity: {out}"
+            );
+        }
+        // Both locks pin the dep, so nothing is left unmatched.
+        assert!(
+            !warning_codes(&r).contains(&"redirect_npm_entry_not_found"),
+            "both locks pin the dep — no not-found warning expected: {:?}",
+            r.warnings
+        );
+
+        // Idempotent: re-running over the rewritten pair must change nothing.
+        let mut files2 = files.clone();
+        for lock in ["npm-shrinkwrap.json", "package-lock.json"] {
+            files2.insert(
+                lock.to_string(),
+                r.files.get(lock).expect("rewritten lock present").clone(),
+            );
+        }
+        let second = rewrite_registry_redirect(&files2, std::slice::from_ref(&ovr));
+        assert!(
+            second.files.is_empty() && second.edits.is_empty(),
+            "dual-lock re-run must be a no-op: files={:?} edits={:?}",
+            second.files.keys().collect::<Vec<_>>(),
+            second.edits
+        );
+    }
+
+    /// A shrinkwrap-ONLY project (the npm <= 6 world, where `npm shrinkwrap`
+    /// wrote the sole lock and no `package-lock.json` was auto-created) must
+    /// still be rewritten with zero warnings — the dual-lock fix must not
+    /// perturb the single-lock path.
+    #[test]
+    fn npm_shrinkwrap_only_still_rewritten_no_warnings() {
+        let ovr = npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://patch.test/left-pad-1.3.0.tgz",
+            "sha512-PATCHED==",
+        );
+        let mut files = BTreeMap::new();
+        files.insert(
+            "npm-shrinkwrap.json".to_string(),
+            r#"{
+  "name": "app",
+  "lockfileVersion": 3,
+  "packages": {
+    "": { "name": "app", "version": "0.0.0" },
+    "node_modules/left-pad": {
+      "version": "1.3.0",
+      "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+      "integrity": "sha512-UPSTREAM=="
+    }
+  }
+}
+"#
+            .to_string(),
+        );
+        let r = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        assert!(
+            !r.files.contains_key("package-lock.json"),
+            "no package-lock.json exists, so none may be emitted: {:?}",
+            r.files.keys().collect::<Vec<_>>()
+        );
+        let out = r
+            .files
+            .get("npm-shrinkwrap.json")
+            .expect("the sole shrinkwrap must be rewritten");
+        let v: Value = serde_json::from_str(out).expect("valid JSON");
+        assert_eq!(
+            v["packages"]["node_modules/left-pad"]["resolved"],
+            "http://patch.test/left-pad-1.3.0.tgz"
+        );
+        assert_eq!(
+            warning_codes(&r),
+            Vec::<&str>::new(),
+            "a clean shrinkwrap-only success must emit NO warnings: {:?}",
+            r.warnings
         );
     }
 
