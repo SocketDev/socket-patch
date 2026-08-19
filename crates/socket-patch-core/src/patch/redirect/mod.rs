@@ -759,6 +759,18 @@ fn is_valid_cargo_index_url(url: &str) -> bool {
         && !url.chars().any(char::is_control)
 }
 
+/// Gem index URLs land verbatim inside a quoted Ruby `source "<url>" do`
+/// Gemfile string and on unquoted Gemfile.lock `remote:` lines — refuse
+/// anything that could break out of either (quote, backslash, whitespace;
+/// control chars cover newline injection into the lock) or that is not an
+/// http(s) URL at all. Twin of [`is_valid_cargo_index_url`].
+fn is_valid_gem_index_url(url: &str) -> bool {
+    (url.starts_with("https://") || url.starts_with("http://"))
+        && !url.contains('"')
+        && !url.contains('\\')
+        && !url.chars().any(|c| c.is_control() || c == ' ')
+}
+
 /// The exact shape `hex::encode(sha256)` / the TS `Buffer.toString('hex')`
 /// produce: 64 lowercase hex chars. Anything else written as a Cargo.lock
 /// `checksum` breaks the next fetch.
@@ -3351,6 +3363,19 @@ fn rewrite_gem(
             continue;
         };
         if ov.kind != "rubygems-compact-index" {
+            continue;
+        }
+        // The URL is interpolated into the Gemfile's quoted source string and
+        // the lock's `remote:` lines — gate it before any write, like the
+        // cargo arm gates sparse index URLs.
+        if !is_valid_gem_index_url(&ov.index_url) {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_gem_invalid_index_url".into(),
+                detail: format!(
+                    "{} has a malformed patch-registry index URL; dependency skipped",
+                    dep.name
+                ),
+            });
             continue;
         }
         let Some(sha256) = ov
@@ -6831,6 +6856,52 @@ mod tests {
                 },
             }),
             integrity: Integrity::default(),
+        }
+    }
+
+    /// A service-supplied index URL is interpolated into the Gemfile's quoted
+    /// source string and the lock's `remote:` lines — a quote, backslash, or
+    /// control character (a newline would inject whole lock lines) must be
+    /// refused at intake with nothing written, like the cargo sparse gate.
+    #[test]
+    fn gem_malformed_index_url_is_refused_before_any_write() {
+        for bad in [
+            "https://patch.test/gem/tok\"/uuid/",
+            "https://patch.test/gem\\tok/uuid/",
+            "https://patch.test/gem/tok/uuid/\nGEM",
+            "https://patch.test/gem/t k/uuid/",
+            "ftp://patch.test/gem/tok/uuid/",
+        ] {
+            let mut files = BTreeMap::new();
+            files.insert(
+                "Gemfile".to_string(),
+                "source \"https://rubygems.org\"\n\ngem \"rails\", \"7.0.0\"\n".to_string(),
+            );
+            files.insert(
+                "Gemfile.lock".to_string(),
+                "GEM\n  remote: https://rubygems.org/\n  specs:\n    rails (7.0.0)\n\n\
+                 PLATFORMS\n  ruby\n\nDEPENDENCIES\n  rails (= 7.0.0)\n\n\
+                 BUNDLED WITH\n   2.6.2\n"
+                    .to_string(),
+            );
+            let mut ov = gem_override("rails", "7.0.0");
+            ov.registry_override
+                .as_mut()
+                .expect("gem_override always carries a registry override")
+                .index_url = bad.into();
+            let r = rewrite_registry_redirect(&files, &[ov]);
+            assert!(
+                r.files.is_empty() && r.edits.is_empty(),
+                "malformed index URL [{bad}] must write nothing: {:?}",
+                r.edits
+            );
+            assert!(
+                r.warnings
+                    .iter()
+                    .any(|w| w.code == "redirect_gem_invalid_index_url"),
+                "malformed index URL [{bad}] must warn: {:?}",
+                r.warnings
+            );
         }
     }
 
