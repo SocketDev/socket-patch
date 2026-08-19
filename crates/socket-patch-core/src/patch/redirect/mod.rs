@@ -5158,6 +5158,156 @@ mod tests {
             .any(|w| w.code == "redirect_yarn_berry_ambiguous_entry"));
     }
 
+    /// A `file:` lock entry carrying the `.socket/vendor/` signature is
+    /// socket-patch's OWN vendored wiring (a `scan --mode vendored` project
+    /// being converted to hosted). Refusing it under the generic
+    /// `redirect_yarn_berry_unsupported_protocol` code misdiagnosed it —
+    /// the detail hardcoded "(workspace:/patch:/portal:/link:)" (`file:`
+    /// was not even listed) and named no way out. The refusal itself is
+    /// correct (fail-closed, byte-identical), but it must carry a DISTINCT
+    /// code and the real per-package remediation: retire the vendored
+    /// wiring first (`socket-patch remove <purl>`; `vendor --revert`
+    /// unwinds EVERY vendored package), then re-run `scan --mode hosted`.
+    /// That remedy holds whether or not a vendored→hosted pre-revert ever
+    /// lands for npm-family — today no berry counterpart of the cargo
+    /// takeover exists, so manual retirement is the only path.
+    #[test]
+    fn yarn_berry_vendored_file_entry_refused_with_distinct_code_and_remediation() {
+        let checksum = format!("10c0/{}", "7".repeat(128));
+        let ovr = berry_override("minimist", "1.2.2", "http://p.test/minimist.tgz", &checksum);
+        let uuid = "80630680-4da6-45f9-bba8-b888e0ffd58c";
+        let entry = format!(
+            "minimist@file:./.socket/vendor/npm/{uuid}/minimist-1.2.2.tgz::\
+             locator=root%40workspace%3A."
+        );
+        let mut files = BTreeMap::new();
+        files.insert(
+            "yarn.lock".to_string(),
+            format!(
+                "# header\n\n__metadata:\n  version: 8\n  cacheKey: 10c0\n\n\
+                 \"{entry}\":\n  version: 1.2.2\n  resolution: \"{entry}\"\n  \
+                 checksum: 10c0/{}\n  languageName: node\n  linkType: hard\n",
+                "3".repeat(128)
+            ),
+        );
+        let mut r = RewriteResult::default();
+        rewrite_yarn_berry(&files, std::slice::from_ref(&ovr), &mut r);
+        assert!(
+            r.files.is_empty() && r.edits.is_empty(),
+            "vendored entry must stay byte-identical: {:?}",
+            r.files
+        );
+        let w = r
+            .warnings
+            .iter()
+            .find(|w| w.code == "redirect_yarn_berry_vendored_entry")
+            .unwrap_or_else(|| {
+                panic!(
+                    "a vendored file: entry must get the distinct vendored-entry \
+                     code, not the generic protocol refusal: {:?}",
+                    r.warnings
+                )
+            });
+        // Names the refused entry and the real remediation sequence.
+        assert!(w.detail.contains(&entry), "must name the entry: {}", w.detail);
+        assert!(
+            w.detail.contains("socket-patch remove"),
+            "must name the per-package remediation: {}",
+            w.detail
+        );
+        assert!(
+            w.detail.contains("vendor --revert"),
+            "must name (and scope) the mass-revert alternative: {}",
+            w.detail
+        );
+        assert!(
+            w.detail.contains("scan --mode hosted"),
+            "must name the re-run step: {}",
+            w.detail
+        );
+        // The old misdiagnosis must be gone: no four-protocol list that
+        // does not even include `file:`.
+        assert!(
+            !w.detail.contains("(workspace:/patch:/portal:/link:)"),
+            "must not misdiagnose the vendored entry with the generic \
+             protocol list: {}",
+            w.detail
+        );
+    }
+
+    /// The generic unsupported-protocol refusal must name the entry's
+    /// ACTUAL protocol (backticked), not a hardcoded four-item list that
+    /// omits, e.g., `file:` — an operator debugging the refusal needs the
+    /// real cause, and the old list actively misdirected for any protocol
+    /// outside it.
+    #[test]
+    fn yarn_berry_unsupported_protocol_detail_names_actual_protocol() {
+        let checksum = format!("10c0/{}", "7".repeat(128));
+        let ovr = berry_override("left-pad", "1.3.0", "http://p.test/lp.tgz", &checksum);
+        let lock_with = |entry: &str| {
+            format!(
+                "# header\n\n__metadata:\n  version: 8\n  cacheKey: 10c0\n\n\
+                 \"{entry}\":\n  version: 1.3.0\n  resolution: \"{entry}\"\n  \
+                 checksum: 10c0/{}\n  languageName: node\n  linkType: hard\n",
+                "3".repeat(128)
+            )
+        };
+
+        // A portal: entry → generic code, detail names `portal:`.
+        let mut files = BTreeMap::new();
+        files.insert(
+            "yarn.lock".to_string(),
+            lock_with("left-pad@portal:./vendor/left-pad::locator=root%40workspace%3A."),
+        );
+        let mut r = RewriteResult::default();
+        rewrite_yarn_berry(&files, std::slice::from_ref(&ovr), &mut r);
+        assert!(r.files.is_empty());
+        let w = r
+            .warnings
+            .iter()
+            .find(|w| w.code == "redirect_yarn_berry_unsupported_protocol")
+            .expect("portal: entry keeps the generic refusal code");
+        assert!(
+            w.detail.contains("`portal:`"),
+            "detail must name the actual protocol: {}",
+            w.detail
+        );
+
+        // A user's own file: entry OUTSIDE `.socket/vendor/` → still the
+        // generic code (not vendored-entry), detail names `file:`.
+        let mut files = BTreeMap::new();
+        files.insert(
+            "yarn.lock".to_string(),
+            lock_with("left-pad@file:./local/left-pad.tgz::locator=root%40workspace%3A."),
+        );
+        let mut r = RewriteResult::default();
+        rewrite_yarn_berry(&files, std::slice::from_ref(&ovr), &mut r);
+        assert!(r.files.is_empty());
+        let w = r
+            .warnings
+            .iter()
+            .find(|w| w.code == "redirect_yarn_berry_unsupported_protocol")
+            .unwrap_or_else(|| {
+                panic!(
+                    "a non-vendored file: entry keeps the generic refusal \
+                     code: {:?}",
+                    r.warnings
+                )
+            });
+        assert!(
+            w.detail.contains("`file:`"),
+            "detail must name the actual protocol: {}",
+            w.detail
+        );
+        assert!(
+            !r.warnings
+                .iter()
+                .any(|w| w.code == "redirect_yarn_berry_vendored_entry"),
+            "vendored-entry code is reserved for `.socket/vendor/` wiring: {:?}",
+            r.warnings
+        );
+    }
+
     /// Two-entry classic lock: a decoy entry FIRST, the target second — the
     /// shape that exposed the CRLF wrong-entry rewrite.
     fn classic_lock_two_entries() -> String {
