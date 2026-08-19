@@ -1533,6 +1533,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_remove_registration_rejects_traversal_in_recorded_dir() {
+        // A committed `.bundle/plugin/index` is attacker-authored input: it
+        // can record ANY path as the plugin's install dir. `..` components
+        // let `<plugin_root>/../../victim` pass a purely lexical
+        // `starts_with(plugin_root)` check while pointing outside the plugin
+        // root — such a dir must never be deleted. Bundler itself never
+        // records traversal paths, so rejecting them loses nothing.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let victim = root.join("victim");
+        fs::create_dir_all(&victim).await.unwrap();
+        write(&victim.join("precious.txt"), "do not delete\n").await;
+        // Lexically under the plugin root, physically the victim dir.
+        let evil = root.join(".bundle/plugin/../../victim");
+        assert!(
+            evil.starts_with(root.join(".bundle/plugin")),
+            "precondition: the traversal path passes the lexical prefix check"
+        );
+        write(
+            &root.join(".bundle/plugin/index"),
+            &format!(
+                "---\ncommands:\nhooks:\nload_paths:\n  socket-patch:\n  - \"{0}/.\"\n\
+                 plugin_paths:\n  socket-patch: \"{0}\"\nsources:\n",
+                evil.display()
+            ),
+        )
+        .await;
+        let r = remove_plugin_registration_at(root, None, false).await;
+        assert!(matches!(r, GemRegistrationCleanup::Cleaned { .. }), "{r:?}");
+        assert!(
+            victim.join("precious.txt").is_file(),
+            "a recorded dir with `..` traversal must never be deleted"
+        );
+    }
+
+    #[tokio::test]
     async fn test_add_appends_gitignore_line_to_unterminated_file() {
         // A .gitignore whose last line has no trailing newline must not have
         // our entry glued onto it ("vendor//gem-plugin-stamp" ignores nothing).
