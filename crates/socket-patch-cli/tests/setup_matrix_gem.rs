@@ -409,6 +409,125 @@ mod host_guard {
         );
     }
 
+    /// A Gemfile.lock pinning bundler 1.x, exactly as `bundle install` under
+    /// bundler 1.17.3 writes it (independent oracle for the version gate —
+    /// the lock probe works even where no `bundle` is on PATH).
+    const LOCK_1X: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    \
+                           colorize (1.1.0)\n\nPLATFORMS\n  ruby\n\nDEPENDENCIES\n  \
+                           colorize (= 1.1.0)\n\nBUNDLED WITH\n   1.17.3\n";
+
+    /// [P1 bundler floor — refuse side] Bundler 1.x cannot load the
+    /// `plugin ... path:` directive `setup` writes (Plugin::DSL undef's
+    /// `:path`; the 1.x plugin installer knows only git/rubygems sources), so
+    /// a wired project dies on EVERY later `bundle install` with exit 7
+    /// ("Could not find gem 'socket-patch' ...") before plugin registration —
+    /// an error that never names socket-patch (campaign-confirmed on
+    /// 1.17.3). `setup` must refuse to wire such a project, loudly, and leave
+    /// the Gemfile untouched so `bundle install` keeps working.
+    #[test]
+    fn gem_setup_refuses_bundler_1x_locked_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("Gemfile"), GEMFILE).unwrap();
+        std::fs::write(root.join("Gemfile.lock"), LOCK_1X).unwrap();
+        let root_s = root.to_str().unwrap();
+
+        let (code, out, err) = run(root, &["setup", "--cwd", root_s, "--yes", "--json"]);
+        assert_eq!(
+            code, 1,
+            "setup on a bundler-1.x-locked project must refuse (exit 1), not \
+             wire an install-breaking directive.\n{out}\n{err}"
+        );
+        let v = parse_json(&out, "setup (bundler 1.x)");
+        assert_eq!(
+            json_str(&v, "status", "setup (bundler 1.x)"),
+            "error",
+            "the refusal must be an error status:\n{v}"
+        );
+        // The refusal names the problem: the detected bundler and the floor.
+        let files = v.get("files").and_then(|f| f.as_array()).expect("files[]");
+        let gem_err = files
+            .iter()
+            .filter(|f| f.get("kind").and_then(|k| k.as_str()) == Some("gemfile"))
+            .find_map(|f| f.get("error").and_then(|e| e.as_str()))
+            .unwrap_or_else(|| panic!("no gemfile error entry in files[]:\n{v}"));
+        assert!(
+            gem_err.contains("1.17.3") && gem_err.contains("2.2"),
+            "the error must name the detected bundler and the >= 2.2 floor:\n{gem_err}"
+        );
+        // On disk: nothing was wired.
+        assert_eq!(
+            gemfile_body(root),
+            GEMFILE,
+            "the Gemfile must be byte-untouched after the refusal"
+        );
+        assert!(
+            !root.join(PLUGIN_DIR).exists(),
+            "no plugin dir may be generated for a refused project"
+        );
+    }
+
+    /// [P1 bundler floor — check side] The campaign's worst variant: a
+    /// project wired elsewhere (older CLI, or a machine with bundler >= 2.2)
+    /// whose lock pins bundler 1.x. Every `bundle install` fails with exit 7,
+    /// yet `setup --check` said "configured" — the CI gate the check exists
+    /// to be went green while installs were broken. `--check` must red-flag
+    /// the wired-but-unloadable state and name the remedy.
+    #[test]
+    fn gem_check_red_flags_wired_but_unloadable_bundler_1x() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("Gemfile"), GEMFILE).unwrap();
+        let root_s = root.to_str().unwrap();
+
+        // Wire for real with the actual CLI (no 1.x lock yet, so the host —
+        // bundler >= 2.2 or none — lets setup proceed) ...
+        let (code, out, err) = run(root, &["setup", "--cwd", root_s, "--yes", "--json"]);
+        assert_eq!(code, 0, "precondition: wiring must succeed.\n{out}\n{err}");
+        assert!(gemfile_body(root).contains(MANAGED_MARKER));
+
+        // ... then the 1.x lock arrives (clone of a legacy project / CI image
+        // downgrade). This is the state the campaign reproduced.
+        std::fs::write(root.join("Gemfile.lock"), LOCK_1X).unwrap();
+
+        let (code, out, err) = run(root, &["setup", "--check", "--cwd", root_s, "--json"]);
+        assert_eq!(
+            code, 1,
+            "check must FAIL on a wired project whose bundler cannot load the \
+             plugin — this exact state broke every `bundle install` while \
+             check reported configured.\n{out}\n{err}"
+        );
+        let v = parse_json(&out, "check (wired, bundler 1.x)");
+        assert_eq!(
+            json_str(&v, "status", "check (wired, bundler 1.x)"),
+            "error",
+            "the unloadable wiring is an error, not a plain needs_configuration:\n{v}"
+        );
+        let files = v.get("files").and_then(|f| f.as_array()).expect("files[]");
+        let gem_err = files
+            .iter()
+            .filter(|f| f.get("kind").and_then(|k| k.as_str()) == Some("gemfile"))
+            .find_map(|f| f.get("error").and_then(|e| e.as_str()))
+            .unwrap_or_else(|| panic!("no gemfile error entry in files[]:\n{v}"));
+        assert!(
+            gem_err.contains("1.17.3")
+                && gem_err.contains("2.2")
+                && gem_err.contains("--remove"),
+            "the check error must name the detected bundler, the floor, and \
+             the `setup --remove` recovery:\n{gem_err}"
+        );
+
+        // Recovery: `setup --remove` still un-wires (the gate must never
+        // block it), restoring the Gemfile byte-for-byte.
+        let (code, out, err) = run(
+            root,
+            &["setup", "--remove", "--cwd", root_s, "--yes", "--json"],
+        );
+        assert_eq!(code, 0, "recovery remove must work.\n{out}\n{err}");
+        assert_eq!(gemfile_body(root), GEMFILE, "Gemfile restored");
+        assert!(!root.join(PLUGIN_DIR).exists(), "plugin dir removed");
+    }
+
     /// `setup --remove` must clear bundler's machine-local plugin
     /// registration SURGICALLY: only the socket-patch entries leave the
     /// index; another plugin's registration (its hook subscriptions and
@@ -553,6 +672,145 @@ mod host_guard {
         assert!(
             !sub.join("Gemfile").exists(),
             "no Gemfile may be synthesized in the invocation subdir"
+        );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Bundler-1.17 docker leg for the >= 2.2 plugin floor.
+//
+// The host guards above pin the LOCK-probe path (`BUNDLED WITH 1.17.3`)
+// against the workspace binary; this leg drives a real bundler 1.17.3
+// toolchain (image: tests/docker/Dockerfile.gem-b1) end to end, covering the
+// `bundle --version` fallback path too, and proves the property the floor
+// exists for: after `setup` refuses, `bundle install` KEEPS WORKING. Before
+// the floor, setup wired `plugin 'socket-patch', path: ...` and bundler 1.17
+// (whose Plugin::DSL undef's `:path`) resolved it as an ordinary gem —
+// every later install exited 7 with an error that never named socket-patch
+// (campaign-confirmed).
+//
+// Soft-skips loudly when Docker / the image is absent, mirroring the
+// docker_e2e_* convention. NOTE: the leg runs the socket-patch binary BAKED
+// INTO the image — an image built before this fix still wires the project
+// and fails this leg deterministically; rebuild it (see the Dockerfile
+// header), or point SOCKET_PATCH_GEM_B1_IMAGE at a fresh uniquely-tagged
+// build.
+// ─────────────────────────────────────────────────────────────────────────
+mod bundler_floor_docker {
+    use std::process::Command;
+
+    fn image() -> String {
+        std::env::var("SOCKET_PATCH_GEM_B1_IMAGE")
+            .unwrap_or_else(|_| "socket-patch-test-gem-b1:latest".to_string())
+    }
+
+    /// Returns `true` when the leg should skip (docker or the image missing).
+    /// Prints a skip notice — Rust tests have no native "skipped" outcome.
+    /// Build locally with
+    /// `docker build -f tests/docker/Dockerfile.gem-b1 -t socket-patch-test-gem-b1:latest .`
+    #[must_use]
+    fn skip_if_no_image(image: &str) -> bool {
+        let Ok(out) = Command::new("docker")
+            .args(["image", "inspect", image])
+            .output()
+        else {
+            eprintln!("skipping: `docker` not on PATH");
+            return true;
+        };
+        if !out.status.success() {
+            eprintln!("skipping: docker image `{image}` not present");
+            return true;
+        }
+        false
+    }
+
+    /// The whole flow runs INSIDE the container (no bind mounts, no network):
+    /// scaffold → setup refuses (version fallback path, no lock yet) →
+    /// `bundle install` still works and writes the 1.17 lock → setup refuses
+    /// again (lock path) → `setup --check` red-flags. Host-side assertions
+    /// read the markers + JSON the script echoes.
+    #[test]
+    fn bundler_1x_setup_refuses_and_installs_keep_working() {
+        let image = image();
+        if skip_if_no_image(&image) {
+            return;
+        }
+        let script = r#"
+set -eu
+export SOCKET_NO_CONFIG=1 SOCKET_TELEMETRY_DISABLED=1
+mkdir -p /workspace/proj && cd /workspace/proj
+printf '# no dependencies\n' > Gemfile
+cp Gemfile /tmp/gemfile-pre
+
+# 1) No lock yet: the probe falls back to `bundle --version` (1.17.3).
+set +e
+socket-patch setup --yes --json --ecosystems gem > setup.json 2> setup.err
+rc=$?
+set -e
+echo "SETUP-RC=$rc"
+cat setup.json
+if grep -q 'socket-patch:managed' Gemfile; then echo 'WIRED-BUT-MUST-NOT'; exit 1; fi
+if [ -e .socket/bundler-plugin ]; then echo 'PLUGIN-DIR-BUT-MUST-NOT'; exit 1; fi
+cmp -s Gemfile /tmp/gemfile-pre && echo 'GEMFILE-UNTOUCHED'
+
+# 2) The refused project still installs (writes the 1.17 lock).
+bundle install > install.log 2>&1 || { echo 'INSTALL-BROKE'; cat install.log; exit 1; }
+echo 'INSTALL-OK'
+grep -q '1\.17\.3' Gemfile.lock && echo 'LOCK-1X'
+
+# 3) Lock present: the deterministic BUNDLED WITH path refuses too.
+set +e
+socket-patch setup --yes --json --ecosystems gem > setup2.json 2>&1
+rc2=$?
+set -e
+echo "SETUP2-RC=$rc2"
+
+# 4) check red-flags the unsupported state.
+set +e
+socket-patch setup --check --json --ecosystems gem > check.json 2>&1
+rc3=$?
+set -e
+echo "CHECK-RC=$rc3"
+cat check.json
+echo 'ALL-DONE'
+"#;
+        let out = Command::new("docker")
+            .args(["run", "--rm", "--network", "none", &image, "bash", "-c", script])
+            .output()
+            .expect("docker run");
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        let ctx = format!("stdout:\n{stdout}\nstderr:\n{stderr}");
+        assert!(
+            stdout.contains("ALL-DONE"),
+            "the in-container flow aborted early (a refused project whose \
+             `bundle install` breaks is the campaign defect).\n{ctx}"
+        );
+        assert!(
+            stdout.contains("SETUP-RC=1"),
+            "setup must refuse (exit 1) under bundler 1.17.3.\n{ctx}"
+        );
+        // The refusal names the detected bundler and the floor (setup.json is
+        // echoed into stdout).
+        assert!(
+            stdout.contains("1.17.3") && stdout.contains("2.2"),
+            "the refusal must name bundler 1.17.3 and the >= 2.2 floor.\n{ctx}"
+        );
+        assert!(
+            stdout.contains("GEMFILE-UNTOUCHED"),
+            "the Gemfile must be byte-untouched after the refusal.\n{ctx}"
+        );
+        assert!(
+            stdout.contains("INSTALL-OK") && stdout.contains("LOCK-1X"),
+            "`bundle install` must keep working after the refusal.\n{ctx}"
+        );
+        assert!(
+            stdout.contains("SETUP2-RC=1"),
+            "the lock-probe path must refuse as well.\n{ctx}"
+        );
+        assert!(
+            stdout.contains("CHECK-RC=1") && stdout.contains("\"status\": \"error\""),
+            "`setup --check` must red-flag the unsupported bundler.\n{ctx}"
         );
     }
 }

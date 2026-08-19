@@ -88,6 +88,37 @@ Debian 12's apt ruby). The gem suite runs against the default no-CHECKSUMS
 lock — the bundler >= 2.6 `lockfile_checksums` variant is a follow-up
 (see the TODO in `docker_e2e_vendor_gem.rs`).
 
+## Bundler-version matrix images (`Dockerfile.gem-b1`, `Dockerfile.gem-b4`)
+
+The plain `Dockerfile.gem` pins bundler `~> 2.7`. Two sibling images cover
+the ends of the bundler spectrum for the setup-matrix gem legs in
+`crates/socket-patch-cli/tests/setup_matrix_gem.rs`:
+
+- `Dockerfile.gem-b1` — ruby 3.1 + **bundler 1.17.3** (last 1.x). Drives the
+  bundler `>= 2.2` plugin floor: gem `setup` must refuse to wire a 1.x
+  project (bundler 1.x cannot load `plugin ... path:` directives) and
+  `bundle install` must keep working after the refusal.
+- `Dockerfile.gem-b4` — ruby 3.4 + **bundler ~> 4.0** (current major, bare
+  `bundle --version` output, CHECKSUMS locks by default).
+
+These images are NOT built in CI (the CI `setup-matrix` job drives
+`scripts/setup-matrix.sh` against the plain `gem` image only). Build them
+locally before running the gated legs:
+
+```sh
+docker build -f tests/docker/Dockerfile.base -t socket-patch-test-base:latest .
+docker build -f tests/docker/Dockerfile.gem-b1 -t socket-patch-test-gem-b1:latest .
+docker build -f tests/docker/Dockerfile.gem-b4 -t socket-patch-test-gem-b4:latest .
+cargo test -p socket-patch-cli --features setup-e2e --test setup_matrix_gem
+```
+
+The legs soft-skip (loudly) when Docker or the image is absent. Both
+Dockerfiles take a `BASE_IMAGE` build-arg so a binary under test can be baked
+in without overwriting the shared `:latest` tags; the test honors a
+`SOCKET_PATCH_GEM_B1_IMAGE` env var to point at such a uniquely-tagged image.
+NOTE: the legs run the binary BAKED INTO the image — rebuild base + image
+after changing setup code or they test a stale binary.
+
 ## Host mode (no Docker)
 
 Set `SOCKET_PATCH_TEST_HOST=1` to run the tests against host-installed

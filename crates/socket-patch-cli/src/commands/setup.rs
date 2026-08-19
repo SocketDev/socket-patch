@@ -825,12 +825,37 @@ async fn append_gem_check_entries(
         Some(p) => p,
         None => return false,
     };
+    // The bundler version floor (core `setup::gem::version`): bundler 1.x
+    // cannot load the `plugin ... path:` directive, so a WIRED project fails
+    // every `bundle install` (exit 7, an error that never names socket-patch)
+    // — the campaign-confirmed state where `--check` kept saying "configured"
+    // while the CI gate it exists to be went green over broken installs. Both
+    // wired and unwired unsupported projects are red-flagged as errors: setup
+    // itself refuses to wire below the floor, so "needs_configuration" (run
+    // `setup` to fix) would point at a command that cannot help.
+    let probe = gem::probe_bundler(&project).await;
     let (state, err) = match tokio::fs::read_to_string(&project.gemfile).await {
         Ok(content) => {
-            if gem::is_plugin_directive_present(&content) {
-                (CheckState::Configured, None)
-            } else {
-                (CheckState::NeedsConfiguration, None)
+            let wired = gem::is_plugin_directive_present(&content);
+            match (&probe, wired) {
+                (gem::BundlerProbe::Unsupported { version, source }, true) => (
+                    CheckState::Error,
+                    Some(format!(
+                        "the wired socket-patch plugin cannot load under bundler \
+                         {version} (from {source}; needs >= {}.{}): every `bundle \
+                         install` fails resolving 'socket-patch' as an ordinary gem \
+                         (exit 7) before the plugin registers. Run `socket-patch \
+                         setup --remove` to unwire, or upgrade bundler",
+                        gem::MIN_BUNDLER.0,
+                        gem::MIN_BUNDLER.1
+                    )),
+                ),
+                (gem::BundlerProbe::Unsupported { version, source }, false) => (
+                    CheckState::Error,
+                    Some(gem::unsupported_bundler_message(version, source)),
+                ),
+                (_, true) => (CheckState::Configured, None),
+                (_, false) => (CheckState::NeedsConfiguration, None),
             }
         }
         Err(e) => (CheckState::Error, Some(e.to_string())),
