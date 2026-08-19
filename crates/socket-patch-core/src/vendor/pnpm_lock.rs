@@ -3976,10 +3976,22 @@ snapshots:
         );
         // Non-drifted fragments still restored.
         assert!(after.contains("  left-pad@1.3.0:\n    resolution: {integrity: sha512-XI5MPzVN"));
-        assert!(!fx
-            .root()
-            .join(format!(".socket/vendor/npm/{UUID}"))
-            .exists());
+        // Residual #131: a drift-skip keeps the artifact dir (the drifted
+        // fragment's recorded original may still be needed later) and says so.
+        assert!(
+            fx.root()
+                .join(format!(".socket/vendor/npm/{UUID}"))
+                .exists(),
+            "drift-skip must keep the artifact dir"
+        );
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_artifact_kept"),
+            "the keep must be surfaced: {:?}",
+            outcome.warnings
+        );
     }
 
     #[tokio::test]

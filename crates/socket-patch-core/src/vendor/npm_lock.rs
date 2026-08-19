@@ -2007,10 +2007,22 @@ mod tests {
             default_lock()["packages"]["node_modules/foo/node_modules/left-pad"],
             "non-drifted instance restored"
         );
-        assert!(!fx
-            .root()
-            .join(format!(".socket/vendor/npm/{UUID}"))
-            .exists());
+        // Residual #131: a drift-skip keeps the artifact dir (the drifted
+        // entry's recorded original may still be needed later) and says so.
+        assert!(
+            fx.root()
+                .join(format!(".socket/vendor/npm/{UUID}"))
+                .exists(),
+            "drift-skip must keep the artifact dir"
+        );
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_artifact_kept"),
+            "the keep must be surfaced: {:?}",
+            outcome.warnings
+        );
     }
 
     #[tokio::test]

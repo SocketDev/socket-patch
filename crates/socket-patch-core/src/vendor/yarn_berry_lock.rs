@@ -1709,7 +1709,9 @@ __metadata:
             outcome.warnings
         );
         // The drifted lock entry stays; the (still-ours) resolutions entry
-        // was removed; the artifact is gone.
+        // was removed; the artifact is KEPT (residual #131: the drifted
+        // entry's recorded original may still be needed later) and the keep
+        // is surfaced.
         let after = tokio::fs::read_to_string(fx.lock_path()).await.unwrap();
         assert!(
             after.contains("left-pad@file:")
@@ -1719,7 +1721,15 @@ __metadata:
         let pkg: Value =
             serde_json::from_slice(&tokio::fs::read(fx.pkg_path()).await.unwrap()).unwrap();
         assert!(pkg.get("resolutions").is_none());
-        assert!(!fx.tgz_path().exists());
+        assert!(fx.tgz_path().exists(), "drift-skip must keep the artifact");
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_artifact_kept"),
+            "the keep must be surfaced: {:?}",
+            outcome.warnings
+        );
 
         // Manifest drift: the user repointed the resolutions entry.
         let fx = fixture().await;
@@ -1757,6 +1767,8 @@ __metadata:
             tokio::fs::read(fx.lock_path()).await.unwrap(),
             fx.lock_bytes
         );
+        // The manifest drift-skip keeps the artifact too (residual #131).
+        assert!(fx.tgz_path().exists(), "drift-skip must keep the artifact");
     }
 
     #[tokio::test]

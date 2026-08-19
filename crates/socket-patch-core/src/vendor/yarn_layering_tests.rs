@@ -14,9 +14,9 @@
 //!    actual vendored blob bytes (the chain the forensics verified 48/48);
 //! 3. hosted-over-vendored layering records the vendored blocks as its
 //!    `original`s (data-level reversibility) — and `vendor --revert` after
-//!    that overlay is CURRENTLY drift-skipped and lossy (blob deleted, lock
-//!    left hosted, exit success): pinned here so a future hosted `--revert`
-//!    must contend with these semantics deliberately;
+//!    that overlay is drift-skipped AND keeps the blob dir + surfaces the
+//!    keep (residual #131 fixed: deleting the blob while the lock stayed
+//!    hosted stranded the redirect ledger's recorded `original`s);
 //! 4. yarn berry locks containing builtin `patch:` resolution entries pass
 //!    through both the vendor backend and the hosted redirect rewriter with
 //!    those entries byte-identical — even when the redirected package IS the
@@ -487,26 +487,28 @@ async fn classic_hosted_redirect_layers_over_vendored_wiring() {
     assert!(again.edits.is_empty(), "{:?}", again.edits);
 }
 
-/// Incident guard 3, reverse direction — PINS CURRENT (lossy) BEHAVIOR:
-/// `vendor --revert` after a hosted overlay finds every block re-resolved
-/// (the hosted URL fails the `.socket/vendor/npm/<uuid>` ownership gate),
-/// warns `vendor_lock_entry_drifted`, leaves the lock byte-identical at the
-/// hosted URLs — yet still DELETES the blob dir and reports success. If a
-/// hosted --revert ships later and restores its recorded originals (the
-/// vendored `file:` blocks), the lock would point at blobs this path already
-/// deleted. A deliberate behavior change here should update this test.
+/// Incident guard 3, reverse direction — the drift-skip KEEP contract
+/// (residual #131, fixed): `vendor --revert` after a hosted overlay finds
+/// every block re-resolved (the hosted URL fails the
+/// `.socket/vendor/npm/<uuid>` ownership gate), warns
+/// `vendor_lock_entry_drifted`, leaves the lock byte-identical at the
+/// hosted URLs — and KEEPS the blob dir, surfacing the keep honestly
+/// (`vendor_artifact_kept`). The blob is the only surviving copy of what
+/// the redirect ledger's recorded `original` (`file:` fragment) points at:
+/// deleting it while claiming success planted a dangling replay hazard and
+/// destroyed the pre-vendor originals a later restore needs.
 ///
-/// RED-verified: asserting the lock was restored (registry URLs) fails;
-/// asserting the blob survives fails.
+/// This test previously PINNED the lossy behavior (blob deleted); it was
+/// flipped when the drift-skip keep shipped.
 #[tokio::test]
-async fn classic_vendor_revert_after_hosted_overlay_is_drift_skipped_and_lossy() {
+async fn classic_vendor_revert_after_hosted_overlay_is_drift_skipped_and_keeps_blob() {
     let fx = classic_fx(CLASSIC_BEFORE);
     let entry = expect_done(fx.vendor().await).unwrap();
     let vendored_text = fx.lock_text();
 
     // Layer the hosted redirect over the vendored lock, on disk.
     let mut files = BTreeMap::new();
-    files.insert("yarn.lock".to_string(), vendored_text);
+    files.insert("yarn.lock".to_string(), vendored_text.clone());
     let result = rewrite_registry_redirect(&files, &[hosted_override()]);
     let hosted_text = result.files.get("yarn.lock").unwrap().clone();
     std::fs::write(fx.lock_path(), hosted_text.as_bytes()).unwrap();
@@ -514,7 +516,7 @@ async fn classic_vendor_revert_after_hosted_overlay_is_drift_skipped_and_lossy()
 
     let outcome: RevertOutcome = revert_yarn_classic(&entry, fx.root(), false).await;
 
-    // CURRENT semantics, all four legs deliberate:
+    // The contract, all five legs deliberate:
     // 1. warning-only success (exit 0 at the CLI layer);
     assert!(outcome.success, "{:?}", outcome.error);
     // 2. per-block drift warning naming the key;
@@ -535,12 +537,40 @@ async fn classic_vendor_revert_after_hosted_overlay_is_drift_skipped_and_lossy()
         hosted_text,
         "drift-skip must leave the hosted lock untouched"
     );
-    // 4. the blob dir is deleted anyway — the lossy half.
+    // 4. the blob dir SURVIVES — "left alone" now holds end-to-end.
+    assert!(
+        fx.tgz_path().exists(),
+        "drift-skip must keep the blob: it is the only copy the redirect \
+         ledger's recorded `original` still points at"
+    );
+    // 5. the keep is surfaced honestly, so the caller (CLI) knows to keep
+    //    the ledger entry too instead of pruning it.
+    assert!(
+        outcome
+            .warnings
+            .iter()
+            .any(|w| w.code == "vendor_artifact_kept"),
+        "keeping the artifact must be surfaced as a warning: {:?}",
+        outcome.warnings
+    );
+
+    // Recovery path: once the drift is undone (the vendored lock is
+    // restored — e.g. a hosted revert replayed its recorded originals),
+    // a second `vendor --revert` completes fully: lock back to the
+    // registry blocks, blob dir gone.
+    std::fs::write(fx.lock_path(), vendored_text.as_bytes()).unwrap();
+    let outcome: RevertOutcome = revert_yarn_classic(&entry, fx.root(), false).await;
+    assert!(outcome.success, "{:?}", outcome.error);
+    assert_eq!(
+        fx.lock_text(),
+        CLASSIC_BEFORE,
+        "after the drift is undone, revert restores the pre-vendor lock"
+    );
     assert!(
         !fx.root()
             .join(format!(".socket/vendor/npm/{UUID}"))
             .exists(),
-        "current behavior deletes the artifact dir even when every block drifted"
+        "the completed revert removes the artifact dir"
     );
 }
 

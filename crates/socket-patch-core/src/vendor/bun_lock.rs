@@ -1348,11 +1348,21 @@ mod tests {
             fx.read_lock().await.contains(drifted_line),
             "drifted entry left alone"
         );
+        // Residual #131: a drift-skip keeps the artifact dir (the drifted
+        // entry's recorded original may still be needed later) and says so.
         assert!(
-            !fx.root()
+            fx.root()
                 .join(format!(".socket/vendor/npm/{UUID}"))
                 .exists(),
-            "artifact still removed"
+            "drift-skip must keep the artifact dir"
+        );
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_artifact_kept"),
+            "the keep must be surfaced: {:?}",
+            outcome.warnings
         );
     }
 

@@ -1414,10 +1414,22 @@ left-pad@^1.3.0:
             after.contains("left-pad@^1.3.0, left-pad@~1.3.0:\n  version \"1.3.0\"\n  resolved \"https://registry.yarnpkg.com/"),
             "non-drifted block restored: {after}"
         );
-        assert!(!fx
-            .root()
-            .join(format!(".socket/vendor/npm/{UUID}"))
-            .exists());
+        // Residual #131: a drift-skip keeps the artifact dir (the drifted
+        // block's recorded original may still be needed later) and says so.
+        assert!(
+            fx.root()
+                .join(format!(".socket/vendor/npm/{UUID}"))
+                .exists(),
+            "drift-skip must keep the artifact dir"
+        );
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_artifact_kept"),
+            "the keep must be surfaced: {:?}",
+            outcome.warnings
+        );
     }
 
     #[tokio::test]
