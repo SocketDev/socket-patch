@@ -321,19 +321,19 @@ async fn pnpm_transitive_only_dep_apply_patches_virtual_store() {
         return;
     }
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("create tempdir");
     let store = tmp.path().join("store");
 
     let stage_project = |name: &str| -> std::path::PathBuf {
         let proj = tmp.path().join(name);
-        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::create_dir_all(&proj).expect("create project dir");
         std::fs::write(
             proj.join("package.json"),
             format!(
                 r#"{{ "name": "{name}", "version": "0.0.0", "dependencies": {{ "mkdirp": "0.5.5" }} }}"#
             ),
         )
-        .unwrap();
+        .expect("write package.json");
         proj
     };
     let proj_a = stage_project("pnpm-iso-a");
@@ -391,8 +391,10 @@ async fn pnpm_transitive_only_dep_apply_patches_virtual_store() {
         minimist_a.components().any(|c| c.as_os_str() == ".pnpm"),
         "premise: minimist's canonical home must be inside the virtual store: {minimist_a:?}"
     );
-    let meta: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(minimist_a.join("package.json")).unwrap()).unwrap();
+    let meta: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(minimist_a.join("package.json")).expect("read minimist package.json"),
+    )
+    .expect("parse minimist package.json");
     let version = meta["version"].as_str().expect("version field").to_string();
 
     let target = minimist_a.join("index.js");
@@ -405,7 +407,7 @@ async fn pnpm_transitive_only_dep_apply_patches_virtual_store() {
     // The sibling project's canonical copy of the same file.
     let target_b = locate(&proj_b).join("index.js");
     assert_eq!(
-        std::fs::read(&target_b).unwrap(),
+        std::fs::read(&target_b).expect("read sibling copy"),
         original,
         "both projects must start from identical store-imported bytes"
     );
@@ -413,8 +415,12 @@ async fn pnpm_transitive_only_dep_apply_patches_virtual_store() {
     {
         use std::os::unix::fs::MetadataExt;
         assert_eq!(
-            std::fs::metadata(&target).unwrap().ino(),
-            std::fs::metadata(&target_b).unwrap().ino(),
+            std::fs::metadata(&target)
+                .expect("stat project A copy")
+                .ino(),
+            std::fs::metadata(&target_b)
+                .expect("stat project B copy")
+                .ino(),
             "hardlink-import premise: both projects' copies must share the store inode"
         );
     }
@@ -427,8 +433,8 @@ async fn pnpm_transitive_only_dep_apply_patches_virtual_store() {
         &after_hash,
     );
     let blobs = socket.join("blobs");
-    std::fs::create_dir_all(&blobs).unwrap();
-    std::fs::write(blobs.join(&after_hash), &patched).unwrap();
+    std::fs::create_dir_all(&blobs).expect("create blobs dir");
+    std::fs::write(blobs.join(&after_hash), &patched).expect("write patch blob");
 
     let code = apply_run(default_apply(&proj_a)).await;
     assert_eq!(
@@ -439,7 +445,7 @@ async fn pnpm_transitive_only_dep_apply_patches_virtual_store() {
 
     // CoW safety: the sibling project sharing the store is untouched, and
     // the patched file no longer shares the store inode.
-    let after_b = std::fs::read(&target_b).unwrap();
+    let after_b = std::fs::read(&target_b).expect("read sibling copy");
     assert_eq!(
         git_sha256(&after_b),
         before_hash,
@@ -449,8 +455,12 @@ async fn pnpm_transitive_only_dep_apply_patches_virtual_store() {
     {
         use std::os::unix::fs::MetadataExt;
         assert_ne!(
-            std::fs::metadata(&target).unwrap().ino(),
-            std::fs::metadata(&target_b).unwrap().ino(),
+            std::fs::metadata(&target)
+                .expect("stat project A copy")
+                .ino(),
+            std::fs::metadata(&target_b)
+                .expect("stat project B copy")
+                .ino(),
             "apply must break the hardlink (CoW) instead of writing through the store inode"
         );
     }
@@ -478,19 +488,19 @@ async fn pnpm4_nested_store_transitive_only_dep_apply_patches_file() {
         return;
     }
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("create tempdir");
     let store = tmp.path().join("store");
 
     let stage_project = |name: &str| -> std::path::PathBuf {
         let proj = tmp.path().join(name);
-        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::create_dir_all(&proj).expect("create project dir");
         std::fs::write(
             proj.join("package.json"),
             format!(
                 r#"{{ "name": "{name}", "version": "0.0.0", "dependencies": {{ "mkdirp": "0.5.5" }} }}"#
             ),
         )
-        .unwrap();
+        .expect("write package.json");
         proj
     };
     let proj_a = stage_project("pnpm4-nested-a");
@@ -557,8 +567,10 @@ async fn pnpm4_nested_store_transitive_only_dep_apply_patches_file() {
             .any(|c| c.as_os_str() == "registry.npmjs.org"),
         "premise: minimist's canonical home must be inside the NESTED store: {minimist_a:?}"
     );
-    let meta: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(minimist_a.join("package.json")).unwrap()).unwrap();
+    let meta: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(minimist_a.join("package.json")).expect("read minimist package.json"),
+    )
+    .expect("parse minimist package.json");
     let version = meta["version"].as_str().expect("version field").to_string();
 
     let target = minimist_a.join("index.js");
@@ -571,7 +583,7 @@ async fn pnpm4_nested_store_transitive_only_dep_apply_patches_file() {
     // The sibling project's canonical copy of the same file.
     let target_b = locate(&proj_b).join("index.js");
     assert_eq!(
-        std::fs::read(&target_b).unwrap(),
+        std::fs::read(&target_b).expect("read sibling copy"),
         original,
         "both projects must start from identical store-imported bytes"
     );
@@ -579,8 +591,12 @@ async fn pnpm4_nested_store_transitive_only_dep_apply_patches_file() {
     {
         use std::os::unix::fs::MetadataExt;
         assert_eq!(
-            std::fs::metadata(&target).unwrap().ino(),
-            std::fs::metadata(&target_b).unwrap().ino(),
+            std::fs::metadata(&target)
+                .expect("stat project A copy")
+                .ino(),
+            std::fs::metadata(&target_b)
+                .expect("stat project B copy")
+                .ino(),
             "hardlink-import premise: both projects' copies must share the store inode"
         );
     }
@@ -593,8 +609,8 @@ async fn pnpm4_nested_store_transitive_only_dep_apply_patches_file() {
         &after_hash,
     );
     let blobs = socket.join("blobs");
-    std::fs::create_dir_all(&blobs).unwrap();
-    std::fs::write(blobs.join(&after_hash), &patched).unwrap();
+    std::fs::create_dir_all(&blobs).expect("create blobs dir");
+    std::fs::write(blobs.join(&after_hash), &patched).expect("write patch blob");
 
     let code = apply_run(default_apply(&proj_a)).await;
     assert_eq!(
@@ -606,7 +622,7 @@ async fn pnpm4_nested_store_transitive_only_dep_apply_patches_file() {
 
     // CoW safety: the sibling project sharing the store is untouched, and
     // the patched file no longer shares the store inode.
-    let after_b = std::fs::read(&target_b).unwrap();
+    let after_b = std::fs::read(&target_b).expect("read sibling copy");
     assert_eq!(
         git_sha256(&after_b),
         before_hash,
@@ -616,8 +632,12 @@ async fn pnpm4_nested_store_transitive_only_dep_apply_patches_file() {
     {
         use std::os::unix::fs::MetadataExt;
         assert_ne!(
-            std::fs::metadata(&target).unwrap().ino(),
-            std::fs::metadata(&target_b).unwrap().ino(),
+            std::fs::metadata(&target)
+                .expect("stat project A copy")
+                .ino(),
+            std::fs::metadata(&target_b)
+                .expect("stat project B copy")
+                .ino(),
             "apply must break the hardlink (CoW) instead of writing through the store inode"
         );
     }
