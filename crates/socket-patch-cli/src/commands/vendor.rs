@@ -920,10 +920,11 @@ pub(crate) async fn vendor_records(
     // it still claims must revert the hosted edits FIRST (see the hook in the
     // dispatch loop below). Loaded once; mutated + persisted per reverted
     // purl. A MALFORMED ledger is held as the hard error it is: this loop
-    // WRITES the ledger for cargo takeovers, and with its records unreadable
-    // a claimed purl is indistinguishable from an unclaimed one — so every
-    // cargo purl fails closed with the corruption surfaced (non-cargo purls
-    // never touch the redirect ledger here and proceed).
+    // WRITES the ledger for takeovers, and with its records unreadable a
+    // claimed purl is indistinguishable from an unclaimed one — so every
+    // purl of a takeover-capable ecosystem (cargo, npm) fails closed with
+    // the corruption surfaced (other purls never touch the redirect ledger
+    // here and proceed).
     let (mut redirect_ledger, redirect_ledger_corrupt) =
         match socket_patch_core::patch::redirect::load_redirect_state(&common.cwd).await {
             Ok(state) => (state, None),
@@ -979,18 +980,24 @@ pub(crate) async fn vendor_records(
             }
             matched.insert(candidate.clone());
 
-            // Cross-mode takeover (cargo): vendoring over a LIVE hosted
-            // redirect must first revert the hosted edits from the redirect
-            // ledger — `[patch.crates-io]` only patches crates-io-sourced
+            // Cross-mode takeover: vendoring over a LIVE hosted redirect
+            // must first revert the hosted edits from the redirect ledger.
+            // Cargo: `[patch.crates-io]` only patches crates-io-sourced
             // deps, so vendoring on top of the `registry = "socket-patch-…"`
             // pin leaves the project unbuildable in BOTH modes while this
-            // run reports success — and the pre-revert also hands the vendor
-            // detach the PRISTINE crates.io lock fragment to record as the
-            // ledger's unrecoverable originals (not the hosted values). A
-            // purl whose hosted edits cannot be cleanly reverted is REFUSED;
-            // the backend's own fail-closed guard (`hosted_redirect_live`)
+            // run reports success. npm family: the vendor rewire happens to
+            // succeed either way, but without the pre-revert the vendor
+            // ledger records the grant-tokenized HOSTED lock fragment as its
+            // unrecoverable pre-vendor original (so `vendor --revert` lands
+            // back on an expiring hosted URL with no CLI path to registry
+            // state) and the superseded redirect records/edits survive
+            // forever as a stale-ledger replay hazard. In every ecosystem
+            // the pre-revert hands the vendor detach the PRISTINE registry
+            // lock fragment to record as the ledger's originals. A purl
+            // whose hosted edits cannot be cleanly reverted is REFUSED; the
+            // cargo backend's own fail-closed guard (`hosted_redirect_live`)
             // backstops states with no usable ledger at all.
-            if candidate.starts_with("pkg:cargo/") {
+            if socket_patch_core::patch::redirect::redirect_revert_supported(candidate) {
                 if let Some(corrupt) = &redirect_ledger_corrupt {
                     has_errors = true;
                     env.record(
@@ -1028,7 +1035,7 @@ pub(crate) async fn vendor_records(
                     );
                 } else if claimed {
                     let ledger = redirect_ledger.as_mut().expect("claimed implies Some");
-                    match socket_patch_core::patch::redirect::revert_cargo_redirect_purl(
+                    match socket_patch_core::patch::redirect::revert_redirect_purl(
                         &common.cwd,
                         ledger,
                         candidate,
@@ -1060,17 +1067,22 @@ pub(crate) async fn vendor_records(
                                 );
                                 continue;
                             }
+                            let reverted_what = if candidate.starts_with("pkg:cargo/") {
+                                "the hosted edits (Cargo.toml registry pin, Cargo.lock \
+                                 source/checksum, registries block)"
+                            } else {
+                                "the hosted lockfile edits back to their pre-redirect \
+                                 registry values"
+                            };
                             record_warning(
                                 env,
                                 candidate,
                                 &VendorWarning::new(
                                     "vendor_takeover_reverted_redirect",
                                     format!(
-                                        "{} was hosted-redirected; reverted the hosted \
-                                         edits (Cargo.toml registry pin, Cargo.lock \
-                                         source/checksum, registries block) and dropped \
-                                         the redirect-ledger record before vendoring \
-                                         (mode takeover)",
+                                        "{} was hosted-redirected; reverted {reverted_what} \
+                                         and dropped the redirect-ledger record before \
+                                         vendoring (mode takeover)",
                                         normalize_purl(candidate)
                                     ),
                                 ),

@@ -531,12 +531,22 @@ fn assert_pure_vendored_and_round_trip(
 
     // (a) The vendor ledger's recorded lock originals are the PRISTINE
     // registry fragments — the only offline-recoverable home of the registry
-    // resolution — not the grant-tokenized hosted values.
+    // resolution — not the grant-tokenized hosted values. Classic locks
+    // resolve to the registry URL; berry locks to the bare
+    // `name@npm:<version>` resolution (no URL).
     let state = read(proj, ".socket/vendor/state.json");
-    assert!(
-        state.contains("registry.yarnpkg.com") || state.contains("registry.npmjs.org"),
-        "the vendor ledger must record the registry originals ({tag}): {state}"
-    );
+    if berry {
+        assert!(
+            state.contains(&format!("resolution: \\\"{DEP}@npm:{DEP_VERSION}\\\"")),
+            "the vendor ledger must record the registry (npm:) original \
+             resolution ({tag}): {state}"
+        );
+    } else {
+        assert!(
+            state.contains("registry.yarnpkg.com") || state.contains("registry.npmjs.org"),
+            "the vendor ledger must record the registry originals ({tag}): {state}"
+        );
+    }
     assert!(
         !state.contains("/patch/npm/") && !state.contains("__archiveUrl"),
         "the vendor ledger must NOT record the hosted fragment as its \
@@ -579,7 +589,13 @@ fn assert_pure_vendored_and_round_trip(
     // path back to registry state).
     let (code, stdout, stderr) = run_socket(
         proj,
-        &["vendor", "--revert", "--json", "--cwd", proj.to_str().unwrap()],
+        &[
+            "vendor",
+            "--revert",
+            "--json",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
     );
     assert_eq!(code, 0, "revert failed ({tag}): {stdout}\n{stderr}");
     assert_eq!(
@@ -617,21 +633,14 @@ async fn classic_hosted_then_vendored_takeover_round_trips_to_registry() {
 
     // A: hosted redirect.
     let tgz_path = fx.tmp.path().join("patched.tgz");
-    build_patched_tgz(
-        &proj.join("node_modules").join(DEP),
-        &fx.patched,
-        &tgz_path,
-    );
+    build_patched_tgz(&proj.join("node_modules").join(DEP), &fx.patched, &tgz_path);
     let tgz = std::fs::read(&tgz_path).unwrap();
     let server = MockServer::start().await;
     let hosted_url = mount_hosted_mocks(&server, &tgz, &fx.orig, &fx.patched, None).await;
     let (code, stdout, stderr) = run_hosted_scan(&proj, &server.uri());
     assert_eq!(code, 0, "hosted scan failed: {stdout}\n{stderr}");
     let lock = read(&proj, "yarn.lock");
-    assert!(
-        lock.contains(&hosted_url),
-        "hosted wiring present:\n{lock}"
-    );
+    assert!(lock.contains(&hosted_url), "hosted wiring present:\n{lock}");
     assert!(
         proj.join(".socket/vendor/redirect-state.json").exists(),
         "hosted ledger written"
@@ -641,7 +650,13 @@ async fn classic_hosted_then_vendored_takeover_round_trips_to_registry() {
     stage_patch(&proj, &fx.orig, &fx.patched);
     let (code, stdout, stderr) = run_socket(
         &proj,
-        &["vendor", "--json", "--offline", "--cwd", proj.to_str().unwrap()],
+        &[
+            "vendor",
+            "--json",
+            "--offline",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
     );
     assert_eq!(code, 0, "vendor failed: {stdout}\n{stderr}");
     let envelope: serde_json::Value = serde_json::from_str(&stdout).expect("json envelope");
@@ -671,11 +686,7 @@ async fn berry_hosted_then_vendored_takeover_round_trips_to_registry() {
 
     // A: hosted redirect (berry needs the bootstrap-resolved 10c0 checksum).
     let tgz_path = fx.tmp.path().join("patched.tgz");
-    build_patched_tgz(
-        &proj.join("node_modules").join(DEP),
-        &fx.patched,
-        &tgz_path,
-    );
+    build_patched_tgz(&proj.join("node_modules").join(DEP), &fx.patched, &tgz_path);
     let tgz = std::fs::read(&tgz_path).unwrap();
     let Some(checksum) = bootstrap_berry_checksum(fx.tmp.path(), &tgz_path) else {
         return;
@@ -695,7 +706,13 @@ async fn berry_hosted_then_vendored_takeover_round_trips_to_registry() {
     stage_patch(&proj, &fx.orig, &fx.patched);
     let (code, stdout, stderr) = run_socket(
         &proj,
-        &["vendor", "--json", "--offline", "--cwd", proj.to_str().unwrap()],
+        &[
+            "vendor",
+            "--json",
+            "--offline",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
     );
     assert_eq!(code, 0, "vendor failed: {stdout}\n{stderr}");
     let envelope: serde_json::Value = serde_json::from_str(&stdout).expect("json envelope");
@@ -729,7 +746,13 @@ async fn classic_vendored_then_hosted_takeover_leaves_pure_hosted() {
     stage_patch(&proj, &fx.orig, &fx.patched);
     let (code, stdout, stderr) = run_socket(
         &proj,
-        &["vendor", "--json", "--offline", "--cwd", proj.to_str().unwrap()],
+        &[
+            "vendor",
+            "--json",
+            "--offline",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
     );
     assert_eq!(code, 0, "vendor failed: {stdout}\n{stderr}");
     assert!(
@@ -739,11 +762,7 @@ async fn classic_vendored_then_hosted_takeover_leaves_pure_hosted() {
 
     // B: hosted redirect over the vendored state — the takeover.
     let tgz_path = fx.tmp.path().join("patched.tgz");
-    build_patched_tgz(
-        &proj.join("node_modules").join(DEP),
-        &fx.patched,
-        &tgz_path,
-    );
+    build_patched_tgz(&proj.join("node_modules").join(DEP), &fx.patched, &tgz_path);
     let tgz = std::fs::read(&tgz_path).unwrap();
     let server = MockServer::start().await;
     let hosted_url = mount_hosted_mocks(&server, &tgz, &fx.orig, &fx.patched, None).await;
@@ -769,10 +788,7 @@ async fn classic_vendored_then_hosted_takeover_leaves_pure_hosted() {
         "the orphaned committed artifact must be removed"
     );
     let lock = read(&proj, "yarn.lock");
-    assert!(
-        lock.contains(&hosted_url),
-        "lock points hosted:\n{lock}"
-    );
+    assert!(lock.contains(&hosted_url), "lock points hosted:\n{lock}");
     assert!(
         !lock.contains(".socket/vendor/"),
         "no vendored residue in the lock:\n{lock}"
