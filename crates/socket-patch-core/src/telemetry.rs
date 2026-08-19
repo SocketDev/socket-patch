@@ -4,7 +4,9 @@ use once_cell::sync::Lazy;
 use uuid::Uuid;
 
 use crate::constants::USER_AGENT;
-use crate::utils::env_compat::{is_debug_enabled, proxy_url_from_env, read_env_with_legacy};
+use crate::utils::env_compat::{
+    is_debug_enabled, is_offline_env, proxy_url_from_env, read_env_with_legacy,
+};
 use crate::utils::fs::home_dir;
 use crate::vex::time::unix_to_ymdhms;
 
@@ -135,11 +137,7 @@ pub fn is_telemetry_disabled() -> bool {
     .unwrap_or_default();
     let disabled_via_env = matches!(env_value.as_str(), "1" | "true");
     let vitest = std::env::var("VITEST").unwrap_or_default() == "true";
-    let offline = matches!(
-        std::env::var("SOCKET_OFFLINE").unwrap_or_default().as_str(),
-        "1" | "true"
-    );
-    disabled_via_env || vitest || offline
+    disabled_via_env || vitest || is_offline_env()
 }
 
 /// Log debug messages when debug mode is enabled.

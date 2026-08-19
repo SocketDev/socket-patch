@@ -481,6 +481,150 @@ fn apply_silent_vex_failure_keeps_error_output() {
     );
 }
 
+/// Failed-run hygiene: a `--vex` failure must remove a PRIOR run's OpenVEX
+/// document parked at the output path. Attestation semantics demand it — a
+/// pipeline reusing one path (`apply --vex out.json` on every CI run) must
+/// not ship yesterday's `not_affected` doc for a tree this run could no
+/// longer attest. Same `product_undetected` fixture as
+/// `apply_vex_failure_flips_exit_code`, plus a pre-seeded stale doc.
+#[test]
+fn apply_vex_failure_removes_stale_openvex_doc() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path();
+    seed_offline_apply(cwd);
+    let vex_path = cwd.join("apply.vex.json");
+    std::fs::write(
+        &vex_path,
+        r#"{"@context":"https://openvex.dev/ns/v0.2.0","@id":"urn:uuid:stale","author":"Socket","timestamp":"2020-01-01T00:00:00Z","version":1,"statements":[]}"#,
+    )
+    .unwrap();
+
+    let out = cli()
+        .args([
+            "apply",
+            "--cwd",
+            cwd.to_str().unwrap(),
+            "--offline",
+            "--json",
+            "--vex",
+            vex_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("invoke apply");
+    assert!(!out.status.success(), "VEX failure must flip the exit code");
+    let env: Value = serde_json::from_slice(&out.stdout).expect("apply envelope JSON");
+    assert_eq!(env["error"]["code"], "product_undetected");
+    assert!(
+        !vex_path.exists(),
+        "a failed run must remove the stale prior OpenVEX doc at --vex"
+    );
+}
+
+/// The stale-doc removal is guarded: only a file that is recognizably an
+/// OpenVEX document is deleted. A mistyped `--vex` pointing at an unrelated
+/// file must survive the failed run byte-identical — the cleanup exists to
+/// prevent stale attestations, not to destroy user data.
+#[test]
+fn apply_vex_failure_preserves_non_openvex_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path();
+    seed_offline_apply(cwd);
+    let precious = cwd.join("precious.txt");
+    let original = b"not an openvex document {".to_vec();
+    std::fs::write(&precious, &original).unwrap();
+
+    let out = cli()
+        .args([
+            "apply",
+            "--cwd",
+            cwd.to_str().unwrap(),
+            "--offline",
+            "--json",
+            "--vex",
+            precious.to_str().unwrap(),
+        ])
+        .output()
+        .expect("invoke apply");
+    assert!(!out.status.success());
+    assert_eq!(
+        std::fs::read(&precious).unwrap(),
+        original,
+        "a non-OpenVEX file at the output path must survive a failed run"
+    );
+}
+
+/// An unwritable `--vex` path fails with `write_failed`, and the message
+/// must name the path and the operation — the bare io::Error ("No such file
+/// or directory (os error 2)") diagnosed nothing in a CI log.
+#[test]
+fn apply_vex_write_failure_names_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path();
+    seed_offline_apply(cwd);
+    let bad_path = cwd.join("no-such-dir/apply.vex.json");
+
+    let out = cli()
+        .args([
+            "apply",
+            "--cwd",
+            cwd.to_str().unwrap(),
+            "--offline",
+            "--json",
+            "--vex",
+            bad_path.to_str().unwrap(),
+            "--vex-product",
+            "pkg:npm/my-app@1.0.0",
+        ])
+        .output()
+        .expect("invoke apply");
+    assert!(!out.status.success(), "write failure must flip the exit");
+    let env: Value = serde_json::from_slice(&out.stdout).expect("apply envelope JSON");
+    assert_eq!(env["error"]["code"], "write_failed", "{env}");
+    let msg = env["error"]["message"].as_str().unwrap();
+    assert!(
+        msg.contains("failed to write VEX document") && msg.contains("no-such-dir"),
+        "the error must name the operation and the path; got {msg:?}"
+    );
+}
+
+/// A non-IRI `--vex-product` is honored verbatim (help text: "PURL /
+/// identifier") but must warn on stderr in human mode — the OpenVEX product
+/// @id is spec-typed as an IRI and strict consumers may reject a bare name.
+#[test]
+fn apply_vex_product_non_iri_warns_in_human_mode() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path();
+    seed_offline_apply(cwd);
+    let vex_path = cwd.join("apply.vex.json");
+
+    let out = cli()
+        .args([
+            "apply",
+            "--cwd",
+            cwd.to_str().unwrap(),
+            "--offline",
+            "--vex",
+            vex_path.to_str().unwrap(),
+            "--vex-product",
+            "my app",
+        ])
+        .output()
+        .expect("invoke apply");
+    assert!(
+        out.status.success(),
+        "a non-IRI product is a warning, never a hard reject. stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("Warning:") && stderr.contains("IRI"),
+        "human mode must warn about the non-IRI product; got {stderr:?}"
+    );
+    // Honored verbatim in the written doc.
+    let doc: Value = serde_json::from_str(&std::fs::read_to_string(&vex_path).unwrap()).unwrap();
+    assert_eq!(doc["statements"][0]["products"][0]["@id"], "my app");
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // scan --vex (read-only; zero installed packages → no network)
 // ──────────────────────────────────────────────────────────────────────

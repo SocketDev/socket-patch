@@ -74,6 +74,19 @@ pub(crate) fn is_debug_enabled() -> bool {
     )
 }
 
+/// Strict-airgap gate: `SOCKET_OFFLINE` is `"1"` or `"true"`. No legacy
+/// name — it lives here as the single definition of the vocabulary shared
+/// by every offline gate (telemetry kill-switch, API-client advisory and
+/// org-slug auto-resolution). The CLI mirrors `--offline` (whose clap-side
+/// bool parse accepts a wider vocabulary) into `SOCKET_OFFLINE=1` before
+/// any of those gates run, so the env read alone is authoritative.
+pub(crate) fn is_offline_env() -> bool {
+    matches!(
+        std::env::var("SOCKET_OFFLINE").unwrap_or_default().as_str(),
+        "1" | "true"
+    )
+}
+
 /// The public patch-API proxy base URL: `SOCKET_PROXY_URL` (with the legacy
 /// `SOCKET_PATCH_PROXY_URL` shim), defaulting to
 /// [`DEFAULT_PATCH_API_PROXY_URL`](crate::constants::DEFAULT_PATCH_API_PROXY_URL).

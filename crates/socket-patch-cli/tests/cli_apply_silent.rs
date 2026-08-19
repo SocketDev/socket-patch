@@ -19,8 +19,10 @@
 //! (all three modes), and apply's own yarn-PnP refusal.
 //!
 //! Stderr assertions ignore the "No SOCKET_API_TOKEN set" client warning:
-//! it's printed unconditionally by `get_api_client_with_overrides` in core
-//! for every command and is out of scope for `apply`'s `--silent` gating.
+//! it's printed by `get_api_client_with_overrides` in core for every ONLINE
+//! command (offline runs suppress it — see
+//! `apply_offline_suppresses_public_proxy_notice`) and is out of scope for
+//! `apply`'s `--silent` gating.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -167,5 +169,32 @@ fn apply_check_silent_drift_keeps_error_output() {
     assert!(
         chatter.iter().any(|l| l.contains("OUT OF SYNC")),
         "--check --silent must keep the drift error output; stderr was: {stderr:?}"
+    );
+}
+
+/// `--offline` promises "never contact the network" (CLI_CONTRACT.md strict
+/// airgap), but the tokenless client-construction advisory claims the run is
+/// "using the public patch API proxy" — implied network use that misleads
+/// airgapped operators. Offline runs must suppress it; online tokenless runs
+/// must keep it (anti-vacuous half).
+#[test]
+fn apply_offline_suppresses_public_proxy_notice() {
+    // No .socket dir at all: apply exits 0 ("nothing to apply") either way,
+    // so the only stderr difference is the advisory under test.
+    let tmp = tempfile::tempdir().unwrap();
+
+    let (code, _stdout, stderr) = run_apply(tmp.path(), &["--offline"]);
+    assert_eq!(code, 0, "no-manifest apply is a clean no-op: {stderr}");
+    assert!(
+        !stderr.contains("public patch API proxy"),
+        "--offline must not claim proxy (network) use; stderr was: {stderr:?}"
+    );
+
+    let (code, _stdout, stderr) = run_apply(tmp.path(), &[]);
+    assert_eq!(code, 0, "no-manifest apply is a clean no-op: {stderr}");
+    assert!(
+        stderr.contains("public patch API proxy"),
+        "anti-vacuous: the same tokenless run WITHOUT --offline must keep the \
+         advisory; stderr was: {stderr:?}"
     );
 }
