@@ -24,10 +24,11 @@ use std::path::Path;
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::PatchSources;
 
+use super::pnpm_lock_legacy::PnpmLockGrammar;
 use super::state::VendorEntry;
 use super::{
-    bun_lock, npm_lock, pnpm_lock, yarn_berry_lock, yarn_classic_lock, RevertOutcome,
-    VendorOutcome, VendorWarning,
+    bun_lock, npm_lock, pnpm_lock, pnpm_lock_legacy, yarn_berry_lock, yarn_classic_lock,
+    RevertOutcome, VendorOutcome, VendorWarning,
 };
 
 /// Which lockfile flavor drives this project's npm installs.
@@ -41,6 +42,9 @@ pub(crate) enum NpmLockFlavor {
     YarnBerry,
     /// `pnpm-lock.yaml`, lockfileVersion 9.0 (pnpm >= 9).
     Pnpm,
+    /// `pnpm-lock.yaml`, the legacy grammars — lockfileVersion 5.4 (pnpm 7)
+    /// or 6.0 (pnpm 8).
+    PnpmLegacy,
     /// `bun.lock` (bun's text lockfile).
     Bun,
 }
@@ -53,6 +57,7 @@ impl NpmLockFlavor {
             NpmLockFlavor::YarnClassic => "yarn-classic",
             NpmLockFlavor::YarnBerry => "yarn-berry",
             NpmLockFlavor::Pnpm => "pnpm",
+            NpmLockFlavor::PnpmLegacy => pnpm_lock_legacy::FLAVOR,
             NpmLockFlavor::Bun => "bun",
         }
     }
@@ -92,8 +97,9 @@ const LOCKFILE_FAMILIES: [(NpmLockFlavor, &[&str]); 4] = [
 ///    [`crate::crawlers::pkg_managers::pnpm_pnp_layout`]) → Err
 ///    `vendor_pnpm_pnp_unsupported` with a pnpm remedy;
 /// 2. `bun.lock` → Bun; else `bun.lockb` → Err `vendor_bun_lockb_unsupported`;
-/// 3. `pnpm-lock.yaml` → head-sniff `lockfileVersion` (only `'9.0'`) → Pnpm,
-///    else Err `vendor_lockfile_version_unsupported`;
+/// 3. `pnpm-lock.yaml` → head-sniff `lockfileVersion`: `'9.0'` → Pnpm;
+///    `5.4`/`'6.0'` (pnpm 7/8) → PnpmLegacy; anything else → Err
+///    `vendor_lockfile_version_unsupported` (version-aware remedy);
 /// 4. `yarn.lock` → head-sniff: column-0 `__metadata:` → Err
 ///    `vendor_yarn_berry_unsupported`; `# yarn lockfile v1` → YarnClassic;
 ///    neither → Err `vendor_lockfile_version_unsupported`;
@@ -164,13 +170,20 @@ pub(crate) async fn detect_npm_lock_flavor(
             ));
         }
 
-        // 3. pnpm: only lockfileVersion 9.0 has a wiring backend (the sniff
-        //    is the pnpm backend's own pre-flight check).
+        // 3. pnpm: lockfileVersion 9.0 routes to the v9 backend, the legacy
+        //    grammars 5.4 (pnpm 7) / 6.0 (pnpm 8) to the legacy backend;
+        //    anything else refuses with the sniff's version-aware remedy.
         if exists("pnpm-lock.yaml").await {
             let text = read_lock(project_root, "pnpm-lock.yaml").await?;
-            pnpm_lock::check_lock_version(&text)
-                .map_err(|detail| ("vendor_lockfile_version_unsupported", detail))?;
-            break 'flavor NpmLockFlavor::Pnpm;
+            match pnpm_lock_legacy::sniff_lock_grammar(&text) {
+                Ok(PnpmLockGrammar::V9) => break 'flavor NpmLockFlavor::Pnpm,
+                Ok(PnpmLockGrammar::V54 | PnpmLockGrammar::V60) => {
+                    break 'flavor NpmLockFlavor::PnpmLegacy
+                }
+                Err(detail) => {
+                    return Err(("vendor_lockfile_version_unsupported", detail));
+                }
+            }
         }
 
         // 4. yarn: classic v1 vs berry (node-modules linker), decided by content.
@@ -223,6 +236,9 @@ pub(crate) async fn detect_npm_lock_flavor(
     // berry detection claims it too (never self-warn about the wired file).
     let family_owner = match detected {
         NpmLockFlavor::YarnBerry => NpmLockFlavor::YarnClassic,
+        // Both pnpm backends wire the same pnpm-lock.yaml (the family table
+        // keys the family under Pnpm) — never self-warn about the wired file.
+        NpmLockFlavor::PnpmLegacy => NpmLockFlavor::Pnpm,
         other => other,
     };
     let mut warnings = Vec::new();
@@ -330,6 +346,7 @@ pub async fn vendor_npm_any(
         NpmLockFlavor::YarnClassic => vend!(yarn_classic_lock::vendor_yarn_classic),
         NpmLockFlavor::YarnBerry => vend!(yarn_berry_lock::vendor_yarn_berry),
         NpmLockFlavor::Pnpm => vend!(pnpm_lock::vendor_pnpm),
+        NpmLockFlavor::PnpmLegacy => vend!(pnpm_lock_legacy::vendor_pnpm_legacy),
         NpmLockFlavor::Bun => vend!(bun_lock::vendor_bun),
     };
     // Probe warnings (e.g. a sibling lockfile that will install UNPATCHED
@@ -365,6 +382,9 @@ pub async fn vendor_npm_any(
 pub async fn vendored_entry_in_use(entry: &VendorEntry, project_root: &Path) -> Option<bool> {
     match entry.flavor.as_deref() {
         Some("pnpm") => pnpm_lock::pnpm_entry_in_use(entry, project_root).await,
+        Some("pnpm-legacy") => {
+            pnpm_lock_legacy::pnpm_legacy_entry_in_use(entry, project_root).await
+        }
         // The remaining flavors wire resolutions into the lock itself
         // (resolved URLs / file: ranges / package tuples), so a textual
         // probe for the uuid dir is exact: the path appears iff some
@@ -387,7 +407,13 @@ pub async fn vendored_entry_in_use(entry: &VendorEntry, project_root: &Path) -> 
 }
 
 /// First readable lockfile from `names`, probed for the uuid artifact dir.
-async fn lock_text_mentions_uuid(project_root: &Path, names: &[&str], uuid: &str) -> Option<bool> {
+/// Shared with the textual backends' unwired-revert guard
+/// ([`super::npm_lock::guard_unwired_textual_revert`]).
+pub(super) async fn lock_text_mentions_uuid(
+    project_root: &Path,
+    names: &[&str],
+    uuid: &str,
+) -> Option<bool> {
     let needle = format!(".socket/vendor/npm/{uuid}/");
     for name in names {
         if let Ok(text) = tokio::fs::read_to_string(project_root.join(name)).await {
@@ -415,6 +441,9 @@ pub async fn revert_npm_any(
             yarn_berry_lock::revert_yarn_berry(entry, project_root, dry_run).await
         }
         Some("pnpm") => pnpm_lock::revert_pnpm(entry, project_root, dry_run).await,
+        Some("pnpm-legacy") => {
+            pnpm_lock_legacy::revert_pnpm_legacy(entry, project_root, dry_run).await
+        }
         Some("bun") => bun_lock::revert_bun(entry, project_root, dry_run).await,
         Some(other) => RevertOutcome::failed(format!(
             "this socket-patch build cannot revert npm vendor flavor `{other}` — upgrade \
@@ -467,6 +496,7 @@ mod tests {
         assert_eq!(NpmLockFlavor::PackageLock.as_str(), "package-lock");
         assert_eq!(NpmLockFlavor::YarnClassic.as_str(), "yarn-classic");
         assert_eq!(NpmLockFlavor::Pnpm.as_str(), "pnpm");
+        assert_eq!(NpmLockFlavor::PnpmLegacy.as_str(), "pnpm-legacy");
         assert_eq!(NpmLockFlavor::Bun.as_str(), "bun");
     }
 
@@ -578,12 +608,21 @@ mod tests {
             assert_eq!(flavor, NpmLockFlavor::Pnpm, "{head}");
         }
 
-        // Older version: named in the error.
+        // Legacy grammars route to the legacy backend: pnpm 7's bare-float
+        // 5.4 and pnpm 8's quoted '6.0' (their own spellings, captured).
+        for head in ["lockfileVersion: 5.4", "lockfileVersion: '6.0'"] {
+            let tmp = tempfile::tempdir().unwrap();
+            touch(tmp.path(), "pnpm-lock.yaml", &format!("{head}\n")).await;
+            let (flavor, _) = detect_npm_lock_flavor(tmp.path()).await.unwrap();
+            assert_eq!(flavor, NpmLockFlavor::PnpmLegacy, "{head}");
+        }
+
+        // Pre-allowlist version (pnpm 6's 5.3): named in the error.
         let tmp = tempfile::tempdir().unwrap();
-        touch(tmp.path(), "pnpm-lock.yaml", "lockfileVersion: '6.0'\n").await;
+        touch(tmp.path(), "pnpm-lock.yaml", "lockfileVersion: 5.3\n").await;
         let (code, detail) = detect_npm_lock_flavor(tmp.path()).await.unwrap_err();
         assert_eq!(code, "vendor_lockfile_version_unsupported");
-        assert!(detail.contains("6.0"), "{detail}");
+        assert!(detail.contains("5.3"), "{detail}");
         assert!(detail.contains("pnpm >= 9"), "{detail}");
 
         // No version line in the head at all.
@@ -893,6 +932,7 @@ mod tests {
             Some("yarn-classic".to_string()),
             Some("yarn-berry".to_string()),
             Some("pnpm".to_string()),
+            Some("pnpm-legacy".to_string()),
             Some("bun".to_string()),
         ] {
             entry.flavor = flavor.clone();

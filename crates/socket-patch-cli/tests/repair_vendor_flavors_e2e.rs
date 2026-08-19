@@ -587,6 +587,136 @@ async fn repair_reconstructs_pnpm_ledger_from_lockfile() {
     ledger_gone_reconstructs_from_lock(Flavor::Pnpm).await;
 }
 
+// ── (f) reconstructed empty-wiring entry: revert must not brick installs ────
+//
+// Empirically confirmed brick (real pnpm@10.34.5 project, 2026-08-18): after
+// `repair` reconstructs a ledger-gone vendored entry from the lockfile, the
+// entry carries EMPTY wiring (npm-family pre-vendor lock fragments are not
+// offline-recoverable). A subsequent `vendor --revert` used to exit 0 with a
+// bare {"action":"removed"} event — zero warnings — while DELETING the
+// vendored tarball pnpm-lock.yaml still resolves through in several places;
+// every later `pnpm install` then fails ENOENT on the missing file: tarball.
+// The npm-family backends now fail closed
+// (`vendor_wiring_unknown_revert_blocked`) when there is nothing to replay
+// and the lock still references the artifact, and still remove genuinely
+// orphaned artifacts once the lock no longer does. `repair`'s reconstruction
+// also stamps the flavor it found the reference in (asserted below), so the
+// revert routes to the backend whose guard probes the RIGHT lockfile; a
+// flavor-None entry falls back to the package-lock backend, which is
+// guarded too (repair_vendor_e2e.rs test 12).
+
+#[tokio::test]
+async fn revert_of_reconstructed_pnpm_entry_fails_closed_then_recovers() {
+    let mock = MockServer::start().await;
+    mount_patch_api(&mock).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_fixture(tmp.path(), Flavor::Pnpm);
+    let lock_pre = std::fs::read(tmp.path().join("pnpm-lock.yaml")).unwrap();
+    let pkg_pre = std::fs::read(tmp.path().join("package.json")).unwrap();
+    let tgz = vendor_project(tmp.path(), &mock.uri());
+    let lock_vendored = std::fs::read(tmp.path().join("pnpm-lock.yaml")).unwrap();
+
+    // Ledger gone; artifact + rewired lock intact (the empirical shape).
+    // The anchored reconstruction restores the entry with wiring: [].
+    std::fs::remove_file(tmp.path().join(".socket/vendor/state.json")).unwrap();
+    let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair"]);
+    assert_eq!(code, 0, "reconstruction: stdout={stdout} stderr={stderr}");
+    let state_path = tmp.path().join(".socket/vendor/state.json");
+    let state: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
+    assert_eq!(
+        state["entries"][PURL]["wiring"].as_array().map(Vec::len),
+        Some(0),
+        "npm wiring is not offline-recoverable: {state}"
+    );
+    // The reconstruction found the reference in pnpm-lock.yaml (v9), so the
+    // entry is stamped with the pnpm flavor — revert routes to the pnpm
+    // backend and its guard probes pnpm-lock.yaml, not package-lock.json.
+    assert_eq!(
+        state["entries"][PURL]["flavor"],
+        serde_json::json!("pnpm"),
+        "reconstruction stamps the detected flavor: {state}"
+    );
+
+    // Nothing to replay + the lock still resolves through the artifact:
+    // revert must refuse loudly instead of silently removing the tarball.
+    let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["vendor", "--revert"]);
+    assert_ne!(
+        code, 0,
+        "revert of an empty-wiring entry the lock still references must fail closed: \
+         stdout={stdout} stderr={stderr}"
+    );
+    let v = parse_env(&stdout);
+    assert!(
+        events_of(&v)
+            .iter()
+            .any(|e| e["errorCode"] == "vendor_wiring_unknown_revert_blocked"),
+        "envelope={v}"
+    );
+    assert!(
+        tgz.is_file(),
+        "the artifact the lock still references must survive the refusal"
+    );
+    assert_eq!(
+        std::fs::read(tmp.path().join("pnpm-lock.yaml")).unwrap(),
+        lock_vendored,
+        "the lock stays untouched by the refusal"
+    );
+
+    // Recovery, exactly as the refusal advises: `repair` keeps the vendored
+    // artifact healthy (idempotent — the entry and tarball survive)...
+    let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair"]);
+    assert_eq!(
+        code, 0,
+        "repair after refusal: stdout={stdout} stderr={stderr}"
+    );
+    assert!(tgz.is_file(), "repair keeps the artifact");
+
+    // ...and once the pre-vendor surfaces are restored (the manual-restore
+    // arm — the wiring originals are unrecoverable by design), a normal
+    // revert removes the now-orphaned artifact cleanly.
+    std::fs::write(tmp.path().join("pnpm-lock.yaml"), &lock_pre).unwrap();
+    std::fs::write(tmp.path().join("package.json"), &pkg_pre).unwrap();
+    let ws = tmp.path().join("pnpm-workspace.yaml");
+    if ws.exists() {
+        std::fs::remove_file(&ws).unwrap();
+    }
+    let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["vendor", "--revert"]);
+    assert_eq!(code, 0, "final revert: stdout={stdout} stderr={stderr}");
+    let v = parse_env(&stdout);
+    assert!(
+        events_of(&v)
+            .iter()
+            .any(|e| e["action"] == "removed" && e["purl"] == PURL),
+        "envelope={v}"
+    );
+    assert!(
+        !tmp.path()
+            .join(format!(".socket/vendor/npm/{UUID}"))
+            .exists(),
+        "the orphaned artifact dir is removed"
+    );
+    assert_eq!(
+        std::fs::read(tmp.path().join("pnpm-lock.yaml")).unwrap(),
+        lock_pre,
+        "clean end state: the restored pre-vendor lock is untouched"
+    );
+    // The ledger entry is gone — either the state file was removed with its
+    // last entry, or it persists with an empty entries map.
+    match std::fs::read_to_string(&state_path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(text) => {
+            let state: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(
+                state["entries"].as_object().map(serde_json::Map::len),
+                Some(0),
+                "ledger entry gone: {state}"
+            );
+        }
+        Err(e) => panic!("unreadable state.json: {e}"),
+    }
+}
+
 #[tokio::test]
 async fn repair_reconstructs_yarn_berry_ledger_from_lockfile() {
     ledger_gone_reconstructs_from_lock(Flavor::YarnBerry).await;

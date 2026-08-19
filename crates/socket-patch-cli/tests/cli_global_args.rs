@@ -108,6 +108,9 @@ fn global_flag_cases() -> Vec<(&'static str, Option<&'static str>, fn(&GlobalArg
         ("--yes", None, |c| assert!(c.yes)),
         ("--debug", None, |c| assert!(c.debug)),
         ("--no-telemetry", None, |c| assert!(c.no_telemetry)),
+        ("--no-trust-lockfile-config", None, |c| {
+            assert!(c.no_trust_lockfile_config)
+        }),
         ("--lock-timeout", Some("30"), |c| {
             assert_eq!(c.lock_timeout, Some(30))
         }),
@@ -220,17 +223,18 @@ fn global_flag_cases_cover_every_global_field() {
         lock_timeout: _,
         debug: _,
         no_telemetry: _,
+        no_trust_lockfile_config: _,
         strict: _,
         vendor_source: _,
         vendor_url: _,
         patch_server_url: _,
     } = common;
 
-    // 23 fields ↔ 23 long-flag cases. Bump both this count and add a case when
+    // 24 fields ↔ 24 long-flag cases. Bump both this count and add a case when
     // the destructure above forces you to add a field.
     assert_eq!(
         global_flag_cases().len(),
-        23,
+        24,
         "every GlobalArgs field needs a long-flag case in global_flag_cases()",
     );
 
@@ -651,7 +655,7 @@ fn bool_env_vars_reject_zero_and_falsey() {
 #[serial_test::serial]
 fn empty_bool_env_var_resolves_to_false_not_crash() {
     // (env var, accessor) for every boolean global.
-    let bool_vars: [(&str, fn(&GlobalArgs) -> bool); 10] = [
+    let bool_vars: [(&str, fn(&GlobalArgs) -> bool); 11] = [
         ("SOCKET_OFFLINE", |c| c.offline),
         ("SOCKET_STRICT", |c| c.strict),
         ("SOCKET_GLOBAL", |c| c.global),
@@ -662,6 +666,9 @@ fn empty_bool_env_var_resolves_to_false_not_crash() {
         ("SOCKET_YES", |c| c.yes),
         ("SOCKET_DEBUG", |c| c.debug),
         ("SOCKET_TELEMETRY_DISABLED", |c| c.no_telemetry),
+        ("SOCKET_NO_TRUST_LOCKFILE_CONFIG", |c| {
+            c.no_trust_lockfile_config
+        }),
     ];
 
     let saved = save_and_clear_global_env();

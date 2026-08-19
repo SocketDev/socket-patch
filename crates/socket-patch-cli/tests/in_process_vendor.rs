@@ -1473,6 +1473,17 @@ fn vendor_missing_file_fails_closed_without_force() {
 
     let (code, env) = vendor_cli(fx.root(), &[]);
     assert_ne!(code, 0, "missing patch target must fail: {env:#}");
+    // CONTRACT: even a run where EVERY outcome failed reports
+    // "partialFailure". The envelope has no "completed with zero successes"
+    // status, and status=error is reserved for pre-event failures (it implies
+    // a top-level error payload and empty events[] — json_envelope.rs), so
+    // escalating this run to "error" would violate the contract and diverge
+    // from scan --vendor and vendor --revert, which report the same outcome
+    // as partialFailure. Exit code 1 carries the failure signal.
+    assert_eq!(
+        env["status"], "partialFailure",
+        "all-failed vendor runs report partialFailure per the envelope contract: {env:#}"
+    );
     let failed = find_event(&env, "failed", None);
     assert!(
         failed["error"]
@@ -1955,4 +1966,341 @@ async fn scan_vendor_gem_detached_writes_no_manifest_and_reverts() {
         "revert must byte-restore Gemfile.lock"
     );
     assert!(!fx.root().join(".socket/vendor").exists());
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// hosted → vendored mode conversion (takeover reconciliation, pnpm v9)
+// ─────────────────────────────────────────────────────────────────────
+//
+// The full migration a real project performs: `scan --mode hosted` first
+// (wiremock API, v9 pnpm root lock — the shapes of
+// `in_process_redirect_pnpm.rs`), then `vendor` over the hosted-redirected
+// lock. Pins the npm-family takeover reconciliation:
+//
+//   * the redirect ledger loses the converted purl's `records` entry AND its
+//     `redirect_pnpm_resolution` edits (stale halves fed VEX/updates and
+//     re-fired the takeover warning forever pre-fix),
+//   * the `vendor_supersedes_redirect` warning fires exactly ONCE — on the
+//     run that reconciles — and a re-vendor (`already_vendored`) is silent,
+//   * `vendor --revert` still restores the HOSTED-spliced lock byte-exactly
+//     (the hosted fragment is embedded as the vendor wiring `original`, so
+//     dropping the redirect ledger halves loses no revert data).
+mod hosted_to_vendor_conversion {
+    use super::*;
+    use serial_test::serial;
+    use socket_patch_cli::commands::scan::{run as scan_run, ScanArgs, ScanMode};
+    use wiremock::matchers::{method, path, path_regex};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const ORG: &str = "test-org";
+    const CONV_NAME: &str = "conv-pnpm-takeover";
+    const CONV_VERSION: &str = "1.0.0";
+    const CONV_PURL: &str = "pkg:npm/conv-pnpm-takeover@1.0.0";
+    const CONV_UUID: &str = "44444444-4444-4444-8444-444444444444";
+    const HOSTED_URL: &str = "http://patch.test/patch/npm/conv-pnpm-takeover/1.0.0/55555555-5555-4555-8555-555555555555/44444444-4444-4444-8444-444444444444/conv-pnpm-takeover-1.0.0.tgz";
+    const PATCHED_SHA512: &str = "sha512-PATCHEDpatchedPATCHEDpatched0123456789==";
+    const UPSTREAM_SHA512: &str = "sha512-UPSTREAMupstream==";
+
+    async fn mock_hosted_api(server: &MockServer) {
+        Mock::given(method("POST"))
+            .and(path(format!("/v0/orgs/{ORG}/patches/batch")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "packages": [{
+                    "purl": CONV_PURL,
+                    "patches": [{
+                        "uuid": CONV_UUID, "purl": CONV_PURL, "tier": "free",
+                        "cveIds": [], "ghsaIds": [], "severity": "high",
+                        "title": "conversion fixture"
+                    }]
+                }],
+                "canAccessPaidPatches": false,
+            })))
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(format!(
+                "^/v0/orgs/{ORG}/patches/by-package/.+$"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "patches": [{
+                    "uuid": CONV_UUID, "purl": CONV_PURL,
+                    "publishedAt": "2024-01-01T00:00:00Z",
+                    "description": "x", "license": "MIT", "tier": "free",
+                    "vulnerabilities": {}
+                }],
+                "canAccessPaidPatches": false,
+            })))
+            .mount(server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(format!("/v0/orgs/{ORG}/patches/package")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": {
+                    CONV_UUID: {
+                        "status": "granted",
+                        "url": HOSTED_URL,
+                        "purl": CONV_PURL,
+                        "artifacts": [{
+                            "kind": "tarball",
+                            "url": HOSTED_URL,
+                            "integrity": { "sha512": PATCHED_SHA512 }
+                        }],
+                        "registryOverride": null
+                    }
+                }
+            })))
+            .mount(server)
+            .await;
+        // `view/{uuid}` — the record the redirect ledger persists (real file
+        // hashes, so the ledger record mirrors the manifest the vendor run
+        // uses later).
+        let before_hash = compute_git_sha256_from_bytes(ORIG_INDEX);
+        let after_hash = compute_git_sha256_from_bytes(PATCHED_INDEX);
+        Mock::given(method("GET"))
+            .and(path(format!("/v0/orgs/{ORG}/patches/view/{CONV_UUID}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "uuid": CONV_UUID,
+                "purl": CONV_PURL,
+                "publishedAt": "2024-01-01T00:00:00Z",
+                "files": {
+                    "package/index.js": {
+                        "beforeHash": before_hash,
+                        "afterHash": after_hash,
+                    }
+                },
+                "vulnerabilities": {},
+                "description": "x", "license": "MIT", "tier": "free"
+            })))
+            .mount(server)
+            .await;
+    }
+
+    /// The `in_process_redirect_pnpm.rs` project shape: v9 root pnpm lock
+    /// resolving the package under `packages:`, plus the installed
+    /// node_modules copy (with the real patch-target file, so the later
+    /// vendor run can pack the artifact).
+    fn write_pnpm_project(root: &Path) {
+        std::fs::write(
+            root.join("package.json"),
+            format!(
+                r#"{{ "name": "consumer", "version": "0.0.0", "dependencies": {{ "{CONV_NAME}": "{CONV_VERSION}" }} }}"#
+            ),
+        )
+        .unwrap();
+        let pkg = root.join("node_modules").join(CONV_NAME);
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(
+            pkg.join("package.json"),
+            format!(r#"{{ "name": "{CONV_NAME}", "version": "{CONV_VERSION}" }}"#),
+        )
+        .unwrap();
+        std::fs::write(pkg.join("index.js"), ORIG_INDEX).unwrap();
+        std::fs::write(
+            root.join("pnpm-lock.yaml"),
+            format!(
+                "lockfileVersion: '9.0'
+
+importers:
+  .:
+    dependencies:
+      {CONV_NAME}:
+        specifier: {CONV_VERSION}
+        version: {CONV_VERSION}
+
+packages:
+  {CONV_NAME}@{CONV_VERSION}:
+    resolution: {{integrity: {UPSTREAM_SHA512}}}
+
+snapshots:
+  {CONV_NAME}@{CONV_VERSION}: {{}}
+"
+            ),
+        )
+        .unwrap();
+    }
+
+    /// `--mode hosted` args against the wiremock API (the
+    /// `in_process_redirect_pnpm.rs` shape).
+    fn hosted_args(cwd: &Path, api_url: String) -> ScanArgs {
+        ScanArgs {
+            common: GlobalArgs {
+                cwd: cwd.to_path_buf(),
+                org: Some(ORG.to_string()),
+                api_token: Some("fake".to_string()),
+                api_url: Some(api_url),
+                json: true,
+                yes: true,
+                ..GlobalArgs::default()
+            },
+            batch_size: 100,
+            apply: false,
+            prune: false,
+            sync: false,
+            vendor: false,
+            detached: false,
+            redirect: false,
+            mode: Some(ScanMode::Hosted),
+            all_releases: false,
+            vex: Default::default(),
+        }
+    }
+
+    /// The manifest + staged blob the vendor run needs (vendor is driven
+    /// offline; hosted mode wrote no manifest — the ledger is its store).
+    fn seed_manifest_and_blob(root: &Path) {
+        let before_hash = compute_git_sha256_from_bytes(ORIG_INDEX);
+        let after_hash = compute_git_sha256_from_bytes(PATCHED_INDEX);
+        let manifest = json!({
+            "patches": {
+                CONV_PURL: {
+                    "uuid": CONV_UUID,
+                    "exportedAt": "2026-01-01T00:00:00Z",
+                    "files": {
+                        "package/index.js": {
+                            "beforeHash": before_hash,
+                            "afterHash": after_hash
+                        }
+                    },
+                    "vulnerabilities": {},
+                    "description": "conversion fixture",
+                    "license": "MIT",
+                    "tier": "free"
+                }
+            }
+        });
+        let socket = root.join(".socket");
+        std::fs::create_dir_all(socket.join("blobs")).unwrap();
+        let mut bytes = serde_json::to_vec_pretty(&manifest).unwrap();
+        bytes.push(b'\n');
+        std::fs::write(socket.join("manifest.json"), &bytes).unwrap();
+        std::fs::write(socket.join("blobs").join(after_hash), PATCHED_INDEX).unwrap();
+    }
+
+    fn takeover_warnings(envelope: &Value) -> Vec<&str> {
+        envelope["warnings"]
+            .as_array()
+            .map(|w| {
+                w.iter()
+                    .filter(|e| e["code"] == "vendor_supersedes_redirect")
+                    .map(|e| e["detail"].as_str().unwrap_or(""))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn hosted_then_vendor_reconciles_ledger_warns_once_and_reverts_bytes() {
+        let server = MockServer::start().await;
+        mock_hosted_api(&server).await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_pnpm_project(root);
+
+        // 1. Hosted redirect: the lock's resolution is spliced to the hosted
+        //    tarball and the redirect ledger claims the purl.
+        let code = scan_run(hosted_args(root, server.uri())).await;
+        assert_eq!(code, 0, "scan --mode hosted must succeed");
+        let hosted_lock = std::fs::read(root.join("pnpm-lock.yaml")).unwrap();
+        let hosted_lock_text = String::from_utf8(hosted_lock.clone()).unwrap();
+        assert!(
+            hosted_lock_text.contains(&format!("tarball: {HOSTED_URL}")),
+            "hosted splice missing:\n{hosted_lock_text}"
+        );
+        let ledger_path = root.join(".socket/vendor/redirect-state.json");
+        let ledger: Value =
+            serde_json::from_str(&std::fs::read_to_string(&ledger_path).unwrap()).unwrap();
+        assert!(
+            ledger["records"].get(CONV_PURL).is_some(),
+            "hosted run must record the purl: {ledger}"
+        );
+
+        // 2. Vendor over the hosted-redirected lock (offline, staged blob).
+        seed_manifest_and_blob(root);
+        let (code, env1) = vendor_cli(root, &[]);
+        assert_eq!(
+            code, 0,
+            "vendor over the hosted lock must succeed: {env1:#}"
+        );
+        find_event(&env1, "applied", None);
+
+        // The takeover warning fired exactly once — on the reconciling run —
+        // and reports the reconciliation as DONE, not as advice to re-run.
+        let warns = takeover_warnings(&env1);
+        assert_eq!(
+            warns.len(),
+            1,
+            "vendor_supersedes_redirect must fire exactly once: {env1:#}"
+        );
+        assert!(
+            warns[0].contains("reconciled automatically"),
+            "the warning must state the reconciliation happened: {}",
+            warns[0]
+        );
+
+        // The redirect ledger no longer carries the purl's halves: its
+        // `records` entry and its `redirect_pnpm_resolution` edits are gone
+        // (a residual non-package edit like the workspace-trust one may
+        // remain — it is the hosted flow's own config surface).
+        match std::fs::read_to_string(&ledger_path) {
+            Ok(text) => {
+                let after: Value = serde_json::from_str(&text).unwrap();
+                assert!(
+                    after["records"].get(CONV_PURL).is_none(),
+                    "the superseded record must be dropped: {after}"
+                );
+                let leftover: Vec<&Value> = after["edits"]
+                    .as_array()
+                    .map(|edits| {
+                        edits
+                            .iter()
+                            .filter(|e| e["key"].as_str().is_some_and(|k| k.contains(CONV_NAME)))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                assert!(
+                    leftover.is_empty(),
+                    "the superseded package edits must be dropped: {after}"
+                );
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Fully emptied ledgers are deleted — also a valid outcome.
+            }
+            Err(e) => panic!("unreadable redirect ledger: {e}"),
+        }
+
+        // The vendor ledger's wiring `original` embeds the HOSTED-spliced
+        // fragment — the revert data the dropped ledger halves would
+        // otherwise have been the last copy of.
+        let state: Value = serde_json::from_str(
+            &std::fs::read_to_string(root.join(".socket/vendor/state.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            state["entries"][CONV_PURL]["wiring"]
+                .to_string()
+                .contains(HOSTED_URL),
+            "vendor wiring must embed the hosted-spliced original: {state:#}"
+        );
+
+        // 3. Re-vendor: an `already_vendored` no-op with NO takeover warning
+        //    (pre-fix the stale ledger re-fired it on every run).
+        let (code, env2) = vendor_cli(root, &[]);
+        assert_eq!(code, 0, "re-vendor must succeed: {env2:#}");
+        find_event(&env2, "skipped", Some("already_vendored"));
+        assert!(
+            takeover_warnings(&env2).is_empty(),
+            "a reconciled ledger must not re-fire the warning: {env2:#}"
+        );
+
+        // 4. `vendor --revert` restores the HOSTED-spliced lock byte-exactly.
+        let (code, renv) = vendor_cli(root, &["--revert"]);
+        assert_eq!(code, 0, "revert must succeed: {renv:#}");
+        assert_eq!(
+            std::fs::read(root.join("pnpm-lock.yaml")).unwrap(),
+            hosted_lock,
+            "revert must byte-restore the hosted-spliced lock"
+        );
+    }
 }

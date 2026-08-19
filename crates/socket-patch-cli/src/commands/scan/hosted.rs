@@ -15,6 +15,14 @@ const REDIRECT_CANDIDATE_FILES: &[&str] = &[
     "package-lock.json",
     "npm-shrinkwrap.json",
     "pnpm-lock.yaml",
+    // pnpm-family MARKERS, never rewritten: `shrinkwrap.yaml` is the
+    // pnpm <=2-era lock (npm never emits that filename) and
+    // `node_modules/.modules.yaml` is pnpm's installer state file. The npm
+    // rewriter's no-lockfile diagnostic keys its family wording off their
+    // presence — without them a pnpm 1/2 project gets told "no
+    // package-lock.json present", npm advice that dead-ends.
+    "shrinkwrap.yaml",
+    "node_modules/.modules.yaml",
     "yarn.lock",
     // A berry lock's cache-config gate reads `.yarnrc.yml`; bun's text lock is
     // `bun.lock` (its binary `bun.lockb` is auto-migrated in `run_redirect`).
@@ -79,6 +87,248 @@ fn parse_purl_simple(purl: &str) -> Option<(String, String, String)> {
     let version =
         socket_patch_core::utils::purl::percent_decode_purl_component(version).into_owned();
     Some((typ.to_string(), name, version))
+}
+
+/// `scheme://[user[:pass]@]host[:port]/…` → `host[:port]`, NEVER userinfo.
+/// For user-facing messages that name where a lockfile now points — the
+/// hosted artifact host follows `--api-url`, so hardcoding `patch.socket.dev`
+/// would misname it in custom-server environments. The port is kept (it is
+/// part of the authority the lock records); credentials are stripped: a
+/// credentialed artifact URL (`https://user:secret@host/…`) must never leak
+/// `user:secret` into the warning text or the persisted `--json` envelope —
+/// both land in CI logs. Split by hand because this crate has no URL-parser
+/// dependency (reqwest is dev-only here); per RFC 3986 a raw `@` in the
+/// authority can ONLY be the userinfo terminator (it is percent-encoded
+/// everywhere else), so the tail after the LAST `@` is exactly host[:port].
+fn url_host(url: &str) -> Option<&str> {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    (!host.is_empty()).then_some(host)
+}
+
+/// Repo-relative path of the pnpm workspace manifest the trustLockfile
+/// auto-config edits (the same file the vendor backend's override surface
+/// uses).
+const PNPM_WORKSPACE_REL: &str = "pnpm-workspace.yaml";
+
+/// `FileEdit.kind` recorded when the hosted flow ensures `trustLockfile:
+/// true` in pnpm-workspace.yaml. `action: "created"` — the workspace file
+/// itself was created (a revert deletes it); `action: "added"` — the single
+/// `trustLockfile: true` line was appended to an existing file (a revert
+/// removes exactly that line). Additive ledger vocabulary: older ledgers
+/// without it load unchanged (kind is an opaque string to the loader).
+const REDIRECT_PNPM_WORKSPACE_TRUST_EDIT_KIND: &str = "redirect_pnpm_workspace_trust";
+
+/// The honest-tradeoff + don't-rebuild tail shared by every trustLockfile
+/// warning variant. The tradeoff sentence is a security disclosure, not
+/// prose garnish: `trustLockfile: true` disables pnpm's lockfile
+/// re-verification for the WHOLE lock, so it must be stated wherever the
+/// setting is written or recommended.
+const PNPM_TRUST_TRADEOFF_AND_CAUTION: &str =
+    "Note: trustLockfile makes pnpm skip its lockfile re-verification \
+     (minimumReleaseAge / trustPolicy re-checks) for ALL lockfile entries, \
+     not just the patched ones — the per-entry sha512 integrity pins are \
+     still enforced. Do NOT follow pnpm's advice to rebuild the lockfile \
+     (`pnpm clean --lockfile`): that silently discards the redirect and \
+     reinstalls the vulnerable upstream artifact. pnpm <=10 ignores the \
+     setting and installs work unchanged";
+
+/// The policy preamble shared by every trustLockfile warning variant:
+/// what was repointed, and how pnpm >=11 fails without trust.
+fn pnpm_trust_policy_preamble(server: &str) -> String {
+    format!(
+        "pnpm-lock.yaml was repointed at {server}; pnpm >=11 rejects the \
+         rewritten lock (pnpm 11: ERR_PNPM_TARBALL_URL_MISMATCH, pnpm 12: \
+         ERR_PNPM_LOCKFILE_RESOLUTION_VERIFICATION)"
+    )
+}
+
+/// The pre-auto-config guidance, kept verbatim for the runs where the
+/// auto-config does not apply (legacy 5.x/6.0 locks, Rush nested locks,
+/// `--no-trust-lockfile-config`): both verified recoveries, spelled exactly.
+fn pnpm_trust_manual_guidance(server: &str) -> String {
+    format!(
+        "{}. Install with `pnpm install --trust-lockfile`, or commit \
+         `trustLockfile: true` in pnpm-workspace.yaml so every install \
+         accepts the patched artifacts. Do NOT follow pnpm's advice to \
+         rebuild the lockfile (`pnpm clean --lockfile`): that silently \
+         discards the redirect and reinstalls the vulnerable upstream \
+         artifact. pnpm <=10 installs work unchanged",
+        pnpm_trust_policy_preamble(server),
+    )
+}
+
+/// The LEGACY-lock variant (lockfileVersion 5.x/6.0 — pnpm 7/8): those
+/// majors have neither the pnpm >=11 lockfile trust policy nor any trust
+/// flag or setting, so installs consume the redirected lock unchanged and
+/// no trust step exists or is needed. Deliberately NEVER mentions
+/// `pnpm install --trust-lockfile`: pnpm 7/8 reject the flag as an unknown
+/// option, so headlining it here would hand users a command that errors.
+fn pnpm_trust_legacy_detail(server: &str) -> String {
+    format!(
+        "pnpm-lock.yaml was repointed at {server}. This is a legacy \
+         (lockfileVersion 5.x/6.0) lock read by pnpm 7/8, which have no \
+         lockfile trust policy: installs work unchanged on pnpm 7/8 and no \
+         trust step exists or is needed. Do NOT regenerate the lockfile \
+         (deleting it, or re-resolving on a newer pnpm): that silently \
+         discards the redirect and reinstalls the vulnerable upstream \
+         artifact. If the project later moves to pnpm >=9, re-run \
+         `socket-patch scan --mode hosted` so the regenerated lock is \
+         redirected (and trust-configured) again"
+    )
+}
+
+/// The unreadable-workspace fallback: pnpm-workspace.yaml EXISTS but could
+/// not be read (permissions, invalid UTF-8, I/O error). Planning a Create
+/// here would OVERWRITE the user's file with the root-only scaffold —
+/// destroying their `packages:` globs — so the auto-config stands down and
+/// the warning names the file, the error, and both manual recoveries.
+fn pnpm_trust_workspace_unreadable_detail(server: &str, err: &std::io::Error) -> String {
+    format!(
+        "{}. {PNPM_WORKSPACE_REL} exists but could not be read ({err}); it \
+         was left untouched — auto-configuring trust would risk overwriting \
+         it. Fix the file, then install with `pnpm install --trust-lockfile` \
+         or add `trustLockfile: true` to it yourself so every install \
+         accepts the patched artifacts. Do NOT follow pnpm's advice to \
+         rebuild the lockfile (`pnpm clean --lockfile`): that silently \
+         discards the redirect and reinstalls the vulnerable upstream \
+         artifact. pnpm <=10 installs work unchanged",
+        pnpm_trust_policy_preamble(server),
+    )
+}
+
+/// The pnpm-workspace.yaml read, classified for the trust auto-config:
+/// `Ok(Some(text))` — read fine; `Ok(None)` — ABSENT (`ErrorKind::NotFound`,
+/// the only state where planning a Create is safe); `Err(e)` — present but
+/// unreadable, so the caller must fall back to warning-only guidance. It
+/// was: a bare `.ok()` collapsed EVERY read error to `None`, so a
+/// present-but-unreadable workspace file was planned as a Create and
+/// OVERWRITTEN with the root-only scaffold, destroying the user's
+/// `packages:` globs.
+fn read_workspace_for_trust(path: &std::path::Path) -> std::io::Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// HEAL-ON-RERUN probe: does this (unspliced) root pnpm-lock.yaml already
+/// carry a granted hosted artifact URL from an EARLIER run? Same spelling
+/// set as the confirmation probe (raw / `\/`-escaped via
+/// `artifact_url_present`, plus the percent-encoded form) so a writer's
+/// spelling can never be one this probe misses. Lets an idempotent re-scan
+/// plan the trust config for a project that missed it once (opted-out first
+/// run, or a crash between the lock write and the workspace write) — the
+/// splice-only trigger skipped both forever on such projects.
+fn pnpm_lock_carries_hosted_redirect(
+    lock_text: &str,
+    overrides: &[socket_patch_core::patch::redirect::DepOverride],
+) -> bool {
+    overrides.iter().filter(|o| o.ecosystem == "npm").any(|o| {
+        let encoded = socket_patch_core::utils::uri::encode_uri_component(&o.artifact_url);
+        socket_patch_core::patch::redirect::artifact_url_present(lock_text, &o.artifact_url)
+            || lock_text.contains(encoded.as_str())
+    })
+}
+
+/// The HEAL-ON-RERUN gate: when this run spliced no root pnpm-lock.yaml
+/// (`root_spliced` false) but the on-disk root lock is v9 and already
+/// carries a granted hosted artifact URL, return its text so the trust
+/// block engages anyway. Legacy (<9) and unparseable-version locks stay
+/// `None` (fail closed: never write config for a lock era we can't read),
+/// as does a root lock this run DID splice (the splice path covers it).
+fn pnpm_heal_root<'a>(
+    root_spliced: bool,
+    disk_root: Option<&'a String>,
+    overrides: &[socket_patch_core::patch::redirect::DepOverride],
+) -> Option<&'a String> {
+    if root_spliced {
+        return None;
+    }
+    disk_root.filter(|text| {
+        pnpm_lock_version_major(text).is_some_and(|major| major >= 9)
+            && pnpm_lock_carries_hosted_redirect(text, overrides)
+    })
+}
+
+/// The auto-config variant: trust was (or, on `--dry-run`, would be)
+/// configured in pnpm-workspace.yaml, so installs need no flags.
+fn pnpm_trust_configured_detail(server: &str, created: bool, dry_run: bool) -> String {
+    let how = match (created, dry_run) {
+        (true, false) => "`trustLockfile: true` was written to a new",
+        (false, false) => "`trustLockfile: true` was merged into the existing",
+        (true, true) => "`trustLockfile: true` would be written to a new (--dry-run)",
+        (false, true) => "`trustLockfile: true` would be merged into the existing (--dry-run)",
+    };
+    format!(
+        "{}, so {how} {PNPM_WORKSPACE_REL} — commit it alongside the lock; \
+         installs need no extra flags. {PNPM_TRUST_TRADEOFF_AND_CAUTION}",
+        pnpm_trust_policy_preamble(server),
+    )
+}
+
+/// `lockfileVersion` major sniffed from a pnpm-lock.yaml head. pnpm 9-12
+/// emit `lockfileVersion: '9.0'` (single doc, first line — verified against
+/// real 7/8/9/10/11/12-rc locks in the 2026-08-18 matrix); pnpm 8 emits
+/// `'6.0'`, pnpm 7 an unquoted `5.4`. `None` when no parseable version line
+/// exists — callers treat that as "not trust-policy era" and stay
+/// hands-off (fail closed: never write config for a lock we can't read).
+fn pnpm_lock_version_major(lock_text: &str) -> Option<u32> {
+    lock_text.lines().find_map(|line| {
+        let rest = line.strip_prefix("lockfileVersion:")?;
+        let value = rest.trim().trim_matches(|c| c == '\'' || c == '"');
+        value.split('.').next()?.parse::<u32>().ok()
+    })
+}
+
+/// The planned pnpm-workspace.yaml `trustLockfile: true` edit.
+enum TrustPlan {
+    /// No workspace file: create it (root-only `packages` scaffold — pnpm 9
+    /// refuses a workspace file with no `packages` field — plus the trust
+    /// key; the same scaffold shape the vendor backend creates).
+    Create(String),
+    /// Workspace file exists without a `trustLockfile:` key: append exactly
+    /// one line after the last non-empty line, every other byte preserved.
+    Append(String),
+    /// Already `trustLockfile: true` — nothing to write.
+    AlreadyTrue,
+    /// The user explicitly set `trustLockfile: <value>` (non-true). Their
+    /// call is respected — flipping an explicit security setting behind the
+    /// user's back is worse than a failing install with a clear warning.
+    UserSet(String),
+}
+
+/// Decide how to ensure `trustLockfile: true` in pnpm-workspace.yaml.
+/// Line splices only (never a YAML library), mirroring the vendor backend's
+/// workspace surgery: untouched lines stay byte-identical, so a revert can
+/// remove exactly what was added.
+fn plan_workspace_trust(existing: Option<&str>) -> TrustPlan {
+    let Some(text) = existing else {
+        return TrustPlan::Create("packages:\n  - '.'\ntrustLockfile: true\n".to_string());
+    };
+    // Top-level key only: an indented `trustLockfile:` under some other
+    // mapping is not the setting pnpm reads.
+    for line in text.split('\n') {
+        if let Some(rest) = line.strip_prefix("trustLockfile:") {
+            let value = rest.trim().trim_matches(|c| c == '\'' || c == '"');
+            if value == "true" {
+                return TrustPlan::AlreadyTrue;
+            }
+            return TrustPlan::UserSet(value.to_string());
+        }
+    }
+    let mut lines: Vec<String> = text.split('\n').map(str::to_string).collect();
+    // After the last non-empty line (no blank separator): a revert removes
+    // exactly one line and the file's trailing bytes stay put.
+    let anchor = lines
+        .iter()
+        .rposition(|l| !l.trim().is_empty())
+        .map(|i| i + 1)
+        .unwrap_or(lines.len());
+    lines.insert(anchor, "trustLockfile: true".to_string());
+    TrustPlan::Append(lines.join("\n"))
 }
 
 /// The hosted-mode JSON error envelope, for bail-outs that return before the
@@ -588,8 +838,10 @@ pub(super) async fn run_redirect(
         }
     }
 
-    let rewrite = rewrite_registry_redirect(&files, &overrides);
-    let rewritten: Vec<String> = rewrite.files.keys().cloned().collect();
+    // `mut`: the pnpm trustLockfile auto-config below may fold a
+    // pnpm-workspace.yaml write (plus its ledger edit) into the rewrite set so
+    // it rides the same atomic-write / ledger-first machinery as the locks.
+    let mut rewrite = rewrite_registry_redirect(&files, &overrides);
 
     // The lockb→text migration is only KEPT when the rewrite actually landed
     // in the migrated bun.lock. Otherwise nothing was redirected there and the
@@ -650,30 +902,196 @@ pub(super) async fn run_redirect(
 
     // pnpm >=11 enforces a lockfile supply-chain policy: it compares each
     // resolution's tarball URL against the registry's published metadata and
-    // REFUSES the lock when they differ
-    // (`ERR_PNPM_TARBALL_URL_MISMATCH … has a tarball URL (https://patch.socket.dev/…)
-    // that does not match the registry's published metadata`). The hosted
-    // rewrite deliberately repoints tarball URLs at patch.socket.dev, so a
-    // pnpm >=11 install rejects the rewritten lock until the user opts in with
-    // `pnpm install --trust-lockfile` (which installs the patched artifact
-    // cleanly). Warn whenever the rewrite actually landed in ANY pnpm-lock.yaml
-    // — the plain root lock or a Rush nested/subspace lock (basename check).
+    // REFUSES a lock whose URLs differ. The failure spelling changed across
+    // majors (both observed against real installs): pnpm 11 fails with
+    // ERR_PNPM_TARBALL_URL_MISMATCH (ERR_PNPM_META_FETCH_FAIL when the
+    // registry is unreachable); pnpm 12 fails with
+    // ERR_PNPM_LOCKFILE_RESOLUTION_VERIFICATION, and its OWN error text tells
+    // users to rebuild the lock (`pnpm clean --lockfile` + install) — which
+    // silently discards the redirect and reinstalls the vulnerable upstream,
+    // so the warning must pre-empt that advice. The recoveries verified on
+    // both majors are the per-run `pnpm install --trust-lockfile` flag and
+    // the committable pnpm-workspace.yaml `trustLockfile: true` key; the
+    // `.npmrc` `trust-lockfile=true` spelling is IGNORED by pnpm and must
+    // never be recommended.
+    //
+    // ZERO-TOUCH DEFAULT: when this run rewrote the ROOT pnpm-lock.yaml and
+    // its lockfileVersion is >= 9 (pnpm 9-12 emit '9.0'; 5.x/6.0 locks mean
+    // pnpm 7/8, which have neither the policy nor the flag — those legacy
+    // locks get their own installs-work-unchanged guidance instead, never
+    // the `--trust-lockfile` headline pnpm 7/8 reject as an unknown option),
+    // the run auto-ensures `trustLockfile: true` in pnpm-workspace.yaml so
+    // CI needs no modification and installs need no flags. The same
+    // auto-config re-engages on a run that spliced NOTHING when the root v9
+    // lock already carries a granted hosted artifact URL (see HEAL-ON-RERUN
+    // below), so a missed config is healed by re-running the scan. Verified against real installs (2026-08-18 matrix +
+    // tolerance spikes): pnpm 9.15.9 / 10.34.5 silently ignore the key
+    // (frozen installs stay green), pnpm 11.22.0 / 12.0.0-rc.7 accept the
+    // redirected lock with it, and the per-entry sha512 integrity pin still
+    // fails closed on tampered bytes. An explicit user `trustLockfile:
+    // <non-true>` is RESPECTED (never flipped — the warning explains the
+    // manual recoveries instead), and `--no-trust-lockfile-config` opts out
+    // entirely. Rush nested/subspace locks are excluded: rush runs pnpm in
+    // common/temp, which never reads the repo-root pnpm-workspace.yaml, so a
+    // root write would be config theater — those runs keep the manual
+    // guidance. The warning names the host(s) the lock now points at: the
+    // hosted artifact host follows --api-url, so it is not always
+    // patch.socket.dev.
     let mut pnpm_warnings: Vec<serde_json::Value> = Vec::new();
-    if rewrite.files.keys().any(|key| {
-        std::path::Path::new(key)
-            .file_name()
-            .and_then(|n| n.to_str())
-            == Some("pnpm-lock.yaml")
-    }) {
-        pnpm_warnings.push(serde_json::json!({
-            "code": "redirect_pnpm_trust_lockfile",
-            "detail":
-                "pnpm-lock.yaml was repointed at patch.socket.dev; pnpm >=11 rejects \
-                 the rewritten lock with ERR_PNPM_TARBALL_URL_MISMATCH (its tarball \
-                 URL no longer matches the registry's published metadata). Install \
-                 with `pnpm install --trust-lockfile` to accept the patched artifacts",
-        }));
+    // The pnpm-workspace.yaml content + ledger edit this run will fold into
+    // the rewrite set (decided inside the borrow scope, applied after it).
+    let mut trust_config_write: Option<(String, socket_patch_core::patch::redirect::FileEdit)> =
+        None;
+    {
+        // pnpm locks spliced THIS run (any depth — the rewriter is
+        // basename-generalized).
+        let mut pnpm_lock_texts: Vec<&String> = rewrite
+            .files
+            .iter()
+            .filter(|(key, _)| {
+                std::path::Path::new(key)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    == Some("pnpm-lock.yaml")
+            })
+            .map(|(_, content)| content)
+            .collect();
+        // HEAL-ON-RERUN: a root v9 lock that ALREADY carries a granted hosted
+        // artifact URL (spliced by an earlier run) still plans the trust
+        // config even though this run spliced nothing — so a project that
+        // missed the config once (opted-out first run, or a crash between the
+        // lock write and the workspace write) is healed by simply re-running
+        // the scan. Without this, the idempotent no-op re-scan skipped both
+        // the config and the warning forever. An AlreadyTrue workspace keeps
+        // the re-run a byte-stable no-op.
+        let heal_root: Option<&String> = pnpm_heal_root(
+            rewrite.files.contains_key("pnpm-lock.yaml"),
+            files.get("pnpm-lock.yaml"),
+            &overrides,
+        );
+        if let Some(text) = heal_root {
+            pnpm_lock_texts.push(text);
+        }
+        if !pnpm_lock_texts.is_empty() {
+            // Name only the hosts whose artifact URL actually landed in a
+            // touched pnpm lock's final text (spliced this run, or the
+            // already-redirected heal root): an npm override may have matched
+            // only a sibling lock (e.g. package-lock.json), and naming its host
+            // here would point users at a server the pnpm lock never references.
+            // Same presence predicate as the confirmation probe below (raw /
+            // `\/`-escaped via artifact_url_present, plus the percent-encoded
+            // spelling) so a writer's spelling can never be one this filter
+            // misses.
+            let mut hosts: Vec<&str> = overrides
+                .iter()
+                .filter(|o| o.ecosystem == "npm")
+                .filter(|o| {
+                    let encoded =
+                        socket_patch_core::utils::uri::encode_uri_component(&o.artifact_url);
+                    pnpm_lock_texts.iter().any(|text| {
+                        socket_patch_core::patch::redirect::artifact_url_present(
+                            text,
+                            &o.artifact_url,
+                        ) || text.contains(encoded.as_str())
+                    })
+                })
+                .filter_map(|o| url_host(&o.artifact_url))
+                .collect();
+            hosts.sort_unstable();
+            hosts.dedup();
+            let server = if hosts.is_empty() {
+                "the hosted patch server".to_string()
+            } else {
+                format!("the hosted patch server ({})", hosts.join(", "))
+            };
+            // Root-lock gate (see the block comment above): only the plain
+            // project lock at lockfileVersion >= 9 gets the auto-config —
+            // spliced this run, or detected already-redirected (heal path).
+            let root_lock_v9 = heal_root.is_some()
+                || rewrite
+                    .files
+                    .get("pnpm-lock.yaml")
+                    .and_then(|text| pnpm_lock_version_major(text))
+                    .is_some_and(|major| major >= 9);
+            // Every touched pnpm lock is a KNOWN legacy (5.x/6.0) format —
+            // pnpm 7/8 territory, where neither the trust policy nor the
+            // `--trust-lockfile` flag exists (the flag is rejected as an
+            // unknown option), so the manual guidance's headline would hand
+            // users a command that errors. An unparseable version stays on
+            // the manual guidance: never claim "no trust step needed" for a
+            // lock whose era is unknown.
+            let all_locks_legacy = pnpm_lock_texts
+                .iter()
+                .all(|text| pnpm_lock_version_major(text).is_some_and(|major| major < 9));
+            let detail = if all_locks_legacy {
+                pnpm_trust_legacy_detail(&server)
+            } else if !root_lock_v9 || args.common.no_trust_lockfile_config {
+                pnpm_trust_manual_guidance(&server)
+            } else {
+                match read_workspace_for_trust(&args.common.cwd.join(PNPM_WORKSPACE_REL)) {
+                    // Present but UNREADABLE: never plan a Create (it would
+                    // overwrite the user's workspace file) — fall back to
+                    // warning-only guidance naming the file and the error.
+                    Err(e) => pnpm_trust_workspace_unreadable_detail(&server, &e),
+                    Ok(ws_existing) => match plan_workspace_trust(ws_existing.as_deref()) {
+                        TrustPlan::Create(text) => {
+                            trust_config_write = Some((
+                                text,
+                                socket_patch_core::patch::redirect::FileEdit {
+                                    path: PNPM_WORKSPACE_REL.into(),
+                                    kind: REDIRECT_PNPM_WORKSPACE_TRUST_EDIT_KIND.into(),
+                                    action: "created".into(),
+                                    key: Some("trustLockfile".into()),
+                                    original: None,
+                                    new: Some(serde_json::json!("true")),
+                                },
+                            ));
+                            pnpm_trust_configured_detail(&server, true, args.common.dry_run)
+                        }
+                        TrustPlan::Append(text) => {
+                            trust_config_write = Some((
+                                text,
+                                socket_patch_core::patch::redirect::FileEdit {
+                                    path: PNPM_WORKSPACE_REL.into(),
+                                    kind: REDIRECT_PNPM_WORKSPACE_TRUST_EDIT_KIND.into(),
+                                    action: "added".into(),
+                                    key: Some("trustLockfile".into()),
+                                    original: None,
+                                    new: Some(serde_json::json!("true")),
+                                },
+                            ));
+                            pnpm_trust_configured_detail(&server, false, args.common.dry_run)
+                        }
+                        TrustPlan::AlreadyTrue => format!(
+                            "{}, and {PNPM_WORKSPACE_REL} already carries `trustLockfile: \
+                         true` — keep it committed alongside the lock; installs need \
+                         no extra flags. {PNPM_TRUST_TRADEOFF_AND_CAUTION}",
+                            pnpm_trust_policy_preamble(&server),
+                        ),
+                        TrustPlan::UserSet(value) => format!(
+                            "{}. {PNPM_WORKSPACE_REL} explicitly sets `trustLockfile: \
+                         {value}`, which was respected and left untouched — install \
+                         with `pnpm install --trust-lockfile`, or set `trustLockfile: \
+                         true` yourself so every install accepts the patched \
+                         artifacts. {PNPM_TRUST_TRADEOFF_AND_CAUTION}",
+                            pnpm_trust_policy_preamble(&server),
+                        ),
+                    },
+                }
+            };
+            pnpm_warnings.push(serde_json::json!({
+                "code": "redirect_pnpm_trust_lockfile",
+                "detail": detail,
+            }));
+        }
     }
+    if let Some((text, edit)) = trust_config_write {
+        rewrite.files.insert(PNPM_WORKSPACE_REL.to_string(), text);
+        // Appended last: `--revert` walks edits in reverse, so the trust key
+        // is unwound before the lock originals are restored.
+        rewrite.edits.push(edit);
+    }
+    let rewritten: Vec<String> = rewrite.files.keys().cloned().collect();
 
     // A dep counts as REDIRECTED only if its hosted-artifact URL (or its
     // per-dependency registry index URL) actually landed in the project's
@@ -1022,8 +1440,372 @@ pub(super) async fn run_redirect(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_redirect_json_envelope, parse_purl_simple, REDIRECT_CANDIDATE_FILES};
+    use super::{
+        build_redirect_json_envelope, parse_purl_simple, plan_workspace_trust, pnpm_heal_root,
+        pnpm_lock_carries_hosted_redirect, pnpm_lock_version_major, pnpm_trust_configured_detail,
+        pnpm_trust_legacy_detail, pnpm_trust_manual_guidance,
+        pnpm_trust_workspace_unreadable_detail, read_workspace_for_trust, TrustPlan,
+        REDIRECT_CANDIDATE_FILES,
+    };
     use socket_patch_core::constants::npm_family;
+    use socket_patch_core::patch::redirect::DepOverride;
+
+    /// Lock-head version sniff against the byte-real heads the 2026-08-18
+    /// matrix captured from pnpm 7/8/9-12: quoted `'9.0'` and `'6.0'`,
+    /// unquoted `5.4`; a headless/garbled lock yields `None` (hands-off).
+    #[test]
+    fn pnpm_lock_version_major_sniffs_real_lock_heads() {
+        assert_eq!(
+            pnpm_lock_version_major("lockfileVersion: '9.0'\n\nsettings:\n"),
+            Some(9),
+            "pnpm 9-12 emit a quoted '9.0'"
+        );
+        assert_eq!(
+            pnpm_lock_version_major("lockfileVersion: '6.0'\n\nsettings:\n"),
+            Some(6),
+            "pnpm 8 emits a quoted '6.0'"
+        );
+        assert_eq!(
+            pnpm_lock_version_major("lockfileVersion: 5.4\n\nspecifiers:\n"),
+            Some(5),
+            "pnpm 7 emits an unquoted 5.4"
+        );
+        // Not necessarily the first line (a comment/BOM-damaged head).
+        assert_eq!(
+            pnpm_lock_version_major("# managed\nlockfileVersion: \"9.0\"\n"),
+            Some(9)
+        );
+        assert_eq!(
+            pnpm_lock_version_major("importers:\n  .:\n"),
+            None,
+            "no version line → None, callers stay hands-off"
+        );
+        assert_eq!(
+            pnpm_lock_version_major("lockfileVersion: banana\n"),
+            None,
+            "unparseable version → None, never a guess"
+        );
+    }
+
+    /// No pnpm-workspace.yaml → create the root-only scaffold + trust key
+    /// (the exact bytes the vendor backend's scaffold precedent uses, with
+    /// `trustLockfile: true` in place of the override).
+    #[test]
+    fn plan_workspace_trust_creates_the_scaffold() {
+        match plan_workspace_trust(None) {
+            TrustPlan::Create(text) => {
+                assert_eq!(text, "packages:\n  - '.'\ntrustLockfile: true\n");
+            }
+            _ => panic!("no workspace file must plan a Create"),
+        }
+    }
+
+    /// An existing workspace file gains exactly one line after its last
+    /// non-empty line; every other byte — including a trailing blank line and
+    /// comments — is preserved so a revert can remove exactly that line.
+    #[test]
+    fn plan_workspace_trust_appends_preserving_user_bytes() {
+        let user = "# team workspace\npackages:\n  - 'apps/*'\n  - 'libs/*'\n\ncatalog:\n  react: ^18.0.0\n";
+        match plan_workspace_trust(Some(user)) {
+            TrustPlan::Append(text) => {
+                assert_eq!(
+                    text,
+                    "# team workspace\npackages:\n  - 'apps/*'\n  - 'libs/*'\n\ncatalog:\n  react: ^18.0.0\ntrustLockfile: true\n",
+                    "one line appended after the last non-empty line, all user bytes intact"
+                );
+            }
+            _ => panic!("a file without the key must plan an Append"),
+        }
+        // No trailing newline: the file's (lack of) trailing bytes stays put.
+        match plan_workspace_trust(Some("packages:\n  - '.'")) {
+            TrustPlan::Append(text) => {
+                assert_eq!(text, "packages:\n  - '.'\ntrustLockfile: true");
+            }
+            _ => panic!("expected Append"),
+        }
+    }
+
+    /// `trustLockfile: true` already present (any quoting) → nothing to do;
+    /// an explicit non-true value is the USER's security call and is
+    /// respected, never flipped.
+    #[test]
+    fn plan_workspace_trust_respects_existing_key() {
+        for spelled in [
+            "packages:\n  - '.'\ntrustLockfile: true\n",
+            "trustLockfile: 'true'\npackages:\n  - '.'\n",
+            "trustLockfile: \"true\"\n",
+        ] {
+            assert!(
+                matches!(plan_workspace_trust(Some(spelled)), TrustPlan::AlreadyTrue),
+                "already-true must be a no-op for {spelled:?}"
+            );
+        }
+        match plan_workspace_trust(Some("packages:\n  - '.'\ntrustLockfile: false\n")) {
+            TrustPlan::UserSet(value) => assert_eq!(value, "false"),
+            _ => panic!("an explicit false must be respected as UserSet"),
+        }
+        // An INDENTED trustLockfile under some other mapping is not the
+        // top-level setting pnpm reads — it must not be mistaken for one.
+        match plan_workspace_trust(Some(
+            "catalogMode:\n  trustLockfile: false\npackages:\n  - '.'\n",
+        )) {
+            TrustPlan::Append(text) => assert!(text.ends_with("trustLockfile: true\n")),
+            _ => panic!("an indented key must not block the top-level append"),
+        }
+    }
+
+    /// The warning variants: the configured text says trust is in place and
+    /// installs need no flags; the dry-run text says WOULD; both carry the
+    /// whole-lock tradeoff disclosure and the don't-rebuild caution; the
+    /// manual-guidance text keeps both verified recoveries. None may leak a
+    /// URL authority `@` (the userinfo-stripping contract).
+    #[test]
+    fn pnpm_trust_warning_variants_carry_the_load_bearing_sentences() {
+        let server = "the hosted patch server (patch.test)";
+        for created in [true, false] {
+            let configured = pnpm_trust_configured_detail(server, created, false);
+            assert!(configured.contains("trustLockfile: true"), "{configured}");
+            assert!(configured.contains("pnpm-workspace.yaml"), "{configured}");
+            assert!(
+                configured.contains("commit it alongside the lock"),
+                "{configured}"
+            );
+            assert!(configured.contains("no extra flags"), "{configured}");
+            assert!(!configured.contains("would be"), "{configured}");
+            let dry = pnpm_trust_configured_detail(server, created, true);
+            assert!(dry.contains("would be"), "{dry}");
+            assert!(dry.contains("--dry-run"), "{dry}");
+            for text in [&configured, &dry] {
+                assert!(text.contains("ALL lockfile entries"), "{text}");
+                assert!(text.contains("minimumReleaseAge"), "{text}");
+                assert!(text.contains("sha512 integrity pins are"), "{text}");
+                assert!(text.contains("pnpm clean --lockfile"), "{text}");
+                assert!(text.contains("pnpm <=10"), "{text}");
+                assert!(
+                    text.contains("ERR_PNPM_TARBALL_URL_MISMATCH")
+                        && text.contains("ERR_PNPM_LOCKFILE_RESOLUTION_VERIFICATION"),
+                    "{text}"
+                );
+                assert!(!text.contains('@'), "no URL authority may leak: {text}");
+                assert!(!text.contains(".npmrc"), "{text}");
+            }
+        }
+        let manual = pnpm_trust_manual_guidance(server);
+        assert!(manual.contains("--trust-lockfile"), "{manual}");
+        assert!(
+            manual.contains("trustLockfile: true") && manual.contains("pnpm-workspace.yaml"),
+            "{manual}"
+        );
+        assert!(manual.contains("pnpm clean --lockfile"), "{manual}");
+        assert!(manual.contains("pnpm <=10"), "{manual}");
+        assert!(!manual.contains('@'), "{manual}");
+    }
+
+    /// FINDING-10 regression: the legacy-lock (5.x/6.0 — pnpm 7/8) guidance
+    /// must NEVER mention `--trust-lockfile` (pnpm 7/8 reject the flag as an
+    /// unknown option) nor the `trustLockfile` setting (pnpm 7/8 ignore it);
+    /// it must say installs work unchanged with no trust step, keep the
+    /// don't-regenerate caution, and leak no URL authority. RED-verified: the
+    /// pre-fix manual guidance headlined `pnpm install --trust-lockfile` for
+    /// legacy locks, which errors out on pnpm 7/8.
+    #[test]
+    fn pnpm_trust_legacy_detail_never_recommends_the_trust_flag() {
+        let server = "the hosted patch server (patch.test)";
+        let legacy = pnpm_trust_legacy_detail(server);
+        assert!(
+            !legacy.contains("trust-lockfile"),
+            "pnpm 7/8 reject --trust-lockfile as an unknown option: {legacy}"
+        );
+        assert!(
+            !legacy.contains("trustLockfile"),
+            "pnpm 7/8 ignore the setting — recommending it is noise: {legacy}"
+        );
+        assert!(legacy.contains("pnpm 7/8"), "{legacy}");
+        assert!(legacy.contains("installs work unchanged"), "{legacy}");
+        assert!(legacy.contains("no trust step"), "{legacy}");
+        // The vulnerable-reinstall caution survives the split: regenerating
+        // the lock still silently discards the redirect.
+        assert!(legacy.contains("Do NOT regenerate"), "{legacy}");
+        assert!(legacy.contains("vulnerable upstream"), "{legacy}");
+        assert!(!legacy.contains('@'), "no URL authority may leak: {legacy}");
+    }
+
+    /// FINDING-5 regression: a PRESENT-but-unreadable pnpm-workspace.yaml
+    /// must classify as `Err` — never as `Ok(None)`, which plans a Create
+    /// that overwrites the user's file (destroying their `packages:` globs).
+    /// Absent stays `Ok(None)` (the only Create-safe state); readable stays
+    /// `Ok(Some)`. RED-verified: the pre-fix `.ok()` collapsed the
+    /// invalid-UTF-8 read error below to `None`.
+    #[test]
+    fn read_workspace_for_trust_distinguishes_unreadable_from_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Absent → Ok(None).
+        assert!(matches!(
+            read_workspace_for_trust(&tmp.path().join("pnpm-workspace.yaml")),
+            Ok(None)
+        ));
+        // Readable → Ok(Some(text)).
+        let readable = tmp.path().join("readable.yaml");
+        std::fs::write(&readable, "packages:\n  - '.'\n").unwrap();
+        assert!(matches!(
+            read_workspace_for_trust(&readable),
+            Ok(Some(text)) if text.contains("packages")
+        ));
+        // Invalid UTF-8 → Err(InvalidData), cross-platform.
+        let invalid = tmp.path().join("invalid.yaml");
+        std::fs::write(&invalid, b"packages:\n  - 'apps/*'\n\xff\xfe\x80").unwrap();
+        let err = read_workspace_for_trust(&invalid)
+            .expect_err("invalid UTF-8 must classify as Err, never as absent→Create");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        // chmod 000 (unix): PermissionDenied → Err. Root ignores mode bits,
+        // so only the failing-read outcome is asserted strictly.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let locked = tmp.path().join("locked.yaml");
+            std::fs::write(&locked, "packages:\n  - '.'\n").unwrap();
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+            match read_workspace_for_trust(&locked) {
+                Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied),
+                // Running as root: mode bits don't apply; the invalid-UTF-8
+                // case above already proved the Err classification.
+                Ok(Some(_)) => {}
+                Ok(None) => panic!("an unreadable file must never classify as absent"),
+            }
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        // The fallback detail names the file, the error, and both manual
+        // recoveries — and never plans a write (it returns prose only).
+        let server = "the hosted patch server (patch.test)";
+        let detail = pnpm_trust_workspace_unreadable_detail(
+            server,
+            &std::io::Error::new(std::io::ErrorKind::PermissionDenied, "permission denied"),
+        );
+        assert!(detail.contains("pnpm-workspace.yaml"), "{detail}");
+        assert!(detail.contains("could not be read"), "{detail}");
+        assert!(detail.contains("permission denied"), "{detail}");
+        assert!(detail.contains("left untouched"), "{detail}");
+        assert!(
+            detail.contains("--trust-lockfile") && detail.contains("trustLockfile: true"),
+            "{detail}"
+        );
+        assert!(detail.contains("pnpm clean --lockfile"), "{detail}");
+    }
+
+    fn npm_override(artifact_url: &str) -> DepOverride {
+        DepOverride {
+            ecosystem: "npm".to_string(),
+            name: "in-proc-heal".to_string(),
+            namespace: None,
+            version: "1.0.0".to_string(),
+            token: "tok".to_string(),
+            patch_uuid: "11111111-1111-4111-8111-111111111111".to_string(),
+            artifact_url: artifact_url.to_string(),
+            berry_zip_url: None,
+            registry_override: None,
+            integrity: Default::default(),
+        }
+    }
+
+    /// FINDING-6 regression (heal-on-rerun probe): a root lock ALREADY
+    /// carrying a granted hosted artifact URL from an earlier run — raw,
+    /// `\/`-escaped, or percent-encoded — is detected even when this run
+    /// spliced nothing, so the trust config can be (re)planned for a project
+    /// that missed it (opted-out first run, or a crash between the lock
+    /// write and the workspace write). A pristine lock, and a lock whose
+    /// only match is a NON-npm override's URL, must stay undetected.
+    #[test]
+    fn pnpm_lock_carries_hosted_redirect_detects_prior_run_splices() {
+        let url = "http://patch.test/patch/npm/in-proc-heal/1.0.0/tok/uuid/in-proc-heal-1.0.0.tgz";
+        let mut cargo = npm_override("http://patch.test/crates/heal-1.0.0.crate");
+        cargo.ecosystem = "cargo".to_string();
+        let overrides = vec![npm_override(url), cargo];
+
+        // The exact splice shape an earlier run wrote (heal-on-rerun with a
+        // pre-redirected lock and a missing workspace file: this probe is
+        // what re-engages the trust planning on the re-scan).
+        let redirected = format!(
+            "lockfileVersion: '9.0'\n\npackages:\n  in-proc-heal@1.0.0:\n    \
+             resolution: {{integrity: sha512-PATCHED==, tarball: {url}}}\n"
+        );
+        assert!(pnpm_lock_carries_hosted_redirect(&redirected, &overrides));
+
+        // The percent-encoded spelling counts too (same predicate set as the
+        // confirmation probe).
+        let encoded = socket_patch_core::utils::uri::encode_uri_component(url);
+        let encoded_lock = format!("lockfileVersion: '9.0'\npackages:\n  x: {encoded}\n");
+        assert!(pnpm_lock_carries_hosted_redirect(&encoded_lock, &overrides));
+
+        // Pristine lock: nothing to heal.
+        assert!(!pnpm_lock_carries_hosted_redirect(
+            "lockfileVersion: '9.0'\n\npackages:\n  in-proc-heal@1.0.0:\n    \
+             resolution: {integrity: sha512-UPSTREAM==}\n",
+            &overrides
+        ));
+
+        // A non-npm override's URL in the text is not a pnpm redirect.
+        assert!(!pnpm_lock_carries_hosted_redirect(
+            "lockfileVersion: '9.0'\n# http://patch.test/crates/heal-1.0.0.crate\n",
+            &overrides
+        ));
+
+        // No grants at all → never engages.
+        assert!(!pnpm_lock_carries_hosted_redirect(&redirected, &[]));
+    }
+
+    /// FINDING-6 regression (heal-on-rerun gate, the production
+    /// `pnpm_heal_root` wiring): a re-scan that spliced NOTHING over a
+    /// pre-redirected root v9 lock with a MISSING pnpm-workspace.yaml must
+    /// engage the trust block (heal → plan Create), while a legacy
+    /// pre-redirected lock, an unparseable-version lock, a pristine lock,
+    /// and a root lock this run DID splice all stay out of the heal path.
+    /// RED-verified by construction: the pre-fix trigger was
+    /// `!spliced.is_empty()` alone, i.e. this gate always answered None.
+    #[test]
+    fn pnpm_heal_root_re_engages_trust_planning_for_pre_redirected_v9_locks() {
+        let url = "http://patch.test/patch/npm/in-proc-heal/1.0.0/tok/uuid/in-proc-heal-1.0.0.tgz";
+        let overrides = vec![npm_override(url)];
+        let redirected_v9 = format!(
+            "lockfileVersion: '9.0'\n\npackages:\n  in-proc-heal@1.0.0:\n    \
+             resolution: {{integrity: sha512-PATCHED==, tarball: {url}}}\n"
+        );
+
+        // The heal scenario: nothing spliced this run, root lock already
+        // redirected, workspace file missing → the gate engages and the
+        // planning it feeds produces the Create the crashed/opted-out first
+        // run never wrote.
+        let healed = pnpm_heal_root(false, Some(&redirected_v9), &overrides)
+            .expect("a pre-redirected root v9 lock must re-engage the trust block");
+        assert_eq!(healed, &redirected_v9);
+        assert!(
+            matches!(plan_workspace_trust(None), TrustPlan::Create(_)),
+            "with the workspace file missing, the healed run must plan the Create"
+        );
+
+        // Root lock spliced THIS run: the splice path covers it — no heal.
+        assert!(pnpm_heal_root(true, Some(&redirected_v9), &overrides).is_none());
+
+        // Pristine v9 lock (no redirect landed): nothing to heal.
+        let pristine = "lockfileVersion: '9.0'\n\npackages:\n  in-proc-heal@1.0.0:\n    \
+                        resolution: {integrity: sha512-UPSTREAM==}\n"
+            .to_string();
+        assert!(pnpm_heal_root(false, Some(&pristine), &overrides).is_none());
+
+        // Legacy pre-redirected lock: pnpm 7/8 need no trust config — the
+        // heal gate must not drag a 5.x/6.0 lock into the v9 auto-config.
+        let redirected_v6 = format!(
+            "lockfileVersion: '6.0'\n\npackages:\n  /in-proc-heal@1.0.0:\n    \
+             resolution: {{integrity: sha512-PATCHED==, tarball: {url}}}\n"
+        );
+        assert!(pnpm_heal_root(false, Some(&redirected_v6), &overrides).is_none());
+
+        // Unparseable version: fail closed, hands off.
+        let headless = format!("packages:\n  x:\n    resolution: {{tarball: {url}}}\n");
+        assert!(pnpm_heal_root(false, Some(&headless), &overrides).is_none());
+
+        // No root lock at all (e.g. Rush): nothing to heal.
+        assert!(pnpm_heal_root(false, None, &overrides).is_none());
+    }
 
     #[test]
     fn parse_purl_simple_percent_decodes_name_and_version() {

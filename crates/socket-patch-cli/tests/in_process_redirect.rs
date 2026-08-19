@@ -1564,6 +1564,14 @@ async fn scan_redirect_rewrites_rush_common_and_subspace_locks() {
         !tmp.path().join("pnpm-lock.yaml").exists(),
         "the rewrite must edit nested locks in place, not create a root lock"
     );
+    // And no root pnpm-workspace.yaml either: rush runs pnpm in common/temp,
+    // which never reads the repo root, so the trustLockfile auto-config
+    // (root-lock-gated) must stay hands-off here — writing it would be
+    // config theater.
+    assert!(
+        !tmp.path().join("pnpm-workspace.yaml").exists(),
+        "rush nested-lock redirects must not create a root pnpm-workspace.yaml"
+    );
 
     // repo-state.json present → the stale-hash warning fires.
     let out = std::fs::read_to_string(tmp.path().join(".socket/vendor/redirect-state.json"))
@@ -1580,6 +1588,13 @@ async fn scan_redirect_rewrites_rush_common_and_subspace_locks() {
 /// hosting test can't read back. No package-manager binary is needed: the
 /// rewrite is pure text over the fixture locks.
 fn run_redirect_subprocess(cwd: &Path, api_url: &str) -> serde_json::Value {
+    run_redirect_subprocess_with(cwd, api_url, &[])
+}
+
+/// [`run_redirect_subprocess`] with extra CLI flags appended (e.g. the
+/// `--no-trust-lockfile-config` opt-out), so flag-dependent envelope shapes
+/// are exercised through the real clap parse.
+fn run_redirect_subprocess_with(cwd: &Path, api_url: &str, extra: &[&str]) -> serde_json::Value {
     let out = scrubbed_cli()
         .args([
             "scan",
@@ -1595,6 +1610,7 @@ fn run_redirect_subprocess(cwd: &Path, api_url: &str) -> serde_json::Value {
             "--api-token",
             "fake",
         ])
+        .args(extra)
         .output()
         .expect("run socket-patch");
     assert_eq!(
@@ -1702,6 +1718,96 @@ async fn redirect_inbundle_only_dep_is_skipped_not_confirmed() {
         !after.contains(HOSTED_URL),
         "the hosted URL must never appear (it would confirm + attest): {after}"
     );
+}
+
+/// A pnpm v6 lock resolving the patched dep through BOTH a plain key and a
+/// nested-peer-paren key (`/pkg@1.0.0(react@18.2.0(scheduler@0.23.2)):` —
+/// a spelling the splice grammar cannot parse) must be refused whole:
+/// `redirected: 0`, the lock byte-untouched, the hosted URL nowhere (a
+/// partial splice would have landed it in the lock, and the confirmation
+/// probe would then confirm + VEX-attest the dep while dependents through
+/// the nested-peer instance keep installing the unpatched upstream tarball),
+/// a `redirect_pnpm_unsupported_lock_key` warning naming the residual key,
+/// and no redirect-ledger record claiming the purl. Subprocess so the
+/// `--json` envelope's `redirected` count and `warnings[]` can be read back.
+#[tokio::test]
+#[serial]
+async fn redirect_pnpm_nested_peer_residual_refuses_dep_not_confirmed() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+
+    let tmp = tempfile::tempdir().expect("create the fixture tempdir");
+    std::fs::write(
+        tmp.path().join("package.json"),
+        format!(
+            r#"{{ "name": "consumer", "version": "0.0.0", "dependencies": {{ "{NAME}": "{VERSION}" }} }}"#
+        ),
+    )
+    .expect("write the consumer package.json");
+    let pkg = tmp.path().join("node_modules").join(NAME);
+    std::fs::create_dir_all(&pkg).expect("create the installed package dir");
+    std::fs::write(
+        pkg.join("package.json"),
+        format!(r#"{{ "name": "{NAME}", "version": "{VERSION}" }}"#),
+    )
+    .expect("write the installed package.json");
+    let lock = format!(
+        "lockfileVersion: '6.0'
+
+dependencies:
+  {NAME}:
+    specifier: {VERSION}
+    version: {VERSION}
+
+packages:
+
+  /{NAME}@{VERSION}:
+    resolution: {{integrity: sha512-UPSTREAMupstream==}}
+    dev: false
+
+  /{NAME}@{VERSION}(react@18.2.0(scheduler@0.23.2)):
+    resolution: {{integrity: sha512-UPSTREAMupstream==}}
+    dev: false
+"
+    );
+    std::fs::write(tmp.path().join("pnpm-lock.yaml"), &lock)
+        .expect("write the mixed plain + nested-peer pnpm lock");
+
+    let env = run_redirect_subprocess(tmp.path(), &server.uri());
+    assert_eq!(
+        env["redirect"]["redirected"], 0,
+        "a residual-instance dep must NOT be counted redirected: {env}"
+    );
+    let codes = warning_codes(&env);
+    assert!(
+        codes.contains(&"redirect_pnpm_unsupported_lock_key".to_string()),
+        "the residual refusal warning must reach the envelope: {env}"
+    );
+    let after = std::fs::read_to_string(tmp.path().join("pnpm-lock.yaml"))
+        .expect("read back the pnpm-lock.yaml the run must have left alone");
+    assert_eq!(after, lock, "the lockfile must be byte-untouched");
+    assert!(
+        !after.contains(HOSTED_URL),
+        "the hosted URL must never appear (it would confirm + attest): {after}"
+    );
+    // No ledger half-claims the purl either: an unconfirmed dep must fetch
+    // no record and record no edits.
+    let ledger_path = tmp.path().join(".socket/vendor/redirect-state.json");
+    if let Ok(text) = std::fs::read_to_string(&ledger_path) {
+        let ledger: serde_json::Value =
+            serde_json::from_str(&text).expect("the redirect ledger must be valid JSON");
+        assert!(
+            ledger["records"].get(PURL).is_none(),
+            "an unconfirmed dep must not be recorded: {ledger}"
+        );
+        let claimed = ledger["edits"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|e| e["key"].as_str().is_some_and(|k| k.contains(NAME)));
+        assert!(!claimed, "no edit may claim the refused dep: {ledger}");
+    }
 }
 
 /// The rewriters' own warnings must reach HUMAN mode too, not just the
@@ -1985,17 +2091,26 @@ fn write_pnpm_project(root: &Path) {
     std::fs::write(root.join("pnpm-lock.yaml"), rush_pnpm_lock(NAME)).unwrap();
 }
 
-/// A hosted redirect that rewrites a `pnpm-lock.yaml` must warn that pnpm >=11's
-/// lockfile supply-chain policy will REJECT the rewritten lock
-/// (`ERR_PNPM_TARBALL_URL_MISMATCH` — the repointed tarball URL no longer
-/// matches the registry's published metadata) and name the documented
-/// `pnpm install --trust-lockfile` opt-out — the same way the Rush repo-state
-/// case surfaces its own post-rewrite install caveat. The npm twin
+/// A hosted redirect that rewrites the root v9 `pnpm-lock.yaml` AUTO-CONFIGURES
+/// `trustLockfile: true` in pnpm-workspace.yaml (zero-touch: pnpm >=11's
+/// lockfile supply-chain policy rejects the rewritten lock otherwise, and the
+/// committable workspace key is the verified recovery both majors honor while
+/// pnpm 9/10 silently ignore it), and the `redirect_pnpm_trust_lockfile`
+/// warning must say so: trust is configured, commit the file alongside the
+/// lock, installs need no flags — naming BOTH failure spellings (pnpm 11:
+/// `ERR_PNPM_TARBALL_URL_MISMATCH`, pnpm 12:
+/// `ERR_PNPM_LOCKFILE_RESOLUTION_VERIFICATION`), disclosing the whole-lock
+/// tradeoff (trustLockfile skips pnpm's re-verification for ALL entries), and
+/// pre-empting pnpm 12's own rebuild-the-lock advice, which silently
+/// reinstates the vulnerable upstream. The named host must be the SPLICED
+/// artifact host (here the fixture's `patch.test`), never a hardcoded
+/// `patch.socket.dev` — the hosted host follows `--api-url`. The npm twin
 /// (package-lock.json, no pnpm lock) rewrites identically but emits no such
-/// warning. Subprocess so the `--json` `warnings[]` array can be read back.
+/// warning and no workspace file. Subprocess so the `--json` `warnings[]`
+/// array can be read back.
 #[tokio::test]
 #[serial]
-async fn pnpm_lock_redirect_warns_to_trust_lockfile() {
+async fn pnpm_lock_redirect_autoconfigures_trust_lockfile_and_says_so() {
     let server = MockServer::start().await;
     mock_discovery(&server).await;
     mock_reference(&server).await;
@@ -2010,12 +2125,28 @@ async fn pnpm_lock_redirect_warns_to_trust_lockfile() {
         env["redirect"]["redirected"], 1,
         "anchor: the pnpm lock must have been redirected: {env}"
     );
+    // The zero-touch write itself: a fresh pnpm-workspace.yaml with the
+    // root-only scaffold + the trust key, and it counts as a rewritten file
+    // (a CI consumer committing rewrittenFiles must not miss it).
+    let ws = std::fs::read_to_string(pnpm.path().join("pnpm-workspace.yaml"))
+        .expect("the run must create pnpm-workspace.yaml");
+    assert_eq!(
+        ws, "packages:\n  - '.'\ntrustLockfile: true\n",
+        "created workspace file must be the scaffold + trust key"
+    );
+    assert!(
+        env["redirect"]["rewrittenFiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f == "pnpm-workspace.yaml"),
+        "pnpm-workspace.yaml must be listed in rewrittenFiles: {env}"
+    );
     assert!(
         warning_codes(&env).contains(&"redirect_pnpm_trust_lockfile".to_string()),
         "a rewritten pnpm-lock.yaml must warn about the pnpm >=11 policy; got warnings {:?}",
         warning_codes(&env)
     );
-    // The warning must NAME the documented opt-out flag.
     let detail = env["redirect"]["warnings"]
         .as_array()
         .unwrap()
@@ -2023,12 +2154,68 @@ async fn pnpm_lock_redirect_warns_to_trust_lockfile() {
         .find(|w| w["code"] == "redirect_pnpm_trust_lockfile")
         .and_then(|w| w["detail"].as_str())
         .unwrap_or_default();
+    // The new reality: trust is configured; commit it; no flags needed.
     assert!(
-        detail.contains("--trust-lockfile"),
-        "the warning must name `pnpm install --trust-lockfile`; got: {detail}"
+        detail.contains("trustLockfile: true") && detail.contains("pnpm-workspace.yaml"),
+        "the warning must name the configured pnpm-workspace.yaml \
+         `trustLockfile: true` key; got: {detail}"
+    );
+    assert!(
+        detail.contains("commit it alongside the lock") && detail.contains("no extra flags"),
+        "the warning must say trust is configured and installs need no flags; got: {detail}"
+    );
+    // The security tradeoff, stated honestly: the skip covers the WHOLE lock.
+    assert!(
+        detail.contains("ALL lockfile entries") && detail.contains("minimumReleaseAge"),
+        "the warning must disclose the whole-lock re-verification skip; got: {detail}"
+    );
+    // The `.npmrc` `trust-lockfile=true` spelling is IGNORED by pnpm and
+    // must never be recommended.
+    assert!(
+        !detail.contains(".npmrc"),
+        "the warning must not point at .npmrc (pnpm ignores that spelling); got: {detail}"
+    );
+    // Both major-specific failure spellings.
+    assert!(
+        detail.contains("ERR_PNPM_TARBALL_URL_MISMATCH")
+            && detail.contains("ERR_PNPM_LOCKFILE_RESOLUTION_VERIFICATION"),
+        "the warning must name the pnpm 11 AND pnpm 12 error codes; got: {detail}"
+    );
+    // pnpm 12's error text steers users to rebuild the lock, which discards
+    // the redirect — the warning must pre-empt it and scope the blast radius.
+    assert!(
+        detail.contains("pnpm clean --lockfile"),
+        "the warning must pre-empt pnpm's rebuild-the-lock advice; got: {detail}"
+    );
+    assert!(
+        detail.contains("pnpm <=10"),
+        "the warning must scope the failure to pnpm >=11; got: {detail}"
+    );
+    // The host is derived from the spliced tarball URL (the fixture's
+    // HOSTED_URL host), never hardcoded.
+    assert!(
+        detail.contains("patch.test") && !detail.contains("patch.socket.dev"),
+        "the warning must name the actual spliced host, not patch.socket.dev; \
+         got: {detail}"
     );
 
-    // npm twin: only a package-lock.json is rewritten → no pnpm warning.
+    // The ledger records the workspace-trust edit (created ⇒ revert deletes).
+    let ledger: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(pnpm.path().join(".socket/vendor/redirect-state.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        ledger["edits"].as_array().unwrap().iter().any(|e| {
+            e["kind"] == "redirect_pnpm_workspace_trust"
+                && e["action"] == "created"
+                && e["path"] == "pnpm-workspace.yaml"
+                && e["key"] == "trustLockfile"
+        }),
+        "the ledger must record the created workspace-trust edit: {ledger}"
+    );
+
+    // npm twin: only a package-lock.json is rewritten → no pnpm warning and
+    // no workspace file materializes.
     let npm = tempfile::tempdir().unwrap();
     write_project(npm.path());
     let env = run_redirect_subprocess(npm.path(), &server.uri());
@@ -2037,6 +2224,348 @@ async fn pnpm_lock_redirect_warns_to_trust_lockfile() {
         !warning_codes(&env).contains(&"redirect_pnpm_trust_lockfile".to_string()),
         "an npm-only redirect must not emit the pnpm trust-lockfile warning; got warnings {:?}",
         warning_codes(&env)
+    );
+    assert!(
+        !npm.path().join("pnpm-workspace.yaml").exists(),
+        "an npm-only redirect must not create pnpm-workspace.yaml"
+    );
+}
+
+/// `--no-trust-lockfile-config` (the opt-out for users who refuse the
+/// whole-lock trust tradeoff): the redirect still lands, but nothing touches
+/// pnpm-workspace.yaml, the ledger records no workspace-trust edit, and the
+/// warning falls back to the OLD two-recovery guidance (per-run
+/// `pnpm install --trust-lockfile`; committable `trustLockfile: true`).
+#[tokio::test]
+#[serial]
+async fn pnpm_trust_opt_out_writes_nothing_and_keeps_manual_guidance() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_pnpm_project(tmp.path());
+    let env =
+        run_redirect_subprocess_with(tmp.path(), &server.uri(), &["--no-trust-lockfile-config"]);
+    assert_eq!(env["status"], "success", "envelope: {env}");
+    assert_eq!(
+        env["redirect"]["redirected"], 1,
+        "the opt-out must not stop the redirect itself: {env}"
+    );
+    assert!(
+        !tmp.path().join("pnpm-workspace.yaml").exists(),
+        "the opt-out must not create pnpm-workspace.yaml"
+    );
+    assert_eq!(
+        env["redirect"]["rewrittenFiles"],
+        serde_json::json!(["pnpm-lock.yaml"]),
+        "only the lock may be rewritten under the opt-out: {env}"
+    );
+    let ledger: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(tmp.path().join(".socket/vendor/redirect-state.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        !ledger.to_string().contains("redirect_pnpm_workspace_trust"),
+        "the opt-out must record no workspace-trust edit: {ledger}"
+    );
+    let detail = env["redirect"]["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["code"] == "redirect_pnpm_trust_lockfile")
+        .and_then(|w| w["detail"].as_str())
+        .unwrap_or_default();
+    assert!(
+        detail.contains("--trust-lockfile")
+            && detail.contains("trustLockfile: true")
+            && detail.contains("pnpm-workspace.yaml"),
+        "the opt-out warning must keep BOTH manual recoveries; got: {detail}"
+    );
+    assert!(
+        detail.contains("pnpm clean --lockfile") && detail.contains("pnpm <=10"),
+        "the opt-out warning keeps the rebuild caution and version scoping; got: {detail}"
+    );
+    assert!(
+        !detail.contains("no extra flags"),
+        "the opt-out warning must not claim trust was configured; got: {detail}"
+    );
+}
+
+/// An EXPLICIT user `trustLockfile: <non-true>` in pnpm-workspace.yaml is a
+/// security decision the auto-config must never flip: the file stays
+/// byte-identical, no workspace-trust edit is recorded, and the warning says
+/// the setting was respected while spelling out the manual recoveries.
+#[tokio::test]
+#[serial]
+async fn pnpm_trust_respects_an_explicit_user_false() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_pnpm_project(tmp.path());
+    let user_ws = "packages:\n  - '.'\ntrustLockfile: false\n";
+    std::fs::write(tmp.path().join("pnpm-workspace.yaml"), user_ws).unwrap();
+
+    let env = run_redirect_subprocess(tmp.path(), &server.uri());
+    assert_eq!(env["status"], "success", "envelope: {env}");
+    assert_eq!(
+        env["redirect"]["redirected"], 1,
+        "the redirect itself must still land: {env}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("pnpm-workspace.yaml")).unwrap(),
+        user_ws,
+        "an explicit trustLockfile: false must be left byte-identical"
+    );
+    let detail = env["redirect"]["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["code"] == "redirect_pnpm_trust_lockfile")
+        .and_then(|w| w["detail"].as_str())
+        .unwrap_or_default();
+    assert!(
+        detail.contains("respected") && detail.contains("trustLockfile: false"),
+        "the warning must say the explicit user setting was respected; got: {detail}"
+    );
+    assert!(
+        detail.contains("--trust-lockfile"),
+        "the warning must fall back to the per-run flag recovery; got: {detail}"
+    );
+    let ledger: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(tmp.path().join(".socket/vendor/redirect-state.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        !ledger.to_string().contains("redirect_pnpm_workspace_trust"),
+        "no workspace-trust edit may be recorded for a respected user setting: {ledger}"
+    );
+}
+
+/// Two hardening pins on the trust-lockfile warning's host list, which lands
+/// in CI logs via both stderr and the persisted `--json` envelope:
+///
+/// 1. USERINFO NEVER LEAKS. A credentialed artifact URL
+///    (`http://alice:s3cret@patch.test/…`) is spliced into the lock verbatim,
+///    but the warning must name `host[:port]` only — printing the URL
+///    authority wholesale leaked `alice:s3cret` into CI logs.
+/// 2. ONLY SPLICED HOSTS ARE NAMED. The host list must come from the URLs
+///    actually present in a REWRITTEN pnpm-lock.yaml's final text, not from
+///    every npm override: a sibling override that landed solely in
+///    package-lock.json (here `other-host.test`) must not be named, or the
+///    warning points users at a server the pnpm lock never references.
+///
+/// Fixture: two granted npm patches — the credentialed one resolved ONLY by
+/// the root pnpm-lock.yaml, the sibling resolved ONLY by package-lock.json.
+#[tokio::test]
+#[serial]
+async fn pnpm_warning_strips_userinfo_and_names_only_spliced_hosts() {
+    const SIBLING_NAME: &str = "sibling-npm-only";
+    const SIBLING_VERSION: &str = "2.0.0";
+    const SIBLING_PURL: &str = "pkg:npm/sibling-npm-only@2.0.0";
+    const SIBLING_UUID: &str = "33333333-3333-4333-8333-333333333333";
+    const SIBLING_URL: &str = "http://other-host.test/patch/npm/sibling-npm-only/2.0.0/44444444-4444-4444-8444-444444444444/33333333-3333-4333-8333-333333333333/sibling-npm-only-2.0.0.tgz";
+    const CRED_URL: &str = "http://alice:s3cret@patch.test/patch/npm/in-proc-redirect/1.0.0/22222222-2222-4222-8222-222222222222/11111111-1111-4111-8111-111111111111/in-proc-redirect-1.0.0.tgz";
+
+    let server = MockServer::start().await;
+    // Discovery: BOTH installed packages have a granted patch.
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/batch")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "packages": [
+                {
+                    "purl": PURL,
+                    "patches": [{
+                        "uuid": UUID, "purl": PURL, "tier": "free",
+                        "cveIds": [], "ghsaIds": [], "severity": "high",
+                        "title": "credentialed redirect fixture"
+                    }]
+                },
+                {
+                    "purl": SIBLING_PURL,
+                    "patches": [{
+                        "uuid": SIBLING_UUID, "purl": SIBLING_PURL, "tier": "free",
+                        "cveIds": [], "ghsaIds": [], "severity": "high",
+                        "title": "sibling redirect fixture"
+                    }]
+                }
+            ],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(&server)
+        .await;
+    // Per-package search, one mock per package name (the names share no
+    // substring, so the regexes cannot cross-match).
+    for (pkg_name, uuid, purl) in [
+        (NAME, UUID, PURL),
+        (SIBLING_NAME, SIBLING_UUID, SIBLING_PURL),
+    ] {
+        Mock::given(method("GET"))
+            .and(path_regex(format!(
+                "^/v0/orgs/{ORG}/patches/by-package/.*{pkg_name}.*$"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "patches": [{
+                    "uuid": uuid, "purl": purl,
+                    "publishedAt": "2024-01-01T00:00:00Z",
+                    "description": "x", "license": "MIT", "tier": "free",
+                    "vulnerabilities": {}
+                }],
+                "canAccessPaidPatches": false,
+            })))
+            .mount(&server)
+            .await;
+    }
+    // Grants: the pnpm-locked package's tarball URL carries userinfo; the
+    // sibling's points at a DIFFERENT host that must never reach the warning.
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/package")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "results": {
+                UUID: {
+                    "status": "granted",
+                    "url": CRED_URL,
+                    "purl": PURL,
+                    "artifacts": [{
+                        "kind": "tarball",
+                        "url": CRED_URL,
+                        "integrity": { "sha512": PATCHED_SHA512 }
+                    }],
+                    "registryOverride": null
+                },
+                SIBLING_UUID: {
+                    "status": "granted",
+                    "url": SIBLING_URL,
+                    "purl": SIBLING_PURL,
+                    "artifacts": [{
+                        "kind": "tarball",
+                        "url": SIBLING_URL,
+                        "integrity": { "sha512": PATCHED_SHA512 }
+                    }],
+                    "registryOverride": null
+                }
+            }
+        })))
+        .mount(&server)
+        .await;
+    // Patch views for BOTH confirmed redirects (ledger records for VEX).
+    for (uuid, purl) in [(UUID, PURL), (SIBLING_UUID, SIBLING_PURL)] {
+        Mock::given(method("GET"))
+            .and(path(format!("/v0/orgs/{ORG}/patches/view/{uuid}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "uuid": uuid,
+                "purl": purl,
+                "publishedAt": "2024-01-01T00:00:00Z",
+                "files": {
+                    "package/index.js": {
+                        "beforeHash": "a".repeat(64),
+                        "afterHash": "b".repeat(64),
+                    }
+                },
+                "vulnerabilities": {
+                    GHSA: {
+                        "cves": ["CVE-2024-9"],
+                        "summary": "redirect vex fixture",
+                        "severity": "high",
+                        "description": "d"
+                    }
+                },
+                "description": "x", "license": "MIT", "tier": "free"
+            })))
+            .mount(&server)
+            .await;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("package.json"),
+        format!(
+            r#"{{ "name": "consumer", "version": "0.0.0", "dependencies": {{ "{NAME}": "{VERSION}", "{SIBLING_NAME}": "{SIBLING_VERSION}" }} }}"#
+        ),
+    )
+    .unwrap();
+    write_installed(tmp.path(), NAME, VERSION, b"unpatched installed bytes\n");
+    write_installed(
+        tmp.path(),
+        SIBLING_NAME,
+        SIBLING_VERSION,
+        b"unpatched sibling bytes\n",
+    );
+    // pnpm-lock.yaml resolves ONLY the credentialed package…
+    std::fs::write(tmp.path().join("pnpm-lock.yaml"), rush_pnpm_lock(NAME)).unwrap();
+    // …while package-lock.json resolves ONLY the sibling.
+    std::fs::write(
+        tmp.path().join("package-lock.json"),
+        format!(
+            r#"{{
+  "name": "consumer",
+  "version": "0.0.0",
+  "lockfileVersion": 3,
+  "requires": true,
+  "packages": {{
+    "": {{ "name": "consumer", "version": "0.0.0", "dependencies": {{ "{SIBLING_NAME}": "{SIBLING_VERSION}" }} }},
+    "node_modules/{SIBLING_NAME}": {{
+      "version": "{SIBLING_VERSION}",
+      "resolved": "https://registry.npmjs.org/{SIBLING_NAME}/-/{SIBLING_NAME}-{SIBLING_VERSION}.tgz",
+      "integrity": "sha512-UPSTREAMupstream=="
+    }}
+  }}
+}}
+"#
+        ),
+    )
+    .unwrap();
+
+    let env = run_redirect_subprocess(tmp.path(), &server.uri());
+    assert_eq!(env["status"], "success", "envelope: {env}");
+    assert_eq!(
+        env["redirect"]["redirected"], 2,
+        "anchor: both locks must have been redirected: {env}"
+    );
+    // Anchors: the credentialed URL really was spliced into the pnpm lock
+    // (so the no-leak assertion below is exercising a real splice), and the
+    // sibling's URL landed only in package-lock.json.
+    let pnpm_lock = std::fs::read_to_string(tmp.path().join("pnpm-lock.yaml")).unwrap();
+    assert!(
+        pnpm_lock.contains(CRED_URL) && !pnpm_lock.contains("other-host.test"),
+        "pnpm-lock.yaml must carry the credentialed URL and nothing from the \
+         sibling host; got:\n{pnpm_lock}"
+    );
+    let npm_lock = std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap();
+    assert!(
+        npm_lock.contains(SIBLING_URL),
+        "package-lock.json must carry the sibling URL; got:\n{npm_lock}"
+    );
+
+    let detail = env["redirect"]["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["code"] == "redirect_pnpm_trust_lockfile")
+        .and_then(|w| w["detail"].as_str())
+        .unwrap_or_default()
+        .to_string();
+    // (1) Host only, never userinfo. The `@` check pins the whole authority
+    // form: no spelling of `user:pass@host` can survive it.
+    assert!(
+        detail.contains("patch.test"),
+        "the warning must name the spliced host; got: {detail}"
+    );
+    assert!(
+        !detail.contains("alice") && !detail.contains("s3cret") && !detail.contains('@'),
+        "the warning must never leak URL userinfo (credentials) into CI logs; \
+         got: {detail}"
+    );
+    // (2) Only hosts spliced into a rewritten pnpm lock — the sibling landed
+    // solely in package-lock.json, so its host must not be named.
+    assert!(
+        !detail.contains("other-host.test"),
+        "the warning must name only hosts the pnpm lock actually points at; \
+         got: {detail}"
     );
 }
 
@@ -2435,7 +2964,10 @@ async fn redirect_ledger_write_failure_leaves_project_files_untouched() {
     perms.set_readonly(true);
     std::fs::set_permissions(&vendor_dir, perms.clone()).unwrap();
     let out = run_hosted_json_scan(tmp.path(), &server).await;
-    // Restore writability so the tempdir can be cleaned up.
+    // Restore writability so the tempdir can be cleaned up. The blanket
+    // group-write concern behind the lint doesn't apply: this un-readonlies a
+    // private tempdir moments before its deletion.
+    #[allow(clippy::permissions_set_readonly_false)]
     perms.set_readonly(false);
     std::fs::set_permissions(&vendor_dir, perms).unwrap();
     assert_write_failure_envelope(&out, "ledger-write failure");
@@ -2897,7 +3429,9 @@ async fn composer_redirect_is_confirmed_and_recorded() {
 }
 
 /// Mount the full cargo hosted-mock set (discovery + reference + view) for
-/// one patch over `purl`.
+/// one patch over `purl`. Eight positional fixture knobs beat a one-off
+/// params struct for a test-local mock helper.
+#[allow(clippy::too_many_arguments)]
 async fn mock_cargo_patch(
     server: &MockServer,
     purl: &str,

@@ -30,6 +30,13 @@ pub struct RedirectState {
     /// (the final mode name); the loader is tolerant of any string, so
     /// ledgers written before the rename (`"redirect"`) still load.
     pub mode: String,
+    /// Recorded [`FileEdit`]s, appended in write order (a revert walks them
+    /// in reverse). `kind` is an open vocabulary — additive kinds (e.g. the
+    /// hosted pnpm flow's `redirect_pnpm_workspace_trust`, recording the
+    /// auto-configured pnpm-workspace.yaml `trustLockfile: true` with
+    /// `action` `"created"` for a new file or `"added"` for a spliced-in
+    /// line) must round-trip through ledgers written before they existed,
+    /// so no field here may ever tighten into an enum.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub edits: Vec<FileEdit>,
     /// PURL -> manifest patch record. Present so VEX can attest redirected
@@ -171,6 +178,127 @@ pub async fn save_redirect_state(
     atomic_write_bytes(&path, format!("{json}\n").as_bytes()).await
 }
 
+/// `pkg:<type>/<name>@<version>` → `(<name>, <version>)`; the name keeps any
+/// namespace slashes (`@scope/pkg`). `None` when either part is missing.
+/// Input must already be canonicalized (qualifiers stripped, percent-decoded).
+fn purl_name_version(purl: &str) -> Option<(&str, &str)> {
+    let rest = purl.strip_prefix("pkg:")?;
+    let (_, coord) = rest.split_once('/')?;
+    let at = coord.rfind('@').filter(|&i| i > 0)?;
+    Some((&coord[..at], &coord[at + 1..]))
+}
+
+/// Drop one PURL's superseded takeover leftovers from the ledger: its
+/// `records` entry (canonical-purl match, qualifiers stripped and
+/// percent-decoded) and every recorded edit keyed to that package. This is
+/// the npm-family half of the hosted→vendored takeover reconciliation: the
+/// vendored flows call it ONLY after the LIVE lockfile provably wires the
+/// package to the committed `.socket/vendor/` artifact and no longer
+/// resolves the hosted URL — at that point the vendor ledger's wiring
+/// `original` embeds the hosted-spliced lock fragment, so `vendor --revert`
+/// stays lossless without these ledger edits, and keeping them would feed
+/// VEX/updates stale records and re-fire the takeover warning on every
+/// later run. CARGO purls are refused (returns `false`, drops nothing): a
+/// cargo takeover must revert the hosted edits ON DISK first — that path is
+/// [`revert_cargo_redirect_purl`](super::revert_cargo_redirect_purl), which
+/// does its own ledger drop.
+///
+/// The edit matcher is ARTIFACT-ANCHORED, never name-anchored. An edit is
+/// claimed when either:
+///
+/// * its `new` content references THIS purl's hosted artifact — every hosted
+///   artifact URL embeds the patch uuid (on ANY patch-server host; the same
+///   invariant the takeover classifier's `hosted_wiring_live` proof rests
+///   on), and a uuid is hex-and-dashes so it spells identically raw,
+///   `\/`-escaped (old composer) and percent-encoded (yarn-berry
+///   `::__archiveUrl=`). The uuid(s) come from this purl's own `records`
+///   entry, captured before it is removed. This is what claims the
+///   version-blind key shapes: npm `node_modules/…` path keys, legacy
+///   `dependencies` bare-name keys, bun `<prefix>/<name>` keys.
+/// * (secondary guard, for when the record — and with it the artifact URL —
+///   is unavailable) its key is a VERSION-EXACT instance key:
+///   `"name@version"`, pnpm v6 peer-suffixed `"name@version(peer…)"`, or the
+///   pnpm-v5 respelling `"name@version_peer…"`.
+///
+/// The old matcher claimed by NAME alone (`key == name`, key ends with
+/// `"/name"`): with two versions of one package hosted, vendoring one
+/// deleted BOTH versions' path-keyed edits, destroying the other version's
+/// revert originals. Name-only matching is gone; version-blind keys with no
+/// artifact anchor are KEPT (fail-closed — they may be the other version's
+/// only revert data). Consequence for the CLI's takeover-overlap fallback
+/// matcher (which still matches edit keys by bare name, but ONLY when
+/// `records` is empty — the degraded record-fetch-failed ledger): a normal
+/// record-carrying ledger reconciles fully here (the record removal alone
+/// ends the overlap), while a degraded ledger's unattributable path-keyed
+/// edits stay and its takeover warning keeps advising the manual per-package
+/// cleanup — the correct outcome when the ledger lacks the records needed to
+/// attribute edits to a version safely.
+///
+/// Edits that are not package-keyed (e.g. the pnpm workspace-trust edit,
+/// keyed `"trustLockfile"`) stay: they belong to the hosted flow's own
+/// config surface and other still-redirected package(s) may ride on them.
+///
+/// Returns whether anything was removed. The caller persists the mutated
+/// ledger via [`persist_redirect_state`] (atomic; an emptied ledger is
+/// deleted).
+pub fn drop_superseded_purl(state: &mut RedirectState, purl: &str) -> bool {
+    use crate::utils::purl::{normalize_purl, strip_purl_qualifiers};
+    let canon = |p: &str| normalize_purl(strip_purl_qualifiers(p)).into_owned();
+    let target = canon(purl);
+    if target.starts_with("pkg:cargo/") {
+        return false;
+    }
+    let Some((name, version)) = purl_name_version(&target) else {
+        return false;
+    };
+    let (name, version) = (name.to_string(), version.to_string());
+
+    let record_keys: Vec<String> = state
+        .records
+        .keys()
+        .filter(|k| canon(k) == target)
+        .cloned()
+        .collect();
+    // THIS purl's patch uuid(s), captured before the records are removed —
+    // the artifact anchor (see the doc comment). Distinct purls (including
+    // two versions of one package) carry distinct patch uuids, so a uuid
+    // match is version-exact by construction.
+    let uuids: Vec<String> = record_keys
+        .iter()
+        .filter_map(|k| state.records.get(k))
+        .map(|r| r.uuid.clone())
+        .collect();
+    for key in &record_keys {
+        state.records.remove(key);
+    }
+
+    let name_at_version = format!("{name}@{version}");
+    let edits_before = state.edits.len();
+    state.edits.retain(|e| {
+        let Some(key) = e.key.as_deref() else {
+            // No key ⇒ not attributable to any package; keep.
+            return true;
+        };
+        // Version-exact instance keys: `name@version`, pnpm v6 peer-suffixed
+        // `name@version(peer…)`, pnpm v5 respelled `name@version_peer…`.
+        let version_exact = key == name_at_version
+            || key
+                .strip_prefix(name_at_version.as_str())
+                .is_some_and(|rest| rest.starts_with('(') || rest.starts_with('_'));
+        // Artifact anchor: the edit's rewritten (`new`) content references
+        // this purl's hosted artifact (its patch uuid — spelling-invariant
+        // across raw / `\/`-escaped / percent-encoded URL forms).
+        let anchored = !uuids.is_empty()
+            && e.new.as_ref().is_some_and(|new| {
+                let text = new.to_string();
+                uuids.iter().any(|uuid| text.contains(uuid.as_str()))
+            });
+        !(version_exact || anchored)
+    });
+
+    !record_keys.is_empty() || state.edits.len() != edits_before
+}
+
 /// Persist the redirect ledger via [`save_redirect_state`]'s atomic writer.
 /// An EMPTY ledger (no edits, no records) is DELETED instead: a residual
 /// empty file would keep takeover-overlap detection and VEX reading a ledger
@@ -197,7 +325,15 @@ mod tests {
     use crate::manifest::schema::{PatchFileInfo, PatchRecord, VulnerabilityInfo};
     use std::collections::HashMap;
 
+    /// The sample record's patch uuid — hosted artifact URLs embed it (the
+    /// artifact anchor `drop_superseded_purl` claims edits by).
+    const SAMPLE_UUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
+
     fn sample_record() -> PatchRecord {
+        record_with_uuid(SAMPLE_UUID)
+    }
+
+    fn record_with_uuid(uuid: &str) -> PatchRecord {
         let mut files = HashMap::new();
         files.insert(
             "package/index.js".to_string(),
@@ -217,7 +353,7 @@ mod tests {
             },
         );
         PatchRecord {
-            uuid: "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f".to_string(),
+            uuid: uuid.to_string(),
             exported_at: "2024-01-01T00:00:00Z".to_string(),
             files,
             vulnerabilities: vulns,
@@ -225,6 +361,12 @@ mod tests {
             license: "MIT".to_string(),
             tier: "free".to_string(),
         }
+    }
+
+    /// The hosted artifact URL shape the patch server serves: the patch uuid
+    /// is a path segment, exactly the anchor `drop_superseded_purl` matches.
+    fn hosted_url(name: &str, version: &str, uuid: &str) -> String {
+        format!("https://patch.test/patch/npm/{name}/{version}/{uuid}/{name}-{version}.tgz")
     }
 
     #[test]
@@ -240,6 +382,408 @@ mod tests {
         let rec = back.records.get("pkg:npm/left-pad@1.3.0").unwrap();
         assert_eq!(rec.files["package/index.js"].after_hash, "b".repeat(64));
         assert!(rec.vulnerabilities.contains_key("GHSA-xxxx-yyyy-zzzz"));
+    }
+
+    /// The hosted pnpm flow's `redirect_pnpm_workspace_trust` edit (the
+    /// auto-configured pnpm-workspace.yaml `trustLockfile: true`) is plain
+    /// `FileEdit` vocabulary: it must round-trip byte-losslessly (camelCase
+    /// contract keys, revert-relevant fields intact) alongside the classic
+    /// lock edits — and, being additive, its ABSENCE must change nothing
+    /// (the legacy-ledger tests below stay green without it).
+    #[test]
+    fn workspace_trust_edit_round_trips_as_plain_file_edit_vocabulary() {
+        let mut state = RedirectState::new();
+        state.edits.push(FileEdit {
+            path: "pnpm-lock.yaml".to_string(),
+            kind: "redirect_pnpm_resolution".to_string(),
+            action: "rewritten".to_string(),
+            key: Some("left-pad@1.3.0".to_string()),
+            original: Some(serde_json::json!("{integrity: sha512-UPSTREAM==}")),
+            new: Some(serde_json::json!(
+                "{integrity: sha512-PATCHED==, tarball: http://patch.test/x.tgz}"
+            )),
+        });
+        state.edits.push(FileEdit {
+            path: "pnpm-workspace.yaml".to_string(),
+            kind: "redirect_pnpm_workspace_trust".to_string(),
+            action: "created".to_string(),
+            key: Some("trustLockfile".to_string()),
+            original: None,
+            new: Some(serde_json::json!("true")),
+        });
+        let json = serde_json::to_string_pretty(&state).unwrap();
+        let back: RedirectState = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.edits, state.edits, "edits must round-trip losslessly");
+        // Edit order is the revert contract (walked in reverse): the trust
+        // edit stays AFTER the lock edit it accompanies.
+        assert_eq!(back.edits[1].kind, "redirect_pnpm_workspace_trust");
+        assert_eq!(back.edits[1].action, "created");
+        assert_eq!(back.edits[1].key.as_deref(), Some("trustLockfile"));
+        assert!(
+            back.edits[1].original.is_none(),
+            "a created file records no original"
+        );
+    }
+
+    /// A ledger written by a FUTURE (or concurrent) writer carrying an edit
+    /// kind/action this build has never heard of must still load — kind and
+    /// action are opaque strings, exactly like `mode`. Guards against
+    /// tightening the edit vocabulary into an enum, which would brick every
+    /// existing ledger the moment a new kind ships.
+    #[tokio::test]
+    async fn load_tolerates_unknown_edit_kinds_and_actions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".socket/vendor");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(
+            dir.join("redirect-state.json"),
+            br#"{
+  "version": 1,
+  "mode": "hosted",
+  "edits": [
+    {
+      "path": "pnpm-workspace.yaml",
+      "kind": "redirect_pnpm_workspace_trust",
+      "action": "added",
+      "key": "trustLockfile",
+      "new": "true"
+    },
+    {
+      "path": "some-future-file",
+      "kind": "redirect_kind_from_the_future",
+      "action": "transmogrified"
+    }
+  ]
+}"#,
+        )
+        .await
+        .unwrap();
+        let loaded = load_redirect_state(tmp.path()).await.unwrap().unwrap();
+        assert_eq!(loaded.edits.len(), 2);
+        assert_eq!(loaded.edits[0].kind, "redirect_pnpm_workspace_trust");
+        assert_eq!(loaded.edits[0].action, "added");
+        assert_eq!(loaded.edits[0].original, None);
+        assert_eq!(loaded.edits[1].kind, "redirect_kind_from_the_future");
+    }
+
+    fn edit(path: &str, kind: &str, key: Option<&str>) -> FileEdit {
+        FileEdit {
+            path: path.to_string(),
+            kind: kind.to_string(),
+            action: "rewritten".to_string(),
+            key: key.map(str::to_string),
+            original: Some(serde_json::json!("orig")),
+            new: Some(serde_json::json!("new")),
+        }
+    }
+
+    /// An edit whose rewritten content points at a hosted artifact URL — the
+    /// shape the npm rewriter records (`new` = the spliced resolved/integrity
+    /// pair), carrying the artifact anchor.
+    fn edit_resolved(path: &str, kind: &str, key: &str, url: &str) -> FileEdit {
+        FileEdit {
+            path: path.to_string(),
+            kind: kind.to_string(),
+            action: "rewritten".to_string(),
+            key: Some(key.to_string()),
+            original: Some(serde_json::json!({
+                "resolved": "https://registry.npmjs.org/upstream.tgz",
+                "integrity": "sha512-UPSTREAM=="
+            })),
+            new: Some(serde_json::json!({ "resolved": url, "integrity": "sha512-P==" })),
+        }
+    }
+
+    /// The takeover reconciliation drops exactly the superseded package's
+    /// halves — its `records` entry and every edit keyed to it (pnpm
+    /// `name@version`, pnpm v6 peer-suffixed and v5 `_`-suffixed instances,
+    /// npm `node_modules/…` paths whose rewritten content carries this purl's
+    /// hosted artifact) — while other packages' data and non-package-keyed
+    /// edits (the pnpm workspace-trust edit) survive verbatim.
+    #[test]
+    fn drop_superseded_purl_removes_both_halves_and_only_them() {
+        let mut state = RedirectState::new();
+        state
+            .records
+            .insert("pkg:npm/left-pad@1.3.0".to_string(), sample_record());
+        state
+            .records
+            .insert("pkg:npm/minimist@1.2.2".to_string(), sample_record());
+        state.edits = vec![
+            edit(
+                "pnpm-lock.yaml",
+                "redirect_pnpm_resolution",
+                Some("left-pad@1.3.0"),
+            ),
+            // pnpm v6 peer-suffixed instance key for the SAME package.
+            edit(
+                "pnpm-lock.yaml",
+                "redirect_pnpm_resolution",
+                Some("left-pad@1.3.0(react@18.2.0)"),
+            ),
+            // pnpm v5 `_`-suffixed instance key (the rewriter's own respelled
+            // `/left-pad/1.3.0_react@18.2.0` key) for the same package.
+            edit(
+                "pnpm-lock.yaml",
+                "redirect_pnpm_resolution",
+                Some("left-pad@1.3.0_react@18.2.0"),
+            ),
+            // npm nested node_modules path for the same package: the key is
+            // version-blind, so the claim rides the artifact anchor in `new`.
+            edit_resolved(
+                "package-lock.json",
+                "redirect_npm_lock_entry",
+                "node_modules/a/node_modules/left-pad",
+                &hosted_url("left-pad", "1.3.0", SAMPLE_UUID),
+            ),
+            // Another package's edit — must survive.
+            edit(
+                "pnpm-lock.yaml",
+                "redirect_pnpm_resolution",
+                Some("minimist@1.2.2"),
+            ),
+            // Non-package-keyed workspace-trust edit — must survive.
+            edit(
+                "pnpm-workspace.yaml",
+                "redirect_pnpm_workspace_trust",
+                Some("trustLockfile"),
+            ),
+        ];
+
+        assert!(drop_superseded_purl(&mut state, "pkg:npm/left-pad@1.3.0"));
+
+        assert!(
+            !state.records.contains_key("pkg:npm/left-pad@1.3.0"),
+            "the superseded record must be dropped"
+        );
+        assert!(
+            state.records.contains_key("pkg:npm/minimist@1.2.2"),
+            "other packages' records must survive"
+        );
+        let keys: Vec<&str> = state
+            .edits
+            .iter()
+            .filter_map(|e| e.key.as_deref())
+            .collect();
+        assert_eq!(
+            keys,
+            vec!["minimist@1.2.2", "trustLockfile"],
+            "only the superseded package's edits may be dropped: {keys:?}"
+        );
+
+        // Idempotent: a second drop finds nothing and reports it.
+        assert!(!drop_superseded_purl(&mut state, "pkg:npm/left-pad@1.3.0"));
+    }
+
+    /// TWO versions of one package hosted at once: dropping the vendored one
+    /// must not touch the other version's halves. The npm path keys
+    /// (`node_modules/…/left-pad`) and legacy `dependencies` bare-name keys
+    /// carry NO version, so the old name-anchored matcher claimed BOTH
+    /// versions' edits here — destroying left-pad@2.0.0's pre-redirect
+    /// originals (its only revert data) when left-pad@1.3.0 was vendored.
+    /// The matcher is artifact-anchored now: only edits whose rewritten
+    /// content references the dropped purl's own hosted artifact go.
+    #[test]
+    fn drop_superseded_purl_never_claims_the_other_hosted_versions_edits() {
+        const UUID_V2: &str = "1a2b3c4d-5e6f-4a1b-8c2d-0f9e8d7c6b5a";
+        let url_v1 = hosted_url("left-pad", "1.3.0", SAMPLE_UUID);
+        let url_v2 = hosted_url("left-pad", "2.0.0", UUID_V2);
+        let mut state = RedirectState::new();
+        state
+            .records
+            .insert("pkg:npm/left-pad@1.3.0".to_string(), sample_record());
+        state.records.insert(
+            "pkg:npm/left-pad@2.0.0".to_string(),
+            record_with_uuid(UUID_V2),
+        );
+        state.edits = vec![
+            // v1's edits: a version-blind path key (anchored via `new`) and
+            // a version-exact pnpm key.
+            edit_resolved(
+                "package-lock.json",
+                "redirect_npm_lock_entry",
+                "node_modules/left-pad",
+                &url_v1,
+            ),
+            edit(
+                "pnpm-lock.yaml",
+                "redirect_pnpm_resolution",
+                Some("left-pad@1.3.0"),
+            ),
+            // v2's edits: a nested path key, a legacy bare-name key, and a
+            // version-exact pnpm key — ALL must survive dropping v1.
+            edit_resolved(
+                "package-lock.json",
+                "redirect_npm_lock_entry",
+                "node_modules/a/node_modules/left-pad",
+                &url_v2,
+            ),
+            edit_resolved(
+                "package-lock.json",
+                "redirect_npm_lock_dep",
+                "left-pad",
+                &url_v2,
+            ),
+            edit(
+                "pnpm-lock.yaml",
+                "redirect_pnpm_resolution",
+                Some("left-pad@2.0.0"),
+            ),
+        ];
+
+        assert!(drop_superseded_purl(&mut state, "pkg:npm/left-pad@1.3.0"));
+
+        assert!(
+            !state.records.contains_key("pkg:npm/left-pad@1.3.0"),
+            "the vendored version's record must be dropped"
+        );
+        assert!(
+            state.records.contains_key("pkg:npm/left-pad@2.0.0"),
+            "the still-hosted version's record must survive"
+        );
+        let keys: Vec<&str> = state
+            .edits
+            .iter()
+            .filter_map(|e| e.key.as_deref())
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                "node_modules/a/node_modules/left-pad",
+                "left-pad",
+                "left-pad@2.0.0"
+            ],
+            "the other hosted version's edits are its only revert data and \
+             must survive verbatim: {keys:?}"
+        );
+    }
+
+    /// A DEGRADED ledger (record fetch failed: `records` empty, edits only)
+    /// offers no artifact anchor. The secondary guard must stay version-exact
+    /// — `name@version` plus the `(`/`_` instance suffixes — and version-blind
+    /// path/bare-name keys must be KEPT (they cannot be attributed to a
+    /// version, and dropping them could destroy another version's revert
+    /// originals). Fail closed: leftover keys mean the takeover warning's
+    /// manual advisory keeps firing, which is the correct degraded outcome.
+    #[test]
+    fn drop_superseded_purl_without_a_record_claims_only_version_exact_keys() {
+        let mut state = RedirectState::new();
+        state.edits = vec![
+            edit(
+                "pnpm-lock.yaml",
+                "redirect_pnpm_resolution",
+                Some("left-pad@1.3.0"),
+            ),
+            edit(
+                "pnpm-lock.yaml",
+                "redirect_pnpm_resolution",
+                Some("left-pad@1.3.0_react@18.2.0"),
+            ),
+            edit(
+                "pnpm-lock.yaml",
+                "redirect_pnpm_resolution",
+                Some("left-pad@1.3.0(react@18.2.0)"),
+            ),
+            // A LONGER version sharing the prefix: `1.3.0` must not claim
+            // `1.3.01`'s instances (the `_`/`(` boundary is load-bearing).
+            edit(
+                "pnpm-lock.yaml",
+                "redirect_pnpm_resolution",
+                Some("left-pad@1.3.01_react@18.2.0"),
+            ),
+            // Version-blind keys: unattributable without the anchor — keep.
+            edit_resolved(
+                "package-lock.json",
+                "redirect_npm_lock_entry",
+                "node_modules/left-pad",
+                "https://patch.test/no-uuid-here/left-pad-1.3.0.tgz",
+            ),
+            edit_resolved(
+                "package-lock.json",
+                "redirect_npm_lock_dep",
+                "left-pad",
+                "https://patch.test/no-uuid-here/left-pad-1.3.0.tgz",
+            ),
+        ];
+
+        assert!(drop_superseded_purl(&mut state, "pkg:npm/left-pad@1.3.0"));
+
+        let keys: Vec<&str> = state
+            .edits
+            .iter()
+            .filter_map(|e| e.key.as_deref())
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                "left-pad@1.3.01_react@18.2.0",
+                "node_modules/left-pad",
+                "left-pad"
+            ],
+            "without an artifact anchor only version-exact instance keys may \
+             be claimed: {keys:?}"
+        );
+    }
+
+    /// A version-boundary key (`left-pad@1.3.10`) and a different package
+    /// whose name merely ends with the target's (`not-left-pad`) must never
+    /// be claimed — the `/`-boundary and `(`-boundary checks are load-bearing.
+    #[test]
+    fn drop_superseded_purl_respects_name_and_version_boundaries() {
+        let mut state = RedirectState::new();
+        state.edits = vec![
+            edit(
+                "pnpm-lock.yaml",
+                "redirect_pnpm_resolution",
+                Some("left-pad@1.3.10"),
+            ),
+            edit(
+                "package-lock.json",
+                "redirect_npm_lock_entry",
+                Some("node_modules/not-left-pad"),
+            ),
+        ];
+        assert!(!drop_superseded_purl(&mut state, "pkg:npm/left-pad@1.3.1"));
+        assert_eq!(state.edits.len(), 2, "no foreign edit may be claimed");
+    }
+
+    /// Scoped names: the record key may carry the percent-encoded API form
+    /// while the caller passes the canonical decoded purl; both halves must
+    /// still be claimed (the path-keyed edit via the artifact anchor its
+    /// rewritten content carries).
+    #[test]
+    fn drop_superseded_purl_matches_percent_encoded_scoped_records() {
+        let mut state = RedirectState::new();
+        state
+            .records
+            .insert("pkg:npm/%40scope%2Fpkg@1.0.0".to_string(), sample_record());
+        state.edits = vec![edit_resolved(
+            "package-lock.json",
+            "redirect_npm_lock_entry",
+            "node_modules/@scope/pkg",
+            &hosted_url("%40scope%2Fpkg", "1.0.0", SAMPLE_UUID),
+        )];
+        assert!(drop_superseded_purl(&mut state, "pkg:npm/@scope/pkg@1.0.0"));
+        assert!(state.records.is_empty() && state.edits.is_empty());
+    }
+
+    /// Cargo purls are refused: their takeover must revert the hosted edits
+    /// ON DISK first (`revert_cargo_redirect_purl`), so a bare ledger drop
+    /// would destroy the only revert data. Fail closed by dropping nothing.
+    #[test]
+    fn drop_superseded_purl_refuses_cargo() {
+        let mut state = RedirectState::new();
+        state
+            .records
+            .insert("pkg:cargo/cfg-if@1.0.4".to_string(), sample_record());
+        state.edits = vec![edit(
+            "Cargo.lock",
+            "redirect_cargo_lock_entry",
+            Some("cfg-if@1.0.4"),
+        )];
+        assert!(!drop_superseded_purl(&mut state, "pkg:cargo/cfg-if@1.0.4"));
+        assert_eq!(state.records.len(), 1);
+        assert_eq!(state.edits.len(), 1);
     }
 
     #[tokio::test]
