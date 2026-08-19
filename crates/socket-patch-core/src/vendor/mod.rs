@@ -568,6 +568,16 @@ pub struct RevertOutcome {
     pub success: bool,
     pub warnings: Vec<VendorWarning>,
     pub error: Option<String>,
+    /// True when the backend deliberately KEPT the artifact uuid dir
+    /// because at least one wiring record was left alone during the
+    /// restore (a `vendor_lock_entry_drifted` skip — residual #131). The
+    /// entry's recorded pre-vendor originals and vendored blob may be the
+    /// only surviving inputs a later restore needs (the lockfile — or the
+    /// hosted redirect ledger's recorded `original` fragments — can still
+    /// point at them), so callers must ALSO keep the state.json entry
+    /// instead of pruning it, and report the package as skipped rather
+    /// than removed. Never set on failure or on dry runs.
+    pub kept_artifact: bool,
 }
 
 impl RevertOutcome {
@@ -576,6 +586,7 @@ impl RevertOutcome {
             success: true,
             warnings: Vec::new(),
             error: None,
+            kept_artifact: false,
         }
     }
 
@@ -584,7 +595,37 @@ impl RevertOutcome {
             success: false,
             warnings: Vec::new(),
             error: Some(error.into()),
+            kept_artifact: false,
         }
+    }
+
+    /// True when any wiring record was left alone during the restore —
+    /// every left-alone branch (ownership-gate drift, vanished block,
+    /// missing pre-vendor original, unknown kind/key, allowlist skip)
+    /// warns with the stable code `vendor_lock_entry_drifted`.
+    pub fn drift_skipped(&self) -> bool {
+        self.warnings
+            .iter()
+            .any(|w| w.code == "vendor_lock_entry_drifted")
+    }
+
+    /// Mark the artifact dir as deliberately kept after a drift-skip and
+    /// surface it honestly. Backends call this INSTEAD of removing the
+    /// uuid dir when [`Self::drift_skipped`] is true: deleting it would be
+    /// unrecoverable, while keeping it is always recoverable (the orphan
+    /// sweep's invariant — never delete what something still references —
+    /// applies to the revert too).
+    pub fn keep_artifact(&mut self, uuid_dir_rel: &str) {
+        self.kept_artifact = true;
+        self.warnings.push(VendorWarning::new(
+            "vendor_artifact_kept",
+            format!(
+                "kept {uuid_dir_rel}: some recorded lock entries were left alone (see the \
+                 vendor_lock_entry_drifted warnings) and the vendored artifacts may still be \
+                 needed for a later restore; undo the drift (restore the vendored lock entries \
+                 or re-vendor) and re-run `vendor --revert` to finish cleaning up"
+            ),
+        ));
     }
 }
 

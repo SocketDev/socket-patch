@@ -546,6 +546,10 @@ async fn classic_vendor_revert_after_hosted_overlay_is_drift_skipped_and_keeps_b
     // 5. the keep is surfaced honestly, so the caller (CLI) knows to keep
     //    the ledger entry too instead of pruning it.
     assert!(
+        outcome.kept_artifact,
+        "RevertOutcome must carry the keep signal for the CLI"
+    );
+    assert!(
         outcome
             .warnings
             .iter()

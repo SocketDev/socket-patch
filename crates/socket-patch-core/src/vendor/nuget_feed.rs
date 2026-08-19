@@ -592,6 +592,7 @@ pub async fn revert_nuget(
             )),
             Err(e) => {
                 return RevertOutcome {
+                    kept_artifact: false,
                     success: false,
                     warnings,
                     error: Some(e),
@@ -603,6 +604,7 @@ pub async fn revert_nuget(
     if !dry_run {
         if let Err(e) = remove_tree(&uuid_dir).await {
             return RevertOutcome {
+                kept_artifact: false,
                 success: false,
                 warnings,
                 error: Some(format!("failed to remove {}: {e}", uuid_dir.display())),
@@ -611,6 +613,7 @@ pub async fn revert_nuget(
     }
 
     RevertOutcome {
+        kept_artifact: false,
         success: true,
         warnings,
         error: None,

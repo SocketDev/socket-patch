@@ -455,6 +455,16 @@ pub async fn revert_npm(entry: &VendorEntry, project_root: &Path, dry_run: bool)
         }
     }
 
+    // LOSSINESS GUARD (residual #131): when any wiring record was left
+    // alone ("drifted; left alone"), the uuid dir may hold the only copy of
+    // what the lock — or the redirect ledger's recorded originals — still
+    // points at. Keep it (and let the CLI keep the ledger entry) instead of
+    // deleting evidence out from under a lock we just refused to touch.
+    if outcome.drift_skipped() {
+        outcome.keep_artifact(&uuid_dir_rel);
+        return outcome;
+    }
+
     // Remove the whole validated uuid dir (tgz + marker + any @scope level)
     // in one tree delete — pruning by leaf would leave empty dirs behind.
     if let Err(e) = remove_tree(&project_root.join(&uuid_dir_rel)).await {
