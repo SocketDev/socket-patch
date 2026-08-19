@@ -1239,6 +1239,50 @@ pub(super) fn vendored_ownership_retained_detail(purls: &[String]) -> String {
     )
 }
 
+/// Additive top-level `redirectState` block for the scan `--json` envelope:
+/// the hosted redirect ledger's records — project STATE, so a descriptive
+/// block rather than a warning — plus the scanned purls whose hosted
+/// lockfile wiring the live lock still proves.
+///
+/// Before this block, a hosted-wired project's report-only `scan --json`
+/// was byte-identical to a never-touched project's (verified against
+/// production on bundler 1.17/2.7/4.0): [`HOSTED_WIRING_RETAINED`] rides
+/// only the agent-mode envelope, and the `redirect` sub-object only a
+/// hosted-mode run's. `None` (key omitted, additive contract) when the
+/// ledger is absent or its `records` are empty — an edits-only ledger
+/// (post-takeover / degraded) asserts no patches, mirroring the warning's
+/// records gate.
+///
+/// Shape: `{ mode, ledger, records: [{purl, uuid}], wiringLive: [purl] }`.
+/// `mode` is the ledger's own (opaque) mode string; `records` keeps the
+/// ledger's verbatim purl keys (BTreeMap order — sorted); `wiringLive` is
+/// [`hosted_wiring_retained_purls`]' canonicalized subset — records are the
+/// ledger's word, wiringLive is the live lock's proof, and consumers must
+/// treat them as exactly that split (a record with no proof means the
+/// wiring was unwound or the lock is unreadable, never "still live").
+pub(super) async fn redirect_state_json(
+    cwd: &Path,
+    redirect_state: Option<&socket_patch_core::patch::redirect::RedirectState>,
+    scanned_purls: &HashSet<String>,
+) -> Option<serde_json::Value> {
+    let redirect = redirect_state?;
+    if redirect.records.is_empty() {
+        return None;
+    }
+    let records: Vec<serde_json::Value> = redirect
+        .records
+        .iter()
+        .map(|(purl, record)| serde_json::json!({ "purl": purl, "uuid": record.uuid }))
+        .collect();
+    let wiring_live = hosted_wiring_retained_purls(cwd, redirect_state, scanned_purls).await;
+    Some(serde_json::json!({
+        "mode": redirect.mode,
+        "ledger": socket_patch_core::patch::redirect::REDIRECT_STATE_REL,
+        "records": records,
+        "wiringLive": wiring_live,
+    }))
+}
+
 /// Append one `{code, detail}` entry to the scan `--json` result's
 /// top-level `warnings` array (created on first use — the key is additive
 /// and absent when no run-level warning fired), mirroring the
@@ -1518,6 +1562,32 @@ pub async fn run(mut args: ScanArgs) -> i32 {
                     "warnings": warnings,
                     "dryRun": args.common.dry_run,
                 });
+            } else {
+                // The `redirectState` block rides the empty-discovery
+                // envelope too (same rule as the ≥1-package path below:
+                // every non-hosted-mode `--json` envelope carries it when
+                // the ledger holds records) — an `--ecosystems` filter or a
+                // wiped tree must not blind a state-probing consumer. The
+                // ledger is loaded here because the main-path load sits
+                // after this early return; a malformed ledger degrades to
+                // "nothing to consult" with the corruption surfaced, the
+                // same read-only posture as the main path.
+                let redirect_state =
+                    match socket_patch_core::patch::redirect::load_redirect_state(&args.common.cwd)
+                        .await
+                    {
+                        Ok(state) => state,
+                        Err(corrupt) => {
+                            eprintln!("Warning: {corrupt}");
+                            None
+                        }
+                    };
+                if let Some(state) =
+                    redirect_state_json(&args.common.cwd, redirect_state.as_ref(), &scanned_purls)
+                        .await
+                {
+                    result["redirectState"] = state;
+                }
             }
             let code =
                 embed_vex_into_json(&args.common, &args.vex, &manifest_path, 0, &mut result).await;
@@ -1865,6 +1935,23 @@ pub async fn run(mut args: ScanArgs) -> i32 {
                 Some(result),
             )
             .await;
+        }
+
+        // Cross-mode visibility, read-only half (companion to the run-level
+        // warnings below): the hosted redirect ledger's records ride every
+        // report-only and agent `--json` envelope as the additive
+        // `redirectState` block. Hosted mode is excluded above (its nested
+        // `redirect` block reports this run's own result, and `run_redirect`
+        // re-persists the ledger mid-run, so a pre-run snapshot would go
+        // stale); the vendored path below is excluded for the same staleness
+        // reason (its takeover reconciliation may retire ledger records
+        // mid-run — the `vendor_supersedes_redirect` warning covers it).
+        if !vendor {
+            if let Some(state) =
+                redirect_state_json(&args.common.cwd, redirect_state.as_ref(), &scanned_purls).await
+            {
+                result["redirectState"] = state;
+            }
         }
 
         // `apply` and `prune` are computed once at the top of run()
@@ -2963,6 +3050,60 @@ mod tests {
         assert_ne!(HOSTED_WIRING_RETAINED, VENDORED_OWNERSHIP_RETAINED);
         assert_ne!(HOSTED_WIRING_RETAINED, REDIRECT_SUPERSEDES_VENDORED);
         assert_ne!(VENDORED_OWNERSHIP_RETAINED, VENDOR_SUPERSEDES_REDIRECT);
+    }
+
+    // ---- redirectState envelope block (read-only cross-mode visibility) ----
+    // The end-to-end envelope placement (report-only + agent runs carry it,
+    // hosted/vendored runs don't) is pinned by `tests/scan_invariants.rs`;
+    // these pin the block builder's own gates and shape.
+
+    /// Records present ⇒ the block exists with the ledger's verbatim purl
+    /// keys, its mode string, and the (here unprovable ⇒ empty) wiringLive
+    /// split. Records absent (edits-only ledger, no ledger) ⇒ `None`, so the
+    /// envelope key stays additive.
+    #[tokio::test]
+    async fn redirect_state_block_gates_on_records_and_splits_live_proof() {
+        let purl = "pkg:npm/minimist@1.2.2";
+        let scanned: HashSet<String> = [purl.to_string()].into_iter().collect();
+
+        // Records, but no lockfile on disk: listed, with an EMPTY wiringLive
+        // (the ledger's word is never promoted to a live-lock proof).
+        let tmp = tempfile::tempdir().unwrap();
+        write_redirect_ledger_with_edit(tmp.path(), &[purl]).await;
+        let ledger = load_ledger(tmp.path()).await;
+        let block = redirect_state_json(tmp.path(), ledger.as_ref(), &scanned)
+            .await
+            .expect("records present ⇒ block present");
+        assert_eq!(block["mode"], "hosted");
+        assert_eq!(block["ledger"], ".socket/vendor/redirect-state.json");
+        assert_eq!(
+            block["records"],
+            serde_json::json!([{ "purl": purl, "uuid": TAKEOVER_UUID }])
+        );
+        assert_eq!(block["wiringLive"], serde_json::json!([]));
+
+        // Live lock present too: the same purl graduates into wiringLive.
+        write_hosted_yarn_lock(tmp.path(), TAKEOVER_UUID).await;
+        let block = redirect_state_json(tmp.path(), ledger.as_ref(), &scanned)
+            .await
+            .expect("records present ⇒ block present");
+        assert_eq!(block["wiringLive"], serde_json::json!([purl]));
+
+        // Edits-only ledger (records retired) ⇒ no block.
+        let tmp = tempfile::tempdir().unwrap();
+        write_redirect_ledger_with_edit(tmp.path(), &[]).await;
+        let ledger = load_ledger(tmp.path()).await;
+        assert!(
+            redirect_state_json(tmp.path(), ledger.as_ref(), &scanned)
+                .await
+                .is_none(),
+            "an edits-only ledger asserts no records"
+        );
+
+        // No ledger ⇒ no block.
+        assert!(redirect_state_json(tmp.path(), None, &scanned)
+            .await
+            .is_none());
     }
 
     // ---- cargo takeover direction (lock-shape probe) ------------------------

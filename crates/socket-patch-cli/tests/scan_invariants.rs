@@ -1669,3 +1669,212 @@ async fn scan_agent_hosted_warning_silent_when_lock_is_registry_clean() {
         "registry-clean lock ⇒ no hosted_wiring_retained warning; envelope={v}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Read-only cross-mode visibility — the `redirectState` envelope block
+// ---------------------------------------------------------------------------
+//
+// The `hosted_wiring_retained` warning above only rides the AGENT-mode
+// envelope, and report-only `scan --json` (the documented read-only state
+// probe) said nothing at all about a live hosted redirect: a hosted-wired
+// project's `scan --json` was byte-identical to a never-touched project's
+// (verified against production on bundler 1.17/2.7/4.0 — the gem live-matrix
+// D3 defect). These pin the additive top-level `redirectState` block: the
+// redirect ledger's records (project STATE, not an anomaly — so a block, not
+// a warning) plus the scanned purls whose hosted lockfile wiring the live
+// lock still proves.
+
+/// Report-only `scan --json` over live hosted wiring must carry the
+/// `redirectState` block — records AND the live-wiring proof — with no
+/// status/exit change and no agent-flow conversion warning.
+#[tokio::test]
+async fn report_only_scan_json_surfaces_hosted_redirect_state() {
+    let mock = MockServer::start().await;
+    let purl = "pkg:npm/minimist@1.2.2";
+    let encoded = "pkg%3Anpm%2Fminimist%401.2.2";
+    mount_patch_discovery(&mock, purl, encoded, AGENT_WARN_UUID).await;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_root_package_json(tmp.path());
+    write_npm_package(tmp.path(), "minimist", "1.2.2");
+    seed_live_hosted_wiring(
+        tmp.path(),
+        purl,
+        AGENT_WARN_UUID,
+        /*with_record=*/ true,
+    );
+
+    // No mode flag: the read-only discovery envelope.
+    let (code, stdout, stderr) = run_scan(tmp.path(), &mock.uri(), &[]);
+    assert_eq!(
+        code, 0,
+        "report-only scan must stay exit 0; stdout={stdout}; stderr={stderr}"
+    );
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert_eq!(v["status"], "success", "envelope={v}");
+
+    let state = &v["redirectState"];
+    assert!(
+        state.is_object(),
+        "report-only scan --json over a hosted-wired project must carry the \
+         redirectState block; envelope={v}"
+    );
+    assert_eq!(state["mode"], "hosted", "envelope={v}");
+    assert_eq!(
+        state["ledger"], ".socket/vendor/redirect-state.json",
+        "the block must name the ledger it reports; envelope={v}"
+    );
+    let records = state["records"].as_array().expect("records array");
+    assert_eq!(records.len(), 1, "envelope={v}");
+    assert_eq!(records[0]["purl"], purl, "envelope={v}");
+    assert_eq!(records[0]["uuid"], AGENT_WARN_UUID, "envelope={v}");
+    let live: Vec<&str> = state["wiringLive"]
+        .as_array()
+        .expect("wiringLive array")
+        .iter()
+        .map(|p| p.as_str().expect("purl string"))
+        .collect();
+    assert_eq!(
+        live,
+        vec![purl],
+        "the live lock still pins the patch server, so the wiring-live proof \
+         must name the purl; envelope={v}"
+    );
+    // The conversion warning stays agent-scoped: a read-only scan converts
+    // nothing, so hosted state is reported as state, never as a warning.
+    assert!(
+        find_warning(&v, "hosted_wiring_retained").is_none(),
+        "report-only scan must not fire the agent-flow conversion warning; \
+         envelope={v}"
+    );
+}
+
+/// The block keys on ledger RECORDS: an edits-only ledger (the post-takeover
+/// / degraded shape) and a ledger-less project both omit it entirely.
+#[tokio::test]
+async fn report_only_scan_json_omits_redirect_state_without_ledger_records() {
+    let mock = MockServer::start().await;
+    let purl = "pkg:npm/minimist@1.2.2";
+    let encoded = "pkg%3Anpm%2Fminimist%401.2.2";
+    mount_patch_discovery(&mock, purl, encoded, AGENT_WARN_UUID).await;
+
+    // Edits-only ledger (records retired), live-looking lock text.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_root_package_json(tmp.path());
+    write_npm_package(tmp.path(), "minimist", "1.2.2");
+    seed_live_hosted_wiring(
+        tmp.path(),
+        purl,
+        AGENT_WARN_UUID,
+        /*with_record=*/ false,
+    );
+    let (code, stdout, stderr) = run_scan(tmp.path(), &mock.uri(), &[]);
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert!(
+        v.get("redirectState").is_none(),
+        "an edits-only ledger asserts no records ⇒ no redirectState block; \
+         envelope={v}"
+    );
+
+    // No ledger at all: the key must stay absent (additive contract).
+    let clean = tempfile::tempdir().expect("tempdir");
+    write_root_package_json(clean.path());
+    write_npm_package(clean.path(), "minimist", "1.2.2");
+    let (code, stdout, stderr) = run_scan(clean.path(), &mock.uri(), &[]);
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert!(
+        v.get("redirectState").is_none(),
+        "no ledger ⇒ no redirectState block; envelope={v}"
+    );
+}
+
+/// Records with a registry-clean lock: the block still lists the records
+/// (the ledger is real state) but `wiringLive` is empty — the records/proof
+/// split mirrors the agent warning's live-lock gate.
+#[tokio::test]
+async fn report_only_scan_json_redirect_state_splits_records_from_live_proof() {
+    let mock = MockServer::start().await;
+    let purl = "pkg:npm/minimist@1.2.2";
+    let encoded = "pkg%3Anpm%2Fminimist%401.2.2";
+    mount_patch_discovery(&mock, purl, encoded, AGENT_WARN_UUID).await;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_root_package_json(tmp.path());
+    write_npm_package(tmp.path(), "minimist", "1.2.2");
+    seed_live_hosted_wiring(
+        tmp.path(),
+        purl,
+        AGENT_WARN_UUID,
+        /*with_record=*/ true,
+    );
+    // Registry-clean lock: the ledger record outlived the wiring.
+    std::fs::write(
+        tmp.path().join("yarn.lock"),
+        "# THIS IS AN AUTOGENERATED FILE. DO NOT EDIT THIS FILE DIRECTLY.\n\
+         # yarn lockfile v1\n\n\n\
+         minimist@^1.2.2:\n  version \"1.2.2\"\n  \
+         resolved \"https://registry.yarnpkg.com/minimist/-/minimist-1.2.2.tgz#bbbb\"\n  \
+         integrity sha512-orig==\n",
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) = run_scan(tmp.path(), &mock.uri(), &[]);
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    let state = &v["redirectState"];
+    assert!(
+        state.is_object(),
+        "records exist ⇒ block exists; envelope={v}"
+    );
+    assert_eq!(
+        state["records"].as_array().map(Vec::len),
+        Some(1),
+        "envelope={v}"
+    );
+    assert_eq!(
+        state["wiringLive"].as_array().map(Vec::len),
+        Some(0),
+        "registry-clean lock ⇒ empty wiringLive (never guess from ledger \
+         presence alone); envelope={v}"
+    );
+}
+
+/// Agent-mode runs carry the block too, alongside the conversion warning —
+/// the state block is descriptive, the warning is the conversion-incomplete
+/// diagnostic; neither replaces the other.
+#[tokio::test]
+async fn scan_agent_json_carries_redirect_state_alongside_warning() {
+    let mock = MockServer::start().await;
+    let purl = "pkg:npm/minimist@1.2.2";
+    let encoded = "pkg%3Anpm%2Fminimist%401.2.2";
+    mount_patch_discovery(&mock, purl, encoded, AGENT_WARN_UUID).await;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_root_package_json(tmp.path());
+    write_npm_package(tmp.path(), "minimist", "1.2.2");
+    seed_live_hosted_wiring(
+        tmp.path(),
+        purl,
+        AGENT_WARN_UUID,
+        /*with_record=*/ true,
+    );
+
+    let (code, stdout, stderr) = run_scan(
+        tmp.path(),
+        &mock.uri(),
+        &["--mode", "agent", "--dry-run", "--yes"],
+    );
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert!(
+        find_warning(&v, "hosted_wiring_retained").is_some(),
+        "the agent-flow warning is unchanged; envelope={v}"
+    );
+    assert_eq!(v["redirectState"]["mode"], "hosted", "envelope={v}");
+    assert_eq!(
+        v["redirectState"]["records"][0]["purl"], purl,
+        "envelope={v}"
+    );
+}
