@@ -589,6 +589,33 @@ pub(crate) fn result_to_event(result: &ApplyResult, dry_run: bool) -> PatchEvent
     PatchEvent::new(PatchAction::Applied, purl).with_files(files)
 }
 
+/// Print the yarn-PnP refusal (JSON envelope or human stderr) and return
+/// apply's refusal exit code. Shared by the pre-manifest gate and the
+/// package-manager layout gate below: scan cannot discover PnP packages so
+/// it never writes a manifest, which used to leave the calm `noManifest`
+/// exit as the ONLY thing a PnP user ever saw — the documented loud
+/// `yarn_pnp_unsupported` refusal was unreachable without a manifest.
+fn refuse_yarn_pnp(args: &ApplyArgs) -> i32 {
+    if args.common.json {
+        let mut env = Envelope::new(Command::Apply);
+        env.dry_run = args.common.dry_run;
+        env.mark_error(EnvelopeError::new(
+            "yarn_pnp_unsupported",
+            "yarn-berry Plug'n'Play layout is not supported by socket-patch (packages live inside .yarn/cache zips). Use `yarn patch <pkg>` instead.",
+        ));
+        println!("{}", env.to_pretty_json());
+    } else {
+        // Errors print even under --silent ("errors only", never
+        // "nothing"): exit 1 with no message would be undiagnosable.
+        eprintln!("Error: yarn-berry Plug'n'Play layout is not supported.");
+        eprintln!(
+            "  Packages live inside .yarn/cache/*.zip — socket-patch cannot rewrite them in place."
+        );
+        eprintln!("  Use `yarn patch <pkg>` instead.");
+    }
+    1
+}
+
 pub async fn run(args: ApplyArgs) -> i32 {
     apply_env_toggles(&args.common);
     let (telemetry_client, _) =
@@ -600,6 +627,18 @@ pub async fn run(args: ApplyArgs) -> i32 {
 
     // Check if manifest exists - exit successfully if no .socket folder is set up
     if tokio::fs::metadata(&manifest_path).await.is_err() {
+        // A yarn-PnP layout refuses loudly even with no manifest: scan
+        // cannot discover PnP packages (they live inside .yarn/cache zips),
+        // so it never writes one — without this hoisted check the layout
+        // gate further down never fired and the ONLY signal a PnP project
+        // ever produced was this calm exit-0 noManifest, i.e. a silent
+        // no-op. Same envelope + exit semantics as the with-manifest gate.
+        if matches!(
+            detect_npm_pkg_manager(&args.common.cwd),
+            NpmPkgManager::YarnBerryPnP
+        ) {
+            return refuse_yarn_pnp(&args);
+        }
         if args.common.json {
             let mut env = Envelope::new(Command::Apply);
             env.status = Status::NoManifest;
@@ -642,24 +681,7 @@ pub async fn run(args: ApplyArgs) -> i32 {
     // in `apply_file_patch` does the substantive safety work.
     match detect_npm_pkg_manager(&args.common.cwd) {
         NpmPkgManager::YarnBerryPnP => {
-            if args.common.json {
-                let mut env = Envelope::new(Command::Apply);
-                env.dry_run = args.common.dry_run;
-                env.mark_error(EnvelopeError::new(
-                    "yarn_pnp_unsupported",
-                    "yarn-berry Plug'n'Play layout is not supported by socket-patch (packages live inside .yarn/cache zips). Use `yarn patch <pkg>` instead.",
-                ));
-                println!("{}", env.to_pretty_json());
-            } else {
-                // Errors print even under --silent ("errors only", never
-                // "nothing"): exit 1 with no message would be undiagnosable.
-                eprintln!("Error: yarn-berry Plug'n'Play layout is not supported.");
-                eprintln!(
-                    "  Packages live inside .yarn/cache/*.zip — socket-patch cannot rewrite them in place."
-                );
-                eprintln!("  Use `yarn patch <pkg>` instead.");
-            }
-            return 1;
+            return refuse_yarn_pnp(&args);
         }
         NpmPkgManager::Pnpm => {
             if !args.common.json && !args.common.silent {

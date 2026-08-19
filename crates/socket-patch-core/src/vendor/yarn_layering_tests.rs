@@ -327,6 +327,7 @@ async fn classic_vendor_rewrites_only_target_block_and_stays_parseable() {
     // from the registry inventory by design).
     let (flavor, entries) = inventory_npm_lock(fx.root())
         .await
+        .expect("no layout refusal")
         .expect("rewritten lock must still be inventoriable");
     assert_eq!(flavor, NpmLockFlavor::YarnClassic);
     let mut got: Vec<(String, String)> = entries
@@ -851,7 +852,10 @@ async fn berry_vendor_leaves_builtin_patch_entries_byte_identical() {
     // The crate's own berry parser still reads the file; the untouched npm:
     // entries survive, patch:/file:/workspace resolutions are skipped by
     // design.
-    let (flavor, entries) = inventory_npm_lock(fx.root()).await.expect("parseable");
+    let (flavor, entries) = inventory_npm_lock(fx.root())
+        .await
+        .expect("no layout refusal")
+        .expect("parseable");
     assert_eq!(flavor, NpmLockFlavor::YarnBerry);
     let mut got: Vec<(String, String)> = entries
         .iter()

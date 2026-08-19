@@ -96,42 +96,69 @@ impl LockfileEntry {
     }
 }
 
+/// A project layout whose npm-family packages the inventory structurally
+/// CANNOT serve — distinct from "no lockfile" (`Ok(None)`), which is a
+/// normal, silent state. Today: the Plug'n'Play loaders (yarn berry's PnP,
+/// and pnpm's own `node-linker=pnp` mode). Consumers surface this as an
+/// explicit refusal instead of a silent empty inventory: under yarn PnP the
+/// installed-tree crawl is ALSO structurally empty (no `node_modules/`), so
+/// swallowing this diagnosis used to turn `scan` into a silent
+/// success-0 no-op in every mode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsupportedNpmLayout {
+    /// Stable diagnosis code from the flavor probe:
+    /// `vendor_yarn_berry_unsupported` or `vendor_pnpm_pnp_unsupported`.
+    pub code: &'static str,
+    /// Human-readable diagnosis with remedy.
+    pub detail: String,
+}
+
 /// Inventory the project's npm-family lockfile. Routes by
-/// [`detect_npm_lock_flavor`]; the two PNPM-SPECIFIC probe refusals
-/// (unsupported lockfileVersion, pnpm node-linker=pnp) fall back to reading
-/// a root `pnpm-lock.yaml` directly — unless a live sibling lock the
-/// router would otherwise have chosen sits beside it (a pnpm→yarn/npm
-/// migration leftover), in which case the SIBLING is inventoried instead
-/// ([`inventory_live_sibling_lock`]). A `vendor_lockfile_missing` refusal
-/// falls back to the pnpm <=2-era `shrinkwrap.yaml` (same v5 grammar,
-/// older filename), and any probe failure falls back to Rush's common
-/// lock when `rush.json` is present. All other refusals (yarn-berry PnP
-/// markers, bun locks, unrecognizable yarn locks) yield `None`.
+/// [`detect_npm_lock_flavor`]. `Ok(None)` means there is nothing to
+/// inventory (missing lockfile, bun.lockb, dep-less locks); `Err`
+/// propagates the probe's Plug'n'Play diagnosis — a layout whose packages
+/// the inventory can NEVER serve, which callers must not conflate with the
+/// calm no-lockfile case. Two pnpm-specific refusals fall back instead of
+/// yielding `None`: an unsupported `lockfileVersion` reads the root
+/// `pnpm-lock.yaml` directly — unless a live sibling lock the router would
+/// otherwise have chosen sits beside it (a pnpm→yarn/npm migration
+/// leftover), in which case the SIBLING is inventoried instead
+/// ([`inventory_live_sibling_lock`]) — and `vendor_lockfile_missing` reads
+/// the pnpm <=2-era `shrinkwrap.yaml` (same v5 grammar, older filename).
+/// Any remaining probe failure falls back to Rush's common lock when
+/// `rush.json` is present.
 pub(crate) async fn inventory_npm_lock(
     project_root: &Path,
-) -> Option<(NpmLockFlavor, Vec<LockfileEntry>)> {
+) -> Result<Option<(NpmLockFlavor, Vec<LockfileEntry>)>, UnsupportedNpmLayout> {
     let (flavor, _warnings) = match detect_npm_lock_flavor(project_root).await {
         Ok(found) => found,
-        Err((code, _detail)) => {
+        Err((code, detail)) => {
+            // The PnP loaders are a refusal, not an absence: propagate the
+            // diagnosis instead of discarding it. Under PnP the
+            // installed-tree crawl is ALSO structurally empty, so
+            // swallowing this here made `scan` a silent success-0 no-op in
+            // every mode. Every other probe error keeps the fallbacks below
+            // and the calm `Ok(None)`.
+            if matches!(
+                code,
+                "vendor_yarn_berry_unsupported" | "vendor_pnpm_pnp_unsupported"
+            ) {
+                return Err(UnsupportedNpmLayout { code, detail });
+            }
             // The flavor probe passes only pnpm locks the WIRING backends
-            // support (lockfileVersion 5.4/6.0/9.0) and refuses PnP layouts,
-            // but inventory is read-only discovery — an out-of-family (pnpm
-            // <= 6 or future) or pnpm-PnP-linked lock still names the
-            // resolved set, so on the probe's two PNPM-SPECIFIC refusals a
-            // present root lock is read directly rather than leaving fresh
-            // clones of such projects blind. Only those two codes: on any
-            // other refusal (yarn-berry PnP marker, bun locks) a root
-            // pnpm-lock.yaml is stale debris from a pnpm→yarn/bun migration,
-            // and inventorying it would present dead resolutions as the
-            // live dependency set.
+            // support (lockfileVersion 5.4/6.0/9.0), but inventory is
+            // read-only discovery — an out-of-family (pnpm <= 6-era or
+            // future) lock still names the resolved set, so on the probe's
+            // pnpm version refusal a present root lock is read directly
+            // rather than leaving fresh clones of such projects blind. Only
+            // that code: on any other refusal a root pnpm-lock.yaml is
+            // stale debris from a migration, and inventorying it would
+            // present dead resolutions as the live dependency set.
             // (`vendor_lockfile_version_unsupported` also covers the
             // unrecognizable-yarn.lock refusal, but the probe only sniffs
             // yarn.lock when no root pnpm-lock.yaml exists, so the direct
             // read is a no-op there.)
-            if matches!(
-                code,
-                "vendor_lockfile_version_unsupported" | "vendor_pnpm_pnp_unsupported"
-            ) {
+            if code == "vendor_lockfile_version_unsupported" {
                 // The version refusal fires from the probe's pnpm step,
                 // which runs BEFORE its yarn/npm steps — so it says nothing
                 // about whether a LIVE sibling lock sits beside the refused
@@ -139,18 +166,10 @@ pub(crate) async fn inventory_npm_lock(
                 // shape behind). Prefer whichever sibling the router would
                 // have chosen had the pnpm lock not shadowed it; only a
                 // sibling-less project is a genuine old-pnpm project whose
-                // lock the fallback may surface. The PnP refusal needs no
-                // such guard: `pnpm_pnp_layout` requires an installed pnpm
-                // store and NO yarn.lock, so there is no migration
-                // ambiguity to resolve.
-                let sibling = if code == "vendor_lockfile_version_unsupported" {
-                    inventory_live_sibling_lock(project_root).await
-                } else {
-                    None
-                };
-                match sibling {
+                // lock the fallback may surface.
+                match inventory_live_sibling_lock(project_root).await {
                     Some((flavor, entries)) if !entries.is_empty() => {
-                        return Some((flavor, finalize_npm(entries)));
+                        return Ok(Some((flavor, finalize_npm(entries))));
                     }
                     // A sibling lock FILE exists but yields no entries
                     // (dep-less project, or a grammar we cannot read): the
@@ -160,7 +179,7 @@ pub(crate) async fn inventory_npm_lock(
                     None => {
                         let pnpm = inventory_pnpm_lock(project_root).await.unwrap_or_default();
                         if !pnpm.is_empty() {
-                            return Some((NpmLockFlavor::Pnpm, finalize_npm(pnpm)));
+                            return Ok(Some((NpmLockFlavor::Pnpm, finalize_npm(pnpm))));
                         }
                     }
                 }
@@ -173,16 +192,16 @@ pub(crate) async fn inventory_npm_lock(
             // resolved set, so read it directly rather than leaving pnpm<=2
             // projects (and their fresh clones) lockfile-blind. Gated on
             // that ONE code: any other refusal means a DIFFERENT lock
-            // family is present (yarn-berry/bun markers, an unsupported
-            // recognized lock), where a shrinkwrap.yaml is stale debris
-            // from a long-ago migration whose dead resolutions must not
-            // pose as the live dependency set.
+            // family is present (bun markers, an unsupported recognized
+            // lock), where a shrinkwrap.yaml is stale debris from a
+            // long-ago migration whose dead resolutions must not pose as
+            // the live dependency set.
             if code == "vendor_lockfile_missing" {
                 let legacy = inventory_pnpm_lock_at(&project_root.join("shrinkwrap.yaml"))
                     .await
                     .unwrap_or_default();
                 if !legacy.is_empty() {
-                    return Some((NpmLockFlavor::PnpmLegacy, finalize_npm(legacy)));
+                    return Ok(Some((NpmLockFlavor::PnpmLegacy, finalize_npm(legacy))));
                 }
             }
             // Rush monorepos have no root package.json/lock pair; their
@@ -191,7 +210,7 @@ pub(crate) async fn inventory_npm_lock(
             // explicitly when the root lock is absent but rush.json is
             // present.
             let rush = inventory_rush_pnpm_locks(project_root).await;
-            return (!rush.is_empty()).then(|| (NpmLockFlavor::Pnpm, finalize_npm(rush)));
+            return Ok((!rush.is_empty()).then(|| (NpmLockFlavor::Pnpm, finalize_npm(rush))));
         }
     };
     let raw = match flavor {
@@ -203,8 +222,8 @@ pub(crate) async fn inventory_npm_lock(
         NpmLockFlavor::YarnClassic => inventory_yarn_classic(project_root).await,
         NpmLockFlavor::YarnBerry => inventory_yarn_berry(project_root).await,
         NpmLockFlavor::Bun => inventory_bun(project_root).await,
-    }?;
-    Some((flavor, finalize_npm(raw)))
+    };
+    Ok(raw.map(|raw| (flavor, finalize_npm(raw))))
 }
 
 /// The live sibling lock a version-refused root `pnpm-lock.yaml` may be
@@ -287,11 +306,26 @@ pub fn lookup<'a>(entries: &'a [LockfileEntry], purl: &str) -> Option<&'a Lockfi
 }
 
 /// Everything every recognized lockfile in the project resolves — the
-/// union the scan supplement and the vendor auto-fetch consume.
+/// union the scan supplement and the vendor auto-fetch consume. Drops the
+/// npm-layout diagnosis; callers that must surface refusals (scan) use
+/// [`inventory_project_diagnosed`].
 pub async fn inventory_project(project_root: &Path) -> Vec<LockfileEntry> {
+    inventory_project_diagnosed(project_root).await.0
+}
+
+/// [`inventory_project`] plus the npm-family layout refusals it hit: a
+/// Plug'n'Play project yields no npm entries AND a diagnosis, so consumers
+/// can tell "nothing to inventory" from "packages structurally unreachable"
+/// and refuse explicitly instead of silently reporting an empty project.
+pub async fn inventory_project_diagnosed(
+    project_root: &Path,
+) -> (Vec<LockfileEntry>, Vec<UnsupportedNpmLayout>) {
     let mut out: Vec<LockfileEntry> = Vec::new();
-    if let Some((_, entries)) = inventory_npm_lock(project_root).await {
-        out.extend(entries);
+    let mut unsupported: Vec<UnsupportedNpmLayout> = Vec::new();
+    match inventory_npm_lock(project_root).await {
+        Ok(Some((_, entries))) => out.extend(entries),
+        Ok(None) => {}
+        Err(diag) => unsupported.push(diag),
     }
     if let Some(entries) = inventory_cargo_lock(project_root).await {
         out.extend(entries);
@@ -308,7 +342,7 @@ pub async fn inventory_project(project_root: &Path) -> Vec<LockfileEntry> {
     if let Some(entries) = inventory_pypi_locks(project_root).await {
         out.extend(entries);
     }
-    out
+    (out, unsupported)
 }
 
 /// Guard + dedup the raw npm entries: unsafe names/versions are dropped
@@ -1762,7 +1796,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         write(tmp.path(), "package-lock.json", PACKAGE_LOCK).await;
 
-        let (flavor, entries) = inventory_npm_lock(tmp.path()).await.unwrap();
+        let (flavor, entries) = inventory_npm_lock(tmp.path()).await.unwrap().unwrap();
         assert_eq!(flavor, NpmLockFlavor::PackageLock);
 
         let lp = entry(&entries, "left-pad");
@@ -1804,7 +1838,7 @@ mod tests {
         )
         .await;
 
-        let (_, entries) = inventory_npm_lock(tmp.path()).await.unwrap();
+        let (_, entries) = inventory_npm_lock(tmp.path()).await.unwrap().unwrap();
         assert!(entries.iter().any(|e| e.name == "only-in-shrinkwrap"));
         assert!(!entries.iter().any(|e| e.name == "left-pad"));
     }
@@ -1818,7 +1852,7 @@ mod tests {
             r#"{ "lockfileVersion": 1, "dependencies": { "left-pad": { "version": "1.3.0" } } }"#,
         )
         .await;
-        assert!(inventory_npm_lock(tmp.path()).await.is_none());
+        assert!(inventory_npm_lock(tmp.path()).await.unwrap().is_none());
     }
 
     // ── pnpm ──────────────────────────────────────────────────────────────
@@ -1863,7 +1897,7 @@ snapshots:
         let tmp = tempfile::tempdir().unwrap();
         write(tmp.path(), "pnpm-lock.yaml", PNPM_LOCK).await;
 
-        let (flavor, entries) = inventory_npm_lock(tmp.path()).await.unwrap();
+        let (flavor, entries) = inventory_npm_lock(tmp.path()).await.unwrap().unwrap();
         assert_eq!(flavor, NpmLockFlavor::Pnpm);
 
         assert_eq!(
@@ -1943,7 +1977,7 @@ packages:
         let tmp = tempfile::tempdir().unwrap();
         write(tmp.path(), "pnpm-lock.yaml", PNPM_LOCK_V5).await;
 
-        let (flavor, entries) = inventory_npm_lock(tmp.path()).await.unwrap();
+        let (flavor, entries) = inventory_npm_lock(tmp.path()).await.unwrap().unwrap();
         // The legacy grammars route to the PnpmLegacy wiring flavor now
         // (they used to reach here through the version-refusal fallback);
         // the inventory content is identical either way.
@@ -2009,7 +2043,7 @@ packages:
         let tmp = tempfile::tempdir().unwrap();
         write(tmp.path(), "pnpm-lock.yaml", PNPM_LOCK_V6).await;
 
-        let (flavor, entries) = inventory_npm_lock(tmp.path()).await.unwrap();
+        let (flavor, entries) = inventory_npm_lock(tmp.path()).await.unwrap().unwrap();
         // The legacy grammars route to the PnpmLegacy wiring flavor now
         // (they used to reach here through the version-refusal fallback);
         // the inventory content is identical either way.
@@ -2039,14 +2073,16 @@ packages:
     /// A pnpm→yarn-berry migration leaves a stale root pnpm-lock.yaml behind
     /// a `.pnp.cjs` loader. The probe's refusal there is a yarn refusal, not
     /// a pnpm one — the legacy-lock fallback must NOT inventory the stale
-    /// lock as the live dependency set.
+    /// lock as the live dependency set; the yarn-PnP diagnosis propagates
+    /// instead.
     #[tokio::test]
     async fn stale_pnpm_lock_behind_yarn_berry_pnp_marker_is_not_inventoried() {
         let tmp = tempfile::tempdir().unwrap();
         write(tmp.path(), "pnpm-lock.yaml", PNPM_LOCK).await;
         write(tmp.path(), ".pnp.cjs", "/* yarn berry PnP loader */").await;
-        assert!(
-            inventory_npm_lock(tmp.path()).await.is_none(),
+        let diag = inventory_npm_lock(tmp.path()).await.unwrap_err();
+        assert_eq!(
+            diag.code, "vendor_yarn_berry_unsupported",
             "a stale pnpm-lock.yaml behind a yarn-berry PnP marker must not be inventoried"
         );
     }
@@ -2059,7 +2095,7 @@ packages:
         write(tmp.path(), "pnpm-lock.yaml", PNPM_LOCK).await;
         write(tmp.path(), "bun.lockb", "\0binary").await;
         assert!(
-            inventory_npm_lock(tmp.path()).await.is_none(),
+            inventory_npm_lock(tmp.path()).await.unwrap().is_none(),
             "a stale pnpm-lock.yaml behind bun.lockb must not be inventoried"
         );
     }
@@ -2086,7 +2122,7 @@ packages:
         write(tmp.path(), "pnpm-lock.yaml", PNPM_LOCK_V53_STALE).await;
         write(tmp.path(), "yarn.lock", YARN_CLASSIC).await;
 
-        let (flavor, entries) = inventory_npm_lock(tmp.path()).await.unwrap();
+        let (flavor, entries) = inventory_npm_lock(tmp.path()).await.unwrap().unwrap();
         assert_eq!(flavor, NpmLockFlavor::YarnClassic);
         assert_eq!(entry(&entries, "left-pad").version, "1.3.0");
         assert!(
@@ -2103,7 +2139,7 @@ packages:
         write(tmp.path(), "pnpm-lock.yaml", PNPM_LOCK_V53_STALE).await;
         write(tmp.path(), "yarn.lock", YARN_BERRY).await;
 
-        let (flavor, entries) = inventory_npm_lock(tmp.path()).await.unwrap();
+        let (flavor, entries) = inventory_npm_lock(tmp.path()).await.unwrap().unwrap();
         assert_eq!(flavor, NpmLockFlavor::YarnBerry);
         assert_eq!(entry(&entries, "left-pad").version, "1.3.0");
         assert!(
@@ -2120,7 +2156,7 @@ packages:
         write(tmp.path(), "pnpm-lock.yaml", PNPM_LOCK_V53_STALE).await;
         write(tmp.path(), "package-lock.json", PACKAGE_LOCK).await;
 
-        let (flavor, entries) = inventory_npm_lock(tmp.path()).await.unwrap();
+        let (flavor, entries) = inventory_npm_lock(tmp.path()).await.unwrap().unwrap();
         assert_eq!(flavor, NpmLockFlavor::PackageLock);
         assert_eq!(entry(&entries, "left-pad").version, "1.3.0");
         assert!(
@@ -2136,7 +2172,7 @@ packages:
         let tmp = tempfile::tempdir().unwrap();
         write(tmp.path(), "pnpm-lock.yaml", PNPM_LOCK_V53_STALE).await;
 
-        let (flavor, entries) = inventory_npm_lock(tmp.path()).await.unwrap();
+        let (flavor, entries) = inventory_npm_lock(tmp.path()).await.unwrap().unwrap();
         assert_eq!(flavor, NpmLockFlavor::Pnpm);
         assert_eq!(entry(&entries, "dead-pnpm-dep").version, "1.0.0");
     }
@@ -2151,7 +2187,7 @@ packages:
         write(tmp.path(), "pnpm-lock.yaml", PNPM_LOCK_V53_STALE).await;
         write(tmp.path(), "bun.lock", BUN_LOCK).await;
 
-        let (flavor, entries) = inventory_npm_lock(tmp.path()).await.unwrap();
+        let (flavor, entries) = inventory_npm_lock(tmp.path()).await.unwrap().unwrap();
         assert_eq!(flavor, NpmLockFlavor::Bun);
         assert_eq!(entry(&entries, "left-pad").version, "1.3.0");
         assert!(
@@ -2175,7 +2211,7 @@ packages:
         )
         .await;
         assert!(
-            inventory_npm_lock(tmp.path()).await.is_none(),
+            inventory_npm_lock(tmp.path()).await.unwrap().is_none(),
             "an empty live sibling must not resurrect the dead pnpm resolutions"
         );
     }
@@ -2228,6 +2264,7 @@ specifiers:
 
         let (flavor, entries) = inventory_npm_lock(tmp.path())
             .await
+            .unwrap()
             .expect("shrinkwrap.yaml must be inventoried");
         assert_eq!(flavor, NpmLockFlavor::PnpmLegacy);
         assert_eq!(entries.len(), 3, "all three packages entries: {entries:?}");
@@ -2262,7 +2299,7 @@ specifiers:
         write(tmp.path(), "pnpm-lock.yaml", PNPM_LOCK).await;
         write(tmp.path(), "shrinkwrap.yaml", SHRINKWRAP_YAML).await;
 
-        let (flavor, entries) = inventory_npm_lock(tmp.path()).await.unwrap();
+        let (flavor, entries) = inventory_npm_lock(tmp.path()).await.unwrap().unwrap();
         assert_eq!(flavor, NpmLockFlavor::Pnpm);
         assert!(
             !entries.iter().any(|e| e.name == "mkdirp"),
@@ -2273,31 +2310,35 @@ specifiers:
     /// Same stale-lock hazard as the pnpm-lock fallbacks: a shrinkwrap.yaml
     /// behind another family's marker (yarn-berry PnP here — the probe
     /// refuses with a NON-missing code) is migration debris, not the live
-    /// dependency set.
+    /// dependency set; the yarn-PnP diagnosis propagates instead.
     #[tokio::test]
     async fn stale_shrinkwrap_behind_yarn_berry_pnp_marker_is_not_inventoried() {
         let tmp = tempfile::tempdir().unwrap();
         write(tmp.path(), "shrinkwrap.yaml", SHRINKWRAP_YAML).await;
         write(tmp.path(), ".pnp.cjs", "/* yarn berry PnP loader */").await;
-        assert!(
-            inventory_npm_lock(tmp.path()).await.is_none(),
+        let diag = inventory_npm_lock(tmp.path()).await.unwrap_err();
+        assert_eq!(
+            diag.code, "vendor_yarn_berry_unsupported",
             "a shrinkwrap.yaml behind a yarn-berry PnP marker must not be inventoried"
         );
     }
 
     /// pnpm's own `node-linker=pnp` layout (`.pnp.cjs` + pnpm store + lock,
-    /// no yarn.lock) refuses with the pnpm-specific PnP code — the fallback
-    /// exists for exactly this project shape and must still read the lock.
+    /// no yarn.lock) refuses with the pnpm-specific PnP code, which
+    /// PROPAGATES as the layout diagnosis rather than falling back to the
+    /// lock read — under PnP the installed-tree crawl is also structurally
+    /// empty, so the honest answer is the refusal, not a lock-only
+    /// inventory posing as a served project (see
+    /// `pnp_layouts_propagate_the_diagnosis_instead_of_yielding_none`).
     #[tokio::test]
-    async fn pnpm_pnp_layout_still_inventories_root_lock() {
+    async fn pnpm_pnp_layout_propagates_the_diagnosis() {
         let tmp = tempfile::tempdir().unwrap();
         write(tmp.path(), "pnpm-lock.yaml", PNPM_LOCK).await;
         write(tmp.path(), ".pnp.cjs", "/* pnpm node-linker=pnp loader */").await;
         write_nested(tmp.path(), "node_modules/.modules.yaml", "").await;
 
-        let (flavor, entries) = inventory_npm_lock(tmp.path()).await.unwrap();
-        assert_eq!(flavor, NpmLockFlavor::Pnpm);
-        assert_eq!(entry(&entries, "left-pad").version, "1.3.0");
+        let diag = inventory_npm_lock(tmp.path()).await.unwrap_err();
+        assert_eq!(diag.code, "vendor_pnpm_pnp_unsupported");
     }
 
     // ── Rush monorepo ───────────────────────────────────────────────────────
@@ -2331,7 +2372,7 @@ packages:
         )
         .await;
 
-        let (flavor, entries) = inventory_npm_lock(tmp.path()).await.unwrap();
+        let (flavor, entries) = inventory_npm_lock(tmp.path()).await.unwrap().unwrap();
         assert_eq!(flavor, NpmLockFlavor::Pnpm);
         // Union across the common lock and the subspace lock.
         assert_eq!(entry(&entries, "left-pad").version, "1.3.0");
@@ -2343,7 +2384,7 @@ packages:
         // rush.json but no common/subspace lock at all: nothing to inventory.
         let tmp = tempfile::tempdir().unwrap();
         write(tmp.path(), "rush.json", r#"{"rushVersion":"5.0.0"}"#).await;
-        assert!(inventory_npm_lock(tmp.path()).await.is_none());
+        assert!(inventory_npm_lock(tmp.path()).await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -2366,7 +2407,7 @@ packages:
         )
         .await;
 
-        let (flavor, entries) = inventory_npm_lock(tmp.path()).await.unwrap();
+        let (flavor, entries) = inventory_npm_lock(tmp.path()).await.unwrap().unwrap();
         assert_eq!(flavor, NpmLockFlavor::Pnpm);
         assert!(entries.iter().any(|e| e.name == "left-pad"));
         assert!(
@@ -2406,7 +2447,7 @@ aliased@npm:real-name@^3.0.0:
         let tmp = tempfile::tempdir().unwrap();
         write(tmp.path(), "yarn.lock", YARN_CLASSIC).await;
 
-        let (flavor, entries) = inventory_npm_lock(tmp.path()).await.unwrap();
+        let (flavor, entries) = inventory_npm_lock(tmp.path()).await.unwrap().unwrap();
         assert_eq!(flavor, NpmLockFlavor::YarnClassic);
 
         let lp = entry(&entries, "left-pad");
@@ -2464,7 +2505,7 @@ __metadata:
         let tmp = tempfile::tempdir().unwrap();
         write(tmp.path(), "yarn.lock", YARN_BERRY).await;
 
-        let (flavor, entries) = inventory_npm_lock(tmp.path()).await.unwrap();
+        let (flavor, entries) = inventory_npm_lock(tmp.path()).await.unwrap().unwrap();
         assert_eq!(flavor, NpmLockFlavor::YarnBerry);
 
         let lp = entry(&entries, "left-pad");
@@ -2499,7 +2540,7 @@ __metadata:
         let tmp = tempfile::tempdir().unwrap();
         write(tmp.path(), "bun.lock", BUN_LOCK).await;
 
-        let (flavor, entries) = inventory_npm_lock(tmp.path()).await.unwrap();
+        let (flavor, entries) = inventory_npm_lock(tmp.path()).await.unwrap().unwrap();
         assert_eq!(flavor, NpmLockFlavor::Bun);
 
         assert_eq!(
@@ -2906,23 +2947,56 @@ source = { editable = "." }
     }
 
     #[tokio::test]
-    async fn unsupported_flavors_yield_none() {
-        // PnP marker wins over any lockfile.
+    async fn pnp_layouts_propagate_the_diagnosis_instead_of_yielding_none() {
+        // PnP marker wins over any lockfile — and the diagnosis must
+        // PROPAGATE, not collapse into the calm no-lockfile `None`. Under
+        // yarn PnP the installed-tree crawl is also structurally empty, so
+        // swallowing this here made `scan` a silent success-0 no-op in
+        // every mode (the P0 this pins).
         let tmp = tempfile::tempdir().unwrap();
         write(tmp.path(), ".pnp.cjs", "/* pnp */").await;
         write(tmp.path(), "package-lock.json", PACKAGE_LOCK).await;
-        assert!(inventory_npm_lock(tmp.path()).await.is_none());
+        let diag = inventory_npm_lock(tmp.path()).await.unwrap_err();
+        assert_eq!(diag.code, "vendor_yarn_berry_unsupported");
+        assert!(diag.detail.contains("Plug'n'Play"), "{}", diag.detail);
+        assert!(diag.detail.contains("yarn patch"), "{}", diag.detail);
 
-        // A legacy pnpm lock fails the flavor probe and is read directly by
-        // the discovery fallback — with no packages section that finds
-        // nothing, so the result stays None rather than Some(empty).
+        // pnpm's own `node-linker=pnp` twin (same loader, pnpm store):
+        // same channel, pnpm diagnosis.
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), ".pnp.cjs", "/* pnp */").await;
+        write(tmp.path(), "pnpm-lock.yaml", "lockfileVersion: '9.0'\n").await;
+        tokio::fs::create_dir_all(tmp.path().join("node_modules/.pnpm"))
+            .await
+            .unwrap();
+        write(&tmp.path().join("node_modules"), ".modules.yaml", "").await;
+        let diag = inventory_npm_lock(tmp.path()).await.unwrap_err();
+        assert_eq!(diag.code, "vendor_pnpm_pnp_unsupported");
+        assert!(diag.detail.contains("node-linker=pnp"), "{}", diag.detail);
+
+        // And the project-level union surfaces the same diagnosis while
+        // still serving the OTHER ecosystems' lockfiles.
+        let (entries, unsupported) = inventory_project_diagnosed(tmp.path()).await;
+        assert!(entries.is_empty(), "{entries:?}");
+        assert_eq!(unsupported.len(), 1, "{unsupported:?}");
+        assert_eq!(unsupported[0].code, "vendor_pnpm_pnp_unsupported");
+    }
+
+    #[tokio::test]
+    async fn unsupported_flavors_yield_none() {
+        // pnpm v6.0: the probe passes it (the 6.0 grammar has a wiring
+        // backend), and a dep-less lock inventories to nothing — the calm
+        // None, not a refusal.
         let tmp = tempfile::tempdir().unwrap();
         write(tmp.path(), "pnpm-lock.yaml", "lockfileVersion: '6.0'\n").await;
-        assert!(inventory_npm_lock(tmp.path()).await.is_none());
+        assert!(inventory_npm_lock(tmp.path()).await.unwrap().is_none());
 
         // No lockfile at all.
         let tmp = tempfile::tempdir().unwrap();
-        assert!(inventory_npm_lock(tmp.path()).await.is_none());
+        assert!(inventory_npm_lock(tmp.path()).await.unwrap().is_none());
+        let (entries, unsupported) = inventory_project_diagnosed(tmp.path()).await;
+        assert!(entries.is_empty());
+        assert!(unsupported.is_empty(), "{unsupported:?}");
     }
 }
 
