@@ -28,7 +28,16 @@ use socket_patch_core::vex::{
 
 use crate::args::{apply_env_toggles, parse_bool_flag, GlobalArgs};
 use crate::ecosystem_dispatch::find_manifest_package_paths;
-use crate::json_envelope::{Command, Envelope, EnvelopeError, PatchAction, PatchEvent};
+use crate::json_envelope::{Command, Envelope, EnvelopeError, PatchAction, PatchEvent, RunWarning};
+
+/// Routing tag for a patch omitted from VEX by the property-7 ecosystem
+/// filter alone: the patch IS applied (byte-verified, or trusted under
+/// `--no-verify`) and carries vulnerability metadata, but its ecosystem has
+/// no install hook set up and is not declared `manual`. Distinct from the
+/// verification tags (`hash_mismatch`, `package_not_found`, …) so a JSON
+/// consumer can tell "not patched" from "patched but not persisted by any
+/// hook" — before this tag existed the drop was machine-invisible.
+const ECOSYSTEM_NOT_SETUP: &str = "ecosystem_not_setup";
 
 #[derive(Args)]
 pub struct VexArgs {
@@ -180,6 +189,12 @@ pub(crate) struct VexWriteSummary {
     /// The built document — returned so the standalone `vex` command can
     /// emit its per-subcomponent envelope without rebuilding.
     pub doc: Document,
+    /// Run-level advisories (non-IRI product override, vendored artifacts
+    /// whose live installed tree is out of sync). Already printed to stderr
+    /// in human mode by [`generate_vex`]; the standalone `vex --json` path
+    /// folds them into the envelope's `warnings[]` (which is the only
+    /// channel `--json` has — it silences stderr).
+    pub warnings: Vec<RunWarning>,
 }
 
 /// Failure from [`generate_vex`], carrying a stable code + message the
@@ -224,7 +239,7 @@ pub async fn run(args: VexArgs) -> i32 {
     match generate_vex_from_manifest_path(&args.common, &params, &manifest_path).await {
         Ok(summary) => {
             if args.common.json {
-                emit_envelope_success(&summary.doc, &summary.failed);
+                emit_envelope_success(&summary);
             } else if let Some(path) = &args.output {
                 if !args.common.silent {
                     println!(
@@ -306,6 +321,34 @@ async fn generate_vex(
         Err(reason) => return Err(fail(common, "product_undetected", reason).await),
     };
 
+    let mut warnings: Vec<RunWarning> = Vec::new();
+
+    // The help text promises "PURL/identifier", so an arbitrary string is
+    // accepted — but the OpenVEX spec types the product `@id` as an IRI, and
+    // strict consumers (vexctl et al.) may reject or mis-key a bare name.
+    // Warn (never hard-reject) when the EXPLICIT override carries no scheme;
+    // auto-detected products are always `pkg:` PURLs and need no check.
+    if let Some(p) = params
+        .product
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+    {
+        if !has_iri_scheme(p) {
+            note_warning(
+                &mut warnings,
+                common,
+                "product_not_iri",
+                format!(
+                    "product override {p:?} (--product / --vex-product) is neither a PURL \
+                     (pkg:...) nor an absolute IRI; it is emitted verbatim as the OpenVEX \
+                     product @id, which the spec requires to be an IRI — strict consumers may \
+                     reject the document. Prefer pkg:<type>/<name>@<version>."
+                ),
+            );
+        }
+    }
+
     // Partition manifest into applied / failed.
     let mut outcome = if params.no_verify {
         // Trust-the-manifest mode still needs the vendored classification:
@@ -364,6 +407,25 @@ async fn generate_vex(
         }
     }
 
+    // Vendored disclosure: the committed artifact verified (the attestation
+    // stands — the committables are what the lockfile consumes) but the LIVE
+    // installed tree is present and running different bytes. Say so — a
+    // build that bypasses the vendor wiring is unpatched until the next
+    // package-manager install.
+    for purl in &outcome.vendored_out_of_sync {
+        note_warning(
+            &mut warnings,
+            common,
+            "vendored_tree_out_of_sync",
+            format!(
+                "{purl}: the installed tree does not match its vendored artifact; the \
+                 attestation is based on the committed .socket/vendor artifact (the lockfile \
+                 consumes it), but the live tree carries different bytes — re-run your \
+                 package manager's install to resync it."
+            ),
+        );
+    }
+
     // Property 7: attest a patch only for an ecosystem that is actually set up —
     // or explicitly declared `manual` in the manifest. Patches for an ecosystem
     // that is neither are dropped regardless of verification mode (so even
@@ -387,20 +449,35 @@ async fn generate_vex(
             }
         }
     }
-    let before = outcome.applied.len();
+    let mut setup_filtered: Vec<String> = Vec::new();
     outcome.applied.retain(|purl| {
-        vendored_set.contains(purl)
+        let keep = vendored_set.contains(purl)
             || redirected_set.contains(purl.as_str())
             || Ecosystem::from_purl(purl)
                 .map(|e| allowed.contains(&e))
-                .unwrap_or(false)
+                .unwrap_or(false);
+        if !keep {
+            setup_filtered.push(purl.clone());
+        }
+        keep
     });
-    if outcome.applied.len() != before && !common.silent && !common.json {
+    if !setup_filtered.is_empty() && !common.silent && !common.json {
         eprintln!(
             "Note: omitting patches for ecosystems that are not set up (and not declared `manual` \
              in .socket/manifest.json's `setup.manual`) from VEX."
         );
     }
+    // The filter drops join the omission channel (`failed`) with their own
+    // routing tag so they surface as per-purl `skipped` events in the
+    // envelope — success and error paths alike. Before this they existed
+    // only as the human-mode note above, leaving `--json` consumers unable
+    // to distinguish "patched but no persistence hook" from "not patched".
+    outcome
+        .failed
+        .extend(setup_filtered.into_iter().map(|purl| FailedPatch {
+            purl,
+            reason: ECOSYSTEM_NOT_SETUP.to_string(),
+        }));
 
     if !outcome.failed.is_empty() && !common.silent && !common.json {
         for f in &outcome.failed {
@@ -437,9 +514,33 @@ async fn generate_vex(
         None => {
             let (token, org) = crate::commands::list::telemetry_credentials(common);
             track_vex_failed("no_applicable_patches", token.as_deref(), org.as_deref()).await;
+            // When nothing attested and EVERY omission was the property-7
+            // filter, say so: those patches ARE applied with vulnerability
+            // metadata, and the generic message below would read as "not
+            // patched" to a human. The code stays `no_applicable_patches` —
+            // it is the documented exit-1 routing tag consumers already
+            // branch on; the per-event `ecosystem_not_setup` errorCode is
+            // the machine-readable discriminator.
+            let all_setup_drops = outcome.applied.is_empty()
+                && !outcome.failed.is_empty()
+                && outcome
+                    .failed
+                    .iter()
+                    .all(|f| f.reason == ECOSYSTEM_NOT_SETUP);
+            let message = if all_setup_drops {
+                format!(
+                    "{} applied patch(es) with vulnerability metadata were omitted from VEX \
+                     because their ecosystems are not set up (no install hook) and not declared \
+                     `manual` in .socket/manifest.json's `setup.manual`. Run `socket-patch \
+                     setup`, or add the ecosystem to `setup.manual`, then re-run.",
+                    outcome.failed.len()
+                )
+            } else {
+                "No applied patches with vulnerability metadata to attest.".to_string()
+            };
             return Err(VexGenError {
                 code: "no_applicable_patches",
-                message: "No applied patches with vulnerability metadata to attest.".to_string(),
+                message,
                 failed: outcome.failed,
             });
         }
@@ -459,7 +560,15 @@ async fn generate_vex(
     let wrote_to_file = match &params.output {
         Some(path) => {
             if let Err(e) = tokio::fs::write(path, &serialized).await {
-                return Err(fail(common, "write_failed", e.to_string()).await);
+                // The raw io::Error ("No such file or directory (os error
+                // 2)") names neither the file nor the operation — useless
+                // in a CI log. Say what was being written and where.
+                return Err(fail(
+                    common,
+                    "write_failed",
+                    format!("failed to write VEX document to {}: {e}", path.display()),
+                )
+                .await);
             }
             true
         }
@@ -483,14 +592,87 @@ async fn generate_vex(
         statements: doc.statements.len(),
         failed: outcome.failed,
         doc,
+        warnings,
     })
+}
+
+/// Record a run-level advisory the way `update`/`vendor` do: stderr
+/// (`Warning: <detail>`) in human mode, and into `warnings` so the `--json`
+/// envelope — which silences stderr — carries it in `warnings[]` instead.
+/// Under `--silent` only the envelope copy survives (warnings are not
+/// errors).
+fn note_warning(warnings: &mut Vec<RunWarning>, common: &GlobalArgs, code: &str, detail: String) {
+    if !common.silent && !common.json {
+        eprintln!("Warning: {detail}");
+    }
+    warnings.push(RunWarning {
+        code: code.to_string(),
+        detail,
+    });
+}
+
+/// True when `s` opens with an RFC 3986/3987 scheme
+/// (`ALPHA *(ALPHA / DIGIT / "+" / "-" / ".") ":"`). A purl passes the same
+/// test (`pkg:` is a scheme), so one check covers both halves of the help
+/// text's "PURL/identifier" promise. Deliberately shallow — the goal is to
+/// catch bare names like `my-app`, not to validate full IRIs.
+fn has_iri_scheme(s: &str) -> bool {
+    let Some((scheme, _)) = s.split_once(':') else {
+        return false;
+    };
+    let mut chars = scheme.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
 }
 
 /// Read the manifest at `manifest_path`, then [`generate_vex`]. Manifest
 /// read failures are wrapped as [`VexGenError`] so embedded callers
 /// (`apply`/`scan`) get a single error channel. Used by the embedded
 /// `--vex` paths, which always write to a file.
+///
+/// Failure contract: a run that ends in error leaves NO OpenVEX document at
+/// the output path — including a stale one from a previous run. Attestation
+/// semantics demand it: a pipeline reusing one `--output`/`--vex` path must
+/// not ship yesterday's `not_affected` document for a tree this run could
+/// no longer attest. See [`remove_stale_vex_doc`] for the deletion guard.
 pub(crate) async fn generate_vex_from_manifest_path(
+    common: &GlobalArgs,
+    params: &VexBuildParams,
+    manifest_path: &Path,
+) -> Result<VexWriteSummary, VexGenError> {
+    let result = generate_vex_from_manifest_path_inner(common, params, manifest_path).await;
+    if result.is_err() {
+        remove_stale_vex_doc(params.output.as_deref()).await;
+    }
+    result
+}
+
+/// Delete a PRIOR run's OpenVEX document at `output` after a failed run.
+/// Only a file that is recognizably OpenVEX (JSON whose `@context` names
+/// openvex.dev) is removed — the guard keeps a mistyped `--output` pointing
+/// at an unrelated file from being destroyed by an unrelated failure.
+/// Removal errors are swallowed: the non-zero exit is the contract, the
+/// deletion is hygiene.
+async fn remove_stale_vex_doc(output: Option<&Path>) {
+    let Some(path) = output else { return };
+    let Ok(bytes) = tokio::fs::read(path).await else {
+        return;
+    };
+    let is_openvex = serde_json::from_slice::<serde_json::Value>(&bytes)
+        .ok()
+        .and_then(|v| {
+            v.get("@context")
+                .and_then(|c| c.as_str())
+                .map(|c| c.contains("openvex.dev"))
+        })
+        .unwrap_or(false);
+    if is_openvex {
+        let _ = tokio::fs::remove_file(path).await;
+    }
+}
+
+/// [`generate_vex_from_manifest_path`] without the failure-cleanup wrapper.
+async fn generate_vex_from_manifest_path_inner(
     common: &GlobalArgs,
     params: &VexBuildParams,
     manifest_path: &Path,
@@ -726,7 +908,7 @@ fn emit_envelope_error(args: &VexArgs, code: &str, message: &str, failures: &[Fa
         for f in failures {
             env.record(
                 PatchEvent::new(PatchAction::Skipped, f.purl.clone())
-                    .with_reason(f.reason.clone(), "patch omitted from VEX"),
+                    .with_reason(f.reason.clone(), omission_reason_message(&f.reason)),
             );
         }
         env.mark_error(EnvelopeError::new(code, message.to_string()));
@@ -739,9 +921,21 @@ fn emit_envelope_error(args: &VexArgs, code: &str, message: &str, failures: &[Fa
     }
 }
 
-fn emit_envelope_success(doc: &Document, failures: &[FailedPatch]) {
+/// Human `reason` string for an omission event; the routing tag rides
+/// `errorCode`. The property-7 drop gets its own phrasing — that patch IS
+/// applied and verified, which the generic "omitted" alone doesn't convey.
+fn omission_reason_message(reason: &str) -> &'static str {
+    if reason == ECOSYSTEM_NOT_SETUP {
+        "applied patch omitted from VEX: its ecosystem has no install hook set up and is not \
+         declared `manual` in setup.manual"
+    } else {
+        "patch omitted from VEX"
+    }
+}
+
+fn emit_envelope_success(summary: &VexWriteSummary) {
     let mut env = Envelope::new(Command::Vex);
-    for st in &doc.statements {
+    for st in &summary.doc.statements {
         for prod in &st.products {
             for sub in &prod.subcomponents {
                 env.record(
@@ -756,15 +950,16 @@ fn emit_envelope_success(doc: &Document, failures: &[FailedPatch]) {
             }
         }
     }
-    for f in failures {
+    for f in &summary.failed {
         env.record(
             PatchEvent::new(PatchAction::Skipped, f.purl.clone())
-                .with_reason(f.reason.clone(), "patch omitted from VEX"),
+                .with_reason(f.reason.clone(), omission_reason_message(&f.reason)),
         );
     }
-    if !failures.is_empty() {
+    if !summary.failed.is_empty() {
         env.mark_partial_failure();
     }
+    env.warnings = summary.warnings.clone();
     println!("{}", env.to_pretty_json());
 }
 
@@ -849,6 +1044,31 @@ mod tests {
         assert!(!are_safe_redirect_coords("github.com/foo/bar", "v1/0/0"));
         assert!(!are_safe_redirect_coords("github.com/foo/bar", ".."));
         assert!(!are_safe_redirect_coords("github.com/foo/bar", ""));
+    }
+
+    /// The `--product` advisory keys off [`has_iri_scheme`]: PURLs and
+    /// anything scheme-shaped sail through silently; bare names (what the
+    /// probe fed in) warn. Pin the accept/reject sets so the check can't
+    /// drift into rejecting legal identifiers (a hard reject is explicitly
+    /// out of contract — help text says "PURL/identifier").
+    #[test]
+    fn iri_scheme_check_accepts_purls_and_iris_rejects_bare_names() {
+        // Accepted (no warning): PURLs, URLs, URNs, exotic-but-legal schemes.
+        assert!(has_iri_scheme("pkg:npm/my-app@1.0.0"));
+        assert!(has_iri_scheme("pkg:golang/github.com/foo/bar@v1.2.3"));
+        assert!(has_iri_scheme("https://example.com/products/app"));
+        assert!(has_iri_scheme(
+            "urn:uuid:0f9be22a-4a56-4b74-8c9d-6d70c67a4b32"
+        ));
+        assert!(has_iri_scheme("git+ssh://git@github.com/foo/bar"));
+        // Rejected (warn): bare names, empty scheme, non-alpha scheme start,
+        // spaces before the colon.
+        assert!(!has_iri_scheme("my-app"));
+        assert!(!has_iri_scheme("my app 1.0"));
+        assert!(!has_iri_scheme(""));
+        assert!(!has_iri_scheme(":no-scheme"));
+        assert!(!has_iri_scheme("1pkg:starts-with-digit"));
+        assert!(!has_iri_scheme("bad scheme:rest"));
     }
 
     #[derive(Parser)]
