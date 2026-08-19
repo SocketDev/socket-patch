@@ -3509,9 +3509,11 @@ fn rewrite_gem(
                             format!(
                                 "the `gem \"{}\"` declaration carries `{tok}` pointing into \
                                  .socket/vendor — socket-patch's own vendored wiring, which \
-                                 would override the Socket source block; run `socket-patch \
-                                 vendor --revert` first, then re-run the hosted scan",
-                                dep.name
+                                 would override the Socket source block; un-vendor this gem \
+                                 first (`socket-patch remove pkg:gem/{}@{}`, or `socket-patch \
+                                 vendor --revert` to revert EVERY vendored dependency in the \
+                                 project), then re-run the hosted scan",
+                                dep.name, dep.name, dep.version
                             )
                         } else {
                             format!(
@@ -7160,8 +7162,9 @@ mod tests {
 
     /// When the blocking `path:` option is socket-patch's OWN vendored wiring
     /// (`.socket/vendor/gem/<uuid>/…`), the refusal must prescribe the eject
-    /// path (`socket-patch vendor --revert`) instead of pointing the user at
-    /// a Gemfile line the tool itself wrote.
+    /// paths instead of pointing the user at a Gemfile line the tool itself
+    /// wrote — and state their blast radius honestly: `remove <purl>` is the
+    /// per-gem undo, `vendor --revert` reverts EVERY vendored dependency.
     #[test]
     fn gemfile_source_option_refusal_prescribes_vendor_revert_for_own_wiring() {
         let mut files = BTreeMap::new();
@@ -7179,8 +7182,11 @@ mod tests {
             .find(|w| w.code == "redirect_gem_source_option")
             .unwrap_or_else(|| panic!("skip must warn: {:?}", r.warnings));
         assert!(
-            warning.detail.contains("socket-patch vendor --revert"),
-            "socket's own vendored wiring must prescribe the eject path: {}",
+            warning.detail.contains("socket-patch remove pkg:gem/rails@7.0.0")
+                && warning.detail.contains("socket-patch vendor --revert")
+                && warning.detail.contains("EVERY vendored dependency"),
+            "socket's own vendored wiring must prescribe the per-gem eject and \
+             state vendor --revert's whole-project blast radius: {}",
             warning.detail
         );
         // A USER path: dep keeps the generic refusal — no bogus prescription.
