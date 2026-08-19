@@ -2041,13 +2041,68 @@ fn rewrite_yarn_berry(
                     .1
                     .starts_with("npm:")
             }) {
+                let ranges: Vec<&str> = parsed
+                    .iter()
+                    .map(|p| {
+                        p.expect("every pattern parsed — None-bearing keys are skipped above")
+                            .1
+                    })
+                    .collect();
+                // A `file:` range into `.socket/vendor/` is socket-patch's
+                // OWN vendored wiring (`scan --mode vendored`), not some
+                // third-party protocol: the refusal stays fail-closed
+                // (byte-identical — the vendored artifact is the live CVE
+                // protection), but it must say what the entry IS and name
+                // the real way out. `remove <purl>` is the per-package
+                // retirement; `vendor --revert` works too but unwinds EVERY
+                // vendored package, so it is scoped, not recommended. The
+                // remedy holds whether or not a vendored→hosted pre-revert
+                // ever lands for npm-family — today no berry counterpart of
+                // the cargo takeover exists.
+                if ranges
+                    .iter()
+                    .any(|r| r.starts_with("file:") && r.contains(".socket/vendor/"))
+                {
+                    result.warnings.push(RewriteWarning {
+                        code: "redirect_yarn_berry_vendored_entry".into(),
+                        detail: format!(
+                            "lock entry `{raw_key}` is socket-patch's own vendored wiring \
+                             for {fname}@{} (a committed `.socket/vendor/` artifact); the \
+                             hosted redirect does not take over a vendor-owned package — \
+                             leaving it byte-identical. To move this package to hosted \
+                             mode, first retire its vendored wiring: run `socket-patch \
+                             remove <purl>` for this package (or `socket-patch vendor \
+                             --revert`, which unwinds EVERY vendored package), then re-run \
+                             `scan --mode hosted`",
+                            dep.version
+                        ),
+                    });
+                    continue;
+                }
+                // Name the entry's ACTUAL protocol(s) — a hardcoded example
+                // list misdirects for anything outside it (`file:`, `exec:`,
+                // …). `workspace:`/`patch:`/`portal:`/`link:` stay the
+                // canonical examples of why the gate exists.
+                let mut protocols: Vec<String> = ranges
+                    .iter()
+                    .filter(|r| !r.starts_with("npm:"))
+                    .map(|r| match r.split_once(':') {
+                        Some((proto, _)) => format!("{proto}:"),
+                        None => "(none)".to_string(),
+                    })
+                    .collect();
+                protocols.sort();
+                protocols.dedup();
                 result.warnings.push(RewriteWarning {
                     code: "redirect_yarn_berry_unsupported_protocol".into(),
                     detail: format!(
-                        "lock entry `{raw_key}` resolves {fname}@{} through a protocol \
-                         the hosted redirect cannot own (workspace:/patch:/portal:/link:); \
-                         leaving it byte-identical",
-                        dep.version
+                        "lock entry `{raw_key}` resolves {fname}@{} through the `{}` \
+                         protocol, which the hosted redirect cannot own (only npm: \
+                         registry entries are rewritten; e.g. workspace:, patch:, \
+                         portal:, link: blocks must survive untouched); leaving it \
+                         byte-identical",
+                        dep.version,
+                        protocols.join("`/`")
                     ),
                 });
                 continue;
@@ -5209,7 +5264,11 @@ mod tests {
                 )
             });
         // Names the refused entry and the real remediation sequence.
-        assert!(w.detail.contains(&entry), "must name the entry: {}", w.detail);
+        assert!(
+            w.detail.contains(&entry),
+            "must name the entry: {}",
+            w.detail
+        );
         assert!(
             w.detail.contains("socket-patch remove"),
             "must name the per-package remediation: {}",

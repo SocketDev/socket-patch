@@ -1454,7 +1454,9 @@ async fn scan_agent_over_vendored_purl_surfaces_run_level_warning() {
     );
 
     // The per-patch skip record is unchanged (contract-pinned elsewhere)…
-    let patches = v["apply"]["patches"].as_array().expect("apply.patches array");
+    let patches = v["apply"]["patches"]
+        .as_array()
+        .expect("apply.patches array");
     assert_eq!(patches.len(), 1, "envelope={v}");
     assert_eq!(patches[0]["errorCode"], "vendored", "envelope={v}");
 
@@ -1485,9 +1487,8 @@ async fn scan_agent_over_vendored_purl_surfaces_run_level_warning() {
 /// edited, whose resolved URL still pins the patch server (the live-wiring
 /// proof `hosted_wiring_live` reads).
 fn seed_live_hosted_wiring(root: &Path, purl: &str, uuid: &str, with_record: bool) {
-    let hosted_url = format!(
-        "https://patch.socket.dev/patch/npm/minimist/1.2.2/tok/{uuid}/minimist-1.2.2.tgz"
-    );
+    let hosted_url =
+        format!("https://patch.socket.dev/patch/npm/minimist/1.2.2/tok/{uuid}/minimist-1.2.2.tgz");
     std::fs::write(
         root.join("yarn.lock"),
         format!(
@@ -1539,7 +1540,12 @@ async fn scan_agent_over_live_hosted_wiring_surfaces_run_level_warning() {
     let tmp = tempfile::tempdir().expect("tempdir");
     write_root_package_json(tmp.path());
     write_npm_package(tmp.path(), "minimist", "1.2.2");
-    seed_live_hosted_wiring(tmp.path(), purl, AGENT_WARN_UUID, /*with_record=*/ true);
+    seed_live_hosted_wiring(
+        tmp.path(),
+        purl,
+        AGENT_WARN_UUID,
+        /*with_record=*/ true,
+    );
 
     // --dry-run keeps the run cheap (no artifact download mocks needed);
     // the warning is a STATE probe — the hosted wiring is live whether or
@@ -1602,7 +1608,12 @@ async fn scan_agent_hosted_warning_silent_once_ledger_records_are_gone() {
     write_npm_package(tmp.path(), "minimist", "1.2.2");
     // Ledger with edits but NO records (the post-pre-revert shape) — and
     // the lock text still carrying the uuid must not resurrect the warning.
-    seed_live_hosted_wiring(tmp.path(), purl, AGENT_WARN_UUID, /*with_record=*/ false);
+    seed_live_hosted_wiring(
+        tmp.path(),
+        purl,
+        AGENT_WARN_UUID,
+        /*with_record=*/ false,
+    );
 
     let (code, stdout, stderr) = run_scan(
         tmp.path(),
@@ -1629,7 +1640,12 @@ async fn scan_agent_hosted_warning_silent_when_lock_is_registry_clean() {
     let tmp = tempfile::tempdir().expect("tempdir");
     write_root_package_json(tmp.path());
     write_npm_package(tmp.path(), "minimist", "1.2.2");
-    seed_live_hosted_wiring(tmp.path(), purl, AGENT_WARN_UUID, /*with_record=*/ true);
+    seed_live_hosted_wiring(
+        tmp.path(),
+        purl,
+        AGENT_WARN_UUID,
+        /*with_record=*/ true,
+    );
     // Overwrite the lock with a registry-clean entry (no uuid, no patch host).
     std::fs::write(
         tmp.path().join("yarn.lock"),
