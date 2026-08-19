@@ -378,6 +378,26 @@ fn find_node_dirs_sync(base: &Path, segments: &[&str]) -> Vec<PathBuf> {
 /// NPM ecosystem crawler for discovering packages in `node_modules`.
 pub struct NpmCrawler;
 
+/// One still-unresolved `find_by_purls` lookup.
+///
+/// `purl` is the *verbatim* caller-supplied PURL, including any
+/// `?qualifiers`. The result map is keyed by this exact string: the
+/// dispatcher drives npm with `passthrough_purls` + `merge_first_wins`,
+/// so it looks results back up under the PURL it handed in. Keying by a
+/// reconstructed/stripped PURL silently loses every qualified PURL
+/// (e.g. `pkg:npm/foo@1.0.0?vcs_url=...`).
+struct Target {
+    namespace: Option<String>,
+    name: String,
+    version: String,
+    purl: String,
+    /// Install dir relative to a `node_modules` root
+    /// (`@scope/name` or `name`) — which is also exactly what the
+    /// package.json `name` field must say for this dir to BE that
+    /// package.
+    dir_key: String,
+}
+
 /// Which kind of `node_modules` directory a scan pass is walking — the one
 /// traversal-policy bit that differs between them.
 #[derive(Clone, Copy)]
@@ -459,24 +479,6 @@ impl NpmCrawler {
     ) -> Result<HashMap<String, CrawledPackage>, std::io::Error> {
         let mut result: HashMap<String, CrawledPackage> = HashMap::new();
 
-        // `purl` is the *verbatim* caller-supplied PURL, including any
-        // `?qualifiers`. The result map is keyed by this exact string: the
-        // dispatcher drives npm with `passthrough_purls` + `merge_first_wins`,
-        // so it looks results back up under the PURL it handed in. Keying by a
-        // reconstructed/stripped PURL silently loses every qualified PURL
-        // (e.g. `pkg:npm/foo@1.0.0?vcs_url=...`).
-        struct Target {
-            namespace: Option<String>,
-            name: String,
-            version: String,
-            purl: String,
-            /// Install dir relative to a `node_modules` root
-            /// (`@scope/name` or `name`) — which is also exactly what the
-            /// package.json `name` field must say for this dir to BE that
-            /// package.
-            dir_key: String,
-        }
-
         let mut pending: Vec<Target> = Vec::new();
         for purl in purls {
             let Some((namespace, name, version)) = Self::parse_purl_components(purl) else {
@@ -510,14 +512,51 @@ impl NpmCrawler {
             });
         }
 
-        // Probe trees breadth-first: the root `node_modules` first (so a
-        // root-level install always wins), then — only while targets remain
-        // unresolved — each nested `node_modules`. npm nests a conflicting
-        // version under the dependent package, so a patched version can
-        // exist *only* nested; CLI_CONTRACT ("Deeply nested transitive
-        // dependencies are fully supported") promises those are patched
-        // identically to direct deps, and `crawl_all` (scan) already
-        // discovers them at unbounded depth.
+        // Pass 1 — filtered: `.pnpm` virtual-store entries are enqueued
+        // only when their dir name decodes to a still-pending target's
+        // name (a manifest routinely lists packages that simply aren't
+        // installed here, and probing every entry of a large monorepo
+        // store for them would add a readdir+stat storm to every
+        // apply/rollback run).
+        let pending =
+            Self::resolve_pending_targets(node_modules_path, pending, &mut result, true).await;
+
+        // Pass 2 — unfiltered fallback, only for targets pass 1 could not
+        // resolve: a target can physically exist ONLY inside another
+        // package's store entry (a bundled dependency at
+        // `.pnpm/host@1.0.0/node_modules/host/node_modules/<target>`),
+        // whose entry name decodes to the HOST's name — the pass-1 filter
+        // skips it, leaving an installed, scan-visible package invisible
+        // to apply (fail-open: apply reported it not installed). Probe
+        // every store entry for just the leftovers; the common all-
+        // resolved case never reaches this pass, so its perf is intact.
+        if !pending.is_empty() {
+            Self::resolve_pending_targets(node_modules_path, pending, &mut result, false).await;
+        }
+
+        Ok(result)
+    }
+
+    /// One breadth-first resolution pass over the tree rooted at
+    /// `node_modules_path`: the root `node_modules` first (so a root-level
+    /// install always wins), then — only while targets remain unresolved —
+    /// each nested `node_modules`. npm nests a conflicting version under
+    /// the dependent package, so a patched version can exist *only*
+    /// nested; CLI_CONTRACT ("Deeply nested transitive dependencies are
+    /// fully supported") promises those are patched identically to direct
+    /// deps, and `crawl_all` (scan) already discovers them at unbounded
+    /// depth.
+    ///
+    /// Resolved targets land in `result`; the still-unresolved remainder
+    /// is returned. `filter_store_entries` selects whether pnpm
+    /// virtual-store entries are bounded by the pending-name filter (pass
+    /// 1) or all probed (the pass-2 fallback) — see `find_by_purls`.
+    async fn resolve_pending_targets(
+        node_modules_path: &Path,
+        mut pending: Vec<Target>,
+        result: &mut HashMap<String, CrawledPackage>,
+        filter_store_entries: bool,
+    ) -> Vec<Target> {
         let mut queue: VecDeque<PathBuf> = VecDeque::from([node_modules_path.to_path_buf()]);
         while let Some(nm_path) = queue.pop_front() {
             if pending.is_empty() {
@@ -559,11 +598,11 @@ impl NpmCrawler {
                 // targets resolved at shallower depths drop out.
                 let pending_names: HashSet<&str> =
                     pending.iter().map(|t| t.dir_key.as_str()).collect();
-                Self::collect_nested_node_modules(&nm_path, &pending_names, &mut queue).await;
+                let filter = filter_store_entries.then_some(&pending_names);
+                Self::collect_nested_node_modules(&nm_path, filter, &mut queue).await;
             }
         }
-
-        Ok(result)
+        pending
     }
 
     /// Append the `node_modules` dirs living one level below `nm_path`
@@ -572,11 +611,13 @@ impl NpmCrawler {
     /// skipped and symlinked packages are never traversed — a symlink here
     /// points into pnpm's content-addressed store or an `npm link` target
     /// outside the project. The one exception is pnpm's `.pnpm` virtual
-    /// store (see below); `pending_names` — the still-unresolved targets'
-    /// full package names — bounds which store entries get enqueued.
+    /// store (see below); `pending_names` — `Some(the still-unresolved
+    /// targets' full package names)` — bounds which store entries get
+    /// enqueued, while `None` (the pass-2 fallback of `find_by_purls`)
+    /// enqueues every store entry.
     async fn collect_nested_node_modules(
         nm_path: &Path,
-        pending_names: &HashSet<&str>,
+        pending_names: Option<&HashSet<&str>>,
         queue: &mut VecDeque<PathBuf>,
     ) {
         for entry in crate::utils::fs::list_dir_entries(nm_path).await {
@@ -670,18 +711,25 @@ impl NpmCrawler {
     /// (dir-name versions can carry peer/build decorations; the
     /// package.json probe stays the authority). An undecodable name
     /// (truncated/hash-suffixed dirs, git/URL deps, `_`-bearing names)
-    /// reveals nothing about what's inside, so it stays probeable. Both
-    /// enumerators only yield entries whose `node_modules` exists, so no
-    /// re-stat here.
+    /// reveals nothing about what's inside, so it stays probeable.
+    ///
+    /// `pending_names = None` disables the filter entirely: the entry name
+    /// only advertises the entry's OWN package, so a target present solely
+    /// as a bundled dependency INSIDE another package's entry hides behind
+    /// a non-matching name — `find_by_purls`' pass-2 fallback probes every
+    /// entry for exactly those. Both enumerators only yield entries whose
+    /// `node_modules` exists, so no re-stat here.
     fn enqueue_pending_store_entries(
         entries: Vec<(String, PathBuf)>,
-        pending_names: &HashSet<&str>,
+        pending_names: Option<&HashSet<&str>>,
         queue: &mut VecDeque<PathBuf>,
     ) {
         for (entry_name, entry_nm) in entries {
-            if let Some((entry_pkg, _version)) = decode_pnpm_store_entry_name(&entry_name) {
-                if !pending_names.contains(entry_pkg.as_str()) {
-                    continue;
+            if let Some(filter) = pending_names {
+                if let Some((entry_pkg, _version)) = decode_pnpm_store_entry_name(&entry_name) {
+                    if !filter.contains(entry_pkg.as_str()) {
+                        continue;
+                    }
                 }
             }
             queue.push_back(entry_nm);
@@ -1233,6 +1281,124 @@ impl Default for NpmCrawler {
     fn default() -> Self {
         Self::new()
     }
+}
+
+// ---------------------------------------------------------------------------
+// pnpm peer-variant duplicate discovery (used by the apply engine)
+// ---------------------------------------------------------------------------
+
+/// Find every OTHER physical copy of the package installed at `pkg_path`
+/// inside the pnpm virtual store(s) reachable from it.
+///
+/// pnpm materializes one store copy PER PEER COMBINATION:
+/// `.pnpm/foo@1.0.0(react@17…)/` and `.pnpm/foo@1.0.0(react@18…)/` are
+/// both real directories holding the same `foo@1.0.0`, and each is
+/// runtime-loaded by whichever importer resolves to it. The purl-keyed
+/// resolver hands apply exactly ONE primary path (root-install-wins), so
+/// the apply engine calls this to fan every write out to the remaining
+/// physical copies — patching (or restoring) only one of them would leave
+/// a live vulnerable copy behind while reporting success (fail-open).
+///
+/// Discovery, all bounded and read-only:
+/// 1. Candidate stores come from the ancestor chains of `pkg_path` AND of
+///    its canonicalized form (the root-linked primary is a symlink into
+///    the store, and in a workspace the store lives beside the ROOT
+///    `node_modules`, on the canonical chain only): any ancestor named
+///    `.pnpm`, plus any `node_modules` ancestor's `.pnpm` child. Non-pnpm
+///    layouts (npm/yarn trees, cargo/go/vendor dirs) have neither and
+///    return early — this is the cheap common case. pnpm <=3 legacy
+///    stores are keyed by plain `name/version` and cannot hold
+///    peer-variant duplicates, so they are deliberately not probed.
+/// 2. Store entries are enumerated with the shared layout walker
+///    (`list_pnpm_store_entries`, flat + nested); an entry whose name
+///    decodes to a DIFFERENT name@version is skipped, an undecodable name
+///    stays probeable (decode is advisory), and the package.json probe is
+///    the authority — exactly the resolver's contract.
+/// 3. Only REAL directories count (a symlink inside a store entry is
+///    another entry's copy, already yielded via that entry), the copy
+///    `pkg_path` itself canonicalizes to is excluded, and results are
+///    deduped by canonical path.
+///
+/// The returned paths are the copies' package roots (each in its own
+/// store entry). Callers write through the hardened per-file pipeline,
+/// which breaks content-store hardlinks per copy — CoW safety holds for
+/// every copy independently.
+pub async fn find_pnpm_peer_variant_copies(pkg_path: &Path) -> Vec<PathBuf> {
+    // 1. Candidate stores from both ancestor chains (cheap stats only —
+    //    no file reads until a store is actually found).
+    let canonical_pkg = tokio::fs::canonicalize(pkg_path).await.ok();
+    let mut stores: Vec<PathBuf> = Vec::new();
+    let mut seen_stores: HashSet<PathBuf> = HashSet::new();
+    let chains = [Some(pkg_path), canonical_pkg.as_deref()];
+    for start in chains.into_iter().flatten() {
+        let mut cur = start.parent();
+        while let Some(dir) = cur {
+            match dir.file_name().map(|n| n.to_string_lossy()) {
+                Some(name) if name == ".pnpm" => {
+                    if seen_stores.insert(dir.to_path_buf()) {
+                        stores.push(dir.to_path_buf());
+                    }
+                }
+                Some(name) if name == "node_modules" => {
+                    let store = dir.join(".pnpm");
+                    if is_dir(&store).await && seen_stores.insert(store.clone()) {
+                        stores.push(store);
+                    }
+                }
+                _ => {}
+            }
+            cur = dir.parent();
+        }
+    }
+    if stores.is_empty() {
+        return Vec::new();
+    }
+
+    // 2. The primary's identity — the package.json is the authority, same
+    //    as the resolver. Unreadable/invalid ⇒ no safe way to identify
+    //    twins ⇒ none reported (the primary itself is still handled by
+    //    the caller).
+    let Some((full_name, version)) = read_package_json(&pkg_path.join("package.json")).await else {
+        return Vec::new();
+    };
+
+    let mut copies: Vec<PathBuf> = Vec::new();
+    let mut seen_copies: HashSet<PathBuf> = HashSet::new();
+    for store in stores {
+        for (entry_name, entry_nm) in NpmCrawler::list_pnpm_store_entries(&store).await {
+            // Fast advertisement filter; undecodable names stay probeable.
+            if let Some((n, v)) = decode_pnpm_store_entry_name(&entry_name) {
+                if n != full_name || v != version {
+                    continue;
+                }
+            }
+            // `full_name` may be scoped (`@s/n`) — Path::join handles the
+            // two-segment relative form.
+            let candidate = entry_nm.join(&full_name);
+            // Real dirs only: a symlink here is another entry's physical
+            // copy, reached via that entry.
+            let Ok(meta) = tokio::fs::symlink_metadata(&candidate).await else {
+                continue;
+            };
+            if !meta.is_dir() {
+                continue;
+            }
+            match read_package_json(&candidate.join("package.json")).await {
+                Some((n, v)) if n == full_name && v == version => {}
+                _ => continue,
+            }
+            let canon = tokio::fs::canonicalize(&candidate)
+                .await
+                .unwrap_or_else(|_| candidate.clone());
+            if canonical_pkg.as_ref() == Some(&canon) {
+                continue;
+            }
+            if seen_copies.insert(canon) {
+                copies.push(candidate);
+            }
+        }
+    }
+    copies
 }
 
 // ---------------------------------------------------------------------------

@@ -373,7 +373,14 @@ pub async fn select_installed_variants(
 /// set on new files to honor the read-only-by-default policy.
 ///
 /// Writes the patched content and verifies the resulting hash.
-pub(crate) async fn apply_file_patch(
+///
+/// This variant writes to exactly the one package root it is given.
+/// External write paths (rollback's restore) go through
+/// [`apply_file_patch`], which additionally fans the write out to every
+/// pnpm peer-variant store copy of the package; `apply_package_patch`
+/// handles those copies itself at package level (with full per-copy
+/// verification) and therefore uses this single-copy variant directly.
+pub(crate) async fn apply_file_patch_at(
     pkg_path: &Path,
     file_name: &str,
     patched_content: &[u8],
@@ -475,6 +482,31 @@ pub(crate) async fn apply_file_patch(
     // manage the readonly attribute.
     restore_file_permissions(&filepath, existing_meta.as_ref()).await?;
 
+    Ok(())
+}
+
+/// [`apply_file_patch_at`] plus pnpm peer-variant fan-out: after the write
+/// to `pkg_path` succeeds, the same hash-verified bytes are written to
+/// every OTHER physical store copy of the package
+/// (`.pnpm/<name>@<ver>(peerA…)/…` vs `(peerB…)/…` are distinct real
+/// dirs, each runtime-loaded). This is the write path rollback's restore
+/// uses, so rolling back a patch restores every copy the apply reached —
+/// restoring only the resolver's single primary would leave a
+/// still-patched twin behind. Each copy goes through the full hardened
+/// pipeline (atomic stage+rename, per-copy hardlink break, permission
+/// restore); a failed copy propagates as an error — fail closed, never
+/// "done" with a copy left divergent. Non-pnpm layouts discover no copies
+/// and behave exactly as before.
+pub(crate) async fn apply_file_patch(
+    pkg_path: &Path,
+    file_name: &str,
+    patched_content: &[u8],
+    expected_hash: &str,
+) -> Result<(), std::io::Error> {
+    apply_file_patch_at(pkg_path, file_name, patched_content, expected_hash).await?;
+    for copy in crate::crawlers::npm_crawler::find_pnpm_peer_variant_copies(pkg_path).await {
+        apply_file_patch_at(&copy, file_name, patched_content, expected_hash).await?;
+    }
     Ok(())
 }
 
@@ -652,7 +684,62 @@ async fn chown_blocking(
 /// diff-archive lookup (the corresponding `sources.packages_path` /
 /// `sources.diffs_path` must also be set). Pass `None` to restrict the
 /// pipeline to per-file blobs only — equivalent to pre-2.2 behavior.
+///
+/// For npm packages, one on-disk `pkg_path` is not necessarily the only
+/// physical home of `package@version`: pnpm materializes a separate
+/// virtual-store copy per peer-dependency combination
+/// (`.pnpm/foo@1.0.0(react@17…)/` and `…(react@18…)/` are both real,
+/// runtime-loaded dirs), and the purl-keyed resolver hands apply exactly
+/// one primary path. After the primary succeeds, the same verify+patch
+/// pipeline is re-run against every other physical copy — including when
+/// the primary is AlreadyPatched, which is precisely the state a
+/// single-copy apply left behind (patched primary, vulnerable twin). A
+/// failed copy fails the whole result: claiming the CVE fixed while a
+/// physical copy remains unpatched is the fail-open this closes. The
+/// primary's per-file records are what the returned `ApplyResult`
+/// carries (the envelope shape is unchanged); copies contribute only
+/// success/error state.
 pub async fn apply_package_patch(
+    package_key: &str,
+    pkg_path: &Path,
+    files: &HashMap<String, PatchFileInfo>,
+    sources: &PatchSources<'_>,
+    uuid: Option<&str>,
+    dry_run: bool,
+    policy: MismatchPolicy,
+) -> ApplyResult {
+    let mut result =
+        apply_package_patch_at(package_key, pkg_path, files, sources, uuid, dry_run, policy).await;
+    // Only npm purls can name pnpm store copies; everything else skips the
+    // (already cheap) discovery outright.
+    if result.success && package_key.starts_with("pkg:npm/") {
+        for copy in crate::crawlers::npm_crawler::find_pnpm_peer_variant_copies(pkg_path).await {
+            let copy_result =
+                apply_package_patch_at(package_key, &copy, files, sources, uuid, dry_run, policy)
+                    .await;
+            if !copy_result.success {
+                result.success = false;
+                let copy_err = copy_result
+                    .error
+                    .unwrap_or_else(|| "unknown error".to_string());
+                let note = format!(
+                    "pnpm store copy {} failed to patch: {}",
+                    copy.display(),
+                    copy_err
+                );
+                result.error = Some(match result.error.take() {
+                    Some(prev) => format!("{prev}; {note}"),
+                    None => note,
+                });
+            }
+        }
+    }
+    result
+}
+
+/// The single-copy apply engine behind [`apply_package_patch`]: verifies
+/// and patches the package at exactly the one `pkg_path` it is given.
+async fn apply_package_patch_at(
     package_key: &str,
     pkg_path: &Path,
     files: &HashMap<String, PatchFileInfo>,
@@ -850,8 +937,11 @@ pub async fn apply_package_patch(
             }
         };
 
+        // Single-copy write: the public `apply_package_patch` wrapper fans
+        // out to pnpm peer-variant copies itself, with per-copy
+        // verification.
         if let Err(e) =
-            apply_file_patch(pkg_path, file_name, &patched_content, &file_info.after_hash).await
+            apply_file_patch_at(pkg_path, file_name, &patched_content, &file_info.after_hash).await
         {
             result.error = Some(e.to_string());
             return result;
@@ -927,7 +1017,9 @@ async fn try_apply_from_archive(
     if compute_git_sha256_from_bytes(bytes) != file_info.after_hash {
         return false;
     }
-    apply_file_patch(pkg_path, file_name, bytes, &file_info.after_hash)
+    // Single-copy write: `apply_package_patch` fans out to pnpm
+    // peer-variant copies itself, with per-copy verification.
+    apply_file_patch_at(pkg_path, file_name, bytes, &file_info.after_hash)
         .await
         .is_ok()
 }
@@ -985,7 +1077,9 @@ async fn try_apply_from_diff(
     if compute_git_sha256_from_bytes(&patched) != file_info.after_hash {
         return false;
     }
-    apply_file_patch(pkg_path, file_name, &patched, &file_info.after_hash)
+    // Single-copy write: `apply_package_patch` fans out to pnpm
+    // peer-variant copies itself, with per-copy verification.
+    apply_file_patch_at(pkg_path, file_name, &patched, &file_info.after_hash)
         .await
         .is_ok()
 }
