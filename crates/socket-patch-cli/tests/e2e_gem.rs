@@ -5,8 +5,9 @@
 //! installation.
 //!
 //! Ignored tests exercise the full CLI against the real Socket API, using the
-//! **activestorage@5.2.0** patch (UUID `4bf7fe0b-dc57-4ea8-945f-bc4a04c47a15`),
-//! which fixes CVE-2022-21831 (code injection).
+//! **activestorage@5.2.0** patch (UUID `efc8d8ca-78c5-43ae-ba1b-41bb1f9f3897`),
+//! which fixes CVE-2020-8162 / GHSA-m42x-37p3-fv5w (circumvention of file
+//! size limits in ActiveStorage's S3 adapter).
 //!
 //! # Running
 //! ```sh
@@ -31,8 +32,11 @@ mod cache_env;
 // Constants
 // ---------------------------------------------------------------------------
 
-const GEM_UUID: &str = "4bf7fe0b-dc57-4ea8-945f-bc4a04c47a15";
-const GEM_PURL: &str = "pkg:gem/activestorage@5.2.0";
+const GEM_UUID: &str = "efc8d8ca-78c5-43ae-ba1b-41bb1f9f3897";
+/// The manifest key `get <uuid>` records is the purl the `/patch/view`
+/// response carries — since the 2026-08-18 republish, the platform-qualified
+/// form.
+const GEM_PURL: &str = "pkg:gem/activestorage@5.2.0?platform=ruby";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -440,7 +444,7 @@ async fn scan_discovers_gems_with_gemspec() {
 // Lifecycle tests (need bundler + network)
 // ---------------------------------------------------------------------------
 
-/// Full lifecycle: get -> list (verify CVE-2022-21831) -> rollback -> apply -> remove.
+/// Full lifecycle: get -> list (verify CVE-2020-8162) -> rollback -> apply -> remove.
 #[test]
 #[ignore]
 fn test_gem_full_lifecycle() {
@@ -508,9 +512,9 @@ fn test_gem_full_lifecycle() {
     let has_cve = vulns.iter().any(|v| {
         v["cves"]
             .as_array()
-            .is_some_and(|cves| cves.iter().any(|c| c == "CVE-2022-21831"))
+            .is_some_and(|cves| cves.iter().any(|c| c == "CVE-2020-8162"))
     });
-    assert!(has_cve, "vulnerability list should include CVE-2022-21831");
+    assert!(has_cve, "vulnerability list should include CVE-2020-8162");
 
     // -- ROLLBACK: restore original files -------------------------------------
     assert_run_ok(cwd, &["rollback"], "rollback");

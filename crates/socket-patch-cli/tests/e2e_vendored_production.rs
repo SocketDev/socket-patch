@@ -18,11 +18,11 @@
 //!      rewires the lockfile / manifest to consume it;
 //!   4. assert the vendor landed (`summary.applied >= 1`, `failed == 0`, the
 //!      expected patch UUID present, the artifact on disk, the lock rewired);
-//!   5. **DELIVERY proof** — copy ONLY the committable files (project manifest
-//!      + lockfile + `.socket/` + any PM config) into a fresh dir, point every
-//!      cache var at a fresh EMPTY dir, run the package manager's clean-install
-//!      offline, and assert the installed bytes are the VENDORED (patched)
-//!      bytes, NOT the pristine registry bytes;
+//!   5. **DELIVERY proof** — copy ONLY the committable files (project
+//!      manifest + lockfile + `.socket/` + any PM config) into a fresh dir,
+//!      point every cache var at a fresh EMPTY dir, run the package
+//!      manager's clean-install offline, and assert the installed bytes are
+//!      the VENDORED (patched) bytes, NOT the pristine registry bytes;
 //!   6. idempotency (a second `scan --mode vendored` is an `already_vendored`
 //!      no-op with a byte-stable lock) and `vendor --revert` byte-restores.
 //!
@@ -52,17 +52,21 @@
 //! | npm    | `pkg:npm/minimist@1.2.2`        | `80630680-4da6-45f9-bba8-b888e0ffd58c` | `Socket Community Patch` header |
 //! | PyPI   | `pkg:pypi/urllib3@1.26.18`      | *any of three* (see [`PYPI_UUIDS`])    | `Socket Community Patch` header |
 //! | Cargo  | `pkg:cargo/traitobject@0.1.1`   | `cf2e6f58-d9fa-4096-9151-c34afa717f89` | advisory id `GHSA-pp8r-vv2j-9j5v` |
-//! | gem    | `pkg:gem/activestorage@7.0.2.2` | `2535d43d-67ce-4944-be27-c19e113997fb` | *(see the known defect below)* |
+//! | gem    | `pkg:gem/activestorage@6.0.3`   | `15e960b5-f432-4b6c-b8aa-534a2b419323` | `Socket Community Patch` header *(not yet asserted — see below)* |
 //!
 //! # Ecosystems with no full coverage, and why
 //!
-//! * **gem** — vendoring the platform-qualified purl (`?platform=ruby`) fails
-//!   in the current CLI with `platform_gem_unsupported`. The download succeeds;
-//!   the vendor backend refuses the platform variant. This is a real CLI gap,
-//!   not a test bug. [`gem_bundler_vendored_known_platform_defect`] asserts the
-//!   redirect+download are correct and tolerates the vendor failure, failing
-//!   loudly if it fails for any *other* reason and auto-retiring the tolerance
-//!   the moment the CLI starts vendoring gems. Promote with
+//! * **gem** — the old `platform_gem_unsupported` refusal for
+//!   `?platform=ruby` purls was fixed in the CLI (#172 — only non-`ruby`
+//!   platform qualifiers are refused), and the 2026-08-18 catalog republish
+//!   restored the pinned patch, so the VENDOR itself now succeeds.
+//!   The full fresh-dir `bundle install` delivery proof is DEFERRED to the
+//!   stacked stub-hardening PR: the gem-stub-gemspec artifact production
+//!   serves is currently invalid (missing `summary`/`authors`), so rubygems
+//!   validation rejects the vendored `path:` source and `bundle install`
+//!   exits 1 on every bundler major (discovered 2026-08-19).
+//!   [`gem_bundler_vendored_known_platform_defect`] asserts redirect+download
+//!   hard and reports the vendor success. Promote with
 //!   `SOCKET_PATCH_VENDORED_E2E_GEM_STRICT=1`.
 //! * **golang** — vendored mode *works* (directory `replace`), but production
 //!   publishes no free golang patches, so there is nothing to vendor.
@@ -147,10 +151,13 @@ const CARGO_UUID: &str = "cf2e6f58-d9fa-4096-9151-c34afa717f89";
 /// not `cargo build`; see [`cargo_vendored_install_proof`].)
 const CARGO_MARKER: &str = "GHSA-pp8r-vv2j-9j5v";
 
-const GEM_PURL: &str = "pkg:gem/activestorage@7.0.2.2";
+/// The gem pin is deliberately UNQUALIFIED (`?platform=ruby` stripped): the
+/// preflight/by-package flows strip purl qualifiers before hitting the
+/// discovery endpoints.
+const GEM_PURL: &str = "pkg:gem/activestorage@6.0.3";
 const GEM_NAME: &str = "activestorage";
-const GEM_VERSION: &str = "7.0.2.2";
-const GEM_UUID: &str = "2535d43d-67ce-4944-be27-c19e113997fb";
+const GEM_VERSION: &str = "6.0.3";
+const GEM_UUID: &str = "15e960b5-f432-4b6c-b8aa-534a2b419323";
 
 /// Header the patch service injects into patched npm / PyPI source files.
 const PATCH_MARKER: &str = "Socket Community Patch";
@@ -1661,23 +1668,24 @@ fn cargo_package_block(lock_text: &str, name: &str) -> Option<String> {
 }
 
 // ===========================================================================
-// RubyGems — vendoring the platform-qualified purl is unsupported (CLI gap)
+// RubyGems — vendor succeeds; full install proof deferred (invalid stub gemspec)
 // ===========================================================================
 
-/// The gem redirect+download are correct and asserted hard. The **vendor** leg
-/// is a different story: `scan --mode vendored` resolves and downloads the
-/// activestorage patch, but the vendor backend refuses the platform-qualified
-/// purl (`pkg:gem/activestorage@7.0.2.2?platform=ruby`) with
-/// `platform_gem_unsupported`, so `summary.applied == 0`, `failed == 1`, and
-/// the run exits non-zero with `"status": "partial_failure"`.
+/// The gem redirect+download are asserted hard, and the vendor itself now
+/// SUCCEEDS: #172 fixed the `platform_gem_unsupported` gate (only non-empty,
+/// non-`ruby` platform qualifiers are refused) and the 2026-08-18 catalog
+/// republish restored the pinned patch, so the success branch below — the
+/// "appears FIXED" NOTE — is the live path today and the failure-tolerance
+/// branch is vestigial.
 ///
-/// That is a real CLI gap, not a test bug, so this leg tolerates the vendor
-/// failure — asserting the download succeeded and the failure is exactly that
-/// known code — and fails loudly for any *other* failure. Set
-/// `SOCKET_PATCH_VENDORED_E2E_GEM_STRICT=1` to promote it to a hard failure (do
-/// that as the regression guard once the CLI learns to vendor platform gems).
-/// The moment the vendor starts succeeding, the tolerance branch reports it so
-/// the leg can be upgraded to a full delivery proof.
+/// The upgrade to a full fresh-dir `bundle install` delivery proof is
+/// DEFERRED to the stacked stub-hardening PR: the gem-stub-gemspec artifact
+/// production serves is currently invalid (missing `summary`/`authors`), so
+/// rubygems validation rejects the vendored `path:` source and
+/// `bundle install` exits 1 on every bundler major (discovered 2026-08-19).
+/// That PR carries the install proof as its regression test; until it lands,
+/// `SOCKET_PATCH_VENDORED_E2E_GEM_STRICT=1` still promotes any vendor
+/// failure here to a hard failure.
 #[test]
 #[ignore = "live production API + real rubygems.org. Run with --ignored."]
 fn gem_bundler_vendored_known_platform_defect() {

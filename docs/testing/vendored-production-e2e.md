@@ -50,7 +50,7 @@ four every run and fails first with the offending PURL named.
 | npm | `pkg:npm/minimist@1.2.2` | `80630680-4da6-45f9-bba8-b888e0ffd58c` | `Socket Community Patch` header |
 | PyPI | `pkg:pypi/urllib3@1.26.18` | one of three (server-ordered) | `Socket Community Patch` header |
 | Cargo | `pkg:cargo/traitobject@0.1.1` | `cf2e6f58-d9fa-4096-9151-c34afa717f89` | advisory id `GHSA-pp8r-vv2j-9j5v` |
-| RubyGems | `pkg:gem/activestorage@7.0.2.2` | `2535d43d-67ce-4944-be27-c19e113997fb` | *(blocked — see below)* |
+| RubyGems | `pkg:gem/activestorage@6.0.3` | `15e960b5-f432-4b6c-b8aa-534a2b419323` | `Socket Community Patch` header |
 
 If a required patch is withdrawn, update the catalog constants at the top of
 `e2e_vendored_production.rs` **and** the table above (same procedure as the
@@ -68,7 +68,7 @@ hosted suite).
 | pip (requirements.txt) | urllib3@1.26.18 | `pip install --no-index -r requirements.txt` | ✅ full |
 | uv (uv.lock) | urllib3@1.26.18 | `uv sync --frozen --offline` | ✅ full |
 | cargo (`[patch.crates-io]`) | traitobject@0.1.1 | `cargo fetch --offline --locked` (see note) | ✅ full |
-| bundler | activestorage@7.0.2.2 | — | ❌ CLI gap (below) |
+| bundler | activestorage@6.0.3 | — (deferred: production's served gem-stub gemspec is invalid, see below) | ⚠️ vendor succeeds; delivery proof deferred to the stub-hardening fix PR |
 | go | — | — | zero-patch assertion (no free golang patches) |
 | deno | — | — | negative assertion (unsupported) |
 | maven / nuget / composer | — | — | canary (no free production patches) |
@@ -83,7 +83,8 @@ directory.
 
 ## Known issues this suite surfaced
 
-Both were found against real production + real toolchains; neither is a test bug.
+All were found against real production + real toolchains; none is a test bug.
+The first two are fixed; the third is open with a stacked fix PR pending.
 
 ### 1. `pnpm` >= 11 — vendored `overrides` land in the wrong file (CLI) — FIXED
 
@@ -103,21 +104,32 @@ mismatch, and `vendor --revert` deletes a file it created (or splices its
 override back out of one it edited). This leg now asserts the frozen install
 succeeds directly, with no workaround.
 
-### 2. `gem` — vendoring the platform-qualified purl is unsupported (CLI)
+### 2. `gem` — vendoring the platform-qualified purl was unsupported (CLI) — FIXED
 
-`scan --mode vendored` resolves and downloads the activestorage patch, but the
-vendor backend refuses the platform-qualified purl
-(`pkg:gem/activestorage@7.0.2.2?platform=ruby`) with `platform_gem_unsupported`.
-`summary.applied == 0`, `failed == 1`, and the run exits non-zero with
-`"status": "partial_failure"`.
+`scan --mode vendored` resolved and downloaded the activestorage patch, but the
+vendor backend refused the platform-qualified purl
+(`pkg:gem/activestorage@…?platform=ruby` — the spelling production publishes)
+with `platform_gem_unsupported`, so `summary.applied == 0`, `failed == 1`, and
+the run exited non-zero with `"status": "partial_failure"`.
 
-**Fix belongs in the CLI**: the gem vendor backend must handle platform
-variants. Until then the leg asserts the redirect+download are correct and
-tolerates the vendor failure, failing loudly for any *other* failure. Set
-`SOCKET_PATCH_VENDORED_E2E_GEM_STRICT=1` to promote it to a hard failure once
-the CLI learns to vendor platform gems; the tolerance auto-retires (upgrades to
-a full `bundle install` delivery proof) the moment the vendor starts
-succeeding.
+**Fixed** (PR #172): the gate in `vendor/gem.rs` now refuses only non-empty,
+non-`ruby` platform qualifiers — `?platform=ruby` is the portable default and
+vendors like a bare purl. With the 2026-08-18 gem catalog republish restoring
+the pinned patch, the vendor now succeeds live and the leg's
+failure-tolerance branch is vestigial. The leg's upgrade to a full fresh-dir
+`bundle install` delivery proof is deferred to the stacked stub-hardening fix
+PR because of issue 3 below; until then the leg keeps its tolerant shape and
+its `SOCKET_PATCH_VENDORED_E2E_GEM_STRICT` knob.
+
+### 3. `gem` — the served gem-stub gemspec is invalid (SERVER + CLI hardening) — OPEN
+
+Discovered 2026-08-19 while upgrading the gem leg to a full delivery proof:
+the gem-stub-gemspec artifact production serves is invalid — it is missing
+`summary`/`authors`, which rubygems validation requires — so bundler rejects
+the vendored `path:` source and `bundle install` exits 1 on every bundler
+major. The fix (server-side stub correction plus CLI-side hardening) lands in
+a separate stacked PR; that PR carries the full
+fresh-dir-frozen-`bundle install` install proof as its regression test.
 
 ## Running
 
@@ -139,7 +151,7 @@ installs from contending on the shared cache sandbox.
 | Variable | Effect |
 |----------|--------|
 | `SOCKET_PATCH_VENDORED_E2E_STRICT=1` | Turn every "toolchain missing" soft-skip into a hard failure. |
-| `SOCKET_PATCH_VENDORED_E2E_GEM_STRICT=1` | Promote the known gem `platform_gem_unsupported` vendor gap to a hard failure. |
+| `SOCKET_PATCH_VENDORED_E2E_GEM_STRICT=1` | Promote any gem vendor failure to a hard failure (the leg's tolerance branch is vestigial since #172; the knob stays until the stub-hardening PR lands the full install proof). |
 | `SOCKET_PATCH_VENDORED_E2E_CANARY_STRICT=1` | Fail when maven/nuget/composer gain their first free published patch. |
 
 The suite forces `SOCKET_NO_CONFIG=true` and scrubs every ambient `SOCKET_*`

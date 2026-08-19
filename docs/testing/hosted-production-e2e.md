@@ -41,7 +41,7 @@ from the child environment.
 | npm | `pkg:npm/minimist@1.2.2` | `80630680-4da6-45f9-bba8-b888e0ffd58c` | GHSA-xvch-5gv4-984h / CVE-2021-44906 | all five npm-family legs |
 | PyPI | `pkg:pypi/urllib3@1.26.18` | `de58c8b8-796c-4b6d-8a48-539b5563db76`, `26242e35-f867-4da8-8789-f0d2ea49e0f1`, `e828efa5-5c6d-43f3-9909-03f5ac232b98` | GHSA-38jv-5279-wg99, GHSA-2xpw-w6gg-jr37, GHSA-gm62-xv2j-4w53 | requirements.txt, uv.lock |
 | Cargo | `pkg:cargo/traitobject@0.1.1` | `cf2e6f58-d9fa-4096-9151-c34afa717f89` | GHSA-pp8r-vv2j-9j5v | cargo sparse-registry leg |
-| RubyGems | `pkg:gem/activestorage@7.0.2.2` | `2535d43d-67ce-4944-be27-c19e113997fb` | GHSA-w749-p3v6-hccq | bundler leg |
+| RubyGems | `pkg:gem/activestorage@6.0.3` | `15e960b5-f432-4b6c-b8aa-534a2b419323` | GHSA-m42x-37p3-fv5w / CVE-2020-8162 | bundler leg |
 
 urllib3 1.26.18 carries **three** distinct free patches, one per advisory. Which
 one the resolver returns is a server-side ordering detail, so the suite accepts
@@ -74,7 +74,7 @@ failure instead of N confusing ones that look like CLI regressions.
 | npm | ✅ | ✅ many | ✅ npm, npm-shrinkwrap, pnpm, yarn classic, yarn berry, bun |
 | PyPI | ✅ (requirements.txt + uv.lock only) | ✅ many | ✅ requirements.txt, uv.lock |
 | Cargo | ✅ | ✅ 1 crate | ✅ sparse registry |
-| RubyGems | ✅ | ✅ 1 gem | ⚠️ redirect asserted; install blocked by a **server defect** (below) |
+| RubyGems | ✅ | ✅ 15 free patches (activestorage 5.2.0→6.0.3) | ✅ bundler install proof |
 | Maven | ✅ | ❌ **none** | canary only |
 | NuGet | ✅ | ❌ **none** | canary only |
 | Composer | ✅ | ❌ **none** | canary only |
@@ -107,37 +107,30 @@ Two supported hosted shapes are deliberately **not** covered here:
 
 ## Known issues this suite surfaced
 
-Both were found by running against real production, and neither is a test bug.
+All were found by running against real production; none is a test bug.
 
-### 1. `gem` — hosted mode is unusable for gems with dependencies (SERVER)
+### 1. `gem` — hosted mode was unusable for gems with dependencies (SERVER) — FIXED
 
-Socket's gem patch-registry serves a compact index whose `/info/<gem>` line
-declares **no runtime dependencies**, while the `.gem` it serves declares six.
-Bundler's `ensure_same_dependencies` check fails closed:
+Socket's gem patch-registry used to serve a compact index whose `/info/<gem>`
+line declared **no runtime dependencies** while the `.gem` it served declared
+several, so bundler's `ensure_same_dependencies` check failed closed with
+`Bundler::APIResponseMismatchError` — hosted gem mode was unusable for any gem
+with runtime dependencies. (The suite's original pin, activestorage@7.0.2.2 /
+`2535d43d-…` / GHSA-w749-p3v6-hccq, was unpublished on 2026-08-14 pending the
+fix.)
 
-```
-Bundler::APIResponseMismatchError: Downloading activestorage-7.0.2.2 revealed
-dependencies not in the API (activesupport (= 7.0.2.2), actionpack (= 7.0.2.2),
-activejob (= 7.0.2.2), activerecord (= 7.0.2.2), marcel (~> 1.0), mini_mime (>= 1.1.0)).
-```
+**Fixed by the 2026-08-18 gem catalog republish**: the patch-registry's compact
+index now serves the gemspec's runtime dependencies (verified against
+activestorage@6.0.3: `/versions` 200, `/info/activestorage` 200 with the full
+dep list). The leg's probe-based tolerance — pass on a non-2xx `/versions`,
+enforce on 2xx — retired itself as designed and was deleted along with its
+`SOCKET_PATCH_HOSTED_E2E_GEM_STRICT` knob; the leg is now the unconditional
+`gem_bundler_hosted_install_proof`.
 
-Compare the two indexes:
-
-```sh
-# rubygems.org — full dependency list
-curl -s https://index.rubygems.org/info/activestorage | grep '^7\.0\.2\.2 '
-# 7.0.2.2 actionpack:= 7.0.2.2,activejob:= 7.0.2.2,...|checksum:7997042a...
-
-# Socket patch-registry — empty dependency list
-curl -s "https://patch.socket.dev/patch-registry/gem/<grant>/<uuid>/info/activestorage"
-# 7.0.2.2 |checksum:89b47c6d...
-```
-
-**Fix belongs on the server**: the compact-index generator must emit the
-gemspec's runtime dependencies. Until then the suite asserts the redirect (which
-is correct) and tolerates the install failure, failing loudly if it fails for
-any *other* reason. Set `SOCKET_PATCH_HOSTED_E2E_GEM_STRICT=1` to promote it to
-a hard failure — do that as the regression guard once the server is fixed.
+**Latent, still open (server)**: the registry's `/api/v1/dependencies` route
+answers 200 with an empty body. Unreachable today — bundler only falls back to
+the Dependency fetcher when the compact index is unavailable — but it would
+resurface as a confusing Marshal error if the compact index ever broke again.
 
 ### 2. `pnpm` — pnpm 11 rejects hosted lockfiles by default (CLI UX gap)
 
@@ -201,7 +194,6 @@ runs only where it is explicitly asked for.
 | Variable | Effect |
 |----------|--------|
 | `SOCKET_PATCH_HOSTED_E2E_STRICT=1` | Turn every "toolchain missing" soft-skip into a hard failure. **CI sets this** — a required check must never report green on an unexercised leg. |
-| `SOCKET_PATCH_HOSTED_E2E_GEM_STRICT=1` | Promote the known gem install defect to a hard failure. |
 | `SOCKET_PATCH_HOSTED_E2E_CANARY_STRICT=1` | Fail when maven/nuget/composer gain their first free published patch. |
 
 ### Toolchains

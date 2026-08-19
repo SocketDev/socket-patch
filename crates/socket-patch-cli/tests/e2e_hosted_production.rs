@@ -36,11 +36,7 @@
 //! | npm    | `pkg:npm/minimist@1.2.2`        | `80630680-4da6-45f9-bba8-b888e0ffd58c` | GHSA-xvch-5gv4-984h (CVE-2021-44906) |
 //! | PyPI   | `pkg:pypi/urllib3@1.26.18`      | *any of three* (see [`PYPI_UUIDS`])    | GHSA-gm62-xv2j-4w53 &co |
 //! | Cargo  | `pkg:cargo/traitobject@0.1.1`   | `cf2e6f58-d9fa-4096-9151-c34afa717f89` | GHSA-pp8r-vv2j-9j5v |
-//! | gem    | `pkg:gem/activestorage@7.0.2.2` | `2535d43d-67ce-4944-be27-c19e113997fb` | GHSA-w749-p3v6-hccq |
-//!
-//! > **gem is TEMPORARILY DISABLED** (see [`GEM_E2E_DISABLED`]): the pinned
-//! > gem patch was intentionally unpublished on 2026-08-14 pending a corrected
-//! > republish, so its three legs skip until the switch is flipped back.
+//! | gem    | `pkg:gem/activestorage@6.0.3`   | `15e960b5-f432-4b6c-b8aa-534a2b419323` | GHSA-m42x-37p3-fv5w (CVE-2020-8162) |
 //!
 //! `docs/testing/hosted-production-e2e.md` explains how these were chosen and
 //! how to re-pick one if it is ever withdrawn.
@@ -132,30 +128,13 @@ const CARGO_UUID: &str = "cf2e6f58-d9fa-4096-9151-c34afa717f89";
 /// that npm/PyPI artifacts carry, so this is the marker to look for.
 const CARGO_MARKER: &str = "GHSA-pp8r-vv2j-9j5v";
 
-const GEM_PURL: &str = "pkg:gem/activestorage@7.0.2.2";
+/// The gem pin is deliberately UNQUALIFIED (`?platform=ruby` stripped):
+/// the preflight/by-package/redirect flows all strip purl qualifiers before
+/// hitting the discovery endpoints.
+const GEM_PURL: &str = "pkg:gem/activestorage@6.0.3";
 const GEM_NAME: &str = "activestorage";
-const GEM_VERSION: &str = "7.0.2.2";
-const GEM_UUID: &str = "2535d43d-67ce-4944-be27-c19e113997fb";
-
-/// TEMPORARY kill switch for the ruby-gem hosted legs.
-///
-/// The pinned gem patch `activestorage@7.0.2.2` (`GEM_UUID`) was
-/// **intentionally unpublished on 2026-08-14** pending a corrected republish
-/// (the compact-index dependency metadata was wrong). Its record still
-/// resolves via `/patch/view/<uuid>`, but the discovery endpoints
-/// (`/patch/batch`, `/patch/by-package`) now return zero patches for the gem,
-/// so `preflight_required_patches_are_published`, the advisory canary, and the
-/// gem redirect leg fail for a reason that has nothing to do with the CLI.
-///
-/// While this is `true`, those three gem legs are skipped so the required
-/// `hosted-e2e` check stays green for npm/PyPI/cargo. This is a plain
-/// unconditional skip (NOT `soft_skip!`, which panics under STRICT) — it does
-/// not depend on any env var and applies in CI too.
-///
-/// **RE-ENABLE** by flipping this to `false` once the corrected gem patch is
-/// published on `patches-api.socket.dev` (and update `GEM_UUID` if the
-/// replacement has a new uuid). Tracked in `docs/testing/hosted-production-e2e.md`.
-const GEM_E2E_DISABLED: bool = true;
+const GEM_VERSION: &str = "6.0.3";
+const GEM_UUID: &str = "15e960b5-f432-4b6c-b8aa-534a2b419323";
 
 /// Header the patch service injects into patched npm / PyPI source files.
 const PATCH_MARKER: &str = "Socket Community Patch";
@@ -660,41 +639,6 @@ fn installed_gem_dir(root: &Path, dir_name: &str, depth: usize) -> Option<PathBu
     None
 }
 
-/// The Socket patch-registry base URL the gem rewriter pinned into `Gemfile`
-/// as `source "<base>" do`, or `None` when no Socket source block is present.
-///
-/// Read back out of the rewritten file rather than rebuilt from constants on
-/// purpose: the probe must interrogate the *exact* registry bundler was told
-/// to use, so a rewriter that emits the wrong base cannot be papered over by a
-/// probe that guesses the right one.
-fn gem_registry_base(gemfile: &str) -> Option<String> {
-    const OPEN: &str = "source \"";
-    let marker = format!("{OPEN}https://{PATCH_HOST}/patch-registry/gem/");
-    let at = gemfile.find(&marker)?;
-    let rest = &gemfile[at + OPEN.len()..];
-    let end = rest.find('"')?;
-    Some(rest[..end].to_string())
-}
-
-/// `GET <url>` → `(status, body_len)`, or `Err` on a transport failure.
-///
-/// Sends a bundler-shaped `User-Agent` so the probe observes whatever a real
-/// `bundle install` would be served.
-async fn http_probe(url: &str) -> Result<(u16, usize), String> {
-    let resp = reqwest::Client::new()
-        .get(url)
-        .header("User-Agent", "bundler/2.6.9 rubygems/3.6.9")
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
-    let status = resp.status().as_u16();
-    let body = resp
-        .bytes()
-        .await
-        .map_err(|e| format!("reading body: {e}"))?;
-    Ok((status, body.len()))
-}
-
 /// Percent-encode a PURL for use as a single path segment. `reqwest` will not
 /// do this for us — a raw `pkg:npm/...` would be split into path segments and
 /// 404.
@@ -724,16 +668,12 @@ fn urlencode(s: &str) -> String {
 #[ignore = "live production API: contacts patches-api.socket.dev. Run with --ignored."]
 async fn preflight_required_patches_are_published() {
     // (purl, acceptable uuids)
-    let mut required: Vec<(&str, Vec<&str>)> = vec![
+    let required: Vec<(&str, Vec<&str>)> = vec![
         (NPM_PURL, vec![NPM_UUID]),
         (PYPI_PURL, PYPI_UUIDS.to_vec()),
         (CARGO_PURL, vec![CARGO_UUID]),
+        (GEM_PURL, vec![GEM_UUID]),
     ];
-    // The gem pin is temporarily unpublished (see `GEM_E2E_DISABLED`); don't
-    // require it while the switch is on.
-    if !GEM_E2E_DISABLED {
-        required.push((GEM_PURL, vec![GEM_UUID]));
-    }
 
     let mut failures: Vec<String> = Vec::new();
     for (purl, expected) in &required {
@@ -785,11 +725,7 @@ async fn canary_patches_name_advisories_so_merge_state_is_inferable() {
     let mut failures: Vec<String> = Vec::new();
     let mut coverage_seen: Vec<(String, String, usize)> = Vec::new();
 
-    let mut canary_purls = vec![NPM_PURL, PYPI_PURL, CARGO_PURL];
-    // Skip the gem while its pin is temporarily unpublished (see `GEM_E2E_DISABLED`).
-    if !GEM_E2E_DISABLED {
-        canary_purls.push(GEM_PURL);
-    }
+    let canary_purls = vec![NPM_PURL, PYPI_PURL, CARGO_PURL, GEM_PURL];
     for purl in canary_purls {
         match published_patch_advisory_counts(purl).await {
             Err(e) => failures.push(format!("{purl}: production probe failed: {e}")),
@@ -1643,78 +1579,36 @@ fn cargo_hosted_install_proof() {
 }
 
 // ===========================================================================
-// RubyGems — redirect works; the hosted install is blocked by a SERVER defect
+// RubyGems — full hosted install proof
 // ===========================================================================
 
-/// The gem redirect itself is correct and is asserted hard here.
+/// Full hosted install proof for RubyGems: the redirect rewrites `Gemfile`
+/// with a per-dep Socket source block and swaps the lock's CHECKSUMS pin to
+/// the patched artifact's sha256, then a real `bundle install` from the
+/// rewritten files alone fetches through `patch.socket.dev` and every file
+/// the patch rewrites is verified on disk against the `/patch/view`
+/// afterHash.
 ///
-/// The **install** leg is a different story. Socket's gem patch-registry serves
-/// a compact index whose `/info/<gem>` line declares **no runtime
-/// dependencies**, while the `.gem` it serves declares six. Bundler's
-/// `ensure_same_dependencies` check fails closed:
+/// # History
 ///
-/// ```text
-/// Bundler::APIResponseMismatchError: Downloading activestorage-7.0.2.2
-/// revealed dependencies not in the API (activesupport (= 7.0.2.2), ...)
-/// ```
+/// Hosted gem mode was long blocked by a **server-side** compact-index
+/// defect: the patch-registry's `/info/<gem>` line declared no runtime
+/// dependencies while the `.gem` it served declared several, so bundler's
+/// `ensure_same_dependencies` check failed closed with
+/// `Bundler::APIResponseMismatchError`. The 2026-08-18 gem catalog republish
+/// fixed the index (deps now served, `/versions` 200), and the probe-based
+/// tolerance this leg used to carry — pass on a non-2xx `/versions`, enforce
+/// on 2xx — retired itself exactly as designed and was deleted.
 ///
-/// Compare production's own index, which does emit them:
-/// `https://index.rubygems.org/info/activestorage` →
-/// `7.0.2.2 actionpack:= 7.0.2.2,activejob:= 7.0.2.2,...|checksum:...`
-/// versus `patch.socket.dev/patch-registry/gem/<grant>/<uuid>/info/activestorage`
-/// → `7.0.2.2 |checksum:...`.
-///
-/// That is a **server-side** defect, not a CLI one, and it blocks hosted gem
-/// mode for any gem with runtime dependencies. Until it is fixed the install
-/// leg reports loudly but does not fail the suite; set
-/// `SOCKET_PATCH_HOSTED_E2E_GEM_STRICT=1` to promote it to a hard failure
-/// (do that as the regression guard once the server is fixed).
-///
-/// # Why the tolerance probes the server instead of matching the error text
-///
-/// This leg used to accept the install failure by string-matching bundler's
-/// message. That couples a CI check to one particular *symptom* of the server
-/// bug, and the symptom is a function of which fetcher bundler lands on —
-/// which the server keeps changing. Bundler selects one via
-/// `available_fetchers.drop_while {|f| !f.available? }` over `[CompactIndex,
-/// Dependency, Index]`, so:
-///
-/// | server state | `/versions` | `/api/v1/dependencies` | bundler raises |
-/// |---|---|---|---|
-/// | originally | 200, empty dep segment | — | `Bundler::APIResponseMismatchError` |
-/// | after depscan#23630 | 404 `not_built` | **200, zero-byte body** | `ArgumentError: marshal data too short` (classic Marshal) / `NoMethodError: undefined method 'bytes' for nil` (SafeMarshal, ruby 3.4+) |
-/// | after the empty-body fix | 404 `not_built` | 404 | `Could not fetch specs from …` |
-///
-/// Three different strings for one unchanged server condition. A whitelist of
-/// them goes stale on every server deploy and reds the check for a reason that
-/// has nothing to do with socket-patch.
-///
-/// So the tolerance is decided by the **condition**, not the symptom: probe
-/// the pinned registry's `/versions` — the URL bundler was actually given,
-/// read back out of the rewritten `Gemfile`.
-///
-/// * non-2xx → the documented server defect. The install failure is expected;
-///   report loudly and pass (unless `SOCKET_PATCH_HOSTED_E2E_GEM_STRICT=1`).
-/// * 2xx → the compact index is **built**, so hosted gem mode MUST work. An
-///   install failure is then a real regression and fails the suite.
-///
-/// That is symptom-independent, and it **auto-retires itself**: the moment the
-/// server is healthy the 2xx branch starts enforcing a real success assertion,
-/// with no stale whitelist and no `NOTE` asking a human to clean up.
+/// NOTE (latent, server-side): the registry's `/api/v1/dependencies` route
+/// still answers 200 with an empty body. That bug is unreachable today —
+/// bundler only falls back to the Dependency fetcher when the compact index
+/// is unavailable — but it would resurface as a confusing Marshal error if
+/// the compact index ever broke again.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "live production API + real rubygems.org. Run with --ignored."]
-async fn gem_bundler_hosted_redirect_and_known_install_defect() {
-    const LEG: &str = "gem_bundler_hosted_redirect_and_known_install_defect";
-    // Unconditional skip while the pinned gem patch is unpublished (see
-    // `GEM_E2E_DISABLED`). Deliberately NOT `soft_skip!` — that panics under
-    // STRICT, and this skip is intentional in CI too, not a missing toolchain.
-    if GEM_E2E_DISABLED {
-        println!(
-            "SKIP {LEG}: gem patch {GEM_UUID} temporarily unpublished \
-             (GEM_E2E_DISABLED); re-enable when the corrected patch is published"
-        );
-        return;
-    }
+async fn gem_bundler_hosted_install_proof() {
+    const LEG: &str = "gem_bundler_hosted_install_proof";
     if !has_command("ruby") || !has_command("bundle") {
         soft_skip!(LEG, "`ruby` and/or `bundle` not on PATH");
     }
@@ -1790,153 +1684,86 @@ async fn gem_bundler_hosted_redirect_and_known_install_defect() {
          patch stay green).\nGemfile.lock:\n{lock}"
     );
 
-    // Known-broken leg: reinstall from the redirected Gemfile.
+    // THE point of the leg: reinstall from the redirected Gemfile alone,
+    // letting bundler fetch through patch.socket.dev and verify the swapped
+    // CHECKSUMS pin itself.
     std::fs::remove_dir_all(&bundle_path).ok();
     let reinstall = tool(&proj, "bundle", &["install"], &env);
-    let gem_strict = std::env::var("SOCKET_PATCH_HOSTED_E2E_GEM_STRICT")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-    if ok(&reinstall) {
-        // The server defect has been fixed. Say so loudly — the guard below
-        // should be promoted to unconditional and this branch deleted.
-        println!(
-            "NOTE {LEG}: `bundle install` from the redirected Gemfile now \
-             SUCCEEDS. The gem patch-registry compact-index dependency defect \
-             appears to be FIXED — delete the tolerance branch in this test and \
-             assert unconditionally."
-        );
-        // Exit 0 proves only that bundler fetched an artifact matching the
-        // CHECKSUMS pin. Close the loop on CONTENT: fetch the patch's file
-        // manifest from the proxy and assert every file it rewrites landed
-        // on disk byte-exact (afterHash is the git-blob sha256 the patch
-        // service publishes — the same digest the CLI's apply verifies).
-        let patch_files = published_patch_files(GEM_UUID).await.unwrap_or_else(|e| {
-            panic!(
-                "{LEG}: `bundle install` from the redirected Gemfile succeeded \
-                 but the patch file manifest could not be fetched to verify \
-                 the installed content: {e}"
-            )
-        });
-        let gem_dir = installed_gem_dir(
-            Path::new(&bundle_path),
-            &format!("{GEM_NAME}-{GEM_VERSION}"),
-            4,
-        )
-        .unwrap_or_else(|| {
-            panic!(
-                "{LEG}: `bundle install` succeeded but no \
-                 gems/{GEM_NAME}-{GEM_VERSION} directory exists under \
-                 {bundle_path}"
-            )
-        });
-        use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
-        let mut verified = 0usize;
-        let mut rewritten = 0usize;
-        for (path, before, after) in &patch_files {
-            // No afterHash = the patch deletes the file; nothing to hash.
-            let Some(after) = after else { continue };
-            let rel = path.strip_prefix("package/").unwrap_or(path.as_str());
-            let installed = gem_dir.join(rel);
-            let bytes = std::fs::read(&installed).unwrap_or_else(|e| {
-                panic!(
-                    "{LEG}: patch {GEM_UUID} rewrites `{path}` but the \
-                     installed gem has no readable {}: {e}",
-                    installed.display()
-                )
-            });
-            assert_eq!(
-                compute_git_sha256_from_bytes(&bytes),
-                *after,
-                "{LEG}: installed {} does not hash to the patch's afterHash — \
-                 bundler fetched an artifact whose content is NOT the \
-                 published patch",
-                installed.display()
-            );
-            verified += 1;
-            if before.as_deref() != Some(after.as_str()) {
-                rewritten += 1;
-            }
-        }
-        assert!(
-            verified >= 1,
-            "{LEG}: patch {GEM_UUID} names no files with an afterHash, so \
-             nothing was content-verified — the install success is vacuous"
-        );
-        assert!(
-            rewritten >= 1,
-            "{LEG}: every file in patch {GEM_UUID} has afterHash == \
-             beforeHash — the published patch is inert and this install \
-             proved nothing"
-        );
-        println!(
-            "{LEG}: verified {verified} patched file(s) on disk against the \
-             published afterHash ({rewritten} differ from upstream)"
-        );
-        return;
-    }
-    let detail = dump(&reinstall);
-
-    // Ask the SERVER what state it is in, rather than guessing from bundler's
-    // error text (see the doc comment above for why the text is untrustworthy).
-    // The base is read back out of the rewritten Gemfile, so this probes the
-    // exact registry bundler was pointed at.
-    let index_base = gem_registry_base(&gemfile).unwrap_or_else(|| {
-        panic!(
-            "{LEG}: could not read the Socket registry base back out of the \
-             rewritten Gemfile, so the install failure cannot be attributed. \
-             The redirect assertions above passed, so the `source \"…\" do` \
-             block shape must have changed:\n{gemfile}"
-        )
-    });
-    let versions_url = format!("{}/versions", index_base.trim_end_matches('/'));
-    let probe = http_probe(&versions_url).await;
-    let probe_note = match &probe {
-        Ok((status, len)) => {
-            format!("GET {versions_url} -> HTTP {status}, {len}-byte body")
-        }
-        Err(e) => format!("GET {versions_url} -> transport error: {e}"),
-    };
-
-    // Strict mode promotes ANY install failure to a hard failure, whatever the
-    // server state — that is its whole purpose as the regression guard.
     assert!(
-        !gem_strict,
-        "{LEG}: SOCKET_PATCH_HOSTED_E2E_GEM_STRICT=1 and `bundle install` from \
-         the redirected Gemfile failed.\n  registry probe: {probe_note}\n{detail}"
+        ok(&reinstall),
+        "{LEG}: `bundle install` from the redirected Gemfile failed — the \
+         redirect assertions above all passed, so the rewrite itself is fine \
+         and the regression is in the hosted install path (CLI rewrite shape \
+         or the gem patch-registry).\n{}",
+        dump(&reinstall)
     );
 
-    // A 2xx `/versions` means the compact index is BUILT and bundler was
-    // served a usable index. The documented server defect therefore does NOT
-    // apply, and tolerating the failure here would hide a real regression.
-    if let Ok((status, _)) = probe {
-        assert!(
-            !(200..300).contains(&status),
-            "{LEG}: `bundle install` from the redirected Gemfile FAILED even \
-             though the pinned registry's compact index is SERVING.\n  \
-             registry probe: {probe_note}\n\
-             A 2xx /versions means `package_gem_index_deps` is populated and \
-             the index is built, so this is NOT the known server defect \
-             (which 404s that route) — it is a real regression in hosted gem \
-             mode. The redirect assertions above all passed, so the rewrite \
-             itself is fine and the failure is in the install leg.\n{detail}"
+    // Exit 0 proves only that bundler fetched an artifact matching the
+    // CHECKSUMS pin. Close the loop on CONTENT: fetch the patch's file
+    // manifest from the proxy and assert every file it rewrites landed
+    // on disk byte-exact (afterHash is the git-blob sha256 the patch
+    // service publishes — the same digest the CLI's apply verifies).
+    let patch_files = published_patch_files(GEM_UUID).await.unwrap_or_else(|e| {
+        panic!(
+            "{LEG}: `bundle install` from the redirected Gemfile succeeded \
+             but the patch file manifest could not be fetched to verify \
+             the installed content: {e}"
+        )
+    });
+    let gem_dir = installed_gem_dir(
+        Path::new(&bundle_path),
+        &format!("{GEM_NAME}-{GEM_VERSION}"),
+        4,
+    )
+    .unwrap_or_else(|| {
+        panic!(
+            "{LEG}: `bundle install` succeeded but no \
+             gems/{GEM_NAME}-{GEM_VERSION} directory exists under \
+             {bundle_path}"
+        )
+    });
+    use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
+    let mut verified = 0usize;
+    let mut rewritten = 0usize;
+    for (path, before, after) in &patch_files {
+        // No afterHash = the patch deletes the file; nothing to hash.
+        let Some(after) = after else { continue };
+        let rel = path.strip_prefix("package/").unwrap_or(path.as_str());
+        let installed = gem_dir.join(rel);
+        let bytes = std::fs::read(&installed).unwrap_or_else(|e| {
+            panic!(
+                "{LEG}: patch {GEM_UUID} rewrites `{path}` but the \
+                 installed gem has no readable {}: {e}",
+                installed.display()
+            )
+        });
+        assert_eq!(
+            compute_git_sha256_from_bytes(&bytes),
+            *after,
+            "{LEG}: installed {} does not hash to the patch's afterHash — \
+             bundler fetched an artifact whose content is NOT the \
+             published patch",
+            installed.display()
         );
+        verified += 1;
+        if before.as_deref() != Some(after.as_str()) {
+            rewritten += 1;
+        }
     }
-
-    // Non-2xx (or an unreachable registry): the documented server defect.
-    // A transport error is tolerated rather than failed because a network
-    // blip is the most likely explanation for BOTH the probe and the install
-    // failing, and a required check must not go red for one.
+    assert!(
+        verified >= 1,
+        "{LEG}: patch {GEM_UUID} names no files with an afterHash, so \
+         nothing was content-verified — the install success is vacuous"
+    );
+    assert!(
+        rewritten >= 1,
+        "{LEG}: every file in patch {GEM_UUID} has afterHash == \
+         beforeHash — the published patch is inert and this install \
+         proved nothing"
+    );
     println!(
-        "KNOWN PRODUCTION DEFECT {LEG}: the Socket gem patch-registry's \
-         compact index is not being served for this patch, so `bundle \
-         install` from the redirected Gemfile cannot succeed.\n  registry \
-         probe: {probe_note}\n\
-         Since depscan#23630 the compact-index routes fail closed with 404 \
-         `not_built` until the requeued rebuild populates \
-         `package_gem_index_deps`. Hosted gem mode stays unusable for gems \
-         with dependencies until that completes. Redirect assertions above \
-         all passed; this leg will start asserting a real successful install \
-         automatically once /versions returns 2xx."
+        "{LEG}: verified {verified} patched file(s) on disk against the \
+         published afterHash ({rewritten} differ from upstream)"
     );
 }
 

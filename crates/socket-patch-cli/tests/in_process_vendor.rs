@@ -1728,6 +1728,10 @@ async fn offline_service_mode_refuses_instead_of_building() {
 
 const GEM_UUID: &str = "35353535-3535-4335-8335-353535353535";
 const GEM_PURL: &str = "pkg:gem/demo-gem@1.0.0";
+/// The platform-qualified spelling production publishes for pure-ruby gems
+/// (e.g. `pkg:gem/activestorage@6.0.3?platform=ruby`). `?platform=ruby` is
+/// the portable default and must vendor exactly like the bare purl.
+const GEM_PURL_QUALIFIED: &str = "pkg:gem/demo-gem@1.0.0?platform=ruby";
 const GEM_ORIG: &[u8] = b"module DemoGem\n  STATUS = \"orig\"\nend\n";
 const GEM_PATCHED: &[u8] = b"module DemoGem\n  STATUS = \"patched\"\nend\n";
 const GEM_GEMSPEC: &str = "Gem::Specification.new do |s|\n  s.name = \"demo-gem\"\n  s.version = \"1.0.0\"\n  s.summary = \"in-process scan --vendor fixture\"\n  s.require_paths = [\"lib\"]\nend\n";
@@ -1788,7 +1792,11 @@ fn gem_fixture() -> GemFixture {
 /// Mount discovery (batch), per-package search, and the full view (inline
 /// `blobContent`, so `scan --vendor` runs against the mock alone) for the
 /// demo gem — the gem mirror of `scan_vendor_e2e::mount_patch_api`.
-async fn mount_gem_patch_api(mock: &wiremock::MockServer) {
+///
+/// `patch_purl` is the purl the SERVED patch records carry ([`GEM_PURL`] or
+/// [`GEM_PURL_QUALIFIED`]); the batch response's outer package purl stays the
+/// bare purl the crawler requested, mirroring production.
+async fn mount_gem_patch_api(mock: &wiremock::MockServer, patch_purl: &str) {
     use base64::Engine as _;
     use wiremock::matchers::{method, path, path_regex};
     use wiremock::{Mock, ResponseTemplate};
@@ -1804,7 +1812,7 @@ async fn mount_gem_patch_api(mock: &wiremock::MockServer) {
                 "purl": GEM_PURL,
                 "patches": [{
                     "uuid": GEM_UUID,
-                    "purl": GEM_PURL,
+                    "purl": patch_purl,
                     "tier": "free",
                     "cveIds": ["CVE-2026-0002"],
                     "ghsaIds": [],
@@ -1823,7 +1831,7 @@ async fn mount_gem_patch_api(mock: &wiremock::MockServer) {
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "patches": [{
                 "uuid": GEM_UUID,
-                "purl": GEM_PURL,
+                "purl": patch_purl,
                 "publishedAt": "2026-01-01T00:00:00Z",
                 "description": "gem vendor patch",
                 "license": "MIT",
@@ -1838,7 +1846,7 @@ async fn mount_gem_patch_api(mock: &wiremock::MockServer) {
         .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/view/{GEM_UUID}")))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "uuid": GEM_UUID,
-            "purl": GEM_PURL,
+            "purl": patch_purl,
             "publishedAt": "2026-01-01T00:00:00Z",
             "files": {
                 "lib/demo_gem.rb": {
@@ -1894,7 +1902,7 @@ fn run_scan_vendor(root: &Path, mock_uri: &str, extra: &[&str]) -> (i32, Value) 
 #[tokio::test]
 async fn scan_vendor_gem_end_to_end_and_reconcile() {
     let mock = wiremock::MockServer::start().await;
-    mount_gem_patch_api(&mock).await;
+    mount_gem_patch_api(&mock, GEM_PURL).await;
     let fx = gem_fixture();
 
     let (code, env) = run_scan_vendor(fx.root(), &mock.uri(), &[]);
@@ -2004,6 +2012,80 @@ async fn scan_vendor_gem_end_to_end_and_reconcile() {
     );
 }
 
+/// Same in-process flow as [`scan_vendor_gem_end_to_end_and_reconcile`], but
+/// the served patch records carry the QUALIFIED gem purl (`?platform=ruby`)
+/// — the spelling production has published since the 2026-08-18 gem catalog
+/// republish. `platform=ruby` is the portable default: the vendor gate
+/// refuses only non-empty, non-`ruby` platform qualifiers (#172), so this
+/// must vendor exactly like the bare purl. This is the CLI-level pin that
+/// keeps the old `platform_gem_unsupported` gap from silently reopening;
+/// the core-level twin is
+/// `vendor::gem::tests::test_platform_ruby_gem_from_autofetch_staging_dir_vendors`.
+#[tokio::test]
+async fn scan_vendor_gem_qualified_platform_ruby_purl_vendors() {
+    let mock = wiremock::MockServer::start().await;
+    mount_gem_patch_api(&mock, GEM_PURL_QUALIFIED).await;
+    let fx = gem_fixture();
+
+    let (code, env) = run_scan_vendor(fx.root(), &mock.uri(), &[]);
+    assert_eq!(
+        code, 0,
+        "scan --vendor must succeed on the qualified purl: {env:#}"
+    );
+    assert_eq!(env["status"], "success", "envelope: {env:#}");
+    assert_eq!(env["vendor"]["summary"]["applied"], 1, "envelope: {env:#}");
+    assert_eq!(env["vendor"]["summary"]["failed"], 0, "envelope: {env:#}");
+    assert!(
+        env["vendor"]["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|e| e["errorCode"] != "platform_gem_unsupported"),
+        "`platform=ruby` is the portable default and must never be refused \
+         as platform_gem_unsupported: {env:#}"
+    );
+
+    // Manifest and ledger entry are keyed by the SERVED (qualified) purl;
+    // the ledger entry additionally records the qualifier-stripped
+    // `basePurl` (built by `build_gem_purl`) — both halves of the mapping.
+    let manifest: Value =
+        serde_json::from_slice(&std::fs::read(fx.root().join(".socket/manifest.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        manifest["patches"][GEM_PURL_QUALIFIED]["uuid"], GEM_UUID,
+        "manifest keys by the served purl: {manifest:#}"
+    );
+    let state: Value = serde_json::from_slice(&std::fs::read(fx.state_path()).unwrap()).unwrap();
+    assert_eq!(
+        state["entries"][GEM_PURL_QUALIFIED]["uuid"], GEM_UUID,
+        "ledger keys by the manifest (qualified) purl: {state:#}"
+    );
+    assert_eq!(
+        state["entries"][GEM_PURL_QUALIFIED]["basePurl"], GEM_PURL,
+        "ledger entry records the qualifier-stripped base purl: {state:#}"
+    );
+
+    // Artifact + pair edit land identically to the bare-purl flow.
+    assert_eq!(
+        std::fs::read(fx.vendored_lib()).unwrap(),
+        GEM_PATCHED,
+        "vendored lib must hold the patched bytes"
+    );
+    let gemfile = std::fs::read_to_string(fx.gemfile_path()).unwrap();
+    assert!(
+        gemfile.contains(&format!(
+            "gem \"demo-gem\", \"1.0.0\", path: \"{}\"",
+            GemFixture::copy_rel()
+        )),
+        "Gemfile line not rewritten to the exact-pin + path: form:\n{gemfile}"
+    );
+    let lock = std::fs::read_to_string(fx.lock_path()).unwrap();
+    assert!(
+        lock.contains("\n  demo-gem (= 1.0.0)!"),
+        "DEPENDENCIES pin missing:\n{lock}"
+    );
+}
+
 /// `scan --vendor --detached` on the gem project: no manifest is written,
 /// the ledger entry is detached with the patch record embedded, the pair
 /// edit still lands — and `vendor --revert` (the detached entry's only exit
@@ -2011,7 +2093,7 @@ async fn scan_vendor_gem_end_to_end_and_reconcile() {
 #[tokio::test]
 async fn scan_vendor_gem_detached_writes_no_manifest_and_reverts() {
     let mock = wiremock::MockServer::start().await;
-    mount_gem_patch_api(&mock).await;
+    mount_gem_patch_api(&mock, GEM_PURL).await;
     let fx = gem_fixture();
 
     let (code, env) = run_scan_vendor(fx.root(), &mock.uri(), &["--detached"]);
