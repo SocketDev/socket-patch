@@ -128,8 +128,8 @@ pub struct GlobalArgs {
     pub ecosystems: Option<Vec<String>>,
 
     /// Which kind of patch artifact to download when local files are missing.
-    /// `diff` (default) fetches the smallest delta archive; `package` fetches
-    /// a full per-package tarball; `file` falls back to legacy per-file blobs.
+    /// `diff` (default) fetches the smallest delta archive; `file` falls back
+    /// to legacy per-file blobs.
     #[arg(
         long = "download-mode",
         env = "SOCKET_DOWNLOAD_MODE",
@@ -337,6 +337,16 @@ impl GlobalArgs {
 /// without this mirror a bare `--offline` flag (or a truthy spelling like
 /// `SOCKET_OFFLINE=yes` that core's `"1" | "true"` match doesn't recognize)
 /// still let telemetry fire a network request.
+///
+/// `--api-url` / `--proxy-url` are mirrored for the same reason: the
+/// telemetry sender resolves its endpoint from the env only
+/// (`resolve_api_base_url` / `proxy_url_from_env`) and never sees the parsed
+/// flags, so without the mirror an on-prem `--api-url` run POSTed the event —
+/// Bearer token included — to the default `api.socket.dev`. Empty values mean
+/// "unset" (as in [`GlobalArgs::api_client_overrides`]) and are not mirrored.
+/// `--api-token` / `--org` are deliberately NOT mirrored: telemetry receives
+/// them as explicit arguments, and exporting a secret into the process env
+/// would leak it to every spawned package-manager child.
 pub(crate) fn apply_env_toggles(common: &GlobalArgs) {
     if common.offline {
         std::env::set_var("SOCKET_OFFLINE", "1");
@@ -346,6 +356,12 @@ pub(crate) fn apply_env_toggles(common: &GlobalArgs) {
     }
     if common.no_telemetry {
         std::env::set_var("SOCKET_TELEMETRY_DISABLED", "1");
+    }
+    if let Some(url) = common.api_url.as_deref().filter(|s| !s.is_empty()) {
+        std::env::set_var("SOCKET_API_URL", url);
+    }
+    if let Some(url) = common.proxy_url.as_deref().filter(|s| !s.is_empty()) {
+        std::env::set_var("SOCKET_PROXY_URL", url);
     }
 }
 
@@ -576,11 +592,6 @@ mod tests {
     /// on-prem token to the very host the operator redirected away from.
     #[test]
     #[serial_test::serial]
-    #[ignore = "RED: documents a real token-egress bug — `apply_env_toggles` does \
-                not mirror --api-url/--proxy-url into the env, and telemetry \
-                resolves its endpoint from the env only, so an on-prem run POSTs \
-                its Bearer token to the default api.socket.dev. The mirror was \
-                not part of this change."]
     fn apply_env_toggles_mirrors_api_and_proxy_urls_for_telemetry() {
         with_clean_socket_env(|| {
             // Guard against a vacuous pass: the resolver must start at the

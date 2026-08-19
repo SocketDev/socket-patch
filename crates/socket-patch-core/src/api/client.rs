@@ -513,21 +513,8 @@ impl ApiClient {
         self.fetch_binary("diff", uuid).await
     }
 
-    /// Fetch a per-package patch archive (tar.gz of patched files) by patch UUID.
-    ///
-    /// Returns the raw archive bytes, or `Ok(None)` if not found (404).
-    pub async fn fetch_package(&self, uuid: &str) -> Result<Option<Vec<u8>>, ApiError> {
-        if !is_valid_uuid(uuid) {
-            return Err(ApiError::InvalidHash(format!(
-                "Invalid patch UUID: {}",
-                uuid
-            )));
-        }
-        self.fetch_binary("package", uuid).await
-    }
-
     /// Build the URL (and an `is_authenticated` flag) for a binary fetch of
-    /// `kind` (`blob` / `diff` / `package`) identified by `identifier`.
+    /// `kind` (`blob` / `diff`) identified by `identifier`.
     ///
     /// Uses the authenticated `/v0/orgs/<slug>/patches/...` endpoint when a
     /// token and org slug are configured (and we're not pinned to the public
@@ -566,9 +553,9 @@ impl ApiClient {
         }
     }
 
-    /// Shared implementation for `fetch_blob` / `fetch_diff` / `fetch_package`.
+    /// Shared implementation for `fetch_blob` / `fetch_diff`.
     ///
-    /// `kind` is the URL segment (`blob` / `diff` / `package`), doubling as the
+    /// `kind` is the URL segment (`blob` / `diff`), doubling as the
     /// noun in log + error messages. `identifier` is the hash or UUID
     /// interpolated into the URL.
     async fn fetch_binary(
@@ -2027,7 +2014,7 @@ mod tests {
         assert!(!is_valid_uuid("80630680xxxxx"));
     }
 
-    // ── fetch_diff / fetch_package validation tests ─────────────────
+    // ── fetch_diff validation tests ──────────────────────────────────
     //
     // These tests cover input validation only — they intentionally do
     // NOT hit the network. The shared `fetch_binary` helper handles the
@@ -2039,14 +2026,6 @@ mod tests {
         std::env::remove_var("SOCKET_API_TOKEN");
         let (client, _) = get_api_client_from_env(None).await;
         let result = client.fetch_diff("not-a-uuid").await;
-        assert!(matches!(result, Err(ApiError::InvalidHash(_))));
-    }
-
-    #[tokio::test]
-    async fn test_fetch_package_rejects_invalid_uuid() {
-        std::env::remove_var("SOCKET_API_TOKEN");
-        let (client, _) = get_api_client_from_env(None).await;
-        let result = client.fetch_package("xxx").await;
         assert!(matches!(result, Err(ApiError::InvalidHash(_))));
     }
 
@@ -2307,15 +2286,11 @@ mod tests {
     }
 
     #[test]
-    fn binary_url_proxy_covers_diff_and_package() {
+    fn binary_url_proxy_covers_diff() {
         let client = proxy_client("https://custom.proxy.example");
         assert_eq!(
             client.binary_url("diff", "uuid-1").0,
             "https://custom.proxy.example/patch/diff/uuid-1"
-        );
-        assert_eq!(
-            client.binary_url("package", "uuid-1").0,
-            "https://custom.proxy.example/patch/package/uuid-1"
         );
     }
 

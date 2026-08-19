@@ -313,10 +313,6 @@ async fn repair_inner(
             .await
             .into_iter()
             .collect(),
-        (Some(m), DownloadMode::Package) => get_missing_archives(m, &packages_path)
-            .await
-            .into_iter()
-            .collect(),
     };
     let missing_count = missing_artifacts.len();
 

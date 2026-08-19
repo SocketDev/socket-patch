@@ -186,9 +186,8 @@ pub(crate) async fn stage_patch_sources(
     let download_needed = !common.offline
         && match download_mode {
             DownloadMode::File => !missing_blobs.is_empty(),
-            DownloadMode::Diff | DownloadMode::Package if missing_blobs.is_empty() => false,
+            DownloadMode::Diff if missing_blobs.is_empty() => false,
             DownloadMode::Diff => !missing_diff_archives.is_empty(),
-            DownloadMode::Package => !missing_package_archives.is_empty(),
         };
 
     if !download_needed {

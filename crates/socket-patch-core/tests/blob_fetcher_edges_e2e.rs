@@ -171,53 +171,9 @@ async fn get_missing_archives_reports_missing_archive() {
     );
 }
 
-/// `fetch_missing_sources` with a `None` packages_path while
-/// requesting `DownloadMode::Package` returns the empty-result
-/// envelope without I/O — covers the "no path configured" fallback
-/// hint documented in the function's rustdoc.
-#[tokio::test]
-async fn fetch_missing_sources_package_mode_with_no_packages_path() {
-    let tmp = tempfile::tempdir().unwrap();
-    let blobs = tmp.path().join("blobs");
-    std::fs::create_dir(&blobs).unwrap();
-    let sources = PatchSources {
-        blobs_path: &blobs,
-        packages_path: None,
-        diffs_path: None,
-        mem_blobs: None,
-    };
-    // Non-empty manifest: there IS work to do. So `total == 0` below can
-    // only mean the None-packages_path branch short-circuited — not that
-    // the manifest was empty or that the call silently fell through to
-    // File mode (which would attempt — and fail — a download here).
-    let manifest = manifest_with_after_hashes(&[&"a".repeat(64)]);
-    let client = dummy_client();
-
-    // Control: File mode against the same manifest genuinely tries to work.
-    let file_mode =
-        fetch_missing_sources(&manifest, &sources, DownloadMode::File, &client, None).await;
-    assert_eq!(file_mode.total, 1, "File mode must find the missing blob");
-    assert_eq!(file_mode.failed, 1, "and attempt (failing) to download it");
-
-    let result =
-        fetch_missing_sources(&manifest, &sources, DownloadMode::Package, &client, None).await;
-    assert_eq!(
-        result.total, 0,
-        "Package mode w/o packages_path must short-circuit"
-    );
-    assert_eq!(result.downloaded, 0);
-    assert_eq!(result.failed, 0);
-    assert_eq!(result.skipped, 0);
-    assert!(result.results.is_empty());
-    // The short-circuit must not have written any blob.
-    assert_eq!(
-        dir_entry_count(&blobs),
-        0,
-        "Package-mode short-circuit did zero I/O"
-    );
-}
-
-/// Same with `DownloadMode::Diff` and no diffs_path.
+/// `fetch_missing_sources` with `DownloadMode::Diff` and no diffs_path
+/// returns the empty-result envelope without I/O — covers the "no path
+/// configured" fallback hint documented in the function's rustdoc.
 #[tokio::test]
 async fn fetch_missing_sources_diff_mode_with_no_diffs_path() {
     let tmp = tempfile::tempdir().unwrap();
@@ -260,19 +216,17 @@ async fn fetch_missing_sources_diff_mode_with_no_diffs_path() {
 #[test]
 fn download_mode_parse_covers_all_branches() {
     assert_eq!(DownloadMode::parse("diff").unwrap(), DownloadMode::Diff);
-    assert_eq!(
-        DownloadMode::parse("package").unwrap(),
-        DownloadMode::Package
-    );
     assert_eq!(DownloadMode::parse("file").unwrap(), DownloadMode::File);
     assert_eq!(DownloadMode::parse("blob").unwrap(), DownloadMode::File);
     // Case-insensitive.
     assert_eq!(DownloadMode::parse("DIFF").unwrap(), DownloadMode::Diff);
-    assert_eq!(
-        DownloadMode::parse("Package").unwrap(),
-        DownloadMode::Package
-    );
     assert_eq!(DownloadMode::parse("FILE").unwrap(), DownloadMode::File);
+    // `package` was removed; its error is a removal notice (case-insensitive),
+    // distinct from the generic unknown-mode error.
+    for spelling in ["package", "Package"] {
+        let err = DownloadMode::parse(spelling).unwrap_err();
+        assert!(err.contains("removed"), "want removal notice: {err}");
+    }
     assert_eq!(DownloadMode::parse("Blob").unwrap(), DownloadMode::File);
     // Unknown value → Err, and the message names the offending input.
     let err = DownloadMode::parse("invalid").unwrap_err();
@@ -290,11 +244,7 @@ fn download_mode_parse_covers_all_branches() {
 /// each variant maps to a *distinct* tag.
 #[test]
 fn download_mode_as_tag_round_trips_with_parse() {
-    let variants = [
-        DownloadMode::Diff,
-        DownloadMode::Package,
-        DownloadMode::File,
-    ];
+    let variants = [DownloadMode::Diff, DownloadMode::File];
     let mut seen_tags = HashSet::new();
     for mode in variants {
         let tag = mode.as_tag();
@@ -306,7 +256,6 @@ fn download_mode_as_tag_round_trips_with_parse() {
     }
     // Pin the exact tag strings so a silent rename is caught.
     assert_eq!(DownloadMode::Diff.as_tag(), "diff");
-    assert_eq!(DownloadMode::Package.as_tag(), "package");
     assert_eq!(DownloadMode::File.as_tag(), "file");
 }
 
@@ -580,10 +529,10 @@ async fn fetch_missing_blobs_accepts_uppercase_manifest_hash() {
     assert_eq!(std::fs::read(blobs.join(&hash_upper)).unwrap(), content);
 }
 
-// ── Archive (diff / package) download path ──────────────────────────
+// ── Archive (diff) download path ─────────────────────────────────────
 //
-// `fetch_missing_archives_inner` (driven via `fetch_missing_sources` in
-// Diff / Package mode) is otherwise only reached on the closed-port
+// `fetch_missing_diff_archives` (driven via `fetch_missing_sources` in
+// Diff mode) is otherwise only reached on the closed-port
 // transport-error arm. These drive the success-write, 404, and
 // progress-callback arms against a mock proxy. Archives are uuid-named
 // and have no content hash, so the only integrity guarantee is the atomic
@@ -664,46 +613,6 @@ async fn fetch_missing_sources_diff_downloads_and_writes_archive() {
     // the mock's `.expect(1)` would trip on a second request).
     let again = fetch_missing_sources(&manifest, &sources, DownloadMode::Diff, &client, None).await;
     assert_eq!(again.total, 0, "already-present archive → nothing to do");
-}
-
-#[tokio::test]
-async fn fetch_missing_sources_package_downloads_via_package_endpoint() {
-    // Distinct from the diff test: Package mode must hit `/patch/package/`
-    // and write into the packages dir, proving the kind→endpoint→dir wiring
-    // isn't crossed.
-    let uuid = "22222222-2222-4222-8222-222222222222";
-    let archive_bytes = b"package archive bytes";
-
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path_matcher(format!("/patch/package/{uuid}")))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(archive_bytes.to_vec()))
-        .expect(1)
-        .mount(&server)
-        .await;
-
-    let tmp = tempfile::tempdir().unwrap();
-    let blobs = tmp.path().join("blobs");
-    let packages = tmp.path().join("packages");
-    std::fs::create_dir(&blobs).unwrap();
-    std::fs::create_dir(&packages).unwrap();
-    let sources = PatchSources {
-        blobs_path: &blobs,
-        packages_path: Some(&packages),
-        diffs_path: None,
-        mem_blobs: None,
-    };
-    let manifest = manifest_with_uuids(&[uuid]);
-    let client = proxy_client(&server.uri());
-
-    let result =
-        fetch_missing_sources(&manifest, &sources, DownloadMode::Package, &client, None).await;
-    assert_eq!(result.downloaded, 1);
-    assert_eq!(result.failed, 0);
-    assert_eq!(
-        std::fs::read(packages.join(format!("{uuid}.tar.gz"))).unwrap(),
-        archive_bytes
-    );
 }
 
 #[tokio::test]

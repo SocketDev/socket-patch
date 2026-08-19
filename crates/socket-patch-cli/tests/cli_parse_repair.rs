@@ -339,15 +339,17 @@ fn repair_download_mode_diff() {
 
 #[test]
 #[serial_test::serial]
-fn repair_download_mode_package() {
+fn repair_download_mode_package_removed() {
+    // `package` still parses at the clap layer (any string does) but the
+    // runtime validator rejects it with a removal message, not a generic
+    // unknown-mode error.
     let args = parse_repair(&["--download-mode", "package"]);
     let mut expected = expected_defaults();
     expected.download_mode = "package".to_string();
     assert_eq!(snapshot(&args), expected);
-    assert_eq!(
-        DownloadMode::parse(&args.common.download_mode),
-        Ok(DownloadMode::Package)
-    );
+    assert!(DownloadMode::parse(&args.common.download_mode)
+        .unwrap_err()
+        .contains("removed"));
 }
 
 #[test]

@@ -1,5 +1,5 @@
-//! Regression: the binary transport path (`fetch_blob` / `fetch_diff` /
-//! `fetch_package`, all sharing `fetch_binary`) must classify authenticated
+//! Regression: the binary transport path (`fetch_blob` / `fetch_diff`,
+//! both sharing `fetch_binary`) must classify authenticated
 //! 401 / 403 / 429 responses the same way the JSON path does.
 //!
 //! Before the fix, `fetch_binary` collapsed every non-OK/404 status into
