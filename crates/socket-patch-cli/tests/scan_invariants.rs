@@ -1343,3 +1343,329 @@ async fn scan_detects_update_without_touching_existing_blobs() {
     let reqs = recorded(&mock).await;
     assert_single_batch_carries_purl(&reqs, purl);
 }
+
+// ---------------------------------------------------------------------------
+// Cross-mode visibility warnings — agent-mode scan over another mode's state
+// ---------------------------------------------------------------------------
+//
+// Additive run-level `warnings[]` (top-level `{code, detail}` entries on the
+// scan `--json` envelope) — NEVER a status or exit-code change. Two blind
+// spots they close:
+//
+// * `vendored_ownership_retained`: agent-mode apply partitions vendor-owned
+//   purls into `apply.patches[]` skip records (`skipped`/`vendored`), which
+//   a `--json` consumer only finds by digging into the per-patch array; the
+//   requested mode change silently did not happen at the envelope level.
+// * `hosted_wiring_retained`: agent-mode scan over a live hosted redirect
+//   (lockfile still pinned to the patch server + redirect ledger records
+//   live) applies in place and reports success with zero hint that the
+//   hosted wiring was NOT unwound (no hosted revert exists for npm/yarn).
+
+const AGENT_WARN_UUID: &str = "33333333-3333-4333-8333-333333333333";
+
+/// Mount the batch + by-package mocks for one purl/uuid pair.
+async fn mount_patch_discovery(mock: &MockServer, purl: &str, encoded: &str, uuid: &str) {
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/batch")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "packages": [{
+                "purl": purl,
+                "patches": [{
+                    "uuid": uuid,
+                    "purl": purl,
+                    "tier": "free",
+                    "cveIds": [],
+                    "ghsaIds": [],
+                    "severity": "high",
+                    "title": "Prototype Pollution"
+                }]
+            }],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/v0/orgs/{ORG_SLUG}/patches/by-package/{encoded}"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "patches": [{
+                "uuid": uuid,
+                "purl": purl,
+                "publishedAt": "2024-01-01T00:00:00Z",
+                "description": "Fixes prototype pollution",
+                "license": "MIT",
+                "tier": "free",
+                "vulnerabilities": {}
+            }],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(mock)
+        .await;
+}
+
+fn find_warning<'a>(v: &'a serde_json::Value, code: &str) -> Option<&'a serde_json::Value> {
+    v["warnings"]
+        .as_array()
+        .and_then(|ws| ws.iter().find(|w| w["code"] == code))
+}
+
+#[tokio::test]
+async fn scan_agent_over_vendored_purl_surfaces_run_level_warning() {
+    let mock = MockServer::start().await;
+    let purl = "pkg:npm/minimist@1.2.2";
+    let encoded = "pkg%3Anpm%2Fminimist%401.2.2";
+    mount_patch_discovery(&mock, purl, encoded, AGENT_WARN_UUID).await;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_root_package_json(tmp.path());
+    write_npm_package(tmp.path(), "minimist", "1.2.2");
+
+    // The vendor ledger owns the purl.
+    let vendor_dir = tmp.path().join(".socket/vendor");
+    std::fs::create_dir_all(&vendor_dir).unwrap();
+    std::fs::write(
+        vendor_dir.join("state.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "version": 1,
+            "entries": { purl: {
+                "ecosystem": "npm",
+                "basePurl": purl,
+                "uuid": AGENT_WARN_UUID,
+                "artifact": {
+                    "path": format!(".socket/vendor/npm/{AGENT_WARN_UUID}/minimist-1.2.2.tgz"),
+                },
+                "wiring": []
+            }}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) = run_scan(tmp.path(), &mock.uri(), &["--mode", "agent", "--yes"]);
+    assert_eq!(
+        code, 0,
+        "additive warning must NOT change the exit code; stdout={stdout}; stderr={stderr}"
+    );
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert_eq!(
+        v["status"], "success",
+        "additive warning must NOT change status; envelope={v}"
+    );
+
+    // The per-patch skip record is unchanged (contract-pinned elsewhere)…
+    let patches = v["apply"]["patches"]
+        .as_array()
+        .expect("apply.patches array");
+    assert_eq!(patches.len(), 1, "envelope={v}");
+    assert_eq!(patches[0]["errorCode"], "vendored", "envelope={v}");
+
+    // …and the NEW top-level run warning names the retained ownership.
+    let w = find_warning(&v, "vendored_ownership_retained").unwrap_or_else(|| {
+        panic!(
+            "agent-mode scan skipping vendor-owned purl(s) must surface a \
+             top-level vendored_ownership_retained warning; envelope={v}"
+        )
+    });
+    let detail = w["detail"].as_str().expect("warning detail is a string");
+    assert!(
+        detail.contains("pkg:npm/minimist@1.2.2"),
+        "must name the purl: {detail}"
+    );
+    assert!(
+        detail.contains("socket-patch remove") && detail.contains("vendor --revert"),
+        "must name the real migration path: {detail}"
+    );
+    // Mirrored to stderr (not silent).
+    assert!(
+        stderr.contains("vendored_ownership_retained"),
+        "warning must be mirrored to stderr when not silent: {stderr}"
+    );
+}
+
+/// Write a hosted redirect ledger + a yarn.lock the ledger claims to have
+/// edited, whose resolved URL still pins the patch server (the live-wiring
+/// proof `hosted_wiring_live` reads).
+fn seed_live_hosted_wiring(root: &Path, purl: &str, uuid: &str, with_record: bool) {
+    let hosted_url =
+        format!("https://patch.socket.dev/patch/npm/minimist/1.2.2/tok/{uuid}/minimist-1.2.2.tgz");
+    std::fs::write(
+        root.join("yarn.lock"),
+        format!(
+            "# THIS IS AN AUTOGENERATED FILE. DO NOT EDIT THIS FILE DIRECTLY.\n\
+             # yarn lockfile v1\n\n\n\
+             minimist@^1.2.2:\n  version \"1.2.2\"\n  \
+             resolved \"{hosted_url}#aaaa\"\n  integrity sha512-fake==\n"
+        ),
+    )
+    .unwrap();
+    let vendor_dir = root.join(".socket/vendor");
+    std::fs::create_dir_all(&vendor_dir).unwrap();
+    let mut state = serde_json::json!({
+        "version": 1,
+        "mode": "hosted",
+        "edits": [{
+            "path": "yarn.lock",
+            "kind": "redirect_yarn_entry",
+            "action": "rewritten",
+            "key": "minimist@1.2.2",
+            "original": "minimist@^1.2.2:\n  version \"1.2.2\"\n  resolved \"https://registry.yarnpkg.com/minimist/-/minimist-1.2.2.tgz#bbbb\"\n  integrity sha512-orig==\n"
+        }],
+    });
+    if with_record {
+        state["records"] = serde_json::json!({ purl: {
+            "uuid": uuid,
+            "exportedAt": "2024-01-01T00:00:00Z",
+            "files": {},
+            "vulnerabilities": {},
+            "description": "hosted patch",
+            "license": "MIT",
+            "tier": "free"
+        }});
+    }
+    std::fs::write(
+        vendor_dir.join("redirect-state.json"),
+        serde_json::to_vec_pretty(&state).unwrap(),
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn scan_agent_over_live_hosted_wiring_surfaces_run_level_warning() {
+    let mock = MockServer::start().await;
+    let purl = "pkg:npm/minimist@1.2.2";
+    let encoded = "pkg%3Anpm%2Fminimist%401.2.2";
+    mount_patch_discovery(&mock, purl, encoded, AGENT_WARN_UUID).await;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_root_package_json(tmp.path());
+    write_npm_package(tmp.path(), "minimist", "1.2.2");
+    seed_live_hosted_wiring(
+        tmp.path(),
+        purl,
+        AGENT_WARN_UUID,
+        /*with_record=*/ true,
+    );
+
+    // --dry-run keeps the run cheap (no artifact download mocks needed);
+    // the warning is a STATE probe — the hosted wiring is live whether or
+    // not this particular run wrote anything.
+    let (code, stdout, stderr) = run_scan(
+        tmp.path(),
+        &mock.uri(),
+        &["--mode", "agent", "--dry-run", "--yes"],
+    );
+    assert_eq!(
+        code, 0,
+        "additive warning must NOT change the exit code; stdout={stdout}; stderr={stderr}"
+    );
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert_eq!(
+        v["status"], "success",
+        "additive warning must NOT change status; envelope={v}"
+    );
+
+    let w = find_warning(&v, "hosted_wiring_retained").unwrap_or_else(|| {
+        panic!(
+            "agent-mode scan over live hosted wiring must surface a \
+             top-level hosted_wiring_retained warning; envelope={v}"
+        )
+    });
+    let detail = w["detail"].as_str().expect("warning detail is a string");
+    assert!(
+        detail.contains("pkg:npm/minimist@1.2.2"),
+        "must name the purl: {detail}"
+    );
+    assert!(
+        detail.contains("scan --mode vendored"),
+        "must name the migration path: {detail}"
+    );
+    assert!(
+        detail.contains("Do not delete"),
+        "must warn against hand-deleting the ledger (it holds the only \
+         revert originals): {detail}"
+    );
+    assert!(
+        stderr.contains("hosted_wiring_retained"),
+        "warning must be mirrored to stderr when not silent: {stderr}"
+    );
+}
+
+/// Coordination guard (lane B: hosted→vendored pre-revert): once another
+/// flow retires the redirect ledger RECORDS for a purl, the agent-flow
+/// warning must stay silent — it keys on records still live at scan time,
+/// never on leftover `edits` (which are append-only revert data and
+/// legitimately outlive the records).
+#[tokio::test]
+async fn scan_agent_hosted_warning_silent_once_ledger_records_are_gone() {
+    let mock = MockServer::start().await;
+    let purl = "pkg:npm/minimist@1.2.2";
+    let encoded = "pkg%3Anpm%2Fminimist%401.2.2";
+    mount_patch_discovery(&mock, purl, encoded, AGENT_WARN_UUID).await;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_root_package_json(tmp.path());
+    write_npm_package(tmp.path(), "minimist", "1.2.2");
+    // Ledger with edits but NO records (the post-pre-revert shape) — and
+    // the lock text still carrying the uuid must not resurrect the warning.
+    seed_live_hosted_wiring(
+        tmp.path(),
+        purl,
+        AGENT_WARN_UUID,
+        /*with_record=*/ false,
+    );
+
+    let (code, stdout, stderr) = run_scan(
+        tmp.path(),
+        &mock.uri(),
+        &["--mode", "agent", "--dry-run", "--yes"],
+    );
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert!(
+        find_warning(&v, "hosted_wiring_retained").is_none(),
+        "no ledger records ⇒ no hosted_wiring_retained warning; envelope={v}"
+    );
+}
+
+/// Registry-clean lock (hosted wiring NOT live) with a leftover record:
+/// the live lock is the truth source — no warning.
+#[tokio::test]
+async fn scan_agent_hosted_warning_silent_when_lock_is_registry_clean() {
+    let mock = MockServer::start().await;
+    let purl = "pkg:npm/minimist@1.2.2";
+    let encoded = "pkg%3Anpm%2Fminimist%401.2.2";
+    mount_patch_discovery(&mock, purl, encoded, AGENT_WARN_UUID).await;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_root_package_json(tmp.path());
+    write_npm_package(tmp.path(), "minimist", "1.2.2");
+    seed_live_hosted_wiring(
+        tmp.path(),
+        purl,
+        AGENT_WARN_UUID,
+        /*with_record=*/ true,
+    );
+    // Overwrite the lock with a registry-clean entry (no uuid, no patch host).
+    std::fs::write(
+        tmp.path().join("yarn.lock"),
+        "# THIS IS AN AUTOGENERATED FILE. DO NOT EDIT THIS FILE DIRECTLY.\n\
+         # yarn lockfile v1\n\n\n\
+         minimist@^1.2.2:\n  version \"1.2.2\"\n  \
+         resolved \"https://registry.yarnpkg.com/minimist/-/minimist-1.2.2.tgz#bbbb\"\n  \
+         integrity sha512-orig==\n",
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) = run_scan(
+        tmp.path(),
+        &mock.uri(),
+        &["--mode", "agent", "--dry-run", "--yes"],
+    );
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert!(
+        find_warning(&v, "hosted_wiring_retained").is_none(),
+        "registry-clean lock ⇒ no hosted_wiring_retained warning; envelope={v}"
+    );
+}
