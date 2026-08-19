@@ -41,6 +41,27 @@ fn git_sha256(content: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// Install the fixture package PATCHED (file at `after` bytes) so the
+/// nested rollback genuinely needs the beforeHash blob. Rollback's blob
+/// gate covers only installed rollback targets — a manifest-only fixture
+/// has nothing to roll back, never plans a download, and would give the
+/// online/offline fetch assertions below nothing to observe.
+fn install_patched_package(root: &Path, after: &[u8]) {
+    std::fs::write(
+        root.join("package.json"),
+        r#"{"name":"remove-network-fixture","version":"0.0.0"}"#,
+    )
+    .expect("write root package.json");
+    let pkg = root.join("node_modules").join("remove-network-test");
+    std::fs::create_dir_all(&pkg).expect("create package dir");
+    std::fs::write(
+        pkg.join("package.json"),
+        r#"{"name":"remove-network-test","version":"1.0.0"}"#,
+    )
+    .expect("write pkg package.json");
+    std::fs::write(pkg.join("index.js"), after).expect("write patched index.js");
+}
+
 fn write_manifest(socket: &Path, before_hash: &str, after_hash: &str) {
     std::fs::create_dir_all(socket).expect("create .socket");
     let body = format!(
@@ -127,10 +148,11 @@ fn run_remove(cwd: &Path, api_url: &str, extra: &[&str]) -> (i32, String) {
     )
 }
 
-/// Online sanity: a missing beforeHash blob is fetched, rollback finds no
-/// installed package (nothing to restore → success), and the entry is
-/// removed. Establishes that the mock can satisfy the download, which is
-/// what gives the `--offline` regression test (below) its teeth.
+/// Online sanity: with the fixture package installed at the PATCHED
+/// bytes, the missing beforeHash blob is fetched, rollback restores the
+/// original file, and the entry is removed. Establishes that the mock
+/// can satisfy the download, which is what gives the `--offline`
+/// regression test (below) its teeth.
 #[tokio::test]
 async fn remove_online_downloads_missing_before_blob_then_removes() {
     let before = b"before\n";
@@ -144,6 +166,7 @@ async fn remove_online_downloads_missing_before_blob_then_removes() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let socket = tmp.path().join(".socket");
     write_manifest(&socket, &before_hash, &after_hash);
+    install_patched_package(tmp.path(), after);
 
     let (code, stdout) = run_remove(tmp.path(), &mock.uri(), &[]);
     assert_eq!(code, 0, "online remove must succeed; stdout=\n{stdout}");
@@ -190,6 +213,7 @@ async fn remove_offline_does_not_fetch_and_keeps_entry() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let socket = tmp.path().join(".socket");
     write_manifest(&socket, &before_hash, &after_hash);
+    install_patched_package(tmp.path(), after);
 
     let (code, stdout) = run_remove(tmp.path(), &mock.uri(), &["--offline"]);
     assert_eq!(
