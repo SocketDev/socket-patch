@@ -565,13 +565,7 @@ async fn redirect_scanned_project(
     // first grant answers exactly twice (scan 1 + the same-grant re-scan),
     // then the rotated grant takes over — production rotates the token path
     // segment per request.
-    mount_reference_mock(
-        &server,
-        TOKEN,
-        &patched_sha,
-        rotated_token.map(|_| 2),
-    )
-    .await;
+    mount_reference_mock(&server, TOKEN, &patched_sha, rotated_token.map(|_| 2)).await;
     if let Some(token_b) = rotated_token {
         mount_compact_index(
             &server,
@@ -902,7 +896,8 @@ fn assert_patched_install(fx: &RedirectFixture, fresh: &Path) {
 #[ignore = "host capstone: shells out to a real ruby/gem/bundler >= 2.6; the unpinned `test` \
             job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
 async fn gem_hosted_fresh_checkout_bundle_install_installs_patched_bytes_and_vex_verifies() {
-    let Some(fx) = redirect_scanned_project("main", Spelling::Gemfile, false, true, None).await else {
+    let Some(fx) = redirect_scanned_project("main", Spelling::Gemfile, false, true, None).await
+    else {
         return;
     };
 
@@ -974,7 +969,8 @@ async fn gem_hosted_fresh_checkout_bundle_install_installs_patched_bytes_and_vex
 #[ignore = "host capstone: shells out to a real ruby/gem/bundler >= 2.6; the unpinned `test` \
             job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
 async fn gem_hosted_gems_rb_spelling_redirects_and_installs() {
-    let Some(fx) = redirect_scanned_project("gems.rb", Spelling::GemsRb, false, true, None).await else {
+    let Some(fx) = redirect_scanned_project("gems.rb", Spelling::GemsRb, false, true, None).await
+    else {
         return;
     };
     assert!(
@@ -1007,7 +1003,8 @@ async fn gem_hosted_gems_rb_spelling_redirects_and_installs() {
 #[ignore = "host capstone: shells out to a real ruby/gem/bundler >= 2.6; the unpinned `test` \
             job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
 async fn gem_hosted_registry_info_without_deps_breaks_install_like_production() {
-    let Some(fx) = redirect_scanned_project("nodeps", Spelling::Gemfile, false, false, None).await else {
+    let Some(fx) = redirect_scanned_project("nodeps", Spelling::Gemfile, false, false, None).await
+    else {
         return;
     };
 

@@ -6968,7 +6968,9 @@ mod tests {
         );
         assert_eq!(
             grant_token_path_segment(
-                &format!("https://patch.socket.dev/patch/gem/rails/7.0.0/tok-b/{uuid}/rails-7.0.0.gem"),
+                &format!(
+                    "https://patch.socket.dev/patch/gem/rails/7.0.0/tok-b/{uuid}/rails-7.0.0.gem"
+                ),
                 uuid
             )
             .as_deref(),
