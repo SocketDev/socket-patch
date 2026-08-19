@@ -306,6 +306,29 @@ pub fn write_minimal_manifest(
     path
 }
 
+/// Write a hosted redirect ledger (`.socket/vendor/redirect-state.json`)
+/// under `root` with the given PURL → record entries — the records-only
+/// shape `scan --mode hosted` persists (tests that need recorded `edits`
+/// add them to the returned-state shape themselves before writing, or
+/// keep their own writer). Serializes through the real `RedirectState`
+/// type so the fixture can never drift from the on-disk schema.
+pub fn write_redirect_ledger(
+    root: &Path,
+    records: &[(&str, socket_patch_core::manifest::schema::PatchRecord)],
+) {
+    let mut state = socket_patch_core::patch::redirect::RedirectState::new();
+    for (purl, record) in records {
+        state.records.insert((*purl).to_string(), record.clone());
+    }
+    let vendor_dir = root.join(".socket/vendor");
+    std::fs::create_dir_all(&vendor_dir).expect("create .socket/vendor dir");
+    std::fs::write(
+        vendor_dir.join("redirect-state.json"),
+        serde_json::to_string_pretty(&state).expect("serialize redirect ledger"),
+    )
+    .expect("write redirect-state.json");
+}
+
 /// Drop `content` at `<socket_dir>/blobs/<hash>`. Used to stage the
 /// `after_hash` blob a synthetic manifest references so apply can
 /// run fully offline.

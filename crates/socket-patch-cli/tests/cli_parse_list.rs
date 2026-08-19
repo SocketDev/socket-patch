@@ -16,6 +16,9 @@ use std::process::Command;
 
 use clap::Parser;
 use socket_patch_cli::commands::list::{run, ListArgs};
+
+#[path = "common/mod.rs"]
+mod common;
 use socket_patch_cli::{Cli, Commands};
 use socket_patch_core::manifest::schema::{
     PatchFileInfo, PatchManifest, PatchRecord, VulnerabilityInfo,
@@ -953,5 +956,448 @@ fn silent_keeps_missing_manifest_error_on_stderr_via_binary() {
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("Manifest not found"),
         "error output must NOT be muted by --silent"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Hosted redirect-ledger records — `scan --mode hosted` records its patches
+// ONLY in `.socket/vendor/redirect-state.json` (it never writes
+// `.socket/manifest.json`), so `list` on a purely hosted-wired project used
+// to hard-fail `manifest_not_found` while patches were demonstrably live
+// (verified against production on bundler 1.17/2.7/4.0 — the gem live-matrix
+// D3 defect). `list` now folds the ledger's records in, labeled as hosted;
+// when both stores exist, both are shown.
+// ---------------------------------------------------------------------------
+
+const HOSTED_PURL: &str = "pkg:npm/hosted-pkg@2.0.0";
+const HOSTED_UUID: &str = "22222222-2222-4222-8222-222222222222";
+
+/// A patch record for the redirect ledger, distinguishable from the
+/// manifest fixture's record.
+fn hosted_record(uuid: &str) -> PatchRecord {
+    let mut files = HashMap::new();
+    files.insert(
+        "package/hosted.js".to_string(),
+        PatchFileInfo {
+            before_hash: "c".repeat(64),
+            after_hash: "d".repeat(64),
+        },
+    );
+    let mut vulnerabilities = HashMap::new();
+    vulnerabilities.insert(
+        "GHSA-host-host-host".to_string(),
+        VulnerabilityInfo {
+            cves: vec!["CVE-2024-0002".to_string()],
+            summary: "hosted vuln".to_string(),
+            severity: "critical".to_string(),
+            description: "hosted description".to_string(),
+        },
+    );
+    PatchRecord {
+        uuid: uuid.to_string(),
+        exported_at: "2024-02-02T00:00:00Z".to_string(),
+        files,
+        vulnerabilities,
+        description: "Hosted patch".to_string(),
+        license: "MIT".to_string(),
+        tier: "free".to_string(),
+    }
+}
+
+// The redirect-ledger writer lives in `tests/common/mod.rs`
+// (`common::write_redirect_ledger`) — shared with the other suites that
+// seed hosted state, so the fixture can never drift from the on-disk schema.
+
+#[test]
+fn hosted_only_project_list_json_lists_ledger_records_via_binary() {
+    // No manifest at all — only the hosted redirect ledger. `list --json`
+    // must exit 0 with the hosted records as labeled discovered events, not
+    // `manifest_not_found`.
+    let tmp = tempfile::tempdir().unwrap();
+    common::write_redirect_ledger(tmp.path(), &[(HOSTED_PURL, hosted_record(HOSTED_UUID))]);
+
+    let out = run_list_binary(tmp.path(), &["--json"]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "hosted-only list --json must exit 0 (records found), stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim())
+        .expect("stdout must be valid JSON");
+    assert_eq!(v["command"], "list");
+    assert_eq!(v["status"], "success", "envelope={v}");
+    assert_eq!(v["summary"]["discovered"], 1, "envelope={v}");
+
+    let events = v["events"].as_array().expect("events array");
+    assert_eq!(events.len(), 1, "envelope={v}");
+    let event = &events[0];
+    assert_eq!(event["action"], "discovered");
+    assert_eq!(event["purl"], HOSTED_PURL);
+    assert_eq!(event["uuid"], HOSTED_UUID);
+    // The hosted label: a consumer must be able to tell a redirect-ledger
+    // record from a manifest entry.
+    assert_eq!(event["details"]["mode"], "hosted", "envelope={v}");
+    assert_eq!(
+        event["details"]["ledger"], ".socket/vendor/redirect-state.json",
+        "envelope={v}"
+    );
+    // The rich metadata rides along exactly like a manifest entry's.
+    assert_eq!(event["details"]["tier"], "free");
+    assert_eq!(event["details"]["exportedAt"], "2024-02-02T00:00:00Z");
+    let vulns = event["details"]["vulnerabilities"]
+        .as_array()
+        .expect("vulnerabilities array");
+    assert_eq!(vulns[0]["id"], "GHSA-host-host-host");
+    assert_eq!(vulns[0]["severity"], "critical");
+}
+
+#[test]
+fn hosted_only_project_list_plain_labels_hosted_via_binary() {
+    let tmp = tempfile::tempdir().unwrap();
+    common::write_redirect_ledger(tmp.path(), &[(HOSTED_PURL, hosted_record(HOSTED_UUID))]);
+
+    let out = run_list_binary(tmp.path(), &[]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "hosted-only list must exit 0, stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains("Found 1 patch(es):"),
+        "count header must include the hosted record: {stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("Package: {HOSTED_PURL}")),
+        "missing hosted purl: {stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("UUID: {HOSTED_UUID}")),
+        "missing hosted uuid: {stdout}"
+    );
+    // The human line must label the record as hosted and name the ledger.
+    assert!(
+        stdout.contains("Mode: hosted"),
+        "hosted record must be labeled: {stdout}"
+    );
+    assert!(
+        stdout.contains(".socket/vendor/redirect-state.json"),
+        "the label must name the ledger the record came from: {stdout}"
+    );
+}
+
+#[test]
+fn manifest_and_hosted_ledger_coexist_via_binary() {
+    // Manifest entry + hosted records, including one purl present in BOTH
+    // stores: both are shown (labeled apart), globally purl-sorted with the
+    // manifest entry first on a tie.
+    let tmp = tempfile::tempdir().unwrap();
+    write_manifest_in(tmp.path(), &populated_manifest());
+    common::write_redirect_ledger(
+        tmp.path(),
+        &[
+            (HOSTED_PURL, hosted_record(HOSTED_UUID)),
+            // Same purl as the manifest fixture, different uuid.
+            (
+                "pkg:npm/test-pkg@1.0.0",
+                hosted_record("33333333-3333-4333-8333-333333333333"),
+            ),
+        ],
+    );
+
+    let out = run_list_binary(tmp.path(), &["--json"]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "list over both stores must exit 0, stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim())
+        .expect("stdout must be valid JSON");
+    assert_eq!(v["summary"]["discovered"], 3, "envelope={v}");
+    let events = v["events"].as_array().expect("events array");
+    let listed: Vec<(&str, &str, bool)> = events
+        .iter()
+        .map(|e| {
+            (
+                e["purl"].as_str().expect("purl"),
+                e["uuid"].as_str().expect("uuid"),
+                e["details"]["mode"] == "hosted",
+            )
+        })
+        .collect();
+    assert_eq!(
+        listed,
+        vec![
+            (HOSTED_PURL, HOSTED_UUID, true),
+            (
+                "pkg:npm/test-pkg@1.0.0",
+                "11111111-1111-4111-8111-111111111111",
+                false
+            ),
+            (
+                "pkg:npm/test-pkg@1.0.0",
+                "33333333-3333-4333-8333-333333333333",
+                true
+            ),
+        ],
+        "both stores' records must be listed, purl-sorted, manifest entry \
+         before the hosted record on a purl tie; envelope={v}"
+    );
+}
+
+#[test]
+fn edits_only_ledger_without_manifest_still_manifest_not_found_via_binary() {
+    // A ledger with recorded edits but NO records (the post-takeover /
+    // degraded shape) asserts no patches, so a manifest-less project stays
+    // on the manifest_not_found path.
+    let tmp = tempfile::tempdir().unwrap();
+    let vendor_dir = tmp.path().join(".socket/vendor");
+    std::fs::create_dir_all(&vendor_dir).unwrap();
+    std::fs::write(
+        vendor_dir.join("redirect-state.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "version": 1,
+            "mode": "hosted",
+            "edits": [{
+                "path": "yarn.lock",
+                "kind": "redirect_yarn_entry",
+                "action": "rewritten",
+                "key": "minimist@1.2.2",
+                "original": "registry original"
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let out = run_list_binary(tmp.path(), &["--json"]);
+    let v: serde_json::Value = serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim())
+        .expect("stdout must be valid JSON");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "no records anywhere must exit 1"
+    );
+    assert_eq!(v["error"]["code"], "manifest_not_found", "envelope={v}");
+}
+
+#[test]
+fn corrupt_manifest_with_hosted_ledger_still_manifest_invalid_via_binary() {
+    // A corrupt manifest is an error state; hosted records must never mask
+    // it as a healthy hosted-only listing.
+    let tmp = tempfile::tempdir().unwrap();
+    let socket_dir = tmp.path().join(".socket");
+    std::fs::create_dir_all(&socket_dir).unwrap();
+    std::fs::write(socket_dir.join("manifest.json"), "{not json").unwrap();
+    common::write_redirect_ledger(tmp.path(), &[(HOSTED_PURL, hosted_record(HOSTED_UUID))]);
+
+    let out = run_list_binary(tmp.path(), &["--json"]);
+    let v: serde_json::Value = serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim())
+        .expect("stdout must be valid JSON");
+    assert_eq!(out.status.code(), Some(1), "corrupt manifest must exit 1");
+    assert_eq!(v["error"]["code"], "manifest_invalid", "envelope={v}");
+}
+
+#[test]
+fn silent_suppresses_hosted_listing_via_binary() {
+    // `--silent` is "errors only": the hosted listing is muted like the
+    // manifest one, while the exit code still says records were found.
+    let tmp = tempfile::tempdir().unwrap();
+    common::write_redirect_ledger(tmp.path(), &[(HOSTED_PURL, hosted_record(HOSTED_UUID))]);
+
+    let out = run_list_binary_scrubbed(tmp.path(), &["--silent"]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "hosted-only --silent must exit 0"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.trim().is_empty(),
+        "--silent must suppress the hosted listing; got {stdout:?}"
+    );
+}
+
+#[test]
+fn silent_gates_the_malformed_ledger_warning_via_binary() {
+    // A malformed ledger degrades to "nothing to consult" with a stderr
+    // warning — and that warning is advisory, so `--silent` ("errors only")
+    // must mute it like every sibling warning. The listing itself proceeds
+    // from the manifest either way.
+    let tmp = tempfile::tempdir().unwrap();
+    write_manifest_in(tmp.path(), &populated_manifest());
+    let vendor_dir = tmp.path().join(".socket/vendor");
+    std::fs::create_dir_all(&vendor_dir).unwrap();
+    std::fs::write(vendor_dir.join("redirect-state.json"), "{ torn ledger").unwrap();
+
+    // Control: without --silent the corruption is surfaced.
+    let loud = run_list_binary_scrubbed(tmp.path(), &[]);
+    assert_eq!(loud.status.code(), Some(0), "manifest still lists");
+    assert!(
+        String::from_utf8_lossy(&loud.stderr).contains("malformed"),
+        "a malformed ledger must be surfaced on stderr when not silent; \
+         stderr={}",
+        String::from_utf8_lossy(&loud.stderr)
+    );
+
+    // --silent: the warning is muted, the exit code unchanged.
+    let out = run_list_binary_scrubbed(tmp.path(), &["--silent"]);
+    assert_eq!(out.status.code(), Some(0));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).trim().is_empty(),
+        "--silent must mute the malformed-ledger warning; stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `--manifest-path` store scoping — both stores must come from the SAME
+// project. The redirect ledger used to be resolved against cwd
+// unconditionally, so pointing `--manifest-path` at another project's
+// manifest interleaved two projects' patch state (and a LOCAL ledger could
+// suppress the flagged project's manifest_not_found).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn manifest_path_scopes_ledger_to_target_project_via_binary() {
+    // cwd has its own (decoy) ledger; --manifest-path points at another
+    // project that has BOTH a manifest and its own ledger. Only the target
+    // project's stores may be listed.
+    let cwd = tempfile::tempdir().unwrap();
+    common::write_redirect_ledger(
+        cwd.path(),
+        &[("pkg:npm/local-decoy@0.0.1", hosted_record(HOSTED_UUID))],
+    );
+
+    let target = tempfile::tempdir().unwrap();
+    write_manifest_in(target.path(), &populated_manifest());
+    common::write_redirect_ledger(target.path(), &[(HOSTED_PURL, hosted_record(HOSTED_UUID))]);
+
+    let manifest_path = target.path().join(".socket/manifest.json");
+    let out = run_list_binary(
+        cwd.path(),
+        &["--json", "--manifest-path", manifest_path.to_str().unwrap()],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim())
+        .expect("stdout must be valid JSON");
+    let purls: Vec<&str> = v["events"]
+        .as_array()
+        .expect("events array")
+        .iter()
+        .map(|e| e["purl"].as_str().expect("purl"))
+        .collect();
+    assert_eq!(
+        purls,
+        vec![HOSTED_PURL, "pkg:npm/test-pkg@1.0.0"],
+        "only the target project's manifest + ledger may be listed — never \
+         the cwd's local ledger; envelope={v}"
+    );
+}
+
+#[test]
+fn local_ledger_never_suppresses_flagged_manifest_not_found_via_binary() {
+    // --manifest-path points at a project with NO manifest and NO ledger;
+    // the cwd's local ledger records must not turn that into a success.
+    let cwd = tempfile::tempdir().unwrap();
+    common::write_redirect_ledger(cwd.path(), &[(HOSTED_PURL, hosted_record(HOSTED_UUID))]);
+    let target = tempfile::tempdir().unwrap();
+
+    let manifest_path = target.path().join(".socket/manifest.json");
+    let out = run_list_binary(
+        cwd.path(),
+        &["--json", "--manifest-path", manifest_path.to_str().unwrap()],
+    );
+    let v: serde_json::Value = serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim())
+        .expect("stdout must be valid JSON");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "the flagged project has no stores at all; envelope={v}"
+    );
+    assert_eq!(v["error"]["code"], "manifest_not_found", "envelope={v}");
+}
+
+// ---------------------------------------------------------------------------
+// Telemetry — `patch_listed`'s `patches_count` predates the hosted folding
+// and dashboards consume it as "manifest patches". Folding hosted records
+// into the SAME field would silently redefine the metric (and double-count
+// purls present in both stores), so the count stays manifest-only.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn list_telemetry_counts_manifest_patches_only_via_binary() {
+    use wiremock::matchers::{method, path as url_path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(url_path("/v0/orgs/test-org/telemetry"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .mount(&server)
+        .await;
+
+    // 1 manifest patch + 2 hosted records (one sharing the manifest purl):
+    // the listing shows 3 entries, the metric must still say 1.
+    let tmp = tempfile::tempdir().unwrap();
+    write_manifest_in(tmp.path(), &populated_manifest());
+    common::write_redirect_ledger(
+        tmp.path(),
+        &[
+            (HOSTED_PURL, hosted_record(HOSTED_UUID)),
+            (
+                "pkg:npm/test-pkg@1.0.0",
+                hosted_record("33333333-3333-4333-8333-333333333333"),
+            ),
+        ],
+    );
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_socket-patch"));
+    cmd.arg("list")
+        .arg("--cwd")
+        .arg(tmp.path())
+        .arg("--json")
+        .arg("--api-token")
+        .arg("sktsec_telemetry_test")
+        .arg("--org")
+        .arg("test-org");
+    for var in socket_patch_cli::args::GLOBAL_ARG_ENV_VARS {
+        cmd.env_remove(var);
+    }
+    cmd.env("SOCKET_TELEMETRY_DISABLED", "0");
+    cmd.env("SOCKET_API_URL", server.uri());
+    cmd.env("SOCKET_NO_UPDATE_CHECK", "1");
+    let out = cmd.output().expect("run socket-patch binary");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim())
+        .expect("stdout must be valid JSON");
+    assert_eq!(
+        v["summary"]["discovered"], 3,
+        "the listing itself shows all three entries; envelope={v}"
+    );
+
+    let reqs = server.received_requests().await.unwrap_or_default();
+    let telemetry = reqs
+        .iter()
+        .find(|r| r.url.path() == "/v0/orgs/test-org/telemetry")
+        .expect("list must POST the patch_listed telemetry event");
+    let body = String::from_utf8_lossy(&telemetry.body);
+    assert!(
+        body.contains("\"patches_count\":1"),
+        "patches_count must keep its pre-hosted meaning (manifest patches \
+         only — here 1, not the 3 listed entries); body={body}"
     );
 }
