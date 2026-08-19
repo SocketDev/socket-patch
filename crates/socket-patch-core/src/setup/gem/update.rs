@@ -10,6 +10,7 @@ use std::path::Path;
 
 use tokio::fs;
 
+use super::version::{probe_bundler, unsupported_bundler_message, BundlerProbe};
 use super::{add_plugin_files, remove_plugin_files, BundlerProject};
 use crate::utils::fs::atomic_write_bytes_preserving_mode;
 
@@ -221,7 +222,23 @@ async fn edit_gemfile_remove(gemfile: &Path, dry_run: bool) -> GemEditResult {
 /// Wiring first and then failing to write the files would leave the project
 /// unable to install at all — strictly worse than never having run `setup`.
 /// Wiring last keeps a failure's blast radius at "not configured".
+///
+/// Refused outright — dry-run included, so the preview never promises a wire
+/// the real run would reject — when the project's bundler is below the
+/// [`super::MIN_BUNDLER`] floor: bundler 1.x resolves the `plugin ... path:`
+/// directive as an ordinary gem and every later `bundle install` exits 7
+/// before the plugin registers (see `version.rs`). The probe fails OPEN on
+/// an undetectable version; `remove_plugin_directive` is never gated (it is
+/// the recovery path for an already-wired 1.x project).
 pub async fn add_plugin_directive(project: &BundlerProject, dry_run: bool) -> Vec<GemEditResult> {
+    if let BundlerProbe::Unsupported { version, source } = probe_bundler(project).await {
+        return vec![GemEditResult {
+            kind: "gemfile",
+            path: project.gemfile.display().to_string(),
+            status: GemSetupStatus::Error,
+            error: Some(unsupported_bundler_message(&version, &source)),
+        }];
+    }
     let files = add_plugin_files(&project.root, dry_run).await;
     if files.status == GemSetupStatus::Error {
         return vec![files];

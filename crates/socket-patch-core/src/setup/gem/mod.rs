@@ -33,6 +33,7 @@
 //! with a published `socket-patch-bundler` gem.
 
 mod update;
+mod version;
 
 use std::path::{Path, PathBuf};
 
@@ -42,6 +43,7 @@ pub use update::{
     add_plugin_directive, is_plugin_directive_present, remove_plugin_directive, GemEditResult,
     GemSetupStatus,
 };
+pub use version::{probe_bundler, unsupported_bundler_message, BundlerProbe, MIN_BUNDLER};
 
 /// The in-tree plugin directory, relative to the project root.
 const PLUGIN_DIR: &str = ".socket/bundler-plugin";
