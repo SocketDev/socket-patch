@@ -11,7 +11,10 @@ use std::path::Path;
 use tokio::fs;
 
 use super::version::{probe_bundler, unsupported_bundler_message, BundlerProbe};
-use super::{add_plugin_files, remove_plugin_files, BundlerProject};
+use super::{
+    add_plugin_files, remove_plugin_files, remove_plugin_registration_at, BundlerProject,
+    GemRegistrationCleanup,
+};
 use crate::utils::fs::atomic_write_bytes_preserving_mode;
 
 /// Outcome of one setup edit.
@@ -24,7 +27,8 @@ pub enum GemSetupStatus {
 
 #[derive(Debug)]
 pub struct GemEditResult {
-    /// Envelope `files[].kind` (`gemfile` | `gem_plugin`).
+    /// Envelope `files[].kind` (`gemfile` | `gem_plugin` |
+    /// `gem_plugin_registration`).
     pub kind: &'static str,
     pub path: String,
     pub status: GemSetupStatus,
@@ -261,22 +265,68 @@ pub async fn add_plugin_directive(project: &BundlerProject, dry_run: bool) -> Ve
 }
 
 /// Unwire the project: strip the Gemfile block (byte-for-byte restore), then
-/// delete the generated plugin directory.
+/// delete the generated plugin directory, then clear bundler's machine-local
+/// `.bundle/plugin` registration of the plugin.
 ///
 /// Mirror of [`add_plugin_directive`]'s ordering contract, from the other end:
 /// the files are deleted only once the directive referencing them is gone. A
 /// failed un-wire that still deleted the plugin dir would leave the Gemfile
 /// pointing at a path that no longer exists, breaking every later
 /// `bundle install` (exit 13) on a project that installed fine before.
+///
+/// The registration comes last (and only after the Gemfile un-wire held):
+/// while the `plugin` directive is still in the Gemfile the registration is
+/// live state bundler needs, not residue. Left behind after a successful
+/// unwire, it makes every later `bundle install` print bundler's "plugin
+/// paths don't exist ... Continuing without installing plugin socket-patch"
+/// block forever, so the cleanup failure/refusal path surfaces the
+/// `bundler plugin uninstall socket-patch` remedy as a `files[]` error.
 pub async fn remove_plugin_directive(
     project: &BundlerProject,
+    dry_run: bool,
+) -> Vec<GemEditResult> {
+    let env = std::env::var_os("BUNDLE_APP_CONFIG");
+    remove_plugin_directive_at(project, env.as_deref(), dry_run).await
+}
+
+/// [`remove_plugin_directive`] with the `BUNDLE_APP_CONFIG` resolution input
+/// made explicit (tests inject it so a machine's exported value — e.g. the
+/// official ruby images' `/usr/local/bundle` — can neither fail them
+/// spuriously nor point the cleanup at a real machine-local index; the public
+/// entry reads the process env, exactly like bundler itself).
+async fn remove_plugin_directive_at(
+    project: &BundlerProject,
+    app_config_env: Option<&std::ffi::OsStr>,
     dry_run: bool,
 ) -> Vec<GemEditResult> {
     let gemfile = edit_gemfile_remove(&project.gemfile, dry_run).await;
     if gemfile.status == GemSetupStatus::Error {
         return vec![gemfile];
     }
-    vec![gemfile, remove_plugin_files(&project.root, dry_run).await]
+    let mut results = vec![gemfile, remove_plugin_files(&project.root, dry_run).await];
+    match remove_plugin_registration_at(&project.root, app_config_env, dry_run).await {
+        GemRegistrationCleanup::Cleaned { index } => results.push(GemEditResult {
+            kind: "gem_plugin_registration",
+            path: index.display().to_string(),
+            status: GemSetupStatus::Updated,
+            error: None,
+        }),
+        // The common pre-first-install case (bundler never registered the
+        // plugin): no entry — there was nothing machine-local to remove.
+        GemRegistrationCleanup::NotRegistered => {}
+        GemRegistrationCleanup::Residue { index, reason } => results.push(GemEditResult {
+            kind: "gem_plugin_registration",
+            path: index.display().to_string(),
+            status: GemSetupStatus::Error,
+            error: Some(format!(
+                "could not clear bundler's machine-local plugin registration at {} \
+                 ({reason}); run `bundler plugin uninstall socket-patch` to remove it, \
+                 or every later `bundle install` will warn about the unwired plugin",
+                index.display()
+            )),
+        }),
+    }
+    results
 }
 
 #[cfg(test)]
@@ -721,7 +771,7 @@ mod tests {
             .await
             .unwrap();
 
-        let results = remove_plugin_directive(&project, false).await;
+        let results = remove_plugin_directive_at(&project, None, false).await;
 
         // Restore before any assertion can unwind, so the tempdir cleans up.
         fs::set_permissions(root, std::fs::Permissions::from_mode(0o755))
@@ -894,6 +944,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_remove_clears_bundler_plugin_registration_entry() {
+        // A project bundler has already installed once: the machine-local
+        // `.bundle/plugin/index` registration exists. `remove` must clear it
+        // and report the cleanup as its own `gem_plugin_registration` entry.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("Gemfile"), GEMFILE).await.unwrap();
+        let project = super::super::discover_bundler_project(root).await.unwrap();
+        assert!(add_plugin_directive(&project, false)
+            .await
+            .iter()
+            .all(|r| r.status == GemSetupStatus::Updated));
+        let index = root.join(".bundle").join("plugin").join("index");
+        fs::create_dir_all(index.parent().unwrap()).await.unwrap();
+        fs::write(
+            &index,
+            format!(
+                "---\ncommands:\nhooks:\n  after-install:\n  - \"socket-patch\"\n  \
+                 after-install-all:\n  - \"socket-patch\"\nload_paths:\n  socket-patch:\n  \
+                 - \"{0}/.socket/bundler-plugin/.\"\nplugin_paths:\n  \
+                 socket-patch: \"{0}/.socket/bundler-plugin\"\nsources:\n",
+                root.display()
+            ),
+        )
+        .await
+        .unwrap();
+
+        let removed = remove_plugin_directive_at(&project, None, false).await;
+        assert!(
+            removed
+                .iter()
+                .any(|r| r.kind == "gem_plugin_registration"
+                    && r.status == GemSetupStatus::Updated),
+            "the registration cleanup must be reported: {removed:?}"
+        );
+        assert!(
+            !index.exists(),
+            "the socket-patch-only registration index must be gone"
+        );
+        // Absent registration (the pre-first-install case): no entry at all.
+        fs::write(root.join("Gemfile"), gemfile_add(GEMFILE).unwrap())
+            .await
+            .unwrap();
+        assert!(add_plugin_directive(&project, false)
+            .await
+            .iter()
+            .all(|r| r.status != GemSetupStatus::Error));
+        let removed = remove_plugin_directive_at(&project, None, false).await;
+        assert!(
+            removed.iter().all(|r| r.kind != "gem_plugin_registration"),
+            "no machine-local registration -> no registration entry: {removed:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_full_roundtrip_via_project() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -913,7 +1018,7 @@ mod tests {
             .iter()
             .all(|r| r.status == GemSetupStatus::AlreadyConfigured));
 
-        let removed = remove_plugin_directive(&project, false).await;
+        let removed = remove_plugin_directive_at(&project, None, false).await;
         assert!(removed.iter().all(|r| r.status == GemSetupStatus::Updated));
         assert_eq!(
             fs::read_to_string(root.join("Gemfile")).await.unwrap(),

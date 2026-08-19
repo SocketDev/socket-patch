@@ -349,6 +349,16 @@ pub async fn revert_yarn_classic(
         }
     }
 
+    // LOSSINESS GUARD (residual #131): when any wiring record was left
+    // alone ("drifted; left alone"), the uuid dir may hold the only copy of
+    // what the lock — or the redirect ledger's recorded originals — still
+    // points at. Keep it (and let the CLI keep the ledger entry) instead of
+    // deleting evidence out from under a lock we just refused to touch.
+    if outcome.drift_skipped() {
+        outcome.keep_artifact(&uuid_dir_rel);
+        return outcome;
+    }
+
     if let Err(e) = remove_tree(&project_root.join(&uuid_dir_rel)).await {
         return RevertOutcome::failed(format!("cannot remove {uuid_dir_rel}: {e}"));
     }
@@ -389,15 +399,35 @@ pub(super) fn revert_recorded_block(
         ));
         return false;
     }
+    // The recorded pre-vendor block (key line first), used both for the
+    // restore and for the ALREADY-CONVERGED checks below.
+    let orig_lines = rec.original.as_ref().and_then(json_to_lines);
     let edit = {
         let blocks = scan_blocks(text);
         let Some(block) = blocks.iter().find(|b| b.key == key) else {
+            // ALREADY CONVERGED: an earlier partial revert restored this
+            // record, and the restore rekeyed the block (berry's `file:`
+            // locator key reverts to the pre-vendor descriptor), so the
+            // recorded key no longer matches while the original block is
+            // live verbatim. Not drift: stay silent so the drift-skip keep
+            // gate can converge instead of keeping the artifacts forever.
+            if let Some(orig) = orig_lines.as_ref() {
+                if blocks.iter().any(|b| &b.lines == orig) {
+                    return false;
+                }
+            }
             warnings.push(VendorWarning::new(
                 "vendor_lock_entry_drifted",
                 format!("{noun} `{key}` no longer exists; nothing to restore"),
             ));
             return false;
         };
+        // ALREADY CONVERGED: the live block equals the recorded pre-vendor
+        // original — an earlier partial revert (or the user, by hand)
+        // already restored it in place. Not drift.
+        if orig_lines.as_ref() == Some(&block.lines) {
+            return false;
+        }
         // Ownership gate: the live block's vendor field must still point
         // into OUR uuid dir — anything else means a third party re-resolved
         // it.
@@ -411,7 +441,7 @@ pub(super) fn revert_recorded_block(
             ));
             return false;
         }
-        let Some(original) = rec.original.as_ref().and_then(json_to_lines) else {
+        let Some(original) = orig_lines else {
             // The record rewrote one of our own earlier edits, so there is
             // no pre-vendor fragment to restore (by design). Surface it
             // instead of guessing a registry URL.
@@ -1414,10 +1444,51 @@ left-pad@^1.3.0:
             after.contains("left-pad@^1.3.0, left-pad@~1.3.0:\n  version \"1.3.0\"\n  resolved \"https://registry.yarnpkg.com/"),
             "non-drifted block restored: {after}"
         );
-        assert!(!fx
-            .root()
-            .join(format!(".socket/vendor/npm/{UUID}"))
-            .exists());
+        // Residual #131: a drift-skip keeps the artifact dir (the drifted
+        // block's recorded original may still be needed later) and says so.
+        assert!(
+            fx.root()
+                .join(format!(".socket/vendor/npm/{UUID}"))
+                .exists(),
+            "drift-skip must keep the artifact dir"
+        );
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_artifact_kept"),
+            "the keep must be surfaced: {:?}",
+            outcome.warnings
+        );
+
+        // KEEP-GATE LIVENESS: undo ONLY the drift (repoint the alias block
+        // back at the vendored tarball). The block the first revert already
+        // restored must now read as CONVERGED, not drifted — otherwise
+        // every later revert would re-classify it as drift and keep the
+        // artifacts + ledger entry forever.
+        let healed = after.replace(theirs, &ours);
+        assert_ne!(healed, after, "the undo edit must hit");
+        tokio::fs::write(fx.lock_path(), healed).await.unwrap();
+
+        let outcome = revert_yarn_classic(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(
+            outcome.warnings.is_empty(),
+            "the already-restored block is converged, not drifted: {:?}",
+            outcome.warnings
+        );
+        assert!(!outcome.kept_artifact);
+        assert_eq!(
+            tokio::fs::read(fx.lock_path()).await.unwrap(),
+            fx.lock_bytes,
+            "lock restored byte-for-byte"
+        );
+        assert!(
+            !fx.root()
+                .join(format!(".socket/vendor/npm/{UUID}"))
+                .exists(),
+            "artifact pruned once the revert converges"
+        );
     }
 
     #[tokio::test]

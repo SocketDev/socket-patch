@@ -97,6 +97,13 @@ mod host_guard {
     /// explicit flags alone — nothing reaches authed endpoints and no ambient
     /// var can stand in for a flag.
     fn run(cwd: &Path, args: &[&str]) -> (i32, String, String) {
+        run_env(cwd, args, &[])
+    }
+
+    /// [`run`] with extra environment variables for the child (e.g. bundler's
+    /// `BUNDLE_APP_CONFIG`, which relocates the machine-local registration
+    /// `--remove` must clean).
+    fn run_env(cwd: &Path, args: &[&str], envs: &[(&str, &str)]) -> (i32, String, String) {
         let mut cmd = Command::new(binary());
         cmd.args(args).current_dir(cwd);
         // Prefix-scrub the whole ambient `SOCKET_*` surface (mirrors
@@ -119,6 +126,13 @@ mod host_guard {
         // would strip a developer's own opt-out. Force it off for the child —
         // no assertion here concerns telemetry.
         cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
+        // An ambient BUNDLE_APP_CONFIG would relocate where `--remove` looks
+        // for bundler's plugin registration — strip it so only the explicit
+        // per-test env below can steer that resolution.
+        cmd.env_remove("BUNDLE_APP_CONFIG");
+        for (k, v) in envs {
+            cmd.env(k, v);
+        }
         let out = cmd.output().expect("failed to execute socket-patch binary");
         (
             out.status.code().unwrap_or(-1),
@@ -313,6 +327,28 @@ mod host_guard {
         // A stamp left behind by a previous apply: `--remove`'s no-residue
         // contract covers it (it sits in the committed .socket/ dir).
         std::fs::write(root.join(".socket/gem-plugin-stamp"), "e".repeat(64)).unwrap();
+        // Bundler's machine-local plugin registration, exactly as the first
+        // `bundle install` after `setup` writes it (bundler's YAMLSerializer
+        // dialect, verified against bundler 2.7.2 / 4.0.18): the hook
+        // subscriptions + load/plugin paths in `.bundle/plugin/index`.
+        // `--remove` must clear it too — a dangling registration makes every
+        // later `bundle install` print bundler's "The following plugin paths
+        // don't exist ... Continuing without installing plugin socket-patch"
+        // block (with a misleading reinstall suggestion) forever.
+        let plugin_reg_dir = root.join(".bundle").join("plugin");
+        std::fs::create_dir_all(&plugin_reg_dir)
+            .expect("create the bundler plugin registration dir");
+        let index_path = plugin_reg_dir.join("index");
+        std::fs::write(
+            &index_path,
+            format!(
+                "---\ncommands:\nhooks:\n  after-install:\n  - \"socket-patch\"\n  \
+                 after-install-all:\n  - \"socket-patch\"\nload_paths:\n  socket-patch:\n  \
+                 - \"{root_s}/.socket/bundler-plugin/.\"\nplugin_paths:\n  \
+                 socket-patch: \"{root_s}/.socket/bundler-plugin\"\nsources:\n"
+            ),
+        )
+        .expect("write the bundler plugin index fixture");
         let (code, out, err) = run(
             root,
             &["setup", "--remove", "--cwd", root_s, "--yes", "--json"],
@@ -341,6 +377,23 @@ mod host_guard {
         assert!(
             !root.join(".socket/.gitignore").exists(),
             "remove must delete the .gitignore setup created (it held only our line)"
+        );
+        // The machine-local registration must be gone too. socket-patch was
+        // the ONLY registered plugin, so nothing in the index is left worth
+        // keeping — the index (and thereby every socket-patch entry) must not
+        // survive.
+        let residue = std::fs::read_to_string(&index_path).unwrap_or_default();
+        assert!(
+            !residue.contains("socket-patch"),
+            "remove must clear bundler's machine-local plugin registration \
+             (.bundle/plugin/index) — a dangling entry makes every later \
+             `bundle install` warn \"plugin paths don't exist ... Continuing \
+             without installing plugin socket-patch\":\n{residue}"
+        );
+        assert!(
+            !index_path.exists(),
+            "socket-patch was the only registered plugin: the emptied index \
+             must be deleted, not left as an all-empty husk"
         );
 
         // ── check (after remove): needs_configuration again, exit 1 ─────────
@@ -473,6 +526,89 @@ mod host_guard {
         assert_eq!(code, 0, "recovery remove must work.\n{out}\n{err}");
         assert_eq!(gemfile_body(root), GEMFILE, "Gemfile restored");
         assert!(!root.join(PLUGIN_DIR).exists(), "plugin dir removed");
+    }
+
+    /// `setup --remove` must clear bundler's machine-local plugin
+    /// registration SURGICALLY: only the socket-patch entries leave the
+    /// index; another plugin's registration (its hook subscriptions and
+    /// paths) survives byte-intact. And the index location must follow
+    /// bundler's own `BUNDLE_APP_CONFIG` resolution — a relative value
+    /// resolves against the project root (`Bundler.app_config_path`), not
+    /// the process cwd or a hardcoded `.bundle`.
+    #[test]
+    fn gem_setup_remove_strips_registration_surgically_under_bundle_app_config() {
+        let tmp = tempfile::tempdir().expect("create tempdir for the test project");
+        let root = tmp.path();
+        std::fs::write(root.join("Gemfile"), GEMFILE).expect("write the fixture Gemfile");
+        let root_s = root.to_str().expect("tempdir path is UTF-8");
+
+        // Wire the project (the registration below is what bundler would
+        // write on the first `bundle install` after this).
+        let (code, out, err) = run_env(
+            root,
+            &["setup", "--cwd", root_s, "--yes", "--json"],
+            &[("BUNDLE_APP_CONFIG", "bundle-config")],
+        );
+        assert_eq!(code, 0, "setup must exit 0.\n{out}\n{err}");
+
+        // The registration lives under the RELATIVE app-config dir, resolved
+        // against the project root — bundler's own resolution rule.
+        let plugin_reg_dir = root.join("bundle-config").join("plugin");
+        std::fs::create_dir_all(&plugin_reg_dir)
+            .expect("create the bundler plugin registration dir");
+        let index_path = plugin_reg_dir.join("index");
+        std::fs::write(
+            &index_path,
+            format!(
+                "---\ncommands:\nhooks:\n  after-install:\n  - \"other-plugin\"\n  \
+                 - \"socket-patch\"\n  after-install-all:\n  - \"socket-patch\"\n  \
+                 before-install-all:\n  - \"other-plugin\"\nload_paths:\n  other-plugin:\n  \
+                 - \"{root_s}/plugins/other-plugin/.\"\n  socket-patch:\n  \
+                 - \"{root_s}/.socket/bundler-plugin/.\"\nplugin_paths:\n  \
+                 other-plugin: \"{root_s}/plugins/other-plugin\"\n  \
+                 socket-patch: \"{root_s}/.socket/bundler-plugin\"\nsources:\n"
+            ),
+        )
+        .expect("write the bundler plugin index fixture");
+
+        let (code, out, err) = run_env(
+            root,
+            &["setup", "--remove", "--cwd", root_s, "--yes", "--json"],
+            &[("BUNDLE_APP_CONFIG", "bundle-config")],
+        );
+        assert_eq!(code, 0, "remove must exit 0.\n{out}\n{err}");
+        assert_eq!(
+            json_str(&parse_json(&out, "remove"), "status", "remove"),
+            "success"
+        );
+
+        let index = std::fs::read_to_string(&index_path).unwrap_or_else(|e| {
+            panic!(
+                "the index must SURVIVE (another plugin is still registered), \
+                 not be deleted wholesale: {e}"
+            )
+        });
+        assert!(
+            !index.contains("socket-patch"),
+            "every socket-patch registration entry must be stripped:\n{index}"
+        );
+        for kept in [
+            "  after-install:\n  - \"other-plugin\"",
+            "  before-install-all:\n  - \"other-plugin\"",
+            &format!("  other-plugin:\n  - \"{root_s}/plugins/other-plugin/.\"") as &str,
+            &format!("  other-plugin: \"{root_s}/plugins/other-plugin\"") as &str,
+        ] {
+            assert!(
+                index.contains(kept),
+                "the OTHER plugin's registration must survive verbatim — \
+                 missing {kept:?} in:\n{index}"
+            );
+        }
+        assert!(
+            !index.contains("after-install-all:"),
+            "a hook event left with NO subscribers must be dropped, not left \
+             as an empty key bundler chokes on:\n{index}"
+        );
     }
 
     /// `bundle` resolves the Gemfile by walking UP from the invocation dir,
@@ -1101,6 +1237,79 @@ mod plugin_runtime {
             "a fully-cached install runs exactly the one forced \
              after-install-all apply; the digest-gated triggers must not \
              shell out again"
+        );
+    }
+
+    /// [P2 remove leaves registration dangling] Bundler records the plugin
+    /// machine-locally at first install (`.bundle/plugin/index`: hook
+    /// subscriptions + plugin/load paths). `setup --remove` unwires the
+    /// Gemfile and deletes the generated plugin dir — if it leaves that
+    /// registration behind, EVERY later `bundle install` prints bundler's
+    /// 5-line "The following plugin paths don't exist ... Continuing without
+    /// installing plugin socket-patch" block with a misleading reinstall
+    /// suggestion (install still exits 0, so nothing ever heals it).
+    /// Reproduced against real bundler 2.7.2 and 4.0.18 in the 2026-08 e2e
+    /// campaign; this drives the same flow with the host bundler.
+    #[test]
+    fn setup_remove_clears_bundler_plugin_registration() {
+        if !have("bundle") {
+            eprintln!("skip plugin_runtime: bundler not on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("create tempdir for the test project");
+        let root = tmp.path();
+        scaffold(root);
+        let (fake, _log) = write_fake_apply(root, 0);
+
+        // First install: bundler registers the plugin machine-locally.
+        let (code, out, err) = bundle_install(root, &fake, &[]);
+        assert_eq!(code, 0, "wired install must succeed.\n{out}\n{err}");
+        let index_path = root.join(".bundle/plugin/index");
+        assert!(
+            std::fs::read_to_string(&index_path)
+                .unwrap_or_default()
+                .contains("socket-patch"),
+            "precondition: bundler must have registered the plugin at {}",
+            index_path.display()
+        );
+
+        // Unwire.
+        let mut cmd = Command::new(binary());
+        cmd.args(["setup", "--remove", "--yes", "--json"])
+            .current_dir(root);
+        scrub(&mut cmd);
+        let (code, out, err) = run(cmd);
+        assert_eq!(code, 0, "setup --remove must exit 0.\n{out}\n{err}");
+        assert!(
+            out.contains("\"status\": \"success\""),
+            "setup --remove must report success:\n{out}"
+        );
+
+        // No socket-patch registration may survive under .bundle/plugin.
+        let residue = std::fs::read_to_string(&index_path).unwrap_or_default();
+        assert!(
+            !residue.contains("socket-patch"),
+            ".bundle/plugin must hold no socket-patch entry after remove:\n{residue}"
+        );
+
+        // And the REAL oracle: the next bundle install is silent about the
+        // unwired plugin — no "plugin paths don't exist", no "Continuing
+        // without installing plugin", on either stream.
+        let (code, out, err) = bundle_install(root, &fake, &[]);
+        assert_eq!(
+            code, 0,
+            "post-remove install must still succeed.\n{out}\n{err}"
+        );
+        let combined = format!("{out}\n{err}");
+        assert!(
+            !combined.contains("plugin paths don't exist"),
+            "post-remove `bundle install` must not warn about the unwired \
+             plugin's missing paths:\n{combined}"
+        );
+        assert!(
+            !combined.contains("Continuing without installing plugin"),
+            "post-remove `bundle install` must not print bundler's \
+             skipped-plugin block:\n{combined}"
         );
     }
 

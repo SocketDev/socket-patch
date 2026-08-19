@@ -700,6 +700,7 @@ pub(super) async fn revert_uv(entry: &VendorEntry, root: &Path, dry_run: bool) -
         // Reverse of the wire order: the lock first, then the pyproject.
         if let Err(e) = atomic_write_bytes_preserving_mode(&lock_path, lock_text.as_bytes()).await {
             return RevertOutcome {
+                kept_artifact: false,
                 success: false,
                 warnings,
                 error: Some(format!("cannot write uv.lock: {e}")),
@@ -709,6 +710,7 @@ pub(super) async fn revert_uv(entry: &VendorEntry, root: &Path, dry_run: bool) -
             atomic_write_bytes_preserving_mode(&pyproject_path, pyproject_text.as_bytes()).await
         {
             return RevertOutcome {
+                kept_artifact: false,
                 success: false,
                 warnings,
                 error: Some(format!("cannot write pyproject.toml: {e}")),
@@ -716,6 +718,7 @@ pub(super) async fn revert_uv(entry: &VendorEntry, root: &Path, dry_run: bool) -
         }
     }
     RevertOutcome {
+        kept_artifact: false,
         success: true,
         warnings,
         error: None,

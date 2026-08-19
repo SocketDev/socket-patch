@@ -1032,3 +1032,492 @@ fn detached_vendor_matrix_attests_every_vendor_ecosystem() {
         );
     }
 }
+
+// ──────────────────────────────────────────────────────────────────────
+// 7. live-tree disclosure — a vendored attestation with the INSTALLED tree
+// present-but-unpatched must keep the attestation (the committed artifact +
+// lock wiring is the product) while warning that the live tree is out of
+// sync. Verified against real pnpm projects 2026-08-18: the attestation was
+// silently thin-disclosed before this warning existed.
+// ──────────────────────────────────────────────────────────────────────
+
+/// Vendored npm entry (detached ledger shape so the crawler-visible
+/// installed tree is the only other evidence): the tgz artifact is healthy,
+/// `node_modules` holds the UN-patched original. The doc must attest
+/// `(vendored)`, exit 0, and the `--json` envelope must carry a
+/// `vendored_tree_out_of_sync` warning naming the purl.
+#[test]
+fn vendored_live_tree_out_of_sync_warns_but_attests() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let cwd = tmp.path();
+    let purl = "pkg:npm/lodash@4.17.21";
+    let uuid = "0a0a0a0a-1111-4111-8111-0a0a0a0a0a0a";
+
+    let patched = b"patched npm bytes\n";
+    let after_hash = compute_git_sha256_from_bytes(patched);
+    let rel = format!(".socket/vendor/npm/{uuid}/lodash-4.17.21.tgz");
+    let sha256 = sha256_hex(&write_member_tgz(
+        &cwd.join(&rel),
+        "package/index.js",
+        patched,
+    ));
+    let record = make_record(
+        uuid,
+        "package/index.js",
+        &after_hash,
+        "GHSA-sync-aaaa",
+        &["CVE-2026-10"],
+    );
+    let mut state = VendorState::new();
+    state.entries.insert(
+        purl.to_string(),
+        detached_matrix_entry("npm", purl, uuid, &rel, sha256, record),
+    );
+    let dir = cwd.join(".socket/vendor");
+    std::fs::create_dir_all(&dir).expect("create .socket/vendor");
+    std::fs::write(
+        dir.join("state.json"),
+        serde_json::to_string_pretty(&state).expect("serialize vendor state"),
+    )
+    .expect("write vendor state.json");
+
+    // Installed tree: present and PRISTINE-UNPATCHED (the drift being
+    // disclosed — e.g. a fresh `pnpm install` that bypassed the wiring).
+    let nm = cwd.join("node_modules/lodash");
+    std::fs::create_dir_all(&nm).expect("create node_modules entry");
+    std::fs::write(
+        nm.join("package.json"),
+        r#"{"name":"lodash","version":"4.17.21"}"#,
+    )
+    .expect("write package.json");
+    std::fs::write(nm.join("index.js"), b"original unpatched bytes\n").expect("write index.js");
+
+    let vex_path = cwd.join("out.vex.json");
+    let out = cli()
+        .args([
+            "vex",
+            "--cwd",
+            cwd.to_str().unwrap(),
+            "--json",
+            "--output",
+            vex_path.to_str().unwrap(),
+            "--product",
+            "pkg:npm/app@1.0.0",
+        ])
+        .output()
+        .expect("invoke vex");
+    assert!(
+        out.status.success(),
+        "an out-of-sync LIVE tree must not block the vendored attestation. stdout:\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    let env: Value = serde_json::from_slice(&out.stdout).expect("envelope JSON on stdout");
+    assert_eq!(env["status"], "success", "{env}");
+    let warnings = env["warnings"]
+        .as_array()
+        .unwrap_or_else(|| panic!("envelope must carry warnings[]: {env}"));
+    let w = warnings
+        .iter()
+        .find(|w| w["code"] == "vendored_tree_out_of_sync")
+        .unwrap_or_else(|| panic!("expected a vendored_tree_out_of_sync warning: {env}"));
+    assert!(
+        w["detail"].as_str().unwrap().contains(purl),
+        "the warning must name the drifted purl: {w}"
+    );
+
+    // The doc still attests, with the (vendored) provenance marker intact.
+    let doc: Value =
+        serde_json::from_str(&std::fs::read_to_string(&vex_path).expect("read emitted VEX doc"))
+            .expect("parse emitted VEX doc");
+    let stmts = doc["statements"].as_array().unwrap();
+    assert_eq!(stmts.len(), 1, "{doc}");
+    assert_eq!(stmts[0]["status"], "not_affected");
+    assert_eq!(
+        stmts[0]["impact_statement"].as_str().unwrap(),
+        format!("Patched via Socket patch {uuid} (vendored)")
+    );
+
+    // Human-mode control: the same drift prints a stderr `Warning:` with
+    // the resync advice (the `--json` run above suppresses stderr chrome).
+    let human = cli()
+        .args([
+            "vex",
+            "--cwd",
+            cwd.to_str().unwrap(),
+            "--product",
+            "pkg:npm/app@1.0.0",
+        ])
+        .output()
+        .expect("invoke vex");
+    assert!(human.status.success());
+    let stderr = String::from_utf8_lossy(&human.stderr);
+    assert!(
+        stderr.contains("Warning:") && stderr.contains("vendored artifact"),
+        "human mode must disclose the out-of-sync tree; got {stderr:?}"
+    );
+
+    // Absent-tree control: remove node_modules — the expected post-vendor
+    // state — and the warning must disappear while the attestation stays.
+    std::fs::remove_dir_all(cwd.join("node_modules")).expect("remove node_modules");
+    let absent = cli()
+        .args([
+            "vex",
+            "--cwd",
+            cwd.to_str().unwrap(),
+            "--json",
+            "--output",
+            vex_path.to_str().unwrap(),
+            "--product",
+            "pkg:npm/app@1.0.0",
+        ])
+        .output()
+        .expect("invoke vex");
+    assert!(absent.status.success());
+    let env: Value = serde_json::from_slice(&absent.stdout).expect("envelope JSON on stdout");
+    assert!(
+        env["warnings"].is_null(),
+        "an absent installed tree is the expected post-vendor state — no warning: {env}"
+    );
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// 8. property-7 filter drops are machine-visible — a byte-verified applied
+// patch omitted ONLY by the ecosystem-setup filter must surface as a
+// per-purl skipped event (errorCode `ecosystem_not_setup`), and an all-
+// drops failure must say so in the top-level error message instead of the
+// generic (and factually wrong) "No applied patches ... to attest."
+// Confirmed against real pnpm projects 2026-08-18.
+// ──────────────────────────────────────────────────────────────────────
+
+/// All-drops case: the ONLY patch is applied + byte-verified but its
+/// ecosystem is neither set up nor `manual`. Exit stays 1 with code
+/// `no_applicable_patches`, but the envelope must carry the skipped event
+/// and the message must name the setup filter. A stale OpenVEX doc parked
+/// at `--output` from a previous run must also be removed — a failed run
+/// leaves no attestation behind.
+#[test]
+fn setup_filter_drop_surfaces_skipped_event_and_removes_stale_doc() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let cwd = tmp.path();
+    let purl = "pkg:npm/applied-pkg@1.0.0";
+
+    // Applied + verifiable in node_modules; no root package.json → no npm
+    // hook configured; manifest carries NO setup section.
+    let nm = cwd.join("node_modules/applied-pkg");
+    std::fs::create_dir_all(&nm).expect("create node_modules entry");
+    std::fs::write(
+        nm.join("package.json"),
+        r#"{"name":"applied-pkg","version":"1.0.0"}"#,
+    )
+    .expect("write package.json");
+    let patched = b"patched npm index";
+    let after = compute_git_sha256_from_bytes(patched);
+    std::fs::write(nm.join("index.js"), patched).expect("write patched index.js");
+
+    let mut manifest = PatchManifest::new();
+    manifest.patches.insert(
+        purl.to_string(),
+        make_record(
+            "11111111-1111-4111-8111-111111111111",
+            "package/index.js",
+            &after,
+            "GHSA-drop-aaaa",
+            &["CVE-2026-20"],
+        ),
+    );
+    write_manifest(cwd, &manifest, false);
+
+    // A previous successful run's doc sits at --output.
+    let vex_path = cwd.join("out.vex.json");
+    std::fs::write(
+        &vex_path,
+        r#"{"@context":"https://openvex.dev/ns/v0.2.0","@id":"urn:uuid:stale","author":"Socket","timestamp":"2020-01-01T00:00:00Z","version":1,"statements":[]}"#,
+    )
+    .expect("write stale VEX doc");
+
+    let out = cli()
+        .args([
+            "vex",
+            "--cwd",
+            cwd.to_str().unwrap(),
+            "--json",
+            "--output",
+            vex_path.to_str().unwrap(),
+            "--product",
+            "pkg:npm/app@1.0.0",
+        ])
+        .output()
+        .expect("invoke vex");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "all patches filtered ⇒ soft exit 1. stdout:\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    let env: Value = serde_json::from_slice(&out.stdout).expect("envelope JSON on stdout");
+    assert_eq!(env["status"], "error", "{env}");
+    assert_eq!(env["error"]["code"], "no_applicable_patches", "{env}");
+    // The message must name the ACTUAL cause — the patch IS applied with
+    // vulnerability metadata; only the setup filter dropped it.
+    let msg = env["error"]["message"].as_str().unwrap();
+    assert!(
+        msg.contains("not set up") && msg.contains("setup.manual"),
+        "an all-drops failure must name the setup filter, got {msg:?}"
+    );
+    // Machine-visible per-purl drop.
+    let events = env["events"].as_array().unwrap();
+    let skipped = events
+        .iter()
+        .find(|e| e["action"] == "skipped" && e["purl"] == purl)
+        .unwrap_or_else(|| panic!("expected a skipped event for the filtered purl: {env}"));
+    assert_eq!(
+        skipped["errorCode"], "ecosystem_not_setup",
+        "the filter drop must carry its routing tag: {skipped}"
+    );
+    // Failed-run hygiene: the stale prior doc must be gone.
+    assert!(
+        !vex_path.exists(),
+        "a failed run must not leave a previous run's attestation at --output"
+    );
+}
+
+/// Partial case: a vendored patch attests while an npm patch is filter-
+/// dropped. Exit 0 (a doc was produced), envelope `partialFailure`, and the
+/// drop is a skipped event alongside the vendored purl's verified event.
+#[test]
+fn setup_filter_drop_alongside_success_is_partial_failure_event() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let cwd = tmp.path();
+    let vendored_purl = "pkg:cargo/serde@1.0.0";
+    let dropped_purl = "pkg:npm/applied-pkg@1.0.0";
+
+    let patched = b"patched vendored source\n";
+    let after_hash = compute_git_sha256_from_bytes(patched);
+    let rel = write_vendored_dir(cwd, patched);
+    write_vendor_state(cwd, vendored_purl, &rel);
+
+    let nm = cwd.join("node_modules/applied-pkg");
+    std::fs::create_dir_all(&nm).expect("create node_modules entry");
+    std::fs::write(
+        nm.join("package.json"),
+        r#"{"name":"applied-pkg","version":"1.0.0"}"#,
+    )
+    .expect("write package.json");
+    let npm_patched = b"patched npm index";
+    let npm_after = compute_git_sha256_from_bytes(npm_patched);
+    std::fs::write(nm.join("index.js"), npm_patched).expect("write patched index.js");
+
+    let mut manifest = PatchManifest::new();
+    manifest.patches.insert(
+        vendored_purl.to_string(),
+        make_record(
+            UUID,
+            "src/lib.rs",
+            &after_hash,
+            "GHSA-keep-aaaa",
+            &["CVE-2026-21"],
+        ),
+    );
+    manifest.patches.insert(
+        dropped_purl.to_string(),
+        make_record(
+            "11111111-1111-4111-8111-111111111111",
+            "package/index.js",
+            &npm_after,
+            "GHSA-drop-bbbb",
+            &["CVE-2026-22"],
+        ),
+    );
+    write_manifest(cwd, &manifest, false);
+
+    let vex_path = cwd.join("out.vex.json");
+    let out = cli()
+        .args([
+            "vex",
+            "--cwd",
+            cwd.to_str().unwrap(),
+            "--json",
+            "--output",
+            vex_path.to_str().unwrap(),
+            "--product",
+            "pkg:cargo/app@1.0.0",
+        ])
+        .output()
+        .expect("invoke vex");
+    assert!(
+        out.status.success(),
+        "a produced doc keeps exit 0 even with filter drops. stdout:\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    let env: Value = serde_json::from_slice(&out.stdout).expect("envelope JSON on stdout");
+    assert_eq!(
+        env["status"], "partialFailure",
+        "an omission alongside a success is partialFailure: {env}"
+    );
+    let events = env["events"].as_array().unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|e| e["action"] == "verified" && e["purl"] == vendored_purl),
+        "the vendored purl must attest: {env}"
+    );
+    let skipped = events
+        .iter()
+        .find(|e| e["action"] == "skipped" && e["purl"] == dropped_purl)
+        .unwrap_or_else(|| panic!("expected a skipped event for the filtered purl: {env}"));
+    assert_eq!(skipped["errorCode"], "ecosystem_not_setup", "{skipped}");
+
+    // The doc holds exactly the vendored statement.
+    let doc: Value =
+        serde_json::from_str(&std::fs::read_to_string(&vex_path).expect("read emitted VEX doc"))
+            .expect("parse emitted VEX doc");
+    assert_eq!(doc["statements"].as_array().unwrap().len(), 1, "{doc}");
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// 9. `--product` / `--output` UX pins (shared vex pipeline; exercised here
+// against the vendored fixture)
+// ──────────────────────────────────────────────────────────────────────
+
+/// A non-IRI `--product` override is accepted verbatim (help text promises
+/// "PURL/identifier") but must warn — envelope `warnings[]` in `--json`
+/// mode — since the OpenVEX product @id is spec-typed as an IRI. A PURL
+/// override must stay silent.
+#[test]
+fn product_override_non_iri_warns_in_envelope() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let cwd = tmp.path();
+    let purl = "pkg:cargo/serde@1.0.0";
+
+    let patched = b"patched vendored source\n";
+    let after_hash = compute_git_sha256_from_bytes(patched);
+    let rel = write_vendored_dir(cwd, patched);
+    write_vendor_state(cwd, purl, &rel);
+    let mut manifest = PatchManifest::new();
+    manifest.patches.insert(
+        purl.to_string(),
+        make_record(
+            UUID,
+            "src/lib.rs",
+            &after_hash,
+            "GHSA-iri-aaaa",
+            &["CVE-2026-30"],
+        ),
+    );
+    write_manifest(cwd, &manifest, true);
+
+    let vex_path = cwd.join("out.vex.json");
+    let out = cli()
+        .args([
+            "vex",
+            "--cwd",
+            cwd.to_str().unwrap(),
+            "--json",
+            "--output",
+            vex_path.to_str().unwrap(),
+            "--product",
+            "internal app name",
+        ])
+        .output()
+        .expect("invoke vex");
+    assert!(
+        out.status.success(),
+        "a non-IRI product is a warning, never a hard reject. stdout:\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let env: Value = serde_json::from_slice(&out.stdout).expect("envelope JSON on stdout");
+    let warnings = env["warnings"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected warnings[]: {env}"));
+    assert!(
+        warnings.iter().any(|w| w["code"] == "product_not_iri"),
+        "non-IRI --product must warn: {env}"
+    );
+    // Emitted verbatim — the override is honored, only advised against.
+    let doc: Value =
+        serde_json::from_str(&std::fs::read_to_string(&vex_path).expect("read emitted VEX doc"))
+            .expect("parse emitted VEX doc");
+    assert_eq!(
+        doc["statements"][0]["products"][0]["@id"], "internal app name",
+        "{doc}"
+    );
+
+    // Control: a PURL override must produce no product warning.
+    let ok = cli()
+        .args([
+            "vex",
+            "--cwd",
+            cwd.to_str().unwrap(),
+            "--json",
+            "--output",
+            vex_path.to_str().unwrap(),
+            "--product",
+            "pkg:cargo/app@1.0.0",
+        ])
+        .output()
+        .expect("invoke vex");
+    assert!(ok.status.success());
+    let env: Value = serde_json::from_slice(&ok.stdout).expect("envelope JSON on stdout");
+    assert!(
+        env["warnings"]
+            .as_array()
+            .map(|ws| ws.iter().all(|w| w["code"] != "product_not_iri"))
+            .unwrap_or(true),
+        "a PURL --product must not warn: {env}"
+    );
+}
+
+/// `--output` into a nonexistent directory must exit 2 with an error that
+/// names the path and the operation — the bare io::Error ("No such file or
+/// directory (os error 2)") diagnosed nothing.
+#[test]
+fn standalone_output_write_failure_names_path_and_exits_2() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let cwd = tmp.path();
+    let purl = "pkg:cargo/serde@1.0.0";
+
+    let patched = b"patched vendored source\n";
+    let after_hash = compute_git_sha256_from_bytes(patched);
+    let rel = write_vendored_dir(cwd, patched);
+    write_vendor_state(cwd, purl, &rel);
+    let mut manifest = PatchManifest::new();
+    manifest.patches.insert(
+        purl.to_string(),
+        make_record(
+            UUID,
+            "src/lib.rs",
+            &after_hash,
+            "GHSA-wrt-aaaa",
+            &["CVE-2026-31"],
+        ),
+    );
+    write_manifest(cwd, &manifest, true);
+
+    let bad_path = cwd.join("no-such-dir/out.vex.json");
+    let out = cli()
+        .args([
+            "vex",
+            "--cwd",
+            cwd.to_str().unwrap(),
+            "--output",
+            bad_path.to_str().unwrap(),
+            "--product",
+            "pkg:cargo/app@1.0.0",
+        ])
+        .output()
+        .expect("invoke vex");
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "write failure is a hard error. stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("failed to write VEX document") && stderr.contains("no-such-dir"),
+        "the error must name the operation and the path; got {stderr:?}"
+    );
+}

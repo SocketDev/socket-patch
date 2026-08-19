@@ -590,6 +590,16 @@ pub async fn revert_pnpm(entry: &VendorEntry, project_root: &Path, dry_run: bool
         }
     }
 
+    // LOSSINESS GUARD (residual #131): when any wiring record was left
+    // alone ("drifted; left alone"), the uuid dir may hold the only copy of
+    // what the lock — or the redirect ledger's recorded originals — still
+    // points at. Keep it (and let the CLI keep the ledger entry) instead of
+    // deleting evidence out from under a lock we just refused to touch.
+    if outcome.drift_skipped() {
+        outcome.keep_artifact(&uuid_dir_rel);
+        return outcome;
+    }
+
     if let Err(e) = remove_tree(&project_root.join(&uuid_dir_rel)).await {
         return RevertOutcome::failed(format!("cannot remove {uuid_dir_rel}: {e}"));
     }
@@ -613,6 +623,13 @@ async fn revert_workspace(
     let text = match tokio::fs::read_to_string(&path).await {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // ALREADY CONVERGED: for an Added override (no recorded
+            // original) the reverted state is "no override" — a missing
+            // file trivially satisfies it (an earlier partial revert may
+            // have deleted the scaffold we created). Not drift.
+            if rec.original.is_none() {
+                return Ok(());
+            }
             warnings.push(drifted(format!(
                 "{PNPM_WORKSPACE} is missing; the pnpm >= 11 override cannot be removed"
             )));
@@ -666,6 +683,12 @@ fn revert_ws_record(
         return;
     };
     let Some((start, end, indent)) = ws_overrides_section(lines) else {
+        // ALREADY CONVERGED: an Added override's reverted state is "no
+        // override" — the section being gone satisfies it (an earlier
+        // partial revert removed our key and pruned the section). Not drift.
+        if rec.original.is_none() {
+            return;
+        }
         warnings.push(drifted(format!(
             "{PNPM_WORKSPACE} overrides section is gone; `{key}` not removed"
         )));
@@ -677,6 +700,11 @@ fn revert_ws_record(
         };
         if k != key {
             continue;
+        }
+        // ALREADY CONVERGED: a takeover entry already restored to the
+        // user's recorded pin. Not drift.
+        if rec.original.as_ref().and_then(Value::as_str) == Some(rest.as_str()) {
+            return;
         }
         let ours = Some(rest.as_str()) == rec.new.as_ref().and_then(Value::as_str)
             || parse_vendor_path(&rest).is_some_and(|p| p.eco == "npm" && p.uuid == entry_uuid);
@@ -695,6 +723,11 @@ fn revert_ws_record(
             }
         }
         *dirty = true;
+        return;
+    }
+    // ALREADY CONVERGED: an Added override's reverted state is "no
+    // override" — an earlier partial revert already removed our key.
+    if rec.original.is_none() {
         return;
     }
     warnings.push(drifted(format!(
@@ -1791,12 +1824,29 @@ fn revert_pkg_record(
         .and_then(|p| p.get_mut("overrides"))
         .and_then(Value::as_object_mut);
     let Some(overrides) = overrides else {
+        // ALREADY CONVERGED: an Added override's reverted state is "no
+        // override" — the table being gone satisfies it (an earlier
+        // partial revert removed our key and dropped the empty table).
+        // Not drift: stay silent so the drift-skip keep gate can converge.
+        if rec.original.is_none() {
+            return;
+        }
         warnings.push(drifted(format!(
             "pnpm.overrides is gone; `{key}` not removed"
         )));
         return;
     };
     let live = overrides.get(key).and_then(Value::as_str);
+    // ALREADY CONVERGED: the live state already equals the reverted state —
+    // key absent for an Added entry, or the user's recorded pin restored in
+    // place for a takeover. Not drift.
+    let converged = match rec.original.as_ref().and_then(Value::as_str) {
+        Some(orig) => live == Some(orig),
+        None => live.is_none() && !overrides.contains_key(key),
+    };
+    if converged {
+        return;
+    }
     let ours = live.is_some_and(|v| {
         Some(v) == rec.new.as_ref().and_then(Value::as_str)
             || parse_vendor_path(v).is_some_and(|p| p.eco == "npm" && p.uuid == entry_uuid)
@@ -1857,6 +1907,13 @@ fn revert_overrides_line(
     warnings: &mut Vec<VendorWarning>,
 ) {
     let Some((start, end)) = section_bounds(lines, "overrides") else {
+        // ALREADY CONVERGED: an Added override's reverted state is "no
+        // override" — the section being gone satisfies it (an earlier
+        // partial revert removed our line and pruned the section). Not
+        // drift: stay silent so the drift-skip keep gate can converge.
+        if rec.original.is_none() {
+            return;
+        }
         warnings.push(drifted(format!(
             "overrides section is gone; `{key}` not removed"
         )));
@@ -1876,9 +1933,19 @@ fn revert_overrides_line(
         }
     }
     let Some((idx, repr, rest)) = ours_at else {
+        // ALREADY CONVERGED: an Added override's reverted state is "no
+        // override" — an earlier partial revert already removed our line.
+        if rec.original.is_none() {
+            return;
+        }
         warnings.push(drifted(format!("overrides entry `{key}` no longer exists")));
         return;
     };
+    // ALREADY CONVERGED: a takeover entry already restored to the user's
+    // recorded pin. Not drift.
+    if rec.original.as_ref().and_then(Value::as_str) == Some(rest.as_str()) {
+        return;
+    }
     let ours = Some(rest.as_str()) == rec.new.as_ref().and_then(Value::as_str)
         || parse_vendor_path(&rest).is_some_and(|p| p.eco == "npm" && p.uuid == entry_uuid);
     if !ours {
@@ -1943,9 +2010,20 @@ fn revert_importer_dep(
                 continue;
             }
             let (spec_idx, ver_idx, _) = dep_field_lines(lines, k + 1, importer.end);
-            let (Some((si, _)), Some((vi, live_ver))) = (spec_idx, ver_idx) else {
+            let (Some((si, live_spec)), Some((vi, live_ver))) = (spec_idx, ver_idx) else {
                 break;
             };
+            // ALREADY CONVERGED: both fields already equal the recorded
+            // pre-vendor original — an earlier partial revert (or the
+            // user, by hand) already restored this record. Not drift:
+            // stay silent so the drift-skip keep gate can converge.
+            if let Some(original) = rec.original.as_ref() {
+                if original.get("specifier").and_then(Value::as_str) == Some(live_spec.as_str())
+                    && original.get("version").and_then(Value::as_str) == Some(live_ver.as_str())
+                {
+                    return;
+                }
+            }
             let new_ver = rec
                 .new
                 .as_ref()
@@ -2048,6 +2126,20 @@ fn revert_block(
         *dirty = true;
         return;
     }
+    // ALREADY CONVERGED: an earlier partial revert restored this record —
+    // the splice rekeys the block back to its pre-vendor key, so the
+    // recorded `file:` key no longer matches while the original block is
+    // live verbatim. Not drift: stay silent so the drift-skip keep gate can
+    // converge instead of keeping the artifacts forever.
+    if let Some(orig) = rec.original.as_ref().and_then(value_lines) {
+        let mut j = start + 1;
+        while let Some(block) = next_block(lines, j, end) {
+            if lines[block.header..block.end] == orig[..] {
+                return;
+            }
+            j = block.end;
+        }
+    }
     warnings.push(drifted(format!(
         "{section} entry `{new_key}` no longer exists; nothing to restore"
     )));
@@ -2085,6 +2177,12 @@ fn revert_snapshot_ref(
             };
             if d != dep {
                 continue;
+            }
+            // ALREADY CONVERGED: the live ref already equals the recorded
+            // pre-vendor original — an earlier partial revert (or the
+            // user, by hand) already restored it. Not drift.
+            if rec.original.as_ref().and_then(Value::as_str) == Some(rest.as_str()) {
+                return;
             }
             let ours = Some(rest.as_str()) == rec.new.as_ref().and_then(Value::as_str)
                 || parse_vendor_path(&rest).is_some_and(|p| p.eco == "npm" && p.uuid == entry_uuid);
@@ -3976,10 +4074,65 @@ snapshots:
         );
         // Non-drifted fragments still restored.
         assert!(after.contains("  left-pad@1.3.0:\n    resolution: {integrity: sha512-XI5MPzVN"));
-        assert!(!fx
-            .root()
-            .join(format!(".socket/vendor/npm/{UUID}"))
-            .exists());
+        // Residual #131: a drift-skip keeps the artifact dir (the drifted
+        // fragment's recorded original may still be needed later) and says so.
+        assert!(
+            fx.root()
+                .join(format!(".socket/vendor/npm/{UUID}"))
+                .exists(),
+            "drift-skip must keep the artifact dir"
+        );
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_artifact_kept"),
+            "the keep must be surfaced: {:?}",
+            outcome.warnings
+        );
+
+        // KEEP-GATE LIVENESS: undo ONLY the drift (repoint the importer dep
+        // back at the vendored spec). Everything the first revert already
+        // restored — the rekeyed packages/snapshots blocks and the removed
+        // overrides — must now read as CONVERGED, not drifted; otherwise
+        // every later revert would re-classify it as drift and keep the
+        // artifacts + ledger entry forever.
+        let healed = after.replace(
+            "      left-pad:\n        specifier: 1.3.1\n        version: 1.3.1\n",
+            &format!(
+                "      left-pad:\n        specifier: file:{rel}\n        version: file:{rel}\n",
+                rel = fx.rel_tgz()
+            ),
+        );
+        assert_ne!(healed, after, "the undo edit must hit");
+        tokio::fs::write(fx.root().join(PNPM_LOCK), &healed)
+            .await
+            .unwrap();
+
+        let outcome = revert_pnpm(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(
+            outcome.warnings.is_empty(),
+            "already-reverted fragments are converged, not drifted: {:?}",
+            outcome.warnings
+        );
+        assert!(!outcome.kept_artifact);
+        assert_eq!(
+            fx.read(PNPM_LOCK).await,
+            P1_BEFORE_LOCK,
+            "lock byte-restored"
+        );
+        assert_eq!(
+            fx.read(PACKAGE_JSON).await,
+            P1_BEFORE_PKG,
+            "package.json byte-restored"
+        );
+        assert!(
+            !fx.root()
+                .join(format!(".socket/vendor/npm/{UUID}"))
+                .exists(),
+            "artifact pruned once the revert converges"
+        );
     }
 
     #[tokio::test]

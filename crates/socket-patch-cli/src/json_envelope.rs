@@ -102,6 +102,16 @@ pub struct VexSummary {
     pub statements: usize,
     /// Document format tag, e.g. `"openvex-0.2.0"`.
     pub format: String,
+    /// Run-level advisories raised during VEX generation (e.g.
+    /// `product_not_iri`, `vendored_tree_out_of_sync`). Same [`RunWarning`]
+    /// shape as the top-level `warnings[]`, but scoped to the embedded VEX
+    /// side-effect — under `--json` stderr is silenced, so this field is
+    /// the only channel these advisories reach a machine consumer on.
+    /// Empty (and omitted from JSON) when generation had nothing to
+    /// advise, so existing consumers see byte-identical output (additive-
+    /// only envelope contract).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<RunWarning>,
 }
 
 impl Envelope {
@@ -760,11 +770,29 @@ mod tests {
             path: "/tmp/openvex.json".into(),
             statements: 3,
             format: "openvex-0.2.0".into(),
+            warnings: Vec::new(),
         });
         let v: serde_json::Value = serde_json::from_str(&env.to_pretty_json()).unwrap();
         assert_eq!(v["vex"]["path"], "/tmp/openvex.json");
         assert_eq!(v["vex"]["statements"], 3);
         assert_eq!(v["vex"]["format"], "openvex-0.2.0");
+        // `vex.warnings` is skip-if-empty: a warning-free generation keeps
+        // the pre-existing three-key shape byte-identical for consumers.
+        assert!(
+            !v["vex"].as_object().unwrap().contains_key("warnings"),
+            "empty vex.warnings must be omitted, got {:?}",
+            v["vex"]
+        );
+
+        // Once generation raised advisories, they ride inside `vex` with
+        // the same code/detail shape as the top-level `warnings[]`.
+        env.vex.as_mut().unwrap().warnings.push(RunWarning {
+            code: "product_not_iri".into(),
+            detail: "product is not an IRI".into(),
+        });
+        let v: serde_json::Value = serde_json::from_str(&env.to_pretty_json()).unwrap();
+        assert_eq!(v["vex"]["warnings"][0]["code"], "product_not_iri");
+        assert_eq!(v["vex"]["warnings"][0]["detail"], "product is not an IRI");
     }
 
     #[test]

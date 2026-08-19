@@ -768,6 +768,10 @@ pub async fn run(args: ApplyArgs) -> i32 {
                                 .to_string(),
                             statements: summary.statements,
                             format: "openvex-0.2.0".to_string(),
+                            // note_warning suppressed these on stderr under
+                            // --json; the envelope copy is their only
+                            // surviving channel.
+                            warnings: summary.warnings.clone(),
                         });
                     }
                     Some(Err(e)) => {

@@ -41,6 +41,27 @@ fn git_sha256(content: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// Install the fixture package PATCHED (file at `after` bytes) so the
+/// nested rollback genuinely needs the beforeHash blob. Rollback's blob
+/// gate covers only installed rollback targets — a manifest-only fixture
+/// has nothing to roll back, never plans a download, and would give the
+/// online/offline fetch assertions below nothing to observe.
+fn install_patched_package(root: &Path, after: &[u8]) {
+    std::fs::write(
+        root.join("package.json"),
+        r#"{"name":"remove-network-fixture","version":"0.0.0"}"#,
+    )
+    .expect("write root package.json");
+    let pkg = root.join("node_modules").join("remove-network-test");
+    std::fs::create_dir_all(&pkg).expect("create package dir");
+    std::fs::write(
+        pkg.join("package.json"),
+        r#"{"name":"remove-network-test","version":"1.0.0"}"#,
+    )
+    .expect("write pkg package.json");
+    std::fs::write(pkg.join("index.js"), after).expect("write patched index.js");
+}
+
 fn write_manifest(socket: &Path, before_hash: &str, after_hash: &str) {
     std::fs::create_dir_all(socket).expect("create .socket");
     let body = format!(
@@ -127,10 +148,11 @@ fn run_remove(cwd: &Path, api_url: &str, extra: &[&str]) -> (i32, String) {
     )
 }
 
-/// Online sanity: a missing beforeHash blob is fetched, rollback finds no
-/// installed package (nothing to restore → success), and the entry is
-/// removed. Establishes that the mock can satisfy the download, which is
-/// what gives the `--offline` regression test (below) its teeth.
+/// Online sanity: with the fixture package installed at the PATCHED
+/// bytes, the missing beforeHash blob is fetched, rollback restores the
+/// original file, and the entry is removed. Establishes that the mock
+/// can satisfy the download, which is what gives the `--offline`
+/// regression test (below) its teeth.
 #[tokio::test]
 async fn remove_online_downloads_missing_before_blob_then_removes() {
     let before = b"before\n";
@@ -144,6 +166,7 @@ async fn remove_online_downloads_missing_before_blob_then_removes() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let socket = tmp.path().join(".socket");
     write_manifest(&socket, &before_hash, &after_hash);
+    install_patched_package(tmp.path(), after);
 
     let (code, stdout) = run_remove(tmp.path(), &mock.uri(), &[]);
     assert_eq!(code, 0, "online remove must succeed; stdout=\n{stdout}");
@@ -172,6 +195,71 @@ async fn remove_online_downloads_missing_before_blob_then_removes() {
     );
 }
 
+/// Crawler-miss guard, network side: with the package NOT installed the
+/// nested rollback skips the entry as `not_installed` — nothing to restore,
+/// so nothing to download. `remove` (online, mock armed) must (a) contact
+/// the network for NOTHING, (b) still drop the manifest entry, (c) keep the
+/// locally-cached beforeHash blob out of the cleanup sweep (it is the only
+/// local revert data if the miss was a crawler layout gap rather than a
+/// real uninstall), and (d) surface a machine-visible
+/// `rollback_not_installed` warning event naming the purl.
+#[tokio::test]
+async fn remove_not_installed_keeps_blob_and_never_fetches() {
+    let before = b"before\n";
+    let after = b"after\n";
+    let before_hash = git_sha256(before);
+    let after_hash = git_sha256(after);
+
+    let mock = MockServer::start().await;
+    mount_before_blob(&mock, before, &before_hash).await;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let socket = tmp.path().join(".socket");
+    write_manifest(&socket, &before_hash, &after_hash);
+    // Deliberately NOT installed — no node_modules at all.
+    let blobs = socket.join("blobs");
+    std::fs::create_dir_all(&blobs).expect("create blobs dir");
+    std::fs::write(blobs.join(&before_hash), before).expect("stage before blob");
+
+    let (code, stdout) = run_remove(tmp.path(), &mock.uri(), &[]);
+    assert_eq!(
+        code, 0,
+        "removing a not-installed entry succeeds; stdout=\n{stdout}"
+    );
+    assert!(
+        !manifest_has_entry(&socket),
+        "the manifest entry is dropped; stdout=\n{stdout}"
+    );
+
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert!(
+        v["events"]
+            .as_array()
+            .expect("events array")
+            .iter()
+            .any(|e| e["errorCode"] == "rollback_not_installed" && e["purl"] == PURL),
+        "expected a rollback_not_installed warning event; envelope={v}"
+    );
+    assert!(
+        blobs.join(&before_hash).exists(),
+        "the not-installed entry's beforeHash blob must survive the sweep; \
+         stdout=\n{stdout}"
+    );
+
+    // Nothing to restore → nothing to fetch: the armed mock saw no traffic.
+    let reqs = mock
+        .received_requests()
+        .await
+        .expect("wiremock request recording must be enabled");
+    assert!(
+        reqs.is_empty(),
+        "a not-installed entry needs no blob download; observed requests={:?}",
+        reqs.iter()
+            .map(|r| (r.method.to_string(), r.url.path().to_string()))
+            .collect::<Vec<_>>()
+    );
+}
+
 /// `--offline` must NOT contact the network: with the beforeHash blob
 /// missing, rollback cannot proceed, so `remove --offline` aborts and
 /// leaves the manifest entry in place. The mock IS armed to serve the
@@ -190,6 +278,7 @@ async fn remove_offline_does_not_fetch_and_keeps_entry() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let socket = tmp.path().join(".socket");
     write_manifest(&socket, &before_hash, &after_hash);
+    install_patched_package(tmp.path(), after);
 
     let (code, stdout) = run_remove(tmp.path(), &mock.uri(), &["--offline"]);
     assert_eq!(

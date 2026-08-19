@@ -275,12 +275,33 @@ pub(super) async fn run_redirect(
                     .as_ref()
                     .and_then(|o| o.identifiers.go_module_path.clone()),
             ));
+            // The grant token is never a top-level reference field — it only
+            // rides the URLs the reference endpoint hands back, as the path
+            // level before the patch uuid. Recover it so the rewriters'
+            // rotation-idempotency guards (which wildcard the token path
+            // level of a previously-written URL) don't depend on it being
+            // derivable from the URL alone: with an empty token the gem
+            // guard used to miss the previous grant's source block and NEST
+            // a new one around it on every re-scan.
+            let token = reference
+                .registry_override
+                .as_ref()
+                .and_then(|o| {
+                    socket_patch_core::patch::redirect::grant_token_path_segment(
+                        &o.index_url,
+                        &sel.uuid,
+                    )
+                })
+                .or_else(|| {
+                    socket_patch_core::patch::redirect::grant_token_path_segment(&url, &sel.uuid)
+                })
+                .unwrap_or_default();
             overrides.push(DepOverride {
                 ecosystem,
                 name,
                 namespace: None,
                 version,
-                token: String::new(),
+                token,
                 patch_uuid: sel.uuid.clone(),
                 artifact_url: url,
                 berry_zip_url: berry_zip.and_then(|a| a.url.clone()),
@@ -315,26 +336,30 @@ pub(super) async fn run_redirect(
             }
         };
 
-    // Cross-mode takeover (cargo): a purl this run is about to redirect may
-    // still be VENDORED — a committed `[patch.crates-io]` path entry, a
+    // Cross-mode takeover: a purl this run is about to redirect may still be
+    // VENDORED — for cargo a committed `[patch.crates-io]` path entry, a
     // detached Cargo.lock entry, a committed copy, and a vendored ledger
-    // entry. The hosted rewriters know nothing about that wiring, so
-    // redirecting on top of it would leave BOTH wirings in place and cargo
-    // then refuses every `--locked` build over the now-unused `[patch]`
-    // entry while this run reports success. A takeover must leave the
-    // project FULLY hosted: revert each such purl's vendored state first
-    // (the exact per-purl machinery `vendor --revert` runs — restore the
-    // lock originals from the ledger, drop the `[patch]` entry, remove the
-    // committed tree and the ledger entry), and only then redirect. This
-    // ordering also hands the redirect the PRISTINE crates.io lock fragment
-    // to record as its own revert original, keeping the originals chain
-    // intact across repeated mode migrations. A purl whose vendored state
-    // cannot be cleanly reverted (revert failure, or vendored wiring with a
-    // missing/corrupt ledger) is REFUSED — skipped with an actionable
-    // error — never half-migrated.
+    // entry; for the npm family a `file:./.socket/vendor/…` lock resolution
+    // (plus a berry `resolutions` pin) and its committed tarball. The hosted
+    // rewriters know nothing about that wiring: cargo then refuses every
+    // `--locked` build over the now-unused `[patch]` entry while this run
+    // reports success, and the npm rewriters either hijack the vendored
+    // resolution while the vendored ledger still claims it (yarn classic)
+    // or fail-closed refuse the `file:` protocol entirely (yarn berry). A
+    // takeover must leave the project FULLY hosted: revert each such purl's
+    // vendored state first (the exact per-purl machinery `vendor --revert`
+    // runs — restore the lock originals from the ledger, drop the vendored
+    // wiring, remove the committed artifact and the ledger entry), and only
+    // then redirect. This ordering also hands the redirect the PRISTINE
+    // registry lock fragment to record as its own revert original, keeping
+    // the originals chain intact across repeated mode migrations. A purl
+    // whose vendored state cannot be cleanly reverted (revert failure, or
+    // vendored wiring with a missing/corrupt ledger) is REFUSED — skipped
+    // with an actionable error — never half-migrated.
+    let takeover_capable = |p: &str| p.starts_with("pkg:cargo/") || p.starts_with("pkg:npm/");
     let mut takeover_pre_warnings: Vec<serde_json::Value> = Vec::new();
-    if !candidates.iter().any(|(p, ..)| p.starts_with("pkg:cargo/")) {
-        // No cargo candidates — nothing to reconcile.
+    if !candidates.iter().any(|(p, ..)| takeover_capable(p)) {
+        // No takeover-capable candidates — nothing to reconcile.
     } else {
         use socket_patch_core::utils::purl::{normalize_purl, strip_purl_qualifiers};
         let canon = |p: &str| normalize_purl(strip_purl_qualifiers(p)).into_owned();
@@ -343,7 +368,7 @@ pub(super) async fn run_redirect(
             socket_patch_core::vendor::cargo_config::read_patch_entries(&args.common.cwd).await;
         let mut refused: Vec<String> = Vec::new();
         for (purl, _uuid, ..) in &candidates {
-            if !purl.starts_with("pkg:cargo/") {
+            if !takeover_capable(purl) {
                 continue;
             }
             let stripped = strip_purl_qualifiers(purl);
@@ -433,7 +458,13 @@ pub(super) async fn run_redirect(
                 // this crate is nevertheless present, the ledger is missing or
                 // corrupt — the originals needed to revert are unrecoverable,
                 // so redirecting on top would wedge the project. Refuse.
-                let name = parse_purl_simple(purl).map(|(_, name, _)| name);
+                // (Cargo-only probe: `.cargo/config.toml` `[patch]` entries.
+                // An npm purl in this state falls through to the rewriters'
+                // own per-flavor diagnostics.)
+                let name = purl
+                    .starts_with("pkg:cargo/")
+                    .then(|| parse_purl_simple(purl).map(|(_, name, _)| name))
+                    .flatten();
                 let wired = name
                     .as_deref()
                     .is_some_and(|n| patch_entries.get(n).is_some_and(|i| i.socket_owned));
@@ -460,17 +491,20 @@ pub(super) async fn run_redirect(
                     }));
                 }
             }
-            let refused_names: std::collections::HashSet<(String, String)> = candidates
+            let refused_names: std::collections::HashSet<(String, String, String)> = candidates
                 .iter()
                 .filter(|(p, ..)| refused.contains(p))
-                .filter_map(|(p, ..)| {
-                    parse_purl_simple(p).map(|(_, name, version)| (name, version))
-                })
+                .filter_map(|(p, ..)| parse_purl_simple(p))
                 .collect();
             candidates.retain(|(p, ..)| !refused.contains(p));
             overrides.retain(|o| {
-                o.ecosystem != "cargo"
-                    || !refused_names.contains(&(o.name.clone(), o.version.clone()))
+                // Overrides built here carry the full coordinate in `name`
+                // (namespace unset) — the same shape parse_purl_simple emits.
+                let coord = match o.namespace.as_deref() {
+                    Some(ns) if !ns.is_empty() => format!("{ns}/{}", o.name),
+                    _ => o.name.clone(),
+                };
+                !refused_names.contains(&(o.ecosystem.clone(), coord, o.version.clone()))
             });
         }
     }

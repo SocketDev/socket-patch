@@ -40,6 +40,15 @@ pub struct VerifyOutcome {
     /// vendor artifact (`.socket/vendor/…`) rather than the installed
     /// tree. Every member is also present in `applied`.
     pub vendored: Vec<String>,
+    /// The subset of `vendored` whose INSTALLED tree is present on disk
+    /// but does NOT hash to the record's `afterHash` (pristine-unpatched,
+    /// tampered, or a missing file). The attestation itself is unaffected —
+    /// the committed artifact + lock wiring is the product the lockfile
+    /// consumes — but callers must disclose the drift: a build that
+    /// bypasses the vendor wiring runs unpatched code until the package
+    /// manager re-installs. An ABSENT installed tree is the expected
+    /// post-vendor state and is never flagged.
+    pub vendored_out_of_sync: Vec<String>,
 }
 
 /// Vendored-patch context for [`applied_patches_with_vendor`].
@@ -116,6 +125,18 @@ pub async fn applied_patches_with_vendor(
                 out.applied.push(purl.clone());
                 if vendor_entry.is_some() {
                     out.vendored.push(purl.clone());
+                    // Disclosure probe: with the vendor artifact healthy,
+                    // also check whether the LIVE installed tree (when the
+                    // crawler found one) carries the patch. Any mismatch is
+                    // recorded in `vendored_out_of_sync` for the caller to
+                    // warn about — it never changes the verdict, because
+                    // there is deliberately no installed-tree fallback in
+                    // either direction (see the precedence note above).
+                    if let Some(pkg_path) = package_paths.get(purl) {
+                        if verify_patch_record(pkg_path, record).await.is_err() {
+                            out.vendored_out_of_sync.push(purl.clone());
+                        }
+                    }
                 }
             }
             Err(reason) => out.failed.push(FailedPatch {
@@ -324,6 +345,8 @@ mod tests {
         let o = VerifyOutcome::default();
         assert!(o.applied.is_empty());
         assert!(o.failed.is_empty());
+        assert!(o.vendored.is_empty());
+        assert!(o.vendored_out_of_sync.is_empty());
     }
 
     /// `FailedPatch` equality + clone for downstream consumers
@@ -999,6 +1022,10 @@ mod tests {
         assert_eq!(out.applied, vec![purl.to_string()]);
         assert_eq!(out.vendored, vec![purl.to_string()]);
         assert!(out.failed.is_empty());
+        assert!(
+            out.vendored_out_of_sync.is_empty(),
+            "an ABSENT installed tree is the expected post-vendor state — no drift flag"
+        );
     }
 
     /// A manifest PURL matches a vendor entry recorded under a different map
@@ -1104,6 +1131,63 @@ mod tests {
         );
         assert_eq!(out.vendored, vec![purl.to_string()]);
         assert!(out.failed.is_empty());
+        // Disclosure: the live tree is present and pristine-unpatched — the
+        // attestation stands (committed artifact is the product) but the
+        // drift must be reported so the CLI can advise a re-install.
+        assert_eq!(out.vendored_out_of_sync, vec![purl.to_string()]);
+    }
+
+    /// Disclosure probe, tampered direction: the vendor artifact is healthy
+    /// (attest + vendored) while the installed tree is present with bytes
+    /// matching NEITHER `beforeHash` nor `afterHash`. The verdict stands but
+    /// the purl is flagged `vendored_out_of_sync` — exactly like the
+    /// pristine-unpatched case, since either way the live tree is running
+    /// different bytes than the attested artifact.
+    #[tokio::test]
+    async fn tampered_installed_tree_flagged_out_of_sync_but_attested() {
+        let root = tempfile::tempdir().unwrap();
+        let purl = "pkg:cargo/serde@1.0.0";
+        let rel = format!(".socket/vendor/cargo/{VUUID}/serde-1.0.0");
+        let patched = b"patched-content";
+        let hash = compute_git_sha256_from_bytes(patched);
+
+        // Vendored copy: healthy.
+        let vdir = root.path().join(&rel);
+        tokio::fs::create_dir_all(&vdir).await.unwrap();
+        tokio::fs::write(vdir.join("index.js"), patched)
+            .await
+            .unwrap();
+        // Installed tree: tampered (neither before nor after content).
+        let installed = root.path().join("installed");
+        tokio::fs::create_dir_all(&installed).await.unwrap();
+        tokio::fs::write(installed.join("index.js"), b"tampered live bytes")
+            .await
+            .unwrap();
+
+        let mut rec = record_with_one_file(&hash);
+        rec.uuid = VUUID.to_string();
+        let mut manifest = PatchManifest::new();
+        manifest.patches.insert(purl.to_string(), rec);
+
+        let mut entries = HashMap::new();
+        entries.insert(purl.to_string(), vendor_entry(purl, &rel));
+        let ctx = VendorContext {
+            project_root: root.path().to_path_buf(),
+            entries,
+            go_patches: HashMap::new(),
+        };
+        let mut paths = HashMap::new();
+        paths.insert(purl.to_string(), installed);
+
+        let out = applied_patches_with_vendor(&manifest, &paths, Some(&ctx)).await;
+        assert_eq!(
+            out.applied,
+            vec![purl.to_string()],
+            "a tampered LIVE tree must not block the committed-artifact attestation"
+        );
+        assert_eq!(out.vendored, vec![purl.to_string()]);
+        assert!(out.failed.is_empty());
+        assert_eq!(out.vendored_out_of_sync, vec![purl.to_string()]);
     }
 
     /// Precedence, fail-closed direction: a TAMPERED vendor artifact fails

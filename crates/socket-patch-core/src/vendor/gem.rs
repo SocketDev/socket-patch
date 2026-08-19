@@ -981,6 +981,7 @@ pub async fn revert_gem(entry: &VendorEntry, project_root: &Path, dry_run: bool)
             )),
             Err(e) => {
                 return RevertOutcome {
+                    kept_artifact: false,
                     success: false,
                     warnings,
                     error: Some(e),
@@ -992,6 +993,7 @@ pub async fn revert_gem(entry: &VendorEntry, project_root: &Path, dry_run: bool)
     if !dry_run {
         if let Err(e) = remove_tree(&uuid_dir).await {
             return RevertOutcome {
+                kept_artifact: false,
                 success: false,
                 warnings,
                 error: Some(format!("failed to remove {}: {e}", uuid_dir.display())),
@@ -1000,6 +1002,7 @@ pub async fn revert_gem(entry: &VendorEntry, project_root: &Path, dry_run: bool)
     }
 
     RevertOutcome {
+        kept_artifact: false,
         success: true,
         warnings,
         error: None,
