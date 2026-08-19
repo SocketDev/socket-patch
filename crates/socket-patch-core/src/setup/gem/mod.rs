@@ -240,7 +240,10 @@ pub enum GemRegistrationCleanup {
 /// getting this resolution wrong means `--remove` cleans (or misses) the
 /// wrong directory — e.g. under the official ruby Docker images, which export
 /// `BUNDLE_APP_CONFIG=/usr/local/bundle`.
-fn bundler_app_config_dir(root: &Path, env_value: Option<&std::ffi::OsStr>) -> PathBuf {
+///
+/// `pub(crate)`: the ruby crawler resolves the same dir to honor the app
+/// config's `BUNDLE_PATH:` entry when discovering bundler install roots.
+pub(crate) fn bundler_app_config_dir(root: &Path, env_value: Option<&std::ffi::OsStr>) -> PathBuf {
     match env_value {
         Some(v) if !v.is_empty() => {
             let p = PathBuf::from(v);
