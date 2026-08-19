@@ -131,7 +131,11 @@ const OVERRIDES_PRECEDING: [&str; 4] = [
 /// unix file name, which is only a separator on Windows-shaped inputs.
 /// Pure string-level so the transformation is unit-testable on any host;
 /// a real Windows CI leg should confirm pnpm 7/8's own emission spelling.
-fn normalize_canonical_root(path: &str) -> String {
+///
+/// `pub` because the e2e capstone's byte-exact lock oracle must build its
+/// expected absolute specifier with THIS transformation — a hand-copied
+/// oracle drifted on Windows the moment the real spelling differed.
+pub fn normalize_canonical_root(path: &str) -> String {
     /// Drive-letter (`C:\...` / `C:/...`) or UNC (`\\server\...`) shape.
     fn is_windows_shaped(path: &str) -> bool {
         let b = path.as_bytes();

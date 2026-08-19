@@ -756,10 +756,12 @@ fn run_legacy_hermetic(lock_text: &str, after_template: &str, version: &str) {
 
     // The lock is byte-identical to what the REAL pnpm serialized for this
     // end state (spike p7/p8), with the live absolute root + integrity.
-    let abs = std::fs::canonicalize(&proj).unwrap();
+    let abs = socket_patch_core::vendor::pnpm_lock_legacy::normalize_canonical_root(
+        &std::fs::canonicalize(&proj).unwrap().display().to_string(),
+    );
     let expected = after_template
         .replace("{UUID}", UUID)
-        .replace("{ABS}", &abs.display().to_string())
+        .replace("{ABS}", &abs)
         .replace("{INT}", &tarball_integrity(&proj.join(&tgz_rel)));
     let lock_after = std::fs::read_to_string(&lock_path).unwrap();
     assert_eq!(
@@ -946,13 +948,15 @@ fn run_legacy_capstone(pm: &str, lock_head: &str) {
         "legacy wiring must not create pnpm-workspace.yaml ({pm})"
     );
     let lock_after = std::fs::read_to_string(&lock_path).unwrap();
-    let abs = std::fs::canonicalize(&proj).unwrap();
+    let abs = socket_patch_core::vendor::pnpm_lock_legacy::normalize_canonical_root(
+        &std::fs::canonicalize(&proj).unwrap().display().to_string(),
+    );
     assert!(
         lock_after.contains(&format!("{DEP}@{DEP_VERSION}: file:{tgz_rel}")),
         "lock overrides must point at the vendored tarball ({pm}):\n{lock_after}"
     );
     assert!(
-        lock_after.contains(&format!("file:{}/{tgz_rel}", abs.display())),
+        lock_after.contains(&format!("file:{abs}/{tgz_rel}")),
         "lock specifier must carry pnpm <= 8's absolutized spelling ({pm}):\n{lock_after}"
     );
     eprintln!("VENDOR OK ({pm})");
