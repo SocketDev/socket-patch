@@ -11,7 +11,7 @@ use std::path::Path;
 use tokio::fs;
 
 use super::{
-    add_plugin_files, remove_plugin_files, remove_plugin_registration, BundlerProject,
+    add_plugin_files, remove_plugin_files, remove_plugin_registration_at, BundlerProject,
     GemRegistrationCleanup,
 };
 use crate::utils::fs::atomic_write_bytes_preserving_mode;
@@ -256,12 +256,26 @@ pub async fn remove_plugin_directive(
     project: &BundlerProject,
     dry_run: bool,
 ) -> Vec<GemEditResult> {
+    let env = std::env::var_os("BUNDLE_APP_CONFIG");
+    remove_plugin_directive_at(project, env.as_deref(), dry_run).await
+}
+
+/// [`remove_plugin_directive`] with the `BUNDLE_APP_CONFIG` resolution input
+/// made explicit (tests inject it so a machine's exported value — e.g. the
+/// official ruby images' `/usr/local/bundle` — can neither fail them
+/// spuriously nor point the cleanup at a real machine-local index; the public
+/// entry reads the process env, exactly like bundler itself).
+async fn remove_plugin_directive_at(
+    project: &BundlerProject,
+    app_config_env: Option<&std::ffi::OsStr>,
+    dry_run: bool,
+) -> Vec<GemEditResult> {
     let gemfile = edit_gemfile_remove(&project.gemfile, dry_run).await;
     if gemfile.status == GemSetupStatus::Error {
         return vec![gemfile];
     }
     let mut results = vec![gemfile, remove_plugin_files(&project.root, dry_run).await];
-    match remove_plugin_registration(&project.root, dry_run).await {
+    match remove_plugin_registration_at(&project.root, app_config_env, dry_run).await {
         GemRegistrationCleanup::Cleaned { index } => results.push(GemEditResult {
             kind: "gem_plugin_registration",
             path: index.display().to_string(),
@@ -728,7 +742,7 @@ mod tests {
             .await
             .unwrap();
 
-        let results = remove_plugin_directive(&project, false).await;
+        let results = remove_plugin_directive_at(&project, None, false).await;
 
         // Restore before any assertion can unwind, so the tempdir cleans up.
         fs::set_permissions(root, std::fs::Permissions::from_mode(0o755))
@@ -778,7 +792,7 @@ mod tests {
         .await
         .unwrap();
 
-        let removed = remove_plugin_directive(&project, false).await;
+        let removed = remove_plugin_directive_at(&project, None, false).await;
         assert!(
             removed
                 .iter()
@@ -798,7 +812,7 @@ mod tests {
             .await
             .iter()
             .all(|r| r.status != GemSetupStatus::Error));
-        let removed = remove_plugin_directive(&project, false).await;
+        let removed = remove_plugin_directive_at(&project, None, false).await;
         assert!(
             removed.iter().all(|r| r.kind != "gem_plugin_registration"),
             "no machine-local registration -> no registration entry: {removed:?}"
@@ -825,7 +839,7 @@ mod tests {
             .iter()
             .all(|r| r.status == GemSetupStatus::AlreadyConfigured));
 
-        let removed = remove_plugin_directive(&project, false).await;
+        let removed = remove_plugin_directive_at(&project, None, false).await;
         assert!(removed.iter().all(|r| r.status == GemSetupStatus::Updated));
         assert_eq!(
             fs::read_to_string(root.join("Gemfile")).await.unwrap(),
