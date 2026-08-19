@@ -3159,6 +3159,15 @@ fn converge_gem_lock_source(
     if sections[sec_idx].remotes.len() != 1 {
         return false;
     }
+    // Bundler always writes source sections before DEPENDENCIES — the pin
+    // edit below runs first on that premise (its lines sit after the parsed
+    // spec/remote/end indices, so they never shift). A hand-edited lock with
+    // DEPENDENCIES before the dep's GEM section breaks the premise: the
+    // transitive-dep pin INSERT would leave the spec-move splicing on stale
+    // indices. Fail soft to the mixed state instead.
+    if deps_start < sections[sec_idx].end {
+        return false;
+    }
     let (remote_idx, remote_url) = sections[sec_idx].remotes[0].clone();
     let socket_remote_re = Regex::new(&format!("^{}$", gem_index_url_pattern(dep, index_url)))
         .expect("anchored index-url pattern from the escaped URL is valid");
