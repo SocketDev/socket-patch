@@ -26,10 +26,16 @@
 //! refusing there would block every such setup on a guess.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use tokio::fs;
 
 use super::BundlerProject;
+
+/// Upper bound on the `bundle --version` fallback probe. A wedged bundler
+/// (broken RubyGems install, hung shim) must degrade to [`BundlerProbe::
+/// Unknown`] — fail open — rather than hang `setup`/`setup --check` forever.
+const BUNDLE_VERSION_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Minimum bundler `(major, minor)` able to load a `plugin ... path:`
 /// directive.
@@ -133,14 +139,20 @@ pub async fn probe_bundler(project: &BundlerProject) -> BundlerProbe {
         }
     }
     // No lock (or no BUNDLED WITH): ask the machine's bundler. stdin nulled
-    // so the child can never block waiting for input.
-    let output = tokio::process::Command::new("bundle")
-        .arg("--version")
-        .current_dir(&project.root)
-        .stdin(std::process::Stdio::null())
-        .output()
-        .await;
-    if let Ok(out) = output {
+    // so the child can never block waiting for input; bounded by
+    // [`BUNDLE_VERSION_TIMEOUT`] (with `kill_on_drop` so a timed-out child is
+    // reaped, not leaked) so a wedged bundler degrades to `Unknown`.
+    let output = tokio::time::timeout(
+        BUNDLE_VERSION_TIMEOUT,
+        tokio::process::Command::new("bundle")
+            .arg("--version")
+            .current_dir(&project.root)
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await;
+    if let Ok(Ok(out)) = output {
         if out.status.success() {
             if let Some(version) =
                 parse_bundle_version_output(&String::from_utf8_lossy(&out.stdout))

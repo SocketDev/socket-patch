@@ -232,11 +232,23 @@ async fn edit_gemfile_remove(gemfile: &Path, dry_run: bool) -> GemEditResult {
 /// the recovery path for an already-wired 1.x project).
 pub async fn add_plugin_directive(project: &BundlerProject, dry_run: bool) -> Vec<GemEditResult> {
     if let BundlerProbe::Unsupported { version, source } = probe_bundler(project).await {
+        let mut message = unsupported_bundler_message(&version, &source);
+        // An ALREADY-wired project (wired before the floor existed, or on
+        // another machine) gets the recovery path by name — "Not wiring this
+        // project" alone would be misleading when the wiring is the problem.
+        if let Ok(content) = fs::read_to_string(&project.gemfile).await {
+            if is_plugin_directive_present(&content) {
+                message.push_str(
+                    ". This project is already wired: run `socket-patch setup --remove` \
+                     to unwire it so `bundle install` works again",
+                );
+            }
+        }
         return vec![GemEditResult {
             kind: "gemfile",
             path: project.gemfile.display().to_string(),
             status: GemSetupStatus::Error,
-            error: Some(unsupported_bundler_message(&version, &source)),
+            error: Some(message),
         }];
     }
     let files = add_plugin_files(&project.root, dry_run).await;
@@ -817,6 +829,42 @@ mod tests {
         assert!(
             results.iter().all(|r| r.status == GemSetupStatus::Updated),
             "a bundler-2.x lock must wire normally: {results:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_add_refusal_on_wired_1x_project_names_remove_recovery() {
+        // Re-running `setup` on an ALREADY-wired 1.x project must not stop at
+        // "Not wiring this project" — the wiring IS the problem there, and the
+        // refusal must hand the user the `setup --remove` recovery path.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("Gemfile"), gemfile_add(GEMFILE).unwrap())
+            .await
+            .unwrap();
+        fs::write(root.join("Gemfile.lock"), LOCK_1X).await.unwrap();
+        let project = super::super::discover_bundler_project(root).await.unwrap();
+
+        let results = add_plugin_directive(&project, false).await;
+        let msg = results
+            .iter()
+            .find_map(|r| r.error.as_deref())
+            .unwrap_or_default();
+        assert!(
+            msg.contains("setup --remove"),
+            "the refusal on a wired project must name the recovery path: {msg:?}"
+        );
+
+        // And the UNWIRED refusal must NOT claim the project is wired.
+        fs::write(root.join("Gemfile"), GEMFILE).await.unwrap();
+        let results = add_plugin_directive(&project, false).await;
+        let msg = results
+            .iter()
+            .find_map(|r| r.error.as_deref())
+            .unwrap_or_default();
+        assert!(
+            !msg.contains("already wired"),
+            "an unwired project's refusal must not mention un-wiring: {msg:?}"
         );
     }
 
