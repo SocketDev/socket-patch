@@ -714,6 +714,120 @@ mod tests {
         );
     }
 
+    // ── bundler version floor ─────────────────────────────────────────
+    //
+    // Bundler 1.x cannot load a `plugin ... path:` directive: `Plugin::DSL`
+    // undef_methods `:path` and the 1.x plugin installer supports only
+    // git/rubygems sources, so the directive is resolved as an ORDINARY GEM
+    // and every later `bundle install` dies with exit 7 ("Could not find gem
+    // 'socket-patch' ...") BEFORE plugin registration — an error that never
+    // names socket-patch. Wiring such a project is strictly worse than
+    // refusing (reproduced on bundler 1.17.3). The project's bundler is read
+    // from the lock's `BUNDLED WITH` section — deterministic, and present
+    // even where `bundle` is not on PATH.
+
+    const LOCK_1X: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    \
+                           colorize (1.1.0)\n\nPLATFORMS\n  ruby\n\nDEPENDENCIES\n  \
+                           colorize (= 1.1.0)\n\nBUNDLED WITH\n   1.17.3\n";
+
+    #[tokio::test]
+    async fn test_add_refuses_bundler_1x_locked_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("Gemfile"), GEMFILE).await.unwrap();
+        fs::write(root.join("Gemfile.lock"), LOCK_1X).await.unwrap();
+        let project = super::super::discover_bundler_project(root).await.unwrap();
+
+        let results = add_plugin_directive(&project, false).await;
+
+        assert!(
+            results.iter().any(|r| r.status == GemSetupStatus::Error),
+            "wiring a bundler-1.x project must be refused as an error: {results:?}"
+        );
+        let msg = results
+            .iter()
+            .find_map(|r| r.error.as_deref())
+            .unwrap_or_default();
+        assert!(
+            msg.contains("1.17.3") && msg.contains("2.2"),
+            "the refusal must name the detected bundler and the floor: {msg:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("Gemfile")).await.unwrap(),
+            GEMFILE,
+            "the Gemfile must NOT be wired — bundler 1.x resolves the plugin \
+             directive as an ordinary gem and every later `bundle install` \
+             exits 7"
+        );
+        assert!(
+            !super::super::plugin_files_present(root).await,
+            "no plugin files may be generated for a refused project"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_add_dry_run_also_refuses_bundler_1x() {
+        // The preview must refuse identically — a dry-run that previews the
+        // wiring while the real run errors would lie to the user.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("Gemfile"), GEMFILE).await.unwrap();
+        fs::write(root.join("Gemfile.lock"), LOCK_1X).await.unwrap();
+        let project = super::super::discover_bundler_project(root).await.unwrap();
+
+        let results = add_plugin_directive(&project, true).await;
+        assert!(
+            results.iter().any(|r| r.status == GemSetupStatus::Error),
+            "dry-run must surface the same refusal: {results:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_add_proceeds_on_bundler_2x_lock() {
+        // A supported lock must not trip the gate.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("Gemfile"), GEMFILE).await.unwrap();
+        fs::write(
+            root.join("Gemfile.lock"),
+            LOCK_1X.replace("1.17.3", "2.7.2"),
+        )
+        .await
+        .unwrap();
+        let project = super::super::discover_bundler_project(root).await.unwrap();
+
+        let results = add_plugin_directive(&project, false).await;
+        assert!(
+            results.iter().all(|r| r.status == GemSetupStatus::Updated),
+            "a bundler-2.x lock must wire normally: {results:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_remove_still_unwires_bundler_1x_project() {
+        // `setup --remove` is the RECOVERY path for a project wired before
+        // the floor existed (or wired on another machine) — the gate must
+        // never block the un-wire.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("Gemfile"), gemfile_add(GEMFILE).unwrap())
+            .await
+            .unwrap();
+        fs::write(root.join("Gemfile.lock"), LOCK_1X).await.unwrap();
+        let project = super::super::discover_bundler_project(root).await.unwrap();
+
+        let results = remove_plugin_directive(&project, false).await;
+        assert!(
+            results.iter().all(|r| r.status != GemSetupStatus::Error),
+            "remove must not be blocked by the version gate: {results:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("Gemfile")).await.unwrap(),
+            GEMFILE,
+            "the recovery un-wire restores the Gemfile byte-for-byte"
+        );
+    }
+
     #[tokio::test]
     async fn test_full_roundtrip_via_project() {
         let dir = tempfile::tempdir().unwrap();

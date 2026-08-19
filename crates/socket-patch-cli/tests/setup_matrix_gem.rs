@@ -356,6 +356,125 @@ mod host_guard {
         );
     }
 
+    /// A Gemfile.lock pinning bundler 1.x, exactly as `bundle install` under
+    /// bundler 1.17.3 writes it (independent oracle for the version gate —
+    /// the lock probe works even where no `bundle` is on PATH).
+    const LOCK_1X: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    \
+                           colorize (1.1.0)\n\nPLATFORMS\n  ruby\n\nDEPENDENCIES\n  \
+                           colorize (= 1.1.0)\n\nBUNDLED WITH\n   1.17.3\n";
+
+    /// [P1 bundler floor — refuse side] Bundler 1.x cannot load the
+    /// `plugin ... path:` directive `setup` writes (Plugin::DSL undef's
+    /// `:path`; the 1.x plugin installer knows only git/rubygems sources), so
+    /// a wired project dies on EVERY later `bundle install` with exit 7
+    /// ("Could not find gem 'socket-patch' ...") before plugin registration —
+    /// an error that never names socket-patch (campaign-confirmed on
+    /// 1.17.3). `setup` must refuse to wire such a project, loudly, and leave
+    /// the Gemfile untouched so `bundle install` keeps working.
+    #[test]
+    fn gem_setup_refuses_bundler_1x_locked_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("Gemfile"), GEMFILE).unwrap();
+        std::fs::write(root.join("Gemfile.lock"), LOCK_1X).unwrap();
+        let root_s = root.to_str().unwrap();
+
+        let (code, out, err) = run(root, &["setup", "--cwd", root_s, "--yes", "--json"]);
+        assert_eq!(
+            code, 1,
+            "setup on a bundler-1.x-locked project must refuse (exit 1), not \
+             wire an install-breaking directive.\n{out}\n{err}"
+        );
+        let v = parse_json(&out, "setup (bundler 1.x)");
+        assert_eq!(
+            json_str(&v, "status", "setup (bundler 1.x)"),
+            "error",
+            "the refusal must be an error status:\n{v}"
+        );
+        // The refusal names the problem: the detected bundler and the floor.
+        let files = v.get("files").and_then(|f| f.as_array()).expect("files[]");
+        let gem_err = files
+            .iter()
+            .filter(|f| f.get("kind").and_then(|k| k.as_str()) == Some("gemfile"))
+            .find_map(|f| f.get("error").and_then(|e| e.as_str()))
+            .unwrap_or_else(|| panic!("no gemfile error entry in files[]:\n{v}"));
+        assert!(
+            gem_err.contains("1.17.3") && gem_err.contains("2.2"),
+            "the error must name the detected bundler and the >= 2.2 floor:\n{gem_err}"
+        );
+        // On disk: nothing was wired.
+        assert_eq!(
+            gemfile_body(root),
+            GEMFILE,
+            "the Gemfile must be byte-untouched after the refusal"
+        );
+        assert!(
+            !root.join(PLUGIN_DIR).exists(),
+            "no plugin dir may be generated for a refused project"
+        );
+    }
+
+    /// [P1 bundler floor — check side] The campaign's worst variant: a
+    /// project wired elsewhere (older CLI, or a machine with bundler >= 2.2)
+    /// whose lock pins bundler 1.x. Every `bundle install` fails with exit 7,
+    /// yet `setup --check` said "configured" — the CI gate the check exists
+    /// to be went green while installs were broken. `--check` must red-flag
+    /// the wired-but-unloadable state and name the remedy.
+    #[test]
+    fn gem_check_red_flags_wired_but_unloadable_bundler_1x() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("Gemfile"), GEMFILE).unwrap();
+        let root_s = root.to_str().unwrap();
+
+        // Wire for real with the actual CLI (no 1.x lock yet, so the host —
+        // bundler >= 2.2 or none — lets setup proceed) ...
+        let (code, out, err) = run(root, &["setup", "--cwd", root_s, "--yes", "--json"]);
+        assert_eq!(code, 0, "precondition: wiring must succeed.\n{out}\n{err}");
+        assert!(gemfile_body(root).contains(MANAGED_MARKER));
+
+        // ... then the 1.x lock arrives (clone of a legacy project / CI image
+        // downgrade). This is the state the campaign reproduced.
+        std::fs::write(root.join("Gemfile.lock"), LOCK_1X).unwrap();
+
+        let (code, out, err) = run(root, &["setup", "--check", "--cwd", root_s, "--json"]);
+        assert_eq!(
+            code, 1,
+            "check must FAIL on a wired project whose bundler cannot load the \
+             plugin — this exact state broke every `bundle install` while \
+             check reported configured.\n{out}\n{err}"
+        );
+        let v = parse_json(&out, "check (wired, bundler 1.x)");
+        assert_eq!(
+            json_str(&v, "status", "check (wired, bundler 1.x)"),
+            "error",
+            "the unloadable wiring is an error, not a plain needs_configuration:\n{v}"
+        );
+        let files = v.get("files").and_then(|f| f.as_array()).expect("files[]");
+        let gem_err = files
+            .iter()
+            .filter(|f| f.get("kind").and_then(|k| k.as_str()) == Some("gemfile"))
+            .find_map(|f| f.get("error").and_then(|e| e.as_str()))
+            .unwrap_or_else(|| panic!("no gemfile error entry in files[]:\n{v}"));
+        assert!(
+            gem_err.contains("1.17.3")
+                && gem_err.contains("2.2")
+                && gem_err.contains("--remove"),
+            "the check error must name the detected bundler, the floor, and \
+             the `setup --remove` recovery:\n{gem_err}"
+        );
+
+        // Recovery: `setup --remove` still un-wires (the gate must never
+        // block it), restoring the Gemfile byte-for-byte.
+        let (code, out, err) = run(
+            root,
+            &["setup", "--remove", "--cwd", root_s, "--yes", "--json"],
+        );
+        assert_eq!(code, 0, "recovery remove must work.\n{out}\n{err}");
+        assert_eq!(gemfile_body(root), GEMFILE, "Gemfile restored");
+        assert!(!root.join(PLUGIN_DIR).exists(), "plugin dir removed");
+    }
+
     /// `bundle` resolves the Gemfile by walking UP from the invocation dir,
     /// and `discover_bundler_project` documents the same contract. Run from a
     /// subdirectory with NO `--cwd` flag the CLI defaults to the RELATIVE
