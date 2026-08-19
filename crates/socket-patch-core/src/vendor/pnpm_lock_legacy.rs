@@ -1986,6 +1986,14 @@ packages:
             std::fs::canonicalize(self.root()).unwrap()
         }
 
+        /// The root as the BACKEND spells it into locks — the raw
+        /// `canonicalize().display()` form differs on Windows (`\\?\C:\...`),
+        /// so every oracle/fixture must go through the same normalizer the
+        /// splice uses or the byte-exact asserts diverge there.
+        fn canon_root_str(&self) -> String {
+            normalize_canonical_root(&self.canon_root().display().to_string())
+        }
+
         fn installed(&self) -> PathBuf {
             self.root().join("node_modules/left-pad")
         }
@@ -2016,7 +2024,7 @@ packages:
         async fn expected_lock(&self, fixture: &str) -> String {
             fixture
                 .replace(SPIKE_INTEGRITY, &self.actual_integrity().await)
-                .replace(ROOT_TOKEN, &self.canon_root().display().to_string())
+                .replace(ROOT_TOKEN, &self.canon_root_str())
         }
 
         async fn vendor(&self, dry_run: bool) -> VendorOutcome {
@@ -2244,7 +2252,7 @@ packages:
         let lock_after = fx.read(PNPM_LOCK).await;
         assert_eq!(lock_after, fx.expected_lock(X7_AFTER_LOCK).await);
         assert!(
-            !lock_after.contains(&fx.canon_root().display().to_string()),
+            !lock_after.contains(&fx.canon_root_str()),
             "no machine path may leak into a transitive-only wiring:\n{lock_after}"
         );
         assert!(
@@ -2621,7 +2629,7 @@ packages:
 
         // Simulate the moved checkout: swap the live absolute root for a
         // foreign machine's path.
-        let here = fx.canon_root().display().to_string();
+        let here = fx.canon_root_str();
         let lock = fx.read(PNPM_LOCK).await;
         let foreign = lock.replace(&here, "/home/other/checkout");
         assert_ne!(lock, foreign, "fixture must embed the absolute root");
