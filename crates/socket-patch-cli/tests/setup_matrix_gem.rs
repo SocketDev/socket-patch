@@ -541,6 +541,145 @@ mod host_guard {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// Bundler-1.17 docker leg for the >= 2.2 plugin floor.
+//
+// The host guards above pin the LOCK-probe path (`BUNDLED WITH 1.17.3`)
+// against the workspace binary; this leg drives a real bundler 1.17.3
+// toolchain (image: tests/docker/Dockerfile.gem-b1) end to end, covering the
+// `bundle --version` fallback path too, and proves the property the floor
+// exists for: after `setup` refuses, `bundle install` KEEPS WORKING. Before
+// the floor, setup wired `plugin 'socket-patch', path: ...` and bundler 1.17
+// (whose Plugin::DSL undef's `:path`) resolved it as an ordinary gem —
+// every later install exited 7 with an error that never named socket-patch
+// (campaign-confirmed).
+//
+// Soft-skips loudly when Docker / the image is absent, mirroring the
+// docker_e2e_* convention. NOTE: the leg runs the socket-patch binary BAKED
+// INTO the image — an image built before this fix still wires the project
+// and fails this leg deterministically; rebuild it (see the Dockerfile
+// header), or point SOCKET_PATCH_GEM_B1_IMAGE at a fresh uniquely-tagged
+// build.
+// ─────────────────────────────────────────────────────────────────────────
+mod bundler_floor_docker {
+    use std::process::Command;
+
+    fn image() -> String {
+        std::env::var("SOCKET_PATCH_GEM_B1_IMAGE")
+            .unwrap_or_else(|_| "socket-patch-test-gem-b1:latest".to_string())
+    }
+
+    /// Returns `true` when the leg should skip (docker or the image missing).
+    /// Prints a skip notice — Rust tests have no native "skipped" outcome.
+    /// Build locally with
+    /// `docker build -f tests/docker/Dockerfile.gem-b1 -t socket-patch-test-gem-b1:latest .`
+    #[must_use]
+    fn skip_if_no_image(image: &str) -> bool {
+        let Ok(out) = Command::new("docker")
+            .args(["image", "inspect", image])
+            .output()
+        else {
+            eprintln!("skipping: `docker` not on PATH");
+            return true;
+        };
+        if !out.status.success() {
+            eprintln!("skipping: docker image `{image}` not present");
+            return true;
+        }
+        false
+    }
+
+    /// The whole flow runs INSIDE the container (no bind mounts, no network):
+    /// scaffold → setup refuses (version fallback path, no lock yet) →
+    /// `bundle install` still works and writes the 1.17 lock → setup refuses
+    /// again (lock path) → `setup --check` red-flags. Host-side assertions
+    /// read the markers + JSON the script echoes.
+    #[test]
+    fn bundler_1x_setup_refuses_and_installs_keep_working() {
+        let image = image();
+        if skip_if_no_image(&image) {
+            return;
+        }
+        let script = r#"
+set -eu
+export SOCKET_NO_CONFIG=1 SOCKET_TELEMETRY_DISABLED=1
+mkdir -p /workspace/proj && cd /workspace/proj
+printf '# no dependencies\n' > Gemfile
+cp Gemfile /tmp/gemfile-pre
+
+# 1) No lock yet: the probe falls back to `bundle --version` (1.17.3).
+set +e
+socket-patch setup --yes --json --ecosystems gem > setup.json 2> setup.err
+rc=$?
+set -e
+echo "SETUP-RC=$rc"
+cat setup.json
+if grep -q 'socket-patch:managed' Gemfile; then echo 'WIRED-BUT-MUST-NOT'; exit 1; fi
+if [ -e .socket/bundler-plugin ]; then echo 'PLUGIN-DIR-BUT-MUST-NOT'; exit 1; fi
+cmp -s Gemfile /tmp/gemfile-pre && echo 'GEMFILE-UNTOUCHED'
+
+# 2) The refused project still installs (writes the 1.17 lock).
+bundle install > install.log 2>&1 || { echo 'INSTALL-BROKE'; cat install.log; exit 1; }
+echo 'INSTALL-OK'
+grep -q '1\.17\.3' Gemfile.lock && echo 'LOCK-1X'
+
+# 3) Lock present: the deterministic BUNDLED WITH path refuses too.
+set +e
+socket-patch setup --yes --json --ecosystems gem > setup2.json 2>&1
+rc2=$?
+set -e
+echo "SETUP2-RC=$rc2"
+
+# 4) check red-flags the unsupported state.
+set +e
+socket-patch setup --check --json --ecosystems gem > check.json 2>&1
+rc3=$?
+set -e
+echo "CHECK-RC=$rc3"
+cat check.json
+echo 'ALL-DONE'
+"#;
+        let out = Command::new("docker")
+            .args(["run", "--rm", "--network", "none", &image, "bash", "-c", script])
+            .output()
+            .expect("docker run");
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        let ctx = format!("stdout:\n{stdout}\nstderr:\n{stderr}");
+        assert!(
+            stdout.contains("ALL-DONE"),
+            "the in-container flow aborted early (a refused project whose \
+             `bundle install` breaks is the campaign defect).\n{ctx}"
+        );
+        assert!(
+            stdout.contains("SETUP-RC=1"),
+            "setup must refuse (exit 1) under bundler 1.17.3.\n{ctx}"
+        );
+        // The refusal names the detected bundler and the floor (setup.json is
+        // echoed into stdout).
+        assert!(
+            stdout.contains("1.17.3") && stdout.contains("2.2"),
+            "the refusal must name bundler 1.17.3 and the >= 2.2 floor.\n{ctx}"
+        );
+        assert!(
+            stdout.contains("GEMFILE-UNTOUCHED"),
+            "the Gemfile must be byte-untouched after the refusal.\n{ctx}"
+        );
+        assert!(
+            stdout.contains("INSTALL-OK") && stdout.contains("LOCK-1X"),
+            "`bundle install` must keep working after the refusal.\n{ctx}"
+        );
+        assert!(
+            stdout.contains("SETUP2-RC=1"),
+            "the lock-probe path must refuse as well.\n{ctx}"
+        );
+        assert!(
+            stdout.contains("CHECK-RC=1") && stdout.contains("\"status\": \"error\""),
+            "`setup --check` must red-flag the unsupported bundler.\n{ctx}"
+        );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // Runtime guards for the GENERATED plugin, driven through a REAL `bundle
 // install` (host bundler; validated against 4.0.15, and the same flows
 // against bundler 2.7 in the gem Docker image during development). Each test
