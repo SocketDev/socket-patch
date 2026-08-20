@@ -34,7 +34,7 @@ use serde_json::Value;
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::PatchSources;
 use crate::patch::copy_tree::remove_tree;
-use crate::utils::fs::atomic_write_bytes;
+use crate::utils::fs::atomic_write_bytes_preserving_mode;
 use crate::vendor::bun_lock_text::{
     check_lock_version, decode_json_string, packages_bounds, parse_entry_line,
     parse_packages_section, split_name_spec, BunEntry,
@@ -230,8 +230,11 @@ pub(crate) async fn vendor_bun(
         };
     }
 
-    if let Err(e) =
-        atomic_write_bytes(&project_root.join(BUN_LOCK), lines.join("\n").as_bytes()).await
+    if let Err(e) = atomic_write_bytes_preserving_mode(
+        &project_root.join(BUN_LOCK),
+        lines.join("\n").as_bytes(),
+    )
+    .await
     {
         return done_failure(purl, format!("cannot write {BUN_LOCK}: {e}"));
     }
@@ -351,8 +354,11 @@ pub(crate) async fn revert_bun(
             revert_one_record(lines, rec, &entry.uuid, &mut dirty, &mut outcome.warnings);
         }
         if dirty {
-            if let Err(e) =
-                atomic_write_bytes(&project_root.join(BUN_LOCK), lines.join("\n").as_bytes()).await
+            if let Err(e) = atomic_write_bytes_preserving_mode(
+                &project_root.join(BUN_LOCK),
+                lines.join("\n").as_bytes(),
+            )
+            .await
             {
                 return RevertOutcome::failed(format!("cannot write {BUN_LOCK}: {e}"));
             }
@@ -1301,6 +1307,45 @@ mod tests {
             .root()
             .join(format!(".socket/vendor/npm/{UUID}"))
             .exists());
+    }
+
+    /// bun.lock is a user-owned file we merely edit: the vendor rewrite and
+    /// the revert restore must keep its permission bits (a 0600 private lock
+    /// must not silently become umask-default 0644).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn lock_writes_preserve_file_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let fx = fixture_with(BN3_BEFORE_LOCK, "node_modules/left-pad").await;
+        let lock_path = fx.root().join(BUN_LOCK);
+        tokio::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o600))
+            .await
+            .unwrap();
+        let mode = |path: PathBuf| async move {
+            tokio::fs::metadata(path)
+                .await
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777
+        };
+
+        let (result, entry, _) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        let entry = entry.unwrap();
+        assert_eq!(
+            mode(lock_path.clone()).await,
+            0o600,
+            "vendor must preserve bun.lock's mode"
+        );
+
+        let outcome = revert_bun(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert_eq!(
+            mode(lock_path).await,
+            0o600,
+            "revert must preserve bun.lock's mode"
+        );
     }
 
     #[tokio::test]

@@ -494,7 +494,7 @@ pub async fn revert_npm(entry: &VendorEntry, project_root: &Path, dry_run: bool)
 
     for lock_name in lock_files {
         let lock_path = project_root.join(lock_name);
-        let lock_bytes = match tokio::fs::read(&lock_path).await {
+        let lock_bytes = match read_regular(&lock_path).await {
             Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 // The lock is gone (user regenerated the project?); the
@@ -551,6 +551,41 @@ pub async fn revert_npm(entry: &VendorEntry, project_root: &Path, dry_run: bool)
     // deleting evidence out from under a lock we just refused to touch.
     if outcome.drift_skipped() {
         outcome.keep_artifact(&uuid_dir_rel);
+        return outcome;
+    }
+
+    // FAIL-CLOSED (same brick class as the unwired guard above): the
+    // restore only rewrites the lock files the wiring names, but the lock
+    // npm actually installs from can still resolve through the artifact —
+    // `npm shrinkwrap` RENAMES the wired package-lock.json to
+    // npm-shrinkwrap.json (carrying the file: entries with it), and a
+    // re-install can hoist the entry to a key the wiring never recorded.
+    // Deleting the uuid dir then fails every subsequent install with
+    // ENOENT on the missing tarball, silently. Probe the winning lock
+    // (shrinkwrap-first, like installs): mentioned ⇒ refuse; absent or
+    // unprovable keeps the wired revert's existing missing-lock tolerance.
+    if super::npm_flavor::lock_text_mentions_uuid(
+        project_root,
+        &[SHRINKWRAP, PACKAGE_LOCK],
+        &entry.uuid,
+    )
+    .await
+        == Some(true)
+    {
+        let detail = format!(
+            "refusing to remove {uuid_dir_rel}: after restoring the recorded lock fragments, \
+             the lockfile npm installs from still resolves through it (was the wired lockfile \
+             renamed — e.g. by `npm shrinkwrap` — or the entry re-hoisted since vendoring?) — \
+             deleting the artifact would make every subsequent install fail; restore the \
+             pre-vendor lockfile (or remove the dependency and re-lock) and re-run \
+             `vendor --revert`"
+        );
+        outcome.success = false;
+        outcome.error = Some(detail.clone());
+        outcome.warnings.push(VendorWarning::new(
+            "vendor_lock_still_wired_revert_blocked",
+            detail,
+        ));
         return outcome;
     }
 
@@ -876,9 +911,24 @@ fn revert_one_record(
 // ───────────────────────────── small helpers ─────────────────────────────
 // (the flavor-agnostic coordinate/staging helpers live in `npm_common`)
 
+/// Guarded read shared in shape with the vendor siblings' twins
+/// (npm_flavor.rs, lock_inventory.rs, cargo_lock.rs): `open_regular_file`
+/// opens with `O_NONBLOCK` and rejects non-regular files, so a FIFO planted
+/// as a lockfile fails fast instead of wedging vendor (flavor detection is
+/// existence-only for the npm locks, so [`select_lockfile`]'s read is the
+/// FIRST open) or revert forever in an `open(2)` waiting for a writer.
+async fn read_regular(path: &Path) -> std::io::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt as _;
+
+    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.read_to_end(&mut bytes).await?;
+    Ok(bytes)
+}
+
 async fn select_lockfile(project_root: &Path) -> std::io::Result<Option<(String, Vec<u8>)>> {
     for lock_name in [SHRINKWRAP, PACKAGE_LOCK] {
-        match tokio::fs::read(project_root.join(lock_name)).await {
+        match read_regular(&project_root.join(lock_name)).await {
             Ok(bytes) => return Ok(Some((lock_name.to_string(), bytes))),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => return Err(e),
@@ -1616,6 +1666,26 @@ mod tests {
         );
     }
 
+    /// npm honors the OBJECT form of bundleDependencies too (npm-bundled
+    /// falls back to `Object.keys(bd)` for any non-array truthy value), so
+    /// it must refuse the same way as the array form, not fail open and
+    /// pack a tarball whose bundled node_modules was pruned.
+    #[tokio::test]
+    async fn bundled_deps_refusal_covers_object_form() {
+        let fx = fixture().await;
+        tokio::fs::write(
+            fx.installed().join("package.json"),
+            br#"{"name":"left-pad","version":"1.3.0","bundleDependencies":{"dep":"^1.0.0"}}"#,
+        )
+        .await
+        .unwrap();
+        expect_refused(fx.vendor(false).await, "vendor_bundled_deps_unsupported");
+        assert!(
+            !fx.root().join(".socket/vendor").exists(),
+            "refusal writes nothing"
+        );
+    }
+
     #[tokio::test]
     async fn lockfile_v1_is_refused() {
         let lock = json!({
@@ -2258,6 +2328,116 @@ mod tests {
         let outcome = revert_npm(&entry, fx.root(), false).await;
         assert!(outcome.success, "{:?}", outcome.error);
         assert!(!tgz_path.exists(), "no lock, no reference: removal is safe");
+    }
+
+    #[cfg(unix)]
+    fn mkfifo(path: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+        let c_path =
+            std::ffi::CString::new(path.as_os_str().as_bytes()).expect("fifo path has no NUL");
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
+        assert_eq!(
+            rc,
+            0,
+            "mkfifo(2) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    /// A FIFO planted as the npm lockfile must fail fast instead of wedging
+    /// vendor (flavor detection is existence-only for the npm locks, so
+    /// `select_lockfile`'s read is the FIRST open) or revert forever in an
+    /// `open(2)` waiting for a writer that never comes. Same
+    /// `open_regular_file` guard class as the vendor siblings
+    /// (npm_flavor.rs, lock_inventory.rs, cargo_lock.rs).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fifo_lockfile_fails_fast_instead_of_wedging_vendor_and_revert() {
+        // Vendor half: the package-lock is a FIFO before any vendor ran.
+        let fx = fixture().await;
+        tokio::fs::remove_file(fx.lock_path()).await.unwrap();
+        mkfifo(&fx.lock_path());
+
+        // Revert half: vendor normally first, then swap the wired lock for
+        // a FIFO before reverting.
+        let fx2 = fixture().await;
+        let (_, entry, _) = expect_done(fx2.vendor(false).await);
+        let entry = entry.unwrap();
+        tokio::fs::remove_file(fx2.lock_path()).await.unwrap();
+        mkfifo(&fx2.lock_path());
+
+        let deadline = std::time::Duration::from_secs(5);
+        let both = async {
+            (
+                fx.vendor(false).await,
+                revert_npm(&entry, fx2.root(), false).await,
+            )
+        };
+        let Ok((vendored, reverted)) = tokio::time::timeout(deadline, both).await else {
+            // On timeout the open is wedged in a `spawn_blocking` thread the
+            // runtime waits for on shutdown; connect a non-blocking writer to
+            // release it so the test can FAIL instead of hanging the suite.
+            use std::os::unix::fs::OpenOptionsExt;
+            for path in [fx.lock_path(), fx2.lock_path()] {
+                let _ = std::fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(path);
+            }
+            panic!("npm lock reads must fail fast on FIFO lockfiles");
+        };
+        let detail = expect_refused(vendored, "vendor_lockfile_missing");
+        assert!(detail.contains("cannot read"), "{detail}");
+        assert!(
+            !reverted.success,
+            "revert must fail closed on an unreadable lock: {:?}",
+            reverted.warnings
+        );
+        assert!(
+            fx2.root().join(fx2.expected_rel_tgz()).exists(),
+            "the artifact must survive the failed revert"
+        );
+    }
+
+    /// `npm shrinkwrap` RENAMES package-lock.json to npm-shrinkwrap.json,
+    /// carrying the vendored `file:` resolutions with it. The wired revert
+    /// then finds no package-lock.json to restore — deleting the artifact
+    /// anyway would leave the shrinkwrap (the lock npm installs from)
+    /// resolving through a deleted tarball, failing every later install
+    /// with ENOENT. Must refuse, fail-closed, like the unwired guard.
+    #[tokio::test]
+    async fn revert_refuses_when_a_renamed_lock_still_resolves_through_the_artifact() {
+        let fx = fixture().await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+        tokio::fs::rename(fx.lock_path(), fx.root().join(SHRINKWRAP))
+            .await
+            .unwrap();
+        let shrink_before = tokio::fs::read(fx.root().join(SHRINKWRAP)).await.unwrap();
+
+        let outcome = revert_npm(&entry, fx.root(), false).await;
+        assert!(
+            !outcome.success,
+            "must refuse while the shrinkwrap still resolves through the artifact: {:?}",
+            outcome.warnings
+        );
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_lock_still_wired_revert_blocked"),
+            "{:?}",
+            outcome.warnings
+        );
+        assert!(
+            fx.root().join(fx.expected_rel_tgz()).exists(),
+            "the artifact must survive the refusal"
+        );
+        assert_eq!(
+            tokio::fs::read(fx.root().join(SHRINKWRAP)).await.unwrap(),
+            shrink_before,
+            "shrinkwrap untouched"
+        );
     }
 
     #[tokio::test]

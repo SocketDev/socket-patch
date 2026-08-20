@@ -102,11 +102,25 @@ fn collect_entries(tgz_bytes: &[u8], package_ident: &str) -> Result<Vec<ZipEntry
     let mut seen_files: HashSet<String> = HashSet::new();
 
     // mkdirp: emit every missing ancestor of `dirpath` (no trailing slash),
-    // shallowest first, exactly once.
-    fn mkdirp(dirpath: &str, seen: &mut HashSet<String>, out: &mut Vec<ZipEntry>) {
+    // shallowest first, exactly once. A needed directory whose path is
+    // already a file is a duplicate path across kinds — yarn's zipfs cannot
+    // hold both, so no yarn checksum exists for the tarball; fail closed.
+    fn mkdirp(
+        dirpath: &str,
+        seen: &mut HashSet<String>,
+        files: &HashSet<String>,
+        out: &mut Vec<ZipEntry>,
+    ) -> Result<(), String> {
         let parts: Vec<&str> = dirpath.split('/').collect();
         for i in 1..=parts.len() {
-            let d = format!("{}/", parts[..i].join("/"));
+            let stem = parts[..i].join("/");
+            if files.contains(&stem) {
+                return Err(format!(
+                    "tarball uses `{stem}` as both a file and a directory; cannot rebuild \
+                     the berry cache zip deterministically"
+                ));
+            }
+            let d = format!("{stem}/");
             if seen.insert(d.clone()) {
                 out.push(ZipEntry {
                     name: d,
@@ -116,6 +130,7 @@ fn collect_entries(tgz_bytes: &[u8], package_ident: &str) -> Result<Vec<ZipEntry
                 });
             }
         }
+        Ok(())
     }
 
     let mut archive = tar::Archive::new(GzDecoder::new(tgz_bytes));
@@ -159,9 +174,19 @@ fn collect_entries(tgz_bytes: &[u8], package_ident: &str) -> Result<Vec<ZipEntry
                 } else {
                     format!("{prefix}/{stripped}")
                 };
-                mkdirp(&dir, &mut seen_dirs, &mut entries);
+                mkdirp(&dir, &mut seen_dirs, &seen_files, &mut entries)?;
             }
             tar::EntryType::Regular | tar::EntryType::Continuous => {
+                // A file-typed name ending in `/` is the pre-POSIX directory
+                // marker — tar readers (GNU tar, node-tar) treat it as a
+                // directory regardless of the typeflag. Another unspiked
+                // shape: refuse rather than hash it as a file.
+                if raw_name.ends_with('/') {
+                    return Err(format!(
+                        "tar file entry `{raw_name}` has a directory-style name; cannot \
+                         rebuild the berry cache zip deterministically"
+                    ));
+                }
                 if stripped.is_empty() {
                     return Err(format!(
                         "tar file entry `{raw_name}` has no path under the package prefix"
@@ -176,8 +201,16 @@ fn collect_entries(tgz_bytes: &[u8], package_ident: &str) -> Result<Vec<ZipEntry
                          berry cache zip deterministically"
                     ));
                 }
+                // The mirror of mkdirp's cross-kind check: this file's path
+                // already emitted as a directory.
+                if seen_dirs.contains(&format!("{target}/")) {
+                    return Err(format!(
+                        "tarball uses `{target}` as both a file and a directory; cannot \
+                         rebuild the berry cache zip deterministically"
+                    ));
+                }
                 let parent = target.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
-                mkdirp(parent, &mut seen_dirs, &mut entries);
+                mkdirp(parent, &mut seen_dirs, &seen_files, &mut entries)?;
                 let mut data = Vec::new();
                 entry
                     .read_to_end(&mut data)
@@ -524,6 +557,53 @@ mod tests {
         let tgz = tgz_with_names(&[("package/a.txt", b"1"), ("package/a.txt", b"2")]);
         let err = berry_cache_checksum_10c0(&tgz, "x").unwrap_err();
         assert!(err.contains("more than once"), "{err}");
+    }
+
+    /// A path used as both a file and a directory is a duplicate path across
+    /// kinds — yarn's zipfs cannot hold both (its mkdir/write throws), so no
+    /// yarn-produced checksum exists for such a tarball. Emitting a zip with
+    /// both `a` and `a/` is a guess; must fail closed in either tar order.
+    #[test]
+    fn file_and_directory_path_collisions_fail_closed() {
+        // File first, then a file nested under the same path.
+        let tgz = tgz_with_names(&[("package/a", b"1"), ("package/a/b", b"2")]);
+        let err = berry_cache_checksum_10c0(&tgz, "x").unwrap_err();
+        assert!(err.contains("both a file and a directory"), "{err}");
+
+        // Directory (implied by the nested file) first, then the same-named file.
+        let tgz = tgz_with_names(&[("package/a/b", b"2"), ("package/a", b"1")]);
+        let err = berry_cache_checksum_10c0(&tgz, "x").unwrap_err();
+        assert!(err.contains("both a file and a directory"), "{err}");
+
+        // An explicit directory entry colliding with a later file.
+        let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::new(6));
+        let mut tar = tar::Builder::new(gz);
+        let mut h = tar::Header::new_gnu();
+        h.set_entry_type(tar::EntryType::Directory);
+        h.set_size(0);
+        h.set_mode(0o755);
+        h.set_cksum();
+        tar.append_data(&mut h, "package/a/", &b""[..]).unwrap();
+        let mut h = tar::Header::new_gnu();
+        h.set_entry_type(tar::EntryType::Regular);
+        h.set_size(1);
+        h.set_mode(0o644);
+        h.set_cksum();
+        tar.append_data(&mut h, "package/a", &b"1"[..]).unwrap();
+        let tgz = tar.into_inner().unwrap().finish().unwrap();
+        let err = berry_cache_checksum_10c0(&tgz, "x").unwrap_err();
+        assert!(err.contains("both a file and a directory"), "{err}");
+    }
+
+    /// A Regular-typed entry whose name ends in `/` is the pre-POSIX
+    /// directory-marker convention — tar readers (GNU tar, node-tar) treat
+    /// name-ends-with-`/` as a directory regardless of the typeflag. Hashing
+    /// it as a file guesses a layout the spike never covered; fail closed.
+    #[test]
+    fn regular_entry_with_trailing_slash_fails_closed() {
+        let tgz = tgz_with_names(&[("package/sub/", b"")]);
+        let err = berry_cache_checksum_10c0(&tgz, "x").unwrap_err();
+        assert!(err.contains("directory-style name"), "{err}");
     }
 
     #[test]

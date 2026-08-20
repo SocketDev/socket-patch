@@ -548,14 +548,17 @@ pub(super) fn tgz_rel_leaf(name: &str, version: &str) -> String {
 }
 
 /// `bundleDependencies` (npm) / `bundledDependencies` (legacy alias):
-/// `true` means "all deps", an array names them; either makes the package
-/// unvendorable (see the refusal site).
+/// `true` means "all deps", an array names them, and npm-bundled falls back
+/// to `Object.keys(bd)` for any other truthy value — so an OBJECT form
+/// bundles its keys too; any of these makes the package unvendorable (see
+/// the refusal site).
 fn declares_bundled_deps(pkg: &Value) -> bool {
     ["bundleDependencies", "bundledDependencies"]
         .iter()
         .any(|k| match pkg.get(*k) {
             Some(Value::Bool(b)) => *b,
             Some(Value::Array(a)) => !a.is_empty(),
+            Some(Value::Object(o)) => !o.is_empty(),
             _ => false,
         })
 }
@@ -724,6 +727,35 @@ mod tests {
             guard_coordinates("pkg:npm/left-pad@1.3.0", &record).unwrap_err(),
             "unsafe_coordinates",
         );
+    }
+
+    /// npm (npm-bundled) derives the bundle list as
+    /// `Array.isArray(bd) ? bd : bd === true ? allDeps : Object.keys(bd)` —
+    /// the OBJECT form `{"dep": "..."}` is honored (its keys are bundled),
+    /// so it must trigger the refusal exactly like the array form instead of
+    /// failing open and packing a tarball whose bundled node_modules was
+    /// pruned.
+    #[test]
+    fn declares_bundled_deps_matches_npm_value_shapes() {
+        let with = |key: &str, v: serde_json::Value| {
+            declares_bundled_deps(&serde_json::json!({ key: v }))
+        };
+        for key in ["bundleDependencies", "bundledDependencies"] {
+            assert!(with(key, serde_json::json!(true)), "{key}: true = all deps");
+            assert!(!with(key, serde_json::json!(false)), "{key}: false");
+            assert!(with(key, serde_json::json!(["dep"])), "{key}: array names");
+            assert!(!with(key, serde_json::json!([])), "{key}: empty array");
+            assert!(
+                with(key, serde_json::json!({"dep": "^1.0.0"})),
+                "{key}: object form bundles its keys (npm-bundled Object.keys)"
+            );
+            assert!(
+                !with(key, serde_json::json!({})),
+                "{key}: empty object bundles nothing"
+            );
+            assert!(!with(key, serde_json::json!(null)), "{key}: null");
+        }
+        assert!(!declares_bundled_deps(&serde_json::json!({})), "absent");
     }
 
     #[tokio::test]

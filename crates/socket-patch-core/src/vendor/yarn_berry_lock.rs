@@ -49,8 +49,9 @@ use super::state::{
     write_marker, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
 };
 use super::yarn_classic_lock::{
-    body_field_line, lines_to_json, pattern_real_name, read_yarn_lock, replace_block,
-    revert_recorded_block, scan_blocks, split_key_patterns, split_pattern, LockBlock,
+    body_field_line, lines_to_json, pattern_real_name, read_regular, read_regular_to_string,
+    read_yarn_lock, replace_block, revert_recorded_block, scan_blocks, split_key_patterns,
+    split_pattern, LockBlock,
 };
 use super::{RevertOutcome, VendorOutcome, VendorWarning};
 
@@ -124,7 +125,7 @@ pub async fn vendor_yarn_berry(
     }
 
     // ── 3. .yarnrc.yml knobs that change the checksum (spike B4) ─────────
-    match tokio::fs::read_to_string(project_root.join(YARNRC)).await {
+    match read_regular_to_string(&project_root.join(YARNRC)).await {
         Ok(rc) => {
             if let Some(level) = yarnrc_compression_level(&rc) {
                 if level != "0" {
@@ -160,7 +161,7 @@ pub async fn vendor_yarn_berry(
 
     // ── 5. package.json + user-override conflict gate ─────────────────────
     let pkg_path = project_root.join(PACKAGE_JSON);
-    let pkg_bytes = match tokio::fs::read(&pkg_path).await {
+    let pkg_bytes = match read_regular(&pkg_path).await {
         Ok(b) => b,
         Err(e) => {
             return refused(
@@ -514,20 +515,26 @@ pub async fn revert_yarn_berry(
         Err(outcome) => return outcome,
     };
     // Nothing to replay (a `repair`-reconstructed entry): the artifact may
-    // only be removed when yarn.lock provably no longer resolves through it
-    // — otherwise refuse, fail-closed, instead of silently bricking
-    // installs. Runs before the dry-run return so a preview never
-    // advertises a revert the wet run refuses.
+    // only be removed when the project provably no longer resolves through
+    // it — otherwise refuse, fail-closed, instead of silently bricking
+    // installs. Berry resolves through BOTH wired files (the yarn.lock
+    // entry AND the package.json resolutions value each carry the uuid dir
+    // path), so each is probed independently — a dangling `file:` spec in
+    // either fails every subsequent install on the missing tarball. Runs
+    // before the dry-run return so a preview never advertises a revert the
+    // wet run refuses.
     if entry.wiring.is_empty() {
-        if let Some(blocked) = super::npm_lock::guard_unwired_textual_revert(
-            project_root,
-            &entry.uuid,
-            &uuid_dir_rel,
-            &[YARN_LOCK],
-        )
-        .await
-        {
-            return blocked;
+        for wired in [YARN_LOCK, PACKAGE_JSON] {
+            if let Some(blocked) = super::npm_lock::guard_unwired_textual_revert(
+                project_root,
+                &entry.uuid,
+                &uuid_dir_rel,
+                &[wired],
+            )
+            .await
+            {
+                return blocked;
+            }
         }
     }
     if dry_run {
@@ -558,7 +565,7 @@ pub async fn revert_yarn_berry(
     // yarn.lock fragments (reverse application order).
     if !lock_recs.is_empty() {
         let lock_path = project_root.join(YARN_LOCK);
-        match tokio::fs::read_to_string(&lock_path).await {
+        match read_regular_to_string(&lock_path).await {
             Ok(mut text) => {
                 let mut changed = false;
                 for rec in lock_recs {
@@ -593,7 +600,7 @@ pub async fn revert_yarn_berry(
     // package.json resolutions entries.
     if !pkg_recs.is_empty() {
         let pkg_path = project_root.join(PACKAGE_JSON);
-        match tokio::fs::read(&pkg_path).await {
+        match read_regular(&pkg_path).await {
             Ok(bytes) => {
                 let mut pkg: Value = match serde_json::from_slice(&bytes) {
                     Ok(v) => v,
@@ -653,6 +660,35 @@ pub async fn revert_yarn_berry(
     if outcome.drift_skipped() {
         outcome.keep_artifact(&uuid_dir_rel);
         return outcome;
+    }
+
+    // FAIL-CLOSED (same brick class as the unwired guard above, twin of
+    // npm_lock's post-restore probe): the restore only rewrites the
+    // fragments the wiring recorded, but yarn can still resolve through the
+    // artifact via a lock entry or resolutions value the wiring never named
+    // (hand-copied or re-keyed since vendoring). Deleting the uuid dir then
+    // fails every subsequent install on the missing tarball, silently. Both
+    // wired files are probed independently; absent or unprovable keeps the
+    // wired revert's existing missing-file tolerance.
+    for wired in [YARN_LOCK, PACKAGE_JSON] {
+        if super::npm_flavor::lock_text_mentions_uuid(project_root, &[wired], &entry.uuid).await
+            == Some(true)
+        {
+            let detail = format!(
+                "refusing to remove {uuid_dir_rel}: after restoring the recorded wiring, \
+                 {wired} still resolves through it (was the entry re-keyed or hand-copied \
+                 since vendoring?) — deleting the artifact would make every subsequent \
+                 install fail; restore the pre-vendor {wired} (or remove the dependency and \
+                 re-lock) and re-run `vendor --revert`"
+            );
+            outcome.success = false;
+            outcome.error = Some(detail.clone());
+            outcome.warnings.push(VendorWarning::new(
+                "vendor_lock_still_wired_revert_blocked",
+                detail,
+            ));
+            return outcome;
+        }
     }
 
     if let Err(e) = remove_tree(&project_root.join(&uuid_dir_rel)).await {
@@ -1937,11 +1973,14 @@ __metadata:
         assert!(!outcome.success, "unreadable-lock revert must refuse");
         assert!(fx.tgz_path().exists());
 
-        // Re-locked away from the artifact (provably orphaned): removal
-        // proceeds, replaying nothing.
+        // Re-locked away from the artifact AND the resolutions entry gone
+        // (provably orphaned — package.json is probed too, see the
+        // dangling-resolutions guard test): removal proceeds, replaying
+        // nothing.
         tokio::fs::write(fx.lock_path(), &fx.lock_bytes)
             .await
             .unwrap();
+        tokio::fs::write(fx.pkg_path(), &fx.pkg_bytes).await.unwrap();
         let outcome = revert_yarn_berry(&entry, fx.root(), false).await;
         assert!(outcome.success, "{:?}", outcome.error);
         assert!(!fx.tgz_path().exists(), "orphaned artifact removed");
@@ -1951,15 +1990,239 @@ __metadata:
             "empty wiring replays nothing"
         );
 
-        // No lock at all: nothing can reference the artifact — proceed.
+        // No lock and no resolutions reference: nothing can reference the
+        // artifact — proceed.
         let fx = fixture().await;
         let (_, entry, _) = expect_done(fx.vendor(false).await);
         let mut entry = entry.unwrap();
         entry.wiring.clear();
         tokio::fs::remove_file(fx.lock_path()).await.unwrap();
+        tokio::fs::write(fx.pkg_path(), &fx.pkg_bytes).await.unwrap();
         let outcome = revert_yarn_berry(&entry, fx.root(), false).await;
         assert!(outcome.success, "{:?}", outcome.error);
         assert!(!fx.tgz_path().exists(), "no lock, no reference");
+    }
+
+    /// A re-install or hand edit can copy our `file:` entry to a lock key
+    /// the wiring never recorded. The recorded fragments then restore
+    /// cleanly, but yarn still resolves through the artifact — deleting the
+    /// uuid dir would fail every subsequent install on the missing tarball,
+    /// silently. Must refuse, fail-closed (twin of npm_lock's post-restore
+    /// probe).
+    #[tokio::test]
+    async fn revert_refuses_when_an_unrecorded_lock_entry_still_resolves_through_the_artifact() {
+        let fx = fixture().await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+
+        // Duplicate the vendored entry under a key the wiring never recorded.
+        let text = tokio::fs::read_to_string(fx.lock_path()).await.unwrap();
+        let resolution = text
+            .lines()
+            .find(|l| l.starts_with("  resolution: \"left-pad@file:"))
+            .expect("the vendored lock must carry our resolution line");
+        let copied = format!(
+            "\n\"left-pad@npm:^1.3.0\":\n  version: 1.3.0\n{resolution}\n  languageName: node\n  linkType: hard\n"
+        );
+        tokio::fs::write(fx.lock_path(), format!("{text}{copied}"))
+            .await
+            .unwrap();
+
+        let outcome = revert_yarn_berry(&entry, fx.root(), false).await;
+        assert!(
+            !outcome.success,
+            "must refuse while an unrecorded entry still resolves through the artifact: {:?}",
+            outcome.warnings
+        );
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_lock_still_wired_revert_blocked"),
+            "{:?}",
+            outcome.warnings
+        );
+        assert!(
+            fx.tgz_path().exists(),
+            "the artifact must survive the refusal"
+        );
+    }
+
+    /// The user re-keys our resolutions entry (`"left-pad"` →
+    /// `"left-pad@npm:1.3.0"`) without changing its `file:` value. The
+    /// recorded key then reads as already-converged (Added record, key
+    /// absent) and the lock restores cleanly — but package.json still
+    /// resolves through the artifact; removing it would make every
+    /// `yarn install` fail on the missing tarball. Must refuse, fail-closed.
+    #[tokio::test]
+    async fn revert_refuses_when_a_rekeyed_resolutions_entry_still_references_the_artifact() {
+        let fx = fixture().await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+
+        let pkg_text = tokio::fs::read_to_string(fx.pkg_path()).await.unwrap();
+        let rekeyed = pkg_text.replace("\"left-pad\": \"file:", "\"left-pad@npm:1.3.0\": \"file:");
+        assert_ne!(rekeyed, pkg_text, "the re-key edit must hit");
+        tokio::fs::write(fx.pkg_path(), &rekeyed).await.unwrap();
+
+        let outcome = revert_yarn_berry(&entry, fx.root(), false).await;
+        assert!(
+            !outcome.success,
+            "must refuse while a re-keyed resolutions entry still references the artifact: {:?}",
+            outcome.warnings
+        );
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_lock_still_wired_revert_blocked"),
+            "{:?}",
+            outcome.warnings
+        );
+        assert!(
+            fx.tgz_path().exists(),
+            "the artifact must survive the refusal"
+        );
+    }
+
+    /// Empty-wiring (repair-reconstructed) entries: yarn resolves through
+    /// package.json's resolutions value too, not just the lock — reverting
+    /// while the resolutions entry still names the uuid dir would leave a
+    /// dangling `file:` spec that fails every subsequent install. Must
+    /// refuse even when yarn.lock provably no longer references the
+    /// artifact.
+    #[tokio::test]
+    async fn empty_wiring_revert_refuses_while_resolutions_still_references_the_artifact() {
+        let fx = fixture().await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let mut entry = entry.unwrap();
+        entry.wiring.clear();
+        // Lock re-resolved away from the artifact; package.json untouched
+        // (its resolutions entry still points into the uuid dir).
+        tokio::fs::write(fx.lock_path(), &fx.lock_bytes)
+            .await
+            .unwrap();
+
+        for dry_run in [true, false] {
+            let outcome = revert_yarn_berry(&entry, fx.root(), dry_run).await;
+            assert!(!outcome.success, "dry_run={dry_run}: must refuse");
+            assert!(
+                outcome
+                    .warnings
+                    .iter()
+                    .any(|w| w.code == "vendor_wiring_unknown_revert_blocked"),
+                "{:?}",
+                outcome.warnings
+            );
+            assert!(fx.tgz_path().exists(), "artifact survives the refusal");
+        }
+    }
+
+    #[cfg(unix)]
+    fn mkfifo(path: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+        let c_path =
+            std::ffi::CString::new(path.as_os_str().as_bytes()).expect("fifo path has no NUL");
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
+        assert_eq!(
+            rc,
+            0,
+            "mkfifo(2) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    /// A FIFO planted as any of the three files this backend reads must
+    /// fail fast instead of wedging vendor or revert forever in an
+    /// `open(2)` waiting for a writer that never comes. Same
+    /// `open_regular_file` guard class as the vendor siblings (npm_lock.rs,
+    /// pnpm_lock.rs, lock_inventory.rs).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fifo_files_fail_fast_instead_of_wedging_vendor_and_revert() {
+        // Vendor halves: a FIFO as yarn.lock / .yarnrc.yml / package.json.
+        let fx_lock = fixture().await;
+        tokio::fs::remove_file(fx_lock.lock_path()).await.unwrap();
+        mkfifo(&fx_lock.lock_path());
+
+        let fx_rc = fixture().await;
+        tokio::fs::remove_file(fx_rc.root().join(YARNRC))
+            .await
+            .unwrap();
+        mkfifo(&fx_rc.root().join(YARNRC));
+
+        let fx_pkg = fixture().await;
+        tokio::fs::remove_file(fx_pkg.pkg_path()).await.unwrap();
+        mkfifo(&fx_pkg.pkg_path());
+
+        // Revert halves: vendor normally, then swap each wired file for a
+        // FIFO before reverting.
+        let fx_rl = fixture().await;
+        let (_, entry_rl, _) = expect_done(fx_rl.vendor(false).await);
+        let entry_rl = entry_rl.unwrap();
+        tokio::fs::remove_file(fx_rl.lock_path()).await.unwrap();
+        mkfifo(&fx_rl.lock_path());
+
+        let fx_rp = fixture().await;
+        let (_, entry_rp, _) = expect_done(fx_rp.vendor(false).await);
+        let entry_rp = entry_rp.unwrap();
+        tokio::fs::remove_file(fx_rp.pkg_path()).await.unwrap();
+        mkfifo(&fx_rp.pkg_path());
+
+        let deadline = std::time::Duration::from_secs(5);
+        let all = async {
+            (
+                fx_lock.vendor(false).await,
+                fx_rc.vendor(false).await,
+                fx_pkg.vendor(false).await,
+                revert_yarn_berry(&entry_rl, fx_rl.root(), false).await,
+                revert_yarn_berry(&entry_rp, fx_rp.root(), false).await,
+            )
+        };
+        let Ok((v_lock, v_rc, v_pkg, r_lock, r_pkg)) = tokio::time::timeout(deadline, all).await
+        else {
+            // On timeout the open is wedged in a `spawn_blocking` thread the
+            // runtime waits for on shutdown; connect a non-blocking writer
+            // to release it so the test can FAIL instead of hanging the
+            // suite.
+            use std::os::unix::fs::OpenOptionsExt;
+            for path in [
+                fx_lock.lock_path(),
+                fx_rc.root().join(YARNRC),
+                fx_pkg.pkg_path(),
+                fx_rl.lock_path(),
+                fx_rp.pkg_path(),
+            ] {
+                let _ = std::fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(path);
+            }
+            panic!("yarn-berry file reads must fail fast on FIFOs");
+        };
+        let detail = expect_refused(v_lock, "vendor_lockfile_missing");
+        assert!(detail.contains("cannot read"), "{detail}");
+        let detail = expect_refused(v_rc, "vendor_yarn_berry_cache_unsupported");
+        assert!(detail.contains("cannot read"), "{detail}");
+        expect_refused(v_pkg, "vendor_yarn_berry_manifest_unreadable");
+        assert!(
+            !r_lock.success,
+            "revert must fail closed on an unreadable lock: {:?}",
+            r_lock.warnings
+        );
+        assert!(
+            fx_rl.tgz_path().exists(),
+            "the artifact must survive the failed revert"
+        );
+        assert!(
+            !r_pkg.success,
+            "revert must fail closed on an unreadable package.json: {:?}",
+            r_pkg.warnings
+        );
+        assert!(
+            fx_rp.tgz_path().exists(),
+            "the artifact must survive the failed revert"
+        );
     }
 
     #[tokio::test]

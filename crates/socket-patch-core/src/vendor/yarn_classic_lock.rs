@@ -95,8 +95,9 @@ pub async fn vendor_yarn_classic(
 
     // ── 3. Find the rewritable blocks (pre-flight, BEFORE staging) ────────
     let mut candidate_keys: Vec<String> = Vec::new();
-    for block in scan_blocks(&text) {
-        match classify_classic_block(&block, name, version) {
+    let blocks = scan_blocks(&text);
+    for block in &blocks {
+        match classify_classic_block(block, name, version) {
             BlockClass::Candidate => candidate_keys.push(block.key.clone()),
             BlockClass::LinkSkip(detail) => {
                 warnings.push(VendorWarning::new("vendor_link_entry_skipped", detail));
@@ -113,6 +114,24 @@ pub async fn vendor_yarn_classic(
             ),
         );
     }
+    // A candidate key on more than one block (a mangled merge — yarn itself
+    // parses duplicates last-wins) makes the by-key rewrite below ambiguous:
+    // it would splice the first same-key block, even a version-mismatched
+    // one classification never selected, and leave yarn's winner resolving
+    // to the registry — success reported, package unpatched. Refuse-early.
+    for key in &candidate_keys {
+        if blocks.iter().filter(|b| &b.key == key).count() > 1 {
+            return refused(
+                "vendor_lock_entry_ambiguous",
+                format!(
+                    "{YARN_LOCK} has more than one block with the key `{key}` (most likely a \
+                     mangled merge; yarn keeps only the last) — run `yarn install` to re-lock, \
+                     then re-run the vendor"
+                ),
+            );
+        }
+    }
+    drop(blocks);
 
     // ── 4–7. Stage → patch → pack (shared flavor-agnostic pipeline) ───────
     // A wiring failure past this point must unwind the uuid dir staging is
@@ -334,7 +353,10 @@ pub async fn revert_yarn_classic(
     }
 
     let lock_path = project_root.join(YARN_LOCK);
-    let text = match tokio::fs::read_to_string(&lock_path).await {
+    // Guarded read (`open_regular_file`): a FIFO planted as yarn.lock fails
+    // fast into the error arm instead of wedging the revert forever in an
+    // `open(2)` waiting for a writer.
+    let text = match read_regular_to_string(&lock_path).await {
         Ok(t) => Some(t),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             outcome.warnings.push(VendorWarning::new(
@@ -373,6 +395,33 @@ pub async fn revert_yarn_classic(
     // deleting evidence out from under a lock we just refused to touch.
     if outcome.drift_skipped() {
         outcome.keep_artifact(&uuid_dir_rel);
+        return outcome;
+    }
+
+    // FAIL-CLOSED (same brick class as the unwired guard above, twin of
+    // npm_lock's and yarn_berry's post-restore probes): the restore only
+    // rewrites the blocks the wiring recorded, but yarn can still resolve
+    // through the artifact via a block the wiring never named (hand-copied
+    // or re-keyed since vendoring). Deleting the uuid dir then fails every
+    // subsequent install on the missing tarball, silently. Mentioned ⇒
+    // refuse; absent or unprovable keeps the wired revert's existing
+    // missing-lock tolerance.
+    if super::npm_flavor::lock_text_mentions_uuid(project_root, &[YARN_LOCK], &entry.uuid).await
+        == Some(true)
+    {
+        let detail = format!(
+            "refusing to remove {uuid_dir_rel}: after restoring the recorded lock blocks, \
+             {YARN_LOCK} still resolves through it (was the entry re-keyed or hand-copied \
+             since vendoring?) — deleting the artifact would make every subsequent install \
+             fail; restore the pre-vendor {YARN_LOCK} (or remove the dependency and re-lock) \
+             and re-run `vendor --revert`"
+        );
+        outcome.success = false;
+        outcome.error = Some(detail.clone());
+        outcome.warnings.push(VendorWarning::new(
+            "vendor_lock_still_wired_revert_blocked",
+            detail,
+        ));
         return outcome;
     }
 
@@ -620,7 +669,7 @@ fn is_tarball_path(path: &str) -> bool {
 /// when it is missing or unreadable (vendoring rewires the lockfile, so one
 /// must exist). Shared verbatim by the classic and berry backends.
 pub(super) async fn read_yarn_lock(project_root: &Path) -> Result<String, Box<VendorOutcome>> {
-    match tokio::fs::read_to_string(project_root.join(YARN_LOCK)).await {
+    match read_regular_to_string(&project_root.join(YARN_LOCK)).await {
         Ok(t) => Ok(t),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(Box::new(refused(
             "vendor_lockfile_missing",
@@ -635,6 +684,28 @@ pub(super) async fn read_yarn_lock(project_root: &Path) -> Result<String, Box<Ve
             format!("cannot read {YARN_LOCK}: {e}"),
         ))),
     }
+}
+
+/// Guarded read shared in shape with the vendor siblings' twins
+/// (npm_lock.rs, pnpm_lock.rs, lock_inventory.rs): `open_regular_file`
+/// opens with `O_NONBLOCK` and rejects non-regular files, so a FIFO planted
+/// as yarn.lock / package.json / .yarnrc.yml fails fast instead of wedging
+/// vendor / revert forever in an `open(2)` waiting for a writer.
+pub(super) async fn read_regular(path: &Path) -> std::io::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt as _;
+
+    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.read_to_end(&mut bytes).await?;
+    Ok(bytes)
+}
+
+/// [`read_regular`], decoded as UTF-8 (`InvalidData` on failure, matching
+/// `read_to_string`'s error kind).
+pub(super) async fn read_regular_to_string(path: &Path) -> std::io::Result<String> {
+    let bytes = read_regular(path).await?;
+    String::from_utf8(bytes)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
 /// One key-line block of a yarn lockfile (classic or berry).
@@ -1337,6 +1408,57 @@ left-pad@^1.3.0:
         );
     }
 
+    /// A key that appears on more than one block (a mangled merge — yarn
+    /// itself parses duplicates last-wins) must be refused before any write:
+    /// the rewrite loop looks blocks up BY KEY, so it would splice the first
+    /// same-key block — even a version-mismatched one classification never
+    /// selected — and leave the real candidate resolving to the registry,
+    /// i.e. report success while the unpatched tarball still installs.
+    #[tokio::test]
+    async fn duplicate_key_blocks_are_refused_before_any_write() {
+        // (a) The duplicate carries a DIFFERENT version: the by-key lookup
+        // would corrupt the 1.2.0 block instead of the 1.3.0 candidate.
+        let wrong_version_dup = r#"# yarn lockfile v1
+
+left-pad@^1.3.0:
+  version "1.2.0"
+  resolved "https://registry.yarnpkg.com/left-pad/-/left-pad-1.2.0.tgz#d30a73c67b8c4a4b494cb3c7d4cfad4bb1a30b8a"
+  integrity sha512-1WWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWA==
+
+left-pad@^1.3.0:
+  version "1.3.0"
+  resolved "https://registry.yarnpkg.com/left-pad/-/left-pad-1.3.0.tgz#5b8a3a7765dfe001261dde915589e782f8c94d1e"
+  integrity sha512-XI5MPzVNApjAyhQzphX8BkmKsKUxD4LdyK24iZeQGinBN9yTQT3bFlCBy/aVx2HrNcqQGsdot8ghrjyrvMCoEA==
+"#;
+        // (b) Both duplicates are candidates: only the first would be
+        // rewritten; the second (yarn's last-wins winner) would stay on the
+        // registry.
+        let both_candidates_dup = r#"# yarn lockfile v1
+
+left-pad@^1.3.0:
+  version "1.3.0"
+  resolved "https://registry.yarnpkg.com/left-pad/-/left-pad-1.3.0.tgz#5b8a3a7765dfe001261dde915589e782f8c94d1e"
+  integrity sha512-XI5MPzVNApjAyhQzphX8BkmKsKUxD4LdyK24iZeQGinBN9yTQT3bFlCBy/aVx2HrNcqQGsdot8ghrjyrvMCoEA==
+
+left-pad@^1.3.0:
+  version "1.3.0"
+  resolved "https://registry.yarnpkg.com/left-pad/-/left-pad-1.3.0.tgz#5b8a3a7765dfe001261dde915589e782f8c94d1e"
+  integrity sha512-XI5MPzVNApjAyhQzphX8BkmKsKUxD4LdyK24iZeQGinBN9yTQT3bFlCBy/aVx2HrNcqQGsdot8ghrjyrvMCoEA==
+"#;
+        for lock in [wrong_version_dup, both_candidates_dup] {
+            let fx = fixture_with_lock(lock).await;
+            let detail = expect_refused(fx.vendor(false).await, "vendor_lock_entry_ambiguous");
+            assert!(detail.contains("left-pad@^1.3.0"), "names the key: {detail}");
+            assert!(detail.contains("yarn install"), "actionable detail: {detail}");
+            assert_eq!(
+                tokio::fs::read(fx.lock_path()).await.unwrap(),
+                fx.lock_bytes,
+                "refusal writes nothing"
+            );
+            assert!(!fx.root().join(".socket/vendor").exists());
+        }
+    }
+
     /// A lock-write failure AFTER the tarball is packed must unwind the
     /// freshly created uuid dir — no ledger entry exists for it, so
     /// `--revert` could never clean it up and the user would commit an
@@ -1624,6 +1746,116 @@ left-pad@^1.3.0:
         entry.uuid = "../../escape".to_string();
         let outcome = revert_yarn_classic(&entry, fx.root(), false).await;
         assert!(!outcome.success, "tampered uuid must fail closed");
+    }
+
+    /// After replaying the recorded blocks, yarn can still resolve through
+    /// the artifact via a block the wiring never named (hand-copied or
+    /// re-keyed since vendoring). Removing the uuid dir would then fail
+    /// every subsequent install on the missing tarball — refuse instead,
+    /// fail-closed (twin of npm_lock's and yarn_berry's post-restore
+    /// probes).
+    #[tokio::test]
+    async fn revert_refuses_when_an_unrecorded_lock_entry_still_resolves_through_the_artifact() {
+        let fx = fixture_with_lock(Y2_BEFORE).await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+
+        // Hand-copy the vendored block under a key the wiring never named.
+        let (sha1, sri) = fx.packed_hashes().await;
+        let extra = format!(
+            "\nleft-pad@^1.2.0:\n  version \"1.3.0\"\n  resolved \
+             \"file:./.socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz#{sha1}\"\n  \
+             integrity {sri}\n"
+        );
+        let text = format!("{}{extra}", fx.lock_text().await);
+        tokio::fs::write(fx.lock_path(), text).await.unwrap();
+
+        let outcome = revert_yarn_classic(&entry, fx.root(), false).await;
+        assert!(!outcome.success, "must refuse while still referenced");
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_lock_still_wired_revert_blocked"),
+            "{:?}",
+            outcome.warnings
+        );
+        assert!(fx.tgz_path().exists(), "artifact survives the refusal");
+        // The recorded block was still restored — only the removal is
+        // blocked — so undoing the hand-copy lets a re-run converge.
+        let after = fx.lock_text().await;
+        assert!(
+            after.contains("resolved \"https://registry.yarnpkg.com/left-pad/"),
+            "recorded block restored: {after}"
+        );
+        let healed = after.replace(&extra, "");
+        assert_ne!(healed, after, "the undo edit must hit");
+        tokio::fs::write(fx.lock_path(), healed).await.unwrap();
+
+        let outcome = revert_yarn_classic(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(!fx
+            .root()
+            .join(format!(".socket/vendor/npm/{UUID}"))
+            .exists());
+        assert_eq!(
+            tokio::fs::read(fx.lock_path()).await.unwrap(),
+            fx.lock_bytes,
+            "lock restored byte-for-byte once the extra reference is gone"
+        );
+    }
+
+    /// A FIFO planted as yarn.lock must fail the revert fast instead of
+    /// wedging it forever in an `open(2)` waiting for a writer (the vendor
+    /// half already reads through `read_regular_to_string`).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fifo_lock_fails_fast_instead_of_wedging_revert() {
+        let fx = fixture_with_lock(Y2_BEFORE).await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+        tokio::fs::remove_file(fx.lock_path()).await.unwrap();
+        mkfifo(&fx.lock_path());
+
+        let deadline = std::time::Duration::from_secs(5);
+        let revert = revert_yarn_classic(&entry, fx.root(), false);
+        let Ok(outcome) = tokio::time::timeout(deadline, revert).await else {
+            // On timeout the open is wedged in a `spawn_blocking` thread the
+            // runtime waits for on shutdown; connect a non-blocking writer
+            // to release it so the test can FAIL instead of hanging the
+            // suite.
+            use std::os::unix::fs::OpenOptionsExt;
+            let _ = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(fx.lock_path());
+            panic!("the revert lock read must fail fast on a FIFO");
+        };
+        assert!(!outcome.success, "a non-regular lock must fail the revert");
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("cannot read yarn.lock"),
+            "{:?}",
+            outcome.error
+        );
+        assert!(fx.tgz_path().exists(), "artifact survives the failure");
+    }
+
+    #[cfg(unix)]
+    fn mkfifo(path: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+        let c_path =
+            std::ffi::CString::new(path.as_os_str().as_bytes()).expect("fifo path has no NUL");
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
+        assert_eq!(
+            rc,
+            0,
+            "mkfifo(2) failed: {}",
+            std::io::Error::last_os_error()
+        );
     }
 
     /// The lockfile is a user-owned file we merely edit: both the vendor
