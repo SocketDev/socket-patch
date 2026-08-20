@@ -310,8 +310,8 @@ fn assert_vendored_on_disk(proj: &Path, pkg_before: &[u8]) {
     );
 }
 
-/// Step 4, shared: fresh dir with ONLY the committable files (package.json
-/// + bun.lock + .socket/), an EMPTY `BUN_INSTALL_CACHE_DIR`, and the
+/// Step 4, shared: fresh dir with ONLY the committable files (package.json,
+/// bun.lock, and .socket/), an EMPTY `BUN_INSTALL_CACHE_DIR`, and the
 /// spike-proven strictest invocation `bun install --frozen-lockfile` — the
 /// patched bytes MUST be what bun installs (BN7), and the committed lock
 /// must stay byte-identical.
