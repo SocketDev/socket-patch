@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use super::types::{CrawledPackage, CrawlerOptions};
 use crate::patch::path_safety;
-use crate::utils::fs::{entry_is_dir, home_dir, is_dir, list_dir_entries};
+use crate::utils::fs::{entry_is_dir, home_dir, is_dir, list_dir_entries, normalize_lexically};
 use crate::utils::process::{CommandRunner, SystemCommandRunner};
 
 /// Ruby/RubyGems ecosystem crawler for discovering gems in Bundler vendor
@@ -23,18 +23,43 @@ impl RubyCrawler {
 
     /// Get gem installation paths based on options.
     ///
-    /// In local mode, checks the project's Bundler install roots first —
-    /// `vendor/bundle` plus any explicit `BUNDLE_PATH` (env var or
-    /// `.bundle/config`), each in both the scoped
-    /// `<root>/<engine>/<abi>/gems/` and flat `<root>/gems/` layouts — then,
-    /// only if the cwd holds a Bundler manifest or lockfile, falls back to
-    /// the gem homes `gem env` reports.
+    /// In local mode, probes the project's Bundler install roots in
+    /// bundler's own precedence order — the app config file's
+    /// `BUNDLE_PATH:` (`bundle config set --local path`), then the
+    /// `BUNDLE_PATH` env var, then the default `vendor/bundle` — each in
+    /// both the scoped `<root>/<engine>/<abi>/gems/` and flat
+    /// `<root>/gems/` layouts. When the default `vendor/bundle` root holds
+    /// a store (a deployment-style install), those stores are the whole
+    /// answer; otherwise, if the cwd holds a Bundler manifest or lockfile,
+    /// the gem homes `gem env` reports are appended (deduped) — default
+    /// gems (rexml, json, …) never live in a bundle path, so an
+    /// env/config-rooted project still needs them.
     ///
     /// In global mode, queries `gem env gemdir` and `gem env gempath`, plus
     /// well-known fallback paths for rbenv, rvm, Homebrew, and system Ruby.
     pub async fn get_gem_paths(
         &self,
         options: &CrawlerOptions,
+    ) -> Result<Vec<PathBuf>, std::io::Error> {
+        self.get_gem_paths_with_env(
+            options,
+            std::env::var_os("BUNDLE_PATH").as_deref(),
+            std::env::var_os("BUNDLE_APP_CONFIG").as_deref(),
+            ambient_home().as_deref(),
+        )
+        .await
+    }
+
+    /// [`Self::get_gem_paths`] with the ambient `BUNDLE_PATH` /
+    /// `BUNDLE_APP_CONFIG` / home environment passed explicitly, so tests
+    /// stay hermetic on machines where bundler is configured. (`gem env`
+    /// still shells out; PATH-swapping tests keep covering that seam.)
+    pub async fn get_gem_paths_with_env(
+        &self,
+        options: &CrawlerOptions,
+        bundle_path_env: Option<&OsStr>,
+        app_config_env: Option<&OsStr>,
+        home_env: Option<&OsStr>,
     ) -> Result<Vec<PathBuf>, std::io::Error> {
         if options.global || options.global_prefix.is_some() {
             if let Some(ref custom) = options.global_prefix {
@@ -43,13 +68,31 @@ impl RubyCrawler {
             return Ok(Self::get_global_gem_paths().await);
         }
 
-        // Local mode: check the Bundler install roots first
-        let vendor_gems = Self::get_vendor_bundle_paths(&options.cwd).await;
-        if !vendor_gems.is_empty() {
-            return Ok(vendor_gems);
+        // Local mode: probe the Bundler install roots first.
+        let discovery = Self::discover_bundle_stores_with_env(
+            &options.cwd,
+            bundle_path_env,
+            app_config_env,
+            home_env,
+        )
+        .await;
+
+        // Historic early-return, kept ONLY for the implicit project-local
+        // `vendor/bundle` probe: a deployment-style install is the
+        // project's one gem source, so the ambient gem homes don't apply.
+        // Stores found via an env/config root do NOT suppress the fallback
+        // below: default gems (rexml, json, …) never live in a bundle path
+        // — they ship with ruby in the DEFAULT/system gem homes — so an
+        // env-`BUNDLE_PATH` project still needs the `gem env` homes to see
+        // them (the explicit-roots feature briefly suppressed that
+        // pre-existing fallback).
+        if discovery.default_root_has_stores {
+            return Ok(discovery.stores);
         }
 
-        // Only fall back to the installed gem homes if this looks like a Ruby
+        let mut paths = discovery.stores;
+
+        // Only consult the installed gem homes if this looks like a Ruby
         // project. A non-deployment `bundle install` puts the project's gems
         // in the ambient gem homes, so every home `gem env` reports counts —
         // not just `gemdir`: bundler resolves from all of `Gem.path`, and a
@@ -57,14 +100,15 @@ impl RubyCrawler {
         // keeps shared gems in the `@global` gemset; `--user-install` puts
         // them under `~/.gem`/`$XDG_DATA_HOME`).
         if Self::has_bundler_manifest(&options.cwd).await {
-            let gems_dirs = Self::gem_env_gems_dirs().await;
-            if !gems_dirs.is_empty() {
-                return Ok(gems_dirs);
+            let mut seen: HashSet<PathBuf> = paths.iter().cloned().collect();
+            for gems_dir in Self::gem_env_gems_dirs().await {
+                if seen.insert(gems_dir.clone()) {
+                    paths.push(gems_dir);
+                }
             }
         }
 
-        // Not a Ruby project — return empty
-        Ok(Vec::new())
+        Ok(paths)
     }
 
     /// Crawl all discovered gem paths and return every package found.
@@ -185,25 +229,46 @@ impl RubyCrawler {
     /// Find installed-gem `gems/` directories under the project's Bundler
     /// install roots.
     ///
-    /// Reads the ambient `BUNDLE_PATH`/`BUNDLE_APP_CONFIG` environment; the
-    /// `_with_env` variant takes both as parameters so tests stay hermetic.
+    /// Reads the ambient `BUNDLE_PATH`/`BUNDLE_APP_CONFIG`/home
+    /// environment; the `_with_env` variant takes them as parameters so
+    /// tests stay hermetic. Production flows go through
+    /// [`Self::get_gem_paths`] → [`Self::discover_bundle_stores_with_env`];
+    /// these two are the unit-test seam pinning the store list shape.
+    #[cfg(test)]
     async fn get_vendor_bundle_paths(cwd: &Path) -> Vec<PathBuf> {
-        Self::get_vendor_bundle_paths_with_env(
-            cwd,
-            std::env::var_os("BUNDLE_PATH").as_deref(),
-            std::env::var_os("BUNDLE_APP_CONFIG").as_deref(),
-        )
-        .await
+        Self::discover_bundle_stores(cwd).await.stores
     }
 
-    /// The bundler install roots probed:
+    /// [`Self::discover_bundle_stores_with_env`], flattened to just the
+    /// store list (the historical shape most tests pin).
+    #[cfg(test)]
+    async fn get_vendor_bundle_paths_with_env(
+        cwd: &Path,
+        bundle_path_env: Option<&OsStr>,
+        app_config_env: Option<&OsStr>,
+    ) -> Vec<PathBuf> {
+        Self::discover_bundle_stores_with_env(cwd, bundle_path_env, app_config_env, None)
+            .await
+            .stores
+    }
+
+    /// The bundler install roots, probed in bundler's own precedence order
+    /// (local config beats env beats default — `Bundler::Settings`):
     ///
-    /// - `<cwd>/vendor/bundle` — the default deployment/`--path` location;
-    /// - `$BUNDLE_PATH` — bundler's explicit install root (a relative value
-    ///   resolves against the project root, matching `Bundler.bundle_path`);
-    /// - the `BUNDLE_PATH:` entry of the app config file
-    ///   (`$BUNDLE_APP_CONFIG/config`, else `<cwd>/.bundle/config`) — what
-    ///   `bundle config set --local path <dir>` records.
+    /// 1. the `BUNDLE_PATH:` entry of the app config file
+    ///    (`$BUNDLE_APP_CONFIG/config`, else `<cwd>/.bundle/config`) — what
+    ///    `bundle config set --local path <dir>` records. SECURITY: this
+    ///    file is typically committed, i.e. attacker-authored input, and
+    ///    the root becomes a scan/apply WRITE target — so a value that
+    ///    resolves outside the project root is skipped with a warning (see
+    ///    [`resolve_config_bundle_path`]). `BUNDLE_PATH__SYSTEM: "true"`
+    ///    makes bundler ignore the recorded path, so it is dropped too
+    ///    (see [`parse_bundle_config_path`]).
+    /// 2. `$BUNDLE_PATH` — bundler's explicit install root (a relative
+    ///    value resolves against the project root, matching
+    ///    `Bundler.bundle_path`; a leading `~` expands against home).
+    ///    Trusted as-is: it is the user's own environment.
+    /// 3. `<cwd>/vendor/bundle` — the default deployment/`--path` location.
     ///
     /// The explicit roots can point anywhere (a machine-wide `BUNDLE_PATH`
     /// export must not pull another project's gem store into a non-Ruby
@@ -214,38 +279,77 @@ impl RubyCrawler {
     ///
     /// Each root is probed in BOTH layouts bundler produces (see
     /// [`Self::bundle_root_gems_dirs`]), and roots plus discovered `gems/`
-    /// dirs are deduped so a root reachable two ways (e.g. `BUNDLE_PATH`
-    /// naming `vendor/bundle`) is not scanned twice.
-    async fn get_vendor_bundle_paths_with_env(
+    /// dirs are lexically normalized and deduped so a root reachable two
+    /// ways (e.g. `BUNDLE_PATH` naming `vendor/bundle`, or spelling it
+    /// `vendor/x/../bundle`) is not scanned — or patched — twice.
+    async fn discover_bundle_stores_with_env(
         cwd: &Path,
         bundle_path_env: Option<&OsStr>,
         app_config_env: Option<&OsStr>,
-    ) -> Vec<PathBuf> {
-        let mut roots = vec![cwd.join("vendor").join("bundle")];
+        home_env: Option<&OsStr>,
+    ) -> BundleStoreDiscovery {
+        let home = home_env.map(Path::new);
+        let default_root = cwd.join("vendor").join("bundle");
+        let default_root = normalize_lexically(&default_root).unwrap_or(default_root);
 
+        let mut roots: Vec<PathBuf> = Vec::new();
+        let mut skipped_config_path = None;
         if Self::has_bundler_manifest(cwd).await {
-            if let Some(v) = bundle_path_env.filter(|v| !v.is_empty()) {
-                roots.push(resolve_bundle_path(cwd, Path::new(v)));
+            if let Some(value) = Self::app_config_bundle_path(cwd, app_config_env).await {
+                match resolve_config_bundle_path(cwd, &value, home) {
+                    Some(root) => roots.push(root),
+                    // Refused by the containment guard. Recorded — not
+                    // printed: the crawler has no --silent/--json context,
+                    // so the CLI surfaces it (see
+                    // [`config_path_ignored_warning`]).
+                    None => skipped_config_path = Some(value),
+                }
             }
-            if let Some(v) = Self::app_config_bundle_path(cwd, app_config_env).await {
-                roots.push(resolve_bundle_path(cwd, Path::new(&v)));
+            if let Some(v) = bundle_path_env.filter(|v| !v.is_empty()) {
+                roots.push(resolve_bundle_path(cwd, Path::new(v), home));
             }
         }
+        roots.push(default_root.clone());
 
-        let mut paths = Vec::new();
+        let mut stores = Vec::new();
+        let mut default_root_has_stores = false;
         let mut seen_roots = HashSet::new();
         let mut seen = HashSet::new();
         for root in roots {
             if !seen_roots.insert(root.clone()) {
                 continue;
             }
+            let is_default = root == default_root;
             for gems_dir in Self::bundle_root_gems_dirs(&root).await {
+                if is_default {
+                    default_root_has_stores = true;
+                }
                 if seen.insert(gems_dir.clone()) {
-                    paths.push(gems_dir);
+                    stores.push(gems_dir);
                 }
             }
         }
-        paths
+        BundleStoreDiscovery {
+            stores,
+            default_root_has_stores,
+            skipped_config_path,
+        }
+    }
+
+    /// Local-mode Bundler install-root discovery against the AMBIENT
+    /// environment — the same probe [`Self::get_gem_paths`] runs, exposed
+    /// for CLI consumers that need what the flat path list drops: the
+    /// store/fallback CLASS boundary (`stores`) and the config-skip
+    /// advisory (`skipped_config_path`). Cheap: filesystem probes only,
+    /// no `gem env` shell-out.
+    pub async fn discover_bundle_stores(cwd: &Path) -> BundleStoreDiscovery {
+        Self::discover_bundle_stores_with_env(
+            cwd,
+            std::env::var_os("BUNDLE_PATH").as_deref(),
+            std::env::var_os("BUNDLE_APP_CONFIG").as_deref(),
+            ambient_home().as_deref(),
+        )
+        .await
     }
 
     /// The installed-gem `gems/` dirs under one bundler install root, in
@@ -537,6 +641,56 @@ impl Default for RubyCrawler {
     }
 }
 
+/// Result of probing the Bundler install roots.
+///
+/// Public so CLI consumers (apply's store-class split, scan/apply's
+/// config-skip advisory) can see what local-mode discovery decided; the
+/// crawler itself stays print-free — surfacing the skip on stderr / the
+/// JSON envelope is the CLI's job, where `--silent`/`--json` gating lives.
+pub struct BundleStoreDiscovery {
+    /// The discovered installed-gem `gems/` stores, in root-precedence
+    /// order (local config > env > default `vendor/bundle`). Copies found
+    /// under these are the PRIMARY class in apply's multi-copy fan-out;
+    /// paths outside them are `gem env` fallback-home copies.
+    pub stores: Vec<PathBuf>,
+    /// Whether any store sits under the implicit project-local
+    /// `vendor/bundle` root — which keeps its historic
+    /// [`RubyCrawler::get_gem_paths`] early-return (a deployment install
+    /// suppresses the `gem env` fallback; env/config roots must not).
+    pub default_root_has_stores: bool,
+    /// A config-sourced `BUNDLE_PATH` value the containment guard REFUSED
+    /// (it resolved outside the project root — see
+    /// [`resolve_config_bundle_path`]). Recorded, never printed: callers
+    /// surface it via [`config_path_ignored_warning`] on their own
+    /// warning channel.
+    pub skipped_config_path: Option<String>,
+}
+
+/// The stable warning `(code, detail)` for a config-sourced `BUNDLE_PATH`
+/// refused by the containment guard. One builder so scan's run-level
+/// `warnings[]`, apply's envelope `warnings[]`, and the gated stderr lines
+/// all carry byte-identical text.
+pub fn config_path_ignored_warning(value: &str) -> (&'static str, String) {
+    (
+        "gem_bundle_config_path_ignored",
+        format!(
+            "bundler app config BUNDLE_PATH {value:?} resolves outside the project \
+             root; ignoring it as an install root (a committed .bundle/config is \
+             untrusted input — set BUNDLE_PATH in the environment to use an \
+             out-of-tree bundle path)"
+        ),
+    )
+}
+
+/// The ambient home directory as an env value (`HOME`, else Windows'
+/// `USERPROFILE`), `None` when unset or empty — the `~`-expansion base for
+/// ambient runs; tests inject theirs through the `_with_env` seams.
+fn ambient_home() -> Option<std::ffi::OsString> {
+    std::env::var_os("HOME")
+        .filter(|v| !v.is_empty())
+        .or_else(|| std::env::var_os("USERPROFILE").filter(|v| !v.is_empty()))
+}
+
 /// Pure parser for `gem env <key>` stdout. Returns the trimmed path
 /// string or `None` on empty input. Extracted so the helper logic is
 /// unit-testable without shelling out to the gem CLI.
@@ -561,43 +715,137 @@ fn gem_homes_to_gems_dirs(gempath: &str) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Resolve a `BUNDLE_PATH` value against the project root. Bundler resolves
-/// a relative bundle path against the directory of the Gemfile
-/// (`Bundler.root`), not the process cwd — the same rule
+/// Expand a leading `~` component against the home directory, as bundler's
+/// `File.expand_path` does for `BUNDLE_PATH` values. Only the bare-`~`
+/// form (`~`, `~/store`) expands; `~user` needs the passwd lookup bundler
+/// itself would do and is left untouched (it then resolves like a relative
+/// path, the crawler's previous behavior for every `~` form). With no home
+/// available the value is likewise left untouched.
+fn expand_tilde(value: &Path, home: Option<&Path>) -> PathBuf {
+    let mut components = value.components();
+    if let (Some(std::path::Component::Normal(first)), Some(home)) = (components.next(), home) {
+        if first == OsStr::new("~") {
+            return home.join(components.as_path());
+        }
+    }
+    value.to_path_buf()
+}
+
+/// Resolve a trusted (ENV-sourced) `BUNDLE_PATH` value against the project
+/// root. Bundler `File.expand_path`s the value: a leading `~` expands to
+/// the user's home, and a relative path resolves against the directory of
+/// the Gemfile (`Bundler.root`), not the process cwd — the same rule
 /// [`crate::setup::gem::bundler_app_config_dir`] follows for
-/// `BUNDLE_APP_CONFIG`.
-fn resolve_bundle_path(root: &Path, value: &Path) -> PathBuf {
-    if value.is_absolute() {
-        value.to_path_buf()
+/// `BUNDLE_APP_CONFIG`. `.`/`..` segments are folded lexically so the same
+/// physical root spelled two ways dedups to one probe; a value that pops
+/// above its own root keeps its unnormalized spelling (it is only ever
+/// probed, and the env value is the user's own machine state — no
+/// containment applies, unlike [`resolve_config_bundle_path`]).
+fn resolve_bundle_path(root: &Path, value: &Path, home: Option<&Path>) -> PathBuf {
+    let expanded = expand_tilde(value, home);
+    let resolved = if expanded.is_absolute() {
+        expanded
     } else {
-        root.join(value)
+        root.join(expanded)
+    };
+    normalize_lexically(&resolved).unwrap_or(resolved)
+}
+
+/// Resolve a CONFIG-sourced `BUNDLE_PATH` value (bundler's app config file
+/// — typically a committed `.bundle/config`) into an install root, or
+/// `None` when the containment policy refuses it.
+///
+/// SECURITY: unlike the environment variable (the user's own machine
+/// state), a repo-committed `.bundle/config` is attacker-authored input —
+/// and the resolved root becomes a scan target and, via `apply`, a WRITE
+/// target. An absolute value (`/usr/local/…`) or a `..` traversal
+/// (`../sibling-checkout`) must not let a malicious clone direct patch
+/// writes outside the project. Policy: after `~` expansion and lexical
+/// `.`/`..` normalization, the root must stay contained in the project
+/// root — the same containment posture as the composer crawler's
+/// `install-path` guard and the gem plugin-index cleanup in
+/// `setup/gem/mod.rs`. Out-of-tree bundle paths stay reachable via the
+/// trusted env `BUNDLE_PATH`.
+fn resolve_config_bundle_path(
+    project_root: &Path,
+    value: &str,
+    home: Option<&Path>,
+) -> Option<PathBuf> {
+    let expanded = expand_tilde(Path::new(value), home);
+    // Anything rooted takes the strict prefix check — not just
+    // `is_absolute()`: on Windows a root-relative `\evil` or drive-relative
+    // `C:evil` is NOT "absolute" yet `Path::join` substitutes it for (part
+    // of) the base, so routing it through the relative branch would escape
+    // containment.
+    let rooted = expanded.has_root()
+        || matches!(
+            expanded.components().next(),
+            Some(std::path::Component::Prefix(_))
+        );
+    if rooted {
+        // Contained iff it normalizes to somewhere under the project root.
+        // The comparison base must be absolute too: the CLI's default
+        // `--cwd .` is relative, and `starts_with` against a relative (or
+        // empty) base would trivially pass. `std::path::absolute` is
+        // lexical (no symlink resolution), matching the normalization here;
+        // if it cannot produce a base, fail closed.
+        let normalized = normalize_lexically(&expanded)?;
+        let base = std::path::absolute(project_root).ok()?;
+        let base = normalize_lexically(&base)?;
+        (!base.as_os_str().is_empty() && normalized.starts_with(&base)).then_some(normalized)
+    } else {
+        // A relative value is contained by construction unless its `..`
+        // segments climb out of the project root — `normalize_lexically`
+        // fails closed on exactly that.
+        let contained = normalize_lexically(&expanded)?;
+        let joined = project_root.join(contained);
+        Some(normalize_lexically(&joined).unwrap_or(joined))
     }
 }
 
-/// Extract the `BUNDLE_PATH:` value from bundler's app config file contents.
-/// The file is flat YAML bundler writes itself
+/// Extract the effective `BUNDLE_PATH:` value from bundler's app config
+/// file contents. The file is flat YAML bundler writes itself
 /// (`---\nBUNDLE_PATH: "vendor/bundle"\n`), so a line-based scrape is enough
 /// — matching the repo convention of line-parsing Cargo.toml rather than
 /// pulling in a format crate. Quoted values (bundler double-quotes what it
 /// writes) are unwrapped; an empty value counts as unset. Sibling keys like
-/// `BUNDLE_PATH__SYSTEM:` must not match — the prefix requires the colon
-/// immediately after `BUNDLE_PATH`.
+/// `BUNDLE_PATH__SYSTEM:` must not match the path key — the prefix requires
+/// the colon immediately after `BUNDLE_PATH`.
+///
+/// `BUNDLE_PATH__SYSTEM: "true"` (bundler's `path.system` setting) makes
+/// bundler IGNORE any recorded path and use the system/default gem home, so
+/// the whole config entry parses as unset — the caller then falls through
+/// to the `gem env` homes, which is exactly where those gems live. Bundler
+/// converts only the exact string `true` to a truthy setting; anything else
+/// leaves the recorded path in effect.
 fn parse_bundle_config_path(contents: &str) -> Option<String> {
+    let mut path: Option<String> = None;
+    let mut path_system = false;
     for line in contents.lines() {
         if let Some(rest) = line.strip_prefix("BUNDLE_PATH:") {
-            let v = rest.trim();
-            let v = v
-                .strip_prefix('"')
-                .and_then(|s| s.strip_suffix('"'))
-                .or_else(|| v.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
-                .unwrap_or(v);
-            if v.is_empty() {
-                return None;
+            let v = unquote_bundle_config_value(rest);
+            if !v.is_empty() {
+                path = Some(v.to_string());
             }
-            return Some(v.to_string());
+        } else if let Some(rest) = line.strip_prefix("BUNDLE_PATH__SYSTEM:") {
+            path_system = unquote_bundle_config_value(rest) == "true";
         }
     }
-    None
+    if path_system {
+        None
+    } else {
+        path
+    }
+}
+
+/// Unwrap one bundler app-config scalar: trim, then strip one matching
+/// pair of double or single quotes (bundler double-quotes what it writes).
+fn unquote_bundle_config_value(rest: &str) -> &str {
+    let v = rest.trim();
+    v.strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .or_else(|| v.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+        .unwrap_or(v)
 }
 
 /// Whether a PURL-derived gem coordinate is safe to join onto the gem root.
@@ -1018,42 +1266,6 @@ mod tests {
         assert_eq!(paths, vec![flat]);
     }
 
-    /// `$BUNDLE_APP_CONFIG` relocates the app config dir (the official
-    /// ruby Docker images export it) — the `BUNDLE_PATH:` entry must be
-    /// honored from there, and the default `.bundle/config` (absent
-    /// here) must not be required.
-    #[tokio::test]
-    async fn app_config_env_relocates_config() {
-        let dir = tempfile::tempdir().unwrap();
-        tokio::fs::write(dir.path().join("Gemfile"), b"gem \"foo\"\n")
-            .await
-            .unwrap();
-        let app_config = dir.path().join("elsewhere-config");
-        tokio::fs::create_dir_all(&app_config).await.unwrap();
-        let root = dir.path().join("store");
-        tokio::fs::write(
-            app_config.join("config"),
-            format!("---\nBUNDLE_PATH: \"{}\"\n", root.display()),
-        )
-        .await
-        .unwrap();
-        let flat = root.join("gems");
-        tokio::fs::create_dir_all(flat.join("foo-1.0.0").join("lib"))
-            .await
-            .unwrap();
-        tokio::fs::create_dir_all(root.join("specifications"))
-            .await
-            .unwrap();
-
-        let paths = RubyCrawler::get_vendor_bundle_paths_with_env(
-            dir.path(),
-            None,
-            Some(app_config.as_os_str()),
-        )
-        .await;
-        assert_eq!(paths, vec![flat]);
-    }
-
     /// A FIFO planted as `.bundle/config` must not wedge discovery. The
     /// app-config read used a plain `tokio::fs::read_to_string`, whose
     /// `open(2)` on a FIFO waits for a writer that never comes — so one
@@ -1113,6 +1325,456 @@ mod tests {
         assert_eq!(paths, vec![flat]);
     }
 
+    /// `$BUNDLE_APP_CONFIG` relocates the app config dir (the official
+    /// ruby Docker images export it) — the `BUNDLE_PATH:` entry must be
+    /// honored from there, and the default `.bundle/config` (absent
+    /// here) must not be required.
+    #[tokio::test]
+    async fn app_config_env_relocates_config() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(dir.path().join("Gemfile"), b"gem \"foo\"\n")
+            .await
+            .unwrap();
+        let app_config = dir.path().join("elsewhere-config");
+        tokio::fs::create_dir_all(&app_config).await.unwrap();
+        let root = dir.path().join("store");
+        tokio::fs::write(
+            app_config.join("config"),
+            format!("---\nBUNDLE_PATH: \"{}\"\n", root.display()),
+        )
+        .await
+        .unwrap();
+        let flat = root.join("gems");
+        tokio::fs::create_dir_all(flat.join("foo-1.0.0").join("lib"))
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(root.join("specifications"))
+            .await
+            .unwrap();
+
+        let paths = RubyCrawler::get_vendor_bundle_paths_with_env(
+            dir.path(),
+            None,
+            Some(app_config.as_os_str()),
+        )
+        .await;
+        assert_eq!(paths, vec![flat]);
+    }
+
+    /// Roots must be probed in bundler's own precedence order — local
+    /// `.bundle/config` `BUNDLE_PATH:` first, then the `BUNDLE_PATH`
+    /// environment variable, then the implicit `vendor/bundle` default —
+    /// so the stores come back highest-precedence first and first-wins
+    /// consumers pick the copy bundler actually loads. The pre-fix order
+    /// (default → env → config) was bundler's precedence inverted.
+    #[tokio::test]
+    async fn bundle_roots_probe_in_bundler_precedence_order() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(dir.path().join("Gemfile"), b"gem \"foo\"\n")
+            .await
+            .unwrap();
+
+        // Flat store under each of the three roots.
+        let mut flats = Vec::new();
+        for root in ["configstore", "envstore"] {
+            let root = dir.path().join("vendor").join(root);
+            let flat = root.join("gems");
+            tokio::fs::create_dir_all(flat.join("foo-1.0.0").join("lib"))
+                .await
+                .unwrap();
+            tokio::fs::create_dir_all(root.join("specifications"))
+                .await
+                .unwrap();
+            flats.push(flat);
+        }
+        let default_root = dir.path().join("vendor").join("bundle");
+        let default_flat = default_root.join("gems");
+        tokio::fs::create_dir_all(default_flat.join("foo-1.0.0").join("lib"))
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(default_root.join("specifications"))
+            .await
+            .unwrap();
+
+        tokio::fs::create_dir_all(dir.path().join(".bundle"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            dir.path().join(".bundle").join("config"),
+            "---\nBUNDLE_PATH: \"vendor/configstore\"\n",
+        )
+        .await
+        .unwrap();
+
+        let env_root = dir.path().join("vendor").join("envstore");
+        let paths = RubyCrawler::get_vendor_bundle_paths_with_env(
+            dir.path(),
+            Some(env_root.as_os_str()),
+            None,
+        )
+        .await;
+        assert_eq!(
+            paths,
+            vec![flats[0].clone(), flats[1].clone(), default_flat],
+            "stores must come back config-first, env second, default last (bundler precedence); got {paths:?}"
+        );
+    }
+
+    // ── config-sourced root containment (untrusted .bundle/config) ─
+
+    /// SECURITY: an ABSOLUTE `BUNDLE_PATH` in the (typically committed,
+    /// attacker-authored) app config file that points outside the project
+    /// must be skipped — it would otherwise become a scan/apply WRITE
+    /// target anywhere on the machine. The store it names must NOT be
+    /// discovered even though it is real and valid.
+    #[tokio::test]
+    async fn config_bundle_path_absolute_outside_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        tokio::fs::write(dir.path().join("Gemfile"), b"gem \"foo\"\n")
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(dir.path().join(".bundle"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            dir.path().join(".bundle").join("config"),
+            format!("---\nBUNDLE_PATH: \"{}\"\n", outside.path().display()),
+        )
+        .await
+        .unwrap();
+        // A real store at the outside root — must stay undiscovered.
+        tokio::fs::create_dir_all(outside.path().join("gems").join("foo-1.0.0").join("lib"))
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(outside.path().join("specifications"))
+            .await
+            .unwrap();
+
+        let paths = RubyCrawler::get_vendor_bundle_paths_with_env(dir.path(), None, None).await;
+        assert!(
+            paths.is_empty(),
+            "absolute out-of-project config BUNDLE_PATH must be skipped: {paths:?}"
+        );
+    }
+
+    /// SECURITY: a `..` traversal in the config value (`../sibling`) must
+    /// be skipped — a malicious clone must not direct patch writes into a
+    /// sibling checkout.
+    #[tokio::test]
+    async fn config_bundle_path_parent_traversal_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        let sibling = dir.path().join("sibling");
+        tokio::fs::create_dir_all(&project).await.unwrap();
+        tokio::fs::write(project.join("Gemfile"), b"gem \"foo\"\n")
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(project.join(".bundle"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            project.join(".bundle").join("config"),
+            "---\nBUNDLE_PATH: \"../sibling\"\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::create_dir_all(sibling.join("gems").join("foo-1.0.0").join("lib"))
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(sibling.join("specifications"))
+            .await
+            .unwrap();
+
+        let paths = RubyCrawler::get_vendor_bundle_paths_with_env(&project, None, None).await;
+        assert!(
+            paths.is_empty(),
+            "`..`-traversing config BUNDLE_PATH must be skipped: {paths:?}"
+        );
+    }
+
+    /// A contained relative config value is accepted — including one that
+    /// detours through `.`/`..` segments but normalizes back inside the
+    /// project (bundler resolves it the same way).
+    #[tokio::test]
+    async fn config_bundle_path_contained_relative_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(dir.path().join("Gemfile"), b"gem \"foo\"\n")
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(dir.path().join(".bundle"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            dir.path().join(".bundle").join("config"),
+            "---\nBUNDLE_PATH: \"vendor/./extra/../mygems\"\n",
+        )
+        .await
+        .unwrap();
+        let root = dir.path().join("vendor").join("mygems");
+        let flat = root.join("gems");
+        tokio::fs::create_dir_all(flat.join("foo-1.0.0").join("lib"))
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(root.join("specifications"))
+            .await
+            .unwrap();
+
+        let paths = RubyCrawler::get_vendor_bundle_paths_with_env(dir.path(), None, None).await;
+        assert_eq!(
+            paths,
+            vec![flat],
+            "contained (normalized) relative config BUNDLE_PATH must be accepted"
+        );
+    }
+
+    /// The containment refusal is RECORDED on the discovery result (for
+    /// the CLI's warning channels), keyed by the verbatim config value —
+    /// and stays `None` for a contained value or a `path.system` drop
+    /// (bundler itself ignores the path there; nothing was refused).
+    #[tokio::test]
+    async fn discovery_records_skipped_config_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        tokio::fs::write(dir.path().join("Gemfile"), b"gem \"foo\"\n")
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(dir.path().join(".bundle"))
+            .await
+            .unwrap();
+        let value = outside.path().display().to_string();
+        tokio::fs::write(
+            dir.path().join(".bundle").join("config"),
+            format!("---\nBUNDLE_PATH: \"{value}\"\n"),
+        )
+        .await
+        .unwrap();
+
+        let discovery =
+            RubyCrawler::discover_bundle_stores_with_env(dir.path(), None, None, None).await;
+        assert_eq!(
+            discovery.skipped_config_path.as_deref(),
+            Some(value.as_str()),
+            "the refused config value must be recorded verbatim"
+        );
+        // The warning builder names the value and carries the stable code.
+        let (code, detail) = config_path_ignored_warning(&value);
+        assert_eq!(code, "gem_bundle_config_path_ignored");
+        assert!(detail.contains(&value) && detail.contains("BUNDLE_PATH"));
+
+        // Contained value → no skip recorded.
+        tokio::fs::write(
+            dir.path().join(".bundle").join("config"),
+            "---\nBUNDLE_PATH: \"vendor/mygems\"\n",
+        )
+        .await
+        .unwrap();
+        let discovery =
+            RubyCrawler::discover_bundle_stores_with_env(dir.path(), None, None, None).await;
+        assert_eq!(discovery.skipped_config_path, None);
+
+        // path.system=true → bundler ignores the path; not a refusal.
+        tokio::fs::write(
+            dir.path().join(".bundle").join("config"),
+            format!("---\nBUNDLE_PATH: \"{value}\"\nBUNDLE_PATH__SYSTEM: \"true\"\n"),
+        )
+        .await
+        .unwrap();
+        let discovery =
+            RubyCrawler::discover_bundle_stores_with_env(dir.path(), None, None, None).await;
+        assert_eq!(discovery.skipped_config_path, None);
+    }
+
+    /// Unit contract for the config-root containment policy itself.
+    /// Real (absolute) tempdir paths keep the assertions valid on Windows,
+    /// where a `/`-rooted literal is NOT absolute.
+    #[test]
+    fn resolve_config_bundle_path_containment_contract() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let outside = tempfile::tempdir().unwrap();
+
+        // Contained relative values resolve against the project root.
+        assert_eq!(
+            resolve_config_bundle_path(root, "vendor/bundle", None),
+            Some(root.join("vendor").join("bundle"))
+        );
+        assert_eq!(
+            resolve_config_bundle_path(root, "vendor/x/../y", None),
+            Some(root.join("vendor").join("y"))
+        );
+        // Escaping relative values are refused.
+        assert_eq!(resolve_config_bundle_path(root, "../sibling", None), None);
+        assert_eq!(
+            resolve_config_bundle_path(root, "vendor/../../sibling", None),
+            None
+        );
+        // Absolute values must land under the project root.
+        let inside = root.join("vendor").join("bundle");
+        assert_eq!(
+            resolve_config_bundle_path(root, inside.to_str().unwrap(), None),
+            Some(inside)
+        );
+        assert_eq!(
+            resolve_config_bundle_path(root, outside.path().to_str().unwrap(), None),
+            None
+        );
+        // `..` smuggled into an absolute value cannot sneak past the
+        // prefix check — it is normalized BEFORE comparing.
+        let sneaky = root.join("vendor").join("..").join("..");
+        assert_eq!(
+            resolve_config_bundle_path(root, sneaky.to_str().unwrap(), None),
+            None
+        );
+        // A root-relative value (`/evil`) is refused on every platform: a
+        // unix absolute path outside the project, and on Windows a rooted
+        // path `Path::join` would substitute into the base — either way it
+        // must take the strict branch and fail the prefix check.
+        assert_eq!(resolve_config_bundle_path(root, "/evil", None), None);
+        // Windows drive-relative (`C:evil`) likewise must not reach the
+        // join-based relative branch.
+        #[cfg(windows)]
+        assert_eq!(resolve_config_bundle_path(root, "C:evil", None), None);
+        // `~` expands against home first; home outside the project →
+        // refused, home inside → accepted.
+        assert_eq!(
+            resolve_config_bundle_path(root, "~/store", Some(outside.path())),
+            None
+        );
+        let home_in = root.join("home");
+        assert_eq!(
+            resolve_config_bundle_path(root, "~/store", Some(&home_in)),
+            Some(home_in.join("store"))
+        );
+    }
+
+    // ── env BUNDLE_PATH `~` expansion + normalization ──────────────
+
+    /// A leading `~/` in the env `BUNDLE_PATH` expands against HOME
+    /// (bundler `File.expand_path`s the value); it used to resolve as a
+    /// literal `<cwd>/~/...` relative path and discover nothing.
+    #[tokio::test]
+    async fn bundle_path_env_tilde_expands_against_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        tokio::fs::write(dir.path().join("Gemfile"), b"gem \"foo\"\n")
+            .await
+            .unwrap();
+        let root = home.path().join("bundle-store");
+        let flat = root.join("gems");
+        tokio::fs::create_dir_all(flat.join("foo-1.0.0").join("lib"))
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(root.join("specifications"))
+            .await
+            .unwrap();
+
+        let discovery = RubyCrawler::discover_bundle_stores_with_env(
+            dir.path(),
+            Some(OsStr::new("~/bundle-store")),
+            None,
+            Some(home.path().as_os_str()),
+        )
+        .await;
+        assert_eq!(
+            discovery.stores,
+            vec![flat],
+            "~/ must expand against the provided home"
+        );
+        assert!(
+            !discovery.default_root_has_stores,
+            "env root must not count as the default vendor/bundle root"
+        );
+    }
+
+    /// The ENV value stays trusted — an out-of-project absolute root is
+    /// honored (unlike the config file, it is the user's own machine
+    /// state) — and `..` segments are normalized so the same physical
+    /// root spelled two ways dedups against the default probe.
+    #[tokio::test]
+    async fn bundle_path_env_outside_project_trusted_and_dotdot_dedups() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        tokio::fs::write(dir.path().join("Gemfile"), b"gem \"foo\"\n")
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(outside.path().join("gems").join("foo-1.0.0").join("lib"))
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(outside.path().join("specifications"))
+            .await
+            .unwrap();
+        let paths = RubyCrawler::get_vendor_bundle_paths_with_env(
+            dir.path(),
+            Some(outside.path().as_os_str()),
+            None,
+        )
+        .await;
+        assert_eq!(
+            paths,
+            vec![outside.path().join("gems")],
+            "env BUNDLE_PATH outside the project stays honored (trusted)"
+        );
+
+        // `vendor/x/../bundle` names the default root — must dedup to one
+        // probe (one store, once).
+        let bundle = dir.path().join("vendor").join("bundle");
+        let flat = bundle.join("gems");
+        tokio::fs::create_dir_all(flat.join("foo-1.0.0").join("lib"))
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(bundle.join("specifications"))
+            .await
+            .unwrap();
+        let paths = RubyCrawler::get_vendor_bundle_paths_with_env(
+            dir.path(),
+            Some(OsStr::new("vendor/x/../bundle")),
+            None,
+        )
+        .await;
+        assert_eq!(
+            paths.iter().filter(|p| **p == flat).count(),
+            1,
+            "normalized env root must dedup against the default probe: {paths:?}"
+        );
+    }
+
+    // ── BUNDLE_PATH__SYSTEM drops the config-sourced root ──────────
+
+    /// `BUNDLE_PATH__SYSTEM: "true"` makes bundler ignore the recorded
+    /// path entirely — the config-sourced root must be dropped so the
+    /// project falls through to the system gem homes (the `gem env`
+    /// fallback in `get_gem_paths`).
+    #[tokio::test]
+    async fn config_bundle_path_system_true_drops_config_root() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(dir.path().join("Gemfile"), b"gem \"foo\"\n")
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(dir.path().join(".bundle"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            dir.path().join(".bundle").join("config"),
+            "---\nBUNDLE_PATH: \"vendor/mygems\"\nBUNDLE_PATH__SYSTEM: \"true\"\n",
+        )
+        .await
+        .unwrap();
+        let root = dir.path().join("vendor").join("mygems");
+        tokio::fs::create_dir_all(root.join("gems").join("foo-1.0.0").join("lib"))
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(root.join("specifications"))
+            .await
+            .unwrap();
+
+        let paths = RubyCrawler::get_vendor_bundle_paths_with_env(dir.path(), None, None).await;
+        assert!(
+            paths.is_empty(),
+            "path.system=true must drop the config-sourced root: {paths:?}"
+        );
+    }
+
     /// Pure parser contract for the `.bundle/config` scrape: bundler's
     /// own quoted form, unquoted and single-quoted variants, CRLF,
     /// empty-value-as-unset, and no match on `BUNDLE_PATH__SYSTEM:` or
@@ -1145,6 +1807,28 @@ mod tests {
         assert_eq!(
             parse_bundle_config_path("---\nBUNDLE_PATH__SYSTEM: \"true\"\n"),
             None
+        );
+        // `path.system` true means "ignore the recorded path, use the
+        // system gem home" — the recorded path must parse as unset,
+        // whichever order the keys appear in.
+        assert_eq!(
+            parse_bundle_config_path(
+                "---\nBUNDLE_PATH: \"vendor/bundle\"\nBUNDLE_PATH__SYSTEM: \"true\"\n"
+            ),
+            None
+        );
+        assert_eq!(
+            parse_bundle_config_path(
+                "---\nBUNDLE_PATH__SYSTEM: \"true\"\nBUNDLE_PATH: \"vendor/bundle\"\n"
+            ),
+            None
+        );
+        // Only the exact string "true" is truthy (bundler's own coercion).
+        assert_eq!(
+            parse_bundle_config_path(
+                "---\nBUNDLE_PATH: \"vendor/bundle\"\nBUNDLE_PATH__SYSTEM: \"false\"\n"
+            ),
+            Some("vendor/bundle".to_string())
         );
         assert_eq!(
             parse_bundle_config_path("---\nBUNDLE_FROZEN: \"true\"\n"),
