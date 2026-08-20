@@ -8,7 +8,7 @@
 //! clock skew by degrading to "never checked". Nothing in here may ever
 //! fail a command — callers treat all errors as "skip the check".
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -84,10 +84,42 @@ pub fn load_state() -> UpdateCheckState {
     let Some(path) = state_file_path() else {
         return UpdateCheckState::default();
     };
-    let Ok(bytes) = std::fs::read(&path) else {
+    let Ok(bytes) = read_state_bytes(&path) else {
         return UpdateCheckState::default();
     };
     serde_json::from_slice(&bytes).unwrap_or_default()
+}
+
+/// Read the state bytes, requiring a regular file — the sync twin of
+/// [`open_regular_file`](crate::utils::fs::open_regular_file). `load_state`
+/// runs synchronously at the start of every command (the passive notifier's
+/// guard path), and a plain `open(2)` of a FIFO planted at this path waits
+/// forever for a writer, wedging the whole CLI before the command even
+/// starts. `O_NONBLOCK` makes the open return immediately; the handle-based
+/// `is_file` check then rejects FIFOs/devices/directories so the caller
+/// degrades to never-checked like any other unreadable state.
+fn read_state_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    #[cfg(unix)]
+    let mut file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(path)?
+    };
+    #[cfg(not(unix))]
+    let mut file = std::fs::File::open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
 }
 
 /// Persist the state atomically (stage + fsync + rename). Errors bubble so
@@ -216,6 +248,66 @@ mod tests {
             Some(v) => std::env::set_var("SOCKET_UPDATE_STATE_DIR", v),
             None => std::env::remove_var("SOCKET_UPDATE_STATE_DIR"),
         }
+    }
+
+    /// mkfifo(2) directly, not the /usr/bin/mkfifo binary: spawning a child
+    /// flakes under heavy parallel load (fork/exec starvation) and the
+    /// syscall needs no process at all.
+    #[cfg(unix)]
+    fn mkfifo(path: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+        let c_path =
+            std::ffi::CString::new(path.as_os_str().as_bytes()).expect("fifo path has no NUL");
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
+        assert_eq!(
+            rc,
+            0,
+            "mkfifo(2) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    /// A FIFO planted at the state path must not wedge the loader: a plain
+    /// `std::fs::read` open(2)s the FIFO with `O_RDONLY` and waits for a
+    /// writer that never comes — and `load_state` runs synchronously at the
+    /// start of EVERY command (the passive notifier's `spawn_if_due`), so
+    /// one special file in the cache dir hangs the whole CLI with no output
+    /// before the command even starts. Cache posture: degrade to Default,
+    /// exactly like corrupt bytes. Same class as the `open_regular_file`
+    /// guards in redirect/state.rs and the crawlers.
+    #[cfg(unix)]
+    #[test]
+    #[serial(update_state_dir_env)]
+    fn load_state_fifo_state_file_degrades_instead_of_wedging() {
+        let tmp = tempfile::tempdir().unwrap();
+        let prev = std::env::var_os("SOCKET_UPDATE_STATE_DIR");
+        std::env::set_var("SOCKET_UPDATE_STATE_DIR", tmp.path());
+        let fifo = tmp.path().join("update-check.json");
+        mkfifo(&fifo);
+
+        // load_state is sync, so bound it with a helper thread + timeout.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(load_state());
+        });
+        let result = rx.recv_timeout(std::time::Duration::from_secs(5));
+        match prev {
+            Some(v) => std::env::set_var("SOCKET_UPDATE_STATE_DIR", v),
+            None => std::env::remove_var("SOCKET_UPDATE_STATE_DIR"),
+        }
+        let Ok(loaded) = result else {
+            // The open is wedged in the helper thread; connect a writer to
+            // release it so the test can FAIL instead of hanging the suite.
+            let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
+            panic!("load_state must complete promptly with a FIFO state file");
+        };
+        assert_eq!(
+            loaded,
+            UpdateCheckState::default(),
+            "a non-regular state file degrades to never-checked"
+        );
+        // The pure load never mutates the cache dir — the FIFO stays put.
+        assert!(fifo.exists());
     }
 
     #[tokio::test]
