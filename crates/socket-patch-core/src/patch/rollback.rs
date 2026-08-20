@@ -226,20 +226,46 @@ pub async fn verify_file_rollback(
         };
     }
 
-    // Check if before blob exists (required to actually restore the file)
+    // Check if before blob exists (required to actually restore the file).
+    // SECURITY: probe the directory ENTRY (`symlink_metadata`), not what it
+    // resolves to. The blobs directory only ever contains regular files the
+    // CLI wrote, but a symlink planted at `blobs/<hash>` — committable to a
+    // poisoned repo alongside the manifest, unlike the escaping hash STRING
+    // the guard above blocks — would carry the restore-loop read out of the
+    // blobs directory: an arbitrary out-of-tree read whose mismatch error
+    // leaks the target's content hash, or an unbounded read / permanent
+    // hang on a device or FIFO target. Anything that is not a regular file
+    // is refused fail-closed like a missing blob; a re-download atomically
+    // rename-replaces the bad entry.
     let before_blob_path = blobs_path.join(&file_info.before_hash);
-    if tokio::fs::metadata(&before_blob_path).await.is_err() {
-        return VerifyRollbackResult {
-            file: file_name.to_string(),
-            status: VerifyRollbackStatus::MissingBlob,
-            message: Some(format!(
-                "Before blob not found: {}. Re-download the patch to enable rollback.",
-                file_info.before_hash
-            )),
-            current_hash: Some(current_hash),
-            expected_hash: None,
-            target_hash: Some(file_info.before_hash.clone()),
-        };
+    match tokio::fs::symlink_metadata(&before_blob_path).await {
+        Ok(meta) if meta.is_file() => {}
+        Ok(_) => {
+            return VerifyRollbackResult {
+                file: file_name.to_string(),
+                status: VerifyRollbackStatus::MissingBlob,
+                message: Some(format!(
+                    "Before blob is not a regular file: {}. Re-download the patch to enable rollback.",
+                    file_info.before_hash
+                )),
+                current_hash: Some(current_hash),
+                expected_hash: None,
+                target_hash: Some(file_info.before_hash.clone()),
+            };
+        }
+        Err(_) => {
+            return VerifyRollbackResult {
+                file: file_name.to_string(),
+                status: VerifyRollbackStatus::MissingBlob,
+                message: Some(format!(
+                    "Before blob not found: {}. Re-download the patch to enable rollback.",
+                    file_info.before_hash
+                )),
+                current_hash: Some(current_hash),
+                expected_hash: None,
+                target_hash: Some(file_info.before_hash.clone()),
+            };
+        }
     }
 
     // Check if matches expected patched hash (afterHash)
@@ -386,8 +412,24 @@ pub async fn rollback_package_patch(
             return result;
         }
 
-        // Read original content from blobs
+        // Read original content from blobs.
+        // SECURITY: defense-in-depth twin of the verify-time entry-type
+        // guard (exactly like the string guard above) — never read through
+        // a symlinked / non-regular blobs entry at the syscall either. The
+        // lstat rejects the entry itself; it must run here because the
+        // read must not depend on verify having blocked it.
         let blob_path = blobs_path.join(&file_info.before_hash);
+        let entry_is_regular = matches!(
+            tokio::fs::symlink_metadata(&blob_path).await,
+            Ok(meta) if meta.is_file()
+        );
+        if !entry_is_regular {
+            result.error = Some(format!(
+                "Before blob is not a regular file: {}",
+                file_info.before_hash
+            ));
+            return result;
+        }
         let original_content = match tokio::fs::read(&blob_path).await {
             Ok(content) => content,
             Err(e) => {
@@ -1710,6 +1752,158 @@ mod tests {
             plain_sha256(b"original a"),
             "an AlreadyOriginal file from the interrupted run must be \
              resynced too — a stale patched-hash entry wedges cargo build"
+        );
+    }
+
+    /// SECURITY (blobs-dir entry type at verify): the before-blob probe
+    /// must inspect the directory ENTRY, not the symlink target. The blobs
+    /// directory only ever contains regular files the CLI wrote, but a
+    /// symlink planted at `blobs/<hash>` — committable to a poisoned repo
+    /// alongside the manifest, unlike the already-guarded escaping hash
+    /// STRING — re-opens the same out-of-tree read the string guard
+    /// blocks. Regression: `metadata` followed the link, verify reported
+    /// `Ready`, and the restore loop then read an arbitrary out-of-tree
+    /// file through it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_verify_file_rollback_rejects_symlinked_blob_entry() {
+        let root = tempfile::tempdir().unwrap();
+        let pkg_dir = root.path().join("pkg");
+        let blobs_dir = root.path().join("blobs");
+        tokio::fs::create_dir_all(&pkg_dir).await.unwrap();
+        tokio::fs::create_dir_all(&blobs_dir).await.unwrap();
+
+        // An out-of-tree file the symlinked "blob" resolves to.
+        tokio::fs::write(root.path().join("secret.txt"), b"top secret contents\n")
+            .await
+            .unwrap();
+
+        let original = b"original content";
+        let patched = b"patched content";
+        let before_hash = compute_git_sha256_from_bytes(original);
+        tokio::fs::write(pkg_dir.join("index.js"), patched)
+            .await
+            .unwrap();
+        // A hex-named entry (passes the string guard) that is a symlink
+        // escaping the blobs directory.
+        std::os::unix::fs::symlink("../secret.txt", blobs_dir.join(&before_hash)).unwrap();
+
+        let file_info = PatchFileInfo {
+            before_hash,
+            after_hash: compute_git_sha256_from_bytes(patched),
+        };
+
+        let result = verify_file_rollback(&pkg_dir, "index.js", &file_info, &blobs_dir).await;
+        assert_eq!(
+            result.status,
+            VerifyRollbackStatus::MissingBlob,
+            "a symlinked blob entry must be refused, never followed"
+        );
+        assert!(
+            result.message.unwrap().contains("not a regular file"),
+            "message must say why the blob is unusable"
+        );
+    }
+
+    /// SECURITY (symlinked blob entry at the read site): a poisoned repo
+    /// that commits `blobs/<hex>` as a symlink to an out-of-tree file must
+    /// fail the package rollback WITHOUT reading through the link.
+    /// Regression: the bare `tokio::fs::read` followed it and the
+    /// hash-verify mismatch error leaked the target's git-sha256
+    /// ("Got: <hash>") — the same existence + content-hash oracle the
+    /// escaping-hash-string fix closed (see
+    /// `test_rollback_package_patch_blob_hash_escape_blocked`); a FIFO or
+    /// device target instead meant an unbounded read or a permanent hang.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_rollback_package_patch_symlinked_blob_entry_blocked() {
+        let root = tempfile::tempdir().unwrap();
+        let pkg_dir = root.path().join("pkg");
+        let blobs_dir = root.path().join("blobs");
+        tokio::fs::create_dir_all(&pkg_dir).await.unwrap();
+        tokio::fs::create_dir_all(&blobs_dir).await.unwrap();
+
+        let secret_content = b"top secret contents\n";
+        tokio::fs::write(root.path().join("secret.txt"), secret_content)
+            .await
+            .unwrap();
+
+        let original = b"original content";
+        let patched = b"patched content";
+        let before_hash = compute_git_sha256_from_bytes(original);
+        tokio::fs::write(pkg_dir.join("index.js"), patched)
+            .await
+            .unwrap();
+        std::os::unix::fs::symlink("../secret.txt", blobs_dir.join(&before_hash)).unwrap();
+
+        let mut files = HashMap::new();
+        files.insert(
+            "index.js".to_string(),
+            PatchFileInfo {
+                before_hash,
+                after_hash: compute_git_sha256_from_bytes(patched),
+            },
+        );
+
+        let result =
+            rollback_package_patch("pkg:npm/test@1.0.0", &pkg_dir, &files, &blobs_dir, false).await;
+
+        assert!(!result.success, "symlinked blob entry must be refused");
+        assert!(result.files_rolled_back.is_empty());
+        let err = result.error.unwrap();
+        let secret_hash = compute_git_sha256_from_bytes(secret_content);
+        assert!(
+            !err.contains(&secret_hash),
+            "error must not leak the out-of-tree file's content hash: {err}"
+        );
+        assert!(
+            err.contains("not a regular file"),
+            "unexpected error: {err}"
+        );
+        // The patched file must be untouched.
+        assert_eq!(
+            tokio::fs::read(pkg_dir.join("index.js")).await.unwrap(),
+            patched
+        );
+    }
+
+    /// SECURITY/robustness (FIFO blob entry): a FIFO planted at
+    /// `blobs/<hash>` must be refused at verification. Regression: the
+    /// `metadata` probe reported it present, verify said `Ready`, and the
+    /// restore loop's blob read then blocked forever waiting for a writer
+    /// — the rollback wedged with zero diagnostics (same class as the
+    /// crawler/state-file FIFO wedges). The verify-time probe is
+    /// stat-only, so this test cannot hang even on the broken code.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_verify_file_rollback_rejects_fifo_blob_entry() {
+        let pkg_dir = tempfile::tempdir().unwrap();
+        let blobs_dir = tempfile::tempdir().unwrap();
+
+        let original = b"original content";
+        let patched = b"patched content";
+        let before_hash = compute_git_sha256_from_bytes(original);
+        tokio::fs::write(pkg_dir.path().join("index.js"), patched)
+            .await
+            .unwrap();
+
+        let status = std::process::Command::new("mkfifo")
+            .arg(blobs_dir.path().join(&before_hash))
+            .status()
+            .expect("mkfifo must be runnable");
+        assert!(status.success(), "mkfifo failed");
+
+        let file_info = PatchFileInfo {
+            before_hash,
+            after_hash: compute_git_sha256_from_bytes(patched),
+        };
+
+        let result =
+            verify_file_rollback(pkg_dir.path(), "index.js", &file_info, blobs_dir.path()).await;
+        assert_eq!(
+            result.status,
+            VerifyRollbackStatus::MissingBlob,
+            "a FIFO blob entry must be refused — the restore read would hang forever"
         );
     }
 }

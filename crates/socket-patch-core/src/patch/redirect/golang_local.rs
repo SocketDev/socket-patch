@@ -203,19 +203,25 @@ pub async fn apply_go_redirect(
         return synthesized_result(purl, &copy_dir, Vec::new(), true, None);
     }
 
-    // A hosted-mode `replace` (`scan --mode hosted`) owns this module. Taking
-    // it over here would silently discard the committed hosted redirect: the
-    // shared upsert would repoint the directive at the local copy while
-    // go.sum still carries the socket module's lines and is missing the
-    // original's (the hosted rewrite prunes them; they are only restorable
-    // from the redirect ledger, which this path does not read). The reverse
-    // direction — hosted taking over a local redirect — IS supported, because
-    // the hosted rewriter reconciles go.sum in the same pass. Fail closed and
-    // name the way out.
-    if read_replace_entries(project_root)
-        .await
-        .iter()
-        .any(|e| e.module == module && e.owner == Some(ReplaceOwner::Hosted))
+    // A hosted-mode `replace` (`scan --mode hosted`) owns this module. APPLY
+    // must not take it over: its `.socket/go-patches/` copy is machine-local
+    // (uncommitted), so the shared upsert would repoint the COMMITTED
+    // directive at a path other machines don't have, while go.sum still
+    // carries the socket module's lines and is missing the original's (the
+    // hosted rewrite prunes them; they are only restorable from the redirect
+    // ledger, which this path does not read). Fail closed and name the way
+    // out. The guard is scoped to apply's copy base: the VENDOR caller's copy
+    // is committed and bypasses go.sum entirely, so vendor-takes-over-hosted
+    // is supported (the documented cross-mode policy — its upsert rewrites
+    // the hosted directive in place and records it in the wiring `original`).
+    // The reverse direction — hosted taking over a local redirect — is also
+    // supported, because the hosted rewriter reconciles go.sum in the same
+    // pass.
+    if base_rel == GO_PATCHES_DIR
+        && read_replace_entries(project_root)
+            .await
+            .iter()
+            .any(|e| e.module == module && e.owner == Some(ReplaceOwner::Hosted))
     {
         return synthesized_result(
             purl,
@@ -382,8 +388,34 @@ pub async fn reconcile_go_redirects(
     // reconstructed from the copy dir is the canonical base — compare bases, or
     // a qualified key's freshly applied copy is pruned as an orphan.
     let desired_bases: HashSet<&str> = desired.iter().map(|p| strip_purl_qualifiers(p)).collect();
+    // Re-read after (a)'s drops so the dangling-directive probe below sees the
+    // current file.
+    let entries = read_replace_entries(project_root).await;
     for (purl, dir) in collect_copy_modules(&project_root.join(GO_PATCHES_DIR)).await {
         if !desired_bases.contains(purl.as_str()) {
+            // A go-patches directive still targeting THIS copy dangles once the
+            // copy is pruned — loop (a) keeps it whenever the module is desired
+            // at ANOTHER version (a bump whose apply hasn't succeeded), and a
+            // dangling `replace` target bricks every `go build`. Drop it with
+            // the copy (directive first, same order as `remove_go_redirect`).
+            // Path-exact on purpose: a directive already repointed at the
+            // desired version's copy is never touched.
+            if let Some((module, version)) = parse_golang_purl(&purl) {
+                let target = replace_target_path(GO_PATCHES_DIR, module, version);
+                if entries.iter().any(|e| {
+                    e.owner == Some(ReplaceOwner::GoPatches)
+                        && e.module == module
+                        && e.path.as_deref() == Some(target.as_str())
+                }) {
+                    let _ = go_mod_edit::drop_replace_entry(
+                        project_root,
+                        module,
+                        ReplaceOwner::GoPatches,
+                        dry_run,
+                    )
+                    .await;
+                }
+            }
             if !dry_run {
                 let _ = remove_tree(&dir).await;
             }
@@ -726,6 +758,58 @@ mod tests {
             },
         );
         m
+    }
+
+    /// Cross-mode policy: APPLY (the go-patches copy base) must refuse to
+    /// take over a hosted-mode replace — its copy is machine-local, so the
+    /// takeover would repoint the committed directive at a path other
+    /// machines don't have and strand the pruned go.sum lines. The guard is
+    /// scoped to [`GO_PATCHES_DIR`]: the vendor backend's committed copy base
+    /// passes through (vendor-takes-over-hosted is supported; pinned by
+    /// `vendor::golang::tests::test_local_vendor_takes_over_hosted_replace`).
+    #[tokio::test]
+    async fn test_apply_refuses_hosted_owned_replace() {
+        let (dir, blobs, pristine, files, _after) = fixture().await;
+        let root = dir.path();
+        let gomod = "module example.com/app\n\ngo 1.21\n\n\
+                     require github.com/foo/bar v1.4.2\n\n\
+                     replace github.com/foo/bar v1.4.2 => \
+                     patch.socket.dev/gopatch/some-uuid v1.4.2-socketpatch.1\n";
+        tokio::fs::write(root.join("go.mod"), gomod).await.unwrap();
+        let sources = PatchSources::blobs_only(&blobs);
+
+        let result = apply_go_redirect(
+            PURL,
+            MODULE,
+            VERSION,
+            &pristine,
+            root,
+            GO_PATCHES_DIR,
+            &files,
+            &sources,
+            None,
+            false,
+            MismatchPolicy::Warn,
+        )
+        .await;
+        assert!(!result.success, "apply must not take over a hosted replace");
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("hosted")),
+            "{:?}",
+            result.error
+        );
+        // Fail-closed: the hosted directive survives, no go-patches copy.
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("go.mod"))
+                .await
+                .unwrap(),
+            gomod,
+            "go.mod untouched"
+        );
+        assert!(!root.join(GO_PATCHES_DIR).exists(), "no copy created");
     }
 
     #[tokio::test]
@@ -1256,6 +1340,113 @@ mod tests {
         assert!(entries
             .iter()
             .any(|e| e.module == "example.com/other" && !e.socket_owned()));
+    }
+
+    /// Reconcile part (a) keeps the directive whenever the MODULE is still
+    /// desired at any version, while part (b) prunes copies by exact PURL — so
+    /// a manifest bumped to a new version whose apply has not succeeded yet
+    /// (module not downloaded, or a manifest/go.mod skew) must not delete the
+    /// old version's copy while leaving the socket-owned directive pointing at
+    /// it: a dangling `replace` target bricks every `go build` with
+    /// "replacement directory does not exist".
+    #[tokio::test]
+    async fn test_reconcile_version_bump_never_leaves_dangling_directive() {
+        let (dir, blobs, pristine, files, _after) = fixture().await;
+        let root = dir.path();
+        let sources = PatchSources::blobs_only(&blobs);
+        let result = apply_go_redirect(
+            PURL,
+            MODULE,
+            VERSION,
+            &pristine,
+            root,
+            GO_PATCHES_DIR,
+            &files,
+            &sources,
+            None,
+            false,
+            MismatchPolicy::Warn,
+        )
+        .await;
+        assert!(result.success, "setup apply failed: {:?}", result.error);
+
+        // The manifest now desires the SAME module at a DIFFERENT version;
+        // that version's apply never ran (its module isn't installed).
+        let desired: HashSet<String> = ["pkg:golang/github.com/foo/bar@v1.5.0".to_string()]
+            .into_iter()
+            .collect();
+        let removed = reconcile_go_redirects(root, &desired, false).await;
+        assert!(removed.contains(&PURL.to_string()));
+        assert!(
+            !root
+                .join(".socket/go-patches/github.com/foo/bar@v1.4.2")
+                .exists(),
+            "the no-longer-desired version's copy is pruned"
+        );
+        let entries = read_replace_entries(root).await;
+        assert!(
+            !entries
+                .iter()
+                .any(|e| e.module == MODULE && e.socket_owned()),
+            "a socket-owned replace must not survive pointing at the deleted \
+             copy (go.mod would brick the build): {entries:?}"
+        );
+    }
+
+    /// The dangling-directive cleanup above must be path-exact: pruning a
+    /// stale copy of a module whose directive already points at the DESIRED
+    /// version's copy (a completed version bump) must not drop that directive.
+    #[tokio::test]
+    async fn test_reconcile_prunes_stale_copy_keeps_repointed_directive() {
+        let (dir, blobs, pristine, files, _after) = fixture().await;
+        let root = dir.path();
+        let sources = PatchSources::blobs_only(&blobs);
+        let result = apply_go_redirect(
+            PURL,
+            MODULE,
+            VERSION,
+            &pristine,
+            root,
+            GO_PATCHES_DIR,
+            &files,
+            &sources,
+            None,
+            false,
+            MismatchPolicy::Warn,
+        )
+        .await;
+        assert!(result.success, "setup apply failed: {:?}", result.error);
+
+        // Simulate a completed bump to v1.5.0: directive repointed, new copy
+        // materialised. The v1.4.2 copy is now stale litter.
+        go_mod_edit::ensure_replace_entry(root, MODULE, "v1.5.0", GO_PATCHES_DIR, false)
+            .await
+            .unwrap();
+        let new_copy = root.join(".socket/go-patches/github.com/foo/bar@v1.5.0");
+        tokio::fs::create_dir_all(&new_copy).await.unwrap();
+        tokio::fs::write(new_copy.join("bar.go"), PATCHED)
+            .await
+            .unwrap();
+
+        let desired: HashSet<String> = ["pkg:golang/github.com/foo/bar@v1.5.0".to_string()]
+            .into_iter()
+            .collect();
+        let removed = reconcile_go_redirects(root, &desired, false).await;
+        assert!(removed.contains(&PURL.to_string()));
+        assert!(
+            !root
+                .join(".socket/go-patches/github.com/foo/bar@v1.4.2")
+                .exists(),
+            "stale copy is pruned"
+        );
+        assert!(new_copy.exists(), "desired version's copy survives");
+        let entries = read_replace_entries(root).await;
+        assert!(
+            entries.iter().any(|e| e.module == MODULE
+                && e.socket_owned()
+                && e.version.as_deref() == Some("v1.5.0")),
+            "the directive pointing at the DESIRED copy must survive: {entries:?}"
+        );
     }
 
     #[tokio::test]

@@ -141,7 +141,7 @@ pub async fn load_redirect_state(
     project_root: &Path,
 ) -> Result<Option<RedirectState>, CorruptRedirectState> {
     let path = project_root.join(REDIRECT_STATE_REL);
-    let bytes = match tokio::fs::read(&path).await {
+    let bytes = match read_ledger_bytes(&path).await {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => {
@@ -160,6 +160,21 @@ pub async fn load_redirect_state(
             quarantined_to: None,
         }),
     }
+}
+
+/// Read the ledger bytes from the (untrusted) project tree. Opens via
+/// [`open_regular_file`](crate::utils::fs::open_regular_file) — non-blocking
+/// on Unix, rejecting FIFOs/devices/directories — so a planted special file
+/// fails loudly instead of wedging every flow that consults the ledger
+/// (scan, vex, list, vendor) on a FIFO `open(2)` that waits forever for a
+/// writer; same guard as package_json discovery and the npm/composer/
+/// python/ruby crawlers.
+async fn read_ledger_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.read_to_end(&mut bytes).await?;
+    Ok(bytes)
 }
 
 /// Persist the redirect ledger atomically (stage + fsync + rename, the same
@@ -267,6 +282,10 @@ pub fn drop_superseded_purl(state: &mut RedirectState, purl: &str) -> bool {
         .iter()
         .filter_map(|k| state.records.get(k))
         .map(|r| r.uuid.clone())
+        // An empty uuid (hand-repaired or degraded ledger) is no anchor at
+        // all: `contains("")` matches EVERY edit, claiming other packages'
+        // revert data. Fail closed to the version-exact-only path instead.
+        .filter(|u| !u.is_empty())
         .collect();
     for key in &record_keys {
         state.records.remove(key);
@@ -913,6 +932,111 @@ mod tests {
         assert!(
             dir.join("redirect-state.json").exists(),
             "with the quarantine slot taken the malformed file stays put"
+        );
+    }
+
+    /// mkfifo(2) directly, not the /usr/bin/mkfifo binary: spawning a child
+    /// flakes under heavy parallel load (fork/exec starvation) and the
+    /// syscall needs no process at all.
+    #[cfg(unix)]
+    fn mkfifo(path: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+        let c_path =
+            std::ffi::CString::new(path.as_os_str().as_bytes()).expect("fifo path has no NUL");
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
+        assert_eq!(
+            rc,
+            0,
+            "mkfifo(2) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    /// A FIFO planted at the ledger path must not wedge the loader: a plain
+    /// `tokio::fs::read` open(2)s the FIFO with `O_RDONLY` and waits for a
+    /// writer that never comes, hanging every flow that consults the ledger
+    /// (scan, vex, list, vendor) with no error and no timeout. Same class as
+    /// the `open_regular_file` guards in the npm/composer/python/ruby
+    /// crawlers and package_json discovery. The non-regular file is a loud
+    /// fail-closed [`CorruptRedirectState`], never `Ok(None)`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn load_fifo_ledger_fails_fast_instead_of_wedging() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".socket/vendor");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let fifo = dir.join("redirect-state.json");
+        mkfifo(&fifo);
+
+        // On timeout the open is wedged in a `spawn_blocking` thread that
+        // the runtime waits for on shutdown; connect a writer to release
+        // it so the test can FAIL instead of hanging the whole suite.
+        let deadline = std::time::Duration::from_secs(5);
+        let Ok(result) = tokio::time::timeout(deadline, load_redirect_state(tmp.path())).await
+        else {
+            let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
+            panic!("load_redirect_state must complete promptly with a FIFO ledger");
+        };
+        let err = result.unwrap_err();
+        assert_eq!(err.path, fifo, "the error must name the planted path");
+        // The pure load never mutates the project — the FIFO stays put.
+        assert!(fifo.exists());
+    }
+
+    /// A record carrying an EMPTY uuid (a hand-repaired ledger — a workflow
+    /// the corrupt-ledger message itself instructs — or a degraded record
+    /// fetch) must not turn the artifact anchor into a match-everything
+    /// wildcard: `text.contains("")` is true for EVERY edit with rewritten
+    /// content, so dropping one purl would claim every other package's edits
+    /// and destroy their only revert data. No usable anchor ⇒ fall back to
+    /// the version-exact-only claim, exactly like the recordless ledger.
+    #[test]
+    fn drop_superseded_purl_empty_uuid_record_claims_no_anchored_edits() {
+        let mut state = RedirectState::new();
+        state
+            .records
+            .insert("pkg:npm/left-pad@1.3.0".to_string(), record_with_uuid(""));
+        state
+            .records
+            .insert("pkg:npm/minimist@1.2.2".to_string(), sample_record());
+        state.edits = vec![
+            edit(
+                "pnpm-lock.yaml",
+                "redirect_pnpm_resolution",
+                Some("left-pad@1.3.0"),
+            ),
+            // ANOTHER package's edits — its path-keyed lock entry (rewritten
+            // content carrying its own artifact URL) and its version-exact
+            // pnpm key. Both must survive dropping left-pad.
+            edit_resolved(
+                "package-lock.json",
+                "redirect_npm_lock_entry",
+                "node_modules/minimist",
+                &hosted_url("minimist", "1.2.2", SAMPLE_UUID),
+            ),
+            edit(
+                "pnpm-lock.yaml",
+                "redirect_pnpm_resolution",
+                Some("minimist@1.2.2"),
+            ),
+        ];
+
+        assert!(drop_superseded_purl(&mut state, "pkg:npm/left-pad@1.3.0"));
+
+        assert!(
+            state.records.contains_key("pkg:npm/minimist@1.2.2"),
+            "the other package's record must survive"
+        );
+        let keys: Vec<&str> = state
+            .edits
+            .iter()
+            .filter_map(|e| e.key.as_deref())
+            .collect();
+        assert_eq!(
+            keys,
+            vec!["node_modules/minimist", "minimist@1.2.2"],
+            "an empty uuid offers no anchor and may claim only the dropped \
+             purl's version-exact keys: {keys:?}"
         );
     }
 

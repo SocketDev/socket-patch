@@ -384,10 +384,15 @@ pub async fn revert_npm_redirect_purl(
         }
     }
 
-    // Claim this purl's edits. Text-fragment kinds and the berry/classic/pnpm
-    // rewriters key edits by `<name>@<version>`; the legacy npm v2
-    // `dependencies` tree keys by bare name; the v3 `packages` map keys by
-    // the lock path. The package-lock JSON kinds carry no version in their
+    // Claim this purl's edits. The berry/classic rewriters key edits by
+    // `<name>@<version>`; the pnpm rewriter keys by the canonical INSTANCE
+    // key — `<name>@<version>` for a plain instance, but one edit per
+    // resolved-peer instance keyed `<name>@<version>(<peer>@<ver>)…` (v6) or
+    // `<name>@<version>_<peer-suffix>` (v5) — so pnpm claims accept a `(`/`_`
+    // peer boundary after the exact version (never `-`/`.`/alnum, which
+    // would extend the version into a sibling's, e.g. 1.3.0 vs 1.3.0-rc1).
+    // The legacy npm v2 `dependencies` tree keys by bare name; the v3
+    // `packages` map keys by the lock path. The package-lock JSON kinds carry no version in their
     // key, so ownership is version-discriminated the way the rewriter
     // matched (entry `name`+`version`, mod.rs) — name-only would claim a
     // SIBLING purl's edits (left-pad@1.2.0 vs @1.3.0 both hosted-redirected,
@@ -401,7 +406,13 @@ pub async fn revert_npm_redirect_purl(
     for (i, e) in state.edits.iter().enumerate() {
         let key = e.key.as_deref().unwrap_or_default();
         let claimed = match e.kind.as_str() {
-            k if NPM_TEXT_KINDS.contains(&k) => key == lock_key,
+            k if NPM_TEXT_KINDS.contains(&k) => {
+                key == lock_key
+                    || (k == "redirect_pnpm_resolution"
+                        && key
+                            .strip_prefix(lock_key.as_str())
+                            .is_some_and(|peer| peer.starts_with('(') || peer.starts_with('_')))
+            }
             "redirect_npm_lock_dep" => key == name && edit_references_version(e, &version),
             "redirect_npm_lock_entry" => {
                 let key_name = key
@@ -1131,6 +1142,207 @@ mod tests {
         );
         assert!(state.records.is_empty(), "record dropped");
         assert!(state.edits.is_empty(), "edits dropped");
+    }
+
+    /// Pristine pnpm v6 lock holding a PLAIN instance and a resolved-peer
+    /// instance of the same purl: the rewriter records one edit per
+    /// instance, keying the peered one `<name>@<version>(<peer>@<ver>)`.
+    fn pnpm_v6_pristine() -> String {
+        [
+            "lockfileVersion: '6.0'",
+            "",
+            "dependencies:",
+            "  left-pad:",
+            "    specifier: 1.3.0",
+            "    version: 1.3.0",
+            "",
+            "packages:",
+            "",
+            "  /left-pad@1.3.0:",
+            "    resolution: {integrity: sha512-pristine==}",
+            "    dev: false",
+            "",
+            "  /left-pad@1.3.0(react@18.2.0):",
+            "    resolution: {integrity: sha512-pristine==}",
+            "    dev: false",
+            "",
+        ]
+        .join("\n")
+    }
+
+    /// Pristine pnpm v5 lock: same two-instance shape, `/name/version` keys
+    /// with the peer combination spelled as a `_<suffix>` (respelled
+    /// `<name>@<version>_<suffix>` in the recorded instance key).
+    fn pnpm_v5_pristine() -> String {
+        [
+            "lockfileVersion: 5.4",
+            "",
+            "specifiers:",
+            "  left-pad: 1.3.0",
+            "",
+            "dependencies:",
+            "  left-pad: 1.3.0",
+            "",
+            "packages:",
+            "",
+            "  /left-pad/1.3.0:",
+            "    resolution: {integrity: sha512-pristine==}",
+            "    dev: false",
+            "",
+            "  /left-pad/1.3.0_react@18.2.0:",
+            "    resolution: {integrity: sha512-pristine==}",
+            "    dev: false",
+            "",
+        ]
+        .join("\n")
+    }
+
+    /// The pnpm rewriter keys a resolved-peer instance's edit
+    /// `<name>@<version>(<peer>@<ver>)`, not bare `<name>@<version>` — the
+    /// takeover claim must cover it. A missed instance is a silent HALF
+    /// takeover: the plain entry reverts, the record is dropped, the peered
+    /// edit is stranded in the ledger, and every dependent resolving through
+    /// the peered instance keeps installing the expiring hosted tarball.
+    #[tokio::test]
+    async fn npm_pnpm_v6_peered_instance_takeover_reverts_every_instance() {
+        let (tmp, mut state) = npm_redirected_fixture("pnpm-lock.yaml", &pnpm_v6_pristine()).await;
+        let root = tmp.path();
+        assert_eq!(
+            state.edits.len(),
+            2,
+            "plain + peered instance edits: {:?}",
+            state.edits
+        );
+        let wired = tokio::fs::read_to_string(root.join("pnpm-lock.yaml"))
+            .await
+            .unwrap();
+        assert_eq!(
+            wired.matches(NPM_URL).count(),
+            2,
+            "both instances hosted-wired: {wired}"
+        );
+
+        revert_npm_redirect_purl(root, &mut state, NPM_PURL)
+            .await
+            .expect("revert succeeds");
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("pnpm-lock.yaml"))
+                .await
+                .unwrap(),
+            pnpm_v6_pristine(),
+            "pnpm-lock.yaml restored byte-identical (both instances)"
+        );
+        assert!(state.records.is_empty(), "record dropped");
+        assert!(
+            state.edits.is_empty(),
+            "no stranded instance edits: {:?}",
+            state.edits
+        );
+    }
+
+    /// v5 twin of the peered-instance claim: the `_<peer-suffix>` instance
+    /// key (`left-pad@1.3.0_react@18.2.0`) must be claimed too.
+    #[tokio::test]
+    async fn npm_pnpm_v5_suffixed_instance_takeover_reverts_every_instance() {
+        let (tmp, mut state) = npm_redirected_fixture("pnpm-lock.yaml", &pnpm_v5_pristine()).await;
+        let root = tmp.path();
+        assert_eq!(
+            state.edits.len(),
+            2,
+            "plain + suffixed instance edits: {:?}",
+            state.edits
+        );
+
+        revert_npm_redirect_purl(root, &mut state, NPM_PURL)
+            .await
+            .expect("revert succeeds");
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("pnpm-lock.yaml"))
+                .await
+                .unwrap(),
+            pnpm_v5_pristine(),
+            "pnpm-lock.yaml restored byte-identical (both instances)"
+        );
+        assert!(state.records.is_empty(), "record dropped");
+        assert!(
+            state.edits.is_empty(),
+            "no stranded instance edits: {:?}",
+            state.edits
+        );
+    }
+
+    /// The peered-instance claim is boundary-checked: `left-pad@1.3.0-rc1`'s
+    /// peered key starts with `left-pad@1.3.0`, but `-` extends the version —
+    /// taking over 1.3.0 must not claim (and replay) the prerelease sibling's
+    /// edit.
+    #[tokio::test]
+    async fn npm_pnpm_prerelease_sibling_peered_edit_is_not_claimed() {
+        let rc1_url =
+            "http://127.0.0.1:5555/patch/npm/left-pad/1.3.0-rc1/tok/6b7c/left-pad-1.3.0-rc1.tgz";
+        let lock = format!(
+            "lockfileVersion: '6.0'\n\npackages:\n\n  /left-pad@1.3.0:\n    \
+             resolution: {{integrity: sha512-h==, tarball: {NPM_URL}}}\n\n  \
+             /left-pad@1.3.0-rc1(react@18.2.0):\n    \
+             resolution: {{integrity: sha512-h2==, tarball: {rc1_url}}}\n"
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        tokio::fs::write(root.join("pnpm-lock.yaml"), &lock)
+            .await
+            .unwrap();
+        let mut state = RedirectState::new();
+        state.records.insert(NPM_PURL.to_string(), record());
+        state
+            .records
+            .insert("pkg:npm/left-pad@1.3.0-rc1".to_string(), record());
+        state.edits.push(FileEdit {
+            path: "pnpm-lock.yaml".into(),
+            kind: "redirect_pnpm_resolution".into(),
+            action: "rewritten".into(),
+            key: Some("left-pad@1.3.0".into()),
+            original: Some(Value::String("{integrity: sha512-p==}".into())),
+            new: Some(Value::String(format!(
+                "{{integrity: sha512-h==, tarball: {NPM_URL}}}"
+            ))),
+        });
+        state.edits.push(FileEdit {
+            path: "pnpm-lock.yaml".into(),
+            kind: "redirect_pnpm_resolution".into(),
+            action: "rewritten".into(),
+            key: Some("left-pad@1.3.0-rc1(react@18.2.0)".into()),
+            original: Some(Value::String("{integrity: sha512-p2==}".into())),
+            new: Some(Value::String(format!(
+                "{{integrity: sha512-h2==, tarball: {rc1_url}}}"
+            ))),
+        });
+
+        revert_npm_redirect_purl(root, &mut state, NPM_PURL)
+            .await
+            .expect("takeover of 1.3.0 succeeds without touching 1.3.0-rc1");
+
+        let lock_after = tokio::fs::read_to_string(root.join("pnpm-lock.yaml"))
+            .await
+            .unwrap();
+        assert!(
+            !lock_after.contains(NPM_URL),
+            "1.3.0 un-hosted: {lock_after}"
+        );
+        assert!(
+            lock_after.contains(rc1_url),
+            "1.3.0-rc1 still hosted-wired: {lock_after}"
+        );
+        assert_eq!(
+            state.edits.len(),
+            1,
+            "the sibling keeps its edit: {:?}",
+            state.edits
+        );
+        assert!(
+            state.records.contains_key("pkg:npm/left-pad@1.3.0-rc1")
+                && !state.records.contains_key(NPM_PURL),
+            "{:?}",
+            state.records.keys()
+        );
     }
 
     /// Pristine package-lock (lockfileVersion 2, both trees) holding TWO

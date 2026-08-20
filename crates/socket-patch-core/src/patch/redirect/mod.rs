@@ -7710,7 +7710,9 @@ mod tests {
             .find(|w| w.code == "redirect_gem_source_option")
             .unwrap_or_else(|| panic!("skip must warn: {:?}", r.warnings));
         assert!(
-            warning.detail.contains("socket-patch remove pkg:gem/rails@7.0.0")
+            warning
+                .detail
+                .contains("socket-patch remove pkg:gem/rails@7.0.0")
                 && warning.detail.contains("socket-patch vendor --revert")
                 && warning.detail.contains("EVERY vendored dependency"),
             "socket's own vendored wiring must prescribe the per-gem eject and \
@@ -8767,8 +8769,7 @@ mod tests {
                 "{lock} left-pad must point at the hosted URL: {out}"
             );
             assert_eq!(
-                v["packages"]["node_modules/left-pad"]["integrity"],
-                "sha512-PATCHED==",
+                v["packages"]["node_modules/left-pad"]["integrity"], "sha512-PATCHED==",
                 "{lock} left-pad must carry the patched integrity: {out}"
             );
         }
