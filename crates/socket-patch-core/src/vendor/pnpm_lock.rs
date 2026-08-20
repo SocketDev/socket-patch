@@ -124,7 +124,7 @@ pub async fn vendor_pnpm(
     let override_key = format!("{name}@{version}");
 
     // ── 2. Read the pair (refuse before any write) ───────────────────────
-    let pkg_bytes = match tokio::fs::read(project_root.join(PACKAGE_JSON)).await {
+    let pkg_bytes = match read_regular(&project_root.join(PACKAGE_JSON)).await {
         Ok(bytes) => bytes,
         Err(e) => {
             return refused(
@@ -146,7 +146,7 @@ pub async fn vendor_pnpm(
             );
         }
     };
-    let lock_text = match tokio::fs::read_to_string(project_root.join(PNPM_LOCK)).await {
+    let lock_text = match read_regular_string(&project_root.join(PNPM_LOCK)).await {
         Ok(text) => text,
         Err(e) => {
             return refused(
@@ -177,10 +177,39 @@ pub async fn vendor_pnpm(
     }
     let mut lines = split_lines(&lock_text);
     // `pnpm-workspace.yaml` is optional (single-package projects have none);
-    // its `overrides:` is where pnpm >= 11 reads them.
-    let ws_text: Option<String> = tokio::fs::read_to_string(project_root.join(PNPM_WORKSPACE))
-        .await
-        .ok();
+    // its `overrides:` is where pnpm >= 11 reads them. ONLY a missing file
+    // counts as "no file": an existing one we cannot read (non-UTF-8
+    // encoding, permissions, a FIFO) must refuse — treating it as absent
+    // would route into the create path, which OVERWRITES the user's
+    // workspace definition with the root-only scaffold.
+    let ws_text: Option<String> =
+        match read_regular_string(&project_root.join(PNPM_WORKSPACE)).await {
+            Ok(text) => Some(text),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                return refused(
+                    "vendor_lockfile_missing",
+                    format!(
+                        "cannot read {PNPM_WORKSPACE}: {e} — vendoring mirrors the override \
+                         into it (pnpm >= 11 reads overrides from pnpm-workspace.yaml); fix \
+                         the file and retry"
+                    ),
+                );
+            }
+        };
+    // Same CRLF posture as the lock above: the workspace splices match exact
+    // LF lines, so a CRLF file dodges the conflict checks and the edit
+    // appends a DUPLICATE `overrides:` section — a duplicated mapping key
+    // pnpm refuses to parse. Fail closed naming the real cause.
+    if ws_text.as_deref().is_some_and(|t| t.contains('\r')) {
+        return refused(
+            "vendor_lockfile_crlf_unsupported",
+            format!(
+                "{PNPM_WORKSPACE} has CRLF line endings, which this rewriter cannot edit \
+                 byte-faithfully — normalize the file to LF and retry"
+            ),
+        );
+    }
 
     // ── 3. Pre-flight refusals (override conflicts, entry present) ───────
     // A user-authored exact-version pin equal to `version` is TAKEN OVER
@@ -373,10 +402,17 @@ pub async fn vendor_pnpm(
 /// `None`: cannot determine (missing/unreadable/unsupported lock) —
 /// callers must keep the entry, fail-safe.
 pub async fn pnpm_entry_in_use(entry: &VendorEntry, project_root: &Path) -> Option<bool> {
-    let text = tokio::fs::read_to_string(project_root.join(PNPM_LOCK))
+    let text = read_regular_string(&project_root.join(PNPM_LOCK))
         .await
         .ok()?;
     if check_lock_version(&text).is_err() {
+        return None;
+    }
+    // CRLF (a Windows autocrlf checkout) breaks every structural probe
+    // below: the scan would find nothing and call a lock that still
+    // resolves through the artifact "provably orphaned" — undeterminable,
+    // keep (the unwired-revert guard then refuses, fail-closed).
+    if text.contains('\r') {
         return None;
     }
     let lines = split_lines(&text);
@@ -508,7 +544,7 @@ pub async fn revert_pnpm(entry: &VendorEntry, project_root: &Path, dry_run: bool
     // file degrades to a warning and the artifact removal still proceeds).
     let mut lock_lines: Option<Vec<String>> = None;
     if touches_lock {
-        match tokio::fs::read_to_string(project_root.join(PNPM_LOCK)).await {
+        match read_regular_string(&project_root.join(PNPM_LOCK)).await {
             Ok(text) => lock_lines = Some(split_lines(&text)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 outcome.warnings.push(VendorWarning::new(
@@ -521,7 +557,7 @@ pub async fn revert_pnpm(entry: &VendorEntry, project_root: &Path, dry_run: bool
     }
     let mut pkg_state: Option<(Value, String)> = None; // (doc, indent)
     if touches_pkg {
-        match tokio::fs::read(project_root.join(PACKAGE_JSON)).await {
+        match read_regular(&project_root.join(PACKAGE_JSON)).await {
             Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
                 Ok(doc) if doc.is_object() => {
                     let indent = detect_indent(&String::from_utf8_lossy(&bytes));
@@ -687,7 +723,7 @@ async fn revert_workspace(
     warnings: &mut Vec<VendorWarning>,
 ) -> Result<(), String> {
     let path = project_root.join(PNPM_WORKSPACE);
-    let text = match tokio::fs::read_to_string(&path).await {
+    let text = match read_regular_string(&path).await {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             // ALREADY CONVERGED: for an Added override (no recorded
@@ -704,6 +740,18 @@ async fn revert_workspace(
         }
         Err(e) => return Err(format!("cannot read {PNPM_WORKSPACE}: {e}")),
     };
+    // CRLF blindness fails CLOSED: the splices below match exact LF lines,
+    // so a CRLF-converted file would read an Added override as "already
+    // converged" and let the artifact it still points at be removed. Drift,
+    // not convergence — the keep gate holds the artifact until the user
+    // normalizes the file.
+    if text.contains('\r') {
+        warnings.push(drifted(format!(
+            "{PNPM_WORKSPACE} has CRLF line endings the revert splices cannot edit; \
+             left alone — normalize the file to LF and re-run `vendor --revert`"
+        )));
+        return Ok(());
+    }
 
     // Fast path: a file we created that is still byte-identical to the
     // scaffold we wrote → delete it (byte-restore to "no file").
@@ -1756,11 +1804,12 @@ fn edit_packages(
                 new_lines.push(expected_resolution.clone());
                 new_lines.push(format!("    version: {}", ctx.version));
                 replaced_resolution = true;
-            } else if line.trim_start().starts_with("deprecated:")
-                || line.trim_start().starts_with("version:")
-            {
+            } else if line.starts_with("    deprecated:") || line.starts_with("    version:") {
                 // deprecated: dropped (pnpm drops it for file: entries);
-                // version: re-inserted canonically after resolution.
+                // version: re-inserted canonically after resolution. Exact
+                // 4-space match: `version`/`deprecated` are also real npm
+                // package names, and a PEER DEP on one puts the same
+                // spelling at 6-space indent — those lines stay verbatim.
             } else {
                 new_lines.push(line.clone());
             }
@@ -1776,7 +1825,12 @@ fn edit_packages(
             file: PNPM_LOCK.to_string(),
             kind: KIND_LOCK_PACKAGE.to_string(),
             action: WiringAction::Rewritten,
-            key: Some(block.key.clone()),
+            // Always the registry key: a stale-ours block's key embeds the
+            // OLD uuid, and recording it would break the carry-forward
+            // original-fill's file+kind+key match against the first
+            // vendoring's record (revert locates the live block via `new`'s
+            // embedded key, never via `key`).
+            key: Some(reg_key.clone()),
             original: if is_ours_key {
                 None
             } else {
@@ -1828,7 +1882,9 @@ fn edit_snapshot_rekey(
             file: PNPM_LOCK.to_string(),
             kind: KIND_LOCK_SNAPSHOT.to_string(),
             action: WiringAction::Rewritten,
-            key: Some(block.key.clone()),
+            // Registry key for the same generation-stability reason as the
+            // packages record above.
+            key: Some(reg_key.clone()),
             original: if is_ours_key {
                 None
             } else {
@@ -2386,6 +2442,30 @@ async fn unwind_override_surfaces(
             let _ = atomic_write_bytes_preserving_mode(&ws_path, orig).await;
         }
     }
+}
+
+// ───────────────────────────── guarded reads ──────────────────────────────
+
+/// Guarded read shared in shape with the vendor siblings' twins
+/// (npm_lock.rs, npm_flavor.rs, lock_inventory.rs): `open_regular_file`
+/// opens with `O_NONBLOCK` and rejects non-regular files, so a FIFO planted
+/// as one of the pair files fails fast instead of wedging vendor / revert /
+/// the in-use probe forever in an `open(2)` waiting for a writer.
+pub(super) async fn read_regular(path: &Path) -> std::io::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt as _;
+
+    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.read_to_end(&mut bytes).await?;
+    Ok(bytes)
+}
+
+/// [`read_regular`], decoded as UTF-8 (`InvalidData` on failure, matching
+/// `read_to_string`'s error kind).
+pub(super) async fn read_regular_string(path: &Path) -> std::io::Result<String> {
+    let bytes = read_regular(path).await?;
+    String::from_utf8(bytes)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
 // ─────────────────────── yaml-ish line-block helpers ──────────────────────
@@ -4694,5 +4774,340 @@ snapshots:
             .root()
             .join(format!(".socket/vendor/npm/{UUID}"))
             .exists());
+    }
+
+    /// A re-vendor under a NEW patch uuid (the patch was updated upstream)
+    /// finds every surface already present — the FIRST vendoring created the
+    /// package.json `pnpm`/`overrides` tables and pnpm-workspace.yaml — so
+    /// the fresh entry records all-false creation flags. Those flags are
+    /// historical facts independent of the patch generation:
+    /// `carry_forward_wiring` must keep them across the uuid change, or
+    /// `--revert` leaves the vendor-created pnpm-workspace.yaml behind (a
+    /// workspace-defining file the user never wrote) and an empty
+    /// `"pnpm": {"overrides": {}}` husk in package.json.
+    #[tokio::test]
+    async fn new_uuid_revendor_revert_removes_created_workspace_and_tables() {
+        let mut fx = fixture_with(P1_BEFORE_PKG, P1_BEFORE_LOCK).await;
+
+        // First vendoring under uuid A creates all three surfaces.
+        let (_, prev, _) = expect_done(fx.vendor(false).await);
+        let prev = prev.unwrap();
+        let meta = prev.pnpm.as_ref().unwrap();
+        assert!(
+            meta.created_pnpm_table && meta.created_overrides_table && meta.created_workspace_file,
+            "first vendoring created the surfaces: {meta:?}"
+        );
+
+        // The patch is updated upstream: same package, new uuid.
+        fx.record.uuid = "0a1b2c3d-4e5f-6a7b-8c9d-0e1f2a3b4c5d".to_string();
+        let (_, revendored, _) = expect_done(fx.vendor(false).await);
+        let mut merged = revendored.unwrap();
+        assert_ne!(merged.uuid, prev.uuid, "re-vendor is a new generation");
+
+        // Reconcile with the entry being replaced (as persist_vendor_entry
+        // does), then revert.
+        super::super::state::carry_forward_wiring(&prev, &mut merged);
+        let outcome = revert_pnpm(&merged, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+
+        assert!(
+            !ws_exists(&fx).await,
+            "the pnpm-workspace.yaml vendor created must not survive revert"
+        );
+        assert_eq!(
+            fx.read(PACKAGE_JSON).await,
+            P1_BEFORE_PKG,
+            "package.json byte-restored (no empty pnpm/overrides husk)"
+        );
+        assert_eq!(
+            fx.read(PNPM_LOCK).await,
+            P1_BEFORE_LOCK,
+            "lock byte-restored"
+        );
+    }
+
+    /// The packages-block rewrite drops the entry's own 4-indent
+    /// `deprecated:`/`version:` FIELDS — but `version` and `deprecated` are
+    /// also real npm package names, and a peerDependency on one of them
+    /// (optional + uninstalled, so no peer-suffixed snapshot key triggers the
+    /// pre-flight refusal) puts the same spellings at 6-space indent inside
+    /// `peerDependencies:`/`peerDependenciesMeta:`. Those lines are part of
+    /// the "everything else verbatim" contract and must survive the rewrite.
+    #[tokio::test]
+    async fn packages_rewrite_keeps_peer_deps_named_version_or_deprecated() {
+        let pkg = "{\n  \"name\": \"x\",\n  \"dependencies\": { \"left-pad\": \"1.3.0\" }\n}\n";
+        let lock = "lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+importers:
+
+  .:
+    dependencies:
+      left-pad:
+        specifier: 1.3.0
+        version: 1.3.0
+
+packages:
+
+  left-pad@1.3.0:
+    resolution: {integrity: sha512-XI5MPzVNApjAyhQzphX8BkmKsKUxD4LdyK24iZeQGinBN9yTQT3bFlCBy/aVx2HrNcqQGsdot8ghrjyrvMCoEA==}
+    deprecated: use String.prototype.padStart()
+    peerDependencies:
+      deprecated: ^1.0.0
+      version: '>=1'
+    peerDependenciesMeta:
+      deprecated:
+        optional: true
+      version:
+        optional: true
+
+snapshots:
+
+  left-pad@1.3.0: {}
+";
+        let fx = fixture_with(pkg, lock).await;
+        let (result, entry, _) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        assert!(entry.is_some());
+
+        let healed = fx.read(PNPM_LOCK).await;
+        assert!(
+            healed.contains("    peerDependencies:\n      deprecated: ^1.0.0\n      version: '>=1'\n"),
+            "peer deps named like dropped fields must survive verbatim:\n{healed}"
+        );
+        assert!(
+            healed.contains(
+                "    peerDependenciesMeta:\n      deprecated:\n        optional: true\n      version:\n        optional: true"
+            ),
+            "peerDependenciesMeta keys must survive verbatim:\n{healed}"
+        );
+        assert!(
+            !healed.contains("    deprecated: use String.prototype.padStart()"),
+            "the entry's own 4-indent deprecated: field is still dropped:\n{healed}"
+        );
+        assert!(
+            healed.contains("    version: 1.3.0\n"),
+            "the canonical version: field is re-inserted:\n{healed}"
+        );
+    }
+
+    /// An EXISTING pnpm-workspace.yaml that cannot be read (non-UTF-8
+    /// encoding — e.g. a UTF-16 save —, permissions, a FIFO) must refuse,
+    /// never be mistaken for "no file": the create path would OVERWRITE the
+    /// user's workspace definition (their `packages:` globs, catalogs) with
+    /// the root-only scaffold.
+    #[tokio::test]
+    async fn unreadable_workspace_file_refuses_instead_of_scaffold_overwrite() {
+        let fx = fixture_with(P1_BEFORE_PKG, P1_BEFORE_LOCK).await;
+        let junk: &[u8] = b"packages:\n  - 'packages/*'\n\xFF\xFE\n";
+        tokio::fs::write(fx.root().join(PNPM_WORKSPACE), junk)
+            .await
+            .unwrap();
+
+        let detail = expect_refused(fx.vendor(false).await, "vendor_lockfile_missing");
+        assert!(detail.contains(PNPM_WORKSPACE), "{detail}");
+        assert_eq!(
+            tokio::fs::read(fx.root().join(PNPM_WORKSPACE)).await.unwrap(),
+            junk,
+            "the unreadable workspace file must survive byte-identical"
+        );
+        assert_eq!(fx.read(PACKAGE_JSON).await, P1_BEFORE_PKG, "pkg untouched");
+        assert_eq!(fx.read(PNPM_LOCK).await, P1_BEFORE_LOCK, "lock untouched");
+    }
+
+    /// A CRLF pnpm-workspace.yaml (Windows autocrlf checkout) dodges every
+    /// structural probe — the conflict checks miss the existing `overrides:`
+    /// section and the edit appends a DUPLICATE one, which pnpm rejects as a
+    /// duplicated mapping key (bricking every pnpm command). Same fail-closed
+    /// posture as the lock's CRLF refusal.
+    #[tokio::test]
+    async fn crlf_workspace_file_refuses_instead_of_duplicating_overrides() {
+        let fx = fixture_with(P1_BEFORE_PKG, P1_BEFORE_LOCK).await;
+        let crlf_ws = "packages:\r\n  - 'packages/*'\r\noverrides:\r\n  other-pkg: 2.0.0\r\n";
+        write_ws(&fx, crlf_ws).await;
+
+        let detail = expect_refused(fx.vendor(false).await, "vendor_lockfile_crlf_unsupported");
+        assert!(detail.contains(PNPM_WORKSPACE), "{detail}");
+        assert!(detail.contains("CRLF"), "{detail}");
+        assert_eq!(fx.read(PNPM_WORKSPACE).await, crlf_ws, "workspace untouched");
+        assert_eq!(fx.read(PNPM_LOCK).await, P1_BEFORE_LOCK, "lock untouched");
+        assert_eq!(fx.read(PACKAGE_JSON).await, P1_BEFORE_PKG, "pkg untouched");
+    }
+
+    /// The revert twin of the CRLF blindness: a workspace file converted to
+    /// CRLF since vendoring makes the Added override read as "already
+    /// converged" (the section probe misses it), so revert would remove the
+    /// artifact while the live override still points at it — pnpm >= 11 then
+    /// resolves through a deleted tarball. Must be a drift-keep instead.
+    #[tokio::test]
+    async fn crlf_workspace_revert_is_a_drift_keep_not_silent_convergence() {
+        let fx = fixture_with(P1_BEFORE_PKG, P1_BEFORE_LOCK).await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+        let crlf_ws = fx.read(PNPM_WORKSPACE).await.replace('\n', "\r\n");
+        tokio::fs::write(fx.root().join(PNPM_WORKSPACE), &crlf_ws)
+            .await
+            .unwrap();
+
+        let outcome = revert_pnpm(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_lock_entry_drifted" && w.detail.contains(PNPM_WORKSPACE)),
+            "CRLF workspace must surface as drift: {:?}",
+            outcome.warnings
+        );
+        assert!(
+            outcome.kept_artifact,
+            "the still-referenced artifact must be kept"
+        );
+        assert!(
+            fx.root()
+                .join(format!(".socket/vendor/npm/{UUID}"))
+                .exists(),
+            "artifact dir survives the drift-keep"
+        );
+        assert_eq!(fx.read(PNPM_WORKSPACE).await, crlf_ws, "CRLF file left alone");
+    }
+
+    /// A CRLF lock breaks the packages/snapshots section probes, so the
+    /// in-use scan finds nothing and would call a still-referenced artifact
+    /// "provably orphaned" (`Some(false)`) — letting the unwired-revert
+    /// guard delete it out from under the lock. CRLF must be undeterminable
+    /// (`None`), which the guard refuses on while the lock exists.
+    #[tokio::test]
+    async fn crlf_lock_is_undeterminable_for_in_use_and_unwired_revert_refuses() {
+        let (fx, entry) = reconstructed_fixture().await;
+        let crlf_lock = fx.read(PNPM_LOCK).await.replace('\n', "\r\n");
+        tokio::fs::write(fx.root().join(PNPM_LOCK), &crlf_lock)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            pnpm_entry_in_use(&entry, fx.root()).await,
+            None,
+            "a CRLF lock is undeterminable, never provably orphaned"
+        );
+        let outcome = revert_pnpm(&entry, fx.root(), false).await;
+        assert!(!outcome.success, "unwired revert must refuse: {outcome:?}");
+        assert!(
+            fx.root().join(fx.rel_tgz()).exists(),
+            "the artifact must survive"
+        );
+    }
+
+    #[cfg(unix)]
+    fn mkfifo(path: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+        let c_path =
+            std::ffi::CString::new(path.as_os_str().as_bytes()).expect("fifo path has no NUL");
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
+        assert_eq!(
+            rc,
+            0,
+            "mkfifo(2) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    /// A FIFO planted as one of the pair files must fail fast instead of
+    /// wedging vendor / revert / the in-use probe forever in an `open(2)`
+    /// waiting for a writer that never comes. package.json and
+    /// pnpm-workspace.yaml are the FIRST opens in the vendor flow (flavor
+    /// detection reads only the lock), and revert's lock/package.json reads
+    /// are the first opens of theirs. Same `open_regular_file` guard class
+    /// as the vendor siblings (npm_lock.rs, npm_flavor.rs, lock_inventory.rs).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fifo_pair_files_fail_fast_instead_of_wedging_vendor_and_revert() {
+        // Vendor half A: package.json is a FIFO.
+        let fxa = fixture_with(P1_BEFORE_PKG, P1_BEFORE_LOCK).await;
+        tokio::fs::remove_file(fxa.root().join(PACKAGE_JSON))
+            .await
+            .unwrap();
+        mkfifo(&fxa.root().join(PACKAGE_JSON));
+
+        // Vendor half B: pnpm-workspace.yaml is a FIFO.
+        let fxb = fixture_with(P1_BEFORE_PKG, P1_BEFORE_LOCK).await;
+        mkfifo(&fxb.root().join(PNPM_WORKSPACE));
+
+        // Revert halves: vendor normally first, then swap one pair file for
+        // a FIFO before reverting (probing the in-use scan on the FIFO lock
+        // too).
+        let fxc = fixture_with(P1_BEFORE_PKG, P1_BEFORE_LOCK).await;
+        let (_, entry_c, _) = expect_done(fxc.vendor(false).await);
+        let entry_c = entry_c.unwrap();
+        tokio::fs::remove_file(fxc.root().join(PNPM_LOCK))
+            .await
+            .unwrap();
+        mkfifo(&fxc.root().join(PNPM_LOCK));
+
+        let fxd = fixture_with(P1_BEFORE_PKG, P1_BEFORE_LOCK).await;
+        let (_, entry_d, _) = expect_done(fxd.vendor(false).await);
+        let entry_d = entry_d.unwrap();
+        tokio::fs::remove_file(fxd.root().join(PACKAGE_JSON))
+            .await
+            .unwrap();
+        mkfifo(&fxd.root().join(PACKAGE_JSON));
+
+        let deadline = std::time::Duration::from_secs(5);
+        let all = async {
+            (
+                fxa.vendor(false).await,
+                fxb.vendor(false).await,
+                pnpm_entry_in_use(&entry_c, fxc.root()).await,
+                revert_pnpm(&entry_c, fxc.root(), false).await,
+                revert_pnpm(&entry_d, fxd.root(), false).await,
+            )
+        };
+        let Ok((vendored_a, vendored_b, in_use_c, reverted_c, reverted_d)) =
+            tokio::time::timeout(deadline, all).await
+        else {
+            // On timeout the open is wedged in a `spawn_blocking` thread the
+            // runtime waits for on shutdown; connect a non-blocking writer to
+            // release it so the test can FAIL instead of hanging the suite.
+            use std::os::unix::fs::OpenOptionsExt;
+            for path in [
+                fxa.root().join(PACKAGE_JSON),
+                fxb.root().join(PNPM_WORKSPACE),
+                fxc.root().join(PNPM_LOCK),
+                fxd.root().join(PACKAGE_JSON),
+            ] {
+                let _ = std::fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(path);
+            }
+            panic!("pnpm pair-file reads must fail fast on FIFOs");
+        };
+        let detail = expect_refused(vendored_a, "vendor_lockfile_missing");
+        assert!(detail.contains(PACKAGE_JSON), "{detail}");
+        let detail = expect_refused(vendored_b, "vendor_lockfile_missing");
+        assert!(detail.contains(PNPM_WORKSPACE), "{detail}");
+        assert_eq!(in_use_c, None, "a FIFO lock is undeterminable");
+        assert!(
+            !reverted_c.success,
+            "revert must fail closed on a FIFO lock: {:?}",
+            reverted_c.warnings
+        );
+        assert!(
+            fxc.root().join(fxc.rel_tgz()).exists(),
+            "the artifact must survive the failed revert"
+        );
+        assert!(
+            !reverted_d.success,
+            "revert must fail closed on a FIFO package.json: {:?}",
+            reverted_d.warnings
+        );
+        assert!(
+            fxd.root().join(fxd.rel_tgz()).exists(),
+            "the artifact must survive the failed revert"
+        );
     }
 }

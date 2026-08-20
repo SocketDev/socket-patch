@@ -381,6 +381,31 @@ fn dedup_prefer_integrity(raw: Vec<LockfileEntry>) -> Vec<LockfileEntry> {
     out
 }
 
+/// Guarded read shared in shape with the vendor siblings' twins
+/// (cargo_lock.rs, gem.rs, go_mod_edit.rs): `open_regular_file` opens with
+/// `O_NONBLOCK` and rejects non-regular files, so a FIFO planted as any
+/// inventoried lockfile fails fast instead of wedging every consumer —
+/// scan's lockfile supplement, vendor's auto-fetch, repair's no-ledger
+/// reconstruction — forever in an `open(2)` that waits for a writer.
+async fn read_regular_to_string(path: &Path) -> std::io::Result<String> {
+    use tokio::io::AsyncReadExt as _;
+
+    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
+    let mut content = String::with_capacity(metadata.len() as usize);
+    file.read_to_string(&mut content).await?;
+    Ok(content)
+}
+
+/// Bytes twin of [`read_regular_to_string`] for the JSON locks.
+async fn read_regular(path: &Path) -> std::io::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt as _;
+
+    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.read_to_end(&mut bytes).await?;
+    Ok(bytes)
+}
+
 // ──────────────────────────────── Cargo.lock ────────────────────────────────
 
 /// Inventory `Cargo.lock` `[[package]]` blocks. Only crates.io-sourced
@@ -388,7 +413,7 @@ fn dedup_prefer_integrity(raw: Vec<LockfileEntry>) -> Vec<LockfileEntry> {
 /// file); workspace members (no `source`) are skipped, and git/custom-
 /// registry sources stay listed for discovery without a verifier.
 async fn inventory_cargo_lock(project_root: &Path) -> Option<Vec<LockfileEntry>> {
-    let text = tokio::fs::read_to_string(project_root.join("Cargo.lock"))
+    let text = read_regular_to_string(&project_root.join("Cargo.lock"))
         .await
         .ok()?;
     /// One in-flight `[[package]]` block: name, version, source, checksum.
@@ -462,7 +487,7 @@ async fn inventory_cargo_lock(project_root: &Path) -> Option<Vec<LockfileEntry>>
 /// may list more modules than the final build graph — acceptable for
 /// discovery, and the manifest decides what actually gets vendored.
 async fn inventory_go_sum(project_root: &Path) -> Option<Vec<LockfileEntry>> {
-    let text = tokio::fs::read_to_string(project_root.join("go.sum"))
+    let text = read_regular_to_string(&project_root.join("go.sum"))
         .await
         .ok()?;
     let mut out = Vec::new();
@@ -511,7 +536,7 @@ async fn inventory_package_lock(root: &Path) -> Option<Vec<LockfileEntry>> {
     // Shrinkwrap wins, mirroring `npm_lock::select_lockfile`.
     let mut bytes = None;
     for lock in ["npm-shrinkwrap.json", "package-lock.json"] {
-        if let Ok(b) = tokio::fs::read(root.join(lock)).await {
+        if let Ok(b) = read_regular(&root.join(lock)).await {
             bytes = Some(b);
             break;
         }
@@ -572,7 +597,7 @@ async fn inventory_pnpm_lock(root: &Path) -> Option<Vec<LockfileEntry>> {
 /// Inventory a specific `pnpm-lock.yaml` (path given explicitly so the Rush
 /// fallback can point it at `common/config/rush/…` and subspace locks).
 async fn inventory_pnpm_lock_at(lock_path: &Path) -> Option<Vec<LockfileEntry>> {
-    let text = tokio::fs::read_to_string(lock_path).await.ok()?;
+    let text = read_regular_to_string(lock_path).await.ok()?;
     let lines = pnpm_lock::split_lines(&text);
     let (start, end) = pnpm_lock::section_bounds(&lines, "packages")?;
 
@@ -731,9 +756,7 @@ async fn inventory_rush_pnpm_locks(project_root: &Path) -> Vec<LockfileEntry> {
 // ───────────────────────────── yarn.lock (classic) ─────────────────────────────
 
 async fn inventory_yarn_classic(root: &Path) -> Option<Vec<LockfileEntry>> {
-    let text = tokio::fs::read_to_string(root.join("yarn.lock"))
-        .await
-        .ok()?;
+    let text = read_regular_to_string(&root.join("yarn.lock")).await.ok()?;
     let mut out = Vec::new();
     for block in yarn_classic_lock::scan_blocks(&text) {
         // Our own vendored block: not a registry dependency.
@@ -774,9 +797,7 @@ async fn inventory_yarn_classic(root: &Path) -> Option<Vec<LockfileEntry>> {
 // ───────────────────────────── yarn.lock (berry) ─────────────────────────────
 
 async fn inventory_yarn_berry(root: &Path) -> Option<Vec<LockfileEntry>> {
-    let text = tokio::fs::read_to_string(root.join("yarn.lock"))
-        .await
-        .ok()?;
+    let text = read_regular_to_string(&root.join("yarn.lock")).await.ok()?;
     let mut out = Vec::new();
     // Berry reuses classic's block grammar (same scanner the berry backend
     // imports); `__metadata` and workspace/patch/file resolutions are not
@@ -811,9 +832,7 @@ async fn inventory_yarn_berry(root: &Path) -> Option<Vec<LockfileEntry>> {
 // ──────────────────────────────── bun.lock ────────────────────────────────
 
 async fn inventory_bun(root: &Path) -> Option<Vec<LockfileEntry>> {
-    let text = tokio::fs::read_to_string(root.join("bun.lock"))
-        .await
-        .ok()?;
+    let text = read_regular_to_string(&root.join("bun.lock")).await.ok()?;
     bun_lock_text::check_lock_version(&text).ok()?;
     let lines: Vec<String> = text.split('\n').map(str::to_string).collect();
     let entries = bun_lock_text::parse_packages_section(&lines).ok()?;
@@ -868,7 +887,7 @@ async fn inventory_bun(root: &Path) -> Option<Vec<LockfileEntry>> {
 /// versions drop the pretty leading `v`/`V` through the crawler's
 /// [`normalize_version`], so installed and lockfile rows agree.
 async fn inventory_composer_lock(project_root: &Path) -> Option<Vec<LockfileEntry>> {
-    let bytes = tokio::fs::read(project_root.join("composer.lock"))
+    let bytes = read_regular(&project_root.join("composer.lock"))
         .await
         .ok()?;
     let doc: Value = serde_json::from_slice(&bytes).ok()?;
@@ -956,7 +975,7 @@ async fn inventory_composer_lock(project_root: &Path) -> Option<Vec<LockfileEntr
 /// per-spec origin is genuinely ambiguous: its specs stay discovery-only
 /// (no resolved URL — the fetch layer then refuses), fail-closed.
 async fn inventory_gemfile_lock(project_root: &Path) -> Option<Vec<LockfileEntry>> {
-    let text = tokio::fs::read_to_string(project_root.join("Gemfile.lock"))
+    let text = read_regular_to_string(&project_root.join("Gemfile.lock"))
         .await
         .ok()?;
     let mut section_remotes: Vec<Vec<String>> = Vec::new();
@@ -1083,7 +1102,7 @@ async fn inventory_pypi_locks(project_root: &Path) -> Option<Vec<LockfileEntry>>
 /// uv.lock: TOML `[[package]]` blocks with `name`/`version` and
 /// `wheels = [{ url, hash = "sha256:…" }, …]` entries.
 async fn inventory_uv_lock(project_root: &Path) -> Option<Vec<LockfileEntry>> {
-    let text = tokio::fs::read_to_string(project_root.join("uv.lock"))
+    let text = read_regular_to_string(&project_root.join("uv.lock"))
         .await
         .ok()?;
     let mut out = Vec::new();
@@ -1163,7 +1182,7 @@ async fn inventory_uv_lock(project_root: &Path) -> Option<Vec<LockfileEntry>> {
 /// poetry.lock: `[[package]]` blocks with `name`/`version` — discovery
 /// only (file hashes exist but carry no URLs and no platform choice).
 async fn inventory_poetry_lock(project_root: &Path) -> Option<Vec<LockfileEntry>> {
-    let text = tokio::fs::read_to_string(project_root.join("poetry.lock"))
+    let text = read_regular_to_string(&project_root.join("poetry.lock"))
         .await
         .ok()?;
     let mut out = Vec::new();
@@ -1211,7 +1230,7 @@ async fn inventory_poetry_lock(project_root: &Path) -> Option<Vec<LockfileEntry>
 
 /// requirements.txt with exact `==` pins — discovery only.
 async fn inventory_requirements_txt(project_root: &Path) -> Option<Vec<LockfileEntry>> {
-    let text = tokio::fs::read_to_string(project_root.join("requirements.txt"))
+    let text = read_regular_to_string(&project_root.join("requirements.txt"))
         .await
         .ok()?;
     let mut out = Vec::new();
@@ -1441,7 +1460,7 @@ pub async fn wired_vendor_integrity(
 
     // JSON locks: resolved == "file:<rel>" (npm writes exactly this form).
     for lock in ["npm-shrinkwrap.json", "package-lock.json"] {
-        let Ok(bytes) = tokio::fs::read(project_root.join(lock)).await else {
+        let Ok(bytes) = read_regular(&project_root.join(lock)).await else {
             continue;
         };
         let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
@@ -1466,7 +1485,7 @@ pub async fn wired_vendor_integrity(
     // Text locks: any line referencing the artifact path, integrity within
     // a short forward window (the same block).
     for lock in ["pnpm-lock.yaml", "yarn.lock", "bun.lock"] {
-        let Ok(text) = tokio::fs::read_to_string(project_root.join(lock)).await else {
+        let Ok(text) = read_regular_to_string(&project_root.join(lock)).await else {
             continue;
         };
         let lines: Vec<&str> = text.lines().collect();
@@ -1682,7 +1701,7 @@ fn inline_yaml_field(line: &str, field: &str) -> Option<String> {
 /// file-sourced gem's name to the http one. The caller requires the single
 /// survivor to be http(s).
 async fn gem_remotes(project_root: &Path) -> Vec<String> {
-    let Ok(text) = tokio::fs::read_to_string(project_root.join("Gemfile.lock")).await else {
+    let Ok(text) = read_regular_to_string(&project_root.join("Gemfile.lock")).await else {
         return Vec::new();
     };
     let mut out: Vec<String> = Vec::new();
@@ -2980,6 +2999,123 @@ source = { editable = "." }
         assert!(entries.is_empty(), "{entries:?}");
         assert_eq!(unsupported.len(), 1, "{unsupported:?}");
         assert_eq!(unsupported[0].code, "vendor_pnpm_pnp_unsupported");
+    }
+
+    #[cfg(unix)]
+    fn mkfifo(path: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+        let c_path =
+            std::ffi::CString::new(path.as_os_str().as_bytes()).expect("fifo path has no NUL");
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
+        assert_eq!(
+            rc,
+            0,
+            "mkfifo(2) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    /// A FIFO planted as any inventoried lockfile must fail fast instead of
+    /// wedging every consumer — scan's lockfile supplement, vendor's
+    /// auto-fetch, and repair's no-ledger reconstruction all read these
+    /// files — forever in an `open(2)` that waits for a writer that never
+    /// comes. Same `open_regular_file` guard class as the vendor siblings
+    /// (cargo_lock.rs, composer_lock.rs, gem.rs, common.rs). Inventories
+    /// stay fail-soft: a non-regular lockfile reads as absent.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fifo_lockfiles_fail_fast_instead_of_wedging() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        // Every filename this module opens: the per-ecosystem inventories,
+        // the npm-family readers (reached without the flavor probe touching
+        // the same file via the shrinkwrap/sibling/rush fallbacks), and
+        // wired_vendor_integrity (no probe at all).
+        let names = [
+            "Cargo.lock",
+            "go.sum",
+            "composer.lock",
+            "Gemfile.lock",
+            "uv.lock",
+            "poetry.lock",
+            "requirements.txt",
+            "npm-shrinkwrap.json",
+            "package-lock.json",
+            "pnpm-lock.yaml",
+            "yarn.lock",
+            "bun.lock",
+            "shrinkwrap.yaml",
+        ];
+        for name in names {
+            mkfifo(&root.join(name));
+        }
+
+        // On timeout the open is wedged in a `spawn_blocking` thread that
+        // the runtime waits for on shutdown; connect a non-blocking writer
+        // to release it so the test can FAIL instead of hanging the suite.
+        let deadline = std::time::Duration::from_secs(5);
+        let all = async {
+            (
+                inventory_cargo_lock(&root).await,
+                inventory_go_sum(&root).await,
+                inventory_composer_lock(&root).await,
+                inventory_gemfile_lock(&root).await,
+                inventory_pypi_locks(&root).await,
+                inventory_package_lock(&root).await,
+                inventory_pnpm_lock(&root).await,
+                inventory_yarn_classic(&root).await,
+                inventory_yarn_berry(&root).await,
+                inventory_bun(&root).await,
+                inventory_pnpm_lock_at(&root.join("shrinkwrap.yaml")).await,
+                gem_remotes(&root).await,
+                wired_vendor_integrity(&root, ".socket/vendor/npm/x/x.tgz").await,
+            )
+        };
+        let Ok(results) = tokio::time::timeout(deadline, all).await else {
+            for name in names {
+                use std::os::unix::fs::OpenOptionsExt;
+                let _ = std::fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(root.join(name));
+            }
+            panic!("lockfile inventories must fail fast on FIFO lockfiles");
+        };
+        let (
+            cargo,
+            go,
+            composer,
+            gem,
+            pypi,
+            npm,
+            pnpm,
+            yarn_c,
+            yarn_b,
+            bun,
+            legacy,
+            remotes,
+            wired,
+        ) = results;
+        for (label, opt) in [
+            ("cargo", cargo),
+            ("go", go),
+            ("composer", composer),
+            ("gem", gem),
+            ("pypi", pypi),
+            ("npm", npm),
+            ("pnpm", pnpm),
+            ("yarn classic", yarn_c),
+            ("yarn berry", yarn_b),
+            ("bun", bun),
+            ("pnpm legacy", legacy),
+        ] {
+            assert!(
+                opt.is_none(),
+                "{label}: a FIFO lockfile must read as absent"
+            );
+        }
+        assert!(remotes.is_empty(), "{remotes:?}");
+        assert!(wired.is_none(), "{wired:?}");
     }
 
     #[tokio::test]

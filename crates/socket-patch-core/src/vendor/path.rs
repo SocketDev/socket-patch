@@ -329,6 +329,14 @@ pub async fn sweep_vendor_dirs(project_root: &Path) -> Vec<SweptVendorDir> {
     let vendor_root = project_root.join(VENDOR_DIR);
     for eco in ECOSYSTEM_DIRS {
         let eco_root = vendor_root.join(eco);
+        // Symlink-strict at the eco level too (lstat, not stat): staging
+        // creates these dirs itself and never writes symlinks, so a symlinked
+        // eco dir cannot be ours — `read_dir` would follow it and the sweep
+        // would enumerate (and let callers delete through) its target.
+        match tokio::fs::symlink_metadata(&eco_root).await {
+            Ok(meta) if meta.is_dir() => {}
+            _ => continue,
+        }
         for entry in list_dir_entries(&eco_root).await {
             let name = entry.file_name().to_string_lossy().into_owned();
             if !is_canonical_uuid(&name) {
@@ -702,6 +710,37 @@ mod tests {
             npm.purls.is_empty(),
             "purls must never be reconstructed through a symlink: {:?}",
             npm.purls
+        );
+    }
+
+    /// SECURITY: same posture one level up — the ECOSYSTEM dir itself may be
+    /// a committed symlink (`.socket/vendor/npm -> <outside>`). `read_dir`
+    /// follows directory symlinks, so an unguarded sweep enumerates uuid-shaped
+    /// dirs at the target and the orphan sweep deletes through the link.
+    /// Vendor staging creates eco dirs itself and never writes symlinks, so a
+    /// symlinked eco dir cannot be ours and must be skipped whole.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sweep_never_follows_a_symlinked_ecosystem_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // An outside tree shaped exactly like a vendor eco dir: a uuid dir
+        // holding a parseable leaf.
+        let outside = root.join("outside");
+        tokio::fs::create_dir_all(outside.join(UUID)).await.unwrap();
+        tokio::fs::write(outside.join(UUID).join("lodash-4.17.21.tgz"), b"x")
+            .await
+            .unwrap();
+
+        tokio::fs::create_dir_all(root.join(".socket/vendor"))
+            .await
+            .unwrap();
+        std::os::unix::fs::symlink(&outside, root.join(".socket/vendor/npm")).unwrap();
+
+        let swept = sweep_vendor_dirs(root).await;
+        assert!(
+            swept.is_empty(),
+            "a symlinked eco dir must not be swept (callers delete through it): {swept:?}"
         );
     }
 }

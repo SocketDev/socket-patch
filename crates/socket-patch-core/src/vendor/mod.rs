@@ -119,6 +119,39 @@ impl VendorWarning {
     }
 }
 
+/// Read a UTF-8 file, requiring a regular file — the sync twin of
+/// [`crate::utils::fs::open_regular_file`] for the advisory probe below.
+/// The probe runs unconditionally at envelope-finalize time on every
+/// vendor / scan --vendor run, and a plain `open(2)` of a FIFO planted at
+/// `yarn.lock` or `package.json` waits for a writer that may never come —
+/// wedging the whole run after all the real work already happened.
+/// `O_NONBLOCK` makes the open return immediately; the handle-based
+/// `is_file` check then rejects FIFOs/devices/directories so the probe
+/// degrades to its unreadable-file behavior.
+fn read_regular_file_to_string(path: &Path) -> std::io::Result<String> {
+    use std::io::Read as _;
+    #[cfg(unix)]
+    let mut file = {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(path)?
+    };
+    #[cfg(not(unix))]
+    let mut file = std::fs::File::open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    let mut s = String::with_capacity(metadata.len() as usize);
+    file.read_to_string(&mut s)?;
+    Ok(s)
+}
+
 /// Advisory probe: is this project one `yarn install` away from silently
 /// losing its vendored patches?
 ///
@@ -137,11 +170,11 @@ impl VendorWarning {
 /// callers can invoke it unconditionally at envelope-finalize time: it stays
 /// silent on unwired projects and after a full revert.
 pub fn yarn_classic_berry_migration_risk(project_root: &Path) -> Option<VendorWarning> {
-    let lock = std::fs::read_to_string(project_root.join("yarn.lock")).ok()?;
+    let lock = read_regular_file_to_string(&project_root.join("yarn.lock")).ok()?;
     if !lock.contains("# yarn lockfile v1") || !lock.contains(".socket/vendor/") {
         return None;
     }
-    if let Some(pm) = std::fs::read_to_string(project_root.join("package.json"))
+    if let Some(pm) = read_regular_file_to_string(&project_root.join("package.json"))
         .ok()
         .and_then(|pkg| serde_json::from_str::<serde_json::Value>(&pkg).ok())
         .and_then(|v| {
@@ -1015,7 +1048,7 @@ mod harvest_tests {
     /// the tokio blocking pool can shut down; the write side closing
     /// immediately EOFs the read.
     #[cfg(unix)]
-    fn unblock_fifo_reader(fifo: &Path) {
+    pub(super) fn unblock_fifo_reader(fifo: &Path) {
         let fifo = fifo.to_path_buf();
         std::thread::spawn(move || {
             let _ = std::fs::OpenOptions::new().write(true).open(fifo);
@@ -1023,7 +1056,7 @@ mod harvest_tests {
     }
 
     #[cfg(unix)]
-    fn mkfifo(path: &Path) {
+    pub(super) fn mkfifo(path: &Path) {
         use std::os::unix::ffi::OsStrExt as _;
         let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
@@ -1178,6 +1211,53 @@ mod berry_migration_risk_tests {
         // No lockfile at all.
         let tmp = project(None, Some(r#"{"name":"x"}"#));
         assert!(yarn_classic_berry_migration_risk(tmp.path()).is_none());
+    }
+
+    /// Run the sync probe on another thread with a timeout: a FIFO planted
+    /// at either probed path wedged the pre-fix `read_to_string` in
+    /// `open(2)` forever — and the probe runs unconditionally at
+    /// envelope-finalize time on EVERY vendor / scan --vendor run.
+    #[cfg(unix)]
+    fn probe_with_timeout(
+        root: &Path,
+        fifo: &Path,
+    ) -> Option<VendorWarning> {
+        let root = root.to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(yarn_classic_berry_migration_risk(&root));
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(res) => res,
+            Err(_) => {
+                super::harvest_tests::unblock_fifo_reader(fifo);
+                panic!("probe must not wedge on a FIFO at {}", fifo.display());
+            }
+        }
+    }
+
+    /// A FIFO planted at `yarn.lock` must be skipped, not read: the probe
+    /// stays silent (unreadable lockfile = nothing to vouch for) instead of
+    /// wedging every vendor run at finalize.
+    #[cfg(unix)]
+    #[test]
+    fn fifo_yarn_lock_never_wedges_probe() {
+        let tmp = project(None, Some(r#"{"name":"x"}"#));
+        let fifo = tmp.path().join("yarn.lock");
+        super::harvest_tests::mkfifo(&fifo);
+        assert!(probe_with_timeout(tmp.path(), &fifo).is_none());
+    }
+
+    /// A FIFO planted at `package.json` must not wedge the probe either —
+    /// and, like a malformed package.json, an unreadable pin cannot vouch
+    /// for the project, so the wired-classic warning still fires.
+    #[cfg(unix)]
+    #[test]
+    fn fifo_package_json_never_wedges_probe() {
+        let tmp = project(Some(WIRED_V1), None);
+        let fifo = tmp.path().join("package.json");
+        super::harvest_tests::mkfifo(&fifo);
+        assert!(probe_with_timeout(tmp.path(), &fifo).is_some());
     }
 
     #[test]

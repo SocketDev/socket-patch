@@ -15,7 +15,7 @@ use crate::patch::apply::{
     is_safe_relative_subpath, normalize_file_path, ApplyResult, VerifyResult, VerifyStatus,
 };
 use crate::patch::file_hash::compute_file_git_sha256;
-use crate::utils::fs::atomic_write_bytes_preserving_mode;
+use crate::utils::fs::{atomic_write_bytes_preserving_mode, open_regular_file};
 
 use super::state::{VendorEntry, WiringAction, WiringRecord};
 use super::{RevertOutcome, VendorOutcome, VendorServiceConfig, VendorWarning};
@@ -224,10 +224,19 @@ pub(crate) async fn zip_matches_after_hashes(
 ) -> bool {
     use std::io::Read as _;
 
+    use tokio::io::AsyncReadExt as _;
+
     use crate::hash::git_sha256::compute_git_sha256_from_bytes;
-    let Ok(bytes) = tokio::fs::read(archive_path).await else {
+    // Guarded read (`open_regular_file`: O_NONBLOCK + regular-file check): a
+    // FIFO planted at the archive path must read as out-of-sync, not wedge
+    // the probe forever in an `open(2)` waiting for a writer.
+    let Ok((mut file, metadata)) = open_regular_file(archive_path).await else {
         return false;
     };
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    if file.read_to_end(&mut bytes).await.is_err() {
+        return false;
+    }
     let Ok(mut archive) = zip::ZipArchive::new(std::io::Cursor::new(bytes)) else {
         return false;
     };
@@ -387,9 +396,20 @@ pub(crate) async fn revert_lock_fragment_splice(
     kind: &str,
     flavor: &str,
 ) -> RevertOutcome {
+    use tokio::io::AsyncReadExt as _;
+
     let lock_path = root.join(lock_file);
-    let mut lock_text = match tokio::fs::read_to_string(&lock_path).await {
-        Ok(t) => t,
+    // Guarded read (`open_regular_file`: O_NONBLOCK + regular-file check): a
+    // FIFO planted as the lock must fail this revert fast and loudly, not
+    // wedge remove/rollback forever in an `open(2)` waiting for a writer.
+    let mut lock_text = match open_regular_file(&lock_path).await {
+        Ok((mut file, metadata)) => {
+            let mut t = String::with_capacity(metadata.len() as usize);
+            if let Err(e) = file.read_to_string(&mut t).await {
+                return RevertOutcome::failed(format!("cannot read {lock_file}: {e}"));
+            }
+            t
+        }
         Err(e) => return RevertOutcome::failed(format!("cannot read {lock_file}: {e}")),
     };
     let mut warnings: Vec<VendorWarning> = Vec::new();
@@ -458,6 +478,109 @@ pub(crate) async fn revert_lock_fragment_splice(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn mkfifo(path: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+        let c_path =
+            std::ffi::CString::new(path.as_os_str().as_bytes()).expect("fifo path has no NUL");
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
+        assert_eq!(
+            rc,
+            0,
+            "mkfifo(2) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    /// A FIFO planted at the committed archive path (`.jar` / `.nupkg`) must
+    /// read as out-of-sync instead of wedging the maven/nuget in-sync probes
+    /// — and with them every apply — forever in an `open(2)` that waits for
+    /// a writer that never comes. Same `open_regular_file` guard class as
+    /// the Cargo.lock / lock-splice twins.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fifo_archive_fails_fast_in_zip_matches_after_hashes() {
+        let dir = tempfile::tempdir().unwrap();
+        let jar = dir.path().join("pkg.jar");
+        mkfifo(&jar);
+        let files: HashMap<String, PatchFileInfo> = HashMap::from([(
+            "lib/a.js".to_string(),
+            PatchFileInfo {
+                before_hash: "before".to_string(),
+                after_hash: "after".to_string(),
+            },
+        )]);
+
+        // On timeout the open is wedged in a `spawn_blocking` thread that the
+        // runtime waits for on shutdown; connect a writer to release it so
+        // the test can FAIL instead of hanging the whole suite.
+        let deadline = std::time::Duration::from_secs(5);
+        let Ok(in_sync) =
+            tokio::time::timeout(deadline, zip_matches_after_hashes(&jar, &files)).await
+        else {
+            let _ = std::fs::OpenOptions::new().write(true).open(&jar);
+            panic!("zip_matches_after_hashes must fail fast on a FIFO archive");
+        };
+        assert!(!in_sync, "a FIFO archive must read as out-of-sync");
+    }
+
+    /// A FIFO planted as the lock file must fail the revert fast and loudly
+    /// instead of wedging `remove` / rollback forever in an `open(2)` that
+    /// waits for a writer that never comes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fifo_lock_fails_fast_in_revert_lock_fragment_splice() {
+        let dir = tempfile::tempdir().unwrap();
+        mkfifo(&dir.path().join("poetry.lock"));
+
+        let mut entry: VendorEntry = serde_json::from_value(serde_json::json!({
+            "ecosystem": "pypi",
+            "basePurl": "pkg:pypi/six@1.16.0",
+            "uuid": "u",
+            "artifact": {"path": ".socket/vendor/pypi/u/x.whl"},
+            "wiring": [],
+        }))
+        .unwrap();
+        entry.wiring = vec![record(
+            "poetry.lock",
+            "poetry_lock_package",
+            WiringAction::Rewritten,
+            "six",
+            Some("OLD-FRAGMENT".into()),
+            "NEW-FRAGMENT".into(),
+        )];
+
+        // Same timeout-then-release shape as the archive test above.
+        let deadline = std::time::Duration::from_secs(5);
+        let Ok(outcome) = tokio::time::timeout(
+            deadline,
+            revert_lock_fragment_splice(
+                &entry,
+                dir.path(),
+                false,
+                "poetry.lock",
+                "poetry_lock_package",
+                "poetry",
+            ),
+        )
+        .await
+        else {
+            let _ = std::fs::OpenOptions::new()
+                .write(true)
+                .open(dir.path().join("poetry.lock"));
+            panic!("revert_lock_fragment_splice must fail fast on a FIFO lock");
+        };
+        assert!(!outcome.success, "a FIFO lock must fail the revert");
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("cannot read poetry.lock")),
+            "{:?}",
+            outcome.error
+        );
+    }
 
     /// The lock file is user-owned: reverting the splice must not reset its
     /// permission bits (the `package_json/update.rs` mode-reset bug, same
