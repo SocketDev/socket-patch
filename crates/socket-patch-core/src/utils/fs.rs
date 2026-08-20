@@ -225,6 +225,15 @@ async fn atomic_write_bytes_as(
         let _ = tokio::fs::remove_file(&stage).await;
         return Err(e);
     }
+    // `write_all` only buffers into tokio's background writer, and
+    // `sync_all` stores an in-flight write error back into the handle
+    // instead of returning it — this flush is the only point where a
+    // failed stage write (ENOSPC, EIO, quota) actually surfaces. Without
+    // it the truncated stage would be renamed over the intact target.
+    if let Err(e) = file.flush().await {
+        let _ = tokio::fs::remove_file(&stage).await;
+        return Err(e);
+    }
     if let Err(e) = file.sync_all().await {
         let _ = tokio::fs::remove_file(&stage).await;
         return Err(e);
@@ -506,6 +515,82 @@ mod tests {
             home,
             PathBuf::from("~"),
             "empty HOME/USERPROFILE must fall back to the harmless `~` sentinel"
+        );
+    }
+
+    /// Regression: a failed stage write must fail the commit and leave the
+    /// destination untouched. tokio's `File` runs writes on a background
+    /// blocking task: `write_all` returns once the bytes are buffered (one
+    /// chunk up to 2 MiB), and `sync_all`'s `complete_inflight` *stores* a
+    /// background-write error back into the handle instead of returning it
+    /// (tokio 1.50 `poll_complete_inflight`), after which the fsync of the
+    /// never-written file succeeds. Without an explicit `flush()`, an
+    /// ENOSPC/EIO/EFBIG during the stage write was therefore swallowed and
+    /// the truncated stage renamed over the intact destination — silent
+    /// data loss in the exact scenario the atomic writer exists to prevent.
+    /// Reproduced by capping `RLIMIT_FSIZE` so the stage write dies at
+    /// 256 KiB of a 1 MiB payload.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn atomic_write_failed_stage_write_errors_and_keeps_target() {
+        struct FsizeGuard {
+            prev: libc::rlimit,
+            prev_handler: libc::sighandler_t,
+        }
+        impl Drop for FsizeGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    libc::setrlimit(libc::RLIMIT_FSIZE, &self.prev);
+                    libc::signal(libc::SIGXFSZ, self.prev_handler);
+                }
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("target.json");
+        tokio::fs::write(&path, b"old").await.unwrap();
+
+        // Exceeding RLIMIT_FSIZE delivers SIGXFSZ (default: kill); ignore it
+        // so the write fails with EFBIG instead. Guard restores both.
+        let guard = unsafe {
+            let mut prev = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            assert_eq!(libc::getrlimit(libc::RLIMIT_FSIZE, &mut prev), 0);
+            let prev_handler = libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+            let capped = libc::rlimit {
+                rlim_cur: 256 * 1024,
+                rlim_max: prev.rlim_max,
+            };
+            assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &capped), 0);
+            FsizeGuard { prev, prev_handler }
+        };
+
+        // 1 MiB fits tokio's 2 MiB write buffer in one chunk, so `write_all`
+        // buffers it and returns Ok before the background write hits EFBIG.
+        let big = vec![0xABu8; 1024 * 1024];
+        let res = atomic_write_bytes(&path, &big).await;
+        drop(guard);
+
+        assert!(
+            res.is_err(),
+            "a failed stage write must surface as an error"
+        );
+        assert_eq!(
+            tokio::fs::read(&path).await.unwrap(),
+            b"old",
+            "the destination must keep its old bytes when the stage write fails"
+        );
+        let leftovers: Vec<String> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "target.json")
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "the failed stage file must be removed, found: {leftovers:?}"
         );
     }
 
