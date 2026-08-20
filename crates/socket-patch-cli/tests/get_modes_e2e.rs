@@ -650,3 +650,85 @@ async fn get_vendored_dry_run_json_envelope() {
         "vendored dry-run is a preview: no manifest, no artifacts, no ledger"
     );
 }
+
+// ── Cross-mode takeover: vendored → hosted, driven entirely by get ─────────
+
+/// A purl vendored by `get --mode vendored` is then redirected by
+/// `get --mode hosted`: the hosted engine's takeover pre-revert must unwind
+/// the vendored wiring FIRST (restore the lock original, drop the ledger
+/// entry, remove the committed artifact) and only then redirect — the
+/// project ends fully hosted, never half-migrated (mode_migration_npm.rs's
+/// invariants, exercised through get alone).
+#[tokio::test]
+async fn get_vendored_then_hosted_takes_over_cleanly() {
+    let server = MockServer::start().await;
+    mock_view(&server, UUID1, PURL1).await;
+    mock_reference(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_project(tmp.path());
+
+    // Step 1: vendor via get.
+    let (code, _stdout, stderr) = run_get(
+        tmp.path(),
+        &server.uri(),
+        &[UUID1, "--mode", "vendored", "--json", "--vendor-source", "build"],
+    );
+    assert_eq!(code, 0, "vendored step failed: {stderr}");
+    let artifact = tmp
+        .path()
+        .join(".socket/vendor/npm")
+        .join(UUID1)
+        .join(format!("{NAME}-1.0.0.tgz"));
+    assert!(artifact.is_file(), "precondition: artifact committed");
+    let lock = std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap();
+    assert!(
+        lock.contains(".socket/vendor/npm/"),
+        "precondition: lock vendored-wired; got:\n{lock}"
+    );
+
+    // Step 2: hosted via get — the takeover.
+    let (code, stdout, stderr) = run_get(
+        tmp.path(),
+        &server.uri(),
+        &[UUID1, "--mode", "hosted", "--json"],
+    );
+    assert_eq!(code, 0, "hosted takeover failed: {stderr}\n{stdout}");
+    let envelope = parse_single_json_doc(&stdout);
+    assert_eq!(envelope["redirect"]["redirected"], 1, "got: {envelope}");
+
+    let lock = std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap();
+    assert!(
+        lock.contains(HOSTED_URL1) && lock.contains(PATCHED_SHA512),
+        "lock must point at the hosted patch after takeover; got:\n{lock}"
+    );
+    assert!(
+        !lock.contains(".socket/vendor/npm/"),
+        "the vendored file: wiring must be fully unwound; got:\n{lock}"
+    );
+    assert!(
+        !artifact.exists(),
+        "the committed vendored artifact must be removed by the pre-revert"
+    );
+    // Vendor ledger entry gone (the file may be deleted outright when it
+    // empties — both shapes mean "no longer vendor-owned").
+    let vendor_state = tmp.path().join(".socket/vendor/state.json");
+    if vendor_state.is_file() {
+        let state = std::fs::read_to_string(&vendor_state).unwrap();
+        assert!(
+            !state.contains(UUID1),
+            "the vendored ledger must no longer claim the purl; got:\n{state}"
+        );
+    }
+    // Hosted ledger present with the record.
+    let ledger: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(tmp.path().join(".socket/vendor/redirect-state.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(ledger["records"][PURL1]["uuid"], UUID1);
+    // The takeover is announced, not silent.
+    assert!(
+        stdout.contains("redirect_takeover_reverted_vendored"),
+        "the takeover warning must ride the envelope; got:\n{stdout}"
+    );
+}

@@ -672,3 +672,231 @@ async fn get_ghsa_all_releases_disables_narrowing() {
         "--all-releases must record every found version"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Presence supplements, PnP vocabulary, and narrowing exemptions (review
+// findings: each branch below is contract-documented and needs its own pin)
+// ---------------------------------------------------------------------------
+
+/// FRESH CLONE (lockfile, no node_modules): hosted mode must count the
+/// lockfile-resolved version as PRESENT (scan's lockfile-supplement parity) —
+/// the grant is requested and the lock rewritten. Delete the supplement (or
+/// break its gate) and this narrows the only relevant version away.
+#[tokio::test]
+#[serial]
+async fn get_ghsa_hosted_counts_lockfile_resolved_as_present() {
+    let server = MockServer::start().await;
+    mock_ghsa_fanout(&server).await;
+    mock_view(&server, UUID1, PURL1).await;
+    mock_reference(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_project(tmp.path());
+    // The fresh-clone shape: the lock resolves 1.0.0 but nothing is installed.
+    std::fs::remove_dir_all(tmp.path().join("node_modules")).unwrap();
+
+    let mut args = get_args(GHSA, tmp.path(), server.uri());
+    args.mode = Some(ScanMode::Hosted);
+    let code = socket_patch_cli::commands::get::run(args).await;
+    assert_eq!(code, 0);
+
+    let lock = std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap();
+    assert!(
+        lock.contains(HOSTED_URL1),
+        "the lockfile-resolved version must be redirected on a fresh clone; got:\n{lock}"
+    );
+    assert_eq!(
+        requests_containing(&server, "/patches/package").await,
+        1,
+        "the grant must be requested for the lockfile-resolved version"
+    );
+}
+
+/// The SAME fresh clone in AGENT mode skips the lockfile-only version
+/// (scan parity: `--apply` partitions lockfile-only purls out as
+/// `package_not_installed`) — nothing recorded, nothing fetched.
+#[tokio::test]
+#[serial]
+async fn get_ghsa_agent_skips_lockfile_only_version() {
+    let server = MockServer::start().await;
+    mock_ghsa_fanout(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_project(tmp.path());
+    std::fs::remove_dir_all(tmp.path().join("node_modules")).unwrap();
+
+    let args = get_args(GHSA, tmp.path(), server.uri());
+    let code = socket_patch_cli::commands::get::run(args).await;
+    assert_eq!(code, 0, "lockfile-only in agent mode is a calm skip");
+    assert!(!tmp.path().join(".socket").exists());
+    assert_eq!(requests_containing(&server, "/patches/view/").await, 0);
+}
+
+/// yarn PnP (`.pnp.cjs` + yarn.lock, no node_modules): npm results are
+/// structurally invisible in EVERY mode — hosted must NOT request grants
+/// (never rewrite a PnP project's lock) and agent must not record anything.
+#[tokio::test]
+#[serial]
+async fn get_ghsa_yarn_pnp_skips_in_every_mode() {
+    for mode in [None, Some(ScanMode::Hosted), Some(ScanMode::Vendored)] {
+        let server = MockServer::start().await;
+        mock_ghsa_fanout(&server).await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("package.json"),
+            format!(r#"{{ "name": "consumer", "dependencies": {{ "{NAME}": "1.0.0" }} }}"#),
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("yarn.lock"), "# yarn lockfile v1\n").unwrap();
+        std::fs::write(tmp.path().join(".pnp.cjs"), "/* yarn berry PnP loader */").unwrap();
+
+        let mut args = get_args(GHSA, tmp.path(), server.uri());
+        args.mode = mode;
+        let code = socket_patch_cli::commands::get::run(args).await;
+        assert_eq!(code, 0, "yarn PnP is a calm warned skip (mode {mode:?})");
+        assert!(
+            !tmp.path().join(".socket").exists(),
+            "nothing may be written under yarn PnP (mode {mode:?})"
+        );
+        assert_eq!(
+            requests_containing(&server, "/patches/package").await,
+            0,
+            "no hosted grant may be requested under yarn PnP (mode {mode:?})"
+        );
+        assert_eq!(requests_containing(&server, "/patches/view/").await, 0);
+    }
+}
+
+/// pnpm PnP (`node-linker=pnp`): agent/vendored skip (`pnpm_pnp_unsupported`),
+/// but HOSTED keeps the results — the refusal's own remedy is the hosted
+/// pnpm-lock.yaml rewrite, so the grant request must fire.
+#[tokio::test]
+#[serial]
+async fn get_ghsa_pnpm_pnp_keeps_only_in_hosted_mode() {
+    let pnpm_pnp_project = |root: &Path| {
+        std::fs::write(
+            root.join("package.json"),
+            format!(r#"{{ "name": "consumer", "dependencies": {{ "{NAME}": "1.0.0" }} }}"#),
+        )
+        .unwrap();
+        std::fs::write(root.join("pnpm-lock.yaml"), "lockfileVersion: '9.0'\n").unwrap();
+        std::fs::write(root.join(".pnp.cjs"), "/* pnpm node-linker=pnp loader */").unwrap();
+        std::fs::create_dir_all(root.join("node_modules")).unwrap();
+        std::fs::write(root.join("node_modules/.modules.yaml"), "").unwrap();
+    };
+
+    // Hosted: kept — the grant request fires (the rewriter's own per-dep
+    // probe then decides; a no-match rewrite is a benign zero-redirect).
+    {
+        let server = MockServer::start().await;
+        mock_ghsa_fanout(&server).await;
+        mock_reference(&server).await;
+        let tmp = tempfile::tempdir().unwrap();
+        pnpm_pnp_project(tmp.path());
+
+        let mut args = get_args(GHSA, tmp.path(), server.uri());
+        args.mode = Some(ScanMode::Hosted);
+        let code = socket_patch_cli::commands::get::run(args).await;
+        assert_eq!(code, 0);
+        assert_eq!(
+            requests_containing(&server, "/patches/package").await,
+            1,
+            "hosted mode must KEEP pnpm-PnP results (its warning's remedy is \
+             the hosted rewrite) and request the grant"
+        );
+    }
+    // Agent + vendored: skipped, nothing fetched or written.
+    for mode in [None, Some(ScanMode::Vendored)] {
+        let server = MockServer::start().await;
+        mock_ghsa_fanout(&server).await;
+        let tmp = tempfile::tempdir().unwrap();
+        pnpm_pnp_project(tmp.path());
+
+        let mut args = get_args(GHSA, tmp.path(), server.uri());
+        args.mode = mode;
+        let code = socket_patch_cli::commands::get::run(args).await;
+        assert_eq!(code, 0, "pnpm PnP outside hosted is a calm skip (mode {mode:?})");
+        assert!(!tmp.path().join(".socket").exists(), "mode {mode:?}");
+        assert_eq!(requests_containing(&server, "/patches/view/").await, 0);
+    }
+}
+
+/// An EXACT-VERSIONED PURL identifier is exempt from narrowing (explicit
+/// intent, like a UUID): the uninstalled version's patch is still fetched
+/// and recorded.
+#[tokio::test]
+#[serial]
+async fn get_versioned_purl_is_exempt_from_narrowing() {
+    let server = MockServer::start().await;
+    // by-package search for the EXACT (uninstalled) 2.0.0 purl.
+    Mock::given(method("GET"))
+        .and(wiremock::matchers::path_regex(format!(
+            "^/v0/orgs/{ORG}/patches/by-package/.+$"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "patches": [{
+                "uuid": UUID2, "purl": PURL2,
+                "publishedAt": "2024-02-01T00:00:00Z",
+                "description": "x", "license": "MIT", "tier": "free",
+                "vulnerabilities": {}
+            }],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(&server)
+        .await;
+    mock_view(&server, UUID2, PURL2).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+
+    let args = get_args(PURL2, tmp.path(), server.uri());
+    // save_only=false: without the versioned-purl exemption this would be
+    // narrowed to nothing (empty dir). The apply step over the uninstalled
+    // entry may degrade the exit code — the exemption's observable contract
+    // is the manifest record below.
+    let _ = socket_patch_cli::commands::get::run(args).await;
+
+    assert_eq!(
+        read_manifest_purls(tmp.path()),
+        vec![PURL2.to_string()],
+        "an exact-versioned PURL identifier must bypass installed narrowing"
+    );
+}
+
+/// An ecosystem THIS binary has no crawler for is never judged "not
+/// installed" — absence from a crawl that never looked carries no
+/// information (the prune-GC fail-safe), so the record is kept.
+#[tokio::test]
+#[serial]
+async fn get_ghsa_unknown_ecosystem_is_never_narrowed() {
+    const FUTUR_UUID: &str = "44444444-4444-4444-8444-444444444444";
+    const FUTUR_PURL: &str = "pkg:futuristic/thing@1.0.0";
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/by-ghsa/{GHSA}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "patches": [{
+                "uuid": FUTUR_UUID, "purl": FUTUR_PURL,
+                "publishedAt": "2024-01-01T00:00:00Z",
+                "description": "x", "license": "MIT", "tier": "free",
+                "vulnerabilities": {}
+            }],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(&server)
+        .await;
+    mock_view(&server, FUTUR_UUID, FUTUR_PURL).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+
+    let args = get_args(GHSA, tmp.path(), server.uri());
+    // The apply step over an ecosystem with no crawler may degrade the exit
+    // code; the keep-not-skip decision is what this pins.
+    let _ = socket_patch_cli::commands::get::run(args).await;
+
+    assert_eq!(
+        read_manifest_purls(tmp.path()),
+        vec![FUTUR_PURL.to_string()],
+        "an unknown-ecosystem purl must be kept, never claimed not-installed"
+    );
+}

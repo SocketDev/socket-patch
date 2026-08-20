@@ -987,6 +987,15 @@ async fn filter_to_installed_purls(
             out.kept.push(result.clone());
             continue;
         }
+        // An ecosystem THIS binary has no crawler for (a newer patch
+        // server's `pkg:<type>/`) was silently absent from the probe —
+        // absence carries no information there (the same fail-safe as
+        // scan's prune GC), so keep the result instead of claiming
+        // "not installed" about a package we cannot see.
+        if !crate::ecosystem_dispatch::crawl_covers_purl(&result.purl) {
+            out.kept.push(result.clone());
+            continue;
+        }
         let is_npm = strip_purl_qualifiers(&result.purl).starts_with("pkg:npm/");
         let error_code = if is_npm && pnp_yarn {
             // Structurally invisible, in EVERY mode — never claim "not
@@ -2666,6 +2675,17 @@ async fn run_get_vendored_search(
         persist_blobs: false,
     };
     let (dl_code, mut result) = boxed_download_and_apply(selected, &params).await;
+    // A download-phase HARD error (unreadable manifest, unwritable
+    // .socket, failed manifest write — an `error`-status envelope the
+    // engine has ALREADY printed) aborts before the vendor step: get's
+    // `--json` contract is exactly one JSON document per run, and the
+    // vendor step would only re-fail on the same broken state and print a
+    // second, different document. Per-patch failures are NOT this case —
+    // they ride a success-shaped envelope and the vendor step still runs
+    // (scan parity: previously-recorded patches still (re)vendor).
+    if result["status"] == "error" {
+        return dl_code;
+    }
     let mut has_errors = dl_code != 0;
     fold_narrowing_into_result(&mut result, narrow_skips, narrow_warnings);
     if let Some(obj) = result.as_object_mut() {
@@ -2676,8 +2696,8 @@ async fn run_get_vendored_search(
     }
 
     // The vendor step (scan's, verbatim): apply lock, whole-manifest
-    // reconcile + staging + engine. A download failure does not skip it —
-    // previously-recorded patches still (re)vendor, exactly like scan.
+    // reconcile + staging + engine. A per-patch download failure does not
+    // skip it — previously-recorded patches still (re)vendor, like scan.
     match super::scan::boxed_scan_vendor_step(&args.common, &manifest_path, &socket_dir, None).await
     {
         Ok((vendor_errors, venv)) => {

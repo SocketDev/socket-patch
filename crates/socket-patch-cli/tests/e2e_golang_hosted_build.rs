@@ -269,7 +269,11 @@ fn stage_hosted_project(tmp: &Path) -> HostedGoProject {
     }
 }
 
+// #[serial]: this test mutates process env (GOTOOLCHAIN/GOFLAGS/GONOSUMDB
+// set_var) while its sibling below iterates env for the subprocess spawn —
+// unserialized, the two race on the process-global environment.
 #[test]
+#[serial_test::serial]
 fn day2_machine_builds_patched_module_from_committed_files_alone() {
     if !has_command("go") || !has_command("zip") {
         eprintln!("skipping e2e_golang_hosted_build: `go`/`zip` not installed");
@@ -449,7 +453,9 @@ fn day2_machine_builds_patched_module_from_committed_files_alone() {
 /// ONLY: no manifest, no blobs.
 // multi_thread: the CLI subprocess blocks a worker thread while wiremock
 // keeps serving the view + reference routes on the others.
+// #[serial]: see the sibling test's note — env mutation vs env iteration.
 #[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial]
 async fn golang_get_uuid_hosted_day2_machine_builds() {
     if !has_command("go") || !has_command("zip") {
         eprintln!("skipping e2e_golang_hosted_build: `go`/`zip` not installed");
