@@ -88,11 +88,24 @@ pub async fn drop_patch_entry(
     edit_config(project_root, dry_run, |c| remove_patch_entry(c, name)).await
 }
 
+/// Guarded read shared in shape with the vendor/cargo.rs + setup twins:
+/// `open_regular_file` opens with `O_NONBLOCK` and rejects non-regular files,
+/// so a FIFO planted as `.cargo/config(.toml)` fails fast instead of wedging
+/// scan / vendor apply forever in an `open(2)` that waits for a writer.
+async fn read_regular_to_string(path: &Path) -> std::io::Result<String> {
+    use tokio::io::AsyncReadExt as _;
+
+    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
+    let mut content = String::with_capacity(metadata.len() as usize);
+    file.read_to_string(&mut content).await?;
+    Ok(content)
+}
+
 /// Read all `[patch.crates-io]` entries. Read-only; a missing or malformed
 /// config yields an empty map (callers treat that as "no managed entries").
 pub async fn read_patch_entries(project_root: &Path) -> HashMap<String, PatchEntryInfo> {
     let path = config_path(project_root).await;
-    match fs::read_to_string(&path).await {
+    match read_regular_to_string(&path).await {
         Ok(content) => parse_patch_entries(&content),
         Err(_) => HashMap::new(),
     }
@@ -108,7 +121,7 @@ pub async fn read_patch_entries(project_root: &Path) -> HashMap<String, PatchEnt
 pub async fn socket_registry_indexes(project_root: &Path) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for file in [".cargo/config", ".cargo/config.toml"] {
-        let Ok(content) = fs::read_to_string(project_root.join(file)).await else {
+        let Ok(content) = read_regular_to_string(&project_root.join(file)).await else {
             continue;
         };
         let Ok(doc) = content.parse::<DocumentMut>() else {
@@ -157,7 +170,10 @@ async fn edit_config(
     transform: impl FnOnce(&str) -> Result<Option<String>, String>,
 ) -> Result<bool, String> {
     let path = config_path(project_root).await;
-    let content = match fs::read_to_string(&path).await {
+    // Guarded read: a FIFO/device/directory squatting the config path errors
+    // here (`InvalidInput`) rather than blocking, and is never mistaken for
+    // an empty config to rename a fresh file over.
+    let content = match read_regular_to_string(&path).await {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => return Err(format!("read {}: {e}", path.display())),
@@ -236,10 +252,12 @@ fn path_is_socket_owned(path: &str) -> bool {
     if segments.contains(&"..") {
         return false;
     }
-    [CARGO_VENDOR_DIR, LEGACY_CARGO_PATCHES_DIR].iter().any(|dir| {
-        let prefix: Vec<&str> = dir.split('/').collect();
-        segments.len() > prefix.len() && segments[..prefix.len()] == prefix[..]
-    })
+    [CARGO_VENDOR_DIR, LEGACY_CARGO_PATCHES_DIR]
+        .iter()
+        .any(|dir| {
+            let prefix: Vec<&str> = dir.split('/').collect();
+            segments.len() > prefix.len() && segments[..prefix.len()] == prefix[..]
+        })
 }
 
 /// The `path` string of a `[patch]` entry (inline table or sub-table), if any.
@@ -384,9 +402,7 @@ mod tests {
         ));
         // A `..` INSIDE the owned prefix escapes it.
         assert!(!path_is_socket_owned(".socket/vendor/cargo/../../../etc"));
-        assert!(!path_is_socket_owned(
-            ".socket/cargo-patches/../../secrets"
-        ));
+        assert!(!path_is_socket_owned(".socket/cargo-patches/../../secrets"));
         // A nested sub-checkout's socket dir is not THIS project's.
         assert!(!path_is_socket_owned("sub/.socket/vendor/cargo/u/x-1.0.0"));
         // The bare owned dir itself (no copy segment) is not an entry we write.
@@ -700,6 +716,122 @@ mod tests {
             mode, 0o640,
             "editing a user-owned config must not reset its permission bits"
         );
+    }
+
+    // ── FIFO / special-file guard: reads must fail fast, not wedge ───
+    /// mkfifo(2) directly rather than shelling out to the `mkfifo` binary —
+    /// same helper as the setup/pypi + crawler FIFO tests: fork/exec flakes
+    /// under heavy parallel load and the syscall needs no process at all.
+    #[cfg(unix)]
+    fn mkfifo(path: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+        let c_path =
+            std::ffi::CString::new(path.as_os_str().as_bytes()).expect("fifo path has no NUL");
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
+        assert_eq!(
+            rc,
+            0,
+            "mkfifo(2) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    /// Connect (and immediately drop) a writer to a FIFO whose reader is
+    /// wedged in `open(2)`, releasing the leaked `spawn_blocking` thread the
+    /// runtime would otherwise wait for on shutdown — so a regressed test
+    /// FAILS instead of hanging the whole suite. `O_NONBLOCK` so a FIFO with
+    /// no pending reader errors (`ENXIO`) instead of blocking us in turn.
+    #[cfg(unix)]
+    fn release_fifo_reader(path: &Path) {
+        use std::os::unix::fs::OpenOptionsExt;
+        let _ = std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(path);
+    }
+
+    /// A FIFO planted as `.cargo/config.toml` must not wedge the read path:
+    /// a plain `read_to_string` `open(2)` of a FIFO waits for a writer that
+    /// never comes, hanging `scan` and every vendor pre-flight that consults
+    /// the patch table. Same class as the `open_regular_file` guards in the
+    /// redirect-ledger / vendor `Cargo.toml` twins; the non-regular file must
+    /// instead read as "no entries" (the malformed-config contract).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_read_patch_entries_fifo_config_does_not_wedge() {
+        let dir = tempfile::tempdir().unwrap();
+        let cargo_dir = dir.path().join(".cargo");
+        fs::create_dir_all(&cargo_dir).await.unwrap();
+        let cfg = cargo_dir.join("config.toml");
+        mkfifo(&cfg);
+
+        let deadline = std::time::Duration::from_secs(5);
+        let Ok(entries) = tokio::time::timeout(deadline, read_patch_entries(dir.path())).await
+        else {
+            release_fifo_reader(&cfg);
+            panic!("read_patch_entries must complete promptly with a FIFO config");
+        };
+        assert!(
+            entries.is_empty(),
+            "a FIFO config holds no readable entries"
+        );
+    }
+
+    /// The edit path: `config_path` picks a legacy `.cargo/config` whose
+    /// metadata probes fine, but the plain read then blocks forever in
+    /// `open(2)`, wedging wet vendor apply/remove. It must fail fast with an
+    /// error instead — and never treat the squatted path as an empty config
+    /// to rename a fresh file over.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_ensure_patch_entry_fifo_legacy_config_fails_fast() {
+        let dir = tempfile::tempdir().unwrap();
+        let cargo_dir = dir.path().join(".cargo");
+        fs::create_dir_all(&cargo_dir).await.unwrap();
+        let legacy = cargo_dir.join("config");
+        mkfifo(&legacy);
+
+        let deadline = std::time::Duration::from_secs(5);
+        let Ok(res) = tokio::time::timeout(
+            deadline,
+            ensure_patch_entry(dir.path(), "cfg-if", &vendor_path("cfg-if", "1.0.4"), false),
+        )
+        .await
+        else {
+            release_fifo_reader(&legacy);
+            panic!("ensure_patch_entry must complete promptly with a FIFO config");
+        };
+        assert!(
+            res.is_err(),
+            "a FIFO config must fail loudly, not be edited"
+        );
+        use std::os::unix::fs::FileTypeExt;
+        let ft = std::fs::symlink_metadata(&legacy).unwrap().file_type();
+        assert!(ft.is_fifo(), "squatted path must not be replaced");
+    }
+
+    /// The registry-index read sweeps both config files; a FIFO squatting
+    /// either one must contribute nothing rather than wedge `scan`. Only the
+    /// first file (`config`) has a pending reader when the timeout fires —
+    /// the dropped future never reaches `config.toml` — so only it needs
+    /// releasing.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_socket_registry_indexes_fifo_configs_do_not_wedge() {
+        let dir = tempfile::tempdir().unwrap();
+        let cargo_dir = dir.path().join(".cargo");
+        fs::create_dir_all(&cargo_dir).await.unwrap();
+        let legacy = cargo_dir.join("config");
+        mkfifo(&legacy);
+        mkfifo(&cargo_dir.join("config.toml"));
+
+        let deadline = std::time::Duration::from_secs(5);
+        let Ok(out) = tokio::time::timeout(deadline, socket_registry_indexes(dir.path())).await
+        else {
+            release_fifo_reader(&legacy);
+            panic!("socket_registry_indexes must complete promptly with FIFO configs");
+        };
+        assert!(out.is_empty(), "FIFO configs contribute no registries");
     }
 
     // ── exact-restore: emptied socket-created config is deleted ──────

@@ -80,6 +80,20 @@ use super::{RevertOutcome, VendorOutcome, VendorServiceConfig, VendorWarning};
 const GEMFILE: &str = "Gemfile";
 const GEMFILE_LOCK: &str = "Gemfile.lock";
 
+/// Guarded read shared in shape with the composer.lock / Cargo.lock twins:
+/// `open_regular_file` opens with `O_NONBLOCK` and rejects non-regular files,
+/// so a FIFO planted as the Gemfile, Gemfile.lock, or a stub gemspec fails
+/// fast instead of wedging vendor's pair read, revert's restore readers, or
+/// the ledger reconstruction forever in an `open(2)` that waits for a writer.
+async fn read_regular_to_string(path: &Path) -> std::io::Result<String> {
+    use tokio::io::AsyncReadExt as _;
+
+    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
+    let mut content = String::with_capacity(metadata.len() as usize);
+    file.read_to_string(&mut content).await?;
+    Ok(content)
+}
+
 /// Wiring-record discriminators (`key` is the gem name for all three).
 ///
 /// `gemfile_line`: `original`/`new` are verbatim line/block strings.
@@ -230,25 +244,34 @@ pub async fn vendor_gem(
 
     // ── project files ────────────────────────────────────────────────────
     let gemfile_path = project_root.join(GEMFILE);
-    let gemfile_text = match tokio::fs::read_to_string(&gemfile_path).await {
+    let gemfile_text = match read_regular_to_string(&gemfile_path).await {
         Ok(t) => t,
-        Err(_) => {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return refused(
                 "gemfile_missing",
                 format!("no Gemfile at {}", gemfile_path.display()),
             );
         }
+        Err(e) => {
+            return refused("gemfile_missing", format!("unreadable Gemfile: {e}"));
+        }
     };
     let lock_path = project_root.join(GEMFILE_LOCK);
-    let lock_text = match tokio::fs::read_to_string(&lock_path).await {
+    let lock_text = match read_regular_to_string(&lock_path).await {
         Ok(t) => t,
-        Err(_) => {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return refused(
                 "vendor_lockfile_missing",
                 format!(
                     "no Gemfile.lock at {} (the pair edit needs the lock)",
                     lock_path.display()
                 ),
+            );
+        }
+        Err(e) => {
+            return refused(
+                "vendor_lockfile_missing",
+                format!("unreadable Gemfile.lock: {e}"),
             );
         }
     };
@@ -277,7 +300,7 @@ pub async fn vendor_gem(
             .and_then(Path::parent)
             .map(|home| home.join("specifications").join(format!("{leaf}.gemspec")));
         match spec_src {
-            Some(p) => tokio::fs::read_to_string(&p).await.ok().map(|t| (p, t)),
+            Some(p) => read_regular_to_string(&p).await.ok().map(|t| (p, t)),
             None => None,
         }
     };
@@ -311,11 +334,11 @@ pub async fn vendor_gem(
     // stub that fails the required-attribute bar routes into the artifact
     // rebuild below (which re-materialises a valid stub) instead of the
     // silent `already_vendored` no-op.
-    let copy_stub_ok =
-        match tokio::fs::read_to_string(copy_dir.join(format!("{name}.gemspec"))).await {
-            Ok(text) => gemspec_missing_required_attrs(&text).is_empty(),
-            Err(_) => false,
-        };
+    let copy_stub_ok = match read_regular_to_string(&copy_dir.join(format!("{name}.gemspec"))).await
+    {
+        Ok(text) => gemspec_missing_required_attrs(&text).is_empty(),
+        Err(_) => false,
+    };
     let copy_ok = copy_matches_after_hashes(&copy_dir, &record.files).await && copy_stub_ok;
     if lock_wired {
         if lock_checksum_in_sync(&lock_text, name, version) {
@@ -1213,7 +1236,7 @@ pub async fn reconstruct_gem_wiring(
     }
 
     // ── Gemfile: exactly one declaration, carrying OUR `path:` ───────────
-    let gemfile_text = tokio::fs::read_to_string(project_root.join(GEMFILE))
+    let gemfile_text = read_regular_to_string(&project_root.join(GEMFILE))
         .await
         .map_err(|e| format!("unreadable Gemfile: {e}"))?;
     let lines: Vec<&str> = gemfile_text.split('\n').collect();
@@ -1277,7 +1300,7 @@ pub async fn reconstruct_gem_wiring(
     };
 
     // ── Gemfile.lock: our PATH section + the `!` DEPENDENCIES pin ────────
-    let lock_text = tokio::fs::read_to_string(project_root.join(GEMFILE_LOCK))
+    let lock_text = read_regular_to_string(&project_root.join(GEMFILE_LOCK))
         .await
         .map_err(|e| format!("unreadable Gemfile.lock: {e}"))?;
     let lock_lines: Vec<String> = lock_text.split('\n').map(str::to_string).collect();
@@ -1455,6 +1478,7 @@ fn plan_gemfile_edit(
     let lines: Vec<&str> = text.split('\n').collect();
     // (line idx, top-level?, paren-call?, quote, rest-after-name)
     let mut found: Vec<(usize, bool, bool, char, String)> = Vec::new();
+    let mut unparsed_mention = false;
     for (i, line) in lines.iter().enumerate() {
         let trimmed = line.trim_start();
         if trimmed.starts_with('#') {
@@ -1462,9 +1486,24 @@ fn plan_gemfile_edit(
         }
         if let Some((q, rest, paren)) = gem_declaration(trimmed, name) {
             found.push((i, trimmed.len() == line.len(), paren, q, rest.to_string()));
+        } else if gem_call_mentions_name(trimmed, name) {
+            unparsed_mention = true;
         }
     }
     if found.is_empty() {
+        // Gate the append behind the looser "declared at all?" probe (the
+        // redirect rewriter's `declared_re` twin): a declaration the strict
+        // grammar above cannot see — `gem"{name}"` with no separator,
+        // `gem ("{name}")` with a space before the paren, both valid Ruby —
+        // must refuse, never Append. Appending the managed block next to the
+        // unseen declaration leaves the Gemfile declaring the gem TWICE, and
+        // bundler hard-fails every install on the duplicate.
+        if unparsed_mention {
+            return Err(format!(
+                "a `gem` call names \"{name}\" in a form the line grammar cannot parse; \
+                 refusing to append a second declaration (bundler hard-fails on duplicates)"
+            ));
+        }
         return Ok(GemfilePlan::Append {
             block: format!(
                 "{MANAGED_OPEN}\ngem \"{name}\", \"{version}\", path: \"{rel}\"\n{MANAGED_CLOSE}\n"
@@ -1529,6 +1568,27 @@ fn plan_gemfile_edit(
         original_line: lines[idx].to_string(),
         new_line,
     })
+}
+
+/// Looser "declared at all?" probe — the redirect rewriter's `declared_re`
+/// twin. True when a non-comment line is a `gem` call (the keyword followed
+/// by anything but an identifier character) whose arguments quote the exact
+/// gem name, in ANY form — including ones [`gem_declaration`]'s strict
+/// grammar cannot see. Gates [`plan_gemfile_edit`]'s transitive Append plan
+/// fail-closed; a false positive (the name quoted elsewhere in a `gem` call's
+/// arguments) costs an honest refusal, never a wrong edit.
+fn gem_call_mentions_name(trimmed: &str, name: &str) -> bool {
+    let Some(rest) = trimmed.strip_prefix("gem") else {
+        return false;
+    };
+    if rest
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return false;
+    }
+    rest.contains(&format!("\"{name}\"")) || rest.contains(&format!("'{name}'"))
 }
 
 /// Match `gem "<name>"` / `gem '<name>'` (or the parenthesized call form) at
@@ -2082,7 +2142,7 @@ async fn revert_gemfile_record(
     w: &WiringRecord,
     dry_run: bool,
 ) -> Result<bool, String> {
-    let text = match tokio::fs::read_to_string(gemfile_path).await {
+    let text = match read_regular_to_string(gemfile_path).await {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(e) => return Err(format!("unreadable Gemfile: {e}")),
@@ -2134,7 +2194,7 @@ async fn revert_lock_record(
     let Some(new_lines) = wiring_string_array(w.new.as_ref()) else {
         return Ok(false);
     };
-    let text = match tokio::fs::read_to_string(lock_path).await {
+    let text = match read_regular_to_string(lock_path).await {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(e) => return Err(format!("unreadable Gemfile.lock: {e}")),
@@ -2172,13 +2232,10 @@ async fn revert_lock_checksum_record(
     w: &WiringRecord,
     dry_run: bool,
 ) -> Result<bool, String> {
-    let Some(original) = w.original.as_ref().and_then(Value::as_str) else {
-        return Ok(false);
-    };
     let Some(written) = w.new.as_ref().and_then(Value::as_str) else {
         return Ok(false);
     };
-    let text = match tokio::fs::read_to_string(lock_path).await {
+    let text = match read_regular_to_string(lock_path).await {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(e) => return Err(format!("unreadable Gemfile.lock: {e}")),
@@ -2189,6 +2246,15 @@ async fn revert_lock_checksum_record(
     };
     let Some(i) = (ck_start + 1..ck_end).find(|&i| lines[i] == written) else {
         return Ok(false);
+    };
+    let Some(original) = w.original.as_ref().and_then(Value::as_str) else {
+        // A re-vendor rides the checksum record forward with `original: None`
+        // for the caller's carry-forward to fill. When the chain has no
+        // registry line to fill FROM — the pre-vendor entry was ALREADY the
+        // bare path form (vendor then recorded no checksum wiring at all) —
+        // there is nothing to restore: the bare line still standing IS the
+        // pre-vendor state, not drift.
+        return Ok(true);
     };
     lines[i] = original.to_string();
     if !dry_run {
@@ -5340,6 +5406,163 @@ mod tests {
         assert_eq!(
             tokio::fs::read(root.join(GEMFILE_LOCK)).await.unwrap(),
             lock_before
+        );
+    }
+
+    #[cfg(unix)]
+    fn mkfifo(path: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+        let c_path =
+            std::ffi::CString::new(path.as_os_str().as_bytes()).expect("fifo path has no NUL");
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
+        assert_eq!(
+            rc,
+            0,
+            "mkfifo(2) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    /// A FIFO planted as `Gemfile.lock` must fail fast instead of wedging
+    /// every lock reader — vendor's pair read and revert's three restore
+    /// readers — forever in an `open(2)` that waits for a writer that never
+    /// comes. Same `open_regular_file` guard class as the composer.lock /
+    /// Cargo.lock twins. Vendor refuses loudly; revert fails without
+    /// deleting the artifacts (what to restore can't be determined).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fifo_lock_fails_fast_instead_of_wedging() {
+        let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
+
+        // A real vendor run first so revert has a live ledger entry.
+        let (r1, e1, _) = unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
+        assert!(r1.success, "{:?}", r1.error);
+        let entry = e1.unwrap();
+
+        let lock_path = root.join(GEMFILE_LOCK);
+        tokio::fs::remove_file(&lock_path).await.unwrap();
+        mkfifo(&lock_path);
+
+        // On timeout the open is wedged in a `spawn_blocking` thread that the
+        // runtime waits for on shutdown; connect a writer to release it so
+        // the test can FAIL instead of hanging the whole suite.
+        let deadline = std::time::Duration::from_secs(5);
+        let all = async {
+            (
+                run_vendor(&root, &blobs, &installed, &record, false).await,
+                revert_gem(&entry, &root, false).await,
+            )
+        };
+        let Ok((vendor_outcome, revert_outcome)) = tokio::time::timeout(deadline, all).await else {
+            use std::os::unix::fs::OpenOptionsExt;
+            let _ = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&lock_path);
+            panic!("Gemfile.lock reads must fail fast on a FIFO");
+        };
+        let (code, detail) = unwrap_refused(vendor_outcome);
+        assert_eq!(code, "vendor_lockfile_missing");
+        assert!(
+            detail.contains("unreadable"),
+            "a squatted lock is unreadable, not missing: {detail}"
+        );
+        assert!(
+            !revert_outcome.success,
+            "revert must fail when the lock can't be read: {revert_outcome:?}"
+        );
+        assert!(
+            root.join(format!(".socket/vendor/gem/{UUID}")).exists(),
+            "failed revert must not delete the artifacts"
+        );
+    }
+
+    /// A declaration the strict line grammar cannot see — `gem"rack"` with no
+    /// separator, `gem ("rack")` with a space before the paren; both valid
+    /// Ruby — must REFUSE, never fall through to the transitive Append plan:
+    /// appending the managed block next to the unseen declaration leaves the
+    /// Gemfile declaring the gem TWICE, and bundler hard-fails every install
+    /// on the duplicate until hand-repaired (the redirect rewriter gates its
+    /// append with the same looser `declared_re` probe).
+    #[tokio::test]
+    async fn unrecognized_gem_call_refuses_instead_of_duplicating() {
+        let gemfile = "source \"https://rubygems.org\"\n\ngem\"rack\", \"~> 3.1\"\n";
+        let (_tmp, root, installed, blobs, record) = fixture(gemfile, LOCK_DIRECT).await;
+
+        let (code, detail) =
+            unwrap_refused(run_vendor(&root, &blobs, &installed, &record, false).await);
+        assert_eq!(code, "gemfile_declaration_not_editable");
+        assert!(!root.join(".socket").exists());
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
+            gemfile,
+            "refusal must write nothing: {detail}"
+        );
+
+        // The space-before-paren call form (single-arg, valid Ruby) is the
+        // same class: unseen by the grammar, so the plan must refuse too.
+        let spaced = "source \"https://rubygems.org\"\n\ngem (\"rack\")\n";
+        assert!(
+            plan_gemfile_edit(spaced, "rack", "3.2.6", &copy_rel()).is_err(),
+            "a space-before-paren declaration must refuse, not Append"
+        );
+    }
+
+    /// Re-vendor (new uuid) over a lock whose CHECKSUMS entry was ALREADY
+    /// bare pre-vendor: the first run recorded no checksum wiring, so the
+    /// re-vendor's `original: None` checksum record has nothing to
+    /// carry-forward from. Revert must treat that as "nothing to restore" —
+    /// the bare line still standing IS the pre-vendor state — never as
+    /// drift: the pair restores byte-exactly and no
+    /// `vendor_lock_entry_drifted` warning fires.
+    #[tokio::test]
+    async fn revendor_over_already_bare_checksum_reverts_without_drift() {
+        let lock = SPIKE_LOCK_CHECKSUMS_BEFORE.replace(SPIKE_RACK_SHA_LINE, "  rack (3.1.8)");
+        let (_tmp, root, installed, blobs, record) =
+            fixture_318(SPIKE_GEMFILE_CHECKSUMS, &lock).await;
+        let (r1, e1, _) =
+            unwrap_done(run_vendor_318(&root, &blobs, &installed, &record, false).await);
+        assert!(r1.success, "{:?}", r1.error);
+        let entry1 = e1.unwrap();
+        assert_eq!(entry1.wiring.len(), 2, "already-bare: no checksum record");
+
+        let mut record2 = record.clone();
+        record2.uuid = UUID2.to_string();
+        let (r2, e2, _) =
+            unwrap_done(run_vendor_318(&root, &blobs, &installed, &record2, false).await);
+        assert!(r2.success, "re-vendor must succeed: {:?}", r2.error);
+        let mut entry2 = e2.unwrap();
+
+        // The caller's carry-forward finds no checksum record to fill from —
+        // the record legitimately keeps `original: None`.
+        carry_forward_originals(&entry1, &mut entry2);
+        let ck = entry2
+            .wiring
+            .iter()
+            .find(|w| w.kind == LOCK_CHECKSUM_WIRING_KIND)
+            .expect("re-vendor rides the checksum record");
+        assert!(ck.original.is_none());
+
+        let outcome = revert_gem(&entry2, &root, false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(
+            !outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_lock_entry_drifted"),
+            "clean revert must not report drift: {:?}",
+            outcome.warnings
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                .await
+                .unwrap(),
+            lock,
+            "pre-vendor lock (bare CHECKSUMS entry) restored byte-exactly"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
+            SPIKE_GEMFILE_CHECKSUMS
         );
     }
 

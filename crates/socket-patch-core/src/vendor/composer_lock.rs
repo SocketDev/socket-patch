@@ -55,6 +55,20 @@ use super::{RevertOutcome, VendorOutcome, VendorServiceConfig, VendorWarning};
 /// Project-relative lockfile this backend wires.
 const COMPOSER_LOCK: &str = "composer.lock";
 
+/// Guarded read shared in shape with the Cargo.lock / .cargo/config.toml
+/// twins: `open_regular_file` opens with `O_NONBLOCK` and rejects non-regular
+/// files, so a FIFO planted as `composer.lock` fails fast instead of wedging
+/// every caller (vendor's presence read, revert's stranded scan and restore)
+/// forever in an `open(2)` that waits for a writer.
+async fn read_regular_to_string(path: &Path) -> std::io::Result<String> {
+    use tokio::io::AsyncReadExt as _;
+
+    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
+    let mut content = String::with_capacity(metadata.len() as usize);
+    file.read_to_string(&mut content).await?;
+    Ok(content)
+}
+
 /// Wiring-record discriminator. The record's `key` is
 /// `"<section>:<vendor>/<name>"` where `<section>` is `packages` or
 /// `packages-dev` (the lock array holding the entry) and `<vendor>/<name>` is
@@ -122,7 +136,7 @@ pub async fn vendor_composer(
 
     // ── lock presence + entry ────────────────────────────────────────────
     let lock_path = project_root.join(COMPOSER_LOCK);
-    let lock_text = match tokio::fs::read_to_string(&lock_path).await {
+    let lock_text = match read_regular_to_string(&lock_path).await {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return refused(
@@ -738,7 +752,7 @@ async fn stranded_wired_packages(
     uuid: &str,
     restorable: &HashSet<String>,
 ) -> Vec<String> {
-    let Ok(text) = tokio::fs::read_to_string(lock_path).await else {
+    let Ok(text) = read_regular_to_string(lock_path).await else {
         return Vec::new();
     };
     let Ok(lock) = serde_json::from_str::<Value>(&text) else {
@@ -796,7 +810,7 @@ async fn restore_lock_entry(
         return Ok(false);
     };
 
-    let lock_text = match tokio::fs::read_to_string(lock_path).await {
+    let lock_text = match read_regular_to_string(lock_path).await {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(e) => return Err(format!("unreadable composer.lock: {e}")),
@@ -1461,6 +1475,78 @@ mod tests {
                 .join(format!(".socket/vendor/composer/{UUID}"))
                 .exists(),
             "uuid dir still removed"
+        );
+    }
+
+    #[cfg(unix)]
+    fn mkfifo(path: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+        let c_path =
+            std::ffi::CString::new(path.as_os_str().as_bytes()).expect("fifo path has no NUL");
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
+        assert_eq!(
+            rc,
+            0,
+            "mkfifo(2) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    /// A FIFO planted as `composer.lock` must fail fast instead of wedging
+    /// every lock reader — vendor's presence read, revert's stranded scan and
+    /// restore read — forever in an `open(2)` that waits for a writer that
+    /// never comes. Same `open_regular_file` guard class as the Cargo.lock /
+    /// .cargo/config.toml twins. Vendor refuses loudly; revert fails without
+    /// deleting the artifacts (ownership can't be determined).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fifo_lock_fails_fast_instead_of_wedging() {
+        let lock = lock_value("psr/log", "3.0.2", false);
+        let (dir, blobs, installed, record) = fixture(&lock).await;
+        let root = dir.path();
+
+        // A real vendor run first so revert has a live ledger entry.
+        let (r1, e1, _) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, PURL, false).await);
+        assert!(r1.success, "{:?}", r1.error);
+        let entry = e1.unwrap();
+
+        let lock_path = root.join(COMPOSER_LOCK);
+        tokio::fs::remove_file(&lock_path).await.unwrap();
+        mkfifo(&lock_path);
+
+        // On timeout the open is wedged in a `spawn_blocking` thread that the
+        // runtime waits for on shutdown; connect a writer to release it so
+        // the test can FAIL instead of hanging the whole suite.
+        let deadline = std::time::Duration::from_secs(5);
+        let all = async {
+            (
+                run_vendor(root, &blobs, &installed, &record, PURL, false).await,
+                revert_composer(&entry, root, false).await,
+            )
+        };
+        let Ok((vendor_outcome, revert_outcome)) = tokio::time::timeout(deadline, all).await else {
+            use std::os::unix::fs::OpenOptionsExt;
+            let _ = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&lock_path);
+            panic!("composer.lock reads must fail fast on a FIFO");
+        };
+        let (code, detail) = unwrap_refused(vendor_outcome);
+        assert_eq!(code, "vendor_lockfile_missing");
+        assert!(
+            detail.contains("unreadable"),
+            "a squatted lock is unreadable, not missing: {detail}"
+        );
+        assert!(
+            !revert_outcome.success,
+            "revert must fail when lock ownership can't be read: {revert_outcome:?}"
+        );
+        assert!(
+            root.join(format!(".socket/vendor/composer/{UUID}"))
+                .exists(),
+            "failed revert must not delete the artifacts"
         );
     }
 
