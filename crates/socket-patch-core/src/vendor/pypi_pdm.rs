@@ -47,6 +47,21 @@ const KIND_LOCK_PACKAGE: &str = "pdm_lock_package";
 /// (D1 default + D6 static_urls). Any other flag refuses fail-closed.
 const SUPPORTED_STRATEGIES: [&str; 2] = ["inherit_metadata", "static_urls"];
 
+/// Guarded read shared in shape with the sibling backend twins:
+/// `open_regular_file` opens with `O_NONBLOCK` and rejects non-regular
+/// files, so a FIFO planted as `pdm.lock` (or the diagnostics-only
+/// `pyproject.toml`) fails fast instead of wedging every pdm-project vendor
+/// run forever in an `open(2)` that waits for a writer — the flavor-routing
+/// probes ahead of the load are metadata-only, so these are the first opens.
+async fn read_regular_to_string(path: &Path) -> std::io::Result<String> {
+    use tokio::io::AsyncReadExt as _;
+
+    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
+    let mut content = String::with_capacity(metadata.len() as usize);
+    file.read_to_string(&mut content).await?;
+    Ok(content)
+}
+
 /// A loaded-and-guard-checked pdm project.
 #[derive(Debug)]
 pub struct PdmProject {
@@ -81,7 +96,7 @@ pub enum PdmTarget {
 /// this (and the target guards) before the wheel is built, so a refusal
 /// leaves the tree byte-untouched.
 pub async fn load_pdm_project(root: &Path) -> Result<PdmProject, (&'static str, String)> {
-    let lock_text = tokio::fs::read_to_string(root.join(LOCK_FILE))
+    let lock_text = read_regular_to_string(&root.join(LOCK_FILE))
         .await
         .map_err(|e| {
             (
@@ -157,7 +172,7 @@ pub async fn load_pdm_project(root: &Path) -> Result<PdmProject, (&'static str, 
         ));
     }
 
-    let pyproject_text = tokio::fs::read_to_string(root.join("pyproject.toml"))
+    let pyproject_text = read_regular_to_string(&root.join("pyproject.toml"))
         .await
         .ok();
     Ok(PdmProject {
@@ -1117,6 +1132,71 @@ distribution = false
         .unwrap_err();
         assert_eq!(err.0, "pypi_pdm_lock_parse_failed");
         assert_eq!(read_lock(tmp.path()).await, crlf, "refusal writes nothing");
+    }
+
+    /// mkfifo(2) directly rather than shelling out to the `mkfifo` binary —
+    /// same helper as the pypi.rs / setup/pypi detect.rs FIFO tests:
+    /// fork/exec flakes under heavy parallel load and the syscall needs no
+    /// process at all.
+    #[cfg(unix)]
+    fn mkfifo(path: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+        let c_path =
+            std::ffi::CString::new(path.as_os_str().as_bytes()).expect("fifo path has no NUL");
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
+        assert_eq!(
+            rc,
+            0,
+            "mkfifo(2) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    /// A FIFO planted as `pdm.lock` (or `pyproject.toml`) must not wedge the
+    /// load: `detect_pypi_flavor`'s routing probes are metadata-only (a FIFO
+    /// stats fine, and the pdm route short-circuits before detection's own
+    /// guarded pyproject read), so the backend's raw `read_to_string`
+    /// open(2) is the FIRST open — it waits for a writer that never comes,
+    /// wedging every pdm-project vendor run indefinitely. Same
+    /// `open_regular_file` guard class as the sibling vendor backends. The
+    /// lock read must refuse fast; the diagnostics-only pyproject read must
+    /// degrade to "no pyproject" (transitive) instead.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fifo_lock_or_pyproject_does_not_wedge_load() {
+        // On timeout the open is wedged in a `spawn_blocking` thread that
+        // the runtime waits for on shutdown; connect a writer to release
+        // it so the test can FAIL instead of hanging the whole suite.
+        let deadline = std::time::Duration::from_secs(5);
+
+        // FIFO squatting as pdm.lock: load must refuse fast.
+        let tmp = tempfile::tempdir().unwrap();
+        let fifo = tmp.path().join("pdm.lock");
+        mkfifo(&fifo);
+        tokio::fs::write(tmp.path().join("pyproject.toml"), PYPROJECT_DIRECT)
+            .await
+            .unwrap();
+        let Ok(res) = tokio::time::timeout(deadline, load_pdm_project(tmp.path())).await else {
+            let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
+            panic!("load_pdm_project must complete promptly with a FIFO pdm.lock");
+        };
+        assert_eq!(res.unwrap_err().0, "pypi_pdm_lock_parse_failed");
+
+        // FIFO squatting as pyproject.toml next to a valid lock: pyproject
+        // is diagnostics-only, so the load must succeed without it.
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(tmp.path().join("pdm.lock"), LOCK_DIRECT_REGISTRY)
+            .await
+            .unwrap();
+        let fifo = tmp.path().join("pyproject.toml");
+        mkfifo(&fifo);
+        let Ok(res) = tokio::time::timeout(deadline, load_pdm_project(tmp.path())).await else {
+            let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
+            panic!("load_pdm_project must complete promptly with a FIFO pyproject.toml");
+        };
+        let p = res.unwrap();
+        assert!(p.pyproject_text.is_none(), "FIFO reads as no pyproject");
+        assert_eq!(classify_dependency(&p, "six"), "transitive");
     }
 
     #[tokio::test]

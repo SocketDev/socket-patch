@@ -39,6 +39,21 @@ const HIGHEST_TESTED_LOCK_REVISION: u64 = 3;
 /// header block (real ones are a few KiB).
 const MAX_WHEEL_METADATA_BYTES: u64 = 4 * 1024 * 1024;
 
+/// Guarded read shared in shape with the sibling backend twins:
+/// `open_regular_file` opens with `O_NONBLOCK` and rejects non-regular
+/// files, so a FIFO planted as `pyproject.toml` or `uv.lock` fails fast
+/// instead of wedging every uv-project vendor run (and revert) forever in
+/// an `open(2)` that waits for a writer — the flavor-routing probes ahead
+/// of the load are metadata-only, so these are the first opens.
+async fn read_regular_to_string(path: &Path) -> std::io::Result<String> {
+    use tokio::io::AsyncReadExt as _;
+
+    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
+    let mut content = String::with_capacity(metadata.len() as usize);
+    file.read_to_string(&mut content).await?;
+    Ok(content)
+}
+
 /// How the target package is declared, which picks the wiring strategy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UvDepClass {
@@ -67,7 +82,7 @@ pub(super) struct UvProject {
 /// ANY write — the orchestrator runs this (and the target guards) before the
 /// wheel is even built, so a refusal leaves the tree byte-untouched.
 pub(super) async fn load_uv_project(root: &Path) -> Result<UvProject, (&'static str, String)> {
-    let pyproject_text = tokio::fs::read_to_string(root.join("pyproject.toml"))
+    let pyproject_text = read_regular_to_string(&root.join("pyproject.toml"))
         .await
         .map_err(|e| {
             (
@@ -75,7 +90,7 @@ pub(super) async fn load_uv_project(root: &Path) -> Result<UvProject, (&'static 
                 format!("cannot read pyproject.toml: {e}"),
             )
         })?;
-    let lock_text = tokio::fs::read_to_string(root.join("uv.lock"))
+    let lock_text = read_regular_to_string(&root.join("uv.lock"))
         .await
         .map_err(|e| {
             (
@@ -591,11 +606,11 @@ pub(super) async fn wire_uv(
 pub(super) async fn revert_uv(entry: &VendorEntry, root: &Path, dry_run: bool) -> RevertOutcome {
     let pyproject_path = root.join("pyproject.toml");
     let lock_path = root.join("uv.lock");
-    let mut pyproject_text = match tokio::fs::read_to_string(&pyproject_path).await {
+    let mut pyproject_text = match read_regular_to_string(&pyproject_path).await {
         Ok(t) => t,
         Err(e) => return RevertOutcome::failed(format!("cannot read pyproject.toml: {e}")),
     };
-    let mut lock_text = match tokio::fs::read_to_string(&lock_path).await {
+    let mut lock_text = match read_regular_to_string(&lock_path).await {
         Ok(t) => t,
         Err(e) => return RevertOutcome::failed(format!("cannot read uv.lock: {e}")),
     };
@@ -2041,6 +2056,94 @@ wheels = [
         // The pyproject side (undrifted) was still reverted.
         let (pyproject, _) = read_pair(tmp.path()).await;
         assert_eq!(pyproject, DIRECT_REGISTRY_PYPROJECT);
+    }
+
+    /// mkfifo(2) directly rather than shelling out to the `mkfifo` binary —
+    /// same helper as the sibling backend FIFO tests: fork/exec flakes under
+    /// heavy parallel load and the syscall needs no process at all.
+    #[cfg(unix)]
+    fn mkfifo(path: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+        let c_path =
+            std::ffi::CString::new(path.as_os_str().as_bytes()).expect("fifo path has no NUL");
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
+        assert_eq!(
+            rc,
+            0,
+            "mkfifo(2) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    /// A FIFO planted as `uv.lock` or `pyproject.toml` must not wedge load
+    /// or revert: `detect_pypi_flavor`'s routing probe is metadata-only (a
+    /// FIFO stats fine), so the backend's raw `read_to_string` open(2) is
+    /// the FIRST open — it waits for a writer that never comes, wedging
+    /// every uv-project vendor run (and `vendor --revert`) indefinitely.
+    /// Same `open_regular_file` guard class as the sibling vendor backends.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fifo_lock_or_pyproject_does_not_wedge_load_or_revert() {
+        // On timeout the open is wedged in a `spawn_blocking` thread that
+        // the runtime waits for on shutdown; connect a writer to release
+        // it so the test can FAIL instead of hanging the whole suite.
+        let deadline = std::time::Duration::from_secs(5);
+
+        // FIFO as uv.lock (pyproject regular).
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(tmp.path().join("pyproject.toml"), DIRECT_REGISTRY_PYPROJECT)
+            .await
+            .unwrap();
+        let lock_fifo = tmp.path().join("uv.lock");
+        mkfifo(&lock_fifo);
+
+        // FIFO as pyproject.toml (lock regular).
+        let tmp2 = tempfile::tempdir().unwrap();
+        let py_fifo = tmp2.path().join("pyproject.toml");
+        mkfifo(&py_fifo);
+        tokio::fs::write(tmp2.path().join("uv.lock"), DIRECT_REGISTRY_LOCK)
+            .await
+            .unwrap();
+
+        // Load must refuse fast on either FIFO.
+        for (root, fifo, what) in [
+            (tmp.path(), &lock_fifo, "uv.lock"),
+            (tmp2.path(), &py_fifo, "pyproject.toml"),
+        ] {
+            let Ok(res) = tokio::time::timeout(deadline, load_uv_project(root)).await else {
+                let _ = std::fs::OpenOptions::new().write(true).open(fifo);
+                panic!("load_uv_project must complete promptly with a FIFO {what}");
+            };
+            assert_eq!(res.unwrap_err().0, "pypi_uv_lock_parse_failed");
+        }
+
+        // Revert reads both files itself (flavor routing never opens them
+        // first): must fail fast on either FIFO, not wedge.
+        let entry = entry_for(
+            Vec::new(),
+            UvMeta {
+                dep_class: "direct".into(),
+                original_specifier: None,
+                created_sources_table: true,
+                lock_revision: Some(3),
+            },
+        );
+        for (root, fifo, what) in [
+            (tmp.path(), &lock_fifo, "uv.lock"),
+            (tmp2.path(), &py_fifo, "pyproject.toml"),
+        ] {
+            let Ok(outcome) = tokio::time::timeout(deadline, revert_uv(&entry, root, false)).await
+            else {
+                let _ = std::fs::OpenOptions::new().write(true).open(fifo);
+                panic!("revert_uv must complete promptly with a FIFO {what}");
+            };
+            assert!(!outcome.success, "FIFO {what} must fail the revert");
+            assert!(
+                outcome.error.as_deref().unwrap_or("").contains("cannot read"),
+                "{:?}",
+                outcome.error
+            );
+        }
     }
 
     #[test]
