@@ -877,6 +877,45 @@ fn purl_has_version(purl: &str) -> bool {
         })
 }
 
+/// Does the raw pnpm-lock text RESOLVE `name@version`? Boundary-anchored
+/// probes over the three lock grammars — a plain `contains` collided on
+/// version prefixes (`left-pad@1.3.0` matched inside
+/// `left-pad@1.3.0-beta.1`), name suffixes (`pad@1.3.0` inside
+/// `left-pad@1.3.0`), and unscoped-inside-scoped names (`name@1.0.0` inside
+/// `@scope/name@1.0.0`). The needles cover v6/v9's `name@version` and v5's
+/// `/name/version` key spellings; a match counts only when the preceding
+/// char cannot extend the name (start/whitespace/quote, or a `/` delimiter
+/// itself preceded by such a boundary) and the following char cannot extend
+/// the version (so `:`, `'`, `(`, and v5's `_peer` suffix all accept).
+/// Heuristic by design: a false negative degrades to a calm skip, a false
+/// positive costs one grant request the rewriter's per-dep confirmation
+/// then ignores.
+fn pnpm_lock_resolves(text: &str, name: &str, version: &str) -> bool {
+    let version_boundary =
+        |c: char| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+'));
+    let name_boundary = |c: char| matches!(c, ' ' | '\t' | '\n' | '\r' | '\'' | '"');
+    for needle in [format!("{name}@{version}"), format!("/{name}/{version}")] {
+        for (pos, _) in text.match_indices(needle.as_str()) {
+            let before_ok = match text[..pos].chars().next_back() {
+                None => true,
+                // v5/v6's leading key delimiter — legitimate only when the
+                // char before it is itself a boundary (otherwise this is a
+                // scoped `@scope/<name>` tail: a DIFFERENT package).
+                Some('/') => text[..pos - 1].chars().next_back().is_none_or(name_boundary),
+                Some(c) => name_boundary(c),
+            };
+            let after_ok = text[pos + needle.len()..]
+                .chars()
+                .next()
+                .is_none_or(version_boundary);
+            if before_ok && after_ok {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Outcome of the coarse installed-VERSION narrowing over a CVE/GHSA/PURL
 /// search fan-out (see [`filter_to_installed_purls`]).
 struct InstalledNarrowing {
@@ -911,9 +950,12 @@ struct InstalledNarrowing {
 ///
 /// PnP layouts are surfaced, never silently misreported: yarn PnP packages
 /// are structurally unpatchable in every mode (skip records carry
-/// `yarn_pnp_unsupported`, not a false "not installed"); pnpm PnP skips
-/// carry `pnpm_pnp_unsupported` except in hosted mode, which KEEPS them —
-/// the refusal's own remedy text blesses the hosted lockfile rewrite.
+/// `yarn_pnp_unsupported`, not a false "not installed"). pnpm PnP skips
+/// carry `pnpm_pnp_unsupported` in agent/vendored modes; hosted mode — the
+/// refusal's own remedy — keeps the versions the raw pnpm-lock.yaml text
+/// resolves ([`pnpm_lock_resolves`]), labels a judged miss
+/// `package_not_installed` like any other mode, and reserves the layout
+/// code for an unreadable lock (no judgment possible).
 ///
 /// Callers exempt UUID identifiers, exact-versioned PURLs, `--save-only`
 /// (record-only has no installation precondition), `--all-releases`, and
@@ -1015,22 +1057,29 @@ async fn filter_to_installed_purls(
             // The pnpm PnP refusal's own remedy is the hosted lockfile
             // rewrite — but only for versions the lock ACTUALLY resolves:
             // keeping the whole fan-out would request grants for every
-            // version ever patched. Probe the raw lock text for the
-            // version's v6/v9 (`name@version`) or v5 (`/name/version`)
-            // spelling; a hit is kept (the rewriter's per-dep confirmation
-            // still decides), a miss skips like the other modes.
+            // version ever patched. Anchored probe over the raw lock text
+            // (see `pnpm_lock_resolves`); a hit is kept (the rewriter's
+            // per-dep confirmation still decides). A judged MISS is a
+            // genuine "version not resolved" verdict — the layout blocked
+            // nothing — so it carries the same `package_not_installed` code
+            // a non-PnP pnpm project would get; only an UNREADABLE lock
+            // (no judgment possible) keeps the layout-refusal code.
             let decoded = canon(&result.purl);
             let coord = decoded.strip_prefix("pkg:npm/").unwrap_or(&decoded);
-            let v5_spelling = coord.rsplit_once('@').map(|(n, v)| format!("/{n}/{v}"));
-            let in_lock = pnpm_pnp_lock_text.as_deref().is_some_and(|text| {
-                text.contains(coord)
-                    || v5_spelling.as_deref().is_some_and(|s| text.contains(s))
-            });
-            if in_lock {
-                out.kept.push(result.clone());
-                continue;
+            if mode == super::scan::ScanMode::Hosted {
+                match (pnpm_pnp_lock_text.as_deref(), coord.rsplit_once('@')) {
+                    (Some(text), Some((name, version))) => {
+                        if pnpm_lock_resolves(text, name, version) {
+                            out.kept.push(result.clone());
+                            continue;
+                        }
+                        "package_not_installed"
+                    }
+                    _ => "pnpm_pnp_unsupported",
+                }
+            } else {
+                "pnpm_pnp_unsupported"
             }
-            "pnpm_pnp_unsupported"
         } else {
             "package_not_installed"
         };
@@ -2987,6 +3036,78 @@ pub(crate) fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pnpm-PnP hosted lock probe must be boundary-anchored: plain
+    /// substring matching collided on version prefixes, name suffixes, and
+    /// unscoped-inside-scoped names (follow-up review finding).
+    #[test]
+    fn pnpm_lock_resolves_is_boundary_anchored() {
+        // v9/v6/v5 key spellings all resolve.
+        assert!(pnpm_lock_resolves(
+            "lockfileVersion: '9.0'\n\nsnapshots:\n\n  left-pad@1.3.0:\n",
+            "left-pad",
+            "1.3.0"
+        ));
+        assert!(pnpm_lock_resolves(
+            "  /left-pad@1.3.0:\n    resolution: {}\n",
+            "left-pad",
+            "1.3.0"
+        ));
+        assert!(pnpm_lock_resolves(
+            "  /left-pad/1.3.0:\n    resolution: {}\n",
+            "left-pad",
+            "1.3.0"
+        ));
+        // Peer-qualified keys still resolve: v9 `(peer)` and v5 `_peer`.
+        assert!(pnpm_lock_resolves(
+            "  'left-pad@1.3.0(react@18.0.0)':\n",
+            "left-pad",
+            "1.3.0"
+        ));
+        assert!(pnpm_lock_resolves(
+            "  /left-pad/1.3.0_react@18.0.0:\n",
+            "left-pad",
+            "1.3.0"
+        ));
+        // Scoped names resolve in both quoted-v9 and v6 spellings.
+        assert!(pnpm_lock_resolves(
+            "  '@scope/name@1.0.0':\n",
+            "@scope/name",
+            "1.0.0"
+        ));
+        assert!(pnpm_lock_resolves(
+            "  /@scope/name@1.0.0:\n",
+            "@scope/name",
+            "1.0.0"
+        ));
+
+        // Version-prefix collision: 1.3.0 must NOT match 1.3.0-beta.1.
+        assert!(!pnpm_lock_resolves(
+            "  left-pad@1.3.0-beta.1:\n",
+            "left-pad",
+            "1.3.0"
+        ));
+        // Name-suffix collision: `pad` must NOT match inside `left-pad`.
+        assert!(!pnpm_lock_resolves("  left-pad@1.3.0:\n", "pad", "1.3.0"));
+        assert!(!pnpm_lock_resolves("  /left-pad/1.3.0:\n", "pad", "1.3.0"));
+        // Unscoped-inside-scoped: `name` must NOT match `@scope/name`.
+        assert!(!pnpm_lock_resolves(
+            "  '@scope/name@1.0.0':\n",
+            "name",
+            "1.0.0"
+        ));
+        assert!(!pnpm_lock_resolves(
+            "  /@scope/name@1.0.0:\n",
+            "name",
+            "1.0.0"
+        ));
+        // Absent version: never resolves.
+        assert!(!pnpm_lock_resolves(
+            "  left-pad@1.3.0:\n",
+            "left-pad",
+            "2.0.0"
+        ));
+    }
     use socket_patch_core::api::types::{PatchFileResponse, VulnerabilityResponse};
     use std::collections::HashMap;
 
