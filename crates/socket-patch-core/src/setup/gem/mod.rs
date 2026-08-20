@@ -96,7 +96,15 @@ pub async fn discover_bundler_project(cwd: &Path) -> Option<BundlerProject> {
     loop {
         for name in ["gems.rb", "Gemfile"] {
             let candidate = dir.join(name);
-            if fs::metadata(&candidate).await.is_ok() {
+            // Regular files only, like bundler's own gate
+            // (`SharedHelpers.find_file` accepts a candidate with
+            // `File.file?`): a directory or FIFO named `Gemfile` is skipped
+            // and the walk continues to the manifest `bundle` actually
+            // loads. Bare `metadata` would select it — handing the Gemfile
+            // editor a directory (setup errors in a project where `bundle
+            // install` works fine) or a FIFO (whose plain `open(2)` blocks
+            // forever waiting for a writer).
+            if fs::metadata(&candidate).await.is_ok_and(|m| m.is_file()) {
                 return Some(BundlerProject {
                     root: dir,
                     gemfile: candidate,
@@ -155,11 +163,27 @@ fn stamp_gitignore_path(root: &Path) -> PathBuf {
     root.join(".socket").join(".gitignore")
 }
 
+/// Guarded read shared by every raw read in this module: `open_regular_file`
+/// opens with `O_NONBLOCK` and rejects non-regular files with `InvalidInput`,
+/// so a FIFO planted at any path setup reads (`plugins.rb`, the gemspec,
+/// `.socket/.gitignore`, bundler's plugin index) fails fast instead of
+/// wedging `setup`/`--check`/`--remove` forever in an `open(2)` that waits
+/// for a writer — the same guard as the composer/npm setup twins and the
+/// crawlers.
+async fn read_regular_to_string(path: &Path) -> std::io::Result<String> {
+    use tokio::io::AsyncReadExt;
+
+    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
+    let mut content = String::with_capacity(metadata.len() as usize);
+    file.read_to_string(&mut content).await?;
+    Ok(content)
+}
+
 /// Whether `.socket/.gitignore` is missing the stamp entry (so `setup` still
 /// has a write to make). Shared by [`add_plugin_files`] and
 /// [`plugin_files_present`] to keep `setup` and `--check` in agreement.
 async fn stamp_ignore_missing(root: &Path) -> bool {
-    match fs::read_to_string(stamp_gitignore_path(root)).await {
+    match read_regular_to_string(&stamp_gitignore_path(root)).await {
         Ok(c) => !c.lines().any(|l| l.trim() == STAMP_IGNORE_LINE),
         Err(_) => true,
     }
@@ -169,7 +193,14 @@ async fn stamp_ignore_missing(root: &Path) -> bool {
 /// (user or other-tool) lines. Creates the file when absent.
 async fn add_stamp_gitignore(root: &Path) -> Result<(), String> {
     let path = stamp_gitignore_path(root);
-    let existing = fs::read_to_string(&path).await.unwrap_or_default();
+    let existing = match read_regular_to_string(&path).await {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        // An existing-but-unreadable file (non-UTF-8 bytes — gitignore
+        // entries are byte strings — a FIFO, EACCES) must fail the setup:
+        // treating it as empty and rewriting would destroy every user line.
+        Err(e) => return Err(format!("read {}: {e}", path.display())),
+    };
     let mut body = existing;
     if !body.is_empty() && !body.ends_with('\n') {
         body.push('\n');
@@ -187,7 +218,7 @@ async fn add_stamp_gitignore(root: &Path) -> Result<(), String> {
 async fn remove_stamp_artifacts(root: &Path) {
     let _ = fs::remove_file(stamp_path(root)).await;
     let path = stamp_gitignore_path(root);
-    let Ok(content) = fs::read_to_string(&path).await else {
+    let Ok(content) = read_regular_to_string(&path).await else {
         return;
     };
     let kept: Vec<&str> = content
@@ -471,7 +502,7 @@ async fn remove_plugin_registration_at(
 ) -> GemRegistrationCleanup {
     let plugin_root = bundler_app_config_dir(root, app_config_env).join("plugin");
     let index = plugin_root.join("index");
-    let content = match fs::read_to_string(&index).await {
+    let content = match read_regular_to_string(&index).await {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return GemRegistrationCleanup::NotRegistered;
@@ -570,7 +601,7 @@ pub async fn plugin_files_present(root: &Path) -> bool {
 
 /// True if the file is absent or its content differs from `desired`.
 async fn needs_write(path: &Path, desired: &str) -> bool {
-    match fs::read_to_string(path).await {
+    match read_regular_to_string(path).await {
         Ok(c) => c != desired,
         Err(_) => true,
     }
@@ -582,7 +613,12 @@ async fn write_file(path: &Path, body: &str) -> Result<(), String> {
             .await
             .map_err(|e| format!("create {}: {e}", p.display()))?;
     }
-    fs::write(path, body)
+    // Stage + rename (mode-preserving): never opens the destination, so a
+    // FIFO squatting on a generated path is replaced, not opened (a plain
+    // `fs::write` would block in `open(2)` waiting for a FIFO reader that
+    // never comes), and a crash mid-write cannot leave a torn half-template
+    // in the committed `.socket/` dir.
+    crate::utils::fs::atomic_write_bytes_preserving_mode(path, body.as_bytes())
         .await
         .map_err(|e| format!("write {}: {e}", path.display()))
 }
@@ -620,7 +656,7 @@ async fn add_plugin_files(root: &Path, dry_run: bool) -> GemEditResult {
 /// Whether the file at `path` carries our [`GENERATED_MARKER`] as its first
 /// line — the per-file ownership test for removal.
 async fn is_generated(path: &Path) -> bool {
-    match fs::read_to_string(path).await {
+    match read_regular_to_string(path).await {
         Ok(content) => content.starts_with(GENERATED_MARKER),
         Err(_) => false,
     }
@@ -1582,6 +1618,219 @@ mod tests {
         assert!(
             victim.join("precious.txt").is_file(),
             "a recorded dir with `..` traversal must never be deleted"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_discover_skips_directory_named_gemfile() {
+        // Bundler's own resolution (`SharedHelpers.find_file`) gates every
+        // candidate on `File.file?`, so a DIRECTORY named `Gemfile` is
+        // skipped and the walk continues to the real ancestor manifest.
+        // Gating on bare `metadata` (which any directory satisfies) selects
+        // the directory instead: `setup` then hands the Gemfile editor a
+        // directory and errors out, in a project where `bundle install`
+        // works fine off the ancestor.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(&root.join("Gemfile"), "real manifest\n").await;
+        let sub = root.join("sub");
+        fs::create_dir_all(sub.join("Gemfile")).await.unwrap();
+
+        let proj = discover_bundler_project(&sub).await.unwrap();
+        assert_eq!(proj.root, root, "a dir named Gemfile is not a manifest");
+        assert_eq!(proj.gemfile, root.join("Gemfile"));
+    }
+
+    /// Plant a FIFO with a direct `mkfifo(2)` syscall — same helper as the
+    /// composer/find.rs/package_json FIFO tests: fork/exec flakes under
+    /// heavy parallel load and the syscall needs no process at all.
+    #[cfg(unix)]
+    fn mkfifo(path: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+        let c_path =
+            std::ffi::CString::new(path.as_os_str().as_bytes()).expect("fifo path has no NUL");
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
+        assert_eq!(
+            rc,
+            0,
+            "mkfifo(2) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_discover_skips_fifo_named_gemfile() {
+        // A FIFO named Gemfile stats fine but `bundle` ignores it
+        // (`File.file?` is false); selecting it hands the Gemfile editor a
+        // path whose plain `open(2)` blocks forever waiting for a writer.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(&root.join("Gemfile"), "real manifest\n").await;
+        let sub = root.join("sub");
+        fs::create_dir_all(&sub).await.unwrap();
+        mkfifo(&sub.join("Gemfile"));
+
+        let proj = discover_bundler_project(&sub).await.unwrap();
+        assert_eq!(proj.gemfile, root.join("Gemfile"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_check_fifo_plugins_rb_does_not_wedge() {
+        // A FIFO squatting on the generated plugins.rb path: a plain
+        // `read_to_string` open(2) waits for a writer that never comes,
+        // wedging `setup --check` indefinitely with no error and no timeout.
+        // Same class as the composer/find.rs `open_regular_file` guards.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(plugin_dir(root)).await.unwrap();
+        mkfifo(&plugins_rb_path(root));
+
+        // On timeout the open is wedged in a `spawn_blocking` thread that
+        // the runtime waits for on shutdown; connect a writer to release
+        // it so the test can FAIL instead of hanging the whole suite.
+        let deadline = std::time::Duration::from_secs(5);
+        let Ok(present) = tokio::time::timeout(deadline, plugin_files_present(root)).await else {
+            let _ = std::fs::OpenOptions::new()
+                .write(true)
+                .open(plugins_rb_path(root));
+            panic!("plugin_files_present must complete promptly with a FIFO plugins.rb");
+        };
+        assert!(!present, "a FIFO is not the generated plugin");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_add_fifo_plugins_rb_does_not_wedge_and_replaces_it() {
+        // `setup` on the same layout: the read must not wedge, and the write
+        // must replace the FIFO via rename (a plain `fs::write` would block
+        // in open(2) waiting for a FIFO reader) — the path is generated
+        // territory, so anything squatting there is stale content to sync.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(plugin_dir(root)).await.unwrap();
+        mkfifo(&plugins_rb_path(root));
+
+        let deadline = std::time::Duration::from_secs(5);
+        let Ok(r) = tokio::time::timeout(deadline, add_plugin_files(root, false)).await else {
+            let _ = std::fs::OpenOptions::new()
+                .write(true)
+                .open(plugins_rb_path(root));
+            panic!("add_plugin_files must complete promptly with a FIFO plugins.rb");
+        };
+        assert_eq!(r.status, GemSetupStatus::Updated);
+        assert_eq!(
+            fs::read_to_string(plugins_rb_path(root)).await.unwrap(),
+            PLUGINS_RB,
+            "the FIFO is replaced by the generated file"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_remove_fifo_plugins_rb_does_not_wedge() {
+        // `setup --remove` reads the ownership marker; a FIFO must read as
+        // not-ours (spared) — never wedge the remove.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(plugin_dir(root)).await.unwrap();
+        mkfifo(&plugins_rb_path(root));
+
+        let deadline = std::time::Duration::from_secs(5);
+        let Ok(r) = tokio::time::timeout(deadline, remove_plugin_files(root, false)).await else {
+            let _ = std::fs::OpenOptions::new()
+                .write(true)
+                .open(plugins_rb_path(root));
+            panic!("remove_plugin_files must complete promptly with a FIFO plugins.rb");
+        };
+        assert_eq!(
+            r.status,
+            GemSetupStatus::AlreadyConfigured,
+            "an unreadable non-regular file is not ours to remove"
+        );
+        assert!(
+            std::fs::symlink_metadata(plugins_rb_path(root)).is_ok(),
+            "the FIFO is spared, like any marker-less file"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_remove_registration_fifo_index_reports_residue_not_wedge() {
+        // A FIFO at bundler's plugin index must surface as Residue (with the
+        // read failure as the reason), never wedge `setup --remove`.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join(".bundle/plugin"))
+            .await
+            .unwrap();
+        let index = root.join(".bundle/plugin/index");
+        mkfifo(&index);
+
+        let deadline = std::time::Duration::from_secs(5);
+        let Ok(r) =
+            tokio::time::timeout(deadline, remove_plugin_registration_at(root, None, false)).await
+        else {
+            let _ = std::fs::OpenOptions::new().write(true).open(&index);
+            panic!("remove_plugin_registration must complete promptly with a FIFO index");
+        };
+        assert!(matches!(r, GemRegistrationCleanup::Residue { .. }), "{r:?}");
+        assert!(
+            std::fs::symlink_metadata(&index).is_ok(),
+            "the unreadable index must survive untouched"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_add_fifo_stamp_gitignore_errors_not_wedges() {
+        // A FIFO at .socket/.gitignore: `setup` reads it twice (the
+        // needs-write probe and the append). Neither read may wedge, and the
+        // append must surface an Error rather than clobber the non-regular
+        // file with a fresh one.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join(".socket")).await.unwrap();
+        let path = stamp_gitignore_path(root);
+        mkfifo(&path);
+
+        let deadline = std::time::Duration::from_secs(5);
+        let Ok(r) = tokio::time::timeout(deadline, add_plugin_files(root, false)).await else {
+            let _ = std::fs::OpenOptions::new().write(true).open(&path);
+            panic!("add_plugin_files must complete promptly with a FIFO .gitignore");
+        };
+        assert_eq!(r.status, GemSetupStatus::Error);
+        assert!(
+            !std::fs::metadata(&path).unwrap().is_file(),
+            "the FIFO must not be replaced by a regular file"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_add_never_clobbers_unreadable_stamp_gitignore() {
+        // gitignore entries are byte strings — a `.socket/.gitignore` with
+        // non-UTF-8 path bytes is legal, and `read_to_string` fails on it.
+        // Treating that failure as "empty file" and rewriting would destroy
+        // every user line: the add must surface an Error and leave the file
+        // byte-identical.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let path = stamp_gitignore_path(root);
+        fs::create_dir_all(path.parent().unwrap()).await.unwrap();
+        let user_bytes: &[u8] = b"caf\xe9-scratch/\n";
+        fs::write(&path, user_bytes).await.unwrap();
+
+        let r = add_plugin_files(root, false).await;
+        assert_eq!(
+            fs::read(&path).await.unwrap(),
+            user_bytes,
+            "the user's unreadable .gitignore must survive byte-identical"
+        );
+        assert_eq!(
+            r.status,
+            GemSetupStatus::Error,
+            "an unreadable existing .gitignore is an error, not a silent clobber"
         );
     }
 

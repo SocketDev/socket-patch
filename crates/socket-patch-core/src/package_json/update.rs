@@ -1,7 +1,7 @@
 use std::path::Path;
-use tokio::fs;
 
 use super::detect::{remove_package_json_content, update_package_json_content, PackageManager};
+use super::find::read_project_file_to_string;
 use crate::utils::fs::atomic_write_bytes_preserving_mode;
 
 /// Result of updating a single package.json.
@@ -31,7 +31,10 @@ pub async fn update_package_json(
 ) -> UpdateResult {
     let path_str = package_json_path.display().to_string();
 
-    let content = match fs::read_to_string(package_json_path).await {
+    // Guarded read: a FIFO planted as package.json would make a plain
+    // `read_to_string` open block forever waiting for a writer — discovery
+    // lists any path whose metadata stats, so it reaches here unopened.
+    let content = match read_project_file_to_string(package_json_path).await {
         Ok(c) => c,
         Err(e) => {
             return UpdateResult {
@@ -113,7 +116,8 @@ pub enum RemoveStatus {
 pub async fn remove_package_json(package_json_path: &Path, dry_run: bool) -> RemoveResult {
     let path_str = package_json_path.display().to_string();
 
-    let content = match fs::read_to_string(package_json_path).await {
+    // Guarded read — see the matching note in `update_package_json`.
+    let content = match read_project_file_to_string(package_json_path).await {
         Ok(c) => c,
         Err(e) => {
             return RemoveResult {
@@ -176,6 +180,7 @@ pub async fn remove_package_json(package_json_path: &Path, dry_run: bool) -> Rem
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::fs;
 
     #[tokio::test]
     async fn test_update_file_not_found() {
@@ -664,6 +669,73 @@ mod tests {
         assert!(!content.contains("socket-patch"));
         let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert_eq!(parsed["scripts"]["build"], "tsc");
+    }
+
+    /// mkfifo(2) directly rather than shelling out to the `mkfifo` binary —
+    /// same helper as the find.rs FIFO tests: fork/exec flakes under heavy
+    /// parallel load and the syscall needs no process at all.
+    #[cfg(unix)]
+    fn mkfifo(path: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+        let c_path =
+            std::ffi::CString::new(path.as_os_str().as_bytes()).expect("fifo path has no NUL");
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
+        assert_eq!(
+            rc,
+            0,
+            "mkfifo(2) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    /// A FIFO planted as `package.json` must not wedge setup. Discovery lists
+    /// any `package.json` whose metadata stats (a FIFO does), then setup calls
+    /// `update_package_json` on it; a plain `read_to_string` open(2) on a FIFO
+    /// waits for a writer that never comes, wedging `socket-patch setup`
+    /// indefinitely with no error and no timeout. Same class as the
+    /// `open_regular_file` guards in find.rs and the npm/composer/python/ruby
+    /// crawlers.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_update_fifo_package_json_does_not_wedge() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("package.json");
+        mkfifo(&fifo);
+
+        // On timeout the open is wedged in a `spawn_blocking` thread that
+        // the runtime waits for on shutdown; connect a writer to release
+        // it so the test can FAIL instead of hanging the whole suite.
+        let deadline = std::time::Duration::from_secs(5);
+        let Ok(result) = tokio::time::timeout(
+            deadline,
+            update_package_json(&fifo, false, PackageManager::Npm),
+        )
+        .await
+        else {
+            let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
+            panic!("update must complete promptly with a FIFO package.json");
+        };
+        assert_eq!(result.status, UpdateStatus::Error);
+        assert!(result.error.is_some());
+    }
+
+    /// The removal twin: `setup --remove` reads every discovered package.json
+    /// through `remove_package_json`, so a FIFO wedged it the same way.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_remove_fifo_package_json_does_not_wedge() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("package.json");
+        mkfifo(&fifo);
+
+        let deadline = std::time::Duration::from_secs(5);
+        let Ok(result) = tokio::time::timeout(deadline, remove_package_json(&fifo, false)).await
+        else {
+            let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
+            panic!("remove must complete promptly with a FIFO package.json");
+        };
+        assert_eq!(result.status, RemoveStatus::Error);
+        assert!(result.error.is_some());
     }
 
     #[tokio::test]

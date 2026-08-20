@@ -106,6 +106,23 @@ pub async fn find_package_json_files(start_path: &Path) -> PackageJsonFindResult
     }
 }
 
+/// Read a manifest/config that lives inside the (untrusted) project tree.
+/// A planted FIFO would make a plain `read_to_string` open block forever
+/// waiting for a writer, wedging `setup`'s discovery — and the workspace
+/// walk reads the package.json of *every* glob-discovered member. Open via
+/// [`open_regular_file`](crate::utils::fs::open_regular_file) — non-blocking
+/// on Unix, rejecting FIFOs/devices/directories (see its docs) — same as the
+/// npm/composer/python/ruby crawlers. Shared with `update.rs`, which reads
+/// the same discovered manifests back for editing.
+pub(super) async fn read_project_file_to_string(path: &Path) -> std::io::Result<String> {
+    use tokio::io::AsyncReadExt;
+
+    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
+    let mut content = String::with_capacity(metadata.len() as usize);
+    file.read_to_string(&mut content).await?;
+    Ok(content)
+}
+
 /// Detect workspace configuration from package.json.
 async fn detect_workspaces(package_json_path: &Path) -> WorkspaceConfig {
     let default = WorkspaceConfig {
@@ -122,7 +139,7 @@ async fn detect_workspaces(package_json_path: &Path) -> WorkspaceConfig {
     // workspace to "no workspace".
     let dir = package_json_path.parent().unwrap_or(Path::new("."));
     let pnpm_workspace = dir.join("pnpm-workspace.yaml");
-    if let Ok(yaml_content) = fs::read_to_string(&pnpm_workspace).await {
+    if let Ok(yaml_content) = read_project_file_to_string(&pnpm_workspace).await {
         let patterns = parse_pnpm_workspace_patterns(&yaml_content);
         return WorkspaceConfig {
             ws_type: WorkspaceType::Pnpm,
@@ -130,7 +147,7 @@ async fn detect_workspaces(package_json_path: &Path) -> WorkspaceConfig {
         };
     }
 
-    let content = match fs::read_to_string(package_json_path).await {
+    let content = match read_project_file_to_string(package_json_path).await {
         Ok(c) => c,
         Err(_) => return default,
     };
@@ -1171,6 +1188,108 @@ mod tests {
             workspace_count,
             1,
             "only the real member must be found; symlinks not followed: {:?}",
+            result.files.iter().map(|f| &f.path).collect::<Vec<_>>()
+        );
+    }
+
+    /// mkfifo(2) directly, not the /usr/bin/mkfifo binary: spawning a child
+    /// flakes under heavy parallel load (fork/exec starvation) and the
+    /// syscall needs no process at all.
+    #[cfg(unix)]
+    fn mkfifo(path: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+        let c_path =
+            std::ffi::CString::new(path.as_os_str().as_bytes()).expect("fifo path has no NUL");
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
+        assert_eq!(
+            rc,
+            0,
+            "mkfifo(2) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    /// A FIFO planted as `pnpm-workspace.yaml` must not wedge discovery. The
+    /// workspace probe used a plain `tokio::fs::read_to_string`, whose
+    /// `open(2)` on a FIFO waits for a writer that never comes — so one
+    /// special file in the project root wedged `setup` indefinitely, with no
+    /// error and no timeout. Same class as the `open_regular_file` guards in
+    /// the npm/composer/python/ruby crawlers. An unreadable
+    /// pnpm-workspace.yaml falls through to the package.json `workspaces`
+    /// field, like a directory of that name already does.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pnpm_workspace_fifo_does_not_wedge_discovery() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"workspaces": ["packages/*"]}"#,
+        )
+        .await
+        .unwrap();
+        let fifo = dir.path().join("pnpm-workspace.yaml");
+        mkfifo(&fifo);
+        let a = dir.path().join("packages").join("a");
+        fs::create_dir_all(&a).await.unwrap();
+        fs::write(a.join("package.json"), r#"{"name":"a"}"#)
+            .await
+            .unwrap();
+
+        // On timeout the open is wedged in a `spawn_blocking` thread that
+        // the runtime waits for on shutdown; connect a writer to release
+        // it so the test can FAIL instead of hanging the whole suite.
+        let deadline = std::time::Duration::from_secs(5);
+        let Ok(result) = tokio::time::timeout(deadline, find_package_json_files(dir.path())).await
+        else {
+            let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
+            panic!("discovery must complete promptly with a FIFO pnpm-workspace.yaml");
+        };
+        assert!(matches!(result.workspace_type, WorkspaceType::Npm));
+        assert!(
+            result
+                .files
+                .iter()
+                .any(|f| f.is_workspace && f.path.ends_with("packages/a/package.json")),
+            "member must still be found via the package.json fallback: {:?}",
+            result.files.iter().map(|f| &f.path).collect::<Vec<_>>()
+        );
+    }
+
+    /// The member-manifest twin: every glob-discovered workspace member has
+    /// its package.json read (nested-workspace probe), so a FIFO planted as
+    /// any member's package.json wedged discovery the same way.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn member_package_json_fifo_does_not_wedge_discovery() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"workspaces": ["packages/*"]}"#,
+        )
+        .await
+        .unwrap();
+        let a = dir.path().join("packages").join("a");
+        fs::create_dir_all(&a).await.unwrap();
+        let fifo = a.join("package.json");
+        mkfifo(&fifo);
+        let b = dir.path().join("packages").join("b");
+        fs::create_dir_all(&b).await.unwrap();
+        fs::write(b.join("package.json"), r#"{"name":"b"}"#)
+            .await
+            .unwrap();
+
+        let deadline = std::time::Duration::from_secs(5);
+        let Ok(result) = tokio::time::timeout(deadline, find_package_json_files(dir.path())).await
+        else {
+            let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
+            panic!("discovery must complete promptly with a FIFO member package.json");
+        };
+        assert!(
+            result
+                .files
+                .iter()
+                .any(|f| f.is_workspace && f.path.ends_with("packages/b/package.json")),
+            "the real member must still be found: {:?}",
             result.files.iter().map(|f| &f.path).collect::<Vec<_>>()
         );
     }

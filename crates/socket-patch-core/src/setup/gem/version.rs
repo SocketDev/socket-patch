@@ -28,8 +28,6 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use tokio::fs;
-
 use super::BundlerProject;
 
 /// Upper bound on the `bundle --version` fallback probe. A wedged bundler
@@ -129,7 +127,11 @@ fn classify(version: String, source: String) -> BundlerProbe {
 /// module docs for the source order and the fail-open contract.
 pub async fn probe_bundler(project: &BundlerProject) -> BundlerProbe {
     let lock_path = lockfile_path(project);
-    if let Ok(lock) = fs::read_to_string(&lock_path).await {
+    // Guarded read: a FIFO/device squatting on the lock path must fail fast
+    // to the `bundle --version` fallback, not wedge `setup`/`--check`
+    // forever in `open(2)` — same guard as every other raw read in this
+    // module tree.
+    if let Ok(lock) = super::read_regular_to_string(&lock_path).await {
         if let Some(version) = parse_bundled_with(&lock) {
             let lock_name = lock_path
                 .file_name()
@@ -181,6 +183,21 @@ pub fn unsupported_bundler_message(version: &str, source: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::fs;
+
+    #[cfg(unix)]
+    fn mkfifo(path: &std::path::Path) {
+        use std::os::unix::ffi::OsStrExt;
+        let c_path =
+            std::ffi::CString::new(path.as_os_str().as_bytes()).expect("fifo path has no NUL");
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
+        assert_eq!(
+            rc,
+            0,
+            "mkfifo(2) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
 
     const LOCK_1X: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    \
                            colorize (1.1.0)\n\nPLATFORMS\n  ruby\n\nDEPENDENCIES\n  \
@@ -295,6 +312,47 @@ mod tests {
             probe_bundler(&project).await,
             BundlerProbe::Unsupported { .. }
         ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_probe_fifo_lockfile_does_not_wedge() {
+        // A FIFO squatting on Gemfile.lock: a plain `read_to_string`
+        // open(2) waits for a writer that never comes, wedging `setup`/
+        // `--check` (and every Gemfile-block update, which probes first)
+        // forever inside `probe_bundler`. Same class as the mod.rs
+        // `read_regular_to_string` guards; the probe must skip the
+        // non-regular lock and fall through to the `bundle --version`
+        // probe (itself bounded by [`BUNDLE_VERSION_TIMEOUT`]).
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("Gemfile"), "source 'x'\n")
+            .await
+            .unwrap();
+        mkfifo(&dir.path().join("Gemfile.lock"));
+        let project = super::super::discover_bundler_project(dir.path())
+            .await
+            .expect("fixture project must be discoverable");
+
+        // Deadline covers the fallback's own 10s bound on hosts whose
+        // bundler also trips on the FIFO. On timeout the open is wedged in
+        // a `spawn_blocking` thread the runtime waits for on shutdown;
+        // connect a writer to release it so the test can FAIL instead of
+        // hanging the whole suite.
+        let deadline = BUNDLE_VERSION_TIMEOUT + Duration::from_secs(20);
+        let Ok(probe) = tokio::time::timeout(deadline, probe_bundler(&project)).await else {
+            let _ = std::fs::OpenOptions::new()
+                .write(true)
+                .open(dir.path().join("Gemfile.lock"));
+            panic!("probe_bundler must complete promptly with a FIFO lockfile");
+        };
+        // The FIFO has no bytes to parse, so only the machine probe can
+        // answer: Supported (dev/CI bundler is >= 2.x wherever this suite
+        // runs) or Unknown (no bundler). An Unsupported verdict would mean
+        // the FIFO was consulted as a lock.
+        assert!(
+            matches!(probe, BundlerProbe::Supported | BundlerProbe::Unknown),
+            "unexpected probe verdict: {probe:?}"
+        );
     }
 
     #[test]
