@@ -732,3 +732,110 @@ async fn get_vendored_then_hosted_takes_over_cleanly() {
         "the takeover warning must ride the envelope; got:\n{stdout}"
     );
 }
+
+// ── bugbot follow-ups: variant-filter wiring (hosted) + PnP-only message ────
+
+/// Hosted mode runs the per-release VARIANT filter (agent/vendored get it
+/// inside the download engines; hosted has no download). The uninstalled-base
+/// fallback keeps all variants WITH its distinctive warning — the warning's
+/// presence in the envelope is the wiring pin.
+#[tokio::test]
+async fn get_hosted_runs_release_variant_filter() {
+    const V_UUID_A: &str = "55555555-5555-4555-8555-555555555555";
+    const V_UUID_B: &str = "66666666-6666-4666-8666-666666666666";
+    const V_PURL_A: &str = "pkg:pypi/varpkg@1.0.0?artifact_id=wheel";
+    const V_PURL_B: &str = "pkg:pypi/varpkg@1.0.0?artifact_id=sdist";
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/by-ghsa/{GHSA}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "patches": [
+                { "uuid": V_UUID_A, "purl": V_PURL_A,
+                  "publishedAt": "2024-01-01T00:00:00Z",
+                  "description": "x", "license": "MIT", "tier": "free",
+                  "vulnerabilities": {} },
+                { "uuid": V_UUID_B, "purl": V_PURL_B,
+                  "publishedAt": "2024-01-01T00:00:00Z",
+                  "description": "x", "license": "MIT", "tier": "free",
+                  "vulnerabilities": {} }
+            ],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(&server)
+        .await;
+    // Grants for both (the uninstalled-base fallback keeps all variants).
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/package")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "results": {}
+        })))
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    // Coarse presence via manifest membership (nothing installed on disk):
+    // the run must fall through to the VARIANT filter, whose not-installed
+    // fallback emits the pinned warning.
+    let socket_dir = tmp.path().join(".socket");
+    std::fs::create_dir_all(&socket_dir).unwrap();
+    std::fs::write(
+        socket_dir.join("manifest.json"),
+        serde_json::json!({
+            "patches": {
+                "pkg:pypi/varpkg@1.0.0": {
+                    "uuid": "99999999-9999-4999-8999-999999999999",
+                    "exportedAt": "2023-01-01T00:00:00Z",
+                    "files": {}, "vulnerabilities": {},
+                    "description": "old", "license": "MIT", "tier": "free"
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) =
+        run_get(tmp.path(), &server.uri(), &[GHSA, "--mode", "hosted", "--json"]);
+    assert_eq!(code, 0, "stderr: {stderr}\nstdout: {stdout}");
+    let envelope = parse_single_json_doc(&stdout);
+    let warnings = envelope["warnings"].to_string();
+    assert!(
+        warnings.contains("release_narrowing") && warnings.contains("keeping all"),
+        "the variant filter's not-installed fallback warning must ride the \
+         hosted envelope (proves the filter runs on the hosted path); got: {envelope}"
+    );
+}
+
+/// When EVERY narrowed-out result is a PnP layout refusal, the human
+/// terminal must point at the layout warning — never claim "not installed"
+/// or advise --all-releases (which cannot make PnP patchable).
+#[tokio::test]
+async fn get_pnp_only_narrowing_message_names_the_layout() {
+    let server = MockServer::start().await;
+    mock_ghsa_fanout(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("package.json"),
+        format!(r#"{{ "name": "consumer", "dependencies": {{ "{NAME}": "1.0.0" }} }}"#),
+    )
+    .unwrap();
+    std::fs::write(tmp.path().join("yarn.lock"), "# yarn lockfile v1\n").unwrap();
+    std::fs::write(tmp.path().join(".pnp.cjs"), "/* yarn berry PnP loader */").unwrap();
+
+    let (code, stdout, stderr) = run_get(tmp.path(), &server.uri(), &[GHSA]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(
+        stdout.contains("Plug'n'Play"),
+        "the PnP-only terminal must name the layout; stdout:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("--all-releases"),
+        "--all-releases cannot make PnP patchable and must not be advised; \
+         stdout:\n{stdout}"
+    );
+    assert!(
+        stderr.contains("yarn_pnp_unsupported"),
+        "the layout refusal warning must be on stderr; stderr:\n{stderr}"
+    );
+}

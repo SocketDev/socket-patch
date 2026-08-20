@@ -780,7 +780,14 @@ async fn get_ghsa_pnpm_pnp_keeps_only_in_hosted_mode() {
             format!(r#"{{ "name": "consumer", "dependencies": {{ "{NAME}": "1.0.0" }} }}"#),
         )
         .unwrap();
-        std::fs::write(root.join("pnpm-lock.yaml"), "lockfileVersion: '9.0'\n").unwrap();
+        // The lock resolves ONLY 1.0.0 (v9 `name@version` spelling): the
+        // hosted keep-branch is gated on lock-text version membership, so
+        // the fan-out's 2.0.0 must still be skipped even under PnP.
+        std::fs::write(
+            root.join("pnpm-lock.yaml"),
+            format!("lockfileVersion: '9.0'\n\npackages:\n\n  {NAME}@1.0.0:\n    resolution: {{}}\n"),
+        )
+        .unwrap();
         std::fs::write(root.join(".pnp.cjs"), "/* pnpm node-linker=pnp loader */").unwrap();
         std::fs::create_dir_all(root.join("node_modules")).unwrap();
         std::fs::write(root.join("node_modules/.modules.yaml"), "").unwrap();
@@ -799,11 +806,27 @@ async fn get_ghsa_pnpm_pnp_keeps_only_in_hosted_mode() {
         args.mode = Some(ScanMode::Hosted);
         let code = socket_patch_cli::commands::get::run(args).await;
         assert_eq!(code, 0);
+        let reference_bodies: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|r| r.url.path().ends_with("/patches/package"))
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect();
         assert_eq!(
-            requests_containing(&server, "/patches/package").await,
+            reference_bodies.len(),
             1,
-            "hosted mode must KEEP pnpm-PnP results (its warning's remedy is \
-             the hosted rewrite) and request the grant"
+            "hosted mode must KEEP the lock-resolved pnpm-PnP result (its \
+             warning's remedy is the hosted rewrite) and request its grant"
+        );
+        assert!(reference_bodies[0].contains(UUID1));
+        assert!(
+            !reference_bodies[0].contains(UUID2),
+            "a version the PnP lock does not resolve must still be skipped \
+             — keeping the whole fan-out would grant every patched version; \
+             body: {}",
+            reference_bodies[0]
         );
     }
     // Agent + vendored: skipped, nothing fetched or written.

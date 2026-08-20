@@ -976,6 +976,16 @@ async fn filter_to_installed_purls(
     let pnp_pnpm = pnp_diags
         .iter()
         .any(|d| d.code == "vendor_pnpm_pnp_unsupported");
+    // pnpm PnP + hosted: the lock inventory REFUSED, so nothing above could
+    // mark the installed version — but the pnpm-lock.yaml the hosted
+    // rewriter will edit is right there. Read its raw text once and gate the
+    // keep-branch below on version membership, so a large advisory fan-out
+    // doesn't request grants for every version ever patched (raw
+    // `read_to_string` matches the hosted flow's own candidate-file reads).
+    let pnpm_pnp_lock_text: Option<String> = (pnp_pnpm
+        && mode == super::scan::ScanMode::Hosted)
+        .then(|| std::fs::read_to_string(common.cwd.join("pnpm-lock.yaml")).ok())
+        .flatten();
 
     let mut out = InstalledNarrowing {
         kept: Vec::new(),
@@ -1002,10 +1012,21 @@ async fn filter_to_installed_purls(
             // installed" when the truth is "cannot see".
             "yarn_pnp_unsupported"
         } else if is_npm && pnp_pnpm {
-            if mode == super::scan::ScanMode::Hosted {
-                // The pnpm PnP refusal's own remedy is the hosted lockfile
-                // rewrite — keep the result and let the rewriter's per-dep
-                // confirmation decide.
+            // The pnpm PnP refusal's own remedy is the hosted lockfile
+            // rewrite — but only for versions the lock ACTUALLY resolves:
+            // keeping the whole fan-out would request grants for every
+            // version ever patched. Probe the raw lock text for the
+            // version's v6/v9 (`name@version`) or v5 (`/name/version`)
+            // spelling; a hit is kept (the rewriter's per-dep confirmation
+            // still decides), a miss skips like the other modes.
+            let decoded = canon(&result.purl);
+            let coord = decoded.strip_prefix("pkg:npm/").unwrap_or(&decoded);
+            let v5_spelling = coord.rsplit_once('@').map(|(n, v)| format!("/{n}/{v}"));
+            let in_lock = pnpm_pnp_lock_text.as_deref().is_some_and(|text| {
+                text.contains(coord)
+                    || v5_spelling.as_deref().is_some_and(|s| text.contains(s))
+            });
+            if in_lock {
                 out.kept.push(result.clone());
                 continue;
             }
@@ -2101,9 +2122,9 @@ pub async fn run(args: GetArgs) -> i32 {
         }
     }
     if accessible.is_empty() {
-        // Every accessible patch targets a version this system doesn't
-        // have. Additive status (never `no_match`, which is pinned to the
-        // fuzzy package-name path): exit 0, the skips carry the detail.
+        // Every accessible patch was narrowed out. Additive status (never
+        // `no_match`, which is pinned to the fuzzy package-name path):
+        // exit 0, the skips carry the detail via their errorCode.
         if args.common.json {
             let mut result = serde_json::json!({
                 "status": "not_installed",
@@ -2115,11 +2136,30 @@ pub async fn run(args: GetArgs) -> i32 {
             fold_narrowing_into_result(&mut result, &[], &narrow_warnings);
             print_json(&result);
         } else if !args.common.silent {
-            println!(
-                "Patches exist for {} package version(s), but none of those versions are \
-                 installed here. Use --all-releases to fetch them anyway.",
-                narrow_skips.len()
-            );
+            // When EVERY skip is a PnP layout refusal, "not installed" and
+            // the --all-releases advice would both be wrong: the packages
+            // were never judged (structurally invisible), and the escape
+            // hatch cannot make a PnP layout patchable — point at the
+            // layout warning above instead.
+            let pnp_only = narrow_skips.iter().all(|rec| {
+                matches!(
+                    rec["errorCode"].as_str(),
+                    Some("yarn_pnp_unsupported" | "pnpm_pnp_unsupported")
+                )
+            });
+            if pnp_only {
+                println!(
+                    "Found {} patch(es), but this project's Plug'n'Play layout makes its npm \
+                     packages unpatchable here — see the layout warning above for the remedy.",
+                    narrow_skips.len()
+                );
+            } else {
+                println!(
+                    "Patches exist for {} package version(s), but none of those versions are \
+                     installed here. Use --all-releases to fetch them anyway.",
+                    narrow_skips.len()
+                );
+            }
         }
         return 0;
     }
@@ -2164,6 +2204,39 @@ pub async fn run(args: GetArgs) -> i32 {
 
     match mode {
         super::scan::ScanMode::Hosted => {
+            // Per-release VARIANT narrowing (the finer layer under the
+            // coarse version narrowing above). Agent/vendored runs get it
+            // inside the download engines; hosted never downloads, so run
+            // it here — otherwise every PyPI wheel/sdist, gem platform, and
+            // Maven classifier variant of the installed version would be
+            // granted and rewritten, not just the installed distribution.
+            // Same fallbacks as everywhere else: uninstalled/unmatched
+            // bases keep all variants with a warning; --all-releases
+            // passes through.
+            let filter_params = DownloadParams {
+                cwd: args.common.cwd.clone(),
+                manifest_path: args.common.resolved_manifest_path(),
+                org: args.common.org.clone(),
+                save_only: true,
+                global: args.common.global,
+                global_prefix: args.common.global_prefix.clone(),
+                json: args.common.json,
+                silent: args.common.silent,
+                download_mode: args.common.download_mode.clone(),
+                api_overrides: args.common.api_client_overrides(),
+                all_releases: args.all_releases,
+                strict: args.common.strict,
+                ecosystems: args.common.ecosystems.clone(),
+                persist_blobs: false,
+            };
+            let (selected, variant_warnings) =
+                filter_to_installed_releases(&selected, &filter_params, &api_client).await;
+            let mut narrow_warnings = narrow_warnings;
+            narrow_warnings.extend(
+                variant_warnings
+                    .into_iter()
+                    .map(|w| ("release_narrowing".to_string(), w)),
+            );
             return run_get_hosted(
                 &args,
                 &api_client,
