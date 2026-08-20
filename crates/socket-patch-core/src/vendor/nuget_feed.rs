@@ -147,6 +147,32 @@ fn is_plain_nuget_token(s: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '+'))
 }
 
+/// Guarded read shared in shape with the vendor twins (cargo.rs, gem.rs,
+/// maven_repo.rs …): `open_regular_file` opens with `O_NONBLOCK` and rejects
+/// non-regular files, so a FIFO planted at any of this backend's read paths —
+/// the committed vendored tree, the project `nuget.config` /
+/// `packages.lock.json`, the `~/.nuget` cache — fails fast instead of wedging
+/// the caller forever in an `open(2)` waiting for a writer that never comes.
+async fn read_regular(path: &Path) -> std::io::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt as _;
+
+    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.read_to_end(&mut bytes).await?;
+    Ok(bytes)
+}
+
+/// String twin of [`read_regular`] (invalid UTF-8 errors as `InvalidData`,
+/// matching `tokio::fs::read_to_string`).
+async fn read_regular_to_string(path: &Path) -> std::io::Result<String> {
+    use tokio::io::AsyncReadExt as _;
+
+    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
+    let mut content = String::with_capacity(metadata.len() as usize);
+    file.read_to_string(&mut content).await?;
+    Ok(content)
+}
+
 /// Vendor a NuGet package: rebuild a patched `.nupkg` under
 /// `.socket/vendor/nuget/<uuid>/`, wire `nuget.config` to serve it, and pin its
 /// `contentHash` in `packages.lock.json` (see the module doc).
@@ -213,7 +239,7 @@ pub async fn vendor_nuget(
 
     let config_path = existing_config_path(project_root).await;
     let config_text: Option<String> = match &config_path {
-        Some(p) => match tokio::fs::read_to_string(p).await {
+        Some(p) => match read_regular_to_string(p).await {
             Ok(t) => Some(t),
             Err(e) => {
                 return refused(
@@ -225,7 +251,7 @@ pub async fn vendor_nuget(
         None => None,
     };
     let lock_path = project_root.join(PACKAGES_LOCK);
-    let lock_text: Option<String> = match tokio::fs::read_to_string(&lock_path).await {
+    let lock_text: Option<String> = match read_regular_to_string(&lock_path).await {
         Ok(t) => Some(t),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => {
@@ -249,7 +275,7 @@ pub async fn vendor_nuget(
         let nupkg_ok = zip_matches_after_hashes(&nupkg_path, &record.files).await;
         let lock_ok = match &lock_text {
             None => true,
-            Some(text) => match tokio::fs::read(&nupkg_path).await {
+            Some(text) => match read_regular(&nupkg_path).await {
                 Ok(bytes) => {
                     let expected = content_hash(&bytes);
                     // Pinned at our bytes, or no matching resolved entry at
@@ -700,7 +726,7 @@ async fn local_rebuild(
             ),
         )));
     };
-    let bytes = match tokio::fs::read(&src_nupkg).await {
+    let bytes = match read_regular(&src_nupkg).await {
         Ok(b) => b,
         Err(e) => {
             return Ok((
@@ -1006,10 +1032,15 @@ fn parse_config_source_keys(text: &str) -> Vec<String> {
     let Some(start) = text.find("<packageSources") else {
         return out;
     };
-    let end = text[start..]
-        .find("</packageSources>")
-        .map(|e| start + e)
-        .unwrap_or(text.len());
+    // No close tag = no children span: a self-closing `<packageSources />`
+    // (valid, common) or a malformed config NuGet itself would reject. Scanning
+    // to EOF instead would harvest `<add key="…">` entries from unrelated
+    // sections (`<config>`, `<packageRestore>`, …) as phantom catch-all
+    // sources — mapping `*` to a key NuGet has no source for hard-fails every
+    // restore.
+    let Some(end) = text[start..].find("</packageSources>").map(|e| start + e) else {
+        return out;
+    };
     let span = &text[start..end];
     let mut rest = span;
     while let Some(add_at) = rest.find("<add") {
@@ -1090,7 +1121,7 @@ async fn revert_config_record(
     let Some(source_key) = w.key.as_deref() else {
         return Ok(false);
     };
-    let live = match tokio::fs::read_to_string(&config_path).await {
+    let live = match read_regular_to_string(&config_path).await {
         Ok(live) => live,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             // Already gone — nothing to restore (we created it and it is gone,
@@ -1287,7 +1318,7 @@ async fn revert_lock_record(
     if orig == ours {
         return Ok(true); // identity pin — nothing to undo
     }
-    let text = match tokio::fs::read_to_string(lock_path).await {
+    let text = match read_regular_to_string(lock_path).await {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(e) => return Err(format!("unreadable {}: {e}", lock_path.display())),
@@ -1527,6 +1558,49 @@ mod tests {
                     <add key=\"a\" value=\"x\" /><add key=\"b\" value=\"y\" />\
                     </packageSources></configuration>";
         assert_eq!(parse_config_source_keys(text), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn self_closing_sources_do_not_harvest_foreign_add_keys() {
+        // A self-closing <packageSources /> has no </packageSources> close
+        // tag: the catch-all key scan must not run past the element and
+        // harvest <add key="…"> entries from unrelated sections (<config>,
+        // <packageRestore>, …) — mapping `*` to a key NuGet has no package
+        // source for hard-fails every restore, and the real fix (seeding
+        // nuget.org) is skipped because the phantom keys look like sources.
+        let orig = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
+                    <configuration>\n\
+                    \x20 <packageSources />\n\
+                    \x20 <config>\n\
+                    \x20   <add key=\"repositoryPath\" value=\"packages\" />\n\
+                    \x20 </config>\n\
+                    </configuration>\n";
+        assert_eq!(
+            parse_config_source_keys(orig),
+            Vec::<String>::new(),
+            "a self-closing packageSources carries no source keys"
+        );
+        let edit = build_config_edit(
+            Some(orig),
+            &source_key(),
+            &format!(".socket/vendor/nuget/{UUID}"),
+            "Newtonsoft.Json",
+        )
+        .unwrap();
+        let t = &edit.new_text;
+        assert!(
+            !t.contains("<packageSource key=\"repositoryPath\">"),
+            "a <config> key must not become a catch-all target: {t}"
+        );
+        // Zero real sources → nuget.org must be seeded and take the catch-all.
+        assert!(
+            t.contains("<add key=\"nuget.org\""),
+            "nuget.org seeded: {t}"
+        );
+        assert!(
+            t.contains("    <packageSource key=\"nuget.org\">\n      <package pattern=\"*\" />"),
+            "the catch-all must target the seeded nuget.org source: {t}"
+        );
     }
 
     // ── packages.lock.json surgery ─────────────────────────────────────────
@@ -2664,6 +2738,240 @@ mod tests {
         assert!(
             !root.join(format!(".socket/vendor/nuget/{UUID}")).exists(),
             "partial uuid dir removed"
+        );
+    }
+
+    // ── FIFO-squatting wedges (unix) ───────────────────────────────────────
+
+    #[cfg(unix)]
+    fn mkfifo(path: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+        let c_path =
+            std::ffi::CString::new(path.as_os_str().as_bytes()).expect("fifo path has no NUL");
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
+        assert_eq!(
+            rc,
+            0,
+            "mkfifo(2) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    /// Await `fut` under the FIFO-wedge deadline. On timeout, connect a writer
+    /// to `fifo` so the blocked `open(2)` in the runtime's blocking pool is
+    /// released (letting the test FAIL instead of hanging the whole suite),
+    /// then panic with `what`.
+    #[cfg(unix)]
+    async fn expect_fast<T>(
+        fut: impl std::future::Future<Output = T>,
+        fifo: &Path,
+        what: &str,
+    ) -> T {
+        let deadline = std::time::Duration::from_secs(5);
+        match tokio::time::timeout(deadline, fut).await {
+            Ok(v) => v,
+            Err(_) => {
+                let _ = std::fs::OpenOptions::new().write(true).open(fifo);
+                panic!("{what}");
+            }
+        }
+    }
+
+    /// A FIFO planted as the project `nuget.config` must surface the
+    /// fail-closed unreadable refusal instead of wedging every vendor run
+    /// forever.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fifo_nuget_config_fails_fast_in_vendor() {
+        let (dir, blobs, installed, record) = fixture(true, None).await;
+        let root = dir.path();
+        let cfg = root.join("nuget.config");
+        mkfifo(&cfg);
+
+        let outcome = expect_fast(
+            run_vendor(root, &blobs, &installed, &record, false),
+            &cfg,
+            "vendor must fail fast on a FIFO nuget.config, not wedge",
+        )
+        .await;
+        let (code, _d) = unwrap_refused(outcome);
+        assert_eq!(code, "vendor_nuget_config_unreadable");
+    }
+
+    /// A FIFO planted as `packages.lock.json` must surface the fail-closed
+    /// unreadable refusal instead of wedging every vendor run forever.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fifo_lockfile_fails_fast_in_vendor() {
+        let (dir, blobs, installed, record) = fixture(false, None).await;
+        let root = dir.path();
+        let lock = root.join(PACKAGES_LOCK);
+        mkfifo(&lock);
+
+        let outcome = expect_fast(
+            run_vendor(root, &blobs, &installed, &record, false),
+            &lock,
+            "vendor must fail fast on a FIFO packages.lock.json, not wedge",
+        )
+        .await;
+        let (code, _d) = unwrap_refused(outcome);
+        assert_eq!(code, "vendor_nuget_lock_unreadable");
+    }
+
+    /// A FIFO planted as the committed vendored nupkg (the tamper-able tree)
+    /// must read as out-of-sync — triggering the artifact rebuild that
+    /// atomically replaces it — instead of wedging the in-sync hot path
+    /// forever. The zip probe (`zip_matches_after_hashes`) is already guarded
+    /// in common.rs; this pins the lock-hash read beside it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fifo_vendored_nupkg_fails_fast_and_rebuilds_on_hot_path() {
+        let (dir, blobs, installed, record) = fixture(true, None).await;
+        let root = dir.path();
+        let (r1, _e, _w) = unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert!(r1.success);
+        let nupkg = root.join(copy_rel());
+        let real = tokio::fs::read(&nupkg).await.unwrap();
+        tokio::fs::remove_file(&nupkg).await.unwrap();
+        mkfifo(&nupkg);
+
+        let outcome = expect_fast(
+            run_vendor(root, &blobs, &installed, &record, false),
+            &nupkg,
+            "the in-sync probe must fail fast on a FIFO vendored nupkg, not wedge",
+        )
+        .await;
+        let (r2, e2, w2) = unwrap_done(outcome);
+        assert!(r2.success, "{:?}", r2.error);
+        assert!(e2.is_none(), "artifact-only rebuild must not re-record");
+        assert!(
+            w2.iter().any(|w| w.code == "vendor_artifact_rebuilt"),
+            "FIFO nupkg must read as stale and trigger the rebuild: {w2:?}"
+        );
+        assert_eq!(
+            tokio::fs::read(&nupkg).await.unwrap(),
+            real,
+            "the rebuild must atomically replace the FIFO with the real nupkg"
+        );
+    }
+
+    /// A FIFO planted as the cached `~/.nuget` nupkg passes the filename probe
+    /// but must fail the stage read fast instead of wedging the rebuild
+    /// forever.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fifo_cached_nupkg_fails_fast_in_local_rebuild() {
+        let (dir, blobs, installed, record) = fixture(true, None).await;
+        let root = dir.path();
+        let cached = installed.join("newtonsoft.json.13.0.3.nupkg");
+        tokio::fs::remove_file(&cached).await.unwrap();
+        mkfifo(&cached);
+
+        let outcome = expect_fast(
+            run_vendor(root, &blobs, &installed, &record, false),
+            &cached,
+            "the local rebuild must fail fast on a FIFO cached nupkg, not wedge",
+        )
+        .await;
+        let (result, entry, _w) = unwrap_done(outcome);
+        assert!(!result.success, "a FIFO nupkg cannot be staged");
+        assert!(entry.is_none());
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("cannot read")),
+            "failure names the unreadable nupkg: {:?}",
+            result.error
+        );
+        assert!(
+            !root.join("nuget.config").exists(),
+            "no config may be written after a failed rebuild"
+        );
+    }
+
+    /// A FIFO planted as `nuget.config` must fail the revert fast and loudly —
+    /// keeping the uuid dir for a retry — instead of wedging `--revert`
+    /// forever.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fifo_nuget_config_fails_fast_in_revert() {
+        let (dir, blobs, installed, record) = fixture(true, None).await;
+        let root = dir.path();
+        let (r1, entry, _w) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert!(r1.success);
+        let entry = entry.unwrap();
+        let cfg = root.join("nuget.config");
+        tokio::fs::remove_file(&cfg).await.unwrap();
+        mkfifo(&cfg);
+
+        let outcome = expect_fast(
+            revert_nuget(&entry, root, false),
+            &cfg,
+            "revert must fail fast on a FIFO nuget.config, not wedge",
+        )
+        .await;
+        assert!(
+            !outcome.success,
+            "an unreadable nuget.config must fail the revert"
+        );
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("unreadable")),
+            "error names the unreadable nuget.config: {:?}",
+            outcome.error
+        );
+        assert!(
+            root.join(format!(".socket/vendor/nuget/{UUID}")).exists(),
+            "the artifact must survive a failed revert for the retry"
+        );
+    }
+
+    /// A FIFO planted as `packages.lock.json` must fail the revert fast and
+    /// loudly — before the config wiring is touched — instead of wedging
+    /// `--revert` forever.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fifo_lockfile_fails_fast_in_revert() {
+        let (dir, blobs, installed, record) = fixture(true, None).await;
+        let root = dir.path();
+        let (r1, entry, _w) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert!(r1.success);
+        let entry = entry.unwrap();
+        let lock = root.join(PACKAGES_LOCK);
+        tokio::fs::remove_file(&lock).await.unwrap();
+        mkfifo(&lock);
+
+        let outcome = expect_fast(
+            revert_nuget(&entry, root, false),
+            &lock,
+            "revert must fail fast on a FIFO packages.lock.json, not wedge",
+        )
+        .await;
+        assert!(
+            !outcome.success,
+            "an unreadable packages.lock.json must fail the revert"
+        );
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("unreadable")),
+            "error names the unreadable lock: {:?}",
+            outcome.error
+        );
+        // The lock record fails first (reverse order) — the config wiring must
+        // be left untouched for the retry.
+        let cfg = tokio::fs::read_to_string(root.join("nuget.config"))
+            .await
+            .unwrap();
+        assert!(
+            cfg.contains(&source_key()),
+            "config wiring untouched after the early lock failure: {cfg}"
         );
     }
 }

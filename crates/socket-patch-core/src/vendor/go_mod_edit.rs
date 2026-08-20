@@ -36,8 +36,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use tokio::fs;
-
 /// Project-relative directory holding `apply`'s patched module copies. A
 /// `replace` whose target path is under this prefix is owned by
 /// [`ReplaceOwner::GoPatches`].
@@ -128,10 +126,24 @@ impl ReplaceEntry {
 
 // ── public async API ─────────────────────────────────────────────────────────
 
+/// Guarded read shared in shape with the Cargo.lock / .cargo/config.toml
+/// twins: `open_regular_file` opens with `O_NONBLOCK` and rejects non-regular
+/// files, so a FIFO planted as `go.mod` fails fast instead of wedging every
+/// caller (apply's redirect + reconcile, `--check`'s verify, vex's directive
+/// scan) forever in an `open(2)` that waits for a writer that never comes.
+async fn read_regular_to_string(path: &Path) -> std::io::Result<String> {
+    use tokio::io::AsyncReadExt as _;
+
+    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
+    let mut content = String::with_capacity(metadata.len() as usize);
+    file.read_to_string(&mut content).await?;
+    Ok(content)
+}
+
 /// Read all `replace` directives. Read-only; a missing/unreadable `go.mod`
 /// yields an empty vec (callers treat that as "no managed entries").
 pub async fn read_replace_entries(project_root: &Path) -> Vec<ReplaceEntry> {
-    match fs::read_to_string(go_mod_path(project_root)).await {
+    match read_regular_to_string(&go_mod_path(project_root)).await {
         Ok(content) => parse_replace_entries(&content),
         Err(_) => Vec::new(),
     }
@@ -142,7 +154,9 @@ pub async fn read_replace_entries(project_root: &Path) -> Vec<ReplaceEntry> {
 /// module graph no longer selects is silently unused). `None` ⇒ no/unreadable
 /// `go.mod` ⇒ skip the check (mirrors cargo's `read_locked_versions`).
 pub async fn read_required_versions(project_root: &Path) -> Option<HashMap<String, String>> {
-    let content = fs::read_to_string(go_mod_path(project_root)).await.ok()?;
+    let content = read_regular_to_string(&go_mod_path(project_root))
+        .await
+        .ok()?;
     Some(parse_required_versions(&content))
 }
 
@@ -199,7 +213,7 @@ async fn edit_go_mod(
     transform: impl FnOnce(&str) -> Result<Option<String>, String>,
 ) -> Result<bool, String> {
     let path = go_mod_path(project_root);
-    let content = fs::read_to_string(&path)
+    let content = read_regular_to_string(&path)
         .await
         .map_err(|e| format!("read {}: {e}", path.display()))?;
     match transform(&content)? {
@@ -421,16 +435,18 @@ fn upsert_socket_replace(
     // No socket-owned entry yet → append a single-line directive, separated
     // from the previous stanza by one blank line (the shape `go mod tidy`
     // itself produces — anything else makes the first day-2 tidy churn the
-    // committed go.mod).
+    // committed go.mod). New lines use the file's own terminator so a CRLF
+    // go.mod round-trips byte-identical through ensure→drop.
+    let eol = super::common::detect_eol(content);
     let mut body = content.to_string();
     if !body.is_empty() && !body.ends_with('\n') {
-        body.push('\n');
+        body.push_str(eol);
     }
-    if !body.is_empty() && !body.ends_with("\n\n") {
-        body.push('\n');
+    if !body.is_empty() && !body.ends_with(&format!("{eol}{eol}")) {
+        body.push_str(eol);
     }
     body.push_str(&want_line);
-    body.push('\n');
+    body.push_str(eol);
     Ok(Some(body))
 }
 
@@ -579,11 +595,14 @@ pub fn remove_replace_entry(
     Ok(Some(join_preserving_trailing_newline(&kept, content)))
 }
 
-/// Re-join lines, restoring a trailing newline iff the original had one.
+/// Re-join lines with the file's dominant terminator (`str::lines` strips the
+/// `\r`, so joining with bare `\n` would LF-normalize every untouched line of
+/// a CRLF go.mod), restoring a trailing newline iff the original had one.
 fn join_preserving_trailing_newline(lines: &[String], original: &str) -> String {
-    let mut out = lines.join("\n");
+    let eol = super::common::detect_eol(original);
+    let mut out = lines.join(eol);
     if original.ends_with('\n') {
-        out.push('\n');
+        out.push_str(eol);
     }
     out
 }
@@ -591,6 +610,7 @@ fn join_preserving_trailing_newline(lines: &[String], original: &str) -> String 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::fs;
 
     // ── path ownership ───────────────────────────────────────────────
     #[test]
@@ -1337,6 +1357,103 @@ replace (
             .expect("tab-separated socket replace must be removable");
         assert!(!out.contains("go-patches"));
         assert!(out.contains("module m"));
+    }
+
+    #[cfg(unix)]
+    fn mkfifo(path: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+        let c_path =
+            std::ffi::CString::new(path.as_os_str().as_bytes()).expect("fifo path has no NUL");
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
+        assert_eq!(
+            rc,
+            0,
+            "mkfifo(2) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    /// A FIFO planted as `go.mod` must fail fast instead of wedging every
+    /// caller — apply's redirect + reconcile, `--check`'s verify, and vex's
+    /// directive scan all read it — forever in an `open(2)` that waits for a
+    /// writer that never comes. Same `open_regular_file` guard class as the
+    /// Cargo.lock / .cargo/config.toml twins. Reads stay fail-safe (empty /
+    /// `None`); edits refuse loudly.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_fifo_go_mod_fails_fast_instead_of_wedging() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("go.mod");
+        mkfifo(&path);
+
+        // On timeout the open is wedged in a `spawn_blocking` thread that the
+        // runtime waits for on shutdown; connect a writer to release it so
+        // the test can FAIL instead of hanging the whole suite.
+        let deadline = std::time::Duration::from_secs(5);
+        let all = async {
+            (
+                read_replace_entries(dir.path()).await,
+                read_required_versions(dir.path()).await,
+                ensure_replace_entry(
+                    dir.path(),
+                    "github.com/foo/bar",
+                    "v1.4.2",
+                    GO_PATCHES_DIR,
+                    false,
+                )
+                .await,
+                drop_replace_entry(
+                    dir.path(),
+                    "github.com/foo/bar",
+                    ReplaceOwner::GoPatches,
+                    false,
+                )
+                .await,
+            )
+        };
+        let Ok((entries, versions, ensure, drop)) = tokio::time::timeout(deadline, all).await
+        else {
+            let _ = std::fs::OpenOptions::new().write(true).open(&path);
+            panic!("go.mod reads must fail fast on a FIFO go.mod");
+        };
+        assert!(entries.is_empty(), "read stays fail-safe: {entries:?}");
+        assert!(versions.is_none(), "version read stays fail-safe");
+        assert!(ensure.is_err(), "edit refuses loudly");
+        assert!(drop.is_err(), "edit refuses loudly");
+    }
+
+    /// A `go.mod` checked out with CRLF endings (git autocrlf on Windows)
+    /// must keep them: the rewrite/removal paths re-join `str::lines()`
+    /// output, and joining with bare `\n` LF-normalizes EVERY line — churning
+    /// the user's whole file and breaking the byte-identical ensure→drop
+    /// round-trip pinned above. Same contract as `setup/pypi/edit.rs`'s
+    /// CRLF preservation (shared `detect_eol`).
+    #[test]
+    fn test_crlf_go_mod_preserves_line_endings() {
+        let original = "module m\r\n\r\ngo 1.21\r\n\r\nrequire github.com/foo/bar v1.4.2\r\n";
+
+        // ensure→drop restores the CRLF file byte-identical.
+        let upserted =
+            upsert_replace_entry(original, "github.com/foo/bar", "v1.4.2", GO_PATCHES_DIR)
+                .unwrap()
+                .unwrap();
+        assert!(upserted.contains("replace github.com/foo/bar v1.4.2 =>"));
+        let restored =
+            remove_replace_entry(&upserted, "github.com/foo/bar", ReplaceOwner::GoPatches)
+                .unwrap()
+                .unwrap();
+        assert_eq!(restored, original, "CRLF byte-identical round-trip");
+
+        // An in-place version bump must not LF-normalize untouched lines.
+        let bumped =
+            upsert_replace_entry(&upserted, "github.com/foo/bar", "v1.5.0", GO_PATCHES_DIR)
+                .unwrap()
+                .unwrap();
+        assert!(
+            bumped.contains("module m\r\n"),
+            "untouched lines keep CRLF: {bumped:?}"
+        );
+        assert!(bumped.contains("bar@v1.5.0"));
     }
 
     #[tokio::test]

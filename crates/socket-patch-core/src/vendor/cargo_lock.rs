@@ -66,12 +66,26 @@ impl std::fmt::Display for LockEditError {
     }
 }
 
+/// Guarded read shared in shape with the Cargo.toml / .cargo/config.toml
+/// twins: `open_regular_file` opens with `O_NONBLOCK` and rejects non-regular
+/// files, so a FIFO planted as `Cargo.lock` fails fast instead of wedging
+/// every caller (scan's probe, vendor mode detection, wet detach/restore)
+/// forever in an `open(2)` that waits for a writer.
+async fn read_regular_to_string(path: &Path) -> std::io::Result<String> {
+    use tokio::io::AsyncReadExt as _;
+
+    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
+    let mut content = String::with_capacity(metadata.len() as usize);
+    file.read_to_string(&mut content).await?;
+    Ok(content)
+}
+
 /// Read + parse `<root>/Cargo.lock`, mapping errors to [`LockEditError`].
 async fn read_lock(
     project_root: &Path,
 ) -> Result<(std::path::PathBuf, DocumentMut), LockEditError> {
     let path = project_root.join("Cargo.lock");
-    let content = match tokio::fs::read_to_string(&path).await {
+    let content = match read_regular_to_string(&path).await {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Err(LockEditError::NoLockfile)
@@ -675,6 +689,69 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count_lock_entries(empty.path(), "cfg-if", "1.0.4").await, 0);
+    }
+
+    #[cfg(unix)]
+    fn mkfifo(path: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+        let c_path =
+            std::ffi::CString::new(path.as_os_str().as_bytes()).expect("fifo path has no NUL");
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
+        assert_eq!(
+            rc,
+            0,
+            "mkfifo(2) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    /// A FIFO planted as `Cargo.lock` must fail fast instead of wedging every
+    /// caller — scan's `probe_lock_entry`, vendor mode detection, the version
+    /// cross-check, and wet detach/restore all read the lock — forever in an
+    /// `open(2)` that waits for a writer that never comes. Same
+    /// `open_regular_file` guard class as the Cargo.toml and
+    /// .cargo/config.toml twins in this module's siblings. Probes stay
+    /// fail-safe (`NoLockfile` / `None` / zero); edits refuse loudly with
+    /// `Io`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fifo_lock_fails_fast_instead_of_wedging() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Cargo.lock");
+        mkfifo(&path);
+
+        let orig = CargoLockOriginal {
+            source: SOURCE.to_string(),
+            checksum: Some(CHECKSUM.to_string()),
+        };
+        // On timeout the open is wedged in a `spawn_blocking` thread that the
+        // runtime waits for on shutdown; connect a writer to release it so
+        // the test can FAIL instead of hanging the whole suite.
+        let deadline = std::time::Duration::from_secs(5);
+        let all = async {
+            (
+                probe_lock_entry(dir.path(), "cfg-if", "1.0.4").await,
+                read_locked_versions(dir.path()).await,
+                count_lock_entries(dir.path(), "cfg-if", "1.0.4").await,
+                detach_lock_entry(dir.path(), "cfg-if", "1.0.4", false).await,
+                restore_lock_entry(dir.path(), "cfg-if", "1.0.4", &orig, false).await,
+            )
+        };
+        let Ok((probe, versions, count, detach, restore)) =
+            tokio::time::timeout(deadline, all).await
+        else {
+            use std::os::unix::fs::OpenOptionsExt;
+            let _ = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&path);
+            panic!("lock reads must fail fast on a FIFO Cargo.lock");
+        };
+        assert_eq!(probe, LockEntryProbe::NoLockfile);
+        assert!(versions.is_none());
+        assert_eq!(count, 0);
+        assert!(matches!(detach, Err(LockEditError::Io(_))), "{detach:?}");
+        assert!(matches!(restore, Err(LockEditError::Io(_))), "{restore:?}");
     }
 
     #[tokio::test]

@@ -400,25 +400,14 @@ async fn repair_diff_mode_downloads_diff_archives() {
 
 #[tokio::test]
 #[serial]
-async fn repair_package_mode_downloads_package_archives() {
+async fn repair_package_mode_is_a_hard_failure() {
+    // `--download-mode package` was removed (no deployed server ever served
+    // its GET archive route). Repair must fail up front on mode parsing —
+    // before any network traffic — rather than silently degrade.
     let tmp = tempfile::tempdir().unwrap();
     let uuid = "13131313-1313-4131-8131-131313131313";
-    let _after_hash = "def456def456def456def456def456def456def456def456def456def456def4";
 
     let server = MockServer::start().await;
-    let archive_bytes = b"fake package archive bytes";
-    Mock::given(method("GET"))
-        .and(path(format!("/v0/orgs/{ORG}/patches/package/{uuid}")))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(archive_bytes.to_vec()))
-        .mount(&server)
-        .await;
-    let real_blob = b"real blob";
-    let real_hash = git_sha256(real_blob);
-    Mock::given(method("GET"))
-        .and(path(format!("/v0/orgs/{ORG}/patches/blob/{real_hash}")))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(real_blob.to_vec()))
-        .mount(&server)
-        .await;
 
     let socket = tmp.path().join(".socket");
     std::fs::create_dir_all(&socket).unwrap();
@@ -431,7 +420,7 @@ async fn repair_package_mode_downloads_package_archives() {
                     "exportedAt": "2024-01-01T00:00:00Z",
                     "files": {{ "package/x.js": {{
                         "beforeHash": "0000000000000000000000000000000000000000000000000000000000000000",
-                        "afterHash": "{real_hash}"
+                        "afterHash": "def456def456def456def456def456def456def456def456def456def456def4"
                     }}}},
                     "vulnerabilities": {{}}, "description": "x",
                     "license": "MIT", "tier": "free"
@@ -448,22 +437,18 @@ async fn repair_package_mode_downloads_package_archives() {
     std::env::remove_var("SOCKET_API_URL");
     std::env::remove_var("SOCKET_API_TOKEN");
     std::env::remove_var("SOCKET_ORG_SLUG");
-    assert_eq!(code, 0);
-    let archive_path = socket.join(format!("packages/{uuid}.tar.gz"));
-    assert!(archive_path.exists());
-    assert_eq!(
-        std::fs::read(&archive_path).unwrap(),
-        archive_bytes,
-        "persisted package archive bytes must match the served body"
-    );
-    let hits = server
+    assert_ne!(code, 0, "removed download mode must be a hard failure");
+    let package_hits = server
         .received_requests()
         .await
         .unwrap()
         .into_iter()
-        .filter(|r| r.url.path() == format!("/v0/orgs/{ORG}/patches/package/{uuid}"))
+        .filter(|r| r.url.path().contains("/patches/package/"))
         .count();
-    assert_eq!(hits, 1, "package endpoint must be fetched exactly once");
+    assert_eq!(
+        package_hits, 0,
+        "the removed mode must never reach the package archive route"
+    );
 }
 
 #[tokio::test]

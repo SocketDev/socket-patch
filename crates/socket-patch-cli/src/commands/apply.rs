@@ -68,7 +68,7 @@ fn warn_mismatch_overwrites(result: &ApplyResult, common: &GlobalArgs) {
 async fn ensure_blobs_for_mismatches(
     args: &ApplyArgs,
     manifest: &PatchManifest,
-    all_packages: &HashMap<String, PathBuf>,
+    all_packages: &HashMap<String, Vec<PathBuf>>,
     vendored_purls: &HashSet<String>,
     staged: &mut StagedSources,
 ) {
@@ -140,15 +140,27 @@ async fn ensure_blobs_for_mismatches(
 /// are skipped outright: the apply loop never attempts them (their
 /// results are synthesized up front), so their drifted files must not
 /// queue fetches either.
+///
+/// EVERY physical copy of a purl is probed: npm materializes genuine
+/// duplicates of one `name@version`, the apply loop patches each of them,
+/// and copies drift independently — a pristine (or already-patched) root
+/// copy says nothing about a locally-modified nested duplicate, whose
+/// mismatched files still need their afterHash blobs. The variant gate,
+/// by contrast, mirrors the apply loop's representative check against the
+/// FIRST copy (release-variant ecosystems install one directory per
+/// `package@version`).
 async fn mismatch_blob_gaps(
     manifest: &PatchManifest,
-    all_packages: &HashMap<String, PathBuf>,
+    all_packages: &HashMap<String, Vec<PathBuf>>,
     vendored_purls: &HashSet<String>,
     blobs_path: &Path,
     force: bool,
 ) -> HashSet<String> {
     let mut needed: HashSet<String> = HashSet::new();
-    for (purl, pkg_path) in all_packages {
+    for (purl, pkg_paths) in all_packages {
+        let Some(first_path) = pkg_paths.first() else {
+            continue;
+        };
         let variant_eco = Ecosystem::from_purl(purl).is_some_and(|e| e.supports_release_variants());
         let stripped = strip_purl_qualifiers(purl);
         let records: Vec<(&String, &PatchRecord)> = manifest
@@ -173,7 +185,7 @@ async fn mismatch_blob_gaps(
         for (_, record) in records {
             if gated {
                 if let Some((file_name, file_info)) = representative_file(&record.files) {
-                    let status = verify_file_patch(pkg_path, file_name, file_info)
+                    let status = verify_file_patch(first_path, file_name, file_info)
                         .await
                         .status;
                     if !variant_matches_installed(Some(&status)) {
@@ -185,13 +197,16 @@ async fn mismatch_blob_gaps(
                 if info.before_hash.is_empty() {
                     continue;
                 }
-                let verify = verify_file_patch(pkg_path, file_name, info).await;
-                if verify.status == VerifyStatus::HashMismatch
-                    && tokio::fs::metadata(blobs_path.join(&info.after_hash))
-                        .await
-                        .is_err()
-                {
-                    needed.insert(info.after_hash.clone());
+                for pkg_path in pkg_paths {
+                    let verify = verify_file_patch(pkg_path, file_name, info).await;
+                    if verify.status == VerifyStatus::HashMismatch
+                        && tokio::fs::metadata(blobs_path.join(&info.after_hash))
+                            .await
+                            .is_err()
+                    {
+                        needed.insert(info.after_hash.clone());
+                        break; // the fetch is per-hash; one drifted copy queues it
+                    }
                 }
             }
         }
@@ -589,6 +604,40 @@ pub(crate) fn result_to_event(result: &ApplyResult, dry_run: bool) -> PatchEvent
     PatchEvent::new(PatchAction::Applied, purl).with_files(files)
 }
 
+/// Whether this run can touch `--cwd`'s npm `node_modules` at all: local
+/// mode (a `--global` / `--global-prefix` run crawls a different tree, so
+/// the checkout's layout says nothing about what it will patch) with npm
+/// not filtered out by `--ecosystems`. Gates the yarn-PnP refusal — the
+/// refusal is about THIS run's packages living inside `.yarn/cache/*.zip`,
+/// so a run that never crawls the checkout's `node_modules` must not be
+/// refused by its layout. The filter check is the exact `cli_name` match
+/// `partition_purls` applies, so the refusal scope can never diverge from
+/// the crawl scope.
+fn npm_in_local_scope(common: &GlobalArgs) -> bool {
+    if common.global || common.global_prefix.is_some() {
+        return false;
+    }
+    match &common.ecosystems {
+        None => true,
+        Some(list) => list.iter().any(|e| e == Ecosystem::Npm.cli_name()),
+    }
+}
+
+/// True when the manifest records at least one npm patch — the only kind a
+/// PnP layout can block (a polyglot repo's pypi/gem/go patches live outside
+/// `node_modules` and apply fine). An unreadable or vanished manifest
+/// returns false so the ordinary manifest error paths surface instead of a
+/// misdirected layout refusal.
+async fn manifest_targets_npm(manifest_path: &Path) -> bool {
+    match read_manifest(manifest_path).await {
+        Ok(Some(m)) => m
+            .patches
+            .keys()
+            .any(|p| Ecosystem::from_purl(p) == Some(Ecosystem::Npm)),
+        _ => false,
+    }
+}
+
 /// Print the yarn-PnP refusal (JSON envelope or human stderr) and return
 /// apply's refusal exit code. Shared by the pre-manifest gate and the
 /// package-manager layout gate below: scan cannot discover PnP packages so
@@ -633,10 +682,15 @@ pub async fn run(args: ApplyArgs) -> i32 {
         // gate further down never fired and the ONLY signal a PnP project
         // ever produced was this calm exit-0 noManifest, i.e. a silent
         // no-op. Same envelope + exit semantics as the with-manifest gate.
-        if matches!(
-            detect_npm_pkg_manager(&args.common.cwd),
-            NpmPkgManager::YarnBerryPnP
-        ) {
+        // Scoped to runs that would actually crawl this checkout's
+        // node_modules: a --global/--global-prefix run or an --ecosystems
+        // filter excluding npm never touches it.
+        if npm_in_local_scope(&args.common)
+            && matches!(
+                detect_npm_pkg_manager(&args.common.cwd),
+                NpmPkgManager::YarnBerryPnP
+            )
+        {
             return refuse_yarn_pnp(&args);
         }
         if args.common.json {
@@ -677,11 +731,17 @@ pub async fn run(args: ApplyArgs) -> i32 {
     // inside `.yarn/cache/*.zip` and resolves them via `.pnp.cjs` —
     // the npm crawler can't reach them and rewriting zips is a
     // different operation entirely. Refuse with a clear pointer to
-    // `yarn patch`. pnpm gets an informational event; the CoW guard
-    // in `apply_file_patch` does the substantive safety work.
+    // `yarn patch` — but only when an npm patch is actually in scope:
+    // a polyglot repo's pypi/gem/go patches apply fine under PnP, and a
+    // global-tree or non-npm `--ecosystems` run never crawls this
+    // checkout's node_modules at all. pnpm gets an informational event;
+    // the CoW guard in `apply_file_patch` does the substantive safety
+    // work.
     match detect_npm_pkg_manager(&args.common.cwd) {
         NpmPkgManager::YarnBerryPnP => {
-            return refuse_yarn_pnp(&args);
+            if npm_in_local_scope(&args.common) && manifest_targets_npm(&manifest_path).await {
+                return refuse_yarn_pnp(&args);
+            }
         }
         NpmPkgManager::Pnpm => {
             if !args.common.json && !args.common.silent {
@@ -1105,14 +1165,6 @@ async fn apply_patches_inner(
     )
     .await;
 
-    // One representative path per PURL, for the mismatch-blob gate and the
-    // pre-attempt checks that only need "is it installed / a sample copy"
-    // (the gate's fetch decision is per-hash, identical across copies).
-    let first_paths: HashMap<String, PathBuf> = all_packages
-        .iter()
-        .filter_map(|(purl, paths)| paths.first().map(|p| (purl.clone(), p.clone())))
-        .collect();
-
     if all_packages.is_empty() && partitioned.is_empty() {
         // Nothing in scope: the manifest lists no patches (or every patch was
         // filtered out by `--ecosystems`). There is genuinely no work to do,
@@ -1150,7 +1202,7 @@ async fn apply_patches_inner(
     }
 
     // Apply patches
-    ensure_blobs_for_mismatches(args, &manifest, &first_paths, &vendored_purls, &mut staged).await;
+    ensure_blobs_for_mismatches(args, &manifest, &all_packages, &vendored_purls, &mut staged).await;
     let sources = staged.as_patch_sources();
     let policy = mismatch_policy(args.force, args.common.strict);
     let mut has_errors = false;
@@ -1773,7 +1825,7 @@ mod tests {
             files,
         );
         let mut all_packages = HashMap::new();
-        all_packages.insert("pkg:pypi/foo@1.0.0".to_string(), pkg.clone());
+        all_packages.insert("pkg:pypi/foo@1.0.0".to_string(), vec![pkg.clone()]);
 
         let needed =
             mismatch_blob_gaps(&manifest, &all_packages, &HashSet::new(), &blobs, false).await;
@@ -1843,7 +1895,7 @@ mod tests {
             },
         );
         let mut all_packages = HashMap::new();
-        all_packages.insert("pkg:pypi/foo@1.0.0".to_string(), pkg.clone());
+        all_packages.insert("pkg:pypi/foo@1.0.0".to_string(), vec![pkg.clone()]);
 
         let needed =
             mismatch_blob_gaps(&manifest, &all_packages, &HashSet::new(), &blobs, false).await;
@@ -1889,7 +1941,7 @@ mod tests {
         );
         let manifest = manifest_with_record("pkg:gem/foo@1.0.0", files);
         let mut all_packages = HashMap::new();
-        all_packages.insert("pkg:gem/foo@1.0.0".to_string(), pkg.clone());
+        all_packages.insert("pkg:gem/foo@1.0.0".to_string(), vec![pkg.clone()]);
 
         let needed =
             mismatch_blob_gaps(&manifest, &all_packages, &HashSet::new(), &blobs, false).await;
@@ -1929,7 +1981,7 @@ mod tests {
         );
         let manifest = manifest_with_record("pkg:gem/foo@1.0.0?platform=x86_64-linux", files);
         let mut all_packages = HashMap::new();
-        all_packages.insert("pkg:gem/foo@1.0.0".to_string(), pkg.clone());
+        all_packages.insert("pkg:gem/foo@1.0.0".to_string(), vec![pkg.clone()]);
 
         let needed =
             mismatch_blob_gaps(&manifest, &all_packages, &HashSet::new(), &blobs, false).await;
@@ -1976,7 +2028,7 @@ mod tests {
         );
         let manifest = manifest_with_record("pkg:gem/foo@1.0.0", files);
         let mut all_packages = HashMap::new();
-        all_packages.insert("pkg:gem/foo@1.0.0".to_string(), pkg.clone());
+        all_packages.insert("pkg:gem/foo@1.0.0".to_string(), vec![pkg.clone()]);
 
         let needed =
             mismatch_blob_gaps(&manifest, &all_packages, &HashSet::new(), &blobs, false).await;
@@ -2024,11 +2076,62 @@ mod tests {
         );
         let manifest = manifest_with_record("pkg:npm/foo@1.0.0", files);
         let mut all_packages = HashMap::new();
-        all_packages.insert("pkg:npm/foo@1.0.0".to_string(), pkg.clone());
+        all_packages.insert("pkg:npm/foo@1.0.0".to_string(), vec![pkg.clone()]);
 
         let needed =
             mismatch_blob_gaps(&manifest, &all_packages, &HashSet::new(), &blobs, false).await;
         assert_eq!(needed, HashSet::from(["7".repeat(64)]));
+    }
+
+    /// Regression (multi-copy): npm materializes genuine duplicates of one
+    /// `name@version` and the apply loop patches every copy, so the probe
+    /// must scan every copy too — copies drift independently. Before the
+    /// fix only the FIRST copy was probed: a clean root copy masked a
+    /// locally-modified nested duplicate, its afterHash blob was never
+    /// queued, and the nested copy failed to apply under the default
+    /// warn-and-overwrite policy in diff download mode.
+    #[tokio::test]
+    async fn mismatch_blob_gaps_probes_every_copy() {
+        use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
+
+        let dir = tempfile::tempdir().unwrap();
+        // First copy: pristine (matches beforeHash — no blob needed).
+        let root_copy = dir.path().join("root");
+        tokio::fs::create_dir_all(&root_copy).await.unwrap();
+        tokio::fs::write(root_copy.join("index.js"), b"pristine\n")
+            .await
+            .unwrap();
+        // Second copy: locally modified (matches neither hash).
+        let nested_copy = dir.path().join("nested");
+        tokio::fs::create_dir_all(&nested_copy).await.unwrap();
+        tokio::fs::write(nested_copy.join("index.js"), b"locally modified\n")
+            .await
+            .unwrap();
+        let blobs = dir.path().join("blobs");
+        tokio::fs::create_dir_all(&blobs).await.unwrap();
+
+        let mut files = HashMap::new();
+        files.insert(
+            "package/index.js".to_string(),
+            PatchFileInfo {
+                before_hash: compute_git_sha256_from_bytes(b"pristine\n"),
+                after_hash: "8".repeat(64),
+            },
+        );
+        let manifest = manifest_with_record("pkg:npm/foo@1.0.0", files);
+        let mut all_packages = HashMap::new();
+        all_packages.insert(
+            "pkg:npm/foo@1.0.0".to_string(),
+            vec![root_copy.clone(), nested_copy.clone()],
+        );
+
+        let needed =
+            mismatch_blob_gaps(&manifest, &all_packages, &HashSet::new(), &blobs, false).await;
+        assert_eq!(
+            needed,
+            HashSet::from(["8".repeat(64)]),
+            "the drifted second copy must queue the blob even though the first copy is clean"
+        );
     }
 
     /// A variant with no content-modifying files (only new files) has

@@ -64,6 +64,21 @@ impl PythonPackageManager {
     }
 }
 
+/// Guarded read shared with the gem/composer/npm setup twins:
+/// `open_regular_file` opens with `O_NONBLOCK` and rejects non-regular files,
+/// so a FIFO planted at `pyproject.toml` fails fast to the `Pip` fallback
+/// instead of wedging `setup`/`--check` forever in an `open(2)` that waits
+/// for a writer — the `is_python_project` gate ahead of detection is
+/// metadata-only and does not filter these.
+async fn read_regular_to_string(path: &Path) -> std::io::Result<String> {
+    use tokio::io::AsyncReadExt;
+
+    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
+    let mut content = String::with_capacity(metadata.len() as usize);
+    file.read_to_string(&mut content).await?;
+    Ok(content)
+}
+
 /// Detect the dependency manager from lockfiles and `pyproject.toml` tables.
 ///
 /// Lockfiles are the strongest signal; `[tool.*]` tables come next; a project
@@ -79,7 +94,7 @@ pub async fn detect_python_pm(cwd: &Path) -> PythonPackageManager {
     if tokio::fs::metadata(cwd.join("poetry.lock")).await.is_ok() {
         return PythonPackageManager::Poetry;
     }
-    if let Ok(content) = tokio::fs::read_to_string(cwd.join("pyproject.toml")).await {
+    if let Ok(content) = read_regular_to_string(&cwd.join("pyproject.toml")).await {
         // Header-anchored checks so a stray substring in a value/comment does
         // not misclassify.
         if has_table(&content, "tool.uv") {
@@ -277,6 +292,49 @@ mod tests {
             detect_python_pm(dir.path()).await,
             PythonPackageManager::Poetry
         );
+    }
+
+    /// mkfifo(2) directly rather than shelling out to the `mkfifo` binary —
+    /// same helper as the find.rs FIFO tests: fork/exec flakes under heavy
+    /// parallel load and the syscall needs no process at all.
+    #[cfg(unix)]
+    fn mkfifo(path: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+        let c_path =
+            std::ffi::CString::new(path.as_os_str().as_bytes()).expect("fifo path has no NUL");
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
+        assert_eq!(
+            rc,
+            0,
+            "mkfifo(2) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    /// A FIFO planted as `pyproject.toml` must not wedge detection. The
+    /// `is_python_project` gate ahead of `detect_python_pm` is metadata-only
+    /// (a FIFO stats fine), so a plain `read_to_string` open(2) here waits
+    /// for a writer that never comes, wedging `setup`/`--check` and the
+    /// configured-ecosystems probe indefinitely with no error and no
+    /// timeout. Same class as the `open_regular_file` guards in the
+    /// npm/composer/gem setup twins and the crawlers. The non-regular file
+    /// must instead fail fast to the `Pip` fallback.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_detect_fifo_pyproject_does_not_wedge() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("pyproject.toml");
+        mkfifo(&fifo);
+
+        // On timeout the open is wedged in a `spawn_blocking` thread that
+        // the runtime waits for on shutdown; connect a writer to release
+        // it so the test can FAIL instead of hanging the whole suite.
+        let deadline = std::time::Duration::from_secs(5);
+        let Ok(pm) = tokio::time::timeout(deadline, detect_python_pm(dir.path())).await else {
+            let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
+            panic!("detect_python_pm must complete promptly with a FIFO pyproject.toml");
+        };
+        assert_eq!(pm, PythonPackageManager::Pip);
     }
 
     #[tokio::test]

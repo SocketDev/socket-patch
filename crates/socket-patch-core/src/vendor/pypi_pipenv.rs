@@ -44,6 +44,21 @@ const KIND_LOCK_ENTRY: &str = "pipenv_lock_entry";
 /// The Pipfile.lock sections searched/wired, in application order.
 const SECTIONS: [&str; 2] = ["default", "develop"];
 
+/// Guarded read shared in shape with the sibling backend twins:
+/// `open_regular_file` opens with `O_NONBLOCK` and rejects non-regular
+/// files, so a FIFO planted as `Pipfile.lock` fails fast instead of wedging
+/// every pipenv-project vendor run (and revert) forever in an `open(2)` that
+/// waits for a writer — the flavor-routing probes ahead of the load are
+/// metadata-only, so these are the first opens.
+async fn read_regular_to_string(path: &Path) -> std::io::Result<String> {
+    use tokio::io::AsyncReadExt as _;
+
+    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
+    let mut content = String::with_capacity(metadata.len() as usize);
+    file.read_to_string(&mut content).await?;
+    Ok(content)
+}
+
 /// Pipfile.lock entry keys that mark a user-declared non-registry source.
 const NON_REGISTRY_KEYS: [&str; 6] = ["path", "git", "hg", "svn", "bzr", "editable"];
 
@@ -77,7 +92,7 @@ pub(super) enum PipenvTarget {
 pub(super) async fn load_pipenv_project(
     root: &Path,
 ) -> Result<PipenvProject, (&'static str, String)> {
-    let lock_text = match tokio::fs::read_to_string(root.join(LOCK_FILE)).await {
+    let lock_text = match read_regular_to_string(&root.join(LOCK_FILE)).await {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Err((
@@ -314,7 +329,7 @@ pub(super) async fn revert_pipenv(
     dry_run: bool,
 ) -> RevertOutcome {
     let lock_path = root.join(LOCK_FILE);
-    let lock_text = match tokio::fs::read_to_string(&lock_path).await {
+    let lock_text = match read_regular_to_string(&lock_path).await {
         Ok(t) => t,
         Err(e) => return RevertOutcome::failed(format!("cannot read {LOCK_FILE}: {e}")),
     };
@@ -1024,6 +1039,79 @@ mod tests {
             & 0o7777;
         assert_eq!(mode, 0o600, "revert must preserve the lockfile's mode");
         assert_eq!(read_lock(tmp.path()).await, LOCK_DIRECT_REGISTRY);
+    }
+
+    /// mkfifo(2) directly rather than shelling out to the `mkfifo` binary —
+    /// same helper as the pypi.rs / pypi_pdm.rs FIFO tests: fork/exec flakes
+    /// under heavy parallel load and the syscall needs no process at all.
+    #[cfg(unix)]
+    fn mkfifo(path: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+        let c_path =
+            std::ffi::CString::new(path.as_os_str().as_bytes()).expect("fifo path has no NUL");
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
+        assert_eq!(
+            rc,
+            0,
+            "mkfifo(2) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    /// A FIFO planted as `Pipfile.lock` must not wedge load or revert:
+    /// `detect_pypi_flavor`'s routing probe is metadata-only (a FIFO stats
+    /// fine), so the backend's raw `read_to_string` open(2) is the FIRST
+    /// open — it waits for a writer that never comes, wedging every
+    /// pipenv-project vendor run (and `vendor --revert`) indefinitely. Same
+    /// `open_regular_file` guard class as the sibling vendor backends.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fifo_lock_does_not_wedge_load_or_revert() {
+        // On timeout the open is wedged in a `spawn_blocking` thread that
+        // the runtime waits for on shutdown; connect a writer to release
+        // it so the test can FAIL instead of hanging the whole suite.
+        let deadline = std::time::Duration::from_secs(5);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let fifo = tmp.path().join("Pipfile.lock");
+        mkfifo(&fifo);
+
+        // Load must refuse fast.
+        let Ok(res) = tokio::time::timeout(deadline, load_pipenv_project(tmp.path())).await
+        else {
+            let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
+            panic!("load_pipenv_project must complete promptly with a FIFO Pipfile.lock");
+        };
+        assert_eq!(res.unwrap_err().0, "pypi_pipenv_lock_parse_failed");
+
+        // Revert reads the lock itself (flavor routing never opens it
+        // first): must fail fast, not wedge.
+        let wiring = vec![WiringRecord {
+            file: LOCK_FILE.to_string(),
+            kind: KIND_LOCK_ENTRY.to_string(),
+            action: WiringAction::Rewritten,
+            key: Some("default:six".to_string()),
+            original: Some(serde_json::json!({})),
+            new: Some(serde_json::json!({})),
+        }];
+        let meta = PipenvMeta {
+            sections: vec!["default".into()],
+        };
+        let Ok(outcome) = tokio::time::timeout(
+            deadline,
+            revert_pipenv(&entry_for(wiring, meta), tmp.path(), false),
+        )
+        .await
+        else {
+            let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
+            panic!("revert_pipenv must complete promptly with a FIFO Pipfile.lock");
+        };
+        assert!(!outcome.success, "FIFO lock must fail the revert");
+        assert!(
+            outcome.error.as_deref().unwrap_or("").contains("cannot read"),
+            "{:?}",
+            outcome.error
+        );
     }
 
     /// A third-party edit to the entry we wrote (e.g. `pipenv lock`

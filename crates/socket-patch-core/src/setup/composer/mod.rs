@@ -274,13 +274,27 @@ pub async fn remove_hook(composer_json: &Path, dry_run: bool) -> ComposerEditRes
     edit(composer_json, dry_run, composer_remove).await
 }
 
+/// Guarded read: a FIFO planted as `composer.json` would make a plain
+/// `read_to_string` open block forever waiting for a writer — discovery
+/// accepts any path whose metadata stats, so it reaches here unopened.
+/// `open_regular_file` opens with `O_NONBLOCK` and rejects non-regular
+/// files, same as the package_json/update.rs and find.rs guards.
+async fn read_composer_json_to_string(path: &Path) -> std::io::Result<String> {
+    use tokio::io::AsyncReadExt;
+
+    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
+    let mut content = String::with_capacity(metadata.len() as usize);
+    file.read_to_string(&mut content).await?;
+    Ok(content)
+}
+
 async fn edit(
     composer_json: &Path,
     dry_run: bool,
     transform: impl FnOnce(&str) -> Result<Option<String>, String>,
 ) -> ComposerEditResult {
     let result = async {
-        let content = match fs::read_to_string(composer_json).await {
+        let content = match read_composer_json_to_string(composer_json).await {
             Ok(c) => c,
             // A missing composer.json on remove is a no-op, not an error.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
@@ -820,6 +834,69 @@ mod tests {
         // remove stays a no-op: a non-string/array value can't hold our
         // command, so there is honestly nothing to strip.
         assert!(composer_remove(malformed).unwrap().is_none());
+    }
+
+    /// Plant a FIFO with a direct `mkfifo(2)` syscall — same helper as the
+    /// find.rs / package_json FIFO tests: fork/exec flakes under heavy
+    /// parallel load and the syscall needs no process at all.
+    #[cfg(unix)]
+    fn mkfifo(path: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+        let c_path =
+            std::ffi::CString::new(path.as_os_str().as_bytes()).expect("fifo path has no NUL");
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
+        assert_eq!(
+            rc,
+            0,
+            "mkfifo(2) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    /// A FIFO planted as `composer.json` must not wedge setup. Discovery
+    /// accepts any path whose metadata stats (a FIFO does), then setup calls
+    /// `add_hook` on it; a plain `read_to_string` open(2) on a FIFO waits for
+    /// a writer that never comes, wedging `socket-patch setup` indefinitely
+    /// with no error and no timeout. Same class as the `open_regular_file`
+    /// guards in package_json/update.rs, find.rs and the crawlers.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_add_fifo_composer_json_does_not_wedge() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("composer.json");
+        mkfifo(&fifo);
+        // Discovery lists it (metadata-only gate), so the production path
+        // reaches the edit's read unopened.
+        assert!(discover_composer_project(dir.path()).await.is_some());
+
+        // On timeout the open is wedged in a `spawn_blocking` thread that
+        // the runtime waits for on shutdown; connect a writer to release
+        // it so the test can FAIL instead of hanging the whole suite.
+        let deadline = std::time::Duration::from_secs(5);
+        let Ok(result) = tokio::time::timeout(deadline, add_hook(&fifo, false)).await else {
+            let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
+            panic!("add_hook must complete promptly with a FIFO composer.json");
+        };
+        assert_eq!(result.status, ComposerSetupStatus::Error);
+        assert!(result.error.is_some());
+    }
+
+    /// The removal twin: `setup --remove` reads the discovered composer.json
+    /// through `remove_hook`, so a FIFO wedged it the same way.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_remove_fifo_composer_json_does_not_wedge() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("composer.json");
+        mkfifo(&fifo);
+
+        let deadline = std::time::Duration::from_secs(5);
+        let Ok(result) = tokio::time::timeout(deadline, remove_hook(&fifo, false)).await else {
+            let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
+            panic!("remove_hook must complete promptly with a FIFO composer.json");
+        };
+        assert_eq!(result.status, ComposerSetupStatus::Error);
+        assert!(result.error.is_some());
     }
 
     #[test]

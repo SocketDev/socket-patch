@@ -23,6 +23,22 @@ use super::common::detect_eol;
 use super::state::{VendorEntry, WiringAction, WiringRecord};
 use super::{RevertOutcome, VendorWarning};
 
+/// Guarded read shared in shape with the sibling backend twins:
+/// `open_regular_file` opens with `O_NONBLOCK` and rejects non-regular
+/// files, so a FIFO planted as `requirements.txt` (or an include) fails
+/// fast instead of wedging every requirements-project vendor run (and
+/// revert) forever in an `open(2)` that waits for a writer — the
+/// flavor-routing probe ahead of the walk is metadata-only, so these are
+/// the first opens.
+async fn read_regular_to_string(path: &Path) -> std::io::Result<String> {
+    use tokio::io::AsyncReadExt as _;
+
+    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
+    let mut content = String::with_capacity(metadata.len() as usize);
+    file.read_to_string(&mut content).await?;
+    Ok(content)
+}
+
 /// Classification of the target package within the requirements tree.
 #[derive(Debug, PartialEq, Eq)]
 enum PinSearch {
@@ -260,7 +276,7 @@ pub(super) async fn revert_requirements(
     let mut reverted: Vec<(String, String)> = Vec::new();
     for file in &files {
         let path = root.join(file);
-        let content = match tokio::fs::read_to_string(&path).await {
+        let content = match read_regular_to_string(&path).await {
             Ok(c) => c,
             Err(e) => {
                 return RevertOutcome::failed(format!("cannot read {file}: {e}"));
@@ -552,7 +568,7 @@ async fn collect_requirements_files(root: &Path) -> Result<Vec<ReqFile>, (&'stat
         if !visited.insert(rel.clone()) {
             continue;
         }
-        let Ok(content) = tokio::fs::read_to_string(&path).await else {
+        let Ok(content) = read_regular_to_string(&path).await else {
             if out.is_empty() {
                 return Err((
                     "pypi_no_requirements",
@@ -604,6 +620,10 @@ fn include_target(text: &str) -> Option<&str> {
     let mut tokens = code.split_whitespace();
     match tokens.next() {
         Some("-r") | Some("--requirement") => tokens.next(),
+        // pip's optparse also accepts the attached short form (`-rdev.txt`);
+        // the bare `-r` was consumed by the arm above, so the value here is
+        // never empty. (No other requirements-file option starts with `-r`.)
+        Some(t) if t.starts_with("-r") && !t.starts_with("--") => Some(&t[2..]),
         _ => None,
     }
 }
@@ -674,6 +694,16 @@ fn logical_lines(content: &str) -> Vec<LogicalLine> {
                 text.push_str(pl.trim_end().strip_suffix('\\').unwrap_or(pl));
             } else {
                 text.push_str(pl);
+            }
+        }
+        // pip decodes the file with utf-8-sig (`auto_decode`) and uv strips
+        // the BOM too: exactly one leading BOM at file start is encoding,
+        // not data. Only `text` (the parse substrate) drops it — `physical`
+        // stays raw, so a rewrite records (and a revert restores) the
+        // original bytes.
+        if start == 0 {
+            if let Some(stripped) = text.strip_prefix('\u{feff}') {
+                text = stripped.to_string();
             }
         }
         out.push(LogicalLine {
@@ -1311,6 +1341,155 @@ mod tests {
         let outcome = revert_requirements(&entry_for(wiring), tmp.path(), true).await;
         assert!(outcome.success);
         assert_eq!(read_root(tmp.path()).await, wired, "dry run must not write");
+    }
+
+    /// pip decodes requirements files with `auto_decode` (utf-8-sig strips
+    /// the BOM) and uv strips it too — probed against pip 26.0 and uv
+    /// 0.11: both see a pin on a BOM'd first line. Missing it classifies
+    /// the package as absent, and the appended transitive wheel line gives
+    /// `pip install -r` a double requirement (or an unhashed-pin error in
+    /// the --require-hashes mode the wheel line switches on).
+    #[tokio::test]
+    async fn bom_first_line_pin_is_rewritten_not_duplicated() {
+        let original = "\u{feff}six==1.16.0\n";
+        let tmp = write_root(original).await;
+        let wiring = wire_requirements(tmp.path(), "six", "1.16.0", REL_WHEEL, SHA)
+            .await
+            .unwrap();
+        assert_eq!(wiring.len(), 1);
+        assert_eq!(
+            wiring[0].action,
+            WiringAction::Rewritten,
+            "the BOM'd pin must be rewritten in place, not duplicated"
+        );
+        assert_eq!(read_root(tmp.path()).await, format!("{}\n", expected_line()));
+
+        // The BOM travels inside the replaced physical line's record, so
+        // the revert is byte-identical.
+        let outcome = revert_requirements(&entry_for(wiring), tmp.path(), false).await;
+        assert!(outcome.success);
+        assert_eq!(
+            read_root(tmp.path()).await,
+            original,
+            "byte-identical revert restores the BOM"
+        );
+    }
+
+    /// pip's optparse accepts the attached short form `-rdev.txt` (no
+    /// space) — probed against pip 26.0. Not following it hides the pin,
+    /// and the transitive line appended at the root EOF gives pip a double
+    /// requirement. (uv 0.11 rejects the spelling outright, so such a file
+    /// is pip-only either way.)
+    #[tokio::test]
+    async fn attached_short_form_include_is_followed() {
+        let tmp = write_root("-rdev.txt\n").await;
+        tokio::fs::write(tmp.path().join("dev.txt"), "six==1.16.0\n")
+            .await
+            .unwrap();
+        let wiring = wire_requirements(tmp.path(), "six", "1.16.0", REL_WHEEL, SHA)
+            .await
+            .unwrap();
+        assert_eq!(wiring.len(), 1);
+        assert_eq!(wiring[0].file, "dev.txt");
+        assert_eq!(
+            read_root(tmp.path()).await,
+            "-rdev.txt\n",
+            "root untouched — no duplicate appended"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(tmp.path().join("dev.txt"))
+                .await
+                .unwrap(),
+            format!("{}\n", expected_line())
+        );
+    }
+
+    /// mkfifo(2) directly rather than shelling out to the `mkfifo` binary —
+    /// same helper as the pypi.rs / pypi_pdm.rs FIFO tests: fork/exec flakes
+    /// under heavy parallel load and the syscall needs no process at all.
+    #[cfg(unix)]
+    fn mkfifo(path: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+        let c_path =
+            std::ffi::CString::new(path.as_os_str().as_bytes()).expect("fifo path has no NUL");
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
+        assert_eq!(
+            rc,
+            0,
+            "mkfifo(2) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    /// A FIFO planted as `requirements.txt` (or an include) must not wedge
+    /// wire or revert: `detect_pypi_flavor`'s routing probe is metadata-only
+    /// (a FIFO stats fine), so this module's raw `read_to_string` open(2) is
+    /// the FIRST open — it waits for a writer that never comes, wedging
+    /// every requirements-project vendor run (and `vendor --revert`)
+    /// indefinitely. Same `open_regular_file` guard class as the sibling
+    /// vendor backends.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fifo_requirements_does_not_wedge_wire_or_revert() {
+        // On timeout the open is wedged in a `spawn_blocking` thread that
+        // the runtime waits for on shutdown; connect a writer to release
+        // it so the test can FAIL instead of hanging the whole suite.
+        let deadline = std::time::Duration::from_secs(5);
+
+        // FIFO as the root file: the wire must refuse fast.
+        let tmp = tempfile::tempdir().unwrap();
+        let fifo = tmp.path().join("requirements.txt");
+        mkfifo(&fifo);
+        let Ok(res) = tokio::time::timeout(
+            deadline,
+            wire_requirements(tmp.path(), "six", "1.16.0", REL_WHEEL, SHA),
+        )
+        .await
+        else {
+            let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
+            panic!("wire_requirements must complete promptly with a FIFO requirements.txt");
+        };
+        assert_eq!(res.unwrap_err().0, "pypi_no_requirements");
+
+        // FIFO as an include: skipped like any unreadable include; the root
+        // pin still rewrites promptly.
+        let tmp = write_root("-r inc.txt\nsix==1.16.0\n").await;
+        let inc = tmp.path().join("inc.txt");
+        mkfifo(&inc);
+        let Ok(res) = tokio::time::timeout(
+            deadline,
+            wire_requirements(tmp.path(), "six", "1.16.0", REL_WHEEL, SHA),
+        )
+        .await
+        else {
+            let _ = std::fs::OpenOptions::new().write(true).open(&inc);
+            panic!("a FIFO include must be skipped, not wedge the wire");
+        };
+        assert_eq!(res.unwrap().len(), 1);
+
+        // Revert reads the wired file itself: must fail fast, not wedge.
+        let tmp = write_root("six==1.16.0\n").await;
+        let wiring = wire_requirements(tmp.path(), "six", "1.16.0", REL_WHEEL, SHA)
+            .await
+            .unwrap();
+        let path = tmp.path().join("requirements.txt");
+        tokio::fs::remove_file(&path).await.unwrap();
+        mkfifo(&path);
+        let Ok(outcome) = tokio::time::timeout(
+            deadline,
+            revert_requirements(&entry_for(wiring), tmp.path(), false),
+        )
+        .await
+        else {
+            let _ = std::fs::OpenOptions::new().write(true).open(&path);
+            panic!("revert_requirements must complete promptly with a FIFO requirements.txt");
+        };
+        assert!(!outcome.success, "FIFO requirements must fail the revert");
+        assert!(
+            outcome.error.as_deref().unwrap_or("").contains("cannot read"),
+            "{:?}",
+            outcome.error
+        );
     }
 
     /// Two identical pins: each record must splice back its OWN original

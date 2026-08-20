@@ -201,6 +201,20 @@ async fn edit_gemfile_remove(gemfile: &Path, dry_run: bool) -> GemEditResult {
             Err(e) => return Err(e.to_string()),
         };
         match gemfile_remove(&content) {
+            // Marker present but no removable form matched: the managed block
+            // was mutated (an edit inside it, a stripped final newline). The
+            // `plugin` directive may still be live, so this must be an Error —
+            // `remove_plugin_directive_at` early-returns on it, keeping the
+            // plugin dir the directive references. Reporting "not configured"
+            // instead lets the dir be deleted and every later `bundle install`
+            // exits 13 on the dangling `path:` source.
+            None if is_plugin_directive_present(&content) => Err(format!(
+                "the socket-patch managed block in {} has been edited and cannot \
+                 be removed automatically; delete the lines from \
+                 `{MANAGED_MARKER}` through `# <<< socket-patch:managed <<<` by \
+                 hand, then re-run `socket-patch setup --remove`",
+                gemfile.display()
+            )),
             None => Ok(false),
             Some(new) => {
                 if !dry_run {
@@ -790,6 +804,47 @@ mod tests {
             super::super::plugin_files_present(root).await,
             "the plugin files must SURVIVE a failed un-wire — deleting them while \
              the directive remains breaks every `bundle install` (exit 13)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_remove_keeps_plugin_files_when_managed_block_is_unmatchable() {
+        // A benign mutation — the Gemfile lost its final newline (an editor
+        // without insert-final-newline, a trailing-whitespace trimmer) — leaves
+        // the marker present but every removable block form unmatchable, so the
+        // Gemfile edit removes nothing. The live `plugin ... path:` directive
+        // is still in the Gemfile, so the plugin dir must SURVIVE: deleting it
+        // breaks every later `bundle install` (exit 13), and the user must get
+        // an error naming the manual remedy, not a "not_configured" no-op.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("Gemfile"), GEMFILE).await.unwrap();
+        let project = super::super::discover_bundler_project(root).await.unwrap();
+        assert!(add_plugin_directive(&project, false)
+            .await
+            .iter()
+            .all(|r| r.status == GemSetupStatus::Updated));
+        let content = fs::read_to_string(root.join("Gemfile")).await.unwrap();
+        fs::write(root.join("Gemfile"), content.strip_suffix('\n').unwrap())
+            .await
+            .unwrap();
+
+        let results = remove_plugin_directive_at(&project, None, false).await;
+
+        assert!(
+            is_plugin_directive_present(&fs::read_to_string(root.join("Gemfile")).await.unwrap()),
+            "precondition: the directive is still in the Gemfile"
+        );
+        assert!(
+            results
+                .iter()
+                .any(|r| r.kind == "gemfile" && r.status == GemSetupStatus::Error),
+            "an unmatchable managed block must surface as a gemfile error: {results:?}"
+        );
+        assert!(
+            super::super::plugin_files_present(root).await,
+            "the plugin files must SURVIVE while the directive remains in the \
+             Gemfile — deleting them breaks every `bundle install` (exit 13)"
         );
     }
 

@@ -11,12 +11,9 @@ use crate::patch::apply::PatchSources;
 /// * `File` — per-file blobs (legacy, largest, always applicable).
 /// * `Diff` — per-patch tar.gz of bsdiff deltas (smallest, only useful
 ///   when the original file is on disk).
-/// * `Package` — per-patch tar.gz of patched files (mid-size, applicable
-///   even when the original file is missing).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DownloadMode {
     Diff,
-    Package,
     File,
 }
 
@@ -26,7 +23,6 @@ impl DownloadMode {
     pub fn as_tag(&self) -> &'static str {
         match self {
             DownloadMode::Diff => "diff",
-            DownloadMode::Package => "package",
             DownloadMode::File => "file",
         }
     }
@@ -35,10 +31,12 @@ impl DownloadMode {
     pub fn parse(s: &str) -> Result<Self, String> {
         match s.to_ascii_lowercase().as_str() {
             "diff" => Ok(DownloadMode::Diff),
-            "package" => Ok(DownloadMode::Package),
+            // Removed: no deployed server ever served its GET archive route,
+            // so every fetch failed and fell back to per-file blobs.
+            "package" => Err("download mode 'package' was removed; use diff or file".to_string()),
             "file" | "blob" => Ok(DownloadMode::File),
             other => Err(format!(
-                "unknown download mode '{}'. Expected diff, package, or file.",
+                "unknown download mode '{}'. Expected diff or file.",
                 other
             )),
         }
@@ -237,14 +235,12 @@ pub async fn get_missing_archives(
 /// * [`DownloadMode::File`] delegates to [`fetch_missing_blobs`].
 /// * [`DownloadMode::Diff`] downloads each missing `<uuid>.tar.gz` into
 ///   `sources.diffs_path` via [`ApiClient::fetch_diff`].
-/// * [`DownloadMode::Package`] does the same with `sources.packages_path`
-///   and [`ApiClient::fetch_package`].
 ///
 /// Returns a [`FetchMissingBlobsResult`] in which each `BlobFetchResult`'s
-/// `hash` field carries the patch UUID (not a blob hash) for diff and
-/// package modes. A `sources.packages_path` / `sources.diffs_path` of
-/// `None` while requesting that mode yields an immediate empty result —
-/// the caller is expected to fall back to a different mode in that case.
+/// `hash` field carries the patch UUID (not a blob hash) for diff mode. A
+/// `sources.diffs_path` of `None` while requesting diff mode yields an
+/// immediate empty result — the caller is expected to fall back to a
+/// different mode in that case.
 pub async fn fetch_missing_sources(
     manifest: &PatchManifest,
     sources: &PatchSources<'_>,
@@ -252,29 +248,21 @@ pub async fn fetch_missing_sources(
     client: &ApiClient,
     on_progress: Option<&OnProgress>,
 ) -> FetchMissingBlobsResult {
-    let (dir, kind) = match mode {
+    let dir = match mode {
         DownloadMode::File => {
             return fetch_missing_blobs(manifest, sources.blobs_path, client, on_progress).await
         }
-        DownloadMode::Diff => (sources.diffs_path, ArchiveKind::Diff),
-        DownloadMode::Package => (sources.packages_path, ArchiveKind::Package),
+        DownloadMode::Diff => sources.diffs_path,
     };
     match dir {
-        Some(dir) => fetch_missing_archives_inner(manifest, dir, kind, client, on_progress).await,
+        Some(dir) => fetch_missing_diff_archives(manifest, dir, client, on_progress).await,
         None => FetchMissingBlobsResult::default(),
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-enum ArchiveKind {
-    Diff,
-    Package,
-}
-
-async fn fetch_missing_archives_inner(
+async fn fetch_missing_diff_archives(
     manifest: &PatchManifest,
     archives_dir: &Path,
-    kind: ArchiveKind,
     client: &ApiClient,
     on_progress: Option<&OnProgress>,
 ) -> FetchMissingBlobsResult {
@@ -301,10 +289,7 @@ async fn fetch_missing_archives_inner(
             cb(uuid, i + 1, total);
         }
 
-        let fetch_result = match kind {
-            ArchiveKind::Diff => client.fetch_diff(uuid).await,
-            ArchiveKind::Package => client.fetch_package(uuid).await,
-        };
+        let fetch_result = client.fetch_diff(uuid).await;
 
         match fetch_result {
             Ok(Some(data)) => {
@@ -332,13 +317,7 @@ async fn fetch_missing_archives_inner(
                 results.push(BlobFetchResult {
                     hash: uuid.clone(),
                     success: false,
-                    error: Some(format!(
-                        "{} archive not found on server",
-                        match kind {
-                            ArchiveKind::Diff => "Diff",
-                            ArchiveKind::Package => "Package",
-                        }
-                    )),
+                    error: Some("Diff archive not found on server".to_string()),
                 });
                 failed += 1;
             }
@@ -812,10 +791,10 @@ mod tests {
     fn test_download_mode_parse() {
         assert_eq!(DownloadMode::parse("diff").unwrap(), DownloadMode::Diff);
         assert_eq!(DownloadMode::parse("DIFF").unwrap(), DownloadMode::Diff);
-        assert_eq!(
-            DownloadMode::parse("package").unwrap(),
-            DownloadMode::Package
-        );
+        // `package` was removed; the error names the surviving modes.
+        assert!(DownloadMode::parse("package")
+            .unwrap_err()
+            .contains("removed"));
         assert_eq!(DownloadMode::parse("file").unwrap(), DownloadMode::File);
         // `blob` aliases to `file` so users can think in pre-2.2 terms.
         assert_eq!(DownloadMode::parse("blob").unwrap(), DownloadMode::File);
@@ -825,7 +804,6 @@ mod tests {
     #[test]
     fn test_download_mode_tag() {
         assert_eq!(DownloadMode::Diff.as_tag(), "diff");
-        assert_eq!(DownloadMode::Package.as_tag(), "package");
         assert_eq!(DownloadMode::File.as_tag(), "file");
     }
 
@@ -891,7 +869,7 @@ mod tests {
     #[tokio::test]
     async fn test_fetch_missing_sources_unsupported_mode_returns_empty() {
         // Asking for Diff mode without a diffs_path yields an empty result
-        // rather than panicking. Same for Package mode.
+        // rather than panicking.
         let dir = tempfile::tempdir().unwrap();
         let blobs = dir.path().join("blobs");
         tokio::fs::create_dir_all(&blobs).await.unwrap();
@@ -905,10 +883,6 @@ mod tests {
         assert_eq!(res.total, 0);
         assert_eq!(res.downloaded, 0);
         assert_eq!(res.failed, 0);
-
-        let res =
-            fetch_missing_sources(&manifest, &sources, DownloadMode::Package, &client, None).await;
-        assert_eq!(res.total, 0);
     }
 
     // ── Regression: skipped accounting in format ─────────────────────

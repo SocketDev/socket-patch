@@ -144,6 +144,12 @@ pub fn parse_pom_group_artifact_version(content: &str) -> Option<(String, String
         "distributionManagement",
         "repositories",
         "pluginRepositories",
+        // Free-form (xs:any): a property may be named exactly `version`/
+        // `groupId`/`artifactId` (Maven warns but permits it) and would
+        // otherwise win first-match extraction over the project's own
+        // coordinates. Project coordinates never live in <properties>,
+        // so skipping it can only prevent leaks.
+        "properties",
     ];
 
     for line in content.lines() {
@@ -1013,6 +1019,32 @@ mod tests {
     <plugins><plugin>
       <groupId>org.leak</groupId>
       <version>9.9.9</version></plugin></plugins></build>
+  <version>1.0.0</version>
+</project>"#;
+        let (g, a, v) = parse_pom_group_artifact_version(content).unwrap();
+        assert_eq!(g, "com.example");
+        assert_eq!(a, "my-app");
+        assert_eq!(v, "1.0.0");
+    }
+
+    #[test]
+    fn test_parse_pom_property_named_coordinate_does_not_leak() {
+        // REGRESSION: <properties> is free-form (xs:any), so a property named
+        // exactly `version`/`groupId`/`artifactId` is schema-valid — Maven
+        // warns about shadowing the built-ins but permits it, and such POMs
+        // exist among the third-party artifacts a ~/.m2 scan walks. The
+        // property matched the coordinate needle before the project's own
+        // tag, leaking a WRONG Some (here 9.9.9 / org.leak) — which, unlike
+        // the parser's None failures, suppresses the directory-path fallback
+        // rescue in scan_maven_repo.
+        let content = r#"<project>
+  <artifactId>my-app</artifactId>
+  <properties>
+    <groupId>org.leak</groupId>
+    <artifactId>leak</artifactId>
+    <version>9.9.9</version>
+  </properties>
+  <groupId>com.example</groupId>
   <version>1.0.0</version>
 </project>"#;
         let (g, a, v) = parse_pom_group_artifact_version(content).unwrap();

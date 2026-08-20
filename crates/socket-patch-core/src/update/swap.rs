@@ -45,12 +45,30 @@ pub fn acquire_update_lock() -> Result<Option<UpdateLock>, UpdateError> {
     std::fs::create_dir_all(&dir)
         .map_err(|e| UpdateError::SwapFailed(format!("cannot create {}: {e}", dir.display())))?;
     let path = dir.join("update.lock");
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).truncate(false).write(true);
+    // A FIFO planted at the lock path would wedge a plain O_WRONLY open(2)
+    // forever waiting for a reader; O_NONBLOCK makes it return immediately
+    // (ENXIO, or a handle the is_file check below rejects). A no-op for the
+    // regular file this normally is — the fd is only ever flock(2)ed, never
+    // read or written. Same guard as state.rs's read_state_bytes.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options
         .open(&path)
         .map_err(|e| UpdateError::SwapFailed(format!("cannot open {}: {e}", path.display())))?;
+    let metadata = file
+        .metadata()
+        .map_err(|e| UpdateError::SwapFailed(format!("cannot stat {}: {e}", path.display())))?;
+    if !metadata.is_file() {
+        return Err(UpdateError::SwapFailed(format!(
+            "update lock {} is not a regular file; remove it and retry",
+            path.display()
+        )));
+    }
     match file.try_lock_exclusive() {
         Ok(()) => Ok(Some(UpdateLock { _file: file })),
         Err(_) => Err(UpdateError::InProgress),
@@ -232,6 +250,63 @@ mod tests {
         std::fs::write(&staged, b"new").unwrap();
         let err = swap_binary(&staged, &tmp.path().join("gone")).unwrap_err();
         assert!(err.to_string().contains("stat"), "{err}");
+    }
+
+    /// mkfifo(2) directly, not the /usr/bin/mkfifo binary: spawning a child
+    /// flakes under heavy parallel load (fork/exec starvation) and the
+    /// syscall needs no process at all.
+    #[cfg(unix)]
+    fn mkfifo(path: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+        let c_path =
+            std::ffi::CString::new(path.as_os_str().as_bytes()).expect("fifo path has no NUL");
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
+        assert_eq!(
+            rc,
+            0,
+            "mkfifo(2) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    /// A FIFO planted at the lock path must not wedge the updater: a plain
+    /// `O_WRONLY` open(2) of a FIFO waits forever for a reader that never
+    /// comes, hanging `--update` with no output before it does anything.
+    /// Same class as the `read_state_bytes` guard one file over in
+    /// state.rs — same directory, even.
+    #[cfg(unix)]
+    #[test]
+    #[serial(update_state_dir_env)]
+    fn update_lock_fifo_lock_file_errors_instead_of_wedging() {
+        let tmp = tempfile::tempdir().unwrap();
+        let prev = std::env::var_os("SOCKET_UPDATE_STATE_DIR");
+        std::env::set_var("SOCKET_UPDATE_STATE_DIR", tmp.path());
+        let fifo = tmp.path().join("update.lock");
+        mkfifo(&fifo);
+
+        // acquire_update_lock is sync, so bound it with a helper thread +
+        // timeout.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(acquire_update_lock());
+        });
+        let result = rx.recv_timeout(std::time::Duration::from_secs(5));
+        match prev {
+            Some(v) => std::env::set_var("SOCKET_UPDATE_STATE_DIR", v),
+            None => std::env::remove_var("SOCKET_UPDATE_STATE_DIR"),
+        }
+        let Ok(acquired) = result else {
+            // The open is wedged in the helper thread; connect a reader to
+            // release it so the test can FAIL instead of hanging the suite.
+            let _ = std::fs::File::open(&fifo);
+            panic!("acquire_update_lock must complete promptly with a FIFO lock file");
+        };
+        match acquired {
+            Err(UpdateError::SwapFailed(_)) => {}
+            Err(other) => panic!("expected SwapFailed for a non-regular lock file, got: {other}"),
+            Ok(Some(_)) => panic!("a FIFO lock path must not yield a lock"),
+            Ok(None) => panic!("a FIFO lock path must not silently degrade to unlocked"),
+        }
     }
 
     #[test]

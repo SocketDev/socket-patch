@@ -319,12 +319,18 @@ impl Default for VendorState {
 ///     the fresh entry verbatim would destroy the first run's originals;
 ///   * preserves the go-patch-takeover flag.
 ///
-/// The union + meta merge are scoped to a re-vendor of the SAME patch
-/// generation (`prev.uuid == entry.uuid`): a new-uuid re-vendor rewires every
-/// surface fresh under the new uuid, so the prior uuid's records name nothing
-/// the new entry left behind and carrying them forward would only dangle.
-/// The original-fill, lock originals, and takeover flag are safe
-/// (identity-matched) either way and run unconditionally.
+/// The wiring UNION is scoped to a re-vendor of the SAME patch generation
+/// (`prev.uuid == entry.uuid`): a new-uuid re-vendor rewires every surface
+/// fresh under the new uuid, so the prior uuid's records name nothing the
+/// new entry left behind and carrying them forward would only dangle.
+/// Everything else — the original-fill, lock originals, takeover flag, and
+/// the pnpm "created this table/file/section" facts (which describe who
+/// created a surface, not which generation wired it) — is generation-
+/// independent and runs unconditionally: a NEW-uuid re-vendor finds every
+/// surface already present and records all-false creation flags, and
+/// dropping the prior entry's flags would make `--revert` leave the
+/// vendor-created pnpm-workspace.yaml and emptied package.json tables
+/// behind.
 pub fn carry_forward_wiring(prev: &VendorEntry, entry: &mut VendorEntry) {
     entry.took_over_go_patches = entry.took_over_go_patches || prev.took_over_go_patches;
     if entry.lock.is_none() {
@@ -346,6 +352,18 @@ pub fn carry_forward_wiring(prev: &VendorEntry, entry: &mut VendorEntry) {
         }
     }
 
+    if let Some(prev_meta) = prev.pnpm.as_ref() {
+        match entry.pnpm.as_mut() {
+            Some(meta) => {
+                meta.created_overrides_table |= prev_meta.created_overrides_table;
+                meta.created_pnpm_table |= prev_meta.created_pnpm_table;
+                meta.created_workspace_file |= prev_meta.created_workspace_file;
+                meta.created_workspace_overrides |= prev_meta.created_workspace_overrides;
+            }
+            None => entry.pnpm = Some(prev_meta.clone()),
+        }
+    }
+
     if prev.uuid != entry.uuid {
         return;
     }
@@ -357,18 +375,6 @@ pub fn carry_forward_wiring(prev: &VendorEntry, entry: &mut VendorEntry) {
             .any(|r| r.file == prev_rec.file && r.kind == prev_rec.kind && r.key == prev_rec.key);
         if !present {
             entry.wiring.push(prev_rec.clone());
-        }
-    }
-
-    if let Some(prev_meta) = prev.pnpm.as_ref() {
-        match entry.pnpm.as_mut() {
-            Some(meta) => {
-                meta.created_overrides_table |= prev_meta.created_overrides_table;
-                meta.created_pnpm_table |= prev_meta.created_pnpm_table;
-                meta.created_workspace_file |= prev_meta.created_workspace_file;
-                meta.created_workspace_overrides |= prev_meta.created_workspace_overrides;
-            }
-            None => entry.pnpm = Some(prev_meta.clone()),
         }
     }
 }
@@ -401,7 +407,7 @@ fn state_path(project_root: &Path) -> PathBuf {
 /// data by construction, so nothing is guessed.
 pub async fn load_state(project_root: &Path) -> std::io::Result<VendorState> {
     let path = state_path(project_root);
-    match tokio::fs::read(&path).await {
+    match read_state_bytes(&path).await {
         Ok(bytes) => serde_json::from_slice(&bytes).or_else(|e| {
             if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) {
                 if value.get("mode").is_some() && value.get("entries").is_none() {
@@ -416,6 +422,20 @@ pub async fn load_state(project_root: &Path) -> std::io::Result<VendorState> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(VendorState::new()),
         Err(e) => Err(e),
     }
+}
+
+/// Read the ledger bytes from the (untrusted) project tree. Opens via
+/// [`open_regular_file`](crate::utils::fs::open_regular_file) — non-blocking
+/// on Unix, rejecting FIFOs/devices/directories — so a planted special file
+/// fails loudly instead of wedging every vendor-adjacent command (`vendor`,
+/// `remove`, `repair`) on a FIFO `open(2)` that waits forever for a writer;
+/// same guard as the sibling redirect ledger.
+async fn read_state_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.read_to_end(&mut bytes).await?;
+    Ok(bytes)
 }
 
 /// Persist the ledger atomically with sorted keys + 2-space indent + trailing
@@ -784,6 +804,88 @@ mod tests {
         assert_eq!(back, PnpmMeta::default());
         let back: PipenvMeta = serde_json::from_str("{}").unwrap();
         assert!(back.sections.is_empty());
+    }
+
+    /// mkfifo(2) directly — `mkfifo` the binary may be absent, and the
+    /// syscall needs no process at all.
+    #[cfg(unix)]
+    fn mkfifo(path: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+        let c_path =
+            std::ffi::CString::new(path.as_os_str().as_bytes()).expect("fifo path has no NUL");
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
+        assert_eq!(
+            rc,
+            0,
+            "mkfifo(2) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    /// A FIFO planted at the ledger path must not wedge the loader: a plain
+    /// `tokio::fs::read` open(2)s the FIFO with `O_RDONLY` and waits for a
+    /// writer that never comes, hanging every vendor-adjacent command
+    /// (`vendor`, `remove`, `repair`) with no error and no timeout. Same
+    /// class as the `open_regular_file` guard on the sibling redirect
+    /// ledger. The non-regular file is a loud fail-closed error, never an
+    /// empty ledger.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn load_fifo_state_fails_fast_instead_of_wedging() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".socket/vendor");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let fifo = dir.join("state.json");
+        mkfifo(&fifo);
+
+        // On timeout the open is wedged in a `spawn_blocking` thread that
+        // the runtime waits for on shutdown; connect a writer to release
+        // it so the test can FAIL instead of hanging the whole suite.
+        let deadline = std::time::Duration::from_secs(5);
+        let Ok(result) = tokio::time::timeout(deadline, load_state(tmp.path())).await else {
+            let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
+            panic!("load_state must complete promptly with a FIFO ledger");
+        };
+        result.unwrap_err();
+        // The pure load never mutates the project — the FIFO stays put.
+        assert!(fifo.exists());
+    }
+
+    /// "Vendor created this table/file/section" is a historical fact
+    /// independent of the patch generation: a NEW-uuid re-vendor finds every
+    /// surface already present (created by the FIRST vendoring) and records
+    /// all-false creation flags, so dropping the prior entry's flags would
+    /// make `--revert` leave the vendor-created pnpm-workspace.yaml and the
+    /// emptied package.json `pnpm`/`overrides` tables behind. The OR-merge
+    /// must survive the uuid change (unlike the wiring union, nothing here
+    /// can dangle).
+    #[test]
+    fn carry_forward_merges_pnpm_created_flags_across_uuid_generations() {
+        let mut prev = sample_entry();
+        prev.pnpm = Some(PnpmMeta {
+            created_overrides_table: true,
+            created_pnpm_table: true,
+            created_workspace_file: true,
+            created_workspace_overrides: false,
+        });
+
+        // The re-vendor under a NEW uuid probes the surfaces as pre-existing.
+        let mut entry = sample_entry();
+        entry.uuid = "0a1b2c3d-4e5f-6a7b-8c9d-0e1f2a3b4c5d".into();
+        entry.pnpm = Some(PnpmMeta::default());
+
+        carry_forward_wiring(&prev, &mut entry);
+        let meta = entry.pnpm.as_ref().unwrap();
+        assert!(
+            meta.created_overrides_table && meta.created_pnpm_table && meta.created_workspace_file,
+            "creation facts must survive a new-uuid re-vendor: {meta:?}"
+        );
+
+        // And a fresh entry with NO meta inherits the prior one wholesale.
+        let mut entry = sample_entry();
+        entry.uuid = "0a1b2c3d-4e5f-6a7b-8c9d-0e1f2a3b4c5d".into();
+        carry_forward_wiring(&prev, &mut entry);
+        assert_eq!(entry.pnpm, prev.pnpm, "absent meta inherits the prior");
     }
 
     #[tokio::test]

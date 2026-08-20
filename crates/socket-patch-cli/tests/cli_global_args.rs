@@ -55,7 +55,7 @@ const DUMMY_IDENTIFIER: &str = "80630680-4da6-45f9-bba8-b888e0ffd58c";
 /// `GlobalArgs` field. Parsing-succeeds-only (`is_ok`) is not enough: it
 /// would stay green if a flag were silently dropped, bound to the wrong
 /// field, or mapped to a no-op. Each value is deliberately chosen to differ
-/// from the field's default (e.g. `--download-mode package`, not `diff`) so
+/// from the field's default (e.g. `--download-mode file`, not `diff`) so
 /// the assertion can distinguish "bound" from "left at default".
 fn global_flag_cases() -> Vec<(&'static str, Option<&'static str>, fn(&GlobalArgs))> {
     vec![
@@ -83,8 +83,8 @@ fn global_flag_cases() -> Vec<(&'static str, Option<&'static str>, fn(&GlobalArg
                 Some(&["npm".to_string(), "pypi".to_string()][..])
             )
         }),
-        ("--download-mode", Some("package"), |c| {
-            assert_eq!(c.download_mode, "package")
+        ("--download-mode", Some("file"), |c| {
+            assert_eq!(c.download_mode, "file")
         }),
         ("--vendor-source", Some("service"), |c| {
             assert_eq!(c.vendor_source, "service")
@@ -435,7 +435,7 @@ fn env_vars_populate_global_args() {
         ("SOCKET_ORG_SLUG", "env-org"),
         ("SOCKET_PROXY_URL", "https://env-proxy.example.com"),
         ("SOCKET_ECOSYSTEMS", "npm,gem"),
-        ("SOCKET_DOWNLOAD_MODE", "package"),
+        ("SOCKET_DOWNLOAD_MODE", "file"),
         ("SOCKET_VENDOR_SOURCE", "service"),
         ("SOCKET_VENDOR_URL", "https://env-vendor.example.com"),
         ("SOCKET_PATCH_SERVER_URL", "http://localhost:4026"),
@@ -482,7 +482,7 @@ fn env_vars_populate_global_args() {
             args.common.ecosystems.as_deref(),
             Some(&["npm".to_string(), "gem".to_string()][..])
         );
-        assert_eq!(args.common.download_mode, "package");
+        assert_eq!(args.common.download_mode, "file");
         assert_eq!(args.common.vendor_source, "service");
         assert_eq!(
             args.common.vendor_url.as_deref(),

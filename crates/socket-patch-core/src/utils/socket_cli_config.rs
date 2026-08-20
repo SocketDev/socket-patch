@@ -164,6 +164,38 @@ fn parse_config_bytes(raw: &[u8]) -> Result<SocketCliConfig, String> {
     })
 }
 
+/// Read the config bytes, requiring a regular file — the sync twin of
+/// [`open_regular_file`](crate::utils::fs::open_regular_file). `load()` runs
+/// synchronously during API-client construction, and a plain `open(2)` of a
+/// FIFO planted at the config path waits forever for a writer, wedging every
+/// networked command before it can do any work. `O_NONBLOCK` makes the open
+/// return immediately (it has no effect on regular-file reads); the
+/// handle-based `is_file` check then rejects FIFOs/devices/directories so
+/// the caller warns and treats the file as absent.
+fn read_regular_file(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    #[cfg(unix)]
+    let mut file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(path)?
+    };
+    #[cfg(not(unix))]
+    let mut file = std::fs::File::open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
 /// Read the config from disk: the first candidate whose file exists wins.
 /// `None` covers every failure path; a present-but-unusable file warns and
 /// stops the probe — falling through to a stale lower-priority file would
@@ -171,7 +203,7 @@ fn parse_config_bytes(raw: &[u8]) -> Result<SocketCliConfig, String> {
 /// fires once per process.)
 fn read_from_disk() -> Option<SocketCliConfig> {
     for path in config_json_paths() {
-        let raw = match std::fs::read(&path) {
+        let raw = match read_regular_file(&path) {
             Ok(raw) => raw,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => {
@@ -407,6 +439,64 @@ mod tests {
         with_env(&[("XDG_DATA_HOME", None), ("HOME", None)], || {
             assert_eq!(config_json_paths(), Vec::<PathBuf>::new());
         });
+    }
+
+    #[cfg(unix)]
+    fn mkfifo(path: &std::path::Path) {
+        use std::os::unix::ffi::OsStrExt;
+        let c_path =
+            std::ffi::CString::new(path.as_os_str().as_bytes()).expect("fifo path has no NUL");
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
+        assert_eq!(
+            rc,
+            0,
+            "mkfifo(2) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    /// A FIFO planted at the config path must not wedge the reader: a plain
+    /// `std::fs::read` open(2)s the FIFO with `O_RDONLY` and waits forever
+    /// for a writer — and `load()` runs synchronously during API-client
+    /// construction, so one special file in the data dir hangs every
+    /// networked command with no output. Contract: warn and treat as
+    /// absent, like any other present-but-unusable file. Same class as the
+    /// guarded reads in update/state.rs and redirect/state.rs.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn fifo_config_file_is_ignored_instead_of_wedging() {
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = tmp.path().join("socket").join("settings");
+        std::fs::create_dir_all(&settings).unwrap();
+        let fifo = settings.join("config.json");
+        mkfifo(&fifo);
+
+        let saved_xdg = std::env::var_os("XDG_DATA_HOME");
+        std::env::set_var("XDG_DATA_HOME", tmp.path());
+
+        // read_from_disk is sync, so bound it with a helper thread + timeout.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(read_from_disk());
+        });
+        let result = rx.recv_timeout(std::time::Duration::from_secs(5));
+        match saved_xdg {
+            Some(v) => std::env::set_var("XDG_DATA_HOME", v),
+            None => std::env::remove_var("XDG_DATA_HOME"),
+        }
+        let Ok(loaded) = result else {
+            // The open is wedged in the helper thread; connect a writer to
+            // release it so the test can FAIL instead of hanging the suite.
+            let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
+            panic!("read_from_disk must complete promptly with a FIFO config file");
+        };
+        assert_eq!(
+            loaded, None,
+            "a non-regular config file is treated as absent"
+        );
+        // The reader never writes: the FIFO must survive untouched.
+        assert!(fifo.exists());
     }
 
     #[test]

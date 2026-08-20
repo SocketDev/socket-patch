@@ -136,6 +136,7 @@ pub async fn fetch_and_stage(
 /// `pub(crate)` so the composer service-download path can extract a downloaded
 /// dist zip into the vendor copy dir (`strip_first` = drop the top-level dir).
 pub(crate) fn extract_zip(bytes: &[u8], dest: &Path, strip_first: bool) -> Result<(), String> {
+    use std::io::Read as _;
     let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
         .map_err(|e| format!("unreadable zip: {e}"))?;
     if archive.len() > MAX_ENTRIES {
@@ -165,13 +166,13 @@ pub(crate) fn extract_zip(bytes: &[u8], dest: &Path, strip_first: bool) -> Resul
                 raw.display()
             ));
         }
-        if file.size() > MAX_ENTRY_BYTES {
+        let declared = file.size();
+        if declared > MAX_ENTRY_BYTES {
             return Err(format!(
-                "zip entry `{rel_str}` is {} bytes (cap {MAX_ENTRY_BYTES})",
-                file.size()
+                "zip entry `{rel_str}` is {declared} bytes (cap {MAX_ENTRY_BYTES})"
             ));
         }
-        total += file.size();
+        total += declared;
         if total > MAX_TOTAL_DECOMPRESSED_BYTES {
             return Err(format!(
                 "zip decompresses past the {MAX_TOTAL_DECOMPRESSED_BYTES}-byte cap"
@@ -184,8 +185,18 @@ pub(crate) fn extract_zip(bytes: &[u8], dest: &Path, strip_first: bool) -> Resul
         }
         let mut out = std::fs::File::create(&target)
             .map_err(|e| format!("cannot create {}: {e}", target.display()))?;
-        std::io::copy(&mut file, &mut out)
+        // The declared size is header data a crafted zip can understate (the
+        // zip crate does not bound an entry's read by it), so hold the caps
+        // against the ACTUAL decompressed bytes too: read at most declared+1
+        // and refuse on any mismatch.
+        let copied = std::io::copy(&mut (&mut file).take(declared + 1), &mut out)
             .map_err(|e| format!("cannot extract `{rel_str}`: {e}"))?;
+        if copied != declared {
+            return Err(format!(
+                "zip entry `{rel_str}` decompresses to {copied} bytes but declares {declared} \
+                 — refusing the artifact"
+            ));
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -280,7 +291,8 @@ async fn fetch_pypi(
 ) -> Result<FetchedPackage, FetchError> {
     let Some(url) = entry.resolved.clone() else {
         return Err(FetchError::Unverifiable(format!(
-            "the lockfile records no platform-independent wheel URL for {}@{} (only uv.lock              carries fetchable wheel resolutions today)",
+            "the lockfile records no platform-independent wheel URL for {}@{} (only uv.lock \
+             carries fetchable wheel resolutions today)",
             entry.name, entry.version
         )));
     };
@@ -356,7 +368,8 @@ fn goproxy_base() -> String {
         }
     }
     if let Ok(v) = std::env::var("GOPROXY") {
-        for part in v.split(',') {
+        // GOPROXY is a comma- OR pipe-separated list (go help goproxy).
+        for part in v.split([',', '|']) {
             let part = part.trim().trim_end_matches('/');
             if !part.is_empty() && part != "direct" && part != "off" {
                 return part.to_string();
@@ -399,13 +412,12 @@ fn go_h1_of_zip(bytes: &[u8]) -> Result<String, String> {
                 file.size()
             ));
         }
-        total += file.size();
-        if total > MAX_TOTAL_DECOMPRESSED_BYTES {
-            return Err(format!(
-                "module zip decompresses past the {MAX_TOTAL_DECOMPRESSED_BYTES}-byte cap"
-            ));
-        }
+        // The caps count ACTUAL decompressed bytes — the declared size is
+        // header data a crafted zip can understate (the zip crate does not
+        // bound an entry's read by it), and this hash runs on lockfile-fetch
+        // bytes before any other verifier.
         let mut hasher = Sha256::new();
+        let mut entry_bytes: u64 = 0;
         let mut buf = [0u8; 64 * 1024];
         loop {
             let n = file
@@ -414,7 +426,19 @@ fn go_h1_of_zip(bytes: &[u8]) -> Result<String, String> {
             if n == 0 {
                 break;
             }
+            entry_bytes += n as u64;
+            if entry_bytes > MAX_ENTRY_BYTES {
+                return Err(format!(
+                    "module zip entry `{name}` decompresses past the {MAX_ENTRY_BYTES}-byte cap"
+                ));
+            }
             hasher.update(&buf[..n]);
+        }
+        total += entry_bytes;
+        if total > MAX_TOTAL_DECOMPRESSED_BYTES {
+            return Err(format!(
+                "module zip decompresses past the {MAX_TOTAL_DECOMPRESSED_BYTES}-byte cap"
+            ));
         }
         files.push((name, hex::encode(hasher.finalize())));
     }
@@ -457,8 +481,13 @@ pub(crate) fn extract_zip_with_prefix(
     dest: &Path,
     prefix: &str,
 ) -> Result<(), String> {
+    use std::io::Read as _;
     let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
         .map_err(|e| format!("unreadable module zip: {e}"))?;
+    if archive.len() > MAX_ENTRIES {
+        return Err(format!("module zip exceeds {MAX_ENTRIES} entries"));
+    }
+    let mut total: u64 = 0;
     for i in 0..archive.len() {
         let mut file = archive
             .by_index(i)
@@ -477,6 +506,22 @@ pub(crate) fn extract_zip_with_prefix(
                 "module zip entry `{name}` escapes the extraction dir — refusing the artifact"
             ));
         }
+        // Bomb caps, same family as [`extract_zip`]: this path is reachable
+        // WITHOUT the cap-enforcing dirhash pre-pass (the service-download
+        // path when the service reports no `dirhashH1`), so it must bound
+        // itself.
+        let declared = file.size();
+        if declared > MAX_ENTRY_BYTES {
+            return Err(format!(
+                "module zip entry `{name}` is {declared} bytes (cap {MAX_ENTRY_BYTES})"
+            ));
+        }
+        total += declared;
+        if total > MAX_TOTAL_DECOMPRESSED_BYTES {
+            return Err(format!(
+                "module zip decompresses past the {MAX_TOTAL_DECOMPRESSED_BYTES}-byte cap"
+            ));
+        }
         let target = dest.join(rel);
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent)
@@ -484,7 +529,16 @@ pub(crate) fn extract_zip_with_prefix(
         }
         let mut out = std::fs::File::create(&target)
             .map_err(|e| format!("cannot create {}: {e}", target.display()))?;
-        std::io::copy(&mut file, &mut out).map_err(|e| format!("cannot extract `{rel}`: {e}"))?;
+        // Hold the caps against the ACTUAL decompressed bytes too — the
+        // declared size is header data a crafted zip can understate.
+        let copied = std::io::copy(&mut (&mut file).take(declared + 1), &mut out)
+            .map_err(|e| format!("cannot extract `{rel}`: {e}"))?;
+        if copied != declared {
+            return Err(format!(
+                "module zip entry `{name}` decompresses to {copied} bytes but declares \
+                 {declared} — refusing the artifact"
+            ));
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -545,6 +599,20 @@ async fn fetch_npm_inner(
     client: &reqwest::Client,
     verify: bool,
 ) -> Result<FetchedPackage, FetchError> {
+    // A foreign berry cacheKey is decidable from the lockfile alone: refuse
+    // BEFORE the download, keeping the Unverifiable no-network contract (and
+    // not spending a full tarball download on an entry we could never
+    // verify).
+    if verify {
+        if let LockIntegrity::BerryChecksum(expected) = &entry.integrity {
+            if !expected.starts_with("10c0/") {
+                return Err(FetchError::Unverifiable(format!(
+                    "yarn berry checksum `{expected}` uses a cacheKey other than 10c0; \
+                     the cache-zip recipe is not reproducible for it"
+                )));
+            }
+        }
+    }
     let url = entry
         .resolved
         .clone()
@@ -559,12 +627,6 @@ async fn fetch_npm_inner(
             // bytes (the same spike-pinned recipe the berry wiring uses) and
             // compare. Only cacheKey 10c0 (yarn 4 default) is reproducible.
             LockIntegrity::BerryChecksum(expected) => {
-                if !expected.starts_with("10c0/") {
-                    return Err(FetchError::Unverifiable(format!(
-                        "yarn berry checksum `{expected}` uses a cacheKey other than 10c0; \
-                         the cache-zip recipe is not reproducible for it"
-                    )));
-                }
                 let actual = super::berry_zip::berry_cache_checksum_10c0(&bytes, &entry.name)
                     .map_err(FetchError::Failed)?;
                 if &actual != expected {
@@ -609,9 +671,22 @@ pub async fn stage_local_artifact(
             "the vendor ledger records no sha256 for the artifact".to_string(),
         ));
     }
-    let bytes = tokio::fs::read(tgz_path)
-        .await
-        .map_err(|e| FetchError::Failed(format!("cannot read {}: {e}", tgz_path.display())))?;
+    // Guarded read (`open_regular_file`): a FIFO squatting at the committed
+    // artifact path must fail fast instead of wedging the fresh-clone
+    // re-vendor forever in an `open(2)` waiting for a writer — the caller's
+    // metadata probe passes for a FIFO, so this is the first open. Same
+    // guard class as the vendor lockfile reads.
+    let bytes = {
+        use tokio::io::AsyncReadExt as _;
+        let (mut file, metadata) = crate::utils::fs::open_regular_file(tgz_path)
+            .await
+            .map_err(|e| FetchError::Failed(format!("cannot read {}: {e}", tgz_path.display())))?;
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        file.read_to_end(&mut bytes)
+            .await
+            .map_err(|e| FetchError::Failed(format!("cannot read {}: {e}", tgz_path.display())))?;
+        bytes
+    };
     if bytes.len() as u64 > MAX_DOWNLOAD_BYTES {
         return Err(FetchError::Failed(format!(
             "{}: artifact exceeds the {MAX_DOWNLOAD_BYTES}-byte cap",
@@ -1577,6 +1652,180 @@ mod tests {
             Err(FetchError::Unverifiable(msg)) => assert!(msg.contains("wheel"), "{msg}"),
             other => panic!("expected Unverifiable, got {other:?}"),
         }
+    }
+
+    #[cfg(unix)]
+    fn mkfifo(path: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+        let c_path =
+            std::ffi::CString::new(path.as_os_str().as_bytes()).expect("fifo path has no NUL");
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
+        assert_eq!(
+            rc,
+            0,
+            "mkfifo(2) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    /// A FIFO squatting at the committed artifact path must fail fast
+    /// instead of wedging the fresh-clone re-vendor forever in an `open(2)`
+    /// waiting for a writer — the caller's metadata probe passes for a FIFO,
+    /// so this read is the first open. Same `open_regular_file` guard class
+    /// as the vendor lockfile reads (lock_inventory.rs, npm_lock.rs).
+    #[cfg(unix)]
+    #[test]
+    fn stage_local_artifact_fifo_fails_fast_instead_of_wedging() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tgz_path = tmp.path().join("left-pad-1.3.0.tgz");
+        mkfifo(&tgz_path);
+        // Own runtime on a detached thread: a wedged open(2) lives in a
+        // spawn_blocking task, and dropping (or #[tokio::test]-finishing) a
+        // runtime with one wedged blocks forever — the timeout must live
+        // OUTSIDE the runtime for the unfixed code to fail instead of hang.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path = tgz_path.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let res = rt.block_on(stage_local_artifact(&path, &"0".repeat(64)));
+            std::mem::forget(rt);
+            let _ = tx.send(res);
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(Err(FetchError::Failed(msg))) => {
+                assert!(msg.contains(&tgz_path.display().to_string()), "{msg}")
+            }
+            Ok(other) => panic!("expected Failed on a FIFO artifact, got {other:?}"),
+            Err(_) => panic!("stage_local_artifact wedged on a FIFO artifact"),
+        }
+    }
+
+    #[test]
+    fn goproxy_base_splits_on_pipe_separator() {
+        // GOPROXY is a comma- OR pipe-separated list (go help goproxy); a
+        // pipe-separated value must yield the first usable proxy, not a
+        // `https://a|b`-shaped base that builds an unparseable URL.
+        let saved_socket = std::env::var("SOCKET_GOPROXY").ok();
+        let saved = std::env::var("GOPROXY").ok();
+        std::env::remove_var("SOCKET_GOPROXY");
+        std::env::set_var(
+            "GOPROXY",
+            "https://athens.example|https://proxy.golang.org|direct",
+        );
+        let piped = goproxy_base();
+        std::env::set_var("GOPROXY", "off|https://mirror.example/,direct");
+        let mixed = goproxy_base();
+        match saved {
+            Some(v) => std::env::set_var("GOPROXY", v),
+            None => std::env::remove_var("GOPROXY"),
+        }
+        match saved_socket {
+            Some(v) => std::env::set_var("SOCKET_GOPROXY", v),
+            None => std::env::remove_var("SOCKET_GOPROXY"),
+        }
+        assert_eq!(piped, "https://athens.example");
+        assert_eq!(mixed, "https://mirror.example");
+    }
+
+    #[tokio::test]
+    async fn berry_foreign_cachekey_refuses_before_network() {
+        // The cacheKey is decidable from the lockfile alone; the refusal must
+        // be the Unverifiable contract's pre-network kind (the URL would
+        // hard-fail if contacted), not a Failed download error — and yarn
+        // 2/3 locks (cacheKey 8/9) must not cost a full tarball download
+        // just to be refused afterwards.
+        let entry = npm_entry(
+            Some("http://127.0.0.1:1/nope.tgz".into()),
+            LockIntegrity::BerryChecksum(format!("9/{}", "0".repeat(128))),
+        );
+        match fetch_and_stage(&entry, &build_registry_client()).await {
+            Err(FetchError::Unverifiable(msg)) => assert!(msg.contains("cacheKey"), "{msg}"),
+            other => panic!("expected pre-network Unverifiable, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn pypi_no_wheel_url_message_is_single_spaced() {
+        let entry = LockfileEntry {
+            ecosystem: "pypi",
+            name: "requests".into(),
+            version: "2.28.0".into(),
+            purl: "pkg:pypi/requests@2.28.0".into(),
+            resolved: None,
+            integrity: LockIntegrity::Sha256Hex("0".repeat(64)),
+        };
+        match fetch_and_stage(&entry, &build_registry_client()).await {
+            Err(FetchError::Unverifiable(msg)) => assert!(
+                !msg.contains("  "),
+                "user-facing message carries an embedded space run: {msg:?}"
+            ),
+            other => panic!("expected Unverifiable, got {other:?}"),
+        }
+    }
+
+    /// Binary-patch a single-entry zip's DECLARED uncompressed size (local
+    /// header + central directory) — the exact lie a crafted artifact can
+    /// carry, since the crc and the deflate stream stay honest and zip 8.x
+    /// does not cross-check the declared size on read.
+    fn patch_declared_uncompressed_size(zip_bytes: &mut [u8], lie: u32) {
+        assert_eq!(&zip_bytes[0..4], b"PK\x03\x04", "local file header");
+        zip_bytes[22..26].copy_from_slice(&lie.to_le_bytes());
+        let cd = (0..zip_bytes.len() - 4)
+            .rev()
+            .find(|&i| &zip_bytes[i..i + 4] == b"PK\x01\x02")
+            .expect("central directory header");
+        zip_bytes[cd + 24..cd + 28].copy_from_slice(&lie.to_le_bytes());
+    }
+
+    #[test]
+    fn zip_entry_lying_declared_size_fails_closed() {
+        // The size caps must hold against the ACTUAL decompressed bytes: an
+        // entry declaring 1 byte while its deflate stream inflates to 4096
+        // must refuse, not extract the full content past the caps.
+        let content = vec![0x42u8; 4096];
+        let mut zip_bytes = make_zip(&[("a.bin", &content)]);
+        patch_declared_uncompressed_size(&mut zip_bytes, 1);
+        let tmp = tempfile::tempdir().unwrap();
+        let err = extract_zip(&zip_bytes, tmp.path(), false).unwrap_err();
+        assert!(err.contains("declares"), "{err}");
+    }
+
+    #[test]
+    fn module_zip_extraction_enforces_size_caps() {
+        // extract_zip_with_prefix is reachable without the cap-enforcing
+        // dirhash pre-pass (the service-download path when the service
+        // reports no `dirhashH1`), so it must carry the bomb caps itself.
+        let prefix = "github.com/x/y@v1.0.0/";
+        let mut zip_bytes = make_module_zip(prefix, &[("big.bin", &[0u8; 16])]);
+        patch_declared_uncompressed_size(&mut zip_bytes, (MAX_ENTRY_BYTES + 1) as u32);
+        let tmp = tempfile::tempdir().unwrap();
+        let err = extract_zip_with_prefix(&zip_bytes, tmp.path(), prefix).unwrap_err();
+        assert!(err.contains("cap"), "{err}");
+
+        // And the actual-bytes guard: declared-small, inflates bigger.
+        let content = vec![0x42u8; 4096];
+        let mut zip_bytes = make_module_zip(prefix, &[("lie.bin", &content)]);
+        patch_declared_uncompressed_size(&mut zip_bytes, 1);
+        let tmp = tempfile::tempdir().unwrap();
+        let err = extract_zip_with_prefix(&zip_bytes, tmp.path(), prefix).unwrap_err();
+        assert!(err.contains("declares"), "{err}");
+    }
+
+    #[test]
+    fn go_h1_caps_actual_decompressed_bytes() {
+        // A module zip whose entry DECLARES a tiny size while its deflate
+        // stream inflates past the per-entry cap must refuse instead of
+        // hashing unbounded decompressed bytes (a capped download can still
+        // inflate ~1000×; the declared-size checks alone are bypassable).
+        let big = vec![0u8; (MAX_ENTRY_BYTES + 64 * 1024) as usize];
+        let mut zip_bytes = make_module_zip("m@v1/", &[("big.bin", &big)]);
+        drop(big);
+        patch_declared_uncompressed_size(&mut zip_bytes, 4096);
+        let err = go_h1_of_zip(&zip_bytes).unwrap_err();
+        assert!(err.contains("cap"), "{err}");
     }
 
     #[test]

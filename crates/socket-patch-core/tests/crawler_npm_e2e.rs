@@ -1707,7 +1707,11 @@ async fn find_by_purls_returns_root_and_nested_duplicate_root_first() {
     let copies = result
         .get("pkg:npm/dup@1.0.0")
         .expect("dup@1.0.0 must resolve");
-    assert_eq!(copies.len(), 2, "BOTH copies must be returned; got {copies:?}");
+    assert_eq!(
+        copies.len(),
+        2,
+        "BOTH copies must be returned; got {copies:?}"
+    );
     assert_eq!(
         copies[0].path,
         nm.join("dup"),
@@ -1870,7 +1874,9 @@ async fn find_by_purls_resolves_pnpm4_nested_store_transitives() {
     // filtered pass, but its inner package — the only physical home of
     // `wanted@1.0.0` — must still resolve via the unfiltered fallback.
     assert_eq!(
-        result.get("pkg:npm/wanted@1.0.0").map(|v| v[0].path.clone()),
+        result
+            .get("pkg:npm/wanted@1.0.0")
+            .map(|v| v[0].path.clone()),
         Some(host.join("decoy/1.0.0/node_modules/wanted")),
         "a target hidden behind a nested entry's advertised name must \
          resolve via the fallback pass"

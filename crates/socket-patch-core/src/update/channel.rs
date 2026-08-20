@@ -137,7 +137,10 @@ fn cargo_bin_dir(env: &ChannelEnv) -> Option<PathBuf> {
 }
 
 /// Cache roots the gem launcher resolves, in its probe order:
-/// `$XDG_CACHE_HOME`, `~/.cache`, `%LOCALAPPDATA%`.
+/// `$XDG_CACHE_HOME`, `~/.cache`, `%LOCALAPPDATA%`, and the launcher's
+/// Windows fallback when LOCALAPPDATA is unset — `~/AppData/Local`
+/// (launcher.rb: `ENV["LOCALAPPDATA"] || File.join(Dir.home, "AppData",
+/// "Local")`).
 fn launcher_cache_roots(env: &ChannelEnv) -> Vec<PathBuf> {
     let mut roots = Vec::new();
     if let Some(xdg) = &env.xdg_cache_home {
@@ -145,6 +148,7 @@ fn launcher_cache_roots(env: &ChannelEnv) -> Vec<PathBuf> {
     }
     if let Some(home) = &env.home {
         roots.push(home.join(".cache"));
+        roots.push(home.join("AppData").join("Local"));
     }
     if let Some(lad) = &env.local_app_data {
         roots.push(lad.clone());
@@ -269,6 +273,34 @@ mod tests {
         // socket-patch cache root is standalone.
         assert_eq!(
             detect_channel(Path::new("/home/u/.cache/socket-patch/socket-patch"), &env),
+            InstallChannel::Standalone
+        );
+    }
+
+    #[test]
+    fn launcher_cache_detected_via_home_appdata_fallback() {
+        // launcher.rb resolves the Windows cache root as
+        // `ENV["LOCALAPPDATA"] || File.join(Dir.home, "AppData", "Local")` —
+        // with LOCALAPPDATA stripped it still caches under the home
+        // fallback, and detection must still refuse there. Forward-slash
+        // spelling so the component walk exercises this on Unix runners too
+        // (the backslash spelling is covered by `windows_paths_detected`).
+        let env = env_with_home("C:/Users/u");
+        assert_eq!(
+            detect_channel(
+                Path::new(
+                    "C:/Users/u/AppData/Local/socket-patch/bin/3.3.0/x86_64-pc-windows-msvc/socket-patch.exe"
+                ),
+                &env
+            ),
+            InstallChannel::LauncherCache
+        );
+        // Only the socket-patch/bin subtree — a sibling app's cache is not ours.
+        assert_eq!(
+            detect_channel(
+                Path::new("C:/Users/u/AppData/Local/other-tool/bin/other-tool.exe"),
+                &env
+            ),
             InstallChannel::Standalone
         );
     }

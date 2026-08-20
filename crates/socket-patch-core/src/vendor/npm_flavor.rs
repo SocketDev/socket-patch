@@ -263,10 +263,25 @@ pub(crate) async fn detect_npm_lock_flavor(
     Ok((detected, warnings))
 }
 
+/// Guarded read shared in shape with the vendor siblings' twins
+/// (lock_inventory.rs, cargo_lock.rs, gem.rs): `open_regular_file` opens
+/// with `O_NONBLOCK` and rejects non-regular files, so a FIFO planted as a
+/// sniffed lockfile fails fast instead of wedging the flavor probe (every
+/// npm `vendor`), the in-use probe, and the unwired-revert guard forever in
+/// an `open(2)` that waits for a writer.
+async fn read_regular_to_string(path: &Path) -> std::io::Result<String> {
+    use tokio::io::AsyncReadExt as _;
+
+    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
+    let mut content = String::with_capacity(metadata.len() as usize);
+    file.read_to_string(&mut content).await?;
+    Ok(content)
+}
+
 /// Read a lockfile for content-sniffing. An unreadable-but-present file maps
 /// to the same stable code as a missing one.
 async fn read_lock(project_root: &Path, name: &str) -> Result<String, (&'static str, String)> {
-    tokio::fs::read_to_string(project_root.join(name))
+    read_regular_to_string(&project_root.join(name))
         .await
         .map_err(|e| {
             (
@@ -416,7 +431,7 @@ pub(super) async fn lock_text_mentions_uuid(
 ) -> Option<bool> {
     let needle = format!(".socket/vendor/npm/{uuid}/");
     for name in names {
-        if let Ok(text) = tokio::fs::read_to_string(project_root.join(name)).await {
+        if let Ok(text) = read_regular_to_string(&project_root.join(name)).await {
             return Some(text.contains(&needle));
         }
     }
@@ -1021,5 +1036,98 @@ mod tests {
         // Unknown flavor: undeterminable, fail-safe keep.
         let entry = probe_entry(Some("future-pm"));
         assert_eq!(vendored_entry_in_use(&entry, tmp.path()).await, None);
+    }
+
+    #[cfg(unix)]
+    fn mkfifo(path: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+        let c_path =
+            std::ffi::CString::new(path.as_os_str().as_bytes()).expect("fifo path has no NUL");
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
+        assert_eq!(
+            rc,
+            0,
+            "mkfifo(2) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    /// A FIFO planted as a content-sniffed lockfile must fail fast instead
+    /// of wedging the flavor probe — and with it every npm `vendor` — or the
+    /// in-use probe behind scan's GC and the textual backends' unwired-revert
+    /// guard, forever in an `open(2)` waiting for a writer that never comes.
+    /// Same `open_regular_file` guard class as the vendor siblings
+    /// (lock_inventory.rs, cargo_lock.rs, gem.rs). The probe stays
+    /// fail-closed (`vendor_lockfile_missing` names the unreadable file); the
+    /// in-use probe stays fail-safe (`None` = keep the entry).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fifo_lockfiles_fail_fast_instead_of_wedging() {
+        // Separate roots: in one shared root bun.lock/pnpm-lock.yaml would
+        // outrank yarn.lock before the probe ever read the wedged file.
+        let pnpm_dir = tempfile::tempdir().unwrap();
+        mkfifo(&pnpm_dir.path().join("pnpm-lock.yaml"));
+        let yarn_dir = tempfile::tempdir().unwrap();
+        mkfifo(&yarn_dir.path().join("yarn.lock"));
+        let in_use_dir = tempfile::tempdir().unwrap();
+        const IN_USE_LOCKS: [&str; 4] = [
+            "npm-shrinkwrap.json",
+            "package-lock.json",
+            "yarn.lock",
+            "bun.lock",
+        ];
+        for name in IN_USE_LOCKS {
+            mkfifo(&in_use_dir.path().join(name));
+        }
+
+        let deadline = std::time::Duration::from_secs(5);
+        let all = async {
+            (
+                detect_npm_lock_flavor(pnpm_dir.path()).await,
+                detect_npm_lock_flavor(yarn_dir.path()).await,
+                vendored_entry_in_use(&probe_entry(Some("package-lock")), in_use_dir.path())
+                    .await,
+                vendored_entry_in_use(&probe_entry(Some("yarn-classic")), in_use_dir.path())
+                    .await,
+                vendored_entry_in_use(&probe_entry(Some("bun")), in_use_dir.path()).await,
+            )
+        };
+        let Ok((pnpm, yarn, npm_use, yarn_use, bun_use)) =
+            tokio::time::timeout(deadline, all).await
+        else {
+            // On timeout the open is wedged in a `spawn_blocking` thread the
+            // runtime waits for on shutdown; connect a non-blocking writer to
+            // release it so the test can FAIL instead of hanging the suite.
+            use std::os::unix::fs::OpenOptionsExt;
+            let stuck = [
+                pnpm_dir.path().join("pnpm-lock.yaml"),
+                yarn_dir.path().join("yarn.lock"),
+            ];
+            for path in stuck
+                .iter()
+                .cloned()
+                .chain(IN_USE_LOCKS.iter().map(|n| in_use_dir.path().join(n)))
+            {
+                let _ = std::fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(path);
+            }
+            panic!("flavor/in-use probes must fail fast on FIFO lockfiles");
+        };
+
+        // The probe refuses with the missing/unreadable code, naming the file.
+        let (code, detail) = pnpm.unwrap_err();
+        assert_eq!(code, "vendor_lockfile_missing", "{detail}");
+        assert!(detail.contains("pnpm-lock.yaml"), "{detail}");
+        let (code, detail) = yarn.unwrap_err();
+        assert_eq!(code, "vendor_lockfile_missing", "{detail}");
+        assert!(detail.contains("yarn.lock"), "{detail}");
+
+        // The in-use probe treats a non-regular lock as unreadable: None =
+        // cannot determine, callers keep the entry (fail-safe).
+        assert_eq!(npm_use, None);
+        assert_eq!(yarn_use, None);
+        assert_eq!(bun_use, None);
     }
 }

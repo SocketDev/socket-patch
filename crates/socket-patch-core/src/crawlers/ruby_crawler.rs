@@ -305,8 +305,18 @@ impl RubyCrawler {
     /// `$BUNDLE_APP_CONFIG/config`, else `<cwd>/.bundle/config`, resolved by
     /// the shared [`crate::setup::gem::bundler_app_config_dir`] rule.
     async fn app_config_bundle_path(cwd: &Path, app_config_env: Option<&OsStr>) -> Option<String> {
+        use tokio::io::AsyncReadExt;
+
         let config = crate::setup::gem::bundler_app_config_dir(cwd, app_config_env).join("config");
-        let contents = tokio::fs::read_to_string(&config).await.ok()?;
+        // The config lives inside the (untrusted) project tree: a planted
+        // FIFO would make a plain `read_to_string` open block forever
+        // waiting for a writer, wedging scan (crawl_all) and apply/get
+        // (find_by_purls path discovery). Open via `open_regular_file` —
+        // non-blocking on Unix, rejecting FIFOs/devices/directories (see
+        // its docs) — same as the npm/composer/python crawlers.
+        let (mut file, metadata) = crate::utils::fs::open_regular_file(&config).await.ok()?;
+        let mut contents = String::with_capacity(metadata.len() as usize);
+        file.read_to_string(&mut contents).await.ok()?;
         parse_bundle_config_path(&contents)
     }
 
@@ -1041,6 +1051,65 @@ mod tests {
             Some(app_config.as_os_str()),
         )
         .await;
+        assert_eq!(paths, vec![flat]);
+    }
+
+    /// A FIFO planted as `.bundle/config` must not wedge discovery. The
+    /// app-config read used a plain `tokio::fs::read_to_string`, whose
+    /// `open(2)` on a FIFO waits for a writer that never comes — so one
+    /// special file in the project tree wedged `scan` (crawl_all) and
+    /// `apply`/`get` (find_by_purls path discovery) indefinitely, with no
+    /// error and no timeout. Same class as the `open_regular_file` guards
+    /// in the npm (package.json), composer (installed.json), and python
+    /// (METADATA) crawlers.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn app_config_fifo_does_not_wedge_discovery() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(dir.path().join("Gemfile"), b"gem \"foo\"\n")
+            .await
+            .unwrap();
+        let dot_bundle = dir.path().join(".bundle");
+        tokio::fs::create_dir_all(&dot_bundle).await.unwrap();
+        let fifo = dot_bundle.join("config");
+        // mkfifo(2) directly, not the /usr/bin/mkfifo binary: spawning a
+        // child flakes under heavy parallel load (fork/exec starvation)
+        // and the syscall needs no process at all.
+        let c_path = {
+            use std::os::unix::ffi::OsStrExt;
+            std::ffi::CString::new(fifo.as_os_str().as_bytes()).expect("fifo path has no NUL")
+        };
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
+        assert_eq!(
+            rc,
+            0,
+            "mkfifo(2) failed: {}",
+            std::io::Error::last_os_error()
+        );
+        // A real store beside the FIFO proves discovery still works
+        // around the unreadable config.
+        let bundle = dir.path().join("vendor").join("bundle");
+        let flat = bundle.join("gems");
+        tokio::fs::create_dir_all(flat.join("foo-1.0.0").join("lib"))
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(bundle.join("specifications"))
+            .await
+            .unwrap();
+
+        // On timeout the open is wedged in a `spawn_blocking` thread that
+        // the runtime waits for on shutdown; connect a writer to release
+        // it so the test can FAIL instead of hanging the whole suite.
+        let deadline = std::time::Duration::from_secs(5);
+        let Ok(paths) = tokio::time::timeout(
+            deadline,
+            RubyCrawler::get_vendor_bundle_paths_with_env(dir.path(), None, None),
+        )
+        .await
+        else {
+            let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
+            panic!("bundle-path discovery must complete promptly with a FIFO .bundle/config");
+        };
         assert_eq!(paths, vec![flat]);
     }
 

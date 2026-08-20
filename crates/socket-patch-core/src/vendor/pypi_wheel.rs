@@ -51,6 +51,32 @@ pub struct WheelArtifact {
     pub size: u64,
 }
 
+/// `open_regular_file` opens with `O_NONBLOCK` and rejects non-regular
+/// files, so a FIFO planted in the dist-info (or squatting a RECORD member)
+/// fails fast — surfacing as the same unreadable-file refusal/failure as a
+/// missing file — instead of wedging the vendor run forever in an `open(2)`
+/// that waits for a writer.
+async fn read_regular_to_string(path: &Path) -> std::io::Result<String> {
+    use tokio::io::AsyncReadExt as _;
+
+    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
+    let mut content = String::with_capacity(metadata.len() as usize);
+    file.read_to_string(&mut content).await?;
+    Ok(content)
+}
+
+/// Byte-reading twin of [`read_regular_to_string`], also handing back the
+/// metadata from the already-open handle (the member staging loop needs the
+/// exec bit without a second stat).
+async fn read_regular(path: &Path) -> std::io::Result<(Vec<u8>, std::fs::Metadata)> {
+    use tokio::io::AsyncReadExt as _;
+
+    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
+    let mut content = Vec::with_capacity(metadata.len() as usize);
+    file.read_to_end(&mut content).await?;
+    Ok((content, metadata))
+}
+
 /// Find the installed dist for `purl_name@version` by scanning the
 /// `*.dist-info` directories under the site-packages root (the crawler's
 /// `pkg_path` for pypi). Name matching is PEP 503-canonical on BOTH sides so
@@ -83,7 +109,7 @@ pub async fn locate_installed_dist(
             _ => raw_name.clone(),
         };
 
-        let record_text = tokio::fs::read_to_string(dist_info.join("RECORD"))
+        let record_text = read_regular_to_string(&dist_info.join("RECORD"))
             .await
             .map_err(|e| {
                 (
@@ -105,7 +131,7 @@ pub async fn locate_installed_dist(
             ));
         }
 
-        let wheel_text = tokio::fs::read_to_string(dist_info.join("WHEEL"))
+        let wheel_text = read_regular_to_string(&dist_info.join("WHEEL"))
             .await
             .map_err(|e| {
                 (
@@ -153,7 +179,7 @@ pub async fn locate_installed_dist(
 /// `<escaped dist>-<escaped version>-<compressed tags>.whl`.
 pub fn wheel_file_name(dist: &InstalledDist) -> Result<String, (&'static str, String)> {
     let name = escape_wheel_component(&dist.dist_name);
-    let version = escape_wheel_component(&dist.version);
+    let version = escape_wheel_version(&dist.version);
     let (py, abi, plat) = compress_wheel_tags(&dist.wheel_tags)?;
     Ok(format!("{name}-{version}-{py}-{abi}-{plat}.whl"))
 }
@@ -161,10 +187,28 @@ pub fn wheel_file_name(dist: &InstalledDist) -> Result<String, (&'static str, St
 /// Wheel-spec component escaping: runs of `[^A-Za-z0-9.]` collapse to a
 /// single `_` so the filename stays unambiguous at the `-` separators.
 fn escape_wheel_component(s: &str) -> String {
+    escape_wheel_chars(s, false)
+}
+
+/// Version-component escaping: PEP 440 normalized versions legitimately
+/// carry `!` (epoch) and `+` (local separator), and real tools keep them
+/// literally in the filename (bdist_wheel's `safer_version` only maps `-`
+/// runs to `_`). pip/uv REJECT the `_`-escaped spelling as an invalid wheel
+/// version (`packaging.utils.parse_wheel_filename` raises on
+/// `torch-2.0.0_cu118-…` but parses `torch-2.0.0+cu118-…`), so escaping
+/// those two would make the rebuilt wheel uninstallable.
+fn escape_wheel_version(s: &str) -> String {
+    escape_wheel_chars(s, true)
+}
+
+fn escape_wheel_chars(s: &str, keep_version_separators: bool) -> String {
     let mut out = String::with_capacity(s.len());
     let mut in_run = false;
     for ch in s.chars() {
-        if ch.is_ascii_alphanumeric() || ch == '.' {
+        if ch.is_ascii_alphanumeric()
+            || ch == '.'
+            || (keep_version_separators && (ch == '+' || ch == '!'))
+        {
             out.push(ch);
             in_run = false;
         } else if !in_run {
@@ -268,7 +312,7 @@ pub async fn build_patched_wheel(
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
     let script_names =
-        match tokio::fs::read_to_string(dist.dist_info_dir.join("entry_points.txt")).await {
+        match read_regular_to_string(&dist.dist_info_dir.join("entry_points.txt")).await {
             Ok(text) => console_script_names(&text),
             Err(_) => HashSet::new(),
         };
@@ -331,8 +375,8 @@ pub async fn build_patched_wheel(
     let mut exec_bits: HashMap<String, bool> = HashMap::new();
     for member in &members {
         let src = site_packages.join(member);
-        let bytes = match tokio::fs::read(&src).await {
-            Ok(b) => b,
+        let (bytes, metadata) = match read_regular(&src).await {
+            Ok(pair) => pair,
             Err(e) => {
                 return Ok((
                     failed_result(
@@ -344,11 +388,7 @@ pub async fn build_patched_wheel(
                 ))
             }
         };
-        let exec = tokio::fs::metadata(&src)
-            .await
-            .map(|m| is_executable(&m))
-            .unwrap_or(false);
-        exec_bits.insert(member.clone(), exec);
+        exec_bits.insert(member.clone(), is_executable(&metadata));
         let dst = stage.path().join(member);
         if let Some(parent) = dst.parent() {
             if let Err(e) = tokio::fs::create_dir_all(parent).await {
@@ -492,7 +532,7 @@ fn is_installer_bookkeeping(path: &str, dist_info_name: &str) -> bool {
 
 /// True when `dist-info/direct_url.json` marks the install editable.
 async fn is_editable_install(dist_info_dir: &Path) -> bool {
-    let Ok(bytes) = tokio::fs::read(dist_info_dir.join("direct_url.json")).await else {
+    let Ok((bytes, _)) = read_regular(&dist_info_dir.join("direct_url.json")).await else {
         return false;
     };
     let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
@@ -1156,5 +1196,218 @@ mod tests {
         // The spike's splitext bug: `pycowsay.6` (a man page) must NOT match.
         assert!(!is_console_script_artifact("pycowsay.6", &names));
         assert!(!is_console_script_artifact("other", &names));
+    }
+
+    /// PEP 440 normalized versions legitimately carry `!` (epoch) and `+`
+    /// (local separator), and real tools keep them literally in the wheel
+    /// filename (bdist_wheel's `safer_version`). pip/uv REJECT the
+    /// `_`-escaped spelling: `packaging.utils.parse_wheel_filename` raises
+    /// InvalidWheelFilename on `torch-2.0.0_cu118-…` but parses
+    /// `torch-2.0.0+cu118-…` — escaping them makes the vendored wheel
+    /// uninstallable.
+    #[test]
+    fn wheel_version_keeps_local_and_epoch_separators() {
+        let dist = InstalledDist {
+            dist_info_dir: PathBuf::from("x"),
+            dist_name: "torch".into(),
+            version: "2.0.0+cu118".into(),
+            record: vec![],
+            wheel_tags: vec!["cp310-cp310-linux_x86_64".into()],
+        };
+        assert_eq!(
+            wheel_file_name(&dist).unwrap(),
+            "torch-2.0.0+cu118-cp310-cp310-linux_x86_64.whl"
+        );
+
+        let dist = InstalledDist {
+            dist_info_dir: PathBuf::from("x"),
+            dist_name: "pkg".into(),
+            version: "1!2.0".into(),
+            record: vec![],
+            wheel_tags: vec!["py3-none-any".into()],
+        };
+        assert_eq!(wheel_file_name(&dist).unwrap(), "pkg-1!2.0-py3-none-any.whl");
+    }
+
+    /// `mkfifo(2)` directly instead of shelling out to the binary — the
+    /// same helper as the sibling vendor FIFO tests: fork/exec flakes under
+    /// heavy parallel load and the syscall needs no process at all.
+    #[cfg(unix)]
+    fn mkfifo(path: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+        let c_path =
+            std::ffi::CString::new(path.as_os_str().as_bytes()).expect("fifo path has no NUL");
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
+        assert_eq!(
+            rc,
+            0,
+            "mkfifo(2) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    /// Await `fut` with a deadline. On timeout the open is wedged in a
+    /// `spawn_blocking` thread that the runtime waits for on shutdown;
+    /// connect a writer to release it so the test can FAIL instead of
+    /// hanging the whole suite. (`timeout` drops the future itself, so
+    /// nothing else keeps running after the release.)
+    #[cfg(unix)]
+    async fn expect_prompt<T>(fifo: &Path, fut: impl std::future::Future<Output = T>) -> T {
+        let deadline = std::time::Duration::from_secs(5);
+        match tokio::time::timeout(deadline, fut).await {
+            Ok(v) => v,
+            Err(_) => {
+                let _ = std::fs::OpenOptions::new().write(true).open(fifo);
+                panic!(
+                    "must complete promptly with a FIFO at {} instead of wedging in open(2)",
+                    fifo.display()
+                );
+            }
+        }
+    }
+
+    /// A FIFO planted as RECORD or WHEEL must fail fast as the existing
+    /// unreadable-file refusal, not wedge `locate_installed_dist` (and the
+    /// whole vendor run) forever in an `open(2)` waiting for a writer.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fifo_record_or_wheel_does_not_wedge_locate() {
+        let fx = make_fixture("", None).await;
+        let di = fx.site_packages.join("six-1.16.0.dist-info");
+
+        let record_backup = tokio::fs::read(di.join("RECORD")).await.unwrap();
+        tokio::fs::remove_file(di.join("RECORD")).await.unwrap();
+        mkfifo(&di.join("RECORD"));
+        let err = expect_prompt(
+            &di.join("RECORD"),
+            locate_installed_dist(&fx.site_packages, "six", "1.16.0"),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, "pypi_missing_record");
+
+        tokio::fs::remove_file(di.join("RECORD")).await.unwrap();
+        tokio::fs::write(di.join("RECORD"), record_backup)
+            .await
+            .unwrap();
+        tokio::fs::remove_file(di.join("WHEEL")).await.unwrap();
+        mkfifo(&di.join("WHEEL"));
+        let err = expect_prompt(
+            &di.join("WHEEL"),
+            locate_installed_dist(&fx.site_packages, "six", "1.16.0"),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, "pypi_missing_wheel_metadata");
+    }
+
+    /// A FIFO squatting a RECORD member must fail the build closed (same as
+    /// an unreadable member), not wedge the staging loop forever.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fifo_record_member_fails_closed_instead_of_wedging_build() {
+        let fx = make_fixture("", None).await;
+        let dist = locate_installed_dist(&fx.site_packages, "six", "1.16.0")
+            .await
+            .unwrap();
+        tokio::fs::remove_file(fx.site_packages.join("six.py"))
+            .await
+            .unwrap();
+        mkfifo(&fx.site_packages.join("six.py"));
+        let record = patch_record(&[("six.py", ORIG, PATCHED)]);
+        let sources = PatchSources::blobs_only(&fx.blobs);
+        let (result, artifact) = expect_prompt(
+            &fx.site_packages.join("six.py"),
+            build_patched_wheel(
+                "pkg:pypi/six@1.16.0",
+                &fx.site_packages,
+                &dist,
+                &record,
+                &sources,
+                &fx.dest,
+                false,
+                false,
+                &mut Vec::new(),
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(!result.success);
+        assert!(
+            result.error.as_deref().unwrap_or("").contains("unreadable"),
+            "{:?}",
+            result.error
+        );
+        assert!(artifact.is_none());
+        assert!(!fx.dest.exists());
+    }
+
+    /// FIFOs planted as the optional dist-info extras (`direct_url.json`,
+    /// `entry_points.txt` — both probed with fall-through-on-error reads)
+    /// must read as absent and let the build succeed, not wedge it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fifo_direct_url_json_does_not_wedge_editable_probe() {
+        let fx = make_fixture("", None).await;
+        let fifo = fx
+            .site_packages
+            .join("six-1.16.0.dist-info/direct_url.json");
+        mkfifo(&fifo);
+        let dist = locate_installed_dist(&fx.site_packages, "six", "1.16.0")
+            .await
+            .unwrap();
+        let record = patch_record(&[("six.py", ORIG, PATCHED)]);
+        let sources = PatchSources::blobs_only(&fx.blobs);
+        let (result, artifact) = expect_prompt(
+            &fifo,
+            build_patched_wheel(
+                "pkg:pypi/six@1.16.0",
+                &fx.site_packages,
+                &dist,
+                &record,
+                &sources,
+                &fx.dest,
+                false,
+                false,
+                &mut Vec::new(),
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(result.success, "{:?}", result.error);
+        assert!(artifact.is_some());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fifo_entry_points_does_not_wedge_build() {
+        let fx = make_fixture("", None).await;
+        let fifo = fx
+            .site_packages
+            .join("six-1.16.0.dist-info/entry_points.txt");
+        mkfifo(&fifo);
+        let dist = locate_installed_dist(&fx.site_packages, "six", "1.16.0")
+            .await
+            .unwrap();
+        let record = patch_record(&[("six.py", ORIG, PATCHED)]);
+        let sources = PatchSources::blobs_only(&fx.blobs);
+        let (result, artifact) = expect_prompt(
+            &fifo,
+            build_patched_wheel(
+                "pkg:pypi/six@1.16.0",
+                &fx.site_packages,
+                &dist,
+                &record,
+                &sources,
+                &fx.dest,
+                false,
+                false,
+                &mut Vec::new(),
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(result.success, "{:?}", result.error);
+        assert!(artifact.is_some());
     }
 }

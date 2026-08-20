@@ -180,12 +180,17 @@ pub async fn run(args: RemoveArgs) -> i32 {
                 return 1;
             }
             Err(e) => {
-                emit_error_envelope(
-                    args.common.json,
-                    args.common.dry_run,
-                    "manifest_unreadable",
-                    e.to_string(),
-                );
+                // A manifest that exists but is unparseable (bad JSON or a
+                // schema violation) surfaces as `ErrorKind::InvalidData` —
+                // the contract's `manifest_invalid`. Everything else is a
+                // genuine I/O failure (`manifest_unreadable`). See the
+                // CLI_CONTRACT.md error-code table; `list` shares the split.
+                let code = if e.kind() == std::io::ErrorKind::InvalidData {
+                    "manifest_invalid"
+                } else {
+                    "manifest_unreadable"
+                };
+                emit_error_envelope(args.common.json, args.common.dry_run, code, e.to_string());
                 return 1;
             }
         }
@@ -728,7 +733,7 @@ async fn remove_detached_only(
         detached.len()
     );
     if !args.common.dry_run && !confirm(&prompt, true, args.common.yes, args.common.json) {
-        if !args.common.json {
+        if !args.common.json && !args.common.silent {
             println!("Removal cancelled.");
         }
         return 0;

@@ -13,7 +13,6 @@
 //! [`crate::package_json::update`] for the npm side.
 
 use std::path::Path;
-use tokio::fs;
 use toml_edit::{Array, DocumentMut, InlineTable, Item, Table, Value};
 
 use super::detect::{deps_contain_hook, HOOK_DEP};
@@ -60,6 +59,22 @@ impl PthEditResult {
     }
 }
 
+/// Guarded read shared with the detect.rs/gem/composer/npm setup twins:
+/// `open_regular_file` opens with `O_NONBLOCK` and rejects non-regular files,
+/// so a FIFO planted at `requirements.txt` / `pyproject.toml` fails fast to
+/// `Error` instead of wedging `setup` / `setup --remove` forever in an
+/// `open(2)` that waits for a writer — detection never opens the manifest it
+/// hands the edit path (a lockfile routes here without a read, and the Pip
+/// fallback targets `requirements.txt` sight-unseen).
+async fn read_regular_to_string(path: &Path) -> std::io::Result<String> {
+    use tokio::io::AsyncReadExt;
+
+    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
+    let mut content = String::with_capacity(metadata.len() as usize);
+    file.read_to_string(&mut content).await?;
+    Ok(content)
+}
+
 /// Shared tail of add/remove: `None` means already in the desired state,
 /// `Some(new_content)` is written atomically (unless `dry_run`).
 async fn finish(
@@ -88,7 +103,7 @@ async fn finish(
 
 /// Add the hook dependency to a manifest. Idempotent.
 pub async fn add_hook_dependency(path: &Path, kind: ManifestKind, dry_run: bool) -> PthEditResult {
-    let content = match fs::read_to_string(path).await {
+    let content = match read_regular_to_string(path).await {
         Ok(c) => c,
         // A missing requirements.txt is created (the pip-from-scratch path);
         // a missing pyproject.toml is an error (we don't synthesize one).
@@ -114,7 +129,7 @@ pub async fn remove_hook_dependency(
     kind: ManifestKind,
     dry_run: bool,
 ) -> PthEditResult {
-    let content = match fs::read_to_string(path).await {
+    let content = match read_regular_to_string(path).await {
         Ok(c) => c,
         // Nothing on disk → nothing to remove (idempotent no-op).
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -1042,6 +1057,74 @@ mod tests {
         assert!(!pyproject_contains_hook(
             "[tool.poetry.dependencies]\nsocket-patchwork = \"*\"\n"
         ));
+    }
+
+    /// mkfifo(2) directly rather than shelling out to the `mkfifo` binary —
+    /// same helper as the detect.rs / find.rs FIFO tests: fork/exec flakes
+    /// under heavy parallel load and the syscall needs no process at all.
+    #[cfg(unix)]
+    fn mkfifo(path: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+        let c_path =
+            std::ffi::CString::new(path.as_os_str().as_bytes()).expect("fifo path has no NUL");
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
+        assert_eq!(
+            rc,
+            0,
+            "mkfifo(2) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    /// A FIFO planted as the manifest must not wedge the edit path. The
+    /// manifest paths handed to add/remove come from detection, which never
+    /// opens the file it targets for editing (a poetry.lock next to a FIFO
+    /// pyproject.toml routes here without a read; the Pip fallback targets
+    /// requirements.txt sight-unseen), so a plain `read_to_string` open(2)
+    /// waits for a writer that never comes, wedging `setup` / `setup
+    /// --remove` indefinitely with no error and no timeout. Same class as
+    /// the `open_regular_file` guards in the detect.rs/gem/composer/npm
+    /// twins. The non-regular file must instead fail fast to `Error`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_edit_fifo_manifest_does_not_wedge() {
+        let dir = tempfile::tempdir().unwrap();
+        let req = dir.path().join("requirements.txt");
+        let py = dir.path().join("pyproject.toml");
+        mkfifo(&req);
+        mkfifo(&py);
+
+        // On timeout the open is wedged in a `spawn_blocking` thread that
+        // the runtime waits for on shutdown; connect a writer to release
+        // it so the test can FAIL instead of hanging the whole suite.
+        let deadline = std::time::Duration::from_secs(5);
+        let Ok(res) = tokio::time::timeout(
+            deadline,
+            add_hook_dependency(&req, ManifestKind::Requirements, false),
+        )
+        .await
+        else {
+            let _ = std::fs::OpenOptions::new().write(true).open(&req);
+            panic!("add_hook_dependency must complete promptly with a FIFO manifest");
+        };
+        assert_eq!(res.status, PthStatus::Error);
+
+        let Ok(res) = tokio::time::timeout(
+            deadline,
+            remove_hook_dependency(&py, ManifestKind::Pyproject, false),
+        )
+        .await
+        else {
+            let _ = std::fs::OpenOptions::new().write(true).open(&py);
+            panic!("remove_hook_dependency must complete promptly with a FIFO manifest");
+        };
+        assert_eq!(res.status, PthStatus::Error);
+
+        // The failed add must not have replaced the user's FIFO with a
+        // regular requirements.txt via the missing-file create path.
+        use std::os::unix::fs::FileTypeExt;
+        let ft = std::fs::symlink_metadata(&req).unwrap().file_type();
+        assert!(ft.is_fifo(), "the squatting FIFO must be left untouched");
     }
 
     #[tokio::test]

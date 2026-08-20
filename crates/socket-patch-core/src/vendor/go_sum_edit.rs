@@ -52,12 +52,23 @@ pub fn upsert_module_lines(
     let gomod_key = format!("{module} {version}/go.mod ");
 
     let mut lines: Vec<&str> = content.lines().collect();
-    let already = lines
-        .iter()
-        .filter(|l| **l == want[0] || **l == want[1])
-        .count()
-        == 2;
-    if already {
+    // "Already applied" means the key-matching lines are exactly the two
+    // wanted ones — a bare match count is not enough: a stale same-key line
+    // with a different hash (a union-merged go.sum straddling a republish) is
+    // a hard go `SECURITY ERROR`, and a duplicated zip line can stand in for
+    // a missing /go.mod line. Both still need the rewrite below.
+    let mut want_seen = [0usize; 2];
+    let mut stale_key_line = false;
+    for l in &lines {
+        if **l == want[0] {
+            want_seen[0] += 1;
+        } else if **l == want[1] {
+            want_seen[1] += 1;
+        } else if l.starts_with(&zip_key) || l.starts_with(&gomod_key) {
+            stale_key_line = true;
+        }
+    }
+    if want_seen == [1, 1] && !stale_key_line {
         return None;
     }
     lines.retain(|l| !l.starts_with(&zip_key) && !l.starts_with(&gomod_key));
@@ -79,8 +90,9 @@ pub fn upsert_module_lines(
     }
     out.extend(pending);
 
-    let mut joined = out.join("\n");
-    joined.push('\n');
+    let eol = super::common::detect_eol(content);
+    let mut joined = out.join(eol);
+    joined.push_str(eol);
     Some(joined)
 }
 
@@ -115,8 +127,9 @@ pub fn remove_exact_module_version_lines(
     if kept.is_empty() {
         return Some((String::new(), removed));
     }
-    let mut joined = kept.join("\n");
-    joined.push('\n');
+    let eol = super::common::detect_eol(content);
+    let mut joined = kept.join(eol);
+    joined.push_str(eol);
     Some((joined, removed))
 }
 
@@ -139,8 +152,9 @@ pub fn remove_module_prefix_lines(content: &str, module_prefix: &str) -> Option<
     if kept.is_empty() {
         return Some(String::new());
     }
-    let mut joined = kept.join("\n");
-    joined.push('\n');
+    let eol = super::common::detect_eol(content);
+    let mut joined = kept.join(eol);
+    joined.push_str(eol);
     Some(joined)
 }
 
@@ -246,6 +260,61 @@ mod tests {
         let out = remove_module_prefix_lines(&content, "patch.socket.dev/gopatch/").unwrap();
         assert_eq!(out, "github.com/foo/bar v1.4.2 h1:AAA=\n");
         assert!(remove_module_prefix_lines(&out, "patch.socket.dev/gopatch/").is_none());
+    }
+
+    /// Both fresh lines present PLUS a stale same-key line (e.g. a
+    /// union-merged go.sum across a republish): go fatals on the conflicting
+    /// hash, so upsert must still rewrite — "already applied" requires the
+    /// key-matching lines to be exactly the two wanted ones.
+    #[test]
+    fn upsert_rewrites_when_stale_duplicate_key_line_coexists() {
+        let content =
+            format!("{MOD} {VER} {ZIP_H1}\n{MOD} {VER} h1:STALE=\n{MOD} {VER}/go.mod {GOMOD_H1}\n");
+        let out = upsert_module_lines(&content, MOD, VER, ZIP_H1, GOMOD_H1).unwrap();
+        assert!(!out.contains("STALE"));
+        assert_eq!(out.lines().count(), 2);
+
+        // A duplicated zip line with the /go.mod line missing is not "already
+        // applied" either, even though two lines match the wanted set.
+        let dup = format!("{MOD} {VER} {ZIP_H1}\n{MOD} {VER} {ZIP_H1}\n");
+        let out = upsert_module_lines(&dup, MOD, VER, ZIP_H1, GOMOD_H1).unwrap();
+        assert_eq!(
+            out,
+            format!("{MOD} {VER} {ZIP_H1}\n{MOD} {VER}/go.mod {GOMOD_H1}\n")
+        );
+    }
+
+    /// CRLF go.sum (git autocrlf on Windows): edits must preserve the file's
+    /// line terminator — joining with bare `\n` would churn every line.
+    #[test]
+    fn crlf_go_sum_preserves_line_endings() {
+        let existing = "github.com/foo/bar v1.4.2 h1:AAA=\r\nsigs.k8s.io/yaml v1.3.0 h1:CCC=\r\n";
+        let out = upsert_module_lines(existing, MOD, VER, ZIP_H1, GOMOD_H1).unwrap();
+        assert_eq!(
+            out,
+            format!(
+                "github.com/foo/bar v1.4.2 h1:AAA=\r\n\
+                 {MOD} {VER} {ZIP_H1}\r\n\
+                 {MOD} {VER}/go.mod {GOMOD_H1}\r\n\
+                 sigs.k8s.io/yaml v1.3.0 h1:CCC=\r\n"
+            )
+        );
+        assert!(
+            upsert_module_lines(&out, MOD, VER, ZIP_H1, GOMOD_H1).is_none(),
+            "idempotency unaffected by the terminator"
+        );
+
+        let (kept, removed) =
+            remove_exact_module_version_lines(&out, "github.com/foo/bar", "v1.4.2").unwrap();
+        assert_eq!(removed.len(), 1);
+        assert!(kept.starts_with(&format!("{MOD} {VER} {ZIP_H1}\r\n")));
+        assert!(kept.ends_with("\r\n"));
+
+        let pruned = remove_module_prefix_lines(&out, "patch.socket.dev/gopatch/").unwrap();
+        assert_eq!(
+            pruned,
+            "github.com/foo/bar v1.4.2 h1:AAA=\r\nsigs.k8s.io/yaml v1.3.0 h1:CCC=\r\n"
+        );
     }
 
     #[test]

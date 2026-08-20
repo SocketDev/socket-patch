@@ -84,19 +84,6 @@ pub struct LockGuard {
 pub fn acquire(socket_dir: &Path, timeout: Duration) -> Result<LockGuard, LockError> {
     let path = socket_dir.join("apply.lock");
 
-    // Open (or create) the lock file. `create(true)` is idempotent if
-    // it already exists; we never write to the file, only flock it.
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&path)
-        .map_err(|source| LockError::Io {
-            path: path.clone(),
-            source,
-        })?;
-
     // Use `checked_add` so an astronomically large `timeout` (the flag
     // is a user-supplied `u64` of seconds — e.g. `--lock-timeout` /
     // `SOCKET_LOCK_TIMEOUT` set to `u64::MAX`) does not panic the whole
@@ -107,6 +94,26 @@ pub fn acquire(socket_dir: &Path, timeout: Duration) -> Result<LockGuard, LockEr
     // responsive and `ZERO` keeps its non-blocking try-once semantics.
     let deadline = Instant::now().checked_add(timeout);
     loop {
+        // Open (or create) the lock file. `create(true)` is idempotent
+        // if it already exists; we never write to the file, only flock
+        // it. The open lives INSIDE the retry loop on purpose: `repair`
+        // may unlink `apply.lock` (and a fresh acquire recreate it)
+        // while we are parked waiting, and re-flocking a handle opened
+        // before the loop would lock the orphaned pre-deletion inode —
+        // handing out a second live guard alongside whoever locked the
+        // replacement file. Re-opening keeps every attempt bound to the
+        // inode the path names now.
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|source| LockError::Io {
+                path: path.clone(),
+                source,
+            })?;
+
         match file.try_lock_exclusive() {
             Ok(()) => return Ok(LockGuard { _file: file }),
             // Only a genuine "someone else holds it" signal counts as
@@ -353,11 +360,6 @@ mod tests {
     /// lock exists to prevent. Re-opening the path on every retry keeps
     /// the waiter honest about whatever file `apply.lock` names now.
     #[test]
-    #[ignore = "RED: documents a real data-corruption bug — `acquire` opens \
-                apply.lock once BEFORE the retry loop, so a waiter parked \
-                across repair's sanctioned unlink flocks the orphaned inode \
-                and returns a SECOND live guard. The fix (re-open the path on \
-                every retry) was not part of this change."]
     fn waiter_does_not_lock_orphaned_inode_after_lock_file_deleted() {
         use std::sync::mpsc;
 

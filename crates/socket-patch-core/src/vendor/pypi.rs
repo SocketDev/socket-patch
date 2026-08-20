@@ -69,6 +69,20 @@ const SETUP_ALTERNATIVE: &str =
     "use the `socket-patch setup` .pth install hook instead, which patches installed \
      site-packages without lockfile edits";
 
+/// `open_regular_file` opens with `O_NONBLOCK` and rejects non-regular files,
+/// so a FIFO planted as `pyproject.toml` fails fast — read as "no pyproject",
+/// falling through to the requirements routing — instead of wedging flavor
+/// detection (and every lockless-project vendor run) forever in an `open(2)`
+/// that waits for a writer.
+async fn read_regular_to_string(path: &Path) -> std::io::Result<String> {
+    use tokio::io::AsyncReadExt as _;
+
+    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
+    let mut content = String::with_capacity(metadata.len() as usize);
+    file.read_to_string(&mut content).await?;
+    Ok(content)
+}
+
 /// Route the project to a wiring flavor, first match wins. Lockfiles are the
 /// authoritative "this tool manages installs" signal, so locks are compared
 /// with locks (precedence follows migration direction / ecosystem currency:
@@ -134,7 +148,7 @@ async fn detect_pypi_flavor(
         return Ok((PypiFlavor::Pipenv, warnings));
     }
 
-    let pyproject_text = tokio::fs::read_to_string(project_root.join("pyproject.toml"))
+    let pyproject_text = read_regular_to_string(&project_root.join("pyproject.toml"))
         .await
         .ok();
     let has_requirements = exists("requirements.txt").await;
@@ -999,6 +1013,51 @@ mod tests {
         let err = detect_pypi_flavor(tmp.path()).await.unwrap_err();
         assert_eq!(err.0, "pypi_no_requirements");
         assert!(err.1.contains("socket-patch setup"));
+    }
+
+    /// mkfifo(2) directly rather than shelling out to the `mkfifo` binary —
+    /// same helper as the setup/pypi detect.rs FIFO tests: fork/exec flakes
+    /// under heavy parallel load and the syscall needs no process at all.
+    #[cfg(unix)]
+    fn mkfifo(path: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+        let c_path =
+            std::ffi::CString::new(path.as_os_str().as_bytes()).expect("fifo path has no NUL");
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
+        assert_eq!(
+            rc,
+            0,
+            "mkfifo(2) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    /// A FIFO planted as `pyproject.toml` must not wedge flavor routing: the
+    /// lockfile probes ahead of the pyproject read are metadata-only (a FIFO
+    /// stats fine), so a plain `read_to_string` open(2) waits for a writer
+    /// that never comes, wedging every lockless-project `vendor` run
+    /// indefinitely with no error and no timeout. Same class as the
+    /// `open_regular_file` guards in the sibling vendor backends and the
+    /// setup/pypi detect twin. The non-regular file must instead read as "no
+    /// pyproject" and fall through to the requirements routing.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fifo_pyproject_does_not_wedge_flavor_detection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fifo = tmp.path().join("pyproject.toml");
+        mkfifo(&fifo);
+        touch(tmp.path(), "requirements.txt", "six==1.16.0\n").await;
+
+        // On timeout the open is wedged in a `spawn_blocking` thread that
+        // the runtime waits for on shutdown; connect a writer to release
+        // it so the test can FAIL instead of hanging the whole suite.
+        let deadline = std::time::Duration::from_secs(5);
+        let Ok(routed) = tokio::time::timeout(deadline, detect_pypi_flavor(tmp.path())).await
+        else {
+            let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
+            panic!("detect_pypi_flavor must complete promptly with a FIFO pyproject.toml");
+        };
+        assert_eq!(routed.unwrap().0, PypiFlavor::Requirements);
     }
 
     #[test]

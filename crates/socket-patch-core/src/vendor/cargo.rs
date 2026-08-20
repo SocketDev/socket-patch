@@ -97,6 +97,18 @@ pub async fn vendored_entry_in_use(entry: &VendorEntry, project_root: &Path) -> 
     }
 }
 
+/// Guarded read shared in shape with the setup/crawler twins:
+/// `open_regular_file` opens with `O_NONBLOCK` and rejects non-regular files,
+/// so a FIFO fails fast instead of wedging the caller forever.
+async fn read_regular_to_string(path: &Path) -> std::io::Result<String> {
+    use tokio::io::AsyncReadExt as _;
+
+    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
+    let mut content = String::with_capacity(metadata.len() as usize);
+    file.read_to_string(&mut content).await?;
+    Ok(content)
+}
+
 /// A LIVE hosted-redirect wiring for `name`+`version`: the lock resolves it
 /// from a Socket hosted patch registry, or Cargo.toml pins it to a
 /// `socket-patch-<uuid>` registry (the shapes `scan --mode hosted` writes).
@@ -116,7 +128,11 @@ async fn hosted_redirect_residue(project_root: &Path, name: &str, version: &str)
             ));
         }
     }
-    if let Ok(toml) = tokio::fs::read_to_string(project_root.join("Cargo.toml")).await {
+    // Guarded read (`open_regular_file`: O_NONBLOCK + regular-file check) —
+    // a FIFO planted as `Cargo.toml` would otherwise wedge every wet vendor
+    // run in an open(2) that waits for a writer; an unreadable manifest has
+    // no readable residue, matching the read_to_string Err arm this guards.
+    if let Ok(toml) = read_regular_to_string(&project_root.join("Cargo.toml")).await {
         let c = regex::escape(name);
         let re = regex::Regex::new(&format!(
             r#"(?m)^\s*{c}\s*=\s*\{{[^}}\n]*registry\s*=\s*"socket-patch-[0-9a-fA-F-]{{36}}""#
@@ -217,8 +233,14 @@ async fn swap_stage_into_place(stage: &Path, copy_dir: &Path) -> std::io::Result
 /// `remove_dir` refuses non-empty dirs, so live copies, markers, and other
 /// crates' vendor dirs always survive.
 async fn prune_empty_vendor_dirs(uuid_dir: &Path) {
-    if tokio::fs::remove_dir(uuid_dir).await.is_err() {
-        return;
+    // The uuid level may already be gone (the unwind paths `remove_tree` it
+    // before pruning): NotFound must continue to the parent levels this run
+    // created, or they survive as committable husks. Any other error (i.e.
+    // non-empty: a live copy or marker) still stops the prune.
+    match tokio::fs::remove_dir(uuid_dir).await {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return,
     }
     let Some(eco_dir) = uuid_dir.parent() else {
         return;
@@ -1360,6 +1382,91 @@ mod tests {
         );
     }
 
+    /// A failed FRESH vendor unwinds the whole `<uuid>/` dir with
+    /// `remove_tree`, then prunes — the prune must still remove the empty
+    /// `.socket/vendor/cargo/` and `.socket/vendor/` levels this run
+    /// created (the module contract: "a hard failure leaves no husk for
+    /// the user to commit"), even though the uuid level is already gone.
+    #[tokio::test]
+    async fn test_failed_fresh_vendor_leaves_no_vendor_husk() {
+        let (dir, _blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        // Empty blobs dir → the blob read fails mid-apply.
+        let empty = root.join(".socket/empty-blobs");
+        tokio::fs::create_dir_all(&empty).await.unwrap();
+
+        let (result, entry, _warnings) =
+            expect_done(run_vendor(PURL, root, &empty, &pristine, &record, false).await);
+        assert!(!result.success);
+        assert!(entry.is_none());
+        assert!(
+            !root.join(".socket/vendor").exists(),
+            "the empty vendor levels created by the failed run must be pruned"
+        );
+    }
+
+    /// Uses `mkfifo(2)` directly rather than shelling out to `mkfifo`: the
+    /// same helper as the find.rs/detect.rs FIFO tests — fork/exec flakes
+    /// under heavy parallel load and the syscall needs no process at all.
+    #[cfg(unix)]
+    fn mkfifo(path: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+        let c_path =
+            std::ffi::CString::new(path.as_os_str().as_bytes()).expect("fifo path has no NUL");
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
+        assert_eq!(
+            rc,
+            0,
+            "mkfifo(2) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    /// A FIFO planted as the project `Cargo.toml` must not wedge the wet
+    /// vendor run: everything ahead of `hosted_redirect_residue` reads only
+    /// Cargo.lock / .cargo/config.toml, so a raw `read_to_string` open(2)
+    /// of the manifest waits for a writer that never comes and hangs the
+    /// vendor forever with no error and no timeout. Same class as the
+    /// `open_regular_file` guards in the setup twins and the crawlers. The
+    /// non-regular manifest must instead be skipped (no residue readable)
+    /// and the vendor must complete.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_fifo_cargo_toml_does_not_wedge_vendor() {
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        let manifest = root.join("Cargo.toml");
+        tokio::fs::remove_file(&manifest).await.unwrap();
+        mkfifo(&manifest);
+
+        // On timeout the open is wedged in a `spawn_blocking` thread that
+        // the runtime waits for on shutdown; connect a writer to release
+        // it so the test can FAIL instead of hanging the whole suite.
+        let deadline = std::time::Duration::from_secs(5);
+        let Ok(outcome) = tokio::time::timeout(
+            deadline,
+            run_vendor(PURL, root, &blobs, &pristine, &record, false),
+        )
+        .await
+        else {
+            use std::os::unix::fs::OpenOptionsExt;
+            let _ = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&manifest);
+            panic!("vendor must complete promptly with a FIFO Cargo.toml");
+        };
+        let (result, entry, _warnings) = expect_done(outcome);
+        assert!(result.success, "{:?}", result.error);
+        assert!(entry.is_some());
+        assert_eq!(
+            tokio::fs::read(root.join(copy_rel()).join("src/lib.rs"))
+                .await
+                .unwrap(),
+            PATCHED
+        );
+    }
+
     #[tokio::test]
     async fn test_lock_detach_failure_unwinds_config_and_copy() {
         let (dir, blobs, pristine, record) = fixture().await;
@@ -1436,7 +1543,9 @@ mod tests {
             "marker must survive"
         );
         assert_eq!(
-            tokio::fs::read(root.join(".cargo/config.toml")).await.unwrap(),
+            tokio::fs::read(root.join(".cargo/config.toml"))
+                .await
+                .unwrap(),
             cfg1,
             "config untouched"
         );
@@ -1521,10 +1630,15 @@ mod tests {
         let copy = dir.path().join("cfg-if-1.0.4");
         let stage = stage_dir_for(&copy);
         tokio::fs::create_dir_all(&stage).await.unwrap();
-        tokio::fs::write(stage.join("lib.rs"), b"new\n").await.unwrap();
+        tokio::fs::write(stage.join("lib.rs"), b"new\n")
+            .await
+            .unwrap();
 
         swap_stage_into_place(&stage, &copy).await.unwrap();
-        assert_eq!(tokio::fs::read(copy.join("lib.rs")).await.unwrap(), b"new\n");
+        assert_eq!(
+            tokio::fs::read(copy.join("lib.rs")).await.unwrap(),
+            b"new\n"
+        );
         assert!(!backup_dir_for(&copy).exists());
         assert!(!stage.exists());
     }
@@ -1578,7 +1692,9 @@ mod tests {
              [[package]]\nname = \"cfg-if\"\nversion = \"1.0.4\"\nsource = \"{SOURCE}\"\nchecksum = \"{CHECKSUM}\"\n\n\
              [[package]]\nname = \"cfg-if\"\nversion = \"1.0.4\"\nsource = \"git+https://example.com/fork/cfg-if#abcdef\"\n"
         );
-        tokio::fs::write(root.join("Cargo.lock"), &lock).await.unwrap();
+        tokio::fs::write(root.join("Cargo.lock"), &lock)
+            .await
+            .unwrap();
 
         let detail = expect_refused(
             run_vendor(PURL, root, &blobs, &pristine, &record, false).await,
@@ -1605,7 +1721,9 @@ mod tests {
     async fn test_refuses_user_entry_through_foreign_socket_dir() {
         let (dir, blobs, pristine, record) = fixture().await;
         let root = dir.path();
-        tokio::fs::create_dir_all(root.join(".cargo")).await.unwrap();
+        tokio::fs::create_dir_all(root.join(".cargo"))
+            .await
+            .unwrap();
         let user_cfg = format!(
             "[patch.crates-io]\ncfg-if = {{ path = \"../shared-fork/.socket/vendor/cargo/{UUID2}/cfg-if-1.0.4\" }}\n"
         );

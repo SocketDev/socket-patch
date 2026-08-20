@@ -53,11 +53,21 @@ pub async fn read_manifest(
 ) -> Result<Option<PatchManifest>, std::io::Error> {
     let path = path.as_ref();
 
-    let content = match tokio::fs::read_to_string(path).await {
-        Ok(c) => c,
+    // Guarded open: a plain `read_to_string` open(2)s a FIFO squatting the
+    // manifest path with `O_RDONLY` and waits forever for a writer, wedging
+    // every manifest consumer (`apply` runs from install hooks, so this
+    // hangs `npm install` with no output). Non-regular files fail fast with
+    // `InvalidInput` instead; a missing file keeps mapping to `Ok(None)`.
+    let (mut file, metadata) = match crate::utils::fs::open_regular_file(path).await {
+        Ok(pair) => pair,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     };
+    let mut content = String::with_capacity(metadata.len() as usize);
+    {
+        use tokio::io::AsyncReadExt;
+        file.read_to_string(&mut content).await?;
+    }
 
     let parsed: serde_json::Value = match serde_json::from_str(&content) {
         Ok(v) => v,
@@ -333,6 +343,53 @@ mod tests {
             "schema-invalid manifest must be an error, not Ok(None)"
         );
         assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    /// mkfifo(2) directly, not the /usr/bin/mkfifo binary: spawning a child
+    /// flakes under heavy parallel load (fork/exec starvation) and the
+    /// syscall needs no process at all.
+    #[cfg(unix)]
+    fn mkfifo(path: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+        let c_path =
+            std::ffi::CString::new(path.as_os_str().as_bytes()).expect("fifo path has no NUL");
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
+        assert_eq!(
+            rc,
+            0,
+            "mkfifo(2) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    /// A FIFO planted as `.socket/manifest.json` must not wedge
+    /// `read_manifest`: a plain `read_to_string` open(2)s the FIFO with
+    /// `O_RDONLY` and waits for a writer that never comes — and
+    /// `read_manifest` is the single manifest choke point for `list`,
+    /// `apply`, `remove`, and `repair`, with `apply` running from install
+    /// hooks, so one special file hangs `npm install` forever with no
+    /// output. It must fail fast (`InvalidInput` from the regular-file
+    /// guard) while a missing file keeps mapping to `Ok(None)`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_read_manifest_fifo_fails_fast_instead_of_wedging() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("manifest.json");
+        mkfifo(&path);
+
+        let deadline = std::time::Duration::from_secs(5);
+        let Ok(result) = tokio::time::timeout(deadline, read_manifest(&path)).await else {
+            // Release the reader wedged in open(2) so the test binary can
+            // exit cleanly, then fail loudly.
+            use std::os::unix::fs::OpenOptionsExt;
+            let _ = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&path);
+            panic!("read_manifest must fail fast on a FIFO manifest, not wedge in open(2)");
+        };
+        let err = result.expect_err("a FIFO manifest must be an error, not a manifest");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     }
 
     // Regression: the two blob extractors must not be swapped. Each must return

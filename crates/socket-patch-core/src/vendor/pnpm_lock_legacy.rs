@@ -70,9 +70,9 @@ use super::npm_common::{
 use super::path::parse_vendor_path;
 use super::pnpm_lock::{
     apply_pkg_override, check_lock_override, classify_pkg_override, commit_surfaces, drifted,
-    guard_unwired_revert, lines_value, next_block, overrides_record, parse_key_line,
-    revert_overrides_line, revert_pkg_record, section_bounds, split_lines, value_lines,
-    vendor_value_is_for, yaml_key, yaml_key_like, KIND_LOCK_OVERRIDES,
+    guard_unwired_revert, lines_value, next_block, overrides_record, parse_key_line, read_regular,
+    read_regular_string, revert_overrides_line, revert_pkg_record, section_bounds, split_lines,
+    value_lines, vendor_value_is_for, yaml_key, yaml_key_like, KIND_LOCK_OVERRIDES,
 };
 use super::state::{
     write_marker, PnpmMeta, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
@@ -303,7 +303,7 @@ pub async fn vendor_pnpm_legacy(
     let override_key = format!("{name}@{version}");
 
     // ── 2. Read the pair (refuse before any write) ───────────────────────
-    let pkg_bytes = match tokio::fs::read(project_root.join(PACKAGE_JSON)).await {
+    let pkg_bytes = match read_regular(&project_root.join(PACKAGE_JSON)).await {
         Ok(bytes) => bytes,
         Err(e) => {
             return refused(
@@ -325,7 +325,7 @@ pub async fn vendor_pnpm_legacy(
             );
         }
     };
-    let lock_text = match tokio::fs::read_to_string(project_root.join(PNPM_LOCK)).await {
+    let lock_text = match read_regular_string(&project_root.join(PNPM_LOCK)).await {
         Ok(text) => text,
         Err(e) => {
             return refused(
@@ -603,12 +603,19 @@ pub async fn vendor_pnpm_legacy(
 /// (the `overrides:` declaration alone never counts); `None` when
 /// undeterminable — callers keep the entry, fail-safe.
 pub async fn pnpm_legacy_entry_in_use(entry: &VendorEntry, project_root: &Path) -> Option<bool> {
-    let text = tokio::fs::read_to_string(project_root.join(PNPM_LOCK))
+    let text = read_regular_string(&project_root.join(PNPM_LOCK))
         .await
         .ok()?;
     match sniff_lock_grammar(&text) {
         Ok(PnpmLockGrammar::V54 | PnpmLockGrammar::V60) => {}
         _ => return None,
+    }
+    // CRLF (a Windows autocrlf checkout) breaks every structural probe
+    // below: the scan would find nothing and call a lock that still
+    // resolves through the artifact "provably orphaned" — undeterminable,
+    // keep (the unwired-revert guard then refuses, fail-closed).
+    if text.contains('\r') {
+        return None;
     }
     let lines = split_lines(&text);
     let Some((start, end)) = section_bounds(&lines, "packages") else {
@@ -1050,7 +1057,12 @@ fn edit_packages(
             file: PNPM_LOCK.to_string(),
             kind: KIND_LOCK_PACKAGE.to_string(),
             action: WiringAction::Rewritten,
-            key: Some(old_key),
+            // Always the registry key: a stale-ours block's key embeds the
+            // OLD uuid, and recording it would break the carry-forward
+            // original-fill's file+kind+key match against the first
+            // vendoring's record (revert locates the live block via `new`'s
+            // embedded key, never via `key`).
+            key: Some(reg_key.clone()),
             original: if is_ours_key {
                 None
             } else {
@@ -1223,7 +1235,7 @@ pub async fn revert_pnpm_legacy(
 
     let mut lock_lines: Option<Vec<String>> = None;
     if touches_lock {
-        match tokio::fs::read_to_string(project_root.join(PNPM_LOCK)).await {
+        match read_regular_string(&project_root.join(PNPM_LOCK)).await {
             Ok(text) => lock_lines = Some(split_lines(&text)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 outcome.warnings.push(VendorWarning::new(
@@ -1236,7 +1248,7 @@ pub async fn revert_pnpm_legacy(
     }
     let mut pkg_state: Option<(Value, String)> = None;
     if touches_pkg {
-        match tokio::fs::read(project_root.join(PACKAGE_JSON)).await {
+        match read_regular(&project_root.join(PACKAGE_JSON)).await {
             Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
                 Ok(doc) if doc.is_object() => {
                     let indent = detect_indent(&String::from_utf8_lossy(&bytes));
@@ -1339,6 +1351,16 @@ pub async fn revert_pnpm_legacy(
                 return RevertOutcome::failed(format!("cannot write {PACKAGE_JSON}: {e}"));
             }
         }
+    }
+
+    // LOSSINESS GUARD (residual #131): when any wiring record was left
+    // alone ("drifted; left alone"), the uuid dir may hold the only copy of
+    // what the lock still points at. Keep it (and let the CLI keep the
+    // ledger entry) instead of deleting evidence out from under a lock we
+    // just refused to touch — same gate as the v9 backend.
+    if outcome.drift_skipped() {
+        outcome.keep_artifact(&uuid_dir_rel);
+        return outcome;
     }
 
     if let Err(e) = remove_tree(&project_root.join(&uuid_dir_rel)).await {
@@ -2468,6 +2490,43 @@ packages:
         assert_eq!(fx.read(PNPM_LOCK).await, T8_BEFORE_LOCK);
     }
 
+    /// A re-vendor under a NEW patch uuid rewrites the stale ours-keyed
+    /// packages block, and the record must carry the generation-STABLE
+    /// registry key (`/left-pad/1.3.0`) — not the stale `file:` key, whose
+    /// embedded old uuid breaks `carry_forward_wiring`'s file+kind+key
+    /// original-fill against the first vendoring's record and leaves the
+    /// merged record with `original: None`: revert then warns "no recorded
+    /// pre-vendor original" and the lock stays wired forever.
+    #[tokio::test]
+    async fn new_uuid_revendor_revert_restores_the_packages_block() {
+        let mut fx = fixture_with(T_BEFORE_PKG, T7_BEFORE_LOCK).await;
+        let (_, prev, _) = expect_done(fx.vendor(false).await);
+        let prev = prev.unwrap();
+
+        // The patch is updated upstream: same package, new uuid.
+        fx.record.uuid = "0a1b2c3d-4e5f-6a7b-8c9d-0e1f2a3b4c5d".to_string();
+        let (_, revendored, _) = expect_done(fx.vendor(false).await);
+        let mut merged = revendored.unwrap();
+        assert_ne!(merged.uuid, prev.uuid, "re-vendor is a new generation");
+
+        // Reconcile with the entry being replaced (as persist_vendor_entry
+        // does), then revert.
+        super::super::state::carry_forward_wiring(&prev, &mut merged);
+        let outcome = revert_pnpm_legacy(&merged, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        assert_eq!(
+            fx.read(PACKAGE_JSON).await,
+            T_BEFORE_PKG,
+            "package.json byte-restored"
+        );
+        assert_eq!(
+            fx.read(PNPM_LOCK).await,
+            T7_BEFORE_LOCK,
+            "lock byte-restored"
+        );
+    }
+
     /// A same-name override that is NOT an ownable pin refuses fail-closed.
     #[tokio::test]
     async fn conflicting_override_refuses() {
@@ -2698,5 +2757,193 @@ packages:
             .await
             .unwrap();
         assert_eq!(pnpm_legacy_entry_in_use(&entry, fx.root()).await, None);
+    }
+
+    /// A CRLF-converted lock (a Windows autocrlf checkout) is UNDETERMINABLE
+    /// for the in-use probe — `sniff_lock_grammar` tolerates the `\r` (its
+    /// `trim()` eats it) but every LF-exact section probe misses, so without
+    /// the guard the probe calls a lock that still resolves through the
+    /// artifact "provably orphaned" and the unwired-revert guard deletes it.
+    #[tokio::test]
+    async fn crlf_lock_is_undeterminable_for_in_use_and_unwired_revert_refuses() {
+        let fx = fixture_with(T_BEFORE_PKG, T7_BEFORE_LOCK).await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let mut entry = entry.unwrap();
+        let crlf = fx.read(PNPM_LOCK).await.replace('\n', "\r\n");
+        tokio::fs::write(fx.root().join(PNPM_LOCK), &crlf)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            pnpm_legacy_entry_in_use(&entry, fx.root()).await,
+            None,
+            "a CRLF lock is undeterminable, never provably orphaned"
+        );
+
+        // The empty-wiring (repair-reconstructed) revert rides that verdict.
+        entry.wiring.clear();
+        entry.pnpm = None;
+        let outcome = revert_pnpm_legacy(&entry, fx.root(), false).await;
+        assert!(!outcome.success, "unwired revert must refuse: {outcome:?}");
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_wiring_unknown_revert_blocked"),
+            "{:?}",
+            outcome.warnings
+        );
+        assert!(
+            fx.root().join(fx.rel_tgz()).exists(),
+            "the artifact must survive"
+        );
+    }
+
+    /// Wiring records left alone during a WIRED revert (here: a
+    /// CRLF-converted lock whose LF-exact probes all miss) must KEEP the
+    /// artifact dir — the lock still resolves through the tarball, and
+    /// deleting it bricks every subsequent install (residual #131's
+    /// lossiness guard, present in the v9/npm/bun backends).
+    #[tokio::test]
+    async fn drifted_lock_revert_keeps_the_artifact() {
+        let fx = fixture_with(T_BEFORE_PKG, T7_BEFORE_LOCK).await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+        let crlf = fx.read(PNPM_LOCK).await.replace('\n', "\r\n");
+        tokio::fs::write(fx.root().join(PNPM_LOCK), &crlf)
+            .await
+            .unwrap();
+
+        let outcome = revert_pnpm_legacy(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_lock_entry_drifted"),
+            "{:?}",
+            outcome.warnings
+        );
+        assert!(
+            outcome.kept_artifact,
+            "a drift-skip must keep the artifact: {:?}",
+            outcome.warnings
+        );
+        assert!(
+            fx.root().join(fx.rel_tgz()).exists(),
+            "the CRLF lock still resolves through the tarball; deleting it bricks installs"
+        );
+        assert_eq!(fx.read(PNPM_LOCK).await, crlf, "the drifted lock is left alone");
+    }
+
+    #[cfg(unix)]
+    fn mkfifo(path: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+        let c_path =
+            std::ffi::CString::new(path.as_os_str().as_bytes()).expect("fifo path has no NUL");
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
+        assert_eq!(
+            rc,
+            0,
+            "mkfifo(2) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    /// A FIFO planted as one of the pair files must fail fast instead of
+    /// wedging vendor / revert / the in-use probe forever in an `open(2)`
+    /// waiting for a writer that never comes. package.json is the FIRST open
+    /// in the legacy vendor flow, and revert's lock/package.json reads are
+    /// the first opens of theirs. Same `open_regular_file` guard class as
+    /// the v9 backend and the other vendor siblings.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fifo_pair_files_fail_fast_instead_of_wedging_vendor_and_revert() {
+        // Vendor half A: package.json is a FIFO.
+        let fxa = fixture_with(T_BEFORE_PKG, T7_BEFORE_LOCK).await;
+        tokio::fs::remove_file(fxa.root().join(PACKAGE_JSON))
+            .await
+            .unwrap();
+        mkfifo(&fxa.root().join(PACKAGE_JSON));
+
+        // Vendor half B: pnpm-lock.yaml is a FIFO.
+        let fxb = fixture_with(T_BEFORE_PKG, T7_BEFORE_LOCK).await;
+        tokio::fs::remove_file(fxb.root().join(PNPM_LOCK))
+            .await
+            .unwrap();
+        mkfifo(&fxb.root().join(PNPM_LOCK));
+
+        // Revert halves: vendor normally first, then swap one pair file for
+        // a FIFO before reverting (probing the in-use scan on the FIFO lock
+        // too).
+        let fxc = fixture_with(T_BEFORE_PKG, T7_BEFORE_LOCK).await;
+        let (_, entry_c, _) = expect_done(fxc.vendor(false).await);
+        let entry_c = entry_c.unwrap();
+        tokio::fs::remove_file(fxc.root().join(PNPM_LOCK))
+            .await
+            .unwrap();
+        mkfifo(&fxc.root().join(PNPM_LOCK));
+
+        let fxd = fixture_with(T_BEFORE_PKG, T7_BEFORE_LOCK).await;
+        let (_, entry_d, _) = expect_done(fxd.vendor(false).await);
+        let entry_d = entry_d.unwrap();
+        tokio::fs::remove_file(fxd.root().join(PACKAGE_JSON))
+            .await
+            .unwrap();
+        mkfifo(&fxd.root().join(PACKAGE_JSON));
+
+        let deadline = std::time::Duration::from_secs(5);
+        let all = async {
+            (
+                fxa.vendor(false).await,
+                fxb.vendor(false).await,
+                pnpm_legacy_entry_in_use(&entry_c, fxc.root()).await,
+                revert_pnpm_legacy(&entry_c, fxc.root(), false).await,
+                revert_pnpm_legacy(&entry_d, fxd.root(), false).await,
+            )
+        };
+        let Ok((vendored_a, vendored_b, in_use_c, reverted_c, reverted_d)) =
+            tokio::time::timeout(deadline, all).await
+        else {
+            // On timeout the open is wedged in a `spawn_blocking` thread the
+            // runtime waits for on shutdown; connect a non-blocking writer to
+            // release it so the test can FAIL instead of hanging the suite.
+            use std::os::unix::fs::OpenOptionsExt;
+            for path in [
+                fxa.root().join(PACKAGE_JSON),
+                fxb.root().join(PNPM_LOCK),
+                fxc.root().join(PNPM_LOCK),
+                fxd.root().join(PACKAGE_JSON),
+            ] {
+                let _ = std::fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(path);
+            }
+            panic!("legacy pnpm pair-file reads must fail fast on FIFOs");
+        };
+        let detail = expect_refused(vendored_a, "vendor_lockfile_missing");
+        assert!(detail.contains(PACKAGE_JSON), "{detail}");
+        let detail = expect_refused(vendored_b, "vendor_lockfile_missing");
+        assert!(detail.contains(PNPM_LOCK), "{detail}");
+        assert_eq!(in_use_c, None, "a FIFO lock is undeterminable");
+        assert!(
+            !reverted_c.success,
+            "revert must fail closed on a FIFO lock: {:?}",
+            reverted_c.warnings
+        );
+        assert!(
+            fxc.root().join(fxc.rel_tgz()).exists(),
+            "the artifact must survive the failed revert"
+        );
+        assert!(
+            !reverted_d.success,
+            "revert must fail closed on a FIFO package.json: {:?}",
+            reverted_d.warnings
+        );
+        assert!(
+            fxd.root().join(fxd.rel_tgz()).exists(),
+            "the artifact must survive the failed revert"
+        );
     }
 }

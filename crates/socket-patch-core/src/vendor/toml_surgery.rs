@@ -96,6 +96,14 @@ pub(super) fn replace_files_array(
     let mut i = 0;
     while i < unit.len() {
         let line = unit[i];
+        // The files array is a top-level unit key, always ahead of any
+        // `[package.*]` sub-table — a sub-table entry that happens to be
+        // keyed `files` (a dependency or extra literally named "files")
+        // must pass through verbatim, not be rewritten as a wheel array.
+        if line.starts_with("[package.") {
+            out.extend(unit[i..].iter().map(|l| (*l).to_string()));
+            break;
+        }
         if line.starts_with("files = [") {
             out.extend(files_lines.iter().cloned());
             files_done = true;
@@ -237,52 +245,50 @@ pub(super) fn remove_substring(text: &str, needle: &str) -> Option<String> {
 }
 
 /// Remove the first line that equals `line` exactly; `None` when absent.
+/// Spliced by byte span so every other byte — including CRLF endings in a
+/// user-authored pyproject.toml — survives verbatim.
 pub(super) fn remove_exact_line(text: &str, line: &str) -> Option<String> {
-    let mut out: Vec<&str> = Vec::new();
-    let mut removed = false;
-    for l in text.lines() {
-        if !removed && l == line {
-            removed = true;
-            continue;
+    let mut offset = 0;
+    for seg in text.split_inclusive('\n') {
+        let l = seg.strip_suffix('\n').unwrap_or(seg);
+        let l = l.strip_suffix('\r').unwrap_or(l);
+        if l == line {
+            let mut out = String::with_capacity(text.len() - seg.len());
+            out.push_str(&text[..offset]);
+            out.push_str(&text[offset + seg.len()..]);
+            return Some(out);
         }
-        out.push(l);
+        offset += seg.len();
     }
-    if !removed {
-        return None;
-    }
-    let mut joined = out.join("\n");
-    if text.ends_with('\n') && !joined.is_empty() {
-        joined.push('\n');
-    }
-    Some(joined)
+    None
 }
 
 /// Drop a `[header]` whose section holds only blank lines, plus its
 /// preceding blank separator. A non-empty section is left untouched.
+/// Spliced by byte span so every other byte — including CRLF endings in a
+/// user-authored pyproject.toml — survives verbatim.
 pub(super) fn remove_table_if_empty(text: &str, header: &str) -> String {
-    let lines: Vec<&str> = text.lines().collect();
-    let Some(h) = lines.iter().position(|l| l.trim_end() == header) else {
+    let index = line_index(text);
+    let Some(h) = index.iter().position(|(_, l)| l.trim_end() == header) else {
         return text.to_string();
     };
     let mut end = h + 1;
-    while end < lines.len() && !lines[end].starts_with('[') {
-        if !lines[end].trim().is_empty() {
+    while end < index.len() && !index[end].1.starts_with('[') {
+        if !index[end].1.trim().is_empty() {
             return text.to_string();
         }
         end += 1;
     }
     let mut start = h;
-    if start > 0 && lines[start - 1].trim().is_empty() {
+    if start > 0 && index[start - 1].1.trim().is_empty() {
         start -= 1;
     }
-    let mut out: Vec<&str> = Vec::with_capacity(lines.len());
-    out.extend(&lines[..start]);
-    out.extend(&lines[end..]);
-    let mut joined = out.join("\n");
-    if text.ends_with('\n') && !joined.is_empty() {
-        joined.push('\n');
-    }
-    joined
+    let start_byte = index[start].0;
+    let end_byte = index.get(end).map_or(text.len(), |(off, _)| *off);
+    let mut out = String::with_capacity(text.len() - (end_byte - start_byte));
+    out.push_str(&text[..start_byte]);
+    out.push_str(&text[end_byte..]);
+    out
 }
 
 #[cfg(test)]
@@ -371,6 +377,35 @@ mod tests {
             ]
         );
         assert!(replace_files_array(&["name = \"six\""], "w.whl", "beef").is_none());
+
+        // A sub-table entry keyed `files` (a dep/extra literally named
+        // "files") passes through verbatim — only the top-level array,
+        // always ahead of any `[package.*]` sub-table, is rewritten.
+        let subtable = [
+            "files = []",
+            "",
+            "[package.extras]",
+            "files = [\"files (>=1.0)\"]",
+        ];
+        assert_eq!(
+            replace_files_array(&subtable, "w.whl", "beef").unwrap(),
+            vec![
+                "files = [",
+                "    {file = \"w.whl\", hash = \"sha256:beef\"},",
+                "]",
+                "",
+                "[package.extras]",
+                "files = [\"files (>=1.0)\"]"
+            ]
+        );
+        // No TOP-LEVEL files array at all → None (fail closed), even when a
+        // sub-table line is keyed `files`.
+        assert!(replace_files_array(
+            &["name = \"six\"", "[package.extras]", "files = [\"x\"]"],
+            "w.whl",
+            "beef"
+        )
+        .is_none());
     }
 
     #[test]
@@ -429,5 +464,35 @@ mod tests {
         assert_eq!(remove_table_if_empty(keep, "[tool.uv]"), keep);
         // Absent header untouched.
         assert_eq!(remove_table_if_empty("x = 1\n", "[tool.uv]"), "x = 1\n");
+    }
+
+    #[test]
+    fn removal_helpers_preserve_foreign_line_endings() {
+        // pyproject.toml is user-authored: git autocrlf on Windows makes it
+        // CRLF, and the wire's toml_edit inserts append LF lines, so revert
+        // sees mixed endings. Every byte outside the removed segment must
+        // survive verbatim (the go_mod/go_sum CRLF-churn class).
+        let wired = "[project]\r\nname = \"x\"\r\n\n[tool.uv.sources]\nfoo = { path = \"w.whl\" }\n";
+        let after = remove_exact_line(wired, "foo = { path = \"w.whl\" }").unwrap();
+        assert_eq!(after, "[project]\r\nname = \"x\"\r\n\n[tool.uv.sources]\n");
+        assert_eq!(
+            remove_table_if_empty(&after, "[tool.uv.sources]"),
+            "[project]\r\nname = \"x\"\r\n",
+            "revert must restore the pre-wire bytes exactly"
+        );
+
+        // All-CRLF file: the match is EOL-insensitive, the splice is not.
+        assert_eq!(
+            remove_exact_line("a\r\nb\r\nc\r\n", "b").as_deref(),
+            Some("a\r\nc\r\n")
+        );
+        assert_eq!(
+            remove_table_if_empty("x = 1\r\n\r\n[tool.uv]\r\n", "[tool.uv]"),
+            "x = 1\r\n"
+        );
+
+        // Removing the final newline-less line keeps the prior line's
+        // terminator (byte-exact splice, not a lines()/join rebuild).
+        assert_eq!(remove_exact_line("a\nb", "b").as_deref(), Some("a\n"));
     }
 }
