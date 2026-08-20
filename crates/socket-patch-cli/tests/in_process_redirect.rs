@@ -827,8 +827,10 @@ async fn scan_redirect_rewrites_correct_entry_in_crlf_classic_lock() {
     );
 }
 
-/// Write a project whose only lockfile is a text `bun.lock` (registry 4-tuple).
-fn write_bun_project(root: &Path) {
+/// Write a project whose only lockfile is a text `bun.lock` (registry
+/// 4-tuple) at the given `lockfileVersion` (bun 1.3 emits 1, bun 1.4 emits 2
+/// — same grammar either way).
+fn write_bun_project(root: &Path, lock_version: u64) {
     std::fs::write(
         root.join("package.json"),
         format!(
@@ -846,7 +848,7 @@ fn write_bun_project(root: &Path) {
     std::fs::write(
         root.join("bun.lock"),
         format!(
-            "{{\n  \"lockfileVersion\": 1,\n  \"packages\": {{\n    \
+            "{{\n  \"lockfileVersion\": {lock_version},\n  \"packages\": {{\n    \
              \"{NAME}\": [\"{NAME}@{VERSION}\", \"\", {{}}, \"sha512-UPSTREAMupstream==\"],\n  \
              }}\n}}\n"
         ),
@@ -864,7 +866,7 @@ async fn scan_redirect_rewrites_bun_lock() {
     mock_reference(&server).await;
 
     let tmp = tempfile::tempdir().unwrap();
-    write_bun_project(tmp.path());
+    write_bun_project(tmp.path(), 1);
 
     let code = run(redirect_args(tmp.path(), server.uri())).await;
     assert_eq!(code, 0, "scan --redirect (bun) should succeed");
@@ -887,6 +889,80 @@ async fn scan_redirect_rewrites_bun_lock() {
             .join(".socket/vendor/redirect-state.json")
             .is_file(),
         "a redirect ledger should be written"
+    );
+}
+
+/// The bun 1.4 leg: `"lockfileVersion": 2` is the SAME emitted grammar as 1
+/// (bun 1.4 bumped the integer to gate stricter parse checks — oven-sh/bun
+/// PR #31539 — same-fixture locks are byte-identical except the integer), so
+/// the rewrite must proceed exactly like v1 and preserve the version line.
+#[tokio::test]
+#[serial]
+async fn scan_redirect_rewrites_bun_lock_v2() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_bun_project(tmp.path(), 2);
+
+    let code = run(redirect_args(tmp.path(), server.uri())).await;
+    assert_eq!(code, 0, "scan --redirect (bun, lock v2) should succeed");
+
+    let lock = std::fs::read_to_string(tmp.path().join("bun.lock")).unwrap();
+    assert!(
+        lock.contains("\"lockfileVersion\": 2,"),
+        "the version line must be preserved verbatim; got:\n{lock}"
+    );
+    assert!(
+        lock.contains(&format!("\"{NAME}@{HOSTED_URL}\"")),
+        "the tuple's spec must be name@<hosted url>; got:\n{lock}"
+    );
+    assert!(
+        lock.contains(PATCHED_SHA512),
+        "integrity must be the patched sha512"
+    );
+    assert!(
+        tmp.path()
+            .join(".socket/vendor/redirect-state.json")
+            .is_file(),
+        "a redirect ledger should be written"
+    );
+}
+
+/// A future `lockfileVersion` (3) has no byte-exact fixtures: the rewrite
+/// must refuse whole (fail closed), leave the lock byte-identical, count
+/// nothing redirected, and surface `redirect_bun_lock_unsupported` in the
+/// `--json` envelope. Subprocess so `redirected` and `warnings[]` can be
+/// read back.
+#[tokio::test]
+#[serial]
+async fn scan_redirect_refuses_bun_lock_v3() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_bun_project(tmp.path(), 3);
+    let before = std::fs::read_to_string(tmp.path().join("bun.lock")).unwrap();
+
+    let env = run_redirect_subprocess(tmp.path(), &server.uri());
+    assert_eq!(
+        env["redirect"]["redirected"], 0,
+        "an unsupported lock version must redirect nothing: {env}"
+    );
+    assert!(
+        warning_codes(&env).contains(&"redirect_bun_lock_unsupported".to_string()),
+        "the refusal must reach the envelope: {env}"
+    );
+    let after = std::fs::read_to_string(tmp.path().join("bun.lock")).unwrap();
+    assert_eq!(
+        after, before,
+        "fail-closed: the lock must be byte-untouched"
+    );
+    assert!(
+        !after.contains(HOSTED_URL),
+        "the hosted URL must never appear in a refused lock: {after}"
     );
 }
 

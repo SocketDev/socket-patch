@@ -1130,13 +1130,35 @@ mod tests {
         let detail = expect_refused(fx.vendor(false).await, "vendor_lockfile_missing");
         assert!(detail.contains("bun install"), "{detail}");
 
-        let lock = BN3_BEFORE_LOCK.replace("\"lockfileVersion\": 1,", "\"lockfileVersion\": 2,");
+        let lock = BN3_BEFORE_LOCK.replace("\"lockfileVersion\": 1,", "\"lockfileVersion\": 3,");
         let fx = fixture_with(&lock, "node_modules/left-pad").await;
         let detail = expect_refused(
             fx.vendor(false).await,
             "vendor_lockfile_version_unsupported",
         );
-        assert!(detail.contains('2'), "{detail}");
+        assert!(detail.contains('3'), "{detail}");
+    }
+
+    /// bun >= 1.4 writes `"lockfileVersion": 2` over the SAME emitted grammar
+    /// (the bump gates stricter parse checks, not new entry shapes), so
+    /// vendoring must proceed exactly as on a v1 lock, and the version line
+    /// must survive verbatim.
+    #[tokio::test]
+    async fn lock_v2_vendors_like_v1() {
+        let lock = BN3_BEFORE_LOCK.replace("\"lockfileVersion\": 1,", "\"lockfileVersion\": 2,");
+        assert_ne!(lock, BN3_BEFORE_LOCK, "replacement must hit");
+        let fx = fixture_with(&lock, "node_modules/left-pad").await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        assert!(entry.is_some(), "the vendor run must record an entry");
+        let rewritten = fx.read_lock().await;
+        assert!(
+            rewritten.contains("\"lockfileVersion\": 2,"),
+            "the version line must be preserved verbatim: {rewritten}"
+        );
+        assert!(
+            rewritten.contains(".socket/vendor/npm/"),
+            "the packages entry must point at the vendored tarball: {rewritten}"
+        );
     }
 
     #[tokio::test]

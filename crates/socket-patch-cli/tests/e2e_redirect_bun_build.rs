@@ -125,13 +125,24 @@ struct BunRedirectFixture {
     tmp: tempfile::TempDir,
     proj: PathBuf,
     patched: Vec<u8>,
+    /// True when the installed bun itself wrote `"lockfileVersion": 2`
+    /// (bun >= 1.4) — i.e. this toolchain can also READ a v2 lock, so the
+    /// fresh-checkout install proof is valid on a v2 lock.
+    native_lock_v2: bool,
     _server: MockServer,
 }
 
 /// Steps 1–3: real install, patched tarball + API mocks, `scan --mode hosted
 /// --vex`, and the envelope/lockfile/ledger assertions. `tamper_served_tarball`
-/// serves DIFFERENT bytes than the sha512 pinned into the lock. `None` = skip.
-async fn bun_hosted_project(tag: &str, tamper_served_tarball: bool) -> Option<BunRedirectFixture> {
+/// serves DIFFERENT bytes than the sha512 pinned into the lock.
+/// `force_lock_version` re-pins the fixture lock's `"lockfileVersion"` line
+/// before the scan (sound because v1 and v2 share one emitted grammar — same
+/// fixture locks are byte-identical except the integer). `None` = skip.
+async fn bun_hosted_project(
+    tag: &str,
+    tamper_served_tarball: bool,
+    force_lock_version: Option<u64>,
+) -> Option<BunRedirectFixture> {
     if !has_command("bun") {
         println!("SKIP e2e_redirect_bun_build ({tag}): `bun` not installed");
         return None;
@@ -169,6 +180,26 @@ async fn bun_hosted_project(tag: &str, tamper_served_tarball: bool) -> Option<Bu
              lockfile?)"
         );
         return None;
+    }
+    let native_lock = std::fs::read_to_string(proj.join("bun.lock")).unwrap();
+    let native_lock_v2 = native_lock.contains("\"lockfileVersion\": 2");
+    if let Some(v) = force_lock_version {
+        // Splice ONLY the version line (v1 and v2 share one emitted grammar).
+        let forced: String = native_lock
+            .split_inclusive('\n')
+            .map(|line| {
+                if line.trim_start().starts_with("\"lockfileVersion\":") {
+                    format!("  \"lockfileVersion\": {v},\n")
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect();
+        assert!(
+            forced.contains(&format!("\"lockfileVersion\": {v},")),
+            "the fixture lock must carry a lockfileVersion line to force:\n{native_lock}"
+        );
+        std::fs::write(proj.join("bun.lock"), forced).unwrap();
     }
 
     let installed_dir = proj.join("node_modules").join(DEP);
@@ -366,6 +397,12 @@ async fn bun_hosted_project(tag: &str, tamper_served_tarball: bool) -> Option<Bu
         lock.contains(&sri),
         "bun.lock integrity must be the patched sha512 ({sri}); got:\n{lock}"
     );
+    if let Some(v) = force_lock_version {
+        assert!(
+            lock.contains(&format!("\"lockfileVersion\": {v},")),
+            "the rewrite must preserve the lockfileVersion line verbatim; got:\n{lock}"
+        );
+    }
 
     let ledger = std::fs::read_to_string(proj.join(".socket/vendor/redirect-state.json")).unwrap();
     assert!(
@@ -377,6 +414,7 @@ async fn bun_hosted_project(tag: &str, tamper_served_tarball: bool) -> Option<Bu
         tmp,
         proj,
         patched,
+        native_lock_v2,
         _server: server,
     })
 }
@@ -402,11 +440,16 @@ fn fresh_checkout_bun_install(fx: &BunRedirectFixture) -> (PathBuf, Output) {
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial]
 async fn bun_redirect_fresh_checkout_installs_patched_bytes() {
-    let Some(fx) = bun_hosted_project("main", false).await else {
+    let Some(fx) = bun_hosted_project("main", false, None).await else {
         return;
     };
+    assert_patched_fresh_install(&fx);
+}
 
-    let (fresh, ci) = fresh_checkout_bun_install(&fx);
+/// Shared fresh-checkout proof: `bun install --frozen-lockfile` against an
+/// empty cache must materialize the PATCHED bytes from the hosted tarball.
+fn assert_patched_fresh_install(fx: &BunRedirectFixture) {
+    let (fresh, ci) = fresh_checkout_bun_install(fx);
     assert!(
         ci.status.success(),
         "fresh-checkout `bun install --frozen-lockfile` must succeed from the hosted patch \
@@ -426,12 +469,34 @@ async fn bun_redirect_fresh_checkout_installs_patched_bytes() {
     );
 }
 
+/// The bun 1.4 leg: `"lockfileVersion": 2` shares v1's emitted grammar (the
+/// bump gates stricter parse checks — integrity hashes required for
+/// off-registry npm tarballs, which our URL 3-tuple always carries), so the
+/// redirect must rewrite a v2 lock exactly like a v1 lock. When the installed
+/// bun is itself >= 1.4 (it WROTE v2 — older bun cannot read v2 locks), the
+/// fresh-checkout frozen install must again produce the patched bytes.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial]
+async fn bun_redirect_lock_v2_fresh_checkout_installs_patched_bytes() {
+    let Some(fx) = bun_hosted_project("lock-v2", false, Some(2)).await else {
+        return;
+    };
+    if !fx.native_lock_v2 {
+        println!(
+            "PARTIAL e2e_redirect_bun_build (lock-v2): installed bun writes lockfileVersion 1 \
+             (< 1.4) and cannot read the forced v2 lock — rewrite proven, install proof skipped"
+        );
+        return;
+    }
+    assert_patched_fresh_install(&fx);
+}
+
 /// Negative twin: the hosted route serves TAMPERED bytes while the lock pins
 /// the real sha512 — the fresh frozen install must refuse.
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial]
 async fn bun_redirect_tampered_hosted_tarball_fails_frozen_install() {
-    let Some(fx) = bun_hosted_project("tampered", true).await else {
+    let Some(fx) = bun_hosted_project("tampered", true, None).await else {
         return;
     };
 

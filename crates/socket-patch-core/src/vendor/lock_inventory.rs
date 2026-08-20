@@ -2556,21 +2556,41 @@ __metadata:
 
     #[tokio::test]
     async fn bun_registry_tuples_parse_and_locals_are_skipped() {
-        let tmp = tempfile::tempdir().unwrap();
-        write(tmp.path(), "bun.lock", BUN_LOCK).await;
+        // lockfileVersion 1 (bun 1.3) and 2 (bun 1.4) share one emitted
+        // grammar, so inventory must read both identically.
+        for version in [1u64, 2] {
+            let lock = BUN_LOCK.replace(
+                "\"lockfileVersion\": 1,",
+                &format!("\"lockfileVersion\": {version},"),
+            );
+            let tmp = tempfile::tempdir().unwrap();
+            write(tmp.path(), "bun.lock", &lock).await;
 
-        let (flavor, entries) = inventory_npm_lock(tmp.path()).await.unwrap().unwrap();
-        assert_eq!(flavor, NpmLockFlavor::Bun);
+            let (flavor, entries) = inventory_npm_lock(tmp.path()).await.unwrap().unwrap();
+            assert_eq!(flavor, NpmLockFlavor::Bun);
 
-        assert_eq!(
-            entry(&entries, "left-pad").integrity,
-            LockIntegrity::Sri("sha512-XI5MPz==".into())
-        );
-        assert_eq!(entry(&entries, "left-pad").resolved, None);
-        assert_eq!(entry(&entries, "@scope/pkg").version, "2.0.0");
-        for absent in ["vendored", "linked"] {
-            assert!(!entries.iter().any(|e| e.name == absent), "{entries:?}");
+            assert_eq!(
+                entry(&entries, "left-pad").integrity,
+                LockIntegrity::Sri("sha512-XI5MPz==".into()),
+                "lockfileVersion {version}"
+            );
+            assert_eq!(entry(&entries, "left-pad").resolved, None);
+            assert_eq!(entry(&entries, "@scope/pkg").version, "2.0.0");
+            for absent in ["vendored", "linked"] {
+                assert!(!entries.iter().any(|e| e.name == absent), "{entries:?}");
+            }
         }
+
+        // An unsupported lockfileVersion (a future 3) yields no inventory at
+        // all — fail closed, same posture as the vendor/redirect gates.
+        let lock = BUN_LOCK.replace("\"lockfileVersion\": 1,", "\"lockfileVersion\": 3,");
+        assert_ne!(lock, BUN_LOCK, "replacement must hit");
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), "bun.lock", &lock).await;
+        assert!(
+            inventory_npm_lock(tmp.path()).await.unwrap().is_none(),
+            "a lockfileVersion-3 bun.lock must not be inventoried"
+        );
     }
 
     // ── shared semantics ──────────────────────────────────────────────────
