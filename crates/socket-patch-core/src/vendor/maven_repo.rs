@@ -123,6 +123,32 @@ fn is_safe_group_id(group_id: &str) -> bool {
     group_id.split('.').all(is_safe_single_segment)
 }
 
+/// Guarded read shared in shape with the vendor twins (cargo.rs, gem.rs,
+/// composer_lock.rs …): `open_regular_file` opens with `O_NONBLOCK` and
+/// rejects non-regular files, so a FIFO planted at any of this backend's read
+/// paths — the committed vendored tree, the project `pom.xml`, the `~/.m2`
+/// cache — fails fast instead of wedging the caller forever in an `open(2)`
+/// waiting for a writer that never comes.
+async fn read_regular(path: &Path) -> std::io::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt as _;
+
+    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.read_to_end(&mut bytes).await?;
+    Ok(bytes)
+}
+
+/// String twin of [`read_regular`] (invalid UTF-8 errors as `InvalidData`,
+/// matching `tokio::fs::read_to_string`).
+async fn read_regular_to_string(path: &Path) -> std::io::Result<String> {
+    use tokio::io::AsyncReadExt as _;
+
+    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
+    let mut content = String::with_capacity(metadata.len() as usize);
+    file.read_to_string(&mut content).await?;
+    Ok(content)
+}
+
 /// Vendor a Maven package: rebuild a patched `.jar` under a committed maven2
 /// repository at `.socket/vendor/maven/<uuid>/`, copy the real upstream pom
 /// beside it, and wire the project `pom.xml` with a `<repository>` serving it
@@ -194,7 +220,7 @@ pub async fn vendor_maven(
 
     // ── project pom.xml: presence + aggregator/gradle refusals ────────────
     let pom_xml_path = project_root.join(PROJECT_POM);
-    let pom_xml_text: Option<String> = match tokio::fs::read_to_string(&pom_xml_path).await {
+    let pom_xml_text: Option<String> = match read_regular_to_string(&pom_xml_path).await {
         Ok(t) => Some(t),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => {
@@ -665,7 +691,7 @@ async fn acquire_upstream_pom(
     warnings: &mut Vec<VendorWarning>,
 ) -> Result<Vec<u8>, String> {
     let local = installed_dir.join(format!("{artifact_id}-{version}.pom"));
-    match tokio::fs::read(&local).await {
+    match read_regular(&local).await {
         Ok(bytes) => return Ok(bytes),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(format!("unreadable local pom {}: {e}", local.display())),
@@ -784,7 +810,7 @@ async fn dry_run_verify(
 /// entry fail-closed. Returns the live [`tempfile::TempDir`] (the caller holds
 /// it for the stage's lifetime).
 async fn extract_jar_to_stage(src_jar: &Path) -> Result<tempfile::TempDir, String> {
-    let bytes = tokio::fs::read(src_jar)
+    let bytes = read_regular(src_jar)
         .await
         .map_err(|e| format!("cannot read {}: {e}", src_jar.display()))?;
     let stage = tempfile::tempdir().map_err(|e| format!("cannot create stage dir: {e}"))?;
@@ -836,11 +862,10 @@ async fn artifact_in_sync(
 
 /// True when `<leaf>.sha1` exists and equals the hex sha1 of `<leaf>`'s bytes.
 async fn sidecar_matches(leaf_dir: &Path, leaf: &str) -> bool {
-    let Ok(bytes) = tokio::fs::read(leaf_dir.join(leaf)).await else {
+    let Ok(bytes) = read_regular(&leaf_dir.join(leaf)).await else {
         return false;
     };
-    let Ok(recorded) = tokio::fs::read_to_string(leaf_dir.join(format!("{leaf}.sha1"))).await
-    else {
+    let Ok(recorded) = read_regular_to_string(&leaf_dir.join(format!("{leaf}.sha1"))).await else {
         return false;
     };
     recorded.trim() == sha1_hex(&bytes)
@@ -1111,7 +1136,7 @@ async fn revert_repo_record(
         Some(Value::String(new)) => Some(new),
         _ => None,
     };
-    let live = match tokio::fs::read_to_string(pom_xml_path).await {
+    let live = match read_regular_to_string(pom_xml_path).await {
         Ok(live) => live,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             // The pom is gone (deleted by the user) — nothing to restore.
@@ -2129,6 +2154,194 @@ mod tests {
             r2.package_path,
             root.join(jar_rel()).display().to_string(),
             "rebuild leg must report the vendored jar, not the temp stage"
+        );
+    }
+
+    #[cfg(unix)]
+    fn mkfifo(path: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+        let c_path =
+            std::ffi::CString::new(path.as_os_str().as_bytes()).expect("fifo path has no NUL");
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
+        assert_eq!(
+            rc,
+            0,
+            "mkfifo(2) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    /// Await `fut` under the FIFO-wedge deadline. On timeout, connect a writer
+    /// to `fifo` so the blocked `open(2)` in the runtime's blocking pool is
+    /// released (letting the test FAIL instead of hanging the whole suite),
+    /// then panic with `what`.
+    #[cfg(unix)]
+    async fn expect_fast<T>(
+        fut: impl std::future::Future<Output = T>,
+        fifo: &Path,
+        what: &str,
+    ) -> T {
+        let deadline = std::time::Duration::from_secs(5);
+        match tokio::time::timeout(deadline, fut).await {
+            Ok(v) => v,
+            Err(_) => {
+                let _ = std::fs::OpenOptions::new().write(true).open(fifo);
+                panic!("{what}");
+            }
+        }
+    }
+
+    /// A FIFO planted as the committed vendored pom (the tamper-able tree)
+    /// must read as out-of-sync — triggering the artifact rebuild that
+    /// atomically replaces it — instead of wedging the in-sync hot path
+    /// forever in an `open(2)` waiting for a writer. The jar half of this
+    /// probe (`zip_matches_after_hashes`) is already guarded in common.rs;
+    /// this pins the `sidecar_matches` half.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fifo_vendored_pom_fails_fast_and_rebuilds_on_hot_path() {
+        let (dir, blobs, installed, record) = fixture(Some(project_pom()), true, true).await;
+        let root = dir.path();
+        let (r1, _e, _w) = unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert!(r1.success);
+        let vendored_pom = root.join(format!("{}/commons-text-1.10.0.pom", leaf_rel()));
+        tokio::fs::remove_file(&vendored_pom).await.unwrap();
+        mkfifo(&vendored_pom);
+
+        let outcome = expect_fast(
+            run_vendor(root, &blobs, &installed, &record, false),
+            &vendored_pom,
+            "the in-sync probe must fail fast on a FIFO vendored pom, not wedge",
+        )
+        .await;
+        let (r2, e2, w2) = unwrap_done(outcome);
+        assert!(r2.success, "{:?}", r2.error);
+        assert!(e2.is_none(), "artifact-only rebuild must not re-record");
+        assert!(
+            w2.iter().any(|w| w.code == "vendor_artifact_rebuilt"),
+            "FIFO pom must read as stale and trigger the rebuild: {w2:?}"
+        );
+        assert_eq!(
+            tokio::fs::read(&vendored_pom).await.unwrap(),
+            UPSTREAM_POM,
+            "the rebuild must atomically replace the FIFO with the real pom"
+        );
+    }
+
+    /// A FIFO planted as the project `pom.xml` must surface the fail-closed
+    /// unreadable refusal instead of wedging every vendor run forever.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fifo_project_pom_fails_fast_in_vendor() {
+        let (dir, blobs, installed, record) = fixture(None, true, true).await;
+        let root = dir.path();
+        let pom_path = root.join(PROJECT_POM);
+        mkfifo(&pom_path);
+
+        let outcome = expect_fast(
+            run_vendor(root, &blobs, &installed, &record, false),
+            &pom_path,
+            "vendor must fail fast on a FIFO pom.xml, not wedge",
+        )
+        .await;
+        let (code, _d) = unwrap_refused(outcome);
+        assert_eq!(code, "vendor_maven_pom_unreadable");
+    }
+
+    /// A FIFO planted as the cached `~/.m2` jar passes the metadata probe but
+    /// must fail the stage read fast instead of wedging the rebuild forever.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fifo_cached_jar_fails_fast_in_local_rebuild() {
+        let (dir, blobs, installed, record) =
+            fixture(Some(project_pom()), /*with_local_jar=*/ false, true).await;
+        let root = dir.path();
+        let fifo_jar = installed.join("commons-text-1.10.0.jar");
+        mkfifo(&fifo_jar);
+
+        let outcome = expect_fast(
+            run_vendor(root, &blobs, &installed, &record, false),
+            &fifo_jar,
+            "the local rebuild must fail fast on a FIFO cached jar, not wedge",
+        )
+        .await;
+        let (result, entry, _w) = unwrap_done(outcome);
+        assert!(!result.success, "a FIFO jar cannot be staged");
+        assert!(entry.is_none());
+        assert!(
+            result.error.as_deref().is_some_and(|e| e.contains("read")),
+            "failure names the unreadable jar: {:?}",
+            result.error
+        );
+    }
+
+    /// A FIFO planted as the cached `~/.m2` pom must map to the
+    /// pom-unavailable refusal fast instead of wedging the pom copy forever.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fifo_local_pom_fails_fast_in_acquire_upstream_pom() {
+        let (dir, blobs, installed, record) =
+            fixture(Some(project_pom()), true, /*with_local_pom=*/ false).await;
+        let root = dir.path();
+        let fifo_pom = installed.join("commons-text-1.10.0.pom");
+        mkfifo(&fifo_pom);
+
+        let outcome = expect_fast(
+            run_vendor(root, &blobs, &installed, &record, false),
+            &fifo_pom,
+            "the pom copy must fail fast on a FIFO local pom, not wedge",
+        )
+        .await;
+        let (code, detail) = unwrap_refused(outcome);
+        assert_eq!(code, "vendor_maven_pom_unavailable");
+        assert!(
+            detail.contains("unreadable local pom"),
+            "refusal names the unreadable pom: {detail}"
+        );
+        assert!(
+            !root.join(format!(".socket/vendor/maven/{UUID}")).exists(),
+            "no partial artifact may survive the refusal"
+        );
+    }
+
+    /// A FIFO planted as `pom.xml` must fail the revert fast and loudly —
+    /// keeping the uuid dir for a retry — instead of wedging `--revert`
+    /// forever.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fifo_project_pom_fails_fast_in_revert() {
+        let (dir, blobs, installed, record) = fixture(Some(project_pom()), true, true).await;
+        let root = dir.path();
+        let (result, entry, _w) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert!(result.success);
+        let entry = entry.unwrap();
+
+        let pom_path = root.join(PROJECT_POM);
+        tokio::fs::remove_file(&pom_path).await.unwrap();
+        mkfifo(&pom_path);
+
+        let outcome = expect_fast(
+            revert_maven(&entry, root, false),
+            &pom_path,
+            "revert must fail fast on a FIFO pom.xml, not wedge",
+        )
+        .await;
+        assert!(
+            !outcome.success,
+            "an unreadable pom.xml must fail the revert"
+        );
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("unreadable")),
+            "error names the unreadable pom.xml: {:?}",
+            outcome.error
+        );
+        assert!(
+            root.join(format!(".socket/vendor/maven/{UUID}")).exists(),
+            "the artifact must survive a failed revert for the retry"
         );
     }
 }

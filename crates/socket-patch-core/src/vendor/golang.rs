@@ -1185,6 +1185,84 @@ mod tests {
             .any(|e| e.module == MODULE && e.owner == Some(ReplaceOwner::Vendor)));
     }
 
+    /// Cross-mode policy regression (docs/design/golang-hosted.md): vendor
+    /// takes over a hosted-mode replace through the LOCAL build leg too — only
+    /// local *apply* refuses a Hosted-owned directive (its go-patches copy is
+    /// uncommitted, so the takeover would break other machines). The hosted
+    /// directive is rewritten in place to the vendor path, the takeover is
+    /// surfaced, and the wiring `original` records the hosted module-target
+    /// text so `--revert` can name the go.sum recovery.
+    #[tokio::test]
+    async fn test_local_vendor_takes_over_hosted_replace() {
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        let hosted_target = format!("patch.socket.dev/gopatch/{UUID} v1.4.2-socketpatch.1");
+        tokio::fs::write(
+            root.join("go.mod"),
+            format!(
+                "module example.com/app\n\ngo 1.21\n\nrequire github.com/foo/bar v1.4.2\n\n\
+                 replace github.com/foo/bar v1.4.2 => {hosted_target}\n"
+            ),
+        )
+        .await
+        .unwrap();
+
+        let (result, entry, warnings) =
+            expect_done(run_vendor(PURL, root, &blobs, &pristine, &record, false).await);
+        assert!(
+            result.success,
+            "local vendor must take over the hosted replace: {:?}",
+            result.error
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.code == "vendor_takeover" && w.detail.contains("hosted")),
+            "hosted takeover surfaced: {warnings:?}"
+        );
+        // The directive is rewritten in place: exactly ONE, now vendor-owned.
+        let entries = read_replace_entries(root).await;
+        let mine: Vec<_> = entries.iter().filter(|e| e.module == MODULE).collect();
+        assert_eq!(
+            mine.len(),
+            1,
+            "single directive after takeover: {entries:?}"
+        );
+        assert_eq!(mine[0].owner, Some(ReplaceOwner::Vendor));
+        assert_eq!(
+            mine[0].path.as_deref(),
+            Some(format!("./{}", copy_rel()).as_str())
+        );
+        assert_eq!(
+            tokio::fs::read(root.join(copy_rel()).join("bar.go"))
+                .await
+                .unwrap(),
+            PATCHED
+        );
+
+        let entry = entry.expect("takeover records the ledger entry");
+        assert!(!entry.took_over_go_patches, "hosted, not go-patches");
+        let w = &entry.wiring[0];
+        assert_eq!(w.action, WiringAction::Rewritten);
+        assert_eq!(
+            w.original,
+            Some(serde_json::Value::from(hosted_target.clone())),
+            "the hosted module-target text is recorded verbatim"
+        );
+
+        // Revert drops the vendor directive and names the go.sum recovery.
+        let out = revert_go_vendor(&entry, root, false).await;
+        assert!(out.success, "{:?}", out.error);
+        assert!(
+            out.warnings
+                .iter()
+                .any(|w| w.code == "takeover_not_restored" && w.detail.contains("hosted")),
+            "{:?}",
+            out.warnings
+        );
+        assert!(read_replace_entries(root).await.is_empty());
+    }
+
     #[tokio::test]
     async fn test_empty_files_is_noop() {
         let (dir, blobs, pristine, mut record) = fixture().await;
