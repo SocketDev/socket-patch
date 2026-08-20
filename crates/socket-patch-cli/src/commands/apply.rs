@@ -1,7 +1,8 @@
 use clap::Args;
 use socket_patch_core::api::client::get_api_client_with_overrides;
+use socket_patch_core::crawlers::ruby_crawler::config_path_ignored_warning;
 use socket_patch_core::crawlers::{
-    detect_npm_pkg_manager, CrawlerOptions, Ecosystem, NpmPkgManager,
+    detect_npm_pkg_manager, CrawlerOptions, Ecosystem, NpmPkgManager, RubyCrawler,
 };
 use socket_patch_core::manifest::operations::read_manifest;
 use socket_patch_core::manifest::schema::{PatchFileInfo, PatchManifest, PatchRecord};
@@ -24,8 +25,8 @@ use crate::commands::lock_cli::acquire_or_emit;
 use crate::commands::vex::{generate_vex_from_manifest_path, VexEmbedArgs};
 use crate::ecosystem_dispatch::{find_all_packages_for_purls, partition_purls};
 use crate::json_envelope::{
-    AppliedVia, Command, Envelope, EnvelopeError, PatchAction, PatchEvent, PatchEventFile, Status,
-    VexSummary,
+    AppliedVia, Command, Envelope, EnvelopeError, PatchAction, PatchEvent, PatchEventFile,
+    RunWarning, Status, VexSummary,
 };
 
 /// Files whose pre-apply content matched NEITHER hash and were (or would
@@ -770,11 +771,30 @@ pub async fn run(args: ApplyArgs) -> i32 {
     }
 
     match apply_patches_inner(&args, &manifest_path).await {
-        Ok((success, results, unmatched)) => {
+        Ok(ApplyOutcome {
+            success,
+            results,
+            unmatched,
+            run_warnings,
+            fallback_skips,
+        }) => {
             let patched_count = results
                 .iter()
                 .filter(|r| r.success && !r.files_patched.is_empty())
                 .count();
+
+            // Run-level advisories + best-effort fallback-home skips on the
+            // human path: one gated stderr line each. `--silent` is
+            // errors-only, and under `--json` the envelope copies below are
+            // the machine channel — same gating as scan's run warnings.
+            if !args.common.json && !args.common.silent {
+                for w in &run_warnings {
+                    eprintln!("Warning ({}): {}", w.code, w.detail);
+                }
+                for skip in &fallback_skips {
+                    eprintln!("Warning (gem_fallback_home_skipped): {}", skip.detail());
+                }
+            }
 
             // Embedded VEX: only on a successful apply and only when
             // `--vex <path>` was passed. Re-read the manifest fresh so
@@ -835,6 +855,20 @@ pub async fn run(args: ApplyArgs) -> i32 {
                         ),
                     );
                 }
+                // Best-effort gem-env fallback-home copies left unpatched:
+                // one non-fatal Skipped event each, with the copy's path
+                // and reason. Never a Failed event — the bundle-store copy
+                // (the one bundler loads) applied, so the run stands.
+                for skip in &fallback_skips {
+                    env.record(
+                        PatchEvent::new(PatchAction::Skipped, skip.purl.clone())
+                            .with_reason("gem_fallback_home_skipped", skip.detail()),
+                    );
+                }
+                // Run-level advisories (the gem config-root containment
+                // skip): the envelope's `warnings[]` is their machine
+                // channel — stderr is suppressed under --json.
+                env.warnings.extend(run_warnings.iter().cloned());
                 if !success {
                     env.mark_partial_failure();
                 }
@@ -1086,10 +1120,54 @@ fn unmatched_purls(
         .collect()
 }
 
+/// Everything `apply_patches_inner` reports back to `run`'s output
+/// builders (JSON envelope + human summary).
+struct ApplyOutcome {
+    /// Overall success — `false` fails the command (exit 1 /
+    /// `partialFailure`).
+    success: bool,
+    results: Vec<ApplyResult>,
+    /// In-scope manifest purls with no installed package on disk.
+    unmatched: Vec<String>,
+    /// Run-level advisories: JSON `warnings[]`, one gated stderr line each
+    /// on the human path (`--silent` = errors only). Today: the gem
+    /// config-root containment skip.
+    run_warnings: Vec<RunWarning>,
+    /// Gem-env fallback-home copies deliberately left unpatched
+    /// (best-effort class): one non-fatal `Skipped` event each in the
+    /// envelope, one gated stderr line each on the human path.
+    fallback_skips: Vec<FallbackHomeSkip>,
+}
+
+/// One gem-env fallback-home copy the fan-out skipped best-effort (a
+/// bundle-store copy applied; this shared-home copy mismatched or failed
+/// to write). Carries what the warning must name: the package, the copy's
+/// path, and why.
+struct FallbackHomeSkip {
+    purl: String,
+    path: PathBuf,
+    why: String,
+}
+
+impl FallbackHomeSkip {
+    /// The human/detail text shared by the JSON event reason and the
+    /// stderr line.
+    fn detail(&self) -> String {
+        format!(
+            "gem-env home copy at {} was not patched ({}); the project's \
+             bundle-path copy — the one bundler loads — is patched. Shared \
+             gem homes are machine-wide state: patch them explicitly with \
+             `--global` if desired",
+            self.path.display(),
+            self.why
+        )
+    }
+}
+
 async fn apply_patches_inner(
     args: &ApplyArgs,
     manifest_path: &Path,
-) -> Result<(bool, Vec<ApplyResult>, Vec<String>), String> {
+) -> Result<ApplyOutcome, String> {
     let manifest = read_manifest(manifest_path)
         .await
         .map_err(|e| e.to_string())?
@@ -1124,7 +1202,15 @@ async fn apply_patches_inner(
 
     let mut staged = match stage_patch_sources(&args.common, &scoped_manifest, socket_dir).await? {
         StageOutcome::Ready(s) => s,
-        StageOutcome::Unavailable => return Ok((false, Vec::new(), Vec::new())),
+        StageOutcome::Unavailable => {
+            return Ok(ApplyOutcome {
+                success: false,
+                results: Vec::new(),
+                unmatched: Vec::new(),
+                run_warnings: Vec::new(),
+                fallback_skips: Vec::new(),
+            })
+        }
     };
 
     // Vendor ownership wins for EVERY ecosystem: a purl recorded in
@@ -1153,6 +1239,45 @@ async fn apply_patches_inner(
         global_prefix: args.common.global_prefix.clone(),
     };
 
+    // Gem bundle-store discovery, re-run cheaply (filesystem probes only,
+    // no `gem env` shell-out) against the same ambient environment the
+    // crawler reads, for two consumers:
+    //   * the config-skip advisory — a committed `.bundle/config` whose
+    //     BUNDLE_PATH the containment guard refused must surface on the
+    //     run's warning channels (JSON `warnings[]`; gated stderr), not
+    //     vanish silently;
+    //   * the store-class boundary for the gem fan-out below — copies
+    //     under a bundle-path store are primary, everything else is a
+    //     `gem env` fallback-home copy (best-effort once a store copy
+    //     applied).
+    // Only when this run actually crawls gems locally: a --global run or
+    // one whose `--ecosystems`/manifest scope holds no gem purls never
+    // consults the config, so it must not warn about it either.
+    let gem_discovery = if partitioned.contains_key(&Ecosystem::Gem)
+        && !args.common.global
+        && args.common.global_prefix.is_none()
+    {
+        Some(RubyCrawler::discover_bundle_stores(&args.common.cwd).await)
+    } else {
+        None
+    };
+    let gem_store_dirs: &[PathBuf] = gem_discovery
+        .as_ref()
+        .map(|d| d.stores.as_slice())
+        .unwrap_or(&[]);
+    let mut run_warnings: Vec<RunWarning> = Vec::new();
+    if let Some(value) = gem_discovery
+        .as_ref()
+        .and_then(|d| d.skipped_config_path.as_deref())
+    {
+        let (code, detail) = config_path_ignored_warning(value);
+        run_warnings.push(RunWarning {
+            code: code.to_string(),
+            detail,
+        });
+    }
+    let mut fallback_skips: Vec<FallbackHomeSkip> = Vec::new();
+
     // Multi-copy aware: npm nests genuine duplicates of one `name@version`
     // (nested dupes, diamonds, `file:` dups), so the resolver returns EVERY
     // physical copy per PURL. Patching only one would leave a live,
@@ -1175,7 +1300,13 @@ async fn apply_patches_inner(
         if !args.common.silent && !args.common.json {
             println!("No patches to apply.");
         }
-        return Ok((true, Vec::new(), Vec::new()));
+        return Ok(ApplyOutcome {
+            success: true,
+            results: Vec::new(),
+            unmatched: Vec::new(),
+            run_warnings,
+            fallback_skips,
+        });
     }
 
     if all_packages.is_empty() {
@@ -1198,7 +1329,13 @@ async fn apply_patches_inner(
                 "  Check that packages are installed and --cwd points to the right directory."
             );
         }
-        return Ok((unmatched.is_empty(), results, unmatched));
+        return Ok(ApplyOutcome {
+            success: unmatched.is_empty(),
+            results,
+            unmatched,
+            run_warnings,
+            fallback_skips,
+        });
     }
 
     // Apply patches
@@ -1274,8 +1411,30 @@ async fn apply_patches_inner(
                     std::slice::from_ref(pkg_path)
                 };
 
+            // Copy CLASS decides FAILURE semantics (never write scope —
+            // patching a shared home's vulnerable copy is fine when it
+            // works): bundle-path store copies are PRIMARY and loud-fail;
+            // `gem env` fallback-home copies (rvm `@global`, system gem
+            // dirs — often root-owned, shared machine-wide) are
+            // BEST-EFFORT once a store copy applied — a mismatch or write
+            // failure there becomes a non-fatal per-copy Skipped warning,
+            // because the copy bundler actually loads is already patched.
+            // With NO store copy the fallback home IS the primary install
+            // (the historic pre-bundle-path layout, and every --global
+            // run) and keeps loud-fail parity. Store copies run first so
+            // best-effort is decidable when the fallback copies come up.
+            let (store_copies, home_copies): (Vec<&PathBuf>, Vec<&PathBuf>) = copy_paths
+                .iter()
+                .partition(|p| gem_store_dirs.iter().any(|s| p.starts_with(s)));
+            let mut any_store_copy_applied = false;
+
             let mut any_copy_applied = false;
-            for pkg_path in copy_paths {
+            for (pkg_path, is_store_copy) in store_copies
+                .into_iter()
+                .map(|p| (p, true))
+                .chain(home_copies.into_iter().map(|p| (p, false)))
+            {
+                let best_effort = !is_store_copy && any_store_copy_applied;
                 let mut applied = false;
                 // Did at least one variant reach `apply_package_patch`? A
                 // variant reaches it only after passing the first-file
@@ -1284,9 +1443,9 @@ async fn apply_patches_inner(
                 // not be reported as "package_not_installed" even if the patch
                 // itself then fails. Tracks the "matched but failed" case so the
                 // failure message is honest and `unmatched` stays accurate.
-                // Both are PER COPY: a copy that matches no variant must fail
-                // loudly even when a sibling copy applied cleanly — that copy
-                // is a real on-disk gem some bundler loads.
+                // Both are PER COPY: a primary copy that matches no variant
+                // must fail loudly even when a sibling copy applied cleanly —
+                // that copy is a real on-disk gem some bundler loads.
                 let mut attempted = false;
 
                 for variant_purl in &variants {
@@ -1358,11 +1517,28 @@ async fn apply_patches_inner(
                     matched_manifest_purls.insert(variant_purl.clone());
                     if result.success {
                         applied = true;
+                        results.push(result);
                         // No `break`: apply *every* matching variant. PyPI/gem
                         // have exactly one installed distribution (the rest
                         // hash-mismatch and were skipped above), so this
                         // applies a single variant for them; Maven's coexisting
                         // classifier jars each get patched.
+                    } else if best_effort {
+                        // A write failure on a BEST-EFFORT fallback-home copy
+                        // (root-owned rvm `@global`, a system gem dir) is a
+                        // per-copy non-fatal skip, never a run failure: the
+                        // bundle-store copy — the one bundler loads — already
+                        // applied. The failed result is NOT recorded (its
+                        // Failed event would flip `partialFailure`); the skip
+                        // rides `fallback_skips` into the envelope instead.
+                        fallback_skips.push(FallbackHomeSkip {
+                            purl: base_purl.clone(),
+                            path: pkg_path.clone(),
+                            why: result
+                                .error
+                                .clone()
+                                .unwrap_or_else(|| "unknown error".to_string()),
+                        });
                     } else {
                         // A variant that reached apply IS the installed
                         // distribution, so a failure here is a real apply
@@ -1382,19 +1558,37 @@ async fn apply_patches_inner(
                                 result.error.as_deref().unwrap_or("unknown error")
                             );
                         }
+                        results.push(result);
                     }
-                    results.push(result);
                 }
 
                 if applied {
                     any_copy_applied = true;
+                    if is_store_copy {
+                        any_store_copy_applied = true;
+                    }
+                } else if best_effort {
+                    // Nothing applied on a best-effort fallback-home copy.
+                    // Attempted-but-failed variants already recorded their
+                    // per-copy skip above; a copy no variant matched gets
+                    // one here — the shared home holds a different (or
+                    // locally diverged) distribution, and the copy bundler
+                    // loads is patched, so this is advisory, not an error.
+                    if !attempted {
+                        fallback_skips.push(FallbackHomeSkip {
+                            purl: base_purl.clone(),
+                            path: pkg_path.clone(),
+                            why: "no release variant in the manifest matches this copy".to_string(),
+                        });
+                    }
                 } else {
-                    // Nothing applied for this copy. `has_errors` was already set
-                    // per-variant above when a variant was attempted-but-failed;
-                    // set it here too for the no-variant-attempted case so both
-                    // paths fail the command — per copy, so a second store copy
-                    // that matches no variant fails loudly instead of silently
-                    // staying vulnerable behind a sibling copy's success.
+                    // Nothing applied for this PRIMARY copy. `has_errors` was
+                    // already set per-variant above when a variant was
+                    // attempted-but-failed; set it here too for the
+                    // no-variant-attempted case so both paths fail the command
+                    // — per copy, so a second store copy that matches no
+                    // variant fails loudly instead of silently staying
+                    // vulnerable behind a sibling copy's success.
                     has_errors = true;
                     if !attempted && !args.common.silent && !args.common.json {
                         // No variant matched the installed distribution at all —
@@ -1523,7 +1717,13 @@ async fn apply_patches_inner(
     // means it can run repeatedly (CI dry-runs, deploy hooks) without
     // mutating patch state.
 
-    Ok((!has_errors, results, unmatched))
+    Ok(ApplyOutcome {
+        success: !has_errors,
+        results,
+        unmatched,
+        run_warnings,
+        fallback_skips,
+    })
 }
 
 #[cfg(test)]

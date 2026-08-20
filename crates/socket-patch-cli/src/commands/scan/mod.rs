@@ -11,7 +11,8 @@ use socket_patch_core::api::client::{
     build_proxy_fallback_client, get_api_client_with_overrides, is_fallback_candidate,
 };
 use socket_patch_core::api::types::{BatchPackagePatches, PatchSearchResult};
-use socket_patch_core::crawlers::{CrawlerOptions, Ecosystem};
+use socket_patch_core::crawlers::ruby_crawler::config_path_ignored_warning;
+use socket_patch_core::crawlers::{CrawlerOptions, Ecosystem, RubyCrawler};
 use socket_patch_core::manifest::operations::read_manifest;
 use socket_patch_core::manifest::schema::PatchManifest;
 use socket_patch_core::telemetry::{track_patch_scan_failed, track_patch_scanned};
@@ -1451,7 +1452,33 @@ pub async fn run(mut args: ScanArgs) -> i32 {
     // empty) and a stderr line on the human path; exit code and `status`
     // stay deliberately unchanged (same posture as hosted refusals, which
     // exit 0 with `redirected: 0`).
-    let layout_refusals = unsupported_layout_warnings(&lockfile_only);
+    let mut layout_refusals = unsupported_layout_warnings(&lockfile_only);
+    // Config-sourced gem bundle root refused by the crawler's containment
+    // guard (a committed `.bundle/config` whose BUNDLE_PATH resolves
+    // outside the project — untrusted input that would otherwise become a
+    // scan/apply WRITE-target root). The crawl above consulted and
+    // silently skipped it; surface the skip on the SAME run-level channel
+    // as the layout refusals (JSON `warnings[]` on both the zero-package
+    // and ≥1-package envelopes; a gated stderr line on the human path).
+    // Scoped like the crawl that hit it: local mode, with gem not filtered
+    // out by `--ecosystems`. Cheap re-probe: filesystem only, no `gem env`
+    // shell-out.
+    if !crawler_options.global
+        && crawler_options.global_prefix.is_none()
+        && args
+            .common
+            .ecosystems
+            .as_ref()
+            .is_none_or(|list| list.iter().any(|e| e == Ecosystem::Gem.cli_name()))
+    {
+        if let Some(value) = RubyCrawler::discover_bundle_stores(&args.common.cwd)
+            .await
+            .skipped_config_path
+        {
+            let (code, detail) = config_path_ignored_warning(&value);
+            layout_refusals.push((code.to_string(), detail));
+        }
+    }
     if !lockfile_only.packages.is_empty() {
         for pkg in &lockfile_only.packages {
             if let Some(eco) = Ecosystem::from_purl(&pkg.purl) {

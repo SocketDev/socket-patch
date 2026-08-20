@@ -292,15 +292,29 @@ the model is **not uniform** today:
   `<root>/<engine>/<abi>/gems/` and flat `<root>/gems/`). The env variable is the user's own machine
   state, so it is honored verbatim (it may point outside `--cwd`; a leading `~` expands against home);
   the **config file is typically committed — untrusted input — so a config-sourced root that resolves
-  outside the project root is skipped with a `gem_bundle_config_path_ignored` stderr warning**
-  (`BUNDLE_PATH__SYSTEM: "true"` likewise drops the recorded path, as bundler itself ignores it).
-  Explicit env/config roots only count when `--cwd` holds a Bundler manifest/lockfile. When the
-  default `vendor/bundle` root holds no store, the gem homes `gem env` reports are appended (default
-  gems like rexml/json only ever live there). When several roots hold **coexisting physical copies of
-  one `gem@version`** (bundler-2's scoped store beside bundler-1's flat store), `apply`/`rollback`
-  patch/restore **every copy** — one summary event per copy, mirroring npm's multi-copy fan-out —
-  while single-representative consumers (`get`, `vendor`, `setup`, `vex`) use the
-  highest-precedence copy.
+  outside the project root is skipped** (`BUNDLE_PATH__SYSTEM: "true"` likewise drops the recorded
+  path, as bundler itself ignores it). The skip is surfaced per the run-warning conventions: a
+  `gem_bundle_config_path_ignored` entry in the run-level `warnings[]` of `scan`/`apply` `--json`
+  envelopes (detail names the config value and the env-`BUNDLE_PATH` remedy), and one stderr
+  `Warning (gem_bundle_config_path_ignored): …` line on the human path, gated on `!--silent`
+  (`--silent` = errors only). Explicit env/config roots only count when `--cwd` holds a Bundler
+  manifest/lockfile. When the default `vendor/bundle` root holds no store, the gem homes `gem env`
+  reports are appended (default gems like rexml/json only ever live there). When several roots hold
+  **coexisting physical copies of one `gem@version`** (bundler-2's scoped store beside bundler-1's
+  flat store), `apply`/`rollback` patch/restore **every copy** — one summary event per copy,
+  mirroring npm's multi-copy fan-out — while single-representative consumers (`get`, `vendor`,
+  `setup`, `vex`) use the highest-precedence copy.
+
+  *Copy classes (additive to the multi-copy vocabulary):* a copy under a **bundle-path store**
+  (config/env/default root) is PRIMARY — a variant mismatch or write failure there fails the run,
+  as always. A copy in a **`gem env` fallback home** (rvm `@global`, `--user-install`, system gem
+  dirs — shared, often root-owned) is patched too when it matches and is writable, but becomes
+  BEST-EFFORT once at least one bundle-store copy applied: its mismatch/write failure surfaces as a
+  non-fatal `skipped` event (`errorCode: gem_fallback_home_skipped`, detail names the copy's path
+  and reason; gated stderr twin on the human path) instead of failing a run whose loaded copy is
+  patched. With **no** bundle-store copy (the historic fallback-only layout, and every `--global`
+  run) the fallback-home copy IS the primary install and keeps loud-fail parity with pre-bundle-path
+  `apply`.
 
 **Intended (gap):** the cwd-only ecosystems *should* also auto-discover per-subproject lockfiles when
 run from the repo root, matching the npm workspace model. The npm-vs-others asymmetry is a known

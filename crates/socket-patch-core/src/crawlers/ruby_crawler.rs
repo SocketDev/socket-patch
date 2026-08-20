@@ -236,14 +236,7 @@ impl RubyCrawler {
     /// these two are the unit-test seam pinning the store list shape.
     #[cfg(test)]
     async fn get_vendor_bundle_paths(cwd: &Path) -> Vec<PathBuf> {
-        Self::discover_bundle_stores_with_env(
-            cwd,
-            std::env::var_os("BUNDLE_PATH").as_deref(),
-            std::env::var_os("BUNDLE_APP_CONFIG").as_deref(),
-            ambient_home().as_deref(),
-        )
-        .await
-        .stores
+        Self::discover_bundle_stores(cwd).await.stores
     }
 
     /// [`Self::discover_bundle_stores_with_env`], flattened to just the
@@ -300,17 +293,16 @@ impl RubyCrawler {
         let default_root = normalize_lexically(&default_root).unwrap_or(default_root);
 
         let mut roots: Vec<PathBuf> = Vec::new();
+        let mut skipped_config_path = None;
         if Self::has_bundler_manifest(cwd).await {
             if let Some(value) = Self::app_config_bundle_path(cwd, app_config_env).await {
                 match resolve_config_bundle_path(cwd, &value, home) {
                     Some(root) => roots.push(root),
-                    None => eprintln!(
-                        "Warning (gem_bundle_config_path_ignored): bundler app config \
-                         BUNDLE_PATH {value:?} resolves outside the project root; \
-                         ignoring it as an install root (a committed .bundle/config is \
-                         untrusted input — set BUNDLE_PATH in the environment to use an \
-                         out-of-tree bundle path)"
-                    ),
+                    // Refused by the containment guard. Recorded — not
+                    // printed: the crawler has no --silent/--json context,
+                    // so the CLI surfaces it (see
+                    // [`config_path_ignored_warning`]).
+                    None => skipped_config_path = Some(value),
                 }
             }
             if let Some(v) = bundle_path_env.filter(|v| !v.is_empty()) {
@@ -340,7 +332,24 @@ impl RubyCrawler {
         BundleStoreDiscovery {
             stores,
             default_root_has_stores,
+            skipped_config_path,
         }
+    }
+
+    /// Local-mode Bundler install-root discovery against the AMBIENT
+    /// environment — the same probe [`Self::get_gem_paths`] runs, exposed
+    /// for CLI consumers that need what the flat path list drops: the
+    /// store/fallback CLASS boundary (`stores`) and the config-skip
+    /// advisory (`skipped_config_path`). Cheap: filesystem probes only,
+    /// no `gem env` shell-out.
+    pub async fn discover_bundle_stores(cwd: &Path) -> BundleStoreDiscovery {
+        Self::discover_bundle_stores_with_env(
+            cwd,
+            std::env::var_os("BUNDLE_PATH").as_deref(),
+            std::env::var_os("BUNDLE_APP_CONFIG").as_deref(),
+            ambient_home().as_deref(),
+        )
+        .await
     }
 
     /// The installed-gem `gems/` dirs under one bundler install root, in
@@ -632,15 +641,45 @@ impl Default for RubyCrawler {
     }
 }
 
-/// Result of probing the Bundler install roots: the discovered
-/// installed-gem `gems/` stores in root-precedence order, plus whether any
-/// of them sit under the implicit project-local `vendor/bundle` root —
-/// which keeps its historic [`RubyCrawler::get_gem_paths`] early-return
-/// (a deployment install suppresses the `gem env` fallback; env/config
-/// roots must not).
-struct BundleStoreDiscovery {
-    stores: Vec<PathBuf>,
-    default_root_has_stores: bool,
+/// Result of probing the Bundler install roots.
+///
+/// Public so CLI consumers (apply's store-class split, scan/apply's
+/// config-skip advisory) can see what local-mode discovery decided; the
+/// crawler itself stays print-free — surfacing the skip on stderr / the
+/// JSON envelope is the CLI's job, where `--silent`/`--json` gating lives.
+pub struct BundleStoreDiscovery {
+    /// The discovered installed-gem `gems/` stores, in root-precedence
+    /// order (local config > env > default `vendor/bundle`). Copies found
+    /// under these are the PRIMARY class in apply's multi-copy fan-out;
+    /// paths outside them are `gem env` fallback-home copies.
+    pub stores: Vec<PathBuf>,
+    /// Whether any store sits under the implicit project-local
+    /// `vendor/bundle` root — which keeps its historic
+    /// [`RubyCrawler::get_gem_paths`] early-return (a deployment install
+    /// suppresses the `gem env` fallback; env/config roots must not).
+    pub default_root_has_stores: bool,
+    /// A config-sourced `BUNDLE_PATH` value the containment guard REFUSED
+    /// (it resolved outside the project root — see
+    /// [`resolve_config_bundle_path`]). Recorded, never printed: callers
+    /// surface it via [`config_path_ignored_warning`] on their own
+    /// warning channel.
+    pub skipped_config_path: Option<String>,
+}
+
+/// The stable warning `(code, detail)` for a config-sourced `BUNDLE_PATH`
+/// refused by the containment guard. One builder so scan's run-level
+/// `warnings[]`, apply's envelope `warnings[]`, and the gated stderr lines
+/// all carry byte-identical text.
+pub fn config_path_ignored_warning(value: &str) -> (&'static str, String) {
+    (
+        "gem_bundle_config_path_ignored",
+        format!(
+            "bundler app config BUNDLE_PATH {value:?} resolves outside the project \
+             root; ignoring it as an install root (a committed .bundle/config is \
+             untrusted input — set BUNDLE_PATH in the environment to use an \
+             out-of-tree bundle path)"
+        ),
+    )
 }
 
 /// The ambient home directory as an env value (`HOME`, else Windows'
@@ -1487,6 +1526,63 @@ mod tests {
             vec![flat],
             "contained (normalized) relative config BUNDLE_PATH must be accepted"
         );
+    }
+
+    /// The containment refusal is RECORDED on the discovery result (for
+    /// the CLI's warning channels), keyed by the verbatim config value —
+    /// and stays `None` for a contained value or a `path.system` drop
+    /// (bundler itself ignores the path there; nothing was refused).
+    #[tokio::test]
+    async fn discovery_records_skipped_config_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        tokio::fs::write(dir.path().join("Gemfile"), b"gem \"foo\"\n")
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(dir.path().join(".bundle"))
+            .await
+            .unwrap();
+        let value = outside.path().display().to_string();
+        tokio::fs::write(
+            dir.path().join(".bundle").join("config"),
+            format!("---\nBUNDLE_PATH: \"{value}\"\n"),
+        )
+        .await
+        .unwrap();
+
+        let discovery =
+            RubyCrawler::discover_bundle_stores_with_env(dir.path(), None, None, None).await;
+        assert_eq!(
+            discovery.skipped_config_path.as_deref(),
+            Some(value.as_str()),
+            "the refused config value must be recorded verbatim"
+        );
+        // The warning builder names the value and carries the stable code.
+        let (code, detail) = config_path_ignored_warning(&value);
+        assert_eq!(code, "gem_bundle_config_path_ignored");
+        assert!(detail.contains(&value) && detail.contains("BUNDLE_PATH"));
+
+        // Contained value → no skip recorded.
+        tokio::fs::write(
+            dir.path().join(".bundle").join("config"),
+            "---\nBUNDLE_PATH: \"vendor/mygems\"\n",
+        )
+        .await
+        .unwrap();
+        let discovery =
+            RubyCrawler::discover_bundle_stores_with_env(dir.path(), None, None, None).await;
+        assert_eq!(discovery.skipped_config_path, None);
+
+        // path.system=true → bundler ignores the path; not a refusal.
+        tokio::fs::write(
+            dir.path().join(".bundle").join("config"),
+            format!("---\nBUNDLE_PATH: \"{value}\"\nBUNDLE_PATH__SYSTEM: \"true\"\n"),
+        )
+        .await
+        .unwrap();
+        let discovery =
+            RubyCrawler::discover_bundle_stores_with_env(dir.path(), None, None, None).await;
+        assert_eq!(discovery.skipped_config_path, None);
     }
 
     /// Unit contract for the config-root containment policy itself.
