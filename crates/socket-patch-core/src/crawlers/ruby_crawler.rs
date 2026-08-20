@@ -673,8 +673,14 @@ pub struct BundleStoreDiscovery {
 pub fn config_path_ignored_warning(value: &str) -> (&'static str, String) {
     (
         "gem_bundle_config_path_ignored",
+        // Display inside manual quotes, NOT `{value:?}`: Debug escaping
+        // doubles backslashes, so on Windows the detail printed
+        // `C:\\Users\\…` for a config that says `C:\Users\…` — breaking
+        // both the substring assertions and any human copy-pasting the
+        // path. The value is already a single scraped line, so Display
+        // cannot smuggle in newlines the quotes would mask.
         format!(
-            "bundler app config BUNDLE_PATH {value:?} resolves outside the project \
+            "bundler app config BUNDLE_PATH \"{value}\" resolves outside the project \
              root; ignoring it as an install root (a committed .bundle/config is \
              untrusted input — set BUNDLE_PATH in the environment to use an \
              out-of-tree bundle path)"
@@ -1532,6 +1538,27 @@ mod tests {
     /// the CLI's warning channels), keyed by the verbatim config value —
     /// and stays `None` for a contained value or a `path.system` drop
     /// (bundler itself ignores the path there; nothing was refused).
+    /// The detail must carry the config value VERBATIM. `{value:?}` (Debug)
+    /// escaped backslashes, so on Windows the warning printed `C:\\Users\\…`
+    /// for a config that says `C:\Users\…` — invisible on Unix (temp paths
+    /// carry no backslashes), red on the windows-latest CI leg, and wrong
+    /// for any human copy-pasting the path out of the warning. A
+    /// backslash-bearing value pins it on every platform.
+    #[test]
+    fn config_path_ignored_warning_names_the_value_verbatim() {
+        let value = r"C:\Users\dev\bundle store";
+        let (code, detail) = config_path_ignored_warning(value);
+        assert_eq!(code, "gem_bundle_config_path_ignored");
+        assert!(
+            detail.contains(value),
+            "detail must contain the unescaped value: {detail}"
+        );
+        assert!(
+            !detail.contains(r"C:\\Users"),
+            "Debug escaping must not double backslashes: {detail}"
+        );
+    }
+
     #[tokio::test]
     async fn discovery_records_skipped_config_path() {
         let dir = tempfile::tempdir().unwrap();
