@@ -33,6 +33,25 @@ fn options_at(root: &Path) -> CrawlerOptions {
     }
 }
 
+/// Restores the original working directory on drop, so a panicking assert
+/// between `enter` and the end of the test can't leave later tests in this
+/// binary running from a soon-deleted TempDir.
+struct CwdGuard(std::path::PathBuf);
+
+impl CwdGuard {
+    fn enter(to: &Path) -> Self {
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(to).unwrap();
+        CwdGuard(prev)
+    }
+}
+
+impl Drop for CwdGuard {
+    fn drop(&mut self) {
+        let _ = std::env::set_current_dir(&self.0);
+    }
+}
+
 /// Stage a composer vendor layout: <root>/vendor/<vendor>/<name>/
 /// with `vendor/composer/installed.json` listing it.
 async fn stage_composer_project(root: &Path, vendor_name: &str, pkg_name: &str, version: &str) {
@@ -545,12 +564,11 @@ async fn get_vendor_paths_global_empty_home_not_cwd_relative() {
     let prev_home = std::env::var("HOME").ok();
     let prev_profile = std::env::var("USERPROFILE").ok();
     let prev_path = std::env::var("PATH").ok();
-    let prev_cwd = std::env::current_dir().unwrap();
     std::env::remove_var("COMPOSER_HOME");
     std::env::set_var("HOME", "");
     std::env::set_var("USERPROFILE", "");
     std::env::set_var("PATH", empty_path.path());
-    std::env::set_current_dir(tmp.path()).unwrap();
+    let cwd_guard = CwdGuard::enter(tmp.path());
 
     let crawler = ComposerCrawler;
     let opts = CrawlerOptions {
@@ -560,7 +578,7 @@ async fn get_vendor_paths_global_empty_home_not_cwd_relative() {
     };
     let paths = crawler.get_vendor_paths(&opts).await.unwrap();
 
-    std::env::set_current_dir(prev_cwd).unwrap();
+    drop(cwd_guard);
     if let Some(v) = prev_composer {
         std::env::set_var("COMPOSER_HOME", v);
     }
@@ -1133,6 +1151,100 @@ async fn rejected_install_path_does_not_fall_back_to_conventional_dir() {
         .await
         .unwrap()
         .is_empty());
+}
+
+/// The CLI defaults to `--cwd .`, so production discovery hands the crawler
+/// a RELATIVE vendor path (`./vendor`). `resolve_project_root` then
+/// normalizes the containment boundary to the EMPTY path — and every path,
+/// absolute ones included, `starts_with` the empty path — so the escape gate
+/// was vacuous in exactly the default invocation: a tampered installed.json
+/// entry with an ABSOLUTE `install-path` resolved out of tree and became a
+/// patch write target. `install_path_escaping_project_root_is_rejected`
+/// above never sees this because its staged project root is absolute.
+#[tokio::test]
+#[serial_test::serial]
+async fn install_path_absolute_escape_rejected_under_relative_cwd() {
+    let outer = tempfile::tempdir().unwrap();
+    let root = outer.path().join("proj");
+    let vendor = root.join("vendor");
+    let composer_dir = vendor.join("composer");
+    tokio::fs::create_dir_all(&composer_dir).await.unwrap();
+    tokio::fs::write(root.join("composer.json"), b"{}")
+        .await
+        .unwrap();
+    tokio::fs::create_dir_all(vendor.join("monolog").join("monolog"))
+        .await
+        .unwrap();
+
+    // The escape target EXISTS outside the project, so the on-disk
+    // corroboration alone does not stop it; only the containment gate does.
+    let outside = outer.path().join("evil-target");
+    tokio::fs::create_dir_all(&outside).await.unwrap();
+
+    tokio::fs::write(
+        composer_dir.join("installed.json"),
+        format!(
+            r#"{{"packages":[
+              {{"name":"monolog/monolog","version":"3.5.0","install-path":"../monolog/monolog"}},
+              {{"name":"absolute/evil","version":"1.0.0","install-path":"{}"}}
+            ]}}"#,
+            outside.display().to_string().replace('\\', "\\\\")
+        ),
+    )
+    .await
+    .unwrap();
+
+    let cwd_guard = CwdGuard::enter(&root);
+
+    let crawler = ComposerCrawler;
+    let opts = CrawlerOptions {
+        cwd: std::path::PathBuf::from("."),
+        global: false,
+        global_prefix: None,
+    };
+    // The production dispatch feeds find_by_purls the paths get_vendor_paths
+    // returned, so exercise that exact chain.
+    let vendor_paths = crawler.get_vendor_paths(&opts).await.unwrap();
+    let packages = crawler.crawl_all(&opts).await;
+    let found = match vendor_paths.first() {
+        Some(vendor_rel) => crawler
+            .find_by_purls(
+                vendor_rel,
+                &[
+                    "pkg:composer/absolute/evil@1.0.0".to_string(),
+                    ORG_PURL.to_string(),
+                ],
+            )
+            .await
+            .unwrap(),
+        None => Default::default(),
+    };
+
+    drop(cwd_guard);
+
+    assert_eq!(
+        vendor_paths,
+        vec![std::path::PathBuf::from("./vendor")],
+        "local discovery under the default cwd must yield the relative vendor path"
+    );
+    assert_eq!(
+        packages.len(),
+        1,
+        "only the in-project package may survive under the default relative cwd; got {:?}",
+        packages.iter().map(|p| &p.path).collect::<Vec<_>>()
+    );
+    assert_eq!(packages[0].purl, ORG_PURL);
+    assert!(
+        found.contains_key(ORG_PURL),
+        "control: the in-project package must still resolve via a relative vendor path"
+    );
+    assert!(
+        !found.contains_key("pkg:composer/absolute/evil@1.0.0"),
+        "absolute install-path escaped the project root under the default `--cwd .`: {:?}",
+        found
+            .get("pkg:composer/absolute/evil@1.0.0")
+            .map(|p| &p.path)
+    );
 }
 
 // ── version normalization parity with the lockfile inventory ────

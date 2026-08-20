@@ -88,8 +88,19 @@ pub async fn read_python_metadata(dist_info_path: &Path) -> Option<(String, Stri
 /// Returns `None` if the file is absent, unreadable, or does not yield a
 /// non-empty `Name` and `Version` before the header/body separator.
 async fn parse_metadata_headers(dist_info_path: &Path) -> Option<(String, String)> {
+    use tokio::io::AsyncReadExt;
+
     let metadata_path = dist_info_path.join("METADATA");
-    let content = tokio::fs::read_to_string(&metadata_path).await.ok()?;
+    // The path lives inside the (untrusted) package tree: a planted FIFO
+    // would make a plain `read_to_string` open block forever waiting for a
+    // writer, wedging scan (crawl_all) and apply (find_by_purls). Open via
+    // `open_regular_file` — non-blocking on Unix, rejecting
+    // FIFOs/devices/directories (see its docs).
+    let (mut file, metadata) = crate::utils::fs::open_regular_file(&metadata_path)
+        .await
+        .ok()?;
+    let mut content = String::with_capacity(metadata.len() as usize);
+    file.read_to_string(&mut content).await.ok()?;
 
     let mut name: Option<String> = None;
     let mut version: Option<String> = None;

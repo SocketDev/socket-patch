@@ -801,6 +801,69 @@ async fn read_python_metadata_missing_name_falls_back_to_dir_name() {
     assert_eq!(result, Some(("requests".to_string(), "2.28.0".to_string())));
 }
 
+/// A FIFO planted as `METADATA` must not wedge the crawler. The header
+/// read used a plain `tokio::fs::read_to_string`, whose `open(2)` on a
+/// FIFO waits for a writer that never comes — so one special file inside
+/// site-packages (a malicious package's build hook can create one; pip
+/// never extracts FIFOs from wheels) wedged `scan` (crawl_all) and
+/// `apply` (find_by_purls) indefinitely, with no error and no timeout.
+/// Same class as the `open_regular_file` guards in the npm
+/// (package.json) and composer (installed.json) crawlers.
+#[cfg(unix)]
+#[tokio::test]
+#[serial_test::parallel]
+async fn read_python_metadata_rejects_fifo_metadata_without_hanging() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dist_info = tmp.path().join("evil-1.0.0.dist-info");
+    tokio::fs::create_dir_all(&dist_info).await.unwrap();
+    let fifo = dist_info.join("METADATA");
+    // mkfifo(2) directly, not the /usr/bin/mkfifo binary: spawning a child
+    // flakes under heavy parallel load (fork/exec starvation) and the
+    // syscall needs no process at all.
+    let c_path = {
+        use std::os::unix::ffi::OsStrExt;
+        std::ffi::CString::new(fifo.as_os_str().as_bytes()).expect("fifo path has no NUL")
+    };
+    let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
+    assert_eq!(
+        rc,
+        0,
+        "mkfifo(2) failed: {}",
+        std::io::Error::last_os_error()
+    );
+    // A sibling real package proves the tree stays crawlable around the FIFO.
+    stage_dist_info(tmp.path(), "requests", "2.28.0").await;
+
+    // On timeout the open is wedged in a `spawn_blocking` thread that the
+    // runtime waits for on shutdown; connect a writer to release it so the
+    // test can FAIL instead of hanging the whole suite.
+    let release_and_panic = |what: &str| -> ! {
+        let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
+        panic!("{what} must complete promptly with a FIFO METADATA in the tree");
+    };
+    let deadline = std::time::Duration::from_secs(5);
+
+    // The unreadable METADATA degrades into the dir-name fallback — the
+    // package stays discoverable under its directory-name identity.
+    let Ok(direct) = tokio::time::timeout(deadline, read_python_metadata(&dist_info)).await else {
+        release_and_panic("read_python_metadata");
+    };
+    assert_eq!(direct, Some(("evil".to_string(), "1.0.0".to_string())));
+
+    let crawler = PythonCrawler;
+    let opts = CrawlerOptions {
+        cwd: tmp.path().to_path_buf(),
+        global: true,
+        global_prefix: Some(tmp.path().to_path_buf()),
+    };
+    let Ok(crawled) = tokio::time::timeout(deadline, crawler.crawl_all(&opts)).await else {
+        release_and_panic("crawl_all");
+    };
+    let mut names: Vec<&str> = crawled.iter().map(|p| p.name.as_str()).collect();
+    names.sort();
+    assert_eq!(names, vec!["evil", "requests"]);
+}
+
 #[path = "common/mod.rs"]
 mod common;
 

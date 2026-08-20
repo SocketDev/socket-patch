@@ -488,7 +488,30 @@ fn resolve_install_path(
     // below is what keeps it in bounds either way.
     let joined = vendor_path.join("composer").join(install_path);
     let resolved = normalize_lexically(&joined)?;
+    // A RELATIVE vendor path (the CLI default is `--cwd .`) yields a
+    // relative project root that can normalize to the EMPTY path — and
+    // `starts_with("")` holds for EVERY path, absolute ones included, so
+    // the prefix check alone is vacuous there. An anchored install-path
+    // can never legitimately live inside a relative project root, so
+    // require the resolved path to be anchored exactly when the boundary
+    // is.
+    if is_anchored(&resolved) != is_anchored(project_root) {
+        return None;
+    }
     resolved.starts_with(project_root).then_some(resolved)
+}
+
+/// Whether a path is anchored to a filesystem root: absolute, or carrying
+/// a Windows prefix even without a root directory (`C:evil` is
+/// drive-relative — `join` substitutes it wholesale, and it resolves
+/// against the drive's own cwd, not the project's).
+fn is_anchored(path: &Path) -> bool {
+    use std::path::Component;
+
+    matches!(
+        path.components().next(),
+        Some(Component::Prefix(_) | Component::RootDir)
+    )
 }
 
 /// The on-disk directory of an installed.json entry.
@@ -1403,6 +1426,35 @@ mod tests {
         assert_eq!(n("../x"), None);
         // Relative paths stay relative.
         assert_eq!(n("a/b/../c").unwrap(), PathBuf::from("a/c"));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_install_path_rejects_absolute_escape_from_relative_root() {
+        // The CLI defaults to `--cwd .`, so local discovery hands the
+        // crawler a RELATIVE vendor path (`./vendor`) and
+        // resolve_project_root normalizes the boundary to the EMPTY path.
+        // Every path — absolute ones included — `starts_with` the empty
+        // path, so the prefix check alone is vacuous there: a tampered
+        // installed.json `install-path` naming an absolute directory must
+        // still be refused (the resolved directory is a patch WRITE
+        // target).
+        let vendor = Path::new("./vendor");
+        let root = resolve_project_root(vendor).await;
+
+        let escape = std::env::temp_dir().join("socket-composer-escape-probe");
+        assert_eq!(
+            resolve_install_path(vendor, &root, escape.to_str().unwrap()),
+            None,
+            "absolute install-path must not escape a relative project root"
+        );
+
+        // Control: the conventional relative install-path still resolves
+        // under the same relative boundary — the gate must not fail closed
+        // on everything.
+        assert_eq!(
+            resolve_install_path(vendor, &root, "../monolog/monolog"),
+            Some(PathBuf::from("vendor/monolog/monolog"))
+        );
     }
 
     #[tokio::test]
