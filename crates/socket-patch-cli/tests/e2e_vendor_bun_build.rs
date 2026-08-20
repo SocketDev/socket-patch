@@ -240,9 +240,12 @@ fn bun_project(tag: &str) -> Option<BunProject> {
     let lock_before = std::fs::read(&lock_path).expect("bun.lock after bun install");
     let pkg_before = std::fs::read(proj.join("package.json")).expect("package.json");
     let lock_before_str = String::from_utf8(lock_before.clone()).unwrap();
+    // bun 1.3 writes lockfileVersion 1, bun 1.4 writes 2 — one emitted
+    // grammar; both are wirable.
     assert!(
-        lock_before_str.contains("\"lockfileVersion\": 1"),
-        "fixture must be a bun text lockfileVersion 1:\n{lock_before_str}"
+        lock_before_str.contains("\"lockfileVersion\": 1")
+            || lock_before_str.contains("\"lockfileVersion\": 2"),
+        "fixture must be a bun text lockfileVersion 1 or 2:\n{lock_before_str}"
     );
     // Pre-vendor: the registry 4-tuple `["left-pad@1.3.0", "", {}, "sha512-…"]`.
     assert!(
