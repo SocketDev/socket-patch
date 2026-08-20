@@ -7,7 +7,7 @@
 //! cache is `repair`'s job, keeping these commands read-only against
 //! `.socket/`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use socket_patch_core::api::blob_fetcher::{
@@ -91,6 +91,40 @@ fn report_offline_missing(common: &GlobalArgs, purls: &[&str]) {
     eprintln!("Run \"socket-patch repair\" to download missing artifacts.");
 }
 
+/// The manifest PURLs with no usable local source. A patch is "locally
+/// applicable" iff at least one of:
+///   - every `after_hash` blob it references is on disk, OR
+///   - its diff archive is on disk, OR
+///   - its package archive is on disk.
+///
+/// The patch pipeline picks whichever is present per file. Shared by the
+/// offline gate (probed against `.socket/`) and the post-download gate
+/// (probed against the staged overlay).
+fn patches_without_source<'m>(
+    manifest: &'m PatchManifest,
+    missing_blobs: &HashSet<String>,
+    missing_diff_archives: &HashSet<String>,
+    missing_package_archives: &HashSet<String>,
+) -> Vec<&'m str> {
+    manifest
+        .patches
+        .iter()
+        .filter_map(|(purl, record)| {
+            let all_blobs_present = record
+                .files
+                .values()
+                .all(|f| !missing_blobs.contains(&f.after_hash));
+            let diff_present = !missing_diff_archives.contains(&record.uuid);
+            let pkg_present = !missing_package_archives.contains(&record.uuid);
+            if all_blobs_present || diff_present || pkg_present {
+                None
+            } else {
+                Some(purl.as_str())
+            }
+        })
+        .collect()
+}
+
 /// Mirror `src`'s files into `dst` by hardlink (copy fallback). Pre-seeds the
 /// overlay tempdir with everything already cached so only the gap downloads.
 async fn overlay_dir(src: &Path, dst: &Path) {
@@ -141,36 +175,20 @@ pub(crate) async fn stage_patch_sources(
     let missing_diff_archives = get_missing_archives(manifest, &socket_diffs_path).await;
     let missing_package_archives = get_missing_archives(manifest, &socket_packages_path).await;
 
-    // A patch is "locally applicable" iff at least one of:
-    //   - every `after_hash` blob it references is on disk, OR
-    //   - its diff archive is on disk, OR
-    //   - its package archive is on disk.
-    // The patch pipeline picks whichever is present per file.
-    let patches_without_source: Vec<&str> = manifest
-        .patches
-        .iter()
-        .filter_map(|(purl, record)| {
-            let all_blobs_present = record
-                .files
-                .values()
-                .all(|f| !missing_blobs.contains(&f.after_hash));
-            let diff_present = !missing_diff_archives.contains(&record.uuid);
-            let pkg_present = !missing_package_archives.contains(&record.uuid);
-            if all_blobs_present || diff_present || pkg_present {
-                None
-            } else {
-                Some(purl.as_str())
-            }
-        })
-        .collect();
+    let no_source_purls = patches_without_source(
+        manifest,
+        &missing_blobs,
+        &missing_diff_archives,
+        &missing_package_archives,
+    );
 
     if common.offline {
         // Offline: bail only if some patch has no usable local source.
         // Note: with `--force`, the patch pipeline can short-circuit
         // verification on its own; we still surface the no-source
         // diagnosis so the user runs `repair` before retrying.
-        if !patches_without_source.is_empty() {
-            report_offline_missing(common, &patches_without_source);
+        if !no_source_purls.is_empty() {
+            report_offline_missing(common, &no_source_purls);
             return Ok(StageOutcome::Unavailable);
         }
     }
@@ -238,6 +256,7 @@ pub(crate) async fn stage_patch_sources(
     // For non-file modes, automatically fetch any still-missing file blobs as
     // a fallback. Patches that lack the requested mode on the server will
     // still apply via the legacy blob path.
+    let mut blob_fetch_failed = false;
     if download_mode != DownloadMode::File {
         let still_missing_blobs = get_missing_blobs(manifest, &staged.blobs).await;
         if !still_missing_blobs.is_empty() {
@@ -251,18 +270,32 @@ pub(crate) async fn stage_patch_sources(
             if !quiet {
                 println!("{}", format_fetch_result(&blob_result));
             }
-            if blob_result.failed > 0 && fetch_result.failed > 0 {
-                if !quiet {
-                    eprintln!("Some artifacts could not be downloaded. Cannot apply patches.");
-                }
-                return Ok(StageOutcome::Unavailable);
+            blob_fetch_failed = blob_result.failed > 0;
+        }
+    }
+
+    // Download failures only matter per patch: bail iff some patch is left
+    // with no usable source at the staged paths — the same coverage rule as
+    // the offline gate. Aggregate counters can't decide this (a patch whose
+    // diff failed may be covered by its blobs and vice versa, and a local
+    // package archive covers its patch even though packages are never
+    // downloaded).
+    if fetch_result.failed > 0 || blob_fetch_failed {
+        let missing_blobs = get_missing_blobs(manifest, &staged.blobs).await;
+        let missing_diff_archives = get_missing_archives(manifest, &staged.diffs).await;
+        let missing_package_archives = get_missing_archives(manifest, &staged.packages).await;
+        let uncovered = patches_without_source(
+            manifest,
+            &missing_blobs,
+            &missing_diff_archives,
+            &missing_package_archives,
+        );
+        if !uncovered.is_empty() {
+            if !quiet {
+                eprintln!("Some artifacts could not be downloaded. Cannot apply patches.");
             }
+            return Ok(StageOutcome::Unavailable);
         }
-    } else if fetch_result.failed > 0 {
-        if !quiet {
-            eprintln!("Some blobs could not be downloaded. Cannot apply patches.");
-        }
-        return Ok(StageOutcome::Unavailable);
     }
 
     Ok(StageOutcome::Ready(staged))
@@ -571,6 +604,102 @@ mod tests {
         assert!(
             matches!(outcome, MemStageOutcome::Unavailable),
             "vendor staging must not treat a diff archive as a usable source"
+        );
+    }
+
+    /// GlobalArgs wired to a guaranteed-unreachable API endpoint: explicit
+    /// token + org overrides keep client construction network-free, and the
+    /// URL points at a port that was just bound and released, so every fetch
+    /// fails fast with connection-refused.
+    fn dead_endpoint_args() -> GlobalArgs {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        GlobalArgs {
+            silent: true,
+            api_url: Some(format!("http://127.0.0.1:{port}")),
+            api_token: Some(format!("sktsec_{}_api", "x".repeat(44))),
+            org: Some("test-org".to_string()),
+            ..GlobalArgs::default()
+        }
+    }
+
+    /// A local package archive is a usable source (the pipeline's Strategy 1,
+    /// and exactly what the offline gate rules), so an online run whose
+    /// downloads all fail must still be Ready when the package archive covers
+    /// every patch. Regression: the failure gate used aggregate fetch
+    /// counters and never consulted package archives, so this cache state was
+    /// Unavailable online while succeeding with --offline.
+    #[tokio::test]
+    async fn stage_online_fetch_failure_accepts_local_package_archive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let socket_dir = tmp.path().join(".socket");
+        std::fs::create_dir_all(socket_dir.join("packages")).unwrap();
+        std::fs::write(
+            socket_dir.join("packages").join(format!("{UUID}.tar.gz")),
+            b"x",
+        )
+        .unwrap();
+
+        let outcome = stage_patch_sources(
+            &dead_endpoint_args(),
+            &manifest_with_one_patch(),
+            &socket_dir,
+        )
+        .await
+        .expect("no hard failure");
+        assert!(
+            matches!(outcome, StageOutcome::Ready(_)),
+            "a local package archive covers the patch even when every download fails"
+        );
+    }
+
+    /// Same coverage rule in file mode: a local diff archive is a usable
+    /// source (pinned offline by `stage_offline_accepts_diff_archive_as_sole_source`),
+    /// so a failed blob download must not flip the outcome to Unavailable.
+    #[tokio::test]
+    async fn stage_online_file_mode_blob_failure_accepts_local_diff_archive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let socket_dir = tmp.path().join(".socket");
+        std::fs::create_dir_all(socket_dir.join("diffs")).unwrap();
+        std::fs::write(
+            socket_dir.join("diffs").join(format!("{UUID}.tar.gz")),
+            b"x",
+        )
+        .unwrap();
+
+        let args = GlobalArgs {
+            download_mode: "file".to_string(),
+            ..dead_endpoint_args()
+        };
+        let outcome = stage_patch_sources(&args, &manifest_with_one_patch(), &socket_dir)
+            .await
+            .expect("no hard failure");
+        assert!(
+            matches!(outcome, StageOutcome::Ready(_)),
+            "a local diff archive covers the patch even when the blob download fails"
+        );
+    }
+
+    /// Overshoot guard for the per-patch coverage gate: with no local source
+    /// at all, failed downloads must still yield Unavailable.
+    #[tokio::test]
+    async fn stage_online_fetch_failure_with_no_local_source_is_unavailable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let socket_dir = tmp.path().join(".socket");
+
+        let outcome = stage_patch_sources(
+            &dead_endpoint_args(),
+            &manifest_with_one_patch(),
+            &socket_dir,
+        )
+        .await
+        .expect("no hard failure");
+        assert!(
+            matches!(outcome, StageOutcome::Unavailable),
+            "no source anywhere + failed downloads must be Unavailable"
         );
     }
 

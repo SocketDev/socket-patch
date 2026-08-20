@@ -488,6 +488,96 @@ fn remove_interactive_non_utf8_answer_declines_without_panic() {
     );
 }
 
+/// Write a vendor ledger with one DETACHED npm entry (no manifest at all —
+/// the pure `scan --vendor --detached` layout), so `remove <purl>` routes to
+/// the detached-only path and its own confirm prompt.
+fn write_detached_vendor_state(root: &Path, purl: &str, uuid: &str) {
+    let vendor = root.join(".socket/vendor");
+    let artifact_dir = vendor.join("npm").join(uuid);
+    std::fs::create_dir_all(&artifact_dir).unwrap();
+    std::fs::write(artifact_dir.join("package.tgz"), b"tgz").unwrap();
+    let state = format!(
+        r#"{{
+  "version": 1,
+  "entries": {{
+    "{purl}": {{
+      "ecosystem": "npm",
+      "basePurl": "{purl}",
+      "uuid": "{uuid}",
+      "artifact": {{ "path": ".socket/vendor/npm/{uuid}/package.tgz" }},
+      "detached": true,
+      "wiring": []
+    }}
+  }}
+}}"#
+    );
+    std::fs::write(vendor.join("state.json"), state).unwrap();
+}
+
+#[test]
+fn remove_detached_interactive_n_cancel_message_respects_silent() {
+    // `--silent` is "errors only" (CLI_CONTRACT.md), and "Removal
+    // cancelled." is chatter: the manifest path gates it on
+    // `!json && !silent`, but the detached-only path gated it on `!json`
+    // alone. The cancel branch is only reachable by an interactive decline
+    // (non-TTY confirm auto-proceeds with the default), which is why the
+    // earlier detached `--silent` sweep in cli_remove_silent.rs missed it.
+    let purl = "pkg:npm/__interactive_detached__@1.0.0";
+    let uuid = "55555555-5555-4555-8555-555555555555";
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_detached_vendor_state(tmp.path(), purl, uuid);
+
+    let (code, output) = run_in_pty(
+        &["remove", purl, "--silent"],
+        tmp.path(),
+        "n\n",
+        Duration::from_secs(15),
+    );
+    assert_eq!(code, 0, "declined detached remove must exit cleanly; got: {output}");
+    // Vacuity guard: the detached confirm prompt MUST have run — otherwise
+    // an early error (e.g. a broken ledger fixture) would pass the absence
+    // assertion below without ever reaching the cancel branch.
+    assert!(
+        output.contains("Remove 1 vendored patch(es) and revert their vendoring?"),
+        "detached remove must have shown its confirm prompt; got: {output}"
+    );
+    assert!(
+        !output.contains("Non-interactive mode"),
+        "remove must NOT have taken the non-interactive branch in a PTY; got: {output}"
+    );
+    assert!(
+        !output.contains("Removal cancelled"),
+        "--silent must suppress the cancellation chatter; got: {output}"
+    );
+    // Declined: the detached ledger entry must be intact.
+    assert!(
+        tmp.path().join(".socket/vendor/state.json").exists(),
+        "declined detached remove must not touch the vendor ledger"
+    );
+
+    // Control run: without --silent the cancel message must print —
+    // otherwise the absence assertion above passes vacuously against a
+    // fix that deleted the message instead of gating it.
+    let tmp2 = tempfile::tempdir().unwrap();
+    write_detached_vendor_state(tmp2.path(), purl, uuid);
+    let (loud_code, loud_output) = run_in_pty(
+        &["remove", purl],
+        tmp2.path(),
+        "n\n",
+        Duration::from_secs(15),
+    );
+    assert_eq!(loud_code, 0, "declined detached remove must exit cleanly; got: {loud_output}");
+    assert!(
+        loud_output.contains("Removal cancelled"),
+        "non-silent declined detached remove must report cancellation; got: {loud_output}"
+    );
+    assert!(
+        tmp2.path().join(".socket/vendor/state.json").exists(),
+        "declined detached remove must not touch the vendor ledger"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Apply non-JSON without --yes also exercises confirm() flow,
 // even though apply auto-proceeds in non-interactive contexts.

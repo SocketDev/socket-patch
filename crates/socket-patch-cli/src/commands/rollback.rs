@@ -743,8 +743,11 @@ async fn rollback_patches_inner(
     .await;
 
     // One representative path per PURL for the "is it installed" checks and
-    // the before-blob gate (the gate's fetch decision is per-hash, identical
-    // across copies). The per-copy restore uses `all_packages_multi`.
+    // the abort envelope's path display. The before-blob gate and the
+    // per-copy restore use `all_packages_multi`: copies drift independently,
+    // so which blobs a rollback needs is NOT identical across copies (an
+    // already-original root copy says nothing about a still-patched nested
+    // duplicate).
     let all_packages: HashMap<String, PathBuf> = all_packages_multi
         .iter()
         .filter_map(|(purl, paths)| paths.first().map(|p| (purl.clone(), p.clone())))
@@ -936,17 +939,27 @@ async fn rollback_patches_inner(
     let mut blob_gated_purls: HashSet<String> = HashSet::new();
     if !absent_blobs.is_empty() {
         for (purl, patch) in &gate_manifest.patches {
-            let pkg_path = all_packages
+            // EVERY physical copy is probed: the rollback loop restores each
+            // copy, and copies drift independently — an already-original (or
+            // locally-drifted) root copy says nothing about a still-patched
+            // nested duplicate, whose restore still needs the blob. Probing
+            // only a representative copy skipped the download and wedged the
+            // online rollback with a mid-run `MissingBlob` failure. Mirrors
+            // apply's `mismatch_blob_gaps`.
+            let pkg_paths = all_packages_multi
                 .get(purl)
                 .expect("gate manifest holds only attempted targets, which the crawler discovered");
             for (file, info) in &patch.files {
                 if info.before_hash.is_empty() || !absent_blobs.contains(&info.before_hash) {
                     continue;
                 }
-                let v = verify_file_rollback(pkg_path, file, info, &blobs_path).await;
-                if v.status == VerifyRollbackStatus::MissingBlob {
-                    missing_blobs.insert(info.before_hash.clone());
-                    blob_gated_purls.insert(purl.clone());
+                for pkg_path in pkg_paths {
+                    let v = verify_file_rollback(pkg_path, file, info, &blobs_path).await;
+                    if v.status == VerifyRollbackStatus::MissingBlob {
+                        missing_blobs.insert(info.before_hash.clone());
+                        blob_gated_purls.insert(purl.clone());
+                        break; // the fetch is per-hash; one needy copy queues it
+                    }
                 }
             }
         }

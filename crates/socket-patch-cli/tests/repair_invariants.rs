@@ -866,6 +866,78 @@ fn repair_honors_manifest_path_override() {
     assert_eq!(v["summary"]["downloaded"], 0);
 }
 
+/// Regression: download failures are ERRORS, and `--silent` suppresses
+/// NON-error output only — so a silent human-mode repair whose downloads
+/// fail must still say so on stderr, not exit 1 completely mute.
+///
+/// Before the fix the only failure report was `format_fetch_result`'s
+/// stdout print, gated on `!(json || silent)`: `repair --silent` swallowed
+/// the failure entirely, leaving a bare exit 1 that a caller can't
+/// distinguish from any other error. (Same class as the `get` download-loop
+/// silent-swallow; `--json` runs carry the failure in the envelope instead.)
+#[tokio::test]
+async fn repair_silent_still_reports_download_failures_on_stderr() {
+    // Mock API with NO blob route mounted: every fetch 404s → counted as
+    // failed ("Blob not found on server"), with no retries or live egress
+    // (telemetry also resolves to this mock via SOCKET_API_URL).
+    let mock = MockServer::start().await;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    // Manifest references REFERENCED_HASH with no blob on disk → the online
+    // download phase must attempt (and fail) the fetch. No orphans, so the
+    // cleanup phase stays quiet either way.
+    make_socket_dir(tmp.path());
+
+    // Loud control: the failure is user-visible and exits 1 — guards the
+    // silent assertion below against passing vacuously if the fetch path
+    // stops failing (or stops being attempted) altogether.
+    let loud = socket_cmd(tmp.path())
+        .args(["repair"])
+        .env("SOCKET_API_URL", mock.uri())
+        .env("SOCKET_API_TOKEN", "fake-token-for-test")
+        .env("SOCKET_ORG_SLUG", ORG_SLUG)
+        .output()
+        .expect("run socket-patch");
+    let loud_all = format!(
+        "{}{}",
+        String::from_utf8_lossy(&loud.stdout),
+        String::from_utf8_lossy(&loud.stderr)
+    );
+    assert_eq!(
+        loud.status.code(),
+        Some(1),
+        "control: repair with failing downloads must exit 1; output=\n{loud_all}"
+    );
+    assert!(
+        loud_all.contains("Failed to download"),
+        "control: loud repair must report the download failure; output=\n{loud_all}"
+    );
+
+    let silent = socket_cmd(tmp.path())
+        .args(["repair", "--silent"])
+        .env("SOCKET_API_URL", mock.uri())
+        .env("SOCKET_API_TOKEN", "fake-token-for-test")
+        .env("SOCKET_ORG_SLUG", ORG_SLUG)
+        .output()
+        .expect("run socket-patch");
+    let silent_stdout = String::from_utf8_lossy(&silent.stdout);
+    let silent_stderr = String::from_utf8_lossy(&silent.stderr);
+    assert_eq!(
+        silent.status.code(),
+        Some(1),
+        "silent repair with failing downloads must still exit 1; stderr=\n{silent_stderr}"
+    );
+    assert!(
+        silent_stdout.trim().is_empty(),
+        "--silent must keep stdout free of progress output; got:\n{silent_stdout}"
+    );
+    assert!(
+        silent_stderr.contains("Failed to download"),
+        "--silent must not swallow download-failure errors (errors are \
+         exempt from --silent); stderr=\n{silent_stderr}"
+    );
+}
+
 /// Regression: `--silent` ("Suppress non-error output") must mute the
 /// human-readable progress that `repair` prints to stdout — "Found N
 /// missing", "Downloading…", the cleanup summary and "Repair complete.".

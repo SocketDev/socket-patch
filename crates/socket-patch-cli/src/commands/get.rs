@@ -950,7 +950,9 @@ pub(crate) async fn download_patch_records(
                 // reporting the purl as vendored would claim protection
                 // while writing nothing. Fail loudly instead.
                 if files.is_empty() {
-                    if !params.json && !params.silent {
+                    // Errors are exempt from --silent ("errors only");
+                    // JSON runs carry them in the envelope instead.
+                    if !params.json {
                         eprintln!(
                             "  [fail] {} (patch has no applicable files)",
                             search_result.purl
@@ -965,7 +967,9 @@ pub(crate) async fn download_patch_records(
                     }));
                     continue;
                 }
-                let quiet = params.json || params.silent;
+                // Blob failures are errors: only JSON mode suppresses the
+                // per-file detail line (the envelope carries the error).
+                let quiet = params.json;
                 // Vendor flows keep blob content in memory (the vendor
                 // step re-fetches what it needs); persisting blobs here
                 // would litter .socket/blobs for no consumer.
@@ -997,7 +1001,7 @@ pub(crate) async fn download_patch_records(
                 downloaded += 1;
             }
             Ok(None) => {
-                if !params.json && !params.silent {
+                if !params.json {
                     eprintln!("  [fail] {} (could not fetch details)", search_result.purl);
                 }
                 failed += 1;
@@ -1009,7 +1013,7 @@ pub(crate) async fn download_patch_records(
                 }));
             }
             Err(e) => {
-                if !params.json && !params.silent {
+                if !params.json {
                     eprintln!("  [fail] {} ({e})", search_result.purl);
                 }
                 failed += 1;
@@ -1246,7 +1250,9 @@ pub async fn download_and_apply_patches(
                 // them while writing nothing. Count it as a failure so the
                 // status/exit code degrade and it is never auto-applied.
                 if files.is_empty() {
-                    if !params.json && !params.silent {
+                    // Errors are exempt from --silent ("errors only");
+                    // JSON runs carry them in the envelope instead.
+                    if !params.json {
                         eprintln!("  [fail] {} (patch has no applicable files)", patch.purl);
                     }
                     downloaded_patches.push(serde_json::json!({
@@ -1259,7 +1265,9 @@ pub async fn download_and_apply_patches(
                     continue;
                 }
 
-                let quiet = params.json || params.silent;
+                // Blob failures are errors: only JSON mode suppresses the
+                // per-file detail line (the envelope carries the error).
+                let quiet = params.json;
                 // Vendor flows keep blob content in memory (the vendor
                 // step re-fetches what it needs); persisting blobs here
                 // would litter .socket/blobs for no consumer.
@@ -1323,7 +1331,7 @@ pub async fn download_and_apply_patches(
                 patches_downloaded += 1;
             }
             Ok(None) => {
-                if !params.json && !params.silent {
+                if !params.json {
                     eprintln!("  [fail] {} (could not fetch details)", search_result.purl);
                 }
                 downloaded_patches.push(serde_json::json!({
@@ -1335,7 +1343,7 @@ pub async fn download_and_apply_patches(
                 patches_failed += 1;
             }
             Err(e) => {
-                if !params.json && !params.silent {
+                if !params.json {
                     eprintln!("  [fail] {} ({e})", search_result.purl);
                 }
                 downloaded_patches.push(serde_json::json!({

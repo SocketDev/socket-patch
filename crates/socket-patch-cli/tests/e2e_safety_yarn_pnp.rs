@@ -509,11 +509,6 @@ fn synthetic_manifest_is_discovered_by_cli() {
 /// unconditionally against `--cwd`, so running global-mode apply from
 /// inside any PnP checkout refused and patched nothing.
 #[test]
-#[ignore = "RED: apply::run calls detect_npm_pkg_manager(&args.common.cwd) \
-            unconditionally, so the yarn_pnp_unsupported refusal is not scoped to \
-            runs that actually touch npm packages. The scoping fix was not part of \
-            this change (see pnp_project_still_refuses_when_an_npm_patch_is_in_scope \
-            for the counter-guard, which stays live)."]
 fn global_prefix_apply_is_not_refused_from_a_pnp_cwd() {
     let dir = tempfile::tempdir().unwrap();
     make_yarn_berry_project(dir.path());
@@ -677,8 +672,6 @@ fn write_polyglot_manifest(socket_dir: &Path, py_before: &str, py_after: &str) {
 /// so the PnP layout is irrelevant — yet the unconditional detector refused
 /// the whole command, leaving the perfectly appliable pypi patch unapplied.
 #[test]
-#[ignore = "RED: same unscoped yarn_pnp_unsupported refusal — a pypi-only apply in \
-            a PnP checkout is refused even though no npm package is involved."]
 fn non_npm_ecosystem_apply_is_not_refused_in_a_pnp_project() {
     let dir = tempfile::tempdir().unwrap();
     make_yarn_berry_project(dir.path());
@@ -739,9 +732,6 @@ fn non_npm_ecosystem_apply_is_not_refused_in_a_pnp_project() {
 /// the PnP layout is irrelevant; the unconditional detector refused the
 /// whole command anyway.
 #[test]
-#[ignore = "RED: same unscoped yarn_pnp_unsupported refusal — a PnP project whose \
-            manifest holds no npm patches has its other ecosystems' patches \
-            refused too."]
 fn pnp_project_with_no_npm_patches_still_applies_its_other_patches() {
     let dir = tempfile::tempdir().unwrap();
     make_yarn_berry_project(dir.path());

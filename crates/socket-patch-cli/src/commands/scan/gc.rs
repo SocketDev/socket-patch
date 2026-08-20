@@ -132,6 +132,26 @@ pub(super) async fn run_apply_gc(
     let vendor_gc =
         crate::commands::vendor::run_vendor_gc(common, manifest_path, /*dry_run=*/ false).await;
 
+    // The prune below is a manifest read-modify-write plus a blob/archive
+    // sweep — the writes the apply lock serializes everywhere else (apply,
+    // get, remove, repair, rollback, and the vendored half above, which
+    // takes it internally). Run unlocked against a live holder mid-write,
+    // the stale read would clobber the holder's new manifest entry on
+    // write-back and the sweep would delete its just-downloaded blobs.
+    // Contention skips the pass without failing the scan — the vendored
+    // half's posture (acquired after it returns, since it self-locks).
+    let _guard = match socket_patch_core::patch::apply_lock::acquire(
+        socket_dir,
+        std::time::Duration::ZERO,
+    ) {
+        Ok(g) => g,
+        Err(_) => {
+            let mut gc = GcSummary::default();
+            gc.absorb_vendor_gc(vendor_gc);
+            return gc;
+        }
+    };
+
     // Re-read the just-written manifest (the apply step may have added
     // or updated entries we now want to consider for pruning).
     let mut manifest = match read_manifest(manifest_path).await {
@@ -586,6 +606,57 @@ mod tests {
         assert!(
             m.patches.contains_key("pkg:npm/gone@1.0.0"),
             "dry-run preview must not prune the manifest entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_apply_gc_skips_prune_and_sweep_while_apply_lock_is_held() {
+        // A live holder of `<socket_dir>/apply.lock` (a concurrent `get`,
+        // `apply`, `remove`, …) may be mid-manifest-write and mid-blob-
+        // download. The wet GC pass is a manifest read-modify-write plus a
+        // blob sweep: run unlocked, its stale read clobbers the holder's
+        // new manifest entry on write-back, and the sweep deletes the
+        // holder's fresh blobs (unreferenced by GC's stale in-memory copy).
+        // Contention must skip the pass — the vendored half's posture —
+        // never prune or delete.
+        let tmp = tempfile::tempdir().unwrap();
+        let after_hash = "c".repeat(64);
+        let (manifest_path, socket_dir, blob_path) =
+            seed_manifest_with_blob(tmp.path(), "pkg:npm/gone@1.0.0", &after_hash);
+
+        let _holder = socket_patch_core::patch::apply_lock::acquire(
+            &socket_dir,
+            std::time::Duration::ZERO,
+        )
+        .expect("test holder must win the fresh lock");
+
+        let scanned: HashSet<String> = HashSet::new();
+        let gc = run_apply_gc(
+            &gc_common(tmp.path()),
+            &manifest_path,
+            &socket_dir,
+            &scanned,
+            &no_vendored(),
+        )
+        .await;
+
+        assert!(
+            gc.pruned.is_empty(),
+            "GC must not prune under a held apply lock; pruned {:?}",
+            gc.pruned
+        );
+        assert_eq!(
+            gc.blobs.blobs_removed, 0,
+            "GC must not sweep blobs under a held apply lock"
+        );
+        assert!(
+            blob_path.exists(),
+            "blob must survive a lock-contended GC pass"
+        );
+        let m = read_manifest(&manifest_path).await.unwrap().unwrap();
+        assert!(
+            m.patches.contains_key("pkg:npm/gone@1.0.0"),
+            "manifest entry must survive a lock-contended GC pass"
         );
     }
 

@@ -1,7 +1,7 @@
 use clap::Args;
 use socket_patch_core::api::blob_fetcher::{
     fetch_missing_sources, format_fetch_result, get_missing_archives, get_missing_blobs,
-    DownloadMode,
+    DownloadMode, FetchMissingBlobsResult,
 };
 use socket_patch_core::api::client::get_api_client_with_overrides;
 use socket_patch_core::manifest::cleanup_blobs::{
@@ -385,6 +385,17 @@ async fn repair_inner(
             download_failed_count = fetch_result.failed;
             if !quiet {
                 println!("{}", format_fetch_result(&fetch_result));
+            } else if fetch_result.failed > 0 && !args.common.json {
+                // `--silent` suppresses NON-error output only: a failed
+                // download must still reach stderr (`--json` runs carry it
+                // in the envelope instead). Zeroing the success counters
+                // makes `format_fetch_result` emit just the failure lines.
+                let failures_only = FetchMissingBlobsResult {
+                    downloaded: 0,
+                    skipped: 0,
+                    ..fetch_result
+                };
+                eprintln!("{}", format_fetch_result(&failures_only));
             }
         }
     }

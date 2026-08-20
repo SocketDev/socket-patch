@@ -913,9 +913,6 @@ fn write_package_archive(packages: &Path, uuid: &str, entries: &[(&str, &[u8])])
 /// entitlement change, dead network) therefore turned a fully satisfiable
 /// apply into a whole-run abort.
 #[tokio::test]
-#[ignore = "RED: a transient fetch failure still aborts the whole run even when \
-            `.socket/packages/<uuid>.tar.gz` already satisfies the apply. The \
-            cache-fallback fix was not part of this change."]
 async fn apply_online_uses_cached_package_archive_when_downloads_fail() {
     let before = b"pkgcache before\n";
     let after = b"pkgcache after\n";
@@ -978,6 +975,140 @@ async fn apply_online_uses_cached_package_archive_when_downloads_fail() {
     );
 
     // Apply stays read-only against the persistent cache.
+    let blobs_dir = socket.join("blobs");
+    if blobs_dir.exists() {
+        let entries: Vec<_> = std::fs::read_dir(&blobs_dir).unwrap().collect();
+        assert!(
+            entries.is_empty(),
+            "apply must not write to .socket/blobs/; found {entries:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Multi-copy mismatch top-up: every physical copy is probed, not just the
+// first.
+// ---------------------------------------------------------------------------
+
+/// Two physical copies of one PURL (a root copy plus a nested duplicate):
+/// the root copy already carries the afterHash bytes, the nested one was
+/// locally modified (matches NEITHER hash). A cached diff archive makes the
+/// stage step download nothing, so the on-demand mismatch top-up is the
+/// ONLY chance to fetch the full afterHash blob the nested copy needs under
+/// the default warn-and-overwrite policy — and copies drift independently,
+/// so the top-up must probe EVERY copy. Before the fix it probed only the
+/// first (root) copy, found it clean, queued nothing, and the nested copy
+/// failed to apply (exit 1) — the very failure the top-up exists to prevent.
+#[tokio::test]
+async fn mismatch_blob_topup_probes_every_copy_of_a_duplicated_package() {
+    let before = b"before\n";
+    let after = b"after\n";
+    let before_hash = git_sha256(before);
+    let after_hash = git_sha256(after);
+
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/v0/orgs/{ORG_SLUG}/patches/blob/{after_hash}"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(after.to_vec()))
+        .mount(&mock)
+        .await;
+
+    let uuid = "44444444-4444-4444-8444-444444444444";
+    let purl = "pkg:npm/dupcopy@1.0.0";
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_root_package_json(tmp.path());
+    // Root copy: already patched (afterHash bytes) — the probe finds no
+    // mismatch here.
+    write_npm_package(tmp.path(), "dupcopy", "1.0.0", "index.js", after);
+    // Nested duplicate under a real intermediate package: locally modified,
+    // matching neither hash.
+    write_npm_package(tmp.path(), "parent", "1.0.0", "index.js", b"parent\n");
+    write_npm_package(
+        &tmp.path().join("node_modules").join("parent"),
+        "dupcopy",
+        "1.0.0",
+        "index.js",
+        b"locally modified\n",
+    );
+
+    let socket = tmp.path().join(".socket");
+    write_manifest_with_patch(&socket, purl, uuid, &before_hash, &after_hash);
+    // A cached diff archive: the stage step concludes nothing needs
+    // downloading (default `--download-mode diff`), so sources are read
+    // in place and no whole-manifest blob fallback runs. The archive's
+    // content is never consulted for these copies (already-patched needs
+    // nothing; a mismatched file can only take the full blob).
+    let diffs = socket.join("diffs");
+    std::fs::create_dir_all(&diffs).unwrap();
+    {
+        use std::io::Write as _;
+        let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
+            std::fs::File::create(diffs.join(format!("{uuid}.tar.gz"))).unwrap(),
+            flate2::Compression::default(),
+        ));
+        let mut header = tar::Header::new_gnu();
+        let bytes = b"unrelated";
+        header.set_size(bytes.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "other.js", &bytes[..])
+            .unwrap();
+        builder
+            .into_inner()
+            .unwrap()
+            .finish()
+            .unwrap()
+            .flush()
+            .unwrap();
+    }
+
+    let (code, stdout, stderr) = run_apply(tmp.path(), &mock.uri(), &[]);
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert_eq!(
+        code, 0,
+        "both copies must apply cleanly.\nstdout={v:#}\nstderr={stderr}"
+    );
+    assert_eq!(
+        v["summary"]["applied"], 1,
+        "the drifted nested copy must be warn-overwritten.\nstdout={v:#}"
+    );
+    assert_eq!(
+        v["summary"]["failed"], 0,
+        "no copy may fail.\nstdout={v:#}"
+    );
+
+    // The nested copy's blob was fetched on demand…
+    let requests = mock.received_requests().await.unwrap();
+    let blob_path = format!("/v0/orgs/{ORG_SLUG}/patches/blob/{after_hash}");
+    assert!(
+        requests.iter().any(|r| r.url.path() == blob_path),
+        "the top-up must fetch the blob the nested copy needs; got {:?}",
+        requests
+            .iter()
+            .map(|r| r.url.path().to_string())
+            .collect::<Vec<_>>()
+    );
+    // …and BOTH copies carry the patched bytes.
+    assert_eq!(
+        std::fs::read(tmp.path().join("node_modules/dupcopy/index.js")).unwrap(),
+        after,
+        "root copy must keep the patched bytes"
+    );
+    assert_eq!(
+        std::fs::read(
+            tmp.path()
+                .join("node_modules/parent/node_modules/dupcopy/index.js")
+        )
+        .unwrap(),
+        after,
+        "the nested copy must be overwritten with the verified patched bytes"
+    );
+
+    // Apply stays read-only against the persistent cache: the on-demand
+    // blob lands in a transient overlay, never `.socket/blobs/`.
     let blobs_dir = socket.join("blobs");
     if blobs_dir.exists() {
         let entries: Vec<_> = std::fs::read_dir(&blobs_dir).unwrap().collect();

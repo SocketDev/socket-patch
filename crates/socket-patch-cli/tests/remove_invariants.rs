@@ -160,9 +160,16 @@ fn remove_with_invalid_manifest_emits_error() {
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
     assert_eq!(v["command"], "remove");
     assert_eq!(v["status"], "error");
-    // A parse failure must be distinguished from a missing manifest, otherwise
-    // a broken loader could silently treat corrupt JSON as "not found".
-    assert_eq!(v["error"]["code"], "manifest_unreadable");
+    // A manifest that EXISTS but cannot be parsed is `manifest_invalid` per
+    // the CLI_CONTRACT.md error-code table — distinct from both
+    // `manifest_not_found` (missing file) and `manifest_unreadable` (genuine
+    // I/O error). Regression: remove labeled every read error
+    // `manifest_unreadable`, telling consumers a corrupt file was a
+    // transient I/O failure (list shares the split and was fixed first).
+    assert_eq!(
+        v["error"]["code"], "manifest_invalid",
+        "unparseable manifest must be manifest_invalid; envelope: {v}"
+    );
     let msg = v["error"]["message"]
         .as_str()
         .expect("error message string");
@@ -172,6 +179,48 @@ fn remove_with_invalid_manifest_emits_error() {
     );
     // Nothing was removed on the error path.
     assert_eq!(v["summary"]["removed"], 0);
+}
+
+#[test]
+fn remove_with_schema_invalid_manifest_emits_manifest_invalid() {
+    // Valid JSON, but not a valid manifest (missing the required `patches`
+    // key). read_manifest's validation step rejects it with InvalidData, so
+    // it must also surface as `manifest_invalid`, never `manifest_unreadable`.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let socket = tmp.path().join(".socket");
+    std::fs::create_dir_all(&socket).unwrap();
+    std::fs::write(socket.join("manifest.json"), r#"{"not_patches": {}}"#).unwrap();
+
+    let (code, stdout) = run_remove(tmp.path(), "pkg:npm/foo@1.0.0", &[]);
+    assert_eq!(code, 1, "schema-invalid manifest must exit 1; stdout=\n{stdout}");
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert_eq!(v["status"], "error");
+    assert_eq!(
+        v["error"]["code"], "manifest_invalid",
+        "schema-invalid manifest must be manifest_invalid; envelope: {v}"
+    );
+}
+
+#[test]
+fn remove_with_directory_manifest_emits_manifest_unreadable() {
+    // A genuine I/O error reaching an EXISTING path must stay
+    // `manifest_unreadable` — the manifest_invalid split above must not
+    // swallow it. A directory at the manifest path makes the read fail with
+    // a non-absence, non-InvalidData error (Unix `IsADirectory` / Windows
+    // `PermissionDenied`), and it passes the metadata pre-check so the flow
+    // reaches read_manifest.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let socket = tmp.path().join(".socket");
+    std::fs::create_dir_all(socket.join("manifest.json")).unwrap();
+
+    let (code, stdout) = run_remove(tmp.path(), "pkg:npm/foo@1.0.0", &[]);
+    assert_eq!(code, 1, "directory manifest must exit 1; stdout=\n{stdout}");
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert_eq!(v["status"], "error");
+    assert_eq!(
+        v["error"]["code"], "manifest_unreadable",
+        "an I/O error on an existing path must be manifest_unreadable; envelope: {v}"
+    );
 }
 
 // ---------------------------------------------------------------------------
