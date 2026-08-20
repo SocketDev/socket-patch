@@ -2453,7 +2453,7 @@ fn rewrite_bun_lock(
     if check_lock_version(content).is_err() {
         result.warnings.push(RewriteWarning {
             code: "redirect_bun_lock_unsupported".into(),
-            detail: "bun.lock lockfileVersion is not 1; re-lock with bun >= 1.3".into(),
+            detail: "bun.lock lockfileVersion is not 1 or 2; re-lock with bun >= 1.3".into(),
         });
         return;
     }
@@ -6248,7 +6248,9 @@ mod tests {
             .iter()
             .any(|w| w.code == "redirect_bun_lockb_unsupported"));
 
-        // Unsupported lockfileVersion → refusal.
+        // lockfileVersion 2 (bun >= 1.4): SAME emitted grammar as 1 — the
+        // bump gates stricter parse checks, not new entry shapes — so the
+        // rewrite proceeds and the version line survives verbatim.
         let mut files = BTreeMap::new();
         files.insert(
             "bun.lock".to_string(),
@@ -6259,8 +6261,32 @@ mod tests {
         );
         let mut r = RewriteResult::default();
         rewrite_bun_lock(&files, std::slice::from_ref(&ovr), &mut r);
+        let out = r
+            .files
+            .get("bun.lock")
+            .expect("a lockfileVersion-2 lock must be rewritten like a v1 lock");
+        assert!(out.contains("\"lockfileVersion\": 2,"), "{out}");
+        assert!(out.contains("http://p.test/lp.tgz"), "{out}");
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+
+        // Unsupported lockfileVersion (a future 3) → refusal.
+        let mut files = BTreeMap::new();
+        files.insert(
+            "bun.lock".to_string(),
+            bun_lock_file(
+                "\"left-pad\": [\"left-pad@1.3.0\", \"\", {}, \"sha512-OLD==\"]",
+                3,
+            ),
+        );
+        let mut r = RewriteResult::default();
+        rewrite_bun_lock(&files, std::slice::from_ref(&ovr), &mut r);
         assert!(r.files.is_empty());
         assert_eq!(r.warnings[0].code, "redirect_bun_lock_unsupported");
+        assert!(
+            r.warnings[0].detail.contains("not 1 or 2"),
+            "the refusal must name the supported versions: {}",
+            r.warnings[0].detail
+        );
 
         // Non-single-line packages section → fail-closed refusal.
         let mut files = BTreeMap::new();

@@ -253,8 +253,30 @@ jobs:
         # that path to subsequent steps so `Command::new("vexctl")` in
         # the test resolves. Pinned to a tagged release rather than
         # @latest for reproducibility.
+        #
+        # Retried: the install compiles sigstore/cosign, whose module
+        # verification reads dozens of sum.golang.org checksum tiles, and
+        # transient INTERNAL_ERROR stream resets there have failed this
+        # step on otherwise-green runs (2026-08-20: two attempts ~18 min
+        # apart, different modules each time — an upstream incident, not
+        # one bad tile). The backoff rides out short resets; a persistent
+        # outage still fails loudly on the last attempt. Follow-up option
+        # if this recurs: install the pinned release BINARY (sha256-pinned)
+        # instead of compiling, which sidesteps module verification and
+        # drops ~100s of compile time per leg.
+        shell: bash
         run: |
-          go install github.com/openvex/vexctl@v0.3.0
+          for attempt in 1 2 3 4 5; do
+            if go install github.com/openvex/vexctl@v0.3.0; then
+              break
+            fi
+            if [ "$attempt" = 5 ]; then
+              echo "::error::go install vexctl failed on all 5 attempts"
+              exit 1
+            fi
+            echo "::warning::go install vexctl attempt $attempt failed; retrying"
+            sleep $((attempt * 20))
+          done
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
       - name: Run tests

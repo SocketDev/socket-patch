@@ -57,7 +57,8 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
   unpatched artifact. The reverse shape — an alias of the patched NAME pointing at a
   different package (`"left-pad@npm:some-fork@^1.3.0"`, the fork-substitution idiom) —
   is never rewritten: it resolves a different package.
-- **bun** — text `bun.lock` v1 only. A binary `bun.lockb` with no text lock beside it
+- **bun** — text `bun.lock` lockfileVersion 1 or 2 (bun 1.3 / 1.4 — one emitted
+  grammar; anything else is refused). A binary `bun.lockb` with no text lock beside it
   is auto-migrated first: the CLI runs your installed `bun`
   (`bun install --save-text-lockfile --frozen-lockfile --lockfile-only`) before reading
   the lock — `redirect_bun_lockb_would_migrate` on `--dry-run`,
