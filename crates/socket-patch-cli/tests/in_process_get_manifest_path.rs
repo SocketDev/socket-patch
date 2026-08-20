@@ -105,6 +105,7 @@ fn get_args(identifier: &str, cwd: &Path, api_url: String) -> GetArgs {
         save_only: true,
         one_off: false,
         all_releases: false,
+        mode: None,
     }
 }
 

@@ -41,6 +41,7 @@ fn default_args(identifier: &str, cwd: &Path) -> GetArgs {
         save_only: true,
         one_off: false,
         all_releases: false,
+        mode: None,
     }
 }
 

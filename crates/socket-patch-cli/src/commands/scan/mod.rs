@@ -36,9 +36,15 @@ mod vendor_flow;
 
 use self::discovery::{
     collect_vuln_ids, detect_updates, lockfile_supplement, merge_redirect_records_for_updates,
-    preverify_vendor_baselines, severity_order, unsupported_layout_warnings,
-    vendored_ledger_supplement,
+    preverify_vendor_baselines, severity_order, vendored_ledger_supplement,
 };
+// Shared with `get --mode hosted|vendored` (commands::get): the advisory-
+// pinned entry into the hosted engine, the vendor step + its dry-run
+// preview, and the PnP layout-refusal warning mapping. `pub(crate)`
+// re-exports because the submodules themselves stay private to scan.
+pub(crate) use self::discovery::unsupported_layout_warnings;
+pub(crate) use self::hosted::boxed_run_redirect_selected;
+pub(crate) use self::vendor_flow::{boxed_scan_vendor_step, preview_vendor_json};
 use self::gc::{gc_json, print_gc_vendored_line, run_apply_gc};
 use self::hosted::run_redirect;
 use self::vendor_flow::{
@@ -74,7 +80,8 @@ pub enum ScanMode {
 
 impl ScanMode {
     /// The CLI spelling of the variant (`--mode <name>`), for error messages.
-    fn cli_name(self) -> &'static str {
+    /// `pub(crate)`: `get --mode` reuses the enum and its error wording.
+    pub(crate) fn cli_name(self) -> &'static str {
         match self {
             ScanMode::Hosted => "hosted",
             ScanMode::Vendored => "vendored",
@@ -1451,7 +1458,7 @@ pub async fn run(mut args: ScanArgs) -> i32 {
     // empty) and a stderr line on the human path; exit code and `status`
     // stay deliberately unchanged (same posture as hosted refusals, which
     // exit 0 with `redirected: 0`).
-    let layout_refusals = unsupported_layout_warnings(&lockfile_only);
+    let layout_refusals = unsupported_layout_warnings(&lockfile_only.unsupported);
     if !lockfile_only.packages.is_empty() {
         for pkg in &lockfile_only.packages {
             if let Some(eco) = Ecosystem::from_purl(&pkg.purl) {

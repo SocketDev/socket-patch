@@ -69,6 +69,7 @@ async fn uuid_get_with_corrupt_manifest_fails_without_clobbering() {
         save_only: true,
         one_off: false,
         all_releases: false,
+        mode: None,
     };
 
     let code = run(args).await;

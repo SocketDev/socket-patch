@@ -154,6 +154,7 @@ struct Snap {
     save_only: bool,
     one_off: bool,
     all_releases: bool,
+    mode: Option<socket_patch_cli::commands::scan::ScanMode>,
 }
 
 fn snapshot(a: &GetArgs) -> Snap {
@@ -189,6 +190,7 @@ fn snapshot(a: &GetArgs) -> Snap {
         save_only: a.save_only,
         one_off: a.one_off,
         all_releases: a.all_releases,
+        mode: a.mode,
     }
 }
 
@@ -232,6 +234,7 @@ fn expected_defaults(identifier: &str) -> Snap {
         save_only: false,
         one_off: false,
         all_releases: false,
+        mode: None,
     }
 }
 

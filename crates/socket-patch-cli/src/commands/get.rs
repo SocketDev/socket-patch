@@ -467,7 +467,9 @@ pub struct GetArgs {
     /// installed distribution. Affects ecosystems with per-release
     /// variants — PyPI (wheel/sdist via `artifact_id`), RubyGems
     /// (`platform`), and Maven (`classifier`). Off by default: only the
-    /// patch(es) for the installed dist are fetched.
+    /// patch(es) for the installed dist are fetched. Also disables the
+    /// coarse installed-VERSION narrowing of CVE/GHSA fan-outs (see
+    /// `--mode`): every version's patch is fetched, installed or not.
     #[arg(
         long = "all-releases",
         env = "SOCKET_ALL_RELEASES",
@@ -475,6 +477,18 @@ pub struct GetArgs {
         value_parser = crate::args::parse_bool_flag,
     )]
     pub all_releases: bool,
+
+    /// How to consume the patch(es) — the same three modes as `scan`:
+    /// `agent` (default; record in `.socket/manifest.json` + blobs and
+    /// apply in place), `hosted` (rewrite lockfiles so the patched deps
+    /// resolve to Socket's hosted patch server; no manifest, no blobs —
+    /// state lives in the redirect ledger), or `vendored` (record in the
+    /// manifest, then commit patched artifacts under `.socket/vendor/` and
+    /// rewire the lockfile). Hosted/vendored runs produce the same on-disk
+    /// result as `scan --mode hosted|vendored` selecting the same patch.
+    /// No env binding, matching `scan --mode`.
+    #[arg(long = "mode", value_enum)]
+    pub mode: Option<super::scan::ScanMode>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -845,6 +859,200 @@ async fn filter_to_installed_releases(
         }
     }
     (kept, warnings)
+}
+
+/// Does this purl carry an exact version (`pkg:type/name@version`)? An
+/// exact-versioned PURL identifier is exempt from the coarse installed-
+/// version narrowing, like a UUID: the user named the version explicitly.
+/// npm scope `@`s don't count (`pkg:npm/@scope/name` is versionless — the
+/// candidate "version" after the last `@` still contains a `/`).
+fn purl_has_version(purl: &str) -> bool {
+    let stripped = strip_purl_qualifiers(purl);
+    stripped
+        .strip_prefix("pkg:")
+        .and_then(|rest| rest.split_once('/'))
+        .and_then(|(_, coord)| coord.rsplit_once('@'))
+        .is_some_and(|(head, version)| {
+            !head.is_empty() && !version.is_empty() && !version.contains('/')
+        })
+}
+
+/// Outcome of the coarse installed-VERSION narrowing over a CVE/GHSA/PURL
+/// search fan-out (see [`filter_to_installed_purls`]).
+struct InstalledNarrowing {
+    /// Results whose package version is present (kept for selection).
+    kept: Vec<PatchSearchResult>,
+    /// Contract-shaped skip records for the filtered-out results
+    /// (`action: "skipped"` + `errorCode`), purl-sorted.
+    skip_records: Vec<serde_json::Value>,
+    /// Run-level `(code, detail)` warnings (PnP layout refusals), for both
+    /// stderr and the JSON `warnings[]`.
+    warnings: Vec<(String, String)>,
+}
+
+/// Narrow a search fan-out to the package VERSIONS actually present, so a
+/// GHSA with patches for dozens of versions acts only on what this system
+/// runs — the coarse layer above [`filter_to_installed_releases`]'s
+/// per-release variant narrowing (which still runs later, unchanged).
+///
+/// Presence evidence per result purl (compared on
+/// `normalize_purl(strip_purl_qualifiers(..))` — API purls are
+/// percent-encoded/qualified, crawler purls literal):
+/// * installed on disk — `find_packages_for_rollback` over the deduped base
+///   purls (the qualified-aware resolver; memory invariant);
+/// * already tracked in the manifest — the user opted this purl in earlier,
+///   and updating its record must keep working on hosts without an
+///   installed copy (CI manifest-maintenance);
+/// * hosted/vendored modes only: resolved in the project lockfile(s)
+///   (hosted rewrites the lock; vendored auto-fetches pristine) or claimed
+///   by the vendor ledger (fresh-clone re-vendor) — mirroring scan's
+///   lockfile/vendored-ledger discovery supplements, including their
+///   global-scan gate.
+///
+/// PnP layouts are surfaced, never silently misreported: yarn PnP packages
+/// are structurally unpatchable in every mode (skip records carry
+/// `yarn_pnp_unsupported`, not a false "not installed"); pnpm PnP skips
+/// carry `pnpm_pnp_unsupported` except in hosted mode, which KEEPS them —
+/// the refusal's own remedy text blesses the hosted lockfile rewrite.
+///
+/// Callers exempt UUID identifiers, exact-versioned PURLs, `--save-only`
+/// (record-only has no installation precondition), `--all-releases`, and
+/// the package-name path (already installed-derived).
+async fn filter_to_installed_purls(
+    accessible: &[PatchSearchResult],
+    common: &GlobalArgs,
+    mode: super::scan::ScanMode,
+) -> InstalledNarrowing {
+    use socket_patch_core::vendor::lock_inventory;
+    use std::collections::HashSet;
+
+    let canon = |p: &str| normalize_purl(strip_purl_qualifiers(p)).into_owned();
+
+    // Deduped base purls, probed against the installed tree. The resolver
+    // keys its result by the purls we pass, so canonicalize the found keys
+    // the same way as the membership probes below.
+    let bases: Vec<String> = {
+        let mut seen = HashSet::new();
+        accessible
+            .iter()
+            .map(|p| strip_purl_qualifiers(&p.purl).to_string())
+            .filter(|b| seen.insert(b.clone()))
+            .collect()
+    };
+    let partitioned = partition_purls(&bases, None);
+    let crawler_options = CrawlerOptions {
+        cwd: common.cwd.clone(),
+        global: common.global,
+        global_prefix: common.global_prefix.clone(),
+    };
+    let found = find_packages_for_rollback(&partitioned, &crawler_options, true).await;
+    let mut present: HashSet<String> = found.keys().map(|k| canon(k)).collect();
+
+    // Manifest membership counts as presence (read-only probe: a corrupt
+    // manifest degrades to "no extension" here — the download path's
+    // fail-closed read still guards every write).
+    if let Ok(Some(manifest)) = read_manifest(&common.resolved_manifest_path()).await {
+        present.extend(manifest.patches.keys().map(|k| canon(k)));
+    }
+
+    // Lockfile + vendor-ledger supplements (scan's discovery gate: never on
+    // global scans, which target the machine tree, not this project).
+    let mut pnp_diags: Vec<lock_inventory::UnsupportedNpmLayout> = Vec::new();
+    if !common.global && common.global_prefix.is_none() {
+        let (entries, unsupported) =
+            lock_inventory::inventory_project_diagnosed(&common.cwd).await;
+        pnp_diags = unsupported;
+        if mode != super::scan::ScanMode::Agent {
+            present.extend(entries.iter().map(|e| canon(&e.purl)));
+            if let Ok(state) = socket_patch_core::vendor::load_state(&common.cwd).await {
+                present.extend(state.entries.values().map(|e| canon(&e.base_purl)));
+            }
+        }
+    }
+
+    let warnings = super::scan::unsupported_layout_warnings(&pnp_diags);
+    let pnp_yarn = pnp_diags
+        .iter()
+        .any(|d| d.code == "vendor_yarn_berry_unsupported");
+    let pnp_pnpm = pnp_diags
+        .iter()
+        .any(|d| d.code == "vendor_pnpm_pnp_unsupported");
+
+    let mut out = InstalledNarrowing {
+        kept: Vec::new(),
+        skip_records: Vec::new(),
+        warnings,
+    };
+    for result in accessible {
+        if present.contains(&canon(&result.purl)) {
+            out.kept.push(result.clone());
+            continue;
+        }
+        let is_npm = strip_purl_qualifiers(&result.purl).starts_with("pkg:npm/");
+        let error_code = if is_npm && pnp_yarn {
+            // Structurally invisible, in EVERY mode — never claim "not
+            // installed" when the truth is "cannot see".
+            "yarn_pnp_unsupported"
+        } else if is_npm && pnp_pnpm {
+            if mode == super::scan::ScanMode::Hosted {
+                // The pnpm PnP refusal's own remedy is the hosted lockfile
+                // rewrite — keep the result and let the rewriter's per-dep
+                // confirmation decide.
+                out.kept.push(result.clone());
+                continue;
+            }
+            "pnpm_pnp_unsupported"
+        } else {
+            "package_not_installed"
+        };
+        out.skip_records.push(serde_json::json!({
+            "purl": result.purl, "uuid": result.uuid,
+            "action": "skipped", "errorCode": error_code,
+        }));
+    }
+    out.skip_records
+        .sort_by(|a, b| a["purl"].as_str().cmp(&b["purl"].as_str()));
+    out
+}
+
+/// Fold the coarse-narrowing skip records + PnP warnings into a get JSON
+/// envelope: they were "found" by the search and skipped before download,
+/// mirroring scan's vendored/not-installed fold. Warnings land as strings
+/// (get's `warnings[]` is a string array — unlike scan's `{code, detail}`
+/// objects) with the stable code prefixed for greppability.
+fn fold_narrowing_into_result(
+    result: &mut serde_json::Value,
+    skip_records: &[serde_json::Value],
+    warnings: &[(String, String)],
+) {
+    let Some(obj) = result.as_object_mut() else {
+        return;
+    };
+    // Only success-shaped envelopes carry a patches[] array to fold into —
+    // error envelopes ({status, error}) keep their minimal shape.
+    if !skip_records.is_empty() && obj.get("patches").and_then(|p| p.as_array()).is_some() {
+        let n = skip_records.len() as u64;
+        for key in ["found", "skipped"] {
+            let bumped = obj.get(key).and_then(|v| v.as_u64()).unwrap_or(0) + n;
+            obj.insert(key.to_string(), serde_json::json!(bumped));
+        }
+        if let Some(patches) = obj.get_mut("patches").and_then(|p| p.as_array_mut()) {
+            patches.extend(skip_records.iter().cloned());
+        }
+    }
+    if !warnings.is_empty() {
+        let mut merged: Vec<String> = obj
+            .get("warnings")
+            .and_then(|w| w.as_array())
+            .map(|w| {
+                w.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        merged.extend(warnings.iter().map(|(code, detail)| format!("({code}) {detail}")));
+        obj.insert("warnings".to_string(), serde_json::json!(merged));
+    }
 }
 
 /// The API-client overrides for a download run: the caller's CLI flags with
@@ -1466,6 +1674,23 @@ pub async fn run(args: GetArgs) -> i32 {
         );
         return 1;
     }
+    // Mode resolution mirrors scan's enum (default = agent, today's
+    // behavior). Conflicts use get's established exit-1 report_error style
+    // (scan's self-enforced conflicts exit 2; get's have always been 1 —
+    // documented carve-out in CLI_CONTRACT.md).
+    let mode = args.mode.unwrap_or(super::scan::ScanMode::Agent);
+    if args.save_only && mode != super::scan::ScanMode::Agent {
+        report_error(
+            args.common.json,
+            format!(
+                "--save-only cannot be used with --mode {}: hosted mode never writes the \
+                 manifest, and vendored mode's vendor step IS the persistence (plain \
+                 `get --save-only` already records without applying)",
+                mode.cli_name()
+            ),
+        );
+        return 1;
+    }
     if args.one_off {
         // Honest failure instead of the historical silent no-op: the flag
         // parsed but was never implemented, so the patch was saved to the
@@ -1604,10 +1829,36 @@ pub async fn run(args: GetArgs) -> i32 {
                     telemetry_org.as_deref(),
                 )
                 .await;
-                // Save to manifest. Pass the fetched patch through so the
-                // save step reuses this (possibly proxy-fallback) result
-                // instead of re-fetching with a fresh client.
-                return save_and_apply_patch(&args, &patch).await;
+                // Mode dispatch. All three reuse THIS fetched patch (and,
+                // for hosted, this possibly-proxy-fallback client) rather
+                // than re-fetching with a fresh client, which would re-hit
+                // the 401/403 the fallback just recovered from. An explicit
+                // UUID is exempt from installed narrowing (exact intent).
+                return match mode {
+                    // Save to manifest and apply in place (today's flow).
+                    super::scan::ScanMode::Agent => save_and_apply_patch(&args, &patch).await,
+                    super::scan::ScanMode::Hosted => {
+                        let selected = vec![search_result_from_response(&patch)];
+                        run_get_hosted(
+                            &args,
+                            &api_client,
+                            effective_org_slug,
+                            &selected,
+                            &[],
+                            &[],
+                        )
+                        .await
+                    }
+                    super::scan::ScanMode::Vendored => {
+                        run_get_vendored_uuid(
+                            &args,
+                            &patch,
+                            telemetry_token.as_deref(),
+                            telemetry_org.as_deref(),
+                        )
+                        .await
+                    }
+                };
             }
             Ok(None) => {
                 track_patch_fetch_failed(
@@ -1805,6 +2056,69 @@ pub async fn run(args: GetArgs) -> i32 {
         return 0;
     }
 
+    // Coarse installed-VERSION narrowing of the fan-out (a GHSA/CVE search
+    // returns one record per patched version — only the versions present
+    // here should be acted on). Exempt: --all-releases (the documented
+    // escape), --save-only (record-only has no installation precondition —
+    // the fresh-clone `get --save-only` → `vendor` flow must keep working),
+    // exact-versioned PURL identifiers (explicit intent, like a UUID), and
+    // the package-name path (its search key IS an installed purl). Runs
+    // AFTER the paid gate above: a paid-only result is `paid_required`,
+    // never "not installed".
+    let narrowing_exempt = args.all_releases
+        || args.save_only
+        || id_type == IdentifierType::Package
+        || (id_type == IdentifierType::Purl && purl_has_version(&args.identifier));
+    let (accessible, narrow_skips, narrow_warnings) = if narrowing_exempt {
+        (accessible, Vec::new(), Vec::new())
+    } else {
+        let narrowing = filter_to_installed_purls(&accessible, &args.common, mode).await;
+        (narrowing.kept, narrowing.skip_records, narrowing.warnings)
+    };
+    // Layout refusals print even when informational output is quieted only
+    // by --json (stderr; the envelope carries them too) — but --silent
+    // mutes them like scan does.
+    if !args.common.silent {
+        for (code, detail) in &narrow_warnings {
+            eprintln!("Warning ({code}): {detail}");
+        }
+    }
+    if !quiet {
+        for rec in &narrow_skips {
+            let reason = match rec["errorCode"].as_str() {
+                Some("package_not_installed") | None => "version not installed",
+                Some(code) => code,
+            };
+            eprintln!(
+                "  [skip] {} ({reason})",
+                rec["purl"].as_str().unwrap_or_default()
+            );
+        }
+    }
+    if accessible.is_empty() {
+        // Every accessible patch targets a version this system doesn't
+        // have. Additive status (never `no_match`, which is pinned to the
+        // fuzzy package-name path): exit 0, the skips carry the detail.
+        if args.common.json {
+            let mut result = serde_json::json!({
+                "status": "not_installed",
+                "found": narrow_skips.len(),
+                "downloaded": 0,
+                "applied": 0,
+                "patches": narrow_skips,
+            });
+            fold_narrowing_into_result(&mut result, &[], &narrow_warnings);
+            print_json(&result);
+        } else if !args.common.silent {
+            println!(
+                "Patches exist for {} package version(s), but none of those versions are \
+                 installed here. Use --all-releases to fetch them anyway.",
+                narrow_skips.len()
+            );
+        }
+        return 0;
+    }
+
     // Smart patch selection: pick one patch per PURL
     let selected = match select_patches(
         &accessible,
@@ -1822,16 +2136,54 @@ pub async fn run(args: GetArgs) -> i32 {
         return 0;
     }
 
-    // Confirm before downloading (default YES)
-    let prompt = format!("Download {} patch(es)?", selected.len());
-    if !confirm(&prompt, true, args.common.yes, args.common.json) {
+    // Confirm before acting (default YES), with mode-appropriate wording.
+    // Hosted/vendored dry-runs skip the prompt — nothing mutates (scan's
+    // dry-run posture); agent mode keeps today's behavior.
+    let prompt = match mode {
+        super::scan::ScanMode::Agent => format!("Download {} patch(es)?", selected.len()),
+        super::scan::ScanMode::Vendored => {
+            format!("Download and vendor {} patch(es)?", selected.len())
+        }
+        super::scan::ScanMode::Hosted => format!(
+            "Redirect {} package(s) to the hosted patch server?",
+            selected.len()
+        ),
+    };
+    let skip_confirm = mode != super::scan::ScanMode::Agent && args.common.dry_run;
+    if !skip_confirm && !confirm(&prompt, true, args.common.yes, args.common.json) {
         if !quiet {
             println!("Download cancelled.");
         }
         return 0;
     }
 
-    // Download and apply
+    match mode {
+        super::scan::ScanMode::Hosted => {
+            return run_get_hosted(
+                &args,
+                &api_client,
+                effective_org_slug,
+                &selected,
+                &narrow_skips,
+                &narrow_warnings,
+            )
+            .await;
+        }
+        super::scan::ScanMode::Vendored => {
+            return run_get_vendored_search(
+                &args,
+                &selected,
+                &narrow_skips,
+                &narrow_warnings,
+                telemetry_token.as_deref(),
+                telemetry_org.as_deref(),
+            )
+            .await;
+        }
+        super::scan::ScanMode::Agent => {}
+    }
+
+    // Download and apply (agent mode)
     let params = DownloadParams {
         cwd: args.common.cwd.clone(),
         manifest_path: args.common.resolved_manifest_path(),
@@ -1849,7 +2201,8 @@ pub async fn run(args: GetArgs) -> i32 {
         persist_blobs: true,
     };
 
-    let (code, result_json) = download_and_apply_patches(&selected, &params).await;
+    let (code, mut result_json) = download_and_apply_patches(&selected, &params).await;
+    fold_narrowing_into_result(&mut result_json, &narrow_skips, &narrow_warnings);
 
     if args.common.json {
         println!(
@@ -1918,22 +2271,45 @@ fn display_search_results(patches: &[PatchSearchResult], can_access_paid: bool) 
 /// back to the public proxy after a 401/403, and a fresh client built
 /// here would hit the same auth failure again, breaking the fallback
 /// end to end.
-async fn save_and_apply_patch(args: &GetArgs, patch: &PatchResponse) -> i32 {
-    // Same "errors only" gate as `run` — informational prints respect
-    // `--silent`; errors and the JSON envelope do not.
-    let quiet = args.common.json || args.common.silent;
+/// The manifest-record half of the single-uuid save — blobs dir + blob
+/// writes (when `persist_blobs`), fail-closed manifest read, the
+/// no-applicable-files guardrail, action classification, and the manifest
+/// write — WITHOUT the nested apply, drift warning, or terminal JSON
+/// envelope. Shared by the agent-mode [`save_and_apply_patch`] terminal
+/// (`persist_blobs: true`, `insert_when_skipped: true` — today's exact
+/// behavior, a same-uuid re-get still rewrites the record bytes) and the
+/// `--mode vendored` uuid path (`false`/`false`: the vendor step stages
+/// patch content in memory so nothing lands in `.socket/blobs`, and an
+/// idempotent re-get leaves the manifest bytes untouched, matching the
+/// multi-patch download loop's Skipped `continue`).
+///
+/// Errors are reported here exactly as before the extraction and surface
+/// as `Err(exit_code)`.
+async fn save_patch_record(
+    args: &GetArgs,
+    patch: &PatchResponse,
+    persist_blobs: bool,
+    insert_when_skipped: bool,
+) -> Result<PatchAction, i32> {
     let manifest_path = args.common.resolved_manifest_path();
-    let blobs_dir = manifest_path
-        .parent()
-        .unwrap_or(Path::new("."))
-        .join("blobs");
+    let socket_dir = manifest_path.parent().unwrap_or(Path::new(".")).to_path_buf();
 
-    if let Err(e) = tokio::fs::create_dir_all(&blobs_dir).await {
+    if persist_blobs {
+        if let Err(e) = tokio::fs::create_dir_all(socket_dir.join("blobs")).await {
+            report_error(
+                args.common.json,
+                format!("Failed to create blobs directory: {e}"),
+            );
+            return Err(1);
+        }
+    } else if let Err(e) = tokio::fs::create_dir_all(&socket_dir).await {
+        // No blobs dir in vendored mode, but the manifest write below (and
+        // the vendor step's apply lock) still need `.socket/` itself.
         report_error(
             args.common.json,
-            format!("Failed to create blobs directory: {e}"),
+            format!("Failed to create .socket directory: {e}"),
         );
-        return 1;
+        return Err(1);
     }
 
     let mut manifest = match read_manifest(&manifest_path).await {
@@ -1944,7 +2320,7 @@ async fn save_and_apply_patch(args: &GetArgs, patch: &PatchResponse) -> i32 {
         // patch, destroying every tracked record.
         Err(e) => {
             report_error(args.common.json, format!("Failed to read manifest: {e}"));
-            return 1;
+            return Err(1);
         }
     };
 
@@ -1965,12 +2341,13 @@ async fn save_and_apply_patch(args: &GetArgs, patch: &PatchResponse) -> i32 {
                 patch.purl
             ),
         );
-        return 1;
+        return Err(1);
     }
 
-    if write_all_patch_blobs(&blobs_dir, patch, args.common.json)
-        .await
-        .is_err()
+    if persist_blobs
+        && write_all_patch_blobs(&socket_dir.join("blobs"), patch, args.common.json)
+            .await
+            .is_err()
     {
         if args.common.json {
             print_json(&serde_json::json!({
@@ -1992,7 +2369,7 @@ async fn save_and_apply_patch(args: &GetArgs, patch: &PatchResponse) -> i32 {
                 patch.purl
             );
         }
-        return 1;
+        return Err(1);
     }
 
     // Classify against the manifest state BEFORE the insert, with the same
@@ -2000,21 +2377,36 @@ async fn save_and_apply_patch(args: &GetArgs, patch: &PatchResponse) -> i32 {
     // different uuid already recorded at this purl is `updated` (+`oldUuid`),
     // not `added` — consumers diff manifest replacements on that action.
     let action = decide_patch_action(&manifest, &patch.purl, &patch.uuid);
+
+    if insert_when_skipped || action != PatchAction::Skipped {
+        manifest
+            .patches
+            .insert(patch.purl.clone(), build_patch_record(patch, files));
+
+        if let Err(e) = write_manifest(&manifest_path, &manifest).await {
+            report_error(args.common.json, format!("Error writing manifest: {e}"));
+            return Err(1);
+        }
+    }
+    Ok(action)
+}
+
+async fn save_and_apply_patch(args: &GetArgs, patch: &PatchResponse) -> i32 {
+    // Same "errors only" gate as `run` — informational prints respect
+    // `--silent`; errors and the JSON envelope do not.
+    let quiet = args.common.json || args.common.silent;
+    let manifest_path = args.common.resolved_manifest_path();
+
+    let action = match save_patch_record(args, patch, true, true).await {
+        Ok(action) => action,
+        Err(code) => return code,
+    };
     let changed = action != PatchAction::Skipped;
     let action_label = match &action {
         PatchAction::Added => "added",
         PatchAction::Updated { .. } => "updated",
         PatchAction::Skipped => "skipped",
     };
-
-    manifest
-        .patches
-        .insert(patch.purl.clone(), build_patch_record(patch, files));
-
-    if let Err(e) = write_manifest(&manifest_path, &manifest).await {
-        report_error(args.common.json, format!("Error writing manifest: {e}"));
-        return 1;
-    }
 
     // Vendored-uuid drift (mirrors `download_and_apply_patches`): the user
     // explicitly fetched this uuid; if the vendor ledger still wires a
@@ -2107,6 +2499,366 @@ async fn save_and_apply_patch(args: &GetArgs, patch: &PatchResponse) -> i32 {
     }
 
     exit_code
+}
+
+/// Bridge a fetched patch view to the search shape the mode flows consume —
+/// the uuid path fetches the view directly and never runs a search.
+fn search_result_from_response(patch: &PatchResponse) -> PatchSearchResult {
+    PatchSearchResult {
+        uuid: patch.uuid.clone(),
+        purl: patch.purl.clone(),
+        published_at: patch.published_at.clone(),
+        description: patch.description.clone(),
+        license: patch.license.clone(),
+        tier: patch.tier.clone(),
+        vulnerabilities: patch.vulnerabilities.clone(),
+    }
+}
+
+/// Transient-frame boxed constructor for the vendored-mode download phase —
+/// `download_and_apply_patches`' future embeds the in-process apply engine,
+/// and `run_get_vendored_search`'s poll frame must not carry it inline
+/// (Windows 1 MiB main-thread stack; scan's vendor flow boxes the same call).
+fn boxed_download_and_apply<'a>(
+    selected: &'a [PatchSearchResult],
+    params: &'a DownloadParams,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = (i32, serde_json::Value)> + 'a>> {
+    Box::pin(download_and_apply_patches(selected, params))
+}
+
+/// Print the whole-manifest blast-radius note for `--mode vendored`: the
+/// vendor step is scan's — it reconciles and (re)vendors EVERY manifest
+/// record, not just the one(s) this get selected.
+async fn note_vendored_whole_manifest_scope(
+    manifest_path: &Path,
+    selected_purls: &[&str],
+    quiet: bool,
+) {
+    if quiet {
+        return;
+    }
+    let Ok(Some(manifest)) = read_manifest(manifest_path).await else {
+        return;
+    };
+    let canon = |p: &str| normalize_purl(strip_purl_qualifiers(p)).into_owned();
+    let selected_canon: std::collections::HashSet<String> =
+        selected_purls.iter().map(|p| canon(p)).collect();
+    let others = manifest
+        .patches
+        .keys()
+        .filter(|k| !selected_canon.contains(&canon(k)))
+        .count();
+    if others > 0 {
+        eprintln!(
+            "  [note] --mode vendored runs the vendor engine over the whole manifest: \
+             {others} existing record(s) will also be verified/re-vendored, and records \
+             whose packages left the manifest may have their vendored state reverted \
+             (same behavior as `scan --mode vendored`)."
+        );
+    }
+}
+
+/// `get … --mode hosted`: hand the selected (purl, uuid) pairs to scan's
+/// hosted engine ([`super::scan::boxed_run_redirect_selected`]) — lockfile
+/// rewrite + redirect ledger, no manifest, no blobs — so the on-disk result
+/// matches `scan --mode hosted` selecting the same patches. The engine owns
+/// all output (and honors `--dry-run` internally); in JSON mode it nests its
+/// `redirect` block into the get base envelope passed as `scan_result`.
+async fn run_get_hosted(
+    args: &GetArgs,
+    api_client: &socket_patch_core::api::client::ApiClient,
+    effective_org_slug: Option<&str>,
+    selected: &[PatchSearchResult],
+    narrow_skips: &[serde_json::Value],
+    narrow_warnings: &[(String, String)],
+) -> i32 {
+    let pairs: Vec<(String, String)> = selected
+        .iter()
+        .map(|s| (s.purl.clone(), s.uuid.clone()))
+        .collect();
+    // `scan_result` iff --json: the engine's human/JSON split keys on
+    // common.json, and a --json caller passing None would get a minimal
+    // envelope that drops get's keys (see run_redirect_selected's doc).
+    let scan_result = args.common.json.then(|| {
+        let mut result = serde_json::json!({
+            "status": "success",
+            "found": pairs.len() + narrow_skips.len(),
+            "patches": narrow_skips,
+        });
+        fold_narrowing_into_result(&mut result, &[], narrow_warnings);
+        result
+    });
+    // Embedded VEX stays a scan/vendor feature (get has no --vex): a
+    // default-off VexEmbedArgs — deliberately NOT env-bound here, so an
+    // ambient SOCKET_VEX only affects commands that declare the flag.
+    let vex = crate::commands::vex::VexEmbedArgs::default();
+    super::scan::boxed_run_redirect_selected(
+        &args.common,
+        &vex,
+        /*prune_requested=*/ false,
+        api_client,
+        effective_org_slug,
+        &pairs,
+        scan_result,
+    )
+    .await
+}
+
+/// `get … --mode vendored` (search path): scan's vendored posture end to
+/// end — download phase writing ONLY the manifest (blobs in memory), then
+/// scan's whole-manifest vendor step, telemetry included — so the result
+/// matches `scan --mode vendored` selecting the same patches.
+async fn run_get_vendored_search(
+    args: &GetArgs,
+    selected: &[PatchSearchResult],
+    narrow_skips: &[serde_json::Value],
+    narrow_warnings: &[(String, String)],
+    telemetry_token: Option<&str>,
+    telemetry_org: Option<&str>,
+) -> i32 {
+    let quiet = args.common.json || args.common.silent;
+    let manifest_path = args.common.resolved_manifest_path();
+    let socket_dir = manifest_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .to_path_buf();
+
+    // Dry run: ledger-classification preview only (scan's posture) — no
+    // download, no vendor step, no writes.
+    if args.common.dry_run {
+        let preview = super::scan::preview_vendor_json(&args.common.cwd, selected).await;
+        if args.common.json {
+            let mut result = serde_json::json!({
+                "status": "success",
+                "found": selected.len() + narrow_skips.len(),
+                "patches": narrow_skips,
+            });
+            fold_narrowing_into_result(&mut result, &[], narrow_warnings);
+            result["vendor"] = preview;
+            print_json(&result);
+        } else if !args.common.silent {
+            println!(
+                "[dry-run] Would download and vendor {} patch(es).",
+                selected.len()
+            );
+        }
+        return 0;
+    }
+
+    let selected_purls: Vec<&str> = selected.iter().map(|s| s.purl.as_str()).collect();
+    note_vendored_whole_manifest_scope(&manifest_path, &selected_purls, quiet).await;
+
+    // Download phase — scan's vendored posture: manifest-only writes, blobs
+    // held in memory, the nested apply never runs (save_only).
+    let params = DownloadParams {
+        cwd: args.common.cwd.clone(),
+        manifest_path: manifest_path.clone(),
+        org: args.common.org.clone(),
+        save_only: true,
+        global: args.common.global,
+        global_prefix: args.common.global_prefix.clone(),
+        json: args.common.json,
+        silent: args.common.silent,
+        download_mode: args.common.download_mode.clone(),
+        api_overrides: args.common.api_client_overrides(),
+        all_releases: args.all_releases,
+        strict: args.common.strict,
+        ecosystems: args.common.ecosystems.clone(),
+        persist_blobs: false,
+    };
+    let (dl_code, mut result) = boxed_download_and_apply(selected, &params).await;
+    let mut has_errors = dl_code != 0;
+    fold_narrowing_into_result(&mut result, narrow_skips, narrow_warnings);
+    if let Some(obj) = result.as_object_mut() {
+        // save_only: the nested apply structurally never ran, so `applied`
+        // would misleadingly report 0 — drop it (scan's vendored download
+        // sub-object gets the same surgery).
+        obj.remove("applied");
+    }
+
+    // The vendor step (scan's, verbatim): apply lock, whole-manifest
+    // reconcile + staging + engine. A download failure does not skip it —
+    // previously-recorded patches still (re)vendor, exactly like scan.
+    match super::scan::boxed_scan_vendor_step(&args.common, &manifest_path, &socket_dir, None)
+        .await
+    {
+        Ok((vendor_errors, venv)) => {
+            has_errors |= vendor_errors;
+            crate::commands::vendor::track_outcomes_for_vendor(
+                vendor_errors,
+                &venv,
+                args.common.dry_run,
+                telemetry_token,
+                telemetry_org,
+            )
+            .await;
+            if args.common.json {
+                result["status"] = serde_json::json!(if has_errors {
+                    "partial_failure"
+                } else {
+                    "success"
+                });
+                result["vendor"] =
+                    serde_json::to_value(&venv).unwrap_or_else(|_| serde_json::json!({}));
+                print_json(&result);
+            }
+            i32::from(has_errors)
+        }
+        Err((code, message, venv)) => {
+            socket_patch_core::telemetry::track_patch_vendor_failed(
+                &message,
+                args.common.dry_run,
+                telemetry_token,
+                telemetry_org,
+            )
+            .await;
+            if args.common.json {
+                // A pre-failure reconcile already mutated the vendor ledger
+                // on disk; its envelope (events included) must reach the
+                // JSON consumer even though the run aborts here.
+                if let Some(venv) = venv {
+                    result["vendor"] =
+                        serde_json::to_value(&*venv).unwrap_or_else(|_| serde_json::json!({}));
+                }
+                result["status"] = serde_json::json!("error");
+                result["error"] = serde_json::json!({ "code": code, "message": message });
+                print_json(&result);
+            } else {
+                eprintln!("Error ({code}): {message}");
+            }
+            1
+        }
+    }
+}
+
+/// `get <uuid> --mode vendored`: record the ALREADY-FETCHED patch in the
+/// manifest (no blobs, no nested apply — the vendor step stages content in
+/// memory), then run scan's whole-manifest vendor step. Reuses the fetched
+/// `PatchResponse` so the uuid path's proxy-fallback survives the record
+/// save; the vendor step builds its own client from the flags, exactly as
+/// scan's does.
+async fn run_get_vendored_uuid(
+    args: &GetArgs,
+    patch: &PatchResponse,
+    telemetry_token: Option<&str>,
+    telemetry_org: Option<&str>,
+) -> i32 {
+    let quiet = args.common.json || args.common.silent;
+    let manifest_path = args.common.resolved_manifest_path();
+    let socket_dir = manifest_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .to_path_buf();
+
+    if args.common.dry_run {
+        let selected = vec![search_result_from_response(patch)];
+        let preview = super::scan::preview_vendor_json(&args.common.cwd, &selected).await;
+        if args.common.json {
+            let mut result = serde_json::json!({
+                "status": "success",
+                "found": 1,
+                "patches": [],
+            });
+            result["vendor"] = preview;
+            print_json(&result);
+        } else if !args.common.silent {
+            println!("[dry-run] Would download and vendor 1 patch.");
+        }
+        return 0;
+    }
+
+    note_vendored_whole_manifest_scope(&manifest_path, &[patch.purl.as_str()], quiet).await;
+
+    let action = match save_patch_record(args, patch, false, false).await {
+        Ok(action) => action,
+        Err(code) => return code,
+    };
+    let changed = action != PatchAction::Skipped;
+    let action_label = match &action {
+        PatchAction::Added => "added",
+        PatchAction::Updated { .. } => "updated",
+        PatchAction::Skipped => "skipped",
+    };
+    if !quiet {
+        println!("\nPatch record saved to {}", manifest_path.display());
+        match &action {
+            PatchAction::Added => println!("  Added: 1"),
+            PatchAction::Updated { old_uuid } => {
+                println!("  Updated: 1 (replacing {})", short_uuid(old_uuid));
+            }
+            PatchAction::Skipped => println!("  Skipped: 1 (already exists)"),
+        }
+    }
+
+    let mut result = if args.common.json {
+        let mut patch_record = serde_json::json!({
+            "purl": patch.purl,
+            "uuid": patch.uuid,
+            "action": action_label,
+        });
+        if let PatchAction::Updated { old_uuid } = &action {
+            patch_record["oldUuid"] = serde_json::json!(old_uuid);
+        }
+        if changed {
+            merge_metadata(&mut patch_record, patch_event_metadata(patch));
+        }
+        serde_json::json!({
+            "status": "success",
+            "found": 1,
+            "downloaded": if changed { 1 } else { 0 },
+            "skipped": if changed { 0 } else { 1 },
+            "patches": [patch_record],
+        })
+    } else {
+        serde_json::Value::Null
+    };
+
+    match super::scan::boxed_scan_vendor_step(&args.common, &manifest_path, &socket_dir, None)
+        .await
+    {
+        Ok((vendor_errors, venv)) => {
+            crate::commands::vendor::track_outcomes_for_vendor(
+                vendor_errors,
+                &venv,
+                args.common.dry_run,
+                telemetry_token,
+                telemetry_org,
+            )
+            .await;
+            if args.common.json {
+                result["status"] = serde_json::json!(if vendor_errors {
+                    "partial_failure"
+                } else {
+                    "success"
+                });
+                result["vendor"] =
+                    serde_json::to_value(&venv).unwrap_or_else(|_| serde_json::json!({}));
+                print_json(&result);
+            }
+            i32::from(vendor_errors)
+        }
+        Err((code, message, venv)) => {
+            socket_patch_core::telemetry::track_patch_vendor_failed(
+                &message,
+                args.common.dry_run,
+                telemetry_token,
+                telemetry_org,
+            )
+            .await;
+            if args.common.json {
+                if let Some(venv) = venv {
+                    result["vendor"] =
+                        serde_json::to_value(&*venv).unwrap_or_else(|_| serde_json::json!({}));
+                }
+                result["status"] = serde_json::json!("error");
+                result["error"] = serde_json::json!({ "code": code, "message": message });
+                print_json(&result);
+            } else {
+                eprintln!("Error ({code}): {message}");
+            }
+            1
+        }
+    }
 }
 
 pub(crate) fn base64_decode(input: &str) -> Result<Vec<u8>, String> {

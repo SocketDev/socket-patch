@@ -41,8 +41,10 @@ pub(super) struct LockfileSupplement {
 /// (`yarn_pnp_unsupported`) so consumers key on ONE name across commands;
 /// the pnpm twin gets the parallel spelling. Details are scan-phrased (what
 /// was NOT scanned + remedy) rather than the probe's vendor-phrased text.
-pub(super) fn unsupported_layout_warnings(sup: &LockfileSupplement) -> Vec<(String, String)> {
-    sup.unsupported
+pub(crate) fn unsupported_layout_warnings(
+    unsupported: &[socket_patch_core::vendor::lock_inventory::UnsupportedNpmLayout],
+) -> Vec<(String, String)> {
+    unsupported
         .iter()
         .map(|diag| match diag.code {
             "vendor_yarn_berry_unsupported" => (
