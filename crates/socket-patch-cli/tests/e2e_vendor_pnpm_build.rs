@@ -27,6 +27,14 @@
 //! when `corepack pnpm@10` is unavailable or the fixture install cannot reach
 //! the registry; every assertion after that is HARD.
 //!
+//! `pnpm_get_uuid_vendored_fresh_checkout_frozen_offline` is the get-driven
+//! twin (v3.6): the SAME capstone with the record arriving over a mocked API
+//! `view/{uuid}` (real hashes + inline blobContent) via `get <uuid> --mode
+//! vendored --vendor-source build` instead of a hand-staged `.socket/` +
+//! `vendor` — manifest + vendor artifacts, NO blobs — ending at the
+//! fresh-checkout install proof (idempotency/revert stay the `vendor` front
+//! door's own contract).
+//!
 //! Below the capstone: the LEGACY grammars — pnpm 7 (`lockfileVersion: 5.4`)
 //! and pnpm 8 (`'6.0'`), wired by the pnpm-legacy backend. HERMETIC legs
 //! (no corepack, no network, always run) prove the splice reproduces the
@@ -42,10 +50,13 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 use sha2::{Digest, Sha256};
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[path = "common/cache_env.rs"]
 mod cache_env;
 
+const ORG: &str = "test-org";
 const UUID: &str = "1a2b3c4d-5e6f-4a1b-8c2d-0123456789ab";
 const MARKER: &str = "/* SOCKET-PATCHED */\n";
 const DEP: &str = "left-pad";
@@ -166,6 +177,56 @@ fn stage_patch(proj: &Path, purl: &str, file_key: &str, before: &[u8], after: &[
     std::fs::write(socket.join("blobs").join(git_sha256(after)), after).unwrap();
 }
 
+fn b64(bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+/// `view/{uuid}` with the REAL installed-bytes hashes and inline base64
+/// `blobContent` (the after bytes), so `get --mode vendored --vendor-source
+/// build` stages the patched content entirely from the mock — no blob
+/// endpoint, no vendoring service. Metadata mirrors `stage_patch` (same
+/// GHSA) so the vex leg attests identically under both drivers.
+async fn mock_view(server: &MockServer, purl: &str, before: &[u8], after: &[u8]) {
+    Mock::given(method("GET"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/view/{UUID}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "uuid": UUID,
+            "purl": purl,
+            "publishedAt": "2026-01-01T00:00:00Z",
+            "files": {
+                "package/index.js": {
+                    "beforeHash": git_sha256(before),
+                    "afterHash": git_sha256(after),
+                    "blobContent": b64(after),
+                }
+            },
+            "vulnerabilities": { "GHSA-vend-pnpm-real": {
+                "cves": ["CVE-2024-88888"],
+                "summary": "capstone vex vuln",
+                "severity": "high",
+                "description": "d",
+            }},
+            "description": "capstone marker patch",
+            "license": "MIT",
+            "tier": "free",
+        })))
+        .mount(server)
+        .await;
+}
+
+/// Which CLI front door drives the vendored engine. Both consume the SAME
+/// engine by construction (v3.6): `vendor` reads a hand-staged `.socket/`
+/// manifest + blob offline, while `get <uuid> --mode vendored` fetches the
+/// record from the (mocked) API — the uuid identifier path is exempt from
+/// installed narrowing, so only the view mock is needed — and persists the
+/// manifest + vendor artifacts with NO blobs.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum VendorDriver {
+    VendorCli,
+    GetUuid,
+}
+
 fn parse_envelope(stdout: &str) -> serde_json::Value {
     serde_json::from_str(stdout)
         .unwrap_or_else(|e| panic!("vendor --json output is not JSON: {e}\nstdout:\n{stdout}"))
@@ -186,8 +247,8 @@ fn copy_dir_recursive(src: &Path, dst: &Path) {
 
 // ── the capstone ──────────────────────────────────────────────────────
 
-#[test]
-fn pnpm_vendor_fresh_checkout_frozen_offline_install_and_revert() {
+#[tokio::test(flavor = "multi_thread")]
+async fn pnpm_vendor_fresh_checkout_frozen_offline_install_and_revert() {
     if !has_corepack_pm(PNPM_PRIMARY) {
         println!(
             "SKIP e2e_vendor_pnpm_build: `corepack {PNPM_PRIMARY}` unavailable \
@@ -195,14 +256,14 @@ fn pnpm_vendor_fresh_checkout_frozen_offline_install_and_revert() {
         );
         return;
     }
-    run_pnpm_capstone(PNPM_PRIMARY);
+    run_pnpm_capstone(PNPM_PRIMARY, VendorDriver::VendorCli).await;
 
     // Cheap bonus coverage: pnpm 9 emits a byte-identical 9.0 lock (spike P1),
     // so run the whole lifecycle again on it when it is fetchable. Never a
     // skip-failure — @10 already carried the hard assertions.
     if has_corepack_pm(PNPM_SECONDARY) {
         eprintln!("--- also exercising {PNPM_SECONDARY} ---");
-        run_pnpm_capstone(PNPM_SECONDARY);
+        run_pnpm_capstone(PNPM_SECONDARY, VendorDriver::VendorCli).await;
     } else {
         eprintln!("note: {PNPM_SECONDARY} not fetchable; ran {PNPM_PRIMARY} only");
     }
@@ -218,13 +279,32 @@ fn pnpm_vendor_fresh_checkout_frozen_offline_install_and_revert() {
     // tarball without it.
     if has_corepack_pm(PNPM_TERTIARY) {
         eprintln!("--- also exercising {PNPM_TERTIARY} ---");
-        run_pnpm_capstone(PNPM_TERTIARY);
+        run_pnpm_capstone(PNPM_TERTIARY, VendorDriver::VendorCli).await;
     } else {
         eprintln!("note: {PNPM_TERTIARY} not fetchable; skipped");
     }
 }
 
-fn run_pnpm_capstone(pm: &str) {
+/// get-driven twin (v3.6): `get <uuid> --mode vendored` consumes the SAME
+/// vendor engine as `vendor` (scan's save-only download + vendor step), so
+/// the committable set it lands must survive the identical fresh-checkout
+/// `--frozen-lockfile --offline` proof. The record arrives over a mocked API
+/// `view/{uuid}` instead of a hand-staged `.socket/`, and NO blobs may be
+/// persisted. Ends at the install proof — the idempotency/revert half stays
+/// the `vendor` front door's contract (the capstone above).
+#[tokio::test(flavor = "multi_thread")]
+async fn pnpm_get_uuid_vendored_fresh_checkout_frozen_offline() {
+    if !has_corepack_pm(PNPM_PRIMARY) {
+        println!(
+            "SKIP e2e_vendor_pnpm_build (get twin): `corepack {PNPM_PRIMARY}` unavailable \
+             (corepack not installed or pnpm not fetchable)"
+        );
+        return;
+    }
+    run_pnpm_capstone(PNPM_PRIMARY, VendorDriver::GetUuid).await;
+}
+
+async fn run_pnpm_capstone(pm: &str, driver: VendorDriver) {
     let tmp = tempfile::tempdir().unwrap();
     let proj = tmp.path().join("proj");
     std::fs::create_dir_all(&proj).unwrap();
@@ -269,8 +349,6 @@ fn run_pnpm_capstone(pm: &str) {
     let patched: Vec<u8> = [MARKER.as_bytes(), orig.as_slice()].concat();
     let purl = format!("pkg:npm/{DEP}@{DEP_VERSION}");
 
-    stage_patch(&proj, &purl, "package/index.js", &orig, &patched);
-
     let lock_path = proj.join("pnpm-lock.yaml");
     let pkg_path = proj.join("package.json");
     let lock_before = std::fs::read(&lock_path).expect("pnpm-lock.yaml after pnpm install");
@@ -281,35 +359,108 @@ fn run_pnpm_capstone(pm: &str) {
         "fixture must be a lockfileVersion 9.0 lock:\n{lock_before_str}"
     );
 
-    // 3. Vendor (offline).
-    let (code, stdout, stderr) = run_socket(
-        &proj,
-        &[
-            "vendor",
-            "--json",
-            "--offline",
-            "--cwd",
-            proj.to_str().unwrap(),
-        ],
-    );
+    // 3. Vendor — via the driver's front door (same engine by construction).
+    let (code, stdout, stderr, server) = match driver {
+        VendorDriver::VendorCli => {
+            stage_patch(&proj, &purl, "package/index.js", &orig, &patched);
+            let (code, stdout, stderr) = run_socket(
+                &proj,
+                &[
+                    "vendor",
+                    "--json",
+                    "--offline",
+                    "--cwd",
+                    proj.to_str().unwrap(),
+                ],
+            );
+            (code, stdout, stderr, None)
+        }
+        VendorDriver::GetUuid => {
+            let server = MockServer::start().await;
+            mock_view(&server, &purl, &orig, &patched).await;
+            let uri = server.uri();
+            let (code, stdout, stderr) = run_socket(
+                &proj,
+                &[
+                    "get",
+                    UUID,
+                    "--mode",
+                    "vendored",
+                    "--json",
+                    "--yes",
+                    "--api-url",
+                    &uri,
+                    "--api-token",
+                    "fake",
+                    "--org",
+                    ORG,
+                    "--vendor-source",
+                    "build",
+                    "--cwd",
+                    proj.to_str().unwrap(),
+                ],
+            );
+            (code, stdout, stderr, Some(server))
+        }
+    };
     assert_eq!(
         code, 0,
-        "vendor failed ({pm}).\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        "{driver:?} vendoring failed ({pm}).\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     let env = parse_envelope(&stdout);
     assert_eq!(env["status"], "success", "envelope: {env}");
-    assert_eq!(env["summary"]["applied"], 1, "one package vendored: {env}");
-    assert_eq!(env["summary"]["failed"], 0, "no failures: {env}");
-    let applied = env["events"]
+    // The vendor envelope is get's nested `vendor` sub-object; `vendor --json`
+    // prints it at the top level.
+    let venv = match driver {
+        VendorDriver::VendorCli => env.clone(),
+        VendorDriver::GetUuid => {
+            assert_eq!(env["downloaded"], 1, "one record downloaded: {env}");
+            assert!(
+                !env.as_object().unwrap().contains_key("applied"),
+                "vendored get drops `applied` (the nested apply never runs): {env}"
+            );
+            env["vendor"].clone()
+        }
+    };
+    assert_eq!(
+        venv["summary"]["applied"], 1,
+        "one package vendored: {venv}"
+    );
+    assert_eq!(venv["summary"]["failed"], 0, "no failures: {venv}");
+    let applied = venv["events"]
         .as_array()
         .unwrap()
         .iter()
         .find(|e| e["action"] == "applied" && e["purl"] == purl.as_str())
-        .unwrap_or_else(|| panic!("expected an applied event for {purl}: {env}"));
+        .unwrap_or_else(|| panic!("expected an applied event for {purl}: {venv}"));
     assert!(
         applied.get("errorCode").is_none(),
         "clean apply event: {applied}"
     );
+
+    if let Some(server) = &server {
+        // Anti-vacuity: the record really came over the mocked API (the
+        // vendored flow may hit view more than once — staging re-reads it).
+        let view_hits = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|r| r.url.path().ends_with(&format!("/patches/view/{UUID}")))
+            .count();
+        assert!(
+            view_hits >= 1,
+            "get must fetch the patch record from the mocked view endpoint"
+        );
+        assert!(
+            proj.join(".socket/manifest.json").is_file(),
+            "get --mode vendored must write the manifest"
+        );
+        assert!(
+            !proj.join(".socket/blobs").exists(),
+            "get --mode vendored must NOT persist blobs (scan parity: content stays in memory)"
+        );
+    }
 
     let tgz_rel = format!(".socket/vendor/npm/{UUID}/{DEP}-{DEP_VERSION}.tgz");
     assert!(
@@ -418,7 +569,7 @@ fn run_pnpm_capstone(pm: &str) {
         ws_after.contains("packages:") && ws_after.contains("- '.'"),
         "created pnpm-workspace.yaml must carry a root-only packages list; got:\n{ws_after}"
     );
-    eprintln!("VENDOR OK ({pm})");
+    eprintln!("VENDOR OK ({pm}, {driver:?})");
 
     // 4. FRESH-CHECKOUT PROOF: committable files only, EMPTY store,
     //    spike-proven `--frozen-lockfile --offline`.
@@ -459,7 +610,14 @@ fn run_pnpm_capstone(pm: &str) {
         fresh_installed, patched,
         "fresh install must be byte-identical to the patched content"
     );
-    eprintln!("FRESH INSTALL OK ({pm})");
+    eprintln!("FRESH INSTALL OK ({pm}, {driver:?})");
+
+    if driver == VendorDriver::GetUuid {
+        // The lifecycle's latter half (idempotent re-vendor + revert) is the
+        // `vendor` front door's own contract, pinned by the VendorCli legs;
+        // the get twin ends at the committability proof.
+        return;
+    }
 
     // 5. Idempotency: a re-run exits 0 and leaves ALL THREE files byte-stable.
     let lock_wired = std::fs::read(&lock_path).unwrap();

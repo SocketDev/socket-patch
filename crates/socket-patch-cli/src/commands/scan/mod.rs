@@ -43,10 +43,10 @@ use self::discovery::{
 // preview, and the PnP layout-refusal warning mapping. `pub(crate)`
 // re-exports because the submodules themselves stay private to scan.
 pub(crate) use self::discovery::unsupported_layout_warnings;
-pub(crate) use self::hosted::boxed_run_redirect_selected;
-pub(crate) use self::vendor_flow::{boxed_scan_vendor_step, preview_vendor_json};
 use self::gc::{gc_json, print_gc_vendored_line, run_apply_gc};
+pub(crate) use self::hosted::boxed_run_redirect_selected;
 use self::hosted::run_redirect;
+pub(crate) use self::vendor_flow::{boxed_scan_vendor_step, preview_vendor_json};
 use self::vendor_flow::{
     boxed_vendor_interactive_path, boxed_vendor_json_path, fold_vendored_skips_into_apply,
     partition_skipped_selected,

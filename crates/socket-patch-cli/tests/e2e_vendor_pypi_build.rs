@@ -18,6 +18,12 @@
 //! requirements.txt byte-identical to the pre-vendor snapshots and
 //! `.socket/vendor/` gone.
 //!
+//! The uv flavor also has a `get <uuid> --mode vendored` twin (v3.6): the
+//! SAME vendor engine driven through get's uuid path against a wiremock
+//! `view/{uuid}` (record + inline blob content served by the API instead of
+//! a locally staged manifest/blob), ending in the same fresh-checkout
+//! frozen-offline proof.
+//!
 //! Network is used for fixture setup only (installing six==1.16.0); the
 //! vendor runs are `--offline` against a locally staged blob, and the
 //! fresh-checkout installs are `--no-index` / `--offline` with empty caches.
@@ -30,12 +36,16 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use sha2::{Digest, Sha256};
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[path = "common/cache_env.rs"]
 mod cache_env;
 
 const UUID: &str = "4d5e6f70-8192-4a1b-8c2d-0123456789ab";
 const PURL: &str = "pkg:pypi/six@1.16.0";
+/// Org slug the get twin passes on the argv (and the view mock's path).
+const ORG: &str = "test-org";
 /// Appended to the installed `six.py` by the synthetic patch.
 const PATCH_SUFFIX: &str = "\n# SOCKET-PATCHED\nSOCKET_PATCHED = 1\n";
 /// Oracle: prints `1` iff the patched module is the one imported.
@@ -227,6 +237,153 @@ fn assert_vendored_applied(env: &serde_json::Value) {
     );
 }
 
+/// Which CLI front door vendors the patch. Both land on the SAME vendor
+/// engine by construction (v3.6): `vendor` consumes the locally staged
+/// `.socket/` manifest + blob fully offline, while `get <uuid> --mode
+/// vendored` fetches the record from the mocked API (the uuid path is
+/// exempt from installed narrowing, so only the `view/{uuid}` route is
+/// needed), writes the manifest itself, and stages patch content in memory
+/// — `.socket/blobs` must stay absent. `--vendor-source build` keeps the
+/// get flow off the vendoring service (no grant/tarball mocks needed).
+enum VendorDriver<'a> {
+    VendorOffline,
+    GetUuidVendored { api_url: &'a str },
+}
+
+/// The vendoring invocation of the capstones, parameterized by `driver`.
+fn run_vendored(driver: &VendorDriver<'_>, proj: &Path) -> (i32, String, String) {
+    match driver {
+        VendorDriver::VendorOffline => run_socket(
+            proj,
+            &[
+                "vendor",
+                "--json",
+                "--offline",
+                "--cwd",
+                proj.to_str().unwrap(),
+            ],
+        ),
+        VendorDriver::GetUuidVendored { api_url } => run_socket(
+            proj,
+            &[
+                "get",
+                UUID,
+                "--mode",
+                "vendored",
+                "--json",
+                "--yes",
+                "--api-url",
+                api_url,
+                "--api-token",
+                "fake",
+                "--org",
+                ORG,
+                "--vendor-source",
+                "build",
+                "--cwd",
+                proj.to_str().unwrap(),
+            ],
+        ),
+    }
+}
+
+/// Mount `view/{UUID}` on the mock API: the patch record with REAL git-blob
+/// hashes over the ACTUAL installed bytes plus inline base64 `blobContent`,
+/// so `get --mode vendored` both saves the manifest record and stages the
+/// after-bytes in memory (nothing is staged locally). The purl is the
+/// suite's bare (unqualified) spelling and the file key is
+/// site-packages-relative — exactly what [`stage_patch`]'s manifest carries.
+async fn mount_view_mock(server: &MockServer, before: &[u8], after: &[u8]) {
+    use base64::Engine as _;
+    let blob_b64 = base64::engine::general_purpose::STANDARD.encode(after);
+    Mock::given(method("GET"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/view/{UUID}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "uuid": UUID,
+            "purl": PURL,
+            "publishedAt": "2026-01-01T00:00:00Z",
+            "files": { "six.py": {
+                "beforeHash": git_sha256(before),
+                "afterHash": git_sha256(after),
+                "blobContent": blob_b64,
+            }},
+            "vulnerabilities": { "GHSA-vend-pypi-real": {
+                "cves": ["CVE-2024-88888"],
+                "summary": "capstone vex vuln",
+                "severity": "high",
+                "description": "d",
+            }},
+            "description": "capstone marker patch",
+            "license": "MIT",
+            "tier": "free",
+        })))
+        .mount(server)
+        .await;
+}
+
+/// REAL uv fixture: write the six==1.16.0 pyproject, `uv lock`, `uv sync`
+/// (network allowed here only). Returns false after printing the suite's
+/// SKIP line — `tag` names the calling test — when PyPI is unreachable.
+fn setup_uv_six_project(uv: &Path, proj: &Path, cache_env: &[(&str, &str)], tag: &str) -> bool {
+    std::fs::write(
+        proj.join("pyproject.toml"),
+        "[project]\nname = \"vendor-capstone\"\nversion = \"0.1.0\"\nrequires-python = \">=3.9\"\ndependencies = [\"six==1.16.0\"]\n",
+    )
+    .unwrap();
+    let lock = tool(uv, proj, &["lock", "-q"], cache_env);
+    if !lock.status.success() {
+        println!(
+            "SKIP e2e_vendor_pypi_build({tag}): `uv lock` failed (PyPI unreachable?):\n{}",
+            String::from_utf8_lossy(&lock.stderr)
+        );
+        return false;
+    }
+    let sync = tool(uv, proj, &["sync", "-q"], cache_env);
+    if !sync.status.success() {
+        println!(
+            "SKIP e2e_vendor_pypi_build({tag}): `uv sync` failed (PyPI unreachable?):\n{}",
+            String::from_utf8_lossy(&sync.stderr)
+        );
+        return false;
+    }
+    true
+}
+
+/// FRESH-CHECKOUT PROOF: pyproject + uv.lock + `.socket/` only travel to a
+/// new dir; with an EMPTY UV_CACHE_DIR, `uv sync --frozen --offline` must
+/// install the PATCHED six and leave uv.lock byte-identical to `lock_wired`
+/// (spike claim 3).
+fn assert_fresh_checkout_frozen_offline(uv: &Path, tmp: &Path, proj: &Path, lock_wired: &[u8]) {
+    let fresh = tmp.join("fresh");
+    std::fs::create_dir_all(&fresh).unwrap();
+    std::fs::copy(proj.join("pyproject.toml"), fresh.join("pyproject.toml")).unwrap();
+    std::fs::copy(proj.join("uv.lock"), fresh.join("uv.lock")).unwrap();
+    copy_dir_recursive(&proj.join(".socket"), &fresh.join(".socket"));
+
+    let fresh_cache = tmp.join("fresh-uv-cache");
+    let fresh_env: Vec<(&str, &str)> = vec![("UV_CACHE_DIR", fresh_cache.to_str().unwrap())];
+    let frozen = tool(
+        uv,
+        &fresh,
+        &["sync", "--frozen", "--offline", "-q"],
+        &fresh_env,
+    );
+    assert_tool_ok(
+        &frozen,
+        "fresh-checkout `uv sync --frozen --offline` (empty cache)",
+    );
+    assert_eq!(
+        python_oracle(&fresh.join(".venv"), &fresh),
+        "1",
+        "fresh checkout must import the PATCHED six"
+    );
+    assert_eq!(
+        std::fs::read(fresh.join("uv.lock")).unwrap(),
+        lock_wired,
+        "the frozen offline sync must leave uv.lock byte-identical"
+    );
+}
+
 /// The single `.whl` inside the uuid dir (PEP 427 name derived from the
 /// installed dist's WHEEL tags — don't hardcode the tag compression).
 fn vendored_wheel(proj: &Path) -> PathBuf {
@@ -304,27 +461,8 @@ fn uv_vendor_fresh_checkout_frozen_offline_and_revert() {
     let cache = tmp.path().join("uv-cache");
     let cache_env: Vec<(&str, &str)> = vec![("UV_CACHE_DIR", cache.to_str().unwrap())];
 
-    std::fs::write(
-        proj.join("pyproject.toml"),
-        "[project]\nname = \"vendor-capstone\"\nversion = \"0.1.0\"\nrequires-python = \">=3.9\"\ndependencies = [\"six==1.16.0\"]\n",
-    )
-    .unwrap();
-
-    // REAL fixture: uv lock + uv sync (network allowed here).
-    let lock = tool(&uv, &proj, &["lock", "-q"], &cache_env);
-    if !lock.status.success() {
-        println!(
-            "SKIP e2e_vendor_pypi_build(uv): `uv lock` failed (PyPI unreachable?):\n{}",
-            String::from_utf8_lossy(&lock.stderr)
-        );
-        return;
-    }
-    let sync = tool(&uv, &proj, &["sync", "-q"], &cache_env);
-    if !sync.status.success() {
-        println!(
-            "SKIP e2e_vendor_pypi_build(uv): `uv sync` failed (PyPI unreachable?):\n{}",
-            String::from_utf8_lossy(&sync.stderr)
-        );
+    // REAL fixture: pyproject + uv lock + uv sync (network allowed here).
+    if !setup_uv_six_project(&uv, &proj, &cache_env, "uv") {
         return;
     }
 
@@ -336,16 +474,7 @@ fn uv_vendor_fresh_checkout_frozen_offline_and_revert() {
     let uvlock_before = std::fs::read(proj.join("uv.lock")).unwrap();
 
     // Vendor (offline; blob staged locally).
-    let (code, stdout, stderr) = run_socket(
-        &proj,
-        &[
-            "vendor",
-            "--json",
-            "--offline",
-            "--cwd",
-            proj.to_str().unwrap(),
-        ],
-    );
+    let (code, stdout, stderr) = run_vendored(&VendorDriver::VendorOffline, &proj);
     assert_eq!(
         code, 0,
         "vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
@@ -424,34 +553,7 @@ fn uv_vendor_fresh_checkout_frozen_offline_and_revert() {
 
     // FRESH-CHECKOUT PROOF: pyproject + uv.lock + .socket only, EMPTY cache,
     // `uv sync --frozen --offline` (spike claim 3).
-    let fresh = tmp.path().join("fresh");
-    std::fs::create_dir_all(&fresh).unwrap();
-    std::fs::copy(proj.join("pyproject.toml"), fresh.join("pyproject.toml")).unwrap();
-    std::fs::copy(proj.join("uv.lock"), fresh.join("uv.lock")).unwrap();
-    copy_dir_recursive(&proj.join(".socket"), &fresh.join(".socket"));
-
-    let fresh_cache = tmp.path().join("fresh-uv-cache");
-    let fresh_env: Vec<(&str, &str)> = vec![("UV_CACHE_DIR", fresh_cache.to_str().unwrap())];
-    let frozen = tool(
-        &uv,
-        &fresh,
-        &["sync", "--frozen", "--offline", "-q"],
-        &fresh_env,
-    );
-    assert_tool_ok(
-        &frozen,
-        "fresh-checkout `uv sync --frozen --offline` (empty cache)",
-    );
-    assert_eq!(
-        python_oracle(&fresh.join(".venv"), &fresh),
-        "1",
-        "fresh checkout must import the PATCHED six"
-    );
-    assert_eq!(
-        std::fs::read(fresh.join("uv.lock")).unwrap(),
-        lock_wired,
-        "the frozen offline sync must leave uv.lock byte-identical"
-    );
+    assert_fresh_checkout_frozen_offline(&uv, tmp.path(), &proj, &lock_wired);
 
     // REVERT PROOF: both halves of the pair restored byte-for-byte.
     let (code, stdout, stderr) = run_socket(
@@ -485,6 +587,121 @@ fn uv_vendor_fresh_checkout_frozen_offline_and_revert() {
         !proj.join(".socket/vendor").exists(),
         ".socket/vendor must be fully removed after revert"
     );
+}
+
+/// `get <uuid> --mode vendored` twin of the uv capstone above (v3.6): the
+/// SAME vendor engine and wiring, driven through get's uuid path — exempt
+/// from installed narrowing, so only the mocked `view/{uuid}` route is
+/// needed. Unlike the capstone, NOTHING is staged locally: the record and
+/// the patched content come from the API mock, get writes
+/// `.socket/manifest.json` itself, and `.socket/blobs` must stay absent
+/// (vendored downloads live in memory). Ends with the same fresh-checkout
+/// `uv sync --frozen --offline` committability proof; the revert half stays
+/// with the vendor capstone (same engine, same ledger).
+// multi_thread: the CLI/uv subprocesses block a worker thread while wiremock
+// keeps serving the view route on the others.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial]
+async fn uv_get_uuid_vendored_fresh_checkout_frozen_offline() {
+    let Some(uv) = find_uv() else {
+        println!("SKIP e2e_vendor_pypi_build(uv-get): `uv` not on PATH or at ~/.local/bin/uv");
+        return;
+    };
+    bake_leak_guards();
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let cache = tmp.path().join("uv-cache");
+    let cache_env: Vec<(&str, &str)> = vec![("UV_CACHE_DIR", cache.to_str().unwrap())];
+
+    // REAL fixture: pyproject + uv lock + uv sync (network allowed here).
+    if !setup_uv_six_project(&uv, &proj, &cache_env, "uv-get") {
+        return;
+    }
+
+    let venv = proj.join(".venv");
+    let installed_six = site_packages(&venv).join("six.py");
+    let orig = std::fs::read(&installed_six).expect("installed six.py");
+    assert!(
+        !orig.ends_with(PATCH_SUFFIX.as_bytes()),
+        "pristine install must not carry the marker"
+    );
+    let patched: Vec<u8> = [orig.as_slice(), PATCH_SUFFIX.as_bytes()].concat();
+
+    // The API serves the record: view/{uuid} with REAL git-blob hashes over
+    // the ACTUAL installed bytes + inline blob content.
+    let server = MockServer::start().await;
+    mount_view_mock(&server, &orig, &patched).await;
+
+    let (code, stdout, stderr) = run_vendored(
+        &VendorDriver::GetUuidVendored {
+            api_url: &server.uri(),
+        },
+        &proj,
+    );
+    assert_eq!(
+        code, 0,
+        "get --mode vendored failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    // get's envelope nests the vendor Envelope under "vendor" and drops
+    // "applied" (structurally zero — the nested apply never runs).
+    let env = parse_envelope(&stdout);
+    assert_eq!(env["status"], "success", "envelope: {env}");
+    assert_eq!(env["found"], 1, "envelope: {env}");
+    assert_eq!(env["downloaded"], 1, "envelope: {env}");
+    assert!(
+        env.get("applied").is_none(),
+        "vendored get must drop 'applied': {env}"
+    );
+    assert_vendored_applied(&env["vendor"]);
+
+    // get wrote the manifest itself, keyed by the suite's bare pypi purl —
+    // and persisted NO blobs.
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(proj.join(".socket/manifest.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        manifest["patches"][PURL]["uuid"], UUID,
+        "manifest must record the vendored patch under the bare purl: {manifest}"
+    );
+    assert!(
+        !proj.join(".socket/blobs").exists(),
+        "get --mode vendored must NOT persist blobs"
+    );
+
+    // Anti-vacuity: the record + blob content really came from the API.
+    let view_hits = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| r.url.path().contains(&format!("/patches/view/{UUID}")))
+        .count();
+    assert!(view_hits >= 1, "the view route must have been consulted");
+
+    // Same artifact + PAIRED wiring contract as the vendor capstone.
+    let wheel = vendored_wheel(&proj);
+    let wheel_rel = format!(
+        ".socket/vendor/pypi/{UUID}/{}",
+        wheel.file_name().unwrap().to_string_lossy()
+    );
+    let pyproject = std::fs::read_to_string(proj.join("pyproject.toml")).unwrap();
+    assert!(
+        pyproject.contains("[tool.uv.sources]") && pyproject.contains(&wheel_rel),
+        "pyproject must gain the [tool.uv.sources] path entry:\n{pyproject}"
+    );
+    let uvlock = std::fs::read_to_string(proj.join("uv.lock")).unwrap();
+    assert!(
+        uvlock.contains(&wheel_rel),
+        "uv.lock must resolve six from the vendored wheel path:\n{uvlock}"
+    );
+
+    // The wired pair is coherent, then the committability proof.
+    let check = tool(&uv, &proj, &["lock", "--check"], &cache_env);
+    assert_tool_ok(&check, "`uv lock --check` on the wired pair");
+    let lock_wired = std::fs::read(proj.join("uv.lock")).unwrap();
+    assert_fresh_checkout_frozen_offline(&uv, tmp.path(), &proj, &lock_wired);
 }
 
 // ── capstone 2: requirements.txt flavor (pip + `uv pip`) ──────────────
@@ -534,16 +751,7 @@ fn pip_requirements_vendor_fresh_checkout_no_index_and_revert() {
     let requirements_before = std::fs::read(proj.join("requirements.txt")).unwrap();
 
     // Vendor (offline; blob staged locally).
-    let (code, stdout, stderr) = run_socket(
-        &proj,
-        &[
-            "vendor",
-            "--json",
-            "--offline",
-            "--cwd",
-            proj.to_str().unwrap(),
-        ],
-    );
+    let (code, stdout, stderr) = run_vendored(&VendorDriver::VendorOffline, &proj);
     assert_eq!(
         code, 0,
         "vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"

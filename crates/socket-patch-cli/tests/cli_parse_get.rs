@@ -489,6 +489,115 @@ fn download_mode_file() {
     assert_eq!(snapshot(&a), want);
 }
 
+// --- `--mode` selector (v3.6) --------------------------------------------
+//
+// `get --mode <hosted|vendored|agent>` reuses scan's `ScanMode` value-enum
+// (see cli_parse_scan.rs) so the two commands can never drift on mode
+// names. Unlike scan, `get` has NO legacy boolean spellings and no
+// `resolve_mode_flags` fold — the parsed enum IS the source of truth
+// (`None` = agent, today's behavior; the `--save-only` conflict is
+// enforced inside `run()`, not by clap — pinned in get_modes_e2e.rs).
+// The hidden VALUE aliases (`host`/`redirect` for hosted, `vendor` for
+// vendored) ride along from the shared enum and are part of the contract.
+// `--mode` deliberately has no `SOCKET_*` env binding (matching scan), so
+// no scrub-list entry is needed.
+
+#[test]
+#[serial_test::serial]
+fn mode_defaults_to_none() {
+    // No `--mode` → `None` (agent behavior). Whole-snapshot: the absent
+    // flag must leave every field at its default, `mode` included.
+    let a = parse_get(&["some-id"]);
+    assert_eq!(snapshot(&a), expected_defaults("some-id"));
+    assert!(a.mode.is_none(), "unset --mode must parse to None");
+}
+
+#[test]
+#[serial_test::serial]
+fn mode_hosted_parses() {
+    let a = parse_get(&["some-id", "--mode", "hosted"]);
+    let mut want = expected_defaults("some-id");
+    want.mode = Some(socket_patch_cli::commands::scan::ScanMode::Hosted);
+    // Full-snapshot equality: `--mode hosted` sets `mode` and nothing else
+    // (in particular it must NOT flip save_only/one_off or any GlobalArgs
+    // field — the runtime conflicts are run()'s job, not the parser's).
+    assert_eq!(snapshot(&a), want);
+}
+
+#[test]
+#[serial_test::serial]
+fn mode_vendored_parses() {
+    let a = parse_get(&["some-id", "--mode", "vendored"]);
+    let mut want = expected_defaults("some-id");
+    want.mode = Some(socket_patch_cli::commands::scan::ScanMode::Vendored);
+    assert_eq!(snapshot(&a), want);
+}
+
+#[test]
+#[serial_test::serial]
+fn mode_agent_parses() {
+    let a = parse_get(&["some-id", "--mode", "agent"]);
+    let mut want = expected_defaults("some-id");
+    want.mode = Some(socket_patch_cli::commands::scan::ScanMode::Agent);
+    assert_eq!(snapshot(&a), want);
+}
+
+#[test]
+#[serial_test::serial]
+fn mode_hidden_value_aliases_parse() {
+    // The hidden value aliases mirror the legacy scan flag spellings:
+    // `host` (old mode name) and `redirect` (the `--redirect` boolean)
+    // for hosted; `vendor` (the `--vendor` boolean) for vendored. Each
+    // must parse byte-identically to its canonical spelling across the
+    // ENTIRE surface, not merely land on the right variant.
+    for (alias, canonical) in [
+        ("host", "hosted"),
+        ("redirect", "hosted"),
+        ("vendor", "vendored"),
+    ] {
+        let via_alias = parse_get(&["some-id", "--mode", alias]);
+        let via_canonical = parse_get(&["some-id", "--mode", canonical]);
+        assert_eq!(
+            snapshot(&via_alias),
+            snapshot(&via_canonical),
+            "--mode {alias} must parse identically to --mode {canonical}"
+        );
+        // ...and the canonical parse itself is default-everything + mode,
+        // so the alias equality above can't be satisfied by two equally
+        // wrong parses.
+        let mut want = expected_defaults("some-id");
+        want.mode = Some(match canonical {
+            "hosted" => socket_patch_cli::commands::scan::ScanMode::Hosted,
+            _ => socket_patch_cli::commands::scan::ScanMode::Vendored,
+        });
+        assert_eq!(snapshot(&via_canonical), want);
+    }
+}
+
+#[test]
+#[serial_test::serial]
+fn mode_rejects_unknown_value() {
+    // The shared value_enum restricts `--mode` to the three known names
+    // (+ hidden aliases). `apply` is deliberately NOT an alias of agent —
+    // applying is not a scan-mode name anywhere else (see ScanMode's doc)
+    // — so it must be rejected exactly like a bogus value.
+    let _scrub = EnvScrub::new();
+    for bad in ["bogus", "apply"] {
+        let err = match Cli::try_parse_from(["socket-patch", "get", "some-id", "--mode", bad]) {
+            Ok(_) => panic!("--mode {bad} should fail to parse"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(
+                err.kind(),
+                clap::error::ErrorKind::ValueValidation | clap::error::ErrorKind::InvalidValue
+            ),
+            "--mode {bad}: expected ValueValidation or InvalidValue, got {:?}",
+            err.kind()
+        );
+    }
+}
+
 // --- `download` visible alias for `get` -------------------------------------
 
 #[test]

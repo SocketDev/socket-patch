@@ -334,7 +334,9 @@ async fn get_uuid_returning_malformed_json_emits_error() {
 
 /// CVE search returning empty patch list → `not_found` envelope, exit 0.
 /// (The search path emits `not_found`; `no_match` is only produced by the
-/// package-name fuzzy-match path, so it must NOT appear here.)
+/// package-name fuzzy-match path, so it must NOT appear here. v3.6 adds a
+/// third distinct status: `not_installed`, for a NON-empty search whose
+/// every version was narrowed out — also never spelled `no_match`.)
 #[tokio::test]
 async fn get_by_cve_with_no_patches_emits_no_match() {
     let mock = MockServer::start().await;

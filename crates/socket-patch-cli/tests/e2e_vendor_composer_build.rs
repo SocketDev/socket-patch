@@ -28,6 +28,12 @@
 //!   7. **Revert proof**: `vendor --revert` restores composer.lock
 //!      byte-for-byte and removes `.socket/vendor/` entirely.
 //!
+//! The capstone also has a `get <uuid> --mode vendored` twin (v3.6): the
+//! SAME vendor engine driven through get's uuid path against a wiremock
+//! `view/{uuid}` (record + inline blob content served by the API instead of
+//! a locally staged manifest/blob), ending in the same fresh-checkout
+//! `composer install` proof.
+//!
 //! Skips (with a println) when `composer` is not installed (this host) or
 //! the fixture install cannot reach packagist; every assertion after that is
 //! hard.
@@ -36,6 +42,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use sha2::{Digest, Sha256};
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[path = "common/cache_env.rs"]
 mod cache_env;
@@ -44,6 +52,8 @@ mod cache_env;
 /// `.socket/vendor/composer/`) — also what `dist.reference` must carry.
 const UUID: &str = "4d5e6f7a-8b9c-4a1b-8c2d-0123456789ab";
 const GHSA: &str = "GHSA-vend-composer-host";
+/// Org slug the get twin passes on the argv (and the view mock's path).
+const ORG: &str = "test-org";
 /// The dependency under test — dep-free, tiny, and the same fixture the
 /// docker twin uses.
 const DEP: &str = "psr/log";
@@ -188,6 +198,195 @@ fn lock_entry(lock_path: &Path, name: &str) -> serde_json::Value {
         .clone()
 }
 
+/// Which CLI front door vendors the patch. Both land on the SAME vendor
+/// engine by construction (v3.6): `vendor` consumes the locally staged
+/// `.socket/` manifest + blob fully offline, while `get <uuid> --mode
+/// vendored` fetches the record from the mocked API (the uuid path is
+/// exempt from installed narrowing, so only the `view/{uuid}` route is
+/// needed), writes the manifest itself, and stages patch content in memory
+/// — `.socket/blobs` must stay absent. `--vendor-source build` keeps the
+/// get flow off the vendoring service (no grant/tarball mocks needed).
+enum VendorDriver<'a> {
+    VendorOffline,
+    GetUuidVendored { api_url: &'a str },
+}
+
+/// The vendoring invocation of the capstone, parameterized by `driver`.
+fn run_vendored(driver: &VendorDriver<'_>, proj: &Path) -> (i32, String, String) {
+    match driver {
+        VendorDriver::VendorOffline => run_socket(
+            proj,
+            &[
+                "vendor",
+                "--json",
+                "--offline",
+                "--cwd",
+                proj.to_str().unwrap(),
+            ],
+        ),
+        VendorDriver::GetUuidVendored { api_url } => run_socket(
+            proj,
+            &[
+                "get",
+                UUID,
+                "--mode",
+                "vendored",
+                "--json",
+                "--yes",
+                "--api-url",
+                api_url,
+                "--api-token",
+                "fake",
+                "--org",
+                ORG,
+                "--vendor-source",
+                "build",
+                "--cwd",
+                proj.to_str().unwrap(),
+            ],
+        ),
+    }
+}
+
+/// Mount `view/{UUID}` on the mock API: the patch record with REAL git-blob
+/// hashes over the ACTUAL installed bytes plus inline base64 `blobContent`,
+/// so `get --mode vendored` both saves the manifest record and stages the
+/// after-bytes in memory (nothing is staged locally). Mirrors
+/// [`stage_patch_with_vuln`]'s record shape — same bare composer purl
+/// (leading `v` stripped, no qualifiers), same vendor-relative file key.
+async fn mount_view_mock(
+    server: &MockServer,
+    purl: &str,
+    file_key: &str,
+    before: &[u8],
+    after: &[u8],
+) {
+    use base64::Engine as _;
+    let blob_b64 = base64::engine::general_purpose::STANDARD.encode(after);
+    Mock::given(method("GET"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/view/{UUID}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "uuid": UUID,
+            "purl": purl,
+            "publishedAt": "2026-01-01T00:00:00Z",
+            "files": { file_key: {
+                "beforeHash": git_sha256(before),
+                "afterHash": git_sha256(after),
+                "blobContent": blob_b64,
+            }},
+            "vulnerabilities": { GHSA: {
+                "cves": ["CVE-2026-44444"],
+                "summary": "composer capstone vex vuln",
+                "severity": "high",
+                "description": "d",
+            }},
+            "description": "capstone marker patch",
+            "license": "MIT",
+            "tier": "free",
+        })))
+        .mount(server)
+        .await;
+}
+
+/// REAL fixture: write the psr/log composer.json, then `composer update`
+/// resolves + installs it from packagist (network allowed here only,
+/// private home + cache). Returns false after printing the suite's SKIP
+/// line — `tag` names the calling test — when packagist is unreachable.
+fn setup_composer_project(proj: &Path, home: &Path, cache: &Path, tag: &str) -> bool {
+    std::fs::write(
+        proj.join("composer.json"),
+        r#"{
+    "name": "socket/vendor-capstone",
+    "description": "socket-patch vendor host capstone fixture",
+    "require": {
+        "psr/log": "3.0.*"
+    }
+}
+"#,
+    )
+    .unwrap();
+    let update = composer(proj, &["update"], home, cache);
+    if !update.status.success() {
+        println!(
+            "SKIP e2e_vendor_composer_build{tag}: `composer update` failed (packagist \
+             unreachable?):\n{}",
+            String::from_utf8_lossy(&update.stderr)
+        );
+        return false;
+    }
+    true
+}
+
+/// FRESH-CHECKOUT PROOF: ONLY the committable files (composer.json,
+/// composer.lock, `.socket/`) travel to a new dir; a cold-home/cache
+/// `composer install` must materialize vendor/psr/log as a REAL directory
+/// (not a symlink — `transport-options.symlink: false` is load-bearing)
+/// holding the `patched` bytes, with the patch uuid surviving into
+/// `vendor/composer/installed.json` (`dist.reference`).
+fn assert_fresh_checkout_installs_patched(tmp: &Path, proj: &Path, patched: &[u8]) {
+    let fresh = tmp.join("fresh");
+    std::fs::create_dir_all(&fresh).unwrap();
+    std::fs::copy(proj.join("composer.json"), fresh.join("composer.json")).unwrap();
+    std::fs::copy(proj.join("composer.lock"), fresh.join("composer.lock")).unwrap();
+    copy_dir_recursive(&proj.join(".socket"), &fresh.join(".socket"));
+    assert!(
+        !fresh.join("vendor").exists(),
+        "fresh checkout must not carry an installed tree (test bug)"
+    );
+
+    let fresh_home = tmp.join("cold-composer-home");
+    let fresh_cache = tmp.join("cold-composer-cache");
+    let install = composer(&fresh, &["install"], &fresh_home, &fresh_cache);
+    assert!(
+        install.status.success(),
+        "cold-cache `composer install` must succeed from the vendored path dist.\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&install.stdout),
+        String::from_utf8_lossy(&install.stderr),
+    );
+
+    // Real COPY, not a symlink (transport-options symlink:false is
+    // load-bearing — a symlink would dangle in any other checkout).
+    let installed_dir = fresh.join("vendor/psr/log");
+    assert!(
+        installed_dir.is_dir(),
+        "vendor/psr/log missing after install"
+    );
+    assert!(
+        !std::fs::symlink_metadata(&installed_dir)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "vendor/psr/log is a SYMLINK — symlink:false not honored"
+    );
+    assert_eq!(
+        std::fs::read(installed_dir.join("src/LoggerInterface.php")).unwrap(),
+        patched,
+        "installed LoggerInterface.php must be byte-identical to the patched content"
+    );
+
+    // In-tree traceability: composer preserves dist.reference verbatim into
+    // vendor/composer/installed.json — the patch uuid must survive there.
+    let installed_json: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(fresh.join("vendor/composer/installed.json")).unwrap(),
+    )
+    .unwrap();
+    // composer 2 wraps the list in {"packages": [...]}; composer 1 wrote a
+    // bare array — accept both like the docker twin's php oracle.
+    let installed_pkgs = installed_json
+        .get("packages")
+        .and_then(|p| p.as_array())
+        .or_else(|| installed_json.as_array())
+        .expect("installed.json package list");
+    let installed_entry = installed_pkgs
+        .iter()
+        .find(|p| p["name"] == DEP)
+        .unwrap_or_else(|| panic!("{DEP} missing from installed.json"));
+    assert_eq!(
+        installed_entry["dist"]["reference"], UUID,
+        "installed.json must carry dist.reference == patch uuid: {installed_entry}"
+    );
+}
+
 // ── the capstone ──────────────────────────────────────────────────────
 
 #[test]
@@ -202,30 +401,12 @@ fn composer_vendor_fresh_checkout_install_and_revert() {
     let tmp = tempfile::tempdir().unwrap();
     let proj = tmp.path().join("proj");
     std::fs::create_dir_all(&proj).unwrap();
-    std::fs::write(
-        proj.join("composer.json"),
-        r#"{
-    "name": "socket/vendor-capstone",
-    "description": "socket-patch vendor host capstone fixture",
-    "require": {
-        "psr/log": "3.0.*"
-    }
-}
-"#,
-    )
-    .unwrap();
 
     // 1. REAL fixture: composer update resolves + installs psr/log from
     //    packagist (network allowed here only, private home + cache).
     let home = tmp.path().join("composer-home");
     let cache = tmp.path().join("composer-cache");
-    let update = composer(&proj, &["update"], &home, &cache);
-    if !update.status.success() {
-        println!(
-            "SKIP e2e_vendor_composer_build: `composer update` failed (packagist \
-             unreachable?):\n{}",
-            String::from_utf8_lossy(&update.stderr)
-        );
+    if !setup_composer_project(&proj, &home, &cache, "") {
         return;
     }
 
@@ -251,16 +432,7 @@ fn composer_vendor_fresh_checkout_install_and_revert() {
     let lock_before = std::fs::read(&lock_path).unwrap();
 
     // 3. Vendor (offline: the blob is staged locally → zero network).
-    let (code, stdout, stderr) = run_socket(
-        &proj,
-        &[
-            "vendor",
-            "--json",
-            "--offline",
-            "--cwd",
-            proj.to_str().unwrap(),
-        ],
-    );
+    let (code, stdout, stderr) = run_vendored(&VendorDriver::VendorOffline, &proj);
     assert_eq!(
         code, 0,
         "vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
@@ -358,80 +530,11 @@ fn composer_vendor_fresh_checkout_install_and_revert() {
     // 5. FRESH-CHECKOUT PROOF: ONLY the committable files, cold composer
     //    home + cache — the vendored path dist is the only possible source
     //    of psr/log.
-    let fresh = tmp.path().join("fresh");
-    std::fs::create_dir_all(&fresh).unwrap();
-    std::fs::copy(proj.join("composer.json"), fresh.join("composer.json")).unwrap();
-    std::fs::copy(&lock_path, fresh.join("composer.lock")).unwrap();
-    copy_dir_recursive(&proj.join(".socket"), &fresh.join(".socket"));
-    assert!(
-        !fresh.join("vendor").exists(),
-        "fresh checkout must not carry an installed tree (test bug)"
-    );
-
-    let fresh_home = tmp.path().join("cold-composer-home");
-    let fresh_cache = tmp.path().join("cold-composer-cache");
-    let install = composer(&fresh, &["install"], &fresh_home, &fresh_cache);
-    assert!(
-        install.status.success(),
-        "cold-cache `composer install` must succeed from the vendored path dist.\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&install.stdout),
-        String::from_utf8_lossy(&install.stderr),
-    );
-
-    // Real COPY, not a symlink (transport-options symlink:false is
-    // load-bearing — a symlink would dangle in any other checkout).
-    let installed_dir = fresh.join("vendor/psr/log");
-    assert!(
-        installed_dir.is_dir(),
-        "vendor/psr/log missing after install"
-    );
-    assert!(
-        !std::fs::symlink_metadata(&installed_dir)
-            .unwrap()
-            .file_type()
-            .is_symlink(),
-        "vendor/psr/log is a SYMLINK — symlink:false not honored"
-    );
-    assert_eq!(
-        std::fs::read(installed_dir.join("src/LoggerInterface.php")).unwrap(),
-        patched,
-        "installed LoggerInterface.php must be byte-identical to the patched content"
-    );
-
-    // In-tree traceability: composer preserves dist.reference verbatim into
-    // vendor/composer/installed.json — the patch uuid must survive there.
-    let installed_json: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(fresh.join("vendor/composer/installed.json")).unwrap(),
-    )
-    .unwrap();
-    // composer 2 wraps the list in {"packages": [...]}; composer 1 wrote a
-    // bare array — accept both like the docker twin's php oracle.
-    let installed_pkgs = installed_json
-        .get("packages")
-        .and_then(|p| p.as_array())
-        .or_else(|| installed_json.as_array())
-        .expect("installed.json package list");
-    let installed_entry = installed_pkgs
-        .iter()
-        .find(|p| p["name"] == DEP)
-        .unwrap_or_else(|| panic!("{DEP} missing from installed.json"));
-    assert_eq!(
-        installed_entry["dist"]["reference"], UUID,
-        "installed.json must carry dist.reference == patch uuid: {installed_entry}"
-    );
+    assert_fresh_checkout_installs_patched(tmp.path(), &proj, &patched);
 
     // 6. Idempotency: a re-run exits 0 and leaves the lock byte-stable.
     let lock_wired = std::fs::read(&lock_path).unwrap();
-    let (code, stdout, stderr) = run_socket(
-        &proj,
-        &[
-            "vendor",
-            "--json",
-            "--offline",
-            "--cwd",
-            proj.to_str().unwrap(),
-        ],
-    );
+    let (code, stdout, stderr) = run_vendored(&VendorDriver::VendorOffline, &proj);
     assert_eq!(
         code, 0,
         "re-vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
@@ -477,6 +580,154 @@ fn composer_vendor_fresh_checkout_install_and_revert() {
         !proj.join(".socket/vendor").exists(),
         ".socket/vendor must be fully removed after revert"
     );
+}
+
+/// `get <uuid> --mode vendored` twin of the capstone above (v3.6): the SAME
+/// vendor engine, artifact convention, and lock-only wiring, driven through
+/// get's uuid path — exempt from installed narrowing, so only the mocked
+/// `view/{uuid}` route is needed. Unlike the capstone, NOTHING is staged
+/// locally: the record and the patched content come from the API mock, get
+/// writes `.socket/manifest.json` itself, and `.socket/blobs` must stay
+/// absent (vendored downloads live in memory). Ends with the same
+/// fresh-checkout `composer install` proof; the revert half stays with the
+/// vendor capstone (same engine, same ledger).
+// multi_thread: the CLI/composer subprocesses block a worker thread while
+// wiremock keeps serving the view route on the others.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "host capstone: shells out to a real composer 2; the unpinned `test` job \
+            skips it, the e2e job runs it with a pinned toolchain via --ignored"]
+async fn composer_get_uuid_vendored_fresh_checkout_install() {
+    if !has_command("composer") {
+        println!("SKIP e2e_vendor_composer_build(get): `composer` not installed");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+
+    // REAL fixture: composer update resolves + installs psr/log from
+    // packagist (network allowed here only, private home + cache).
+    let home = tmp.path().join("composer-home");
+    let cache = tmp.path().join("composer-cache");
+    if !setup_composer_project(&proj, &home, &cache, "(get)") {
+        return;
+    }
+
+    let lock_path = proj.join("composer.lock");
+    let version = locked_composer_version(&lock_path, DEP)
+        .unwrap_or_else(|| panic!("{DEP} not present in composer.lock after update"));
+
+    let installed_php = proj.join("vendor/psr/log/src/LoggerInterface.php");
+    let orig = std::fs::read(&installed_php).expect("installed LoggerInterface.php");
+    assert!(
+        !String::from_utf8_lossy(&orig).contains("SOCKET-PATCH-VENDOR-E2E-MARKER"),
+        "pristine install must not carry the marker"
+    );
+    let marker = format!("\n// SOCKET-PATCH-VENDOR-E2E-MARKER patch={UUID}\n");
+    let patched: Vec<u8> = [orig.as_slice(), marker.as_bytes()].concat();
+    let purl = format!("pkg:composer/{DEP}@{version}");
+
+    let json_before = std::fs::read(proj.join("composer.json")).unwrap();
+
+    // The API serves the record: view/{uuid} with REAL git-blob hashes over
+    // the ACTUAL installed bytes + inline blob content.
+    let server = MockServer::start().await;
+    mount_view_mock(&server, &purl, "src/LoggerInterface.php", &orig, &patched).await;
+
+    let (code, stdout, stderr) = run_vendored(
+        &VendorDriver::GetUuidVendored {
+            api_url: &server.uri(),
+        },
+        &proj,
+    );
+    assert_eq!(
+        code, 0,
+        "get --mode vendored failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    // get's envelope nests the vendor Envelope under "vendor" and drops
+    // "applied" (structurally zero — the nested apply never runs).
+    let env = parse_envelope(&stdout);
+    assert_eq!(env["status"], "success", "envelope: {env}");
+    assert_eq!(env["found"], 1, "envelope: {env}");
+    assert_eq!(env["downloaded"], 1, "envelope: {env}");
+    assert!(
+        env.get("applied").is_none(),
+        "vendored get must drop 'applied': {env}"
+    );
+    assert_eq!(
+        env["vendor"]["summary"]["applied"], 1,
+        "one package vendored: {env}"
+    );
+    assert_eq!(env["vendor"]["summary"]["failed"], 0, "no failures: {env}");
+    assert!(
+        env["vendor"]["events"]
+            .as_array()
+            .expect("vendor.events[]")
+            .iter()
+            .any(|e| e["action"] == "applied" && e["purl"] == purl.as_str()),
+        "expected an applied vendor event for {purl}: {env}"
+    );
+
+    // get wrote the manifest itself, keyed by the bare composer purl — and
+    // persisted NO blobs.
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(proj.join(".socket/manifest.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        manifest["patches"][purl.as_str()]["uuid"],
+        UUID,
+        "manifest must record the vendored patch under the bare purl: {manifest}"
+    );
+    assert!(
+        !proj.join(".socket/blobs").exists(),
+        "get --mode vendored must NOT persist blobs"
+    );
+
+    // Anti-vacuity: the record + blob content really came from the API.
+    let view_hits = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| r.url.path().contains(&format!("/patches/view/{UUID}")))
+        .count();
+    assert!(view_hits >= 1, "the view route must have been consulted");
+
+    // Same artifact + lock-only wiring contract as the vendor capstone.
+    let copy_rel = format!(".socket/vendor/composer/{UUID}/{DEP}@{version}");
+    assert_eq!(
+        std::fs::read(proj.join(&copy_rel).join("src/LoggerInterface.php")).unwrap(),
+        patched,
+        "vendored LoggerInterface.php must hold the patched bytes"
+    );
+    assert!(
+        proj.join(".socket/vendor/state.json").is_file(),
+        "vendor ledger missing"
+    );
+    let entry = lock_entry(&lock_path, DEP);
+    assert_eq!(entry["dist"]["type"], "path", "dist.type: {entry}");
+    assert_eq!(entry["dist"]["url"], copy_rel, "dist.url: {entry}");
+    assert_eq!(entry["dist"]["reference"], UUID, "dist.reference: {entry}");
+    assert_eq!(
+        entry["transport-options"]["symlink"],
+        serde_json::Value::Bool(false),
+        "transport-options.symlink: {entry}"
+    );
+    assert!(
+        entry.get("source").is_none(),
+        "source must be removed from the wired entry: {entry}"
+    );
+    assert_eq!(
+        std::fs::read(proj.join("composer.json")).unwrap(),
+        json_before,
+        "get --mode vendored must NOT touch composer.json (lock-only wiring)"
+    );
+
+    // FRESH-CHECKOUT PROOF: identical committability contract to the
+    // capstone — cold home + cache, path dist the only source.
+    assert_fresh_checkout_installs_patched(tmp.path(), &proj, &patched);
 }
 
 // ── revert against ledger state the capstone above never produces ─────

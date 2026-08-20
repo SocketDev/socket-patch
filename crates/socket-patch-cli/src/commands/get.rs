@@ -959,8 +959,7 @@ async fn filter_to_installed_purls(
     // global scans, which target the machine tree, not this project).
     let mut pnp_diags: Vec<lock_inventory::UnsupportedNpmLayout> = Vec::new();
     if !common.global && common.global_prefix.is_none() {
-        let (entries, unsupported) =
-            lock_inventory::inventory_project_diagnosed(&common.cwd).await;
+        let (entries, unsupported) = lock_inventory::inventory_project_diagnosed(&common.cwd).await;
         pnp_diags = unsupported;
         if mode != super::scan::ScanMode::Agent {
             present.extend(entries.iter().map(|e| canon(&e.purl)));
@@ -1050,7 +1049,11 @@ fn fold_narrowing_into_result(
                     .collect()
             })
             .unwrap_or_default();
-        merged.extend(warnings.iter().map(|(code, detail)| format!("({code}) {detail}")));
+        merged.extend(
+            warnings
+                .iter()
+                .map(|(code, detail)| format!("({code}) {detail}")),
+        );
         obj.insert("warnings".to_string(), serde_json::json!(merged));
     }
 }
@@ -1839,15 +1842,8 @@ pub async fn run(args: GetArgs) -> i32 {
                     super::scan::ScanMode::Agent => save_and_apply_patch(&args, &patch).await,
                     super::scan::ScanMode::Hosted => {
                         let selected = vec![search_result_from_response(&patch)];
-                        run_get_hosted(
-                            &args,
-                            &api_client,
-                            effective_org_slug,
-                            &selected,
-                            &[],
-                            &[],
-                        )
-                        .await
+                        run_get_hosted(&args, &api_client, effective_org_slug, &selected, &[], &[])
+                            .await
                     }
                     super::scan::ScanMode::Vendored => {
                         run_get_vendored_uuid(
@@ -2292,7 +2288,10 @@ async fn save_patch_record(
     insert_when_skipped: bool,
 ) -> Result<PatchAction, i32> {
     let manifest_path = args.common.resolved_manifest_path();
-    let socket_dir = manifest_path.parent().unwrap_or(Path::new(".")).to_path_buf();
+    let socket_dir = manifest_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .to_path_buf();
 
     if persist_blobs {
         if let Err(e) = tokio::fs::create_dir_all(socket_dir.join("blobs")).await {
@@ -2679,8 +2678,7 @@ async fn run_get_vendored_search(
     // The vendor step (scan's, verbatim): apply lock, whole-manifest
     // reconcile + staging + engine. A download failure does not skip it —
     // previously-recorded patches still (re)vendor, exactly like scan.
-    match super::scan::boxed_scan_vendor_step(&args.common, &manifest_path, &socket_dir, None)
-        .await
+    match super::scan::boxed_scan_vendor_step(&args.common, &manifest_path, &socket_dir, None).await
     {
         Ok((vendor_errors, venv)) => {
             has_errors |= vendor_errors;
@@ -2813,8 +2811,7 @@ async fn run_get_vendored_uuid(
         serde_json::Value::Null
     };
 
-    match super::scan::boxed_scan_vendor_step(&args.common, &manifest_path, &socket_dir, None)
-        .await
+    match super::scan::boxed_scan_vendor_step(&args.common, &manifest_path, &socket_dir, None).await
     {
         Ok((vendor_errors, venv)) => {
             crate::commands::vendor::track_outcomes_for_vendor(

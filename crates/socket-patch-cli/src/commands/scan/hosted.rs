@@ -718,7 +718,6 @@ pub(super) async fn run_redirect(
     // other scan; `.take()` at each terminal (error or success) folds it in.
     mut scan_result: Option<serde_json::Value>,
 ) -> i32 {
-
     // Same discovery/selection as `--apply`/`--vendor`.
     let selected = match discover_selected(
         api_client,
@@ -1027,8 +1026,7 @@ pub(crate) async fn run_redirect_selected(
                     continue;
                 }
                 let outcome =
-                    crate::commands::vendor::dispatch_revert_one(&entry, &common.cwd, false)
-                        .await;
+                    crate::commands::vendor::dispatch_revert_one(&entry, &common.cwd, false).await;
                 if !outcome.success {
                     refused.push(purl.clone());
                     takeover_pre_warnings.push(serde_json::json!({
@@ -1046,8 +1044,7 @@ pub(crate) async fn run_redirect_selected(
                 // mid-run leaves a ledger matching the on-disk wiring.
                 // Re-loaded fresh each iteration (each iteration saves): the
                 // saved file is the truth.
-                let mut state = match socket_patch_core::vendor::load_state(&common.cwd).await
-                {
+                let mut state = match socket_patch_core::vendor::load_state(&common.cwd).await {
                     Ok(s) => s,
                     Err(e) => {
                         refused.push(purl.clone());
@@ -1065,9 +1062,7 @@ pub(crate) async fn run_redirect_selected(
                 state
                     .entries
                     .retain(|k, e| canon(k) != canon(purl) && canon(&e.base_purl) != canon(purl));
-                if let Err(e) =
-                    socket_patch_core::vendor::save_state(&common.cwd, &state).await
-                {
+                if let Err(e) = socket_patch_core::vendor::save_state(&common.cwd, &state).await {
                     // The wiring is reverted but the ledger still claims it;
                     // redirecting now would leave a ledger asserting wiring
                     // that is gone. Fail closed for this purl.
@@ -1639,8 +1634,7 @@ pub(crate) async fn run_redirect_selected(
             // a swallowed write failure would let the lockfile writes below
             // proceed with no revert data persisted while reporting success.
             if let Err(e) =
-                socket_patch_core::patch::redirect::save_redirect_state(&common.cwd, &ledger)
-                    .await
+                socket_patch_core::patch::redirect::save_redirect_state(&common.cwd, &ledger).await
             {
                 let message = format!("failed to write .socket/vendor/redirect-state.json: {e}");
                 eprintln!("{message}");
@@ -1724,9 +1718,7 @@ pub(crate) async fn run_redirect_selected(
     // deleting the other mode's ledger; reconciliation is deferred (see PR Scope).
     // Read after the ledger write above so a non-dry-run reflects this run.
     let mut takeover_warnings: Vec<serde_json::Value> = Vec::new();
-    let superseded = super::classify_overlap_takeover(&common.cwd)
-        .await
-        .redirect;
+    let superseded = super::classify_overlap_takeover(&common.cwd).await.redirect;
     if !superseded.is_empty() {
         takeover_warnings.push(serde_json::json!({
             "code": super::REDIRECT_SUPERSEDES_VENDORED,
@@ -1901,8 +1893,7 @@ pub(crate) async fn run_redirect_selected(
                      install time; run `socket-patch vex` after installing to verify against \
                      the installed tree).",
                     statements,
-                    vex
-                        .vex
+                    vex.vex
                         .as_ref()
                         .expect("vex_statements is Some only when --vex was given")
                         .display(),
@@ -1944,7 +1935,6 @@ pub(crate) fn boxed_run_redirect_selected<'a>(
         scan_result,
     ))
 }
-
 
 #[cfg(test)]
 mod tests {

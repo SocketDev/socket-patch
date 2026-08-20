@@ -355,7 +355,9 @@ async fn get_uuid_hosted_dry_run_writes_nothing() {
     let lock_after = std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap();
     assert_eq!(lock_before, lock_after, "dry-run must not touch the lock");
     assert!(
-        !tmp.path().join(".socket/vendor/redirect-state.json").exists(),
+        !tmp.path()
+            .join(".socket/vendor/redirect-state.json")
+            .exists(),
         "dry-run must not write the ledger"
     );
     assert!(!tmp.path().join(".socket/manifest.json").exists());
@@ -434,8 +436,7 @@ async fn get_uuid_vendored_rerun_is_idempotent() {
         .join(".socket/vendor/npm")
         .join(UUID1)
         .join(format!("{NAME}-1.0.0.tgz"));
-    let lock_after_first =
-        std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap();
+    let lock_after_first = std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap();
 
     let mut args = get_args(UUID1, tmp.path(), server.uri());
     args.mode = Some(ScanMode::Vendored);
@@ -445,8 +446,7 @@ async fn get_uuid_vendored_rerun_is_idempotent() {
         "re-run must be a benign no-op"
     );
     assert!(artifact.is_file(), "artifact must survive the re-run");
-    let lock_after_second =
-        std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap();
+    let lock_after_second = std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap();
     assert_eq!(
         lock_after_first, lock_after_second,
         "the re-run must leave the lock byte-identical"
@@ -608,10 +608,9 @@ async fn get_ghsa_manifest_membership_counts_as_presence() {
     // state below.
     let _ = code;
 
-    let manifest: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(socket_dir.join("manifest.json")).unwrap(),
-    )
-    .unwrap();
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(socket_dir.join("manifest.json")).unwrap())
+            .unwrap();
     assert_eq!(
         manifest["patches"][PURL1]["uuid"], UUID1,
         "the tracked purl must be updated to the new uuid"
@@ -638,7 +637,11 @@ async fn mode_with_save_only_conflicts_exit_one_before_network() {
         assert_eq!(code, 1, "--save-only + --mode {mode:?} must be rejected");
     }
     assert!(
-        server.received_requests().await.unwrap_or_default().is_empty(),
+        server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty(),
         "the conflict must be rejected before any network contact"
     );
     assert!(!tmp.path().join(".socket").exists());

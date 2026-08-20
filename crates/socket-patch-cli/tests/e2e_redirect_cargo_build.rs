@@ -37,6 +37,13 @@
 //! --locked` must FAIL with a checksum error — the pin is enforcement, not
 //! decoration.
 //!
+//! A get-driven twin (`cargo_get_uuid_hosted_fresh_checkout_fetch`) drives
+//! the SAME fixture through `get <uuid> --mode hosted` (v3.6) — parity by
+//! construction, since get hands the (purl, uuid) pair to scan's extracted
+//! run_redirect_selected engine — and re-proves the fresh-checkout fetch.
+//! Hosted get writes NO manifest and NO blobs (the redirect ledger is the
+//! persistence) and has no `--vex`.
+//!
 //! Skips (with a println) when `cargo` is missing or crates.io is
 //! unreachable for the fixture build; every assertion after that is hard.
 
@@ -270,6 +277,20 @@ fn stage_fixture(tmp: &Path, tag: &str) -> Option<(PathBuf, PathBuf, String, Pat
     Some((proj, cargo_home, version, crate_dir))
 }
 
+/// Which CLI invocation drives the hosted redirect in
+/// [`redirect_scanned_project`]. The fixture, API/index mocks, three-file
+/// rewrite, and ledger assertions are identical — both routes flow through
+/// scan's `run_redirect_selected` engine; only the argv and the JSON
+/// envelope framing differ.
+#[derive(Clone, Copy, PartialEq)]
+enum Driver {
+    /// `scan --mode hosted --json --yes --vex …` (the original capstone).
+    ScanVex,
+    /// `get <uuid> --mode hosted --json --yes` — no `--vex` (get has none),
+    /// and the uuid identifier path needs no search-endpoint mocks.
+    GetUuid,
+}
+
 /// Everything the post-redirect legs need. `tmp` owns the whole tree;
 /// `_server` keeps the sparse index + download routes alive through the
 /// fresh `cargo fetch`.
@@ -285,12 +306,16 @@ struct RedirectFixture {
 }
 
 /// Steps 1–3 of the module doc: real fixture build, patched `.crate` + API
-/// mocks + sparse-index routes, `scan --mode hosted --vex`, and the
-/// envelope / three-file-rewrite / ledger assertions. When
-/// `tamper_served_crate` is set, the download route serves DIFFERENT bytes
-/// than the sha256 pinned into the index + lockfile — the negative twin's
-/// premise. `None` = skip (message already printed).
-async fn redirect_scanned_project(tag: &str, tamper_served_crate: bool) -> Option<RedirectFixture> {
+/// mocks + sparse-index routes, the `driver` invocation (scan's capstone
+/// argv or the get-uuid twin), and the envelope / three-file-rewrite /
+/// ledger assertions. When `tamper_served_crate` is set, the download route
+/// serves DIFFERENT bytes than the sha256 pinned into the index + lockfile
+/// — the negative twin's premise. `None` = skip (message already printed).
+async fn redirect_scanned_project(
+    tag: &str,
+    tamper_served_crate: bool,
+    driver: Driver,
+) -> Option<RedirectFixture> {
     if !has_command("cargo") {
         println!("SKIP e2e_redirect_cargo_build ({tag}): `cargo` not installed");
         return None;
@@ -451,12 +476,14 @@ async fn redirect_scanned_project(tag: &str, tamper_served_crate: bool) -> Optio
         .mount(&server)
         .await;
 
-    // scan --mode hosted --vex: the three-file rewrite + the in-run
-    // (unverified) attestation. `--mode hosted` is the documented spelling
-    // of `--redirect`.
-    let (code, stdout, stderr) = run_socket(
-        &proj,
-        &[
+    // The driver invocation. Scan: `--mode hosted --vex` — the three-file
+    // rewrite + the in-run (unverified) attestation (`--mode hosted` is the
+    // documented spelling of `--redirect`). Get: `get <uuid> --mode hosted`
+    // — same engine, get's confirm gate auto-accepted by --json/--yes, no
+    // --vex (get has none).
+    let server_uri = server.uri();
+    let argv: Vec<&str> = match driver {
+        Driver::ScanVex => vec![
             "scan",
             "--mode",
             "hosted",
@@ -465,7 +492,7 @@ async fn redirect_scanned_project(tag: &str, tamper_served_crate: bool) -> Optio
             "--cwd",
             proj.to_str().unwrap(),
             "--api-url",
-            &server.uri(),
+            &server_uri,
             "--org",
             ORG,
             "--api-token",
@@ -475,27 +502,61 @@ async fn redirect_scanned_project(tag: &str, tamper_served_crate: bool) -> Optio
             "--vex-product",
             PRODUCT,
         ],
-        &cargo_home,
-    );
+        Driver::GetUuid => vec![
+            "get",
+            UUID,
+            "--mode",
+            "hosted",
+            "--json",
+            "--yes",
+            "--cwd",
+            proj.to_str().unwrap(),
+            "--api-url",
+            &server_uri,
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+        ],
+    };
+    let (code, stdout, stderr) = run_socket(&proj, &argv, &cargo_home);
     assert_eq!(
         code, 0,
-        "scan --mode hosted failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        "hosted redirect run ({tag}) failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
-    let env: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
-        panic!("scan --mode hosted --json output is not JSON: {e}\nstdout:\n{stdout}")
-    });
+    let env: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("hosted --json output is not JSON: {e}\nstdout:\n{stdout}"));
     assert_eq!(env["status"], "success", "envelope: {env}");
     assert_eq!(env["redirect"]["mode"], "hosted", "envelope: {env}");
+    // Cargo confirmation is TRANSACTIONAL: the count comes from
+    // confirmed_cargo_uuids — a grant only counts once the three-file
+    // rewrite actually landed.
     assert_eq!(
         env["redirect"]["redirected"], 1,
         "exactly one dep redirected: {env}"
     );
-    assert_eq!(env["vex"]["path"], "out.vex.json", "vex block: {env}");
-    assert_eq!(env["vex"]["statements"], 1, "vex block: {env}");
-    assert_eq!(
-        env["vex"]["verified"], false,
-        "in-run hosted VEX is attested from the ledger, not hash-verified: {env}"
-    );
+    match driver {
+        Driver::ScanVex => {
+            assert_eq!(env["vex"]["path"], "out.vex.json", "vex block: {env}");
+            assert_eq!(env["vex"]["statements"], 1, "vex block: {env}");
+            assert_eq!(
+                env["vex"]["verified"], false,
+                "in-run hosted VEX is attested from the ledger, not hash-verified: {env}"
+            );
+        }
+        Driver::GetUuid => {
+            // Get's base envelope wraps the nested redirect block: found
+            // counts the resolved patch; downloaded/applied are ABSENT
+            // (nothing lands in .socket/) and get has no --vex.
+            assert_eq!(env["found"], 1, "get envelope: {env}");
+            assert!(env["vex"].is_null(), "get has no --vex: {env}");
+            assert!(
+                env["downloaded"].is_null() && env["applied"].is_null(),
+                "hosted get must not report downloaded/applied — nothing \
+                 is persisted under .socket/ but the ledger: {env}"
+            );
+        }
+    }
 
     // The three-file rewrite (the cargo contract row).
     let reg = format!("socket-patch-{UUID}");
@@ -527,6 +588,18 @@ async fn redirect_scanned_project(tag: &str, tamper_served_crate: bool) -> Optio
         ledger.contains("\"records\"") && ledger.contains(GHSA),
         "redirect ledger must embed the patch record + vulnerability: {ledger}"
     );
+
+    if driver == Driver::GetUuid {
+        // Parity with scan --mode hosted: the ledger IS the persistence.
+        assert!(
+            !proj.join(".socket/manifest.json").exists(),
+            "get --mode hosted must NOT write the manifest"
+        );
+        assert!(
+            !proj.join(".socket/blobs").exists(),
+            "get --mode hosted must NOT persist blobs"
+        );
+    }
 
     Some(RedirectFixture {
         tmp,
@@ -564,7 +637,7 @@ fn fresh_checkout_cargo_fetch(fx: &RedirectFixture) -> (PathBuf, PathBuf, Output
 // wiremock keeps serving the API + index + download routes on the others.
 #[tokio::test(flavor = "multi_thread")]
 async fn cargo_hosted_fresh_checkout_fetch_pulls_patched_crate_and_vex_verifies() {
-    let Some(fx) = redirect_scanned_project("main", false).await else {
+    let Some(fx) = redirect_scanned_project("main", false, Driver::ScanVex).await else {
         return;
     };
 
@@ -656,6 +729,38 @@ async fn cargo_hosted_fresh_checkout_fetch_pulls_patched_crate_and_vex_verifies(
     );
 }
 
+/// get-driven twin (v3.6): `get <uuid> --mode hosted --json --yes` must land
+/// the SAME three-file rewrite + ledger as the scan capstone (asserted
+/// inside the shared fixture — parity by construction through
+/// run_redirect_selected, redirected count via the transactional
+/// confirmed_cargo_uuids), with NO manifest and NO blobs. Then the
+/// fresh-checkout proof: `cargo fetch --locked` against an EMPTY CARGO_HOME
+/// pulls the patched `.crate` from the hosted sparse registry,
+/// byte-identical to the served tarball.
+#[tokio::test(flavor = "multi_thread")]
+async fn cargo_get_uuid_hosted_fresh_checkout_fetch() {
+    let Some(fx) = redirect_scanned_project("get-uuid", false, Driver::GetUuid).await else {
+        return;
+    };
+
+    let (_fresh, fresh_home, fetch) = fresh_checkout_cargo_fetch(&fx);
+    assert!(
+        fetch.status.success(),
+        "fresh-checkout `cargo fetch --locked` after `get --mode hosted` must succeed from the \
+         hosted registry.\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&fetch.stdout),
+        String::from_utf8_lossy(&fetch.stderr),
+    );
+    let leaf = format!("{DEP}-{}", fx.version);
+    let cached = find_cached_crate(&fresh_home, &format!("{leaf}.crate"))
+        .expect("fetch must land the .crate in <CARGO_HOME>/registry/cache");
+    assert_eq!(
+        std::fs::read(&cached).unwrap(),
+        fx.crate_bytes,
+        "the fetched .crate must be byte-identical to the hosted patched tarball"
+    );
+}
+
 /// Negative twin: the download route serves TAMPERED bytes while the index
 /// cksum + the committed Cargo.lock checksum pin the REAL `.crate`'s sha256
 /// — the fresh `cargo fetch --locked` must refuse. This is what makes the
@@ -663,7 +768,7 @@ async fn cargo_hosted_fresh_checkout_fetch_pulls_patched_crate_and_vex_verifies(
 /// cannot slip past the pin.
 #[tokio::test(flavor = "multi_thread")]
 async fn cargo_hosted_tampered_crate_fails_fresh_fetch() {
-    let Some(fx) = redirect_scanned_project("tampered", true).await else {
+    let Some(fx) = redirect_scanned_project("tampered", true, Driver::ScanVex).await else {
         return;
     };
 

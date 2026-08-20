@@ -23,6 +23,11 @@
 //! The negative twin serves TAMPERED tarball bytes while the lock keeps the
 //! real sha512: the fresh frozen install MUST fail with an integrity error.
 //!
+//! The get-driven twin (v3.6) runs step 3 as `get <uuid> --mode hosted`
+//! instead of `scan --mode hosted` — same hosted engine by construction
+//! (get routes through scan's `run_redirect_selected`), so the lock/ledger
+//! assertions and the fresh-checkout proof are shared via [`HostedDriver`].
+//!
 //! `bun.lockb` (bun's legacy binary lockfile) auto-migration is NOT exercised
 //! here: bun 1.3.x writes the text `bun.lock` by default and offers no flag to
 //! emit the binary form, so a real lockb fixture cannot be generated on this
@@ -128,10 +133,32 @@ struct BunRedirectFixture {
     _server: MockServer,
 }
 
-/// Steps 1–3: real install, patched tarball + API mocks, `scan --mode hosted
-/// --vex`, and the envelope/lockfile/ledger assertions. `tamper_served_tarball`
-/// serves DIFFERENT bytes than the sha512 pinned into the lock. `None` = skip.
-async fn bun_hosted_project(tag: &str, tamper_served_tarball: bool) -> Option<BunRedirectFixture> {
+/// Which socket-patch invocation drives the hosted rewrite (step 3). Both
+/// route through the same hosted engine (`get --mode hosted` hands its
+/// selected (purl, uuid) pair to scan's `run_redirect_selected`), so every
+/// lockfile/ledger assertion below is shared; only the argv and the outer
+/// envelope shape differ.
+#[derive(Clone, Copy, PartialEq)]
+enum HostedDriver {
+    /// `scan --mode hosted --vex …` — the original capstone path, in-run
+    /// VEX assertions included.
+    ScanVex,
+    /// `get <uuid> --mode hosted` — the v3.6 per-advisory selector. The
+    /// UUID identifier path is exempt from installed narrowing, so the
+    /// fixture's view + reference mocks are all it needs. No manifest, no
+    /// blobs, no vex flags (get has none).
+    GetUuid,
+}
+
+/// Steps 1–3: real install, patched tarball + API mocks, the `driver`'s
+/// hosted invocation, and the envelope/lockfile/ledger assertions.
+/// `tamper_served_tarball` serves DIFFERENT bytes than the sha512 pinned
+/// into the lock. `None` = skip.
+async fn bun_hosted_project(
+    tag: &str,
+    tamper_served_tarball: bool,
+    driver: HostedDriver,
+) -> Option<BunRedirectFixture> {
     if !has_command("bun") {
         println!("SKIP e2e_redirect_bun_build ({tag}): `bun` not installed");
         return None;
@@ -287,10 +314,10 @@ async fn bun_hosted_project(tag: &str, tamper_served_tarball: bool) -> Option<Bu
         .mount(&server)
         .await;
 
-    // scan --mode hosted --vex.
-    let (code, stdout, stderr) = run_socket(
-        &proj,
-        &[
+    // Step 3, per driver: scan --mode hosted --vex | get <uuid> --mode hosted.
+    let server_uri = server.uri();
+    let argv: Vec<&str> = match driver {
+        HostedDriver::ScanVex => vec![
             "scan",
             "--mode",
             "hosted",
@@ -299,7 +326,7 @@ async fn bun_hosted_project(tag: &str, tamper_served_tarball: bool) -> Option<Bu
             "--cwd",
             proj.to_str().unwrap(),
             "--api-url",
-            &server.uri(),
+            &server_uri,
             "--org",
             ORG,
             "--api-token",
@@ -309,52 +336,110 @@ async fn bun_hosted_project(tag: &str, tamper_served_tarball: bool) -> Option<Bu
             "--vex-product",
             PRODUCT,
         ],
-    );
+        HostedDriver::GetUuid => vec![
+            "get",
+            UUID,
+            "--mode",
+            "hosted",
+            "--json",
+            "--yes",
+            "--cwd",
+            proj.to_str().unwrap(),
+            "--api-url",
+            &server_uri,
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+        ],
+    };
+    let (code, stdout, stderr) = run_socket(&proj, &argv);
     assert_eq!(
         code, 0,
-        "scan --mode hosted failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        "{} --mode hosted failed.\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        argv[0]
     );
     let env: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
-        panic!("scan --mode hosted --json output is not JSON: {e}\nstdout:\n{stdout}")
+        panic!(
+            "{} --mode hosted --json output is not JSON: {e}\nstdout:\n{stdout}",
+            argv[0]
+        )
     });
     assert_eq!(env["status"], "success", "envelope: {env}");
     assert_eq!(
         env["redirect"]["redirected"], 1,
         "one dep redirected: {env}"
     );
-    // In-run VEX (step 3 of the module doc): the envelope's vex block plus the
-    // document's unverified `(redirected)` attestation. Without these, a scan
-    // that silently skips the VEX write (or emits the wrong statement) stays
-    // green — the exit code only catches a HARD vex failure.
-    assert_eq!(env["vex"]["path"], "out.vex.json", "vex block: {env}");
-    assert_eq!(env["vex"]["statements"], 1, "vex block: {env}");
-    assert_eq!(env["vex"]["format"], "openvex-0.2.0", "vex block: {env}");
-    assert_eq!(
-        env["vex"]["verified"], false,
-        "in-run redirect VEX is attested from the ledger, not hash-verified: {env}"
-    );
-    let vex_doc: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(proj.join("out.vex.json")).unwrap()).unwrap();
-    let stmts = vex_doc["statements"].as_array().unwrap();
-    assert_eq!(
-        stmts.len(),
-        1,
-        "exactly the redirected patch attested: {vex_doc}"
-    );
-    assert_eq!(
-        stmts[0]["vulnerability"]["name"], GHSA,
-        "vex doc: {vex_doc}"
-    );
-    assert_eq!(stmts[0]["status"], "not_affected", "vex doc: {vex_doc}");
-    assert_eq!(
-        stmts[0]["products"][0]["subcomponents"][0]["@id"], PURL,
-        "vex doc: {vex_doc}"
-    );
-    assert_eq!(
-        stmts[0]["impact_statement"].as_str().unwrap(),
-        format!("Patched via Socket patch {UUID} (redirected)"),
-        "the in-run attestation must carry the (redirected) marker: {vex_doc}"
-    );
+    match driver {
+        HostedDriver::ScanVex => {
+            // In-run VEX (step 3 of the module doc): the envelope's vex block
+            // plus the document's unverified `(redirected)` attestation.
+            // Without these, a scan that silently skips the VEX write (or
+            // emits the wrong statement) stays green — the exit code only
+            // catches a HARD vex failure.
+            assert_eq!(env["vex"]["path"], "out.vex.json", "vex block: {env}");
+            assert_eq!(env["vex"]["statements"], 1, "vex block: {env}");
+            assert_eq!(env["vex"]["format"], "openvex-0.2.0", "vex block: {env}");
+            assert_eq!(
+                env["vex"]["verified"], false,
+                "in-run redirect VEX is attested from the ledger, not hash-verified: {env}"
+            );
+            let vex_doc: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(proj.join("out.vex.json")).unwrap()).unwrap();
+            let stmts = vex_doc["statements"].as_array().unwrap();
+            assert_eq!(
+                stmts.len(),
+                1,
+                "exactly the redirected patch attested: {vex_doc}"
+            );
+            assert_eq!(
+                stmts[0]["vulnerability"]["name"], GHSA,
+                "vex doc: {vex_doc}"
+            );
+            assert_eq!(stmts[0]["status"], "not_affected", "vex doc: {vex_doc}");
+            assert_eq!(
+                stmts[0]["products"][0]["subcomponents"][0]["@id"], PURL,
+                "vex doc: {vex_doc}"
+            );
+            assert_eq!(
+                stmts[0]["impact_statement"].as_str().unwrap(),
+                format!("Patched via Socket patch {UUID} (redirected)"),
+                "the in-run attestation must carry the (redirected) marker: {vex_doc}"
+            );
+        }
+        HostedDriver::GetUuid => {
+            // get's envelope nests the same redirect block into its own base
+            // shape; nothing is downloaded into `.socket/` (the ledger IS the
+            // persistence — parity with `scan --mode hosted`).
+            assert_eq!(env["redirect"]["mode"], "hosted", "envelope: {env}");
+            assert_eq!(env["found"], 1, "get keeps its found count: {env}");
+            assert!(
+                env.get("downloaded").is_none() && env.get("applied").is_none(),
+                "hosted get downloads/applies nothing — those keys must be absent: {env}"
+            );
+            assert!(
+                !proj.join(".socket/manifest.json").exists(),
+                "get --mode hosted must NOT write the manifest"
+            );
+            assert!(
+                !proj.join(".socket/blobs").exists(),
+                "get --mode hosted must NOT persist blobs"
+            );
+            // Anti-vacuity oracle: the grant really came from the reference
+            // endpoint (exactly one resolve for the one selected uuid).
+            let reference_hits = server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .filter(|r| r.url.path().ends_with("/patches/package"))
+                .count();
+            assert_eq!(
+                reference_hits, 1,
+                "get --mode hosted must resolve exactly one reference grant"
+            );
+        }
+    }
 
     // Lockfile pin: the hosted URL (as the tuple spec) + the patched sha512.
     let lock = std::fs::read_to_string(proj.join("bun.lock")).unwrap();
@@ -402,7 +487,7 @@ fn fresh_checkout_bun_install(fx: &BunRedirectFixture) -> (PathBuf, Output) {
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial]
 async fn bun_redirect_fresh_checkout_installs_patched_bytes() {
-    let Some(fx) = bun_hosted_project("main", false).await else {
+    let Some(fx) = bun_hosted_project("main", false, HostedDriver::ScanVex).await else {
         return;
     };
 
@@ -426,12 +511,44 @@ async fn bun_redirect_fresh_checkout_installs_patched_bytes() {
     );
 }
 
+/// get-driven twin (v3.6): `get <uuid> --mode hosted` must land the SAME
+/// hosted rewrite as the scan capstone — same engine by construction — and a
+/// fresh checkout carrying only package.json + bun.lock + .socket/ must
+/// install the patched bytes from the hosted tarball. The fixture's GetUuid
+/// arm already proved the no-manifest/no-blobs posture and the ledger write.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial]
+async fn bun_get_uuid_hosted_fresh_checkout_installs() {
+    let Some(fx) = bun_hosted_project("get-uuid", false, HostedDriver::GetUuid).await else {
+        return;
+    };
+
+    let (fresh, ci) = fresh_checkout_bun_install(&fx);
+    assert!(
+        ci.status.success(),
+        "fresh-checkout `bun install --frozen-lockfile` must succeed from the hosted patch \
+         tarball after `get --mode hosted`.\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&ci.stdout),
+        String::from_utf8_lossy(&ci.stderr),
+    );
+    let installed = std::fs::read(fresh.join("node_modules").join(DEP).join("index.js")).unwrap();
+    assert!(
+        installed.starts_with(MARKER.as_bytes()),
+        "bun must install the PATCHED bytes from the hosted patch; got:\n{}",
+        String::from_utf8_lossy(&installed[..installed.len().min(120)])
+    );
+    assert_eq!(
+        installed, fx.patched,
+        "fresh install must be byte-identical to the patched content"
+    );
+}
+
 /// Negative twin: the hosted route serves TAMPERED bytes while the lock pins
 /// the real sha512 — the fresh frozen install must refuse.
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial]
 async fn bun_redirect_tampered_hosted_tarball_fails_frozen_install() {
-    let Some(fx) = bun_hosted_project("tampered", true).await else {
+    let Some(fx) = bun_hosted_project("tampered", true, HostedDriver::ScanVex).await else {
         return;
     };
 
