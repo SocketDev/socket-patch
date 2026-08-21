@@ -1,0 +1,143 @@
+name: Publish RubyGems
+run-name: "Publish RubyGems ${{ inputs.version }}${{ inputs.distinct-id != '' && format(' [{0}]', inputs.distinct-id) || '' }}"
+
+# Publishes BOTH gems via one OIDC trusted-publishing exchange:
+#   - gem/socket-patch          — the CLI launcher gem (downloads the
+#     prebuilt binary from the GitHub release at its own version, so this
+#     workflow only needs the GitHub release + SHA256SUMS to exist).
+#   - gem/socket-patch-bundler  — Phase 2 scaffolding, non-blocking (see the
+#     step comment below).
+#
+# Dispatched two ways, both as a plain workflow_dispatch run:
+#   - by release.yml (scripts/dispatch-publish.sh), as one leg of the
+#     single-dispatch release fan-out — distinct-id carries the release
+#     run's correlation id into this run's name;
+#   - manually (Actions → Publish RubyGems → Run workflow), to retry just
+#     this registry after a mid-release failure: fix the cause, enter the
+#     release version, leave distinct-id blank.
+# Every run checks out refs/tags/v<version>, so a manual retry publishes
+# exactly what the release run would have.
+#
+# Idempotent: already-published versions are probed and skipped, so re-runs
+# and partial-failure retries are safe.
+#
+# OIDC trusted publishing: the RubyGems trusted publisher on each gem is
+# keyed on this repo + THIS file's name (publish-rubygems.yml) + environment
+# `rubygems`. Because this workflow only ever runs as its own top-level
+# workflow_dispatch run (never as a called reusable workflow), the OIDC
+# token's workflow_ref and job_workflow_ref claims both name this file — one
+# publisher registration per gem covers every path, and one exchange
+# satisfies both gems' publishers.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (X.Y.Z; the v<version> GitHub release must exist — the launcher gem downloads its binary from it)'
+        required: true
+        type: string
+      distinct-id:
+        description: 'Correlation id set by release.yml to track its dispatched run — leave blank for manual runs'
+        required: false
+        default: ''
+        type: string
+
+permissions: {}
+
+jobs:
+  rubygems-publish:
+    runs-on: ubuntu-latest
+    # OIDC trusted publishing scoped to a deployment environment; also lets a
+    # maintainer gate publishing with required reviewers. Auto-created with no
+    # protection rules until configured.
+    environment: rubygems
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Validate version input
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if ! printf '%s' "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::'${VERSION}' is not a plain X.Y.Z release version"
+            exit 1
+          fi
+
+      - name: Checkout release tag
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: refs/tags/v${{ inputs.version }}
+          persist-credentials: false
+
+      # Ruby is pre-installed on ubuntu-latest; no setup action needed.
+      - name: Lint + version-check the launcher gem
+        working-directory: gem/socket-patch
+        env:
+          EXPECTED_VERSION: ${{ inputs.version }}
+        run: |
+          ruby -c lib/socket_patch/launcher.rb
+          ruby -c exe/socket-patch
+          # The gemspec version is baked at the tag by scripts/version-sync.sh.
+          gemver="$(ruby -e 'print Gem::Specification.load("socket-patch.gemspec").version')"
+          if [ "$gemver" != "$EXPECTED_VERSION" ]; then
+            echo "::error::gemspec version $gemver != release $EXPECTED_VERSION (run scripts/version-sync.sh before tagging)"
+            exit 1
+          fi
+
+      - name: Lint + version-check the bundler-plugin gem
+        working-directory: gem/socket-patch-bundler
+        env:
+          EXPECTED_VERSION: ${{ inputs.version }}
+        run: |
+          ruby -c plugins.rb
+          # The gemspec version is baked at the tag by scripts/version-sync.sh.
+          gemver="$(ruby -e 'print Gem::Specification.load("socket-patch-bundler.gemspec").version')"
+          if [ "$gemver" != "$EXPECTED_VERSION" ]; then
+            echo "::error::gemspec version $gemver != release $EXPECTED_VERSION (run scripts/version-sync.sh before tagging)"
+            exit 1
+          fi
+
+      - name: Configure RubyGems credentials (OIDC trusted publishing)
+        # One OIDC exchange covers both gems: a trusted publisher keyed on
+        # this repo + workflow (+ the `rubygems` environment) can be
+        # registered on multiple gems on rubygems.org, and the exchanged
+        # token pushes any gem whose publisher matches.
+        uses: rubygems/configure-rubygems-credentials@dc5a8d8553e6ee01fc26761a49e99e733d17954a # v2.1.0
+
+      - name: Publish socket-patch to RubyGems
+        working-directory: gem/socket-patch
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          gem build socket-patch.gemspec
+          # `gem list -r -e -a` prints `socket-patch (3.3.0, 3.2.0, ...)`; match
+          # this version as a precise list element (preceded by `(`/space,
+          # followed by `,`/`)`).
+          if gem list --remote --exact --all socket-patch 2>/dev/null | grep -qE "[ (]${VERSION}[,)]"; then
+            echo "socket-patch ${VERSION} already on RubyGems; skipping."
+            exit 0
+          fi
+          gem push "socket-patch-${VERSION}.gem"
+
+      # Phase 2 scaffolding (CLI_CONTRACT "gem" support matrix): publish the
+      # `socket-patch-bundler` gem — the published form of the Bundler plugin
+      # that `socket-patch setup` currently wires via an in-tree `git:`
+      # reference. This gem is NOT yet the active mechanism (setup::gem still
+      # emits the in-tree plugin), so the push is **non-blocking**
+      # (`continue-on-error`). A follow-up switches the generated Gemfile
+      # directive to `plugin "socket-patch-bundler"` and drops
+      # continue-on-error.
+      - name: Publish socket-patch-bundler to RubyGems
+        continue-on-error: true
+        working-directory: gem/socket-patch-bundler
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          gem build socket-patch-bundler.gemspec
+          # Same precise-list-element match as the launcher gem above.
+          if gem list --remote --exact --all socket-patch-bundler 2>/dev/null | grep -qE "[ (]${VERSION}[,)]"; then
+            echo "socket-patch-bundler ${VERSION} already on RubyGems; skipping."
+            exit 0
+          fi
+          gem push "socket-patch-bundler-${VERSION}.gem"

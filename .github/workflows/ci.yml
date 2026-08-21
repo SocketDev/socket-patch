@@ -159,7 +159,7 @@ jobs:
           done
 
       - name: Shell — shellcheck the release scripts
-        run: shellcheck scripts/version-sync.sh scripts/bump-version.sh scripts/release-lint.sh
+        run: shellcheck scripts/version-sync.sh scripts/bump-version.sh scripts/release-lint.sh scripts/dispatch-publish.sh
 
   # Release-readiness gate (scripts/release-lint.sh — the same checks the
   # Release workflow's `version` job runs before publishing anything):

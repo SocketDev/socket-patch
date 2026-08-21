@@ -1,0 +1,129 @@
+name: Publish PyPI
+run-name: "Publish PyPI ${{ inputs.version }}${{ inputs.distinct-id != '' && format(' [{0}]', inputs.distinct-id) || '' }}"
+
+# Publishes socket-patch (platform wheels) + socket-patch-hook (pure-python
+# .pth carrier) to PyPI for an existing v<version> release. Dispatched two
+# ways, both as a plain workflow_dispatch run:
+#   - by release.yml (scripts/dispatch-publish.sh), as one leg of the
+#     single-dispatch release fan-out — distinct-id carries the release
+#     run's correlation id into this run's name;
+#   - manually (Actions → Publish PyPI → Run workflow), to retry just this
+#     registry after a mid-release failure: fix the cause, enter the release
+#     version, leave distinct-id blank.
+# Every run checks out refs/tags/v<version> and takes the prebuilt binaries
+# from the GitHub release's assets (verified against SHA256SUMS), so a
+# manual retry publishes exactly what the release run would have — no
+# rebuild needed. The GitHub release must already exist with all assets.
+#
+# Idempotent: uploads run with skip-existing, so re-runs and retries after a
+# partial upload are safe.
+#
+# OIDC trusted publishing: each project's PyPI trusted publisher is keyed on
+# this repo + THIS file's name (publish-pypi.yml) + environment `pypi`.
+# Because this workflow only ever runs as its own top-level
+# workflow_dispatch run (never as a called reusable workflow), the OIDC
+# token's workflow_ref and job_workflow_ref claims both name this file — so
+# the one registration per project keeps working when PyPI flips its
+# matching from job_workflow_ref to workflow_ref (warehouse PR #20083).
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (X.Y.Z; the v<version> GitHub release must exist with binaries + SHA256SUMS)'
+        required: true
+        type: string
+      distinct-id:
+        description: 'Correlation id set by release.yml to track its dispatched run — leave blank for manual runs'
+        required: false
+        default: ''
+        type: string
+
+permissions: {}
+
+jobs:
+  pypi-publish:
+    runs-on: ubuntu-latest
+    # OIDC trusted publishing scoped to a deployment environment; also lets a
+    # maintainer gate publishing with required reviewers. Auto-created with no
+    # protection rules until configured.
+    environment: pypi
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Validate version input
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if ! printf '%s' "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::'${VERSION}' is not a plain X.Y.Z release version"
+            exit 1
+          fi
+
+      - name: Checkout release tag
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: refs/tags/v${{ inputs.version }}
+          persist-credentials: false
+
+      - name: Verify tag carries the requested version
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          CARGO_VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          if [ "$CARGO_VERSION" != "$VERSION" ]; then
+            echo "::error::tag v${VERSION} carries workspace version ${CARGO_VERSION} — refusing to publish"
+            exit 1
+          fi
+
+      - name: Download binaries from the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          mkdir artifacts
+          gh release download "v${VERSION}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir artifacts \
+            --pattern '*.tar.gz' --pattern '*.zip' --pattern 'SHA256SUMS'
+          cd artifacts
+          # -c also fails on a file that SHA256SUMS lists but the download
+          # missed, so this doubles as a completeness check: the sums file
+          # was generated from the full 14-target artifact set.
+          sha256sum -c SHA256SUMS
+
+      - name: Setup Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12.13'
+
+      - name: Copy README for PyPI package
+        run: cp README.md pypi/socket-patch/README.md
+
+      - name: Build wheels (platform socket-patch + pure-python socket-patch-hook)
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          # Builds the platform-tagged socket-patch wheels AND the pure-python
+          # socket-patch-hook wheel (the .pth carrier behind `socket-patch[hook]`).
+          python scripts/build-pypi-wheels.py --version "$VERSION" --artifacts artifacts --dist dist
+          # socket-patch and socket-patch-hook are two distinct PyPI projects.
+          # Publish each from its own dir so trusted publishing mints an OIDC
+          # token scoped to the right project (one upload spanning both projects
+          # can be rejected). Each needs its own trusted publisher on PyPI.
+          mkdir -p dist-hook
+          mv dist/socket_patch_hook-*.whl dist-hook/
+
+      - name: Publish socket-patch to PyPI
+        uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
+        with:
+          packages-dir: dist/
+          # Idempotent for re-runs: already-uploaded files skip.
+          skip-existing: true
+
+      - name: Publish socket-patch-hook to PyPI
+        uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
+        with:
+          packages-dir: dist-hook/
+          skip-existing: true

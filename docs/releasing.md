@@ -51,7 +51,15 @@ publishing.
 The real run: re-verifies the release gate → builds the matrix → creates and
 pushes `v<version>` → creates the GitHub release with `SHA256SUMS` → fans out
 to crates.io, npm, PyPI, and RubyGems in parallel (all OIDC trusted
-publishing; no long-lived registry secrets).
+publishing; no long-lived registry secrets). Each registry leg is its own
+workflow (`publish-cargo.yml`, `publish-npm.yml`, `publish-pypi.yml`,
+`publish-rubygems.yml`), dispatched at the release tag by the release run
+and watched to completion, so the release run's job graph still reflects
+each registry's outcome (its step summaries link the four leg runs) — and
+each leg can equally be dispatched by hand (see "If a job fails
+mid-release"). The `release.yml` header records why the legs are dispatched
+runs rather than reusable workflows (registry trusted-publisher filename
+matching; npm allows one publisher per package).
 
 ## 4. Approve npm (the one manual step)
 
@@ -85,19 +93,63 @@ curl -fsSL https://install.socket.dev/patch | sh && socket-patch --version
 
 ## If a job fails mid-release
 
-Fix the cause and use **"Re-run failed jobs"** on the same run. Every job is
-idempotent: the tag re-push is a no-op, the GitHub release re-uploads with
-`--clobber`, and each registry job probes for an already-published version
-and skips it. A partial release never requires deleting tags or re-bumping.
+Two ways back, both safe — every job is idempotent: the tag re-push is a
+no-op, the GitHub release re-uploads with `--clobber`, and each registry job
+probes for an already-published (or already-staged) version and skips it. A
+partial release never requires deleting tags or re-bumping.
+
+1. **"Re-run failed jobs"** on the release run — right when the failure was
+   transient (network, registry hiccup) and no workflow change is needed.
+   Re-running a failed fan-out job dispatches a fresh run of that registry's
+   publish workflow *as of the tag* (a re-run never picks up workflow edits).
+2. **Dispatch the failed registry's own workflow** — right when the fix
+   needed a change (registry-side config such as a trusted publisher, or a
+   workflow edit landed on the default branch): Actions → **Publish
+   crates.io** / **Publish npm** / **Publish PyPI** / **Publish RubyGems** →
+   Run workflow, entering the release version (`X.Y.Z`, no `v`) and leaving
+   `distinct-id` blank. This runs the publish workflow as it exists on the
+   dispatched branch (default: the default branch), so workflow fixes apply.
+   Nothing rebuilds: each publish workflow checks out the `v<version>` tag
+   and (npm/PyPI) takes the prebuilt binaries from the GitHub release's
+   assets, verified against `SHA256SUMS` — the same inputs the release run
+   would have published. The GitHub release must exist with all assets, so
+   failures in `build`, `tag`, or `github-release` itself are still fixed
+   via the release run.
 
 ## One-time registry setup
 
 Deployment environments (`pypi`, `rubygems`) and each registry's trusted
-publisher (repo `SocketDev/socket-patch` + workflow `release.yml`, plus the
-environment where one is named above) are listed in the checklist of
+publisher are listed in the checklist of
 [PR #138](https://github.com/SocketDev/socket-patch/pull/138). All four
 registry channels authenticate via OIDC trusted publishing, so a missing or
 misconfigured trusted publisher (or environment) **fails that channel's
 job** — configure it before dispatching a real release. The one
 non-blocking push is the `socket-patch-bundler` gem (`continue-on-error`
 Phase-2 scaffolding).
+
+Since the publish legs moved into their own workflow files, each trusted
+publisher is registered against repo `SocketDev/socket-patch` + **the
+publish workflow's filename** (not `release.yml`). The legs only ever run
+as top-level `workflow_dispatch` runs of their own file — whether the
+release run dispatched them or a maintainer did — so the OIDC token's
+`workflow_ref` and `job_workflow_ref` claims both name that file, and one
+registration per package satisfies every registry's matching rule (npm and
+crates.io match the top-level workflow; PyPI and RubyGems match the
+job-defining workflow).
+
+| Registry | Publisher workflow | Environment |
+|----------|--------------------|-------------|
+| crates.io (`socket-patch-core`, `socket-patch-cli`) | `publish-cargo.yml` | — |
+| npm (main + 14 platform packages) | `publish-npm.yml` | — |
+| PyPI (`socket-patch`, `socket-patch-hook`) | `publish-pypi.yml` | `pypi` |
+| RubyGems (`socket-patch`, `socket-patch-bundler`) | `publish-rubygems.yml` | `rubygems` |
+
+**Migration from the `release.yml` publishers:** crates.io (up to 5 configs
+per crate), PyPI, and RubyGems (both: multiple publishers per package) can
+carry the old `release.yml` publisher alongside the new one until every
+release run predating this split — whose re-run legs still authenticate as
+`release.yml` — has fully landed; then delete the `release.yml` publishers.
+npm allows only **one** trusted publisher per package, so its cutover is
+atomic: edit each package's publisher from `release.yml` to
+`publish-npm.yml` once no pre-split npm job may need re-running (approving
+already-staged versions needs no OIDC, only re-staging does).
