@@ -76,10 +76,22 @@ fi
 # --exit-status: this job fails iff the dispatched run fails, so the release
 # run's job graph reflects each registry's real outcome and "Re-run failed
 # jobs" re-dispatches exactly the failed legs. A re-dispatched duplicate is
-# safe: each publish workflow serializes same-version runs with a
-# concurrency group, so it queues behind any still-live leg and then no-ops
-# on the already-published probes.
+# safe for the registry: each publish workflow serializes same-version runs
+# with a concurrency group, so it waits behind any still-live leg and then
+# no-ops on the already-published probes. Caveat: the group holds at most
+# ONE waiting run — yet another same-version dispatch displaces (cancels)
+# the waiting duplicate, which this watch reports as a failure even though
+# the surviving runs publish fine; the cancelled-conclusion diagnostic
+# below calls that out.
 # NOTE: a re-dispatch from the release run executes the leg's workflow file
 # as of the TAG; a fix to a publish workflow on the default branch is picked
 # up by dispatching that workflow manually instead (docs/releasing.md).
-gh run watch "$RUN_ID" --repo "$GITHUB_REPOSITORY" --exit-status --interval 15
+if ! gh run watch "$RUN_ID" --repo "$GITHUB_REPOSITORY" --exit-status --interval 15; then
+  CONCLUSION="$(gh run view "$RUN_ID" --repo "$GITHUB_REPOSITORY" --json conclusion --jq .conclusion || true)"
+  if [ "$CONCLUSION" = "cancelled" ]; then
+    echo "::error::${WORKFLOW} run for v${VERSION} was cancelled — if it was a waiting duplicate, a newer same-version dispatch displaced it and the newest run carries the publish (check the Actions tab before retrying): ${RUN_URL}"
+  else
+    echo "::error::${WORKFLOW} run for v${VERSION} failed (conclusion: ${CONCLUSION:-unknown}): ${RUN_URL}"
+  fi
+  exit 1
+fi

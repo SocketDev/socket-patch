@@ -42,13 +42,16 @@ on:
         default: ''
         type: string
 
-# Serialize same-version runs (queued, not cancelled): the already-published
-# probes below are check-then-act, so two CONCURRENT runs for one version
-# could both pass a probe and the loser would hard-fail on the registry
-# ("Repushing of gem versions is not allowed"). Serialized, a duplicate
-# (e.g. re-dispatched by a release-run watcher whose `gh run watch` timed
-# out while this run was still going) queues behind the live run and then
-# no-ops.
+# Serialize same-version runs: the already-published probes below are
+# check-then-act, so two CONCURRENT runs for one version could both pass a
+# probe and the loser would hard-fail on the registry ("Repushing of gem
+# versions is not allowed"). Serialized, a duplicate (e.g. re-dispatched by
+# a release-run watcher whose `gh run watch` timed out while this run was
+# still going) waits behind the live run and then no-ops. NOTE: the group
+# holds at most ONE waiting run — a further same-version dispatch displaces
+# (cancels) the waiting duplicate, and a watcher following the displaced
+# run reports that as a failure; the publish itself is unaffected (the
+# surviving runs no-op or publish).
 concurrency:
   group: publish-rubygems-${{ inputs.version }}
 
@@ -57,12 +60,18 @@ permissions: {}
 jobs:
   rubygems-publish:
     runs-on: ubuntu-latest
+    # Bounds how long a wedged run (hung registry call) can hold this
+    # workflow's per-version concurrency group before retries can proceed.
+    # (A pending environment approval pauses the run BEFORE the job starts,
+    # so it does not consume this timeout.)
+    timeout-minutes: 45
     # OIDC trusted publishing scoped to a deployment environment; also lets a
     # maintainer gate publishing with required reviewers. Auto-created with no
     # protection rules until configured. NOTE: if required reviewers are ever
     # configured, a pending approval pauses THIS run while the release run's
-    # watcher counts toward its timeout-minutes — approve promptly, or re-run
-    # the timed-out watcher afterwards (this run itself is unaffected).
+    # watcher counts toward its own timeout-minutes — approve promptly. If
+    # the watcher timed out, re-running it dispatches a NEW run that needs
+    # its own approval before it can no-op; this run is unaffected either way.
     environment: rubygems
     permissions:
       contents: read

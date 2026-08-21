@@ -44,11 +44,15 @@ on:
         default: ''
         type: string
 
-# Serialize same-version runs (queued, not cancelled): the already-published/
-# already-staged probes below are check-then-act, so two CONCURRENT runs for
-# one version could race them. Serialized, a duplicate (e.g. re-dispatched by
-# a release-run watcher whose `gh run watch` timed out while this run was
-# still going) queues behind the live run and then no-ops.
+# Serialize same-version runs: the already-published/already-staged probes
+# below are check-then-act, so two CONCURRENT runs for one version could
+# race them. Serialized, a duplicate (e.g. re-dispatched by a release-run
+# watcher whose `gh run watch` timed out while this run was still going)
+# waits behind the live run and then no-ops. NOTE: the group holds at most
+# ONE waiting run — a further same-version dispatch displaces (cancels) the
+# waiting duplicate, and a watcher following the displaced run reports that
+# as a failure; the publish itself is unaffected (the surviving runs no-op
+# or publish).
 concurrency:
   group: publish-npm-${{ inputs.version }}
 
@@ -57,6 +61,9 @@ permissions: {}
 jobs:
   npm-publish:
     runs-on: ubuntu-latest
+    # Bounds how long a wedged run (hung registry call) can hold this
+    # workflow's per-version concurrency group before retries can proceed.
+    timeout-minutes: 45
     permissions:
       contents: read
       id-token: write

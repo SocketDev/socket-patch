@@ -304,7 +304,7 @@ jobs:
     needs: [version, build, tag]
     if: ${{ !inputs.dry-run }}
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     permissions:
       contents: read
       actions: write
@@ -327,7 +327,7 @@ jobs:
     needs: [version, github-release]
     if: ${{ !inputs.dry-run }}
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     permissions:
       contents: read
       actions: write
@@ -342,13 +342,20 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ needs.version.outputs.version }}
           SUMS_DIGEST: ${{ needs.github-release.outputs.sums-digest }}
-        run: bash scripts/dispatch-publish.sh publish-npm.yml "$VERSION" "sums-digest=${SUMS_DIGEST}"
+        run: |
+          # Fail closed: an empty digest would silently downgrade the leg's
+          # asset check from provenance-pinned to integrity-only.
+          if [ -z "$SUMS_DIGEST" ]; then
+            echo "::error::github-release produced no SHA256SUMS digest; refusing to dispatch an unpinned publish"
+            exit 1
+          fi
+          bash scripts/dispatch-publish.sh publish-npm.yml "$VERSION" "sums-digest=${SUMS_DIGEST}"
 
   pypi-publish:
     needs: [version, github-release]
     if: ${{ !inputs.dry-run }}
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     permissions:
       contents: read
       actions: write
@@ -363,13 +370,20 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ needs.version.outputs.version }}
           SUMS_DIGEST: ${{ needs.github-release.outputs.sums-digest }}
-        run: bash scripts/dispatch-publish.sh publish-pypi.yml "$VERSION" "sums-digest=${SUMS_DIGEST}"
+        run: |
+          # Fail closed: an empty digest would silently downgrade the leg's
+          # asset check from provenance-pinned to integrity-only.
+          if [ -z "$SUMS_DIGEST" ]; then
+            echo "::error::github-release produced no SHA256SUMS digest; refusing to dispatch an unpinned publish"
+            exit 1
+          fi
+          bash scripts/dispatch-publish.sh publish-pypi.yml "$VERSION" "sums-digest=${SUMS_DIGEST}"
 
   rubygems-publish:
     needs: [version, github-release]
     if: ${{ !inputs.dry-run }}
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     permissions:
       contents: read
       actions: write
