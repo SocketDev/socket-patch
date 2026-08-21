@@ -17,7 +17,50 @@ into the new version's section — see docs/releasing.md.
 
 ## [Unreleased]
 
-### Removed (BREAKING — lands in v4.0)
+## [4.0.0] — 2026-08-20
+
+v4.0 is the three-modes release. What began as an agent-style tool that
+patches installed packages in place now offers three deployment modes,
+selected with `scan --mode <agent|vendored|hosted>` (each mode's detailed
+entries follow below; per-ecosystem mechanics live in `docs/ecosystems.md`):
+
+- **Agent mode** (the default, and the original behavior): `apply` patches
+  installed packages in place on the current machine — `node_modules/`,
+  site-packages, the cargo registry cache, and so on — tracked in the local
+  `.socket/` manifest and re-applied after installs by the hooks `setup`
+  configures. Requires socket-patch (and Socket API access, or pre-fetched
+  blobs) on every machine that installs dependencies.
+
+- **Vendored mode** (`vendor`, or `scan --mode vendored`): ejects each
+  patched package into a committed
+  `.socket/vendor/<ecosystem>/<patch-uuid>/<artifact>` and rewires the
+  ecosystem's lockfile so the project consumes the vendored copy. After
+  committing, a fresh checkout builds with the patched dependency on
+  machines with no socket-patch installed and no Socket API access — fully
+  offline/airgap-friendly, and the strictest install flags (`npm ci`,
+  `--frozen-lockfile`, `--locked`, `--deploy`, …) verify the vendored
+  artifact like any other. A committed ledger records the verbatim original
+  lockfile fragments, so `vendor --revert` restores them byte-exactly.
+  Covered in v4.0: the whole npm family (npm, yarn classic, yarn berry
+  node-modules, pnpm, bun), pypi (uv, requirements, poetry, pdm, pipenv),
+  cargo, go, composer, gem, maven, and nuget.
+
+- **Hosted mode** (`scan --mode hosted`, new in v4.0): rewrites lockfiles /
+  registry configs so ONLY the patched dependencies resolve to
+  Socket-hosted, integrity-pinned artifacts on patch.socket.dev — no
+  artifact bytes land in the repo and no CI changes are needed. The package
+  manager's own integrity checking pins the patched bytes (tamper fails the
+  native install), and re-runs are idempotent. Covered in v4.0: the npm
+  family (package-lock/shrinkwrap, pnpm — including Rush monorepos — yarn
+  classic, yarn berry, bun), pypi (requirements, uv), cargo, composer, gem,
+  nuget, maven (fail-closed version suffixing + Trusted Checksums), and
+  golang for references carrying a `goproxy` registry override (free tier;
+  otherwise Go stays vendored — see the documented NO-GO analysis).
+
+All three modes feed VEX attestation, with a provenance marker per mode:
+plain (agent), `(vendored)`, and `(redirected)` (hosted).
+
+### Removed (BREAKING)
 
 - **The `unlock` subcommand.** Folded into `repair`, which now deletes the
   leftover `<.socket>/apply.lock` file as its final housekeeping step (skipped
@@ -40,7 +83,7 @@ into the new version's section — see docs/releasing.md.
   always empty). The `lock_held` stderr hint now advises waiting /
   `--lock-timeout` instead of pointing at the removed commands.
 
-### Changed (BREAKING — lands in v4.0)
+### Changed (BREAKING)
 
 - **`--help` command order** is now workflow-first: `scan`, `apply`, `vex`,
   `vendor`, `setup`, then `rollback`, `get`, `list`, `remove`, `repair`.

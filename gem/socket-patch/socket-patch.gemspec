@@ -10,7 +10,7 @@
 # `scripts/version-sync.sh`.
 Gem::Specification.new do |s|
   s.name        = "socket-patch"
-  s.version     = "3.3.0"
+  s.version     = "4.0.0"
   s.summary     = "CLI tool for applying security patches to dependencies."
   s.description = "Launcher gem for the socket-patch CLI: downloads the prebuilt binary for the " \
                   "host platform from the matching GitHub release, verifies its SHA-256, caches " \
