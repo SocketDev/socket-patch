@@ -38,6 +38,19 @@ on:
         required: false
         default: ''
         type: string
+      sums-digest:
+        description: 'Expected sha256 of the release''s SHA256SUMS asset — set by release.yml to pin the assets to what its build produced; leave blank for manual runs'
+        required: false
+        default: ''
+        type: string
+
+# Serialize same-version runs (queued, not cancelled): the already-published/
+# already-staged probes below are check-then-act, so two CONCURRENT runs for
+# one version could race them. Serialized, a duplicate (e.g. re-dispatched by
+# a release-run watcher whose `gh run watch` timed out while this run was
+# still going) queues behind the live run and then no-ops.
+concurrency:
+  group: publish-npm-${{ inputs.version }}
 
 permissions: {}
 
@@ -80,6 +93,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ inputs.version }}
+          SUMS_DIGEST: ${{ inputs.sums-digest }}
         run: |
           mkdir artifacts
           gh release download "v${VERSION}" \
@@ -87,6 +101,15 @@ jobs:
             --dir artifacts \
             --pattern '*.tar.gz' --pattern '*.zip' --pattern 'SHA256SUMS'
           cd artifacts
+          # Release assets are mutable (contents:write can clobber them), and
+          # SHA256SUMS is itself an asset of the same release — so when the
+          # release run dispatched us it pinned the sums file by digest,
+          # binding this publish to exactly what that run built (the same
+          # provenance the pre-split inline jobs got from same-run
+          # artifacts). Manual retries leave the pin blank: integrity-only.
+          if [ -n "$SUMS_DIGEST" ]; then
+            echo "${SUMS_DIGEST}  SHA256SUMS" | sha256sum -c -
+          fi
           # -c also fails on a file that SHA256SUMS lists but the download
           # missed, so this doubles as a completeness check: the sums file
           # was generated from the full 14-target artifact set.

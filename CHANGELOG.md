@@ -29,7 +29,9 @@ into the new version's section — see docs/releasing.md.
   standalone (Actions → the registry's publish workflow → Run workflow with
   the release version) without rebuilding: each leg checks out the
   `v<version>` tag and, where binaries are needed, takes them from the
-  GitHub release's assets verified against `SHA256SUMS`. Registry-side
+  GitHub release's assets verified against `SHA256SUMS` (release-run
+  dispatches additionally pin the sums file by digest, and same-version leg
+  runs serialize through a concurrency group). Registry-side
   trusted publishers must be re-registered against the new workflow
   filenames (the legs always run as top-level `workflow_dispatch` runs, so
   every registry's filename matching sees the leg's own file) — see

@@ -35,6 +35,15 @@ on:
         default: ''
         type: string
 
+# Serialize same-version runs (queued, not cancelled): the already-published
+# probes below are check-then-act, so two CONCURRENT runs for one version
+# could both pass a probe and the loser would hard-fail on the registry.
+# Serialized, a duplicate (e.g. re-dispatched by a release-run watcher whose
+# `gh run watch` timed out while this run was still going) queues behind the
+# live run and then no-ops.
+concurrency:
+  group: publish-cargo-${{ inputs.version }}
+
 permissions: {}
 
 jobs:

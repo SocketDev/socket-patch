@@ -63,10 +63,11 @@ matching; npm allows one publisher per package).
 
 ## 4. Approve npm (the one manual step)
 
-The npm job *stages* rather than publishes. Approve with 2FA — **platform
+The npm leg *stages* rather than publishes. Approve with 2FA — **platform
 packages first, then `@socketsecurity/socket-patch`** — so
 optionalDependencies resolution never sees the main package without its
-binaries. Approve from the run's step summary links, the
+binaries. Approve from the **Publish npm** run's step summary links (the
+release run's `npm-publish` job summary links to that run), the
 [org staged-packages dashboard](https://www.npmjs.com/settings/socketsecurity/staged-packages),
 or the CLI (`npm stage list` / `npm stage approve <stage-id>`, npm 11.15+).
 
@@ -107,7 +108,7 @@ partial release never requires deleting tags or re-bumping.
    workflow edit landed on the default branch): Actions → **Publish
    crates.io** / **Publish npm** / **Publish PyPI** / **Publish RubyGems** →
    Run workflow, entering the release version (`X.Y.Z`, no `v`) and leaving
-   `distinct-id` blank. This runs the publish workflow as it exists on the
+   the other inputs blank. This runs the publish workflow as it exists on the
    dispatched branch (default: the default branch), so workflow fixes apply.
    Nothing rebuilds: each publish workflow checks out the `v<version>` tag
    and (npm/PyPI) takes the prebuilt binaries from the GitHub release's

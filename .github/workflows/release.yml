@@ -10,9 +10,11 @@ name: Release
 # "Re-run failed jobs" re-dispatches exactly the failed legs. A failed leg
 # can also be retried without this run at all: fix the cause and dispatch
 # that registry's workflow manually with the release version — no rebuild
-# happens either way, because the publish legs take the prebuilt binaries
-# from the GitHub release's assets (verified against SHA256SUMS), which is
-# why npm/PyPI/RubyGems wait on `github-release` below.
+# happens either way. The npm and PyPI legs take the prebuilt binaries from
+# the GitHub release's assets (verified against SHA256SUMS, pinned by digest
+# on the fan-out path), and the launcher gem downloads its binary from the
+# release at run time — which is why npm/PyPI/RubyGems wait on
+# `github-release` below.
 #
 # Why dispatch instead of `uses:` (reusable workflows) — two GitHub/registry
 # facts, verified 2026-08-21 against the registries' docs and source:
@@ -217,9 +219,10 @@ jobs:
         # Intentionally persists credentials: the tag push below authenticates
         # with this workflow's GITHUB_TOKEN. Note that tags (and releases)
         # created with GITHUB_TOKEN do NOT trigger other workflows — GitHub
-        # suppresses events caused by that token — which is exactly why every
-        # publish job lives in THIS file instead of hanging off a
-        # `push: tags:` or `release: published` trigger elsewhere.
+        # suppresses events caused by that token — which is why the publish
+        # legs hang off explicit workflow_dispatch fan-out (the documented
+        # suppression exception; see this file's header) rather than a
+        # `push: tags:` or `release: published` trigger.
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Create and push tag
@@ -238,6 +241,14 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    outputs:
+      # sha256 of the SHA256SUMS file uploaded below. The npm/PyPI fan-out
+      # passes it to those legs, which re-download the assets from the
+      # release: pinning the sums file by digest binds what the legs publish
+      # to exactly what THIS run built, restoring the same-run-artifact
+      # provenance the pre-split inline jobs had (release assets are mutable;
+      # anyone with contents:write could clobber them between jobs).
+      sums-digest: ${{ steps.sums.outputs.digest }}
     steps:
       - name: Download all artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -246,12 +257,14 @@ jobs:
           merge-multiple: true
 
       - name: Generate SHA256SUMS
+        id: sums
         run: |
           cd artifacts
           # Hash every release artifact (tar.gz + zip) so install.sh can verify
           # the binary before extraction. Sorted output keeps the file stable.
           sha256sum -- *.tar.gz *.zip 2>/dev/null | sort > SHA256SUMS
           cat SHA256SUMS
+          echo "digest=$(sha256sum SHA256SUMS | awk '{print $1}')" >> "$GITHUB_OUTPUT"
 
       - name: Create or update GitHub Release
         env:
@@ -280,7 +293,12 @@ jobs:
   # failing iff that run fails — see this file's header for why the legs run
   # as separate workflow_dispatch runs. The step summary links each leg's
   # run. timeout-minutes bounds the watch; a timed-out watch does NOT cancel
-  # the leg, which finishes (and stays retryable) on its own.
+  # the leg, which finishes (and stays retryable) on its own. If a watcher
+  # fails while its leg is still alive (watch timeout, correlation miss),
+  # re-running it dispatches a second run of the same leg — safe, because
+  # each publish workflow serializes same-version runs with a concurrency
+  # group, so the duplicate queues behind the live run and then no-ops on
+  # the already-published probes.
 
   cargo-publish:
     needs: [version, build, tag]
@@ -323,7 +341,8 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ needs.version.outputs.version }}
-        run: bash scripts/dispatch-publish.sh publish-npm.yml "$VERSION"
+          SUMS_DIGEST: ${{ needs.github-release.outputs.sums-digest }}
+        run: bash scripts/dispatch-publish.sh publish-npm.yml "$VERSION" "sums-digest=${SUMS_DIGEST}"
 
   pypi-publish:
     needs: [version, github-release]
@@ -343,7 +362,8 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ needs.version.outputs.version }}
-        run: bash scripts/dispatch-publish.sh publish-pypi.yml "$VERSION"
+          SUMS_DIGEST: ${{ needs.github-release.outputs.sums-digest }}
+        run: bash scripts/dispatch-publish.sh publish-pypi.yml "$VERSION" "sums-digest=${SUMS_DIGEST}"
 
   rubygems-publish:
     needs: [version, github-release]

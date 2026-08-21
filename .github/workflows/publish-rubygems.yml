@@ -42,6 +42,16 @@ on:
         default: ''
         type: string
 
+# Serialize same-version runs (queued, not cancelled): the already-published
+# probes below are check-then-act, so two CONCURRENT runs for one version
+# could both pass a probe and the loser would hard-fail on the registry
+# ("Repushing of gem versions is not allowed"). Serialized, a duplicate
+# (e.g. re-dispatched by a release-run watcher whose `gh run watch` timed
+# out while this run was still going) queues behind the live run and then
+# no-ops.
+concurrency:
+  group: publish-rubygems-${{ inputs.version }}
+
 permissions: {}
 
 jobs:
@@ -49,7 +59,10 @@ jobs:
     runs-on: ubuntu-latest
     # OIDC trusted publishing scoped to a deployment environment; also lets a
     # maintainer gate publishing with required reviewers. Auto-created with no
-    # protection rules until configured.
+    # protection rules until configured. NOTE: if required reviewers are ever
+    # configured, a pending approval pauses THIS run while the release run's
+    # watcher counts toward its timeout-minutes — approve promptly, or re-run
+    # the timed-out watcher afterwards (this run itself is unaffected).
     environment: rubygems
     permissions:
       contents: read
