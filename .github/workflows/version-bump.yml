@@ -7,7 +7,8 @@ name: Version Bump
 #
 # CAVEAT — PRs opened by this workflow's GITHUB_TOKEN do NOT trigger
 # pull_request CI (GitHub suppresses events caused by that token, the same
-# rule that shaped release.yml's one-workflow topology). To get CI on the PR:
+# rule release.yml works around by fanning out its publish legs as
+# workflow_dispatch runs — the documented exception). To get CI on the PR:
 # close and reopen it from the UI, or push any commit to the branch. Running
 # `scripts/bump-version.sh <version> --pr` from a developer machine avoids
 # the problem entirely and is the preferred path; this workflow exists so a

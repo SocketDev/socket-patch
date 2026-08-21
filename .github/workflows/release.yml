@@ -1,28 +1,52 @@
 name: Release
 
-# One-workflow release: build, tag, GitHub release, and EVERY ecosystem publish
-# live in this single file — deliberately. The tag and the GitHub release are
-# created with this workflow's own GITHUB_TOKEN, and GitHub suppresses events
-# caused by GITHUB_TOKEN: a `release: published` (or `push: tags:`) trigger in
-# a second workflow file would never fire. Fanning every publish job out from
-# the one dispatch via `needs:` is the only reliable topology without a
-# PAT/GitHub App token, and it gives full job-graph visibility plus
-# "Re-run failed jobs" retryability (every publish job is idempotent).
+# One-dispatch release orchestrator: version gate, build matrix, tag, and
+# GitHub release live here; each registry publish lives in its own
+# independently-runnable workflow (publish-cargo.yml, publish-npm.yml,
+# publish-pypi.yml, publish-rubygems.yml). The fan-out jobs below dispatch
+# each of those at the release tag via `gh workflow run`
+# (scripts/dispatch-publish.sh) and watch the dispatched run to completion,
+# so this run's job graph still reflects every registry's real outcome and
+# "Re-run failed jobs" re-dispatches exactly the failed legs. A failed leg
+# can also be retried without this run at all: fix the cause and dispatch
+# that registry's workflow manually with the release version — no rebuild
+# happens either way. The npm and PyPI legs take the prebuilt binaries from
+# the GitHub release's assets (verified against SHA256SUMS, pinned by digest
+# on the fan-out path), and the launcher gem downloads its binary from the
+# release at run time — which is why npm/PyPI/RubyGems wait on
+# `github-release` below.
 #
-# The launcher-package job (rubygems) publishes thin launchers that download
-# the prebuilt binary from the GitHub release at their own version, so it only
-# needs the GitHub release (and its SHA256SUMS) to exist:
-# `needs: [version, github-release]`.
+# Why dispatch instead of `uses:` (reusable workflows) — two GitHub/registry
+# facts, verified 2026-08-21 against the registries' docs and source:
+#   1. Registry OIDC trusted publishers are keyed on a workflow FILENAME,
+#      but the registries disagree on WHICH one: npm and crates.io match the
+#      top-level workflow (`workflow_ref` claim), while PyPI and RubyGems
+#      match the file defining the job (`job_workflow_ref`) — and PyPI plans
+#      to flip to top-level matching (warehouse PR #20083). npm additionally
+#      allows only ONE trusted publisher per package, so a leg that is
+#      sometimes `uses:`-called (top-level = release.yml) and sometimes
+#      dispatched (top-level = its own file) can never be authorized for
+#      both paths. Dispatching makes every leg ALWAYS the top-level workflow
+#      of its own run, so both claims name the leg's file and one publisher
+#      registration per package covers everything, on every registry.
+#   2. GitHub suppresses events caused by this workflow's own GITHUB_TOKEN —
+#      a `release: published` (or `push: tags:`) trigger in another file
+#      would never fire, which is why the old design kept every publish job
+#      in this file — but workflow_dispatch (and repository_dispatch) events
+#      are documented exceptions, so `gh workflow run` with GITHUB_TOKEN
+#      works without a PAT/GitHub App token.
 #
 # Credentials / deployment-environment matrix (per-registry):
 #   - crates.io:     OIDC trusted publishing (rust-lang/crates-io-auth-action);
 #                    no long-lived secret, no environment.
 #   - npm:           OIDC via `npm stage publish`; staged versions require
-#                    manual 2FA approval (see the npm job's step summary).
+#                    manual 2FA approval (see the npm run's step summary).
 #   - PyPI:          OIDC trusted publishing; environment `pypi`.
 #   - RubyGems:      OIDC trusted publishing; environment `rubygems`. One
 #                    repo+workflow publisher per gem (`socket-patch` and
 #                    `socket-patch-bundler`), both satisfied by one exchange.
+# Every registry's trusted publisher is keyed on the repo + the publish
+# workflow's own filename (see each publish-*.yml header), NOT release.yml.
 
 on:
   workflow_dispatch:
@@ -195,9 +219,10 @@ jobs:
         # Intentionally persists credentials: the tag push below authenticates
         # with this workflow's GITHUB_TOKEN. Note that tags (and releases)
         # created with GITHUB_TOKEN do NOT trigger other workflows — GitHub
-        # suppresses events caused by that token — which is exactly why every
-        # publish job lives in THIS file instead of hanging off a
-        # `push: tags:` or `release: published` trigger elsewhere.
+        # suppresses events caused by that token — which is why the publish
+        # legs hang off explicit workflow_dispatch fan-out (the documented
+        # suppression exception; see this file's header) rather than a
+        # `push: tags:` or `release: published` trigger.
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Create and push tag
@@ -216,6 +241,14 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    outputs:
+      # sha256 of the SHA256SUMS file uploaded below. The npm/PyPI fan-out
+      # passes it to those legs, which re-download the assets from the
+      # release: pinning the sums file by digest binds what the legs publish
+      # to exactly what THIS run built, restoring the same-run-artifact
+      # provenance the pre-split inline jobs had (release assets are mutable;
+      # anyone with contents:write could clobber them between jobs).
+      sums-digest: ${{ steps.sums.outputs.digest }}
     steps:
       - name: Download all artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -224,12 +257,14 @@ jobs:
           merge-multiple: true
 
       - name: Generate SHA256SUMS
+        id: sums
         run: |
           cd artifacts
           # Hash every release artifact (tar.gz + zip) so install.sh can verify
           # the binary before extraction. Sorted output keeps the file stable.
-          sha256sum *.tar.gz *.zip 2>/dev/null | sort > SHA256SUMS
+          sha256sum -- *.tar.gz *.zip 2>/dev/null | sort > SHA256SUMS
           cat SHA256SUMS
+          echo "digest=$(sha256sum SHA256SUMS | awk '{print $1}')" >> "$GITHUB_OUTPUT"
 
       - name: Create or update GitHub Release
         env:
@@ -252,398 +287,114 @@ jobs:
               artifacts/*
           fi
 
+  # ── Publish fan-out ────────────────────────────────────────────────────────
+  # Each job dispatches one registry's publish workflow at the release tag
+  # and watches the dispatched run to completion (scripts/dispatch-publish.sh),
+  # failing iff that run fails — see this file's header for why the legs run
+  # as separate workflow_dispatch runs. The step summary links each leg's
+  # run. timeout-minutes bounds the watch; a timed-out watch does NOT cancel
+  # the leg, which finishes (and stays retryable) on its own. If a watcher
+  # fails while its leg is still alive (watch timeout, correlation miss),
+  # re-running it dispatches a second run of the same leg — safe, because
+  # each publish workflow serializes same-version runs with a concurrency
+  # group, so the duplicate queues behind the live run and then no-ops on
+  # the already-published probes.
+
   cargo-publish:
     needs: [version, build, tag]
     if: ${{ !inputs.dry-run }}
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     permissions:
       contents: read
-      id-token: write
+      actions: write
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
 
-      - name: Install Rust
-        # rustup is pre-installed on GitHub-hosted runners. `rustup show`
-        # reads rust-toolchain.toml in the repo root, then installs the
-        # pinned channel + listed components if missing.
-        run: rustup show
-
-      - name: Probe crates.io for already-published versions
-        id: published
+      - name: Dispatch and watch Publish crates.io
         env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ needs.version.outputs.version }}
-        run: |
-          # crates.io returns HTTP 200 for a published version and 404
-          # otherwise; its crawler policy requires a User-Agent identifying
-          # the caller. Anything but a definite 200 (including transient
-          # network errors) falls through to publishing, where `cargo publish`
-          # gives the authoritative error.
-          probe() {
-            curl -fsSL -o /dev/null \
-              -H 'User-Agent: socket-patch-release-workflow (https://github.com/SocketDev/socket-patch)' \
-              "https://crates.io/api/v1/crates/${1}/${VERSION}"
-          }
-          if probe socket-patch-core; then
-            echo "socket-patch-core ${VERSION} already on crates.io; skipping its publish."
-            echo "core=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "core=false" >> "$GITHUB_OUTPUT"
-          fi
-          if probe socket-patch-cli; then
-            echo "socket-patch-cli ${VERSION} already on crates.io; skipping its publish."
-            echo "cli=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "cli=false" >> "$GITHUB_OUTPUT"
-          fi
+        run: bash scripts/dispatch-publish.sh publish-cargo.yml "$VERSION"
 
-      - name: Authenticate with crates.io
-        id: crates-io-auth
-        uses: rust-lang/crates-io-auth-action@b7e9a28eded4986ec6b1fa40eeee8f8f165559ec # v1.0.3
-
-      - name: Publish socket-patch-core
-        if: steps.published.outputs.core != 'true'
-        run: cargo publish -p socket-patch-core
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
-
-      - name: Wait for crates.io index update
-        if: steps.published.outputs.core != 'true'
-        run: sleep 30
-
-      - name: Copy README for CLI crate
-        run: cp README.md crates/socket-patch-cli/README.md
-
-      - name: Publish socket-patch-cli
-        if: steps.published.outputs.cli != 'true'
-        run: cargo publish -p socket-patch-cli
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
-
+  # npm, PyPI, and RubyGems consume the GitHub release (npm/PyPI take the
+  # prebuilt binaries from its assets; the launcher gem downloads its binary
+  # from it at run time), so all three wait on `github-release`.
   npm-publish:
-    needs: [version, build, tag]
+    needs: [version, github-release]
     if: ${{ !inputs.dry-run }}
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     permissions:
       contents: read
-      id-token: write
+      actions: write
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
 
-      - name: Configure git for HTTPS
-        run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
-
-      - name: Download all artifacts
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          path: artifacts
-          merge-multiple: true
-
-      - name: Setup Node.js
-        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
-        with:
-          node-version: '22.22.1'
-          registry-url: 'https://registry.npmjs.org'
-          package-manager-cache: false
-
-      - name: Update npm for staged publishing
-        run: npm install -g npm@11.15.0
-
-      - name: Stage binaries into platform packages
-        run: |
-          # Unix platforms: extract binary into each platform package directory
-          stage_unix() {
-            local artifact="$1" pkg_dir="$2"
-            tar xzf "artifacts/${artifact}.tar.gz" -C "${pkg_dir}/"
-          }
-
-          # Windows platforms: extract .exe into each platform package directory
-          stage_win() {
-            local artifact="$1" pkg_dir="$2"
-            unzip -o "artifacts/${artifact}.zip" -d "${pkg_dir}/"
-          }
-
-          stage_unix socket-patch-aarch64-apple-darwin       npm/socket-patch-darwin-arm64
-          stage_unix socket-patch-x86_64-apple-darwin        npm/socket-patch-darwin-x64
-          stage_unix socket-patch-x86_64-unknown-linux-gnu      npm/socket-patch-linux-x64-gnu
-          stage_unix socket-patch-x86_64-unknown-linux-musl     npm/socket-patch-linux-x64-musl
-          stage_unix socket-patch-aarch64-unknown-linux-gnu     npm/socket-patch-linux-arm64-gnu
-          stage_unix socket-patch-aarch64-unknown-linux-musl    npm/socket-patch-linux-arm64-musl
-          stage_unix socket-patch-arm-unknown-linux-gnueabihf   npm/socket-patch-linux-arm-gnu
-          stage_unix socket-patch-arm-unknown-linux-musleabihf  npm/socket-patch-linux-arm-musl
-          stage_unix socket-patch-i686-unknown-linux-gnu        npm/socket-patch-linux-ia32-gnu
-          stage_unix socket-patch-i686-unknown-linux-musl       npm/socket-patch-linux-ia32-musl
-          stage_unix socket-patch-aarch64-linux-android      npm/socket-patch-android-arm64
-
-          stage_win socket-patch-x86_64-pc-windows-msvc      npm/socket-patch-win32-x64
-          stage_win socket-patch-i686-pc-windows-msvc        npm/socket-patch-win32-ia32
-          stage_win socket-patch-aarch64-pc-windows-msvc     npm/socket-patch-win32-arm64
-
-      - name: Stage-publish platform packages
-        id: stage-platform
+      - name: Dispatch and watch Publish npm
         env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ needs.version.outputs.version }}
+          SUMS_DIGEST: ${{ needs.github-release.outputs.sums-digest }}
         run: |
-          : > "${RUNNER_TEMP}/staged-packages.txt"
-          for pkg_dir in npm/socket-patch-*/; do
-            pkg_name="@socketsecurity/$(basename "$pkg_dir")"
-            echo "Staging ${pkg_name}..."
-            if npm stage publish "./${pkg_dir}" --access public; then
-              echo "$pkg_name" >> "${RUNNER_TEMP}/staged-packages.txt"
-            elif npm view "${pkg_name}@${VERSION}" version >/dev/null 2>&1; then
-              # Already fully published (approved) — a clean re-run.
-              echo "Already published, skipping."
-            elif npm stage list 2>/dev/null | grep -qF "${pkg_name}@${VERSION}"; then
-              # Staged but not yet 2FA-approved: `npm view` can't see staged
-              # versions, so without this check a re-run after a mid-job
-              # failure could never succeed. Best-effort match on the stage
-              # listing (format unverified against a live staged state — if it
-              # misses we still fail loudly below).
-              echo "Already staged awaiting approval, skipping."
-              echo "$pkg_name" >> "${RUNNER_TEMP}/staged-packages.txt"
-            else
-              exit 1
-            fi
-          done
-
-      - name: Copy README for npm package
-        run: cp README.md npm/socket-patch/README.md
-
-      - name: Install main-package devDependencies
-        # `npm stage publish` (like `npm pack`) runs the package's `prepack`
-        # script, which compiles the `./schema` export with tsc — the
-        # `typescript` devDependency must be installed for that build.
-        #
-        # NOT `npm ci`: version-sync.sh refreshes package-lock.json while the
-        # release's platform packages are not yet on the registry, so npm
-        # records the optionalDependencies as hollow stubs ("optional": true,
-        # no version/resolved/integrity) and `npm ci` refuses that lockfile
-        # ("lock file's ...@ does not satisfy ...@X.Y.Z"). `npm install`
-        # tolerates the stubs and skips unresolvable optional platform
-        # packages (verified for both the published and unpublished-version
-        # states); --no-save keeps the runner from touching package.json.
-        working-directory: npm/socket-patch
-        run: npm install --no-save --ignore-scripts --no-audit --no-fund
-
-      - name: Stage-publish main package
-        env:
-          VERSION: ${{ needs.version.outputs.version }}
-        run: |
-          pkg_name="@socketsecurity/socket-patch"
-          if npm stage publish ./npm/socket-patch --access public; then
-            echo "$pkg_name" >> "${RUNNER_TEMP}/staged-packages.txt"
-          elif npm view "${pkg_name}@${VERSION}" version >/dev/null 2>&1; then
-            echo "Already published, skipping."
-          elif npm stage list 2>/dev/null | grep -qF "${pkg_name}@${VERSION}"; then
-            # See the platform-package step: staged-not-approved versions are
-            # invisible to `npm view`; tolerate them so re-runs can succeed.
-            echo "Already staged awaiting approval, skipping."
-            echo "$pkg_name" >> "${RUNNER_TEMP}/staged-packages.txt"
-          else
+          # Fail closed: an empty digest would silently downgrade the leg's
+          # asset check from provenance-pinned to integrity-only.
+          if [ -z "$SUMS_DIGEST" ]; then
+            echo "::error::github-release produced no SHA256SUMS digest; refusing to dispatch an unpinned publish"
             exit 1
           fi
-
-      - name: Summarize staged versions awaiting approval
-        if: always()
-        env:
-          VERSION: ${{ needs.version.outputs.version }}
-        run: |
-          STAGED_FILE="${RUNNER_TEMP}/staged-packages.txt"
-          if [ ! -s "$STAGED_FILE" ]; then
-            echo "No packages staged this run (all versions already published or publish step failed before staging)." >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
-          {
-            echo "## npm staged versions awaiting approval"
-            echo ""
-            echo "Version \`${VERSION}\` is staged on npm. A maintainer must approve each package with 2FA before it becomes installable."
-            echo ""
-            echo "**Approve platform packages first**, then the main \`@socketsecurity/socket-patch\` package, so install-time \`optionalDependencies\` resolution sees the platform binaries already live."
-            echo ""
-            echo "**Approve from the web** (signs in + 2FA prompts inline):"
-            echo ""
-            echo "- Org dashboard: <https://www.npmjs.com/settings/socketsecurity/staged-packages>"
-            echo ""
-            echo "Per-package review pages:"
-            echo ""
-            while IFS= read -r pkg_name; do
-              [ -z "$pkg_name" ] && continue
-              # npmjs.com renders staged versions inline on the package page;
-              # the access page exposes the "Staged" tab and the approve button.
-              echo "- \`${pkg_name}@${VERSION}\` — <https://www.npmjs.com/package/${pkg_name}/access>"
-            done < "$STAGED_FILE"
-            echo ""
-            echo "**Approve from the CLI** (requires \`npm@11.15.0+\` locally, signed in to the \`socketsecurity\` org with 2FA):"
-            echo ""
-            echo '```sh'
-            echo "npm stage list"
-            echo "# then, for each stage id printed above (platform packages first, main package last):"
-            echo "npm stage approve <stage-id>"
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-          # Mirror to step log so it's also visible in the raw run output.
-          echo "::notice title=npm staged versions awaiting approval::Review and approve at https://www.npmjs.com/settings/socketsecurity/staged-packages"
+          bash scripts/dispatch-publish.sh publish-npm.yml "$VERSION" "sums-digest=${SUMS_DIGEST}"
 
   pypi-publish:
-    needs: [version, build, tag]
+    needs: [version, github-release]
     if: ${{ !inputs.dry-run }}
     runs-on: ubuntu-latest
-    # OIDC trusted publishing scoped to a deployment environment; also lets a
-    # maintainer gate publishing with required reviewers. Auto-created with no
-    # protection rules until configured.
-    environment: pypi
+    timeout-minutes: 45
     permissions:
       contents: read
-      id-token: write
+      actions: write
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
 
-      - name: Download all artifacts
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          path: artifacts
-          merge-multiple: true
-
-      - name: Setup Python
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
-        with:
-          python-version: '3.12.13'
-
-      - name: Copy README for PyPI package
-        run: cp README.md pypi/socket-patch/README.md
-
-      - name: Build wheels (platform socket-patch + pure-python socket-patch-hook)
+      - name: Dispatch and watch Publish PyPI
         env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ needs.version.outputs.version }}
+          SUMS_DIGEST: ${{ needs.github-release.outputs.sums-digest }}
         run: |
-          # Builds the platform-tagged socket-patch wheels AND the pure-python
-          # socket-patch-hook wheel (the .pth carrier behind `socket-patch[hook]`).
-          python scripts/build-pypi-wheels.py --version "$VERSION" --artifacts artifacts --dist dist
-          # socket-patch and socket-patch-hook are two distinct PyPI projects.
-          # Publish each from its own dir so trusted publishing mints an OIDC
-          # token scoped to the right project (one upload spanning both projects
-          # can be rejected). Each needs its own trusted publisher on PyPI
-          # (repo + workflow `release.yml`; register a "pending" publisher for
-          # socket-patch-hook before its first release). This job now runs in
-          # the `pypi` deployment environment: tighten both publishers to
-          # REQUIRE environment `pypi` — publishers registered without an
-          # environment constraint still match, so this change lands safely
-          # before that tightening happens.
-          mkdir -p dist-hook
-          mv dist/socket_patch_hook-*.whl dist-hook/
+          # Fail closed: an empty digest would silently downgrade the leg's
+          # asset check from provenance-pinned to integrity-only.
+          if [ -z "$SUMS_DIGEST" ]; then
+            echo "::error::github-release produced no SHA256SUMS digest; refusing to dispatch an unpinned publish"
+            exit 1
+          fi
+          bash scripts/dispatch-publish.sh publish-pypi.yml "$VERSION" "sums-digest=${SUMS_DIGEST}"
 
-      - name: Publish socket-patch to PyPI
-        uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
-        with:
-          packages-dir: dist/
-          # Idempotent for "Re-run failed jobs": already-uploaded files skip.
-          skip-existing: true
-
-      - name: Publish socket-patch-hook to PyPI
-        uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
-        with:
-          packages-dir: dist-hook/
-          skip-existing: true
-
-  # Publishes BOTH gems via one OIDC trusted-publishing exchange:
-  #   - gem/socket-patch          — the CLI launcher gem (downloads the
-  #     prebuilt binary from the GitHub release at its own version, so this
-  #     job only needs the GitHub release + SHA256SUMS to exist).
-  #   - gem/socket-patch-bundler  — Phase 2 scaffolding, non-blocking (see the
-  #     step comment below).
   rubygems-publish:
     needs: [version, github-release]
     if: ${{ !inputs.dry-run }}
     runs-on: ubuntu-latest
-    # OIDC trusted publishing scoped to a deployment environment; also lets a
-    # maintainer gate publishing with required reviewers. Auto-created with no
-    # protection rules until configured.
-    environment: rubygems
+    timeout-minutes: 45
     permissions:
       contents: read
-      id-token: write
+      actions: write
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
 
-      # Ruby is pre-installed on ubuntu-latest; no setup action needed.
-      - name: Lint + version-check the launcher gem
-        working-directory: gem/socket-patch
+      - name: Dispatch and watch Publish RubyGems
         env:
-          EXPECTED_VERSION: ${{ needs.version.outputs.version }}
-        run: |
-          ruby -c lib/socket_patch/launcher.rb
-          ruby -c exe/socket-patch
-          # The gemspec version is baked at the tag by scripts/version-sync.sh.
-          gemver="$(ruby -e 'print Gem::Specification.load("socket-patch.gemspec").version')"
-          if [ "$gemver" != "$EXPECTED_VERSION" ]; then
-            echo "::error::gemspec version $gemver != release $EXPECTED_VERSION (run scripts/version-sync.sh before tagging)"
-            exit 1
-          fi
-
-      - name: Lint + version-check the bundler-plugin gem
-        working-directory: gem/socket-patch-bundler
-        env:
-          EXPECTED_VERSION: ${{ needs.version.outputs.version }}
-        run: |
-          ruby -c plugins.rb
-          # The gemspec version is baked at the tag by scripts/version-sync.sh.
-          gemver="$(ruby -e 'print Gem::Specification.load("socket-patch-bundler.gemspec").version')"
-          if [ "$gemver" != "$EXPECTED_VERSION" ]; then
-            echo "::error::gemspec version $gemver != release $EXPECTED_VERSION (run scripts/version-sync.sh before tagging)"
-            exit 1
-          fi
-
-      - name: Configure RubyGems credentials (OIDC trusted publishing)
-        # One OIDC exchange covers both gems: a trusted publisher keyed on
-        # this repo + workflow (+ the `rubygems` environment) can be
-        # registered on multiple gems on rubygems.org, and the exchanged
-        # token pushes any gem whose publisher matches.
-        uses: rubygems/configure-rubygems-credentials@dc5a8d8553e6ee01fc26761a49e99e733d17954a # v2.1.0
-
-      - name: Publish socket-patch to RubyGems
-        working-directory: gem/socket-patch
-        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ needs.version.outputs.version }}
-        run: |
-          gem build socket-patch.gemspec
-          # `gem list -r -e -a` prints `socket-patch (3.3.0, 3.2.0, ...)`; match
-          # this version as a precise list element (preceded by `(`/space,
-          # followed by `,`/`)`).
-          if gem list --remote --exact --all socket-patch 2>/dev/null | grep -qE "[ (]${VERSION}[,)]"; then
-            echo "socket-patch ${VERSION} already on RubyGems; skipping."
-            exit 0
-          fi
-          gem push "socket-patch-${VERSION}.gem"
-
-      # Phase 2 scaffolding (CLI_CONTRACT "gem" support matrix): publish the
-      # `socket-patch-bundler` gem — the published form of the Bundler plugin
-      # that `socket-patch setup` currently wires via an in-tree `git:`
-      # reference. This gem is NOT yet the active mechanism (setup::gem still
-      # emits the in-tree plugin), so the push is **non-blocking**
-      # (`continue-on-error`). A follow-up switches the generated Gemfile
-      # directive to `plugin "socket-patch-bundler"` and drops
-      # continue-on-error.
-      - name: Publish socket-patch-bundler to RubyGems
-        continue-on-error: true
-        working-directory: gem/socket-patch-bundler
-        env:
-          VERSION: ${{ needs.version.outputs.version }}
-        run: |
-          gem build socket-patch-bundler.gemspec
-          # Same precise-list-element match as the launcher gem above.
-          if gem list --remote --exact --all socket-patch-bundler 2>/dev/null | grep -qE "[ (]${VERSION}[,)]"; then
-            echo "socket-patch-bundler ${VERSION} already on RubyGems; skipping."
-            exit 0
-          fi
-          gem push "socket-patch-bundler-${VERSION}.gem"
+        run: bash scripts/dispatch-publish.sh publish-rubygems.yml "$VERSION"

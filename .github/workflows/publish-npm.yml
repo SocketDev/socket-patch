@@ -1,0 +1,268 @@
+name: Publish npm
+run-name: "Publish npm ${{ inputs.version }}${{ inputs.distinct-id != '' && format(' [{0}]', inputs.distinct-id) || '' }}"
+
+# Stage-publishes @socketsecurity/socket-patch + the 14 platform packages to
+# npm for an existing v<version> release. Dispatched two ways, both as a
+# plain workflow_dispatch run:
+#   - by release.yml (scripts/dispatch-publish.sh), as one leg of the
+#     single-dispatch release fan-out — distinct-id carries the release
+#     run's correlation id into this run's name;
+#   - manually (Actions → Publish npm → Run workflow), to retry just this
+#     registry after a mid-release failure: fix the cause, enter the release
+#     version, leave distinct-id blank.
+# Every run checks out refs/tags/v<version> and takes the prebuilt binaries
+# from the GitHub release's assets (verified against SHA256SUMS), so a
+# manual retry stages exactly what the release run would have — no rebuild
+# needed. The GitHub release must already exist with all assets.
+#
+# Idempotent: already-published and already-staged versions are detected and
+# skipped, so re-runs and partial-failure retries are safe.
+#
+# OIDC trusted publishing: the npm trusted publisher for every package is
+# keyed on this repo + THIS file's name (publish-npm.yml). npm allows only
+# ONE trusted publisher per package and matches the TOP-LEVEL workflow's
+# filename, which is precisely why release.yml dispatches this file as its
+# own run instead of calling it as a reusable workflow: dispatched, this
+# file is always the top-level workflow, so the one registration covers
+# both the release fan-out and manual retries.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (X.Y.Z; the v<version> GitHub release must exist with binaries + SHA256SUMS)'
+        required: true
+        type: string
+      distinct-id:
+        description: 'Correlation id set by release.yml to track its dispatched run — leave blank for manual runs'
+        required: false
+        default: ''
+        type: string
+      sums-digest:
+        description: 'Expected sha256 of the release''s SHA256SUMS asset — set by release.yml to pin the assets to what its build produced; leave blank for manual runs'
+        required: false
+        default: ''
+        type: string
+
+# Serialize same-version runs: the already-published/already-staged probes
+# below are check-then-act, so two CONCURRENT runs for one version could
+# race them. Serialized, a duplicate (e.g. re-dispatched by a release-run
+# watcher whose `gh run watch` timed out while this run was still going)
+# waits behind the live run and then no-ops. NOTE: the group holds at most
+# ONE waiting run — a further same-version dispatch displaces (cancels) the
+# waiting duplicate, and a watcher following the displaced run reports that
+# as a failure; the publish itself is unaffected (the surviving runs no-op
+# or publish).
+concurrency:
+  group: publish-npm-${{ inputs.version }}
+
+permissions: {}
+
+jobs:
+  npm-publish:
+    runs-on: ubuntu-latest
+    # Bounds how long a wedged run (hung registry call) can hold this
+    # workflow's per-version concurrency group before retries can proceed.
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Validate version input
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if ! printf '%s' "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::'${VERSION}' is not a plain X.Y.Z release version"
+            exit 1
+          fi
+
+      - name: Checkout release tag
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: refs/tags/v${{ inputs.version }}
+          persist-credentials: false
+
+      - name: Verify tag carries the requested version
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          CARGO_VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          if [ "$CARGO_VERSION" != "$VERSION" ]; then
+            echo "::error::tag v${VERSION} carries workspace version ${CARGO_VERSION} — refusing to publish"
+            exit 1
+          fi
+
+      - name: Configure git for HTTPS
+        run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+
+      - name: Download binaries from the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+          SUMS_DIGEST: ${{ inputs.sums-digest }}
+        run: |
+          mkdir artifacts
+          gh release download "v${VERSION}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir artifacts \
+            --pattern '*.tar.gz' --pattern '*.zip' --pattern 'SHA256SUMS'
+          cd artifacts
+          # Release assets are mutable (contents:write can clobber them), and
+          # SHA256SUMS is itself an asset of the same release — so when the
+          # release run dispatched us it pinned the sums file by digest,
+          # binding this publish to exactly what that run built (the same
+          # provenance the pre-split inline jobs got from same-run
+          # artifacts). Manual retries leave the pin blank: integrity-only.
+          if [ -n "$SUMS_DIGEST" ]; then
+            echo "${SUMS_DIGEST}  SHA256SUMS" | sha256sum -c -
+          fi
+          # -c also fails on a file that SHA256SUMS lists but the download
+          # missed, so this doubles as a completeness check: the sums file
+          # was generated from the full 14-target artifact set.
+          sha256sum -c SHA256SUMS
+
+      - name: Setup Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: '22.22.1'
+          registry-url: 'https://registry.npmjs.org'
+          package-manager-cache: false
+
+      - name: Update npm for staged publishing
+        run: npm install -g npm@11.15.0
+
+      - name: Stage binaries into platform packages
+        run: |
+          # Unix platforms: extract binary into each platform package directory
+          stage_unix() {
+            local artifact="$1" pkg_dir="$2"
+            tar xzf "artifacts/${artifact}.tar.gz" -C "${pkg_dir}/"
+          }
+
+          # Windows platforms: extract .exe into each platform package directory
+          stage_win() {
+            local artifact="$1" pkg_dir="$2"
+            unzip -o "artifacts/${artifact}.zip" -d "${pkg_dir}/"
+          }
+
+          stage_unix socket-patch-aarch64-apple-darwin       npm/socket-patch-darwin-arm64
+          stage_unix socket-patch-x86_64-apple-darwin        npm/socket-patch-darwin-x64
+          stage_unix socket-patch-x86_64-unknown-linux-gnu      npm/socket-patch-linux-x64-gnu
+          stage_unix socket-patch-x86_64-unknown-linux-musl     npm/socket-patch-linux-x64-musl
+          stage_unix socket-patch-aarch64-unknown-linux-gnu     npm/socket-patch-linux-arm64-gnu
+          stage_unix socket-patch-aarch64-unknown-linux-musl    npm/socket-patch-linux-arm64-musl
+          stage_unix socket-patch-arm-unknown-linux-gnueabihf   npm/socket-patch-linux-arm-gnu
+          stage_unix socket-patch-arm-unknown-linux-musleabihf  npm/socket-patch-linux-arm-musl
+          stage_unix socket-patch-i686-unknown-linux-gnu        npm/socket-patch-linux-ia32-gnu
+          stage_unix socket-patch-i686-unknown-linux-musl       npm/socket-patch-linux-ia32-musl
+          stage_unix socket-patch-aarch64-linux-android      npm/socket-patch-android-arm64
+
+          stage_win socket-patch-x86_64-pc-windows-msvc      npm/socket-patch-win32-x64
+          stage_win socket-patch-i686-pc-windows-msvc        npm/socket-patch-win32-ia32
+          stage_win socket-patch-aarch64-pc-windows-msvc     npm/socket-patch-win32-arm64
+
+      - name: Stage-publish platform packages
+        id: stage-platform
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          : > "${RUNNER_TEMP}/staged-packages.txt"
+          for pkg_dir in npm/socket-patch-*/; do
+            pkg_name="@socketsecurity/$(basename "$pkg_dir")"
+            echo "Staging ${pkg_name}..."
+            if npm stage publish "./${pkg_dir}" --access public; then
+              echo "$pkg_name" >> "${RUNNER_TEMP}/staged-packages.txt"
+            elif npm view "${pkg_name}@${VERSION}" version >/dev/null 2>&1; then
+              # Already fully published (approved) — a clean re-run.
+              echo "Already published, skipping."
+            elif npm stage list 2>/dev/null | grep -qF "${pkg_name}@${VERSION}"; then
+              # Staged but not yet 2FA-approved: `npm view` can't see staged
+              # versions, so without this check a re-run after a mid-job
+              # failure could never succeed. Best-effort match on the stage
+              # listing (format unverified against a live staged state — if it
+              # misses we still fail loudly below).
+              echo "Already staged awaiting approval, skipping."
+              echo "$pkg_name" >> "${RUNNER_TEMP}/staged-packages.txt"
+            else
+              exit 1
+            fi
+          done
+
+      - name: Copy README for npm package
+        run: cp README.md npm/socket-patch/README.md
+
+      - name: Install main-package devDependencies
+        # `npm stage publish` (like `npm pack`) runs the package's `prepack`
+        # script, which compiles the `./schema` export with tsc — the
+        # `typescript` devDependency must be installed for that build.
+        #
+        # NOT `npm ci`: version-sync.sh refreshes package-lock.json while the
+        # release's platform packages are not yet on the registry, so npm
+        # records the optionalDependencies as hollow stubs ("optional": true,
+        # no version/resolved/integrity) and `npm ci` refuses that lockfile
+        # ("lock file's ...@ does not satisfy ...@X.Y.Z"). `npm install`
+        # tolerates the stubs and skips unresolvable optional platform
+        # packages (verified for both the published and unpublished-version
+        # states); --no-save keeps the runner from touching package.json.
+        working-directory: npm/socket-patch
+        run: npm install --no-save --ignore-scripts --no-audit --no-fund
+
+      - name: Stage-publish main package
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          pkg_name="@socketsecurity/socket-patch"
+          if npm stage publish ./npm/socket-patch --access public; then
+            echo "$pkg_name" >> "${RUNNER_TEMP}/staged-packages.txt"
+          elif npm view "${pkg_name}@${VERSION}" version >/dev/null 2>&1; then
+            echo "Already published, skipping."
+          elif npm stage list 2>/dev/null | grep -qF "${pkg_name}@${VERSION}"; then
+            # See the platform-package step: staged-not-approved versions are
+            # invisible to `npm view`; tolerate them so re-runs can succeed.
+            echo "Already staged awaiting approval, skipping."
+            echo "$pkg_name" >> "${RUNNER_TEMP}/staged-packages.txt"
+          else
+            exit 1
+          fi
+
+      - name: Summarize staged versions awaiting approval
+        if: always()
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          STAGED_FILE="${RUNNER_TEMP}/staged-packages.txt"
+          if [ ! -s "$STAGED_FILE" ]; then
+            echo "No packages staged this run (all versions already published or publish step failed before staging)." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          {
+            echo "## npm staged versions awaiting approval"
+            echo ""
+            echo "Version \`${VERSION}\` is staged on npm. A maintainer must approve each package with 2FA before it becomes installable."
+            echo ""
+            echo "**Approve platform packages first**, then the main \`@socketsecurity/socket-patch\` package, so install-time \`optionalDependencies\` resolution sees the platform binaries already live."
+            echo ""
+            echo "**Approve from the web** (signs in + 2FA prompts inline):"
+            echo ""
+            echo "- Org dashboard: <https://www.npmjs.com/settings/socketsecurity/staged-packages>"
+            echo ""
+            echo "Per-package review pages:"
+            echo ""
+            while IFS= read -r pkg_name; do
+              [ -z "$pkg_name" ] && continue
+              # npmjs.com renders staged versions inline on the package page;
+              # the access page exposes the "Staged" tab and the approve button.
+              echo "- \`${pkg_name}@${VERSION}\` — <https://www.npmjs.com/package/${pkg_name}/access>"
+            done < "$STAGED_FILE"
+            echo ""
+            echo "**Approve from the CLI** (requires \`npm@11.15.0+\` locally, signed in to the \`socketsecurity\` org with 2FA):"
+            echo ""
+            echo '```sh'
+            echo "npm stage list"
+            echo "# then, for each stage id printed above (platform packages first, main package last):"
+            echo "npm stage approve <stage-id>"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          # Mirror to step log so it's also visible in the raw run output.
+          echo "::notice title=npm staged versions awaiting approval::Review and approve at https://www.npmjs.com/settings/socketsecurity/staged-packages"
