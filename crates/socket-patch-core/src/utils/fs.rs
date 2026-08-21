@@ -567,10 +567,50 @@ mod tests {
     /// data loss in the exact scenario the atomic writer exists to prevent.
     /// Reproduced by capping `RLIMIT_FSIZE` so the stage write dies at
     /// 256 KiB of a 1 MiB payload.
+    ///
+    /// The capped body runs in a CHILD PROCESS. `RLIMIT_FSIZE` (and the
+    /// ignored `SIGXFSZ`) are process-wide, and `#[serial]` only serializes
+    /// against other `#[serial]` tests — with the cap active in THIS
+    /// process, every concurrently-running sibling test (and the libtest
+    /// harness itself) that wrote a file larger than 256 KiB died with
+    /// EFBIG, aborting the whole binary: observed as `cargo test
+    /// --workspace` exiting 101 with ZERO failed tests and `io error when
+    /// listing tests: … FileTooLarge`. The parent re-execs this test binary
+    /// filtered to exactly this test with a marker env var selecting the
+    /// capped body, so the blast radius is one single-test process. The
+    /// payload/cap sizes cannot simply be raised out of siblings' range
+    /// instead: the payload must fit tokio's single 2 MiB write chunk or
+    /// `write_all` returns the error directly and the swallowed-`sync_all`
+    /// path this test exists to pin is never exercised.
     #[cfg(unix)]
     #[tokio::test]
-    #[serial_test::serial]
     async fn atomic_write_failed_stage_write_errors_and_keeps_target() {
+        const CHILD_ENV: &str = "SOCKET_PATCH_CORE_TEST_FSIZE_CHILD";
+        const TEST_NAME: &str =
+            "utils::fs::tests::atomic_write_failed_stage_write_errors_and_keeps_target";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let exe = std::env::current_exe().expect("test binary path must resolve");
+            let output = std::process::Command::new(exe)
+                .args([TEST_NAME, "--exact", "--test-threads=1", "--nocapture"])
+                .env(CHILD_ENV, "1")
+                .output()
+                .expect("the capped child test process must spawn");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success(),
+                "the capped child run failed:\nstdout:\n{stdout}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stderr),
+            );
+            // Anti-vacuity: a renamed test would make the `--exact` filter
+            // match nothing and the child exit 0 having proven nothing.
+            assert!(
+                stdout.contains("1 passed"),
+                "the child run must execute exactly this test — filter drift \
+                 after a rename? child stdout:\n{stdout}"
+            );
+            return;
+        }
+
         struct FsizeGuard {
             prev: libc::rlimit,
             prev_handler: libc::sighandler_t,
