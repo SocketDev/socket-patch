@@ -101,6 +101,34 @@ release itself at run time (`/releases/latest/download`), so cutting 3.4.0
 changes what the hosted installer *installs* without changing the hosted
 installer. Only edits to the script itself require a publish.
 
+## The Cloudflare front door
+
+`install.socket.dev` is a proxied hostname in the `socket.dev` Cloudflare zone,
+and two zone-level settings are load-bearing. Neither lives in any repo — they
+are dashboard state, listed as out-of-repo prerequisites in depscan's
+`tanka/lib/depscan/install-server.libsonnet`:
+
+- **Bot-challenge exemption.** The hostname must be on the existing hostname
+  exemption rule (socket.dev zone → Security → Bots — the same rule
+  `patch.socket.dev` and `api.socket.dev` are on). Without it, Cloudflare's
+  managed challenge answers plain curl with `403` + `cf-mitigated: challenge`
+  and an HTML interstitial. For a `curl | sh` endpoint that is a hard outage:
+  with the documented `-f` flag, `sh` receives an empty script; without it, a
+  challenge page. A managed challenge can only be solved by a browser, so there
+  is no client-side workaround. This was missed at standup — the host 403'd
+  every non-browser client from 2026-08-13 until the exemption was applied on
+  2026-08-21.
+- **A cache rule honoring origin `Cache-Control`.** Cloudflare's default edge
+  caching is file-extension-driven and every hot path here is extension-less
+  (`/patch`, `/patch/latest`, the `/patch/dl/**` relays), so without the rule
+  nothing caches at the edge and the small install-server fleet becomes the
+  bandwidth path it is not sized for.
+
+The drift check below emits the exact exemption error when the challenge
+reappears, so a regression surfaces within a week — or immediately via
+`workflow_dispatch`. When it does, the fix is the Cloudflare dashboard rule
+above; nothing in this repo or in depscan's code can grant it.
+
 ## The drift check
 
 `.github/workflows/installer-drift.yml` (weekly, plus `workflow_dispatch`)
