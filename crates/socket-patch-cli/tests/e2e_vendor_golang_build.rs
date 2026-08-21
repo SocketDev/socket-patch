@@ -11,15 +11,23 @@
 //! and `go.sum` entirely — spike claims 2/3).
 //!
 //! Skips (println) when `go`/`zip` are missing; everything else is hard.
+//!
+//! Capstone 1b is the `get <uuid> --mode vendored` twin of capstone 1: the
+//! same committed shape out of the CLI's advisory-selector path, with the
+//! patch record served by a wiremock `view/{uuid}` instead of a local
+//! manifest+blobs seed.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use sha2::{Digest, Sha256};
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[path = "common/cache_env.rs"]
 mod cache_env;
 
+const ORG: &str = "test-org";
 const UUID: &str = "3c4d5e6f-7081-4a1b-8c2d-0123456789ab";
 const UMOD: &str = "example.com/upstream";
 const UVER: &str = "v1.0.0";
@@ -98,6 +106,11 @@ fn git_sha256(content: &[u8]) -> String {
     hasher.update(format!("blob {}\0", content.len()).as_bytes());
     hasher.update(content);
     hex::encode(hasher.finalize())
+}
+
+fn b64(bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
 /// Build the upstream module into a file proxy and `go mod download` it into
@@ -455,6 +468,208 @@ fn go_vendor_fresh_checkout_offline_build_and_revert() {
         String::from_utf8_lossy(&back.stdout).contains("OUT: PRISTINE"),
         "reverted project must link the pristine module: {}",
         String::from_utf8_lossy(&back.stdout)
+    );
+
+    chmod_writable(tmp.path());
+}
+
+// ── capstone 1b: the `get`-driven twin ────────────────────────────────
+
+/// `get <uuid> --mode vendored` twin of the capstone above: the CLI's
+/// advisory-selector path must land the SAME committed vendor shape — but
+/// with the patch record served over the wire (wiremock `view/{uuid}` with
+/// the suite's real hashes + inline blobContent) instead of `write_patch`'s
+/// local manifest+blobs seed. The download phase writes ONLY the manifest
+/// (NO `.socket/blobs` — content stays in memory, scan parity), the vendor
+/// step builds the artifact locally (`--vendor-source build`) from the
+/// installed module, and the fresh-checkout proof builds the PATCHED module
+/// fully offline. The revert half stays the vendor capstone's job.
+// multi_thread: the CLI/go subprocesses block a worker thread while wiremock
+// keeps serving the view route on the others.
+#[tokio::test(flavor = "multi_thread")]
+async fn go_get_uuid_vendored_fresh_checkout_offline_build() {
+    if !has_command("go") || !has_command("zip") {
+        println!("SKIP e2e_vendor_golang_build: `go`/`zip` not installed");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let (consumer, modcache, proxy) = stage(tmp.path());
+    let goenv = go_env(modcache.to_str().unwrap(), &proxy);
+
+    // Baseline links PRISTINE (anti-vacuity: a later PATCHED link can only
+    // come from the vendored bytes) and settles go.mod/go.sum first.
+    let base = go(&consumer, &["run", "."], &goenv);
+    assert!(
+        base.status.success(),
+        "baseline go run failed: {}",
+        String::from_utf8_lossy(&base.stderr)
+    );
+    assert!(String::from_utf8_lossy(&base.stdout).contains("OUT: PRISTINE"));
+
+    // The suite's patch record served over the wire: REAL git-blob hashes +
+    // inline blobContent, so the vendor step's in-memory staging hash-gates
+    // pass with no `.socket/` seed on disk.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/view/{UUID}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "uuid": UUID,
+            "purl": UPURL,
+            "publishedAt": "2026-01-01T00:00:00Z",
+            "files": { "lib.go": {
+                "beforeHash": git_sha256(PRISTINE_LIB.as_bytes()),
+                "afterHash": git_sha256(PATCHED_LIB.as_bytes()),
+                "blobContent": b64(PATCHED_LIB.as_bytes()),
+            }},
+            "vulnerabilities": { "GHSA-vend-golang-get1": {
+                "cves": ["CVE-2026-77777"],
+                "summary": "get-vendored capstone vuln",
+                "severity": "high",
+                "description": "d",
+            }},
+            "description": "get-vendored capstone patch",
+            "license": "MIT",
+            "tier": "free",
+        })))
+        .mount(&server)
+        .await;
+
+    let (code, stdout, stderr) = run_socket(
+        &consumer,
+        &[
+            "get",
+            UUID,
+            "--mode",
+            "vendored",
+            "--json",
+            "--yes",
+            "--vendor-source",
+            "build",
+            "--cwd",
+            consumer.to_str().unwrap(),
+            "--api-url",
+            &server.uri(),
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+        ],
+        &modcache,
+    );
+    assert_eq!(
+        code, 0,
+        "get --mode vendored failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let env = parse_envelope(&stdout);
+    assert_eq!(env["status"], "success", "envelope: {env}");
+    assert_eq!(env["downloaded"], 1, "one record downloaded: {env}");
+    assert!(
+        env.get("applied").is_none(),
+        "vendored get drops `applied` (nothing is applied in place): {env}"
+    );
+    assert_eq!(
+        env["vendor"]["status"], "success",
+        "nested vendor envelope: {env}"
+    );
+    assert_eq!(
+        env["vendor"]["summary"]["failed"], 0,
+        "no vendor failures: {env}"
+    );
+
+    // The record came over the wire — the view endpoint was actually hit.
+    let view_hits = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| r.url.path().ends_with(&format!("/patches/view/{UUID}")))
+        .count();
+    assert!(
+        view_hits >= 1,
+        "the patch record must be fetched via the API"
+    );
+
+    // Download-phase persistence: the manifest records the patch, but NO
+    // blobs are written (scan --mode vendored parity: content in memory).
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(consumer.join(".socket/manifest.json"))
+            .expect("the manifest must be written"),
+    )
+    .unwrap();
+    assert_eq!(
+        manifest["patches"][UPURL]["uuid"], UUID,
+        "manifest must record the vendored patch: {manifest}"
+    );
+    assert!(
+        !consumer.join(".socket/blobs").exists(),
+        "get --mode vendored must NOT persist blobs"
+    );
+
+    // Committed vendor shape identical to the `vendor` capstone: the replace
+    // directive at the uuid copy (mandatory `./` prefix), the patched copy +
+    // marker + ledger, pristine module cache.
+    let expected_replace =
+        format!("replace {UMOD} {UVER} => ./.socket/vendor/golang/{UUID}/{UMOD}@{UVER}");
+    let gomod = std::fs::read_to_string(consumer.join("go.mod")).unwrap();
+    assert!(
+        gomod.lines().any(|l| l.trim() == expected_replace),
+        "go.mod must carry the vendor replace directive.\nwant: {expected_replace}\ngot:\n{gomod}"
+    );
+    let copy_dir = consumer.join(format!(".socket/vendor/golang/{UUID}/{UMOD}@{UVER}"));
+    assert_eq!(
+        std::fs::read(copy_dir.join("lib.go")).unwrap(),
+        PATCHED_LIB.as_bytes(),
+        "vendored copy must hold the patched bytes"
+    );
+    assert!(
+        consumer
+            .join(format!(
+                ".socket/vendor/golang/{UUID}/socket-patch.vendor.json"
+            ))
+            .is_file(),
+        "informational vendor marker missing"
+    );
+    assert!(consumer.join(".socket/vendor/state.json").is_file());
+    assert_eq!(
+        std::fs::read(modcache.join(format!("{UMOD}@{UVER}")).join("lib.go")).unwrap(),
+        PRISTINE_LIB.as_bytes(),
+        "module cache must stay pristine"
+    );
+
+    // FRESH-CHECKOUT PROOF: go.mod + go.sum + main.go + .socket/ only, EMPTY
+    // GOMODCACHE, GOPROXY=off (directory replaces bypass the cache and sumdb
+    // entirely — same claim the vendor capstone pins).
+    let fresh = tmp.path().join("fresh");
+    std::fs::create_dir_all(&fresh).unwrap();
+    std::fs::copy(consumer.join("go.mod"), fresh.join("go.mod")).unwrap();
+    if consumer.join("go.sum").exists() {
+        std::fs::copy(consumer.join("go.sum"), fresh.join("go.sum")).unwrap();
+    }
+    std::fs::copy(consumer.join("main.go"), fresh.join("main.go")).unwrap();
+    copy_dir_recursive(&consumer.join(".socket"), &fresh.join(".socket"));
+
+    let fresh_mc = tmp.path().join("fresh-modcache");
+    std::fs::create_dir_all(&fresh_mc).unwrap();
+    let offline_env = go_env(fresh_mc.to_str().unwrap(), "off");
+    let build = go(&fresh, &["build", "-o", "app", "."], &offline_env);
+    assert!(
+        build.status.success(),
+        "fresh-checkout `go build` (GOPROXY=off, empty GOMODCACHE) must succeed.\nstderr:\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let app = Command::new(fresh.join("app"))
+        .output()
+        .expect("run fresh app");
+    assert!(
+        String::from_utf8_lossy(&app.stdout).contains("OUT: PATCHED"),
+        "fresh build must link the PATCHED module: {}",
+        String::from_utf8_lossy(&app.stdout)
+    );
+    // The total-offline guarantee: the empty GOMODCACHE stayed empty.
+    assert_eq!(
+        std::fs::read_dir(&fresh_mc).unwrap().count(),
+        0,
+        "directory-replaced modules must write NOTHING to the module cache"
     );
 
     chmod_writable(tmp.path());

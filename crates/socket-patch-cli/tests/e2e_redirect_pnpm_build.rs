@@ -170,11 +170,32 @@ fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
     )
 }
 
-/// `scan --mode hosted` (the real binary) over the project at `root`.
-/// `extra_args` rides at the end (e.g. `--no-trust-lockfile-config`).
-fn scan_hosted(root: &Path, api_url: &str, extra_args: &[&str]) -> (i32, String, String) {
-    let mut args = vec![
-        "scan",
+/// Which CLI front door drives the hosted engine. Both consume the SAME
+/// engine by construction (v3.6): `scan --mode hosted` discovers the dep,
+/// while `get <uuid> --mode hosted` names the patch explicitly (the uuid
+/// identifier path is exempt from installed narrowing and needs no
+/// discovery mocks beyond view + reference, which the fixture mounts
+/// anyway).
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum HostedDriver {
+    Scan,
+    GetUuid,
+}
+
+/// `scan --mode hosted` / `get <uuid> --mode hosted` (the real binary) over
+/// the project at `root`, per `driver`. `extra_args` rides at the end (e.g.
+/// `--no-trust-lockfile-config` — a global flag both subcommands accept).
+fn run_hosted(
+    driver: HostedDriver,
+    root: &Path,
+    api_url: &str,
+    extra_args: &[&str],
+) -> (i32, String, String) {
+    let mut args = match driver {
+        HostedDriver::Scan => vec!["scan"],
+        HostedDriver::GetUuid => vec!["get", UUID],
+    };
+    args.extend_from_slice(&[
         "--mode",
         "hosted",
         "--json",
@@ -187,7 +208,7 @@ fn scan_hosted(root: &Path, api_url: &str, extra_args: &[&str]) -> (i32, String,
         ORG,
         "--api-token",
         "fake",
-    ];
+    ]);
     args.extend_from_slice(extra_args);
     run_socket(root, &args)
 }
@@ -394,18 +415,20 @@ struct PnpmRedirectFixture {
 }
 
 /// Steps 1–3 of the module doc against the REAL `corepack <pm>`: fixture
-/// install, patched tarball + API mocks, `scan --mode hosted`, and the
-/// envelope/lockfile/ledger/idempotency assertions. When
-/// `tamper_served_tarball` is set, the tarball route serves DIFFERENT bytes
-/// than the sha512 pinned into the lockfile — the negative twin's premise.
-/// `no_trust_config` runs every scan with `--no-trust-lockfile-config` and
-/// flips the trust-auto-config expectations to the opted-out contract.
-/// `None` = skip (message already printed).
+/// install, patched tarball + API mocks, the hosted rewrite (via `driver`:
+/// `scan --mode hosted` or `get <uuid> --mode hosted` — same engine, same
+/// on-disk contract), and the envelope/lockfile/ledger/idempotency
+/// assertions. When `tamper_served_tarball` is set, the tarball route serves
+/// DIFFERENT bytes than the sha512 pinned into the lockfile — the negative
+/// twin's premise. `no_trust_config` runs every rewrite with
+/// `--no-trust-lockfile-config` and flips the trust-auto-config expectations
+/// to the opted-out contract. `None` = skip (message already printed).
 async fn redirect_scanned_pnpm_project(
     pm: &str,
     tag: &str,
     tamper_served_tarball: bool,
     no_trust_config: bool,
+    driver: HostedDriver,
 ) -> Option<PnpmRedirectFixture> {
     if !has_corepack_pm(pm) {
         println!("SKIP e2e_redirect_pnpm_build ({tag}): `corepack {pm}` unavailable");
@@ -492,10 +515,10 @@ async fn redirect_scanned_pnpm_project(
     } else {
         &[]
     };
-    let (code, stdout, stderr) = scan_hosted(&proj, &server.uri(), scan_extra);
+    let (code, stdout, stderr) = run_hosted(driver, &proj, &server.uri(), scan_extra);
     assert_eq!(
         code, 0,
-        "scan --mode hosted failed ({tag}).\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        "{driver:?} --mode hosted failed ({tag}).\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     let env = parse_envelope(&stdout);
     assert_eq!(env["status"], "success", "envelope: {env}");
@@ -651,10 +674,10 @@ async fn redirect_scanned_pnpm_project(
     // hosted URL is already in the lock) but rewrites nothing — lock AND
     // workspace file byte-stable — and appends no duplicate edits (which
     // would poison a revert).
-    let (code, stdout, stderr) = scan_hosted(&proj, &server.uri(), scan_extra);
+    let (code, stdout, stderr) = run_hosted(driver, &proj, &server.uri(), scan_extra);
     assert_eq!(
         code, 0,
-        "second scan --mode hosted failed ({tag}).\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        "second {driver:?} --mode hosted failed ({tag}).\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     let env2 = parse_envelope(&stdout);
     assert_eq!(
@@ -774,7 +797,10 @@ fn assert_marker_landed(fresh: &Path, patched: &[u8], ci: &Output, tag: &str) {
 #[serial_test::serial]
 #[ignore = "wall-bound real-pnpm install (~60s); runs on all 3 OSes as an e2e CI matrix leg"]
 async fn pnpm10_redirect_fresh_checkout_frozen_install_lands_patched_bytes() {
-    let Some(fx) = redirect_scanned_pnpm_project(PNPM_PRIMARY, "pnpm10", false, false).await else {
+    let Some(fx) =
+        redirect_scanned_pnpm_project(PNPM_PRIMARY, "pnpm10", false, false, HostedDriver::Scan)
+            .await
+    else {
         return;
     };
 
@@ -793,8 +819,14 @@ async fn pnpm10_redirect_fresh_checkout_frozen_install_lands_patched_bytes() {
 #[serial_test::serial]
 #[ignore = "wall-bound real-pnpm install (~60s); runs on all 3 OSes as an e2e CI matrix leg"]
 async fn pnpm10_redirect_tampered_hosted_tarball_fails_fresh_frozen_install() {
-    let Some(fx) =
-        redirect_scanned_pnpm_project(PNPM_PRIMARY, "pnpm10-tampered", true, false).await
+    let Some(fx) = redirect_scanned_pnpm_project(
+        PNPM_PRIMARY,
+        "pnpm10-tampered",
+        true,
+        false,
+        HostedDriver::Scan,
+    )
+    .await
     else {
         return;
     };
@@ -826,13 +858,45 @@ async fn pnpm10_redirect_tampered_hosted_tarball_fails_fresh_frozen_install() {
     }
 }
 
+/// get-driven hosted twin (v3.6): `get <uuid> --mode hosted --json --yes`
+/// routes through the SAME hosted engine as `scan --mode hosted`, so the
+/// full pnpm@10 chain must hold unchanged — the fixture's lock splice,
+/// trustLockfile auto-config (pnpm-workspace.yaml gains `trustLockfile:
+/// true`, the workspace file joins `rewrittenFiles`), ledger, and
+/// idempotency assertions all run against the get front door, and the fresh
+/// dead-registry `pnpm install --frozen-lockfile` lands the marker bytes.
+/// The uuid identifier path is exempt from installed narrowing, so no
+/// search-endpoint mocks are needed beyond the view + reference routes the
+/// fixture already mounts.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial]
+#[ignore = "wall-bound real-pnpm install (~60s); runs on all 3 OSes as an e2e CI matrix leg"]
+async fn pnpm_get_uuid_hosted_fresh_checkout_frozen_install() {
+    let Some(fx) = redirect_scanned_pnpm_project(
+        PNPM_PRIMARY,
+        "pnpm10-get",
+        false,
+        false,
+        HostedDriver::GetUuid,
+    )
+    .await
+    else {
+        return;
+    };
+
+    let (fresh, ci) = fresh_checkout_install(&fx, PNPM_PRIMARY, "pnpm10-get", &[], false);
+    assert_marker_landed(&fresh, &fx.patched, &ci, "pnpm10 get-uuid");
+}
+
 /// Opportunistic pnpm@9 leg (the vendor capstone's secondary convention):
 /// same positive chain, no tamper twin needed — @10 already carries it.
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial]
 #[ignore = "wall-bound real-pnpm install (~60s); runs on all 3 OSes as an e2e CI matrix leg"]
 async fn pnpm9_redirect_fresh_checkout_frozen_install_lands_patched_bytes() {
-    let Some(fx) = redirect_scanned_pnpm_project(PNPM_SECONDARY, "pnpm9", false, false).await
+    let Some(fx) =
+        redirect_scanned_pnpm_project(PNPM_SECONDARY, "pnpm9", false, false, HostedDriver::Scan)
+            .await
     else {
         return;
     };
@@ -851,7 +915,9 @@ async fn pnpm9_redirect_fresh_checkout_frozen_install_lands_patched_bytes() {
 #[serial_test::serial]
 #[ignore = "wall-bound real-pnpm install (~60s); runs on all 3 OSes as an e2e CI matrix leg"]
 async fn pnpm11_zero_touch_frozen_install_lands_patched_bytes_via_auto_trust_config() {
-    let Some(fx) = redirect_scanned_pnpm_project(PNPM_TERTIARY, "pnpm11", false, false).await
+    let Some(fx) =
+        redirect_scanned_pnpm_project(PNPM_TERTIARY, "pnpm11", false, false, HostedDriver::Scan)
+            .await
     else {
         return;
     };
@@ -872,8 +938,14 @@ async fn pnpm11_zero_touch_frozen_install_lands_patched_bytes_via_auto_trust_con
 #[serial_test::serial]
 #[ignore = "wall-bound real-pnpm install (~60s); runs on all 3 OSes as an e2e CI matrix leg"]
 async fn pnpm11_no_trust_config_opt_out_frozen_install_needs_manual_trust_lockfile() {
-    let Some(fx) =
-        redirect_scanned_pnpm_project(PNPM_TERTIARY, "pnpm11-opt-out", false, true).await
+    let Some(fx) = redirect_scanned_pnpm_project(
+        PNPM_TERTIARY,
+        "pnpm11-opt-out",
+        false,
+        true,
+        HostedDriver::Scan,
+    )
+    .await
     else {
         return;
     };
@@ -917,7 +989,9 @@ async fn pnpm11_no_trust_config_opt_out_frozen_install_needs_manual_trust_lockfi
 #[serial_test::serial]
 #[ignore = "wall-bound real-pnpm install (~60s); runs on all 3 OSes as an e2e CI matrix leg"]
 async fn pnpm7_v5_lock_redirect_fresh_checkout_frozen_install_lands_patched_bytes() {
-    let Some(fx) = redirect_scanned_pnpm_project(PNPM_LEGACY_V5, "pnpm7", false, false).await
+    let Some(fx) =
+        redirect_scanned_pnpm_project(PNPM_LEGACY_V5, "pnpm7", false, false, HostedDriver::Scan)
+            .await
     else {
         return;
     };
@@ -938,7 +1012,9 @@ async fn pnpm7_v5_lock_redirect_fresh_checkout_frozen_install_lands_patched_byte
 #[serial_test::serial]
 #[ignore = "wall-bound real-pnpm install (~60s); runs on all 3 OSes as an e2e CI matrix leg"]
 async fn pnpm8_v6_lock_redirect_fresh_checkout_frozen_install_lands_patched_bytes() {
-    let Some(fx) = redirect_scanned_pnpm_project(PNPM_LEGACY_V6, "pnpm8", false, false).await
+    let Some(fx) =
+        redirect_scanned_pnpm_project(PNPM_LEGACY_V6, "pnpm8", false, false, HostedDriver::Scan)
+            .await
     else {
         return;
     };
@@ -1045,7 +1121,7 @@ async fn pnpm_v5_lock_key_rewrite_splices_in_place() {
     write_synthetic_project(tmp.path(), &v5_lock());
     let lock_path = tmp.path().join("pnpm-lock.yaml");
 
-    let (code, stdout, stderr) = scan_hosted(tmp.path(), &server.uri(), &[]);
+    let (code, stdout, stderr) = run_hosted(HostedDriver::Scan, tmp.path(), &server.uri(), &[]);
     assert_eq!(
         code, 0,
         "scan --mode hosted failed on the v5 lock.\nstdout:\n{stdout}\nstderr:\n{stderr}"
@@ -1124,7 +1200,7 @@ async fn pnpm_v6_plain_lock_key_rewrite_stays_supported() {
     write_synthetic_project(tmp.path(), &v6_lock());
     let lock_path = tmp.path().join("pnpm-lock.yaml");
 
-    let (code, stdout, stderr) = scan_hosted(tmp.path(), &server.uri(), &[]);
+    let (code, stdout, stderr) = run_hosted(HostedDriver::Scan, tmp.path(), &server.uri(), &[]);
     assert_eq!(
         code, 0,
         "scan --mode hosted failed on the v6 lock.\nstdout:\n{stdout}\nstderr:\n{stderr}"

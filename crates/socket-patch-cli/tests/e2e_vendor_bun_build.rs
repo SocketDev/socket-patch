@@ -22,6 +22,14 @@
 //!   6. **Revert proof**: `vendor --revert` restores bun.lock byte-for-byte
 //!      and removes `.socket/vendor/` entirely.
 //!
+//! The get-driven twin (v3.6) replaces steps 2–3 with a wiremock
+//! `view/{uuid}` (same hashes, base64 `blobContent` of the after bytes) and
+//! `get <uuid> --mode vendored --vendor-source build` — scan's vendored
+//! posture end to end: manifest + committed artifact + ledger + wired lock,
+//! NO `.socket/blobs` — then re-runs the same fresh-checkout frozen-install
+//! proof. The revert half is not repeated there: `vendor --revert` on the
+//! capstone already covers it (same ledger, same engine).
+//!
 //! LOCAL capstone (not behind docker-e2e): skips with a `println` + return
 //! when `bun` is unavailable or the fixture install cannot reach the
 //! registry; every assertion after that is HARD.
@@ -30,6 +38,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 use sha2::{Digest, Sha256};
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[path = "common/cache_env.rs"]
 mod cache_env;
@@ -38,6 +48,7 @@ const UUID: &str = "1a2b3c4d-5e6f-4a1b-8c2d-0123456789ab";
 const MARKER: &str = "/* SOCKET-PATCHED */\n";
 const DEP: &str = "left-pad";
 const DEP_VERSION: &str = "1.3.0";
+const ORG: &str = "test-org";
 
 // ── self-contained helpers ────────────────────────────────────────────
 
@@ -103,6 +114,11 @@ fn git_sha256(content: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
+fn b64(bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
 fn stage_patch(proj: &Path, purl: &str, file_key: &str, before: &[u8], after: &[u8]) {
     let socket = proj.join(".socket");
     std::fs::create_dir_all(socket.join("blobs")).unwrap();
@@ -130,7 +146,7 @@ fn stage_patch(proj: &Path, purl: &str, file_key: &str, before: &[u8], after: &[
 
 fn parse_envelope(stdout: &str) -> serde_json::Value {
     serde_json::from_str(stdout)
-        .unwrap_or_else(|e| panic!("vendor --json output is not JSON: {e}\nstdout:\n{stdout}"))
+        .unwrap_or_else(|e| panic!("--json output is not JSON: {e}\nstdout:\n{stdout}"))
 }
 
 fn copy_dir_recursive(src: &Path, dst: &Path) {
@@ -146,13 +162,29 @@ fn copy_dir_recursive(src: &Path, dst: &Path) {
     }
 }
 
-// ── the capstone ──────────────────────────────────────────────────────
+// ── shared fixture (steps 1–2) ────────────────────────────────────────
 
-#[test]
-fn bun_vendor_fresh_checkout_frozen_install_and_revert() {
+/// The real-bun project both capstones drive, plus the pre-vendor snapshots
+/// the wiring/revert assertions diff against.
+struct BunProject {
+    tmp: tempfile::TempDir,
+    proj: PathBuf,
+    orig: Vec<u8>,
+    patched: Vec<u8>,
+    purl: String,
+    lock_before: Vec<u8>,
+    pkg_before: Vec<u8>,
+}
+
+/// Steps 1–2 of the module doc, shared by the vendor capstone and the
+/// get-driven twin: a tempdir project depending on left-pad, a REAL
+/// `bun install` (network here, private cache) with the hermeticity guard,
+/// pristine-byte checks, and the patched-content twin of the installed
+/// `index.js`. `None` = soft-skip, already reported with a println.
+fn bun_project(tag: &str) -> Option<BunProject> {
     if !has_command("bun") {
-        println!("SKIP e2e_vendor_bun_build: `bun` not installed");
-        return;
+        println!("SKIP e2e_vendor_bun_build ({tag}): `bun` not installed");
+        return None;
     }
 
     let tmp = tempfile::tempdir().unwrap();
@@ -173,19 +205,19 @@ fn bun_vendor_fresh_checkout_frozen_install_and_revert() {
     let install = bun(&proj, &["install", "--save-text-lockfile"], &cache);
     if !install.status.success() {
         println!(
-            "SKIP e2e_vendor_bun_build: fixture `bun install` failed (registry \
+            "SKIP e2e_vendor_bun_build ({tag}): fixture `bun install` failed (registry \
              unreachable?):\n{}",
             String::from_utf8_lossy(&install.stderr)
         );
-        return;
+        return None;
     }
     let lock_path = proj.join("bun.lock");
     if !lock_path.is_file() {
         println!(
-            "SKIP e2e_vendor_bun_build: bun produced no text bun.lock (binary lockfile?) — \
-             this bun version's default lockfile is not the wirable text form"
+            "SKIP e2e_vendor_bun_build ({tag}): bun produced no text bun.lock (binary \
+             lockfile?) — this bun version's default lockfile is not the wirable text form"
         );
-        return;
+        return None;
     }
     // Hermeticity guard: the install must have gone through the PRIVATE cache.
     // If BUN_INSTALL_CACHE_DIR never reached the child, bun silently used the
@@ -205,11 +237,8 @@ fn bun_vendor_fresh_checkout_frozen_install_and_revert() {
     let patched: Vec<u8> = [MARKER.as_bytes(), orig.as_slice()].concat();
     let purl = format!("pkg:npm/{DEP}@{DEP_VERSION}");
 
-    stage_patch(&proj, &purl, "package/index.js", &orig, &patched);
-
-    let pkg_path = proj.join("package.json");
     let lock_before = std::fs::read(&lock_path).expect("bun.lock after bun install");
-    let pkg_before = std::fs::read(&pkg_path).expect("package.json");
+    let pkg_before = std::fs::read(proj.join("package.json")).expect("package.json");
     let lock_before_str = String::from_utf8(lock_before.clone()).unwrap();
     // bun 1.3 writes lockfileVersion 1, bun 1.4 writes 2 — one emitted
     // grammar; both are wirable.
@@ -224,9 +253,126 @@ fn bun_vendor_fresh_checkout_frozen_install_and_revert() {
         "pre-vendor packages entry must be the registry 4-tuple:\n{lock_before_str}"
     );
 
+    Some(BunProject {
+        tmp,
+        proj,
+        orig,
+        patched,
+        purl,
+        lock_before,
+        pkg_before,
+    })
+}
+
+/// The on-disk vendored state BOTH drivers (`vendor --offline`, `get <uuid>
+/// --mode vendored`) must produce: the committed artifact + informational
+/// marker + ledger, the bun.lock `packages` entry rewritten from the
+/// registry 4-tuple to the local-tarball 3-tuple with OUR recomputed
+/// integrity, and package.json untouched.
+fn assert_vendored_on_disk(proj: &Path, pkg_before: &[u8]) {
+    let tgz_rel = format!(".socket/vendor/npm/{UUID}/{DEP}-{DEP_VERSION}.tgz");
+    assert!(
+        proj.join(&tgz_rel).is_file(),
+        "vendored tarball missing at {tgz_rel}"
+    );
+    assert!(
+        proj.join(format!(
+            ".socket/vendor/npm/{UUID}/socket-patch.vendor.json"
+        ))
+        .is_file(),
+        "informational vendor marker missing"
+    );
+    assert!(
+        proj.join(".socket/vendor/state.json").is_file(),
+        "vendor ledger missing"
+    );
+
+    // bun.lock packages entry rewritten to the local-tarball 3-tuple:
+    // element 0 = `<name>@<bare-rel-path>` (no `file:`/`./`), the deps object
+    // shifts to index 1, integrity is the recomputed sha512 of OUR tarball.
+    let lock_after = std::fs::read_to_string(proj.join("bun.lock")).unwrap();
+    assert!(
+        lock_after.contains(&format!("\"{DEP}@{tgz_rel}\", {{}}, \"sha512-")),
+        "bun.lock packages entry must be the local-tarball 3-tuple; got:\n{lock_after}"
+    );
+    assert!(
+        !lock_after.contains(&format!("\"{DEP}@{DEP_VERSION}\", \"\"")),
+        "the registry 4-tuple must be gone after the rewrite:\n{lock_after}"
+    );
+    assert!(
+        !lock_after.contains(
+            "sha512-XI5MPzVNApjAyhQzphX8BkmKsKUxD4LdyK24iZeQGinBN9yTQT3bFlCBy/aVx2HrNcqQGsdot8ghrjyrvMCoEA=="
+        ),
+        "the inherited registry integrity must NOT survive the rewrite:\n{lock_after}"
+    );
+    // package.json is left untouched by the lock-only bun wiring.
+    assert_eq!(
+        std::fs::read(proj.join("package.json")).unwrap(),
+        pkg_before,
+        "bun vendoring is lock-only; package.json must stay byte-identical"
+    );
+}
+
+/// Step 4, shared: fresh dir with ONLY the committable files (package.json,
+/// bun.lock, and .socket/), an EMPTY `BUN_INSTALL_CACHE_DIR`, and the
+/// spike-proven strictest invocation `bun install --frozen-lockfile` — the
+/// patched bytes MUST be what bun installs (BN7), and the committed lock
+/// must stay byte-identical.
+fn fresh_checkout_frozen_install(tmp: &Path, proj: &Path, patched: &[u8]) {
+    let fresh = tmp.join("fresh");
+    std::fs::create_dir_all(&fresh).unwrap();
+    std::fs::copy(proj.join("package.json"), fresh.join("package.json")).unwrap();
+    std::fs::copy(proj.join("bun.lock"), fresh.join("bun.lock")).unwrap();
+    copy_dir_recursive(&proj.join(".socket"), &fresh.join(".socket"));
+
+    let fresh_cache = tmp.join("fresh-bun-cache");
+    let ci = bun(&fresh, &["install", "--frozen-lockfile"], &fresh_cache);
+    assert!(
+        ci.status.success(),
+        "fresh-checkout `bun install --frozen-lockfile` must succeed from the vendored \
+         tarball.\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&ci.stdout),
+        String::from_utf8_lossy(&ci.stderr),
+    );
+    let fresh_installed =
+        std::fs::read(fresh.join("node_modules").join(DEP).join("index.js")).unwrap();
+    assert!(
+        fresh_installed.starts_with(MARKER.as_bytes()),
+        "bun must install the PATCHED bytes from the vendored tarball; got:\n{}",
+        String::from_utf8_lossy(&fresh_installed[..fresh_installed.len().min(120)])
+    );
+    assert_eq!(
+        fresh_installed, patched,
+        "fresh install must be byte-identical to the patched content"
+    );
+    // --frozen-lockfile would have errored if the lock drifted; prove it
+    // left the committed lock byte-stable.
+    assert_eq!(
+        std::fs::read(fresh.join("bun.lock")).unwrap(),
+        std::fs::read(proj.join("bun.lock")).unwrap(),
+        "--frozen-lockfile install must leave bun.lock byte-identical"
+    );
+    eprintln!("FRESH INSTALL OK");
+}
+
+// ── the capstone ──────────────────────────────────────────────────────
+
+#[test]
+fn bun_vendor_fresh_checkout_frozen_install_and_revert() {
+    let Some(fx) = bun_project("vendor-offline") else {
+        return;
+    };
+    let proj = &fx.proj;
+    let lock_path = proj.join("bun.lock");
+    let pkg_path = proj.join("package.json");
+    let purl = &fx.purl;
+
+    // 2. Hand-stage the .socket/ manifest + blob from the installed bytes.
+    stage_patch(proj, purl, "package/index.js", &fx.orig, &fx.patched);
+
     // 3. Vendor (offline).
     let (code, stdout, stderr) = run_socket(
-        &proj,
+        proj,
         &[
             "vendor",
             "--json",
@@ -254,90 +400,17 @@ fn bun_vendor_fresh_checkout_frozen_install_and_revert() {
         "clean apply event: {applied}"
     );
 
-    let tgz_rel = format!(".socket/vendor/npm/{UUID}/{DEP}-{DEP_VERSION}.tgz");
-    assert!(
-        proj.join(&tgz_rel).is_file(),
-        "vendored tarball missing at {tgz_rel}"
-    );
-    assert!(
-        proj.join(format!(
-            ".socket/vendor/npm/{UUID}/socket-patch.vendor.json"
-        ))
-        .is_file(),
-        "informational vendor marker missing"
-    );
-    assert!(
-        proj.join(".socket/vendor/state.json").is_file(),
-        "vendor ledger missing"
-    );
-
-    // bun.lock packages entry rewritten to the local-tarball 3-tuple:
-    // element 0 = `<name>@<bare-rel-path>` (no `file:`/`./`), the deps object
-    // shifts to index 1, integrity is the recomputed sha512 of OUR tarball.
-    let lock_after = std::fs::read_to_string(&lock_path).unwrap();
-    assert!(
-        lock_after.contains(&format!("\"{DEP}@{tgz_rel}\", {{}}, \"sha512-")),
-        "bun.lock packages entry must be the local-tarball 3-tuple; got:\n{lock_after}"
-    );
-    assert!(
-        !lock_after.contains(&format!("\"{DEP}@{DEP_VERSION}\", \"\"")),
-        "the registry 4-tuple must be gone after the rewrite:\n{lock_after}"
-    );
-    assert!(
-        !lock_after.contains(
-            "sha512-XI5MPzVNApjAyhQzphX8BkmKsKUxD4LdyK24iZeQGinBN9yTQT3bFlCBy/aVx2HrNcqQGsdot8ghrjyrvMCoEA=="
-        ),
-        "the inherited registry integrity must NOT survive the rewrite:\n{lock_after}"
-    );
-    // package.json is left untouched by the lock-only bun wiring.
-    assert_eq!(
-        std::fs::read(&pkg_path).unwrap(),
-        pkg_before,
-        "bun vendoring is lock-only; package.json must stay byte-identical"
-    );
+    assert_vendored_on_disk(proj, &fx.pkg_before);
     eprintln!("VENDOR OK");
 
     // 4. FRESH-CHECKOUT PROOF: committable files only, EMPTY cache,
     //    spike-proven `--frozen-lockfile`.
-    let fresh = tmp.path().join("fresh");
-    std::fs::create_dir_all(&fresh).unwrap();
-    std::fs::copy(&pkg_path, fresh.join("package.json")).unwrap();
-    std::fs::copy(&lock_path, fresh.join("bun.lock")).unwrap();
-    copy_dir_recursive(&proj.join(".socket"), &fresh.join(".socket"));
-
-    let fresh_cache = tmp.path().join("fresh-bun-cache");
-    let ci = bun(&fresh, &["install", "--frozen-lockfile"], &fresh_cache);
-    assert!(
-        ci.status.success(),
-        "fresh-checkout `bun install --frozen-lockfile` must succeed from the vendored \
-         tarball.\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&ci.stdout),
-        String::from_utf8_lossy(&ci.stderr),
-    );
-    let fresh_installed =
-        std::fs::read(fresh.join("node_modules").join(DEP).join("index.js")).unwrap();
-    assert!(
-        fresh_installed.starts_with(MARKER.as_bytes()),
-        "bun must install the PATCHED bytes from the vendored tarball; got:\n{}",
-        String::from_utf8_lossy(&fresh_installed[..fresh_installed.len().min(120)])
-    );
-    assert_eq!(
-        fresh_installed, patched,
-        "fresh install must be byte-identical to the patched content"
-    );
-    // --frozen-lockfile would have errored if the lock drifted; prove it
-    // left the committed lock byte-stable.
-    assert_eq!(
-        std::fs::read(fresh.join("bun.lock")).unwrap(),
-        std::fs::read(&lock_path).unwrap(),
-        "--frozen-lockfile install must leave bun.lock byte-identical"
-    );
-    eprintln!("FRESH INSTALL OK");
+    fresh_checkout_frozen_install(fx.tmp.path(), proj, &fx.patched);
 
     // 5. Idempotency: a re-run exits 0 and leaves bun.lock byte-stable.
     let lock_wired = std::fs::read(&lock_path).unwrap();
     let (code, stdout, stderr) = run_socket(
-        &proj,
+        proj,
         &[
             "vendor",
             "--json",
@@ -360,7 +433,7 @@ fn bun_vendor_fresh_checkout_frozen_install_and_revert() {
 
     // 6. REVERT PROOF: bun.lock restored byte-for-byte, artifacts gone.
     let (code, stdout, stderr) = run_socket(
-        &proj,
+        proj,
         &[
             "vendor",
             "--revert",
@@ -379,12 +452,12 @@ fn bun_vendor_fresh_checkout_frozen_install_and_revert() {
     assert_eq!(renv["summary"]["removed"], 1, "one entry reverted: {renv}");
     assert_eq!(
         std::fs::read(&lock_path).unwrap(),
-        lock_before,
+        fx.lock_before,
         "revert must restore bun.lock byte-identical to the pre-vendor snapshot"
     );
     assert_eq!(
         std::fs::read(&pkg_path).unwrap(),
-        pkg_before,
+        fx.pkg_before,
         "revert must leave package.json byte-identical"
     );
     assert!(
@@ -392,4 +465,132 @@ fn bun_vendor_fresh_checkout_frozen_install_and_revert() {
         ".socket/vendor must be fully removed after revert"
     );
     eprintln!("REVERT OK");
+}
+
+// ── the get-driven twin (v3.6) ────────────────────────────────────────
+
+/// `view/{uuid}` carrying the SAME hashes the stager computes plus base64
+/// `blobContent` of the after bytes — everything the get-vendored flow needs
+/// to record the manifest and stage the patched content in memory (no
+/// `.socket/blobs` is ever written).
+async fn mock_view(server: &MockServer, purl: &str, before: &[u8], after: &[u8]) {
+    Mock::given(method("GET"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/view/{UUID}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "uuid": UUID,
+            "purl": purl,
+            "publishedAt": "2026-01-01T00:00:00Z",
+            "files": {
+                "package/index.js": {
+                    "beforeHash": git_sha256(before),
+                    "afterHash": git_sha256(after),
+                    "blobContent": b64(after),
+                }
+            },
+            "vulnerabilities": {},
+            "description": "capstone marker patch",
+            "license": "MIT",
+            "tier": "free",
+        })))
+        .mount(server)
+        .await;
+}
+
+/// get-driven twin: `get <uuid> --mode vendored` must land scan's vendored
+/// result — manifest record + committed artifact + ledger + wired lock, NO
+/// blobs — and the fresh-checkout frozen install must materialize the
+/// patched bytes. The revert half is deliberately not repeated here:
+/// `vendor --revert` on the capstone above already proves it (same ledger,
+/// same engine).
+#[tokio::test(flavor = "multi_thread")]
+async fn bun_get_uuid_vendored_fresh_checkout_frozen_install() {
+    let Some(fx) = bun_project("get-uuid-vendored") else {
+        return;
+    };
+    let proj = &fx.proj;
+
+    // Steps 2–3, get-driven: the patch record comes from a mocked
+    // `view/{uuid}` instead of a hand-staged `.socket/`, and the vendor step
+    // builds the artifact locally (`--vendor-source build` — no vendoring
+    // service, so no grant/tarball mocks are needed).
+    let server = MockServer::start().await;
+    mock_view(&server, &fx.purl, &fx.orig, &fx.patched).await;
+
+    let server_uri = server.uri();
+    let (code, stdout, stderr) = run_socket(
+        proj,
+        &[
+            "get",
+            UUID,
+            "--mode",
+            "vendored",
+            "--json",
+            "--yes",
+            "--cwd",
+            proj.to_str().unwrap(),
+            "--api-url",
+            &server_uri,
+            "--api-token",
+            "fake",
+            "--org",
+            ORG,
+            "--vendor-source",
+            "build",
+        ],
+    );
+    assert_eq!(
+        code, 0,
+        "get --mode vendored failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let env = parse_envelope(&stdout);
+    assert_eq!(env["status"], "success", "envelope: {env}");
+    assert_eq!(env["found"], 1, "envelope: {env}");
+    assert_eq!(env["downloaded"], 1, "envelope: {env}");
+    assert!(
+        env.get("applied").is_none(),
+        "vendored get drops the applied key (nothing is applied in place): {env}"
+    );
+    assert_eq!(
+        env["vendor"]["summary"]["applied"], 1,
+        "the nested vendor envelope must report the one vendored package: {env}"
+    );
+    assert_eq!(
+        env["vendor"]["summary"]["failed"], 0,
+        "no vendor failures: {env}"
+    );
+
+    // Anti-vacuity oracle: the record really came from the mocked view
+    // endpoint, not from any pre-existing local state.
+    let view_hits = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| r.url.path().contains(&format!("/patches/view/{UUID}")))
+        .count();
+    assert!(
+        view_hits >= 1,
+        "the view endpoint must have served the patch record"
+    );
+
+    // Manifest yes, blobs no (scan-vendored parity: content stays in memory).
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(proj.join(".socket/manifest.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        manifest["patches"][fx.purl.as_str()]["uuid"],
+        UUID,
+        "the manifest must record the vendored patch: {manifest}"
+    );
+    assert!(
+        !proj.join(".socket/blobs").exists(),
+        "get --mode vendored must NOT persist blobs"
+    );
+
+    assert_vendored_on_disk(proj, &fx.pkg_before);
+    eprintln!("GET VENDOR OK");
+
+    // FRESH-CHECKOUT PROOF: committable files only, EMPTY cache,
+    // spike-proven `--frozen-lockfile`.
+    fresh_checkout_frozen_install(fx.tmp.path(), proj, &fx.patched);
 }

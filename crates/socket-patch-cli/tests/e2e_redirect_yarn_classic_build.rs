@@ -205,13 +205,27 @@ struct ClassicRedirectFixture {
     _server: MockServer,
 }
 
-/// Steps 1–3: real install, patched tarball + API mocks, `scan --mode hosted
-/// --vex`, and the envelope/lockfile/ledger assertions.
+/// Which CLI front door drives the hosted engine. Both consume the SAME
+/// engine by construction (v3.6): `scan --mode hosted` discovers the dep,
+/// while `get <uuid> --mode hosted` names the patch explicitly (the uuid
+/// identifier path is exempt from installed narrowing and needs only the
+/// view + reference mocks, which the fixture mounts anyway). get has no
+/// `--vex`, so the get driver drops the vex flags + assertions.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum HostedDriver {
+    Scan,
+    GetUuid,
+}
+
+/// Steps 1–3: real install, patched tarball + API mocks, the hosted rewrite
+/// (per `driver`: `scan --mode hosted --vex` or `get <uuid> --mode hosted`),
+/// and the envelope/lockfile/ledger assertions.
 /// `tamper_served_tarball` serves DIFFERENT bytes at the hosted URL than the
 /// sha1/integrity pins. `None` = skip (message printed).
 async fn classic_hosted_project(
     tag: &str,
     tamper_served_tarball: bool,
+    driver: HostedDriver,
 ) -> Option<ClassicRedirectFixture> {
     if !has_corepack_pm(YARN_CLASSIC) {
         println!(
@@ -362,10 +376,11 @@ async fn classic_hosted_project(
         .mount(&server)
         .await;
 
-    // scan --mode hosted --vex.
-    let (code, stdout, stderr) = run_socket(
-        &proj,
-        &[
+    // The hosted rewrite: scan (with --vex) or get <uuid> (no --vex — get
+    // has none by contract), same engine either way.
+    let api_url = server.uri();
+    let argv: Vec<&str> = match driver {
+        HostedDriver::Scan => vec![
             "scan",
             "--mode",
             "hosted",
@@ -374,7 +389,7 @@ async fn classic_hosted_project(
             "--cwd",
             proj.to_str().unwrap(),
             "--api-url",
-            &server.uri(),
+            &api_url,
             "--org",
             ORG,
             "--api-token",
@@ -384,13 +399,30 @@ async fn classic_hosted_project(
             "--vex-product",
             PRODUCT,
         ],
-    );
+        HostedDriver::GetUuid => vec![
+            "get",
+            UUID,
+            "--mode",
+            "hosted",
+            "--json",
+            "--yes",
+            "--cwd",
+            proj.to_str().unwrap(),
+            "--api-url",
+            &api_url,
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+        ],
+    };
+    let (code, stdout, stderr) = run_socket(&proj, &argv);
     assert_eq!(
         code, 0,
-        "scan --mode hosted failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        "{driver:?} --mode hosted failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     let env: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
-        panic!("scan --mode hosted --json output is not JSON: {e}\nstdout:\n{stdout}")
+        panic!("{driver:?} --mode hosted --json output is not JSON: {e}\nstdout:\n{stdout}")
     });
     assert_eq!(env["status"], "success", "envelope: {env}");
     assert_eq!(
@@ -454,7 +486,7 @@ fn fresh_checkout_yarn_install(fx: &ClassicRedirectFixture) -> (PathBuf, Output)
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial]
 async fn classic_redirect_fresh_checkout_installs_patched_bytes() {
-    let Some(fx) = classic_hosted_project("main", false).await else {
+    let Some(fx) = classic_hosted_project("main", false, HostedDriver::Scan).await else {
         return;
     };
 
@@ -478,13 +510,48 @@ async fn classic_redirect_fresh_checkout_installs_patched_bytes() {
     );
 }
 
+/// get-driven hosted twin (v3.6): `get <uuid> --mode hosted --json --yes`
+/// routes through the SAME hosted engine as `scan --mode hosted`, so the
+/// classic chain must hold unchanged — the fixture's lock pin (hosted URL +
+/// `#sha1` + recomputed integrity) and ledger assertions run against the get
+/// front door, and the fresh `yarn install --frozen-lockfile` (empty cache,
+/// dead registry) installs the patched bytes from the hosted tarball. The
+/// uuid identifier path is exempt from installed narrowing, so only the
+/// view + reference mocks matter (the fixture mounts them anyway).
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial]
+async fn classic_get_uuid_hosted_fresh_checkout_installs() {
+    let Some(fx) = classic_hosted_project("get-uuid", false, HostedDriver::GetUuid).await else {
+        return;
+    };
+
+    let (fresh, ci) = fresh_checkout_yarn_install(&fx);
+    assert!(
+        ci.status.success(),
+        "fresh-checkout `yarn install --frozen-lockfile` must succeed from the hosted patch \
+         tarball (get-driven redirect).\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&ci.stdout),
+        String::from_utf8_lossy(&ci.stderr),
+    );
+    let installed = std::fs::read(fresh.join("node_modules").join(DEP).join("index.js")).unwrap();
+    assert!(
+        installed.starts_with(MARKER.as_bytes()),
+        "yarn must install the PATCHED bytes from the hosted patch (get-driven); got:\n{}",
+        String::from_utf8_lossy(&installed[..installed.len().min(120)])
+    );
+    assert_eq!(
+        installed, fx.patched,
+        "fresh install must be byte-identical to the patched content (get-driven)"
+    );
+}
+
 /// Negative twin: the hosted URL serves a DIFFERENT tarball while the lock
 /// pins the real sha1/integrity — the fresh install must fail on the
 /// integrity/hash check, proving the lock pin is enforcement.
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial]
 async fn classic_redirect_tampered_hosted_tarball_fails_integrity() {
-    let Some(fx) = classic_hosted_project("tampered", true).await else {
+    let Some(fx) = classic_hosted_project("tampered", true, HostedDriver::Scan).await else {
         return;
     };
 

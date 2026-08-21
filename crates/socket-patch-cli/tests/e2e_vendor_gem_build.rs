@@ -27,6 +27,15 @@
 //!   7. **Revert proof**: `vendor --revert` byte-restores BOTH halves of the
 //!      pair edit and removes `.socket/vendor/` entirely.
 //!
+//! The `get <uuid> --mode vendored` twin (v3.6) drives the same
+//! fresh-checkout committability proof through get's per-advisory selector:
+//! the patch record comes from a wiremock `view/{uuid}` (real hashes of the
+//! ACTUAL installed bytes + inline `blobContent`), `--vendor-source build`
+//! keeps the artifact build local, and the result must match a plain
+//! `vendor` run by construction — manifest + `.socket/vendor/` artifact +
+//! ledger + the mandatory Gemfile/lock pair edit, but NO `.socket/blobs`
+//! (get's vendored download phase holds content in memory).
+//!
 //! Skips (with a println) when `bundle`/`ruby` are missing, when the host
 //! bundler predates the spike-verified 2.5 floor (macOS ships a 1.17-era
 //! bundler whose lock grammar the pair edit was never validated against), or
@@ -37,6 +46,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use sha2::{Digest, Sha256};
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[path = "common/cache_env.rs"]
 mod cache_env;
@@ -46,6 +57,8 @@ mod cache_env;
 const UUID: &str = "3c4d5e6f-7a8b-4a1b-8c2d-0123456789ab";
 const DEP: &str = "rack";
 const GHSA: &str = "GHSA-vend-gem-host";
+/// Org slug baked into the wiremock API paths of the get-driven twin.
+const ORG: &str = "test-org";
 
 // ── self-contained helpers ────────────────────────────────────────────
 
@@ -137,6 +150,12 @@ fn git_sha256(content: &[u8]) -> String {
     hasher.update(format!("blob {}\0", content.len()).as_bytes());
     hasher.update(content);
     hex::encode(hasher.finalize())
+}
+
+/// Base64 for the wiremock view's inline `blobContent`.
+fn b64(bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
 /// Write `.socket/manifest.json` + the after-hash blob (with a vulnerability
@@ -847,5 +866,322 @@ fn gem_vendor_transitive_dep_fresh_checkout_and_revert() {
     assert!(
         !proj.join(".socket/vendor").exists(),
         ".socket/vendor must be fully removed after revert"
+    );
+}
+
+/// GET-DRIVEN TWIN of the direct-dep capstone: `get <uuid> --mode vendored`
+/// (v3.6, the per-advisory selector) must leave the same committable state
+/// as a plain `vendor` run — manifest record, `.socket/vendor/` artifact +
+/// ledger, the mandatory Gemfile/lock pair edit — with NO `.socket/blobs`
+/// (get's vendored download phase holds content in memory) and get's
+/// envelope nesting the vendor Envelope (and dropping `applied`). The patch
+/// record arrives THROUGH get from a wiremock `view/{uuid}` carrying REAL
+/// git-blob hashes of the actual installed bytes plus inline `blobContent`;
+/// `--vendor-source build` keeps the artifact build local so that mock is
+/// the only API surface. Proof is the model capstone's fresh-checkout leg
+/// (frozen install, byte-stable lock, runtime require probe); the revert
+/// half stays with the vendor-driven capstone.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "host capstone: shells out to a real bundler >= 2.5; the unpinned `test` job \
+            skips it, the e2e job runs it with a pinned toolchain via --ignored"]
+async fn gem_get_uuid_vendored_fresh_checkout_bundle_install() {
+    if !has_command("ruby") {
+        println!("SKIP e2e_vendor_gem_build (get-vendored): `ruby` not installed");
+        return;
+    }
+    let Some((major, minor)) = bundler_version() else {
+        println!(
+            "SKIP e2e_vendor_gem_build (get-vendored): `bundle` not installed (or version \
+             unparseable)"
+        );
+        return;
+    };
+    if major < 2 || (major == 2 && minor < 5) {
+        println!(
+            "SKIP e2e_vendor_gem_build (get-vendored): host bundler {major}.{minor} predates \
+             the spike-verified 2.5 floor"
+        );
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::write(
+        proj.join("Gemfile"),
+        "source \"https://rubygems.org\"\n\ngem \"rack\", \"~> 3.1\"\n",
+    )
+    .unwrap();
+
+    let config = bundle(
+        &proj,
+        &["config", "set", "--local", "path", "vendor/bundle"],
+        false,
+    );
+    if !config.status.success() {
+        println!(
+            "SKIP e2e_vendor_gem_build (get-vendored): `bundle config set --local path` \
+             failed:\n{}",
+            String::from_utf8_lossy(&config.stderr)
+        );
+        return;
+    }
+
+    // 1. REAL fixture: bundle install resolves rack from rubygems.org
+    //    (network allowed here only; skip when unreachable).
+    let install = bundle(&proj, &["install"], false);
+    if !install.status.success() {
+        println!(
+            "SKIP e2e_vendor_gem_build (get-vendored): `bundle install` failed (registry \
+             unreachable, or host ruby too old for rack ~> 3.1?):\n{}",
+            String::from_utf8_lossy(&install.stderr)
+        );
+        return;
+    }
+
+    let lock_path = proj.join("Gemfile.lock");
+    let lock_before = std::fs::read(&lock_path).expect("Gemfile.lock after bundle install");
+    let version = locked_gem_version(&String::from_utf8_lossy(&lock_before), DEP)
+        .unwrap_or_else(|| panic!("could not read the resolved {DEP} version from Gemfile.lock"));
+
+    // The installed gem dir under bundler's deployment layout.
+    let mut ruby = Command::new("ruby");
+    ruby.args(["-e", "puts Gem.ruby_api_version"]);
+    cache_env::isolate(&mut ruby);
+    let api = ruby.output().expect("failed to run ruby");
+    assert!(api.status.success(), "ruby api version probe failed");
+    let api = String::from_utf8_lossy(&api.stdout).trim().to_string();
+    let installed_rb = proj
+        .join("vendor/bundle/ruby")
+        .join(&api)
+        .join("gems")
+        .join(format!("{DEP}-{version}"))
+        .join("lib/rack.rb");
+    let orig = std::fs::read(&installed_rb).expect("installed lib/rack.rb");
+    assert!(
+        !String::from_utf8_lossy(&orig).contains("SOCKET_PATCH_VENDOR_E2E"),
+        "pristine install must not carry the probe constant"
+    );
+
+    // 2. Marker patch on the ACTUAL installed bytes — served by the MOCK
+    //    API (view with real hashes + inline blobContent) instead of a
+    //    hand-staged manifest: get is the component under test, so the
+    //    record must arrive through it.
+    let marker = format!(
+        "\n# SOCKET-PATCH-VENDOR-E2E-MARKER\nmodule Rack\n  SOCKET_PATCH_VENDOR_E2E = \"{UUID}\"\nend\n"
+    );
+    let patched: Vec<u8> = [orig.as_slice(), marker.as_bytes()].concat();
+    let purl = format!("pkg:gem/{DEP}@{version}");
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/view/{UUID}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "uuid": UUID,
+            "purl": purl,
+            "publishedAt": "2026-01-01T00:00:00Z",
+            "files": {
+                "lib/rack.rb": {
+                    "beforeHash": git_sha256(&orig),
+                    "afterHash": git_sha256(&patched),
+                    "blobContent": b64(&patched),
+                }
+            },
+            "vulnerabilities": { GHSA: {
+                "cves": ["CVE-2026-55555"],
+                "summary": "gem capstone vex vuln",
+                "severity": "high",
+                "description": "d",
+            }},
+            "description": "capstone marker patch",
+            "license": "MIT",
+            "tier": "free",
+        })))
+        .mount(&server)
+        .await;
+    let api_url = server.uri();
+
+    let gemfile_path = proj.join("Gemfile");
+
+    // 3. get <uuid> --mode vendored: record save + scan's whole-manifest
+    //    vendor step in one command. `--vendor-source build` keeps the
+    //    artifact build local (no vendoring-service mocks needed); the
+    //    staging fetches the blob content into MEMORY from the view mock.
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &[
+            "get",
+            UUID,
+            "--mode",
+            "vendored",
+            "--json",
+            "--yes",
+            "--vendor-source",
+            "build",
+            "--cwd",
+            proj.to_str().unwrap(),
+            "--api-url",
+            &api_url,
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+        ],
+    );
+    assert_eq!(
+        code, 0,
+        "get --mode vendored failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let env = parse_envelope(&stdout);
+    assert_eq!(env["status"], "success", "envelope: {env}");
+    assert_eq!(env["found"], 1, "envelope: {env}");
+    assert_eq!(env["downloaded"], 1, "envelope: {env}");
+    // get's vendored envelope (CLI_CONTRACT.md "get --mode and installed
+    // narrowing"): `applied` is dropped (structurally zero — nothing is
+    // applied in place), and the vendor Envelope nests under "vendor".
+    assert!(
+        env.get("applied").is_none(),
+        "get --mode vendored must drop the `applied` key: {env}"
+    );
+    assert_eq!(env["patches"][0]["purl"], purl.as_str(), "envelope: {env}");
+    assert_eq!(env["patches"][0]["uuid"], UUID, "envelope: {env}");
+    assert_eq!(
+        env["vendor"]["summary"]["applied"], 1,
+        "one package vendored: {env}"
+    );
+    assert_eq!(
+        env["vendor"]["summary"]["failed"], 0,
+        "no vendor failures: {env}"
+    );
+    let applied = env["vendor"]["events"]
+        .as_array()
+        .expect("vendor events array")
+        .iter()
+        .find(|e| e["action"] == "applied" && e["purl"] == purl.as_str())
+        .unwrap_or_else(|| panic!("expected an applied vendor event for {purl}: {env}"));
+    assert!(
+        applied.get("errorCode").is_none(),
+        "clean vendor event: {applied}"
+    );
+
+    // Persistence: the manifest records the patch; NO blobs land on disk
+    // (the committed artifact IS the patch — parity with scan --mode
+    // vendored).
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(proj.join(".socket/manifest.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        manifest["patches"][purl.as_str()]["uuid"],
+        UUID,
+        "manifest must record the vendored patch: {manifest}"
+    );
+    assert!(
+        !proj.join(".socket/blobs").exists(),
+        "get --mode vendored must NOT persist blobs"
+    );
+
+    // Artifact: patched gem dir + the materialized stub gemspec + the
+    // committed ledger — identical to what a plain `vendor` run commits.
+    let copy_rel = format!(".socket/vendor/gem/{UUID}/{DEP}-{version}");
+    assert_eq!(
+        std::fs::read(proj.join(&copy_rel).join("lib/rack.rb")).unwrap(),
+        patched,
+        "vendored lib/rack.rb must hold the patched bytes"
+    );
+    assert!(
+        proj.join(&copy_rel)
+            .join(format!("{DEP}.gemspec"))
+            .is_file(),
+        "stub gemspec not materialized into the vendored dir"
+    );
+    assert!(
+        proj.join(".socket/vendor/state.json").is_file(),
+        "vendor ledger missing"
+    );
+
+    // The MANDATORY pair edit, exactly as the vendor-driven capstone pins
+    // it: Gemfile line → exact pin + `path:`; the lock gains the canonical
+    // PATH section (before GEM) and the `rack (= <ver>)!` DEPENDENCIES pin.
+    let gemfile = std::fs::read_to_string(&gemfile_path).unwrap();
+    assert!(
+        gemfile.contains(&format!(
+            "gem \"{DEP}\", \"{version}\", path: \"{copy_rel}\""
+        )),
+        "Gemfile line not rewritten to the exact-pin + path: form:\n{gemfile}"
+    );
+    let lock = std::fs::read_to_string(&lock_path).unwrap();
+    let path_section = format!("PATH\n  remote: {copy_rel}\n  specs:\n    {DEP} ({version})");
+    assert!(
+        lock.contains(&path_section),
+        "canonical PATH section missing from Gemfile.lock:\n{lock}"
+    );
+    assert!(
+        lock.contains(&format!("\n  {DEP} (= {version})!")),
+        "DEPENDENCIES pin `  {DEP} (= {version})!` missing:\n{lock}"
+    );
+    let path_at = lock.find(&path_section).unwrap();
+    let gem_at = lock.find("\nGEM\n").expect("GEM section survives the edit");
+    assert!(
+        path_at < gem_at,
+        "the PATH section must precede GEM (bundler's canonical placement):\n{lock}"
+    );
+
+    // FRESH-CHECKOUT PROOF (the model capstone's leg): ONLY the committable
+    // files, frozen lock. The vendored path source is the only provider of
+    // rack, and the patched constant must be visible at `require` time.
+    let fresh = tmp.path().join("fresh");
+    std::fs::create_dir_all(&fresh).unwrap();
+    std::fs::copy(&gemfile_path, fresh.join("Gemfile")).unwrap();
+    std::fs::copy(&lock_path, fresh.join("Gemfile.lock")).unwrap();
+    copy_dir_recursive(&proj.join(".socket"), &fresh.join(".socket"));
+    copy_dir_recursive(&proj.join(".bundle"), &fresh.join(".bundle"));
+    assert!(
+        !fresh.join("vendor").exists(),
+        "fresh checkout must not carry an installed tree (test bug)"
+    );
+
+    let lock_wired = std::fs::read(&lock_path).unwrap();
+    let ci = bundle(&fresh, &["install"], true);
+    assert!(
+        ci.status.success(),
+        "fresh-checkout frozen `bundle install` must succeed from the vendored path.\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&ci.stdout),
+        String::from_utf8_lossy(&ci.stderr),
+    );
+    assert_eq!(
+        std::fs::read(fresh.join("Gemfile.lock")).unwrap(),
+        lock_wired,
+        "frozen install must leave the committed Gemfile.lock byte-identical"
+    );
+
+    // Runtime proof: rack loads FROM the vendored path and exposes the
+    // patched probe constant carrying the patch uuid.
+    let probe = bundle(
+        &fresh,
+        &[
+            "exec",
+            "ruby",
+            "-e",
+            "require \"rack\"\n\
+             abort \"probe constant missing after require\" unless defined?(Rack::SOCKET_PATCH_VENDOR_E2E)\n\
+             puts Rack::SOCKET_PATCH_VENDOR_E2E\n\
+             puts $LOADED_FEATURES.grep(%r{/rack\\.rb\\z})",
+        ],
+        false,
+    );
+    assert!(
+        probe.status.success(),
+        "bundle exec runtime probe failed.\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&probe.stdout),
+        String::from_utf8_lossy(&probe.stderr),
+    );
+    let probe_out = String::from_utf8_lossy(&probe.stdout).into_owned();
+    assert!(
+        probe_out.contains(UUID),
+        "probe constant must carry the patch uuid:\n{probe_out}"
+    );
+    assert!(
+        probe_out.contains(&format!("{copy_rel}/lib/rack.rb")),
+        "rack must be loaded from the vendored path:\n{probe_out}"
     );
 }

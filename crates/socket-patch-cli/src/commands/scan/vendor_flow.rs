@@ -34,7 +34,10 @@ use super::{
 /// discovery. Action values are part of the CLI contract:
 /// `would_vendor` (no ledger entry), `already_vendored` (entry at this
 /// uuid), `would_revendor` + `oldUuid` (entry at an older uuid).
-async fn preview_vendor_json(cwd: &Path, selected: &[PatchSearchResult]) -> serde_json::Value {
+pub(crate) async fn preview_vendor_json(
+    cwd: &Path,
+    selected: &[PatchSearchResult],
+) -> serde_json::Value {
     let state = load_state(cwd).await.unwrap_or_default();
     let mut patches: Vec<serde_json::Value> = selected
         .iter()
@@ -619,7 +622,7 @@ pub(super) fn boxed_vendor_interactive_path<'a>(
 /// would otherwise ride must themselves fit Windows' 1 MiB main-thread
 /// stack (same rationale as [`boxed_vendor_json_path`], one level down).
 #[allow(clippy::type_complexity)]
-fn boxed_scan_vendor_step<'a>(
+pub(crate) fn boxed_scan_vendor_step<'a>(
     common: &'a GlobalArgs,
     manifest_path: &'a Path,
     socket_dir: &'a Path,

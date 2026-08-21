@@ -25,6 +25,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use sha2::{Digest, Sha256};
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[path = "common/cache_env.rs"]
 mod cache_env;
@@ -36,6 +38,8 @@ const UUID: &str = "1a2b3c4d-5e6f-4a1b-8c2d-0123456789ab";
 const MARKER: &str = "/* SOCKET-PATCHED */\n";
 const DEP: &str = "left-pad";
 const DEP_VERSION: &str = "1.3.0";
+/// Org slug embedded in the mocked API paths of the get-driven twin.
+const ORG: &str = "test-org";
 
 // ── self-contained helpers ────────────────────────────────────────────
 
@@ -113,6 +117,12 @@ fn git_sha256(content: &[u8]) -> String {
     hasher.update(format!("blob {}\0", content.len()).as_bytes());
     hasher.update(content);
     hex::encode(hasher.finalize())
+}
+
+/// Standard base64 — the encoding of a view response's inline `blobContent`.
+fn b64(bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
 /// Write `.socket/manifest.json` + the after-hash blob so vendor runs fully
@@ -521,5 +531,221 @@ fn npm_vendor_vex_attests_against_vendored_tarball() {
     assert!(
         impact.contains("(vendored)"),
         "vendored attestation must carry the (vendored) marker: {impact}"
+    );
+}
+
+/// get-driven twin of the capstone (v3.6): instead of hand-staging
+/// `.socket/` (manifest + blob) and running `vendor --offline`,
+/// `get <uuid> --mode vendored` resolves the SAME patch from a mocked
+/// `view/{uuid}` endpoint — the before/after git-blob hashes `stage_patch`
+/// would compute from the actually-installed bytes, plus the after bytes
+/// inline as base64 `blobContent` — and must land the identical committed
+/// state: manifest record, deterministic artifact, vendor ledger, `file:`
+/// lock wiring with a recomputed sha512, and NO `.socket/blobs` (scan
+/// parity: the download phase holds patch content in memory). The
+/// fresh-checkout `npm ci` proof is the capstone's, verbatim.
+// multi_thread: the CLI/npm subprocesses block a worker thread while
+// wiremock keeps serving the view route on the others.
+#[tokio::test(flavor = "multi_thread")]
+async fn npm_get_uuid_vendored_fresh_checkout_npm_ci() {
+    if !has_command("npm") {
+        println!("SKIP e2e_vendor_npm_build (get vendored): `npm` not installed");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::write(
+        proj.join("package.json"),
+        r#"{"name":"get-vendored-capstone","version":"0.0.0","private":true}"#,
+    )
+    .unwrap();
+
+    // 1. REAL fixture: npm install (network allowed here, private cache).
+    let cache = tmp.path().join("npm-cache");
+    let install = npm(
+        &proj,
+        &[
+            "install",
+            &format!("{DEP}@{DEP_VERSION}"),
+            "--no-audit",
+            "--no-fund",
+            "--cache",
+            cache.to_str().unwrap(),
+        ],
+    );
+    if !install.status.success() {
+        println!(
+            "SKIP e2e_vendor_npm_build (get vendored): `npm install {DEP}@{DEP_VERSION}` failed \
+             (registry unreachable?):\n{}",
+            String::from_utf8_lossy(&install.stderr)
+        );
+        return;
+    }
+
+    let orig = std::fs::read(proj.join("node_modules").join(DEP).join("index.js"))
+        .expect("installed index.js");
+    assert!(
+        !orig.starts_with(MARKER.as_bytes()),
+        "pristine install must not carry the marker"
+    );
+    let patched: Vec<u8> = [MARKER.as_bytes(), orig.as_slice()].concat();
+    let purl = format!("pkg:npm/{DEP}@{DEP_VERSION}");
+
+    // 2. The patch record arrives over the (mocked) API instead of being
+    //    staged on disk: same hashes, after bytes inline.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/view/{UUID}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "uuid": UUID,
+            "purl": purl,
+            "publishedAt": "2026-01-01T00:00:00Z",
+            "files": {
+                "package/index.js": {
+                    "beforeHash": git_sha256(&orig),
+                    "afterHash": git_sha256(&patched),
+                    "blobContent": b64(&patched),
+                }
+            },
+            "vulnerabilities": {},
+            "description": "capstone marker patch",
+            "license": "MIT",
+            "tier": "free",
+        })))
+        .mount(&server)
+        .await;
+
+    let lock_path = proj.join("package-lock.json");
+    let pre_lock: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&lock_path).unwrap()).unwrap();
+    let registry_integrity = pre_lock["packages"][format!("node_modules/{DEP}")]["integrity"]
+        .as_str()
+        .expect("registry lock entry has integrity")
+        .to_string();
+
+    // 3. get <uuid> --mode vendored (--vendor-source build: local build, no
+    //    vendoring-service mocks needed).
+    let uri = server.uri();
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &[
+            "get",
+            UUID,
+            "--mode",
+            "vendored",
+            "--json",
+            "--yes",
+            "--cwd",
+            proj.to_str().unwrap(),
+            "--api-url",
+            &uri,
+            "--api-token",
+            "fake",
+            "--org",
+            ORG,
+            "--vendor-source",
+            "build",
+        ],
+    );
+    assert_eq!(
+        code, 0,
+        "get --mode vendored failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let env = parse_envelope(&stdout);
+    assert_eq!(env["status"], "success", "envelope: {env}");
+    assert_eq!(env["found"], 1, "envelope: {env}");
+    assert_eq!(env["downloaded"], 1, "envelope: {env}");
+    assert!(
+        env.get("applied").is_none(),
+        "vendored get drops `applied` — nothing is applied in place: {env}"
+    );
+    assert_eq!(
+        env["vendor"]["summary"]["applied"], 1,
+        "one package vendored: {env}"
+    );
+    assert_eq!(env["vendor"]["summary"]["failed"], 0, "no failures: {env}");
+
+    // Committed state: manifest record + artifact + ledger, NO blobs.
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(proj.join(".socket/manifest.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        manifest["patches"][purl.as_str()]["uuid"],
+        UUID,
+        "the manifest must record the vendored patch: {manifest}"
+    );
+    let tgz_rel = format!(".socket/vendor/npm/{UUID}/{DEP}-{DEP_VERSION}.tgz");
+    assert!(
+        proj.join(&tgz_rel).is_file(),
+        "vendored tarball missing at {tgz_rel}"
+    );
+    assert!(
+        proj.join(".socket/vendor/state.json").is_file(),
+        "vendor ledger missing"
+    );
+    assert!(
+        !proj.join(".socket/blobs").exists(),
+        "get --mode vendored must NOT persist blobs (scan parity: content stays in memory)"
+    );
+
+    // Lock rewiring: `resolved` → relative file: spec, `integrity`
+    // recomputed from the PATCHED tarball (never inherited).
+    let post_lock: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&lock_path).unwrap()).unwrap();
+    let entry = &post_lock["packages"][format!("node_modules/{DEP}")];
+    assert_eq!(
+        entry["resolved"],
+        format!("file:{tgz_rel}"),
+        "lock entry must resolve to the vendored tarball: {entry}"
+    );
+    let new_integrity = entry["integrity"].as_str().expect("rewired integrity");
+    assert!(
+        new_integrity.starts_with("sha512-"),
+        "recomputed integrity must be sha512: {new_integrity}"
+    );
+    assert_ne!(
+        new_integrity, registry_integrity,
+        "integrity must be recomputed from the PATCHED tarball, not inherited"
+    );
+
+    // 4. FRESH-CHECKOUT PROOF (the capstone's, verbatim): only the
+    //    committable files, empty npm cache — the committed tarball is the
+    //    install source, offline for the dep by construction (the recomputed
+    //    integrity means the registry tarball can never satisfy the lock).
+    let fresh = tmp.path().join("fresh");
+    std::fs::create_dir_all(&fresh).unwrap();
+    std::fs::copy(proj.join("package.json"), fresh.join("package.json")).unwrap();
+    std::fs::copy(&lock_path, fresh.join("package-lock.json")).unwrap();
+    copy_dir_recursive(&proj.join(".socket"), &fresh.join(".socket"));
+
+    let fresh_cache = tmp.path().join("fresh-npm-cache");
+    let ci = npm(
+        &fresh,
+        &[
+            "ci",
+            "--cache",
+            fresh_cache.to_str().unwrap(),
+            "--no-audit",
+            "--no-fund",
+        ],
+    );
+    assert!(
+        ci.status.success(),
+        "fresh-checkout `npm ci` must succeed from the vendored tarball.\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&ci.stdout),
+        String::from_utf8_lossy(&ci.stderr),
+    );
+    let fresh_installed =
+        std::fs::read(fresh.join("node_modules").join(DEP).join("index.js")).unwrap();
+    assert!(
+        fresh_installed.starts_with(MARKER.as_bytes()),
+        "npm ci must install the PATCHED bytes from the vendored tarball; got:\n{}",
+        String::from_utf8_lossy(&fresh_installed[..fresh_installed.len().min(120)])
+    );
+    assert_eq!(
+        fresh_installed, patched,
+        "fresh install must be byte-identical to the patched content"
     );
 }

@@ -73,6 +73,7 @@ async fn stale_token_uuid_get_falls_back_to_proxy_end_to_end() {
         save_only: true,
         one_off: false,
         all_releases: false,
+        mode: None,
     };
 
     let code = run(args).await;
