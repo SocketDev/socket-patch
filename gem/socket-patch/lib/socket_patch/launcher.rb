@@ -21,7 +21,7 @@ module SocketPatch
     # Fallback version, used ONLY when the installed gem's version can't be read
     # (e.g. running this file from a checkout). In a real `gem install` the
     # download uses the installed gem's own version — see `version`.
-    VERSION = "3.3.0"
+    VERSION = "4.0.0"
     REPO = "SocketDev/socket-patch"
     BINARY = "socket-patch"
 

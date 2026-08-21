@@ -41,7 +41,7 @@ from the child environment.
 | npm | `pkg:npm/minimist@1.2.2` | `80630680-4da6-45f9-bba8-b888e0ffd58c` | GHSA-xvch-5gv4-984h / CVE-2021-44906 | all five npm-family legs |
 | PyPI | `pkg:pypi/urllib3@1.26.18` | `de58c8b8-796c-4b6d-8a48-539b5563db76`, `26242e35-f867-4da8-8789-f0d2ea49e0f1`, `e828efa5-5c6d-43f3-9909-03f5ac232b98` | GHSA-38jv-5279-wg99, GHSA-2xpw-w6gg-jr37, GHSA-gm62-xv2j-4w53 | requirements.txt, uv.lock |
 | Cargo | `pkg:cargo/traitobject@0.1.1` | `cf2e6f58-d9fa-4096-9151-c34afa717f89` | GHSA-pp8r-vv2j-9j5v | cargo sparse-registry leg |
-| RubyGems | `pkg:gem/activestorage@6.0.3` | any of `15e960b5-f432-4b6c-b8aa-534a2b419323` (GHSA-m42x-37p3-fv5w / CVE-2020-8162), `6c4141c5-1535-4fd2-9db1-b5f8e4834bdb` (GHSA-w749-p3v6-hccq / CVE-2022-21831, published 2026-08-19) | see UUID column | bundler leg |
+| RubyGems | `pkg:gem/activestorage@6.0.3` | any of `15e960b5-f432-4b6c-b8aa-534a2b419323` (GHSA-m42x-37p3-fv5w / CVE-2020-8162), `6c4141c5-1535-4fd2-9db1-b5f8e4834bdb` (GHSA-w749-p3v6-hccq / CVE-2022-21831, published 2026-08-19), `eeb6bf9f-96c0-4963-a0f1-2e88f91f8b1a` (GHSA-9xrj-h377-fr87 / CVE-2026-33195, published 2026-08-20), `c1a1cd3c-b670-4e44-b4fa-1a63ecd42db6` (GHSA-r4mg-4433-c7g3 / CVE-2025-24293, published 2026-08-20) | see UUID column | bundler leg |
 
 urllib3 1.26.18 carries **three** distinct free patches, one per advisory. Which
 one the resolver returns is a server-side ordering detail, so the suite accepts

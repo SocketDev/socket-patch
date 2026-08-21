@@ -8,7 +8,7 @@
 # sync with the workspace by `scripts/version-sync.sh`.
 Gem::Specification.new do |s|
   s.name        = "socket-patch-bundler"
-  s.version     = "3.3.0"
+  s.version     = "4.0.0"
   s.summary     = "Bundler plugin that keeps socket-patch gem patches applied on every bundle install."
   s.description = "Re-applies the gem patches recorded in a project's .socket/manifest.json on " \
                   "every `bundle install` (cached and fresh) by invoking the socket-patch CLI. " \

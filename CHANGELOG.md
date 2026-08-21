@@ -17,7 +17,50 @@ into the new version's section — see docs/releasing.md.
 
 ## [Unreleased]
 
-### Removed (BREAKING — lands in v4.0)
+## [4.0.0] — 2026-08-20
+
+v4.0 is the three-modes release. What began as an agent-style tool that
+patches installed packages in place now offers three deployment modes,
+selected with `scan --mode <agent|vendored|hosted>` (each mode's detailed
+entries follow below; per-ecosystem mechanics live in `docs/ecosystems.md`):
+
+- **Agent mode** (the default, and the original behavior): `apply` patches
+  installed packages in place on the current machine — `node_modules/`,
+  site-packages, the cargo registry cache, and so on — tracked in the local
+  `.socket/` manifest and re-applied after installs by the hooks `setup`
+  configures. Requires socket-patch (and Socket API access, or pre-fetched
+  blobs) on every machine that installs dependencies.
+
+- **Vendored mode** (`vendor`, or `scan --mode vendored`): ejects each
+  patched package into a committed
+  `.socket/vendor/<ecosystem>/<patch-uuid>/<artifact>` and rewires the
+  ecosystem's lockfile so the project consumes the vendored copy. After
+  committing, a fresh checkout builds with the patched dependency on
+  machines with no socket-patch installed and no Socket API access — fully
+  offline/airgap-friendly, and the strictest install flags (`npm ci`,
+  `--frozen-lockfile`, `--locked`, `--deploy`, …) verify the vendored
+  artifact like any other. A committed ledger records the verbatim original
+  lockfile fragments, so `vendor --revert` restores them byte-exactly.
+  Covered in v4.0: the whole npm family (npm, yarn classic, yarn berry
+  node-modules, pnpm, bun), pypi (uv, requirements, poetry, pdm, pipenv),
+  cargo, go, composer, gem, maven, and nuget.
+
+- **Hosted mode** (`scan --mode hosted`, new in v4.0): rewrites lockfiles /
+  registry configs so ONLY the patched dependencies resolve to
+  Socket-hosted, integrity-pinned artifacts on patch.socket.dev — no
+  artifact bytes land in the repo and no CI changes are needed. The package
+  manager's own integrity checking pins the patched bytes (tamper fails the
+  native install), and re-runs are idempotent. Covered in v4.0: the npm
+  family (package-lock/shrinkwrap, pnpm — including Rush monorepos — yarn
+  classic, yarn berry, bun), pypi (requirements, uv), cargo, composer, gem,
+  nuget, maven (fail-closed version suffixing + Trusted Checksums), and
+  golang for references carrying a `goproxy` registry override (free tier;
+  otherwise Go stays vendored — see the documented NO-GO analysis).
+
+All three modes feed VEX attestation, with a provenance marker per mode:
+plain (agent), `(vendored)`, and `(redirected)` (hosted).
+
+### Removed (BREAKING)
 
 - **The `unlock` subcommand.** Folded into `repair`, which now deletes the
   leftover `<.socket>/apply.lock` file as its final housekeeping step (skipped
@@ -40,13 +83,24 @@ into the new version's section — see docs/releasing.md.
   always empty). The `lock_held` stderr hint now advises waiting /
   `--lock-timeout` instead of pointing at the removed commands.
 
-### Changed (BREAKING — lands in v4.0)
+### Changed (BREAKING)
 
 - **`--help` command order** is now workflow-first: `scan`, `apply`, `vex`,
   `vendor`, `setup`, then `rollback`, `get`, `list`, `remove`, `repair`.
 
 ### Added
 
+- **`get --mode <hosted|vendored|agent>` — per-advisory hosted/vendored
+  patching.** `get` (fetch/apply a single patch by CVE/GHSA id, patch UUID,
+  or package name) now honors the same mode selector as `scan`: hosted
+  rewrites lockfiles for just the selected patches through scan's redirect
+  engine verbatim; vendored routes through scan's vendor step with scan's
+  save-only download posture. CVE/GHSA fan-outs are narrowed to versions
+  actually installed (disk ∪ manifest, plus the lockfile inventory and
+  vendor ledger in hosted/vendored modes); when narrowing leaves nothing,
+  the new additive `not_installed` status reports it at exit 0. Exempt from
+  narrowing: UUID ids, exact-versioned purls, `--save-only`,
+  `--all-releases`, and the package-name path.
 - **Hosted mode for Go (free tier).** `scan --mode hosted` now redirects
   golang dependencies when the reference carries a `goproxy` registry
   override: a fork-style
@@ -432,6 +486,24 @@ into the new version's section — see docs/releasing.md.
 
 ### Fixed
 
+- **bun 1.4 lockfiles are accepted again.** bun 1.4.0 bumped `bun.lock`
+  `lockfileVersion` to 2 while leaving the emitted grammar unchanged; the
+  shared version gate refused everything but 1, so hosted and vendored
+  modes refused every lock written by bun ≥ 1.4
+  (`redirect_bun_lock_unsupported` / `vendor_lockfile_version_unsupported`).
+  The gate now accepts versions 1 and 2 and keeps failing closed on
+  anything else; new shared golden fixture `npm/bun/lock-v2` (the depscan
+  TS twin needs the matching acceptance + fixture sync).
+- **gem: every coexisting installed copy is patched.** Bundler's scoped
+  `<engine>/<abi>/gems` and flat `gems/` stores can coexist under one
+  `BUNDLE_PATH` root, each holding a real copy of the same gem@version;
+  first-wins resolution patched one store and reported success while the
+  other bundler loaded pristine (vulnerable) bytes. `apply` now fans out
+  per copy (per-copy `Applied` events, each counted in `summary.applied`),
+  bundle-path roots are crawled in bundler precedence order, and
+  config-sourced roots are contained. The `gem_bundle_config_path_ignored`
+  warning also prints the skipped path verbatim instead of
+  backslash-escaped.
 - **npm `@socketsecurity/socket-patch`: the `./schema` export is now built
   at publish.** The subpath pointed at a gitignored `dist/` directory that
   nothing built during release, so it shipped broken; a `prepack` script
