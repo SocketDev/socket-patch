@@ -624,11 +624,9 @@ mod tests {
         let (manifest_path, socket_dir, blob_path) =
             seed_manifest_with_blob(tmp.path(), "pkg:npm/gone@1.0.0", &after_hash);
 
-        let _holder = socket_patch_core::patch::apply_lock::acquire(
-            &socket_dir,
-            std::time::Duration::ZERO,
-        )
-        .expect("test holder must win the fresh lock");
+        let _holder =
+            socket_patch_core::patch::apply_lock::acquire(&socket_dir, std::time::Duration::ZERO)
+                .expect("test holder must win the fresh lock");
 
         let scanned: HashSet<String> = HashSet::new();
         let gc = run_apply_gc(

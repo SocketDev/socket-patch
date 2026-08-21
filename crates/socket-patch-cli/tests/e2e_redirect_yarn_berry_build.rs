@@ -231,13 +231,28 @@ struct BerryRedirectFixture {
     _server: MockServer,
 }
 
+/// Which CLI front door drives the hosted engine. Both consume the SAME
+/// engine by construction (v3.6): `scan --mode hosted` discovers the dep,
+/// while `get <uuid> --mode hosted` names the patch explicitly (the uuid
+/// identifier path is exempt from installed narrowing and needs only the
+/// view + reference mocks, which the fixture mounts anyway). get has no
+/// `--vex`, so the get driver drops the vex flags + assertions; the `10c0`
+/// cacheKey bootstrap is engine-side and runs identically for both.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum HostedDriver {
+    Scan,
+    GetUuid,
+}
+
 /// Steps 1–3: real install, patched tarball + bootstrap checksum + API mocks,
-/// `scan --mode hosted --vex`, and the envelope/lockfile/ledger assertions.
+/// the hosted rewrite (per `driver`: `scan --mode hosted --vex` or
+/// `get <uuid> --mode hosted`), and the envelope/lockfile/ledger assertions.
 /// `tamper_served_tarball` serves DIFFERENT bytes at the archiveUrl than the
 /// checksum pins. `None` = skip (message printed).
 async fn berry_hosted_project(
     tag: &str,
     tamper_served_tarball: bool,
+    driver: HostedDriver,
 ) -> Option<BerryRedirectFixture> {
     if !has_corepack_pm(YARN_BERRY) {
         println!("SKIP e2e_redirect_yarn_berry_build ({tag}): `corepack {YARN_BERRY}` unavailable");
@@ -394,10 +409,11 @@ async fn berry_hosted_project(
         .mount(&server)
         .await;
 
-    // scan --mode hosted --vex.
-    let (code, stdout, stderr) = run_socket(
-        &proj,
-        &[
+    // The hosted rewrite: scan (with --vex) or get <uuid> (no --vex — get
+    // has none by contract), same engine either way.
+    let api_url = server.uri();
+    let argv: Vec<&str> = match driver {
+        HostedDriver::Scan => vec![
             "scan",
             "--mode",
             "hosted",
@@ -406,7 +422,7 @@ async fn berry_hosted_project(
             "--cwd",
             proj.to_str().unwrap(),
             "--api-url",
-            &server.uri(),
+            &api_url,
             "--org",
             ORG,
             "--api-token",
@@ -416,52 +432,72 @@ async fn berry_hosted_project(
             "--vex-product",
             PRODUCT,
         ],
-    );
+        HostedDriver::GetUuid => vec![
+            "get",
+            UUID,
+            "--mode",
+            "hosted",
+            "--json",
+            "--yes",
+            "--cwd",
+            proj.to_str().unwrap(),
+            "--api-url",
+            &api_url,
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+        ],
+    };
+    let (code, stdout, stderr) = run_socket(&proj, &argv);
     assert_eq!(
         code, 0,
-        "scan --mode hosted failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        "{driver:?} --mode hosted failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     let env: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
-        panic!("scan --mode hosted --json output is not JSON: {e}\nstdout:\n{stdout}")
+        panic!("{driver:?} --mode hosted --json output is not JSON: {e}\nstdout:\n{stdout}")
     });
     assert_eq!(env["status"], "success", "envelope: {env}");
     assert_eq!(
         env["redirect"]["redirected"], 1,
         "one dep redirected: {env}"
     );
-    // In-run VEX (step 3 of the module doc): the envelope's vex block plus the
-    // document's unverified `(redirected)` attestation. Without these, a scan
-    // that silently skips the VEX write (or emits the wrong statement) stays
-    // green — the exit code only catches a HARD vex failure.
-    assert_eq!(env["vex"]["path"], "out.vex.json", "vex block: {env}");
-    assert_eq!(env["vex"]["statements"], 1, "vex block: {env}");
-    assert_eq!(env["vex"]["format"], "openvex-0.2.0", "vex block: {env}");
-    assert_eq!(
-        env["vex"]["verified"], false,
-        "in-run redirect VEX is attested from the ledger, not hash-verified: {env}"
-    );
-    let vex_doc: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(proj.join("out.vex.json")).unwrap()).unwrap();
-    let stmts = vex_doc["statements"].as_array().unwrap();
-    assert_eq!(
-        stmts.len(),
-        1,
-        "exactly the redirected patch attested: {vex_doc}"
-    );
-    assert_eq!(
-        stmts[0]["vulnerability"]["name"], GHSA,
-        "vex doc: {vex_doc}"
-    );
-    assert_eq!(stmts[0]["status"], "not_affected", "vex doc: {vex_doc}");
-    assert_eq!(
-        stmts[0]["products"][0]["subcomponents"][0]["@id"], PURL,
-        "vex doc: {vex_doc}"
-    );
-    assert_eq!(
-        stmts[0]["impact_statement"].as_str().unwrap(),
-        format!("Patched via Socket patch {UUID} (redirected)"),
-        "the in-run attestation must carry the (redirected) marker: {vex_doc}"
-    );
+    if driver == HostedDriver::Scan {
+        // In-run VEX (step 3 of the module doc): the envelope's vex block plus
+        // the document's unverified `(redirected)` attestation. Without these,
+        // a scan that silently skips the VEX write (or emits the wrong
+        // statement) stays green — the exit code only catches a HARD vex
+        // failure. (Scan driver only: get has no --vex by contract.)
+        assert_eq!(env["vex"]["path"], "out.vex.json", "vex block: {env}");
+        assert_eq!(env["vex"]["statements"], 1, "vex block: {env}");
+        assert_eq!(env["vex"]["format"], "openvex-0.2.0", "vex block: {env}");
+        assert_eq!(
+            env["vex"]["verified"], false,
+            "in-run redirect VEX is attested from the ledger, not hash-verified: {env}"
+        );
+        let vex_doc: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(proj.join("out.vex.json")).unwrap()).unwrap();
+        let stmts = vex_doc["statements"].as_array().unwrap();
+        assert_eq!(
+            stmts.len(),
+            1,
+            "exactly the redirected patch attested: {vex_doc}"
+        );
+        assert_eq!(
+            stmts[0]["vulnerability"]["name"], GHSA,
+            "vex doc: {vex_doc}"
+        );
+        assert_eq!(stmts[0]["status"], "not_affected", "vex doc: {vex_doc}");
+        assert_eq!(
+            stmts[0]["products"][0]["subcomponents"][0]["@id"], PURL,
+            "vex doc: {vex_doc}"
+        );
+        assert_eq!(
+            stmts[0]["impact_statement"].as_str().unwrap(),
+            format!("Patched via Socket patch {UUID} (redirected)"),
+            "the in-run attestation must carry the (redirected) marker: {vex_doc}"
+        );
+    }
 
     // Lockfile pin: the encoded __archiveUrl + the 10c0 checksum.
     let lock = std::fs::read_to_string(proj.join("yarn.lock")).unwrap();
@@ -532,7 +568,7 @@ fn fresh_checkout_yarn_install(fx: &BerryRedirectFixture) -> (PathBuf, Output) {
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial]
 async fn berry_redirect_fresh_checkout_installs_patched_bytes() {
-    let Some(fx) = berry_hosted_project("main", false).await else {
+    let Some(fx) = berry_hosted_project("main", false, HostedDriver::Scan).await else {
         return;
     };
 
@@ -556,13 +592,49 @@ async fn berry_redirect_fresh_checkout_installs_patched_bytes() {
     );
 }
 
+/// get-driven hosted twin (v3.6): `get <uuid> --mode hosted --json --yes`
+/// routes through the SAME hosted engine as `scan --mode hosted`, so the
+/// berry chain must hold unchanged — including the `10c0` cacheKey bootstrap
+/// (the fixture still resolves the patched tarball with a real yarn to pin
+/// the exact cache-zip checksum) and the lock's `::__archiveUrl=` +
+/// `checksum: 10c0/<hex>` splice — and the fresh `yarn install --immutable
+/// --check-cache` pulls the patched bytes from the hosted tarball. The uuid
+/// identifier path is exempt from installed narrowing, so only the view +
+/// reference mocks matter (the fixture mounts them anyway).
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial]
+async fn berry_get_uuid_hosted_fresh_checkout_installs() {
+    let Some(fx) = berry_hosted_project("get-uuid", false, HostedDriver::GetUuid).await else {
+        return;
+    };
+
+    let (fresh, ci) = fresh_checkout_yarn_install(&fx);
+    assert!(
+        ci.status.success(),
+        "fresh-checkout `yarn install --immutable --check-cache` must succeed from the \
+         hosted patch tarball (get-driven redirect).\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&ci.stdout),
+        String::from_utf8_lossy(&ci.stderr),
+    );
+    let installed = std::fs::read(fresh.join("node_modules").join(DEP).join("index.js")).unwrap();
+    assert!(
+        installed.starts_with(MARKER.as_bytes()),
+        "yarn must install the PATCHED bytes from the hosted patch (get-driven); got:\n{}",
+        String::from_utf8_lossy(&installed[..installed.len().min(120)])
+    );
+    assert_eq!(
+        installed, fx.patched,
+        "fresh install must be byte-identical to the patched content (get-driven)"
+    );
+}
+
 /// Negative twin: the archiveUrl serves a DIFFERENT tarball while the lock
 /// pins the real `10c0` checksum — the fresh `--check-cache` install must fail
 /// with YN0018.
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial]
 async fn berry_redirect_tampered_hosted_tarball_fails_check_cache() {
-    let Some(fx) = berry_hosted_project("tampered", true).await else {
+    let Some(fx) = berry_hosted_project("tampered", true, HostedDriver::Scan).await else {
         return;
     };
 

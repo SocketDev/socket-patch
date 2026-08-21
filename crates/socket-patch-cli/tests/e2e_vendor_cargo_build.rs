@@ -24,6 +24,14 @@
 //!   6. **Revert proof**: `vendor --revert` restores Cargo.lock byte-for-byte
 //!      and removes `.socket/vendor/` + the managed `[patch]` entry.
 //!
+//! A get-driven twin (`cargo_get_uuid_vendored_fresh_checkout_locked_build`,
+//! v3.6) reaches the same committed state through `get <uuid> --mode
+//! vendored` with the patch record + blob content served from a wiremock
+//! view endpoint instead of a pre-staged `.socket/` — proving the manifest
+//! write, the NO-blobs posture (content stays in memory), and the same
+//! fresh-checkout `--locked --offline` build (the revert half is covered by
+//! the capstone: get rides the identical vendor engine).
+//!
 //! Skips (println) when `cargo` is missing or crates.io is unreachable for
 //! the fixture build; all assertions after that are hard.
 
@@ -31,7 +39,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use sha2::{Digest, Sha256};
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
+const ORG: &str = "test-org";
 const UUID: &str = "2b3c4d5e-6f70-4a1b-8c2d-0123456789ab";
 const DEP: &str = "cfg-if";
 /// Appended to the dep's `src/lib.rs`. Doc comment required: cfg-if denies
@@ -93,6 +104,11 @@ fn git_sha256(content: &[u8]) -> String {
     hasher.update(format!("blob {}\0", content.len()).as_bytes());
     hasher.update(content);
     hex::encode(hasher.finalize())
+}
+
+fn b64(bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
 fn stage_patch(proj: &Path, purl: &str, file_key: &str, before: &[u8], after: &[u8]) {
@@ -187,8 +203,9 @@ fn find_registry_crate(cargo_home: &Path, leaf: &str) -> Option<PathBuf> {
 /// Stage the consumer project + private CARGO_HOME and run the baseline
 /// build (which extracts cfg-if into `registry/src/`). Returns
 /// `(proj, cargo_home, locked cfg-if version, registry src dir)` or `None`
-/// when the toolchain/network makes the fixture impossible (caller skips).
-fn stage_fixture(tmp: &Path) -> Option<(PathBuf, PathBuf, String, PathBuf)> {
+/// when the toolchain/network makes the fixture impossible (caller skips;
+/// `tag` names the calling test in the skip message).
+fn stage_fixture(tmp: &Path, tag: &str) -> Option<(PathBuf, PathBuf, String, PathBuf)> {
     let proj = tmp.join("proj");
     let cargo_home = tmp.join("cargo-home");
     std::fs::create_dir_all(proj.join("src")).unwrap();
@@ -209,7 +226,7 @@ fn stage_fixture(tmp: &Path) -> Option<(PathBuf, PathBuf, String, PathBuf)> {
     let build = cargo(&proj, &["build", "-q"], &cargo_home);
     if !build.status.success() {
         println!(
-            "SKIP e2e_vendor_cargo_build: baseline `cargo build` failed (crates.io \
+            "SKIP e2e_vendor_cargo_build ({tag}): baseline `cargo build` failed (crates.io \
              unreachable?):\n{}",
             String::from_utf8_lossy(&build.stderr)
         );
@@ -237,7 +254,7 @@ fn cargo_vendor_fresh_checkout_locked_offline_build_and_revert() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
-    let Some((proj, cargo_home, version, crate_dir)) = stage_fixture(tmp.path()) else {
+    let Some((proj, cargo_home, version, crate_dir)) = stage_fixture(tmp.path(), "main") else {
         return; // skip already printed
     };
     let purl = format!("pkg:cargo/{DEP}@{version}");
@@ -503,7 +520,8 @@ fn cargo_vendor_reports_applied_event() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
-    let Some((proj, cargo_home, version, crate_dir)) = stage_fixture(tmp.path()) else {
+    let Some((proj, cargo_home, version, crate_dir)) = stage_fixture(tmp.path(), "applied-event")
+    else {
         return;
     };
     let purl = format!("pkg:cargo/{DEP}@{version}");
@@ -540,5 +558,208 @@ fn cargo_vendor_reports_applied_event() {
     assert_eq!(
         event["action"], "applied",
         "vendor success must be an `applied` event, not skipped/`vendored`: {event}"
+    );
+}
+
+/// get-driven twin (v3.6): `get <uuid> --mode vendored --vendor-source build`
+/// must reach the capstone's committed state through scan's vendored engine —
+/// the manifest record, the patched copy under `.socket/vendor/cargo/<uuid>/`,
+/// the `[patch.crates-io]` wiring + surgical lock detach — with NO
+/// `.socket/blobs` (the download phase holds content in memory; the vendor
+/// step re-fetches `blobContent` from the same view mock). Then the
+/// fresh-checkout proof: only the committable files, EMPTY CARGO_HOME,
+/// `cargo build --locked --offline` links the patched-only symbol with zero
+/// crate downloads. The revert half is covered by the capstone — get rides
+/// the identical vendor engine.
+///
+/// multi_thread: the CLI/cargo subprocesses block a worker thread while
+/// wiremock keeps serving the view endpoint on the others.
+#[tokio::test(flavor = "multi_thread")]
+async fn cargo_get_uuid_vendored_fresh_checkout_locked_build() {
+    if !has_command("cargo") {
+        println!("SKIP e2e_vendor_cargo_build (get-uuid): `cargo` not installed");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let Some((proj, cargo_home, version, crate_dir)) = stage_fixture(tmp.path(), "get-uuid") else {
+        return; // skip already printed
+    };
+    let purl = format!("pkg:cargo/{DEP}@{version}");
+    let copy_rel = format!(".socket/vendor/cargo/{UUID}/{DEP}-{version}");
+
+    // The view endpoint serves the record with REAL hashes computed from the
+    // ACTUAL extracted registry bytes + inline blobContent — no `.socket/`
+    // pre-staging: `get` writes the manifest itself and the vendor step
+    // fetches the after-blob into memory from this same mock.
+    let orig = std::fs::read(crate_dir.join("src/lib.rs")).unwrap();
+    assert!(
+        !String::from_utf8_lossy(&orig).contains("socket_patched"),
+        "pristine registry sources must not carry the marker"
+    );
+    let patched: Vec<u8> = [orig.as_slice(), PATCH_SUFFIX.as_bytes()].concat();
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/view/{UUID}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "uuid": UUID,
+            "purl": purl,
+            "publishedAt": "2026-01-01T00:00:00Z",
+            "files": {
+                "src/lib.rs": {
+                    "beforeHash": git_sha256(&orig),
+                    "afterHash": git_sha256(&patched),
+                    "blobContent": b64(&patched),
+                }
+            },
+            "vulnerabilities": { "GHSA-vend-cargo-real": {
+                "cves": ["CVE-2024-88888"],
+                "summary": "capstone vex vuln",
+                "severity": "high",
+                "description": "d",
+            }},
+            "description": "capstone marker patch",
+            "license": "MIT",
+            "tier": "free",
+        })))
+        .mount(&server)
+        .await;
+
+    let server_uri = server.uri();
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &[
+            "get",
+            UUID,
+            "--mode",
+            "vendored",
+            "--json",
+            "--yes",
+            "--cwd",
+            proj.to_str().unwrap(),
+            "--api-url",
+            &server_uri,
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+            "--vendor-source",
+            "build",
+        ],
+        &cargo_home,
+    );
+    assert_eq!(
+        code, 0,
+        "get --mode vendored failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let env = parse_envelope(&stdout);
+    assert_eq!(env["status"], "success", "envelope: {env}");
+    assert_eq!(env["found"], 1, "envelope: {env}");
+    assert_eq!(env["downloaded"], 1, "envelope: {env}");
+    assert!(
+        env["applied"].is_null(),
+        "vendored get drops `applied` — nothing applies in place: {env}"
+    );
+    assert_eq!(
+        env["vendor"]["summary"]["failed"], 0,
+        "nested vendor envelope must report no failures: {env}"
+    );
+
+    // The download phase writes ONLY the manifest — no blobs on disk.
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(proj.join(".socket/manifest.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        manifest["patches"][purl.as_str()]["uuid"],
+        UUID,
+        "manifest must record the vendored patch: {manifest}"
+    );
+    assert!(
+        !proj.join(".socket/blobs").exists(),
+        "get --mode vendored must NOT persist blobs (content stays in memory)"
+    );
+
+    // The committed copy: patched bytes, no `.cargo-checksum.json`, pristine
+    // registry source, ledger written (the capstone's on-disk assertions).
+    let copy_lib = proj.join(&copy_rel).join("src/lib.rs");
+    assert_eq!(
+        std::fs::read(&copy_lib).unwrap(),
+        patched,
+        "vendored copy must hold the patched bytes"
+    );
+    assert!(
+        !proj.join(&copy_rel).join(".cargo-checksum.json").exists(),
+        "a path-dep copy must not carry .cargo-checksum.json"
+    );
+    assert_eq!(
+        std::fs::read(crate_dir.join("src/lib.rs")).unwrap(),
+        orig,
+        "registry source must stay pristine"
+    );
+    assert!(
+        proj.join(".socket/vendor/state.json").is_file(),
+        "the vendor ledger must be written"
+    );
+
+    // `[patch.crates-io]` wiring + the surgical lock detach.
+    let config = std::fs::read_to_string(proj.join(".cargo/config.toml"))
+        .expect("get --mode vendored must create .cargo/config.toml");
+    assert!(
+        config.contains("[patch.crates-io]") && config.contains(&copy_rel),
+        "config must patch crates-io to the uuid copy path:\n{config}"
+    );
+    let lock_text = std::fs::read_to_string(proj.join("Cargo.lock")).unwrap();
+    let block = package_block(&lock_text, DEP).expect("cfg-if lock entry must survive");
+    assert!(
+        block.contains(&format!("version = \"{version}\"")),
+        "lock entry keeps the version:\n{block}"
+    );
+    assert!(
+        !block.contains("source = ") && !block.contains("checksum = "),
+        "lock entry must be detached from the registry (no source/checksum):\n{block}"
+    );
+
+    // FRESH-CHECKOUT PROOF: committable files only, EMPTY CARGO_HOME,
+    // `--locked --offline` — the consumer references the patched-only
+    // symbol, so the build links iff the vendored bytes are what cargo uses.
+    std::fs::write(
+        proj.join("src/main.rs"),
+        "fn main() { println!(\"MARKER:{}\", cfg_if::socket_patched()); }\n",
+    )
+    .unwrap();
+    let fresh = tmp.path().join("fresh");
+    std::fs::create_dir_all(&fresh).unwrap();
+    std::fs::copy(proj.join("Cargo.toml"), fresh.join("Cargo.toml")).unwrap();
+    std::fs::copy(proj.join("Cargo.lock"), fresh.join("Cargo.lock")).unwrap();
+    copy_dir_recursive(&proj.join(".cargo"), &fresh.join(".cargo"));
+    copy_dir_recursive(&proj.join("src"), &fresh.join("src"));
+    copy_dir_recursive(&proj.join(".socket"), &fresh.join(".socket"));
+
+    let fresh_home = tmp.path().join("fresh-cargo-home");
+    std::fs::create_dir_all(&fresh_home).unwrap();
+    let build = cargo(
+        &fresh,
+        &["build", "-q", "--locked", "--offline"],
+        &fresh_home,
+    );
+    assert!(
+        build.status.success(),
+        "fresh-checkout `cargo build --locked --offline` (empty CARGO_HOME) after \
+         `get --mode vendored` must succeed.\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr),
+    );
+    let bin = Command::new(fresh.join("target/debug/consumer"))
+        .output()
+        .expect("run fresh consumer binary");
+    assert!(
+        String::from_utf8_lossy(&bin.stdout).contains("MARKER:1"),
+        "fresh build must link the PATCHED dep: {}",
+        String::from_utf8_lossy(&bin.stdout)
+    );
+    assert!(
+        !fresh_home.join("registry").exists(),
+        "fresh CARGO_HOME must not gain a registry/ — the vendored path dep \
+         is the sole provider"
     );
 }

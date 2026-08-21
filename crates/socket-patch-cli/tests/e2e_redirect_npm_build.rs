@@ -27,6 +27,11 @@
 //! the real sha512: the fresh `npm ci` must FAIL with an integrity error —
 //! the lockfile pin is enforcement, not decoration.
 //!
+//! v3.6 adds get-driven twins through the SAME fixture: `get <uuid> --mode
+//! hosted` must land the identical redirect (no manifest, no blobs — the
+//! ledger is the persistence), and `get <GHSA> --mode hosted` must narrow a
+//! two-version fan-out to the installed version BEFORE the grant request.
+//!
 //! Skips (with a println) when `npm`/`tar` are missing or the fixture install
 //! cannot reach the registry; every assertion after that is hard.
 
@@ -54,6 +59,16 @@ const TOKEN: &str = "22222222-2222-4222-8222-222222222222";
 const MARKER: &str = "/* SOCKET-PATCHED */\n";
 const GHSA: &str = "GHSA-redirect-real";
 const PRODUCT: &str = "pkg:npm/app@1.0.0";
+/// GHSA identifier the get-narrowing twin searches by. Must match get's
+/// auto-detect shape (`GHSA-xxxx-xxxx-xxxx`) — the free-form `GHSA` above
+/// only keys the view record's vulnerabilities map, which get never parses
+/// as an identifier.
+const SEARCH_GHSA: &str = "GHSA-gett-hstd-narw";
+/// Fabricated second fan-out patch: a version this project does NOT have
+/// installed (nor lock-resolved). Its uuid reaching the reference endpoint
+/// means the installed-version narrowing regressed.
+const UUID_UNINSTALLED: &str = "9f8e7d6c-5b4a-4c3d-8e2f-1a0b9c8d7e6f";
+const PURL_UNINSTALLED: &str = "pkg:npm/left-pad@9.9.9";
 
 // ── self-contained helpers ────────────────────────────────────────────
 
@@ -121,23 +136,42 @@ fn copy_dir_recursive(src: &Path, dst: &Path) {
 }
 
 /// Everything the post-redirect legs need. `tmp` owns the whole tree;
-/// `_server` keeps the hosted-tarball route alive through the fresh `npm ci`.
+/// `server` keeps the hosted-tarball route alive through the fresh `npm ci`
+/// and is queried by the narrowing twin's received-request oracles.
 struct RedirectFixture {
     tmp: tempfile::TempDir,
     proj: PathBuf,
     patched: Vec<u8>,
-    _server: MockServer,
+    server: MockServer,
+}
+
+/// Which CLI invocation drives step 3 (the redirect itself). The scan
+/// variant is the original capstone; the get variants prove `get … --mode
+/// hosted` parity through the same fixture — a (purl, uuid)-identical
+/// selection must produce the identical on-disk redirect.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum RedirectCli {
+    /// `scan --redirect --json --yes --vex …` (embedded VEX asserted).
+    ScanRedirectVex,
+    /// `get <UUID> --mode hosted --json --yes` — get has no `--vex`.
+    GetUuidHosted,
+    /// `get <SEARCH_GHSA> --mode hosted --json --yes`, with a two-version
+    /// by-ghsa fan-out mounted: the real patch for the installed version +
+    /// a fabricated one for an uninstalled version that MUST be narrowed
+    /// out before the grant request.
+    GetGhsaHosted,
 }
 
 /// Steps 1–3 of the module doc: real install, patched tarball + API mocks
-/// (same contract as `tests/in_process_redirect.rs`), `scan --redirect
-/// --vex`, and the envelope/lockfile/ledger assertions. When
+/// (same contract as `tests/in_process_redirect.rs`), the `cli`-selected
+/// redirect invocation, and the envelope/lockfile/ledger assertions. When
 /// `tamper_served_tarball` is set, the tarball route serves DIFFERENT bytes
 /// than the sha512 pinned into the lockfile — the negative twin's premise.
 /// `None` = skip (message already printed).
 async fn redirect_scanned_project(
     tag: &str,
     tamper_served_tarball: bool,
+    cli: RedirectCli,
 ) -> Option<RedirectFixture> {
     if !has_command("npm") {
         println!("SKIP e2e_redirect_npm_build ({tag}): `npm` not installed");
@@ -308,20 +342,49 @@ async fn redirect_scanned_project(
         .respond_with(ResponseTemplate::new(200).set_body_raw(served, "application/octet-stream"))
         .mount(&server)
         .await;
+    // The GHSA fan-out the narrowing twin resolves through: the real patch
+    // for the installed 1.3.0 plus a fabricated one for the uninstalled
+    // 9.9.9 (listed first, with a NEWER publishedAt, so any regression that
+    // skips the narrowing has every chance to pick it up).
+    if cli == RedirectCli::GetGhsaHosted {
+        let fanout_patch = |uuid: &str, purl: &str, published: &str| {
+            serde_json::json!({
+                "uuid": uuid, "purl": purl,
+                "publishedAt": published,
+                "description": "x", "license": "MIT", "tier": "free",
+                "vulnerabilities": {}
+            })
+        };
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/v0/orgs/{ORG}/patches/by-ghsa/{SEARCH_GHSA}"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "patches": [
+                    fanout_patch(UUID_UNINSTALLED, PURL_UNINSTALLED, "2026-02-01T00:00:00Z"),
+                    fanout_patch(UUID, PURL, "2026-01-01T00:00:00Z"),
+                ],
+                "canAccessPaidPatches": false,
+            })))
+            .mount(&server)
+            .await;
+    }
 
-    // scan --redirect --vex: rewrite the lockfile + emit the in-run
-    // (unverified) attestation.
-    let (code, stdout, stderr) = run_socket(
-        &proj,
-        &[
+    // The redirect invocation itself: `scan --redirect --vex` (the original
+    // capstone, in-run unverified attestation included) or one of the
+    // `get … --mode hosted` twins (get has no --vex).
+    let uri = server.uri();
+    let proj_str = proj.to_str().unwrap();
+    let argv: Vec<&str> = match cli {
+        RedirectCli::ScanRedirectVex => vec![
             "scan",
             "--redirect",
             "--json",
             "--yes",
             "--cwd",
-            proj.to_str().unwrap(),
+            proj_str,
             "--api-url",
-            &server.uri(),
+            &uri,
             "--org",
             ORG,
             "--api-token",
@@ -331,26 +394,116 @@ async fn redirect_scanned_project(
             "--vex-product",
             PRODUCT,
         ],
-    );
+        RedirectCli::GetUuidHosted => vec![
+            "get",
+            UUID,
+            "--mode",
+            "hosted",
+            "--json",
+            "--yes",
+            "--cwd",
+            proj_str,
+            "--api-url",
+            &uri,
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+        ],
+        RedirectCli::GetGhsaHosted => vec![
+            "get",
+            SEARCH_GHSA,
+            "--mode",
+            "hosted",
+            "--json",
+            "--yes",
+            "--cwd",
+            proj_str,
+            "--api-url",
+            &uri,
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+        ],
+    };
+    let (code, stdout, stderr) = run_socket(&proj, &argv);
     assert_eq!(
-        code, 0,
-        "scan --redirect failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        code,
+        0,
+        "`{}` failed.\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        argv.join(" ")
     );
     let env: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
-        panic!("scan --redirect --json output is not JSON: {e}\nstdout:\n{stdout}")
+        panic!(
+            "--json output of `{}` is not JSON: {e}\nstdout:\n{stdout}",
+            argv.join(" ")
+        )
     });
     assert_eq!(env["status"], "success", "envelope: {env}");
+    assert_eq!(
+        env["redirect"]["mode"], "hosted",
+        "redirect sub-object is mode-tagged: {env}"
+    );
     assert_eq!(
         env["redirect"]["redirected"], 1,
         "exactly one dep redirected: {env}"
     );
-    assert_eq!(env["vex"]["path"], "out.vex.json", "vex block: {env}");
-    assert_eq!(env["vex"]["statements"], 1, "vex block: {env}");
-    assert_eq!(env["vex"]["format"], "openvex-0.2.0", "vex block: {env}");
-    assert_eq!(
-        env["vex"]["verified"], false,
-        "in-run redirect VEX is attested from the ledger, not hash-verified: {env}"
-    );
+    match cli {
+        RedirectCli::ScanRedirectVex => {
+            assert_eq!(env["vex"]["path"], "out.vex.json", "vex block: {env}");
+            assert_eq!(env["vex"]["statements"], 1, "vex block: {env}");
+            assert_eq!(env["vex"]["format"], "openvex-0.2.0", "vex block: {env}");
+            assert_eq!(
+                env["vex"]["verified"], false,
+                "in-run redirect VEX is attested from the ledger, not hash-verified: {env}"
+            );
+        }
+        RedirectCli::GetUuidHosted => {
+            assert_eq!(
+                env["found"], 1,
+                "uuid get resolves exactly one patch: {env}"
+            );
+            assert_eq!(
+                env["patches"],
+                serde_json::json!([]),
+                "the UUID path is exempt from narrowing — no skip records: {env}"
+            );
+        }
+        RedirectCli::GetGhsaHosted => {
+            assert_eq!(env["found"], 2, "both fan-out versions were found: {env}");
+            let skips = env["patches"].as_array().expect("patches array");
+            assert_eq!(
+                skips.len(),
+                1,
+                "exactly the uninstalled version is skipped: {env}"
+            );
+            assert_eq!(skips[0]["purl"], PURL_UNINSTALLED, "skip record: {env}");
+            assert_eq!(skips[0]["uuid"], UUID_UNINSTALLED, "skip record: {env}");
+            assert_eq!(
+                skips[0]["errorCode"], "package_not_installed",
+                "calm narrowing skip, never an error: {env}"
+            );
+        }
+    }
+    if cli != RedirectCli::ScanRedirectVex {
+        assert!(
+            env.get("vex").is_none(),
+            "get has no --vex — no vex block may appear: {env}"
+        );
+        assert!(
+            env.get("downloaded").is_none() && env.get("applied").is_none(),
+            "hosted get drops downloaded/applied (nothing lands in .socket/): {env}"
+        );
+        assert!(
+            !proj.join(".socket/manifest.json").exists(),
+            "get --mode hosted must NOT write the manifest (scan parity)"
+        );
+        assert!(
+            !proj.join(".socket/blobs").exists(),
+            "get --mode hosted must NOT persist blobs"
+        );
+    }
 
     // Lockfile pin: hosted URL + the PATCHED tarball's sha512.
     let lock = std::fs::read_to_string(proj.join("package-lock.json")).unwrap();
@@ -374,7 +527,7 @@ async fn redirect_scanned_project(
         tmp,
         proj,
         patched,
-        _server: server,
+        server,
     })
 }
 
@@ -413,7 +566,8 @@ fn fresh_checkout_npm_ci(fx: &RedirectFixture) -> (PathBuf, Output) {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "wall-bound real-npm install (~150s); runs on all 3 OSes as an e2e CI matrix leg"]
 async fn npm_redirect_fresh_checkout_npm_ci_installs_patched_bytes_and_vex_verifies() {
-    let Some(fx) = redirect_scanned_project("main", false).await else {
+    let Some(fx) = redirect_scanned_project("main", false, RedirectCli::ScanRedirectVex).await
+    else {
         return;
     };
 
@@ -481,7 +635,8 @@ async fn npm_redirect_fresh_checkout_npm_ci_installs_patched_bytes_and_vex_verif
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "wall-bound real-npm install (~150s); runs on all 3 OSes as an e2e CI matrix leg"]
 async fn npm_redirect_tampered_hosted_tarball_fails_fresh_npm_ci() {
-    let Some(fx) = redirect_scanned_project("tampered", true).await else {
+    let Some(fx) = redirect_scanned_project("tampered", true, RedirectCli::ScanRedirectVex).await
+    else {
         return;
     };
 
@@ -500,5 +655,123 @@ async fn npm_redirect_tampered_hosted_tarball_fails_fresh_npm_ci() {
     assert!(
         chatter.contains("EINTEGRITY") || chatter.to_lowercase().contains("integrity"),
         "the failure must be the integrity check, not something incidental:\n{chatter}"
+    );
+}
+
+// ── get --mode hosted twins (v3.6) ────────────────────────────────────
+
+/// `get <uuid> --mode hosted` twin of the capstone: the same fixture (real
+/// npm install, patched hosted tarball, API mocks) driven by get's UUID path
+/// must land the identical redirect — lockfile pinned to the hosted tarball,
+/// ledger written, NO manifest/blobs (all asserted inside the fixture) — and
+/// a fresh checkout's `npm ci` must install the patched bytes.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "wall-bound real-npm install (~150s); runs on all 3 OSes as an e2e CI matrix leg"]
+async fn npm_get_uuid_hosted_fresh_checkout_npm_ci_installs_patched_bytes() {
+    let Some(fx) = redirect_scanned_project("get-uuid", false, RedirectCli::GetUuidHosted).await
+    else {
+        return;
+    };
+
+    let (fresh, ci) = fresh_checkout_npm_ci(&fx);
+    assert!(
+        ci.status.success(),
+        "fresh-checkout `npm ci` must succeed from the hosted patch tarball.\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&ci.stdout),
+        String::from_utf8_lossy(&ci.stderr),
+    );
+    let installed = std::fs::read(fresh.join("node_modules").join(DEP).join("index.js")).unwrap();
+    assert!(
+        installed.starts_with(MARKER.as_bytes()),
+        "npm ci must install the PATCHED bytes from the hosted patch; got:\n{}",
+        String::from_utf8_lossy(&installed[..installed.len().min(120)])
+    );
+    assert_eq!(
+        installed, fx.patched,
+        "fresh install must be byte-identical to the patched content"
+    );
+}
+
+/// `get <GHSA> --mode hosted` narrowing twin: the by-ghsa fan-out returns
+/// TWO patches — the installed 1.3.0's and a fabricated one for an
+/// uninstalled 9.9.9. The coarse installed-version narrowing must drop the
+/// latter BEFORE the grant request (the reference body is the oracle — the
+/// lockfile rewriter could never catch a granted-but-unmatchable version),
+/// only the installed purl may land in the ledger, and the fresh-checkout
+/// install must still land the patched bytes.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "wall-bound real-npm install (~150s); runs on all 3 OSes as an e2e CI matrix leg"]
+async fn npm_get_ghsa_hosted_narrows_and_installs() {
+    let Some(fx) = redirect_scanned_project("get-ghsa", false, RedirectCli::GetGhsaHosted).await
+    else {
+        return;
+    };
+
+    // The reference request must carry ONLY the installed version's uuid —
+    // requesting the uninstalled version's grant means the fan-out was not
+    // narrowed before the hosted engine ran.
+    let requests = fx.server.received_requests().await.unwrap_or_default();
+    let reference_bodies: Vec<String> = requests
+        .iter()
+        .filter(|r| r.url.path().ends_with("/patches/package"))
+        .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+        .collect();
+    assert_eq!(reference_bodies.len(), 1, "exactly one reference request");
+    assert!(
+        reference_bodies[0].contains(UUID),
+        "the installed version's uuid must be requested; body: {}",
+        reference_bodies[0]
+    );
+    assert!(
+        !reference_bodies[0].contains(UUID_UNINSTALLED),
+        "the uninstalled version's uuid must be narrowed out BEFORE the grant \
+         request; body: {}",
+        reference_bodies[0]
+    );
+    let uninstalled_views = requests
+        .iter()
+        .filter(|r| {
+            r.url
+                .path()
+                .contains(&format!("/patches/view/{UUID_UNINSTALLED}"))
+        })
+        .count();
+    assert_eq!(
+        uninstalled_views, 0,
+        "the uninstalled version's view must never be fetched"
+    );
+
+    // Ledger: only the installed purl's record.
+    let ledger: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(fx.proj.join(".socket/vendor/redirect-state.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        ledger["records"][PURL].is_object(),
+        "the installed purl must be recorded in the ledger: {ledger}"
+    );
+    assert!(
+        ledger["records"][PURL_UNINSTALLED].is_null(),
+        "no ledger record for the uninstalled version: {ledger}"
+    );
+
+    // Fresh-checkout proof: the narrowed redirect still installs the
+    // patched bytes.
+    let (fresh, ci) = fresh_checkout_npm_ci(&fx);
+    assert!(
+        ci.status.success(),
+        "fresh-checkout `npm ci` must succeed from the hosted patch tarball.\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&ci.stdout),
+        String::from_utf8_lossy(&ci.stderr),
+    );
+    let installed = std::fs::read(fresh.join("node_modules").join(DEP).join("index.js")).unwrap();
+    assert!(
+        installed.starts_with(MARKER.as_bytes()),
+        "npm ci must install the PATCHED bytes from the hosted patch; got:\n{}",
+        String::from_utf8_lossy(&installed[..installed.len().min(120)])
+    );
+    assert_eq!(
+        installed, fx.patched,
+        "fresh install must be byte-identical to the patched content"
     );
 }

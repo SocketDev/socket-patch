@@ -718,11 +718,6 @@ pub(super) async fn run_redirect(
     // other scan; `.take()` at each terminal (error or success) folds it in.
     mut scan_result: Option<serde_json::Value>,
 ) -> i32 {
-    use socket_patch_core::manifest::schema::PatchRecord;
-    use socket_patch_core::patch::redirect::{
-        rewrite_registry_redirect, DepOverride, RedirectState,
-    };
-
     // Same discovery/selection as `--apply`/`--vendor`.
     let selected = match discover_selected(
         api_client,
@@ -746,6 +741,53 @@ pub(super) async fn run_redirect(
         }
     };
 
+    // The redirect body consumes the selection only as (purl, uuid) pairs —
+    // the seam `get --mode hosted` injects its advisory-pinned selection
+    // through (see `run_redirect_selected`).
+    let pairs: Vec<(String, String)> = selected
+        .iter()
+        .map(|s| (s.purl.clone(), s.uuid.clone()))
+        .collect();
+    run_redirect_selected(
+        &args.common,
+        &args.vex,
+        args.prune || args.sync,
+        api_client,
+        effective_org_slug,
+        &pairs,
+        scan_result,
+    )
+    .await
+}
+
+/// The hosted-redirect engine over an ALREADY-SELECTED `(purl, uuid)` set:
+/// reference grants → DepOverride build → vendored→hosted takeover pre-revert
+/// → bun.lockb migration → candidate-file read → rewrite → pnpm trust config →
+/// confirmation probe → ledger merge-then-persist → file writes → gem stale
+/// probe → warnings → optional VEX. Shared VERBATIM by `scan --mode hosted`
+/// (whose `run_redirect` wrapper selects via `discover_selected`) and
+/// `get --mode hosted` (which pins the advisory-resolved uuid), so both
+/// produce identical on-disk results for the same selection.
+///
+/// `scan_result` must be `Some` exactly when `common.json` is set (the
+/// human/JSON split keys on `common.json`; a `--json` caller passing `None`
+/// would get a minimal envelope that drops its own keys). `prune_requested`
+/// only feeds the `redirect_prune_ignored` warning — `get` passes `false`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_redirect_selected(
+    common: &crate::args::GlobalArgs,
+    vex: &crate::commands::vex::VexEmbedArgs,
+    prune_requested: bool,
+    api_client: &socket_patch_core::api::client::ApiClient,
+    effective_org_slug: Option<&str>,
+    selected: &[(String, String)],
+    mut scan_result: Option<serde_json::Value>,
+) -> i32 {
+    use socket_patch_core::manifest::schema::PatchRecord;
+    use socket_patch_core::patch::redirect::{
+        rewrite_registry_redirect, DepOverride, RedirectState,
+    };
+
     let mut skipped: Vec<serde_json::Value> = Vec::new();
     let mut overrides: Vec<DepOverride> = Vec::new();
     // (purl, uuid, artifact_url, registry index_url, maven suffixed version,
@@ -767,37 +809,37 @@ pub(super) async fn run_redirect(
     let mut candidates: Vec<RedirectCandidate> = Vec::new();
 
     if !selected.is_empty() {
-        let uuids: Vec<String> = selected.iter().map(|s| s.uuid.clone()).collect();
+        let uuids: Vec<String> = selected.iter().map(|(_, uuid)| uuid.clone()).collect();
         let references = match api_client.fetch_registry_references(&uuids).await {
             Ok(r) => r,
             Err(e) => {
                 let message = format!("failed to resolve patch references: {e}");
                 eprintln!("{message}");
-                if args.common.json {
+                if common.json {
                     emit_json_error(scan_result.take(), &message);
                 }
                 return 1;
             }
         };
-        for sel in &selected {
-            let Some(reference) = references.get(&sel.uuid) else {
-                skipped.push(serde_json::json!({ "purl": sel.purl, "uuid": sel.uuid, "reason": "not_found" }));
+        for (sel_purl, sel_uuid) in selected {
+            let Some(reference) = references.get(sel_uuid) else {
+                skipped.push(serde_json::json!({ "purl": sel_purl, "uuid": sel_uuid, "reason": "not_found" }));
                 continue;
             };
             if reference.status != "granted" && reference.status != "reused" {
-                skipped.push(serde_json::json!({ "purl": sel.purl, "uuid": sel.uuid, "reason": reference.status }));
+                skipped.push(serde_json::json!({ "purl": sel_purl, "uuid": sel_uuid, "reason": reference.status }));
                 continue;
             }
-            let purl = reference.purl.as_deref().unwrap_or(&sel.purl);
+            let purl = reference.purl.as_deref().unwrap_or(sel_purl);
             let Some((ecosystem, name, version)) = parse_purl_simple(purl) else {
                 skipped.push(
-                    serde_json::json!({ "purl": purl, "uuid": sel.uuid, "reason": "bad_purl" }),
+                    serde_json::json!({ "purl": purl, "uuid": sel_uuid, "reason": "bad_purl" }),
                 );
                 continue;
             };
             let Some(url) = reference.url.clone() else {
                 skipped.push(
-                    serde_json::json!({ "purl": purl, "uuid": sel.uuid, "reason": "no_url" }),
+                    serde_json::json!({ "purl": purl, "uuid": sel_uuid, "reason": "no_url" }),
                 );
                 continue;
             };
@@ -841,7 +883,7 @@ pub(super) async fn run_redirect(
             }
             candidates.push((
                 purl.to_string(),
-                sel.uuid.clone(),
+                sel_uuid.clone(),
                 url.clone(),
                 reference
                     .registry_override
@@ -870,11 +912,11 @@ pub(super) async fn run_redirect(
                 .and_then(|o| {
                     socket_patch_core::patch::redirect::grant_token_path_segment(
                         &o.index_url,
-                        &sel.uuid,
+                        sel_uuid,
                     )
                 })
                 .or_else(|| {
-                    socket_patch_core::patch::redirect::grant_token_path_segment(&url, &sel.uuid)
+                    socket_patch_core::patch::redirect::grant_token_path_segment(&url, sel_uuid)
                 })
                 .unwrap_or_default();
             overrides.push(DepOverride {
@@ -883,7 +925,7 @@ pub(super) async fn run_redirect(
                 namespace: None,
                 version,
                 token,
-                patch_uuid: sel.uuid.clone(),
+                patch_uuid: sel_uuid.clone(),
                 artifact_url: url,
                 berry_zip_url: berry_zip.and_then(|a| a.url.clone()),
                 registry_override: reference.registry_override.clone(),
@@ -902,15 +944,15 @@ pub(super) async fn run_redirect(
     // redirect-state.json.corrupt (never clobbered) so recovery stays
     // possible; a dry-run reports the same hard error but moves nothing.
     let existing_ledger =
-        match socket_patch_core::patch::redirect::load_redirect_state(&args.common.cwd).await {
+        match socket_patch_core::patch::redirect::load_redirect_state(&common.cwd).await {
             Ok(state) => state,
             Err(mut corrupt) => {
-                if !args.common.dry_run {
+                if !common.dry_run {
                     corrupt.quarantine().await;
                 }
                 let message = corrupt.to_string();
                 eprintln!("{message}");
-                if args.common.json {
+                if common.json {
                     emit_json_error(scan_result.take(), &message);
                 }
                 return 1;
@@ -957,9 +999,9 @@ pub(super) async fn run_redirect(
     } else {
         use socket_patch_core::utils::purl::{normalize_purl, strip_purl_qualifiers};
         let canon = |p: &str| normalize_purl(strip_purl_qualifiers(p)).into_owned();
-        let vendor_state = socket_patch_core::vendor::load_state(&args.common.cwd).await;
+        let vendor_state = socket_patch_core::vendor::load_state(&common.cwd).await;
         let patch_entries =
-            socket_patch_core::vendor::cargo_config::read_patch_entries(&args.common.cwd).await;
+            socket_patch_core::vendor::cargo_config::read_patch_entries(&common.cwd).await;
         let mut refused: Vec<String> = Vec::new();
         for (purl, _uuid, ..) in &candidates {
             if !takeover_capable(purl) {
@@ -972,7 +1014,7 @@ pub(super) async fn run_redirect(
                 .and_then(|s| socket_patch_core::vendor::lookup_entry(&s.entries, stripped))
                 .cloned();
             if let Some(entry) = ledger_entry {
-                if args.common.dry_run {
+                if common.dry_run {
                     takeover_pre_warnings.push(serde_json::json!({
                         "code": "redirect_would_revert_vendored",
                         "detail": format!(
@@ -984,8 +1026,7 @@ pub(super) async fn run_redirect(
                     continue;
                 }
                 let outcome =
-                    crate::commands::vendor::dispatch_revert_one(&entry, &args.common.cwd, false)
-                        .await;
+                    crate::commands::vendor::dispatch_revert_one(&entry, &common.cwd, false).await;
                 if !outcome.success {
                     refused.push(purl.clone());
                     takeover_pre_warnings.push(serde_json::json!({
@@ -1003,8 +1044,7 @@ pub(super) async fn run_redirect(
                 // mid-run leaves a ledger matching the on-disk wiring.
                 // Re-loaded fresh each iteration (each iteration saves): the
                 // saved file is the truth.
-                let mut state = match socket_patch_core::vendor::load_state(&args.common.cwd).await
-                {
+                let mut state = match socket_patch_core::vendor::load_state(&common.cwd).await {
                     Ok(s) => s,
                     Err(e) => {
                         refused.push(purl.clone());
@@ -1022,9 +1062,7 @@ pub(super) async fn run_redirect(
                 state
                     .entries
                     .retain(|k, e| canon(k) != canon(purl) && canon(&e.base_purl) != canon(purl));
-                if let Err(e) =
-                    socket_patch_core::vendor::save_state(&args.common.cwd, &state).await
-                {
+                if let Err(e) = socket_patch_core::vendor::save_state(&common.cwd, &state).await {
                     // The wiring is reverted but the ledger still claims it;
                     // redirecting now would leave a ledger asserting wiring
                     // that is gone. Fail closed for this purl.
@@ -1120,11 +1158,11 @@ pub(super) async fn run_redirect(
     // refused) must not permanently convert the user's lockfile format as a
     // side effect of a zero-redirect run.
     let mut lockb_backup: Option<Vec<u8>> = None;
-    let has_lockb = args.common.cwd.join("bun.lockb").exists();
-    let has_bun_lock = args.common.cwd.join("bun.lock").exists();
+    let has_lockb = common.cwd.join("bun.lockb").exists();
+    let has_bun_lock = common.cwd.join("bun.lock").exists();
     let has_npm_override = overrides.iter().any(|o| o.ecosystem == "npm");
     if has_lockb && !has_bun_lock && has_npm_override {
-        if args.common.dry_run {
+        if common.dry_run {
             migration_warnings.push(serde_json::json!({
                 "code": "redirect_bun_lockb_would_migrate",
                 "detail": "bun.lockb would be migrated to a text bun.lock \
@@ -1134,7 +1172,7 @@ pub(super) async fn run_redirect(
         } else {
             // Read the binary lock BEFORE bun deletes it, so a zero-rewrite
             // run can restore it below.
-            let lockb_bytes = std::fs::read(args.common.cwd.join("bun.lockb")).ok();
+            let lockb_bytes = std::fs::read(common.cwd.join("bun.lockb")).ok();
             // `.output()` (not `.status()`): bun's install chatter must not
             // interleave with the machine `--json` envelope on stdout.
             let output = std::process::Command::new("bun")
@@ -1144,10 +1182,10 @@ pub(super) async fn run_redirect(
                     "--frozen-lockfile",
                     "--lockfile-only",
                 ])
-                .current_dir(&args.common.cwd)
+                .current_dir(&common.cwd)
                 .output();
             let migrated = matches!(output, Ok(o) if o.status.success())
-                && args.common.cwd.join("bun.lock").exists();
+                && common.cwd.join("bun.lock").exists();
             if migrated {
                 lockb_backup = lockb_bytes;
                 // bun deleted bun.lockb itself. Record the removal so `--revert`
@@ -1175,7 +1213,7 @@ pub(super) async fn run_redirect(
     // Read the project's candidate files, run the rewriters.
     let mut files: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
     for name in REDIRECT_CANDIDATE_FILES {
-        if let Ok(content) = std::fs::read_to_string(args.common.cwd.join(name)) {
+        if let Ok(content) = std::fs::read_to_string(common.cwd.join(name)) {
             files.insert((*name).to_string(), content);
         }
     }
@@ -1188,13 +1226,13 @@ pub(super) async fn run_redirect(
     // rewritten in place, and the write-back below is already path-generic.
     let mut rush_warnings: Vec<serde_json::Value> = Vec::new();
     let mut rush_lock_keys: Vec<String> = Vec::new();
-    if args.common.cwd.join("rush.json").is_file() {
+    if common.cwd.join("rush.json").is_file() {
         let common_lock = socket_patch_core::constants::npm_family::RUSH_COMMON_LOCK_REL;
-        if let Ok(content) = std::fs::read_to_string(args.common.cwd.join(common_lock)) {
+        if let Ok(content) = std::fs::read_to_string(common.cwd.join(common_lock)) {
             files.insert(common_lock.to_string(), content);
             rush_lock_keys.push(common_lock.to_string());
         }
-        let subspaces_dir = args.common.cwd.join("common/config/subspaces");
+        let subspaces_dir = common.cwd.join("common/config/subspaces");
         if let Ok(read_dir) = std::fs::read_dir(&subspaces_dir) {
             // read_dir order is unspecified — sort for deterministic output.
             let mut subspace_dirs: Vec<std::path::PathBuf> = read_dir
@@ -1230,9 +1268,9 @@ pub(super) async fn run_redirect(
     if !migration_edits.is_empty() && !rewrite.files.contains_key("bun.lock") {
         let restored = lockb_backup
             .as_deref()
-            .is_some_and(|bytes| std::fs::write(args.common.cwd.join("bun.lockb"), bytes).is_ok());
+            .is_some_and(|bytes| std::fs::write(common.cwd.join("bun.lockb"), bytes).is_ok());
         if restored {
-            let _ = std::fs::remove_file(args.common.cwd.join("bun.lock"));
+            let _ = std::fs::remove_file(common.cwd.join("bun.lock"));
             migration_edits.clear();
             migration_warnings.push(serde_json::json!({
                 "code": "redirect_bun_lockb_migration_reverted",
@@ -1262,8 +1300,7 @@ pub(super) async fn run_redirect(
     if rush_lock_keys
         .iter()
         .any(|key| rewrite.files.contains_key(key))
-        && args
-            .common
+        && common
             .cwd
             .join("common/config/rush/repo-state.json")
             .is_file()
@@ -1403,10 +1440,10 @@ pub(super) async fn run_redirect(
                 .all(|text| pnpm_lock_version_major(text).is_some_and(|major| major < 9));
             let detail = if all_locks_legacy {
                 pnpm_trust_legacy_detail(&server)
-            } else if !root_lock_v9 || args.common.no_trust_lockfile_config {
+            } else if !root_lock_v9 || common.no_trust_lockfile_config {
                 pnpm_trust_manual_guidance(&server)
             } else {
-                match read_workspace_for_trust(&args.common.cwd.join(PNPM_WORKSPACE_REL)) {
+                match read_workspace_for_trust(&common.cwd.join(PNPM_WORKSPACE_REL)) {
                     // Present but UNREADABLE: never plan a Create (it would
                     // overwrite the user's workspace file) — fall back to
                     // warning-only guidance naming the file and the error.
@@ -1424,7 +1461,7 @@ pub(super) async fn run_redirect(
                                     new: Some(serde_json::json!("true")),
                                 },
                             ));
-                            pnpm_trust_configured_detail(&server, true, args.common.dry_run)
+                            pnpm_trust_configured_detail(&server, true, common.dry_run)
                         }
                         TrustPlan::Append(text) => {
                             trust_config_write = Some((
@@ -1438,7 +1475,7 @@ pub(super) async fn run_redirect(
                                     new: Some(serde_json::json!("true")),
                                 },
                             ));
-                            pnpm_trust_configured_detail(&server, false, args.common.dry_run)
+                            pnpm_trust_configured_detail(&server, false, common.dry_run)
                         }
                         TrustPlan::AlreadyTrue => format!(
                             "{}, and {PNPM_WORKSPACE_REL} already carries `trustLockfile: \
@@ -1540,7 +1577,7 @@ pub(super) async fn run_redirect(
     let mut records: std::collections::BTreeMap<String, PatchRecord> =
         std::collections::BTreeMap::new();
     let mut record_warnings: Vec<serde_json::Value> = Vec::new();
-    if !args.common.dry_run {
+    if !common.dry_run {
         for (purl, uuid) in &confirmed {
             match api_client.fetch_patch(effective_org_slug, uuid).await {
                 Ok(Some(resp)) => {
@@ -1561,7 +1598,7 @@ pub(super) async fn run_redirect(
         }
     }
 
-    if !args.common.dry_run {
+    if !common.dry_run {
         // Ledger (mirrors the vendor state.json shape): recorded edits for a
         // future revert + the patch records (file hashes + vulnerabilities) so
         // a post-install `socket-patch vex` can attest the redirected patches.
@@ -1597,19 +1634,18 @@ pub(super) async fn run_redirect(
             // a swallowed write failure would let the lockfile writes below
             // proceed with no revert data persisted while reporting success.
             if let Err(e) =
-                socket_patch_core::patch::redirect::save_redirect_state(&args.common.cwd, &ledger)
-                    .await
+                socket_patch_core::patch::redirect::save_redirect_state(&common.cwd, &ledger).await
             {
                 let message = format!("failed to write .socket/vendor/redirect-state.json: {e}");
                 eprintln!("{message}");
-                if args.common.json {
+                if common.json {
                     emit_json_error(scan_result.take(), &message);
                 }
                 return 1;
             }
         }
         for (rel, content) in &rewrite.files {
-            let path = args.common.cwd.join(rel);
+            let path = common.cwd.join(rel);
             if let Some(parent) = path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
@@ -1624,7 +1660,7 @@ pub(super) async fn run_redirect(
             {
                 let message = format!("failed to write {rel}: {e}");
                 eprintln!("{message}");
-                if args.common.json {
+                if common.json {
                     emit_json_error(scan_result.take(), &message);
                 }
                 return 1;
@@ -1641,7 +1677,7 @@ pub(super) async fn run_redirect(
     // the probe's ledger-record fallback could still judge an
     // already-redirected project, so without this gate a dry-run would warn
     // about state the run did not (re)create.
-    let gem_stale: GemStaleOutcome = if args.common.dry_run {
+    let gem_stale: GemStaleOutcome = if common.dry_run {
         GemStaleOutcome::default()
     } else {
         // purl-coordinate → the PATCHED .gem artifact's sha256 (registry
@@ -1660,9 +1696,9 @@ pub(super) async fn run_redirect(
             })
             .collect();
         gem_stale_install_warnings(
-            &args.common.cwd,
-            args.common.global,
-            args.common.global_prefix.clone(),
+            &common.cwd,
+            common.global,
+            common.global_prefix.clone(),
             &confirmed,
             &records,
             &ledger_records,
@@ -1682,9 +1718,7 @@ pub(super) async fn run_redirect(
     // deleting the other mode's ledger; reconciliation is deferred (see PR Scope).
     // Read after the ledger write above so a non-dry-run reflects this run.
     let mut takeover_warnings: Vec<serde_json::Value> = Vec::new();
-    let superseded = super::classify_overlap_takeover(&args.common.cwd)
-        .await
-        .redirect;
+    let superseded = super::classify_overlap_takeover(&common.cwd).await.redirect;
     if !superseded.is_empty() {
         takeover_warnings.push(serde_json::json!({
             "code": super::REDIRECT_SUPERSEDES_VENDORED,
@@ -1698,7 +1732,7 @@ pub(super) async fn run_redirect(
     // `--mode agent --prune` must see WHY it stopped pruning. The human
     // path warns once up front in `run` (before this flow is entered).
     let mut prune_warnings: Vec<serde_json::Value> = Vec::new();
-    if args.prune || args.sync {
+    if prune_requested {
         prune_warnings.push(serde_json::json!({
             "code": super::REDIRECT_PRUNE_IGNORED,
             "detail": super::REDIRECT_PRUNE_IGNORED_DETAIL,
@@ -1719,8 +1753,8 @@ pub(super) async fn run_redirect(
     let mut vex_statements: Option<usize> = None;
     let mut vex_error: Option<(&'static str, String)> = None;
     let mut vex_code = 0;
-    if args.vex.vex.is_some() && !args.common.dry_run {
-        let mut params = args.vex.to_build_params();
+    if vex.vex.is_some() && !common.dry_run {
+        let mut params = vex.to_build_params();
         // Stale-flagged purls are EXCLUDED from assume_applied: the same-run
         // envelope carries a redirect_gem_stale_install warning proving the
         // installed materialization unpatched, so attesting that purl from
@@ -1734,8 +1768,8 @@ pub(super) async fn run_redirect(
             .map(|(purl, _)| purl.clone())
             .filter(|purl| !gem_stale.stale_purls.contains(purl))
             .collect();
-        let manifest_path = args.common.resolved_manifest_path();
-        match generate_vex_from_manifest_path(&args.common, &params, &manifest_path).await {
+        let manifest_path = common.resolved_manifest_path();
+        match generate_vex_from_manifest_path(common, &params, &manifest_path).await {
             Ok(summary) => vex_statements = Some(summary.statements),
             Err(e) => {
                 vex_code = 1;
@@ -1744,7 +1778,7 @@ pub(super) async fn run_redirect(
         }
     }
 
-    if args.common.json {
+    if common.json {
         let mut warnings: Vec<serde_json::Value> = rewrite
             .warnings
             .iter()
@@ -1778,12 +1812,12 @@ pub(super) async fn run_redirect(
             "rewrittenFiles": rewritten,
             "skipped": skipped,
             "warnings": warnings,
-            "dryRun": args.common.dry_run,
+            "dryRun": common.dry_run,
         });
         let mut result = build_redirect_json_envelope(scan_result.take(), redirect);
         if let Some(statements) = vex_statements {
             result["vex"] = serde_json::json!({
-                "path": args.vex.vex.as_ref().expect("vex_statements is Some only when --vex was given").display().to_string(),
+                "path": vex.vex.as_ref().expect("vex_statements is Some only when --vex was given").display().to_string(),
                 "statements": statements,
                 "format": "openvex-0.2.0",
                 "verified": false,
@@ -1798,8 +1832,8 @@ pub(super) async fn run_redirect(
                 .expect("serializing an in-memory JSON value cannot fail")
         );
     } else {
-        if !args.common.silent {
-            let verb = if args.common.dry_run {
+        if !common.silent {
+            let verb = if common.dry_run {
                 "would rewrite"
             } else {
                 "rewrote"
@@ -1859,13 +1893,12 @@ pub(super) async fn run_redirect(
                      install time; run `socket-patch vex` after installing to verify against \
                      the installed tree).",
                     statements,
-                    args.vex
-                        .vex
+                    vex.vex
                         .as_ref()
                         .expect("vex_statements is Some only when --vex was given")
                         .display(),
                 );
-            } else if args.vex.vex.is_some() && args.common.dry_run {
+            } else if vex.vex.is_some() && common.dry_run {
                 eprintln!("Skipping VEX generation (--dry-run).");
             }
         }
@@ -1876,6 +1909,31 @@ pub(super) async fn run_redirect(
         }
     }
     vex_code
+}
+
+/// Transient-frame boxed constructor for [`run_redirect_selected`] — the
+/// future embeds the whole hosted engine, and callers outside scan (`get
+/// --mode hosted`) must not materialize it in their own poll frame (Windows
+/// 1 MiB main-thread stack; same rationale as scan's `boxed_*` family).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn boxed_run_redirect_selected<'a>(
+    common: &'a crate::args::GlobalArgs,
+    vex: &'a crate::commands::vex::VexEmbedArgs,
+    prune_requested: bool,
+    api_client: &'a socket_patch_core::api::client::ApiClient,
+    effective_org_slug: Option<&'a str>,
+    selected: &'a [(String, String)],
+    scan_result: Option<serde_json::Value>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = i32> + 'a>> {
+    Box::pin(run_redirect_selected(
+        common,
+        vex,
+        prune_requested,
+        api_client,
+        effective_org_slug,
+        selected,
+        scan_result,
+    ))
 }
 
 #[cfg(test)]

@@ -44,6 +44,12 @@
 //! `gems.rb`/`gems.locked` spelling (which bundler prefers over `Gemfile`
 //! when both exist — this pins the candidate-list + rewriter support).
 //!
+//! The `get <uuid> --mode hosted` twin (v3.6) drives the SAME fixture
+//! through get's per-advisory selector instead of scan — same hosted engine
+//! by construction (CLI_CONTRACT.md "get --mode and installed narrowing"):
+//! identical Gemfile/lock rewrite + ledger, get's envelope (nested
+//! `redirect`, no `downloaded`/`applied`), NO manifest, NO blobs, no --vex.
+//!
 //! The deps red-arm serves an `/info` shaped like production's HISTORICAL
 //! defect (checksum but NO dependencies): the fresh install must fail with
 //! bundler's `APIResponseMismatchError … revealed dependencies not in the
@@ -364,6 +370,29 @@ impl Spelling {
     }
 }
 
+/// Which command drives the hosted redirect in the fixture. Both route
+/// through scan's hosted engine, so the on-disk result is identical by
+/// construction; the argv and the JSON envelope differ.
+#[derive(Clone, Copy, PartialEq)]
+enum Driver {
+    /// `scan --mode hosted --json --yes --vex out.vex.json` — the original
+    /// recipe with the in-run (unverified) attestation.
+    ScanVex,
+    /// `get <uuid> --mode hosted --json --yes` — get's per-advisory
+    /// selector (v3.6). No `--vex` (get has none); the uuid path needs only
+    /// the view + reference mocks and is exempt from installed narrowing.
+    GetUuid,
+}
+
+impl Driver {
+    fn label(self) -> &'static str {
+        match self {
+            Driver::ScanVex => "scan --mode hosted",
+            Driver::GetUuid => "get <uuid> --mode hosted",
+        }
+    }
+}
+
 /// The Socket patches API reference endpoint for one grant token: granted,
 /// carrying the rubygems-compact-index registry override (the identifier
 /// shape the TS reference builder emits — name / version /
@@ -435,11 +464,12 @@ fn run_hosted_scan(proj: &Path, api: &str) -> (i32, String, String) {
     )
 }
 
-/// Build the hermetic fixture and run `scan --mode hosted` through the real
+/// Build the hermetic fixture and run the `driver` command (`scan --mode
+/// hosted --vex`, or its `get <uuid> --mode hosted` twin) through the real
 /// binary: author + `gem build` the three gems, mount both compact indexes
-/// and the patches API, `bundle install` from the mock upstream, scan, and
-/// assert the redirect envelope + Gemfile rewrite. `checksums_lock` opts the
-/// fixture lock into a CHECKSUMS section (`bundle lock --add-checksums`);
+/// and the patches API, `bundle install` from the mock upstream, redirect,
+/// and assert the redirect envelope + Gemfile rewrite. `checksums_lock` opts
+/// the fixture lock into a CHECKSUMS section (`bundle lock --add-checksums`);
 /// `registry_declares_deps` toggles the patch registry's `/info` between the
 /// CORRECT contract (runtime deps declared) and today's production-like
 /// deps-less answer. `rotated_token` = Some(token B) arms a grant-rotation
@@ -453,6 +483,7 @@ async fn redirect_scanned_project(
     checksums_lock: bool,
     registry_declares_deps: bool,
     rotated_token: Option<&str>,
+    driver: Driver,
 ) -> Option<RedirectFixture> {
     for cmd in ["ruby", "gem", "bundle"] {
         if !has_command(cmd) {
@@ -698,20 +729,23 @@ async fn redirect_scanned_project(
         "fixture install must extract the authored pristine bytes"
     );
 
-    // 4. scan --mode hosted --vex: the Gemfile rewrite + the in-run
-    //    (unverified) attestation.
-    let (code, stdout, stderr) = run_socket(
-        &proj,
-        &[
+    // 4. The driving command. ScanVex: scan --mode hosted --vex — the
+    //    Gemfile rewrite + the in-run (unverified) attestation. GetUuid:
+    //    `get <uuid> --mode hosted` — the same engine by construction, no
+    //    --vex (get has none), get's envelope with the nested `redirect`.
+    let api = server.uri();
+    let proj_str = proj.to_str().expect("utf8 tmp path");
+    let argv: Vec<&str> = match driver {
+        Driver::ScanVex => vec![
             "scan",
             "--mode",
             "hosted",
             "--json",
             "--yes",
             "--cwd",
-            proj.to_str().unwrap(),
+            proj_str,
             "--api-url",
-            &server.uri(),
+            &api,
             "--org",
             ORG,
             "--api-token",
@@ -721,13 +755,35 @@ async fn redirect_scanned_project(
             "--vex-product",
             PRODUCT,
         ],
-    );
+        Driver::GetUuid => vec![
+            "get",
+            UUID,
+            "--mode",
+            "hosted",
+            "--json",
+            "--yes",
+            "--cwd",
+            proj_str,
+            "--api-url",
+            &api,
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+        ],
+    };
+    let (code, stdout, stderr) = run_socket(&proj, &argv);
     assert_eq!(
-        code, 0,
-        "scan --mode hosted failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        code,
+        0,
+        "{} failed.\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        driver.label()
     );
     let env: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
-        panic!("scan --mode hosted --json output is not JSON: {e}\nstdout:\n{stdout}")
+        panic!(
+            "{} --json output is not JSON: {e}\nstdout:\n{stdout}",
+            driver.label()
+        )
     });
     assert_eq!(env["status"], "success", "envelope: {env}");
     assert_eq!(env["redirect"]["mode"], "hosted", "envelope: {env}");
@@ -778,11 +834,32 @@ async fn redirect_scanned_project(
             "a no-CHECKSUMS lock must be byte-untouched"
         );
     }
-    assert_eq!(env["vex"]["statements"], 1, "vex block: {env}");
-    assert_eq!(
-        env["vex"]["verified"], false,
-        "in-run hosted VEX is attested from the ledger, not hash-verified: {env}"
-    );
+    match driver {
+        Driver::ScanVex => {
+            assert_eq!(env["vex"]["statements"], 1, "vex block: {env}");
+            assert_eq!(
+                env["vex"]["verified"], false,
+                "in-run hosted VEX is attested from the ledger, not hash-verified: {env}"
+            );
+        }
+        Driver::GetUuid => {
+            // get's hosted envelope (CLI_CONTRACT.md "get --mode and
+            // installed narrowing"): `found` counts the resolved patch;
+            // `downloaded`/`applied` are ABSENT — nothing lands in
+            // `.socket/`, the redirect ledger IS the persistence — and no
+            // `vex` key (get has no --vex).
+            assert_eq!(env["found"], 1, "envelope: {env}");
+            assert!(
+                env.get("downloaded").is_none(),
+                "hosted get downloads nothing into .socket/: {env}"
+            );
+            assert!(
+                env.get("applied").is_none(),
+                "hosted get applies nothing in place: {env}"
+            );
+            assert!(env.get("vex").is_none(), "get has no --vex: {env}");
+        }
+    }
 
     // The Gemfile rewrite: the declaration moved into the source block whose
     // URL is the patch-registry compact index.
@@ -924,7 +1001,15 @@ fn assert_patched_install(fx: &RedirectFixture, fresh: &Path) {
 #[ignore = "host capstone: shells out to a real ruby/gem/bundler >= 2.6; the unpinned `test` \
             job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
 async fn gem_hosted_fresh_checkout_bundle_install_installs_patched_bytes_and_vex_verifies() {
-    let Some(fx) = redirect_scanned_project("main", Spelling::Gemfile, false, true, None).await
+    let Some(fx) = redirect_scanned_project(
+        "main",
+        Spelling::Gemfile,
+        false,
+        true,
+        None,
+        Driver::ScanVex,
+    )
+    .await
     else {
         return;
     };
@@ -989,6 +1074,66 @@ async fn gem_hosted_fresh_checkout_bundle_install_installs_patched_bytes_and_vex
     );
 }
 
+/// GET-DRIVEN TWIN of the main capstone: `get <uuid> --mode hosted` (v3.6,
+/// the per-advisory selector) must leave the same committable redirect
+/// state as `scan --mode hosted` — same Gemfile source block, same ledger,
+/// NO manifest, NO blobs — proven the same way against the REAL bundler: a
+/// fresh checkout of only the committable files resolves the PATCHED gem
+/// (bytes + runtime dep + require probe) from the mock patch registry.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "host capstone: shells out to a real ruby/gem/bundler >= 2.6; the unpinned `test` \
+            job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
+async fn gem_get_uuid_hosted_fresh_checkout_bundle_install() {
+    let Some(fx) = redirect_scanned_project(
+        "get-uuid",
+        Spelling::Gemfile,
+        false,
+        true,
+        None,
+        Driver::GetUuid,
+    )
+    .await
+    else {
+        return;
+    };
+
+    // Persistence parity with `scan --mode hosted`: the redirect ledger is
+    // the ONLY .socket/ artifact — no manifest, no blobs (the fixture
+    // already asserted the ledger + the Gemfile source block).
+    assert!(
+        !fx.proj.join(".socket/manifest.json").exists(),
+        "get --mode hosted must NOT write the manifest (parity with scan --mode hosted)"
+    );
+    assert!(
+        !fx.proj.join(".socket/blobs").exists(),
+        "get --mode hosted must NOT persist blobs"
+    );
+
+    // FRESH-CHECKOUT PROOF: the unfrozen install the redirect prescribes
+    // pulls the patched .gem from the hosted compact index.
+    let (fresh, install) = fresh_checkout_bundle_install(&fx);
+    assert!(
+        install.status.success(),
+        "fresh-checkout `bundle install` must succeed from the patch registry.\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&install.stdout),
+        String::from_utf8_lossy(&install.stderr),
+    );
+    assert_patched_install(&fx, &fresh);
+
+    // The converged lock records the patch registry as the gem's source and
+    // bundler's own `!` pin — identical to what the scan-driven capstone
+    // leaves behind (parity by construction).
+    let lock = std::fs::read_to_string(fresh.join(fx.lock_name)).unwrap();
+    assert!(
+        lock.contains(&format!("remote: {}", fx.index_url)),
+        "post-install lock must record the patch-registry source:\n{lock}"
+    );
+    assert!(
+        lock.contains(&format!("{DEP} (= {DEP_VERSION})!")),
+        "post-install lock must carry bundler's source-pinned dependency:\n{lock}"
+    );
+}
+
 /// Bundler's modern `gems.rb`/`gems.locked` spelling, end to end: the
 /// candidate list must read the pair, the rewriter must key its edits to it,
 /// and the real bundler must install the patched gem from the redirected
@@ -997,7 +1142,15 @@ async fn gem_hosted_fresh_checkout_bundle_install_installs_patched_bytes_and_vex
 #[ignore = "host capstone: shells out to a real ruby/gem/bundler >= 2.6; the unpinned `test` \
             job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
 async fn gem_hosted_gems_rb_spelling_redirects_and_installs() {
-    let Some(fx) = redirect_scanned_project("gems.rb", Spelling::GemsRb, false, true, None).await
+    let Some(fx) = redirect_scanned_project(
+        "gems.rb",
+        Spelling::GemsRb,
+        false,
+        true,
+        None,
+        Driver::ScanVex,
+    )
+    .await
     else {
         return;
     };
@@ -1031,7 +1184,15 @@ async fn gem_hosted_gems_rb_spelling_redirects_and_installs() {
 #[ignore = "host capstone: shells out to a real ruby/gem/bundler >= 2.6; the unpinned `test` \
             job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
 async fn gem_hosted_registry_info_without_deps_breaks_install_like_production() {
-    let Some(fx) = redirect_scanned_project("nodeps", Spelling::Gemfile, false, false, None).await
+    let Some(fx) = redirect_scanned_project(
+        "nodeps",
+        Spelling::Gemfile,
+        false,
+        false,
+        None,
+        Driver::ScanVex,
+    )
+    .await
     else {
         return;
     };
@@ -1078,7 +1239,15 @@ async fn gem_hosted_registry_info_without_deps_breaks_install_like_production() 
 #[ignore = "host capstone: shells out to a real ruby/gem/bundler >= 2.6; the unpinned `test` \
             job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
 async fn gem_hosted_checksums_lock_converges_and_installs_frozen_and_unfrozen() {
-    let Some(fx) = redirect_scanned_project("checksums", Spelling::Gemfile, true, true, None).await
+    let Some(fx) = redirect_scanned_project(
+        "checksums",
+        Spelling::Gemfile,
+        true,
+        true,
+        None,
+        Driver::ScanVex,
+    )
+    .await
     else {
         return;
     };
@@ -1175,8 +1344,15 @@ async fn gem_hosted_checksums_lock_converges_and_installs_frozen_and_unfrozen() 
             job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
 async fn gem_hosted_rotated_grant_rescan_refreshes_source_block_and_installs() {
     const TOKEN_B: &str = "55555555-5555-4555-8555-555555555555";
-    let Some(fx) =
-        redirect_scanned_project("rotation", Spelling::Gemfile, false, true, Some(TOKEN_B)).await
+    let Some(fx) = redirect_scanned_project(
+        "rotation",
+        Spelling::Gemfile,
+        false,
+        true,
+        Some(TOKEN_B),
+        Driver::ScanVex,
+    )
+    .await
     else {
         return;
     };

@@ -256,8 +256,9 @@ pub struct GlobalArgs {
     /// Default (`None`) and `0` both mean a single non-blocking try
     /// — failing immediately if another process holds the lock. A
     /// positive value retries with a 100 ms backoff until the lock
-    /// frees or the budget elapses. Only meaningful for the mutating
-    /// subcommands (`apply`, `rollback`, `repair`, `remove`); other
+    /// frees or the budget elapses. Only meaningful for the lock-
+    /// contending subcommands (`apply`, `rollback`, `repair`, `remove`,
+    /// `vendor`, and the vendored modes of `scan`/`get`); other
     /// commands accept it silently.
     #[arg(long = "lock-timeout", env = "SOCKET_LOCK_TIMEOUT")]
     pub lock_timeout: Option<u64>,

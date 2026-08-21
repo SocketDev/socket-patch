@@ -24,6 +24,12 @@
 //! Hermetic + offline: both the upstream and the socket-patched module are
 //! served from a `file://` GOPROXY into per-"machine" temp caches. Skips when
 //! `go`/`zip` aren't installed.
+//!
+//! Two entry points into the SAME committed shape (both stage through
+//! [`stage_hosted_project`]): the rewriter capstone drives the pure
+//! `rewrite_registry_redirect` engine in-process, and the `get`-driven twin
+//! drives the full CLI (`get <uuid> --mode hosted`) against a wiremock API,
+//! proving the advisory-selector path lands the identical go.mod/go.sum.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -33,11 +39,16 @@ mod common;
 
 use common::{cache_env, has_command};
 
+use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
 use socket_patch_core::patch::redirect::{
     rewrite_registry_redirect, DepOverride, Integrity, RegistryOverride,
     RegistryOverrideIdentifiers,
 };
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
+const ORG: &str = "test-org";
+const GHSA: &str = "GHSA-gogo-host-get1";
 const UMOD: &str = "example.com/upstream";
 const UVER: &str = "v1.0.0";
 const UUID: &str = "55555555-5555-5555-5555-555555555555";
@@ -185,37 +196,41 @@ fn harvest_sums(tmp: &Path, proxy_url: &str, mod_path: &str, ver: &str) -> (Stri
     )
 }
 
-#[test]
-fn day2_machine_builds_patched_module_from_committed_files_alone() {
-    if !has_command("go") || !has_command("zip") {
-        eprintln!("skipping e2e_golang_hosted_build: `go`/`zip` not installed");
-        return;
-    }
-    // RED guards: hostile ambient values every pinned env below must defeat.
-    // `GOTOOLCHAIN` must lose to the `local` pin; `GOFLAGS=-mod=mod` must lose
-    // to the explicit empty (day-2 must run readonly); `GONOSUMDB=*` must lose
-    // to the explicit empty (it would mask the bogus-GOSUMDB tripwire).
-    std::env::set_var("GOTOOLCHAIN", "go1.99.99");
-    std::env::set_var("GOFLAGS", "-mod=mod");
-    std::env::set_var("GONOSUMDB", "*");
-    let tmp = tempfile::tempdir().unwrap();
-    let _cleanup = ChmodGuard(tmp.path().to_path_buf());
-    let proxy_url = format!("file://{}", tmp.path().join("proxy").display());
+/// Everything both capstones share once [`stage_hosted_project`] returns.
+struct HostedGoProject {
+    consumer: PathBuf,
+    proxy_url: String,
+    /// The socket module path (`patch.socket.dev/gopatch/<uuid>`).
+    smod: String,
+    /// The socket module's go.sum pair: zip dirhash + served-`.mod` hash.
+    zip_h1: String,
+    gomod_h1: String,
+}
+
+/// Shared fixture for the rewriter capstone and the `get`-driven twin — the
+/// patch server's side plus the user's pre-redirect project:
+///
+/// * Upstream module (vulnerable), and the patched artifact published under
+///   the socket module path. ZERO-REWRITE converter shape: the internal
+///   go.mod still declares the ORIGINAL module path and sources keep original
+///   import spellings; only the zip prefix + proxy dir carry the socket path.
+/// * The consumer project (go.mod + upstream go.sum pair + main.go).
+/// * Anti-vacuity baseline: an untouched project on a fresh machine links
+///   PRISTINE (so a later PATCHED link can only come from the redirect).
+///
+/// Each caller then performs the redirect its own way (in-process rewriter
+/// vs the CLI's `get <uuid> --mode hosted`) and proves the same day-2 build.
+fn stage_hosted_project(tmp: &Path) -> HostedGoProject {
+    let proxy_url = format!("file://{}", tmp.join("proxy").display());
     let smod = socket_module();
 
-    // ── the patch server's side ─────────────────────────────────────────────
-    // Upstream module (vulnerable), and the patched artifact published under
-    // the socket module path. ZERO-REWRITE converter shape: the internal
-    // go.mod still declares the ORIGINAL module path and sources keep original
-    // import spellings; only the zip prefix + proxy dir carry the socket path.
     let upstream_gomod = format!("module {UMOD}\n\ngo 1.21\n");
-    publish(tmp.path(), UMOD, UVER, &upstream_gomod, PRISTINE_LIB);
-    publish(tmp.path(), &smod, SVER, &upstream_gomod, PATCHED_LIB);
-    let (zip_h1, gomod_h1) = harvest_sums(tmp.path(), &proxy_url, &smod, SVER);
-    let (u_zip_h1, u_gomod_h1) = harvest_sums(tmp.path(), &proxy_url, UMOD, UVER);
+    publish(tmp, UMOD, UVER, &upstream_gomod, PRISTINE_LIB);
+    publish(tmp, &smod, SVER, &upstream_gomod, PATCHED_LIB);
+    let (zip_h1, gomod_h1) = harvest_sums(tmp, &proxy_url, &smod, SVER);
+    let (u_zip_h1, u_gomod_h1) = harvest_sums(tmp, &proxy_url, UMOD, UVER);
 
-    // ── the user's project, pre-redirect ────────────────────────────────────
-    let consumer = tmp.path().join("consumer");
+    let consumer = tmp.join("consumer");
     std::fs::create_dir_all(&consumer).unwrap();
     std::fs::write(
         consumer.join("go.mod"),
@@ -235,8 +250,7 @@ fn day2_machine_builds_patched_module_from_committed_files_alone() {
     )
     .unwrap();
 
-    // Sanity: an untouched project on a fresh machine links PRISTINE.
-    let m0 = Machine::new(tmp.path(), "machine0");
+    let m0 = Machine::new(tmp, "machine0");
     let env = day2_env(&proxy_url);
     let base = go(&consumer, &m0, &["run", "."], &as_pairs(&env));
     assert!(
@@ -245,6 +259,41 @@ fn day2_machine_builds_patched_module_from_committed_files_alone() {
         String::from_utf8_lossy(&base.stderr)
     );
     assert!(String::from_utf8_lossy(&base.stdout).contains("OUT: PRISTINE"));
+
+    HostedGoProject {
+        consumer,
+        proxy_url,
+        smod,
+        zip_h1,
+        gomod_h1,
+    }
+}
+
+// #[serial]: this test mutates process env (GOTOOLCHAIN/GOFLAGS/GONOSUMDB
+// set_var) while its sibling below iterates env for the subprocess spawn —
+// unserialized, the two race on the process-global environment.
+#[test]
+#[serial_test::serial]
+fn day2_machine_builds_patched_module_from_committed_files_alone() {
+    if !has_command("go") || !has_command("zip") {
+        eprintln!("skipping e2e_golang_hosted_build: `go`/`zip` not installed");
+        return;
+    }
+    // RED guards: hostile ambient values every pinned env below must defeat.
+    // `GOTOOLCHAIN` must lose to the `local` pin; `GOFLAGS=-mod=mod` must lose
+    // to the explicit empty (day-2 must run readonly); `GONOSUMDB=*` must lose
+    // to the explicit empty (it would mask the bogus-GOSUMDB tripwire).
+    std::env::set_var("GOTOOLCHAIN", "go1.99.99");
+    std::env::set_var("GOFLAGS", "-mod=mod");
+    std::env::set_var("GONOSUMDB", "*");
+    let tmp = tempfile::tempdir().unwrap();
+    let _cleanup = ChmodGuard(tmp.path().to_path_buf());
+    let fx = stage_hosted_project(tmp.path());
+    let consumer = fx.consumer.clone();
+    let proxy_url = fx.proxy_url.clone();
+    let smod = fx.smod.clone();
+    let (zip_h1, gomod_h1) = (fx.zip_h1.clone(), fx.gomod_h1.clone());
+    let env = day2_env(&proxy_url);
 
     // ── `scan --mode hosted`'s rewrite (in-process, pure) ───────────────────
     let ovr = DepOverride {
@@ -392,4 +441,218 @@ fn day2_machine_builds_patched_module_from_committed_files_alone() {
         "failure must come from the bogus checksum DB (tripwire armed), got: {dl_err}"
     );
     std::fs::write(consumer.join("go.sum"), &before_sum).unwrap();
+}
+
+/// `get <uuid> --mode hosted` twin of the capstone above: the CLI's
+/// advisory-selector path routes through the SAME shared engine, so the
+/// committed go.mod/go.sum must come out identical in shape — fork-replace
+/// onto the gopatch module path, plus BOTH go.sum `h1:` lines (the goproxy
+/// integrity pair is all-or-nothing; the grant carries it on the override's
+/// identifiers) — and a fresh day-2 machine must build the PATCHED module
+/// from the committed files alone. Hosted persistence is the redirect ledger
+/// ONLY: no manifest, no blobs.
+// multi_thread: the CLI subprocess blocks a worker thread while wiremock
+// keeps serving the view + reference routes on the others.
+// #[serial]: see the sibling test's note — env mutation vs env iteration.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial]
+async fn golang_get_uuid_hosted_day2_machine_builds() {
+    if !has_command("go") || !has_command("zip") {
+        eprintln!("skipping e2e_golang_hosted_build: `go`/`zip` not installed");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let _cleanup = ChmodGuard(tmp.path().to_path_buf());
+    let fx = stage_hosted_project(tmp.path());
+    let purl = format!("pkg:golang/{UMOD}@{UVER}");
+    let artifact_url = format!("{}/{}/@v/{SVER}.zip", fx.proxy_url, fx.smod);
+
+    // API mocks: `view/{uuid}` (the record the redirect ledger embeds for
+    // VEX) + the reference grant whose goproxy override carries the module
+    // path/version and the gopatch-flavor hash pair the rewriter pins.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/view/{UUID}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "uuid": UUID,
+            "purl": &purl,
+            "publishedAt": "2026-01-01T00:00:00Z",
+            "files": {
+                "lib.go": {
+                    "beforeHash": compute_git_sha256_from_bytes(PRISTINE_LIB.as_bytes()),
+                    "afterHash": compute_git_sha256_from_bytes(PATCHED_LIB.as_bytes()),
+                }
+            },
+            "vulnerabilities": {
+                GHSA: {
+                    "cves": ["CVE-2026-4242"],
+                    "summary": "golang hosted get capstone vuln",
+                    "severity": "high",
+                    "description": "d"
+                }
+            },
+            "description": "golang hosted get capstone fixture",
+            "license": "MIT",
+            "tier": "free",
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/package")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "results": {
+                UUID: {
+                    "status": "granted",
+                    "url": &artifact_url,
+                    "purl": &purl,
+                    "artifacts": [{
+                        "kind": "tarball",
+                        "url": &artifact_url,
+                        "integrity": {}
+                    }],
+                    "registryOverride": {
+                        "kind": "goproxy",
+                        "indexUrl": &fx.proxy_url,
+                        "identifiers": {
+                            "name": UMOD,
+                            "version": UVER,
+                            "goModulePath": &fx.smod,
+                            "goModuleVersion": SVER,
+                            "goZipDirhashH1": &fx.zip_h1,
+                            "goModH1": &fx.gomod_h1,
+                        }
+                    }
+                }
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    // The CLI run: `get <uuid> --mode hosted --json --yes`.
+    let (code, stdout, stderr) = common::run_with_env(
+        &fx.consumer,
+        &[
+            "get",
+            UUID,
+            "--mode",
+            "hosted",
+            "--json",
+            "--yes",
+            "--cwd",
+            fx.consumer.to_str().unwrap(),
+            "--api-url",
+            &server.uri(),
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+        ],
+        &[],
+    );
+    assert_eq!(
+        code, 0,
+        "get --mode hosted failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let envelope: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!("get --mode hosted --json output is not JSON: {e}\nstdout:\n{stdout}")
+    });
+    assert_eq!(envelope["status"], "success", "envelope: {envelope}");
+    assert_eq!(
+        envelope["redirect"]["mode"], "hosted",
+        "envelope: {envelope}"
+    );
+    assert_eq!(
+        envelope["redirect"]["redirected"], 1,
+        "exactly one dep redirected: {envelope}"
+    );
+    assert_eq!(
+        envelope["redirect"]["rewrittenFiles"],
+        serde_json::json!(["go.mod", "go.sum"]),
+        "exactly the two committed files change: {envelope}"
+    );
+    assert_eq!(
+        envelope["redirect"]["warnings"],
+        serde_json::json!([]),
+        "no rewriter warnings: {envelope}"
+    );
+
+    // Committed shape identical to the rewriter capstone: the fork-style
+    // replace onto the gopatch module path…
+    let gomod = std::fs::read_to_string(fx.consumer.join("go.mod")).unwrap();
+    let expected_replace = format!("replace {UMOD} {UVER} => {} {SVER}", fx.smod);
+    assert!(
+        gomod.lines().any(|l| l.trim() == expected_replace),
+        "go.mod must carry the fork-replace.\nwant: {expected_replace}\ngot:\n{gomod}"
+    );
+    // …plus BOTH go.sum lines (the all-or-nothing integrity pair).
+    let gosum = std::fs::read_to_string(fx.consumer.join("go.sum")).unwrap();
+    let want_zip = format!("{} {SVER} {}", fx.smod, fx.zip_h1);
+    let want_mod = format!("{} {SVER}/go.mod {}", fx.smod, fx.gomod_h1);
+    assert!(
+        gosum.lines().any(|l| l.trim() == want_zip),
+        "go.sum must pin the zip dirhash.\nwant: {want_zip}\ngot:\n{gosum}"
+    );
+    assert!(
+        gosum.lines().any(|l| l.trim() == want_mod),
+        "go.sum must pin the served-.mod hash.\nwant: {want_mod}\ngot:\n{gosum}"
+    );
+
+    // Hosted persistence contract: the ledger IS the persistence.
+    let ledger: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(fx.consumer.join(".socket/vendor/redirect-state.json"))
+            .expect("redirect ledger must be written"),
+    )
+    .unwrap();
+    assert_eq!(ledger["mode"], "hosted", "ledger: {ledger}");
+    assert_eq!(
+        ledger["records"][purl.as_str()]["uuid"],
+        UUID,
+        "the ledger must embed the patch record for VEX: {ledger}"
+    );
+    assert!(
+        !fx.consumer.join(".socket/manifest.json").exists(),
+        "hosted mode must NOT write the manifest (parity with scan --mode hosted)"
+    );
+    assert!(
+        !fx.consumer.join(".socket/blobs").exists(),
+        "hosted mode must NOT persist blobs"
+    );
+
+    // Reference-grant oracle: exactly one grant request, for THIS uuid.
+    let reference_bodies: Vec<String> = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| r.url.path().ends_with("/patches/package"))
+        .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+        .collect();
+    assert_eq!(
+        reference_bodies.len(),
+        1,
+        "exactly one reference request: {reference_bodies:?}"
+    );
+    assert!(
+        reference_bodies[0].contains(UUID),
+        "the grant request must carry the selected uuid: {}",
+        reference_bodies[0]
+    );
+
+    // ── day 2: a fresh machine, committed files only, zero local config ─────
+    // Same harness as the rewriter capstone: default `-mod=readonly`, bogus
+    // GOSUMDB (never consulted thanks to the committed pair), every escape
+    // hatch empty.
+    let env = day2_env(&fx.proxy_url);
+    let m2 = Machine::new(tmp.path(), "machine2");
+    let patched = go(&fx.consumer, &m2, &["run", "."], &as_pairs(&env));
+    assert!(
+        patched.status.success(),
+        "day-2 run failed: {}",
+        String::from_utf8_lossy(&patched.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&patched.stdout).contains("OUT: PATCHED"),
+        "day-2 build must link the PATCHED module: {}",
+        String::from_utf8_lossy(&patched.stdout)
+    );
 }

@@ -370,7 +370,11 @@ async fn get_gem_paths_with_gemfile_no_vendor_returns_gemdir() {
     std::env::set_var("PATH", bin.path());
 
     let crawler = RubyCrawler;
-    let result = crawler.get_gem_paths(&options_at(tmp.path())).await;
+    // Hermetic seam: a developer's ambient BUNDLE_PATH/BUNDLE_APP_CONFIG
+    // must not add install roots to this assertion.
+    let result = crawler
+        .get_gem_paths_with_env(&options_at(tmp.path()), None, None, None)
+        .await;
 
     if let Some(v) = prev {
         std::env::set_var("PATH", v);
@@ -408,7 +412,11 @@ async fn get_gem_paths_with_gemfile_lock_only_returns_gemdir() {
     std::env::set_var("PATH", bin.path());
 
     let crawler = RubyCrawler;
-    let result = crawler.get_gem_paths(&options_at(tmp.path())).await;
+    // Hermetic seam: a developer's ambient BUNDLE_PATH/BUNDLE_APP_CONFIG
+    // must not add install roots to this assertion.
+    let result = crawler
+        .get_gem_paths_with_env(&options_at(tmp.path()), None, None, None)
+        .await;
 
     if let Some(v) = prev {
         std::env::set_var("PATH", v);
@@ -452,8 +460,12 @@ async fn get_gem_paths_with_gems_rb_manifest_returns_gemdir() {
     install_fake_gem(bin.path(), gemdir.path());
 
     let crawler = RubyCrawler;
+    // Hermetic seam: ambient BUNDLE_PATH/BUNDLE_APP_CONFIG must not add
+    // install roots to this assertion.
     let paths = with_path(bin.path(), || async {
-        crawler.get_gem_paths(&options_at(tmp.path())).await
+        crawler
+            .get_gem_paths_with_env(&options_at(tmp.path()), None, None, None)
+            .await
     })
     .await
     .unwrap();
@@ -484,8 +496,12 @@ async fn get_gem_paths_with_gems_locked_only_returns_gemdir() {
     install_fake_gem(bin.path(), gemdir.path());
 
     let crawler = RubyCrawler;
+    // Hermetic seam: ambient BUNDLE_PATH/BUNDLE_APP_CONFIG must not add
+    // install roots to this assertion.
     let paths = with_path(bin.path(), || async {
-        crawler.get_gem_paths(&options_at(tmp.path())).await
+        crawler
+            .get_gem_paths_with_env(&options_at(tmp.path()), None, None, None)
+            .await
     })
     .await
     .unwrap();
@@ -537,15 +553,17 @@ async fn get_gem_paths_local_includes_every_gempath_home() {
 
     let crawler = RubyCrawler;
     let (paths, decoy, crawled) = with_path(bin.path(), || async {
+        // Hermetic seam: ambient BUNDLE_PATH/BUNDLE_APP_CONFIG must not
+        // add install roots to this assertion.
         let paths = crawler
-            .get_gem_paths(&options_at(tmp.path()))
+            .get_gem_paths_with_env(&options_at(tmp.path()), None, None, None)
             .await
             .unwrap();
         // Control: the gate still holds with `gem env` answerable — a
         // non-Ruby cwd must not pull in the ambient gem homes.
         let non_ruby = tempfile::tempdir().unwrap();
         let decoy = crawler
-            .get_gem_paths(&options_at(non_ruby.path()))
+            .get_gem_paths_with_env(&options_at(non_ruby.path()), None, None, None)
             .await
             .unwrap();
         let crawled = crawler.crawl_all(&options_at(tmp.path())).await;
@@ -571,6 +589,76 @@ async fn get_gem_paths_local_includes_every_gempath_home() {
     assert!(
         purls.contains(&"pkg:gem/rails@7.1.0"),
         "the gemdir home's gem must still be discovered; got {purls:?}"
+    );
+}
+
+/// An explicit env `BUNDLE_PATH` root must NOT suppress the `gem env`
+/// fallback homes: default gems (rexml, json, …) ship with ruby in the
+/// DEFAULT/system gem homes and never live in a bundle path. Before the
+/// explicit-roots feature, an env-`BUNDLE_PATH` project with no
+/// `vendor/bundle` reached the fallback (the vendor probe came back
+/// empty); afterwards the env root tripped the same early-return and the
+/// fallback vanished — a regression this pins closed. Only the implicit
+/// project-local `vendor/bundle` probe keeps the early-return.
+///
+/// Order is bundler's precedence: the env store first, then the gem-env
+/// homes (gemdir's, then every other gempath home's), deduped.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn get_gem_paths_env_root_still_includes_gempath_homes() {
+    let tmp = tempfile::tempdir().unwrap();
+    tokio::fs::write(
+        tmp.path().join("Gemfile"),
+        b"source 'https://rubygems.org'\n",
+    )
+    .await
+    .unwrap();
+
+    // The env-designated bundle root, flat (bundler-1) layout.
+    let env_root = tmp.path().join("bundle-store");
+    let env_flat = env_root.join("gems");
+    tokio::fs::create_dir_all(env_flat.join("rack-3.1.0").join("lib"))
+        .await
+        .unwrap();
+    tokio::fs::create_dir_all(env_root.join("specifications"))
+        .await
+        .unwrap();
+
+    // Two gem homes the fake `gem env` reports: gemdir + a gempath-only one.
+    let home_a = tempfile::tempdir().unwrap();
+    let home_b = tempfile::tempdir().unwrap();
+    let gems_a = home_a.path().join("gems");
+    let gems_b = home_b.path().join("gems");
+    tokio::fs::create_dir_all(gems_a.join("rexml-3.2.6").join("lib"))
+        .await
+        .unwrap();
+    tokio::fs::create_dir_all(gems_b.join("json-2.7.2").join("lib"))
+        .await
+        .unwrap();
+
+    let gempath = std::env::join_paths([home_a.path(), home_b.path()]).unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    install_fake_gem_with_gempath(bin.path(), home_a.path(), gempath.to_str().unwrap());
+
+    let crawler = RubyCrawler;
+    let paths = with_path(bin.path(), || async {
+        crawler
+            .get_gem_paths_with_env(
+                &options_at(tmp.path()),
+                Some(env_root.as_os_str()),
+                None,
+                None,
+            )
+            .await
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        paths,
+        vec![env_flat, gems_a, gems_b],
+        "env-root store first, then every gem-env home (fallback restored); got {paths:?}"
     );
 }
 
@@ -667,8 +755,10 @@ async fn get_gem_paths_local_gemfile_no_gem_binary_returns_empty() {
     std::env::set_var("PATH", empty_path.path());
 
     let crawler = RubyCrawler;
+    // Hermetic seam: ambient BUNDLE_PATH/BUNDLE_APP_CONFIG must not add
+    // install roots to this assertion.
     let paths = crawler
-        .get_gem_paths(&options_at(tmp.path()))
+        .get_gem_paths_with_env(&options_at(tmp.path()), None, None, None)
         .await
         .unwrap();
 
