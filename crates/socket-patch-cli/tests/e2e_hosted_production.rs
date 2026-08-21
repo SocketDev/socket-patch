@@ -36,7 +36,7 @@
 //! | npm    | `pkg:npm/minimist@1.2.2`        | `80630680-4da6-45f9-bba8-b888e0ffd58c` | GHSA-xvch-5gv4-984h (CVE-2021-44906) |
 //! | PyPI   | `pkg:pypi/urllib3@1.26.18`      | *any of three* (see [`PYPI_UUIDS`])    | GHSA-gm62-xv2j-4w53 &co |
 //! | Cargo  | `pkg:cargo/traitobject@0.1.1`   | `cf2e6f58-d9fa-4096-9151-c34afa717f89` | GHSA-pp8r-vv2j-9j5v |
-//! | gem    | `pkg:gem/activestorage@6.0.3`   | *any of* [`GEM_UUIDS`] (two today)     | GHSA-m42x-37p3-fv5w (CVE-2020-8162), GHSA-w749-p3v6-hccq (CVE-2022-21831) |
+//! | gem    | `pkg:gem/activestorage@6.0.3`   | *any of* [`GEM_UUIDS`] (four today)    | GHSA-m42x-37p3-fv5w (CVE-2020-8162), GHSA-w749-p3v6-hccq (CVE-2022-21831), GHSA-9xrj-h377-fr87 (CVE-2026-33195), GHSA-r4mg-4433-c7g3 (CVE-2025-24293) |
 //!
 //! `docs/testing/hosted-production-e2e.md` explains how these were chosen and
 //! how to re-pick one if it is ever withdrawn.
@@ -155,6 +155,17 @@ const GEM_UUIDS: &[&str] = &[
     // checksum, carries the Socket patch header in the transformer, and every
     // other file is byte-identical to stock rubygems 6.0.3.
     "6c4141c5-1535-4fd2-9db1-b5f8e4834bdb",
+    // GHSA-9xrj-h377-fr87 / CVE-2026-33195 (disk_service.rb +
+    // disk_controller.rb + errors.rb), published 2026-08-20T16:14Z when
+    // production extended 6.0.3 with a third advisory. /patch/view blobs
+    // live-verified 2026-08-20: every touched file carries the Socket
+    // Community Patch header.
+    "eeb6bf9f-96c0-4963-a0f1-2e88f91f8b1a",
+    // GHSA-r4mg-4433-c7g3 / CVE-2025-24293 (image_processing_transformer.rb),
+    // published 2026-08-20T20:31Z — the fourth advisory, and the one the
+    // server-ranked selection now wires. /patch/view blobs live-verified
+    // 2026-08-20: carries the Socket Community Patch header.
+    "c1a1cd3c-b670-4e44-b4fa-1a63ecd42db6",
 ];
 
 /// Header the patch service injects into patched npm / PyPI source files.

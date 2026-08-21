@@ -90,6 +90,17 @@ plain (agent), `(vendored)`, and `(redirected)` (hosted).
 
 ### Added
 
+- **`get --mode <hosted|vendored|agent>` — per-advisory hosted/vendored
+  patching.** `get` (fetch/apply a single patch by CVE/GHSA id, patch UUID,
+  or package name) now honors the same mode selector as `scan`: hosted
+  rewrites lockfiles for just the selected patches through scan's redirect
+  engine verbatim; vendored routes through scan's vendor step with scan's
+  save-only download posture. CVE/GHSA fan-outs are narrowed to versions
+  actually installed (disk ∪ manifest, plus the lockfile inventory and
+  vendor ledger in hosted/vendored modes); when narrowing leaves nothing,
+  the new additive `not_installed` status reports it at exit 0. Exempt from
+  narrowing: UUID ids, exact-versioned purls, `--save-only`,
+  `--all-releases`, and the package-name path.
 - **Hosted mode for Go (free tier).** `scan --mode hosted` now redirects
   golang dependencies when the reference carries a `goproxy` registry
   override: a fork-style
@@ -475,6 +486,24 @@ plain (agent), `(vendored)`, and `(redirected)` (hosted).
 
 ### Fixed
 
+- **bun 1.4 lockfiles are accepted again.** bun 1.4.0 bumped `bun.lock`
+  `lockfileVersion` to 2 while leaving the emitted grammar unchanged; the
+  shared version gate refused everything but 1, so hosted and vendored
+  modes refused every lock written by bun ≥ 1.4
+  (`redirect_bun_lock_unsupported` / `vendor_lockfile_version_unsupported`).
+  The gate now accepts versions 1 and 2 and keeps failing closed on
+  anything else; new shared golden fixture `npm/bun/lock-v2` (the depscan
+  TS twin needs the matching acceptance + fixture sync).
+- **gem: every coexisting installed copy is patched.** Bundler's scoped
+  `<engine>/<abi>/gems` and flat `gems/` stores can coexist under one
+  `BUNDLE_PATH` root, each holding a real copy of the same gem@version;
+  first-wins resolution patched one store and reported success while the
+  other bundler loaded pristine (vulnerable) bytes. `apply` now fans out
+  per copy (per-copy `Applied` events, each counted in `summary.applied`),
+  bundle-path roots are crawled in bundler precedence order, and
+  config-sourced roots are contained. The `gem_bundle_config_path_ignored`
+  warning also prints the skipped path verbatim instead of
+  backslash-escaped.
 - **npm `@socketsecurity/socket-patch`: the `./schema` export is now built
   at publish.** The subpath pointed at a gitignored `dist/` directory that
   nothing built during release, so it shipped broken; a `prepack` script

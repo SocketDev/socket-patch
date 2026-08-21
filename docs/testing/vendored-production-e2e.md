@@ -50,7 +50,7 @@ four every run and fails first with the offending PURL named.
 | npm | `pkg:npm/minimist@1.2.2` | `80630680-4da6-45f9-bba8-b888e0ffd58c` | `Socket Community Patch` header |
 | PyPI | `pkg:pypi/urllib3@1.26.18` | one of three (server-ordered) | `Socket Community Patch` header |
 | Cargo | `pkg:cargo/traitobject@0.1.1` | `cf2e6f58-d9fa-4096-9151-c34afa717f89` | advisory id `GHSA-pp8r-vv2j-9j5v` |
-| RubyGems | `pkg:gem/activestorage@6.0.3` | `15e960b5-f432-4b6c-b8aa-534a2b419323` | `Socket Community Patch` header |
+| RubyGems | `pkg:gem/activestorage@6.0.3` | any of the `GEM_PATCHES` table (4 as of 2026-08-20 — see the hosted doc's UUID list; each patch marks a different file) | `Socket Community Patch` header |
 
 If a required patch is withdrawn, update the catalog constants at the top of
 `e2e_vendored_production.rs` **and** the table above (same procedure as the

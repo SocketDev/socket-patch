@@ -52,7 +52,7 @@
 //! | npm    | `pkg:npm/minimist@1.2.2`        | `80630680-4da6-45f9-bba8-b888e0ffd58c` | `Socket Community Patch` header |
 //! | PyPI   | `pkg:pypi/urllib3@1.26.18`      | *any of three* (see [`PYPI_UUIDS`])    | `Socket Community Patch` header |
 //! | Cargo  | `pkg:cargo/traitobject@0.1.1`   | `cf2e6f58-d9fa-4096-9151-c34afa717f89` | advisory id `GHSA-pp8r-vv2j-9j5v` |
-//! | gem    | `pkg:gem/activestorage@6.0.3`   | `15e960b5-f432-4b6c-b8aa-534a2b419323` | `Socket Community Patch` header |
+//! | gem    | `pkg:gem/activestorage@6.0.3`   | *any of* [`GEM_PATCHES`]               | `Socket Community Patch` header |
 //!
 //! # Ecosystem coverage notes (gaps, and one resolved gap)
 //!
@@ -159,7 +159,40 @@ const CARGO_MARKER: &str = "GHSA-pp8r-vv2j-9j5v";
 const GEM_PURL: &str = "pkg:gem/activestorage@6.0.3";
 const GEM_NAME: &str = "activestorage";
 const GEM_VERSION: &str = "6.0.3";
-const GEM_UUID: &str = "15e960b5-f432-4b6c-b8aa-534a2b419323";
+/// Any-of pin set for the gem leg: `(patch uuid, the file its diff marks)`.
+/// Production has published several distinct free 6.0.3 patches (one per
+/// advisory), the manifest holds one patch per PURL, and which one the
+/// server-ranked resolver returns is a server-side ordering detail — so the
+/// leg accepts any pinned patch and probes the marker file that PATCH
+/// actually touches. When production publishes another acceptable 6.0.3
+/// patch, verify its `/patch/view` blobs carry the marker and append it here
+/// (and to the hosted suite's `GEM_UUIDS`).
+const GEM_PATCHES: &[(&str, &str)] = &[
+    // GHSA-m42x-37p3-fv5w / CVE-2020-8162, from the 2026-08-18 catalog
+    // republish.
+    (
+        "15e960b5-f432-4b6c-b8aa-534a2b419323",
+        "lib/active_storage/service/s3_service.rb",
+    ),
+    // GHSA-w749-p3v6-hccq / CVE-2022-21831, published 2026-08-19T21:19Z.
+    (
+        "6c4141c5-1535-4fd2-9db1-b5f8e4834bdb",
+        "lib/active_storage/transformers/image_processing_transformer.rb",
+    ),
+    // GHSA-9xrj-h377-fr87 / CVE-2026-33195, published 2026-08-20T16:14Z
+    // (also touches disk_controller.rb + errors.rb; the service file is the
+    // marker probe).
+    (
+        "eeb6bf9f-96c0-4963-a0f1-2e88f91f8b1a",
+        "lib/active_storage/service/disk_service.rb",
+    ),
+    // GHSA-r4mg-4433-c7g3 / CVE-2025-24293, published 2026-08-20T20:31Z —
+    // the one the server-ranked selection wires as of 2026-08-20.
+    (
+        "c1a1cd3c-b670-4e44-b4fa-1a63ecd42db6",
+        "lib/active_storage/transformers/image_processing_transformer.rb",
+    ),
+];
 
 /// Header the patch service injects into patched npm / PyPI source files.
 const PATCH_MARKER: &str = "Socket Community Patch";
@@ -706,7 +739,7 @@ async fn preflight_required_patches_are_published() {
         (NPM_PURL, vec![NPM_UUID]),
         (PYPI_PURL, PYPI_UUIDS.to_vec()),
         (CARGO_PURL, vec![CARGO_UUID]),
-        (GEM_PURL, vec![GEM_UUID]),
+        (GEM_PURL, GEM_PATCHES.iter().map(|(u, _)| *u).collect()),
     ];
 
     let mut failures: Vec<String> = Vec::new();
@@ -1828,14 +1861,40 @@ fn gem_bundler_vendored_install_proof() {
         dump(&info)
     );
     let installed_dir = PathBuf::from(String::from_utf8_lossy(&info.stdout).trim());
-    let patched_file_rel = "lib/active_storage/service/s3_service.rb";
-    assert_pristine(&installed_dir.join(patched_file_rel), PATCH_MARKER, LEG);
-    let pristine = std::fs::read(installed_dir.join(patched_file_rel)).unwrap();
+    // Anti-vacuity over EVERY pinned patch's marker file: whichever patch the
+    // server-ranked resolver wires below, its target must start pristine.
+    // Capture the pristine bytes now, keyed by file, for the post-install
+    // byte-inequality probe.
+    let mut pristine_by_file = std::collections::HashMap::new();
+    for (_, file) in GEM_PATCHES {
+        assert_pristine(&installed_dir.join(file), PATCH_MARKER, LEG);
+        pristine_by_file
+            .entry(*file)
+            .or_insert_with(|| std::fs::read(installed_dir.join(file)).unwrap());
+    }
     let gemfile_before = std::fs::read(proj.join("Gemfile")).unwrap();
     let lock_before = std::fs::read(proj.join("Gemfile.lock")).unwrap();
 
     let env_json = scan_vendored(&proj, &[]);
-    assert_download_uuid(&env_json, &[GEM_UUID], LEG);
+    let gem_uuids: Vec<&str> = GEM_PATCHES.iter().map(|(u, _)| *u).collect();
+    assert_download_uuid(&env_json, &gem_uuids, LEG);
+    // Which pinned patch did the resolver wire? The marker probes below are
+    // per-patch — each advisory's diff marks a different file.
+    let wired_uuid = env_json["download"]["patches"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|p| p["uuid"].as_str())
+        .find(|u| gem_uuids.contains(u))
+        .expect("assert_download_uuid guarantees a pinned uuid is downloaded")
+        .to_string();
+    let patched_file_rel = GEM_PATCHES
+        .iter()
+        .find(|(u, _)| *u == wired_uuid)
+        .map(|(_, f)| *f)
+        .unwrap();
+    let pristine = pristine_by_file[patched_file_rel].clone();
     assert_eq!(
         env_json["download"]["failed"].as_u64().unwrap_or(99),
         0,
@@ -1875,11 +1934,11 @@ fn gem_bundler_vendored_install_proof() {
     );
 
     // The committable artifact + the mandatory pair edit.
-    let copy_rel = format!(".socket/vendor/gem/{GEM_UUID}/{GEM_NAME}-{GEM_VERSION}");
+    let copy_rel = format!(".socket/vendor/gem/{wired_uuid}/{GEM_NAME}-{GEM_VERSION}");
     assert_patched(
         &proj
             .join(&copy_rel)
-            .join("lib/active_storage/service/s3_service.rb"),
+            .join(patched_file_rel),
         PATCH_MARKER,
         LEG,
     );
