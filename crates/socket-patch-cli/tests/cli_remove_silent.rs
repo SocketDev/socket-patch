@@ -365,7 +365,16 @@ fn remove_silent_suppresses_vendor_revert_warnings() {
     write_vendor_state_wired(tmp.path(), purl, uuid, false, DRIFTED_WIRING);
 
     let (code, _stdout, stderr) = run_remove(tmp.path(), &[purl, "--silent", "--yes"]);
-    assert_eq!(code, 0, "remove must succeed; stderr={stderr:?}");
+    // v4: a drift-kept revert KEEPS the vendored state and the manifest
+    // entry (the RevertOutcome contract), so an all-matches-kept remove is
+    // a partialFailure — nothing was removed. The error line still prints
+    // under --silent ("errors only, never nothing"); the backend WARNING
+    // chatter stays suppressed, which is what this test pins.
+    assert_eq!(code, 1, "all-kept remove is a partialFailure; stderr={stderr:?}");
+    assert!(
+        stderr.contains("drift-kept"),
+        "the drift-kept error must print even under --silent; got {stderr:?}"
+    );
     assert!(
         !stderr.contains("Warning ("),
         "--silent must suppress backend revert warnings; got {stderr:?}"
@@ -376,10 +385,25 @@ fn remove_silent_suppresses_vendor_revert_warnings() {
     make_socket_dir(tmp2.path());
     write_vendor_state_wired(tmp2.path(), purl, uuid, false, DRIFTED_WIRING);
     let (loud_code, _loud_stdout, loud_stderr) = run_remove(tmp2.path(), &[purl, "--yes"]);
-    assert_eq!(loud_code, 0);
+    assert_eq!(loud_code, 1);
     assert!(
         loud_stderr.contains("Warning (vendor_lock_entry_drifted)"),
         "non-silent run must print the backend warning; got {loud_stderr:?}"
+    );
+    // The drift-keep must leave BOTH stores intact: ledger entry and
+    // manifest entry survive for a later normalize + retry.
+    assert!(
+        tmp2.path().join(".socket/vendor/state.json").exists(),
+        "drift-kept ledger entry must survive"
+    );
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(tmp2.path().join(".socket/manifest.json"))
+            .expect("manifest survives"),
+    )
+    .expect("manifest parses");
+    assert!(
+        manifest["patches"].get(purl).is_some(),
+        "drift-kept manifest entry must survive; got {manifest}"
     );
 }
 

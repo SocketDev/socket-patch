@@ -217,6 +217,7 @@ async fn mount_view(
 
 fn scan_args(cwd: &Path, api_url: String, all_releases: bool) -> ScanArgs {
     ScanArgs {
+        paths: Vec::new(),
         common: socket_patch_cli::args::GlobalArgs {
             cwd: cwd.to_path_buf(),
             org: Some(ORG.to_string()),
@@ -489,6 +490,7 @@ async fn remove_base_purl_clears_all_platforms_and_rolls_back() {
             ..socket_patch_cli::args::GlobalArgs::default()
         },
         skip_rollback: false,
+        preserve_state: false,
     };
     let code = remove_run(remove_args).await;
     assert_eq!(code, 0, "remove base PURL should succeed (exit 0)");
@@ -585,14 +587,13 @@ async fn rollback_succeeds_when_uninstalled_sibling_before_blob_unfetchable() {
             .map(|r| r.url.path().to_string())
             .collect::<Vec<_>>()
     );
-    // Rollback is not remove: both variants stay recorded.
-    let mut keys = manifest_keys(tmp.path());
-    keys.sort();
-    let mut expected = vec![qualified(PLATFORM_INSTALLED), qualified(PLATFORM_OTHER)];
-    expected.sort();
-    assert_eq!(
-        keys, expected,
-        "rollback must leave both variants in the manifest"
+    // v4 default: rollback removes the rolled-back group from the
+    // manifest — the attempted variant AND its narrowed-away sibling
+    // (half a variant group must never linger). --preserve-state keeps
+    // them; the default cleans up.
+    assert!(
+        manifest_keys(tmp.path()).is_empty(),
+        "the rolled-back variant group must leave the manifest"
     );
 }
 
@@ -685,6 +686,7 @@ async fn remove_succeeds_when_uninstalled_sibling_before_blob_unfetchable() {
             ..socket_patch_cli::args::GlobalArgs::default()
         },
         skip_rollback: false,
+        preserve_state: false,
     })
     .await;
     assert_eq!(
@@ -748,16 +750,11 @@ async fn rollback_all_over_broad_manifest_succeeds() {
         ORIGINAL_BYTES,
         "rollback must restore exactly the original gem file bytes"
     );
-    // Rollback restores files but, unlike `remove`, must NOT prune the
-    // manifest — both platform variants stay recorded so they can be
-    // re-applied. (If this ever flips to empty, rollback has silently become
-    // a destructive remove.)
-    let mut keys = manifest_keys(tmp.path());
-    keys.sort();
-    let mut expected = vec![qualified(PLATFORM_INSTALLED), qualified(PLATFORM_OTHER)];
-    expected.sort();
-    assert_eq!(
-        keys, expected,
-        "rollback must leave both variants in the manifest (it is not a remove)"
+    // v4 default: rollback removes the rolled-back group from the manifest
+    // — the attempted variant AND its narrowed-away sibling. (Keeping the
+    // records for a later re-apply is now `--preserve-state`'s job.)
+    assert!(
+        manifest_keys(tmp.path()).is_empty(),
+        "the rolled-back variant group must leave the manifest"
     );
 }

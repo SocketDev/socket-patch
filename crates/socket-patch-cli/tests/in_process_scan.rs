@@ -19,6 +19,7 @@ const UUID: &str = "11111111-1111-4111-8111-111111111111";
 
 fn default_args(cwd: &Path) -> ScanArgs {
     ScanArgs {
+        paths: Vec::new(),
         common: socket_patch_cli::args::GlobalArgs {
             cwd: cwd.to_path_buf(),
             org: Some(ORG.to_string()),

@@ -102,6 +102,7 @@ async fn remove_with_rollback_full_chain() {
         },
         identifier: "pkg:npm/remove-target@1.0.0".to_string(),
         skip_rollback: false,
+        preserve_state: false,
     };
     let code = remove_run(args).await;
     assert_eq!(code, 0, "remove with rollback must succeed");
@@ -171,6 +172,7 @@ async fn remove_by_uuid_finds_correct_purl() {
         },
         identifier: uuid.to_string(),
         skip_rollback: true,
+        preserve_state: false,
     };
     assert_eq!(remove_run(args).await, 0);
     let m: serde_json::Value =
@@ -227,6 +229,7 @@ async fn remove_no_matching_purl_exits_not_found() {
         },
         identifier: "pkg:npm/does-not-exist@9.9.9".to_string(),
         skip_rollback: true,
+        preserve_state: false,
     };
     assert_eq!(remove_run(args).await, 1);
     // The bystander entry must remain — a non-match deletes nothing.
@@ -263,6 +266,7 @@ async fn remove_invalid_manifest_emits_error() {
         },
         identifier: "pkg:npm/anything@1.0.0".to_string(),
         skip_rollback: true,
+        preserve_state: false,
     };
     assert_eq!(remove_run(args).await, 1);
     // A manifest it could not parse must be left byte-for-byte intact — remove
@@ -290,6 +294,7 @@ async fn remove_no_manifest_emits_not_found() {
         },
         identifier: "pkg:npm/anything@1.0.0".to_string(),
         skip_rollback: true,
+        preserve_state: false,
     };
     assert_eq!(remove_run(args).await, 1);
     // Removing from a non-existent manifest must not conjure one into being.
@@ -758,6 +763,7 @@ async fn remove_detached_vendored_without_manifest_reverts() {
         },
         identifier: purl.to_string(),
         skip_rollback: false,
+        preserve_state: false,
     };
     assert_eq!(
         remove_run(args).await,

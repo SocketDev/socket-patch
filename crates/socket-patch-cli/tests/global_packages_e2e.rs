@@ -352,6 +352,11 @@ fn rollback_global_prefix_uses_explicit_path() {
     assert_eq!(code, 0, "empty rollback → exit 0; stdout={stdout}");
     assert_rollback_noop(&stdout);
 
+    // The v4 default dropped the not-installed entry from the manifest on
+    // the empty run above (rollback now cleans up by default) — re-seed it
+    // so the positive control below has an entry to resolve.
+    write_manifest(tmp.path(), PREFIX_PURL);
+
     // Positive control: plant the matching package under the prefix. The
     // rollback must now report a per-package result whose `path` lives
     // inside the explicit prefix — proving the prefix (not the real npm

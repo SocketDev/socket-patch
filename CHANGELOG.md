@@ -17,6 +17,96 @@ into the new version's section — see docs/releasing.md.
 
 ## [Unreleased]
 
+> **Semver note:** this entry changes `rollback`'s default behavior and
+> narrows the meaning of its existing `vendored: []` JSON key — both MAJOR
+> per CLI_CONTRACT.md's semver policy — so it ships as the next major
+> release (v5.0).
+
+### Changed (BREAKING)
+
+- **`rollback` is now the full-state dual of `scan`.** `scan` and `rollback`
+  are the batch primaries (`get`↔`remove` stay the single-patch duals): a
+  bare `rollback` restores the SYSTEM to unpatched across all three modes —
+  in-place file restore (agent), vendored unwire + artifact deletion +
+  ledger-entry drop, hosted lockfile-redirect unwind + redirect-record drop
+  — then removes the rolled-back entries from `.socket/manifest.json` and
+  GCs the now-unused blobs plus diff/package archives. No `--mode` needed:
+  state is inferred from the manifest, the vendor ledger, and the redirect
+  ledger, and rollback now runs manifest-less when a ledger holds work
+  (hosted-only and detached-vendored projects; the truly-empty project
+  keeps the "Manifest not found" exit 1, and a wired-but-ledgerless project
+  errors naming `socket-patch repair`). Wet non-preserve runs confirm once
+  ("Roll back N patch(es), remove them from the local manifest, and delete
+  M vendored artifact(s)?" — auto-accepted under `--yes`/`--json`/non-TTY;
+  declining prints "Rollback cancelled." and exits 0). Drift-keeps, hosted
+  refusals/unsupported targets, corrupt ledgers, and a failed manifest
+  write exit 1 `partial_failure`; not-installed entries still exit 0.
+- **`rollback --json`'s `vendored: []` array narrows** to vendor-owned purls
+  the run did NOT act on (today: the corrupt-vendor-ledger skip). Acted-on
+  entries move to the new always-present `vendoredReverted` /
+  `vendoredPreserved` / `vendoredKept` arrays; the envelope also gains
+  always-present `warnings[]` (`{code, detail}`, now populated), `hosted`
+  (`{reverted, failed, unsupported, editedFiles}`), `manifest`
+  (`{removedEntries, preserved}`), `gc`, and `paths` keys.
+
+### Added
+
+- **Path targeting on `scan` and `rollback`.** `scan [PATHS]...` scopes
+  discovery to packages with an installed copy under a matching glob
+  (ancestor rule: `scan packages/foo` covers the subtree; `*` never crosses
+  `/`; absolute patterns are the only way to reach `--global` stores); the
+  prune universe is never narrowed (`scan PATHS --prune` prunes exactly
+  what an unscoped run would), lockfile-only/vendor-ledger supplements are
+  excluded with a `path_scope_excluded_supplements` warning, an empty match
+  is a normal empty scan (exit 0, no GC), and PATHS is rejected with
+  `--mode hosted|vendored` (exit 2). `rollback [TARGET]...` accepts
+  PURLs, UUIDs, and path globs (variadic, unioned); only path-SHAPED tokens
+  (separator, glob metachar, `./` prefix, absolute) become globs, so a
+  mistyped identifier stays a safe exit-1 error. A path target selecting
+  nothing is an error on rollback (exit 1) and an empty scan on scan
+  (exit 0); path targets select installed copies, and rollback restores
+  EVERY installed copy of a selected patch (`out_of_scope_copies_restored`
+  warning when copies live outside the patterns).
+- **`--preserve-state` on `rollback` and `remove`** (env
+  `SOCKET_PRESERVE_STATE`): fully unpatch the system but keep the local
+  state for a later re-apply — manifest entries, vendored artifacts +
+  ledger entries (kept byte-identical; re-vendor re-wires from the live
+  lock) — and skip all GC. Hosted redirects have no preservable state:
+  they are unwound and their records dropped either way
+  (`hosted_state_not_preservable` warning). On `remove`, combining it with
+  `--skip-rollback` is a usage error (exit 2, flag- or env-sourced): the
+  combination would be a no-op — one flag keeps the tree and drops the
+  state, the other restores the tree and keeps the state.
+- **Hosted redirect unwind.** Per-purl reverts for cargo + the npm family,
+  plus a whole-ledger reverse replay (core `patch/redirect/replay.rs`) that
+  runs whenever the scope covers every redirect record: a per-kind inverse
+  table, staged all-or-nothing per ecosystem group, covering gem, golang,
+  pypi, composer, bun, and the non-package rideshare edits (pnpm
+  `trustLockfile` auto-config — pristine scaffold deleted, modified
+  scaffold keeps the file and loses only the owned line). The bun.lockb
+  migration is unrestorable by design (warning names git history);
+  maven and nuget fail closed with `hosted_revert_unsupported` guidance
+  (their structured-metadata edits keep their ledger records; re-run
+  `scan --mode hosted` or restore from VCS). Refused groups keep their
+  edits AND records — the coherent ledger a retry needs.
+- **`remove` gains the hosted leg and full archive GC**: an identifier
+  matching hosted redirect-ledger records unwinds those redirects (per-purl
+  or via the replay when it covers the full record set; works manifest-less
+  on hosted-only projects; unsupported ecosystems fail closed with
+  `hosted_revert_unsupported` before the manifest mutation), and remove's
+  default GC extends from blobs-only to blobs + diff + package archives
+  (parity with rollback/repair/`scan --prune`).
+
+### Fixed
+
+- **`remove` no longer drops the manifest entry of a drift-kept vendored
+  purl.** When the vendored revert keeps the artifact (`kept_artifact` —
+  the lockfile drifted), the manifest entry is now kept too
+  (`skipped`/`vendor_revert_kept`), matching the core RevertOutcome
+  contract; previously the entry was deleted, stranding a live ledger
+  entry with no backing record. An all-kept run exits 1 `partialFailure`
+  with `summary.removed: 0` (never `not_found` — the identifier matched).
+
 ## [4.0.0] — 2026-08-20
 
 v4.0 is the three-modes release. What began as an agent-style tool that

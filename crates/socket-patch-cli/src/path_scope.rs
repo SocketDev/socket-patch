@@ -237,9 +237,13 @@ mod tests {
     }
 
     #[test]
-    fn case_is_sensitive_on_every_platform() {
+    fn case_sensitivity_follows_the_platform() {
+        // Sensitive on Unix; insensitive on Windows (whose filesystems
+        // are case-insensitive — a drive-letter case mismatch must not
+        // silently empty a scope). Mirrors MATCH_OPTIONS.
         let s = scope(&["Packages/foo"]);
-        assert!(!s.matches(&cwd(), Path::new("/proj/packages/foo/x")));
+        let matches = s.matches(&cwd(), Path::new("/proj/packages/foo/x"));
+        assert_eq!(matches, cfg!(windows));
     }
 
     #[test]

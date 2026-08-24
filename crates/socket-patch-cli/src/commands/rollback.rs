@@ -47,8 +47,13 @@ pub(crate) fn pin_before_hash_blobs<'a>(
             .iter()
             .filter(|(_, info)| !info.before_hash.is_empty())
             .map(|(file, info)| {
+                // A synthetic key so pins never clobber the real file rows
+                // of an entry that REMAINS in the reference (whose afterHash
+                // blobs must stay kept). The sweep reads only the hash
+                // VALUES, never the keys, and this reference manifest is
+                // in-memory only.
                 (
-                    file.clone(),
+                    format!("{file}#beforeHash-pin"),
                     PatchFileInfo {
                         before_hash: String::new(),
                         after_hash: info.before_hash.clone(),
@@ -59,9 +64,13 @@ pub(crate) fn pin_before_hash_blobs<'a>(
         if pinned.is_empty() {
             continue; // every file was created-by-patch: no revert blobs
         }
-        let mut keep_record = record.clone();
-        keep_record.files = pinned;
-        reference.patches.insert(purl.clone(), keep_record);
+        if let Some(existing) = reference.patches.get_mut(purl) {
+            existing.files.extend(pinned);
+        } else {
+            let mut keep_record = record.clone();
+            keep_record.files = pinned;
+            reference.patches.insert(purl.clone(), keep_record);
+        }
     }
 }
 
@@ -175,6 +184,11 @@ struct RollbackOutcome {
     /// apply's `unmatched` twin (`package_not_installed`). Never in the
     /// before-blob plan, never a failed result. Sorted for determinism.
     not_installed: Vec<String>,
+    /// Release-variant manifest entries narrowed away by
+    /// `select_installed_variants` (their distribution is not on disk;
+    /// an attempted sibling covered the group). The manifest-cleanup
+    /// default drops them with their group. Empty on early returns.
+    narrowed_out: Vec<String>,
     /// The run aborted at the before-blob gate BEFORE any restore ran
     /// (offline with missing blobs, or a failed download). The CLI
     /// boundary's manifest-cleanup default must skip entirely: nothing
@@ -509,15 +523,15 @@ struct VendoredLegOutcome {
     warnings: Vec<(String, String)>,
 }
 
-/// What the hosted leg did.
+/// What the hosted leg did. Shared with remove's hosted leg.
 #[derive(Default)]
-struct HostedLegOutcome {
-    reverted: Vec<String>,
-    failed: Vec<(String, String)>,
+pub(crate) struct HostedLegOutcome {
+    pub(crate) reverted: Vec<String>,
+    pub(crate) failed: Vec<(String, String)>,
     /// Scoped targets whose ecosystem has no per-purl hosted revert.
-    unsupported: Vec<String>,
-    warnings: Vec<(String, String)>,
-    edited_files: std::collections::BTreeSet<String>,
+    pub(crate) unsupported: Vec<String>,
+    pub(crate) warnings: Vec<(String, String)>,
+    pub(crate) edited_files: std::collections::BTreeSet<String>,
 }
 
 /// Unwire the in-scope vendored entries. `preserve` keeps artifacts and
@@ -619,7 +633,7 @@ async fn run_vendored_leg(
 /// exist (cargo + npm-family), and — when the scope covers the ENTIRE
 /// record set — the whole-ledger reverse replay for everything else.
 /// Mutates `state`; the caller persists on wet runs.
-async fn run_hosted_leg(
+pub(crate) async fn run_hosted_leg(
     common: &GlobalArgs,
     purls: &[String],
     state: &mut socket_patch_core::patch::redirect::RedirectState,
@@ -1055,7 +1069,15 @@ pub async fn run(args: RollbackArgs) -> i32 {
     // a per-purl revert) runs only when the scope covers EVERY record —
     // however the scope was spelled.
     let replay_eligible = match &redirect_state_result {
-        Ok(Some(s)) => s.records.keys().all(|p| hosted_scope.contains(p)),
+        // A records-EMPTY ledger (degraded record-fetch-failed runs leave
+        // edits without records) is vacuously "covered" by any scope; only
+        // an UNSCOPED run may replay those leftover edits — a scoped
+        // rollback of an unrelated purl must not unwind live redirects it
+        // was never asked about.
+        Ok(Some(s)) => {
+            (!s.records.is_empty() || !scoped)
+                && s.records.keys().all(|p| hosted_scope.contains(p))
+        }
         _ => false,
     };
 
@@ -1099,21 +1121,35 @@ pub async fn run(args: RollbackArgs) -> i32 {
             .iter()
             .filter(|(k, e)| vendor_scope.contains(k) && e.detached)
             .count();
-        let mut prompt = format!(
-            "Roll back {} patch(es), remove them from the local manifest",
-            manifest_scope.len().max(1)
-        );
-        if !vendor_scope.is_empty() {
-            prompt.push_str(&format!(
-                ", and delete {} vendored artifact(s)",
-                vendor_scope.len()
+        // Compose only the clauses that apply, so a hosted-only run never
+        // claims manifest entries it does not have.
+        let mut clauses: Vec<String> = Vec::new();
+        if !manifest_scope.is_empty() {
+            clauses.push(format!(
+                "roll back {} patch(es) and remove them from the local manifest",
+                manifest_scope.len()
             ));
         }
-        if detached_count > 0 {
-            prompt.push_str(&format!(
-                " ({detached_count} detached — their embedded patch records are the only \
-                 local copy)"
+        if !vendor_scope.is_empty() {
+            let mut clause = format!("delete {} vendored artifact(s)", vendor_scope.len());
+            if detached_count > 0 {
+                clause.push_str(&format!(
+                    " ({detached_count} detached — their embedded patch records are the \
+                     only local copy)"
+                ));
+            }
+            clauses.push(clause);
+        }
+        if !hosted_scope.is_empty() {
+            clauses.push(format!(
+                "unwind {} hosted redirect(s)",
+                hosted_scope.len()
             ));
+        }
+        let mut prompt = clauses.join(", and ");
+        if let Some(first) = prompt.get(..1) {
+            let capitalized = first.to_uppercase();
+            prompt.replace_range(..1, &capitalized);
         }
         prompt.push('?');
         if !crate::output::confirm(&prompt, true, args.common.yes, args.common.json) {
@@ -1142,6 +1178,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
             results,
             vendored_skipped: vendored_excluded,
             not_installed,
+            narrowed_out,
             aborted,
         }) => {
             // ── vendored leg ─────────────────────────────────────────────
@@ -1234,6 +1271,12 @@ pub async fn run(args: RollbackArgs) -> i32 {
                 .filter(|r| r.success)
                 .map(|r| r.package_key.clone())
                 .collect();
+            // Bases whose attempted variant(s) failed hold their whole
+            // group in the manifest (narrowed-away siblings included).
+            let failed_bases: HashSet<&str> = failed_purls
+                .iter()
+                .map(|p| strip_purl_qualifiers(p))
+                .collect();
             let mut removable: Vec<String> = manifest_scope
                 .iter()
                 .filter(|purl| {
@@ -1243,7 +1286,10 @@ pub async fn run(args: RollbackArgs) -> i32 {
                     if vendored_excluded.contains(purl) {
                         return vendored_reverted_ok(purl);
                     }
-                    succeeded_purls.contains(*purl) || not_installed.contains(purl)
+                    succeeded_purls.contains(*purl)
+                        || not_installed.contains(purl)
+                        || (narrowed_out.contains(purl)
+                            && !failed_bases.contains(strip_purl_qualifiers(purl)))
                 })
                 .cloned()
                 .collect();
@@ -1278,10 +1324,16 @@ pub async fn run(args: RollbackArgs) -> i32 {
             let mut gc_bytes_freed: u64 = 0;
             if cleanup_allowed {
                 let mut cleanup_reference = updated_manifest.clone();
+                // Pin the beforeHash blobs of EVERY entry remaining in the
+                // manifest (still-active patches keep their revert data —
+                // an eco-scoped or failed run must never destroy the blobs
+                // a later rollback needs) plus removed-but-not-installed
+                // entries (remove's crawler-miss guard). Blobs referenced
+                // only by genuinely-removed entries are what gets swept.
                 let pinned_purls: Vec<&String> = removed
                     .iter()
                     .filter(|p| not_installed.contains(p))
-                    .chain(manifest_scope.iter().filter(|p| failed_purls.contains(*p)))
+                    .chain(updated_manifest.patches.keys())
                     .collect();
                 pin_before_hash_blobs(&mut cleanup_reference, &manifest, pinned_purls);
                 let blobs_dir = socket_dir.join("blobs");
@@ -1688,13 +1740,6 @@ async fn rollback_patches_inner(
         .parent()
         .expect("manifest path names a file, so it has a parent");
     let mut blobs_path = socket_dir.join("blobs");
-    // `--dry-run` must not mutate `.socket/` ("Preview, no mutations"):
-    // don't create the blobs dir; a throwaway stage replaces it below.
-    if !common.dry_run {
-        tokio::fs::create_dir_all(&blobs_path)
-            .await
-            .map_err(|e| e.to_string())?;
-    }
 
     let patches_to_rollback = match &selection {
         InnerSelection::Identifier(identifier) => {
@@ -1734,6 +1779,7 @@ async fn rollback_patches_inner(
             results: Vec::new(),
             vendored_skipped: Vec::new(),
             not_installed: Vec::new(),
+            narrowed_out: Vec::new(),
             aborted: false,
         });
     }
@@ -1761,8 +1807,19 @@ async fn rollback_patches_inner(
             results: Vec::new(),
             vendored_skipped,
             not_installed: Vec::new(),
+            narrowed_out: Vec::new(),
             aborted: false,
         });
+    }
+
+    // `--dry-run` must not mutate `.socket/` ("Preview, no mutations"):
+    // don't create the blobs dir; a throwaway stage replaces it below.
+    // Created only now that in-place work is known to exist, so a
+    // hosted-/vendored-only rollback leaves no empty blobs dir behind.
+    if !common.dry_run {
+        tokio::fs::create_dir_all(&blobs_path)
+            .await
+            .map_err(|e| e.to_string())?;
     }
 
     // Create filtered manifest (a synthetic rollback-target subset, never
@@ -1875,6 +1932,12 @@ async fn rollback_patches_inner(
 
     // Resolve which variant(s) each base PURL will actually roll back,
     // BEFORE the before-blob gate below, so the gate covers only them.
+    // Narrowed-away sibling variants (same base, distribution NOT on disk)
+    // are collected so the CLI boundary's manifest-cleanup default can
+    // drop them alongside their attempted siblings — a rolled-back
+    // package must not leave half its variant group in the manifest
+    // (remove's identifier flow drops the whole group the same way).
+    let mut narrowed_out: Vec<String> = Vec::new();
     for (_base, entries) in groups {
         let to_rollback: Vec<(&String, &PathBuf)> = if entries.len() == 1 {
             entries
@@ -1902,6 +1965,12 @@ async fn rollback_patches_inner(
                     .iter()
                     .map(|&i| candidates[i].0.to_string())
                     .collect();
+                narrowed_out.extend(
+                    entries
+                        .iter()
+                        .filter(|(p, _)| !winners.contains(*p))
+                        .map(|(p, _)| (*p).clone()),
+                );
                 entries
                     .into_iter()
                     .filter(|(p, _)| winners.contains(*p))
@@ -1910,6 +1979,8 @@ async fn rollback_patches_inner(
         };
         rollback_targets.extend(to_rollback);
     }
+    narrowed_out.sort();
+    narrowed_out.dedup();
 
     // Check for missing beforeHash blobs — AFTER discovery and variant
     // narrowing, so the gate covers ONLY the packages this run will
@@ -2074,6 +2145,7 @@ async fn rollback_patches_inner(
                 results,
                 vendored_skipped,
                 not_installed,
+                narrowed_out: Vec::new(),
                 aborted: true,
             });
         }
@@ -2151,6 +2223,7 @@ async fn rollback_patches_inner(
                 results,
                 vendored_skipped,
                 not_installed,
+                narrowed_out: Vec::new(),
                 aborted: true,
             });
         }
@@ -2168,6 +2241,7 @@ async fn rollback_patches_inner(
             results: Vec::new(),
             vendored_skipped,
             not_installed,
+            narrowed_out: narrowed_out.clone(),
             aborted: false,
         });
     }
@@ -2247,6 +2321,7 @@ async fn rollback_patches_inner(
         results,
         vendored_skipped,
         not_installed,
+        narrowed_out,
         aborted: false,
     })
 }

@@ -508,6 +508,9 @@ fn scan_json_empty_cwd_emits_updates_key() {
         "canAccessPaidPatches": false,
         "packages": [],
         "updates": [],
+        // v4 duality rework: the positional PATH globs are echoed on every
+        // scan envelope, always present (empty when no scoping was given).
+        "paths": [],
     });
     assert_eq!(
         v,
@@ -703,10 +706,11 @@ fn legacy_mode_spellings_still_parse() {
 /// `Debug` derive) are formatted individually.
 fn snap(a: &ScanArgs) -> String {
     format!(
-        "{:?} batch_size={} apply={} prune={} sync={} vendor={} detached={} \
+        "{:?} paths={:?} batch_size={} apply={} prune={} sync={} vendor={} detached={} \
          redirect={} mode={:?} all_releases={} vex={:?} vex_product={:?} \
          vex_no_verify={} vex_doc_id={:?} vex_compact={}",
         a.common,
+        a.paths,
         a.batch_size,
         a.apply,
         a.prune,

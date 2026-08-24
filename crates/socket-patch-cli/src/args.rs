@@ -409,6 +409,7 @@ pub const LOCAL_ARG_ENV_VARS: &[&str] = &[
     "SOCKET_ONE_OFF",
     "SOCKET_ALL_RELEASES",
     "SOCKET_SKIP_ROLLBACK",
+    "SOCKET_PRESERVE_STATE",
     "SOCKET_DOWNLOAD_ONLY",
     "SOCKET_SETUP_EXCLUDE",
     "SOCKET_VENDOR_REVERT",
@@ -1202,6 +1203,9 @@ mod tests {
             ("SOCKET_ALL_RELEASES", &["socket-patch", "get", "x"]),
             ("SOCKET_ALL_RELEASES", &["socket-patch", "scan"]),
             ("SOCKET_SKIP_ROLLBACK", &["socket-patch", "remove", "x"]),
+            // Shared by rollback and remove, like SOCKET_ONE_OFF above.
+            ("SOCKET_PRESERVE_STATE", &["socket-patch", "rollback"]),
+            ("SOCKET_PRESERVE_STATE", &["socket-patch", "remove", "x"]),
             ("SOCKET_DOWNLOAD_ONLY", &["socket-patch", "repair"]),
             ("SOCKET_VENDOR_REVERT", &["socket-patch", "vendor"]),
             ("SOCKET_VEX_NO_VERIFY", &["socket-patch", "vex"]),
