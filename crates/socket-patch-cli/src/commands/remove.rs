@@ -270,6 +270,33 @@ pub async fn run(args: RemoveArgs) -> i32 {
             .await;
         }
 
+        // Hosted-only patches likewise have no manifest entry — the
+        // redirect ledger is their only persistence, and `remove` is
+        // their per-purl exit path (the unwind IS the removal). An
+        // unreadable ledger falls through to `not_found`: nothing is
+        // mutated on that path.
+        if let Ok(Some(redirect_state)) =
+            socket_patch_core::patch::redirect::load_redirect_state(&args.common.cwd).await
+        {
+            let mut hosted_matches: Vec<String> = redirect_state
+                .records
+                .iter()
+                .filter(|(purl, rec)| patch_matches(purl, &rec.uuid, &args.identifier))
+                .map(|(purl, _)| purl.clone())
+                .collect();
+            hosted_matches.sort();
+            if !hosted_matches.is_empty() {
+                return remove_hosted_only(
+                    &args,
+                    hosted_matches,
+                    redirect_state,
+                    api_token.as_deref(),
+                    org_slug.as_deref(),
+                )
+                .await;
+            }
+        }
+
         emit_not_found(
             args.common.json,
             args.common.dry_run,
@@ -991,6 +1018,141 @@ pub async fn run(args: RemoveArgs) -> i32 {
 /// through `env.record` and bump `summary.removed`. `--skip-rollback` is
 /// refused: with no manifest entry to delete, removing a detached patch
 /// can only mean reverting its vendoring.
+/// Remove path for identifiers that match ONLY hosted redirect records
+/// (no manifest entry, no detached vendor entry): confirm, unwind each
+/// record's lockfile wiring, drop it from the redirect ledger, and report
+/// `Removed`/`hosted_reverted` events. Like the detached path, the unwind
+/// IS the removal, so events go through `env.record` and bump
+/// `summary.removed`. `--skip-rollback` is refused (with no manifest
+/// entry to delete, removing a hosted patch can only mean unwinding its
+/// redirect); `--preserve-state` still unwinds — hosted has no
+/// preservable local state.
+async fn remove_hosted_only(
+    args: &RemoveArgs,
+    hosted_matches: Vec<String>,
+    mut redirect_state: socket_patch_core::patch::redirect::RedirectState,
+    api_token: Option<&str>,
+    org_slug: Option<&str>,
+) -> i32 {
+    if args.skip_rollback {
+        emit_error_envelope(
+            args.common.json,
+            args.common.dry_run,
+            "hosted_state_retained",
+            format!(
+                "{} matches only hosted redirect record(s); removing one means unwinding \
+                 its lockfile redirect, which --skip-rollback prevents",
+                args.identifier
+            ),
+        );
+        return 1;
+    }
+
+    if !args.common.json && !args.common.silent {
+        eprintln!("The following hosted redirect(s) will be unwound and removed:");
+        for purl in &hosted_matches {
+            eprintln!("  - {purl}");
+        }
+        eprintln!();
+    }
+    // `--dry-run` previews without mutating — nothing to confirm.
+    let prompt = format!(
+        "Remove {} hosted redirect(s) and unwind their lockfile wiring?",
+        hosted_matches.len()
+    );
+    if !args.common.dry_run && !confirm(&prompt, true, args.common.yes, args.common.json) {
+        if !args.common.json && !args.common.silent {
+            println!("Removal cancelled.");
+        }
+        return 0;
+    }
+
+    let replay_eligible = redirect_state
+        .records
+        .keys()
+        .all(|p| hosted_matches.contains(p));
+    let before = (redirect_state.edits.len(), redirect_state.records.len());
+    let leg = super::rollback::run_hosted_leg(
+        &args.common,
+        &hosted_matches,
+        &mut redirect_state,
+        replay_eligible,
+    )
+    .await;
+    if !leg.unsupported.is_empty() {
+        track_patch_remove_failed(
+            "hosted redirect revert unsupported",
+            api_token,
+            org_slug,
+        )
+        .await;
+        emit_error_envelope(
+            args.common.json,
+            args.common.dry_run,
+            "hosted_revert_unsupported",
+            format!(
+                "no per-purl hosted-redirect revert exists for: {}. Run an unscoped \
+                 `socket-patch rollback` to unwind ALL hosted redirects, or re-run \
+                 `scan --mode hosted` to normalize.",
+                leg.unsupported.join(", ")
+            ),
+        );
+        return 1;
+    }
+    if let Some((what, why)) = leg.failed.first() {
+        track_patch_remove_failed("hosted redirect revert failed", api_token, org_slug).await;
+        emit_error_envelope(
+            args.common.json,
+            args.common.dry_run,
+            "hosted_revert_failed",
+            format!("could not unwind hosted redirect for {what}: {why}"),
+        );
+        return 1;
+    }
+    if !args.common.dry_run
+        && (redirect_state.edits.len(), redirect_state.records.len()) != before
+    {
+        if let Err(e) = socket_patch_core::patch::redirect::persist_redirect_state(
+            &args.common.cwd,
+            &redirect_state,
+        )
+        .await
+        {
+            emit_error_envelope(
+                args.common.json,
+                args.common.dry_run,
+                "hosted_revert_failed",
+                format!("failed to persist the hosted redirect ledger: {e}"),
+            );
+            return 1;
+        }
+    }
+
+    let mut env = Envelope::new(Command::Remove);
+    env.dry_run = args.common.dry_run;
+    let action = if args.common.dry_run {
+        PatchAction::Verified
+    } else {
+        PatchAction::Removed
+    };
+    // Human per-purl lines already printed inside `run_hosted_leg`.
+    for purl in &leg.reverted {
+        env.record(
+            PatchEvent::new(action, purl.clone()).with_reason(
+                "hosted_reverted",
+                "hosted lockfile redirect unwound on remove",
+            ),
+        );
+    }
+    if args.common.json {
+        println!("{}", env.to_pretty_json());
+    }
+    if !args.common.dry_run {
+        track_patch_removed(leg.reverted.len(), api_token, org_slug).await;
+    }
+    0
+}
+
 async fn remove_detached_only(
     args: &RemoveArgs,
     detached: Vec<(String, VendorEntry)>,

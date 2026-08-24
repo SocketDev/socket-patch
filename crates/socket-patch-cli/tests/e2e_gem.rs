@@ -542,7 +542,9 @@ fn test_gem_full_lifecycle() {
     );
 
     // -- ROLLBACK: restore original files -------------------------------------
-    assert_run_ok(cwd, &["rollback"], "rollback");
+    // --preserve-state keeps the manifest entry (+ blobs) so the re-apply
+    // below still has a record to work from; the v4 default removes both.
+    assert_run_ok(cwd, &["rollback", "--preserve-state"], "rollback");
     assert_before_hashes(&gem_dir, files);
 
     // -- APPLY: re-apply from manifest ----------------------------------------

@@ -193,8 +193,9 @@ fn write_vendor_state_wired(root: &Path, purl: &str, uuid: &str, detached: bool,
 }
 
 /// A wiring record naming a file the npm revert backend does not edit:
-/// the revert still succeeds (artifact deleted, ledger entry dropped) but
-/// emits a `vendor_lock_entry_drifted` warning — fully offline.
+/// the backend emits a `vendor_lock_entry_drifted` warning and DRIFT-KEEPS
+/// (`kept_artifact`) — since v5.0 the caller then keeps the ledger entry
+/// AND the manifest entry, and an all-kept remove exits 1 — fully offline.
 const DRIFTED_WIRING: &str = r#"[{ "file": "weird.txt", "kind": "npm_lock_entry", "action": "added", "key": "node_modules/x" }]"#;
 
 /// `--silent` must also gate the vendor-revert chatter on the manifest

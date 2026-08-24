@@ -229,7 +229,9 @@ fn test_npm_full_lifecycle() {
     assert!(has_cve, "vulnerability list should include CVE-2021-44906");
 
     // -- ROLLBACK: restore original file -----------------------------------
-    assert_run_ok(cwd, &["rollback"], "rollback");
+    // --preserve-state keeps the manifest entry (+ blobs) so the re-apply
+    // below still has a record to work from; the v4 default removes both.
+    assert_run_ok(cwd, &["rollback", "--preserve-state"], "rollback");
 
     assert_eq!(
         git_sha256_file(&index_js),
