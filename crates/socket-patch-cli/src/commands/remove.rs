@@ -702,13 +702,15 @@ pub async fn run(args: RemoveArgs) -> i32 {
                         );
                         return 1;
                     }
-                    if args.preserve_state && !leg.reverted.is_empty() {
-                        if !args.common.silent && !args.common.json {
-                            eprintln!(
-                                "Note: hosted redirects have no preservable local state; \
-                                 their ledger records were dropped with the unwound wiring."
-                            );
-                        }
+                    if args.preserve_state
+                        && !leg.reverted.is_empty()
+                        && !args.common.silent
+                        && !args.common.json
+                    {
+                        eprintln!(
+                            "Note: hosted redirects have no preservable local state; \
+                             their ledger records were dropped with the unwound wiring."
+                        );
                     }
                     let hosted_action = if args.common.dry_run {
                         PatchAction::Verified

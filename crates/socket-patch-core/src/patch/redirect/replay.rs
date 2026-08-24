@@ -336,7 +336,7 @@ pub async fn revert_remaining_redirect_edits(
             .map(|&i| state.edits[i].path.clone())
             .collect();
 
-        let mut refuse = |reason: String, out: &mut ReplayOutcome| {
+        let refuse = |reason: String, out: &mut ReplayOutcome| {
             out.refusals.push(GroupRefusal {
                 group: (*group).to_string(),
                 files: files.clone(),

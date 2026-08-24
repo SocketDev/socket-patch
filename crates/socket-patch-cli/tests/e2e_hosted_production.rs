@@ -36,7 +36,7 @@
 //! | npm    | `pkg:npm/minimist@1.2.2`        | `80630680-4da6-45f9-bba8-b888e0ffd58c` | GHSA-xvch-5gv4-984h (CVE-2021-44906) |
 //! | PyPI   | `pkg:pypi/urllib3@1.26.18`      | *any of three* (see [`PYPI_UUIDS`])    | GHSA-gm62-xv2j-4w53 &co |
 //! | Cargo  | `pkg:cargo/traitobject@0.1.1`   | `cf2e6f58-d9fa-4096-9151-c34afa717f89` | GHSA-pp8r-vv2j-9j5v |
-//! | gem    | `pkg:gem/activestorage@6.0.3`   | *any of* [`GEM_UUIDS`] (four today)    | GHSA-m42x-37p3-fv5w (CVE-2020-8162), GHSA-w749-p3v6-hccq (CVE-2022-21831), GHSA-9xrj-h377-fr87 (CVE-2026-33195), GHSA-r4mg-4433-c7g3 (CVE-2025-24293) |
+//! | gem    | `pkg:gem/activestorage@6.0.3`   | *any of* [`GEM_UUIDS`] (five today)    | GHSA-m42x-37p3-fv5w (CVE-2020-8162), GHSA-w749-p3v6-hccq (CVE-2022-21831), GHSA-9xrj-h377-fr87 (CVE-2026-33195), GHSA-r4mg-4433-c7g3 (CVE-2025-24293), GHSA-xr9x-r78c-5hrm (CVE-2026-66066) |
 //!
 //! `docs/testing/hosted-production-e2e.md` explains how these were chosen and
 //! how to re-pick one if it is ever withdrawn.
@@ -162,10 +162,16 @@ const GEM_UUIDS: &[&str] = &[
     // Community Patch header.
     "eeb6bf9f-96c0-4963-a0f1-2e88f91f8b1a",
     // GHSA-r4mg-4433-c7g3 / CVE-2025-24293 (image_processing_transformer.rb),
-    // published 2026-08-20T20:31Z — the fourth advisory, and the one the
-    // server-ranked selection now wires. /patch/view blobs live-verified
-    // 2026-08-20: carries the Socket Community Patch header.
+    // published 2026-08-20T20:31Z — the fourth advisory. /patch/view blobs
+    // live-verified 2026-08-20: carries the Socket Community Patch header.
     "c1a1cd3c-b670-4e44-b4fa-1a63ecd42db6",
+    // GHSA-xr9x-r78c-5hrm / CVE-2026-66066 (Active Storage libvips variant
+    // processing arbitrary-file-read/RCE) — the fifth advisory, published
+    // 2026-08-24, and the one the server-ranked selection now wires.
+    // Live-verified 2026-08-24 via the public proxy /patch/view: free tier,
+    // purl pkg:gem/activestorage@6.0.3?platform=ruby, single CRITICAL
+    // advisory GHSA-xr9x-r78c-5hrm.
+    "9c2b4925-b413-4a3a-bb3a-9990440fb446",
 ];
 
 /// Header the patch service injects into patched npm / PyPI source files.
