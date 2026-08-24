@@ -48,7 +48,7 @@ use super::path::parse_vendor_path;
 use super::state::{
     write_marker, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
 };
-use super::{RevertOutcome, VendorOutcome, VendorWarning};
+use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorWarning};
 
 const BUN_LOCK: &str = "bun.lock";
 
@@ -281,11 +281,29 @@ pub(crate) async fn vendor_bun(
 /// Undo one bun-vendored package: restore the recorded entry lines and
 /// remove the artifact dir. Reverse application order; per-record ownership
 /// is re-checked against the live line (drift ⇒ warning, left alone).
+/// Test-only shorthand — production routes through [`revert_bun_opts`]
+/// (via [`super::npm_flavor::revert_npm_any_opts`]).
+#[cfg(test)]
 pub(crate) async fn revert_bun(
     entry: &VendorEntry,
     project_root: &Path,
     dry_run: bool,
 ) -> RevertOutcome {
+    revert_bun_opts(entry, project_root, RevertOpts::new(dry_run)).await
+}
+
+/// [`revert_bun`] with full [`RevertOpts`]: `keep_artifact` skips the
+/// artifact deletion — and the refusals that exist only to protect it —
+/// while the wiring restore runs unchanged.
+pub(crate) async fn revert_bun_opts(
+    entry: &VendorEntry,
+    project_root: &Path,
+    opts: RevertOpts,
+) -> RevertOutcome {
+    let RevertOpts {
+        dry_run,
+        keep_artifact,
+    } = opts;
     // SECURITY: `entry.uuid` comes from the committed, tamper-able
     // state.json and names the directory tree we are about to DELETE.
     // Validate through the same fail-closed grammar vendor used.
@@ -297,8 +315,10 @@ pub(crate) async fn revert_bun(
     // only be removed when bun.lock provably no longer resolves through it
     // — otherwise refuse, fail-closed, instead of silently bricking
     // installs. Runs before the dry-run return so a preview never
-    // advertises a revert the wet run refuses.
-    if entry.wiring.is_empty() {
+    // advertises a revert the wet run refuses. Skipped under
+    // `keep_artifact`: the refusal exists only to protect the deletion,
+    // which a preserve-state revert never performs.
+    if entry.wiring.is_empty() && !keep_artifact {
         if let Some(blocked) = super::npm_lock::guard_unwired_textual_revert(
             project_root,
             &entry.uuid,
@@ -375,8 +395,13 @@ pub(crate) async fn revert_bun(
         return outcome;
     }
 
-    if let Err(e) = remove_tree(&project_root.join(&uuid_dir_rel)).await {
-        return RevertOutcome::failed(format!("cannot remove {uuid_dir_rel}: {e}"));
+    // `--preserve-state` (`keep_artifact`): the wiring restore above already
+    // ran; the artifact dir stays behind (and the caller keeps the ledger
+    // entry), so only the deletion is skipped.
+    if !keep_artifact {
+        if let Err(e) = remove_tree(&project_root.join(&uuid_dir_rel)).await {
+            return RevertOutcome::failed(format!("cannot remove {uuid_dir_rel}: {e}"));
+        }
     }
     outcome
 }

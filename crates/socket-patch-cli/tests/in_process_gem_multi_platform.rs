@@ -522,7 +522,8 @@ fn delete_darwin_before_blob(cwd: &Path) -> String {
 
 fn rollback_args(cwd: &Path, api_url: String, offline: bool) -> RollbackArgs {
     RollbackArgs {
-        identifier: None,
+        targets: Vec::new(),
+        preserve_state: false,
         common: socket_patch_cli::args::GlobalArgs {
             cwd: cwd.to_path_buf(),
             org: Some(ORG.to_string()),
@@ -727,7 +728,8 @@ async fn rollback_all_over_broad_manifest_succeeds() {
     );
 
     let rollback_args = RollbackArgs {
-        identifier: None,
+        targets: Vec::new(),
+        preserve_state: false,
         common: socket_patch_cli::args::GlobalArgs {
             cwd: tmp.path().to_path_buf(),
             org: Some(ORG.to_string()),

@@ -564,7 +564,8 @@ async fn rollback_all_over_broad_manifest_succeeds() {
     // this exited non-zero (HashMismatch on the two non-installed
     // variants against the single on-disk file).
     let rollback_args = RollbackArgs {
-        identifier: None,
+        targets: Vec::new(),
+        preserve_state: false,
         common: socket_patch_cli::args::GlobalArgs {
             cwd: tmp.path().to_path_buf(),
             org: Some(ORG.to_string()),

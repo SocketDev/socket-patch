@@ -28,7 +28,7 @@ use super::pnpm_lock_legacy::PnpmLockGrammar;
 use super::state::VendorEntry;
 use super::{
     bun_lock, npm_lock, pnpm_lock, pnpm_lock_legacy, yarn_berry_lock, yarn_classic_lock,
-    RevertOutcome, VendorOutcome, VendorWarning,
+    RevertOpts, RevertOutcome, VendorOutcome, VendorWarning,
 };
 
 /// Which lockfile flavor drives this project's npm installs.
@@ -447,19 +447,29 @@ pub async fn revert_npm_any(
     project_root: &Path,
     dry_run: bool,
 ) -> RevertOutcome {
+    revert_npm_any_opts(entry, project_root, RevertOpts::new(dry_run)).await
+}
+
+/// [`revert_npm_any`] with full [`RevertOpts`], threaded through to the
+/// flavor backend that wired the entry.
+pub async fn revert_npm_any_opts(
+    entry: &VendorEntry,
+    project_root: &Path,
+    opts: RevertOpts,
+) -> RevertOutcome {
     match entry.flavor.as_deref() {
-        None | Some("package-lock") => npm_lock::revert_npm(entry, project_root, dry_run).await,
+        None | Some("package-lock") => npm_lock::revert_npm_opts(entry, project_root, opts).await,
         Some("yarn-classic") => {
-            yarn_classic_lock::revert_yarn_classic(entry, project_root, dry_run).await
+            yarn_classic_lock::revert_yarn_classic_opts(entry, project_root, opts).await
         }
         Some("yarn-berry") => {
-            yarn_berry_lock::revert_yarn_berry(entry, project_root, dry_run).await
+            yarn_berry_lock::revert_yarn_berry_opts(entry, project_root, opts).await
         }
-        Some("pnpm") => pnpm_lock::revert_pnpm(entry, project_root, dry_run).await,
+        Some("pnpm") => pnpm_lock::revert_pnpm_opts(entry, project_root, opts).await,
         Some("pnpm-legacy") => {
-            pnpm_lock_legacy::revert_pnpm_legacy(entry, project_root, dry_run).await
+            pnpm_lock_legacy::revert_pnpm_legacy_opts(entry, project_root, opts).await
         }
-        Some("bun") => bun_lock::revert_bun(entry, project_root, dry_run).await,
+        Some("bun") => bun_lock::revert_bun_opts(entry, project_root, opts).await,
         Some(other) => RevertOutcome::failed(format!(
             "this socket-patch build cannot revert npm vendor flavor `{other}` — upgrade \
              socket-patch and re-run"

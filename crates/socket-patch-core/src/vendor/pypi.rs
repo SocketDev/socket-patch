@@ -36,7 +36,7 @@ use super::state::{
     write_marker, PdmMeta, PipenvMeta, PoetryMeta, UvMeta, VendorArtifact, VendorEntry,
     VendorMarker,
 };
-use super::{RevertOutcome, VendorOutcome, VendorServiceConfig, VendorWarning};
+use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorServiceConfig, VendorWarning};
 
 /// Which wiring backend serves this project.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -601,6 +601,20 @@ pub async fn vendor_pypi(
 /// the artifact uuid dir (validated path only — never a path taken on faith
 /// from state.json).
 pub async fn revert_pypi(entry: &VendorEntry, project_root: &Path, dry_run: bool) -> RevertOutcome {
+    revert_pypi_opts(entry, project_root, RevertOpts::new(dry_run)).await
+}
+
+/// [`revert_pypi`] with full [`RevertOpts`]: `keep_artifact` skips the
+/// artifact deletion while the per-flavor wiring restore runs unchanged.
+pub async fn revert_pypi_opts(
+    entry: &VendorEntry,
+    project_root: &Path,
+    opts: RevertOpts,
+) -> RevertOutcome {
+    let RevertOpts {
+        dry_run,
+        keep_artifact,
+    } = opts;
     let mut outcome = match entry.flavor.as_deref() {
         Some("uv") => revert_uv(entry, project_root, dry_run).await,
         Some("requirements") => revert_requirements(entry, project_root, dry_run).await,
@@ -614,6 +628,12 @@ pub async fn revert_pypi(entry: &VendorEntry, project_root: &Path, dry_run: bool
         }
     };
     if !outcome.success || dry_run {
+        return outcome;
+    }
+    // `--preserve-state` (`keep_artifact`): the wiring restore above already
+    // ran; the artifact dir stays behind (and the caller keeps the ledger
+    // entry), so only the deletion is skipped.
+    if keep_artifact {
         return outcome;
     }
     // SECURITY: entry.uuid comes from the committed, tamper-able state.json

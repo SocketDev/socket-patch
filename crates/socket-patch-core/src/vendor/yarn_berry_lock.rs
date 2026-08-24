@@ -53,7 +53,7 @@ use super::yarn_classic_lock::{
     read_yarn_lock, replace_block, revert_recorded_block, scan_blocks, split_key_patterns,
     split_pattern, LockBlock,
 };
-use super::{RevertOutcome, VendorOutcome, VendorWarning};
+use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorWarning};
 
 const YARN_LOCK: &str = "yarn.lock";
 const PACKAGE_JSON: &str = "package.json";
@@ -503,11 +503,30 @@ pub async fn vendor_yarn_berry(
 
 /// Undo one yarn-berry vendored package: restore the recorded lock entry,
 /// remove the resolutions entry, and remove the artifact dir.
+/// Test-only shorthand — production routes through
+/// [`revert_yarn_berry_opts`] (via
+/// [`super::npm_flavor::revert_npm_any_opts`]).
+#[cfg(test)]
 pub async fn revert_yarn_berry(
     entry: &VendorEntry,
     project_root: &Path,
     dry_run: bool,
 ) -> RevertOutcome {
+    revert_yarn_berry_opts(entry, project_root, RevertOpts::new(dry_run)).await
+}
+
+/// [`revert_yarn_berry`] with full [`RevertOpts`]: `keep_artifact` skips the
+/// artifact deletion — and the refusals that exist only to protect it —
+/// while the wiring restore runs unchanged.
+pub async fn revert_yarn_berry_opts(
+    entry: &VendorEntry,
+    project_root: &Path,
+    opts: RevertOpts,
+) -> RevertOutcome {
+    let RevertOpts {
+        dry_run,
+        keep_artifact,
+    } = opts;
     // SECURITY: shared fail-closed guard on the tamper-able uuid, before any
     // disk access.
     let uuid_dir_rel = match guard_revert_uuid_dir(&entry.uuid) {
@@ -522,8 +541,10 @@ pub async fn revert_yarn_berry(
     // path), so each is probed independently — a dangling `file:` spec in
     // either fails every subsequent install on the missing tarball. Runs
     // before the dry-run return so a preview never advertises a revert the
-    // wet run refuses.
-    if entry.wiring.is_empty() {
+    // wet run refuses. Skipped under `keep_artifact`: the refusal exists
+    // only to protect the deletion, which a preserve-state revert never
+    // performs.
+    if entry.wiring.is_empty() && !keep_artifact {
         for wired in [YARN_LOCK, PACKAGE_JSON] {
             if let Some(blocked) = super::npm_lock::guard_unwired_textual_revert(
                 project_root,
@@ -659,6 +680,14 @@ pub async fn revert_yarn_berry(
     // deleting evidence out from under a lock we just refused to touch.
     if outcome.drift_skipped() {
         outcome.keep_artifact(&uuid_dir_rel);
+        return outcome;
+    }
+
+    // `--preserve-state` (`keep_artifact`): the wiring restore above already
+    // ran; the artifact dir stays behind (and the caller keeps the ledger
+    // entry), so the deletion — and the still-wired probes that exist only
+    // to protect it — are skipped.
+    if keep_artifact {
         return outcome;
     }
 

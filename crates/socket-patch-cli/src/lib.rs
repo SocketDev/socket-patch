@@ -10,6 +10,7 @@ pub mod commands;
 pub(crate) mod ecosystem_dispatch;
 pub mod json_envelope;
 pub mod output;
+pub mod path_scope;
 pub mod update_notifier;
 
 use clap::{Parser, Subcommand};
@@ -122,8 +123,10 @@ impl Commands {
 /// Check whether `s` looks like a UUID (8-4-4-4-12 hex pattern).
 ///
 /// Used by [`parse_with_uuid_fallback`] to detect the convenience form
-/// `socket-patch <UUID>` and rewrite it to `socket-patch get <UUID>`.
-fn looks_like_uuid(s: &str) -> bool {
+/// `socket-patch <UUID>` and rewrite it to `socket-patch get <UUID>`, and
+/// by rollback's target resolver to decide whether a no-match identifier
+/// error should hint at the path-glob spelling.
+pub(crate) fn looks_like_uuid(s: &str) -> bool {
     let parts: Vec<&str> = s.split('-').collect();
     if parts.len() != 5 {
         return false;

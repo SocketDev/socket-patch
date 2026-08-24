@@ -109,7 +109,8 @@ fn default_rollback_args(cwd: &Path, eco: &str) -> RollbackArgs {
             verbose: false,
             ..socket_patch_cli::args::GlobalArgs::default()
         },
-        identifier: None,
+        targets: Vec::new(),
+        preserve_state: false,
         one_off: false,
     }
 }

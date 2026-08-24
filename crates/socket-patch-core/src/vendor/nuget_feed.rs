@@ -67,7 +67,7 @@ use super::service_fetch::{service_archive_copy, ServiceCopy};
 use super::state::{
     write_marker, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
 };
-use super::{RevertOutcome, VendorOutcome, VendorServiceConfig, VendorWarning};
+use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorServiceConfig, VendorWarning};
 
 /// Project-relative lockfile this backend pins (optional — NuGet only writes
 /// it when `RestorePackagesWithLockFile`/`--use-lock-file` is set).
@@ -573,6 +573,20 @@ pub async fn revert_nuget(
     project_root: &Path,
     dry_run: bool,
 ) -> RevertOutcome {
+    revert_nuget_opts(entry, project_root, RevertOpts::new(dry_run)).await
+}
+
+/// [`revert_nuget`] with full [`RevertOpts`]: `keep_artifact` skips the
+/// artifact deletion while the wiring restore runs unchanged.
+pub async fn revert_nuget_opts(
+    entry: &VendorEntry,
+    project_root: &Path,
+    opts: RevertOpts,
+) -> RevertOutcome {
+    let RevertOpts {
+        dry_run,
+        keep_artifact,
+    } = opts;
     // SECURITY: state.json is committed and tamper-able; the uuid keys the
     // directory we are about to delete. Anything but the canonical uuid
     // grammar is rejected fail-closed before any disk access.
@@ -627,7 +641,10 @@ pub async fn revert_nuget(
         }
     }
 
-    if !dry_run {
+    // `--preserve-state` (`keep_artifact`): the artifact dir stays behind
+    // (and the caller keeps the ledger entry), so only the deletion is
+    // skipped.
+    if !dry_run && !keep_artifact {
         if let Err(e) = remove_tree(&uuid_dir).await {
             return RevertOutcome {
                 kept_artifact: false,

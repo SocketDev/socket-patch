@@ -39,7 +39,7 @@ use super::service_fetch::{fetch_verified_archive, ServiceArtifact};
 use super::state::{
     write_marker, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
 };
-use super::{RevertOutcome, VendorOutcome, VendorServiceConfig, VendorWarning};
+use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorServiceConfig, VendorWarning};
 
 /// Vendor one Go module: patched copy in the uuid dir + a vendor-owned
 /// `replace` directive + marker, returning the ledger entry to persist.
@@ -547,6 +547,20 @@ pub async fn revert_go_vendor(
     project_root: &Path,
     dry_run: bool,
 ) -> RevertOutcome {
+    revert_go_vendor_opts(entry, project_root, RevertOpts::new(dry_run)).await
+}
+
+/// [`revert_go_vendor`] with full [`RevertOpts`]: `keep_artifact` skips the
+/// artifact deletion while the wiring restore runs unchanged.
+pub async fn revert_go_vendor_opts(
+    entry: &VendorEntry,
+    project_root: &Path,
+    opts: RevertOpts,
+) -> RevertOutcome {
+    let RevertOpts {
+        dry_run,
+        keep_artifact,
+    } = opts;
     // SECURITY: the coordinates and uuid come from a committed, tamper-able
     // state.json and key a directory we are about to delete — re-validate
     // fail-closed before any disk access (mirrors the vendor-side guard).
@@ -575,7 +589,10 @@ pub async fn revert_go_vendor(
         return RevertOutcome::failed(format!("failed to update go.mod: {e}"));
     }
 
-    if !dry_run {
+    // `--preserve-state` (`keep_artifact`): the artifact dir stays behind
+    // (and the caller keeps the ledger entry), so only the deletion is
+    // skipped.
+    if !dry_run && !keep_artifact {
         let uuid_dir = project_root.join(&base_rel);
         let _ = remove_tree(&uuid_dir).await; // ignore NotFound
                                               // Best-effort: prune the now-empty `.socket/vendor/golang/` level so a
