@@ -77,7 +77,12 @@ impl PathScope {
             }
             let compiled = Pattern::new(&normalized)
                 .map_err(|e| format!("invalid path pattern {r:?}: {e}"))?;
-            let is_absolute = Path::new(&normalized).is_absolute();
+            // `has_root` rather than `is_absolute`: identical on Unix, but a
+            // Windows drive-RELATIVE rooted pattern (`/global/store`, no
+            // drive letter) is not `is_absolute` — and a rooted pattern can
+            // never be cwd-relative, so it must match against the absolute
+            // candidate path either way.
+            let is_absolute = Path::new(&normalized).has_root();
             patterns.push((compiled, is_absolute));
             raw.push(r.clone());
         }
