@@ -473,7 +473,7 @@ pub async fn revert_npm_opts(
     // the wet run refuses (same precedent as the uuid guard above). Skipped
     // under `keep_artifact`: the refusal exists only to protect the
     // deletion, which a preserve-state revert never performs.
-    if entry.wiring.is_empty() && !keep_artifact {
+    if entry.wiring.is_empty() {
         if let Some(blocked) = guard_unwired_textual_revert(
             project_root,
             &entry.uuid,

@@ -788,40 +788,24 @@ pub async fn run(args: RollbackArgs) -> i32 {
     // manifest (in-place/agent patches), the vendor ledger (vendored
     // patches), and the redirect ledger (hosted lockfile redirects). A
     // missing manifest is no longer fatal when a ledger holds work.
+    //
+    // Only cheap EXISTENCE probes happen before the lock (they decide the
+    // truly-empty error path, which never locks — the lock file would
+    // materialize `.socket/` in a project that has none). The stores
+    // themselves are LOADED UNDER the apply lock below: this run persists
+    // mutated clones of the ledgers, so a pre-lock snapshot could clobber
+    // a concurrent run's writes with stale state.
     let manifest_missing = tokio::fs::metadata(&manifest_path).await.is_err();
-    let vendor_state_result = socket_patch_core::vendor::load_state(&cwd).await;
-    let redirect_state_result =
-        socket_patch_core::patch::redirect::load_redirect_state(&cwd).await;
+    let vendor_ledger_exists = tokio::fs::metadata(cwd.join(".socket/vendor/state.json"))
+        .await
+        .is_ok();
+    let redirect_ledger_exists = tokio::fs::metadata(
+        cwd.join(socket_patch_core::patch::redirect::REDIRECT_STATE_REL),
+    )
+    .await
+    .is_ok();
 
-    let vendor_present = vendor_state_result
-        .as_ref()
-        .is_ok_and(|s| !s.entries.is_empty());
-    let redirect_present = redirect_state_result
-        .as_ref()
-        .is_ok_and(|s| s.as_ref().is_some_and(|s| !s.records.is_empty() || !s.edits.is_empty()));
-    let vendor_corrupt = vendor_state_result.is_err();
-    let redirect_corrupt = redirect_state_result.is_err();
-
-    if manifest_missing && !vendor_present && !redirect_present {
-        if vendor_corrupt || redirect_corrupt {
-            // The only state on disk is unreadable: nothing can be safely
-            // undone. Fail closed naming the store.
-            let msg = if vendor_corrupt {
-                format!(
-                    "cannot read .socket/vendor/state.json: {}",
-                    vendor_state_result.as_ref().expect_err("checked corrupt above")
-                )
-            } else {
-                format!(
-                    "cannot read the hosted redirect ledger: {}",
-                    redirect_state_result
-                        .as_ref()
-                        .expect_err("checked corrupt above")
-                )
-            };
-            emit_rollback_error(args.common.json, &msg);
-            return 1;
-        }
+    if manifest_missing && !vendor_ledger_exists && !redirect_ledger_exists {
         // Ledger-less but still wired? (a deleted/uncommitted state.json
         // with lockfiles still consuming `.socket/vendor/` artifacts is a
         // supported recovery state — `repair` reconstructs the ledger.)
@@ -869,6 +853,13 @@ pub async fn run(args: RollbackArgs) -> i32 {
         Ok(guard) => guard,
         Err(code) => return code,
     };
+
+    // Load the state stores UNDER the lock (see the discovery note above).
+    let vendor_state_result = socket_patch_core::vendor::load_state(&cwd).await;
+    let redirect_state_result =
+        socket_patch_core::patch::redirect::load_redirect_state(&cwd).await;
+    let vendor_corrupt = vendor_state_result.is_err();
+    let redirect_corrupt = redirect_state_result.is_err();
 
     // ── scope resolution ────────────────────────────────────────────────
     let manifest = if manifest_missing {
@@ -1114,8 +1105,21 @@ pub async fn run(args: RollbackArgs) -> i32 {
     // records, and unused blobs — prompt once, remove-style. Auto-accepted
     // under --yes/--json/non-TTY; skipped for previews and for
     // --preserve-state runs (which delete no local state).
-    let has_work =
-        !manifest_scope.is_empty() || !vendor_scope.is_empty() || !hosted_scope.is_empty();
+    // Leftover hosted edits an eligible replay would unwind even with no
+    // in-scope records (degraded record-fetch-failed ledgers): they are
+    // work — and prompt-worthy mutation — too.
+    let hosted_leftover_edits = if replay_eligible {
+        match &redirect_state_result {
+            Ok(Some(st)) => st.edits.len(),
+            _ => 0,
+        }
+    } else {
+        0
+    };
+    let has_work = !manifest_scope.is_empty()
+        || !vendor_scope.is_empty()
+        || !hosted_scope.is_empty()
+        || hosted_leftover_edits > 0;
     if has_work && !args.common.dry_run && !args.preserve_state {
         let detached_count = vendor_entries
             .iter()
@@ -1144,6 +1148,10 @@ pub async fn run(args: RollbackArgs) -> i32 {
             clauses.push(format!(
                 "unwind {} hosted redirect(s)",
                 hosted_scope.len()
+            ));
+        } else if hosted_leftover_edits > 0 {
+            clauses.push(format!(
+                "replay {hosted_leftover_edits} leftover hosted redirect edit(s)"
             ));
         }
         let mut prompt = clauses.join(", and ");
@@ -1198,15 +1206,14 @@ pub async fn run(args: RollbackArgs) -> i32 {
                 vendored_leg =
                     run_vendored_leg(&args.common, &keys, &mut vs, args.preserve_state).await;
             }
-            // `vendored` (the legacy "benign, untouched" array) now lists
-            // only vendor-owned purls the run did NOT act on — i.e. the
-            // corrupt-ledger skip. Acted-on entries land in the
-            // vendoredReverted/vendoredPreserved/vendoredKept arrays.
-            let vendored: Vec<String> = if vendor_corrupt {
-                vendored_excluded.clone()
-            } else {
-                Vec::new()
-            };
+            // `vendored` (the legacy "benign, untouched" array) is
+            // reserved-empty in v5.0: acted-on entries land in the
+            // vendoredReverted/vendoredPreserved/vendoredKept arrays, and
+            // the corrupt-ledger skip cannot name vendor-owned purls (the
+            // detection itself needs the ledger) — it surfaces via the
+            // `vendor_state_unreadable` warning and exit 1 instead.
+            let vendored: Vec<String> = Vec::new();
+            let _ = &vendored_excluded;
 
             // ── hosted leg ───────────────────────────────────────────────
             let mut hosted_leg = HostedLegOutcome::default();
@@ -1493,6 +1500,12 @@ pub async fn run(args: RollbackArgs) -> i32 {
                                 "purl": key, "reason": reason,
                             }))
                             .collect::<Vec<_>>(),
+                        "vendoredFailed": vendored_leg.failed
+                            .iter()
+                            .map(|(key, error)| serde_json::json!({
+                                "purl": key, "error": error,
+                            }))
+                            .collect::<Vec<_>>(),
                         "hosted": {
                             "reverted": hosted_leg.reverted,
                             "failed": hosted_leg.failed
@@ -1600,20 +1613,20 @@ pub async fn run(args: RollbackArgs) -> i32 {
                 }
             }
 
-            if !args.common.json && !args.common.silent {
-                if !vendored.is_empty() {
-                    println!(
-                        "\n{} vendored package(s) skipped (vendor ledger unreadable; \
-                         quarantine or restore .socket/vendor/state.json and re-run):",
-                        vendored.len()
-                    );
-                    for purl in &vendored {
-                        println!("  {purl}");
-                    }
-                }
+            // Error-class notices print even under --silent ("errors only,
+            // never nothing"): drift-keeps and corrupt-ledger skips drive
+            // exit 1, so a silent run must still say why.
+            if !args.common.json {
                 for (key, reason) in &vendored_leg.kept {
                     eprintln!("Kept vendored state for {key}: {reason}");
                 }
+                for (code, detail) in &run_warnings {
+                    if code == "vendor_state_unreadable" || code == "redirect_state_unreadable" {
+                        eprintln!("Error ({code}): {detail}");
+                    }
+                }
+            }
+            if !args.common.json && !args.common.silent {
                 if args.common.dry_run {
                     if cleanup_allowed && !removed.is_empty() {
                         println!("\nWould remove {} patch(es) from manifest:", removed.len());

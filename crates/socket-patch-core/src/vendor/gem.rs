@@ -1112,7 +1112,7 @@ pub async fn revert_gem_opts(
     // `vendor_gem` records carries at least the Gemfile + lock records.)
     // Skipped under `keep_artifact`: the refusal exists only to protect the
     // deletion, which a preserve-state revert never performs.
-    if entry.wiring.is_empty() && !keep_artifact {
+    if entry.wiring.is_empty() {
         let name = parse_gem_purl(&entry.base_purl)
             .map(|(n, _)| n)
             .unwrap_or("<unknown>");

@@ -316,17 +316,16 @@ pub async fn revert_cargo_redirect_purl(
         }
     }
 
-    // Dry run: every inverse (and every drift refusal) has already resolved
-    // against the staged view — identical to a wet run — so report what
-    // WOULD be reverted without flushing the staged writes or touching the
-    // ledger.
-    if dry_run {
-        return Ok(out);
-    }
-
     // Every inverse resolved — only now does any of it reach disk, so a
-    // refusal above left the project exactly as it was found.
-    flush_staged(project_root, &staged).await?;
+    // refusal above left the project exactly as it was found. A dry run
+    // skips ONLY the disk flush: the in-memory ledger mutation below still
+    // happens, so composed previews (the whole-ledger replay running after
+    // the per-purl reverts inside one rollback) see exactly the state a
+    // wet run would hand them. The caller owns the state clone and never
+    // persists it on a dry run, so nothing durable changes.
+    if !dry_run {
+        flush_staged(project_root, &staged).await?;
+    }
 
     // Only after every inverse applied cleanly: drop this purl's edits and
     // record from the ledger (the caller persists it).
@@ -539,17 +538,16 @@ pub async fn revert_npm_redirect_purl(
         }
     }
 
-    // Dry run: every inverse (and every drift refusal) has already resolved
-    // against the staged view — identical to a wet run — so report what
-    // WOULD be reverted without flushing the staged writes or touching the
-    // ledger.
-    if dry_run {
-        return Ok(out);
-    }
-
     // Every inverse resolved — only now does any of it reach disk, so a
-    // refusal above left the project exactly as it was found.
-    flush_staged(project_root, &staged).await?;
+    // refusal above left the project exactly as it was found. A dry run
+    // skips ONLY the disk flush: the in-memory ledger mutation below still
+    // happens, so composed previews (the whole-ledger replay running after
+    // the per-purl reverts inside one rollback) see exactly the state a
+    // wet run would hand them. The caller owns the state clone and never
+    // persists it on a dry run, so nothing durable changes.
+    if !dry_run {
+        flush_staged(project_root, &staged).await?;
+    }
 
     // Only after every inverse applied cleanly: drop this purl's edits and
     // record from the ledger (the caller persists it).
@@ -1017,11 +1015,18 @@ mod tests {
             cfg_before,
             ".cargo/config.toml untouched"
         );
-        assert_eq!(state.records.len(), records_before, "record kept");
-        assert_eq!(state.edits.len(), edits_before, "edits kept");
+        // The IN-MEMORY ledger is claimed exactly like a wet run (composed
+        // previews — the whole-ledger replay running after per-purl
+        // reverts — must see the post-claim state); the caller owns the
+        // clone and never persists it on a dry run.
+        assert!(state.records.len() < records_before, "record claimed in memory");
+        assert!(state.edits.len() < edits_before, "edits claimed in memory");
 
-        // The preview names exactly the files the wet run then reverts.
-        let wet = revert_cargo_redirect_purl(root, &mut state, PURL, false)
+        // The preview names exactly the files a wet run then reverts —
+        // re-run wet on a FRESH state clone of the same fixture.
+        let (tmp2, mut state2) = redirected_fixture().await;
+        let root = tmp2.path();
+        let wet = revert_cargo_redirect_purl(root, &mut state2, PURL, false)
             .await
             .expect("wet revert succeeds");
         assert_eq!(dry.reverted_files, wet.reverted_files);

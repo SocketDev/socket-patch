@@ -114,9 +114,16 @@ fn classify(kind: &str, action: &str) -> (&'static str, Inverse) {
                 Inverse::ReplaceFragment
             },
         ),
-        "redirect_gemfile_lock_source_url"
-        | "redirect_gemfile_lock_gem_source"
-        | "redirect_gemfile_source_url" => ("gem", Inverse::ReplaceFragment),
+        "redirect_gemfile_lock_source_url" | "redirect_gemfile_source_url" => {
+            ("gem", Inverse::ReplaceFragment)
+        }
+        // The section-move record: the writer drained the spec (+ sublines)
+        // out of its upstream GEM section into a new socket GEM section but
+        // recorded only the bare remote URLs — not the moved block — so a
+        // URL swap would claim success while leaving the moved spec and the
+        // scaffold section in place. Refuse until the writer records enough
+        // to invert the move.
+        "redirect_gemfile_lock_gem_source" => ("gem", Inverse::Unsupported),
         // "updated" carries the prior socket directive in `original`;
         // the chain unwinds newest-first down to the first run's "added".
         "redirect_golang_replace" => (
@@ -214,12 +221,22 @@ fn safe_rel_path(path: &str) -> bool {
         && !path.split(['/', '\\']).any(|c| c == "..")
 }
 
+/// FIFO-guarded read: a planted FIFO squatting a lockfile path must fail
+/// fast (`InvalidInput`) instead of wedging the replay on a blocking open
+/// — the same posture as every other raw read in the patch engine.
 async fn read_rel(project_root: &Path, rel: &str) -> Result<Option<String>, String> {
-    match tokio::fs::read_to_string(project_root.join(rel)).await {
-        Ok(c) => Ok(Some(c)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(format!("read {rel}: {e}")),
-    }
+    use tokio::io::AsyncReadExt;
+    let path = project_root.join(rel);
+    let (mut file, _) = match crate::utils::fs::open_regular_file(&path).await {
+        Ok(pair) => pair,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("read {rel}: {e}")),
+    };
+    let mut content = String::new();
+    file.read_to_string(&mut content)
+        .await
+        .map_err(|e| format!("read {rel}: {e}"))?;
+    Ok(Some(content))
 }
 
 /// Files the group's unwind has decided but not yet written:
@@ -237,31 +254,46 @@ async fn staged_read(
     }
 }
 
-/// Remove one inserted fragment, eating the separator the writer added
-/// around it. An EOF-appended fragment (the go.mod replace / Gemfile
-/// source-block shape: maybe-a-blank-separator + fragment + newline) is
-/// byte-AMBIGUOUS to invert — `"m\n\n" + "F\n"` and `"m\n" + "\nF\n"`
-/// produce identical files — so the EOF case strips the fragment and
-/// collapses the trailing blank run to the canonical single newline (the
-/// shape `go mod tidy` itself emits). Mid-file fragments remove exactly
-/// the fragment line (`{fragment}\n`), falling back to a bare removal.
+/// Remove one inserted fragment, eating the separators the writer added
+/// around it. Position-based: several writers record the fragment WITHOUT
+/// the indentation they inserted it with (the gem DEPENDENCIES pin and
+/// CHECKSUMS line record `target.trim_start()`), so when everything
+/// between the fragment and its line start is whitespace the whole line
+/// is removed — a bare `replacen` would strand the orphaned indent onto
+/// the NEXT line and corrupt indentation-sensitive locks. An EOF-removed
+/// fragment additionally collapses the trailing blank run to the
+/// canonical single newline: the append shape (maybe-a-blank-separator +
+/// fragment + newline) is byte-AMBIGUOUS to invert — `"m\n\n" + "F\n"`
+/// and `"m\n" + "\nF\n"` produce identical files — so the tidy form (the
+/// one `go mod tidy` itself emits) is chosen.
 fn remove_fragment_once(content: &str, fragment: &str) -> String {
-    let at_eof = format!("{fragment}\n");
-    if let Some(prefix) = content.strip_suffix(&at_eof) {
-        let trimmed = prefix.trim_end_matches('\n');
+    let Some(pos) = content.find(fragment) else {
+        return content.to_string();
+    };
+    let mut end = pos + fragment.len();
+    // The fragment's own indentation, when the writer recorded it stripped.
+    let line_start = content[..pos].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let start = if content[line_start..pos]
+        .chars()
+        .all(|c| c == ' ' || c == '\t')
+    {
+        line_start
+    } else {
+        pos
+    };
+    // The removed line's own newline goes with it.
+    if content[end..].starts_with('\n') {
+        end += 1;
+    }
+    if end >= content.len() {
+        // EOF removal: collapse the (ambiguous) trailing separator run.
+        let trimmed = content[..start].trim_end_matches('\n');
         if trimmed.is_empty() {
             return String::new();
         }
         return format!("{trimmed}\n");
     }
-    if content.contains(&at_eof) {
-        return content.replacen(&at_eof, "", 1);
-    }
-    let with_leading = format!("\n{fragment}");
-    if content.contains(&with_leading) {
-        return content.replacen(&with_leading, "", 1);
-    }
-    content.replacen(fragment, "", 1)
+    format!("{}{}", &content[..start], &content[end..])
 }
 
 /// The string payloads of an edit, or `None` when a payload is missing or
@@ -417,9 +449,16 @@ pub async fn revert_remaining_redirect_edits(
                             Some(content.replacen(new, original, 1)),
                         );
                         group_drops.insert(idx);
-                    } else if content.contains(original) {
+                    } else if content.contains(original) && !new.contains(original) {
                         // Already at the pre-edit state (an interrupted
                         // earlier revert, or a hand-fix) — nothing to do.
+                        // The `!new.contains(original)` guard matters:
+                        // several writers record an `original` that is a
+                        // SUBSTRING of `new` (the Cargo.toml insert variant
+                        // records the always-present table header), so its
+                        // presence proves nothing about the inserted part —
+                        // a drifted insert must refuse, not silently drop
+                        // the edit as reverted.
                         group_drops.insert(idx);
                     } else {
                         refuse(
@@ -560,6 +599,15 @@ pub async fn revert_remaining_redirect_edits(
         if !dry_run {
             for (rel, pending) in &staged {
                 let path = project_root.join(rel);
+                // FIFO/device guard on the write side too: writing to a
+                // planted FIFO blocks forever. Refuse the group instead.
+                if let Ok(meta) = tokio::fs::symlink_metadata(&path).await {
+                    if !meta.is_file() {
+                        refuse(format!("{rel} is not a regular file"), &mut outcome);
+                        refused_groups.insert(group);
+                        continue 'group;
+                    }
+                }
                 let write_result = match pending {
                     Some(content) => tokio::fs::write(&path, content).await,
                     None => match tokio::fs::remove_file(&path).await {
@@ -910,6 +958,99 @@ mod tests {
         let out = revert_remaining_redirect_edits(dir.path(), &mut state, false).await;
         assert!(out.fully_reverted());
         assert_eq!(read(dir.path(), "go.sum").await, "x v0.9 h1:orig\n");
+    }
+
+    #[tokio::test]
+    async fn gem_added_pin_removal_preserves_sibling_indentation() {
+        // The gem writer records the DEPENDENCIES pin / CHECKSUMS line
+        // STRIPPED of its two-space indent; removal must take the whole
+        // line, never strand the indent onto the next line (which bundler
+        // then misparses).
+        let dir = TempDir::new().unwrap();
+        write(
+            dir.path(),
+            "Gemfile.lock",
+            "DEPENDENCIES\n  rack\n  rex (= 1.0.0)!\n  rspec\n",
+        )
+        .await;
+        let mut state = state_with(
+            vec![edit(
+                "Gemfile.lock",
+                "redirect_gemfile_lock_dependency_pin",
+                "added",
+                None,
+                Some("rex (= 1.0.0)!"),
+            )],
+            &[],
+        );
+        let out = revert_remaining_redirect_edits(dir.path(), &mut state, false).await;
+        assert!(out.fully_reverted(), "{:?}", out.refusals);
+        assert_eq!(
+            read(dir.path(), "Gemfile.lock").await,
+            "DEPENDENCIES\n  rack\n  rspec\n",
+            "sibling lines keep their exact indentation"
+        );
+    }
+
+    #[tokio::test]
+    async fn anchor_shaped_original_never_reads_as_already_reverted() {
+        // The Cargo.toml insert variant records the always-present table
+        // header as `original` and header+insert as `new`. With the insert
+        // drifted, contains(original) is vacuously true — the edit must
+        // REFUSE, not silently drop as already-reverted.
+        let dir = TempDir::new().unwrap();
+        write(
+            dir.path(),
+            "Cargo.toml",
+            "[dependencies.cfg-if]\nregistry  =  \"socket-patch-u\"\n",
+        )
+        .await;
+        let mut state = state_with(
+            vec![edit(
+                "Cargo.toml",
+                "redirect_cargo_toml_dep",
+                "rewritten",
+                Some("[dependencies.cfg-if]"),
+                Some("[dependencies.cfg-if]\nregistry = \"socket-patch-u\""),
+            )],
+            &[],
+        );
+        let out = revert_remaining_redirect_edits(dir.path(), &mut state, false).await;
+        assert_eq!(out.refusals.len(), 1, "{out:?}");
+        assert!(out.refusals[0].reason.contains("drifted"));
+        assert_eq!(state.edits.len(), 1, "the edit must survive for a retry");
+    }
+
+    #[tokio::test]
+    async fn gem_section_move_record_fails_closed() {
+        // redirect_gemfile_lock_gem_source records only the bare URLs of a
+        // SECTION MOVE — not enough to invert it. Must refuse, never swap
+        // the URL and claim success.
+        let dir = TempDir::new().unwrap();
+        write(
+            dir.path(),
+            "Gemfile.lock",
+            "GEM\n  remote: https://patch.example/\n  specs:\n    rex (1.0.0)\n",
+        )
+        .await;
+        let mut state = state_with(
+            vec![edit(
+                "Gemfile.lock",
+                "redirect_gemfile_lock_gem_source",
+                "rewritten",
+                Some("https://rubygems.org/"),
+                Some("https://patch.example/"),
+            )],
+            &["pkg:gem/rex@1.0.0"],
+        );
+        let before = read(dir.path(), "Gemfile.lock").await;
+        let out = revert_remaining_redirect_edits(dir.path(), &mut state, false).await;
+        assert_eq!(out.refusals.len(), 1);
+        assert!(out.refusals[0]
+            .reason
+            .contains("no hosted-redirect revert implementation"));
+        assert_eq!(read(dir.path(), "Gemfile.lock").await, before);
+        assert!(state.records.contains_key("pkg:gem/rex@1.0.0"));
     }
 
     #[tokio::test]

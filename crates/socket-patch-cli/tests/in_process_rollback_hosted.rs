@@ -501,6 +501,61 @@ async fn npm_hosted_round_trip() {
     );
 }
 
+/// Dry-run twin of the round trip — the review-caught regression: the
+/// per-purl dry revert must claim its npm JSON edits IN MEMORY so the
+/// whole-ledger replay does not refuse them as unclaimed (`group:npm`)
+/// and flip a would-succeed run to partial_failure. A hosted npm dry run
+/// exits 0, reports the purl as would-be-reverted, and mutates NOTHING.
+#[tokio::test]
+#[serial]
+async fn npm_hosted_dry_run_previews_cleanly() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_npm_project(tmp.path());
+    let code = scan_run(hosted_scan_args(tmp.path(), server.uri())).await;
+    assert_eq!(code, 0, "scan --mode hosted should succeed");
+    let wired = std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap();
+    let ledger_before = std::fs::read(ledger_path(tmp.path())).unwrap();
+
+    let args = RollbackArgs {
+        targets: Vec::new(),
+        common: socket_patch_cli::args::GlobalArgs {
+            cwd: tmp.path().to_path_buf(),
+            manifest_path: ".socket/manifest.json".to_string(),
+            offline: true,
+            json: true,
+            yes: true,
+            silent: true,
+            dry_run: true,
+            ..socket_patch_cli::args::GlobalArgs::default()
+        },
+        one_off: false,
+        preserve_state: false,
+    };
+    let code = rollback_run(args).await;
+    std::env::remove_var("SOCKET_OFFLINE");
+    std::env::remove_var("SOCKET_DRY_RUN");
+    assert_eq!(
+        code, 0,
+        "a hosted npm dry run must preview cleanly, never refuse its own \
+         per-purl-claimed edits"
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap(),
+        wired,
+        "dry run must not touch the lock"
+    );
+    assert_eq!(
+        std::fs::read(ledger_path(tmp.path())).unwrap(),
+        ledger_before,
+        "dry run must not touch the on-disk ledger"
+    );
+}
+
 /// The same round trip through the binary so the `--json` envelope can be
 /// parsed back: `hosted.reverted == [purl]`, `hosted.editedFiles >= 1`,
 /// nothing failed/unsupported, status success.

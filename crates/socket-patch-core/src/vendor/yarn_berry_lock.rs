@@ -544,7 +544,7 @@ pub async fn revert_yarn_berry_opts(
     // wet run refuses. Skipped under `keep_artifact`: the refusal exists
     // only to protect the deletion, which a preserve-state revert never
     // performs.
-    if entry.wiring.is_empty() && !keep_artifact {
+    if entry.wiring.is_empty() {
         for wired in [YARN_LOCK, PACKAGE_JSON] {
             if let Some(blocked) = super::npm_lock::guard_unwired_textual_revert(
                 project_root,

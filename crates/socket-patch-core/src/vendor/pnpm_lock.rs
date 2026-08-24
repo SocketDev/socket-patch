@@ -524,7 +524,7 @@ pub async fn revert_pnpm_opts(
     // the wet run refuses (same precedent as the uuid guard above). Skipped
     // under `keep_artifact`: the refusal exists only to protect the
     // deletion, which a preserve-state revert never performs.
-    if entry.wiring.is_empty() && !keep_artifact {
+    if entry.wiring.is_empty() {
         let in_use = pnpm_entry_in_use(entry, project_root).await;
         if let Some(blocked) = guard_unwired_revert(project_root, in_use, &uuid_dir_rel).await {
             return blocked;

@@ -1219,7 +1219,7 @@ pub async fn revert_pnpm_legacy_opts(
     // (see [`super::pnpm_lock::guard_unwired_revert`]). Skipped under
     // `keep_artifact`: the refusal exists only to protect the deletion,
     // which a preserve-state revert never performs.
-    if entry.wiring.is_empty() && !keep_artifact {
+    if entry.wiring.is_empty() {
         let in_use = pnpm_legacy_entry_in_use(entry, project_root).await;
         if let Some(blocked) = guard_unwired_revert(project_root, in_use, &uuid_dir_rel).await {
             return blocked;

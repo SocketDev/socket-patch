@@ -774,6 +774,7 @@ fn rollback_json_shape_has_documented_keys() {
         "vendoredReverted",
         "vendoredPreserved",
         "vendoredKept",
+        "vendoredFailed",
         "hosted",
         "manifest",
         "gc",

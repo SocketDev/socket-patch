@@ -651,6 +651,30 @@ pub async fn run(args: RemoveArgs) -> i32 {
                         replay_eligible,
                     )
                     .await;
+                    // Persist FIRST, failure or not: per-purl reverts flush
+                    // lockfile writes as they go, so an early error return
+                    // without persisting would strand already-reverted
+                    // purls' records in the on-disk ledger (lockfiles and
+                    // ledger desynced; `list`/VEX attest dead wiring).
+                    if !args.common.dry_run
+                        && (redirect_state.edits.len(), redirect_state.records.len()) != before
+                    {
+                        if let Err(e) =
+                            socket_patch_core::patch::redirect::persist_redirect_state(
+                                &args.common.cwd,
+                                &redirect_state,
+                            )
+                            .await
+                        {
+                            emit_error_envelope(
+                                args.common.json,
+                                args.common.dry_run,
+                                "hosted_revert_failed",
+                                format!("failed to persist the hosted redirect ledger: {e}"),
+                            );
+                            return 1;
+                        }
+                    }
                     if !leg.unsupported.is_empty() {
                         emit_error_envelope(
                             args.common.json,
@@ -677,25 +701,6 @@ pub async fn run(args: RemoveArgs) -> i32 {
                             ),
                         );
                         return 1;
-                    }
-                    if !args.common.dry_run
-                        && (redirect_state.edits.len(), redirect_state.records.len()) != before
-                    {
-                        if let Err(e) =
-                            socket_patch_core::patch::redirect::persist_redirect_state(
-                                &args.common.cwd,
-                                &redirect_state,
-                            )
-                            .await
-                        {
-                            emit_error_envelope(
-                                args.common.json,
-                                args.common.dry_run,
-                                "hosted_revert_failed",
-                                format!("failed to persist the hosted redirect ledger: {e}"),
-                            );
-                            return 1;
-                        }
                     }
                     if args.preserve_state && !leg.reverted.is_empty() {
                         if !args.common.silent && !args.common.json {
@@ -995,13 +1000,34 @@ pub async fn run(args: RemoveArgs) -> i32 {
                             }),
                         ));
                 }
+                // Any drift-kept entry means part of the requested removal
+                // did NOT happen: the run is a partialFailure (exit 1) even
+                // when sibling entries were removed.
+                if !vendor_kept_purls.is_empty() {
+                    env.status = Status::PartialFailure;
+                }
                 println!("{}", env.to_pretty_json());
             }
 
             if !args.common.dry_run {
                 track_patch_removed(removed.len(), api_token.as_deref(), org_slug.as_deref()).await;
             }
-            0
+            if vendor_kept_purls.is_empty() {
+                0
+            } else {
+                // Errors print even under --silent; the per-key drift-keep
+                // lines above are gated, so name the outcome once here.
+                if !args.common.json {
+                    eprintln!(
+                        "Error: {} matching entr{} drift-kept (vendored state and manifest \
+                         record retained); re-run `scan --mode vendored` to normalize, then \
+                         remove again",
+                        vendor_kept_purls.len(),
+                        if vendor_kept_purls.len() == 1 { "y was" } else { "ies were" }
+                    );
+                }
+                1
+            }
         }
         Err(e) => {
             track_patch_remove_failed(&e, api_token.as_deref(), org_slug.as_deref()).await;
@@ -1079,6 +1105,27 @@ async fn remove_hosted_only(
         replay_eligible,
     )
     .await;
+    // Persist FIRST, failure or not (see the main-flow hosted leg): the
+    // per-purl reverts already flushed lockfile writes, so the on-disk
+    // ledger must reflect them even when a later match failed.
+    if !args.common.dry_run
+        && (redirect_state.edits.len(), redirect_state.records.len()) != before
+    {
+        if let Err(e) = socket_patch_core::patch::redirect::persist_redirect_state(
+            &args.common.cwd,
+            &redirect_state,
+        )
+        .await
+        {
+            emit_error_envelope(
+                args.common.json,
+                args.common.dry_run,
+                "hosted_revert_failed",
+                format!("failed to persist the hosted redirect ledger: {e}"),
+            );
+            return 1;
+        }
+    }
     if !leg.unsupported.is_empty() {
         track_patch_remove_failed(
             "hosted redirect revert unsupported",
@@ -1109,25 +1156,6 @@ async fn remove_hosted_only(
         );
         return 1;
     }
-    if !args.common.dry_run
-        && (redirect_state.edits.len(), redirect_state.records.len()) != before
-    {
-        if let Err(e) = socket_patch_core::patch::redirect::persist_redirect_state(
-            &args.common.cwd,
-            &redirect_state,
-        )
-        .await
-        {
-            emit_error_envelope(
-                args.common.json,
-                args.common.dry_run,
-                "hosted_revert_failed",
-                format!("failed to persist the hosted redirect ledger: {e}"),
-            );
-            return 1;
-        }
-    }
-
     let mut env = Envelope::new(Command::Remove);
     env.dry_run = args.common.dry_run;
     let action = if args.common.dry_run {
