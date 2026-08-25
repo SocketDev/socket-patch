@@ -1263,10 +1263,15 @@ This syncs the workspace package version into:
 - `gem/socket-patch-bundler/socket-patch-bundler.gemspec` (the Bundler plugin gem)
 - `gem/socket-patch/socket-patch.gemspec` + its launcher `VERSION` (the RubyGems CLI launcher)
 
-All ecosystem publishing lives in the single **`.github/workflows/release.yml`** workflow:
-one dispatch publishes crates.io, npm, and PyPI plus the CLI launcher gem
-(`socket-patch` on RubyGems). The launcher-gem job is gated on the GitHub
-release — with its binaries and `SHA256SUMS` — existing.
+All ecosystem publishing fans out from the single
+**`.github/workflows/release.yml`** dispatch: one run publishes crates.io,
+npm, and PyPI plus the CLI launcher gem (`socket-patch` on RubyGems). Each
+registry leg lives in its own workflow
+(`.github/workflows/publish-{cargo,npm,pypi,rubygems}.yml`), dispatched at
+the release tag by the release run and also independently dispatchable to
+retry one registry against an existing release. The npm, PyPI, and
+launcher-gem legs are gated on the GitHub release — with its binaries and
+`SHA256SUMS` — existing.
 
 ## How the contract is enforced
 
