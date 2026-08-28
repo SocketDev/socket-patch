@@ -114,6 +114,7 @@ async fn scan_scrubbed(args: ScanArgs) -> i32 {
 
 fn default_args(cwd: &Path, api_url: String) -> ScanArgs {
     ScanArgs {
+        paths: Vec::new(),
         common: socket_patch_cli::args::GlobalArgs {
             cwd: cwd.to_path_buf(),
             org: Some(ORG.to_string()),

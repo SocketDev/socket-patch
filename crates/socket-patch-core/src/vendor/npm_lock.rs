@@ -29,7 +29,7 @@ use super::path::parse_vendor_path;
 use super::state::{
     write_marker, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
 };
-use super::{RevertOutcome, VendorOutcome, VendorWarning};
+use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorWarning};
 
 // Test-only re-imports: the helpers moved to `npm_common` but the existing
 // suite exercises them through `use super::*` and stays unmodified.
@@ -443,6 +443,21 @@ pub(super) async fn guard_unwired_textual_revert(
 /// Undo one vendored npm package: restore the recorded lock fragments and
 /// remove the artifact dir.
 pub async fn revert_npm(entry: &VendorEntry, project_root: &Path, dry_run: bool) -> RevertOutcome {
+    revert_npm_opts(entry, project_root, RevertOpts::new(dry_run)).await
+}
+
+/// [`revert_npm`] with full [`RevertOpts`]: `keep_artifact` skips the
+/// artifact deletion — and the refusals that exist only to protect it —
+/// while the wiring restore runs unchanged.
+pub async fn revert_npm_opts(
+    entry: &VendorEntry,
+    project_root: &Path,
+    opts: RevertOpts,
+) -> RevertOutcome {
+    let RevertOpts {
+        dry_run,
+        keep_artifact,
+    } = opts;
     // SECURITY: `entry.uuid` comes from the committed, tamper-able
     // state.json and names the directory tree we are about to DELETE.
     // Validate through the same fail-closed grammar vendor used before any
@@ -455,7 +470,9 @@ pub async fn revert_npm(entry: &VendorEntry, project_root: &Path, dry_run: bool)
     // only be removed when the lock provably no longer resolves through it —
     // otherwise refuse, fail-closed, instead of silently bricking installs.
     // Runs before the dry-run return so a preview never advertises a revert
-    // the wet run refuses (same precedent as the uuid guard above).
+    // the wet run refuses (same precedent as the uuid guard above). Skipped
+    // under `keep_artifact`: the refusal exists only to protect the
+    // deletion, which a preserve-state revert never performs.
     if entry.wiring.is_empty() {
         if let Some(blocked) = guard_unwired_textual_revert(
             project_root,
@@ -551,6 +568,14 @@ pub async fn revert_npm(entry: &VendorEntry, project_root: &Path, dry_run: bool)
     // deleting evidence out from under a lock we just refused to touch.
     if outcome.drift_skipped() {
         outcome.keep_artifact(&uuid_dir_rel);
+        return outcome;
+    }
+
+    // `--preserve-state` (`keep_artifact`): the wiring restore above already
+    // ran; the artifact dir stays behind (and the caller keeps the ledger
+    // entry), so the deletion — and the still-wired probe that exists only
+    // to protect it — are skipped.
+    if keep_artifact {
         return outcome;
     }
 

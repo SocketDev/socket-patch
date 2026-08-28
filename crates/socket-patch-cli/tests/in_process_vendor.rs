@@ -946,11 +946,32 @@ async fn vendored_npm_purl_skipped_even_without_installed_tree() {
 /// `not_found`.
 #[tokio::test]
 async fn vendored_purl_excluded_from_rollback() {
+    // v4 duality rework: `rollback` REVERTS vendored state by default —
+    // lock restored byte-for-byte, artifact + ledger entry gone, manifest
+    // entry removed. (The pre-v4 benign skip is what `--preserve-state`'s
+    // artifact/entry retention replaced.) Both the unscoped and the
+    // identifier-scoped spellings act; the fixture is re-vendored between
+    // them.
     let fx = npm_fixture();
-    assert_eq!(vendor_run(vendor_args(fx.root())).await, 0);
-    let lock_after_vendor = fx.lock_bytes();
-
+    // The default rollback now removes the manifest entry AND sweeps the
+    // now-unused blobs, and re-vendoring needs both back — snapshot the
+    // seeded manifest + blob store and restore them between iterations.
+    let seeded_manifest = std::fs::read(fx.manifest_path()).expect("seeded manifest");
+    let blobs_dir = fx.root().join(".socket").join("blobs");
+    let seeded_blobs: Vec<(std::ffi::OsString, Vec<u8>)> = std::fs::read_dir(&blobs_dir)
+        .expect("seeded blobs dir")
+        .map(|e| {
+            let e = e.expect("dir entry");
+            (e.file_name(), std::fs::read(e.path()).expect("blob bytes"))
+        })
+        .collect();
     for extra in [&[][..], &[PURL][..]] {
+        std::fs::write(fx.manifest_path(), &seeded_manifest).expect("re-seed manifest");
+        std::fs::create_dir_all(&blobs_dir).expect("blobs dir");
+        for (name, bytes) in &seeded_blobs {
+            std::fs::write(blobs_dir.join(name), bytes).expect("re-seed blob");
+        }
+        assert_eq!(vendor_run(vendor_args(fx.root())).await, 0);
         let mut argv = vec![
             "rollback",
             "--json",
@@ -963,28 +984,41 @@ async fn vendored_purl_excluded_from_rollback() {
         let out: Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
             panic!("rollback --json must emit JSON: {e}\nstdout:\n{stdout}\nstderr:\n{stderr}")
         });
-        assert_eq!(code, 0, "vendored-only rollback exits 0: {out:#}");
+        assert_eq!(code, 0, "vendored rollback exits 0: {out:#}");
         assert_eq!(out["status"], "success", "{out:#}");
         assert_eq!(
             out["vendored"],
-            json!([PURL]),
-            "vendored skip must be surfaced: {out:#}"
+            json!([]),
+            "no benign skip remains — the vendored leg acted: {out:#}"
         );
-        assert_eq!(out["rolledBack"], 0, "{out:#}");
+        assert_eq!(
+            out["vendoredReverted"],
+            json!([PURL]),
+            "the revert must be surfaced: {out:#}"
+        );
         assert_eq!(out["failed"], 0, "{out:#}");
-    }
+        assert_eq!(
+            out["manifest"]["removedEntries"],
+            json!([PURL]),
+            "the manifest entry leaves with the vendored state: {out:#}"
+        );
 
-    assert_eq!(
-        std::fs::read(fx.installed_index()).unwrap(),
-        ORIG_INDEX,
-        "rollback must not touch the installed tree of a vendored purl"
-    );
-    assert_eq!(
-        fx.lock_bytes(),
-        lock_after_vendor,
-        "rollback must not disturb the vendored lock wiring"
-    );
-    assert!(fx.tgz_path().is_file(), "artifact untouched");
+        assert_eq!(
+            std::fs::read(fx.installed_index()).unwrap(),
+            ORIG_INDEX,
+            "rollback must not touch the installed tree of a vendored purl"
+        );
+        assert_eq!(
+            fx.lock_bytes(),
+            fx.original_lock,
+            "the lock must be restored byte-for-byte"
+        );
+        assert!(!fx.tgz_path().is_file(), "artifact deleted");
+        assert!(!fx.state_path().is_file(), "emptied ledger deleted");
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(fx.manifest_path()).unwrap()).unwrap();
+        assert_eq!(manifest["patches"], json!({}), "manifest entry removed");
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -2378,6 +2412,7 @@ snapshots:
     /// `in_process_redirect_pnpm.rs` shape).
     fn hosted_args(cwd: &Path, api_url: String) -> ScanArgs {
         ScanArgs {
+            paths: Vec::new(),
             common: GlobalArgs {
                 cwd: cwd.to_path_buf(),
                 org: Some(ORG.to_string()),

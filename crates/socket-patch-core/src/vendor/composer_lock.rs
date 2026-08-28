@@ -50,7 +50,7 @@ use super::service_fetch::{fetch_verified_archive, ServiceArtifact};
 use super::state::{
     write_marker, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
 };
-use super::{RevertOutcome, VendorOutcome, VendorServiceConfig, VendorWarning};
+use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorServiceConfig, VendorWarning};
 
 /// Project-relative lockfile this backend wires.
 const COMPOSER_LOCK: &str = "composer.lock";
@@ -390,6 +390,21 @@ pub async fn revert_composer(
     project_root: &Path,
     dry_run: bool,
 ) -> RevertOutcome {
+    revert_composer_opts(entry, project_root, RevertOpts::new(dry_run)).await
+}
+
+/// [`revert_composer`] with full [`RevertOpts`]: `keep_artifact` skips the
+/// artifact deletion — and the stranded-wiring refusal that exists only to
+/// protect it — while the wiring restore runs unchanged.
+pub async fn revert_composer_opts(
+    entry: &VendorEntry,
+    project_root: &Path,
+    opts: RevertOpts,
+) -> RevertOutcome {
+    let RevertOpts {
+        dry_run,
+        keep_artifact,
+    } = opts;
     // SECURITY: state.json is committed and tamper-able; the uuid keys the
     // directory we are about to delete. Anything but the canonical uuid
     // grammar is rejected fail-closed before any disk access.
@@ -405,20 +420,25 @@ pub async fn revert_composer(
 
     // Nothing may be deleted while composer.lock still consumes it. Checked
     // BEFORE the restore loop (and before any write) so the answer is the
-    // same for `--dry-run` and a wet run.
-    let stranded = stranded_wired_packages(&lock_path, &entry.uuid, &restorable_keys(entry)).await;
-    if !stranded.is_empty() {
-        let listed = stranded.join(", ");
-        let args = stranded.join(" ");
-        return RevertOutcome::failed(format!(
-            "refusing revert: composer.lock still points {listed} at {uuid_dir_rel}, but the \
-             ledger entry records no pre-vendor lock fragment to restore (an entry \
-             reconstructed by `socket-patch repair` recovers the artifact, never the \
-             registry dist the surgery replaced). The vendored artifacts were LEFT IN \
-             PLACE so the project still installs. To undo the vendoring, re-resolve the \
-             package from the registry first (`composer update --no-install {args}`), then \
-             re-run `socket-patch vendor --revert`"
-        ));
+    // same for `--dry-run` and a wet run. Skipped under `keep_artifact`:
+    // the refusal exists only to protect the deletion, which a
+    // preserve-state revert never performs.
+    if !keep_artifact {
+        let stranded =
+            stranded_wired_packages(&lock_path, &entry.uuid, &restorable_keys(entry)).await;
+        if !stranded.is_empty() {
+            let listed = stranded.join(", ");
+            let args = stranded.join(" ");
+            return RevertOutcome::failed(format!(
+                "refusing revert: composer.lock still points {listed} at {uuid_dir_rel}, but the \
+                 ledger entry records no pre-vendor lock fragment to restore (an entry \
+                 reconstructed by `socket-patch repair` recovers the artifact, never the \
+                 registry dist the surgery replaced). The vendored artifacts were LEFT IN \
+                 PLACE so the project still installs. To undo the vendoring, re-resolve the \
+                 package from the registry first (`composer update --no-install {args}`), then \
+                 re-run `socket-patch vendor --revert`"
+            ));
+        }
     }
 
     // Wiring is restored in reverse application order (one record today).
@@ -450,7 +470,10 @@ pub async fn revert_composer(
         }
     }
 
-    if !dry_run {
+    // `--preserve-state` (`keep_artifact`): the artifact dir stays behind
+    // (and the caller keeps the ledger entry), so only the deletion is
+    // skipped.
+    if !dry_run && !keep_artifact {
         if let Err(e) = remove_tree(&uuid_dir).await {
             return RevertOutcome {
                 kept_artifact: false,

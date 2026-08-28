@@ -192,6 +192,7 @@ async fn run_missing_manifest_exits_one() {
         },
         identifier: "pkg:npm/foo@1".to_string(),
         skip_rollback: false,
+        preserve_state: false,
     };
     let exit = run(args).await;
     assert_eq!(exit, 1, "missing manifest must exit 1");
@@ -271,6 +272,7 @@ async fn run_removes_matching_patch_and_exits_zero() {
         // Skip rollback so we exercise the manifest-mutation path without
         // needing installed packages on disk.
         skip_rollback: true,
+        preserve_state: false,
     };
     let exit = run(args).await;
     assert_eq!(exit, 0, "removing an existing patch must exit 0");

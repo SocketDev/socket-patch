@@ -75,7 +75,7 @@ use super::service_fetch::{
 use super::state::{
     write_marker, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
 };
-use super::{RevertOutcome, VendorOutcome, VendorServiceConfig, VendorWarning};
+use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorServiceConfig, VendorWarning};
 
 const GEMFILE: &str = "Gemfile";
 const GEMFILE_LOCK: &str = "Gemfile.lock";
@@ -1076,6 +1076,21 @@ async fn materialise_patched_copy(
 /// `bundle update`, a newer vendor run — is left alone with a
 /// `vendor_lock_entry_drifted` warning.
 pub async fn revert_gem(entry: &VendorEntry, project_root: &Path, dry_run: bool) -> RevertOutcome {
+    revert_gem_opts(entry, project_root, RevertOpts::new(dry_run)).await
+}
+
+/// [`revert_gem`] with full [`RevertOpts`]: `keep_artifact` skips the
+/// artifact deletion — and the unwired refusal that exists only to protect
+/// it — while the wiring restore runs unchanged.
+pub async fn revert_gem_opts(
+    entry: &VendorEntry,
+    project_root: &Path,
+    opts: RevertOpts,
+) -> RevertOutcome {
+    let RevertOpts {
+        dry_run,
+        keep_artifact,
+    } = opts;
     // SECURITY: state.json is committed and tamper-able; the uuid keys the
     // directory we are about to delete. Anything but the canonical uuid
     // grammar is rejected fail-closed before any disk access.
@@ -1095,6 +1110,8 @@ pub async fn revert_gem(entry: &VendorEntry, project_root: &Path, dry_run: bool)
     // the removed dir and the next `bundle install` hard-fails. Refuse
     // loudly with the manual cleanup steps instead. (Every entry
     // `vendor_gem` records carries at least the Gemfile + lock records.)
+    // Skipped under `keep_artifact`: the refusal exists only to protect the
+    // deletion, which a preserve-state revert never performs.
     if entry.wiring.is_empty() {
         let name = parse_gem_purl(&entry.base_purl)
             .map(|(n, _)| n)
@@ -1152,7 +1169,10 @@ pub async fn revert_gem(entry: &VendorEntry, project_root: &Path, dry_run: bool)
         }
     }
 
-    if !dry_run {
+    // `--preserve-state` (`keep_artifact`): the artifact dir stays behind
+    // (and the caller keeps the ledger entry), so only the deletion is
+    // skipped.
+    if !dry_run && !keep_artifact {
         if let Err(e) = remove_tree(&uuid_dir).await {
             return RevertOutcome {
                 kept_artifact: false,

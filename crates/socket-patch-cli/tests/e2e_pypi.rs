@@ -331,7 +331,9 @@ fn test_pypi_full_lifecycle() {
     assert!(has_cve, "vulnerability list should include CVE-2026-25580");
 
     // -- ROLLBACK: restore original files ----------------------------------
-    assert_run_ok(cwd, &["rollback"], "rollback");
+    // --preserve-state keeps the manifest entry (+ blobs) so the re-apply
+    // below still has a record to work from; the v4 default removes both.
+    assert_run_ok(cwd, &["rollback", "--preserve-state"], "rollback");
 
     // Verify files are restored to their original state.
     for (rel_path, info) in files {

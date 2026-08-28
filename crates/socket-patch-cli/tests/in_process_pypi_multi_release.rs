@@ -291,6 +291,7 @@ async fn mount_view(
 
 fn scan_args(tmp: &Path, api_url: String, all_releases: bool) -> ScanArgs {
     ScanArgs {
+        paths: Vec::new(),
         common: socket_patch_cli::args::GlobalArgs {
             cwd: tmp.to_path_buf(),
             org: Some(ORG.to_string()),
@@ -517,6 +518,7 @@ async fn remove_base_purl_clears_all_variants_and_rolls_back() {
             ..socket_patch_cli::args::GlobalArgs::default()
         },
         skip_rollback: false,
+        preserve_state: false,
     };
     let code = remove_run(remove_args).await;
     assert_eq!(code, 0, "remove base PURL should succeed (exit 0)");
@@ -564,7 +566,8 @@ async fn rollback_all_over_broad_manifest_succeeds() {
     // this exited non-zero (HashMismatch on the two non-installed
     // variants against the single on-disk file).
     let rollback_args = RollbackArgs {
-        identifier: None,
+        targets: Vec::new(),
+        preserve_state: false,
         common: socket_patch_cli::args::GlobalArgs {
             cwd: tmp.path().to_path_buf(),
             org: Some(ORG.to_string()),

@@ -147,6 +147,18 @@ pub fn resolve_mode_flags(args: &mut ScanArgs) -> Result<(), String> {
     } else if args.apply || args.sync {
         args.mode = Some(ScanMode::Agent);
     }
+    if !args.paths.is_empty()
+        && matches!(args.mode, Some(ScanMode::Hosted) | Some(ScanMode::Vendored))
+    {
+        // Hosted/vendored consume root lockfiles (and, for vendored, the
+        // WHOLE manifest) — path scoping cannot mean anything coherent
+        // there. Same phrasing family as the conflicts above.
+        return Err(format!(
+            "path targeting cannot be used with --mode {}: it applies to \
+             agent-mode and read-only scans",
+            args.mode.expect("checked Some above").cli_name(),
+        ));
+    }
     if args.detached && args.mode != Some(ScanMode::Vendored) {
         // "required" phrasing matches clap's requires errors — the
         // scan_vendor_e2e contract test accepts exactly that shape.
@@ -160,6 +172,18 @@ pub fn resolve_mode_flags(args: &mut ScanArgs) -> Result<(), String> {
 
 #[derive(Args)]
 pub struct ScanArgs {
+    /// Optional path globs scoping DISCOVERY to packages installed under
+    /// matching paths (e.g. `packages/foo`, `apps/**`). A bare directory
+    /// pattern scopes its whole subtree. Scoping selects which PACKAGES
+    /// are considered; the prune universe (`--prune`/`--sync`) always
+    /// stays the full crawl, so a scoped scan never prunes out-of-scope
+    /// manifest entries. Lockfile-only and vendor-ledger supplements have
+    /// no installed path and are excluded from a path-scoped scan (a
+    /// run-level warning carries the count). Applies to agent-mode and
+    /// read-only scans; rejected with `--mode hosted`/`--mode vendored`
+    /// (their lockfile rewiring is whole-project by construction).
+    pub paths: Vec<String>,
+
     #[command(flatten)]
     pub common: GlobalArgs,
 
@@ -1199,12 +1223,12 @@ pub(super) async fn hosted_wiring_retained_purls(
     out
 }
 
-/// Detail for [`HOSTED_WIRING_RETAINED`]. Names the package(s) and the two
-/// real options — stay hosted, or migrate via the vendored flow (which
-/// reconciles the superseded ledger entries per package). It must never
-/// advise hand-deleting the redirect ledger (the only store of the
-/// pre-redirect originals plus the records VEX reads) and never promise a
-/// hosted→agent unwind that does not exist for npm/yarn.
+/// Detail for [`HOSTED_WIRING_RETAINED`]. Names the package(s) and the
+/// real options — stay hosted, migrate via the vendored flow (which
+/// reconciles the superseded ledger entries per package), or unwind via
+/// `rollback`. It must never advise hand-deleting the redirect ledger
+/// (the only store of the pre-redirect originals plus the records VEX
+/// reads).
 pub(super) fn hosted_wiring_retained_detail(retained: &[String]) -> String {
     let list = retained.join(", ");
     format!(
@@ -1212,15 +1236,16 @@ pub(super) fn hosted_wiring_retained_detail(retained: &[String]) -> String {
          The lockfile still resolves these package(s) to the hosted patch \
          server and `.socket/vendor/redirect-state.json` still records the \
          redirect — an agent run patches installed files in place but does \
-         NOT unwind hosted lockfile wiring (no hosted revert exists for \
-         this ecosystem yet), so installs keep fetching these package(s) \
-         from the patch server. Either keep the project in hosted mode \
-         (`scan --mode hosted`), or migrate to committed artifacts with \
-         `scan --mode vendored`, which takes these package(s) over in the \
-         lockfile and reconciles the superseded redirect ledger entries. \
-         Do not delete `.socket/vendor/redirect-state.json` by hand: it \
-         holds the recorded pre-redirect lockfile originals (the only \
-         revert data) and the redirect records VEX reads."
+         NOT unwind hosted lockfile wiring, so installs keep fetching \
+         these package(s) from the patch server. Either keep the project \
+         in hosted mode (`scan --mode hosted`), migrate to committed \
+         artifacts with `scan --mode vendored` (which takes these \
+         package(s) over in the lockfile and reconciles the superseded \
+         redirect ledger entries), or unwind the redirects with \
+         `socket-patch rollback`. Do not delete \
+         `.socket/vendor/redirect-state.json` by hand: it holds the \
+         recorded pre-redirect lockfile originals (the only revert data) \
+         and the redirect records VEX reads."
     )
 }
 
@@ -1336,6 +1361,16 @@ pub async fn run(mut args: ScanArgs) -> i32 {
         return 2;
     }
 
+    // Positional PATH globs (see `ScanArgs::paths`). An unparseable glob
+    // is a usage error, same exit-2 stderr shape as the mode conflicts.
+    let path_scope = match crate::path_scope::PathScope::parse(&args.paths) {
+        Ok(s) => s,
+        Err(message) => {
+            eprintln!("error: {message}");
+            return 2;
+        }
+    };
+
     // Strict airgap (CLI_CONTRACT.md `--offline`: never contact the
     // network; operations that need remote data fail loudly). Scan's
     // patch discovery IS remote data — proceeding would POST the crawled
@@ -1360,6 +1395,7 @@ pub async fn run(mut args: ScanArgs) -> i32 {
                 "canAccessPaidPatches": false,
                 "packages": [],
                 "updates": [],
+                "paths": path_scope.raw(),
             });
             println!(
                 "{}",
@@ -1486,11 +1522,17 @@ pub async fn run(mut args: ScanArgs) -> i32 {
             layout_refusals.push((code.to_string(), detail));
         }
     }
+    // Supplement purls, captured for the path-scope filter below: their
+    // `path` fields are fabricated placeholders, so a path-scoped scan
+    // excludes them (with a counted warning) instead of glob-matching
+    // meaningless paths.
+    let mut supplement_purls: HashSet<String> = HashSet::new();
     if !lockfile_only.packages.is_empty() {
         for pkg in &lockfile_only.packages {
             if let Some(eco) = Ecosystem::from_purl(&pkg.purl) {
                 *eco_counts.entry(eco).or_insert(0) += 1;
             }
+            supplement_purls.insert(pkg.purl.clone());
         }
         all_crawled.extend(lockfile_only.packages.iter().cloned());
     }
@@ -1499,6 +1541,7 @@ pub async fn run(mut args: ScanArgs) -> i32 {
         if let Some(eco) = Ecosystem::from_purl(&pkg.purl) {
             *eco_counts.entry(eco).or_insert(0) += 1;
         }
+        supplement_purls.insert(pkg.purl.clone());
     }
     all_crawled.extend(ledger_supplement);
 
@@ -1535,6 +1578,39 @@ pub async fn run(mut args: ScanArgs) -> i32 {
             .collect()
     } else {
         all_crawled
+    };
+
+    // PATH scoping — applied strictly AFTER the `scanned_purls` capture
+    // above (the prune universe stays full-crawl: `scan PATHS --prune`
+    // must never treat out-of-scope packages as uninstalled) and after the
+    // `--ecosystems` filter. A purl is in scope when ANY genuinely-crawled
+    // copy of it sits under a matching path.
+    let filtered_crawled: Vec<_> = if path_scope.is_empty() {
+        filtered_crawled
+    } else {
+        let excluded_supplements = filtered_crawled
+            .iter()
+            .filter(|pkg| supplement_purls.contains(&pkg.purl))
+            .count();
+        if excluded_supplements > 0 {
+            layout_refusals.push((
+                "path_scope_excluded_supplements".to_string(),
+                format!(
+                    "{excluded_supplements} lockfile-only/vendor-ledger package(s) have \
+                     no installed path and were excluded from the path-scoped scan"
+                ),
+            ));
+        }
+        let in_scope: HashSet<String> = filtered_crawled
+            .iter()
+            .filter(|pkg| !supplement_purls.contains(&pkg.purl))
+            .filter(|pkg| path_scope.matches(&args.common.cwd, &pkg.path))
+            .map(|pkg| pkg.purl.clone())
+            .collect();
+        filtered_crawled
+            .into_iter()
+            .filter(|pkg| in_scope.contains(&pkg.purl))
+            .collect()
     };
 
     let all_purls: Vec<String> = filtered_crawled.iter().map(|p| p.purl.clone()).collect();
@@ -1582,6 +1658,7 @@ pub async fn run(mut args: ScanArgs) -> i32 {
                 "canAccessPaidPatches": false,
                 "packages": [],
                 "updates": [],
+                "paths": path_scope.raw(),
             });
             // PnP layout refusals: additive top-level `warnings` (omitted
             // when empty — run-level warnings precedent) so a JSON consumer
@@ -1807,6 +1884,7 @@ pub async fn run(mut args: ScanArgs) -> i32 {
                 "canAccessPaidPatches": false,
                 "packages": [],
                 "updates": [],
+                "paths": path_scope.raw(),
             });
             println!(
                 "{}",
@@ -1937,6 +2015,7 @@ pub async fn run(mut args: ScanArgs) -> i32 {
             "paidPatches": paid_patches,
             "canAccessPaidPatches": can_access_paid_patches,
             "packages": all_packages_with_patches,
+            "paths": path_scope.raw(),
             "updates": updates.iter().map(|u| serde_json::json!({
                 "purl": u.purl,
                 "oldUuid": u.old_uuid,

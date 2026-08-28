@@ -66,15 +66,18 @@ pub fn redirect_revert_supported(purl: &str) -> bool {
 /// drop that purl's record and edits from `state`. The caller persists the
 /// mutated ledger (see `persist_redirect_state`). Dispatches per ecosystem;
 /// purls outside [`redirect_revert_supported`] are refused (fail closed).
+/// `dry_run` resolves every inverse and drift check exactly like a wet run
+/// but writes nothing and leaves `state` untouched.
 pub async fn revert_redirect_purl(
     project_root: &Path,
     state: &mut RedirectState,
     purl: &str,
+    dry_run: bool,
 ) -> Result<RedirectRevert, String> {
     if purl.starts_with("pkg:cargo/") {
-        revert_cargo_redirect_purl(project_root, state, purl).await
+        revert_cargo_redirect_purl(project_root, state, purl, dry_run).await
     } else if purl.starts_with("pkg:npm/") {
-        revert_npm_redirect_purl(project_root, state, purl).await
+        revert_npm_redirect_purl(project_root, state, purl, dry_run).await
     } else {
         Err(format!(
             "no hosted-redirect revert implementation for {purl}"
@@ -150,10 +153,13 @@ async fn flush_staged(project_root: &Path, staged: &Staged) -> Result<(), String
 /// `original`, and an intermediate edit whose `original` is already live is a
 /// no-op. `[registries.socket-patch-…]` blocks tied to this purl's uuids are
 /// removed only when nothing in Cargo.toml / Cargo.lock still references them.
+/// `dry_run` resolves every inverse and drift check exactly like a wet run
+/// but writes nothing and leaves `state` untouched.
 pub async fn revert_cargo_redirect_purl(
     project_root: &Path,
     state: &mut RedirectState,
     purl: &str,
+    dry_run: bool,
 ) -> Result<RedirectRevert, String> {
     let canon = |p: &str| normalize_purl(strip_purl_qualifiers(p)).into_owned();
     let target = canon(purl);
@@ -311,8 +317,15 @@ pub async fn revert_cargo_redirect_purl(
     }
 
     // Every inverse resolved — only now does any of it reach disk, so a
-    // refusal above left the project exactly as it was found.
-    flush_staged(project_root, &staged).await?;
+    // refusal above left the project exactly as it was found. A dry run
+    // skips ONLY the disk flush: the in-memory ledger mutation below still
+    // happens, so composed previews (the whole-ledger replay running after
+    // the per-purl reverts inside one rollback) see exactly the state a
+    // wet run would hand them. The caller owns the state clone and never
+    // persists it on a dry run, so nothing durable changes.
+    if !dry_run {
+        flush_staged(project_root, &staged).await?;
+    }
 
     // Only after every inverse applied cleanly: drop this purl's edits and
     // record from the ledger (the caller persists it).
@@ -350,11 +363,14 @@ const NPM_TEXT_KINDS: [&str; 3] = [
 /// Same fail-closed contract as [`revert_cargo_redirect_purl`]: every inverse
 /// is resolved against a staged view and NOTHING reaches disk until all of
 /// them have resolved, so a drift refusal leaves the project byte-identical
-/// across ALL the files the ledger claims.
+/// across ALL the files the ledger claims. `dry_run` resolves every inverse
+/// and drift check exactly like a wet run but writes nothing and leaves
+/// `state` untouched.
 pub async fn revert_npm_redirect_purl(
     project_root: &Path,
     state: &mut RedirectState,
     purl: &str,
+    dry_run: bool,
 ) -> Result<RedirectRevert, String> {
     let canon = |p: &str| normalize_purl(strip_purl_qualifiers(p)).into_owned();
     let target = canon(purl);
@@ -523,8 +539,15 @@ pub async fn revert_npm_redirect_purl(
     }
 
     // Every inverse resolved — only now does any of it reach disk, so a
-    // refusal above left the project exactly as it was found.
-    flush_staged(project_root, &staged).await?;
+    // refusal above left the project exactly as it was found. A dry run
+    // skips ONLY the disk flush: the in-memory ledger mutation below still
+    // happens, so composed previews (the whole-ledger replay running after
+    // the per-purl reverts inside one rollback) see exactly the state a
+    // wet run would hand them. The caller owns the state clone and never
+    // persists it on a dry run, so nothing durable changes.
+    if !dry_run {
+        flush_staged(project_root, &staged).await?;
+    }
 
     // Only after every inverse applied cleanly: drop this purl's edits and
     // record from the ledger (the caller persists it).
@@ -816,7 +839,7 @@ mod tests {
             .unwrap();
         assert!(toml.contains("socket-patch-"), "{toml}");
 
-        let out = revert_cargo_redirect_purl(root, &mut state, PURL)
+        let out = revert_cargo_redirect_purl(root, &mut state, PURL, false)
             .await
             .expect("revert succeeds");
         assert!(!out.reverted_files.is_empty());
@@ -852,7 +875,7 @@ mod tests {
             .await
             .unwrap();
 
-        revert_cargo_redirect_purl(root, &mut state, PURL)
+        revert_cargo_redirect_purl(root, &mut state, PURL, false)
             .await
             .expect("revert succeeds");
         let cfg = tokio::fs::read_to_string(&cfg_path).await.unwrap();
@@ -874,7 +897,7 @@ mod tests {
         let records_before = state.records.len();
         let edits_before = state.edits.len();
 
-        let err = revert_cargo_redirect_purl(root, &mut state, PURL)
+        let err = revert_cargo_redirect_purl(root, &mut state, PURL, false)
             .await
             .expect_err("drifted lock must refuse");
         assert!(err.contains("drifted"), "{err}");
@@ -910,7 +933,7 @@ mod tests {
             "fixture is hosted-wired: {lock_before}"
         );
 
-        let err = revert_cargo_redirect_purl(root, &mut state, PURL)
+        let err = revert_cargo_redirect_purl(root, &mut state, PURL, false)
             .await
             .expect_err("drifted manifest must refuse");
         assert!(err.contains("drifted"), "{err}");
@@ -944,10 +967,93 @@ mod tests {
     async fn missing_record_is_an_error() {
         let tmp = tempfile::tempdir().unwrap();
         let mut state = RedirectState::new();
-        let err = revert_cargo_redirect_purl(tmp.path(), &mut state, PURL)
+        let err = revert_cargo_redirect_purl(tmp.path(), &mut state, PURL, false)
             .await
             .expect_err("no record");
         assert!(err.contains("records no hosted redirect"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn dry_run_previews_the_wet_summary_without_touching_disk_or_ledger() {
+        let (tmp, mut state) = redirected_fixture().await;
+        let root = tmp.path();
+        let toml_before = tokio::fs::read_to_string(root.join("Cargo.toml"))
+            .await
+            .unwrap();
+        let lock_before = tokio::fs::read_to_string(root.join("Cargo.lock"))
+            .await
+            .unwrap();
+        let cfg_before = tokio::fs::read_to_string(root.join(".cargo/config.toml"))
+            .await
+            .unwrap();
+        let records_before = state.records.len();
+        let edits_before = state.edits.len();
+
+        let dry = revert_cargo_redirect_purl(root, &mut state, PURL, true)
+            .await
+            .expect("dry-run revert succeeds");
+
+        // Nothing reached disk and the ledger still claims everything.
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("Cargo.toml"))
+                .await
+                .unwrap(),
+            toml_before,
+            "Cargo.toml untouched"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("Cargo.lock"))
+                .await
+                .unwrap(),
+            lock_before,
+            "Cargo.lock untouched"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(".cargo/config.toml"))
+                .await
+                .unwrap(),
+            cfg_before,
+            ".cargo/config.toml untouched"
+        );
+        // The IN-MEMORY ledger is claimed exactly like a wet run (composed
+        // previews — the whole-ledger replay running after per-purl
+        // reverts — must see the post-claim state); the caller owns the
+        // clone and never persists it on a dry run.
+        assert!(state.records.len() < records_before, "record claimed in memory");
+        assert!(state.edits.len() < edits_before, "edits claimed in memory");
+
+        // The preview names exactly the files a wet run then reverts —
+        // re-run wet on a FRESH state clone of the same fixture.
+        let (tmp2, mut state2) = redirected_fixture().await;
+        let root = tmp2.path();
+        let wet = revert_cargo_redirect_purl(root, &mut state2, PURL, false)
+            .await
+            .expect("wet revert succeeds");
+        assert_eq!(dry.reverted_files, wet.reverted_files);
+    }
+
+    #[tokio::test]
+    async fn dry_run_still_fail_closes_on_drift() {
+        let (tmp, mut state) = redirected_fixture().await;
+        let root = tmp.path();
+        // Same drift as the wet refusal above: a third party re-resolved the
+        // lock to a shape the ledger never saw.
+        tokio::fs::write(
+            root.join("Cargo.lock"),
+            "version = 4\n\n[[package]]\nname = \"cfg-if\"\nversion = \"1.0.4\"\nsource = \"registry+https://corp.example/index\"\n",
+        )
+        .await
+        .unwrap();
+        let records_before = state.records.len();
+        let edits_before = state.edits.len();
+
+        let err = revert_cargo_redirect_purl(root, &mut state, PURL, true)
+            .await
+            .expect_err("drifted lock must refuse on a dry run too");
+        assert!(err.contains("drifted"), "{err}");
+        // The ledger keeps everything on refusal.
+        assert_eq!(state.records.len(), records_before);
+        assert_eq!(state.edits.len(), edits_before);
     }
 
     // ── npm family ───────────────────────────────────────────────────────
@@ -1078,7 +1184,7 @@ mod tests {
             .unwrap();
         assert!(wired.contains(NPM_URL), "fixture is hosted-wired: {wired}");
 
-        let out = revert_redirect_purl(root, &mut state, NPM_PURL)
+        let out = revert_redirect_purl(root, &mut state, NPM_PURL, false)
             .await
             .expect("revert succeeds");
         assert_eq!(out.reverted_files, vec!["yarn.lock".to_string()]);
@@ -1105,7 +1211,7 @@ mod tests {
             "fixture is hosted-wired: {wired}"
         );
 
-        revert_redirect_purl(root, &mut state, NPM_PURL)
+        revert_redirect_purl(root, &mut state, NPM_PURL, false)
             .await
             .expect("revert succeeds");
         assert_eq!(
@@ -1130,7 +1236,7 @@ mod tests {
             .unwrap();
         assert!(wired.contains(NPM_URL), "fixture is hosted-wired: {wired}");
 
-        revert_npm_redirect_purl(root, &mut state, NPM_PURL)
+        revert_npm_redirect_purl(root, &mut state, NPM_PURL, false)
             .await
             .expect("revert succeeds");
         assert_eq!(
@@ -1222,7 +1328,7 @@ mod tests {
             "both instances hosted-wired: {wired}"
         );
 
-        revert_npm_redirect_purl(root, &mut state, NPM_PURL)
+        revert_npm_redirect_purl(root, &mut state, NPM_PURL, false)
             .await
             .expect("revert succeeds");
         assert_eq!(
@@ -1253,7 +1359,7 @@ mod tests {
             state.edits
         );
 
-        revert_npm_redirect_purl(root, &mut state, NPM_PURL)
+        revert_npm_redirect_purl(root, &mut state, NPM_PURL, false)
             .await
             .expect("revert succeeds");
         assert_eq!(
@@ -1316,7 +1422,7 @@ mod tests {
             ))),
         });
 
-        revert_npm_redirect_purl(root, &mut state, NPM_PURL)
+        revert_npm_redirect_purl(root, &mut state, NPM_PURL, false)
             .await
             .expect("takeover of 1.3.0 succeeds without touching 1.3.0-rc1");
 
@@ -1411,7 +1517,7 @@ mod tests {
             .unwrap();
         assert!(wired.contains(NPM_URL) && wired.contains(&sibling_url));
 
-        revert_npm_redirect_purl(root, &mut state, NPM_PURL)
+        revert_npm_redirect_purl(root, &mut state, NPM_PURL, false)
             .await
             .expect("takeover of 1.3.0 succeeds without touching 1.2.0");
 
@@ -1441,7 +1547,7 @@ mod tests {
         );
 
         // The sibling's own takeover still round-trips the file to pristine.
-        revert_npm_redirect_purl(root, &mut state, sibling_purl)
+        revert_npm_redirect_purl(root, &mut state, sibling_purl, false)
             .await
             .expect("takeover of 1.2.0 succeeds");
         assert_eq!(
@@ -1506,7 +1612,7 @@ mod tests {
         assert_eq!(state.edits.len(), 3, "{:?}", state.edits);
         let other_url = npm_dep_for("other", "1.3.0").artifact_url.clone();
 
-        revert_npm_redirect_purl(root, &mut state, NPM_PURL)
+        revert_npm_redirect_purl(root, &mut state, NPM_PURL, false)
             .await
             .expect("takeover of left-pad succeeds without touching `other`");
 
@@ -1533,7 +1639,7 @@ mod tests {
             state.edits
         );
 
-        revert_npm_redirect_purl(root, &mut state, other_purl)
+        revert_npm_redirect_purl(root, &mut state, other_purl, false)
             .await
             .expect("takeover of other succeeds");
         assert_eq!(
@@ -1590,7 +1696,7 @@ mod tests {
         .unwrap();
         let edits_before = state.edits.len();
 
-        let err = revert_npm_redirect_purl(root, &mut state, NPM_PURL)
+        let err = revert_npm_redirect_purl(root, &mut state, NPM_PURL, false)
             .await
             .expect_err("vanished entry must refuse");
         assert!(err.contains("no longer exists"), "{err}");
@@ -1613,7 +1719,7 @@ mod tests {
         let records_before = state.records.len();
         let edits_before = state.edits.len();
 
-        let err = revert_npm_redirect_purl(root, &mut state, NPM_PURL)
+        let err = revert_npm_redirect_purl(root, &mut state, NPM_PURL, false)
             .await
             .expect_err("drifted lock must refuse");
         assert!(err.contains("drifted"), "{err}");
@@ -1632,7 +1738,7 @@ mod tests {
     async fn npm_missing_record_is_an_error() {
         let tmp = tempfile::tempdir().unwrap();
         let mut state = RedirectState::new();
-        let err = revert_npm_redirect_purl(tmp.path(), &mut state, NPM_PURL)
+        let err = revert_npm_redirect_purl(tmp.path(), &mut state, NPM_PURL, false)
             .await
             .expect_err("no record");
         assert!(err.contains("records no hosted redirect"), "{err}");
@@ -1658,7 +1764,7 @@ mod tests {
                 "    \"left-pad\": [\"left-pad@{NPM_URL}\", {{}}, \"sha512-h==\"],"
             ))),
         });
-        let err = revert_npm_redirect_purl(tmp.path(), &mut state, NPM_PURL)
+        let err = revert_npm_redirect_purl(tmp.path(), &mut state, NPM_PURL, false)
             .await
             .expect_err("bun edits must refuse");
         assert!(err.contains("bun.lock"), "{err}");

@@ -596,6 +596,29 @@ pub enum VendorOutcome {
     },
 }
 
+/// Options for a vendored revert (one backend `revert_*_opts` call).
+#[derive(Debug, Clone, Copy)]
+pub struct RevertOpts {
+    /// Preview only — no file writes, no artifact deletion.
+    pub dry_run: bool,
+    /// Restore the lockfile wiring but KEEP the artifact directory (and the
+    /// caller keeps the ledger entry) — `rollback/remove --preserve-state`.
+    /// Never sets [`RevertOutcome::kept_artifact`], which stays reserved for
+    /// drift-keeps.
+    pub keep_artifact: bool,
+}
+
+impl RevertOpts {
+    /// The classic revert shape every `dry_run: bool` caller used: the
+    /// artifact directory is deleted on a successful wet revert.
+    pub fn new(dry_run: bool) -> Self {
+        Self {
+            dry_run,
+            keep_artifact: false,
+        }
+    }
+}
+
 /// The result of one backend `revert_*` call.
 #[derive(Debug)]
 pub struct RevertOutcome {

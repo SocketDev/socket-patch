@@ -25,8 +25,10 @@ use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::vendor::yarn_berry_lock::yarnrc_compression_level;
 
 pub mod golang_local;
+mod replay;
 mod state;
 mod takeover;
+pub use replay::{revert_remaining_redirect_edits, GroupRefusal, ReplayOutcome};
 pub use state::{
     drop_superseded_purl, load_redirect_state, persist_redirect_state, save_redirect_state,
     CorruptRedirectState, RedirectState, REDIRECT_STATE_REL,

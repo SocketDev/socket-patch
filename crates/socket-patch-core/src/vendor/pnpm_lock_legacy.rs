@@ -77,7 +77,7 @@ use super::pnpm_lock::{
 use super::state::{
     write_marker, PnpmMeta, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
 };
-use super::{RevertOutcome, VendorOutcome, VendorWarning};
+use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorWarning};
 
 const PACKAGE_JSON: &str = "package.json";
 const PNPM_LOCK: &str = "pnpm-lock.yaml";
@@ -1194,6 +1194,21 @@ pub async fn revert_pnpm_legacy(
     project_root: &Path,
     dry_run: bool,
 ) -> RevertOutcome {
+    revert_pnpm_legacy_opts(entry, project_root, RevertOpts::new(dry_run)).await
+}
+
+/// [`revert_pnpm_legacy`] with full [`RevertOpts`]: `keep_artifact` skips
+/// the artifact deletion — and the refusals that exist only to protect it —
+/// while the wiring restore runs unchanged.
+pub async fn revert_pnpm_legacy_opts(
+    entry: &VendorEntry,
+    project_root: &Path,
+    opts: RevertOpts,
+) -> RevertOutcome {
+    let RevertOpts {
+        dry_run,
+        keep_artifact,
+    } = opts;
     let uuid_dir_rel = match guard_revert_uuid_dir(&entry.uuid) {
         Ok(d) => d,
         Err(outcome) => return outcome,
@@ -1201,7 +1216,9 @@ pub async fn revert_pnpm_legacy(
     // Nothing to replay (a `repair`-reconstructed entry): refuse the
     // artifact removal while the legacy lock still resolves through it —
     // fail-closed, before the dry-run return, exactly like the v9 backend
-    // (see [`super::pnpm_lock::guard_unwired_revert`]).
+    // (see [`super::pnpm_lock::guard_unwired_revert`]). Skipped under
+    // `keep_artifact`: the refusal exists only to protect the deletion,
+    // which a preserve-state revert never performs.
     if entry.wiring.is_empty() {
         let in_use = pnpm_legacy_entry_in_use(entry, project_root).await;
         if let Some(blocked) = guard_unwired_revert(project_root, in_use, &uuid_dir_rel).await {
@@ -1363,8 +1380,13 @@ pub async fn revert_pnpm_legacy(
         return outcome;
     }
 
-    if let Err(e) = remove_tree(&project_root.join(&uuid_dir_rel)).await {
-        return RevertOutcome::failed(format!("cannot remove {uuid_dir_rel}: {e}"));
+    // `--preserve-state` (`keep_artifact`): the wiring restore above already
+    // ran; the artifact dir stays behind (and the caller keeps the ledger
+    // entry), so only the deletion is skipped.
+    if !keep_artifact {
+        if let Err(e) = remove_tree(&project_root.join(&uuid_dir_rel)).await {
+            return RevertOutcome::failed(format!("cannot remove {uuid_dir_rel}: {e}"));
+        }
     }
     outcome
 }

@@ -40,6 +40,7 @@ fn bool_flags(a: &RollbackArgs) -> Vec<(&'static str, bool)> {
         ("debug", a.common.debug),
         ("no_telemetry", a.common.no_telemetry),
         ("one_off", a.one_off),
+        ("preserve_state", a.preserve_state),
     ]
 }
 
@@ -61,7 +62,8 @@ fn assert_only_true(a: &RollbackArgs, expected_true: &[&str]) {
 #[test]
 fn defaults_no_positional() {
     let args = parse_rollback(&[]);
-    assert_eq!(args.identifier, None);
+    assert!(args.targets.is_empty());
+    assert!(!args.preserve_state);
     assert_eq!(args.common.cwd, PathBuf::from("."));
     assert!(!args.common.dry_run);
     assert!(!args.common.silent);
@@ -91,15 +93,15 @@ fn defaults_no_positional() {
 fn positional_identifier_uuid() {
     let args = parse_rollback(&["80630680-4da6-45f9-bba8-b888e0ffd58c"]);
     assert_eq!(
-        args.identifier,
-        Some("80630680-4da6-45f9-bba8-b888e0ffd58c".to_string())
+        args.targets,
+        vec!["80630680-4da6-45f9-bba8-b888e0ffd58c".to_string()]
     );
 }
 
 #[test]
 fn positional_identifier_purl() {
     let args = parse_rollback(&["pkg:npm/foo@1"]);
-    assert_eq!(args.identifier, Some("pkg:npm/foo@1".to_string()));
+    assert_eq!(args.targets, vec!["pkg:npm/foo@1".to_string()]);
 }
 
 #[test]
@@ -222,7 +224,7 @@ fn ecosystems_csv_split() {
 #[test]
 fn positional_plus_flags() {
     let args = parse_rollback(&["pkg:npm/foo@1", "--dry-run", "--json"]);
-    assert_eq!(args.identifier, Some("pkg:npm/foo@1".to_string()));
+    assert_eq!(args.targets, vec!["pkg:npm/foo@1".to_string()]);
     assert!(args.common.dry_run);
     assert!(args.common.json);
     // Exactly these two flags — nothing else rode along on the combination.
@@ -316,6 +318,7 @@ fn all_bools_settable_together() {
         "--debug",
         "--no-telemetry",
         "--one-off",
+        "--preserve-state",
     ]);
     assert_only_true(
         &args,
@@ -330,6 +333,7 @@ fn all_bools_settable_together() {
             "debug",
             "no_telemetry",
             "one_off",
+            "preserve_state",
         ],
     );
 }
@@ -363,20 +367,45 @@ fn all_short_flags_map_to_distinct_fields() {
 fn bare_bool_does_not_consume_next_token() {
     let args = parse_rollback(&["--one-off", "pkg:npm/foo@1"]);
     assert!(args.one_off);
-    // The trailing token landed in `identifier`, not as a value for `--one-off`.
-    assert_eq!(args.identifier, Some("pkg:npm/foo@1".to_string()));
+    // The trailing token landed in `targets`, not as a value for `--one-off`.
+    assert_eq!(args.targets, vec!["pkg:npm/foo@1".to_string()]);
     assert_only_true(&args, &["one_off"]);
 }
 
-/// A second positional is rejected — `identifier` takes exactly one value, so
-/// a stray extra arg must not be silently swallowed.
+/// Variadic targets (v4 duality rework): multiple positionals parse in
+/// order. Before v4 a second positional was an UnknownArgument error —
+/// pinned here as a DELIBERATE contract change (MAJOR), so wrappers that
+/// relied on the rejection get a test-visible flip instead of a silent one.
 #[test]
-fn second_positional_fails() {
-    let err = match Cli::try_parse_from(["socket-patch", "rollback", "a", "b"]) {
-        Ok(_) => panic!("expected parse failure for extra positional"),
-        Err(e) => e,
-    };
-    assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+fn multiple_targets_parse_in_order() {
+    let args = parse_rollback(&["pkg:npm/foo@1", "packages/api/**", "b0630680-4da6-45f9-bba8-b888e0ffd58c"]);
+    assert_eq!(
+        args.targets,
+        vec![
+            "pkg:npm/foo@1".to_string(),
+            "packages/api/**".to_string(),
+            "b0630680-4da6-45f9-bba8-b888e0ffd58c".to_string(),
+        ]
+    );
+    assert_only_true(&args, &[]);
+}
+
+/// `--preserve-state` parses and flips only its own field.
+#[test]
+fn preserve_state_long() {
+    let args = parse_rollback(&["--preserve-state"]);
+    assert!(args.preserve_state);
+    assert_only_true(&args, &["preserve_state"]);
+}
+
+/// `--preserve-state` composes with targets: the flag never consumes the
+/// following token.
+#[test]
+fn preserve_state_does_not_consume_next_token() {
+    let args = parse_rollback(&["--preserve-state", "pkg:npm/foo@1"]);
+    assert!(args.preserve_state);
+    assert_eq!(args.targets, vec!["pkg:npm/foo@1".to_string()]);
+    assert_only_true(&args, &["preserve_state"]);
 }
 
 #[test]

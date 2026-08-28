@@ -1,18 +1,21 @@
 use clap::Args;
 use socket_patch_core::api::client::get_api_client_with_overrides;
-use socket_patch_core::manifest::cleanup_blobs::{cleanup_unused_blobs, format_cleanup_result};
+use socket_patch_core::manifest::cleanup_blobs::{
+    cleanup_unused_archives, cleanup_unused_blobs, format_cleanup_result,
+};
 use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
-use socket_patch_core::manifest::schema::{PatchFileInfo, PatchManifest};
+use socket_patch_core::manifest::schema::PatchManifest;
 use socket_patch_core::telemetry::{track_patch_remove_failed, track_patch_removed};
-use socket_patch_core::utils::purl::purl_matches_identifier;
+use socket_patch_core::utils::purl::{purl_matches_identifier, strip_purl_qualifiers};
 use socket_patch_core::vendor::{load_state, save_state, VendorEntry, VendorState};
 use std::path::Path;
 use std::time::Duration;
 
 use super::get::short_uuid;
-use super::rollback::{all_files_already_original, rollback_patches};
-use super::vendor::dispatch_revert_one;
+use super::rollback::{all_files_already_original, pin_before_hash_blobs, rollback_patches};
+use super::vendor::{dispatch_revert_one, dispatch_revert_one_opts};
 use crate::args::{apply_env_toggles, GlobalArgs};
+use socket_patch_core::vendor::RevertOpts;
 use crate::commands::lock_cli::acquire_or_emit;
 use crate::json_envelope::{Command, Envelope, EnvelopeError, PatchAction, PatchEvent, Status};
 use crate::output::confirm;
@@ -107,10 +110,38 @@ pub struct RemoveArgs {
         value_parser = crate::args::parse_bool_flag,
     )]
     pub skip_rollback: bool,
+
+    /// Restore the system (files and lockfiles) but PRESERVE the local
+    /// patch state for a later re-apply: the manifest entry is kept,
+    /// vendored artifacts and their ledger entries are kept (only the
+    /// lockfile wiring is reverted), and no blob/archive cleanup runs —
+    /// the single-patch twin of `rollback --preserve-state`. Conflicts
+    /// with `--skip-rollback` (keeping the tree AND the state would be a
+    /// no-op).
+    #[arg(
+        long = "preserve-state",
+        env = "SOCKET_PRESERVE_STATE",
+        default_value_t = false,
+        value_parser = crate::args::parse_bool_flag,
+    )]
+    pub preserve_state: bool,
 }
 
 pub async fn run(args: RemoveArgs) -> i32 {
     apply_env_toggles(&args.common);
+
+    // Self-enforced usage error (exit 2, like scan's mode conflicts):
+    // `--skip-rollback` keeps the tree and drops the state,
+    // `--preserve-state` restores the tree and keeps the state — together
+    // they select the do-nothing quadrant.
+    if args.preserve_state && args.skip_rollback {
+        eprintln!(
+            "error: --preserve-state cannot be used with --skip-rollback: the \
+             combination would be a no-op (nothing would change)"
+        );
+        return 2;
+    }
+
     let (telemetry_client, _) =
         get_api_client_with_overrides(args.common.api_client_overrides()).await;
     let api_token = telemetry_client.api_token().cloned();
@@ -134,7 +165,21 @@ pub async fn run(args: RemoveArgs) -> i32 {
                     .any(|(_, e)| e.detached)
             })
             .unwrap_or(false);
-        if !has_detached_match {
+        // Hosted redirects likewise live outside the manifest (the
+        // redirect ledger is the only persistence), so a hosted-only
+        // project's `remove` proceeds manifest-less too.
+        let has_hosted_match = socket_patch_core::patch::redirect::load_redirect_state(
+            &args.common.cwd,
+        )
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|st| {
+            st.records
+                .iter()
+                .any(|(purl, rec)| patch_matches(purl, &rec.uuid, &args.identifier))
+        });
+        if !has_detached_match && !has_hosted_match {
             emit_error_envelope(
                 args.common.json,
                 args.common.dry_run,
@@ -225,6 +270,33 @@ pub async fn run(args: RemoveArgs) -> i32 {
             .await;
         }
 
+        // Hosted-only patches likewise have no manifest entry — the
+        // redirect ledger is their only persistence, and `remove` is
+        // their per-purl exit path (the unwind IS the removal). An
+        // unreadable ledger falls through to `not_found`: nothing is
+        // mutated on that path.
+        if let Ok(Some(redirect_state)) =
+            socket_patch_core::patch::redirect::load_redirect_state(&args.common.cwd).await
+        {
+            let mut hosted_matches: Vec<String> = redirect_state
+                .records
+                .iter()
+                .filter(|(purl, rec)| patch_matches(purl, &rec.uuid, &args.identifier))
+                .map(|(purl, _)| purl.clone())
+                .collect();
+            hosted_matches.sort();
+            if !hosted_matches.is_empty() {
+                return remove_hosted_only(
+                    &args,
+                    hosted_matches,
+                    redirect_state,
+                    api_token.as_deref(),
+                    org_slug.as_deref(),
+                )
+                .await;
+            }
+        }
+
         emit_not_found(
             args.common.json,
             args.common.dry_run,
@@ -267,7 +339,14 @@ pub async fn run(args: RemoveArgs) -> i32 {
     // `--dry-run` previews without mutating, so there is nothing to
     // confirm — skip the prompt (matching the global contract row:
     // "Preview, no mutations").
-    let prompt = format!("Remove {} patch(es) and rollback files?", matching.len());
+    let prompt = if args.preserve_state {
+        format!(
+            "Rollback files for {} patch(es)? (patch records will be preserved)",
+            matching.len()
+        )
+    } else {
+        format!("Remove {} patch(es) and rollback files?", matching.len())
+    };
     if !args.common.dry_run && !confirm(&prompt, true, args.common.yes, args.common.json) {
         if !args.common.json && !args.common.silent {
             println!("Removal cancelled.");
@@ -392,6 +471,12 @@ pub async fn run(args: RemoveArgs) -> i32 {
     // events are Skipped and bump normally.
     let mut vendor_reverted_events: Vec<PatchEvent> = Vec::new();
     let mut vendor_skipped_events: Vec<PatchEvent> = Vec::new();
+    // Ledger keys whose revert drift-kept: their manifest entries are
+    // EXCLUDED from the removal below (dropping a record whose vendored
+    // state survives would hand `vendor`'s reconcile a revert with no
+    // backing record).
+    let mut vendor_kept_purls: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     if !vendored_matches.is_empty() {
         if args.skip_rollback {
             for (key, _) in &vendored_matches {
@@ -410,8 +495,15 @@ pub async fn run(args: RemoveArgs) -> i32 {
             }
         } else {
             for (key, entry) in &vendored_matches {
-                let outcome =
-                    dispatch_revert_one(entry, &args.common.cwd, args.common.dry_run).await;
+                let outcome = dispatch_revert_one_opts(
+                    entry,
+                    &args.common.cwd,
+                    RevertOpts {
+                        dry_run: args.common.dry_run,
+                        keep_artifact: args.preserve_state,
+                    },
+                )
+                .await;
                 for w in &outcome.warnings {
                     if !args.common.json && !args.common.silent {
                         eprintln!("Warning ({}): {}", w.code, w.detail);
@@ -440,9 +532,34 @@ pub async fn run(args: RemoveArgs) -> i32 {
                     );
                     return 1;
                 }
+                if outcome.kept_artifact {
+                    // Drift-keep: the lock changed under us and the backend
+                    // left both the wiring and the artifact alone. Per the
+                    // RevertOutcome contract the ledger entry stays — and so
+                    // must the manifest entry, or `vendor`'s reconcile would
+                    // re-revert an entry whose backing record is gone.
+                    if !args.common.json && !args.common.silent {
+                        eprintln!(
+                            "Kept vendored state for {key}: lockfile wiring drifted; \
+                             its manifest entry was kept too"
+                        );
+                    }
+                    vendor_kept_purls.insert(key.clone());
+                    vendor_skipped_events.push(
+                        PatchEvent::new(PatchAction::Skipped, key.clone()).with_reason(
+                            "vendor_revert_kept",
+                            "lockfile wiring drifted; vendored state and manifest entry kept",
+                        ),
+                    );
+                    continue;
+                }
                 if args.common.dry_run {
                     if !args.common.json && !args.common.silent {
-                        println!("Would revert vendoring for {key}");
+                        if args.preserve_state {
+                            println!("Would unwire vendoring for {key} (artifact preserved)");
+                        } else {
+                            println!("Would revert vendoring for {key}");
+                        }
                     }
                     // Dry-run flips the would-be Removed to a Verified
                     // preview, same convention as apply/vendor/repair.
@@ -450,6 +567,22 @@ pub async fn run(args: RemoveArgs) -> i32 {
                         PatchEvent::new(PatchAction::Verified, key.clone()).with_reason(
                             "vendor_would_revert",
                             "vendoring would be reverted on remove",
+                        ),
+                    );
+                    continue;
+                }
+                if args.preserve_state {
+                    // Entry kept byte-identical: its already-reverted wiring
+                    // records replay as silent no-ops later (the liveness
+                    // contract) and a re-vendor re-wires from the live lock.
+                    if !args.common.json && !args.common.silent {
+                        println!("Unwired vendoring for {key} (artifact preserved)");
+                    }
+                    vendor_skipped_events.push(
+                        PatchEvent::new(PatchAction::Skipped, key.clone()).with_reason(
+                            "vendor_state_preserved",
+                            "lockfile unwired; artifact and ledger entry preserved \
+                             (--preserve-state)",
                         ),
                     );
                     continue;
@@ -475,20 +608,191 @@ pub async fn run(args: RemoveArgs) -> i32 {
         }
     }
 
+    // Hosted-redirect leg: an identifier can also (or only) match hosted
+    // records in the redirect ledger. Supported ecosystems (cargo,
+    // npm-family) unwind per-purl; when the identifier covers EVERY record
+    // the whole-ledger replay serves the rest; otherwise unsupported
+    // targets fail closed BEFORE the manifest mutation. A corrupt ledger
+    // skips the leg with a warning (the identifier may still match other
+    // stores). `--skip-rollback` leaves hosted wiring untouched, like the
+    // vendor wiring above; `--preserve-state` still unwinds — hosted has
+    // no preservable local state.
+    let mut hosted_reverted_events: Vec<PatchEvent> = Vec::new();
+    if !args.skip_rollback {
+        match socket_patch_core::patch::redirect::load_redirect_state(&args.common.cwd).await {
+            Err(e) => {
+                if !args.common.silent && !args.common.json {
+                    eprintln!(
+                        "Warning: cannot read the hosted redirect ledger ({e}); hosted \
+                         redirects were not examined"
+                    );
+                }
+            }
+            Ok(None) => {}
+            Ok(Some(mut redirect_state)) => {
+                let mut hosted_matches: Vec<String> = redirect_state
+                    .records
+                    .iter()
+                    .filter(|(purl, rec)| patch_matches(purl, &rec.uuid, &args.identifier))
+                    .map(|(purl, _)| purl.clone())
+                    .collect();
+                hosted_matches.sort();
+                if !hosted_matches.is_empty() {
+                    let replay_eligible = redirect_state
+                        .records
+                        .keys()
+                        .all(|p| hosted_matches.contains(p));
+                    let before =
+                        (redirect_state.edits.len(), redirect_state.records.len());
+                    let leg = super::rollback::run_hosted_leg(
+                        &args.common,
+                        &hosted_matches,
+                        &mut redirect_state,
+                        replay_eligible,
+                    )
+                    .await;
+                    // Persist FIRST, failure or not: per-purl reverts flush
+                    // lockfile writes as they go, so an early error return
+                    // without persisting would strand already-reverted
+                    // purls' records in the on-disk ledger (lockfiles and
+                    // ledger desynced; `list`/VEX attest dead wiring).
+                    if !args.common.dry_run
+                        && (redirect_state.edits.len(), redirect_state.records.len()) != before
+                    {
+                        if let Err(e) =
+                            socket_patch_core::patch::redirect::persist_redirect_state(
+                                &args.common.cwd,
+                                &redirect_state,
+                            )
+                            .await
+                        {
+                            emit_error_envelope(
+                                args.common.json,
+                                args.common.dry_run,
+                                "hosted_revert_failed",
+                                format!("failed to persist the hosted redirect ledger: {e}"),
+                            );
+                            return 1;
+                        }
+                    }
+                    if !leg.unsupported.is_empty() {
+                        emit_error_envelope(
+                            args.common.json,
+                            args.common.dry_run,
+                            "hosted_revert_unsupported",
+                            format!(
+                                "no per-purl hosted-redirect revert exists for: {}. Run an \
+                                 unscoped `socket-patch rollback` to unwind ALL hosted \
+                                 redirects, or re-run `scan --mode hosted` to normalize. \
+                                 The manifest was not modified.",
+                                leg.unsupported.join(", ")
+                            ),
+                        );
+                        return 1;
+                    }
+                    if let Some((what, why)) = leg.failed.first() {
+                        emit_error_envelope(
+                            args.common.json,
+                            args.common.dry_run,
+                            "hosted_revert_failed",
+                            format!(
+                                "could not unwind hosted redirect for {what}: {why}. The \
+                                 manifest was not modified."
+                            ),
+                        );
+                        return 1;
+                    }
+                    if args.preserve_state
+                        && !leg.reverted.is_empty()
+                        && !args.common.silent
+                        && !args.common.json
+                    {
+                        eprintln!(
+                            "Note: hosted redirects have no preservable local state; \
+                             their ledger records were dropped with the unwound wiring."
+                        );
+                    }
+                    let hosted_action = if args.common.dry_run {
+                        PatchAction::Verified
+                    } else {
+                        PatchAction::Removed
+                    };
+                    for purl in &leg.reverted {
+                        hosted_reverted_events.push(
+                            PatchEvent::new(hosted_action, purl.clone()).with_reason(
+                                "hosted_reverted",
+                                "hosted lockfile redirect unwound on remove",
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // Manifest entries excluded from the removal: drift-kept vendored
+    // purls (kept ledger key / base-purl / qualifier-stripped matching).
+    let excluded_kept: std::collections::HashSet<String> = matching
+        .iter()
+        .map(|(purl, _)| (*purl).clone())
+        .filter(|purl| {
+            vendor_kept_purls.iter().any(|key| {
+                key == purl
+                    || strip_purl_qualifiers(key) == strip_purl_qualifiers(purl)
+                    || vendored_matches
+                        .iter()
+                        .find(|(k, _)| k == key)
+                        .is_some_and(|(_, e)| e.base_purl == strip_purl_qualifiers(purl))
+            })
+        })
+        .collect();
+
     // Now remove from manifest. On --dry-run the removal is simulated in
     // memory (manifest untouched) so the blob sweep below can still
-    // preview against the post-removal reference set.
-    let removal = if args.common.dry_run {
-        let removed: Vec<String> = matching.iter().map(|(purl, _)| (*purl).clone()).collect();
+    // preview against the post-removal reference set. `--preserve-state`
+    // deliberately touches neither the manifest nor the blobs.
+    let removal = if args.preserve_state {
+        Ok((Vec::new(), manifest.clone()))
+    } else if args.common.dry_run {
+        let removed: Vec<String> = matching
+            .iter()
+            .map(|(purl, _)| (*purl).clone())
+            .filter(|p| !excluded_kept.contains(p))
+            .collect();
         let mut simulated = manifest.clone();
         simulated.patches.retain(|purl, _| !removed.contains(purl));
         Ok((removed, simulated))
     } else {
-        remove_patch_from_manifest(&args.identifier, &manifest_path).await
+        remove_patch_from_manifest(&args.identifier, &manifest_path, &excluded_kept).await
     };
     match removal {
         Ok((removed, updated_manifest)) => {
-            if removed.is_empty() {
+            if removed.is_empty() && !args.preserve_state {
+                if !excluded_kept.is_empty() {
+                    // Every matching entry was drift-kept: the remove did
+                    // not happen. NOT not_found — the identifier matched;
+                    // partialFailure keeps `summary.removed` honest at 0.
+                    let msg = format!(
+                        "{}: every matching entry's vendored state drift-kept; nothing was \
+                         removed (re-run `scan --mode vendored` to normalize, then remove)",
+                        args.identifier
+                    );
+                    track_patch_remove_failed(&msg, api_token.as_deref(), org_slug.as_deref())
+                        .await;
+                    if args.common.json {
+                        let mut env = Envelope::new(Command::Remove);
+                        env.dry_run = args.common.dry_run;
+                        for ev in vendor_skipped_events {
+                            env.record(ev);
+                        }
+                        env.status = Status::PartialFailure;
+                        env.error = Some(EnvelopeError::new("vendor_revert_kept", msg));
+                        println!("{}", env.to_pretty_json());
+                    } else {
+                        eprintln!("Error: {msg}");
+                    }
+                    return 1;
+                }
                 emit_not_found(
                     args.common.json,
                     args.common.dry_run,
@@ -501,7 +805,13 @@ pub async fn run(args: RemoveArgs) -> i32 {
             }
 
             if !args.common.json && !args.common.silent {
-                if args.common.dry_run {
+                if args.preserve_state {
+                    println!(
+                        "Manifest entries and vendored artifacts preserved \
+                         (--preserve-state); re-apply with `socket-patch apply` or \
+                         `socket-patch vendor`."
+                    );
+                } else if args.common.dry_run {
                     println!("Would remove {} patch(es) from manifest:", removed.len());
                 } else {
                     println!("Removed {} patch(es) from manifest:", removed.len());
@@ -511,7 +821,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
                 }
                 if args.common.dry_run {
                     println!("\nDry run — nothing was changed.");
-                } else {
+                } else if !args.preserve_state {
                     println!("\nManifest updated at {}", manifest_path.display());
                 }
             }
@@ -550,44 +860,54 @@ pub async fn run(args: RemoveArgs) -> i32 {
             // data only — the retained entries' real afterHash blobs stay
             // sweepable like any other orphan.
             let mut cleanup_reference = updated_manifest.clone();
-            for purl in &retained_not_installed {
-                let Some(record) = manifest.patches.get(*purl) else {
-                    continue;
-                };
-                let pinned: std::collections::HashMap<String, PatchFileInfo> = record
-                    .files
-                    .iter()
-                    .filter(|(_, info)| !info.before_hash.is_empty())
-                    .map(|(file, info)| {
-                        (
-                            file.clone(),
-                            PatchFileInfo {
-                                before_hash: String::new(),
-                                after_hash: info.before_hash.clone(),
-                            },
-                        )
-                    })
-                    .collect();
-                if pinned.is_empty() {
-                    continue; // every file was created-by-patch: no revert blobs
-                }
-                let mut keep_record = record.clone();
-                keep_record.files = pinned;
-                cleanup_reference
-                    .patches
-                    .insert((*purl).to_string(), keep_record);
-            }
+            let pinned_purls: Vec<String> = retained_not_installed
+                .iter()
+                .map(|p| (*p).to_string())
+                .collect();
+            pin_before_hash_blobs(&mut cleanup_reference, &manifest, pinned_purls.iter());
             let blobs_path = socket_dir.join("blobs");
             let mut blobs_removed = 0;
-            if let Ok(cleanup_result) =
-                cleanup_unused_blobs(&cleanup_reference, &blobs_path, args.common.dry_run).await
-            {
-                blobs_removed = cleanup_result.blobs_removed;
-                if !args.common.json && !args.common.silent && cleanup_result.blobs_removed > 0 {
-                    println!(
-                        "\n{}",
-                        format_cleanup_result(&cleanup_result, args.common.dry_run)
-                    );
+            let mut archives_removed = 0;
+            if !args.preserve_state {
+                match cleanup_unused_blobs(&cleanup_reference, &blobs_path, args.common.dry_run)
+                    .await
+                {
+                    Ok(cleanup_result) => {
+                        blobs_removed = cleanup_result.blobs_removed;
+                        if !args.common.json
+                            && !args.common.silent
+                            && cleanup_result.blobs_removed > 0
+                        {
+                            println!(
+                                "\n{}",
+                                format_cleanup_result(&cleanup_result, args.common.dry_run)
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        // repair's posture: warn and continue, never fatal.
+                        if !args.common.silent && !args.common.json {
+                            eprintln!("Warning: blob cleanup failed: {e}");
+                        }
+                    }
+                }
+                // Diff/package archives use the same manifest-uuid keep rule
+                // (parity with repair and scan --prune).
+                for dir in ["diffs", "packages"] {
+                    match cleanup_unused_archives(
+                        &cleanup_reference,
+                        &socket_dir.join(dir),
+                        args.common.dry_run,
+                    )
+                    .await
+                    {
+                        Ok(r) => archives_removed += r.blobs_removed,
+                        Err(e) => {
+                            if !args.common.silent && !args.common.json {
+                                eprintln!("Warning: {dir} cleanup failed: {e}");
+                            }
+                        }
+                    }
                 }
             }
 
@@ -644,6 +964,11 @@ pub async fn run(args: RemoveArgs) -> i32 {
                 for ev in vendor_reverted_events {
                     env.events.push(ev);
                 }
+                // Hosted unwinds likewise bypass `record` — summary.removed
+                // stays "manifest entries deleted".
+                for ev in hosted_reverted_events {
+                    env.events.push(ev);
+                }
                 for ev in vendor_skipped_events {
                     env.record(ev);
                 }
@@ -667,14 +992,21 @@ pub async fn run(args: RemoveArgs) -> i32 {
                 // e.g. `removed: 2` for a single-patch removal that happened
                 // to sweep an orphan blob. Consumers read the blob/rollback
                 // totals from `details`, never from `summary.removed`.
-                if blobs_removed > 0 || rollback_count > 0 {
+                if blobs_removed > 0 || rollback_count > 0 || archives_removed > 0 {
                     env.events
                         .push(PatchEvent::artifact(removal_action).with_details(
                             serde_json::json!({
                                 "blobsRemoved": blobs_removed,
                                 "rolledBack": rollback_count,
+                                "archivesRemoved": archives_removed,
                             }),
                         ));
+                }
+                // Any drift-kept entry means part of the requested removal
+                // did NOT happen: the run is a partialFailure (exit 1) even
+                // when sibling entries were removed.
+                if !vendor_kept_purls.is_empty() {
+                    env.status = Status::PartialFailure;
                 }
                 println!("{}", env.to_pretty_json());
             }
@@ -682,7 +1014,22 @@ pub async fn run(args: RemoveArgs) -> i32 {
             if !args.common.dry_run {
                 track_patch_removed(removed.len(), api_token.as_deref(), org_slug.as_deref()).await;
             }
-            0
+            if vendor_kept_purls.is_empty() {
+                0
+            } else {
+                // Errors print even under --silent; the per-key drift-keep
+                // lines above are gated, so name the outcome once here.
+                if !args.common.json {
+                    eprintln!(
+                        "Error: {} matching entr{} drift-kept (vendored state and manifest \
+                         record retained); re-run `scan --mode vendored` to normalize, then \
+                         remove again",
+                        vendor_kept_purls.len(),
+                        if vendor_kept_purls.len() == 1 { "y was" } else { "ies were" }
+                    );
+                }
+                1
+            }
         }
         Err(e) => {
             track_patch_remove_failed(&e, api_token.as_deref(), org_slug.as_deref()).await;
@@ -699,6 +1046,143 @@ pub async fn run(args: RemoveArgs) -> i32 {
 /// through `env.record` and bump `summary.removed`. `--skip-rollback` is
 /// refused: with no manifest entry to delete, removing a detached patch
 /// can only mean reverting its vendoring.
+/// Remove path for identifiers that match ONLY hosted redirect records
+/// (no manifest entry, no detached vendor entry): confirm, unwind each
+/// record's lockfile wiring, drop it from the redirect ledger, and report
+/// `Removed`/`hosted_reverted` events. Like the detached path, the unwind
+/// IS the removal, so events go through `env.record` and bump
+/// `summary.removed`. `--skip-rollback` is refused (with no manifest
+/// entry to delete, removing a hosted patch can only mean unwinding its
+/// redirect); `--preserve-state` still unwinds — hosted has no
+/// preservable local state.
+async fn remove_hosted_only(
+    args: &RemoveArgs,
+    hosted_matches: Vec<String>,
+    mut redirect_state: socket_patch_core::patch::redirect::RedirectState,
+    api_token: Option<&str>,
+    org_slug: Option<&str>,
+) -> i32 {
+    if args.skip_rollback {
+        emit_error_envelope(
+            args.common.json,
+            args.common.dry_run,
+            "hosted_state_retained",
+            format!(
+                "{} matches only hosted redirect record(s); removing one means unwinding \
+                 its lockfile redirect, which --skip-rollback prevents",
+                args.identifier
+            ),
+        );
+        return 1;
+    }
+
+    if !args.common.json && !args.common.silent {
+        eprintln!("The following hosted redirect(s) will be unwound and removed:");
+        for purl in &hosted_matches {
+            eprintln!("  - {purl}");
+        }
+        eprintln!();
+    }
+    // `--dry-run` previews without mutating — nothing to confirm.
+    let prompt = format!(
+        "Remove {} hosted redirect(s) and unwind their lockfile wiring?",
+        hosted_matches.len()
+    );
+    if !args.common.dry_run && !confirm(&prompt, true, args.common.yes, args.common.json) {
+        if !args.common.json && !args.common.silent {
+            println!("Removal cancelled.");
+        }
+        return 0;
+    }
+
+    let replay_eligible = redirect_state
+        .records
+        .keys()
+        .all(|p| hosted_matches.contains(p));
+    let before = (redirect_state.edits.len(), redirect_state.records.len());
+    let leg = super::rollback::run_hosted_leg(
+        &args.common,
+        &hosted_matches,
+        &mut redirect_state,
+        replay_eligible,
+    )
+    .await;
+    // Persist FIRST, failure or not (see the main-flow hosted leg): the
+    // per-purl reverts already flushed lockfile writes, so the on-disk
+    // ledger must reflect them even when a later match failed.
+    if !args.common.dry_run
+        && (redirect_state.edits.len(), redirect_state.records.len()) != before
+    {
+        if let Err(e) = socket_patch_core::patch::redirect::persist_redirect_state(
+            &args.common.cwd,
+            &redirect_state,
+        )
+        .await
+        {
+            emit_error_envelope(
+                args.common.json,
+                args.common.dry_run,
+                "hosted_revert_failed",
+                format!("failed to persist the hosted redirect ledger: {e}"),
+            );
+            return 1;
+        }
+    }
+    if !leg.unsupported.is_empty() {
+        track_patch_remove_failed(
+            "hosted redirect revert unsupported",
+            api_token,
+            org_slug,
+        )
+        .await;
+        emit_error_envelope(
+            args.common.json,
+            args.common.dry_run,
+            "hosted_revert_unsupported",
+            format!(
+                "no per-purl hosted-redirect revert exists for: {}. Run an unscoped \
+                 `socket-patch rollback` to unwind ALL hosted redirects, or re-run \
+                 `scan --mode hosted` to normalize.",
+                leg.unsupported.join(", ")
+            ),
+        );
+        return 1;
+    }
+    if let Some((what, why)) = leg.failed.first() {
+        track_patch_remove_failed("hosted redirect revert failed", api_token, org_slug).await;
+        emit_error_envelope(
+            args.common.json,
+            args.common.dry_run,
+            "hosted_revert_failed",
+            format!("could not unwind hosted redirect for {what}: {why}"),
+        );
+        return 1;
+    }
+    let mut env = Envelope::new(Command::Remove);
+    env.dry_run = args.common.dry_run;
+    let action = if args.common.dry_run {
+        PatchAction::Verified
+    } else {
+        PatchAction::Removed
+    };
+    // Human per-purl lines already printed inside `run_hosted_leg`.
+    for purl in &leg.reverted {
+        env.record(
+            PatchEvent::new(action, purl.clone()).with_reason(
+                "hosted_reverted",
+                "hosted lockfile redirect unwound on remove",
+            ),
+        );
+    }
+    if args.common.json {
+        println!("{}", env.to_pretty_json());
+    }
+    if !args.common.dry_run {
+        track_patch_removed(leg.reverted.len(), api_token, org_slug).await;
+    }
+    0
+}
+
 async fn remove_detached_only(
     args: &RemoveArgs,
     detached: Vec<(String, VendorEntry)>,
@@ -814,6 +1298,9 @@ async fn remove_detached_only(
 async fn remove_patch_from_manifest(
     identifier: &str,
     manifest_path: &Path,
+    // Matching entries to KEEP anyway — drift-kept vendored purls whose
+    // vendored state survived the revert (the record must survive with it).
+    exclusions: &std::collections::HashSet<String>,
 ) -> Result<(Vec<String>, PatchManifest), String> {
     let mut manifest = read_manifest(manifest_path)
         .await
@@ -823,7 +1310,9 @@ async fn remove_patch_from_manifest(
     let removed: Vec<String> = manifest
         .patches
         .iter()
-        .filter(|(purl, patch)| patch_matches(purl, &patch.uuid, identifier))
+        .filter(|(purl, patch)| {
+            patch_matches(purl, &patch.uuid, identifier) && !exclusions.contains(*purl)
+        })
         .map(|(purl, _)| purl.clone())
         .collect();
 
@@ -891,7 +1380,7 @@ mod tests {
         write_multi_variant(tmp.path()).await;
         let manifest_path = tmp.path().join("manifest.json");
 
-        let (removed, manifest) = remove_patch_from_manifest("pkg:pypi/six@1.16.0", &manifest_path)
+        let (removed, manifest) = remove_patch_from_manifest("pkg:pypi/six@1.16.0", &manifest_path, &Default::default())
             .await
             .expect("remove ok");
 
@@ -909,7 +1398,7 @@ mod tests {
         let manifest_path = tmp.path().join("manifest.json");
 
         let (removed, manifest) =
-            remove_patch_from_manifest("pkg:pypi/six@1.16.0?artifact_id=sdist", &manifest_path)
+            remove_patch_from_manifest("pkg:pypi/six@1.16.0?artifact_id=sdist", &manifest_path, &Default::default())
                 .await
                 .expect("remove ok");
 
@@ -927,7 +1416,7 @@ mod tests {
         write_multi_variant(tmp.path()).await;
         let manifest_path = tmp.path().join("manifest.json");
 
-        let (removed, manifest) = remove_patch_from_manifest("uuid-cp312", &manifest_path)
+        let (removed, manifest) = remove_patch_from_manifest("uuid-cp312", &manifest_path, &Default::default())
             .await
             .expect("remove ok");
 
@@ -954,7 +1443,7 @@ mod tests {
             .await
             .expect("write manifest");
 
-        let (removed, manifest) = remove_patch_from_manifest("pkg:npm/foo@1.0", &manifest_path)
+        let (removed, manifest) = remove_patch_from_manifest("pkg:npm/foo@1.0", &manifest_path, &Default::default())
             .await
             .expect("remove ok");
 
@@ -975,7 +1464,7 @@ mod tests {
         let before_bytes = tokio::fs::read(&manifest_path).await.expect("read before");
 
         let (removed, manifest) =
-            remove_patch_from_manifest("pkg:npm/not-here@9.9.9", &manifest_path)
+            remove_patch_from_manifest("pkg:npm/not-here@9.9.9", &manifest_path, &Default::default())
                 .await
                 .expect("remove ok");
 
@@ -1011,7 +1500,7 @@ mod tests {
             .await
             .expect("write manifest");
 
-        let (removed, manifest) = remove_patch_from_manifest("pkg:pypi/six@1.16.0", &manifest_path)
+        let (removed, manifest) = remove_patch_from_manifest("pkg:pypi/six@1.16.0", &manifest_path, &Default::default())
             .await
             .expect("remove ok");
 

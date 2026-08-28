@@ -34,7 +34,7 @@ use super::state::{
     write_marker, CargoLockOriginal, VendorArtifact, VendorEntry, VendorMarker, WiringAction,
     WiringRecord, VENDOR_MARKER_FILE,
 };
-use super::{RevertOutcome, VendorOutcome, VendorServiceConfig, VendorWarning};
+use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorServiceConfig, VendorWarning};
 
 /// True if a crate is vendored under `<project_root>/vendor/` (in either the
 /// `<name>-<version>/` or bare `<name>/` layout the cargo crawler probes). A
@@ -916,6 +916,20 @@ pub async fn revert_cargo_vendor(
     project_root: &Path,
     dry_run: bool,
 ) -> RevertOutcome {
+    revert_cargo_vendor_opts(entry, project_root, RevertOpts::new(dry_run)).await
+}
+
+/// [`revert_cargo_vendor`] with full [`RevertOpts`]: `keep_artifact` skips
+/// the artifact deletion while the wiring restore runs unchanged.
+pub async fn revert_cargo_vendor_opts(
+    entry: &VendorEntry,
+    project_root: &Path,
+    opts: RevertOpts,
+) -> RevertOutcome {
+    let RevertOpts {
+        dry_run,
+        keep_artifact,
+    } = opts;
     // SECURITY: the coordinates and uuid come from a committed, tamper-able
     // state.json and key a directory we are about to delete — re-validate
     // fail-closed before any disk access (mirrors the vendor-side guard).
@@ -973,7 +987,10 @@ pub async fn revert_cargo_vendor(
         };
     }
 
-    if !dry_run {
+    // `--preserve-state` (`keep_artifact`): the artifact dir stays behind
+    // (and the caller keeps the ledger entry), so only the deletion is
+    // skipped.
+    if !dry_run && !keep_artifact {
         let uuid_dir = project_root.join(&base_rel);
         let _ = remove_tree(&uuid_dir).await; // ignore NotFound
                                               // Best-effort: prune the now-empty `.socket/vendor/cargo/` level so a

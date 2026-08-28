@@ -26,6 +26,7 @@ dialoguer = { workspace = true }
 indicatif = { workspace = true }
 uuid = { workspace = true }
 regex = { workspace = true }
+glob = { workspace = true }
 tempfile = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]

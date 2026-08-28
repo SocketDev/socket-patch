@@ -759,6 +759,9 @@ fn rollback_json_shape_has_documented_keys() {
     // These keys are documented in CLI_CONTRACT.md as the rollback shape
     // (not yet migrated to the unified envelope). Pin them so a future
     // migration trips this test instead of breaking wrappers silently.
+    // The v4 duality rework added the always-present additive keys from
+    // `vendored` onward (vendoredReverted/vendoredPreserved/vendoredKept,
+    // hosted, manifest, gc, paths).
     for key in [
         "status",
         "rolledBack",
@@ -767,9 +770,25 @@ fn rollback_json_shape_has_documented_keys() {
         "dryRun",
         "warnings",
         "results",
+        "vendored",
+        "vendoredReverted",
+        "vendoredPreserved",
+        "vendoredKept",
+        "vendoredFailed",
+        "hosted",
+        "manifest",
+        "gc",
+        "paths",
     ] {
         assert!(keys.contains(key), "rollback JSON missing key: {key}");
     }
+    // The hosted/manifest sub-objects carry their documented keys.
+    assert!(v["hosted"]["reverted"].is_array());
+    assert!(v["hosted"]["failed"].is_array());
+    assert!(v["hosted"]["unsupported"].is_array());
+    assert!(v["hosted"]["editedFiles"].is_number());
+    assert!(v["manifest"]["removedEntries"].is_array());
+    assert!(v["manifest"]["preserved"].is_boolean());
     // Not-installed entries surface as per-entry `skipped` markers inside
     // `results[]` — there is deliberately NO top-level `notInstalled` key.
     assert!(

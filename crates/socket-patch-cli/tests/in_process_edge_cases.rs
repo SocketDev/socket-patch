@@ -554,7 +554,8 @@ async fn rollback_already_original_short_circuits() {
             verbose: false,
             ..socket_patch_cli::args::GlobalArgs::default()
         },
-        identifier: None,
+        targets: Vec::new(),
+        preserve_state: false,
         one_off: false,
     };
     let target = tmp.path().join("node_modules/already-orig/index.js");

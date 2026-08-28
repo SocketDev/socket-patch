@@ -27,8 +27,8 @@ use socket_patch_core::telemetry::{track_patch_vendor_failed, track_patch_vendor
 use socket_patch_core::utils::purl::{normalize_purl, strip_purl_qualifiers};
 use socket_patch_core::vendor::{
     self, ecosystem_dir_for_purl, load_state, lock_inventory, lookup_entry, registry_fetch,
-    save_state, RevertOutcome, VendorEntry, VendorOutcome, VendorServiceConfig, VendorSource,
-    VendorState, VendorWarning,
+    save_state, RevertOpts, RevertOutcome, VendorEntry, VendorOutcome, VendorServiceConfig,
+    VendorSource, VendorState, VendorWarning,
 };
 use socket_patch_core::vex::time::now_rfc3339;
 use std::collections::{HashMap, HashSet};
@@ -172,15 +172,26 @@ pub(crate) async fn dispatch_revert_one(
     project_root: &Path,
     dry_run: bool,
 ) -> RevertOutcome {
+    dispatch_revert_one_opts(entry, project_root, RevertOpts::new(dry_run)).await
+}
+
+/// [`dispatch_revert_one`] with full [`RevertOpts`]: `keep_artifact` is the
+/// `rollback/remove --preserve-state` shape — restore the lockfile wiring
+/// but keep the artifact dir (the caller keeps the ledger entry).
+pub(crate) async fn dispatch_revert_one_opts(
+    entry: &VendorEntry,
+    project_root: &Path,
+    opts: RevertOpts,
+) -> RevertOutcome {
     match entry.ecosystem.as_str() {
-        "npm" => vendor::npm_flavor::revert_npm_any(entry, project_root, dry_run).await,
-        "pypi" => vendor::pypi::revert_pypi(entry, project_root, dry_run).await,
-        "gem" => vendor::gem::revert_gem(entry, project_root, dry_run).await,
-        "cargo" => vendor::cargo::revert_cargo_vendor(entry, project_root, dry_run).await,
-        "golang" => vendor::golang::revert_go_vendor(entry, project_root, dry_run).await,
-        "composer" => vendor::composer_lock::revert_composer(entry, project_root, dry_run).await,
-        "nuget" => vendor::nuget_feed::revert_nuget(entry, project_root, dry_run).await,
-        "maven" => vendor::maven_repo::revert_maven(entry, project_root, dry_run).await,
+        "npm" => vendor::npm_flavor::revert_npm_any_opts(entry, project_root, opts).await,
+        "pypi" => vendor::pypi::revert_pypi_opts(entry, project_root, opts).await,
+        "gem" => vendor::gem::revert_gem_opts(entry, project_root, opts).await,
+        "cargo" => vendor::cargo::revert_cargo_vendor_opts(entry, project_root, opts).await,
+        "golang" => vendor::golang::revert_go_vendor_opts(entry, project_root, opts).await,
+        "composer" => vendor::composer_lock::revert_composer_opts(entry, project_root, opts).await,
+        "nuget" => vendor::nuget_feed::revert_nuget_opts(entry, project_root, opts).await,
+        "maven" => vendor::maven_repo::revert_maven_opts(entry, project_root, opts).await,
         other => RevertOutcome::failed(format!(
             "this build has no vendor backend for ecosystem `{other}`"
         )),
@@ -1055,6 +1066,7 @@ pub(crate) async fn vendor_records(
                         &common.cwd,
                         ledger,
                         candidate,
+                        false,
                     )
                     .await
                     {
