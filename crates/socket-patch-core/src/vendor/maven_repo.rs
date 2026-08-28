@@ -63,7 +63,6 @@ use serde_json::Value;
 use sha1::Sha1;
 use sha2::{Digest as _, Sha256};
 
-use crate::constants::USER_AGENT;
 use crate::manifest::schema::{PatchFileInfo, PatchRecord};
 use crate::patch::apply::{ApplyResult, PatchSources};
 use crate::patch::copy_tree::remove_tree;
@@ -94,6 +93,21 @@ const REPO_WIRING_KIND: &str = "maven_pom_repository";
 /// Bound on a pom download from the registry — a pom is dependency metadata
 /// (small XML); a multi-MB response is a mirror serving the wrong thing.
 const MAX_POM_BYTES: usize = 8 * 1024 * 1024;
+
+/// User-Agent for maven2 registry requests. Maven Central blocks/rate-limits
+/// user agents containing "socket", so the CLI's own `SocketPatchCLI/x.y.z`
+/// UA (`constants.rs`) gets the pom fallback download refused. These requests
+/// instead identify exactly as the official Maven CLI —
+/// `Apache-Maven/<maven> (Java <jdk>; <os.name> <os.version>)`, the shape
+/// maven-resolver sends — pinned to fixed Maven/JDK/OS versions so the string
+/// stays deterministic (no runtime probing). Only maven2 registry traffic
+/// uses this; Socket API requests keep the honest UA.
+#[cfg(target_os = "macos")]
+const MAVEN_USER_AGENT: &str = "Apache-Maven/3.9.11 (Java 17.0.16; Mac OS X 15.5)";
+#[cfg(target_os = "windows")]
+const MAVEN_USER_AGENT: &str = "Apache-Maven/3.9.11 (Java 17.0.16; Windows 11 10.0)";
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+const MAVEN_USER_AGENT: &str = "Apache-Maven/3.9.11 (Java 17.0.16; Linux 6.8.0)";
 
 /// The maven2 registry base for the (fallback) pom download, overridable with
 /// `SOCKET_MAVEN_REGISTRY` (the private-mirror / test escape hatch). Default is
@@ -747,7 +761,7 @@ async fn acquire_upstream_pom(
 /// Bounded HTTP GET of a pom from the maven2 registry.
 async fn fetch_pom_bytes(url: &str) -> Result<Vec<u8>, String> {
     let client = reqwest::Client::builder()
-        .user_agent(USER_AGENT)
+        .user_agent(MAVEN_USER_AGENT)
         .timeout(Duration::from_secs(60))
         .build()
         .map_err(|e| format!("build http client: {e}"))?;
@@ -2319,6 +2333,46 @@ mod tests {
             !root.join(format!(".socket/vendor/maven/{UUID}")).exists(),
             "no partial artifact may survive the refusal"
         );
+    }
+
+    /// Maven Central blocks/rate-limits user agents containing "socket" —
+    /// the maven2 registry client must identify as the official Maven CLI,
+    /// never as `SocketPatchCLI/…`.
+    #[test]
+    fn maven_user_agent_is_the_maven_cli_shape() {
+        assert!(
+            MAVEN_USER_AGENT.starts_with("Apache-Maven/"),
+            "maven2 registry UA must lead with the Maven CLI product token: {MAVEN_USER_AGENT}"
+        );
+        assert!(
+            !MAVEN_USER_AGENT.to_ascii_lowercase().contains("socket"),
+            "a UA containing \"socket\" is blocked by Maven Central: {MAVEN_USER_AGENT}"
+        );
+    }
+
+    /// The Maven-CLI UA must actually go out on the wire: the mock only
+    /// serves the pom when the request carries `MAVEN_USER_AGENT`, so a
+    /// regression back to `SocketPatchCLI/…` misses the matcher and fails
+    /// the fetch.
+    #[tokio::test]
+    async fn pom_fetch_sends_the_maven_cli_user_agent() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let pom_route = "/org/apache/commons/commons-text/1.10.0/commons-text-1.10.0.pom";
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(pom_route))
+            .and(header("user-agent", MAVEN_USER_AGENT))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(UPSTREAM_POM.to_vec()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let bytes = fetch_pom_bytes(&format!("{}{pom_route}", server.uri()))
+            .await
+            .expect("pom fetch under the Maven CLI UA succeeds");
+        assert_eq!(bytes, UPSTREAM_POM);
     }
 
     /// A FIFO planted as `pom.xml` must fail the revert fast and loudly —

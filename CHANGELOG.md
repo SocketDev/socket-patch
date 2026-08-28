@@ -107,6 +107,26 @@ into the new version's section — see docs/releasing.md.
   entry with no backing record. An all-kept run exits 1 `partialFailure`
   with `summary.removed: 0` (never `not_found` — the identifier matched).
 
+### Changed
+
+- **Release publishing decomposed into per-registry workflows.** The
+  crates.io, npm, PyPI, and RubyGems legs of the `Release` workflow now live
+  in their own workflows
+  (`.github/workflows/publish-{cargo,npm,pypi,rubygems}.yml`). A release is
+  still one dispatch — `release.yml` dispatches each leg at the release tag
+  (`scripts/dispatch-publish.sh`) and watches it to completion — but after a
+  mid-release failure any single registry can now also be retried
+  standalone (Actions → the registry's publish workflow → Run workflow with
+  the release version) without rebuilding: each leg checks out the
+  `v<version>` tag and, where binaries are needed, takes them from the
+  GitHub release's assets verified against `SHA256SUMS` (release-run
+  dispatches additionally pin the sums file by digest, and same-version leg
+  runs serialize through a concurrency group). Registry-side
+  trusted publishers must be re-registered against the new workflow
+  filenames (the legs always run as top-level `workflow_dispatch` runs, so
+  every registry's filename matching sees the leg's own file) — see
+  docs/releasing.md § One-time registry setup.
+
 ## [4.0.0] — 2026-08-20
 
 v4.0 is the three-modes release. What began as an agent-style tool that

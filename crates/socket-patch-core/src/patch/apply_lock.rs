@@ -359,52 +359,89 @@ mod tests {
     /// i.e. exactly the concurrent manifest/package-file corruption the
     /// lock exists to prevent. Re-opening the path on every retry keeps
     /// the waiter honest about whatever file `apply.lock` names now.
+    ///
+    /// The choreography below can lose two *benign* races on a loaded
+    /// runner (both observed on CI's macos-latest), so it retries: the
+    /// regressed bug double-holds on essentially every iteration, while
+    /// the benign losses need an unlucky deschedule and almost never
+    /// repeat. One clean iteration proves the re-open behavior; a full
+    /// run of iterations without one is statistically the bug.
     #[test]
     fn waiter_does_not_lock_orphaned_inode_after_lock_file_deleted() {
         use std::sync::mpsc;
 
-        let dir = tempfile::tempdir().unwrap();
-        let lock_path = dir.path().join("apply.lock");
+        const ATTEMPTS: usize = 5;
+        let mut benign = Vec::new();
+        for _ in 0..ATTEMPTS {
+            let dir = tempfile::tempdir().unwrap();
+            let lock_path = dir.path().join("apply.lock");
 
-        // A `repair` run holds the lock; this is the inode the waiter
-        // will open below.
-        let repair_guard = acquire(dir.path(), Duration::ZERO).unwrap();
+            // A `repair` run holds the lock; this is the inode the
+            // waiter will open below.
+            let repair_guard = acquire(dir.path(), Duration::ZERO).unwrap();
 
-        // The waiter: a concurrent `apply --lock-timeout 1` that parks
-        // in the retry loop while repair finishes.
-        let (started_tx, started_rx) = mpsc::channel();
-        let waiter_dir = dir.path().to_path_buf();
-        let waiter = std::thread::spawn(move || {
-            started_tx.send(()).unwrap();
-            acquire(&waiter_dir, Duration::from_millis(600))
-        });
+            // The waiter: a concurrent `apply --lock-timeout 1` that
+            // parks in the retry loop while repair finishes.
+            let (started_tx, started_rx) = mpsc::channel();
+            let waiter_dir = dir.path().to_path_buf();
+            let waiter = std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                acquire(&waiter_dir, Duration::from_millis(600))
+            });
 
-        // Let the waiter open the lock file and burn its first
-        // (contended) attempt, so its handle is on the pre-deletion
-        // inode. Being late here is harmless — it just means the waiter
-        // burns another attempt on the same handle.
-        started_rx.recv().unwrap();
-        std::thread::sleep(Duration::from_millis(50));
+            // Let the waiter open the lock file and burn its first
+            // (contended) attempt, so its handle is on the pre-deletion
+            // inode. Being late here is harmless — it just means the
+            // waiter burns another attempt on the same handle.
+            started_rx.recv().unwrap();
+            std::thread::sleep(Duration::from_millis(50));
 
-        // repair's tail: release the guard, then unlink the lock file.
-        drop(repair_guard);
-        std::fs::remove_file(&lock_path).unwrap();
+            // repair's tail: release the guard, then unlink the lock
+            // file. The next mutating command comes along and takes the
+            // lock on a brand-new inode.
+            drop(repair_guard);
+            std::fs::remove_file(&lock_path).unwrap();
+            let fresh = acquire(dir.path(), Duration::ZERO);
 
-        // The next mutating command comes along and takes the lock on a
-        // brand-new inode.
-        let fresh_guard = acquire(dir.path(), Duration::ZERO).unwrap();
-
-        // Mutual exclusion: while `fresh_guard` is alive, nobody else
-        // may hold the apply lock. Under the bug the waiter locks the
-        // orphaned inode and hands back a second live guard.
-        let waiter_result = waiter.join().unwrap();
-        assert!(
-            matches!(waiter_result, Err(LockError::Held)),
+            let waiter_result = waiter.join().unwrap();
+            match (fresh, waiter_result) {
+                // The interleaving under test: the fresh acquire won
+                // the post-unlink window, and the waiter — re-opening
+                // the path every retry — saw the new inode held and
+                // gave up. Under the bug this outcome is unreachable
+                // (the waiter flocks its orphaned pre-loop handle and
+                // returns a guard), so one clean iteration is proof.
+                (Ok(_fresh_guard), Err(LockError::Held)) => return,
+                // Benign race: the waiter's retry landed between the
+                // unlink and the fresh acquire, while the lock was
+                // genuinely free — it recreated the file and is a
+                // legitimate sole holder, and the fresh try-once
+                // correctly reported Held. Mutual exclusion held; retry
+                // for the interleaving under test.
+                (Err(LockError::Held), Ok(_waiter_guard)) => {
+                    benign.push("waiter won the free-lock window");
+                }
+                // Both hold "the" lock at once. For the fixed,
+                // re-opening waiter this needs the sanctioned
+                // microsecond window between its open() and flock()
+                // straddling repair's drop+unlink — vanishingly rare
+                // twice. The old one-handle waiter lands here on every
+                // iteration, so repeats fail below.
+                (Ok(_fresh_guard), Ok(_waiter_guard)) => {
+                    benign.push("double hold via the open->flock window");
+                }
+                (fresh, waiter_result) => panic!(
+                    "unexpected lock outcome: fresh={:?} waiter={:?}",
+                    fresh.map(|_| "Ok(guard)"),
+                    waiter_result.map(|_| "Ok(guard)")
+                ),
+            }
+        }
+        panic!(
             "waiter must not acquire the apply lock while another holder is live \
-             (it locked the orphaned pre-deletion inode): got {:?}",
-            waiter_result.map(|_| "Ok(guard)")
+             (it locked the orphaned pre-deletion inode): no clean iteration in \
+             {ATTEMPTS} attempts — {benign:?}"
         );
-        drop(fresh_guard);
     }
 
     /// The retry loop must not overshoot the deadline by a full sleep

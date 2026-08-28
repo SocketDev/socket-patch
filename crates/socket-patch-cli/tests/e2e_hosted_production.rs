@@ -165,12 +165,13 @@ const GEM_UUIDS: &[&str] = &[
     // published 2026-08-20T20:31Z — the fourth advisory. /patch/view blobs
     // live-verified 2026-08-20: carries the Socket Community Patch header.
     "c1a1cd3c-b670-4e44-b4fa-1a63ecd42db6",
-    // GHSA-xr9x-r78c-5hrm / CVE-2026-66066 (Active Storage libvips variant
-    // processing arbitrary-file-read/RCE) — the fifth advisory, published
-    // 2026-08-24, and the one the server-ranked selection now wires.
-    // Live-verified 2026-08-24 via the public proxy /patch/view: free tier,
-    // purl pkg:gem/activestorage@6.0.3?platform=ruby, single CRITICAL
-    // advisory GHSA-xr9x-r78c-5hrm.
+    // GHSA-xr9x-r78c-5hrm / CVE-2026-66066 (image_processing_transformer.rb +
+    // NEW lib/active_storage/vips.rb backporting the libvips
+    // unfuzzed-operations hardening), published 2026-08-21T19:07Z — the fifth
+    // advisory, and the one the server-ranked selection now wires.
+    // /patch/view blobs live-verified 2026-08-24: both files carry the Socket
+    // Community Patch header and git-blob-sha256-match their manifest
+    // afterHash entries.
     "9c2b4925-b413-4a3a-bb3a-9990440fb446",
 ];
 
