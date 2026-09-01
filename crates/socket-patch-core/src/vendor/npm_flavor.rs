@@ -939,6 +939,50 @@ mod tests {
         );
     }
 
+    /// The router's documented contract: probe refusals (PnP, bun.lockb,
+    /// unsupported lock versions, missing locks) surface VERBATIM through
+    /// `vendor_npm_any` — same code, same detail, nothing remapped — and a
+    /// refusal writes nothing. (The one other Refused-outcome test gets its
+    /// refusal from a backend AFTER a successful probe; this one exercises
+    /// the probe-refusal arm itself.)
+    #[tokio::test]
+    async fn router_surfaces_probe_refusals_verbatim() {
+        let (tmp, record) = npm_project().await;
+        tokio::fs::remove_file(tmp.path().join("package-lock.json"))
+            .await
+            .unwrap();
+        touch(tmp.path(), "bun.lockb", "binary").await;
+
+        let outcome = vendor_any(tmp.path(), &record).await;
+        let VendorOutcome::Refused { code, detail } = outcome else {
+            panic!("expected the probe's Refused, got {outcome:?}");
+        };
+        assert_eq!(code, "vendor_bun_lockb_unsupported");
+        assert!(
+            detail.contains("bun install --save-text-lockfile"),
+            "the probe's remedy must surface unremapped: {detail}"
+        );
+        assert!(
+            !tmp.path().join(".socket/vendor").exists(),
+            "a probe refusal writes nothing"
+        );
+
+        // No lockfile at all: the missing-lock refusal surfaces the same way.
+        tokio::fs::remove_file(tmp.path().join("bun.lockb"))
+            .await
+            .unwrap();
+        let outcome = vendor_any(tmp.path(), &record).await;
+        let VendorOutcome::Refused { code, detail } = outcome else {
+            panic!("expected the probe's Refused, got {outcome:?}");
+        };
+        assert_eq!(code, "vendor_lockfile_missing");
+        assert!(
+            detail.contains(&tmp.path().display().to_string()),
+            "the probe's root-naming detail must surface unremapped: {detail}"
+        );
+        assert!(!tmp.path().join(".socket/vendor").exists());
+    }
+
     #[tokio::test]
     async fn revert_routes_by_flavor_and_fails_closed_on_unknown() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1045,6 +1089,53 @@ mod tests {
 
         // Unknown flavor: undeterminable, fail-safe keep.
         let entry = probe_entry(Some("future-pm"));
+        assert_eq!(vendored_entry_in_use(&entry, tmp.path()).await, None);
+    }
+
+    /// An entry stamped `flavor="pnpm-legacy"` must dispatch to the legacy
+    /// backend's structural packages-key probe — not fall into the
+    /// unknown-flavor `Some(_) => None` arm (a typo'd match string would
+    /// silently make scan's GC keep every legacy entry forever). Only the
+    /// legacy backend can return `Some(..)` here: the lock is a 5.4 grammar
+    /// the textual flavors never probe.
+    #[tokio::test]
+    async fn vendored_entry_in_use_routes_pnpm_legacy_to_the_legacy_backend() {
+        let entry = probe_entry(Some("pnpm-legacy"));
+
+        // Missing lock: undeterminable.
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(vendored_entry_in_use(&entry, tmp.path()).await, None);
+
+        // A legacy-grammar lock whose packages section keys our artifact:
+        // in use — only the legacy backend's structural probe says so.
+        touch(
+            tmp.path(),
+            "pnpm-lock.yaml",
+            &format!(
+                "lockfileVersion: 5.4\n\npackages:\n\n  \
+                 file:.socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz:\n    \
+                 resolution: {{tarball: file:.socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz}}\n    \
+                 name: left-pad\n    version: 1.3.0\n    dev: false\n"
+            ),
+        )
+        .await;
+        assert_eq!(vendored_entry_in_use(&entry, tmp.path()).await, Some(true));
+
+        // Dep removed + re-locked (no packages key references the artifact):
+        // provably unused.
+        touch(
+            tmp.path(),
+            "pnpm-lock.yaml",
+            "lockfileVersion: 5.4\n\npackages:\n\n  file:consumer:\n    \
+             resolution: {directory: consumer, type: directory}\n    \
+             name: consumer\n    version: 1.0.0\n",
+        )
+        .await;
+        assert_eq!(vendored_entry_in_use(&entry, tmp.path()).await, Some(false));
+
+        // A v9 grammar is not the legacy backend's to judge: undeterminable,
+        // fail-safe keep.
+        touch(tmp.path(), "pnpm-lock.yaml", "lockfileVersion: '9.0'\n").await;
         assert_eq!(vendored_entry_in_use(&entry, tmp.path()).await, None);
     }
 

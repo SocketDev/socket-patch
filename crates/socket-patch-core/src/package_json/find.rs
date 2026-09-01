@@ -192,7 +192,10 @@ fn parse_pnpm_workspace_patterns(yaml_content: &str) -> Vec<String> {
 
     // A BOM is not Unicode whitespace, so `trim` would leave it glued to a
     // first-line `packages:` header and the whole section would be missed.
-    for line in strip_bom(yaml_content).lines() {
+    // Lines are collected up front so a flow sequence can hand the scanner
+    // its continuation lines — a `[` need not close on the line it opens on.
+    let lines: Vec<&str> = strip_bom(yaml_content).lines().collect();
+    for (idx, line) in lines.iter().enumerate() {
         let trimmed = line.trim();
 
         // The header may carry an inline comment (`packages: # globs`); a `#`
@@ -212,14 +215,25 @@ fn parse_pnpm_workspace_patterns(yaml_content: &str) -> Vec<String> {
 
         // The value may instead be a YAML flow sequence on the header line
         // (`packages: ['a/*', "b/*"]`) — pnpm's real YAML parser accepts it
-        // exactly like the block list.
+        // exactly like the block list. The sequence need not close on that
+        // line; the scanner consumes continuation lines up to the unquoted
+        // closing `]`.
         if let Some(rest) = after_key {
             if rest.starts_with(|c: char| c.is_whitespace()) && rest.trim_start().starts_with('[') {
-                return parse_yaml_flow_sequence(rest.trim_start());
+                return parse_yaml_flow_sequence(rest.trim_start(), &lines[idx + 1..]);
             }
         }
 
         if in_packages {
+            // The flow sequence may equally sit on its own line below the
+            // header (`packages:` then `  ['a/*']`); the next-section check
+            // below would otherwise break on the `[` and silently drop every
+            // pattern. Only the section's first item line can open one —
+            // after a real block item, a `[` line means the section ended.
+            if patterns.is_empty() && trimmed.starts_with('[') {
+                return parse_yaml_flow_sequence(trimmed, &lines[idx + 1..]);
+            }
+
             if !trimmed.is_empty() && !trimmed.starts_with('-') && !trimmed.starts_with('#') {
                 break;
             }
@@ -236,33 +250,49 @@ fn parse_pnpm_workspace_patterns(yaml_content: &str) -> Vec<String> {
     patterns
 }
 
-/// Parse a single-line YAML flow sequence (`['a', "b", c]`) into its scalar
-/// items. `s` starts at the `[`; anything after the closing `]` (e.g. an
-/// inline comment) is ignored. A `,` inside a quoted scalar is part of the
+/// Parse a YAML flow sequence (`['a', "b", c]`) into its scalar items.
+/// `first` starts at the `[`; when the sequence does not close on that line,
+/// scanning continues through `continuation` — pnpm's real parser accepts
+/// the multi-line spelling (`packages: [` with items on following lines) —
+/// until the unquoted closing `]`. Anything after the `]` (e.g. an inline
+/// comment) is ignored, and an unquoted whitespace-preceded `#` opens a
+/// comment running to end of line, so a `,` or `]` inside one neither splits
+/// nor closes the sequence. A `,` inside a quoted scalar is part of the
 /// value — a brace pattern carries one — not an item separator.
-fn parse_yaml_flow_sequence(s: &str) -> Vec<String> {
+fn parse_yaml_flow_sequence(first: &str, continuation: &[&str]) -> Vec<String> {
     let mut items = Vec::new();
     let mut current = String::new();
     let mut quote: Option<char> = None;
-    // Skip the opening `[`.
-    for c in s.chars().skip(1) {
-        match quote {
-            Some(q) => {
-                current.push(c);
-                if c == q {
-                    quote = None;
-                }
-            }
-            None => match c {
-                '\'' | '"' => {
-                    quote = Some(c);
+    // Skip the opening `[` (one ASCII byte).
+    let lines = std::iter::once(&first[1..]).chain(continuation.iter().copied());
+    'sequence: for line in lines {
+        // Start-of-line counts as whitespace: a leading `#` opens a comment.
+        let mut prev_is_whitespace = true;
+        'chars: for c in line.chars() {
+            match quote {
+                Some(q) => {
                     current.push(c);
+                    if c == q {
+                        quote = None;
+                    }
                 }
-                ',' => items.push(std::mem::take(&mut current)),
-                ']' => break,
-                _ => current.push(c),
-            },
+                None => match c {
+                    '\'' | '"' => {
+                        quote = Some(c);
+                        current.push(c);
+                    }
+                    ',' => items.push(std::mem::take(&mut current)),
+                    ']' => break 'sequence,
+                    // Comment through end of line.
+                    '#' if prev_is_whitespace => break 'chars,
+                    _ => current.push(c),
+                },
+            }
+            prev_is_whitespace = c.is_whitespace();
         }
+        // A line break separates tokens like any other whitespace; it is
+        // never part of a scalar.
+        current.push(' ');
     }
     items.push(current);
 
@@ -589,6 +619,50 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_parse_pnpm_flow_sequence_multiline() {
+        // A flow sequence need not close on the line it opens on: `packages: [`
+        // with items on the following lines is valid YAML, accepted by pnpm's
+        // real parser. The single-line scanner saw only the bare `[`, returned
+        // zero patterns, and — pnpm-workspace.yaml still marking the project
+        // as a pnpm workspace — every member was silently skipped.
+        assert_eq!(
+            parse_pnpm_workspace_patterns("packages: [\n  'packages/*',\n  \"apps/*\"\n]\n"),
+            vec!["packages/*", "apps/*"]
+        );
+        // Comments inside the sequence run to end of line; a `,` or `]` in
+        // one must not split or close the sequence. A quoted `,` stays part
+        // of its value across the line-by-line scan.
+        assert_eq!(
+            parse_pnpm_workspace_patterns(
+                "packages: [ # globs, right]\n  '{apps,libs}/*', # brace, glob\n  tools/*\n]"
+            ),
+            vec!["{apps,libs}/*", "tools/*"]
+        );
+    }
+
+    #[test]
+    fn test_parse_pnpm_flow_sequence_on_line_after_header() {
+        // The flow sequence may equally sit indented on its own line below the
+        // header (`packages:` then `  ['a']`). The next-section check used to
+        // break on the `[` line and drop every pattern.
+        assert_eq!(
+            parse_pnpm_workspace_patterns("packages:\n  ['packages/*', apps/*]"),
+            vec!["packages/*", "apps/*"]
+        );
+        // ...preceded by comment/blank lines, and itself spanning lines.
+        assert_eq!(
+            parse_pnpm_workspace_patterns("packages:\n  # globs\n\n  [\n    'packages/*'\n  ]"),
+            vec!["packages/*"]
+        );
+        // After a real block item a `[` line is NOT a flow sequence — the
+        // section simply ended (same next-section break as any other line).
+        assert_eq!(
+            parse_pnpm_workspace_patterns("packages:\n  - real/*\n['other']"),
+            vec!["real/*"]
+        );
+    }
+
     #[tokio::test]
     async fn detect_package_manager_accepts_every_table_flagged_pnpm_marker() {
         // Behavioral pin on the shared npm_family table wiring: every row
@@ -764,6 +838,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_detect_workspaces_non_array_workspaces_field() {
+        // "workspaces" present but neither array nor object (a bare string,
+        // null, ...) hits the else-arm: WorkspaceType::Npm with zero
+        // patterns. Characterizes the current contract — note this also
+        // suppresses the no-workspace fallback walk (pinned end-to-end
+        // below); if the team decides such values should degrade to
+        // WorkspaceType::None (npm semantics), update detect_workspaces and
+        // flip these assertions together.
+        for spelling in [
+            r#"{"workspaces": "packages/*"}"#,
+            r#"{"workspaces": null}"#,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let pkg = dir.path().join("package.json");
+            fs::write(&pkg, spelling).await.unwrap();
+            let config = detect_workspaces(&pkg).await;
+            assert!(
+                matches!(config.ws_type, WorkspaceType::Npm),
+                "non-array workspaces must still read as npm: {spelling}"
+            );
+            assert!(
+                config.patterns.is_empty(),
+                "no patterns can be extracted from: {spelling}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_find_non_array_workspaces_suppresses_fallback_walk() {
+        // End-to-end consequence of the else-arm above: a non-array
+        // "workspaces" value marks the project as an (empty) npm workspace,
+        // so the no-workspace fallback walk never runs and a nested manifest
+        // is NOT discovered — only the root comes back.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"workspaces": "packages/*"}"#,
+        )
+        .await
+        .unwrap();
+        let sub = dir.path().join("packages").join("a");
+        fs::create_dir_all(&sub).await.unwrap();
+        fs::write(sub.join("package.json"), r#"{"name":"a"}"#)
+            .await
+            .unwrap();
+        let result = find_package_json_files(dir.path()).await;
+        assert!(matches!(result.workspace_type, WorkspaceType::Npm));
+        assert_eq!(
+            result.files.len(),
+            1,
+            "only the root must be found: {:?}",
+            result.files.iter().map(|f| &f.path).collect::<Vec<_>>()
+        );
+        assert!(result.files[0].is_root);
+    }
+
+    #[tokio::test]
     async fn test_detect_workspaces_invalid_json() {
         let dir = tempfile::tempdir().unwrap();
         let pkg = dir.path().join("package.json");
@@ -880,6 +1011,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_find_pnpm_multiline_flow_sequence_members_discovered() {
+        // The multi-line spelling of the same gap: `packages: [` with items on
+        // the following lines parsed to zero patterns (the scanner saw only
+        // the bare `[`), so a real pnpm workspace reported zero members — and
+        // the fallback walk that would otherwise have found them is skipped
+        // for a pnpm workspace.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("package.json"), r#"{"name":"root"}"#)
+            .await
+            .unwrap();
+        fs::write(
+            dir.path().join("pnpm-workspace.yaml"),
+            "packages: [\n  'packages/*'\n]\n",
+        )
+        .await
+        .unwrap();
+        let pkg_a = dir.path().join("packages").join("a");
+        fs::create_dir_all(&pkg_a).await.unwrap();
+        fs::write(pkg_a.join("package.json"), r#"{"name":"a"}"#)
+            .await
+            .unwrap();
+        let result = find_package_json_files(dir.path()).await;
+        assert!(matches!(result.workspace_type, WorkspaceType::Pnpm));
+        assert!(
+            result
+                .files
+                .iter()
+                .any(|f| f.is_workspace && f.path.ends_with("packages/a/package.json")),
+            "multi-line flow-sequence member must be discovered: {:?}",
+            result.files.iter().map(|f| &f.path).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
     async fn test_find_nested_skips_node_modules() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("package.json"), r#"{"name":"root"}"#)
@@ -914,6 +1079,72 @@ mod tests {
         let result = find_package_json_files(dir.path()).await;
         // Only root (the deep one exceeds depth limit)
         assert_eq!(result.files.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_find_nested_manifest_without_workspaces() {
+        // No workspace config at all: the bounded fallback walk picks up a
+        // plain nested manifest and labels it {is_root: false,
+        // is_workspace: false} — the location contract `setup` relies on to
+        // tell fallback-walk hits apart from real workspace members.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("package.json"), r#"{"name":"root"}"#)
+            .await
+            .unwrap();
+        let sub = dir.path().join("sub");
+        fs::create_dir_all(&sub).await.unwrap();
+        fs::write(sub.join("package.json"), r#"{"name":"sub"}"#)
+            .await
+            .unwrap();
+        let result = find_package_json_files(dir.path()).await;
+        assert!(matches!(result.workspace_type, WorkspaceType::None));
+        assert_eq!(
+            result.files.len(),
+            2,
+            "root + nested manifest: {:?}",
+            result.files.iter().map(|f| &f.path).collect::<Vec<_>>()
+        );
+        assert!(result.files[0].is_root);
+        let nested = &result.files[1];
+        assert!(nested.path.ends_with("sub/package.json"));
+        assert!(!nested.is_root, "fallback-walk hit is not the root");
+        assert!(
+            !nested.is_workspace,
+            "fallback-walk hit is not a workspace member"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_find_nested_depth_boundary_included() {
+        // The fallback walk's guard is `depth > 5`, and a call at depth d
+        // discovers manifests one directory level below it — so a manifest
+        // exactly 6 levels down is the LAST included tier. The sibling test
+        // above pins exclusion at 7 levels; this pins the boundary from the
+        // inside so a future off-by-one can't silently shrink the walk.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("package.json"), r#"{"name":"root"}"#)
+            .await
+            .unwrap();
+        let mut deep = dir.path().to_path_buf();
+        for i in 0..6 {
+            deep = deep.join(format!("level{}", i));
+        }
+        fs::create_dir_all(&deep).await.unwrap();
+        fs::write(deep.join("package.json"), r#"{"name":"deep"}"#)
+            .await
+            .unwrap();
+        let result = find_package_json_files(dir.path()).await;
+        assert_eq!(
+            result.files.len(),
+            2,
+            "manifest 6 levels down must still be found: {:?}",
+            result.files.iter().map(|f| &f.path).collect::<Vec<_>>()
+        );
+        let nested = &result.files[1];
+        assert!(nested
+            .path
+            .ends_with("level0/level1/level2/level3/level4/level5/package.json"));
+        assert!(!nested.is_root && !nested.is_workspace);
     }
 
     #[tokio::test]
@@ -1035,6 +1266,25 @@ mod tests {
         // A `#` inside quotes is part of the value, not a comment.
         let yaml = "packages:\n  - 'packages/#weird'  # but this is a comment";
         assert_eq!(parse_pnpm_workspace_patterns(yaml), vec!["packages/#weird"]);
+    }
+
+    #[test]
+    fn test_parse_pnpm_unterminated_quote_kept_verbatim() {
+        // Malformed YAML: a quoted scalar with no closing quote. The quote
+        // scan in `parse_yaml_list_value` finds no matching pair and falls
+        // through to the unquoted-scalar path, so the item is neither
+        // dropped nor panicking — the raw text survives, leading quote
+        // included. Characterizes the fallthrough; if malformed quotes
+        // should instead be rejected, change parse_yaml_list_value and
+        // assert emptiness here.
+        assert_eq!(
+            parse_pnpm_workspace_patterns("packages:\n  - 'packages/*"),
+            vec!["'packages/*"]
+        );
+        assert_eq!(
+            parse_pnpm_workspace_patterns("packages:\n  - \"packages/*"),
+            vec!["\"packages/*"]
+        );
     }
 
     #[tokio::test]

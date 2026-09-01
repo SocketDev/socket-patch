@@ -992,6 +992,42 @@ distribution = false
         assert!(err.1.contains(UUID), "names the wired uuid: {}", err.1);
     }
 
+    /// Defensive wire-time InSync refusal: the orchestrator short-circuits
+    /// in-sync pre-flight and never calls wire on it, but if [`wire_pdm`] is
+    /// ever reached on an already-wired lock it must refuse rather than
+    /// re-record our own vendored unit as the ledger "original" — revert
+    /// would then restore vendored state instead of the registry state.
+    #[tokio::test]
+    async fn wire_on_in_sync_lock_refuses_without_writing() {
+        let tmp = write_project(LOCK_DIRECT_VENDORED, PYPROJECT_DIRECT).await;
+        let p = load_pdm_project(tmp.path()).await.unwrap();
+        assert_eq!(
+            check_target_guards(&p, "six", "1.16.0", UUID).unwrap(),
+            PdmTarget::InSync,
+            "precondition: the fixture is the in-sync hot path"
+        );
+
+        let err = wire_pdm(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UUID,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, "pypi_pdm_source_already_exists");
+        assert!(err.1.contains("nothing to wire"), "{}", err.1);
+        assert_eq!(
+            read_lock(tmp.path()).await,
+            LOCK_DIRECT_VENDORED,
+            "refusal writes nothing — the ledger's only original survives"
+        );
+    }
+
     #[tokio::test]
     async fn classify_dependency_covers_every_declaration_surface() {
         let p = |pyproject: Option<&str>| PdmProject {
@@ -1041,6 +1077,40 @@ distribution = false
             "transitive"
         );
         assert_eq!(classify_dependency(&p(None), "six"), "transitive");
+    }
+
+    /// The documented degrade contract's other half: a present-but-UNPARSEABLE
+    /// pyproject classifies as "transitive" instead of refusing (the missing
+    /// half is covered above — classification is diagnostics-only, the splice
+    /// is identical either way). Degenerate group shapes — a group value that
+    /// is not an array, a `dependency-groups` that is not table-like — degrade
+    /// the same way rather than panicking or misclassifying.
+    #[test]
+    fn classify_dependency_degrades_on_unparseable_and_degenerate_pyproject() {
+        let p = |pyproject: Option<&str>| PdmProject {
+            lock_text: String::new(),
+            lock: DocumentMut::new(),
+            pyproject_text: pyproject.map(str::to_string),
+            lock_version: "4.5.0".into(),
+            strategy: Vec::new(),
+            warnings: Vec::new(),
+        };
+        // Unparseable TOML: the parse-fail branch, never a refusal.
+        assert_eq!(
+            classify_dependency(&p(Some("not = valid = toml [")), "six"),
+            "transitive"
+        );
+        // A dependency-group whose value is not an array is skipped, even
+        // though its string names the package.
+        assert_eq!(
+            classify_dependency(&p(Some("[dependency-groups]\ndev = \"six\"\n")), "six"),
+            "transitive"
+        );
+        // A `dependency-groups` key that is not table-like is skipped whole.
+        assert_eq!(
+            classify_dependency(&p(Some("dependency-groups = 3\n")), "six"),
+            "transitive"
+        );
     }
 
     /// Dry-run purity: load + classify + guards are pure reads, mirroring
@@ -1103,6 +1173,50 @@ distribution = false
         );
     }
 
+    /// A write failure — a read-only project dir, so the atomic stage+rename
+    /// cannot create its stage sibling (the writable-parent invariant of
+    /// `atomic_write_bytes_preserving_mode`) — maps to the
+    /// orchestrator-surfaced `pypi_pdm_write_failed`, and the lock keeps its
+    /// pre-wire bytes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wire_write_failure_maps_to_pypi_pdm_write_failed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipping: running as root, 0o555 does not block writes");
+            return;
+        }
+
+        let tmp = write_project(LOCK_DIRECT_REGISTRY, PYPROJECT_DIRECT).await;
+        let p = load_pdm_project(tmp.path()).await.unwrap();
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let res = wire_pdm(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UUID,
+        )
+        .await;
+
+        // Restore before any assertion can unwind, so the tempdir cleans up.
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let err = res.unwrap_err();
+        assert_eq!(err.0, "pypi_pdm_write_failed");
+        assert!(err.1.starts_with("cannot write pdm.lock"), "{}", err.1);
+        assert_eq!(
+            read_lock(tmp.path()).await,
+            LOCK_DIRECT_REGISTRY,
+            "a failed write leaves the lock byte-untouched"
+        );
+    }
+
     /// A CRLF lock (e.g. a `core.autocrlf` checkout) parses fine but its
     /// physical lines differ from the LF-joined splice fragment, so the
     /// literal-text replace would match nothing — wiring must refuse
@@ -1132,6 +1246,77 @@ distribution = false
         .unwrap_err();
         assert_eq!(err.0, "pypi_pdm_lock_parse_failed");
         assert_eq!(read_lock(tmp.path()).await, crlf, "refusal writes nothing");
+    }
+
+    /// The parsed and textual lock views can diverge on hand-edited spelling:
+    /// TOML accepts `name="six"` / `files=[` without spaces, but the textual
+    /// scanner pins pdm's own `key = ` serialization. The parsed-view guards
+    /// pass, so the splice-time rescan must refuse fail-closed — never report
+    /// success while the literal-text replace matched nothing (the CRLF twin
+    /// above is the same class).
+    #[tokio::test]
+    async fn textual_parsed_view_divergence_refuses_fail_closed() {
+        // Direct probe: an absent package misses find_unit_span.
+        let err = rewrite_target_package_unit(
+            LOCK_DIRECT_REGISTRY,
+            "absent-pkg",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+        )
+        .unwrap_err();
+        assert_eq!(err.0, "pypi_pdm_lock_package_missing");
+        assert!(err.1.contains("absent-pkg"), "{}", err.1);
+
+        // `name="six"`: the parsed guards pass, the unit-span scan misses.
+        let lock = LOCK_DIRECT_REGISTRY.replace("name = \"six\"", "name=\"six\"");
+        let tmp = write_project(&lock, PYPROJECT_DIRECT).await;
+        let p = load_pdm_project(tmp.path()).await.unwrap();
+        assert_eq!(
+            check_target_guards(&p, "six", "1.16.0", UUID).unwrap(),
+            PdmTarget::Fresh,
+            "the parsed view accepts the no-space spelling; only the splice must refuse"
+        );
+        let err = wire_pdm(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UUID,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, "pypi_pdm_lock_package_missing");
+        assert_eq!(read_lock(tmp.path()).await, lock, "refusal writes nothing");
+
+        // `files=[`: the parsed guards see the hashed array, the textual
+        // files rewrite finds no `files = [` line.
+        let lock = LOCK_DIRECT_REGISTRY.replace("files = [", "files=[");
+        let tmp = write_project(&lock, PYPROJECT_DIRECT).await;
+        let p = load_pdm_project(tmp.path()).await.unwrap();
+        assert_eq!(
+            check_target_guards(&p, "six", "1.16.0", UUID).unwrap(),
+            PdmTarget::Fresh,
+            "the parsed view sees the hashed files entries; only the splice must refuse"
+        );
+        let err = wire_pdm(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UUID,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, "pypi_pdm_lock_parse_failed");
+        assert!(err.1.contains("no files array to rewrite"), "{}", err.1);
+        assert_eq!(read_lock(tmp.path()).await, lock, "refusal writes nothing");
     }
 
     /// mkfifo(2) directly rather than shelling out to the `mkfifo` binary —

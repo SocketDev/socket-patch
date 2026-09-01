@@ -1196,4 +1196,367 @@ mod tests {
             "drifted lock left alone"
         );
     }
+
+    /// A matched lock entry that is not a JSON object (the hand-edited
+    /// `"six": "1.16.0"` shorthand shape) refuses in the target guards
+    /// before anything is built or written.
+    #[tokio::test]
+    async fn guard_refuses_non_object_lock_entry() {
+        let mut lock: Value = serde_json::from_str(LOCK_DIRECT_REGISTRY).unwrap();
+        lock["default"]["six"] = serde_json::json!("1.16.0");
+        let tmp = write_lock(&to_canonical_json(&lock)).await;
+        let p = load_pipenv_project(tmp.path()).await.unwrap();
+
+        let err = check_target_guards(&p, "six", UUID).unwrap_err();
+        assert_eq!(err.0, "pypi_pipenv_lock_parse_failed");
+        assert!(
+            err.1.contains("default.six is not a JSON object"),
+            "{}",
+            err.1
+        );
+    }
+
+    /// Defensive in-sync refusal: the orchestrator short-circuits InSync
+    /// pre-flight and never calls wire on it, but wire re-runs the guards
+    /// itself and must refuse rather than re-record our own edit as an
+    /// "original" (which would poison the revert ledger).
+    #[tokio::test]
+    async fn wire_refuses_in_sync_lock_defensively() {
+        let tmp = write_lock(LOCK_DIRECT_VENDORED).await;
+        let p = load_pipenv_project(tmp.path()).await.unwrap();
+
+        let err = wire_pipenv(&p, tmp.path(), "six", REL_WHEEL, WHEEL_SHA, UUID)
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, "pypi_pipenv_source_already_exists");
+        assert!(err.1.contains("nothing to wire"), "{}", err.1);
+        assert_eq!(
+            read_lock(tmp.path()).await,
+            LOCK_DIRECT_VENDORED,
+            "refusal writes nothing"
+        );
+    }
+
+    /// A hand-maintained lock with NO `develop` key at all (every fixture
+    /// carries both sections): find_entries and the wire loop both skip the
+    /// absent section and the default entry wires normally.
+    #[tokio::test]
+    async fn wire_handles_lock_without_develop_section() {
+        let mut before: Value = serde_json::from_str(LOCK_DIRECT_REGISTRY).unwrap();
+        before.as_object_mut().unwrap().remove("develop");
+        let before_text = to_canonical_json(&before);
+        let tmp = write_lock(&before_text).await;
+        let p = load_pipenv_project(tmp.path()).await.unwrap();
+        assert_eq!(
+            check_target_guards(&p, "six", UUID).unwrap(),
+            PipenvTarget::Fresh,
+            "the absent develop section is skipped, not an error"
+        );
+
+        let (wiring, meta) = wire_default(&p, tmp.path()).await;
+        let mut after: Value = serde_json::from_str(LOCK_DIRECT_VENDORED).unwrap();
+        after.as_object_mut().unwrap().remove("develop");
+        assert_eq!(
+            read_lock(tmp.path()).await,
+            to_canonical_json(&after),
+            "default wired to the fixture shape; no develop key invented"
+        );
+        assert_eq!(wiring.len(), 1);
+        assert_eq!(wiring[0].key.as_deref(), Some("default:six"));
+        assert_eq!(meta.sections, vec!["default".to_string()]);
+    }
+
+    /// Per-entry idempotency: a mixed lock whose default entry ALREADY
+    /// carries our exact vendored shape (same uuid, so the guards say
+    /// Fresh via the develop entry) is skipped with NO wiring record —
+    /// only the registry-shaped develop entry is wired and recorded.
+    #[tokio::test]
+    async fn wire_skips_entry_already_in_exact_shape_mixed_sections() {
+        let registry: Value = serde_json::from_str(LOCK_DIRECT_REGISTRY).unwrap();
+        let six_registry = registry["default"]["six"].clone();
+        let mut before: Value = serde_json::from_str(LOCK_DIRECT_VENDORED).unwrap();
+        before["develop"]["six"] = six_registry.clone();
+        let before_text = to_canonical_json(&before);
+
+        let tmp = write_lock(&before_text).await;
+        let p = load_pipenv_project(tmp.path()).await.unwrap();
+        assert_eq!(
+            check_target_guards(&p, "six", UUID).unwrap(),
+            PipenvTarget::Fresh,
+            "the registry-shaped develop entry keeps the target Fresh"
+        );
+
+        let (wiring, meta) = wire_default(&p, tmp.path()).await;
+        assert_eq!(
+            wiring.len(),
+            1,
+            "no record for the already-exact default entry: {wiring:?}"
+        );
+        assert_eq!(wiring[0].key.as_deref(), Some("develop:six"));
+        assert_eq!(wiring[0].action, WiringAction::Rewritten);
+        assert_eq!(
+            wiring[0].original.as_ref(),
+            Some(&six_registry),
+            "the develop registry fragment is the recorded original"
+        );
+        assert_eq!(meta.sections, vec!["develop".to_string()]);
+
+        let mut after: Value = serde_json::from_str(LOCK_DIRECT_VENDORED).unwrap();
+        let six_vendored = after["default"]["six"].clone();
+        after["develop"]["six"] = six_vendored;
+        assert_eq!(
+            read_lock(tmp.path()).await,
+            to_canonical_json(&after),
+            "develop wired; default bytes unchanged"
+        );
+    }
+
+    /// Wire's atomic-write failure maps to `pypi_pipenv_write_failed` and
+    /// leaves the lock byte-untouched (the atomic write stages a temp file
+    /// in the read-only parent, so nothing is ever committed).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wire_write_failure_maps_pypi_pipenv_write_failed() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root bypasses permission bits; nothing to test
+        }
+        let tmp = write_lock(LOCK_DIRECT_REGISTRY).await;
+        let p = load_pipenv_project(tmp.path()).await.unwrap();
+        tokio::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o555))
+            .await
+            .unwrap();
+
+        let err = wire_pipenv(&p, tmp.path(), "six", REL_WHEEL, WHEEL_SHA, UUID)
+            .await
+            .unwrap_err();
+        tokio::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o755))
+            .await
+            .unwrap();
+        assert_eq!(err.0, "pypi_pipenv_write_failed");
+        assert!(err.1.contains("cannot write Pipfile.lock"), "{}", err.1);
+        assert_eq!(
+            read_lock(tmp.path()).await,
+            LOCK_DIRECT_REGISTRY,
+            "failed write leaves the lock byte-untouched"
+        );
+    }
+
+    /// Fail-closed: revert refuses to edit a lock it cannot parse — a hard
+    /// failure with remediation, and the garbage file is left byte-intact.
+    #[tokio::test]
+    async fn revert_fails_closed_on_unparseable_lock() {
+        let tmp = write_lock("{not json").await;
+        let wiring = vec![WiringRecord {
+            file: LOCK_FILE.to_string(),
+            kind: KIND_LOCK_ENTRY.to_string(),
+            action: WiringAction::Rewritten,
+            key: Some("default:six".to_string()),
+            original: Some(serde_json::json!({})),
+            new: Some(serde_json::json!({})),
+        }];
+        let meta = PipenvMeta {
+            sections: vec!["default".into()],
+        };
+
+        let outcome = revert_pipenv(&entry_for(wiring, meta), tmp.path(), false).await;
+        assert!(!outcome.success, "unparseable lock must fail the revert");
+        let error = outcome.error.as_deref().unwrap_or("");
+        assert!(error.contains("not parseable JSON"), "{error}");
+        assert!(error.contains("fix it and re-run revert"), "{error}");
+        assert!(!outcome.kept_artifact, "never set on failure");
+        assert_eq!(
+            read_lock(tmp.path()).await,
+            "{not json",
+            "the unparseable lock is left byte-intact"
+        );
+    }
+
+    /// Every left-alone drift arm past the allowlist gates: a known section
+    /// name missing from the live lock, an entry gone from its section, a
+    /// record with no `new` to compare against, and the same-uuid
+    /// hash-refresh record class wire deliberately produces (Rewritten with
+    /// original: None — no registry fragment to restore). Each is a
+    /// successful revert with exactly one drift warning and the lock bytes
+    /// UNCHANGED (changed=false must skip re-serialization entirely).
+    #[tokio::test]
+    async fn revert_drift_skips_missing_section_entry_new_and_missing_original() {
+        use serde_json::json;
+        let mut no_develop: Value = serde_json::from_str(LOCK_DIRECT_REGISTRY).unwrap();
+        no_develop.as_object_mut().unwrap().remove("develop");
+        let no_develop_text = to_canonical_json(&no_develop);
+        let vendored_six =
+            serde_json::from_str::<Value>(LOCK_DIRECT_VENDORED).unwrap()["default"]["six"].clone();
+
+        let rec = |key: &str, original: Option<Value>, new: Option<Value>| WiringRecord {
+            file: LOCK_FILE.to_string(),
+            kind: KIND_LOCK_ENTRY.to_string(),
+            action: WiringAction::Rewritten,
+            key: Some(key.to_string()),
+            original,
+            new,
+        };
+        let cases = [
+            (
+                no_develop_text.clone(),
+                rec("develop:six", Some(json!({"o": 1})), Some(json!({"n": 2}))),
+                "develop:six",
+                "record's section deleted from the live lock",
+            ),
+            (
+                LOCK_DIRECT_REGISTRY.to_string(),
+                rec(
+                    "default:absent-pkg",
+                    Some(json!({"o": 1})),
+                    Some(json!({"n": 2})),
+                ),
+                "default:absent-pkg",
+                "record's entry removed from the live section",
+            ),
+            (
+                LOCK_DIRECT_REGISTRY.to_string(),
+                rec("default:six", Some(json!({"different": true})), None),
+                "default:six",
+                "record carries no `new` to deep-compare against",
+            ),
+            (
+                LOCK_DIRECT_VENDORED.to_string(),
+                rec("default:six", None, Some(vendored_six.clone())),
+                "default:six",
+                "same-uuid hash-refresh record: live still equals what we wrote, \
+                 but there is no registry fragment to restore",
+            ),
+        ];
+        for (lock_text, record, key, label) in cases {
+            let tmp = write_lock(&lock_text).await;
+            let meta = PipenvMeta {
+                sections: vec!["default".into()],
+            };
+            let outcome = revert_pipenv(&entry_for(vec![record], meta), tmp.path(), false).await;
+            assert!(outcome.success, "{label}: {:?}", outcome.error);
+            assert_eq!(outcome.warnings.len(), 1, "{label}: {:?}", outcome.warnings);
+            assert_eq!(
+                outcome.warnings[0].code, "vendor_lock_entry_drifted",
+                "{label}"
+            );
+            assert!(
+                outcome.warnings[0].detail.contains(key),
+                "{label}: {}",
+                outcome.warnings[0].detail
+            );
+            assert_eq!(
+                read_lock(tmp.path()).await,
+                lock_text,
+                "{label}: nothing restored, nothing re-serialized"
+            );
+        }
+    }
+
+    /// The Added arm removes a lock entry — a destructive edit driven by
+    /// tamper-able state.json, gated ONLY by the live==rec.new deep-equality
+    /// check. wire_pipenv never emits Added (forward-compat/defensive), so
+    /// pin the gate: deep-equal removes exactly that entry; anything else
+    /// drifts and the lock stays byte-intact.
+    #[tokio::test]
+    async fn revert_added_record_removes_only_deep_equal_entry() {
+        let six_registry =
+            serde_json::from_str::<Value>(LOCK_DIRECT_REGISTRY).unwrap()["default"]["six"].clone();
+        let added = |new: Value| {
+            vec![WiringRecord {
+                file: LOCK_FILE.to_string(),
+                kind: KIND_LOCK_ENTRY.to_string(),
+                action: WiringAction::Added,
+                key: Some("default:six".to_string()),
+                original: None,
+                new: Some(new),
+            }]
+        };
+        let meta = || PipenvMeta {
+            sections: vec!["default".into()],
+        };
+
+        // Deep-equal: the recorded entry is removed, nothing else touched.
+        let tmp = write_lock(LOCK_DIRECT_REGISTRY).await;
+        let outcome = revert_pipenv(
+            &entry_for(added(six_registry.clone()), meta()),
+            tmp.path(),
+            false,
+        )
+        .await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        let mut expected: Value = serde_json::from_str(LOCK_DIRECT_REGISTRY).unwrap();
+        expected["default"].as_object_mut().unwrap().remove("six");
+        assert_eq!(
+            read_lock(tmp.path()).await,
+            to_canonical_json(&expected),
+            "only default.six removed"
+        );
+
+        // Not deep-equal: the gate refuses the removal — drift warning, the
+        // entry survives, and the lock is not even re-serialized.
+        let tmp = write_lock(LOCK_DIRECT_REGISTRY).await;
+        let outcome = revert_pipenv(
+            &entry_for(added(serde_json::json!({"file": "./nope"})), meta()),
+            tmp.path(),
+            false,
+        )
+        .await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert_eq!(
+            outcome
+                .warnings
+                .iter()
+                .filter(|w| w.code == "vendor_lock_entry_drifted")
+                .count(),
+            1,
+            "{:?}",
+            outcome.warnings
+        );
+        assert_eq!(
+            read_lock(tmp.path()).await,
+            LOCK_DIRECT_REGISTRY,
+            "non-matching Added record must not delete the live entry"
+        );
+    }
+
+    /// Revert's write-failure outcome: the restore computes fine but the
+    /// commit fails (read-only project root) — a loud failure with the
+    /// wired lock left intact, no warnings, and kept_artifact false.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn revert_write_failure_reports_error() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root bypasses permission bits; nothing to test
+        }
+        let tmp = write_lock(LOCK_DIRECT_REGISTRY).await;
+        let p = load_pipenv_project(tmp.path()).await.unwrap();
+        let (wiring, meta) = wire_default(&p, tmp.path()).await;
+        let wired = read_lock(tmp.path()).await;
+        tokio::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o555))
+            .await
+            .unwrap();
+
+        let outcome = revert_pipenv(&entry_for(wiring, meta), tmp.path(), false).await;
+        tokio::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o755))
+            .await
+            .unwrap();
+        assert!(!outcome.success, "write failure must fail the revert");
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("cannot write Pipfile.lock")),
+            "{:?}",
+            outcome.error
+        );
+        assert!(!outcome.kept_artifact, "never set on failure");
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        assert_eq!(
+            read_lock(tmp.path()).await,
+            wired,
+            "failed write leaves the wired lock intact"
+        );
+    }
 }

@@ -564,6 +564,12 @@ mod tests {
         let (ns, name) = split_module_path("gopkg.in/yaml.v3");
         assert_eq!(ns, "gopkg.in");
         assert_eq!(name, "yaml.v3");
+
+        // A module path with NO slash is legal (e.g. `gotest.tools` through
+        // v2): the whole path is the name and the namespace is empty.
+        let (ns, name) = split_module_path("gotest.tools");
+        assert_eq!(ns, "");
+        assert_eq!(name, "gotest.tools");
     }
 
     #[tokio::test]
@@ -1144,5 +1150,155 @@ mod tests {
             packages[0].purl,
             "pkg:golang/github.com/gin-gonic/gin@v1.9.1"
         );
+    }
+
+    // ---- get_gomodcache env tests ----
+
+    /// Save and restore an env var around a test body.
+    struct EnvGuard {
+        key: &'static str,
+        prev: Option<String>,
+    }
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let prev = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self { key, prev }
+        }
+        fn unset(key: &'static str) -> Self {
+            let prev = std::env::var(key).ok();
+            std::env::remove_var(key);
+            Self { key, prev }
+        }
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_get_gomodcache_empty_env_fallback_chain() {
+        // `std::env::var` yields `Ok("")` for a set-but-empty var (a CI
+        // script exporting an unset variable). Every arm of the discovery
+        // chain must treat empty as unset — honoring `""` would yield a
+        // CWD-RELATIVE cache path (`go/pkg/mod` or `pkg/mod`), pointing the
+        // crawl (and the in-place patcher) at a directory inside the user's
+        // own project. Twin of `m2_repo_path`'s / `nuget_home`'s guards.
+        let gopath_a = tempfile::tempdir().unwrap();
+        let home_b = tempfile::tempdir().unwrap();
+
+        // Case A: empty GOMODCACHE falls through to GOPATH, and the empty
+        // FIRST GOPATH entry is skipped in favor of the next non-empty one
+        // (GOPATH is an OS-separator-delimited list; Go uses the first
+        // usable entry for the module cache).
+        let gopath_list =
+            std::env::join_paths(["".as_ref(), gopath_a.path().as_os_str()]).unwrap();
+        let _gomodcache = EnvGuard::set("GOMODCACHE", "");
+        let _gopath = EnvGuard::set("GOPATH", gopath_list.to_str().unwrap());
+        let _home = EnvGuard::set("HOME", "/nonexistent-home-unused");
+        let _userprofile = EnvGuard::unset("USERPROFILE");
+        assert_eq!(
+            GoCrawler::get_gomodcache(),
+            Some(gopath_a.path().join("pkg").join("mod")),
+            "empty GOMODCACHE must fall through to GOPATH, skipping the \
+             empty first GOPATH entry"
+        );
+
+        // Case B: GOMODCACHE and GOPATH both set-but-empty fall all the way
+        // through to the $HOME/go/pkg/mod default.
+        let _gopath_empty = EnvGuard::set("GOPATH", "");
+        let _home_b = EnvGuard::set("HOME", home_b.path().to_str().unwrap());
+        assert_eq!(
+            GoCrawler::get_gomodcache(),
+            Some(home_b.path().join("go").join("pkg").join("mod")),
+            "set-but-empty GOPATH must fall through to the HOME default"
+        );
+
+        // Case C: with HOME empty too (and USERPROFILE unset), discovery
+        // must report NO cache rather than fabricate a relative path.
+        let _home_empty = EnvGuard::set("HOME", "");
+        assert_eq!(
+            GoCrawler::get_gomodcache(),
+            None,
+            "all-empty env must yield None, never a CWD-relative path"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parse_versioned_dir_second_visit_same_purl_returns_none() {
+        // The `seen` dedup contract: crawl_all threads one HashSet through
+        // every parse so a module reachable twice (e.g. via multiple cache
+        // roots) surfaces exactly once. The second visit of the SAME purl
+        // must hit the seen-contains early-return and yield None.
+        let base = std::path::Path::new("/cache");
+        let dir = std::path::Path::new("/cache/github.com/foo/bar@v1.0.0");
+        let mut seen = HashSet::new();
+        let crawler = GoCrawler;
+
+        let first = crawler.parse_versioned_dir(base, dir, &mut seen).await;
+        let pkg = first.expect("first visit must parse the module");
+        assert_eq!(pkg.purl, "pkg:golang/github.com/foo/bar@v1.0.0");
+
+        let second = crawler.parse_versioned_dir(base, dir, &mut seen).await;
+        assert!(
+            second.is_none(),
+            "second visit of an already-seen purl must be deduplicated"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_crawl_all_slashless_module_path() {
+        // A single-segment module path with no `/` is real: `gotest.tools`
+        // (a widely-used assertion library) has a slashless module path
+        // through v2, so its versioned dir sits directly at the cache root.
+        let dir = tempfile::tempdir().unwrap();
+        let module_dir = dir.path().join("gotest.tools@v2.3.0");
+        tokio::fs::create_dir_all(&module_dir).await.unwrap();
+
+        let crawler = GoCrawler::new();
+        let options = CrawlerOptions {
+            cwd: dir.path().to_path_buf(),
+            global: false,
+            global_prefix: Some(dir.path().to_path_buf()),
+        };
+
+        let packages = crawler.crawl_all(&options).await;
+        assert_eq!(packages.len(), 1);
+        assert_eq!(packages[0].purl, "pkg:golang/gotest.tools@v2.3.0");
+        assert_eq!(packages[0].name, "gotest.tools");
+        assert_eq!(packages[0].version, "v2.3.0");
+        // Pins CURRENT behavior: split_module_path's no-slash arm returns an
+        // empty namespace, which the CrawledPackage construction wraps as
+        // `Some("")` rather than mapping to `None` (crawled_from_purl's
+        // convention for namespace-less packages).
+        assert_eq!(packages[0].namespace, Some(String::new()));
+        assert_eq!(packages[0].path, module_dir);
+    }
+
+    #[tokio::test]
+    async fn test_find_by_purls_slashless_module_path() {
+        // Same slashless module path through the PURL lookup:
+        // `parse_golang_purl` splits at the LAST `@`, so a no-slash name is
+        // accepted and must resolve to the root-level versioned dir.
+        let dir = tempfile::tempdir().unwrap();
+        let module_dir = dir.path().join("gotest.tools@v2.3.0");
+        tokio::fs::create_dir_all(&module_dir).await.unwrap();
+
+        let crawler = GoCrawler::new();
+        let purls = vec!["pkg:golang/gotest.tools@v2.3.0".to_string()];
+        let result = crawler.find_by_purls(dir.path(), &purls).await.unwrap();
+
+        assert_eq!(result.len(), 1);
+        let pkg = &result["pkg:golang/gotest.tools@v2.3.0"];
+        assert_eq!(pkg.name, "gotest.tools");
+        assert_eq!(pkg.version, "v2.3.0");
+        // Same Some("") pin as the crawl-side test above.
+        assert_eq!(pkg.namespace, Some(String::new()));
+        assert_eq!(pkg.path, module_dir);
     }
 }

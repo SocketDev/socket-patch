@@ -309,6 +309,134 @@ mod tests {
         }
     }
 
+    /// An OPENABLE non-regular lock file must be rejected by the
+    /// handle-based `is_file` check. The FIFO test above never reaches that
+    /// check — a reader-less FIFO fails the O_NONBLOCK open itself (ENXIO)
+    /// — so this plants a symlink to `/dev/null` instead: the open follows
+    /// the link and succeeds on the char device, and only the fstat
+    /// rejection stands between that handle and a bogus flock.
+    #[cfg(unix)]
+    #[test]
+    #[serial(update_state_dir_env)]
+    fn update_lock_rejects_openable_non_regular_lock_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let prev = std::env::var_os("SOCKET_UPDATE_STATE_DIR");
+        std::env::set_var("SOCKET_UPDATE_STATE_DIR", tmp.path());
+        std::os::unix::fs::symlink("/dev/null", tmp.path().join("update.lock")).unwrap();
+
+        let result = acquire_update_lock();
+
+        match prev {
+            Some(v) => std::env::set_var("SOCKET_UPDATE_STATE_DIR", v),
+            None => std::env::remove_var("SOCKET_UPDATE_STATE_DIR"),
+        }
+        match result {
+            Err(UpdateError::SwapFailed(msg)) => assert!(
+                msg.contains("not a regular file"),
+                "an openable non-regular lock must be caught by the is_file \
+                 check, not the open error the FIFO test exercises: {msg}"
+            ),
+            Err(other) => panic!("expected SwapFailed for a device lock file, got: {other}"),
+            Ok(Some(_)) => panic!("a /dev/null lock path must not yield a lock"),
+            Ok(None) => panic!("a /dev/null lock path must not silently degrade to unlocked"),
+        }
+    }
+
+    /// The rename-EACCES → `PermissionDenied { path: parent }` mapping —
+    /// the error code the CLI turns into the sudo hint. The read-only
+    /// install-dir e2e never reaches it: staging fails first (the stage
+    /// file cannot be created in the read-only dir), so `swap_binary` is
+    /// never called there. This is what a user sees when the install dir
+    /// becomes unwritable between stage and swap.
+    #[cfg(unix)]
+    #[test]
+    fn swap_rename_permission_denied_maps_to_parent_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().join("bin");
+        std::fs::create_dir(&bin_dir).unwrap();
+        let dest = bin_dir.join("socket-patch");
+        std::fs::write(&dest, b"old").unwrap();
+        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let staged = bin_dir.join(".socket-patch.stage-test");
+        std::fs::write(&staged, b"new").unwrap();
+        std::fs::set_permissions(&bin_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        // Root ignores directory write bits: probe, don't assume.
+        if std::fs::File::create(bin_dir.join("probe")).is_ok() {
+            let _ = std::fs::remove_file(bin_dir.join("probe"));
+            std::fs::set_permissions(&bin_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            eprintln!("skipping: running as root, read-only dir is not enforced");
+            return;
+        }
+
+        // dest's stat succeeds, no setuid, and the file chmod at the
+        // mode-carry step succeeds too (chmod needs ownership, not dir
+        // write) — so this fails exactly at the rename.
+        let result = swap_binary(&staged, &dest);
+
+        // Restore writability BEFORE asserting so TempDir cleanup can't
+        // wedge on a read-only dir.
+        std::fs::set_permissions(&bin_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, UpdateError::PermissionDenied { ref path } if *path == bin_dir),
+            "rename EACCES must map to PermissionDenied on the parent dir: {err}"
+        );
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            b"old",
+            "a failed rename must leave the target untouched"
+        );
+        // No stage-cleanup assertion: the failure IS an unwritable dir, so
+        // the best-effort remove cannot succeed — the age-gated
+        // sweep_stale_stages owns that leftover by design.
+    }
+
+    /// A rename failure that is NOT permission-shaped (here: dest is an
+    /// existing directory ⇒ EISDIR) must stay `SwapFailed` with the
+    /// "rename onto" context — and must still clean the stage, proving the
+    /// failure cleanup for a POST-refusal rename error in a writable dir
+    /// (the setuid test only proves it for pre-rename refusals).
+    #[cfg(unix)]
+    #[test]
+    fn swap_rename_onto_directory_is_swap_failed_and_cleans_stage() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("destdir");
+        std::fs::create_dir(&dest).unwrap();
+        let staged = tmp.path().join(".socket-patch.stage-test");
+        std::fs::write(&staged, b"new").unwrap();
+
+        let err = swap_binary(&staged, &dest).unwrap_err();
+
+        assert!(
+            matches!(err, UpdateError::SwapFailed(ref msg) if msg.contains("rename onto")),
+            "a non-EACCES rename failure must stay SwapFailed: {err}"
+        );
+        assert!(
+            dest.is_dir(),
+            "the obstructing directory must be left alone"
+        );
+        assert!(
+            !staged.exists(),
+            "the failure path must clean the stage even when the rename \
+             itself is what failed"
+        );
+    }
+
+    /// Pins the canonicalization contract in-process: the swap target is
+    /// the symlink-resolved current executable (macOS `current_exe` can
+    /// return the symlink used to exec), not the raw `current_exe` value.
+    #[test]
+    fn resolve_install_path_is_canonicalized_current_exe() {
+        let path = resolve_install_path().unwrap();
+        assert!(path.is_absolute());
+        assert_eq!(
+            path,
+            std::fs::canonicalize(std::env::current_exe().unwrap()).unwrap(),
+            "the swap target must be the canonicalized current exe"
+        );
+    }
+
     #[test]
     #[serial(update_state_dir_env)]
     fn update_lock_is_exclusive_and_released_on_drop() {

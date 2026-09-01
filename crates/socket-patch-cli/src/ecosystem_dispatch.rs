@@ -1268,6 +1268,96 @@ mod tests {
         }
     }
 
+    /// Deno is the ONE dispatch branch no other test drives end-to-end
+    /// (lcov: every other ecosystem's `scan_ecosystem!` invocation has
+    /// executed, deno's never has). Stage the JSR cache layout
+    /// `<root>/@<scope>/<name>/<version>/` and resolve a `pkg:jsr/` PURL
+    /// through the full dispatch — partition → `get_jsr_cache_paths`
+    /// (returns `global_prefix` verbatim) → `find_by_purls` → merge.
+    /// `silent = false` also executes the "Using Deno JSR cache at:"
+    /// banner branch for the deno invocation.
+    #[tokio::test]
+    async fn dispatch_find_deno_global_prefix_resolves_jsr_purl() {
+        let tmp = tempfile::tempdir().unwrap();
+        // JSR cache layout: <root>/@scope/name/version/ (scope keeps '@').
+        let pkg_dir = tmp.path().join("@std").join("path").join("0.220.0");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(pkg_dir.join("mod.ts"), b"export default 1;").unwrap();
+
+        let purl = "pkg:jsr/@std/path@0.220.0".to_string();
+        let partitioned = partition_purls(std::slice::from_ref(&purl), None);
+        // `pkg:jsr/` is the one PURL type whose token differs from its
+        // cli_name — it must partition to Ecosystem::Deno, not vanish.
+        assert_eq!(partitioned.len(), 1);
+        assert_eq!(partitioned.get(&Ecosystem::Deno), Some(&vec![purl.clone()]));
+
+        let options = CrawlerOptions {
+            cwd: tmp.path().to_path_buf(),
+            global: false,
+            global_prefix: Some(tmp.path().to_path_buf()),
+        };
+
+        let out = find_packages_for_purls(&partitioned, &options, false).await;
+        assert_eq!(
+            out.get(&purl),
+            Some(&pkg_dir),
+            "deno dispatch must resolve the jsr PURL to its cache dir"
+        );
+
+        // Deno is wired to `merge_first_wins` on the ROLLBACK path too (it
+        // has no release variants), so the same verbatim key must resolve.
+        // A refactor routing deno through `merge_qualified` would drop the
+        // key (the crawler echoes the verbatim input PURL, and rollback's
+        // qualified fan-out only re-keys stripped bases) — caught here.
+        let rb = find_packages_for_rollback(&partitioned, &options, false).await;
+        assert_eq!(
+            rb.get(&purl),
+            Some(&pkg_dir),
+            "deno rollback dispatch must keep the verbatim jsr key"
+        );
+    }
+
+    /// The `!silent` banner branch — "Using <label> at: <prefix>", printed
+    /// on global/global-prefix runs (`apply --global` shows it) — has never
+    /// executed for ANY labeled ecosystem: every existing dispatch test
+    /// passes `silent = true`. Drive it for all eight labeled ecosystems
+    /// (pypi's label is "" — deliberately suppressed) and pin the real
+    /// output contract: an empty prefix resolves NOTHING, so the banner
+    /// path must not fabricate phantom mappings. Every crawler's
+    /// `get_paths` returns `global_prefix` verbatim (verified per-crawler),
+    /// so no env vars are consulted and no serial guard is needed.
+    #[tokio::test]
+    async fn dispatch_global_prefix_nonsilent_prints_using_banner_for_labeled_ecosystems() {
+        for purl in [
+            "pkg:npm/foo@1.0.0",
+            "pkg:cargo/foo@1.0.0",
+            "pkg:gem/foo@1.0.0",
+            "pkg:golang/example.com/foo@v1.0.0",
+            "pkg:maven/org.example/foo@1.0.0",
+            "pkg:composer/vendor/foo@1.0.0",
+            "pkg:nuget/Foo@1.0.0",
+            "pkg:jsr/@std/foo@1.0.0",
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let options = CrawlerOptions {
+                cwd: tmp.path().to_path_buf(),
+                global: false,
+                global_prefix: Some(tmp.path().to_path_buf()),
+            };
+            let partitioned = partition_purls(&[purl.to_string()], None);
+            assert_eq!(
+                partitioned.len(),
+                1,
+                "{purl} must partition to exactly one ecosystem"
+            );
+            let out = find_packages_for_purls(&partitioned, &options, false).await;
+            assert!(
+                out.is_empty(),
+                "empty global prefix must resolve nothing for {purl}, got {out:?}"
+            );
+        }
+    }
+
     /// The PURL-lookup path (`find_packages_for_purls` — apply/vendor's
     /// resolver) must resolve a maven package from a local repository with
     /// no env opt-in of any kind.

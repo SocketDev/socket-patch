@@ -1446,6 +1446,67 @@ mod tests {
         );
     }
 
+    /// The scanner's false-positive guard: a `.socket` mention that is NOT
+    /// a parseable vendored-artifact path (the committed manifest, a
+    /// non-uuid path segment) must never be reported as a vendor reference
+    /// — `parse_vendor_path`'s reject branch is what keeps `repair` from
+    /// reconstructing ledger entries out of ordinary `.socket/` mentions.
+    #[tokio::test]
+    async fn scan_ignores_non_vendor_socket_mentions() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            tmp.path().join("package.json"),
+            r#"{
+  "name": "t",
+  "socketManifest": ".socket/manifest.json",
+  "notAVendorPath": ".socket/vendor/npm/not-a-uuid/x.tgz"
+}"#,
+        )
+        .await
+        .unwrap();
+        let refs = scan_vendor_references(tmp.path()).await;
+        assert!(
+            refs.is_empty(),
+            "non-vendor .socket mentions must be rejected: {refs:?}"
+        );
+    }
+
+    /// A lock that is PRESENT but does not reference the uuid must not
+    /// claim the entry: the probe falls through past pnpm-lock.yaml and
+    /// yarn.lock to the lock that actually carries the reference.
+    #[tokio::test]
+    async fn detect_reference_flavor_falls_through_present_unreferencing_locks() {
+        let uuid = "11111111-1111-4111-8111-111111111111";
+        let mention = format!("resolved: file:.socket/vendor/npm/{uuid}/left-pad-1.3.0.tgz\n");
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            tmp.path().join("pnpm-lock.yaml"),
+            "lockfileVersion: '9.0'\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(tmp.path().join("yarn.lock"), "# yarn lockfile v1\n")
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.path().join("package-lock.json"), &mention)
+            .await
+            .unwrap();
+        assert_eq!(
+            detect_reference_flavor(tmp.path(), "npm", uuid).await,
+            Some("package-lock".to_string()),
+            "present-but-unreferencing locks must fall through to the referencing one"
+        );
+    }
+
+    /// The empty-component rejects: a purl with no name or no version can
+    /// never drive a registry fetch — `npm_coords` must return `None`, not
+    /// empty coordinates.
+    #[test]
+    fn npm_coords_rejects_empty_name_or_version() {
+        assert_eq!(npm_coords("pkg:npm/@1.2.3"), None, "empty name");
+        assert_eq!(npm_coords("pkg:npm/left-pad@"), None, "empty version");
+    }
+
     /// The reconstruction stamps [`VendorEntry::flavor`] from whichever
     /// lockfile carries the vendored reference, so `vendor --revert` routes
     /// to the backend whose unwired-revert guard probes the RIGHT lockfile.

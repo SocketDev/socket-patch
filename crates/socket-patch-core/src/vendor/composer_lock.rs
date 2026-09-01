@@ -2316,4 +2316,973 @@ mod tests {
         );
         assert_eq!(code, "vendor_service_offline_conflict");
     }
+
+    // ───────────────────── coverage: refusal / no-op input shapes ─────────────
+
+    /// A purl from another ecosystem (a cross-wired manifest) is refused
+    /// before any disk access.
+    #[tokio::test]
+    async fn test_refuses_non_composer_purl() {
+        let lock = lock_value("psr/log", "3.0.2", false);
+        let (dir, blobs, installed, record) = fixture(&lock).await;
+        let root = dir.path();
+        let before = tokio::fs::read(root.join(COMPOSER_LOCK)).await.unwrap();
+
+        let (code, detail) = unwrap_refused(
+            run_vendor(
+                root,
+                &blobs,
+                &installed,
+                &record,
+                "pkg:npm/left-pad@1.3.0",
+                false,
+            )
+            .await,
+        );
+        assert_eq!(code, "unsafe_coordinates");
+        assert!(detail.contains("not a composer purl"), "{detail}");
+        assert!(!root.join(".socket").exists(), "refusal must write nothing");
+        assert_eq!(
+            tokio::fs::read(root.join(COMPOSER_LOCK)).await.unwrap(),
+            before
+        );
+    }
+
+    /// A metadata-only record (no files) is meaningless to vendor: no-op
+    /// success — no copy, no lock edit, no ledger entry.
+    #[tokio::test]
+    async fn test_empty_files_record_is_noop_success() {
+        let lock = lock_value("psr/log", "3.0.2", false);
+        let (dir, blobs, installed, mut record) = fixture(&lock).await;
+        let root = dir.path();
+        let before = tokio::fs::read(root.join(COMPOSER_LOCK)).await.unwrap();
+        record.files.clear();
+
+        let (result, entry, warnings) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, PURL, false).await);
+        assert!(result.success, "{:?}", result.error);
+        assert!(entry.is_none(), "no-op must not record a ledger entry");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(!root.join(".socket").exists(), "no copy created");
+        assert_eq!(
+            tokio::fs::read(root.join(COMPOSER_LOCK)).await.unwrap(),
+            before,
+            "lock untouched"
+        );
+    }
+
+    /// An unparseable composer.lock is as unusable as a missing one — same
+    /// refusal code, distinguishing detail.
+    #[tokio::test]
+    async fn test_refuses_unparseable_lock() {
+        let lock = lock_value("psr/log", "3.0.2", false);
+        let (dir, blobs, installed, record) = fixture(&lock).await;
+        let root = dir.path();
+        tokio::fs::write(root.join(COMPOSER_LOCK), b"{ not json")
+            .await
+            .unwrap();
+
+        let (code, detail) =
+            unwrap_refused(run_vendor(root, &blobs, &installed, &record, PURL, false).await);
+        assert_eq!(code, "vendor_lockfile_missing");
+        assert!(detail.contains("unparseable"), "{detail}");
+        assert!(!root.join(".socket").exists(), "refusal must write nothing");
+    }
+
+    /// Wired lock + missing copy under `--dry-run`: the rebuild is a WET
+    /// operation, so a dry run must fall through to the verify-only preview —
+    /// no copy recreated, no lock write, no rebuild warning.
+    #[tokio::test]
+    async fn test_wired_stale_copy_dry_run_rebuilds_nothing() {
+        let lock = lock_value("psr/log", "3.0.2", false);
+        let (dir, blobs, installed, record) = fixture(&lock).await;
+        let root = dir.path();
+
+        let (r1, e1, _) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, PURL, false).await);
+        assert!(r1.success, "{:?}", r1.error);
+        assert!(e1.is_some());
+        let lock_bytes = tokio::fs::read(root.join(COMPOSER_LOCK)).await.unwrap();
+
+        crate::patch::copy_tree::remove_tree(&root.join(copy_rel()))
+            .await
+            .unwrap();
+
+        let (r2, e2, w2) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, PURL, true).await);
+        assert!(r2.success, "{:?}", r2.error);
+        assert!(e2.is_none(), "dry run records nothing");
+        assert!(
+            w2.iter().all(|w| w.code != "vendor_artifact_rebuilt"),
+            "dry run must not rebuild: {w2:?}"
+        );
+        assert!(
+            !root.join(copy_rel()).exists(),
+            "dry run must not recreate the copy"
+        );
+        assert_eq!(
+            tokio::fs::read(root.join(COMPOSER_LOCK)).await.unwrap(),
+            lock_bytes,
+            "lock untouched"
+        );
+    }
+
+    // ───────────────────── coverage: vendor write-failure edges ───────────────
+
+    /// The marker is informational only: a squatted marker path (a directory
+    /// where the file goes) degrades to a `vendor_marker_write_failed`
+    /// warning while the vendor itself succeeds and records its entry.
+    #[tokio::test]
+    async fn test_marker_write_failure_degrades_to_warning() {
+        let lock = lock_value("psr/log", "3.0.2", false);
+        let (dir, blobs, installed, record) = fixture(&lock).await;
+        let root = dir.path();
+        // A directory squats the marker path: the atomic rename cannot land.
+        tokio::fs::create_dir_all(root.join(format!(
+            ".socket/vendor/composer/{UUID}/{VENDOR_MARKER_FILE}"
+        )))
+        .await
+        .unwrap();
+
+        let (result, entry, warnings) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, PURL, false).await);
+        assert!(
+            result.success,
+            "a marker failure must not fail the vendor: {:?}",
+            result.error
+        );
+        assert!(entry.is_some(), "the wiring is live, the entry is recorded");
+        assert!(
+            warnings.iter().any(|w| w.code == "vendor_marker_write_failed"),
+            "{warnings:?}"
+        );
+        // The surgery really landed despite the marker failure.
+        let text = tokio::fs::read_to_string(root.join(COMPOSER_LOCK))
+            .await
+            .unwrap();
+        assert!(text.contains(&copy_rel()), "lock rewired: {text}");
+        assert_eq!(
+            tokio::fs::read(root.join(copy_rel()).join("src/LoggerInterface.php"))
+                .await
+                .unwrap(),
+            PATCHED
+        );
+    }
+
+    /// Restores a directory's mode on drop so a failing assertion can never
+    /// wedge the TempDir cleanup behind a read-only dir.
+    #[cfg(unix)]
+    struct ModeGuard {
+        path: PathBuf,
+        mode: u32,
+    }
+
+    #[cfg(unix)]
+    impl ModeGuard {
+        fn set(path: &Path, mode: u32) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            let prev = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+            Self {
+                path: path.to_path_buf(),
+                mode: prev,
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for ModeGuard {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(
+                &self.path,
+                std::fs::Permissions::from_mode(self.mode),
+            );
+        }
+    }
+
+    /// composer.lock write failure AFTER a successful copy build: the fresh
+    /// uuid dir is unwound (wiring runs last — a copy the lock never points
+    /// at must not survive) and the failure is reported, lock untouched.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_lock_write_failure_removes_copy_and_reports() {
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root ignores mode bits — the trigger cannot fire
+        }
+        let lock = lock_value("psr/log", "3.0.2", false);
+        let (dir, blobs, installed, record) = fixture(&lock).await;
+        let root = dir.path();
+        let before = tokio::fs::read(root.join(COMPOSER_LOCK)).await.unwrap();
+        // Writable vendor chain + read-only project root: the copy build
+        // succeeds, the lock's temp-file staging (in the root) fails.
+        tokio::fs::create_dir_all(root.join(".socket/vendor/composer"))
+            .await
+            .unwrap();
+        let guard = ModeGuard::set(root, 0o555);
+
+        let (result, entry, _w) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, PURL, false).await);
+        drop(guard);
+        assert!(!result.success);
+        let err = result.error.clone().unwrap_or_default();
+        assert!(err.contains("failed to write composer.lock"), "{err}");
+        assert!(entry.is_none());
+        assert!(
+            !root.join(".socket/vendor").exists(),
+            "a failed lock write must unwind the never-wired uuid dir"
+        );
+        assert_eq!(
+            tokio::fs::read(root.join(COMPOSER_LOCK)).await.unwrap(),
+            before,
+            "lock unchanged on failure"
+        );
+    }
+
+    // ───────────────────── coverage: service outcome matrix ───────────────────
+
+    /// `--vendor-source=build` disables the service outright: local build
+    /// only, zero network — no `vendor_prebuilt_*` warning may appear even
+    /// though a (dead) service endpoint is configured.
+    #[tokio::test]
+    async fn service_source_build_never_contacts_the_service() {
+        let lock = lock_value("psr/log", "3.0.2", false);
+        let (dir, blobs, installed, record) = fixture(&lock).await;
+        let root = dir.path();
+        let cfg = composer_service_cfg("http://127.0.0.1:1", VendorSource::Build, false);
+
+        let (result, entry, warnings) =
+            unwrap_done(vendor_with_service(root, &blobs, &installed, &record, &cfg).await);
+        assert!(result.success, "{:?}", result.error);
+        assert!(entry.is_some());
+        assert_eq!(
+            tokio::fs::read(root.join(copy_rel()).join("src/LoggerInterface.php"))
+                .await
+                .unwrap(),
+            PATCHED
+        );
+        assert!(
+            warnings.iter().all(|w| !w.code.starts_with("vendor_prebuilt")),
+            "build source must never touch the service: {warnings:?}"
+        );
+    }
+
+    /// A FRESH vendor whose prebuilt zip fails to extract (integrity-valid
+    /// garbage) refuses hard and leaves no `.socket/vendor` husk behind.
+    #[tokio::test]
+    async fn service_extract_failure_fresh_vendor_leaves_no_husk() {
+        let lock = lock_value("psr/log", "3.0.2", false);
+        let (dir, blobs, installed, record) = fixture(&lock).await;
+        let root = dir.path();
+        let before = tokio::fs::read(root.join(COMPOSER_LOCK)).await.unwrap();
+
+        let garbage = b"not a zip at all".to_vec();
+        let sri = sri_sha512(&garbage);
+        let server = wiremock::MockServer::start().await;
+        mount_composer_granted(&server, &sri, &garbage).await;
+
+        let (code, _) = unwrap_refused(
+            vendor_with_service(
+                root,
+                &blobs,
+                &installed,
+                &record,
+                &composer_service_cfg(&server.uri(), VendorSource::Service, false),
+            )
+            .await,
+        );
+        assert_eq!(code, "vendor_prebuilt_extract_failed");
+        assert!(
+            !root.join(".socket/vendor").exists(),
+            "a failed fresh extract must leave no vendor husk"
+        );
+        assert_eq!(
+            tokio::fs::read(root.join(COMPOSER_LOCK)).await.unwrap(),
+            before,
+            "lock untouched"
+        );
+    }
+
+    /// `service` mode + a still-building archive hard-fails (no fallback).
+    #[tokio::test]
+    async fn service_pending_service_mode_hard_fails() {
+        let lock = lock_value("psr/log", "3.0.2", false);
+        let (dir, blobs, installed, record) = fixture(&lock).await;
+        let root = dir.path();
+        let before = tokio::fs::read(root.join(COMPOSER_LOCK)).await.unwrap();
+        let server = wiremock::MockServer::start().await;
+        mount_composer_status(&server, "pending_build").await;
+
+        let (code, detail) = unwrap_refused(
+            vendor_with_service(
+                root,
+                &blobs,
+                &installed,
+                &record,
+                &composer_service_cfg(&server.uri(), VendorSource::Service, false),
+            )
+            .await,
+        );
+        assert_eq!(code, "vendor_prebuilt_required");
+        assert!(detail.contains("still building"), "{detail}");
+        assert!(!root.join(".socket").exists(), "nothing written");
+        assert_eq!(
+            tokio::fs::read(root.join(COMPOSER_LOCK)).await.unwrap(),
+            before
+        );
+    }
+
+    /// `auto` + a still-building archive falls back to the local build with a
+    /// `vendor_prebuilt_pending` advisory.
+    #[tokio::test]
+    async fn service_pending_auto_falls_back_to_build() {
+        let lock = lock_value("psr/log", "3.0.2", false);
+        let (dir, blobs, installed, record) = fixture(&lock).await;
+        let root = dir.path();
+        let server = wiremock::MockServer::start().await;
+        mount_composer_status(&server, "pending_build").await;
+
+        let (result, entry, warnings) = unwrap_done(
+            vendor_with_service(
+                root,
+                &blobs,
+                &installed,
+                &record,
+                &composer_service_cfg(&server.uri(), VendorSource::Auto, false),
+            )
+            .await,
+        );
+        assert!(result.success, "{:?}", result.error);
+        assert!(entry.is_some());
+        assert!(
+            warnings.iter().any(|w| w.code == "vendor_prebuilt_pending"),
+            "{warnings:?}"
+        );
+        assert_eq!(
+            tokio::fs::read(root.join(copy_rel()).join("src/LoggerInterface.php"))
+                .await
+                .unwrap(),
+            PATCHED
+        );
+    }
+
+    /// `service` mode + an unavailable archive (`not_found`) hard-fails; the
+    /// auto flavor of the same status is covered by
+    /// `service_unavailable_auto_falls_back_to_build`.
+    #[tokio::test]
+    async fn service_unavailable_service_mode_hard_fails() {
+        let lock = lock_value("psr/log", "3.0.2", false);
+        let (dir, blobs, installed, record) = fixture(&lock).await;
+        let root = dir.path();
+        let server = wiremock::MockServer::start().await;
+        mount_composer_status(&server, "not_found").await;
+
+        let (code, detail) = unwrap_refused(
+            vendor_with_service(
+                root,
+                &blobs,
+                &installed,
+                &record,
+                &composer_service_cfg(&server.uri(), VendorSource::Service, false),
+            )
+            .await,
+        );
+        assert_eq!(code, "vendor_prebuilt_required");
+        assert!(detail.contains("unavailable"), "{detail}");
+        assert!(!root.join(".socket").exists(), "nothing written");
+    }
+
+    /// A failed service REQUEST (HTTP 500 on the grant endpoint) under `auto`
+    /// warns `vendor_prebuilt_unavailable` and builds locally.
+    #[tokio::test]
+    async fn service_request_failure_auto_warns_and_builds_locally() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let lock = lock_value("psr/log", "3.0.2", false);
+        let (dir, blobs, installed, record) = fixture(&lock).await;
+        let root = dir.path();
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v0/orgs/acme/patches/package"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let (result, entry, warnings) = unwrap_done(
+            vendor_with_service(
+                root,
+                &blobs,
+                &installed,
+                &record,
+                &composer_service_cfg(&server.uri(), VendorSource::Auto, false),
+            )
+            .await,
+        );
+        assert!(result.success, "{:?}", result.error);
+        assert!(entry.is_some());
+        assert!(
+            warnings.iter().any(|w| w.code == "vendor_prebuilt_unavailable"),
+            "the fallback must record why the service was skipped: {warnings:?}"
+        );
+        assert_eq!(
+            tokio::fs::read(root.join(copy_rel()).join("src/LoggerInterface.php"))
+                .await
+                .unwrap(),
+            PATCHED
+        );
+    }
+
+    /// A granted archive whose copy dir cannot be created (read-only
+    /// `.socket/vendor/composer`) hard-fails `vendor_prebuilt_write_failed`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn service_copy_dir_create_failure_hard_fails() {
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root ignores mode bits — the trigger cannot fire
+        }
+        let lock = lock_value("psr/log", "3.0.2", false);
+        let (dir, blobs, installed, record) = fixture(&lock).await;
+        let root = dir.path();
+        let before = tokio::fs::read(root.join(COMPOSER_LOCK)).await.unwrap();
+        let zip = make_dist_zip(
+            "php-fig-log-f16e1d5",
+            &[
+                ("src/LoggerInterface.php", PATCHED),
+                ("composer.json", b"{\"name\": \"psr/log\"}\n"),
+            ],
+        );
+        let sri = sri_sha512(&zip);
+        let server = wiremock::MockServer::start().await;
+        mount_composer_granted(&server, &sri, &zip).await;
+
+        let composer_dir = root.join(".socket/vendor/composer");
+        tokio::fs::create_dir_all(&composer_dir).await.unwrap();
+        let guard = ModeGuard::set(&composer_dir, 0o555);
+
+        let (code, detail) = unwrap_refused(
+            vendor_with_service(
+                root,
+                &blobs,
+                &installed,
+                &record,
+                &composer_service_cfg(&server.uri(), VendorSource::Service, false),
+            )
+            .await,
+        );
+        drop(guard);
+        assert_eq!(code, "vendor_prebuilt_write_failed");
+        assert!(detail.contains("cannot create"), "{detail}");
+        assert_eq!(
+            tokio::fs::read(root.join(COMPOSER_LOCK)).await.unwrap(),
+            before,
+            "lock untouched"
+        );
+    }
+
+    // ───────────────────── coverage: helper unit tests ────────────────────────
+
+    /// Malformed lock entries — a bare string, no name, no version, a
+    /// same-name/other-version sibling — are skipped leniently until the real
+    /// match; a lock without either section (or a non-array one) yields None.
+    #[test]
+    fn test_find_lock_entry_skips_malformed_entries() {
+        let lock = json!({
+            "packages": [
+                "not-an-object",
+                { "version": "1.0" },
+                { "name": "psr/log" },
+                { "name": "psr/log", "version": "2.0.0" },
+                { "name": "psr/log", "version": "3.0.2" }
+            ]
+        });
+        assert_eq!(
+            find_lock_entry(&lock, "psr/log", "3.0.2"),
+            Some(("packages", 4))
+        );
+        assert_eq!(
+            find_lock_entry(&json!({ "content-hash": "abc" }), "psr/log", "3.0.2"),
+            None
+        );
+        assert_eq!(
+            find_lock_entry(&json!({ "packages": "oops" }), "psr/log", "3.0.2"),
+            None
+        );
+    }
+
+    /// A source-only entry (no `dist`) gets `dist` + `transport-options`
+    /// appended at the end; a pre-existing `transport-options` (wherever it
+    /// sits) is superseded by ours, never duplicated.
+    #[test]
+    fn test_rewrite_lock_entry_source_only_and_transport_dedup() {
+        let original = json!({
+            "name": "psr/log",
+            "version": "3.0.2",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/php-fig/log.git",
+                "reference": "f16e1d5"
+            },
+            "type": "library"
+        });
+        let out = rewrite_lock_entry(original.as_object().unwrap(), "rel/copy", "uuid-x");
+        let keys: Vec<&str> = out.keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            vec!["name", "version", "type", "dist", "transport-options"],
+            "source dropped, dist + transport-options appended at the end"
+        );
+        assert_eq!(out["dist"]["type"], "path");
+        assert_eq!(out["dist"]["url"], "rel/copy");
+        assert_eq!(out["dist"]["reference"], "uuid-x");
+        assert_eq!(out["transport-options"]["symlink"], json!(false));
+
+        let original = json!({
+            "name": "psr/log",
+            "transport-options": { "symlink": true },
+            "dist": { "type": "zip", "url": "https://example.com/x.zip" },
+            "type": "library"
+        });
+        let out = rewrite_lock_entry(original.as_object().unwrap(), "rel/copy", "uuid-x");
+        let keys: Vec<&str> = out.keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            vec!["name", "dist", "transport-options", "type"],
+            "exactly one transport-options, right after the replaced dist"
+        );
+        assert_eq!(
+            out["transport-options"]["symlink"],
+            json!(false),
+            "our transport-options supersedes the pre-existing one"
+        );
+    }
+
+    /// The stranded scan degrades to empty on a missing/unparseable/odd-shaped
+    /// lock, skips a wired entry without a name, reports an unrestorable
+    /// wired entry lowercased, and clears once a wiring record can restore it.
+    #[tokio::test]
+    async fn test_stranded_scan_degrades_on_unreadable_or_odd_shapes() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join(COMPOSER_LOCK);
+        let none: HashSet<String> = HashSet::new();
+
+        // Missing lock: nothing can be consuming it.
+        assert!(stranded_wired_packages(&lock_path, UUID, &none)
+            .await
+            .is_empty());
+        // Unparseable lock: same degrade (the restore loop reports drift).
+        tokio::fs::write(&lock_path, b"not json").await.unwrap();
+        assert!(stranded_wired_packages(&lock_path, UUID, &none)
+            .await
+            .is_empty());
+        // No package sections at all.
+        tokio::fs::write(
+            &lock_path,
+            composer_json_bytes(&json!({ "content-hash": "x" })).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(stranded_wired_packages(&lock_path, UUID, &none)
+            .await
+            .is_empty());
+
+        // A wired entry without a name is skipped; the named one (pretty
+        // casing) comes back lowercased.
+        let lock = json!({
+            "packages": [
+                { "dist": { "type": "path", "url": copy_rel() } },
+                { "name": "Psr/Log", "dist": { "type": "path", "url": copy_rel() } }
+            ]
+        });
+        tokio::fs::write(&lock_path, composer_json_bytes(&lock).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            stranded_wired_packages(&lock_path, UUID, &none).await,
+            vec!["psr/log".to_string()]
+        );
+        // The same entry is no longer stranded once a record can restore it.
+        let restorable: HashSet<String> =
+            std::iter::once("packages:psr/log".to_string()).collect();
+        assert!(stranded_wired_packages(&lock_path, UUID, &restorable)
+            .await
+            .is_empty());
+    }
+
+    // ───────────────────── coverage: revert guard rails ───────────────────────
+
+    /// SECURITY: a tampered state.json uuid (the key of the dir revert
+    /// deletes) is rejected fail-closed before any disk access.
+    #[tokio::test]
+    async fn test_revert_refuses_non_canonical_uuid() {
+        let lock = lock_value("psr/log", "3.0.2", false);
+        let (dir, blobs, installed, record) = fixture(&lock).await;
+        let root = dir.path();
+
+        let (result, entry, _w) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, PURL, false).await);
+        assert!(result.success);
+        let mut tampered = entry.unwrap();
+        let wired = tokio::fs::read(root.join(COMPOSER_LOCK)).await.unwrap();
+        tampered.uuid = "../../escape".to_string();
+
+        let outcome = revert_composer(&tampered, root, false).await;
+        assert!(!outcome.success);
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("non-canonical"),
+            "{:?}",
+            outcome.error
+        );
+        assert!(
+            root.join(format!(".socket/vendor/composer/{UUID}")).exists(),
+            "fail-closed: nothing deleted"
+        );
+        assert_eq!(
+            tokio::fs::read(root.join(COMPOSER_LOCK)).await.unwrap(),
+            wired,
+            "lock untouched"
+        );
+    }
+
+    /// `--preserve-state` (`keep_artifact`): the lock restore runs unchanged
+    /// while the artifact dir (copy + marker) stays behind; `kept_artifact`
+    /// stays false — it is reserved for drift-keeps.
+    #[tokio::test]
+    async fn test_revert_preserve_state_restores_lock_keeps_artifact() {
+        let lock = lock_value("psr/log", "3.0.2", false);
+        let (dir, blobs, installed, record) = fixture(&lock).await;
+        let root = dir.path();
+        let fixture_bytes = tokio::fs::read(root.join(COMPOSER_LOCK)).await.unwrap();
+
+        let (result, entry, _w) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, PURL, false).await);
+        assert!(result.success);
+        let entry = entry.unwrap();
+
+        let outcome = revert_composer_opts(
+            &entry,
+            root,
+            RevertOpts {
+                dry_run: false,
+                keep_artifact: true,
+            },
+        )
+        .await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(
+            !outcome.kept_artifact,
+            "kept_artifact stays reserved for drift-keeps"
+        );
+        assert_eq!(
+            tokio::fs::read(root.join(COMPOSER_LOCK)).await.unwrap(),
+            fixture_bytes,
+            "lock restored byte-identically"
+        );
+        assert!(
+            root.join(format!(
+                ".socket/vendor/composer/{UUID}/{VENDOR_MARKER_FILE}"
+            ))
+            .exists(),
+            "--preserve-state must keep the marker"
+        );
+        assert_eq!(
+            tokio::fs::read(root.join(copy_rel()).join("src/LoggerInterface.php"))
+                .await
+                .unwrap(),
+            PATCHED,
+            "--preserve-state must keep the patched copy"
+        );
+    }
+
+    /// A dry-run revert previews cleanly: no lock write, no deletion, no
+    /// drift warning.
+    #[tokio::test]
+    async fn test_revert_dry_run_writes_nothing() {
+        let lock = lock_value("psr/log", "3.0.2", false);
+        let (dir, blobs, installed, record) = fixture(&lock).await;
+        let root = dir.path();
+
+        let (result, entry, _w) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, PURL, false).await);
+        assert!(result.success);
+        let entry = entry.unwrap();
+        let wired = tokio::fs::read(root.join(COMPOSER_LOCK)).await.unwrap();
+
+        let outcome = revert_composer(&entry, root, true).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(
+            !outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_lock_entry_drifted"),
+            "a clean preview must not report drift: {:?}",
+            outcome.warnings
+        );
+        assert_eq!(
+            tokio::fs::read(root.join(COMPOSER_LOCK)).await.unwrap(),
+            wired,
+            "dry run must not rewrite the lock"
+        );
+        assert!(
+            root.join(copy_rel()).exists(),
+            "dry run must not delete the artifact"
+        );
+    }
+
+    /// An unrecognized wiring kind (a forward-version or tampered state.json)
+    /// warns `vendor_lock_entry_drifted` and leaves the fragment alone.
+    #[tokio::test]
+    async fn test_revert_unrecognized_wiring_kind_warns_and_continues() {
+        let lock = lock_value("psr/log", "3.0.2", false);
+        let (dir, blobs, installed, record) = fixture(&lock).await;
+        let root = dir.path();
+
+        let (result, entry, _w) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, PURL, false).await);
+        assert!(result.success);
+        let mut tampered = entry.unwrap();
+        let wired = tokio::fs::read(root.join(COMPOSER_LOCK)).await.unwrap();
+        tampered.wiring[0].kind = "composer_json_repo".to_string();
+
+        // keep_artifact skips the stranded refusal that would otherwise trip
+        // (an unrecognized kind is unrestorable by definition).
+        let outcome = revert_composer_opts(
+            &tampered,
+            root,
+            RevertOpts {
+                dry_run: false,
+                keep_artifact: true,
+            },
+        )
+        .await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(
+            outcome.warnings.iter().any(|w| w.code == "vendor_lock_entry_drifted"
+                && w.detail.contains("unrecognized wiring kind")),
+            "{:?}",
+            outcome.warnings
+        );
+        assert_eq!(
+            tokio::fs::read(root.join(COMPOSER_LOCK)).await.unwrap(),
+            wired,
+            "unknown wiring left alone"
+        );
+        assert!(root.join(copy_rel()).exists(), "artifact kept");
+    }
+
+    /// Malformed wiring records — no key, a colon-less key, an unknown
+    /// section, no recorded original — each drift-skip with a warning and
+    /// never touch the lock.
+    #[tokio::test]
+    async fn test_revert_malformed_wiring_records_drift_skip() {
+        let lock = lock_value("psr/log", "3.0.2", false);
+        let (dir, blobs, installed, record) = fixture(&lock).await;
+        let root = dir.path();
+
+        let (result, entry, _w) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, PURL, false).await);
+        assert!(result.success);
+        let entry = entry.unwrap();
+        let wired = tokio::fs::read(root.join(COMPOSER_LOCK)).await.unwrap();
+
+        let mut no_key = entry.clone();
+        no_key.wiring[0].key = None;
+        let mut no_colon = entry.clone();
+        no_colon.wiring[0].key = Some("nocolon".to_string());
+        let mut bad_section = entry.clone();
+        bad_section.wiring[0].key = Some("plugins:psr/log".to_string());
+        let mut no_original = entry.clone();
+        no_original.wiring[0].original = None;
+
+        for (label, tampered) in [
+            ("no key", no_key),
+            ("no colon", no_colon),
+            ("bad section", bad_section),
+            ("no original", no_original),
+        ] {
+            // keep_artifact: a malformed record is unrestorable, so a wet
+            // delete-the-artifacts revert would hit the stranded refusal.
+            let outcome = revert_composer_opts(
+                &tampered,
+                root,
+                RevertOpts {
+                    dry_run: false,
+                    keep_artifact: true,
+                },
+            )
+            .await;
+            assert!(outcome.success, "{label}: {:?}", outcome.error);
+            assert!(
+                outcome
+                    .warnings
+                    .iter()
+                    .any(|w| w.code == "vendor_lock_entry_drifted"),
+                "{label}: {:?}",
+                outcome.warnings
+            );
+            assert_eq!(
+                tokio::fs::read(root.join(COMPOSER_LOCK)).await.unwrap(),
+                wired,
+                "{label}: lock untouched"
+            );
+            assert!(root.join(copy_rel()).exists(), "{label}: artifact kept");
+        }
+    }
+
+    /// Drift shapes beyond the covered registry-dist rewrite: the whole lock
+    /// section vanished, or the package entry was dropped from the lock. Both
+    /// warn and still remove the artifact (composer's documented
+    /// delete-on-drift behavior — nothing wired consumes it any more).
+    #[tokio::test]
+    async fn test_revert_drift_section_or_entry_gone_still_removes_artifact() {
+        for strip_section in [true, false] {
+            let lock = lock_value("psr/log", "3.0.2", false);
+            let (dir, blobs, installed, record) = fixture(&lock).await;
+            let root = dir.path();
+
+            let (result, entry, _w) =
+                unwrap_done(run_vendor(root, &blobs, &installed, &record, PURL, false).await);
+            assert!(result.success);
+            let entry = entry.unwrap();
+
+            let mut drifted = lock_value("psr/log", "3.0.2", false);
+            if strip_section {
+                drifted.as_object_mut().unwrap().remove("packages");
+            } else {
+                drifted["packages"] = json!([]);
+            }
+            tokio::fs::write(
+                root.join(COMPOSER_LOCK),
+                composer_json_bytes(&drifted).unwrap(),
+            )
+            .await
+            .unwrap();
+            let drifted_bytes = tokio::fs::read(root.join(COMPOSER_LOCK)).await.unwrap();
+
+            let outcome = revert_composer(&entry, root, false).await;
+            assert!(
+                outcome.success,
+                "strip_section={strip_section}: {:?}",
+                outcome.error
+            );
+            assert!(
+                outcome
+                    .warnings
+                    .iter()
+                    .any(|w| w.code == "vendor_lock_entry_drifted"),
+                "strip_section={strip_section}: {:?}",
+                outcome.warnings
+            );
+            assert_eq!(
+                tokio::fs::read(root.join(COMPOSER_LOCK)).await.unwrap(),
+                drifted_bytes,
+                "strip_section={strip_section}: drifted lock left alone"
+            );
+            assert!(
+                !root.join(format!(".socket/vendor/composer/{UUID}")).exists(),
+                "strip_section={strip_section}: uuid dir still removed"
+            );
+        }
+    }
+
+    /// Artifact deletion failure AFTER the lock restore landed: the revert
+    /// reports the failure (success=false) with the lock already restored —
+    /// rerunning revert can finish the job.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_revert_artifact_removal_failure_reported_after_restore() {
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root ignores mode bits — the trigger cannot fire
+        }
+        let lock = lock_value("psr/log", "3.0.2", false);
+        let (dir, blobs, installed, record) = fixture(&lock).await;
+        let root = dir.path();
+        let fixture_bytes = tokio::fs::read(root.join(COMPOSER_LOCK)).await.unwrap();
+
+        let (result, entry, _w) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, PURL, false).await);
+        assert!(result.success);
+        let entry = entry.unwrap();
+
+        // The uuid dir's PARENT is read-only: its contents go, the final
+        // rmdir fails (removal needs write on the parent, which force
+        // deletion never chmods — it only relaxes dirs INSIDE the tree).
+        let composer_dir = root.join(".socket/vendor/composer");
+        let guard = ModeGuard::set(&composer_dir, 0o555);
+        let outcome = revert_composer(&entry, root, false).await;
+        drop(guard);
+
+        assert!(!outcome.success);
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("failed to remove"),
+            "{:?}",
+            outcome.error
+        );
+        assert_eq!(
+            tokio::fs::read(root.join(COMPOSER_LOCK)).await.unwrap(),
+            fixture_bytes,
+            "the lock restore lands BEFORE the failed deletion"
+        );
+        assert!(
+            root.join(format!(".socket/vendor/composer/{UUID}")).exists(),
+            "the undeletable uuid dir is still there"
+        );
+    }
+
+    /// composer.lock write failure during the restore: the revert fails with
+    /// the write error and the artifacts are kept (the error return precedes
+    /// the deletion) — the wired project still installs.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_revert_lock_write_failure_keeps_artifacts() {
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root ignores mode bits — the trigger cannot fire
+        }
+        let lock = lock_value("psr/log", "3.0.2", false);
+        let (dir, blobs, installed, record) = fixture(&lock).await;
+        let root = dir.path();
+
+        let (result, entry, _w) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, PURL, false).await);
+        assert!(result.success);
+        let entry = entry.unwrap();
+        let wired = tokio::fs::read(root.join(COMPOSER_LOCK)).await.unwrap();
+
+        // Read-only project root: the lock stays readable (the stranded scan
+        // and ownership gate still run) but the atomic write's temp file
+        // cannot be staged next to it.
+        let guard = ModeGuard::set(root, 0o555);
+        let outcome = revert_composer(&entry, root, false).await;
+        drop(guard);
+
+        assert!(!outcome.success);
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("failed to write composer.lock"),
+            "{:?}",
+            outcome.error
+        );
+        assert_eq!(
+            tokio::fs::read(root.join(COMPOSER_LOCK)).await.unwrap(),
+            wired,
+            "a failed restore leaves the wired lock in place"
+        );
+        assert!(
+            root.join(format!(
+                ".socket/vendor/composer/{UUID}/{VENDOR_MARKER_FILE}"
+            ))
+            .exists(),
+            "artifacts must survive a failed restore"
+        );
+    }
 }

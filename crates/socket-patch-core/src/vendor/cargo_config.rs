@@ -668,6 +668,30 @@ mod tests {
             .is_none());
     }
 
+    /// COVERAGE 2026-09: `[patch]` exists but `crates-io` is absent or not a
+    /// table. Only `[patch.crates-io]` is managed — an entry under some other
+    /// registry's patch table is never ours, even when its `path` value looks
+    /// socket-owned; and a scalar `crates-io` (adversarial hand edit) must be
+    /// a quiet no-op rather than a panic or a rewrite.
+    #[test]
+    fn test_remove_with_patch_but_no_crates_io_table_is_noop() {
+        // A different registry's patch table; crates-io absent entirely.
+        let toml = format!(
+            "[patch.my-registry]\nfoo = {{ path = \"{}\" }}\n",
+            vendor_path("foo", "1.0.0")
+        );
+        assert!(
+            remove_patch_entry(&toml, "foo").unwrap().is_none(),
+            "entries under a foreign registry's patch table are not managed"
+        );
+        // `crates-io` present but not table-like.
+        let toml = "[patch]\ncrates-io = \"oops\"\n";
+        assert!(
+            remove_patch_entry(toml, "cfg-if").unwrap().is_none(),
+            "a non-table crates-io value must be left untouched"
+        );
+    }
+
     // ── read_patch_entries / parse ───────────────────────────────────
     #[test]
     fn test_parse_entries_classifies_ownership() {
@@ -970,6 +994,44 @@ mod tests {
         assert!(out.is_empty(), "FIFO configs contribute no registries");
     }
 
+    /// COVERAGE 2026-09: the skip branches of `socket_registry_indexes` — a
+    /// malformed legacy `.cargo/config` alongside a good `config.toml` (a
+    /// real mixed/legacy state) contributes nothing, per the doc's
+    /// "malformed files contribute nothing" promise; a user-authored
+    /// `[registries.*]` entry (mirror / private registry) is never reported
+    /// as Socket's; and a socket-named table without an `index` key is
+    /// skipped rather than fabricated.
+    #[tokio::test]
+    async fn test_socket_registry_indexes_skips_malformed_and_foreign_registries() {
+        let dir = tempfile::tempdir().unwrap();
+        let cargo_dir = dir.path().join(".cargo");
+        fs::create_dir_all(&cargo_dir).await.unwrap();
+        fs::write(cargo_dir.join("config"), "not = = toml [[")
+            .await
+            .unwrap();
+        fs::write(
+            cargo_dir.join("config.toml"),
+            "[registries.my-mirror]\n\
+             index = \"https://example.com/idx\"\n\n\
+             [registries.socket-patch-9f6b2c4e]\n\
+             index = \"sparse+http://127.0.0.1:8000/idx/\"\n\n\
+             [registries.socket-patch-noindex]\n\
+             token = \"x\"\n",
+        )
+        .await
+        .unwrap();
+
+        let out = socket_registry_indexes(dir.path()).await;
+        assert_eq!(
+            out,
+            vec![(
+                "socket-patch-9f6b2c4e".to_string(),
+                "sparse+http://127.0.0.1:8000/idx/".to_string()
+            )],
+            "only the socket-named registry WITH an index is reported"
+        );
+    }
+
     // ── exact-restore: emptied socket-created config is deleted ──────
     #[tokio::test]
     async fn test_drop_deletes_socket_created_config_and_dir() {
@@ -1043,6 +1105,45 @@ mod tests {
         assert!(
             cargo_dir.exists() && cargo_dir.join("credentials.toml").exists(),
             ".cargo/ is kept because it still holds the user's credentials file"
+        );
+    }
+
+    /// COVERAGE 2026-09: a real `remove_file` failure in the delete branch
+    /// must propagate as `Err("remove {path}: …")` — a swallowed unlink error
+    /// would make `drop_patch_entry` report a successful revert while the
+    /// stale `[patch]` wiring still sits on disk.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_drop_errors_when_emptied_config_is_undeletable() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipping: root ignores directory permission bits");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            ensure_patch_entry(dir.path(), "cfg-if", &vendor_path("cfg-if", "1.0.4"), false)
+                .await
+                .unwrap()
+        );
+        let cargo_dir = dir.path().join(".cargo");
+        // Read-only dir: the emptied config's unlink gets EACCES.
+        fs::set_permissions(&cargo_dir, std::fs::Permissions::from_mode(0o555))
+            .await
+            .unwrap();
+        let res = drop_patch_entry(dir.path(), "cfg-if", false).await;
+        // Restore before asserting so the tempdir always cleans up.
+        fs::set_permissions(&cargo_dir, std::fs::Permissions::from_mode(0o755))
+            .await
+            .unwrap();
+        let err = res.expect_err("undeletable emptied config must fail the revert");
+        assert!(
+            err.starts_with("remove ") && err.contains("config.toml"),
+            "error must name the remove and the path: {err}"
+        );
+        assert!(
+            cargo_dir.join("config.toml").exists(),
+            "failed unlink must leave the config in place, not half-deleted"
         );
     }
 

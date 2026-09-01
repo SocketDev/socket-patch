@@ -1054,6 +1054,158 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_edit_gemfile_remove_read_error_is_error() {
+        // A non-NotFound read failure (here: a directory squatting on the
+        // Gemfile path, EISDIR on unix / access-denied on Windows) must
+        // surface as an Error result — NOT the missing-file no-op, which
+        // would let the remove flow proceed to delete the plugin dir while
+        // an unreadable Gemfile may still carry the live directive.
+        let dir = tempfile::tempdir().unwrap();
+        let gemfile = dir.path().join("Gemfile");
+        fs::create_dir(&gemfile).await.unwrap();
+
+        let res = edit_gemfile_remove(&gemfile, false).await;
+        assert_eq!(res.kind, "gemfile");
+        assert_eq!(
+            res.status,
+            GemSetupStatus::Error,
+            "an unreadable Gemfile is an error, not a no-op: {res:?}"
+        );
+        assert!(
+            res.error.as_deref().is_some_and(|e| !e.is_empty()),
+            "the read failure must be reported: {res:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_remove_on_unwired_gemfile_is_already_configured() {
+        // `setup --remove` on a project whose Gemfile exists but was never
+        // wired — a completely ordinary user flow. The Gemfile edit reports
+        // AlreadyConfigured (nothing to strip, no error), the bytes survive
+        // untouched, and the rest of the cleanup still runs without errors.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let gemfile = root.join("Gemfile");
+        fs::write(&gemfile, GEMFILE).await.unwrap();
+
+        let res = edit_gemfile_remove(&gemfile, false).await;
+        assert_eq!(res.status, GemSetupStatus::AlreadyConfigured, "{res:?}");
+        assert!(res.error.is_none(), "no error on a never-wired Gemfile");
+        assert_eq!(
+            fs::read_to_string(&gemfile).await.unwrap(),
+            GEMFILE,
+            "an unwired Gemfile survives byte-for-byte"
+        );
+
+        // The full remove flow on the same fixture: the AlreadyConfigured
+        // gemfile result must NOT early-return — the file/registration
+        // cleanup steps still run, and nothing errors.
+        let project = super::super::discover_bundler_project(root).await.unwrap();
+        let results = remove_plugin_directive_at(&project, None, false).await;
+        assert!(
+            results
+                .iter()
+                .any(|r| r.kind == "gemfile" && r.status == GemSetupStatus::AlreadyConfigured),
+            "the gemfile entry reports already-configured: {results:?}"
+        );
+        assert!(
+            results.iter().all(|r| r.status != GemSetupStatus::Error),
+            "remove on a never-wired project is error-free: {results:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(&gemfile).await.unwrap(),
+            GEMFILE,
+            "the full remove flow leaves the unwired Gemfile untouched"
+        );
+    }
+
+    /// Plant a FIFO with a direct `mkfifo(2)` syscall — same helper as the
+    /// gem/mod.rs / composer / find.rs FIFO tests: fork/exec flakes under
+    /// heavy parallel load and the syscall needs no process at all.
+    #[cfg(unix)]
+    fn mkfifo(path: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+        let c_path =
+            std::ffi::CString::new(path.as_os_str().as_bytes()).expect("fifo path has no NUL");
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
+        assert_eq!(
+            rc,
+            0,
+            "mkfifo(2) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_remove_reports_registration_residue_with_uninstall_remedy() {
+        // A wired project whose machine-local `.bundle/plugin/index` cannot
+        // be read (a FIFO squatting there — the deterministic stand-in for
+        // any unreadable index). The unwire itself succeeds, and the
+        // registration residue must surface as a `gem_plugin_registration`
+        // files[] Error naming the index path and the
+        // `bundler plugin uninstall socket-patch` remedy — the user-facing
+        // recovery messaging for the "bundle install warns forever" trap.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let gemfile = root.join("Gemfile");
+        // Write the wired Gemfile directly (remove is never version-gated,
+        // so no lockfile pin is needed and no `bundle` probe ever runs).
+        fs::write(&gemfile, gemfile_add(GEMFILE).unwrap())
+            .await
+            .unwrap();
+        let project = super::super::discover_bundler_project(root).await.unwrap();
+        let index = root.join(".bundle").join("plugin").join("index");
+        fs::create_dir_all(index.parent().unwrap()).await.unwrap();
+        mkfifo(&index);
+
+        // On timeout the open is wedged in a `spawn_blocking` thread that the
+        // runtime waits for on shutdown; connect a writer to release it so
+        // the test can FAIL instead of hanging the whole suite.
+        let deadline = std::time::Duration::from_secs(5);
+        let Ok(results) = tokio::time::timeout(
+            deadline,
+            remove_plugin_directive_at(&project, None, false),
+        )
+        .await
+        else {
+            let _ = std::fs::OpenOptions::new().write(true).open(&index);
+            panic!("remove must complete promptly with a FIFO index");
+        };
+
+        assert!(
+            results
+                .iter()
+                .any(|r| r.kind == "gemfile" && r.status == GemSetupStatus::Updated),
+            "the unwire itself succeeded: {results:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(&gemfile).await.unwrap(),
+            GEMFILE,
+            "the Gemfile is restored despite the registration residue"
+        );
+        let residue = results
+            .iter()
+            .find(|r| r.kind == "gem_plugin_registration")
+            .expect("the registration residue must be reported as its own entry");
+        assert_eq!(residue.status, GemSetupStatus::Error, "{residue:?}");
+        assert_eq!(residue.path, index.display().to_string());
+        let msg = residue.error.as_deref().unwrap_or_default();
+        assert!(
+            msg.contains("bundler plugin uninstall socket-patch"),
+            "the error must hand the user the uninstall remedy: {msg:?}"
+        );
+        assert!(
+            msg.contains(&index.display().to_string()),
+            "the error must name the index it could not clear: {msg:?}"
+        );
+        assert!(
+            std::fs::symlink_metadata(&index).is_ok(),
+            "the unreadable index must survive untouched"
+        );
+    }
+
+    #[tokio::test]
     async fn test_full_roundtrip_via_project() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();

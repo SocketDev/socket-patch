@@ -1882,6 +1882,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn goproxy_base_splits_on_pipe_separator() {
         // GOPROXY is a comma- OR pipe-separated list (go help goproxy); a
         // pipe-separated value must yield the first usable proxy, not a
@@ -2031,5 +2032,743 @@ mod tests {
             err.contains("cap") || err.contains("unreadable"),
             "oversize header fails closed: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn unknown_ecosystem_refuses_before_network() {
+        // Ecosystems without a fetcher (maven/nuget/deno) keep the caller's
+        // not-installed outcome via Unverifiable — decided BEFORE any I/O
+        // (the poison URL would hard-fail if contacted).
+        let entry = LockfileEntry {
+            ecosystem: "maven",
+            name: "org.apache.commons:commons-lang3".into(),
+            version: "3.14.0".into(),
+            purl: "pkg:maven/org.apache.commons/commons-lang3@3.14.0".into(),
+            resolved: Some("http://127.0.0.1:1/x.jar".into()),
+            integrity: LockIntegrity::Sha256Hex("0".repeat(64)),
+        };
+        match fetch_and_stage(&entry, &build_registry_client()).await {
+            Err(FetchError::Unverifiable(msg)) => assert!(
+                msg.contains("no registry fetcher for ecosystem `maven`"),
+                "{msg}"
+            ),
+            other => panic!("expected pre-network Unverifiable, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn per_ecosystem_unverifiable_refusals_without_network() {
+        // Each refusal is decidable from the lockfile alone, so each must be
+        // the Unverifiable kind — poison URLs prove no I/O happened.
+        let client = build_registry_client();
+
+        // composer.lock entry with no dist URL.
+        let entry = LockfileEntry {
+            ecosystem: "composer",
+            name: "monolog/monolog".into(),
+            version: "3.5.0".into(),
+            purl: "pkg:composer/monolog/monolog@3.5.0".into(),
+            resolved: None,
+            integrity: LockIntegrity::Sha1Hex("0".repeat(40)),
+        };
+        match fetch_and_stage(&entry, &client).await {
+            Err(FetchError::Unverifiable(msg)) => {
+                assert!(msg.contains("no dist URL"), "{msg}")
+            }
+            other => panic!("expected composer Unverifiable, got {other:?}"),
+        }
+
+        // Gem entry (safe coordinates) with no download URL.
+        let entry = LockfileEntry {
+            ecosystem: "gem",
+            name: "rails".into(),
+            version: "7.1.0".into(),
+            purl: "pkg:gem/rails@7.1.0".into(),
+            resolved: None,
+            integrity: LockIntegrity::Sha256Hex("0".repeat(64)),
+        };
+        match fetch_and_stage(&entry, &client).await {
+            Err(FetchError::Unverifiable(msg)) => {
+                assert!(msg.contains("no download URL"), "{msg}")
+            }
+            other => panic!("expected gem Unverifiable, got {other:?}"),
+        }
+
+        // Go modules verify via the go.sum h1 dirhash ONLY: any other
+        // integrity kind refuses before the URL is even built.
+        let entry = LockfileEntry {
+            ecosystem: "golang",
+            name: "github.com/x/y".into(),
+            version: "v1.0.0".into(),
+            purl: "pkg:golang/github.com/x/y@v1.0.0".into(),
+            resolved: Some("http://127.0.0.1:1/m.zip".into()),
+            integrity: LockIntegrity::Sha256Hex("0".repeat(64)),
+        };
+        match fetch_and_stage(&entry, &client).await {
+            Err(FetchError::Unverifiable(msg)) => {
+                assert!(msg.contains("h1 dirhash"), "{msg}")
+            }
+            other => panic!("expected golang Unverifiable, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cargo_crate_without_cargo_toml_refuses() {
+        // A sha256-VERIFIED .crate that extracts without a Cargo.toml is not
+        // a crate — the post-extraction shape check must fail the fetch.
+        let crate_bytes = make_tgz(&[("left-pad-1.3.0/src/lib.rs", b"pub fn pad() {}\n", false)]);
+        let sha = hex::encode(Sha256::digest(&crate_bytes));
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(url_path("/left-pad/left-pad-1.3.0.crate"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(crate_bytes))
+            .mount(&mock)
+            .await;
+
+        let entry = LockfileEntry {
+            ecosystem: "cargo",
+            name: "left-pad".into(),
+            version: "1.3.0".into(),
+            purl: "pkg:cargo/left-pad@1.3.0".into(),
+            resolved: Some(format!("{}/left-pad/left-pad-1.3.0.crate", mock.uri())),
+            integrity: LockIntegrity::Sha256Hex(sha),
+        };
+        match fetch_and_stage(&entry, &build_registry_client()).await {
+            Err(FetchError::Failed(msg)) => assert!(msg.contains("no Cargo.toml"), "{msg}"),
+            other => panic!("expected shape refusal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn composer_dist_without_composer_json_refuses() {
+        // sha1-verified zipball whose lone top dir carries no composer.json:
+        // the layout detection strips the top dir, finds nothing, refuses.
+        let zip_bytes = make_zip(&[("pkg-1.0/README.md", b"# not a composer package\n")]);
+        let sha1 = hex::encode(Sha1::digest(&zip_bytes));
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(url_path("/dists/pkg-1.0.zip"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(zip_bytes))
+            .mount(&mock)
+            .await;
+
+        let entry = LockfileEntry {
+            ecosystem: "composer",
+            name: "acme/pkg".into(),
+            version: "1.0.0".into(),
+            purl: "pkg:composer/acme/pkg@1.0.0".into(),
+            resolved: Some(format!("{}/dists/pkg-1.0.zip", mock.uri())),
+            integrity: LockIntegrity::Sha1Hex(sha1),
+        };
+        match fetch_and_stage(&entry, &build_registry_client()).await {
+            Err(FetchError::Failed(msg)) => assert!(msg.contains("no composer.json"), "{msg}"),
+            other => panic!("expected shape refusal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn npm_tarball_without_package_json_refuses() {
+        // SRI-verified tarball with no package.json — not an npm package.
+        let tgz = make_tgz(&[("package/index.js", b"module.exports = 1;\n", false)]);
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(url_path("/left-pad/-/left-pad-1.3.0.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(tgz.clone()))
+            .mount(&mock)
+            .await;
+
+        let entry = npm_entry(
+            Some(format!("{}/left-pad/-/left-pad-1.3.0.tgz", mock.uri())),
+            LockIntegrity::Sri(sri_of(&tgz)),
+        );
+        match fetch_and_stage(&entry, &build_registry_client()).await {
+            Err(FetchError::Failed(msg)) => assert!(msg.contains("no package.json"), "{msg}"),
+            other => panic!("expected shape refusal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn cargo_conventional_url_honors_registry_override() {
+        // Cargo.lock records no `resolved` URL for registry crates — the
+        // conventional `{base}/{name}/{name}-{version}.crate` construction
+        // (and the SOCKET_CRATES_REGISTRY override feeding it) must run.
+        let crate_bytes = make_tgz(&[(
+            "left-pad-1.3.0/Cargo.toml",
+            b"[package]\nname = \"left-pad\"\n",
+            false,
+        )]);
+        let sha = hex::encode(Sha256::digest(&crate_bytes));
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(url_path("/left-pad/left-pad-1.3.0.crate"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(crate_bytes))
+            .mount(&mock)
+            .await;
+
+        let entry = LockfileEntry {
+            ecosystem: "cargo",
+            name: "left-pad".into(),
+            version: "1.3.0".into(),
+            purl: "pkg:cargo/left-pad@1.3.0".into(),
+            resolved: None,
+            integrity: LockIntegrity::Sha256Hex(sha),
+        };
+        let saved = std::env::var("SOCKET_CRATES_REGISTRY").ok();
+        // Trailing slash on purpose: the base must be trimmed before use.
+        std::env::set_var("SOCKET_CRATES_REGISTRY", format!("{}/", mock.uri()));
+        let result = fetch_and_stage(&entry, &build_registry_client()).await;
+        match saved {
+            Some(v) => std::env::set_var("SOCKET_CRATES_REGISTRY", v),
+            None => std::env::remove_var("SOCKET_CRATES_REGISTRY"),
+        }
+        let fetched = result.expect("the conventional crate URL must fetch");
+        assert_eq!(
+            fetched.url,
+            format!("{}/left-pad/left-pad-1.3.0.crate", mock.uri()),
+            "conventional URL: {{base}}/{{name}}/{{name}}-{{version}}.crate"
+        );
+        assert!(fetched.dir().join("Cargo.toml").is_file());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn golang_conventional_url_escapes_name_and_version() {
+        // No resolved URL → the conventional GOPROXY zip URL, with the
+        // module-path CASE ESCAPING applied to BOTH the name and the version
+        // (an uppercase letter becomes `!lowercase` in the URL, while the
+        // zip's interior prefix keeps the unescaped coordinates).
+        let prefix = "github.com/Azure/y@v1.0.0-RC1/";
+        let files: [(&str, &[u8]); 1] = [("go.mod", b"module github.com/Azure/y\n")];
+        let zip_bytes = make_module_zip(prefix, &files);
+        let expected_h1 = spec_h1(&files, prefix);
+
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(url_path("/github.com/!azure/y/@v/v1.0.0-!r!c1.zip"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(zip_bytes))
+            .mount(&mock)
+            .await;
+
+        let entry = LockfileEntry {
+            ecosystem: "golang",
+            name: "github.com/Azure/y".into(),
+            version: "v1.0.0-RC1".into(),
+            purl: "pkg:golang/github.com/Azure/y@v1.0.0-RC1".into(),
+            resolved: None,
+            integrity: LockIntegrity::GoH1(expected_h1),
+        };
+        let saved_socket = std::env::var("SOCKET_GOPROXY").ok();
+        let saved = std::env::var("GOPROXY").ok();
+        std::env::set_var("SOCKET_GOPROXY", mock.uri());
+        std::env::remove_var("GOPROXY");
+        let result = fetch_and_stage(&entry, &build_registry_client()).await;
+        match saved_socket {
+            Some(v) => std::env::set_var("SOCKET_GOPROXY", v),
+            None => std::env::remove_var("SOCKET_GOPROXY"),
+        }
+        match saved {
+            Some(v) => std::env::set_var("GOPROXY", v),
+            None => std::env::remove_var("GOPROXY"),
+        }
+        let fetched = result.expect("the conventional module zip URL must fetch");
+        assert_eq!(
+            fetched.url,
+            format!("{}/github.com/!azure/y/@v/v1.0.0-!r!c1.zip", mock.uri()),
+            "case escaping must apply to the name AND the version"
+        );
+        assert!(fetched.dir().join("go.mod").is_file());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn goproxy_base_env_precedence() {
+        let saved_socket = std::env::var("SOCKET_GOPROXY").ok();
+        let saved = std::env::var("GOPROXY").ok();
+
+        // SOCKET_GOPROXY wins over GOPROXY (trailing slash trimmed).
+        std::env::set_var("SOCKET_GOPROXY", "https://socket.example/");
+        std::env::set_var("GOPROXY", "https://ignored.example");
+        let socket_wins = goproxy_base();
+        // An EMPTY SOCKET_GOPROXY falls through to GOPROXY.
+        std::env::set_var("SOCKET_GOPROXY", "");
+        std::env::set_var("GOPROXY", "https://fallback.example");
+        let empty_falls_through = goproxy_base();
+        // Neither set → the default proxy.
+        std::env::remove_var("SOCKET_GOPROXY");
+        std::env::remove_var("GOPROXY");
+        let neither = goproxy_base();
+        // A GOPROXY of only direct/off parts is unusable → the default.
+        std::env::set_var("GOPROXY", "direct,off");
+        let all_unusable = goproxy_base();
+
+        match saved_socket {
+            Some(v) => std::env::set_var("SOCKET_GOPROXY", v),
+            None => std::env::remove_var("SOCKET_GOPROXY"),
+        }
+        match saved {
+            Some(v) => std::env::set_var("GOPROXY", v),
+            None => std::env::remove_var("GOPROXY"),
+        }
+        assert_eq!(socket_wins, "https://socket.example");
+        assert_eq!(empty_falls_through, "https://fallback.example");
+        assert_eq!(neither, DEFAULT_GOPROXY);
+        assert_eq!(all_unusable, DEFAULT_GOPROXY);
+    }
+
+    #[test]
+    fn zip_traversal_entries_fail_closed() {
+        // ZipWriter::start_file accepts raw names — exactly what a hostile
+        // artifact carries. Nothing may extract from a traversal-bearing zip.
+        let evil = make_zip(&[("../evil.txt", b"evil")]);
+        let tmp = tempfile::tempdir().unwrap();
+        let err = extract_zip(&evil, tmp.path(), /*strip_first=*/ false).unwrap_err();
+        assert!(err.contains("escapes"), "{err}");
+        assert!(
+            std::fs::read_dir(tmp.path()).unwrap().next().is_none(),
+            "nothing may extract from a traversal-bearing zip"
+        );
+
+        // With strip_first, the REMAINDER after the strip is what must hold.
+        let evil = make_zip(&[("pfx/../../up.txt", b"evil")]);
+        let tmp = tempfile::tempdir().unwrap();
+        let err = extract_zip(&evil, tmp.path(), /*strip_first=*/ true).unwrap_err();
+        assert!(err.contains("escapes"), "{err}");
+        assert!(std::fs::read_dir(tmp.path()).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn zip_dir_entries_skip_across_extractors() {
+        // One zip with an explicit directory entry drives all three zip
+        // consumers: a dir entry neither errors nor materializes anywhere.
+        use std::io::Write as _;
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        writer
+            .add_directory("m@v1/d", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer
+            .start_file(
+                "m@v1/go.mod",
+                zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Deflated),
+            )
+            .unwrap();
+        writer.write_all(b"module m\n").unwrap();
+        let bytes = writer.finish().unwrap().into_inner();
+
+        let tmp = tempfile::tempdir().unwrap();
+        extract_zip(&bytes, tmp.path(), /*strip_first=*/ false).unwrap();
+        assert!(tmp.path().join("m@v1/go.mod").is_file());
+        assert!(!tmp.path().join("m@v1/d").exists(), "dir entry must not materialize");
+
+        // The dirhash covers FILES only — the dir entry must not add a line.
+        assert_eq!(
+            go_h1_of_zip(&bytes).unwrap(),
+            spec_h1(&[("go.mod", b"module m\n")], "m@v1/"),
+            "dir entries must not contribute dirhash lines"
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        extract_zip_with_prefix(&bytes, tmp.path(), "m@v1/").unwrap();
+        assert!(tmp.path().join("go.mod").is_file());
+        assert!(!tmp.path().join("d").exists());
+    }
+
+    #[test]
+    fn strip_first_drops_bare_top_level_entries() {
+        // A single-component entry alongside prefixed content is silently
+        // dropped — not extracted, not fatal — in both archive flavors.
+        let zip_bytes = make_zip(&[("TOPFILE", b"loose"), ("pfx/composer.json", b"{}")]);
+        let tmp = tempfile::tempdir().unwrap();
+        extract_zip(&zip_bytes, tmp.path(), /*strip_first=*/ true).unwrap();
+        assert!(tmp.path().join("composer.json").is_file());
+        assert_eq!(
+            std::fs::read_dir(tmp.path()).unwrap().count(),
+            1,
+            "the bare top-level zip entry must not extract anywhere"
+        );
+
+        let tgz = make_tgz(&[
+            ("toplevel", b"loose", false),
+            ("package/package.json", b"{}", false),
+        ]);
+        let tmp = tempfile::tempdir().unwrap();
+        extract_tgz(&tgz, tmp.path()).unwrap();
+        assert!(tmp.path().join("package.json").is_file());
+        assert_eq!(
+            std::fs::read_dir(tmp.path()).unwrap().count(),
+            1,
+            "the bare top-level tar entry must not extract anywhere"
+        );
+    }
+
+    #[test]
+    fn module_zip_prefix_interior_traversal_fails_closed() {
+        // An entry INSIDE the prefix whose remainder escapes — distinct from
+        // the outside-prefix refusal — must fail the whole artifact.
+        let zip_bytes = make_module_zip("github.com/x/y@v1.0.0/", &[("../evil", b"evil")]);
+        let tmp = tempfile::tempdir().unwrap();
+        let err =
+            extract_zip_with_prefix(&zip_bytes, tmp.path(), "github.com/x/y@v1.0.0/").unwrap_err();
+        assert!(err.contains("escapes"), "{err}");
+        assert!(
+            std::fs::read_dir(tmp.path()).unwrap().next().is_none(),
+            "nothing may extract from a traversal-bearing module zip"
+        );
+    }
+
+    #[test]
+    fn module_zip_newline_in_name_fails_closed() {
+        // dirhash is line-oriented: a newline inside an entry name could
+        // forge another file's hash line, so it must refuse outright.
+        let zip_bytes = make_module_zip("m@v1/", &[("a\nb", b"x")]);
+        let err = go_h1_of_zip(&zip_bytes).unwrap_err();
+        assert!(err.contains("newline"), "{err}");
+    }
+
+    #[test]
+    fn zip_declared_entry_size_over_cap_fails_closed() {
+        // A DECLARED size past the per-entry cap refuses before any read —
+        // in the plain extractor and in the dirhash pre-pass (the prefix
+        // extractor's twin is covered by module_zip_extraction_enforces_size_caps).
+        let mut zip_bytes = make_zip(&[("a.bin", &[0u8; 16])]);
+        patch_declared_uncompressed_size(&mut zip_bytes, (MAX_ENTRY_BYTES + 1) as u32);
+        let tmp = tempfile::tempdir().unwrap();
+        let err = extract_zip(&zip_bytes, tmp.path(), false).unwrap_err();
+        assert!(err.contains("cap"), "{err}");
+        assert!(std::fs::read_dir(tmp.path()).unwrap().next().is_none());
+
+        let mut zip_bytes = make_module_zip("m@v1/", &[("big.bin", &[0u8; 16])]);
+        patch_declared_uncompressed_size(&mut zip_bytes, (MAX_ENTRY_BYTES + 1) as u32);
+        let err = go_h1_of_zip(&zip_bytes).unwrap_err();
+        assert!(err.contains("cap"), "{err}");
+    }
+
+    #[test]
+    fn entry_count_caps_fail_closed() {
+        // 60,001 empty entries: the zip caps refuse up front (archive.len()
+        // is header data), the tar cap refuses during iteration. Entries are
+        // empty/dir-typed so the fixtures stay small and nothing extracts.
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for i in 0..=MAX_ENTRIES {
+            writer
+                .start_file(
+                    format!("m@v1/f{i}"),
+                    zip::write::SimpleFileOptions::default()
+                        .compression_method(zip::CompressionMethod::Stored),
+                )
+                .unwrap();
+        }
+        let zip_bytes = writer.finish().unwrap().into_inner();
+        let tmp = tempfile::tempdir().unwrap();
+        let err = extract_zip(&zip_bytes, tmp.path(), false).unwrap_err();
+        assert!(err.contains("entries"), "{err}");
+        assert!(std::fs::read_dir(tmp.path()).unwrap().next().is_none());
+        let err = go_h1_of_zip(&zip_bytes).unwrap_err();
+        assert!(err.contains("entries"), "{err}");
+        let tmp = tempfile::tempdir().unwrap();
+        let err = extract_zip_with_prefix(&zip_bytes, tmp.path(), "m@v1/").unwrap_err();
+        assert!(err.contains("entries"), "{err}");
+
+        // Tar twin: dir-typed entries count toward the cap without any
+        // extraction work (the file-type skip runs after the count check).
+        let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::fast(),
+        ));
+        for i in 0..=MAX_ENTRIES {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Directory);
+            header.set_size(0);
+            header.set_mode(0o755);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, format!("package/d{i}"), std::io::empty())
+                .unwrap();
+        }
+        let tgz = builder.into_inner().unwrap().finish().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let err = extract_tgz(&tgz, tmp.path()).unwrap_err();
+        assert!(err.contains("entries"), "{err}");
+    }
+
+    #[test]
+    fn tar_link_entries_never_materialize() {
+        // Symlinks and hardlinks are silently skipped: a link could redirect
+        // later entries out of the stage, so neither may land on disk while
+        // regular siblings still extract.
+        let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::default(),
+        ));
+        let mut lh = tar::Header::new_gnu();
+        lh.set_path("package/link").unwrap();
+        lh.set_link_name("../../etc/passwd").unwrap();
+        lh.set_entry_type(tar::EntryType::Symlink);
+        lh.set_size(0);
+        lh.set_mode(0o777);
+        lh.set_cksum();
+        builder.append(&lh, std::io::empty()).unwrap();
+        let mut hh = tar::Header::new_gnu();
+        hh.set_path("package/hard").unwrap();
+        hh.set_link_name("package/package.json").unwrap();
+        hh.set_entry_type(tar::EntryType::Link);
+        hh.set_size(0);
+        hh.set_mode(0o644);
+        hh.set_cksum();
+        builder.append(&hh, std::io::empty()).unwrap();
+        let mut fh = tar::Header::new_gnu();
+        fh.set_size(2);
+        fh.set_mode(0o644);
+        fh.set_cksum();
+        builder
+            .append_data(&mut fh, "package/package.json", &b"{}"[..])
+            .unwrap();
+        let tgz = builder.into_inner().unwrap().finish().unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        extract_tgz(&tgz, tmp.path()).unwrap();
+        assert!(tmp.path().join("package.json").is_file());
+        assert!(
+            std::fs::symlink_metadata(tmp.path().join("link")).is_err(),
+            "a symlink entry must not materialize"
+        );
+        assert!(
+            std::fs::symlink_metadata(tmp.path().join("hard")).is_err(),
+            "a hardlink entry must not materialize"
+        );
+    }
+
+    #[test]
+    fn gem_without_data_tar_gz_refuses() {
+        let mut outer = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_size(4);
+        header.set_mode(0o644);
+        header.set_cksum();
+        outer
+            .append_data(&mut header, "metadata.gz", &b"meta"[..])
+            .unwrap();
+        let gem_bytes = outer.into_inner().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let err = extract_gem_data(&gem_bytes, tmp.path()).unwrap_err();
+        assert_eq!(err, "the .gem carries no data.tar.gz");
+    }
+
+    #[test]
+    fn gem_data_member_declaring_over_cap_refuses() {
+        // A data.tar.gz header DECLARING more than the download cap refuses
+        // before any attempt to read that much data (header-only craft — no
+        // data follows, so a read attempt would error differently).
+        let mut header = tar::Header::new_gnu();
+        header.set_path("data.tar.gz").unwrap();
+        header.set_size(MAX_DOWNLOAD_BYTES + 1);
+        header.set_mode(0o644);
+        header.set_cksum();
+        let gem_bytes = header.as_bytes().to_vec();
+        let tmp = tempfile::tempdir().unwrap();
+        let err = extract_gem_data(&gem_bytes, tmp.path()).unwrap_err();
+        assert!(err.contains("size cap"), "{err}");
+    }
+
+    #[test]
+    fn verify_go_h1_accepts_matching_dirhash() {
+        // The SUCCESS path is the golang service-download content verifier —
+        // a round-trip against the module's own hasher must pass, and a
+        // foreign h1 must name the mismatch.
+        let zip_bytes = make_module_zip("m@v1/", &[("go.mod", b"module m\n")]);
+        let h1 = go_h1_of_zip(&zip_bytes).unwrap();
+        verify_go_h1(&zip_bytes, &h1).expect("a matching dirhash must verify");
+        let err = verify_go_h1(&zip_bytes, "h1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+            .unwrap_err();
+        assert!(err.contains("mismatch"), "{err}");
+    }
+
+    #[test]
+    fn artifact_matches_integrity_contract() {
+        // The repair-path / service-path whole-artifact verifier.
+        // Foreign berry cacheKey: refused without attempting the rebuild.
+        let err = artifact_matches_integrity(
+            b"x",
+            "pkg",
+            &LockIntegrity::BerryChecksum(format!("8/{}", "0".repeat(128))),
+        )
+        .unwrap_err();
+        assert!(err.contains("cacheKey other than 10c0"), "{err}");
+
+        // 10c0: the cache-zip rebuild round-trips, and a tampered checksum
+        // names the mismatch.
+        let tgz = make_tgz(&[("package/package.json", br#"{"name":"left-pad"}"#, false)]);
+        let good = super::super::berry_zip::berry_cache_checksum_10c0(&tgz, "left-pad").unwrap();
+        artifact_matches_integrity(&tgz, "left-pad", &LockIntegrity::BerryChecksum(good))
+            .expect("the rebuilt cache checksum must match");
+        let err = artifact_matches_integrity(
+            &tgz,
+            "left-pad",
+            &LockIntegrity::BerryChecksum(format!("10c0/{}", "0".repeat(128))),
+        )
+        .unwrap_err();
+        assert!(err.contains("mismatch"), "{err}");
+
+        // GoH1 has a dedicated fetch-path verifier; None is reachable from a
+        // repair against an npm-era lock recording no integrity. Both refuse.
+        let err =
+            artifact_matches_integrity(b"x", "pkg", &LockIntegrity::GoH1("h1:x".into()))
+                .unwrap_err();
+        assert!(err.contains("dedicated ecosystem fetcher"), "{err}");
+        let err = artifact_matches_integrity(b"x", "pkg", &LockIntegrity::None).unwrap_err();
+        assert!(err.contains("no integrity recorded"), "{err}");
+
+        // …and the in-module verifier pins both as the Unverifiable KIND.
+        match verify_integrity(b"x", &LockIntegrity::GoH1("h1:x".into())) {
+            Err(FetchError::Unverifiable(_)) => {}
+            other => panic!("GoH1 must be Unverifiable in verify_integrity, got {other:?}"),
+        }
+        match verify_integrity(b"x", &LockIntegrity::None) {
+            Err(FetchError::Unverifiable(_)) => {}
+            other => panic!("None must be Unverifiable in verify_integrity, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sri_dashless_tokens_skip_and_sha256_verifies() {
+        let bytes = b"hello";
+        let b64 = base64::engine::general_purpose::STANDARD;
+        // A dash-less token is skipped, not fatal — the usable hash beside
+        // it still verifies.
+        assert!(
+            verify_sri(bytes, &format!("notanalgo {}", sri_of(bytes))).is_ok(),
+            "a dash-less token must not poison the SRI string"
+        );
+        // sha256-strongest SRI: the sha256 digest arm actually computes and
+        // compares — pass on the right digest, refuse on a wrong one.
+        let good = b64.encode(Sha256::digest(bytes));
+        assert!(verify_sri(bytes, &format!("sha256-{good}")).is_ok());
+        let wrong = b64.encode(Sha256::digest(b"other"));
+        let err = verify_sri(bytes, &format!("sha256-{wrong}")).unwrap_err();
+        assert!(err.contains("sha256"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn download_refuses_lying_content_length() {
+        // wiremock cannot send a mismatched Content-Length, so script a raw
+        // socket: a 256 GiB header with no body must refuse on the DECLARED
+        // size, before any body read or allocation.
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await; // request head
+            let _ = sock
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 274877906944\r\n\
+                      Connection: close\r\n\r\n",
+                )
+                .await;
+            // Hold the socket until the client gives up on its own.
+            let mut sink = [0u8; 16];
+            let _ = sock.read(&mut sink).await;
+        });
+
+        let err = download(&build_registry_client(), &format!("http://{addr}/x.tgz"))
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("274877906944") && err.contains("cap"),
+            "the refusal must fire on the declared Content-Length: {err}"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn download_caps_streamed_bytes_without_content_length() {
+        // With NO Content-Length (chunked encoding) the declared-size check
+        // never runs — the streamed-bytes cap is the only guard against a
+        // lying/absent-length server, so it must fire after ~128 MB.
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await; // request head
+            if sock
+                .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+                .await
+                .is_err()
+            {
+                return;
+            }
+            // Stream zeros until the client hits its cap and drops the
+            // connection (our write then errors — the loop's exit).
+            let chunk = vec![0u8; 1024 * 1024];
+            let head = format!("{:x}\r\n", chunk.len());
+            loop {
+                if sock.write_all(head.as_bytes()).await.is_err()
+                    || sock.write_all(&chunk).await.is_err()
+                    || sock.write_all(b"\r\n").await.is_err()
+                {
+                    break;
+                }
+            }
+        });
+
+        let err = download(&build_registry_client(), &format!("http://{addr}/big.tgz"))
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("exceeds the") && err.contains("cap"),
+            "the stream cap must fire without a Content-Length: {err}"
+        );
+        server.abort();
+    }
+
+    #[test]
+    fn total_decompressed_cap_fails_closed_across_zip_extractors() {
+        // The per-entry actual-bytes guards mean only HONEST content reaches
+        // the total cap: four entries of exactly MAX_ENTRY_BYTES land the
+        // running total exactly ON the 512 MB cap, and a fifth 1-byte entry
+        // pushes past it — the cheapest honest fixture that trips the check.
+        // (The suite's most expensive test: ~512 MB of zeros deflate once,
+        // and each extractor inflates them back before refusing entry 5.)
+        use std::io::Write as _;
+        let zeros = vec![0u8; MAX_ENTRY_BYTES as usize];
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for i in 0..4 {
+            writer
+                .start_file(
+                    format!("m@v1/z{i}.bin"),
+                    zip::write::SimpleFileOptions::default()
+                        .compression_method(zip::CompressionMethod::Deflated),
+                )
+                .unwrap();
+            writer.write_all(&zeros).unwrap();
+        }
+        drop(zeros);
+        writer
+            .start_file(
+                "m@v1/tip.bin",
+                zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Deflated),
+            )
+            .unwrap();
+        writer.write_all(b"x").unwrap();
+        let bytes = writer.finish().unwrap().into_inner();
+
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let err = extract_zip(&bytes, tmp.path(), /*strip_first=*/ false).unwrap_err();
+            assert!(err.contains("decompresses past"), "{err}");
+        }
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let err = extract_zip_with_prefix(&bytes, tmp.path(), "m@v1/").unwrap_err();
+            assert!(err.contains("decompresses past"), "{err}");
+        }
+        // The dirhash pre-pass counts ACTUAL decompressed bytes, in memory.
+        let err = go_h1_of_zip(&bytes).unwrap_err();
+        assert!(err.contains("decompresses past"), "{err}");
     }
 }

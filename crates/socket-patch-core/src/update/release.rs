@@ -381,6 +381,9 @@ pub async fn fetch_sha256sums_entry(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     // ---------- version parsing ----------
 
@@ -604,5 +607,251 @@ mod tests {
             endpoints.download_url(&semver::Version::new(3, 4, 0), "SHA256SUMS"),
             "https://github.com/SocketDev/socket-patch/releases/download/v3.4.0/SHA256SUMS"
         );
+    }
+
+    #[test]
+    #[serial(update_base_url_env)]
+    fn endpoints_from_env_defaults_when_unset_or_empty() {
+        let prev = std::env::var_os("SOCKET_UPDATE_BASE_URL");
+
+        // Unset: the production path every real user takes. is_default MUST
+        // be true here — it arms both the HTTPS-only redirect policy and the
+        // hard-fail version self-check.
+        std::env::remove_var("SOCKET_UPDATE_BASE_URL");
+        let endpoints = UpdateEndpoints::from_env();
+        assert_eq!(endpoints.web_base, DEFAULT_UPDATE_BASE_URL);
+        assert_eq!(endpoints.api_base, DEFAULT_UPDATE_API_BASE_URL);
+        assert!(endpoints.is_default());
+
+        // Empty string routes to the same default arm (the .filter guard).
+        std::env::set_var("SOCKET_UPDATE_BASE_URL", "");
+        let endpoints = UpdateEndpoints::from_env();
+        assert_eq!(endpoints.web_base, DEFAULT_UPDATE_BASE_URL);
+        assert_eq!(endpoints.api_base, DEFAULT_UPDATE_API_BASE_URL);
+        assert!(endpoints.is_default());
+
+        // An override points BOTH routes at one base (trailing slash
+        // trimmed) and disarms the default-only security posture.
+        std::env::set_var("SOCKET_UPDATE_BASE_URL", "http://mirror.test:1/");
+        let endpoints = UpdateEndpoints::from_env();
+        assert_eq!(endpoints.web_base, "http://mirror.test:1");
+        assert_eq!(endpoints.api_base, "http://mirror.test:1");
+        assert!(!endpoints.is_default());
+
+        match prev {
+            Some(v) => std::env::set_var("SOCKET_UPDATE_BASE_URL", v),
+            None => std::env::remove_var("SOCKET_UPDATE_BASE_URL"),
+        }
+    }
+
+    // ---------- default-endpoint redirect policy ----------
+
+    /// The default (real GitHub) endpoints — the only shape that selects the
+    /// custom HTTPS-only redirect policy.
+    fn default_endpoints() -> UpdateEndpoints {
+        UpdateEndpoints {
+            web_base: DEFAULT_UPDATE_BASE_URL.to_string(),
+            api_base: DEFAULT_UPDATE_API_BASE_URL.to_string(),
+            is_default: true,
+        }
+    }
+
+    /// Short budgets so a policy/connect failure cannot stall the suite.
+    fn short_timeouts() -> UpdateTimeouts {
+        UpdateTimeouts {
+            connect: Duration::from_secs(2),
+            metadata: Duration::from_secs(5),
+            download: Duration::from_secs(5),
+        }
+    }
+
+    #[tokio::test]
+    async fn default_redirect_policy_refuses_insecure_hop() {
+        // A 302 whose target is plain http:// — the MITM-downgrade shape the
+        // default policy exists to refuse. The policy only governs redirect
+        // TARGETS, so the initial request to the http wiremock is allowed.
+        let server = MockServer::start().await;
+        let insecure_target = format!("{}/next", server.uri());
+        Mock::given(method("GET"))
+            .and(path("/start"))
+            .respond_with(
+                ResponseTemplate::new(302).insert_header("Location", insecure_target.as_str()),
+            )
+            .mount(&server)
+            .await;
+
+        let client =
+            metadata_client(&short_timeouts(), follow_redirect_policy(&default_endpoints()))
+                .unwrap();
+        let err = client
+            .get(format!("{}/start", server.uri()))
+            .send()
+            .await
+            .expect_err("an http:// redirect target must be refused on default endpoints");
+        // reqwest::Error's Debug includes the policy's custom error source.
+        let msg = format!("{err:?}");
+        assert!(msg.contains("refusing insecure"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn default_redirect_policy_follows_https_hop() {
+        // The follow() arm: a policy that refused everything would brick
+        // self-update for all real users while every fixture-based test
+        // stayed green. Redirect to an https:// loopback port with nothing
+        // listening: the follow decision happens before the connect, so the
+        // failure must be a connect error, NOT a policy refusal.
+        let server = MockServer::start().await;
+        let dead_port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+            // listener dropped: port is closed again, connects get refused
+        };
+        let https_target = format!("https://127.0.0.1:{dead_port}/next");
+        Mock::given(method("GET"))
+            .and(path("/start"))
+            .respond_with(
+                ResponseTemplate::new(302).insert_header("Location", https_target.as_str()),
+            )
+            .mount(&server)
+            .await;
+
+        let client =
+            metadata_client(&short_timeouts(), follow_redirect_policy(&default_endpoints()))
+                .unwrap();
+        let err = client
+            .get(format!("{}/start", server.uri()))
+            .send()
+            .await
+            .expect_err("connect to a dead loopback port must fail");
+        let msg = format!("{err:?}");
+        assert!(
+            !msg.contains("refusing insecure"),
+            "https hop must be followed, not refused: {msg}"
+        );
+        assert!(!msg.contains("too many redirects"), "{msg}");
+    }
+
+    // ---------- latest-version resolution ladder (wiremock) ----------
+
+    /// Endpoints pointed at a wiremock fixture (`SOCKET_UPDATE_BASE_URL`
+    /// posture: both routes on one server, is_default off).
+    fn overridden_endpoints(base: &str) -> UpdateEndpoints {
+        UpdateEndpoints {
+            web_base: base.to_string(),
+            api_base: base.to_string(),
+            is_default: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_latest_version_api_fallback_rescues_failed_probe() {
+        // The resilience contract from the module docs: when the redirect
+        // probe shape drifts (here: a 200 instead of a redirect), the API
+        // fallback alone must still resolve the version.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/SocketDev/socket-patch/releases/latest"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/SocketDev/socket-patch/releases/latest"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "tag_name": "v9.9.9" })),
+            )
+            .mount(&server)
+            .await;
+
+        let endpoints = overridden_endpoints(&server.uri());
+        let version = fetch_latest_version(&endpoints, &UpdateTimeouts::default())
+            .await
+            .unwrap();
+        assert_eq!(version, semver::Version::new(9, 9, 9));
+    }
+
+    #[tokio::test]
+    async fn fetch_latest_version_combines_probe_and_api_errors() {
+        // Probe answers 200 (non-redirect), API answers 500: the combined
+        // CheckFailed must carry both legs so a support log tells the whole
+        // story.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/SocketDev/socket-patch/releases/latest"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/SocketDev/socket-patch/releases/latest"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let endpoints = overridden_endpoints(&server.uri());
+        let err = fetch_latest_version(&endpoints, &UpdateTimeouts::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, UpdateError::CheckFailed(_)), "{err:?}");
+        let msg = err.to_string();
+        assert!(msg.contains("expected a redirect to the latest tag"), "{msg}");
+        assert!(msg.contains("API fallback:"), "{msg}");
+        assert!(msg.contains("returned 500"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn probe_redirect_without_location_is_check_failed() {
+        // A proxy/CDN interposing on releases/latest can 302 without a
+        // Location header. API mounted as 404 so the fallback also fails
+        // deterministically and the probe leg's message surfaces.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/SocketDev/socket-patch/releases/latest"))
+            .respond_with(ResponseTemplate::new(302))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/SocketDev/socket-patch/releases/latest"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let endpoints = overridden_endpoints(&server.uri());
+        let err = fetch_latest_version(&endpoints, &UpdateTimeouts::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, UpdateError::CheckFailed(_)), "{err:?}");
+        let msg = err.to_string();
+        assert!(msg.contains("redirect without a Location header"), "{msg}");
+        assert!(msg.contains("returned 404"), "{msg}");
+    }
+
+    // ---------- SHA256SUMS fetch ----------
+
+    #[tokio::test]
+    async fn sha256sums_server_error_status_is_reported() {
+        // A non-404 error status on the integrity-root fetch surfaces as
+        // UpdateError::Network (envelope errorCode "download_failed") —
+        // deliberately distinct from the 404 "publishes no SHA256SUMS"
+        // CheckFailed sibling. Pinned so the envelope contract can't drift
+        // silently.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/SocketDev/socket-patch/releases/download/v1.2.3/SHA256SUMS"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let endpoints = overridden_endpoints(&server.uri());
+        let err = fetch_sha256sums_entry(
+            &endpoints,
+            &UpdateTimeouts::default(),
+            &semver::Version::new(1, 2, 3),
+            "socket-patch-x.tar.gz",
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, UpdateError::Network(_)), "{err:?}");
+        assert_eq!(err.error_code(), "download_failed");
+        assert!(err.to_string().contains("returned 500"), "{err}");
     }
 }

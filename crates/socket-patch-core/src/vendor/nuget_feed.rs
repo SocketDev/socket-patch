@@ -1107,9 +1107,14 @@ fn attr_value(elem: &str, attr: &str) -> Option<String> {
         let at = rest.find(attr)?;
         let after = rest[at + attr.len()..].trim_start();
         if let Some(eq) = after.strip_prefix('=') {
-            if let Some(quoted) = eq.trim_start().strip_prefix('"') {
-                let close = quoted.find('"')?;
-                return Some(quoted[..close].to_string());
+            // NuGet accepts either XML quote style; tolerate both, like the
+            // redirect twin (patch/redirect/mod.rs nuget key harvesting).
+            let val = eq.trim_start();
+            for quote in ['"', '\''] {
+                if let Some(quoted) = val.strip_prefix(quote) {
+                    let close = quoted.find(quote)?;
+                    return Some(quoted[..close].to_string());
+                }
             }
         }
         rest = &rest[at + attr.len()..];
@@ -1718,6 +1723,38 @@ mod tests {
                 "    <packageSource key=\"nuget.org\">\n      <package pattern=\"*\" />\n    </packageSource>"
             ),
             "the existing source takes the catch-all: {t}"
+        );
+    }
+
+    #[test]
+    fn single_quoted_add_takes_catch_all_not_duplicated() {
+        // XML also allows single-quoted attribute values: `<add key='corp'>`
+        // is a REAL source NuGet parses (redirect twin tolerates it too).
+        // Same contract as the whitespace flavor above: harvested as the
+        // catch-all target, never double-added by the seed.
+        let orig = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
+                    <configuration>\n\
+                    \x20 <packageSources>\n\
+                    \x20   <add key='corp' value='https://feed.corp.example/v3/index.json' />\n\
+                    \x20 </packageSources>\n\
+                    </configuration>\n";
+        let edit = build_config_edit(
+            Some(orig),
+            &source_key(),
+            &format!(".socket/vendor/nuget/{UUID}"),
+            "Newtonsoft.Json",
+        )
+        .unwrap();
+        let t = &edit.new_text;
+        assert!(
+            !t.contains("<add key=\"nuget.org\""),
+            "a parsed real source must suppress the nuget.org seed: {t}"
+        );
+        assert!(
+            t.contains(
+                "    <packageSource key=\"corp\">\n      <package pattern=\"*\" />\n    </packageSource>"
+            ),
+            "the single-quoted source takes the catch-all: {t}"
         );
     }
 
@@ -3138,6 +3175,1232 @@ mod tests {
         assert!(
             cfg.contains(&source_key()),
             "config wiring untouched after the early lock failure: {cfg}"
+        );
+    }
+
+    // ── covgap 2026-09: refusal + no-op edges ───────────────────────────────
+
+    /// A purl from another ecosystem is refused before any disk access.
+    #[tokio::test]
+    async fn refuses_non_nuget_purl() {
+        let (dir, blobs, installed, record) = fixture(true, None).await;
+        let root = dir.path();
+        let sources = PatchSources::blobs_only(&blobs);
+        let (code, detail) = unwrap_refused(
+            vendor_nuget(
+                "pkg:npm/foo@1.0.0",
+                &installed,
+                root,
+                &record,
+                &sources,
+                "t",
+                false,
+                false,
+                None,
+            )
+            .await,
+        );
+        assert_eq!(code, "unsafe_coordinates");
+        assert!(detail.contains("not a nuget purl"), "{detail}");
+        assert!(!root.join(".socket").exists(), "refusal writes nothing");
+    }
+
+    /// A patch record with no files is a no-op success: nothing to vendor,
+    /// nothing written, no ledger entry.
+    #[tokio::test]
+    async fn empty_files_record_is_noop_success() {
+        let (dir, blobs, installed, mut record) = fixture(true, None).await;
+        let root = dir.path();
+        record.files.clear();
+        let lock_before = tokio::fs::read(root.join(PACKAGES_LOCK)).await.unwrap();
+
+        let (result, entry, warnings) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert!(result.success, "{:?}", result.error);
+        assert!(entry.is_none(), "no ledger entry for an empty patch");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(!root.join(".socket").exists(), "no artifact written");
+        assert!(!root.join("nuget.config").exists(), "no config written");
+        assert_eq!(
+            tokio::fs::read(root.join(PACKAGES_LOCK)).await.unwrap(),
+            lock_before
+        );
+    }
+
+    // ── covgap 2026-09: wired hot path without a lockfile ───────────────────
+
+    /// The in-sync rerun of a project with NO packages.lock.json short-circuits
+    /// to AlreadyPatched (an absent lock is trivially in sync).
+    #[tokio::test]
+    async fn wired_rerun_without_lockfile_is_already_patched() {
+        let (dir, blobs, installed, record) = fixture(false, None).await;
+        let root = dir.path();
+        let (r1, e1, _w) = unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert!(r1.success, "{:?}", r1.error);
+        assert!(e1.is_some());
+
+        let (r2, e2, w2) = unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert!(r2.success, "{:?}", r2.error);
+        assert!(e2.is_none(), "in-sync rerun must not re-record");
+        assert!(
+            !w2.iter().any(|w| w.code == "vendor_artifact_rebuilt"),
+            "lock-less in-sync rerun is AlreadyPatched, not a rebuild: {w2:?}"
+        );
+        assert!(
+            !root.join(PACKAGES_LOCK).exists(),
+            "no lockfile may appear on a lock-less rerun"
+        );
+    }
+
+    /// The wired rebuild leg of a lock-less project re-materialises the nupkg
+    /// and skips the re-pin entirely (there is no lock to pin).
+    #[tokio::test]
+    async fn wired_rebuild_without_lockfile_skips_repin() {
+        let (dir, blobs, installed, record) = fixture(false, None).await;
+        let root = dir.path();
+        let (r1, _e, _w) = unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert!(r1.success);
+        tokio::fs::remove_file(root.join(copy_rel())).await.unwrap();
+
+        let (r2, e2, w2) = unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert!(r2.success, "{:?}", r2.error);
+        assert!(e2.is_none(), "artifact-only rebuild must not re-record");
+        assert!(
+            w2.iter().any(|w| w.code == "vendor_artifact_rebuilt"),
+            "{w2:?}"
+        );
+        assert!(root.join(copy_rel()).exists(), "nupkg re-materialised");
+        assert!(
+            !root.join(PACKAGES_LOCK).exists(),
+            "no lockfile invented by the rebuild leg"
+        );
+    }
+
+    // ── covgap 2026-09: wired hot-path rebuild failure legs ─────────────────
+
+    /// Wired + stale with the cached pristine nupkg ALSO gone: the rebuild leg
+    /// bubbles the terminal refusal, and the wired config stays untouched.
+    #[tokio::test]
+    async fn wired_rebuild_missing_cached_nupkg_refuses_keeps_config() {
+        let (dir, blobs, installed, record) = fixture(true, None).await;
+        let root = dir.path();
+        let (r1, _e, _w) = unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert!(r1.success);
+        tokio::fs::remove_file(root.join(copy_rel())).await.unwrap();
+        tokio::fs::remove_file(installed.join("newtonsoft.json.13.0.3.nupkg"))
+            .await
+            .unwrap();
+
+        let (code, _d) = unwrap_refused(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert_eq!(code, "vendor_nupkg_not_found");
+        let cfg = tokio::fs::read_to_string(root.join("nuget.config"))
+            .await
+            .unwrap();
+        assert!(
+            cfg.contains(&source_key()),
+            "wired config untouched by the refusal: {cfg}"
+        );
+    }
+
+    /// Wired + stale with the blob store emptied: the rebuild's apply failure
+    /// comes back as an un-successful ApplyResult; the config and lock stay as
+    /// run 1 left them.
+    #[tokio::test]
+    async fn wired_rebuild_apply_failure_keeps_wiring_untouched() {
+        let (dir, blobs, installed, record) = fixture(true, None).await;
+        let root = dir.path();
+        let (r1, _e, _w) = unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert!(r1.success);
+        let cfg1 = tokio::fs::read(root.join("nuget.config")).await.unwrap();
+        let lock1 = tokio::fs::read(root.join(PACKAGES_LOCK)).await.unwrap();
+        tokio::fs::remove_file(root.join(copy_rel())).await.unwrap();
+
+        let empty = tempfile::tempdir().unwrap();
+        let sources = PatchSources::blobs_only(empty.path());
+        let outcome = vendor_nuget(
+            PURL, &installed, root, &record, &sources, "t", false, false, None,
+        )
+        .await;
+        let (r2, e2, _w2) = unwrap_done(outcome);
+        assert!(!r2.success, "a failed apply must be reported");
+        assert!(r2.error.is_some());
+        assert!(e2.is_none());
+        assert_eq!(
+            tokio::fs::read(root.join("nuget.config")).await.unwrap(),
+            cfg1
+        );
+        assert_eq!(
+            tokio::fs::read(root.join(PACKAGES_LOCK)).await.unwrap(),
+            lock1
+        );
+    }
+
+    /// Wired + stale with a lock that never resolved the patched id: the
+    /// rebuild succeeds and the re-pin is a no-op (nothing to pin).
+    #[tokio::test]
+    async fn wired_rebuild_with_unpinnable_lock_leaves_lock_untouched() {
+        let (dir, blobs, installed, record) = fixture(false, None).await;
+        let root = dir.path();
+        let other_lock = serde_json::to_string_pretty(&json!({
+            "version": 1,
+            "dependencies": {
+                "net8.0": {
+                    "Some.Other.Pkg": {
+                        "type": "Direct",
+                        "requested": "[1.0.0, )",
+                        "resolved": "1.0.0",
+                        "contentHash": "OTHERhash=="
+                    }
+                }
+            }
+        }))
+        .unwrap();
+        tokio::fs::write(root.join(PACKAGES_LOCK), &other_lock)
+            .await
+            .unwrap();
+
+        let (r1, _e, _w) = unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert!(r1.success);
+        tokio::fs::remove_file(root.join(copy_rel())).await.unwrap();
+
+        let (r2, e2, w2) = unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert!(r2.success, "{:?}", r2.error);
+        assert!(e2.is_none());
+        assert!(
+            w2.iter().any(|w| w.code == "vendor_artifact_rebuilt"),
+            "{w2:?}"
+        );
+        assert!(root.join(copy_rel()).exists());
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(PACKAGES_LOCK))
+                .await
+                .unwrap(),
+            other_lock,
+            "an unpinnable lock stays byte-identical through the rebuild"
+        );
+    }
+
+    /// A DRY run on a wired-but-stale project must fall through to the
+    /// verify-only preview: success, and zero writes.
+    #[tokio::test]
+    async fn wired_stale_dry_run_previews_without_writes() {
+        let (dir, blobs, installed, record) = fixture(true, None).await;
+        let root = dir.path();
+        let (r1, _e, _w) = unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert!(r1.success);
+        let cfg1 = tokio::fs::read(root.join("nuget.config")).await.unwrap();
+        let lock1 = tokio::fs::read(root.join(PACKAGES_LOCK)).await.unwrap();
+        tokio::fs::remove_file(root.join(copy_rel())).await.unwrap();
+
+        let (r2, e2, _w2) = unwrap_done(run_vendor(root, &blobs, &installed, &record, true).await);
+        assert!(r2.success, "{:?}", r2.error);
+        assert!(e2.is_none());
+        assert!(
+            !root.join(copy_rel()).exists(),
+            "dry run must not rebuild the artifact"
+        );
+        assert_eq!(
+            tokio::fs::read(root.join("nuget.config")).await.unwrap(),
+            cfg1
+        );
+        assert_eq!(
+            tokio::fs::read(root.join(PACKAGES_LOCK)).await.unwrap(),
+            lock1
+        );
+    }
+
+    // ── covgap 2026-09: config-edit failure shapes ──────────────────────────
+
+    /// A pre-existing config with no `</configuration>` fails the FRESH vendor
+    /// after the artifact was built — the partial uuid dir is removed and no
+    /// project file is touched.
+    #[tokio::test]
+    async fn config_without_closing_tag_fails_and_cleans_uuid_dir() {
+        let broken = "<configuration>";
+        let (dir, blobs, installed, record) = fixture(true, Some(broken)).await;
+        let root = dir.path();
+        let lock_before = tokio::fs::read(root.join(PACKAGES_LOCK)).await.unwrap();
+
+        let (result, entry, _w) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert!(!result.success);
+        assert!(entry.is_none());
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("no </configuration>"),
+            "{:?}",
+            result.error
+        );
+        assert!(
+            !root.join(format!(".socket/vendor/nuget/{UUID}")).exists(),
+            "partial uuid dir removed"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("nuget.config"))
+                .await
+                .unwrap(),
+            broken,
+            "the malformed config is left byte-identical"
+        );
+        assert_eq!(
+            tokio::fs::read(root.join(PACKAGES_LOCK)).await.unwrap(),
+            lock_before
+        );
+    }
+
+    /// No <packageSources> anywhere: the section is created before
+    /// `</configuration>`, seeded with nuget.org (the catch-all target) plus
+    /// our source.
+    #[test]
+    fn config_without_sources_section_gets_one_created() {
+        let orig = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
+                    <configuration>\n\
+                    </configuration>\n";
+        let edit = build_config_edit(
+            Some(orig),
+            &source_key(),
+            &format!(".socket/vendor/nuget/{UUID}"),
+            "Newtonsoft.Json",
+        )
+        .unwrap();
+        let t = &edit.new_text;
+        assert_eq!(t.matches("<packageSources>").count(), 1, "{t}");
+        assert!(
+            t.contains("<add key=\"nuget.org\" value=\"https://api.nuget.org/v3/index.json\" />"),
+            "{t}"
+        );
+        assert!(t.contains(&format!("<add key=\"{}\"", source_key())), "{t}");
+        // The created section sits before </configuration>, which stays last.
+        assert!(t.find("<packageSources>").unwrap() < t.find("</configuration>").unwrap());
+        assert!(
+            t.contains(
+                "    <packageSource key=\"nuget.org\">\n      <package pattern=\"*\" />\n    </packageSource>"
+            ),
+            "{t}"
+        );
+        assert!(t.contains("<package pattern=\"Newtonsoft.Json\" />"), "{t}");
+        assert!(t.trim_end().ends_with("</configuration>"));
+    }
+
+    /// A config whose only anchor is `</packageSources>` (step 1 lands) but
+    /// with no `</configuration>` fails creating the mapping section.
+    #[test]
+    fn config_without_configuration_close_errs_on_mapping_section() {
+        let orig = "<packageSources>\n</packageSources>\n";
+        let err = build_config_edit(
+            Some(orig),
+            &source_key(),
+            &format!(".socket/vendor/nuget/{UUID}"),
+            "Newtonsoft.Json",
+        )
+        .err()
+        .expect("a config without </configuration> must fail the mapping insert");
+        assert!(err.contains("packageSourceMapping section"), "{err}");
+    }
+
+    /// No usable anchor at all: fail-closed with the `</configuration>` error.
+    #[test]
+    fn config_without_any_anchor_errs() {
+        let err = build_config_edit(
+            Some("<configuration>"),
+            &source_key(),
+            &format!(".socket/vendor/nuget/{UUID}"),
+            "Newtonsoft.Json",
+        )
+        .err()
+        .expect("an anchorless config must fail the edit");
+        assert!(err.contains("no </configuration> to edit"), "{err}");
+    }
+
+    // ── covgap 2026-09: marker write failure is a warning, not a failure ────
+
+    #[tokio::test]
+    async fn marker_write_failure_warns_but_vendor_succeeds() {
+        let (dir, blobs, installed, record) = fixture(true, None).await;
+        let root = dir.path();
+        // A DIRECTORY squatting the marker path makes write_marker's atomic
+        // rename fail while everything else wires normally.
+        let marker_path = root.join(format!(".socket/vendor/nuget/{UUID}/{VENDOR_MARKER_FILE}"));
+        tokio::fs::create_dir_all(&marker_path).await.unwrap();
+
+        let (result, entry, warnings) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert!(result.success, "{:?}", result.error);
+        assert!(
+            entry.is_some(),
+            "a marker failure must not drop the ledger entry"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.code == "vendor_marker_write_failed"),
+            "{warnings:?}"
+        );
+        // The vendor itself is fully wired.
+        let nupkg = tokio::fs::read(root.join(copy_rel())).await.unwrap();
+        assert_eq!(
+            read_nupkg_entry(&nupkg, "LICENSE.md").as_deref(),
+            Some(PATCHED)
+        );
+        let cfg = tokio::fs::read_to_string(root.join("nuget.config"))
+            .await
+            .unwrap();
+        assert!(cfg.contains(&source_key()));
+        let lock = tokio::fs::read_to_string(root.join(PACKAGES_LOCK))
+            .await
+            .unwrap();
+        assert!(lock.contains(&content_hash(&nupkg)));
+    }
+
+    // ── covgap 2026-09: revert entry validation edges ───────────────────────
+
+    fn entry_with_wiring(uuid: &str, wiring: Vec<WiringRecord>) -> VendorEntry {
+        VendorEntry {
+            ecosystem: "nuget".to_string(),
+            base_purl: PURL.to_string(),
+            uuid: uuid.to_string(),
+            artifact: VendorArtifact {
+                path: copy_rel(),
+                sha256: String::new(),
+                size: None,
+                platform_locked: None,
+                file_inventory: None,
+            },
+            wiring,
+            lock: None,
+            took_over_go_patches: false,
+            detached: false,
+            record: None,
+            flavor: None,
+            uv: None,
+            pnpm: None,
+            poetry: None,
+            pdm: None,
+            pipenv: None,
+        }
+    }
+
+    /// A tampered state.json uuid must refuse the revert fail-closed before
+    /// any disk access.
+    #[tokio::test]
+    async fn revert_refuses_non_canonical_uuid() {
+        let dir = tempfile::tempdir().unwrap();
+        let entry = entry_with_wiring("../../escape", Vec::new());
+        let outcome = revert_nuget(&entry, dir.path(), false).await;
+        assert!(!outcome.success);
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("non-canonical patch uuid"),
+            "{:?}",
+            outcome.error
+        );
+    }
+
+    /// An unrecognized wiring kind (a NEWER state.json) is skipped with a
+    /// drift warning — forward-compat, never a hard failure.
+    #[tokio::test]
+    async fn revert_unknown_wiring_kind_warns_and_continues() {
+        let dir = tempfile::tempdir().unwrap();
+        let entry = entry_with_wiring(
+            UUID,
+            vec![WiringRecord {
+                file: "nuget.config".to_string(),
+                kind: "bogus_kind".to_string(),
+                action: WiringAction::Added,
+                key: Some("Newtonsoft.Json".to_string()),
+                original: None,
+                new: None,
+            }],
+        );
+        let outcome = revert_nuget(&entry, dir.path(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(
+            outcome.warnings.iter().any(|w| {
+                w.code == "vendor_lock_entry_drifted"
+                    && w.detail.contains("unrecognized wiring kind")
+            }),
+            "{:?}",
+            outcome.warnings
+        );
+    }
+
+    /// A config source record with no `key` (tampered/truncated state.json) is
+    /// drift: warned, and the live config left alone.
+    #[tokio::test]
+    async fn revert_config_record_without_key_is_drift() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let cfg = "<configuration>\n</configuration>\n";
+        tokio::fs::write(root.join("nuget.config"), cfg)
+            .await
+            .unwrap();
+        let entry = entry_with_wiring(
+            UUID,
+            vec![WiringRecord {
+                file: "nuget.config".to_string(),
+                kind: CONFIG_SOURCE_WIRING_KIND.to_string(),
+                action: WiringAction::Rewritten,
+                key: None,
+                original: None,
+                new: None,
+            }],
+        );
+        let outcome = revert_nuget(&entry, root, false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_lock_entry_drifted"),
+            "{:?}",
+            outcome.warnings
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("nuget.config"))
+                .await
+                .unwrap(),
+            cfg,
+            "a key-less record must not touch the live config"
+        );
+    }
+
+    /// The vendored config already deleted by hand: the source record treats
+    /// "already gone" as done, and the rest of the revert completes.
+    #[tokio::test]
+    async fn revert_with_config_already_deleted_succeeds() {
+        let (dir, blobs, installed, record) = fixture(true, None).await;
+        let root = dir.path();
+        let lock_before = tokio::fs::read(root.join(PACKAGES_LOCK)).await.unwrap();
+        let (_r, entry, _w) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        let entry = entry.unwrap();
+        tokio::fs::remove_file(root.join("nuget.config"))
+            .await
+            .unwrap();
+
+        let outcome = revert_nuget(&entry, root, false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(
+            !root.join(format!(".socket/vendor/nuget/{UUID}")).exists(),
+            "uuid dir removed"
+        );
+        assert_eq!(
+            tokio::fs::read(root.join(PACKAGES_LOCK)).await.unwrap(),
+            lock_before,
+            "lock restored despite the missing config"
+        );
+        assert!(!root.join("nuget.config").exists(), "no config resurrected");
+    }
+
+    // ── covgap 2026-09: dry-run revert previews without writes ──────────────
+
+    #[tokio::test]
+    async fn dry_run_revert_in_sync_touches_nothing() {
+        let (dir, blobs, installed, record) = fixture(true, None).await;
+        let root = dir.path();
+        let (_r, entry, _w) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        let entry = entry.unwrap();
+        let cfg = tokio::fs::read(root.join("nuget.config")).await.unwrap();
+        let lock = tokio::fs::read(root.join(PACKAGES_LOCK)).await.unwrap();
+        let nupkg = tokio::fs::read(root.join(copy_rel())).await.unwrap();
+
+        let outcome = revert_nuget(&entry, root, true).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(
+            outcome.warnings.is_empty(),
+            "an in-sync dry revert has no drift: {:?}",
+            outcome.warnings
+        );
+        assert_eq!(
+            tokio::fs::read(root.join("nuget.config")).await.unwrap(),
+            cfg
+        );
+        assert_eq!(
+            tokio::fs::read(root.join(PACKAGES_LOCK)).await.unwrap(),
+            lock
+        );
+        assert_eq!(tokio::fs::read(root.join(copy_rel())).await.unwrap(), nupkg);
+        assert!(
+            root.join(format!(".socket/vendor/nuget/{UUID}")).exists(),
+            "artifact dir kept on dry run"
+        );
+    }
+
+    #[tokio::test]
+    async fn dry_run_revert_after_user_edit_touches_nothing() {
+        let (dir, blobs, installed, record) = fixture(true, None).await;
+        let root = dir.path();
+        let (_r, entry, _w) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        let entry = entry.unwrap();
+        // A user edit forces the excise path (live != what vendor wrote).
+        let wired = tokio::fs::read_to_string(root.join("nuget.config"))
+            .await
+            .unwrap();
+        let edited = wired.replacen(
+            "</configuration>",
+            "<!-- user note -->\n</configuration>",
+            1,
+        );
+        assert_ne!(edited, wired);
+        tokio::fs::write(root.join("nuget.config"), &edited)
+            .await
+            .unwrap();
+        let lock = tokio::fs::read(root.join(PACKAGES_LOCK)).await.unwrap();
+
+        let outcome = revert_nuget(&entry, root, true).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("nuget.config"))
+                .await
+                .unwrap(),
+            edited,
+            "dry-run excise must not modify the config"
+        );
+        assert_eq!(
+            tokio::fs::read(root.join(PACKAGES_LOCK)).await.unwrap(),
+            lock
+        );
+        assert!(root.join(format!(".socket/vendor/nuget/{UUID}")).exists());
+    }
+
+    // ── covgap 2026-09: local-rebuild failure shapes ────────────────────────
+
+    /// A cached .nupkg that is not a zip cannot be staged: failed result, and
+    /// no project file (or artifact dir) is written after the failure.
+    #[tokio::test]
+    async fn corrupt_cached_nupkg_fails_before_any_wiring() {
+        let (dir, blobs, installed, record) = fixture(true, None).await;
+        let root = dir.path();
+        tokio::fs::write(
+            installed.join("newtonsoft.json.13.0.3.nupkg"),
+            b"not a zip archive",
+        )
+        .await
+        .unwrap();
+
+        let (result, entry, _w) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert!(!result.success);
+        assert!(entry.is_none());
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("cannot extract"),
+            "{:?}",
+            result.error
+        );
+        assert!(
+            !root.join("nuget.config").exists(),
+            "no config after a failed rebuild"
+        );
+        assert!(
+            !root.join(".socket").exists(),
+            "no artifact dir after a failed extract"
+        );
+    }
+
+    /// An empty blob store fails the force-apply: failed result, no wiring.
+    #[tokio::test]
+    async fn missing_blob_apply_failure_writes_no_config() {
+        let (dir, _blobs, installed, record) = fixture(true, None).await;
+        let root = dir.path();
+        let empty = tempfile::tempdir().unwrap();
+        let sources = PatchSources::blobs_only(empty.path());
+        let outcome = vendor_nuget(
+            PURL, &installed, root, &record, &sources, "t", false, false, None,
+        )
+        .await;
+        let (result, entry, _w) = unwrap_done(outcome);
+        assert!(
+            !result.success,
+            "a missing after-hash blob must fail the apply"
+        );
+        assert!(result.error.is_some());
+        assert!(entry.is_none());
+        assert!(
+            !root.join("nuget.config").exists(),
+            "no config after a failed apply"
+        );
+    }
+
+    /// A regular FILE squatting the uuid dir path: create_dir_all fails, the
+    /// vendor reports it, and no config is written. (The squatting file itself
+    /// survives — remove_tree removes trees, not files: pinned as the current
+    /// husk behavior.)
+    #[tokio::test]
+    async fn squatted_uuid_path_fails_and_writes_no_config() {
+        let (dir, blobs, installed, record) = fixture(true, None).await;
+        let root = dir.path();
+        let parent = root.join(".socket/vendor/nuget");
+        tokio::fs::create_dir_all(&parent).await.unwrap();
+        tokio::fs::write(parent.join(UUID), b"squatter").await.unwrap();
+
+        let (result, entry, _w) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert!(!result.success);
+        assert!(entry.is_none());
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("cannot create"),
+            "{:?}",
+            result.error
+        );
+        assert!(
+            !root.join("nuget.config").exists(),
+            "no config after a failed artifact write"
+        );
+        assert!(
+            parent.join(UUID).is_file(),
+            "the squatting file survives the cleanup attempt"
+        );
+    }
+
+    // ── covgap 2026-09: service prebuilt (Tier A) arms ──────────────────────
+
+    #[tokio::test]
+    async fn service_prebuilt_used_writes_served_bytes_verbatim() {
+        use crate::api::client::{ApiClient, ApiClientOptions};
+        use crate::vendor::npm_pack::PackedTarball;
+        use crate::vendor::VendorSource;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let (dir, blobs, installed, record) = fixture(true, None).await;
+        let root = dir.path();
+        let server = MockServer::start().await;
+        let served = make_nupkg(PATCHED);
+        let sri = PackedTarball::from_bytes(&served).integrity;
+        let serve_path =
+            "/patch/nuget/newtonsoft.json/13.0.3/tok/uuid/newtonsoft.json.13.0.3.nupkg";
+        let serve_url = format!("{}{serve_path}", server.uri());
+        Mock::given(method("POST"))
+            .and(path("/v0/orgs/acme/patches/package"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": { UUID: {
+                    "status": "granted",
+                    "url": serve_url,
+                    "artifacts": [{ "kind": "tarball", "url": serve_url,
+                                    "integrity": { "sha512": sri } }]
+                }}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(serve_path))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(served.clone()))
+            .mount(&server)
+            .await;
+        let cfg = VendorServiceConfig {
+            source: VendorSource::Service,
+            client: Some(ApiClient::new(ApiClientOptions {
+                api_url: server.uri(),
+                api_token: Some("sktsec_placeholder_value_for_tests_api".into()),
+                use_public_proxy: false,
+                org_slug: Some("acme".into()),
+            })),
+            use_public_proxy: false,
+            vendor_url: None,
+            patch_server_url: None,
+            offline: false,
+        };
+
+        let sources = PatchSources::blobs_only(&blobs);
+        let outcome = vendor_nuget(
+            PURL,
+            &installed,
+            root,
+            &record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            Some(&cfg),
+        )
+        .await;
+        let (result, entry, warnings) = unwrap_done(outcome);
+        assert!(result.success, "{:?}", result.error);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.code == "vendor_prebuilt_downloaded"),
+            "{warnings:?}"
+        );
+        // Tier A: the served bytes ARE the artifact, written VERBATIM — the
+        // signature part is still present (service bytes are trusted, never
+        // re-zipped locally).
+        let got = tokio::fs::read(root.join(copy_rel())).await.unwrap();
+        assert_eq!(got, served);
+        assert!(
+            read_nupkg_entry(&got, ".signature.p7s").is_some(),
+            "verbatim copy keeps the signature part"
+        );
+        // Wiring ran normally over the downloaded artifact.
+        let cfg_text = tokio::fs::read_to_string(root.join("nuget.config"))
+            .await
+            .unwrap();
+        assert!(cfg_text.contains(&source_key()));
+        let lock = tokio::fs::read_to_string(root.join(PACKAGES_LOCK))
+            .await
+            .unwrap();
+        assert!(
+            lock.contains(&content_hash(&served)),
+            "lock pinned at the served bytes"
+        );
+        assert_eq!(entry.expect("ledger entry").wiring.len(), 3);
+    }
+
+    /// A terminal service miss under `--vendor-source=service` is a hard
+    /// refusal — never a quiet local rebuild — and leaves no partial state.
+    #[tokio::test]
+    async fn service_prebuilt_miss_hard_fails_under_service_source() {
+        use crate::api::client::{ApiClient, ApiClientOptions};
+        use crate::vendor::VendorSource;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let (dir, blobs, installed, record) = fixture(true, None).await;
+        let root = dir.path();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v0/orgs/acme/patches/package"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": { UUID: { "status": "not_found" } }
+            })))
+            .mount(&server)
+            .await;
+        let cfg = VendorServiceConfig {
+            source: VendorSource::Service,
+            client: Some(ApiClient::new(ApiClientOptions {
+                api_url: server.uri(),
+                api_token: Some("sktsec_placeholder_value_for_tests_api".into()),
+                use_public_proxy: false,
+                org_slug: Some("acme".into()),
+            })),
+            use_public_proxy: false,
+            vendor_url: None,
+            patch_server_url: None,
+            offline: false,
+        };
+
+        let sources = PatchSources::blobs_only(&blobs);
+        let outcome = vendor_nuget(
+            PURL,
+            &installed,
+            root,
+            &record,
+            &sources,
+            "t",
+            false,
+            false,
+            Some(&cfg),
+        )
+        .await;
+        let (code, detail) = unwrap_refused(outcome);
+        assert_eq!(code, "vendor_prebuilt_required");
+        assert!(detail.contains("unavailable"), "{detail}");
+        assert!(
+            !root.join(".socket").exists(),
+            "a hard service miss writes nothing"
+        );
+        assert!(!root.join("nuget.config").exists());
+    }
+
+    // ── covgap 2026-09: edit_lock / lock_pinned pure edges ──────────────────
+
+    #[test]
+    fn edit_lock_absent_shapes_are_nothing_to_pin() {
+        // No dependencies object at all.
+        assert!(
+            edit_lock(r#"{"version":1}"#, "Newtonsoft.Json", "13.0.3", "N==")
+                .unwrap()
+                .is_none()
+        );
+        // A framework whose value is not an object is skipped.
+        let odd = r#"{"version":1,"dependencies":{"net8.0":42}}"#;
+        assert!(edit_lock(odd, "Newtonsoft.Json", "13.0.3", "N==")
+            .unwrap()
+            .is_none());
+        // A matching resolved entry WITHOUT a contentHash: nothing to rewrite.
+        let unhashed = serde_json::to_string_pretty(&json!({
+            "version": 1,
+            "dependencies": {
+                "net8.0": {
+                    "Newtonsoft.Json": { "type": "Direct", "resolved": "13.0.3" }
+                }
+            }
+        }))
+        .unwrap();
+        assert!(edit_lock(&unhashed, "Newtonsoft.Json", "13.0.3", "N==")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn edit_lock_conflicting_hashes_fail_closed() {
+        let lock = serde_json::to_string_pretty(&json!({
+            "version": 1,
+            "dependencies": {
+                "net8.0": {
+                    "Newtonsoft.Json": { "resolved": "13.0.3", "contentHash": "AAA==" }
+                },
+                "net6.0": {
+                    "Newtonsoft.Json": { "resolved": "13.0.3", "contentHash": "BBB==" }
+                }
+            }
+        }))
+        .unwrap();
+        let err = edit_lock(&lock, "Newtonsoft.Json", "13.0.3", "N==")
+            .err()
+            .expect("a self-contradictory lock must fail closed");
+        assert!(err.contains("conflicting contentHash"), "{err}");
+    }
+
+    #[test]
+    fn lock_pinned_edge_shapes_report_unpinned() {
+        // No dependencies object.
+        assert!(!lock_pinned("{}", "Newtonsoft.Json", "13.0.3", "H=="));
+        // Non-object framework value.
+        assert!(!lock_pinned(
+            r#"{"dependencies":{"net8.0":42}}"#,
+            "Newtonsoft.Json",
+            "13.0.3",
+            "H=="
+        ));
+        // Same id at a DIFFERENT resolved version: no match, not pinned.
+        let lock = lock_json("H==");
+        assert!(!lock_pinned(&lock, "Newtonsoft.Json", "12.0.0", "H=="));
+    }
+
+    // ── covgap 2026-09: revert_lock_record pure edges ───────────────────────
+
+    fn lock_wiring(original: Option<&str>, new: Option<&str>) -> WiringRecord {
+        WiringRecord {
+            file: PACKAGES_LOCK.to_string(),
+            kind: LOCK_WIRING_KIND.to_string(),
+            action: WiringAction::Rewritten,
+            key: Some("Newtonsoft.Json".to_string()),
+            original: original.map(|s| Value::String(s.to_string())),
+            new: new.map(|s| Value::String(s.to_string())),
+        }
+    }
+
+    #[tokio::test]
+    async fn revert_lock_record_missing_fields_is_drift() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join(PACKAGES_LOCK);
+        let text = lock_json("OURS==");
+        tokio::fs::write(&lock_path, &text).await.unwrap();
+        // original missing → drift, and the file is never touched.
+        let w = lock_wiring(None, Some("OURS=="));
+        assert!(!revert_lock_record(&lock_path, &w, false).await.unwrap());
+        assert_eq!(
+            tokio::fs::read_to_string(&lock_path).await.unwrap(),
+            text
+        );
+        // new missing → same drift.
+        let w = lock_wiring(Some("OLD=="), None);
+        assert!(!revert_lock_record(&lock_path, &w, false).await.unwrap());
+        assert_eq!(
+            tokio::fs::read_to_string(&lock_path).await.unwrap(),
+            text
+        );
+    }
+
+    #[tokio::test]
+    async fn revert_lock_record_identity_pin_needs_no_file() {
+        // orig == ours: nothing to undo — proven by pointing at a lock path
+        // that does not even exist (any I/O would error).
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("no-such-lock.json");
+        let w = lock_wiring(Some("SAME=="), Some("SAME=="));
+        assert!(revert_lock_record(&missing, &w, false).await.unwrap());
+        assert!(!missing.exists());
+    }
+
+    #[tokio::test]
+    async fn revert_lock_record_prior_restore_vs_drift() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join(PACKAGES_LOCK);
+        let w = lock_wiring(Some("OLD=="), Some("NEW=="));
+        // Ours gone but the original is present: a prior revert already
+        // restored it (shared hash across framework entries) — done.
+        let restored = lock_json("OLD==");
+        tokio::fs::write(&lock_path, &restored).await.unwrap();
+        assert!(revert_lock_record(&lock_path, &w, false).await.unwrap());
+        assert_eq!(
+            tokio::fs::read_to_string(&lock_path).await.unwrap(),
+            restored
+        );
+        // Neither value present: drift, file untouched.
+        let foreign = lock_json("SOMETHINGELSE==");
+        tokio::fs::write(&lock_path, &foreign).await.unwrap();
+        assert!(!revert_lock_record(&lock_path, &w, false).await.unwrap());
+        assert_eq!(
+            tokio::fs::read_to_string(&lock_path).await.unwrap(),
+            foreign
+        );
+        // A missing lock file is drift too, not an error.
+        tokio::fs::remove_file(&lock_path).await.unwrap();
+        assert!(!revert_lock_record(&lock_path, &w, false).await.unwrap());
+    }
+
+    // ── covgap 2026-09: unwind of a CREATED config ──────────────────────────
+
+    /// When vendor CREATED nuget.config and the lock edit then fails, the
+    /// unwind must DELETE the created config (the None arm), not restore it.
+    #[tokio::test]
+    async fn failed_lock_edit_unwind_deletes_created_config() {
+        let (dir, blobs, installed, record) = fixture(false, None).await;
+        let root = dir.path();
+        tokio::fs::write(root.join(PACKAGES_LOCK), b"{ not json")
+            .await
+            .unwrap();
+
+        let (result, entry, _w) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert!(!result.success, "unparseable lock fails the vendor");
+        assert!(entry.is_none());
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("unparseable"),
+            "{:?}",
+            result.error
+        );
+        assert!(
+            !root.join("nuget.config").exists(),
+            "the config vendor just created must be unwound (deleted)"
+        );
+        assert!(
+            !root.join(format!(".socket/vendor/nuget/{UUID}")).exists(),
+            "partial uuid dir removed"
+        );
+    }
+
+    // ── covgap 2026-09: comment blanking + key scan edges ───────────────────
+
+    #[test]
+    fn blank_comments_unterminated_blanks_through_eof() {
+        let input = "keep <!-- never closed\nline2";
+        let out = blank_comments(input);
+        let blanked_first = " ".repeat("<!-- never closed".len());
+        let blanked_second = " ".repeat("line2".len());
+        assert_eq!(out, format!("keep {blanked_first}\n{blanked_second}"));
+        assert_eq!(out.len(), input.len(), "length-preserving");
+    }
+
+    #[test]
+    fn parse_config_source_keys_no_section_and_odd_adds() {
+        // No <packageSources> at all → no keys.
+        assert_eq!(
+            parse_config_source_keys("<configuration></configuration>"),
+            Vec::<String>::new()
+        );
+        // An <add> without a key is skipped; a duplicate key is deduped.
+        let text = "<packageSources>\n\
+                    \x20 <add value=\"x\" />\n\
+                    \x20 <add key=\"a\" value=\"y\" />\n\
+                    \x20 <add key=\"a\" value=\"z\" />\n\
+                    </packageSources>";
+        assert_eq!(parse_config_source_keys(text), vec!["a"]);
+    }
+
+    // ── covgap 2026-09: permission-failure unwinds (unix) ───────────────────
+
+    /// Fresh-path nuget.config write failure: the artifact already staged into
+    /// the (pre-created, writable) uuid dir must be cleaned up so a failed
+    /// vendor leaves no half-wired feed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn config_write_failure_removes_staged_uuid_dir() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (dir, blobs, installed, record) = fixture(false, None).await;
+        let root = dir.path();
+        let uuid_dir = root.join(format!(".socket/vendor/nuget/{UUID}"));
+        tokio::fs::create_dir_all(&uuid_dir).await.unwrap();
+
+        tokio::fs::set_permissions(root, std::fs::Permissions::from_mode(0o555))
+            .await
+            .unwrap();
+        if std::fs::write(root.join(".probe"), b"x").is_ok() {
+            let _ = std::fs::remove_file(root.join(".probe"));
+            tokio::fs::set_permissions(root, std::fs::Permissions::from_mode(0o755))
+                .await
+                .unwrap();
+            return; // modes ignored (running as root) — nothing to test
+        }
+        let outcome = run_vendor(root, &blobs, &installed, &record, false).await;
+        tokio::fs::set_permissions(root, std::fs::Permissions::from_mode(0o755))
+            .await
+            .unwrap();
+
+        let (result, entry, _w) = unwrap_done(outcome);
+        assert!(!result.success);
+        assert!(entry.is_none());
+        let err = result.error.as_deref().unwrap_or("");
+        assert!(
+            err.contains("failed to write") && err.contains("nuget.config"),
+            "{err}"
+        );
+        assert!(!uuid_dir.exists(), "the staged uuid dir must be removed");
+        assert!(!root.join("nuget.config").exists());
+    }
+
+    /// Revert's final uuid-dir removal failure is a reported failure naming
+    /// the dir — after the wiring restore already ran.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn revert_reports_uuid_dir_removal_failure() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (dir, blobs, installed, record) = fixture(true, None).await;
+        let root = dir.path();
+        let (r1, entry, _w) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert!(r1.success);
+        let entry = entry.unwrap();
+        let parent = root.join(".socket/vendor/nuget");
+        tokio::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o555))
+            .await
+            .unwrap();
+        if std::fs::write(parent.join(".probe"), b"x").is_ok() {
+            let _ = std::fs::remove_file(parent.join(".probe"));
+            tokio::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755))
+                .await
+                .unwrap();
+            return; // modes ignored (running as root) — nothing to test
+        }
+        let outcome = revert_nuget(&entry, root, false).await;
+        tokio::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755))
+            .await
+            .unwrap();
+
+        assert!(!outcome.success, "{outcome:?}");
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("failed to remove"),
+            "{:?}",
+            outcome.error
+        );
+        // The wiring restore ran before the artifact removal failed.
+        assert!(
+            !root.join("nuget.config").exists(),
+            "created config already deleted"
+        );
+    }
+
+    /// Revert of a CREATED config whose deletion fails (read-only project
+    /// root) surfaces the I/O error instead of silently succeeding.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn revert_created_config_delete_failure_reported() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (dir, blobs, installed, record) = fixture(false, None).await;
+        let root = dir.path();
+        let (r1, entry, _w) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert!(r1.success);
+        let entry = entry.unwrap();
+
+        tokio::fs::set_permissions(root, std::fs::Permissions::from_mode(0o555))
+            .await
+            .unwrap();
+        if std::fs::write(root.join(".probe"), b"x").is_ok() {
+            let _ = std::fs::remove_file(root.join(".probe"));
+            tokio::fs::set_permissions(root, std::fs::Permissions::from_mode(0o755))
+                .await
+                .unwrap();
+            return; // modes ignored (running as root) — nothing to test
+        }
+        let outcome = revert_nuget(&entry, root, false).await;
+        tokio::fs::set_permissions(root, std::fs::Permissions::from_mode(0o755))
+            .await
+            .unwrap();
+
+        assert!(!outcome.success, "{outcome:?}");
+        let err = outcome.error.as_deref().unwrap_or("");
+        assert!(
+            err.contains("failed to remove") && err.contains("nuget.config"),
+            "{err}"
+        );
+        assert!(
+            root.join("nuget.config").exists(),
+            "the config stays when its delete fails"
+        );
+    }
+
+    /// packages.lock.json write failure AFTER the config write: the config is
+    /// unwound to its pre-vendor bytes and the uuid dir removed (macOS: a
+    /// `uchg`-flagged lock lets the read succeed while the atomic rename-over
+    /// fails EPERM).
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn lock_write_failure_unwinds_preexisting_config() {
+        use std::os::unix::ffi::OsStrExt as _;
+        fn chflags(path: &Path, flags: libc::c_uint) -> bool {
+            let c_path =
+                std::ffi::CString::new(path.as_os_str().as_bytes()).expect("path has no NUL");
+            (unsafe { libc::chflags(c_path.as_ptr(), flags) }) == 0
+        }
+        let (dir, blobs, installed, record) = fixture(true, Some(preexisting_cfg())).await;
+        let root = dir.path();
+        let lock = root.join(PACKAGES_LOCK);
+        let lock_before = tokio::fs::read(&lock).await.unwrap();
+        if !chflags(&lock, libc::UF_IMMUTABLE) {
+            return; // environment refuses chflags (exotic fs) — skip
+        }
+        // Prove the flag actually blocks writes here (else clear and skip).
+        if std::fs::OpenOptions::new().write(true).open(&lock).is_ok() {
+            assert!(chflags(&lock, 0));
+            return;
+        }
+        let outcome = run_vendor(root, &blobs, &installed, &record, false).await;
+        assert!(chflags(&lock, 0), "cleanup: clear uchg");
+
+        let (result, entry, _w) = unwrap_done(outcome);
+        assert!(!result.success);
+        assert!(entry.is_none());
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("failed to write packages.lock.json"),
+            "{:?}",
+            result.error
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("nuget.config"))
+                .await
+                .unwrap(),
+            preexisting_cfg(),
+            "the config unwind restores the pre-vendor bytes"
+        );
+        assert!(
+            !root.join(format!(".socket/vendor/nuget/{UUID}")).exists(),
+            "uuid dir removed"
+        );
+        assert_eq!(
+            tokio::fs::read(&lock).await.unwrap(),
+            lock_before,
+            "lock bytes untouched"
         );
     }
 }

@@ -3013,6 +3013,103 @@ mod tests {
         assert!(out.warnings.is_empty());
     }
 
+    /// Committed `vendor/cache` fold, UNKNOWN-sha arm (`_ => false`): when
+    /// the run carries NO artifact sha for the gem (empty shas map — e.g. a
+    /// reference served without a gem checksum), a committed archive beside
+    /// a stale install must STILL be folded into the delete list. Removal is
+    /// safe either way (`bundle install` refetches), so "unknown" must never
+    /// downgrade to "proven patched" and leave the archive to silently
+    /// reinstate the stale bytes.
+    #[tokio::test]
+    async fn gem_stale_probe_folds_committed_cache_with_unknown_artifact_sha() {
+        let tmp = tempfile::tempdir().unwrap();
+        materialize_gem(tmp.path(), GEM_UPSTREAM);
+        let committed = tmp
+            .path()
+            .join("vendor")
+            .join("cache")
+            .join(format!("{GEM_LEAF}.gem"));
+        std::fs::create_dir_all(committed.parent().unwrap()).unwrap();
+        std::fs::write(&committed, b"upstream archive bytes").unwrap();
+
+        // `probe()` passes an EMPTY gem_artifact_shas map: the
+        // (None, Some(_)) pair must take the fold-anyway arm.
+        let out = probe(tmp.path(), &one_confirmed(), &one_record()).await;
+        assert_eq!(
+            out.warnings.len(),
+            1,
+            "one stale install, one warning (cache folded, not standalone): {:?}",
+            out.warnings
+        );
+        let detail = detail_of(&out.warnings[0]);
+        assert!(
+            detail.contains(&committed.display().to_string()),
+            "the committed archive must join the delete list even with no \
+             known artifact sha: {detail}"
+        );
+        assert_eq!(
+            out.stale_purls,
+            std::collections::BTreeSet::from([GEM_PURL.to_string()])
+        );
+        // Read-only contract: the archive itself is never deleted.
+        assert!(committed.is_file(), "the probe prescribes, never deletes");
+    }
+
+    /// Standalone cache pass 3, UNREADABLE-archive arm: a committed archive
+    /// whose bytes cannot be read (chmod 000) yields NO positive evidence,
+    /// so the probe must stay silent instead of guessing staleness from the
+    /// differing expected sha — the never-warn-without-positive-evidence
+    /// contract, archive flavor.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn gem_stale_probe_never_judges_unreadable_committed_archive() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        // NO installed gem dir (fresh-checkout shape) so pass 3 is the only
+        // judgment path.
+        let committed = tmp
+            .path()
+            .join("vendor")
+            .join("cache")
+            .join(format!("{GEM_LEAF}.gem"));
+        std::fs::create_dir_all(committed.parent().unwrap()).unwrap();
+        std::fs::write(&committed, b"upstream archive bytes").unwrap();
+        std::fs::set_permissions(&committed, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Root ignores mode bits: detect it while the chmod is in force so
+        // the assertion below matches what the probe could actually read.
+        let readable_despite_chmod = std::fs::File::open(&committed).is_ok();
+
+        let mut shas = std::collections::BTreeMap::new();
+        shas.insert(
+            ("stale-unit".to_string(), "1.0.0".to_string()),
+            "0".repeat(64), // differs from the archive bytes' sha
+        );
+        let out = gem_stale_install_warnings(
+            tmp.path(),
+            false,
+            None,
+            &one_confirmed(),
+            &one_record(),
+            &std::collections::BTreeMap::new(),
+            &shas,
+        )
+        .await;
+        std::fs::set_permissions(&committed, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        if readable_despite_chmod {
+            // Running as root: the archive WAS readable and its sha differs,
+            // so the ordinary stale-cache warning is the correct outcome.
+            assert_eq!(out.warnings.len(), 1, "root fallback: readable + stale");
+        } else {
+            assert!(
+                out.warnings.is_empty(),
+                "an unreadable archive is never staleness evidence: {:?}",
+                out.warnings
+            );
+            assert!(out.stale_purls.is_empty());
+        }
+    }
+
     /// The standalone cache-flavor warning's load-bearing wording.
     #[test]
     fn gem_stale_cache_warning_names_archive_and_remedy() {

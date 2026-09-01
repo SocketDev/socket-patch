@@ -923,6 +923,70 @@ mod tests {
     }
 
     #[test]
+    fn test_scan_maven_repo_stray_root_pom_skipped_and_duplicate_purl_deduped() {
+        // (a) A stray `.pom` at the repository ROOT — a real occurrence in
+        // ~/.m2 trees full of resolver droppings. Its content carries no
+        // coordinates (parse_pom returns None) and the directory-path
+        // fallback also fails (zero components relative to the root), so
+        // the entry must be skipped rather than emit a garbage package.
+        // (b) Two DIFFERENT .pom files that resolve to the SAME purl — one
+        // from correct content in its own version dir, one elsewhere whose
+        // CONTENT declares the first's coordinates (content wins over the
+        // path): the seen-set must dedupe them to a single package.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("stray.pom"), "<project/>").unwrap();
+
+        let real_dir = dir
+            .path()
+            .join("com")
+            .join("example")
+            .join("dup")
+            .join("1.0.0");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        std::fs::write(
+            real_dir.join("dup-1.0.0.pom"),
+            r#"<project>
+  <groupId>com.example</groupId>
+  <artifactId>dup</artifactId>
+  <version>1.0.0</version>
+</project>"#,
+        )
+        .unwrap();
+
+        // Lives at com/other/shadow/9.9.9 but its content claims the same
+        // coordinates as the package above.
+        let shadow_dir = dir
+            .path()
+            .join("com")
+            .join("other")
+            .join("shadow")
+            .join("9.9.9");
+        std::fs::create_dir_all(&shadow_dir).unwrap();
+        std::fs::write(
+            shadow_dir.join("shadow-9.9.9.pom"),
+            r#"<project>
+  <groupId>com.example</groupId>
+  <artifactId>dup</artifactId>
+  <version>1.0.0</version>
+</project>"#,
+        )
+        .unwrap();
+
+        let crawler = MavenCrawler::new();
+        let mut seen = HashSet::new();
+        let pkgs = crawler.scan_maven_repo(dir.path(), &mut seen);
+        assert_eq!(
+            pkgs.len(),
+            1,
+            "stray root pom must be skipped and the duplicate purl deduped, got {pkgs:?}"
+        );
+        assert_eq!(pkgs[0].purl, "pkg:maven/com.example/dup@1.0.0");
+        assert_eq!(pkgs[0].name, "dup");
+        assert_eq!(pkgs[0].version, "1.0.0");
+        assert_eq!(pkgs[0].namespace, Some("com.example".to_string()));
+    }
+
+    #[test]
     fn test_parse_pom_foreign_element_prefixed_with_skip_name() {
         // REGRESSION: a top-level element whose name merely *starts with* a
         // skip-section name (here `<buildtools>` vs the `build` skip section,
@@ -1085,6 +1149,14 @@ mod tests {
         assert_eq!(opening_tag("<build foo=\"x\" />", "build"), Some(true));
         // Attribute list spilling onto the next line — name at end of line.
         assert_eq!(opening_tag("<build", "build"), Some(false));
+        // Attribute list spilling onto the next line — whitespace boundary
+        // after the name but no `>` anywhere on the line: a real,
+        // non-self-closing open (the `after.find('>')` None arm).
+        assert_eq!(opening_tag("<build attr=\"x\"", "build"), Some(false));
+        assert_eq!(
+            opening_tag("<dependencies foo", "dependencies"),
+            Some(false)
+        );
         // Prefix-only matches are NOT opening tags.
         assert_eq!(opening_tag("<buildtools>", "build"), None);
         assert_eq!(opening_tag("<modulesInfo>x</modulesInfo>", "modules"), None);
@@ -1493,6 +1565,33 @@ mod tests {
 
         let paths = crawler.get_maven_repo_paths(&options).await.unwrap();
         assert!(paths.is_empty());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_get_maven_repo_paths_java_project_missing_repo_returns_empty() {
+        // Local mode with a real Java marker (pom.xml) in the cwd but a
+        // Maven local repo that does not exist on disk: the java-project
+        // gate passes, yet discovery must return empty rather than hand a
+        // phantom repo path to the scanner.
+        let project = tempfile::tempdir().unwrap();
+        tokio::fs::write(project.path().join("pom.xml"), "<project/>")
+            .await
+            .unwrap();
+        let missing = project.path().join("no-such-m2-repo");
+        let _local = EnvGuard::set("MAVEN_REPO_LOCAL", missing.to_str().unwrap());
+
+        let crawler = MavenCrawler::new();
+        let options = CrawlerOptions {
+            cwd: project.path().to_path_buf(),
+            global: false,
+            global_prefix: None,
+        };
+        let paths = crawler.get_maven_repo_paths(&options).await.unwrap();
+        assert!(
+            paths.is_empty(),
+            "a java project with a missing m2 repo must yield no repo paths, got {paths:?}"
+        );
     }
 
     #[tokio::test]

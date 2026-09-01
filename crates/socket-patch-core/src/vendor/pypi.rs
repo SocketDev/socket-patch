@@ -256,6 +256,68 @@ async fn uuid_dir_has_wheel(uuid_dir: &Path) -> bool {
     false
 }
 
+/// The (wheel path, sha256) a WIRED splice-flavor lock (poetry/pdm) still
+/// pins: the vendored `[[package]]` unit names the wheel under the uuid dir
+/// (`url = "<path>"` / `path = "./<path>"`) and its `files` array carries
+/// the one-line `{file = "<wheel>", hash = "sha256:<hex>"}` element vendor
+/// wrote. Paths are returned bare (no `./` prefix), matching the ledger's
+/// `artifact.path` spelling. `None` on any shape drift — the caller then
+/// keeps the unguarded rebuild rather than guessing.
+fn splice_lock_wired_pin(lock_text: &str, uuid_dir_rel: &str) -> Option<(String, String)> {
+    let prefix = format!("{uuid_dir_rel}/");
+    let path = lock_text.lines().find_map(|line| {
+        let (_, rest) = line.split_once('"')?;
+        let (quoted, _) = rest.split_once('"')?;
+        let bare = quoted.strip_prefix("./").unwrap_or(quoted);
+        (bare.starts_with(&prefix) && bare.ends_with(".whl")).then(|| bare.to_string())
+    })?;
+    let wheel_name = path.rsplit('/').next()?;
+    let hash_needle = format!("file = \"{wheel_name}\", hash = \"sha256:");
+    let at = lock_text.find(&hash_needle)?;
+    let hex: String = lock_text[at + hash_needle.len()..]
+        .chars()
+        .take_while(|c| c.is_ascii_hexdigit())
+        .collect();
+    (hex.len() == 64).then_some((path, hex))
+}
+
+/// The (wheel path, sha256) a WIRED Pipfile.lock still pins: the vendored
+/// entry's `file` ref names the wheel under the uuid dir and its `hashes`
+/// array holds the `sha256:` pin vendor wrote. Scans every category section
+/// (`default`, `develop`, and V3 named categories). Paths are returned bare
+/// (no `./` prefix), matching the ledger's `artifact.path` spelling.
+fn pipenv_wired_pin(lock: &serde_json::Value, uuid_dir_rel: &str) -> Option<(String, String)> {
+    let prefix = format!("{uuid_dir_rel}/");
+    for (key, section) in lock.as_object()?.iter() {
+        if key == "_meta" {
+            continue;
+        }
+        let Some(map) = section.as_object() else {
+            continue;
+        };
+        for entry in map.values() {
+            let Some(file) = entry.get("file").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            let bare = file.strip_prefix("./").unwrap_or(file);
+            if !bare.starts_with(&prefix) || !bare.ends_with(".whl") {
+                continue;
+            }
+            let Some(sha) = entry
+                .get("hashes")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|a| a.iter().find_map(|h| h.as_str()?.strip_prefix("sha256:")))
+            else {
+                continue;
+            };
+            if sha.len() == 64 && sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Some((bare.to_string(), sha.to_string()));
+            }
+        }
+    }
+    None
+}
+
 /// Vendor one pypi package: route the flavor, pre-flight every guard, build
 /// the patched wheel at `.socket/vendor/pypi/<uuid>/<wheel>`, write the
 /// marker, then wire the project files (LAST).
@@ -304,6 +366,15 @@ pub async fn vendor_pypi(
 
     // Pre-flight the wiring guards BEFORE building anything, so refusals
     // leave the tree byte-untouched.
+    //
+    // On an in-sync target the wired lockfiles themselves still carry the
+    // first vendor's wheel path + sha256 (that is what the in-sync probes
+    // matched on, and what the next hash-checked install verifies against).
+    // Captured here, while each flavor's parse is still in scope, so the
+    // rebuild pin guard below can fall back to it when the ledger has no
+    // entry left (a state.json lost in a merge, clobbered, or never
+    // committed — the exact window the state `repair` exists for).
+    let mut wired_pin: Option<(String, String)> = None;
     let mut warnings: Vec<VendorWarning> = flavor_warnings;
     let plan = match flavor {
         PypiFlavor::UvProject => {
@@ -312,7 +383,10 @@ pub async fn vendor_pypi(
                 Err((code, detail)) => return refused(code, detail),
             };
             match check_target_guards(&project, &canon_name, &record.uuid) {
-                Ok(UvTarget::InSync) => WiringPlan::InSync,
+                Ok(UvTarget::InSync) => {
+                    wired_pin = super::pypi_uv::wired_pin(&project, &canon_name, &record.uuid);
+                    WiringPlan::InSync
+                }
                 Ok(UvTarget::Fresh) => {
                     warnings.extend(project.warnings.iter().cloned());
                     WiringPlan::Uv(Box::new(project))
@@ -322,7 +396,10 @@ pub async fn vendor_pypi(
         }
         PypiFlavor::Requirements => {
             match preflight_requirements(project_root, &canon_name, version, &record.uuid).await {
-                Ok(RequirementsTarget::InSync) => WiringPlan::InSync,
+                Ok(RequirementsTarget::InSync { pin }) => {
+                    wired_pin = pin;
+                    WiringPlan::InSync
+                }
                 Ok(RequirementsTarget::Fresh) => WiringPlan::Requirements,
                 Err((code, detail)) => return refused(code, detail),
             }
@@ -338,7 +415,10 @@ pub async fn vendor_pypi(
                 version,
                 &record.uuid,
             ) {
-                Ok(PoetryTarget::InSync) => WiringPlan::InSync,
+                Ok(PoetryTarget::InSync) => {
+                    wired_pin = splice_lock_wired_pin(&project.lock_text, &uuid_dir_rel);
+                    WiringPlan::InSync
+                }
                 Ok(PoetryTarget::Fresh) => {
                     warnings.extend(project.warnings.iter().cloned());
                     WiringPlan::Poetry(Box::new(project))
@@ -353,7 +433,10 @@ pub async fn vendor_pypi(
             };
             match super::pypi_pdm::check_target_guards(&project, &canon_name, version, &record.uuid)
             {
-                Ok(PdmTarget::InSync) => WiringPlan::InSync,
+                Ok(PdmTarget::InSync) => {
+                    wired_pin = splice_lock_wired_pin(&project.lock_text, &uuid_dir_rel);
+                    WiringPlan::InSync
+                }
                 Ok(PdmTarget::Fresh) => {
                     warnings.extend(project.warnings.iter().cloned());
                     WiringPlan::Pdm(Box::new(project))
@@ -367,7 +450,10 @@ pub async fn vendor_pypi(
                 Err((code, detail)) => return refused(code, detail),
             };
             match super::pypi_pipenv::check_target_guards(&project, &canon_name, &record.uuid) {
-                Ok(PipenvTarget::InSync) => WiringPlan::InSync,
+                Ok(PipenvTarget::InSync) => {
+                    wired_pin = pipenv_wired_pin(&project.lock, &uuid_dir_rel);
+                    WiringPlan::InSync
+                }
                 Ok(PipenvTarget::Fresh) => {
                     warnings.extend(project.warnings.iter().cloned());
                     WiringPlan::Pipenv(Box::new(project))
@@ -398,8 +484,13 @@ pub async fn vendor_pypi(
     // the lockfile still pins the FIRST vendor's exact wheel path + sha256.
     // An artifact-only rebuild is safe only when it reproduces those exact
     // bytes; the ledger entry recorded at wiring time carries that pin.
-    // (Callers with no readable ledger entry keep the unguarded rebuild —
-    // the local build is deterministic for locally-vendored projects.)
+    // With no readable ledger entry (a state.json lost in a merge, corrupt,
+    // or never committed) the guard must NOT silently drop away — the wired
+    // lockfile itself still carries the authoritative pin the next
+    // hash-checked install verifies against, so fall back to the pin the
+    // flavor pre-flight read out of it. Only when the wired file yields no
+    // pin either does the unguarded rebuild remain (the local build is
+    // deterministic for locally-vendored projects).
     let expected_pin: Option<(String, String)> = if in_sync {
         match super::state::load_state(project_root).await {
             Ok(state) => state
@@ -409,6 +500,7 @@ pub async fn vendor_pypi(
                 .map(|e| (e.artifact.path, e.artifact.sha256)),
             Err(_) => None,
         }
+        .or(wired_pin)
     } else {
         None
     };
@@ -675,8 +767,19 @@ pub async fn revert_pypi_opts(
     // the uuid dir, and the ledger entry holds the only recorded pre-vendor
     // originals. Keep both (the caller keeps the entry when `kept_artifact`
     // is set) instead of deleting evidence out from under a lock the flavor
-    // revert just refused to touch.
-    if outcome.drift_skipped() {
+    // revert just refused to touch. The requirements flavor speaks its own
+    // codes: `vendor_revert_residual_reference` is its post-revert proof
+    // that a file STILL points into the uuid dir — an even more precise
+    // keep signal than the drift code (its `vendor_revert_line_drifted`
+    // alone is NOT gated: it also fires for a hand-restored line whose
+    // reverted state is already satisfied, and gating on it would keep the
+    // artifact forever against the LIVENESS CONTRACT).
+    if outcome.drift_skipped()
+        || outcome
+            .warnings
+            .iter()
+            .any(|w| w.code == "vendor_revert_residual_reference")
+    {
         // Display-only path: with a non-canonical uuid nothing below would
         // have been deleted anyway, but the drift-keep must still be
         // surfaced so the ledger entry survives.
@@ -2255,6 +2358,162 @@ wheels = [
         );
     }
 
+    /// The LEDGERLESS window of the same class: the state.json entry is gone
+    /// (a merge dropped it, or it was never committed) but the wired
+    /// requirements line still pins the first vendor's path + sha256 — the
+    /// guard must fall back to THAT pin instead of silently switching off.
+    /// Service `auto` offering different bytes must fall back to the local
+    /// build that reproduces the pin, exactly as with the ledger present.
+    #[tokio::test]
+    async fn in_sync_ledgerless_service_rebuild_must_not_break_wired_pin() {
+        let fx = e2e_fixture().await;
+        let sources = PatchSources::blobs_only(&fx.blobs);
+        let VendorOutcome::Done { result, entry, .. } = vendor_pypi(
+            "pkg:pypi/six@1.16.0",
+            &fx.site_packages,
+            &fx.root,
+            &fx.record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            None,
+        )
+        .await
+        else {
+            panic!("first vendor must be Done");
+        };
+        assert!(result.success, "{:?}", result.error);
+        let entry = entry.expect("entry on success");
+        let wired = tokio::fs::read_to_string(fx.root.join("requirements.txt"))
+            .await
+            .unwrap();
+        // NO ledger entry is persisted: the clone never got state.json.
+        tokio::fs::remove_dir_all(fx.root.join(format!(".socket/vendor/pypi/{UUID}")))
+            .await
+            .unwrap();
+
+        let bytes = b"service-built wheel bytes that differ from the local build";
+        let sri = sri_sha512(bytes);
+        let server = wiremock::MockServer::start().await;
+        mount_pypi_granted(&server, WHEEL_NAME, &sri, bytes).await;
+
+        let outcome = vendor_pypi(
+            "pkg:pypi/six@1.16.0",
+            &fx.site_packages,
+            &fx.root,
+            &fx.record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            Some(&pypi_service_cfg(&server.uri(), VendorSource::Auto, false)),
+        )
+        .await;
+        let VendorOutcome::Done {
+            result,
+            entry: e2,
+            warnings,
+        } = outcome
+        else {
+            panic!("rebuild run must be Done, got {outcome:?}");
+        };
+        assert!(result.success, "{:?}", result.error);
+        assert!(e2.is_none(), "artifact-only rebuild records no entry");
+        let on_disk = tokio::fs::read(fx.root.join(&entry.artifact.path))
+            .await
+            .expect("the pinned wheel path must exist again");
+        assert_eq!(
+            hex::encode(sha2::Sha256::digest(&on_disk)),
+            entry.artifact.sha256,
+            "the rebuilt wheel must reproduce the sha256 the lockfile still pins"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(fx.root.join("requirements.txt"))
+                .await
+                .unwrap(),
+            wired,
+            "rebuild must not touch requirements.txt"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.code == "vendor_prebuilt_pin_mismatch"),
+            "the service mismatch is surfaced even without a ledger: {warnings:?}"
+        );
+    }
+
+    /// The ledgerless twin of the loud local failure: a project vendored
+    /// FROM THE SERVICE whose ledger entry AND wheel are gone must not
+    /// "rebuild" locally into bytes the wired requirements line does not
+    /// pin — the wired file itself carries the pin the guard checks.
+    #[tokio::test]
+    async fn in_sync_ledgerless_local_rebuild_pin_mismatch_fails_loudly() {
+        let fx = e2e_fixture().await;
+        let sources = PatchSources::blobs_only(&fx.blobs);
+        let bytes = b"prebuilt wheel bytes from the service";
+        let sri = sri_sha512(bytes);
+        let server = wiremock::MockServer::start().await;
+        mount_pypi_granted(&server, WHEEL_NAME, &sri, bytes).await;
+        let VendorOutcome::Done { result, entry, .. } = vendor_pypi(
+            "pkg:pypi/six@1.16.0",
+            &fx.site_packages,
+            &fx.root,
+            &fx.record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            Some(&pypi_service_cfg(
+                &server.uri(),
+                VendorSource::Service,
+                false,
+            )),
+        )
+        .await
+        else {
+            panic!("service vendor must be Done");
+        };
+        assert!(result.success, "{:?}", result.error);
+        assert!(entry.is_some(), "entry on success");
+        // NO ledger entry is persisted; only the uuid dir goes missing.
+        let uuid_dir = fx.root.join(format!(".socket/vendor/pypi/{UUID}"));
+        tokio::fs::remove_dir_all(&uuid_dir).await.unwrap();
+
+        let outcome = vendor_pypi(
+            "pkg:pypi/six@1.16.0",
+            &fx.site_packages,
+            &fx.root,
+            &fx.record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            None,
+        )
+        .await;
+        let VendorOutcome::Done {
+            result, entry: e2, ..
+        } = outcome
+        else {
+            panic!("rebuild run must be Done, got {outcome:?}");
+        };
+        assert!(
+            !result.success,
+            "a ledgerless rebuild that breaks the wired pin must not report success"
+        );
+        assert!(
+            result.error.as_deref().unwrap_or("").contains("pins"),
+            "{:?}",
+            result.error
+        );
+        assert!(e2.is_none());
+        assert!(
+            !uuid_dir.exists(),
+            "the mismatched wheel must be swept back out"
+        );
+    }
+
     /// Positive control: a prebuilt wheel that byte-matches the wired pin
     /// (the normal case for a service-vendored project) rebuilds fine under
     /// `service` mode.
@@ -2559,6 +2818,215 @@ wheels = [
         );
     }
 
+    /// The requirements twin of the drift-keep gate: a hand-edited vendored
+    /// line that no longer trim-matches what vendor wrote — but still points
+    /// into the uuid dir — raises `vendor_revert_line_drifted` +
+    /// `vendor_revert_residual_reference`, and the gate must key on the
+    /// latter: deleting the dir would brick every `pip install -r`, and
+    /// pruning the ledger entry would destroy the only recorded pre-vendor
+    /// original lines.
+    #[tokio::test]
+    async fn requirements_residual_reference_revert_keeps_artifact() {
+        use crate::vendor::pypi_requirements::wire_requirements;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        tokio::fs::write(root.join("requirements.txt"), "six==1.16.0\n")
+            .await
+            .unwrap();
+        let rel_wheel = format!(".socket/vendor/pypi/{UUID}/six-1.16.0-py2.py3-none-any.whl");
+        let wiring = wire_requirements(root, "six", "1.16.0", &rel_wheel, &"0".repeat(64))
+            .await
+            .unwrap();
+        let uuid_dir = root.join(format!(".socket/vendor/pypi/{UUID}"));
+        tokio::fs::create_dir_all(&uuid_dir).await.unwrap();
+        let wheel = uuid_dir.join("six-1.16.0-py2.py3-none-any.whl");
+        tokio::fs::write(&wheel, b"wheel bytes").await.unwrap();
+
+        // Hand-edit the vendored line (an env marker) so it no longer
+        // trim-matches what vendor wrote, while still referencing the wheel.
+        let live = tokio::fs::read_to_string(root.join("requirements.txt"))
+            .await
+            .unwrap();
+        let edited = live.replace(
+            "  # socket-patch vendor:",
+            " ; python_version >= \"3.8\"  # socket-patch vendor:",
+        );
+        assert_ne!(edited, live, "the tamper must edit the vendored line");
+        tokio::fs::write(root.join("requirements.txt"), &edited)
+            .await
+            .unwrap();
+
+        let entry = revert_entry("requirements", &rel_wheel, wiring);
+        let outcome = revert_pypi(&entry, root, false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_revert_line_drifted"),
+            "{:?}",
+            outcome.warnings
+        );
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_revert_residual_reference"),
+            "{:?}",
+            outcome.warnings
+        );
+        assert!(
+            outcome.kept_artifact,
+            "a residual-reference revert must flag the keep so the CLI retains the ledger entry"
+        );
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_artifact_kept"),
+            "{:?}",
+            outcome.warnings
+        );
+        assert!(
+            wheel.is_file(),
+            "requirements.txt still references the wheel; deleting it would brick installs"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("requirements.txt"))
+                .await
+                .unwrap(),
+            edited,
+            "the drifted line is left alone"
+        );
+    }
+
+    /// LIVENESS twin of the requirements gate: a hand-RESTORED line (the
+    /// vendored line replaced back with the original pin) still raises
+    /// `vendor_revert_line_drifted`, but nothing references the uuid dir any
+    /// more — the gate must NOT key on the drift code alone, or the artifact
+    /// and ledger entry would be kept forever with an unsatisfiable
+    /// remediation. Cleanup proceeds.
+    #[tokio::test]
+    async fn requirements_hand_restored_revert_still_cleans_up() {
+        use crate::vendor::pypi_requirements::wire_requirements;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        tokio::fs::write(root.join("requirements.txt"), "six==1.16.0\n")
+            .await
+            .unwrap();
+        let rel_wheel = format!(".socket/vendor/pypi/{UUID}/six-1.16.0-py2.py3-none-any.whl");
+        let wiring = wire_requirements(root, "six", "1.16.0", &rel_wheel, &"0".repeat(64))
+            .await
+            .unwrap();
+        let uuid_dir = root.join(format!(".socket/vendor/pypi/{UUID}"));
+        tokio::fs::create_dir_all(&uuid_dir).await.unwrap();
+        tokio::fs::write(uuid_dir.join("six-1.16.0-py2.py3-none-any.whl"), b"wheel")
+            .await
+            .unwrap();
+
+        // The user hand-restored the original pin.
+        tokio::fs::write(root.join("requirements.txt"), "six==1.16.0\n")
+            .await
+            .unwrap();
+
+        let entry = revert_entry("requirements", &rel_wheel, wiring);
+        let outcome = revert_pypi(&entry, root, false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(
+            !outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_revert_residual_reference"),
+            "{:?}",
+            outcome.warnings
+        );
+        assert!(
+            !outcome.kept_artifact,
+            "no surviving reference: the keep gate must not fire: {:?}",
+            outcome.warnings
+        );
+        assert!(
+            !uuid_dir.exists(),
+            "a hand-restored revert must still clean up the artifact"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("requirements.txt"))
+                .await
+                .unwrap(),
+            "six==1.16.0\n"
+        );
+    }
+
+    /// The splice-flavor wired-pin reader (the rebuild guard's ledgerless
+    /// fallback): poetry's `url = "…"` and pdm's `path = "./…"` unit shapes
+    /// both yield (path, sha) from the one-line files element vendor wrote;
+    /// a lock missing the hash line yields None.
+    #[test]
+    fn splice_lock_wired_pin_reads_poetry_and_pdm_shapes() {
+        let dir_rel = format!(".socket/vendor/pypi/{UUID}");
+        let rel_wheel = format!("{dir_rel}/six-1.16.0-py2.py3-none-any.whl");
+        let sha = "a".repeat(64);
+        let poetry = format!(
+            "[[package]]\nname = \"six\"\nversion = \"1.16.0\"\nfiles = [\n    {{file = \
+             \"six-1.16.0-py2.py3-none-any.whl\", hash = \"sha256:{sha}\"}},\n]\n\n\
+             [package.source]\ntype = \"file\"\nurl = \"{rel_wheel}\"\n"
+        );
+        assert_eq!(
+            splice_lock_wired_pin(&poetry, &dir_rel),
+            Some((rel_wheel.clone(), sha.clone()))
+        );
+        let pdm = format!(
+            "[[package]]\nname = \"six\"\nversion = \"1.16.0\"\npath = \"./{rel_wheel}\"\n\
+             summary = \"x\"\nfiles = [\n    {{file = \"six-1.16.0-py2.py3-none-any.whl\", \
+             hash = \"sha256:{sha}\"}},\n]\n"
+        );
+        assert_eq!(
+            splice_lock_wired_pin(&pdm, &dir_rel),
+            Some((rel_wheel.clone(), sha))
+        );
+        let no_hash = format!("[[package]]\nname = \"six\"\nurl = \"{rel_wheel}\"\n");
+        assert_eq!(
+            splice_lock_wired_pin(&no_hash, &dir_rel),
+            None,
+            "no files hash line ⇒ no pin (the guard stays off rather than guessing)"
+        );
+        assert_eq!(
+            splice_lock_wired_pin(&poetry, ".socket/vendor/pypi/00000000-0000-4000-8000-000000000000"),
+            None,
+            "a foreign uuid dir pins nothing of ours"
+        );
+    }
+
+    /// The pipenv wired-pin reader: the vendored entry's `file` ref (with
+    /// its `./` prefix stripped) plus the `sha256:` hash, found in ANY
+    /// category section — never `_meta`.
+    #[test]
+    fn pipenv_wired_pin_reads_any_category_section() {
+        let dir_rel = format!(".socket/vendor/pypi/{UUID}");
+        let rel_wheel = format!("{dir_rel}/six-1.16.0-py2.py3-none-any.whl");
+        let sha = "b".repeat(64);
+        let lock = serde_json::json!({
+            "_meta": {"hash": {"sha256": "c".repeat(64)}},
+            "default": {
+                "requests": {"hashes": ["sha256:ddd"], "version": "==2.0.0"}
+            },
+            "packages-custom": {
+                "six": {
+                    "file": format!("./{rel_wheel}"),
+                    "hashes": [format!("sha256:{sha}")]
+                }
+            }
+        });
+        assert_eq!(
+            pipenv_wired_pin(&lock, &dir_rel),
+            Some((rel_wheel, sha))
+        );
+        let no_ref = serde_json::json!({
+            "default": {"six": {"version": "==1.16.0", "hashes": ["sha256:eee"]}}
+        });
+        assert_eq!(pipenv_wired_pin(&no_ref, &dir_rel), None);
+    }
+
     /// `--offline` + `--vendor-source=service` refuses, never hitting the network.
     #[tokio::test]
     async fn offline_service_mode_refuses() {
@@ -2587,5 +3055,1175 @@ wheels = [
             }
             other => panic!("expected Refused, got {other:?}"),
         }
+    }
+
+    // ──────────────── shared shorthand for the full-cycle tests ────────────────
+
+    /// `vendor_pypi` with the fixture's default arguments (real run, no
+    /// force) — the exact call shape every full-cycle test above repeats.
+    async fn vendor_six(
+        fx: &E2eFixture,
+        sources: &PatchSources<'_>,
+        service: Option<&VendorServiceConfig>,
+    ) -> VendorOutcome {
+        vendor_pypi(
+            "pkg:pypi/six@1.16.0",
+            &fx.site_packages,
+            &fx.root,
+            &fx.record,
+            sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            service,
+        )
+        .await
+    }
+
+    fn uuid_dir_of(fx: &E2eFixture) -> PathBuf {
+        fx.root.join(format!(".socket/vendor/pypi/{UUID}"))
+    }
+
+    async fn read_requirements(fx: &E2eFixture) -> String {
+        tokio::fs::read_to_string(fx.root.join("requirements.txt"))
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn invalid_purl_refuses_before_any_probe() {
+        let fx = e2e_fixture().await;
+        let sources = PatchSources::blobs_only(&fx.blobs);
+        // A non-pypi purl and a version-less pypi purl both fail the first
+        // guard — before flavor routing, before any disk write.
+        for purl in ["pkg:npm/foo@1.0.0", "pkg:pypi/six"] {
+            let outcome = vendor_pypi(
+                purl,
+                &fx.site_packages,
+                &fx.root,
+                &fx.record,
+                &sources,
+                "2026-06-09T00:00:00Z",
+                false,
+                false,
+                None,
+            )
+            .await;
+            let VendorOutcome::Refused { code, detail } = outcome else {
+                panic!("{purl}: expected Refused, got {outcome:?}");
+            };
+            assert_eq!(code, "pypi_invalid_purl", "{purl}");
+            assert!(detail.contains(purl), "{detail}");
+            assert!(
+                !fx.root.join(".socket").exists(),
+                "{purl}: nothing may be written"
+            );
+        }
+    }
+
+    // ───────── full lock-flavor orchestration (poetry / pdm / pipenv) ─────────
+    //
+    // Byte-exact copies of the sibling modules' spike-derived six==1.16.0
+    // registry lock fixtures (pypi_poetry.rs tests::LOCK21_DIRECT_REGISTRY,
+    // pypi_pdm.rs / pypi_pipenv.rs tests::LOCK_DIRECT_REGISTRY — private to
+    // their mods, duplicated verbatim; the spike dirs are the source of
+    // truth). They pair exactly with e2e_fixture()'s installed six 1.16.0,
+    // so one vendor_pypi → revert_pypi cycle runs the flavor's plan arm,
+    // wire arm, flavor tag, and MetaSlot arm end to end.
+
+    const POETRY_LOCK_REGISTRY: &str = r#"# This file is automatically @generated by Poetry 2.4.1 and should not be changed by hand.
+
+[[package]]
+name = "six"
+version = "1.16.0"
+description = "Python 2 and 3 compatibility utilities"
+optional = false
+python-versions = ">=2.7, !=3.0.*, !=3.1.*, !=3.2.*"
+groups = ["main"]
+files = [
+    {file = "six-1.16.0-py2.py3-none-any.whl", hash = "sha256:8abb2f1d86890a2dfb989f9a77cfcfd3e47c2a354b01111771326f8aa26e0254"},
+    {file = "six-1.16.0.tar.gz", hash = "sha256:1e61c37477a1626458e36f7b1d82aa5c9b094fa4802892072e49de9c60c4c926"},
+]
+
+[metadata]
+lock-version = "2.1"
+python-versions = ">=3.9"
+content-hash = "4b42a89b7ff7b26511b06acdc458dbd85312e5083db8f212b017482bc68cdd01"
+"#;
+
+    const PDM_LOCK_REGISTRY: &str = r#"# This file is @generated by PDM.
+# It is not intended for manual editing.
+
+[metadata]
+groups = ["default"]
+strategy = ["inherit_metadata"]
+lock_version = "4.5.0"
+content_hash = "sha256:d49d286986c5de41ec9879b6d710389b0be11cd096d883c069123b489ac6e6ea"
+
+[[metadata.targets]]
+requires_python = "==3.14.*"
+
+[[package]]
+name = "six"
+version = "1.16.0"
+requires_python = ">=2.7, !=3.0.*, !=3.1.*, !=3.2.*"
+summary = "Python 2 and 3 compatibility utilities"
+groups = ["default"]
+files = [
+    {file = "six-1.16.0-py2.py3-none-any.whl", hash = "sha256:8abb2f1d86890a2dfb989f9a77cfcfd3e47c2a354b01111771326f8aa26e0254"},
+    {file = "six-1.16.0.tar.gz", hash = "sha256:1e61c37477a1626458e36f7b1d82aa5c9b094fa4802892072e49de9c60c4c926"},
+]
+"#;
+
+    const PIPENV_LOCK_REGISTRY: &str = r#"{
+    "_meta": {
+        "hash": {
+            "sha256": "55f44fe4c8bc29094f3076c7eddb912ca00f80c016020ffa2bcbd67ccc7114a1"
+        },
+        "pipfile-spec": 6,
+        "requires": {
+            "python_version": "3.14"
+        },
+        "sources": [
+            {
+                "name": "pypi",
+                "url": "https://pypi.org/simple",
+                "verify_ssl": true
+            }
+        ]
+    },
+    "default": {
+        "six": {
+            "hashes": [
+                "sha256:1e61c37477a1626458e36f7b1d82aa5c9b094fa4802892072e49de9c60c4c926",
+                "sha256:8abb2f1d86890a2dfb989f9a77cfcfd3e47c2a354b01111771326f8aa26e0254"
+            ],
+            "index": "pypi",
+            "markers": "python_version >= '2.7' and python_version not in '3.0, 3.1, 3.2'",
+            "version": "==1.16.0"
+        }
+    },
+    "develop": {}
+}
+"#;
+
+    /// The uv pair fixture (same text as the wired-rebuild test above; kept
+    /// as consts so the orchestration-refusal tests can reuse it).
+    const UV_PYPROJECT: &str = r#"[project]
+name = "proj"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = ["six==1.16.0"]
+"#;
+
+    const UV_LOCK_REGISTRY: &str = r#"version = 1
+revision = 3
+requires-python = ">=3.10"
+
+[[package]]
+name = "proj"
+version = "0.1.0"
+source = { virtual = "." }
+dependencies = [
+    { name = "six" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "six", specifier = "==1.16.0" }]
+
+[[package]]
+name = "six"
+version = "1.16.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/71/39/171f1c67cd00715f190ba0b100d606d440a28c93c7714febeca8b79af85e/six-1.16.0.tar.gz", hash = "sha256:1e61c37477a1626458e36f7b1d82aa5c9b094fa4802892072e49de9c60c4c926", size = 34041, upload-time = "2021-05-05T14:18:18.379Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d9/5a/e7c31adbe875f2abbb91bd84cf2dc52d792b5a01506781dbcf25c91daf11/six-1.16.0-py2.py3-none-any.whl", hash = "sha256:8abb2f1d86890a2dfb989f9a77cfcfd3e47c2a354b01111771326f8aa26e0254", size = 11053, upload-time = "2021-05-05T14:18:17.237Z" },
+]
+"#;
+
+    /// Swap the e2e fixture's requirements flavor for a lockfile flavor.
+    async fn swap_to_lock_flavor(fx: &E2eFixture, files: &[(&str, &str)]) {
+        tokio::fs::remove_file(fx.root.join("requirements.txt"))
+            .await
+            .unwrap();
+        for (name, text) in files {
+            touch(&fx.root, name, text).await;
+        }
+    }
+
+    /// One full vendor → revert cycle through `vendor_pypi` for a lock-splice
+    /// flavor: plan arm, wire arm, `entry.flavor` tag (PypiFlavor::as_str),
+    /// the matching MetaSlot, and the byte-identical lock restore.
+    async fn full_cycle_lock_flavor(
+        flavor: &str,
+        lock_file: &str,
+        lock_text: &str,
+        wiring_kind: &str,
+    ) {
+        let fx = e2e_fixture().await;
+        swap_to_lock_flavor(&fx, &[(lock_file, lock_text)]).await;
+        let sources = PatchSources::blobs_only(&fx.blobs);
+
+        let outcome = vendor_six(&fx, &sources, None).await;
+        let VendorOutcome::Done { result, entry, .. } = outcome else {
+            panic!("{flavor}: expected Done, got {outcome:?}");
+        };
+        assert!(result.success, "{flavor}: {:?}", result.error);
+        let entry = entry.expect("entry on success");
+
+        // Ledger shape: the flavor tag routes revert; exactly the matching
+        // meta slot is filled.
+        assert_eq!(entry.flavor.as_deref(), Some(flavor));
+        assert!(entry.uv.is_none(), "{flavor}: uv slot must stay empty");
+        assert_eq!(
+            entry.poetry.is_some(),
+            flavor == "poetry",
+            "{flavor}: poetry meta slot"
+        );
+        assert_eq!(
+            entry.pdm.is_some(),
+            flavor == "pdm",
+            "{flavor}: pdm meta slot"
+        );
+        assert_eq!(
+            entry.pipenv.is_some(),
+            flavor == "pipenv",
+            "{flavor}: pipenv meta slot"
+        );
+
+        // The wheel landed at the uuid path and the lock was wired to it
+        // (path + recomputed sha256 — a positional-arg swap in the wire call
+        // would compile silently and break exactly these).
+        let wheel_rel = format!(".socket/vendor/pypi/{UUID}/six-1.16.0-py2.py3-none-any.whl");
+        assert_eq!(entry.artifact.path, wheel_rel);
+        assert!(fx.root.join(&wheel_rel).is_file(), "{flavor}");
+        let wired = tokio::fs::read_to_string(fx.root.join(lock_file))
+            .await
+            .unwrap();
+        assert_ne!(wired, lock_text, "{flavor}: the lock must be rewritten");
+        assert!(
+            wired.contains(&wheel_rel),
+            "{flavor}: the lock must reference the vendored wheel: {wired}"
+        );
+        assert!(
+            wired.contains(&entry.artifact.sha256),
+            "{flavor}: the lock must pin the recomputed wheel sha256: {wired}"
+        );
+        assert!(!entry.wiring.is_empty(), "{flavor}");
+        assert_eq!(entry.wiring[0].kind, wiring_kind, "{flavor}");
+        assert_eq!(entry.wiring[0].file, lock_file, "{flavor}");
+
+        // Revert: byte-identical lock restore, artifact dir swept.
+        let reverted = revert_pypi(&entry, &fx.root, false).await;
+        assert!(reverted.success, "{flavor}: {:?}", reverted.error);
+        assert!(
+            reverted.warnings.is_empty(),
+            "{flavor}: {:?}",
+            reverted.warnings
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(fx.root.join(lock_file))
+                .await
+                .unwrap(),
+            lock_text,
+            "{flavor}: revert must restore the lock byte-identically"
+        );
+        assert!(!uuid_dir_of(&fx).exists(), "{flavor}");
+    }
+
+    #[tokio::test]
+    async fn end_to_end_poetry_vendor_and_revert() {
+        full_cycle_lock_flavor(
+            "poetry",
+            "poetry.lock",
+            POETRY_LOCK_REGISTRY,
+            "poetry_lock_package",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn end_to_end_pdm_vendor_and_revert() {
+        full_cycle_lock_flavor("pdm", "pdm.lock", PDM_LOCK_REGISTRY, "pdm_lock_package").await;
+    }
+
+    #[tokio::test]
+    async fn end_to_end_pipenv_vendor_and_revert() {
+        full_cycle_lock_flavor(
+            "pipenv",
+            "Pipfile.lock",
+            PIPENV_LOCK_REGISTRY,
+            "pipenv_lock_entry",
+        )
+        .await;
+    }
+
+    /// The `vendor_platform_locked` advisory names the file the platform
+    /// pin now lives in, per flavor (the requirements arm is covered by
+    /// `platform_specific_tags_set_platform_locked_and_warn`).
+    #[tokio::test]
+    async fn platform_locked_warning_names_the_lock_per_flavor() {
+        let cases = [
+            (
+                "uv",
+                &[
+                    ("pyproject.toml", UV_PYPROJECT),
+                    ("uv.lock", UV_LOCK_REGISTRY),
+                ][..],
+                "uv.lock now resolves",
+            ),
+            (
+                "poetry",
+                &[("poetry.lock", POETRY_LOCK_REGISTRY)][..],
+                "poetry.lock now resolves",
+            ),
+            (
+                "pdm",
+                &[("pdm.lock", PDM_LOCK_REGISTRY)][..],
+                "pdm.lock now resolves",
+            ),
+            (
+                "pipenv",
+                &[("Pipfile.lock", PIPENV_LOCK_REGISTRY)][..],
+                "Pipfile.lock now resolves",
+            ),
+        ];
+        for (flavor, files, needle) in cases {
+            let fx = e2e_fixture().await;
+            swap_to_lock_flavor(&fx, files).await;
+            // The installed dist is a compiled single-platform wheel.
+            tokio::fs::write(
+                fx.site_packages.join("six-1.16.0.dist-info/WHEEL"),
+                "Wheel-Version: 1.0\nRoot-Is-Purelib: false\nTag: cp312-cp312-manylinux_2_17_x86_64\n",
+            )
+            .await
+            .unwrap();
+            let sources = PatchSources::blobs_only(&fx.blobs);
+            let outcome = vendor_six(&fx, &sources, None).await;
+            let VendorOutcome::Done {
+                result,
+                entry,
+                warnings,
+            } = outcome
+            else {
+                panic!("{flavor}: expected Done, got {outcome:?}");
+            };
+            assert!(result.success, "{flavor}: {:?}", result.error);
+            assert_eq!(
+                entry.unwrap().artifact.platform_locked,
+                Some(true),
+                "{flavor}"
+            );
+            let w = warnings
+                .iter()
+                .find(|w| w.code == "vendor_platform_locked")
+                .unwrap_or_else(|| panic!("{flavor}: {warnings:?}"));
+            assert!(w.detail.contains(needle), "{flavor}: {}", w.detail);
+        }
+    }
+
+    // ───────────── uv guard failures surfaced through the orchestrator ─────────────
+
+    #[tokio::test]
+    async fn uv_lock_parse_failure_refuses_through_orchestrator() {
+        let fx = e2e_fixture().await;
+        swap_to_lock_flavor(
+            &fx,
+            &[
+                ("pyproject.toml", UV_PYPROJECT),
+                ("uv.lock", "version = [broken\n"),
+            ],
+        )
+        .await;
+        let sources = PatchSources::blobs_only(&fx.blobs);
+        let outcome = vendor_six(&fx, &sources, None).await;
+        let VendorOutcome::Refused { code, detail } = outcome else {
+            panic!("expected Refused, got {outcome:?}");
+        };
+        assert_eq!(code, "pypi_uv_lock_parse_failed");
+        assert!(detail.contains("uv.lock does not parse"), "{detail}");
+        assert!(
+            !fx.root.join(".socket").exists(),
+            "a load refusal must leave the tree byte-untouched"
+        );
+    }
+
+    /// The uv mirror of `requirements_stale_uuid_vendor_line_refuses`: a pair
+    /// already wired to an EARLIER patch uuid refuses through the
+    /// orchestrator, before any new uuid dir is created.
+    #[tokio::test]
+    async fn uv_stale_uuid_vendor_refuses_through_orchestrator() {
+        const UUID2: &str = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
+        let fx = e2e_fixture().await;
+        swap_to_lock_flavor(
+            &fx,
+            &[
+                ("pyproject.toml", UV_PYPROJECT),
+                ("uv.lock", UV_LOCK_REGISTRY),
+            ],
+        )
+        .await;
+        let sources = PatchSources::blobs_only(&fx.blobs);
+        let VendorOutcome::Done { result, .. } = vendor_six(&fx, &sources, None).await else {
+            panic!("first vendor must be Done");
+        };
+        assert!(result.success, "{:?}", result.error);
+        let pyproject_wired = tokio::fs::read(fx.root.join("pyproject.toml"))
+            .await
+            .unwrap();
+        let lock_wired = tokio::fs::read(fx.root.join("uv.lock")).await.unwrap();
+
+        // Same package, new patch generation (different uuid).
+        let mut record2 = fx.record.clone();
+        record2.uuid = UUID2.to_string();
+        let outcome = vendor_pypi(
+            "pkg:pypi/six@1.16.0",
+            &fx.site_packages,
+            &fx.root,
+            &record2,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            None,
+        )
+        .await;
+        let VendorOutcome::Refused { code, detail } = outcome else {
+            panic!("expected Refused, got {outcome:?}");
+        };
+        assert_eq!(code, "pypi_uv_source_already_exists");
+        assert!(detail.contains("vendor --revert"), "{detail}");
+        // Pre-flight refusal: the wired pair untouched, no second uuid dir.
+        assert_eq!(
+            tokio::fs::read(fx.root.join("pyproject.toml"))
+                .await
+                .unwrap(),
+            pyproject_wired
+        );
+        assert_eq!(
+            tokio::fs::read(fx.root.join("uv.lock")).await.unwrap(),
+            lock_wired
+        );
+        assert!(!fx
+            .root
+            .join(format!(".socket/vendor/pypi/{UUID2}"))
+            .exists());
+    }
+
+    // ───────────── local-build refusals surfaced through the orchestrator ─────────────
+
+    #[tokio::test]
+    async fn missing_dist_refuses_with_no_residue() {
+        let fx = e2e_fixture().await;
+        tokio::fs::remove_dir_all(fx.site_packages.join("six-1.16.0.dist-info"))
+            .await
+            .unwrap();
+        let sources = PatchSources::blobs_only(&fx.blobs);
+        let outcome = vendor_six(&fx, &sources, None).await;
+        let VendorOutcome::Refused { code, detail } = outcome else {
+            panic!("expected Refused, got {outcome:?}");
+        };
+        assert_eq!(code, "pypi_dist_not_found");
+        assert!(detail.contains("six@1.16.0"), "{detail}");
+        assert!(!fx.root.join(".socket").exists());
+        assert_eq!(read_requirements(&fx).await, "six==1.16.0\n");
+    }
+
+    /// A WHEEL tag set that is not a cross product of its components cannot
+    /// be expressed as one wheel filename — `wheel_file_name` refuses through
+    /// the orchestrator before anything is built.
+    #[tokio::test]
+    async fn non_cross_product_wheel_tags_refuse_with_no_residue() {
+        let fx = e2e_fixture().await;
+        tokio::fs::write(
+            fx.site_packages.join("six-1.16.0.dist-info/WHEEL"),
+            "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py2-none-any\nTag: py3-abi3-manylinux1_x86_64\n",
+        )
+        .await
+        .unwrap();
+        let sources = PatchSources::blobs_only(&fx.blobs);
+        let outcome = vendor_six(&fx, &sources, None).await;
+        let VendorOutcome::Refused { code, detail } = outcome else {
+            panic!("expected Refused, got {outcome:?}");
+        };
+        assert_eq!(code, "pypi_wheel_tags_unrecoverable");
+        assert!(detail.contains("cross product"), "{detail}");
+        assert!(!fx.root.join(".socket").exists());
+    }
+
+    /// An editable install (`pip install -e`) is the user's own working tree
+    /// — `build_patched_wheel`'s hard-Err maps to a refusal with no residue.
+    #[tokio::test]
+    async fn editable_install_refuses_with_no_residue() {
+        let fx = e2e_fixture().await;
+        tokio::fs::write(
+            fx.site_packages
+                .join("six-1.16.0.dist-info/direct_url.json"),
+            r#"{"url":"file:///src","dir_info":{"editable":true}}"#,
+        )
+        .await
+        .unwrap();
+        let sources = PatchSources::blobs_only(&fx.blobs);
+        let outcome = vendor_six(&fx, &sources, None).await;
+        let VendorOutcome::Refused { code, detail } = outcome else {
+            panic!("expected Refused, got {outcome:?}");
+        };
+        assert_eq!(code, "pypi_editable_install");
+        assert!(detail.contains("editable install"), "{detail}");
+        assert!(!fx.root.join(".socket").exists());
+        assert_eq!(read_requirements(&fx).await, "six==1.16.0\n");
+    }
+
+    /// Deleting ONLY the committed wheel (the marker file survives) must
+    /// still take the artifact-only rebuild: `uuid_dir_has_wheel` scans the
+    /// surviving entries for a `.whl` rather than keying on dir existence.
+    #[tokio::test]
+    async fn wheel_deleted_marker_kept_still_rebuilds() {
+        let fx = e2e_fixture().await;
+        let sources = PatchSources::blobs_only(&fx.blobs);
+        let VendorOutcome::Done { result, entry, .. } = vendor_six(&fx, &sources, None).await
+        else {
+            panic!("first vendor must be Done");
+        };
+        assert!(result.success, "{:?}", result.error);
+        let entry = entry.expect("entry on success");
+        let wired = read_requirements(&fx).await;
+        let wheel = fx.root.join(&entry.artifact.path);
+        tokio::fs::remove_file(&wheel).await.unwrap();
+        assert!(uuid_dir_of(&fx).join(VENDOR_MARKER_FILE).is_file());
+
+        let VendorOutcome::Done {
+            result: r2,
+            entry: e2,
+            warnings,
+        } = vendor_six(&fx, &sources, None).await
+        else {
+            panic!("rebuild run must be Done");
+        };
+        assert!(r2.success, "{:?}", r2.error);
+        assert!(e2.is_none(), "artifact-only rebuild records no entry");
+        assert!(
+            warnings.iter().any(|w| w.code == "vendor_artifact_rebuilt"),
+            "{warnings:?}"
+        );
+        assert!(
+            !warnings.iter().any(|w| w.code == "marker_write_failed"),
+            "rewriting the surviving marker file must succeed: {warnings:?}"
+        );
+        assert!(wheel.is_file(), "wheel rebuilt at the recorded path");
+        assert_eq!(read_requirements(&fx).await, wired);
+    }
+
+    // ───────────── marker write failures (fresh + rebuild paths) ─────────────
+
+    /// A non-empty DIRECTORY squatting at the marker filename makes
+    /// `write_marker`'s atomic rename fail deterministically.
+    async fn plant_marker_blocker(fx: &E2eFixture) {
+        let blocker = uuid_dir_of(fx).join(VENDOR_MARKER_FILE);
+        tokio::fs::create_dir_all(&blocker).await.unwrap();
+        tokio::fs::write(blocker.join("occupied"), b"x")
+            .await
+            .unwrap();
+    }
+
+    /// Fresh path: a failed marker write flips the run to failure, sweeps
+    /// the uuid dir, and leaves the wiring untouched (it was never written —
+    /// the marker lands BEFORE the wiring).
+    #[tokio::test]
+    async fn fresh_marker_write_failure_sweeps_artifact_and_fails() {
+        let fx = e2e_fixture().await;
+        plant_marker_blocker(&fx).await;
+        let sources = PatchSources::blobs_only(&fx.blobs);
+        let outcome = vendor_six(&fx, &sources, None).await;
+        let VendorOutcome::Done { result, entry, .. } = outcome else {
+            panic!("expected Done, got {outcome:?}");
+        };
+        assert!(!result.success, "the failed marker write must be reported");
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("cannot write vendor marker"),
+            "{:?}",
+            result.error
+        );
+        assert!(entry.is_none());
+        assert!(
+            !uuid_dir_of(&fx).exists(),
+            "a failed fresh vendor must leave no committed residue"
+        );
+        assert_eq!(read_requirements(&fx).await, "six==1.16.0\n");
+    }
+
+    /// In-sync rebuild path: the marker restore is advisory — its failure is
+    /// a warning riding an otherwise-successful artifact rebuild.
+    #[tokio::test]
+    async fn rebuild_marker_write_failure_is_warning_only() {
+        let fx = e2e_fixture().await;
+        let sources = PatchSources::blobs_only(&fx.blobs);
+        let VendorOutcome::Done { result, entry, .. } = vendor_six(&fx, &sources, None).await
+        else {
+            panic!("first vendor must be Done");
+        };
+        assert!(result.success, "{:?}", result.error);
+        let entry = entry.expect("entry on success");
+        let wired = read_requirements(&fx).await;
+        // The wheel rots away; the marker path is then blocked by a dir.
+        tokio::fs::remove_file(fx.root.join(&entry.artifact.path))
+            .await
+            .unwrap();
+        tokio::fs::remove_file(uuid_dir_of(&fx).join(VENDOR_MARKER_FILE))
+            .await
+            .unwrap();
+        plant_marker_blocker(&fx).await;
+
+        let VendorOutcome::Done {
+            result: r2,
+            entry: e2,
+            warnings,
+        } = vendor_six(&fx, &sources, None).await
+        else {
+            panic!("rebuild run must be Done");
+        };
+        assert!(
+            r2.success,
+            "the rebuild itself succeeded; the marker is advisory: {:?}",
+            r2.error
+        );
+        assert!(e2.is_none());
+        assert!(
+            warnings.iter().any(|w| w.code == "vendor_artifact_rebuilt"),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|w| w.code == "marker_write_failed"),
+            "{warnings:?}"
+        );
+        assert!(fx.root.join(&entry.artifact.path).is_file());
+        assert_eq!(read_requirements(&fx).await, wired);
+    }
+
+    /// Wiring failure LAST-step contract: when the lockfile write fails
+    /// after the wheel was built and the marker written, the artifact dir is
+    /// swept back out — a failed vendor leaves no committed residue.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wiring_failure_sweeps_wheel_artifact() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let fx = e2e_fixture().await;
+        let sources = PatchSources::blobs_only(&fx.blobs);
+        // The artifact area gets its own writable home first; the root is
+        // then frozen so the wiring's atomic stage file for requirements.txt
+        // cannot be created (flavor routing + preflight only READ the root).
+        tokio::fs::create_dir_all(fx.root.join(".socket/vendor/pypi"))
+            .await
+            .unwrap();
+        tokio::fs::set_permissions(&fx.root, std::fs::Permissions::from_mode(0o555))
+            .await
+            .unwrap();
+        // Skip when the environment ignores modes (running as root).
+        if std::fs::write(fx.root.join(".probe"), b"x").is_ok() {
+            let _ = std::fs::remove_file(fx.root.join(".probe"));
+            tokio::fs::set_permissions(&fx.root, std::fs::Permissions::from_mode(0o755))
+                .await
+                .unwrap();
+            return;
+        }
+        let outcome = vendor_six(&fx, &sources, None).await;
+        tokio::fs::set_permissions(&fx.root, std::fs::Permissions::from_mode(0o755))
+            .await
+            .unwrap();
+
+        let VendorOutcome::Done { result, entry, .. } = outcome else {
+            panic!("expected Done, got {outcome:?}");
+        };
+        assert!(!result.success, "the failed wiring must be reported");
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("pypi_requirements_write_failed"),
+            "{:?}",
+            result.error
+        );
+        assert!(entry.is_none());
+        assert!(
+            !uuid_dir_of(&fx).exists(),
+            "a failed wiring must sweep the wheel artifact back out"
+        );
+        assert_eq!(read_requirements(&fx).await, "six==1.16.0\n");
+    }
+
+    // ───────────── revert: dry-run / --preserve-state / delete guards ─────────────
+
+    #[tokio::test]
+    async fn revert_dry_run_leaves_wiring_and_artifact_intact() {
+        let fx = e2e_fixture().await;
+        let sources = PatchSources::blobs_only(&fx.blobs);
+        let VendorOutcome::Done { result, entry, .. } = vendor_six(&fx, &sources, None).await
+        else {
+            panic!("vendor must be Done");
+        };
+        assert!(result.success, "{:?}", result.error);
+        let entry = entry.expect("entry on success");
+        let wired = read_requirements(&fx).await;
+
+        let outcome = revert_pypi(&entry, &fx.root, true).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert_eq!(
+            read_requirements(&fx).await,
+            wired,
+            "a dry-run revert must not touch the wiring"
+        );
+        assert!(
+            fx.root.join(&entry.artifact.path).is_file(),
+            "a dry-run revert must not delete the artifact"
+        );
+        assert!(uuid_dir_of(&fx).join(VENDOR_MARKER_FILE).is_file());
+    }
+
+    /// `--preserve-state` (`keep_artifact`): the wiring restore runs, the
+    /// artifact dir survives, and the drift-keep flag stays reserved for
+    /// actual drift-keeps.
+    #[tokio::test]
+    async fn revert_keep_artifact_restores_wiring_but_keeps_artifact() {
+        let fx = e2e_fixture().await;
+        let sources = PatchSources::blobs_only(&fx.blobs);
+        let VendorOutcome::Done { result, entry, .. } = vendor_six(&fx, &sources, None).await
+        else {
+            panic!("vendor must be Done");
+        };
+        assert!(result.success, "{:?}", result.error);
+        let entry = entry.expect("entry on success");
+
+        let outcome = revert_pypi_opts(
+            &entry,
+            &fx.root,
+            RevertOpts {
+                dry_run: false,
+                keep_artifact: true,
+            },
+        )
+        .await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(
+            !outcome.kept_artifact,
+            "keep_artifact must not claim a drift-keep"
+        );
+        assert_eq!(
+            read_requirements(&fx).await,
+            "six==1.16.0\n",
+            "the wiring restore still runs under --preserve-state"
+        );
+        assert!(
+            fx.root.join(&entry.artifact.path).is_file(),
+            "the artifact dir must survive --preserve-state"
+        );
+    }
+
+    /// SECURITY fail-closed twin of `uuid_traversal_is_refused_before_any_write`:
+    /// a revert with a tampered (non-canonical) uuid from state.json must
+    /// warn and refuse the deletion, never derive a delete path from it.
+    #[tokio::test]
+    async fn revert_with_tampered_uuid_refuses_artifact_deletion() {
+        let fx = e2e_fixture().await;
+        let mut entry = revert_entry(
+            "requirements",
+            ".socket/vendor/pypi/x/six-1.16.0-py2.py3-none-any.whl",
+            vec![],
+        );
+        entry.uuid = "../../../etc/passwd".to_string();
+        let outcome = revert_pypi(&entry, &fx.root, false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        let w = outcome
+            .warnings
+            .iter()
+            .find(|w| w.code == "vendor_unsafe_uuid")
+            .unwrap_or_else(|| panic!("{:?}", outcome.warnings));
+        assert!(w.detail.contains("../../../etc/passwd"), "{}", w.detail);
+    }
+
+    /// An artifact dir already gone is the expected post-clean state:
+    /// NotFound is tolerated silently.
+    #[tokio::test]
+    async fn revert_tolerates_already_deleted_artifact_dir() {
+        let fx = e2e_fixture().await;
+        let sources = PatchSources::blobs_only(&fx.blobs);
+        let VendorOutcome::Done { result, entry, .. } = vendor_six(&fx, &sources, None).await
+        else {
+            panic!("vendor must be Done");
+        };
+        assert!(result.success, "{:?}", result.error);
+        let entry = entry.expect("entry on success");
+        tokio::fs::remove_dir_all(uuid_dir_of(&fx)).await.unwrap();
+
+        let outcome = revert_pypi(&entry, &fx.root, false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(
+            outcome.warnings.is_empty(),
+            "an already-deleted dir must stay warning-free: {:?}",
+            outcome.warnings
+        );
+        assert_eq!(read_requirements(&fx).await, "six==1.16.0\n");
+    }
+
+    /// A real removal error (not NotFound) is surfaced as a warning naming
+    /// the dir, on an otherwise-successful revert.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn revert_artifact_remove_failure_is_warning_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let fx = e2e_fixture().await;
+        let sources = PatchSources::blobs_only(&fx.blobs);
+        let VendorOutcome::Done { result, entry, .. } = vendor_six(&fx, &sources, None).await
+        else {
+            panic!("vendor must be Done");
+        };
+        assert!(result.success, "{:?}", result.error);
+        let entry = entry.expect("entry on success");
+
+        // A read-only PARENT blocks the final rmdir of the uuid dir. Skip
+        // when the environment ignores modes (running as root).
+        let parent = fx.root.join(".socket/vendor/pypi");
+        tokio::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o555))
+            .await
+            .unwrap();
+        if std::fs::write(parent.join(".probe"), b"x").is_ok() {
+            let _ = std::fs::remove_file(parent.join(".probe"));
+            tokio::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755))
+                .await
+                .unwrap();
+            return;
+        }
+        let outcome = revert_pypi(&entry, &fx.root, false).await;
+        tokio::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755))
+            .await
+            .unwrap();
+
+        assert!(outcome.success, "{:?}", outcome.error);
+        let w = outcome
+            .warnings
+            .iter()
+            .find(|w| w.code == "vendor_artifact_remove_failed")
+            .unwrap_or_else(|| panic!("{:?}", outcome.warnings));
+        assert!(
+            w.detail.contains(&format!(".socket/vendor/pypi/{UUID}")),
+            "{}",
+            w.detail
+        );
+        assert_eq!(
+            read_requirements(&fx).await,
+            "six==1.16.0\n",
+            "the wiring restore lands before (and despite) the delete failure"
+        );
+    }
+
+    // ───────────── service status matrix (pending / unavailable / failed) ─────────────
+
+    /// Mount ONLY the package POST, answering `status` for the fixture uuid
+    /// (no artifacts — the pre-download build/grant classification arms).
+    async fn mount_pypi_status(server: &wiremock::MockServer, status: &str) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(method("POST"))
+            .and(path("/v0/orgs/acme/patches/package"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "results": { UUID: { "status": status } }
+            })))
+            .mount(server)
+            .await;
+    }
+
+    /// `pending_build` under `auto`: warn + fall back to the local build.
+    #[tokio::test]
+    async fn service_pending_auto_warns_and_builds_locally() {
+        let fx = e2e_fixture().await;
+        let sources = PatchSources::blobs_only(&fx.blobs);
+        let server = wiremock::MockServer::start().await;
+        mount_pypi_status(&server, "pending_build").await;
+
+        let outcome = vendor_six(
+            &fx,
+            &sources,
+            Some(&pypi_service_cfg(&server.uri(), VendorSource::Auto, false)),
+        )
+        .await;
+        let VendorOutcome::Done {
+            result,
+            entry,
+            warnings,
+        } = outcome
+        else {
+            panic!("expected Done, got {outcome:?}");
+        };
+        assert!(result.success, "{:?}", result.error);
+        assert!(entry.is_some(), "the local fallback is a full fresh vendor");
+        let w = warnings
+            .iter()
+            .find(|w| w.code == "vendor_prebuilt_pending")
+            .unwrap_or_else(|| panic!("{warnings:?}"));
+        assert!(w.detail.contains("still building"), "{}", w.detail);
+        assert!(
+            w.detail.contains("building locally instead"),
+            "{}",
+            w.detail
+        );
+        assert!(
+            fx.root
+                .join(format!(".socket/vendor/pypi/{UUID}/{WHEEL_NAME}"))
+                .is_file(),
+            "the local fallback build must land"
+        );
+    }
+
+    /// `pending_build` under `service`: hard fail, nothing written.
+    #[tokio::test]
+    async fn service_pending_service_mode_hard_fails() {
+        let fx = e2e_fixture().await;
+        let sources = PatchSources::blobs_only(&fx.blobs);
+        let server = wiremock::MockServer::start().await;
+        mount_pypi_status(&server, "pending_build").await;
+
+        let outcome = vendor_six(
+            &fx,
+            &sources,
+            Some(&pypi_service_cfg(
+                &server.uri(),
+                VendorSource::Service,
+                false,
+            )),
+        )
+        .await;
+        let VendorOutcome::Refused { code, detail } = outcome else {
+            panic!("expected Refused, got {outcome:?}");
+        };
+        assert_eq!(code, "vendor_prebuilt_required");
+        assert!(detail.contains("still building"), "{detail}");
+        assert!(!fx.root.join(".socket").exists());
+        assert_eq!(read_requirements(&fx).await, "six==1.16.0\n");
+    }
+
+    /// `not_found` under `auto` is the deliberately-QUIET fallback (the
+    /// common "not built / free-only" case): no `vendor_prebuilt_*` warning
+    /// at all, just the local build.
+    #[tokio::test]
+    async fn service_unavailable_auto_falls_back_silently() {
+        let fx = e2e_fixture().await;
+        let sources = PatchSources::blobs_only(&fx.blobs);
+        let server = wiremock::MockServer::start().await;
+        mount_pypi_status(&server, "not_found").await;
+
+        let outcome = vendor_six(
+            &fx,
+            &sources,
+            Some(&pypi_service_cfg(&server.uri(), VendorSource::Auto, false)),
+        )
+        .await;
+        let VendorOutcome::Done {
+            result,
+            entry,
+            warnings,
+        } = outcome
+        else {
+            panic!("expected Done, got {outcome:?}");
+        };
+        assert!(result.success, "{:?}", result.error);
+        assert!(entry.is_some());
+        assert!(
+            warnings
+                .iter()
+                .all(|w| !w.code.starts_with("vendor_prebuilt")),
+            "the unavailable fallback is documented as silent: {warnings:?}"
+        );
+        assert!(fx
+            .root
+            .join(format!(".socket/vendor/pypi/{UUID}/{WHEEL_NAME}"))
+            .is_file());
+    }
+
+    /// `not_found` under `service`: hard fail naming the miss reason.
+    #[tokio::test]
+    async fn service_unavailable_service_mode_hard_fails() {
+        let fx = e2e_fixture().await;
+        let sources = PatchSources::blobs_only(&fx.blobs);
+        let server = wiremock::MockServer::start().await;
+        mount_pypi_status(&server, "not_found").await;
+
+        let outcome = vendor_six(
+            &fx,
+            &sources,
+            Some(&pypi_service_cfg(
+                &server.uri(),
+                VendorSource::Service,
+                false,
+            )),
+        )
+        .await;
+        let VendorOutcome::Refused { code, detail } = outcome else {
+            panic!("expected Refused, got {outcome:?}");
+        };
+        assert_eq!(code, "vendor_prebuilt_required");
+        assert!(detail.contains("unavailable: not_found"), "{detail}");
+        assert!(!fx.root.join(".socket").exists());
+    }
+
+    /// A failed service REQUEST (HTTP 500) under `auto`: loud
+    /// `vendor_prebuilt_unavailable` warning + local-build fallback.
+    #[tokio::test]
+    async fn service_request_failure_auto_warns_and_builds_locally() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let fx = e2e_fixture().await;
+        let sources = PatchSources::blobs_only(&fx.blobs);
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v0/orgs/acme/patches/package"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let outcome = vendor_six(
+            &fx,
+            &sources,
+            Some(&pypi_service_cfg(&server.uri(), VendorSource::Auto, false)),
+        )
+        .await;
+        let VendorOutcome::Done {
+            result,
+            entry,
+            warnings,
+        } = outcome
+        else {
+            panic!("expected Done, got {outcome:?}");
+        };
+        assert!(result.success, "{:?}", result.error);
+        assert!(entry.is_some());
+        let w = warnings
+            .iter()
+            .find(|w| w.code == "vendor_prebuilt_unavailable")
+            .unwrap_or_else(|| panic!("{warnings:?}"));
+        assert!(
+            w.detail.contains("patch service request failed"),
+            "{}",
+            w.detail
+        );
+        assert!(fx
+            .root
+            .join(format!(".socket/vendor/pypi/{UUID}/{WHEEL_NAME}"))
+            .is_file());
+    }
+
+    // ───────────── service write failures (hard fail in EVERY mode) ─────────────
+
+    /// A regular file squatting at the uuid dir path: `create_dir_all`
+    /// fails → `vendor_prebuilt_write_failed` hard fail, wiring untouched.
+    #[tokio::test]
+    async fn service_uuid_dir_create_failure_hard_fails() {
+        let fx = e2e_fixture().await;
+        let sources = PatchSources::blobs_only(&fx.blobs);
+        let bytes = b"prebuilt wheel bytes from the service";
+        let sri = sri_sha512(bytes);
+        let server = wiremock::MockServer::start().await;
+        mount_pypi_granted(&server, WHEEL_NAME, &sri, bytes).await;
+
+        tokio::fs::create_dir_all(fx.root.join(".socket/vendor/pypi"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            fx.root.join(format!(".socket/vendor/pypi/{UUID}")),
+            b"squatter",
+        )
+        .await
+        .unwrap();
+
+        let outcome = vendor_six(
+            &fx,
+            &sources,
+            Some(&pypi_service_cfg(
+                &server.uri(),
+                VendorSource::Service,
+                false,
+            )),
+        )
+        .await;
+        let VendorOutcome::Refused { code, detail } = outcome else {
+            panic!("expected Refused, got {outcome:?}");
+        };
+        assert_eq!(code, "vendor_prebuilt_write_failed");
+        assert!(detail.contains("cannot create"), "{detail}");
+        assert_eq!(read_requirements(&fx).await, "six==1.16.0\n");
+    }
+
+    /// A write failure on the wheel itself is a hard fail even under `auto`
+    /// (a broken disk is not a "service miss" to silently build around).
+    #[tokio::test]
+    async fn service_wheel_write_failure_hard_fails_even_under_auto() {
+        let fx = e2e_fixture().await;
+        let sources = PatchSources::blobs_only(&fx.blobs);
+        let bytes = b"prebuilt wheel bytes from the service";
+        let sri = sri_sha512(bytes);
+        let server = wiremock::MockServer::start().await;
+        mount_pypi_granted(&server, WHEEL_NAME, &sri, bytes).await;
+
+        // A non-empty directory squatting at the destination wheel filename
+        // makes atomic_write_bytes' rename fail deterministically.
+        let blocker = fx
+            .root
+            .join(format!(".socket/vendor/pypi/{UUID}/{WHEEL_NAME}"));
+        tokio::fs::create_dir_all(&blocker).await.unwrap();
+        tokio::fs::write(blocker.join("occupied"), b"x")
+            .await
+            .unwrap();
+
+        let outcome = vendor_six(
+            &fx,
+            &sources,
+            Some(&pypi_service_cfg(&server.uri(), VendorSource::Auto, false)),
+        )
+        .await;
+        let VendorOutcome::Refused { code, detail } = outcome else {
+            panic!("expected Refused, got {outcome:?}");
+        };
+        assert_eq!(code, "vendor_prebuilt_write_failed");
+        assert!(
+            detail.contains("cannot write the vendored wheel"),
+            "{detail}"
+        );
+        assert_eq!(
+            read_requirements(&fx).await,
+            "six==1.16.0\n",
+            "the wiring is only ever written after a successful wheel"
+        );
+        // Pin of CURRENT residue behavior: the refusal does not sweep the
+        // (pre-existing) uuid dir — nothing references it, since the wiring
+        // was never touched. FIXME(no-residue): candidate cleanup gap if the
+        // dir was created by this very run.
+        assert!(blocker.is_dir());
+    }
+
+    /// The wheel-filename fallback for an unparseable stem (< 3 dash parts)
+    /// cannot prove portability → claims platform-locked, fail-closed.
+    #[test]
+    fn wheel_platform_filename_fallback_is_fail_closed() {
+        // Full stems parse the trailing tag triple.
+        assert_eq!(
+            wheel_platform_from_filename("six-1.16.0-py2.py3-none-any.whl"),
+            (false, "py2.py3-none-any".to_string())
+        );
+        assert_eq!(
+            wheel_platform_from_filename("x-1.0-cp312-cp312-manylinux_2_17_x86_64.whl"),
+            (true, "cp312-cp312-manylinux_2_17_x86_64".to_string())
+        );
+        // Short stems fall back closed and surface the stem verbatim.
+        assert_eq!(
+            wheel_platform_from_filename("six.whl"),
+            (true, "six".to_string())
+        );
+        assert_eq!(
+            wheel_platform_from_filename("a-b.whl"),
+            (true, "a-b".to_string())
+        );
     }
 }

@@ -5962,4 +5962,1715 @@ mod tests {
             hex::encode(Sha256::digest(GEMSPEC.as_bytes()))
         );
     }
+
+    // ── coverage-gap additions (2026-09 audit): refusal / failure legs ────
+
+    /// [`run_vendor`] with an explicit service config (the service tests
+    /// above inline this shape; the coverage additions share it).
+    async fn run_vendor_service(
+        root: &Path,
+        blobs: &Path,
+        installed: &Path,
+        record: &PatchRecord,
+        cfg: &VendorServiceConfig,
+    ) -> VendorOutcome {
+        let sources = PatchSources::blobs_only(blobs);
+        vendor_gem(
+            PURL,
+            installed,
+            root,
+            record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            Some(cfg),
+        )
+        .await
+    }
+
+    /// Coordinate guards fire before any disk access: a non-gem purl and a
+    /// version outside the plain gem-token charset (both embedded verbatim
+    /// into ruby source + lock grammar) are `unsafe_coordinates` refusals
+    /// that write nothing.
+    #[tokio::test]
+    async fn refuses_non_gem_purl_and_unsafe_tokens() {
+        let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
+
+        let (code, detail) = unwrap_refused(
+            run_vendor_purl(
+                "pkg:npm/left-pad@1.0.0",
+                &root,
+                &blobs,
+                &installed,
+                &record,
+                false,
+            )
+            .await,
+        );
+        assert_eq!(code, "unsafe_coordinates");
+        assert!(detail.contains("not a gem purl"), "{detail}");
+
+        // `+` is valid in a purl version but NOT in the plain gem token
+        // charset vendor may embed into the Gemfile / lock grammar.
+        let (code, detail) = unwrap_refused(
+            run_vendor_purl(
+                "pkg:gem/rack@3.2.6+meta",
+                &root,
+                &blobs,
+                &installed,
+                &record,
+                false,
+            )
+            .await,
+        );
+        assert_eq!(code, "unsafe_coordinates");
+        assert!(detail.contains("unsafe gem coordinates"), "{detail}");
+
+        assert!(!root.join(".socket").exists(), "refusals must write nothing");
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
+            GEMFILE_DIRECT
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                .await
+                .unwrap(),
+            LOCK_DIRECT
+        );
+    }
+
+    /// A patch record with no files is meaningless to vendor: a no-op
+    /// success — no ledger entry, no copy, neither project file touched.
+    #[tokio::test]
+    async fn empty_record_files_is_a_noop_success() {
+        let (_tmp, root, installed, blobs, mut record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
+        record.files.clear();
+
+        let (result, entry, warnings) =
+            unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
+        assert!(result.success, "{:?}", result.error);
+        assert!(entry.is_none(), "a no-op records no ledger entry");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(!root.join(".socket").exists(), "no writes at all");
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
+            GEMFILE_DIRECT
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                .await
+                .unwrap(),
+            LOCK_DIRECT
+        );
+    }
+
+    /// The Gemfile twin of [`fifo_lock_fails_fast_instead_of_wedging`]: a
+    /// FIFO planted as the Gemfile must fail vendor's pair read fast (the
+    /// `open_regular_file` guard) with the "unreadable" (not "missing")
+    /// refusal, instead of wedging in `open(2)` forever.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fifo_gemfile_fails_fast_instead_of_wedging() {
+        let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
+        let gemfile_path = root.join(GEMFILE);
+        tokio::fs::remove_file(&gemfile_path).await.unwrap();
+        mkfifo(&gemfile_path);
+
+        let deadline = std::time::Duration::from_secs(5);
+        let fut = run_vendor(&root, &blobs, &installed, &record, false);
+        let Ok(outcome) = tokio::time::timeout(deadline, fut).await else {
+            use std::os::unix::fs::OpenOptionsExt;
+            let _ = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&gemfile_path);
+            panic!("Gemfile reads must fail fast on a FIFO");
+        };
+        let (code, detail) = unwrap_refused(outcome);
+        assert_eq!(code, "gemfile_missing");
+        assert!(
+            detail.contains("unreadable"),
+            "a squatted Gemfile is unreadable, not missing: {detail}"
+        );
+        assert!(!root.join(".socket").exists(), "refusal must write nothing");
+    }
+
+    /// Wired pair + stale copy + dry run: falls through the artifact rebuild
+    /// to the verify-only preview — the copy is NOT recreated and nothing is
+    /// written.
+    #[tokio::test]
+    async fn wired_missing_copy_dry_run_previews_without_rebuilding() {
+        let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
+        let (r1, _, _) = unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
+        assert!(r1.success, "{:?}", r1.error);
+        let gemfile1 = tokio::fs::read(root.join(GEMFILE)).await.unwrap();
+        let lock1 = tokio::fs::read(root.join(GEMFILE_LOCK)).await.unwrap();
+        let copy_root = root.join(copy_rel());
+        crate::patch::copy_tree::remove_tree(&copy_root)
+            .await
+            .unwrap();
+
+        let (r2, e2, _) = unwrap_done(run_vendor(&root, &blobs, &installed, &record, true).await);
+        assert!(r2.success, "{:?}", r2.error);
+        assert!(e2.is_none(), "dry run records nothing");
+        assert!(
+            !copy_root.exists(),
+            "a dry run must not rebuild the missing copy"
+        );
+        assert_eq!(tokio::fs::read(root.join(GEMFILE)).await.unwrap(), gemfile1);
+        assert_eq!(
+            tokio::fs::read(root.join(GEMFILE_LOCK)).await.unwrap(),
+            lock1
+        );
+    }
+
+    /// Wired pair + stale copy + `--offline --vendor-source=service`: the
+    /// artifact-rebuild path re-checks the conflict and refuses before any
+    /// network or disk write.
+    #[tokio::test]
+    async fn wired_missing_copy_offline_service_mode_refuses() {
+        let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
+        let (r1, _, _) = unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
+        assert!(r1.success, "{:?}", r1.error);
+        let gemfile1 = tokio::fs::read(root.join(GEMFILE)).await.unwrap();
+        let lock1 = tokio::fs::read(root.join(GEMFILE_LOCK)).await.unwrap();
+        let copy_root = root.join(copy_rel());
+        crate::patch::copy_tree::remove_tree(&copy_root)
+            .await
+            .unwrap();
+
+        let cfg = gem_service_cfg("http://127.0.0.1:1", VendorSource::Service, true);
+        let (code, _d) =
+            unwrap_refused(run_vendor_service(&root, &blobs, &installed, &record, &cfg).await);
+        assert_eq!(code, "vendor_service_offline_conflict");
+        assert!(!copy_root.exists(), "refusal must not rebuild");
+        assert_eq!(tokio::fs::read(root.join(GEMFILE)).await.unwrap(), gemfile1);
+        assert_eq!(
+            tokio::fs::read(root.join(GEMFILE_LOCK)).await.unwrap(),
+            lock1
+        );
+    }
+
+    /// Wired pair + stale copy + no service and no local stub gemspec: the
+    /// artifact rebuild hard-fails `gem_spec_missing`, and the live pair
+    /// edit is left exactly as it was.
+    #[tokio::test]
+    async fn wired_missing_copy_rebuild_without_stub_refuses() {
+        let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
+        let (r1, _, _) = unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
+        assert!(r1.success, "{:?}", r1.error);
+        let gemfile1 = tokio::fs::read(root.join(GEMFILE)).await.unwrap();
+        let lock1 = tokio::fs::read(root.join(GEMFILE_LOCK)).await.unwrap();
+        crate::patch::copy_tree::remove_tree(&root.join(copy_rel()))
+            .await
+            .unwrap();
+        tokio::fs::remove_file(
+            installed
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("specifications/rack-3.2.6.gemspec"),
+        )
+        .await
+        .unwrap();
+
+        let (code, _d) =
+            unwrap_refused(run_vendor(&root, &blobs, &installed, &record, false).await);
+        assert_eq!(code, "gem_spec_missing");
+        assert_eq!(tokio::fs::read(root.join(GEMFILE)).await.unwrap(), gemfile1);
+        assert_eq!(
+            tokio::fs::read(root.join(GEMFILE_LOCK)).await.unwrap(),
+            lock1
+        );
+    }
+
+    /// Local-build failure: the installed gem dir is gone (spec stub still
+    /// present). The result is an un-successful Done with no ledger entry,
+    /// the uuid dir (and the empty `.socket/vendor` levels this run created)
+    /// removed — no committable husk — and neither project file touched.
+    #[tokio::test]
+    async fn fresh_copy_failure_cleans_up_and_touches_nothing() {
+        let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
+        tokio::fs::remove_dir_all(&installed).await.unwrap();
+
+        let (result, entry, _w) =
+            unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("failed to copy installed gem"),
+            "{:?}",
+            result.error
+        );
+        assert!(entry.is_none());
+        assert!(
+            !root.join(format!(".socket/vendor/gem/{UUID}")).exists(),
+            "no uuid-dir husk after a failed fresh vendor"
+        );
+        assert!(
+            !root.join(".socket/vendor").exists(),
+            "the empty vendor levels this run created are pruned"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
+            GEMFILE_DIRECT
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                .await
+                .unwrap(),
+            LOCK_DIRECT
+        );
+    }
+
+    /// Local-build failure: the after-hash blob is missing, so the staged
+    /// apply fails. Same contract: un-successful Done, no entry, no husk,
+    /// pair untouched.
+    #[tokio::test]
+    async fn missing_blob_apply_failure_cleans_up_and_touches_nothing() {
+        let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
+        let after = compute_git_sha256_from_bytes(PATCHED);
+        tokio::fs::remove_file(blobs.join(&after)).await.unwrap();
+
+        let (result, entry, _w) =
+            unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
+        assert!(!result.success, "apply must fail without the blob");
+        assert!(result.error.is_some());
+        assert!(entry.is_none());
+        assert!(
+            !root.join(format!(".socket/vendor/gem/{UUID}")).exists(),
+            "no uuid-dir husk"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
+            GEMFILE_DIRECT
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                .await
+                .unwrap(),
+            LOCK_DIRECT
+        );
+    }
+
+    /// Local-build failure: a DIRECTORY named `rack.gemspec` inside the
+    /// installed gem rides fresh_copy into the stage, so the stub-gemspec
+    /// write fails (EISDIR). Same cleanup contract.
+    #[tokio::test]
+    async fn stub_write_failure_cleans_up_and_touches_nothing() {
+        let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
+        tokio::fs::create_dir_all(installed.join("rack.gemspec"))
+            .await
+            .unwrap();
+
+        let (result, entry, _w) =
+            unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("failed to copy the stub gemspec"),
+            "{:?}",
+            result.error
+        );
+        assert!(entry.is_none());
+        assert!(
+            !root.join(format!(".socket/vendor/gem/{UUID}")).exists(),
+            "no uuid-dir husk"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
+            GEMFILE_DIRECT
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                .await
+                .unwrap(),
+            LOCK_DIRECT
+        );
+    }
+
+    /// A marker-write failure is informational only (state.json is the
+    /// ledger of record): a DIRECTORY squatting the marker path survives
+    /// materialise (which only rebuilds the copy dir) and makes the atomic
+    /// marker write fail — vendor still succeeds, entry recorded, with a
+    /// `vendor_marker_write_failed` warning.
+    #[tokio::test]
+    async fn marker_write_failure_downgrades_to_warning() {
+        let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
+        let marker_path = root.join(format!(".socket/vendor/gem/{UUID}/{VENDOR_MARKER_FILE}"));
+        tokio::fs::create_dir_all(&marker_path).await.unwrap();
+
+        let (result, entry, warnings) =
+            unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
+        assert!(result.success, "{:?}", result.error);
+        assert!(entry.is_some(), "a marker failure must not drop the entry");
+        assert!(
+            warnings.iter().any(|w| w.code == "vendor_marker_write_failed"),
+            "{warnings:?}"
+        );
+        // The pair edit went through normally.
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                .await
+                .unwrap(),
+            expected_lock_direct()
+        );
+        assert_eq!(
+            tokio::fs::read(copy_lib(&root)).await.unwrap(),
+            PATCHED,
+            "copy still materialised"
+        );
+    }
+
+    /// An uninventoriable copy vendors like a pre-inventory entry (fail-soft
+    /// contract): a file over the inventory hash cap (a sparse `set_len`
+    /// file — no real disk use) makes `compute_dir_inventory` refuse, so the
+    /// entry records `file_inventory: None` plus the
+    /// `vendor_inventory_unrecorded` warning, while the vendor itself
+    /// succeeds.
+    #[tokio::test]
+    async fn uninventoriable_copy_degrades_to_warning() {
+        let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
+        let big = std::fs::File::create(installed.join("lib/huge.bin")).unwrap();
+        big.set_len(512 * 1024 * 1024 + 1).unwrap();
+        drop(big);
+
+        let (result, entry, warnings) =
+            unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
+        assert!(result.success, "{:?}", result.error);
+        let entry = entry.expect("vendor still records the entry");
+        assert!(
+            entry.artifact.file_inventory.is_none(),
+            "inventory must be absent, not partial"
+        );
+        let warning = warnings
+            .iter()
+            .find(|w| w.code == "vendor_inventory_unrecorded")
+            .expect("the gap is surfaced");
+        assert!(
+            warning.detail.contains("drift in its unpatched files"),
+            "{}",
+            warning.detail
+        );
+        // The pair edit itself is unaffected.
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                .await
+                .unwrap(),
+            expected_lock_direct()
+        );
+    }
+
+    /// A Gemfile atomic-write failure (read-only project root: the stage
+    /// file cannot be created) unwinds the freshly-built uuid dir and
+    /// reports an un-successful Done with both project files byte-untouched.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn gemfile_write_failure_unwinds_uuid_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root ignores mode bits — the trigger cannot fire
+        }
+        let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
+        // Pre-create the writable uuid chain so materialise needs no write
+        // under the (about to be read-only) project root itself.
+        let uuid_dir = root.join(format!(".socket/vendor/gem/{UUID}"));
+        tokio::fs::create_dir_all(&uuid_dir).await.unwrap();
+        tokio::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o555))
+            .await
+            .unwrap();
+
+        let outcome = run_vendor(&root, &blobs, &installed, &record, false).await;
+
+        // Restore before asserting so TempDir cleanup works even on failure.
+        tokio::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755))
+            .await
+            .unwrap();
+        let (result, entry, _w) = unwrap_done(outcome);
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("failed to write Gemfile"),
+            "{:?}",
+            result.error
+        );
+        assert!(entry.is_none());
+        assert!(!uuid_dir.exists(), "failed pair edit unwinds the uuid dir");
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
+            GEMFILE_DIRECT
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                .await
+                .unwrap(),
+            LOCK_DIRECT
+        );
+    }
+
+    // ── service miss / failure matrix (coverage-gap legs) ─────────────────
+
+    /// [`mount_gem_granted`], but the advertised `gem-stub-gemspec` GET
+    /// returns 500 — the stub-fetch `Failed` leg.
+    async fn mount_gem_granted_stub_get_fails(
+        server: &wiremock::MockServer,
+        gem_bytes: &[u8],
+        gem_sha512: &str,
+        stub_sha512: &str,
+    ) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let gem_path = format!("/patch/gem/rack/3.2.6/tok/{UUID}/rack-3.2.6.gem");
+        let gem_url = format!("{}{gem_path}", server.uri());
+        let stub_path = format!("/patch/gem/rack/3.2.6/tok/{UUID}/rack-3.2.6.gemspec");
+        let stub_url = format!("{}{stub_path}", server.uri());
+        Mock::given(method("POST"))
+            .and(path("/v0/orgs/acme/patches/package"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "results": { UUID: {
+                    "status": "granted",
+                    "url": gem_url,
+                    "purl": PURL,
+                    "artifacts": [
+                        { "kind": "tarball", "url": gem_url,
+                          "integrity": { "sha512": gem_sha512 } },
+                        { "kind": "gem-stub-gemspec", "url": stub_url,
+                          "integrity": { "sha512": stub_sha512 } }
+                    ]
+                }}
+            })))
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(gem_path))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(gem_bytes.to_vec()))
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(stub_path))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(server)
+            .await;
+    }
+
+    /// A configured-but-disabled service (`--vendor-source=build`, or `auto`
+    /// while offline) silently uses the local build: no request is made (the
+    /// URI is a dead port) and no `vendor_prebuilt_*` advisory fires.
+    #[tokio::test]
+    async fn disabled_service_config_silently_builds_locally() {
+        for cfg in [
+            gem_service_cfg("http://127.0.0.1:1", VendorSource::Build, false),
+            gem_service_cfg("http://127.0.0.1:1", VendorSource::Auto, true),
+        ] {
+            let (_tmp, root, installed, blobs, record) =
+                fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
+            let (result, entry, warnings) =
+                unwrap_done(run_vendor_service(&root, &blobs, &installed, &record, &cfg).await);
+            assert!(result.success, "{:?}: {:?}", cfg.source, result.error);
+            assert!(entry.is_some());
+            assert_eq!(tokio::fs::read(copy_lib(&root)).await.unwrap(), PATCHED);
+            assert_eq!(
+                tokio::fs::read_to_string(copy_gemspec(&root))
+                    .await
+                    .unwrap(),
+                GEMSPEC,
+                "the LOCAL stub is used"
+            );
+            assert!(
+                !warnings
+                    .iter()
+                    .any(|w| w.code.starts_with("vendor_prebuilt")),
+                "silent local fallback, no service advisories: {warnings:?}"
+            );
+        }
+    }
+
+    /// `service` mode + a still-building archive (`pending_build`) refuses
+    /// with the "still building" detail; nothing is written.
+    #[tokio::test]
+    async fn service_pending_service_mode_refuses() {
+        let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
+        let server = wiremock::MockServer::start().await;
+        mount_gem_status(&server, "pending_build").await;
+        let cfg = gem_service_cfg(&server.uri(), VendorSource::Service, false);
+
+        let (code, detail) =
+            unwrap_refused(run_vendor_service(&root, &blobs, &installed, &record, &cfg).await);
+        assert_eq!(code, "vendor_prebuilt_required");
+        assert!(detail.contains("still building"), "{detail}");
+        assert!(!root.join(".socket").exists());
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                .await
+                .unwrap(),
+            LOCK_DIRECT
+        );
+    }
+
+    /// `auto` + `pending_build` warns under `vendor_prebuilt_pending` and
+    /// falls back to the local build.
+    #[tokio::test]
+    async fn service_pending_auto_warns_and_builds_locally() {
+        let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
+        let server = wiremock::MockServer::start().await;
+        mount_gem_status(&server, "pending_build").await;
+        let cfg = gem_service_cfg(&server.uri(), VendorSource::Auto, false);
+
+        let (result, entry, warnings) =
+            unwrap_done(run_vendor_service(&root, &blobs, &installed, &record, &cfg).await);
+        assert!(result.success, "auto must fall back: {:?}", result.error);
+        assert!(entry.is_some());
+        assert_eq!(tokio::fs::read(copy_lib(&root)).await.unwrap(), PATCHED);
+        let warning = warnings
+            .iter()
+            .find(|w| w.code == "vendor_prebuilt_pending")
+            .expect("the pending miss is surfaced");
+        assert!(
+            warning.detail.contains("building locally instead"),
+            "{}",
+            warning.detail
+        );
+    }
+
+    /// `service` mode + a terminal miss (`not_found`) hard-fails naming the
+    /// unavailability (the `auto` fallback leg is covered above).
+    #[tokio::test]
+    async fn service_unavailable_service_mode_refuses() {
+        let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
+        let server = wiremock::MockServer::start().await;
+        mount_gem_status(&server, "not_found").await;
+        let cfg = gem_service_cfg(&server.uri(), VendorSource::Service, false);
+
+        let (code, detail) =
+            unwrap_refused(run_vendor_service(&root, &blobs, &installed, &record, &cfg).await);
+        assert_eq!(code, "vendor_prebuilt_required");
+        assert!(detail.contains("unavailable"), "{detail}");
+        assert!(!root.join(".socket").exists());
+    }
+
+    /// `service` mode + a stub-artifact GET failure (HTTP 500) hard-fails
+    /// with the "could not fetch the stub gemspec" detail.
+    #[tokio::test]
+    async fn stub_fetch_failure_service_mode_refuses() {
+        let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
+        let gem = make_gem(&[("lib/rack.rb", PATCHED)]);
+        let sri = sri_sha512(&gem);
+        let stub_sri = sri_sha512(SERVICE_STUB);
+        let server = wiremock::MockServer::start().await;
+        mount_gem_granted_stub_get_fails(&server, &gem, &sri, &stub_sri).await;
+        let cfg = gem_service_cfg(&server.uri(), VendorSource::Service, false);
+
+        let (code, detail) =
+            unwrap_refused(run_vendor_service(&root, &blobs, &installed, &record, &cfg).await);
+        assert_eq!(code, "vendor_prebuilt_required");
+        assert!(
+            detail.contains("could not fetch the stub gemspec"),
+            "{detail}"
+        );
+        assert!(!root.join(format!(".socket/vendor/gem/{UUID}")).exists());
+    }
+
+    /// `auto` + the same stub-fetch failure warns (`vendor_prebuilt_unavailable`)
+    /// and builds locally with the local stub.
+    #[tokio::test]
+    async fn stub_fetch_failure_auto_warns_and_builds_locally() {
+        let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
+        let gem = make_gem(&[("lib/rack.rb", PATCHED)]);
+        let sri = sri_sha512(&gem);
+        let stub_sri = sri_sha512(SERVICE_STUB);
+        let server = wiremock::MockServer::start().await;
+        mount_gem_granted_stub_get_fails(&server, &gem, &sri, &stub_sri).await;
+        let cfg = gem_service_cfg(&server.uri(), VendorSource::Auto, false);
+
+        let (result, entry, warnings) =
+            unwrap_done(run_vendor_service(&root, &blobs, &installed, &record, &cfg).await);
+        assert!(result.success, "auto must fall back: {:?}", result.error);
+        assert!(entry.is_some());
+        assert_eq!(
+            tokio::fs::read_to_string(copy_gemspec(&root))
+                .await
+                .unwrap(),
+            GEMSPEC,
+            "the LOCAL stub is used"
+        );
+        let warning = warnings
+            .iter()
+            .find(|w| w.code == "vendor_prebuilt_unavailable")
+            .expect("the fetch failure is surfaced");
+        assert!(
+            warning.detail.contains("could not fetch the stub gemspec"),
+            "{}",
+            warning.detail
+        );
+    }
+
+    /// `service` mode + a served `.gem` whose extracted layout misses the
+    /// recorded file paths fails closed (`vendor_prebuilt_layout_mismatch`
+    /// miss → `vendor_prebuilt_required` refusal); no husk is left.
+    #[tokio::test]
+    async fn service_layout_mismatch_service_mode_refuses() {
+        let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
+        let gem = make_gem(&[("wrong/rack.rb", PATCHED)]);
+        let sri = sri_sha512(&gem);
+        let stub_sri = sri_sha512(SERVICE_STUB);
+        let server = wiremock::MockServer::start().await;
+        mount_gem_granted(&server, &gem, &sri, Some((SERVICE_STUB, &stub_sri))).await;
+        let cfg = gem_service_cfg(&server.uri(), VendorSource::Service, false);
+
+        let (code, detail) =
+            unwrap_refused(run_vendor_service(&root, &blobs, &installed, &record, &cfg).await);
+        assert_eq!(code, "vendor_prebuilt_required");
+        assert!(detail.contains("unexpected layout"), "{detail}");
+        assert!(!root.join(format!(".socket/vendor/gem/{UUID}")).exists());
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                .await
+                .unwrap(),
+            LOCK_DIRECT
+        );
+    }
+
+    /// `auto` + the same layout mismatch warns and falls back to the local
+    /// build — the wrong-layout service bytes never land in the copy.
+    #[tokio::test]
+    async fn service_layout_mismatch_auto_falls_back_with_warning() {
+        let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
+        let gem = make_gem(&[("wrong/rack.rb", PATCHED)]);
+        let sri = sri_sha512(&gem);
+        let stub_sri = sri_sha512(SERVICE_STUB);
+        let server = wiremock::MockServer::start().await;
+        mount_gem_granted(&server, &gem, &sri, Some((SERVICE_STUB, &stub_sri))).await;
+        let cfg = gem_service_cfg(&server.uri(), VendorSource::Auto, false);
+
+        let (result, entry, warnings) =
+            unwrap_done(run_vendor_service(&root, &blobs, &installed, &record, &cfg).await);
+        assert!(result.success, "auto must fall back: {:?}", result.error);
+        assert!(entry.is_some());
+        assert_eq!(
+            tokio::fs::read(copy_lib(&root)).await.unwrap(),
+            PATCHED,
+            "the LOCAL build's patched file, at the recorded path"
+        );
+        assert!(
+            !root.join(copy_rel()).join("wrong/rack.rb").exists(),
+            "the mismatched service layout never lands"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.code == "vendor_prebuilt_layout_mismatch"),
+            "{warnings:?}"
+        );
+    }
+
+    /// A served `.gem` whose data.tar.gz carries a DIRECTORY at the stub
+    /// path (`rack.gemspec/…`) makes the stub write fail — a hard
+    /// `vendor_prebuilt_write_failed`, no husk.
+    #[tokio::test]
+    async fn service_gem_with_dir_at_stub_path_hard_fails() {
+        let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
+        let gem = make_gem(&[("lib/rack.rb", PATCHED), ("rack.gemspec/inner.rb", b"x")]);
+        let sri = sri_sha512(&gem);
+        let stub_sri = sri_sha512(SERVICE_STUB);
+        let server = wiremock::MockServer::start().await;
+        mount_gem_granted(&server, &gem, &sri, Some((SERVICE_STUB, &stub_sri))).await;
+        let cfg = gem_service_cfg(&server.uri(), VendorSource::Service, false);
+
+        let (code, detail) =
+            unwrap_refused(run_vendor_service(&root, &blobs, &installed, &record, &cfg).await);
+        assert_eq!(code, "vendor_prebuilt_write_failed");
+        assert!(
+            detail.contains("cannot write the stub gemspec"),
+            "{detail}"
+        );
+        assert!(!root.join(format!(".socket/vendor/gem/{UUID}")).exists());
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                .await
+                .unwrap(),
+            LOCK_DIRECT
+        );
+    }
+
+    /// A regular FILE squatting `.socket/vendor/gem` makes the service
+    /// stage's `create_dir_all` fail — a hard `vendor_prebuilt_write_failed`
+    /// naming the un-creatable path; the pair is untouched.
+    #[tokio::test]
+    async fn service_stage_create_failure_hard_fails() {
+        let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
+        tokio::fs::create_dir_all(root.join(".socket/vendor"))
+            .await
+            .unwrap();
+        tokio::fs::write(root.join(".socket/vendor/gem"), b"not a dir")
+            .await
+            .unwrap();
+        let gem = make_gem(&[("lib/rack.rb", PATCHED)]);
+        let sri = sri_sha512(&gem);
+        let stub_sri = sri_sha512(SERVICE_STUB);
+        let server = wiremock::MockServer::start().await;
+        mount_gem_granted(&server, &gem, &sri, Some((SERVICE_STUB, &stub_sri))).await;
+        let cfg = gem_service_cfg(&server.uri(), VendorSource::Service, false);
+
+        let (code, detail) =
+            unwrap_refused(run_vendor_service(&root, &blobs, &installed, &record, &cfg).await);
+        assert_eq!(code, "vendor_prebuilt_write_failed");
+        assert!(detail.contains("cannot create"), "{detail}");
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
+            GEMFILE_DIRECT
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                .await
+                .unwrap(),
+            LOCK_DIRECT
+        );
+    }
+
+    /// An invalid served stub that DOES assign `licenses` must not carry the
+    /// "also omits `licenses`" advisory — the empty-note branch of the D4
+    /// refusal detail.
+    #[tokio::test]
+    async fn invalid_stub_with_licenses_omits_licenses_advisory() {
+        const STUB_INVALID_WITH_LICENSE: &[u8] = b"# -*- encoding: utf-8 -*-\n# stub: rack 3.2.6 ruby lib\n\nGem::Specification.new do |s|\n  s.name = \"rack\".freeze\n  s.version = \"3.2.6\".freeze\n  s.licenses = [\"MIT\".freeze]\n  s.require_paths = [\"lib\".freeze]\nend\n";
+        let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
+        let gem = make_gem(&[("lib/rack.rb", PATCHED)]);
+        let sri = sri_sha512(&gem);
+        let stub_sri = sri_sha512(STUB_INVALID_WITH_LICENSE);
+        let server = wiremock::MockServer::start().await;
+        mount_gem_granted(
+            &server,
+            &gem,
+            &sri,
+            Some((STUB_INVALID_WITH_LICENSE, &stub_sri)),
+        )
+        .await;
+        let cfg = gem_service_cfg(&server.uri(), VendorSource::Service, false);
+
+        let (code, detail) =
+            unwrap_refused(run_vendor_service(&root, &blobs, &installed, &record, &cfg).await);
+        assert_eq!(code, "vendor_prebuilt_stub_invalid");
+        assert!(detail.contains("does not assign"), "{detail}");
+        assert!(
+            !detail.contains("also omits"),
+            "a stub assigning licenses must not get the licenses advisory: {detail}"
+        );
+        assert!(!root.join(".socket").exists());
+    }
+
+    /// D4 + `auto` + a CORRUPTED local stub: the local-build write choke
+    /// point refuses `gem_spec_invalid`, and the detail honestly notes the
+    /// service cannot supply a stub either (its served stub is defective) —
+    /// never circular "use --vendor-source=service" advice.
+    #[tokio::test]
+    async fn invalid_served_and_local_stub_refuses_with_honest_note() {
+        let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
+        tokio::fs::write(
+            installed
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("specifications/rack-3.2.6.gemspec"),
+            "Gem::Specification.new do |s|\n  s.name = \"rack\"\n  s.version = \"3.2.6\"\nend\n",
+        )
+        .await
+        .unwrap();
+        let gem = make_gem(&[("lib/rack.rb", PATCHED)]);
+        let sri = sri_sha512(&gem);
+        let stub_sri = sri_sha512(SERVICE_STUB_INVALID);
+        let server = wiremock::MockServer::start().await;
+        mount_gem_granted(&server, &gem, &sri, Some((SERVICE_STUB_INVALID, &stub_sri))).await;
+        let cfg = gem_service_cfg(&server.uri(), VendorSource::Auto, false);
+
+        let (code, detail) =
+            unwrap_refused(run_vendor_service(&root, &blobs, &installed, &record, &cfg).await);
+        assert_eq!(code, "gem_spec_invalid");
+        assert!(
+            detail.contains("cannot supply one either"),
+            "the served-stub defect must ride the local refusal: {detail}"
+        );
+        assert!(!root.join(".socket").exists());
+    }
+
+    // ── revert guard / drift / failure legs (coverage-gap) ────────────────
+
+    /// SECURITY: a traversal uuid in a (tamperable) ledger entry must refuse
+    /// the revert before any disk access — wiring and artifact untouched.
+    #[tokio::test]
+    async fn revert_refuses_traversal_uuid() {
+        let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
+        let (r1, e1, _) = unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
+        assert!(r1.success, "{:?}", r1.error);
+        let mut entry = e1.unwrap();
+        entry.uuid = "../../escape".to_string();
+        let gemfile_wired = tokio::fs::read(root.join(GEMFILE)).await.unwrap();
+        let lock_wired = tokio::fs::read(root.join(GEMFILE_LOCK)).await.unwrap();
+
+        let outcome = revert_gem(&entry, &root, false).await;
+        assert!(!outcome.success);
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("non-canonical patch uuid"),
+            "{:?}",
+            outcome.error
+        );
+        assert_eq!(
+            tokio::fs::read(root.join(GEMFILE)).await.unwrap(),
+            gemfile_wired,
+            "refusal happens before any wiring restore"
+        );
+        assert_eq!(
+            tokio::fs::read(root.join(GEMFILE_LOCK)).await.unwrap(),
+            lock_wired
+        );
+        assert!(
+            root.join(copy_rel()).join("lib/rack.rb").is_file(),
+            "artifact untouched"
+        );
+    }
+
+    /// An unrecognized wiring kind (a newer ledger) warns and continues —
+    /// forward compatibility: the known records still restore byte-exactly.
+    #[tokio::test]
+    async fn revert_unrecognized_wiring_kind_warns_and_continues() {
+        let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
+        let (r1, e1, _) = unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
+        assert!(r1.success, "{:?}", r1.error);
+        let mut entry = e1.unwrap();
+        entry.wiring.push(WiringRecord {
+            file: GEMFILE_LOCK.to_string(),
+            kind: "gemfile_lock_future_thing".to_string(),
+            action: WiringAction::Added,
+            key: Some("rack".to_string()),
+            original: None,
+            new: None,
+        });
+
+        let outcome = revert_gem(&entry, &root, false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        let unknown: Vec<_> = outcome
+            .warnings
+            .iter()
+            .filter(|w| w.detail.contains("unrecognized wiring kind"))
+            .collect();
+        assert_eq!(unknown.len(), 1, "{:?}", outcome.warnings);
+        assert_eq!(unknown[0].code, "vendor_lock_entry_drifted");
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
+            GEMFILE_DIRECT,
+            "known records still restore"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                .await
+                .unwrap(),
+            LOCK_DIRECT
+        );
+        assert!(!root.join(format!(".socket/vendor/gem/{UUID}")).exists());
+    }
+
+    /// Artifact removal failing at revert's END (read-only parent dir): the
+    /// wiring is ALREADY restored (it runs first) and the outcome reports
+    /// the removal failure instead of a false success.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn revert_artifact_removal_failure_reports_error_after_restore() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root ignores mode bits — the trigger cannot fire
+        }
+        let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
+        let (r1, e1, _) = unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
+        assert!(r1.success, "{:?}", r1.error);
+        let entry = e1.unwrap();
+
+        let eco = root.join(".socket/vendor/gem");
+        tokio::fs::set_permissions(&eco, std::fs::Permissions::from_mode(0o555))
+            .await
+            .unwrap();
+        let outcome = revert_gem(&entry, &root, false).await;
+        tokio::fs::set_permissions(&eco, std::fs::Permissions::from_mode(0o755))
+            .await
+            .unwrap();
+
+        assert!(!outcome.success, "{outcome:?}");
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("failed to remove"),
+            "{:?}",
+            outcome.error
+        );
+        assert!(
+            root.join(format!(".socket/vendor/gem/{UUID}")).exists(),
+            "the un-removable uuid dir is still there"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
+            GEMFILE_DIRECT,
+            "wiring restored before the removal attempt"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                .await
+                .unwrap(),
+            LOCK_DIRECT
+        );
+    }
+
+    /// A deleted Gemfile drifts (NotFound → left alone) while the lock
+    /// record still restores and the artifact is still removed.
+    #[tokio::test]
+    async fn revert_missing_gemfile_drifts_and_restores_lock() {
+        let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
+        let (r1, e1, _) = unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
+        assert!(r1.success, "{:?}", r1.error);
+        let entry = e1.unwrap();
+        tokio::fs::remove_file(root.join(GEMFILE)).await.unwrap();
+
+        let outcome = revert_gem(&entry, &root, false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        let drift = outcome
+            .warnings
+            .iter()
+            .filter(|w| w.code == "vendor_lock_entry_drifted")
+            .count();
+        assert_eq!(drift, 1, "{:?}", outcome.warnings);
+        assert!(!root.join(GEMFILE).exists(), "the missing file stays gone");
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                .await
+                .unwrap(),
+            LOCK_DIRECT
+        );
+        assert!(!root.join(format!(".socket/vendor/gem/{UUID}")).exists());
+    }
+
+    /// A deleted lock drifts BOTH lock-side records (spec + checksum, via
+    /// NotFound) while the Gemfile still restores.
+    #[tokio::test]
+    async fn revert_missing_lock_drifts_and_restores_gemfile() {
+        let (_tmp, root, installed, blobs, record) =
+            fixture_318(SPIKE_GEMFILE_CHECKSUMS, SPIKE_LOCK_CHECKSUMS_BEFORE).await;
+        let (r1, e1, _) =
+            unwrap_done(run_vendor_318(&root, &blobs, &installed, &record, false).await);
+        assert!(r1.success, "{:?}", r1.error);
+        let entry = e1.unwrap();
+        assert_eq!(entry.wiring.len(), 3);
+        tokio::fs::remove_file(root.join(GEMFILE_LOCK))
+            .await
+            .unwrap();
+
+        let outcome = revert_gem(&entry, &root, false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        let drift = outcome
+            .warnings
+            .iter()
+            .filter(|w| w.code == "vendor_lock_entry_drifted")
+            .count();
+        assert_eq!(
+            drift, 2,
+            "both lock-side records drift: {:?}",
+            outcome.warnings
+        );
+        assert!(!root.join(GEMFILE_LOCK).exists());
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
+            SPIKE_GEMFILE_CHECKSUMS
+        );
+        assert!(!root.join(format!(".socket/vendor/gem/{UUID}")).exists());
+    }
+
+    /// Malformed / hand-stripped ledger records must degrade to a drift
+    /// warning — never a partial splice. Each tamper is probed with a
+    /// DRY-RUN revert (no writes), so one vendored fixture serves the whole
+    /// matrix; the intact entry still reverts byte-exactly afterwards.
+    #[tokio::test]
+    async fn revert_tampered_ledger_records_drift_instead_of_partial_splice() {
+        let (_tmp, root, installed, blobs, record) =
+            fixture_318(SPIKE_GEMFILE_CHECKSUMS, SPIKE_LOCK_CHECKSUMS_BEFORE).await;
+        let (r1, e1, _) =
+            unwrap_done(run_vendor_318(&root, &blobs, &installed, &record, false).await);
+        assert!(r1.success, "{:?}", r1.error);
+        let entry = e1.unwrap();
+        assert_eq!(entry.wiring.len(), 3, "gemfile + lock spec + checksum");
+        let wired_gemfile = tokio::fs::read(root.join(GEMFILE)).await.unwrap();
+        let wired_lock = tokio::fs::read(root.join(GEMFILE_LOCK)).await.unwrap();
+
+        fn t_gemfile_new_none(e: &mut VendorEntry) {
+            e.wiring[0].new = None;
+        }
+        fn t_gemfile_original_none(e: &mut VendorEntry) {
+            e.wiring[0].original = None;
+        }
+        fn t_lock_original_not_array(e: &mut VendorEntry) {
+            e.wiring[1].original = Some(Value::Bool(true));
+        }
+        fn t_lock_new_remote_tampered(e: &mut VendorEntry) {
+            let arr = e.wiring[1].new.as_mut().unwrap().as_array_mut().unwrap();
+            arr[1] = Value::String("  broken".to_string());
+        }
+        fn t_checksum_new_none(e: &mut VendorEntry) {
+            e.wiring[2].new = None;
+        }
+        let cases: [(&str, fn(&mut VendorEntry)); 5] = [
+            ("gemfile record without `new`", t_gemfile_new_none),
+            ("rewritten gemfile record without `original`", t_gemfile_original_none),
+            ("lock record with non-array `original`", t_lock_original_not_array),
+            ("lock record whose `new` lost its remote line", t_lock_new_remote_tampered),
+            ("checksum record without `new`", t_checksum_new_none),
+        ];
+        for (label, tamper) in cases {
+            let mut tampered = entry.clone();
+            tamper(&mut tampered);
+            let outcome = revert_gem(&tampered, &root, true).await;
+            assert!(outcome.success, "{label}: {:?}", outcome.error);
+            let drift = outcome
+                .warnings
+                .iter()
+                .filter(|w| w.code == "vendor_lock_entry_drifted")
+                .count();
+            assert_eq!(drift, 1, "{label}: {:?}", outcome.warnings);
+            assert_eq!(
+                tokio::fs::read(root.join(GEMFILE)).await.unwrap(),
+                wired_gemfile,
+                "{label}: dry run writes nothing"
+            );
+            assert_eq!(
+                tokio::fs::read(root.join(GEMFILE_LOCK)).await.unwrap(),
+                wired_lock,
+                "{label}"
+            );
+            assert!(root.join(copy_rel_318()).exists(), "{label}");
+        }
+
+        // The intact entry still restores everything byte-exactly.
+        let outcome = revert_gem(&entry, &root, false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(
+            !outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_lock_entry_drifted"),
+            "{:?}",
+            outcome.warnings
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                .await
+                .unwrap(),
+            SPIKE_LOCK_CHECKSUMS_BEFORE
+        );
+    }
+
+    /// The lock lost the `!` dep pin: the spec record's precondition fails →
+    /// that record drifts (left alone in FULL — no partial splice) while the
+    /// checksum record and Gemfile still restore.
+    #[tokio::test]
+    async fn revert_missing_dep_pin_leaves_lock_spec_alone() {
+        let (_tmp, root, installed, blobs, record) =
+            fixture_318(SPIKE_GEMFILE_CHECKSUMS, SPIKE_LOCK_CHECKSUMS_BEFORE).await;
+        let (r1, e1, _) =
+            unwrap_done(run_vendor_318(&root, &blobs, &installed, &record, false).await);
+        assert!(r1.success, "{:?}", r1.error);
+        let entry = e1.unwrap();
+        let wired = tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+            .await
+            .unwrap();
+        let no_pin = wired.replace("DEPENDENCIES\n  rack (= 3.1.8)!\n", "DEPENDENCIES\n");
+        assert_ne!(no_pin, wired, "fixture edit must hit the pin");
+        tokio::fs::write(root.join(GEMFILE_LOCK), &no_pin)
+            .await
+            .unwrap();
+
+        let outcome = revert_gem(&entry, &root, false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        let drift = outcome
+            .warnings
+            .iter()
+            .filter(|w| w.code == "vendor_lock_entry_drifted")
+            .count();
+        assert_eq!(drift, 1, "{:?}", outcome.warnings);
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                .await
+                .unwrap(),
+            no_pin.replace(
+                "CHECKSUMS\n  rack (3.1.8)\n",
+                &format!("CHECKSUMS\n{SPIKE_RACK_SHA_LINE}\n")
+            ),
+            "checksum restored; the drifted spec fragment left alone in full"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
+            SPIKE_GEMFILE_CHECKSUMS,
+            "Gemfile still restored"
+        );
+    }
+
+    /// The whole CHECKSUMS section is gone: only the checksum record drifts;
+    /// the spec splice and Gemfile restore normally.
+    #[tokio::test]
+    async fn revert_checksums_section_gone_drifts_only_checksum_record() {
+        let (_tmp, root, installed, blobs, record) =
+            fixture_318(SPIKE_GEMFILE_CHECKSUMS, SPIKE_LOCK_CHECKSUMS_BEFORE).await;
+        let (r1, e1, _) =
+            unwrap_done(run_vendor_318(&root, &blobs, &installed, &record, false).await);
+        assert!(r1.success, "{:?}", r1.error);
+        let entry = e1.unwrap();
+        let wired = tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+            .await
+            .unwrap();
+        let no_section = wired.replace("CHECKSUMS\n  rack (3.1.8)\n\n", "");
+        assert_ne!(no_section, wired, "fixture edit must drop the section");
+        tokio::fs::write(root.join(GEMFILE_LOCK), &no_section)
+            .await
+            .unwrap();
+
+        let outcome = revert_gem(&entry, &root, false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        let drift = outcome
+            .warnings
+            .iter()
+            .filter(|w| w.code == "vendor_lock_entry_drifted")
+            .count();
+        assert_eq!(drift, 1, "{:?}", outcome.warnings);
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                .await
+                .unwrap(),
+            SPIKE_LOCK_CHECKSUMS_BEFORE
+                .replace(&format!("CHECKSUMS\n{SPIKE_RACK_SHA_LINE}\n\n"), ""),
+            "spec block + dep entry restored; no CHECKSUMS resurrected"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
+            SPIKE_GEMFILE_CHECKSUMS
+        );
+    }
+
+    /// A hand-deleted managed block (the `Added` Gemfile record's written
+    /// text is gone) drifts instead of guessing; the lock still restores.
+    #[tokio::test]
+    async fn revert_added_block_gone_drifts() {
+        let (_tmp, root, installed, blobs, record) =
+            fixture(GEMFILE_TRANSITIVE, LOCK_TRANSITIVE).await;
+        let (r1, e1, _) = unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
+        assert!(r1.success, "{:?}", r1.error);
+        let entry = e1.unwrap();
+        tokio::fs::write(root.join(GEMFILE), GEMFILE_TRANSITIVE)
+            .await
+            .unwrap();
+
+        let outcome = revert_gem(&entry, &root, false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        let drift = outcome
+            .warnings
+            .iter()
+            .filter(|w| w.code == "vendor_lock_entry_drifted")
+            .count();
+        assert_eq!(drift, 1, "{:?}", outcome.warnings);
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
+            GEMFILE_TRANSITIVE
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                .await
+                .unwrap(),
+            LOCK_TRANSITIVE
+        );
+    }
+
+    /// The CHECKSUM reader's FIFO twin of
+    /// [`fifo_lock_fails_fast_instead_of_wedging`]: on a CHECKSUMS-vendored
+    /// project the checksum record is restored FIRST (reverse order), so a
+    /// FIFO planted as the lock must fail revert fast through
+    /// `revert_lock_checksum_record`'s guarded reader.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fifo_lock_fails_revert_via_checksum_reader() {
+        let (_tmp, root, installed, blobs, record) =
+            fixture_318(SPIKE_GEMFILE_CHECKSUMS, SPIKE_LOCK_CHECKSUMS_BEFORE).await;
+        let (r1, e1, _) =
+            unwrap_done(run_vendor_318(&root, &blobs, &installed, &record, false).await);
+        assert!(r1.success, "{:?}", r1.error);
+        let entry = e1.unwrap();
+        assert_eq!(
+            entry.wiring[2].kind, LOCK_CHECKSUM_WIRING_KIND,
+            "checksum record is last → restored first"
+        );
+
+        let lock_path = root.join(GEMFILE_LOCK);
+        tokio::fs::remove_file(&lock_path).await.unwrap();
+        mkfifo(&lock_path);
+
+        let deadline = std::time::Duration::from_secs(5);
+        let fut = revert_gem(&entry, &root, false);
+        let Ok(outcome) = tokio::time::timeout(deadline, fut).await else {
+            use std::os::unix::fs::OpenOptionsExt;
+            let _ = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&lock_path);
+            panic!("the checksum revert reader must fail fast on a FIFO");
+        };
+        assert!(!outcome.success, "{outcome:?}");
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("unreadable Gemfile.lock"),
+            "{:?}",
+            outcome.error
+        );
+        assert!(
+            root.join(format!(".socket/vendor/gem/{UUID}")).exists(),
+            "failed revert must not delete the artifacts"
+        );
+    }
+
+    /// Reverting one of TWO vendored gems must walk past the other's PATH
+    /// section to find its own; both reverts land the fixture pair
+    /// byte-exactly with zero drift.
+    #[tokio::test]
+    async fn multi_gem_revert_walks_past_other_path_sections() {
+        let (_tmp, root, installed_rack, blobs, record_rack) =
+            fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
+        let (installed_puma, record_puma) = add_puma_fixture(&installed_rack, &blobs).await;
+        let (r_rack, e_rack, _) = unwrap_done(
+            run_vendor_purl(PURL, &root, &blobs, &installed_rack, &record_rack, false).await,
+        );
+        assert!(r_rack.success, "{:?}", r_rack.error);
+        let (r_puma, e_puma, _) = unwrap_done(
+            run_vendor_purl(
+                PURL_PUMA,
+                &root,
+                &blobs,
+                &installed_puma,
+                &record_puma,
+                false,
+            )
+            .await,
+        );
+        assert!(r_puma.success, "{:?}", r_puma.error);
+
+        // puma's PATH section sorts FIRST, so rack's revert must walk past it.
+        let rack_out = revert_gem(&e_rack.unwrap(), &root, false).await;
+        assert!(rack_out.success, "{:?}", rack_out.error);
+        assert!(
+            !rack_out
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_lock_entry_drifted"),
+            "{:?}",
+            rack_out.warnings
+        );
+        let puma_out = revert_gem(&e_puma.unwrap(), &root, false).await;
+        assert!(puma_out.success, "{:?}", puma_out.error);
+        assert!(
+            !puma_out
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_lock_entry_drifted"),
+            "{:?}",
+            puma_out.warnings
+        );
+
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
+            GEMFILE_DIRECT
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                .await
+                .unwrap(),
+            LOCK_DIRECT
+        );
+        assert!(!root.join(format!(".socket/vendor/gem/{UUID}")).exists());
+        assert!(!root
+            .join(format!(".socket/vendor/gem/{UUID_PUMA}"))
+            .exists());
+    }
+
+    // ── edit_lock / grammar fail-closed units (coverage-gap) ──────────────
+
+    /// A GEM section without a `specs:` stanza is not a lock this backend
+    /// understands — fail closed.
+    #[test]
+    fn edit_lock_missing_specs_stanza_fails_closed() {
+        let lock = LOCK_DIRECT.replace("  specs:\n", "");
+        assert_ne!(lock, LOCK_DIRECT);
+        let err = edit_lock(&lock, "rack", "3.2.6", &copy_rel())
+            .err()
+            .expect("a specs:-less GEM section must fail closed");
+        assert!(err.contains("no specs: stanza"), "{err}");
+    }
+
+    /// Re-vendor guards: our previous PATH section must carry exactly the
+    /// shape vendor wrote — a missing spec entry and a hand-edited extra
+    /// line each fail closed instead of being rewired around.
+    #[test]
+    fn edit_lock_revendor_path_section_guards_fail_closed() {
+        let tail = "\nGEM\n  remote: https://rubygems.org/\n  specs:\n    puma (6.4.2)\n\nPLATFORMS\n  ruby\n\nDEPENDENCIES\n  puma\n  rack (= 3.2.6)!\n\nBUNDLED WITH\n   2.5.22\n";
+
+        let lost = format!(
+            "PATH\n  remote: {rel}\n  specs:\n    other (1.0)\n{tail}",
+            rel = copy_rel()
+        );
+        let err = edit_lock(&lost, "rack", "3.2.6", &copy_rel())
+            .err()
+            .expect("a PATH section without its spec entry must fail closed");
+        assert!(err.contains("lost its"), "{err}");
+
+        let edited = format!(
+            "PATH\n  remote: {rel}\n  specs:\n    rack (3.2.6)\n  hand: edit\n{tail}",
+            rel = copy_rel()
+        );
+        let err = edit_lock(&edited, "rack", "3.2.6", &copy_rel())
+            .err()
+            .expect("a hand-edited PATH section must fail closed");
+        assert!(err.contains("not the shape vendor wrote"), "{err}");
+    }
+
+    /// A non-PATH leading section (a GIT source — a real-world lock shape)
+    /// keeps the legacy insert-before-GEM fallback: our PATH section lands
+    /// between the GIT section and GEM, everything else byte-preserved.
+    #[test]
+    fn edit_lock_git_leading_section_keeps_insert_before_gem() {
+        let git =
+            "GIT\n  remote: https://example.com/dep.git\n  revision: abc123\n  specs:\n    dep (1.0)\n\n";
+        let lock = format!("{git}{LOCK_DIRECT}");
+        let edit = edit_lock(&lock, "rack", "3.2.6", &copy_rel()).unwrap();
+        assert_eq!(edit.text, format!("{git}{}", expected_lock_direct()));
+    }
+
+    /// Tail-grammar rejects: text after the closing paren (or deeper indent)
+    /// makes an entry unparseable — these `None`s are what route malformed
+    /// lines into the fail-closed "not parseable" refusals.
+    #[test]
+    fn spec_and_checksum_entry_tail_grammar_rejects() {
+        assert_eq!(spec_entry("    rack (3.2.6)"), Some(("rack", "3.2.6")));
+        assert_eq!(spec_entry("    rack (3.2.6)x"), None);
+        assert_eq!(
+            checksum_entry("  rack (3.1.8) sha256=abc"),
+            Some(("rack", "3.1.8"))
+        );
+        assert_eq!(checksum_entry("  rack (3.2.6)x"), None);
+        assert_eq!(checksum_entry("   deep (1)"), None);
+    }
+
+    /// The in-sync hot path must skip OTHER gems' CHECKSUMS entries: a
+    /// rerun over the transitive fixture (puma's registry sha line present)
+    /// is a no-op that records nothing and rewrites nothing.
+    #[tokio::test]
+    async fn checksums_rerun_hot_path_skips_foreign_entries() {
+        let gemfile = "source \"https://rubygems.org\"\n\ngem \"puma\"\n";
+        let puma_sha_line =
+            "  puma (6.4.2) sha256=9c4f1f9d8f7c3a1b5e2d6c8a0b4f7e1d3c5a9b8e7f6d4c2a1b3e5d7c9f8a6b4c";
+        let lock = format!(
+            "GEM\n  remote: https://rubygems.org/\n  specs:\n    puma (6.4.2)\n      nio4r (~> 2.0)\n    rack (3.1.8)\n\nPLATFORMS\n  aarch64-linux\n  ruby\n\nDEPENDENCIES\n  puma\n\nCHECKSUMS\n{puma_sha_line}\n{SPIKE_RACK_SHA_LINE}\n\nBUNDLED WITH\n   2.7.2\n"
+        );
+        let (_tmp, root, installed, blobs, record) = fixture_318(gemfile, &lock).await;
+        let (r1, e1, _) =
+            unwrap_done(run_vendor_318(&root, &blobs, &installed, &record, false).await);
+        assert!(r1.success, "{:?}", r1.error);
+        assert!(e1.is_some());
+        let gemfile1 = tokio::fs::read(root.join(GEMFILE)).await.unwrap();
+        let lock1 = tokio::fs::read(root.join(GEMFILE_LOCK)).await.unwrap();
+
+        let (r2, e2, _) =
+            unwrap_done(run_vendor_318(&root, &blobs, &installed, &record, false).await);
+        assert!(r2.success, "{:?}", r2.error);
+        assert!(
+            e2.is_none(),
+            "puma's foreign sha line must not defeat the in-sync hot path"
+        );
+        assert_eq!(tokio::fs::read(root.join(GEMFILE)).await.unwrap(), gemfile1);
+        assert_eq!(
+            tokio::fs::read(root.join(GEMFILE_LOCK)).await.unwrap(),
+            lock1
+        );
+    }
+
+    /// [`plan_gemfile_edit`]'s refusal grammar, leg by leg — a wrong Gemfile
+    /// rewrite executes on every `bundle`, so each unsafe shape must name
+    /// its refusal (and the `gemspec` keyword must NOT block the Append).
+    #[test]
+    fn plan_gemfile_edit_refusal_grammar() {
+        let rel = copy_rel();
+
+        // (`GemfilePlan` is deliberately Debug-less, so refusals are pulled
+        // out via `.err()` rather than `unwrap_err`.)
+        let err = plan_gemfile_edit(
+            "gem \"rack\", \"~> 3.0\"\ngem \"rack\"\n",
+            "rack",
+            "3.2.6",
+            &rel,
+        )
+        .err()
+        .expect("duplicate declarations must refuse");
+        assert!(err.contains("more than once"), "{err}");
+
+        let err = plan_gemfile_edit("gem(\"rack\", \"~> 3.1\")\n", "rack", "3.2.6", &rel)
+            .err()
+            .expect("a parenthesized call must refuse");
+        assert!(err.contains("parenthesized"), "{err}");
+
+        let err = plan_gemfile_edit("gem \"rack\" if ENV[\"CI\"]\n", "rack", "3.2.6", &rel)
+            .err()
+            .expect("trailing non-option tokens must refuse");
+        assert!(err.contains("unexpected tokens"), "{err}");
+
+        let err = plan_gemfile_edit(
+            "gem \"rack\", \"~> 3.1\" unless ENV[\"CI\"]\n",
+            "rack",
+            "3.2.6",
+            &rel,
+        )
+        .err()
+        .expect("a conditional declaration must refuse");
+        assert!(err.contains("conditional"), "{err}");
+
+        for gemfile in [
+            "gem \"rack\", mypath: \"y\"\n",
+            "gem \"rack\", path: File.expand_path(\"x\")\n",
+        ] {
+            let err = plan_gemfile_edit(gemfile, "rack", "3.2.6", &rel)
+                .err()
+                .expect("path-shaped options must refuse");
+            assert!(err.contains("path:"), "{gemfile:?}: {err}");
+        }
+
+        // `gemspec name: "rack"` opens with the keyword but continues as an
+        // identifier — NOT a gem-call mention; the transitive Append stays
+        // available (the identifier-continuation guard must not false-fire).
+        let plan = plan_gemfile_edit(
+            "source \"https://rubygems.org\"\n\ngemspec name: \"rack\"\n",
+            "rack",
+            "3.2.6",
+            &rel,
+        )
+        .unwrap();
+        assert!(matches!(plan, GemfilePlan::Append { .. }));
+    }
+
+    /// [`devendored_gem_line`] fail-closed shapes: trailing `, ` (empty
+    /// opts) and a source-selecting trailing option must never reconstruct;
+    /// the plain and kept-options forms are the positive controls.
+    #[test]
+    fn devendored_gem_line_fail_closed_shapes() {
+        let rel = copy_rel();
+        let with_path = format!("gem \"rack\", \"3.2.6\", path: \"{rel}\"");
+        assert_eq!(
+            devendored_gem_line(&with_path, "rack", "3.2.6", &rel).as_deref(),
+            Some("gem \"rack\", \"3.2.6\"")
+        );
+        assert_eq!(
+            devendored_gem_line(&format!("{with_path}, require: false"), "rack", "3.2.6", &rel)
+                .as_deref(),
+            Some("gem \"rack\", \"3.2.6\", require: false")
+        );
+        assert_eq!(
+            devendored_gem_line(&format!("{with_path}, "), "rack", "3.2.6", &rel),
+            None,
+            "trailing `, ` (empty opts) is fail-closed"
+        );
+        assert_eq!(
+            devendored_gem_line(&format!("{with_path}, source: \"x\""), "rack", "3.2.6", &rel),
+            None,
+            "a source-selecting trailing option is fail-closed"
+        );
+    }
+
+    /// The Append splice on a Gemfile with NO trailing newline must insert
+    /// one before the managed block — never concatenate onto the last line.
+    #[tokio::test]
+    async fn append_inserts_newline_before_managed_block() {
+        let gemfile = "source \"https://rubygems.org\"\n\ngem \"puma\"";
+        let (_tmp, root, installed, blobs, record) = fixture(gemfile, LOCK_TRANSITIVE).await;
+
+        let (result, entry, _w) =
+            unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
+        assert!(result.success, "{:?}", result.error);
+        assert!(entry.is_some());
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
+            format!(
+                "source \"https://rubygems.org\"\n\ngem \"puma\"\n{MANAGED_OPEN}\ngem \"rack\", \"3.2.6\", path: \"{}\"\n{MANAGED_CLOSE}\n",
+                copy_rel()
+            ),
+            "a newline is inserted before the block — never line concatenation"
+        );
+    }
+
+    // ── ledger reconstruction fail-closed error legs (coverage-gap) ───────
+
+    /// Every non-vendor shape must yield `Err` — a wrong `Ok` here would let
+    /// repair fabricate wiring records for state vendor never wrote.
+    #[tokio::test]
+    async fn reconstruction_error_legs_fail_closed() {
+        let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_PINNED, LOCK_PINNED).await;
+        let (result, entry, _w) =
+            unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
+        assert!(result.success, "{:?}", result.error);
+        let entry = entry.expect("wired entry");
+
+        // Entry-side guards (before any file access).
+        let mut bad = entry.clone();
+        bad.base_purl = "pkg:npm/x@1.0.0".to_string();
+        let err = reconstruct_gem_wiring(&root, &bad).await.unwrap_err();
+        assert!(err.contains("not a gem purl"), "{err}");
+
+        let mut bad = entry.clone();
+        bad.base_purl = "pkg:gem/rack@3.2.6+x".to_string();
+        let err = reconstruct_gem_wiring(&root, &bad).await.unwrap_err();
+        assert!(err.contains("unsafe gem coordinates"), "{err}");
+
+        let mut bad = entry.clone();
+        bad.artifact.path = "vendor/forks/rack".to_string();
+        let err = reconstruct_gem_wiring(&root, &bad).await.unwrap_err();
+        assert!(err.contains("canonical vendored dir"), "{err}");
+
+        // Gemfile-side guards.
+        let gemfile_path = root.join(GEMFILE);
+        let wired = tokio::fs::read_to_string(&gemfile_path).await.unwrap();
+
+        tokio::fs::write(&gemfile_path, format!("{wired}gem \"rack\", \"3.2.6\"\n"))
+            .await
+            .unwrap();
+        let err = reconstruct_gem_wiring(&root, &entry).await.unwrap_err();
+        assert!(err.contains("more than once"), "{err}");
+
+        tokio::fs::write(&gemfile_path, GEMFILE_TRANSITIVE)
+            .await
+            .unwrap();
+        let err = reconstruct_gem_wiring(&root, &entry).await.unwrap_err();
+        assert!(err.contains("does not declare"), "{err}");
+
+        let wired_line = format!("gem \"rack\", \"3.2.6\", path: \"{}\"", copy_rel());
+        tokio::fs::write(
+            &gemfile_path,
+            wired.replace(&wired_line, &format!("  {wired_line}")),
+        )
+        .await
+        .unwrap();
+        let err = reconstruct_gem_wiring(&root, &entry).await.unwrap_err();
+        assert!(err.contains("indented"), "{err}");
+        tokio::fs::write(&gemfile_path, &wired).await.unwrap();
+
+        // Lock-side guard: a foreign line inside our PATH section.
+        let lock_path = root.join(GEMFILE_LOCK);
+        let wired_lock = tokio::fs::read_to_string(&lock_path).await.unwrap();
+        let tampered = wired_lock.replace(
+            "      base64 (>= 0.1.0)\n\nGEM",
+            "      base64 (>= 0.1.0)\n    extra (1.0)\n\nGEM",
+        );
+        assert_ne!(tampered, wired_lock, "fixture edit must hit our section");
+        tokio::fs::write(&lock_path, &tampered).await.unwrap();
+        let err = reconstruct_gem_wiring(&root, &entry).await.unwrap_err();
+        assert!(err.contains("not the shape"), "{err}");
+        tokio::fs::write(&lock_path, &wired_lock).await.unwrap();
+
+        // Control: the untampered pair still reconstructs.
+        assert!(reconstruct_gem_wiring(&root, &entry).await.is_ok());
+    }
+
+    /// The managed-fence line must be EXACTLY the form vendor writes —
+    /// trailing options on it are not vendor's output.
+    #[tokio::test]
+    async fn reconstruction_managed_block_tampered_line_fails_closed() {
+        let (_tmp, root, installed, blobs, record) =
+            fixture(GEMFILE_TRANSITIVE, LOCK_TRANSITIVE).await;
+        let (result, entry, _w) =
+            unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
+        assert!(result.success, "{:?}", result.error);
+        let entry = entry.expect("wired entry");
+
+        let gemfile_path = root.join(GEMFILE);
+        let wired = tokio::fs::read_to_string(&gemfile_path).await.unwrap();
+        let needle = format!("path: \"{}\"", copy_rel());
+        let tampered = wired.replace(&needle, &format!("{needle}, require: false"));
+        assert_ne!(tampered, wired);
+        tokio::fs::write(&gemfile_path, &tampered).await.unwrap();
+
+        let err = reconstruct_gem_wiring(&root, &entry).await.unwrap_err();
+        assert!(err.contains("not the form vendor writes"), "{err}");
+    }
+
+    /// A CHECKSUMS line that names the gem but breaks the entry grammar
+    /// fails reconstruction closed.
+    #[tokio::test]
+    async fn reconstruction_unparseable_checksum_line_fails_closed() {
+        let lock = format!(
+            "GEM\n  remote: https://rubygems.org/\n  specs:\n    puma (6.4.2)\n      nio4r (~> 2.0)\n    rack (3.2.6)\n      base64 (>= 0.1.0)\n\nPLATFORMS\n  arm64-darwin-23\n  ruby\n\nDEPENDENCIES\n  puma\n  rack (= 3.2.6)\n\nCHECKSUMS\n  puma (6.4.2) sha256={}\n  rack (3.2.6) sha256={}\n\nBUNDLED WITH\n   2.5.22\n",
+            "a".repeat(64),
+            "b".repeat(64),
+        );
+        let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_PINNED, &lock).await;
+        let (result, entry, _w) =
+            unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
+        assert!(result.success, "{:?}", result.error);
+        let entry = entry.expect("wired entry");
+
+        let lock_path = root.join(GEMFILE_LOCK);
+        let wired = tokio::fs::read_to_string(&lock_path).await.unwrap();
+        let tampered = wired.replace("\n  rack (3.2.6)\n", "\n  rack (3.2.6)x\n");
+        assert_ne!(tampered, wired, "fixture edit must hit the bare line");
+        tokio::fs::write(&lock_path, &tampered).await.unwrap();
+
+        let err = reconstruct_gem_wiring(&root, &entry).await.unwrap_err();
+        assert!(err.contains("not parseable"), "{err}");
+    }
+
+    /// [`gemspec_declares_extensions`] alternate operators and the
+    /// [`gemspec_attr_rhs`] line-start `==` comparison (not an assignment).
+    #[test]
+    fn gemspec_heuristic_operator_variants() {
+        for decl in [
+            "s.extensions << \"ext/e/extconf.rb\"",
+            "s.extensions += [\"ext/e/extconf.rb\"]",
+            "s.extensions.push(\"ext/e/extconf.rb\")",
+            "s.extensions.concat([\"ext/e/extconf.rb\"])",
+        ] {
+            assert!(
+                gemspec_declares_extensions(&format!(
+                    "Gem::Specification.new do |s|\n  {decl}\nend\n"
+                )),
+                "{decl} must count as declaring extensions"
+            );
+        }
+        assert!(
+            !gemspec_declares_extensions("raise if s.extensions == [\"e\"]\n"),
+            "a `==` comparison is not a declaration"
+        );
+        assert!(
+            !gemspec_declares_extensions("s.extensions_dir = \"x\"\n"),
+            "a longer identifier is not the attribute"
+        );
+        // A line-start `==` comparison is not an assignment for the
+        // required-attribute bar either.
+        assert_eq!(
+            gemspec_missing_required_attrs("s.summary = \"x\"\ns.authors == [\"a\"]\n"),
+            vec!["authors"]
+        );
+    }
 }

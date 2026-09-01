@@ -1002,6 +1002,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         seed_manifest_entry(tmp.path(), "pkg:cargo/foo@1.0.0", "../../escape");
         seed_corrupt_ledger(tmp.path());
+        // Seed the dir the traversal uuid actually resolves to if a bypassed
+        // guard builds `.socket/vendor/cargo/../../escape` (-> `.socket/
+        // escape`), so the probe finds an EXISTING dir and fabricates the
+        // purl — plus the literal spelling for a bypass that keeps the uuid
+        // as a lone path component.
+        std::fs::create_dir_all(tmp.path().join(".socket/escape")).unwrap();
         std::fs::create_dir_all(tmp.path().join(".socket/vendor/cargo/escape")).unwrap();
 
         assert!(supplement_in(tmp.path(), &[]).await.is_empty());
@@ -1089,6 +1095,320 @@ mod tests {
                 "GHSA-aaaa-aaaa-aaaa".to_string(),
                 "GHSA-zzzz-zzzz-zzzz".to_string(),
             ],
+        );
+    }
+
+    // ---- unsupported_layout_warnings -----------------------------------
+
+    #[test]
+    fn unsupported_layout_warnings_forwards_unknown_codes_verbatim() {
+        use socket_patch_core::vendor::lock_inventory::UnsupportedNpmLayout;
+
+        // Forward-compat contract: a refusal code this match doesn't know
+        // yet must surface verbatim — code AND the probe's own detail —
+        // rather than being swallowed back into silence.
+        let unknown = UnsupportedNpmLayout {
+            code: "vendor_future_layout_unsupported",
+            detail: "probe detail text".to_string(),
+        };
+        assert_eq!(
+            unsupported_layout_warnings(std::slice::from_ref(&unknown)),
+            vec![(
+                "vendor_future_layout_unsupported".to_string(),
+                "probe detail text".to_string(),
+            )],
+        );
+
+        // Contrast: a KNOWN code is rewritten — renamed to apply's refusal
+        // errorCode and scan-phrased, not the probe's vendor-phrased text.
+        let known = UnsupportedNpmLayout {
+            code: "vendor_yarn_berry_unsupported",
+            detail: "probe detail text".to_string(),
+        };
+        let rewritten = unsupported_layout_warnings(std::slice::from_ref(&known));
+        assert_eq!(rewritten.len(), 1);
+        assert_eq!(rewritten[0].0, "yarn_pnp_unsupported");
+        assert_ne!(rewritten[0].1, "probe detail text");
+    }
+
+    // ---- candidate_supersedes (merge-coverage rung) ----------------------
+    // Production publishes no merged patches yet, so this rung has never run
+    // outside these tests; these pin its polarity for the day one ships.
+
+    /// A batch-shaped patch with explicit advisory lists and NO publish
+    /// date, so only the severity and merge-coverage rungs can decide.
+    fn info_with_advisories(
+        uuid: &str,
+        severity: Option<&str>,
+        ghsas: &[&str],
+        cves: &[&str],
+    ) -> BatchPatchInfo {
+        BatchPatchInfo {
+            uuid: uuid.to_string(),
+            purl: "pkg:npm/foo@1.0".to_string(),
+            tier: "free".to_string(),
+            cve_ids: cves.iter().map(|s| (*s).to_string()).collect(),
+            ghsa_ids: ghsas.iter().map(|s| (*s).to_string()).collect(),
+            severity: severity.map(str::to_string),
+            title: String::new(),
+            published_at: None,
+        }
+    }
+
+    #[test]
+    fn candidate_supersedes_on_broader_ghsa_merge_coverage() {
+        // Same severity, no dates: only the advisory count separates them.
+        // A patch folding in MORE GHSAs is broader and genuinely supersedes.
+        let merged = info_with_advisories(
+            "uuid-merged",
+            Some("high"),
+            &["GHSA-1111-1111-1111", "GHSA-2222-2222-2222"],
+            &[],
+        );
+        let single =
+            info_with_advisories("uuid-single", Some("high"), &["GHSA-3333-3333-3333"], &[]);
+        assert!(
+            candidate_supersedes(&merged, &single),
+            "broader merge coverage is a genuine supersede"
+        );
+        // Swapped: a NARROWER candidate never supersedes. Only reachable by
+        // direct call — via detect_updates a lower-coverage candidate can
+        // never win `min_by` — but the polarity of the `>` at the coverage
+        // return must be pinned somewhere.
+        assert!(
+            !candidate_supersedes(&single, &merged),
+            "narrower coverage must never supersede"
+        );
+    }
+
+    #[test]
+    fn candidate_supersedes_cve_aliases_do_not_inflate_ghsa_coverage() {
+        // Both sides name a GHSA, so the CVE lists are aliases and must not
+        // count: 1 == 1 advisory, no date on either side -> not a supersede
+        // in either direction (falls through coverage to the strict-date
+        // rung, which requires two REAL dates).
+        let candidate = info_with_advisories(
+            "uuid-cand",
+            Some("high"),
+            &["GHSA-xxxx-xxxx-xxxx"],
+            &["CVE-2026-1", "CVE-2026-2"],
+        );
+        let applied = info_with_advisories(
+            "uuid-appl",
+            Some("high"),
+            &["GHSA-yyyy-yyyy-yyyy"],
+            &["CVE-2026-3"],
+        );
+        assert!(!candidate_supersedes(&candidate, &applied));
+        assert!(!candidate_supersedes(&applied, &candidate));
+    }
+
+    #[test]
+    fn detect_updates_flags_merged_patch_superseding_applied_single() {
+        // End-to-end through detect_updates: the manifest holds the
+        // single-advisory patch; the batch offers it alongside a merged
+        // sibling (2 GHSAs, same severity, no dates). The merged patch wins
+        // the ranking on coverage AND genuinely supersedes — the module doc
+        // promises this works the day production ships a merged patch.
+        let m = manifest_with(&[("pkg:npm/foo@1.0", "uuid-single")]);
+        let pkgs = vec![BatchPackagePatches {
+            purl: "pkg:npm/foo@1.0".to_string(),
+            patches: vec![
+                info_with_advisories("uuid-single", Some("high"), &["GHSA-3333-3333-3333"], &[]),
+                info_with_advisories(
+                    "uuid-merged",
+                    Some("high"),
+                    &["GHSA-1111-1111-1111", "GHSA-2222-2222-2222"],
+                    &[],
+                ),
+            ],
+        }];
+        let updates = detect_updates(Some(&m), &pkgs);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].old_uuid, "uuid-single");
+        assert_eq!(updates[0].new_uuid, "uuid-merged");
+    }
+
+    // ---- preverify_vendor_baselines --------------------------------------
+    // The HashMismatch positive path is covered end-to-end by
+    // tests/scan_vendor_e2e.rs; these pin the three SKIP shapes: the two
+    // pre-fetch skips (lockfile-only, no crawled counterpart) and the
+    // per-file new-file skip after the fetch.
+
+    fn search_result(uuid: &str, purl: &str) -> PatchSearchResult {
+        PatchSearchResult {
+            uuid: uuid.to_string(),
+            purl: purl.to_string(),
+            published_at: String::new(),
+            description: String::new(),
+            license: String::new(),
+            tier: "free".to_string(),
+            vulnerabilities: std::collections::HashMap::new(),
+        }
+    }
+
+    fn crawled_pkg(
+        name: &str,
+        purl: &str,
+        path: std::path::PathBuf,
+    ) -> socket_patch_core::crawlers::types::CrawledPackage {
+        socket_patch_core::crawlers::types::CrawledPackage {
+            name: name.to_string(),
+            version: "1.0.0".to_string(),
+            namespace: None,
+            purl: purl.to_string(),
+            path,
+        }
+    }
+
+    fn api_client_for(uri: &str) -> socket_patch_core::api::client::ApiClient {
+        socket_patch_core::api::client::ApiClient::new(
+            socket_patch_core::api::client::ApiClientOptions {
+                api_url: uri.to_string(),
+                api_token: None,
+                use_public_proxy: true,
+                org_slug: None,
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn preverify_skips_lockfile_only_and_uncrawled_patches_without_fetching() {
+        // A server with NO mounted mocks: any fetch would still degrade to
+        // "skip" (404 -> Ok(None)), so the real assertion is the request
+        // log — both skips fire BEFORE the detail fetch.
+        let mock = wiremock::MockServer::start().await;
+        let client = api_client_for(&mock.uri());
+
+        let selected = vec![
+            // (a) lockfile-only: no installed bytes to compare. The patch
+            // purl is API-encoded; the lockfile-only set holds the
+            // crawler's literal spelling — the normalize bridge must match
+            // them.
+            search_result("uuid-lockonly", "pkg:npm/%40scope/lockonly@1.0.0"),
+            // (b) no crawled counterpart at all.
+            search_result("uuid-ghost", "pkg:npm/ghost@1.0.0"),
+        ];
+        let crawled = vec![
+            // The lockonly purl HAS a crawled counterpart — production
+            // passes `filtered_crawled`, which CONTAINS the fabricated
+            // lockfile-only supplement entries — so the lockfile-only guard
+            // is the deciding branch: were it (or its normalize bridge)
+            // broken, the find below would succeed and the detail fetch
+            // would fire, tripping the request-log assertion.
+            crawled_pkg(
+                "lockonly",
+                "pkg:npm/@scope/lockonly@1.0.0",
+                std::path::PathBuf::from("/nonexistent"),
+            ),
+            crawled_pkg(
+                "other",
+                "pkg:npm/other@1.0.0",
+                std::path::PathBuf::from("/nonexistent"),
+            ),
+        ];
+        let lockfile_only: HashSet<String> =
+            std::iter::once("pkg:npm/@scope/lockonly@1.0.0".to_string()).collect();
+
+        let mismatched =
+            preverify_vendor_baselines(&client, None, &selected, &crawled, &lockfile_only).await;
+        assert!(mismatched.is_empty());
+        assert!(
+            mock.received_requests().await.unwrap().is_empty(),
+            "both skip shapes must decide before any detail fetch"
+        );
+    }
+
+    /// Mount `GET /patch/view/<uuid>` (the public-proxy detail route) with
+    /// the given `files` map; every other `PatchResponse` field is filler.
+    async fn mount_patch_view(mock: &wiremock::MockServer, uuid: &str, files: serde_json::Value) {
+        use wiremock::matchers::{method, path as wm_path};
+        wiremock::Mock::given(method("GET"))
+            .and(wm_path(format!("/patch/view/{uuid}")))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({
+                    "uuid": uuid,
+                    "purl": "pkg:npm/newfile@1.0.0",
+                    "publishedAt": "2026-01-01T00:00:00Z",
+                    "files": files,
+                    "vulnerabilities": {},
+                    "description": "",
+                    "license": "MIT",
+                    "tier": "free",
+                }),
+            ))
+            .mount(mock)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn preverify_ignores_new_file_entries_with_no_baseline() {
+        // A fetched detail file with NO beforeHash is a new file: there is
+        // no baseline to compare, so it must not flag a mismatch — even
+        // though nothing exists at its would-be path. (This is the live
+        // wire shape: new-file patch entries omit beforeHash entirely.)
+        let mock = wiremock::MockServer::start().await;
+        mount_patch_view(
+            &mock,
+            "u3",
+            serde_json::json!({
+                "package/added.js": { "afterHash": "a".repeat(64) }
+            }),
+        )
+        .await;
+        let client = api_client_for(&mock.uri());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let pkg_dir = tmp.path().join("node_modules/newfile");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        let crawled = vec![crawled_pkg("newfile", "pkg:npm/newfile@1.0.0", pkg_dir)];
+        let selected = vec![search_result("u3", "pkg:npm/newfile@1.0.0")];
+
+        let mismatched =
+            preverify_vendor_baselines(&client, None, &selected, &crawled, &HashSet::new()).await;
+        assert!(
+            mismatched.is_empty(),
+            "a new-file-only patch never annotates a baseline mismatch"
+        );
+        // Unlike the pre-fetch skips, this one DID fetch the detail.
+        assert_eq!(mock.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn preverify_new_file_skip_is_per_file_not_per_patch() {
+        // One patch, two files: a baseline-less new file AND a real
+        // beforeHash entry whose installed bytes differ. The new-file skip
+        // is a per-file `continue`, so the sibling mismatch must still
+        // flag the patch uuid.
+        let mock = wiremock::MockServer::start().await;
+        mount_patch_view(
+            &mock,
+            "u4",
+            serde_json::json!({
+                "package/added.js": { "afterHash": "a".repeat(64) },
+                "package/index.js": {
+                    "beforeHash": "b".repeat(64),
+                    "afterHash": "c".repeat(64),
+                },
+            }),
+        )
+        .await;
+        let client = api_client_for(&mock.uri());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let pkg_dir = tmp.path().join("node_modules/newfile");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        // Installed bytes hash to neither beforeHash nor afterHash.
+        std::fs::write(pkg_dir.join("index.js"), b"installed bytes\n").unwrap();
+        let crawled = vec![crawled_pkg("newfile", "pkg:npm/newfile@1.0.0", pkg_dir)];
+        let selected = vec![search_result("u4", "pkg:npm/newfile@1.0.0")];
+
+        let mismatched =
+            preverify_vendor_baselines(&client, None, &selected, &crawled, &HashSet::new()).await;
+        assert_eq!(
+            mismatched,
+            std::iter::once("u4".to_string()).collect::<HashSet<_>>(),
+            "the new-file skip must not swallow a sibling file's mismatch"
         );
     }
 

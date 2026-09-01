@@ -490,6 +490,187 @@ pub(crate) async fn revert_lock_fragment_splice(
 mod tests {
     use super::*;
 
+    use crate::hash::git_sha256::compute_git_sha256_from_bytes;
+
+    /// A one-entry `pkg.jar` (`lib/a.js` = `b"patched\n"`) written into `dir`,
+    /// plus the files map whose `afterHash` matches it — the in-sync baseline
+    /// each `zip_matches_after_hashes` case perturbs.
+    fn in_sync_jar_fixture(
+        dir: &Path,
+    ) -> (std::path::PathBuf, HashMap<String, PatchFileInfo>, Vec<u8>) {
+        let zip_bytes = write_zip_entries(&[("lib/a.js".to_string(), b"patched\n".to_vec(), 0o644)])
+            .expect("fixture zip");
+        let jar = dir.join("pkg.jar");
+        std::fs::write(&jar, &zip_bytes).unwrap();
+        let files = HashMap::from([(
+            "lib/a.js".to_string(),
+            PatchFileInfo {
+                before_hash: "before".to_string(),
+                after_hash: compute_git_sha256_from_bytes(b"patched\n"),
+            },
+        )]);
+        (jar, files, zip_bytes)
+    }
+
+    /// Control for the negative cases below: an archive whose every patched
+    /// entry hashes to its `afterHash` reads as in-sync.
+    #[tokio::test]
+    async fn zip_matches_after_hashes_accepts_in_sync_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let (jar, files, _) = in_sync_jar_fixture(dir.path());
+        assert!(
+            zip_matches_after_hashes(&jar, &files).await,
+            "an archive matching every afterHash must read as in-sync"
+        );
+    }
+
+    /// Bytes that aren't a zip archive at all (a truncated or clobbered
+    /// `.jar` / `.nupkg`) must read as out-of-sync, not error or panic.
+    #[tokio::test]
+    async fn zip_matches_after_hashes_rejects_non_zip_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (jar, files, _) = in_sync_jar_fixture(dir.path());
+        std::fs::write(&jar, b"not a zip archive").unwrap();
+        assert!(
+            !zip_matches_after_hashes(&jar, &files).await,
+            "non-zip bytes must read as out-of-sync"
+        );
+    }
+
+    /// SECURITY: a manifest key that escapes the package dir must read as
+    /// out-of-sync BEFORE any lookup — even when the archive itself carries
+    /// a literal `../evil.js` entry whose content hashes to the afterHash
+    /// (so without the guard the probe would say in-sync).
+    #[tokio::test]
+    async fn zip_matches_after_hashes_rejects_escaping_manifest_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let zip_bytes =
+            write_zip_entries(&[("../evil.js".to_string(), b"patched\n".to_vec(), 0o644)])
+                .expect("fixture zip");
+        let jar = dir.path().join("pkg.jar");
+        std::fs::write(&jar, &zip_bytes).unwrap();
+        let files = HashMap::from([(
+            "../evil.js".to_string(),
+            PatchFileInfo {
+                before_hash: "before".to_string(),
+                after_hash: compute_git_sha256_from_bytes(b"patched\n"),
+            },
+        )]);
+        assert!(
+            !zip_matches_after_hashes(&jar, &files).await,
+            "a manifest key escaping the package dir must read as out-of-sync"
+        );
+    }
+
+    /// A patched file the archive no longer contains must read as
+    /// out-of-sync.
+    #[tokio::test]
+    async fn zip_matches_after_hashes_rejects_missing_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let (jar, _, _) = in_sync_jar_fixture(dir.path());
+        let files = HashMap::from([(
+            "lib/missing.js".to_string(),
+            PatchFileInfo {
+                before_hash: "before".to_string(),
+                after_hash: compute_git_sha256_from_bytes(b"patched\n"),
+            },
+        )]);
+        assert!(
+            !zip_matches_after_hashes(&jar, &files).await,
+            "an entry absent from the archive must read as out-of-sync"
+        );
+    }
+
+    /// A corrupted entry payload (deflate/CRC read error behind an intact
+    /// central directory, so `by_name` still succeeds) must read as
+    /// out-of-sync instead of erroring.
+    #[tokio::test]
+    async fn zip_matches_after_hashes_rejects_corrupt_entry_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let (jar, files, mut zip_bytes) = in_sync_jar_fixture(dir.path());
+        // The byte just before the central-directory signature is the last
+        // byte of the (sole) entry's deflate payload — ZipWriter over a
+        // Cursor seeks back to patch the local header, so there is no data
+        // descriptor in between. Flipping it corrupts the stream/CRC while
+        // the central directory stays intact.
+        let cd_offset = zip_bytes
+            .windows(4)
+            .position(|w| w == [0x50, 0x4b, 0x01, 0x02])
+            .expect("central directory signature");
+        zip_bytes[cd_offset - 1] ^= 0xff;
+        std::fs::write(&jar, &zip_bytes).unwrap();
+        assert!(
+            !zip_matches_after_hashes(&jar, &files).await,
+            "a corrupt entry payload must read as out-of-sync"
+        );
+    }
+
+    /// An entry whose content no longer hashes to its `afterHash` must read
+    /// as out-of-sync.
+    #[tokio::test]
+    async fn zip_matches_after_hashes_rejects_after_hash_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let (jar, _, _) = in_sync_jar_fixture(dir.path());
+        let files = HashMap::from([(
+            "lib/a.js".to_string(),
+            PatchFileInfo {
+                before_hash: "before".to_string(),
+                after_hash: "0".repeat(64),
+            },
+        )]);
+        assert!(
+            !zip_matches_after_hashes(&jar, &files).await,
+            "a content-hash mismatch must read as out-of-sync"
+        );
+    }
+
+    /// Control for the escape test below: a copy whose every patched file
+    /// hashes to its `afterHash` reads as in-sync.
+    #[tokio::test]
+    async fn copy_matches_after_hashes_accepts_in_sync_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let copy = dir.path().join("copy");
+        std::fs::create_dir_all(copy.join("lib")).unwrap();
+        std::fs::write(copy.join("lib/a.js"), b"patched\n").unwrap();
+        let files = HashMap::from([(
+            "lib/a.js".to_string(),
+            PatchFileInfo {
+                before_hash: "before".to_string(),
+                after_hash: compute_git_sha256_from_bytes(b"patched\n"),
+            },
+        )]);
+        assert!(
+            copy_matches_after_hashes(&copy, &files).await,
+            "a copy matching every afterHash must read as in-sync"
+        );
+    }
+
+    /// SECURITY: a manifest key that escapes the copy dir must read as
+    /// out-of-sync BEFORE any hashing — even when a real file at the escaped
+    /// location hashes to the afterHash (so without the guard the probe
+    /// would resolve outside the copy dir and say in-sync).
+    #[tokio::test]
+    async fn copy_matches_after_hashes_refuses_escaping_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let copy = dir.path().join("copy");
+        std::fs::create_dir_all(copy.join("lib")).unwrap();
+        std::fs::write(copy.join("lib/a.js"), b"patched\n").unwrap();
+        // A real, afterHash-matching file OUTSIDE the copy dir at the exact
+        // spot `copy.join("../evil.js")` would resolve to.
+        std::fs::write(dir.path().join("evil.js"), b"patched\n").unwrap();
+        let files = HashMap::from([(
+            "../evil.js".to_string(),
+            PatchFileInfo {
+                before_hash: "before".to_string(),
+                after_hash: compute_git_sha256_from_bytes(b"patched\n"),
+            },
+        )]);
+        assert!(
+            !copy_matches_after_hashes(&copy, &files).await,
+            "a manifest key escaping the copy dir must read as out-of-sync"
+        );
+    }
+
     #[cfg(unix)]
     fn mkfifo(path: &Path) {
         use std::os::unix::ffi::OsStrExt;
@@ -699,6 +880,163 @@ mod tests {
         assert_eq!(
             mode, 0o600,
             "revert must preserve the lock file's permission bits"
+        );
+    }
+
+    /// A lock file that opens as a regular file but isn't valid UTF-8 (a
+    /// stray Latin-1 byte in a poetry.lock/pdm.lock) must fail the revert
+    /// loudly with `cannot read <lock>` — and leave the bytes on disk
+    /// untouched — rather than proceed on garbled text.
+    #[tokio::test]
+    async fn revert_lock_fragment_splice_fails_on_non_utf8_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("poetry.lock");
+        let lock_bytes: &[u8] = b"alpha\nNEW-FRAGMENT\n\xff\xfe\n";
+        std::fs::write(&lock, lock_bytes).unwrap();
+
+        let mut entry: VendorEntry = serde_json::from_value(serde_json::json!({
+            "ecosystem": "pypi",
+            "basePurl": "pkg:pypi/six@1.16.0",
+            "uuid": "u",
+            "artifact": {"path": ".socket/vendor/pypi/u/x.whl"},
+            "wiring": [],
+        }))
+        .unwrap();
+        entry.wiring = vec![record(
+            "poetry.lock",
+            "poetry_lock_package",
+            WiringAction::Rewritten,
+            "six",
+            Some("OLD-FRAGMENT".into()),
+            "NEW-FRAGMENT".into(),
+        )];
+
+        let outcome = revert_lock_fragment_splice(
+            &entry,
+            dir.path(),
+            false,
+            "poetry.lock",
+            "poetry_lock_package",
+            "poetry",
+        )
+        .await;
+        assert!(!outcome.success, "a non-UTF-8 lock must fail the revert");
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("cannot read poetry.lock")),
+            "{:?}",
+            outcome.error
+        );
+        assert!(
+            !outcome.kept_artifact,
+            "kept_artifact is never set on failure"
+        );
+        assert_eq!(
+            std::fs::read(&lock).unwrap(),
+            lock_bytes,
+            "a failed revert must leave the lock bytes untouched"
+        );
+    }
+
+    /// When the final atomic write fails (read-only parent dir — the
+    /// documented 'atomic write needs writable parent' class), the revert
+    /// must fail with `cannot write <lock>`, keep `kept_artifact == false`
+    /// (the mod.rs contract), and — the reason lines 462-467 hand-build the
+    /// outcome instead of calling `RevertOutcome::failed` — carry the drift
+    /// warnings accumulated before the write into the failed outcome.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn revert_lock_fragment_splice_write_failure_keeps_warnings() {
+        use std::os::unix::fs::PermissionsExt;
+        // root ignores permission bits, so the read-only dir wouldn't fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("poetry.lock");
+        tokio::fs::write(&lock, "alpha\nNEW-FRAGMENT\nomega\n")
+            .await
+            .unwrap();
+
+        let mut entry: VendorEntry = serde_json::from_value(serde_json::json!({
+            "ecosystem": "pypi",
+            "basePurl": "pkg:pypi/six@1.16.0",
+            "uuid": "u",
+            "artifact": {"path": ".socket/vendor/pypi/u/x.whl"},
+            "wiring": [],
+        }))
+        .unwrap();
+        entry.wiring = vec![
+            // Allowlist-skipped record: seeds a vendor_lock_entry_drifted
+            // warning that must survive the failed write below.
+            record(
+                "other.lock",
+                "poetry_lock_package",
+                WiringAction::Rewritten,
+                "six",
+                Some("OLD".into()),
+                "NEW".into(),
+            ),
+            record(
+                "poetry.lock",
+                "poetry_lock_package",
+                WiringAction::Rewritten,
+                "six",
+                Some("OLD-FRAGMENT".into()),
+                "NEW-FRAGMENT".into(),
+            ),
+        ];
+
+        // Read-only parent: the atomic write stages its temp file in the
+        // parent dir, so the write fails EACCES while the lock itself stays
+        // readable.
+        let mut dir_perms = std::fs::metadata(dir.path()).unwrap().permissions();
+        dir_perms.set_mode(0o555);
+        std::fs::set_permissions(dir.path(), dir_perms).unwrap();
+
+        let outcome = revert_lock_fragment_splice(
+            &entry,
+            dir.path(),
+            false,
+            "poetry.lock",
+            "poetry_lock_package",
+            "poetry",
+        )
+        .await;
+
+        // Restore before asserting so tempdir cleanup succeeds even on a
+        // failed assertion.
+        let mut dir_perms = std::fs::metadata(dir.path()).unwrap().permissions();
+        dir_perms.set_mode(0o755);
+        std::fs::set_permissions(dir.path(), dir_perms).unwrap();
+
+        assert!(!outcome.success, "a failed write must fail the revert");
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("cannot write poetry.lock")),
+            "{:?}",
+            outcome.error
+        );
+        assert!(
+            !outcome.kept_artifact,
+            "kept_artifact is never set on failure"
+        );
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_lock_entry_drifted" && w.detail.contains("other.lock")),
+            "warnings accumulated before the failed write must survive it: {:?}",
+            outcome.warnings
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(&lock).await.unwrap(),
+            "alpha\nNEW-FRAGMENT\nomega\n",
+            "a failed revert must leave the lock content untouched"
         );
     }
 }

@@ -1497,6 +1497,9 @@ left-pad@^1.3.0:
     #[tokio::test]
     async fn lock_write_failure_unwinds_the_staged_artifact() {
         use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return; // chmod is advisory for root — the failure never fires
+        }
         let fx = fixture_with_lock(Y2_BEFORE).await;
         // Pre-create the eco level so staging only creates the uuid dir.
         tokio::fs::create_dir_all(fx.root().join(".socket/vendor/npm"))
@@ -2016,5 +2019,548 @@ left-pad@^1.3.0:
         // Field reads.
         assert_eq!(classic_field(&blocks[0].lines, "version"), Some("1.3.0"));
         assert!(classic_field(&blocks[1].lines, "resolved").is_none());
+    }
+
+    /// A second canonical uuid, distinct from [`UUID`], for re-vendor tests.
+    const UUID_B: &str = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
+
+    /// The mainline production shape: the vendored package HAS a
+    /// dependencies sub-map and the patch does NOT rewrite package.json
+    /// (`staged_pkg_json` is `None`). The rewrite must pass the
+    /// `dependencies:` header and its 4-space entries through verbatim —
+    /// dropping (or recomputing) them would change what installs — and the
+    /// revert must round-trip byte-for-byte.
+    #[tokio::test]
+    async fn deps_submap_preserved_verbatim_without_manifest_patch() {
+        let submap = "  dependencies:\n    wow \"^1.0.0\"\n";
+        let lock = format!("{Y2_BEFORE}{submap}");
+        let fx = fixture_with_lock(&lock).await;
+        let (result, entry, warnings) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| w.code == "vendor_dep_manifest_rewritten"),
+            "no manifest patch, no recompute warning: {warnings:?}"
+        );
+
+        // Byte-exact: the spike after-lock with the sub-map still attached
+        // to the block, untouched (resolved repointed, integrity swapped).
+        let (sha1, sri) = fx.packed_hashes().await;
+        assert_eq!(
+            fx.lock_text().await,
+            format!("{}{submap}", spike_after(Y2_AFTER, &sha1, &sri)),
+            "sub-map lines must survive byte-for-byte"
+        );
+
+        let outcome = revert_yarn_classic(&entry.unwrap(), fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        assert_eq!(
+            tokio::fs::read(fx.lock_path()).await.unwrap(),
+            fx.lock_bytes,
+            "lock (sub-map included) restored byte-for-byte"
+        );
+    }
+
+    /// A `file:`-TARBALL range (unlike a `file:` directory) resolves from a
+    /// packable tarball, so it must fall through the LinkSkip gate and be
+    /// rewritten — a flipped `is_tarball_path` polarity would silently skip
+    /// real tarball deps.
+    #[tokio::test]
+    async fn file_tarball_range_block_is_rewritten_not_skipped() {
+        let lock = r#"# yarn lockfile v1
+
+"left-pad@file:./old/left-pad-1.3.0.tgz":
+  version "1.3.0"
+  resolved "file:./old/left-pad-1.3.0.tgz#0123456789abcdef0123456789abcdef01234567"
+"#;
+        let fx = fixture_with_lock(lock).await;
+        let (result, entry, warnings) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        assert!(
+            !warnings.iter().any(|w| w.code == "vendor_link_entry_skipped"),
+            "a file: TARBALL range is rewritable, not a link-skip: {warnings:?}"
+        );
+        let entry = entry.expect("success carries a ledger entry");
+        assert_eq!(entry.wiring.len(), 1);
+        assert_eq!(
+            entry.wiring[0].key.as_deref(),
+            Some("\"left-pad@file:./old/left-pad-1.3.0.tgz\""),
+            "verbatim quoted key line (no colon)"
+        );
+
+        let (sha1, sri) = fx.packed_hashes().await;
+        let text = fx.lock_text().await;
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines[4],
+            format!("  resolved \"file:./.socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz#{sha1}\""),
+            "resolved repointed at the vendored tarball"
+        );
+        assert_eq!(
+            lines[5],
+            format!("  integrity {sri}"),
+            "integrity line added so both hash checks are enforced"
+        );
+    }
+
+    /// `--preserve-state` (`keep_artifact`): the wiring restore runs
+    /// unchanged, the artifact dir stays behind, and `kept_artifact` stays
+    /// false (reserved for drift-keeps).
+    #[tokio::test]
+    async fn preserve_state_revert_keeps_artifact_and_restores_wiring() {
+        let fx = fixture_with_lock(Y2_BEFORE).await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+
+        let outcome = revert_yarn_classic_opts(
+            &entry,
+            fx.root(),
+            RevertOpts {
+                dry_run: false,
+                keep_artifact: true,
+            },
+        )
+        .await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        assert!(
+            !outcome.kept_artifact,
+            "kept_artifact stays reserved for drift-keeps"
+        );
+        assert_eq!(
+            tokio::fs::read(fx.lock_path()).await.unwrap(),
+            fx.lock_bytes,
+            "wiring restored byte-for-byte"
+        );
+        assert!(
+            fx.tgz_path().exists(),
+            "the artifact dir must survive a preserve-state revert"
+        );
+    }
+
+    /// Under `keep_artifact` the deletion is skipped, so the still-wired
+    /// probe that exists only to protect it must be skipped too: an
+    /// unrecorded hand-copied block that still resolves through the artifact
+    /// must NOT block the revert, while the recorded block is still
+    /// restored.
+    #[tokio::test]
+    async fn preserve_state_revert_skips_the_still_wired_probe() {
+        let fx = fixture_with_lock(Y2_BEFORE).await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+
+        // Hand-copy the vendored block under a key the wiring never named.
+        let (sha1, sri) = fx.packed_hashes().await;
+        let extra = format!(
+            "\nleft-pad@^1.2.0:\n  version \"1.3.0\"\n  resolved \
+             \"file:./.socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz#{sha1}\"\n  \
+             integrity {sri}\n"
+        );
+        let text = format!("{}{extra}", fx.lock_text().await);
+        tokio::fs::write(fx.lock_path(), text).await.unwrap();
+
+        let outcome = revert_yarn_classic_opts(
+            &entry,
+            fx.root(),
+            RevertOpts {
+                dry_run: false,
+                keep_artifact: true,
+            },
+        )
+        .await;
+        assert!(
+            outcome.success,
+            "the probe protects only the skipped deletion: {:?}",
+            outcome.error
+        );
+        assert!(
+            !outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_lock_still_wired_revert_blocked"),
+            "{:?}",
+            outcome.warnings
+        );
+        let after = fx.lock_text().await;
+        assert!(
+            after.contains("resolved \"https://registry.yarnpkg.com/left-pad/"),
+            "recorded block still restored: {after}"
+        );
+        assert!(
+            after.contains(&extra),
+            "the unrecorded block is left alone: {after}"
+        );
+        assert!(fx.tgz_path().exists(), "artifact kept");
+    }
+
+    /// Direct matrix over [`revert_recorded_block`]'s degradation arms
+    /// (shared with the berry backend): every poisoned-or-newer-ledger
+    /// record must degrade to a `vendor_lock_entry_drifted` warning and
+    /// leave the text byte-untouched, the converged-under-a-different-key
+    /// arm must stay silent, and (control) a well-formed record restores.
+    #[test]
+    fn revert_recorded_block_degradations_leave_text_alone() {
+        fn wrec(key: Option<&str>, kind: &str, original: Option<Value>) -> WiringRecord {
+            WiringRecord {
+                file: YARN_LOCK.to_string(),
+                kind: kind.to_string(),
+                action: WiringAction::Rewritten,
+                key: key.map(str::to_string),
+                original,
+                new: None,
+            }
+        }
+        fn run(text_in: &str, rec: &WiringRecord) -> (bool, String, Vec<VendorWarning>) {
+            let mut text = text_in.to_string();
+            let mut warnings = Vec::new();
+            let changed = revert_recorded_block(
+                &mut text,
+                rec,
+                UUID,
+                KIND_LOCK_BLOCK,
+                "lock block",
+                |lines| classic_field(lines, "resolved"),
+                &mut warnings,
+            );
+            (changed, text, warnings)
+        }
+        fn assert_drift_warning(warnings: &[VendorWarning], detail_needle: &str) {
+            assert_eq!(warnings.len(), 1, "{warnings:?}");
+            assert_eq!(warnings[0].code, "vendor_lock_entry_drifted");
+            assert!(
+                warnings[0].detail.contains(detail_needle),
+                "want `{detail_needle}` in: {}",
+                warnings[0].detail
+            );
+        }
+        // The verbatim pre-vendor left-pad block out of the fixture itself.
+        let orig_block = scan_blocks(Y2_BEFORE)
+            .into_iter()
+            .find(|b| b.key == "left-pad@^1.3.0")
+            .expect("Y2_BEFORE has the left-pad block")
+            .lines;
+
+        // (a) Record with no key: warned, left alone.
+        let rec = wrec(None, KIND_LOCK_BLOCK, Some(lines_to_json(&orig_block)));
+        let (changed, text, warnings) = run(Y2_AFTER, &rec);
+        assert!(!changed);
+        assert_eq!(text, Y2_AFTER, "text byte-untouched");
+        assert_drift_warning(&warnings, "has no key");
+
+        // (b) Unknown wiring kind (newer binary): warned, left alone.
+        let rec = wrec(
+            Some("left-pad@^1.3.0"),
+            "future_kind",
+            Some(lines_to_json(&orig_block)),
+        );
+        let (changed, text, warnings) = run(Y2_AFTER, &rec);
+        assert!(!changed);
+        assert_eq!(text, Y2_AFTER);
+        assert_drift_warning(&warnings, "unknown wiring kind `future_kind`");
+
+        // (c) Recorded key gone AND the original block not live anywhere:
+        // deleted-since-vendoring drift.
+        let absent = vec!["absent@^9:".to_string(), "  version \"9.0.0\"".to_string()];
+        let rec = wrec(Some("absent@^9"), KIND_LOCK_BLOCK, Some(lines_to_json(&absent)));
+        let (changed, text, warnings) = run(Y2_AFTER, &rec);
+        assert!(!changed);
+        assert_eq!(text, Y2_AFTER);
+        assert_drift_warning(&warnings, "no longer exists; nothing to restore");
+
+        // (d) ALREADY CONVERGED under a different key: the recorded key is
+        // gone but the original block is live verbatim — a silent no-op so
+        // the drift-keep gate can converge (berry's rekeying restore
+        // produces exactly this state).
+        let rec = wrec(
+            Some("left-pad@file:./x.tgz"),
+            KIND_LOCK_BLOCK,
+            Some(lines_to_json(&orig_block)),
+        );
+        let (changed, text, warnings) = run(Y2_BEFORE, &rec);
+        assert!(!changed);
+        assert_eq!(text, Y2_BEFORE);
+        assert!(warnings.is_empty(), "converged is not drift: {warnings:?}");
+
+        // (e) Live block is ours but the record has NO pre-vendor original
+        // (a re-vendor over our own stale edit): warned, left as-is.
+        let rec = wrec(Some("left-pad@^1.3.0"), KIND_LOCK_BLOCK, None);
+        let (changed, text, warnings) = run(Y2_AFTER, &rec);
+        assert!(!changed);
+        assert_eq!(text, Y2_AFTER);
+        assert_drift_warning(&warnings, "no recorded pre-vendor original");
+
+        // Control: a well-formed record against the vendored text restores
+        // the original block (the matrix would prove nothing if the inputs
+        // were degenerate).
+        let rec = wrec(
+            Some("left-pad@^1.3.0"),
+            KIND_LOCK_BLOCK,
+            Some(lines_to_json(&orig_block)),
+        );
+        let (changed, text, warnings) = run(Y2_AFTER, &rec);
+        assert!(changed, "control record must restore");
+        assert_eq!(text, Y2_BEFORE);
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    /// Re-vendoring over our own stale edit (a new patch uuid for the same
+    /// package) must record `original: None` — never a `.socket/vendor/`
+    /// pointer as the "pre-vendor" state — and a revert of that entry
+    /// degrades to the no-original drift arm: lock left alone, artifact and
+    /// ledger kept.
+    #[tokio::test]
+    async fn revendor_under_new_uuid_records_no_original_and_drift_keeps_on_revert() {
+        let fx = fixture_with_lock(Y2_BEFORE).await;
+        let (_, entry_a, _) = expect_done(fx.vendor(false).await);
+        assert!(entry_a.is_some());
+
+        // Same package, same files, NEW patch uuid.
+        let mut record_b = fx.record.clone();
+        record_b.uuid = UUID_B.to_string();
+        let blobs = fx.root().join(".socket/blobs");
+        let sources = PatchSources::blobs_only(&blobs);
+        let outcome = vendor_yarn_classic(
+            "pkg:npm/left-pad@1.3.0",
+            &fx.installed(),
+            fx.root(),
+            &record_b,
+            &sources,
+            "2026-06-10T00:00:00Z",
+            false,
+            false,
+            None,
+        )
+        .await;
+        let (result, entry_b, _) = expect_done(outcome);
+        assert!(result.success, "{:?}", result.error);
+        let entry_b = entry_b.expect("re-vendor under a new uuid is a real edit");
+        assert_eq!(entry_b.wiring.len(), 1);
+        assert!(
+            entry_b.wiring[0].original.is_none(),
+            "our own stale edit must never be recorded as the pre-vendor original"
+        );
+        let new_lines = entry_b.wiring[0].new.as_ref().unwrap().to_string();
+        assert!(new_lines.contains(UUID_B), "new block points at uuid B");
+        let vendored_b = fx.lock_text().await;
+        assert!(vendored_b.contains(UUID_B), "lock repointed at uuid B");
+        assert!(!vendored_b.contains(UUID), "stale uuid-A pointer replaced");
+
+        // Reverting entry B: the block is ours, but there is no pre-vendor
+        // fragment to restore — drift warning, lock untouched, artifact and
+        // (by contract) the ledger entry kept.
+        let outcome = revert_yarn_classic(&entry_b, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_lock_entry_drifted"
+                    && w.detail.contains("no recorded pre-vendor original")),
+            "{:?}",
+            outcome.warnings
+        );
+        assert!(outcome.kept_artifact, "drift-skip keeps the artifact");
+        assert!(
+            fx.root()
+                .join(format!(".socket/vendor/npm/{UUID_B}"))
+                .exists(),
+            "uuid-B dir kept"
+        );
+        assert_eq!(
+            fx.lock_text().await,
+            vendored_b,
+            "lock left alone (still resolves through uuid B)"
+        );
+    }
+
+    /// The two pre-wiring failure bubbles: an unsafe purl refuses via the
+    /// shared coordinates guard before any disk access, and a stage failure
+    /// (installed copy missing) fails the run — both before any write inside
+    /// the project.
+    #[tokio::test]
+    async fn unsafe_purl_and_stage_failure_bubble_before_any_project_write() {
+        // (a) Unsafe coordinates: refused, nothing written.
+        let fx = fixture_with_lock(Y2_BEFORE).await;
+        let blobs = fx.root().join(".socket/blobs");
+        let sources = PatchSources::blobs_only(&blobs);
+        let outcome = vendor_yarn_classic(
+            "pkg:npm/left-pad@../evil",
+            &fx.installed(),
+            fx.root(),
+            &fx.record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            None,
+        )
+        .await;
+        expect_refused(outcome, "unsafe_coordinates");
+        assert!(!fx.root().join(".socket/vendor").exists());
+        assert_eq!(
+            tokio::fs::read(fx.lock_path()).await.unwrap(),
+            fx.lock_bytes
+        );
+
+        // (b) Stage failure: the installed copy is gone.
+        tokio::fs::remove_dir_all(fx.installed()).await.unwrap();
+        let (result, entry, _) = expect_done(fx.vendor(false).await);
+        assert!(!result.success, "staging a missing install must fail");
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("cannot stage a copy of the installed package"),
+            "{:?}",
+            result.error
+        );
+        assert!(entry.is_none());
+        assert!(
+            !fx.root().join(".socket/vendor").exists(),
+            "stage failure precedes any project write"
+        );
+        assert_eq!(
+            tokio::fs::read(fx.lock_path()).await.unwrap(),
+            fx.lock_bytes
+        );
+    }
+
+    /// The marker is informational: a marker write failure must degrade to a
+    /// warning on an otherwise fully successful vendor (tarball packed, lock
+    /// rewritten, ledger entry produced).
+    #[tokio::test]
+    async fn marker_write_failure_is_a_nonfatal_warning() {
+        let fx = fixture_with_lock(Y2_BEFORE).await;
+        // A DIRECTORY squatting on the marker path: the tarball pack into
+        // the (pre-existing) uuid dir succeeds, the marker's atomic rename
+        // onto a directory fails.
+        let marker_path = fx
+            .root()
+            .join(format!(".socket/vendor/npm/{UUID}/socket-patch.vendor.json"));
+        tokio::fs::create_dir_all(&marker_path).await.unwrap();
+
+        let (result, entry, warnings) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        assert!(entry.is_some(), "the vendor itself succeeded");
+        assert!(
+            warnings.iter().any(|w| w.code == "vendor_marker_write_failed"),
+            "{warnings:?}"
+        );
+        assert!(fx.tgz_path().exists(), "tarball packed");
+        let (sha1, sri) = fx.packed_hashes().await;
+        assert_eq!(
+            fx.lock_text().await,
+            spike_after(Y2_AFTER, &sha1, &sri),
+            "lock rewrite unaffected by the marker failure"
+        );
+    }
+
+    /// Revert-side lock-write failure fails closed: the artifact and the
+    /// on-disk (still vendored) lock are both untouched, so a re-run after
+    /// fixing the permission converges.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn revert_lock_write_failure_leaves_lock_and_artifact_untouched() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return; // chmod is advisory for root — the failure never fires
+        }
+        let fx = fixture_with_lock(Y2_BEFORE).await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+        let lock_vendored = tokio::fs::read(fx.lock_path()).await.unwrap();
+
+        // A read-only project root: yarn.lock still reads, but the atomic
+        // write (temp file in the root) fails.
+        let orig_mode = tokio::fs::metadata(fx.root()).await.unwrap().permissions();
+        tokio::fs::set_permissions(fx.root(), std::fs::Permissions::from_mode(0o555))
+            .await
+            .unwrap();
+        let outcome = revert_yarn_classic(&entry, fx.root(), false).await;
+        tokio::fs::set_permissions(fx.root(), orig_mode)
+            .await
+            .unwrap();
+
+        assert!(!outcome.success, "the lock write must fail");
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("cannot write yarn.lock"),
+            "{:?}",
+            outcome.error
+        );
+        assert!(fx.tgz_path().exists(), "artifact survives the failure");
+        assert_eq!(
+            tokio::fs::read(fx.lock_path()).await.unwrap(),
+            lock_vendored,
+            "on-disk lock untouched on write failure"
+        );
+    }
+
+    /// Artifact-removal failure at the END of a wet revert: the lock is
+    /// already restored, the failure is surfaced, and a re-run after fixing
+    /// the permission converges (records read as converged, removal
+    /// retried).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn revert_remove_failure_surfaces_and_rerun_converges() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return; // chmod is advisory for root — the failure never fires
+        }
+        let fx = fixture_with_lock(Y2_BEFORE).await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+
+        // A read-only .socket/vendor/npm parent: the uuid dir's CONTENTS
+        // still unlink (the uuid dir itself is writable), but the final
+        // rmdir of the uuid dir fails.
+        let npm_dir = fx.root().join(".socket/vendor/npm");
+        tokio::fs::set_permissions(&npm_dir, std::fs::Permissions::from_mode(0o555))
+            .await
+            .unwrap();
+        let outcome = revert_yarn_classic(&entry, fx.root(), false).await;
+        tokio::fs::set_permissions(&npm_dir, std::fs::Permissions::from_mode(0o755))
+            .await
+            .unwrap();
+
+        assert!(!outcome.success, "the removal must fail");
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains(&format!("cannot remove .socket/vendor/npm/{UUID}")),
+            "{:?}",
+            outcome.error
+        );
+        assert_eq!(
+            tokio::fs::read(fx.lock_path()).await.unwrap(),
+            fx.lock_bytes,
+            "the lock was already restored before the removal failed"
+        );
+
+        // Re-run liveness: the restored block reads as converged (silently),
+        // and the removal is retried and succeeds.
+        let outcome = revert_yarn_classic(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(
+            outcome.warnings.is_empty(),
+            "converged records are not drift: {:?}",
+            outcome.warnings
+        );
+        assert!(
+            !fx.root().join(format!(".socket/vendor/npm/{UUID}")).exists(),
+            "artifact removed on the re-run"
+        );
+        assert_eq!(
+            tokio::fs::read(fx.lock_path()).await.unwrap(),
+            fx.lock_bytes
+        );
     }
 }

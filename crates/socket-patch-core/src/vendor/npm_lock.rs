@@ -1405,6 +1405,10 @@ mod tests {
     async fn post_pack_lock_write_failure_unstages_the_artifact_husk() {
         use std::os::unix::fs::PermissionsExt;
 
+        if unsafe { libc::geteuid() } == 0 {
+            return; // chmod is advisory for root — the failures never fire
+        }
+
         async fn chmod(path: &Path, mode: u32) {
             tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
                 .await
@@ -1448,7 +1452,47 @@ mod tests {
         chmod(fx2.root(), 0o755).await;
         assert!(!result.success);
         assert!(entry.is_none());
-        assert!(uuid_dir.exists(), "a pre-existing uuid dir is never unstaged");
+        assert!(
+            uuid_dir.exists(),
+            "a pre-existing uuid dir is never unstaged"
+        );
+    }
+
+    /// The marker is informational belt-and-braces: a marker write failure
+    /// downgrades to a `vendor_marker_write_failed` warning while the vendor
+    /// itself succeeds (the lock is already correctly wired). Reachable
+    /// cross-platform by planting a DIRECTORY at the marker path — staging
+    /// only `create_dir_all`s the uuid dir, and the marker's atomic rename
+    /// cannot replace a directory.
+    #[tokio::test]
+    async fn marker_write_failure_downgrades_to_warning() {
+        let fx = fixture().await;
+        tokio::fs::create_dir_all(fx.root().join(format!(
+            ".socket/vendor/npm/{UUID}/socket-patch.vendor.json"
+        )))
+        .await
+        .unwrap();
+
+        let (result, entry, warnings) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        assert!(entry.is_some(), "wired vendor still records a ledger entry");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.code == "vendor_marker_write_failed"),
+            "{warnings:?}"
+        );
+
+        // The lock rewrite happened exactly as in the happy path.
+        let lock = fx.read_lock().await;
+        assert_eq!(
+            lock["packages"]["node_modules/left-pad"]["resolved"],
+            json!(format!("file:{}", fx.expected_rel_tgz()))
+        );
+        assert!(
+            fx.root().join(fx.expected_rel_tgz()).exists(),
+            "tarball packed despite the marker failure"
+        );
     }
 
     /// `vendor --force` keeps its missing-file tolerance (strict superset
@@ -1737,6 +1781,29 @@ mod tests {
         );
     }
 
+    /// `entry_name`'s LAST fallback: a workspace-member key carrying NO
+    /// `name` field is classified by the key's basename and must hit the
+    /// same refusal (the test above covers only the name-field branch).
+    #[tokio::test]
+    async fn nameless_workspace_member_key_is_refused_via_basename() {
+        let lock = json!({
+            "name": "fixture",
+            "version": "1.0.0",
+            "lockfileVersion": 3,
+            "packages": {
+                "": { "name": "fixture", "version": "1.0.0" },
+                "packages/left-pad": { "version": "1.3.0" }
+            }
+        });
+        let fx = fixture_with("left-pad", "1.3.0", lock).await;
+        let detail = expect_refused(fx.vendor(false).await, "vendor_workspace_member");
+        assert!(detail.contains("packages/left-pad"), "{detail}");
+        assert!(
+            !fx.root().join(".socket/vendor").exists(),
+            "refusal writes nothing"
+        );
+    }
+
     #[tokio::test]
     async fn bundled_deps_package_is_refused_before_lock_writes() {
         let fx = fixture().await;
@@ -1812,6 +1879,30 @@ mod tests {
         expect_refused(
             fx.vendor(false).await,
             "vendor_lockfile_version_unsupported",
+        );
+    }
+
+    /// A merge-conflicted / truncated package-lock.json must refuse before
+    /// any project write. Reusing the `vendor_lockfile_version_unsupported`
+    /// code for a parse failure is the cross-backend convention (see
+    /// lock_inventory.rs), not a bug.
+    #[tokio::test]
+    async fn unparseable_lock_is_refused_before_any_write() {
+        let fx = fixture().await;
+        tokio::fs::write(fx.lock_path(), b"{ definitely: not json")
+            .await
+            .unwrap();
+        let detail = expect_refused(
+            fx.vendor(false).await,
+            "vendor_lockfile_version_unsupported",
+        );
+        assert!(
+            detail.contains("is not parseable JSON"),
+            "actionable detail: {detail}"
+        );
+        assert!(
+            !fx.root().join(".socket/vendor").exists(),
+            "refusal writes nothing"
         );
     }
 
@@ -2116,6 +2207,60 @@ mod tests {
         assert_eq!(legacy_keys, vec!["/dependencies/left-pad"]);
     }
 
+    /// Hand-mangled locks with non-object nodes (e.g. `null`) are tolerated:
+    /// both the `packages` scan and the v2 legacy-tree walk skip them
+    /// instead of aborting the rewrite, and leave the junk byte-untouched.
+    #[tokio::test]
+    async fn malformed_non_object_lock_nodes_are_skipped() {
+        let lock = json!({
+            "name": "fixture",
+            "version": "1.0.0",
+            "lockfileVersion": 2,
+            "requires": true,
+            "packages": {
+                "": { "name": "fixture", "version": "1.0.0" },
+                "node_modules/junk": null,
+                "node_modules/left-pad": {
+                    "version": "1.3.0",
+                    "resolved": REG_RESOLVED,
+                    "integrity": "sha512-orig=="
+                }
+            },
+            "dependencies": {
+                "weird": null,
+                "left-pad": {
+                    "version": "1.3.0",
+                    "resolved": REG_RESOLVED,
+                    "integrity": "sha512-orig=="
+                }
+            }
+        });
+        let fx = fixture_with("left-pad", "1.3.0", lock).await;
+        let (result, entry, _) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        let entry = entry.unwrap();
+
+        let resolved = json!(format!("file:{}", fx.expected_rel_tgz()));
+        let live = fx.read_lock().await;
+        assert_eq!(
+            live["packages"]["node_modules/left-pad"]["resolved"],
+            resolved
+        );
+        assert_eq!(live["dependencies"]["left-pad"]["resolved"], resolved);
+        assert_eq!(
+            live["packages"]["node_modules/junk"],
+            json!(null),
+            "non-object packages node byte-untouched"
+        );
+        assert_eq!(
+            live["dependencies"]["weird"],
+            json!(null),
+            "non-object legacy node byte-untouched"
+        );
+        // Exactly the two real halves were wired; the nulls yield no records.
+        assert_eq!(entry.wiring.len(), 2, "{:?}", entry.wiring);
+    }
+
     #[tokio::test]
     async fn dry_run_writes_nothing() {
         let fx = fixture().await;
@@ -2340,6 +2485,357 @@ mod tests {
                 .join(format!(".socket/vendor/npm/{UUID}"))
                 .exists(),
             "artifact pruned once the revert converges"
+        );
+    }
+
+    /// The WIRED revert (non-empty wiring) fails closed on an unparseable
+    /// lock — editing JSON we cannot parse risks destroying it. (The
+    /// unreadable-lock test below covers only the EMPTY-wiring guard.)
+    #[tokio::test]
+    async fn wired_revert_fails_closed_on_unparseable_lock() {
+        let fx = fixture().await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+        assert!(
+            !entry.wiring.is_empty(),
+            "the wired path is the one under test"
+        );
+        let garbage: &[u8] = b"{ not json at all";
+        tokio::fs::write(fx.lock_path(), garbage).await.unwrap();
+
+        let outcome = revert_npm(&entry, fx.root(), false).await;
+        assert!(!outcome.success, "must refuse: {:?}", outcome.warnings);
+        let err = outcome.error.as_deref().unwrap_or_default();
+        assert!(err.contains("is not parseable JSON"), "{err}");
+        assert!(err.contains("fix it and re-run revert"), "{err}");
+        assert!(
+            fx.root().join(fx.expected_rel_tgz()).exists(),
+            "the artifact must survive the failed revert"
+        );
+        assert_eq!(
+            tokio::fs::read(fx.lock_path()).await.unwrap(),
+            garbage,
+            "the broken lock is left for the user to repair"
+        );
+    }
+
+    /// state.json is tamper-able input (see the SECURITY notes in
+    /// `revert_npm_opts`): a wiring record with NO key must be left alone
+    /// with a `vendor_lock_entry_drifted` warning, restoring the intact
+    /// records and drift-keeping the artifact dir.
+    #[tokio::test]
+    async fn revert_leaves_keyless_wiring_record_alone_and_keeps_artifact() {
+        let fx = fixture().await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let mut entry = entry.unwrap();
+        let tampered_key = entry.wiring[0].key.take().unwrap();
+        let other_key = entry.wiring[1].key.clone().unwrap();
+
+        let outcome = revert_npm(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_lock_entry_drifted"
+                    && w.detail.contains("has no key; left alone")
+                    && w.detail.contains(PACKAGE_LOCK)),
+            "{:?}",
+            outcome.warnings
+        );
+
+        let after = fx.read_lock().await;
+        assert_eq!(
+            after["packages"][tampered_key.as_str()]["resolved"],
+            json!(format!("file:{}", fx.expected_rel_tgz())),
+            "the keyless record's entry is left vendored"
+        );
+        assert_eq!(
+            after["packages"][other_key.as_str()],
+            default_lock()["packages"][other_key.as_str()],
+            "the intact record is still restored"
+        );
+        // Drift-keep gate: the artifact may still be needed for a later
+        // restore, so it survives and the keep is surfaced.
+        assert!(outcome.kept_artifact);
+        assert!(fx
+            .root()
+            .join(format!(".socket/vendor/npm/{UUID}"))
+            .exists());
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_artifact_kept"),
+            "{:?}",
+            outcome.warnings
+        );
+    }
+
+    /// Same tamper class: an unknown wiring `kind` is left alone with a
+    /// drift warning naming the kind, never guessed at.
+    #[tokio::test]
+    async fn revert_leaves_unknown_wiring_kind_alone_and_keeps_artifact() {
+        let fx = fixture().await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let mut entry = entry.unwrap();
+        entry.wiring[0].kind = "npm_bogus_kind".to_string();
+        let tampered_key = entry.wiring[0].key.clone().unwrap();
+        let other_key = entry.wiring[1].key.clone().unwrap();
+
+        let outcome = revert_npm(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_lock_entry_drifted"
+                    && w.detail.contains("unknown wiring kind `npm_bogus_kind`")
+                    && w.detail.contains(tampered_key.as_str())),
+            "{:?}",
+            outcome.warnings
+        );
+
+        let after = fx.read_lock().await;
+        assert_eq!(
+            after["packages"][tampered_key.as_str()]["resolved"],
+            json!(format!("file:{}", fx.expected_rel_tgz())),
+            "the unknown-kind record's entry is left vendored"
+        );
+        assert_eq!(
+            after["packages"][other_key.as_str()],
+            default_lock()["packages"][other_key.as_str()],
+            "the intact record is still restored"
+        );
+        assert!(outcome.kept_artifact);
+        assert!(fx
+            .root()
+            .join(format!(".socket/vendor/npm/{UUID}"))
+            .exists());
+    }
+
+    /// A live lock entry with NO `resolved` at all is not provably ours
+    /// (`None => false` in the ownership gate): revert leaves it alone with
+    /// a drift warning instead of clobbering an entry it cannot attribute.
+    #[tokio::test]
+    async fn revert_leaves_entry_missing_resolved_alone() {
+        let fx = fixture().await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+
+        // Delete `resolved` from the DIRECT instance; the vendored integrity
+        // stays, so the live fragment differs from the recorded original and
+        // the already-converged gate stays cold.
+        let mut live = fx.read_lock().await;
+        live["packages"]["node_modules/left-pad"]
+            .as_object_mut()
+            .unwrap()
+            .remove("resolved");
+        tokio::fs::write(fx.lock_path(), serialize_json(&live, "  ").unwrap())
+            .await
+            .unwrap();
+
+        let outcome = revert_npm(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_lock_entry_drifted"
+                    && w.detail.contains("resolved = None")
+                    && w.detail.contains("left alone")),
+            "{:?}",
+            outcome.warnings
+        );
+
+        let after = fx.read_lock().await;
+        assert!(
+            after["packages"]["node_modules/left-pad"]
+                .get("resolved")
+                .is_none(),
+            "resolved-less entry left alone"
+        );
+        assert_eq!(
+            after["packages"]["node_modules/foo/node_modules/left-pad"],
+            default_lock()["packages"]["node_modules/foo/node_modules/left-pad"],
+            "nested instance restored"
+        );
+        assert!(outcome.kept_artifact, "drift-skip keeps the artifact");
+        assert!(fx
+            .root()
+            .join(format!(".socket/vendor/npm/{UUID}"))
+            .exists());
+    }
+
+    const UUID_B: &str = "1a2b3c4d-5e6f-4a2b-9c3d-8e7f6a5b4c3d";
+
+    /// A patch update re-vendors over our own earlier edit: step 8 records
+    /// `original: None` (never record our own stale edit as an "original"),
+    /// and reverting THAT entry warns instead of guessing a registry URL —
+    /// fail-safe: the lock keeps resolving through the new artifact, which
+    /// is drift-kept, so installs keep working.
+    #[tokio::test]
+    async fn revert_of_revendored_entry_warns_without_original_and_keeps_artifact() {
+        let fx = fixture().await;
+        let (_, entry_a, _) = expect_done(fx.vendor(false).await);
+        assert!(entry_a.is_some());
+
+        // Second vendor of the SAME package under a new patch uuid — the
+        // lock already points into .socket/vendor.
+        let mut record_b = fx.record.clone();
+        record_b.uuid = UUID_B.to_string();
+        let blobs = fx.root().join(".socket/blobs");
+        let sources = PatchSources::blobs_only(&blobs);
+        let outcome = vendor_npm(
+            &fx.purl(),
+            &fx.installed(),
+            fx.root(),
+            &record_b,
+            &sources,
+            "2026-06-10T00:00:00Z",
+            false,
+            false,
+            None,
+        )
+        .await;
+        let (result, entry_b, _) = expect_done(outcome);
+        assert!(result.success, "{:?}", result.error);
+        let entry_b = entry_b.unwrap();
+        assert_eq!(entry_b.wiring.len(), 2);
+        assert!(
+            entry_b.wiring.iter().all(|r| r.original.is_none()),
+            "a re-vendor must not record our own edit as an original: {:?}",
+            entry_b.wiring
+        );
+
+        let resolved_b = json!(format!(
+            "file:.socket/vendor/npm/{UUID_B}/{}",
+            tgz_rel_leaf(&fx.name, &fx.version)
+        ));
+        assert_eq!(
+            fx.read_lock().await["packages"]["node_modules/left-pad"]["resolved"],
+            resolved_b
+        );
+
+        let outcome = revert_npm(&entry_b, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_lock_entry_drifted"
+                    && w.detail
+                        .contains("no recorded pre-vendor original; left as-is")
+                    && w.detail.contains("npm install")),
+            "{:?}",
+            outcome.warnings
+        );
+        assert!(outcome.kept_artifact);
+        assert_eq!(
+            fx.read_lock().await["packages"]["node_modules/left-pad"]["resolved"],
+            resolved_b,
+            "the lock keeps resolving through the new artifact"
+        );
+        assert!(
+            fx.root()
+                .join(format!(".socket/vendor/npm/{UUID_B}"))
+                .exists(),
+            "the referenced artifact survives"
+        );
+    }
+
+    /// Revert's lock write failing (EACCES on a read-only project root)
+    /// must fail the revert BEFORE artifact removal: the lock still
+    /// resolves through the artifact, so deleting it would brick installs.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn revert_lock_write_failure_keeps_the_artifact() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if unsafe { libc::geteuid() } == 0 {
+            return; // chmod is advisory for root — the failures never fire
+        }
+
+        async fn chmod(path: &Path, mode: u32) {
+            tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+                .await
+                .unwrap();
+        }
+
+        let fx = fixture().await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+        let lock_vendored = tokio::fs::read(fx.lock_path()).await.unwrap();
+
+        chmod(fx.root(), 0o555).await;
+        let outcome = revert_npm(&entry, fx.root(), false).await;
+        chmod(fx.root(), 0o755).await;
+
+        assert!(!outcome.success, "the lock-write failure is reported");
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("cannot write package-lock.json"),
+            "{:?}",
+            outcome.error
+        );
+        assert!(
+            fx.root().join(fx.expected_rel_tgz()).exists(),
+            "the artifact must survive the failed revert"
+        );
+        assert_eq!(
+            tokio::fs::read(fx.lock_path()).await.unwrap(),
+            lock_vendored,
+            "lock still vendored (the atomic write never landed)"
+        );
+    }
+
+    /// `remove_tree` failing on the uuid dir (rmdir needs write permission
+    /// on its parent `.socket/vendor/npm`) is a PARTIAL revert reported as
+    /// failed: the lock restore precedes the removal and must stick, and
+    /// the error names the dir that could not be removed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn revert_artifact_removal_failure_reports_failed_after_lock_restore() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if unsafe { libc::geteuid() } == 0 {
+            return; // chmod is advisory for root — the failures never fire
+        }
+
+        async fn chmod(path: &Path, mode: u32) {
+            tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+                .await
+                .unwrap();
+        }
+
+        let fx = fixture().await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+        let npm_dir = fx.root().join(".socket/vendor/npm");
+
+        chmod(&npm_dir, 0o555).await;
+        let outcome = revert_npm(&entry, fx.root(), false).await;
+        chmod(&npm_dir, 0o755).await;
+
+        assert!(!outcome.success, "the removal failure is reported");
+        let err = outcome.error.as_deref().unwrap_or_default();
+        assert!(
+            err.contains(&format!("cannot remove .socket/vendor/npm/{UUID}")),
+            "{err}"
+        );
+        assert_eq!(
+            tokio::fs::read(fx.lock_path()).await.unwrap(),
+            fx.lock_bytes,
+            "the lock restore precedes the removal and must stick"
+        );
+        assert!(
+            fx.root()
+                .join(format!(".socket/vendor/npm/{UUID}"))
+                .exists(),
+            "the uuid dir survives the failed removal"
         );
     }
 

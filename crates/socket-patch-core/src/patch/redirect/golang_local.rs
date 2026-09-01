@@ -1995,4 +1995,310 @@ mod tests {
             "pkg:golang/github.com/foo/bar@v1.4.2"
         );
     }
+
+    /// The `WrongReplacePath` and `OrphanReplace` `Display` arms are printed
+    /// verbatim by `apply --check` (the CLI calls `d.to_string()` for every
+    /// drift) — pin the user-facing shape: both paths and the UNPATCHED
+    /// consequence for the wrong-path form, `<none>` when no path was found,
+    /// and the module name for the orphan form.
+    #[test]
+    fn test_drift_display_wrong_replace_and_orphan() {
+        let expected = "./.socket/go-patches/github.com/foo/bar@v1.4.2";
+        let found = "./.socket/go-patches/github.com/foo/bar@v9.9.9";
+        let msg = Drift::WrongReplacePath {
+            purl: PURL.into(),
+            expected: expected.into(),
+            found: Some(found.into()),
+        }
+        .to_string();
+        assert!(msg.contains(PURL), "{msg}");
+        assert!(msg.contains(expected), "{msg}");
+        assert!(msg.contains(found), "{msg}");
+        assert!(msg.contains("UNPATCHED"), "{msg}");
+
+        let msg_none = Drift::WrongReplacePath {
+            purl: PURL.into(),
+            expected: expected.into(),
+            found: None,
+        }
+        .to_string();
+        assert!(msg_none.contains("<none>"), "{msg_none}");
+        assert!(msg_none.contains(expected), "{msg_none}");
+
+        let orphan = Drift::OrphanReplace {
+            module: MODULE.into(),
+        }
+        .to_string();
+        assert!(orphan.contains("orphan go.mod `replace`"), "{orphan}");
+        assert!(orphan.contains(MODULE), "{orphan}");
+    }
+
+    /// `remove_go_redirect` is pub core API: a non-golang PURL must be
+    /// refused as `InvalidInput` BEFORE any go.mod edit or tree removal
+    /// (the CLI gates on `is_local_go`, but the error is this function's
+    /// own contract).
+    #[tokio::test]
+    async fn test_remove_rejects_non_golang_purl() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let gomod = "module m\n\ngo 1.21\n";
+        tokio::fs::write(root.join("go.mod"), gomod).await.unwrap();
+
+        let err = remove_go_redirect(
+            "pkg:npm/left-pad@1.0.0",
+            root,
+            GO_PATCHES_DIR,
+            ReplaceOwner::GoPatches,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("not a golang purl"), "{err}");
+        // The guard fires before any edit: go.mod is byte-unchanged.
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("go.mod"))
+                .await
+                .unwrap(),
+            gomod
+        );
+    }
+
+    /// Cross-mode precedence in the audit: a vendor- or hosted-owned
+    /// `replace` outranks the go-patches redirect, so `--check` must NOT
+    /// demand a go-patches copy/directive for a module another socket mode
+    /// legitimately took over (that would drift-spam MissingCopy +
+    /// MissingReplace and exit 1 in CI for every vendored/hosted module).
+    #[tokio::test]
+    async fn test_verify_skips_vendor_and_hosted_owned_modules() {
+        let (dir, _blobs, _pristine, files, _after) = fixture().await;
+        let root = dir.path();
+        let manifest = manifest_with(&files);
+        let desired: HashSet<String> = [PURL.to_string()].into_iter().collect();
+
+        // Control (fixture go.mod: require only, no replace, no copy): the
+        // audit DOES flag both drifts — proving the skips below carry the Ok.
+        let drifts = verify_go_redirect_state(root, &manifest, &desired)
+            .await
+            .unwrap_err();
+        assert!(drifts
+            .iter()
+            .any(|d| matches!(d, Drift::MissingCopy { .. })));
+        assert!(drifts
+            .iter()
+            .any(|d| matches!(d, Drift::MissingReplace { .. })));
+
+        // Hosted-owned replace for the module → the whole per-purl audit is
+        // skipped: no copy exists, yet verify is clean.
+        tokio::fs::write(
+            root.join("go.mod"),
+            "module example.com/app\n\ngo 1.21\n\n\
+             require github.com/foo/bar v1.4.2\n\n\
+             replace github.com/foo/bar v1.4.2 => \
+             patch.socket.dev/gopatch/some-uuid v1.4.2-socketpatch.1\n",
+        )
+        .await
+        .unwrap();
+        assert!(
+            verify_go_redirect_state(root, &manifest, &desired)
+                .await
+                .is_ok(),
+            "a hosted-owned module must be skipped, not flagged as drift"
+        );
+
+        // Vendor-owned replace → same skip.
+        tokio::fs::write(
+            root.join("go.mod"),
+            "module example.com/app\n\ngo 1.21\n\n\
+             require github.com/foo/bar v1.4.2\n\n\
+             replace github.com/foo/bar v1.4.2 => \
+             ./.socket/vendor/golang/u1/github.com/foo/bar@v1.4.2\n",
+        )
+        .await
+        .unwrap();
+        assert!(
+            verify_go_redirect_state(root, &manifest, &desired)
+                .await
+                .is_ok(),
+            "a vendor-owned module must be skipped, not flagged as drift"
+        );
+    }
+
+    /// `apply --dry-run` passes `dry_run=true` straight through to reconcile:
+    /// it must REPORT the would-be-removed purl while leaving the copy dir,
+    /// go.mod, and the directive byte-untouched — and a subsequent real run
+    /// must remove exactly what the dry run reported.
+    #[tokio::test]
+    async fn test_reconcile_dry_run_reports_without_mutating() {
+        let (dir, blobs, pristine, files, _after) = fixture().await;
+        let root = dir.path();
+        let sources = PatchSources::blobs_only(&blobs);
+        let result = apply_go_redirect(
+            PURL,
+            MODULE,
+            VERSION,
+            &pristine,
+            root,
+            GO_PATCHES_DIR,
+            &files,
+            &sources,
+            None,
+            false,
+            MismatchPolicy::Warn,
+        )
+        .await;
+        assert!(result.success, "setup apply failed: {:?}", result.error);
+
+        let copy_dir = root.join(".socket/go-patches/github.com/foo/bar@v1.4.2");
+        let gomod_before = tokio::fs::read_to_string(root.join("go.mod"))
+            .await
+            .unwrap();
+
+        let removed = reconcile_go_redirects(root, &HashSet::new(), true).await;
+        assert!(
+            removed.contains(&PURL.to_string()),
+            "dry-run must still report the orphan: {removed:?}"
+        );
+        assert!(copy_dir.exists(), "dry-run must not delete the copy");
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("go.mod"))
+                .await
+                .unwrap(),
+            gomod_before,
+            "dry-run must leave go.mod byte-untouched"
+        );
+        assert!(
+            read_replace_entries(root)
+                .await
+                .iter()
+                .any(|e| e.module == MODULE && e.socket_owned()),
+            "dry-run must keep the socket-owned directive"
+        );
+
+        // Parity: the real run removes exactly what the dry run reported.
+        let removed_wet = reconcile_go_redirects(root, &HashSet::new(), false).await;
+        assert_eq!(removed_wet, removed, "dry-run report must match the real run");
+        assert!(!copy_dir.exists(), "real run prunes the copy");
+        assert!(read_replace_entries(root).await.is_empty());
+    }
+
+    /// A hand-edited version-less directive (`replace M => ./.socket/go-patches/…`,
+    /// no LHS version) is still GoPatches-owned, so reconcile must drop it
+    /// when the module is no longer desired — but with no LHS version no PURL
+    /// can be reconstructed, so the drop goes unreported (current contract).
+    #[tokio::test]
+    async fn test_reconcile_drops_versionless_orphan_directive() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        tokio::fs::write(
+            root.join("go.mod"),
+            "module example.com/app\n\ngo 1.21\n\n\
+             replace github.com/foo/bar => ./.socket/go-patches/github.com/foo/bar@v1.4.2\n",
+        )
+        .await
+        .unwrap();
+
+        // Sanity: the parser sees a version-less GoPatches-owned entry.
+        let entries = read_replace_entries(root).await;
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0].owner, Some(ReplaceOwner::GoPatches));
+        assert_eq!(entries[0].version, None);
+
+        let removed = reconcile_go_redirects(root, &HashSet::new(), false).await;
+        assert!(
+            read_replace_entries(root).await.is_empty(),
+            "the version-less orphan directive must be dropped"
+        );
+        assert!(
+            removed.is_empty(),
+            "no PURL exists without a LHS version — the drop is unreported: {removed:?}"
+        );
+    }
+
+    /// collect_copy_modules edge cases: a `<name>@<version>` dir directly at
+    /// the go-patches root (single-segment module, empty prefix) must
+    /// reconstruct `pkg:golang/foo@v1.0.0` and be pruned as an orphan, while
+    /// stray non-directory entries (macOS `.DS_Store`, an `@`-named FILE)
+    /// must produce no bogus removals and be left in place.
+    #[tokio::test]
+    async fn test_reconcile_prunes_top_level_module_dir_and_ignores_stray_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        tokio::fs::write(root.join("go.mod"), "module m\n\ngo 1.21\n")
+            .await
+            .unwrap();
+        let patches = root.join(GO_PATCHES_DIR);
+        // Single-segment module copy directly at the go-patches root.
+        let top = patches.join("foo@v1.0.0");
+        tokio::fs::create_dir_all(&top).await.unwrap();
+        tokio::fs::write(top.join("foo.go"), b"package foo\n")
+            .await
+            .unwrap();
+        // Stray non-dir entries: a plain file, an `@`-named file, and a
+        // descent dir holding only a plain file.
+        tokio::fs::write(patches.join(".DS_Store"), b"junk")
+            .await
+            .unwrap();
+        tokio::fs::write(patches.join("bar@v2.0.0"), b"not a module dir")
+            .await
+            .unwrap();
+        let nested = patches.join("github.com");
+        tokio::fs::create_dir_all(&nested).await.unwrap();
+        tokio::fs::write(nested.join(".DS_Store"), b"junk")
+            .await
+            .unwrap();
+
+        let removed = reconcile_go_redirects(root, &HashSet::new(), false).await;
+        assert_eq!(
+            removed,
+            vec!["pkg:golang/foo@v1.0.0".to_string()],
+            "top-level module dir pruned; stray files must yield no bogus purls"
+        );
+        assert!(!top.exists(), "orphan copy dir is deleted");
+        assert!(patches.join(".DS_Store").exists(), "stray file untouched");
+        assert!(
+            patches.join("bar@v2.0.0").exists(),
+            "an @-named FILE is not a module copy and must not be removed"
+        );
+    }
+
+    /// The seam apply_go_redirect's go.mod-synthesis failure arm consumes:
+    /// `ensure_module_go_mod` propagates the atomic writer's Err (a missing
+    /// copy dir cannot be staged into), writes Go's minimal module line into
+    /// a go.mod-less dir, and never overwrites an existing go.mod.
+    #[tokio::test]
+    async fn test_ensure_module_go_mod_error_propagates() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // Missing copy dir → the atomic writer cannot stage → Err propagates.
+        let err = ensure_module_go_mod(&root.join("no-such-copy-dir"), MODULE)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+
+        // Success contract: a dir without go.mod gets the minimal module line.
+        let copy = root.join("copy");
+        tokio::fs::create_dir_all(&copy).await.unwrap();
+        ensure_module_go_mod(&copy, MODULE).await.unwrap();
+        assert_eq!(
+            tokio::fs::read_to_string(copy.join("go.mod"))
+                .await
+                .unwrap(),
+            "module github.com/foo/bar\n"
+        );
+
+        // Early-return contract: an existing go.mod is never overwritten.
+        tokio::fs::write(copy.join("go.mod"), "module custom/path\n")
+            .await
+            .unwrap();
+        ensure_module_go_mod(&copy, MODULE).await.unwrap();
+        assert_eq!(
+            tokio::fs::read_to_string(copy.join("go.mod"))
+                .await
+                .unwrap(),
+            "module custom/path\n",
+            "an existing go.mod must be left untouched"
+        );
+    }
 }

@@ -606,6 +606,18 @@ mod tests {
         assert!(err.contains("directory-style name"), "{err}");
     }
 
+    /// A Regular entry whose name is a single path component (literally
+    /// `package`, no `/`) has nothing left after stripping the first
+    /// component — hashing it would silently drop the file from the rebuilt
+    /// zip and emit a checksum yarn disagrees with. Hand-rolled registry
+    /// tarballs can carry this shape; fail closed.
+    #[test]
+    fn single_component_file_entry_fails_closed() {
+        let tgz = tgz_with_names(&[("package", b"x")]);
+        let err = berry_cache_checksum_10c0(&tgz, "x").unwrap_err();
+        assert!(err.contains("no path under the package prefix"), "{err}");
+    }
+
     #[test]
     fn unsupported_inputs_fail_closed() {
         // Not a gzip stream at all.

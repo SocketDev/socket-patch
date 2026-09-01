@@ -2693,4 +2693,487 @@ mod tests {
              too — a stale original-hash entry wedges cargo build"
         );
     }
+
+    // ── New-file entry over existing divergent content ───────────────
+    //
+    // A new-file entry (empty beforeHash) whose target path ALREADY holds
+    // content matching neither hash — a stale or locally-created file at a
+    // path the patch adds. `verify_file_patch` deliberately treats this as
+    // Ready (force overwrite; see the comment above the `is_new_file`
+    // branch after the AlreadyPatched check).
+
+    #[tokio::test]
+    async fn test_verify_file_patch_new_file_over_divergent_existing_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let stale = b"stale local content";
+        let stale_hash = compute_git_sha256_from_bytes(stale);
+        let after_hash = compute_git_sha256_from_bytes(b"fresh");
+
+        tokio::fs::write(dir.path().join("new.js"), stale)
+            .await
+            .unwrap();
+
+        let file_info = PatchFileInfo {
+            before_hash: String::new(),
+            after_hash: after_hash.clone(),
+        };
+
+        let result = verify_file_patch(dir.path(), "new.js", &file_info).await;
+        assert_eq!(result.status, VerifyStatus::Ready);
+        assert_eq!(result.current_hash.as_deref(), Some(stale_hash.as_str()));
+        assert_eq!(result.expected_hash, None);
+        assert_eq!(result.target_hash.as_deref(), Some(after_hash.as_str()));
+    }
+
+    #[tokio::test]
+    async fn test_apply_package_patch_new_file_overwrites_divergent_existing() {
+        let pkg_dir = tempfile::tempdir().unwrap();
+        let blobs_dir = tempfile::tempdir().unwrap();
+
+        let fresh = b"fresh";
+        let after_hash = compute_git_sha256_from_bytes(fresh);
+
+        tokio::fs::write(pkg_dir.path().join("new.js"), b"stale local content")
+            .await
+            .unwrap();
+        tokio::fs::write(blobs_dir.path().join(&after_hash), fresh)
+            .await
+            .unwrap();
+
+        let mut files = HashMap::new();
+        files.insert(
+            "new.js".to_string(),
+            PatchFileInfo {
+                before_hash: String::new(),
+                after_hash: after_hash.clone(),
+            },
+        );
+
+        let result = apply_package_patch(
+            "pkg:npm/test@1.0.0",
+            pkg_dir.path(),
+            &files,
+            &PatchSources::blobs_only(blobs_dir.path()),
+            None,
+            false,
+            MismatchPolicy::Warn,
+        )
+        .await;
+
+        assert!(result.success, "expected success: {:?}", result.error);
+        assert_eq!(result.files_patched, vec!["new.js".to_string()]);
+        assert_eq!(result.applied_via.get("new.js"), Some(&AppliedVia::Blob));
+        let written = tokio::fs::read(pkg_dir.path().join("new.js")).await.unwrap();
+        assert_eq!(written, fresh, "divergent existing content is overwritten");
+    }
+
+    /// CHARACTERIZATION: `--strict` does NOT protect divergent content at
+    /// a new-file path. `verify_file_patch` returns `Ready` (never
+    /// `HashMismatch`) for a new-file entry, so the Strict policy arm is
+    /// never consulted and the verified patched bytes overwrite the local
+    /// file — the deliberate "force overwrite" contract documented above
+    /// the `is_new_file` branch. If that contract ever changes to
+    /// fail-closed under Strict, flip these assertions.
+    #[tokio::test]
+    async fn test_apply_package_patch_new_file_overwrite_strict_characterization() {
+        let pkg_dir = tempfile::tempdir().unwrap();
+        let blobs_dir = tempfile::tempdir().unwrap();
+
+        let fresh = b"fresh";
+        let after_hash = compute_git_sha256_from_bytes(fresh);
+
+        tokio::fs::write(pkg_dir.path().join("new.js"), b"stale local content")
+            .await
+            .unwrap();
+        tokio::fs::write(blobs_dir.path().join(&after_hash), fresh)
+            .await
+            .unwrap();
+
+        let mut files = HashMap::new();
+        files.insert(
+            "new.js".to_string(),
+            PatchFileInfo {
+                before_hash: String::new(),
+                after_hash,
+            },
+        );
+
+        let result = apply_package_patch(
+            "pkg:npm/test@1.0.0",
+            pkg_dir.path(),
+            &files,
+            &PatchSources::blobs_only(blobs_dir.path()),
+            None,
+            false,
+            MismatchPolicy::Strict,
+        )
+        .await;
+
+        assert!(result.success, "strict still overwrites at a new-file path");
+        assert_eq!(result.files_patched, vec!["new.js".to_string()]);
+        let written = tokio::fs::read(pkg_dir.path().join("new.js")).await.unwrap();
+        assert_eq!(written, fresh);
+    }
+
+    // ── create_dir_all failure inside apply_file_patch ───────────────
+
+    /// A patch adds a file under a path whose intermediate component
+    /// exists as a regular FILE. `create_dir_all` must fail and the error
+    /// must propagate (after the mkdir guard restored the ancestor), with
+    /// the blocking file untouched and no stage litter left behind.
+    #[tokio::test]
+    async fn test_apply_file_patch_mkdir_fails_when_parent_component_is_regular_file() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(dir.path().join("blocker"), b"i am a file")
+            .await
+            .unwrap();
+
+        let patched = b"x";
+        let hash = compute_git_sha256_from_bytes(patched);
+        let res = apply_file_patch(dir.path(), "blocker/new.js", patched, &hash).await;
+        assert!(res.is_err(), "mkdir through a regular file must fail");
+
+        // The blocking file is untouched.
+        assert_eq!(
+            tokio::fs::read(dir.path().join("blocker")).await.unwrap(),
+            b"i am a file"
+        );
+
+        // No stage litter (stage files are named `.socket-stage-*`).
+        let mut entries = tokio::fs::read_dir(dir.path()).await.unwrap();
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            assert!(
+                !name.starts_with(".socket-stage-"),
+                "stage file leaked into parent dir: {name}"
+            );
+        }
+    }
+
+    /// Same failure with a READ-ONLY blocking file: `nearest_existing_
+    /// ancestor` resolves to the blocker itself, the mkdir guard relaxes
+    /// its write bit, `create_dir_all` still fails, and the guard must
+    /// restore the exact original mode before the error propagates.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_apply_file_patch_mkdir_failure_restores_readonly_blocker_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("blocker");
+        tokio::fs::write(&blocker, b"i am a file").await.unwrap();
+        tokio::fs::set_permissions(&blocker, std::fs::Permissions::from_mode(0o444))
+            .await
+            .unwrap();
+
+        let patched = b"x";
+        let hash = compute_git_sha256_from_bytes(patched);
+        let res = apply_file_patch(dir.path(), "blocker/new.js", patched, &hash).await;
+        assert!(res.is_err(), "mkdir through a regular file must fail");
+
+        let mode = tokio::fs::metadata(&blocker)
+            .await
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o444,
+            "mkdir guard must restore the blocker's original mode on failure"
+        );
+        assert_eq!(tokio::fs::read(&blocker).await.unwrap(), b"i am a file");
+    }
+
+    // ── Package-level unsafe-path rejection ──────────────────────────
+    //
+    // The file-level twin (`apply_file_patch_at`) has
+    // `test_apply_file_patch_rejects_escaping_path`; these exercise the
+    // package-level gate in the verify loop of `apply_package_patch_at`,
+    // which must abort the whole apply BEFORE any disk write and must not
+    // be skippable by --force.
+
+    #[tokio::test]
+    async fn test_apply_package_patch_rejects_escaping_manifest_key() {
+        let root = tempfile::tempdir().unwrap();
+        let pkg = root.path().join("site");
+        tokio::fs::create_dir_all(&pkg).await.unwrap();
+        let blobs_dir = tempfile::tempdir().unwrap();
+
+        let content = b"pwned";
+        let after_hash = compute_git_sha256_from_bytes(content);
+        tokio::fs::write(blobs_dir.path().join(&after_hash), content)
+            .await
+            .unwrap();
+
+        for key in ["../escape.js", "/abs/escape.js", "package//etc/x"] {
+            // Warn (default) and Force must BOTH refuse: a path escape is
+            // never a legitimate patch target.
+            for policy in [MismatchPolicy::Warn, MismatchPolicy::Force] {
+                let mut files = HashMap::new();
+                files.insert(
+                    key.to_string(),
+                    PatchFileInfo {
+                        before_hash: String::new(),
+                        after_hash: after_hash.clone(),
+                    },
+                );
+                let result = apply_package_patch(
+                    "pkg:npm/evil@1.0.0",
+                    &pkg,
+                    &files,
+                    &PatchSources::blobs_only(blobs_dir.path()),
+                    None,
+                    false,
+                    policy,
+                )
+                .await;
+                assert!(!result.success, "{key:?} must be refused under {policy:?}");
+                let err = result.error.as_deref().unwrap_or("");
+                assert!(
+                    err.contains("Refusing patch with unsafe file path"),
+                    "{key:?} / {policy:?}: wrong error: {err}"
+                );
+                assert!(
+                    err.contains(key),
+                    "{key:?} / {policy:?}: error must name the key: {err}"
+                );
+                assert!(result.files_patched.is_empty(), "{key:?} / {policy:?}");
+            }
+        }
+        // Nothing was written outside the package dir.
+        assert!(!root.path().join("escape.js").exists());
+    }
+
+    /// A map with BOTH a valid safe entry and an unsafe key: the rejection
+    /// fires in the verify loop before the apply loop runs, so the safe
+    /// file must be untouched regardless of HashMap iteration order.
+    #[tokio::test]
+    async fn test_apply_package_patch_escaping_key_aborts_before_any_write() {
+        let root = tempfile::tempdir().unwrap();
+        let pkg = root.path().join("site");
+        tokio::fs::create_dir_all(&pkg).await.unwrap();
+        let blobs_dir = tempfile::tempdir().unwrap();
+
+        let original = b"original content";
+        let patched = b"patched content";
+        let before_hash = compute_git_sha256_from_bytes(original);
+        let after_hash = compute_git_sha256_from_bytes(patched);
+        let evil = b"pwned";
+        let evil_hash = compute_git_sha256_from_bytes(evil);
+
+        tokio::fs::write(pkg.join("index.js"), original).await.unwrap();
+        tokio::fs::write(blobs_dir.path().join(&after_hash), patched)
+            .await
+            .unwrap();
+        tokio::fs::write(blobs_dir.path().join(&evil_hash), evil)
+            .await
+            .unwrap();
+
+        let mut files = HashMap::new();
+        files.insert(
+            "index.js".to_string(),
+            PatchFileInfo {
+                before_hash,
+                after_hash,
+            },
+        );
+        files.insert(
+            "../escape.js".to_string(),
+            PatchFileInfo {
+                before_hash: String::new(),
+                after_hash: evil_hash,
+            },
+        );
+
+        let result = apply_package_patch(
+            "pkg:npm/evil@1.0.0",
+            &pkg,
+            &files,
+            &PatchSources::blobs_only(blobs_dir.path()),
+            None,
+            false,
+            MismatchPolicy::Warn,
+        )
+        .await;
+
+        assert!(!result.success);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("Refusing patch with unsafe file path"));
+        assert!(result.files_patched.is_empty());
+        // The safe file was never written — the whole apply aborted
+        // before the write phase.
+        assert_eq!(tokio::fs::read(pkg.join("index.js")).await.unwrap(), original);
+        assert!(!root.path().join("escape.js").exists());
+    }
+
+    // ── try_apply_from_diff bail-outs ────────────────────────────────
+    //
+    // Direct-call tests for the private diff strategy's fail-soft
+    // contract: each bail returns `false` (fall through to blob) and
+    // writes NOTHING.
+
+    #[tokio::test]
+    async fn test_try_apply_from_diff_bails_on_new_file_entry() {
+        // A diff entry for a file with empty beforeHash (malformed or
+        // adversarial patch data): there is no before content to diff
+        // against, so the strategy must refuse.
+        let dir = tempfile::tempdir().unwrap();
+        let mut entries = HashMap::new();
+        entries.insert("new.js".to_string(), make_delta(b"", b"x"));
+        let info = PatchFileInfo {
+            before_hash: String::new(),
+            after_hash: compute_git_sha256_from_bytes(b"x"),
+        };
+
+        let applied =
+            try_apply_from_diff(Some(&entries), "new.js", dir.path(), "new.js", &info, Some("anything"))
+                .await;
+        assert!(!applied, "new-file entries must never apply via diff");
+        assert!(!dir.path().join("new.js").exists(), "nothing written");
+    }
+
+    #[tokio::test]
+    async fn test_try_apply_from_diff_bails_when_target_unreadable() {
+        // The current_hash gate passes (verify/apply race or permission
+        // loss) but the on-disk read fails: fail soft, fall through.
+        let dir = tempfile::tempdir().unwrap();
+        let original = b"the original content";
+        let patched = b"the patched content!";
+        let before_hash = compute_git_sha256_from_bytes(original);
+        let mut entries = HashMap::new();
+        entries.insert("index.js".to_string(), make_delta(original, patched));
+        let info = PatchFileInfo {
+            before_hash: before_hash.clone(),
+            after_hash: compute_git_sha256_from_bytes(patched),
+        };
+
+        // NO file on disk, but current_hash claims the before state.
+        let applied = try_apply_from_diff(
+            Some(&entries),
+            "index.js",
+            dir.path(),
+            "index.js",
+            &info,
+            Some(&before_hash),
+        )
+        .await;
+        assert!(!applied, "unreadable target must bail");
+        assert!(!dir.path().join("index.js").exists(), "nothing written");
+    }
+
+    #[tokio::test]
+    async fn test_try_apply_from_diff_bails_on_corrupt_delta() {
+        // `.socket/diffs` is on-disk and user-tamperable: garbage delta
+        // bytes must fail apply_diff and leave the target untouched.
+        let dir = tempfile::tempdir().unwrap();
+        let original = b"the original content";
+        let before_hash = compute_git_sha256_from_bytes(original);
+        tokio::fs::write(dir.path().join("index.js"), original)
+            .await
+            .unwrap();
+
+        let mut entries = HashMap::new();
+        entries.insert(
+            "index.js".to_string(),
+            b"not a real bsdiff delta header".to_vec(),
+        );
+        let info = PatchFileInfo {
+            before_hash: before_hash.clone(),
+            after_hash: compute_git_sha256_from_bytes(b"whatever"),
+        };
+
+        let applied = try_apply_from_diff(
+            Some(&entries),
+            "index.js",
+            dir.path(),
+            "index.js",
+            &info,
+            Some(&before_hash),
+        )
+        .await;
+        assert!(!applied, "corrupt delta must bail");
+        assert_eq!(
+            tokio::fs::read(dir.path().join("index.js")).await.unwrap(),
+            original,
+            "target untouched after corrupt delta"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_try_apply_from_diff_bails_on_wrong_target_delta() {
+        // A delta authored against the RIGHT base but toward the WRONG
+        // target: apply_diff succeeds, but the product's hash differs
+        // from afterHash — nothing may be written.
+        let dir = tempfile::tempdir().unwrap();
+        let original = b"the original content";
+        let before_hash = compute_git_sha256_from_bytes(original);
+        tokio::fs::write(dir.path().join("index.js"), original)
+            .await
+            .unwrap();
+
+        let mut entries = HashMap::new();
+        entries.insert(
+            "index.js".to_string(),
+            make_delta(original, b"unexpected target"),
+        );
+        let info = PatchFileInfo {
+            before_hash: before_hash.clone(),
+            // The declared target is DIFFERENT from what the delta produces.
+            after_hash: compute_git_sha256_from_bytes(b"the real patched content"),
+        };
+
+        let applied = try_apply_from_diff(
+            Some(&entries),
+            "index.js",
+            dir.path(),
+            "index.js",
+            &info,
+            Some(&before_hash),
+        )
+        .await;
+        assert!(!applied, "wrong-target delta must bail");
+        assert_eq!(
+            tokio::fs::read(dir.path().join("index.js")).await.unwrap(),
+            original,
+            "nothing written when the product hash mismatches"
+        );
+    }
+
+    /// Pipeline variant: a corrupt diff archive entry must fall through
+    /// to the blob strategy and still patch successfully.
+    #[tokio::test]
+    async fn test_apply_corrupt_diff_falls_through_to_blob() {
+        let (_root, pkg_dir, blobs_dir, packages_dir, diffs_dir, files, _orig, patched) =
+            make_fixture().await;
+        // No package archive; diff archive holds garbage delta bytes.
+        tokio::fs::remove_file(packages_dir.join(format!("{TEST_UUID}.tar.gz")))
+            .await
+            .unwrap();
+        write_uuid_archive(&diffs_dir, TEST_UUID, &[("index.js", b"garbage delta")]);
+
+        let sources = PatchSources {
+            blobs_path: &blobs_dir,
+            packages_path: Some(&packages_dir),
+            diffs_path: Some(&diffs_dir),
+            mem_blobs: None,
+        };
+        let result = apply_package_patch(
+            "pkg:npm/x@1.0.0",
+            &pkg_dir,
+            &files,
+            &sources,
+            Some(TEST_UUID),
+            false,
+            MismatchPolicy::Warn,
+        )
+        .await;
+
+        assert!(result.success, "expected success: {:?}", result.error);
+        assert_eq!(result.applied_via.get("index.js"), Some(&AppliedVia::Blob));
+        let written = tokio::fs::read(pkg_dir.join("index.js")).await.unwrap();
+        assert_eq!(written, patched);
+    }
 }

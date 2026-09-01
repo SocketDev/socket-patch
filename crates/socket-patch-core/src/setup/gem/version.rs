@@ -221,6 +221,12 @@ mod tests {
             parse_bundled_with("BUNDLED WITH\n   2.7.2\n").as_deref(),
             Some("2.7.2")
         );
+        // Blank line(s) between the header and the version are skipped: the
+        // section yields the first NON-EMPTY line, not the first line.
+        assert_eq!(
+            parse_bundled_with("BUNDLED WITH\n\n   2.7.2\n").as_deref(),
+            Some("2.7.2")
+        );
         // No section, or a section followed by garbage → None.
         assert_eq!(parse_bundled_with("GEM\n  specs:\n"), None);
         assert_eq!(parse_bundled_with("BUNDLED WITH\n   not-a-version\n"), None);
@@ -251,6 +257,10 @@ mod tests {
         // Bare major (no minor) or garbage: unknown, never a refusal.
         assert_eq!(meets_floor("2"), None);
         assert_eq!(meets_floor("abc"), None);
+        // Digits-only components that overflow u64 also fail to parse —
+        // the only way a `looks_like_version` token reaches `classify`'s
+        // fail-open arm.
+        assert_eq!(meets_floor("99999999999999999999.1"), None);
     }
 
     #[tokio::test]
@@ -312,6 +322,47 @@ mod tests {
             probe_bundler(&project).await,
             BundlerProbe::Unsupported { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn test_probe_lock_overflow_version_is_unknown_fail_open() {
+        // A digits-only version whose major component overflows u64 gets past
+        // `looks_like_version` but not `meets_floor`: `classify` must fail
+        // OPEN (Unknown), never refuse. The lock branch answers directly —
+        // the machine's `bundle --version` is not consulted — so the verdict
+        // is deterministic on any host.
+        let (_dir, project) = project_with(&[
+            ("Gemfile", "source 'x'\n"),
+            ("Gemfile.lock", "BUNDLED WITH\n   99999999999999999999.1\n"),
+        ])
+        .await;
+        assert_eq!(probe_bundler(&project).await, BundlerProbe::Unknown);
+    }
+
+    #[tokio::test]
+    async fn test_probe_lock_without_bundled_with_falls_through_to_machine() {
+        // A readable lock with no BUNDLED WITH section (pre-1.10 bundler
+        // locks, hand-trimmed locks) must fall through to the machine's
+        // `bundle --version` probe — not classify the sectionless lock.
+        let (_dir, project) = project_with(&[
+            ("Gemfile", "source 'x'\n"),
+            ("Gemfile.lock", "GEM\n  specs:\n"),
+        ])
+        .await;
+        // Bound the wait like the FIFO test: the fallback carries its own
+        // BUNDLE_VERSION_TIMEOUT, so a prompt answer is part of the contract.
+        let deadline = BUNDLE_VERSION_TIMEOUT + Duration::from_secs(20);
+        let probe = tokio::time::timeout(deadline, probe_bundler(&project))
+            .await
+            .expect("probe_bundler must complete within the machine-probe bound");
+        // Only the machine probe can answer here: Supported (dev/CI bundler
+        // is >= 2.x wherever this suite runs) or Unknown (no bundler, or
+        // unparseable output). An Unsupported verdict would mean the
+        // sectionless lock was somehow consulted as a version source.
+        assert!(
+            matches!(probe, BundlerProbe::Supported | BundlerProbe::Unknown),
+            "unexpected probe verdict: {probe:?}"
+        );
     }
 
     #[cfg(unix)]

@@ -1906,4 +1906,298 @@ mod tests {
             "a FIFO blob entry must be refused — the restore read would hang forever"
         );
     }
+
+    /// Fail-closed (new-file stat error): a non-NotFound stat error on the
+    /// patch-added entry (here ELOOP from a self-referencing symlink as an
+    /// intermediate path component) is an UNVERIFIABLE state and must block
+    /// the rollback — only a true ENOENT means "already rolled back". A
+    /// swallowed error here would mis-classify the entry `AlreadyOriginal`
+    /// and the package rollback would claim success over a state it never
+    /// inspected.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_verify_file_rollback_new_file_stat_error_fails_closed() {
+        let pkg_dir = tempfile::tempdir().unwrap();
+        let blobs_dir = tempfile::tempdir().unwrap();
+
+        // pkg/loop -> loop: resolving `loop` as an intermediate component of
+        // `loop/added.js` hits ELOOP (root-immune, unlike an EACCES setup).
+        std::os::unix::fs::symlink("loop", pkg_dir.path().join("loop")).unwrap();
+
+        let file_info = PatchFileInfo {
+            before_hash: String::new(),
+            after_hash: compute_git_sha256_from_bytes(b"x"),
+        };
+
+        let result = verify_file_rollback(
+            pkg_dir.path(),
+            "loop/added.js",
+            &file_info,
+            blobs_dir.path(),
+        )
+        .await;
+
+        assert_ne!(
+            result.status,
+            VerifyRollbackStatus::AlreadyOriginal,
+            "an unverifiable stat error must never be classified as already rolled back"
+        );
+        assert_eq!(result.status, VerifyRollbackStatus::NotFound);
+        assert!(
+            result
+                .message
+                .as_deref()
+                .unwrap()
+                .contains("Failed to stat file"),
+            "message must carry the real stat error: {:?}",
+            result.message
+        );
+    }
+
+    /// Fail-closed (existing-entry hash error): when the manifest-keyed path
+    /// exists but cannot be hashed — a DIRECTORY planted at the path passes
+    /// the `metadata` existence probe, then `open_regular_file` rejects it —
+    /// verify must block with the real error, not fabricate a hash. The
+    /// new-file twin of this branch is covered by the dangling-symlink test;
+    /// this pins the non-empty-`beforeHash` route.
+    #[tokio::test]
+    async fn test_verify_file_rollback_hash_error_on_existing_entry_fails_closed() {
+        let pkg_dir = tempfile::tempdir().unwrap();
+        let blobs_dir = tempfile::tempdir().unwrap();
+
+        // A directory where the patched file should be.
+        tokio::fs::create_dir(pkg_dir.path().join("index.js"))
+            .await
+            .unwrap();
+
+        let file_info = PatchFileInfo {
+            before_hash: "aaa".to_string(),
+            after_hash: "bbb".to_string(),
+        };
+
+        let result =
+            verify_file_rollback(pkg_dir.path(), "index.js", &file_info, blobs_dir.path()).await;
+
+        assert_eq!(result.status, VerifyRollbackStatus::NotFound);
+        assert!(
+            result
+                .message
+                .as_deref()
+                .unwrap()
+                .contains("Failed to hash file"),
+            "message must carry the real hash error: {:?}",
+            result.message
+        );
+        assert!(
+            result.current_hash.is_none(),
+            "no fabricated hash on the error path"
+        );
+    }
+
+    /// Blob READ failure at restore time: verify only ever STATS the blob
+    /// (never opens it), so an unreadable blob (0o000 — partial GC, botched
+    /// copy, wrong-uid write) verifies `Ready` and the failure surfaces in
+    /// the restore loop's read. The error must name the blob, no file may be
+    /// reported rolled back, and the patched file must be untouched.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_rollback_package_patch_unreadable_blob_fails_at_read() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipping: running as root, 0o000 does not block reads");
+            return;
+        }
+
+        let pkg_dir = tempfile::tempdir().unwrap();
+        let blobs_dir = tempfile::tempdir().unwrap();
+
+        let original = b"original content";
+        let patched = b"patched content";
+        let before_hash = compute_git_sha256_from_bytes(original);
+        let after_hash = compute_git_sha256_from_bytes(patched);
+
+        tokio::fs::write(pkg_dir.path().join("index.js"), patched)
+            .await
+            .unwrap();
+        let blob_path = blobs_dir.path().join(&before_hash);
+        tokio::fs::write(&blob_path, original).await.unwrap();
+        // Blob present (verify's stat-only probe passes) but unreadable.
+        tokio::fs::set_permissions(&blob_path, std::fs::Permissions::from_mode(0o000))
+            .await
+            .unwrap();
+
+        let mut files = HashMap::new();
+        files.insert(
+            "index.js".to_string(),
+            PatchFileInfo {
+                before_hash: before_hash.clone(),
+                after_hash,
+            },
+        );
+
+        let result = rollback_package_patch(
+            "pkg:npm/test@1.0.0",
+            pkg_dir.path(),
+            &files,
+            blobs_dir.path(),
+            false,
+        )
+        .await;
+
+        assert!(!result.success, "unreadable blob must fail the rollback");
+        assert!(result.files_rolled_back.is_empty());
+        let err = result.error.unwrap();
+        assert!(
+            err.contains("Failed to read blob"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.contains(&before_hash),
+            "error must name the unreadable blob: {err}"
+        );
+        // The patched file must be untouched.
+        assert_eq!(
+            tokio::fs::read(pkg_dir.path().join("index.js"))
+                .await
+                .unwrap(),
+            patched
+        );
+    }
+
+    /// Validate-before-write through the PACKAGE engine: verify never
+    /// content-checks the blob (only lstat), so `blobs/<beforeHash>` holding
+    /// wrong bytes verifies `Ready` — the corruption must then be caught by
+    /// `apply_file_patch`'s in-memory hash check BEFORE any disk write. The
+    /// user-facing contract: corrupt blob => rollback fails, the patched
+    /// file is left byte-identical, and no stage/cow litter is dropped.
+    /// Package-engine twin of
+    /// `test_rollback_file_patch_hash_mismatch_leaves_file_intact`.
+    #[tokio::test]
+    async fn test_rollback_package_patch_corrupted_blob_refused_before_write() {
+        let pkg_dir = tempfile::tempdir().unwrap();
+        let blobs_dir = tempfile::tempdir().unwrap();
+
+        let original = b"original content";
+        let patched = b"patched content";
+        let before_hash = compute_git_sha256_from_bytes(original);
+        let after_hash = compute_git_sha256_from_bytes(patched);
+
+        tokio::fs::write(pkg_dir.path().join("index.js"), patched)
+            .await
+            .unwrap();
+        // Blob whose CONTENT does not match its name — verifies Ready.
+        tokio::fs::write(
+            blobs_dir.path().join(&before_hash),
+            b"corrupted blob bytes",
+        )
+        .await
+        .unwrap();
+
+        let mut files = HashMap::new();
+        files.insert(
+            "index.js".to_string(),
+            PatchFileInfo {
+                before_hash,
+                after_hash,
+            },
+        );
+
+        let result = rollback_package_patch(
+            "pkg:npm/test@1.0.0",
+            pkg_dir.path(),
+            &files,
+            blobs_dir.path(),
+            false,
+        )
+        .await;
+
+        assert!(!result.success, "a corrupted blob must fail the rollback");
+        assert!(result.files_rolled_back.is_empty());
+        let err = result.error.unwrap();
+        assert!(
+            err.contains("Hash verification failed"),
+            "unexpected error: {err}"
+        );
+        // The patched file must NOT have been overwritten with the bad bytes.
+        assert_eq!(
+            tokio::fs::read(pkg_dir.path().join("index.js"))
+                .await
+                .unwrap(),
+            patched
+        );
+        // No staged temp file leaked into the package directory.
+        let mut entries = tokio::fs::read_dir(pkg_dir.path()).await.unwrap();
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            assert!(
+                !name.starts_with(".socket-stage-") && !name.starts_with(".socket-cow-"),
+                "stage/cow litter leaked: {name}"
+            );
+        }
+    }
+
+    /// New-file delete failure surfaces: when the unlink itself fails the
+    /// rollback must report the error, name the file, report nothing rolled
+    /// back, and leave the entry in place. macOS-only trigger: `chflags
+    /// uchg` on the parent directory blocks unlink with EPERM while
+    /// `DirWriteGuard` no-ops (the owner-write bit is still set) — the one
+    /// unprivileged deterministic route to this branch (Linux immutability
+    /// needs CAP_LINUX_IMMUTABLE, and the guard already defeats 0o555).
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn test_rollback_package_patch_new_file_delete_failure_surfaces() {
+        let pkg_dir = tempfile::tempdir().unwrap();
+        let blobs_dir = tempfile::tempdir().unwrap();
+
+        let added = b"added by patch\n";
+        let after_hash = compute_git_sha256_from_bytes(added);
+        let path = pkg_dir.path().join("added.js");
+        tokio::fs::write(&path, added).await.unwrap();
+
+        let mut files = HashMap::new();
+        files.insert(
+            "added.js".to_string(),
+            PatchFileInfo {
+                before_hash: String::new(),
+                after_hash,
+            },
+        );
+
+        // Make the parent directory immutable: reads (verify) still pass,
+        // the unlink fails with EPERM.
+        let status = std::process::Command::new("chflags")
+            .arg("uchg")
+            .arg(pkg_dir.path())
+            .status()
+            .expect("chflags must be runnable");
+        assert!(status.success(), "chflags uchg failed");
+
+        let result = rollback_package_patch(
+            "pkg:npm/test@1.0.0",
+            pkg_dir.path(),
+            &files,
+            blobs_dir.path(),
+            false,
+        )
+        .await;
+
+        // Clear the flag BEFORE any assert can panic, so the TempDir drops.
+        let status = std::process::Command::new("chflags")
+            .arg("nouchg")
+            .arg(pkg_dir.path())
+            .status()
+            .expect("chflags must be runnable");
+        assert!(status.success(), "chflags nouchg failed");
+
+        assert!(!result.success, "a failed delete must fail the rollback");
+        assert!(result.files_rolled_back.is_empty());
+        let err = result.error.unwrap();
+        assert!(
+            err.contains("Failed to delete") && err.contains("added.js"),
+            "error must say what could not be deleted: {err}"
+        );
+        // The entry survives — it must not be reported as removed.
+        assert!(tokio::fs::symlink_metadata(&path).await.is_ok());
+    }
 }

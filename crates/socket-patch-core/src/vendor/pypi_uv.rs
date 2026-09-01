@@ -373,6 +373,49 @@ pub(super) fn check_target_guards(
     Ok(UvTarget::Fresh)
 }
 
+/// The (wheel path, sha256) the WIRED pair still pins for an in-sync target:
+/// the lock's rewritten `[[package]]` unit carries `source = { path = … }`
+/// under THIS patch uuid's dir plus the single `{ filename, hash }` wheels
+/// element vendor wrote — the very pin the next `uv sync` verifies. The
+/// in-sync rebuild guard falls back to it when the state.json ledger has no
+/// entry left for the patch. Paths are returned bare (no `./` prefix),
+/// matching the ledger's `artifact.path` spelling.
+pub(super) fn wired_pin(
+    p: &UvProject,
+    canon_name: &str,
+    record_uuid: &str,
+) -> Option<(String, String)> {
+    let unit = p
+        .lock
+        .get("package")
+        .and_then(Item::as_array_of_tables)?
+        .iter()
+        .find(|t| t.get("name").and_then(Item::as_str) == Some(canon_name))?;
+    let path = unit
+        .get("source")
+        .and_then(Item::as_value)
+        .and_then(Value::as_inline_table)
+        .and_then(|t| t.get("path"))
+        .and_then(Value::as_str)?;
+    super::path::parse_vendor_path(path)
+        .filter(|parts| parts.eco == "pypi" && parts.uuid == record_uuid)?;
+    let sha = unit
+        .get("wheels")
+        .and_then(Item::as_array)?
+        .iter()
+        .find_map(|w| {
+            w.as_inline_table()?
+                .get("hash")?
+                .as_str()?
+                .strip_prefix("sha256:")
+        })?;
+    if sha.len() != 64 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let path = path.strip_prefix("./").unwrap_or(path);
+    Some((path.to_string(), sha.to_string()))
+}
+
 /// Wire the pair for the vendored wheel. Writes `pyproject.toml` FIRST, then
 /// `uv.lock`; a failed lock write unwinds the pyproject from the recorded
 /// original so the pair is never left half-wired (either half alone is a
@@ -609,7 +652,10 @@ pub(super) async fn wire_uv(
 /// Reverse the wiring: restore verbatim originals (or delete added fragments)
 /// in reverse application order. A live fragment that no longer matches what
 /// we wrote is left alone with a `vendor_lock_entry_drifted` warning — revert
-/// must never clobber third-party edits.
+/// must never clobber third-party edits — EXCEPT when the fragment already
+/// equals its reverted state (a hand-restored file, a `uv lock` regeneration,
+/// an earlier partial revert): that is convergence, not drift, and it stays
+/// silent per the LIVENESS CONTRACT on [`RevertOutcome::drift_skipped`].
 pub(super) async fn revert_uv(entry: &VendorEntry, root: &Path, dry_run: bool) -> RevertOutcome {
     let pyproject_path = root.join("pyproject.toml");
     let lock_path = root.join("uv.lock");
@@ -627,6 +673,10 @@ pub(super) async fn revert_uv(entry: &VendorEntry, root: &Path, dry_run: bool) -
         .as_ref()
         .map(|m| m.created_sources_table)
         .unwrap_or(false);
+    // Every artifact-routing fragment embeds the uuid dir path — the
+    // ALREADY-CONVERGED probes below key on it (see the LIVENESS CONTRACT
+    // on `RevertOutcome::drift_skipped`).
+    let needle = format!(".socket/vendor/pypi/{}", entry.uuid);
 
     for rec in entry.wiring.iter().rev() {
         let new_text = rec.new.as_ref().and_then(serde_json::Value::as_str);
@@ -644,7 +694,19 @@ pub(super) async fn revert_uv(entry: &VendorEntry, root: &Path, dry_run: bool) -
             "uv_lock_package" | "uv_lock_requires_dist" | "uv_lock_requires_dev" => {
                 match replace_fragment(&lock_text, new_text, original_text) {
                     Some(t) => lock_text = t,
-                    None => warnings.push(drifted("uv.lock")),
+                    None => {
+                        // ALREADY CONVERGED (the LIVENESS CONTRACT,
+                        // vendor/mod.rs): the lock already carries the
+                        // recorded pre-vendor original — a `uv lock`
+                        // regeneration or an earlier partial revert restored
+                        // the fragment. Not drift: stay silent so the
+                        // drift-keep gate can converge instead of keeping
+                        // the artifact dir and ledger entry forever.
+                        if original_text.is_some_and(|orig| lock_text.contains(orig)) {
+                            continue;
+                        }
+                        warnings.push(drifted("uv.lock"));
+                    }
                 }
             }
             "uv_lock_manifest_overrides" => match rec.action {
@@ -662,13 +724,30 @@ pub(super) async fn revert_uv(entry: &VendorEntry, root: &Path, dry_run: bool) -
                     };
                     match removed {
                         Some(t) => lock_text = t,
-                        None => warnings.push(drifted("uv.lock")),
+                        None => {
+                            // ALREADY CONVERGED: an Added fragment's reverted
+                            // state is "no such fragment" — it being gone,
+                            // with no surviving reference to this entry's
+                            // uuid dir anywhere in the lock, satisfies it.
+                            // A reshaped fragment that still routes through
+                            // the artifact stays drift (fail-closed).
+                            if !lock_text.contains(new) && !lock_text.contains(&needle) {
+                                continue;
+                            }
+                            warnings.push(drifted("uv.lock"));
+                        }
                     }
                 }
                 WiringAction::Rewritten => {
                     match replace_fragment(&lock_text, new_text, original_text) {
                         Some(t) => lock_text = t,
-                        None => warnings.push(drifted("uv.lock")),
+                        None => {
+                            // ALREADY CONVERGED: see the package-unit arm.
+                            if original_text.is_some_and(|orig| lock_text.contains(orig)) {
+                                continue;
+                            }
+                            warnings.push(drifted("uv.lock"));
+                        }
                     }
                 }
             },
@@ -685,7 +764,17 @@ pub(super) async fn revert_uv(entry: &VendorEntry, root: &Path, dry_run: bool) -
                                 remove_table_if_empty(&pyproject_text, "[tool.uv.sources]");
                         }
                     }
-                    None => warnings.push(drifted("pyproject.toml")),
+                    None => {
+                        // ALREADY CONVERGED: the added sources line's
+                        // reverted state is "no line" — the pyproject no
+                        // longer referencing this entry's uuid dir satisfies
+                        // it (a hand-restored pyproject). A reshaped line
+                        // still routing through the artifact stays drift.
+                        if !pyproject_text.contains(&needle) {
+                            continue;
+                        }
+                        warnings.push(drifted("pyproject.toml"));
+                    }
                 }
             }
             "uv_override" => match rec.action {
@@ -701,13 +790,31 @@ pub(super) async fn revert_uv(entry: &VendorEntry, root: &Path, dry_run: bool) -
                             // was removed first — reverse order).
                             pyproject_text = remove_table_if_empty(&t, "[tool.uv]");
                         }
-                        None => warnings.push(drifted("pyproject.toml")),
+                        None => {
+                            // ALREADY CONVERGED: the added override's
+                            // reverted state is "no override array" — the
+                            // whole `override-dependencies` key being gone
+                            // satisfies it (a hand-restored pyproject). An
+                            // array that still exists in ANY form stays
+                            // drift, fail-closed (a user-edited spec, or
+                            // user-authored overrides we must not touch).
+                            if !pyproject_text.contains("override-dependencies") {
+                                continue;
+                            }
+                            warnings.push(drifted("pyproject.toml"));
+                        }
                     }
                 }
                 WiringAction::Rewritten => {
                     match replace_fragment(&pyproject_text, new_text, original_text) {
                         Some(t) => pyproject_text = t,
-                        None => warnings.push(drifted("pyproject.toml")),
+                        None => {
+                            // ALREADY CONVERGED: see the package-unit arm.
+                            if original_text.is_some_and(|orig| pyproject_text.contains(orig)) {
+                                continue;
+                            }
+                            warnings.push(drifted("pyproject.toml"));
+                        }
                     }
                 }
             },
@@ -1593,6 +1700,33 @@ wheels = [
             pdm: None,
             pipenv: None,
         }
+    }
+
+    /// The wired-pair pin reader the in-sync rebuild guard falls back to
+    /// when the state.json ledger has no entry: the lock's rewritten
+    /// `[[package]]` unit yields (wheel path, sha256); a registry-shaped
+    /// lock, or a foreign uuid, yields None (the guard then stays off, as
+    /// before, rather than guessing).
+    #[tokio::test]
+    async fn wired_pin_reads_the_wired_pair() {
+        let tmp = write_pair(DIRECT_PATH_PYPROJECT, DIRECT_PATH_LOCK).await;
+        let p = load_uv_project(tmp.path()).await.unwrap();
+        assert_eq!(
+            wired_pin(&p, "six", UUID),
+            Some((REL_WHEEL.to_string(), WHEEL_SHA.to_string()))
+        );
+        assert_eq!(
+            wired_pin(&p, "six", "00000000-0000-4000-8000-000000000000"),
+            None,
+            "a foreign patch uuid pins nothing of ours"
+        );
+        let tmp2 = write_pair(DIRECT_REGISTRY_PYPROJECT, DIRECT_REGISTRY_LOCK).await;
+        let p2 = load_uv_project(tmp2.path()).await.unwrap();
+        assert_eq!(
+            wired_pin(&p2, "six", UUID),
+            None,
+            "a registry-shaped lock pins nothing of ours"
+        );
     }
 
     /// The load-bearing oracle: wiring the direct-registry pair must produce
@@ -2852,5 +2986,1061 @@ wheels = [
                     \n\
                     body\n";
         assert_eq!(render_package_metadata_block(text), None);
+    }
+
+    // ── load/wire refusal edges ──────────────────────────────────────────
+
+    /// Load-side error tuples for malformed pyproject shapes: an unparseable
+    /// pyproject.toml and a `[project]` with no `name` (only their uv.lock
+    /// twins were covered).
+    #[tokio::test]
+    async fn load_refuses_unparseable_or_nameless_pyproject() {
+        let tmp = write_pair("not = [broken\n", DIRECT_REGISTRY_LOCK).await;
+        let err = load_uv_project(tmp.path()).await.unwrap_err();
+        assert_eq!(err.0, "pypi_uv_lock_parse_failed");
+        assert!(err.1.contains("pyproject.toml does not parse"), "{}", err.1);
+
+        let tmp = write_pair("[project]\nversion = \"0.1.0\"\n", DIRECT_REGISTRY_LOCK).await;
+        let err = load_uv_project(tmp.path()).await.unwrap_err();
+        assert_eq!(err.0, "pypi_uv_lock_root_missing");
+        assert!(err.1.contains("no [project] name"), "{}", err.1);
+    }
+
+    /// `[tool]` whose `uv` key is not a standard table sails past the load
+    /// guards (they use `item_get` and skip a non-table), so wire's
+    /// `ensure_table` is the first place the shape is caught — it must
+    /// refuse BEFORE any write, leaving both files byte-untouched.
+    #[tokio::test]
+    async fn wire_refuses_non_table_tool_uv_before_any_write() {
+        let pyproject = format!("{DIRECT_REGISTRY_PYPROJECT}\n[tool]\nuv = 3\n");
+        let tmp = write_pair(&pyproject, DIRECT_REGISTRY_LOCK).await;
+        let p = load_uv_project(tmp.path()).await.unwrap();
+
+        let err = wire_uv(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UUID,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, "pypi_uv_lock_parse_failed");
+        assert!(err.1.contains("is not a standard table"), "{}", err.1);
+
+        let (py, lock) = read_pair(tmp.path()).await;
+        assert_eq!(py, pyproject, "refusal must precede any pyproject write");
+        assert_eq!(lock, DIRECT_REGISTRY_LOCK, "refusal must precede any lock write");
+    }
+
+    /// Two real single-project lock shapes that must load clean: a
+    /// `[manifest] members` list naming ONLY the root (the workspace
+    /// refusal's fall-through edge) and a lock with no `revision` key at all
+    /// (older uv emits none) — the latter must round-trip `None` into
+    /// [`UvMeta`] with zero warnings.
+    #[tokio::test]
+    async fn load_tolerates_root_only_members_and_revisionless_lock() {
+        let members_lock = DIRECT_REGISTRY_LOCK.replace(
+            "requires-python = \">=3.10\"\n",
+            "requires-python = \">=3.10\"\n\n[manifest]\nmembers = [\n    \"proj\",\n]\n",
+        );
+        let tmp = write_pair(DIRECT_REGISTRY_PYPROJECT, &members_lock).await;
+        let p = load_uv_project(tmp.path()).await.unwrap();
+        assert!(p.warnings.is_empty(), "{:?}", p.warnings);
+
+        let revisionless_lock = DIRECT_REGISTRY_LOCK.replace("revision = 3\n", "");
+        let tmp = write_pair(DIRECT_REGISTRY_PYPROJECT, &revisionless_lock).await;
+        let p = load_uv_project(tmp.path()).await.unwrap();
+        assert!(p.warnings.is_empty(), "{:?}", p.warnings);
+        assert_eq!(p.lock_revision, None);
+
+        let (_, meta) = wire_uv(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UUID,
+        )
+        .await
+        .unwrap();
+        assert_eq!(meta.lock_revision, None);
+        let (_, lock) = read_pair(tmp.path()).await;
+        assert_eq!(
+            lock,
+            DIRECT_PATH_LOCK.replace("revision = 3\n", ""),
+            "the wired revisionless lock must still byte-match uv's shape"
+        );
+    }
+
+    /// A `[tool.uv.sources]` entry or an override pin for a DIFFERENT
+    /// package must be tolerated (Fresh), not refused — the guards skip
+    /// non-matching entries.
+    #[tokio::test]
+    async fn guards_tolerate_foreign_sources_and_overrides() {
+        let tmp = write_pair(
+            &format!(
+                "{DIRECT_REGISTRY_PYPROJECT}\n[tool.uv.sources]\nother-pkg = {{ path = \"../local/other\" }}\n"
+            ),
+            DIRECT_REGISTRY_LOCK,
+        )
+        .await;
+        let p = load_uv_project(tmp.path()).await.unwrap();
+        assert_eq!(
+            check_target_guards(&p, "six", UUID),
+            Ok(UvTarget::Fresh),
+            "a sources entry for another package must not refuse"
+        );
+
+        let tmp = write_pair(
+            &format!(
+                "{TRANSITIVE_REGISTRY_PYPROJECT}\n[tool.uv]\noverride-dependencies = [\"other-pkg==1.0\"]\n"
+            ),
+            TRANSITIVE_REGISTRY_LOCK,
+        )
+        .await;
+        let p = load_uv_project(tmp.path()).await.unwrap();
+        assert_eq!(
+            check_target_guards(&p, "six", UUID),
+            Ok(UvTarget::Fresh),
+            "an override pin for another package must not refuse"
+        );
+    }
+
+    // ── pre-existing user config: override array + [manifest] section ───
+
+    /// The user already pins one package via `[tool.uv] override-dependencies`
+    /// and we vendor a DIFFERENT transitive dep: wire must APPEND to the
+    /// existing array (Rewritten record with old/new array texts), and revert
+    /// must restore the user's one-element array while keeping their
+    /// `[tool.uv]` table alive.
+    #[tokio::test]
+    async fn override_wiring_appends_to_existing_override_dependencies_and_reverts() {
+        let pyproject = format!(
+            "{TRANSITIVE_REGISTRY_PYPROJECT}\n[tool.uv]\noverride-dependencies = [\"other-pkg==1.0\"]\n"
+        );
+        let tmp = write_pair(&pyproject, TRANSITIVE_REGISTRY_LOCK).await;
+        let p = load_uv_project(tmp.path()).await.unwrap();
+        assert_eq!(classify_dependency(&p, "six"), UvDepClass::Transitive);
+
+        let (wiring, meta) = wire_uv(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UUID,
+        )
+        .await
+        .unwrap();
+
+        let (wired_py, wired_lock) = read_pair(tmp.path()).await;
+        assert_eq!(
+            wired_py,
+            OVERRIDE_TRANSITIVE_PYPROJECT.replace(
+                "override-dependencies = [\"six==1.16.0\"]",
+                "override-dependencies = [\"other-pkg==1.0\", \"six==1.16.0\"]",
+            ),
+            "our pin must be appended to the user's array"
+        );
+        assert_eq!(wired_lock, OVERRIDE_TRANSITIVE_LOCK);
+        assert_eq!(meta.dep_class, "override");
+
+        let rec = wiring.iter().find(|w| w.kind == "uv_override").unwrap();
+        assert_eq!(rec.action, WiringAction::Rewritten);
+        assert_eq!(
+            rec.original.as_ref().and_then(serde_json::Value::as_str),
+            Some("[\"other-pkg==1.0\"]")
+        );
+        assert_eq!(
+            rec.new.as_ref().and_then(serde_json::Value::as_str),
+            Some("[\"other-pkg==1.0\", \"six==1.16.0\"]")
+        );
+
+        let entry = entry_for(wiring, meta);
+        let outcome = revert_uv(&entry, tmp.path(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        let (py, lock) = read_pair(tmp.path()).await;
+        assert_eq!(
+            py, pyproject,
+            "the user's own pin keeps [tool.uv] alive after revert"
+        );
+        assert_eq!(lock, TRANSITIVE_REGISTRY_LOCK);
+    }
+
+    /// A pre-existing single-line non-empty `[manifest] overrides` array
+    /// gains our element with `, ` separation (Rewritten record), and revert
+    /// byte-restores the user's array.
+    #[tokio::test]
+    async fn override_wiring_extends_a_single_line_manifest_overrides_array() {
+        let one_el = "overrides = [{ name = \"other\", path = \"o.whl\" }]";
+        let input_lock = TRANSITIVE_REGISTRY_LOCK.replace(
+            "requires-python = \">=3.10\"\n",
+            &format!("requires-python = \">=3.10\"\n\n[manifest]\n{one_el}\n"),
+        );
+        let tmp = write_pair(TRANSITIVE_REGISTRY_PYPROJECT, &input_lock).await;
+        let p = load_uv_project(tmp.path()).await.unwrap();
+        let (wiring, meta) = wire_uv(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UUID,
+        )
+        .await
+        .unwrap();
+
+        let (wired_py, wired_lock) = read_pair(tmp.path()).await;
+        assert_eq!(wired_py, OVERRIDE_TRANSITIVE_PYPROJECT);
+        assert_eq!(
+            wired_lock,
+            OVERRIDE_TRANSITIVE_LOCK.replace(
+                &format!("overrides = [{{ name = \"six\", path = \"{REL_WHEEL}\" }}]"),
+                &format!(
+                    "overrides = [{{ name = \"other\", path = \"o.whl\" }}, {{ name = \"six\", path = \"{REL_WHEEL}\" }}]"
+                ),
+            )
+        );
+        wired_lock
+            .parse::<DocumentMut>()
+            .expect("the wired uv.lock must stay parseable TOML");
+
+        let rec = wiring
+            .iter()
+            .find(|w| w.kind == "uv_lock_manifest_overrides")
+            .unwrap();
+        assert_eq!(rec.action, WiringAction::Rewritten);
+        assert_eq!(
+            rec.original.as_ref().and_then(serde_json::Value::as_str),
+            Some("[{ name = \"other\", path = \"o.whl\" }]")
+        );
+
+        let entry = entry_for(wiring, meta);
+        let outcome = revert_uv(&entry, tmp.path(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        let (py, lock) = read_pair(tmp.path()).await;
+        assert_eq!(py, TRANSITIVE_REGISTRY_PYPROJECT);
+        assert_eq!(lock, input_lock, "the user's overrides array is restored");
+    }
+
+    /// A pre-existing MULTI-LINE `[manifest] overrides` array gains our
+    /// element as an indented line before the closing bracket, and revert
+    /// byte-restores it.
+    #[tokio::test]
+    async fn override_wiring_extends_a_multi_line_manifest_overrides_array() {
+        let ml = "overrides = [\n    { name = \"other\", path = \"o.whl\" },\n]";
+        let input_lock = TRANSITIVE_REGISTRY_LOCK.replace(
+            "requires-python = \">=3.10\"\n",
+            &format!("requires-python = \">=3.10\"\n\n[manifest]\n{ml}\n"),
+        );
+        let tmp = write_pair(TRANSITIVE_REGISTRY_PYPROJECT, &input_lock).await;
+        let p = load_uv_project(tmp.path()).await.unwrap();
+        let (wiring, meta) = wire_uv(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UUID,
+        )
+        .await
+        .unwrap();
+
+        let (wired_py, wired_lock) = read_pair(tmp.path()).await;
+        assert_eq!(wired_py, OVERRIDE_TRANSITIVE_PYPROJECT);
+        assert_eq!(
+            wired_lock,
+            OVERRIDE_TRANSITIVE_LOCK.replace(
+                &format!("overrides = [{{ name = \"six\", path = \"{REL_WHEEL}\" }}]"),
+                &format!(
+                    "overrides = [\n    {{ name = \"other\", path = \"o.whl\" }},\n    {{ name = \"six\", path = \"{REL_WHEEL}\" }},\n]"
+                ),
+            ),
+            "our element must be inserted before the closing bracket, indented"
+        );
+        wired_lock
+            .parse::<DocumentMut>()
+            .expect("the wired uv.lock must stay parseable TOML");
+
+        let entry = entry_for(wiring, meta);
+        let outcome = revert_uv(&entry, tmp.path(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        let (py, lock) = read_pair(tmp.path()).await;
+        assert_eq!(py, TRANSITIVE_REGISTRY_PYPROJECT);
+        assert_eq!(lock, input_lock);
+    }
+
+    /// `[manifest]` exists (a root-only members list) but has no `overrides`
+    /// key: wire adds the key right under the header (Added record NOT
+    /// prefixed with `[manifest]`), and revert removes exactly that line —
+    /// never the user's section.
+    #[tokio::test]
+    async fn override_wiring_adds_overrides_key_under_existing_manifest_header() {
+        let input_lock = TRANSITIVE_REGISTRY_LOCK.replace(
+            "requires-python = \">=3.10\"\n",
+            "requires-python = \">=3.10\"\n\n[manifest]\nmembers = [\n    \"proj\",\n]\n",
+        );
+        let tmp = write_pair(TRANSITIVE_REGISTRY_PYPROJECT, &input_lock).await;
+        let p = load_uv_project(tmp.path()).await.unwrap();
+        let (wiring, meta) = wire_uv(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UUID,
+        )
+        .await
+        .unwrap();
+
+        let overrides_line = format!("overrides = [{{ name = \"six\", path = \"{REL_WHEEL}\" }}]");
+        let (_, wired_lock) = read_pair(tmp.path()).await;
+        assert_eq!(
+            wired_lock,
+            OVERRIDE_TRANSITIVE_LOCK.replace(
+                &format!("{overrides_line}\n"),
+                &format!("{overrides_line}\nmembers = [\n    \"proj\",\n]\n"),
+            ),
+            "the overrides key must land right under the [manifest] header"
+        );
+        wired_lock
+            .parse::<DocumentMut>()
+            .expect("the wired uv.lock must stay parseable TOML");
+
+        let rec = wiring
+            .iter()
+            .find(|w| w.kind == "uv_lock_manifest_overrides")
+            .unwrap();
+        assert_eq!(rec.action, WiringAction::Added);
+        assert_eq!(
+            rec.new.as_ref().and_then(serde_json::Value::as_str),
+            Some(overrides_line.as_str()),
+            "an added key (not a created section) must not carry the [manifest] header"
+        );
+
+        let entry = entry_for(wiring, meta);
+        let outcome = revert_uv(&entry, tmp.path(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        let (py, lock) = read_pair(tmp.path()).await;
+        assert_eq!(py, TRANSITIVE_REGISTRY_PYPROJECT);
+        assert_eq!(lock, input_lock, "only our added line may be removed");
+    }
+
+    /// A third-party edit to the REWRITTEN `[manifest] overrides` array must
+    /// be left alone with a drift warning — the never-clobber contract for
+    /// this record kind (only the uv_lock_package drift arm was covered).
+    #[tokio::test]
+    async fn revert_warns_and_skips_on_drifted_manifest_overrides_array() {
+        let one_el = "overrides = [{ name = \"other\", path = \"o.whl\" }]";
+        let input_lock = TRANSITIVE_REGISTRY_LOCK.replace(
+            "requires-python = \">=3.10\"\n",
+            &format!("requires-python = \">=3.10\"\n\n[manifest]\n{one_el}\n"),
+        );
+        let tmp = write_pair(TRANSITIVE_REGISTRY_PYPROJECT, &input_lock).await;
+        let p = load_uv_project(tmp.path()).await.unwrap();
+        let (wiring, meta) = wire_uv(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UUID,
+        )
+        .await
+        .unwrap();
+
+        // Drift: the user reshaped the overrides array around our element
+        // (still routing six through the vendored wheel). NOT convergence —
+        // hand-removing our element back to the recorded original array is
+        // (covered by the converged-revert tests).
+        let (_, wired_lock) = read_pair(tmp.path()).await;
+        let tampered = wired_lock.replace(
+            &format!(
+                "[{{ name = \"other\", path = \"o.whl\" }}, {{ name = \"six\", path = \"{REL_WHEEL}\" }}]"
+            ),
+            &format!(
+                "[{{ name = \"six\", path = \"{REL_WHEEL}\" }}, {{ name = \"extra\", path = \"e.whl\" }}]"
+            ),
+        );
+        assert_ne!(tampered, wired_lock, "the tamper must hit the array");
+        tokio::fs::write(tmp.path().join("uv.lock"), &tampered)
+            .await
+            .unwrap();
+
+        let entry = entry_for(wiring, meta);
+        let outcome = revert_uv(&entry, tmp.path(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert_eq!(outcome.warnings.len(), 1, "{:?}", outcome.warnings);
+        assert_eq!(outcome.warnings[0].code, "vendor_lock_entry_drifted");
+        assert!(
+            outcome.warnings[0].detail.contains("uv.lock"),
+            "{}",
+            outcome.warnings[0].detail
+        );
+        let (py, lock) = read_pair(tmp.path()).await;
+        assert_eq!(py, TRANSITIVE_REGISTRY_PYPROJECT);
+        let expected = input_lock.replace(
+            "[{ name = \"other\", path = \"o.whl\" }]",
+            &format!(
+                "[{{ name = \"six\", path = \"{REL_WHEEL}\" }}, {{ name = \"extra\", path = \"e.whl\" }}]"
+            ),
+        );
+        assert_eq!(
+            lock, expected,
+            "the undrifted [[package]] fragment still reverts; the array is left as the user edited it"
+        );
+    }
+
+    // ── pyproject-side drift + forward-compat revert arms ────────────────
+
+    /// The `[tool.uv.sources]` line we wrote was EDITED by hand — still
+    /// routing six through the vendored wheel: revert warns and leaves the
+    /// pyproject alone while still reverting the lock. (A line REMOVED by
+    /// hand is convergence, not drift — the converged-revert tests below.)
+    #[tokio::test]
+    async fn revert_warns_and_skips_when_sources_line_was_edited() {
+        let tmp = write_pair(DIRECT_REGISTRY_PYPROJECT, DIRECT_REGISTRY_LOCK).await;
+        let p = load_uv_project(tmp.path()).await.unwrap();
+        let (wiring, meta) = wire_uv(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UUID,
+        )
+        .await
+        .unwrap();
+
+        let (wired_py, _) = read_pair(tmp.path()).await;
+        let tampered = wired_py.replace(
+            &format!("six = {{ path = \"{REL_WHEEL}\" }}\n"),
+            &format!("six = {{ path = \"{REL_WHEEL}\", editable = false }}\n"),
+        );
+        assert_ne!(tampered, wired_py, "the tamper must edit the sources line");
+        tokio::fs::write(tmp.path().join("pyproject.toml"), &tampered)
+            .await
+            .unwrap();
+
+        let entry = entry_for(wiring, meta);
+        let outcome = revert_uv(&entry, tmp.path(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert_eq!(outcome.warnings.len(), 1, "{:?}", outcome.warnings);
+        assert_eq!(outcome.warnings[0].code, "vendor_lock_entry_drifted");
+        assert!(
+            outcome.warnings[0].detail.contains("pyproject.toml"),
+            "{}",
+            outcome.warnings[0].detail
+        );
+        let (py, lock) = read_pair(tmp.path()).await;
+        assert_eq!(lock, DIRECT_REGISTRY_LOCK, "the lock side still reverts");
+        assert!(
+            py.contains(&format!(
+                "six = {{ path = \"{REL_WHEEL}\", editable = false }}"
+            )),
+            "the drifted pyproject is left alone: {py}"
+        );
+    }
+
+    /// LIVENESS CONTRACT (vendor/mod.rs): a hand-restored pair — the user
+    /// removed the vendor wiring and relocked, so every fragment already
+    /// equals its reverted state — is CONVERGED, not drifted. The revert
+    /// must stay silent (no `vendor_lock_entry_drifted`), or the pypi
+    /// drift-keep gate would retain the uuid dir and ledger entry forever
+    /// with a remediation ("undo the drift") that can never be satisfied.
+    /// Covers the direct shape (sources entry + package/requires-dist
+    /// fragments) and the transitive shape (override + manifest overrides).
+    #[tokio::test]
+    async fn revert_hand_restored_pair_is_silent_convergence() {
+        for (registry_py, registry_lock, target) in [
+            (DIRECT_REGISTRY_PYPROJECT, DIRECT_REGISTRY_LOCK, "six"),
+            (
+                TRANSITIVE_REGISTRY_PYPROJECT,
+                TRANSITIVE_REGISTRY_LOCK,
+                "six",
+            ),
+        ] {
+            let tmp = write_pair(registry_py, registry_lock).await;
+            let p = load_uv_project(tmp.path()).await.unwrap();
+            let (wiring, meta) = wire_uv(
+                &p,
+                tmp.path(),
+                target,
+                "1.16.0",
+                REL_WHEEL,
+                WHEEL_NAME,
+                WHEEL_SHA,
+                UUID,
+            )
+            .await
+            .unwrap();
+
+            // The user hand-restores the pyproject and regenerates the lock
+            // (`uv lock`): both files are back at their pre-vendor bytes.
+            tokio::fs::write(tmp.path().join("pyproject.toml"), registry_py)
+                .await
+                .unwrap();
+            tokio::fs::write(tmp.path().join("uv.lock"), registry_lock)
+                .await
+                .unwrap();
+
+            let entry = entry_for(wiring, meta);
+            let outcome = revert_uv(&entry, tmp.path(), false).await;
+            assert!(outcome.success, "{:?}", outcome.error);
+            assert!(
+                outcome.warnings.is_empty(),
+                "already-converged records are silent no-ops: {:?}",
+                outcome.warnings
+            );
+            assert!(!outcome.kept_artifact);
+            let (py, lock) = read_pair(tmp.path()).await;
+            assert_eq!(py, registry_py, "the restored pyproject stays put");
+            assert_eq!(lock, registry_lock, "the restored lock stays put");
+        }
+    }
+
+    /// The pypi drift-keep gate × the convergence carve-out, end to end: a
+    /// hand-restored uv pair converges silently, so `revert_pypi` must still
+    /// DELETE the artifact dir (no `kept_artifact`) — before the carve-out
+    /// the gate misread the convergence as drift and kept the uuid dir and
+    /// ledger entry forever with an unsatisfiable remediation.
+    #[tokio::test]
+    async fn revert_pypi_converged_uv_cleans_up_the_artifact() {
+        let tmp = write_pair(DIRECT_REGISTRY_PYPROJECT, DIRECT_REGISTRY_LOCK).await;
+        let p = load_uv_project(tmp.path()).await.unwrap();
+        let (wiring, meta) = wire_uv(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UUID,
+        )
+        .await
+        .unwrap();
+        let uuid_dir = tmp.path().join(format!(".socket/vendor/pypi/{UUID}"));
+        tokio::fs::create_dir_all(&uuid_dir).await.unwrap();
+        tokio::fs::write(uuid_dir.join(WHEEL_NAME), b"wheel")
+            .await
+            .unwrap();
+
+        // Hand-restore the pair: nothing references the artifact any more.
+        tokio::fs::write(tmp.path().join("pyproject.toml"), DIRECT_REGISTRY_PYPROJECT)
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.path().join("uv.lock"), DIRECT_REGISTRY_LOCK)
+            .await
+            .unwrap();
+
+        let entry = entry_for(wiring, meta);
+        let outcome = crate::vendor::pypi::revert_pypi(&entry, tmp.path(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(
+            !outcome.kept_artifact,
+            "convergence must not trip the drift-keep gate: {:?}",
+            outcome.warnings
+        );
+        assert!(
+            !uuid_dir.exists(),
+            "a converged revert must still clean up the artifact"
+        );
+    }
+
+    /// The gate's keep side for uv: a hand-EDITED lock fragment that still
+    /// routes through the vendored wheel is genuine drift — `revert_pypi`
+    /// must keep the uuid dir (and flag it) rather than deleting the wheel
+    /// the lock still points at.
+    #[tokio::test]
+    async fn revert_pypi_drifted_uv_keeps_artifact() {
+        let tmp = write_pair(DIRECT_REGISTRY_PYPROJECT, DIRECT_REGISTRY_LOCK).await;
+        let p = load_uv_project(tmp.path()).await.unwrap();
+        let (wiring, meta) = wire_uv(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UUID,
+        )
+        .await
+        .unwrap();
+        let uuid_dir = tmp.path().join(format!(".socket/vendor/pypi/{UUID}"));
+        tokio::fs::create_dir_all(&uuid_dir).await.unwrap();
+        let wheel = uuid_dir.join(WHEEL_NAME);
+        tokio::fs::write(&wheel, b"wheel").await.unwrap();
+
+        // Hand-edit ONLY the source line's decor; the path still points into
+        // the uuid dir about to be deleted.
+        let (_, wired_lock) = read_pair(tmp.path()).await;
+        let tampered = wired_lock.replace(
+            &format!("source = {{ path = \"{REL_WHEEL}\" }}"),
+            &format!("source = {{ path = \"{REL_WHEEL}\" }} # reviewed"),
+        );
+        assert_ne!(tampered, wired_lock, "the tamper must edit the unit");
+        tokio::fs::write(tmp.path().join("uv.lock"), &tampered)
+            .await
+            .unwrap();
+
+        let entry = entry_for(wiring, meta);
+        let outcome = crate::vendor::pypi::revert_pypi(&entry, tmp.path(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_lock_entry_drifted"),
+            "{:?}",
+            outcome.warnings
+        );
+        assert!(
+            outcome.kept_artifact,
+            "a drift-skipped revert must flag the keep so the CLI retains the ledger entry"
+        );
+        assert!(
+            wheel.is_file(),
+            "uv.lock still references the wheel; deleting it would brick installs"
+        );
+    }
+
+    /// The ADDED `override-dependencies = […]` line was edited after wiring:
+    /// revert warns and leaves it in place (never clobbers), while the
+    /// sources entry and both lock fragments still revert.
+    #[tokio::test]
+    async fn revert_warns_and_skips_when_added_override_line_was_edited() {
+        let tmp = write_pair(TRANSITIVE_REGISTRY_PYPROJECT, TRANSITIVE_REGISTRY_LOCK).await;
+        let p = load_uv_project(tmp.path()).await.unwrap();
+        let (wiring, meta) = wire_uv(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UUID,
+        )
+        .await
+        .unwrap();
+
+        let (wired_py, _) = read_pair(tmp.path()).await;
+        let tampered = wired_py.replace(
+            "override-dependencies = [\"six==1.16.0\"]",
+            "override-dependencies = [\"six==1.17.0\"]",
+        );
+        assert_ne!(tampered, wired_py, "the tamper must edit the override line");
+        tokio::fs::write(tmp.path().join("pyproject.toml"), &tampered)
+            .await
+            .unwrap();
+
+        let entry = entry_for(wiring, meta);
+        let outcome = revert_uv(&entry, tmp.path(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert_eq!(outcome.warnings.len(), 1, "{:?}", outcome.warnings);
+        assert_eq!(outcome.warnings[0].code, "vendor_lock_entry_drifted");
+        assert!(
+            outcome.warnings[0].detail.contains("pyproject.toml"),
+            "{}",
+            outcome.warnings[0].detail
+        );
+        let (py, lock) = read_pair(tmp.path()).await;
+        assert_eq!(lock, TRANSITIVE_REGISTRY_LOCK);
+        assert!(
+            py.contains("override-dependencies = [\"six==1.17.0\"]"),
+            "the user's edit must survive: {py}"
+        );
+        assert!(
+            !py.contains("[tool.uv.sources]"),
+            "the undrifted sources entry (and its created table) still reverts: {py}"
+        );
+    }
+
+    /// Forward-compat: a wiring record written by a NEWER CLI (unknown kind)
+    /// is skipped with a warning naming the kind — revert still succeeds and
+    /// touches nothing.
+    #[tokio::test]
+    async fn revert_skips_unknown_wiring_kind_with_a_warning() {
+        let tmp = write_pair(DIRECT_REGISTRY_PYPROJECT, DIRECT_REGISTRY_LOCK).await;
+        let entry = entry_for(
+            vec![record(
+                "uv.lock",
+                "uv_future_kind",
+                WiringAction::Added,
+                "six",
+                None,
+                "x".into(),
+            )],
+            UvMeta {
+                dep_class: "direct".into(),
+                original_specifier: None,
+                created_sources_table: false,
+                lock_revision: Some(3),
+            },
+        );
+
+        let outcome = revert_uv(&entry, tmp.path(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert_eq!(outcome.warnings.len(), 1, "{:?}", outcome.warnings);
+        assert_eq!(outcome.warnings[0].code, "vendor_lock_entry_drifted");
+        assert!(
+            outcome.warnings[0].detail.contains("unknown uv wiring kind")
+                && outcome.warnings[0].detail.contains("uv_future_kind"),
+            "{}",
+            outcome.warnings[0].detail
+        );
+        let (py, lock) = read_pair(tmp.path()).await;
+        assert_eq!(py, DIRECT_REGISTRY_PYPROJECT);
+        assert_eq!(lock, DIRECT_REGISTRY_LOCK);
+    }
+
+    // ── write-failure edges ──────────────────────────────────────────────
+
+    /// The pyproject write is the FIRST write of the commit: when it fails,
+    /// wire errors out with the lock never written (the tested twin covers
+    /// the lock-write failure + unwind).
+    #[tokio::test]
+    async fn pyproject_write_failure_leaves_the_lock_untouched() {
+        let tmp = write_pair(DIRECT_REGISTRY_PYPROJECT, DIRECT_REGISTRY_LOCK).await;
+        let p = load_uv_project(tmp.path()).await.unwrap();
+        // Make the pyproject unwritable: a directory can't be renamed over.
+        tokio::fs::remove_file(tmp.path().join("pyproject.toml"))
+            .await
+            .unwrap();
+        tokio::fs::create_dir(tmp.path().join("pyproject.toml"))
+            .await
+            .unwrap();
+
+        let err = wire_uv(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UUID,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, "pypi_uv_write_failed");
+        assert!(err.1.contains("cannot write pyproject.toml"), "{}", err.1);
+        let lock = tokio::fs::read_to_string(tmp.path().join("uv.lock"))
+            .await
+            .unwrap();
+        assert_eq!(
+            lock, DIRECT_REGISTRY_LOCK,
+            "no lock write may precede the failed pyproject write"
+        );
+    }
+
+    /// A revert that cannot write uv.lock reports failure (not a silent
+    /// partial revert) and leaves the wired pair on disk.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn revert_lock_write_failure_reports_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = write_pair(DIRECT_REGISTRY_PYPROJECT, DIRECT_REGISTRY_LOCK).await;
+        let p = load_uv_project(tmp.path()).await.unwrap();
+        let (wiring, meta) = wire_uv(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UUID,
+        )
+        .await
+        .unwrap();
+        let (wired_py, wired_lock) = read_pair(tmp.path()).await;
+        let entry = entry_for(wiring, meta);
+
+        // The atomic write stages a temp file in the parent dir; a read-only
+        // dir fails the stage while both reads still succeed.
+        tokio::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o555))
+            .await
+            .unwrap();
+        // Skip when the environment ignores modes (running as root).
+        if std::fs::write(tmp.path().join(".probe"), b"x").is_ok() {
+            let _ = std::fs::remove_file(tmp.path().join(".probe"));
+            tokio::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o755))
+                .await
+                .unwrap();
+            return;
+        }
+        let outcome = revert_uv(&entry, tmp.path(), false).await;
+        // Restore before asserting so the TempDir cleans up even on failure.
+        tokio::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o755))
+            .await
+            .unwrap();
+
+        assert!(!outcome.success, "the failed write must fail the revert");
+        assert!(!outcome.kept_artifact);
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("cannot write uv.lock"),
+            "{:?}",
+            outcome.error
+        );
+        let (py, lock) = read_pair(tmp.path()).await;
+        assert_eq!(py, wired_py, "the wired pair must be left in place");
+        assert_eq!(lock, wired_lock, "the wired pair must be left in place");
+    }
+
+    // ── sdist-only [[package]] units ─────────────────────────────────────
+
+    /// A pure-sdist distribution ([[package]] with no wheels array): the
+    /// rewrite must APPEND the wheels array at the unit's end — and the
+    /// result is exactly uv's own path-wheel shape, so the wired lock
+    /// byte-matches the fixture and revert byte-restores the sdist-only
+    /// original.
+    #[tokio::test]
+    async fn sdist_only_package_unit_gains_the_wheels_array() {
+        // Drop six's wheels array from the registry lock (the only one).
+        let start = DIRECT_REGISTRY_LOCK.find("wheels = [").unwrap();
+        let end = start + DIRECT_REGISTRY_LOCK[start..].find("]\n").unwrap() + 2;
+        let sdist_only_lock = format!(
+            "{}{}",
+            &DIRECT_REGISTRY_LOCK[..start],
+            &DIRECT_REGISTRY_LOCK[end..]
+        );
+
+        let tmp = write_pair(DIRECT_REGISTRY_PYPROJECT, &sdist_only_lock).await;
+        let p = load_uv_project(tmp.path()).await.unwrap();
+        let (wiring, meta) = wire_uv(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UUID,
+        )
+        .await
+        .unwrap();
+
+        let (py, lock) = read_pair(tmp.path()).await;
+        assert_eq!(py, DIRECT_PATH_PYPROJECT);
+        assert_eq!(
+            lock, DIRECT_PATH_LOCK,
+            "the sdist-only unit must gain the wheels array in uv's own shape"
+        );
+
+        let entry = entry_for(wiring, meta);
+        let outcome = revert_uv(&entry, tmp.path(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        let (py, lock) = read_pair(tmp.path()).await;
+        assert_eq!(py, DIRECT_REGISTRY_PYPROJECT);
+        assert_eq!(lock, sdist_only_lock, "revert must byte-restore the sdist-only lock");
+    }
+
+    /// An sdist-only unit FOLLOWED by a `[package.*]` sub-table: the wheels
+    /// array must be spliced before the blank line preceding the sub-table,
+    /// never after it.
+    #[test]
+    fn sdist_only_unit_splices_wheels_before_a_package_subtable() {
+        let lock_text = "version = 1\n\n[[package]]\nname = \"six\"\nversion = \"1.15.0\"\nsource = { registry = \"https://pypi.org/simple\" }\nsdist = { url = \"https://e/six-1.15.0.tar.gz\", hash = \"sha256:aa\", size = 1 }\n\n[package.optional-dependencies]\nsocks = [\n    { name = \"pysocks\" },\n]\n";
+        let (old_unit, new_unit) = rewrite_target_package_unit(
+            lock_text,
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            None,
+        )
+        .unwrap();
+        assert!(lock_text.contains(&old_unit));
+        assert_eq!(
+            new_unit,
+            format!(
+                "[[package]]\nname = \"six\"\nversion = \"1.16.0\"\nsource = {{ path = \"{REL_WHEEL}\" }}\nwheels = [\n    {{ filename = \"{WHEEL_NAME}\", hash = \"sha256:{WHEEL_SHA}\" }},\n]\n\n[package.optional-dependencies]\nsocks = [\n    {{ name = \"pysocks\" }},\n]"
+            ),
+            "wheels must land before the [package.*] sub-table"
+        );
+    }
+
+    // ── root-metadata rewrite edges ──────────────────────────────────────
+
+    /// A multi-entry requires-dist array: the needle-matching must skip
+    /// foreign entries and the byte-span arithmetic must address the LATER
+    /// target entry exactly.
+    #[test]
+    fn requires_dist_rewrite_targets_the_correct_entry_among_many() {
+        let lock = DIRECT_REGISTRY_LOCK.replace(
+            "requires-dist = [{ name = \"six\", specifier = \"==1.16.0\" }]",
+            "requires-dist = [\n    { name = \"aaa\", specifier = \"==1.0\" },\n    { name = \"six\", specifier = \"==1.16.0\" },\n]",
+        );
+        let edits = rewrite_root_metadata_entries(&lock, "six", REL_WHEEL).unwrap();
+        assert_eq!(edits.len(), 1);
+        let e = &edits[0];
+        assert_eq!(e.kind, "uv_lock_requires_dist");
+        assert_eq!(
+            &lock[e.span.clone()],
+            e.old_entry,
+            "the span must address the six entry's exact bytes"
+        );
+        assert_eq!(e.old_entry, "{ name = \"six\", specifier = \"==1.16.0\" }");
+        assert_eq!(
+            e.new_entry,
+            format!("{{ name = \"six\", path = \"{REL_WHEEL}\" }}")
+        );
+        assert_eq!(e.specifier.as_deref(), Some("==1.16.0"));
+
+        let mut spliced = lock.clone();
+        spliced.replace_range(e.span.clone(), &e.new_entry);
+        spliced
+            .parse::<DocumentMut>()
+            .expect("the spliced lock must stay parseable TOML");
+        assert!(
+            spliced.contains("{ name = \"aaa\", specifier = \"==1.0\" }"),
+            "the foreign entry must be untouched: {spliced}"
+        );
+    }
+
+    /// The two error tuples of the root-metadata rewrite: a root with no
+    /// entry for the target anywhere, and a lock with no root unit at all.
+    #[test]
+    fn rewrite_root_metadata_reports_missing_entry_and_missing_root() {
+        let Err(err) = rewrite_root_metadata_entries(DIRECT_REGISTRY_LOCK, "absent", REL_WHEEL)
+        else {
+            panic!("a root without the target entry must refuse");
+        };
+        assert_eq!(err.0, "pypi_uv_lock_package_missing");
+        assert!(
+            err.1.contains("absent") && err.1.contains("requires-dist or requires-dev"),
+            "{}",
+            err.1
+        );
+
+        let rootless = DIRECT_REGISTRY_LOCK.replace(
+            "source = { virtual = \".\" }",
+            "source = { registry = \"https://pypi.org/simple\" }",
+        );
+        let Err(err) = rewrite_root_metadata_entries(&rootless, "six", REL_WHEEL) else {
+            panic!("a lock without a root unit must refuse");
+        };
+        assert_eq!(err.0, "pypi_uv_lock_root_missing");
+    }
+
+    /// PEP 735 `[dependency-groups]` classification: a group-declared dep is
+    /// Direct, and a non-string `{ include-group = … }` member is skipped
+    /// (the included group's own array is already scanned), never misread as
+    /// a declaration.
+    #[tokio::test]
+    async fn classify_scans_dependency_groups_and_tolerates_include_group_members() {
+        let pyproject =
+            format!("{DEV_GROUP_REGISTRY_PYPROJECT}all = [{{ include-group = \"dev\" }}]\n");
+        let tmp = write_pair(&pyproject, DEV_GROUP_REGISTRY_LOCK).await;
+        let p = load_uv_project(tmp.path()).await.unwrap();
+        assert_eq!(classify_dependency(&p, "six"), UvDepClass::Direct);
+        assert_eq!(
+            classify_dependency(&p, "absent"),
+            UvDepClass::Transitive,
+            "an include-group member must not register a declaration"
+        );
+    }
+
+    // ── wheel METADATA extraction edges ──────────────────────────────────
+
+    /// A wheel vendoring a sub-package carries a NESTED
+    /// `foo/bar.dist-info/METADATA` decoy — the extractor must pick the
+    /// top-level one, never the nested one.
+    #[test]
+    fn wheel_metadata_text_skips_a_nested_dist_info_decoy() {
+        let decoy = "Name: inner\nRequires-Dist: evil ==9.9\n\n";
+        let real = "Name: widget\nRequires-Dist: leftpad >=1.0\n\n";
+        let entries = vec![
+            (
+                "vendored/inner-1.0.dist-info/METADATA".to_string(),
+                decoy.as_bytes().to_vec(),
+                0o644,
+            ),
+            (
+                "widget-1.0.0.dist-info/METADATA".to_string(),
+                real.as_bytes().to_vec(),
+                0o644,
+            ),
+        ];
+        let bytes = crate::vendor::common::write_zip_entries(&entries).unwrap();
+        assert_eq!(wheel_metadata_text(&bytes).as_deref(), Some(real));
+    }
+
+    /// METADATA over the size cap drops the WHOLE extraction (degrade to the
+    /// pre-fix no-block behavior), never a truncated block.
+    #[test]
+    fn wheel_metadata_text_drops_an_oversized_metadata_file() {
+        let entries = vec![(
+            "widget-1.0.0.dist-info/METADATA".to_string(),
+            vec![b'x'; (MAX_WHEEL_METADATA_BYTES + 1) as usize],
+            0o644,
+        )];
+        let bytes = crate::vendor::common::write_zip_entries(&entries).unwrap();
+        assert_eq!(wheel_metadata_text(&bytes), None);
+    }
+
+    /// RFC822 header edges: a folded continuation line and a colon-less line
+    /// inside the header block are both ignored, not misparsed.
+    #[test]
+    fn core_metadata_fields_ignore_folded_and_colonless_header_lines() {
+        let text = "Metadata-Version: 2.1\nName: widget\nRequires-Dist: leftpad >=1.0\n folded continuation line\ngarbage line without a colon\nProvides-Extra: fast\n\nbody\n";
+        let (requires, provides) = parse_core_metadata_fields(text);
+        assert_eq!(requires, vec!["leftpad >=1.0"]);
+        assert_eq!(provides, vec!["fast"]);
+    }
+
+    /// Extras render in reconstructed requires-dist entries, pinning uv's
+    /// serializer key order end-to-end: name, extras, marker, specifier.
+    #[test]
+    fn render_entry_pins_uv_key_order_name_extras_marker_specifier() {
+        let text = "Name: x\nRequires-Dist: requests[socks,security] >=2.0 ; extra == 'fast'\n\n";
+        assert_eq!(
+            render_package_metadata_block(text).as_deref(),
+            Some(
+                "[package.metadata]\nrequires-dist = [{ name = \"requests\", extras = [\"socks\", \"security\"], marker = \"extra == 'fast'\", specifier = \">=2.0\" }]"
+            )
+        );
+    }
+
+    /// A Provides-Extra-only wheel (extras declared, no deps) yields
+    /// `requires-dist = []` plus the provides-extras block — uv records
+    /// exactly that for such path sources.
+    #[test]
+    fn render_block_with_provides_extra_only_yields_empty_requires_dist() {
+        assert_eq!(
+            render_package_metadata_block("Name: x\nProvides-Extra: fast\n\n").as_deref(),
+            Some("[package.metadata]\nrequires-dist = []\nprovides-extras = [\"fast\"]")
+        );
     }
 }
