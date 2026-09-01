@@ -135,6 +135,22 @@ pub async fn vendor_go_module(
         return refusal;
     }
 
+    // Hot path (mirrors cargo.rs / composer_lock.rs): already wired to this
+    // uuid with the committed copy intact → touch nothing and never consult
+    // `pristine_src` — a pruned/partial module-cache copy must not fail a
+    // healthy re-run. The engine's `redirect_in_sync` would answer the same,
+    // but only after the `!force` missing-target pre-check below consulted
+    // the pristine source; returning here keeps that pre-check scoped to
+    // runs that actually rebuild from it. Dry runs keep the engine's
+    // read-only verify as their preview.
+    if copy_was_ok && !dry_run {
+        return done(
+            already_patched_result(purl, &copy_dir, &record.files),
+            None,
+            warnings,
+        );
+    }
+
     // Acquire the patched module: prefer the prebuilt module zip from the patch
     // service (download → verify → extract → wire the `replace`, no pristine
     // source needed); else let the engine copy the pristine source, patch it,
@@ -968,6 +984,48 @@ mod tests {
             tokio::fs::read(&copy).await.unwrap(),
             copy1,
             "copy unchanged"
+        );
+        assert_eq!(
+            tokio::fs::read(&gomod).await.unwrap(),
+            mod1,
+            "go.mod byte-stable"
+        );
+    }
+
+    /// A healthy wired re-run must never consult the pristine module cache:
+    /// a pruned/partial cache copy (a beforeHash target file absent) must not
+    /// fail a project whose vendored state is fully intact — the in-sync hot
+    /// path answers already-patched without touching `pristine_src`, exactly
+    /// as the cargo and composer backends do.
+    #[tokio::test]
+    async fn test_wired_intact_copy_rerun_survives_pruned_pristine() {
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        expect_done(run_vendor(PURL, root, &blobs, &pristine, &record, false).await);
+
+        let copy = root.join(copy_rel()).join("bar.go");
+        let gomod = root.join("go.mod");
+        let copy1 = tokio::fs::read(&copy).await.unwrap();
+        let mod1 = tokio::fs::read(&gomod).await.unwrap();
+
+        // The module cache lost a patch-target file after the first run.
+        tokio::fs::remove_file(pristine.join("bar.go"))
+            .await
+            .unwrap();
+
+        let (result, entry, warnings) =
+            expect_done(run_vendor(PURL, root, &blobs, &pristine, &record, false).await);
+        assert!(
+            result.success,
+            "an in-sync re-run must not fail on a pruned pristine: {:?}",
+            result.error
+        );
+        assert!(entry.is_none(), "no re-recorded entry");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(
+            tokio::fs::read(&copy).await.unwrap(),
+            copy1,
+            "copy untouched"
         );
         assert_eq!(
             tokio::fs::read(&gomod).await.unwrap(),

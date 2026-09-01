@@ -74,8 +74,11 @@ pub(crate) enum StageOutcome {
 
 /// Shared offline diagnostic: patches with no usable local source while
 /// `--offline` is set (first five PURLs, then the `repair` hint).
+/// Prints even under `--silent` (errors only, NEVER nothing — an exit-1
+/// run with zero output is undiagnosable); `--json` mutes stderr and the
+/// caller's envelope is the machine channel instead.
 fn report_offline_missing(common: &GlobalArgs, purls: &[&str]) {
-    if common.silent || common.json {
+    if common.json {
         return;
     }
     eprintln!(
@@ -291,7 +294,9 @@ pub(crate) async fn stage_patch_sources(
             &missing_package_archives,
         );
         if !uncovered.is_empty() {
-            if !quiet {
+            // An error, not progress chatter: prints even under --silent
+            // (same rule as report_offline_missing above).
+            if !common.json {
                 eprintln!("Some artifacts could not be downloaded. Cannot apply patches.");
             }
             return Ok(StageOutcome::Unavailable);

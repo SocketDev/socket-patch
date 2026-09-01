@@ -142,8 +142,23 @@ pub(super) async fn vendored_ledger_supplement(
     if common.global || common.global_prefix.is_some() {
         return Vec::new();
     }
-    let Ok(state) = socket_patch_core::vendor::load_state(&common.cwd).await else {
-        return Vec::new();
+    let base_purls: Vec<String> = match socket_patch_core::vendor::load_state(&common.cwd).await {
+        Ok(state) => state
+            .entries
+            .values()
+            .map(|entry| strip_purl_qualifiers(&entry.base_purl).to_string())
+            .collect(),
+        // Corrupt/unreadable ledger (a MISSING file is Ok(empty) above).
+        // Returning empty here silently dropped every vendored purl from
+        // `scanned_purls` — and since the `vendored_purl_keys` prune
+        // exemption degrades to empty on the same Err (fail-open by its
+        // documented contract), `scan --prune` then deleted still-vendored
+        // packages' manifest entries and blobs while their committed
+        // artifacts remained. Recover the vendored set from the committed
+        // ground truth instead: a manifest entry whose patch uuid owns a
+        // live `.socket/vendor/<eco>/<uuid>` artifact dir is vendored (the
+        // contract-documented recovery convention — see `vendor::path`).
+        Err(_) => vendored_purls_from_artifacts(common).await,
     };
     let crawled_norm: HashSet<String> = crawled
         .iter()
@@ -151,8 +166,7 @@ pub(super) async fn vendored_ledger_supplement(
         .collect();
     let mut seen: HashSet<String> = HashSet::new();
     let mut out = Vec::new();
-    for entry in state.entries.values() {
-        let base = strip_purl_qualifiers(&entry.base_purl);
+    for base in &base_purls {
         let norm = normalize_purl(base).into_owned();
         if crawled_norm.contains(&norm) || !seen.insert(norm) {
             continue;
@@ -162,6 +176,37 @@ pub(super) async fn vendored_ledger_supplement(
         }
     }
     out.sort_by(|a, b| a.purl.cmp(&b.purl));
+    out
+}
+
+/// Fallback source for [`vendored_ledger_supplement`] when the vendor ledger
+/// is unreadable: base purls of manifest entries whose patch uuid owns a
+/// live `.socket/vendor/<eco>/<uuid>` artifact dir. `vendor_uuid_dir_rel`
+/// validates the (committed, tamper-able) uuid grammar fail-closed before
+/// any disk probe. Entries without a live artifact dir are NOT recovered —
+/// nothing committed consumes them, so they stay prunable.
+async fn vendored_purls_from_artifacts(common: &GlobalArgs) -> Vec<String> {
+    use socket_patch_core::manifest::operations::read_manifest;
+    use socket_patch_core::vendor::ecosystem_dir_for_purl;
+    use socket_patch_core::vendor::path::vendor_uuid_dir_rel;
+
+    let Ok(Some(manifest)) = read_manifest(common.resolved_manifest_path()).await else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (purl, record) in &manifest.patches {
+        let base = strip_purl_qualifiers(purl);
+        let Some(eco) = ecosystem_dir_for_purl(base) else {
+            continue;
+        };
+        let Some(rel) = vendor_uuid_dir_rel(eco, &record.uuid) else {
+            continue;
+        };
+        match tokio::fs::metadata(common.cwd.join(&rel)).await {
+            Ok(md) if md.is_dir() => out.push(base.to_string()),
+            _ => {}
+        }
+    }
     out
 }
 
@@ -834,6 +879,171 @@ mod tests {
             manifest.patches.len(),
             "an empty ledger adds nothing"
         );
+    }
+
+    // ---- vendored_ledger_supplement (corrupt-ledger fallback) ---------------
+    // The prune-safety chain for vendored packages: their purls enter
+    // `scanned_purls` via this supplement, which shields their manifest
+    // entries (and blobs) from `scan --prune`'s GC even when the
+    // `vendored_purl_keys` exemption degrades to empty (fail-open by its
+    // documented contract). A corrupt `.socket/vendor/state.json`
+    // (`load_state` → Err; a MISSING file is Ok(empty)) must therefore fall
+    // back to the committed ground truth — manifest entries whose patch uuid
+    // owns a live `.socket/vendor/<eco>/<uuid>` artifact dir — instead of
+    // silently returning empty and letting the prune delete still-vendored
+    // records.
+
+    const VENDORED_UUID: &str = "11111111-1111-4111-8111-111111111111";
+
+    fn seed_manifest_entry(root: &std::path::Path, purl: &str, uuid: &str) {
+        let socket = root.join(".socket");
+        std::fs::create_dir_all(&socket).unwrap();
+        let manifest = serde_json::json!({
+            "patches": {
+                purl: {
+                    "uuid": uuid,
+                    "exportedAt": "2026-01-01T00:00:00Z",
+                    "files": {},
+                    "vulnerabilities": {},
+                    "description": "",
+                    "license": "MIT",
+                    "tier": "free",
+                }
+            }
+        });
+        std::fs::write(
+            socket.join("manifest.json"),
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// A truncated merge-resolution artifact: not valid JSON at all, so
+    /// `load_state` errs (fail-closed) rather than reading an empty ledger.
+    fn seed_corrupt_ledger(root: &std::path::Path) {
+        let vendor = root.join(".socket/vendor");
+        std::fs::create_dir_all(&vendor).unwrap();
+        std::fs::write(vendor.join("state.json"), b"{\"entries\": {").unwrap();
+    }
+
+    async fn supplement_in(
+        root: &std::path::Path,
+        crawled: &[socket_patch_core::crawlers::types::CrawledPackage],
+    ) -> Vec<socket_patch_core::crawlers::types::CrawledPackage> {
+        let args = GlobalArgs {
+            cwd: root.to_path_buf(),
+            ..GlobalArgs::default()
+        };
+        vendored_ledger_supplement(&args, crawled).await
+    }
+
+    #[tokio::test]
+    async fn corrupt_ledger_recovers_vendored_purls_from_committed_artifacts() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_manifest_entry(tmp.path(), "pkg:cargo/foo@1.0.0", VENDORED_UUID);
+        seed_corrupt_ledger(tmp.path());
+        std::fs::create_dir_all(
+            tmp.path()
+                .join(format!(".socket/vendor/cargo/{VENDORED_UUID}/foo-1.0.0")),
+        )
+        .unwrap();
+
+        let out = supplement_in(tmp.path(), &[]).await;
+        assert_eq!(
+            out.iter().map(|p| p.purl.as_str()).collect::<Vec<_>>(),
+            vec!["pkg:cargo/foo@1.0.0"],
+            "a corrupt ledger must fall back to the committed artifact dirs, \
+             not silently drop the vendored purls from the scan"
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupt_ledger_fallback_decodes_qualified_manifest_keys() {
+        // Manifest keys come API-encoded and possibly qualified; the
+        // fabricated purl must be the decoded base form (what the crawler
+        // and `scanned_purls` speak).
+        let tmp = tempfile::tempdir().unwrap();
+        seed_manifest_entry(
+            tmp.path(),
+            "pkg:npm/%40scope/pkg@1.0.0?artifact_id=x",
+            VENDORED_UUID,
+        );
+        seed_corrupt_ledger(tmp.path());
+        std::fs::create_dir_all(
+            tmp.path()
+                .join(format!(".socket/vendor/npm/{VENDORED_UUID}")),
+        )
+        .unwrap();
+
+        let out = supplement_in(tmp.path(), &[]).await;
+        assert_eq!(
+            out.iter().map(|p| p.purl.as_str()).collect::<Vec<_>>(),
+            vec!["pkg:npm/@scope/pkg@1.0.0"],
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupt_ledger_fallback_skips_entries_without_artifact_dirs() {
+        // A manifest entry with no live uuid dir has nothing committed
+        // consuming it — it is NOT resurrected, so a genuinely-stale entry
+        // stays prunable even while the ledger is corrupt.
+        let tmp = tempfile::tempdir().unwrap();
+        seed_manifest_entry(tmp.path(), "pkg:cargo/foo@1.0.0", VENDORED_UUID);
+        seed_corrupt_ledger(tmp.path());
+
+        assert!(supplement_in(tmp.path(), &[]).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn corrupt_ledger_fallback_rejects_non_canonical_uuids() {
+        // The manifest is a committed, tamper-able file: a uuid that is not
+        // the exact canonical grammar must not drive any disk probe or
+        // fabrication (same fail-closed rule as `vendor_uuid_dir_rel`).
+        let tmp = tempfile::tempdir().unwrap();
+        seed_manifest_entry(tmp.path(), "pkg:cargo/foo@1.0.0", "../../escape");
+        seed_corrupt_ledger(tmp.path());
+        std::fs::create_dir_all(tmp.path().join(".socket/vendor/cargo/escape")).unwrap();
+
+        assert!(supplement_in(tmp.path(), &[]).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn missing_ledger_still_yields_no_supplement() {
+        // A MISSING state.json is a deliberately-empty ledger (Ok path), not
+        // corruption — the fallback must not fire and invent vendored
+        // packages for a project that never vendored.
+        let tmp = tempfile::tempdir().unwrap();
+        seed_manifest_entry(tmp.path(), "pkg:cargo/foo@1.0.0", VENDORED_UUID);
+        std::fs::create_dir_all(
+            tmp.path()
+                .join(format!(".socket/vendor/cargo/{VENDORED_UUID}")),
+        )
+        .unwrap();
+
+        assert!(supplement_in(tmp.path(), &[]).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn corrupt_ledger_fallback_excludes_crawled_packages() {
+        // Same exclusion the healthy-ledger path applies: an installed
+        // (crawled) copy needs no fabricated supplement entry.
+        let tmp = tempfile::tempdir().unwrap();
+        seed_manifest_entry(tmp.path(), "pkg:cargo/foo@1.0.0", VENDORED_UUID);
+        seed_corrupt_ledger(tmp.path());
+        std::fs::create_dir_all(
+            tmp.path()
+                .join(format!(".socket/vendor/cargo/{VENDORED_UUID}")),
+        )
+        .unwrap();
+        let crawled = vec![socket_patch_core::crawlers::types::CrawledPackage {
+            name: "foo".to_string(),
+            version: "1.0.0".to_string(),
+            namespace: None,
+            purl: "pkg:cargo/foo@1.0.0".to_string(),
+            path: tmp.path().join("foo"),
+        }];
+
+        assert!(supplement_in(tmp.path(), &crawled).await.is_empty());
     }
 
     // ---- collect_vuln_ids --------------------------------------------------

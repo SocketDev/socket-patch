@@ -1605,6 +1605,11 @@ pub(crate) struct VendorGcSummary {
 ///     blob sweep reclaims the rest in the same pass;
 /// (c) sweep orphan uuid dirs.
 ///
+/// A drift-skipped revert ([`RevertOutcome::kept_artifact`]) keeps the
+/// ledger entry — and, in (b), the purl's manifest records — exactly like
+/// every other `dispatch_revert_one` caller; the kept purl is counted
+/// nowhere (nothing was reclaimed).
+///
 /// Detached entries are exempt from BOTH (a) (never manifest-tracked) and
 /// (b) (lockfile-invisible by design — the probe would always call them
 /// unused). A missing/unreadable manifest skips (a) only (a prune must
@@ -1660,14 +1665,19 @@ pub(crate) async fn run_vendor_gc(
                 continue;
             }
             let entry = state.entries.get(&purl).cloned().expect("listed above");
-            if dispatch_revert_one(&entry, &common.cwd, false)
-                .await
-                .success
-            {
+            let outcome = dispatch_revert_one(&entry, &common.cwd, false).await;
+            if !outcome.success {
+                out.failed.push(purl);
+            } else if outcome.kept_artifact {
+                // Drift-skip keep (residual #131): the backend left the
+                // drifted lock alone and kept the artifacts, so the ledger
+                // entry must survive too (the RevertOutcome contract every
+                // other caller honors) — which also shields the uuid dir
+                // from the (c) orphan sweep. Nothing was reclaimed, so the
+                // purl is counted nowhere.
+            } else {
                 state.entries.remove(&purl);
                 out.dropped_reverted.push(purl);
-            } else {
-                out.failed.push(purl);
             }
         }
     }
@@ -1693,11 +1703,16 @@ pub(crate) async fn run_vendor_gc(
             out.unused_reverted.push(purl);
             continue;
         }
-        if !dispatch_revert_one(&entry, &common.cwd, false)
-            .await
-            .success
-        {
+        let outcome = dispatch_revert_one(&entry, &common.cwd, false).await;
+        if !outcome.success {
             out.failed.push(purl);
+            continue;
+        }
+        if outcome.kept_artifact {
+            // Drift-skip keep (residual #131), same gate as (a) — and the
+            // purl's manifest records must survive too: pruning them would
+            // make the next `vendor` reconcile re-revert an entry whose
+            // backing record is gone (the `remove` caller's rationale).
             continue;
         }
         state.entries.remove(&purl);
@@ -2377,6 +2392,175 @@ mod gc_tests {
             lock.contains("sparse+http://127.0.0.1:5555/index/"),
             "{lock}"
         );
+    }
+
+    /// The registry fragment recorded as the wiring `original` (pre-vendor).
+    fn registry_fragment() -> serde_json::Value {
+        serde_json::json!({
+            "version": "1.3.0",
+            "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+            "integrity": "sha512-orig==",
+            "license": "WTFPL"
+        })
+    }
+
+    /// `entry(false)` plus the wiring record a real vendor run records for
+    /// the package-lock entry — what lets the revert classify third-party
+    /// drift (live fragment neither ours nor the recorded original).
+    fn wired_entry() -> VendorEntry {
+        use socket_patch_core::vendor::state::{WiringAction, WiringRecord};
+        let mut e = entry(false);
+        e.wiring.push(WiringRecord {
+            file: "package-lock.json".into(),
+            kind: "npm_lock_entry".into(),
+            action: WiringAction::Rewritten,
+            key: Some("node_modules/left-pad".into()),
+            original: Some(registry_fragment()),
+            new: Some(serde_json::json!({
+                "version": "1.3.0",
+                "resolved": format!("file:.socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz"),
+            })),
+        });
+        e
+    }
+
+    /// [`gc_fixture`] with the ledger entry re-written as [`wired_entry`]
+    /// and the package-lock's `node_modules/left-pad` set to
+    /// `lock_fragment`.
+    async fn wired_gc_fixture(
+        lock_fragment: serde_json::Value,
+    ) -> (tempfile::TempDir, GlobalArgs, PathBuf) {
+        let (tmp, common, manifest_path) = gc_fixture(false).await;
+        let mut state = VendorState::default();
+        state.entries.insert(PURL.to_string(), wired_entry());
+        save_state(tmp.path(), &state).await.unwrap();
+        tokio::fs::write(
+            tmp.path().join("package-lock.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "packages": { "node_modules/left-pad": lock_fragment }
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        (tmp, common, manifest_path)
+    }
+
+    /// The drifted lock fragment: a third party re-resolved the entry since
+    /// vendoring — neither ours nor the recorded pre-vendor original.
+    fn fork_fragment() -> serde_json::Value {
+        serde_json::json!({
+            "version": "1.3.0",
+            "resolved": "https://example.com/their-fork.tgz"
+        })
+    }
+
+    /// (a) + drift-keep (residual #131): the patch left the manifest, but
+    /// the lock entry drifted since vendoring, so the revert leaves the
+    /// lock alone and returns success with `kept_artifact`. Per the
+    /// [`RevertOutcome::kept_artifact`] contract the GC must keep the
+    /// ledger entry — which also shields the uuid dir from the (c) orphan
+    /// sweep — and must NOT report the purl as cleanly reverted. Pre-fix
+    /// it pruned the entry, counted it `dropped_reverted`, and the sweep
+    /// then destroyed the kept artifacts.
+    #[tokio::test]
+    async fn vendor_gc_keeps_drift_skipped_manifest_dropped_entry() {
+        let (tmp, common, manifest_path) = wired_gc_fixture(fork_fragment()).await;
+        write_manifest(&manifest_path, &PatchManifest::new())
+            .await
+            .unwrap();
+        let lock_before = tokio::fs::read(tmp.path().join("package-lock.json"))
+            .await
+            .unwrap();
+
+        let out = run_vendor_gc(&common, &manifest_path, false).await;
+        assert!(
+            out.dropped_reverted.is_empty(),
+            "a drift-kept entry must not be reported reverted: {out:?}"
+        );
+        assert!(out.failed.is_empty(), "a keep is not a failure: {out:?}");
+        assert!(
+            load_state(tmp.path())
+                .await
+                .unwrap()
+                .entries
+                .contains_key(PURL),
+            "ledger entry must be kept"
+        );
+        assert!(
+            tmp.path()
+                .join(format!(".socket/vendor/npm/{UUID}"))
+                .exists(),
+            "kept artifacts must survive the orphan sweep"
+        );
+        assert_eq!(
+            tokio::fs::read(tmp.path().join("package-lock.json"))
+                .await
+                .unwrap(),
+            lock_before,
+            "drifted lock left alone"
+        );
+    }
+
+    /// (b) + drift-keep: the patch is still in the manifest, and the
+    /// in-use probe says the dependency no longer resolves through the
+    /// artifact — because the lock entry drifted to a third-party fork.
+    /// Same keep contract as (a), plus the purl's manifest records must
+    /// survive (pruning them would make the next `vendor` reconcile
+    /// re-revert an entry whose backing record is gone — the `remove`
+    /// caller's rationale).
+    #[tokio::test]
+    async fn vendor_gc_keeps_drift_skipped_unused_entry_and_manifest_record() {
+        let (tmp, common, manifest_path) = wired_gc_fixture(fork_fragment()).await;
+
+        let out = run_vendor_gc(&common, &manifest_path, false).await;
+        assert!(
+            out.unused_reverted.is_empty(),
+            "a drift-kept entry must not be reported reverted: {out:?}"
+        );
+        assert!(out.failed.is_empty(), "a keep is not a failure: {out:?}");
+        assert!(
+            load_state(tmp.path())
+                .await
+                .unwrap()
+                .entries
+                .contains_key(PURL),
+            "ledger entry must be kept"
+        );
+        assert!(
+            tmp.path()
+                .join(format!(".socket/vendor/npm/{UUID}"))
+                .exists(),
+            "kept artifacts must survive the orphan sweep"
+        );
+        let manifest = read_manifest(&manifest_path).await.unwrap().unwrap();
+        assert!(
+            manifest.patches.contains_key(PURL),
+            "the kept entry's manifest record must survive"
+        );
+    }
+
+    /// KEEP-GATE LIVENESS (mirrors in_process_vendor.rs's
+    /// `revert_completes_when_lock_already_matches_the_original`): a wired
+    /// entry whose lock fragment already equals the recorded pre-vendor
+    /// original is CONVERGED, not drifted — the keep gate must not block
+    /// the full reclaim.
+    #[tokio::test]
+    async fn vendor_gc_reclaims_converged_wired_unused_entry() {
+        let (tmp, common, manifest_path) = wired_gc_fixture(registry_fragment()).await;
+
+        let out = run_vendor_gc(&common, &manifest_path, false).await;
+        assert_eq!(out.unused_reverted, vec![PURL.to_string()], "{out:?}");
+        assert!(out.failed.is_empty(), "{out:?}");
+        assert!(load_state(tmp.path()).await.unwrap().entries.is_empty());
+        assert!(
+            !tmp.path()
+                .join(format!(".socket/vendor/npm/{UUID}"))
+                .exists(),
+            "converged revert completes: artifacts reclaimed"
+        );
+        let manifest = read_manifest(&manifest_path).await.unwrap().unwrap();
+        assert!(!manifest.patches.contains_key(PURL), "{manifest:?}");
     }
 
     /// (c) uuid dirs with no owning ledger entry are swept (wet) / counted

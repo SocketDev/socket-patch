@@ -541,17 +541,24 @@ pub(super) async fn wire_uv(
     let mut original_specifier: Option<String> = None;
     match class {
         UvDepClass::Direct => {
-            let edit = rewrite_requires_dist_entry(&new_lock, canon_name, rel_wheel)?;
-            new_lock.replace_range(edit.span, &edit.new_entry);
-            original_specifier = edit.specifier;
-            wiring.push(record(
-                "uv.lock",
-                "uv_lock_requires_dist",
-                WiringAction::Rewritten,
-                canon_name,
-                Some(edit.old_entry),
-                edit.new_entry,
-            ));
+            let edits = rewrite_root_metadata_entries(&new_lock, canon_name, rel_wheel)?;
+            // Splice back-to-front so the earlier (ascending) spans stay valid.
+            for edit in edits.iter().rev() {
+                new_lock.replace_range(edit.span.clone(), &edit.new_entry);
+            }
+            for edit in edits {
+                if original_specifier.is_none() {
+                    original_specifier = edit.specifier;
+                }
+                wiring.push(record(
+                    "uv.lock",
+                    edit.kind,
+                    WiringAction::Rewritten,
+                    canon_name,
+                    Some(edit.old_entry),
+                    edit.new_entry,
+                ));
+            }
         }
         UvDepClass::Transitive => {
             let (rec, text) = add_manifest_override(&new_lock, canon_name, rel_wheel)?;
@@ -634,7 +641,7 @@ pub(super) async fn revert_uv(entry: &VendorEntry, root: &Path, dry_run: bool) -
             )
         };
         match rec.kind.as_str() {
-            "uv_lock_package" | "uv_lock_requires_dist" => {
+            "uv_lock_package" | "uv_lock_requires_dist" | "uv_lock_requires_dev" => {
                 match replace_fragment(&lock_text, new_text, original_text) {
                     Some(t) => lock_text = t,
                     None => warnings.push(drifted("uv.lock")),
@@ -877,26 +884,35 @@ fn rewrite_target_package_unit(
     Ok((old_unit, new_unit))
 }
 
-/// One planned requires-dist entry rewrite: the absolute byte span plus the
-/// verbatim old/new entry texts and the captured specifier.
+/// One planned root-metadata entry rewrite: the absolute byte span plus the
+/// verbatim old/new fragment texts, the captured specifier, and the wiring
+/// record kind (`uv_lock_requires_dist` / `uv_lock_requires_dev`).
 struct RequiresDistEdit {
     span: Range<usize>,
     old_entry: String,
     new_entry: String,
     specifier: Option<String>,
+    kind: &'static str,
 }
 
-/// Find + transform the root package's `requires-dist` entry for `canon`:
+/// Find + transform EVERY root-package metadata entry for `canon`: the
+/// `[package.metadata]` `requires-dist` array (project.dependencies /
+/// optional-dependencies) AND each `[package.metadata.requires-dev]` group
+/// array (PEP 735 `[dependency-groups]` — uv records group deps there, never
+/// in requires-dist, and rewrites ALL entries to the path shape when a
+/// source applies; spike-verified against uv 0.11.19). Each entry:
 /// `{ name = "x", specifier = "==v" }` → `{ name = "x", path = "<rel>" }`
 /// (uv DROPS the specifier for path sources — recorded for revert). Returns
-/// the absolute byte span so the caller splices by range, never by string
-/// search (a bare `{ name = "x" }` entry would collide with `dependencies`
-/// arrays elsewhere in the lock).
-fn rewrite_requires_dist_entry(
+/// absolute byte spans, ascending, so the caller splices by range, never by
+/// string search (a bare `{ name = "x" }` entry would collide with
+/// `dependencies` arrays elsewhere in the lock). requires-dev fragments span
+/// the whole `<group> = […]` line so identically-pinned groups stay
+/// distinguishable when revert matches fragments by text.
+fn rewrite_root_metadata_entries(
     lock_text: &str,
     canon: &str,
     rel_wheel: &str,
-) -> Result<RequiresDistEdit, (&'static str, String)> {
+) -> Result<Vec<RequiresDistEdit>, (&'static str, String)> {
     let unit_span = find_unit_span(lock_text, unit_is_root).ok_or_else(|| {
         (
             "pypi_uv_lock_root_missing",
@@ -905,38 +921,96 @@ fn rewrite_requires_dist_entry(
     })?;
     let unit_start = unit_span.start;
     let unit_text = &lock_text[unit_span];
-    let rd_rel = unit_text.find("requires-dist = [").ok_or_else(|| {
-        (
-            "pypi_uv_lock_root_missing",
-            "uv.lock root package has no [package.metadata] requires-dist".to_string(),
-        )
-    })?;
-    let arr_open = rd_rel + "requires-dist = ".len();
-    let arr_end = balanced_span(unit_text, arr_open).ok_or_else(|| {
-        (
-            "pypi_uv_lock_parse_failed",
-            "uv.lock requires-dist array is unbalanced".to_string(),
-        )
-    })?;
-    let array_text = &unit_text[arr_open..arr_end];
     let needle = format!("name = \"{canon}\"");
-    for (s, e) in top_level_brace_groups(array_text) {
-        let entry = &array_text[s..e];
-        if !entry.contains(&needle) {
-            continue;
+    let mut edits: Vec<RequiresDistEdit> = Vec::new();
+
+    // requires-dist lives in [package.metadata], always AHEAD of the
+    // requires-dev sub-table — bound the search so a dev group literally
+    // named "requires-dist" can never masquerade as the real key.
+    let dev_hdr = unit_text.find("[package.metadata.requires-dev]");
+    let dist_scan = &unit_text[..dev_hdr.unwrap_or(unit_text.len())];
+    if let Some(rd_rel) = dist_scan.find("requires-dist = [") {
+        let arr_open = rd_rel + "requires-dist = ".len();
+        let arr_end = balanced_span(unit_text, arr_open).ok_or_else(|| {
+            (
+                "pypi_uv_lock_parse_failed",
+                "uv.lock requires-dist array is unbalanced".to_string(),
+            )
+        })?;
+        let array_text = &unit_text[arr_open..arr_end];
+        for (s, e) in top_level_brace_groups(array_text) {
+            let entry = &array_text[s..e];
+            if !entry.contains(&needle) {
+                continue;
+            }
+            let (new_entry, specifier) = path_source_entry(entry, rel_wheel);
+            edits.push(RequiresDistEdit {
+                span: (unit_start + arr_open + s)..(unit_start + arr_open + e),
+                old_entry: entry.to_string(),
+                new_entry,
+                specifier,
+                kind: "uv_lock_requires_dist",
+            });
+            break;
         }
-        let (new_entry, specifier) = path_source_entry(entry, rel_wheel);
-        return Ok(RequiresDistEdit {
-            span: (unit_start + arr_open + s)..(unit_start + arr_open + e),
-            old_entry: entry.to_string(),
-            new_entry,
-            specifier,
-        });
     }
-    Err((
-        "pypi_uv_lock_package_missing",
-        format!("uv.lock root requires-dist has no entry for {canon}"),
-    ))
+
+    if let Some(hdr_rel) = dev_hdr {
+        // Section spans from after the header to the next sub-table header
+        // (group array elements are indented, so a line-leading `[` is
+        // always a header).
+        let sect_start = hdr_rel + "[package.metadata.requires-dev]".len();
+        let sect_end = unit_text[sect_start..]
+            .find("\n[")
+            .map(|i| sect_start + i + 1)
+            .unwrap_or(unit_text.len());
+        let mut cursor = sect_start;
+        while let Some(open_rel) = unit_text[cursor..sect_end].find('[') {
+            let arr_open = cursor + open_rel;
+            let arr_end = balanced_span(unit_text, arr_open).ok_or_else(|| {
+                (
+                    "pypi_uv_lock_parse_failed",
+                    "uv.lock [package.metadata.requires-dev] array is unbalanced".to_string(),
+                )
+            })?;
+            let array_text = &unit_text[arr_open..arr_end];
+            for (s, e) in top_level_brace_groups(array_text) {
+                let entry = &array_text[s..e];
+                if !entry.contains(&needle) {
+                    continue;
+                }
+                let (new_entry, specifier) = path_source_entry(entry, rel_wheel);
+                // Fragment from the group key so revert's text match can't
+                // confuse two groups pinning the same entry.
+                let key_start = unit_text[..arr_open].rfind('\n').map_or(0, |i| i + 1);
+                edits.push(RequiresDistEdit {
+                    span: (unit_start + key_start)..(unit_start + arr_end),
+                    old_entry: unit_text[key_start..arr_end].to_string(),
+                    new_entry: format!(
+                        "{}{}{}",
+                        &unit_text[key_start..arr_open + s],
+                        new_entry,
+                        &unit_text[arr_open + e..arr_end]
+                    ),
+                    specifier,
+                    kind: "uv_lock_requires_dev",
+                });
+                break;
+            }
+            cursor = arr_end;
+        }
+    }
+
+    if edits.is_empty() {
+        return Err((
+            "pypi_uv_lock_package_missing",
+            format!(
+                "uv.lock root [package.metadata] has no requires-dist or requires-dev entry \
+                 for {canon}; run `uv lock` first"
+            ),
+        ));
+    }
+    Ok(edits)
 }
 
 /// Build the path-source requires-dist entry from the registry one: keep
@@ -1030,6 +1104,10 @@ fn add_manifest_override(
             // multi-line: add an indented element before the closing bracket
             let body = &old_array[..old_array.rfind(']').unwrap_or(old_array.len())];
             format!("{body}    {element},\n]")
+        } else if old_array[1..old_array.len() - 1].trim().is_empty() {
+            // `overrides = []` (hand-edited; uv omits the key when empty):
+            // no existing element to comma-separate from
+            format!("[{element}]")
         } else {
             format!("{}, {element}]", &old_array[..old_array.len() - 1])
         };
@@ -1185,6 +1263,14 @@ fn parse_requires_dist(raw: &str) -> Option<MetaDep> {
             .map(canonicalize_pypi_name)
             .collect();
         rest = after_open[close + 1..].trim_start();
+    }
+
+    // A PEP 508 direct reference (`name @ https://…`) has no PEP 440
+    // specifier form uv could parse back out of the lock — fail closed (the
+    // caller drops the whole block; `uv sync` heals it) rather than emit a
+    // bogus `specifier = "@https://…"`.
+    if rest.starts_with('@') {
+        return None;
     }
 
     // The version specifier may be wrapped in parens (older METADATA style,
@@ -2410,5 +2496,361 @@ wheels = [
             lock, WIDGET_REGISTRY_LOCK,
             "revert must byte-restore uv.lock"
         );
+    }
+
+    /// A hand-edited `overrides = []` (uv itself omits the key when empty)
+    /// must extend to a well-formed single-element array — the single-line
+    /// branch used to emit `[, { … }]`, a leading comma that stops the whole
+    /// lock from parsing (every later `uv sync` AND our own next load fail).
+    #[tokio::test]
+    async fn override_wiring_extends_an_empty_manifest_overrides_array() {
+        let empty_overrides_lock = TRANSITIVE_REGISTRY_LOCK.replace(
+            "requires-python = \">=3.10\"\n",
+            "requires-python = \">=3.10\"\n\n[manifest]\noverrides = []\n",
+        );
+        let tmp = write_pair(TRANSITIVE_REGISTRY_PYPROJECT, &empty_overrides_lock).await;
+        let p = load_uv_project(tmp.path()).await.unwrap();
+        let (wiring, meta) = wire_uv(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f",
+        )
+        .await
+        .unwrap();
+
+        let (pyproject, lock) = read_pair(tmp.path()).await;
+        lock.parse::<DocumentMut>()
+            .expect("the wired uv.lock must stay parseable TOML");
+        assert_eq!(pyproject, OVERRIDE_TRANSITIVE_PYPROJECT);
+        assert_eq!(
+            lock, OVERRIDE_TRANSITIVE_LOCK,
+            "extending an empty overrides array must byte-match uv's own \
+             single-element form"
+        );
+
+        // revert byte-restores the empty array, not uv's omitted-key form —
+        // the user wrote `overrides = []` and gets it back verbatim.
+        let entry = entry_for(wiring, meta);
+        let outcome = revert_uv(&entry, tmp.path(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        let (pyproject, lock) = read_pair(tmp.path()).await;
+        assert_eq!(pyproject, TRANSITIVE_REGISTRY_PYPROJECT);
+        assert_eq!(lock, empty_overrides_lock);
+    }
+
+    // ── PEP 735 dependency-groups (requires-dev) fixtures ───────────────
+    // Byte-exact uv output (uv 0.11.19, 2026-09-01): a dep declared only in
+    // `[dependency-groups]` is recorded in the root unit's
+    // `[package.metadata.requires-dev]` groups, never `requires-dist`, and a
+    // path source rewrites EVERY group entry with the same specifier→path
+    // transformation.
+
+    const DEV_GROUP_REGISTRY_PYPROJECT: &str = r#"[project]
+name = "proj"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = []
+
+[dependency-groups]
+dev = ["six==1.16.0"]
+"#;
+
+    const DEV_GROUP_PATH_PYPROJECT: &str = r#"[project]
+name = "proj"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = []
+
+[dependency-groups]
+dev = ["six==1.16.0"]
+
+[tool.uv.sources]
+six = { path = ".socket/vendor/pypi/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/six-1.16.0-py2.py3-none-any.whl" }
+"#;
+
+    const DEV_GROUP_REGISTRY_LOCK: &str = r#"version = 1
+revision = 3
+requires-python = ">=3.10"
+
+[[package]]
+name = "proj"
+version = "0.1.0"
+source = { virtual = "." }
+
+[package.dev-dependencies]
+dev = [
+    { name = "six" },
+]
+
+[package.metadata]
+
+[package.metadata.requires-dev]
+dev = [{ name = "six", specifier = "==1.16.0" }]
+
+[[package]]
+name = "six"
+version = "1.16.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/71/39/171f1c67cd00715f190ba0b100d606d440a28c93c7714febeca8b79af85e/six-1.16.0.tar.gz", hash = "sha256:1e61c37477a1626458e36f7b1d82aa5c9b094fa4802892072e49de9c60c4c926", size = 34041, upload-time = "2021-05-05T14:18:18.379Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d9/5a/e7c31adbe875f2abbb91bd84cf2dc52d792b5a01506781dbcf25c91daf11/six-1.16.0-py2.py3-none-any.whl", hash = "sha256:8abb2f1d86890a2dfb989f9a77cfcfd3e47c2a354b01111771326f8aa26e0254", size = 11053, upload-time = "2021-05-05T14:18:17.237Z" },
+]
+"#;
+
+    const DEV_GROUP_PATH_LOCK: &str = r#"version = 1
+revision = 3
+requires-python = ">=3.10"
+
+[[package]]
+name = "proj"
+version = "0.1.0"
+source = { virtual = "." }
+
+[package.dev-dependencies]
+dev = [
+    { name = "six" },
+]
+
+[package.metadata]
+
+[package.metadata.requires-dev]
+dev = [{ name = "six", path = ".socket/vendor/pypi/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/six-1.16.0-py2.py3-none-any.whl" }]
+
+[[package]]
+name = "six"
+version = "1.16.0"
+source = { path = ".socket/vendor/pypi/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/six-1.16.0-py2.py3-none-any.whl" }
+wheels = [
+    { filename = "six-1.16.0-py2.py3-none-any.whl", hash = "sha256:8abb2f1d86890a2dfb989f9a77cfcfd3e47c2a354b01111771326f8aa26e0254" },
+]
+"#;
+
+    const MIXED_SURFACES_REGISTRY_PYPROJECT: &str = r#"[project]
+name = "proj"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = ["six==1.16.0"]
+
+[dependency-groups]
+dev = ["six==1.16.0"]
+lint = ["six==1.16.0"]
+"#;
+
+    const MIXED_SURFACES_PATH_PYPROJECT: &str = r#"[project]
+name = "proj"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = ["six==1.16.0"]
+
+[dependency-groups]
+dev = ["six==1.16.0"]
+lint = ["six==1.16.0"]
+
+[tool.uv.sources]
+six = { path = ".socket/vendor/pypi/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/six-1.16.0-py2.py3-none-any.whl" }
+"#;
+
+    const MIXED_SURFACES_REGISTRY_LOCK: &str = r#"version = 1
+revision = 3
+requires-python = ">=3.10"
+
+[[package]]
+name = "proj"
+version = "0.1.0"
+source = { virtual = "." }
+dependencies = [
+    { name = "six" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "six" },
+]
+lint = [
+    { name = "six" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "six", specifier = "==1.16.0" }]
+
+[package.metadata.requires-dev]
+dev = [{ name = "six", specifier = "==1.16.0" }]
+lint = [{ name = "six", specifier = "==1.16.0" }]
+
+[[package]]
+name = "six"
+version = "1.16.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/71/39/171f1c67cd00715f190ba0b100d606d440a28c93c7714febeca8b79af85e/six-1.16.0.tar.gz", hash = "sha256:1e61c37477a1626458e36f7b1d82aa5c9b094fa4802892072e49de9c60c4c926", size = 34041, upload-time = "2021-05-05T14:18:18.379Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d9/5a/e7c31adbe875f2abbb91bd84cf2dc52d792b5a01506781dbcf25c91daf11/six-1.16.0-py2.py3-none-any.whl", hash = "sha256:8abb2f1d86890a2dfb989f9a77cfcfd3e47c2a354b01111771326f8aa26e0254", size = 11053, upload-time = "2021-05-05T14:18:17.237Z" },
+]
+"#;
+
+    const MIXED_SURFACES_PATH_LOCK: &str = r#"version = 1
+revision = 3
+requires-python = ">=3.10"
+
+[[package]]
+name = "proj"
+version = "0.1.0"
+source = { virtual = "." }
+dependencies = [
+    { name = "six" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "six" },
+]
+lint = [
+    { name = "six" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "six", path = ".socket/vendor/pypi/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/six-1.16.0-py2.py3-none-any.whl" }]
+
+[package.metadata.requires-dev]
+dev = [{ name = "six", path = ".socket/vendor/pypi/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/six-1.16.0-py2.py3-none-any.whl" }]
+lint = [{ name = "six", path = ".socket/vendor/pypi/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/six-1.16.0-py2.py3-none-any.whl" }]
+
+[[package]]
+name = "six"
+version = "1.16.0"
+source = { path = ".socket/vendor/pypi/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/six-1.16.0-py2.py3-none-any.whl" }
+wheels = [
+    { filename = "six-1.16.0-py2.py3-none-any.whl", hash = "sha256:8abb2f1d86890a2dfb989f9a77cfcfd3e47c2a354b01111771326f8aa26e0254" },
+]
+"#;
+
+    /// A dep declared ONLY under PEP 735 `[dependency-groups]` classifies
+    /// Direct (sources apply to it), but uv records it in the root unit's
+    /// `[package.metadata.requires-dev]`, never `requires-dist` — wiring
+    /// must rewrite the group entry, not refuse with a root-missing error.
+    #[tokio::test]
+    async fn dev_group_wiring_matches_fixture_byte_identically() {
+        let tmp = write_pair(DEV_GROUP_REGISTRY_PYPROJECT, DEV_GROUP_REGISTRY_LOCK).await;
+        let p = load_uv_project(tmp.path()).await.unwrap();
+        assert_eq!(classify_dependency(&p, "six"), UvDepClass::Direct);
+
+        let (wiring, meta) = wire_uv(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UUID,
+        )
+        .await
+        .unwrap();
+
+        let (pyproject, lock) = read_pair(tmp.path()).await;
+        assert_eq!(pyproject, DEV_GROUP_PATH_PYPROJECT);
+        assert_eq!(
+            lock, DEV_GROUP_PATH_LOCK,
+            "uv.lock must byte-match uv's own dev-group path-source output"
+        );
+        assert_eq!(meta.dep_class, "direct");
+        assert_eq!(meta.original_specifier.as_deref(), Some("==1.16.0"));
+        let kinds: Vec<&str> = wiring.iter().map(|w| w.kind.as_str()).collect();
+        assert_eq!(
+            kinds,
+            vec!["uv_sources_entry", "uv_lock_package", "uv_lock_requires_dev"]
+        );
+
+        let entry = entry_for(wiring, meta);
+        let outcome = revert_uv(&entry, tmp.path(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        let (pyproject, lock) = read_pair(tmp.path()).await;
+        assert_eq!(pyproject, DEV_GROUP_REGISTRY_PYPROJECT);
+        assert_eq!(lock, DEV_GROUP_REGISTRY_LOCK);
+    }
+
+    /// A dep declared in project.dependencies AND several dependency-groups:
+    /// uv rewrites the requires-dist entry AND every requires-dev group
+    /// entry to the path shape — so must we, or `uv lock --check` goes red.
+    #[tokio::test]
+    async fn mixed_surfaces_wiring_rewrites_every_metadata_entry() {
+        let tmp = write_pair(
+            MIXED_SURFACES_REGISTRY_PYPROJECT,
+            MIXED_SURFACES_REGISTRY_LOCK,
+        )
+        .await;
+        let p = load_uv_project(tmp.path()).await.unwrap();
+        assert_eq!(classify_dependency(&p, "six"), UvDepClass::Direct);
+
+        let (wiring, meta) = wire_uv(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UUID,
+        )
+        .await
+        .unwrap();
+
+        let (pyproject, lock) = read_pair(tmp.path()).await;
+        assert_eq!(pyproject, MIXED_SURFACES_PATH_PYPROJECT);
+        assert_eq!(
+            lock, MIXED_SURFACES_PATH_LOCK,
+            "every requires-dist/requires-dev entry must be rewritten"
+        );
+        assert_eq!(meta.original_specifier.as_deref(), Some("==1.16.0"));
+        let kinds: Vec<&str> = wiring.iter().map(|w| w.kind.as_str()).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "uv_sources_entry",
+                "uv_lock_package",
+                "uv_lock_requires_dist",
+                "uv_lock_requires_dev",
+                "uv_lock_requires_dev"
+            ]
+        );
+
+        let entry = entry_for(wiring, meta);
+        let outcome = revert_uv(&entry, tmp.path(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        let (pyproject, lock) = read_pair(tmp.path()).await;
+        assert_eq!(pyproject, MIXED_SURFACES_REGISTRY_PYPROJECT);
+        assert_eq!(lock, MIXED_SURFACES_REGISTRY_LOCK);
+    }
+
+    /// A PEP 508 direct reference (`name @ https://…`) has no PEP 440
+    /// specifier form — it must fail closed (whole block dropped, uv sync
+    /// heals the lock) rather than sail through as the bogus
+    /// `specifier = "@https://…"` uv refuses to parse back.
+    #[test]
+    fn parse_requires_dist_rejects_direct_url_references() {
+        assert_eq!(
+            parse_requires_dist("foo @ https://example.com/foo-1.0-py3-none-any.whl"),
+            None
+        );
+        // extras + marker variants are equally direct references
+        assert_eq!(
+            parse_requires_dist("foo[fast] @ git+https://example.com/foo.git ; extra == 'x'"),
+            None
+        );
+
+        // block-level: one direct-reference line drops the WHOLE block
+        let text = "Name: widget\n\
+                    Requires-Dist: leftpad >=1.0\n\
+                    Requires-Dist: foo @ https://example.com/foo-1.0-py3-none-any.whl\n\
+                    \n\
+                    body\n";
+        assert_eq!(render_package_metadata_block(text), None);
     }
 }

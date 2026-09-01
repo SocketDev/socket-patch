@@ -994,6 +994,12 @@ pub(crate) async fn run_redirect_selected(
     // with an actionable error — never half-migrated.
     let takeover_capable = |p: &str| p.starts_with("pkg:cargo/") || p.starts_with("pkg:npm/");
     let mut takeover_pre_warnings: Vec<serde_json::Value> = Vec::new();
+    // Dry-run takeover previews: `(purl, uuid)` pairs whose vendored state
+    // the wet run would revert and then redirect. Withheld from the
+    // rewriters (their lock fragments still carry the vendored wiring the
+    // wet run reverts FIRST) and counted as redirected below, so the
+    // preview's envelope matches the wet run's outcome.
+    let mut dry_run_takeover: Vec<(String, String)> = Vec::new();
     if !candidates.iter().any(|(p, ..)| takeover_capable(p)) {
         // No takeover-capable candidates — nothing to reconcile.
     } else {
@@ -1003,7 +1009,7 @@ pub(crate) async fn run_redirect_selected(
         let patch_entries =
             socket_patch_core::vendor::cargo_config::read_patch_entries(&common.cwd).await;
         let mut refused: Vec<String> = Vec::new();
-        for (purl, _uuid, ..) in &candidates {
+        for (purl, uuid, ..) in &candidates {
             if !takeover_capable(purl) {
                 continue;
             }
@@ -1015,6 +1021,32 @@ pub(crate) async fn run_redirect_selected(
                 .cloned();
             if let Some(entry) = ledger_entry {
                 if common.dry_run {
+                    // Preview through the same per-purl revert machinery the
+                    // wet run dispatches (write-free under dry_run): a
+                    // vendored state the wet run would refuse to revert is
+                    // refused here too, and one it would revert is announced
+                    // as a takeover — never handed to the rewriters, which
+                    // would preview against the still-vendored wiring and
+                    // fail-closed refuse it, prescribing a manual
+                    // `vendor --revert` for a purl this run just promised to
+                    // revert itself while reporting `redirected: 0` for a
+                    // migration the wet run lands.
+                    let outcome =
+                        crate::commands::vendor::dispatch_revert_one(&entry, &common.cwd, true)
+                            .await;
+                    if !outcome.success {
+                        refused.push(purl.clone());
+                        takeover_pre_warnings.push(serde_json::json!({
+                            "code": "redirect_vendored_revert_failed",
+                            "detail": format!(
+                                "{purl} is vendored and its vendored state could not be \
+                                 reverted ({}); NOT redirected — run `socket-patch vendor \
+                                 --revert` to clean up, then re-run `scan --mode hosted`",
+                                outcome.error.as_deref().unwrap_or("unknown error")
+                            ),
+                        }));
+                        continue;
+                    }
                     takeover_pre_warnings.push(serde_json::json!({
                         "code": "redirect_would_revert_vendored",
                         "detail": format!(
@@ -1023,6 +1055,7 @@ pub(crate) async fn run_redirect_selected(
                              artifact first, then redirect (mode takeover)"
                         ),
                     }));
+                    dry_run_takeover.push((purl.clone(), uuid.clone()));
                     continue;
                 }
                 let outcome =
@@ -1123,12 +1156,21 @@ pub(crate) async fn run_redirect_selected(
                     }));
                 }
             }
-            let refused_names: std::collections::HashSet<(String, String, String)> = candidates
+        }
+        // Purls leaving the rewrite set: refused takeovers, plus the dry-run
+        // takeover previews (still vendored on disk — the wet run reverts
+        // them before the rewriters ever see their files).
+        let withheld: Vec<&String> = refused
+            .iter()
+            .chain(dry_run_takeover.iter().map(|(p, _)| p))
+            .collect();
+        if !withheld.is_empty() {
+            let withheld_names: std::collections::HashSet<(String, String, String)> = candidates
                 .iter()
-                .filter(|(p, ..)| refused.contains(p))
+                .filter(|(p, ..)| withheld.contains(&p))
                 .filter_map(|(p, ..)| parse_purl_simple(p))
                 .collect();
-            candidates.retain(|(p, ..)| !refused.contains(p));
+            candidates.retain(|(p, ..)| !withheld.contains(&p));
             overrides.retain(|o| {
                 // Overrides built here carry the full coordinate in `name`
                 // (namespace unset) — the same shape parse_purl_simple emits.
@@ -1136,7 +1178,7 @@ pub(crate) async fn run_redirect_selected(
                     Some(ns) if !ns.is_empty() => format!("{ns}/{}", o.name),
                     _ => o.name.clone(),
                 };
-                !refused_names.contains(&(o.ecosystem.clone(), coord, o.version.clone()))
+                !withheld_names.contains(&(o.ecosystem.clone(), coord, o.version.clone()))
             });
         }
     }
@@ -1568,6 +1610,13 @@ pub(crate) async fn run_redirect_selected(
         )
         .map(|(purl, uuid, _, _, _, _)| (purl.clone(), uuid.clone()))
         .collect();
+    // Dry-run mode-takeover previews were withheld from the rewriters (their
+    // lock fragments still carry the vendored wiring the wet run reverts
+    // first), so the presence probe above cannot see them: the wet run
+    // reverts then redirects each one, and the preview's `redirected` count
+    // must report that outcome. Populated only under --dry-run.
+    let mut confirmed = confirmed;
+    confirmed.extend(dry_run_takeover);
 
     // Fetch the full patch view (file hashes + vulnerabilities) for each
     // CONFIRMED redirect and persist it so a post-install `socket-patch vex`

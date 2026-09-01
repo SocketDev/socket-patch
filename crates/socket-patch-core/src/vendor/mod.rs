@@ -467,8 +467,22 @@ pub async fn harvest_artifact_blobs(
                 if file.is_dir() || file.size() > MAX_FILE_BYTES {
                     continue;
                 }
+                // SECURITY: `file.size()` above is only the archive-DECLARED
+                // uncompressed size; the entry reader is bounded solely by the
+                // COMPRESSED size, so a zip bomb can declare a tiny size (past
+                // the gate) yet decompress far beyond the cap. Bound the
+                // decompressed read itself and drop any entry that overflows,
+                // before its bytes are all in memory.
                 let mut content = Vec::with_capacity(file.size() as usize);
-                if file.read_to_end(&mut content).is_err() {
+                if file
+                    .by_ref()
+                    .take(MAX_FILE_BYTES + 1)
+                    .read_to_end(&mut content)
+                    .is_err()
+                {
+                    continue;
+                }
+                if content.len() as u64 > MAX_FILE_BYTES {
                     continue;
                 }
                 let h = compute_git_sha256_from_bytes(&content);
@@ -1159,6 +1173,91 @@ mod harvest_tests {
             mem.get(&hash).map(|b| b.as_slice()),
             Some(PATCHED),
             "dir-shaped artifact must yield its afterHash blob"
+        );
+    }
+
+    fn write_zip(path: &Path, entry_name: &str, content: &[u8]) {
+        use std::io::Write as _;
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        writer
+            .start_file(
+                entry_name,
+                zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Deflated),
+            )
+            .unwrap();
+        writer.write_all(content).unwrap();
+        let bytes = writer.finish().unwrap().into_inner();
+        std::fs::write(path, &bytes).unwrap();
+    }
+
+    /// Like [`write_zip`], but afterwards forges the entry's DECLARED
+    /// uncompressed size (in both the local file header at offset 22 and the
+    /// central-directory header's field at +24) down to a small value. The
+    /// deflate stream is untouched, so it still decompresses to `content` —
+    /// this is the zip-bomb shape: a tiny declared size hiding a large
+    /// payload.
+    fn write_forged_undersized_zip(path: &Path, entry_name: &str, content: &[u8]) {
+        write_zip(path, entry_name, content);
+        let mut bytes = std::fs::read(path).unwrap();
+        let forged: u32 = 10;
+        assert_eq!(&bytes[0..4], b"PK\x03\x04", "local file header");
+        bytes[22..26].copy_from_slice(&forged.to_le_bytes());
+        let cd = bytes
+            .windows(4)
+            .position(|w| w == b"PK\x01\x02")
+            .expect("central directory header");
+        bytes[cd + 24..cd + 28].copy_from_slice(&forged.to_le_bytes());
+        std::fs::write(path, &bytes).unwrap();
+    }
+
+    #[tokio::test]
+    async fn honest_zip_artifact_yields_its_after_blob() {
+        let tmp = tempfile::tempdir().unwrap();
+        let purl = "pkg:pypi/lib@1.0.0";
+        let rel = format!(".socket/vendor/pypi/{UUID}/lib-1.0.0-py3-none-any.whl");
+        write_zip(&tmp.path().join(&rel), "lib/__init__.py", PATCHED);
+        write_ledger(tmp.path(), purl, UUID, &rel);
+
+        let (k, r) = record(purl, UUID, "lib/__init__.py", PATCHED);
+        let patches = HashMap::from([(k, r)]);
+        let mem = harvest_artifact_blobs(tmp.path(), &patches).await;
+        let hash = compute_git_sha256_from_bytes(PATCHED);
+        assert_eq!(
+            mem.get(&hash).map(|b| b.as_slice()),
+            Some(PATCHED),
+            "an in-bounds zip entry must still yield its afterHash blob"
+        );
+    }
+
+    /// A zip entry whose header DECLARES a tiny uncompressed size but whose
+    /// stream decompresses past the per-file cap (a zip bomb) must contribute
+    /// nothing. The metadata gate trusts `file.size()` (the declared value),
+    /// but the entry reader is bounded only by the COMPRESSED size, so the
+    /// decompressed read itself must enforce the cap — otherwise the bomb is
+    /// inflated fully into memory before any cap or CRC check, OOM-killing the
+    /// harvest.
+    #[tokio::test]
+    async fn oversized_zip_entry_declaring_small_size_contributes_nothing() {
+        // Mirror of the private per-file cap in `harvest_artifact_blobs`.
+        const MAX_FILE_BYTES: usize = 64 * 1024 * 1024;
+        let tmp = tempfile::tempdir().unwrap();
+        let purl = "pkg:pypi/lib@1.0.0";
+        let rel = format!(".socket/vendor/pypi/{UUID}/lib-1.0.0-py3-none-any.whl");
+        // Decompresses to just past the cap; a run of one byte compresses to a
+        // few KiB, so the artifact itself stays well under the artifact cap.
+        let content = vec![0x41u8; MAX_FILE_BYTES + 4096];
+        write_forged_undersized_zip(&tmp.path().join(&rel), "lib/__init__.py", &content);
+        write_ledger(tmp.path(), purl, UUID, &rel);
+
+        let (k, r) = record(purl, UUID, "lib/__init__.py", &content);
+        let patches = HashMap::from([(k, r)]);
+        let mem = harvest_artifact_blobs(tmp.path(), &patches).await;
+        assert!(
+            mem.is_empty(),
+            "a zip entry decompressing past the per-file cap must be dropped, \
+             not harvested — the declared size must not gate an unbounded read"
         );
     }
 }

@@ -211,6 +211,7 @@ pub async fn vendor_composer(
                         record,
                         sources,
                         force,
+                        false, // live-wired: never unwind the uuid dir on failure
                         &pkg,
                         version,
                         &mut warnings,
@@ -276,6 +277,7 @@ pub async fn vendor_composer(
                     record,
                     sources,
                     force,
+                    true, // fresh vendor: nothing pre-existing worth keeping
                     &pkg,
                     version,
                     &mut warnings,
@@ -293,6 +295,7 @@ pub async fn vendor_composer(
     let Some(original_obj) = original_entry.as_object() else {
         // find_lock_entry only matches objects; defensive.
         let _ = remove_tree(&uuid_dir).await;
+        prune_empty_vendor_dirs(&copy_dir).await;
         result.success = false;
         result.error = Some("composer.lock entry is not a JSON object".to_string());
         return done(result, None, warnings);
@@ -316,6 +319,7 @@ pub async fn vendor_composer(
     };
     if let Err(e) = write_result {
         let _ = remove_tree(&uuid_dir).await;
+        prune_empty_vendor_dirs(&copy_dir).await;
         result.success = false;
         result.error = Some(format!("failed to write composer.lock: {e}"));
         return done(result, None, warnings);
@@ -507,12 +511,109 @@ pub async fn revert_composer_opts(
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
-/// Copy the installed package into `copy_dir` and run the hardened apply
-/// pipeline against it (vendor auto-force policy — see
-/// [`super::force_apply_staged`]). On apply failure the whole uuid dir is
-/// removed — a partial copy under `.socket/vendor/` would be misjudged by
-/// verify/sweep — and the failed [`ApplyResult`] is the `Err` for the caller
-/// to bubble (composer.lock is only ever edited after this succeeds).
+fn swap_sibling_for(copy_dir: &Path, suffix: &str) -> std::path::PathBuf {
+    let name = copy_dir
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "copy".to_string());
+    match copy_dir.parent() {
+        Some(parent) => parent.join(format!("{name}{suffix}")),
+        None => copy_dir.join(suffix),
+    }
+}
+
+/// The staging sibling for a copy dir:
+/// `<uuid>/<vendor>/<name>@<version>.socket-stage`. (Re)builds are
+/// materialised here and swapped into place only on success, so a failure can
+/// never destroy a pre-existing (possibly live-wired) copy.
+fn stage_dir_for(copy_dir: &Path) -> std::path::PathBuf {
+    swap_sibling_for(copy_dir, ".socket-stage")
+}
+
+/// The backup sibling the old copy is parked at mid-swap:
+/// `<uuid>/<vendor>/<name>@<version>.socket-old`.
+fn backup_dir_for(copy_dir: &Path) -> std::path::PathBuf {
+    swap_sibling_for(copy_dir, ".socket-old")
+}
+
+/// Swap a fully-built stage into place without a destructive window: park the
+/// old copy (if any) at `<copy>.socket-old` with a same-dir rename, rename the
+/// stage over the now-vacant copy path, and only then delete the backup.
+/// Every step is a single atomic rename — no step can leave less recoverable
+/// state than it started with (see the cargo twin for the full rationale).
+async fn swap_stage_into_place(stage: &Path, copy_dir: &Path) -> std::io::Result<()> {
+    let backup = backup_dir_for(copy_dir);
+    // A stale backup (crash mid-swap on an earlier run) would make the
+    // park rename fail; `remove_tree` is a no-op when it is absent.
+    remove_tree(&backup).await?;
+    let had_old = match tokio::fs::rename(copy_dir, &backup).await {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => return Err(e),
+    };
+    match tokio::fs::rename(stage, copy_dir).await {
+        Ok(()) => {
+            if had_old {
+                let _ = remove_tree(&backup).await;
+            }
+            Ok(())
+        }
+        Err(e) => {
+            if had_old {
+                let _ = tokio::fs::rename(&backup, copy_dir).await;
+            }
+            Err(e)
+        }
+    }
+}
+
+/// Best-effort removal of the EMPTY dir levels a failed run may have created
+/// above the copy — `<uuid>/<vendor>/`, `<uuid>/`, `.socket/vendor/composer/`
+/// and `.socket/vendor/` — so a hard failure leaves no husk for sweep to
+/// enumerate as a vendored unit (or for the user to commit). `remove_dir`
+/// refuses non-empty dirs, so live copies, markers, and other patches' vendor
+/// dirs always survive. `copy_dir` may be the copy or its stage sibling
+/// (same parent); pruning starts at its parent.
+async fn prune_empty_vendor_dirs(copy_dir: &Path) {
+    let mut level = copy_dir.parent();
+    for _ in 0..4 {
+        let Some(dir) = level else { return };
+        match tokio::fs::remove_dir(dir).await {
+            Ok(()) => {}
+            // Already unwound wholesale (`remove_tree(uuid_dir)`): keep
+            // pruning the parent levels this run created.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            // Non-empty (a live copy or marker) or otherwise busy: stop.
+            Err(_) => return,
+        }
+        level = dir.parent();
+    }
+}
+
+/// Failure cleanup for a staged (re)build: always remove the stage, then
+/// either unwind the whole `<uuid>/` dir (`unwind_uuid_dir` — a fresh vendor
+/// with no pre-existing state worth keeping) or leave existing state (a
+/// live-wired copy and its marker) untouched; either way prune any
+/// empty-husk dirs left behind.
+async fn cleanup_failed_stage(stage: &Path, uuid_dir: &Path, unwind_uuid_dir: bool) {
+    let _ = remove_tree(stage).await;
+    if unwind_uuid_dir {
+        let _ = remove_tree(uuid_dir).await;
+    }
+    prune_empty_vendor_dirs(stage).await;
+}
+
+/// Copy the installed package into a STAGE sibling of `copy_dir`, run the
+/// hardened apply pipeline against it (vendor auto-force policy — see
+/// [`super::force_apply_staged`]), and swap the stage into `copy_dir` only on
+/// success. A failed (re)build therefore never destroys a pre-existing copy:
+/// with `unwind_uuid_dir` (a fresh vendor — nothing pre-existing to keep) the
+/// whole uuid dir is removed, without it (a live-wired rebuild, where
+/// composer.lock keeps pointing at the copy) the previous copy and marker are
+/// left exactly as they were; either way no partial copy or empty `<uuid>/`
+/// husk — which verify/sweep would misjudge — survives, and the failed
+/// [`ApplyResult`] is the `Err` for the caller to bubble (composer.lock is
+/// only ever edited after this succeeds).
 #[allow(clippy::too_many_arguments)]
 async fn copy_and_patch(
     purl: &str,
@@ -522,11 +623,15 @@ async fn copy_and_patch(
     record: &PatchRecord,
     sources: &PatchSources<'_>,
     force: bool,
+    unwind_uuid_dir: bool,
     pkg: &str,
     version: &str,
     warnings: &mut Vec<VendorWarning>,
 ) -> Result<ApplyResult, ApplyResult> {
-    if let Err(e) = fresh_copy(installed_dir, copy_dir, None).await {
+    let stage = stage_dir_for(copy_dir);
+    // `fresh_copy` removes + recreates the stage itself.
+    if let Err(e) = fresh_copy(installed_dir, &stage, None).await {
+        cleanup_failed_stage(&stage, uuid_dir, unwind_uuid_dir).await;
         return Err(synthesized_result(
             purl,
             copy_dir,
@@ -536,13 +641,18 @@ async fn copy_and_patch(
         ));
     }
     let mut result = super::force_apply_staged(
-        purl, copy_dir, record, sources, false, force, pkg, version, warnings,
+        purl, &stage, record, sources, false, force, pkg, version, warnings,
     )
     .await;
     result.package_path = copy_dir.display().to_string();
     if !result.success {
-        // Don't leave a half-built copy under `.socket/vendor/`.
-        let _ = remove_tree(uuid_dir).await;
+        cleanup_failed_stage(&stage, uuid_dir, unwind_uuid_dir).await;
+        return Err(result);
+    }
+    if let Err(e) = swap_stage_into_place(&stage, copy_dir).await {
+        cleanup_failed_stage(&stage, uuid_dir, unwind_uuid_dir).await;
+        result.success = false;
+        result.error = Some(format!("failed to move the rebuilt copy into place: {e}"));
         return Err(result);
     }
     Ok(result)
@@ -592,16 +702,22 @@ async fn composer_service_copy(
     };
     match fetch_verified_archive(cfg, &record.uuid).await {
         ServiceArtifact::Ready(archive) => {
-            let _ = remove_tree(copy_dir).await;
-            if let Err(e) = tokio::fs::create_dir_all(copy_dir).await {
+            // Extract into a STAGE sibling and swap it into the copy dir only
+            // once fully verified — a failure then leaves any pre-existing
+            // (possibly live-wired) copy and its marker untouched and no husk
+            // behind.
+            let stage = stage_dir_for(copy_dir);
+            let _ = remove_tree(&stage).await;
+            if let Err(e) = tokio::fs::create_dir_all(&stage).await {
+                cleanup_failed_stage(&stage, uuid_dir, false).await;
                 return hard(
                     "vendor_prebuilt_write_failed",
-                    format!("cannot create {}: {e}", copy_dir.display()),
+                    format!("cannot create {}: {e}", stage.display()),
                 );
             }
             // composer dist zips carry a single variable top-level dir.
-            if let Err(e) = extract_zip(&archive.bytes, copy_dir, /*strip_first=*/ true) {
-                let _ = remove_tree(uuid_dir).await;
+            if let Err(e) = extract_zip(&archive.bytes, &stage, /*strip_first=*/ true) {
+                cleanup_failed_stage(&stage, uuid_dir, false).await;
                 return hard(
                     "vendor_prebuilt_extract_failed",
                     format!("cannot extract the prebuilt dist zip: {e}"),
@@ -619,8 +735,8 @@ async fn composer_service_copy(
             // `record.files` and shipped a copy missing its patched files
             // (exit 0, empty copy_dir on disk). Fail closed here and let
             // the `auto` source fall back to the local build.
-            if !copy_matches_after_hashes(copy_dir, &record.files).await {
-                let _ = remove_tree(copy_dir).await;
+            if !copy_matches_after_hashes(&stage, &record.files).await {
+                cleanup_failed_stage(&stage, uuid_dir, false).await;
                 return miss(
                     warnings,
                     "vendor_prebuilt_layout_mismatch",
@@ -629,6 +745,13 @@ async fn composer_service_copy(
                          unexpected layout (patched files absent at their \
                          recorded paths)"
                     ),
+                );
+            }
+            if let Err(e) = swap_stage_into_place(&stage, copy_dir).await {
+                cleanup_failed_stage(&stage, uuid_dir, false).await;
+                return hard(
+                    "vendor_prebuilt_write_failed",
+                    format!("cannot move the extracted dist into place: {e}"),
                 );
             }
             warnings.push(VendorWarning::new(
@@ -1409,6 +1532,89 @@ mod tests {
         );
     }
 
+    /// A failed FRESH copy must leave no `.socket/vendor` husk: `fresh_copy`
+    /// creates the full `<uuid>/<vendor>/<name>@<version>` destination chain
+    /// BEFORE walking the source, so a copy failure (unreadable installed
+    /// package, ENOSPC mid-copy) would otherwise strand an empty uuid dir
+    /// that sweep enumerates as a vendored unit with no ledger entry — a
+    /// phantom orphan the user commits. Same contract as the cargo twin's
+    /// `cleanup_failed_stage`.
+    #[tokio::test]
+    async fn test_failed_fresh_copy_leaves_no_vendor_husk() {
+        let lock = lock_value("psr/log", "3.0.2", false);
+        let (dir, blobs, _installed, record) = fixture(&lock).await;
+        let root = dir.path();
+        let before = tokio::fs::read(root.join(COMPOSER_LOCK)).await.unwrap();
+
+        // A missing installed dir makes the copy's source walk fail after
+        // the destination chain was created (unit-level stand-in for the
+        // mid-copy ENOSPC / EACCES / concurrent-delete failures).
+        let missing = root.join("missing");
+        let (result, entry, _w) =
+            unwrap_done(run_vendor(root, &blobs, &missing, &record, PURL, false).await);
+        assert!(!result.success);
+        assert!(entry.is_none());
+        assert!(
+            !root.join(".socket/vendor").exists(),
+            "a failed copy must not strand a uuid-dir husk under .socket/vendor"
+        );
+        assert_eq!(
+            tokio::fs::read(root.join(COMPOSER_LOCK)).await.unwrap(),
+            before,
+            "lock untouched on failure"
+        );
+    }
+
+    /// Wired lock + drifted copy + a FAILING local rebuild: the
+    /// rebuild-artifact-only path keeps composer.lock untouched by design, so
+    /// a failure must NOT delete the uuid dir the lock still points at — that
+    /// strands the project (`composer install` dies with "Source path … is
+    /// not found", precisely the state revert refuses to create). Like the
+    /// cargo twin, the rebuild is staged: the previous
+    /// (drifted-but-installable) copy and the marker survive exactly as they
+    /// were.
+    #[tokio::test]
+    async fn test_failed_rebuild_keeps_wired_artifact() {
+        let lock = lock_value("psr/log", "3.0.2", false);
+        let (dir, blobs, installed, record) = fixture(&lock).await;
+        let root = dir.path();
+
+        let (r1, e1, _) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, PURL, false).await);
+        assert!(r1.success, "{:?}", r1.error);
+        assert!(e1.is_some());
+        let lock_bytes = tokio::fs::read(root.join(COMPOSER_LOCK)).await.unwrap();
+
+        // Drift the committed copy so the rerun takes the rebuild path…
+        let drifted = root.join(copy_rel()).join("src/LoggerInterface.php");
+        tokio::fs::write(&drifted, b"<?php // drifted\n").await.unwrap();
+        // …and make the rebuild fail: the patch bytes cannot be sourced.
+        let empty = root.join("empty-blobs");
+        tokio::fs::create_dir_all(&empty).await.unwrap();
+
+        let (r2, e2, _w2) =
+            unwrap_done(run_vendor(root, &empty, &installed, &record, PURL, false).await);
+        assert!(!r2.success, "the failed rebuild must be reported");
+        assert!(e2.is_none());
+        assert_eq!(
+            tokio::fs::read(root.join(COMPOSER_LOCK)).await.unwrap(),
+            lock_bytes,
+            "the rebuild path never touches the lock"
+        );
+        assert_eq!(
+            tokio::fs::read(&drifted).await.unwrap(),
+            b"<?php // drifted\n".to_vec(),
+            "a failed rebuild must leave the previous live-wired copy as it was"
+        );
+        assert!(
+            root.join(format!(
+                ".socket/vendor/composer/{UUID}/{VENDOR_MARKER_FILE}"
+            ))
+            .exists(),
+            "a failed rebuild must not delete the marker while the lock is wired"
+        );
+    }
+
     #[tokio::test]
     async fn test_revert_round_trip_byte_identical() {
         let lock = lock_value("psr/log", "3.0.2", false);
@@ -2041,6 +2247,55 @@ mod tests {
             vendor_with_service(root, &blobs, &bogus_installed, &record, &offline).await,
         );
         assert_eq!(code, "vendor_service_offline_conflict");
+    }
+
+    /// The same strand through the service path: wired lock + drifted copy +
+    /// a corrupt prebuilt zip. The extract failure must not delete the
+    /// live-wired uuid dir — the marker and the drifted copy composer.lock
+    /// still installs from must survive.
+    #[tokio::test]
+    async fn service_rebuild_extract_failure_keeps_wired_artifact() {
+        let lock = lock_value("psr/log", "3.0.2", false);
+        let (dir, blobs, installed, record) = fixture(&lock).await;
+        let root = dir.path();
+
+        let (r1, e1, _) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, PURL, false).await);
+        assert!(r1.success, "{:?}", r1.error);
+        assert!(e1.is_some());
+
+        let drifted = root.join(copy_rel()).join("src/LoggerInterface.php");
+        tokio::fs::write(&drifted, b"<?php // drifted\n").await.unwrap();
+
+        // Integrity-valid garbage: the download verifies, the extract fails.
+        let garbage = b"not a zip at all".to_vec();
+        let sri = sri_sha512(&garbage);
+        let server = wiremock::MockServer::start().await;
+        mount_composer_granted(&server, &sri, &garbage).await;
+
+        let (code, _) = unwrap_refused(
+            vendor_with_service(
+                root,
+                &blobs,
+                &installed,
+                &record,
+                &composer_service_cfg(&server.uri(), VendorSource::Service, false),
+            )
+            .await,
+        );
+        assert_eq!(code, "vendor_prebuilt_extract_failed");
+        assert_eq!(
+            tokio::fs::read(&drifted).await.unwrap(),
+            b"<?php // drifted\n".to_vec(),
+            "an extract failure must leave the previous live-wired copy in place"
+        );
+        assert!(
+            root.join(format!(
+                ".socket/vendor/composer/{UUID}/{VENDOR_MARKER_FILE}"
+            ))
+            .exists(),
+            "an extract failure must not delete the marker while the lock is wired"
+        );
     }
 
     /// `--offline` + `--vendor-source=service` refuses without any network.

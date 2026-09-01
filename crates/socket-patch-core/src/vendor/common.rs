@@ -444,13 +444,24 @@ pub(crate) async fn revert_lock_fragment_splice(
         let original_text = rec.original.as_ref().and_then(Value::as_str);
         match super::toml_surgery::replace_fragment(&lock_text, new_text, original_text) {
             Some(t) => lock_text = t,
-            None => warnings.push(VendorWarning::new(
-                "vendor_lock_entry_drifted",
-                format!(
-                    "{lock_file} fragment for {:?} changed since vendoring; left untouched",
-                    rec.key
-                ),
-            )),
+            None => {
+                // ALREADY CONVERGED (the LIVENESS CONTRACT, vendor/mod.rs):
+                // the lock already carries the recorded pre-vendor original
+                // — an earlier partial revert or a relock regeneration
+                // already restored the unit. Not drift: stay silent so the
+                // drift-skip keep gate can converge instead of keeping the
+                // artifact dir and ledger entry forever.
+                if original_text.is_some_and(|orig| lock_text.contains(orig)) {
+                    continue;
+                }
+                warnings.push(VendorWarning::new(
+                    "vendor_lock_entry_drifted",
+                    format!(
+                        "{lock_file} fragment for {:?} changed since vendoring; left untouched",
+                        rec.key
+                    ),
+                ));
+            }
         }
     }
 
@@ -579,6 +590,59 @@ mod tests {
                 .is_some_and(|e| e.contains("cannot read poetry.lock")),
             "{:?}",
             outcome.error
+        );
+    }
+
+    /// LIVENESS CONTRACT (vendor/mod.rs): a fragment whose lock already
+    /// carries the recorded pre-vendor original — a relock regenerated the
+    /// unit, or an earlier partial revert restored it — is CONVERGED, not
+    /// drifted: re-classifying it would make the pypi drift-keep gate
+    /// retain the artifact dir and ledger entry forever, with remediation
+    /// advice that can never be satisfied.
+    #[tokio::test]
+    async fn revert_lock_fragment_splice_converged_fragment_is_silent_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("poetry.lock");
+        tokio::fs::write(&lock, "alpha\nOLD-FRAGMENT\nomega\n")
+            .await
+            .unwrap();
+
+        let mut entry: VendorEntry = serde_json::from_value(serde_json::json!({
+            "ecosystem": "pypi",
+            "basePurl": "pkg:pypi/six@1.16.0",
+            "uuid": "u",
+            "artifact": {"path": ".socket/vendor/pypi/u/x.whl"},
+            "wiring": [],
+        }))
+        .unwrap();
+        entry.wiring = vec![record(
+            "poetry.lock",
+            "poetry_lock_package",
+            WiringAction::Rewritten,
+            "six",
+            Some("OLD-FRAGMENT".into()),
+            "NEW-FRAGMENT".into(),
+        )];
+
+        let outcome = revert_lock_fragment_splice(
+            &entry,
+            dir.path(),
+            false,
+            "poetry.lock",
+            "poetry_lock_package",
+            "poetry",
+        )
+        .await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(
+            outcome.warnings.is_empty(),
+            "converged fragments must not read as drift: {:?}",
+            outcome.warnings
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(&lock).await.unwrap(),
+            "alpha\nOLD-FRAGMENT\nomega\n",
+            "nothing to restore"
         );
     }
 

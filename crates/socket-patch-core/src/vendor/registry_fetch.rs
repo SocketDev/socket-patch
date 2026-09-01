@@ -208,8 +208,9 @@ pub(crate) fn extract_zip(bytes: &[u8], dest: &Path, strip_first: bool) -> Resul
     Ok(())
 }
 
-/// Composer dist zips (packagist/GitHub zipballs): sha1-verified, variable
-/// top dir stripped. The extracted dir plays the installed package dir.
+/// Composer dist zips: sha1-verified; a variable zipball top dir is
+/// stripped when present, flat `composer archive`-built dists extract
+/// as-is. The extracted dir plays the installed package dir.
 async fn fetch_composer(
     entry: &LockfileEntry,
     client: &reqwest::Client,
@@ -225,7 +226,11 @@ async fn fetch_composer(
     let tmp = tempfile::tempdir()
         .map_err(|e| FetchError::Failed(format!("cannot create fetch tempdir: {e}")))?;
     let dir = tmp.path().join("package");
-    extract_zip(&bytes, &dir, /*strip_first=*/ true).map_err(FetchError::Failed)?;
+    // Strip only when the zip actually nests under a lone top dir (the
+    // zipball layout) — flat `composer archive`-built dists carry
+    // composer.json at the root; see [`zip_has_single_top_dir`].
+    let strip_first = zip_has_single_top_dir(&bytes).map_err(FetchError::Failed)?;
+    extract_zip(&bytes, &dir, strip_first).map_err(FetchError::Failed)?;
     if tokio::fs::metadata(dir.join("composer.json"))
         .await
         .is_err()
@@ -678,11 +683,25 @@ pub async fn stage_local_artifact(
     // guard class as the vendor lockfile reads.
     let bytes = {
         use tokio::io::AsyncReadExt as _;
-        let (mut file, metadata) = crate::utils::fs::open_regular_file(tgz_path)
+        let (file, metadata) = crate::utils::fs::open_regular_file(tgz_path)
             .await
             .map_err(|e| FetchError::Failed(format!("cannot read {}: {e}", tgz_path.display())))?;
+        // Enforce the cap BEFORE the size-matched allocation and read: the
+        // committed artifact path can hold a huge (or sparse, cost-free to
+        // craft) file, and a metadata-sized `with_capacity` would abort or
+        // OOM instead of returning the clean cap error below. Declared size
+        // here + actual bytes below — the same double enforcement as
+        // [`download`]; the `take` holds the memory bound even against a
+        // file that grows between this stat and the read.
+        if metadata.len() > MAX_DOWNLOAD_BYTES {
+            return Err(FetchError::Failed(format!(
+                "{}: artifact exceeds the {MAX_DOWNLOAD_BYTES}-byte cap",
+                tgz_path.display()
+            )));
+        }
         let mut bytes = Vec::with_capacity(metadata.len() as usize);
-        file.read_to_end(&mut bytes)
+        file.take(MAX_DOWNLOAD_BYTES + 1)
+            .read_to_end(&mut bytes)
             .await
             .map_err(|e| FetchError::Failed(format!("cannot read {}: {e}", tgz_path.display())))?;
         bytes
@@ -887,6 +906,32 @@ fn verify_sri(bytes: &[u8], sri: &str) -> Result<(), String> {
              {actual}"
         ))
     }
+}
+
+/// Whether every FILE entry in the zip nests under one shared top-level
+/// directory — the GitHub/GitLab-zipball layout. This is the per-archive
+/// `strip_first` decision Composer itself makes (ArchiveDownloader promotes
+/// a lone top dir, else installs from the extract root): `composer archive`-
+/// built dists (Satis archive builds, Artifactory/Nexus, private Packagist)
+/// store composer.json at the archive ROOT, where an unconditional strip
+/// would drop it and refuse a genuine, integrity-verified artifact.
+fn zip_has_single_top_dir(bytes: &[u8]) -> Result<bool, String> {
+    let archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
+        .map_err(|e| format!("unreadable zip: {e}"))?;
+    let mut top: Option<&str> = None;
+    for name in archive.file_names() {
+        if name.ends_with('/') {
+            continue; // dir entries: extraction skips them too
+        }
+        let Some((first, _)) = name.split_once('/') else {
+            return Ok(false); // a root-level file — flat layout
+        };
+        if top.is_some_and(|t| t != first) {
+            return Ok(false);
+        }
+        top = Some(first);
+    }
+    Ok(top.is_some())
 }
 
 /// Strip the FIRST path component (npm's tarball semantics — usually
@@ -1526,6 +1571,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn composer_flat_dist_fetch_keeps_root_layout() {
+        // `composer archive`-built dists (Satis archive builds, Artifactory/
+        // Nexus, private Packagist) store composer.json at the archive ROOT —
+        // no zipball top dir. Composer itself auto-detects the layout per
+        // archive (ArchiveDownloader promotes a lone top dir, else installs
+        // from the extract root); an unconditional first-component strip
+        // drops the root composer.json and refuses a genuine, sha1-verified
+        // artifact as "carries no composer.json".
+        let zip_bytes = make_zip(&[
+            ("composer.json", br#"{"name":"acme/flat"}"#),
+            ("src/Flat.php", b"<?php\n"),
+        ]);
+        let sha1 = hex::encode(Sha1::digest(&zip_bytes));
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(url_path("/dists/acme-flat-1.0.0.zip"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(zip_bytes))
+            .mount(&mock)
+            .await;
+
+        let entry = LockfileEntry {
+            ecosystem: "composer",
+            name: "acme/flat".into(),
+            version: "1.0.0".into(),
+            purl: "pkg:composer/acme/flat@1.0.0".into(),
+            resolved: Some(format!("{}/dists/acme-flat-1.0.0.zip", mock.uri())),
+            integrity: LockIntegrity::Sha1Hex(sha1),
+        };
+        let fetched = fetch_and_stage(&entry, &build_registry_client())
+            .await
+            .expect("a flat-layout dist is a genuine, integrity-verified artifact");
+        assert!(fetched.dir().join("composer.json").is_file());
+        assert!(
+            fetched.dir().join("src/Flat.php").is_file(),
+            "flat-layout paths must extract verbatim, not lose their first segment"
+        );
+    }
+
+    #[test]
+    fn zip_single_top_dir_detection() {
+        // Zipball layout: everything nests under one top dir → strip.
+        let zipball = make_zip(&[
+            ("Seldaek-monolog-abc123/composer.json", b"{}".as_slice()),
+            ("Seldaek-monolog-abc123/src/Logger.php", b"<?php\n"),
+        ]);
+        assert!(zip_has_single_top_dir(&zipball).unwrap());
+        // Flat layout: a root-level file → extract as-is.
+        let flat = make_zip(&[
+            ("composer.json", b"{}".as_slice()),
+            ("src/A.php", b"<?php\n"),
+        ]);
+        assert!(!zip_has_single_top_dir(&flat).unwrap());
+        // Two top dirs with no root file: still not a lone-top-dir archive.
+        let two = make_zip(&[("a/x.php", b"1".as_slice()), ("b/y.php", b"2".as_slice())]);
+        assert!(!zip_has_single_top_dir(&two).unwrap());
+        // No file entries at all: nothing to promote.
+        assert!(!zip_has_single_top_dir(&make_zip(&[])).unwrap());
+    }
+
+    #[tokio::test]
     async fn gem_fetch_verifies_sha256_and_extracts_data_tar() {
         // .gem = plain tar holding data.tar.gz (content at the ROOT — no
         // prefix dir) + metadata.gz.
@@ -1701,6 +1806,79 @@ mod tests {
             Ok(other) => panic!("expected Failed on a FIFO artifact, got {other:?}"),
             Err(_) => panic!("stage_local_artifact wedged on a FIFO artifact"),
         }
+    }
+
+    /// The 128 MB artifact cap must fire BEFORE the size-matched allocation
+    /// and read: a huge file at the ledger-recorded artifact path (a sparse
+    /// `truncate -s 64G` costs the attacker nothing) must get the clean
+    /// FetchError cap message, not a metadata-sized `Vec::with_capacity`
+    /// that aborts or OOMs — the module's documented memory-bomb bound.
+    ///
+    /// Runs in a CHILD PROCESS (the fs.rs RLIMIT_FSIZE precedent): peak RSS
+    /// is process-wide and monotonic, so sibling tests in this binary (the
+    /// 128 MB go_h1 bomb-cap test among them) would poison an in-process
+    /// measurement.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stage_local_artifact_caps_oversized_artifact_before_buffering() {
+        const CHILD_ENV: &str = "SOCKET_PATCH_CORE_TEST_STAGE_CAP_CHILD";
+        const TEST_NAME: &str = "vendor::registry_fetch::tests::\
+                                 stage_local_artifact_caps_oversized_artifact_before_buffering";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let exe = std::env::current_exe().expect("test binary path must resolve");
+            let output = std::process::Command::new(exe)
+                .args([TEST_NAME, "--exact", "--test-threads=1", "--nocapture"])
+                .env(CHILD_ENV, "1")
+                .output()
+                .expect("the measured child test process must spawn");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success(),
+                "the measured child run failed:\nstdout:\n{stdout}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stderr),
+            );
+            // Anti-vacuity: a renamed test would make the `--exact` filter
+            // match nothing and the child exit 0 having proven nothing.
+            assert!(
+                stdout.contains("1 passed"),
+                "the child run must execute exactly this test — filter drift \
+                 after a rename? child stdout:\n{stdout}"
+            );
+            return;
+        }
+
+        // 1 GiB sparse: zero disk blocks, but 8× the cap — buffering it
+        // before the cap check dirties ~1 GiB of RSS.
+        const HUGE: u64 = 1024 * 1024 * 1024;
+        let tmp = tempfile::tempdir().unwrap();
+        let tgz_path = tmp.path().join("huge.tgz");
+        std::fs::File::create(&tgz_path)
+            .unwrap()
+            .set_len(HUGE)
+            .unwrap();
+
+        match stage_local_artifact(&tgz_path, &"0".repeat(64)).await {
+            Err(FetchError::Failed(msg)) => assert!(msg.contains("cap"), "{msg}"),
+            other => panic!("expected the cap refusal, got {other:?}"),
+        }
+
+        let mut ru = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+        assert_eq!(
+            unsafe { libc::getrusage(libc::RUSAGE_SELF, ru.as_mut_ptr()) },
+            0
+        );
+        let ru = unsafe { ru.assume_init() };
+        // macOS reports ru_maxrss in bytes, Linux in kilobytes.
+        let peak = if cfg!(target_os = "macos") {
+            ru.ru_maxrss as u64
+        } else {
+            (ru.ru_maxrss as u64) * 1024
+        };
+        assert!(
+            peak < HUGE / 2,
+            "peak RSS {peak} bytes — the oversized artifact was buffered into \
+             memory before the cap check"
+        );
     }
 
     #[test]

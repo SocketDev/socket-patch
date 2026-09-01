@@ -197,7 +197,8 @@ fn parse_pnpm_workspace_patterns(yaml_content: &str) -> Vec<String> {
 
         // The header may carry an inline comment (`packages: # globs`); a `#`
         // opens a comment only when preceded by whitespace.
-        let is_packages_header = match trimmed.strip_prefix("packages:") {
+        let after_key = trimmed.strip_prefix("packages:");
+        let is_packages_header = match after_key {
             Some("") => true,
             Some(rest) => {
                 rest.starts_with(|c: char| c.is_whitespace()) && rest.trim_start().starts_with('#')
@@ -207,6 +208,15 @@ fn parse_pnpm_workspace_patterns(yaml_content: &str) -> Vec<String> {
         if is_packages_header {
             in_packages = true;
             continue;
+        }
+
+        // The value may instead be a YAML flow sequence on the header line
+        // (`packages: ['a/*', "b/*"]`) — pnpm's real YAML parser accepts it
+        // exactly like the block list.
+        if let Some(rest) = after_key {
+            if rest.starts_with(|c: char| c.is_whitespace()) && rest.trim_start().starts_with('[') {
+                return parse_yaml_flow_sequence(rest.trim_start());
+            }
         }
 
         if in_packages {
@@ -224,6 +234,43 @@ fn parse_pnpm_workspace_patterns(yaml_content: &str) -> Vec<String> {
     }
 
     patterns
+}
+
+/// Parse a single-line YAML flow sequence (`['a', "b", c]`) into its scalar
+/// items. `s` starts at the `[`; anything after the closing `]` (e.g. an
+/// inline comment) is ignored. A `,` inside a quoted scalar is part of the
+/// value — a brace pattern carries one — not an item separator.
+fn parse_yaml_flow_sequence(s: &str) -> Vec<String> {
+    let mut items = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    // Skip the opening `[`.
+    for c in s.chars().skip(1) {
+        match quote {
+            Some(q) => {
+                current.push(c);
+                if c == q {
+                    quote = None;
+                }
+            }
+            None => match c {
+                '\'' | '"' => {
+                    quote = Some(c);
+                    current.push(c);
+                }
+                ',' => items.push(std::mem::take(&mut current)),
+                ']' => break,
+                _ => current.push(c),
+            },
+        }
+    }
+    items.push(current);
+
+    items
+        .iter()
+        .map(|item| parse_yaml_list_value(item))
+        .filter(|item| !item.is_empty())
+        .collect()
 }
 
 /// Extract the scalar value of a YAML list item, handling surrounding quotes
@@ -512,9 +559,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "RED: parse_pnpm_workspace does not support the YAML flow-sequence \
-                spelling `packages: [a, b]`. The test is correct; the parser fix \
-                was not part of this change."]
     fn test_parse_pnpm_flow_sequence() {
         // pnpm parses pnpm-workspace.yaml with a real YAML parser, which accepts
         // a flow sequence (`packages: ['a/*', "b/*"]`) exactly like the block
@@ -536,8 +580,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "RED: same missing flow-sequence support as \
-                test_parse_pnpm_flow_sequence, for the quoted-comma case."]
     fn test_parse_pnpm_flow_sequence_keeps_quoted_comma() {
         // A `,` inside a quoted scalar is part of the value (a brace pattern
         // carries one), so it must not split the sequence.
@@ -805,9 +847,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "RED: end-to-end consequence of the missing flow-sequence support \
-                — a pnpm workspace declared with `packages: [a, b]` has its \
-                members silently skipped by discovery."]
     async fn test_find_pnpm_flow_sequence_members_discovered() {
         // End-to-end symptom of the flow-sequence gap: the inline
         // `packages: [...]` spelling yielded no patterns, so a real pnpm

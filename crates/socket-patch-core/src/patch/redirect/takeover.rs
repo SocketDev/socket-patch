@@ -455,17 +455,30 @@ pub async fn revert_npm_redirect_purl(
                             && match entry.get("version").and_then(Value::as_str) {
                                 Some(v) => v == version,
                                 // Version field gone (hand-edited lock): fall
-                                // back to the recorded URLs, erring toward
-                                // claiming — the replay itself fails closed
-                                // on any value mismatch.
-                                None => edit_references_version(e, &version),
+                                // back to the recorded URLs, which must name
+                                // this exact package AND version — version
+                                // alone would claim a same-version alias
+                                // collision (`npm i <name>@npm:other`, name
+                                // field stripped too) whose live values ARE
+                                // its edit's `new` values, so the replay
+                                // would NOT fail closed and the sibling would
+                                // be silently un-hosted.
+                                None => edit_references_package(e, &name, &version),
                             }
                     }
                     // Entry (or the whole lock) gone: keep the fail-closed
                     // "no longer exists" refusal for edits attributable to
-                    // this purl by key path + recorded URLs; a sibling
-                    // version's edit is not ours to claim.
-                    None => key_name == name && edit_references_version(e, &version),
+                    // this purl — by key path + recorded URLs, or (an alias
+                    // install OF this package keys its entry by the ALIAS,
+                    // so the key path exonerates nothing) by recorded URLs
+                    // naming this exact package. Leaving the alias edit
+                    // unclaimed would drop the record while stranding it —
+                    // half a takeover. A sibling purl's edit is still not
+                    // ours to claim.
+                    None => {
+                        (key_name == name && edit_references_version(e, &version))
+                            || edit_references_package(e, &name, &version)
+                    }
                 }
             }
             "redirect_bun_lock_package" => {
@@ -585,6 +598,37 @@ fn edit_references_version(edit: &FileEdit, version: &str) -> bool {
             .and_then(|o| o.get("resolved"))
             .and_then(Value::as_str)
             .is_some_and(|s| s.contains(&path_seg) || s.contains(&tarball))
+    })
+}
+
+/// Does one of this edit's recorded `resolved` URLs reference BOTH `name`
+/// and `version`?
+///
+/// Name-discriminated twin of [`edit_references_version`], for the claims
+/// where the lock key path cannot vouch for the name (an alias install keys
+/// its entry by the alias, and `npm i <name>@npm:other` keys ANOTHER package
+/// by this name's path). Both the hosted artifact URL
+/// (`…/npm/<name>/<version>/…/<name>-<version>.tgz`) and the registry
+/// tarball URL (`…/<name>/-/<basename>-<version>.tgz`) embed the name as a
+/// `/<name>/` path segment or in the tarball basename — where a scoped
+/// name's `@scope/` prefix is dropped (`…/@scope/x/-/x-1.0.0.tgz`), so the
+/// basename probe uses the bare name. Both discriminators must hold in the
+/// SAME URL, so a sibling purl of a different name never matches even at an
+/// identical version.
+fn edit_references_package(edit: &FileEdit, name: &str, version: &str) -> bool {
+    let path_seg = format!("/{version}/");
+    let tarball = format!("-{version}.tgz");
+    let name_seg = format!("/{name}/");
+    let bare = name.rsplit('/').next().unwrap_or(name);
+    let name_tarball = format!("/{bare}-{version}.tgz");
+    [&edit.new, &edit.original].into_iter().any(|v| {
+        v.as_ref()
+            .and_then(|o| o.get("resolved"))
+            .and_then(Value::as_str)
+            .is_some_and(|s| {
+                (s.contains(&path_seg) || s.contains(&tarball))
+                    && (s.contains(&name_seg) || s.contains(&name_tarball))
+            })
     })
 }
 
@@ -1702,6 +1746,228 @@ mod tests {
         assert!(err.contains("no longer exists"), "{err}");
         assert!(!state.records.is_empty(), "ledger keeps the record");
         assert_eq!(state.edits.len(), edits_before, "ledger keeps the edits");
+    }
+
+    /// `npm i mylp@npm:left-pad` records an edit keyed by the ALIAS lock path
+    /// (`node_modules/mylp`); after `npm uninstall mylp` regenerates the lock
+    /// without that entry, the takeover must still attribute the edit to this
+    /// purl (via its recorded URLs — the key path says "mylp") and refuse
+    /// fail-closed exactly like the path-keyed vanished entry above — never
+    /// report success with the alias edit stranded in the ledger behind a
+    /// dropped record (half a takeover).
+    #[tokio::test]
+    async fn npm_vanished_alias_keyed_entry_fails_closed_not_half_takeover() {
+        let lock = serde_json::json!({
+            "name": "app",
+            "version": "1.0.0",
+            "lockfileVersion": 3,
+            "requires": true,
+            "packages": {
+                "": { "name": "app", "version": "1.0.0" },
+                "node_modules/left-pad": {
+                    "version": "1.3.0",
+                    "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+                    "integrity": "sha512-pristine=="
+                },
+                // Alias install OF the target package: the rewriter matches
+                // it via the `name` field and keys its edit by this path.
+                "node_modules/mylp": {
+                    "name": "left-pad",
+                    "version": "1.3.0",
+                    "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+                    "integrity": "sha512-pristine=="
+                },
+            },
+        });
+        let pristine = format!("{}\n", serde_json::to_string_pretty(&lock).unwrap());
+        let (tmp, mut state) = npm_redirected_fixture("package-lock.json", &pristine).await;
+        let root = tmp.path();
+        assert_eq!(
+            state.edits.len(),
+            2,
+            "path-keyed + alias-keyed edits: {:?}",
+            state.edits
+        );
+        // `npm uninstall mylp` regenerated the lock: the alias entry is gone,
+        // the surviving entry keeps the hosted `resolved`.
+        let mut on_disk: Value = serde_json::from_str(
+            &tokio::fs::read_to_string(root.join("package-lock.json"))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        on_disk
+            .get_mut("packages")
+            .and_then(Value::as_object_mut)
+            .unwrap()
+            .remove("node_modules/mylp")
+            .expect("fixture alias entry present");
+        let on_disk_text = serde_json::to_string_pretty(&on_disk).unwrap();
+        tokio::fs::write(root.join("package-lock.json"), &on_disk_text)
+            .await
+            .unwrap();
+        let edits_before = state.edits.len();
+
+        let err = revert_npm_redirect_purl(root, &mut state, NPM_PURL, false)
+            .await
+            .expect_err("vanished alias-keyed entry must refuse, not strand its edit");
+        assert!(err.contains("no longer exists"), "{err}");
+        assert!(!state.records.is_empty(), "ledger keeps the record");
+        assert_eq!(state.edits.len(), edits_before, "ledger keeps the edits");
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("package-lock.json"))
+                .await
+                .unwrap(),
+            on_disk_text,
+            "nothing reached disk on refusal"
+        );
+    }
+
+    /// `npm i left-pad@npm:other` keys package `other` under
+    /// `node_modules/left-pad`; a hand edit strips BOTH the `name` and
+    /// `version` fields from that live entry. Taking over left-pad must not
+    /// claim `other`'s edit through a version-only URL fallback — the entry's
+    /// live values ARE that edit's `new` values, so the replay would NOT fail
+    /// closed: `other` would be silently un-hosted and its edit dropped while
+    /// its record survives edit-less.
+    #[tokio::test]
+    async fn npm_version_gone_fallback_does_not_claim_alias_collision_sibling() {
+        let other_purl = "pkg:npm/other@1.3.0";
+        let lock = serde_json::json!({
+            "name": "app",
+            "version": "1.0.0",
+            "lockfileVersion": 3,
+            "requires": true,
+            "packages": {
+                "": { "name": "app", "version": "1.0.0" },
+                // Alias of ANOTHER package onto this key path — same version
+                // on purpose.
+                "node_modules/left-pad": {
+                    "name": "other",
+                    "version": "1.3.0",
+                    "resolved": "https://registry.npmjs.org/other/-/other-1.3.0.tgz",
+                    "integrity": "sha512-pristine-other=="
+                },
+                // The real target package, nested.
+                "node_modules/b/node_modules/left-pad": {
+                    "version": "1.3.0",
+                    "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+                    "integrity": "sha512-pristine-1.3.0=="
+                },
+            },
+        });
+        let pristine = format!("{}\n", serde_json::to_string_pretty(&lock).unwrap());
+        let (tmp, mut state) = npm_redirected_fixture_multi(
+            "package-lock.json",
+            &pristine,
+            &[
+                (NPM_PURL, npm_dep()),
+                (other_purl, npm_dep_for("other", "1.3.0")),
+            ],
+        )
+        .await;
+        let root = tmp.path();
+        assert_eq!(state.edits.len(), 2, "{:?}", state.edits);
+        let other_url = npm_dep_for("other", "1.3.0").artifact_url.clone();
+        // Hand edit / merge artifact: strip the alias entry's name+version.
+        let mut on_disk: Value = serde_json::from_str(
+            &tokio::fs::read_to_string(root.join("package-lock.json"))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let entry = on_disk
+            .get_mut("packages")
+            .and_then(|p| p.get_mut("node_modules/left-pad"))
+            .and_then(Value::as_object_mut)
+            .unwrap();
+        entry.remove("name").expect("fixture name field present");
+        entry.remove("version").expect("fixture version field present");
+        tokio::fs::write(
+            root.join("package-lock.json"),
+            serde_json::to_string_pretty(&on_disk).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        revert_npm_redirect_purl(root, &mut state, NPM_PURL, false)
+            .await
+            .expect("takeover of left-pad succeeds without touching `other`");
+
+        let lock = tokio::fs::read_to_string(root.join("package-lock.json"))
+            .await
+            .unwrap();
+        assert!(!lock.contains(NPM_URL), "left-pad un-hosted: {lock}");
+        assert!(
+            lock.contains(&other_url),
+            "`other` (aliased onto node_modules/left-pad, fields stripped) \
+             still hosted-wired: {lock}"
+        );
+        assert!(
+            state.records.contains_key(other_purl) && !state.records.contains_key(NPM_PURL),
+            "{:?}",
+            state.records.keys()
+        );
+        assert_eq!(
+            state.edits.len(),
+            1,
+            "other keeps its edit: {:?}",
+            state.edits
+        );
+    }
+
+    /// Narrowing guard for the version-gone fallback: with only the `version`
+    /// field hand-stripped from the target's own live entry, the recorded
+    /// URLs name this exact package+version, so the takeover still claims and
+    /// reverts it rather than stranding the edit.
+    #[tokio::test]
+    async fn npm_version_stripped_target_entry_is_still_claimed_via_recorded_urls() {
+        let lock = serde_json::json!({
+            "name": "app",
+            "version": "1.0.0",
+            "lockfileVersion": 3,
+            "requires": true,
+            "packages": {
+                "": { "name": "app", "version": "1.0.0" },
+                "node_modules/left-pad": {
+                    "version": "1.3.0",
+                    "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+                    "integrity": "sha512-pristine=="
+                },
+            },
+        });
+        let pristine = format!("{}\n", serde_json::to_string_pretty(&lock).unwrap());
+        let (tmp, mut state) = npm_redirected_fixture("package-lock.json", &pristine).await;
+        let root = tmp.path();
+        let mut on_disk: Value = serde_json::from_str(
+            &tokio::fs::read_to_string(root.join("package-lock.json"))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        on_disk
+            .get_mut("packages")
+            .and_then(|p| p.get_mut("node_modules/left-pad"))
+            .and_then(Value::as_object_mut)
+            .unwrap()
+            .remove("version")
+            .expect("fixture version field present");
+        tokio::fs::write(
+            root.join("package-lock.json"),
+            serde_json::to_string_pretty(&on_disk).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        revert_npm_redirect_purl(root, &mut state, NPM_PURL, false)
+            .await
+            .expect("revert succeeds");
+        let lock = tokio::fs::read_to_string(root.join("package-lock.json"))
+            .await
+            .unwrap();
+        assert!(!lock.contains(NPM_URL), "left-pad un-hosted: {lock}");
+        assert!(state.records.is_empty(), "record dropped");
+        assert!(state.edits.is_empty(), "edits dropped");
     }
 
     #[tokio::test]

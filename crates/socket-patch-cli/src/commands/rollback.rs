@@ -1064,9 +1064,12 @@ pub async fn run(args: RollbackArgs) -> i32 {
         // edits without records) is vacuously "covered" by any scope; only
         // an UNSCOPED run may replay those leftover edits — a scoped
         // rollback of an unrelated purl must not unwind live redirects it
-        // was never asked about.
+        // was never asked about. `--ecosystems` counts as a scope here:
+        // recordless edits carry no purl to narrow by, so an eco-narrowed
+        // run leaves them to an unscoped rollback rather than replaying
+        // other ecosystems' edits behind the filter's back.
         Ok(Some(s)) => {
-            (!s.records.is_empty() || !scoped)
+            (!s.records.is_empty() || (!scoped && args.common.ecosystems.is_none()))
                 && s.records.keys().all(|p| hosted_scope.contains(p))
         }
         _ => false,

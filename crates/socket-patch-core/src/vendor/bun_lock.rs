@@ -318,7 +318,7 @@ pub(crate) async fn revert_bun_opts(
     // advertises a revert the wet run refuses. Skipped under
     // `keep_artifact`: the refusal exists only to protect the deletion,
     // which a preserve-state revert never performs.
-    if entry.wiring.is_empty() {
+    if !keep_artifact && entry.wiring.is_empty() {
         if let Some(blocked) = super::npm_lock::guard_unwired_textual_revert(
             project_root,
             &entry.uuid,
@@ -1586,6 +1586,52 @@ mod tests {
             !fx.root().join(fx.rel_tgz()).exists(),
             "no lock, no reference"
         );
+    }
+
+    /// `--preserve-state` (`keep_artifact`) with empty wiring: the
+    /// deletion-protecting refusal above must be SKIPPED (the fn doc and
+    /// composer's reference implementation both promise it — a
+    /// preserve-state revert deletes nothing), so the revert completes as
+    /// a successful no-op with lock and artifact intact. Dry-run preview
+    /// included: it must never advertise a refusal the wet preserve-state
+    /// run does not hit.
+    #[tokio::test]
+    async fn empty_wiring_preserve_state_revert_skips_the_deletion_refusal() {
+        let fx = fixture_with(BN3_BEFORE_LOCK, "node_modules/left-pad").await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let mut entry = entry.unwrap();
+        entry.wiring.clear();
+        let tgz_path = fx.root().join(fx.rel_tgz());
+        let lock_vendored = fx.read_lock().await;
+
+        for dry_run in [true, false] {
+            let outcome = revert_bun_opts(
+                &entry,
+                fx.root(),
+                RevertOpts {
+                    dry_run,
+                    keep_artifact: true,
+                },
+            )
+            .await;
+            assert!(
+                outcome.success,
+                "dry_run={dry_run}: preserve-state deletes nothing, so the \
+                 deletion guard must not fire: {:?}",
+                outcome.error
+            );
+            assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+            assert!(
+                !outcome.kept_artifact,
+                "preserve-state is not a drift-keep"
+            );
+            assert!(tgz_path.exists(), "artifact kept");
+            assert_eq!(
+                fx.read_lock().await,
+                lock_vendored,
+                "empty wiring replays nothing"
+            );
+        }
     }
 
     #[tokio::test]

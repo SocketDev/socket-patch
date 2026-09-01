@@ -394,6 +394,15 @@ pub(super) async fn revert_pipenv(
             warnings.push(drifted());
             continue;
         };
+        // ALREADY CONVERGED (the LIVENESS CONTRACT, vendor/mod.rs): the live
+        // entry already equals the recorded pre-vendor original — an earlier
+        // partial revert, a hand-restore, or a `pipenv lock` regeneration
+        // already reverted this record. Not drift: stay silent so the
+        // drift-skip keep gate can converge instead of keeping the artifact
+        // dir and ledger entry forever.
+        if map.get(name) == rec.original.as_ref() {
+            continue;
+        }
         let (Some(new_value), Some(live)) = (rec.new.as_ref(), map.get(name)) else {
             warnings.push(drifted());
             continue;
@@ -1111,6 +1120,36 @@ mod tests {
             outcome.error.as_deref().unwrap_or("").contains("cannot read"),
             "{:?}",
             outcome.error
+        );
+    }
+
+    /// LIVENESS CONTRACT (vendor/mod.rs): a record whose live entry already
+    /// equals the recorded pre-vendor original — `pipenv lock` regenerated
+    /// the registry shape, or an earlier partial revert restored it — is a
+    /// silent no-op, NOT drift: re-classifying it would make the pypi
+    /// drift-keep gate retain the artifact dir and ledger entry forever,
+    /// with remediation advice that can never be satisfied.
+    #[tokio::test]
+    async fn revert_already_converged_entry_is_silent_no_op() {
+        let tmp = write_lock(LOCK_DIRECT_REGISTRY).await;
+        let p = load_pipenv_project(tmp.path()).await.unwrap();
+        let (wiring, meta) = wire_default(&p, tmp.path()).await;
+        // Simulate `pipenv lock` regenerating the pre-vendor registry entry.
+        tokio::fs::write(tmp.path().join("Pipfile.lock"), LOCK_DIRECT_REGISTRY)
+            .await
+            .unwrap();
+
+        let outcome = revert_pipenv(&entry_for(wiring, meta), tmp.path(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(
+            outcome.warnings.is_empty(),
+            "converged records must not read as drift: {:?}",
+            outcome.warnings
+        );
+        assert_eq!(
+            read_lock(tmp.path()).await,
+            LOCK_DIRECT_REGISTRY,
+            "nothing to restore, nothing re-serialized"
         );
     }
 

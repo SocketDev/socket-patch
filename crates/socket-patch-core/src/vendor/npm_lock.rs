@@ -24,7 +24,9 @@ use crate::patch::copy_tree::remove_tree;
 use crate::utils::fs::atomic_write_bytes_preserving_mode;
 
 use super::common::{already_patched_result, detect_indent, done, refused, serialize_json};
-use super::npm_common::{done_failure, guard_coordinates, guard_revert_uuid_dir, stage_patch_pack};
+use super::npm_common::{
+    done_failure_unstage, guard_coordinates, guard_revert_uuid_dir, stage_patch_pack,
+};
 use super::path::parse_vendor_path;
 use super::state::{
     write_marker, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
@@ -196,6 +198,12 @@ pub async fn vendor_npm(
     // ── 4–7. Stage → patch → pack (shared flavor-agnostic pipeline:
     //         tempdir stage outside the project, nested node_modules prune,
     //         bundled-deps refusal, hardened apply, deterministic pack) ────
+    // A wiring failure past this point must unwind the uuid dir staging is
+    // about to create — but never one that already existed (a same-uuid
+    // re-vendor's dir may still be referenced by live wiring).
+    let uuid_dir_preexisted = tokio::fs::metadata(project_root.join(&uuid_dir_rel))
+        .await
+        .is_ok();
     let (staged, result) = match stage_patch_pack(
         purl,
         installed_dir,
@@ -238,10 +246,14 @@ pub async fn vendor_npm(
     let mut recomputed_deps = false;
     {
         let Some(packages) = lock.get_mut("packages").and_then(Value::as_object_mut) else {
-            return done_failure(
+            return done_failure_unstage(
                 purl,
                 "lock `packages` object vanished mid-rewrite".to_string(),
-            );
+                project_root,
+                &uuid_dir_rel,
+                uuid_dir_preexisted,
+            )
+            .await;
         };
         for m in &matches {
             let Some(live) = packages.get_mut(&m.key).and_then(Value::as_object_mut) else {
@@ -324,10 +336,26 @@ pub async fn vendor_npm(
     let indent = detect_indent(&String::from_utf8_lossy(&lock_bytes));
     let out = match serialize_json(&lock, &indent) {
         Ok(out) => out,
-        Err(e) => return done_failure(purl, format!("cannot serialize {lock_name}: {e}")),
+        Err(e) => {
+            return done_failure_unstage(
+                purl,
+                format!("cannot serialize {lock_name}: {e}"),
+                project_root,
+                &uuid_dir_rel,
+                uuid_dir_preexisted,
+            )
+            .await
+        }
     };
     if let Err(e) = atomic_write_bytes_preserving_mode(&project_root.join(&lock_name), &out).await {
-        return done_failure(purl, format!("cannot write {lock_name}: {e}"));
+        return done_failure_unstage(
+            purl,
+            format!("cannot write {lock_name}: {e}"),
+            project_root,
+            &uuid_dir_rel,
+            uuid_dir_preexisted,
+        )
+        .await;
     }
 
     // ── 9. Marker + ledger entry ─────────────────────────────────────────
@@ -1362,6 +1390,65 @@ mod tests {
                 .is_err(),
             "no artifact dir on failure"
         );
+    }
+
+    /// A wiring failure AFTER `stage_patch_pack` packed the tarball into the
+    /// project must unstage the uuid dir ([`done_failure_unstage`]) — plain
+    /// `done_failure` leaves an untracked artifact husk with NO ledger entry,
+    /// breaking the "a failure leaves the project byte-untouched" contract
+    /// (yarn classic/berry + pnpm-legacy precedent). Repro: the project root
+    /// turns read-only after install (the .socket subtree keeps its own
+    /// writable mode, so packing succeeds and only step 8's lock write fails
+    /// with EACCES).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn post_pack_lock_write_failure_unstages_the_artifact_husk() {
+        use std::os::unix::fs::PermissionsExt;
+
+        async fn chmod(path: &Path, mode: u32) {
+            tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+                .await
+                .unwrap();
+        }
+
+        let fx = fixture().await;
+        chmod(fx.root(), 0o555).await;
+        let (result, entry, _) = expect_done(fx.vendor(false).await);
+        chmod(fx.root(), 0o755).await;
+        assert!(!result.success, "the lock-write failure is reported");
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("cannot write package-lock.json"),
+            "{:?}",
+            result.error
+        );
+        assert!(entry.is_none(), "no ledger entry for a failed wiring");
+        assert!(
+            !fx.root()
+                .join(format!(".socket/vendor/npm/{UUID}"))
+                .exists(),
+            "no orphaned artifact husk may remain (nothing tracks it)"
+        );
+        assert_eq!(
+            tokio::fs::read(fx.lock_path()).await.unwrap(),
+            fx.lock_bytes,
+            "lock byte-untouched on failure"
+        );
+
+        // A same-uuid re-vendor's PRE-EXISTING dir must survive the failure
+        // (live wiring may still reference it).
+        let fx2 = fixture().await;
+        let uuid_dir = fx2.root().join(format!(".socket/vendor/npm/{UUID}"));
+        tokio::fs::create_dir_all(&uuid_dir).await.unwrap();
+        chmod(fx2.root(), 0o555).await;
+        let (result, entry, _) = expect_done(fx2.vendor(false).await);
+        chmod(fx2.root(), 0o755).await;
+        assert!(!result.success);
+        assert!(entry.is_none());
+        assert!(uuid_dir.exists(), "a pre-existing uuid dir is never unstaged");
     }
 
     /// `vendor --force` keeps its missing-file tolerance (strict superset

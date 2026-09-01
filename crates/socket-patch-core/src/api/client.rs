@@ -287,10 +287,18 @@ impl ApiClient {
             let result = self
                 .post_json::<BatchSearchResponse, _>(&path, &body)
                 .await?;
-            let mut result = result.unwrap_or_else(|| BatchSearchResponse {
-                packages: Vec::new(),
-                can_access_paid_patches: false,
-            });
+            // A 404 here is a COLLECTION route miss — an unknown org slug
+            // (e.g. a typo'd --org / SOCKET_ORG_SLUG) or a server without
+            // the route. The server expresses "no patches" as 200 with
+            // empty `packages`, so substituting an empty success would
+            // mask the misconfiguration as a clean zero-patch scan.
+            let Some(mut result) = result else {
+                return Err(ApiError::Other(format!(
+                    "API request failed with status 404: POST {} not found — \
+                     check the organization slug '{}' (--org / SOCKET_ORG_SLUG)",
+                    path, slug
+                )));
+            };
             sort_batch_response(&mut result);
             return Ok(result);
         }
@@ -2915,5 +2923,78 @@ mod vendor_package_tests {
             outcome,
             VendorServiceOutcome::Failed(ApiError::InvalidHash(_))
         ));
+    }
+}
+
+#[cfg(test)]
+mod authenticated_batch_tests {
+    use super::*;
+    use serde_json::json;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn auth_client(uri: String, slug: &str) -> ApiClient {
+        ApiClient::new(ApiClientOptions {
+            api_url: uri,
+            api_token: Some("sktsec_token_placeholder_value_api".into()),
+            use_public_proxy: false,
+            org_slug: Some(slug.into()),
+        })
+    }
+
+    /// A 404 from the authenticated batch COLLECTION route means the org
+    /// slug is wrong (or the deployment lacks the route) — the server
+    /// expresses "no patches" as 200 with empty `packages` — so it must
+    /// surface as an error. Substituting an empty success would mask a
+    /// typo'd `--org` / SOCKET_ORG_SLUG as a clean zero-patch scan.
+    #[tokio::test]
+    async fn authenticated_batch_404_is_an_error_not_empty_success() {
+        let server = MockServer::start().await;
+        // .expect(1): exactly one POST, no retry / per-package fallback.
+        Mock::given(method("POST"))
+            .and(path("/v0/orgs/typo-slug/patches/batch"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let err = auth_client(server.uri(), "typo-slug")
+            .search_patches_batch(None, &["pkg:npm/lodash@4.17.21".to_string()])
+            .await
+            .expect_err("a 404 on the authenticated batch route must not become an empty success");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("404") && msg.contains("typo-slug"),
+            "error must name the status and the org slug: {msg}"
+        );
+        // A wrong org slug must surface, not silently downgrade the scan
+        // to the public proxy's free-only patches.
+        assert!(
+            !is_fallback_candidate(&err),
+            "batch 404 must not trigger the auth→proxy fallback: {msg}"
+        );
+    }
+
+    /// Guard: the legitimate "no patches" shape (200 + empty packages)
+    /// stays a success — only the 404 route-miss is an error.
+    #[tokio::test]
+    async fn authenticated_batch_200_empty_packages_is_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v0/orgs/acme/patches/batch"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "packages": [],
+                "canAccessPaidPatches": true
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let result = auth_client(server.uri(), "acme")
+            .search_patches_batch(None, &["pkg:npm/lodash@4.17.21".to_string()])
+            .await
+            .expect("200 with empty packages is the legitimate no-patches shape");
+        assert!(result.packages.is_empty());
+        assert!(result.can_access_paid_patches);
     }
 }

@@ -65,7 +65,7 @@ use crate::utils::fs::atomic_write_bytes_preserving_mode;
 
 use super::common::{already_patched_result, detect_indent, done, refused, serialize_json};
 use super::npm_common::{
-    done_failure, guard_coordinates, guard_revert_uuid_dir, stage_patch_pack, tgz_rel_leaf,
+    done_failure_unstage, guard_coordinates, guard_revert_uuid_dir, stage_patch_pack, tgz_rel_leaf,
 };
 use super::path::parse_vendor_path;
 use super::pnpm_lock::{
@@ -432,6 +432,12 @@ pub async fn vendor_pnpm_legacy(
     }
 
     // ── 4. Stage → patch → pack ───────────────────────────────────────────
+    // A wiring failure past this point must unwind the uuid dir staging is
+    // about to create — but never one that already existed (a same-uuid
+    // re-vendor's dir may still be referenced by live wiring).
+    let uuid_dir_preexisted = tokio::fs::metadata(project_root.join(&coords.uuid_dir_rel))
+        .await
+        .is_ok();
     let (staged, result) = match stage_patch_pack(
         purl,
         installed_dir,
@@ -476,13 +482,31 @@ pub async fn vendor_pnpm_legacy(
     let (pkg_changed, created_pnpm_table, created_overrides_table) =
         match apply_pkg_override(&mut pkg, &effective_key, &spec, &mut wiring) {
             Ok(out) => out,
-            Err(e) => return done_failure(purl, e),
+            Err(e) => {
+                return done_failure_unstage(
+                    purl,
+                    e,
+                    project_root,
+                    &coords.uuid_dir_rel,
+                    uuid_dir_preexisted,
+                )
+                .await
+            }
         };
 
     let mut lock_changed = false;
     match edit_overrides(&mut lines, &ctx, &mut wiring) {
         Ok(changed) => lock_changed |= changed,
-        Err(e) => return done_failure(purl, format!("{PNPM_LOCK} surgery failed: {e}")),
+        Err(e) => {
+            return done_failure_unstage(
+                purl,
+                format!("{PNPM_LOCK} surgery failed: {e}"),
+                project_root,
+                &coords.uuid_dir_rel,
+                uuid_dir_preexisted,
+            )
+            .await
+        }
     }
     let root_edit = match grammar {
         PnpmLockGrammar::V54 => edit_root_deps_v54(&mut lines, &ctx, &mut wiring),
@@ -493,18 +517,45 @@ pub async fn vendor_pnpm_legacy(
             lock_changed |= changed;
             hit
         }
-        Err(e) => return done_failure(purl, format!("{PNPM_LOCK} surgery failed: {e}")),
+        Err(e) => {
+            return done_failure_unstage(
+                purl,
+                format!("{PNPM_LOCK} surgery failed: {e}"),
+                project_root,
+                &coords.uuid_dir_rel,
+                uuid_dir_preexisted,
+            )
+            .await
+        }
     };
     if grammar == PnpmLockGrammar::V54 && root_dep_hit {
         match edit_specifier_v54(&mut lines, &ctx, &mut wiring) {
             Ok(changed) => lock_changed |= changed,
-            Err(e) => return done_failure(purl, format!("{PNPM_LOCK} surgery failed: {e}")),
+            Err(e) => {
+                return done_failure_unstage(
+                    purl,
+                    format!("{PNPM_LOCK} surgery failed: {e}"),
+                    project_root,
+                    &coords.uuid_dir_rel,
+                    uuid_dir_preexisted,
+                )
+                .await
+            }
         }
     }
     for edit in [edit_packages, edit_pkg_dep_refs] {
         match edit(&mut lines, &ctx, &mut wiring) {
             Ok(changed) => lock_changed |= changed,
-            Err(e) => return done_failure(purl, format!("{PNPM_LOCK} surgery failed: {e}")),
+            Err(e) => {
+                return done_failure_unstage(
+                    purl,
+                    format!("{PNPM_LOCK} surgery failed: {e}"),
+                    project_root,
+                    &coords.uuid_dir_rel,
+                    uuid_dir_preexisted,
+                )
+                .await
+            }
         }
     }
 
@@ -539,7 +590,16 @@ pub async fn vendor_pnpm_legacy(
     let pkg_indent = detect_indent(&String::from_utf8_lossy(&pkg_bytes));
     let new_pkg_bytes = match serialize_json(&pkg, &pkg_indent) {
         Ok(bytes) => bytes,
-        Err(e) => return done_failure(purl, format!("cannot serialize {PACKAGE_JSON}: {e}")),
+        Err(e) => {
+            return done_failure_unstage(
+                purl,
+                format!("cannot serialize {PACKAGE_JSON}: {e}"),
+                project_root,
+                &coords.uuid_dir_rel,
+                uuid_dir_preexisted,
+            )
+            .await
+        }
     };
     let lock_out = lines.join("\n");
     if let Err(e) = commit_surfaces(
@@ -553,7 +613,14 @@ pub async fn vendor_pnpm_legacy(
     )
     .await
     {
-        return done_failure(purl, e);
+        return done_failure_unstage(
+            purl,
+            e,
+            project_root,
+            &coords.uuid_dir_rel,
+            uuid_dir_preexisted,
+        )
+        .await;
     }
 
     // ── 7. Marker + ledger entry ──────────────────────────────────────────
@@ -1219,7 +1286,7 @@ pub async fn revert_pnpm_legacy_opts(
     // (see [`super::pnpm_lock::guard_unwired_revert`]). Skipped under
     // `keep_artifact`: the refusal exists only to protect the deletion,
     // which a preserve-state revert never performs.
-    if entry.wiring.is_empty() {
+    if entry.wiring.is_empty() && !keep_artifact {
         let in_use = pnpm_legacy_entry_in_use(entry, project_root).await;
         if let Some(blocked) = guard_unwired_revert(project_root, in_use, &uuid_dir_rel).await {
             return blocked;
@@ -1452,6 +1519,13 @@ fn revert_value_line(
         if k != dep {
             continue;
         }
+        // ALREADY CONVERGED: the live value already equals the recorded
+        // pre-vendor original — an earlier partial revert (or the user, by
+        // hand) already restored it. Not drift: stay silent so the
+        // drift-skip keep gate can converge.
+        if rec.original.as_ref().and_then(Value::as_str) == Some(rest.as_str()) {
+            return;
+        }
         let ours = Some(rest.as_str()) == rec.new.as_ref().and_then(Value::as_str)
             || parse_vendor_path(&rest).is_some_and(|p| p.eco == "npm" && p.uuid == entry_uuid);
         if !ours {
@@ -1508,9 +1582,20 @@ fn revert_root_dep_pair(
             continue;
         }
         let (spec_f, ver_f, _) = dep_field_lines(lines, k + 1, end, 4);
-        let (Some((si, _)), Some((vi, live_ver))) = (spec_f, ver_f) else {
+        let (Some((si, live_spec)), Some((vi, live_ver))) = (spec_f, ver_f) else {
             break;
         };
+        // ALREADY CONVERGED: both fields already equal the recorded
+        // pre-vendor original — an earlier partial revert (or the user, by
+        // hand) already restored this record. Not drift: stay silent so
+        // the drift-skip keep gate can converge.
+        if let Some(original) = rec.original.as_ref() {
+            if original.get("specifier").and_then(Value::as_str) == Some(live_spec.as_str())
+                && original.get("version").and_then(Value::as_str) == Some(live_ver.as_str())
+            {
+                return;
+            }
+        }
         let new_ver = rec
             .new
             .as_ref()
@@ -1616,6 +1701,20 @@ fn revert_package_block(
         *dirty = true;
         return;
     }
+    // ALREADY CONVERGED: an earlier partial revert restored this record —
+    // the restore rekeys the block back to its pre-vendor key, so the
+    // recorded `file:` key no longer matches while the original block is
+    // live verbatim. Not drift: stay silent so the drift-skip keep gate can
+    // converge instead of keeping the artifacts forever.
+    if let Some(orig) = rec.original.as_ref().and_then(value_lines) {
+        let mut j = start + 1;
+        while let Some(block) = next_block(lines, j, end) {
+            if lines[block.header..block.end] == orig[..] {
+                return;
+            }
+            j = block.end;
+        }
+    }
     warnings.push(drifted(format!(
         "packages entry `{new_key}` no longer exists; nothing to restore"
     )));
@@ -1662,6 +1761,12 @@ fn revert_pkg_dep_ref(
             };
             if d != dep {
                 continue;
+            }
+            // ALREADY CONVERGED: the live ref already equals the recorded
+            // pre-vendor original — an earlier partial revert (or the
+            // user, by hand) already restored it. Not drift.
+            if rec.original.as_ref().and_then(Value::as_str) == Some(rest.as_str()) {
+                return;
             }
             let ours = Some(rest.as_str()) == rec.new.as_ref().and_then(Value::as_str)
                 || parse_vendor_path(&rest).is_some_and(|p| p.eco == "npm" && p.uuid == entry_uuid);
@@ -2856,6 +2961,127 @@ packages:
             "the CRLF lock still resolves through the tarball; deleting it bricks installs"
         );
         assert_eq!(fx.read(PNPM_LOCK).await, crlf, "the drifted lock is left alone");
+    }
+
+    /// LIVENESS CONTRACT ([`RevertOutcome::drift_skipped`]): a pair already
+    /// back at its pre-vendor state (a `git checkout`, or an earlier partial
+    /// revert) is CONVERGED, not drifted — revert must no-op silently and
+    /// still remove the artifact, exactly like the v9 backend, instead of
+    /// keeping artifact + ledger entry forever behind an "undo the drift"
+    /// remediation the reverted state can never satisfy. Both grammars
+    /// (covers all four legacy-only revert helpers).
+    #[tokio::test]
+    async fn converged_pair_revert_is_silent_and_removes_the_artifact() {
+        for (before_lock, tag) in [(T7_BEFORE_LOCK, "5.4"), (T8_BEFORE_LOCK, "6.0")] {
+            let fx = fixture_with(T_BEFORE_PKG, before_lock).await;
+            let (_, entry, _) = expect_done(fx.vendor(false).await);
+            let entry = entry.unwrap();
+
+            // The pair reaches its pre-vendor state while the ledger entry
+            // survives (`git checkout pnpm-lock.yaml package.json`).
+            tokio::fs::write(fx.root().join(PACKAGE_JSON), T_BEFORE_PKG)
+                .await
+                .unwrap();
+            tokio::fs::write(fx.root().join(PNPM_LOCK), before_lock)
+                .await
+                .unwrap();
+
+            let outcome = revert_pnpm_legacy(&entry, fx.root(), false).await;
+            assert!(outcome.success, "{tag}: {:?}", outcome.error);
+            assert!(
+                outcome.warnings.is_empty(),
+                "{tag}: converged records are silent no-ops, not drift: {:?}",
+                outcome.warnings
+            );
+            assert!(!outcome.kept_artifact, "{tag}");
+            assert!(
+                !fx.root()
+                    .join(format!(".socket/vendor/npm/{UUID}"))
+                    .exists(),
+                "{tag}: the artifact dir is removed"
+            );
+            assert_eq!(fx.read(PACKAGE_JSON).await, T_BEFORE_PKG, "{tag}");
+            assert_eq!(fx.read(PNPM_LOCK).await, before_lock, "{tag}");
+        }
+    }
+
+    /// A wiring failure AFTER `stage_patch_pack` packed the tarball into the
+    /// project must unstage the uuid dir ([`done_failure_unstage`]) — plain
+    /// `done_failure` leaves an untracked artifact husk with NO ledger entry,
+    /// breaking the "a failure leaves the project byte-untouched" contract
+    /// (yarn classic/berry precedent). Reachable shape: a non-object `pnpm`
+    /// value passes classify's pre-flight (`Value::get` on a string is None)
+    /// and errs in `apply_pkg_override`, after the pack.
+    #[tokio::test]
+    async fn post_pack_wiring_failure_unstages_the_artifact_husk() {
+        let pkg_bad_pnpm = r#"{
+  "name": "legacy-spike2",
+  "version": "0.0.0",
+  "private": true,
+  "dependencies": {
+    "consumer": "file:./consumer",
+    "left-pad": "1.3.0",
+    "left-pad-old": "npm:left-pad@1.2.0"
+  },
+  "pnpm": "not-an-object"
+}
+"#;
+        let fx = fixture_with(pkg_bad_pnpm, T7_BEFORE_LOCK).await;
+        let (result, entry, _) = expect_done(fx.vendor(false).await);
+        assert!(!result.success, "the wiring failure is reported");
+        assert!(entry.is_none(), "no ledger entry for a failed wiring");
+        assert!(
+            !fx.root()
+                .join(format!(".socket/vendor/npm/{UUID}"))
+                .exists(),
+            "no orphaned artifact husk may remain (nothing tracks it)"
+        );
+        assert_eq!(fx.read(PACKAGE_JSON).await, pkg_bad_pnpm);
+        assert_eq!(fx.read(PNPM_LOCK).await, T7_BEFORE_LOCK);
+
+        // A same-uuid re-vendor's PRE-EXISTING dir must survive the failure
+        // (live wiring may still reference it).
+        let fx2 = fixture_with(pkg_bad_pnpm, T7_BEFORE_LOCK).await;
+        let uuid_dir = fx2.root().join(format!(".socket/vendor/npm/{UUID}"));
+        tokio::fs::create_dir_all(&uuid_dir).await.unwrap();
+        let (result, entry, _) = expect_done(fx2.vendor(false).await);
+        assert!(!result.success);
+        assert!(entry.is_none());
+        assert!(
+            uuid_dir.exists(),
+            "a pre-existing uuid dir is never unstaged"
+        );
+    }
+
+    /// `keep_artifact` (rollback/remove --preserve-state) never deletes the
+    /// artifact, so the empty-wiring refusal that exists only to protect the
+    /// deletion must be SKIPPED (its own documented contract): a
+    /// repair-reconstructed entry over a still-wired lock preserve-state
+    /// reverts as a clean no-op instead of a hard per-entry failure.
+    #[tokio::test]
+    async fn empty_wiring_preserve_state_revert_skips_the_deletion_guard() {
+        let fx = fixture_with(T_BEFORE_PKG, T7_BEFORE_LOCK).await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let mut entry = entry.unwrap();
+        entry.wiring.clear();
+        entry.pnpm = None;
+        let lock_wired = fx.read(PNPM_LOCK).await;
+
+        let opts = RevertOpts {
+            dry_run: false,
+            keep_artifact: true,
+        };
+        let outcome = revert_pnpm_legacy_opts(&entry, fx.root(), opts).await;
+        assert!(
+            outcome.success,
+            "a preserve-state revert performs no deletion, so nothing needs guarding: {:?} {:?}",
+            outcome.error, outcome.warnings
+        );
+        assert!(
+            fx.root().join(fx.rel_tgz()).exists(),
+            "the artifact stays (preserve-state)"
+        );
+        assert_eq!(fx.read(PNPM_LOCK).await, lock_wired, "lock untouched");
     }
 
     #[cfg(unix)]

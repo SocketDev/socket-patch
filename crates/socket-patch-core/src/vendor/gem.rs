@@ -354,7 +354,10 @@ pub async fn vendor_gem(
             // already correct and the full path would re-record the live
             // vendored fragments as `original`, breaking a later --revert.
             // Service-preferred like the full path (an auto-fetched gem has no
-            // local stub to rebuild from — only the service can).
+            // local stub to rebuild from — only the service can). The rebuild
+            // is staged: a failure must leave the previous (drifted-but-
+            // buildable) copy and the live pair edit exactly as they were,
+            // never a deleted uuid dir under a still-pointing `path:`.
             if !dry_run {
                 if let Some(refusal) = service_offline_conflict(service) {
                     return refusal;
@@ -371,6 +374,7 @@ pub async fn vendor_gem(
                     record,
                     sources,
                     force,
+                    false, // live-wired: never unwind the uuid dir on failure
                     service,
                     &mut warnings,
                 )
@@ -454,6 +458,7 @@ pub async fn vendor_gem(
         record,
         sources,
         force,
+        true, // fresh vendor: nothing pre-existing worth keeping
         service,
         &mut warnings,
     )
@@ -680,6 +685,110 @@ pub async fn vendor_gem(
 
 // ── materialisation (service download / local build) ──────────────────────────
 
+/// A swap sibling for a copy dir: `<uuid>/<name>-<version><suffix>`. Same
+/// directory as the copy → every swap step is a real rename, never a
+/// cross-device copy. The suffixes can never collide with a copy dir: this
+/// backend creates exactly one `<name>-<version>` leaf per uuid dir, from
+/// validated plain gem tokens (see the mirrored cargo.rs machinery).
+fn swap_sibling_for(copy_dir: &Path, suffix: &str) -> std::path::PathBuf {
+    let name = copy_dir
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "copy".to_string());
+    match copy_dir.parent() {
+        Some(parent) => parent.join(format!("{name}{suffix}")),
+        None => copy_dir.join(suffix),
+    }
+}
+
+/// The staging sibling for a copy dir: `<uuid>/<name>-<version>.socket-stage`.
+/// (Re)builds are materialised here and swapped into place only on success, so
+/// a failure can never destroy a pre-existing (possibly live-wired) copy.
+fn stage_dir_for(copy_dir: &Path) -> std::path::PathBuf {
+    swap_sibling_for(copy_dir, ".socket-stage")
+}
+
+/// The backup sibling the old copy is parked at mid-swap:
+/// `<uuid>/<name>-<version>.socket-old`.
+fn backup_dir_for(copy_dir: &Path) -> std::path::PathBuf {
+    swap_sibling_for(copy_dir, ".socket-old")
+}
+
+/// Swap a fully-built stage into place without a destructive window: park the
+/// old copy (if any) at `<copy>.socket-old` with a same-dir rename, rename the
+/// stage over the now-vacant copy path, and only then delete the backup. Every
+/// step is a single atomic rename — unlike a remove-then-rename swap (where a
+/// partial `remove_dir_all`, realistic under Windows file locks, strands a
+/// half-deleted copy) no step can leave less recoverable state than it started
+/// with. If the stage rename fails the backup is renamed straight back; should
+/// even that restore fail (an external process racing the uuid dir), the old
+/// copy still exists intact at `<copy>.socket-old` instead of being destroyed.
+async fn swap_stage_into_place(stage: &Path, copy_dir: &Path) -> std::io::Result<()> {
+    let backup = backup_dir_for(copy_dir);
+    // A stale backup (crash mid-swap on an earlier run) would make the
+    // park rename fail; `remove_tree` is a no-op when it is absent.
+    remove_tree(&backup).await?;
+    let had_old = match tokio::fs::rename(copy_dir, &backup).await {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => return Err(e),
+    };
+    match tokio::fs::rename(stage, copy_dir).await {
+        Ok(()) => {
+            if had_old {
+                let _ = remove_tree(&backup).await;
+            }
+            Ok(())
+        }
+        Err(e) => {
+            if had_old {
+                let _ = tokio::fs::rename(&backup, copy_dir).await;
+            }
+            Err(e)
+        }
+    }
+}
+
+/// Best-effort removal of an EMPTY `<uuid>/` dir plus the empty
+/// `.socket/vendor/gem/` and `.socket/vendor/` levels a failed run may have
+/// created, so a hard failure leaves no husk for the user to commit.
+/// `remove_dir` refuses non-empty dirs, so live copies, markers, and other
+/// gems' vendor dirs always survive.
+async fn prune_empty_vendor_dirs(uuid_dir: &Path) {
+    // The uuid level may already be gone (the unwind paths `remove_tree` it
+    // before pruning): NotFound must continue to the parent levels this run
+    // created, or they survive as committable husks. Any other error (i.e.
+    // non-empty: a live copy or marker) still stops the prune.
+    match tokio::fs::remove_dir(uuid_dir).await {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return,
+    }
+    let Some(eco_dir) = uuid_dir.parent() else {
+        return;
+    };
+    if tokio::fs::remove_dir(eco_dir).await.is_err() {
+        return;
+    }
+    if let Some(vendor_dir) = eco_dir.parent() {
+        let _ = tokio::fs::remove_dir(vendor_dir).await;
+    }
+}
+
+/// Failure cleanup for a staged (re)build: always remove the stage, then
+/// either unwind the whole `<uuid>/` dir (`unwind_uuid_dir` — a fresh vendor
+/// with no pre-existing state worth keeping) or leave existing state
+/// untouched — a live-wired rebuild must never delete the copy the Gemfile
+/// `path:` and the lock's PATH `remote:` still point at; either way prune any
+/// empty-husk dirs left behind.
+async fn cleanup_failed_stage(stage: &Path, uuid_dir: &Path, unwind_uuid_dir: bool) {
+    let _ = remove_tree(stage).await;
+    if unwind_uuid_dir {
+        let _ = remove_tree(uuid_dir).await;
+    }
+    prune_empty_vendor_dirs(uuid_dir).await;
+}
+
 /// The path-source stub gemspec served as the gem's SECOND artifact, alongside
 /// the `.gem` (mirrors npm's `yarn-berry-zip`). The converter generates it
 /// because a `.gem` only carries the gemspec as YAML in `metadata.gz`, not the
@@ -725,6 +834,7 @@ async fn gem_service_copy(
     name: &str,
     copy_dir: &Path,
     uuid_dir: &Path,
+    unwind_uuid_dir: bool,
     warnings: &mut Vec<VendorWarning>,
 ) -> GemServiceCopy {
     let Some(cfg) = service else {
@@ -889,25 +999,29 @@ async fn gem_service_copy(
         );
     }
 
-    // Extract the patched `.gem`'s data.tar.gz into a clean copy dir, then add
-    // the stub as `<name>.gemspec` (a `.gem`'s data.tar.gz never carries one —
-    // the gemspec lives in metadata.gz).
-    let _ = remove_tree(copy_dir).await;
-    if let Err(e) = tokio::fs::create_dir_all(copy_dir).await {
+    // Extract the patched `.gem`'s data.tar.gz into a STAGE sibling, add the
+    // stub as `<name>.gemspec` (a `.gem`'s data.tar.gz never carries one —
+    // the gemspec lives in metadata.gz), and swap it into the copy dir only
+    // once fully verified — a failure then leaves any pre-existing (possibly
+    // live-wired) copy untouched and no husk behind.
+    let stage = stage_dir_for(copy_dir);
+    let _ = remove_tree(&stage).await;
+    if let Err(e) = tokio::fs::create_dir_all(&stage).await {
+        cleanup_failed_stage(&stage, uuid_dir, unwind_uuid_dir).await;
         return hard(
             "vendor_prebuilt_write_failed",
-            format!("cannot create {}: {e}", copy_dir.display()),
+            format!("cannot create {}: {e}", stage.display()),
         );
     }
-    if let Err(e) = extract_gem_data(&archive.bytes, copy_dir) {
-        let _ = remove_tree(uuid_dir).await;
+    if let Err(e) = extract_gem_data(&archive.bytes, &stage) {
+        cleanup_failed_stage(&stage, uuid_dir, unwind_uuid_dir).await;
         return hard(
             "vendor_prebuilt_extract_failed",
             format!("cannot extract the prebuilt .gem: {e}"),
         );
     }
-    if let Err(e) = tokio::fs::write(copy_dir.join(format!("{name}.gemspec")), &stub).await {
-        let _ = remove_tree(uuid_dir).await;
+    if let Err(e) = tokio::fs::write(stage.join(format!("{name}.gemspec")), &stub).await {
+        cleanup_failed_stage(&stage, uuid_dir, unwind_uuid_dir).await;
         return hard(
             "vendor_prebuilt_write_failed",
             format!("cannot write the stub gemspec into the vendored dir: {e}"),
@@ -920,8 +1034,8 @@ async fn gem_service_copy(
     // stub gemspec we just wrote is not in record.files, so it is not part
     // of this check.) Fail closed → `auto` falls back to the local build.
     // (Mirrors composer_lock.rs.)
-    if !copy_matches_after_hashes(copy_dir, &record.files).await {
-        let _ = remove_tree(uuid_dir).await;
+    if !copy_matches_after_hashes(&stage, &record.files).await {
+        cleanup_failed_stage(&stage, uuid_dir, unwind_uuid_dir).await;
         return miss(
             warnings,
             "vendor_prebuilt_layout_mismatch",
@@ -931,6 +1045,13 @@ async fn gem_service_copy(
                  (patched files absent at their recorded paths)"
             ),
             false,
+        );
+    }
+    if let Err(e) = swap_stage_into_place(&stage, copy_dir).await {
+        cleanup_failed_stage(&stage, uuid_dir, unwind_uuid_dir).await;
+        return hard(
+            "vendor_prebuilt_write_failed",
+            format!("cannot move the extracted .gem into place: {e}"),
         );
     }
     warnings.push(VendorWarning::new(
@@ -948,8 +1069,15 @@ async fn gem_service_copy(
 /// as the fallback. Returns the verify [`ApplyResult`] (a synthesized
 /// `AlreadyPatched` on the service path), or a terminal [`VendorOutcome`] to
 /// bubble. A non-fatal copy/stub/patch failure is surfaced as an UN-successful
-/// `ApplyResult` (the caller returns it as a `Done` with no ledger entry); this
-/// helper cleans up its own partial copy in that case.
+/// `ApplyResult` (the caller returns it as a `Done` with no ledger entry).
+///
+/// Either build is staged (see [`swap_stage_into_place`]) and swapped into
+/// `copy_dir` only on success, so a failure never destroys a pre-existing
+/// copy: with `unwind_uuid_dir` (a fresh vendor — nothing pre-existing to
+/// keep) the whole uuid dir is removed on failure, without it (the wired
+/// hot-path rebuild, where the Gemfile `path:` and the lock's PATH `remote:`
+/// still point at the copy) the previous copy, marker, and wiring are left
+/// exactly as they were.
 #[allow(clippy::too_many_arguments)]
 async fn materialise_patched_copy(
     purl: &str,
@@ -962,10 +1090,21 @@ async fn materialise_patched_copy(
     record: &PatchRecord,
     sources: &PatchSources<'_>,
     force: bool,
+    unwind_uuid_dir: bool,
     service: Option<&VendorServiceConfig>,
     warnings: &mut Vec<VendorWarning>,
 ) -> Result<ApplyResult, Box<VendorOutcome>> {
-    match gem_service_copy(service, record, name, copy_dir, uuid_dir, warnings).await {
+    match gem_service_copy(
+        service,
+        record,
+        name,
+        copy_dir,
+        uuid_dir,
+        unwind_uuid_dir,
+        warnings,
+    )
+    .await
+    {
         GemServiceCopy::Used => {
             // The service `.gem` is the patched package; trust its verified
             // integrity (every file reads as AlreadyPatched).
@@ -1029,7 +1168,10 @@ async fn materialise_patched_copy(
                     ),
                 )));
             }
-            if let Err(e) = fresh_copy(installed_dir, copy_dir, None).await {
+            let stage = stage_dir_for(copy_dir);
+            // `fresh_copy` removes + recreates the stage itself.
+            if let Err(e) = fresh_copy(installed_dir, &stage, None).await {
+                cleanup_failed_stage(&stage, uuid_dir, unwind_uuid_dir).await;
                 return Ok(synthesized_result(
                     purl,
                     copy_dir,
@@ -1038,12 +1180,12 @@ async fn materialise_patched_copy(
                     Some(format!("failed to copy installed gem: {e}")),
                 ));
             }
-            // The vendored dir is freshly created and not yet referenced by
+            // The stage is freshly created and not yet referenced by
             // anything, so a plain write suffices for the gemspec.
             if let Err(e) =
-                tokio::fs::write(copy_dir.join(format!("{name}.gemspec")), spec_text).await
+                tokio::fs::write(stage.join(format!("{name}.gemspec")), spec_text).await
             {
-                let _ = remove_tree(uuid_dir).await;
+                cleanup_failed_stage(&stage, uuid_dir, unwind_uuid_dir).await;
                 return Ok(synthesized_result(
                     purl,
                     copy_dir,
@@ -1055,13 +1197,22 @@ async fn materialise_patched_copy(
                 ));
             }
             let mut result = super::force_apply_staged(
-                purl, copy_dir, record, sources, false, force, name, version, warnings,
+                purl, &stage, record, sources, false, force, name, version, warnings,
             )
             .await;
             result.package_path = copy_dir.display().to_string();
             if !result.success {
-                // Don't leave a half-built copy; neither project file was touched.
-                let _ = remove_tree(uuid_dir).await;
+                // Don't leave a half-built stage; neither project file was
+                // touched, and any pre-existing copy is still in place.
+                cleanup_failed_stage(&stage, uuid_dir, unwind_uuid_dir).await;
+                return Ok(result);
+            }
+            if let Err(e) = swap_stage_into_place(&stage, copy_dir).await {
+                cleanup_failed_stage(&stage, uuid_dir, unwind_uuid_dir).await;
+                result.success = false;
+                result.error =
+                    Some(format!("failed to move the rebuilt copy into place: {e}"));
+                return Ok(result);
             }
             Ok(result)
         }
@@ -1079,9 +1230,9 @@ pub async fn revert_gem(entry: &VendorEntry, project_root: &Path, dry_run: bool)
     revert_gem_opts(entry, project_root, RevertOpts::new(dry_run)).await
 }
 
-/// [`revert_gem`] with full [`RevertOpts`]: `keep_artifact` skips the
-/// artifact deletion — and the unwired refusal that exists only to protect
-/// it — while the wiring restore runs unchanged.
+/// [`revert_gem`] with full [`RevertOpts`]: `keep_artifact` skips ONLY the
+/// artifact deletion; the wiring restore — and the empty-wiring refusal,
+/// which applies under `keep_artifact` too — runs unchanged.
 pub async fn revert_gem_opts(
     entry: &VendorEntry,
     project_root: &Path,
@@ -1110,8 +1261,10 @@ pub async fn revert_gem_opts(
     // the removed dir and the next `bundle install` hard-fails. Refuse
     // loudly with the manual cleanup steps instead. (Every entry
     // `vendor_gem` records carries at least the Gemfile + lock records.)
-    // Skipped under `keep_artifact`: the refusal exists only to protect the
-    // deletion, which a preserve-state revert never performs.
+    // NOT skipped under `keep_artifact` (PR #231 review hardening): a
+    // preserve-state revert that cannot restore the wiring must not report
+    // the system restored while the pair edit still wires the vendored dir
+    // in — the patch would silently stay applied.
     if entry.wiring.is_empty() {
         let name = parse_gem_purl(&entry.base_purl)
             .map(|(n, _)| n)
@@ -5086,6 +5239,150 @@ mod tests {
         );
     }
 
+    /// AUDIT B1 (cargo twin, PR #194): a failed hot-path artifact rebuild must
+    /// never destroy the live-wired vendored copy. Drift the committed copy
+    /// (bad merge / hand edit — still buildable: the path source exists and
+    /// the stub is valid), then re-run with the patch content unavailable
+    /// (empty blobs dir — the offline shape: a drifted file harvests no
+    /// blob): the rebuild fails, but the previous — drifted yet buildable —
+    /// copy, the marker, the Gemfile, and the lock must all be left exactly
+    /// as they were, never a deleted uuid dir under a still-pointing pair
+    /// edit.
+    #[tokio::test]
+    async fn failed_rebuild_preserves_live_wired_copy() {
+        let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
+        let (r1, e1, _) = unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
+        assert!(r1.success, "{:?}", r1.error);
+        assert!(e1.is_some());
+        let gemfile_wired = tokio::fs::read(root.join(GEMFILE)).await.unwrap();
+        let lock_wired = tokio::fs::read(root.join(GEMFILE_LOCK)).await.unwrap();
+
+        tokio::fs::write(copy_lib(&root), b"drifted but buildable\n")
+            .await
+            .unwrap();
+
+        let empty = root.join(".socket/empty-blobs");
+        tokio::fs::create_dir_all(&empty).await.unwrap();
+        let (r2, e2, _) =
+            unwrap_done(run_vendor(&root, &empty, &installed, &record, false).await);
+        assert!(!r2.success, "rebuild must fail without patch content");
+        assert!(e2.is_none());
+
+        // The live-wired state is untouched: copy, marker, Gemfile, lock.
+        assert_eq!(
+            tokio::fs::read(copy_lib(&root)).await.unwrap(),
+            b"drifted but buildable\n",
+            "the previous committed copy must survive a failed rebuild"
+        );
+        assert!(
+            root.join(format!(".socket/vendor/gem/{UUID}/{VENDOR_MARKER_FILE}"))
+                .exists(),
+            "marker must survive"
+        );
+        assert_eq!(
+            tokio::fs::read(root.join(GEMFILE)).await.unwrap(),
+            gemfile_wired,
+            "Gemfile untouched"
+        );
+        assert_eq!(
+            tokio::fs::read(root.join(GEMFILE_LOCK)).await.unwrap(),
+            lock_wired,
+            "lock untouched"
+        );
+        // And the failed rebuild's swap siblings never leak into the uuid dir.
+        let uuid_dir = root.join(format!(".socket/vendor/gem/{UUID}"));
+        let mut rd = tokio::fs::read_dir(&uuid_dir).await.unwrap();
+        while let Some(e) = rd.next_entry().await.unwrap() {
+            let n = e.file_name().to_string_lossy().into_owned();
+            assert!(!n.contains("socket-stage"), "stage litter: {n}");
+            assert!(!n.contains("socket-old"), "backup litter: {n}");
+        }
+    }
+
+    /// The swap itself must never leave less recoverable state than it
+    /// started with. Force the stage rename to fail (stage absent — the same
+    /// io::Error surface as a Windows file lock) with a live copy in place:
+    /// the old copy must be restored byte-identical, with no backup parked
+    /// beside it.
+    #[tokio::test]
+    async fn swap_failure_restores_previous_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let copy = dir.path().join("rack-3.2.6");
+        tokio::fs::create_dir_all(copy.join("lib")).await.unwrap();
+        tokio::fs::write(copy.join("lib/rack.rb"), b"live\n")
+            .await
+            .unwrap();
+
+        let stage = stage_dir_for(&copy);
+        assert!(
+            swap_stage_into_place(&stage, &copy).await.is_err(),
+            "swapping a missing stage must fail"
+        );
+        assert_eq!(
+            tokio::fs::read(copy.join("lib/rack.rb")).await.unwrap(),
+            b"live\n",
+            "the previous copy must be restored after a failed swap"
+        );
+        assert!(!backup_dir_for(&copy).exists(), "no parked backup litter");
+    }
+
+    /// Same destroy class, service leg: a wired-but-stale hot-path rebuild
+    /// whose served `.gem` fails to extract (garbage bytes behind a correct
+    /// SRI) hard-fails — and must leave the drifted-but-present copy and the
+    /// live pair edit exactly as they were, not delete the uuid dir the
+    /// Gemfile `path:` still points at.
+    #[tokio::test]
+    async fn failed_service_rebuild_preserves_live_wired_copy() {
+        let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
+        let (r1, _, _) = unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
+        assert!(r1.success, "{:?}", r1.error);
+        let gemfile_wired = tokio::fs::read(root.join(GEMFILE)).await.unwrap();
+        let lock_wired = tokio::fs::read(root.join(GEMFILE_LOCK)).await.unwrap();
+        tokio::fs::write(copy_lib(&root), b"drifted but buildable\n")
+            .await
+            .unwrap();
+
+        let garbage = b"not a gem archive".to_vec();
+        let sri = sri_sha512(&garbage);
+        let stub_sri = sri_sha512(SERVICE_STUB);
+        let server = wiremock::MockServer::start().await;
+        mount_gem_granted(&server, &garbage, &sri, Some((SERVICE_STUB, &stub_sri))).await;
+        let sources = PatchSources::blobs_only(&blobs);
+
+        let outcome = vendor_gem(
+            PURL,
+            &installed,
+            &root,
+            &record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            Some(&gem_service_cfg(
+                &server.uri(),
+                VendorSource::Service,
+                false,
+            )),
+        )
+        .await;
+        let (code, _) = unwrap_refused(outcome);
+        assert_eq!(code, "vendor_prebuilt_extract_failed");
+
+        assert_eq!(
+            tokio::fs::read(copy_lib(&root)).await.unwrap(),
+            b"drifted but buildable\n",
+            "the previous committed copy must survive a failed service rebuild"
+        );
+        assert_eq!(
+            tokio::fs::read(root.join(GEMFILE)).await.unwrap(),
+            gemfile_wired
+        );
+        assert_eq!(
+            tokio::fs::read(root.join(GEMFILE_LOCK)).await.unwrap(),
+            lock_wired
+        );
+    }
+
     /// `auto` + a not-built service status falls back to the local build.
     #[tokio::test]
     async fn service_unavailable_auto_falls_back_to_build() {
@@ -5414,6 +5711,54 @@ mod tests {
             let err = outcome.error.expect("error detail");
             assert!(err.contains("vendor_wiring_unknown"), "{err}");
             assert!(err.contains("Gemfile"), "names the files to clean: {err}");
+        }
+        assert!(
+            root.join(copy_rel()).join("lib/rack.rb").is_file(),
+            "the artifact must NOT be deleted"
+        );
+        assert_eq!(
+            tokio::fs::read(root.join(GEMFILE)).await.unwrap(),
+            gemfile_before
+        );
+        assert_eq!(
+            tokio::fs::read(root.join(GEMFILE_LOCK)).await.unwrap(),
+            lock_before
+        );
+    }
+
+    /// The empty-wiring refusal applies under `keep_artifact`
+    /// (`--preserve-state`) TOO — PR #231's review hardening (5ceba4a3)
+    /// deliberately removed the `&& !keep_artifact` gate: a preserve-state
+    /// rollback that cannot restore the wiring must not report the system
+    /// restored while the pair edit still wires the vendored dir in (the
+    /// patch would silently stay applied). Pins that decision.
+    #[tokio::test]
+    async fn preserve_state_revert_refuses_empty_wiring_entry() {
+        let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_PINNED, LOCK_PINNED).await;
+        let (result, entry, _w) =
+            unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
+        assert!(result.success, "vendor failed: {:?}", result.error);
+        let mut entry = entry.expect("wired entry");
+        entry.wiring = Vec::new();
+
+        let gemfile_before = tokio::fs::read(root.join(GEMFILE)).await.unwrap();
+        let lock_before = tokio::fs::read(root.join(GEMFILE_LOCK)).await.unwrap();
+        for dry_run in [true, false] {
+            let outcome = revert_gem_opts(
+                &entry,
+                &root,
+                RevertOpts {
+                    dry_run,
+                    keep_artifact: true,
+                },
+            )
+            .await;
+            assert!(
+                !outcome.success,
+                "dry_run={dry_run}: must refuse under keep_artifact too"
+            );
+            let err = outcome.error.expect("error detail");
+            assert!(err.contains("vendor_wiring_unknown"), "{err}");
         }
         assert!(
             root.join(copy_rel()).join("lib/rack.rb").is_file(),

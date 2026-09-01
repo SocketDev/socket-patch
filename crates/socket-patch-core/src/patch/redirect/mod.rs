@@ -518,6 +518,7 @@ fn rewrite_pypi_requirements(
             continue;
         };
         let target = canonicalize_pypi_name(&dep.name);
+        let mut matched_any = false;
         for raw in lines.iter_mut() {
             let line = raw.trim();
             if line.is_empty() || line.starts_with('#') || line.starts_with('-') {
@@ -529,6 +530,7 @@ fn rewrite_pypi_requirements(
             if canonicalize_pypi_name(&caps[1]) != target {
                 continue;
             }
+            matched_any = true;
             // pip-compile --generate-hashes emits backslash continuations
             // (`foo==1.2 \` + indented `--hash=…` lines). Rewriting only the
             // first physical line would orphan the old hash lines and — with
@@ -573,6 +575,20 @@ fn rewrite_pypi_requirements(
                 *raw = rewritten;
                 changed = true;
             }
+        }
+        // Parity with the npm/pnpm/berry/uv rewriters: a granted dep no line
+        // accounted for — omitted (a transitive dep the file never pins), or
+        // spelled in a form the name matcher cannot parse (a PEP 508 extras
+        // bracket) — must be SAID, not silently dropped from the redirected
+        // count. A found-but-refused line (continuation) already warned above.
+        if !matched_any {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_requirements_entry_not_found".into(),
+                detail: format!(
+                    "no requirements.txt entry for {}@{}",
+                    dep.name, dep.version
+                ),
+            });
         }
     }
     if changed {
@@ -2981,7 +2997,12 @@ fn default_nuget_config() -> String {
 const NUGET_ORG_KEY: &str = "nuget.org";
 const NUGET_ORG_URL: &str = "https://api.nuget.org/v3/index.json";
 
-fn add_nuget_source(config: &str, reg: &str, index_url: &str, pkg_id: &str) -> String {
+/// `None` when an insert found no anchor (no `<packageSources>` form and no
+/// `<configuration>` root, or no close tag for a from-scratch mapping): the
+/// caller must skip the dep fail-closed — writing the mapping without its
+/// source (or recording the edit at all) routes the patched id to a source
+/// that was never defined while the ledger claims the redirect landed.
+fn add_nuget_source(config: &str, reg: &str, index_url: &str, pkg_id: &str) -> Option<String> {
     // Capture the pre-existing packageSource keys BEFORE the Socket source is
     // added — the fallback below fans a `*` mapping out to them.
     let mut pre_existing_keys = nuget_package_source_keys(config);
@@ -2994,14 +3015,18 @@ fn add_nuget_source(config: &str, reg: &str, index_url: &str, pkg_id: &str) -> S
     // nuget.org source so the catch-all has a real target (unless the config
     // already has one). Only relevant when we are about to CREATE the mapping.
     let creating_mapping = !out.contains("<packageSourceMapping>");
-    let seed_nuget_org =
-        creating_mapping && pre_existing_keys.is_empty() && !config.contains(NUGET_ORG_KEY);
+    // "Already has one" is decided by the parsed <packageSources> keys ALONE:
+    // a whole-file "nuget.org" probe is satisfied by text that defines no
+    // source (a defaultPushSource URL, a <disabledPackageSources> entry, a
+    // comment), and suppressing the seed on it leaves the from-scratch
+    // mapping socket-only — NU1100 for every other package.
+    let seed_nuget_org = creating_mapping && pre_existing_keys.is_empty();
     if seed_nuget_org {
-        out = insert_nuget_source(&out, NUGET_ORG_KEY, NUGET_ORG_URL);
+        out = insert_nuget_source(&out, NUGET_ORG_KEY, NUGET_ORG_URL)?;
         pre_existing_keys.push(NUGET_ORG_KEY.to_string());
     }
 
-    out = insert_nuget_source(&out, reg, index_url);
+    out = insert_nuget_source(&out, reg, index_url)?;
 
     let socket_mapping = format!(
         "    <packageSource key=\"{reg}\">\n      <package pattern=\"{pkg_id}\" />\n    </packageSource>"
@@ -3038,21 +3063,25 @@ fn add_nuget_source(config: &str, reg: &str, index_url: &str, pkg_id: &str) -> S
             format!("{socket_mapping}\n{fallback_mappings}")
         };
         let map_block = format!("  <packageSourceMapping>\n{inner}\n  </packageSourceMapping>");
-        out = out.replacen(
-            "</configuration>",
-            &format!("{map_block}\n</configuration>"),
-            1,
-        );
+        // The close tag may carry whitespace (`</configuration >` is valid
+        // XML); a literal replacen would silently drop the mapping.
+        let close_re = Regex::new(r"</configuration\s*>")
+            .expect("static configuration close-tag regex is valid");
+        let m = close_re.find(&out)?;
+        let at = m.start();
+        out = format!("{}{map_block}\n{}", &out[..at], &out[at..]);
     }
-    out
+    Some(out)
 }
 
 /// Insert an `<add key="…" value="…" />` source under `<packageSources>`,
-/// creating the element (right after `<configuration>`) when absent. A
-/// self-closing `<packageSources />` (any whitespace before `/>`) is expanded
-/// in place into an open/close pair rather than left dangling beside a
-/// duplicate element.
-fn insert_nuget_source(config: &str, key: &str, url: &str) -> String {
+/// creating the element (right after the `<configuration>` root open tag,
+/// whatever whitespace or attributes it carries) when absent. A self-closing
+/// `<packageSources />` (any whitespace before `/>`) is expanded in place
+/// into an open/close pair rather than left dangling beside a duplicate
+/// element. `None` when no anchor exists at all — the caller must treat the
+/// insert as failed rather than proceed on unchanged text.
+fn insert_nuget_source(config: &str, key: &str, url: &str) -> Option<String> {
     let source_line = format!("    <add key=\"{key}\" value=\"{url}\" />");
     // A self-closing element carries no children, so expand it to an open/close
     // pair holding the new source. Matched before the open-tag check because a
@@ -3067,19 +3096,26 @@ fn insert_nuget_source(config: &str, key: &str, url: &str) -> String {
             "<packageSources>\n{source_line}\n  </packageSources>"
         ));
         out.push_str(&config[m.end()..]);
-        out
+        Some(out)
     } else if config.contains("<packageSources>") {
-        config.replacen(
+        Some(config.replacen(
             "<packageSources>",
             &format!("<packageSources>\n{source_line}"),
             1,
-        )
+        ))
     } else {
-        config.replacen(
-            "<configuration>",
-            &format!("<configuration>\n  <packageSources>\n{source_line}\n  </packageSources>"),
-            1,
-        )
+        // The root open tag may carry whitespace or attributes
+        // (`<configuration >`, `<configuration xmlns=…>`) — all valid XML a
+        // literal `<configuration>` match would silently miss, leaving the
+        // source undefined while the mapping still lands.
+        let open_re = Regex::new(r"<configuration(\s[^>]*)?>")
+            .expect("static configuration open-tag regex is valid");
+        let end = open_re.find(config)?.end();
+        Some(format!(
+            "{}\n  <packageSources>\n{source_line}\n  </packageSources>{}",
+            &config[..end],
+            &config[end..]
+        ))
     }
 }
 
@@ -3097,7 +3133,12 @@ fn nuget_package_source_keys(config: &str) -> Vec<String> {
                 .as_str()
         })
         .unwrap_or("");
-    Regex::new(r#"<add\s+key="([^"]+)""#)
+    // Tolerates any attribute order and whitespace around `=` (both valid
+    // XML NuGet accepts): a real source the scan misses would read as "no
+    // sources", triggering a duplicate nuget.org seed and leaving the missed
+    // source out of the catch-all fan-out. `[^>]` keeps the match inside one
+    // element.
+    Regex::new(r#"<add\s[^>]*?key\s*=\s*"([^"]+)""#)
         .expect("static add-key regex is valid")
         .captures_iter(scope)
         .map(|c| c[1].to_string())
@@ -3156,7 +3197,23 @@ fn rewrite_nuget(
             .unwrap_or_else(|| dep.name.to_lowercase());
 
         if !config.contains(&format!("key=\"{reg}\"")) {
-            config = add_nuget_source(&config, &reg, &ov.index_url, &dep.name);
+            // A failed insert skips the WHOLE dep (no edit record, no lock
+            // re-pin): a mapping without its source routes the patched id to
+            // a source that was never defined, and a lock pinned at the
+            // patched contentHash over an upstream fetch fails NU1403 — both
+            // while the ledger would claim the redirect landed.
+            let Some(updated) = add_nuget_source(&config, &reg, &ov.index_url, &dep.name) else {
+                result.warnings.push(RewriteWarning {
+                    code: "redirect_nuget_config_unwritable".into(),
+                    detail: format!(
+                        "nuget.config has no <configuration> element to wire {} into; \
+                         not redirected",
+                        dep.name
+                    ),
+                });
+                continue;
+            };
+            config = updated;
             config_changed = true;
             result.edits.push(FileEdit {
                 path: "nuget.config".into(),
@@ -5625,6 +5682,140 @@ mod tests {
         ));
     }
 
+    /// The nuget.org seed must not be suppressed by "nuget.org" TEXT outside
+    /// the `<packageSources>` element — a `defaultPushSource` URL, a
+    /// `<disabledPackageSources>` entry, or a comment is not a package
+    /// source. Suppressing the seed there leaves the from-scratch mapping
+    /// socket-only, and a mapping is exclusive: every other package NU1100s.
+    #[test]
+    fn nuget_seed_not_suppressed_by_nugetorg_text_outside_sources() {
+        for extra in [
+            // The push URL mentions nuget.org but defines no source.
+            "  <config>\n    <add key=\"defaultPushSource\" value=\"https://api.nuget.org/v3/index.json\" />\n  </config>\n",
+            // So does a comment.
+            "  <!-- nuget.org supplied by machine config -->\n",
+        ] {
+            let mut files = BTreeMap::new();
+            files.insert(
+                "nuget.config".to_string(),
+                format!(
+                    "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<configuration>\n  <packageSources>\n  </packageSources>\n{extra}</configuration>\n"
+                ),
+            );
+            let r = rewrite_registry_redirect(&files, &[nuget_override()]);
+            let out = r.files.get("nuget.config").expect("config rewritten");
+            assert!(
+                out.contains(
+                    "<add key=\"nuget.org\" value=\"https://api.nuget.org/v3/index.json\" />"
+                ),
+                "nuget.org source seeded despite unrelated mention: {out}"
+            );
+            assert!(
+                out.contains(
+                    "    <packageSource key=\"nuget.org\">\n      <package pattern=\"*\" />\n    </packageSource>"
+                ),
+                "catch-all present (socket-only mapping NU1100s everything): {out}"
+            );
+        }
+    }
+
+    /// An `<add>` keyed nuget.org that the strict scan used to miss (XML
+    /// allows whitespace around `=` and any attribute order) is a REAL
+    /// source: it must be harvested as the catch-all target — not
+    /// double-added by the seed, and not left out of the `*` fan-out.
+    #[test]
+    fn nuget_whitespace_variant_add_is_harvested_not_reseeded() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "nuget.config".to_string(),
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<configuration>\n  <packageSources>\n    <add key = \"nuget.org\" value=\"https://api.nuget.org/v3/index.json\" />\n  </packageSources>\n</configuration>\n"
+                .to_string(),
+        );
+        let r = rewrite_registry_redirect(&files, &[nuget_override()]);
+        let out = r.files.get("nuget.config").expect("config rewritten");
+        assert!(
+            !out.contains("<add key=\"nuget.org\""),
+            "the existing source must not be duplicated by the seed: {out}"
+        );
+        assert!(
+            out.contains(
+                "    <packageSource key=\"nuget.org\">\n      <package pattern=\"*\" />\n    </packageSource>"
+            ),
+            "the existing source takes the catch-all: {out}"
+        );
+    }
+
+    /// A root open tag that isn't the literal `<configuration>` — trailing
+    /// whitespace or attributes, both valid XML NuGet parses fine — must
+    /// still receive the source insert. The literal `replacen` used to no-op
+    /// silently while the mapping (anchored on the close tag) still landed,
+    /// routing the patched id to a source that was never defined.
+    #[test]
+    fn nuget_config_root_tag_with_whitespace_still_wired() {
+        for open_tag in ["<configuration >", "<configuration\n    >"] {
+            let mut files = BTreeMap::new();
+            files.insert(
+                "nuget.config".to_string(),
+                format!(
+                    "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n{open_tag}\n</configuration>\n"
+                ),
+            );
+            let r = rewrite_registry_redirect(&files, &[nuget_override()]);
+            let out = r.files.get("nuget.config").expect("config rewritten");
+            assert!(
+                out.contains("<add key=\"socket-patch-uuid\""),
+                "socket source defined for root tag {open_tag:?}: {out}"
+            );
+            assert!(
+                out.contains("<package pattern=\"Newtonsoft.Json\" />"),
+                "socket mapping present: {out}"
+            );
+        }
+    }
+
+    /// When NO anchor exists for the source insert, the dep must be skipped
+    /// fail-closed with a warning: no config write, no recorded edit whose
+    /// `new` claims the source landed, and no lock re-pin (a patched
+    /// contentHash over an upstream fetch fails restore with NU1403).
+    #[test]
+    fn nuget_config_without_configuration_root_skips_dep_with_warning() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "nuget.config".to_string(),
+            "<packages>\n</packages>\n".to_string(),
+        );
+        files.insert(
+            "packages.lock.json".to_string(),
+            r#"{
+  "version": 1,
+  "dependencies": {
+    "net8.0": {
+      "Newtonsoft.Json": {
+        "type": "Direct",
+        "requested": "[13.0.3, )",
+        "resolved": "13.0.3",
+        "contentHash": "ORIGINALHASH=="
+      }
+    }
+  }
+}
+"#
+            .to_string(),
+        );
+        let r = rewrite_registry_redirect(&files, &[nuget_override()]);
+        assert!(
+            r.files.is_empty() && r.edits.is_empty(),
+            "an unwritable config must not record a half-write: files={:?} edits={:?}",
+            r.files.keys(),
+            r.edits
+        );
+        assert!(
+            warning_codes(&r).contains(&"redirect_nuget_config_unwritable"),
+            "the failed insert must be SAID: {:?}",
+            r.warnings
+        );
+    }
+
     /// A pre-existing `<packageSourceMapping>` already covers the other
     /// sources — the rewriter must append ONLY the Socket mapping and add NO
     /// catch-all (injecting `*` entries would loosen the project's own
@@ -5687,6 +5878,82 @@ mod tests {
                 .any(|w| w.code == "redirect_requirements_continuation"),
             "must surface the continuation refusal: {:?}",
             result.warnings
+        );
+    }
+
+    /// A granted pypi dep whose requirements.txt line the name matcher cannot
+    /// parse (a PEP 508 extras bracket terminates the name run before any
+    /// terminator alternative) — or that the file omits entirely — must be
+    /// SAID with an entry-not-found warning, matching npm/pnpm/yarn/berry/
+    /// bun/uv/cargo/composer, not silently dropped from the redirected count.
+    #[test]
+    fn requirements_unmatched_dep_warns_entry_not_found() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "requirements.txt".to_string(),
+            "requests[security]==2.28.1\n".to_string(),
+        );
+        let overrides = vec![pypi_override(
+            "requests",
+            "2.28.1",
+            "http://patch.test/requests-2.28.1-py3-none-any.whl",
+            &"c".repeat(64),
+        )];
+        let r = rewrite_registry_redirect(&files, &overrides);
+        // The extras spelling itself is a recorded TS-parity residual (the
+        // line matching needs a coordinated TS+Rust fix) — the line stays.
+        assert!(
+            r.files.is_empty() && r.edits.is_empty(),
+            "extras line must not be rewritten: {:?}",
+            r.files
+        );
+        assert!(
+            warning_codes(&r).contains(&"redirect_requirements_entry_not_found"),
+            "the un-wired dep must be SAID, not silent: {:?}",
+            r.warnings
+        );
+    }
+
+    /// The not-found warning fires ONLY for a dep no line accounted for: a
+    /// rewritten line and a continuation-refused line (which carries its own
+    /// warning) both count as found.
+    #[test]
+    fn requirements_matched_or_refused_dep_gets_no_not_found_warning() {
+        let overrides = vec![pypi_override(
+            "requests",
+            "2.28.1",
+            "http://patch.test/requests-2.28.1-py3-none-any.whl",
+            &"c".repeat(64),
+        )];
+        // Plain match: rewritten, no not-found.
+        let mut files = BTreeMap::new();
+        files.insert(
+            "requirements.txt".to_string(),
+            "requests==2.28.1\n".to_string(),
+        );
+        let r = rewrite_registry_redirect(&files, &overrides);
+        assert!(!r.edits.is_empty(), "plain pin rewritten");
+        assert!(
+            !warning_codes(&r).contains(&"redirect_requirements_entry_not_found"),
+            "a rewritten dep is not not-found: {:?}",
+            r.warnings
+        );
+        // Continuation refusal: found-but-refused must not ALSO say not-found.
+        let mut files = BTreeMap::new();
+        files.insert(
+            "requirements.txt".to_string(),
+            "requests==2.28.1 \\\n    --hash=sha256:OLDOLDOLD\n".to_string(),
+        );
+        let r = rewrite_registry_redirect(&files, &overrides);
+        assert!(
+            warning_codes(&r).contains(&"redirect_requirements_continuation"),
+            "{:?}",
+            r.warnings
+        );
+        assert!(
+            !warning_codes(&r).contains(&"redirect_requirements_entry_not_found"),
+            "a refused-with-cause dep is not not-found: {:?}",
+            r.warnings
         );
     }
 

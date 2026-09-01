@@ -313,6 +313,7 @@ pub async fn vendor_nuget(
                 sources,
                 force,
                 service,
+                /*config_wired=*/ true,
                 &mut warnings,
             )
             .await
@@ -394,6 +395,7 @@ pub async fn vendor_nuget(
         sources,
         force,
         service,
+        /*config_wired=*/ false,
         &mut warnings,
     )
     .await
@@ -670,7 +672,12 @@ pub async fn revert_nuget_opts(
 /// rebuild otherwise (extract the cached pristine nupkg → force-apply → re-zip
 /// deterministically). Returns `(bytes, ApplyResult)`, or a terminal
 /// [`VendorOutcome`] to bubble. On a non-fatal rebuild failure the returned
-/// `ApplyResult.success` is false and the partial uuid dir is cleaned up.
+/// `ApplyResult.success` is false and the partial uuid dir is cleaned up —
+/// UNLESS `config_wired`: on the wired hot path nuget.config already routes
+/// the patched id exclusively at this dir, so removing it (the marker AND a
+/// previously servable committed nupkg) would leave the wired config pointing
+/// at nothing and brick every cold restore (the module-doc invariant stated
+/// for the lock re-pin failure).
 #[allow(clippy::too_many_arguments)]
 async fn materialise_patched_nupkg(
     purl: &str,
@@ -683,12 +690,15 @@ async fn materialise_patched_nupkg(
     sources: &PatchSources<'_>,
     force: bool,
     service: Option<&VendorServiceConfig>,
+    config_wired: bool,
     warnings: &mut Vec<VendorWarning>,
 ) -> Result<(Vec<u8>, ApplyResult), Box<VendorOutcome>> {
     match service_archive_copy(service, &record.uuid, name, ".nupkg", warnings).await {
         ServiceCopy::Used(bytes) => {
             if let Err(e) = write_nupkg(uuid_dir, nupkg_path, &bytes).await {
-                let _ = remove_tree(uuid_dir).await;
+                if !config_wired {
+                    let _ = remove_tree(uuid_dir).await;
+                }
                 return Err(Box::new(refused("vendor_prebuilt_write_failed", e)));
             }
             Ok((
@@ -708,6 +718,7 @@ async fn materialise_patched_nupkg(
                 record,
                 sources,
                 force,
+                config_wired,
                 warnings,
             )
             .await
@@ -719,7 +730,8 @@ async fn materialise_patched_nupkg(
 /// extract it to a private stage, force-apply the patch, and re-zip
 /// deterministically. The `.signature.p7s` part is dropped (see the module
 /// doc). Returns `(bytes, ApplyResult)`; a failure surfaces as an un-successful
-/// `ApplyResult` (partial uuid dir cleaned up), or a refusal to bubble.
+/// `ApplyResult` (partial uuid dir cleaned up — unless `config_wired`, see
+/// [`materialise_patched_nupkg`]), or a refusal to bubble.
 #[allow(clippy::too_many_arguments)]
 async fn local_rebuild(
     purl: &str,
@@ -731,6 +743,7 @@ async fn local_rebuild(
     record: &PatchRecord,
     sources: &PatchSources<'_>,
     force: bool,
+    config_wired: bool,
     warnings: &mut Vec<VendorWarning>,
 ) -> Result<(Vec<u8>, ApplyResult), Box<VendorOutcome>> {
     let Some(src_nupkg) = locate_cached_nupkg(installed_dir).await else {
@@ -817,7 +830,12 @@ async fn local_rebuild(
     };
 
     if let Err(e) = write_nupkg(uuid_dir, nupkg_path, &nupkg_bytes).await {
-        let _ = remove_tree(uuid_dir).await;
+        // atomic_write_bytes cleans up its own stage file, so an existing
+        // committed nupkg in the dir is intact; on the wired hot path it (and
+        // the marker) must stay — the config still routes restores here.
+        if !config_wired {
+            let _ = remove_tree(uuid_dir).await;
+        }
         return Ok((Vec::new(), failed_result(purl, nupkg_path, e)));
     }
     Ok((nupkg_bytes, result))
@@ -929,12 +947,15 @@ fn build_config_edit(
             // The pre-existing sources the catch-all fans `*` out to. When the
             // config has NONE and we are creating a mapping from scratch, a
             // socket-only mapping would NU1100 every other package, so seed the
-            // implicit default nuget.org source (unless already present) and map
-            // `*` to it. Mirrors redirect::add_nuget_source.
+            // implicit default nuget.org source and map `*` to it. "Already
+            // present" is decided by the parsed source keys ALONE: a whole-file
+            // "nuget.org" probe is satisfied by text that defines no source (a
+            // defaultPushSource URL, a <disabledPackageSources> entry), and
+            // suppressing the seed on it recreates the exact socket-only
+            // mapping the seed exists to prevent. Mirrors
+            // redirect::add_nuget_source.
             let mut catch_all_keys = parse_config_source_keys(&visible);
-            let seed_nuget_org = creating_mapping
-                && catch_all_keys.is_empty()
-                && !visible.contains(NUGET_ORG_SOURCE_KEY);
+            let seed_nuget_org = creating_mapping && catch_all_keys.is_empty();
 
             let source_add = format!("    <add key=\"{source_key}\" value=\"{source_rel}\" />\n");
             let org_add = format!(
@@ -1076,12 +1097,23 @@ fn parse_config_source_keys(text: &str) -> Vec<String> {
 }
 
 /// The value of `<attr>="..."` inside an element's attribute text, if present.
+/// Tolerates whitespace around `=` (`key = "nuget.org"` is valid XML NuGet
+/// parses): a real source the scan misses would read as "no sources",
+/// triggering a duplicate nuget.org seed and leaving the missed source out of
+/// the catch-all fan-out.
 fn attr_value(elem: &str, attr: &str) -> Option<String> {
-    let needle = format!("{attr}=\"");
-    let at = elem.find(&needle)?;
-    let after = &elem[at + needle.len()..];
-    let close = after.find('"')?;
-    Some(after[..close].to_string())
+    let mut rest = elem;
+    loop {
+        let at = rest.find(attr)?;
+        let after = rest[at + attr.len()..].trim_start();
+        if let Some(eq) = after.strip_prefix('=') {
+            if let Some(quoted) = eq.trim_start().strip_prefix('"') {
+                let close = quoted.find('"')?;
+                return Some(quoted[..close].to_string());
+            }
+        }
+        rest = &rest[at + attr.len()..];
+    }
 }
 
 /// The `[start, end)` byte span of a self-closing `<packageSources />` element
@@ -1617,6 +1649,75 @@ mod tests {
         assert!(
             t.contains("    <packageSource key=\"nuget.org\">\n      <package pattern=\"*\" />"),
             "the catch-all must target the seeded nuget.org source: {t}"
+        );
+    }
+
+    #[test]
+    fn seed_not_suppressed_by_nugetorg_text_outside_sources() {
+        // "nuget.org" appearing OUTSIDE <packageSources> — a defaultPushSource
+        // URL, a <disabledPackageSources> entry — defines no package source.
+        // With zero catch-all keys the seed must still run: a socket-only
+        // from-scratch mapping is exclusive and NU1100s every other package.
+        for extra in [
+            "  <config>\n    <add key=\"defaultPushSource\" value=\"https://api.nuget.org/v3/index.json\" />\n  </config>\n",
+            "  <disabledPackageSources>\n    <add key=\"nuget.org\" value=\"true\" />\n  </disabledPackageSources>\n",
+        ] {
+            let orig = format!(
+                "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<configuration>\n  <packageSources />\n{extra}</configuration>\n"
+            );
+            let edit = build_config_edit(
+                Some(&orig),
+                &source_key(),
+                &format!(".socket/vendor/nuget/{UUID}"),
+                "Newtonsoft.Json",
+            )
+            .unwrap();
+            let t = &edit.new_text;
+            assert!(
+                t.contains(
+                    "<add key=\"nuget.org\" value=\"https://api.nuget.org/v3/index.json\" />"
+                ),
+                "nuget.org seeded despite unrelated mention: {t}"
+            );
+            assert!(
+                t.contains(
+                    "    <packageSource key=\"nuget.org\">\n      <package pattern=\"*\" />\n    </packageSource>"
+                ),
+                "catch-all targets the seeded nuget.org: {t}"
+            );
+        }
+    }
+
+    #[test]
+    fn unparsed_nugetorg_add_takes_catch_all_not_duplicated() {
+        // XML allows whitespace around `=`: `<add key = "nuget.org" …>` is a
+        // REAL source NuGet parses. It must be harvested as the catch-all
+        // target — not double-added by the seed, and not left out of the `*`
+        // fan-out (a source with no mapping entry is unusable once a mapping
+        // exists).
+        let orig = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
+                    <configuration>\n\
+                    \x20 <packageSources>\n\
+                    \x20   <add key = \"nuget.org\" value=\"https://api.nuget.org/v3/index.json\" />\n\
+                    \x20 </packageSources>\n\
+                    </configuration>\n";
+        let edit = build_config_edit(
+            Some(orig),
+            &source_key(),
+            &format!(".socket/vendor/nuget/{UUID}"),
+            "Newtonsoft.Json",
+        )
+        .unwrap();
+        let t = &edit.new_text;
+        assert!(
+            !t.contains("<add key=\"nuget.org\""),
+            "the existing source must not be duplicated by the seed: {t}"
+        );
+        assert!(
+            t.contains(
+                "    <packageSource key=\"nuget.org\">\n      <package pattern=\"*\" />\n    </packageSource>"
+            ),
+            "the existing source takes the catch-all: {t}"
         );
     }
 
@@ -2496,6 +2597,54 @@ mod tests {
             root.join(copy_rel()).exists(),
             "nuget.config (from run 1) still points at the feed — the rebuilt \
              nupkg must survive a lock re-pin failure or restore bricks"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hot_path_nupkg_write_failure_keeps_wired_feed_dir() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (dir, blobs, installed, record) = fixture(true, None).await;
+        let root = dir.path();
+        let (r1, _e, _w) = unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert!(r1.success);
+
+        // The committed nupkg rots (stale bytes) — the rerun takes the wired
+        // hot-path rebuild leg. A read-only uuid dir then blocks the rebuilt
+        // nupkg's atomic stage file. Skip when modes are ignored (root).
+        let stale = b"stale-but-previously-servable".to_vec();
+        tokio::fs::write(root.join(copy_rel()), &stale)
+            .await
+            .unwrap();
+        let uuid_dir = root.join(format!(".socket/vendor/nuget/{UUID}"));
+        tokio::fs::set_permissions(&uuid_dir, std::fs::Permissions::from_mode(0o555))
+            .await
+            .unwrap();
+        if std::fs::write(uuid_dir.join(".probe"), b"x").is_ok() {
+            let _ = std::fs::remove_file(uuid_dir.join(".probe"));
+            tokio::fs::set_permissions(&uuid_dir, std::fs::Permissions::from_mode(0o755))
+                .await
+                .unwrap();
+            return;
+        }
+        let outcome = run_vendor(root, &blobs, &installed, &record, false).await;
+        let _ = tokio::fs::set_permissions(&uuid_dir, std::fs::Permissions::from_mode(0o755)).await;
+
+        let (r2, _e2, _w2) = unwrap_done(outcome);
+        assert!(!r2.success, "the failed rebuild write must be reported");
+        // nuget.config (from run 1) still routes the patched id EXCLUSIVELY at
+        // this dir: deleting it on the wired path would leave the mapping
+        // pointing at nothing — every cold restore of the patched package
+        // hard-fails until a re-vendor or revert (module-doc invariant, same
+        // as the lock re-pin failure above).
+        assert!(
+            uuid_dir.exists(),
+            "the wired feed dir must survive a rebuild write failure"
+        );
+        assert_eq!(
+            tokio::fs::read(root.join(copy_rel())).await.unwrap(),
+            stale,
+            "the previously committed nupkg must survive the failed write"
         );
     }
 

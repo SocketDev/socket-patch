@@ -281,8 +281,12 @@ fn remove_fragment_once(content: &str, fragment: &str) -> String {
     } else {
         pos
     };
-    // The removed line's own newline goes with it.
-    if content[end..].starts_with('\n') {
+    // The removed line's own newline goes with it — but only when the
+    // whole line is removed: a fragment spliced out from behind a
+    // non-whitespace prefix (the user commented the line out) leaves the
+    // prefix as its own line, and eating the newline would join that
+    // prefix onto the FOLLOWING line, commenting it out too.
+    if start == line_start && content[end..].starts_with('\n') {
         end += 1;
     }
     if end >= content.len() {
@@ -569,6 +573,18 @@ pub async fn revert_remaining_redirect_edits(
                         // only the line the redirect owns, and say so.
                         (_, Some(c)) => {
                             if c.contains(PNPM_TRUST_LINE) {
+                                if c.matches(PNPM_TRUST_LINE).count() > 1 {
+                                    refuse(
+                                        format!(
+                                            "{}: the `{PNPM_TRUST_LINE}` line appears more \
+                                             than once — ambiguous, refusing to guess",
+                                            edit.path
+                                        ),
+                                        &mut outcome,
+                                    );
+                                    refused_groups.insert(group);
+                                    continue 'group;
+                                }
                                 staged.insert(
                                     edit.path.clone(),
                                     Some(remove_fragment_once(&c, PNPM_TRUST_LINE)),
@@ -993,6 +1009,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn commented_out_added_fragment_removal_keeps_the_following_line() {
+        // The user disabled the redirect by commenting the directive out.
+        // Mid-line removal must not eat the line's newline — doing so
+        // joins the surviving comment prefix onto the NEXT line and
+        // comments out the `require` directive.
+        let dir = TempDir::new().unwrap();
+        write(
+            dir.path(),
+            "go.mod",
+            "module m\n// replace x v1.0.0 => gopatch.socket.dev/x v1\nrequire y v1.0.0\n",
+        )
+        .await;
+        let mut state = state_with(
+            vec![edit(
+                "go.mod",
+                "redirect_golang_replace",
+                "added",
+                None,
+                Some("replace x v1.0.0 => gopatch.socket.dev/x v1"),
+            )],
+            &[],
+        );
+        let out = revert_remaining_redirect_edits(dir.path(), &mut state, false).await;
+        assert!(out.fully_reverted(), "{:?}", out.refusals);
+        assert_eq!(
+            read(dir.path(), "go.mod").await,
+            "module m\n// \nrequire y v1.0.0\n",
+            "the require directive must survive on its own line"
+        );
+    }
+
+    #[tokio::test]
     async fn anchor_shaped_original_never_reads_as_already_reverted() {
         // The Cargo.toml insert variant records the always-present table
         // header as `original` and header+insert as `new`. With the insert
@@ -1234,6 +1282,71 @@ mod tests {
         assert_eq!(
             read(dir.path(), "pnpm-workspace.yaml").await,
             "packages:\n  - 'apps/*'\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicated_trust_line_refuses_instead_of_removing_the_wrong_copy() {
+        // A commented-out copy of the trust line above the live one:
+        // removing the FIRST occurrence would strip the comment's text and
+        // leave the LIVE line active while claiming full revert. Must
+        // refuse like the ReplaceFragment / RemoveAddedFragment ambiguity
+        // guards.
+        let dir = TempDir::new().unwrap();
+        write(
+            dir.path(),
+            "pnpm-workspace.yaml",
+            "packages:\n  - '.'\n# trustLockfile: true — added by socket\ntrustLockfile: true\n",
+        )
+        .await;
+        let mut state = state_with(
+            vec![FileEdit {
+                path: "pnpm-workspace.yaml".into(),
+                kind: "redirect_pnpm_workspace_trust".into(),
+                action: "added".into(),
+                key: Some("trustLockfile".into()),
+                original: None,
+                new: Some(json!("true")),
+            }],
+            &[],
+        );
+        let before = read(dir.path(), "pnpm-workspace.yaml").await;
+        let out = revert_remaining_redirect_edits(dir.path(), &mut state, false).await;
+        assert_eq!(out.refusals.len(), 1, "{out:?}");
+        assert_eq!(out.refusals[0].group, "pnpm");
+        assert!(out.refusals[0].reason.contains("more than once"));
+        assert_eq!(read(dir.path(), "pnpm-workspace.yaml").await, before);
+        assert_eq!(state.edits.len(), 1, "the edit must survive for a retry");
+    }
+
+    #[tokio::test]
+    async fn commented_out_trust_line_removal_keeps_the_following_line() {
+        // Single (commented) occurrence: removal proceeds, but must not
+        // eat the newline and comment out the key on the next line.
+        let dir = TempDir::new().unwrap();
+        write(
+            dir.path(),
+            "pnpm-workspace.yaml",
+            "packages:\n  - '.'\n# trustLockfile: true\nshamefullyHoist: true\n",
+        )
+        .await;
+        let mut state = state_with(
+            vec![FileEdit {
+                path: "pnpm-workspace.yaml".into(),
+                kind: "redirect_pnpm_workspace_trust".into(),
+                action: "added".into(),
+                key: Some("trustLockfile".into()),
+                original: None,
+                new: Some(json!("true")),
+            }],
+            &[],
+        );
+        let out = revert_remaining_redirect_edits(dir.path(), &mut state, false).await;
+        assert!(out.fully_reverted(), "{:?}", out.refusals);
+        assert_eq!(
+            read(dir.path(), "pnpm-workspace.yaml").await,
+            "packages:\n  - '.'\n# \nshamefullyHoist: true\n",
+            "the following key must survive on its own line"
         );
     }
 

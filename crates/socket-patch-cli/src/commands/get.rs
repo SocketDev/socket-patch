@@ -2329,6 +2329,16 @@ pub async fn run(args: GetArgs) -> i32 {
     };
 
     let (code, mut result_json) = download_and_apply_patches(&selected, &params).await;
+    // A download-phase HARD error (unreadable manifest, unwritable
+    // .socket, failed manifest write) is an `error`-status envelope the
+    // engine has ALREADY printed — printing below would put a second JSON
+    // document on stdout (get's `--json` contract is exactly one per
+    // run; `run_get_vendored_search` has the same guard). Per-patch
+    // failures are NOT this case: they ride a success-shaped
+    // (`partial_failure`) envelope the engine leaves for us to print.
+    if result_json["status"] == "error" {
+        return code;
+    }
     fold_narrowing_into_result(&mut result_json, &narrow_skips, &narrow_warnings);
 
     if args.common.json {

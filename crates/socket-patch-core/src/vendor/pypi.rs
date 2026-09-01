@@ -394,6 +394,25 @@ pub async fn vendor_pypi(
         }
     }
 
+    // The in-sync probes key only on the patch uuid in the wired path, so
+    // the lockfile still pins the FIRST vendor's exact wheel path + sha256.
+    // An artifact-only rebuild is safe only when it reproduces those exact
+    // bytes; the ledger entry recorded at wiring time carries that pin.
+    // (Callers with no readable ledger entry keep the unguarded rebuild —
+    // the local build is deterministic for locally-vendored projects.)
+    let expected_pin: Option<(String, String)> = if in_sync {
+        match super::state::load_state(project_root).await {
+            Ok(state) => state
+                .entries
+                .into_values()
+                .find(|e| e.ecosystem == "pypi" && e.uuid == record.uuid)
+                .map(|e| (e.artifact.path, e.artifact.sha256)),
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+
     // Acquire the patched wheel: prefer the prebuilt service artifact (which
     // skips needing the package installed), else build it locally. A refusal /
     // hard fail bubbles as a terminal outcome.
@@ -416,6 +435,7 @@ pub async fn vendor_pypi(
         dry_run,
         force,
         service,
+        expected_pin.as_ref(),
         &mut warnings,
     )
     .await
@@ -460,6 +480,25 @@ pub async fn vendor_pypi(
     }
 
     if in_sync {
+        // The wiring still pins the first vendor's wheel path + sha256; a
+        // rebuilt artifact that does not reproduce them would break every
+        // subsequent hash-checked install (`pip --require-hashes`,
+        // `uv sync`, …) the moment vendor reports success. Sweep the
+        // mismatched wheel back out and fail loudly instead.
+        if let Some((pin_path, pin_sha)) = &expected_pin {
+            if *pin_path != rel_wheel || *pin_sha != artifact.sha256_hex {
+                let _ = tokio::fs::remove_dir_all(project_root.join(&uuid_dir_rel)).await;
+                let mut result = result;
+                result.success = false;
+                result.error = Some(format!(
+                    "the rebuilt wheel ({rel_wheel}, sha256 {}) does not match the wheel the \
+                     lockfile still pins ({pin_path}, sha256 {pin_sha}); run `socket-patch \
+                     vendor --revert` for {base} and re-vendor to re-wire the lockfile",
+                    artifact.sha256_hex
+                ));
+                return done(result, None, warnings);
+            }
+        }
         // Artifact rebuilt; wiring untouched, ledger entry stays with the
         // first run (the only copy of the pre-vendor originals).
         warnings.push(VendorWarning::new(
@@ -630,6 +669,22 @@ pub async fn revert_pypi_opts(
     if !outcome.success || dry_run {
         return outcome;
     }
+    // LOSSINESS GUARD (residual #131 — the RevertOutcome contract every
+    // npm-family backend honors): when any wiring record was left alone
+    // ("drifted; left untouched"), the lockfile may still resolve through
+    // the uuid dir, and the ledger entry holds the only recorded pre-vendor
+    // originals. Keep both (the caller keeps the entry when `kept_artifact`
+    // is set) instead of deleting evidence out from under a lock the flavor
+    // revert just refused to touch.
+    if outcome.drift_skipped() {
+        // Display-only path: with a non-canonical uuid nothing below would
+        // have been deleted anyway, but the drift-keep must still be
+        // surfaced so the ledger entry survives.
+        let uuid_dir_rel = vendor_uuid_dir_rel("pypi", &entry.uuid)
+            .unwrap_or_else(|| format!(".socket/vendor/pypi/{:?}", entry.uuid));
+        outcome.keep_artifact(&uuid_dir_rel);
+        return outcome;
+    }
     // `--preserve-state` (`keep_artifact`): the wiring restore above already
     // ran; the artifact dir stays behind (and the caller keeps the ledger
     // entry), so only the deletion is skipped.
@@ -690,6 +745,7 @@ async fn acquire_patched_wheel(
     dry_run: bool,
     force: bool,
     service: Option<&VendorServiceConfig>,
+    expected_pin: Option<&(String, String)>,
     warnings: &mut Vec<VendorWarning>,
 ) -> Result<AcquiredWheel, VendorOutcome> {
     if let Some(refusal) = service_offline_conflict(service) {
@@ -699,8 +755,16 @@ async fn acquire_patched_wheel(
         // A dry run previews the local build; the service is only consulted for
         // a real vendor.
         if cfg.service_enabled() && !dry_run {
-            match try_pypi_service_wheel(base, uuid_dir_rel, project_root, record, cfg, warnings)
-                .await
+            match try_pypi_service_wheel(
+                base,
+                uuid_dir_rel,
+                project_root,
+                record,
+                cfg,
+                expected_pin,
+                warnings,
+            )
+            .await
             {
                 PypiServiceWheel::Used(acq) => return Ok(*acq),
                 PypiServiceWheel::HardFail(outcome) => return Err(*outcome),
@@ -768,6 +832,7 @@ async fn try_pypi_service_wheel(
     project_root: &Path,
     record: &PatchRecord,
     cfg: &VendorServiceConfig,
+    expected_pin: Option<&(String, String)>,
     warnings: &mut Vec<VendorWarning>,
 ) -> PypiServiceWheel {
     // A terminal `service`-mode refusal (boxed — the enum's other variants are
@@ -799,6 +864,26 @@ async fn try_pypi_service_wheel(
                 );
             };
             let rel_wheel = format!("{uuid_dir_rel}/{wheel_name}");
+            let sha256_hex = hex::encode(Sha256::digest(&archive.bytes));
+            // In-sync rebuild: the lockfile still pins the first vendor's
+            // wheel path + sha256, and a prebuilt wheel that differs would
+            // break every subsequent hash-checked install the moment vendor
+            // reports success. Checked BEFORE writing, so a mismatch leaves
+            // no poisoned artifact behind (`auto` falls back to the
+            // deterministic local build, which reproduces a local pin).
+            if let Some((pin_path, pin_sha)) = expected_pin {
+                if *pin_path != rel_wheel || *pin_sha != sha256_hex {
+                    return miss(
+                        warnings,
+                        "vendor_prebuilt_pin_mismatch",
+                        format!(
+                            "the prebuilt wheel ({rel_wheel}, sha256 {sha256_hex}) does not \
+                             match the wheel the lockfile still pins ({pin_path}, sha256 \
+                             {pin_sha})"
+                        ),
+                    );
+                }
+            }
             let dest = project_root.join(uuid_dir_rel).join(&wheel_name);
             if let Some(parent) = dest.parent() {
                 if let Err(e) = tokio::fs::create_dir_all(parent).await {
@@ -828,7 +913,7 @@ async fn try_pypi_service_wheel(
                 result: already_patched_result(base, &dest, &record.files),
                 artifact: Some(WheelArtifact {
                     file_name: wheel_name.clone(),
-                    sha256_hex: hex::encode(Sha256::digest(&archive.bytes)),
+                    sha256_hex,
                     size: archive.bytes.len() as u64,
                 }),
                 wheel_name,
@@ -1929,6 +2014,548 @@ wheels = [
                 .join(format!(".socket/vendor/pypi/{UUID}/{WHEEL_NAME}"))
                 .exists(),
             "nothing written on a hard fail"
+        );
+    }
+
+    /// Write `entry` into the on-disk ledger the CLI would have persisted
+    /// after a real vendor run (state.json keyed by base purl).
+    async fn save_ledger_entry(root: &Path, entry: &VendorEntry) {
+        use crate::vendor::state::{save_state, VendorState};
+        let mut state = VendorState::new();
+        state.entries.insert(entry.base_purl.clone(), entry.clone());
+        save_state(root, &state).await.unwrap();
+    }
+
+    /// BUG GUARD (in-sync rebuild × service): the in-sync probes key only on
+    /// the patch uuid, so the lockfile still pins the FIRST vendor's exact
+    /// wheel sha256. A service-built wheel with different bytes must not
+    /// silently replace the missing artifact — under `auto` the rebuild must
+    /// fall back to the deterministic local build that reproduces the pin,
+    /// or every subsequent `pip install --require-hashes` / `uv sync` fails
+    /// hash verification right after vendor reported a successful rebuild.
+    #[tokio::test]
+    async fn in_sync_service_rebuild_must_not_break_wired_pin() {
+        let fx = e2e_fixture().await;
+        let sources = PatchSources::blobs_only(&fx.blobs);
+        // Local vendor: requirements.txt pins the locally-built wheel's hash.
+        let VendorOutcome::Done { result, entry, .. } = vendor_pypi(
+            "pkg:pypi/six@1.16.0",
+            &fx.site_packages,
+            &fx.root,
+            &fx.record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            None,
+        )
+        .await
+        else {
+            panic!("first vendor must be Done");
+        };
+        assert!(result.success, "{:?}", result.error);
+        let entry = entry.expect("entry on success");
+        let wired = tokio::fs::read_to_string(fx.root.join("requirements.txt"))
+            .await
+            .unwrap();
+        save_ledger_entry(&fx.root, &entry).await;
+
+        // The exact situation the rebuild path exists for: uuid dir deleted.
+        tokio::fs::remove_dir_all(fx.root.join(format!(".socket/vendor/pypi/{UUID}")))
+            .await
+            .unwrap();
+
+        // The service offers a wheel whose bytes do NOT match the wired pin.
+        let bytes = b"service-built wheel bytes that differ from the local build";
+        let sri = sri_sha512(bytes);
+        let server = wiremock::MockServer::start().await;
+        mount_pypi_granted(&server, WHEEL_NAME, &sri, bytes).await;
+
+        let outcome = vendor_pypi(
+            "pkg:pypi/six@1.16.0",
+            &fx.site_packages,
+            &fx.root,
+            &fx.record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            Some(&pypi_service_cfg(&server.uri(), VendorSource::Auto, false)),
+        )
+        .await;
+        let VendorOutcome::Done {
+            result,
+            entry: e2,
+            warnings,
+        } = outcome
+        else {
+            panic!("rebuild run must be Done, got {outcome:?}");
+        };
+        assert!(result.success, "{:?}", result.error);
+        assert!(e2.is_none(), "artifact-only rebuild records no entry");
+        // The wheel on disk still verifies against the pinned hash.
+        let on_disk = tokio::fs::read(fx.root.join(&entry.artifact.path))
+            .await
+            .expect("the pinned wheel path must exist again");
+        assert_eq!(
+            hex::encode(sha2::Sha256::digest(&on_disk)),
+            entry.artifact.sha256,
+            "the rebuilt wheel must reproduce the sha256 the lockfile still pins"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(fx.root.join("requirements.txt"))
+                .await
+                .unwrap(),
+            wired,
+            "rebuild must not touch requirements.txt"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.code == "vendor_prebuilt_pin_mismatch"),
+            "the service mismatch is surfaced: {warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|w| w.code == "vendor_artifact_rebuilt"),
+            "{warnings:?}"
+        );
+    }
+
+    /// `service` mode + an in-sync rebuild whose prebuilt bytes do not match
+    /// the wired pin hard-fails (nothing written) instead of silently
+    /// breaking the lockfile's hash pin.
+    #[tokio::test]
+    async fn in_sync_service_rebuild_pin_mismatch_service_mode_hard_fails() {
+        let fx = e2e_fixture().await;
+        let sources = PatchSources::blobs_only(&fx.blobs);
+        let VendorOutcome::Done { result, entry, .. } = vendor_pypi(
+            "pkg:pypi/six@1.16.0",
+            &fx.site_packages,
+            &fx.root,
+            &fx.record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            None,
+        )
+        .await
+        else {
+            panic!("first vendor must be Done");
+        };
+        assert!(result.success, "{:?}", result.error);
+        let entry = entry.expect("entry on success");
+        save_ledger_entry(&fx.root, &entry).await;
+        tokio::fs::remove_dir_all(fx.root.join(format!(".socket/vendor/pypi/{UUID}")))
+            .await
+            .unwrap();
+
+        let bytes = b"service-built wheel bytes that differ from the local build";
+        let sri = sri_sha512(bytes);
+        let server = wiremock::MockServer::start().await;
+        mount_pypi_granted(&server, WHEEL_NAME, &sri, bytes).await;
+
+        let outcome = vendor_pypi(
+            "pkg:pypi/six@1.16.0",
+            &fx.site_packages,
+            &fx.root,
+            &fx.record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            Some(&pypi_service_cfg(
+                &server.uri(),
+                VendorSource::Service,
+                false,
+            )),
+        )
+        .await;
+        let VendorOutcome::Refused { code, detail } = outcome else {
+            panic!("expected Refused, got {outcome:?}");
+        };
+        assert_eq!(code, "vendor_prebuilt_required");
+        assert!(detail.contains("pins"), "{detail}");
+        assert!(
+            !fx.root.join(&entry.artifact.path).exists(),
+            "a pin mismatch must write nothing"
+        );
+    }
+
+    /// The reverse direction of the same class: a project vendored FROM THE
+    /// SERVICE whose wheel goes missing must not "rebuild" locally into
+    /// different bytes — the loud failure names the pin so the user can
+    /// revert + re-vendor instead of committing a broken lockfile.
+    #[tokio::test]
+    async fn in_sync_local_rebuild_pin_mismatch_fails_loudly() {
+        let fx = e2e_fixture().await;
+        let sources = PatchSources::blobs_only(&fx.blobs);
+        let bytes = b"prebuilt wheel bytes from the service";
+        let sri = sri_sha512(bytes);
+        let server = wiremock::MockServer::start().await;
+        mount_pypi_granted(&server, WHEEL_NAME, &sri, bytes).await;
+        let VendorOutcome::Done { result, entry, .. } = vendor_pypi(
+            "pkg:pypi/six@1.16.0",
+            &fx.site_packages,
+            &fx.root,
+            &fx.record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            Some(&pypi_service_cfg(
+                &server.uri(),
+                VendorSource::Service,
+                false,
+            )),
+        )
+        .await
+        else {
+            panic!("service vendor must be Done");
+        };
+        assert!(result.success, "{:?}", result.error);
+        let entry = entry.expect("entry on success");
+        save_ledger_entry(&fx.root, &entry).await;
+        let uuid_dir = fx.root.join(format!(".socket/vendor/pypi/{UUID}"));
+        tokio::fs::remove_dir_all(&uuid_dir).await.unwrap();
+
+        // Re-run without the service: the local build cannot reproduce the
+        // service bytes the lockfile still pins.
+        let outcome = vendor_pypi(
+            "pkg:pypi/six@1.16.0",
+            &fx.site_packages,
+            &fx.root,
+            &fx.record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            None,
+        )
+        .await;
+        let VendorOutcome::Done {
+            result, entry: e2, ..
+        } = outcome
+        else {
+            panic!("rebuild run must be Done, got {outcome:?}");
+        };
+        assert!(
+            !result.success,
+            "a rebuild that breaks the wired pin must not report success"
+        );
+        assert!(
+            result.error.as_deref().unwrap_or("").contains("pins"),
+            "{:?}",
+            result.error
+        );
+        assert!(e2.is_none());
+        assert!(
+            !uuid_dir.exists(),
+            "the mismatched wheel must be swept back out"
+        );
+    }
+
+    /// Positive control: a prebuilt wheel that byte-matches the wired pin
+    /// (the normal case for a service-vendored project) rebuilds fine under
+    /// `service` mode.
+    #[tokio::test]
+    async fn in_sync_service_rebuild_matching_pin_succeeds() {
+        let fx = e2e_fixture().await;
+        let sources = PatchSources::blobs_only(&fx.blobs);
+        let VendorOutcome::Done { result, entry, .. } = vendor_pypi(
+            "pkg:pypi/six@1.16.0",
+            &fx.site_packages,
+            &fx.root,
+            &fx.record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            None,
+        )
+        .await
+        else {
+            panic!("first vendor must be Done");
+        };
+        assert!(result.success, "{:?}", result.error);
+        let entry = entry.expect("entry on success");
+        let wheel_bytes = tokio::fs::read(fx.root.join(&entry.artifact.path))
+            .await
+            .unwrap();
+        save_ledger_entry(&fx.root, &entry).await;
+        tokio::fs::remove_dir_all(fx.root.join(format!(".socket/vendor/pypi/{UUID}")))
+            .await
+            .unwrap();
+
+        let sri = sri_sha512(&wheel_bytes);
+        let server = wiremock::MockServer::start().await;
+        mount_pypi_granted(&server, WHEEL_NAME, &sri, &wheel_bytes).await;
+
+        let outcome = vendor_pypi(
+            "pkg:pypi/six@1.16.0",
+            &fx.site_packages,
+            &fx.root,
+            &fx.record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            Some(&pypi_service_cfg(
+                &server.uri(),
+                VendorSource::Service,
+                false,
+            )),
+        )
+        .await;
+        let VendorOutcome::Done {
+            result, warnings, ..
+        } = outcome
+        else {
+            panic!("rebuild run must be Done, got {outcome:?}");
+        };
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(
+            tokio::fs::read(fx.root.join(&entry.artifact.path))
+                .await
+                .unwrap(),
+            wheel_bytes,
+            "the pinned wheel is restored byte-for-byte"
+        );
+        assert!(
+            warnings.iter().any(|w| w.code == "vendor_artifact_rebuilt"),
+            "{warnings:?}"
+        );
+    }
+
+    // ─────────── revert drift-keep gate (RevertOutcome contract) ───────────
+
+    use crate::vendor::state::{WiringAction, WiringRecord};
+
+    /// A pypi-flavored [`VendorEntry`] carrying just what revert reads.
+    fn revert_entry(flavor: &str, rel_wheel: &str, wiring: Vec<WiringRecord>) -> VendorEntry {
+        VendorEntry {
+            ecosystem: "pypi".into(),
+            base_purl: "pkg:pypi/six@1.16.0".into(),
+            uuid: UUID.into(),
+            artifact: VendorArtifact {
+                path: rel_wheel.to_string(),
+                sha256: String::new(),
+                size: None,
+                platform_locked: None,
+                file_inventory: None,
+            },
+            wiring,
+            lock: None,
+            took_over_go_patches: false,
+            detached: false,
+            record: None,
+            flavor: Some(flavor.into()),
+            uv: None,
+            pnpm: None,
+            poetry: None,
+            pdm: None,
+            pipenv: None,
+        }
+    }
+
+    const PIPENV_REGISTRY_LOCK: &str = r#"{
+    "_meta": {
+        "hash": {"sha256": "x"},
+        "pipfile-spec": 6,
+        "requires": {},
+        "sources": []
+    },
+    "default": {
+        "six": {
+            "hashes": ["sha256:aaa"],
+            "index": "pypi",
+            "markers": "python_version >= '2.7'",
+            "version": "==1.16.0"
+        }
+    },
+    "develop": {}
+}
+"#;
+
+    /// BUG GUARD (missing drift-keep gate — the npm-family RevertOutcome
+    /// contract, residual #131): a drift-skipped pipenv revert leaves the
+    /// vendor-pointing entry in Pipfile.lock, so deleting the uuid dir
+    /// bricks every subsequent `pipenv install`/`sync` and pruning the
+    /// ledger entry destroys the only recorded pre-vendor original. The
+    /// backend must keep both and say so via `kept_artifact`.
+    #[tokio::test]
+    async fn pipenv_drift_skipped_revert_keeps_artifact() {
+        use crate::vendor::pypi_pipenv::{load_pipenv_project, wire_pipenv};
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        tokio::fs::write(root.join("Pipfile.lock"), PIPENV_REGISTRY_LOCK)
+            .await
+            .unwrap();
+        let rel_wheel = format!(".socket/vendor/pypi/{UUID}/six-1.16.0-py2.py3-none-any.whl");
+        let p = load_pipenv_project(root).await.unwrap();
+        let (wiring, _meta) = wire_pipenv(&p, root, "six", &rel_wheel, &"0".repeat(64), UUID)
+            .await
+            .unwrap();
+        let uuid_dir = root.join(format!(".socket/vendor/pypi/{UUID}"));
+        tokio::fs::create_dir_all(&uuid_dir).await.unwrap();
+        let wheel = uuid_dir.join("six-1.16.0-py2.py3-none-any.whl");
+        tokio::fs::write(&wheel, b"wheel bytes").await.unwrap();
+
+        // Hand-edit ONLY the markers string; the "file" ref still points
+        // into the uuid dir about to be deleted.
+        let text = tokio::fs::read_to_string(root.join("Pipfile.lock"))
+            .await
+            .unwrap();
+        let mut live: serde_json::Value = serde_json::from_str(&text).unwrap();
+        live["default"]["six"]["markers"] = serde_json::json!("python_version >= '3.0'");
+        tokio::fs::write(
+            root.join("Pipfile.lock"),
+            serde_json::to_string_pretty(&live).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let entry = revert_entry("pipenv", &rel_wheel, wiring);
+        let outcome = revert_pypi(&entry, root, false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_lock_entry_drifted"),
+            "{:?}",
+            outcome.warnings
+        );
+        assert!(
+            outcome.kept_artifact,
+            "a drift-skipped revert must flag the keep so the CLI retains the ledger entry"
+        );
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_artifact_kept"),
+            "{:?}",
+            outcome.warnings
+        );
+        assert!(
+            wheel.is_file(),
+            "Pipfile.lock still references the wheel; deleting it would brick installs"
+        );
+    }
+
+    /// The splice flavors (poetry/pdm) share the same missing gate: a
+    /// hand-edited-but-still-vendor-pointing `[[package]]` unit is left
+    /// alone with a drift warning, so the uuid dir it references must
+    /// survive the revert (and the ledger entry with it).
+    #[tokio::test]
+    async fn poetry_pdm_drift_skipped_revert_keeps_artifact() {
+        for (flavor, lock_file, kind) in [
+            ("poetry", "poetry.lock", "poetry_lock_package"),
+            ("pdm", "pdm.lock", "pdm_lock_package"),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path();
+            let rel_wheel = format!(".socket/vendor/pypi/{UUID}/six-1.16.0-py2.py3-none-any.whl");
+            let original_unit =
+                "[[package]]\nname = \"six\"\nversion = \"1.16.0\"\nsource = \"registry\"\n";
+            let new_unit = format!(
+                "[[package]]\nname = \"six\"\nversion = \"1.16.0\"\nsource = \"./{rel_wheel}\"\n"
+            );
+            // Hand-edited since vendoring (an added comment), but the unit
+            // still resolves through the vendored wheel.
+            let live = format!(
+                "[[package]]\nname = \"six\"\nversion = \"1.16.0\"\n# reviewed\nsource = \
+                 \"./{rel_wheel}\"\n"
+            );
+            tokio::fs::write(root.join(lock_file), &live).await.unwrap();
+            let uuid_dir = root.join(format!(".socket/vendor/pypi/{UUID}"));
+            tokio::fs::create_dir_all(&uuid_dir).await.unwrap();
+            let wheel = uuid_dir.join("six-1.16.0-py2.py3-none-any.whl");
+            tokio::fs::write(&wheel, b"wheel bytes").await.unwrap();
+
+            let wiring = vec![WiringRecord {
+                file: lock_file.to_string(),
+                kind: kind.to_string(),
+                action: WiringAction::Rewritten,
+                key: Some("six".into()),
+                original: Some(serde_json::Value::String(original_unit.to_string())),
+                new: Some(serde_json::Value::String(new_unit.clone())),
+            }];
+            let entry = revert_entry(flavor, &rel_wheel, wiring);
+            let outcome = revert_pypi(&entry, root, false).await;
+            assert!(outcome.success, "{flavor}: {:?}", outcome.error);
+            assert!(
+                outcome
+                    .warnings
+                    .iter()
+                    .any(|w| w.code == "vendor_lock_entry_drifted"),
+                "{flavor}: {:?}",
+                outcome.warnings
+            );
+            assert!(
+                outcome.kept_artifact,
+                "{flavor}: a drift-skipped revert must flag the keep"
+            );
+            assert!(
+                wheel.is_file(),
+                "{flavor}: {lock_file} still references the wheel; deleting it would brick \
+                 installs"
+            );
+            assert_eq!(
+                tokio::fs::read_to_string(root.join(lock_file))
+                    .await
+                    .unwrap(),
+                live,
+                "{flavor}: the drifted lock is left alone"
+            );
+        }
+    }
+
+    /// LIVENESS CONTRACT twin of the gate: a lock that already carries the
+    /// pre-vendor originals (a relock regenerated them, or an earlier
+    /// partial revert restored them) is CONVERGED, not drifted — the revert
+    /// must stay silent and still clean up the artifact, or the drift-keep
+    /// gate would retain the uuid dir and ledger entry forever.
+    #[tokio::test]
+    async fn pipenv_converged_revert_deletes_artifact_without_drift() {
+        use crate::vendor::pypi_pipenv::{load_pipenv_project, wire_pipenv};
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        tokio::fs::write(root.join("Pipfile.lock"), PIPENV_REGISTRY_LOCK)
+            .await
+            .unwrap();
+        let rel_wheel = format!(".socket/vendor/pypi/{UUID}/six-1.16.0-py2.py3-none-any.whl");
+        let p = load_pipenv_project(root).await.unwrap();
+        let (wiring, _meta) = wire_pipenv(&p, root, "six", &rel_wheel, &"0".repeat(64), UUID)
+            .await
+            .unwrap();
+        let uuid_dir = root.join(format!(".socket/vendor/pypi/{UUID}"));
+        tokio::fs::create_dir_all(&uuid_dir).await.unwrap();
+        tokio::fs::write(uuid_dir.join("six-1.16.0-py2.py3-none-any.whl"), b"wheel")
+            .await
+            .unwrap();
+
+        // Simulate `pipenv lock` regenerating the registry entry.
+        tokio::fs::write(root.join("Pipfile.lock"), PIPENV_REGISTRY_LOCK)
+            .await
+            .unwrap();
+
+        let entry = revert_entry("pipenv", &rel_wheel, wiring);
+        let outcome = revert_pypi(&entry, root, false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(
+            !outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_lock_entry_drifted"),
+            "already-converged records are silent no-ops: {:?}",
+            outcome.warnings
+        );
+        assert!(!outcome.kept_artifact);
+        assert!(
+            !uuid_dir.exists(),
+            "a converged revert must still clean up the artifact"
         );
     }
 

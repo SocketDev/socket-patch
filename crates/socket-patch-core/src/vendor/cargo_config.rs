@@ -30,10 +30,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use tokio::fs;
-use toml_edit::{DocumentMut, InlineTable, Item, Table, Value};
+use toml_edit::{DocumentMut, InlineTable, Item, Table, TableLike, Value};
 
 use crate::utils::fs::atomic_write_bytes_preserving_mode;
-use crate::utils::toml_edit_ext::ensure_table;
 
 /// Project-relative root of the vendor backend's committed crate copies. An
 /// entry whose `path` is under this prefix is socket-owned.
@@ -267,6 +266,30 @@ fn entry_path(item: &Item) -> Option<&str> {
         .and_then(Item::as_str)
 }
 
+/// `parent[key]` as a mutable table-like view, creating a (header) table if
+/// absent. Like `toml_edit_ext::ensure_table` but tolerant of an existing
+/// inline-table value — `[patch]` + `crates-io = { … }` is valid TOML that
+/// cargo honors identically to `[patch.crates-io]` (a hand edit or another
+/// tool re-serializing this user-owned file produces it), and refusing it
+/// would strand the socket-owned entries inside. Errors on a non-table item.
+fn ensure_table_like<'a>(
+    parent: &'a mut dyn TableLike,
+    key: &str,
+    implicit: bool,
+) -> Result<&'a mut dyn TableLike, String> {
+    if !parent.contains_key(key) {
+        let mut t = Table::new();
+        t.set_implicit(implicit);
+        // An inline-table parent converts this to an inline value on insert,
+        // preserving the user's inline style.
+        parent.insert(key, Item::Table(t));
+    }
+    parent
+        .get_mut(key)
+        .and_then(Item::as_table_like_mut)
+        .ok_or_else(|| format!("`{key}` is not a table"))
+}
+
 fn upsert_patch_entry(content: &str, name: &str, rel_path: &str) -> Result<Option<String>, String> {
     let mut doc = content
         .parse::<DocumentMut>()
@@ -275,8 +298,8 @@ fn upsert_patch_entry(content: &str, name: &str, rel_path: &str) -> Result<Optio
     let root = doc.as_table_mut();
     // `[patch]` is a parent table that only ever holds `[patch.crates-io]`, so
     // keep it implicit; `[patch.crates-io]` is the explicit one we write into.
-    let patch = ensure_table(root, "patch", true)?;
-    let crates_io = ensure_table(patch, "crates-io", false)?;
+    let patch = ensure_table_like(root, "patch", true)?;
+    let crates_io = ensure_table_like(patch, "crates-io", false)?;
 
     if let Some(existing) = crates_io.get(name) {
         match entry_path(existing) {
@@ -302,9 +325,12 @@ fn remove_patch_entry(content: &str, name: &str) -> Result<Option<String>, Strin
         .map_err(|e| format!("Invalid .cargo/config.toml: {e}"))?;
 
     let mut removed = false;
-    if let Some(patch) = doc.get_mut("patch").and_then(Item::as_table_mut) {
+    // Table-like views (as in `entry_path`): the inline `crates-io = { … }`
+    // form is honored by cargo, and a remove blind to it would leave the
+    // entry dangling after the vendor copy it points at is deleted.
+    if let Some(patch) = doc.get_mut("patch").and_then(Item::as_table_like_mut) {
         let mut crates_io_empty = false;
-        if let Some(crates_io) = patch.get_mut("crates-io").and_then(Item::as_table_mut) {
+        if let Some(crates_io) = patch.get_mut("crates-io").and_then(Item::as_table_like_mut) {
             if matches!(crates_io.get(name).and_then(entry_path), Some(p) if path_is_socket_owned(p))
             {
                 crates_io.remove(name);
@@ -321,8 +347,8 @@ fn remove_patch_entry(content: &str, name: &str) -> Result<Option<String>, Strin
     }
     if doc
         .get("patch")
-        .and_then(Item::as_table)
-        .map(Table::is_empty)
+        .and_then(Item::as_table_like)
+        .map(|t| t.is_empty())
         .unwrap_or(false)
     {
         doc.as_table_mut().remove("patch");
@@ -338,9 +364,9 @@ fn parse_patch_entries(content: &str) -> HashMap<String, PatchEntryInfo> {
     };
     let crates_io = doc
         .get("patch")
-        .and_then(Item::as_table)
+        .and_then(Item::as_table_like)
         .and_then(|t| t.get("crates-io"))
-        .and_then(Item::as_table);
+        .and_then(Item::as_table_like);
     if let Some(tbl) = crates_io {
         for (name, item) in tbl.iter() {
             let path = entry_path(item).map(str::to_string);
@@ -496,6 +522,37 @@ mod tests {
         );
     }
 
+    /// COVERAGE 2026-09: `crates-io` written as an INLINE table —
+    /// `[patch]` + `crates-io = { cfg-if = { path = "…" } }` — is valid TOML
+    /// that cargo honors identically to `[patch.crates-io]` (a hand edit or
+    /// another tool re-serializing this user-owned file produces it). The
+    /// path prefix is the entire ownership signal, so a socket-owned entry
+    /// in this form must refresh in place, not error via `ensure_table`.
+    #[test]
+    fn test_upsert_refreshes_inline_crates_io_form() {
+        let old = format!("{CARGO_VENDOR_DIR}/11111111-2222-3333-4444-555555555555/cfg-if-1.0.4");
+        let toml = format!("[patch]\ncrates-io = {{ cfg-if = {{ path = \"{old}\" }} }}\n");
+        let want = vendor_path("cfg-if", "1.0.4");
+        let out = upsert_patch_entry(&toml, "cfg-if", &want)
+            .expect("inline-form owned entry must refresh, not error")
+            .expect("stale path means the file changes");
+        let doc = parse(&out);
+        assert_eq!(
+            entry_path(&doc["patch"]["crates-io"]["cfg-if"]),
+            Some(want.as_str())
+        );
+        // Idempotent thereafter.
+        assert!(upsert_patch_entry(&out, "cfg-if", &want).unwrap().is_none());
+    }
+
+    /// COVERAGE 2026-09: …and a USER-authored entry in the inline form is
+    /// still refused, never silently overwritten.
+    #[test]
+    fn test_upsert_refuses_user_authored_inline_form() {
+        let toml = "[patch]\ncrates-io = { cfg-if = { path = \"../my-fork\" } }\n";
+        assert!(upsert_patch_entry(toml, "cfg-if", &vendor_path("cfg-if", "1.0.4")).is_err());
+    }
+
     #[test]
     fn test_upsert_takes_over_legacy_redirect_entry() {
         // An entry left by the retired redirect backend is socket-owned →
@@ -553,6 +610,57 @@ mod tests {
         assert!(remove_patch_entry(toml, "cfg-if").unwrap().is_none());
     }
 
+    /// COVERAGE 2026-09: removal twin of the inline-form blindness. A
+    /// socket-owned entry inside `crates-io = { … }` must be removed on
+    /// rollback — a silent no-op here means revert_cargo_vendor_opts still
+    /// deletes the `.socket/vendor/cargo/<uuid>/` copy, leaving a dangling
+    /// `[patch]` entry that breaks the next `cargo build`.
+    #[test]
+    fn test_remove_inline_crates_io_form_socket_entry() {
+        let toml = format!(
+            "[patch]\ncrates-io = {{ cfg-if = {{ path = \"{}\" }} }}\n",
+            vendor_path("cfg-if", "1.0.4")
+        );
+        let out = remove_patch_entry(&toml, "cfg-if")
+            .unwrap()
+            .expect("socket-owned inline-form entry must be removed, not no-op'd");
+        assert!(!out.contains("cfg-if"));
+        assert!(!out.contains("[patch"), "emptied [patch] pruned: {out}");
+
+        // The fully-inline `patch = { crates-io = { … } }` form as well.
+        let toml = format!(
+            "patch = {{ crates-io = {{ cfg-if = {{ path = \"{}\" }} }} }}\n",
+            vendor_path("cfg-if", "1.0.4")
+        );
+        let out = remove_patch_entry(&toml, "cfg-if")
+            .unwrap()
+            .expect("fully-inline patch form entry must be removed");
+        assert!(!out.contains("cfg-if"));
+        assert!(!out.contains("patch"), "emptied inline patch pruned: {out}");
+    }
+
+    /// COVERAGE 2026-09: sibling user entries sharing the inline table
+    /// survive the removal.
+    #[test]
+    fn test_remove_inline_crates_io_form_keeps_user_entry() {
+        let toml = format!(
+            "[patch]\ncrates-io = {{ cfg-if = {{ path = \"{}\" }}, other = {{ git = \"https://example.com/o.git\" }} }}\n",
+            vendor_path("cfg-if", "1.0.4")
+        );
+        let out = remove_patch_entry(&toml, "cfg-if").unwrap().unwrap();
+        let doc = parse(&out);
+        assert!(doc["patch"]["crates-io"].get("cfg-if").is_none());
+        assert!(doc["patch"]["crates-io"].get("other").is_some());
+    }
+
+    /// COVERAGE 2026-09: the ownership guard holds through the inline form —
+    /// a user-authored same-name entry stays a no-op.
+    #[test]
+    fn test_remove_inline_form_user_entry_is_noop() {
+        let toml = "[patch]\ncrates-io = { cfg-if = { path = \"../my-fork\" } }\n";
+        assert!(remove_patch_entry(toml, "cfg-if").unwrap().is_none());
+    }
+
     #[test]
     fn test_remove_absent_is_noop() {
         assert!(remove_patch_entry("[build]\njobs = 2\n", "cfg-if")
@@ -584,6 +692,34 @@ mod tests {
         );
         let entries = parse_patch_entries(&toml);
         assert!(entries["mine"].socket_owned);
+    }
+
+    /// COVERAGE 2026-09: read twin of the inline-form blindness — an unread
+    /// entry makes verify / pre-flight report the vendor copy unwired (so
+    /// GC-reclaimable) while cargo still resolves through it.
+    #[test]
+    fn test_parse_entries_handles_inline_crates_io_form() {
+        let toml = format!(
+            "[patch]\ncrates-io = {{ mine = {{ path = \"{}\" }}, yours = {{ git = \"https://example.com/y.git\" }} }}\n",
+            vendor_path("mine", "1.0.0")
+        );
+        let entries = parse_patch_entries(&toml);
+        assert!(
+            entries.get("mine").is_some_and(|e| e.socket_owned),
+            "inline-table crates-io form must be readable: {entries:?}"
+        );
+        assert!(entries.get("yours").is_some_and(|e| !e.socket_owned));
+
+        // The fully-inline `patch = { crates-io = { … } }` form as well.
+        let toml = format!(
+            "patch = {{ crates-io = {{ mine = {{ path = \"{}\" }} }} }}\n",
+            vendor_path("mine", "1.0.0")
+        );
+        let entries = parse_patch_entries(&toml);
+        assert!(
+            entries.get("mine").is_some_and(|e| e.socket_owned),
+            "fully-inline patch form must be readable: {entries:?}"
+        );
     }
 
     #[test]
