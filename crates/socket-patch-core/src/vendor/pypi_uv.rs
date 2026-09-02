@@ -4043,4 +4043,587 @@ wheels = [
             Some("[package.metadata]\nrequires-dist = []\nprovides-extras = [\"fast\"]")
         );
     }
+
+    // ── coverage mop-up 2026-09: guard/error/skip arms ────────────────────
+
+    /// In-memory pair (no tempdir) for the pure-read helpers.
+    fn project_from(pyproject: &str, lock: &str) -> UvProject {
+        UvProject {
+            pyproject_text: pyproject.to_string(),
+            lock_text: lock.to_string(),
+            pyproject: pyproject.parse().unwrap(),
+            lock: lock.parse().unwrap(),
+            lock_revision: None,
+            warnings: Vec::new(),
+        }
+    }
+
+    /// A `[dependency-groups]` key whose value is NOT an array (legal TOML,
+    /// outside the PEP 735 shape) is skipped, never a panic — and it must not
+    /// swallow the declarations in the well-formed sibling groups.
+    #[test]
+    fn classify_skips_a_non_array_dependency_group_value() {
+        let pyproject = format!(
+            "{DIRECT_REGISTRY_PYPROJECT}\n[dependency-groups]\nbroken = \"not-an-array\"\ndev = [\"attrs==23.1.0\"]\n"
+        );
+        let p = project_from(&pyproject, DIRECT_REGISTRY_LOCK);
+        assert_eq!(
+            classify_dependency(&p, "attrs"),
+            UvDepClass::Direct,
+            "the array group after the malformed one still registers"
+        );
+        assert_eq!(classify_dependency(&p, "absent"), UvDepClass::Transitive);
+    }
+
+    /// A wired-shaped lock whose wheels hash is not a plausible sha256 (too
+    /// short, or non-hex) pins nothing: the in-sync rebuild guard must stay
+    /// off rather than trust a corrupted pin.
+    #[test]
+    fn wired_pin_rejects_a_malformed_wheel_hash() {
+        let short = DIRECT_PATH_LOCK.replace(WHEEL_SHA, "deadbeef");
+        let p = project_from(DIRECT_PATH_PYPROJECT, &short);
+        assert_eq!(wired_pin(&p, "six", UUID), None, "a short hash pins nothing");
+
+        let non_hex = DIRECT_PATH_LOCK.replace(WHEEL_SHA, &"z".repeat(64));
+        let p = project_from(DIRECT_PATH_PYPROJECT, &non_hex);
+        assert_eq!(
+            wired_pin(&p, "six", UUID),
+            None,
+            "a non-hex 64-char hash pins nothing"
+        );
+    }
+
+    /// A version string that breaks the override TOML value (an embedded
+    /// quote) is reported as a parse failure BEFORE any write.
+    #[tokio::test]
+    async fn wire_reports_an_unbuildable_override_value() {
+        let tmp = write_pair(TRANSITIVE_REGISTRY_PYPROJECT, TRANSITIVE_REGISTRY_LOCK).await;
+        let p = load_uv_project(tmp.path()).await.unwrap();
+        let err = wire_uv(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0\"",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UUID,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, "pypi_uv_lock_parse_failed");
+        assert!(err.1.contains("cannot build override value"), "{}", err.1);
+        let (py, lock) = read_pair(tmp.path()).await;
+        assert_eq!(py, TRANSITIVE_REGISTRY_PYPROJECT, "refusal leaves the tree untouched");
+        assert_eq!(lock, TRANSITIVE_REGISTRY_LOCK);
+    }
+
+    /// A user-authored `[tool.uv.override-dependencies]` TABLE (not the array
+    /// uv expects) refuses cleanly instead of panicking or clobbering it.
+    #[tokio::test]
+    async fn wire_refuses_a_table_shaped_override_dependencies() {
+        let pyproject =
+            format!("{TRANSITIVE_REGISTRY_PYPROJECT}\n[tool.uv.override-dependencies]\n");
+        let tmp = write_pair(&pyproject, TRANSITIVE_REGISTRY_LOCK).await;
+        let p = load_uv_project(tmp.path()).await.unwrap();
+        let err = wire_uv(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UUID,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, "pypi_uv_lock_parse_failed");
+        assert!(err.1.contains("is not a value"), "{}", err.1);
+        let (py, lock) = read_pair(tmp.path()).await;
+        assert_eq!(py, pyproject, "refusal leaves the tree untouched");
+        assert_eq!(lock, TRANSITIVE_REGISTRY_LOCK);
+    }
+
+    /// A user-authored scalar `override-dependencies = "…"` (a value, but not
+    /// an array) refuses cleanly too — the append has nowhere to go.
+    #[tokio::test]
+    async fn wire_refuses_a_non_array_override_dependencies_value() {
+        let pyproject = format!(
+            "{TRANSITIVE_REGISTRY_PYPROJECT}\n[tool.uv]\noverride-dependencies = \"attrs==23.1.0\"\n"
+        );
+        let tmp = write_pair(&pyproject, TRANSITIVE_REGISTRY_LOCK).await;
+        let p = load_uv_project(tmp.path()).await.unwrap();
+        let err = wire_uv(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UUID,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, "pypi_uv_lock_parse_failed");
+        assert!(err.1.contains("is not an array"), "{}", err.1);
+        let (py, lock) = read_pair(tmp.path()).await;
+        assert_eq!(py, pyproject, "refusal leaves the tree untouched");
+        assert_eq!(lock, TRANSITIVE_REGISTRY_LOCK);
+    }
+
+    /// A wheel path that breaks the sources TOML value (an embedded quote) is
+    /// reported as a parse failure BEFORE any write.
+    #[tokio::test]
+    async fn wire_reports_an_unbuildable_sources_value() {
+        let tmp = write_pair(DIRECT_REGISTRY_PYPROJECT, DIRECT_REGISTRY_LOCK).await;
+        let p = load_uv_project(tmp.path()).await.unwrap();
+        let err = wire_uv(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            ".socket/vendor/pypi/x\"y/six.whl",
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UUID,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, "pypi_uv_lock_parse_failed");
+        assert!(err.1.contains("cannot build sources value"), "{}", err.1);
+        let (py, lock) = read_pair(tmp.path()).await;
+        assert_eq!(py, DIRECT_REGISTRY_PYPROJECT, "refusal leaves the tree untouched");
+        assert_eq!(lock, DIRECT_REGISTRY_LOCK);
+    }
+
+    /// The lock parses (so the TOML-level guard sees the package) but the
+    /// [[package]] unit is spelled `name="six"` — outside the text-surgery
+    /// shape uv emits. The rewrite's own missing-unit error must propagate
+    /// out of wire_uv before any write, not panic or half-wire.
+    #[tokio::test]
+    async fn wire_propagates_a_textually_missing_package_unit() {
+        let lock = DIRECT_REGISTRY_LOCK.replacen(
+            "[[package]]\nname = \"six\"",
+            "[[package]]\nname=\"six\"",
+            1,
+        );
+        assert_ne!(lock, DIRECT_REGISTRY_LOCK);
+        let tmp = write_pair(DIRECT_REGISTRY_PYPROJECT, &lock).await;
+        let p = load_uv_project(tmp.path()).await.unwrap();
+        let err = wire_uv(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UUID,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, "pypi_uv_lock_package_missing");
+        assert!(err.1.contains("six"), "{}", err.1);
+        let (py, on_disk) = read_pair(tmp.path()).await;
+        assert_eq!(py, DIRECT_REGISTRY_PYPROJECT, "refusal leaves the tree untouched");
+        assert_eq!(on_disk, lock);
+    }
+
+    /// A ledger record with no `new` fragment at all (malformed/truncated
+    /// state.json). Every Added revert arm needs the fragment it wrote to
+    /// remove it — each must warn and skip, never panic or guess.
+    fn record_without_new(kind: &str, action: WiringAction) -> WiringRecord {
+        WiringRecord {
+            file: "x".into(),
+            kind: kind.into(),
+            action,
+            key: Some("six".into()),
+            original: None,
+            new: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn revert_warns_on_records_missing_the_new_fragment() {
+        let tmp = write_pair(TRANSITIVE_REGISTRY_PYPROJECT, TRANSITIVE_REGISTRY_LOCK).await;
+        let entry = entry_for(
+            vec![
+                record_without_new("uv_override", WiringAction::Added),
+                record_without_new("uv_sources_entry", WiringAction::Added),
+                record_without_new("uv_lock_manifest_overrides", WiringAction::Added),
+            ],
+            UvMeta {
+                dep_class: "override".into(),
+                original_specifier: None,
+                created_sources_table: false,
+                lock_revision: None,
+            },
+        );
+        let outcome = revert_uv(&entry, tmp.path(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert_eq!(outcome.warnings.len(), 3, "{:?}", outcome.warnings);
+        for w in &outcome.warnings {
+            assert_eq!(w.code, "vendor_lock_entry_drifted");
+        }
+        let (py, lock) = read_pair(tmp.path()).await;
+        assert_eq!(py, TRANSITIVE_REGISTRY_PYPROJECT);
+        assert_eq!(lock, TRANSITIVE_REGISTRY_LOCK);
+    }
+
+    /// The `[manifest]` section vendor CREATED was reshaped by hand but still
+    /// routes through the vendored wheel: that is drift (fail-closed), not
+    /// convergence — revert warns and leaves the section, while the untouched
+    /// [[package]] fragment and the pyproject still revert.
+    #[tokio::test]
+    async fn revert_warns_when_created_manifest_section_still_routes_after_reshape() {
+        let tmp = write_pair(TRANSITIVE_REGISTRY_PYPROJECT, TRANSITIVE_REGISTRY_LOCK).await;
+        let p = load_uv_project(tmp.path()).await.unwrap();
+        let (wiring, meta) = wire_uv(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UUID,
+        )
+        .await
+        .unwrap();
+        let pkg_rec = wiring
+            .iter()
+            .find(|w| w.kind == "uv_lock_package")
+            .unwrap();
+        let pkg_new = pkg_rec
+            .new
+            .as_ref()
+            .and_then(serde_json::Value::as_str)
+            .unwrap()
+            .to_string();
+        let pkg_orig = pkg_rec
+            .original
+            .as_ref()
+            .and_then(serde_json::Value::as_str)
+            .unwrap()
+            .to_string();
+
+        let (_, wired_lock) = read_pair(tmp.path()).await;
+        let tampered = wired_lock.replacen(
+            &format!("path = \"{REL_WHEEL}\" }}]"),
+            &format!("path = \"{REL_WHEEL}\" }}, {{ name = \"extra\", path = \"e.whl\" }}]"),
+            1,
+        );
+        assert_ne!(tampered, wired_lock, "the tamper must hit the overrides line");
+        tokio::fs::write(tmp.path().join("uv.lock"), &tampered)
+            .await
+            .unwrap();
+
+        let outcome = revert_uv(&entry_for(wiring, meta), tmp.path(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert_eq!(outcome.warnings.len(), 1, "{:?}", outcome.warnings);
+        assert_eq!(outcome.warnings[0].code, "vendor_lock_entry_drifted");
+        assert!(
+            outcome.warnings[0].detail.contains("uv.lock"),
+            "{}",
+            outcome.warnings[0].detail
+        );
+        let (py, lock) = read_pair(tmp.path()).await;
+        assert_eq!(py, TRANSITIVE_REGISTRY_PYPROJECT);
+        let expected = tampered.replacen(&pkg_new, &pkg_orig, 1);
+        assert_eq!(
+            lock, expected,
+            "the [[package]] fragment reverts; the reshaped [manifest] stays"
+        );
+    }
+
+    /// Hand-restoring a pair whose lock had a PRE-EXISTING overrides array
+    /// (a Rewritten manifest record) is convergence: the recorded original
+    /// is already live, so revert is silent — no drift warnings.
+    #[tokio::test]
+    async fn revert_hand_restored_preexisting_overrides_lock_is_silent_convergence() {
+        let one_el = "overrides = [{ name = \"other\", path = \"o.whl\" }]";
+        let input_lock = TRANSITIVE_REGISTRY_LOCK.replace(
+            "requires-python = \">=3.10\"\n",
+            &format!("requires-python = \">=3.10\"\n\n[manifest]\n{one_el}\n"),
+        );
+        let tmp = write_pair(TRANSITIVE_REGISTRY_PYPROJECT, &input_lock).await;
+        let p = load_uv_project(tmp.path()).await.unwrap();
+        let (wiring, meta) = wire_uv(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UUID,
+        )
+        .await
+        .unwrap();
+        // Hand-restore BOTH files to their pre-vendor bytes.
+        tokio::fs::write(tmp.path().join("pyproject.toml"), TRANSITIVE_REGISTRY_PYPROJECT)
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.path().join("uv.lock"), &input_lock)
+            .await
+            .unwrap();
+
+        let outcome = revert_uv(&entry_for(wiring, meta), tmp.path(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        let (py, lock) = read_pair(tmp.path()).await;
+        assert_eq!(py, TRANSITIVE_REGISTRY_PYPROJECT);
+        assert_eq!(lock, input_lock);
+    }
+
+    /// Hand-restoring ONLY the pyproject after wiring extended a user's
+    /// existing `override-dependencies` array: the Rewritten uv_override arm
+    /// finds the recorded original live — convergence, silent — while the
+    /// lock side still reverts fully.
+    #[tokio::test]
+    async fn revert_hand_restored_rewritten_override_array_is_silent_convergence() {
+        let pyproject = format!(
+            "{TRANSITIVE_REGISTRY_PYPROJECT}\n[tool.uv]\noverride-dependencies = [\"attrs==23.1.0\"]\n"
+        );
+        let tmp = write_pair(&pyproject, TRANSITIVE_REGISTRY_LOCK).await;
+        let p = load_uv_project(tmp.path()).await.unwrap();
+        let (wiring, meta) = wire_uv(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UUID,
+        )
+        .await
+        .unwrap();
+        // Hand-restore only the pyproject; leave the wired lock.
+        tokio::fs::write(tmp.path().join("pyproject.toml"), &pyproject)
+            .await
+            .unwrap();
+
+        let outcome = revert_uv(&entry_for(wiring, meta), tmp.path(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        let (py, lock) = read_pair(tmp.path()).await;
+        assert_eq!(py, pyproject, "the hand-restored pyproject is untouched");
+        assert_eq!(lock, TRANSITIVE_REGISTRY_LOCK, "the lock still reverts");
+    }
+
+    /// The extended `override-dependencies` array was EDITED by hand into a
+    /// shape that is neither what vendor wrote nor the recorded original:
+    /// drift — warn and leave it, while everything else reverts.
+    #[tokio::test]
+    async fn revert_warns_when_rewritten_override_array_was_edited() {
+        let pyproject = format!(
+            "{TRANSITIVE_REGISTRY_PYPROJECT}\n[tool.uv]\noverride-dependencies = [\"attrs==23.1.0\"]\n"
+        );
+        let tmp = write_pair(&pyproject, TRANSITIVE_REGISTRY_LOCK).await;
+        let p = load_uv_project(tmp.path()).await.unwrap();
+        let (wiring, meta) = wire_uv(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UUID,
+        )
+        .await
+        .unwrap();
+        let (wired_py, _) = read_pair(tmp.path()).await;
+        let tampered = wired_py.replacen("attrs==23.1.0", "attrs==23.9.9", 1);
+        assert_ne!(tampered, wired_py, "the tamper must hit the override array");
+        tokio::fs::write(tmp.path().join("pyproject.toml"), &tampered)
+            .await
+            .unwrap();
+
+        let outcome = revert_uv(&entry_for(wiring, meta), tmp.path(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert_eq!(outcome.warnings.len(), 1, "{:?}", outcome.warnings);
+        assert_eq!(outcome.warnings[0].code, "vendor_lock_entry_drifted");
+        assert!(
+            outcome.warnings[0].detail.contains("pyproject.toml"),
+            "{}",
+            outcome.warnings[0].detail
+        );
+        let (py, lock) = read_pair(tmp.path()).await;
+        assert_eq!(lock, TRANSITIVE_REGISTRY_LOCK, "the lock still reverts");
+        assert!(
+            py.contains("override-dependencies = [\"attrs==23.9.9\", \"six==1.16.0\"]"),
+            "the drifted array is left as the user edited it: {py}"
+        );
+        assert!(
+            !py.contains("[tool.uv.sources]"),
+            "the undrifted sources entry still reverts: {py}"
+        );
+    }
+
+    /// The lock write succeeds but the pyproject write fails (an immutable
+    /// pyproject.toml): revert reports failure with the pyproject error, not
+    /// a silent partial revert. UF_IMMUTABLE blocks rename-over regardless
+    /// of euid, so no root-skip probe is needed.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn revert_pyproject_write_failure_after_the_lock_write_reports_failure() {
+        fn set_flags(path: &Path, flags: libc::c_uint) {
+            use std::os::unix::ffi::OsStrExt;
+            let c_path =
+                std::ffi::CString::new(path.as_os_str().as_bytes()).expect("path has no NUL");
+            let rc = unsafe { libc::chflags(c_path.as_ptr(), flags) };
+            assert_eq!(rc, 0, "chflags failed: {}", std::io::Error::last_os_error());
+        }
+
+        let tmp = write_pair(DIRECT_REGISTRY_PYPROJECT, DIRECT_REGISTRY_LOCK).await;
+        let entry = entry_for(
+            Vec::new(),
+            UvMeta {
+                dep_class: "direct".into(),
+                original_specifier: None,
+                created_sources_table: false,
+                lock_revision: None,
+            },
+        );
+        let pyproject_path = tmp.path().join("pyproject.toml");
+        set_flags(&pyproject_path, libc::UF_IMMUTABLE);
+        let outcome = revert_uv(&entry, tmp.path(), false).await;
+        // Clear the flag before asserting so the TempDir cleans up even on
+        // failure.
+        set_flags(&pyproject_path, 0);
+
+        assert!(!outcome.success, "the failed write must fail the revert");
+        assert!(!outcome.kept_artifact);
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("cannot write pyproject.toml"),
+            "{:?}",
+            outcome.error
+        );
+        let (py, lock) = read_pair(tmp.path()).await;
+        assert_eq!(py, DIRECT_REGISTRY_PYPROJECT);
+        assert_eq!(lock, DIRECT_REGISTRY_LOCK, "the preceding lock write succeeded");
+    }
+
+    /// A SINGLE-LINE `wheels = […]` array (uv emits one for one-wheel
+    /// packages) is replaced in place — not duplicated by the sdist-only
+    /// append path.
+    #[test]
+    fn single_line_wheels_array_is_rewritten_in_place() {
+        let lock = "version = 1\n\n[[package]]\nname = \"six\"\nversion = \"1.15.0\"\nsource = { registry = \"https://pypi.org/simple\" }\nsdist = { url = \"https://example.invalid/six.tar.gz\", hash = \"sha256:aa\", size = 1 }\nwheels = [{ url = \"https://example.invalid/six.whl\", hash = \"sha256:bb\" }]\n";
+        let (old_unit, new_unit) = rewrite_target_package_unit(
+            lock,
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            None,
+        )
+        .unwrap();
+        assert!(old_unit.contains("wheels = [{ url"), "{old_unit}");
+        let expected_wheels = format!(
+            "wheels = [\n    {{ filename = \"{WHEEL_NAME}\", hash = \"sha256:{WHEEL_SHA}\" }},\n]"
+        );
+        assert!(new_unit.contains(&expected_wheels), "{new_unit}");
+        assert_eq!(
+            new_unit.matches("wheels = [").count(),
+            1,
+            "replaced in place, never appended a second array: {new_unit}"
+        );
+        assert!(!new_unit.contains("url ="), "{new_unit}");
+        assert!(!new_unit.contains("sdist"), "{new_unit}");
+        assert!(
+            new_unit.contains(&format!("source = {{ path = \"{REL_WHEEL}\" }}")),
+            "{new_unit}"
+        );
+        assert!(new_unit.contains("version = \"1.16.0\""), "{new_unit}");
+    }
+
+    /// Root-unit header shared by the unbalanced-array fixtures below.
+    const ROOT_UNIT_HDR: &str = "version = 1\n\n[[package]]\nname = \"proj\"\nversion = \"0.1.0\"\nsource = { virtual = \".\" }\n\n[package.metadata]\n";
+
+    /// A truncated (unbalanced) root `requires-dist` array refuses with a
+    /// parse error instead of slicing out of bounds or mis-splicing.
+    #[test]
+    fn unbalanced_requires_dist_array_is_a_parse_error() {
+        let lock = format!(
+            "{ROOT_UNIT_HDR}requires-dist = [{{ name = \"six\", specifier = \"==1.16.0\" }}\n"
+        );
+        let Err(err) = rewrite_root_metadata_entries(&lock, "six", REL_WHEEL) else {
+            panic!("an unbalanced requires-dist array must refuse");
+        };
+        assert_eq!(err.0, "pypi_uv_lock_parse_failed");
+        assert!(err.1.contains("requires-dist array is unbalanced"), "{}", err.1);
+    }
+
+    /// Same for a truncated `[package.metadata.requires-dev]` group array.
+    #[test]
+    fn unbalanced_requires_dev_group_array_is_a_parse_error() {
+        let lock = format!(
+            "{ROOT_UNIT_HDR}requires-dist = [{{ name = \"six\", specifier = \"==1.16.0\" }}]\n\n[package.metadata.requires-dev]\ndev = [\n    {{ name = \"six\", specifier = \"==1.16.0\" }},\n"
+        );
+        let Err(err) = rewrite_root_metadata_entries(&lock, "six", REL_WHEEL) else {
+            panic!("an unbalanced requires-dev group array must refuse");
+        };
+        assert_eq!(err.0, "pypi_uv_lock_parse_failed");
+        assert!(
+            err.1.contains("requires-dev] array is unbalanced"),
+            "{}",
+            err.1
+        );
+    }
+
+    /// A requires-dev group whose entries name OTHER packages contributes no
+    /// edit — the scan skips it and the requires-dist edit alone survives.
+    #[test]
+    fn requires_dev_scan_skips_groups_without_the_target() {
+        let lock = format!(
+            "{ROOT_UNIT_HDR}requires-dist = [{{ name = \"six\", specifier = \"==1.16.0\" }}]\n\n[package.metadata.requires-dev]\nlint = [\n    {{ name = \"black\", specifier = \"==24.4.2\" }},\n]\n"
+        );
+        let edits = rewrite_root_metadata_entries(&lock, "six", REL_WHEEL).unwrap();
+        assert_eq!(edits.len(), 1, "the black-only dev group contributes no edit");
+        assert_eq!(edits[0].kind, "uv_lock_requires_dist");
+        assert!(edits[0].old_entry.contains("name = \"six\""));
+    }
+
+    /// A hand-edited entry with a trailing comma splits into a final empty
+    /// piece — skipped, so the rebuilt entry carries no stray separator.
+    #[test]
+    fn path_source_entry_tolerates_a_trailing_comma() {
+        let (new_entry, specifier) =
+            path_source_entry("{ name = \"six\", specifier = \"==1.16.0\", }", REL_WHEEL);
+        assert_eq!(specifier.as_deref(), Some("==1.16.0"));
+        assert_eq!(
+            new_entry,
+            format!("{{ name = \"six\", path = \"{REL_WHEEL}\" }}")
+        );
+    }
+
+    /// A lock with neither `[manifest]` nor any `[[package]]` unit gives the
+    /// created section no insertion anchor: a parse-failure refusal.
+    #[test]
+    fn manifest_override_requires_a_package_entry() {
+        let err = add_manifest_override("version = 1\nrevision = 3\n", "six", REL_WHEEL)
+            .unwrap_err();
+        assert_eq!(err.0, "pypi_uv_lock_parse_failed");
+        assert!(err.1.contains("no [[package]] entries"), "{}", err.1);
+    }
+
+    /// A truncated (unbalanced) existing `[manifest] overrides` array refuses
+    /// with a parse error instead of splicing garbage.
+    #[test]
+    fn manifest_override_reports_an_unbalanced_overrides_array() {
+        let lock = "version = 1\n\n[manifest]\noverrides = [{ name = \"other\", path = \"o.whl\" }\n\n[[package]]\nname = \"proj\"\nversion = \"0.1.0\"\nsource = { virtual = \".\" }\n";
+        let err = add_manifest_override(lock, "six", REL_WHEEL).unwrap_err();
+        assert_eq!(err.0, "pypi_uv_lock_parse_failed");
+        assert!(err.1.contains("overrides array is unbalanced"), "{}", err.1);
+    }
 }

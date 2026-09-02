@@ -14,6 +14,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use serde_json::{json, Value};
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 use socket_patch_cli::args::GlobalArgs;
 use socket_patch_cli::commands::vendor::{run as vendor_run, VendorArgs};
 use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
@@ -929,5 +931,344 @@ fn redirect_ledger_write_failure_fails_takeover_purl_closed() {
         std::fs::read(fx.redirect_state_path()).unwrap(),
         ledger_bytes,
         "the unpersistable ledger is left exactly as found"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// 8. human-mode error/refusal stderr surfaces (no --json, no --silent)
+//
+// Section 5 covered the human happy paths; every test here pins one of
+// the human-only eprintln lines that ride beside an already-pinned JSON
+// contract (same fixture shapes as sections 1–4, human runner).
+// ─────────────────────────────────────────────────────────────────────
+
+/// `sha512-…` SRI of `bytes` (same helper shape as the sibling repair and
+/// scan-vendor suites): a syntactically VALID integrity so the pristine
+/// ladder proceeds past the no-integrity `Unverifiable` refusal and
+/// actually attempts the fetch.
+fn sri_of(bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    use sha2::{Digest as _, Sha512};
+    format!(
+        "sha512-{}",
+        base64::engine::general_purpose::STANDARD.encode(Sha512::digest(bytes))
+    )
+}
+
+/// Human corrupt-manifest surface: the `Error: could not read manifest`
+/// stderr line beside the `invalid_manifest` exit contract section 1 pins
+/// under --json.
+#[test]
+fn human_corrupt_manifest_prints_could_not_read() {
+    let fx = npm_fixture();
+    std::fs::write(fx.manifest_path(), b"{broken").unwrap();
+
+    let (code, stdout, stderr) = human_vendor(&fx, &[]);
+    assert_eq!(code, 1, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(
+        stderr.contains("Error: could not read manifest:"),
+        "the human explanation for the flipped exit code: {stderr}"
+    );
+    assert_eq!(fx.lock_bytes(), fx.original_lock, "lock untouched");
+}
+
+/// Human corrupt-committed-artifact surface (fresh clone, ledger sha
+/// mismatch): the `Cannot vendor …` stderr line still carries the
+/// `socket-patch repair` remedy.
+#[tokio::test]
+async fn human_corrupt_committed_artifact_prints_repair_hint() {
+    let fx = npm_fixture();
+    assert_eq!(vendor_run(vendor_args(fx.root())).await, 0, "stage vendor");
+    std::fs::remove_dir_all(fx.root().join("node_modules")).unwrap();
+    std::fs::write(fx.tgz_path(), b"corrupt bytes").unwrap();
+
+    let (code, stdout, stderr) = human_vendor(&fx, &[]);
+    assert_eq!(code, 1, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(
+        stderr.contains("Cannot vendor pkg:npm/left-pad@1.3.0:"),
+        "stderr names the purl: {stderr}"
+    );
+    assert!(
+        stderr.contains("socket-patch repair"),
+        "the human line must carry the repair remedy: {stderr}"
+    );
+    assert!(
+        stdout.contains("Vendored 0 package(s); 0 skipped; 1 failed."),
+        "the summary counts the failure: {stdout}"
+    );
+}
+
+/// Human registry-fetch-failure surface: a lockfile-resolved missing
+/// package whose registry serves a 500 prints the
+/// `Cannot vendor …: fetch failed: …` stderr line (the human twin of the
+/// `vendor_fetch_failed` event scan_vendor_e2e pins under --json).
+#[tokio::test]
+async fn human_fetch_failure_prints_fetch_failed() {
+    let fx = npm_fixture();
+    std::fs::remove_dir_all(fx.root().join("node_modules")).unwrap();
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/left-pad/-/left-pad-1.3.0.tgz"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&mock)
+        .await;
+    // Re-point the lock at the mock registry with a VALID SRI: the ladder
+    // reaches the download (an SRI-less entry would stop at Unverifiable)
+    // and the 500 lands in `PristineFetch::Failed`.
+    let mut lock: Value = serde_json::from_slice(&fx.lock_bytes()).unwrap();
+    lock["packages"]["node_modules/left-pad"]["resolved"] =
+        Value::String(format!("{}/left-pad/-/left-pad-1.3.0.tgz", mock.uri()));
+    lock["packages"]["node_modules/left-pad"]["integrity"] =
+        Value::String(sri_of(b"pristine bytes the mock never serves"));
+    std::fs::write(fx.lock_path(), serde_json::to_vec_pretty(&lock).unwrap()).unwrap();
+
+    // Non-offline (the fetch must actually run), anonymous (no other
+    // network path opens), human mode (no --json).
+    let (code, stdout, stderr) = run_cli(
+        fx.root(),
+        &["vendor", "--cwd", fx.root().to_str().unwrap()],
+        &[("SOCKET_NO_API_TOKEN", "1")],
+    );
+    assert_eq!(code, 1, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(
+        stderr.contains("Cannot vendor pkg:npm/left-pad@1.3.0: fetch failed:"),
+        "the human fetch-failure line: {stderr}"
+    );
+    assert!(
+        stdout.contains("Vendored 0 package(s); 0 skipped; 1 failed."),
+        "a fetch failure is counted as failed, not skipped: {stdout}"
+    );
+    assert!(
+        !fx.vendor_dir().exists(),
+        "nothing may be vendored from a failed fetch"
+    );
+}
+
+/// Human corrupt-redirect-ledger surface: the takeover-capable purl's
+/// fail-closed refusal prints `Cannot vendor …` with the corruption.
+#[test]
+fn human_corrupt_redirect_ledger_prints_cannot_vendor() {
+    let fx = npm_fixture();
+    std::fs::create_dir_all(fx.vendor_dir()).unwrap();
+    std::fs::write(fx.redirect_state_path(), b"garbage").unwrap();
+
+    let (code, stdout, stderr) = human_vendor(&fx, &[]);
+    assert_eq!(code, 1, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(
+        stderr.contains("Cannot vendor pkg:npm/left-pad@1.3.0:"),
+        "stderr names the refused purl: {stderr}"
+    );
+    assert!(
+        stdout.contains("Vendored 0 package(s); 0 skipped; 1 failed."),
+        "the fail-closed refusal is counted: {stdout}"
+    );
+    assert_eq!(fx.lock_bytes(), fx.original_lock, "lock untouched");
+}
+
+/// Human unrevertable-redirect surface: a claimed purl whose hosted edits
+/// cannot be reverted prints the `cannot revert the hosted redirect` line.
+#[test]
+fn human_unrevertable_redirect_prints_cannot_revert() {
+    let fx = npm_fixture();
+    std::fs::create_dir_all(fx.vendor_dir()).unwrap();
+    let before_hash = compute_git_sha256_from_bytes(ORIG_INDEX);
+    let after_hash = compute_git_sha256_from_bytes(PATCHED_INDEX);
+    // Same unrevertable shape as section 3: a rewritten hosted edit with
+    // NO recorded original fragment.
+    let ledger = json!({
+        "version": 1,
+        "mode": "hosted",
+        "edits": [{
+            "path": "yarn.lock",
+            "kind": "redirect_yarn_classic_entry",
+            "action": "rewritten",
+            "key": "left-pad@1.3.0"
+        }],
+        "records": { PURL: patch_record(&before_hash, &after_hash) }
+    });
+    std::fs::write(
+        fx.redirect_state_path(),
+        serde_json::to_vec_pretty(&ledger).unwrap(),
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) = human_vendor(&fx, &[]);
+    assert_eq!(code, 1, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(
+        stderr.contains("Cannot vendor pkg:npm/left-pad@1.3.0:")
+            && stderr.contains("cannot revert the hosted redirect"),
+        "the human takeover-refusal line: {stderr}"
+    );
+    assert_eq!(fx.lock_bytes(), fx.original_lock, "lock untouched");
+}
+
+/// Human backend-refusal surface: an installed package with NO lockfile of
+/// any flavor is a non-benign `vendor_lockfile_missing` refusal — the
+/// `Cannot vendor …` stderr line carries the backend's remedy.
+#[test]
+fn human_lockfile_missing_refusal_prints_cannot_vendor() {
+    let fx = npm_fixture();
+    std::fs::remove_file(fx.lock_path()).unwrap();
+
+    let (code, stdout, stderr) = human_vendor(&fx, &[]);
+    assert_eq!(code, 1, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(
+        stderr.contains("Cannot vendor pkg:npm/left-pad@1.3.0:")
+            && stderr.contains("vendoring rewires the lockfile"),
+        "the refusal detail surfaces verbatim: {stderr}"
+    );
+    assert!(
+        stdout.contains("Vendored 0 package(s); 0 skipped; 1 failed."),
+        "a non-benign refusal is counted as failed: {stdout}"
+    );
+}
+
+/// Human patch-failure surface: a manifest record with a patch-target file
+/// ABSENT from the installed copy (non-empty beforeHash, no --force) fails
+/// the staged apply closed; the `Failed to vendor …` stderr line carries
+/// the apply diagnostic.
+#[test]
+fn human_patch_failure_prints_failed_to_vendor() {
+    let fx = npm_fixture();
+    let after_hash = compute_git_sha256_from_bytes(PATCHED_INDEX);
+    let elsewhere = compute_git_sha256_from_bytes(b"bytes the fixture never installed\n");
+    let mut manifest: Value =
+        serde_json::from_slice(&std::fs::read(fx.manifest_path()).unwrap()).unwrap();
+    manifest["patches"][PURL]["files"]["package/absent.js"] =
+        json!({ "beforeHash": elsewhere, "afterHash": after_hash });
+    std::fs::write(
+        fx.manifest_path(),
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) = human_vendor(&fx, &[]);
+    assert_eq!(code, 1, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(
+        stderr.contains("Failed to vendor pkg:npm/left-pad@1.3.0:")
+            && stderr.contains("File not found"),
+        "the human line carries the apply failure: {stderr}"
+    );
+    assert!(
+        stdout.contains("Vendored 0 package(s); 0 skipped; 1 failed."),
+        "the failed patch is counted: {stdout}"
+    );
+    assert!(
+        !fx.tgz_path().exists(),
+        "a failed patch must not pack an artifact"
+    );
+    assert_eq!(fx.lock_bytes(), fx.original_lock, "lock untouched");
+}
+
+/// Human corrupt-ledger `--revert` surface: the
+/// `Error: could not read .socket/vendor/state.json` stderr line beside
+/// the `vendor_state_unreadable` exit contract section 1 pins under --json.
+#[test]
+fn human_corrupt_state_revert_prints_could_not_read() {
+    let fx = npm_fixture();
+    std::fs::create_dir_all(fx.vendor_dir()).unwrap();
+    std::fs::write(fx.state_path(), b"not json{").unwrap();
+
+    let (code, stdout, stderr) = human_vendor(&fx, &["--revert"]);
+    assert_eq!(code, 1, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(
+        stderr.contains("Error: could not read .socket/vendor/state.json:"),
+        "the human explanation for the flipped exit code: {stderr}"
+    );
+}
+
+/// Human `--revert` failure surface: a ledger entry with no revert backend
+/// prints the `Failed to revert <purl>` stderr line, and the summary
+/// counts it.
+#[tokio::test]
+async fn human_revert_failure_prints_failed_to_revert() {
+    let fx = npm_fixture();
+    write_ledger_entry(fx.root(), "frobnicate").await;
+
+    let (code, stdout, stderr) = human_vendor(&fx, &["--revert"]);
+    assert_eq!(code, 1, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(
+        stderr.contains("Failed to revert pkg:npm/left-pad@1.3.0"),
+        "stderr names the failed purl: {stderr}"
+    );
+    assert!(
+        stdout.contains("Reverted 0 vendored package(s); 1 failed."),
+        "the summary counts the failure: {stdout}"
+    );
+}
+
+/// Human `--revert --dry-run`: the `Would revert` verb, and NOTHING is
+/// mutated — the ledger keeps its entry, the wired lock and the artifact
+/// stay exactly as vendored.
+#[tokio::test]
+async fn human_revert_dry_run_prints_would_revert_and_mutates_nothing() {
+    let fx = npm_fixture();
+    assert_eq!(vendor_run(vendor_args(fx.root())).await, 0, "stage vendor");
+    let state_before = std::fs::read(fx.state_path()).unwrap();
+    let wired_lock = fx.lock_bytes();
+
+    let (code, stdout, stderr) = human_vendor(&fx, &["--revert", "--dry-run"]);
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(
+        stdout.contains("Would revert 1 vendored package(s); 0 failed."),
+        "the dry-run verb and count: {stdout}"
+    );
+    assert_eq!(
+        std::fs::read(fx.state_path()).unwrap(),
+        state_before,
+        "a dry revert must not touch the ledger"
+    );
+    assert_eq!(
+        fx.lock_bytes(),
+        wired_lock,
+        "a dry revert must not touch the wired lock"
+    );
+    assert!(fx.tgz_path().is_file(), "a dry revert keeps the artifact");
+}
+
+/// Human `--dry-run --vex`: the VEX skip line — a dry run vendors nothing,
+/// so generating (and verifying the untouched tree) would spuriously fail;
+/// the file must NOT be written.
+#[test]
+fn human_dry_run_with_vex_prints_skip_and_writes_no_vex() {
+    let fx = npm_fixture();
+    let vex_path = fx.root().join("attestation.vex.json");
+
+    let (code, stdout, stderr) =
+        human_vendor(&fx, &["--dry-run", "--vex", vex_path.to_str().unwrap()]);
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(
+        stdout.contains("Skipping VEX generation (--dry-run: nothing was vendored)."),
+        "the human VEX-skip explanation: {stdout}"
+    );
+    assert!(
+        !vex_path.exists(),
+        "no attestation may be written during --dry-run"
+    );
+}
+
+/// Human run-level classic→berry migration advisory: a classic `yarn.lock`
+/// carrying vendored wiring (and no yarn@1 corepack pin) warns on stderr at
+/// envelope-finalize time — pinned through the `--revert` no-op path, which
+/// exercises the state-based probe without any vendoring in the run itself.
+#[test]
+fn human_classic_migration_risk_prints_stderr_warning() {
+    let fx = npm_fixture();
+    std::fs::write(
+        fx.root().join("yarn.lock"),
+        "# yarn lockfile v1\n\nleft-pad@^1.3.0:\n  version \"1.3.0\"\n  \
+         resolved \"file:.socket/vendor/npm/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/left-pad-1.3.0.tgz\"\n",
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) = human_vendor(&fx, &["--revert"]);
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(
+        stdout.contains("Nothing vendored to revert."),
+        "the revert itself is the calm no-op: {stdout}"
+    );
+    assert!(
+        stderr.contains("Warning (yarn_classic_berry_migration_risk)"),
+        "the run-level advisory prints for humans: {stderr}"
     );
 }

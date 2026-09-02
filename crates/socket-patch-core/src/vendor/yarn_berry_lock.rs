@@ -2989,4 +2989,40 @@ __metadata:
             vec!["    orphan-submap-line".to_string()]
         );
     }
+
+    /// An EMPTY workspace ident (`"@workspace:."` — a root package.json with
+    /// no `name`) must never satisfy the root-workspace probe: the extracted
+    /// name is embedded verbatim in the vendored `file:` locator, and an
+    /// empty ident there would emit a lock key/resolution yarn cannot parse.
+    /// The probe skips it — still finding a later named root — and with no
+    /// named root at all the vendor path refuses fail-closed before any
+    /// write.
+    #[tokio::test]
+    async fn empty_workspace_ident_is_skipped_and_vendor_refuses() {
+        // Unit: the empty ident is skipped, not returned as "".
+        let empty_only = B3_BEFORE_LOCK.replace("vendor-spike@workspace:.", "@workspace:.");
+        assert_eq!(root_workspace_name(&scan_blocks(&empty_only)), None);
+
+        // Skipping means the scan CONTINUES: a later named root still wins.
+        let empty_then_named = format!(
+            "{empty_only}\n\"vendor-spike@workspace:.\":\n  version: 0.0.0-use.local\n  \
+             resolution: \"vendor-spike@workspace:.\"\n  languageName: unknown\n  \
+             linkType: soft\n"
+        );
+        assert_eq!(
+            root_workspace_name(&scan_blocks(&empty_then_named)).as_deref(),
+            Some("vendor-spike")
+        );
+
+        // E2E: with only the empty-ident root, vendoring refuses fail-closed
+        // (same gate as a lock with no workspace entry at all) and the
+        // project stays byte-untouched.
+        let fx = fixture_with(B3_BEFORE_PKG, &empty_only).await;
+        let detail = expect_refused(
+            fx.vendor(false).await,
+            "vendor_lockfile_version_unsupported",
+        );
+        assert!(detail.contains("@workspace:."), "{detail}");
+        fx.assert_untouched().await;
+    }
 }

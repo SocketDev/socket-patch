@@ -4017,4 +4017,94 @@ mod tests {
             "the committable blobs dir must be untouched by a dry run"
         );
     }
+
+    /// A purl absent from the source manifest contributes nothing to the
+    /// GC reference: the pin loop skips it (the lookup-miss `continue`)
+    /// rather than inserting an empty synthetic keep record, and present
+    /// purls around it still pin normally.
+    #[test]
+    fn pin_before_hash_blobs_skips_purls_absent_from_source() {
+        let mut present = make_record("uuid-present");
+        present.files.insert(
+            "package/index.js".to_string(),
+            PatchFileInfo {
+                before_hash: "beefbeef".to_string(),
+                after_hash: "cafecafe".to_string(),
+            },
+        );
+        let mut source = PatchManifest {
+            patches: HashMap::new(),
+            setup: None,
+        };
+        source
+            .patches
+            .insert("pkg:npm/present@1.0.0".to_string(), present);
+
+        let mut reference = PatchManifest {
+            patches: HashMap::new(),
+            setup: None,
+        };
+        let purls = [
+            "pkg:npm/ghost@9.9.9".to_string(),
+            "pkg:npm/present@1.0.0".to_string(),
+        ];
+        pin_before_hash_blobs(&mut reference, &source, purls.iter());
+
+        assert!(
+            !reference.patches.contains_key("pkg:npm/ghost@9.9.9"),
+            "a purl the source manifest does not hold must not grow a \
+             synthetic record, got {:?}",
+            reference.patches.keys().collect::<Vec<_>>()
+        );
+        let pinned = reference
+            .patches
+            .get("pkg:npm/present@1.0.0")
+            .expect("the present purl must still pin");
+        assert_eq!(pinned.files.len(), 1, "got {:?}", pinned.files);
+        assert_eq!(
+            pinned
+                .files
+                .get("package/index.js#beforeHash-pin")
+                .expect("synthetic pin key")
+                .after_hash,
+            "beefbeef",
+            "the beforeHash must be pinned in an afterHash slot"
+        );
+    }
+
+    /// The vendored leg tolerates a key with no ledger entry: the scope
+    /// resolver guarantees keys exist, but a divergent ledger must skip
+    /// the key silently (the lookup-miss `continue`) rather than panic or
+    /// fail the leg — every outcome array stays empty.
+    #[tokio::test]
+    async fn run_vendored_leg_skips_keys_missing_from_ledger() {
+        let common = crate::args::GlobalArgs::default();
+        let mut state = socket_patch_core::vendor::VendorState::new();
+        let out = run_vendored_leg(
+            &common,
+            &["pkg:npm/ghost@1.0.0".to_string()],
+            &mut state,
+            false,
+        )
+        .await;
+        assert!(
+            out.reverted.is_empty()
+                && out.preserved.is_empty()
+                && out.kept.is_empty()
+                && out.failed.is_empty()
+                && out.warnings.is_empty(),
+            "an unknown ledger key must be a silent no-op: reverted={:?} \
+             preserved={:?} kept={:?} failed={:?} warnings={:?}",
+            out.reverted,
+            out.preserved,
+            out.kept,
+            out.failed,
+            out.warnings
+        );
+        assert!(
+            state.entries.is_empty(),
+            "the ledger must be untouched, got {:?}",
+            state.entries.keys().collect::<Vec<_>>()
+        );
+    }
 }

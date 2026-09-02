@@ -1782,3 +1782,527 @@ async fn human_ghsa_all_uninstalled_advises_all_releases() {
     );
     assert!(!tmp.path().join(".socket").exists());
 }
+
+// ===========================================================================
+// (8) final coverage mop-up (2026-09): human/silent twins, vendored search
+//     hard-error and partial-failure arms, lock-held vendor-step errors,
+//     and the reconcile-failure Ok(vendor_errors=true) demotion.
+// ===========================================================================
+
+/// `by-ghsa/{GHSA}` returning exactly the one project-fixture patch.
+async fn mount_ghsa_single(server: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/by-ghsa/{GHSA}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "patches": [{
+                "uuid": UUID, "purl": PURL,
+                "publishedAt": "2024-01-01T00:00:00Z",
+                "description": "x", "license": "MIT", "tier": "free",
+                "vulnerabilities": {}
+            }],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(server)
+        .await;
+}
+
+/// The manifest `files` map `save_patch_record` writes for the project
+/// fixture's real bytes — used to seed a manifest that classifies a re-get
+/// of `UUID` as `Skipped` while staying vendorable.
+fn real_files_manifest_json() -> serde_json::Value {
+    serde_json::json!({
+        "package/index.js": {
+            "beforeHash": git_hash(BEFORE_BYTES),
+            "afterHash": git_hash(AFTER_BYTES),
+        }
+    })
+}
+
+/// Human-mode (json=false) engine run with `--silent`: the
+/// no-applicable-files failure is an ERROR, exempt from --silent — the
+/// envelope still degrades to partial_failure and the purl stays
+/// unrecorded, exactly like the --json flavor.
+#[tokio::test]
+#[serial]
+async fn engine_human_silent_no_applicable_files_still_fails() {
+    let server = MockServer::start().await;
+    mount_view_files(
+        &server,
+        UUID,
+        PURL,
+        serde_json::json!({
+            "package/index.js": { "beforeHash": "e".repeat(64), "afterHash": null }
+        }),
+    )
+    .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let selected = vec![search_result(UUID, PURL)];
+    let mut params = engine_params(tmp.path(), server.uri());
+    params.json = false;
+    params.silent = true;
+    let (code, json) = download_and_apply_patches(&selected, &params).await;
+
+    assert_eq!(code, 1, "json={json}");
+    assert_eq!(json["status"], "partial_failure", "json={json}");
+    assert_eq!(json["failed"], 1, "json={json}");
+    assert!(
+        manifest_json(tmp.path())["patches"][PURL].is_null(),
+        "a guardrail failure must not record the purl"
+    );
+}
+
+/// Human-mode (json=false) twin of the manifest-write-failure envelope: the
+/// error goes to stderr instead of stdout, and the returned envelope still
+/// carries `status: error` for the caller's early-return guard.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn engine_human_readonly_socket_manifest_write_failure_still_errors() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let server = MockServer::start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let socket = tmp.path().join(".socket");
+    std::fs::create_dir_all(&socket).unwrap();
+    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o555)).unwrap();
+    if !readonly_dir_enforced(&socket) {
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o755)).unwrap();
+        return;
+    }
+
+    let mut params = engine_params(tmp.path(), server.uri());
+    params.persist_blobs = false;
+    params.json = false;
+    params.silent = true;
+    let (code, json) = download_and_apply_patches(&[], &params).await;
+
+    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert_eq!(code, 1, "json={json}");
+    assert_eq!(json["status"], "error", "json={json}");
+    assert!(
+        json["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("writing manifest"),
+        "json={json}"
+    );
+    assert!(!socket.join("manifest.json").exists());
+}
+
+/// `--silent` twin of the all-uninstalled narrowing terminal: a clean
+/// no-op run must print NOTHING — no advise message on stdout, no per-
+/// version `[skip]` lines on stderr — while still exiting 0.
+#[tokio::test]
+async fn silent_ghsa_all_uninstalled_prints_nothing() {
+    let server = MockServer::start().await;
+    mount_ghsa_fanout(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (code, stdout, stderr) = run_get_bin(tmp.path(), &server.uri(), &[GHSA, "--silent"]);
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    assert!(
+        stdout.trim().is_empty(),
+        "--silent must mute the advise message; stdout={stdout}"
+    );
+    assert!(
+        !stderr.contains("[skip]") && !stderr.contains("installed here"),
+        "--silent must mute the per-version skip lines; stderr={stderr}"
+    );
+    assert!(!tmp.path().join(".socket").exists());
+}
+
+/// The human search listing's `Fixes:` line falls back to the advisory id
+/// when the vulnerability has no CVE assigned yet.
+#[tokio::test]
+async fn human_search_fixes_line_falls_back_to_advisory_id_without_cves() {
+    let server = MockServer::start().await;
+    let cve = "CVE-2024-31337";
+    Mock::given(method("GET"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/by-cve/{cve}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "patches": [{
+                "uuid": UUID, "purl": PURL,
+                "publishedAt": "2024-01-01T00:00:00Z",
+                "description": "no cve assigned yet", "license": "MIT", "tier": "free",
+                "vulnerabilities": {
+                    "GHSA-nocv-1111-2222": {
+                        "cves": [], "summary": "s",
+                        "severity": "high", "description": "d"
+                    }
+                }
+            }],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(&server)
+        .await;
+
+    // Empty project: the run ends in the all-uninstalled terminal, but the
+    // search listing (the surface under test) prints first.
+    let tmp = tempfile::tempdir().unwrap();
+    let (code, stdout, stderr) = run_get_bin(tmp.path(), &server.uri(), &[cve]);
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    assert!(
+        stdout.contains("Fixes: GHSA-nocv-1111-2222 (high)"),
+        "a CVE-less advisory must be summarized by its id; stdout={stdout}"
+    );
+}
+
+/// Human search-path vendored SUCCESS: the vendored flow commits the
+/// artifact and rewires the lock in human mode too — and with no
+/// pre-existing manifest the whole-manifest blast-radius note must NOT
+/// print (there is nothing else the vendor step could touch).
+#[tokio::test]
+async fn human_vendored_search_success_commits_artifact_without_blast_radius_note() {
+    let server = MockServer::start().await;
+    mount_ghsa_fanout(&server).await;
+    mount_real_view(&server, UUID, PURL).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_project(tmp.path());
+
+    let (code, stdout, stderr) = run_get_bin(
+        tmp.path(),
+        &server.uri(),
+        &[GHSA, "--mode", "vendored", "--vendor-source", "build"],
+    );
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    let artifact = tmp
+        .path()
+        .join(".socket/vendor/npm")
+        .join(UUID)
+        .join(format!("{NAME}-1.0.0.tgz"));
+    assert!(
+        artifact.is_file(),
+        "the artifact must be committed; stdout={stdout}\nstderr={stderr}"
+    );
+    let lock = std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap();
+    assert!(lock.contains(".socket/vendor/npm/"), "lock must be rewired:\n{lock}");
+    assert!(
+        !stderr.contains("whole manifest"),
+        "no blast-radius note without a pre-existing manifest; stderr={stderr}"
+    );
+}
+
+/// Search-path vendored download hard error: a corrupt manifest fails the
+/// download phase closed with ONE `status: error` JSON document, before any
+/// patch view is fetched and before the vendor step could print a second
+/// document.
+#[tokio::test]
+async fn vendored_search_json_corrupt_manifest_is_single_error_document() {
+    let server = MockServer::start().await;
+    mount_ghsa_single(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".socket")).unwrap();
+    std::fs::write(tmp.path().join(".socket/manifest.json"), b"{ corrupt").unwrap();
+
+    let (code, stdout, stderr) = run_get_bin(
+        tmp.path(),
+        &server.uri(),
+        &[
+            GHSA,
+            "--mode",
+            "vendored",
+            "--vendor-source",
+            "build",
+            "--all-releases",
+            "--json",
+        ],
+    );
+    assert_eq!(code, 1, "stdout={stdout}\nstderr={stderr}");
+    let v = parse_single_json_doc(&stdout);
+    assert_eq!(v["status"], "error", "stdout={stdout}");
+    assert!(
+        v["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("manifest"),
+        "the error must name the manifest read; stdout={stdout}"
+    );
+    assert_eq!(
+        requests_containing(&server, "/patches/view/").await,
+        0,
+        "the fail-closed read must precede any fetch"
+    );
+    assert_eq!(
+        std::fs::read(tmp.path().join(".socket/manifest.json")).unwrap(),
+        b"{ corrupt",
+        "the corrupt manifest must be preserved, never clobbered"
+    );
+}
+
+/// Search-path vendored run where one patch's download FAILS but the vendor
+/// step itself succeeds: the run demotes to `partial_failure` (exit 1)
+/// while the nested vendor envelope stays `success` — the download failure
+/// alone must degrade the run.
+#[tokio::test]
+async fn vendored_search_json_download_failure_with_clean_vendor_is_partial_failure() {
+    let server = MockServer::start().await;
+    mount_ghsa_fanout(&server).await;
+    mount_real_view(&server, UUID, PURL).await;
+    // UUID_V2's view stays unmounted -> 404 -> per-patch download failure.
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_project(tmp.path());
+
+    let (code, stdout, stderr) = run_get_bin(
+        tmp.path(),
+        &server.uri(),
+        &[
+            GHSA,
+            "--mode",
+            "vendored",
+            "--vendor-source",
+            "build",
+            "--all-releases",
+            "--json",
+        ],
+    );
+    assert_eq!(code, 1, "stdout={stdout}\nstderr={stderr}");
+    let v = parse_single_json_doc(&stdout);
+    assert_eq!(v["status"], "partial_failure", "stdout={stdout}");
+    assert_eq!(v["failed"], 1, "stdout={stdout}");
+    assert_eq!(
+        v["vendor"]["status"], "success",
+        "the vendor step itself was clean; stdout={stdout}"
+    );
+    // The successfully-downloaded patch was still vendored.
+    let artifact = tmp
+        .path()
+        .join(".socket/vendor/npm")
+        .join(UUID)
+        .join(format!("{NAME}-1.0.0.tgz"));
+    assert!(artifact.is_file(), "stdout={stdout}");
+}
+
+/// Vendor step dying BEFORE any reconcile (the apply lock is held by
+/// another process): the error envelope carries `lock_held` and — with no
+/// pre-failure vendor envelope to hand over — NO `vendor` key at all, in
+/// both the uuid and search flavors; human mode prints the
+/// `Error (lock_held):` line.
+#[tokio::test]
+async fn vendored_lock_held_vendor_step_errors_without_vendor_envelope() {
+    use std::time::Duration;
+
+    // (a) uuid path, --json: the record is saved, then the vendor step
+    // refuses on the held lock.
+    {
+        let server = MockServer::start().await;
+        mount_view_files(&server, UUID, PURL, good_files()).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let socket = tmp.path().join(".socket");
+        std::fs::create_dir_all(&socket).unwrap();
+        let _lock =
+            socket_patch_core::patch::apply_lock::acquire(&socket, Duration::ZERO).unwrap();
+
+        let (code, stdout, stderr) = run_get_bin(
+            tmp.path(),
+            &server.uri(),
+            &[UUID, "--mode", "vendored", "--vendor-source", "build", "--json"],
+        );
+        assert_eq!(code, 1, "stdout={stdout}\nstderr={stderr}");
+        let v = parse_single_json_doc(&stdout);
+        assert_eq!(v["status"], "error", "stdout={stdout}");
+        assert_eq!(v["error"]["code"], "lock_held", "stdout={stdout}");
+        assert!(
+            v.get("vendor").is_none(),
+            "no pre-failure vendor envelope exists to carry; stdout={stdout}"
+        );
+        assert_eq!(
+            v["patches"][0]["action"], "added",
+            "the record save preceded the refusal; stdout={stdout}"
+        );
+    }
+
+    // (b) search path, --json: same refusal after the download phase.
+    {
+        let server = MockServer::start().await;
+        mount_ghsa_single(&server).await;
+        mount_view_files(&server, UUID, PURL, good_files()).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let socket = tmp.path().join(".socket");
+        std::fs::create_dir_all(&socket).unwrap();
+        let _lock =
+            socket_patch_core::patch::apply_lock::acquire(&socket, Duration::ZERO).unwrap();
+
+        let (code, stdout, stderr) = run_get_bin(
+            tmp.path(),
+            &server.uri(),
+            &[
+                GHSA,
+                "--mode",
+                "vendored",
+                "--vendor-source",
+                "build",
+                "--all-releases",
+                "--json",
+            ],
+        );
+        assert_eq!(code, 1, "stdout={stdout}\nstderr={stderr}");
+        let v = parse_single_json_doc(&stdout);
+        assert_eq!(v["status"], "error", "stdout={stdout}");
+        assert_eq!(v["error"]["code"], "lock_held", "stdout={stdout}");
+        assert!(v.get("vendor").is_none(), "stdout={stdout}");
+    }
+
+    // (c) search path, human: the `Error (lock_held):` stderr line.
+    {
+        let server = MockServer::start().await;
+        mount_ghsa_single(&server).await;
+        mount_view_files(&server, UUID, PURL, good_files()).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let socket = tmp.path().join(".socket");
+        std::fs::create_dir_all(&socket).unwrap();
+        let _lock =
+            socket_patch_core::patch::apply_lock::acquire(&socket, Duration::ZERO).unwrap();
+
+        let (code, stdout, stderr) = run_get_bin(
+            tmp.path(),
+            &server.uri(),
+            &[
+                GHSA,
+                "--mode",
+                "vendored",
+                "--vendor-source",
+                "build",
+                "--all-releases",
+            ],
+        );
+        assert_eq!(code, 1, "stdout={stdout}\nstderr={stderr}");
+        assert!(
+            stderr.contains("Error (lock_held):"),
+            "human mode must print the coded vendor-step error; stderr={stderr}"
+        );
+    }
+}
+
+/// Human vendored-uuid over a manifest holding the SAME purl at a DIFFERENT
+/// uuid: the `Updated: 1 (replacing …)` print, then a clean vendor step —
+/// exit 0 with the artifact committed.
+#[tokio::test]
+async fn human_vendored_uuid_update_prints_replacing_and_vendors() {
+    let server = MockServer::start().await;
+    mount_real_view(&server, UUID, PURL).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_project(tmp.path());
+    seed_manifest_with(tmp.path(), PURL, UUID_B);
+
+    let (code, stdout, stderr) = run_get_bin(
+        tmp.path(),
+        &server.uri(),
+        &[UUID, "--mode", "vendored", "--vendor-source", "build"],
+    );
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    assert!(
+        stdout.contains("Updated: 1 (replacing 22222222)"),
+        "the update print must carry the short old uuid; stdout={stdout}"
+    );
+    assert_eq!(manifest_json(tmp.path())["patches"][PURL]["uuid"], UUID);
+    let artifact = tmp
+        .path()
+        .join(".socket/vendor/npm")
+        .join(UUID)
+        .join(format!("{NAME}-1.0.0.tgz"));
+    assert!(artifact.is_file(), "stdout={stdout}\nstderr={stderr}");
+}
+
+/// Human vendored-uuid re-get of an ALREADY-RECORDED uuid: the
+/// `Skipped: 1 (already exists)` print, the manifest untouched, and the
+/// vendor step still runs (and succeeds) over the existing record.
+#[tokio::test]
+async fn human_vendored_uuid_same_uuid_skip_prints_already_exists() {
+    let server = MockServer::start().await;
+    mount_real_view(&server, UUID, PURL).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_project(tmp.path());
+    seed_manifest_with_files(tmp.path(), PURL, UUID, real_files_manifest_json());
+    let manifest_before = std::fs::read_to_string(tmp.path().join(".socket/manifest.json")).unwrap();
+
+    let (code, stdout, stderr) = run_get_bin(
+        tmp.path(),
+        &server.uri(),
+        &[UUID, "--mode", "vendored", "--vendor-source", "build"],
+    );
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    assert!(
+        stdout.contains("Skipped: 1 (already exists)"),
+        "stdout={stdout}"
+    );
+    assert_eq!(
+        manifest_before,
+        std::fs::read_to_string(tmp.path().join(".socket/manifest.json")).unwrap(),
+        "an idempotent re-get must leave the manifest bytes untouched"
+    );
+    let artifact = tmp
+        .path()
+        .join(".socket/vendor/npm")
+        .join(UUID)
+        .join(format!("{NAME}-1.0.0.tgz"));
+    assert!(artifact.is_file(), "stdout={stdout}\nstderr={stderr}");
+}
+
+/// Vendor step returning `Ok(vendor_errors = true)`: a dropped ledger entry
+/// whose ecosystem this build cannot revert is a RECORDED-and-continued
+/// reconcile failure — the run demotes to `partial_failure` (exit 1) while
+/// the selected patch still vendors successfully.
+#[tokio::test]
+async fn vendored_uuid_json_reconcile_revert_failure_demotes_to_partial_failure() {
+    let server = MockServer::start().await;
+    mount_real_view(&server, UUID, PURL).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_project(tmp.path());
+    // A non-detached ledger entry the (about-to-be-written) manifest does
+    // not contain -> reconcile_dropped tries to revert it -> the unknown
+    // ecosystem fails the revert, which is recorded and continued.
+    let dropped_purl = "pkg:covgapeco/gone@1.0.0";
+    let vendor = tmp.path().join(".socket/vendor");
+    std::fs::create_dir_all(&vendor).unwrap();
+    std::fs::write(
+        vendor.join("state.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "version": 1,
+            "entries": { dropped_purl: {
+                "ecosystem": "covgapeco",
+                "basePurl": dropped_purl,
+                "uuid": DROPPED_UUID,
+                "artifact": {
+                    "path": format!(".socket/vendor/covgapeco/{DROPPED_UUID}/gone-1.0.0.tgz"),
+                },
+                "wiring": []
+            }}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) = run_get_bin(
+        tmp.path(),
+        &server.uri(),
+        &[UUID, "--mode", "vendored", "--vendor-source", "build", "--json"],
+    );
+    assert_eq!(code, 1, "stdout={stdout}\nstderr={stderr}");
+    let v = parse_single_json_doc(&stdout);
+    assert_eq!(v["status"], "partial_failure", "stdout={stdout}");
+    assert_eq!(v["vendor"]["status"], "partialFailure", "stdout={stdout}");
+    let events = v["vendor"]["events"]
+        .as_array()
+        .unwrap_or_else(|| panic!("vendor events must be carried; stdout={stdout}"));
+    assert!(
+        events
+            .iter()
+            .any(|e| e["purl"] == dropped_purl && e["errorCode"] == "revert_failed"),
+        "the reconcile failure must be reported; stdout={stdout}"
+    );
+    // The selected patch still vendored despite the reconcile failure.
+    let artifact = tmp
+        .path()
+        .join(".socket/vendor/npm")
+        .join(UUID)
+        .join(format!("{NAME}-1.0.0.tgz"));
+    assert!(artifact.is_file(), "stdout={stdout}\nstderr={stderr}");
+}

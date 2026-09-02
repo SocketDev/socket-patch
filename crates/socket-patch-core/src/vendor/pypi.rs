@@ -4226,4 +4226,361 @@ wheels = [
             (true, "a-b".to_string())
         );
     }
+
+    // ───────── splice-flavor orchestrator arms + wired-pin edge shapes ─────────
+
+    /// The pipenv wired-pin reader skips (rather than trips over) malformed
+    /// lock shapes: a non-object category section, a file ref outside OUR
+    /// uuid dir, a hashes array with no `sha256:` entry, and a truncated
+    /// sha256 all yield no pin — the rebuild guard then stays off rather
+    /// than guessing — and none of them may mask a valid pin elsewhere.
+    #[test]
+    fn pipenv_wired_pin_skips_malformed_sections_and_entries() {
+        let dir_rel = format!(".socket/vendor/pypi/{UUID}");
+        let rel_wheel = format!("{dir_rel}/six-1.16.0-py2.py3-none-any.whl");
+        let all_bad = serde_json::json!({
+            "_meta": {"hash": {"sha256": "x"}},
+            // A top-level value that is not an object is skipped whole.
+            "pipfile-spec": 6,
+            "default": {
+                // A wheel ref pointing outside our uuid dir pins nothing.
+                "other": {
+                    "file": "./vendor/elsewhere/other-1.0-py3-none-any.whl",
+                    "hashes": [format!("sha256:{}", "c".repeat(64))]
+                },
+                // Our wheel, but no sha256 entry among the hashes.
+                "nosha": {
+                    "file": format!("./{rel_wheel}"),
+                    "hashes": ["md5:0123456789abcdef0123456789abcdef"]
+                },
+                // Our wheel, but a truncated sha256 cannot be a pin.
+                "shortsha": {
+                    "file": format!("./{rel_wheel}"),
+                    "hashes": [format!("sha256:{}", "a".repeat(10))]
+                }
+            }
+        });
+        assert_eq!(pipenv_wired_pin(&all_bad, &dir_rel), None);
+
+        // The same malformed neighbors must not mask a valid pin elsewhere.
+        let sha = "b".repeat(64);
+        let mut with_good = all_bad.clone();
+        with_good["develop"] = serde_json::json!({
+            "six": {
+                "file": format!("./{rel_wheel}"),
+                "hashes": [format!("sha256:{sha}")]
+            }
+        });
+        assert_eq!(
+            pipenv_wired_pin(&with_good, &dir_rel),
+            Some((rel_wheel, sha))
+        );
+    }
+
+    /// Splice-flavor lock load failures surface through the orchestrator as
+    /// refusals (the poetry/pdm/pipenv load-Err plan arms), leaving the tree
+    /// byte-untouched — the uv mirror is
+    /// `uv_lock_parse_failure_refuses_through_orchestrator`.
+    #[tokio::test]
+    async fn splice_flavor_lock_parse_failure_refuses_through_orchestrator() {
+        let cases = [
+            (
+                "poetry.lock",
+                "version = [broken\n",
+                "pypi_poetry_lock_parse_failed",
+            ),
+            ("pdm.lock", "version = [broken\n", "pypi_pdm_lock_parse_failed"),
+            ("Pipfile.lock", "{ not json", "pypi_pipenv_lock_parse_failed"),
+        ];
+        for (lock_file, broken, expected_code) in cases {
+            let fx = e2e_fixture().await;
+            swap_to_lock_flavor(&fx, &[(lock_file, broken)]).await;
+            let sources = PatchSources::blobs_only(&fx.blobs);
+            let outcome = vendor_six(&fx, &sources, None).await;
+            let VendorOutcome::Refused { code, .. } = outcome else {
+                panic!("{lock_file}: expected Refused, got {outcome:?}");
+            };
+            assert_eq!(code, expected_code, "{lock_file}");
+            assert!(
+                !fx.root.join(".socket").exists(),
+                "{lock_file}: a load refusal must leave the tree byte-untouched"
+            );
+        }
+    }
+
+    /// The splice-flavor mirror of
+    /// `uv_stale_uuid_vendor_refuses_through_orchestrator`: a lock already
+    /// wired to an EARLIER patch uuid refuses through the orchestrator (the
+    /// poetry/pdm/pipenv guard-Err plan arms), before any new uuid dir is
+    /// created, naming the stale uuid and the revert remediation.
+    #[tokio::test]
+    async fn splice_flavor_stale_uuid_vendor_refuses_through_orchestrator() {
+        const UUID2: &str = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
+        let cases = [
+            (
+                "poetry.lock",
+                POETRY_LOCK_REGISTRY,
+                "pypi_poetry_source_already_exists",
+            ),
+            ("pdm.lock", PDM_LOCK_REGISTRY, "pypi_pdm_source_already_exists"),
+            (
+                "Pipfile.lock",
+                PIPENV_LOCK_REGISTRY,
+                "pypi_pipenv_source_already_exists",
+            ),
+        ];
+        for (lock_file, lock_text, expected_code) in cases {
+            let fx = e2e_fixture().await;
+            swap_to_lock_flavor(&fx, &[(lock_file, lock_text)]).await;
+            let sources = PatchSources::blobs_only(&fx.blobs);
+            let VendorOutcome::Done { result, .. } = vendor_six(&fx, &sources, None).await
+            else {
+                panic!("{lock_file}: first vendor must be Done");
+            };
+            assert!(result.success, "{lock_file}: {:?}", result.error);
+            let wired = tokio::fs::read(fx.root.join(lock_file)).await.unwrap();
+
+            // Same package, new patch generation (different uuid).
+            let mut record2 = fx.record.clone();
+            record2.uuid = UUID2.to_string();
+            let outcome = vendor_pypi(
+                "pkg:pypi/six@1.16.0",
+                &fx.site_packages,
+                &fx.root,
+                &record2,
+                &sources,
+                "2026-06-09T00:00:00Z",
+                false,
+                false,
+                None,
+            )
+            .await;
+            let VendorOutcome::Refused { code, detail } = outcome else {
+                panic!("{lock_file}: expected Refused, got {outcome:?}");
+            };
+            assert_eq!(code, expected_code, "{lock_file}");
+            assert!(detail.contains(UUID), "{lock_file}: {detail}");
+            assert!(detail.contains("vendor --revert"), "{lock_file}: {detail}");
+            // Pre-flight refusal: the wired lock untouched, no second uuid dir.
+            assert_eq!(
+                tokio::fs::read(fx.root.join(lock_file)).await.unwrap(),
+                wired,
+                "{lock_file}: a pre-flight refusal must leave the wired lock untouched"
+            );
+            assert!(
+                !fx.root
+                    .join(format!(".socket/vendor/pypi/{UUID2}"))
+                    .exists(),
+                "{lock_file}: no second uuid dir may appear"
+            );
+        }
+    }
+
+    /// The splice-flavor mirror of `requirements_revendor_is_in_sync_skip`
+    /// (the poetry/pdm/pipenv InSync plan arms): re-running vendor on a
+    /// wired lock is the in-sync skip (nothing recorded, lock
+    /// byte-identical), and a deleted uuid dir takes the artifact-only
+    /// rebuild guarded by the pin the WIRED LOCK still carries — no ledger
+    /// is ever persisted here, so the guard runs off the lock's own pin,
+    /// which the deterministic local build reproduces byte-for-byte.
+    #[tokio::test]
+    async fn splice_flavor_revendor_in_sync_skip_and_ledgerless_rebuild() {
+        let cases = [
+            ("poetry.lock", POETRY_LOCK_REGISTRY),
+            ("pdm.lock", PDM_LOCK_REGISTRY),
+            ("Pipfile.lock", PIPENV_LOCK_REGISTRY),
+        ];
+        for (lock_file, lock_text) in cases {
+            let fx = e2e_fixture().await;
+            swap_to_lock_flavor(&fx, &[(lock_file, lock_text)]).await;
+            let sources = PatchSources::blobs_only(&fx.blobs);
+            let VendorOutcome::Done { result, entry, .. } =
+                vendor_six(&fx, &sources, None).await
+            else {
+                panic!("{lock_file}: first vendor must be Done");
+            };
+            assert!(result.success, "{lock_file}: {:?}", result.error);
+            let entry = entry.expect("entry on success");
+            let wired = tokio::fs::read(fx.root.join(lock_file)).await.unwrap();
+
+            // Intact wheel: in-sync skip — nothing recorded, lock untouched.
+            let VendorOutcome::Done {
+                result: r2,
+                entry: e2,
+                warnings: w2,
+            } = vendor_six(&fx, &sources, None).await
+            else {
+                panic!("{lock_file}: re-run must be Done");
+            };
+            assert!(r2.success, "{lock_file}: {:?}", r2.error);
+            assert!(e2.is_none(), "{lock_file}: in-sync re-run records nothing");
+            assert!(
+                !w2.iter().any(|w| w.code == "vendor_artifact_rebuilt"),
+                "{lock_file}: intact wheel must not claim a rebuild: {w2:?}"
+            );
+            assert_eq!(
+                tokio::fs::read(fx.root.join(lock_file)).await.unwrap(),
+                wired,
+                "{lock_file}: the in-sync skip must not touch the lock"
+            );
+
+            // Deleted uuid dir: artifact-only rebuild, pin-checked against
+            // the wired lock itself (no state.json exists in this fixture).
+            tokio::fs::remove_dir_all(uuid_dir_of(&fx)).await.unwrap();
+            let VendorOutcome::Done {
+                result: r3,
+                entry: e3,
+                warnings: w3,
+            } = vendor_six(&fx, &sources, None).await
+            else {
+                panic!("{lock_file}: rebuild run must be Done");
+            };
+            assert!(r3.success, "{lock_file}: {:?}", r3.error);
+            assert!(
+                e3.is_none(),
+                "{lock_file}: artifact-only rebuild records no entry"
+            );
+            assert!(
+                w3.iter().any(|w| w.code == "vendor_artifact_rebuilt"),
+                "{lock_file}: {w3:?}"
+            );
+            let rebuilt = tokio::fs::read(fx.root.join(&entry.artifact.path))
+                .await
+                .unwrap_or_else(|e| panic!("{lock_file}: rebuilt wheel must exist: {e}"));
+            assert_eq!(
+                hex::encode(sha2::Sha256::digest(&rebuilt)),
+                entry.artifact.sha256,
+                "{lock_file}: the rebuild must reproduce the sha256 the lock still pins"
+            );
+            assert_eq!(
+                tokio::fs::read(fx.root.join(lock_file)).await.unwrap(),
+                wired,
+                "{lock_file}: rebuild must not touch the lock"
+            );
+        }
+    }
+
+    /// A CORRUPT state.json (vs the MISSING one of the ledgerless tests) on
+    /// an in-sync rebuild must not silently drop the pin guard: `load_state`
+    /// fails, the guard falls back to the pin the wired requirements line
+    /// still carries, and a mismatched service wheel is rejected under
+    /// `auto` in favor of the deterministic local build that reproduces it.
+    #[tokio::test]
+    async fn in_sync_rebuild_with_corrupt_ledger_falls_back_to_wired_pin() {
+        let fx = e2e_fixture().await;
+        let sources = PatchSources::blobs_only(&fx.blobs);
+        let VendorOutcome::Done { result, entry, .. } = vendor_six(&fx, &sources, None).await
+        else {
+            panic!("first vendor must be Done");
+        };
+        assert!(result.success, "{:?}", result.error);
+        let entry = entry.expect("entry on success");
+        // The committed ledger got clobbered into garbage.
+        tokio::fs::write(
+            fx.root.join(crate::vendor::state::VENDOR_STATE_REL),
+            b"{ not json",
+        )
+        .await
+        .unwrap();
+        tokio::fs::remove_dir_all(uuid_dir_of(&fx)).await.unwrap();
+
+        // The service offers a wheel whose bytes do NOT match the wired pin.
+        let bytes = b"service-built wheel bytes that differ from the local build";
+        let sri = sri_sha512(bytes);
+        let server = wiremock::MockServer::start().await;
+        mount_pypi_granted(&server, WHEEL_NAME, &sri, bytes).await;
+
+        let outcome = vendor_six(
+            &fx,
+            &sources,
+            Some(&pypi_service_cfg(&server.uri(), VendorSource::Auto, false)),
+        )
+        .await;
+        let VendorOutcome::Done {
+            result,
+            entry: e2,
+            warnings,
+        } = outcome
+        else {
+            panic!("rebuild run must be Done, got {outcome:?}");
+        };
+        assert!(result.success, "{:?}", result.error);
+        assert!(e2.is_none(), "artifact-only rebuild records no entry");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.code == "vendor_prebuilt_pin_mismatch"),
+            "the pin must survive a corrupt ledger via the wired line: {warnings:?}"
+        );
+        let on_disk = tokio::fs::read(fx.root.join(&entry.artifact.path))
+            .await
+            .expect("the pinned wheel path must exist again");
+        assert_eq!(
+            hex::encode(sha2::Sha256::digest(&on_disk)),
+            entry.artifact.sha256,
+            "the rebuilt wheel must reproduce the sha256 the wired line still pins"
+        );
+    }
+
+    /// The guard's last resort: an in-sync poetry rebuild with NO ledger AND
+    /// a wired lock whose one-line files hash element was hand-stripped has
+    /// no pin to check against — the deterministic local rebuild proceeds
+    /// unguarded (the documented "only when the wired file yields no pin
+    /// either" case) instead of refusing an unrecoverable state, and the
+    /// hand-edited lock stays untouched.
+    #[tokio::test]
+    async fn in_sync_rebuild_with_no_ledger_and_no_wired_pin_rebuilds_unguarded() {
+        let fx = e2e_fixture().await;
+        swap_to_lock_flavor(&fx, &[("poetry.lock", POETRY_LOCK_REGISTRY)]).await;
+        let sources = PatchSources::blobs_only(&fx.blobs);
+        let VendorOutcome::Done { result, entry, .. } = vendor_six(&fx, &sources, None).await
+        else {
+            panic!("first vendor must be Done");
+        };
+        assert!(result.success, "{:?}", result.error);
+        let entry = entry.expect("entry on success");
+
+        // Hand-strip the files hash line(s) vendor wrote; the
+        // [package.source] url still routes six through the uuid dir, so
+        // the project stays in-sync — but the lock now yields no pin.
+        let wired = tokio::fs::read_to_string(fx.root.join("poetry.lock"))
+            .await
+            .unwrap();
+        let stripped: String = wired
+            .lines()
+            .filter(|l| !l.contains("hash = \"sha256:"))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        assert_ne!(stripped, wired, "the tamper must remove a hash line");
+        tokio::fs::write(fx.root.join("poetry.lock"), &stripped)
+            .await
+            .unwrap();
+        tokio::fs::remove_dir_all(uuid_dir_of(&fx)).await.unwrap();
+
+        let VendorOutcome::Done {
+            result: r2,
+            entry: e2,
+            warnings,
+        } = vendor_six(&fx, &sources, None).await
+        else {
+            panic!("rebuild run must be Done");
+        };
+        assert!(r2.success, "{:?}", r2.error);
+        assert!(e2.is_none(), "artifact-only rebuild records no entry");
+        assert!(
+            warnings.iter().any(|w| w.code == "vendor_artifact_rebuilt"),
+            "{warnings:?}"
+        );
+        assert!(
+            fx.root.join(&entry.artifact.path).is_file(),
+            "the wheel is rebuilt at the recorded path"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(fx.root.join("poetry.lock"))
+                .await
+                .unwrap(),
+            stripped,
+            "the hand-stripped lock is left alone"
+        );
+    }
 }

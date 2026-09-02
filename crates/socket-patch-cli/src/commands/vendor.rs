@@ -2272,6 +2272,57 @@ mod gc_tests {
         );
     }
 
+    /// A MISSING manifest skips pass (a) entirely — a prune must not
+    /// mass-revert every ledger entry as "dropped" just because the
+    /// manifest file is gone (that is `vendor --revert`'s explicit
+    /// contract) — while pass (b) still runs: a lockfile-unused entry is
+    /// reclaimed, its manifest half is skipped (nothing to edit), and no
+    /// manifest file is invented; a still-wired entry is kept untouched.
+    #[tokio::test]
+    async fn vendor_gc_missing_manifest_skips_pass_a_but_b_still_runs() {
+        // Still wired: with no manifest, NOTHING may be reclaimed — a
+        // regression that treats a missing manifest as an empty one would
+        // land the entry in dropped_reverted.
+        let (tmp, common, manifest_path) = gc_fixture(false).await;
+        tokio::fs::remove_file(&manifest_path).await.unwrap();
+        let out = run_vendor_gc(&common, &manifest_path, false).await;
+        assert!(
+            out.dropped_reverted.is_empty(),
+            "no manifest must not read as every-patch-dropped: {out:?}"
+        );
+        assert!(out.unused_reverted.is_empty(), "{out:?}");
+        assert!(out.failed.is_empty(), "{out:?}");
+        assert!(load_state(tmp.path())
+            .await
+            .unwrap()
+            .entries
+            .contains_key(PURL));
+
+        // Dependency gone from the lock graph: (b) reclaims the entry even
+        // with no manifest, and invents no manifest file for its manifest
+        // half.
+        let (tmp, common, manifest_path) = gc_fixture(false).await;
+        tokio::fs::remove_file(&manifest_path).await.unwrap();
+        tokio::fs::write(tmp.path().join("package-lock.json"), "{\"packages\":{}}")
+            .await
+            .unwrap();
+        let out = run_vendor_gc(&common, &manifest_path, false).await;
+        assert!(out.dropped_reverted.is_empty(), "{out:?}");
+        assert_eq!(out.unused_reverted, vec![PURL.to_string()], "{out:?}");
+        assert!(out.failed.is_empty(), "{out:?}");
+        assert!(load_state(tmp.path()).await.unwrap().entries.is_empty());
+        assert!(
+            !tmp.path()
+                .join(format!(".socket/vendor/npm/{UUID}"))
+                .exists(),
+            "the unused entry's artifacts are reclaimed"
+        );
+        assert!(
+            !manifest_path.exists(),
+            "the GC must not invent a manifest file"
+        );
+    }
+
     /// Dry run lists without mutating anything.
     #[tokio::test]
     async fn vendor_gc_dry_run_is_read_only() {
@@ -3165,6 +3216,54 @@ mod persist_tests {
         assert!(
             root.join(format!(".socket/vendor/npm/{UUID_A}")).exists(),
             "the sweep only reclaims the REPLACED entry's dir, never unrelated ones"
+        );
+    }
+
+    /// The stale-uuid sweep's dry-run guard: a dry-run caller must NEVER
+    /// delete the replaced uuid's dir, while the `Removed` event still
+    /// records (as the preview of what a wet run would reclaim). Today's
+    /// backends return no entry on dry runs, so this pins the helper's own
+    /// contract against a future caller that does.
+    #[tokio::test]
+    async fn stale_uuid_sweep_dry_run_keeps_the_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        mk_uuid_dir(root, UUID_A).await;
+        let common = GlobalArgs {
+            cwd: root.to_path_buf(),
+            json: true,
+            silent: true,
+            dry_run: true,
+            ..GlobalArgs::default()
+        };
+        let record = empty_record();
+        let mut state = VendorState::default();
+        state
+            .entries
+            .insert(PURL_ONE.to_string(), npm_entry(PURL_ONE, UUID_A));
+
+        let mut env = Envelope::new(Command::Vendor);
+        let has_errors = persist_vendor_entry(
+            &common,
+            &mut env,
+            &mut state,
+            PURL_ONE,
+            npm_entry(PURL_ONE, UUID_B),
+            false,
+            &record,
+        )
+        .await;
+        assert!(!has_errors, "save must succeed: {:?}", env.events);
+        assert!(
+            root.join(format!(".socket/vendor/npm/{UUID_A}")).exists(),
+            "a dry run must not delete the replaced uuid's dir"
+        );
+        assert!(
+            env.events
+                .iter()
+                .any(|e| e.error_code.as_deref() == Some("vendor_stale_artifact_removed")),
+            "the would-be removal is still previewed as an event: {:?}",
+            env.events
         );
     }
 }

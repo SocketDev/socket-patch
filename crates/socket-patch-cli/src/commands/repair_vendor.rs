@@ -1498,6 +1498,26 @@ mod tests {
         );
     }
 
+    /// [`remove_vendor_dir`] is a best-effort guard that must never GUESS a
+    /// path: an eco/uuid pair that cannot map to a canonical vendor dir
+    /// (unknown ecosystem dir, non-canonical uuid) removes NOTHING, while
+    /// the mappable pair removes exactly its uuid dir.
+    #[tokio::test]
+    async fn remove_vendor_dir_refuses_unmappable_eco_or_uuid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let uuid = "11111111-1111-4111-8111-111111111111";
+        let dir = tmp.path().join(format!(".socket/vendor/npm/{uuid}"));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("x.tgz"), b"bytes").await.unwrap();
+
+        remove_vendor_dir(tmp.path(), "jsr", uuid).await;
+        assert!(dir.is_dir(), "an unmappable ecosystem must remove nothing");
+        remove_vendor_dir(tmp.path(), "npm", "not-a-uuid").await;
+        assert!(dir.is_dir(), "a non-canonical uuid must remove nothing");
+        remove_vendor_dir(tmp.path(), "npm", uuid).await;
+        assert!(!dir.exists(), "the canonical pair removes its uuid dir");
+    }
+
     /// The empty-component rejects: a purl with no name or no version can
     /// never drive a registry fetch — `npm_coords` must return `None`, not
     /// empty coordinates.

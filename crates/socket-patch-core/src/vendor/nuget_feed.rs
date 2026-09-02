@@ -4403,4 +4403,177 @@ mod tests {
             "lock bytes untouched"
         );
     }
+
+    // ── covgap 2026-09 mop-up: remaining prod arms ───────────────────────────
+
+    /// `attr_value` scanning edges: a substring hit on the attribute NAME
+    /// (`keyring`) and a malformed unquoted value both advance the scan to the
+    /// next occurrence instead of aborting the harvest, and a config with no
+    /// properly quoted attribute at all terminates with `None`.
+    #[test]
+    fn attr_value_skips_name_lookalikes_and_unquoted_values() {
+        // "keyring" contains "key" but is not the attribute: the real quoted
+        // `key` later in the element must still be harvested.
+        assert_eq!(
+            attr_value(" keyring=\"x\" key=\"real\" /", "key").as_deref(),
+            Some("real")
+        );
+        // An unquoted value (malformed XML NuGet would reject anyway) is not
+        // harvested; the scan moves on to the next, properly quoted match.
+        assert_eq!(
+            attr_value("key=bare key='q2'", "key").as_deref(),
+            Some("q2")
+        );
+        // Lookalikes only ("keyring", "monkeys") and no quoted value → None,
+        // not an infinite loop.
+        assert_eq!(attr_value("keyring monkeys", "key"), None);
+    }
+
+    /// Tier A (service prebuilt) write failure: the served bytes cannot land
+    /// because a regular FILE squats the uuid dir path → the hard
+    /// `vendor_prebuilt_write_failed` refusal, before any wiring. On this
+    /// fresh (unwired) path the cleanup attempt runs; the squatter itself
+    /// survives it (remove_tree removes trees, not files — same husk behavior
+    /// as the local-rebuild squat test above).
+    #[tokio::test]
+    async fn service_prebuilt_write_failure_refuses_before_wiring() {
+        use crate::api::client::{ApiClient, ApiClientOptions};
+        use crate::vendor::npm_pack::PackedTarball;
+        use crate::vendor::VendorSource;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let (dir, blobs, installed, record) = fixture(false, None).await;
+        let root = dir.path();
+        let parent = root.join(".socket/vendor/nuget");
+        tokio::fs::create_dir_all(&parent).await.unwrap();
+        tokio::fs::write(parent.join(UUID), b"squatter").await.unwrap();
+
+        let server = MockServer::start().await;
+        let served = make_nupkg(PATCHED);
+        let sri = PackedTarball::from_bytes(&served).integrity;
+        let serve_path =
+            "/patch/nuget/newtonsoft.json/13.0.3/tok/uuid/newtonsoft.json.13.0.3.nupkg";
+        let serve_url = format!("{}{serve_path}", server.uri());
+        Mock::given(method("POST"))
+            .and(path("/v0/orgs/acme/patches/package"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": { UUID: {
+                    "status": "granted",
+                    "url": serve_url,
+                    "artifacts": [{ "kind": "tarball", "url": serve_url,
+                                    "integrity": { "sha512": sri } }]
+                }}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(serve_path))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(served.clone()))
+            .mount(&server)
+            .await;
+        let cfg = VendorServiceConfig {
+            source: VendorSource::Service,
+            client: Some(ApiClient::new(ApiClientOptions {
+                api_url: server.uri(),
+                api_token: Some("sktsec_placeholder_value_for_tests_api".into()),
+                use_public_proxy: false,
+                org_slug: Some("acme".into()),
+            })),
+            use_public_proxy: false,
+            vendor_url: None,
+            patch_server_url: None,
+            offline: false,
+        };
+
+        let sources = PatchSources::blobs_only(&blobs);
+        let outcome = vendor_nuget(
+            PURL,
+            &installed,
+            root,
+            &record,
+            &sources,
+            "t",
+            false,
+            false,
+            Some(&cfg),
+        )
+        .await;
+        let (code, detail) = unwrap_refused(outcome);
+        assert_eq!(code, "vendor_prebuilt_write_failed");
+        assert!(detail.contains("cannot create"), "{detail}");
+        assert!(
+            !root.join("nuget.config").exists(),
+            "the refusal precedes all wiring"
+        );
+        assert!(
+            parent.join(UUID).is_file(),
+            "the squatting file survives the cleanup attempt"
+        );
+    }
+
+    /// The surgical-excise revert path with a failing write: the live config
+    /// drifted from `w.new` but still carries our authored `<add>` line, and
+    /// a read-only project root blocks the atomic rewrite — the I/O error
+    /// must surface naming the config, and the live bytes stay untouched.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn excise_write_failure_names_the_config() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let uuid_dir_rel = format!(".socket/vendor/nuget/{UUID}");
+        let key = source_key();
+        let source_add = format!("    <add key=\"{key}\" value=\"{uuid_dir_rel}\" />\n");
+        let live = format!(
+            "<?xml version=\"1.0\"?>\n<configuration>\n  <packageSources>\n{source_add}  \
+             </packageSources>\n  <!-- hand edit after vendoring -->\n</configuration>\n"
+        );
+        tokio::fs::write(root.join("nuget.config"), &live)
+            .await
+            .unwrap();
+        let w = WiringRecord {
+            file: "nuget.config".to_string(),
+            kind: CONFIG_SOURCE_WIRING_KIND.to_string(),
+            action: WiringAction::Rewritten,
+            key: Some(key),
+            original: Some(Value::String(
+                "<configuration></configuration>\n".to_string(),
+            )),
+            new: Some(Value::String(
+                "what vendor wrote (the live file has drifted since)".to_string(),
+            )),
+        };
+
+        // A read-only project root blocks the excise rewrite's atomic stage
+        // file. Skip when the environment ignores modes (running as root).
+        tokio::fs::set_permissions(root, std::fs::Permissions::from_mode(0o555))
+            .await
+            .unwrap();
+        if std::fs::write(root.join(".probe"), b"x").is_ok() {
+            let _ = std::fs::remove_file(root.join(".probe"));
+            tokio::fs::set_permissions(root, std::fs::Permissions::from_mode(0o755))
+                .await
+                .unwrap();
+            return; // modes ignored (running as root) — nothing to test
+        }
+        let res = revert_config_record(root, &uuid_dir_rel, &w, false).await;
+        tokio::fs::set_permissions(root, std::fs::Permissions::from_mode(0o755))
+            .await
+            .unwrap();
+
+        let err = res.expect_err("the excise write failure must surface");
+        assert!(
+            err.contains("failed to excise the vendored source from"),
+            "{err}"
+        );
+        assert!(err.contains("nuget.config"), "{err}");
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("nuget.config"))
+                .await
+                .unwrap(),
+            live,
+            "the drifted live config is untouched after the failed write"
+        );
+    }
 }

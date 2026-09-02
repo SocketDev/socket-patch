@@ -223,6 +223,44 @@ fn readonly_dir_enforced(dir: &Path) -> bool {
     true
 }
 
+/// Spawn the binary WITHOUT waiting (the lock-choreography tests mutate
+/// the fixture while the child is blocked on the apply lock), with the
+/// exact same seed-then-scrub environment as `common::run`.
+fn spawn_scrubbed(cwd: &Path, args: &[&str]) -> std::process::Child {
+    let mut cmd = std::process::Command::new(common::binary());
+    cmd.args(args).current_dir(cwd);
+    cmd.env("SOCKET_GLOBAL", "true")
+        .env("SOCKET_GLOBAL_PREFIX", "/nonexistent")
+        .env("SOCKET_DRY_RUN", "true")
+        .env("SOCKET_MANIFEST_PATH", "/nonexistent/manifest.json")
+        .env("SOCKET_JSON", "true")
+        .env("SOCKET_SILENT", "true")
+        .env("SOCKET_VERBOSE", "true")
+        .env_remove("SOCKET_GLOBAL")
+        .env_remove("SOCKET_GLOBAL_PREFIX")
+        .env_remove("SOCKET_DRY_RUN")
+        .env_remove("SOCKET_MANIFEST_PATH")
+        .env_remove("SOCKET_JSON")
+        .env_remove("SOCKET_SILENT")
+        .env_remove("SOCKET_VERBOSE")
+        .env_remove("SOCKET_API_TOKEN");
+    for (key, _) in std::env::vars_os() {
+        let name = key.to_string_lossy();
+        if name.starts_with("SOCKET_")
+            && !name.contains("TELEMETRY")
+            && name != "SOCKET_NO_CONFIG"
+            && name != "SOCKET_NO_UPDATE_CHECK"
+        {
+            cmd.env_remove(&key);
+        }
+    }
+    cmd.env("SOCKET_NO_CONFIG", "1");
+    cmd.env("SOCKET_NO_UPDATE_CHECK", "1");
+    cmd.stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    cmd.spawn().expect("spawn socket-patch binary")
+}
+
 // ═══════════════════════ 1. human-mode output pass ════════════════════════
 
 /// The HUMAN dry-run summary (`--dry-run` with no `--json`): the
@@ -2161,4 +2199,916 @@ mod interactive {
             "a declined rollback must leave the manifest byte-identical"
         );
     }
+}
+
+// ══════════════════ 7. mop-up: remaining uncovered arms ════════════════════
+
+/// JSON dry-run of the vendored leg: the human preview print is skipped
+/// (the mode gate's false branch) while the envelope still previews the
+/// revert — `dryRun: true`, `vendoredReverted` names the key — and lock,
+/// ledger, and artifact are all untouched.
+#[test]
+fn vendored_dry_run_json_previews_without_human_print() {
+    let fx = vendor_fixture();
+    vendor(&fx);
+    let wired_lock = fx.lock_bytes();
+    let state_before = std::fs::read(fx.state_path()).unwrap();
+
+    let (code, stdout, stderr) = run(fx.root(), &["rollback", "--json", "--offline", "--dry-run"]);
+    assert_eq!(
+        code, 0,
+        "the JSON dry run must exit 0; stdout=\n{stdout}\nstderr=\n{stderr}"
+    );
+    let v = parse_envelope(&stdout, &stderr);
+    assert_eq!(v["dryRun"], json!(true), "stdout=\n{stdout}");
+    assert_eq!(
+        v["vendoredReverted"],
+        json!([V_PURL]),
+        "the envelope must preview the revert; stdout=\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("Would revert vendoring"),
+        "--json must mute the human preview line; stdout=\n{stdout}"
+    );
+    assert_eq!(fx.lock_bytes(), wired_lock, "dry run must not touch the lock");
+    assert_eq!(
+        std::fs::read(fx.state_path()).unwrap(),
+        state_before,
+        "dry run must not touch the ledger"
+    );
+    assert!(fx.tgz_path().is_file(), "dry run must keep the artifact");
+}
+
+/// Human twin of `per_purl_revert_failure_lands_in_hosted_failed`: the
+/// failed per-purl npm revert prints the "Failed to unwind hosted
+/// redirect for {purl}: {e}" stderr line (errors print even without
+/// `--json`), exit 1, ledger untouched.
+#[test]
+fn per_purl_revert_failure_prints_human_stderr_line() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    // yarn.lock is a DIRECTORY so the scoped npm revert fails on read;
+    // the second (gem) record keeps the scoped run replay-ineligible.
+    std::fs::create_dir(tmp.path().join("yarn.lock")).unwrap();
+    std::fs::write(
+        tmp.path().join("Gemfile.lock"),
+        gemfile_lock_content(GEM_PATCH_REMOTE),
+    )
+    .unwrap();
+    write_hosted_ledger(
+        tmp.path(),
+        vec![
+            (LP_PURL, hosted_record(LP_UUID)),
+            (GEM_PURL, hosted_record(GEM_UUID)),
+        ],
+        vec![yarn_classic_edit(), gem_source_edit()],
+    );
+    let ledger_before = std::fs::read(ledger_path(tmp.path())).unwrap();
+
+    let (code, stdout, stderr) = run(tmp.path(), &["rollback", "--offline", "--yes", LP_PURL]);
+    assert_eq!(
+        code, 1,
+        "a failed per-purl revert must exit 1; stdout=\n{stdout}\nstderr=\n{stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("Failed to unwind hosted redirect for {LP_PURL}:")),
+        "the human failure line must print on stderr; stderr=\n{stderr}"
+    );
+    assert_eq!(
+        std::fs::read(ledger_path(tmp.path())).unwrap(),
+        ledger_before,
+        "a failed revert must leave the ledger byte-identical"
+    );
+}
+
+/// Dry-run twin of `bun_deferred_purl_unwinds_via_replay`: the bun-lock
+/// edits hard-refuse the per-purl npm revert, so the deferred purl's
+/// PREVIEW routes through the replay's dropped-records probe and prints
+/// "Would unwind hosted redirect for {purl}" — with bun.lock and the
+/// ledger byte-identical afterwards.
+#[test]
+fn bun_deferred_purl_dry_run_previews_via_replay() {
+    let bun_original = r#"    "left-pad": ["left-pad@1.2.3", "", {}, "sha512-UPSTREAMupstream=="],"#;
+    let bun_redirected = format!(r#"    "left-pad": ["{LP_HOSTED_URL}", "", {{}}, "sha512-PATCHEDpatched=="],"#);
+    let bun_lock = |block: &str| {
+        format!("{{\n  \"lockfileVersion\": 1,\n  \"packages\": {{\n{block}\n  }}\n}}\n")
+    };
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(tmp.path().join("bun.lock"), bun_lock(&bun_redirected)).unwrap();
+    write_hosted_ledger(
+        tmp.path(),
+        vec![(LP_PURL, hosted_record(LP_UUID))],
+        vec![FileEdit {
+            path: "bun.lock".to_string(),
+            kind: "redirect_bun_lock_package".to_string(),
+            action: "rewritten".to_string(),
+            key: Some("left-pad".to_string()),
+            original: Some(Value::String(bun_original.to_string())),
+            new: Some(Value::String(bun_redirected.clone())),
+        }],
+    );
+    let ledger_before = std::fs::read(ledger_path(tmp.path())).unwrap();
+
+    let (code, stdout, stderr) = run(tmp.path(), &["rollback", "--offline", "--dry-run"]);
+    assert_eq!(
+        code, 0,
+        "the bun-deferred dry run succeeds; stdout=\n{stdout}\nstderr=\n{stderr}"
+    );
+    assert!(
+        stdout.contains(&format!("Would unwind hosted redirect for {LP_PURL}")),
+        "the deferred purl's dry-run preview line must print; stdout=\n{stdout}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("bun.lock")).unwrap(),
+        bun_lock(&bun_redirected),
+        "dry run must not touch the wired bun.lock"
+    );
+    assert_eq!(
+        std::fs::read(ledger_path(tmp.path())).unwrap(),
+        ledger_before,
+        "dry run must not touch the ledger"
+    );
+}
+
+/// The manifest vanishing while another process holds the apply lock: the
+/// pre-lock existence probe saw the file, but the under-lock read finds
+/// it gone — rollback fails closed with the "Invalid manifest" error
+/// (exit 1) rather than silently treating the run as empty.
+///
+/// Choreography: hold the lock, let the CLI pass its probe and block,
+/// delete the manifest, release. If the CLI was slow enough to probe
+/// AFTER the delete it takes the pre-lock "Manifest not found" path
+/// instead — that alternative is detected and retried with a longer
+/// pre-delete grace (bounded; the first attempt lands in practice).
+#[test]
+fn manifest_deleted_under_held_lock_fails_with_invalid_manifest() {
+    use fs2::FileExt;
+
+    for attempt in 1..=8u64 {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let socket = write_socket_manifest(
+            tmp.path(),
+            &[manifest_entry(
+                "pkg:npm/covgap-toctou@1.0.0",
+                "33333333-3333-4333-8333-333333333333",
+                &git_sha256(b"toctou-original\n"),
+                &git_sha256(b"toctou-patched\n"),
+            )],
+        );
+        let lock_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(socket.join("apply.lock"))
+            .expect("open lock file");
+        lock_file
+            .try_lock_exclusive()
+            .expect("test could not take the initial lock");
+
+        let child = spawn_scrubbed(
+            tmp.path(),
+            &["rollback", "--json", "--offline", "--yes", "--lock-timeout", "30"],
+        );
+        // Grace for the child to pass its (fast) pre-lock probe and block
+        // on the lock; escalates across retries.
+        std::thread::sleep(std::time::Duration::from_millis(200 * attempt));
+        std::fs::remove_file(socket.join("manifest.json")).expect("delete manifest");
+        FileExt::unlock(&lock_file).expect("release the lock");
+
+        let out = child.wait_with_output().expect("wait for socket-patch");
+        let code = out.status.code().unwrap_or(-1);
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        assert_eq!(
+            code, 1,
+            "both interleavings exit 1; stdout=\n{stdout}\nstderr=\n{stderr}"
+        );
+        let v = parse_envelope(&stdout, &stderr);
+        assert_eq!(v["status"], "error", "stdout=\n{stdout}");
+        match v["error"].as_str() {
+            Some("Invalid manifest") => return, // target interleaving reached
+            Some("Manifest not found") => continue, // probed after the delete — retry
+            other => panic!(
+                "unexpected error for the vanished manifest: {other:?}\nstdout=\n{stdout}\nstderr=\n{stderr}"
+            ),
+        }
+    }
+    panic!("the probe-then-delete interleaving never landed in 8 attempts");
+}
+
+/// Human twin of `hosted_persist_failure_lands_in_hosted_failed`: the
+/// wet-run ledger persist failure prints the "Error: failed to persist
+/// the hosted redirect ledger" stderr line, exit 1 — after the replay
+/// already restored the wired file.
+#[cfg(unix)]
+#[test]
+fn hosted_persist_failure_prints_human_error_line() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        tmp.path().join("yarn.lock"),
+        yarn_lock_content(&yarn_redirected_block()),
+    )
+    .unwrap();
+    write_hosted_ledger(tmp.path(), vec![], vec![yarn_classic_edit()]);
+
+    let vendor_dir = tmp.path().join(".socket/vendor");
+    let guard = DirModeGuard::chmod(&vendor_dir, 0o555, 0o755);
+    if !readonly_dir_enforced(&vendor_dir) {
+        return;
+    }
+
+    let (code, stdout, stderr) = run(tmp.path(), &["rollback", "--offline", "--yes"]);
+    guard.restore();
+
+    assert_eq!(
+        code, 1,
+        "a ledger persist failure must exit 1; stdout=\n{stdout}\nstderr=\n{stderr}"
+    );
+    assert!(
+        stderr.contains("Error: failed to persist the hosted redirect ledger"),
+        "the human persist-failure line must print on stderr; stderr=\n{stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("yarn.lock")).unwrap(),
+        yarn_lock_content(&yarn_original_block()),
+        "the replay's file writes land before the persist failure"
+    );
+}
+
+/// Human twin of `manifest_write_failure_warns_and_exits_one`: the failed
+/// manifest update prints the "Error: failed to update the manifest:"
+/// stderr line, exit 1, manifest byte-identical — after the file restore
+/// already landed.
+#[cfg(target_os = "macos")]
+#[test]
+fn manifest_write_failure_prints_human_error_line() {
+    struct ChflagsGuard(PathBuf);
+    impl ChflagsGuard {
+        fn set(path: &Path) -> Self {
+            let status = std::process::Command::new("chflags")
+                .arg("uchg")
+                .arg(path)
+                .status()
+                .expect("run chflags uchg");
+            assert!(status.success(), "chflags uchg must succeed");
+            Self(path.to_path_buf())
+        }
+        fn release(&self) {
+            let _ = std::process::Command::new("chflags")
+                .arg("nouchg")
+                .arg(&self.0)
+                .status();
+        }
+    }
+    impl Drop for ChflagsGuard {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+
+    let fx = patched_fixture();
+    let manifest_path = fx.socket.join("manifest.json");
+    let manifest_before = std::fs::read(&manifest_path).expect("read manifest bytes");
+    let guard = ChflagsGuard::set(&manifest_path);
+
+    let (code, stdout, stderr) = run(fx.root.path(), &["rollback", "--offline", "--yes"]);
+    guard.release();
+
+    assert_eq!(
+        code, 1,
+        "a manifest write failure must exit 1; stdout=\n{stdout}\nstderr=\n{stderr}"
+    );
+    assert!(
+        stderr.contains("Error: failed to update the manifest:"),
+        "the human write-failure line must print on stderr; stderr=\n{stderr}"
+    );
+    // The restore itself DID land...
+    assert_eq!(
+        std::fs::read(fx.pkg_dir.join("index.js")).expect("read restored file"),
+        fx.before,
+        "the file restore happens before the manifest write"
+    );
+    // ...but the manifest is untouched.
+    assert_eq!(
+        std::fs::read(&manifest_path).expect("manifest exists"),
+        manifest_before,
+        "a failed manifest write must leave the file byte-identical"
+    );
+}
+
+/// The dry-run human summary's two conditional lines: "N package(s)
+/// already in original state" and "N package(s) cannot be rolled back" —
+/// one no-op entry plus one drifted entry render both, the can-rollback
+/// count excludes them, and nothing is mutated.
+#[test]
+fn human_dry_run_summary_reports_already_original_and_failed() {
+    let noop_before: &[u8] = b"dryboth-noop-original\n";
+    let noop_purl = "pkg:npm/covgap-dry-noop@1.0.0";
+    let drift_before: &[u8] = b"dryboth-drift-original\n";
+    let drifted: &[u8] = b"dryboth-locally-drifted\n";
+    let drift_purl = "pkg:npm/covgap-dry-drift@1.0.0";
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_root_package_json(tmp.path());
+    // Installed at the BEFORE bytes: verification says already-original.
+    install_npm_pkg(tmp.path(), "node_modules", "covgap-dry-noop", "1.0.0", noop_before);
+    // Installed at DRIFTED bytes: verification says hash-mismatch.
+    let drift_dir = install_npm_pkg(tmp.path(), "node_modules", "covgap-dry-drift", "1.0.0", drifted);
+    let socket = write_socket_manifest(
+        tmp.path(),
+        &[
+            manifest_entry(
+                noop_purl,
+                "88888888-8888-4888-8888-888888888888",
+                &git_sha256(noop_before),
+                &git_sha256(b"dryboth-noop-patched\n"),
+            ),
+            manifest_entry(
+                drift_purl,
+                "99999999-9999-4999-8999-999999999999",
+                &git_sha256(drift_before),
+                &git_sha256(b"dryboth-drift-patched\n"),
+            ),
+        ],
+    );
+    // Both before-blobs staged so the missing-blob gate never downloads:
+    // the statuses under test are already_original and hash_mismatch.
+    stage_blob(&socket, &git_sha256(noop_before), noop_before);
+    stage_blob(&socket, &git_sha256(drift_before), drift_before);
+    let manifest_bytes = std::fs::read(socket.join("manifest.json")).unwrap();
+
+    let (code, stdout, stderr) = run(tmp.path(), &["rollback", "--dry-run", "--offline"]);
+    assert_eq!(
+        code, 1,
+        "the drifted entry cannot roll back, so the preview exits 1; \
+         stdout=\n{stdout}\nstderr=\n{stderr}"
+    );
+    assert!(
+        stdout.contains("Rollback verification complete:"),
+        "the dry-run header must print; stdout=\n{stdout}"
+    );
+    assert!(
+        stdout.contains("0 package(s) can be rolled back"),
+        "a no-op and a failure leave nothing rollback-able; stdout=\n{stdout}"
+    );
+    assert!(
+        stdout.contains("1 package(s) already in original state"),
+        "the already-original summary line must print; stdout=\n{stdout}"
+    );
+    assert!(
+        stdout.contains("1 package(s) cannot be rolled back"),
+        "the cannot-rollback summary line must print; stdout=\n{stdout}"
+    );
+    // Preview, no mutations.
+    assert_eq!(
+        std::fs::read(drift_dir.join("index.js")).unwrap(),
+        drifted,
+        "dry run must not touch the drifted file"
+    );
+    assert_eq!(
+        std::fs::read(socket.join("manifest.json")).unwrap(),
+        manifest_bytes,
+        "dry run must leave the manifest byte-identical"
+    );
+}
+
+/// A DIRECTORY squatting a before-blob's path in `.socket/blobs`: the
+/// dry-run stage's hard-link fails and the copy fallback is attempted
+/// (and swallowed) — the preview still completes because the
+/// already-original file never reads the blob, and the squatter itself is
+/// untouched.
+#[test]
+fn dry_run_blob_stage_survives_directory_squatting_blob_hash() {
+    let before: &[u8] = b"squat-original\n";
+    let before_hash = git_sha256(before);
+    let purl = "pkg:npm/covgap-squat@1.0.0";
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_root_package_json(tmp.path());
+    install_npm_pkg(tmp.path(), "node_modules", "covgap-squat", "1.0.0", before);
+    let socket = write_socket_manifest(
+        tmp.path(),
+        &[manifest_entry(
+            purl,
+            "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+            &before_hash,
+            &git_sha256(b"squat-patched\n"),
+        )],
+    );
+    let squatter = socket.join("blobs").join(&before_hash);
+    std::fs::create_dir_all(&squatter).unwrap();
+    std::fs::write(squatter.join("marker"), b"keep").unwrap();
+
+    let (code, stdout, stderr) = run(tmp.path(), &["rollback", "--dry-run", "--offline"]);
+    assert_eq!(
+        code, 0,
+        "the already-original preview must survive the squatter; \
+         stdout=\n{stdout}\nstderr=\n{stderr}"
+    );
+    assert!(
+        stdout.contains("1 package(s) already in original state"),
+        "the entry must still verify as already original; stdout=\n{stdout}"
+    );
+    assert!(
+        squatter.is_dir() && squatter.join("marker").exists(),
+        "the squatting directory must be untouched by the dry run"
+    );
+}
+
+// ═══════════ 8. mop-up: scope isolation, variant + redirect routing ════════
+
+/// One camelCase manifest patch entry as a JSON value (the string helper
+/// above pins `package/index.js`; these fixtures pick their own file key).
+fn patch_entry_value(uuid: &str, file: &str, before_hash: &str, after_hash: &str) -> Value {
+    json!({
+        "uuid": uuid,
+        "exportedAt": "2026-01-01T00:00:00Z",
+        "files": {
+            file: { "beforeHash": before_hash, "afterHash": after_hash }
+        },
+        "vulnerabilities": {},
+        "description": "synthetic covgap test patch",
+        "license": "MIT",
+        "tier": "free"
+    })
+}
+
+/// An identifier that matches only a MANIFEST entry is still probed
+/// against every vendor-ledger entry — by ledger key AND by the entry's
+/// `base_purl` — and must match neither: the unrelated vendored package
+/// keeps its ledger record, lock wiring, and artifact while the named
+/// in-place patch rolls back and leaves the manifest.
+#[test]
+fn identifier_scope_leaves_unrelated_vendored_entry_untouched() {
+    const IO_PURL: &str = "pkg:npm/is-odd@1.0.0";
+    const IO_UUID: &str = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+    let io_before: &[u8] = b"module.exports = n => n % 2 === 1; // orig\n";
+    let io_patched: &[u8] = b"module.exports = n => Math.abs(n) % 2 === 1; // patched\n";
+
+    let fx = vendor_fixture();
+    vendor(&fx);
+    let wired_lock = fx.lock_bytes();
+    let state_before = std::fs::read(fx.state_path()).expect("read vendor ledger");
+
+    // The in-place patch arrives AFTER vendoring so `vendor` never saw it:
+    // installed at the PATCHED bytes, before-blob staged for the restore.
+    install_npm_pkg(fx.root(), "node_modules", "is-odd", "1.0.0", io_patched);
+    let socket = fx.root().join(".socket");
+    stage_blob(&socket, &git_sha256(io_before), io_before);
+    let mut manifest = fx.manifest_json();
+    manifest["patches"][IO_PURL] = patch_entry_value(
+        IO_UUID,
+        "package/index.js",
+        &git_sha256(io_before),
+        &git_sha256(io_patched),
+    );
+    std::fs::write(
+        socket.join("manifest.json"),
+        serde_json::to_vec_pretty(&manifest).expect("serialize manifest"),
+    )
+    .expect("write manifest");
+
+    let (code, stdout, stderr) = run(
+        fx.root(),
+        &["rollback", "--json", "--yes", "--offline", "--lock-timeout", "5", IO_PURL],
+    );
+    assert_eq!(
+        code, 0,
+        "the identifier-scoped rollback must succeed; stdout=\n{stdout}\nstderr=\n{stderr}"
+    );
+    let v = parse_envelope(&stdout, &stderr);
+    assert_eq!(v["rolledBack"], json!(1), "stdout=\n{stdout}");
+    assert_eq!(
+        v["results"][0]["purl"],
+        json!(IO_PURL),
+        "only the named patch may be acted on; stdout=\n{stdout}"
+    );
+    for leg in ["vendoredReverted", "vendoredPreserved", "vendoredKept", "vendoredFailed"] {
+        assert_eq!(
+            v[leg],
+            json!([]),
+            "the identifier must not leak into the vendored leg ({leg}); stdout=\n{stdout}"
+        );
+    }
+    assert_eq!(
+        v["manifest"]["removedEntries"],
+        json!([IO_PURL]),
+        "only the named entry leaves the manifest; stdout=\n{stdout}"
+    );
+    assert_eq!(
+        std::fs::read(fx.root().join("node_modules/is-odd/index.js")).expect("read restored file"),
+        io_before,
+        "the named patch must be restored in place"
+    );
+    // Every vendored surface survives byte-identically.
+    assert_eq!(fx.lock_bytes(), wired_lock, "the vendored lock wiring must survive");
+    assert_eq!(
+        std::fs::read(fx.state_path()).expect("vendor ledger still present"),
+        state_before,
+        "the vendor ledger must be byte-identical"
+    );
+    assert!(fx.tgz_path().is_file(), "the vendored artifact must survive");
+    let m = fx.manifest_json();
+    assert!(
+        m["patches"].get(V_PURL).is_some(),
+        "the vendored manifest entry must be retained; manifest={m}"
+    );
+    assert!(
+        m["patches"].get(IO_PURL).is_none(),
+        "the rolled-back entry must be removed; manifest={m}"
+    );
+}
+
+/// TWO vendored entries reverted in one run: the manifest-cleanup matcher
+/// walks EVERY reverted ledger key for each vendor-owned purl — the
+/// non-matching sibling key falls through key equality, qualifier
+/// stripping, and the ledger `base_purl` probe — and each entry is still
+/// keyed to ITS OWN revert: both manifest records drop, both artifacts
+/// and ledger entries go, and the lock returns to its pre-vendor bytes.
+#[test]
+fn two_vendored_entries_each_cleanup_via_their_own_revert() {
+    const RP_PURL: &str = "pkg:npm/right-pad@1.0.1";
+    const RP_UUID: &str = "5b8c0d2e-3f4a-4b5c-8d6e-9f0a1b2c3d4e";
+    let rp_orig: &[u8] = b"module.exports = (s, n) => s + ' '.repeat(n); // orig\n";
+    let rp_patched: &[u8] = b"module.exports = (s, n) => s + ' '.repeat(n < 0 ? 0 : n); // patched\n";
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    install_npm_pkg(root, "node_modules", "left-pad", "1.3.0", ORIG_INDEX);
+    install_npm_pkg(root, "node_modules", "right-pad", "1.0.1", rp_orig);
+    std::fs::write(
+        root.join("package.json"),
+        br#"{"name":"fixture","version":"1.0.0","private":true}"#,
+    )
+    .expect("write root package.json");
+    let lock = json!({
+        "name": "fixture",
+        "version": "1.0.0",
+        "lockfileVersion": 3,
+        "requires": true,
+        "packages": {
+            "": {
+                "name": "fixture",
+                "version": "1.0.0",
+                "dependencies": { "left-pad": "^1.3.0", "right-pad": "^1.0.1" }
+            },
+            "node_modules/left-pad": {
+                "version": "1.3.0",
+                "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+                "integrity": "sha512-orig==",
+                "license": "WTFPL"
+            },
+            "node_modules/right-pad": {
+                "version": "1.0.1",
+                "resolved": "https://registry.npmjs.org/right-pad/-/right-pad-1.0.1.tgz",
+                "integrity": "sha512-origrp==",
+                "license": "MIT"
+            }
+        }
+    });
+    let mut original_lock = serde_json::to_vec_pretty(&lock).expect("serialize lock");
+    original_lock.push(b'\n');
+    std::fs::write(root.join("package-lock.json"), &original_lock).expect("write lock");
+
+    let socket = root.join(".socket");
+    std::fs::create_dir_all(&socket).expect("create .socket");
+    let mut patches = serde_json::Map::new();
+    patches.insert(
+        V_PURL.to_string(),
+        patch_entry_value(
+            V_UUID,
+            "package/index.js",
+            &git_sha256(ORIG_INDEX),
+            &git_sha256(PATCHED_INDEX),
+        ),
+    );
+    patches.insert(
+        RP_PURL.to_string(),
+        patch_entry_value(
+            RP_UUID,
+            "package/index.js",
+            &git_sha256(rp_orig),
+            &git_sha256(rp_patched),
+        ),
+    );
+    std::fs::write(
+        socket.join("manifest.json"),
+        serde_json::to_vec_pretty(&json!({ "patches": patches })).expect("serialize manifest"),
+    )
+    .expect("write manifest");
+    // After-hash blobs are the offline vendor source for both packages.
+    stage_blob(&socket, &git_sha256(PATCHED_INDEX), PATCHED_INDEX);
+    stage_blob(&socket, &git_sha256(rp_patched), rp_patched);
+
+    let (code, stdout, stderr) = run(
+        root,
+        &["vendor", "--json", "--silent", "--offline", "--lock-timeout", "5"],
+    );
+    assert_eq!(
+        code, 0,
+        "fixture vendor of both packages must succeed; stdout=\n{stdout}\nstderr=\n{stderr}"
+    );
+    let lp_tgz = root.join(format!(".socket/vendor/npm/{V_UUID}/left-pad-1.3.0.tgz"));
+    let rp_tgz = root.join(format!(".socket/vendor/npm/{RP_UUID}/right-pad-1.0.1.tgz"));
+    assert!(lp_tgz.is_file() && rp_tgz.is_file(), "sanity: both artifacts written");
+
+    let (code, stdout, stderr) = run(
+        root,
+        &["rollback", "--json", "--yes", "--offline", "--lock-timeout", "5"],
+    );
+    assert_eq!(
+        code, 0,
+        "the two-entry revert must succeed; stdout=\n{stdout}\nstderr=\n{stderr}"
+    );
+    let v = parse_envelope(&stdout, &stderr);
+    let mut reverted: Vec<String> = v["vendoredReverted"]
+        .as_array()
+        .expect("vendoredReverted array")
+        .iter()
+        .map(|p| p.as_str().expect("purl string").to_string())
+        .collect();
+    reverted.sort();
+    assert_eq!(
+        reverted,
+        vec![V_PURL.to_string(), RP_PURL.to_string()],
+        "both entries must revert; stdout=\n{stdout}"
+    );
+    let mut removed: Vec<String> = v["manifest"]["removedEntries"]
+        .as_array()
+        .expect("removedEntries array")
+        .iter()
+        .map(|p| p.as_str().expect("purl string").to_string())
+        .collect();
+    removed.sort();
+    assert_eq!(
+        removed,
+        vec![V_PURL.to_string(), RP_PURL.to_string()],
+        "each manifest entry must be keyed to its own revert; stdout=\n{stdout}"
+    );
+    let m: Value = serde_json::from_slice(
+        &std::fs::read(socket.join("manifest.json")).expect("read manifest"),
+    )
+    .expect("manifest is JSON");
+    assert_eq!(
+        m["patches"],
+        json!({}),
+        "no manifest entry may survive its own clean revert; manifest={m}"
+    );
+    assert!(
+        !lp_tgz.exists() && !rp_tgz.exists(),
+        "both artifacts must be deleted"
+    );
+    let state_path = root.join(".socket/vendor/state.json");
+    if state_path.exists() {
+        let state: Value = serde_json::from_slice(
+            &std::fs::read(&state_path).expect("read vendor ledger"),
+        )
+        .expect("ledger is JSON");
+        assert_eq!(
+            state["entries"],
+            json!({}),
+            "no ledger entry may survive; state={state}"
+        );
+    }
+    assert_eq!(
+        std::fs::read(root.join("package-lock.json")).expect("read lock"),
+        original_lock,
+        "the lock must return to its pre-vendor bytes"
+    );
+}
+
+/// PyPI release-variant fallback when NO variant matches the installed
+/// distribution (a locally-modified file): rollback attempts EVERY
+/// variant instead of silently skipping the package, so the per-file
+/// verification surfaces the drift — both qualified purls land in
+/// `results` as hash-mismatch failures, exit 1, the file keeps its
+/// drifted bytes, and the manifest keeps both entries.
+#[test]
+fn pypi_variant_group_with_no_installed_match_attempts_every_variant() {
+    const WHEEL: &str = "pkg:pypi/covgapkit@1.0.0?artifact_id=covgapkit-1.0.0-py3-none-any.whl";
+    const SDIST: &str = "pkg:pypi/covgapkit@1.0.0?artifact_id=covgapkit-1.0.0.tar.gz";
+    let drifted: &[u8] = b"VERSION = 'locally-drifted'\n";
+    let wheel_before: &[u8] = b"VERSION = 'wheel-original'\n";
+    let wheel_after: &[u8] = b"VERSION = 'wheel-patched'\n";
+    let sdist_before: &[u8] = b"VERSION = 'sdist-original'\n";
+    let sdist_after: &[u8] = b"VERSION = 'sdist-patched'\n";
+
+    // Hand-built venv layout (the shape the python crawler probes);
+    // `VIRTUAL_ENV` is injected child-only, so discovery is deterministic
+    // and parallel-safe regardless of the ambient shell.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    let venv = root.join(".venv");
+    #[cfg(windows)]
+    let site_packages = venv.join("Lib").join("site-packages");
+    #[cfg(not(windows))]
+    let site_packages = venv.join("lib").join("python3.12").join("site-packages");
+    let dist_info = site_packages.join("covgapkit-1.0.0.dist-info");
+    std::fs::create_dir_all(&dist_info).expect("create dist-info");
+    std::fs::write(
+        dist_info.join("METADATA"),
+        "Metadata-Version: 2.1\nName: covgapkit\nVersion: 1.0.0\n",
+    )
+    .expect("write METADATA");
+    let pkg = site_packages.join("covgapkit");
+    std::fs::create_dir_all(&pkg).expect("create package dir");
+    std::fs::write(pkg.join("__init__.py"), drifted).expect("write module");
+
+    let socket = root.join(".socket");
+    std::fs::create_dir_all(&socket).expect("create .socket");
+    let mut patches = serde_json::Map::new();
+    patches.insert(
+        WHEEL.to_string(),
+        patch_entry_value(
+            "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+            "covgapkit/__init__.py",
+            &git_sha256(wheel_before),
+            &git_sha256(wheel_after),
+        ),
+    );
+    patches.insert(
+        SDIST.to_string(),
+        patch_entry_value(
+            "ffffffff-ffff-4fff-8fff-ffffffffffff",
+            "covgapkit/__init__.py",
+            &git_sha256(sdist_before),
+            &git_sha256(sdist_after),
+        ),
+    );
+    std::fs::write(
+        socket.join("manifest.json"),
+        serde_json::to_vec_pretty(&json!({ "patches": patches })).expect("serialize manifest"),
+    )
+    .expect("write manifest");
+    // Both before-blobs staged: verification must reach the drift
+    // comparison (hash_mismatch), not stop at a missing-blob gate.
+    stage_blob(&socket, &git_sha256(wheel_before), wheel_before);
+    stage_blob(&socket, &git_sha256(sdist_before), sdist_before);
+
+    let (code, stdout, stderr) = common::run_with_env(
+        root,
+        &["rollback", "--json", "--yes", "--offline", "--lock-timeout", "5"],
+        &[("VIRTUAL_ENV", venv.to_str().expect("utf8 venv path"))],
+    );
+    assert_eq!(
+        code, 1,
+        "a drifted install cannot roll back; stdout=\n{stdout}\nstderr=\n{stderr}"
+    );
+    let v = parse_envelope(&stdout, &stderr);
+    assert_eq!(v["status"], json!("partial_failure"), "stdout=\n{stdout}");
+    assert_eq!(v["failed"], json!(2), "stdout=\n{stdout}");
+    let results = v["results"].as_array().expect("results array");
+    let mut result_purls: Vec<&str> = results
+        .iter()
+        .map(|r| r["purl"].as_str().expect("purl string"))
+        .collect();
+    result_purls.sort_unstable();
+    assert_eq!(
+        result_purls,
+        vec![WHEEL, SDIST],
+        "EVERY variant must be attempted when none matches the installed \
+         distribution — silent skipping is the bug this guards; stdout=\n{stdout}"
+    );
+    for r in results {
+        assert_eq!(r["success"], json!(false), "stdout=\n{stdout}");
+        assert_eq!(
+            r["filesVerified"][0]["status"],
+            json!("hash_mismatch"),
+            "the per-file verification must surface the drift; stdout=\n{stdout}"
+        );
+    }
+    assert_eq!(
+        std::fs::read(pkg.join("__init__.py")).expect("read module"),
+        drifted,
+        "a failed verification must leave the drifted bytes alone"
+    );
+    let m: Value = serde_json::from_slice(
+        &std::fs::read(socket.join("manifest.json")).expect("read manifest"),
+    )
+    .expect("manifest is JSON");
+    assert!(
+        m["patches"].get(WHEEL).is_some() && m["patches"].get(SDIST).is_some(),
+        "failed variants must both stay in the manifest; manifest={m}"
+    );
+}
+
+/// A DISCOVERED local-go redirect target: the module lives in the module
+/// cache (child-only `GOMODCACHE` injection), so the crawler resolves it
+/// and the rollback loop routes the discovered target through the
+/// local-go redirect teardown — dropping the socket-owned `replace` and
+/// the `.socket/go-patches/` copy while the CACHE copy stays
+/// byte-identical (a redirect never patches the cache in place).
+#[test]
+fn discovered_local_go_redirect_drops_wiring_not_cache_copy() {
+    use socket_patch_core::vendor::go_mod_edit::{
+        ensure_replace_entry, read_replace_entries, GO_PATCHES_DIR,
+    };
+
+    const MODULE: &str = "github.com/covgap/discovered";
+    const VERSION: &str = "v1.2.3";
+    const PURL: &str = "pkg:golang/github.com/covgap/discovered@v1.2.3";
+    let original: &[u8] = b"package discovered\n\nfunc V() string { return \"orig\" }\n";
+    let patched: &[u8] = b"package discovered\n\nfunc V() string { return \"patched\" }\n";
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    std::fs::write(
+        root.join("go.mod"),
+        format!("module covgapproj\n\ngo 1.21\n\nrequire {MODULE} {VERSION}\n"),
+    )
+    .expect("write go.mod");
+    assert!(
+        rt.block_on(ensure_replace_entry(root, MODULE, VERSION, GO_PATCHES_DIR, false))
+            .expect("install replace directive"),
+        "fixture must install the socket-owned replace"
+    );
+    let copy_dir = root.join(GO_PATCHES_DIR).join(format!("{MODULE}@{VERSION}"));
+    std::fs::create_dir_all(&copy_dir).expect("create go-patches copy");
+    std::fs::write(copy_dir.join("discovered.go"), patched).expect("write patched copy");
+
+    // The module cache the crawler discovers. All-lowercase coordinates:
+    // no case-escaping in the on-disk directory name.
+    let cache = tempfile::tempdir().expect("cache tempdir");
+    let cache_mod_dir = cache.path().join(format!("{MODULE}@{VERSION}"));
+    std::fs::create_dir_all(&cache_mod_dir).expect("create cache module dir");
+    std::fs::write(cache_mod_dir.join("discovered.go"), original).expect("write cache copy");
+
+    let socket = root.join(".socket");
+    std::fs::create_dir_all(&socket).expect("create .socket");
+    let mut patches = serde_json::Map::new();
+    patches.insert(
+        PURL.to_string(),
+        patch_entry_value(
+            "abababab-abab-4bab-8bab-abababababab",
+            "package/discovered.go",
+            &git_sha256(original),
+            &git_sha256(patched),
+        ),
+    );
+    std::fs::write(
+        socket.join("manifest.json"),
+        serde_json::to_vec_pretty(&json!({ "patches": patches })).expect("serialize manifest"),
+    )
+    .expect("write manifest");
+
+    let (code, stdout, stderr) = common::run_with_env(
+        root,
+        &["rollback", "--json", "--yes", "--offline", "--lock-timeout", "5"],
+        &[("GOMODCACHE", cache.path().to_str().expect("utf8 cache path"))],
+    );
+    assert_eq!(
+        code, 0,
+        "the discovered redirect rollback must succeed; stdout=\n{stdout}\nstderr=\n{stderr}"
+    );
+    let v = parse_envelope(&stdout, &stderr);
+    assert_eq!(v["rolledBack"], json!(1), "stdout=\n{stdout}");
+    let result = &v["results"][0];
+    assert_eq!(result["purl"], json!(PURL), "stdout=\n{stdout}");
+    // The DISCOVERED route: the result names the module-cache copy — the
+    // undiscovered fallback reports the project root instead, so this
+    // pins which path ran.
+    let path = result["path"].as_str().expect("path string");
+    assert!(
+        path.ends_with("discovered@v1.2.3") && path != root.display().to_string(),
+        "the target must be the discovered cache dir; path={path}"
+    );
+    assert!(
+        result["filesRolledBack"]
+            .as_array()
+            .expect("filesRolledBack array")
+            .iter()
+            .any(|f| f == "package/discovered.go"),
+        "the redirect teardown reports the patch's files; stdout=\n{stdout}"
+    );
+    assert!(
+        rt.block_on(read_replace_entries(root))
+            .iter()
+            .all(|e| !(e.module == MODULE && e.socket_owned())),
+        "the socket-owned replace directive must be dropped"
+    );
+    let go_mod = std::fs::read_to_string(root.join("go.mod")).expect("read go.mod");
+    assert!(
+        go_mod.contains(&format!("require {MODULE} {VERSION}")),
+        "the require directive must survive; go.mod=\n{go_mod}"
+    );
+    assert!(!copy_dir.exists(), "the go-patches copy must be removed");
+    assert_eq!(
+        std::fs::read(cache_mod_dir.join("discovered.go")).expect("read cache copy"),
+        original,
+        "the module-cache copy must stay byte-identical"
+    );
+    let m: Value = serde_json::from_slice(
+        &std::fs::read(socket.join("manifest.json")).expect("read manifest"),
+    )
+    .expect("manifest is JSON");
+    assert!(
+        m["patches"].get(PURL).is_none(),
+        "the rolled-back entry must leave the manifest; manifest={m}"
+    );
 }

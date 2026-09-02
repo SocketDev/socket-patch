@@ -7673,4 +7673,365 @@ mod tests {
             vec!["authors"]
         );
     }
+
+    // ── coverage mop-up 2026-09: swap / prune / grammar / unwind edges ───────
+
+    /// A parentless `copy_dir` (e.g. the filesystem root) has no directory to
+    /// place a same-dir sibling in; the fallback nests the suffix under the
+    /// copy dir itself instead of panicking.
+    #[test]
+    fn swap_sibling_for_parentless_copy_dir_nests_suffix() {
+        assert_eq!(
+            swap_sibling_for(Path::new("/"), ".socket-stage"),
+            PathBuf::from("/.socket-stage")
+        );
+    }
+
+    /// The stage rename failing with NO previous copy parked (fresh vendor,
+    /// stage vanished): the swap must bubble the error without inventing a
+    /// copy dir or leaving a backup behind.
+    #[tokio::test]
+    async fn swap_failure_without_previous_copy_creates_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let copy = dir.path().join("rack-3.2.6");
+        let stage = stage_dir_for(&copy);
+        assert!(
+            swap_stage_into_place(&stage, &copy).await.is_err(),
+            "swapping a missing stage with no old copy must fail"
+        );
+        assert!(!copy.exists(), "no half-made copy dir");
+        assert!(!backup_dir_for(&copy).exists(), "no parked backup litter");
+    }
+
+    /// The PARK rename itself failing hard (an unwritable uuid dir — the same
+    /// io::Error surface as a Windows file lock on the copy): the error
+    /// bubbles and the live copy is left exactly where it was.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn swap_park_failure_bubbles_and_keeps_live_copy() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root ignores mode bits — the trigger cannot fire
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let uuid = dir.path().join("uuid");
+        let copy = uuid.join("rack-3.2.6");
+        tokio::fs::create_dir_all(&copy).await.unwrap();
+        tokio::fs::write(copy.join("f.rb"), b"live\n")
+            .await
+            .unwrap();
+        let stage = stage_dir_for(&copy);
+        tokio::fs::create_dir_all(&stage).await.unwrap();
+        tokio::fs::set_permissions(&uuid, std::fs::Permissions::from_mode(0o555))
+            .await
+            .unwrap();
+
+        let swapped = swap_stage_into_place(&stage, &copy).await;
+
+        tokio::fs::set_permissions(&uuid, std::fs::Permissions::from_mode(0o755))
+            .await
+            .unwrap();
+        assert!(
+            swapped.is_err(),
+            "parking the old copy must fail under a read-only uuid dir"
+        );
+        assert_eq!(
+            tokio::fs::read(copy.join("f.rb")).await.unwrap(),
+            b"live\n",
+            "the live copy must be untouched"
+        );
+        assert!(!backup_dir_for(&copy).exists(), "no parked backup litter");
+    }
+
+    /// `prune_empty_vendor_dirs` removes exactly the three levels a failed
+    /// run may have created (`<uuid>` → `gem` → `vendor`) and never climbs
+    /// higher; a parentless uuid path has no levels above it and returns.
+    #[tokio::test]
+    async fn prune_empty_vendor_dirs_removes_three_levels_and_stops() {
+        let dir = tempfile::tempdir().unwrap();
+        let keep = dir.path().join("keep");
+        let uuid = keep.join("vendor/gem").join(UUID);
+        tokio::fs::create_dir_all(&uuid).await.unwrap();
+        prune_empty_vendor_dirs(&uuid).await;
+        assert!(
+            !keep.join("vendor").exists(),
+            "all three empty levels pruned"
+        );
+        assert!(
+            keep.exists(),
+            "the prune never climbs past the vendor level"
+        );
+
+        // A sibling entry keeps the `gem` level non-empty: the empty uuid
+        // level is still pruned, but the climb stops there — another gem's
+        // vendor state must never be collateral of this run's cleanup.
+        let busy = dir.path().join("busy");
+        let uuid_b = busy.join("vendor/gem").join(UUID);
+        tokio::fs::create_dir_all(&uuid_b).await.unwrap();
+        tokio::fs::write(busy.join("vendor/gem/other-gem-marker"), b"x")
+            .await
+            .unwrap();
+        prune_empty_vendor_dirs(&uuid_b).await;
+        assert!(!uuid_b.exists(), "the empty uuid level is pruned");
+        assert!(
+            busy.join("vendor/gem/other-gem-marker").exists(),
+            "a non-empty gem level stops the prune"
+        );
+
+        // Parentless uuid path: nothing above to prune, returns cleanly.
+        prune_empty_vendor_dirs(Path::new("")).await;
+    }
+
+    /// DEPENDENCIES entries are exactly 2-space-indented and specs entries
+    /// exactly 4: blank rests and deeper (continuation) indentation are not
+    /// entries.
+    #[test]
+    fn dep_and_spec_entry_names_reject_blank_and_deeper_indentation() {
+        assert_eq!(dep_entry_name("  rack (~> 3.1)"), Some("rack"));
+        assert_eq!(dep_entry_name("  "), None);
+        assert_eq!(dep_entry_name("    base64 (>= 0.1.0)"), None);
+        assert_eq!(spec_entry_name("    rack (3.2.6)"), Some("rack"));
+        assert_eq!(spec_entry_name("    "), None);
+        assert_eq!(spec_entry_name("      base64 (>= 0.1.0)"), None);
+    }
+
+    /// An unreadable (present but non-regular) Gemfile fails a `gemfile_line`
+    /// revert loudly — unlike a MISSING one, which is drift and left alone.
+    #[tokio::test]
+    async fn revert_gemfile_record_unreadable_gemfile_is_an_error() {
+        // The tempdir itself squats the Gemfile path: a directory is
+        // readable-as-path but not a regular file, so the guarded read
+        // errors with a non-NotFound kind.
+        let dir = tempfile::tempdir().unwrap();
+        let w = WiringRecord {
+            file: GEMFILE.to_string(),
+            kind: GEMFILE_WIRING_KIND.to_string(),
+            action: WiringAction::Rewritten,
+            key: Some("rack".to_string()),
+            original: Some(Value::String("gem \"rack\", \"~> 3.1\"".to_string())),
+            new: Some(Value::String(format!(
+                "gem \"rack\", path: \"{}\"",
+                copy_rel()
+            ))),
+        };
+        let err = revert_gemfile_record(dir.path(), &w, true)
+            .await
+            .expect_err("a directory squatting the Gemfile path must error");
+        assert!(err.contains("unreadable Gemfile"), "{err}");
+    }
+
+    /// A `gemfile_lock_spec` record whose `new` is not a string array is
+    /// drift (`Ok(false)`), decided BEFORE the lock is read — proven with a
+    /// lock path that would error loudly (a directory) if it were read.
+    #[tokio::test]
+    async fn revert_lock_record_non_array_new_is_drift_before_reading() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = WiringRecord {
+            file: GEMFILE_LOCK.to_string(),
+            kind: LOCK_WIRING_KIND.to_string(),
+            action: WiringAction::Added,
+            key: Some("rack".to_string()),
+            original: Some(serde_json::json!(["    rack (3.2.6)"])),
+            new: Some(Value::String("not-an-array".to_string())),
+        };
+        let restored = revert_lock_record(dir.path(), &w, true).await.unwrap();
+        assert!(!restored, "malformed `new` wiring is drift, not an error");
+    }
+
+    /// The specs-splice scan steps over a line inside GEM/specs that is not
+    /// a spec entry (a stray 6-space continuation with no parent entry)
+    /// instead of breaking the splice or mis-sorting the restored block.
+    #[test]
+    fn revert_lock_text_steps_over_non_spec_lines_in_gem_specs() {
+        let rel = ".socket/vendor/gem/u/aaa-1.0.0";
+        let new_lines: Vec<String> = [
+            "PATH",
+            &format!("  remote: {rel}") as &str,
+            "  specs:",
+            "    aaa (1.0.0)",
+            "",
+            "  aaa (= 1.0.0)!",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let original_lines: Vec<String> = ["    aaa (1.0.0)", "  aaa (~> 1.0)"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let text = format!(
+            "PATH\n  remote: {rel}\n  specs:\n    aaa (1.0.0)\n\nGEM\n  remote: https://rubygems.org/\n  specs:\n      orphan-continuation (~> 1.0)\n    zzz (1.0)\n\nDEPENDENCIES\n  aaa (= 1.0.0)!\n  zzz\n"
+        );
+        let restored = revert_lock_text(&text, &original_lines, &new_lines)
+            .expect("an odd-but-parseable specs section must still revert");
+        assert_eq!(
+            restored,
+            "GEM\n  remote: https://rubygems.org/\n  specs:\n    aaa (1.0.0)\n      orphan-continuation (~> 1.0)\n    zzz (1.0)\n\nDEPENDENCIES\n  aaa (~> 1.0)\n  zzz\n"
+        );
+    }
+
+    /// An anchored attribute mention that is not an assignment at all (no
+    /// `=` after the attr — `.push(…)`) yields no RHS, so a push-only
+    /// `authors` still fails the required-attribute bar.
+    #[test]
+    fn gemspec_attr_rhs_ignores_non_assignment_mentions() {
+        assert!(
+            gemspec_attr_rhs("s.authors.push(\"m\")\n", &["authors", "author"]).is_empty(),
+            "a method call on the attribute is not an assignment"
+        );
+        assert_eq!(
+            gemspec_missing_required_attrs("s.summary = \"x\"\ns.authors.push(\"m\")\n"),
+            vec!["authors"]
+        );
+    }
+
+    /// The LOCAL build's final swap failing (a stale regular FILE squatting
+    /// the backup sibling — a dir-tree remover cannot clear it): the run
+    /// reports the move failure, wires neither project file, and unwinds the
+    /// fresh uuid dir.
+    #[tokio::test]
+    async fn local_swap_failure_reports_move_error_and_touches_nothing() {
+        let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
+        let uuid_dir = root.join(format!(".socket/vendor/gem/{UUID}"));
+        tokio::fs::create_dir_all(&uuid_dir).await.unwrap();
+        tokio::fs::write(uuid_dir.join("rack-3.2.6.socket-old"), b"husk")
+            .await
+            .unwrap();
+
+        let (result, entry, _w) =
+            unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
+        assert!(!result.success, "the swap failure must fail the vendor");
+        assert!(entry.is_none(), "no ledger entry for a failed vendor");
+        let err = result.error.as_deref().unwrap_or("");
+        assert!(
+            err.contains("failed to move the rebuilt copy into place"),
+            "{err}"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
+            GEMFILE_DIRECT,
+            "Gemfile untouched"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                .await
+                .unwrap(),
+            LOCK_DIRECT,
+            "lock untouched"
+        );
+        assert!(
+            !uuid_dir.exists(),
+            "a fresh-vendor failure unwinds the uuid dir"
+        );
+    }
+
+    /// The SERVICE path's swap failing the same way hard-fails under its own
+    /// `vendor_prebuilt_write_failed` code, with the project untouched.
+    #[tokio::test]
+    async fn service_swap_failure_hard_fails_and_unwinds() {
+        let (_tmp, root, _installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
+        let gem = make_gem(&[("lib/rack.rb", PATCHED)]);
+        let sri = sri_sha512(&gem);
+        let stub_sri = sri_sha512(SERVICE_STUB);
+        let server = wiremock::MockServer::start().await;
+        mount_gem_granted(&server, &gem, &sri, Some((SERVICE_STUB, &stub_sri))).await;
+        let sources = PatchSources::blobs_only(&blobs);
+        let uuid_dir = root.join(format!(".socket/vendor/gem/{UUID}"));
+        tokio::fs::create_dir_all(&uuid_dir).await.unwrap();
+        tokio::fs::write(uuid_dir.join("rack-3.2.6.socket-old"), b"husk")
+            .await
+            .unwrap();
+
+        let outcome = vendor_gem(
+            PURL,
+            &missing_install(&root),
+            &root,
+            &record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            Some(&gem_service_cfg(
+                &server.uri(),
+                VendorSource::Service,
+                false,
+            )),
+        )
+        .await;
+        let (code, detail) = unwrap_refused(outcome);
+        assert_eq!(code, "vendor_prebuilt_write_failed");
+        assert!(
+            detail.contains("cannot move the extracted .gem into place"),
+            "{detail}"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
+            GEMFILE_DIRECT,
+            "Gemfile untouched"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                .await
+                .unwrap(),
+            LOCK_DIRECT,
+            "lock untouched"
+        );
+        assert!(
+            !uuid_dir.exists(),
+            "a fresh-vendor failure unwinds the uuid dir"
+        );
+    }
+
+    /// A Gemfile.lock write failure AFTER the Gemfile edit landed (macOS
+    /// user-immutable flag on the lock: the atomic rename fails EPERM while
+    /// the Gemfile in the same dir writes fine) unwinds the Gemfile to its
+    /// recorded original bytes — the pair is never left half-wired — and
+    /// removes the freshly-built uuid dir.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn lock_write_failure_unwinds_gemfile_and_uuid_dir() {
+        if unsafe { libc::geteuid() } == 0 {
+            return; // uchg semantics under root differ — the trigger is not guaranteed
+        }
+        let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
+        let lock_path = root.join(GEMFILE_LOCK);
+        let set = std::process::Command::new("chflags")
+            .arg("uchg")
+            .arg(&lock_path)
+            .status()
+            .expect("run chflags uchg");
+        assert!(set.success(), "chflags uchg must succeed");
+
+        let outcome = run_vendor(&root, &blobs, &installed, &record, false).await;
+
+        let cleared = std::process::Command::new("chflags")
+            .arg("nouchg")
+            .arg(&lock_path)
+            .status()
+            .expect("run chflags nouchg");
+        assert!(cleared.success(), "chflags nouchg must succeed");
+
+        let (result, entry, _w) = unwrap_done(outcome);
+        assert!(
+            !result.success,
+            "the lock write failure must fail the vendor"
+        );
+        assert!(entry.is_none(), "no ledger entry for a failed vendor");
+        let err = result.error.as_deref().unwrap_or("");
+        assert!(err.contains("failed to write Gemfile.lock"), "{err}");
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
+            GEMFILE_DIRECT,
+            "the Gemfile edit must be unwound to the original bytes"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(&lock_path).await.unwrap(),
+            LOCK_DIRECT,
+            "the failed rename must leave the lock byte-identical"
+        );
+        assert!(
+            !root.join(format!(".socket/vendor/gem/{UUID}")).exists(),
+            "the freshly-built uuid dir is unwound"
+        );
+    }
 }

@@ -12718,4 +12718,604 @@ packages:
         assert!(checksums.contains(&format!("{}  ", "c".repeat(64))));
         assert!(checksums.contains(&format!("{}  ", "d".repeat(64))));
     }
+
+    // ── coverage mop-up 2026-09 (final wave) ─────────────────────────────────
+    // Residual branches the earlier audit passes did not pin: malformed-input
+    // tolerance legs, workspace-inheritance satisfaction, and the remaining
+    // diagnosis spellings.
+
+    /// Malformed Cargo.toml section headers (unbalanced quote in a segment,
+    /// an unclosed `[dependencies`) must classify as non-dependency sections
+    /// — their entries stay byte-identical — and garbage lines inside the
+    /// real [dependencies] table are skipped while the real entry still
+    /// gains the pin.
+    #[test]
+    fn cargo_malformed_headers_and_table_lines_are_skipped_not_fatal() {
+        let files = cargo_files(
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+             [target.'cfg(unix).dependencies]\nserde = \"9.9.9\"\n\n\
+             [dependencies\nserde = \"8.8.8\"\n\n\
+             [dependencies]\n= \"junk\"\njunk\nserde = \"1.0.190\"\n",
+        );
+        let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+        assert!(
+            r.warnings.is_empty(),
+            "garbage headers/lines are skipped, not refused: {:?}",
+            r.warnings
+        );
+        let toml = r.files.get("Cargo.toml").expect("Cargo.toml rewritten");
+        let pinned = format!(
+            "serde = {{ version = \"1.0.190\", registry = \"{}\" }}",
+            cargo_reg()
+        );
+        assert_eq!(
+            toml.matches(&pinned).count(),
+            1,
+            "only the real [dependencies] entry is pinned: {toml}"
+        );
+        assert!(
+            toml.contains("serde = \"9.9.9\"") && toml.contains("serde = \"8.8.8\""),
+            "entries under malformed headers stay byte-identical: {toml}"
+        );
+        assert!(
+            toml.contains("= \"junk\"\njunk\n"),
+            "garbage table lines survive untouched: {toml}"
+        );
+    }
+
+    /// Unparseable lines INSIDE a `[dependencies.<key>]` table block (a bare
+    /// `= …`, a key token with no `=`) are skipped by the block scanner while
+    /// the block still gains its `registry` pin right after the header.
+    #[test]
+    fn cargo_dep_entry_block_garbage_lines_are_skipped() {
+        let files = cargo_files(
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+             [dependencies.serde]\n= \"zap\"\npackage \"serde\"\nversion = \"1.0.190\"\n",
+        );
+        let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        let toml = r.files.get("Cargo.toml").expect("Cargo.toml rewritten");
+        assert!(
+            toml.contains(&format!(
+                "[dependencies.serde]\nregistry = \"{}\"\n= \"zap\"\npackage \"serde\"\nversion = \"1.0.190\"",
+                cargo_reg()
+            )),
+            "registry pin inserted after the header, garbage lines untouched: {toml}"
+        );
+    }
+
+    /// A `[workspace.dependencies]` entry ALREADY pinned to the managed
+    /// registry satisfies `workspace = true` inheritors: no Cargo.toml write
+    /// (no ledger growth), no refusal, and the lock is still repointed —
+    /// both the `[workspace.dependencies.<key>]` table form and the
+    /// inline-table form.
+    #[test]
+    fn cargo_workspace_already_pinned_satisfies_inheritor_without_toml_write() {
+        for manifest in [
+            format!(
+                "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+                 [workspace.dependencies.serde]\nversion = \"1.0.190\"\nregistry = \"{reg}\"\n\n\
+                 [dependencies]\nserde.workspace = true\n",
+                reg = cargo_reg()
+            ),
+            format!(
+                "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+                 [workspace.dependencies]\nserde = {{ version = \"1.0.190\", registry = \"{reg}\" }}\n\n\
+                 [dependencies]\nserde = {{ workspace = true }}\n",
+                reg = cargo_reg()
+            ),
+        ] {
+            let files = cargo_files(&manifest);
+            let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+            assert!(
+                r.warnings.is_empty(),
+                "a satisfied inheritor must not refuse: {:?}",
+                r.warnings
+            );
+            assert!(
+                !r.files.contains_key("Cargo.toml"),
+                "an already-pinned workspace entry writes no manifest: {:?}",
+                r.files.keys()
+            );
+            assert!(
+                r.files.contains_key("Cargo.lock"),
+                "the lock is still repointed: {:?}",
+                r.files.keys()
+            );
+            assert!(r.confirmed_cargo_uuids.contains(CARGO_UUID));
+        }
+    }
+
+    /// A STALE socket-patch pin on the `[workspace.dependencies]` entry is
+    /// superseded in place (table and inline forms) and still satisfies the
+    /// `workspace = true` inheritor — no refusal, old uuid gone.
+    #[test]
+    fn cargo_workspace_stale_socket_pin_superseded_in_both_forms() {
+        const OLD: &str = "socket-patch-0a1b2c3d-4e5f-4a7b-8c9d-0e1f2a3b4c5d";
+        for manifest in [
+            format!(
+                "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+                 [workspace.dependencies.serde]\nversion = \"1.0.190\"\nregistry = \"{OLD}\"\n\n\
+                 [dependencies]\nserde.workspace = true\n"
+            ),
+            format!(
+                "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+                 [workspace.dependencies]\nserde = {{ version = \"1.0.190\", registry = \"{OLD}\" }}\n\n\
+                 [dependencies]\nserde.workspace = true\n"
+            ),
+        ] {
+            let files = cargo_files(&manifest);
+            let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+            assert!(
+                r.warnings.is_empty(),
+                "superseding our own stale pin must not refuse: {:?}",
+                r.warnings
+            );
+            let toml = r
+                .files
+                .get("Cargo.toml")
+                .expect("the stale pin is superseded in place");
+            assert!(
+                toml.contains(&cargo_reg()) && !toml.contains(OLD),
+                "old uuid replaced by the current registry: {toml}"
+            );
+        }
+    }
+
+    /// A bare `[workspace.dependencies]` inline entry gains the registry pin
+    /// and thereby satisfies the `workspace = true` inheritor in the same
+    /// manifest.
+    #[test]
+    fn cargo_workspace_inline_entry_gains_pin_and_satisfies_inheritor() {
+        let files = cargo_files(
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+             [workspace.dependencies]\nserde = { version = \"1.0.190\" }\n\n\
+             [dependencies]\nserde.workspace = true\n",
+        );
+        let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        let toml = r.files.get("Cargo.toml").expect("Cargo.toml rewritten");
+        assert!(
+            toml.contains(&format!(
+                "serde = {{ version = \"1.0.190\", registry = \"{}\" }}",
+                cargo_reg()
+            )),
+            "the workspace inline table gains the registry pin: {toml}"
+        );
+    }
+
+    /// v9 vendored lock WITHOUT the `overrides:` respelling (packages key
+    /// only): the `<name>@file:.socket/vendor/…` packages key ALONE must
+    /// drive the vendored diagnosis — not the generic entry-not-found.
+    #[test]
+    fn pnpm_v9_packages_key_alone_is_diagnosed_vendored() {
+        let ovr = npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://patch.test/left-pad-1.3.0.tgz",
+            "sha512-PATCHED==",
+        );
+        let lock = "lockfileVersion: '9.0'
+
+importers:
+
+  .:
+    dependencies:
+      left-pad:
+        specifier: file:.socket/vendor/npm/1a2b3c4d-5e6f-4a1b-8c2d-0123456789ab/left-pad-1.3.0.tgz
+        version: file:.socket/vendor/npm/1a2b3c4d-5e6f-4a1b-8c2d-0123456789ab/left-pad-1.3.0.tgz
+
+packages:
+
+  left-pad@file:.socket/vendor/npm/1a2b3c4d-5e6f-4a1b-8c2d-0123456789ab/left-pad-1.3.0.tgz:
+    resolution: {integrity: sha512-VENDORED==, tarball: file:.socket/vendor/npm/1a2b3c4d-5e6f-4a1b-8c2d-0123456789ab/left-pad-1.3.0.tgz}
+    version: 1.3.0
+";
+        let mut files = BTreeMap::new();
+        files.insert("pnpm-lock.yaml".to_string(), lock.to_string());
+        let r = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        assert!(
+            r.files.is_empty() && r.edits.is_empty(),
+            "a vendored lock must stay untouched: {:?}",
+            r.files.keys()
+        );
+        assert_eq!(
+            warning_codes(&r),
+            vec!["redirect_pnpm_entry_vendored"],
+            "the packages key alone must carry the vendored diagnosis: {:?}",
+            r.warnings
+        );
+    }
+
+    /// A classic-lock block whose first line is not a `key:` line
+    /// (hand-mangled) is skipped without derailing the rewrite of the real
+    /// entry — and survives byte-identically.
+    #[test]
+    fn yarn_classic_keyless_block_is_skipped() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "yarn.lock".to_string(),
+            "# yarn lockfile v1\n\nnot-a-key-line\n\n\
+             left-pad@^1.3.0:\n  version \"1.3.0\"\n  \
+             resolved \"https://registry.yarnpkg.com/left-pad/-/left-pad-1.3.0.tgz#bbbb\"\n  \
+             integrity sha512-UPSTREAM==\n"
+                .to_string(),
+        );
+        let ovr = npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://p.test/lp.tgz",
+            "sha512-PATCHED==",
+        );
+        let mut r = RewriteResult::default();
+        rewrite_yarn_classic(&files, std::slice::from_ref(&ovr), &mut r);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        let out = r.files.get("yarn.lock").expect("real entry rewritten");
+        assert!(
+            out.contains("not-a-key-line"),
+            "keyless block preserved: {out}"
+        );
+        assert!(out.contains("resolved \"http://p.test/lp.tgz\""), "{out}");
+    }
+
+    /// An EXPLICIT `.yarnrc.yml` `compressionLevel: 0` (the supported value,
+    /// spelled out rather than defaulted) must proceed — only non-zero
+    /// levels refuse.
+    #[test]
+    fn yarn_berry_explicit_compression_level_zero_proceeds() {
+        let checksum = format!("10c0/{}", "7".repeat(128));
+        let ovr = berry_override("left-pad", "1.3.0", "http://p.test/lp.tgz", &checksum);
+        let mut files = BTreeMap::new();
+        files.insert("yarn.lock".to_string(), berry_lock("10c0"));
+        files.insert(
+            ".yarnrc.yml".to_string(),
+            "compressionLevel: 0\n".to_string(),
+        );
+        let mut r = RewriteResult::default();
+        rewrite_yarn_berry(&files, std::slice::from_ref(&ovr), &mut r);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        let out = r
+            .files
+            .get("yarn.lock")
+            .expect("explicit level 0 must not refuse");
+        assert!(
+            out.contains("__archiveUrl=") && out.contains(&checksum),
+            "{out}"
+        );
+    }
+
+    /// A berry key whose descriptor has no range after `@` and an EMPTY block
+    /// (two consecutive blank lines) are both skipped; the real entry in the
+    /// same lock is still rewritten and the malformed bytes survive verbatim.
+    #[test]
+    fn yarn_berry_malformed_key_and_empty_block_are_skipped() {
+        let checksum = format!("10c0/{}", "7".repeat(128));
+        let ovr = berry_override("left-pad", "1.3.0", "http://p.test/lp.tgz", &checksum);
+        let lock = format!(
+            "# header\n\n__metadata:\n  version: 8\n  cacheKey: 10c0\n\n\
+             \"left-pad@\":\n  version: 1.3.0\n  resolution: \"left-pad@npm:1.3.0\"\n  checksum: 10c0/333\n\n\n\n\
+             \"left-pad@npm:^1.3.0\":\n  version: 1.3.0\n  resolution: \"left-pad@npm:1.3.0\"\n  checksum: 10c0/{}\n  languageName: node\n  linkType: hard\n",
+            "3".repeat(128)
+        );
+        let mut files = BTreeMap::new();
+        files.insert("yarn.lock".to_string(), lock);
+        let mut r = RewriteResult::default();
+        rewrite_yarn_berry(&files, std::slice::from_ref(&ovr), &mut r);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        let out = r
+            .files
+            .get("yarn.lock")
+            .expect("the real entry is rewritten");
+        assert!(
+            out.contains(
+                "\"left-pad@\":\n  version: 1.3.0\n  resolution: \"left-pad@npm:1.3.0\"\n  checksum: 10c0/333"
+            ),
+            "the rangeless key stays byte-identical: {out}"
+        );
+        assert_eq!(
+            r.edits.len(),
+            1,
+            "only the real entry is edited: {:?}",
+            r.edits
+        );
+        assert!(out.contains("__archiveUrl="), "{out}");
+    }
+
+    /// A descriptor with NO protocol at all (`left-pad@1.3.0`) is refused
+    /// through the unsupported-protocol arm, and the diagnosis names the
+    /// missing protocol as `(none)` instead of misquoting one.
+    #[test]
+    fn yarn_berry_protocolless_descriptor_names_none_protocol() {
+        let checksum = format!("10c0/{}", "7".repeat(128));
+        let ovr = berry_override("left-pad", "1.3.0", "http://p.test/lp.tgz", &checksum);
+        let mut files = BTreeMap::new();
+        files.insert(
+            "yarn.lock".to_string(),
+            format!(
+                "# header\n\n__metadata:\n  version: 8\n  cacheKey: 10c0\n\n\
+                 \"left-pad@1.3.0\":\n  version: 1.3.0\n  resolution: \"left-pad@npm:1.3.0\"\n  checksum: 10c0/{}\n",
+                "3".repeat(128)
+            ),
+        );
+        let mut r = RewriteResult::default();
+        rewrite_yarn_berry(&files, std::slice::from_ref(&ovr), &mut r);
+        assert!(r.files.is_empty(), "{:?}", r.files.keys());
+        assert_eq!(
+            r.warnings[0].code,
+            "redirect_yarn_berry_unsupported_protocol"
+        );
+        assert!(
+            r.warnings[0].detail.contains("`(none)`"),
+            "the diagnosis must name the absent protocol: {}",
+            r.warnings[0].detail
+        );
+    }
+
+    /// A packages entry whose first tuple element is not a JSON string (a
+    /// grammar-balanced but non-bun shape) is skipped; the real registry
+    /// tuple in the same lock is still rewritten.
+    #[test]
+    fn bun_lock_non_string_first_element_entry_is_skipped() {
+        let ovr = npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://p.test/lp.tgz",
+            "sha512-PATCHED==",
+        );
+        let mut files = BTreeMap::new();
+        files.insert(
+            "bun.lock".to_string(),
+            bun_lock_file(
+                "\"weird\": [{ \"dep\": \"1.0.0\" }],\n    \
+                 \"left-pad\": [\"left-pad@1.3.0\", \"\", {}, \"sha512-OLD==\"]",
+                1,
+            ),
+        );
+        let mut r = RewriteResult::default();
+        rewrite_bun_lock(&files, std::slice::from_ref(&ovr), &mut r);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        let out = r.files.get("bun.lock").expect("registry tuple rewritten");
+        assert!(
+            out.contains("\"weird\": [{ \"dep\": \"1.0.0\" }],"),
+            "non-string entry untouched: {out}"
+        );
+        assert!(
+            out.contains(
+                "\"left-pad\": [\"left-pad@http://p.test/lp.tgz\", {}, \"sha512-PATCHED==\"]"
+            ),
+            "{out}"
+        );
+    }
+
+    /// A truncated composer.lock (the entry object never closes before EOF)
+    /// must fail closed as pkg-not-found — the brace scan runs off the end
+    /// instead of electing a bogus boundary.
+    #[test]
+    fn composer_truncated_lock_is_pkg_not_found() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "composer.lock".to_string(),
+            "{\n    \"packages\": [\n        {\n            \"name\": \"acme/target\",\n            \"version\": \"6.4.1\"\n"
+                .to_string(),
+        );
+        let r = rewrite_registry_redirect(&files, &[composer_override("6.4.1")]);
+        assert!(
+            r.files.is_empty() && r.edits.is_empty(),
+            "files={:?} edits={:?}",
+            r.files.keys(),
+            r.edits
+        );
+        assert_eq!(
+            warning_codes(&r),
+            vec!["redirect_composer_pkg_not_found"],
+            "{:?}",
+            r.warnings
+        );
+    }
+
+    /// packages.lock.json shapes the walker must skip without touching the
+    /// lock: a non-object framework value, a non-matching id, a matching id
+    /// whose entry is not an object, and a lock with no `dependencies` at
+    /// all. The nuget.config wiring still lands in every case.
+    #[test]
+    fn nuget_lock_walker_skips_unrewritable_shapes() {
+        for lock in [
+            "{\n  \"version\": 1,\n  \"dependencies\": {\n    \"net6.0\": {\n      \"Aardvark.Zebra\": { \"resolved\": \"1.0.0\", \"contentHash\": \"AAA\" },\n      \"Newtonsoft.Json\": \"not-an-entry-object\"\n    },\n    \"net472\": [\"not-an-object\"]\n  }\n}\n",
+            "{\n  \"version\": 1\n}\n",
+        ] {
+            let mut files = BTreeMap::new();
+            files.insert("packages.lock.json".to_string(), lock.to_string());
+            let r = rewrite_registry_redirect(&files, &[nuget_override()]);
+            assert!(
+                r.files.contains_key("nuget.config"),
+                "config wiring still lands: {:?}",
+                r.files.keys()
+            );
+            assert!(
+                !r.files.contains_key("packages.lock.json"),
+                "an unrewritable lock stays untouched: {:?}",
+                r.files.keys()
+            );
+            let kinds: Vec<&str> = r.edits.iter().map(|e| e.kind.as_str()).collect();
+            assert_eq!(
+                kinds,
+                vec!["redirect_nuget_source"],
+                "no lock edit may be recorded"
+            );
+        }
+    }
+
+    /// A dep whose registry override is of a FOREIGN kind writes nothing —
+    /// the nuget and golang arms skip it rather than misinterpreting the
+    /// override's fields (silently, matching the TS twin).
+    #[test]
+    fn foreign_override_kind_is_skipped_by_nuget_and_golang() {
+        let mut nuget = nuget_override();
+        nuget
+            .registry_override
+            .as_mut()
+            .expect("nuget_override always carries an override")
+            .kind = "nuget-v2".into();
+        let mut golang = golang_override();
+        golang
+            .registry_override
+            .as_mut()
+            .expect("golang_override always carries an override")
+            .kind = "nuget-v3".into();
+        let files = golang_files();
+        let r = rewrite_registry_redirect(&files, &[nuget, golang]);
+        assert!(
+            r.files.is_empty() && r.edits.is_empty(),
+            "files={:?} edits={:?}",
+            r.files.keys(),
+            r.edits
+        );
+        assert!(
+            r.warnings.is_empty(),
+            "foreign kinds are skipped silently today: {:?}",
+            r.warnings
+        );
+    }
+
+    /// gems.rb + Gemfile twins with deps that carry NO compact-index override
+    /// (absent, or a foreign kind): the divergence residue skips those deps
+    /// (nothing of theirs to erase), the rewrite loop skips them too — the
+    /// absent override warns, the foreign kind is silent, nothing is written.
+    #[test]
+    fn gem_deps_without_compact_index_override_are_skipped() {
+        let gemfile = "source \"https://rubygems.org\"\n\ngem \"rails\", \"7.0.0\"\n";
+        let mut files = BTreeMap::new();
+        files.insert("gems.rb".to_string(), gemfile.to_string());
+        files.insert("Gemfile".to_string(), gemfile.to_string());
+        let mut no_override = gem_override("rails", "7.0.0");
+        no_override.registry_override = None;
+        let mut foreign = gem_override("rack", "3.0.0");
+        foreign
+            .registry_override
+            .as_mut()
+            .expect("gem_override always carries an override")
+            .kind = "cargo-sparse".into();
+        let r = rewrite_registry_redirect(&files, &[no_override, foreign]);
+        assert!(
+            r.files.is_empty() && r.edits.is_empty(),
+            "files={:?} edits={:?}",
+            r.files.keys(),
+            r.edits
+        );
+        assert_eq!(
+            warning_codes(&r),
+            vec!["redirect_gem_missing_override"],
+            "{:?}",
+            r.warnings
+        );
+    }
+
+    /// The documented bail-to-empty legs of `gem_line_trailing_options`: a
+    /// dangling comma and an unbalanced quote both yield "" (options dropped
+    /// rather than a panic or a mangled tail). Shared with vendor::gem.
+    #[test]
+    fn gem_line_trailing_options_bails_empty_on_unparseable_tails() {
+        assert_eq!(gem_line_trailing_options(","), "");
+        assert_eq!(gem_line_trailing_options(", \"7.0"), "");
+        assert_eq!(
+            gem_line_trailing_options(", \"7.0\", require: false"),
+            "require: false"
+        );
+    }
+
+    /// A Gemfile.lock with a leading blank line (hand-edited) still
+    /// converges: the section parser steps over non-header lines at the top
+    /// instead of misparsing the file, and the leading byte survives.
+    #[test]
+    fn gem_lock_with_leading_blank_line_still_converges() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "Gemfile".to_string(),
+            "source \"https://rubygems.org\"\n\ngem \"rails\", \"7.0.0\"\n".to_string(),
+        );
+        files.insert(
+            "Gemfile.lock".to_string(),
+            format!(
+                "\n{}",
+                gem_lock(&format!("  rails (7.0.0) sha256={}", "2".repeat(64)))
+            ),
+        );
+        let r = rewrite_registry_redirect(&files, &[gem_override("rails", "7.0.0")]);
+        let lock = r.files.get("Gemfile.lock").expect("the lock converges");
+        assert!(
+            lock.starts_with('\n'),
+            "leading blank line preserved: {lock:?}"
+        );
+        assert!(
+            lock.contains(
+                "GEM\n  remote: https://patch.test/gem/tok/uuid/\n  specs:\n    rails (7.0.0)"
+            ),
+            "{lock}"
+        );
+        assert!(lock.contains("  rails (= 7.0.0)!"), "{lock}");
+    }
+
+    /// LEGACY same-GAV path: an explicit `<type>jar</type>` is the supported
+    /// packaging — the repository must still be added (only non-jar types
+    /// refuse the dep).
+    #[test]
+    fn maven_legacy_explicit_jar_type_is_redirected() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "pom.xml".to_string(),
+            pom_with_dep(
+                "\n      <version>1.7.36</version>",
+                "\n      <type>jar</type>",
+            ),
+        );
+        let r = rewrite_registry_redirect(&files, &[legacy_maven_override()]);
+        let out = r.files.get("pom.xml").expect("repository added");
+        assert!(out.contains("<id>socket-patch-uuid</id>"), "{out}");
+        assert_eq!(
+            warning_codes(&r),
+            vec!["redirect_maven_same_gav_fallback"],
+            "{:?}",
+            r.warnings
+        );
+    }
+
+    /// A committed hosted replace that LACKS its rhs version (hand-mangled)
+    /// is still recognized as ours: the ledger `original` records the
+    /// version-less spelling and the directive is repaired in place.
+    #[test]
+    fn golang_versionless_hosted_replace_is_repaired_with_original_recorded() {
+        let mut files = golang_files();
+        files.insert(
+            "go.mod".to_string(),
+            format!(
+                "module example.com/app\n\ngo 1.21\n\nrequire github.com/foo/bar v1.4.2\n\n\
+                 replace github.com/foo/bar v1.4.2 => {}\n",
+                golang_socket_module()
+            ),
+        );
+        let ovr = golang_override();
+        let out = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+        let go_mod = &out.files["go.mod"];
+        assert!(
+            go_mod.contains(&format!(
+                "replace github.com/foo/bar v1.4.2 => {} v1.4.2-socketpatch.1",
+                golang_socket_module()
+            )),
+            "the directive is repaired in place: {go_mod}"
+        );
+        let edit = out
+            .edits
+            .iter()
+            .find(|e| e.kind == "redirect_golang_replace")
+            .expect("replace edit recorded");
+        assert_eq!(edit.action, "updated");
+        assert_eq!(
+            edit.original,
+            Some(Value::String(format!(
+                "replace github.com/foo/bar v1.4.2 => {}",
+                golang_socket_module()
+            )))
+        );
+    }
 }

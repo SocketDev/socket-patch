@@ -6709,4 +6709,553 @@ snapshots:
             assert!(fx.root().join(fx.rel_tgz()).exists(), "artifact untouched");
         }
     }
+
+    // ── coverage mop-up 2026-09: remaining vendor/revert edges ─────────────
+
+    /// SECURITY: the coordinates guard is the FIRST gate in `vendor_pnpm` —
+    /// a purl the npm grammar cannot parse refuses fail-closed before any
+    /// file is even read, let alone written.
+    #[tokio::test]
+    async fn unparseable_purl_refuses_unsafe_coordinates_before_any_write() {
+        let fx = fixture_with(P1_BEFORE_PKG, P1_BEFORE_LOCK).await;
+        let blobs = fx.root().join(".socket/blobs");
+        let sources = PatchSources::blobs_only(&blobs);
+        let outcome = vendor_pnpm(
+            "pkg:npm/left-pad", // no @version — the npm purl grammar refuses
+            &fx.installed(),
+            fx.root(),
+            &fx.record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            None,
+        )
+        .await;
+        let detail = expect_refused(outcome, "unsafe_coordinates");
+        assert!(detail.contains("cannot parse"), "{detail}");
+        assert_eq!(fx.read(PACKAGE_JSON).await, P1_BEFORE_PKG, "pkg untouched");
+        assert_eq!(fx.read(PNPM_LOCK).await, P1_BEFORE_LOCK, "lock untouched");
+        assert!(!ws_exists(&fx).await, "no workspace file scaffolded");
+    }
+
+    /// A staging failure (the installed dir is gone between crawl and
+    /// vendor) is a LOUD Done failure from the shared stage→patch→pack
+    /// pipeline, with the project byte-untouched and no uuid dir created.
+    #[tokio::test]
+    async fn missing_installed_dir_is_a_loud_staging_failure() {
+        let fx = fixture_with(P1_BEFORE_PKG, P1_BEFORE_LOCK).await;
+        tokio::fs::remove_dir_all(fx.installed()).await.unwrap();
+
+        let (result, entry, _) = expect_done(fx.vendor(false).await);
+        assert!(!result.success, "staging failure must fail the run");
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("cannot stage a copy of the installed package")),
+            "{:?}",
+            result.error
+        );
+        assert!(entry.is_none());
+        assert_eq!(fx.read(PACKAGE_JSON).await, P1_BEFORE_PKG, "pkg untouched");
+        assert_eq!(fx.read(PNPM_LOCK).await, P1_BEFORE_LOCK, "lock untouched");
+        assert!(!uuid_dir(&fx).exists(), "no artifact dir left behind");
+    }
+
+    /// The vendor marker is informational: a write failure (here: a
+    /// directory squatting on the marker path inside the uuid dir) degrades
+    /// to a `vendor_marker_write_failed` warning while the vendoring itself
+    /// succeeds with the full wiring in place.
+    #[tokio::test]
+    async fn marker_write_failure_degrades_to_a_warning() {
+        let fx = fixture_with(P1_BEFORE_PKG, P1_BEFORE_LOCK).await;
+        let marker_path = uuid_dir(&fx).join(crate::vendor::state::VENDOR_MARKER_FILE);
+        tokio::fs::create_dir_all(&marker_path).await.unwrap();
+        tokio::fs::write(marker_path.join("occupied"), b"x")
+            .await
+            .unwrap();
+
+        let (result, entry, warnings) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        assert!(entry.is_some(), "the ledger entry is still recorded");
+        assert_warning(
+            &warnings,
+            "vendor_marker_write_failed",
+            "informational vendor marker",
+        );
+        assert_eq!(
+            fx.read(PACKAGE_JSON).await,
+            P1_AFTER_PKG,
+            "wiring landed despite the marker failure"
+        );
+    }
+
+    /// A lock carrying only a `snapshots:` section (no `packages:`) still
+    /// resolves the in-use probe: the missing section is skipped, not
+    /// treated as "cannot determine".
+    #[tokio::test]
+    async fn in_use_probe_scans_snapshots_when_packages_section_is_absent() {
+        let (fx, entry) = reconstructed_fixture().await;
+        let lock = format!(
+            "lockfileVersion: '9.0'\n\nsnapshots:\n\n  left-pad@file:{}: {{}}\n",
+            fx.rel_tgz()
+        );
+        tokio::fs::write(fx.root().join(PNPM_LOCK), &lock)
+            .await
+            .unwrap();
+        assert_eq!(
+            pnpm_entry_in_use(&entry, fx.root()).await,
+            Some(true),
+            "the snapshots-only lock still resolves through the artifact"
+        );
+    }
+
+    /// Third-party keys added under a vendor-created `pnpm` table since
+    /// vendoring keep the table alive on revert: only the emptied
+    /// `overrides` sub-table is pruned.
+    #[tokio::test]
+    async fn revert_keeps_a_created_pnpm_table_that_gained_third_party_keys() {
+        let fx = fixture_with(P1_BEFORE_PKG, P1_BEFORE_LOCK).await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+
+        let mut doc: Value = serde_json::from_str(&fx.read(PACKAGE_JSON).await).unwrap();
+        doc["pnpm"]["peerDependencyRules"] = serde_json::json!({"allowAny": ["left-pad"]});
+        tokio::fs::write(
+            fx.root().join(PACKAGE_JSON),
+            serde_json::to_string_pretty(&doc).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let outcome = revert_pnpm(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        let after: Value = serde_json::from_str(&fx.read(PACKAGE_JSON).await).unwrap();
+        let pnpm_tbl = after
+            .get("pnpm")
+            .and_then(Value::as_object)
+            .expect("pnpm table kept alive by the third-party key");
+        assert!(
+            pnpm_tbl.get("overrides").is_none(),
+            "the emptied created overrides table is still pruned: {pnpm_tbl:?}"
+        );
+        assert!(pnpm_tbl.contains_key("peerDependencyRules"));
+    }
+
+    /// A revert whose lock write fails (read-only project root) fails
+    /// LOUDLY, and the failed atomic write leaves the vendored lock intact
+    /// — never a half-restored pair.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn revert_lock_write_failure_fails_loudly_and_keeps_the_artifact() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root bypasses permission bits; nothing to test
+        }
+        let fx = fixture_with(P1_BEFORE_PKG, P1_BEFORE_LOCK).await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+        let lock_after = fx.read(PNPM_LOCK).await;
+
+        tokio::fs::set_permissions(fx.root(), std::fs::Permissions::from_mode(0o555))
+            .await
+            .unwrap();
+        let outcome = revert_pnpm(&entry, fx.root(), false).await;
+        tokio::fs::set_permissions(fx.root(), std::fs::Permissions::from_mode(0o755))
+            .await
+            .unwrap();
+
+        assert!(!outcome.success, "lock write failure must fail the revert");
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains(&format!("cannot write {PNPM_LOCK}"))),
+            "{:?}",
+            outcome.error
+        );
+        assert_eq!(
+            fx.read(PNPM_LOCK).await,
+            lock_after,
+            "failed atomic write leaves the vendored lock intact"
+        );
+        assert!(fx.root().join(fx.rel_tgz()).exists(), "artifact survives");
+    }
+
+    /// Same failure class one write later: an entry whose wiring touches
+    /// ONLY package.json (so the lock is never written) fails loudly when
+    /// the package.json write fails.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn revert_pkg_write_failure_fails_loudly() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root bypasses permission bits; nothing to test
+        }
+        let fx = fixture_with(P1_BEFORE_PKG, P1_BEFORE_LOCK).await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let mut entry = entry.unwrap();
+        // Keep ONLY the package.json record: the first (and only) surface
+        // write the revert attempts is then package.json itself.
+        entry.wiring.retain(|r| r.file == PACKAGE_JSON);
+        assert_eq!(entry.wiring.len(), 1, "{:?}", entry.wiring);
+        let pkg_after = fx.read(PACKAGE_JSON).await;
+
+        tokio::fs::set_permissions(fx.root(), std::fs::Permissions::from_mode(0o555))
+            .await
+            .unwrap();
+        let outcome = revert_pnpm(&entry, fx.root(), false).await;
+        tokio::fs::set_permissions(fx.root(), std::fs::Permissions::from_mode(0o755))
+            .await
+            .unwrap();
+
+        assert!(!outcome.success, "pkg write failure must fail the revert");
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains(&format!("cannot write {PACKAGE_JSON}"))),
+            "{:?}",
+            outcome.error
+        );
+        assert_eq!(
+            fx.read(PACKAGE_JSON).await,
+            pkg_after,
+            "failed atomic write leaves the vendored pkg intact"
+        );
+    }
+
+    /// An artifact-dir removal failure (read-only `.socket/vendor/npm`
+    /// parent) fails the revert loudly — but only AFTER the wiring restore,
+    /// which has already run and stays restored.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn revert_artifact_removal_failure_fails_loudly_after_restoring_wiring() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root bypasses permission bits; nothing to test
+        }
+        let fx = fixture_with(P1_BEFORE_PKG, P1_BEFORE_LOCK).await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+        let vendor_parent = fx.root().join(".socket/vendor/npm");
+
+        tokio::fs::set_permissions(&vendor_parent, std::fs::Permissions::from_mode(0o555))
+            .await
+            .unwrap();
+        let outcome = revert_pnpm(&entry, fx.root(), false).await;
+        tokio::fs::set_permissions(&vendor_parent, std::fs::Permissions::from_mode(0o755))
+            .await
+            .unwrap();
+
+        assert!(!outcome.success, "removal failure must fail the revert");
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("cannot remove")),
+            "{:?}",
+            outcome.error
+        );
+        assert_eq!(
+            fx.read(PACKAGE_JSON).await,
+            P1_BEFORE_PKG,
+            "wiring restore ran before the removal attempt"
+        );
+        assert_eq!(fx.read(PNPM_LOCK).await, P1_BEFORE_LOCK);
+    }
+
+    /// `--preserve-state` (`keep_artifact`): the wiring restore runs in
+    /// full — pair byte-restored, the created workspace file deleted — but
+    /// the artifact dir stays, and `kept_artifact` stays false (that flag
+    /// is reserved for drift-keeps).
+    #[tokio::test]
+    async fn preserve_state_revert_restores_wiring_but_keeps_the_artifact() {
+        let fx = fixture_with(P1_BEFORE_PKG, P1_BEFORE_LOCK).await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+
+        let outcome = revert_pnpm_opts(
+            &entry,
+            fx.root(),
+            RevertOpts {
+                dry_run: false,
+                keep_artifact: true,
+            },
+        )
+        .await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        assert!(
+            !outcome.kept_artifact,
+            "preserve-state never counts as a drift-keep"
+        );
+        assert_eq!(fx.read(PACKAGE_JSON).await, P1_BEFORE_PKG);
+        assert_eq!(fx.read(PNPM_LOCK).await, P1_BEFORE_LOCK);
+        assert!(
+            !ws_exists(&fx).await,
+            "the created workspace file is wiring, not artifact — still removed"
+        );
+        assert!(fx.root().join(fx.rel_tgz()).exists(), "artifact kept");
+    }
+
+    /// A created-then-user-rewritten workspace file whose `overrides:`
+    /// section is gone entirely is ALREADY CONVERGED for an Added override
+    /// (the reverted state is "no override") — no drift warning, the user's
+    /// file survives, and the artifact removal proceeds.
+    #[tokio::test]
+    async fn ws_rewritten_without_overrides_section_is_converged_for_added() {
+        let fx = fixture_with(P1_BEFORE_PKG, P1_BEFORE_LOCK).await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+        let user_ws = "packages:\n  - '.'\n";
+        write_ws(&fx, user_ws).await;
+
+        let outcome = revert_pnpm(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        assert_eq!(
+            fx.read(PNPM_WORKSPACE).await,
+            user_ws,
+            "the user's rewritten file survives untouched"
+        );
+        assert!(
+            !uuid_dir(&fx).exists(),
+            "converged (not drift): the artifact removal proceeds"
+        );
+    }
+
+    /// The empty-section pruner is a no-op when there is no `overrides:`
+    /// section at all (nothing to prune, nothing disturbed).
+    #[test]
+    fn remove_empty_ws_overrides_section_is_a_noop_without_a_section() {
+        let mut lines = split_lines("packages:\n  - '.'\n");
+        let before = lines.clone();
+        remove_empty_ws_overrides_section(&mut lines);
+        assert_eq!(lines, before);
+    }
+
+    /// The pre-flight refusal scan tolerates importer entries the surgery
+    /// never targets: an inline-valued line at dep indent and a dep entry
+    /// with no `version:` field are both skipped, and the plain registry
+    /// target still passes.
+    #[test]
+    fn refusal_scan_skips_inline_and_fieldless_importer_entries() {
+        let lines = split_lines(
+            "lockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    dependencies:\n      \
+             inline-extra: 1.0.0\n      fieldless:\n        specifier: ^2.0.0\n      \
+             left-pad:\n        specifier: 1.3.0\n        version: 1.3.0\n",
+        );
+        assert_eq!(check_rewritable_refs(&lines, "left-pad", "1.3.0"), Ok(()));
+    }
+
+    /// A dep entry carrying a field that is neither `specifier` nor
+    /// `version` (hand-edited or future-pnpm) is skipped, not misparsed:
+    /// both known fields are still found and the cursor lands past the
+    /// whole field run.
+    #[test]
+    fn dep_field_lines_ignores_unknown_fields() {
+        let lines = split_lines(
+            "        specifier: ^1.0.0\n        engines: whatever\n        version: 1.0.0\n      other:",
+        );
+        let (spec, ver, f) = dep_field_lines(&lines, 0, lines.len());
+        assert_eq!(spec, Some((0, "^1.0.0".to_string())));
+        assert_eq!(ver, Some((2, "1.0.0".to_string())));
+        assert_eq!(f, 3, "cursor stops at the first non-field line");
+    }
+
+    /// The importer/snapshot edits are no-ops on a lock without their
+    /// sections (a deps-free lock has no importer dep entries, and a lock
+    /// without `snapshots:` has nothing to rekey or re-reference).
+    #[test]
+    fn lock_edits_are_noops_without_their_sections() {
+        let rel_tgz = format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz");
+        let spec = format!("file:{rel_tgz}");
+        let ctx = EditCtx {
+            name: "left-pad",
+            version: "1.3.0",
+            rel_tgz: &rel_tgz,
+            spec: &spec,
+            integrity: SPIKE_INTEGRITY,
+            override_key: "left-pad@1.3.0",
+        };
+        let mut lines = split_lines("lockfileVersion: '9.0'\n\nsettings:\n  autoInstallPeers: true\n");
+        let before = lines.clone();
+        let mut wiring = Vec::new();
+        assert_eq!(edit_importers(&mut lines, &ctx, &mut wiring), Ok(false));
+        assert_eq!(edit_snapshot_rekey(&mut lines, &ctx, &mut wiring), Ok(false));
+        assert_eq!(edit_snapshot_refs(&mut lines, &ctx, &mut wiring), Ok(false));
+        assert_eq!(lines, before, "no-ops leave every byte alone");
+        assert!(wiring.is_empty(), "{wiring:?}");
+
+        // A snapshots section with only foreign entries: scanned, untouched.
+        let mut lines = split_lines("lockfileVersion: '9.0'\n\nsnapshots:\n\n  other@1.0.0: {}\n");
+        let before = lines.clone();
+        assert_eq!(edit_snapshot_rekey(&mut lines, &ctx, &mut wiring), Ok(false));
+        assert_eq!(lines, before);
+        assert!(wiring.is_empty(), "{wiring:?}");
+
+        // The packages rewrite is fail-LOUD instead: pre-flight proved the
+        // entry exists, so scanning past every block means it vanished.
+        let mut lines = split_lines(
+            "lockfileVersion: '9.0'\n\npackages:\n\n  other@1.0.0:\n    resolution: {integrity: sha512-x}\n",
+        );
+        let err = edit_packages(&mut lines, &ctx, &mut wiring)
+            .expect_err("a missing target entry must fail loudly");
+        assert!(err.contains("vanished mid-rewrite"), "{err}");
+        assert!(wiring.is_empty(), "{wiring:?}");
+    }
+
+    /// An importer dep entry that lost its `specifier:`/`version:` field
+    /// lines is "no longer exists" for the revert — warned, left alone.
+    #[test]
+    fn importer_dep_revert_with_fieldless_entry_warns_nothing_to_restore() {
+        let mut lines = split_lines("importers:\n\n  .:\n    dependencies:\n      left-pad:\n");
+        let rec = WiringRecord {
+            file: PNPM_LOCK.to_string(),
+            kind: KIND_LOCK_IMPORTER_DEP.to_string(),
+            action: WiringAction::Rewritten,
+            key: Some(".|left-pad".to_string()),
+            original: Some(serde_json::json!({"specifier": "1.3.0", "version": "1.3.0"})),
+            new: Some(serde_json::json!({"specifier": "file:x", "version": "file:x"})),
+        };
+        let mut dirty = false;
+        let mut warnings = Vec::new();
+        revert_importer_dep(&mut lines, &rec, ".|left-pad", UUID, &mut dirty, &mut warnings);
+        assert!(!dirty);
+        assert_warning(&warnings, "vendor_lock_entry_drifted", "no longer exists");
+    }
+
+    /// A record whose `original` lost its `specifier`/`version` fields
+    /// (tampered or truncated state.json) is fail-closed: warned as
+    /// malformed, the live (still-ours) entry left alone.
+    #[test]
+    fn importer_dep_revert_with_malformed_original_warns_left_alone() {
+        let spec = format!("file:.socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz");
+        let text = format!(
+            "importers:\n\n  .:\n    dependencies:\n      left-pad:\n        specifier: {spec}\n        version: {spec}\n"
+        );
+        let mut lines = split_lines(&text);
+        let before = lines.clone();
+        let rec = WiringRecord {
+            file: PNPM_LOCK.to_string(),
+            kind: KIND_LOCK_IMPORTER_DEP.to_string(),
+            action: WiringAction::Rewritten,
+            key: Some(".|left-pad".to_string()),
+            original: Some(serde_json::json!({"bogus": true})),
+            new: Some(serde_json::json!({"specifier": spec, "version": spec})),
+        };
+        let mut dirty = false;
+        let mut warnings = Vec::new();
+        revert_importer_dep(&mut lines, &rec, ".|left-pad", UUID, &mut dirty, &mut warnings);
+        assert!(!dirty);
+        assert_eq!(lines, before, "left alone");
+        assert_warning(&warnings, "vendor_lock_entry_drifted", "original is malformed");
+    }
+
+    /// A rekeyed block that vanished, where the recorded original ALSO
+    /// matches no live block, is drift ("no longer exists") — the converged
+    /// silent return applies only when the original block is live verbatim.
+    #[test]
+    fn packages_block_revert_with_no_live_or_original_match_warns_vanished() {
+        let mut lines = split_lines(
+            "packages:\n\n  other@1.0.0:\n    resolution: {integrity: sha512-o}\n",
+        );
+        let rec = WiringRecord {
+            file: PNPM_LOCK.to_string(),
+            kind: KIND_LOCK_PACKAGE.to_string(),
+            action: WiringAction::Rewritten,
+            key: Some("left-pad@1.3.0".to_string()),
+            original: Some(lines_value(&[
+                "  left-pad@1.3.0:".to_string(),
+                "    resolution: {integrity: sha512-old}".to_string(),
+            ])),
+            new: Some(lines_value(&[
+                format!("  left-pad@file:.socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz:"),
+                "    resolution: {integrity: sha512-new}".to_string(),
+            ])),
+        };
+        let mut dirty = false;
+        let mut warnings = Vec::new();
+        revert_block(
+            &mut lines,
+            &rec,
+            "left-pad@1.3.0",
+            "packages",
+            UUID,
+            &mut dirty,
+            &mut warnings,
+        );
+        assert!(!dirty);
+        assert_warning(&warnings, "vendor_lock_entry_drifted", "no longer exists");
+
+        // Same vanish with NO recorded original (a stripped/reconstructed
+        // record): the converged probe is skipped — still the same drift
+        // warning, never a silent pass.
+        let rec = WiringRecord {
+            original: None,
+            ..rec
+        };
+        let mut dirty = false;
+        let mut warnings = Vec::new();
+        revert_block(
+            &mut lines,
+            &rec,
+            "left-pad@1.3.0",
+            "packages",
+            UUID,
+            &mut dirty,
+            &mut warnings,
+        );
+        assert!(!dirty);
+        assert_warning(&warnings, "vendor_lock_entry_drifted", "no longer exists");
+    }
+
+    /// The unwind helper restores exactly what was written: with no
+    /// package.json write to unwind, only the edited workspace file is
+    /// byte-restored — and without recorded original bytes it deliberately
+    /// leaves the file alone rather than delete or guess.
+    #[tokio::test]
+    async fn unwind_restores_edited_ws_and_skips_surfaces_it_never_wrote() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        tokio::fs::write(root.join(PACKAGE_JSON), b"pkg untouched")
+            .await
+            .unwrap();
+        tokio::fs::write(root.join(PNPM_WORKSPACE), b"clobbered")
+            .await
+            .unwrap();
+
+        unwind_override_surfaces(root, None, b"never written", true, Some(b"original ws\n"), false)
+            .await;
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(PACKAGE_JSON))
+                .await
+                .unwrap(),
+            "pkg untouched",
+            "no pkg write happened, so none is unwound"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(PNPM_WORKSPACE))
+                .await
+                .unwrap(),
+            "original ws\n",
+            "edited ws byte-restored"
+        );
+
+        // Edited-but-no-original (defensive combination): left alone.
+        tokio::fs::write(root.join(PNPM_WORKSPACE), b"clobbered again")
+            .await
+            .unwrap();
+        unwind_override_surfaces(root, None, b"never written", true, None, false).await;
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(PNPM_WORKSPACE))
+                .await
+                .unwrap(),
+            "clobbered again",
+            "no original bytes recorded: the unwind must not delete or guess"
+        );
+    }
 }

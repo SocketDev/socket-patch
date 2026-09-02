@@ -4396,4 +4396,463 @@ packages:
             "the artifact dir is left behind for a re-run to clean up"
         );
     }
+
+    // ── coverage mop-up 2026-09: grammar naming, coordinate guard routing,
+    //    marker degradation, malformed/hand-edited lock tolerance, and the
+    //    remaining revert left-alone shapes ─────────────────────────────────
+
+    /// The grammar names quoted in user-facing refusals/warnings each carry
+    /// their lockfileVersion (the V9 spelling is only reachable through
+    /// diagnostics, never the legacy surgery — pinned here directly).
+    #[test]
+    fn grammar_describe_names_each_lockfile_version() {
+        assert_eq!(
+            PnpmLockGrammar::V9.describe(),
+            "pnpm >= 9 (lockfileVersion 9.0)"
+        );
+        assert_eq!(
+            PnpmLockGrammar::V54.describe(),
+            "pnpm 7 (lockfileVersion 5.4)"
+        );
+        assert_eq!(
+            PnpmLockGrammar::V60.describe(),
+            "pnpm 8 (lockfileVersion 6.0)"
+        );
+    }
+
+    /// SECURITY: a tampered manifest uuid (the artifact-path escape class)
+    /// refuses through the shared coordinate guard BEFORE the pair is even
+    /// read — nothing on disk changes.
+    #[tokio::test]
+    async fn unsafe_coordinates_refuse_before_any_write() {
+        let fx = fixture_with(T_BEFORE_PKG, T7_BEFORE_LOCK).await;
+        let blobs = fx.root().join(".socket/blobs");
+        let sources = PatchSources::blobs_only(&blobs);
+        let mut record = fx.record.clone();
+        record.uuid = "../escape".to_string();
+        let outcome = vendor_pnpm_legacy(
+            "pkg:npm/left-pad@1.3.0",
+            &fx.installed(),
+            fx.root(),
+            &record,
+            &sources,
+            "2026-08-18T00:00:00Z",
+            false,
+            false,
+            None,
+        )
+        .await;
+        let detail = expect_refused(outcome, "unsafe_coordinates");
+        assert!(detail.contains("non-canonical patch uuid"), "{detail}");
+        assert_eq!(fx.read(PACKAGE_JSON).await, T_BEFORE_PKG);
+        assert_eq!(fx.read(PNPM_LOCK).await, T7_BEFORE_LOCK);
+        assert!(!fx.root().join(".socket/vendor").exists());
+    }
+
+    /// The marker is informational only: a marker that cannot be written
+    /// (its path squatted by a non-empty directory) degrades to the
+    /// `vendor_marker_write_failed` warning AFTER the pair committed — the
+    /// vendor still succeeds and records its ledger entry.
+    #[tokio::test]
+    async fn marker_write_failure_degrades_to_a_warning_after_commit() {
+        let fx = fixture_with(T_BEFORE_PKG, T7_BEFORE_LOCK).await;
+        let marker_path = fx.root().join(format!(
+            ".socket/vendor/npm/{UUID}/{}",
+            crate::vendor::state::VENDOR_MARKER_FILE
+        ));
+        tokio::fs::create_dir_all(marker_path.join("squatter"))
+            .await
+            .unwrap();
+
+        let (result, entry, warnings) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        assert!(entry.is_some(), "the wiring itself succeeded");
+        assert!(
+            warnings.iter().any(|w| w.code == "vendor_marker_write_failed"),
+            "{warnings:?}"
+        );
+        assert_eq!(fx.read(PACKAGE_JSON).await, T_AFTER_PKG);
+        assert_eq!(
+            fx.read(PNPM_LOCK).await,
+            fx.expected_lock(T7_AFTER_LOCK).await
+        );
+    }
+
+    /// A v6.0 root dep entry for the TARGET that lost its `version:` field
+    /// (a truncated / hand-edited lock) is tolerated, not corrupted: the
+    /// refs guard skips it, the root-dep surgery leaves it byte-untouched
+    /// (unknown fields like `extra:` included), and with no root-dep hit
+    /// neither the absolute specifier nor its portability warning appears —
+    /// while the packages rekey and the consumer ref still wire, and revert
+    /// restores the original bytes.
+    #[tokio::test]
+    async fn v60_root_dep_entry_missing_its_version_field_is_left_alone() {
+        const MALFORMED: &str = "lockfileVersion: '6.0'
+
+dependencies:
+  consumer:
+    specifier: file:./consumer
+    version: file:consumer
+  left-pad:
+    specifier: 1.3.0
+    extra: x
+
+packages:
+
+  /left-pad@1.3.0:
+    resolution: {integrity: sha512-XI5MPzVNApjAyhQzphX8BkmKsKUxD4LdyK24iZeQGinBN9yTQT3bFlCBy/aVx2HrNcqQGsdot8ghrjyrvMCoEA==}
+    dev: false
+
+  file:consumer:
+    resolution: {directory: consumer, type: directory}
+    name: consumer
+    dependencies:
+      left-pad: 1.3.0
+    dev: false
+";
+        let fx = fixture_with(T_BEFORE_PKG, MALFORMED).await;
+        let (result, entry, warnings) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        let entry = entry.expect("the lock still wires through packages + refs");
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| w.code == "vendor_pnpm_legacy_absolute_specifier"),
+            "no root-dep hit ⇒ no absolute specifier caveat: {warnings:?}"
+        );
+        let kinds: Vec<&str> = entry.wiring.iter().map(|r| r.kind.as_str()).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "pnpm_pkg_override",
+                KIND_LOCK_OVERRIDES,
+                KIND_LOCK_PACKAGE,
+                KIND_LOCK_PKG_DEP_REF,
+            ],
+            "{:?}",
+            entry.wiring
+        );
+
+        let rel = fx.rel_tgz();
+        let expected = MALFORMED
+            .replace(
+                "lockfileVersion: '6.0'\n\ndependencies:",
+                &format!(
+                    "lockfileVersion: '6.0'\n\noverrides:\n  left-pad@1.3.0: file:{rel}\n\ndependencies:"
+                ),
+            )
+            .replace(
+                "  /left-pad@1.3.0:\n    resolution: {integrity: sha512-XI5MPzVNApjAyhQzphX8BkmKsKUxD4LdyK24iZeQGinBN9yTQT3bFlCBy/aVx2HrNcqQGsdot8ghrjyrvMCoEA==}\n    dev: false\n",
+                &format!(
+                    "  file:{rel}:\n    resolution: {{integrity: {}, tarball: file:{rel}}}\n    name: left-pad\n    version: 1.3.0\n    dev: false\n",
+                    fx.actual_integrity().await
+                ),
+            )
+            .replace(
+                "\n      left-pad: 1.3.0\n",
+                &format!("\n      left-pad: file:{rel}\n"),
+            );
+        assert_eq!(fx.read(PNPM_LOCK).await, expected);
+
+        let outcome = revert_pnpm_legacy(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        assert_eq!(fx.read(PNPM_LOCK).await, MALFORMED, "lock byte-restored");
+        assert_eq!(fx.read(PACKAGE_JSON).await, T_BEFORE_PKG);
+    }
+
+    /// The v5.4 specifier splice degrades quietly on hand-degraded locks:
+    /// with NO `specifiers:` section, and with a section that carries a
+    /// non-entry line plus no entry for the target, the root-dep wiring
+    /// (and its absolute-path caveat) still lands with no specifier record.
+    #[tokio::test]
+    async fn v54_specifier_surgery_degrades_when_the_section_or_entry_is_missing() {
+        // (a) no specifiers section at all.
+        const NO_SECTION: &str = "lockfileVersion: 5.4
+
+dependencies:
+  left-pad: 1.3.0
+
+packages:
+
+  /left-pad/1.3.0:
+    resolution: {integrity: sha512-XI5MPzVNApjAyhQzphX8BkmKsKUxD4LdyK24iZeQGinBN9yTQT3bFlCBy/aVx2HrNcqQGsdot8ghrjyrvMCoEA==}
+    dev: false
+";
+        let fx = fixture_with(T_BEFORE_PKG, NO_SECTION).await;
+        let (result, entry, warnings) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        let entry = entry.unwrap();
+        let kinds: Vec<&str> = entry.wiring.iter().map(|r| r.kind.as_str()).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "pnpm_pkg_override",
+                KIND_LOCK_OVERRIDES,
+                KIND_LOCK_ROOT_DEP,
+                KIND_LOCK_PACKAGE,
+            ],
+            "{:?}",
+            entry.wiring
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.code == "vendor_pnpm_legacy_absolute_specifier"),
+            "the root dep DID move: {warnings:?}"
+        );
+        let lock = fx.read(PNPM_LOCK).await;
+        assert!(
+            lock.contains(&format!("\n  left-pad: file:{}\n", fx.rel_tgz())),
+            "{lock}"
+        );
+        assert!(!lock.contains("specifiers:"), "{lock}");
+
+        // (b) a specifiers section with a stray non-entry line and NO entry
+        // for the target — both skipped, the section byte-untouched.
+        const NO_ENTRY: &str = "lockfileVersion: 5.4
+
+specifiers:
+  # pruned by hand
+  consumer: file:./consumer
+
+dependencies:
+  consumer: file:consumer
+  left-pad: 1.3.0
+
+packages:
+
+  /left-pad/1.3.0:
+    resolution: {integrity: sha512-XI5MPzVNApjAyhQzphX8BkmKsKUxD4LdyK24iZeQGinBN9yTQT3bFlCBy/aVx2HrNcqQGsdot8ghrjyrvMCoEA==}
+    dev: false
+";
+        let fx = fixture_with(T_BEFORE_PKG, NO_ENTRY).await;
+        let (result, entry, _) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        let entry = entry.unwrap();
+        assert!(
+            !entry.wiring.iter().any(|r| r.kind == KIND_LOCK_SPECIFIER),
+            "no specifier entry ⇒ no specifier record: {:?}",
+            entry.wiring
+        );
+        let lock = fx.read(PNPM_LOCK).await;
+        assert!(
+            lock.contains("specifiers:\n  # pruned by hand\n  consumer: file:./consumer\n\n"),
+            "the degraded section is byte-untouched:\n{lock}"
+        );
+    }
+
+    /// Direct editor contracts when the pre-flighted target is missing:
+    /// `edit_packages` fails CLOSED (a silent success would wire a tarball
+    /// nothing resolves through), while `edit_pkg_dep_refs` is a benign
+    /// no-op (transitive refs are optional).
+    #[test]
+    fn packages_editors_fail_closed_or_noop_without_their_target() {
+        let rel_tgz = format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz");
+        let spec = format!("file:{rel_tgz}");
+        let abs_spec = format!("file:/checkout/{rel_tgz}");
+        let ctx = Ctx {
+            grammar: PnpmLockGrammar::V54,
+            name: "left-pad",
+            version: "1.3.0",
+            rel_tgz: &rel_tgz,
+            spec: &spec,
+            abs_spec: &abs_spec,
+            integrity: SPIKE_INTEGRITY,
+            override_key: "left-pad@1.3.0",
+        };
+        let mut wiring = Vec::new();
+
+        let mut lines = split_lines(
+            "lockfileVersion: 5.4\n\npackages:\n\n  /other/1.0.0:\n    resolution: {integrity: sha512-AAA}\n    dev: false\n",
+        );
+        let err = edit_packages(&mut lines, &ctx, &mut wiring).unwrap_err();
+        assert!(err.contains("vanished mid-rewrite"), "{err}");
+        assert!(wiring.is_empty(), "a failed edit records no wiring");
+
+        let mut lines =
+            split_lines("lockfileVersion: 5.4\n\ndependencies:\n  left-pad: 1.3.0\n");
+        assert_eq!(edit_pkg_dep_refs(&mut lines, &ctx, &mut wiring), Ok(false));
+        assert!(wiring.is_empty());
+    }
+
+    /// Everything the surgery must NOT rewrite rides vendor + revert
+    /// byte-untouched: a `peerDependencies:` ref to the exact target (peer
+    /// values are ranges, never resolutions), a stray non-entry line inside
+    /// a dep map, and a foreign dep entry — while the real resolution ref
+    /// on the same map still wires and reverts. Full byte oracles both ways.
+    #[tokio::test]
+    async fn peer_maps_comments_and_foreign_deps_ride_vendor_and_revert_untouched() {
+        const TOLERANT: &str = "lockfileVersion: 5.4
+
+specifiers:
+  consumer: file:./consumer
+  left-pad: ^1.3.0
+
+dependencies:
+  consumer: file:consumer
+  left-pad: 1.3.0
+
+packages:
+
+  /left-pad/1.3.0:
+    resolution: {integrity: sha512-XI5MPzVNApjAyhQzphX8BkmKsKUxD4LdyK24iZeQGinBN9yTQT3bFlCBy/aVx2HrNcqQGsdot8ghrjyrvMCoEA==}
+    deprecated: use String.prototype.padStart()
+    dev: false
+
+  file:consumer:
+    resolution: {directory: consumer, type: directory}
+    name: consumer
+    version: 1.0.0
+    peerDependencies:
+      left-pad: '>=1'
+    dependencies:
+      # hand-pinned
+      another: 1.0.0
+      left-pad: 1.3.0
+    dev: false
+";
+        let fx = fixture_with(T_BEFORE_PKG, TOLERANT).await;
+        let (result, entry, _) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        let entry = entry.unwrap();
+
+        let rel = fx.rel_tgz();
+        let here = fx.canon_root_str();
+        let expected = TOLERANT
+            .replace(
+                "lockfileVersion: 5.4\n\nspecifiers:",
+                &format!(
+                    "lockfileVersion: 5.4\n\noverrides:\n  left-pad@1.3.0: file:{rel}\n\nspecifiers:"
+                ),
+            )
+            .replace(
+                "\n  left-pad: ^1.3.0\n",
+                &format!("\n  left-pad: file:{here}/{rel}\n"),
+            )
+            .replace(
+                "\n  left-pad: 1.3.0\n",
+                &format!("\n  left-pad: file:{rel}\n"),
+            )
+            .replace(
+                "  /left-pad/1.3.0:\n    resolution: {integrity: sha512-XI5MPzVNApjAyhQzphX8BkmKsKUxD4LdyK24iZeQGinBN9yTQT3bFlCBy/aVx2HrNcqQGsdot8ghrjyrvMCoEA==}\n    deprecated: use String.prototype.padStart()\n    dev: false\n",
+                &format!(
+                    "  file:{rel}:\n    resolution: {{integrity: {}, tarball: file:{rel}}}\n    name: left-pad\n    version: 1.3.0\n    dev: false\n",
+                    fx.actual_integrity().await
+                ),
+            )
+            .replace(
+                "\n      left-pad: 1.3.0\n",
+                &format!("\n      left-pad: file:{rel}\n"),
+            );
+        // The peer ref, the stray line, and the foreign dep survive verbatim
+        // by construction of `expected` (only the four wired lines moved).
+        assert_eq!(fx.read(PNPM_LOCK).await, expected);
+        assert!(
+            expected.contains("    peerDependencies:\n      left-pad: '>=1'\n"),
+            "oracle sanity: the peer range is present and untouched"
+        );
+
+        let outcome = revert_pnpm_legacy(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        assert_eq!(fx.read(PNPM_LOCK).await, TOLERANT, "lock byte-restored");
+        assert_eq!(fx.read(PACKAGE_JSON).await, T_BEFORE_PKG);
+        assert!(
+            !fx.root()
+                .join(format!(".socket/vendor/npm/{UUID}"))
+                .exists(),
+            "a clean revert removes the artifact dir"
+        );
+    }
+
+    /// An entry with NO pnpm meta (an older/foreign ledger shape) reverts
+    /// the wiring but NEVER deletes the override tables — without creation
+    /// provenance they might be the user's, so the emptied tables stay.
+    #[tokio::test]
+    async fn revert_without_pnpm_meta_keeps_the_emptied_tables() {
+        let (fx, mut entry) = vendored(T7_BEFORE_LOCK).await;
+        entry.pnpm = None;
+        let outcome = revert_pnpm_legacy(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        assert_eq!(fx.read(PNPM_LOCK).await, T7_BEFORE_LOCK, "lock restored");
+        let pkg = fx.read(PACKAGE_JSON).await;
+        assert!(
+            pkg.contains("\"pnpm\": {"),
+            "the pnpm table stays without creation provenance: {pkg}"
+        );
+        assert!(
+            pkg.contains("\"overrides\": {}"),
+            "the overrides table stays, emptied: {pkg}"
+        );
+        assert!(
+            !fx.root()
+                .join(format!(".socket/vendor/npm/{UUID}"))
+                .exists(),
+            "the artifact dir is still removed"
+        );
+    }
+
+    /// A packages record whose `new` fragment names a block we cannot prove
+    /// ours (no vendor-path key) and whose live bytes differ is left alone
+    /// with a drift warning — the fail-closed ownership check for a
+    /// tampered/corrupted state.json record.
+    #[tokio::test]
+    async fn package_record_pointing_at_an_unowned_block_is_left_alone() {
+        let (fx, mut entry) = vendored(T7_BEFORE_LOCK).await;
+        let rec = entry
+            .wiring
+            .iter_mut()
+            .find(|r| r.kind == KIND_LOCK_PACKAGE)
+            .unwrap();
+        rec.new = Some(lines_value(&[
+            "  file:consumer:".to_string(),
+            "    resolution: {directory: consumer, type: directory}".to_string(),
+        ]));
+        assert_drift_keep(
+            &fx,
+            &entry,
+            "packages entry `file:consumer` was changed since vendoring",
+            1,
+        )
+        .await;
+        assert!(
+            fx.read(PNPM_LOCK).await.contains(
+                "\n  file:consumer:\n    resolution: {directory: consumer, type: directory}\n    name: consumer\n"
+            ),
+            "the unowned block survives verbatim"
+        );
+    }
+
+    /// Our rekeyed block gone (user re-locked) AND the record's original
+    /// stripped (corrupted ledger): with neither the live block nor a
+    /// converged original to anchor on, the record warns `no longer exists`
+    /// and the artifact is kept.
+    #[tokio::test]
+    async fn missing_block_with_no_recorded_original_warns_no_longer_exists() {
+        let (fx, mut entry) = vendored(T7_BEFORE_LOCK).await;
+        let rel = fx.rel_tgz();
+        let wired = fx.read(PNPM_LOCK).await;
+        let i = wired.find(&format!("\n\n  file:{rel}:")).unwrap();
+        let j = wired.find("\n\n  file:consumer:").unwrap();
+        assert!(i < j);
+        let tampered_lock = format!("{}{}", &wired[..i], &wired[j..]);
+        tokio::fs::write(fx.root().join(PNPM_LOCK), &tampered_lock)
+            .await
+            .unwrap();
+        let rec = entry
+            .wiring
+            .iter_mut()
+            .find(|r| r.kind == KIND_LOCK_PACKAGE)
+            .unwrap();
+        rec.original = None;
+        assert_drift_keep(
+            &fx,
+            &entry,
+            &format!("packages entry `file:{rel}` no longer exists"),
+            1,
+        )
+        .await;
+    }
 }

@@ -1357,6 +1357,68 @@ mod tests {
         );
     }
 
+    /// Direct probe of `scan_lock_matches`' defensive fallback: the caller
+    /// validates that `packages` is an object before scanning, but the scan
+    /// itself must degrade to "no matches" — never panic — when the key is
+    /// missing or the wrong shape.
+    #[test]
+    fn scan_degrades_to_no_matches_when_packages_is_missing_or_not_an_object() {
+        for lock in [json!({"lockfileVersion": 3}), json!({"packages": []})] {
+            let mut warnings = Vec::new();
+            assert!(
+                matches!(
+                    scan_lock_matches(&lock, "left-pad", "1.3.0", &mut warnings),
+                    LockScan::Matches(m) if m.is_empty()
+                ),
+                "defensive scan of {lock} must yield no matches"
+            );
+            assert!(warnings.is_empty(), "{warnings:?}");
+        }
+    }
+
+    /// The staged copy's nested `node_modules` (hoisting leftovers,
+    /// `file:`-dep installs) is pruned before packing: the vendored tarball
+    /// carries the patched files but never a `package/node_modules/…`
+    /// member (npm itself never packs nested deps; shipping them would
+    /// balloon the artifact and change the install layout). The prune runs
+    /// on the STAGE only — the installed tree keeps its nested dir.
+    #[tokio::test]
+    async fn vendored_tarball_omits_the_installed_trees_nested_node_modules() {
+        let fx = fixture().await;
+        let nested = fx.installed().join("node_modules/junk");
+        tokio::fs::create_dir_all(&nested).await.unwrap();
+        tokio::fs::write(
+            nested.join("package.json"),
+            br#"{"name":"junk","version":"0.0.1"}"#,
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(nested.join("index.js"), b"module.exports = 42;\n")
+            .await
+            .unwrap();
+
+        let (result, _, _) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+
+        let tgz = tokio::fs::read(fx.root().join(fx.expected_rel_tgz()))
+            .await
+            .unwrap();
+        assert_eq!(
+            tgz_member(&tgz, "package/index.js").unwrap(),
+            PATCHED_INDEX,
+            "the patched bytes are still packed"
+        );
+        assert_eq!(
+            tgz_member(&tgz, "package/node_modules/junk/index.js"),
+            None,
+            "nested node_modules must be pruned from the pack"
+        );
+        assert!(
+            tokio::fs::metadata(nested.join("index.js")).await.is_ok(),
+            "only the stage is pruned; the installed tree keeps its nested dir"
+        );
+    }
+
     /// Auto-force must NOT inherit force's silent NotFound skip: a missing
     /// patch-target file still fails closed (a tarball without the fix
     /// must never be packed), leaving the project byte-untouched.

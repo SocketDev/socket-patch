@@ -3285,4 +3285,222 @@ mod tests {
             "artifacts must survive a failed restore"
         );
     }
+
+    // ───────────────────── coverage: staged-swap edges ─────────────────────
+
+    /// A rootless copy dir has no parent to stage siblings in; the swap
+    /// helpers degrade to suffixing the path itself instead of panicking.
+    #[test]
+    fn test_swap_sibling_fallback_for_rootless_copy_dir() {
+        assert_eq!(
+            stage_dir_for(Path::new("/")),
+            PathBuf::from("/.socket-stage")
+        );
+        assert_eq!(backup_dir_for(Path::new("/")), PathBuf::from("/.socket-old"));
+    }
+
+    /// A swap whose stage is gone (crash window / concurrent cleanup) must
+    /// fail AND put the parked old copy back — no step may leave less
+    /// recoverable state than it started with.
+    #[tokio::test]
+    async fn test_swap_missing_stage_restores_parked_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let copy = dir.path().join("log@3.0.2");
+        tokio::fs::create_dir_all(&copy).await.unwrap();
+        tokio::fs::write(copy.join("keep.php"), b"live copy")
+            .await
+            .unwrap();
+        let stage = stage_dir_for(&copy); // never created
+
+        let err = swap_stage_into_place(&stage, &copy)
+            .await
+            .expect_err("swapping a missing stage must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(
+            tokio::fs::read(copy.join("keep.php")).await.unwrap(),
+            b"live copy".to_vec(),
+            "the parked copy must be restored after the failed swap"
+        );
+        assert!(
+            !backup_dir_for(&copy).exists(),
+            "no .socket-old husk may remain after the restore"
+        );
+    }
+
+    /// A park rename that fails for a real reason (EACCES on a read-only
+    /// parent — not the benign no-previous-copy NotFound) must bubble the
+    /// error with the live copy and the stage still in place.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_swap_park_rename_failure_bubbles() {
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root ignores mode bits — the trigger cannot fire
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let hold = dir.path().join("hold");
+        let copy = hold.join("log@3.0.2");
+        tokio::fs::create_dir_all(&copy).await.unwrap();
+        tokio::fs::write(copy.join("keep.php"), b"live copy")
+            .await
+            .unwrap();
+        let stage = stage_dir_for(&copy);
+        tokio::fs::create_dir_all(&stage).await.unwrap();
+        tokio::fs::write(stage.join("new.php"), b"rebuilt").await.unwrap();
+
+        let guard = ModeGuard::set(&hold, 0o555);
+        let result = swap_stage_into_place(&stage, &copy).await;
+        drop(guard);
+
+        let err = result.expect_err("a read-only parent must fail the park rename");
+        assert_ne!(
+            err.kind(),
+            std::io::ErrorKind::NotFound,
+            "the failure is a real error, not the benign no-old-copy case"
+        );
+        assert_eq!(
+            tokio::fs::read(copy.join("keep.php")).await.unwrap(),
+            b"live copy".to_vec(),
+            "the live copy must be untouched"
+        );
+        assert!(stage.exists(), "the stage is left for the caller's cleanup");
+    }
+
+    /// Wired lock + drifted copy + a SUCCEEDING local rebuild: the staged
+    /// rebuild swaps over the drifted copy in place — parking it and then
+    /// clearing the `.socket-old` backup — while the lock stays
+    /// byte-identical and no ledger entry is re-recorded.
+    #[tokio::test]
+    async fn test_wired_drifted_copy_rebuild_swaps_over_old_copy() {
+        let lock = lock_value("psr/log", "3.0.2", false);
+        let (dir, blobs, installed, record) = fixture(&lock).await;
+        let root = dir.path();
+
+        let (r1, e1, _) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, PURL, false).await);
+        assert!(r1.success, "{:?}", r1.error);
+        assert!(e1.is_some());
+        let lock_bytes = tokio::fs::read(root.join(COMPOSER_LOCK)).await.unwrap();
+
+        // Drift the committed copy (a hand edit); the rerun rebuilds it.
+        let drifted = root.join(copy_rel()).join("src/LoggerInterface.php");
+        tokio::fs::write(&drifted, b"<?php // drifted\n").await.unwrap();
+
+        let (r2, e2, w2) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, PURL, false).await);
+        assert!(r2.success, "{:?}", r2.error);
+        assert!(e2.is_none(), "artifact-only rebuild must not re-record");
+        assert!(
+            w2.iter().any(|w| w.code == "vendor_artifact_rebuilt"),
+            "{w2:?}"
+        );
+        assert_eq!(
+            tokio::fs::read(&drifted).await.unwrap(),
+            PATCHED,
+            "the drifted copy is replaced by the rebuilt one"
+        );
+        assert!(
+            !root.join(format!("{}.socket-old", copy_rel())).exists(),
+            "the parked old copy is deleted after a successful swap"
+        );
+        assert!(
+            !root.join(format!("{}.socket-stage", copy_rel())).exists(),
+            "no stage sibling survives a successful swap"
+        );
+        assert_eq!(
+            tokio::fs::read(root.join(COMPOSER_LOCK)).await.unwrap(),
+            lock_bytes,
+            "composer.lock untouched by the rebuild"
+        );
+    }
+
+    /// A fresh vendor whose final stage→copy swap fails must report the
+    /// failure, leave composer.lock untouched, and unwind the never-wired
+    /// uuid dir. Trigger: a regular file squatting the `.socket-old` backup
+    /// path — `remove_dir_all` on a file fails ENOTDIR on every platform, so
+    /// the swap's park step errors deterministically, permission-free.
+    #[tokio::test]
+    async fn test_fresh_vendor_swap_failure_reports_and_unwinds() {
+        let lock = lock_value("psr/log", "3.0.2", false);
+        let (dir, blobs, installed, record) = fixture(&lock).await;
+        let root = dir.path();
+        let before = tokio::fs::read(root.join(COMPOSER_LOCK)).await.unwrap();
+
+        let pkg_parent = root.join(format!(".socket/vendor/composer/{UUID}/psr"));
+        tokio::fs::create_dir_all(&pkg_parent).await.unwrap();
+        tokio::fs::write(pkg_parent.join("log@3.0.2.socket-old"), b"squatter")
+            .await
+            .unwrap();
+
+        let (result, entry, _w) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, PURL, false).await);
+        assert!(!result.success);
+        let err = result.error.clone().unwrap_or_default();
+        assert!(
+            err.contains("failed to move the rebuilt copy into place"),
+            "{err}"
+        );
+        assert!(entry.is_none());
+        assert!(
+            !root.join(".socket/vendor").exists(),
+            "a failed fresh vendor must unwind the never-wired uuid dir"
+        );
+        assert_eq!(
+            tokio::fs::read(root.join(COMPOSER_LOCK)).await.unwrap(),
+            before,
+            "lock untouched on failure (wiring runs last)"
+        );
+    }
+
+    /// The same squatting-backup swap failure through the SERVICE path: the
+    /// verified extract cannot be moved into place → hard
+    /// `vendor_prebuilt_write_failed`, no copy lands at the wired path, and
+    /// composer.lock is untouched.
+    #[tokio::test]
+    async fn service_swap_failure_hard_fails_write_failed() {
+        let lock = lock_value("psr/log", "3.0.2", false);
+        let (dir, blobs, installed, record) = fixture(&lock).await;
+        let root = dir.path();
+        let before = tokio::fs::read(root.join(COMPOSER_LOCK)).await.unwrap();
+        let zip = make_dist_zip(
+            "php-fig-log-f16e1d5",
+            &[
+                ("src/LoggerInterface.php", PATCHED),
+                ("composer.json", b"{\"name\": \"psr/log\"}\n"),
+            ],
+        );
+        let sri = sri_sha512(&zip);
+        let server = wiremock::MockServer::start().await;
+        mount_composer_granted(&server, &sri, &zip).await;
+
+        let pkg_parent = root.join(format!(".socket/vendor/composer/{UUID}/psr"));
+        tokio::fs::create_dir_all(&pkg_parent).await.unwrap();
+        tokio::fs::write(pkg_parent.join("log@3.0.2.socket-old"), b"squatter")
+            .await
+            .unwrap();
+
+        let (code, detail) = unwrap_refused(
+            vendor_with_service(
+                root,
+                &blobs,
+                &installed,
+                &record,
+                &composer_service_cfg(&server.uri(), VendorSource::Service, false),
+            )
+            .await,
+        );
+        assert_eq!(code, "vendor_prebuilt_write_failed");
+        assert!(
+            detail.contains("cannot move the extracted dist into place"),
+            "{detail}"
+        );
+        assert!(
+            !root.join(copy_rel()).exists(),
+            "no copy may land at the wired path after a failed swap"
+        );
+        assert_eq!(
+            tokio::fs::read(root.join(COMPOSER_LOCK)).await.unwrap(),
+            before,
+            "lock untouched"
+        );
+    }
 }

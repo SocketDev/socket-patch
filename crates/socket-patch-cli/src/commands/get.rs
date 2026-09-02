@@ -4508,4 +4508,571 @@ mod tests {
             "warning must explain the keep-all fallback; json={json}"
         );
     }
+
+    // --- coverage mop-up (2026-09 final wave) -------------------------------
+
+    /// `merge_metadata` is a best-effort splice: a non-object record (or a
+    /// non-object metadata value) must be left untouched, never panic —
+    /// callers hand it freshly-built json! values, but the contract is
+    /// defensive on both sides.
+    #[test]
+    fn merge_metadata_leaves_non_object_inputs_untouched() {
+        // Non-object record: nothing to insert into.
+        let mut record = serde_json::Value::Null;
+        merge_metadata(&mut record, serde_json::json!({"severity": "high"}));
+        assert!(record.is_null(), "a non-object record must stay untouched");
+
+        // Non-object metadata: nothing to splice from.
+        let mut record = serde_json::json!({"purl": "pkg:npm/x@1.0.0"});
+        merge_metadata(&mut record, serde_json::Value::String("nope".into()));
+        assert_eq!(record, serde_json::json!({"purl": "pkg:npm/x@1.0.0"}));
+    }
+
+    /// The `IdentifierType` Display labels are user-facing vocabulary (the
+    /// "No patches found for {type}: {id}" terminal) — pin all five.
+    #[test]
+    fn identifier_type_display_labels_are_stable() {
+        assert_eq!(IdentifierType::Uuid.to_string(), "UUID");
+        assert_eq!(IdentifierType::Cve.to_string(), "CVE");
+        assert_eq!(IdentifierType::Ghsa.to_string(), "GHSA");
+        assert_eq!(IdentifierType::Purl.to_string(), "PURL");
+        assert_eq!(IdentifierType::Package.to_string(), "package name");
+    }
+
+    /// JSON mode with multiple free patches for one purl: the
+    /// `selection_required` options must carry each patch's vulnerability
+    /// details (id/cves/severity/summary) so a bot can choose without a
+    /// second query. The existing json-mode test used vuln-less patches, so
+    /// the serialization closure never ran.
+    #[test]
+    fn select_json_mode_multi_free_options_serialize_vulnerabilities() {
+        let mut a = mk_patch("a", "pkg:npm/foo@1.0", "free", "2024-01-01");
+        a.vulnerabilities.insert(
+            "GHSA-aaaa-bbbb-cccc".to_string(),
+            VulnerabilityResponse {
+                cves: vec!["CVE-2024-1111".to_string()],
+                summary: "summary-a".to_string(),
+                severity: "high".to_string(),
+                description: "desc-a".to_string(),
+            },
+        );
+        let mut b = mk_patch("b", "pkg:npm/foo@1.0", "free", "2024-02-01");
+        b.vulnerabilities.insert(
+            "GHSA-dddd-eeee-ffff".to_string(),
+            VulnerabilityResponse {
+                cves: vec![],
+                summary: "summary-b".to_string(),
+                severity: "low".to_string(),
+                description: "desc-b".to_string(),
+            },
+        );
+        let result = select_patches(&[a, b], false, true);
+        assert_eq!(
+            result.err(),
+            Some(1),
+            "json mode with multiple free candidates must error with exit 1"
+        );
+    }
+
+    /// `fold_narrowing_into_result` on a non-object envelope (the error
+    /// shapes are the callers' concern) must be a calm no-op.
+    #[test]
+    fn fold_narrowing_ignores_non_object_result() {
+        let mut result = serde_json::json!(["not", "an", "object"]);
+        fold_narrowing_into_result(
+            &mut result,
+            &[serde_json::json!({"purl": "p", "action": "skipped"})],
+            &[("code".to_string(), "detail".to_string())],
+        );
+        assert_eq!(result, serde_json::json!(["not", "an", "object"]));
+    }
+
+    /// A corrupt vendor ledger must degrade the coarse narrowing to "no
+    /// ledger extension" (the download path's fail-closed read still guards
+    /// writes): a purl claimed by nothing else is skipped as not installed,
+    /// never kept on the strength of an unreadable state file.
+    #[tokio::test]
+    async fn filter_to_installed_purls_corrupt_vendor_state_degrades_to_no_extension() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vendor = tmp.path().join(".socket/vendor");
+        std::fs::create_dir_all(&vendor).unwrap();
+        std::fs::write(vendor.join("state.json"), b"{ not json").unwrap();
+
+        let common = crate::args::GlobalArgs {
+            cwd: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
+        let accessible = vec![mk_patch(
+            "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+            "pkg:npm/covgap-ledger-only@1.0.0",
+            "free",
+            "2024-01-01",
+        )];
+        let out = filter_to_installed_purls(
+            &accessible,
+            &common,
+            crate::commands::scan::ScanMode::Hosted,
+        )
+        .await;
+        assert!(out.kept.is_empty(), "nothing may be kept via a corrupt ledger");
+        assert_eq!(out.skip_records.len(), 1);
+        assert_eq!(out.skip_records[0]["errorCode"], "package_not_installed");
+    }
+
+    /// The lockfile/vendor-ledger supplements are gated OFF for
+    /// machine-tree-scoped runs (`--global` / `--global-prefix`): a version
+    /// resolved only by the PROJECT lockfile must not count as present
+    /// there — those runs target the machine tree, not this project.
+    #[tokio::test]
+    async fn filter_to_installed_purls_prefix_scoped_run_skips_lock_supplement() {
+        let tmp = tempfile::tempdir().unwrap();
+        let prefix = tempfile::tempdir().unwrap();
+        // The project lockfile resolves the exact version under test.
+        std::fs::write(
+            tmp.path().join("package-lock.json"),
+            serde_json::json!({
+                "name": "consumer", "version": "0.0.0", "lockfileVersion": 3,
+                "packages": {
+                    "": { "name": "consumer", "version": "0.0.0" },
+                    "node_modules/covgap-lock-only": {
+                        "version": "1.0.0",
+                        "resolved": "https://registry.npmjs.org/covgap-lock-only/-/covgap-lock-only-1.0.0.tgz",
+                        "integrity": "sha512-AAAA=="
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let common = crate::args::GlobalArgs {
+            cwd: tmp.path().to_path_buf(),
+            global_prefix: Some(prefix.path().to_path_buf()),
+            ..Default::default()
+        };
+        let accessible = vec![mk_patch(
+            "ffffffff-ffff-4fff-8fff-ffffffffffff",
+            "pkg:npm/covgap-lock-only@1.0.0",
+            "free",
+            "2024-01-01",
+        )];
+        let out = filter_to_installed_purls(
+            &accessible,
+            &common,
+            crate::commands::scan::ScanMode::Hosted,
+        )
+        .await;
+        assert!(
+            out.kept.is_empty(),
+            "a prefix-scoped run must not treat lockfile resolution as presence"
+        );
+        assert_eq!(out.skip_records.len(), 1);
+        assert_eq!(out.skip_records[0]["errorCode"], "package_not_installed");
+    }
+
+    /// pnpm-PnP + hosted: a purl the lock probe CANNOT judge (no `@version`
+    /// coordinate to look for) must keep the layout-refusal code — the same
+    /// no-judgment fallback as an unreadable lock — never a false
+    /// "not installed" verdict; a judgeable-but-absent version is a genuine
+    /// miss and carries `package_not_installed`.
+    #[tokio::test]
+    async fn filter_to_installed_purls_pnpm_pnp_hosted_unjudgeable_purl_keeps_layout_code() {
+        let tmp = tempfile::tempdir().unwrap();
+        // pnpm's own node-linker=pnp layout: PnP loader + pnpm-lock.yaml +
+        // installed pnpm store marker, no yarn.lock.
+        std::fs::write(tmp.path().join(".pnp.cjs"), b"// pnp loader\n").unwrap();
+        std::fs::write(
+            tmp.path().join("pnpm-lock.yaml"),
+            b"lockfileVersion: '9.0'\n\nsnapshots:\n\n  some-other-pkg@2.0.0:\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(tmp.path().join("node_modules")).unwrap();
+        std::fs::write(tmp.path().join("node_modules/.modules.yaml"), b"").unwrap();
+
+        let common = crate::args::GlobalArgs {
+            cwd: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
+        let accessible = vec![
+            // Versionless: the probe has no version to anchor on.
+            mk_patch(
+                "99999999-9999-4999-8999-999999999999",
+                "pkg:npm/covgap-noversion",
+                "free",
+                "2024-01-01",
+            ),
+            // Versioned but absent from the lock: a judged miss.
+            mk_patch(
+                "88888888-8888-4888-8888-888888888888",
+                "pkg:npm/covgap-judged@1.0.0",
+                "free",
+                "2024-01-01",
+            ),
+        ];
+        let out = filter_to_installed_purls(
+            &accessible,
+            &common,
+            crate::commands::scan::ScanMode::Hosted,
+        )
+        .await;
+        assert!(out.kept.is_empty(), "neither purl may be kept");
+        assert!(
+            out.warnings.iter().any(|(code, _)| code.contains("pnp")),
+            "the layout refusal must surface as a run-level warning; got {:?}",
+            out.warnings
+        );
+        let code_for = |purl: &str| {
+            out.skip_records
+                .iter()
+                .find(|r| r["purl"] == purl)
+                .unwrap_or_else(|| panic!("missing skip record for {purl}"))["errorCode"]
+                .clone()
+        };
+        assert_eq!(
+            code_for("pkg:npm/covgap-noversion"),
+            "pnpm_pnp_unsupported",
+            "an unjudgeable purl must keep the layout code"
+        );
+        assert_eq!(
+            code_for("pkg:npm/covgap-judged@1.0.0"),
+            "package_not_installed",
+            "a judged miss is a genuine not-installed verdict"
+        );
+    }
+
+    /// `download_patch_records` with `persist_blobs`: an uncreatable blobs
+    /// dir (`.socket` squatted by a regular file) is a hard `error` envelope
+    /// BEFORE any fetch, with no records handed to the caller.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn download_patch_records_blobs_dir_create_failure_errors_before_any_fetch() {
+        use wiremock::MockServer;
+
+        let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL", "SOCKET_PATCH_PROXY_URL"]);
+        let server = MockServer::start().await;
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(".socket"), b"not a dir").unwrap();
+
+        let selected = vec![mk_patch(
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "pkg:npm/covgap-blobfail@1.0.0",
+            "free",
+            "2024-01-01",
+        )];
+        let mut params = detached_params(tmp.path(), server.uri());
+        params.persist_blobs = true;
+        let (code, json, records) = download_patch_records(&selected, &params).await;
+
+        assert_eq!(code, 1, "json={json}");
+        assert_eq!(json["status"], "error", "json={json}");
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("blobs directory"),
+            "the error must name the blobs dir; json={json}"
+        );
+        assert!(records.is_empty());
+        assert!(
+            server.received_requests().await.unwrap_or_default().is_empty(),
+            "the failure must precede any fetch"
+        );
+        assert_eq!(
+            std::fs::read(tmp.path().join(".socket")).unwrap(),
+            b"not a dir",
+            "the squatting file must be left untouched"
+        );
+    }
+
+    /// `download_patch_records` with `persist_blobs`: undecodable blob
+    /// content is a per-patch failure — `Blob decode or write failed`, no
+    /// record returned, nothing written into `.socket/blobs`.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn download_patch_records_persist_blobs_bad_base64_is_failed_and_unrecorded() {
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL", "SOCKET_PATCH_PROXY_URL"]);
+        let server = MockServer::start().await;
+        let uuid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let purl = "pkg:npm/covgap-badblob@1.0.0";
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/v0/orgs/test-org/patches/view/{uuid}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "uuid": uuid, "purl": purl,
+                "publishedAt": "2024-01-01T00:00:00Z",
+                "files": {
+                    "package/index.js": {
+                        "beforeHash": "0".repeat(64),
+                        "afterHash": "1".repeat(64),
+                        "blobContent": "%%%not-base64%%%",
+                    }
+                },
+                "vulnerabilities": {}, "description": "d", "license": "MIT", "tier": "free",
+            })))
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let selected = vec![mk_patch(uuid, purl, "free", "2024-01-01")];
+        let mut params = detached_params(tmp.path(), server.uri());
+        params.persist_blobs = true;
+        let (code, json, records) = download_patch_records(&selected, &params).await;
+
+        assert_eq!(code, 1, "json={json}");
+        assert_eq!(json["failed"], 1, "json={json}");
+        assert_eq!(
+            json["patches"][0]["error"], "Blob decode or write failed",
+            "json={json}"
+        );
+        assert!(records.is_empty(), "a blob failure must not hand back a record");
+        let blobs = tmp.path().join(".socket/blobs");
+        assert!(blobs.is_dir(), "the blobs dir itself was created");
+        assert_eq!(
+            std::fs::read_dir(&blobs).unwrap().count(),
+            0,
+            "no blob may materialize from undecodable content"
+        );
+    }
+
+    /// Human-mode `download_patch_records` (json=false, silent=false): the
+    /// `[fetch]`, no-applicable-files `[fail]`, and fetch-miss `[fail]`
+    /// print paths all execute, and the envelope keeps exact per-action
+    /// counts alongside them.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn download_patch_records_human_mode_mixed_outcomes() {
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL", "SOCKET_PATCH_PROXY_URL"]);
+        let server = MockServer::start().await;
+        let good_uuid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let good_purl = "pkg:npm/covgap-good@1.0.0";
+        let nofiles_uuid = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        let nofiles_purl = "pkg:npm/covgap-nofiles@1.0.0";
+        let missing_uuid = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+        let missing_purl = "pkg:npm/covgap-missing@1.0.0";
+
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/v0/orgs/test-org/patches/view/{good_uuid}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "uuid": good_uuid, "purl": good_purl,
+                "publishedAt": "2024-01-01T00:00:00Z",
+                "files": {
+                    "package/index.js": {
+                        "beforeHash": "0".repeat(64),
+                        "afterHash": "1".repeat(64),
+                        "blobContent": "cGF0Y2hlZAo=",
+                    }
+                },
+                "vulnerabilities": {}, "description": "d", "license": "MIT", "tier": "free",
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(wm_path(format!(
+                "/v0/orgs/test-org/patches/view/{nofiles_uuid}"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "uuid": nofiles_uuid, "purl": nofiles_purl,
+                "publishedAt": "2024-01-01T00:00:00Z",
+                "files": {
+                    "package/index.js": { "beforeHash": "e".repeat(64), "afterHash": null }
+                },
+                "vulnerabilities": {}, "description": "d", "license": "MIT", "tier": "free",
+            })))
+            .mount(&server)
+            .await;
+        // missing_uuid's view stays unmounted -> 404 -> fetch miss.
+
+        let tmp = tempfile::tempdir().unwrap();
+        let selected = vec![
+            mk_patch(good_uuid, good_purl, "free", "2024-01-01"),
+            mk_patch(nofiles_uuid, nofiles_purl, "free", "2024-01-01"),
+            mk_patch(missing_uuid, missing_purl, "free", "2024-01-01"),
+        ];
+        let mut params = detached_params(tmp.path(), server.uri());
+        params.json = false;
+        params.silent = false;
+        let (code, json, records) = download_patch_records(&selected, &params).await;
+
+        assert_eq!(code, 1, "json={json}");
+        assert_eq!(json["downloaded"], 1, "json={json}");
+        assert_eq!(json["failed"], 2, "json={json}");
+        assert_eq!(records.len(), 1, "only the good patch yields a record");
+        assert!(records.contains_key(good_purl), "json={json}");
+        let errors: Vec<&str> = json["patches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|p| p["error"].as_str())
+            .collect();
+        assert!(errors.contains(&"patch has no applicable files"), "json={json}");
+        assert!(errors.contains(&"could not fetch details"), "json={json}");
+    }
+
+    /// A purl already vendored DETACHED at the selected uuid is served from
+    /// the ledger's embedded record with ZERO network traffic — the
+    /// idempotent re-run contract (human mode, so the `[skip]` print runs).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn download_patch_records_already_vendored_detached_skips_offline() {
+        use wiremock::MockServer;
+
+        let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL", "SOCKET_PATCH_PROXY_URL"]);
+        let server = MockServer::start().await; // trap: no mounts
+        let tmp = tempfile::tempdir().unwrap();
+        let uuid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let purl = "pkg:npm/covgap-vendored@1.0.0";
+
+        let vendor = tmp.path().join(".socket/vendor");
+        std::fs::create_dir_all(&vendor).unwrap();
+        std::fs::write(
+            vendor.join("state.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "version": 1,
+                "entries": { purl: {
+                    "ecosystem": "npm",
+                    "basePurl": purl,
+                    "uuid": uuid,
+                    "artifact": {
+                        "path": format!(".socket/vendor/npm/{uuid}/covgap-vendored-1.0.0.tgz"),
+                    },
+                    "wiring": [],
+                    "detached": true,
+                    "record": {
+                        "uuid": uuid,
+                        "exportedAt": "2024-01-01T00:00:00Z",
+                        "files": {
+                            "package/index.js": {
+                                "beforeHash": "0".repeat(64),
+                                "afterHash": "1".repeat(64),
+                            }
+                        },
+                        "vulnerabilities": {},
+                        "description": "embedded",
+                        "license": "MIT",
+                        "tier": "free",
+                    }
+                }}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let selected = vec![mk_patch(uuid, purl, "free", "2024-01-01")];
+        let mut params = detached_params(tmp.path(), server.uri());
+        params.json = false;
+        params.silent = false;
+        let (code, json, records) = download_patch_records(&selected, &params).await;
+
+        assert_eq!(code, 0, "json={json}");
+        assert_eq!(json["skipped"], 1, "json={json}");
+        assert_eq!(json["patches"][0]["action"], "skipped", "json={json}");
+        assert_eq!(
+            records.get(purl).map(|r| r.uuid.as_str()),
+            Some(uuid),
+            "the ledger's embedded record must be reused"
+        );
+        assert!(
+            server.received_requests().await.unwrap_or_default().is_empty(),
+            "an already-vendored entry must never touch the network"
+        );
+    }
+
+    /// An unreadable vendor ledger silences the drift warning (the main
+    /// vendor path reports unreadable state itself) instead of panicking or
+    /// fabricating a warning.
+    #[tokio::test]
+    async fn warn_on_vendored_uuid_drift_unreadable_state_warns_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vendor = tmp.path().join(".socket/vendor");
+        std::fs::create_dir_all(&vendor).unwrap();
+        std::fs::write(vendor.join("state.json"), b"{ not json").unwrap();
+
+        let mut warnings = Vec::new();
+        warn_on_vendored_uuid_drift(
+            tmp.path(),
+            true,
+            &[serde_json::json!({
+                "purl": "pkg:npm/x@1.0.0",
+                "uuid": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                "action": "added",
+            })],
+            &mut warnings,
+        )
+        .await;
+        assert!(warnings.is_empty(), "unreadable state must warn nothing");
+    }
+
+    /// Malformed per-patch records (missing purl/uuid) are skipped without
+    /// panicking, while a well-formed drifting record still warns.
+    #[tokio::test]
+    async fn warn_on_vendored_uuid_drift_skips_malformed_records_and_flags_drift() {
+        let tmp = tempfile::tempdir().unwrap();
+        let purl = "pkg:npm/covgap-drift@1.0.0";
+        let vendored_uuid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let new_uuid = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        let vendor = tmp.path().join(".socket/vendor");
+        std::fs::create_dir_all(&vendor).unwrap();
+        std::fs::write(
+            vendor.join("state.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "version": 1,
+                "entries": { purl: {
+                    "ecosystem": "npm",
+                    "basePurl": purl,
+                    "uuid": vendored_uuid,
+                    "artifact": {
+                        "path": format!(".socket/vendor/npm/{vendored_uuid}/covgap-drift-1.0.0.tgz"),
+                    },
+                    "wiring": []
+                }}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut warnings = Vec::new();
+        warn_on_vendored_uuid_drift(
+            tmp.path(),
+            true,
+            &[
+                // Malformed: no purl/uuid — must be skipped, not panic.
+                serde_json::json!({"action": "added"}),
+                // Genuine drift: manifest moved to a different uuid.
+                serde_json::json!({"purl": purl, "uuid": new_uuid, "action": "added"}),
+            ],
+            &mut warnings,
+        )
+        .await;
+        assert_eq!(warnings.len(), 1, "warnings={warnings:?}");
+        assert!(
+            warnings[0].contains(purl) && warnings[0].contains("is vendored at patch"),
+            "warnings={warnings:?}"
+        );
+    }
+
+    /// The env guard must RESTORE a variable that was set before the scrub —
+    /// the suite depends on it not leaking scrubbed state across tests.
+    #[test]
+    #[serial_test::serial]
+    fn env_var_guard_restores_previously_set_values() {
+        std::env::set_var("COVGAP_GET_GUARD_PROBE", "original");
+        {
+            let _guard = EnvVarGuard::scrub(&["COVGAP_GET_GUARD_PROBE"]);
+            assert!(
+                std::env::var("COVGAP_GET_GUARD_PROBE").is_err(),
+                "scrub must remove the var"
+            );
+        }
+        assert_eq!(
+            std::env::var("COVGAP_GET_GUARD_PROBE").as_deref(),
+            Ok("original"),
+            "drop must restore the pre-scrub value"
+        );
+        std::env::remove_var("COVGAP_GET_GUARD_PROBE");
+    }
 }
