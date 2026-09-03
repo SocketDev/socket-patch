@@ -747,4 +747,53 @@ mod tests {
         assert_eq!(result.status, RemoveStatus::Error);
         assert_eq!(fs::read_to_string(&pkg).await.unwrap(), "not json!!!");
     }
+
+    /// When the stripped package.json cannot be written back (the atomic
+    /// writer's stage file cannot be created in a read-only parent), remove
+    /// must report `RemoveStatus::Error` carrying the parsed script fields —
+    /// not the empty-string invalid-JSON arm — and leave the configured file
+    /// byte-identical on disk. (0o555 on the parent makes the stage-file
+    /// `create_new` fail EACCES; like the repo's other read-only-dir tests
+    /// this assumes a non-root test run.)
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_remove_write_failure_reports_error_and_leaves_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("package.json");
+        fs::write(&pkg, r#"{"name":"x","scripts":{"build":"tsc"}}"#)
+            .await
+            .unwrap();
+        update_package_json(&pkg, false, PackageManager::Npm).await;
+        let before = fs::read_to_string(&pkg).await.unwrap();
+
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let result = remove_package_json(&pkg, false).await;
+
+        // Restore before any assertion can unwind, so the tempdir cleans up.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(result.status, RemoveStatus::Error);
+        assert!(result.error.is_some(), "write failure must be surfaced");
+        // The error branch must carry the parsed status fields (proving it is
+        // the write-failure arm, not the invalid-JSON arm whose fields are
+        // empty): update added postinstall/dependencies purely for
+        // socket-patch, so the strip deletes both keys.
+        assert!(
+            result.old_script.contains("socket-patch apply"),
+            "old_script must reflect the configured postinstall, got {:?}",
+            result.old_script
+        );
+        assert!(result.new_script.is_none());
+        assert!(
+            result.old_dependencies_script.contains("socket-patch apply"),
+            "old_dependencies_script must reflect the configured script, got {:?}",
+            result.old_dependencies_script
+        );
+        assert!(result.new_dependencies_script.is_none());
+        // The write never landed: file byte-identical, no stage litter.
+        assert_eq!(fs::read_to_string(&pkg).await.unwrap(), before);
+        assert_eq!(count_stage_litter(dir.path()).await, 0);
+    }
 }

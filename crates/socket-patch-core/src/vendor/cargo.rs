@@ -2693,4 +2693,592 @@ mod tests {
             "hosted_redirect_live",
         );
     }
+
+    // ── service status arms: pending / unavailable / failed ──────────────
+
+    /// `auto` + a still-building service artifact falls back to the local
+    /// build with a `vendor_prebuilt_pending` advisory explaining why.
+    #[tokio::test]
+    async fn service_pending_auto_falls_back_with_warning() {
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        let server = wiremock::MockServer::start().await;
+        mount_cargo_status(&server, "pending_build").await;
+        let sources = PatchSources::blobs_only(&blobs);
+
+        let outcome = vendor_cargo_crate(
+            PURL,
+            &pristine,
+            root,
+            &record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            Some(&cargo_service_cfg(&server.uri(), VendorSource::Auto, false)),
+        )
+        .await;
+        let (result, entry, warnings) = expect_done(outcome);
+        assert!(
+            result.success,
+            "auto must fall back to the local build: {:?}",
+            result.error
+        );
+        assert!(entry.is_some());
+        // The locally-built copy has the patched content.
+        assert_eq!(tokio::fs::read(copy_lib(root)).await.unwrap(), PATCHED);
+        let w = warnings
+            .iter()
+            .find(|w| w.code == "vendor_prebuilt_pending")
+            .unwrap_or_else(|| panic!("missing pending warning: {warnings:?}"));
+        assert!(w.detail.contains("still building"), "{}", w.detail);
+        assert!(
+            w.detail.ends_with("; building locally instead"),
+            "{}",
+            w.detail
+        );
+    }
+
+    /// `service` mode + a still-building artifact hard-fails (no local-build
+    /// fallback), writing nothing.
+    #[tokio::test]
+    async fn service_pending_service_mode_hard_fails() {
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        let server = wiremock::MockServer::start().await;
+        mount_cargo_status(&server, "pending_build").await;
+        let sources = PatchSources::blobs_only(&blobs);
+
+        let outcome = vendor_cargo_crate(
+            PURL,
+            &pristine,
+            root,
+            &record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            Some(&cargo_service_cfg(
+                &server.uri(),
+                VendorSource::Service,
+                false,
+            )),
+        )
+        .await;
+        let detail = expect_refused(outcome, "vendor_prebuilt_required");
+        assert!(detail.contains("still building"), "{detail}");
+        assert!(!root.join(".socket/vendor").exists(), "no vendor debris");
+        assert!(!root.join(".cargo").exists(), "nothing wired");
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("Cargo.lock"))
+                .await
+                .unwrap(),
+            lock_body()
+        );
+    }
+
+    /// `service` mode + a not-built artifact (`not_found`) hard-fails with
+    /// the unavailable reason — the required-mode twin of the covered `auto`
+    /// silent fallback.
+    #[tokio::test]
+    async fn service_unavailable_service_mode_hard_fails() {
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        let server = wiremock::MockServer::start().await;
+        mount_cargo_status(&server, "not_found").await;
+        let sources = PatchSources::blobs_only(&blobs);
+
+        let outcome = vendor_cargo_crate(
+            PURL,
+            &pristine,
+            root,
+            &record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            Some(&cargo_service_cfg(
+                &server.uri(),
+                VendorSource::Service,
+                false,
+            )),
+        )
+        .await;
+        let detail = expect_refused(outcome, "vendor_prebuilt_required");
+        assert!(
+            detail.contains("prebuilt crate unavailable: not_found"),
+            "{detail}"
+        );
+        assert!(!root.join(".socket/vendor").exists(), "no vendor debris");
+        assert!(!root.join(".cargo").exists(), "nothing wired");
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("Cargo.lock"))
+                .await
+                .unwrap(),
+            lock_body()
+        );
+    }
+
+    /// `auto` + a request-level service failure (`forbidden` →
+    /// `ServiceArtifact::Failed`) falls back to the local build with a
+    /// `vendor_prebuilt_unavailable` advisory.
+    #[tokio::test]
+    async fn service_failed_auto_falls_back_with_warning() {
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        let server = wiremock::MockServer::start().await;
+        mount_cargo_status(&server, "forbidden").await;
+        let sources = PatchSources::blobs_only(&blobs);
+
+        let outcome = vendor_cargo_crate(
+            PURL,
+            &pristine,
+            root,
+            &record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            Some(&cargo_service_cfg(&server.uri(), VendorSource::Auto, false)),
+        )
+        .await;
+        let (result, entry, warnings) = expect_done(outcome);
+        assert!(
+            result.success,
+            "auto must fall back to the local build: {:?}",
+            result.error
+        );
+        assert!(entry.is_some());
+        assert_eq!(tokio::fs::read(copy_lib(root)).await.unwrap(), PATCHED);
+        let w = warnings
+            .iter()
+            .find(|w| w.code == "vendor_prebuilt_unavailable")
+            .unwrap_or_else(|| panic!("missing unavailable warning: {warnings:?}"));
+        assert!(
+            w.detail.contains("patch service request failed"),
+            "{}",
+            w.detail
+        );
+        assert!(
+            w.detail.ends_with("; building locally instead"),
+            "{}",
+            w.detail
+        );
+    }
+
+    /// A downloaded archive that PASSES SRI verification but is not a valid
+    /// tar.gz hard-fails (`vendor_prebuilt_extract_failed`) in every mode —
+    /// and the failed run leaves no vendor husk, wiring, or lock edit behind.
+    #[tokio::test]
+    async fn service_corrupt_archive_extract_hard_fails() {
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        let bytes: &[u8] = b"definitely not a tar.gz";
+        let server = wiremock::MockServer::start().await;
+        mount_cargo_granted(&server, &sri_sha512(bytes), bytes).await;
+        let sources = PatchSources::blobs_only(&blobs);
+
+        let outcome = vendor_cargo_crate(
+            PURL,
+            &pristine,
+            root,
+            &record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            Some(&cargo_service_cfg(
+                &server.uri(),
+                VendorSource::Service,
+                false,
+            )),
+        )
+        .await;
+        let detail = expect_refused(outcome, "vendor_prebuilt_extract_failed");
+        assert!(
+            detail.contains("cannot extract the prebuilt crate"),
+            "{detail}"
+        );
+        assert!(
+            !root.join(".socket/vendor").exists(),
+            "the vendor levels created by this failed run are pruned"
+        );
+        assert!(!root.join(".cargo").exists(), "nothing wired");
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("Cargo.lock"))
+                .await
+                .unwrap(),
+            lock_body()
+        );
+    }
+
+    /// A granted service artifact whose stage dir cannot be created (a
+    /// regular FILE squatting the `<uuid>` dir path) hard-fails with
+    /// `vendor_prebuilt_write_failed` ("cannot create"), touching neither the
+    /// config nor the lock.
+    #[tokio::test]
+    async fn service_stage_create_failure_hard_fails() {
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        // A FILE at the uuid-dir path makes `create_dir_all(&stage)` fail
+        // (the preceding remove_tree(&stage) error is discarded).
+        tokio::fs::create_dir_all(root.join(".socket/vendor/cargo"))
+            .await
+            .unwrap();
+        tokio::fs::write(root.join(format!(".socket/vendor/cargo/{UUID}")), b"squat")
+            .await
+            .unwrap();
+        // A fully valid granted crate, so the run reaches the stage step.
+        let crate_tgz = make_crate_tgz("cfg-if-1.0.4", &[("src/lib.rs", PATCHED)]);
+        let sri = sri_sha512(&crate_tgz);
+        let server = wiremock::MockServer::start().await;
+        mount_cargo_granted(&server, &sri, &crate_tgz).await;
+        let sources = PatchSources::blobs_only(&blobs);
+
+        let outcome = vendor_cargo_crate(
+            PURL,
+            &pristine,
+            root,
+            &record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            Some(&cargo_service_cfg(
+                &server.uri(),
+                VendorSource::Service,
+                false,
+            )),
+        )
+        .await;
+        let detail = expect_refused(outcome, "vendor_prebuilt_write_failed");
+        assert!(detail.contains("cannot create"), "{detail}");
+        assert!(!root.join(".cargo").exists(), "nothing wired");
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("Cargo.lock"))
+                .await
+                .unwrap(),
+            lock_body()
+        );
+    }
+
+    // ── local-build + wiring error paths ──────────────────────────────────
+
+    /// A missing pristine source (the crawler's pkg_path was deleted between
+    /// scan and vendor, no service configured) fails cleanly: a synthesized
+    /// "failed to copy pristine source" result and a full unwind — no vendor
+    /// husk, no wiring, lock untouched.
+    #[tokio::test]
+    async fn local_build_missing_pristine_fails_cleanly() {
+        let (dir, blobs, _pristine, record) = fixture().await;
+        let root = dir.path();
+        let bogus_pristine = root.join("no-such-pristine");
+
+        let (result, entry, _warnings) =
+            expect_done(run_vendor(PURL, root, &blobs, &bogus_pristine, &record, false).await);
+        assert!(!result.success);
+        assert!(entry.is_none());
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("failed to copy pristine source"),
+            "error names the copy step: {:?}",
+            result.error
+        );
+        assert_eq!(
+            result.package_path,
+            root.join(copy_rel()).display().to_string(),
+            "the synthesized result reports the copy path"
+        );
+        assert!(
+            !root.join(".socket/vendor").exists(),
+            "the vendor levels created by this failed run are pruned"
+        );
+        assert!(!root.join(".cargo").exists(), "nothing wired");
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("Cargo.lock"))
+                .await
+                .unwrap(),
+            lock_body()
+        );
+    }
+
+    /// `ensure_patch_entry` failure after a successful local build (a
+    /// DIRECTORY squatting `.cargo/config.toml`: the guarded read errs
+    /// InvalidInput while the preflight `read_patch_entries` degrades to
+    /// empty, so the run proceeds all the way to the config write) unwinds
+    /// the copy and prunes the husks; the lock is never touched.
+    #[tokio::test]
+    async fn config_write_failure_unwinds_copy() {
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        // NOTE: not `.cargo/config` (extensionless) — config_path would
+        // resolve there instead of erroring on the squatted config.toml.
+        tokio::fs::create_dir_all(root.join(".cargo/config.toml"))
+            .await
+            .unwrap();
+
+        let (result, entry, _warnings) =
+            expect_done(run_vendor(PURL, root, &blobs, &pristine, &record, false).await);
+        assert!(!result.success);
+        assert!(entry.is_none());
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("failed to update .cargo/config.toml"),
+            "error names the config: {:?}",
+            result.error
+        );
+        assert!(
+            !root.join(".socket/vendor").exists(),
+            "the copy is unwound and the husks pruned"
+        );
+        assert!(
+            tokio::fs::metadata(root.join(".cargo/config.toml"))
+                .await
+                .unwrap()
+                .is_dir(),
+            "the squatting directory is left alone"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("Cargo.lock"))
+                .await
+                .unwrap(),
+            lock_body(),
+            "the detach never ran"
+        );
+    }
+
+    /// A failed marker write on a FRESH vendor (a directory squatting the
+    /// marker path makes the atomic rename fail) must not undo the
+    /// fully-wired vendor: success + a `marker_write_failed` warning, with
+    /// copy, config, and lock all wired.
+    #[tokio::test]
+    async fn marker_write_failure_warns_but_vendor_succeeds() {
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        tokio::fs::create_dir_all(root.join(format!(
+            ".socket/vendor/cargo/{UUID}/{VENDOR_MARKER_FILE}"
+        )))
+        .await
+        .unwrap();
+
+        let (result, entry, warnings) =
+            expect_done(run_vendor(PURL, root, &blobs, &pristine, &record, false).await);
+        assert!(result.success, "{:?}", result.error);
+        assert!(entry.is_some(), "the wired vendor still emits its entry");
+        assert!(
+            warnings.iter().any(|w| w.code == "marker_write_failed"),
+            "the failed marker write is surfaced: {warnings:?}"
+        );
+        // The vendor is otherwise fully wired.
+        assert_eq!(tokio::fs::read(copy_lib(root)).await.unwrap(), PATCHED);
+        assert_eq!(
+            cargo_config::read_patch_entries(root).await["cfg-if"]
+                .path
+                .as_deref(),
+            Some(copy_rel().as_str())
+        );
+        let lock = tokio::fs::read_to_string(root.join("Cargo.lock"))
+            .await
+            .unwrap();
+        assert!(!lock.contains("source ="), "lock detached");
+    }
+
+    // ── revert failure arms ───────────────────────────────────────────────
+
+    /// Revert re-validates the (tamper-able) ledger entry's purl fail-closed:
+    /// a non-cargo purl is refused before any disk access.
+    #[tokio::test]
+    async fn test_revert_refuses_non_cargo_purl() {
+        let (dir, _blobs, _pristine, _record) = fixture().await;
+        let root = dir.path();
+        let mut entry = ledger_entry_for(UUID);
+        entry.base_purl = "pkg:npm/not-cargo@1.0.0".into();
+
+        let out = revert_cargo_vendor(&entry, root, false).await;
+        assert!(!out.success);
+        assert!(
+            out.error.as_deref().unwrap_or("").contains("not a cargo purl"),
+            "{:?}",
+            out.error
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("Cargo.lock"))
+                .await
+                .unwrap(),
+            lock_body(),
+            "the refusal touched nothing"
+        );
+    }
+
+    /// Revert with recorded lock originals but a DELETED Cargo.lock warns
+    /// (`lock_restore_skipped` / "no longer exists" — distinct from the
+    /// re-resolved twin) and still completes the config + artifact revert.
+    #[tokio::test]
+    async fn test_revert_warns_when_lock_deleted() {
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        let (_result, entry, _warnings) =
+            expect_done(run_vendor(PURL, root, &blobs, &pristine, &record, false).await);
+        let entry = entry.unwrap();
+        tokio::fs::remove_file(root.join("Cargo.lock"))
+            .await
+            .unwrap();
+
+        let out = revert_cargo_vendor(&entry, root, false).await;
+        assert!(out.success, "{:?}", out.error);
+        let w = out
+            .warnings
+            .iter()
+            .find(|w| w.code == "lock_restore_skipped")
+            .unwrap_or_else(|| panic!("missing skip warning: {:?}", out.warnings));
+        assert!(w.detail.contains("no longer exists"), "{}", w.detail);
+        // The rest still reverted: config entry gone, uuid dir gone.
+        assert!(cargo_config::read_patch_entries(root).await.is_empty());
+        assert!(!root.join(format!(".socket/vendor/cargo/{UUID}")).exists());
+    }
+
+    /// Revert fails CLOSED on a corrupt lock BEFORE touching the config
+    /// entry — a half-revert (entry dropped, lock still path-form) would
+    /// break every `--locked` build with no breadcrumb.
+    #[tokio::test]
+    async fn test_revert_corrupt_lock_fails_closed() {
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        let (_result, entry, _warnings) =
+            expect_done(run_vendor(PURL, root, &blobs, &pristine, &record, false).await);
+        let entry = entry.unwrap();
+        tokio::fs::write(root.join("Cargo.lock"), "not = = toml [[[")
+            .await
+            .unwrap();
+
+        let out = revert_cargo_vendor(&entry, root, false).await;
+        assert!(!out.success);
+        assert!(
+            out.error
+                .as_deref()
+                .unwrap_or("")
+                .contains("failed to restore the Cargo.lock entry"),
+            "{:?}",
+            out.error
+        );
+        // Fail-closed: the config entry and the artifact both survive.
+        assert_eq!(
+            cargo_config::read_patch_entries(root).await["cfg-if"]
+                .path
+                .as_deref(),
+            Some(copy_rel().as_str()),
+            "the config entry must not be dropped on a failed lock restore"
+        );
+        assert!(
+            root.join(copy_rel()).exists(),
+            "the artifact must survive a failed revert"
+        );
+    }
+
+    /// Revert `drop_patch_entry` failure (a directory squatting the config
+    /// path) reports "failed to update .cargo/config.toml" and leaves the
+    /// artifact in place (deletion is last). The lock was already restored
+    /// when this fails — documenting the lock-then-config order: a re-run
+    /// recovers, with the restore degrading to an Ok(false) skip.
+    #[tokio::test]
+    async fn test_revert_config_drop_failure_reports_error() {
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        let (_result, entry, _warnings) =
+            expect_done(run_vendor(PURL, root, &blobs, &pristine, &record, false).await);
+        let entry = entry.unwrap();
+        tokio::fs::remove_file(root.join(".cargo/config.toml"))
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(root.join(".cargo/config.toml"))
+            .await
+            .unwrap();
+
+        let out = revert_cargo_vendor(&entry, root, false).await;
+        assert!(!out.success);
+        assert!(
+            out.error
+                .as_deref()
+                .unwrap_or("")
+                .contains("failed to update .cargo/config.toml"),
+            "{:?}",
+            out.error
+        );
+        // The lock restore ran FIRST and stuck: byte-identical originals.
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("Cargo.lock"))
+                .await
+                .unwrap(),
+            lock_body(),
+            "the lock is restored before the config edit"
+        );
+        assert!(
+            root.join(copy_rel()).exists(),
+            "artifact untouched — its deletion comes after the config edit"
+        );
+    }
+
+    // ── swap_stage_into_place unit edges ──────────────────────────────────
+
+    /// A failed stage rename with NO pre-existing copy parked (had_old =
+    /// false skips the backup restore): the error propagates and no backup
+    /// is fabricated.
+    #[tokio::test]
+    async fn test_swap_missing_stage_and_vacant_copy_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let copy = dir.path().join("cfg-if-1.0.4");
+        let err = swap_stage_into_place(&stage_dir_for(&copy), &copy)
+            .await
+            .expect_err("swapping a missing stage into a vacant copy must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        assert!(
+            !backup_dir_for(&copy).exists(),
+            "no fabricated backup litter"
+        );
+        assert!(!copy.exists(), "no fabricated copy");
+    }
+
+    /// A park rename (copy → backup) that fails with a non-NotFound error
+    /// (EACCES: read-only parent) must propagate WITHOUT touching the old
+    /// copy — it is never moved, and no backup appears.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_swap_park_failure_propagates_and_keeps_old_copy() {
+        use std::os::unix::fs::PermissionsExt as _;
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root ignores mode bits — the trigger cannot fire
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("uuid");
+        let copy = parent.join("cfg-if-1.0.4");
+        tokio::fs::create_dir_all(copy.join("src")).await.unwrap();
+        tokio::fs::write(copy.join("src/lib.rs"), b"live\n")
+            .await
+            .unwrap();
+        let stage = stage_dir_for(&copy);
+        tokio::fs::create_dir_all(&stage).await.unwrap();
+        tokio::fs::write(stage.join("lib.rs"), b"new\n")
+            .await
+            .unwrap();
+
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let swapped = swap_stage_into_place(&stage, &copy).await;
+        // Restore before any assert so the tempdir can always be cleaned up.
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(swapped.is_err(), "the park rename failure must propagate");
+        assert_eq!(
+            tokio::fs::read(copy.join("src/lib.rs")).await.unwrap(),
+            b"live\n",
+            "the old copy is never moved"
+        );
+        assert!(!backup_dir_for(&copy).exists(), "no parked backup");
+        assert!(stage.exists(), "the stage is left for the caller's cleanup");
+    }
 }

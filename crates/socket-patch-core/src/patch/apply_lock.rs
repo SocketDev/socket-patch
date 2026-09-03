@@ -444,6 +444,98 @@ mod tests {
         );
     }
 
+    /// mkfifo(2) directly, not the /usr/bin/mkfifo binary: spawning a child
+    /// flakes under heavy parallel load (fork/exec starvation) and the
+    /// syscall needs no process at all.
+    #[cfg(target_os = "macos")]
+    fn mkfifo(path: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+        let c_path =
+            std::ffi::CString::new(path.as_os_str().as_bytes()).expect("fifo path has no NUL");
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
+        assert_eq!(
+            rc,
+            0,
+            "mkfifo(2) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    /// A non-contention `try_lock_exclusive` fault must surface as
+    /// `LockError::Io` immediately — not busy-sleep the whole timeout
+    /// budget and then come out mislabelled as `Held` (the documented
+    /// contract of the second `Err` arm in `acquire`).
+    ///
+    /// Induced for real, with no fault-injection seam: a FIFO planted at
+    /// `apply.lock` opens fine with `O_RDWR` (the process is both reader
+    /// and writer, so the open never blocks), but macOS's fifofs has no
+    /// advisory-lock op, so `flock(2)` fails with ENOTSUP — an OS error
+    /// distinct from the EWOULDBLOCK contention sentinel. macOS-only:
+    /// Linux `flock` has no file-type restriction (a FIFO locks fine
+    /// there), so the fault is not inducible on a path without a seam.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn non_contention_lock_fault_returns_io_immediately() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("apply.lock");
+        mkfifo(&lock_path);
+
+        let start = Instant::now();
+        let err = acquire(dir.path(), Duration::from_secs(5)).unwrap_err();
+        let elapsed = start.elapsed();
+
+        match err {
+            LockError::Io { path, source } => {
+                assert_eq!(path, lock_path);
+                // The flock errno must be preserved verbatim (ENOTSUP from
+                // fifofs), not swallowed or rewritten — and it is, by
+                // construction, not the contended sentinel.
+                assert_eq!(source.raw_os_error(), Some(libc::ENOTSUP));
+                assert_ne!(
+                    source.raw_os_error(),
+                    fs2::lock_contended_error().raw_os_error()
+                );
+            }
+            LockError::Held => panic!(
+                "a genuine flock fault must not be mislabelled as contention"
+            ),
+        }
+        // The fault arm returns without ever entering the retry/backoff
+        // path: nowhere near the 5 s budget (the old funnel-everything-
+        // into-retry behaviour slept the full budget before erroring).
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "Io fault must not burn the retry budget, took {:?}",
+            elapsed
+        );
+    }
+
+    /// Companion in try-once mode: `timeout = ZERO` on a faulting lock
+    /// file is still `Io`, never `Held` — the non-blocking path must not
+    /// collapse "the lock is broken" into "someone else holds it".
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn non_contention_lock_fault_is_io_not_held_in_try_once_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("apply.lock");
+        mkfifo(&lock_path);
+
+        let err = acquire(dir.path(), Duration::ZERO).unwrap_err();
+        match err {
+            LockError::Io { path, source } => {
+                assert_eq!(path, lock_path);
+                assert!(source.raw_os_error().is_some());
+                assert_ne!(
+                    source.raw_os_error(),
+                    fs2::lock_contended_error().raw_os_error()
+                );
+            }
+            LockError::Held => panic!(
+                "try-once mode must not mislabel a genuine flock fault as Held"
+            ),
+        }
+    }
+
     /// The retry loop must not overshoot the deadline by a full sleep
     /// quantum. A 150 ms budget should resolve well under the old
     /// fixed-100 ms-sleep worst case (~200 ms) — the final sleep is

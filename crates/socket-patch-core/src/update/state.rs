@@ -310,6 +310,37 @@ mod tests {
         assert!(fifo.exists());
     }
 
+    /// save_state's documented error contract: `create_dir_all` failures
+    /// bubble so callers can debug-log them (they treat them as non-fatal).
+    /// Reachable without permission tricks — a regular file occupying the
+    /// state-dir path makes `create_dir_all` fail with `AlreadyExists`
+    /// even when running as root.
+    #[tokio::test]
+    #[serial(update_state_dir_env)]
+    async fn save_state_bubbles_create_dir_all_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let occupied = tmp.path().join("statedir");
+        std::fs::write(&occupied, b"occupied").unwrap();
+        let prev = std::env::var_os("SOCKET_UPDATE_STATE_DIR");
+        std::env::set_var("SOCKET_UPDATE_STATE_DIR", &occupied);
+        let result = save_state(&UpdateCheckState::default()).await;
+        match prev {
+            Some(v) => std::env::set_var("SOCKET_UPDATE_STATE_DIR", v),
+            None => std::env::remove_var("SOCKET_UPDATE_STATE_DIR"),
+        }
+        let err = result.expect_err("create_dir_all over a regular file must bubble to the caller");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists, "{err}");
+        // The failed save neither clobbers the occupying file nor leaves
+        // stage droppings beside it.
+        assert_eq!(std::fs::read(&occupied).unwrap(), b"occupied");
+        let entries: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(entries, vec!["statedir".to_string()]);
+    }
+
     #[tokio::test]
     #[serial(update_state_dir_env)]
     async fn save_state_writes_atomically_with_no_stage_droppings() {

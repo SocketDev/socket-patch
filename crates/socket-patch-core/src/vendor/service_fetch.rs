@@ -283,7 +283,20 @@ mod tests {
     }
 
     async fn mount_granted(server: &MockServer, sha512: &str, body: &[u8]) {
+        mount_granted_with_dirhash(server, sha512, None, body).await;
+    }
+
+    async fn mount_granted_with_dirhash(
+        server: &MockServer,
+        sha512: &str,
+        dirhash_h1: Option<&str>,
+        body: &[u8],
+    ) {
         let serve_url = format!("{}{SERVE_PATH}", server.uri());
+        let mut integrity = json!({ "sha512": sha512 });
+        if let Some(h1) = dirhash_h1 {
+            integrity["dirhashH1"] = serde_json::Value::from(h1);
+        }
         Mock::given(method("POST"))
             .and(path("/v0/orgs/acme/patches/package"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -291,7 +304,7 @@ mod tests {
                     "status": "granted",
                     "url": serve_url,
                     "artifacts": [{ "kind": "tarball", "url": serve_url,
-                                    "integrity": { "sha512": sha512 } }]
+                                    "integrity": integrity }]
                 }}
             })))
             .mount(server)
@@ -299,6 +312,18 @@ mod tests {
         Mock::given(method("GET"))
             .and(path(SERVE_PATH))
             .respond_with(ResponseTemplate::new(200).set_body_bytes(body.to_vec()))
+            .mount(server)
+            .await;
+    }
+
+    /// Mount a package-reference response with a non-`granted` status (no
+    /// artifacts) — mirrors golang.rs's `mount_go_status`.
+    async fn mount_status(server: &MockServer, status: &str) {
+        Mock::given(method("POST"))
+            .and(path("/v0/orgs/acme/patches/package"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": { UUID: { "status": status, "url": null, "artifacts": [] } }
+            })))
             .mount(server)
             .await;
     }
@@ -416,5 +441,262 @@ mod tests {
             fetch_verified_archive(&cfg, UUID).await,
             ServiceArtifact::Unavailable(_)
         ));
+    }
+
+    /// The h1-dirhash verify's SUCCESS continuation: a service archive whose
+    /// golang `h1:` dirhash matches its zip contents passes through to Ready
+    /// (only the mismatch side of this gate had ever executed).
+    #[tokio::test]
+    async fn ready_when_golang_h1_dirhash_matches() {
+        let server = MockServer::start().await;
+        let entry_name = "m@v1.0.0/a.go";
+        let content: &[u8] = b"package a\n";
+        // One-file module zip (the go zip layout: `module@version/` prefix).
+        let zip_bytes = {
+            use std::io::Write as _;
+            let mut zw = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+            zw.start_file(entry_name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zw.write_all(content).unwrap();
+            zw.finish().unwrap().into_inner()
+        };
+        // Independent spec mirror of dirhash Hash1 (single entry, so no sort):
+        // h1 = base64(sha256("{hex(sha256(content))}  {name}\n")).
+        let h1 = {
+            use base64::Engine as _;
+            use sha2::{Digest as _, Sha256};
+            let line = format!("{}  {entry_name}\n", hex::encode(Sha256::digest(content)));
+            format!(
+                "h1:{}",
+                base64::engine::general_purpose::STANDARD.encode(Sha256::digest(line.as_bytes()))
+            )
+        };
+        let sri = PackedTarball::from_bytes(&zip_bytes).integrity;
+        mount_granted_with_dirhash(&server, &sri, Some(&h1), &zip_bytes).await;
+
+        match fetch_verified_archive(&cfg_for(&server), UUID).await {
+            ServiceArtifact::Ready(v) => assert_eq!(v.bytes, zip_bytes),
+            other => panic!("expected Ready, got {other:?}"),
+        }
+    }
+
+    /// Tier-A happy path: a granted, integrity-verified archive comes back as
+    /// `Used(bytes)` plus exactly one `vendor_prebuilt_downloaded` advisory
+    /// naming the package and the serve URL.
+    #[tokio::test]
+    async fn service_copy_ready_returns_used_bytes_with_downloaded_note() {
+        let server = MockServer::start().await;
+        let body = b"prebuilt jar bytes";
+        let sri = PackedTarball::from_bytes(body).integrity;
+        mount_granted(&server, &sri, body).await;
+        let mut warnings = Vec::new();
+        match service_archive_copy(Some(&cfg_for(&server)), UUID, "x", ".jar", &mut warnings).await
+        {
+            ServiceCopy::Used(bytes) => assert_eq!(bytes, body),
+            ServiceCopy::HardFail(outcome) => panic!("expected Used, got HardFail({outcome:?})"),
+            ServiceCopy::FallBack => panic!("expected Used, got FallBack"),
+        }
+        assert_eq!(warnings.len(), 1, "exactly one downloaded advisory");
+        assert_eq!(warnings[0].code, "vendor_prebuilt_downloaded");
+        assert!(
+            warnings[0]
+                .detail
+                .contains("vendored x from the patch service"),
+            "{}",
+            warnings[0].detail
+        );
+        assert!(
+            warnings[0].detail.ends_with(&format!("{SERVE_PATH})")),
+            "advisory names the serve URL: {}",
+            warnings[0].detail
+        );
+    }
+
+    /// Pending under `auto`: warn (`vendor_prebuilt_pending`, "still
+    /// building; building locally instead") and fall back to the local build.
+    #[tokio::test]
+    async fn service_copy_pending_auto_warns_and_falls_back() {
+        let server = MockServer::start().await;
+        mount_status(&server, "pending_build").await;
+        let mut cfg = cfg_for(&server);
+        cfg.source = VendorSource::Auto;
+        let mut warnings = Vec::new();
+        assert!(matches!(
+            service_archive_copy(Some(&cfg), UUID, "x", ".jar", &mut warnings).await,
+            ServiceCopy::FallBack
+        ));
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].code, "vendor_prebuilt_pending");
+        assert_eq!(
+            warnings[0].detail,
+            "prebuilt .jar is still building; building locally instead"
+        );
+    }
+
+    /// Pending under `--vendor-source=service`: a hard `vendor_prebuilt_required`
+    /// refusal (never a local-build fallback), and no warning alongside it.
+    #[tokio::test]
+    async fn service_copy_pending_service_hard_fails() {
+        let server = MockServer::start().await;
+        mount_status(&server, "pending_build").await;
+        let mut warnings = Vec::new();
+        match service_archive_copy(Some(&cfg_for(&server)), UUID, "x", ".jar", &mut warnings).await
+        {
+            ServiceCopy::HardFail(outcome) => match *outcome {
+                VendorOutcome::Refused { code, detail } => {
+                    assert_eq!(code, "vendor_prebuilt_required");
+                    assert!(detail.contains("is still building"), "{detail}");
+                }
+                other => panic!("expected Refused, got {other:?}"),
+            },
+            ServiceCopy::Used(_) => panic!("pending build must not yield bytes"),
+            ServiceCopy::FallBack => {
+                panic!("--vendor-source=service fell back on a pending build")
+            }
+        }
+        assert!(warnings.is_empty(), "the hard-fail path must not warn");
+    }
+
+    /// Unavailable under `--vendor-source=service`: hard refusal with the
+    /// terminal-miss reason verbatim.
+    #[tokio::test]
+    async fn service_copy_unavailable_service_hard_fails() {
+        let server = MockServer::start().await;
+        mount_status(&server, "not_found").await;
+        let mut warnings = Vec::new();
+        match service_archive_copy(Some(&cfg_for(&server)), UUID, "x", ".jar", &mut warnings).await
+        {
+            ServiceCopy::HardFail(outcome) => match *outcome {
+                VendorOutcome::Refused { code, detail } => {
+                    assert_eq!(code, "vendor_prebuilt_required");
+                    assert_eq!(detail, "prebuilt .jar unavailable: not_found");
+                }
+                other => panic!("expected Refused, got {other:?}"),
+            },
+            ServiceCopy::Used(_) => panic!("unavailable archive must not yield bytes"),
+            ServiceCopy::FallBack => {
+                panic!("--vendor-source=service fell back on an unavailable archive")
+            }
+        }
+        assert!(warnings.is_empty(), "the hard-fail path must not warn");
+    }
+
+    /// Unavailable under `auto` is a QUIET fallback — no warning. This is the
+    /// deliberate asymmetry with Pending/Failed (mirrors the golang backend's
+    /// mapping): a terminal miss is routine, not noteworthy.
+    #[tokio::test]
+    async fn service_copy_unavailable_auto_is_quiet_fallback() {
+        let server = MockServer::start().await;
+        mount_status(&server, "not_found").await;
+        let mut cfg = cfg_for(&server);
+        cfg.source = VendorSource::Auto;
+        let mut warnings = Vec::new();
+        assert!(matches!(
+            service_archive_copy(Some(&cfg), UUID, "x", ".jar", &mut warnings).await,
+            ServiceCopy::FallBack
+        ));
+        assert!(
+            warnings.is_empty(),
+            "Unavailable under auto must fall back quietly, without a warning"
+        );
+    }
+
+    /// Transport failure under `auto`: warn and fall back. The Failed arm
+    /// deliberately reuses the `vendor_prebuilt_unavailable` warning code
+    /// (matching the golang mapping) rather than a dedicated one.
+    #[tokio::test]
+    async fn service_copy_failed_auto_warns_and_falls_back() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v0/orgs/acme/patches/package"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let mut cfg = cfg_for(&server);
+        cfg.source = VendorSource::Auto;
+        let mut warnings = Vec::new();
+        assert!(matches!(
+            service_archive_copy(Some(&cfg), UUID, "x", ".jar", &mut warnings).await,
+            ServiceCopy::FallBack
+        ));
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].code, "vendor_prebuilt_unavailable");
+        assert!(
+            warnings[0]
+                .detail
+                .starts_with("patch service request failed ("),
+            "{}",
+            warnings[0].detail
+        );
+        assert!(
+            warnings[0].detail.ends_with("; building locally instead"),
+            "{}",
+            warnings[0].detail
+        );
+    }
+
+    /// Transport failure under `--vendor-source=service`: hard refusal
+    /// (`vendor_prebuilt_required`), never a local-build fallback.
+    #[tokio::test]
+    async fn service_copy_failed_service_hard_fails() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v0/orgs/acme/patches/package"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let mut warnings = Vec::new();
+        match service_archive_copy(Some(&cfg_for(&server)), UUID, "x", ".jar", &mut warnings).await
+        {
+            ServiceCopy::HardFail(outcome) => match *outcome {
+                VendorOutcome::Refused { code, detail } => {
+                    assert_eq!(code, "vendor_prebuilt_required");
+                    assert!(
+                        detail.starts_with("patch service request failed ("),
+                        "{detail}"
+                    );
+                }
+                other => panic!("expected Refused, got {other:?}"),
+            },
+            ServiceCopy::Used(_) => panic!("a failed request must not yield bytes"),
+            ServiceCopy::FallBack => {
+                panic!("--vendor-source=service fell back on a transport failure")
+            }
+        }
+        assert!(warnings.is_empty(), "the hard-fail path must not warn");
+    }
+
+    /// A transport failure downloading a PRESENT secondary artifact is
+    /// `Failed` (never `Absent` — the kind is referenced — and never a panic).
+    #[tokio::test]
+    async fn secondary_failed_when_download_errors() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/stub"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let archive = VerifiedArchive {
+            bytes: Vec::new(),
+            integrity_sri: String::new(),
+            source_url: String::new(),
+            secondary: vec![SecondaryArtifact {
+                kind: "gem-stub-gemspec".into(),
+                url: format!("{}/stub", server.uri()),
+                integrity_sri: PackedTarball::from_bytes(b"x").integrity,
+            }],
+        };
+        match fetch_verified_secondary(&cfg_for(&server), &archive, "gem-stub-gemspec").await {
+            SecondaryArtifactResult::Failed(reason) => {
+                assert!(reason.contains("500"), "{reason}");
+            }
+            SecondaryArtifactResult::Ready(_) => panic!("a 500 must not yield bytes"),
+            SecondaryArtifactResult::Absent => {
+                panic!("the kind IS referenced — a download failure must be Failed, not Absent")
+            }
+            SecondaryArtifactResult::IntegrityMismatch(m) => {
+                panic!("expected Failed, got IntegrityMismatch({m})")
+            }
+        }
     }
 }

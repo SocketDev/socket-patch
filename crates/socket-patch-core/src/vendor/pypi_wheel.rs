@@ -749,6 +749,14 @@ mod tests {
         out
     }
 
+    #[cfg(unix)]
+    fn zip_unix_mode(bytes: &[u8], name: &str) -> u32 {
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes.to_vec())).unwrap();
+        let file = archive.by_name(name).unwrap();
+        file.unix_mode()
+            .unwrap_or_else(|| panic!("{name} carries no unix mode"))
+    }
+
     #[test]
     fn record_parse_round_trips_quoted_and_empty_fields() {
         let text = "six.py,sha256=abc_DEF,123\n\
@@ -1409,5 +1417,313 @@ mod tests {
         .unwrap();
         assert!(result.success, "{:?}", result.error);
         assert!(artifact.is_some());
+    }
+
+    /// Locate-side degraded shapes: an undecodable `*.dist-info` entry is
+    /// skipped (the real dist is still found), a RECORD that parses to zero
+    /// member paths is refused, and a WHEEL whose only `Tag:` header is
+    /// whitespace-valued is refused.
+    #[tokio::test]
+    async fn locate_skips_undecodable_dist_info_and_refuses_empty_record_and_tagless_wheel() {
+        let fx = make_fixture("", None).await;
+        // A regular FILE named like a dist-info: METADATA is unreadable
+        // beneath it and the dir-name fallback rejects non-directories, so
+        // read_python_metadata yields None and the entry is skipped. (An
+        // empty dist-info DIRECTORY would instead be rescued by the
+        // crawler's dir-name fallback and never exercise the skip.)
+        tokio::fs::write(fx.site_packages.join("stray-1.0.dist-info"), b"not a dir")
+            .await
+            .unwrap();
+        let dist = locate_installed_dist(&fx.site_packages, "six", "1.16.0")
+            .await
+            .unwrap();
+        assert_eq!(dist.dist_name, "six");
+
+        // RECORD present but degenerate: blank / whitespace-only lines and
+        // an empty-path row all drop out of the parse, leaving no members.
+        let di = fx.site_packages.join("six-1.16.0.dist-info");
+        let record_backup = tokio::fs::read(di.join("RECORD")).await.unwrap();
+        tokio::fs::write(di.join("RECORD"), "\n  \n,,\n")
+            .await
+            .unwrap();
+        let err = locate_installed_dist(&fx.site_packages, "six", "1.16.0")
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, "pypi_missing_record");
+        assert!(err.1.contains("lists no files"), "{}", err.1);
+
+        // WHEEL present but its only Tag: value is whitespace, which the
+        // non-empty filter drops — same refusal as a missing WHEEL.
+        tokio::fs::write(di.join("RECORD"), record_backup)
+            .await
+            .unwrap();
+        tokio::fs::write(
+            di.join("WHEEL"),
+            "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag:   \n",
+        )
+        .await
+        .unwrap();
+        let err = locate_installed_dist(&fx.site_packages, "six", "1.16.0")
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, "pypi_missing_wheel_metadata");
+        assert!(err.1.contains("no Tag: headers"), "{}", err.1);
+    }
+
+    /// A noncompliant dist-info stem carrying no version part
+    /// (`six.dist-info`): `rfind('-')` misses, so `dist_name` falls back to
+    /// the METADATA raw name — which then drives the rebuilt wheel filename.
+    #[tokio::test]
+    async fn locate_versionless_dist_info_stem_falls_back_to_metadata_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sp = tmp.path().join("site-packages");
+        let di = sp.join("six.dist-info");
+        tokio::fs::create_dir_all(&di).await.unwrap();
+        tokio::fs::write(sp.join("six.py"), ORIG).await.unwrap();
+        tokio::fs::write(
+            di.join("METADATA"),
+            "Metadata-Version: 2.1\nName: six\nVersion: 1.16.0\n\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(di.join("WHEEL"), "Wheel-Version: 1.0\nTag: py3-none-any\n")
+            .await
+            .unwrap();
+        tokio::fs::write(
+            di.join("RECORD"),
+            "six.py,sha256=AAAA,20\nsix.dist-info/METADATA,,\n",
+        )
+        .await
+        .unwrap();
+
+        let dist = locate_installed_dist(&sp, "six", "1.16.0").await.unwrap();
+        assert_eq!(dist.dist_name, "six");
+        assert_eq!(
+            wheel_file_name(&dist).unwrap(),
+            "six-1.16.0-py3-none-any.whl"
+        );
+    }
+
+    /// An installed RECORD member with the exec bit set must come back out
+    /// of the rebuilt wheel as unix mode 0o755 (a package script losing +x
+    /// breaks the reinstalled dist), non-executables as 0o644 — and the
+    /// exec bit must not break byte determinism.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn executable_record_member_keeps_exec_bit_in_wheel() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fx = make_fixture("six_cli.py,sha256=cc,10\n", None).await;
+        let cli = fx.site_packages.join("six_cli.py");
+        tokio::fs::write(&cli, b"#!/usr/bin/env python3\n")
+            .await
+            .unwrap();
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let dist = locate_installed_dist(&fx.site_packages, "six", "1.16.0")
+            .await
+            .unwrap();
+        let record = patch_record(&[("six.py", ORIG, PATCHED)]);
+        let sources = PatchSources::blobs_only(&fx.blobs);
+        let (r1, a1) = build_patched_wheel(
+            "pkg:pypi/six@1.16.0",
+            &fx.site_packages,
+            &dist,
+            &record,
+            &sources,
+            &fx.dest,
+            false,
+            false,
+            &mut Vec::new(),
+        )
+        .await
+        .unwrap();
+        assert!(r1.success, "{:?}", r1.error);
+        assert!(a1.is_some());
+        let bytes1 = tokio::fs::read(&fx.dest).await.unwrap();
+        assert_eq!(
+            zip_unix_mode(&bytes1, "six_cli.py") & 0o777,
+            0o755,
+            "installed exec bit must survive into the wheel"
+        );
+        assert_eq!(
+            zip_unix_mode(&bytes1, "six.py") & 0o777,
+            0o644,
+            "non-executable members stay 0o644"
+        );
+
+        let (r2, _) = build_patched_wheel(
+            "pkg:pypi/six@1.16.0",
+            &fx.site_packages,
+            &dist,
+            &record,
+            &sources,
+            &fx.dest,
+            false,
+            false,
+            &mut Vec::new(),
+        )
+        .await
+        .unwrap();
+        assert!(r2.success, "{:?}", r2.error);
+        let bytes2 = tokio::fs::read(&fx.dest).await.unwrap();
+        assert_eq!(bytes1, bytes2, "exec bit must not break determinism");
+    }
+
+    /// Dest-side write failures after a SUCCESSFUL apply flip the result to
+    /// an Ok-shaped FAILED ApplyResult (success=false, artifact=None) — not
+    /// an Err refusal. Both shapes are root-proof squatter states: a regular
+    /// file blocking a dest path component, and a directory occupying dest
+    /// itself.
+    #[tokio::test]
+    async fn dest_write_failures_fail_closed_with_ok_shaped_failed_result() {
+        let fx = make_fixture("", None).await;
+        let dist = locate_installed_dist(&fx.site_packages, "six", "1.16.0")
+            .await
+            .unwrap();
+        let record = patch_record(&[("six.py", ORIG, PATCHED)]);
+        let sources = PatchSources::blobs_only(&fx.blobs);
+
+        // A regular file squatting a dest path component: create_dir_all of
+        // dest's parent fails with ENOTDIR.
+        let blocker = fx._tmp.path().join("blocker");
+        tokio::fs::write(&blocker, b"file").await.unwrap();
+        let dest_a = blocker.join("sub").join("x.whl");
+        let (result, artifact) = build_patched_wheel(
+            "pkg:pypi/six@1.16.0",
+            &fx.site_packages,
+            &dist,
+            &record,
+            &sources,
+            &dest_a,
+            false,
+            false,
+            &mut Vec::new(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .starts_with("cannot create "),
+            "{:?}",
+            result.error
+        );
+        assert!(artifact.is_none());
+
+        // Dest itself occupied by a directory: the atomic rename fails and
+        // the squatter is left alone (never unlinked first).
+        let dest_b = fx._tmp.path().join("out").join("x.whl");
+        tokio::fs::create_dir_all(&dest_b).await.unwrap();
+        let (result, artifact) = build_patched_wheel(
+            "pkg:pypi/six@1.16.0",
+            &fx.site_packages,
+            &dist,
+            &record,
+            &sources,
+            &dest_b,
+            false,
+            false,
+            &mut Vec::new(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .starts_with("cannot write "),
+            "{:?}",
+            result.error
+        );
+        assert!(artifact.is_none());
+        assert!(
+            tokio::fs::metadata(&dest_b).await.unwrap().is_dir(),
+            "the squatting directory must be left alone"
+        );
+    }
+
+    /// The editable-install probe fails OPEN on a `direct_url.json` that is
+    /// not valid JSON (deliberate, matching the missing-file twin) and on
+    /// valid JSON with no `dir_info` — both read as not-editable and the
+    /// build proceeds.
+    #[tokio::test]
+    async fn malformed_direct_url_json_reads_as_non_editable() {
+        let fx = make_fixture("", None).await;
+        let du = fx
+            .site_packages
+            .join("six-1.16.0.dist-info/direct_url.json");
+        tokio::fs::write(&du, b"{ not json").await.unwrap();
+        let dist = locate_installed_dist(&fx.site_packages, "six", "1.16.0")
+            .await
+            .unwrap();
+        let record = patch_record(&[("six.py", ORIG, PATCHED)]);
+        let sources = PatchSources::blobs_only(&fx.blobs);
+        let (result, artifact) = build_patched_wheel(
+            "pkg:pypi/six@1.16.0",
+            &fx.site_packages,
+            &dist,
+            &record,
+            &sources,
+            &fx.dest,
+            false,
+            false,
+            &mut Vec::new(),
+        )
+        .await
+        .unwrap();
+        assert!(result.success, "{:?}", result.error);
+        assert!(artifact.is_some());
+        assert!(fx.dest.exists());
+
+        // Valid JSON, no dir_info: the unwrap_or(false) chain also reads
+        // as not-editable.
+        tokio::fs::write(&du, r#"{"url": "https://pypi.org/simple/six"}"#)
+            .await
+            .unwrap();
+        let (result, artifact) = build_patched_wheel(
+            "pkg:pypi/six@1.16.0",
+            &fx.site_packages,
+            &dist,
+            &record,
+            &sources,
+            &fx.dest,
+            false,
+            false,
+            &mut Vec::new(),
+        )
+        .await
+        .unwrap();
+        assert!(result.success, "{:?}", result.error);
+        assert!(artifact.is_some());
+    }
+
+    /// entry_points.txt parser fall-throughs and script-artifact negatives:
+    /// an in-section line without `=`, an empty-name row, a non-script
+    /// section whose entries never reach the insert, and suffix strips
+    /// whose stem is not a declared script.
+    #[test]
+    fn entry_points_parser_and_script_artifact_negative_edges() {
+        let names = console_script_names(
+            "[console_scripts]\n\
+             junk line without equals\n\
+             = empty-name\n\
+             six-cmd = six:main\n\
+             [flake8.extension]\n\
+             not-a-script = x\n",
+        );
+        assert_eq!(
+            names,
+            ["six-cmd".to_string()].into_iter().collect::<HashSet<_>>()
+        );
+
+        let declared: HashSet<String> = ["pycowsay".to_string()].into_iter().collect();
+        assert!(!is_console_script_artifact("other.exe", &declared));
+        assert!(!is_console_script_artifact("other-script.py", &declared));
     }
 }

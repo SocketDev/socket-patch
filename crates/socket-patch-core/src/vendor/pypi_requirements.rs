@@ -126,7 +126,13 @@ fn find_pin(content: &str, canon_name: &str, version: &str) -> PinSearch {
 /// exact patch generation (mirrors `UvTarget` / `PoetryTarget`).
 pub(super) enum RequirementsTarget {
     Fresh,
-    InSync,
+    InSync {
+        /// The wheel path + sha256 the wired vendor line still pins — the
+        /// very pin `pip install --require-hashes` verifies. The in-sync
+        /// rebuild guard falls back to it when the state.json ledger has no
+        /// entry left for the patch.
+        pin: Option<(String, String)>,
+    },
 }
 
 /// Pre-flight the wiring without writing — the orchestrator runs this before
@@ -148,7 +154,9 @@ pub(super) async fn preflight_requirements(
     for file in &files {
         if let Some(found) = vendored_uuid_for(&file.content, canon_name) {
             if found == record_uuid {
-                return Ok(RequirementsTarget::InSync);
+                return Ok(RequirementsTarget::InSync {
+                    pin: wired_pin_in(&file.content, canon_name, record_uuid),
+                });
             }
             return Err((
                 "pypi_requirements_already_vendored",
@@ -184,6 +192,42 @@ fn vendored_uuid_for(content: &str, canon_name: &str) -> Option<String> {
                 return Some(parts.uuid);
             }
         }
+    }
+    None
+}
+
+/// Extract the (wheel path, sha256) pin the wired vendor line for
+/// `canon_name` carries — the same line shape [`vendored_uuid_for`] matches,
+/// restricted to THIS patch uuid and requiring the `--hash=sha256:` pin
+/// vendor always writes. Paths are returned bare (no `./` prefix), matching
+/// the ledger's `artifact.path` spelling.
+fn wired_pin_in(content: &str, canon_name: &str, record_uuid: &str) -> Option<(String, String)> {
+    for line in content.lines() {
+        let trimmed = line.trim();
+        let Some((_, tag)) = trimmed.split_once("# socket-patch vendor: ") else {
+            continue;
+        };
+        if !tag.starts_with(canon_name) || !tag[canon_name.len()..].starts_with("==") {
+            continue;
+        }
+        let token = trimmed.split_whitespace().next().unwrap_or("");
+        let Some(parts) = super::path::parse_vendor_path(token) else {
+            continue;
+        };
+        if parts.eco != "pypi" || parts.uuid != record_uuid {
+            continue;
+        }
+        let Some(sha) = trimmed
+            .split_whitespace()
+            .find_map(|t| t.strip_prefix("--hash=sha256:"))
+        else {
+            continue;
+        };
+        if sha.len() != 64 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+            continue;
+        }
+        let path = token.strip_prefix("./").unwrap_or(token);
+        return Some((path.to_string(), sha.to_string()));
     }
     None
 }
@@ -792,6 +836,8 @@ mod tests {
     const REL_WHEEL: &str =
         ".socket/vendor/pypi/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/six-1.16.0-py2.py3-none-any.whl";
     const SHA: &str = "f75f0d4e2f0a4d29b8d3f3a87b8d6cbe9a1c1f95d97d4a92f51e1b04b6a3c9aa";
+    /// A different canonical uuid, for "another patch generation" fixtures.
+    const OTHER_UUID: &str = "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d";
 
     fn expected_line() -> String {
         format!("./{REL_WHEEL} --hash=sha256:{SHA}  # socket-patch vendor: six==1.16.0")
@@ -1508,5 +1554,438 @@ mod tests {
         let outcome = revert_requirements(&entry_for(wiring), tmp.path(), false).await;
         assert!(outcome.success, "{:?}", outcome.error);
         assert_eq!(read_root(tmp.path()).await, original);
+    }
+
+    // ── preflight / vendored_uuid_for ────────────────────────────────────
+
+    /// `vendored_uuid_for` must recognize ONLY this module's own line shape
+    /// for the queried package: another package's tag, a name-prefix tag
+    /// (`sixty`), a non-vendor path token, and a foreign-ecosystem vendor
+    /// path are all invisible. Each false positive would misroute preflight
+    /// into InSync (skipping the wire) or an already-vendored refusal for a
+    /// line that does not actually wire the queried package.
+    #[test]
+    fn vendored_uuid_for_skips_other_packages_and_foreign_paths() {
+        // Positive control: our own line shape yields the patch uuid.
+        assert_eq!(
+            vendored_uuid_for(&format!("{}\n", expected_line()), "six"),
+            Some(UUID.to_string())
+        );
+        // The tag names a DIFFERENT package than the one queried.
+        assert_eq!(
+            vendored_uuid_for(&format!("{}\n", expected_line()), "requests"),
+            None
+        );
+        // Name boundary: a `sixty==…` tag must not match `six`.
+        let sixty = expected_line().replace("six==1.16.0", "sixty==1.16.0");
+        assert_eq!(vendored_uuid_for(&sixty, "six"), None);
+        // Tag matches, but the first token is not a vendor path at all
+        // (hand-written local wheel line).
+        assert_eq!(
+            vendored_uuid_for(
+                "./wheels/six-1.16.0-py2.py3-none-any.whl  # socket-patch vendor: six==1.16.0\n",
+                "six"
+            ),
+            None
+        );
+        // Tag matches and the token IS a vendor path — for another
+        // ecosystem's dir, which can never be a pypi wiring.
+        assert_eq!(
+            vendored_uuid_for(
+                &format!(
+                    "./.socket/vendor/npm/{UUID}/six.tgz  # socket-patch vendor: six==1.16.0\n"
+                ),
+                "six"
+            ),
+            None
+        );
+    }
+
+    /// Multi-package coexistence: a root already carrying ANOTHER package's
+    /// vendor line (at another patch uuid) plus a clean `six` pin is a Fresh
+    /// wire for six — the foreign line must neither read as InSync nor
+    /// refuse as already-vendored.
+    #[tokio::test]
+    async fn preflight_ignores_other_packages_vendor_line() {
+        let requests_line = format!(
+            "./.socket/vendor/pypi/{OTHER_UUID}/requests-2.31.0-py3-none-any.whl \
+             --hash=sha256:{SHA}  # socket-patch vendor: requests==2.31.0"
+        );
+        let tmp = write_root(&format!("{requests_line}\nsix==1.16.0\n")).await;
+        let res = preflight_requirements(tmp.path(), "six", "1.16.0", UUID).await;
+        assert!(
+            matches!(res, Ok(RequirementsTarget::Fresh)),
+            "another package's vendor line must not block a fresh six vendor"
+        );
+    }
+
+    // ── more revert edge cases ───────────────────────────────────────────
+
+    /// A hand-edited/poisoned state.json record whose `new` field is missing
+    /// or not a string must be skipped fail-closed with a drift warning —
+    /// never panic, never guess a line to splice.
+    #[tokio::test]
+    async fn revert_warns_on_record_with_missing_or_nonstring_new() {
+        let tmp = write_root("six==1.16.0\n").await;
+        let rec = |new: Option<serde_json::Value>| WiringRecord {
+            file: "requirements.txt".to_string(),
+            kind: "requirements_line".to_string(),
+            action: WiringAction::Rewritten,
+            key: Some("requirements.txt:1".to_string()),
+            original: Some(serde_json::json!(["six==1.16.0"])),
+            new,
+        };
+        let wiring = vec![rec(None), rec(Some(serde_json::json!(42)))];
+        let outcome = revert_requirements(&entry_for(wiring), tmp.path(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert_eq!(
+            outcome.warnings.len(),
+            2,
+            "one drift warning per unusable record: {:?}",
+            outcome.warnings
+        );
+        assert!(outcome
+            .warnings
+            .iter()
+            .all(|w| w.code == "vendor_revert_line_drifted"));
+        assert_eq!(
+            read_root(tmp.path()).await,
+            "six==1.16.0\n",
+            "unusable records must leave the file byte-untouched"
+        );
+    }
+
+    /// Mirror of `wire_failure_rolls_back_already_written_files` for the
+    /// REVERT side: when the atomic write fails, the outcome reports the
+    /// failure (`cannot write …`) with `kept_artifact: false`, and the wired
+    /// file survives byte-identical — the atomic temp-file write never
+    /// touches the target on failure.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn revert_write_failure_reports_error_and_keeps_wired_content() {
+        use std::os::unix::fs::PermissionsExt as _;
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root ignores mode bits — the trigger cannot fire
+        }
+        let tmp = write_root("six==1.16.0\n").await;
+        let wiring = wire_requirements(tmp.path(), "six", "1.16.0", REL_WHEEL, SHA)
+            .await
+            .unwrap();
+        let wired = read_root(tmp.path()).await;
+        // Read-only project root: revert READS fine, the atomic write (temp
+        // file in the same dir) fails.
+        let mut perms = std::fs::metadata(tmp.path()).unwrap().permissions();
+        perms.set_mode(0o555);
+        std::fs::set_permissions(tmp.path(), perms.clone()).unwrap();
+        let outcome = revert_requirements(&entry_for(wiring), tmp.path(), false).await;
+        perms.set_mode(0o755);
+        std::fs::set_permissions(tmp.path(), perms).unwrap();
+
+        assert!(!outcome.success);
+        assert!(!outcome.kept_artifact);
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("cannot write requirements.txt"),
+            "{:?}",
+            outcome.error
+        );
+        assert_eq!(
+            read_root(tmp.path()).await,
+            wired,
+            "a failed atomic write must leave the wired file untouched"
+        );
+    }
+
+    /// Unlike wire (which rolls back already-written files on a later write
+    /// failure), revert deliberately leaves earlier reverted files in place:
+    /// the orchestrator keeps the artifact dir and ledger entry on
+    /// `!success`, so a partial revert converges on re-run. Pin that shape:
+    /// root reverted, the unwritable include still wired, outcome failed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn revert_write_failure_does_not_roll_back_earlier_reverted_files() {
+        use std::os::unix::fs::PermissionsExt as _;
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root ignores mode bits — the trigger cannot fire
+        }
+        let original_root = "six==1.16.0\n-r deps/pinned.txt\n";
+        let tmp = write_root(original_root).await;
+        tokio::fs::create_dir_all(tmp.path().join("deps"))
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.path().join("deps/pinned.txt"), "six==1.16.0\n")
+            .await
+            .unwrap();
+        let wiring = wire_requirements(tmp.path(), "six", "1.16.0", REL_WHEEL, SHA)
+            .await
+            .unwrap();
+        assert_eq!(wiring.len(), 2, "both files wired");
+        let wired_include = tokio::fs::read_to_string(tmp.path().join("deps/pinned.txt"))
+            .await
+            .unwrap();
+        // Only the include dir is read-only: the root write succeeds first
+        // (records are grouped in application order — root first), then the
+        // include write fails.
+        let deps = tmp.path().join("deps");
+        let mut perms = std::fs::metadata(&deps).unwrap().permissions();
+        perms.set_mode(0o555);
+        std::fs::set_permissions(&deps, perms.clone()).unwrap();
+        let outcome = revert_requirements(&entry_for(wiring), tmp.path(), false).await;
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&deps, perms).unwrap();
+
+        assert!(!outcome.success);
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("cannot write deps/pinned.txt"),
+            "{:?}",
+            outcome.error
+        );
+        assert_eq!(
+            read_root(tmp.path()).await,
+            original_root,
+            "the root reverted before the failure stays reverted (no rollback)"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(tmp.path().join("deps/pinned.txt"))
+                .await
+                .unwrap(),
+            wired_include,
+            "the unwritable include keeps its wired content for the re-run"
+        );
+    }
+
+    // ── transitive append without a trailing newline ─────────────────────
+
+    /// Transitive append when the root lacks a trailing newline: the
+    /// separator is inserted before the appended vendor line (every other
+    /// append fixture is newline-terminated). NOTE: the revert of this shape
+    /// is asserted at CURRENT behavior — the pin set is restored but the
+    /// file gains a trailing newline the original never had, because the
+    /// revert writer re-terminates any non-empty file that was wired with a
+    /// final newline.
+    #[tokio::test]
+    async fn transitive_append_to_root_without_trailing_newline() {
+        let tmp = write_root("requests==2.31.0").await; // NO trailing newline
+        let wiring = wire_requirements(tmp.path(), "six", "1.16.0", REL_WHEEL, SHA)
+            .await
+            .unwrap();
+        assert_eq!(wiring[0].action, WiringAction::Added);
+        assert_eq!(
+            read_root(tmp.path()).await,
+            format!(
+                "requests==2.31.0\n./{REL_WHEEL} --hash=sha256:{SHA}  # socket-patch vendor: six==1.16.0 (transitive)\n"
+            )
+        );
+        let outcome = revert_requirements(&entry_for(wiring), tmp.path(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        // Not byte-identical: the original had no final newline.
+        assert_eq!(read_root(tmp.path()).await, "requests==2.31.0\n");
+    }
+
+    /// CRLF root without a trailing newline: the inserted separator (and the
+    /// appended line's terminator) must both use the file's dominant `\r\n`.
+    #[tokio::test]
+    async fn transitive_append_crlf_root_without_trailing_newline() {
+        let tmp = write_root("requests==2.31.0\r\nzope.interface==5.0").await;
+        let wiring = wire_requirements(tmp.path(), "six", "1.16.0", REL_WHEEL, SHA)
+            .await
+            .unwrap();
+        assert_eq!(wiring[0].action, WiringAction::Added);
+        assert_eq!(
+            read_root(tmp.path()).await,
+            format!(
+                "requests==2.31.0\r\nzope.interface==5.0\r\n./{REL_WHEEL} --hash=sha256:{SHA}  # socket-patch vendor: six==1.16.0 (transitive)\r\n"
+            )
+        );
+    }
+
+    // ── nested includes ──────────────────────────────────────────────────
+
+    /// A `-r` inside a non-root file resolves against the INCLUDING file's
+    /// directory (the module's documented contract): `deps/a.txt` reaches
+    /// `b.txt` (sibling → `deps/b.txt`) and `../c.txt` (back at the root —
+    /// the interior `..` pop of `normalize_rel_path`). The pin in deps/b.txt
+    /// is rewritten in place; nothing else is touched and no transitive
+    /// duplicate is appended, proving BOTH nested includes were walked.
+    #[tokio::test]
+    async fn nested_include_resolves_against_including_dir() {
+        let tmp = write_root("-r deps/a.txt\n").await;
+        tokio::fs::create_dir_all(tmp.path().join("deps"))
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.path().join("deps/a.txt"), "-r b.txt\n-r ../c.txt\n")
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.path().join("deps/b.txt"), "six==1.16.0\n")
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.path().join("c.txt"), "requests==2.31.0\n")
+            .await
+            .unwrap();
+        let wiring = wire_requirements(tmp.path(), "six", "1.16.0", REL_WHEEL, SHA)
+            .await
+            .unwrap();
+        assert_eq!(wiring.len(), 1);
+        assert_eq!(
+            wiring[0].file, "deps/b.txt",
+            "the pin lives two includes deep, resolved against deps/"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(tmp.path().join("deps/b.txt"))
+                .await
+                .unwrap(),
+            format!("{}\n", expected_line())
+        );
+        // No transitive duplicate at the root, and the other files are
+        // byte-untouched — the walk really visited them.
+        assert_eq!(read_root(tmp.path()).await, "-r deps/a.txt\n");
+        assert_eq!(
+            tokio::fs::read_to_string(tmp.path().join("deps/a.txt"))
+                .await
+                .unwrap(),
+            "-r b.txt\n-r ../c.txt\n"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(tmp.path().join("c.txt"))
+                .await
+                .unwrap(),
+            "requests==2.31.0\n"
+        );
+
+        let outcome = revert_requirements(&entry_for(wiring), tmp.path(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert_eq!(
+            tokio::fs::read_to_string(tmp.path().join("deps/b.txt"))
+                .await
+                .unwrap(),
+            "six==1.16.0\n"
+        );
+    }
+
+    /// An interior-`..` include that then escapes the root
+    /// (`deps/../../shared.txt` → `../shared.txt`) must still refuse: the
+    /// pop-then-leading-parent normalization may not launder an out-of-root
+    /// path into an editable one.
+    #[tokio::test]
+    async fn interior_parent_include_escaping_root_still_refuses() {
+        let outer = tempfile::tempdir().unwrap();
+        let root = outer.path().join("project");
+        tokio::fs::create_dir_all(root.join("deps")).await.unwrap();
+        tokio::fs::write(root.join("requirements.txt"), "-r deps/a.txt\n")
+            .await
+            .unwrap();
+        tokio::fs::write(root.join("deps/a.txt"), "-r ../../shared.txt\n")
+            .await
+            .unwrap();
+        tokio::fs::write(outer.path().join("shared.txt"), "six==1.16.0\n")
+            .await
+            .unwrap();
+        let err = wire_requirements(&root, "six", "1.16.0", REL_WHEEL, SHA)
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, "pypi_requirements_outside_root");
+        assert_eq!(
+            tokio::fs::read_to_string(outer.path().join("shared.txt"))
+                .await
+                .unwrap(),
+            "six==1.16.0\n",
+            "the escaped include is never edited"
+        );
+    }
+
+    /// pip also accepts the attached long form `--requirement=dev.txt`;
+    /// missing it would classify the pin as absent and append a duplicate at
+    /// the root EOF — the same pip double-requirement failure class the
+    /// `-rdev.txt` test documents.
+    #[tokio::test]
+    async fn requirement_equals_long_form_include_is_followed() {
+        // Unit shape checks for the `=` arm.
+        assert_eq!(include_target("--requirement=dev.txt"), Some("dev.txt"));
+        assert_eq!(
+            include_target("--requirement= dev.txt "),
+            Some("dev.txt"),
+            "the attached value is trimmed"
+        );
+        assert_eq!(
+            include_target("--requirement="),
+            None,
+            "an empty attached value is not an include"
+        );
+
+        let tmp = write_root("--requirement=dev.txt\n").await;
+        tokio::fs::write(tmp.path().join("dev.txt"), "six==1.16.0\n")
+            .await
+            .unwrap();
+        let wiring = wire_requirements(tmp.path(), "six", "1.16.0", REL_WHEEL, SHA)
+            .await
+            .unwrap();
+        assert_eq!(wiring.len(), 1);
+        assert_eq!(wiring[0].file, "dev.txt");
+        assert_eq!(
+            read_root(tmp.path()).await,
+            "--requirement=dev.txt\n",
+            "root untouched — no duplicate appended"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(tmp.path().join("dev.txt"))
+                .await
+                .unwrap(),
+            format!("{}\n", expected_line())
+        );
+    }
+
+    // ── pure-function matrices ───────────────────────────────────────────
+
+    /// Lexical normalization: interior `..` pops the stack (which decides
+    /// editable-vs-refuse for nested includes); escapes keep their `../`
+    /// prefix; absolute paths keep their leading `/`.
+    #[test]
+    fn normalize_rel_path_unit_matrix() {
+        assert_eq!(normalize_rel_path("deps/../dev.txt"), "dev.txt");
+        assert_eq!(normalize_rel_path("a/b/../../c"), "c");
+        assert_eq!(
+            normalize_rel_path("deps/../../x"),
+            "../x",
+            "pop, then the second `..` escapes"
+        );
+        assert_eq!(normalize_rel_path("./a//b/./c"), "a/b/c");
+        assert_eq!(normalize_rel_path("../x"), "../x");
+        assert_eq!(normalize_rel_path("/abs/../x"), "/x");
+        assert_eq!(normalize_rel_path("deps\\..\\dev.txt"), "dev.txt");
+    }
+
+    /// Lines that do not start with a PEP 508 name are not requirements —
+    /// in particular this module's OWN vendor-line shape must be invisible
+    /// to the pin search, or an already-wired path line would misparse as a
+    /// pin during a later scan.
+    #[test]
+    fn parse_requirement_line_ignores_path_and_nonname_lines() {
+        assert!(parse_requirement_line(&expected_line()).is_none());
+        assert!(parse_requirement_line("./local/wheel.whl --hash=sha256:abc").is_none());
+        assert!(parse_requirement_line("=six==1.0").is_none());
+        assert!(parse_requirement_line("[section]").is_none());
+        // A stray path line neither matches nor shifts the classification of
+        // the real pin below it.
+        assert_eq!(
+            find_pin(
+                "./other/wheel.whl --hash=sha256:def\nsix==1.16.0\n",
+                "six",
+                "1.16.0"
+            ),
+            PinSearch::Exact {
+                line_start: 1,
+                line_count: 1,
+                marker: None,
+                hashed: false,
+            }
+        );
     }
 }

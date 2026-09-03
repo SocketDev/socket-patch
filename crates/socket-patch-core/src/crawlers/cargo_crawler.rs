@@ -467,6 +467,29 @@ version.workspace = true
         assert!(parse_cargo_toml_name_version(content).is_none());
     }
 
+    /// The inline-table spelling `version = { workspace = true }` is the
+    /// equally-valid sibling of the tested `version.workspace = true`.
+    /// `extract_string_value` must bail on the `{` (not a quote), after
+    /// which the `version`+`workspace` short-circuit returns `None` for
+    /// the whole manifest — the version cannot be determined here.
+    #[test]
+    fn test_parse_cargo_toml_inline_table_workspace_version() {
+        let content = "[package]\nname = \"my-crate\"\nversion = { workspace = true }\n";
+        assert!(parse_cargo_toml_name_version(content).is_none());
+    }
+
+    /// A malformed bracket line (`[oops` — no closing `]`) inside
+    /// `[package]` is not a table header: it must be skipped without
+    /// terminating the section, so keys after it are still read.
+    #[test]
+    fn test_parse_cargo_toml_malformed_header_line_skipped() {
+        let content = "[package]\nname = \"a\"\n[oops\nversion = \"1.0\"\n";
+        assert_eq!(
+            parse_cargo_toml_name_version(content),
+            Some(("a".to_string(), "1.0".to_string()))
+        );
+    }
+
     #[test]
     fn test_parse_cargo_toml_missing_fields() {
         let content = r#"

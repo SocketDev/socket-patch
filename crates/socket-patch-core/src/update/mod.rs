@@ -149,3 +149,111 @@ pub async fn perform_update(req: UpdateRequest<'_>) -> Result<UpdateOutcome, Upd
         warnings,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use serial_test::serial;
+
+    /// Pins the full `error_code()` mapping to the stable top-level
+    /// `errorCode` list documented in CLI_CONTRACT.md ("Top-level
+    /// `errorCode` values (stable)"). `Network => "download_failed"` is a
+    /// deliberate alias: the contract's stable list has no separate
+    /// `network` tag, so a network-layer failure routes to the same tag
+    /// callers already handle for download failures.
+    #[test]
+    fn error_code_table_matches_cli_contract() {
+        let table: [(UpdateError, &str); 9] = [
+            (UpdateError::CheckFailed("x".into()), "check_failed"),
+            (UpdateError::Network("x".into()), "download_failed"),
+            (
+                UpdateError::AssetNotFound {
+                    asset: "a".into(),
+                    version: "1.0.0".into(),
+                },
+                "asset_not_found",
+            ),
+            (UpdateError::DownloadFailed("x".into()), "download_failed"),
+            (
+                UpdateError::ChecksumMismatch {
+                    asset: "a".into(),
+                    detail: "d".into(),
+                },
+                "checksum_mismatch",
+            ),
+            (UpdateError::VerifyFailed("x".into()), "verify_failed"),
+            (UpdateError::SwapFailed("x".into()), "swap_failed"),
+            (
+                UpdateError::PermissionDenied {
+                    path: PathBuf::from("/x"),
+                },
+                "permission_denied",
+            ),
+            (UpdateError::InProgress, "update_in_progress"),
+        ];
+        for (err, expected) in &table {
+            assert_eq!(
+                err.error_code(),
+                *expected,
+                "error_code for {err:?} drifted from the CLI_CONTRACT.md stable list"
+            );
+        }
+    }
+
+    /// A parentless install path (only a bare root can be one — a
+    /// canonicalized exe path essentially never is) must be refused as
+    /// `SwapFailed` under the single-flight lock and BEFORE any network
+    /// or stage-sweep work. The dead base URL proves the ordering: had
+    /// perform_update reached the download step, the failure would surface
+    /// as `Network`/`DownloadFailed` instead and the match below would
+    /// fail.
+    #[tokio::test]
+    #[serial(update_state_dir_env, update_base_url_env)]
+    async fn perform_update_refuses_parentless_install_path_before_network() {
+        let tmp = tempfile::tempdir().unwrap();
+        let prev_state = std::env::var_os("SOCKET_UPDATE_STATE_DIR");
+        let prev_base = std::env::var_os("SOCKET_UPDATE_BASE_URL");
+        std::env::set_var("SOCKET_UPDATE_STATE_DIR", tmp.path());
+        std::env::set_var("SOCKET_UPDATE_BASE_URL", "http://127.0.0.1:9");
+
+        let endpoints = UpdateEndpoints::from_env();
+        assert!(!endpoints.is_default(), "dead base URL override must take");
+        let timeouts = UpdateTimeouts::default();
+        let version = semver::Version::new(9, 9, 9);
+        let result = perform_update(UpdateRequest {
+            target_triple: "x86_64-unknown-linux-gnu",
+            version: &version,
+            install_path: Path::new("/"),
+            endpoints: &endpoints,
+            timeouts: &timeouts,
+        })
+        .await;
+
+        let err = result.expect_err("a parentless install path must be refused");
+        assert!(
+            matches!(err, UpdateError::SwapFailed(_)),
+            "expected SwapFailed, got {err:?}"
+        );
+        assert_eq!(err.error_code(), "swap_failed");
+        assert!(
+            err.to_string().contains("has no parent directory"),
+            "unexpected message: {err}"
+        );
+        // The refusal happened under the lock: acquire_update_lock already
+        // created update.lock in the (env-overridden) state dir.
+        assert!(
+            tmp.path().join("update.lock").is_file(),
+            "refusal must happen under the single-flight lock"
+        );
+
+        match prev_state {
+            Some(v) => std::env::set_var("SOCKET_UPDATE_STATE_DIR", v),
+            None => std::env::remove_var("SOCKET_UPDATE_STATE_DIR"),
+        }
+        match prev_base {
+            Some(v) => std::env::set_var("SOCKET_UPDATE_BASE_URL", v),
+            None => std::env::remove_var("SOCKET_UPDATE_BASE_URL"),
+        }
+    }
+}

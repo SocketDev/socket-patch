@@ -518,6 +518,7 @@ fn rewrite_pypi_requirements(
             continue;
         };
         let target = canonicalize_pypi_name(&dep.name);
+        let mut matched_any = false;
         for raw in lines.iter_mut() {
             let line = raw.trim();
             if line.is_empty() || line.starts_with('#') || line.starts_with('-') {
@@ -529,6 +530,7 @@ fn rewrite_pypi_requirements(
             if canonicalize_pypi_name(&caps[1]) != target {
                 continue;
             }
+            matched_any = true;
             // pip-compile --generate-hashes emits backslash continuations
             // (`foo==1.2 \` + indented `--hash=…` lines). Rewriting only the
             // first physical line would orphan the old hash lines and — with
@@ -573,6 +575,20 @@ fn rewrite_pypi_requirements(
                 *raw = rewritten;
                 changed = true;
             }
+        }
+        // Parity with the npm/pnpm/berry/uv rewriters: a granted dep no line
+        // accounted for — omitted (a transitive dep the file never pins), or
+        // spelled in a form the name matcher cannot parse (a PEP 508 extras
+        // bracket) — must be SAID, not silently dropped from the redirected
+        // count. A found-but-refused line (continuation) already warned above.
+        if !matched_any {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_requirements_entry_not_found".into(),
+                detail: format!(
+                    "no requirements.txt entry for {}@{}",
+                    dep.name, dep.version
+                ),
+            });
         }
     }
     if changed {
@@ -2981,7 +2997,12 @@ fn default_nuget_config() -> String {
 const NUGET_ORG_KEY: &str = "nuget.org";
 const NUGET_ORG_URL: &str = "https://api.nuget.org/v3/index.json";
 
-fn add_nuget_source(config: &str, reg: &str, index_url: &str, pkg_id: &str) -> String {
+/// `None` when an insert found no anchor (no `<packageSources>` form and no
+/// `<configuration>` root, or no close tag for a from-scratch mapping): the
+/// caller must skip the dep fail-closed — writing the mapping without its
+/// source (or recording the edit at all) routes the patched id to a source
+/// that was never defined while the ledger claims the redirect landed.
+fn add_nuget_source(config: &str, reg: &str, index_url: &str, pkg_id: &str) -> Option<String> {
     // Capture the pre-existing packageSource keys BEFORE the Socket source is
     // added — the fallback below fans a `*` mapping out to them.
     let mut pre_existing_keys = nuget_package_source_keys(config);
@@ -2994,14 +3015,18 @@ fn add_nuget_source(config: &str, reg: &str, index_url: &str, pkg_id: &str) -> S
     // nuget.org source so the catch-all has a real target (unless the config
     // already has one). Only relevant when we are about to CREATE the mapping.
     let creating_mapping = !out.contains("<packageSourceMapping>");
-    let seed_nuget_org =
-        creating_mapping && pre_existing_keys.is_empty() && !config.contains(NUGET_ORG_KEY);
+    // "Already has one" is decided by the parsed <packageSources> keys ALONE:
+    // a whole-file "nuget.org" probe is satisfied by text that defines no
+    // source (a defaultPushSource URL, a <disabledPackageSources> entry, a
+    // comment), and suppressing the seed on it leaves the from-scratch
+    // mapping socket-only — NU1100 for every other package.
+    let seed_nuget_org = creating_mapping && pre_existing_keys.is_empty();
     if seed_nuget_org {
-        out = insert_nuget_source(&out, NUGET_ORG_KEY, NUGET_ORG_URL);
+        out = insert_nuget_source(&out, NUGET_ORG_KEY, NUGET_ORG_URL)?;
         pre_existing_keys.push(NUGET_ORG_KEY.to_string());
     }
 
-    out = insert_nuget_source(&out, reg, index_url);
+    out = insert_nuget_source(&out, reg, index_url)?;
 
     let socket_mapping = format!(
         "    <packageSource key=\"{reg}\">\n      <package pattern=\"{pkg_id}\" />\n    </packageSource>"
@@ -3038,28 +3063,39 @@ fn add_nuget_source(config: &str, reg: &str, index_url: &str, pkg_id: &str) -> S
             format!("{socket_mapping}\n{fallback_mappings}")
         };
         let map_block = format!("  <packageSourceMapping>\n{inner}\n  </packageSourceMapping>");
-        out = out.replacen(
-            "</configuration>",
-            &format!("{map_block}\n</configuration>"),
-            1,
-        );
+        // The close tag may carry whitespace (`</configuration >` is valid
+        // XML); a literal replacen would silently drop the mapping.
+        let close_re = Regex::new(r"</configuration\s*>")
+            .expect("static configuration close-tag regex is valid");
+        let m = close_re.find(&out)?;
+        let at = m.start();
+        out = format!("{}{map_block}\n{}", &out[..at], &out[at..]);
     }
-    out
+    Some(out)
 }
 
 /// Insert an `<add key="…" value="…" />` source under `<packageSources>`,
-/// creating the element (right after `<configuration>`) when absent. A
-/// self-closing `<packageSources />` (any whitespace before `/>`) is expanded
-/// in place into an open/close pair rather than left dangling beside a
-/// duplicate element.
-fn insert_nuget_source(config: &str, key: &str, url: &str) -> String {
+/// creating the element (right after the `<configuration>` root open tag,
+/// whatever whitespace or attributes it carries) when absent. A self-closing
+/// `<packageSources />` (any whitespace before `/>`) is expanded in place
+/// into an open/close pair rather than left dangling beside a duplicate
+/// element. `None` when no anchor exists at all — the caller must treat the
+/// insert as failed rather than proceed on unchanged text.
+fn insert_nuget_source(config: &str, key: &str, url: &str) -> Option<String> {
     let source_line = format!("    <add key=\"{key}\" value=\"{url}\" />");
     // A self-closing element carries no children, so expand it to an open/close
-    // pair holding the new source. Matched before the open-tag check because a
-    // `<packageSources/>` literal does not contain the `<packageSources>` open
-    // tag.
+    // pair holding the new source. Matched before the open-tag check because
+    // the tolerant open-tag regex below also matches the whitespace-carrying
+    // `<packageSources />` form, and inserting after its `>` would land the
+    // source OUTSIDE the element.
     let self_closing = Regex::new(r"<packageSources\s*/>")
         .expect("static self-closing packageSources regex is valid");
+    // The open tag may carry whitespace (`<packageSources >` is valid XML
+    // NuGet parses); a literal `<packageSources>` probe reads it as absent
+    // and the from-scratch branch below authors a DUPLICATE element — the
+    // vendor/nuget_feed twin already tolerates the spelling.
+    let open_tag = Regex::new(r"<packageSources(?:\s[^>]*)?>")
+        .expect("static packageSources open-tag regex is valid");
     if let Some(m) = self_closing.find(config) {
         let mut out = String::with_capacity(config.len() + source_line.len() + 40);
         out.push_str(&config[..m.start()]);
@@ -3067,19 +3103,33 @@ fn insert_nuget_source(config: &str, key: &str, url: &str) -> String {
             "<packageSources>\n{source_line}\n  </packageSources>"
         ));
         out.push_str(&config[m.end()..]);
-        out
-    } else if config.contains("<packageSources>") {
-        config.replacen(
-            "<packageSources>",
-            &format!("<packageSources>\n{source_line}"),
-            1,
-        )
+        Some(out)
+    } else if let Some(m) = open_tag
+        .find(config)
+        // An attribute-carrying self-closing form (`<packageSources … />`,
+        // schema-invalid but cheap to guard) has no children span: fall
+        // through to the from-scratch branch rather than insert outside it.
+        .filter(|m| !m.as_str().ends_with("/>"))
+    {
+        let end = m.end();
+        Some(format!(
+            "{}\n{source_line}{}",
+            &config[..end],
+            &config[end..]
+        ))
     } else {
-        config.replacen(
-            "<configuration>",
-            &format!("<configuration>\n  <packageSources>\n{source_line}\n  </packageSources>"),
-            1,
-        )
+        // The root open tag may carry whitespace or attributes
+        // (`<configuration >`, `<configuration xmlns=…>`) — all valid XML a
+        // literal `<configuration>` match would silently miss, leaving the
+        // source undefined while the mapping still lands.
+        let open_re = Regex::new(r"<configuration(\s[^>]*)?>")
+            .expect("static configuration open-tag regex is valid");
+        let end = open_re.find(config)?.end();
+        Some(format!(
+            "{}\n  <packageSources>\n{source_line}\n  </packageSources>{}",
+            &config[..end],
+            &config[end..]
+        ))
     }
 }
 
@@ -3087,7 +3137,13 @@ fn insert_nuget_source(config: &str, key: &str, url: &str) -> String {
 /// is no such element). Used to preserve resolution for non-patched packages
 /// when a `<packageSourceMapping>` is introduced.
 fn nuget_package_source_keys(config: &str) -> Vec<String> {
-    let region_re = Regex::new(r"(?s)<packageSources>(.*?)</packageSources>")
+    // The open tag may carry whitespace (`<packageSources >` is valid XML
+    // NuGet parses); a literal match reads a real source list as "no
+    // sources" — duplicate nuget.org seed, missed catch-all fan-out — while
+    // the vendor/nuget_feed twin already tolerates the spelling. A
+    // self-closing `<packageSources />` has no close tag, so the regex
+    // (correctly) finds no children span.
+    let region_re = Regex::new(r"(?s)<packageSources(?:\s[^>]*)?>(.*?)</packageSources>")
         .expect("static packageSources region regex is valid");
     let scope = region_re
         .captures(config)
@@ -3097,10 +3153,21 @@ fn nuget_package_source_keys(config: &str) -> Vec<String> {
                 .as_str()
         })
         .unwrap_or("");
-    Regex::new(r#"<add\s+key="([^"]+)""#)
+    // Tolerates any attribute order, whitespace around `=`, and single-quoted
+    // values (all valid XML NuGet accepts): a real source the scan misses
+    // would read as "no sources", triggering a duplicate nuget.org seed and
+    // leaving the missed source out of the catch-all fan-out. `[^>]` keeps
+    // the match inside one element.
+    Regex::new(r#"<add\s[^>]*?key\s*=\s*(?:"([^"]+)"|'([^']+)')"#)
         .expect("static add-key regex is valid")
         .captures_iter(scope)
-        .map(|c| c[1].to_string())
+        .map(|c| {
+            c.get(1)
+                .or_else(|| c.get(2))
+                .expect("one quote alternative always captures")
+                .as_str()
+                .to_string()
+        })
         .collect()
 }
 
@@ -3156,7 +3223,23 @@ fn rewrite_nuget(
             .unwrap_or_else(|| dep.name.to_lowercase());
 
         if !config.contains(&format!("key=\"{reg}\"")) {
-            config = add_nuget_source(&config, &reg, &ov.index_url, &dep.name);
+            // A failed insert skips the WHOLE dep (no edit record, no lock
+            // re-pin): a mapping without its source routes the patched id to
+            // a source that was never defined, and a lock pinned at the
+            // patched contentHash over an upstream fetch fails NU1403 — both
+            // while the ledger would claim the redirect landed.
+            let Some(updated) = add_nuget_source(&config, &reg, &ov.index_url, &dep.name) else {
+                result.warnings.push(RewriteWarning {
+                    code: "redirect_nuget_config_unwritable".into(),
+                    detail: format!(
+                        "nuget.config has no <configuration> element to wire {} into; \
+                         not redirected",
+                        dep.name
+                    ),
+                });
+                continue;
+            };
+            config = updated;
             config_changed = true;
             result.edits.push(FileEdit {
                 path: "nuget.config".into(),
@@ -5625,6 +5708,184 @@ mod tests {
         ));
     }
 
+    /// The nuget.org seed must not be suppressed by "nuget.org" TEXT outside
+    /// the `<packageSources>` element — a `defaultPushSource` URL, a
+    /// `<disabledPackageSources>` entry, or a comment is not a package
+    /// source. Suppressing the seed there leaves the from-scratch mapping
+    /// socket-only, and a mapping is exclusive: every other package NU1100s.
+    #[test]
+    fn nuget_seed_not_suppressed_by_nugetorg_text_outside_sources() {
+        for extra in [
+            // The push URL mentions nuget.org but defines no source.
+            "  <config>\n    <add key=\"defaultPushSource\" value=\"https://api.nuget.org/v3/index.json\" />\n  </config>\n",
+            // So does a comment.
+            "  <!-- nuget.org supplied by machine config -->\n",
+        ] {
+            let mut files = BTreeMap::new();
+            files.insert(
+                "nuget.config".to_string(),
+                format!(
+                    "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<configuration>\n  <packageSources>\n  </packageSources>\n{extra}</configuration>\n"
+                ),
+            );
+            let r = rewrite_registry_redirect(&files, &[nuget_override()]);
+            let out = r.files.get("nuget.config").expect("config rewritten");
+            assert!(
+                out.contains(
+                    "<add key=\"nuget.org\" value=\"https://api.nuget.org/v3/index.json\" />"
+                ),
+                "nuget.org source seeded despite unrelated mention: {out}"
+            );
+            assert!(
+                out.contains(
+                    "    <packageSource key=\"nuget.org\">\n      <package pattern=\"*\" />\n    </packageSource>"
+                ),
+                "catch-all present (socket-only mapping NU1100s everything): {out}"
+            );
+        }
+    }
+
+    /// An `<add>` keyed nuget.org that the strict scan used to miss (XML
+    /// allows whitespace around `=` and any attribute order) is a REAL
+    /// source: it must be harvested as the catch-all target — not
+    /// double-added by the seed, and not left out of the `*` fan-out.
+    #[test]
+    fn nuget_whitespace_variant_add_is_harvested_not_reseeded() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "nuget.config".to_string(),
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<configuration>\n  <packageSources>\n    <add key = \"nuget.org\" value=\"https://api.nuget.org/v3/index.json\" />\n  </packageSources>\n</configuration>\n"
+                .to_string(),
+        );
+        let r = rewrite_registry_redirect(&files, &[nuget_override()]);
+        let out = r.files.get("nuget.config").expect("config rewritten");
+        assert!(
+            !out.contains("<add key=\"nuget.org\""),
+            "the existing source must not be duplicated by the seed: {out}"
+        );
+        assert!(
+            out.contains(
+                "    <packageSource key=\"nuget.org\">\n      <package pattern=\"*\" />\n    </packageSource>"
+            ),
+            "the existing source takes the catch-all: {out}"
+        );
+    }
+
+    /// A `<packageSources >`-style open tag, or single-quoted `<add>`
+    /// attributes — both valid XML NuGet parses — is a REAL source list: its
+    /// keys must be harvested and the socket source inserted into the
+    /// EXISTING element. The literal probes used to read it as zero sources:
+    /// a SECOND `<packageSources>` element appeared carrying a duplicate
+    /// nuget.org seed, and the catch-all fanned `*` only to nuget.org —
+    /// every corp-feed-only package then NU1100s. Mirrors the tolerant
+    /// vendor/nuget_feed twin.
+    #[test]
+    fn nuget_open_tag_whitespace_and_single_quotes_harvested_not_reseeded() {
+        for config in [
+            // Whitespace inside the <packageSources> open tag.
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<configuration>\n  <packageSources >\n    <add key=\"corp-feed\" value=\"https://nuget.corp.example/v3/index.json\" />\n  </packageSources>\n</configuration>\n",
+            // Single-quoted <add> attribute values.
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<configuration>\n  <packageSources>\n    <add key='corp-feed' value='https://nuget.corp.example/v3/index.json' />\n  </packageSources>\n</configuration>\n",
+        ] {
+            let mut files = BTreeMap::new();
+            files.insert("nuget.config".to_string(), config.to_string());
+            let r = rewrite_registry_redirect(&files, &[nuget_override()]);
+            let out = r.files.get("nuget.config").expect("config rewritten");
+            // Exactly ONE opening <packageSources> element, whatever its
+            // spelling — no from-scratch duplicate beside the real one.
+            assert_eq!(
+                out.matches("<packageSources").count(),
+                1,
+                "single packageSources element (no duplicate): {out}"
+            );
+            assert!(
+                !out.contains("nuget.org"),
+                "the harvested corp feed suppresses the nuget.org seed: {out}"
+            );
+            assert!(
+                out.contains("<add key=\"socket-patch-uuid\""),
+                "socket source inserted into the existing element: {out}"
+            );
+            assert!(
+                out.contains(
+                    "    <packageSource key=\"corp-feed\">\n      <package pattern=\"*\" />\n    </packageSource>"
+                ),
+                "the corp feed takes the catch-all: {out}"
+            );
+        }
+    }
+
+    /// A root open tag that isn't the literal `<configuration>` — trailing
+    /// whitespace or attributes, both valid XML NuGet parses fine — must
+    /// still receive the source insert. The literal `replacen` used to no-op
+    /// silently while the mapping (anchored on the close tag) still landed,
+    /// routing the patched id to a source that was never defined.
+    #[test]
+    fn nuget_config_root_tag_with_whitespace_still_wired() {
+        for open_tag in ["<configuration >", "<configuration\n    >"] {
+            let mut files = BTreeMap::new();
+            files.insert(
+                "nuget.config".to_string(),
+                format!(
+                    "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n{open_tag}\n</configuration>\n"
+                ),
+            );
+            let r = rewrite_registry_redirect(&files, &[nuget_override()]);
+            let out = r.files.get("nuget.config").expect("config rewritten");
+            assert!(
+                out.contains("<add key=\"socket-patch-uuid\""),
+                "socket source defined for root tag {open_tag:?}: {out}"
+            );
+            assert!(
+                out.contains("<package pattern=\"Newtonsoft.Json\" />"),
+                "socket mapping present: {out}"
+            );
+        }
+    }
+
+    /// When NO anchor exists for the source insert, the dep must be skipped
+    /// fail-closed with a warning: no config write, no recorded edit whose
+    /// `new` claims the source landed, and no lock re-pin (a patched
+    /// contentHash over an upstream fetch fails restore with NU1403).
+    #[test]
+    fn nuget_config_without_configuration_root_skips_dep_with_warning() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "nuget.config".to_string(),
+            "<packages>\n</packages>\n".to_string(),
+        );
+        files.insert(
+            "packages.lock.json".to_string(),
+            r#"{
+  "version": 1,
+  "dependencies": {
+    "net8.0": {
+      "Newtonsoft.Json": {
+        "type": "Direct",
+        "requested": "[13.0.3, )",
+        "resolved": "13.0.3",
+        "contentHash": "ORIGINALHASH=="
+      }
+    }
+  }
+}
+"#
+            .to_string(),
+        );
+        let r = rewrite_registry_redirect(&files, &[nuget_override()]);
+        assert!(
+            r.files.is_empty() && r.edits.is_empty(),
+            "an unwritable config must not record a half-write: files={:?} edits={:?}",
+            r.files.keys(),
+            r.edits
+        );
+        assert!(
+            warning_codes(&r).contains(&"redirect_nuget_config_unwritable"),
+            "the failed insert must be SAID: {:?}",
+            r.warnings
+        );
+    }
+
     /// A pre-existing `<packageSourceMapping>` already covers the other
     /// sources — the rewriter must append ONLY the Socket mapping and add NO
     /// catch-all (injecting `*` entries would loosen the project's own
@@ -5687,6 +5948,82 @@ mod tests {
                 .any(|w| w.code == "redirect_requirements_continuation"),
             "must surface the continuation refusal: {:?}",
             result.warnings
+        );
+    }
+
+    /// A granted pypi dep whose requirements.txt line the name matcher cannot
+    /// parse (a PEP 508 extras bracket terminates the name run before any
+    /// terminator alternative) — or that the file omits entirely — must be
+    /// SAID with an entry-not-found warning, matching npm/pnpm/yarn/berry/
+    /// bun/uv/cargo/composer, not silently dropped from the redirected count.
+    #[test]
+    fn requirements_unmatched_dep_warns_entry_not_found() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "requirements.txt".to_string(),
+            "requests[security]==2.28.1\n".to_string(),
+        );
+        let overrides = vec![pypi_override(
+            "requests",
+            "2.28.1",
+            "http://patch.test/requests-2.28.1-py3-none-any.whl",
+            &"c".repeat(64),
+        )];
+        let r = rewrite_registry_redirect(&files, &overrides);
+        // The extras spelling itself is a recorded TS-parity residual (the
+        // line matching needs a coordinated TS+Rust fix) — the line stays.
+        assert!(
+            r.files.is_empty() && r.edits.is_empty(),
+            "extras line must not be rewritten: {:?}",
+            r.files
+        );
+        assert!(
+            warning_codes(&r).contains(&"redirect_requirements_entry_not_found"),
+            "the un-wired dep must be SAID, not silent: {:?}",
+            r.warnings
+        );
+    }
+
+    /// The not-found warning fires ONLY for a dep no line accounted for: a
+    /// rewritten line and a continuation-refused line (which carries its own
+    /// warning) both count as found.
+    #[test]
+    fn requirements_matched_or_refused_dep_gets_no_not_found_warning() {
+        let overrides = vec![pypi_override(
+            "requests",
+            "2.28.1",
+            "http://patch.test/requests-2.28.1-py3-none-any.whl",
+            &"c".repeat(64),
+        )];
+        // Plain match: rewritten, no not-found.
+        let mut files = BTreeMap::new();
+        files.insert(
+            "requirements.txt".to_string(),
+            "requests==2.28.1\n".to_string(),
+        );
+        let r = rewrite_registry_redirect(&files, &overrides);
+        assert!(!r.edits.is_empty(), "plain pin rewritten");
+        assert!(
+            !warning_codes(&r).contains(&"redirect_requirements_entry_not_found"),
+            "a rewritten dep is not not-found: {:?}",
+            r.warnings
+        );
+        // Continuation refusal: found-but-refused must not ALSO say not-found.
+        let mut files = BTreeMap::new();
+        files.insert(
+            "requirements.txt".to_string(),
+            "requests==2.28.1 \\\n    --hash=sha256:OLDOLDOLD\n".to_string(),
+        );
+        let r = rewrite_registry_redirect(&files, &overrides);
+        assert!(
+            warning_codes(&r).contains(&"redirect_requirements_continuation"),
+            "{:?}",
+            r.warnings
+        );
+        assert!(
+            !warning_codes(&r).contains(&"redirect_requirements_entry_not_found"),
+            "a refused-with-cause dep is not not-found: {:?}",
+            r.warnings
         );
     }
 
@@ -10974,5 +11311,2011 @@ packages:
                     .as_str()
                     .unwrap_or_default()
                     .contains("v1.4.2-socketpatch.1"))));
+    }
+
+    // ── coverage-audit 2026-09 additions ─────────────────────────────────────
+    // Warning/refusal legs and rare-lock-shape branches the golden fixtures
+    // deliberately do not pin (they are byte-shared with the TS backend).
+
+    /// A crafted lock entry that carries BOTH `link: true` and a version gets
+    /// the specific link diagnosis; the REAL npm-emitted link shape (no
+    /// `version` key at all) falls through to the generic not-found today —
+    /// pinned here so a future link-aware diagnosis flips this test
+    /// deliberately (audit bug anchor #2).
+    #[test]
+    fn npm_link_entry_versioned_skips_loudly_versionless_is_generic_not_found() {
+        let ovr = npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://p.test/lp.tgz",
+            "sha512-PATCHED==",
+        );
+
+        // Versioned link entry → the specific skip diagnosis, nothing written.
+        let mut files = BTreeMap::new();
+        files.insert(
+            "package-lock.json".to_string(),
+            r#"{
+  "lockfileVersion": 3,
+  "packages": {
+    "": { "name": "app" },
+    "packages/left-pad": { "version": "1.3.0" },
+    "node_modules/left-pad": {
+      "version": "1.3.0",
+      "resolved": "packages/left-pad",
+      "link": true
+    }
+  }
+}
+"#
+            .to_string(),
+        );
+        let r = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        assert!(
+            r.files.is_empty() && r.edits.is_empty(),
+            "a link entry must never gain resolved/integrity: files={:?} edits={:?}",
+            r.files.keys(),
+            r.edits
+        );
+        assert_eq!(
+            warning_codes(&r),
+            vec!["redirect_npm_link_entry_skipped"],
+            "a matched link entry is SKIPPED, not not-found: {:?}",
+            r.warnings
+        );
+        assert!(
+            r.warnings[0].detail.contains("node_modules/left-pad"),
+            "the detail names the lock key: {}",
+            r.warnings[0].detail
+        );
+
+        // Real npm link shape: NO version key — the version gate skips the
+        // entry before the link check, so today the diagnosis is the generic
+        // not-found. Flip this assertion when the link check learns to match
+        // versionless entries.
+        let mut files = BTreeMap::new();
+        files.insert(
+            "package-lock.json".to_string(),
+            r#"{
+  "lockfileVersion": 3,
+  "packages": {
+    "": { "name": "app" },
+    "packages/left-pad": { "version": "1.3.0" },
+    "node_modules/left-pad": {
+      "resolved": "packages/left-pad",
+      "link": true
+    }
+  }
+}
+"#
+            .to_string(),
+        );
+        let r = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        assert!(r.files.is_empty() && r.edits.is_empty());
+        assert_eq!(
+            warning_codes(&r),
+            vec!["redirect_npm_entry_not_found"],
+            "versionless link entries are not diagnosed as links today: {:?}",
+            r.warnings
+        );
+    }
+
+    /// A granted npm dep with NO sha512 must be SAID per lock family — every
+    /// npm-family rewriter carries its own missing-integrity leg — and nothing
+    /// may be written anywhere.
+    #[test]
+    fn missing_sha512_warns_once_per_npm_family_lock() {
+        let mut ovr = npm_override("left-pad", "1.3.0", "http://p.test/lp.tgz", "unused");
+        ovr.integrity.sha512 = None;
+
+        let mut files = BTreeMap::new();
+        files.insert("package-lock.json".to_string(), "{}".to_string());
+        files.insert(
+            "pnpm-lock.yaml".to_string(),
+            "lockfileVersion: '9.0'\n".to_string(),
+        );
+        files.insert(
+            "yarn.lock".to_string(),
+            "left-pad@^1.3.0:\n  version \"1.3.0\"\n  resolved \"https://x/lp.tgz\"\n"
+                .to_string(),
+        );
+        files.insert(
+            "bun.lock".to_string(),
+            bun_lock_file("\"other\": [\"other@1.0.0\", \"\", {}, \"sha512-X==\"]", 1),
+        );
+        let r = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        assert!(
+            r.files.is_empty() && r.edits.is_empty(),
+            "no integrity, no writes: files={:?} edits={:?}",
+            r.files.keys(),
+            r.edits
+        );
+        assert_eq!(
+            warning_codes(&r),
+            vec![
+                "redirect_npm_missing_sha512",
+                "redirect_pnpm_missing_sha512",
+                "redirect_yarn_classic_missing_sha512",
+                "redirect_bun_missing_sha512",
+            ],
+            "one missing-integrity warning per lock family: {:?}",
+            r.warnings
+        );
+    }
+
+    /// The pypi twins of the missing-integrity legs: requirements.txt and
+    /// uv.lock each warn for a granted dep with no sha256.
+    #[test]
+    fn missing_sha256_warns_for_requirements_and_uv() {
+        let mut ovr = pypi_override(
+            "requests",
+            "2.28.1",
+            "http://patch.test/requests-2.28.1-py3-none-any.whl",
+            "unused",
+        );
+        ovr.integrity.sha256 = None;
+
+        let mut files = BTreeMap::new();
+        files.insert(
+            "requirements.txt".to_string(),
+            "requests==2.28.1\n".to_string(),
+        );
+        files.insert("uv.lock".to_string(), "version = 1\n".to_string());
+        let r = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        assert!(r.files.is_empty() && r.edits.is_empty());
+        assert_eq!(
+            warning_codes(&r),
+            vec![
+                "redirect_requirements_missing_sha256",
+                "redirect_uv_missing_sha256",
+            ],
+            "{:?}",
+            r.warnings
+        );
+        assert!(
+            r.warnings.iter().all(|w| w.detail.contains("requests")),
+            "each detail names the dep: {:?}",
+            r.warnings
+        );
+    }
+
+    /// The registry-config ecosystems' intake gates: a dep with no (or the
+    /// wrong kind of) registry override, or with its required integrity field
+    /// blank, is skipped with ITS OWN warning code and nothing written.
+    #[test]
+    fn missing_override_or_integrity_warns_for_registry_ecosystems() {
+        let mut cargo_dep = cargo_sparse_override();
+        cargo_dep.registry_override = None;
+
+        let mut composer_dep = composer_override("1.0.0");
+        composer_dep.integrity.sha1 = None;
+
+        let mut nuget_no_override = nuget_override();
+        nuget_no_override.registry_override = None;
+        let mut nuget_no_sha = nuget_override();
+        nuget_no_sha.integrity.sha512 = None;
+
+        let mut gem_no_override = gem_override("rails", "7.0.0");
+        gem_no_override.registry_override = None;
+        let mut gem_no_sha = gem_override("rails", "7.0.0");
+        gem_no_sha
+            .registry_override
+            .as_mut()
+            .expect("gem_override always carries a registry override")
+            .identifiers
+            .gem_checksum_sha256 = None;
+
+        let mut maven_dep = maven_override();
+        maven_dep.registry_override = None;
+
+        let mut golang_dep = golang_override();
+        golang_dep
+            .registry_override
+            .as_mut()
+            .expect("golang_override always carries a registry override")
+            .identifiers
+            .go_module_path = None;
+
+        let mut files = BTreeMap::new();
+        files.insert("composer.lock".to_string(), "{}\n".to_string());
+        files.insert(
+            "go.mod".to_string(),
+            "module example.com/app\n\ngo 1.21\n\nrequire github.com/foo/bar v1.4.2\n"
+                .to_string(),
+        );
+        let overrides = vec![
+            cargo_dep,
+            composer_dep,
+            nuget_no_override,
+            nuget_no_sha,
+            gem_no_override,
+            gem_no_sha,
+            maven_dep,
+            golang_dep,
+        ];
+        let r = rewrite_registry_redirect(&files, &overrides);
+        assert!(
+            r.files.is_empty() && r.edits.is_empty(),
+            "gated deps must write NOTHING: files={:?} edits={:?}",
+            r.files.keys(),
+            r.edits
+        );
+        assert!(r.confirmed_cargo_uuids.is_empty());
+        assert_eq!(
+            warning_codes(&r),
+            vec![
+                "redirect_cargo_missing_override",
+                "redirect_composer_missing_sha1",
+                "redirect_nuget_missing_override",
+                "redirect_nuget_missing_sha512",
+                "redirect_gem_missing_override",
+                "redirect_gem_missing_sha256",
+                "redirect_maven_missing_override",
+                "redirect_golang_missing_module",
+            ],
+            "{:?}",
+            r.warnings
+        );
+    }
+
+    /// A cargo grant against a files map with NO Cargo.toml at all (only a
+    /// lock) is skipped fail-closed with the no-manifest flavor of the
+    /// not-found warning — the lock alone can never pin the registry.
+    #[test]
+    fn cargo_lock_only_project_skips_dep_with_no_manifest_warning() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "Cargo.lock".to_string(),
+            cargo_lock_with("serde", "1.0.190"),
+        );
+        let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+        assert!(
+            r.files.is_empty() && r.edits.is_empty(),
+            "no manifest, no writes: {:?}",
+            r.files.keys()
+        );
+        assert_eq!(warning_codes(&r), vec!["redirect_cargo_toml_dep_not_found"]);
+        assert!(
+            r.warnings[0].detail.contains("no Cargo.toml present"),
+            "the detail must name the missing manifest, not a missing entry: {}",
+            r.warnings[0].detail
+        );
+        assert!(r.confirmed_cargo_uuids.is_empty());
+    }
+
+    /// The TABLE-FORM twins of the inline-table registry matrix: an existing
+    /// socket pin is superseded in place, a current pin is recognized as
+    /// Already (silent, still confirmed), and a foreign pin refuses the whole
+    /// dep. The trailing `[package.metadata]` section bounds the block scan.
+    #[test]
+    fn cargo_table_form_supersede_already_and_foreign_registry() {
+        const OLD_UUID: &str = "0a1b2c3d-4e5f-4a7b-8c9d-0e1f2a3b4c5d";
+
+        // Supersede: an older socket-patch pin is rewritten in place.
+        let manifest = format!(
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+             [dependencies.serde]\nversion = \"1.0.190\"\nregistry = \"socket-patch-{OLD_UUID}\"\n\n\
+             [package.metadata]\nnote = \"trailing\"\n"
+        );
+        let r = rewrite_registry_redirect(&cargo_files(&manifest), &[cargo_sparse_override()]);
+        let toml = r.files.get("Cargo.toml").expect("manifest re-pinned");
+        assert!(
+            toml.contains(&format!(
+                "[dependencies.serde]\nversion = \"1.0.190\"\nregistry = \"{}\"\n\n\
+                 [package.metadata]\nnote = \"trailing\"",
+                cargo_reg()
+            )),
+            "the registry line must be superseded IN PLACE: {toml}"
+        );
+        assert!(!toml.contains(OLD_UUID), "old uuid gone: {toml}");
+        assert!(r.confirmed_cargo_uuids.contains(CARGO_UUID));
+        let toml_edits: Vec<_> = r.edits.iter().filter(|e| e.path == "Cargo.toml").collect();
+        assert_eq!(toml_edits.len(), 1, "{:?}", r.edits);
+        assert!(
+            toml_edits[0]
+                .original
+                .as_ref()
+                .and_then(Value::as_str)
+                .is_some_and(|s| s.contains(OLD_UUID)),
+            "the edit's original records the OLD pin: {:?}",
+            toml_edits[0]
+        );
+
+        // Already at the current registry everywhere: a silent no-op that
+        // still confirms the dep.
+        let manifest = format!(
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+             [dependencies.serde]\nversion = \"1.0.190\"\nregistry = \"{}\"\n",
+            cargo_reg()
+        );
+        let mut files = cargo_files(&manifest);
+        files.insert(
+            "Cargo.lock".to_string(),
+            cargo_lock_with("serde", "1.0.190")
+                .replace(
+                    "registry+https://github.com/rust-lang/crates.io-index",
+                    &cargo_index_url(),
+                )
+                .replace(
+                    "91f70896d6720bc714a4a57d22fc91f1db634680e65c8efe13323f1fa38d53f5",
+                    &"e".repeat(64),
+                ),
+        );
+        files.insert(
+            ".cargo/config.toml".to_string(),
+            format!("[registries.{}]\nindex = \"{}\"\n", cargo_reg(), cargo_index_url()),
+        );
+        let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+        assert!(
+            r.files.is_empty() && r.edits.is_empty() && r.warnings.is_empty(),
+            "fully-redirected table form must be silent: files={:?} warnings={:?}",
+            r.files.keys(),
+            r.warnings
+        );
+        assert!(r.confirmed_cargo_uuids.contains(CARGO_UUID));
+
+        // A foreign registry pin refuses the WHOLE dep.
+        let manifest = "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+                        [dependencies.serde]\nversion = \"1.0.190\"\nregistry = \"corp\"\n";
+        let r = rewrite_registry_redirect(&cargo_files(manifest), &[cargo_sparse_override()]);
+        assert!(r.files.is_empty(), "{:?}", r.files.keys());
+        assert_eq!(
+            warning_codes(&r),
+            vec!["redirect_cargo_toml_dep_unrewritable"]
+        );
+        assert!(
+            r.warnings[0].detail.contains("\"corp\""),
+            "the refusal names the foreign registry: {}",
+            r.warnings[0].detail
+        );
+        assert!(r.confirmed_cargo_uuids.is_empty());
+    }
+
+    /// Table-form path refusal and rename-aware matching: a `path =` block
+    /// refuses the dep; a `package = "<crate>"` alias table IS the crate (and
+    /// gains the pin) while a key-colliding table renaming ANOTHER crate is
+    /// never touched.
+    #[test]
+    fn cargo_table_form_path_refusal_and_rename_matching() {
+        // path dep in table form → refuse whole dep.
+        let manifest = "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+                        [dependencies.serde]\npath = \"../serde\"\n";
+        let r = rewrite_registry_redirect(&cargo_files(manifest), &[cargo_sparse_override()]);
+        assert!(r.files.is_empty(), "{:?}", r.files.keys());
+        assert_eq!(
+            warning_codes(&r),
+            vec!["redirect_cargo_toml_dep_unrewritable"]
+        );
+        assert!(
+            r.warnings[0].detail.contains("path/git"),
+            "{}",
+            r.warnings[0].detail
+        );
+        assert!(r.confirmed_cargo_uuids.is_empty());
+
+        // Rename-aware: the alias table gains the pin, the collision doesn't.
+        let manifest = "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+                        [dependencies.serde]\npackage = \"leftpad\"\nversion = \"1.0.0\"\n\n\
+                        [dependencies.iffy]\npackage = \"serde\"\nversion = \"1.0.190\"\n";
+        let r = rewrite_registry_redirect(&cargo_files(manifest), &[cargo_sparse_override()]);
+        let toml = r.files.get("Cargo.toml").expect("alias table pinned");
+        assert!(
+            toml.contains(&format!(
+                "[dependencies.iffy]\nregistry = \"{}\"\npackage = \"serde\"\nversion = \"1.0.190\"",
+                cargo_reg()
+            )),
+            "the alias table gains the registry line: {toml}"
+        );
+        assert!(
+            toml.contains(
+                "[dependencies.serde]\npackage = \"leftpad\"\nversion = \"1.0.0\""
+            ),
+            "the key-colliding rename of another crate is untouched: {toml}"
+        );
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert!(r.confirmed_cargo_uuids.contains(CARGO_UUID));
+    }
+
+    /// Workspace inheritance in BOTH table spellings: a
+    /// `[workspace.dependencies.<name>]` table satisfies an inline
+    /// `{ workspace = true }` inheritor, and a `[dependencies.<name>]` table
+    /// carrying `workspace = true` is satisfied by a `[workspace.dependencies]`
+    /// entry — the inheritor line stays byte-identical either way.
+    #[test]
+    fn cargo_workspace_table_forms_satisfy_inheritors() {
+        // [workspace.dependencies.serde] table + inline inheritor.
+        let manifest = "[workspace]\nmembers = []\n\n\
+                        [workspace.dependencies.serde]\nversion = \"1.0.190\"\n\n\
+                        [dependencies]\nserde = { workspace = true }\n";
+        let r = rewrite_registry_redirect(&cargo_files(manifest), &[cargo_sparse_override()]);
+        let toml = r.files.get("Cargo.toml").expect("workspace table pinned");
+        assert!(
+            toml.contains(&format!(
+                "[workspace.dependencies.serde]\nregistry = \"{}\"\nversion = \"1.0.190\"",
+                cargo_reg()
+            )),
+            "{toml}"
+        );
+        assert!(
+            toml.contains("serde = { workspace = true }"),
+            "the inheritor is untouched: {toml}"
+        );
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert!(r.confirmed_cargo_uuids.contains(CARGO_UUID));
+
+        // [dependencies.serde] table with workspace = true + plain workspace
+        // entry.
+        let manifest = "[workspace]\nmembers = []\n\n\
+                        [workspace.dependencies]\nserde = \"1.0.190\"\n\n\
+                        [dependencies.serde]\nworkspace = true\n";
+        let r = rewrite_registry_redirect(&cargo_files(manifest), &[cargo_sparse_override()]);
+        let toml = r.files.get("Cargo.toml").expect("workspace entry pinned");
+        assert!(
+            toml.contains(&format!(
+                "[workspace.dependencies]\nserde = {{ version = \"1.0.190\", registry = \"{}\" }}",
+                cargo_reg()
+            )),
+            "{toml}"
+        );
+        assert!(
+            toml.contains("[dependencies.serde]\nworkspace = true"),
+            "the table-form inheritor is untouched: {toml}"
+        );
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert!(r.confirmed_cargo_uuids.contains(CARGO_UUID));
+    }
+
+    /// Quoted keys and target-specific table entries are first-class rewrite
+    /// targets: `[dependencies."serde"]`, `[target.….dependencies.serde]`, and
+    /// a quoted plain entry `"serde" = "…"`.
+    #[test]
+    fn cargo_quoted_keys_and_target_table_entries_are_rewritten() {
+        // Quoted table-header key.
+        let manifest = "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+                        [dependencies.\"serde\"]\nversion = \"1.0.190\"\n";
+        let r = rewrite_registry_redirect(&cargo_files(manifest), &[cargo_sparse_override()]);
+        let toml = r.files.get("Cargo.toml").expect("quoted-key table pinned");
+        assert!(
+            toml.contains(&format!(
+                "[dependencies.\"serde\"]\nregistry = \"{}\"\nversion = \"1.0.190\"",
+                cargo_reg()
+            )),
+            "{toml}"
+        );
+        assert!(r.confirmed_cargo_uuids.contains(CARGO_UUID));
+
+        // Target-specific TABLE entry (not just the target dep-table).
+        let manifest = "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+                        [target.'cfg(unix)'.dependencies.serde]\nversion = \"1.0.190\"\n";
+        let r = rewrite_registry_redirect(&cargo_files(manifest), &[cargo_sparse_override()]);
+        let toml = r.files.get("Cargo.toml").expect("target table pinned");
+        assert!(
+            toml.contains(&format!(
+                "[target.'cfg(unix)'.dependencies.serde]\nregistry = \"{}\"\nversion = \"1.0.190\"",
+                cargo_reg()
+            )),
+            "{toml}"
+        );
+        assert!(r.confirmed_cargo_uuids.contains(CARGO_UUID));
+
+        // Quoted plain entry key under [dependencies].
+        let manifest = "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+                        [dependencies]\n\"serde\" = \"1.0.190\"\n";
+        let r = rewrite_registry_redirect(&cargo_files(manifest), &[cargo_sparse_override()]);
+        let toml = r.files.get("Cargo.toml").expect("quoted entry pinned");
+        assert!(
+            toml.contains(&format!(
+                "\"serde\" = {{ version = \"1.0.190\", registry = \"{}\" }}",
+                cargo_reg()
+            )),
+            "{toml}"
+        );
+        assert!(r.confirmed_cargo_uuids.contains(CARGO_UUID));
+    }
+
+    /// Every dependency-entry spelling the planner cannot pin refuses the
+    /// WHOLE dep — one warning, zero writes, zero confirmations. Guards the
+    /// transactional nothing-written contract across the refusal matrix.
+    #[test]
+    fn cargo_unsupported_spellings_refuse_whole_dep() {
+        for entry in [
+            // Dotted keys (both the crate's own and an alias renaming it).
+            "serde.version = \"1.0.190\"\n",
+            "iffy.package = \"serde\"\n",
+            // Inline table that does not close on its line.
+            "serde = {\n  version = \"1.0.190\" }\n",
+            // registry-index beside a would-be registry pin is ambiguous.
+            "serde = { version = \"1.0.190\", registry-index = \"sparse+https://index.example/\" }\n",
+            // Single-quoted and non-string values.
+            "serde = '1.0.190'\n",
+            "serde = 13\n",
+            // A quoted version with trailing junk the line grammar rejects.
+            "serde = \"1.0.190\" trailing junk\n",
+        ] {
+            let manifest = format!(
+                "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\n{entry}"
+            );
+            let r = rewrite_registry_redirect(&cargo_files(&manifest), &[cargo_sparse_override()]);
+            assert!(
+                r.files.is_empty() && r.edits.is_empty(),
+                "[{entry:?}] must write nothing: files={:?} edits={:?}",
+                r.files.keys(),
+                r.edits
+            );
+            assert_eq!(
+                warning_codes(&r),
+                vec!["redirect_cargo_toml_dep_unrewritable"],
+                "[{entry:?}] must refuse with one warning: {:?}",
+                r.warnings
+            );
+            assert!(
+                r.confirmed_cargo_uuids.is_empty(),
+                "[{entry:?}] must not confirm"
+            );
+        }
+    }
+
+    /// An inline table whose inner already ends with a trailing comma gains
+    /// the registry pin without doubling the separator.
+    #[test]
+    fn cargo_inline_table_trailing_comma_is_not_doubled() {
+        let manifest = "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+                        [dependencies]\nserde = { version = \"1.0.190\", }\n";
+        let r = rewrite_registry_redirect(&cargo_files(manifest), &[cargo_sparse_override()]);
+        let toml = r.files.get("Cargo.toml").expect("rewritten");
+        assert!(
+            toml.contains(&format!(
+                "serde = {{ version = \"1.0.190\", registry = \"{}\" }}",
+                cargo_reg()
+            )),
+            "single separator between the fields: {toml}"
+        );
+        assert!(
+            !toml.contains(",,") && !toml.contains(", ,"),
+            "no doubled comma: {toml}"
+        );
+        assert!(r.confirmed_cargo_uuids.contains(CARGO_UUID));
+    }
+
+    /// Cargo.lock blocks missing their `checksum` (a `[patch]`-resolved or
+    /// git-sourced entry) or missing BOTH `source` and `checksum` are rebuilt
+    /// with the lines inserted in canonical order, and the neighbor blocks
+    /// stay byte-identical.
+    #[test]
+    fn cargo_lock_blocks_without_source_or_checksum_lines_are_rebuilt() {
+        let manifest = "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+                        [dependencies]\nserde = \"1.0.190\"\n";
+        let cksum = "e".repeat(64);
+
+        // source present, checksum absent → checksum inserted AFTER source.
+        let lock = "version = 3\n\n\
+                    [[package]]\nname = \"serde\"\nversion = \"1.0.190\"\n\
+                    source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
+                    dependencies = [\n \"serde_derive\",\n]\n\n\
+                    [[package]]\nname = \"serde_derive\"\nversion = \"1.0.190\"\n\
+                    source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
+                    checksum = \"abcd\"\n";
+        let mut files = BTreeMap::new();
+        files.insert("Cargo.toml".to_string(), manifest.to_string());
+        files.insert("Cargo.lock".to_string(), lock.to_string());
+        let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+        let out = r.files.get("Cargo.lock").expect("lock rewritten");
+        assert!(
+            out.contains(&format!(
+                "name = \"serde\"\nversion = \"1.0.190\"\nsource = \"{}\"\nchecksum = \"{cksum}\"\ndependencies = [\n \"serde_derive\",\n]",
+                cargo_index_url()
+            )),
+            "checksum inserted right after source: {out}"
+        );
+        assert!(
+            out.contains(
+                "name = \"serde_derive\"\nversion = \"1.0.190\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"abcd\"\n"
+            ),
+            "the neighbor block is byte-identical: {out}"
+        );
+        let lock_edit = r
+            .edits
+            .iter()
+            .find(|e| e.kind == "redirect_cargo_lock_entry")
+            .unwrap_or_else(|| panic!("lock edit recorded: {:?}", r.edits));
+        let original = lock_edit
+            .original
+            .as_ref()
+            .and_then(Value::as_str)
+            .expect("original recorded");
+        assert!(
+            original.contains("registry+https") && !original.contains("checksum"),
+            "original records the checksum-less block: {original}"
+        );
+        assert!(
+            lock_edit
+                .new
+                .as_ref()
+                .and_then(Value::as_str)
+                .is_some_and(|s| s.contains(&format!("checksum = \"{cksum}\""))),
+            "new records the inserted checksum: {:?}",
+            lock_edit.new
+        );
+        assert!(r.confirmed_cargo_uuids.contains(CARGO_UUID));
+
+        // NEITHER source nor checksum → source prepended, checksum after it.
+        let lock = "version = 3\n\n\
+                    [[package]]\nname = \"serde\"\nversion = \"1.0.190\"\n\n\
+                    [[package]]\nname = \"zzz\"\nversion = \"0.1.0\"\n\
+                    source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
+                    checksum = \"ffff\"\n";
+        let mut files = BTreeMap::new();
+        files.insert("Cargo.toml".to_string(), manifest.to_string());
+        files.insert("Cargo.lock".to_string(), lock.to_string());
+        let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+        let out = r.files.get("Cargo.lock").expect("lock rewritten");
+        assert!(
+            out.contains(&format!(
+                "name = \"serde\"\nversion = \"1.0.190\"\nsource = \"{}\"\nchecksum = \"{cksum}\"\n\n[[package]]\nname = \"zzz\"",
+                cargo_index_url()
+            )),
+            "source prepended then checksum, neighbor untouched: {out}"
+        );
+        assert!(r.confirmed_cargo_uuids.contains(CARGO_UUID));
+    }
+
+    /// Managed-config splice edges: a degraded managed block followed by a
+    /// user section is regenerated WITHOUT touching that section, and a
+    /// pre-existing config lacking a trailing newline gains one before the
+    /// appended block.
+    #[test]
+    fn cargo_config_splice_stops_at_next_section_and_handles_missing_newline() {
+        let manifest = "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+                        [dependencies]\nserde = \"1.0.190\"\n";
+
+        // Degraded block followed by [build]: regenerate only the block.
+        let mut files = cargo_files(manifest);
+        files.insert(
+            ".cargo/config.toml".to_string(),
+            format!(
+                "[registries.{}]\n# stale, hand-edited\nindex = \"sparse+https://old.example/\"\n\n[build]\njobs = 4\n",
+                cargo_reg()
+            ),
+        );
+        let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+        let cfg = r
+            .files
+            .get(".cargo/config.toml")
+            .expect("degraded block regenerated");
+        assert_eq!(
+            cfg,
+            &format!(
+                "[registries.{}]\nindex = \"{}\"\n\n[build]\njobs = 4\n",
+                cargo_reg(),
+                cargo_index_url()
+            ),
+            "the splice must stop at the next section header"
+        );
+        assert!(r.confirmed_cargo_uuids.contains(CARGO_UUID));
+
+        // Newline-less user config: exactly one blank line before the block.
+        let mut files = cargo_files(manifest);
+        files.insert(
+            ".cargo/config.toml".to_string(),
+            "[net]\nretry = 3".to_string(),
+        );
+        let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+        let cfg = r.files.get(".cargo/config.toml").expect("block appended");
+        assert_eq!(
+            cfg,
+            &format!(
+                "[net]\nretry = 3\n\n[registries.{}]\nindex = \"{}\"\n",
+                cargo_reg(),
+                cargo_index_url()
+            ),
+            "a newline must be added before the separator blank line"
+        );
+        assert!(r.confirmed_cargo_uuids.contains(CARGO_UUID));
+    }
+
+    /// A custom-registry pnpm lock carries extra `resolution:` fields
+    /// (`registry:`) beside integrity/tarball — the splice must preserve them
+    /// while replacing the integrity and tarball values.
+    #[test]
+    fn pnpm_resolution_splice_preserves_extra_fields() {
+        let ovr = npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://patch.test/left-pad-1.3.0.tgz",
+            "sha512-PATCHED==",
+        );
+        let lock = "lockfileVersion: '6.0'\n\npackages:\n\n  /left-pad@1.3.0:\n    resolution: {integrity: sha512-OLD==, tarball: https://old.example/x.tgz, registry: https://r.example/}\n    dev: false\n";
+        let mut files = BTreeMap::new();
+        files.insert("pnpm-lock.yaml".to_string(), lock.to_string());
+        let r = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        let out = r.files.get("pnpm-lock.yaml").expect("lock rewritten");
+        assert!(
+            out.contains(
+                "    resolution: {integrity: sha512-PATCHED==, tarball: http://patch.test/left-pad-1.3.0.tgz, registry: https://r.example/}"
+            ),
+            "integrity+tarball replaced, registry field preserved: {out}"
+        );
+        assert!(
+            !out.contains("https://old.example/x.tgz") && !out.contains("sha512-OLD=="),
+            "old values dropped: {out}"
+        );
+        assert_eq!(r.edits.len(), 1, "{:?}", r.edits);
+        assert_eq!(r.edits[0].key.as_deref(), Some("left-pad@1.3.0"));
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+    }
+
+    /// Old yarn v1 emitted blocks WITHOUT an `integrity` line: the rewrite
+    /// must insert one right after the repointed `resolved`, leaving the
+    /// decoy entry byte-identical.
+    #[test]
+    fn yarn_classic_block_without_integrity_gains_inserted_line() {
+        let ovr = npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://p.test/lp.tgz",
+            "sha512-PATCHED==",
+        );
+        let lock = "# yarn lockfile v1\n\n\n\
+                    abbrev@^1.0.0:\n  version \"1.1.1\"\n  \
+                    resolved \"https://registry.yarnpkg.com/abbrev/-/abbrev-1.1.1.tgz#aaaa\"\n  \
+                    integrity sha512-DECOYdecoy==\n\n\
+                    left-pad@^1.3.0:\n  version \"1.3.0\"\n  \
+                    resolved \"https://registry.yarnpkg.com/left-pad/-/left-pad-1.3.0.tgz#bbbb\"\n";
+        let mut files = BTreeMap::new();
+        files.insert("yarn.lock".to_string(), lock.to_string());
+        let mut r = RewriteResult::default();
+        rewrite_yarn_classic(&files, std::slice::from_ref(&ovr), &mut r);
+        let out = r.files.get("yarn.lock").expect("lock rewritten");
+        assert!(
+            out.contains(
+                "left-pad@^1.3.0:\n  version \"1.3.0\"\n  \
+                 resolved \"http://p.test/lp.tgz\"\n  integrity sha512-PATCHED=="
+            ),
+            "integrity inserted after the repointed resolved: {out}"
+        );
+        assert!(
+            out.contains(
+                "abbrev@^1.0.0:\n  version \"1.1.1\"\n  \
+                 resolved \"https://registry.yarnpkg.com/abbrev/-/abbrev-1.1.1.tgz#aaaa\"\n  \
+                 integrity sha512-DECOYdecoy=="
+            ),
+            "the decoy entry stays byte-identical: {out}"
+        );
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert_eq!(r.edits.len(), 1);
+    }
+
+    /// A berry `__metadata` block with NO cacheKey line must refuse with the
+    /// honest `(missing)` detail — not guess a checksum scheme.
+    #[test]
+    fn yarn_berry_metadata_without_cache_key_refuses_with_missing_detail() {
+        let checksum = format!("10c0/{}", "7".repeat(128));
+        let ovr = berry_override("left-pad", "1.3.0", "http://p.test/lp.tgz", &checksum);
+        let lock = format!(
+            "# header\n\n__metadata:\n  version: 8\n\n\
+             \"left-pad@npm:^1.3.0\":\n  version: 1.3.0\n  resolution: \"left-pad@npm:1.3.0\"\n  \
+             checksum: 10c0/{}\n  languageName: node\n  linkType: hard\n",
+            "3".repeat(128)
+        );
+        let mut files = BTreeMap::new();
+        files.insert("yarn.lock".to_string(), lock);
+        let r = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        assert!(r.files.is_empty() && r.edits.is_empty());
+        assert_eq!(
+            warning_codes(&r),
+            vec!["redirect_yarn_berry_cache_unsupported"]
+        );
+        assert!(
+            r.warnings[0].detail.contains("`(missing)`"),
+            "the detail must say the cacheKey is missing: {}",
+            r.warnings[0].detail
+        );
+    }
+
+    /// An UNQUOTED single-descriptor berry key (yarn emits unquoted keys for
+    /// names that need no YAML quoting) whose entry has no `checksum:` line:
+    /// the resolution gains `::__archiveUrl=` and a checksum line is INSERTED
+    /// after it.
+    #[test]
+    fn yarn_berry_unquoted_key_without_checksum_gains_inserted_line() {
+        let checksum = format!("10c0/{}", "7".repeat(128));
+        let ovr = berry_override("left-pad", "1.3.0", "http://p.test/lp.tgz", &checksum);
+        let lock = "# header\n\n__metadata:\n  version: 8\n  cacheKey: 10c0\n\n\
+                    left-pad@npm:^1.3.0:\n  version: 1.3.0\n  \
+                    resolution: \"left-pad@npm:1.3.0\"\n  languageName: node\n  linkType: hard\n";
+        let mut files = BTreeMap::new();
+        files.insert("yarn.lock".to_string(), lock.to_string());
+        let r = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        let out = r.files.get("yarn.lock").expect("lock rewritten");
+        assert!(
+            out.contains("\n  resolution: \"left-pad@npm:1.3.0::__archiveUrl="),
+            "resolution gains the archiveUrl binding: {out}"
+        );
+        assert!(
+            out.contains(&format!("\"\n  checksum: {checksum}\n  languageName: node")),
+            "checksum inserted right after the resolution: {out}"
+        );
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert_eq!(r.edits.len(), 1);
+    }
+
+    /// A bun URL 3-tuple already at the CURRENT artifact URL but with a stale
+    /// integrity (a patch republish rotating only the hash) is refreshed in
+    /// place.
+    #[test]
+    fn bun_lock_current_url_tuple_with_stale_integrity_is_refreshed() {
+        let new_sha = format!("sha512-{}==", "N".repeat(86));
+        let ovr = npm_override("left-pad", "1.3.0", "http://p.test/lp.tgz", &new_sha);
+        let mut files = BTreeMap::new();
+        files.insert(
+            "bun.lock".to_string(),
+            bun_lock_file(
+                "\"left-pad\": [\"left-pad@http://p.test/lp.tgz\", {}, \"sha512-STALE==\"],",
+                1,
+            ),
+        );
+        let mut r = RewriteResult::default();
+        rewrite_bun_lock(&files, std::slice::from_ref(&ovr), &mut r);
+        let out = r.files.get("bun.lock").expect("integrity refreshed");
+        assert!(
+            out.contains(&format!(
+                "\"left-pad\": [\"left-pad@http://p.test/lp.tgz\", {{}}, \"{new_sha}\"]"
+            )),
+            "the tuple keeps its URL and gains the new integrity: {out}"
+        );
+        assert!(!out.contains("sha512-STALE=="), "{out}");
+        assert_eq!(r.edits.len(), 1);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+    }
+
+    /// Fail-closed ownership legs of the URL-tuple takeover: an OTHER-name
+    /// spec, a non-http `file:` spec, and a foreign-origin URL all survive
+    /// byte-identically while the target registry tuple in the same lock is
+    /// rewritten.
+    #[test]
+    fn bun_lock_unowned_url_and_file_tuples_survive_untouched() {
+        let sha = format!("sha512-{}==", "A".repeat(86));
+        let ovr = npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://p.test/left-pad-1.3.0.tgz",
+            &sha,
+        );
+        let unowned = [
+            "\"other-pkg\": [\"other-pkg@https://user.example/other-1.0.0.tgz\", {}, \"sha512-UUU==\"]",
+            "\"nested/left-pad\": [\"left-pad@file:./local\", {}, \"sha512-VVV==\"]",
+            "\"mirror/left-pad\": [\"left-pad@https://mirror.example/left-pad-1.3.0.tgz\", {}, \"sha512-WWW==\"]",
+        ];
+        let entries = format!(
+            "\"left-pad\": [\"left-pad@1.3.0\", \"\", {{}}, \"sha512-OLD==\"],\n    {},\n    {},\n    {}",
+            unowned[0], unowned[1], unowned[2]
+        );
+        let mut files = BTreeMap::new();
+        files.insert("bun.lock".to_string(), bun_lock_file(&entries, 1));
+        let mut r = RewriteResult::default();
+        rewrite_bun_lock(&files, std::slice::from_ref(&ovr), &mut r);
+        let out = r.files.get("bun.lock").expect("target rewritten");
+        assert!(
+            out.contains("\"left-pad\": [\"left-pad@http://p.test/left-pad-1.3.0.tgz\", {}, "),
+            "the registry tuple is redirected: {out}"
+        );
+        for entry in unowned {
+            assert!(
+                out.contains(entry),
+                "unowned tuple must stay byte-identical: {entry}\n{out}"
+            );
+        }
+        assert_eq!(r.edits.len(), 1, "only the target is edited: {:?}", r.edits);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+    }
+
+    /// The uv block iteration must find the target mid-file and leave both
+    /// neighbor [[package]] blocks byte-identical.
+    #[test]
+    fn uv_lock_target_mid_file_leaves_neighbors_untouched() {
+        let alpha = "[[package]]\nname = \"alpha\"\nversion = \"0.1.0\"\nsource = { registry = \"https://pypi.org/simple\" }\nsdist = { url = \"https://files.pythonhosted.org/packages/aa/alpha-0.1.0.tar.gz\", hash = \"sha256:1111\" }\n";
+        let target = "[[package]]\nname = \"requests\"\nversion = \"2.28.1\"\nsource = { registry = \"https://pypi.org/simple\" }\nsdist = { url = \"https://files.pythonhosted.org/packages/aa/requests-2.28.1.tar.gz\", hash = \"sha256:aaaa\" }\nwheels = [\n    { url = \"https://files.pythonhosted.org/packages/bb/requests-2.28.1-py3-none-any.whl\", hash = \"sha256:bbbb\" },\n]\n";
+        let zulu = "[[package]]\nname = \"zulu\"\nversion = \"9.9.9\"\nsource = { registry = \"https://pypi.org/simple\" }\nsdist = { url = \"https://files.pythonhosted.org/packages/zz/zulu-9.9.9.tar.gz\", hash = \"sha256:9999\" }\n";
+        let lock = format!("version = 1\n\n{alpha}\n{target}\n{zulu}");
+        let mut files = BTreeMap::new();
+        files.insert("uv.lock".to_string(), lock);
+        let url = "http://patch.test/requests-2.28.1-py3-none-any.whl";
+        let overrides = vec![pypi_override("requests", "2.28.1", url, &"c".repeat(64))];
+        let r = rewrite_registry_redirect(&files, &overrides);
+        let out = r.files.get("uv.lock").expect("uv.lock rewritten");
+        assert!(out.contains(alpha), "alpha block byte-identical: {out}");
+        assert!(out.contains(zulu), "zulu block byte-identical: {out}");
+        assert_eq!(out.matches(url).count(), 2, "sdist + wheel repointed: {out}");
+        assert_eq!(r.edits.len(), 1, "{:?}", r.edits);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+    }
+
+    /// A matched uv block with no `{ url, hash }` entries (a git/directory
+    /// source) and a lock with no block for the dep at all both surface the
+    /// entry-not-found warning with nothing rewritten.
+    #[test]
+    fn uv_lock_git_source_or_absent_block_warns_not_found() {
+        let overrides = vec![pypi_override(
+            "requests",
+            "2.28.1",
+            "http://patch.test/requests-2.28.1-py3-none-any.whl",
+            &"c".repeat(64),
+        )];
+
+        // Name+version match, but the source is git: nothing to repoint.
+        let mut files = BTreeMap::new();
+        files.insert(
+            "uv.lock".to_string(),
+            "version = 1\n\n[[package]]\nname = \"requests\"\nversion = \"2.28.1\"\nsource = { git = \"https://github.com/psf/requests?rev=abc\" }\n"
+                .to_string(),
+        );
+        let r = rewrite_registry_redirect(&files, &overrides);
+        assert!(r.files.is_empty() && r.edits.is_empty());
+        assert_eq!(warning_codes(&r), vec!["redirect_uv_entry_not_found"]);
+
+        // No block for the dep at all.
+        let mut files = BTreeMap::new();
+        files.insert(
+            "uv.lock".to_string(),
+            "version = 1\n\n[[package]]\nname = \"alpha\"\nversion = \"0.1.0\"\nsource = { registry = \"https://pypi.org/simple\" }\nsdist = { url = \"https://files.pythonhosted.org/packages/aa/alpha-0.1.0.tar.gz\", hash = \"sha256:1111\" }\n"
+                .to_string(),
+        );
+        let r = rewrite_registry_redirect(&files, &overrides);
+        assert!(r.files.is_empty() && r.edits.is_empty());
+        assert_eq!(warning_codes(&r), vec!["redirect_uv_entry_not_found"]);
+    }
+
+    /// An `authors[]` object whose `name` collides with the package
+    /// coordinate is NOT a package entry (it has no `version`): the dep is
+    /// reported not-found and nothing is written — the collision must never
+    /// elect the surrounding package's dist.
+    #[test]
+    fn composer_authors_name_collision_is_not_found() {
+        let lock = r#"{
+    "packages": [
+        {
+            "name": "other/lib",
+            "version": "3.2.1",
+            "authors": [
+                {
+                    "name": "acme/target"
+                }
+            ],
+            "dist": {
+                "type": "zip",
+                "url": "https://example.test/other-lib.zip",
+                "reference": "beef",
+                "shasum": ""
+            }
+        }
+    ],
+    "packages-dev": []
+}
+"#;
+        let r = composer_result(lock, "1.0.0");
+        assert!(
+            r.files.is_empty() && r.edits.is_empty(),
+            "the bystander's dist must never be elected: files={:?} edits={:?}",
+            r.files.keys(),
+            r.edits
+        );
+        assert_eq!(warning_codes(&r), vec!["redirect_composer_pkg_not_found"]);
+    }
+
+    /// With NO nuget.config in the candidate map the rewriter authors the
+    /// DEFAULT config from scratch: nuget.org source kept, socket source
+    /// added, socket mapping first, `*` catch-all fanned to nuget.org — and
+    /// the lock is still re-pinned in the same run.
+    #[test]
+    fn nuget_missing_config_authors_default_and_pins_lock() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "packages.lock.json".to_string(),
+            r#"{
+  "version": 1,
+  "dependencies": {
+    "net8.0": {
+      "Newtonsoft.Json": {
+        "type": "Direct",
+        "requested": "[13.0.3, )",
+        "resolved": "13.0.3",
+        "contentHash": "ORIGINALHASH=="
+      }
+    }
+  }
+}
+"#
+            .to_string(),
+        );
+        let r = rewrite_registry_redirect(&files, &[nuget_override()]);
+        let config = r.files.get("nuget.config").expect("default config authored");
+        assert!(
+            config.contains(
+                "<add key=\"nuget.org\" value=\"https://api.nuget.org/v3/index.json\" />"
+            ),
+            "default nuget.org source kept: {config}"
+        );
+        assert!(
+            config.contains(
+                "<add key=\"socket-patch-uuid\" value=\"https://patch.test/nuget/index.json\" />"
+            ),
+            "socket source added: {config}"
+        );
+        assert!(
+            config.contains(
+                "    <packageSource key=\"socket-patch-uuid\">\n      <package pattern=\"Newtonsoft.Json\" />\n    </packageSource>"
+            ),
+            "socket mapping present: {config}"
+        );
+        assert!(
+            config.contains(
+                "    <packageSource key=\"nuget.org\">\n      <package pattern=\"*\" />\n    </packageSource>"
+            ),
+            "catch-all fanned to nuget.org: {config}"
+        );
+        let lock = r.files.get("packages.lock.json").expect("lock re-pinned");
+        assert!(
+            lock.contains("\"contentHash\": \"PATCHED==\"") && !lock.contains("ORIGINALHASH=="),
+            "contentHash pinned to the patched artifact: {lock}"
+        );
+        let kinds: Vec<&str> = r.edits.iter().map(|e| e.kind.as_str()).collect();
+        assert_eq!(kinds, vec!["redirect_nuget_source", "redirect_nuget_lock"]);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+    }
+
+    /// Re-running the nuget rewriter over its own output must record nothing:
+    /// the config already carries the socket key and the lock entry is
+    /// already at the patched resolved/contentHash.
+    #[test]
+    fn nuget_rerun_over_rewritten_output_is_a_noop() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "nuget.config".to_string(),
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<configuration>\n  <packageSources>\n    <add key=\"nuget.org\" value=\"https://api.nuget.org/v3/index.json\" />\n  </packageSources>\n</configuration>\n"
+                .to_string(),
+        );
+        files.insert(
+            "packages.lock.json".to_string(),
+            r#"{
+  "version": 1,
+  "dependencies": {
+    "net8.0": {
+      "Newtonsoft.Json": {
+        "type": "Direct",
+        "requested": "[13.0.3, )",
+        "resolved": "13.0.3",
+        "contentHash": "ORIGINALHASH=="
+      }
+    }
+  }
+}
+"#
+            .to_string(),
+        );
+        let first = rewrite_registry_redirect(&files, &[nuget_override()]);
+        assert!(
+            first.files.contains_key("nuget.config")
+                && first.files.contains_key("packages.lock.json"),
+            "anchor: the first pass rewrites both files"
+        );
+        let mut again = files.clone();
+        for (name, content) in &first.files {
+            again.insert(name.clone(), content.clone());
+        }
+        let second = rewrite_registry_redirect(&again, &[nuget_override()]);
+        assert!(
+            second.files.is_empty() && second.edits.is_empty(),
+            "the second pass must be a no-op: files={:?} edits={:?}",
+            second.files.keys(),
+            second.edits
+        );
+        assert!(second.warnings.is_empty(), "{:?}", second.warnings);
+    }
+
+    /// A parenthesized `gem(...)` call whose closing paren is NOT on the
+    /// declaration line (the call continues) cannot be safely edited: warn
+    /// and leave the Gemfile byte-identical — no source block, no append.
+    #[test]
+    fn gemfile_paren_call_spanning_lines_fails_closed() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "Gemfile".to_string(),
+            "source \"https://rubygems.org\"\n\ngem(\"rails\",\n  \"7.0.0\")\n".to_string(),
+        );
+        let r = rewrite_registry_redirect(&files, &[gem_override("rails", "7.0.0")]);
+        assert!(
+            r.files.is_empty() && r.edits.is_empty(),
+            "a spanning call must not be edited or duplicated: files={:?} edits={:?}",
+            r.files.keys(),
+            r.edits
+        );
+        assert_eq!(
+            warning_codes(&r),
+            vec!["redirect_gem_unrecognized_declaration"],
+            "{:?}",
+            r.warnings
+        );
+    }
+
+    /// Lock shapes `converge_gem_lock_source` refuses — a legacy multi-remote
+    /// GEM section, a spec duplicated across GEM sections, and a lock with no
+    /// DEPENDENCIES section — fall back to the mixed state: the CHECKSUMS pin
+    /// still lands, the GEM attribution is untouched, and the frozen-install
+    /// caveat is emitted.
+    #[test]
+    fn gem_lock_converge_refusals_fall_back_to_mixed_state() {
+        let pinned = format!("  rails (7.0.0) sha256={}", "2".repeat(64));
+        let locks = [
+            // Legacy multi-remote GEM section (bundler <1.7 wrote these).
+            format!(
+                "GEM\n  remote: https://rubygems.org/\n  remote: https://gems.mirror.example/\n  specs:\n    rails (7.0.0)\n\nPLATFORMS\n  ruby\n\nDEPENDENCIES\n  rails (= 7.0.0)\n\nCHECKSUMS\n{pinned}\n\nBUNDLED WITH\n   2.6.2\n"
+            ),
+            // Spec entry duplicated across two GEM sections.
+            format!(
+                "GEM\n  remote: https://rubygems.org/\n  specs:\n    rails (7.0.0)\n\nGEM\n  remote: https://gems.mirror.example/\n  specs:\n    rails (7.0.0)\n\nPLATFORMS\n  ruby\n\nDEPENDENCIES\n  rails (= 7.0.0)\n\nCHECKSUMS\n{pinned}\n\nBUNDLED WITH\n   2.6.2\n"
+            ),
+            // No DEPENDENCIES section at all.
+            format!(
+                "GEM\n  remote: https://rubygems.org/\n  specs:\n    rails (7.0.0)\n\nPLATFORMS\n  ruby\n\nCHECKSUMS\n{pinned}\n\nBUNDLED WITH\n   2.6.2\n"
+            ),
+        ];
+        for lock in &locks {
+            let mut files = BTreeMap::new();
+            files.insert(
+                "Gemfile".to_string(),
+                "source \"https://rubygems.org\"\n\ngem \"rails\", \"7.0.0\"\n".to_string(),
+            );
+            files.insert("Gemfile.lock".to_string(), lock.clone());
+            let r = rewrite_registry_redirect(&files, &[gem_override("rails", "7.0.0")]);
+            let out = r
+                .files
+                .get("Gemfile.lock")
+                .unwrap_or_else(|| panic!("checksum still pinned for lock:\n{lock}"));
+            assert!(
+                out.contains(&format!("  rails (7.0.0) sha256={}", "f".repeat(64))),
+                "the CHECKSUMS pin must still land: {out}"
+            );
+            assert!(
+                !out.contains("remote: https://patch.test/gem/tok/uuid/"),
+                "the refused convergence must not touch GEM attribution: {out}"
+            );
+            assert!(
+                r.edits.iter().all(|e| {
+                    e.kind != "redirect_gemfile_lock_gem_source"
+                        && e.kind != "redirect_gemfile_lock_dependency_pin"
+                        && e.kind != "redirect_gemfile_lock_source_url"
+                }),
+                "no convergence edits may be recorded: {:?}",
+                r.edits
+            );
+            assert!(
+                warning_codes(&r).contains(&"redirect_gem_frozen_install"),
+                "the mixed state must carry the frozen-install caveat: {:?}",
+                r.warnings
+            );
+        }
+    }
+
+    /// The legacy same-GAV verify-only inspection: dep-not-found still adds
+    /// the repository; a non-jar type skips everything; a missing literal
+    /// version and a `${property}` version each warn dep_unpinned but keep
+    /// the repository (legacy is NOT fail-closed).
+    #[test]
+    fn maven_legacy_verify_only_inspection_matrix() {
+        // (a) No matching <dependency>: warn, repository still added.
+        let mut files = BTreeMap::new();
+        files.insert(
+            "pom.xml".to_string(),
+            "<project>\n  <dependencies>\n    <dependency>\n      <groupId>ch.qos.logback</groupId>\n      <artifactId>logback-classic</artifactId>\n      <version>1.4.14</version>\n    </dependency>\n  </dependencies>\n</project>\n"
+                .to_string(),
+        );
+        let r = rewrite_registry_redirect(&files, &[legacy_maven_override()]);
+        let out = r.files.get("pom.xml").expect("repository still added");
+        assert!(out.contains("<id>socket-patch-uuid</id>"), "{out}");
+        assert_eq!(
+            warning_codes(&r),
+            vec![
+                "redirect_maven_dep_not_found",
+                "redirect_maven_same_gav_fallback",
+            ]
+        );
+        let kinds: Vec<&str> = r.edits.iter().map(|e| e.kind.as_str()).collect();
+        assert_eq!(kinds, vec!["redirect_maven_repository"]);
+
+        // (b) Non-jar <type>: nothing written, only the packaging warning.
+        let mut files = BTreeMap::new();
+        files.insert(
+            "pom.xml".to_string(),
+            pom_with_dep(
+                "\n      <version>1.7.36</version>",
+                "\n      <type>pom</type>",
+            ),
+        );
+        let r = rewrite_registry_redirect(&files, &[legacy_maven_override()]);
+        assert!(r.files.is_empty() && r.edits.is_empty());
+        assert_eq!(
+            warning_codes(&r),
+            vec!["redirect_maven_unsupported_packaging"]
+        );
+
+        // (c) No literal <version> (inherited/managed): unpinned + repo added.
+        let mut files = BTreeMap::new();
+        files.insert("pom.xml".to_string(), pom_with_dep("", ""));
+        let r = rewrite_registry_redirect(&files, &[legacy_maven_override()]);
+        let out = r.files.get("pom.xml").expect("repository still added");
+        assert!(out.contains("<id>socket-patch-uuid</id>"), "{out}");
+        assert_eq!(
+            warning_codes(&r),
+            vec![
+                "redirect_maven_dep_unpinned",
+                "redirect_maven_same_gav_fallback",
+            ]
+        );
+        assert!(
+            r.warnings[0].detail.contains("no literal <version>"),
+            "{}",
+            r.warnings[0].detail
+        );
+
+        // (d) ${property} version: unpinned + repo added (contrast with the
+        // fail-closed path, which refuses the dep entirely).
+        let mut files = BTreeMap::new();
+        files.insert(
+            "pom.xml".to_string(),
+            pom_with_dep("\n      <version>${slf4j.version}</version>", ""),
+        );
+        let r = rewrite_registry_redirect(&files, &[legacy_maven_override()]);
+        let out = r.files.get("pom.xml").expect("repository still added");
+        assert!(out.contains("<id>socket-patch-uuid</id>"), "{out}");
+        assert_eq!(
+            warning_codes(&r),
+            vec![
+                "redirect_maven_dep_unpinned",
+                "redirect_maven_same_gav_fallback",
+            ]
+        );
+        assert!(
+            r.warnings[0].detail.contains("property placeholder"),
+            "{}",
+            r.warnings[0].detail
+        );
+    }
+
+    /// The LEGACY gradle snippet pins the BASE version and omits the "Also
+    /// bump" sentence (there is no suffixed version to bump to).
+    #[test]
+    fn maven_legacy_gradle_snippet_pins_base_version() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "build.gradle".to_string(),
+            "plugins { id 'java' }\n".to_string(),
+        );
+        let r = rewrite_registry_redirect(&files, &[legacy_maven_override()]);
+        assert!(r.files.is_empty() && r.edits.is_empty());
+        assert_eq!(warning_codes(&r), vec!["redirect_gradle_manual_snippet"]);
+        let detail = &r.warnings[0].detail;
+        assert!(
+            detail.contains("includeVersion(\"org.slf4j\", \"slf4j-api\", \"1.7.36\")"),
+            "snippet pins the BASE version: {detail}"
+        );
+        assert!(
+            !detail.contains("Also bump"),
+            "no bump reminder in legacy mode: {detail}"
+        );
+    }
+
+    /// A pom that already carries `<dependencyManagement><dependencies>` gets
+    /// the suffixed pin inserted INSIDE it — never a duplicate section.
+    #[test]
+    fn maven_existing_dependency_management_is_extended_in_place() {
+        let pom = "<project>\n  <dependencyManagement>\n    <dependencies>\n      <dependency>\n        <groupId>com.other</groupId>\n        <artifactId>thing</artifactId>\n        <version>1.0.0</version>\n      </dependency>\n    </dependencies>\n  </dependencyManagement>\n  <dependencies>\n    <dependency>\n      <groupId>org.slf4j</groupId>\n      <artifactId>slf4j-api</artifactId>\n    </dependency>\n  </dependencies>\n</project>\n";
+        let mut files = BTreeMap::new();
+        files.insert("pom.xml".to_string(), pom.to_string());
+        let r = rewrite_registry_redirect(&files, &[maven_override()]);
+        let out = r.files.get("pom.xml").expect("pom rewritten");
+        assert_eq!(
+            out.matches("<dependencyManagement>").count(),
+            1,
+            "no duplicate section: {out}"
+        );
+        assert!(
+            out.contains(&format!(
+                "<dependencies>\n      <dependency>\n        <groupId>org.slf4j</groupId>\n        <artifactId>slf4j-api</artifactId>\n        <version>{MAVEN_SUFFIXED}</version>\n      </dependency>"
+            )),
+            "the pin lands inside the existing element: {out}"
+        );
+        assert!(
+            out.contains("<artifactId>thing</artifactId>"),
+            "the user's own managed entry survives: {out}"
+        );
+        assert!(warning_codes(&r).contains(&"redirect_maven_dep_management_added"));
+    }
+
+    /// merge_mvn_config edges through the full pipeline: a user config already
+    /// carrying ALL six args (no trailing newline) is left untouched — no
+    /// config edit, checksums still written — and a config holding only an
+    /// unrelated line (no trailing newline) gains a newline before the merged
+    /// args.
+    #[test]
+    fn maven_config_fully_present_is_untouched_and_newline_less_config_merges() {
+        // All six args present, no trailing newline: identical-line arm.
+        let mut files = BTreeMap::new();
+        files.insert(
+            "pom.xml".to_string(),
+            pom_with_dep("\n      <version>1.7.36</version>", ""),
+        );
+        files.insert(".mvn/maven.config".to_string(), MVN_CONFIG_ARGS.join("\n"));
+        let r = rewrite_registry_redirect(&files, &[maven_override()]);
+        assert!(
+            !r.files.contains_key(".mvn/maven.config"),
+            "an already-complete config must not be rewritten: {:?}",
+            r.files.keys()
+        );
+        assert!(
+            r.edits.iter().all(|e| e.kind != "redirect_maven_config"),
+            "no config edit may be recorded: {:?}",
+            r.edits
+        );
+        assert!(
+            r.files.contains_key(".mvn/checksums/checksums.sha256"),
+            "the checksums file is still written: {:?}",
+            r.files.keys()
+        );
+        assert!(
+            !warning_codes(&r).contains(&"redirect_maven_trusted_checksums_conflict"),
+            "identical lines are not conflicts: {:?}",
+            r.warnings
+        );
+
+        // Unrelated line without a trailing newline: newline added, args
+        // appended after it.
+        let mut files = BTreeMap::new();
+        files.insert(
+            "pom.xml".to_string(),
+            pom_with_dep("\n      <version>1.7.36</version>", ""),
+        );
+        files.insert(
+            ".mvn/maven.config".to_string(),
+            "-Dmaven.wagon.http.retryHandler.count=3".to_string(),
+        );
+        let r = rewrite_registry_redirect(&files, &[maven_override()]);
+        let config = r.files.get(".mvn/maven.config").expect("config merged");
+        assert_eq!(
+            config,
+            &format!(
+                "-Dmaven.wagon.http.retryHandler.count=3\n{}\n",
+                MVN_CONFIG_ARGS.join("\n")
+            ),
+            "the user line keeps its place and gains a newline"
+        );
+    }
+
+    /// A `sha256:`-prefixed hash (the colon SRI spelling) is stripped to bare
+    /// hex before it lands in the trusted-checksums file, like `sha256-`.
+    #[test]
+    fn maven_sha256_colon_prefix_is_stripped() {
+        let mut dep = maven_override();
+        dep.integrity.sha256 = Some(format!("sha256:{}", "c".repeat(64)));
+        dep.registry_override
+            .as_mut()
+            .expect("maven_override always carries a registry override")
+            .identifiers
+            .maven_pom_sha256 = Some(format!("sha256:{}", "d".repeat(64)));
+        let mut files = BTreeMap::new();
+        files.insert(
+            "pom.xml".to_string(),
+            pom_with_dep("\n      <version>1.7.36</version>", ""),
+        );
+        let r = rewrite_registry_redirect(&files, &[dep]);
+        let checksums = r
+            .files
+            .get(".mvn/checksums/checksums.sha256")
+            .expect("checksums written");
+        assert!(
+            !checksums.contains("sha256:"),
+            "colon prefix stripped: {checksums}"
+        );
+        assert!(checksums.contains(&format!("{}  ", "c".repeat(64))));
+        assert!(checksums.contains(&format!("{}  ", "d".repeat(64))));
+    }
+
+    // ── coverage mop-up 2026-09 (final wave) ─────────────────────────────────
+    // Residual branches the earlier audit passes did not pin: malformed-input
+    // tolerance legs, workspace-inheritance satisfaction, and the remaining
+    // diagnosis spellings.
+
+    /// Malformed Cargo.toml section headers (unbalanced quote in a segment,
+    /// an unclosed `[dependencies`) must classify as non-dependency sections
+    /// — their entries stay byte-identical — and garbage lines inside the
+    /// real [dependencies] table are skipped while the real entry still
+    /// gains the pin.
+    #[test]
+    fn cargo_malformed_headers_and_table_lines_are_skipped_not_fatal() {
+        let files = cargo_files(
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+             [target.'cfg(unix).dependencies]\nserde = \"9.9.9\"\n\n\
+             [dependencies\nserde = \"8.8.8\"\n\n\
+             [dependencies]\n= \"junk\"\njunk\nserde = \"1.0.190\"\n",
+        );
+        let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+        assert!(
+            r.warnings.is_empty(),
+            "garbage headers/lines are skipped, not refused: {:?}",
+            r.warnings
+        );
+        let toml = r.files.get("Cargo.toml").expect("Cargo.toml rewritten");
+        let pinned = format!(
+            "serde = {{ version = \"1.0.190\", registry = \"{}\" }}",
+            cargo_reg()
+        );
+        assert_eq!(
+            toml.matches(&pinned).count(),
+            1,
+            "only the real [dependencies] entry is pinned: {toml}"
+        );
+        assert!(
+            toml.contains("serde = \"9.9.9\"") && toml.contains("serde = \"8.8.8\""),
+            "entries under malformed headers stay byte-identical: {toml}"
+        );
+        assert!(
+            toml.contains("= \"junk\"\njunk\n"),
+            "garbage table lines survive untouched: {toml}"
+        );
+    }
+
+    /// Unparseable lines INSIDE a `[dependencies.<key>]` table block (a bare
+    /// `= …`, a key token with no `=`) are skipped by the block scanner while
+    /// the block still gains its `registry` pin right after the header.
+    #[test]
+    fn cargo_dep_entry_block_garbage_lines_are_skipped() {
+        let files = cargo_files(
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+             [dependencies.serde]\n= \"zap\"\npackage \"serde\"\nversion = \"1.0.190\"\n",
+        );
+        let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        let toml = r.files.get("Cargo.toml").expect("Cargo.toml rewritten");
+        assert!(
+            toml.contains(&format!(
+                "[dependencies.serde]\nregistry = \"{}\"\n= \"zap\"\npackage \"serde\"\nversion = \"1.0.190\"",
+                cargo_reg()
+            )),
+            "registry pin inserted after the header, garbage lines untouched: {toml}"
+        );
+    }
+
+    /// A `[workspace.dependencies]` entry ALREADY pinned to the managed
+    /// registry satisfies `workspace = true` inheritors: no Cargo.toml write
+    /// (no ledger growth), no refusal, and the lock is still repointed —
+    /// both the `[workspace.dependencies.<key>]` table form and the
+    /// inline-table form.
+    #[test]
+    fn cargo_workspace_already_pinned_satisfies_inheritor_without_toml_write() {
+        for manifest in [
+            format!(
+                "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+                 [workspace.dependencies.serde]\nversion = \"1.0.190\"\nregistry = \"{reg}\"\n\n\
+                 [dependencies]\nserde.workspace = true\n",
+                reg = cargo_reg()
+            ),
+            format!(
+                "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+                 [workspace.dependencies]\nserde = {{ version = \"1.0.190\", registry = \"{reg}\" }}\n\n\
+                 [dependencies]\nserde = {{ workspace = true }}\n",
+                reg = cargo_reg()
+            ),
+        ] {
+            let files = cargo_files(&manifest);
+            let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+            assert!(
+                r.warnings.is_empty(),
+                "a satisfied inheritor must not refuse: {:?}",
+                r.warnings
+            );
+            assert!(
+                !r.files.contains_key("Cargo.toml"),
+                "an already-pinned workspace entry writes no manifest: {:?}",
+                r.files.keys()
+            );
+            assert!(
+                r.files.contains_key("Cargo.lock"),
+                "the lock is still repointed: {:?}",
+                r.files.keys()
+            );
+            assert!(r.confirmed_cargo_uuids.contains(CARGO_UUID));
+        }
+    }
+
+    /// A STALE socket-patch pin on the `[workspace.dependencies]` entry is
+    /// superseded in place (table and inline forms) and still satisfies the
+    /// `workspace = true` inheritor — no refusal, old uuid gone.
+    #[test]
+    fn cargo_workspace_stale_socket_pin_superseded_in_both_forms() {
+        const OLD: &str = "socket-patch-0a1b2c3d-4e5f-4a7b-8c9d-0e1f2a3b4c5d";
+        for manifest in [
+            format!(
+                "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+                 [workspace.dependencies.serde]\nversion = \"1.0.190\"\nregistry = \"{OLD}\"\n\n\
+                 [dependencies]\nserde.workspace = true\n"
+            ),
+            format!(
+                "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+                 [workspace.dependencies]\nserde = {{ version = \"1.0.190\", registry = \"{OLD}\" }}\n\n\
+                 [dependencies]\nserde.workspace = true\n"
+            ),
+        ] {
+            let files = cargo_files(&manifest);
+            let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+            assert!(
+                r.warnings.is_empty(),
+                "superseding our own stale pin must not refuse: {:?}",
+                r.warnings
+            );
+            let toml = r
+                .files
+                .get("Cargo.toml")
+                .expect("the stale pin is superseded in place");
+            assert!(
+                toml.contains(&cargo_reg()) && !toml.contains(OLD),
+                "old uuid replaced by the current registry: {toml}"
+            );
+        }
+    }
+
+    /// A bare `[workspace.dependencies]` inline entry gains the registry pin
+    /// and thereby satisfies the `workspace = true` inheritor in the same
+    /// manifest.
+    #[test]
+    fn cargo_workspace_inline_entry_gains_pin_and_satisfies_inheritor() {
+        let files = cargo_files(
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+             [workspace.dependencies]\nserde = { version = \"1.0.190\" }\n\n\
+             [dependencies]\nserde.workspace = true\n",
+        );
+        let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        let toml = r.files.get("Cargo.toml").expect("Cargo.toml rewritten");
+        assert!(
+            toml.contains(&format!(
+                "serde = {{ version = \"1.0.190\", registry = \"{}\" }}",
+                cargo_reg()
+            )),
+            "the workspace inline table gains the registry pin: {toml}"
+        );
+    }
+
+    /// v9 vendored lock WITHOUT the `overrides:` respelling (packages key
+    /// only): the `<name>@file:.socket/vendor/…` packages key ALONE must
+    /// drive the vendored diagnosis — not the generic entry-not-found.
+    #[test]
+    fn pnpm_v9_packages_key_alone_is_diagnosed_vendored() {
+        let ovr = npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://patch.test/left-pad-1.3.0.tgz",
+            "sha512-PATCHED==",
+        );
+        let lock = "lockfileVersion: '9.0'
+
+importers:
+
+  .:
+    dependencies:
+      left-pad:
+        specifier: file:.socket/vendor/npm/1a2b3c4d-5e6f-4a1b-8c2d-0123456789ab/left-pad-1.3.0.tgz
+        version: file:.socket/vendor/npm/1a2b3c4d-5e6f-4a1b-8c2d-0123456789ab/left-pad-1.3.0.tgz
+
+packages:
+
+  left-pad@file:.socket/vendor/npm/1a2b3c4d-5e6f-4a1b-8c2d-0123456789ab/left-pad-1.3.0.tgz:
+    resolution: {integrity: sha512-VENDORED==, tarball: file:.socket/vendor/npm/1a2b3c4d-5e6f-4a1b-8c2d-0123456789ab/left-pad-1.3.0.tgz}
+    version: 1.3.0
+";
+        let mut files = BTreeMap::new();
+        files.insert("pnpm-lock.yaml".to_string(), lock.to_string());
+        let r = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        assert!(
+            r.files.is_empty() && r.edits.is_empty(),
+            "a vendored lock must stay untouched: {:?}",
+            r.files.keys()
+        );
+        assert_eq!(
+            warning_codes(&r),
+            vec!["redirect_pnpm_entry_vendored"],
+            "the packages key alone must carry the vendored diagnosis: {:?}",
+            r.warnings
+        );
+    }
+
+    /// A classic-lock block whose first line is not a `key:` line
+    /// (hand-mangled) is skipped without derailing the rewrite of the real
+    /// entry — and survives byte-identically.
+    #[test]
+    fn yarn_classic_keyless_block_is_skipped() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "yarn.lock".to_string(),
+            "# yarn lockfile v1\n\nnot-a-key-line\n\n\
+             left-pad@^1.3.0:\n  version \"1.3.0\"\n  \
+             resolved \"https://registry.yarnpkg.com/left-pad/-/left-pad-1.3.0.tgz#bbbb\"\n  \
+             integrity sha512-UPSTREAM==\n"
+                .to_string(),
+        );
+        let ovr = npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://p.test/lp.tgz",
+            "sha512-PATCHED==",
+        );
+        let mut r = RewriteResult::default();
+        rewrite_yarn_classic(&files, std::slice::from_ref(&ovr), &mut r);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        let out = r.files.get("yarn.lock").expect("real entry rewritten");
+        assert!(
+            out.contains("not-a-key-line"),
+            "keyless block preserved: {out}"
+        );
+        assert!(out.contains("resolved \"http://p.test/lp.tgz\""), "{out}");
+    }
+
+    /// An EXPLICIT `.yarnrc.yml` `compressionLevel: 0` (the supported value,
+    /// spelled out rather than defaulted) must proceed — only non-zero
+    /// levels refuse.
+    #[test]
+    fn yarn_berry_explicit_compression_level_zero_proceeds() {
+        let checksum = format!("10c0/{}", "7".repeat(128));
+        let ovr = berry_override("left-pad", "1.3.0", "http://p.test/lp.tgz", &checksum);
+        let mut files = BTreeMap::new();
+        files.insert("yarn.lock".to_string(), berry_lock("10c0"));
+        files.insert(
+            ".yarnrc.yml".to_string(),
+            "compressionLevel: 0\n".to_string(),
+        );
+        let mut r = RewriteResult::default();
+        rewrite_yarn_berry(&files, std::slice::from_ref(&ovr), &mut r);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        let out = r
+            .files
+            .get("yarn.lock")
+            .expect("explicit level 0 must not refuse");
+        assert!(
+            out.contains("__archiveUrl=") && out.contains(&checksum),
+            "{out}"
+        );
+    }
+
+    /// A berry key whose descriptor has no range after `@` and an EMPTY block
+    /// (two consecutive blank lines) are both skipped; the real entry in the
+    /// same lock is still rewritten and the malformed bytes survive verbatim.
+    #[test]
+    fn yarn_berry_malformed_key_and_empty_block_are_skipped() {
+        let checksum = format!("10c0/{}", "7".repeat(128));
+        let ovr = berry_override("left-pad", "1.3.0", "http://p.test/lp.tgz", &checksum);
+        let lock = format!(
+            "# header\n\n__metadata:\n  version: 8\n  cacheKey: 10c0\n\n\
+             \"left-pad@\":\n  version: 1.3.0\n  resolution: \"left-pad@npm:1.3.0\"\n  checksum: 10c0/333\n\n\n\n\
+             \"left-pad@npm:^1.3.0\":\n  version: 1.3.0\n  resolution: \"left-pad@npm:1.3.0\"\n  checksum: 10c0/{}\n  languageName: node\n  linkType: hard\n",
+            "3".repeat(128)
+        );
+        let mut files = BTreeMap::new();
+        files.insert("yarn.lock".to_string(), lock);
+        let mut r = RewriteResult::default();
+        rewrite_yarn_berry(&files, std::slice::from_ref(&ovr), &mut r);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        let out = r
+            .files
+            .get("yarn.lock")
+            .expect("the real entry is rewritten");
+        assert!(
+            out.contains(
+                "\"left-pad@\":\n  version: 1.3.0\n  resolution: \"left-pad@npm:1.3.0\"\n  checksum: 10c0/333"
+            ),
+            "the rangeless key stays byte-identical: {out}"
+        );
+        assert_eq!(
+            r.edits.len(),
+            1,
+            "only the real entry is edited: {:?}",
+            r.edits
+        );
+        assert!(out.contains("__archiveUrl="), "{out}");
+    }
+
+    /// A descriptor with NO protocol at all (`left-pad@1.3.0`) is refused
+    /// through the unsupported-protocol arm, and the diagnosis names the
+    /// missing protocol as `(none)` instead of misquoting one.
+    #[test]
+    fn yarn_berry_protocolless_descriptor_names_none_protocol() {
+        let checksum = format!("10c0/{}", "7".repeat(128));
+        let ovr = berry_override("left-pad", "1.3.0", "http://p.test/lp.tgz", &checksum);
+        let mut files = BTreeMap::new();
+        files.insert(
+            "yarn.lock".to_string(),
+            format!(
+                "# header\n\n__metadata:\n  version: 8\n  cacheKey: 10c0\n\n\
+                 \"left-pad@1.3.0\":\n  version: 1.3.0\n  resolution: \"left-pad@npm:1.3.0\"\n  checksum: 10c0/{}\n",
+                "3".repeat(128)
+            ),
+        );
+        let mut r = RewriteResult::default();
+        rewrite_yarn_berry(&files, std::slice::from_ref(&ovr), &mut r);
+        assert!(r.files.is_empty(), "{:?}", r.files.keys());
+        assert_eq!(
+            r.warnings[0].code,
+            "redirect_yarn_berry_unsupported_protocol"
+        );
+        assert!(
+            r.warnings[0].detail.contains("`(none)`"),
+            "the diagnosis must name the absent protocol: {}",
+            r.warnings[0].detail
+        );
+    }
+
+    /// A packages entry whose first tuple element is not a JSON string (a
+    /// grammar-balanced but non-bun shape) is skipped; the real registry
+    /// tuple in the same lock is still rewritten.
+    #[test]
+    fn bun_lock_non_string_first_element_entry_is_skipped() {
+        let ovr = npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://p.test/lp.tgz",
+            "sha512-PATCHED==",
+        );
+        let mut files = BTreeMap::new();
+        files.insert(
+            "bun.lock".to_string(),
+            bun_lock_file(
+                "\"weird\": [{ \"dep\": \"1.0.0\" }],\n    \
+                 \"left-pad\": [\"left-pad@1.3.0\", \"\", {}, \"sha512-OLD==\"]",
+                1,
+            ),
+        );
+        let mut r = RewriteResult::default();
+        rewrite_bun_lock(&files, std::slice::from_ref(&ovr), &mut r);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        let out = r.files.get("bun.lock").expect("registry tuple rewritten");
+        assert!(
+            out.contains("\"weird\": [{ \"dep\": \"1.0.0\" }],"),
+            "non-string entry untouched: {out}"
+        );
+        assert!(
+            out.contains(
+                "\"left-pad\": [\"left-pad@http://p.test/lp.tgz\", {}, \"sha512-PATCHED==\"]"
+            ),
+            "{out}"
+        );
+    }
+
+    /// A truncated composer.lock (the entry object never closes before EOF)
+    /// must fail closed as pkg-not-found — the brace scan runs off the end
+    /// instead of electing a bogus boundary.
+    #[test]
+    fn composer_truncated_lock_is_pkg_not_found() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "composer.lock".to_string(),
+            "{\n    \"packages\": [\n        {\n            \"name\": \"acme/target\",\n            \"version\": \"6.4.1\"\n"
+                .to_string(),
+        );
+        let r = rewrite_registry_redirect(&files, &[composer_override("6.4.1")]);
+        assert!(
+            r.files.is_empty() && r.edits.is_empty(),
+            "files={:?} edits={:?}",
+            r.files.keys(),
+            r.edits
+        );
+        assert_eq!(
+            warning_codes(&r),
+            vec!["redirect_composer_pkg_not_found"],
+            "{:?}",
+            r.warnings
+        );
+    }
+
+    /// packages.lock.json shapes the walker must skip without touching the
+    /// lock: a non-object framework value, a non-matching id, a matching id
+    /// whose entry is not an object, and a lock with no `dependencies` at
+    /// all. The nuget.config wiring still lands in every case.
+    #[test]
+    fn nuget_lock_walker_skips_unrewritable_shapes() {
+        for lock in [
+            "{\n  \"version\": 1,\n  \"dependencies\": {\n    \"net6.0\": {\n      \"Aardvark.Zebra\": { \"resolved\": \"1.0.0\", \"contentHash\": \"AAA\" },\n      \"Newtonsoft.Json\": \"not-an-entry-object\"\n    },\n    \"net472\": [\"not-an-object\"]\n  }\n}\n",
+            "{\n  \"version\": 1\n}\n",
+        ] {
+            let mut files = BTreeMap::new();
+            files.insert("packages.lock.json".to_string(), lock.to_string());
+            let r = rewrite_registry_redirect(&files, &[nuget_override()]);
+            assert!(
+                r.files.contains_key("nuget.config"),
+                "config wiring still lands: {:?}",
+                r.files.keys()
+            );
+            assert!(
+                !r.files.contains_key("packages.lock.json"),
+                "an unrewritable lock stays untouched: {:?}",
+                r.files.keys()
+            );
+            let kinds: Vec<&str> = r.edits.iter().map(|e| e.kind.as_str()).collect();
+            assert_eq!(
+                kinds,
+                vec!["redirect_nuget_source"],
+                "no lock edit may be recorded"
+            );
+        }
+    }
+
+    /// A dep whose registry override is of a FOREIGN kind writes nothing —
+    /// the nuget and golang arms skip it rather than misinterpreting the
+    /// override's fields (silently, matching the TS twin).
+    #[test]
+    fn foreign_override_kind_is_skipped_by_nuget_and_golang() {
+        let mut nuget = nuget_override();
+        nuget
+            .registry_override
+            .as_mut()
+            .expect("nuget_override always carries an override")
+            .kind = "nuget-v2".into();
+        let mut golang = golang_override();
+        golang
+            .registry_override
+            .as_mut()
+            .expect("golang_override always carries an override")
+            .kind = "nuget-v3".into();
+        let files = golang_files();
+        let r = rewrite_registry_redirect(&files, &[nuget, golang]);
+        assert!(
+            r.files.is_empty() && r.edits.is_empty(),
+            "files={:?} edits={:?}",
+            r.files.keys(),
+            r.edits
+        );
+        assert!(
+            r.warnings.is_empty(),
+            "foreign kinds are skipped silently today: {:?}",
+            r.warnings
+        );
+    }
+
+    /// gems.rb + Gemfile twins with deps that carry NO compact-index override
+    /// (absent, or a foreign kind): the divergence residue skips those deps
+    /// (nothing of theirs to erase), the rewrite loop skips them too — the
+    /// absent override warns, the foreign kind is silent, nothing is written.
+    #[test]
+    fn gem_deps_without_compact_index_override_are_skipped() {
+        let gemfile = "source \"https://rubygems.org\"\n\ngem \"rails\", \"7.0.0\"\n";
+        let mut files = BTreeMap::new();
+        files.insert("gems.rb".to_string(), gemfile.to_string());
+        files.insert("Gemfile".to_string(), gemfile.to_string());
+        let mut no_override = gem_override("rails", "7.0.0");
+        no_override.registry_override = None;
+        let mut foreign = gem_override("rack", "3.0.0");
+        foreign
+            .registry_override
+            .as_mut()
+            .expect("gem_override always carries an override")
+            .kind = "cargo-sparse".into();
+        let r = rewrite_registry_redirect(&files, &[no_override, foreign]);
+        assert!(
+            r.files.is_empty() && r.edits.is_empty(),
+            "files={:?} edits={:?}",
+            r.files.keys(),
+            r.edits
+        );
+        assert_eq!(
+            warning_codes(&r),
+            vec!["redirect_gem_missing_override"],
+            "{:?}",
+            r.warnings
+        );
+    }
+
+    /// The documented bail-to-empty legs of `gem_line_trailing_options`: a
+    /// dangling comma and an unbalanced quote both yield "" (options dropped
+    /// rather than a panic or a mangled tail). Shared with vendor::gem.
+    #[test]
+    fn gem_line_trailing_options_bails_empty_on_unparseable_tails() {
+        assert_eq!(gem_line_trailing_options(","), "");
+        assert_eq!(gem_line_trailing_options(", \"7.0"), "");
+        assert_eq!(
+            gem_line_trailing_options(", \"7.0\", require: false"),
+            "require: false"
+        );
+    }
+
+    /// A Gemfile.lock with a leading blank line (hand-edited) still
+    /// converges: the section parser steps over non-header lines at the top
+    /// instead of misparsing the file, and the leading byte survives.
+    #[test]
+    fn gem_lock_with_leading_blank_line_still_converges() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "Gemfile".to_string(),
+            "source \"https://rubygems.org\"\n\ngem \"rails\", \"7.0.0\"\n".to_string(),
+        );
+        files.insert(
+            "Gemfile.lock".to_string(),
+            format!(
+                "\n{}",
+                gem_lock(&format!("  rails (7.0.0) sha256={}", "2".repeat(64)))
+            ),
+        );
+        let r = rewrite_registry_redirect(&files, &[gem_override("rails", "7.0.0")]);
+        let lock = r.files.get("Gemfile.lock").expect("the lock converges");
+        assert!(
+            lock.starts_with('\n'),
+            "leading blank line preserved: {lock:?}"
+        );
+        assert!(
+            lock.contains(
+                "GEM\n  remote: https://patch.test/gem/tok/uuid/\n  specs:\n    rails (7.0.0)"
+            ),
+            "{lock}"
+        );
+        assert!(lock.contains("  rails (= 7.0.0)!"), "{lock}");
+    }
+
+    /// LEGACY same-GAV path: an explicit `<type>jar</type>` is the supported
+    /// packaging — the repository must still be added (only non-jar types
+    /// refuse the dep).
+    #[test]
+    fn maven_legacy_explicit_jar_type_is_redirected() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "pom.xml".to_string(),
+            pom_with_dep(
+                "\n      <version>1.7.36</version>",
+                "\n      <type>jar</type>",
+            ),
+        );
+        let r = rewrite_registry_redirect(&files, &[legacy_maven_override()]);
+        let out = r.files.get("pom.xml").expect("repository added");
+        assert!(out.contains("<id>socket-patch-uuid</id>"), "{out}");
+        assert_eq!(
+            warning_codes(&r),
+            vec!["redirect_maven_same_gav_fallback"],
+            "{:?}",
+            r.warnings
+        );
+    }
+
+    /// A committed hosted replace that LACKS its rhs version (hand-mangled)
+    /// is still recognized as ours: the ledger `original` records the
+    /// version-less spelling and the directive is repaired in place.
+    #[test]
+    fn golang_versionless_hosted_replace_is_repaired_with_original_recorded() {
+        let mut files = golang_files();
+        files.insert(
+            "go.mod".to_string(),
+            format!(
+                "module example.com/app\n\ngo 1.21\n\nrequire github.com/foo/bar v1.4.2\n\n\
+                 replace github.com/foo/bar v1.4.2 => {}\n",
+                golang_socket_module()
+            ),
+        );
+        let ovr = golang_override();
+        let out = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+        let go_mod = &out.files["go.mod"];
+        assert!(
+            go_mod.contains(&format!(
+                "replace github.com/foo/bar v1.4.2 => {} v1.4.2-socketpatch.1",
+                golang_socket_module()
+            )),
+            "the directive is repaired in place: {go_mod}"
+        );
+        let edit = out
+            .edits
+            .iter()
+            .find(|e| e.kind == "redirect_golang_replace")
+            .expect("replace edit recorded");
+        assert_eq!(edit.action, "updated");
+        assert_eq!(
+            edit.original,
+            Some(Value::String(format!(
+                "replace github.com/foo/bar v1.4.2 => {}",
+                golang_socket_module()
+            )))
+        );
     }
 }

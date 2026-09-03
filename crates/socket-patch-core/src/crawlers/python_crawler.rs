@@ -1219,12 +1219,69 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_home_dir_detection() {
         // Verify the shared fallback chain (HOME -> USERPROFILE -> "~")
         // yields a real path, not the "~" sentinel, on any CI or dev machine.
+        // `serial`: other tests in this binary mutate HOME (go_crawler's
+        // gomodcache fallback chain, utils::fs's empty-HOME regression) —
+        // reading home_dir() while one of them holds HOME="" would see the
+        // "~" sentinel and fail spuriously.
         let home = crate::utils::fs::home_dir();
         assert_ne!(home, PathBuf::from("~"), "expected a real home directory");
         assert!(!home.as_os_str().is_empty());
+    }
+
+    /// Global discovery must honor `PYENV_ROOT`: a pyenv install tree at
+    /// `$PYENV_ROOT/versions/<v>/lib/python3.X/site-packages` has to surface
+    /// in `get_global_python_site_packages`. Unlike the other well-known
+    /// roots (which are hardwired system paths), the pyenv root is
+    /// injectable via the env var, so a tempdir fixture reaches the pyenv
+    /// match-collection loop on any host. Containment-only assertion — the
+    /// function also scans real system dirs, so the full result vec is not
+    /// deterministic across machines.
+    #[cfg(not(windows))]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_pyenv_root_env_var_site_packages_discovered() {
+        // Save/restore guard so a panicking assertion cannot leak the
+        // override into other #[serial] env-var tests.
+        struct EnvGuard {
+            key: &'static str,
+            prev: Option<String>,
+        }
+        impl EnvGuard {
+            fn set(key: &'static str, value: &str) -> Self {
+                let prev = std::env::var(key).ok();
+                std::env::set_var(key, value);
+                Self { key, prev }
+            }
+        }
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                match &self.prev {
+                    Some(v) => std::env::set_var(self.key, v),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let sp = dir
+            .path()
+            .join("versions")
+            .join("3.11.5")
+            .join("lib")
+            .join("python3.11")
+            .join("site-packages");
+        tokio::fs::create_dir_all(&sp).await.unwrap();
+
+        let _pyenv_root = EnvGuard::set("PYENV_ROOT", dir.path().to_str().unwrap());
+        let results = get_global_python_site_packages().await;
+        assert!(
+            results.contains(&sp),
+            "PYENV_ROOT site-packages {sp:?} missing from global discovery: {results:?}"
+        );
     }
 
     #[tokio::test]

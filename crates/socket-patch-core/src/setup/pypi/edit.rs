@@ -1140,4 +1140,136 @@ mod tests {
         assert_eq!(count_stage_litter(dir.path()).await, 0);
         assert_eq!(tokio::fs::read_to_string(&py).await.unwrap(), original);
     }
+
+    // ── finish()'s failure arms through the async wrappers ───────────
+    //
+    // Every error-shape test above calls the pure transforms directly; these
+    // pin the wrapper glue: the atomic-write Err arm and the transform Err arm
+    // must both surface as `PthStatus::Error` with the message attached, and
+    // must leave the user's file untouched.
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_add_write_failure_readonly_parent_is_error() {
+        use std::os::unix::fs::PermissionsExt;
+        // A read-only PARENT directory blocks the stage-sibling creation while
+        // the manifest itself stays readable — so the read and transform
+        // succeed and the failure lands exactly in finish()'s write arm.
+        let dir = tempfile::tempdir().unwrap();
+        let req = dir.path().join("requirements.txt");
+        let original = "requests\n";
+        tokio::fs::write(&req, original).await.unwrap();
+        tokio::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555))
+            .await
+            .unwrap();
+
+        let res = add_hook_dependency(&req, ManifestKind::Requirements, false).await;
+
+        // Restore before any assertion can unwind, so the tempdir cleans up.
+        tokio::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755))
+            .await
+            .unwrap();
+
+        assert_eq!(res.status, PthStatus::Error);
+        assert!(
+            res.error.is_some(),
+            "the write failure must carry a message: {res:?}"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(&req).await.unwrap(),
+            original,
+            "a failed write must leave the manifest byte-for-byte untouched"
+        );
+        assert_eq!(
+            count_stage_litter(dir.path()).await,
+            0,
+            "the failed stage creation must not leave litter behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_add_malformed_pyproject_via_wrapper_is_error() {
+        // The path `setup` actually takes on a real broken manifest: the
+        // transform's Err must route through finish() to `Error`, not panic
+        // and not touch the file.
+        let dir = tempfile::tempdir().unwrap();
+        let py = dir.path().join("pyproject.toml");
+        let original = "this is = = not toml [[[\n";
+        tokio::fs::write(&py, original).await.unwrap();
+
+        let res = add_hook_dependency(&py, ManifestKind::Pyproject, false).await;
+        assert_eq!(res.status, PthStatus::Error);
+        assert!(
+            res.error
+                .as_deref()
+                .is_some_and(|e| e.contains("Invalid pyproject.toml")),
+            "the parse failure must be attributed to pyproject.toml: {res:?}"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(&py).await.unwrap(),
+            original,
+            "a failed transform must leave the manifest untouched"
+        );
+        assert_eq!(
+            count_stage_litter(dir.path()).await,
+            0,
+            "no stage may be created for a failed transform"
+        );
+    }
+
+    // ── remove_hook_dependency's Pyproject routing ────────────────────
+
+    #[tokio::test]
+    async fn test_remove_pyproject_via_wrapper_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let py = dir.path().join("pyproject.toml");
+        let original =
+            "[project]\nname = \"x\"\ndependencies = [\"requests\", \"socket-patch[hook]\"]\n";
+        tokio::fs::write(&py, original).await.unwrap();
+
+        let res = remove_hook_dependency(&py, ManifestKind::Pyproject, false).await;
+        assert_eq!(res.status, PthStatus::Updated, "err: {:?}", res.error);
+
+        let body = tokio::fs::read_to_string(&py).await.unwrap();
+        assert!(
+            !pyproject_contains_hook(&body),
+            "the hook must be gone after remove:\n{body}"
+        );
+        assert!(body.contains("\"requests\""), "other deps survive:\n{body}");
+        // Byte-preservation-sensitive subsystem: the wrapper must write
+        // exactly what the pure transform produced — untouched lines verbatim.
+        assert_eq!(
+            body,
+            pyproject_remove(original).unwrap().unwrap(),
+            "the wrapper must persist the pure transform's output byte-for-byte"
+        );
+        assert!(
+            body.contains("[project]\nname = \"x\"\n"),
+            "untouched header and name line survive verbatim:\n{body}"
+        );
+        assert_eq!(count_stage_litter(dir.path()).await, 0);
+
+        // Second remove: nothing left to strip → idempotent no-op.
+        let res = remove_hook_dependency(&py, ManifestKind::Pyproject, false).await;
+        assert_eq!(res.status, PthStatus::AlreadyConfigured);
+        assert_eq!(
+            tokio::fs::read_to_string(&py).await.unwrap(),
+            body,
+            "the no-op remove must not rewrite the file"
+        );
+    }
+
+    // ── poetry_remove: socket-patch table without extras ─────────────
+
+    #[test]
+    fn test_poetry_remove_table_without_extras_is_noop() {
+        // A table-shaped `socket-patch` dep with no `extras` array has nothing
+        // of ours to strip: `changed` must stay false (Ok(None)) and the
+        // user's version spec must be left alone.
+        let toml = "[tool.poetry.dependencies]\nsocket-patch = {version = \"^3.3.0\"}\n";
+        assert!(
+            pyproject_remove(toml).unwrap().is_none(),
+            "a socket-patch dep without extras is not ours to touch"
+        );
+    }
 }

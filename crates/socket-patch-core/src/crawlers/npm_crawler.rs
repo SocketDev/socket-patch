@@ -2217,4 +2217,96 @@ mod tests {
         assert_eq!(copies.len(), 1, "single install must be one copy");
         assert_eq!(copies[0].path, foo);
     }
+
+    /// The `NESTED_STORE_MAX_DIRS` cap must terminate a nested-store
+    /// descent over a corrupted/adversarial tree instead of turning it
+    /// into an unbounded readdir storm. Stages one more child than the
+    /// cap (each shaped as a depth-1 package home so every one passes the
+    /// filters and consumes cap budget) and pins that the walk stops at
+    /// exactly the cap — failing toward "not installed", never patching
+    /// the wrong package. Deliberately does NOT assert WHICH entries
+    /// survive: readdir order is unspecified. (~16.4k staged dirs; a
+    /// couple of seconds of mkdir churn is the price of firing the cap.)
+    #[tokio::test]
+    async fn test_collect_nested_store_entries_respects_dir_cap() {
+        let host = tempfile::tempdir().unwrap();
+        let over = NESTED_STORE_MAX_DIRS + 16;
+        for i in 0..over {
+            std::fs::create_dir_all(host.path().join(format!("d{i:05}")).join("node_modules"))
+                .unwrap();
+        }
+
+        let mut entries = Vec::new();
+        NpmCrawler::collect_nested_store_entries(host.path(), &mut entries).await;
+
+        assert_eq!(
+            entries.len(),
+            NESTED_STORE_MAX_DIRS,
+            "the walk must stop at exactly the dir cap"
+        );
+        // Every yielded entry is a real staged package home.
+        for (name, nm) in &entries {
+            assert!(name.starts_with('d'), "unexpected entry name {name:?}");
+            assert_eq!(nm, &host.path().join(name).join("node_modules"));
+        }
+    }
+
+    /// Save and restore an env var around a test body (drop-safe).
+    #[cfg(target_os = "macos")]
+    struct EnvGuard {
+        key: &'static str,
+        prev: Option<String>,
+    }
+    #[cfg(target_os = "macos")]
+    impl EnvGuard {
+        fn set(key: &'static str, value: &std::ffi::OsStr) -> Self {
+            let prev = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self { key, prev }
+        }
+    }
+    #[cfg(target_os = "macos")]
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    /// Pins the literal volta (`.volta/tools/image/node/*/lib/
+    /// node_modules`) and fnm (`.fnm/node-versions/*/installation/lib/
+    /// node_modules`) global-install layouts on macOS — the nvm sibling
+    /// loop is exercised on any nvm-carrying host, but nothing pins these
+    /// two unless the dev machine happens to have the tools installed.
+    /// `HOME` is process-global, hence `serial` + guard.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[serial_test::serial]
+    fn test_macos_global_paths_pick_up_volta_and_fnm_layouts() {
+        let home = tempfile::tempdir().unwrap();
+        let volta_nm = home
+            .path()
+            .join(".volta/tools/image/node/v20.0.0/lib/node_modules");
+        let fnm_nm = home
+            .path()
+            .join(".fnm/node-versions/v20.0.0/installation/lib/node_modules");
+        std::fs::create_dir_all(&volta_nm).unwrap();
+        std::fs::create_dir_all(&fnm_nm).unwrap();
+
+        let _home_guard = EnvGuard::set("HOME", home.path().as_os_str());
+        let paths = NpmCrawler::new().get_global_node_modules_paths();
+
+        // `contains`, not equality: host npm/nvm/homebrew paths may also
+        // appear.
+        assert!(
+            paths.contains(&volta_nm),
+            "volta layout must be discovered under $HOME; got {paths:?}"
+        );
+        assert!(
+            paths.contains(&fnm_nm),
+            "fnm layout must be discovered under $HOME; got {paths:?}"
+        );
+    }
 }

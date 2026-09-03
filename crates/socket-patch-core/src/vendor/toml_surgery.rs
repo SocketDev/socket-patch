@@ -428,6 +428,24 @@ mod tests {
 
         let parts = split_top_level_commas("a = 1, b = [1, 2], c = \"x,y\"");
         assert_eq!(parts, vec!["a = 1", " b = [1, 2]", " c = \"x,y\""]);
+
+        // Backslash escapes inside strings: the `\"` does NOT close the
+        // string, so the `}` right after it is still string content and the
+        // first group spans the whole table (uv lock files-array elements
+        // can carry escaped quotes in file names).
+        let text = "{ file = \"a\\\"}b\" }, { h = 1 }";
+        let groups = top_level_brace_groups(text);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(&text[groups[0].0..groups[0].1], "{ file = \"a\\\"}b\" }");
+        assert_eq!(&text[groups[1].0..groups[1].1], "{ h = 1 }");
+
+        // Escaped-escape reset: in `"x\\"` the second backslash is itself
+        // escaped, so the quote that follows really closes the string.
+        let text = "{ p = \"x\\\\\" }, { q = 2 }";
+        let groups = top_level_brace_groups(text);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(&text[groups[0].0..groups[0].1], "{ p = \"x\\\\\" }");
+        assert_eq!(&text[groups[1].0..groups[1].1], "{ q = 2 }");
     }
 
     #[test]
@@ -462,6 +480,23 @@ mod tests {
         // Non-empty section untouched.
         let keep = "x = 1\n\n[tool.uv]\ndev = true\n";
         assert_eq!(remove_table_if_empty(keep, "[tool.uv]"), keep);
+        // Blank lines followed by a real entry: NOT empty, untouched.
+        let keep_blanks = "x = 1\n\n[tool.uv]\n\ndev = true\n";
+        assert_eq!(remove_table_if_empty(keep_blanks, "[tool.uv]"), keep_blanks);
+        // A section holding ONLY blank lines is empty too — the headline
+        // documented case. The splice consumes the section's trailing blanks
+        // up to the next header, so the blank separator that used to sit
+        // before [next] does not survive (pinning current behavior).
+        assert_eq!(
+            remove_table_if_empty("x = 1\n\n[tool.uv]\n\n\n[next]\na = 1\n", "[tool.uv]"),
+            "x = 1\n[next]\na = 1\n"
+        );
+        // Blank-only section at EOF: header, its blanks, and the preceding
+        // separator are all dropped.
+        assert_eq!(
+            remove_table_if_empty("x = 1\n\n[tool.uv]\n\n\n", "[tool.uv]"),
+            "x = 1\n"
+        );
         // Absent header untouched.
         assert_eq!(remove_table_if_empty("x = 1\n", "[tool.uv]"), "x = 1\n");
     }

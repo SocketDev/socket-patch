@@ -375,4 +375,48 @@ mod tests {
         assert!(packed.integrity.starts_with("sha512-"));
         assert_eq!(packed.size, written.len() as u64);
     }
+
+    /// The fail-closed InvalidData arm in `collect_regular_files`: a staged
+    /// file whose name is not valid UTF-8 must abort the pack (tar entry
+    /// paths are strings) BEFORE any artifact lands at `dest` — never emit a
+    /// tarball with a mangled or lossy entry path. Linux-only: APFS refuses
+    /// to create non-UTF-8 names (EILSEQ), so macOS cannot stage the input;
+    /// ext4 and friends accept arbitrary bytes.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn non_utf8_staged_filename_fails_closed() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let stage = tmp.path().join("stage");
+        build_stage(&stage).await;
+        // `f\xFF.js`: 0xFF is invalid in UTF-8 anywhere, so `seg.to_str()`
+        // fails for this name.
+        let bad = std::ffi::OsString::from_vec(vec![b'f', 0xFF, b'.', b'j', b's']);
+        std::fs::write(stage.join(&bad), b"x").unwrap();
+
+        let dest = tmp.path().join("pkg.tgz");
+        // No `unwrap_err()`: PackedTarball carries no Debug impl (nothing in
+        // prod prints one), so unwrap the Err arm by hand.
+        let err = match pack_deterministic(&stage, &dest).await {
+            Ok(_) => panic!("packing a stage with a non-UTF-8 file name must fail"),
+            Err(e) => e,
+        };
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::InvalidData,
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.to_string()
+                .contains("non-UTF-8 file name in staged package"),
+            "unexpected error: {err}"
+        );
+        // The error fires while packing in memory, before atomic_write_bytes:
+        // a failed pack must leave no torn artifact behind.
+        assert!(
+            !dest.exists(),
+            "no artifact may be written when packing fails"
+        );
+    }
 }

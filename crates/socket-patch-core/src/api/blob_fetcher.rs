@@ -1014,6 +1014,69 @@ mod tests {
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
+    #[tokio::test]
+    async fn test_write_cache_entry_atomic_rename_failure_removes_stage() {
+        // Rename-failure arm: the stage write succeeds, but `dest` is an
+        // existing DIRECTORY, so the rename(file -> dir) fails on unix and
+        // Windows alike (no perms tricks needed; works as root too). The
+        // stage must be removed, leaving the directory exactly as it was.
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("entry");
+        std::fs::create_dir(&dest).unwrap();
+
+        let result = write_cache_entry_atomic(&dest, b"bytes").await;
+        assert!(
+            result.is_err(),
+            "rename over an existing directory must fail"
+        );
+        assert!(dest.is_dir(), "dest must still be the original directory");
+        let entries: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            entries,
+            vec!["entry".to_string()],
+            "no .socket-dl-* stage may survive the failed rename: {entries:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_write_cache_entry_atomic_stage_write_failure_no_litter() {
+        // Stage-write-failure arm: the parent directory denies writes, so
+        // the stage file itself cannot be created. The error propagates and
+        // the directory stays empty — no stage, no dest.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let ro = dir.path().join("ro");
+        std::fs::create_dir(&ro).unwrap();
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        // Precondition probe: under root / CAP_DAC_OVERRIDE the mode bits
+        // do not deny writes and the Err arm under test cannot fire — skip
+        // rather than pass vacuously.
+        let probe = ro.join(".probe");
+        if std::fs::write(&probe, b"").is_ok() {
+            let _ = std::fs::remove_file(&probe);
+            eprintln!("skipping: directory mode bits do not deny writes here (root?)");
+            return;
+        }
+
+        let result = write_cache_entry_atomic(&ro.join("x"), b"bytes").await;
+        let err = result.expect_err("stage write into a read-only dir must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+
+        // Restore before asserting/teardown so cleanup cannot mask failure.
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!ro.join("x").exists(), "dest must not exist");
+        assert_eq!(
+            std::fs::read_dir(&ro).unwrap().count(),
+            0,
+            "no stage litter may survive the failed stage write"
+        );
+    }
+
     #[test]
     fn test_format_only_failed() {
         let result = FetchMissingBlobsResult {
