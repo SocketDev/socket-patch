@@ -38,9 +38,17 @@ node -e "
 # Refresh the npm wrapper lockfile so package-lock.json stays in sync with the
 # bumped package.json (own version, optionalDependencies). Uses --package-lock-only
 # so node_modules is untouched.
+#
+# The npm major is pinned: the lock's byte shape depends on it (npm >= 11 adds
+# `libc` arrays to platform-package entries that npm 10 omits), and
+# release-lint.sh compares the regenerated lock byte-for-byte against the
+# committed one on every PR. An unpinned npm makes that gate depend on
+# whichever npm the runner or developer happens to have. Bumping this pin
+# requires refreshing the committed lock in the same commit.
+NPM_LOCK_REFRESH_VERSION="10"
 (
   cd "$REPO_ROOT/npm/socket-patch"
-  npm install --package-lock-only --ignore-scripts >/dev/null
+  npx --yes "npm@$NPM_LOCK_REFRESH_VERSION" install --package-lock-only --ignore-scripts >/dev/null
 )
 
 # Update all per-platform npm package versions
