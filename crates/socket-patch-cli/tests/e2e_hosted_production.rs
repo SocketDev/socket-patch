@@ -35,7 +35,6 @@
 //! |-----------|------|------------|----------|
 //! | npm    | `pkg:npm/minimist@1.2.2`        | `80630680-4da6-45f9-bba8-b888e0ffd58c` | GHSA-xvch-5gv4-984h (CVE-2021-44906) |
 //! | PyPI   | `pkg:pypi/urllib3@1.26.18`      | *any of three* (see [`PYPI_UUIDS`])    | GHSA-gm62-xv2j-4w53 &co |
-//! | Cargo  | `pkg:cargo/traitobject@0.1.1`   | `cf2e6f58-d9fa-4096-9151-c34afa717f89` | GHSA-pp8r-vv2j-9j5v |
 //! | gem    | `pkg:gem/activestorage@6.0.3`   | *any of* [`GEM_UUIDS`] (five today)    | GHSA-m42x-37p3-fv5w (CVE-2020-8162), GHSA-w749-p3v6-hccq (CVE-2022-21831), GHSA-9xrj-h377-fr87 (CVE-2026-33195), GHSA-r4mg-4433-c7g3 (CVE-2025-24293), GHSA-xr9x-r78c-5hrm (CVE-2026-66066) |
 //!
 //! `docs/testing/hosted-production-e2e.md` explains how these were chosen and
@@ -43,11 +42,14 @@
 //!
 //! # Ecosystems with no coverage, and why
 //!
-//! * **maven / nuget / composer** — hosted mode is implemented and documented
-//!   for all three, but production currently publishes **zero** free-tier
-//!   patches for them, so there is nothing real to redirect to. Rather than
-//!   silently skipping, [`canary_unpublished_ecosystems`] probes production
-//!   every run and tells us the moment that changes.
+//! * **cargo / maven / nuget / composer** — hosted mode is implemented and
+//!   documented for all four, but production currently publishes **zero**
+//!   free-tier patches for them, so there is nothing real to redirect to.
+//!   Rather than silently skipping, [`canary_unpublished_ecosystems`] probes
+//!   production every run and tells us the moment that changes. cargo carried
+//!   a full sparse-registry install proof until 2026-09-01: production's free
+//!   cargo tier emptied on 2026-08-28, so the leg was demoted to the canary
+//!   (`docs/testing/hosted-production-e2e.md` says how to re-promote it).
 //! * **golang** — hosted mode is supported for free-tier references carrying
 //!   a `goproxy` override (`docs/design/golang-hosted.md`), but production
 //!   publishes no golang hosted modules yet. Covered as a shape guard that
@@ -58,11 +60,11 @@
 //!
 //! Toolchains (each leg soft-skips if its own toolchain is absent, unless
 //! `SOCKET_PATCH_HOSTED_E2E_STRICT=1`): `npm`, `pnpm`, `yarn` (classic),
-//! `corepack` (berry), `bun`, `uv`, `cargo`, `ruby` + `bundle`, `go`.
+//! `corepack` (berry), `bun`, `uv`, `ruby` + `bundle`, `go`.
 //!
 //! Network egress to: `patches-api.socket.dev`, `patch.socket.dev`,
 //! `registry.npmjs.org`, `pypi.org`, `files.pythonhosted.org`,
-//! `static.crates.io`, `index.crates.io`, `rubygems.org`.
+//! `rubygems.org`.
 //!
 //! No API token is used or needed — the suite deliberately runs against the
 //! **free public proxy**, which is the surface every unauthenticated user
@@ -118,16 +120,6 @@ const PYPI_UUIDS: &[&str] = &[
     "e828efa5-5c6d-43f3-9909-03f5ac232b98",
 ];
 
-const CARGO_PURL: &str = "pkg:cargo/traitobject@0.1.1";
-const CARGO_NAME: &str = "traitobject";
-const CARGO_VERSION: &str = "0.1.1";
-const CARGO_UUID: &str = "cf2e6f58-d9fa-4096-9151-c34afa717f89";
-/// The traitobject patch annotates `src/lib.rs` with its advisory ID (the
-/// crate is unmaintained; the patch documents that and fixes deprecations).
-/// Cargo crates are not rewritten with the `// Socket Community Patch` header
-/// that npm/PyPI artifacts carry, so this is the marker to look for.
-const CARGO_MARKER: &str = "GHSA-pp8r-vv2j-9j5v";
-
 /// The gem pin is deliberately UNQUALIFIED. Production publishes the purl as
 /// `pkg:gem/activestorage@6.0.3?platform=ruby`, but nothing client-side
 /// strips qualifiers — the SERVER normalizes both spellings to the same
@@ -182,6 +174,19 @@ const PATCH_MARKER: &str = "Socket Community Patch";
 /// patches to exercise it with. [`canary_unpublished_ecosystems`] watches
 /// these so coverage can be extended the moment one lights up.
 const UNPUBLISHED_ECOSYSTEMS: &[(&str, &[&str])] = &[
+    // cargo joined this list on 2026-09-01: production deleted its last free
+    // cargo patches on 2026-08-28, retiring the pinned sparse-registry
+    // install proof this suite used to carry. Re-promotion procedure:
+    // docs/testing/hosted-production-e2e.md.
+    (
+        "cargo",
+        &[
+            "pkg:cargo/openssl",
+            "pkg:cargo/tokio",
+            "pkg:cargo/hyper",
+            "pkg:cargo/smallvec",
+        ],
+    ),
     (
         "maven",
         &[
@@ -729,7 +734,6 @@ async fn preflight_required_patches_are_published() {
     let required: Vec<(&str, Vec<&str>)> = vec![
         (NPM_PURL, vec![NPM_UUID]),
         (PYPI_PURL, PYPI_UUIDS.to_vec()),
-        (CARGO_PURL, vec![CARGO_UUID]),
         (GEM_PURL, GEM_UUIDS.to_vec()),
     ];
 
@@ -783,7 +787,7 @@ async fn canary_patches_name_advisories_so_merge_state_is_inferable() {
     let mut failures: Vec<String> = Vec::new();
     let mut coverage_seen: Vec<(String, String, usize)> = Vec::new();
 
-    let canary_purls = vec![NPM_PURL, PYPI_PURL, CARGO_PURL, GEM_PURL];
+    let canary_purls = vec![NPM_PURL, PYPI_PURL, GEM_PURL];
     for purl in canary_purls {
         match published_patch_advisory_counts(purl).await {
             Err(e) => failures.push(format!("{purl}: production probe failed: {e}")),
@@ -1532,111 +1536,6 @@ fn pypi_uv_lock_hosted_install_proof() {
 }
 
 // ===========================================================================
-// Cargo — per-patch sparse registry
-// ===========================================================================
-
-#[test]
-#[ignore = "live production API + real crates.io. Run with --ignored."]
-fn cargo_hosted_install_proof() {
-    const LEG: &str = "cargo_hosted_install_proof";
-    if !has_command("cargo") {
-        soft_skip!(LEG, "`cargo` not on PATH");
-    }
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let proj = tmp.path().join("proj");
-    std::fs::create_dir_all(proj.join("src")).expect("mkdir src");
-    let home = tmp.path().join("cargo-home").display().to_string();
-    let env = [("CARGO_HOME", home.as_str())];
-
-    std::fs::write(
-        proj.join("Cargo.toml"),
-        format!(
-            "[package]\nname = \"hosted-e2e\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
-             [dependencies]\n{CARGO_NAME} = \"={CARGO_VERSION}\"\n"
-        ),
-    )
-    .expect("write Cargo.toml");
-    std::fs::write(proj.join("src").join("main.rs"), "fn main() {}\n").expect("write main.rs");
-
-    let fetch = tool(&proj, "cargo", &["fetch"], &env);
-    if !ok(&fetch) {
-        soft_skip!(LEG, "upstream `cargo fetch` failed:\n{}", dump(&fetch));
-    }
-    let pristine_lock = read(&proj.join("Cargo.lock"));
-    assert!(
-        pristine_lock.contains("registry+https://github.com/rust-lang/crates.io-index"),
-        "{LEG}: pristine Cargo.lock does not resolve {CARGO_NAME} from \
-         crates.io — fixture setup is wrong:\n{pristine_lock}"
-    );
-
-    let env_json = scan_hosted(&proj, &[]);
-    assert_redirected(&env_json, "Cargo.lock");
-
-    let lock = read(&proj.join("Cargo.lock"));
-    assert_hosted_pin(&lock, &[CARGO_UUID], LEG);
-    let config = read(&proj.join(".cargo").join("config.toml"));
-    assert!(
-        config.contains(&format!(
-            "sparse+https://{PATCH_HOST}/patch-registry/cargo/"
-        )),
-        "{LEG}: .cargo/config.toml declares no Socket sparse registry:\n{config}"
-    );
-    let manifest = read(&proj.join("Cargo.toml"));
-    assert!(
-        manifest.contains(&format!("socket-patch-{CARGO_UUID}")),
-        "{LEG}: Cargo.toml does not route {CARGO_NAME} at the per-patch \
-         registry:\n{manifest}"
-    );
-
-    // Proof: fetch again with a cold CARGO_HOME so cargo must reach the Socket
-    // sparse index, download the crate, and verify the checksum in the lock.
-    let cold = tmp.path().join("cargo-home-cold").display().to_string();
-    let cold_env = [("CARGO_HOME", cold.as_str())];
-    let refetch = tool(&proj, "cargo", &["fetch"], &cold_env);
-    assert!(
-        ok(&refetch),
-        "{LEG}: `cargo fetch` from the Socket sparse registry failed — cargo \
-         could not reach the index, download the crate, or verify its \
-         checksum:\n{}",
-        dump(&refetch)
-    );
-
-    // The extracted source must be the patched crate, not the crates.io one.
-    let src_root = Path::new(&cold).join("registry").join("src");
-    let mut found = None;
-    if let Ok(hosts) = std::fs::read_dir(&src_root) {
-        for host in hosts.flatten() {
-            let candidate = host
-                .path()
-                .join(format!("{CARGO_NAME}-{CARGO_VERSION}"))
-                .join("src")
-                .join("lib.rs");
-            if candidate.exists() {
-                found = Some(candidate);
-                break;
-            }
-        }
-    }
-    let lib_rs = found.unwrap_or_else(|| {
-        panic!("{LEG}: no extracted {CARGO_NAME}-{CARGO_VERSION}/src/lib.rs under {src_root:?}")
-    });
-    assert!(
-        lib_rs
-            .parent()
-            .and_then(|p| p.parent())
-            .and_then(|p| p.parent())
-            .and_then(|p| p.file_name())
-            .map(|n| n.to_string_lossy().contains(PATCH_HOST))
-            .unwrap_or(false),
-        "{LEG}: {CARGO_NAME} was extracted from a non-Socket registry dir \
-         ({}) — cargo served it from the crates.io cache instead of the \
-         redirect",
-        lib_rs.display()
-    );
-    assert_patched(&lib_rs, CARGO_MARKER, LEG);
-}
-
-// ===========================================================================
 // RubyGems — full hosted install proof
 // ===========================================================================
 
@@ -1960,10 +1859,12 @@ fn deno_hosted_is_unsupported() {
 // Canary — ecosystems whose hosted support has nothing to test against
 // ===========================================================================
 
-/// maven, nuget and composer all implement hosted mode, but production
+/// cargo, maven, nuget and composer all implement hosted mode, but production
 /// publishes no free-tier patches for them, so there is no honest end-to-end
-/// leg to write. This probes production every run and reports the moment that
-/// changes, so coverage can be extended deliberately rather than by accident.
+/// leg to write. (cargo used to have one — the pinned sparse-registry install
+/// proof retired 2026-09-01 when production's free cargo tier emptied.) This
+/// probes production every run and reports the moment that changes, so
+/// coverage can be extended deliberately rather than by accident.
 ///
 /// It deliberately does NOT fail when patches appear: production publishing a
 /// new patch is not a socket-patch regression, and a required check must not
@@ -1996,9 +1897,9 @@ async fn canary_unpublished_ecosystems() {
 
     if newly_published.is_empty() {
         println!(
-            "canary_unpublished_ecosystems: maven / nuget / composer still have \
-             no free-tier published patches — their hosted-mode legs remain \
-             untestable end-to-end against production."
+            "canary_unpublished_ecosystems: cargo / maven / nuget / composer \
+             still have no free-tier published patches — their hosted-mode legs \
+             remain untestable end-to-end against production."
         );
         return;
     }

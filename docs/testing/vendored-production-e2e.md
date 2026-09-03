@@ -43,13 +43,12 @@ matches how the `e2e_vendor_*_build.rs` capstones assert.
 
 Pinned to these free-tier patches; they must stay published on
 `patches-api.socket.dev`. `preflight_required_patches_are_published` checks all
-four every run and fails first with the offending PURL named.
+three every run and fails first with the offending PURL named.
 
 | Ecosystem | PURL | Patch UUID | Marker in the patched bytes |
 |-----------|------|------------|-----------------------------|
 | npm | `pkg:npm/minimist@1.2.2` | `80630680-4da6-45f9-bba8-b888e0ffd58c` | `Socket Community Patch` header |
 | PyPI | `pkg:pypi/urllib3@1.26.18` | one of three (server-ordered) | `Socket Community Patch` header |
-| Cargo | `pkg:cargo/traitobject@0.1.1` | `cf2e6f58-d9fa-4096-9151-c34afa717f89` | advisory id `GHSA-pp8r-vv2j-9j5v` |
 | RubyGems | `pkg:gem/activestorage@6.0.3` | any of the `GEM_PATCHES` table (4 as of 2026-08-20 — see the hosted doc's UUID list; each patch marks a different file) | `Socket Community Patch` header |
 
 If a required patch is withdrawn, update the catalog constants at the top of
@@ -67,19 +66,22 @@ hosted suite).
 | bun (text lockfile) | minimist@1.2.2 | `bun install --frozen-lockfile` | ✅ full |
 | pip (requirements.txt) | urllib3@1.26.18 | `pip install --no-index -r requirements.txt` | ✅ full |
 | uv (uv.lock) | urllib3@1.26.18 | `uv sync --frozen --offline` | ✅ full |
-| cargo (`[patch.crates-io]`) | traitobject@0.1.1 | `cargo fetch --offline --locked` (see note) | ✅ full |
 | bundler | activestorage@6.0.3 | frozen `bundle install`, fresh empty `BUNDLE_PATH` | ✅ full |
 | go | — | — | zero-patch assertion (no free golang patches) |
 | deno | — | — | negative assertion (unsupported) |
-| maven / nuget / composer | — | — | canary (no free production patches) |
+| cargo / maven / nuget / composer | — | — | canary (no free production patches) |
 
-The cargo delivery proof uses `cargo fetch --offline`, not `cargo build`,
-because the production traitobject patch injects a `compile_error!` unless the
-`allow-unmaintained` Cargo feature is enabled — the patch's whole point is to
-make the unmaintained crate refuse to compile. That is patch *content*, not a
-vendoring defect; the leg proves the artifact resolves entirely from the
-committable files with zero registry downloads, and byte-checks the vendored
-directory.
+Cargo sat in the ✅-full rows until 2026-09-01: the leg vendored a pinned crate
+as a `[patch.crates-io]` path dep and proved delivery with
+`cargo fetch --offline --locked` from an empty `CARGO_HOME`. Production's free
+cargo tier emptied on 2026-08-28 (the pinned patches were deleted server-side,
+leaving zero live free patches for any cargo crate), so the leg was demoted to
+`canary_unpublished_vendored_ecosystems` — deliberately dropping the cargo
+install-proof coverage. To re-promote: pick a live free cargo patch and follow
+the withdrawn-patch procedure in the
+[hosted doc](./hosted-production-e2e.md#if-a-required-patch-is-withdrawn); the
+git history of this demotion shows every piece to restore in both production
+suites.
 
 ## Known issues this suite surfaced
 
@@ -170,7 +172,7 @@ installs from contending on the shared cache sandbox.
 | Variable | Effect |
 |----------|--------|
 | `SOCKET_PATCH_VENDORED_E2E_STRICT=1` | Turn every "toolchain missing" soft-skip into a hard failure. |
-| `SOCKET_PATCH_VENDORED_E2E_CANARY_STRICT=1` | Fail when maven/nuget/composer gain their first free published patch. |
+| `SOCKET_PATCH_VENDORED_E2E_CANARY_STRICT=1` | Fail when cargo/maven/nuget/composer gain their first free published patch. |
 
 The suite forces `SOCKET_NO_CONFIG=true` and scrubs every ambient `SOCKET_*`
 var, planting hostile seeds so a dropped scrub reddens the suite instead of
@@ -180,10 +182,9 @@ token is used.
 ### Toolchains
 
 `npm`, `pnpm`, `corepack` (yarn classic + berry), `bun`, `uv`, `python3` (pip),
-`cargo`, `ruby` + `bundle`, `go`.
+`ruby` + `bundle`, `go`.
 
 ### Network egress
 
 `patches-api.socket.dev`, `patch.socket.dev`, `registry.npmjs.org`, `pypi.org`,
-`files.pythonhosted.org`, `static.crates.io`, `index.crates.io`,
-`rubygems.org`.
+`files.pythonhosted.org`, `rubygems.org`.
