@@ -40,7 +40,6 @@ from the child environment.
 |-----------|------|------------|----------|---------|
 | npm | `pkg:npm/minimist@1.2.2` | `80630680-4da6-45f9-bba8-b888e0ffd58c` | GHSA-xvch-5gv4-984h / CVE-2021-44906 | all five npm-family legs |
 | PyPI | `pkg:pypi/urllib3@1.26.18` | `de58c8b8-796c-4b6d-8a48-539b5563db76`, `26242e35-f867-4da8-8789-f0d2ea49e0f1`, `e828efa5-5c6d-43f3-9909-03f5ac232b98` | GHSA-38jv-5279-wg99, GHSA-2xpw-w6gg-jr37, GHSA-gm62-xv2j-4w53 | requirements.txt, uv.lock |
-| Cargo | `pkg:cargo/traitobject@0.1.1` | `cf2e6f58-d9fa-4096-9151-c34afa717f89` | GHSA-pp8r-vv2j-9j5v | cargo sparse-registry leg |
 | RubyGems | `pkg:gem/activestorage@6.0.3` | any of `15e960b5-f432-4b6c-b8aa-534a2b419323` (GHSA-m42x-37p3-fv5w / CVE-2020-8162), `6c4141c5-1535-4fd2-9db1-b5f8e4834bdb` (GHSA-w749-p3v6-hccq / CVE-2022-21831, published 2026-08-19), `eeb6bf9f-96c0-4963-a0f1-2e88f91f8b1a` (GHSA-9xrj-h377-fr87 / CVE-2026-33195, published 2026-08-20), `c1a1cd3c-b670-4e44-b4fa-1a63ecd42db6` (GHSA-r4mg-4433-c7g3 / CVE-2025-24293, published 2026-08-20) | see UUID column | bundler leg |
 
 urllib3 1.26.18 carries **three** distinct free patches, one per advisory. Which
@@ -48,7 +47,7 @@ one the resolver returns is a server-side ordering detail, so the suite accepts
 any of the three rather than pinning one — pinning would go red on an unrelated
 server-side reorder.
 
-`preflight_required_patches_are_published` checks all four every run and fails
+`preflight_required_patches_are_published` checks all three every run and fails
 first with the offending PURL named, so a withdrawn patch produces one clear
 failure instead of N confusing ones that look like CLI regressions.
 
@@ -63,9 +62,9 @@ failure instead of N confusing ones that look like CLI regressions.
    package manager in that ecosystem's leg.
 2. Update the catalog constants at the top of `e2e_hosted_production.rs`
    (`*_PURL`, `*_NAME`, `*_VERSION`, `*_UUID`) **and** the table above.
-3. If the new patch does not inject the `// Socket Community Patch` header
-   (Cargo crates do not), pick a marker unique to the patch and set the
-   ecosystem's `*_MARKER` constant.
+3. If the new patch does not inject the `// Socket Community Patch` header,
+   pick a marker unique to the patch and set the ecosystem's `*_MARKER`
+   constant.
 
 ## Ecosystem coverage, and the honest gaps
 
@@ -73,22 +72,34 @@ failure instead of N confusing ones that look like CLI regressions.
 |-----------|-------------|----------------------------|----------------|
 | npm | ✅ | ✅ many | ✅ npm, npm-shrinkwrap, pnpm, yarn classic, yarn berry, bun |
 | PyPI | ✅ (requirements.txt + uv.lock only) | ✅ many | ✅ requirements.txt, uv.lock |
-| Cargo | ✅ | ✅ 1 crate | ✅ sparse registry |
 | RubyGems | ✅ | ✅ (this suite pins one purl/UUID: `activestorage@6.0.3`; the 2026-08-18 republish covers more versions) | ✅ full bundler install proof |
+| Cargo | ✅ | ❌ **none** (tier emptied 2026-08-28) | canary only |
 | Maven | ✅ | ❌ **none** | canary only |
 | NuGet | ✅ | ❌ **none** | canary only |
 | Composer | ✅ | ❌ **none** | canary only |
 | Go | ✅ free tier [by design](../design/golang-hosted.md) (paid: ❌ [analysis](../design/golang-hosted-no-go.md)) | ❌ none published yet | shape guard (redirects only via `goproxy` override) |
 | Deno | ❌ not supported | — | negative assertion |
 
-Maven, NuGet and Composer all *implement* hosted mode, but production publishes
-**zero** free-tier patches for them, so there is nothing real to redirect to.
-Rather than skipping silently, `canary_unpublished_ecosystems` probes production
-every run and reports the moment that changes, so coverage can be extended
-deliberately. It does not fail when patches appear — production publishing a
-patch is not a socket-patch regression — but
+Cargo, Maven, NuGet and Composer all *implement* hosted mode, but production
+publishes **zero** free-tier patches for them, so there is nothing real to
+redirect to. Rather than skipping silently, `canary_unpublished_ecosystems`
+probes production every run and reports the moment that changes, so coverage
+can be extended deliberately. It does not fail when patches appear — production
+publishing a patch is not a socket-patch regression — but
 `SOCKET_PATCH_HOSTED_E2E_CANARY_STRICT=1` makes it fail, for use in a scheduled
 nag run.
+
+**Cargo was demoted to the canary on 2026-09-01.** Until then the suite carried
+a full sparse-registry install proof pinned to one crate, but production's free
+cargo tier emptied on 2026-08-28 (both pinned patches were deleted server-side,
+leaving zero live free patches for any cargo crate), so there is nothing honest
+left to pin. This deliberately drops the cargo install-proof coverage — the
+canary only watches for the tier lighting up again. To re-promote cargo: pick a
+live free patch and follow
+[the withdrawn-patch procedure](#if-a-required-patch-is-withdrawn); the git
+history of this demotion shows every piece to restore (catalog constants,
+preflight registration, the install-proof leg, and these tables) in both
+production suites.
 
 PyPI's poetry / pdm / pipenv locks are **not** rewritten by hosted mode (see the
 [matrix](../ecosystems.md#mode--ecosystem-matrix)); those flavors are vendored-mode
@@ -194,18 +205,18 @@ runs only where it is explicitly asked for.
 | Variable | Effect |
 |----------|--------|
 | `SOCKET_PATCH_HOSTED_E2E_STRICT=1` | Turn every "toolchain missing" soft-skip into a hard failure. **CI sets this** — a required check must never report green on an unexercised leg. |
-| `SOCKET_PATCH_HOSTED_E2E_CANARY_STRICT=1` | Fail when maven/nuget/composer gain their first free published patch. |
+| `SOCKET_PATCH_HOSTED_E2E_CANARY_STRICT=1` | Fail when cargo/maven/nuget/composer gain their first free published patch. |
 
 ### Toolchains
 
-`npm`, `corepack` (pnpm + yarn classic + yarn berry), `bun`, `uv`, `cargo`,
+`npm`, `corepack` (pnpm + yarn classic + yarn berry), `bun`, `uv`,
 `ruby` + `bundle` (**≥ 2.6** — `bundle lock --add-checksums` emits the CHECKSUMS
 section the gem rewrite pins into), `go`.
 
 ### Network egress
 
 `patches-api.socket.dev`, `patch.socket.dev`, `registry.npmjs.org`, `pypi.org`,
-`files.pythonhosted.org`, `static.crates.io`, `index.crates.io`, `rubygems.org`.
+`files.pythonhosted.org`, `rubygems.org`.
 
 ## CI: the `hosted-e2e` job
 

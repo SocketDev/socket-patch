@@ -51,7 +51,6 @@
 //! |-----------|------|------------|-----------------------------|
 //! | npm    | `pkg:npm/minimist@1.2.2`        | `80630680-4da6-45f9-bba8-b888e0ffd58c` | `Socket Community Patch` header |
 //! | PyPI   | `pkg:pypi/urllib3@1.26.18`      | *any of three* (see [`PYPI_UUIDS`])    | `Socket Community Patch` header |
-//! | Cargo  | `pkg:cargo/traitobject@0.1.1`   | `cf2e6f58-d9fa-4096-9151-c34afa717f89` | advisory id `GHSA-pp8r-vv2j-9j5v` |
 //! | gem    | `pkg:gem/activestorage@6.0.3`   | *any of* [`GEM_PATCHES`]               | `Socket Community Patch` header |
 //!
 //! # Ecosystem coverage notes (gaps, and one resolved gap)
@@ -72,10 +71,13 @@
 //!   publishes no free golang patches, so there is nothing to vendor.
 //!   [`golang_vendored_finds_no_free_patches`] asserts exactly that (zero
 //!   applied) and would light up the moment a golang patch is published.
-//! * **maven / nuget / composer** — vendored mode is implemented, but
+//! * **cargo / maven / nuget / composer** — vendored mode is implemented, but
 //!   production publishes **zero** free-tier patches for them.
 //!   [`canary_unpublished_vendored_ecosystems`] probes production every run and
-//!   reports the moment that changes.
+//!   reports the moment that changes. cargo carried a full
+//!   `[patch.crates-io]` delivery proof until 2026-09-01: production's free
+//!   cargo tier emptied on 2026-08-28, so the leg was demoted to the canary
+//!   (`docs/testing/vendored-production-e2e.md` says how to re-promote it).
 //! * **deno** — vendored mode is not supported.
 //!   [`deno_vendored_is_unsupported`] covers it as a negative assertion.
 //!
@@ -83,12 +85,11 @@
 //!
 //! Toolchains (each leg soft-skips if its own toolchain is absent, unless
 //! `SOCKET_PATCH_VENDORED_E2E_STRICT=1`): `npm`, `pnpm`, `corepack` (yarn
-//! classic + berry), `bun`, `uv`, `python3` (pip), `cargo`, `ruby` + `bundle`,
-//! `go`.
+//! classic + berry), `bun`, `uv`, `python3` (pip), `ruby` + `bundle`, `go`.
 //!
 //! Network egress to: `patches-api.socket.dev`, `patch.socket.dev`,
 //! `registry.npmjs.org`, `pypi.org`, `files.pythonhosted.org`,
-//! `static.crates.io`, `index.crates.io`, `rubygems.org`.
+//! `rubygems.org`.
 //!
 //! No API token is used or needed — the suite deliberately runs against the
 //! **free public proxy** with `SOCKET_NO_CONFIG=true` so a developer's
@@ -138,18 +139,6 @@ const PYPI_UUIDS: &[&str] = &[
     "26242e35-f867-4da8-8789-f0d2ea49e0f1",
     "e828efa5-5c6d-43f3-9909-03f5ac232b98",
 ];
-
-const CARGO_PURL: &str = "pkg:cargo/traitobject@0.1.1";
-const CARGO_NAME: &str = "traitobject";
-const CARGO_VERSION: &str = "0.1.1";
-const CARGO_UUID: &str = "cf2e6f58-d9fa-4096-9151-c34afa717f89";
-/// The traitobject patch annotates `src/lib.rs` with its advisory ID. Cargo
-/// crates are not rewritten with the `Socket Community Patch` header the
-/// npm/PyPI artifacts carry, so this is the marker to look for. (The same
-/// patch also injects a `compile_error!` unless the `allow-unmaintained`
-/// feature is set — which is why the cargo delivery proof uses `cargo fetch`,
-/// not `cargo build`; see [`cargo_vendored_install_proof`].)
-const CARGO_MARKER: &str = "GHSA-pp8r-vv2j-9j5v";
 
 /// The gem pin is deliberately UNQUALIFIED. Production publishes the purl as
 /// `pkg:gem/activestorage@6.0.3?platform=ruby`, but nothing client-side
@@ -207,6 +196,14 @@ const YARN_BERRY: &str = "yarn@4.6.0";
 /// patches to exercise it with. [`canary_unpublished_vendored_ecosystems`]
 /// watches these so coverage can be extended the moment one lights up.
 const UNPUBLISHED_ECOSYSTEMS: &[(&str, &[&str])] = &[
+    // cargo joined this list on 2026-09-01: production deleted its last free
+    // cargo patches on 2026-08-28, retiring the pinned `[patch.crates-io]`
+    // delivery proof this suite used to carry. Re-promotion procedure:
+    // docs/testing/vendored-production-e2e.md.
+    (
+        "cargo",
+        &["pkg:cargo/openssl", "pkg:cargo/tokio", "pkg:cargo/smallvec"],
+    ),
     (
         "maven",
         &[
@@ -738,7 +735,6 @@ async fn preflight_required_patches_are_published() {
     let required: Vec<(&str, Vec<&str>)> = vec![
         (NPM_PURL, vec![NPM_UUID]),
         (PYPI_PURL, PYPI_UUIDS.to_vec()),
-        (CARGO_PURL, vec![CARGO_UUID]),
         (GEM_PURL, GEM_PATCHES.iter().map(|(u, _)| *u).collect()),
     ];
 
@@ -1600,180 +1596,6 @@ fn pypi_uv_lock_vendored_install_proof() {
 }
 
 // ===========================================================================
-// Cargo — `[patch.crates-io]` path dep
-// ===========================================================================
-
-/// Cargo's vendored artifact is a **directory** (a `[patch.crates-io]` path
-/// dep), so the delivery proof is a `cargo fetch --offline` that resolves the
-/// whole dependency graph from committable files with an empty CARGO_HOME —
-/// proving zero registry access — plus a byte check that the vendored
-/// directory carries the patch.
-///
-/// It deliberately does NOT `cargo build`: the production traitobject patch
-/// injects a `compile_error!` unless the `allow-unmaintained` Cargo feature is
-/// enabled (the patch's whole point is to make the unmaintained crate refuse to
-/// compile silently). That is patch *content*, not a vendoring defect, and this
-/// suite proves byte delivery, not CVE efficacy.
-#[test]
-#[ignore = "live production API + real crates.io. Run with --ignored."]
-fn cargo_vendored_install_proof() {
-    const LEG: &str = "cargo_vendored_install_proof";
-    if !has_command("cargo") {
-        soft_skip!(LEG, "`cargo` not on PATH");
-    }
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let proj = tmp.path().join("proj");
-    std::fs::create_dir_all(proj.join("src")).expect("mkdir src");
-    let home = tmp.path().join("cargo-home").display().to_string();
-    let env = [("CARGO_HOME", home.as_str())];
-
-    std::fs::write(
-        proj.join("Cargo.toml"),
-        format!(
-            "[package]\nname = \"vendored-e2e\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
-             [dependencies]\n{CARGO_NAME} = \"={CARGO_VERSION}\"\n"
-        ),
-    )
-    .expect("write Cargo.toml");
-    std::fs::write(proj.join("src").join("main.rs"), "fn main() {}\n").expect("write main.rs");
-
-    let fetch = tool(&proj, "cargo", &["fetch"], &env);
-    if !ok(&fetch) {
-        soft_skip!(LEG, "upstream `cargo fetch` failed:\n{}", dump(&fetch));
-    }
-    let pristine_lock = std::fs::read(proj.join("Cargo.lock")).unwrap();
-
-    // The pristine registry-extracted source must NOT carry the marker.
-    let registry_lib = find_registry_lib(Path::new(&home));
-    if let Some(ref lib) = registry_lib {
-        assert_pristine(lib, CARGO_MARKER, LEG);
-    }
-
-    let env_json = scan_vendored(&proj, &[]);
-    assert_vendor_applied(&env_json, CARGO_PURL, LEG);
-    assert_download_uuid(&env_json, &[CARGO_UUID], LEG);
-
-    // Vendored directory carries the patch; the registry source stays pristine.
-    let vendored_lib = proj
-        .join(format!(
-            ".socket/vendor/cargo/{CARGO_UUID}/{CARGO_NAME}-{CARGO_VERSION}"
-        ))
-        .join("src/lib.rs");
-    assert_patched(&vendored_lib, CARGO_MARKER, LEG);
-    if let Some(ref lib) = registry_lib {
-        assert!(
-            !read(lib).contains(CARGO_MARKER),
-            "{LEG}: vendoring mutated the pristine registry source at {} — vendor must copy, \
-             never mutate",
-            lib.display()
-        );
-    }
-    let config = read(&proj.join(".cargo/config.toml"));
-    assert!(
-        config.contains("[patch.crates-io]")
-            && config.contains(&format!(".socket/vendor/cargo/{CARGO_UUID}/")),
-        "{LEG}: .cargo/config.toml declares no [patch.crates-io] pointing at the vendored \
-         crate:\n{config}"
-    );
-    // Lock detached from the registry (keeps name+version, loses source+checksum).
-    let lock = read(&proj.join("Cargo.lock"));
-    let block = cargo_package_block(&lock, CARGO_NAME).expect("traitobject lock entry survives");
-    assert!(
-        !block.contains("source = ") && !block.contains("checksum = "),
-        "{LEG}: lock entry must be detached from the registry:\n{block}"
-    );
-    let lock_wired = std::fs::read(proj.join("Cargo.lock")).unwrap();
-
-    // DELIVERY PROOF: committable files only, EMPTY CARGO_HOME, `cargo fetch
-    // --offline --locked` — resolves the whole graph from the vendored path
-    // with zero registry downloads.
-    let fresh = tmp.path().join("fresh");
-    std::fs::create_dir_all(&fresh).unwrap();
-    std::fs::copy(proj.join("Cargo.toml"), fresh.join("Cargo.toml")).unwrap();
-    std::fs::copy(proj.join("Cargo.lock"), fresh.join("Cargo.lock")).unwrap();
-    copy_dir_recursive(&proj.join(".cargo"), &fresh.join(".cargo"));
-    copy_dir_recursive(&proj.join("src"), &fresh.join("src"));
-    copy_dir_recursive(&proj.join(".socket"), &fresh.join(".socket"));
-    let fresh_home = tmp.path().join("fresh-cargo-home");
-    std::fs::create_dir_all(&fresh_home).unwrap();
-    let fresh_home_s = fresh_home.display().to_string();
-    let refetch = tool(
-        &fresh,
-        "cargo",
-        &["fetch", "--offline", "--locked"],
-        &[("CARGO_HOME", fresh_home_s.as_str())],
-    );
-    assert!(
-        ok(&refetch),
-        "{LEG}: `cargo fetch --offline --locked` from the vendored path (empty CARGO_HOME) \
-         failed — cargo could not resolve the graph from committable files alone:\n{}",
-        dump(&refetch)
-    );
-    assert!(
-        !fresh_home.join("registry").exists(),
-        "{LEG}: the empty CARGO_HOME gained a registry/ — cargo hit the network instead of \
-         resolving {CARGO_NAME} from the vendored path dep"
-    );
-    // The delivered bytes ARE the vendored directory's bytes (path dep), and
-    // they carry the patch marker.
-    assert_patched(
-        &fresh.join(format!(
-            ".socket/vendor/cargo/{CARGO_UUID}/{CARGO_NAME}-{CARGO_VERSION}/src/lib.rs"
-        )),
-        CARGO_MARKER,
-        LEG,
-    );
-
-    // Idempotency + revert.
-    let env2 = scan_vendored(&proj, &[]);
-    assert_eq!(
-        env2["vendor"]["summary"]["applied"].as_u64().unwrap_or(99),
-        0,
-        "{LEG}: re-run must vendor nothing new:\n{env2:#}"
-    );
-    assert_eq!(
-        std::fs::read(proj.join("Cargo.lock")).unwrap(),
-        lock_wired,
-        "{LEG}: re-run must leave Cargo.lock byte-identical"
-    );
-    assert_eq!(vendor_revert(&proj, LEG), 1, "{LEG}: one entry reverted");
-    assert_eq!(
-        std::fs::read(proj.join("Cargo.lock")).unwrap(),
-        pristine_lock,
-        "{LEG}: revert must restore Cargo.lock byte-identical"
-    );
-    assert!(
-        !proj.join(".socket/vendor").exists(),
-        "{LEG}: .socket/vendor must be gone after revert"
-    );
-}
-
-/// Find `<cargo_home>/registry/src/<idx>/traitobject-0.1.1/src/lib.rs`.
-fn find_registry_lib(cargo_home: &Path) -> Option<PathBuf> {
-    let src = cargo_home.join("registry").join("src");
-    for host in std::fs::read_dir(&src).ok()?.flatten() {
-        let candidate = host
-            .path()
-            .join(format!("{CARGO_NAME}-{CARGO_VERSION}"))
-            .join("src")
-            .join("lib.rs");
-        if candidate.exists() {
-            return Some(candidate);
-        }
-    }
-    None
-}
-
-/// The full `[[package]]` block (text) for `name` in Cargo.lock.
-fn cargo_package_block(lock_text: &str, name: &str) -> Option<String> {
-    let needle = format!("name = \"{name}\"");
-    lock_text
-        .split("[[package]]")
-        .find(|block| block.lines().any(|l| l.trim() == needle))
-        .map(str::to_string)
-}
-
-// ===========================================================================
 // RubyGems — bundler `path:` source
 // ===========================================================================
 
@@ -2147,10 +1969,12 @@ fn deno_vendored_is_unsupported() {
     );
 }
 
-/// maven, nuget and composer all implement vendored mode, but production
-/// publishes no free-tier patches for them. This probes production every run
-/// and reports the moment that changes, so coverage can be extended
-/// deliberately rather than by accident. It does not fail when patches appear;
+/// cargo, maven, nuget and composer all implement vendored mode, but
+/// production publishes no free-tier patches for them. (cargo used to have a
+/// full delivery proof — retired 2026-09-01 when production's free cargo tier
+/// emptied.) This probes production every run and reports the moment that
+/// changes, so coverage can be extended deliberately rather than by accident.
+/// It does not fail when patches appear;
 /// `SOCKET_PATCH_VENDORED_E2E_CANARY_STRICT=1` makes it fail, for a scheduled
 /// nag run.
 #[tokio::test(flavor = "multi_thread")]
@@ -2180,8 +2004,8 @@ async fn canary_unpublished_vendored_ecosystems() {
 
     if newly_published.is_empty() {
         println!(
-            "canary_unpublished_vendored_ecosystems: maven / nuget / composer still have no \
-             free-tier published patches — their vendored-mode legs remain untestable \
+            "canary_unpublished_vendored_ecosystems: cargo / maven / nuget / composer still \
+             have no free-tier published patches — their vendored-mode legs remain untestable \
              end-to-end against production."
         );
         return;
