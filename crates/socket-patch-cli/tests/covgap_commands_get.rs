@@ -1028,8 +1028,21 @@ async fn engine_human_mode_skip_and_failed_summary() {
 /// Fabricate a crawler-visible PyPI install without python: a `.venv`
 /// site-packages with a `<name>-<version>.dist-info/METADATA` and the
 /// package's single module file. Returns the module file path.
+///
+/// The crawler probes a platform-specific venv layout
+/// (`find_site_packages_under`): `.venv/Lib/site-packages` on Windows,
+/// `.venv/lib/python3.*/site-packages` elsewhere — stage whichever this
+/// runner will actually look in, or the package is "not installed" and the
+/// variant narrowing under test never runs.
 fn fake_pypi_venv(root: &Path, name: &str, version: &str, file_bytes: &[u8]) -> PathBuf {
-    let sp = root.join(".venv/lib/python3.11/site-packages");
+    let sp = if cfg!(windows) {
+        root.join(".venv").join("Lib").join("site-packages")
+    } else {
+        root.join(".venv")
+            .join("lib")
+            .join("python3.11")
+            .join("site-packages")
+    };
     let dist = sp.join(format!("{name}-{version}.dist-info"));
     std::fs::create_dir_all(&dist).unwrap();
     std::fs::write(

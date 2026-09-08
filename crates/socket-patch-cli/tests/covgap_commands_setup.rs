@@ -777,12 +777,17 @@ fn exclude_already_persisted_skips_manifest_rewrite() {
         "a rerun whose excludes are already persisted exactly must not \
          rewrite the manifest"
     );
-    // The persisted exclusion still holds without the flag.
+    // The persisted exclusion still holds without the flag. Entry paths render
+    // via Path::display() (`\` on Windows) — normalize the separator so this
+    // guard cannot pass vacuously there.
     let files = v["files"].as_array().expect("files[]");
+    let names_packages_a = |f: &serde_json::Value| {
+        f["path"]
+            .as_str()
+            .is_some_and(|p| p.replace('\\', "/").contains("packages/a"))
+    };
     assert!(
-        !files
-            .iter()
-            .any(|f| f["path"].as_str().is_some_and(|p| p.contains("packages/a"))),
+        !files.iter().any(names_packages_a),
         "the persisted exclude must keep packages/a out of the run: {v}"
     );
 }
