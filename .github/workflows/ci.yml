@@ -287,11 +287,17 @@ jobs:
         # Build them with --all-features (compile rot is real coverage), but
         # run only the default-feature suites; the dedicated e2e-docker and
         # setup-matrix jobs run the gated suites for real.
+        #
+        # `--no-fail-fast`: without it cargo stops at the first failing test
+        # BINARY, so one bad file hides every later binary's result on that
+        # OS (2026-09-03: two Windows-only fixture failures in
+        # covgap_commands_get masked ~180 binaries that had never run on
+        # Windows at all). Run them all and fail at the end instead.
         shell: bash
         run: |
           set -euo pipefail
           cargo test --workspace --all-features --no-run
-          cargo test --workspace
+          cargo test --workspace --no-fail-fast
 
   test-release:
     runs-on: ubuntu-latest
