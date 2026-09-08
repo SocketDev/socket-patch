@@ -541,6 +541,39 @@ mod tests {
         ));
     }
 
+    /// Fail-closed arms of the uuid normalizer: a key whose vendored path is
+    /// truncated at the anchor (nothing, or no uuid level, after
+    /// `.socket/vendor/`) or names an eco dir outside `ECOSYSTEM_DIRS` must
+    /// NOT be uuid-normalized — such keys only ever match byte-equal.
+    #[test]
+    fn wiring_key_matching_fails_closed_on_truncated_and_unknown_eco_keys() {
+        const UUID2: &str = "0a1b2c3d-4e5f-6a7b-8c9d-0e1f2a3b4c5d";
+        // Key ends at the anchor: no eco/uuid follows, so nothing normalizes
+        // and different prefixes never match…
+        assert!(!wiring_key_matches(
+            "x@file:.socket/vendor/",
+            "y@file:.socket/vendor/"
+        ));
+        // …while the byte-equal fast path still matches the same key.
+        assert!(wiring_key_matches(
+            "x@file:.socket/vendor/",
+            "x@file:.socket/vendor/"
+        ));
+        // A single component after the anchor (no uuid level) is truncated
+        // too: byte-equal only.
+        assert!(!wiring_key_matches(
+            ".socket/vendor/npm",
+            ".socket/vendor/gem"
+        ));
+        // An eco dir not in ECOSYSTEM_DIRS (jsr has no vendor backend): the
+        // uuid level must NOT be normalized away, so a uuid-only difference
+        // is a mismatch…
+        let jsr_key = |uuid: &str| format!("x@file:.socket/vendor/jsr/{uuid}/x.tgz");
+        assert!(!wiring_key_matches(&jsr_key(UUID), &jsr_key(UUID2)));
+        // …and again byte-equal still matches.
+        assert!(wiring_key_matches(&jsr_key(UUID), &jsr_key(UUID)));
+    }
+
     #[test]
     fn leaf_round_trips() {
         // npm, incl. scoped and digit-bearing names + prerelease versions.
@@ -629,6 +662,44 @@ mod tests {
             leaf_to_purl("pypi", "six-1.16.0.whl").is_none(),
             "tags required"
         );
+    }
+
+    /// Fail-closed rejection arms of `leaf_to_purl` and its splitters: every
+    /// leaf below is a legal (creatable) file/dir name in a tamper-able
+    /// committed tree, and every one must come back `None` — report, never
+    /// delete by guess — rather than a garbage or coordinate-unsafe PURL.
+    #[test]
+    fn leaf_to_purl_fails_closed_on_adversarial_leaves() {
+        // npm: a file literally named `-1.2.3.tgz` splits at index 0 leaving
+        // the name empty.
+        assert!(leaf_to_purl("npm", "-1.2.3.tgz").is_none());
+        // golang: the last `@` must sit in the FINAL component (an npm-style
+        // scope dir planted under golang/ has it in the first)…
+        assert!(leaf_to_purl("golang", "@scope/foo").is_none());
+        // …and an empty module or empty version is rejected.
+        assert!(leaf_to_purl("golang", "@v1.0.0").is_none());
+        assert!(leaf_to_purl("golang", "foo@").is_none());
+        // golang: coordinate-safety guard — backslash in the module, colon in
+        // the version (both would poison downstream path joins).
+        assert!(leaf_to_purl("golang", "a\\b@v1.0.0").is_none());
+        assert!(leaf_to_purl("golang", "foo@v1:0").is_none());
+        // composer: empty vendor, empty name, nested (slashed) name.
+        assert!(leaf_to_purl("composer", "/name@1.0").is_none());
+        assert!(leaf_to_purl("composer", "vendor/@1.0").is_none());
+        assert!(leaf_to_purl("composer", "a/b/c@1.0").is_none());
+        // pypi: empty dist and empty version are both legal wheel-ish
+        // filenames.
+        assert!(leaf_to_purl("pypi", "-1.0-py3-none-any.whl").is_none());
+        assert!(leaf_to_purl("pypi", "six--py3-none-any.whl").is_none());
+        // nuget: empty id (first `.` at index 0 followed by a digit), and a
+        // nested leaf whose recovered version would span a `/`.
+        assert!(leaf_to_purl("nuget", ".1.2.3.nupkg").is_none());
+        assert!(leaf_to_purl("nuget", "foo.1.0/evil.nupkg").is_none());
+        // maven: an empty group component, and an unsafe group (colon).
+        assert!(leaf_to_purl("maven", "/app/1.0.0/app-1.0.0.jar").is_none());
+        assert!(leaf_to_purl("maven", "a:b/x/1.0/x-1.0.jar").is_none());
+        // An eco with no vendor backend (deno) never parses.
+        assert!(leaf_to_purl("deno", "x-1.0.0").is_none());
     }
 
     #[tokio::test]

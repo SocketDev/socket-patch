@@ -527,6 +527,21 @@ mod tests {
         assert!(!is_hook_present("{}"));
     }
 
+    #[test]
+    fn test_is_hook_present_false_on_malformed_json() {
+        // An unparseable composer.json reads as "not configured" — the
+        // `--check` probe is a pure scan that must never crash or wedge on
+        // malformed input.
+        assert!(!is_hook_present("{ not json"));
+        assert!(!is_hook_present(""));
+        // The asymmetry is intentional and must stay so: on the very same
+        // bytes `setup` (composer_add) errors loudly instead of quietly
+        // reporting AlreadyConfigured — so `--check` says needs-configuration
+        // and `setup` refuses with an error, never a silent success.
+        assert!(composer_add("{ not json").is_err());
+        assert!(composer_add("").is_err());
+    }
+
     #[tokio::test]
     async fn test_async_add_remove_round_trip() {
         let dir = tempfile::tempdir().unwrap();

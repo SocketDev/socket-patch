@@ -252,14 +252,27 @@ pub(super) async fn stage_patch_pack(
     }
 
     // ── Pack the deterministic tarball ──────────────────────────────────
+    // An Err past this point must unwind the uuid dir the pack is about to
+    // create inside the project (the `Err` contract above: "Nothing inside
+    // the project was written") — but never one that already existed (a
+    // same-uuid re-vendor's dir may still be referenced by live wiring).
+    let uuid_dir_preexisted = tokio::fs::metadata(project_root.join(&coords.uuid_dir_rel))
+        .await
+        .is_ok();
     let (rel_tgz, dest) = prepare_tgz_dest(purl, project_root, &coords).await?;
     let packed = match pack_deterministic(&stage, &dest).await {
         Ok(p) => p,
         Err(e) => {
-            return Err(Box::new(done_failure(
-                purl,
-                format!("cannot pack the vendored tarball: {e}"),
-            )))
+            return Err(Box::new(
+                done_failure_unstage(
+                    purl,
+                    format!("cannot pack the vendored tarball: {e}"),
+                    project_root,
+                    &coords.uuid_dir_rel,
+                    uuid_dir_preexisted,
+                )
+                .await,
+            ))
         }
     };
 
@@ -271,7 +284,18 @@ pub(super) async fn stage_patch_pack(
     {
         match read_staged_package_json(&stage).await {
             Ok(pkg) => Some(pkg),
-            Err(e) => return Err(Box::new(done_failure(purl, e))),
+            Err(e) => {
+                return Err(Box::new(
+                    done_failure_unstage(
+                        purl,
+                        e,
+                        project_root,
+                        &coords.uuid_dir_rel,
+                        uuid_dir_preexisted,
+                    )
+                    .await,
+                ))
+            }
         }
     } else {
         None
@@ -425,12 +449,25 @@ async fn staged_pack_from_service_bytes(
         )));
     }
 
+    // An Err past this point must unwind the uuid dir the write is about to
+    // create inside the project (the caller's `Err` contract: "Nothing
+    // inside the project was written") — but never one that already existed
+    // (a same-uuid re-vendor's dir may still be referenced by live wiring).
+    let uuid_dir_preexisted = tokio::fs::metadata(project_root.join(&coords.uuid_dir_rel))
+        .await
+        .is_ok();
     let (rel_tgz, dest) = prepare_tgz_dest(purl, project_root, coords).await?;
     if let Err(e) = atomic_write_bytes(&dest, bytes).await {
-        return Err(Box::new(done_failure(
-            purl,
-            format!("cannot write the vendored tarball: {e}"),
-        )));
+        return Err(Box::new(
+            done_failure_unstage(
+                purl,
+                format!("cannot write the vendored tarball: {e}"),
+                project_root,
+                &coords.uuid_dir_rel,
+                uuid_dir_preexisted,
+            )
+            .await,
+        ));
     }
 
     let staged_pkg_json = if record
@@ -440,7 +477,18 @@ async fn staged_pack_from_service_bytes(
     {
         match read_package_json_from_vendored_tgz(&dest).await {
             Ok(pkg) => Some(pkg),
-            Err(e) => return Err(Box::new(done_failure(purl, e))),
+            Err(e) => {
+                return Err(Box::new(
+                    done_failure_unstage(
+                        purl,
+                        e,
+                        project_root,
+                        &coords.uuid_dir_rel,
+                        uuid_dir_preexisted,
+                    )
+                    .await,
+                ))
+            }
         }
     } else {
         None
@@ -758,6 +806,109 @@ mod tests {
         assert!(!declares_bundled_deps(&serde_json::json!({})), "absent");
     }
 
+    /// An Err AFTER `prepare_tgz_dest` must unwind the uuid dir the pack
+    /// created inside the project — the module contract ("a refusal or
+    /// failure in this pipeline leaves the project byte-untouched", and the
+    /// `Err` arm's "Nothing inside the project was written") — instead of
+    /// stranding an unledgered, committable husk no `--revert` entry tracks
+    /// (the vendor/cargo.rs failed-vendor-husk class). Reachable shape: the
+    /// patch rewrites package/package.json to content that is not valid
+    /// JSON (apply is afterHash-gated only, never a JSON parse), so
+    /// `read_staged_package_json` errs after the tarball fully packed.
+    #[tokio::test]
+    async fn err_after_pack_unstages_the_uuid_dir() {
+        use crate::hash::git_sha256::compute_git_sha256_from_bytes;
+        use crate::patch::apply::PatchSources;
+
+        const ORIG_PKG: &[u8] = b"{\"name\":\"left-pad\",\"version\":\"1.3.0\"}\n";
+        const BAD_PKG: &[u8] = b"module.exports = 'not json';\n";
+
+        async fn build_fixture() -> (tempfile::TempDir, PatchRecord) {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path();
+            let installed = root.join("node_modules/left-pad");
+            tokio::fs::create_dir_all(&installed).await.unwrap();
+            tokio::fs::write(installed.join("package.json"), ORIG_PKG)
+                .await
+                .unwrap();
+            let blobs = root.join(".socket/blobs");
+            tokio::fs::create_dir_all(&blobs).await.unwrap();
+            let after_hash = compute_git_sha256_from_bytes(BAD_PKG);
+            tokio::fs::write(blobs.join(&after_hash), BAD_PKG)
+                .await
+                .unwrap();
+            let mut record = record_with_uuid(UUID);
+            record.files.clear();
+            record.files.insert(
+                "package/package.json".to_string(),
+                PatchFileInfo {
+                    before_hash: compute_git_sha256_from_bytes(ORIG_PKG),
+                    after_hash,
+                },
+            );
+            (tmp, record)
+        }
+
+        async fn run(root: &Path, record: &PatchRecord) -> Box<VendorOutcome> {
+            let blobs = root.join(".socket/blobs");
+            let sources = PatchSources::blobs_only(&blobs);
+            let mut warnings = Vec::new();
+            match stage_patch_pack(
+                "pkg:npm/left-pad@1.3.0",
+                &root.join("node_modules/left-pad"),
+                root,
+                record,
+                &sources,
+                false,
+                false,
+                &mut warnings,
+                None,
+            )
+            .await
+            {
+                Err(outcome) => outcome,
+                Ok(_) => panic!("expected the post-pack package.json parse to Err"),
+            }
+        }
+
+        // Fresh vendor: the post-pack failure must leave no husk at all.
+        let (tmp, record) = build_fixture().await;
+        match *run(tmp.path(), &record).await {
+            VendorOutcome::Done { result, entry, .. } => {
+                assert!(!result.success);
+                assert!(
+                    result
+                        .error
+                        .as_deref()
+                        .unwrap_or("")
+                        .contains("not parseable JSON"),
+                    "fails on the post-pack package.json parse: {:?}",
+                    result.error
+                );
+                assert!(entry.is_none());
+            }
+            other => panic!("expected Done failure, got {other:?}"),
+        }
+        assert!(
+            !tmp.path().join(".socket/vendor").exists(),
+            "no orphaned uuid-dir husk may remain after a post-pack failure"
+        );
+
+        // Same-uuid re-vendor: a PRE-EXISTING uuid dir is never unstaged
+        // (live wiring may still reference it).
+        let (tmp, record) = build_fixture().await;
+        let uuid_dir = tmp.path().join(format!(".socket/vendor/npm/{UUID}"));
+        tokio::fs::create_dir_all(&uuid_dir).await.unwrap();
+        match *run(tmp.path(), &record).await {
+            VendorOutcome::Done { result, .. } => assert!(!result.success),
+            other => panic!("expected Done failure, got {other:?}"),
+        }
+        assert!(
+            uuid_dir.exists(),
+            "a pre-existing uuid dir survives the failure"
+        );
+    }
+
     #[tokio::test]
     async fn done_failure_shape_matches_contract() {
         let outcome = done_failure("pkg:npm/x@1.0.0", "boom".to_string());
@@ -775,5 +926,587 @@ mod tests {
         assert!(result.files_verified.is_empty() && result.files_patched.is_empty());
         assert!(entry.is_none());
         assert!(warnings.is_empty());
+    }
+
+    // ──────────── shared fixtures for the pipeline-arm tests ────────────
+
+    const LP_PURL: &str = "pkg:npm/left-pad@1.3.0";
+    const ORIG_INDEX: &[u8] = b"module.exports = () => 'orig';\n";
+    const PATCHED_INDEX: &[u8] = b"module.exports = () => 'patched';\n";
+
+    /// Unwrap a pipeline `Err` into its `Done` failure, asserting the
+    /// synthesized result carries `needle` and no ledger entry; returns the
+    /// full error text for further assertions.
+    fn expect_done_failure(outcome: Box<VendorOutcome>, needle: &str) -> String {
+        match *outcome {
+            VendorOutcome::Done { result, entry, .. } => {
+                assert!(!result.success, "expected a failed result");
+                assert!(entry.is_none(), "a failure must never carry a ledger entry");
+                let error = result.error.unwrap_or_default();
+                assert!(
+                    error.contains(needle),
+                    "error `{error}` must contain `{needle}`"
+                );
+                error
+            }
+            other => panic!("expected Done failure, got {other:?}"),
+        }
+    }
+
+    /// `unwrap_err` for pipeline results whose Ok side (`NpmStagedPack`)
+    /// deliberately has no `Debug` impl.
+    fn expect_err<T>(result: Result<T, Box<VendorOutcome>>) -> Box<VendorOutcome> {
+        match result {
+            Err(outcome) => outcome,
+            Ok(_) => panic!("expected the pipeline to Err"),
+        }
+    }
+
+    /// Project tempdir with an installed left-pad (the given package.json
+    /// plus `ORIG_INDEX`), a patched-index blob, and a record patching only
+    /// `package/index.js` — the minimal shape a full local
+    /// stage→patch→pack run succeeds on.
+    async fn local_fixture(installed_pkg_json: &[u8]) -> (tempfile::TempDir, PatchRecord) {
+        use crate::hash::git_sha256::compute_git_sha256_from_bytes;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let installed = root.join("node_modules/left-pad");
+        tokio::fs::create_dir_all(&installed).await.unwrap();
+        tokio::fs::write(installed.join("package.json"), installed_pkg_json)
+            .await
+            .unwrap();
+        tokio::fs::write(installed.join("index.js"), ORIG_INDEX)
+            .await
+            .unwrap();
+        let blobs = root.join(".socket/blobs");
+        tokio::fs::create_dir_all(&blobs).await.unwrap();
+        let after_hash = compute_git_sha256_from_bytes(PATCHED_INDEX);
+        tokio::fs::write(blobs.join(&after_hash), PATCHED_INDEX)
+            .await
+            .unwrap();
+        let mut record = record_with_uuid(UUID);
+        record.files.clear();
+        record.files.insert(
+            "package/index.js".to_string(),
+            PatchFileInfo {
+                before_hash: compute_git_sha256_from_bytes(ORIG_INDEX),
+                after_hash,
+            },
+        );
+        (tmp, record)
+    }
+
+    async fn run_pipeline(
+        root: &Path,
+        record: &PatchRecord,
+        service: Option<&VendorServiceConfig>,
+    ) -> Result<(Option<NpmStagedPack>, ApplyResult), Box<VendorOutcome>> {
+        let blobs = root.join(".socket/blobs");
+        let sources = PatchSources::blobs_only(&blobs);
+        let mut warnings = Vec::new();
+        stage_patch_pack(
+            LP_PURL,
+            &root.join("node_modules/left-pad"),
+            root,
+            record,
+            &sources,
+            false,
+            false,
+            &mut warnings,
+            service,
+        )
+        .await
+    }
+
+    /// Deterministically pack `files` (rel path → bytes) into real tgz
+    /// bytes, exactly as a local build would.
+    async fn build_tgz(files: &[(&str, &[u8])]) -> Vec<u8> {
+        let tmp = tempfile::tempdir().unwrap();
+        let staged = tmp.path().join("staged");
+        tokio::fs::create_dir_all(&staged).await.unwrap();
+        for &(name, bytes) in files {
+            tokio::fs::write(staged.join(name), bytes).await.unwrap();
+        }
+        let dest = tmp.path().join("built.tgz");
+        pack_deterministic(&staged, &dest).await.unwrap();
+        tokio::fs::read(&dest).await.unwrap()
+    }
+
+    // ───────────────────── local-build failure arms ─────────────────────
+
+    /// A vanished installed dir (removed after the scan resolved it) is a
+    /// `Done` failure naming the stage step, with the project left
+    /// byte-untouched.
+    #[tokio::test]
+    async fn missing_installed_dir_fails_without_touching_the_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let record = record_with_uuid(UUID);
+        let err = expect_err(run_pipeline(tmp.path(), &record, None).await);
+        expect_done_failure(err, "cannot stage a copy of the installed package");
+        assert!(
+            !tmp.path().join(".socket").exists(),
+            "a stage failure must write nothing inside the project"
+        );
+    }
+
+    /// The bundled-deps refusal deliberately fails OPEN on an unparseable
+    /// staged package.json (npm itself tolerates manifests serde rejects;
+    /// refusing here would make such packages unvendorable — see the comment
+    /// at the check site): the pipeline must proceed to a successful pack.
+    /// The parseable twin of the same content refuses, proving the skip is
+    /// exactly the parse failure and not a dead check.
+    #[tokio::test]
+    async fn unparseable_package_json_fails_open_past_the_bundled_deps_refusal() {
+        // Invalid JSON (trailing comma) that WOULD declare bundled deps if
+        // it parsed.
+        let (tmp, record) = local_fixture(b"{\"bundleDependencies\": [\"dep\"],}").await;
+        let (staged, result) = run_pipeline(tmp.path(), &record, None)
+            .await
+            .expect("an unparseable package.json must neither refuse nor fail");
+        assert!(result.success, "{:?}", result.error);
+        let staged = staged.expect("a real (non-dry) run must pack");
+        assert!(
+            tmp.path().join(&staged.rel_tgz).is_file(),
+            "the tarball must be packed despite the unparseable manifest"
+        );
+        assert!(
+            staged.staged_pkg_json.is_none(),
+            "the record does not patch package.json"
+        );
+
+        // Contrast: the SAME declaration in valid JSON refuses.
+        let (tmp, record) = local_fixture(b"{\"bundleDependencies\": [\"dep\"]}").await;
+        expect_refusal(
+            expect_err(run_pipeline(tmp.path(), &record, None).await),
+            "vendor_bundled_deps_unsupported",
+        );
+    }
+
+    /// A pack failure (something undeletable squatting on the dest path) is
+    /// a `Done` failure naming the pack step — and since the uuid dir
+    /// pre-existed this run, the unwind must NOT delete it (live wiring may
+    /// still reference it).
+    #[tokio::test]
+    async fn pack_failure_reports_and_preserves_a_preexisting_uuid_dir() {
+        let (tmp, record) = local_fixture(b"{\"name\":\"left-pad\",\"version\":\"1.3.0\"}").await;
+        // A DIRECTORY at the tgz destination: the atomic rename-over fails.
+        let squatter = tmp
+            .path()
+            .join(format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz"));
+        tokio::fs::create_dir_all(&squatter).await.unwrap();
+        let err = expect_err(run_pipeline(tmp.path(), &record, None).await);
+        expect_done_failure(err, "cannot pack the vendored tarball");
+        assert!(
+            squatter.exists(),
+            "a pre-existing uuid dir must survive the failed pack's unwind"
+        );
+    }
+
+    // ─────────────── service fast path: the hard-fail arms ───────────────
+
+    use crate::api::client::{ApiClient, ApiClientOptions};
+    use crate::vendor::VendorSource;
+
+    const SERVE_PATH: &str = "/patch/npm/left-pad/1.3.0/tok/uuid/left-pad-1.3.0.tgz";
+
+    fn service_cfg(server_uri: &str, source: VendorSource) -> VendorServiceConfig {
+        VendorServiceConfig {
+            source,
+            client: Some(ApiClient::new(ApiClientOptions {
+                api_url: server_uri.to_string(),
+                api_token: Some("sktsec_placeholder_value_for_tests_api".into()),
+                use_public_proxy: false,
+                org_slug: Some("acme".into()),
+            })),
+            use_public_proxy: false,
+            vendor_url: None,
+            patch_server_url: None,
+            offline: false,
+        }
+    }
+
+    async fn mount_status_only(server: &wiremock::MockServer, status: &str) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(method("POST"))
+            .and(path("/v0/orgs/acme/patches/package"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "results": { UUID: { "status": status, "url": null, "artifacts": [] } }
+            })))
+            .mount(server)
+            .await;
+    }
+
+    async fn mount_granted(server: &wiremock::MockServer, sha512: &str, tgz: &[u8]) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let serve_url = format!("{}{SERVE_PATH}", server.uri());
+        Mock::given(method("POST"))
+            .and(path("/v0/orgs/acme/patches/package"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "results": { UUID: {
+                    "status": "granted",
+                    "url": serve_url,
+                    "artifacts": [{ "kind": "tarball", "url": serve_url,
+                                    "integrity": { "sha512": sha512 } }]
+                }}
+            })))
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(SERVE_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(tgz.to_vec()))
+            .mount(server)
+            .await;
+    }
+
+    /// `--vendor-source=service` + a terminal service miss (not built / not
+    /// found) = hard fail carrying the service reason, nothing written. (The
+    /// `auto` sibling — a quiet local-build fallback — is pinned in
+    /// npm_lock's service tests.)
+    #[tokio::test]
+    async fn service_mode_hard_fails_when_the_artifact_is_unavailable() {
+        let server = wiremock::MockServer::start().await;
+        mount_status_only(&server, "not_found").await;
+        let tmp = tempfile::tempdir().unwrap();
+        let record = record_with_uuid(UUID);
+        let cfg = service_cfg(&server.uri(), VendorSource::Service);
+        let err = expect_err(run_pipeline(tmp.path(), &record, Some(&cfg)).await);
+        let error = expect_done_failure(err, "prebuilt artifact unavailable");
+        assert!(
+            error.contains("not_found"),
+            "carries the service reason: {error}"
+        );
+        assert!(
+            !tmp.path().join(".socket/vendor").exists(),
+            "a service-mode miss writes nothing"
+        );
+    }
+
+    /// `--vendor-source=service` + a request/transport failure (HTTP 500 on
+    /// the package-reference POST) = hard fail naming the request failure.
+    #[tokio::test]
+    async fn service_mode_hard_fails_when_the_service_request_fails() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v0/orgs/acme/patches/package"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let tmp = tempfile::tempdir().unwrap();
+        let record = record_with_uuid(UUID);
+        let cfg = service_cfg(&server.uri(), VendorSource::Service);
+        let err = expect_err(run_pipeline(tmp.path(), &record, Some(&cfg)).await);
+        expect_done_failure(err, "patch service request failed");
+        assert!(
+            !tmp.path().join(".socket/vendor").exists(),
+            "a service-mode request failure writes nothing"
+        );
+    }
+
+    /// A Ready artifact that VERIFIES (its sha512 token matches the bytes)
+    /// but whose service SRI is not byte-identical to the recomputed
+    /// canonical SRI (here: a multi-hash string) fails conversion — a hard
+    /// fail in EVERY mode, because the value about to be written into the
+    /// lockfile is ambiguous and an `auto` fallback would mask the service
+    /// defect. The fixture has no node_modules, so a fallback build would
+    /// fail with a DIFFERENT error — the assertion proves it never ran.
+    #[tokio::test]
+    async fn noncanonical_service_sri_hard_fails_with_no_auto_fallback() {
+        let tgz = build_tgz(&[("index.js", PATCHED_INDEX)]).await;
+        let canonical = PackedTarball::from_bytes(&tgz).integrity;
+        let served_sri = format!("{canonical} sha256-AAAA");
+        let server = wiremock::MockServer::start().await;
+        mount_granted(&server, &served_sri, &tgz).await;
+
+        let record = record_with_uuid(UUID);
+        for source in [VendorSource::Service, VendorSource::Auto] {
+            let tmp = tempfile::tempdir().unwrap();
+            let cfg = service_cfg(&server.uri(), source);
+            let err = expect_err(run_pipeline(tmp.path(), &record, Some(&cfg)).await);
+            let error = expect_done_failure(err, "disagrees with the service integrity");
+            assert!(
+                error.contains(&canonical),
+                "names the recomputed SRI: {error}"
+            );
+            assert!(
+                !tmp.path().join(".socket/vendor").exists(),
+                "the string guard fires before any write"
+            );
+        }
+    }
+
+    // ──────────── staged_pack_from_service_bytes unit matrix ────────────
+
+    fn record_also_patching_package_json() -> PatchRecord {
+        let mut record = record_with_uuid(UUID);
+        record.files.insert(
+            "package/package.json".to_string(),
+            PatchFileInfo {
+                before_hash: "c".repeat(64),
+                after_hash: "d".repeat(64),
+            },
+        );
+        record
+    }
+
+    async fn service_bytes(
+        root: &Path,
+        record: &PatchRecord,
+        bytes: &[u8],
+        service_sri: &str,
+    ) -> Result<NpmStagedPack, Box<VendorOutcome>> {
+        let coords = guard_coordinates(LP_PURL, record).unwrap();
+        staged_pack_from_service_bytes(LP_PURL, root, &coords, record, bytes, service_sri).await
+    }
+
+    /// The recomputed-vs-service SRI guard protects the exact string written
+    /// into the lockfile, and fires BEFORE anything touches the project.
+    #[tokio::test]
+    async fn service_bytes_integrity_string_guard_fires_before_any_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let record = record_with_uuid(UUID);
+        let err = expect_err(service_bytes(tmp.path(), &record, b"tarball bytes", "sha512-AAAA").await);
+        let error = expect_done_failure(err, "disagrees with the service integrity sha512-AAAA");
+        assert!(error.contains("recomputed integrity"), "{error}");
+        assert!(
+            !tmp.path().join(".socket").exists(),
+            "the guard must reject before creating anything"
+        );
+    }
+
+    /// A tarball write failure (something squatting on the dest path) is a
+    /// `Done` failure naming the write — with a pre-existing uuid dir kept
+    /// by the unwind.
+    #[tokio::test]
+    async fn service_bytes_write_failure_reports_and_keeps_a_preexisting_uuid_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let squatter = tmp
+            .path()
+            .join(format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz"));
+        tokio::fs::create_dir_all(&squatter).await.unwrap();
+        let record = record_with_uuid(UUID);
+        let bytes = b"service tarball bytes";
+        let sri = PackedTarball::from_bytes(bytes).integrity;
+        let err = expect_err(service_bytes(tmp.path(), &record, bytes, &sri).await);
+        expect_done_failure(err, "cannot write the vendored tarball");
+        assert!(
+            squatter.exists(),
+            "a pre-existing uuid dir must survive the failed write's unwind"
+        );
+    }
+
+    /// When the patch rewrites package.json, a prebuilt artifact WITHOUT one
+    /// is a service-data defect: fail loudly and unwind the already-written
+    /// tarball (nothing inside the project may survive an `Err`).
+    #[tokio::test]
+    async fn service_bytes_missing_package_json_reports_and_unstages() {
+        let tmp = tempfile::tempdir().unwrap();
+        let record = record_also_patching_package_json();
+        let tgz = build_tgz(&[("index.js", PATCHED_INDEX)]).await;
+        let sri = PackedTarball::from_bytes(&tgz).integrity;
+        let err = expect_err(service_bytes(tmp.path(), &record, &tgz, &sri).await);
+        expect_done_failure(
+            err,
+            "the patch rewrites package.json but the prebuilt artifact has none",
+        );
+        assert!(
+            !tmp.path().join(".socket/vendor").exists(),
+            "the already-written tarball must be unwound on the Err path"
+        );
+    }
+
+    /// Same defect class, other arm: the artifact HAS a package.json but it
+    /// is not parseable JSON — the dependency-mirror recompute would be
+    /// garbage, so fail loudly and unwind.
+    #[tokio::test]
+    async fn service_bytes_unparseable_package_json_reports_and_unstages() {
+        let tmp = tempfile::tempdir().unwrap();
+        let record = record_also_patching_package_json();
+        let tgz = build_tgz(&[
+            ("index.js", PATCHED_INDEX),
+            ("package.json", b"not json".as_slice()),
+        ])
+        .await;
+        let sri = PackedTarball::from_bytes(&tgz).integrity;
+        let err = expect_err(service_bytes(tmp.path(), &record, &tgz, &sri).await);
+        expect_done_failure(err, "vendored package.json is not parseable JSON");
+        assert!(!tmp.path().join(".socket/vendor").exists());
+    }
+
+    /// Full service-bytes success: the tarball lands verbatim at the same
+    /// rel path a local build uses, the `PackedTarball` facts describe the
+    /// served bytes, and the patched package.json is extracted through the
+    /// archive map's normalized (`package/`-stripped) keys — pinning the
+    /// coupling with `read_archive_to_map`'s key format that the lookup
+    /// silently depends on.
+    #[tokio::test]
+    async fn service_bytes_success_writes_verbatim_and_extracts_the_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let record = record_also_patching_package_json();
+        let manifest: &[u8] =
+            br#"{"name":"left-pad","version":"1.3.0","dependencies":{"pad-core":"^2.0.0"}}"#;
+        let tgz = build_tgz(&[("index.js", PATCHED_INDEX), ("package.json", manifest)]).await;
+        let sri = PackedTarball::from_bytes(&tgz).integrity;
+        let staged = service_bytes(tmp.path(), &record, &tgz, &sri)
+            .await
+            .unwrap_or_else(|e| panic!("a canonical-SRI artifact must convert: {e:?}"));
+        assert_eq!(staged.name, "left-pad");
+        assert_eq!(staged.version, "1.3.0");
+        assert_eq!(
+            staged.rel_tgz,
+            format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz")
+        );
+        assert_eq!(staged.packed.integrity, sri);
+        assert_eq!(staged.packed.size, tgz.len() as u64);
+        assert_eq!(
+            staged.staged_pkg_json,
+            Some(serde_json::json!({
+                "name": "left-pad",
+                "version": "1.3.0",
+                "dependencies": { "pad-core": "^2.0.0" }
+            })),
+            "the patched manifest is extracted for the lock's dependency-mirror recompute"
+        );
+        assert_eq!(
+            tokio::fs::read(tmp.path().join(&staged.rel_tgz))
+                .await
+                .unwrap(),
+            tgz,
+            "the service bytes are written verbatim"
+        );
+    }
+
+    // ───────────────────────── small helper arms ─────────────────────────
+
+    /// A file squatting where `.socket/vendor` must be a directory makes the
+    /// dest-parent creation fail — a `Done` failure naming the parent path.
+    #[tokio::test]
+    async fn prepare_tgz_dest_reports_an_uncreatable_parent() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::create_dir_all(tmp.path().join(".socket"))
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.path().join(".socket/vendor"), b"squatter")
+            .await
+            .unwrap();
+        let record = record_with_uuid(UUID);
+        let coords = guard_coordinates(LP_PURL, &record).unwrap();
+        let err = prepare_tgz_dest(LP_PURL, tmp.path(), &coords)
+            .await
+            .unwrap_err();
+        let error = expect_done_failure(err, "cannot create");
+        let parent = tmp.path().join(format!(".socket/vendor/npm/{UUID}"));
+        assert!(
+            error.contains(&parent.display().to_string()),
+            "names the parent it could not create: {error}"
+        );
+    }
+
+    /// An empty version (`pkg:npm/x@`) can never key an artifact path —
+    /// parse returns None and `guard_coordinates` refuses fail-closed.
+    #[test]
+    fn parse_npm_purl_rejects_an_empty_version() {
+        assert_eq!(parse_npm_purl("pkg:npm/x@"), None);
+        assert_eq!(parse_npm_purl("pkg:npm/@scope/pkg@"), None);
+        expect_refusal(
+            guard_coordinates("pkg:npm/x@", &record_with_uuid(UUID)).unwrap_err(),
+            "unsafe_coordinates",
+        );
+    }
+
+    // ───────────────────── done_failure_unstage guards ─────────────────────
+
+    fn expect_done_error(outcome: VendorOutcome, want_error: &str) {
+        match outcome {
+            VendorOutcome::Done { result, entry, .. } => {
+                assert!(!result.success);
+                assert_eq!(result.error.as_deref(), Some(want_error));
+                assert!(entry.is_none());
+            }
+            other => panic!("expected Done failure, got {other:?}"),
+        }
+    }
+
+    /// Unstaging one failed artifact must never take out a SIBLING uuid dir:
+    /// the parent prune is non-recursive (`remove_dir` on a non-empty dir
+    /// fails, deliberately silently).
+    #[tokio::test]
+    async fn unstage_preserves_sibling_artifacts_and_their_parents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let rel = format!(".socket/vendor/npm/{UUID}");
+        let failed_dir = root.join(&rel);
+        let sibling = root.join(".socket/vendor/npm/00000000-0000-4000-8000-000000000000");
+        tokio::fs::create_dir_all(&failed_dir).await.unwrap();
+        tokio::fs::write(failed_dir.join("left-pad-1.3.0.tgz"), b"t")
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(&sibling).await.unwrap();
+        tokio::fs::write(sibling.join("other-1.0.0.tgz"), b"s")
+            .await
+            .unwrap();
+
+        let outcome =
+            done_failure_unstage(LP_PURL, "boom".to_string(), root, &rel, false).await;
+        expect_done_error(outcome, "boom");
+        assert!(!failed_dir.exists(), "the failed artifact dir is removed");
+        assert!(
+            sibling.join("other-1.0.0.tgz").exists(),
+            "a sibling artifact must survive"
+        );
+        assert!(root.join(".socket/vendor/npm").exists());
+        assert!(root.join(".socket/vendor").exists());
+    }
+
+    /// With no siblings the empty `npm/` and `vendor/` parents are pruned —
+    /// but never `.socket` itself (blobs, manifest, and state live there).
+    #[tokio::test]
+    async fn unstage_prunes_empty_parents_but_never_dot_socket() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let rel = format!(".socket/vendor/npm/{UUID}");
+        let dir = root.join(&rel);
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("left-pad-1.3.0.tgz"), b"t")
+            .await
+            .unwrap();
+
+        let outcome =
+            done_failure_unstage(LP_PURL, "boom".to_string(), root, &rel, false).await;
+        expect_done_error(outcome, "boom");
+        assert!(
+            !root.join(".socket/vendor").exists(),
+            "empty parents are pruned"
+        );
+        assert!(
+            root.join(".socket").exists(),
+            ".socket itself is never pruned"
+        );
+    }
+
+    /// `uuid_dir_preexisted` means the dir was there BEFORE this run: it may
+    /// be referenced by live wiring, so the unwind must not delete it (or
+    /// its contents), only report the failure.
+    #[tokio::test]
+    async fn unstage_never_deletes_a_preexisting_uuid_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let rel = format!(".socket/vendor/npm/{UUID}");
+        let dir = root.join(&rel);
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("left-pad-1.3.0.tgz"), b"live artifact")
+            .await
+            .unwrap();
+
+        let outcome = done_failure_unstage(LP_PURL, "boom".to_string(), root, &rel, true).await;
+        expect_done_error(outcome, "boom");
+        assert_eq!(
+            tokio::fs::read(dir.join("left-pad-1.3.0.tgz")).await.unwrap(),
+            b"live artifact",
+            "a pre-existing (possibly live) artifact dir survives untouched"
+        );
     }
 }

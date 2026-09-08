@@ -2362,4 +2362,134 @@ mod tests {
             Some(("concurrent-ruby".to_string(), "1.2.3".to_string()))
         );
     }
+
+    // ── audited coverage gaps (2026-09) ────────────────────────────
+
+    /// A stray FILE inside an engine dir (`vendor/bundle/ruby/README.txt`,
+    /// a `.DS_Store`, …) must be skipped by the scoped
+    /// `<root>/<engine>/<version>/gems` walk — only real `<version>/gems`
+    /// dirs count. (A file directly under the root exercises the outer
+    /// non-dir guard; this one sits one level down, inside the engine dir.)
+    #[tokio::test]
+    async fn scoped_engine_walk_skips_stray_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let ruby_dir = dir.path().join("vendor").join("bundle").join("ruby");
+        let gems = ruby_dir.join("3.2.0").join("gems");
+        tokio::fs::create_dir_all(gems.join("foo-1.0.0").join("lib"))
+            .await
+            .unwrap();
+        tokio::fs::write(ruby_dir.join("README.txt"), b"stray")
+            .await
+            .unwrap();
+
+        let paths = RubyCrawler::get_vendor_bundle_paths_with_env(dir.path(), None, None).await;
+        assert_eq!(paths, vec![gems]);
+    }
+
+    /// `scan_gem_dir` (via `crawl_all`) must skip hidden dot-directories —
+    /// even one that parses AND verifies as a gem (`.hidden-2.0.0/lib/`
+    /// would surface a ghost `pkg:gem/.hidden@2.0.0` without the guard) —
+    /// and dirs with no dash-digit name/version boundary at all.
+    #[tokio::test]
+    async fn crawl_all_skips_hidden_and_unparseable_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::create_dir_all(dir.path().join("rails-7.1.0").join("lib"))
+            .await
+            .unwrap();
+        // Parses as (".hidden", "2.0.0") and verifies (has lib/) — only
+        // the hidden-directory guard can exclude it.
+        tokio::fs::create_dir_all(dir.path().join(".hidden-2.0.0").join("lib"))
+            .await
+            .unwrap();
+        // No dash-digit boundary → parse_dir_name_version None → skipped.
+        tokio::fs::create_dir_all(dir.path().join("noversiondir").join("lib"))
+            .await
+            .unwrap();
+
+        let crawler = RubyCrawler::new();
+        let options = CrawlerOptions {
+            cwd: dir.path().to_path_buf(),
+            global: false,
+            global_prefix: Some(dir.path().to_path_buf()),
+        };
+        let packages = crawler.crawl_all(&options).await;
+        let purls: HashSet<_> = packages.iter().map(|p| p.purl.as_str()).collect();
+        assert_eq!(purls, HashSet::from(["pkg:gem/rails@7.1.0"]));
+    }
+
+    /// A lib-less dir whose entries are NOT `.gemspec` files (a partially
+    /// deleted gem: README-style files, a stale `.gemspec.bak`) must fail
+    /// verification — the `.bak` name also pins the `ends_with(".gemspec")`
+    /// check against a contains-style regression.
+    #[tokio::test]
+    async fn verify_gem_lib_less_dir_with_non_gemspec_files_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let gem_dir = dir.path().join("rails-7.1.0");
+        tokio::fs::create_dir_all(&gem_dir).await.unwrap();
+        tokio::fs::write(gem_dir.join("README.md"), b"# docs")
+            .await
+            .unwrap();
+        tokio::fs::write(gem_dir.join("rails.gemspec.bak"), b"# stale")
+            .await
+            .unwrap();
+
+        let crawler = RubyCrawler::new();
+        assert!(!crawler.verify_gem_at_path(&gem_dir).await);
+    }
+
+    /// `locate_gem_dir`'s prefix scan must skip a `<name>-<version>-*` dir
+    /// that matches the prefix but fails gem verification (a hollow
+    /// platform dir — no `lib/`, no `.gemspec`): alone it resolves
+    /// nothing, and beside a valid platform sibling the sibling wins.
+    #[tokio::test]
+    async fn locate_gem_dir_continues_past_hollow_platform_dir() {
+        // (a) ONLY the hollow platform dir: the prefix matches, verify
+        // fails, the scan exhausts and the purl stays unresolved.
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::create_dir_all(dir.path().join("nokogiri-1.16.5-x86_64-linux"))
+            .await
+            .unwrap();
+        let crawler = RubyCrawler::new();
+        let purls = vec!["pkg:gem/nokogiri@1.16.5".to_string()];
+        let result = crawler.find_by_purls(dir.path(), &purls).await.unwrap();
+        assert!(
+            result.is_empty(),
+            "hollow platform dir must not resolve: {result:?}"
+        );
+
+        // (b) The hollow dir PLUS a valid platform sibling: the valid one
+        // is returned (order-independent — only one candidate verifies).
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::create_dir_all(dir.path().join("nokogiri-1.16.5-x86_64-linux"))
+            .await
+            .unwrap();
+        let valid = dir.path().join("nokogiri-1.16.5-arm64-darwin");
+        tokio::fs::create_dir_all(valid.join("lib")).await.unwrap();
+        let result = crawler.find_by_purls(dir.path(), &purls).await.unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result.get("pkg:gem/nokogiri@1.16.5").unwrap().path, valid);
+    }
+
+    /// With a home PRESENT, only the bare-`~` form expands: `~user` (which
+    /// would need the passwd lookup bundler itself does) and plain relative
+    /// values are left untouched, and bare `~` maps to home itself.
+    #[test]
+    fn expand_tilde_untouched_forms_with_home_present() {
+        let home = Path::new(if cfg!(windows) {
+            r"C:\home\u"
+        } else {
+            "/home/u"
+        });
+        assert_eq!(
+            expand_tilde(Path::new("~user/store"), Some(home)),
+            PathBuf::from("~user/store")
+        );
+        assert_eq!(
+            expand_tilde(Path::new("rel/store"), Some(home)),
+            PathBuf::from("rel/store")
+        );
+        // Bare `~` → home itself (PathBuf equality is components-based,
+        // tolerating join("")'s trailing-separator artifact).
+        assert_eq!(expand_tilde(Path::new("~"), Some(home)), home.to_path_buf());
+    }
 }

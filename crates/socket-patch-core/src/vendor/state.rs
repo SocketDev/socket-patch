@@ -888,6 +888,71 @@ mod tests {
         assert_eq!(entry.pnpm, prev.pnpm, "absent meta inherits the prior");
     }
 
+    /// The original-fill matcher's non-(Some,Some) key arm (`(a, b) => a == b`):
+    /// line-anchored kinds like `requirements_line`/`gemfile_line` record
+    /// `key: None`, so (None, None) must MATCH — the re-vendor's missing
+    /// pre-vendor original is filled from the prior generation — while a
+    /// one-sided key, (Some, None) or (None, Some), must NOT (a keyed record
+    /// and an unkeyed one name different fragments; filling across them would
+    /// restore the wrong original on `--revert`).
+    #[test]
+    fn carry_forward_fills_original_across_none_keys() {
+        let requirements_rec =
+            |key: Option<&str>, original: Option<serde_json::Value>| WiringRecord {
+                file: "requirements.txt".into(),
+                kind: "requirements_line".into(),
+                action: WiringAction::Rewritten,
+                key: key.map(str::to_string),
+                original,
+                new: Some(serde_json::json!(format!(
+                    "left-pad @ file:.socket/vendor/pypi/{UUID}/left_pad-1.3.0.whl"
+                ))),
+            };
+
+        // (None, None): the prior entry's original fills the re-vendor's gap.
+        let mut prev = sample_entry();
+        prev.wiring = vec![requirements_rec(
+            None,
+            Some(serde_json::json!("left-pad==1.3.0")),
+        )];
+        let mut entry = sample_entry();
+        entry.wiring = vec![requirements_rec(None, None)];
+        carry_forward_wiring(&prev, &mut entry);
+        assert_eq!(
+            entry.wiring[0].original,
+            Some(serde_json::json!("left-pad==1.3.0")),
+            "(None, None) keys must match and fill the original"
+        );
+
+        // (Some, None): a keyed prior record must NOT fill an unkeyed one.
+        let mut prev = sample_entry();
+        prev.wiring = vec![requirements_rec(
+            Some("left-pad"),
+            Some(serde_json::json!("left-pad==1.3.0")),
+        )];
+        let mut entry = sample_entry();
+        entry.wiring = vec![requirements_rec(None, None)];
+        carry_forward_wiring(&prev, &mut entry);
+        assert_eq!(
+            entry.wiring[0].original, None,
+            "(Some, None) keys must not match"
+        );
+
+        // (None, Some): the symmetric refusal.
+        let mut prev = sample_entry();
+        prev.wiring = vec![requirements_rec(
+            None,
+            Some(serde_json::json!("left-pad==1.3.0")),
+        )];
+        let mut entry = sample_entry();
+        entry.wiring = vec![requirements_rec(Some("left-pad"), None)];
+        carry_forward_wiring(&prev, &mut entry);
+        assert_eq!(
+            entry.wiring[0].original, None,
+            "(None, Some) keys must not match"
+        );
+    }
+
     #[tokio::test]
     async fn missing_file_is_empty_corrupt_file_is_error() {
         let tmp = tempfile::tempdir().unwrap();

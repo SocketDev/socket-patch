@@ -74,8 +74,11 @@ pub(crate) enum StageOutcome {
 
 /// Shared offline diagnostic: patches with no usable local source while
 /// `--offline` is set (first five PURLs, then the `repair` hint).
+/// Prints even under `--silent` (errors only, NEVER nothing — an exit-1
+/// run with zero output is undiagnosable); `--json` mutes stderr and the
+/// caller's envelope is the machine channel instead.
 fn report_offline_missing(common: &GlobalArgs, purls: &[&str]) {
-    if common.silent || common.json {
+    if common.json {
         return;
     }
     eprintln!(
@@ -291,7 +294,9 @@ pub(crate) async fn stage_patch_sources(
             &missing_package_archives,
         );
         if !uncovered.is_empty() {
-            if !quiet {
+            // An error, not progress chatter: prints even under --silent
+            // (same rule as report_offline_missing above).
+            if !common.json {
                 eprintln!("Some artifacts could not be downloaded. Cannot apply patches.");
             }
             return Ok(StageOutcome::Unavailable);
@@ -423,7 +428,10 @@ pub(crate) async fn stage_vendor_sources_in_memory(
                     let mut complete = true;
                     for (file, info) in &patch.files {
                         let (Some(b64), Some(hash)) = (&info.blob_content, &info.after_hash) else {
-                            if !quiet {
+                            // An error, not progress chatter: prints even
+                            // under --silent (same rule as
+                            // report_offline_missing above).
+                            if !common.json {
                                 eprintln!("  [error] {purl}: no blob content served for {file}");
                             }
                             complete = false;
@@ -453,7 +461,12 @@ pub(crate) async fn stage_vendor_sources_in_memory(
             }
         }
         if !failed.is_empty() {
-            if !quiet {
+            // An error, not progress chatter: the vendor caller only marks
+            // the envelope (printed exclusively under --json), so muting
+            // this under --silent meant exit 1 with zero output — the
+            // CLI_CONTRACT violation ("errors only", NEVER nothing) fixed
+            // for the disk stager's arms above.
+            if !common.json {
                 eprintln!(
                     "Error: could not fetch patch content for {} patch(es):",
                     failed.len()
@@ -784,5 +797,52 @@ mod tests {
             "existing destination files are never overwritten"
         );
         assert!(!dst.join("subdir").exists(), "directories are not mirrored");
+    }
+
+    /// The hardlink-failure copy fallback — the PRIMARY mirror path when
+    /// `.socket/` and the overlay tempdir sit on different filesystems
+    /// (EXDEV; e.g. tmpfs /tmp on Linux). Same-volume tempdirs always
+    /// hardlink, so force the arm deterministically: a DANGLING symlink at
+    /// the destination makes `metadata` err (follows the link — the
+    /// existing-file skip does not fire), makes `hard_link` fail (the link
+    /// occupies the path), and lets `copy` succeed by writing THROUGH the
+    /// link into its target.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn overlay_dir_falls_back_to_copy_when_hardlink_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        std::fs::write(src.join("a"), b"from-src").unwrap();
+        // Dangling link: the target does not exist yet.
+        let resolved = tmp.path().join("resolved");
+        std::os::unix::fs::symlink(&resolved, dst.join("a")).unwrap();
+
+        overlay_dir(&src, &dst).await;
+
+        // hard_link never replaces an occupied path, so the entry must
+        // still be the symlink — the bytes can only have arrived via the
+        // copy arm.
+        assert!(
+            dst.join("a")
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the destination entry stays a symlink (hard_link cannot have run)"
+        );
+        assert_eq!(
+            std::fs::read(dst.join("a")).unwrap(),
+            b"from-src",
+            "the mirrored bytes are readable at the destination path"
+        );
+        assert_eq!(
+            std::fs::read(&resolved).unwrap(),
+            b"from-src",
+            "proof the copy arm ran: only a write-through-the-link copy \
+             creates the link target"
+        );
     }
 }

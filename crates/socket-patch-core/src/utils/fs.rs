@@ -526,6 +526,69 @@ mod tests {
         assert_eq!(tokio::fs::read(&fresh).await.unwrap(), b"x");
     }
 
+    /// The post-rename parent-directory fsync is best-effort: when the
+    /// parent can be traversed and written but not opened for read
+    /// (mode 0o333 — the stage create, the stage write, and the rename
+    /// all still work), `File::open(parent)` fails and the miss arm must
+    /// swallow that failure. An otherwise fully-committed write has to
+    /// return Ok, not surface the fsync-open error.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn atomic_write_tolerates_fsync_unreadable_parent_dir() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Root bypasses directory permission bits entirely, so the 0o333
+        // parent would still open for read and the miss arm would never run.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipping: running as root, directory perms are not enforced");
+            return;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("d");
+        tokio::fs::create_dir(&dir).await.unwrap();
+        let path = dir.join("f");
+        tokio::fs::write(&path, b"old").await.unwrap();
+
+        // write+exec only: creating the stage, writing it, and renaming it
+        // over the target all succeed, but open(dir, O_RDONLY) for the
+        // directory fsync fails with EACCES.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o333)).unwrap();
+
+        // Anti-vacuity: prove the fsync's open really is refused under
+        // 0o333 — otherwise this test would pass without ever exercising
+        // the miss arm it exists to pin.
+        assert!(
+            std::fs::File::open(&dir).is_err(),
+            "0o333 must make the parent unopenable for read on this host"
+        );
+
+        let res = atomic_write_bytes(&path, b"new").await;
+
+        // Restore before asserting (and before TempDir drop) so the
+        // read-backs and the tempdir cleanup can list the directory again.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            res.is_ok(),
+            "an fsync-inaccessible parent must not fail a committed write: {res:?}"
+        );
+        assert_eq!(
+            tokio::fs::read(&path).await.unwrap(),
+            b"new",
+            "the rename must have committed the new bytes"
+        );
+        let leftovers: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "f")
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "no stage files may leak on the success path, found: {leftovers:?}"
+        );
+    }
+
     /// Regression: a set-but-empty `HOME` (stripped CI/container/sudo
     /// environments) must be treated as unset, exactly like the documented
     /// no-home fallback. Honoring `""` made `home_dir()` return an empty
@@ -582,6 +645,12 @@ mod tests {
     /// instead: the payload must fit tokio's single 2 MiB write chunk or
     /// `write_all` returns the error directly and the swallowed-`sync_all`
     /// path this test exists to pin is never exercised.
+    ///
+    /// A second case in the same capped child then triggers that direct
+    /// `write_all` error on purpose — a 3 MiB payload exceeds the single
+    /// 2 MiB chunk, so `write_all` has to wait on the in-flight first chunk
+    /// and returns its EFBIG synchronously — pinning the `write_all`
+    /// cleanup arm (remove stage, propagate error) as well.
     #[cfg(unix)]
     #[tokio::test]
     async fn atomic_write_failed_stage_write_errors_and_keeps_target() {
@@ -649,11 +718,22 @@ mod tests {
         // buffers it and returns Ok before the background write hits EFBIG.
         let big = vec![0xABu8; 1024 * 1024];
         let res = atomic_write_bytes(&path, &big).await;
+
+        // Second case, same capped child: 3 MiB exceeds tokio's single
+        // 2 MiB write chunk, so `write_all` must wait on the in-flight
+        // first chunk and returns its EFBIG directly — exercising the
+        // `write_all` cleanup arm (remove stage, propagate error) instead
+        // of the flush arm the 1 MiB case pins above.
+        let res_write_all = atomic_write_bytes(&path, &vec![0xCDu8; 3 * 1024 * 1024]).await;
         drop(guard);
 
         assert!(
             res.is_err(),
             "a failed stage write must surface as an error"
+        );
+        assert!(
+            res_write_all.is_err(),
+            "a stage write failing inside write_all itself must surface as an error"
         );
         assert_eq!(
             tokio::fs::read(&path).await.unwrap(),

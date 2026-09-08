@@ -939,6 +939,49 @@ content-hash = "4b42a89b7ff7b26511b06acdc458dbd85312e5083db8f212b017482bc68cdd01
         );
     }
 
+    /// A write failure AFTER every guard passes (read-only project dir,
+    /// ENOSPC) maps to `pypi_poetry_write_failed` and leaves the lock
+    /// byte-untouched — the atomic writer's `.socket-stage-*` create_new in
+    /// the read-only parent fails before any rename (mirrors
+    /// pypi_requirements' wire-failure rollback test).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wire_write_failure_maps_error_and_leaves_lock_untouched() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = write_project(LOCK21_DIRECT_REGISTRY, PYPROJECT_DIRECT).await;
+        let p = load_poetry_project(tmp.path()).await.unwrap();
+
+        let mut perms = std::fs::metadata(tmp.path()).unwrap().permissions();
+        perms.set_mode(0o555);
+        std::fs::set_permissions(tmp.path(), perms).unwrap();
+
+        let res = wire_poetry(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UUID,
+        )
+        .await;
+
+        // Restore writability BEFORE asserting so read_lock and the tempdir
+        // cleanup work even when an assertion below fails.
+        let mut perms = std::fs::metadata(tmp.path()).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(tmp.path(), perms).unwrap();
+
+        let err = res.unwrap_err();
+        assert_eq!(err.0, "pypi_poetry_write_failed");
+        assert_eq!(
+            read_lock(tmp.path()).await,
+            LOCK21_DIRECT_REGISTRY,
+            "a failed write leaves the lock byte-untouched"
+        );
+    }
+
     /// A CRLF lock (git autocrlf checkout) parses fine, but the splice
     /// fragment is re-derived via `str::lines()` (which strips `\r`) and can
     /// never byte-match the file — the replacen would silently no-op while
@@ -968,6 +1011,72 @@ content-hash = "4b42a89b7ff7b26511b06acdc458dbd85312e5083db8f212b017482bc68cdd01
         .unwrap_err();
         assert_eq!(err.0, "pypi_poetry_lock_parse_failed");
         assert_eq!(read_lock(tmp.path()).await, crlf, "refusal writes nothing");
+    }
+
+    /// Valid TOML poetry itself never emits — `name="six"` with no spaces
+    /// around the `=` — parses fine, so the parsed-TOML guards pass Fresh,
+    /// but the text surgery's literal `name = ` line matcher cannot find the
+    /// unit: wire must fail closed (refuse before any write) rather than
+    /// splice a wrong span.
+    #[tokio::test]
+    async fn wire_fails_closed_when_text_surgery_cannot_find_the_parsed_unit() {
+        let lock = LOCK21_DIRECT_REGISTRY.replace("name = \"six\"", "name=\"six\"");
+        let tmp = write_project(&lock, PYPROJECT_DIRECT).await;
+        let p = load_poetry_project(tmp.path()).await.unwrap();
+        assert_eq!(
+            check_target_guards(&p, "six", "1.16.0", UUID).unwrap(),
+            PoetryTarget::Fresh,
+            "the parsed guards see the unit"
+        );
+
+        let err = wire_poetry(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UUID,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, "pypi_poetry_lock_package_missing");
+        assert_eq!(read_lock(tmp.path()).await, lock, "refusal writes nothing");
+    }
+
+    /// A target unit with no top-level `files = [` array (a hand-minimized
+    /// or degenerate lock — the guards never inspect files[], so wire is the
+    /// first to notice) must fail closed rather than guess a placement for
+    /// the rewritten array.
+    #[tokio::test]
+    async fn wire_fails_closed_on_unit_without_files_array() {
+        let lock = "[[package]]\nname = \"six\"\nversion = \"1.16.0\"\noptional = false\n\
+                    python-versions = \"*\"\ngroups = [\"main\"]\n\n[metadata]\n\
+                    lock-version = \"2.1\"\npython-versions = \">=3.9\"\ncontent-hash = \"x\"\n";
+        let tmp = write_project(lock, PYPROJECT_DIRECT).await;
+        let p = load_poetry_project(tmp.path()).await.unwrap();
+        assert_eq!(
+            check_target_guards(&p, "six", "1.16.0", UUID).unwrap(),
+            PoetryTarget::Fresh,
+            "guards do not inspect files[]"
+        );
+
+        let err = wire_poetry(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UUID,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, "pypi_poetry_lock_parse_failed");
+        assert!(err.1.contains("no files array"), "{}", err.1);
+        assert_eq!(read_lock(tmp.path()).await, lock, "refusal writes nothing");
     }
 
     #[tokio::test]
@@ -1084,6 +1193,41 @@ content-hash = "4b42a89b7ff7b26511b06acdc458dbd85312e5083db8f212b017482bc68cdd01
         assert!(err.1.contains(UUID), "names the wired uuid: {}", err.1);
     }
 
+    /// Defensive: the orchestrator short-circuits an in-sync target and
+    /// never calls wire on it — but if it ever did, wire must refuse without
+    /// writing rather than re-record our own splice as the "original" (which
+    /// would poison the revert ledger with a vendored unit posing as the
+    /// registry state).
+    #[tokio::test]
+    async fn wire_refuses_in_sync_lock_without_writing() {
+        let tmp = write_project(LOCK21_DIRECT_VENDORED, PYPROJECT_DIRECT).await;
+        let p = load_poetry_project(tmp.path()).await.unwrap();
+        assert_eq!(
+            check_target_guards(&p, "six", "1.16.0", UUID).unwrap(),
+            PoetryTarget::InSync
+        );
+
+        let err = wire_poetry(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UUID,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, "pypi_poetry_source_already_exists");
+        assert!(err.1.contains("nothing to wire"), "{}", err.1);
+        assert_eq!(
+            read_lock(tmp.path()).await,
+            LOCK21_DIRECT_VENDORED,
+            "wire must never re-record its own splice as an original"
+        );
+    }
+
     #[tokio::test]
     async fn classify_dependency_covers_every_declaration_surface() {
         let p = |pyproject: Option<&str>| PoetryProject {
@@ -1145,6 +1289,21 @@ content-hash = "4b42a89b7ff7b26511b06acdc458dbd85312e5083db8f212b017482bc68cdd01
             "transitive"
         );
         assert_eq!(classify_dependency(&p(None), "six"), "transitive");
+        // An UNPARSEABLE pyproject next to a valid lock degrades to
+        // transitive instead of refusing (the docstring's degrade-not-refuse
+        // promise — the splice is identical either way).
+        assert_eq!(
+            classify_dependency(&p(Some("not valid toml [")), "six"),
+            "transitive"
+        );
+        // A group table with no `dependencies` key declares nothing.
+        assert_eq!(
+            classify_dependency(
+                &p(Some("[tool.poetry.group.docs]\noptional = true\n")),
+                "six"
+            ),
+            "transitive"
+        );
     }
 
     /// Dry-run purity: load + classify + guards are pure reads, mirroring

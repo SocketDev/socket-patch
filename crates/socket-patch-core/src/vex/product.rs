@@ -1738,4 +1738,132 @@ mod tests {
         assert!(r.purl.is_none());
         assert!(r.warnings.is_empty());
     }
+
+    // ── Coverage: manifest read failure (metadata Ok, read Err) ───
+    // A manifest whose metadata() succeeds but whose read fails
+    // (invalid UTF-8 → read_to_string Err) hits the implicit else of
+    // the `if let Ok(content)` read inside the manifest loop. The
+    // file still counts as "present" for the multi-manifest warning,
+    // but selection must fall through to the next-priority manifest —
+    // and the warning must name the manifest ACTUALLY used.
+
+    #[tokio::test]
+    async fn manifest_read_failure_falls_through_to_next_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        // 0xC3 0x28 is invalid UTF-8: metadata succeeds, read fails.
+        tokio::fs::write(dir.path().join("package.json"), &[0xC3u8, 0x28][..])
+            .await
+            .unwrap();
+        tokio::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"alt\"\nversion = \"9.9.9\"\n",
+        )
+        .await
+        .unwrap();
+
+        let r = detect_product(dir.path()).await;
+        assert_eq!(r.purl.as_deref(), Some("pkg:cargo/alt@9.9.9"));
+        assert_eq!(r.warnings.len(), 1);
+        // The "detected (...)" list still mentions the unreadable one.
+        assert!(r.warnings[0].contains("package.json"));
+        assert!(
+            r.warnings[0].contains("using Cargo.toml"),
+            "warning should name the manifest actually used: {}",
+            r.warnings[0]
+        );
+    }
+
+    /// Same read-failure shape but with NO fallback manifest: no
+    /// product, and — since only one manifest is present — no
+    /// multi-manifest warning either.
+    #[tokio::test]
+    async fn sole_unreadable_manifest_yields_none_and_no_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(dir.path().join("package.json"), &[0xC3u8, 0x28][..])
+            .await
+            .unwrap();
+
+        let r = detect_product(dir.path()).await;
+        assert!(r.purl.is_none());
+        assert!(r.warnings.is_empty());
+    }
+
+    // ── Coverage: unclosed TOML table headers ─────────────────────
+    // A `[`-line with no closing `]` hits the `None => false` arm of
+    // the header match: it never OPENS a section, and — unlike the
+    // git scanner's fall-through — it safely CLOSES the current one.
+
+    /// `[package` (unclosed) must not open the section, so the
+    /// name/version lines below it are never attributed.
+    #[test]
+    fn scan_toml_unclosed_header_does_not_open_section() {
+        let toml = "[package\nname = \"x\"\nversion = \"1.0\"\n";
+        assert!(scan_toml_section(toml, "package").is_none());
+    }
+
+    /// An unclosed FOREIGN header must still close an open
+    /// `[package]` section — `version` below belongs to the
+    /// (malformed) `[dependencies` block, not `[package]`, so the
+    /// name-only section yields None rather than a misattributed
+    /// version.
+    #[test]
+    fn scan_toml_unclosed_foreign_header_still_closes_section() {
+        let toml = "[package]\nname = \"x\"\n[dependencies\nversion = \"9.9\"\n";
+        assert!(scan_toml_section(toml, "package").is_none());
+    }
+
+    // ── Coverage: malformed git-config header fall-through ────────
+    // A `[`-line that fails header validation — non-comment junk
+    // after the `]`, or no `]` at all — falls past the `in_section`
+    // update into the key=value parser. git rejects both shapes as
+    // `bad config line`; here they must at least never OPEN the
+    // origin section.
+
+    /// `[remote "origin"] junk` — `]` present but followed by
+    /// non-comment text — is not a valid header and must not open
+    /// the section.
+    #[test]
+    fn scan_origin_url_header_with_noncomment_junk_never_opens_section() {
+        let cfg = "[remote \"origin\"] junk\nurl = git@github.com:foo/bar.git\n";
+        assert!(scan_remote_origin_url(cfg).is_none());
+    }
+
+    /// `[remote "origin"` — no closing `]` at all — likewise never
+    /// opens the section.
+    #[test]
+    fn scan_origin_url_unclosed_header_never_opens_section() {
+        let cfg = "[remote \"origin\"\nurl = git@github.com:foo/bar.git\n";
+        assert!(scan_remote_origin_url(cfg).is_none());
+    }
+
+    // ── Coverage: backslash escapes in git config values ──────────
+    // `\` passes the next character through literally (git's `\\`
+    // and `\"` escapes; verified against `git config -f`).
+
+    #[test]
+    fn parse_git_config_value_backslash_escapes() {
+        // `\\` → a single literal backslash, matching git.
+        assert_eq!(parse_git_config_value(r"a\\b"), r"a\b");
+        // `\"` inside a quoted segment stays literal and does NOT
+        // toggle in_quotes — the `#` after it is still inside the
+        // quotes and must remain a value byte, not a comment start.
+        assert_eq!(parse_git_config_value("\"a\\\"#b\""), "a\"#b");
+        // `\#` outside quotes keeps the comment char literal.
+        assert_eq!(parse_git_config_value(r"a\#b"), "a#b");
+        // Trailing backslash (git line-continuation) is silently
+        // dropped — the line-based scanner deliberately does not
+        // support continuations; pin the current behavior.
+        assert_eq!(parse_git_config_value("abc\\"), "abc");
+    }
+
+    /// The escape arm through the public path: a url value carrying
+    /// `\\` resolves to a single backslash in the returned url.
+    #[test]
+    fn scan_origin_url_backslash_escape_in_value() {
+        let cfg = "[remote \"origin\"]\n\turl = git@github.com:foo/b\\\\ar.git\n";
+        assert_eq!(
+            scan_remote_origin_url(cfg).as_deref(),
+            Some(r"git@github.com:foo/b\ar.git")
+        );
+    }
 }

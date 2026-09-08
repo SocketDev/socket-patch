@@ -28,6 +28,16 @@ pub(super) struct GcSummary {
     /// their patch is gone from the manifest or their dependency left the
     /// lockfile graph — see `vendor::run_vendor_gc`. Sorted.
     vendored_reverted: Vec<String>,
+    /// Vendored entries the wet pass drift-kept
+    /// (`RevertOutcome::kept_artifact`): a revert was due, but the lock
+    /// entries drifted since vendoring, so artifacts, ledger entry, and
+    /// manifest records were all retained — nothing reclaimed until the
+    /// user undoes the drift and re-runs `vendor --revert`. Sorted.
+    /// Always empty in preview mode (drift is only detected by a wet
+    /// wiring replay), so the preview still lists such entries in
+    /// `vendored_reverted` — this field is what lets the apply output
+    /// explain the difference.
+    vendored_kept: Vec<String>,
     /// Orphan `.socket/vendor/<eco>/<uuid>` dirs swept (or sweepable).
     vendor_orphan_dirs: usize,
     /// `true` when `--no-prune` was set; the sub-object only carries the
@@ -48,6 +58,8 @@ impl GcSummary {
             .chain(v.unused_reverted)
             .collect();
         self.vendored_reverted.sort();
+        self.vendored_kept = v.kept;
+        self.vendored_kept.sort();
         self.vendor_orphan_dirs = v.orphan_dirs;
     }
 
@@ -62,6 +74,7 @@ impl GcSummary {
             "removedDiffArchives": self.diffs.blobs_removed,
             "removedPackageArchives": self.packages.blobs_removed,
             "revertedVendoredEntries": self.vendored_reverted,
+            "keptVendoredEntries": self.vendored_kept,
             "removedVendorOrphanDirs": self.vendor_orphan_dirs,
             "bytesFreed": self.total_bytes(),
         })
@@ -246,23 +259,39 @@ pub(super) async fn gc_json(
     }
 }
 
-/// Human-readable one-liner for the vendored-state half of a GC pass;
+/// Human-readable line(s) for the vendored-state half of a GC pass;
 /// prints nothing when that half did nothing.
 pub(super) fn print_gc_vendored_line(gc: &GcSummary) {
-    if gc.vendored_reverted.is_empty() && gc.vendor_orphan_dirs == 0 {
-        return;
+    if !gc.vendored_reverted.is_empty() || gc.vendor_orphan_dirs > 0 {
+        println!(
+            "GC: reverted {} vendored entr{}; swept {} orphan vendor dir{}.",
+            gc.vendored_reverted.len(),
+            if gc.vendored_reverted.len() == 1 {
+                "y"
+            } else {
+                "ies"
+            },
+            gc.vendor_orphan_dirs,
+            if gc.vendor_orphan_dirs == 1 { "" } else { "s" },
+        );
     }
-    println!(
-        "GC: reverted {} vendored entr{}; swept {} orphan vendor dir{}.",
-        gc.vendored_reverted.len(),
-        if gc.vendored_reverted.len() == 1 {
-            "y"
-        } else {
-            "ies"
-        },
-        gc.vendor_orphan_dirs,
-        if gc.vendor_orphan_dirs == 1 { "" } else { "s" },
-    );
+    // Drift-keeps are the one GC outcome that silently contradicts the
+    // `--dry-run` preview (which cannot see drift and lists the entry as
+    // revertable), so they always earn the same remediation hint every
+    // other drift-keep caller prints.
+    if !gc.vendored_kept.is_empty() {
+        println!(
+            "GC: kept {} drifted vendored entr{}: lock entries were re-resolved since \
+             vendoring, so their artifacts and manifest/ledger entries were retained — undo \
+             the drift and re-run `vendor --revert` to finish.",
+            gc.vendored_kept.len(),
+            if gc.vendored_kept.len() == 1 {
+                "y"
+            } else {
+                "ies"
+            },
+        );
+    }
 }
 
 /// PURL strings present in the manifest but absent from `scanned_purls`.
@@ -705,6 +734,430 @@ mod tests {
         assert!(
             !m.patches.contains_key("pkg:npm/gone@1.0.0"),
             "wet run must prune the entry"
+        );
+    }
+
+    // ---- missing/corrupt manifest fail-safe ---------------------------------
+    // An unreadable manifest must abort the GC pass, NOT be treated as an
+    // empty referenced-set: the cleanup helpers derive "still referenced"
+    // from the manifest they're handed, so proceeding with an empty one
+    // would sweep EVERY blob in `.socket/blobs` — including ones a healthy
+    // manifest (restored from git, say) still references.
+
+    /// Tempdir with a `.socket/blobs/<hash>` blob planted but NO manifest
+    /// written; returns `(manifest_path, socket_dir, blob_path)`.
+    fn seed_blob_without_manifest(
+        tmp: &std::path::Path,
+        blob_hash: &str,
+    ) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+        let socket_dir = tmp.join(".socket");
+        let blobs_dir = socket_dir.join("blobs");
+        std::fs::create_dir_all(&blobs_dir).unwrap();
+        let blob_path = blobs_dir.join(blob_hash);
+        std::fs::write(&blob_path, vec![0u8; 64]).unwrap();
+        let manifest_path = socket_dir.join("manifest.json");
+        (manifest_path, socket_dir, blob_path)
+    }
+
+    #[tokio::test]
+    async fn run_apply_gc_deletes_nothing_when_manifest_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (manifest_path, socket_dir, blob_path) =
+            seed_blob_without_manifest(tmp.path(), &"e".repeat(64));
+
+        let gc = run_apply_gc(
+            &gc_common(tmp.path()),
+            &manifest_path,
+            &socket_dir,
+            &scanned(&[]),
+            &no_vendored(),
+        )
+        .await;
+
+        assert!(
+            gc.pruned.is_empty(),
+            "nothing to prune from a missing manifest; pruned {:?}",
+            gc.pruned
+        );
+        assert_eq!(
+            gc.blobs.blobs_removed, 0,
+            "a missing manifest must NOT read as an empty referenced-set"
+        );
+        assert_eq!(gc.total_bytes(), 0, "no bytes may be freed");
+        assert!(
+            blob_path.exists(),
+            "the blob must survive a GC pass with no manifest to consult"
+        );
+        assert!(
+            !manifest_path.exists(),
+            "the aborted pass must not conjure a manifest file"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_apply_gc_deletes_nothing_when_manifest_corrupt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (manifest_path, socket_dir, blob_path) =
+            seed_blob_without_manifest(tmp.path(), &"e".repeat(64));
+        std::fs::write(&manifest_path, "{ not json").unwrap();
+
+        let gc = run_apply_gc(
+            &gc_common(tmp.path()),
+            &manifest_path,
+            &socket_dir,
+            &scanned(&[]),
+            &no_vendored(),
+        )
+        .await;
+
+        assert!(
+            gc.pruned.is_empty(),
+            "nothing to prune from a corrupt manifest; pruned {:?}",
+            gc.pruned
+        );
+        assert_eq!(
+            gc.blobs.blobs_removed, 0,
+            "a corrupt manifest must NOT read as an empty referenced-set"
+        );
+        assert_eq!(gc.total_bytes(), 0, "no bytes may be freed");
+        assert!(
+            blob_path.exists(),
+            "the blob must survive a GC pass with an unreadable manifest"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&manifest_path).unwrap(),
+            "{ not json",
+            "the aborted pass must not rewrite the corrupt manifest"
+        );
+    }
+
+    #[tokio::test]
+    async fn preview_apply_gc_reports_zero_and_mutates_nothing_when_manifest_missing_or_corrupt() {
+        // Missing manifest.
+        let tmp = tempfile::tempdir().unwrap();
+        let (manifest_path, socket_dir, blob_path) =
+            seed_blob_without_manifest(tmp.path(), &"e".repeat(64));
+        let gc = preview_apply_gc(
+            &gc_common(tmp.path()),
+            &manifest_path,
+            &socket_dir,
+            &scanned(&[]),
+            &no_vendored(),
+        )
+        .await;
+        assert!(gc.pruned.is_empty(), "pruned {:?}", gc.pruned);
+        assert_eq!(
+            gc.blobs.blobs_removed, 0,
+            "preview of a missing manifest must report zero orphans, \
+             not the whole blob store"
+        );
+        assert_eq!(gc.total_bytes(), 0);
+        assert!(blob_path.exists(), "preview must not delete the blob");
+        assert!(
+            !manifest_path.exists(),
+            "preview must not create a manifest file"
+        );
+        // The serialized degenerate preview is the normal all-zero shape,
+        // not the `skipped` one.
+        let json = gc.to_preview_json();
+        assert_eq!(json["prunableManifestEntries"], serde_json::json!([]));
+        assert_eq!(json["orphanBlobs"], serde_json::json!(0));
+        assert_eq!(json["bytesReclaimable"], serde_json::json!(0));
+
+        // Corrupt manifest, fresh tempdir.
+        let tmp = tempfile::tempdir().unwrap();
+        let (manifest_path, socket_dir, blob_path) =
+            seed_blob_without_manifest(tmp.path(), &"e".repeat(64));
+        std::fs::write(&manifest_path, "{ not json").unwrap();
+        let gc = preview_apply_gc(
+            &gc_common(tmp.path()),
+            &manifest_path,
+            &socket_dir,
+            &scanned(&[]),
+            &no_vendored(),
+        )
+        .await;
+        assert!(gc.pruned.is_empty(), "pruned {:?}", gc.pruned);
+        assert_eq!(
+            gc.blobs.blobs_removed, 0,
+            "preview of a corrupt manifest must report zero orphans"
+        );
+        assert_eq!(gc.total_bytes(), 0);
+        assert!(blob_path.exists(), "preview must not delete the blob");
+        assert_eq!(
+            std::fs::read_to_string(&manifest_path).unwrap(),
+            "{ not json",
+            "preview must not rewrite the corrupt manifest"
+        );
+    }
+
+    // ---- lockfile-unused vendored entry in the preview ----------------------
+
+    #[tokio::test]
+    async fn preview_counts_blobs_of_lockfile_unused_vendored_entry() {
+        // A vendored entry whose dependency left the lockfile graph: the wet
+        // pass reverts it AND drops its manifest entry, so its blob is freed
+        // in the same run. The preview must mirror that — drop the entry's
+        // manifest keys in memory before the orphan sweep — or `--dry-run`
+        // under-reports orphanBlobs/bytesReclaimable vs the real `--prune`.
+        // Note the vendored exemption set deliberately contains the purl:
+        // detect_prunable exempts it (gc.pruned stays empty), so ONLY the
+        // vendor-gc mirror loop can surface the blob as reclaimable.
+        const PURL: &str = "pkg:npm/gone@1.0.0";
+        const UUID: &str = "11111111-1111-4111-8111-111111111111";
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (manifest_path, socket_dir, blob_path) =
+            seed_manifest_with_blob(tmp.path(), PURL, &"d".repeat(64));
+        // A lockfile that parses but carries no `.socket/vendor/npm/<uuid>/`
+        // reference: the in-use probe answers Some(false) — unused.
+        std::fs::write(
+            tmp.path().join("package-lock.json"),
+            "{\"lockfileVersion\":3,\"packages\":{}}",
+        )
+        .unwrap();
+        // The ledger: one npm package-lock entry keyed by the manifest purl.
+        let mut state = socket_patch_core::vendor::VendorState::default();
+        state.entries.insert(
+            PURL.to_string(),
+            socket_patch_core::vendor::VendorEntry {
+                ecosystem: "npm".into(),
+                base_purl: PURL.into(),
+                uuid: UUID.into(),
+                artifact: socket_patch_core::vendor::state::VendorArtifact {
+                    path: format!(".socket/vendor/npm/{UUID}/gone-1.0.0.tgz"),
+                    sha256: String::new(),
+                    size: None,
+                    platform_locked: None,
+                    file_inventory: None,
+                },
+                wiring: Vec::new(),
+                lock: None,
+                took_over_go_patches: false,
+                detached: false,
+                record: None,
+                flavor: Some("package-lock".into()),
+                uv: None,
+                pnpm: None,
+                poetry: None,
+                pdm: None,
+                pipenv: None,
+            },
+        );
+        socket_patch_core::vendor::save_state(tmp.path(), &state)
+            .await
+            .unwrap();
+        let state_before =
+            std::fs::read(tmp.path().join(".socket/vendor/state.json")).unwrap();
+
+        let vendored: HashSet<String> = [PURL.to_string()].into_iter().collect();
+        let gc = preview_apply_gc(
+            &gc_common(tmp.path()),
+            &manifest_path,
+            &socket_dir,
+            &scanned(&[]),
+            &vendored,
+        )
+        .await;
+
+        assert_eq!(
+            gc.vendored_reverted,
+            vec![PURL.to_string()],
+            "the lockfile-unused entry must be listed as revertable"
+        );
+        assert!(
+            gc.pruned.is_empty(),
+            "the vendored exemption keeps it out of the prunable set (it is \
+             reclaimed via the vendor GC, not detect_prunable); got {:?}",
+            gc.pruned
+        );
+        assert_eq!(
+            gc.blobs.blobs_removed, 1,
+            "the preview must count the unused entry's blob as an orphan — \
+             its manifest keys are dropped in memory before the sweep, \
+             mirroring what the wet run frees"
+        );
+        assert!(
+            gc.total_bytes() > 0,
+            "bytesReclaimable must include the unused entry's blob"
+        );
+        assert_eq!(gc.vendor_orphan_dirs, 0, "no orphan uuid dirs on disk");
+        // Preview is non-mutating: blob, manifest entry, and ledger intact.
+        assert!(blob_path.exists(), "preview must not delete the blob");
+        let m = read_manifest(&manifest_path).await.unwrap().unwrap();
+        assert!(
+            m.patches.contains_key(PURL),
+            "preview must not prune the on-disk manifest entry"
+        );
+        assert_eq!(
+            std::fs::read(tmp.path().join(".socket/vendor/state.json")).unwrap(),
+            state_before,
+            "preview must not rewrite the vendor ledger"
+        );
+    }
+
+    // ---- drift-kept vendored entry in the wet pass ---------------------------
+
+    /// A vendored entry whose lock fragment DRIFTED since vendoring (fork
+    /// re-resolve): the in-use probe calls it unused, but the wet revert
+    /// refuses to touch the drifted lock and keeps artifacts, ledger entry
+    /// and manifest record. The preview cannot see drift and lists the
+    /// entry as revertable, so the wet `scan --prune` reclaims nothing —
+    /// pre-fix, with zero explanation (the kept purl was counted nowhere
+    /// and both call sites dropped the backend's vendor_artifact_kept
+    /// warning). The keep must surface as `keptVendoredEntries` in the
+    /// apply JSON.
+    #[tokio::test]
+    async fn apply_gc_reports_drift_kept_vendored_entry() {
+        use socket_patch_core::vendor::state::{WiringAction, WiringRecord};
+
+        const PURL: &str = "pkg:npm/gone@1.0.0";
+        const UUID: &str = "11111111-1111-4111-8111-111111111111";
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (manifest_path, socket_dir, blob_path) =
+            seed_manifest_with_blob(tmp.path(), PURL, &"e".repeat(64));
+        // The drifted lock: the recorded key resolves to a third-party
+        // fork — neither our vendored fragment nor the recorded
+        // pre-vendor original (and no `.socket/vendor/npm/<uuid>/`
+        // mention, so the in-use probe answers Some(false) — unused).
+        std::fs::write(
+            tmp.path().join("package-lock.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "lockfileVersion": 3,
+                "packages": {
+                    "node_modules/gone": {
+                        "version": "1.0.0",
+                        "resolved": "https://example.com/their-fork.tgz",
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        // The artifact the keep must preserve.
+        let uuid_dir = tmp.path().join(format!(".socket/vendor/npm/{UUID}"));
+        std::fs::create_dir_all(&uuid_dir).unwrap();
+        std::fs::write(uuid_dir.join("gone-1.0.0.tgz"), b"tgz").unwrap();
+        // The ledger: one wired package-lock entry, so the revert can
+        // classify the fork fragment as third-party drift.
+        let mut state = socket_patch_core::vendor::VendorState::default();
+        state.entries.insert(
+            PURL.to_string(),
+            socket_patch_core::vendor::VendorEntry {
+                ecosystem: "npm".into(),
+                base_purl: PURL.into(),
+                uuid: UUID.into(),
+                artifact: socket_patch_core::vendor::state::VendorArtifact {
+                    path: format!(".socket/vendor/npm/{UUID}/gone-1.0.0.tgz"),
+                    sha256: String::new(),
+                    size: None,
+                    platform_locked: None,
+                    file_inventory: None,
+                },
+                wiring: vec![WiringRecord {
+                    file: "package-lock.json".into(),
+                    kind: "npm_lock_entry".into(),
+                    action: WiringAction::Rewritten,
+                    key: Some("node_modules/gone".into()),
+                    original: Some(serde_json::json!({
+                        "version": "1.0.0",
+                        "resolved": "https://registry.npmjs.org/gone/-/gone-1.0.0.tgz",
+                    })),
+                    new: Some(serde_json::json!({
+                        "version": "1.0.0",
+                        "resolved":
+                            format!("file:.socket/vendor/npm/{UUID}/gone-1.0.0.tgz"),
+                    })),
+                }],
+                lock: None,
+                took_over_go_patches: false,
+                detached: false,
+                record: None,
+                flavor: Some("package-lock".into()),
+                uv: None,
+                pnpm: None,
+                poetry: None,
+                pdm: None,
+                pipenv: None,
+            },
+        );
+        socket_patch_core::vendor::save_state(tmp.path(), &state)
+            .await
+            .unwrap();
+
+        let vendored: HashSet<String> = [PURL.to_string()].into_iter().collect();
+        let gc = run_apply_gc(
+            &gc_common(tmp.path()),
+            &manifest_path,
+            &socket_dir,
+            &scanned(&[]),
+            &vendored,
+        )
+        .await;
+
+        assert!(
+            gc.vendored_reverted.is_empty(),
+            "a drift-kept entry must not be reported reverted: {:?}",
+            gc.vendored_reverted
+        );
+        assert_eq!(
+            gc.vendored_kept,
+            vec![PURL.to_string()],
+            "the keep must be counted — the only signal that the entry the \
+             preview listed as revertable was deliberately not reclaimed"
+        );
+        assert_eq!(
+            gc.to_apply_json()["keptVendoredEntries"],
+            serde_json::json!([PURL]),
+            "scan --prune --json must carry the keep"
+        );
+        // Nothing reclaimed: manifest record, blob, ledger entry, and
+        // artifacts all survive (the drift-keep contract).
+        assert_eq!(gc.blobs.blobs_removed, 0, "kept entry's blob is not swept");
+        assert!(blob_path.exists());
+        let m = read_manifest(&manifest_path).await.unwrap().unwrap();
+        assert!(
+            m.patches.contains_key(PURL),
+            "the kept entry's manifest record must survive"
+        );
+        assert!(
+            socket_patch_core::vendor::load_state(tmp.path())
+                .await
+                .unwrap()
+                .entries
+                .contains_key(PURL),
+            "the kept entry's ledger record must survive"
+        );
+        assert!(uuid_dir.exists(), "kept artifacts must survive the sweep");
+    }
+
+    /// The `keptVendoredEntries` plumbing in isolation: absorbed sorted,
+    /// serialized on the apply shape, absent from the preview shape (a
+    /// read-only preview cannot detect drift, so emitting a constant `[]`
+    /// would claim a check that never ran).
+    #[test]
+    fn gc_json_shapes_carry_drift_keeps_only_on_apply() {
+        let mut gc = GcSummary::default();
+        gc.absorb_vendor_gc(crate::commands::vendor::VendorGcSummary {
+            kept: vec!["pkg:npm/b@1.0.0".into(), "pkg:npm/a@1.0.0".into()],
+            ..Default::default()
+        });
+        assert_eq!(
+            gc.vendored_kept,
+            vec!["pkg:npm/a@1.0.0".to_string(), "pkg:npm/b@1.0.0".to_string()],
+            "absorb must sort, like every other purl list"
+        );
+        let apply = gc.to_apply_json();
+        assert_eq!(
+            apply["keptVendoredEntries"],
+            serde_json::json!(["pkg:npm/a@1.0.0", "pkg:npm/b@1.0.0"])
+        );
+        assert_eq!(apply["revertedVendoredEntries"], serde_json::json!([]));
+        let preview = gc.to_preview_json();
+        assert!(
+            preview.get("keptVendoredEntries").is_none(),
+            "preview must not claim a drift check it cannot run: {preview}"
         );
     }
 }

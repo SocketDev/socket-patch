@@ -287,10 +287,18 @@ impl ApiClient {
             let result = self
                 .post_json::<BatchSearchResponse, _>(&path, &body)
                 .await?;
-            let mut result = result.unwrap_or_else(|| BatchSearchResponse {
-                packages: Vec::new(),
-                can_access_paid_patches: false,
-            });
+            // A 404 here is a COLLECTION route miss — an unknown org slug
+            // (e.g. a typo'd --org / SOCKET_ORG_SLUG) or a server without
+            // the route. The server expresses "no patches" as 200 with
+            // empty `packages`, so substituting an empty success would
+            // mask the misconfiguration as a clean zero-patch scan.
+            let Some(mut result) = result else {
+                return Err(ApiError::Other(format!(
+                    "API request failed with status 404: POST {} not found — \
+                     check the organization slug '{}' (--org / SOCKET_ORG_SLUG)",
+                    path, slug
+                )));
+            };
             sort_batch_response(&mut result);
             return Ok(result);
         }
@@ -1742,6 +1750,197 @@ mod tests {
         );
     }
 
+    /// `fetch_blob` must reject a malformed hash *before* any network I/O:
+    /// the client points at a closed port, so a regression that bypasses the
+    /// `is_valid_sha256_hex` guard surfaces as `ApiError::Network` instead
+    /// of `InvalidHash` (mirrors `invalid_uuid_is_failed_without_network`;
+    /// `fetch_diff`'s twin guard is already covered).
+    #[tokio::test]
+    async fn fetch_blob_invalid_hash_rejected_without_network() {
+        let client = ApiClient::new(ApiClientOptions {
+            api_url: "http://127.0.0.1:1".into(),
+            api_token: None,
+            use_public_proxy: true,
+            org_slug: None,
+        });
+        let err = client.fetch_blob("not-a-hash").await.unwrap_err();
+        assert!(
+            matches!(err, ApiError::InvalidHash(_)),
+            "expected InvalidHash, got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("Invalid hash format"), "got: {msg}");
+        assert!(msg.contains("64 hex"), "got: {msg}");
+    }
+
+    /// The documented corner of `binary_url`: an *authenticated* client
+    /// (token set) that lacks an org slug cannot build `/v0/orgs/...` URLs,
+    /// so it re-derives the public-proxy base from `SOCKET_PROXY_URL` —
+    /// with `use_auth == false` so `fetch_binary` uses the plain client and
+    /// the bearer is never sent to the proxy. Serialized: SOCKET_* env is
+    /// process-global.
+    #[test]
+    #[serial_test::serial]
+    fn binary_url_rederives_proxy_from_env_when_org_slug_missing() {
+        const HASH: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        let saved_proxy = std::env::var("SOCKET_PROXY_URL").ok();
+        let saved_legacy = std::env::var("SOCKET_PATCH_PROXY_URL").ok();
+        std::env::set_var("SOCKET_PROXY_URL", "http://env-proxy.test:9999/");
+        std::env::remove_var("SOCKET_PATCH_PROXY_URL");
+
+        let client = ApiClient::new(ApiClientOptions {
+            api_url: "https://api.socket.dev".into(),
+            api_token: Some(format!("sktsec_{}_api", "x".repeat(44))),
+            use_public_proxy: false,
+            org_slug: None,
+        });
+        let (env_url, env_use_auth) = client.binary_url("blob", HASH);
+
+        // With the vars unset the base falls back to the built-in default.
+        std::env::remove_var("SOCKET_PROXY_URL");
+        let (default_url, default_use_auth) = client.binary_url("blob", HASH);
+
+        match saved_proxy {
+            Some(v) => std::env::set_var("SOCKET_PROXY_URL", v),
+            None => std::env::remove_var("SOCKET_PROXY_URL"),
+        }
+        match saved_legacy {
+            Some(v) => std::env::set_var("SOCKET_PATCH_PROXY_URL", v),
+            None => std::env::remove_var("SOCKET_PATCH_PROXY_URL"),
+        }
+
+        assert_eq!(
+            env_url,
+            format!("http://env-proxy.test:9999/patch/blob/{HASH}"),
+            "proxy base from SOCKET_PROXY_URL, trailing slash trimmed"
+        );
+        assert!(!env_use_auth, "the bearer must never target the proxy");
+        assert_eq!(
+            default_url,
+            format!(
+                "{}/patch/blob/{HASH}",
+                crate::constants::DEFAULT_PATCH_API_PROXY_URL
+            ),
+            "with no env override the base is the built-in proxy default"
+        );
+        assert!(!default_use_auth);
+    }
+
+    /// Guard that snapshots the env vars that can short-circuit org
+    /// auto-resolution, forces the "no ambient slug / offline flag /
+    /// socket-cli config" state, and restores the snapshot on drop (panic
+    /// included). Keeps the resolution tests below honest on a dev machine
+    /// with `socket login` state or ambient SOCKET_* vars.
+    struct OrgResolutionEnvGuard {
+        saved: Vec<(&'static str, Option<String>)>,
+    }
+    impl OrgResolutionEnvGuard {
+        fn isolate() -> Self {
+            let names = ["SOCKET_ORG_SLUG", "SOCKET_OFFLINE", "SOCKET_NO_CONFIG"];
+            let saved = names.iter().map(|&n| (n, std::env::var(n).ok())).collect();
+            std::env::remove_var("SOCKET_ORG_SLUG");
+            std::env::remove_var("SOCKET_OFFLINE");
+            std::env::set_var("SOCKET_NO_CONFIG", "1");
+            Self { saved }
+        }
+    }
+    impl Drop for OrgResolutionEnvGuard {
+        fn drop(&mut self) {
+            for (name, value) in self.saved.drain(..) {
+                match value {
+                    Some(v) => std::env::set_var(name, v),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+
+    /// The network half of `resolve_org_slug`: `GET /v0/organizations`
+    /// answering 404 (e.g. `--api-url` pointed at the wrong host) yields an
+    /// empty org list → `select_org_slug` errors → the warning arm leaves
+    /// the slug unset while keeping the client authenticated (never a
+    /// silent downgrade to proxy mode). The mock's `.expect(1)` proves
+    /// auto-resolution actually fired exactly once.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn org_auto_resolution_404_leaves_slug_unset_but_stays_authenticated() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _env = OrgResolutionEnvGuard::isolate();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v0/organizations"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let token = format!("sktsec_{}_api", "x".repeat(44));
+        let (client, use_public_proxy) = get_api_client_with_overrides(ApiClientEnvOverrides {
+            api_url: Some(server.uri()),
+            api_token: Some(token.clone()),
+            ..ApiClientEnvOverrides::default()
+        })
+        .await;
+
+        assert!(
+            !use_public_proxy,
+            "a token was provided → authenticated mode"
+        );
+        assert!(
+            client.org_slug().is_none(),
+            "failed auto-resolution must leave the slug unset, got {:?}",
+            client.org_slug()
+        );
+        assert_eq!(client.api_token(), Some(&token), "token must be retained");
+    }
+
+    /// A 401 on the org auto-resolution round-trip with a hash-shaped token
+    /// exercises the `Unauthorized` + `looks_like_token_hash` hint arm (the
+    /// "you configured the sha512- storage hash, not the token" UX path).
+    /// Client construction must still succeed: slug unset, token retained,
+    /// NOT downgraded to proxy mode. (The hint's stderr text is pinned by
+    /// the process-level twin in the CLI covgap suite.)
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn org_auto_resolution_401_with_hash_shaped_token_hint_arm() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _env = OrgResolutionEnvGuard::isolate();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v0/organizations"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let hash_token = "sha512-deadbeefdeadbeef".to_string();
+        let (client, use_public_proxy) = get_api_client_with_overrides(ApiClientEnvOverrides {
+            api_url: Some(server.uri()),
+            api_token: Some(hash_token.clone()),
+            ..ApiClientEnvOverrides::default()
+        })
+        .await;
+
+        assert!(
+            !use_public_proxy,
+            "a 401 during resolution must not silently downgrade to the proxy"
+        );
+        assert!(
+            client.org_slug().is_none(),
+            "unauthorized resolution must leave the slug unset, got {:?}",
+            client.org_slug()
+        );
+        assert_eq!(
+            client.api_token(),
+            Some(&hash_token),
+            "the (mis)configured token is kept — the hint is advisory"
+        );
+    }
+
     // ── Group 6: convert_search_result_to_batch_info edge cases ──────
 
     fn make_vuln(summary: &str, severity: &str, cves: Vec<&str>) -> VulnerabilityResponse {
@@ -2915,5 +3114,420 @@ mod vendor_package_tests {
             outcome,
             VendorServiceOutcome::Failed(ApiError::InvalidHash(_))
         ));
+    }
+
+    // ── fetch_registry_references (scan --redirect resolution) ────────
+
+    /// `fetch_registry_references` with no UUIDs must return an empty map
+    /// with zero I/O — the client points at a closed port, so a regression
+    /// that fires the POST surfaces as `Err(Network)`, never a vacuous pass
+    /// (this guards the offline-scan contract: crawler output can be empty).
+    #[tokio::test]
+    async fn fetch_registry_references_empty_uuids_makes_no_request() {
+        let map = proxy_client("http://127.0.0.1:1".into())
+            .fetch_registry_references(&[])
+            .await
+            .expect("empty input is a local no-op, never a network call");
+        assert!(map.is_empty());
+    }
+
+    /// Matches a request whose JSON body has NO `freeOnly` key at all.
+    /// `fetch_registry_references` omits it (`skip_serializing_if`) on
+    /// every route — unlike `request_vendor_package`, which forces
+    /// `freeOnly: true` on the proxy — so this pins the wire shape.
+    struct BodyLacksFreeOnlyKey;
+    impl Match for BodyLacksFreeOnlyKey {
+        fn matches(&self, request: &Request) -> bool {
+            serde_json::from_slice::<serde_json::Value>(&request.body)
+                .map(|v| v.get("freeOnly").is_none())
+                .unwrap_or(false)
+        }
+    }
+
+    /// The anonymous `scan --redirect` route: `fetch_registry_references`
+    /// on a public-proxy client POSTs `/patch/package` with no bearer and
+    /// no `freeOnly` key, and returns the UUID → reference map.
+    #[tokio::test]
+    async fn fetch_registry_references_proxy_route_posts_anonymously() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/patch/package"))
+            .and(NoAuthorizationHeader)
+            .and(BodyLacksFreeOnlyKey)
+            .and(body_partial_json(json!({ "uuids": [UUID] })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": { UUID: { "status": "granted", "url": null, "artifacts": [] } }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let map = proxy_client(server.uri())
+            .fetch_registry_references(&[UUID.to_string()])
+            .await
+            .expect("proxy package-reference resolution must succeed");
+        assert_eq!(map.len(), 1);
+        assert_eq!(map[UUID].status, "granted");
+    }
+
+    // ── fetch_vendor_package grant / artifact edge arms ───────────────
+
+    /// Forward-compat contract: an unrecognized vendor status must degrade
+    /// to `Unavailable` (local-build fallback under `auto`), naming the
+    /// status — never crash or hard-fail.
+    #[tokio::test]
+    async fn unknown_vendor_status_is_unavailable_naming_the_status() {
+        let server = MockServer::start().await;
+        mount_status(&server, "shipped_to_mars").await;
+        let outcome = auth_client(server.uri())
+            .fetch_vendor_package(UUID, false, None, None)
+            .await;
+        match outcome {
+            VendorServiceOutcome::Unavailable(reason) => assert!(
+                reason.contains("unknown status `shipped_to_mars`"),
+                "reason must name the unknown status, got: {reason}"
+            ),
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+    }
+
+    /// A `granted` result carrying a sha512-bearing tarball artifact but NO
+    /// download URL anywhere (artifact url null, top-level url null) is a
+    /// malformed service response → `Unavailable`, not a crash.
+    #[tokio::test]
+    async fn granted_without_any_download_url_is_unavailable() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v0/orgs/acme/patches/package"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": { UUID: {
+                    "status": "granted",
+                    "url": null,
+                    "artifacts": [{ "kind": "tarball", "url": null,
+                                    "integrity": { "sha512": "sha512-AA==" } }]
+                }}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let outcome = auth_client(server.uri())
+            .fetch_vendor_package(UUID, false, None, None)
+            .await;
+        match outcome {
+            VendorServiceOutcome::Unavailable(reason) => {
+                assert!(reason.contains("no download url"), "got: {reason}")
+            }
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+    }
+
+    /// A typo'd `--patch-server-url` must surface as `Failed` (hard error
+    /// under `service`, operator-visible under `auto`) — a distinct outcome
+    /// from `Unavailable` — and must not attempt any download.
+    #[tokio::test]
+    async fn malformed_patch_server_url_is_failed_before_any_download() {
+        let server = MockServer::start().await;
+        let baked = format!("https://patch.socket.dev{SERVE_PATH}");
+        Mock::given(method("POST"))
+            .and(path("/v0/orgs/acme/patches/package"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(granted_body(&baked, "sha512-AA==")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        // No GET mock mounted: the rewrite fails before step 2.
+        let outcome = auth_client(server.uri())
+            .fetch_vendor_package(UUID, false, None, Some("not a url"))
+            .await;
+        match outcome {
+            VendorServiceOutcome::Failed(ApiError::Other(msg)) => {
+                assert!(msg.contains("malformed --patch-server-url"), "got: {msg}")
+            }
+            other => panic!("expected Failed(Other), got {other:?}"),
+        }
+        let reqs = server
+            .received_requests()
+            .await
+            .expect("wiremock must record received requests");
+        assert_eq!(
+            reqs.len(),
+            1,
+            "the failed rewrite must not attempt the download GET"
+        );
+    }
+
+    /// A 200 whose results map lacks the requested UUID (server answered
+    /// for a different uuid / empty map) is a service-contract violation →
+    /// `Failed(Other)` naming the missing uuid.
+    #[tokio::test]
+    async fn missing_uuid_in_package_response_is_failed() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v0/orgs/acme/patches/package"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "results": {} })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let outcome = auth_client(server.uri())
+            .fetch_vendor_package(UUID, false, None, None)
+            .await;
+        match outcome {
+            VendorServiceOutcome::Failed(ApiError::Other(msg)) => assert!(
+                msg.contains(&format!("package response missing a result for {UUID}")),
+                "got: {msg}"
+            ),
+            other => panic!("expected Failed(Other), got {other:?}"),
+        }
+    }
+
+    /// A 401 on the grant POST classifies as `Unauthorized` — the variant
+    /// `is_fallback_candidate` keys on — so the hosted-get auth→proxy
+    /// fallback stays wired for the vendor flow.
+    #[tokio::test]
+    async fn grant_401_is_failed_unauthorized_and_fallback_candidate() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v0/orgs/acme/patches/package"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let outcome = auth_client(server.uri())
+            .fetch_vendor_package(UUID, false, None, None)
+            .await;
+        match outcome {
+            VendorServiceOutcome::Failed(err) => {
+                assert!(matches!(err, ApiError::Unauthorized(_)), "got {err:?}");
+                assert!(
+                    is_fallback_candidate(&err),
+                    "grant 401 must remain an auth→proxy fallback candidate"
+                );
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    /// Secondary (non-tarball) artifact edge arms: an entry missing its
+    /// sha512 is skipped, one whose URL can't be host-rewritten is skipped
+    /// (Err → continue), and the survivor gets its host rewritten at
+    /// `--patch-server-url` with its bare sha512 normalized to SRI form —
+    /// the fields the gem stub-gemspec flow depends on.
+    #[tokio::test]
+    async fn secondary_artifacts_skip_unusable_and_rewrite_host() {
+        let server = MockServer::start().await;
+        let baked_tarball = format!("https://patch.socket.dev{SERVE_PATH}");
+        Mock::given(method("POST"))
+            .and(path("/v0/orgs/acme/patches/package"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": { UUID: {
+                    "status": "granted",
+                    "url": null,
+                    "artifacts": [
+                        { "kind": "tarball", "url": baked_tarball,
+                          "integrity": { "sha512": "sha512-AA==" } },
+                        // Survivor: host rewritten + bare sha512 → SRI.
+                        { "kind": "gem-stub-gemspec",
+                          "url": "https://patch.socket.dev/patch/gem/x/stub.gemspec",
+                          "integrity": { "sha512": "BARE==" } },
+                        // No sha512 → skipped.
+                        { "kind": "gem-stub-gemspec",
+                          "url": "https://patch.socket.dev/x2",
+                          "integrity": { "sha1": "aa" } },
+                        // Unrewritable URL → skipped (Err → continue).
+                        { "kind": "gem-stub-gemspec", "url": "::not-a-url",
+                          "integrity": { "sha512": "CC==" } }
+                    ]
+                }}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(SERVE_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(TARBALL.to_vec()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let outcome = auth_client(server.uri())
+            .fetch_vendor_package(UUID, false, None, Some(&server.uri()))
+            .await;
+        match outcome {
+            VendorServiceOutcome::Ready(pkg) => {
+                assert_eq!(
+                    pkg.secondary_artifacts.len(),
+                    1,
+                    "exactly the sha512-bearing rewritable secondary survives: {:?}",
+                    pkg.secondary_artifacts
+                );
+                let s = &pkg.secondary_artifacts[0];
+                assert_eq!(s.kind, "gem-stub-gemspec");
+                assert!(
+                    s.url.starts_with(&server.uri()),
+                    "secondary host must be rewritten at --patch-server-url: {}",
+                    s.url
+                );
+                assert!(
+                    s.url.ends_with("/patch/gem/x/stub.gemspec"),
+                    "secondary path preserved: {}",
+                    s.url
+                );
+                assert_eq!(s.integrity_sri, "sha512-BARE==", "bare sha512 → SRI");
+            }
+            other => panic!("expected Ready, got {other:?}"),
+        }
+    }
+
+    // ── download_artifact (promised-secondary fetch) arm mapping ──────
+
+    /// The SSRF/file-scheme guard: `download_artifact` refuses a
+    /// non-http(s) URL outright with zero I/O (closed-port client), and the
+    /// refusal flows through the `Failed` passthrough arm.
+    #[tokio::test]
+    async fn download_artifact_refuses_non_http_url_without_io() {
+        let err = auth_client("http://127.0.0.1:1".into())
+            .download_artifact("file:///etc/passwd")
+            .await
+            .expect_err("file: URLs must be refused");
+        match err {
+            ApiError::Other(msg) => {
+                assert!(
+                    msg.contains("refusing non-http(s) artifact URL"),
+                    "got: {msg}"
+                );
+                assert!(
+                    msg.contains("file:///etc/passwd"),
+                    "must name the refused URL: {msg}"
+                );
+            }
+            other => panic!("expected Other, got {other:?}"),
+        }
+    }
+
+    /// A promised secondary that 404s must ERROR ("artifact not found"),
+    /// and a still-building 408 maps to "artifact still building" — the
+    /// arms encoding the no-soft-skip policy for promised artifacts.
+    #[tokio::test]
+    async fn download_artifact_maps_not_found_and_pending_to_errors() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/gone"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/building"))
+            .respond_with(ResponseTemplate::new(408))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = auth_client(server.uri());
+
+        let gone = client
+            .download_artifact(&format!("{}/gone", server.uri()))
+            .await
+            .expect_err("a promised artifact that 404s must error, not soft-skip");
+        assert!(
+            matches!(&gone, ApiError::Other(m) if m.contains("artifact not found")),
+            "got: {gone:?}"
+        );
+
+        let building = client
+            .download_artifact(&format!("{}/building", server.uri()))
+            .await
+            .expect_err("a still-building artifact must error");
+        assert!(
+            matches!(&building, ApiError::Other(m) if m.contains("artifact still building")),
+            "got: {building:?}"
+        );
+    }
+
+    /// A transport failure on the serve GET maps to `ApiError::Network`
+    /// (closed-port idiom — any success or hang here is the regression).
+    #[tokio::test]
+    async fn download_artifact_network_error_maps_to_network() {
+        let err = auth_client("http://127.0.0.1:1".into())
+            .download_artifact("http://127.0.0.1:1/x")
+            .await
+            .expect_err("closed port must be a network error");
+        assert!(
+            matches!(&err, ApiError::Network(m) if m.contains("Network error fetching vendor package")),
+            "got: {err:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod authenticated_batch_tests {
+    use super::*;
+    use serde_json::json;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn auth_client(uri: String, slug: &str) -> ApiClient {
+        ApiClient::new(ApiClientOptions {
+            api_url: uri,
+            api_token: Some("sktsec_token_placeholder_value_api".into()),
+            use_public_proxy: false,
+            org_slug: Some(slug.into()),
+        })
+    }
+
+    /// A 404 from the authenticated batch COLLECTION route means the org
+    /// slug is wrong (or the deployment lacks the route) — the server
+    /// expresses "no patches" as 200 with empty `packages` — so it must
+    /// surface as an error. Substituting an empty success would mask a
+    /// typo'd `--org` / SOCKET_ORG_SLUG as a clean zero-patch scan.
+    #[tokio::test]
+    async fn authenticated_batch_404_is_an_error_not_empty_success() {
+        let server = MockServer::start().await;
+        // .expect(1): exactly one POST, no retry / per-package fallback.
+        Mock::given(method("POST"))
+            .and(path("/v0/orgs/typo-slug/patches/batch"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let err = auth_client(server.uri(), "typo-slug")
+            .search_patches_batch(None, &["pkg:npm/lodash@4.17.21".to_string()])
+            .await
+            .expect_err("a 404 on the authenticated batch route must not become an empty success");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("404") && msg.contains("typo-slug"),
+            "error must name the status and the org slug: {msg}"
+        );
+        // A wrong org slug must surface, not silently downgrade the scan
+        // to the public proxy's free-only patches.
+        assert!(
+            !is_fallback_candidate(&err),
+            "batch 404 must not trigger the auth→proxy fallback: {msg}"
+        );
+    }
+
+    /// Guard: the legitimate "no patches" shape (200 + empty packages)
+    /// stays a success — only the 404 route-miss is an error.
+    #[tokio::test]
+    async fn authenticated_batch_200_empty_packages_is_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v0/orgs/acme/patches/batch"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "packages": [],
+                "canAccessPaidPatches": true
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let result = auth_client(server.uri(), "acme")
+            .search_patches_batch(None, &["pkg:npm/lodash@4.17.21".to_string()])
+            .await
+            .expect("200 with empty packages is the legitimate no-patches shape");
+        assert!(result.packages.is_empty());
+        assert!(result.can_access_paid_patches);
     }
 }

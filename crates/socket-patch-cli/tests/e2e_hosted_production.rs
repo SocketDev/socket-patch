@@ -35,7 +35,7 @@
 //! |-----------|------|------------|----------|
 //! | npm    | `pkg:npm/minimist@1.2.2`        | `80630680-4da6-45f9-bba8-b888e0ffd58c` | GHSA-xvch-5gv4-984h (CVE-2021-44906) |
 //! | PyPI   | `pkg:pypi/urllib3@1.26.18`      | *any of three* (see [`PYPI_UUIDS`])    | GHSA-gm62-xv2j-4w53 &co |
-//! | gem    | `pkg:gem/activestorage@6.0.3`   | *any of* [`GEM_UUIDS`] (five today)    | GHSA-m42x-37p3-fv5w (CVE-2020-8162), GHSA-w749-p3v6-hccq (CVE-2022-21831), GHSA-9xrj-h377-fr87 (CVE-2026-33195), GHSA-r4mg-4433-c7g3 (CVE-2025-24293), GHSA-xr9x-r78c-5hrm (CVE-2026-66066) |
+//! | gem    | `pkg:gem/activestorage@6.0.3`   | *any of* [`GEM_UUIDS`] (six today; the sixth merges three advisories) | GHSA-m42x-37p3-fv5w (CVE-2020-8162), GHSA-w749-p3v6-hccq (CVE-2022-21831), GHSA-9xrj-h377-fr87 (CVE-2026-33195), GHSA-r4mg-4433-c7g3 (CVE-2025-24293), GHSA-xr9x-r78c-5hrm (CVE-2026-66066) |
 //!
 //! `docs/testing/hosted-production-e2e.md` explains how these were chosen and
 //! how to re-pick one if it is ever withdrawn.
@@ -165,6 +165,17 @@ const GEM_UUIDS: &[&str] = &[
     // Community Patch header and git-blob-sha256-match their manifest
     // afterHash entries.
     "9c2b4925-b413-4a3a-bb3a-9990440fb446",
+    // MERGED patch — the first one production has published for any pinned
+    // purl: GHSA-w749-p3v6-hccq / CVE-2022-21831 + GHSA-r4mg-4433-c7g3 /
+    // CVE-2025-24293 + GHSA-xr9x-r78c-5hrm / CVE-2026-66066 in one artifact
+    // (image_processing_transformer.rb allowlist + unsupported-method guard,
+    // engine.rb + active_storage.rb config plumbing, NEW vips.rb libvips
+    // backport). Published 2026-09-04T21:23Z; the server-ranked selection
+    // (merge rung) now wires this one. Served .gem live-verified 2026-09-08:
+    // sha256 matches the registry /info checksum, all four touched files
+    // carry the Socket Community Patch header naming this UUID, metadata and
+    // every other file are byte-identical to stock rubygems 6.0.3.
+    "01019627-b481-4bae-bc09-e93b5a5e4481",
 ];
 
 /// Header the patch service injects into patched npm / PyPI source files.
@@ -778,9 +789,10 @@ async fn preflight_required_patches_are_published() {
 /// anywhere.
 ///
 /// This asserts only that the signal EXISTS (every patch names >= 1
-/// advisory), never how many. Production publishes no merged patches today —
-/// all patches sampled cover exactly one advisory — and the day that changes
-/// is not a regression, so a count of >= 2 must not fail this test.
+/// advisory), never how many. Production published its first merged patch on
+/// 2026-09-04 (the activestorage 6.0.3 artifact covering three advisories,
+/// see [`GEM_UUIDS`]); a count of >= 2 is expected, not a regression, and
+/// must never fail this test.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "live production API: contacts patches-api.socket.dev. Run with --ignored."]
 async fn canary_patches_name_advisories_so_merge_state_is_inferable() {

@@ -324,6 +324,79 @@ mod tests {
         );
     }
 
+    /// The fail-closed refusals bun never emits (empty tuple, empty element,
+    /// a line whose only quote is the opener) plus the escape-aware paths of
+    /// the scanners: an escaped quote in the KEY, a backslash escape inside
+    /// an ELEMENT string (verbatim round-trip), and decode_json_string's
+    /// None arm — load-bearing for the callers that classify tuple shapes by
+    /// `decode_json_string(&elems[1]).is_some()` where elems[1] is a `{...}`
+    /// deps object.
+    #[test]
+    fn grammar_edge_cases_fail_closed_and_escapes_parse() {
+        // BunEntry has no Debug impl (deliberately — never touched here), so
+        // extract the error side without `unwrap_err`.
+        let err_of = |line: &str| parse_entry_line(line).err().expect("expected an error");
+
+        // Empty tuple: bun never emits `[]` — the guard must refuse it.
+        assert_eq!(err_of(r#"    "k": [],"#), "empty tuple");
+
+        // Empty tuple elements from a hand-mangled lock (double / leading
+        // comma) fail closed rather than parse as fewer elements.
+        assert_eq!(err_of(r#"    "k": ["a", , "b"],"#), "empty tuple element");
+        assert_eq!(err_of(r#"    "k": [, "a"]"#), "empty tuple element");
+
+        // A truncated line whose only quote is the opening one: the string
+        // scanner itself must report the unterminated STRING (the existing
+        // `["a", ` fixture only ever hits the unterminated-ARRAY arm).
+        assert_eq!(err_of("    \"key"), "unterminated string");
+        // A lone backslash at end-of-line: the escape skip steps past the
+        // end and must fall through to the same error, not panic.
+        assert_eq!(err_of("    \"k\\"), "unterminated string");
+
+        // Escaped quote in the key: decoded key vs verbatim key_raw.
+        let e = parse_entry_line(r#"    "k\"x": ["a@1.0.0", "", {}, "sha512-Y=="],"#).unwrap();
+        assert_eq!(e.key, "k\"x", "key decodes the escape");
+        assert_eq!(e.key_raw, r#""k\"x""#, "key_raw keeps the escape verbatim");
+        assert_eq!(e.elems.len(), 4);
+
+        // Backslash escape inside an ELEMENT string round-trips verbatim
+        // (elements are re-emitted, never decoded).
+        let e = parse_entry_line(r#"    "k": ["a\\b@1.0.0", "", {}, "sha512-Y=="]"#).unwrap();
+        assert_eq!(e.elems[0], r#""a\\b@1.0.0""#);
+
+        // decode_json_string: None for any non-string token — the negative
+        // side of the registry-4-tuple classifiers — Some for a real string.
+        assert_eq!(decode_json_string("{}"), None);
+        assert_eq!(decode_json_string("123"), None);
+        assert_eq!(decode_json_string(""), None);
+        assert_eq!(decode_json_string(r#""a\"b""#), Some("a\"b".to_string()));
+
+        // A stray closer at top level inside a tuple interior is unbalanced.
+        assert_eq!(
+            split_top_level(r#""a"]"#).unwrap_err(),
+            "unbalanced brackets"
+        );
+    }
+
+    /// A nested ARRAY element (commas and all) must survive the top-level
+    /// split as ONE verbatim element — the fixtures only ever nest objects.
+    #[test]
+    fn nested_array_element_splits_at_top_level() {
+        let e = parse_entry_line(r#"    "k": ["a@1.0.0", ["x", "y"], "z"],"#).unwrap();
+        assert_eq!(
+            e.elems,
+            vec![r#""a@1.0.0""#, r#"["x", "y"]"#, r#""z""#],
+            "the nested array's comma must not split it"
+        );
+        assert!(e.trailing_comma);
+
+        // A comma inside a string inside the nested array doesn't split
+        // either level.
+        let e = parse_entry_line(r#"    "k": [["a,b"], "c"]"#).unwrap();
+        assert_eq!(e.elems, vec![r#"["a,b"]"#, r#""c""#]);
+        assert!(!e.trailing_comma);
+    }
+
     fn to_lines(text: &str) -> Vec<String> {
         text.split('\n').map(str::to_string).collect()
     }

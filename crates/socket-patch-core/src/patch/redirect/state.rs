@@ -805,6 +805,87 @@ mod tests {
         assert_eq!(state.edits.len(), 1);
     }
 
+    /// A purl that cannot name one exact package instance — versionless
+    /// (`pkg:npm/left-pad`) or empty-named (`pkg:npm/@1.0.0`, whose only `@`
+    /// is at index 0) — is refused outright: nothing is dropped and `false`
+    /// is reported. Fail closed — without a `(name, version)` pair the
+    /// matcher could only claim by name, the exact over-deletion the
+    /// artifact-anchored rewrite removed.
+    #[test]
+    fn drop_superseded_purl_unversioned_purl_drops_nothing() {
+        for bogus in ["pkg:npm/left-pad", "pkg:npm/@1.0.0"] {
+            let mut state = RedirectState::new();
+            state
+                .records
+                .insert("pkg:npm/left-pad@1.3.0".to_string(), sample_record());
+            state.edits = vec![edit(
+                "pnpm-lock.yaml",
+                "redirect_pnpm_resolution",
+                Some("left-pad@1.3.0"),
+            )];
+            assert!(
+                !drop_superseded_purl(&mut state, bogus),
+                "{bogus} names no exact instance and must report false"
+            );
+            assert_eq!(
+                state.records.len(),
+                1,
+                "{bogus} must drop no record (fail closed)"
+            );
+            assert_eq!(
+                state.edits.len(),
+                1,
+                "{bogus} must drop no edit (fail closed)"
+            );
+        }
+    }
+
+    /// An edit with NO key is not attributable to any package, so the retain
+    /// pass keeps it BEFORE consulting the artifact anchor — even when its
+    /// rewritten content happens to reference the dropped purl's own hosted
+    /// artifact. The documented fail-closed contract: a keyless edit may be
+    /// some other surface's only revert data, and keeping a stale edit is
+    /// recoverable where destroying revert originals is not.
+    #[test]
+    fn drop_superseded_purl_keeps_keyless_edits_even_when_anchored() {
+        let keyless = FileEdit {
+            path: "package-lock.json".to_string(),
+            kind: "redirect_npm_lock_entry".to_string(),
+            action: "rewritten".to_string(),
+            key: None,
+            original: Some(serde_json::json!("orig")),
+            new: Some(serde_json::json!({
+                "resolved": hosted_url("left-pad", "1.3.0", SAMPLE_UUID),
+                "integrity": "sha512-P=="
+            })),
+        };
+        let mut state = RedirectState::new();
+        state
+            .records
+            .insert("pkg:npm/left-pad@1.3.0".to_string(), sample_record());
+        state.edits = vec![
+            keyless.clone(),
+            edit(
+                "pnpm-lock.yaml",
+                "redirect_pnpm_resolution",
+                Some("left-pad@1.3.0"),
+            ),
+        ];
+
+        assert!(drop_superseded_purl(&mut state, "pkg:npm/left-pad@1.3.0"));
+
+        assert!(
+            state.records.is_empty(),
+            "the superseded record must still be dropped"
+        );
+        assert_eq!(
+            state.edits,
+            vec![keyless],
+            "the keyless edit must survive verbatim even though its rewritten \
+             content carries the dropped purl's artifact uuid"
+        );
+    }
+
     #[tokio::test]
     async fn load_missing_ledger_is_none() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1067,5 +1148,71 @@ mod tests {
                 "stage litter left behind: {name}"
             );
         }
+    }
+
+    /// Persisting an EMPTY state into a project with no ledger must succeed
+    /// as a pure no-op: the delete-instead-of-write path tolerates NotFound
+    /// (a fresh project has nothing to delete) and must not scaffold
+    /// `.socket/` or leave a residual empty ledger behind.
+    #[tokio::test]
+    async fn persist_empty_state_with_no_ledger_is_a_no_op() {
+        let tmp = tempfile::tempdir().unwrap();
+        persist_redirect_state(tmp.path(), &RedirectState::new())
+            .await
+            .unwrap();
+        assert!(
+            !tmp.path().join(REDIRECT_STATE_REL).exists(),
+            "no ledger may be created by an empty persist"
+        );
+        assert!(
+            !tmp.path().join(".socket").exists(),
+            "an empty persist must not scaffold .socket/"
+        );
+    }
+
+    /// A FAILED delete of the emptied ledger (anything but NotFound) must
+    /// propagate, never report success: callers treat `Ok` as "the ledger no
+    /// longer asserts anything", and a swallowed error would leave a live
+    /// ledger feeding VEX and takeover detection stale state.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn persist_empty_state_propagates_non_notfound_delete_errors() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".socket/vendor");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let ledger = dir.join("redirect-state.json");
+        let mut nonempty = RedirectState::new();
+        nonempty
+            .records
+            .insert("pkg:npm/left-pad@1.3.0".to_string(), sample_record());
+        tokio::fs::write(&ledger, serde_json::to_string_pretty(&nonempty).unwrap())
+            .await
+            .unwrap();
+        // A read-only parent dir makes the unlink fail with EACCES.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        // Root ignores mode bits; skip there (CI containers sometimes run as root).
+        if std::fs::File::create(dir.join("probe")).is_ok() {
+            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755));
+            let _ = std::fs::remove_file(dir.join("probe"));
+            eprintln!("skipping: running as root, 0555 does not block writes");
+            return;
+        }
+
+        let err = persist_redirect_state(tmp.path(), &RedirectState::new())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "the delete failure must propagate verbatim: {err}"
+        );
+
+        // Restore so the tempdir can clean up, then confirm nothing was lost.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            ledger.exists(),
+            "a failed delete must leave the ledger in place"
+        );
     }
 }

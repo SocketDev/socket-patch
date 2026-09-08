@@ -897,14 +897,29 @@ async fn scan_vendor_resolves_percent_encoded_scoped_purl() {
 // ───────────────────── prune reconciles vendored state ─────────────────────
 
 /// After a dependency is removed and re-locked, `scan --prune` (without
-/// `--vendor`) reverts the now-unused vendored entry: lock restored, ledger
-/// entry + manifest entry dropped, artifact dir removed.
+/// `--vendor`) honors the drift-keep contract, then completes the reclaim
+/// once the drift is undone:
+///
+/// 1. The wired lock entry VANISHED (an uninstall is one drift flavor —
+///    the live lock no longer matches anything the wiring recorded), so
+///    the backend revert keeps the artifacts (`RevertOutcome::
+///    kept_artifact`, residual #131) and the GC must keep the ledger and
+///    manifest entries too — pre-fix it pruned the ledger, dropped the
+///    manifest records, reported the purl in `revertedVendoredEntries`,
+///    and the orphan sweep then destroyed the kept artifacts (with the
+///    recorded pre-vendor originals, the state a later `git checkout` of
+///    the vendored lock still points at).
+/// 2. Undoing the drift (restoring the pre-vendor registry lock — the
+///    keep warning's documented remediation) converges every recorded
+///    fragment, and the same prune then reverts fully: ledger entry +
+///    manifest entry dropped, artifact dir removed, lock untouched.
 #[tokio::test]
 async fn scan_prune_reverts_unused_vendored_entry() {
     let mock = MockServer::start().await;
     mount_patch_api(&mock, UUID).await;
     let tmp = tempfile::tempdir().unwrap();
     write_fixture(tmp.path());
+    let original_lock = std::fs::read(tmp.path().join("package-lock.json")).unwrap();
 
     // A second installed package so the later prune run's crawl is
     // non-empty (left-pad itself gets removed below).
@@ -937,27 +952,72 @@ async fn scan_prune_reverts_unused_vendored_entry() {
     std::fs::remove_dir_all(tmp.path().join("node_modules/left-pad")).unwrap();
 
     // Plain prune scan (read-only discovery + GC; no --vendor, no --apply).
-    let out = Command::new(binary())
-        .args([
-            "scan",
-            "--json",
-            "--prune",
-            "--yes",
-            "--api-url",
-            &mock.uri(),
-            "--api-token",
-            "fake-token",
-            "--org",
-            ORG_SLUG,
-        ])
-        .current_dir(tmp.path())
-        .output()
-        .expect("run");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let code = out.status.code().unwrap_or(-1);
-    assert_eq!(code, 0, "stdout={stdout}");
-    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    let run_prune = || {
+        let out = Command::new(binary())
+            .args([
+                "scan",
+                "--json",
+                "--prune",
+                "--yes",
+                "--api-url",
+                &mock.uri(),
+                "--api-token",
+                "fake-token",
+                "--org",
+                ORG_SLUG,
+            ])
+            .current_dir(tmp.path())
+            .output()
+            .expect("run");
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let code = out.status.code().unwrap_or(-1);
+        assert_eq!(code, 0, "stdout={stdout}");
+        serde_json::from_str::<serde_json::Value>(stdout.trim()).expect("valid JSON")
+    };
 
+    // 1. Drifted (vanished) lock entry: everything is KEPT — nothing may
+    //    be reported reverted, and the artifacts must survive the sweep.
+    let v = run_prune();
+    assert_eq!(
+        v["gc"]["revertedVendoredEntries"],
+        serde_json::json!([]),
+        "a drift-kept entry must not be reported reverted: {v}"
+    );
+    let state: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(tmp.path().join(".socket/vendor/state.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        state["entries"][PURL].is_object(),
+        "ledger entry must be kept: {state}"
+    );
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(tmp.path().join(".socket/manifest.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        manifest["patches"]
+            .as_object()
+            .is_some_and(|m| m.contains_key(PURL)),
+        "manifest entry must be kept: {manifest}"
+    );
+    assert!(
+        tmp.path()
+            .join(format!(".socket/vendor/npm/{UUID}"))
+            .exists(),
+        "kept artifacts must survive the orphan sweep"
+    );
+    // The (already left-pad-free) lock stays exactly as the user re-locked
+    // it — the keep never edits a lock it refused to own.
+    assert_eq!(
+        std::fs::read(tmp.path().join("package-lock.json")).unwrap(),
+        lock_bytes
+    );
+
+    // 2. Undo the drift: restore the pre-vendor registry lock, so every
+    //    recorded fragment is converged. The same prune now reclaims fully.
+    std::fs::write(tmp.path().join("package-lock.json"), &original_lock).unwrap();
+    let v = run_prune();
     assert_eq!(
         v["gc"]["revertedVendoredEntries"],
         serde_json::json!([PURL]),
@@ -993,11 +1053,11 @@ async fn scan_prune_reverts_unused_vendored_entry() {
             .exists(),
         "artifact dir removed"
     );
-    // The (already left-pad-free) lock stays exactly as the user re-locked
-    // it — the revert had nothing to restore there.
+    // The converged revert restores nothing (the lock already equals every
+    // recorded original), so the restored lock survives byte-for-byte.
     assert_eq!(
         std::fs::read(tmp.path().join("package-lock.json")).unwrap(),
-        lock_bytes
+        original_lock
     );
 }
 

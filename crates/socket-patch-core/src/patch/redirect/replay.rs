@@ -281,8 +281,12 @@ fn remove_fragment_once(content: &str, fragment: &str) -> String {
     } else {
         pos
     };
-    // The removed line's own newline goes with it.
-    if content[end..].starts_with('\n') {
+    // The removed line's own newline goes with it — but only when the
+    // whole line is removed: a fragment spliced out from behind a
+    // non-whitespace prefix (the user commented the line out) leaves the
+    // prefix as its own line, and eating the newline would join that
+    // prefix onto the FOLLOWING line, commenting it out too.
+    if start == line_start && content[end..].starts_with('\n') {
         end += 1;
     }
     if end >= content.len() {
@@ -569,6 +573,18 @@ pub async fn revert_remaining_redirect_edits(
                         // only the line the redirect owns, and say so.
                         (_, Some(c)) => {
                             if c.contains(PNPM_TRUST_LINE) {
+                                if c.matches(PNPM_TRUST_LINE).count() > 1 {
+                                    refuse(
+                                        format!(
+                                            "{}: the `{PNPM_TRUST_LINE}` line appears more \
+                                             than once — ambiguous, refusing to guess",
+                                            edit.path
+                                        ),
+                                        &mut outcome,
+                                    );
+                                    refused_groups.insert(group);
+                                    continue 'group;
+                                }
                                 staged.insert(
                                     edit.path.clone(),
                                     Some(remove_fragment_once(&c, PNPM_TRUST_LINE)),
@@ -993,6 +1009,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn commented_out_added_fragment_removal_keeps_the_following_line() {
+        // The user disabled the redirect by commenting the directive out.
+        // Mid-line removal must not eat the line's newline — doing so
+        // joins the surviving comment prefix onto the NEXT line and
+        // comments out the `require` directive.
+        let dir = TempDir::new().unwrap();
+        write(
+            dir.path(),
+            "go.mod",
+            "module m\n// replace x v1.0.0 => gopatch.socket.dev/x v1\nrequire y v1.0.0\n",
+        )
+        .await;
+        let mut state = state_with(
+            vec![edit(
+                "go.mod",
+                "redirect_golang_replace",
+                "added",
+                None,
+                Some("replace x v1.0.0 => gopatch.socket.dev/x v1"),
+            )],
+            &[],
+        );
+        let out = revert_remaining_redirect_edits(dir.path(), &mut state, false).await;
+        assert!(out.fully_reverted(), "{:?}", out.refusals);
+        assert_eq!(
+            read(dir.path(), "go.mod").await,
+            "module m\n// \nrequire y v1.0.0\n",
+            "the require directive must survive on its own line"
+        );
+    }
+
+    #[tokio::test]
     async fn anchor_shaped_original_never_reads_as_already_reverted() {
         // The Cargo.toml insert variant records the always-present table
         // header as `original` and header+insert as `new`. With the insert
@@ -1237,6 +1285,71 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn duplicated_trust_line_refuses_instead_of_removing_the_wrong_copy() {
+        // A commented-out copy of the trust line above the live one:
+        // removing the FIRST occurrence would strip the comment's text and
+        // leave the LIVE line active while claiming full revert. Must
+        // refuse like the ReplaceFragment / RemoveAddedFragment ambiguity
+        // guards.
+        let dir = TempDir::new().unwrap();
+        write(
+            dir.path(),
+            "pnpm-workspace.yaml",
+            "packages:\n  - '.'\n# trustLockfile: true — added by socket\ntrustLockfile: true\n",
+        )
+        .await;
+        let mut state = state_with(
+            vec![FileEdit {
+                path: "pnpm-workspace.yaml".into(),
+                kind: "redirect_pnpm_workspace_trust".into(),
+                action: "added".into(),
+                key: Some("trustLockfile".into()),
+                original: None,
+                new: Some(json!("true")),
+            }],
+            &[],
+        );
+        let before = read(dir.path(), "pnpm-workspace.yaml").await;
+        let out = revert_remaining_redirect_edits(dir.path(), &mut state, false).await;
+        assert_eq!(out.refusals.len(), 1, "{out:?}");
+        assert_eq!(out.refusals[0].group, "pnpm");
+        assert!(out.refusals[0].reason.contains("more than once"));
+        assert_eq!(read(dir.path(), "pnpm-workspace.yaml").await, before);
+        assert_eq!(state.edits.len(), 1, "the edit must survive for a retry");
+    }
+
+    #[tokio::test]
+    async fn commented_out_trust_line_removal_keeps_the_following_line() {
+        // Single (commented) occurrence: removal proceeds, but must not
+        // eat the newline and comment out the key on the next line.
+        let dir = TempDir::new().unwrap();
+        write(
+            dir.path(),
+            "pnpm-workspace.yaml",
+            "packages:\n  - '.'\n# trustLockfile: true\nshamefullyHoist: true\n",
+        )
+        .await;
+        let mut state = state_with(
+            vec![FileEdit {
+                path: "pnpm-workspace.yaml".into(),
+                kind: "redirect_pnpm_workspace_trust".into(),
+                action: "added".into(),
+                key: Some("trustLockfile".into()),
+                original: None,
+                new: Some(json!("true")),
+            }],
+            &[],
+        );
+        let out = revert_remaining_redirect_edits(dir.path(), &mut state, false).await;
+        assert!(out.fully_reverted(), "{:?}", out.refusals);
+        assert_eq!(
+            read(dir.path(), "pnpm-workspace.yaml").await,
+            "packages:\n  - '.'\n# \nshamefullyHoist: true\n",
+            "the following key must survive on its own line"
+        );
+    }
+
     // ---------- dry-run ----------
 
     #[tokio::test]
@@ -1374,5 +1487,544 @@ mod tests {
                 "writer kind {kind}/{action} has no replay classification"
             );
         }
+    }
+
+    // ---------- payload corruption (tampered / partially-written ledger) ----------
+
+    #[tokio::test]
+    async fn replace_arm_missing_payload_refuses_and_keeps_the_edit() {
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), "composer.lock", "https://patch.example/a\n").await;
+        let mut state = state_with(
+            vec![edit(
+                "composer.lock",
+                "redirect_composer_dist",
+                "rewritten",
+                None,
+                Some("https://patch.example/a"),
+            )],
+            &[],
+        );
+        let out = revert_remaining_redirect_edits(dir.path(), &mut state, false).await;
+        assert_eq!(out.refusals.len(), 1, "{out:?}");
+        assert!(out.refusals[0]
+            .reason
+            .contains("missing its recorded fragments"));
+        assert_eq!(state.edits.len(), 1, "the edit must survive for a retry");
+        assert_eq!(
+            read(dir.path(), "composer.lock").await,
+            "https://patch.example/a\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn replace_arm_non_string_payload_refuses() {
+        // A hand-edited or corrupted ledger can carry a non-string Value
+        // where the inverse table requires a fragment string — str_payload
+        // must reject it, not coerce.
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), "composer.lock", "https://patch.example/a\n").await;
+        let mut state = state_with(
+            vec![FileEdit {
+                path: "composer.lock".into(),
+                kind: "redirect_composer_dist".into(),
+                action: "rewritten".into(),
+                key: Some("k".into()),
+                original: Some(json!(42)),
+                new: Some(Value::String("https://patch.example/a".into())),
+            }],
+            &[],
+        );
+        let out = revert_remaining_redirect_edits(dir.path(), &mut state, false).await;
+        assert_eq!(out.refusals.len(), 1, "{out:?}");
+        assert!(out.refusals[0]
+            .reason
+            .contains("missing its recorded fragments"));
+        assert_eq!(state.edits.len(), 1);
+        assert_eq!(
+            read(dir.path(), "composer.lock").await,
+            "https://patch.example/a\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_added_arm_missing_payload_refuses() {
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), "go.sum", "gopatch.socket.dev/x v1 h1:a\n").await;
+        let mut state = state_with(
+            vec![edit("go.sum", "redirect_golang_gosum", "added", None, None)],
+            &[],
+        );
+        let out = revert_remaining_redirect_edits(dir.path(), &mut state, false).await;
+        assert_eq!(out.refusals.len(), 1, "{out:?}");
+        assert!(out.refusals[0]
+            .reason
+            .contains("missing its recorded fragment"));
+        assert_eq!(state.edits.len(), 1);
+        assert_eq!(
+            read(dir.path(), "go.sum").await,
+            "gopatch.socket.dev/x v1 h1:a\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn reinsert_arm_missing_payload_refuses() {
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), "go.sum", "x v1 h1:a\n").await;
+        let mut state = state_with(
+            vec![edit(
+                "go.sum",
+                "redirect_golang_gosum_prune",
+                "removed",
+                None,
+                None,
+            )],
+            &[],
+        );
+        let out = revert_remaining_redirect_edits(dir.path(), &mut state, false).await;
+        assert_eq!(out.refusals.len(), 1, "{out:?}");
+        assert!(out.refusals[0].reason.contains("missing its recorded lines"));
+        assert_eq!(state.edits.len(), 1);
+        assert_eq!(read(dir.path(), "go.sum").await, "x v1 h1:a\n");
+    }
+
+    // ---------- read failures (FIFO / directory squats) ----------
+
+    #[tokio::test]
+    async fn directory_squatting_a_lockfile_refuses_each_arm_fail_fast() {
+        // A directory planted at the lockfile path makes open_regular_file
+        // return InvalidInput (open + fstat) — the fail-fast posture the
+        // module doc claims. Every per-arm read must refuse the group with
+        // the read error and keep the ledger.
+        let cases: [(&str, &str, &str, Option<&str>, Option<&str>); 4] = [
+            (
+                "composer.lock",
+                "redirect_composer_dist",
+                "rewritten",
+                Some("https://upstream.example/a"),
+                Some("https://patch.example/a"),
+            ),
+            (
+                "go.sum",
+                "redirect_golang_gosum",
+                "added",
+                None,
+                Some("gopatch.socket.dev/x v1 h1:a"),
+            ),
+            (
+                "go.sum",
+                "redirect_golang_gosum_prune",
+                "removed",
+                Some("x v0.9 h1:o"),
+                None,
+            ),
+            (
+                "pnpm-workspace.yaml",
+                "redirect_pnpm_workspace_trust",
+                "added",
+                None,
+                Some("true"),
+            ),
+        ];
+        for (path, kind, action, original, new) in cases {
+            let dir = TempDir::new().unwrap();
+            tokio::fs::create_dir_all(dir.path().join(path)).await.unwrap();
+            let mut state = state_with(vec![edit(path, kind, action, original, new)], &[]);
+            let out = revert_remaining_redirect_edits(dir.path(), &mut state, false).await;
+            assert_eq!(out.refusals.len(), 1, "{kind}/{action} must refuse: {out:?}");
+            assert!(
+                out.refusals[0].reason.starts_with(&format!("read {path}:")),
+                "{kind}/{action}: {}",
+                out.refusals[0].reason
+            );
+            // The fstat guard's "not a regular file" text is unix-only: on
+            // Windows, opening a directory fails at CreateFileW with
+            // ERROR_ACCESS_DENIED before the guard runs. The refusal itself
+            // (count, `read {path}:` prefix, kept ledger) is platform-neutral.
+            #[cfg(unix)]
+            assert!(
+                out.refusals[0].reason.contains("not a regular file"),
+                "{kind}/{action}: {}",
+                out.refusals[0].reason
+            );
+            assert_eq!(state.edits.len(), 1, "{kind}/{action} must keep its edit");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fifo_squatting_a_lockfile_refuses_instead_of_wedging() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("composer.lock");
+        let cpath = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o644) }, 0);
+        let mut state = state_with(
+            vec![edit(
+                "composer.lock",
+                "redirect_composer_dist",
+                "rewritten",
+                Some("https://upstream.example/a"),
+                Some("https://patch.example/a"),
+            )],
+            &[],
+        );
+        let out = revert_remaining_redirect_edits(dir.path(), &mut state, false).await;
+        assert_eq!(out.refusals.len(), 1, "{out:?}");
+        assert!(
+            out.refusals[0].reason.starts_with("read composer.lock:"),
+            "{}",
+            out.refusals[0].reason
+        );
+        assert!(out.refusals[0].reason.contains("not a regular file"));
+        assert_eq!(state.edits.len(), 1);
+    }
+
+    // ---------- RemoveAddedFragment already-clean edges ----------
+
+    #[tokio::test]
+    async fn added_fragment_with_file_gone_drops_without_recreating_it() {
+        let dir = TempDir::new().unwrap();
+        let mut state = state_with(
+            vec![edit(
+                "go.sum",
+                "redirect_golang_gosum",
+                "added",
+                None,
+                Some("gopatch.socket.dev/x v1 h1:a"),
+            )],
+            &[],
+        );
+        let out = revert_remaining_redirect_edits(dir.path(), &mut state, false).await;
+        assert!(out.fully_reverted(), "{:?}", out.refusals);
+        assert!(state.edits.is_empty());
+        assert!(out.reverted_files.is_empty(), "nothing was written");
+        assert!(
+            !dir.path().join("go.sum").exists(),
+            "the deleted file must not be recreated"
+        );
+    }
+
+    #[tokio::test]
+    async fn added_fragment_already_absent_is_a_noop_drop() {
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), "go.mod", "module m\n").await;
+        let mut state = state_with(
+            vec![edit(
+                "go.mod",
+                "redirect_golang_replace",
+                "added",
+                None,
+                Some("replace x => gopatch.socket.dev/x v1"),
+            )],
+            &[],
+        );
+        let out = revert_remaining_redirect_edits(dir.path(), &mut state, false).await;
+        assert!(out.fully_reverted(), "{:?}", out.refusals);
+        assert!(state.edits.is_empty());
+        assert!(out.reverted_files.is_empty(), "nothing was written");
+        assert_eq!(read(dir.path(), "go.mod").await, "module m\n");
+    }
+
+    #[tokio::test]
+    async fn duplicated_added_fragment_refuses_instead_of_guessing() {
+        // The RemoveAddedFragment twin of the ReplaceFragment ambiguity
+        // guard: two occurrences of the recorded fragment mean removal
+        // could hit the wrong one — refuse byte-untouched.
+        let dir = TempDir::new().unwrap();
+        write(
+            dir.path(),
+            "go.sum",
+            "gopatch.socket.dev/x v1 h1:a\ngopatch.socket.dev/x v1 h1:a\n",
+        )
+        .await;
+        let mut state = state_with(
+            vec![edit(
+                "go.sum",
+                "redirect_golang_gosum",
+                "added",
+                None,
+                Some("gopatch.socket.dev/x v1 h1:a"),
+            )],
+            &[],
+        );
+        let before = read(dir.path(), "go.sum").await;
+        let out = revert_remaining_redirect_edits(dir.path(), &mut state, false).await;
+        assert_eq!(out.refusals.len(), 1, "{out:?}");
+        assert_eq!(out.refusals[0].group, "golang");
+        assert!(out.refusals[0].reason.contains("more than once"));
+        assert_eq!(read(dir.path(), "go.sum").await, before);
+        assert_eq!(state.edits.len(), 1, "the edit must survive for a retry");
+    }
+
+    // ---------- ReinsertRemoved edge shapes ----------
+
+    #[tokio::test]
+    async fn reinsert_into_unterminated_file_adds_a_separating_newline() {
+        // A go.sum whose last line lost its trailing newline (hand-edited
+        // or tool-truncated): the re-inserted pruned lines must not
+        // concatenate onto it.
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), "go.sum", "x v1 h1:abc").await;
+        let mut state = state_with(
+            vec![edit(
+                "go.sum",
+                "redirect_golang_gosum_prune",
+                "removed",
+                Some("y v0.9 h1:o"),
+                None,
+            )],
+            &[],
+        );
+        let out = revert_remaining_redirect_edits(dir.path(), &mut state, false).await;
+        assert!(out.fully_reverted(), "{:?}", out.refusals);
+        assert_eq!(
+            read(dir.path(), "go.sum").await,
+            "x v1 h1:abc\ny v0.9 h1:o\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn reinsert_recreates_a_deleted_gosum() {
+        // The user deleted go.sum entirely; the pruned upstream lines must
+        // still come back — the staged write lands on a nonexistent path
+        // (the flush-side symlink_metadata Err edge) and creates the file.
+        let dir = TempDir::new().unwrap();
+        let mut state = state_with(
+            vec![edit(
+                "go.sum",
+                "redirect_golang_gosum_prune",
+                "removed",
+                Some("y v0.9 h1:o"),
+                None,
+            )],
+            &[],
+        );
+        let out = revert_remaining_redirect_edits(dir.path(), &mut state, false).await;
+        assert!(out.fully_reverted(), "{:?}", out.refusals);
+        assert!(out.reverted_files.contains("go.sum"));
+        assert_eq!(read(dir.path(), "go.sum").await, "y v0.9 h1:o\n");
+        assert!(state.edits.is_empty());
+    }
+
+    // ---------- pnpm trust already-clean edges ----------
+
+    #[tokio::test]
+    async fn trust_edit_with_workspace_file_gone_drops_without_recreating_it() {
+        let dir = TempDir::new().unwrap();
+        let mut state = state_with(
+            vec![FileEdit {
+                path: "pnpm-workspace.yaml".into(),
+                kind: "redirect_pnpm_workspace_trust".into(),
+                action: "created".into(),
+                key: Some("trustLockfile".into()),
+                original: None,
+                new: Some(json!("true")),
+            }],
+            &[],
+        );
+        let out = revert_remaining_redirect_edits(dir.path(), &mut state, false).await;
+        assert!(out.fully_reverted(), "{:?}", out.refusals);
+        assert!(state.edits.is_empty());
+        assert!(
+            !dir.path().join("pnpm-workspace.yaml").exists(),
+            "the deleted workspace file must not be recreated"
+        );
+        assert!(out.reverted_files.is_empty(), "nothing was written");
+    }
+
+    #[tokio::test]
+    async fn trust_line_already_absent_leaves_the_file_untouched() {
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), "pnpm-workspace.yaml", "packages:\n  - 'apps/*'\n").await;
+        let mut state = state_with(
+            vec![FileEdit {
+                path: "pnpm-workspace.yaml".into(),
+                kind: "redirect_pnpm_workspace_trust".into(),
+                action: "created".into(),
+                key: Some("trustLockfile".into()),
+                original: None,
+                new: Some(json!("true")),
+            }],
+            &[],
+        );
+        let out = revert_remaining_redirect_edits(dir.path(), &mut state, false).await;
+        assert!(out.fully_reverted(), "{:?}", out.refusals);
+        assert!(state.edits.is_empty());
+        assert_eq!(
+            read(dir.path(), "pnpm-workspace.yaml").await,
+            "packages:\n  - 'apps/*'\n"
+        );
+        assert!(
+            out.warnings.is_empty(),
+            "no scaffold_modified warning: {:?}",
+            out.warnings
+        );
+        assert!(out.reverted_files.is_empty(), "nothing was written");
+    }
+
+    // ---------- flush-side guards ----------
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlinked_lockfile_reads_fine_but_refuses_at_flush() {
+        // open_regular_file follows the symlink at read time (open+fstat),
+        // but the flush-side symlink_metadata guard does not — a symlinked
+        // lockfile must refuse fail-closed rather than write through the
+        // link.
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), "real.lock", "https://patch.example/a\n").await;
+        std::os::unix::fs::symlink(
+            dir.path().join("real.lock"),
+            dir.path().join("composer.lock"),
+        )
+        .unwrap();
+        let mut state = state_with(
+            vec![edit(
+                "composer.lock",
+                "redirect_composer_dist",
+                "rewritten",
+                Some("https://upstream.example/a"),
+                Some("https://patch.example/a"),
+            )],
+            &[],
+        );
+        let out = revert_remaining_redirect_edits(dir.path(), &mut state, false).await;
+        assert_eq!(out.refusals.len(), 1, "{out:?}");
+        assert_eq!(out.refusals[0].reason, "composer.lock is not a regular file");
+        assert_eq!(
+            read(dir.path(), "real.lock").await,
+            "https://patch.example/a\n",
+            "the symlink target must stay byte-identical"
+        );
+        assert_eq!(state.edits.len(), 1, "the edit must survive for a retry");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_failure_at_flush_refuses_late_and_keeps_the_ledger() {
+        // Root bypasses mode bits (CI containers) — skip there.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), "composer.lock", "https://patch.example/a\n").await;
+        let path = dir.path().join("composer.lock");
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o444);
+        std::fs::set_permissions(&path, perms).unwrap();
+        let mut state = state_with(
+            vec![edit(
+                "composer.lock",
+                "redirect_composer_dist",
+                "rewritten",
+                Some("https://upstream.example/a"),
+                Some("https://patch.example/a"),
+            )],
+            &[],
+        );
+        let out = revert_remaining_redirect_edits(dir.path(), &mut state, false).await;
+        assert_eq!(out.refusals.len(), 1, "{out:?}");
+        assert!(
+            out.refusals[0].reason.starts_with("write composer.lock:"),
+            "{}",
+            out.refusals[0].reason
+        );
+        assert_eq!(state.edits.len(), 1, "the edit must survive for a retry");
+        assert_eq!(
+            read(dir.path(), "composer.lock").await,
+            "https://patch.example/a\n",
+            "the redirected fragment must still be present"
+        );
+    }
+
+    // ---------- record hold/drop per purl ecosystem ----------
+
+    #[tokio::test]
+    async fn cargo_and_composer_records_drop_when_their_groups_replay_clean() {
+        let dir = TempDir::new().unwrap();
+        write(
+            dir.path(),
+            "Cargo.lock",
+            "source = \"sparse+https://patch.example/\"\n",
+        )
+        .await;
+        write(dir.path(), "composer.lock", "https://patch.example/a\n").await;
+        let mut state = state_with(
+            vec![
+                edit(
+                    "Cargo.lock",
+                    "redirect_cargo_lock_entry",
+                    "rewritten",
+                    Some("source = \"registry+https://github.com/rust-lang/crates.io-index\""),
+                    Some("source = \"sparse+https://patch.example/\""),
+                ),
+                edit(
+                    "composer.lock",
+                    "redirect_composer_dist",
+                    "rewritten",
+                    Some("https://upstream.example/a"),
+                    Some("https://patch.example/a"),
+                ),
+            ],
+            &["pkg:cargo/cfg-if@1.0.0", "pkg:composer/a/b@1"],
+        );
+        let out = revert_remaining_redirect_edits(dir.path(), &mut state, false).await;
+        assert!(out.fully_reverted(), "{:?}", out.refusals);
+        assert_eq!(
+            out.dropped_records,
+            vec!["pkg:cargo/cfg-if@1.0.0", "pkg:composer/a/b@1"]
+        );
+        assert!(state.records.is_empty());
+        assert!(state.edits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn nuget_and_unknown_ecosystem_records_are_held_by_their_refusals() {
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), "packages.lock.json", "{}\n").await;
+        let mut state = state_with(
+            vec![
+                edit(
+                    "packages.lock.json",
+                    "redirect_nuget_lock",
+                    "rewritten",
+                    Some("a"),
+                    Some("b"),
+                ),
+                edit("f", "redirect_future_thing", "rewritten", Some("a"), Some("b")),
+            ],
+            &["pkg:nuget/A@1", "pkg:hex/x@1"],
+        );
+        let out = revert_remaining_redirect_edits(dir.path(), &mut state, false).await;
+        assert_eq!(out.refusals.len(), 2, "{out:?}");
+        assert!(
+            state.records.contains_key("pkg:nuget/A@1"),
+            "a nuget record must be held while its Unsupported edits refuse"
+        );
+        assert!(
+            state.records.contains_key("pkg:hex/x@1"),
+            "an unknown-ecosystem record is tied to the reserved unknown group"
+        );
+        assert!(out.dropped_records.is_empty());
+        assert_eq!(state.edits.len(), 2);
+    }
+
+    // ---------- remove_fragment_once unit pins ----------
+
+    #[test]
+    fn remove_fragment_once_absent_fragment_is_identity() {
+        // Defensive edge: callers check contains() first, so the not-found
+        // arm must be a pure no-op if that invariant ever breaks.
+        assert_eq!(remove_fragment_once("a\nb\n", "zzz"), "a\nb\n");
+    }
+
+    #[test]
+    fn remove_fragment_once_sole_content_collapses_to_empty() {
+        // EOF removal of the only content: the trailing-separator collapse
+        // must yield an empty file, not a lone newline.
+        assert_eq!(remove_fragment_once("F\n", "F"), "");
+        assert_eq!(remove_fragment_once("\nF\n", "F"), "");
     }
 }

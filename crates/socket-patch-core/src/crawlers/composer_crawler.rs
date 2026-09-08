@@ -1509,4 +1509,103 @@ mod tests {
 
         assert!(result.is_empty());
     }
+
+    #[tokio::test]
+    async fn test_crawl_all_skips_name_without_namespace_separator() {
+        // installed.json can carry a single-segment name ("nosplit"): it
+        // passes the coordinate gate (is_safe_multi_segment accepts one
+        // safe segment), so it reaches crawl_all's `split_once('/')` and
+        // must be skipped there — composer packages are always
+        // vendor/name, and a namespace-less PURL cannot be built.
+        let dir = tempfile::tempdir().unwrap();
+        let vendor_dir = dir.path().join("vendor");
+
+        let composer_dir = vendor_dir.join("composer");
+        tokio::fs::create_dir_all(&composer_dir).await.unwrap();
+        tokio::fs::write(
+            composer_dir.join("installed.json"),
+            r#"{"packages": [
+                {"name": "monolog/monolog", "version": "3.5.0"},
+                {"name": "nosplit", "version": "1.0.0"}
+            ]}"#,
+        )
+        .await
+        .unwrap();
+        tokio::fs::create_dir_all(vendor_dir.join("monolog").join("monolog"))
+            .await
+            .unwrap();
+        // The slash-less entry HAS a directory on disk, so the skip below
+        // is the missing '/' split — not the is_dir corroboration.
+        tokio::fs::create_dir_all(vendor_dir.join("nosplit"))
+            .await
+            .unwrap();
+        tokio::fs::write(dir.path().join("composer.json"), "{}")
+            .await
+            .unwrap();
+
+        let crawler = ComposerCrawler::new();
+        let options = CrawlerOptions {
+            cwd: dir.path().to_path_buf(),
+            global: false,
+            global_prefix: None,
+        };
+
+        let packages = crawler.crawl_all(&options).await;
+        assert_eq!(
+            packages.len(),
+            1,
+            "slash-less entry must be skipped, got: {packages:?}"
+        );
+        assert_eq!(packages[0].name, "monolog");
+    }
+
+    #[test]
+    fn test_resolve_install_path_rejects_embedded_nul() {
+        // serde_json strings may legally contain `\u{0000}`, so a tampered
+        // installed.json can deliver an install-path with an embedded NUL;
+        // it must be refused up front, before any filesystem use.
+        assert_eq!(
+            resolve_install_path(
+                Path::new("/proj/vendor"),
+                Path::new("/proj"),
+                "../mono\0log"
+            ),
+            None,
+            "an install-path with an embedded NUL must be refused"
+        );
+        // Control: the conventional relative install-path still resolves —
+        // the NUL gate must not fail closed on everything.
+        assert_eq!(
+            resolve_install_path(
+                Path::new("/proj/vendor"),
+                Path::new("/proj"),
+                "../monolog/monolog"
+            ),
+            Some(PathBuf::from("/proj/vendor/monolog/monolog"))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_installed_json_invalid_utf8_returns_empty() {
+        // open_regular_file succeeds (regular file) but read_to_string
+        // fails on invalid UTF-8 — the read-error early return, distinct
+        // from the open-failure branch the chmod-000 e2e test covers.
+        let dir = tempfile::tempdir().unwrap();
+        let vendor_dir = dir.path();
+        let composer_dir = vendor_dir.join("composer");
+        tokio::fs::create_dir_all(&composer_dir).await.unwrap();
+        // A UTF-16 BOM in front of otherwise-valid JSON listing a package:
+        // if the failed read were ever papered over (e.g. a lossy decode),
+        // the entry would surface and the assert below would catch it.
+        let mut bytes = vec![0xff, 0xfe];
+        bytes.extend_from_slice(br#"{"packages":[{"name":"monolog/monolog","version":"3.5.0"}]}"#);
+        tokio::fs::write(composer_dir.join("installed.json"), &bytes)
+            .await
+            .unwrap();
+
+        assert!(
+            read_installed_json(vendor_dir).await.is_empty(),
+            "invalid UTF-8 installed.json must yield no entries"
+        );
+    }
 }

@@ -719,6 +719,48 @@ replace (
         );
     }
 
+    /// `for_each_directive_body` must NOT treat a keyword-PREFIXED word
+    /// (`replacements …`), a bare `replace` with no body, or a body without
+    /// `=>` as a replace directive: Go's lexer separates tokens on
+    /// whitespace, so `replaceX` is a different word entirely, and
+    /// `parse_replace_body` tolerates (skips) an arrow-less body instead of
+    /// erroring. Parse yields nothing; upsert and remove leave all three
+    /// shapes untouched.
+    #[test]
+    fn test_keyword_prefixed_words_and_arrowless_bodies_are_ignored() {
+        let gomod = "module m\n\nreplacements github.com/x/y v1.0.0 => ../fork\nreplace\nreplace github.com/foo/bar-incomplete\n";
+
+        // None of the three lines parses as a replace directive.
+        assert!(parse_replace_entries(gomod).is_empty());
+
+        // Upsert skips the arrow-less body (no error, no match) and still
+        // appends our directive, keeping every original line verbatim.
+        let out = upsert_replace_entry(gomod, "github.com/foo/bar", "v1.4.2", GO_PATCHES_DIR)
+            .unwrap()
+            .unwrap();
+        assert!(out.contains("replacements github.com/x/y v1.0.0 => ../fork"));
+        assert!(out.contains("\nreplace\n"));
+        assert!(out.contains("\nreplace github.com/foo/bar-incomplete\n"));
+        assert!(out.contains(
+            "replace github.com/foo/bar v1.4.2 => ./.socket/go-patches/github.com/foo/bar@v1.4.2"
+        ));
+
+        // Remove must not touch a keyword-prefixed word ("replacements" is
+        // not `replace <body>`) nor an arrow-less body.
+        assert!(
+            remove_replace_entry(gomod, "github.com/x/y", ReplaceOwner::GoPatches)
+                .unwrap()
+                .is_none()
+        );
+        assert!(remove_replace_entry(
+            gomod,
+            "github.com/foo/bar-incomplete",
+            ReplaceOwner::GoPatches
+        )
+        .unwrap()
+        .is_none());
+    }
+
     // ── upsert ───────────────────────────────────────────────────────
     #[test]
     fn test_upsert_appends_single_line() {
@@ -737,6 +779,31 @@ replace (
             upsert_replace_entry(&out, "github.com/foo/bar", "v1.4.2", GO_PATCHES_DIR)
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    /// Appending to a go.mod whose content does not end with a newline: the
+    /// upsert must first terminate the last line, then add the one blank
+    /// stanza separator — never glue the directive onto `module m`.
+    #[test]
+    fn test_upsert_appends_to_newline_less_go_mod() {
+        let out = upsert_replace_entry("module m", "github.com/foo/bar", "v1.4.2", GO_PATCHES_DIR)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            out,
+            "module m\n\nreplace github.com/foo/bar v1.4.2 => ./.socket/go-patches/github.com/foo/bar@v1.4.2\n"
+        );
+        // KNOWN GAP (characterized, not endorsed): the reverse transform only
+        // sees the upserted content — which ends with a newline — so removal
+        // restores "module m\n", gaining the trailing newline the original
+        // never had. Pin today's exact shape so a change is deliberate.
+        let restored = remove_replace_entry(&out, "github.com/foo/bar", ReplaceOwner::GoPatches)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            restored, "module m\n",
+            "trailing newline gained on round-trip (known gap)"
         );
     }
 
@@ -953,6 +1020,22 @@ replace (
         .is_err());
     }
 
+    /// A user's module-to-module replace WITHOUT an rhs version
+    /// (`replace m => other.mod` — a versionless catch-all): the refusal
+    /// message's target falls back to the bare rhs module path, and the lhs
+    /// is rendered without a version.
+    #[test]
+    fn test_upsert_refuses_user_module_replace_without_rhs_version() {
+        let gomod = "module m\n\nreplace github.com/foo/bar => example.com/fork\n";
+        let err = upsert_replace_entry(gomod, "github.com/foo/bar", "v1.4.2", GO_PATCHES_DIR)
+            .unwrap_err();
+        assert!(err.contains("refusing to overwrite"), "{err}");
+        assert!(
+            err.contains("`replace github.com/foo/bar` => example.com/fork"),
+            "target named as the bare rhs module, lhs without version: {err}"
+        );
+    }
+
     #[test]
     fn test_remove_hosted_entry() {
         let gomod = format!(
@@ -1051,6 +1134,43 @@ replace (
             .unwrap();
         assert!(!out.contains("go-patches"));
         assert!(!out.contains("replace ("), "emptied block pruned");
+    }
+
+    /// A block member that doesn't parse as a replace body (no `=>`) must be
+    /// kept — and COUNTED as a member, so the block is never pruned around
+    /// it (dropping `replace (` / `)` while a line survives inside would
+    /// corrupt go.mod).
+    #[test]
+    fn test_remove_block_keeps_unparsable_member() {
+        let gomod = "module m\n\nreplace (\n\tgarbage-no-arrow\n\tgithub.com/foo/bar v1.4.2 => ./.socket/go-patches/github.com/foo/bar@v1.4.2\n)\n";
+        let out = remove_replace_entry(gomod, "github.com/foo/bar", ReplaceOwner::GoPatches)
+            .unwrap()
+            .unwrap();
+        assert!(!out.contains("go-patches"), "socket member removed");
+        assert_eq!(
+            out, "module m\n\nreplace (\n\tgarbage-no-arrow\n)\n",
+            "block delimiters + unparsable member kept verbatim"
+        );
+    }
+
+    /// Blank and comment-only lines inside a `replace ( … )` block are not
+    /// members: removing the only real member still prunes the block
+    /// delimiters. KNOWN GAP (characterized, not endorsed): the interior
+    /// blank/comment lines are stranded in place rather than removed with
+    /// the block — pin today's exact output so a change is deliberate.
+    #[test]
+    fn test_remove_block_with_blank_and_comment_lines_prunes_block() {
+        let gomod = "module m\n\nreplace (\n\n\t// note\n\tgithub.com/foo/bar v1.4.2 => ./.socket/go-patches/github.com/foo/bar@v1.4.2\n)\n";
+        let out = remove_replace_entry(gomod, "github.com/foo/bar", ReplaceOwner::GoPatches)
+            .unwrap()
+            .unwrap();
+        assert!(!out.contains("go-patches"), "socket member removed");
+        assert!(!out.contains("replace ("), "emptied block pruned");
+        assert!(!out.contains(')'), "block closer pruned");
+        assert_eq!(
+            out, "module m\n\n\n\t// note\n",
+            "interior blank + comment lines stranded (known gap)"
+        );
     }
 
     #[test]

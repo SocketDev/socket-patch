@@ -49,7 +49,7 @@
 //! member-only state — never from the unverifiable live tree.
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use socket_patch_core::api::client::{get_api_client_with_overrides, ApiClient};
 use socket_patch_core::crawlers::CrawlerOptions;
@@ -350,6 +350,38 @@ async fn remove_vendor_dir(cwd: &Path, eco: &str, uuid: &str) {
     if let Some(rel) = vendor::path::vendor_uuid_dir_rel(eco, uuid) {
         let _ = remove_tree(&cwd.join(rel)).await;
     }
+}
+
+/// Move the live uuid dir aside (same parent, `<uuid>.pre-rebuild`) so the
+/// backends' rebuild-on-MISSING trigger fires while the bytes stay
+/// recoverable: the dispatch can still refuse or fail — the in-hand
+/// installed copy may itself be broken in ways no pre-rebuild rung probes
+/// — and a failed dispatch replaced nothing, so the artifact
+/// (member-healthy for a soft candidate, corrupt-but-diagnosable for a
+/// pass-1 one) must be restorable instead of leaving the wired lockfiles
+/// pointing at a bare ENOENT (see the NOTE above the staging step).
+/// Returns `(live, kept)` for [`restore_aside_vendor_dir`]; on a rename
+/// failure falls back to plain removal (the rebuild trigger must fire)
+/// and returns `None`.
+async fn set_aside_vendor_dir(cwd: &Path, eco: &str, uuid: &str) -> Option<(PathBuf, PathBuf)> {
+    let rel = vendor::path::vendor_uuid_dir_rel(eco, uuid)?;
+    let live = cwd.join(&rel);
+    let kept = cwd.join(format!("{rel}.pre-rebuild"));
+    // A crashed earlier run's leftover must not wedge the rename.
+    let _ = remove_tree(&kept).await;
+    if tokio::fs::rename(&live, &kept).await.is_ok() {
+        Some((live, kept))
+    } else {
+        let _ = remove_tree(&live).await;
+        None
+    }
+}
+
+/// Put the pre-rebuild bytes back after a dispatch that produced no
+/// replacement (clearing any partial husk the failed backend left first).
+async fn restore_aside_vendor_dir(live: &Path, kept: &Path) {
+    let _ = remove_tree(live).await;
+    let _ = tokio::fs::rename(kept, live).await;
 }
 
 /// The vendored-artifact phase of `repair`. Runs between the download and
@@ -804,9 +836,10 @@ pub(crate) async fn repair_vendored_artifacts(
         }
     }
 
-    // NOTE: corrupt artifacts are NOT deleted here. Deletion waits until
+    // NOTE: corrupt artifacts are NOT deleted here. Clearing waits until
     // the rebuild loop below, where the patch sources and a pristine
-    // package source are both in hand — see the comment there. Destroying
+    // package source are both in hand (and even there it is a MOVE-ASIDE,
+    // restored when the dispatch fails) — see the comment there. Destroying
     // the corrupt copy before the rebuild-source ladder runs would, on any
     // no-source outcome (--offline, node_modules gone, fetch failure),
     // convert a corrupt-but-diagnosable integrity-mismatch state into a
@@ -1035,20 +1068,24 @@ pub(crate) async fn repair_vendored_artifacts(
             continue; // failed above
         };
         // Clear the live uuid dir only NOW — the patch sources and the
-        // pristine source are both in hand, so a rebuild WILL replace it.
-        // The backends' wired hot paths rebuild on MISSING (one uniform
-        // trigger for every ecosystem), and the live bytes must never
-        // blend into the rebuild:
+        // pristine source are both in hand. The backends' wired hot paths
+        // rebuild on MISSING (one uniform trigger for every ecosystem),
+        // and the live bytes must never blend into the rebuild:
         //  - corrupt: the recorded fingerprint already condemned them;
         //  - soft: the healthy-by-members live tree is exactly what cannot
         //    be trusted — the fingerprint below derives from the
         //    member-verified rebuild, never the live bytes.
-        // Deleting any earlier destroys evidence: with no rebuild source
-        // the corrupt copy is all a human has left to diagnose (and the
-        // lock still points at it — see the NOTE above the staging step).
-        if c.soft || c.reason == "vendor_artifact_corrupt" {
-            remove_vendor_dir(&common.cwd, &c.entry.ecosystem, &c.entry.uuid).await;
-        }
+        // Cleared by MOVE-ASIDE, not deletion: an in-hand source does not
+        // make the dispatch infallible (the installed copy may itself be
+        // broken in ways no pre-rebuild rung probes), and a dispatch that
+        // refuses or fails replaced nothing — the bytes go back rather
+        // than leaving the wired lockfiles pointing at a bare ENOENT and
+        // destroying the evidence the NOTE above the staging step keeps.
+        let aside = if c.soft || c.reason == "vendor_artifact_corrupt" {
+            set_aside_vendor_dir(&common.cwd, &c.entry.ecosystem, &c.entry.uuid).await
+        } else {
+            None
+        };
         // For an unverified-source rebuild the rewired lockfile is the trust
         // anchor: snapshot the wiring files so a failed post-verify can put
         // them back byte-for-byte. The backend's re-wire may refresh the
@@ -1089,6 +1126,9 @@ pub(crate) async fn repair_vendored_artifacts(
         .await;
         match outcome {
             None => {
+                if let Some((live, kept)) = &aside {
+                    restore_aside_vendor_dir(live, kept).await;
+                }
                 fail(
                     env,
                     quiet,
@@ -1098,6 +1138,9 @@ pub(crate) async fn repair_vendored_artifacts(
                 );
             }
             Some(VendorOutcome::Refused { code, detail }) => {
+                if let Some((live, kept)) = &aside {
+                    restore_aside_vendor_dir(live, kept).await;
+                }
                 fail(env, quiet, &c.purl, code, detail);
             }
             Some(VendorOutcome::Done {
@@ -1106,6 +1149,9 @@ pub(crate) async fn repair_vendored_artifacts(
                 warnings,
             }) => {
                 if !result.success {
+                    if let Some((live, kept)) = &aside {
+                        restore_aside_vendor_dir(live, kept).await;
+                    }
                     fail(
                         env,
                         quiet,
@@ -1114,6 +1160,12 @@ pub(crate) async fn repair_vendored_artifacts(
                         result.error.unwrap_or_else(|| "rebuild failed".to_string()),
                     );
                     continue;
+                }
+                // The rebuild replaced the artifact: the set-aside copy is
+                // condemned bytes now (post-verify failures below keep
+                // their existing nothing-kept contract).
+                if let Some((_, kept)) = &aside {
+                    let _ = remove_tree(kept).await;
                 }
                 for w in &warnings {
                     // The Rebuilt event below carries the rebuild signal.
@@ -1392,6 +1444,87 @@ mod tests {
             refs[0].2.ends_with("left-pad-1.3.0.tgz"),
             "trailing colon must be cut: {refs:?}"
         );
+    }
+
+    /// The scanner's false-positive guard: a `.socket` mention that is NOT
+    /// a parseable vendored-artifact path (the committed manifest, a
+    /// non-uuid path segment) must never be reported as a vendor reference
+    /// — `parse_vendor_path`'s reject branch is what keeps `repair` from
+    /// reconstructing ledger entries out of ordinary `.socket/` mentions.
+    #[tokio::test]
+    async fn scan_ignores_non_vendor_socket_mentions() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            tmp.path().join("package.json"),
+            r#"{
+  "name": "t",
+  "socketManifest": ".socket/manifest.json",
+  "notAVendorPath": ".socket/vendor/npm/not-a-uuid/x.tgz"
+}"#,
+        )
+        .await
+        .unwrap();
+        let refs = scan_vendor_references(tmp.path()).await;
+        assert!(
+            refs.is_empty(),
+            "non-vendor .socket mentions must be rejected: {refs:?}"
+        );
+    }
+
+    /// A lock that is PRESENT but does not reference the uuid must not
+    /// claim the entry: the probe falls through past pnpm-lock.yaml and
+    /// yarn.lock to the lock that actually carries the reference.
+    #[tokio::test]
+    async fn detect_reference_flavor_falls_through_present_unreferencing_locks() {
+        let uuid = "11111111-1111-4111-8111-111111111111";
+        let mention = format!("resolved: file:.socket/vendor/npm/{uuid}/left-pad-1.3.0.tgz\n");
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            tmp.path().join("pnpm-lock.yaml"),
+            "lockfileVersion: '9.0'\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(tmp.path().join("yarn.lock"), "# yarn lockfile v1\n")
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.path().join("package-lock.json"), &mention)
+            .await
+            .unwrap();
+        assert_eq!(
+            detect_reference_flavor(tmp.path(), "npm", uuid).await,
+            Some("package-lock".to_string()),
+            "present-but-unreferencing locks must fall through to the referencing one"
+        );
+    }
+
+    /// [`remove_vendor_dir`] is a best-effort guard that must never GUESS a
+    /// path: an eco/uuid pair that cannot map to a canonical vendor dir
+    /// (unknown ecosystem dir, non-canonical uuid) removes NOTHING, while
+    /// the mappable pair removes exactly its uuid dir.
+    #[tokio::test]
+    async fn remove_vendor_dir_refuses_unmappable_eco_or_uuid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let uuid = "11111111-1111-4111-8111-111111111111";
+        let dir = tmp.path().join(format!(".socket/vendor/npm/{uuid}"));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("x.tgz"), b"bytes").await.unwrap();
+
+        remove_vendor_dir(tmp.path(), "jsr", uuid).await;
+        assert!(dir.is_dir(), "an unmappable ecosystem must remove nothing");
+        remove_vendor_dir(tmp.path(), "npm", "not-a-uuid").await;
+        assert!(dir.is_dir(), "a non-canonical uuid must remove nothing");
+        remove_vendor_dir(tmp.path(), "npm", uuid).await;
+        assert!(!dir.exists(), "the canonical pair removes its uuid dir");
+    }
+
+    /// The empty-component rejects: a purl with no name or no version can
+    /// never drive a registry fetch — `npm_coords` must return `None`, not
+    /// empty coordinates.
+    #[test]
+    fn npm_coords_rejects_empty_name_or_version() {
+        assert_eq!(npm_coords("pkg:npm/@1.2.3"), None, "empty name");
+        assert_eq!(npm_coords("pkg:npm/left-pad@"), None, "empty version");
     }
 
     /// The reconstruction stamps [`VendorEntry::flavor`] from whichever

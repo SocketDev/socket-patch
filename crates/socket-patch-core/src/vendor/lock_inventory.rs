@@ -1805,6 +1805,9 @@ mod tests {
       "version": "../../escape",
       "resolved": "https://registry.npmjs.org/evil/-/evil-1.0.0.tgz",
       "integrity": "sha512-evil=="
+    },
+    "node_modules/no-version": {
+      "resolved": "https://registry.npmjs.org/no-version/-/no-version-1.0.0.tgz"
     }
   }
 }
@@ -1835,9 +1838,16 @@ mod tests {
         assert_eq!(git.resolved, None);
         assert_eq!(git.integrity, LockIntegrity::None);
 
-        // Workspace members, links, bundled deps, our vendored spec, and
-        // the unsafe-version entry are all absent.
-        for absent in ["member", "fixture", "bundled-dep", "vendored", "evil"] {
+        // Workspace members, links, bundled deps, our vendored spec, the
+        // unsafe-version entry, and the version-less node are all absent.
+        for absent in [
+            "member",
+            "fixture",
+            "bundled-dep",
+            "vendored",
+            "evil",
+            "no-version",
+        ] {
             assert!(
                 !entries.iter().any(|e| e.name == absent),
                 "{absent} must not be inventoried: {entries:?}"
@@ -3154,6 +3164,450 @@ source = { editable = "." }
         assert!(entries.is_empty());
         assert!(unsupported.is_empty(), "{unsupported:?}");
     }
+
+    /// A version-refused pnpm lock (pnpm 6 wrote 5.3) with NO live sibling
+    /// and NO dependencies at all: the direct read yields nothing, and the
+    /// fall-through past it must land on the calm `Ok(None)` via the rush
+    /// check — never a phantom inventory and never an error.
+    #[tokio::test]
+    async fn version_refused_depless_pnpm_lock_yields_calm_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), "pnpm-lock.yaml", "lockfileVersion: 5.3\n").await;
+        assert!(
+            inventory_npm_lock(tmp.path()).await.unwrap().is_none(),
+            "a dep-less version-refused pnpm lock must inventory to the calm None"
+        );
+    }
+
+    /// The union entrypoint reads EVERY ecosystem's lock out of one polyglot
+    /// root — each per-ecosystem reader is unit-covered, but the union arms
+    /// (go.sum, pypi, …) only execute here. `lookup` bridges one purl per
+    /// ecosystem, and an unknown purl type (nuget has no lock inventory)
+    /// yields None instead of a cross-ecosystem false match.
+    #[tokio::test]
+    async fn inventory_project_unions_every_ecosystem_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), "package-lock.json", PACKAGE_LOCK).await;
+        write(
+            tmp.path(),
+            "Cargo.lock",
+            "[[package]]\nname = \"serde\"\nversion = \"1.0.200\"\n\
+             source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
+             checksum = \"ddc6f9cc94d67c0e21aaf7eda3a010fd3af78ebf6e096aa6e2e13c79749cce4f\"\n",
+        )
+        .await;
+        write(
+            tmp.path(),
+            "go.sum",
+            "github.com/gin-gonic/gin v1.9.1 h1:4idEAncQnU5cB7BeOkPtxjfCSye0AAm1R0RVIqJ+Jmg=\n",
+        )
+        .await;
+        write(
+            tmp.path(),
+            "composer.lock",
+            r#"{ "packages": [ { "name": "Monolog/Monolog", "version": "v3.5.0",
+                 "dist": { "type": "zip", "url": "https://example.com/monolog.zip",
+                           "shasum": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" } } ] }"#,
+        )
+        .await;
+        write(
+            tmp.path(),
+            "Gemfile.lock",
+            "GEM\n  remote: https://rubygems.org/\n  specs:\n    rails (7.1.0)\n",
+        )
+        .await;
+        write(tmp.path(), "requirements.txt", "requests==2.31.0\n").await;
+
+        let (entries, unsupported) = inventory_project_diagnosed(tmp.path()).await;
+        assert!(unsupported.is_empty(), "{unsupported:?}");
+        for purl in [
+            "pkg:npm/left-pad@1.3.0",
+            "pkg:cargo/serde@1.0.200",
+            "pkg:golang/github.com/gin-gonic/gin@v1.9.1",
+            "pkg:composer/monolog/monolog@3.5.0",
+            "pkg:gem/rails@7.1.0",
+            "pkg:pypi/requests@2.31.0",
+        ] {
+            assert!(
+                lookup(&entries, purl).is_some(),
+                "the union must serve {purl}: {entries:?}"
+            );
+        }
+        // Unknown purl type: no inventory ever answers for nuget.
+        assert!(
+            lookup(&entries, "pkg:nuget/Newtonsoft.Json@13.0.1").is_none(),
+            "an unrecognized purl type must never match: {entries:?}"
+        );
+    }
+
+    /// The `[metadata]` tail of a v1-era Cargo.lock flushes the in-flight
+    /// block (its key=value lines must not bleed a foreign checksum into the
+    /// LAST package), and an unsafe name is dropped fail-closed — the
+    /// lockfile is committed, tamperable input feeding paths/URLs.
+    #[tokio::test]
+    async fn cargo_lock_metadata_section_flushes_and_unsafe_name_drops() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "Cargo.lock",
+            &format!(
+                "version = 3\n\n\
+                 [[package]]\nname = \"../evil\"\nversion = \"1.0.0\"\n\
+                 source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
+                 checksum = \"{}\"\n\n\
+                 [[package]]\nname = \"serde\"\nversion = \"1.0.200\"\n\
+                 source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
+                 checksum = \"{}\"\n\n\
+                 [metadata]\n\
+                 \"checksum foo 1.0.0 (registry+https://github.com/rust-lang/crates.io-index)\" = \"{}\"\n",
+                "a".repeat(64),
+                "d".repeat(64),
+                "b".repeat(64),
+            ),
+        )
+        .await;
+
+        let entries = inventory_cargo_lock(tmp.path()).await.unwrap();
+        assert_eq!(
+            entries.len(),
+            1,
+            "only the safe crates.io package inventories: {entries:?}"
+        );
+        let serde_entry = entry(&entries, "serde");
+        assert_eq!(
+            serde_entry.integrity,
+            LockIntegrity::Sha256Hex("d".repeat(64)),
+            "the [metadata] line's checksum must not bleed into the last block"
+        );
+        assert!(!entries.iter().any(|e| e.name.contains("..")), "{entries:?}");
+        assert!(!entries.iter().any(|e| e.name == "foo"), "{entries:?}");
+    }
+
+    /// go.sum lines with fewer than 3 fields are skipped, and unsafe module
+    /// paths / versions are dropped fail-closed (SECURITY: both feed
+    /// filesystem paths and download URLs).
+    #[tokio::test]
+    async fn go_sum_skips_short_and_unsafe_lines() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "go.sum",
+            "lonely\n\
+             example.com/../up v1.0.0 h1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n\
+             example.com/mod v1.0.0/../x h1:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=\n\
+             golang.org/x/text v0.14.0 h1:ScX5w1eTa3QqT8oi6+ziP7dTV1S2+ALU0bI+0zXKWiQ=\n",
+        )
+        .await;
+
+        let entries = inventory_go_sum(tmp.path()).await.unwrap();
+        assert_eq!(
+            entries.len(),
+            1,
+            "short and unsafe lines must be skipped: {entries:?}"
+        );
+        assert_eq!(entries[0].name, "golang.org/x/text");
+        assert!(
+            !entries
+                .iter()
+                .any(|e| e.name.contains("..") || e.version.contains("..")),
+            "{entries:?}"
+        );
+    }
+
+    /// shrinkwrap.yaml BLOCK-mapped `resolution:` with a `tarball:` child
+    /// AND a following shallower-indented field: the mapping must terminate
+    /// at the shallower line (the SHRINKWRAP_YAML fixture happens to put
+    /// resolution last in every entry, so the terminator never ran) and the
+    /// tarball child must be captured as the resolved URL.
+    #[tokio::test]
+    async fn shrinkwrap_block_mapped_tarball_reads_and_stops_at_shallower_indent() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "shrinkwrap.yaml",
+            "dependencies:
+  left-pad: 1.3.0
+packages:
+  /left-pad/1.3.0:
+    resolution:
+      integrity: sha512-blockmapped==
+      tarball: https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz
+    dev: false
+registry: 'https://registry.npmjs.org/'
+shrinkwrapVersion: 3
+",
+        )
+        .await;
+
+        let (flavor, entries) = inventory_npm_lock(tmp.path()).await.unwrap().unwrap();
+        assert_eq!(flavor, NpmLockFlavor::PnpmLegacy);
+        let lp = entry(&entries, "left-pad");
+        assert_eq!(
+            lp.resolved.as_deref(),
+            Some("https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz"),
+            "the block-mapped tarball child must be captured"
+        );
+        assert_eq!(
+            lp.integrity,
+            LockIntegrity::Sri("sha512-blockmapped==".into()),
+            "the shallower `dev:` line must terminate the mapping without eating fields"
+        );
+    }
+
+    /// A registry-shaped pnpm key (digit version) whose resolution tarball
+    /// points into `.socket/vendor/` is OUR OWN vendored artifact, not a
+    /// registry dependency — self-exclusion fail-closed. (Rewired v9 locks
+    /// are keyed `name@file:…` and die at the digit check instead, but a
+    /// crafted or v5.4-era lock can present exactly this shape.)
+    #[tokio::test]
+    async fn pnpm_registry_keyed_entry_with_vendored_tarball_is_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "pnpm-lock.yaml",
+            "lockfileVersion: '6.0'
+
+packages:
+
+  /left-pad@1.3.0:
+    resolution: {integrity: sha512-x==, tarball: file:.socket/vendor/npm/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/left-pad-1.3.0.tgz}
+
+  /other@2.0.0:
+    resolution: {integrity: sha512-y==}
+",
+        )
+        .await;
+
+        let (_, entries) = inventory_npm_lock(tmp.path()).await.unwrap().unwrap();
+        assert!(
+            !entries.iter().any(|e| e.name == "left-pad"),
+            "a vendored tarball must self-exclude even behind a registry key: {entries:?}"
+        );
+        assert_eq!(
+            entry(&entries, "other").integrity,
+            LockIntegrity::Sri("sha512-y==".into())
+        );
+    }
+
+    /// Real classic-lock degenerations: a `resolved` URL without the legacy
+    /// `#sha1` fragment (registries that strip fragments) and a block with
+    /// no `resolved` at all (offline-pruned locks). Both stay listed for
+    /// discovery with no verifier — never dropped, never guessed.
+    #[tokio::test]
+    async fn yarn_classic_fragmentless_and_resolvedless_blocks_stay_discovery_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "yarn.lock",
+            "# yarn lockfile v1\n\n\
+             no-fragment@^1.0.0:\n  version \"1.0.0\"\n  \
+             resolved \"https://registry.npmjs.org/no-fragment/-/no-fragment-1.0.0.tgz\"\n\n\
+             no-resolved@^2.0.0:\n  version \"2.0.0\"\n",
+        )
+        .await;
+
+        let entries = inventory_yarn_classic(tmp.path()).await.unwrap();
+        let nf = entry(&entries, "no-fragment");
+        assert_eq!(
+            nf.resolved.as_deref(),
+            Some("https://registry.npmjs.org/no-fragment/-/no-fragment-1.0.0.tgz"),
+            "a fragmentless URL is still a usable artifact URL"
+        );
+        assert_eq!(nf.integrity, LockIntegrity::None);
+        let nr = entry(&entries, "no-resolved");
+        assert_eq!(nr.resolved, None);
+        assert_eq!(nr.integrity, LockIntegrity::None);
+    }
+
+    /// bun.lock is attacker-shaped committed input; each malformed 4-tuple
+    /// (undecodable spec/registry/integrity elements, unsplittable spec,
+    /// non-registry version) is skipped fail-soft — the well-formed entry
+    /// still inventories and no malformed one leaks through.
+    #[tokio::test]
+    async fn bun_malformed_tuples_are_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "bun.lock",
+            r#"{
+  "lockfileVersion": 1,
+  "workspaces": {
+    "": { "name": "fixture", "dependencies": { "left-pad": "1.3.0" } },
+  },
+  "packages": {
+    "left-pad": ["left-pad@1.3.0", "", {}, "sha512-XI5MPz=="],
+    "bad-elem0": [123, "", {}, "sha512-a=="],
+    "noat": ["noatsign", "", {}, "sha512-b=="],
+    "wsdep": ["wsdep@workspace:*", "", {}, "sha512-c=="],
+    "badreg": ["badreg@1.0.0", 42, {}, "sha512-d=="],
+    "badint": ["badint@1.0.0", "", {}, 99],
+  }
+}
+"#,
+        )
+        .await;
+
+        let (flavor, entries) = inventory_npm_lock(tmp.path()).await.unwrap().unwrap();
+        assert_eq!(flavor, NpmLockFlavor::Bun);
+        assert_eq!(
+            sorted_pairs(&entries),
+            vec![("left-pad".into(), "1.3.0".into())],
+            "every malformed tuple must be skipped, the good one kept"
+        );
+    }
+
+    /// composer.lock packages missing a name or version are skipped, and
+    /// names that are unsafe or not `vendor/pkg`-shaped are dropped
+    /// fail-closed (SECURITY: they feed paths and download URLs).
+    #[tokio::test]
+    async fn composer_lock_drops_nameless_versionless_and_unsafe_packages() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "composer.lock",
+            r#"{
+  "packages": [
+    { "version": "1.0.0" },
+    { "name": "nameless/partner" },
+    { "name": "singleseg", "version": "1.0.0" },
+    { "name": "a/../b", "version": "1.0.0" },
+    { "name": "good/pkg", "version": "1.0.0" }
+  ]
+}"#,
+        )
+        .await;
+
+        let entries = inventory_composer_lock(tmp.path()).await.unwrap();
+        assert_eq!(
+            entries.len(),
+            1,
+            "only the well-formed safe package inventories: {entries:?}"
+        );
+        assert_eq!(entries[0].purl, "pkg:composer/good/pkg@1.0.0");
+    }
+
+    /// The pre-multisource Gemfile.lock shape: ONE remote-less GEM section
+    /// defaults to rubygems.org. Rides along: an unsafe spec name is dropped
+    /// fail-closed, and a CHECKSUMS value that is not 64-hex is ignored (the
+    /// entry stays discovery-fetchable but unverified — LockIntegrity::None).
+    #[tokio::test]
+    async fn gemfile_lock_remoteless_single_section_defaults_to_rubygems() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "Gemfile.lock",
+            "GEM\n  specs:\n    rake (13.0.6)\n    ../evil (1.0.0)\n\n\
+             CHECKSUMS\n  rake (13.0.6) sha256=zznothexzznothexzznothexzznothex\n",
+        )
+        .await;
+
+        let entries = inventory_gemfile_lock(tmp.path()).await.unwrap();
+        assert_eq!(
+            entries.len(),
+            1,
+            "the unsafe spec name must be dropped: {entries:?}"
+        );
+        let rake = entry(&entries, "rake");
+        assert_eq!(
+            rake.resolved.as_deref(),
+            Some("https://rubygems.org/downloads/rake-13.0.6.gem"),
+            "a lone remote-less GEM section defaults to rubygems.org"
+        );
+        assert_eq!(
+            rake.integrity,
+            LockIntegrity::None,
+            "a non-64-hex CHECKSUMS value must be ignored"
+        );
+    }
+
+    /// A poetry.lock with zero `[[package]]` blocks yields None, which
+    /// routes `inventory_pypi_locks` onward to requirements.txt — where a
+    /// non-digit-version pin is guard-dropped; and a requirements.txt with
+    /// no `==` pin at all yields None.
+    #[tokio::test]
+    async fn depless_poetry_lock_falls_through_to_requirements() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "poetry.lock",
+            "[metadata]\nlock-version = \"2.0\"\n",
+        )
+        .await;
+        write(tmp.path(), "requirements.txt", "requests==2.31.0\nbad==vNaN\n").await;
+        let entries = inventory_pypi_locks(tmp.path()).await.unwrap();
+        assert_eq!(
+            sorted_pairs(&entries),
+            vec![("requests".into(), "2.31.0".into())],
+            "a package-less poetry.lock must route onward; the vNaN pin is dropped"
+        );
+
+        // No exact pin anywhere: the calm None, not an empty inventory.
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "requirements.txt",
+            "# comment\n-r other.txt\nflask>=2.0\n",
+        )
+        .await;
+        assert!(inventory_pypi_locks(tmp.path()).await.is_none());
+    }
+
+    /// `pure_wheel_from_uv_unit` rejection fall-throughs: a pure wheel whose
+    /// hash is not 64-hex, one with no hash at all, and one whose URL is not
+    /// http(s) all yield None — fail-closed, never a guessed pairing.
+    #[tokio::test]
+    async fn pure_wheel_rejects_short_hash_missing_hash_and_non_http_url() {
+        let short = "wheels = [{ url = \"https://h/x-1.0-py3-none-any.whl\", hash = \"sha256:abcd\" }]";
+        assert_eq!(pure_wheel_from_uv_unit(short), None, "short hash");
+
+        let hashless = "wheels = [{ url = \"https://h/x-1.0-py3-none-any.whl\" }]";
+        assert_eq!(pure_wheel_from_uv_unit(hashless), None, "no hash");
+
+        let ftp = format!(
+            "wheels = [{{ url = \"ftp://h/x-1.0-py3-none-any.whl\", hash = \"sha256:{}\" }}]",
+            "a".repeat(64)
+        );
+        assert_eq!(pure_wheel_from_uv_unit(&ftp), None, "non-http url");
+    }
+
+    /// The yarn-classic `integrity <sri>` branch of `wired_vendor_integrity`
+    /// — the trust anchor for repair's no-ledger reconstruction on
+    /// yarn-classic projects (rewired classic locks carry exactly this
+    /// line). Rides along fail-soft: an unparseable JSON lock and a v1 lock
+    /// without a `packages` map are both skipped, not fatal.
+    #[tokio::test]
+    async fn wired_vendor_integrity_reads_rewired_yarn_classic_and_skips_bad_json_locks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rel = ".socket/vendor/npm/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/left-pad-1.3.0.tgz";
+        // Unparseable JSON lock: skipped fail-soft.
+        write(tmp.path(), "npm-shrinkwrap.json", "not json").await;
+        // v1 lock without a packages map: skipped fail-soft.
+        write(
+            tmp.path(),
+            "package-lock.json",
+            r#"{"lockfileVersion":1,"dependencies":{}}"#,
+        )
+        .await;
+        // The rewired classic block, exactly as yarn_classic_lock rewires it.
+        write(
+            tmp.path(),
+            "yarn.lock",
+            &format!(
+                "# yarn lockfile v1\n\n\
+                 \"left-pad@file:./{rel}\":\n  \
+                 version \"1.3.0\"\n  \
+                 resolved \"file:./{rel}#0000000000000000000000000000000000000000\"\n  \
+                 integrity sha512-ours==\n"
+            ),
+        )
+        .await;
+
+        assert_eq!(
+            wired_vendor_integrity(tmp.path(), rel).await,
+            Some(LockIntegrity::Sri("sha512-ours==".into())),
+            "the classic `integrity <sri>` line is the wired trust anchor"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -3626,5 +4080,89 @@ mod recover_tests {
             )],
         );
         assert!(recover_lock_entry(tmp.path(), &bad).await.is_err());
+    }
+
+    /// composer dists FREQUENTLY record `shasum: ""` — that common recovery
+    /// outcome refuses the unverifiable fetch; the gem twin refuses when the
+    /// recorded checksum line carries no extractable 64-hex sha256.
+    #[tokio::test]
+    async fn recover_composer_empty_shasum_and_gem_hexless_checksum_fail_closed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let composer = entry(
+            "composer",
+            "pkg:composer/monolog/monolog@2.9.1",
+            vec![rec(
+                "composer_lock_package",
+                serde_json::json!({
+                    "dist": { "type": "zip", "url": "https://example.com/a.zip", "shasum": "" },
+                }),
+            )],
+        );
+        let err = recover_lock_entry(tmp.path(), &composer).await.unwrap_err();
+        assert!(
+            err.contains("records no shasum"),
+            "an empty shasum must refuse the fetch: {err}"
+        );
+
+        // The sha256 check precedes gem_remotes, so no Gemfile.lock needed.
+        let gem = entry(
+            "gem",
+            "pkg:gem/rake@13.0.6",
+            vec![rec(
+                "gemfile_lock_checksum",
+                serde_json::json!("  rake (13.0.6) sha256=zz"),
+            )],
+        );
+        let err = recover_lock_entry(tmp.path(), &gem).await.unwrap_err();
+        assert!(
+            err.contains("has no sha256"),
+            "a hex-less checksum line must refuse the fetch: {err}"
+        );
+    }
+
+    /// Fragments PRESENT but invalid (non-SRI pnpm integrity, a yarn block
+    /// with neither SRI nor 40-hex fragment, a malformed berry checksum, a
+    /// bun tuple without an SRI token) must all fall through to the final
+    /// fail-closed error — only the no-fragment-at-all path was tested. An
+    /// empty-name base purl is unparseable outright.
+    #[tokio::test]
+    async fn recover_present_but_invalid_npm_fragments_fail_closed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nameless = entry("npm", "pkg:npm/@1.0.0", vec![]);
+        let err = recover_lock_entry(tmp.path(), &nameless).await.unwrap_err();
+        assert!(
+            err.contains("unparseable base purl"),
+            "an empty-name purl must be rejected: {err}"
+        );
+
+        let all_invalid = entry(
+            "npm",
+            "pkg:npm/x@1.0.0",
+            vec![
+                rec(
+                    "pnpm_lock_package",
+                    serde_json::json!(["    resolution: {integrity: garbage}"]),
+                ),
+                rec(
+                    "yarn_lock_block",
+                    serde_json::json!(["  resolved \"https://x/y.tgz\""]),
+                ),
+                rec(
+                    "yarn_berry_lock_entry",
+                    serde_json::json!(["  checksum: malformed"]),
+                ),
+                rec(
+                    "bun_lock_package",
+                    serde_json::json!("    \"x\": [\"x@1.0.0\", \"\", {}, \"notsri\"],"),
+                ),
+            ],
+        );
+        let err = recover_lock_entry(tmp.path(), &all_invalid)
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("no pre-vendor npm registry fragment"),
+            "every invalid fragment must fall through to the fail-closed error: {err}"
+        );
     }
 }

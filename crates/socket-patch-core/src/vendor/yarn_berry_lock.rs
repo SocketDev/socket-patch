@@ -2147,6 +2147,28 @@ __metadata:
         }
     }
 
+    /// Chmod `path` to `mode`, restoring 0o755 on drop so TempDir cleanup
+    /// (and a panicking assert mid-test) never leaves an undeletable tree.
+    #[cfg(unix)]
+    struct ModeGuard(PathBuf);
+
+    #[cfg(unix)]
+    impl ModeGuard {
+        fn set(path: &Path, mode: u32) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+            Self(path.to_path_buf())
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for ModeGuard {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+
     #[cfg(unix)]
     fn mkfifo(path: &Path) {
         use std::os::unix::ffi::OsStrExt;
@@ -2264,6 +2286,637 @@ __metadata:
         assert!(!outcome.success, "tampered uuid must fail closed");
     }
 
+    /// Every remaining pre-write gate refuses BEFORE any project write:
+    /// malformed coordinates, a non-berry lock (no `__metadata:`), a lock
+    /// with no root `<name>@workspace:.` entry, an unparseable/non-object
+    /// package.json, a non-object `resolutions` table, and a bundled-deps
+    /// package (the shared pipeline's refusal bubbling verbatim).
+    #[tokio::test]
+    async fn pre_write_gates_refuse_and_leave_the_project_untouched() {
+        // Coordinates guard: a non-npm purl never reaches the disk.
+        let fx = fixture().await;
+        let blobs = fx.root().join(".socket/blobs");
+        let sources = PatchSources::blobs_only(&blobs);
+        let outcome = vendor_yarn_berry(
+            "pkg:gem/left-pad@1.3.0",
+            &fx.installed(),
+            fx.root(),
+            &fx.record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            None,
+        )
+        .await;
+        let detail = expect_refused(outcome, "unsafe_coordinates");
+        assert!(detail.contains("pkg:gem/left-pad@1.3.0"), "{detail}");
+        fx.assert_untouched().await;
+
+        // No `__metadata:` block: not a yarn berry lockfile.
+        let lock = B3_BEFORE_LOCK.replace("__metadata:\n  version: 8\n  cacheKey: 10c0\n\n", "");
+        assert_ne!(lock, B3_BEFORE_LOCK, "the fixture edit must hit");
+        let fx = fixture_with(B3_BEFORE_PKG, &lock).await;
+        let detail = expect_refused(fx.vendor(false).await, "vendor_lockfile_version_unsupported");
+        assert!(detail.contains("__metadata"), "{detail}");
+        fx.assert_untouched().await;
+
+        // No root `<name>@workspace:.` entry: the locator cannot be built.
+        let lock = B3_BEFORE_LOCK
+            .replace("vendor-spike@workspace:.", "vendor-spike@workspace:packages/a");
+        assert_ne!(lock, B3_BEFORE_LOCK, "the fixture edit must hit");
+        let fx = fixture_with(B3_BEFORE_PKG, &lock).await;
+        let detail = expect_refused(fx.vendor(false).await, "vendor_lockfile_version_unsupported");
+        assert!(detail.contains("@workspace:."), "{detail}");
+        fx.assert_untouched().await;
+
+        // Unparseable package.json.
+        let fx = fixture_with("{\"name\":", B3_BEFORE_LOCK).await;
+        let detail = expect_refused(
+            fx.vendor(false).await,
+            "vendor_yarn_berry_manifest_unreadable",
+        );
+        assert!(detail.contains("not parseable"), "{detail}");
+        fx.assert_untouched().await;
+
+        // Parseable but non-object root.
+        let fx = fixture_with("[]", B3_BEFORE_LOCK).await;
+        let detail = expect_refused(
+            fx.vendor(false).await,
+            "vendor_yarn_berry_manifest_unreadable",
+        );
+        assert!(detail.contains("root is not an object"), "{detail}");
+        fx.assert_untouched().await;
+
+        // `resolutions` present but not an object.
+        let pkg = B3_BEFORE_PKG.replace("  }\n}", "  },\n  \"resolutions\": \"nope\"\n}");
+        assert_ne!(pkg, B3_BEFORE_PKG, "the fixture edit must hit");
+        let fx = fixture_with(&pkg, B3_BEFORE_LOCK).await;
+        let detail = expect_refused(fx.vendor(false).await, "vendor_override_conflict");
+        assert!(detail.contains("is not an object"), "{detail}");
+        fx.assert_untouched().await;
+
+        // Bundled dependencies: stage_patch_pack's refusal bubbles verbatim
+        // before anything inside the project is written.
+        let fx = fixture().await;
+        tokio::fs::write(
+            fx.installed().join("package.json"),
+            br#"{"name":"left-pad","version":"1.3.0","bundledDependencies":["x"]}"#,
+        )
+        .await
+        .unwrap();
+        let detail = expect_refused(fx.vendor(false).await, "vendor_bundled_deps_unsupported");
+        assert!(detail.contains("bundleDependencies"), "{detail}");
+        fx.assert_untouched().await;
+    }
+
+    /// An unrelated resolutions entry is skipped by the conflict scan and
+    /// carried into the rewritten table alongside our new spec.
+    #[tokio::test]
+    async fn unrelated_resolutions_entry_is_kept_alongside_ours() {
+        let pkg = B3_BEFORE_PKG.replace(
+            "  }\n}",
+            "  },\n  \"resolutions\": {\n    \"is-odd\": \"1.0.0\"\n  }\n}",
+        );
+        assert_ne!(pkg, B3_BEFORE_PKG, "the fixture edit must hit");
+        let fx = fixture_with(&pkg, B3_BEFORE_LOCK).await;
+
+        let (result, entry, _) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        assert!(entry.is_some());
+
+        let pkg: Value =
+            serde_json::from_slice(&tokio::fs::read(fx.pkg_path()).await.unwrap()).unwrap();
+        assert_eq!(
+            pkg["resolutions"]["is-odd"],
+            json!("1.0.0"),
+            "unrelated entry kept"
+        );
+        assert_eq!(
+            pkg["resolutions"]["left-pad"],
+            json!(format!(
+                "file:./.socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz"
+            )),
+            "our spec added beside it"
+        );
+    }
+
+    /// Lock-scan shape guards: a key with no parseable `name@range`
+    /// descriptor is skipped (not ours to touch), a multi-pattern key mixing
+    /// the target name with another name refuses, and two entries resolving
+    /// the same name@version refuse as ambiguous.
+    #[tokio::test]
+    async fn lock_scan_skips_unparseable_keys_and_refuses_ambiguous_targets() {
+        // Unparseable key: skipped, vendor proceeds, block byte-untouched.
+        const WEIRD_BLOCK: &str = "\"weird\":\n  version: 9.9.9\n  resolution: \"weird@npm:9.9.9\"\n  checksum: 10c0/aa\n  languageName: node\n  linkType: hard\n";
+        let lock = format!("{B3_BEFORE_LOCK}\n{WEIRD_BLOCK}");
+        let fx = fixture_with(B3_BEFORE_PKG, &lock).await;
+        let (result, entry, _) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        assert!(entry.is_some());
+        let text = tokio::fs::read_to_string(fx.lock_path()).await.unwrap();
+        assert!(
+            text.contains(WEIRD_BLOCK),
+            "unparseable block byte-untouched: {text}"
+        );
+        assert!(text.contains("left-pad@file:./"), "target still rewired");
+
+        // A key mixing the target name with another descriptor's name
+        // (per-pattern quoting — a comma inside ONE quoted key is a single
+        // pattern and takes the plain-candidate path instead).
+        let lock = B3_BEFORE_LOCK.replace(
+            "\"left-pad@npm:1.3.0\":",
+            "\"left-pad@npm:1.3.0\", \"is-odd@npm:1.0.0\":",
+        );
+        assert_ne!(lock, B3_BEFORE_LOCK, "the fixture edit must hit");
+        let fx = fixture_with(B3_BEFORE_PKG, &lock).await;
+        let detail = expect_refused(fx.vendor(false).await, "vendor_override_conflict");
+        assert!(detail.contains("mixes"), "{detail}");
+        fx.assert_untouched().await;
+
+        // Two entries resolving the SAME name@version: ambiguous rewrite.
+        let lock = format!(
+            "{B3_BEFORE_LOCK}\n\"left-pad@npm:^1.3.0\":\n  version: 1.3.0\n  resolution: \"left-pad@npm:1.3.0\"\n  checksum: 10c0/aa\n  languageName: node\n  linkType: hard\n"
+        );
+        let fx = fixture_with(B3_BEFORE_PKG, &lock).await;
+        let detail = expect_refused(fx.vendor(false).await, "vendor_override_conflict");
+        assert!(detail.contains("multiple yarn.lock entries"), "{detail}");
+        fx.assert_untouched().await;
+    }
+
+    /// Revert tolerates a deleted wired file (warn + restore the rest +
+    /// prune the artifact) but fails CLOSED on a corrupt package.json —
+    /// after the lock restore already ran (the partial-restore contract).
+    #[tokio::test]
+    async fn revert_tolerates_missing_wired_files_and_fails_closed_on_corrupt_manifest() {
+        // yarn.lock deleted: warn, restore package.json, prune the artifact.
+        let fx = fixture().await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+        tokio::fs::remove_file(fx.lock_path()).await.unwrap();
+        let outcome = revert_yarn_berry(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        let warning = outcome
+            .warnings
+            .iter()
+            .find(|w| w.code == "vendor_lockfile_missing")
+            .unwrap_or_else(|| panic!("expected the missing-lock warning: {:?}", outcome.warnings));
+        assert!(warning.detail.contains(YARN_LOCK), "{}", warning.detail);
+        assert_eq!(
+            tokio::fs::read(fx.pkg_path()).await.unwrap(),
+            fx.pkg_bytes,
+            "package.json still restored"
+        );
+        assert!(
+            !fx.tgz_path().exists(),
+            "artifact pruned despite the missing lock"
+        );
+
+        // package.json deleted: warn, restore yarn.lock, prune the artifact.
+        let fx = fixture().await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+        tokio::fs::remove_file(fx.pkg_path()).await.unwrap();
+        let outcome = revert_yarn_berry(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        let warning = outcome
+            .warnings
+            .iter()
+            .find(|w| w.code == "vendor_lockfile_missing")
+            .unwrap_or_else(|| {
+                panic!("expected the missing-manifest warning: {:?}", outcome.warnings)
+            });
+        assert!(warning.detail.contains(PACKAGE_JSON), "{}", warning.detail);
+        assert_eq!(
+            tokio::fs::read(fx.lock_path()).await.unwrap(),
+            fx.lock_bytes,
+            "yarn.lock still restored"
+        );
+        assert!(
+            !fx.tgz_path().exists(),
+            "artifact pruned despite the missing manifest"
+        );
+        assert!(
+            !fx.pkg_path().exists(),
+            "the missing manifest is not resurrected"
+        );
+
+        // Corrupt package.json: fail closed AFTER the lock restore ran.
+        let fx = fixture().await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+        tokio::fs::write(fx.pkg_path(), b"{bad").await.unwrap();
+        let outcome = revert_yarn_berry(&entry, fx.root(), false).await;
+        assert!(!outcome.success, "corrupt manifest must fail the revert");
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("not parseable JSON"),
+            "{:?}",
+            outcome.error
+        );
+        assert_eq!(
+            tokio::fs::read(fx.lock_path()).await.unwrap(),
+            fx.lock_bytes,
+            "the lock restore already ran when the manifest failed (partial restore)"
+        );
+        assert!(
+            fx.tgz_path().exists(),
+            "artifact survives the failed revert"
+        );
+    }
+
+    /// Write failures fail closed on unix: a read-only project root makes
+    /// the vendor commit fail (unwinding the staged uuid dir) and the revert
+    /// writes fail; a read-only `.socket/vendor/npm` makes the artifact
+    /// removal fail — and a re-run converges once the permission is fixed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_write_failures_fail_closed_and_unstage() {
+        if unsafe { libc::geteuid() } == 0 {
+            return; // chmod is advisory for root — the failures never fire
+        }
+
+        // Vendor: commit_pair's package.json temp-write fails on the
+        // read-only root (node_modules and .socket stay writable, so
+        // staging + packing succeed); the fresh uuid dir is unwound.
+        let fx = fixture().await;
+        let guard = ModeGuard::set(fx.root(), 0o555);
+        let (result, entry, _) = expect_done(fx.vendor(false).await);
+        assert!(!result.success, "a read-only root must fail the commit");
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("cannot write package.json"),
+            "{:?}",
+            result.error
+        );
+        assert!(entry.is_none());
+        fx.assert_untouched().await;
+        drop(guard);
+
+        // Revert: the yarn.lock restore write fails first.
+        let fx = fixture().await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+        let guard = ModeGuard::set(fx.root(), 0o555);
+        let outcome = revert_yarn_berry(&entry, fx.root(), false).await;
+        assert!(!outcome.success, "read-only root must fail the lock write");
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("cannot write yarn.lock"),
+            "{:?}",
+            outcome.error
+        );
+        assert!(
+            fx.tgz_path().exists(),
+            "the artifact must survive the failed revert"
+        );
+        drop(guard);
+
+        // Revert with the lock hand-restored (converged — no lock write
+        // happens): the package.json restore write fails instead.
+        let fx = fixture().await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+        tokio::fs::write(fx.lock_path(), &fx.lock_bytes)
+            .await
+            .unwrap();
+        let guard = ModeGuard::set(fx.root(), 0o555);
+        let outcome = revert_yarn_berry(&entry, fx.root(), false).await;
+        assert!(!outcome.success, "read-only root must fail the pkg write");
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("cannot write package.json"),
+            "{:?}",
+            outcome.error
+        );
+        assert_eq!(
+            tokio::fs::read(fx.lock_path()).await.unwrap(),
+            fx.lock_bytes,
+            "the converged lock is never rewritten"
+        );
+        assert!(fx.tgz_path().exists());
+        drop(guard);
+
+        // Revert with a read-only .socket/vendor/npm: the wiring restores,
+        // the removal fails — and a re-run converges once perms are fixed.
+        let fx = fixture().await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+        let guard = ModeGuard::set(&fx.root().join(".socket/vendor/npm"), 0o555);
+        let outcome = revert_yarn_berry(&entry, fx.root(), false).await;
+        assert!(!outcome.success, "a read-only parent must fail the removal");
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("cannot remove"),
+            "{:?}",
+            outcome.error
+        );
+        assert_eq!(
+            tokio::fs::read(fx.pkg_path()).await.unwrap(),
+            fx.pkg_bytes,
+            "the wiring restore ran before the failed removal"
+        );
+        assert_eq!(
+            tokio::fs::read(fx.lock_path()).await.unwrap(),
+            fx.lock_bytes
+        );
+        drop(guard);
+        let outcome = revert_yarn_berry(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(
+            outcome.warnings.is_empty(),
+            "the converged re-run is silent: {:?}",
+            outcome.warnings
+        );
+        assert!(
+            !fx.root().join(format!(".socket/vendor/npm/{UUID}")).exists(),
+            "the re-run converges and removes the uuid dir"
+        );
+    }
+
+    /// Poisoned state.json wiring records are left alone with a drift
+    /// warning: a record with no key, an unknown kind, and a non-object
+    /// package.json root each warn without touching anything.
+    #[test]
+    fn revert_resolution_record_leaves_poisoned_records_alone() {
+        let rec = |kind: &str, key: Option<&str>| WiringRecord {
+            file: PACKAGE_JSON.to_string(),
+            kind: kind.to_string(),
+            action: WiringAction::Added,
+            key: key.map(str::to_string),
+            original: None,
+            new: Some(json!("file:./x")),
+        };
+        let pristine = json!({"resolutions": {"left-pad": "file:./x"}});
+
+        // No key.
+        let mut pkg = pristine.clone();
+        let mut changed = false;
+        let mut warnings = Vec::new();
+        revert_resolution_record(
+            &mut pkg,
+            &rec(KIND_RESOLUTION, None),
+            UUID,
+            &mut changed,
+            &mut warnings,
+        );
+        assert!(!changed);
+        assert_eq!(pkg, pristine, "left alone");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert_eq!(warnings[0].code, "vendor_lock_entry_drifted");
+        assert!(
+            warnings[0].detail.contains("has no key"),
+            "{}",
+            warnings[0].detail
+        );
+
+        // Unknown kind.
+        let mut pkg = pristine.clone();
+        let mut changed = false;
+        let mut warnings = Vec::new();
+        revert_resolution_record(
+            &mut pkg,
+            &rec("bogus", Some("left-pad")),
+            UUID,
+            &mut changed,
+            &mut warnings,
+        );
+        assert!(!changed);
+        assert_eq!(pkg, pristine, "left alone");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].detail.contains("unknown wiring kind `bogus`"),
+            "{}",
+            warnings[0].detail
+        );
+
+        // Non-object package.json root.
+        let mut pkg = json!([1]);
+        let mut changed = false;
+        let mut warnings = Vec::new();
+        revert_resolution_record(
+            &mut pkg,
+            &rec(KIND_RESOLUTION, Some("left-pad")),
+            UUID,
+            &mut changed,
+            &mut warnings,
+        );
+        assert!(!changed);
+        assert_eq!(pkg, json!([1]), "left alone");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].detail.contains("root is not an object"),
+            "{}",
+            warnings[0].detail
+        );
+    }
+
+    /// Takeover records (a user pin recorded as `original`) whose
+    /// resolutions table or key was removed by the user warn + keep the
+    /// artifact; a hand-restored pin reads as CONVERGED — silent, artifact
+    /// pruned (the drift-keep liveness contract).
+    #[tokio::test]
+    async fn takeover_drift_warns_and_keeps_while_a_restored_pin_converges_silently() {
+        let pkg_before = B3_BEFORE_PKG.replace(
+            "  }\n}",
+            "  },\n  \"resolutions\": {\n    \"left-pad\": \"1.3.0\"\n  }\n}",
+        );
+
+        // The whole resolutions table was removed since vendoring.
+        let fx = fixture_with(&pkg_before, B3_BEFORE_LOCK).await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+        tokio::fs::write(fx.pkg_path(), B3_BEFORE_PKG).await.unwrap();
+        let outcome = revert_yarn_berry(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(
+            outcome.warnings.iter().any(
+                |w| w.code == "vendor_lock_entry_drifted" && w.detail.contains("no longer exists")
+            ),
+            "{:?}",
+            outcome.warnings
+        );
+        assert!(outcome.kept_artifact, "drift-skip keeps the artifact");
+        assert!(fx.tgz_path().exists());
+        let pkg: Value =
+            serde_json::from_slice(&tokio::fs::read(fx.pkg_path()).await.unwrap()).unwrap();
+        assert!(
+            pkg.get("resolutions").is_none(),
+            "the recorded pin is NOT resurrected"
+        );
+        assert_eq!(
+            tokio::fs::read(fx.lock_path()).await.unwrap(),
+            fx.lock_bytes,
+            "the lock restore still ran (independent fragment)"
+        );
+
+        // The table is present but our key was removed by the user.
+        let fx = fixture_with(&pkg_before, B3_BEFORE_LOCK).await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+        let mut pkg: Value =
+            serde_json::from_slice(&tokio::fs::read(fx.pkg_path()).await.unwrap()).unwrap();
+        pkg["resolutions"] = json!({"is-odd": "1.0.0"});
+        tokio::fs::write(fx.pkg_path(), serde_json::to_vec_pretty(&pkg).unwrap())
+            .await
+            .unwrap();
+        let outcome = revert_yarn_berry(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(
+            outcome.warnings.iter().any(
+                |w| w.code == "vendor_lock_entry_drifted" && w.detail.contains("no longer exists")
+            ),
+            "{:?}",
+            outcome.warnings
+        );
+        assert!(outcome.kept_artifact && fx.tgz_path().exists());
+        let after: Value =
+            serde_json::from_slice(&tokio::fs::read(fx.pkg_path()).await.unwrap()).unwrap();
+        assert_eq!(
+            after["resolutions"],
+            json!({"is-odd": "1.0.0"}),
+            "the user's table is left alone"
+        );
+
+        // The pin was hand-restored: converged, silent, artifact pruned.
+        let fx = fixture_with(&pkg_before, B3_BEFORE_LOCK).await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+        let text = tokio::fs::read_to_string(fx.pkg_path()).await.unwrap();
+        let healed = text.replace(
+            &format!("file:./.socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz"),
+            "1.3.0",
+        );
+        assert_ne!(healed, text, "the hand-restore edit must hit");
+        tokio::fs::write(fx.pkg_path(), &healed).await.unwrap();
+        let outcome = revert_yarn_berry(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(
+            outcome.warnings.is_empty(),
+            "a converged pin is silent: {:?}",
+            outcome.warnings
+        );
+        assert!(!outcome.kept_artifact);
+        assert_eq!(
+            tokio::fs::read(fx.lock_path()).await.unwrap(),
+            fx.lock_bytes,
+            "lock restored byte-for-byte"
+        );
+        assert!(!fx.tgz_path().exists(), "artifact pruned once converged");
+        let after: Value =
+            serde_json::from_slice(&tokio::fs::read(fx.pkg_path()).await.unwrap()).unwrap();
+        assert_eq!(
+            after["resolutions"]["left-pad"],
+            json!("1.3.0"),
+            "the hand-restored pin stays"
+        );
+    }
+
+    /// `--preserve-state` (`keep_artifact`): the wiring restore runs, the
+    /// artifact dir (tarball + marker) stays, `kept_artifact` stays false
+    /// (reserved for drift-keeps) — and a later plain revert converges
+    /// silently and prunes the artifact.
+    #[tokio::test]
+    async fn preserve_state_revert_restores_wiring_but_keeps_the_artifact() {
+        let fx = fixture().await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+
+        let outcome = revert_yarn_berry_opts(
+            &entry,
+            fx.root(),
+            RevertOpts {
+                dry_run: false,
+                keep_artifact: true,
+            },
+        )
+        .await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        assert!(!outcome.kept_artifact, "reserved for drift-keeps");
+        assert_eq!(
+            tokio::fs::read(fx.pkg_path()).await.unwrap(),
+            fx.pkg_bytes,
+            "the wiring restore ran"
+        );
+        assert_eq!(
+            tokio::fs::read(fx.lock_path()).await.unwrap(),
+            fx.lock_bytes
+        );
+        assert!(fx.tgz_path().exists(), "artifact kept");
+        assert!(
+            fx.root()
+                .join(format!(
+                    ".socket/vendor/npm/{UUID}/socket-patch.vendor.json"
+                ))
+                .exists(),
+            "marker kept"
+        );
+
+        // A later plain revert converges silently and prunes the artifact.
+        let outcome = revert_yarn_berry(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(
+            outcome.warnings.is_empty(),
+            "converged records are silent: {:?}",
+            outcome.warnings
+        );
+        assert!(!fx
+            .root()
+            .join(format!(".socket/vendor/npm/{UUID}"))
+            .exists());
+    }
+
+    /// A failed vendor-marker write is a warning, never a failure: the
+    /// marker is informational and the pair wiring must stand.
+    #[tokio::test]
+    async fn marker_write_failure_is_a_warning_not_a_failure() {
+        let fx = fixture().await;
+        // Staging only create_dir_all's the uuid dir (never wipes it), so a
+        // DIRECTORY planted at the marker path survives staging and fails
+        // the marker's atomic rename.
+        let marker_path = fx.root().join(format!(
+            ".socket/vendor/npm/{UUID}/socket-patch.vendor.json"
+        ));
+        tokio::fs::create_dir_all(&marker_path).await.unwrap();
+
+        let (result, entry, warnings) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        assert!(entry.is_some(), "the wiring stands");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.code == "vendor_marker_write_failed"),
+            "{warnings:?}"
+        );
+
+        // Both files were still wired normally (the B3 oracles hold).
+        assert_eq!(
+            tokio::fs::read_to_string(fx.pkg_path()).await.unwrap(),
+            B3_AFTER_PKG
+        );
+        let (hash6, checksum) = fx.packed_berry_facts().await;
+        assert_eq!(
+            tokio::fs::read_to_string(fx.lock_path()).await.unwrap(),
+            spike_after_lock(&hash6, &checksum)
+        );
+    }
+
     #[test]
     fn helper_grammar() {
         // encodeURIComponent semantics, incl. a scoped workspace name.
@@ -2315,5 +2968,61 @@ __metadata:
                 "    wow: \"npm:^1.0.0\"".to_string()
             ]
         );
+
+        // A `resolutions:` line must not satisfy a `resolution` field read:
+        // the prefix match leaves a leading `s`, and the `:` gate skips it.
+        let collide: Vec<String> = ["\"k\":", "  resolutions: nope", "  resolution: \"y\""]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(berry_field(&collide, "resolution"), Some("y"));
+        assert_eq!(berry_field(&collide, "resolutions"), Some("nope"));
+
+        // A body line that is neither a field line nor preceded by a section
+        // header is carried verbatim (the owned scalar still drops).
+        let orphan: Vec<String> = ["\"k\":", "    orphan-submap-line", "  version: 1.3.0"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            carried_sections(&orphan),
+            vec!["    orphan-submap-line".to_string()]
+        );
+    }
+
+    /// An EMPTY workspace ident (`"@workspace:."` — a root package.json with
+    /// no `name`) must never satisfy the root-workspace probe: the extracted
+    /// name is embedded verbatim in the vendored `file:` locator, and an
+    /// empty ident there would emit a lock key/resolution yarn cannot parse.
+    /// The probe skips it — still finding a later named root — and with no
+    /// named root at all the vendor path refuses fail-closed before any
+    /// write.
+    #[tokio::test]
+    async fn empty_workspace_ident_is_skipped_and_vendor_refuses() {
+        // Unit: the empty ident is skipped, not returned as "".
+        let empty_only = B3_BEFORE_LOCK.replace("vendor-spike@workspace:.", "@workspace:.");
+        assert_eq!(root_workspace_name(&scan_blocks(&empty_only)), None);
+
+        // Skipping means the scan CONTINUES: a later named root still wins.
+        let empty_then_named = format!(
+            "{empty_only}\n\"vendor-spike@workspace:.\":\n  version: 0.0.0-use.local\n  \
+             resolution: \"vendor-spike@workspace:.\"\n  languageName: unknown\n  \
+             linkType: soft\n"
+        );
+        assert_eq!(
+            root_workspace_name(&scan_blocks(&empty_then_named)).as_deref(),
+            Some("vendor-spike")
+        );
+
+        // E2E: with only the empty-ident root, vendoring refuses fail-closed
+        // (same gate as a lock with no workspace entry at all) and the
+        // project stays byte-untouched.
+        let fx = fixture_with(B3_BEFORE_PKG, &empty_only).await;
+        let detail = expect_refused(
+            fx.vendor(false).await,
+            "vendor_lockfile_version_unsupported",
+        );
+        assert!(detail.contains("@workspace:."), "{detail}");
+        fx.assert_untouched().await;
     }
 }

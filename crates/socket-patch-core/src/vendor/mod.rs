@@ -467,8 +467,22 @@ pub async fn harvest_artifact_blobs(
                 if file.is_dir() || file.size() > MAX_FILE_BYTES {
                     continue;
                 }
+                // SECURITY: `file.size()` above is only the archive-DECLARED
+                // uncompressed size; the entry reader is bounded solely by the
+                // COMPRESSED size, so a zip bomb can declare a tiny size (past
+                // the gate) yet decompress far beyond the cap. Bound the
+                // decompressed read itself and drop any entry that overflows,
+                // before its bytes are all in memory.
                 let mut content = Vec::with_capacity(file.size() as usize);
-                if file.read_to_end(&mut content).is_err() {
+                if file
+                    .by_ref()
+                    .take(MAX_FILE_BYTES + 1)
+                    .read_to_end(&mut content)
+                    .is_err()
+                {
+                    continue;
+                }
+                if content.len() as u64 > MAX_FILE_BYTES {
                     continue;
                 }
                 let h = compute_git_sha256_from_bytes(&content);
@@ -890,6 +904,29 @@ mod staging_tests {
         assert_eq!(missing, vec!["index.js".to_string()]);
     }
 
+    /// An unsafe record key (escaping or absolute) is SKIPPED by the
+    /// pre-check, never flagged missing: the apply pipeline itself rejects
+    /// unsafe keys fail-closed, and reporting them as "missing" would
+    /// misdiagnose a poisoned manifest as an incomplete stage.
+    #[tokio::test]
+    async fn unsafe_relative_key_is_not_flagged_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut record = one_file_record("../evil.js");
+        record.files.insert(
+            "/abs/evil.js".to_string(),
+            PatchFileInfo {
+                before_hash: "aa".repeat(32),
+                after_hash: "bb".repeat(32),
+            },
+        );
+        let missing = missing_existing_patch_files(tmp.path(), &record.files).await;
+        assert!(
+            missing.is_empty(),
+            "unsafe keys are the apply pipeline's fail-closed job, not the \
+             missing list's: {missing:?}"
+        );
+    }
+
     /// A readable staged file (even with mismatched content) is NOT flagged —
     /// that's the force-overwrite path, not the missing path.
     #[tokio::test]
@@ -1159,6 +1196,424 @@ mod harvest_tests {
             mem.get(&hash).map(|b| b.as_slice()),
             Some(PATCHED),
             "dir-shaped artifact must yield its afterHash blob"
+        );
+    }
+
+    fn write_zip(path: &Path, entry_name: &str, content: &[u8]) {
+        use std::io::Write as _;
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        writer
+            .start_file(
+                entry_name,
+                zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Deflated),
+            )
+            .unwrap();
+        writer.write_all(content).unwrap();
+        let bytes = writer.finish().unwrap().into_inner();
+        std::fs::write(path, &bytes).unwrap();
+    }
+
+    /// Like [`write_zip`], but afterwards forges the entry's DECLARED
+    /// uncompressed size (in both the local file header at offset 22 and the
+    /// central-directory header's field at +24) down to a small value. The
+    /// deflate stream is untouched, so it still decompresses to `content` —
+    /// this is the zip-bomb shape: a tiny declared size hiding a large
+    /// payload.
+    fn write_forged_undersized_zip(path: &Path, entry_name: &str, content: &[u8]) {
+        write_zip(path, entry_name, content);
+        let mut bytes = std::fs::read(path).unwrap();
+        let forged: u32 = 10;
+        assert_eq!(&bytes[0..4], b"PK\x03\x04", "local file header");
+        bytes[22..26].copy_from_slice(&forged.to_le_bytes());
+        let cd = bytes
+            .windows(4)
+            .position(|w| w == b"PK\x01\x02")
+            .expect("central directory header");
+        bytes[cd + 24..cd + 28].copy_from_slice(&forged.to_le_bytes());
+        std::fs::write(path, &bytes).unwrap();
+    }
+
+    #[tokio::test]
+    async fn honest_zip_artifact_yields_its_after_blob() {
+        let tmp = tempfile::tempdir().unwrap();
+        let purl = "pkg:pypi/lib@1.0.0";
+        let rel = format!(".socket/vendor/pypi/{UUID}/lib-1.0.0-py3-none-any.whl");
+        write_zip(&tmp.path().join(&rel), "lib/__init__.py", PATCHED);
+        write_ledger(tmp.path(), purl, UUID, &rel);
+
+        let (k, r) = record(purl, UUID, "lib/__init__.py", PATCHED);
+        let patches = HashMap::from([(k, r)]);
+        let mem = harvest_artifact_blobs(tmp.path(), &patches).await;
+        let hash = compute_git_sha256_from_bytes(PATCHED);
+        assert_eq!(
+            mem.get(&hash).map(|b| b.as_slice()),
+            Some(PATCHED),
+            "an in-bounds zip entry must still yield its afterHash blob"
+        );
+    }
+
+    /// A zip entry whose header DECLARES a tiny uncompressed size but whose
+    /// stream decompresses past the per-file cap (a zip bomb) must contribute
+    /// nothing. The metadata gate trusts `file.size()` (the declared value),
+    /// but the entry reader is bounded only by the COMPRESSED size, so the
+    /// decompressed read itself must enforce the cap — otherwise the bomb is
+    /// inflated fully into memory before any cap or CRC check, OOM-killing the
+    /// harvest.
+    #[tokio::test]
+    async fn oversized_zip_entry_declaring_small_size_contributes_nothing() {
+        // Mirror of the private per-file cap in `harvest_artifact_blobs`.
+        const MAX_FILE_BYTES: usize = 64 * 1024 * 1024;
+        let tmp = tempfile::tempdir().unwrap();
+        let purl = "pkg:pypi/lib@1.0.0";
+        let rel = format!(".socket/vendor/pypi/{UUID}/lib-1.0.0-py3-none-any.whl");
+        // Decompresses to just past the cap; a run of one byte compresses to a
+        // few KiB, so the artifact itself stays well under the artifact cap.
+        let content = vec![0x41u8; MAX_FILE_BYTES + 4096];
+        write_forged_undersized_zip(&tmp.path().join(&rel), "lib/__init__.py", &content);
+        write_ledger(tmp.path(), purl, UUID, &rel);
+
+        let (k, r) = record(purl, UUID, "lib/__init__.py", &content);
+        let patches = HashMap::from([(k, r)]);
+        let mem = harvest_artifact_blobs(tmp.path(), &patches).await;
+        assert!(
+            mem.is_empty(),
+            "a zip entry decompressing past the per-file cap must be dropped, \
+             not harvested — the declared size must not gate an unbounded read"
+        );
+    }
+
+    /// Like [`write_ledger`], but with full control over each entry's map
+    /// key, `basePurl`, uuid, and artifact path — for the multi-entry and
+    /// qualified-purl shapes the single-entry helper can't express.
+    fn write_ledger_entries(root: &Path, entries: &[(&str, &str, &str, &str)]) {
+        let vendor_dir = root.join(".socket/vendor");
+        std::fs::create_dir_all(&vendor_dir).unwrap();
+        let mut map = serde_json::Map::new();
+        for (key, base_purl, uuid, artifact_path) in entries {
+            map.insert(
+                key.to_string(),
+                serde_json::json!({
+                    "ecosystem": "npm",
+                    "basePurl": base_purl,
+                    "uuid": uuid,
+                    "artifact": { "path": artifact_path },
+                    "wiring": [],
+                }),
+            );
+        }
+        let state = serde_json::json!({ "version": 1, "entries": map });
+        std::fs::write(
+            vendor_dir.join("state.json"),
+            serde_json::to_vec(&state).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// Like [`write_zip`], but with a directory entry plus multiple file
+    /// entries — the shape a real wheel/jar/nupkg has.
+    fn write_zip_with_entries(path: &Path, dir_entry: &str, entries: &[(&str, &[u8])]) {
+        use std::io::Write as _;
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let opts = || {
+            zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated)
+        };
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        writer.add_directory(dir_entry, opts()).unwrap();
+        for (name, content) in entries {
+            writer.start_file(*name, opts()).unwrap();
+            writer.write_all(content).unwrap();
+        }
+        let bytes = writer.finish().unwrap().into_inner();
+        std::fs::write(path, &bytes).unwrap();
+    }
+
+    /// Every zip-shaped suffix (`.whl`/`.zip`/`.jar`/`.nupkg` — pypi, maven,
+    /// nuget) harvests its afterHash blob, skipping directory entries and
+    /// entries whose content no record needs.
+    #[tokio::test]
+    async fn zip_shaped_suffixes_harvest_and_skip_dir_and_unneeded_entries() {
+        for (suffix, eco, purl) in [
+            (".whl", "pypi", "pkg:pypi/lib@1.0.0"),
+            (".zip", "pypi", "pkg:pypi/lib@1.0.0"),
+            (".jar", "maven", "pkg:maven/g/a@1.0"),
+            (".nupkg", "nuget", "pkg:nuget/lib@1.0.0"),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let rel = format!(".socket/vendor/{eco}/{UUID}/artifact{suffix}");
+            write_zip_with_entries(
+                &tmp.path().join(&rel),
+                "lib/",
+                &[
+                    ("lib/__init__.py", PATCHED),
+                    ("lib/other.py", b"unrelated content\n"),
+                ],
+            );
+            write_ledger(tmp.path(), purl, UUID, &rel);
+
+            let (k, r) = record(purl, UUID, "lib/__init__.py", PATCHED);
+            let patches = HashMap::from([(k, r)]);
+            let mem = harvest_artifact_blobs(tmp.path(), &patches).await;
+            let hash = compute_git_sha256_from_bytes(PATCHED);
+            assert_eq!(
+                mem.len(),
+                1,
+                "{suffix}: only the needed afterHash blob is kept, got {:?}",
+                mem.keys().collect::<Vec<_>>()
+            );
+            assert_eq!(
+                mem.get(&hash).map(|b| b.as_slice()),
+                Some(PATCHED),
+                "{suffix} artifact must yield its afterHash blob"
+            );
+        }
+    }
+
+    /// Garbage bytes at a zip-shaped artifact path (a regular file, so it
+    /// passes the metadata gate) must be refused by the zip parser and
+    /// contribute nothing — fail-soft, no error.
+    #[tokio::test]
+    async fn corrupt_zip_shaped_artifact_contributes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let purl = "pkg:pypi/lib@1.0.0";
+        let rel = format!(".socket/vendor/pypi/{UUID}/lib-1.0.0-py3-none-any.whl");
+        let path = tmp.path().join(&rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"not a zip archive").unwrap();
+        write_ledger(tmp.path(), purl, UUID, &rel);
+
+        let (k, r) = record(purl, UUID, "lib/__init__.py", PATCHED);
+        let patches = HashMap::from([(k, r)]);
+        assert!(
+            harvest_artifact_blobs(tmp.path(), &patches).await.is_empty(),
+            "a corrupt zip-shaped artifact contributes nothing"
+        );
+    }
+
+    /// A manifest record keyed by a QUALIFIED purl still finds its ledger
+    /// entry through the base-purl fallback (the harvest twin of the
+    /// find_packages_for_rollback resolver invariant).
+    #[tokio::test]
+    async fn qualified_record_purl_falls_back_to_ledger_base_purl() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = "pkg:npm/left-pad@1.3.0";
+        let qualified = "pkg:npm/left-pad@1.3.0?checksum=sha256:aa";
+        let rel = format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz");
+        write_tgz(&tmp.path().join(&rel), "package/index.js", PATCHED);
+        // Ledger keyed (and basePurl'd) by the BASE spelling only.
+        write_ledger(tmp.path(), base, UUID, &rel);
+
+        let (k, r) = record(qualified, UUID, "package/index.js", PATCHED);
+        let patches = HashMap::from([(k, r)]);
+        let mem = harvest_artifact_blobs(tmp.path(), &patches).await;
+        let hash = compute_git_sha256_from_bytes(PATCHED);
+        assert_eq!(
+            mem.get(&hash).map(|b| b.as_slice()),
+            Some(PATCHED),
+            "a qualified record purl must resolve via the ledger's base purl"
+        );
+    }
+
+    /// A record whose purl matches NO ledger entry (neither the map key nor
+    /// any base purl) is skipped fail-soft.
+    #[tokio::test]
+    async fn record_purl_absent_from_ledger_is_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let other = "pkg:npm/other@2.0.0";
+        let rel = format!(".socket/vendor/npm/{UUID}/other-2.0.0.tgz");
+        write_tgz(&tmp.path().join(&rel), "package/index.js", PATCHED);
+        write_ledger(tmp.path(), other, UUID, &rel);
+
+        let (k, r) = record("pkg:npm/left-pad@1.3.0", UUID, "package/index.js", PATCHED);
+        let patches = HashMap::from([(k, r)]);
+        assert!(
+            harvest_artifact_blobs(tmp.path(), &patches).await.is_empty(),
+            "an un-vendored record must not harvest another package's artifact"
+        );
+    }
+
+    /// The documented "unreadable ledger contributes nothing" contract: a
+    /// corrupt state.json degrades the whole harvest to empty even when a
+    /// matching artifact is sitting right there.
+    #[tokio::test]
+    async fn corrupt_ledger_degrades_harvest_to_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let purl = "pkg:npm/left-pad@1.3.0";
+        let rel = format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz");
+        write_tgz(&tmp.path().join(&rel), "package/index.js", PATCHED);
+        std::fs::write(tmp.path().join(".socket/vendor/state.json"), b"{not json").unwrap();
+
+        let (k, r) = record(purl, UUID, "package/index.js", PATCHED);
+        let patches = HashMap::from([(k, r)]);
+        assert!(
+            harvest_artifact_blobs(tmp.path(), &patches).await.is_empty(),
+            "an unreadable ledger contributes nothing"
+        );
+    }
+
+    /// A record needing nothing (its only file is a deletion — empty
+    /// afterHash) never consults the ledger or reads the artifact.
+    #[tokio::test]
+    async fn record_with_only_empty_after_hashes_is_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let purl = "pkg:npm/left-pad@1.3.0";
+        let rel = format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz");
+        write_tgz(&tmp.path().join(&rel), "package/index.js", PATCHED);
+        write_ledger(tmp.path(), purl, UUID, &rel);
+
+        let (k, mut r) = record(purl, UUID, "package/index.js", PATCHED);
+        r.files.get_mut("package/index.js").unwrap().after_hash = String::new();
+        let patches = HashMap::from([(k, r)]);
+        assert!(
+            harvest_artifact_blobs(tmp.path(), &patches).await.is_empty(),
+            "a deletion-only record needs no blobs, even with a readable artifact"
+        );
+    }
+
+    /// Two records sharing one afterHash harvest the blob exactly once —
+    /// whichever record iterates second finds nothing left to need.
+    #[tokio::test]
+    async fn after_hash_shared_across_records_is_harvested_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let purl_a = "pkg:npm/left-pad@1.3.0";
+        let purl_b = "pkg:npm/right-pad@2.0.0";
+        let uuid_b = "22222222-3333-4444-8555-666666666666";
+        let rel_a = format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz");
+        let rel_b = format!(".socket/vendor/npm/{uuid_b}/right-pad-2.0.0.tgz");
+        write_tgz(&tmp.path().join(&rel_a), "package/index.js", PATCHED);
+        write_tgz(&tmp.path().join(&rel_b), "package/index.js", PATCHED);
+        write_ledger_entries(
+            tmp.path(),
+            &[
+                (purl_a, purl_a, UUID, &rel_a),
+                (purl_b, purl_b, uuid_b, &rel_b),
+            ],
+        );
+
+        let (ka, ra) = record(purl_a, UUID, "package/index.js", PATCHED);
+        let (kb, rb) = record(purl_b, uuid_b, "package/index.js", PATCHED);
+        let patches = HashMap::from([(ka, ra), (kb, rb)]);
+        let mem = harvest_artifact_blobs(tmp.path(), &patches).await;
+        let hash = compute_git_sha256_from_bytes(PATCHED);
+        assert_eq!(
+            mem.len(),
+            1,
+            "a shared afterHash is harvested once, got {:?}",
+            mem.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(mem.get(&hash).map(|b| b.as_slice()), Some(PATCHED));
+    }
+
+    /// Dir-shaped branch: an unsafe record file key must be skipped, never
+    /// joined onto the artifact dir for reading. Matching content is planted
+    /// at the exact location the key WOULD resolve to, proving the empty
+    /// harvest is the guard and not a read miss.
+    #[tokio::test]
+    async fn unsafe_record_file_key_is_skipped_in_dir_harvest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let purl = "pkg:cargo/serde@1.0.0";
+        let rel = format!(".socket/vendor/cargo/{UUID}/serde-1.0.0");
+        std::fs::create_dir_all(tmp.path().join(&rel)).unwrap();
+        write_ledger(tmp.path(), purl, UUID, &rel);
+        // <artifact>/../../outside.rs resolves here:
+        std::fs::write(
+            tmp.path().join(".socket/vendor/cargo/outside.rs"),
+            PATCHED,
+        )
+        .unwrap();
+
+        let (k, r) = record(purl, UUID, "../../outside.rs", PATCHED);
+        let patches = HashMap::from([(k, r)]);
+        assert!(
+            harvest_artifact_blobs(tmp.path(), &patches).await.is_empty(),
+            "an escaping record key must never be resolved against the artifact dir"
+        );
+    }
+
+    /// Dir-shaped branch skip matrix in one record: a deletion (empty
+    /// afterHash) is never read, a tampered file (content matching neither
+    /// hash) contributes nothing — per the doc contract — and the intact
+    /// file still harvests.
+    #[tokio::test]
+    async fn dir_artifact_skips_empty_hash_and_tampered_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let purl = "pkg:cargo/serde@1.0.0";
+        let rel = format!(".socket/vendor/cargo/{UUID}/serde-1.0.0");
+        let src = tmp.path().join(&rel).join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("lib.rs"), PATCHED).unwrap();
+        std::fs::write(src.join("tampered.rs"), b"tampered bytes").unwrap();
+        write_ledger(tmp.path(), purl, UUID, &rel);
+
+        let (k, mut r) = record(purl, UUID, "src/lib.rs", PATCHED);
+        r.files.insert(
+            "src/deleted.rs".to_string(),
+            PatchFileInfo {
+                before_hash: compute_git_sha256_from_bytes(b"original"),
+                after_hash: String::new(),
+            },
+        );
+        r.files.insert(
+            "src/tampered.rs".to_string(),
+            PatchFileInfo {
+                before_hash: compute_git_sha256_from_bytes(b"original"),
+                after_hash: compute_git_sha256_from_bytes(b"expected patched content"),
+            },
+        );
+        let patches = HashMap::from([(k, r)]);
+        let mem = harvest_artifact_blobs(tmp.path(), &patches).await;
+        let hash = compute_git_sha256_from_bytes(PATCHED);
+        assert_eq!(
+            mem.len(),
+            1,
+            "only the intact file harvests, got {:?}",
+            mem.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            mem.get(&hash).map(|b| b.as_slice()),
+            Some(PATCHED),
+            "the tampered and deleted files must contribute nothing"
+        );
+    }
+
+    /// Every spelling `vendored_purl_keys` promises: the entry's map key
+    /// (possibly qualified), its resolved base purl, and the
+    /// qualifier-stripped key.
+    #[tokio::test]
+    async fn vendored_purl_keys_lists_all_addressable_spellings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let qualified = "pkg:npm/left-pad@1.3.0?checksum=sha256:aa";
+        let base = "pkg:npm/left-pad@1.3.0";
+        let rel = format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz");
+        write_ledger_entries(tmp.path(), &[(qualified, base, UUID, &rel)]);
+
+        let keys = vendored_purl_keys(tmp.path()).await;
+        assert!(keys.contains(qualified), "map key spelling: {keys:?}");
+        assert!(
+            keys.contains(base),
+            "base purl / stripped spelling: {keys:?}"
+        );
+        assert_eq!(keys.len(), 2, "base and stripped coincide here: {keys:?}");
+    }
+
+    /// The documented fail-open degrade: no ledger yields the empty set, and
+    /// so does a corrupt one (apply/rollback/scan-prune then treat nothing
+    /// as vendor-owned).
+    #[tokio::test]
+    async fn vendored_purl_keys_degrade_to_empty_on_missing_or_corrupt_ledger() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(
+            vendored_purl_keys(tmp.path()).await.is_empty(),
+            "no ledger at all: empty set"
+        );
+        let vendor_dir = tmp.path().join(".socket/vendor");
+        std::fs::create_dir_all(&vendor_dir).unwrap();
+        std::fs::write(vendor_dir.join("state.json"), b"{not json").unwrap();
+        assert!(
+            vendored_purl_keys(tmp.path()).await.is_empty(),
+            "a corrupt ledger degrades fail-open to the empty set"
         );
     }
 }

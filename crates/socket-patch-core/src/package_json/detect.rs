@@ -705,6 +705,43 @@ mod tests {
         assert!(result.unwrap_err().contains("Invalid package.json"));
     }
 
+    /// Mirror of test_update_object_adds_dependencies_when_postinstall_exists:
+    /// `dependencies` is already configured but `postinstall` is not. The
+    /// already-configured script must come back byte-for-byte unchanged (the
+    /// keep-arm of `update_package_json_object`), with only `postinstall`
+    /// added — and no second patch command prepended to `dependencies`.
+    #[test]
+    fn test_update_content_dependencies_preconfigured_adds_postinstall() {
+        let configured = "npx @socketsecurity/socket-patch apply --silent --ecosystems npm";
+        let content = format!(r#"{{"scripts":{{"dependencies":"{configured}"}}}}"#);
+        let (modified, new_content, old_pi, new_pi, old_dep, new_dep) =
+            update_package_json_content(&content, PackageManager::Npm).unwrap();
+        assert!(modified);
+        assert!(old_pi.is_empty());
+        assert!(new_pi.contains("npx @socketsecurity/socket-patch apply"));
+        // The pre-configured dependencies script is untouched.
+        assert_eq!(old_dep, configured);
+        assert_eq!(new_dep, configured);
+        let parsed: serde_json::Value = serde_json::from_str(&new_content).unwrap();
+        assert_eq!(
+            parsed["scripts"]["dependencies"].as_str().unwrap(),
+            configured
+        );
+        assert_eq!(
+            parsed["scripts"]["dependencies"]
+                .as_str()
+                .unwrap()
+                .matches("socket-patch apply")
+                .count(),
+            1,
+            "must not double-prepend the patch command:\n{new_content}"
+        );
+        assert!(parsed["scripts"]["postinstall"]
+            .as_str()
+            .unwrap()
+            .contains("npx @socketsecurity/socket-patch apply"));
+    }
+
     #[test]
     fn test_update_object_scripts_is_string_does_not_panic() {
         // Regression: a present-but-non-object `scripts` previously panicked
@@ -1027,6 +1064,47 @@ mod tests {
     #[test]
     fn test_remove_content_invalid_json_errors() {
         assert!(remove_package_json_content("not json").is_err());
+    }
+
+    #[test]
+    fn test_remove_content_non_object_root_errors() {
+        // Twin of test_update_content_non_object_root_errors: valid JSON whose
+        // root is not an object must error, not panic or no-op.
+        for content in ["[1,2,3]", "42", "\"hello\"", "true", "null"] {
+            let result = remove_package_json_content(content);
+            assert!(result.is_err(), "expected error for content {content:?}");
+            assert!(result.unwrap_err().contains("root is not a JSON object"));
+        }
+    }
+
+    /// Partial removal from the `dependencies` script (the Some-arm of the
+    /// dep_changed branch): the patch is present ONLY in `dependencies`,
+    /// chained with a user command that must survive. Also pins the
+    /// pi_changed=false && dep_changed=true status shape: `new_postinstall`
+    /// is `None` here because the postinstall script was already empty/absent
+    /// (not because a postinstall key was deleted).
+    #[test]
+    fn test_remove_content_dependencies_only_keeps_user_command() {
+        let content = r#"{"name":"x","scripts":{"dependencies":"npx @socketsecurity/socket-patch apply --silent --ecosystems npm && npm run prep"}}"#;
+        let (modified, new_content, status) = remove_package_json_content(content).unwrap();
+        assert!(modified);
+        assert_eq!(status.new_dependencies.as_deref(), Some("npm run prep"));
+        assert_eq!(
+            status.old_dependencies,
+            "npx @socketsecurity/socket-patch apply --silent --ecosystems npm && npm run prep"
+        );
+        assert!(status.old_postinstall.is_empty());
+        assert!(
+            status.new_postinstall.is_none(),
+            "absent postinstall reads as empty and unchanged reports None"
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&new_content).unwrap();
+        assert_eq!(
+            parsed["scripts"]["dependencies"], "npm run prep",
+            "the user's command must survive:\n{new_content}"
+        );
+        assert!(parsed["scripts"].get("postinstall").is_none());
+        assert!(!new_content.contains("socket-patch"));
     }
 
     #[test]

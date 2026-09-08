@@ -614,4 +614,259 @@ mod tests {
         dropper.join().unwrap();
         assert_eq!(result.unwrap(), None);
     }
+
+    // ── 2026-09 coverage audit additions ────────────────────────────────
+
+    /// Like [`tgz_with`], but streams `len` zero bytes from `io::repeat`
+    /// so the input side never materializes — the archive stays tiny
+    /// (gzip of zeros) and only the extraction side allocates.
+    fn tgz_with_sized_member(name: &str, len: u64) -> Vec<u8> {
+        use std::io::Read;
+        let mut builder = tar::Builder::new(GzEncoder::new(Vec::new(), Compression::default()));
+        let mut header = tar::Header::new_gnu();
+        header.set_size(len);
+        header.set_mode(0o755);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, name, std::io::repeat(0).take(len))
+            .unwrap();
+        builder.into_inner().unwrap().finish().unwrap()
+    }
+
+    /// Single-member zip whose `socket-patch.exe` entry is `len` zero
+    /// bytes, streamed through the deflater (zeros deflate ~1000:1, so the
+    /// archive stays small even for an over-cap member).
+    fn zip_with_zero_member(len: u64) -> Vec<u8> {
+        use std::io::Read;
+        let mut buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut writer = zip::ZipWriter::new(&mut buf);
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            writer.start_file("socket-patch.exe", opts).unwrap();
+            std::io::copy(&mut std::io::repeat(0).take(len), &mut writer).unwrap();
+            writer.finish().unwrap();
+        }
+        buf.into_inner()
+    }
+
+    /// The decompressed-size cap on the tar.gz path — the zip-bomb defense
+    /// for the primary (Unix) archive format. The member streams one byte
+    /// past the cap; the read side transiently holds ~256 MiB, the archive
+    /// itself is a few hundred KiB of gzipped zeros.
+    #[test]
+    fn targz_member_over_cap_refused() {
+        let archive = tgz_with_sized_member("socket-patch", MAX_BINARY_BYTES + 1);
+        let err = extract_binary("socket-patch-x.tar.gz", &archive).unwrap_err();
+        assert!(err.to_string().contains("exceeds the"), "{err}");
+    }
+
+    /// The zip path's early refusal: an HONEST header declaring an
+    /// over-cap uncompressed size is rejected before any decompression.
+    #[test]
+    fn zip_declared_size_over_cap_refused() {
+        let archive = zip_with_zero_member(MAX_BINARY_BYTES + 1);
+        let err = extract_binary("socket-patch-x.zip", &archive).unwrap_err();
+        assert!(err.to_string().contains("exceeds the"), "{err}");
+    }
+
+    /// The zip path's post-read backstop: a LYING header. The zip crate's
+    /// Deflated decompressor does not bound its output at the declared
+    /// uncompressed size (verified against the vendored zip 8.6.0 source:
+    /// only the LZMA/legacy decoders consume `uncompressed_size`, and
+    /// `Crc32Reader` validates only at stream EOF), so a zip whose size
+    /// fields are byte-patched down sails past the declared-size check and
+    /// must be caught by the byte count after reading. If a future zip
+    /// crate starts enforcing the declared size on read, this becomes a
+    /// read error instead — keep the rejection assertion but re-audit the
+    /// post-read branch's reachability then.
+    #[test]
+    fn zip_lying_size_fields_hit_post_read_cap() {
+        let mut archive = zip_with_zero_member(MAX_BINARY_BYTES + 1);
+        let lie = 64u32.to_le_bytes();
+        // Local file header (PK\x03\x04 at 0): uncompressed size at +22.
+        assert_eq!(&archive[0..4], b"PK\x03\x04", "unexpected zip layout");
+        archive[22..26].copy_from_slice(&lie);
+        // Central directory entry: uncompressed size at +24 from the
+        // PK\x01\x02 signature (last occurrence — the deflate stream of
+        // zeros cannot contain it, but scan from the end regardless).
+        let cd = archive
+            .windows(4)
+            .rposition(|w| w == b"PK\x01\x02")
+            .expect("central directory signature");
+        archive[cd + 24..cd + 28].copy_from_slice(&lie);
+        // Anti-vacuity: prove the patch landed — the entry now DECLARES 64
+        // bytes, so the declared-size check at the top of the extraction
+        // cannot be the branch that rejects; only the post-read cap can.
+        {
+            let mut probe = zip::ZipArchive::new(std::io::Cursor::new(&archive[..])).unwrap();
+            assert_eq!(
+                probe.by_name("socket-patch.exe").unwrap().size(),
+                64,
+                "central-directory size patch must have landed"
+            );
+        }
+        let err = extract_binary("socket-patch-x.zip", &archive).unwrap_err();
+        assert!(err.to_string().contains("exceeds the"), "{err}");
+    }
+
+    /// Non-EACCES open failures must stay `SwapFailed` — only the
+    /// permissions preflight (`PermissionDenied`) earns the sudo hint.
+    #[test]
+    fn stage_open_failure_not_eacces_is_swap_failed() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Missing destination dir: NotFound.
+        let err = stage_binary(&tmp.path().join("nope"), b"x").unwrap_err();
+        assert!(
+            matches!(err, UpdateError::SwapFailed(_)),
+            "NotFound must not masquerade as PermissionDenied: {err}"
+        );
+        assert!(err.to_string().contains("cannot stage into"), "{err}");
+        // Destination "dir" is a regular file: NotADirectory (exact io
+        // message differs per-OS, so only the variant is pinned).
+        let file = tmp.path().join("file");
+        std::fs::write(&file, b"").unwrap();
+        let err = stage_binary(&file, b"x").unwrap_err();
+        assert!(
+            matches!(err, UpdateError::SwapFailed(_)),
+            "NotADirectory must not masquerade as PermissionDenied: {err}"
+        );
+    }
+
+    /// A destination dir that cannot be listed (vanished install dir) is a
+    /// silent early return — the best-effort sweep must neither panic nor
+    /// conjure the directory into existence.
+    #[test]
+    fn sweep_tolerates_unlistable_dest_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("never-existed");
+        sweep_stale_stages(&missing);
+        assert!(!missing.exists(), "sweep must not create the destination dir");
+    }
+
+    /// A write failure AFTER a successful open (EFBIG here, standing in
+    /// for ENOSPC/EIO) must remove the stage file — no `.socket-patch.
+    /// stage-*` husk next to the install — and map to `SwapFailed`.
+    ///
+    /// The capped body runs in a CHILD PROCESS: `RLIMIT_FSIZE` (and the
+    /// ignored `SIGXFSZ`) are process-wide, and capping them in the shared
+    /// test process killed the whole workspace suite before #227. Same
+    /// re-exec choreography as
+    /// `utils::fs::tests::atomic_write_failed_stage_write_errors_and_keeps_target`.
+    #[cfg(unix)]
+    #[test]
+    fn stage_write_failure_cleans_up_stage_file() {
+        const CHILD_ENV: &str = "SOCKET_PATCH_CORE_TEST_STAGE_FSIZE_CHILD";
+        const TEST_NAME: &str =
+            "update::download::tests::stage_write_failure_cleans_up_stage_file";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let exe = std::env::current_exe().expect("test binary path must resolve");
+            let output = std::process::Command::new(exe)
+                .args([TEST_NAME, "--exact", "--test-threads=1", "--nocapture"])
+                .env(CHILD_ENV, "1")
+                .output()
+                .expect("the capped child test process must spawn");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success(),
+                "the capped child run failed:\nstdout:\n{stdout}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stderr),
+            );
+            // Anti-vacuity: a renamed test would make the `--exact` filter
+            // match nothing and the child exit 0 having proven nothing.
+            assert!(
+                stdout.contains("1 passed"),
+                "the child run must execute exactly this test — filter drift \
+                 after a rename? child stdout:\n{stdout}"
+            );
+            return;
+        }
+
+        struct FsizeGuard {
+            prev: libc::rlimit,
+            prev_handler: libc::sighandler_t,
+        }
+        impl Drop for FsizeGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    libc::setrlimit(libc::RLIMIT_FSIZE, &self.prev);
+                    libc::signal(libc::SIGXFSZ, self.prev_handler);
+                }
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Exceeding RLIMIT_FSIZE delivers SIGXFSZ (default: kill); ignore
+        // it so the write fails with EFBIG instead. Guard restores both.
+        let guard = unsafe {
+            let mut prev = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            assert_eq!(libc::getrlimit(libc::RLIMIT_FSIZE, &mut prev), 0);
+            let prev_handler = libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+            let capped = libc::rlimit {
+                rlim_cur: 256 * 1024,
+                rlim_max: prev.rlim_max,
+            };
+            assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &capped), 0);
+            FsizeGuard { prev, prev_handler }
+        };
+
+        // stage_binary is synchronous std::fs, so write_all surfaces EFBIG
+        // directly (no tokio background-write indirection here).
+        let result = stage_binary(tmp.path(), &vec![0u8; 1024 * 1024]);
+        drop(guard);
+
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, UpdateError::SwapFailed(_)),
+            "expected SwapFailed, got: {err}"
+        );
+        assert!(err.to_string().contains("error writing staged binary"), "{err}");
+        let leftovers: Vec<String> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "the failed stage file must be removed, found: {leftovers:?}"
+        );
+    }
+
+    /// The 10-second hang timeout — the only `sanity_exec` branch no other
+    /// test executes: a wedged (or wrong-arch-but-execable) binary must be
+    /// killed, not awaited. Costs ~10s wall clock (the timeout is
+    /// hardcoded, no injection point); runs concurrently with siblings.
+    /// The error message is the discriminator: had the timeout NOT fired,
+    /// `sleep 30` would eventually exit 0 with empty stdout and produce
+    /// the "identifies as" error instead.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sanity_exec_hung_binary_times_out() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("hung");
+        std::fs::write(&script, "#!/bin/sh\nsleep 30\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let start = std::time::Instant::now();
+        let err = sanity_exec(&script, &semver::Version::new(9, 9, 9), true)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("hung during its --version self-check"),
+            "got: {err}"
+        );
+        // Generous bound — strictly under the child's 30s sleep — proving
+        // the hardcoded 10s timeout fired rather than the sleep being
+        // awaited. Do not tighten: coverage jobs run hot.
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(25),
+            "timeout must bound the self-check, took {:?}",
+            start.elapsed()
+        );
+    }
 }

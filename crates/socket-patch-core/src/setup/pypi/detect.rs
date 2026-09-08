@@ -338,6 +338,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_detect_uv_by_tool_table() {
+        // A uv-configured project before its first `uv lock`: no uv.lock yet,
+        // only the `[tool.uv]` config table in pyproject.toml.
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            dir.path().join("pyproject.toml"),
+            "[project]\nname = \"x\"\n\n[tool.uv]\ndev-dependencies = []\n",
+        )
+        .await
+        .unwrap();
+        assert_eq!(detect_python_pm(dir.path()).await, PythonPackageManager::Uv);
+    }
+
+    #[tokio::test]
+    async fn test_detect_pdm_by_tool_table() {
+        // A PDM project pre-first-lock: `[tool.pdm]` table, no pdm.lock.
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            dir.path().join("pyproject.toml"),
+            "[project]\nname = \"x\"\n\n[tool.pdm]\ndistribution = true\n",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            detect_python_pm(dir.path()).await,
+            PythonPackageManager::Pdm
+        );
+    }
+
+    #[tokio::test]
+    async fn test_detect_hatch_by_tool_subtable() {
+        // Real Hatch projects rarely declare a bare `[tool.hatch]` — config
+        // lives in sub-tables like `[tool.hatch.envs.default]`. Detection
+        // must resolve the namespace prefix (has_table), and Hatch never has
+        // a lockfile, so the table branch is the ONLY signal.
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            dir.path().join("pyproject.toml"),
+            "[project]\nname = \"x\"\n\n[tool.hatch.envs.default]\ndependencies = []\n",
+        )
+        .await
+        .unwrap();
+        let pm = detect_python_pm(dir.path()).await;
+        assert_eq!(pm, PythonPackageManager::Hatch);
+        // The detected manager is surfaced in the JSON envelope via as_str.
+        assert_eq!(pm.as_str(), "hatch");
+    }
+
+    #[tokio::test]
+    async fn test_detect_table_precedence_pdm_before_hatch() {
+        // Documents the uv > poetry > pdm > hatch table ordering: a project
+        // carrying BOTH `[tool.pdm]` and `[tool.hatch.*]` (e.g. hatchling as
+        // build backend, pdm as the workflow tool) resolves to Pdm.
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            dir.path().join("pyproject.toml"),
+            "[tool.pdm]\n\n[tool.hatch.envs.default]\ndependencies = []\n",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            detect_python_pm(dir.path()).await,
+            PythonPackageManager::Pdm
+        );
+    }
+
+    #[tokio::test]
     async fn test_detect_pip_fallback() {
         let dir = tempfile::tempdir().unwrap();
         tokio::fs::write(dir.path().join("requirements.txt"), "requests\n")

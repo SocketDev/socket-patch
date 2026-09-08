@@ -994,6 +994,12 @@ pub(crate) async fn run_redirect_selected(
     // with an actionable error — never half-migrated.
     let takeover_capable = |p: &str| p.starts_with("pkg:cargo/") || p.starts_with("pkg:npm/");
     let mut takeover_pre_warnings: Vec<serde_json::Value> = Vec::new();
+    // Dry-run takeover previews: `(purl, uuid)` pairs whose vendored state
+    // the wet run would revert and then redirect. Withheld from the
+    // rewriters (their lock fragments still carry the vendored wiring the
+    // wet run reverts FIRST) and counted as redirected below, so the
+    // preview's envelope matches the wet run's outcome.
+    let mut dry_run_takeover: Vec<(String, String)> = Vec::new();
     if !candidates.iter().any(|(p, ..)| takeover_capable(p)) {
         // No takeover-capable candidates — nothing to reconcile.
     } else {
@@ -1003,7 +1009,7 @@ pub(crate) async fn run_redirect_selected(
         let patch_entries =
             socket_patch_core::vendor::cargo_config::read_patch_entries(&common.cwd).await;
         let mut refused: Vec<String> = Vec::new();
-        for (purl, _uuid, ..) in &candidates {
+        for (purl, uuid, ..) in &candidates {
             if !takeover_capable(purl) {
                 continue;
             }
@@ -1015,6 +1021,32 @@ pub(crate) async fn run_redirect_selected(
                 .cloned();
             if let Some(entry) = ledger_entry {
                 if common.dry_run {
+                    // Preview through the same per-purl revert machinery the
+                    // wet run dispatches (write-free under dry_run): a
+                    // vendored state the wet run would refuse to revert is
+                    // refused here too, and one it would revert is announced
+                    // as a takeover — never handed to the rewriters, which
+                    // would preview against the still-vendored wiring and
+                    // fail-closed refuse it, prescribing a manual
+                    // `vendor --revert` for a purl this run just promised to
+                    // revert itself while reporting `redirected: 0` for a
+                    // migration the wet run lands.
+                    let outcome =
+                        crate::commands::vendor::dispatch_revert_one(&entry, &common.cwd, true)
+                            .await;
+                    if !outcome.success {
+                        refused.push(purl.clone());
+                        takeover_pre_warnings.push(serde_json::json!({
+                            "code": "redirect_vendored_revert_failed",
+                            "detail": format!(
+                                "{purl} is vendored and its vendored state could not be \
+                                 reverted ({}); NOT redirected — run `socket-patch vendor \
+                                 --revert` to clean up, then re-run `scan --mode hosted`",
+                                outcome.error.as_deref().unwrap_or("unknown error")
+                            ),
+                        }));
+                        continue;
+                    }
                     takeover_pre_warnings.push(serde_json::json!({
                         "code": "redirect_would_revert_vendored",
                         "detail": format!(
@@ -1023,6 +1055,7 @@ pub(crate) async fn run_redirect_selected(
                              artifact first, then redirect (mode takeover)"
                         ),
                     }));
+                    dry_run_takeover.push((purl.clone(), uuid.clone()));
                     continue;
                 }
                 let outcome =
@@ -1123,12 +1156,21 @@ pub(crate) async fn run_redirect_selected(
                     }));
                 }
             }
-            let refused_names: std::collections::HashSet<(String, String, String)> = candidates
+        }
+        // Purls leaving the rewrite set: refused takeovers, plus the dry-run
+        // takeover previews (still vendored on disk — the wet run reverts
+        // them before the rewriters ever see their files).
+        let withheld: Vec<&String> = refused
+            .iter()
+            .chain(dry_run_takeover.iter().map(|(p, _)| p))
+            .collect();
+        if !withheld.is_empty() {
+            let withheld_names: std::collections::HashSet<(String, String, String)> = candidates
                 .iter()
-                .filter(|(p, ..)| refused.contains(p))
+                .filter(|(p, ..)| withheld.contains(&p))
                 .filter_map(|(p, ..)| parse_purl_simple(p))
                 .collect();
-            candidates.retain(|(p, ..)| !refused.contains(p));
+            candidates.retain(|(p, ..)| !withheld.contains(&p));
             overrides.retain(|o| {
                 // Overrides built here carry the full coordinate in `name`
                 // (namespace unset) — the same shape parse_purl_simple emits.
@@ -1136,7 +1178,7 @@ pub(crate) async fn run_redirect_selected(
                     Some(ns) if !ns.is_empty() => format!("{ns}/{}", o.name),
                     _ => o.name.clone(),
                 };
-                !refused_names.contains(&(o.ecosystem.clone(), coord, o.version.clone()))
+                !withheld_names.contains(&(o.ecosystem.clone(), coord, o.version.clone()))
             });
         }
     }
@@ -1568,6 +1610,13 @@ pub(crate) async fn run_redirect_selected(
         )
         .map(|(purl, uuid, _, _, _, _)| (purl.clone(), uuid.clone()))
         .collect();
+    // Dry-run mode-takeover previews were withheld from the rewriters (their
+    // lock fragments still carry the vendored wiring the wet run reverts
+    // first), so the presence probe above cannot see them: the wet run
+    // reverts then redirects each one, and the preview's `redirected` count
+    // must report that outcome. Populated only under --dry-run.
+    let mut confirmed = confirmed;
+    confirmed.extend(dry_run_takeover);
 
     // Fetch the full patch view (file hashes + vulnerabilities) for each
     // CONFIRMED redirect and persist it so a post-install `socket-patch vex`
@@ -2962,6 +3011,103 @@ mod tests {
         )
         .await;
         assert!(out.warnings.is_empty());
+    }
+
+    /// Committed `vendor/cache` fold, UNKNOWN-sha arm (`_ => false`): when
+    /// the run carries NO artifact sha for the gem (empty shas map — e.g. a
+    /// reference served without a gem checksum), a committed archive beside
+    /// a stale install must STILL be folded into the delete list. Removal is
+    /// safe either way (`bundle install` refetches), so "unknown" must never
+    /// downgrade to "proven patched" and leave the archive to silently
+    /// reinstate the stale bytes.
+    #[tokio::test]
+    async fn gem_stale_probe_folds_committed_cache_with_unknown_artifact_sha() {
+        let tmp = tempfile::tempdir().unwrap();
+        materialize_gem(tmp.path(), GEM_UPSTREAM);
+        let committed = tmp
+            .path()
+            .join("vendor")
+            .join("cache")
+            .join(format!("{GEM_LEAF}.gem"));
+        std::fs::create_dir_all(committed.parent().unwrap()).unwrap();
+        std::fs::write(&committed, b"upstream archive bytes").unwrap();
+
+        // `probe()` passes an EMPTY gem_artifact_shas map: the
+        // (None, Some(_)) pair must take the fold-anyway arm.
+        let out = probe(tmp.path(), &one_confirmed(), &one_record()).await;
+        assert_eq!(
+            out.warnings.len(),
+            1,
+            "one stale install, one warning (cache folded, not standalone): {:?}",
+            out.warnings
+        );
+        let detail = detail_of(&out.warnings[0]);
+        assert!(
+            detail.contains(&committed.display().to_string()),
+            "the committed archive must join the delete list even with no \
+             known artifact sha: {detail}"
+        );
+        assert_eq!(
+            out.stale_purls,
+            std::collections::BTreeSet::from([GEM_PURL.to_string()])
+        );
+        // Read-only contract: the archive itself is never deleted.
+        assert!(committed.is_file(), "the probe prescribes, never deletes");
+    }
+
+    /// Standalone cache pass 3, UNREADABLE-archive arm: a committed archive
+    /// whose bytes cannot be read (chmod 000) yields NO positive evidence,
+    /// so the probe must stay silent instead of guessing staleness from the
+    /// differing expected sha — the never-warn-without-positive-evidence
+    /// contract, archive flavor.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn gem_stale_probe_never_judges_unreadable_committed_archive() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        // NO installed gem dir (fresh-checkout shape) so pass 3 is the only
+        // judgment path.
+        let committed = tmp
+            .path()
+            .join("vendor")
+            .join("cache")
+            .join(format!("{GEM_LEAF}.gem"));
+        std::fs::create_dir_all(committed.parent().unwrap()).unwrap();
+        std::fs::write(&committed, b"upstream archive bytes").unwrap();
+        std::fs::set_permissions(&committed, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Root ignores mode bits: detect it while the chmod is in force so
+        // the assertion below matches what the probe could actually read.
+        let readable_despite_chmod = std::fs::File::open(&committed).is_ok();
+
+        let mut shas = std::collections::BTreeMap::new();
+        shas.insert(
+            ("stale-unit".to_string(), "1.0.0".to_string()),
+            "0".repeat(64), // differs from the archive bytes' sha
+        );
+        let out = gem_stale_install_warnings(
+            tmp.path(),
+            false,
+            None,
+            &one_confirmed(),
+            &one_record(),
+            &std::collections::BTreeMap::new(),
+            &shas,
+        )
+        .await;
+        std::fs::set_permissions(&committed, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        if readable_despite_chmod {
+            // Running as root: the archive WAS readable and its sha differs,
+            // so the ordinary stale-cache warning is the correct outcome.
+            assert_eq!(out.warnings.len(), 1, "root fallback: readable + stale");
+        } else {
+            assert!(
+                out.warnings.is_empty(),
+                "an unreadable archive is never staleness evidence: {:?}",
+                out.warnings
+            );
+            assert!(out.stale_purls.is_empty());
+        }
     }
 
     /// The standalone cache-flavor warning's load-bearing wording.

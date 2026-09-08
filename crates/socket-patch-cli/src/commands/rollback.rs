@@ -1064,9 +1064,12 @@ pub async fn run(args: RollbackArgs) -> i32 {
         // edits without records) is vacuously "covered" by any scope; only
         // an UNSCOPED run may replay those leftover edits — a scoped
         // rollback of an unrelated purl must not unwind live redirects it
-        // was never asked about.
+        // was never asked about. `--ecosystems` counts as a scope here:
+        // recordless edits carry no purl to narrow by, so an eco-narrowed
+        // run leaves them to an unscoped rollback rather than replaying
+        // other ecosystems' edits behind the filter's back.
         Ok(Some(s)) => {
-            (!s.records.is_empty() || !scoped)
+            (!s.records.is_empty() || (!scoped && args.common.ecosystems.is_none()))
                 && s.records.keys().all(|p| hosted_scope.contains(p))
         }
         _ => false,
@@ -3539,6 +3542,569 @@ mod tests {
         assert!(
             all_files_already_original(&results[0]),
             "the no-op must be reported as already original, got {results:?}"
+        );
+    }
+
+    // --- Coverage-gap fills (2026-09 audit) --------------------------------
+
+    /// Exhaustive pin of the status vocabulary the JSON `filesVerified`
+    /// entries and the `--verbose` per-file labels are built from: every
+    /// `VerifyRollbackStatus` variant maps to its stable snake_case string.
+    #[test]
+    fn verify_rollback_status_str_covers_every_variant() {
+        assert_eq!(
+            verify_rollback_status_str(&VerifyRollbackStatus::Ready),
+            "ready"
+        );
+        assert_eq!(
+            verify_rollback_status_str(&VerifyRollbackStatus::AlreadyOriginal),
+            "already_original"
+        );
+        assert_eq!(
+            verify_rollback_status_str(&VerifyRollbackStatus::HashMismatch),
+            "hash_mismatch"
+        );
+        assert_eq!(
+            verify_rollback_status_str(&VerifyRollbackStatus::NotFound),
+            "not_found"
+        );
+        assert_eq!(
+            verify_rollback_status_str(&VerifyRollbackStatus::MissingBlob),
+            "missing_blob"
+        );
+    }
+
+    /// The local-go redirect rollback's FAILURE arm: when the `go.mod` edit
+    /// fails (here: `go.mod` is a directory, so the read errors), the result
+    /// flips to failure, clears the pre-populated `files_rolled_back` (the
+    /// JSON `rolledBack` count is derived from it, and nothing was rolled
+    /// back), and carries the error.
+    #[tokio::test]
+    async fn try_rollback_local_go_reports_failure_when_go_mod_unreadable() {
+        const PURL: &str = "pkg:golang/github.com/foo/bar@v1.4.2";
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // go.mod as a DIRECTORY: `drop_replace_entry`'s go.mod read fails.
+        std::fs::create_dir(root.join("go.mod")).unwrap();
+
+        let patch = record_with_file("uuid-go", "errors.go", "go_before");
+        let common = crate::args::GlobalArgs {
+            cwd: root.to_path_buf(),
+            ..crate::args::GlobalArgs::default()
+        };
+        let result = try_rollback_local_go(PURL, root, &patch, &common)
+            .await
+            .expect("go PURL in local mode must be handled by the go backend");
+        assert!(
+            !result.success,
+            "an unreadable go.mod must fail the redirect rollback, got {result:?}"
+        );
+        assert!(
+            result.files_rolled_back.is_empty(),
+            "a failed redirect rollback must not claim files were rolled \
+             back, got {:?}",
+            result.files_rolled_back
+        );
+        assert!(
+            result.error.is_some(),
+            "the failure must carry the underlying error"
+        );
+    }
+
+    /// The undiscovered-redirect fallback's FAILURE leg: a manifest-only
+    /// local-go redirect (no module-cache copy for the crawler to find)
+    /// whose `go.mod` edit fails must surface as a real failed result —
+    /// `success: false` with the error set — not silently vanish.
+    #[tokio::test]
+    async fn undiscovered_local_go_redirect_failure_reports_error() {
+        use socket_patch_core::vendor::go_mod_edit::{ensure_replace_entry, GO_PATCHES_DIR};
+
+        const MODULE: &str = "github.com/socket-patch-test/never-cached";
+        const VERSION: &str = "v1.4.2";
+        const PURL: &str = "pkg:golang/github.com/socket-patch-test/never-cached@v1.4.2";
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        tokio::fs::write(
+            root.join("go.mod"),
+            format!("module myproj\n\ngo 1.21\n\nrequire {MODULE} {VERSION}\n"),
+        )
+        .await
+        .unwrap();
+        assert!(
+            ensure_replace_entry(root, MODULE, VERSION, GO_PATCHES_DIR, false)
+                .await
+                .unwrap()
+        );
+        let copy_dir = root
+            .join(GO_PATCHES_DIR)
+            .join(format!("{MODULE}@{VERSION}"));
+        tokio::fs::create_dir_all(&copy_dir).await.unwrap();
+        tokio::fs::write(copy_dir.join("errors.go"), b"// patched\n")
+            .await
+            .unwrap();
+
+        let mut patches = HashMap::new();
+        patches.insert(
+            PURL.to_string(),
+            record_with_file("uuid-go", "errors.go", "go_before"),
+        );
+        let manifest = PatchManifest {
+            patches,
+            setup: None,
+        };
+        let socket = root.join(".socket");
+        tokio::fs::create_dir_all(&socket).await.unwrap();
+        let manifest_path = socket.join("manifest.json");
+        tokio::fs::write(&manifest_path, serde_json::to_string(&manifest).unwrap())
+            .await
+            .unwrap();
+
+        // Now break the redirect removal: replace go.mod with a DIRECTORY.
+        tokio::fs::remove_file(root.join("go.mod")).await.unwrap();
+        tokio::fs::create_dir(root.join("go.mod")).await.unwrap();
+
+        let common = crate::args::GlobalArgs {
+            cwd: root.to_path_buf(),
+            offline: true,
+            ..crate::args::GlobalArgs::default()
+        };
+        let (success, results, _vendored, _not_installed) = rollback_patches(
+            &common,
+            &manifest_path,
+            None,
+            false, // dry_run
+            true,  // silent
+            Some(vec!["golang".to_string()]),
+        )
+        .await
+        .expect("rollback must not error at the boundary");
+
+        assert!(
+            !success,
+            "a failed undiscovered-redirect rollback must flip success, got {results:?}"
+        );
+        assert_eq!(results.len(), 1, "got {results:?}");
+        assert!(!results[0].success, "got {results:?}");
+        assert!(
+            results[0].error.is_some(),
+            "the failure must carry the go.mod error, got {results:?}"
+        );
+        assert!(
+            results[0].files_rolled_back.is_empty(),
+            "nothing was rolled back, got {results:?}"
+        );
+        assert!(
+            copy_dir.exists(),
+            "the go.mod edit failed first, so the patched copy must survive"
+        );
+    }
+
+    /// The `remove`-delegation contract for a MISSING manifest: the
+    /// Identifier selection keeps the legacy hard error. Pins the CURRENT
+    /// wording — `read_manifest` reports NotFound as `Ok(None)`, which the
+    /// Identifier arm maps to the legacy "Invalid manifest" string (the
+    /// message predates the missing/corrupt split).
+    #[tokio::test]
+    async fn rollback_patches_missing_manifest_is_identifier_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let common = crate::args::GlobalArgs {
+            cwd: tmp.path().to_path_buf(),
+            offline: true,
+            ..crate::args::GlobalArgs::default()
+        };
+        let err = rollback_patches(
+            &common,
+            &tmp.path().join(".socket/manifest.json"),
+            Some("pkg:npm/x@1.0.0"),
+            false,
+            true,
+            None,
+        )
+        .await
+        .expect_err("a missing manifest is an error for the Identifier selection");
+        assert_eq!(err, "Invalid manifest");
+    }
+
+    /// The Identifier selection's no-match error names the identifier.
+    #[tokio::test]
+    async fn rollback_patches_unmatched_identifier_is_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let socket = tmp.path().join(".socket");
+        tokio::fs::create_dir_all(&socket).await.unwrap();
+        let mut patches = HashMap::new();
+        patches.insert("pkg:npm/foo@1.0".to_string(), make_record("uuid-foo"));
+        let manifest = PatchManifest {
+            patches,
+            setup: None,
+        };
+        let manifest_path = socket.join("manifest.json");
+        tokio::fs::write(&manifest_path, serde_json::to_string(&manifest).unwrap())
+            .await
+            .unwrap();
+
+        let common = crate::args::GlobalArgs {
+            cwd: tmp.path().to_path_buf(),
+            offline: true,
+            ..crate::args::GlobalArgs::default()
+        };
+        let err = rollback_patches(
+            &common,
+            &manifest_path,
+            Some("pkg:npm/nope@9.9"),
+            false,
+            true,
+            None,
+        )
+        .await
+        .expect_err("an identifier matching nothing must be an error");
+        assert_eq!(err, "No patch found matching identifier: pkg:npm/nope@9.9");
+    }
+
+    /// An EMPTY manifest with no identifier is a quiet success for the
+    /// delegation (the announce print runs; `remove` then has nothing to
+    /// drop): `Ok` with success and every list empty.
+    #[tokio::test]
+    async fn rollback_patches_empty_manifest_is_quiet_success() {
+        let tmp = tempfile::tempdir().unwrap();
+        let socket = tmp.path().join(".socket");
+        tokio::fs::create_dir_all(&socket).await.unwrap();
+        let manifest_path = socket.join("manifest.json");
+        tokio::fs::write(&manifest_path, b"{\"patches\": {}}\n")
+            .await
+            .unwrap();
+
+        let common = crate::args::GlobalArgs {
+            cwd: tmp.path().to_path_buf(),
+            offline: true,
+            ..crate::args::GlobalArgs::default()
+        };
+        // silent=false so the "No patches found in manifest" announce path
+        // actually executes (its output is not capturable here; the
+        // contract under test is the quiet Ok).
+        let (success, results, vendored_skipped, not_installed) =
+            rollback_patches(&common, &manifest_path, None, false, false, None)
+                .await
+                .expect("an empty manifest is not an error");
+        assert!(success);
+        assert!(results.is_empty(), "got {results:?}");
+        assert!(vendored_skipped.is_empty());
+        assert!(not_installed.is_empty());
+    }
+
+    /// A package gated by ONE absent before-blob must name ONLY that blob's
+    /// file in the synthesized offline abort: a sibling file in the SAME
+    /// patch whose blob IS staged never rides into the failure rows (the
+    /// per-file gate skip for present blobs).
+    #[tokio::test]
+    async fn offline_gate_names_only_the_absent_blob_file() {
+        use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
+
+        let index_before: &[u8] = b"index original\n";
+        let index_after: &[u8] = b"index patched\n";
+        let lib_before: &[u8] = b"lib original\n";
+        let lib_after: &[u8] = b"lib patched\n";
+        let index_before_hash = compute_git_sha256_from_bytes(index_before);
+        let index_after_hash = compute_git_sha256_from_bytes(index_after);
+        let lib_before_hash = compute_git_sha256_from_bytes(lib_before);
+        let lib_after_hash = compute_git_sha256_from_bytes(lib_after);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let socket = root.join(".socket");
+        let blobs = socket.join("blobs");
+        tokio::fs::create_dir_all(&blobs).await.unwrap();
+
+        // Installed package with BOTH files at their PATCHED bytes (so
+        // both would genuinely read their before-blob on restore).
+        tokio::fs::write(
+            root.join("package.json"),
+            r#"{ "name": "gate-two-file-root", "version": "0.0.0" }"#,
+        )
+        .await
+        .unwrap();
+        let pkg_dir = root.join("node_modules").join("gatepkg");
+        tokio::fs::create_dir_all(&pkg_dir).await.unwrap();
+        tokio::fs::write(
+            pkg_dir.join("package.json"),
+            r#"{ "name": "gatepkg", "version": "1.0.0" }"#,
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(pkg_dir.join("index.js"), index_after)
+            .await
+            .unwrap();
+        tokio::fs::write(pkg_dir.join("lib.js"), lib_after)
+            .await
+            .unwrap();
+
+        // One record, two file rows.
+        let mut rec = make_record("uuid-gate");
+        rec.files.insert(
+            "package/index.js".to_string(),
+            PatchFileInfo {
+                before_hash: index_before_hash.clone(),
+                after_hash: index_after_hash.clone(),
+            },
+        );
+        rec.files.insert(
+            "package/lib.js".to_string(),
+            PatchFileInfo {
+                before_hash: lib_before_hash.clone(),
+                after_hash: lib_after_hash.clone(),
+            },
+        );
+        let mut patches = HashMap::new();
+        patches.insert("pkg:npm/gatepkg@1.0.0".to_string(), rec);
+        let manifest = PatchManifest {
+            patches,
+            setup: None,
+        };
+        let manifest_path = socket.join("manifest.json");
+        tokio::fs::write(&manifest_path, serde_json::to_string(&manifest).unwrap())
+            .await
+            .unwrap();
+
+        // Stage ONLY index's before-blob; lib's is deliberately absent.
+        tokio::fs::write(blobs.join(&index_before_hash), index_before)
+            .await
+            .unwrap();
+
+        let common = crate::args::GlobalArgs {
+            cwd: root.to_path_buf(),
+            offline: true,
+            ..crate::args::GlobalArgs::default()
+        };
+        let (success, results, _vendored, _not_installed) =
+            rollback_patches(&common, &manifest_path, None, false, true, None)
+                .await
+                .expect("rollback must not error");
+        assert!(!success, "the absent lib before-blob must abort offline");
+        assert_eq!(results.len(), 1, "got {results:?}");
+        let r = &results[0];
+        assert_eq!(r.package_key, "pkg:npm/gatepkg@1.0.0");
+        assert!(!r.success);
+        assert_eq!(
+            r.files_verified.len(),
+            1,
+            "the staged index blob must NOT ride into the abort, got {results:?}"
+        );
+        let f = &r.files_verified[0];
+        assert_eq!(f.file, "package/lib.js");
+        assert_eq!(f.status, VerifyRollbackStatus::MissingBlob);
+        assert_eq!(f.target_hash.as_deref(), Some(lib_before_hash.as_str()));
+        assert!(
+            r.error
+                .as_deref()
+                .is_some_and(|e| e.contains("package/lib.js")),
+            "the abort error names the blocking file, got {results:?}"
+        );
+    }
+
+    /// A dry run over a patch that CREATES a file (empty `beforeHash`
+    /// sentinel) must succeed: the throwaway blob stage skips the sentinel
+    /// (there is no blob "" to stage) and leaves no litter behind.
+    #[tokio::test]
+    async fn dry_run_tolerates_created_by_patch_sentinel_rows() {
+        use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
+
+        let index_before: &[u8] = b"sentinel index original\n";
+        let index_after: &[u8] = b"sentinel index patched\n";
+        let created: &[u8] = b"file created by the patch\n";
+        let index_before_hash = compute_git_sha256_from_bytes(index_before);
+        let index_after_hash = compute_git_sha256_from_bytes(index_after);
+        let created_hash = compute_git_sha256_from_bytes(created);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let socket = root.join(".socket");
+        let blobs = socket.join("blobs");
+        tokio::fs::create_dir_all(&blobs).await.unwrap();
+        tokio::fs::write(
+            root.join("package.json"),
+            r#"{ "name": "sentinel-root", "version": "0.0.0" }"#,
+        )
+        .await
+        .unwrap();
+        let pkg_dir = root.join("node_modules").join("sentinelpkg");
+        tokio::fs::create_dir_all(&pkg_dir).await.unwrap();
+        tokio::fs::write(
+            pkg_dir.join("package.json"),
+            r#"{ "name": "sentinelpkg", "version": "1.0.0" }"#,
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(pkg_dir.join("index.js"), index_after)
+            .await
+            .unwrap();
+        tokio::fs::write(pkg_dir.join("created.js"), created)
+            .await
+            .unwrap();
+
+        let mut rec = make_record("uuid-sentinel");
+        rec.files.insert(
+            "package/index.js".to_string(),
+            PatchFileInfo {
+                before_hash: index_before_hash.clone(),
+                after_hash: index_after_hash,
+            },
+        );
+        rec.files.insert(
+            "package/created.js".to_string(),
+            PatchFileInfo {
+                before_hash: String::new(), // created-by-patch sentinel
+                after_hash: created_hash,
+            },
+        );
+        let mut patches = HashMap::new();
+        patches.insert("pkg:npm/sentinelpkg@1.0.0".to_string(), rec);
+        let manifest = PatchManifest {
+            patches,
+            setup: None,
+        };
+        let manifest_path = socket.join("manifest.json");
+        tokio::fs::write(&manifest_path, serde_json::to_string(&manifest).unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(blobs.join(&index_before_hash), index_before)
+            .await
+            .unwrap();
+
+        let common = crate::args::GlobalArgs {
+            cwd: root.to_path_buf(),
+            offline: true,
+            ..crate::args::GlobalArgs::default()
+        };
+        let (success, results, _vendored, _not_installed) = rollback_patches(
+            &common,
+            &manifest_path,
+            None,
+            true, // dry_run
+            true, // silent
+            None,
+        )
+        .await
+        .expect("dry run must not error");
+        assert!(
+            success,
+            "a created-by-patch row must not fail the dry run, got {results:?}"
+        );
+        assert_eq!(results.len(), 1, "got {results:?}");
+        assert!(results[0].success, "got {results:?}");
+
+        // No `.socket-stage-*` litter, and the real blobs dir is untouched
+        // (exactly the one staged before-blob — no phantom "" blob).
+        let mut socket_entries: Vec<String> = std::fs::read_dir(&socket)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        socket_entries.sort();
+        assert!(
+            socket_entries
+                .iter()
+                .all(|n| !n.starts_with(".socket-stage")),
+            "dry-run must clean up its blob stage, found {socket_entries:?}"
+        );
+        let blob_entries: Vec<String> = std::fs::read_dir(&blobs)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            blob_entries,
+            vec![index_before_hash],
+            "the committable blobs dir must be untouched by a dry run"
+        );
+    }
+
+    /// A purl absent from the source manifest contributes nothing to the
+    /// GC reference: the pin loop skips it (the lookup-miss `continue`)
+    /// rather than inserting an empty synthetic keep record, and present
+    /// purls around it still pin normally.
+    #[test]
+    fn pin_before_hash_blobs_skips_purls_absent_from_source() {
+        let mut present = make_record("uuid-present");
+        present.files.insert(
+            "package/index.js".to_string(),
+            PatchFileInfo {
+                before_hash: "beefbeef".to_string(),
+                after_hash: "cafecafe".to_string(),
+            },
+        );
+        let mut source = PatchManifest {
+            patches: HashMap::new(),
+            setup: None,
+        };
+        source
+            .patches
+            .insert("pkg:npm/present@1.0.0".to_string(), present);
+
+        let mut reference = PatchManifest {
+            patches: HashMap::new(),
+            setup: None,
+        };
+        let purls = [
+            "pkg:npm/ghost@9.9.9".to_string(),
+            "pkg:npm/present@1.0.0".to_string(),
+        ];
+        pin_before_hash_blobs(&mut reference, &source, purls.iter());
+
+        assert!(
+            !reference.patches.contains_key("pkg:npm/ghost@9.9.9"),
+            "a purl the source manifest does not hold must not grow a \
+             synthetic record, got {:?}",
+            reference.patches.keys().collect::<Vec<_>>()
+        );
+        let pinned = reference
+            .patches
+            .get("pkg:npm/present@1.0.0")
+            .expect("the present purl must still pin");
+        assert_eq!(pinned.files.len(), 1, "got {:?}", pinned.files);
+        assert_eq!(
+            pinned
+                .files
+                .get("package/index.js#beforeHash-pin")
+                .expect("synthetic pin key")
+                .after_hash,
+            "beefbeef",
+            "the beforeHash must be pinned in an afterHash slot"
+        );
+    }
+
+    /// The vendored leg tolerates a key with no ledger entry: the scope
+    /// resolver guarantees keys exist, but a divergent ledger must skip
+    /// the key silently (the lookup-miss `continue`) rather than panic or
+    /// fail the leg — every outcome array stays empty.
+    #[tokio::test]
+    async fn run_vendored_leg_skips_keys_missing_from_ledger() {
+        let common = crate::args::GlobalArgs::default();
+        let mut state = socket_patch_core::vendor::VendorState::new();
+        let out = run_vendored_leg(
+            &common,
+            &["pkg:npm/ghost@1.0.0".to_string()],
+            &mut state,
+            false,
+        )
+        .await;
+        assert!(
+            out.reverted.is_empty()
+                && out.preserved.is_empty()
+                && out.kept.is_empty()
+                && out.failed.is_empty()
+                && out.warnings.is_empty(),
+            "an unknown ledger key must be a silent no-op: reverted={:?} \
+             preserved={:?} kept={:?} failed={:?} warnings={:?}",
+            out.reverted,
+            out.preserved,
+            out.kept,
+            out.failed,
+            out.warnings
+        );
+        assert!(
+            state.entries.is_empty(),
+            "the ledger must be untouched, got {:?}",
+            state.entries.keys().collect::<Vec<_>>()
         );
     }
 }

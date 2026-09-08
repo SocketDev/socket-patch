@@ -738,6 +738,38 @@ mod tests {
         assert_eq!(packages[0].purl, "pkg:nuget/newtonsoft.json@13.0.3");
     }
 
+    /// Direct guard on the `seen`-dedup arm of `scan_global_cache_package`:
+    /// the same package reached through TWO scanned paths (e.g. a local
+    /// `packages/` folder and the global cache both holding it) must be
+    /// emitted only once. `test_deduplication` above creates a single
+    /// package, so the duplicate-purl arm never actually runs there; here a
+    /// shared `seen` set is threaded through two scans of the same tree.
+    #[tokio::test]
+    async fn test_scan_package_dir_dedups_same_package_across_two_scans() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg_dir = dir.path().join("newtonsoft.json").join("13.0.3");
+        tokio::fs::create_dir_all(pkg_dir.join("lib")).await.unwrap();
+
+        let crawler = NuGetCrawler::new();
+        let mut seen = HashSet::new();
+
+        let first = crawler.scan_package_dir(dir.path(), &mut seen).await;
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].purl, "pkg:nuget/newtonsoft.json@13.0.3");
+        assert_eq!(first[0].path, pkg_dir);
+
+        // Second scan of the same tree: the version dir verifies again
+        // (so `scan_global_cache_package` reports `found_any` for it), but
+        // the purl is already in `seen`, so no duplicate package is
+        // emitted.
+        let second = crawler.scan_package_dir(dir.path(), &mut seen).await;
+        assert!(
+            second.is_empty(),
+            "a purl already in `seen` must not be emitted again, got {second:?}"
+        );
+        assert!(seen.contains("pkg:nuget/newtonsoft.json@13.0.3"));
+    }
+
     #[tokio::test]
     async fn test_project_assets_discovery() {
         let dir = tempfile::tempdir().unwrap();
@@ -1131,6 +1163,29 @@ mod tests {
 
         assert_eq!(result.len(), 1);
         assert!(result.contains_key("pkg:nuget/Contoso.Widgets@2.0.0-RC1"));
+    }
+
+    /// Guard on `find_legacy_dir_case_insensitive`'s verification gate: a
+    /// directory whose NAME matches the legacy `<name>.<version>` target
+    /// case-insensitively but whose contents do not verify as a NuGet
+    /// package (no `lib/`, no `.nuspec`) must be skipped — the lookup
+    /// yields nothing rather than handing back an unverified husk
+    /// directory as an in-place patch target.
+    #[tokio::test]
+    async fn test_find_by_purls_legacy_case_match_without_verification_yields_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        // Name matches (case-insensitively), contents don't verify.
+        tokio::fs::create_dir_all(dir.path().join("newtonsoft.json.13.0.3"))
+            .await
+            .unwrap();
+
+        let crawler = NuGetCrawler::new();
+        let purls = vec!["pkg:nuget/Newtonsoft.Json@13.0.3".to_string()];
+        let result = crawler.find_by_purls(dir.path(), &purls).await.unwrap();
+        assert!(
+            result.is_empty(),
+            "an unverified case-matched husk dir must not become a patch target, got {result:?}"
+        );
     }
 
     /// Regression: the NuGet config file name is matched

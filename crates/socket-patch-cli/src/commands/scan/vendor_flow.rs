@@ -757,3 +757,103 @@ mod service_config_tests {
         assert!(cfg.offline);
     }
 }
+
+#[cfg(test)]
+mod fold_vendored_skips_tests {
+    use super::fold_vendored_skips_into_apply;
+
+    /// A pre-rendered vendored-skip record, shaped exactly like
+    /// [`super::partition_skipped_selected`]'s output.
+    fn record(purl: &str) -> serde_json::Value {
+        serde_json::json!({
+            "purl": purl,
+            "uuid": "11111111-1111-4111-8111-111111111111",
+            "action": "skipped",
+            "errorCode": "vendored",
+        })
+    }
+
+    /// The count-consistency contract: every pre-download vendored skip
+    /// was "found" by discovery and "skipped" here, so both counters bump
+    /// by the record count, the records land appended after the download
+    /// phase's own entries, and every other counter is left alone.
+    #[test]
+    fn fold_bumps_found_and_skipped_and_appends_records() {
+        let mut apply_obj = serde_json::json!({
+            "status": "partialFailure",
+            "found": 2,
+            "downloaded": 1,
+            "skipped": 1,
+            "failed": 1,
+            "applied": 1,
+            "patches": [{ "purl": "pkg:npm/a@1.0.0" }],
+        });
+        let records = [record("pkg:npm/b@1.0.0"), record("pkg:npm/c@1.0.0")];
+
+        fold_vendored_skips_into_apply(&mut apply_obj, &records);
+
+        let obj = apply_obj.as_object().expect("still an object");
+        assert!(
+            !obj.contains_key("status"),
+            "the inner status is scan's to recompute: {apply_obj}"
+        );
+        assert_eq!(apply_obj["found"], 4, "{apply_obj}");
+        assert_eq!(apply_obj["skipped"], 3, "{apply_obj}");
+        assert_eq!(apply_obj["downloaded"], 1, "untouched: {apply_obj}");
+        assert_eq!(apply_obj["failed"], 1, "untouched: {apply_obj}");
+        assert_eq!(apply_obj["applied"], 1, "untouched: {apply_obj}");
+        let patches = apply_obj["patches"].as_array().expect("patches array");
+        assert_eq!(patches.len(), 3, "{apply_obj}");
+        assert_eq!(patches[0]["purl"], "pkg:npm/a@1.0.0", "{apply_obj}");
+        assert_eq!(patches[1], records[0], "appended in order: {apply_obj}");
+        assert_eq!(patches[2], records[1], "appended in order: {apply_obj}");
+    }
+
+    /// Missing counters default to zero before the bump (the
+    /// `unwrap_or(0)` fallback) — the keys are CREATED, not skipped, so a
+    /// minimal download report still ends up count-consistent.
+    #[test]
+    fn fold_missing_counts_default_to_zero() {
+        let mut apply_obj = serde_json::json!({ "patches": [] });
+        let records = [record("pkg:npm/b@1.0.0")];
+
+        fold_vendored_skips_into_apply(&mut apply_obj, &records);
+
+        assert_eq!(apply_obj["found"], 1, "{apply_obj}");
+        assert_eq!(apply_obj["skipped"], 1, "{apply_obj}");
+        let patches = apply_obj["patches"].as_array().expect("patches array");
+        assert_eq!(patches.len(), 1, "{apply_obj}");
+        assert_eq!(patches[0], records[0], "{apply_obj}");
+    }
+
+    /// A non-object report (defensive arm) is left byte-identical — no
+    /// panic, no partial mutation.
+    #[test]
+    fn fold_non_object_report_is_a_noop() {
+        let mut apply_obj = serde_json::json!("nope");
+        fold_vendored_skips_into_apply(&mut apply_obj, &[record("pkg:npm/b@1.0.0")]);
+        assert_eq!(apply_obj, serde_json::json!("nope"));
+    }
+
+    /// With zero records the fold only strips the inner `status`: counts
+    /// and patches stay exactly as the download phase reported them.
+    #[test]
+    fn fold_empty_records_only_strips_status() {
+        let mut apply_obj = serde_json::json!({
+            "status": "success",
+            "found": 2,
+            "skipped": 1,
+            "patches": [{ "purl": "pkg:npm/a@1.0.0" }],
+        });
+        fold_vendored_skips_into_apply(&mut apply_obj, &[]);
+        assert_eq!(
+            apply_obj,
+            serde_json::json!({
+                "found": 2,
+                "skipped": 1,
+                "patches": [{ "purl": "pkg:npm/a@1.0.0" }],
+            }),
+            "only the status may change on the zero-record fold"
+        );
+    }
+}

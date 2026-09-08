@@ -377,6 +377,64 @@ mod tests {
     }
 
     #[test]
+    fn empty_env_skips_cargo_probe() {
+        // A fully stripped environment (no CARGO_HOME, no HOME/USERPROFILE,
+        // e.g. a minimal container): cargo_bin_dir has nothing to resolve, so
+        // the cargo probe is skipped entirely and even a path that *looks*
+        // like someone's ~/.cargo/bin stays Standalone.
+        let env = ChannelEnv::default();
+        for p in [
+            "/home/u/.cargo/bin/socket-patch",
+            "/usr/local/bin/socket-patch",
+        ] {
+            assert_eq!(
+                detect_channel(Path::new(p), &env),
+                InstallChannel::Standalone,
+                "{p}"
+            );
+        }
+    }
+
+    #[test]
+    fn launcher_cache_detected_via_localappdata_root() {
+        // LOCALAPPDATA is a launcher cache root in its own right (launcher.rb
+        // reads ENV["LOCALAPPDATA"] before the home fallback). Forward-slash
+        // spelling so the component walk exercises this on Unix runners too
+        // (the backslash spelling is covered by `windows_paths_detected`).
+        // Home is deliberately unset so only the LOCALAPPDATA root can match.
+        let env = ChannelEnv {
+            local_app_data: Some(PathBuf::from("C:/Users/u/AppData/Local")),
+            ..Default::default()
+        };
+        let cached = Path::new(
+            "C:/Users/u/AppData/Local/socket-patch/bin/3.3.0/x86_64-pc-windows-msvc/socket-patch.exe",
+        );
+        assert_eq!(detect_channel(cached, &env), InstallChannel::LauncherCache);
+        // Without LOCALAPPDATA (and no home fallback) the same path has no
+        // root to match against — proving the refusal above came from the
+        // LOCALAPPDATA root, not another heuristic.
+        assert_eq!(
+            detect_channel(cached, &ChannelEnv::default()),
+            InstallChannel::Standalone
+        );
+    }
+
+    #[test]
+    fn channel_label_covers_every_channel() {
+        // Exact strings: these feed the "--update refused: managed by <label>"
+        // message, so a drift here is user-visible wording.
+        assert_eq!(channel_label(InstallChannel::Standalone), "standalone");
+        assert_eq!(channel_label(InstallChannel::Npm), "npm");
+        assert_eq!(channel_label(InstallChannel::Pypi), "pip");
+        assert_eq!(channel_label(InstallChannel::Cargo), "cargo install");
+        assert_eq!(
+            channel_label(InstallChannel::LauncherCache),
+            "the RubyGems launcher"
+        );
+        assert_eq!(channel_label(InstallChannel::Homebrew), "Homebrew");
+    }
+
+    #[test]
     fn hints_route_to_the_owning_manager() {
         assert!(upgrade_hint(InstallChannel::Npm).contains("npm update -g"));
         assert!(upgrade_hint(InstallChannel::Pypi).contains("pip install --upgrade"));

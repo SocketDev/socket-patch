@@ -1850,4 +1850,299 @@ mod tests {
         );
         assert!(plugin_files_present(root).await);
     }
+
+    #[test]
+    fn test_strip_registration_removes_commands_and_sources_entries_keeps_unknown_section() {
+        // Bundler records command-declaring plugins under `commands` and
+        // source-declaring ones under `sources` — both map ENTRY VALUE →
+        // plugin name, so ours must be dropped by value while a foreign
+        // command survives byte-verbatim. A section this CLI has never heard
+        // of (a future bundler's addition) must also survive byte-verbatim
+        // and count toward plugins_remain, so the index is rewritten, never
+        // deleted out from under it.
+        let index = "---\ncommands:\n  patch: \"socket-patch\"\n  mycmd: \"other-plugin\"\n\
+             hooks:\n  after-install:\n  - \"socket-patch\"\nload_paths:\n  socket-patch:\n  \
+             - \"/proj/p/.\"\nplugin_paths:\n  socket-patch: \"/proj/p\"\nsources:\n  \
+             https://example.test: \"socket-patch\"\nfrobs:\n  future: \"thing\"\n";
+        let stripped = strip_plugin_registration(index)
+            .expect("parses")
+            .expect("has our entries");
+        assert!(
+            stripped.plugins_remain,
+            "the foreign command and the unknown section still hold entries"
+        );
+        assert_eq!(
+            stripped.installed_dir.as_deref(),
+            Some(Path::new("/proj/p"))
+        );
+        assert_eq!(
+            stripped.content,
+            "---\ncommands:\n  mycmd: \"other-plugin\"\nhooks:\nload_paths:\n\
+             plugin_paths:\nsources:\nfrobs:\n  future: \"thing\"\n",
+            "our commands/sources entries leave by value; the foreign command \
+             and the unknown `frobs` section survive byte-verbatim"
+        );
+        assert!(
+            !stripped.content.contains("https://example.test"),
+            "the source mapping to socket-patch must be gone:\n{}",
+            stripped.content
+        );
+    }
+
+    #[test]
+    fn test_strip_registration_refuses_unrecognized_entry_and_section_lines() {
+        // A 2-space-indented line that is neither `- item`, `key: value`,
+        // nor `key:` is outside bundler's dialect: refuse with the line
+        // number (the caller surfaces the Residue remedy, never rewrites).
+        let err = strip_plugin_registration("---\nhooks:\n  garbage entry\n")
+            .err()
+            .expect("an unrecognized entry line must refuse");
+        assert!(
+            err.contains("line 3") && err.contains("unrecognized entry line"),
+            "refusal must name the line and the entry-line shape: {err}"
+        );
+        // A single-space-indented header is not a top-level section.
+        let err = strip_plugin_registration("---\n hooks:\n")
+            .err()
+            .expect("a space-indented section line must refuse");
+        assert!(
+            err.contains("line 2") && err.contains("unrecognized section line"),
+            "refusal must name the line and the section-line shape: {err}"
+        );
+        // An embedded space in a section name is not bundler's dialect either.
+        let err = strip_plugin_registration("---\nbad section:\n")
+            .err()
+            .expect("a section name with a space must refuse");
+        assert!(
+            err.contains("line 2") && err.contains("unrecognized section line"),
+            "refusal must name the line and the section-line shape: {err}"
+        );
+        // An empty section name (a bare `:` line) is refused too.
+        let err = strip_plugin_registration("---\n:\n")
+            .err()
+            .expect("an empty section name must refuse");
+        assert!(
+            err.contains("line 2") && err.contains("unrecognized section line"),
+            "refusal must name the line and the section-line shape: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_remove_registration_foreign_index_is_not_registered_and_untouched() {
+        // The common real-world `--remove` state: bundler's index exists but
+        // registers only OTHER plugins (no "socket-patch" substring anywhere).
+        // The fast path must report NotRegistered and leave the foreign index
+        // byte-identical — never parse-and-rewrite it.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let index = root.join(".bundle/plugin/index");
+        let body = "---\ncommands:\nhooks:\n  after-install:\n  - \"other-plugin\"\n\
+             load_paths:\n  other-plugin:\n  - \"/x/other/.\"\nplugin_paths:\n  \
+             other-plugin: \"/x/other\"\nsources:\n";
+        write(&index, body).await;
+
+        let r = remove_plugin_registration_at(root, None, false).await;
+        assert!(matches!(r, GemRegistrationCleanup::NotRegistered), "{r:?}");
+        assert_eq!(
+            fs::read_to_string(&index).await.unwrap(),
+            body,
+            "a foreign index must survive byte-identical"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_remove_registration_substring_mention_is_not_registered_and_untouched() {
+        // A plugin NAMED with our name as a substring (socket-patch-extras):
+        // the coarse `contains(PLUGIN_NAME)` gate passes, but the strip
+        // compares full keys/values, finds nothing of ours, and returns
+        // Ok(None) → NotRegistered. Guards against false-positive stripping
+        // of a similarly-named plugin's registration.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let index = root.join(".bundle/plugin/index");
+        let body = "---\ncommands:\nhooks:\n  after-install:\n  - \"socket-patch-extras\"\n\
+             load_paths:\n  socket-patch-extras:\n  - \"/x/extras/.\"\nplugin_paths:\n  \
+             socket-patch-extras: \"/x/extras\"\nsources:\n";
+        write(&index, body).await;
+
+        let r = remove_plugin_registration_at(root, None, false).await;
+        assert!(matches!(r, GemRegistrationCleanup::NotRegistered), "{r:?}");
+        assert_eq!(
+            fs::read_to_string(&index).await.unwrap(),
+            body,
+            "a similarly-named plugin's registration must survive byte-identical"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_remove_registration_cleans_index_lacking_plugin_paths_entry() {
+        // A partially hand-cleaned index: our hooks/load_paths entries remain
+        // but the `plugin_paths` section is empty, so the strip surfaces NO
+        // installed dir. The cleanup must take the installed_dir-None
+        // fall-through (nothing to delete under the plugin root) and still
+        // finish: emptied index deleted, dirs pruned.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let index = root.join(".bundle/plugin/index");
+        write(
+            &index,
+            "---\ncommands:\nhooks:\n  after-install:\n  - \"socket-patch\"\n\
+             load_paths:\n  socket-patch:\n  - \"/proj/p/.\"\nplugin_paths:\nsources:\n",
+        )
+        .await;
+
+        let r = remove_plugin_registration_at(root, None, false).await;
+        assert!(matches!(r, GemRegistrationCleanup::Cleaned { .. }), "{r:?}");
+        assert!(!index.exists(), "emptied index deleted");
+        assert!(
+            !root.join(".bundle").exists(),
+            "plugin dir and empty app-config dir pruned even with no recorded install dir"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_remove_registration_readonly_parent_delete_failure_is_residue() {
+        // Deleting the index requires write permission on `.bundle/plugin`.
+        // With that dir read-only the solo-plugin delete arm fails (EACCES),
+        // and the failure must surface as Residue carrying the delete reason
+        // (the caller turns it into the `bundler plugin uninstall` remedy) —
+        // never a false Cleaned while the index is in fact still there.
+        use std::os::unix::fs::PermissionsExt;
+
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root ignores mode bits — the delete cannot fail
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let plugin_root = root.join(".bundle/plugin");
+        let index = plugin_root.join("index");
+        let body = solo_index(&root.display().to_string());
+        write(&index, &body).await;
+        fs::set_permissions(&plugin_root, std::fs::Permissions::from_mode(0o555))
+            .await
+            .unwrap();
+
+        let r = remove_plugin_registration_at(root, None, false).await;
+
+        // Restore so the tempdir can be cleaned up regardless of the outcome.
+        fs::set_permissions(&plugin_root, std::fs::Permissions::from_mode(0o755))
+            .await
+            .unwrap();
+
+        match r {
+            GemRegistrationCleanup::Residue { reason, .. } => assert!(
+                reason.contains("could not delete it"),
+                "the delete failure must be the surfaced reason: {reason}"
+            ),
+            other => panic!("a failed index delete must report Residue, got {other:?}"),
+        }
+        assert_eq!(
+            fs::read_to_string(&index).await.unwrap(),
+            body,
+            "the index the delete could not remove must survive byte-identical"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_remove_registration_readonly_parent_rewrite_failure_is_residue() {
+        // Same read-only parent, but another plugin remains registered: the
+        // rewrite arm stages a temp file next to the index, which the
+        // read-only dir refuses — Residue with the rewrite reason, and the
+        // multi-plugin index survives byte-identical (a torn or half-cleaned
+        // index would break EVERY plugin).
+        use std::os::unix::fs::PermissionsExt;
+
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root ignores mode bits — the rewrite cannot fail
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let plugin_root = root.join(".bundle/plugin");
+        let index = plugin_root.join("index");
+        let body = "---\ncommands:\nhooks:\n  after-install:\n  - \"other\"\n  - \"socket-patch\"\n\
+             load_paths:\n  other:\n  - \"/x/other/.\"\n  socket-patch:\n  - \"/proj/p/.\"\n\
+             plugin_paths:\n  other: \"/x/other\"\n  socket-patch: \"/proj/p\"\nsources:\n";
+        write(&index, body).await;
+        fs::set_permissions(&plugin_root, std::fs::Permissions::from_mode(0o555))
+            .await
+            .unwrap();
+
+        let r = remove_plugin_registration_at(root, None, false).await;
+
+        fs::set_permissions(&plugin_root, std::fs::Permissions::from_mode(0o755))
+            .await
+            .unwrap();
+
+        match r {
+            GemRegistrationCleanup::Residue { reason, .. } => assert!(
+                reason.contains("could not rewrite it"),
+                "the rewrite failure must be the surfaced reason: {reason}"
+            ),
+            other => panic!("a failed index rewrite must report Residue, got {other:?}"),
+        }
+        assert_eq!(
+            fs::read_to_string(&index).await.unwrap(),
+            body,
+            "the index the rewrite could not replace must survive byte-identical"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_remove_leaves_stamp_free_user_gitignore_byte_identical() {
+        // `--remove` after our stamp line was hand-deleted (or the file was
+        // rewritten by another tool): nothing of ours is in the .gitignore,
+        // so the early return must leave it BYTE-identical — the CRLF ending
+        // proves the lines-split-and-rejoin reconstruction never ran (a
+        // rewrite would emit "my-scratch-dir/\n" and churn the user's file).
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        add_plugin_files(root, false).await;
+        let user_bytes = b"my-scratch-dir/\r\n";
+        fs::write(stamp_gitignore_path(root), user_bytes)
+            .await
+            .unwrap();
+
+        let r = remove_plugin_files(root, false).await;
+        assert_eq!(r.status, GemSetupStatus::Updated, "plugin files were ours");
+        assert!(!plugins_rb_path(root).exists(), "plugin files removed");
+        assert_eq!(
+            fs::read(stamp_gitignore_path(root)).await.unwrap(),
+            user_bytes,
+            "a stamp-free user .gitignore must survive byte-identical (CRLF kept)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resync_with_intact_stamp_gitignore_appends_no_duplicate() {
+        // A template resync (stale plugins.rb, everything else intact) must
+        // NOT touch `.socket/.gitignore`: `add_stamp_gitignore` is an
+        // unconditional append, and the ignore_missing gate is the only thing
+        // keeping every resync from duplicating the stamp line.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        add_plugin_files(root, false).await;
+        write(
+            &plugins_rb_path(root),
+            "# Code generated by stale\nold body\n",
+        )
+        .await;
+
+        let r = add_plugin_files(root, false).await;
+        assert_eq!(r.status, GemSetupStatus::Updated, "stale plugins.rb resynced");
+        assert_eq!(
+            fs::read_to_string(plugins_rb_path(root)).await.unwrap(),
+            PLUGINS_RB
+        );
+        assert_eq!(
+            fs::read_to_string(stamp_gitignore_path(root))
+                .await
+                .unwrap(),
+            "/gem-plugin-stamp\n",
+            "the intact .gitignore must keep exactly one stamp line — no duplicate append"
+        );
+    }
 }

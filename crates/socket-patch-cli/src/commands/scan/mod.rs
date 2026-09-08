@@ -4005,4 +4005,353 @@ mod tests {
             vec!["pkg:npm/minimist@1.2.2".to_string()]
         );
     }
+
+    // ---- takeover detection degradation: corrupt / probe-less ledgers ------
+
+    #[tokio::test]
+    async fn corrupt_vendor_state_json_degrades_to_no_overlap() {
+        // A hand-corrupted (or torn mid-write) `.socket/vendor/state.json`
+        // must classify like a missing one: this path only feeds takeover
+        // WARNINGS, and the vendored write paths hard-error on corruption
+        // themselves. A valid redirect ledger alone must not produce a
+        // spurious overlap.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_redirect_ledger(root, &["pkg:npm/minimist@1.2.2"]).await;
+        let dir = root.join(".socket/vendor");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("state.json"), "not-json {{{")
+            .await
+            .unwrap();
+
+        assert!(
+            overlapping_ledger_purls(root).await.is_empty(),
+            "a corrupt vendor ledger must degrade to no-overlap"
+        );
+        assert_eq!(
+            classify_overlap_takeover(root).await,
+            OverlapTakeover::default(),
+            "no overlap ⇒ no directional classification"
+        );
+    }
+
+    #[tokio::test]
+    async fn cargo_overlap_with_no_lock_to_probe_stays_silent() {
+        // Both ledgers claim the cargo purl but there is NO Cargo.lock (a
+        // fresh checkout / deleted lock). `classify_cargo_overlap`'s probe
+        // returns NoLockfile, which proves neither direction — the `_` arm
+        // must classify silent rather than guess.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_redirect_ledger(root, &[CARGO_PURL]).await;
+        write_cargo_vendor_ledger(root).await;
+
+        // The raw overlap fires (both ledgers name the purl)…
+        assert_eq!(
+            overlapping_ledger_purls(root).await,
+            vec![CARGO_PURL.to_string()],
+            "the overlap itself must be detected"
+        );
+        // …but with no lock to prove a direction, both buckets stay empty.
+        assert_eq!(
+            classify_overlap_takeover(root).await,
+            OverlapTakeover::default(),
+            "no Cargo.lock ⇒ neither direction proven ⇒ silent"
+        );
+    }
+
+    // ---- hostile-ledger tamper guards (path traversal) ----------------------
+    // The ledgers are committed files an attacker can edit: a recorded
+    // lockfile name must never make the wiring probes READ outside the
+    // project root.
+
+    #[tokio::test]
+    async fn hosted_wiring_text_proof_never_reads_outside_the_project() {
+        // The escaping file EXISTS and carries the record uuid — it would
+        // prove hosted wiring were it read. The `../` guard must skip it.
+        let outer = tempfile::tempdir().unwrap();
+        let root = outer.path().join("proj");
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        tokio::fs::write(
+            outer.path().join("escape.lock"),
+            format!("resolved https://patch.socket.dev/x/{TAKEOVER_UUID}/m.tgz\n"),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !hosted_wiring_live(
+                &root,
+                "pkg:npm/minimist@1.2.2",
+                Some(TAKEOVER_UUID),
+                &["../escape.lock"],
+                &[],
+            )
+            .await,
+            "a '../'-escaping ledger path must never be read"
+        );
+
+        // Positive control: the SAME content inside the project proves the
+        // wiring — so the negative above is the guard, not a missing file.
+        tokio::fs::write(
+            root.join("inside.lock"),
+            format!("resolved https://patch.socket.dev/x/{TAKEOVER_UUID}/m.tgz\n"),
+        )
+        .await
+        .unwrap();
+        assert!(
+            hosted_wiring_live(
+                &root,
+                "pkg:npm/minimist@1.2.2",
+                Some(TAKEOVER_UUID),
+                &["inside.lock"],
+                &[],
+            )
+            .await,
+            "the identical in-project file must prove hosted wiring"
+        );
+    }
+
+    #[tokio::test]
+    async fn vendored_wiring_probe_never_reads_outside_the_project() {
+        let marker = socket_patch_core::vendor::path::vendor_uuid_dir_rel("npm", TAKEOVER_UUID)
+            .expect("npm has a vendor dir mapping");
+        let entry_json = |wiring_file: &str| {
+            serde_json::json!({
+                "ecosystem": "npm",
+                "basePurl": "pkg:npm/minimist@1.2.2",
+                "uuid": TAKEOVER_UUID,
+                "artifact": {
+                    "path": format!("{marker}/minimist-1.2.2.tgz"),
+                },
+                "wiring": [{
+                    "file": wiring_file,
+                    "kind": "npm_lock_entry",
+                    "action": "rewritten",
+                }],
+            })
+        };
+
+        let outer = tempfile::tempdir().unwrap();
+        let root = outer.path().join("proj");
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        // The escaping file EXISTS and contains the vendored marker.
+        tokio::fs::write(
+            outer.path().join("escape.lock"),
+            format!("resolved file:{marker}/minimist-1.2.2.tgz\n"),
+        )
+        .await
+        .unwrap();
+
+        let escaping: socket_patch_core::vendor::VendorEntry =
+            serde_json::from_value(entry_json("../escape.lock")).unwrap();
+        assert!(
+            !vendored_wiring_live(&root, &escaping).await,
+            "a '../'-escaping wiring file must never be read"
+        );
+
+        // Positive control: same content, in-project name ⇒ proven live.
+        tokio::fs::write(
+            root.join("inside.lock"),
+            format!("resolved file:{marker}/minimist-1.2.2.tgz\n"),
+        )
+        .await
+        .unwrap();
+        let in_project: socket_patch_core::vendor::VendorEntry =
+            serde_json::from_value(entry_json("inside.lock")).unwrap();
+        assert!(
+            vendored_wiring_live(&root, &in_project).await,
+            "the identical in-project wiring file must prove vendored wiring"
+        );
+    }
+
+    // ---- note_vendor_supersedes_redirect: warning + npm auto-reconcile ------
+    // The vendored flows' takeover advisory. Detection is pinned above;
+    // these pin the post-detection body: the reconciled/manual/dry-run
+    // partitions, the ledger mutation, and the fires-once contract.
+
+    const NPM_TAKEOVER_PURL: &str = "pkg:npm/minimist@1.2.2";
+
+    fn vendor_env() -> crate::json_envelope::Envelope {
+        crate::json_envelope::Envelope::new(crate::json_envelope::Command::Vendor)
+    }
+
+    /// `GlobalArgs` for the advisory: `json` keeps the stderr print quiet
+    /// (the envelope `warnings[]` is what the tests read).
+    fn takeover_common() -> GlobalArgs {
+        GlobalArgs {
+            json: true,
+            ..GlobalArgs::default()
+        }
+    }
+
+    /// The WET npm takeover: redirect ledger records the purl (with a
+    /// version-exact keyed edit `drop_superseded_purl` can claim), the
+    /// vendored ledger is wired, and the LIVE lock points at the committed
+    /// vendored artifact.
+    async fn write_wet_npm_takeover(root: &Path) {
+        write_redirect_ledger_with_edits(
+            root,
+            &[NPM_TAKEOVER_PURL],
+            vec![redirect_edit("package-lock.json", "minimist@1.2.2")],
+        )
+        .await;
+        write_vendor_ledger_wired(root, &[NPM_TAKEOVER_PURL]).await;
+        write_lock_pointing_at_vendored(root, "minimist", "1.2.2").await;
+    }
+
+    #[tokio::test]
+    async fn vendored_takeover_wet_npm_run_reconciles_the_ledger_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_wet_npm_takeover(root).await;
+
+        let mut env = vendor_env();
+        note_vendor_supersedes_redirect(&mut env, root, &takeover_common()).await;
+
+        assert_eq!(env.warnings.len(), 1, "exactly one warning: {:?}", env.warnings);
+        assert_eq!(env.warnings[0].code, VENDOR_SUPERSEDES_REDIRECT);
+        assert!(
+            env.warnings[0].detail.contains("reconciled automatically"),
+            "a wet npm run must report the past-tense reconciled detail: {}",
+            env.warnings[0].detail
+        );
+        assert!(
+            env.warnings[0].detail.contains(NPM_TAKEOVER_PURL),
+            "the warning must name the package: {}",
+            env.warnings[0].detail
+        );
+
+        // Both halves dropped; the emptied ledger is deleted outright.
+        assert!(
+            load_ledger(root).await.is_none(),
+            "an emptied redirect ledger must be deleted"
+        );
+
+        // Fires once: the reconciled project no longer overlaps.
+        let mut env2 = vendor_env();
+        note_vendor_supersedes_redirect(&mut env2, root, &takeover_common()).await;
+        assert!(
+            env2.warnings.is_empty(),
+            "a reconciled takeover must not re-warn: {:?}",
+            env2.warnings
+        );
+    }
+
+    #[tokio::test]
+    async fn vendored_takeover_dry_run_warns_manual_and_leaves_the_ledger() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_wet_npm_takeover(root).await;
+        let ledger_path = root.join(".socket/vendor/redirect-state.json");
+        let before = tokio::fs::read(&ledger_path).await.unwrap();
+
+        let mut env = vendor_env();
+        let common = GlobalArgs {
+            dry_run: true,
+            ..takeover_common()
+        };
+        note_vendor_supersedes_redirect(&mut env, root, &common).await;
+
+        assert_eq!(env.warnings.len(), 1, "{:?}", env.warnings);
+        assert_eq!(env.warnings[0].code, VENDOR_SUPERSEDES_REDIRECT);
+        // A dry run hands out the MANUAL remediation (never the past-tense
+        // reconciled text — nothing was mutated).
+        assert!(
+            env.warnings[0].detail.contains("clean up by hand"),
+            "dry-run must carry the manual advisory: {}",
+            env.warnings[0].detail
+        );
+        assert!(
+            !env.warnings[0].detail.contains("reconciled automatically"),
+            "dry-run must not claim a reconciliation: {}",
+            env.warnings[0].detail
+        );
+        let after = tokio::fs::read(&ledger_path).await.unwrap();
+        assert_eq!(before, after, "a dry run must leave the ledger byte-identical");
+    }
+
+    #[tokio::test]
+    async fn degraded_ledger_reconcile_matches_nothing_and_falls_back_to_manual() {
+        // The degraded record-fetch-failed ledger: records EMPTY, one
+        // version-blind path-keyed edit. The overlap fallback flags it, but
+        // `drop_superseded_purl` (fail-closed: no record uuid to anchor on,
+        // key not version-exact) drops nothing — the warning must hand out
+        // the manual remediation, never claim a reconciliation.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_redirect_ledger_with_edits(
+            root,
+            &[],
+            vec![redirect_edit("package-lock.json", "node_modules/minimist")],
+        )
+        .await;
+        write_vendor_ledger_wired(root, &[NPM_TAKEOVER_PURL]).await;
+        write_lock_pointing_at_vendored(root, "minimist", "1.2.2").await;
+        let ledger_path = root.join(".socket/vendor/redirect-state.json");
+        let before = tokio::fs::read(&ledger_path).await.unwrap();
+
+        let mut env = vendor_env();
+        note_vendor_supersedes_redirect(&mut env, root, &takeover_common()).await;
+
+        assert_eq!(env.warnings.len(), 1, "{:?}", env.warnings);
+        assert_eq!(env.warnings[0].code, VENDOR_SUPERSEDES_REDIRECT);
+        assert_eq!(
+            env.warnings[0].detail,
+            mode_takeover_detail(&[NPM_TAKEOVER_PURL.to_string()], false),
+            "an Ok(false) reconcile must fall back to the manual detail verbatim"
+        );
+        let after = tokio::fs::read(&ledger_path).await.unwrap();
+        assert_eq!(
+            before, after,
+            "a no-op reconcile must leave the degraded ledger byte-identical"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reconcile_persist_failure_fails_closed_with_manual_advice() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_wet_npm_takeover(root).await;
+        let vendor_dir = root.join(".socket/vendor");
+        let ledger_path = vendor_dir.join("redirect-state.json");
+        let before = tokio::fs::read(&ledger_path).await.unwrap();
+
+        std::fs::set_permissions(&vendor_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        // Root ignores mode bits; skip there (CI containers sometimes run as root).
+        if std::fs::File::create(vendor_dir.join("probe")).is_ok() {
+            let _ = std::fs::remove_file(vendor_dir.join("probe"));
+            let _ =
+                std::fs::set_permissions(&vendor_dir, std::fs::Permissions::from_mode(0o755));
+            eprintln!("skipping: running as root, 0555 does not block writes");
+            return;
+        }
+
+        let mut env = vendor_env();
+        note_vendor_supersedes_redirect(&mut env, root, &takeover_common()).await;
+
+        // Restore BEFORE asserting so a failure never leaks an undeletable
+        // tempdir.
+        std::fs::set_permissions(&vendor_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(env.warnings.len(), 1, "{:?}", env.warnings);
+        assert_eq!(env.warnings[0].code, VENDOR_SUPERSEDES_REDIRECT);
+        assert!(
+            env.warnings[0].detail.contains("Automatic reconciliation failed"),
+            "the persist failure must be surfaced inside the warning: {}",
+            env.warnings[0].detail
+        );
+        assert!(
+            env.warnings[0]
+                .detail
+                .starts_with(&mode_takeover_detail(&[NPM_TAKEOVER_PURL.to_string()], false)),
+            "the failure text must ride on the full manual remediation: {}",
+            env.warnings[0].detail
+        );
+        // Fail closed: the atomic writer left the ledger fully pre-drop.
+        let after = tokio::fs::read(&ledger_path).await.unwrap();
+        assert_eq!(before, after, "a failed persist must leave the ledger untouched");
+    }
 }

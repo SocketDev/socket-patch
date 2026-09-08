@@ -689,6 +689,15 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count_lock_entries(empty.path(), "cfg-if", "1.0.4").await, 0);
+
+        // A lock that parses but has no [[package]] array counts zero too
+        // (the documented "no usable lock" contract, matching
+        // read_locked_versions).
+        let bare = tempfile::tempdir().unwrap();
+        tokio::fs::write(bare.path().join("Cargo.lock"), "version = 4\n")
+            .await
+            .unwrap();
+        assert_eq!(count_lock_entries(bare.path(), "cfg-if", "1.0.4").await, 0);
     }
 
     #[cfg(unix)]

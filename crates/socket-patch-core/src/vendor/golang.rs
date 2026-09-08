@@ -127,12 +127,43 @@ pub async fn vendor_go_module(
     // `prior_target` recorded here would be our own vendored pointer.
     let wired =
         prior_target.as_deref() == Some(replace_target_path(&base_rel, module, version).as_str());
+    // Hot-path parity with the engine's `redirect_in_sync`: the directive's
+    // LEFT-hand version must also still pin `version`. A hand-edited
+    // `replace <module> v1.0.0 => <this uuid's copy>` still matches on path,
+    // but the wrong LHS version no longer applies to the required version —
+    // `go build` would compile the UNPATCHED module (the version-less
+    // catch-all still builds patched, but is equally out of the canonical
+    // form) — so drift must fall through to the engine, whose socket-owned
+    // upsert rewrites the drifted line in place. `wired` itself stays
+    // path-keyed: it also gates entry suppression (a healing re-run must
+    // record no entry — `prior_target` is our own vendored pointer, not a
+    // pre-vendor original) and the failure-teardown directive drop.
+    let wired_version_ok = prior
+        .as_ref()
+        .is_some_and(|e| e.version.as_deref() == Some(version));
     let copy_dir = copy_dir_for(project_root, &base_rel, module, version);
-    let copy_was_ok = wired && copy_matches_after_hashes(&copy_dir, &record.files).await;
+    let copy_was_ok =
+        wired && wired_version_ok && copy_matches_after_hashes(&copy_dir, &record.files).await;
 
     let mut warnings: Vec<VendorWarning> = Vec::new();
     if let Some(refusal) = service_offline_conflict(service) {
         return refusal;
+    }
+
+    // Hot path (mirrors cargo.rs / composer_lock.rs): already wired to this
+    // uuid with the committed copy intact → touch nothing and never consult
+    // `pristine_src` — a pruned/partial module-cache copy must not fail a
+    // healthy re-run. The engine's `redirect_in_sync` would answer the same,
+    // but only after the `!force` missing-target pre-check below consulted
+    // the pristine source; returning here keeps that pre-check scoped to
+    // runs that actually rebuild from it. Dry runs keep the engine's
+    // read-only verify as their preview.
+    if copy_was_ok && !dry_run {
+        return done(
+            already_patched_result(purl, &copy_dir, &record.files),
+            None,
+            warnings,
+        );
     }
 
     // Acquire the patched module: prefer the prebuilt module zip from the patch
@@ -227,9 +258,10 @@ pub async fn vendor_go_module(
     }
 
     if wired {
-        // Already wired to this uuid: either the engine's in-sync hot path
-        // (copy intact) or an artifact-only rebuild (copy was missing/stale).
-        // Never re-record the ledger entry.
+        // Already wired to this uuid: the engine's in-sync hot path (copy
+        // intact), an artifact-only rebuild (copy was missing/stale), or a
+        // directive heal (the LHS version had drifted). Never re-record the
+        // ledger entry.
         if !copy_was_ok {
             // A wholesale-deleted uuid dir lost the informational marker;
             // restore it alongside the rebuilt copy (never a trust input —
@@ -242,13 +274,26 @@ pub async fn vendor_go_module(
                     format!("could not write the vendor marker: {e}"),
                 ));
             }
-            warnings.push(VendorWarning::new(
-                "vendor_artifact_rebuilt",
-                format!(
-                    "the committed vendored copy for {module}@{version} was missing or \
-                     stale; rebuilt under {base_rel} (go.mod untouched)"
-                ),
-            ));
+            if wired_version_ok {
+                warnings.push(VendorWarning::new(
+                    "vendor_artifact_rebuilt",
+                    format!(
+                        "the committed vendored copy for {module}@{version} was missing or \
+                         stale; rebuilt under {base_rel} (go.mod untouched)"
+                    ),
+                ));
+            } else {
+                // The rebuild ran because the directive's LHS version had
+                // drifted; the engine's upsert rewrote the line back in place.
+                warnings.push(VendorWarning::new(
+                    "vendor_replace_healed",
+                    format!(
+                        "the socket-owned `replace` for {module} no longer pinned \
+                         {version} on its left-hand side (drifted go.mod); rewrote \
+                         the directive in place and rebuilt the copy under {base_rel}"
+                    ),
+                ));
+            }
         }
         return done(result, None, warnings);
     }
@@ -974,6 +1019,113 @@ mod tests {
             mod1,
             "go.mod byte-stable"
         );
+    }
+
+    /// A healthy wired re-run must never consult the pristine module cache:
+    /// a pruned/partial cache copy (a beforeHash target file absent) must not
+    /// fail a project whose vendored state is fully intact — the in-sync hot
+    /// path answers already-patched without touching `pristine_src`, exactly
+    /// as the cargo and composer backends do.
+    #[tokio::test]
+    async fn test_wired_intact_copy_rerun_survives_pruned_pristine() {
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        expect_done(run_vendor(PURL, root, &blobs, &pristine, &record, false).await);
+
+        let copy = root.join(copy_rel()).join("bar.go");
+        let gomod = root.join("go.mod");
+        let copy1 = tokio::fs::read(&copy).await.unwrap();
+        let mod1 = tokio::fs::read(&gomod).await.unwrap();
+
+        // The module cache lost a patch-target file after the first run.
+        tokio::fs::remove_file(pristine.join("bar.go"))
+            .await
+            .unwrap();
+
+        let (result, entry, warnings) =
+            expect_done(run_vendor(PURL, root, &blobs, &pristine, &record, false).await);
+        assert!(
+            result.success,
+            "an in-sync re-run must not fail on a pruned pristine: {:?}",
+            result.error
+        );
+        assert!(entry.is_none(), "no re-recorded entry");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(
+            tokio::fs::read(&copy).await.unwrap(),
+            copy1,
+            "copy untouched"
+        );
+        assert_eq!(
+            tokio::fs::read(&gomod).await.unwrap(),
+            mod1,
+            "go.mod byte-stable"
+        );
+    }
+
+    /// Hot-path parity with the engine's `redirect_in_sync`: a socket-owned
+    /// directive whose LEFT-hand version drifted (hand-edited go.mod, or a
+    /// version-less catch-all) still matches on the RHS path, but a wrong LHS
+    /// version no longer applies to the required version — `go build` would
+    /// compile the UNPATCHED module while a path-only gate reports
+    /// already-patched forever. The re-run must fall through and self-heal
+    /// the directive in place (no re-recorded entry, copy stays patched).
+    #[tokio::test]
+    async fn test_wired_drifted_lhs_version_is_healed_not_already_patched() {
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        expect_done(run_vendor(PURL, root, &blobs, &pristine, &record, false).await);
+        let gomod = root.join("go.mod");
+        let healthy = tokio::fs::read_to_string(&gomod).await.unwrap();
+
+        for drifted_lhs in [format!("{MODULE} v1.0.0"), MODULE.to_string()] {
+            // External tooling rewrites the directive's LHS (path unchanged).
+            let drifted = healthy.replace(
+                &format!("replace {MODULE} {VERSION} =>"),
+                &format!("replace {drifted_lhs} =>"),
+            );
+            assert_ne!(drifted, healthy, "fixture must drift the directive");
+            tokio::fs::write(&gomod, &drifted).await.unwrap();
+
+            let (result, entry, warnings) =
+                expect_done(run_vendor(PURL, root, &blobs, &pristine, &record, false).await);
+            assert!(result.success, "{:?}", result.error);
+            assert!(
+                entry.is_none(),
+                "a healing re-run records no entry (the prior target is our \
+                 own vendored pointer, not a pre-vendor original)"
+            );
+            assert!(
+                warnings.iter().any(|w| w.code == "vendor_replace_healed"),
+                "heal surfaced for `{drifted_lhs}`: {warnings:?}"
+            );
+            // The directive is healed back to the canonical pinned form …
+            let entries = read_replace_entries(root).await;
+            let mine: Vec<_> = entries.iter().filter(|e| e.module == MODULE).collect();
+            assert_eq!(mine.len(), 1, "{entries:?}");
+            assert_eq!(mine[0].owner, Some(ReplaceOwner::Vendor));
+            assert_eq!(
+                mine[0].version.as_deref(),
+                Some(VERSION),
+                "LHS version healed for `{drifted_lhs}`"
+            );
+            assert_eq!(
+                mine[0].path.as_deref(),
+                Some(format!("./{}", copy_rel()).as_str())
+            );
+            assert_eq!(
+                tokio::fs::read_to_string(&gomod).await.unwrap(),
+                healthy,
+                "the heal round-trips go.mod byte-identical"
+            );
+            // … and the copy still carries the patched bytes.
+            assert_eq!(
+                tokio::fs::read(root.join(copy_rel()).join("bar.go"))
+                    .await
+                    .unwrap(),
+                PATCHED
+            );
+        }
     }
 
     #[tokio::test]
@@ -1722,5 +1874,604 @@ mod tests {
         )
         .await;
         expect_refused(outcome, "vendor_service_offline_conflict");
+    }
+
+    // ── missing-patch-target pre-check (fail-closed vs `--force`) ─────────
+
+    /// A patch-target file absent from the pristine module cache fails closed
+    /// on a first (non-`--force`) run: the vendor pre-check reports the
+    /// missing file BEFORE the engine's force-apply could silently skip it,
+    /// and nothing is written.
+    #[tokio::test]
+    async fn test_missing_patch_target_fails_closed_without_force() {
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        let gomod_before = tokio::fs::read_to_string(root.join("go.mod"))
+            .await
+            .unwrap();
+        // The module cache lost the beforeHash target.
+        tokio::fs::remove_file(pristine.join("bar.go"))
+            .await
+            .unwrap();
+
+        let (result, entry, _warnings) =
+            expect_done(run_vendor(PURL, root, &blobs, &pristine, &record, false).await);
+        assert!(!result.success, "missing target must fail closed");
+        assert_eq!(
+            result.error.as_deref(),
+            Some("Cannot apply patch: package/bar.go - File not found")
+        );
+        assert!(entry.is_none());
+        // Nothing was written: no uuid dir husk, no replace, go.mod untouched.
+        assert!(!root.join(format!(".socket/vendor/golang/{UUID}")).exists());
+        assert!(read_replace_entries(root).await.is_empty());
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("go.mod"))
+                .await
+                .unwrap(),
+            gomod_before
+        );
+    }
+
+    /// `--force` bypasses the fail-closed pre-check: the engine owns the
+    /// outcome, and its force policy SKIPS the missing file (its own skip
+    /// message, not the pre-check's "File not found") while still wiring the
+    /// vendor `replace` and recording the ledger entry.
+    #[tokio::test]
+    async fn test_force_bypasses_missing_target_precheck() {
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        tokio::fs::remove_file(pristine.join("bar.go"))
+            .await
+            .unwrap();
+
+        let sources = PatchSources::blobs_only(&blobs);
+        let outcome = vendor_go_module(
+            PURL,
+            &pristine,
+            root,
+            &record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            /*force=*/ true,
+            None,
+        )
+        .await;
+        let (result, entry, _warnings) = expect_done(outcome);
+        assert!(
+            result.success,
+            "force skips the missing target: {:?}",
+            result.error
+        );
+        let err = result.error.expect("force skip is surfaced in the result");
+        assert!(
+            err.contains("not found on disk (--force)"),
+            "the engine's skip message, not the pre-check text: {err}"
+        );
+        assert!(entry.is_some(), "a forced vendor still records the entry");
+        let entries = read_replace_entries(root).await;
+        let e = entries
+            .iter()
+            .find(|e| e.module == MODULE)
+            .expect("replace wired despite the skip");
+        assert_eq!(e.owner, Some(ReplaceOwner::Vendor));
+        assert_eq!(
+            e.path.as_deref(),
+            Some(format!("./{}", copy_rel()).as_str())
+        );
+    }
+
+    // ── takeover husk-prune: multi-module go-patches layouts ──────────────
+
+    /// The takeover prune walks empty parent husks upward but must stop at
+    /// the first non-empty level: a sibling module's `apply` copy under the
+    /// same `github.com/foo/` parent survives the takeover untouched.
+    #[tokio::test]
+    async fn test_takeover_prune_preserves_sibling_module_copy() {
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        // Pre-seed the apply redirect for OUR module through the engine.
+        let sources = PatchSources::blobs_only(&blobs);
+        let pre = apply_go_redirect(
+            PURL,
+            MODULE,
+            VERSION,
+            &pristine,
+            root,
+            GO_PATCHES_DIR,
+            &record.files,
+            &sources,
+            Some(UUID),
+            false,
+            MismatchPolicy::Warn,
+        )
+        .await;
+        assert!(pre.success, "fixture redirect failed: {:?}", pre.error);
+        // A sibling module's copy shares the `github.com/foo/` parent level.
+        let sibling = root.join(".socket/go-patches/github.com/foo/other@v1.0.0");
+        tokio::fs::create_dir_all(&sibling).await.unwrap();
+        tokio::fs::write(sibling.join("keep.go"), b"package other\n")
+            .await
+            .unwrap();
+
+        let (result, entry, warnings) =
+            expect_done(run_vendor(PURL, root, &blobs, &pristine, &record, false).await);
+        assert!(result.success, "{:?}", result.error);
+        assert!(
+            warnings.iter().any(|w| w.code == "vendor_takeover"),
+            "takeover surfaced: {warnings:?}"
+        );
+        assert!(entry.unwrap().took_over_go_patches);
+
+        // OUR stale copy is gone …
+        assert!(!root
+            .join(".socket/go-patches/github.com/foo/bar@v1.4.2")
+            .exists());
+        // … but the prune broke at the non-empty parent: the sibling copy
+        // (and with it the go-patches root) survives byte-intact.
+        assert_eq!(
+            tokio::fs::read(sibling.join("keep.go")).await.unwrap(),
+            b"package other\n"
+        );
+        assert!(root.join(GO_PATCHES_DIR).exists());
+        // Exactly ONE directive for the module, now vendor-owned.
+        let entries = read_replace_entries(root).await;
+        let mine: Vec<_> = entries.iter().filter(|e| e.module == MODULE).collect();
+        assert_eq!(mine.len(), 1, "{entries:?}");
+        assert_eq!(mine[0].owner, Some(ReplaceOwner::Vendor));
+    }
+
+    // ── service status legs: pending / unavailable / request-failed ───────
+
+    /// `auto` + a still-building prebuilt zip falls back to the local build
+    /// with a `vendor_prebuilt_pending` advisory naming the degradation.
+    #[tokio::test]
+    async fn service_pending_auto_falls_back_to_build() {
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        let server = wiremock::MockServer::start().await;
+        mount_go_status(&server, "pending_build").await;
+        let sources = PatchSources::blobs_only(&blobs);
+
+        let outcome = vendor_go_module(
+            PURL,
+            &pristine,
+            root,
+            &record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            Some(&go_service_cfg(&server.uri(), VendorSource::Auto, false)),
+        )
+        .await;
+        let (result, entry, warnings) = expect_done(outcome);
+        assert!(result.success, "{:?}", result.error);
+        assert!(entry.is_some());
+        let w = warnings
+            .iter()
+            .find(|w| w.code == "vendor_prebuilt_pending")
+            .unwrap_or_else(|| panic!("pending advisory: {warnings:?}"));
+        assert!(w.detail.contains("still building"), "{}", w.detail);
+        assert!(
+            w.detail.contains("building locally instead"),
+            "{}",
+            w.detail
+        );
+        assert_eq!(
+            tokio::fs::read(root.join(copy_rel()).join("bar.go"))
+                .await
+                .unwrap(),
+            PATCHED,
+            "the local build produced the patched copy"
+        );
+    }
+
+    /// `service` mode + a still-building prebuilt zip hard-fails (no
+    /// fallback), writing nothing.
+    #[tokio::test]
+    async fn service_pending_service_mode_hard_fails() {
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        let gomod_before = tokio::fs::read(root.join("go.mod")).await.unwrap();
+        let server = wiremock::MockServer::start().await;
+        mount_go_status(&server, "pending_build").await;
+        let sources = PatchSources::blobs_only(&blobs);
+
+        let outcome = vendor_go_module(
+            PURL,
+            &pristine,
+            root,
+            &record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            Some(&go_service_cfg(&server.uri(), VendorSource::Service, false)),
+        )
+        .await;
+        let detail = expect_refused(outcome, "vendor_prebuilt_required");
+        assert!(detail.contains("still building"), "{detail}");
+        assert!(!root.join(format!(".socket/vendor/golang/{UUID}")).exists());
+        assert_eq!(
+            tokio::fs::read(root.join("go.mod")).await.unwrap(),
+            gomod_before,
+            "go.mod untouched"
+        );
+    }
+
+    /// `service` mode + an unavailable prebuilt zip (`not_found`) hard-fails
+    /// naming the reason; the auto flavor is covered by
+    /// `service_unavailable_auto_falls_back_to_build`.
+    #[tokio::test]
+    async fn service_unavailable_service_mode_hard_fails() {
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        let gomod_before = tokio::fs::read(root.join("go.mod")).await.unwrap();
+        let server = wiremock::MockServer::start().await;
+        mount_go_status(&server, "not_found").await;
+        let sources = PatchSources::blobs_only(&blobs);
+
+        let outcome = vendor_go_module(
+            PURL,
+            &pristine,
+            root,
+            &record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            Some(&go_service_cfg(&server.uri(), VendorSource::Service, false)),
+        )
+        .await;
+        let detail = expect_refused(outcome, "vendor_prebuilt_required");
+        assert!(
+            detail.contains("prebuilt module zip unavailable: not_found"),
+            "{detail}"
+        );
+        assert!(!root.join(format!(".socket/vendor/golang/{UUID}")).exists());
+        assert_eq!(
+            tokio::fs::read(root.join("go.mod")).await.unwrap(),
+            gomod_before,
+            "go.mod untouched"
+        );
+    }
+
+    /// A failed service REQUEST (HTTP 500 on the grant endpoint) under `auto`
+    /// warns `vendor_prebuilt_unavailable` and builds locally.
+    #[tokio::test]
+    async fn service_request_failure_auto_warns_and_builds_locally() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v0/orgs/acme/patches/package"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let sources = PatchSources::blobs_only(&blobs);
+
+        let outcome = vendor_go_module(
+            PURL,
+            &pristine,
+            root,
+            &record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            Some(&go_service_cfg(&server.uri(), VendorSource::Auto, false)),
+        )
+        .await;
+        let (result, entry, warnings) = expect_done(outcome);
+        assert!(result.success, "{:?}", result.error);
+        assert!(entry.is_some());
+        let w = warnings
+            .iter()
+            .find(|w| w.code == "vendor_prebuilt_unavailable")
+            .unwrap_or_else(|| panic!("fallback reason recorded: {warnings:?}"));
+        assert!(
+            w.detail.contains("patch service request failed"),
+            "{}",
+            w.detail
+        );
+        assert_eq!(
+            tokio::fs::read(root.join(copy_rel()).join("bar.go"))
+                .await
+                .unwrap(),
+            PATCHED
+        );
+    }
+
+    /// The same failed request under `service` mode hard-fails, writing
+    /// nothing.
+    #[tokio::test]
+    async fn service_request_failure_service_mode_hard_fails() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        let gomod_before = tokio::fs::read(root.join("go.mod")).await.unwrap();
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v0/orgs/acme/patches/package"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let sources = PatchSources::blobs_only(&blobs);
+
+        let outcome = vendor_go_module(
+            PURL,
+            &pristine,
+            root,
+            &record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            Some(&go_service_cfg(&server.uri(), VendorSource::Service, false)),
+        )
+        .await;
+        let detail = expect_refused(outcome, "vendor_prebuilt_required");
+        assert!(detail.contains("patch service request failed"), "{detail}");
+        assert!(!root.join(format!(".socket/vendor/golang/{UUID}")).exists());
+        assert_eq!(
+            tokio::fs::read(root.join("go.mod")).await.unwrap(),
+            gomod_before,
+            "go.mod untouched"
+        );
+    }
+
+    // ── prebuilt-zip layout mismatch (integrity OK, wrong file set) ────────
+
+    /// A well-formed, integrity-passing zip whose entries carry the correct
+    /// `{module}@{version}/` prefix but the WRONG file set (converter drift):
+    /// the extracted-tree verify fails closed and `auto` rebuilds locally —
+    /// the bad extract is torn down, never left behind.
+    #[tokio::test]
+    async fn service_layout_mismatch_auto_falls_back_to_build() {
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        let zip = make_module_zip(&[
+            ("go.mod", b"module github.com/foo/bar\n\ngo 1.21\n"),
+            ("wrong.go", PATCHED), // bar.go absent at its recorded path
+        ]);
+        let sri = sri_sha512(&zip);
+        let server = wiremock::MockServer::start().await;
+        mount_go_granted(&server, &sri, None, &zip).await;
+        let sources = PatchSources::blobs_only(&blobs);
+
+        let outcome = vendor_go_module(
+            PURL,
+            &pristine,
+            root,
+            &record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            Some(&go_service_cfg(&server.uri(), VendorSource::Auto, false)),
+        )
+        .await;
+        let (result, entry, warnings) = expect_done(outcome);
+        assert!(result.success, "{:?}", result.error);
+        assert!(entry.is_some());
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.code == "vendor_prebuilt_layout_mismatch"),
+            "{warnings:?}"
+        );
+        let copy = root.join(copy_rel());
+        assert_eq!(
+            tokio::fs::read(copy.join("bar.go")).await.unwrap(),
+            PATCHED,
+            "the local rebuild produced the patched copy"
+        );
+        assert!(
+            !copy.join("wrong.go").exists(),
+            "the bad extract was torn down before the local rebuild"
+        );
+        let entries = read_replace_entries(root).await;
+        let e = entries.iter().find(|e| e.module == MODULE).unwrap();
+        assert_eq!(e.owner, Some(ReplaceOwner::Vendor));
+    }
+
+    /// The same layout mismatch under `service` mode refuses (no local
+    /// fallback allowed): the extracted uuid dir is torn down and go.mod was
+    /// never edited (the verify runs BEFORE the wire).
+    #[tokio::test]
+    async fn service_layout_mismatch_service_mode_hard_fails() {
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        let gomod_before = tokio::fs::read(root.join("go.mod")).await.unwrap();
+        let zip = make_module_zip(&[
+            ("go.mod", b"module github.com/foo/bar\n\ngo 1.21\n"),
+            ("wrong.go", PATCHED),
+        ]);
+        let sri = sri_sha512(&zip);
+        let server = wiremock::MockServer::start().await;
+        mount_go_granted(&server, &sri, None, &zip).await;
+        let sources = PatchSources::blobs_only(&blobs);
+
+        let outcome = vendor_go_module(
+            PURL,
+            &pristine,
+            root,
+            &record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            Some(&go_service_cfg(&server.uri(), VendorSource::Service, false)),
+        )
+        .await;
+        let detail = expect_refused(outcome, "vendor_prebuilt_required");
+        assert!(detail.contains("unexpected layout"), "{detail}");
+        assert!(
+            !root.join(format!(".socket/vendor/golang/{UUID}")).exists(),
+            "extracted uuid dir torn down"
+        );
+        assert_eq!(
+            tokio::fs::read(root.join("go.mod")).await.unwrap(),
+            gomod_before,
+            "go.mod untouched"
+        );
+    }
+
+    // ── service wire failure + first-run teardown (wired=false edge) ───────
+
+    /// A GOOD prebuilt zip whose `replace` upsert collides with a
+    /// user-authored same-version pin: the service leg hard-fails
+    /// `vendor_prebuilt_wire_failed` AFTER a successful extract, so the
+    /// teardown must remove the freshly-extracted uuid dir and leave the
+    /// user's go.mod byte-identical.
+    #[tokio::test]
+    async fn service_wire_conflict_with_user_replace_hard_fails_without_litter() {
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        tokio::fs::write(
+            root.join("go.mod"),
+            "module example.com/app\n\ngo 1.21\n\nrequire github.com/foo/bar v1.4.2\n\nreplace github.com/foo/bar v1.4.2 => ../fork\n",
+        )
+        .await
+        .unwrap();
+        let gomod_before = tokio::fs::read(root.join("go.mod")).await.unwrap();
+        let zip = make_module_zip(&[
+            ("go.mod", b"module github.com/foo/bar\n\ngo 1.21\n"),
+            ("bar.go", PATCHED),
+        ]);
+        let sri = sri_sha512(&zip);
+        let server = wiremock::MockServer::start().await;
+        mount_go_granted(&server, &sri, None, &zip).await;
+        let sources = PatchSources::blobs_only(&blobs);
+
+        let outcome = vendor_go_module(
+            PURL,
+            &pristine,
+            root,
+            &record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            Some(&go_service_cfg(&server.uri(), VendorSource::Service, false)),
+        )
+        .await;
+        let detail = expect_refused(outcome, "vendor_prebuilt_wire_failed");
+        assert!(detail.contains("refusing to overwrite"), "{detail}");
+        assert!(
+            !root.join(format!(".socket/vendor/golang/{UUID}")).exists(),
+            "the extracted uuid dir was torn down"
+        );
+        assert_eq!(
+            tokio::fs::read(root.join("go.mod")).await.unwrap(),
+            gomod_before,
+            "the user's replace survives byte-identical"
+        );
+    }
+
+    /// A FIRST-run service failure (corrupt zip, never previously wired)
+    /// must remove the uuid dir but leave go.mod completely untouched — the
+    /// teardown has no directive to drop (`wired=false`), unlike the stale-
+    /// copy rebuild covered by
+    /// `failed_service_rebuild_of_stale_copy_drops_dangling_directive`.
+    #[tokio::test]
+    async fn first_run_service_extract_failure_leaves_gomod_untouched() {
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        let gomod_before = tokio::fs::read(root.join("go.mod")).await.unwrap();
+        let junk: &[u8] = b"not a zip at all";
+        let server = wiremock::MockServer::start().await;
+        mount_go_granted(&server, &sri_sha512(junk), None, junk).await;
+        let sources = PatchSources::blobs_only(&blobs);
+
+        let outcome = vendor_go_module(
+            PURL,
+            &pristine,
+            root,
+            &record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            Some(&go_service_cfg(&server.uri(), VendorSource::Service, false)),
+        )
+        .await;
+        expect_refused(outcome, "vendor_prebuilt_extract_failed");
+        assert!(
+            !root.join(format!(".socket/vendor/golang/{UUID}")).exists(),
+            "uuid dir cleared"
+        );
+        assert_eq!(
+            tokio::fs::read(root.join("go.mod")).await.unwrap(),
+            gomod_before,
+            "go.mod byte-identical: nothing to drop on a first run"
+        );
+        assert!(read_replace_entries(root).await.is_empty());
+    }
+
+    // ── revert guards: purl validation + missing go.mod ───────────────────
+
+    /// Revert re-validates the (tamper-able) ledger purl's ECOSYSTEM too: a
+    /// non-golang purl fails before any disk access, leaving the vendored
+    /// state fully intact.
+    #[tokio::test]
+    async fn test_revert_refuses_non_golang_purl() {
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        let (_result, entry, _warnings) =
+            expect_done(run_vendor(PURL, root, &blobs, &pristine, &record, false).await);
+        let good = entry.unwrap();
+
+        let mut bad_eco = good.clone();
+        bad_eco.base_purl = "pkg:npm/foo@1.0.0".to_string();
+        let out = revert_go_vendor(&bad_eco, root, false).await;
+        assert!(!out.success);
+        assert!(
+            out.error
+                .as_deref()
+                .is_some_and(|e| e.contains("not a golang purl")),
+            "{:?}",
+            out.error
+        );
+        // The refusal deleted nothing.
+        assert!(root.join(copy_rel()).exists());
+        assert!(read_replace_entries(root)
+            .await
+            .iter()
+            .any(|e| e.module == MODULE && e.owner == Some(ReplaceOwner::Vendor)));
+    }
+
+    /// A project whose go.mod was deleted fails the revert on the go.mod
+    /// edit (a missing go.mod is a read error, never an empty start) — and
+    /// the failure aborts BEFORE the artifact dir is deleted, so the revert
+    /// stays retryable once go.mod is restored.
+    #[tokio::test]
+    async fn test_revert_missing_gomod_fails_before_artifact_delete() {
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        let (_result, entry, _warnings) =
+            expect_done(run_vendor(PURL, root, &blobs, &pristine, &record, false).await);
+        let entry = entry.unwrap();
+
+        tokio::fs::remove_file(root.join("go.mod")).await.unwrap();
+
+        let out = revert_go_vendor(&entry, root, false).await;
+        assert!(!out.success);
+        assert!(
+            out.error
+                .as_deref()
+                .is_some_and(|e| e.starts_with("failed to update go.mod:")),
+            "{:?}",
+            out.error
+        );
+        assert!(
+            root.join(copy_rel()).exists(),
+            "the artifact dir survives a failed wiring restore (retryable)"
+        );
     }
 }

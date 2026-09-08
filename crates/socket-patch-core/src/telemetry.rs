@@ -718,8 +718,10 @@ mod tests {
     /// Combined into a single test to avoid env-var races across parallel tests.
     /// Exercises the `SOCKET_TELEMETRY_DISABLED` name, the legacy
     /// `SOCKET_PATCH_TELEMETRY_DISABLED` shim, and the airgap gate via
-    /// `SOCKET_OFFLINE`.
+    /// `SOCKET_OFFLINE`. Serialized: SOCKET_* env is process-global and the
+    /// api/client.rs suite reads `SOCKET_OFFLINE` mid-test.
     #[test]
+    #[serial_test::serial]
     fn test_is_telemetry_disabled() {
         // Save originals
         let orig_new = std::env::var("SOCKET_TELEMETRY_DISABLED").ok();
@@ -1025,7 +1027,10 @@ mod tests {
     /// config works for every API call — telemetry must match, or the
     /// fire-and-forget POST silently lands on a malformed `//v0/...` /
     /// `//patch/...` path (same malformed-URL class as `/v0/orgs//telemetry`).
+    /// Serialized: SOCKET_* env is process-global and the api/client.rs suite
+    /// mutates `SOCKET_PROXY_URL` mid-test.
     #[test]
+    #[serial_test::serial]
     fn test_resolve_telemetry_endpoint_trims_trailing_slash() {
         let orig_api = std::env::var("SOCKET_API_URL").ok();
         let orig_proxy = std::env::var("SOCKET_PROXY_URL").ok();

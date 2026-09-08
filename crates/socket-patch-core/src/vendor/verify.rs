@@ -1070,4 +1070,194 @@ mod tests {
             }
         );
     }
+
+    /// SECURITY: the zip entry-count cap fails a tampered wheel closed —
+    /// one entry past the cap (even zero-byte entries) is rejected up
+    /// front, while a wheel at exactly the cap still reads (no off-by-one
+    /// shrink of the legitimate budget).
+    #[test]
+    fn wheel_entry_count_cap_rejects_over_ten_thousand_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let write_n_entry_whl = |n: usize| -> PathBuf {
+            let whl = tmp.path().join(format!("entries-{n}.whl"));
+            let file = std::fs::File::create(&whl).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            for i in 0..n {
+                zip.start_file::<_, ()>(format!("e{i}"), Default::default())
+                    .unwrap();
+            }
+            zip.finish().unwrap();
+            whl
+        };
+
+        let at_cap = write_n_entry_whl(MAX_WHEEL_ENTRIES);
+        assert_eq!(
+            read_wheel_to_map(&at_cap).unwrap().len(),
+            MAX_WHEEL_ENTRIES,
+            "a wheel at exactly the entry cap still reads"
+        );
+
+        let over_cap = write_n_entry_whl(MAX_WHEEL_ENTRIES + 1);
+        assert_eq!(
+            read_wheel_to_map(&over_cap).unwrap_err(),
+            "vendor_artifact_unreadable",
+            "one entry past the cap fails closed"
+        );
+    }
+
+    /// SECURITY: an honest wheel DECLARING more than the 64 MiB budget is
+    /// rejected by the declared-size fast-fail before its data is
+    /// decompressed — the other half of the accounting pinned by the
+    /// lying-header bomb test above.
+    #[test]
+    fn honest_oversized_wheel_rejected_by_declared_size_fast_fail() {
+        let tmp = tempfile::tempdir().unwrap();
+        let whl = tmp.path().join("big-1.0.0-py3-none-any.whl");
+        let file = std::fs::File::create(&whl).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        // One byte past the cap, headers recording the TRUE size (zeros
+        // deflate to a few KiB, so the fixture itself stays tiny).
+        zip.start_file::<_, ()>("pad.bin", Default::default())
+            .unwrap();
+        zip.write_all(&vec![0u8; (MAX_WHEEL_DECOMPRESSED_BYTES + 1) as usize])
+            .unwrap();
+        zip.finish().unwrap();
+
+        assert_eq!(
+            read_wheel_to_map(&whl).unwrap_err(),
+            "vendor_artifact_unreadable"
+        );
+    }
+
+    /// Real wheels carry explicit directory entries; the zip reader must
+    /// skip them (they are not hashable members) while still verifying the
+    /// file members around them.
+    #[tokio::test]
+    async fn wheel_with_directory_entries_still_verifies() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let rel = format!(".socket/vendor/pypi/{UUID}/six-1.16.0-py2.py3-none-any.whl");
+        tokio::fs::create_dir_all(root.join(format!(".socket/vendor/pypi/{UUID}")))
+            .await
+            .unwrap();
+        let abs = root.join(&rel);
+        let file = std::fs::File::create(&abs).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        zip.add_directory::<_, ()>("six/", Default::default())
+            .unwrap();
+        zip.start_file::<_, ()>("six.py", Default::default())
+            .unwrap();
+        zip.write_all(PATCHED).unwrap();
+        zip.finish().unwrap();
+
+        // The dir entry is excluded from the member map entirely…
+        let map = read_wheel_to_map(&abs).unwrap();
+        assert_eq!(map.keys().collect::<Vec<_>>(), ["six.py"]);
+
+        // …and end-to-end verification of the file member still passes.
+        let rec = record(UUID, "six.py");
+        let ent = entry("pypi", UUID, &rel);
+        assert!(verify_vendored_patch_record(root, &ent, &rec).await.is_ok());
+    }
+
+    /// SECURITY: the inventory per-file size cap fails closed on a single
+    /// over-cap file (sparse, so the fixture is free — the cap trips on
+    /// `len()` before any bytes are read), and the whole-file hasher
+    /// refuses the same over-cap file and non-regular paths with `None`.
+    #[tokio::test]
+    async fn dir_inventory_size_cap_and_file_hasher_fail_closed() {
+        use sha2::{Digest, Sha256};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("artifact");
+        std::fs::create_dir_all(&dir).unwrap();
+        let huge = dir.join("huge.bin");
+        std::fs::File::create(&huge)
+            .unwrap()
+            .set_len(MAX_HEALTH_HASH_BYTES + 1)
+            .unwrap();
+
+        let err = compute_dir_inventory(&dir).await.unwrap_err();
+        assert!(err.contains("exceeds the inventory size cap"), "got: {err}");
+
+        assert_eq!(file_sha256_hex(&huge).await, None, "over-cap file");
+        assert_eq!(file_sha256_hex(&dir).await, None, "non-regular path");
+        // Positive control: the Nones above are the cap/non-file arms, not
+        // general hasher breakage.
+        let small = tmp.path().join("small.txt");
+        std::fs::write(&small, b"abc").unwrap();
+        assert_eq!(
+            file_sha256_hex(&small).await.unwrap(),
+            hex::encode(Sha256::digest(b"abc"))
+        );
+    }
+
+    /// SECURITY: the inventory entry cap refuses a tampered artifact dir
+    /// with a planted file flood — exactly at the cap still inventories
+    /// (no off-by-one shrink), one more file fails closed.
+    #[tokio::test]
+    async fn dir_inventory_entry_cap_fails_closed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("artifact");
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 0..MAX_INVENTORY_ENTRIES {
+            std::fs::File::create(dir.join(format!("f{i}"))).unwrap();
+        }
+        assert_eq!(
+            compute_dir_inventory(&dir).await.unwrap().len(),
+            MAX_INVENTORY_ENTRIES,
+            "a dir at exactly the entry cap still inventories"
+        );
+
+        std::fs::File::create(dir.join("one-more")).unwrap();
+        let err = compute_dir_inventory(&dir).await.unwrap_err();
+        assert!(err.contains("exceeds 10000 files"), "got: {err}");
+    }
+
+    /// A committed artifact grown past the 512 MiB health-hash cap whose
+    /// TAIL is still a valid wheel (zip readers resolve the archive offset
+    /// past leading garbage) verifies member-wise but must classify
+    /// Corrupt/unreadable: the ledger-sha cross-check cannot vouch for
+    /// bytes it refuses to hash.
+    #[tokio::test]
+    async fn oversize_artifact_with_valid_zip_tail_is_corrupt_unreadable() {
+        use std::io::{Seek, SeekFrom};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let rel = format!(".socket/vendor/pypi/{UUID}/six-1.16.0-py2.py3-none-any.whl");
+        tokio::fs::create_dir_all(root.join(format!(".socket/vendor/pypi/{UUID}")))
+            .await
+            .unwrap();
+
+        // A valid wheel appended after a 512 MiB sparse zero prefix.
+        let scratch = root.join("scratch.whl");
+        write_whl(&scratch, "six.py", PATCHED);
+        let wheel_bytes = std::fs::read(&scratch).unwrap();
+        let abs = root.join(&rel);
+        let mut file = std::fs::File::create(&abs).unwrap();
+        file.set_len(MAX_HEALTH_HASH_BYTES).unwrap();
+        file.seek(SeekFrom::End(0)).unwrap();
+        file.write_all(&wheel_bytes).unwrap();
+        drop(file);
+
+        let rec = record(UUID, "six.py");
+        let mut ent = entry("pypi", UUID, &rel);
+        ent.artifact.sha256 = "0".repeat(64);
+
+        // Precondition: the zip reader tolerates the prefix, so member
+        // verification alone would bless the artifact…
+        assert!(
+            verify_vendored_patch_record(root, &ent, &rec).await.is_ok(),
+            "zip reader must resolve the archive offset past the sparse prefix"
+        );
+        // …and only the whole-file arm catches it: file_sha256_hex bails
+        // on the size cap, so the recorded sha is unverifiable.
+        assert_eq!(
+            check_vendored_artifact(root, &ent, &rec).await,
+            ArtifactHealth::Corrupt {
+                reason: "vendor_artifact_unreadable".to_string()
+            }
+        );
+    }
 }

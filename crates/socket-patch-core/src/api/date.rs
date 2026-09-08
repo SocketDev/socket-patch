@@ -310,6 +310,72 @@ mod tests {
         assert_eq!(unix_to_ymdhms(secs), (2026, 3, 27, 19, 12, 0));
     }
 
+    /// A bare `27 Mar 2026` (no time token) is legal enough and reads as
+    /// midnight UTC, matching the bare-civil-date arm of the RFC 3339 path.
+    #[test]
+    fn bare_rfc2822_date_parses_as_midnight_utc() {
+        let secs = parse_timestamp_secs("27 Mar 2026").unwrap();
+        assert_eq!(unix_to_ymdhms(secs), (2026, 3, 27, 0, 0, 0));
+        // Same instant as the ISO spelling of the same day...
+        assert_eq!(parse_timestamp_secs("2026-03-27"), Some(secs));
+        // ...and the day-of-week prefix stays optional without a time.
+        assert_eq!(parse_timestamp_secs("Fri, 27 Mar 2026"), Some(secs));
+        // Asymmetry pin: a zone without a time is rejected — the fourth
+        // token is always read as a clock time, so `GMT` fails parse_hms.
+        assert_eq!(parse_timestamp_secs("27 Mar 2026 GMT"), None);
+    }
+
+    /// A missing zone token means UTC (HTTP-date practice for the
+    /// malformed-but-common no-zone spelling) — the RFC 2822 twin of the
+    /// zoneless `2024-05-24T12:14:56` variant tested below.
+    #[test]
+    fn rfc2822_missing_zone_is_utc() {
+        let with_zone = parse_timestamp_secs("Fri, 27 Mar 2026 19:12:42 GMT").unwrap();
+        assert_eq!(
+            parse_timestamp_secs("Fri, 27 Mar 2026 19:12:42"),
+            Some(with_zone)
+        );
+        assert_eq!(
+            parse_timestamp_secs("27 Mar 2026 19:12:42"),
+            Some(with_zone)
+        );
+    }
+
+    /// Named zones other than the UTC aliases are the obsolete RFC 822
+    /// forms; per RFC 2822 §4.3 they read as `-0000`, i.e. no shift. An
+    /// unrecognized token (even a non-zone like `XYZZY`) never rejects the
+    /// record — a wrong-but-rankable date beats sorting last.
+    #[test]
+    fn named_obsolete_zones_are_read_as_utc() {
+        let base = parse_timestamp_secs("Fri, 27 Mar 2026 19:12:42 GMT").unwrap();
+        for zone in ["EST", "PDT", "JST", "XYZZY"] {
+            assert_eq!(
+                parse_timestamp_secs(&format!("Fri, 27 Mar 2026 19:12:42 {zone}")),
+                Some(base),
+                "zone={zone}"
+            );
+        }
+    }
+
+    /// In the RFC 2822 path a sign-prefixed zone that fails to parse as
+    /// `±HHMM`/`±HH:MM` degrades to UTC instead of rejecting: the
+    /// `unwrap_or_default` fallback in `apply_zone` treats it like an
+    /// unknown named zone. Pins current (lenient) behavior — production
+    /// only ever emits `GMT`, and keeping the record rankable beats
+    /// dropping it. Contrast `rejects_malformed_rfc3339_offsets`, where
+    /// the same offsets reject the whole string.
+    #[test]
+    fn rfc2822_malformed_numeric_offsets_degrade_to_utc() {
+        let base = parse_timestamp_secs("Fri, 27 Mar 2026 19:12:42 GMT").unwrap();
+        for zone in ["+530", "+02:0"] {
+            assert_eq!(
+                parse_timestamp_secs(&format!("Fri, 27 Mar 2026 19:12:42 {zone}")),
+                Some(base),
+                "zone={zone}"
+            );
+        }
+    }
+
     // ── RFC 3339 / ISO 8601: the format every in-repo fixture uses ──
 
     #[test]
@@ -371,6 +437,21 @@ mod tests {
             "1969-12-31T23:59:59Z",          // pre-epoch
             "2024-01-01T00:00:00:00Z",       // too many clock fields
             "2024-01-01-01",                 // too many date fields
+        ] {
+            assert_eq!(parse_timestamp_secs(s), None, "should reject: {s:?}");
+        }
+    }
+
+    /// RFC 3339 zone suffixes must be exactly `Z` or `±HHMM`/`±HH:MM`: a
+    /// short, digitless, or trailing-junk suffix rejects the whole string
+    /// rather than silently mis-shifting the instant.
+    #[test]
+    fn rejects_malformed_rfc3339_offsets() {
+        for s in [
+            "2026-03-27T19:12:42+2:00",  // one-digit hour
+            "2026-03-27T19:12:42+02",    // missing minutes
+            "2026-03-27T19:12:42+ab:cd", // non-digits after sign
+            "2026-03-27T19:12:42Zjunk",  // trailing junk after Z
         ] {
             assert_eq!(parse_timestamp_secs(s), None, "should reject: {s:?}");
         }

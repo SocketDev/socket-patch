@@ -1588,6 +1588,12 @@ pub(crate) struct VendorGcSummary {
     /// (b) entries whose package left the lockfile dependency graph —
     /// reverted, and their manifest entries dropped.
     pub unused_reverted: Vec<String>,
+    /// Entries a wet revert drift-kept ([`RevertOutcome::kept_artifact`]):
+    /// the backend left the drifted lock alone, so artifacts, ledger entry
+    /// and (in (b)) manifest records were all retained — nothing reclaimed.
+    /// Always empty on dry runs: backends detect drift only during a wet
+    /// wiring replay, so the preview still lists such entries as revertable.
+    pub kept: Vec<String>,
     /// (c) orphan uuid dirs (no owning ledger entry) swept.
     pub orphan_dirs: usize,
     /// Entries that could not be reverted (kept in the ledger), plus any
@@ -1604,6 +1610,15 @@ pub(crate) struct VendorGcSummary {
 ///     and drop their manifest entries so the caller's manifest prune +
 ///     blob sweep reclaims the rest in the same pass;
 /// (c) sweep orphan uuid dirs.
+///
+/// A drift-skipped revert ([`RevertOutcome::kept_artifact`]) keeps the
+/// ledger entry — and, in (b), the purl's manifest records — exactly like
+/// every other `dispatch_revert_one` caller; the kept purl is reported in
+/// [`VendorGcSummary::kept`] so `scan --prune` can explain the entry it
+/// did not reclaim instead of silently no-oping on what its own preview
+/// listed as revertable. Wet-only: a dry [`dispatch_revert_one`] returns
+/// before the wiring replay that detects drift, so the dry lists still
+/// carry such an entry as revertable.
 ///
 /// Detached entries are exempt from BOTH (a) (never manifest-tracked) and
 /// (b) (lockfile-invisible by design — the probe would always call them
@@ -1660,14 +1675,20 @@ pub(crate) async fn run_vendor_gc(
                 continue;
             }
             let entry = state.entries.get(&purl).cloned().expect("listed above");
-            if dispatch_revert_one(&entry, &common.cwd, false)
-                .await
-                .success
-            {
+            let outcome = dispatch_revert_one(&entry, &common.cwd, false).await;
+            if !outcome.success {
+                out.failed.push(purl);
+            } else if outcome.kept_artifact {
+                // Drift-skip keep (residual #131): the backend left the
+                // drifted lock alone and kept the artifacts, so the ledger
+                // entry must survive too (the RevertOutcome contract every
+                // other caller honors) — which also shields the uuid dir
+                // from the (c) orphan sweep. Nothing was reclaimed, so the
+                // purl is reported as kept, never as reverted.
+                out.kept.push(purl);
+            } else {
                 state.entries.remove(&purl);
                 out.dropped_reverted.push(purl);
-            } else {
-                out.failed.push(purl);
             }
         }
     }
@@ -1693,11 +1714,17 @@ pub(crate) async fn run_vendor_gc(
             out.unused_reverted.push(purl);
             continue;
         }
-        if !dispatch_revert_one(&entry, &common.cwd, false)
-            .await
-            .success
-        {
+        let outcome = dispatch_revert_one(&entry, &common.cwd, false).await;
+        if !outcome.success {
             out.failed.push(purl);
+            continue;
+        }
+        if outcome.kept_artifact {
+            // Drift-skip keep (residual #131), same gate as (a) — and the
+            // purl's manifest records must survive too: pruning them would
+            // make the next `vendor` reconcile re-revert an entry whose
+            // backing record is gone (the `remove` caller's rationale).
+            out.kept.push(purl);
             continue;
         }
         state.entries.remove(&purl);
@@ -2019,6 +2046,71 @@ mod variant_probe_tests {
             );
         }
     }
+
+    /// A variant record consisting ONLY of new files (every `beforeHash`
+    /// empty) has no representative to probe: `representative_file` returns
+    /// `None`, and `variant_matches_installed(None)` must ADMIT the variant
+    /// (the same pinned contract as apply's variant loop) — a new file can
+    /// neither identify nor disqualify a variant, so the record proceeds to
+    /// the backend instead of being silently dropped as not-installed.
+    #[tokio::test]
+    async fn all_new_file_variant_record_is_admitted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let site = tmp.path().join("site-packages");
+        tokio::fs::create_dir_all(site.join("foo-1.0.0.dist-info"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            site.join("foo-1.0.0.dist-info").join("METADATA"),
+            "Name: foo\nVersion: 1.0.0\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::create_dir_all(site.join("foo")).await.unwrap();
+        tokio::fs::write(site.join("foo").join("__init__.py"), b"print('hi')\n")
+            .await
+            .unwrap();
+        let after = compute_git_sha256_from_bytes(b"patched\n");
+
+        let common = GlobalArgs {
+            cwd: tmp.path().to_path_buf(),
+            global_prefix: Some(site.clone()),
+            ecosystems: Some(vec!["pypi".to_string()]),
+            dry_run: true,
+            offline: true,
+            json: true,
+            silent: true,
+            ..GlobalArgs::default()
+        };
+        let sources = PatchSources {
+            blobs_path: tmp.path(),
+            packages_path: None,
+            diffs_path: None,
+            mem_blobs: None,
+        };
+
+        let mut records: HashMap<String, PatchRecord> = HashMap::new();
+        records.insert(
+            WHEEL.to_string(),
+            record(&[("brand_new_file.py", "", &after)]),
+        );
+        let mut env = Envelope::new(Command::Vendor);
+        vendor_records(&common, &records, &sources, false, false, &mut env, None).await;
+
+        assert!(
+            env.events.iter().any(|e| e.purl.as_deref() == Some(WHEEL)),
+            "an all-new-files variant must pass the probe (representative None \
+             admits) and reach the backend; events: {:?}",
+            env.events
+        );
+        assert!(
+            !env.events
+                .iter()
+                .any(|e| e.error_code.as_deref() == Some("package_not_installed")),
+            "the admitted variant must not be misclassified as not installed: {:?}",
+            env.events
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2177,6 +2269,57 @@ mod gc_tests {
         assert!(
             !manifest.patches.contains_key(PURL),
             "the unused entry's manifest record is dropped too"
+        );
+    }
+
+    /// A MISSING manifest skips pass (a) entirely — a prune must not
+    /// mass-revert every ledger entry as "dropped" just because the
+    /// manifest file is gone (that is `vendor --revert`'s explicit
+    /// contract) — while pass (b) still runs: a lockfile-unused entry is
+    /// reclaimed, its manifest half is skipped (nothing to edit), and no
+    /// manifest file is invented; a still-wired entry is kept untouched.
+    #[tokio::test]
+    async fn vendor_gc_missing_manifest_skips_pass_a_but_b_still_runs() {
+        // Still wired: with no manifest, NOTHING may be reclaimed — a
+        // regression that treats a missing manifest as an empty one would
+        // land the entry in dropped_reverted.
+        let (tmp, common, manifest_path) = gc_fixture(false).await;
+        tokio::fs::remove_file(&manifest_path).await.unwrap();
+        let out = run_vendor_gc(&common, &manifest_path, false).await;
+        assert!(
+            out.dropped_reverted.is_empty(),
+            "no manifest must not read as every-patch-dropped: {out:?}"
+        );
+        assert!(out.unused_reverted.is_empty(), "{out:?}");
+        assert!(out.failed.is_empty(), "{out:?}");
+        assert!(load_state(tmp.path())
+            .await
+            .unwrap()
+            .entries
+            .contains_key(PURL));
+
+        // Dependency gone from the lock graph: (b) reclaims the entry even
+        // with no manifest, and invents no manifest file for its manifest
+        // half.
+        let (tmp, common, manifest_path) = gc_fixture(false).await;
+        tokio::fs::remove_file(&manifest_path).await.unwrap();
+        tokio::fs::write(tmp.path().join("package-lock.json"), "{\"packages\":{}}")
+            .await
+            .unwrap();
+        let out = run_vendor_gc(&common, &manifest_path, false).await;
+        assert!(out.dropped_reverted.is_empty(), "{out:?}");
+        assert_eq!(out.unused_reverted, vec![PURL.to_string()], "{out:?}");
+        assert!(out.failed.is_empty(), "{out:?}");
+        assert!(load_state(tmp.path()).await.unwrap().entries.is_empty());
+        assert!(
+            !tmp.path()
+                .join(format!(".socket/vendor/npm/{UUID}"))
+                .exists(),
+            "the unused entry's artifacts are reclaimed"
+        );
+        assert!(
+            !manifest_path.exists(),
+            "the GC must not invent a manifest file"
         );
     }
 
@@ -2379,6 +2522,215 @@ mod gc_tests {
         );
     }
 
+    /// The registry fragment recorded as the wiring `original` (pre-vendor).
+    fn registry_fragment() -> serde_json::Value {
+        serde_json::json!({
+            "version": "1.3.0",
+            "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+            "integrity": "sha512-orig==",
+            "license": "WTFPL"
+        })
+    }
+
+    /// `entry(false)` plus the wiring record a real vendor run records for
+    /// the package-lock entry — what lets the revert classify third-party
+    /// drift (live fragment neither ours nor the recorded original).
+    fn wired_entry() -> VendorEntry {
+        use socket_patch_core::vendor::state::{WiringAction, WiringRecord};
+        let mut e = entry(false);
+        e.wiring.push(WiringRecord {
+            file: "package-lock.json".into(),
+            kind: "npm_lock_entry".into(),
+            action: WiringAction::Rewritten,
+            key: Some("node_modules/left-pad".into()),
+            original: Some(registry_fragment()),
+            new: Some(serde_json::json!({
+                "version": "1.3.0",
+                "resolved": format!("file:.socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz"),
+            })),
+        });
+        e
+    }
+
+    /// [`gc_fixture`] with the ledger entry re-written as [`wired_entry`]
+    /// and the package-lock's `node_modules/left-pad` set to
+    /// `lock_fragment`.
+    async fn wired_gc_fixture(
+        lock_fragment: serde_json::Value,
+    ) -> (tempfile::TempDir, GlobalArgs, PathBuf) {
+        let (tmp, common, manifest_path) = gc_fixture(false).await;
+        let mut state = VendorState::default();
+        state.entries.insert(PURL.to_string(), wired_entry());
+        save_state(tmp.path(), &state).await.unwrap();
+        tokio::fs::write(
+            tmp.path().join("package-lock.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "packages": { "node_modules/left-pad": lock_fragment }
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        (tmp, common, manifest_path)
+    }
+
+    /// The drifted lock fragment: a third party re-resolved the entry since
+    /// vendoring — neither ours nor the recorded pre-vendor original.
+    fn fork_fragment() -> serde_json::Value {
+        serde_json::json!({
+            "version": "1.3.0",
+            "resolved": "https://example.com/their-fork.tgz"
+        })
+    }
+
+    /// (a) + drift-keep (residual #131): the patch left the manifest, but
+    /// the lock entry drifted since vendoring, so the revert leaves the
+    /// lock alone and returns success with `kept_artifact`. Per the
+    /// [`RevertOutcome::kept_artifact`] contract the GC must keep the
+    /// ledger entry — which also shields the uuid dir from the (c) orphan
+    /// sweep — and must NOT report the purl as cleanly reverted. Pre-fix
+    /// it pruned the entry, counted it `dropped_reverted`, and the sweep
+    /// then destroyed the kept artifacts.
+    #[tokio::test]
+    async fn vendor_gc_keeps_drift_skipped_manifest_dropped_entry() {
+        let (tmp, common, manifest_path) = wired_gc_fixture(fork_fragment()).await;
+        write_manifest(&manifest_path, &PatchManifest::new())
+            .await
+            .unwrap();
+        let lock_before = tokio::fs::read(tmp.path().join("package-lock.json"))
+            .await
+            .unwrap();
+
+        let out = run_vendor_gc(&common, &manifest_path, false).await;
+        assert!(
+            out.dropped_reverted.is_empty(),
+            "a drift-kept entry must not be reported reverted: {out:?}"
+        );
+        assert!(out.failed.is_empty(), "a keep is not a failure: {out:?}");
+        assert_eq!(
+            out.kept,
+            vec![PURL.to_string()],
+            "the drift-keep must be COUNTED — scan --prune's only signal \
+             that the entry its preview listed was deliberately not \
+             reclaimed: {out:?}"
+        );
+        assert!(
+            load_state(tmp.path())
+                .await
+                .unwrap()
+                .entries
+                .contains_key(PURL),
+            "ledger entry must be kept"
+        );
+        assert!(
+            tmp.path()
+                .join(format!(".socket/vendor/npm/{UUID}"))
+                .exists(),
+            "kept artifacts must survive the orphan sweep"
+        );
+        assert_eq!(
+            tokio::fs::read(tmp.path().join("package-lock.json"))
+                .await
+                .unwrap(),
+            lock_before,
+            "drifted lock left alone"
+        );
+    }
+
+    /// (b) + drift-keep: the patch is still in the manifest, and the
+    /// in-use probe says the dependency no longer resolves through the
+    /// artifact — because the lock entry drifted to a third-party fork.
+    /// Same keep contract as (a), plus the purl's manifest records must
+    /// survive (pruning them would make the next `vendor` reconcile
+    /// re-revert an entry whose backing record is gone — the `remove`
+    /// caller's rationale).
+    #[tokio::test]
+    async fn vendor_gc_keeps_drift_skipped_unused_entry_and_manifest_record() {
+        let (tmp, common, manifest_path) = wired_gc_fixture(fork_fragment()).await;
+
+        let out = run_vendor_gc(&common, &manifest_path, false).await;
+        assert!(
+            out.unused_reverted.is_empty(),
+            "a drift-kept entry must not be reported reverted: {out:?}"
+        );
+        assert!(out.failed.is_empty(), "a keep is not a failure: {out:?}");
+        assert_eq!(
+            out.kept,
+            vec![PURL.to_string()],
+            "the drift-keep must be COUNTED — scan --prune's only signal \
+             that the entry its preview listed was deliberately not \
+             reclaimed: {out:?}"
+        );
+        assert!(
+            load_state(tmp.path())
+                .await
+                .unwrap()
+                .entries
+                .contains_key(PURL),
+            "ledger entry must be kept"
+        );
+        assert!(
+            tmp.path()
+                .join(format!(".socket/vendor/npm/{UUID}"))
+                .exists(),
+            "kept artifacts must survive the orphan sweep"
+        );
+        let manifest = read_manifest(&manifest_path).await.unwrap().unwrap();
+        assert!(
+            manifest.patches.contains_key(PURL),
+            "the kept entry's manifest record must survive"
+        );
+    }
+
+    /// The preview half of the drift-keep contract: backends detect drift
+    /// only during a wet wiring replay (a dry [`dispatch_revert_one`]
+    /// returns before it), so the read-only preview still lists a drifted
+    /// entry as revertable and `kept` stays empty. The wet run's `kept`
+    /// report — and the `keptVendoredEntries` / hint `scan --prune` builds
+    /// on it — is what explains the difference when the wet run then
+    /// reclaims nothing.
+    #[tokio::test]
+    async fn vendor_gc_dry_run_cannot_see_drift_and_reports_nothing_kept() {
+        let (tmp, common, manifest_path) = wired_gc_fixture(fork_fragment()).await;
+        let dry = run_vendor_gc(&common, &manifest_path, true).await;
+        assert_eq!(dry.unused_reverted, vec![PURL.to_string()], "{dry:?}");
+        assert!(dry.kept.is_empty(), "{dry:?}");
+        // Read-only: the ledger entry is untouched.
+        assert!(load_state(tmp.path())
+            .await
+            .unwrap()
+            .entries
+            .contains_key(PURL));
+    }
+
+    /// KEEP-GATE LIVENESS (mirrors in_process_vendor.rs's
+    /// `revert_completes_when_lock_already_matches_the_original`): a wired
+    /// entry whose lock fragment already equals the recorded pre-vendor
+    /// original is CONVERGED, not drifted — the keep gate must not block
+    /// the full reclaim.
+    #[tokio::test]
+    async fn vendor_gc_reclaims_converged_wired_unused_entry() {
+        let (tmp, common, manifest_path) = wired_gc_fixture(registry_fragment()).await;
+
+        let out = run_vendor_gc(&common, &manifest_path, false).await;
+        assert_eq!(out.unused_reverted, vec![PURL.to_string()], "{out:?}");
+        assert!(out.failed.is_empty(), "{out:?}");
+        assert!(
+            out.kept.is_empty(),
+            "a converged entry reverts cleanly — it must not be reported \
+             as a drift-keep: {out:?}"
+        );
+        assert!(load_state(tmp.path()).await.unwrap().entries.is_empty());
+        assert!(
+            !tmp.path()
+                .join(format!(".socket/vendor/npm/{UUID}"))
+                .exists(),
+            "converged revert completes: artifacts reclaimed"
+        );
+        let manifest = read_manifest(&manifest_path).await.unwrap().unwrap();
+        assert!(!manifest.patches.contains_key(PURL), "{manifest:?}");
+    }
+
     /// (c) uuid dirs with no owning ledger entry are swept (wet) / counted
     /// (dry).
     #[tokio::test]
@@ -2403,5 +2755,535 @@ mod gc_tests {
             .path()
             .join(format!(".socket/vendor/npm/{UUID}"))
             .exists());
+    }
+
+    /// Wet GC under apply-lock contention: the run records the single skip
+    /// marker and reclaims NOTHING (the scan-must-not-fail contract), while
+    /// a dry-run preview with the same lock held still lists (dry runs are
+    /// read-only and lock-free).
+    #[tokio::test]
+    async fn vendor_gc_lock_contention_skips_without_reverting() {
+        let (tmp, common, manifest_path) = gc_fixture(false).await;
+        // Both passes WOULD reclaim: patch dropped + dependency gone.
+        write_manifest(&manifest_path, &PatchManifest::new())
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.path().join("package-lock.json"), "{\"packages\":{}}")
+            .await
+            .unwrap();
+
+        let _held = socket_patch_core::patch::apply_lock::acquire(
+            &tmp.path().join(".socket"),
+            Duration::ZERO,
+        )
+        .expect("test holds the apply lock first");
+
+        let out = run_vendor_gc(&common, &manifest_path, false).await;
+        assert_eq!(
+            out.failed,
+            vec!["vendor GC skipped: another socket-patch run holds the apply lock".to_string()],
+            "{out:?}"
+        );
+        assert!(out.dropped_reverted.is_empty(), "{out:?}");
+        assert!(out.unused_reverted.is_empty(), "{out:?}");
+        assert_eq!(out.orphan_dirs, 0, "{out:?}");
+        assert!(
+            load_state(tmp.path())
+                .await
+                .unwrap()
+                .entries
+                .contains_key(PURL),
+            "a contended GC must not touch the ledger"
+        );
+        assert!(
+            tmp.path()
+                .join(format!(".socket/vendor/npm/{UUID}"))
+                .exists(),
+            "a contended GC must not touch artifacts"
+        );
+
+        let dry = run_vendor_gc(&common, &manifest_path, true).await;
+        assert_eq!(
+            dry.dropped_reverted,
+            vec![PURL.to_string()],
+            "the lock-free dry preview still lists: {dry:?}"
+        );
+        assert!(dry.failed.is_empty(), "{dry:?}");
+    }
+
+    /// (a) revert FAILURE accounting: a ledger entry whose ecosystem has no
+    /// revert backend (a tampered/hand-edited state.json) lands in
+    /// `out.failed`, is KEPT in the ledger, and is excluded from pass (b)
+    /// (no double count).
+    #[tokio::test]
+    async fn vendor_gc_failed_dropped_revert_keeps_entry() {
+        let (tmp, common, manifest_path) = gc_fixture(false).await;
+        write_manifest(&manifest_path, &PatchManifest::new())
+            .await
+            .unwrap();
+        let mut state = load_state(tmp.path()).await.unwrap();
+        state.entries.get_mut(PURL).unwrap().ecosystem = "frobnicate".into();
+        save_state(tmp.path(), &state).await.unwrap();
+
+        let out = run_vendor_gc(&common, &manifest_path, false).await;
+        assert_eq!(out.failed, vec![PURL.to_string()], "{out:?}");
+        assert!(out.dropped_reverted.is_empty(), "{out:?}");
+        assert!(
+            out.unused_reverted.is_empty(),
+            "an (a)-handled purl must not also be tried by (b): {out:?}"
+        );
+        assert!(
+            load_state(tmp.path())
+                .await
+                .unwrap()
+                .entries
+                .contains_key(PURL),
+            "a failed revert must keep the ledger entry"
+        );
+        assert!(
+            tmp.path()
+                .join(format!(".socket/vendor/npm/{UUID}"))
+                .exists(),
+            "the still-wired artifact dir survives the orphan sweep"
+        );
+    }
+
+    /// (b) revert FAILURE accounting: the in-use probe says the dependency
+    /// left the lock graph (the lock never mentions the tampered uuid's
+    /// dir), the revert refuses fail-closed on the non-canonical uuid, and
+    /// BOTH the ledger entry and the purl's manifest record are kept.
+    #[tokio::test]
+    async fn vendor_gc_failed_unused_revert_keeps_entry_and_manifest() {
+        let (tmp, common, manifest_path) = gc_fixture(false).await;
+        let mut state = load_state(tmp.path()).await.unwrap();
+        state.entries.get_mut(PURL).unwrap().uuid = "deadbeef".into();
+        save_state(tmp.path(), &state).await.unwrap();
+
+        let out = run_vendor_gc(&common, &manifest_path, false).await;
+        assert_eq!(out.failed, vec![PURL.to_string()], "{out:?}");
+        assert!(out.unused_reverted.is_empty(), "{out:?}");
+        assert!(out.dropped_reverted.is_empty(), "{out:?}");
+        assert!(
+            load_state(tmp.path())
+                .await
+                .unwrap()
+                .entries
+                .contains_key(PURL),
+            "a failed (b) revert must keep the ledger entry"
+        );
+        let manifest = read_manifest(&manifest_path).await.unwrap().unwrap();
+        assert!(
+            manifest.patches.contains_key(PURL),
+            "a failed (b) revert must not drop the manifest record"
+        );
+    }
+
+    /// `--ecosystems` scoping gates BOTH GC passes ([`ecosystem_in_scope`]'s
+    /// `Some(list)` branch): a cargo-scoped run must not revert an npm entry
+    /// as a cross-ecosystem side effect, while the matching scope reclaims
+    /// it normally.
+    #[tokio::test]
+    async fn vendor_gc_respects_ecosystems_scope() {
+        let (tmp, mut common, manifest_path) = gc_fixture(false).await;
+        // Both passes WOULD reclaim the npm entry were it in scope.
+        write_manifest(&manifest_path, &PatchManifest::new())
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.path().join("package-lock.json"), "{\"packages\":{}}")
+            .await
+            .unwrap();
+
+        common.ecosystems = Some(vec!["cargo".to_string()]);
+        let out = run_vendor_gc(&common, &manifest_path, false).await;
+        assert!(
+            out.dropped_reverted.is_empty()
+                && out.unused_reverted.is_empty()
+                && out.failed.is_empty(),
+            "an out-of-scope entry is untouchable: {out:?}"
+        );
+        assert!(
+            load_state(tmp.path())
+                .await
+                .unwrap()
+                .entries
+                .contains_key(PURL),
+            "cargo scope must keep the npm ledger entry"
+        );
+        assert!(
+            tmp.path()
+                .join(format!(".socket/vendor/npm/{UUID}"))
+                .exists(),
+            "cargo scope must keep the npm artifacts"
+        );
+
+        common.ecosystems = Some(vec!["npm".to_string()]);
+        let out = run_vendor_gc(&common, &manifest_path, false).await;
+        assert_eq!(
+            out.dropped_reverted,
+            vec![PURL.to_string()],
+            "the matching scope reclaims: {out:?}"
+        );
+        assert!(load_state(tmp.path()).await.unwrap().entries.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod scope_and_hint_tests {
+    use super::*;
+
+    /// [`flavor_install_command`] drives the human reinstall hints: every
+    /// npm-family flavor must name its own package manager's install, and
+    /// flavors with no consuming install step stay silent.
+    #[test]
+    fn flavor_install_command_maps_every_flavor() {
+        assert_eq!(flavor_install_command("package-lock"), Some("npm install"));
+        assert_eq!(flavor_install_command("yarn-classic"), Some("yarn install"));
+        assert_eq!(flavor_install_command("yarn-berry"), Some("yarn install"));
+        assert_eq!(flavor_install_command("pnpm"), Some("pnpm install"));
+        assert_eq!(flavor_install_command("pnpm-legacy"), Some("pnpm install"));
+        assert_eq!(flavor_install_command("bun"), Some("bun install"));
+        assert_eq!(flavor_install_command("cargo"), None);
+        assert_eq!(flavor_install_command(""), None);
+    }
+
+    fn with_scope(list: Option<&[&str]>) -> GlobalArgs {
+        GlobalArgs {
+            ecosystems: list.map(|l| l.iter().map(|s| s.to_string()).collect()),
+            ..GlobalArgs::default()
+        }
+    }
+
+    /// The `Some(list)` branch of [`ecosystem_in_scope`]: exact match,
+    /// case-insensitivity, and the `go` → `golang` alias; `None` means
+    /// everything is in scope.
+    #[test]
+    fn ecosystem_in_scope_honors_list_alias_and_case() {
+        let unscoped = with_scope(None);
+        assert!(ecosystem_in_scope(&unscoped, "npm"));
+        assert!(ecosystem_in_scope(&unscoped, "cargo"));
+
+        let npm_only = with_scope(Some(&["npm"]));
+        assert!(ecosystem_in_scope(&npm_only, "npm"));
+        assert!(!ecosystem_in_scope(&npm_only, "cargo"));
+        assert!(!ecosystem_in_scope(&npm_only, "golang"));
+
+        let upper = with_scope(Some(&["NPM"]));
+        assert!(
+            ecosystem_in_scope(&upper, "npm"),
+            "scope matching is case-insensitive"
+        );
+
+        let go_alias = with_scope(Some(&["go"]));
+        assert!(
+            ecosystem_in_scope(&go_alias, "golang"),
+            "`go` must alias the golang ecosystem"
+        );
+        assert!(!ecosystem_in_scope(&go_alias, "npm"));
+    }
+}
+
+#[cfg(test)]
+mod revert_dispatch_tests {
+    use super::*;
+    use socket_patch_core::vendor::state::VendorArtifact;
+
+    const UUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
+
+    fn entry_for(eco: &str, base_purl: &str) -> VendorEntry {
+        VendorEntry {
+            ecosystem: eco.into(),
+            base_purl: base_purl.into(),
+            uuid: UUID.into(),
+            artifact: VendorArtifact {
+                path: format!(".socket/vendor/{eco}/{UUID}/artifact"),
+                sha256: String::new(),
+                size: None,
+                platform_locked: None,
+                file_inventory: None,
+            },
+            wiring: Vec::new(),
+            lock: None,
+            took_over_go_patches: false,
+            detached: false,
+            record: None,
+            flavor: None,
+            uv: None,
+            pnpm: None,
+            poetry: None,
+            pdm: None,
+            pipenv: None,
+        }
+    }
+
+    /// The nuget and maven revert arms must route to their real backends —
+    /// whatever those backends decide about an empty project, the outcome
+    /// must never be the unknown-ecosystem fall-through refusal.
+    #[tokio::test]
+    async fn nuget_and_maven_reverts_route_to_real_backends() {
+        for (eco, purl) in [
+            ("nuget", "pkg:nuget/Newtonsoft.Json@13.0.1"),
+            (
+                "maven",
+                "pkg:maven/org.apache.logging.log4j/log4j-core@2.17.0",
+            ),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let outcome = dispatch_revert_one(&entry_for(eco, purl), tmp.path(), true).await;
+            if let Some(error) = &outcome.error {
+                assert!(
+                    !error.contains("no vendor backend for ecosystem"),
+                    "`{eco}` must route to its backend, not the unknown-ecosystem arm: {error}"
+                );
+            }
+        }
+    }
+
+    /// An unknown ecosystem string (a tampered/hand-edited state.json entry)
+    /// fails CLOSED with a diagnostic naming the ecosystem — never guessed
+    /// into some other backend, never a silent success.
+    #[tokio::test]
+    async fn unknown_ecosystem_revert_fails_closed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outcome = dispatch_revert_one(
+            &entry_for("frobnicate", "pkg:frobnicate/x@1.0.0"),
+            tmp.path(),
+            false,
+        )
+        .await;
+        assert!(!outcome.success, "unknown ecosystem must fail the revert");
+        let error = outcome.error.expect("failure carries a diagnostic");
+        assert!(
+            error.contains("no vendor backend for ecosystem `frobnicate`"),
+            "{error}"
+        );
+    }
+
+    /// [`dispatch_in_use_one`]'s fail-safe arm: every ecosystem without an
+    /// in-use probe (everything but npm/cargo) reports `None` — "cannot
+    /// determine" — which all callers must treat as KEEP.
+    #[tokio::test]
+    async fn in_use_probe_is_none_for_unprobed_ecosystems() {
+        let tmp = tempfile::tempdir().unwrap();
+        for (eco, purl) in [
+            ("gem", "pkg:gem/rails@6.0.3"),
+            ("pypi", "pkg:pypi/foo@1.0.0"),
+            ("frobnicate", "pkg:frobnicate/x@1.0.0"),
+        ] {
+            assert_eq!(
+                dispatch_in_use_one(&entry_for(eco, purl), tmp.path()).await,
+                None,
+                "`{eco}` has no in-use probe — must report undeterminable (keep)"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod persist_tests {
+    use super::*;
+    use socket_patch_core::vendor::state::VendorArtifact;
+
+    const UUID_A: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
+    const UUID_B: &str = "1a2b3c4d-5e6f-4a1b-8c2d-9e0f1a2b3c4d";
+    const UUID_C: &str = "2b3c4d5e-6f7a-4b2c-9d3e-0f1a2b3c4d5e";
+    const PURL_ONE: &str = "pkg:npm/left-pad@1.3.0";
+    const PURL_TWO: &str = "pkg:npm/right-pad@1.0.0";
+
+    fn npm_entry(base_purl: &str, uuid: &str) -> VendorEntry {
+        VendorEntry {
+            ecosystem: "npm".into(),
+            base_purl: base_purl.into(),
+            uuid: uuid.into(),
+            artifact: VendorArtifact {
+                path: format!(".socket/vendor/npm/{uuid}/pkg.tgz"),
+                sha256: String::new(),
+                size: None,
+                platform_locked: None,
+                file_inventory: None,
+            },
+            wiring: Vec::new(),
+            lock: None,
+            took_over_go_patches: false,
+            detached: false,
+            record: None,
+            flavor: Some("package-lock".into()),
+            uv: None,
+            pnpm: None,
+            poetry: None,
+            pdm: None,
+            pipenv: None,
+        }
+    }
+
+    fn empty_record() -> PatchRecord {
+        PatchRecord {
+            uuid: UUID_A.to_string(),
+            exported_at: String::new(),
+            files: HashMap::new(),
+            vulnerabilities: HashMap::new(),
+            description: String::new(),
+            license: String::new(),
+            tier: String::new(),
+        }
+    }
+
+    async fn mk_uuid_dir(root: &Path, uuid: &str) {
+        let dir = root.join(format!(".socket/vendor/npm/{uuid}"));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("pkg.tgz"), b"tgz").await.unwrap();
+    }
+
+    /// The stale-uuid sweep's filter-false KEEP: on a re-vendor under a new
+    /// patch uuid, the previous uuid's dir must be kept when another ledger
+    /// entry (a variant sibling) still shares the same `(eco, uuid)` —
+    /// deleting it would destroy the sibling's live artifact. Once nothing
+    /// shares the uuid, the same sweep removes the stale dir and records
+    /// the `vendor_stale_artifact_removed` event.
+    #[tokio::test]
+    async fn stale_uuid_sweep_keeps_dir_still_shared_with_a_sibling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        mk_uuid_dir(root, UUID_A).await;
+        let common = GlobalArgs {
+            cwd: root.to_path_buf(),
+            json: true,
+            silent: true,
+            ..GlobalArgs::default()
+        };
+        let record = empty_record();
+
+        let mut state = VendorState::default();
+        state
+            .entries
+            .insert(PURL_ONE.to_string(), npm_entry(PURL_ONE, UUID_A));
+        state
+            .entries
+            .insert(PURL_TWO.to_string(), npm_entry(PURL_TWO, UUID_A));
+
+        // Re-vendor PURL_ONE under UUID_B: UUID_A is still owned by the
+        // sibling entry, so its dir must survive and no removal is recorded.
+        let mut env = Envelope::new(Command::Vendor);
+        let has_errors = persist_vendor_entry(
+            &common,
+            &mut env,
+            &mut state,
+            PURL_ONE,
+            npm_entry(PURL_ONE, UUID_B),
+            false,
+            &record,
+        )
+        .await;
+        assert!(!has_errors, "save must succeed: {:?}", env.events);
+        assert!(
+            root.join(format!(".socket/vendor/npm/{UUID_A}")).exists(),
+            "a uuid dir still shared with a sibling entry must be KEPT"
+        );
+        assert!(
+            !env.events
+                .iter()
+                .any(|e| e.error_code.as_deref() == Some("vendor_stale_artifact_removed")),
+            "no removal may be recorded for a kept dir: {:?}",
+            env.events
+        );
+
+        // Drop the sibling; re-vendor PURL_ONE again under UUID_C. UUID_B is
+        // now unshared — the sweep removes it and records the event.
+        state.entries.remove(PURL_TWO);
+        mk_uuid_dir(root, UUID_B).await;
+        let mut env = Envelope::new(Command::Vendor);
+        let has_errors = persist_vendor_entry(
+            &common,
+            &mut env,
+            &mut state,
+            PURL_ONE,
+            npm_entry(PURL_ONE, UUID_C),
+            false,
+            &record,
+        )
+        .await;
+        assert!(!has_errors, "save must succeed: {:?}", env.events);
+        assert!(
+            !root.join(format!(".socket/vendor/npm/{UUID_B}")).exists(),
+            "an unshared stale uuid dir is removed on re-vendor"
+        );
+        assert!(
+            env.events
+                .iter()
+                .any(|e| e.error_code.as_deref() == Some("vendor_stale_artifact_removed")),
+            "the removal is recorded: {:?}",
+            env.events
+        );
+        assert!(
+            root.join(format!(".socket/vendor/npm/{UUID_A}")).exists(),
+            "the sweep only reclaims the REPLACED entry's dir, never unrelated ones"
+        );
+    }
+
+    /// The stale-uuid sweep's dry-run guard: a dry-run caller must NEVER
+    /// delete the replaced uuid's dir, while the `Removed` event still
+    /// records (as the preview of what a wet run would reclaim). Today's
+    /// backends return no entry on dry runs, so this pins the helper's own
+    /// contract against a future caller that does.
+    #[tokio::test]
+    async fn stale_uuid_sweep_dry_run_keeps_the_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        mk_uuid_dir(root, UUID_A).await;
+        let common = GlobalArgs {
+            cwd: root.to_path_buf(),
+            json: true,
+            silent: true,
+            dry_run: true,
+            ..GlobalArgs::default()
+        };
+        let record = empty_record();
+        let mut state = VendorState::default();
+        state
+            .entries
+            .insert(PURL_ONE.to_string(), npm_entry(PURL_ONE, UUID_A));
+
+        let mut env = Envelope::new(Command::Vendor);
+        let has_errors = persist_vendor_entry(
+            &common,
+            &mut env,
+            &mut state,
+            PURL_ONE,
+            npm_entry(PURL_ONE, UUID_B),
+            false,
+            &record,
+        )
+        .await;
+        assert!(!has_errors, "save must succeed: {:?}", env.events);
+        assert!(
+            root.join(format!(".socket/vendor/npm/{UUID_A}")).exists(),
+            "a dry run must not delete the replaced uuid's dir"
+        );
+        assert!(
+            env.events
+                .iter()
+                .any(|e| e.error_code.as_deref() == Some("vendor_stale_artifact_removed")),
+            "the would-be removal is still previewed as an event: {:?}",
+            env.events
+        );
+    }
+}
+
+#[cfg(test)]
+mod pristine_fetch_tests {
+    use super::*;
+
+    /// No lockfile entry AND no ledger entry: the pristine-source ladder
+    /// reports `NoSource` (the calm `package_not_installed` path) BEFORE any
+    /// network I/O — nothing else can name a verifiable source.
+    #[tokio::test]
+    async fn no_lock_and_no_ledger_is_no_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let client = registry_fetch::build_registry_client();
+        let out =
+            fetch_pristine_package(tmp.path(), &[], &client, "pkg:npm/left-pad@1.3.0", None).await;
+        assert!(
+            matches!(out, PristineFetch::NoSource),
+            "expected NoSource for a purl with no lock and no ledger entry"
+        );
     }
 }
