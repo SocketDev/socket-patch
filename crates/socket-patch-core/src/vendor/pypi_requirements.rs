@@ -1,7 +1,7 @@
 //! requirements.txt wiring (pip & `uv pip`).
 //!
 //! The spike-verified line shape is
-//! `./<rel wheel> --hash=sha256:<hex>[ ; <marker>]  # socket-patch vendor: <name>==<ver>`:
+//! `./<rel wheel>[ ; <marker>] --hash=sha256:<hex>  # socket-patch vendor: <name>==<ver>`:
 //! both pip 26 and uv 0.11 accept the bare relative path (resolved against
 //! the INVOKING CWD, never the requirements-file dir — hence the documented
 //! root-only constraint), enforce the `--hash` pin (implicitly: any
@@ -592,7 +592,7 @@ fn vendor_line(
         .unwrap_or_default();
     let note = if transitive { " (transitive)" } else { "" };
     format!(
-        "./{rel_wheel} --hash=sha256:{sha256_hex}{marker_part}  # socket-patch vendor: {canon_name}=={version}{note}"
+        "./{rel_wheel}{marker_part} --hash=sha256:{sha256_hex}  # socket-patch vendor: {canon_name}=={version}{note}"
     )
 }
 
@@ -1020,7 +1020,7 @@ mod tests {
         assert_eq!(
             read_root(tmp.path()).await,
             format!(
-                "./{REL_WHEEL} --hash=sha256:{SHA} ; python_version >= \"3.8\"  # socket-patch vendor: six==1.16.0\n"
+                "./{REL_WHEEL} ; python_version >= \"3.8\" --hash=sha256:{SHA}  # socket-patch vendor: six==1.16.0\n"
             )
         );
     }

@@ -504,6 +504,7 @@ fn rewrite_pypi_requirements(
     }
     let name_re = Regex::new(r"^([A-Za-z0-9._-]+)\s*(?:[=<>~!]=?|@|;|\s|$)")
         .expect("static requirements-name regex is valid");
+    let comment_re = Regex::new(r"\s+#.*$").expect("static requirements-comment regex is valid");
     let mut lines: Vec<String> = files["requirements.txt"]
         .split('\n')
         .map(|s| s.to_string())
@@ -550,7 +551,12 @@ fn rewrite_pypi_requirements(
             // BEFORE any per-requirement ` --` option. Grabbing to end-of-line
             // would swallow a previously appended `--hash=…` and duplicate it
             // on every re-run.
-            let req_part = line.split(" --").next().unwrap_or(line).trim_end();
+            let uncommented = comment_re.replace(line, "");
+            let req_part = uncommented
+                .split(" --")
+                .next()
+                .unwrap_or(&uncommented)
+                .trim_end();
             let marker = match req_part.find(';') {
                 Some(idx) => req_part[idx..].trim_end(),
                 None => "",
@@ -5245,6 +5251,25 @@ mod tests {
             second.files,
             second.edits
         );
+    }
+
+    #[test]
+    fn requirements_marker_comment_keeps_hash_active() {
+        let original = "requests==2.28.1 ; python_version >= \"3.7\" # explanation\n";
+        let files = BTreeMap::from([("requirements.txt".to_string(), original.to_string())]);
+        let sha256 = "c".repeat(64);
+        let url = "https://patch.socket.dev/requests-2.28.1-py3-none-any.whl";
+        let overrides = vec![pypi_override("requests", "2.28.1", url, &sha256)];
+        let first = rewrite_registry_redirect(&files, &overrides);
+        let output = first.files.get("requirements.txt").expect("rewritten");
+        assert_eq!(
+            output,
+            &format!("requests @ {url} ; python_version >= \"3.7\" --hash=sha256:{sha256}\n")
+        );
+        let again = BTreeMap::from([("requirements.txt".to_string(), output.clone())]);
+        let second = rewrite_registry_redirect(&again, &overrides);
+        assert!(second.files.is_empty());
+        assert!(second.edits.is_empty());
     }
 
     const MAVEN_SUFFIXED: &str = "1.7.36-socket.aaaaaaaa";
