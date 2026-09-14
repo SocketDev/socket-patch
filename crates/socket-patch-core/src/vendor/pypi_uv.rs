@@ -1316,7 +1316,10 @@ pub(super) fn wheel_metadata_text(bytes: &[u8]) -> Option<String> {
         return None;
     }
     let mut text = String::new();
-    entry.take(MAX_WHEEL_METADATA_BYTES + 1).read_to_string(&mut text).ok()?;
+    entry
+        .take(MAX_WHEEL_METADATA_BYTES + 1)
+        .read_to_string(&mut text)
+        .ok()?;
     (text.len() as u64 <= MAX_WHEEL_METADATA_BYTES).then_some(text)
 }
 

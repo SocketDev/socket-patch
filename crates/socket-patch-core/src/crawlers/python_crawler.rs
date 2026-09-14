@@ -566,8 +566,7 @@ pub async fn is_python_project(cwd: &Path) -> bool {
             return true;
         }
     }
-    crate::utils::python_lock::python_lock_paths(cwd)
-        .is_ok_and(|paths| !paths.is_empty())
+    crate::utils::python_lock::python_lock_paths(cwd).is_ok_and(|paths| !paths.is_empty())
 }
 
 // ---------------------------------------------------------------------------
