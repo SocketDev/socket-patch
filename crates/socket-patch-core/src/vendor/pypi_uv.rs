@@ -111,6 +111,13 @@ pub(super) async fn load_uv_project(root: &Path) -> Result<UvProject, (&'static 
         )
     })?;
 
+    if lock.contains_key("distribution") {
+        return Err((
+            "pypi_uv_legacy_lock_unsupported",
+            "uv 0.1 lockfiles require absolute file URLs; upgrade to uv >=0.2 for portable native vendoring, or use a requirements.txt installation".to_string(),
+        ));
+    }
+
     // Workspaces resolve all members into ONE shared lock whose fragments we
     // have no fixtures for; refuse rather than guess (fail-closed).
     if pyproject
@@ -1280,14 +1287,14 @@ struct MetaDep {
 /// can't be read, has no `*.dist-info/METADATA`, or (like `six`) declares no
 /// requires-dist / provides-extras — uv omits the block in that case too, so
 /// the fixtures that pass no block stay byte-exact.
-async fn wheel_metadata_block(wheel_path: &Path) -> Option<String> {
+pub(super) async fn wheel_metadata_block(wheel_path: &Path) -> Option<String> {
     let bytes = tokio::fs::read(wheel_path).await.ok()?;
     let text = wheel_metadata_text(&bytes)?;
     render_package_metadata_block(&text)
 }
 
 /// Extract the top-level `*.dist-info/METADATA` text from a wheel zip.
-fn wheel_metadata_text(bytes: &[u8]) -> Option<String> {
+pub(super) fn wheel_metadata_text(bytes: &[u8]) -> Option<String> {
     use std::io::Read as _;
     let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).ok()?;
     let mut metadata_name: Option<String> = None;
@@ -1304,13 +1311,13 @@ fn wheel_metadata_text(bytes: &[u8]) -> Option<String> {
         }
     }
     let metadata_name = metadata_name?;
-    let mut entry = archive.by_name(&metadata_name).ok()?;
+    let entry = archive.by_name(&metadata_name).ok()?;
     if entry.size() > MAX_WHEEL_METADATA_BYTES {
         return None;
     }
     let mut text = String::new();
-    entry.read_to_string(&mut text).ok()?;
-    Some(text)
+    entry.take(MAX_WHEEL_METADATA_BYTES + 1).read_to_string(&mut text).ok()?;
+    (text.len() as u64 <= MAX_WHEEL_METADATA_BYTES).then_some(text)
 }
 
 /// Collect the `Requires-Dist` / `Provides-Extra` header values from a wheel's
@@ -1432,7 +1439,7 @@ fn render_requires_dist_entry(dep: &MetaDep) -> String {
 /// provides-extras) or a `Requires-Dist` line fails to parse — in which case
 /// we emit no block rather than risk malformed TOML (`uv sync` then heals it,
 /// the pre-fix behavior, instead of failing to parse the lock).
-fn render_package_metadata_block(metadata_text: &str) -> Option<String> {
+pub(super) fn render_package_metadata_block(metadata_text: &str) -> Option<String> {
     let (requires_raw, provides_raw) = parse_core_metadata_fields(metadata_text);
     if requires_raw.is_empty() && provides_raw.is_empty() {
         return None;

@@ -32,6 +32,7 @@ const REDIRECT_CANDIDATE_FILES: &[&str] = &[
     "bun.lock",
     "requirements.txt",
     "uv.lock",
+    "pyproject.toml",
     "Cargo.toml",
     "Cargo.lock",
     ".cargo/config.toml",
@@ -785,7 +786,7 @@ pub(crate) async fn run_redirect_selected(
 ) -> i32 {
     use socket_patch_core::manifest::schema::PatchRecord;
     use socket_patch_core::patch::redirect::{
-        rewrite_registry_redirect, DepOverride, RedirectState,
+        rewrite_registry_redirect_with_python_metadata, DepOverride, RedirectState,
     };
 
     let mut skipped: Vec<serde_json::Value> = Vec::new();
@@ -1260,6 +1261,22 @@ pub(crate) async fn run_redirect_selected(
         }
     }
 
+    if let Ok(paths) = socket_patch_core::utils::python_lock::python_lock_paths(&common.cwd) {
+        for path in paths {
+            if let Some(script_path) = path
+                .strip_suffix(".py.lock")
+                .map(|prefix| format!("{prefix}.py"))
+            {
+                if let Ok(content) = std::fs::read_to_string(common.cwd.join(&script_path)) {
+                    files.insert(script_path, content);
+                }
+            }
+            if let Ok(content) = std::fs::read_to_string(common.cwd.join(&path)) {
+                files.insert(path, content);
+            }
+        }
+    }
+
     // Rush monorepos have no root package.json/lock pair: the single pnpm
     // source-of-truth lock lives at common/config/rush/pnpm-lock.yaml, and
     // (when subspaces are enabled) one lock per subspace under
@@ -1299,7 +1316,63 @@ pub(crate) async fn run_redirect_selected(
     // `mut`: the pnpm trustLockfile auto-config below may fold a
     // pnpm-workspace.yaml write (plus its ledger edit) into the rewrite set so
     // it rides the same atomic-write / ledger-first machinery as the locks.
-    let mut rewrite = rewrite_registry_redirect(&files, &overrides);
+    let mut python_metadata = std::collections::BTreeMap::new();
+    let mut unavailable_python_artifacts = std::collections::BTreeSet::new();
+    for dep in overrides.iter().filter(|dep| dep.ecosystem == "pypi") {
+        let Some(sha256) = dep.integrity.sha256.as_deref() else {
+            continue;
+        };
+        if !dep
+            .artifact_url
+            .split(['?', '#'])
+            .next()
+            .is_some_and(|path| path.ends_with(".whl"))
+        {
+            continue;
+        }
+        let native_target = files
+            .iter()
+            .filter(|(path, _)| *path == "uv.lock" || path.ends_with(".py.lock"))
+            .any(|(_, text)| {
+                socket_patch_core::utils::python_lock::rewrite_python_lock(
+                    text,
+                    &dep.name,
+                    &dep.version,
+                    socket_patch_core::utils::python_lock::ArtifactSource::Url(&dep.artifact_url),
+                    sha256,
+                )
+                .ok()
+                .flatten()
+                .is_some()
+            });
+        if !native_target {
+            continue;
+        }
+        match socket_patch_core::vendor::pypi::fetch_hosted_wheel_metadata(
+            api_client,
+            &dep.artifact_url,
+            sha256,
+        )
+        .await
+        {
+            Ok(Some(metadata)) => {
+                python_metadata.insert(dep.artifact_url.clone(), metadata);
+            }
+            Ok(None) => {}
+            Err(detail) => {
+                unavailable_python_artifacts.insert(dep.artifact_url.clone());
+                skipped.push(serde_json::json!({
+                    "purl": format!("pkg:pypi/{}@{}", dep.name, dep.version),
+                    "uuid": dep.patch_uuid,
+                    "reason": "python_metadata_unavailable",
+                    "detail": detail.replace(&dep.artifact_url, "<hosted artifact>"),
+                }));
+            }
+        }
+    }
+    overrides.retain(|dep| !unavailable_python_artifacts.contains(&dep.artifact_url));
+    let mut rewrite =
+        rewrite_registry_redirect_with_python_metadata(&files, &overrides, &python_metadata);
 
     // The lockb→text migration is only KEPT when the rewrite actually landed
     // in the migrated bun.lock. Otherwise nothing was redirected there and the

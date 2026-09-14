@@ -10,6 +10,7 @@ use std::path::Path;
 
 use sha2::{Digest as _, Sha256};
 
+use crate::api::client::ApiClient;
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::{ApplyResult, PatchSources};
@@ -43,6 +44,7 @@ use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorServiceConfig, Vendo
 enum PypiFlavor {
     /// `uv.lock`-managed project → paired pyproject + lock surgery.
     UvProject,
+    PythonLocks,
     /// `poetry.lock`-managed project → lock-only `[[package]]` splice.
     Poetry,
     /// `pdm.lock`-managed project → lock-only `[[package]]` splice.
@@ -57,12 +59,72 @@ impl PypiFlavor {
     fn as_str(self) -> &'static str {
         match self {
             PypiFlavor::UvProject => "uv",
+            PypiFlavor::PythonLocks => "python-lock",
             PypiFlavor::Poetry => "poetry",
             PypiFlavor::Pdm => "pdm",
             PypiFlavor::Pipenv => "pipenv",
             PypiFlavor::Requirements => "requirements",
         }
     }
+}
+
+fn validate_hosted_wheel_sha256(sha256: &str) -> Result<(), String> {
+    if sha256.len() != 64 || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("hosted wheel sha256 must be 64 hexadecimal characters".to_string());
+    }
+    Ok(())
+}
+
+fn decode_hosted_wheel_metadata(bytes: &[u8], sha256: &str) -> Result<Option<String>, String> {
+    validate_hosted_wheel_sha256(sha256)?;
+    if !hex::encode(Sha256::digest(bytes)).eq_ignore_ascii_case(sha256) {
+        return Err("hosted wheel sha256 does not match the published artifact".to_string());
+    }
+    let metadata = super::pypi_uv::wheel_metadata_text(bytes)
+        .ok_or_else(|| "hosted wheel has no readable size-bounded core metadata".to_string())?;
+    let headers: Vec<_> = metadata
+        .lines()
+        .take_while(|line| !line.is_empty())
+        .filter_map(|line| line.split_once(':'))
+        .collect();
+    for required in ["Metadata-Version", "Name", "Version"] {
+        if !headers
+            .iter()
+            .any(|(name, value)| name.eq_ignore_ascii_case(required) && !value.trim().is_empty())
+        {
+            return Err(format!("hosted wheel core metadata is missing {required}"));
+        }
+    }
+    let rendered = super::pypi_uv::render_package_metadata_block(&metadata);
+    if rendered.is_none()
+        && headers.iter().any(|(name, _)| {
+            name.eq_ignore_ascii_case("Requires-Dist")
+                || name.eq_ignore_ascii_case("Provides-Extra")
+        })
+    {
+        return Err(
+            "hosted wheel dependency metadata cannot be represented in a uv lockfile".to_string(),
+        );
+    }
+    if let Some(rendered) = &rendered {
+        rendered
+            .parse::<toml_edit::DocumentMut>()
+            .map_err(|error| format!("hosted wheel dependency metadata is invalid: {error}"))?;
+    }
+    Ok(rendered)
+}
+
+pub async fn fetch_hosted_wheel_metadata(
+    client: &ApiClient,
+    url: &str,
+    sha256: &str,
+) -> Result<Option<String>, String> {
+    validate_hosted_wheel_sha256(sha256)?;
+    let bytes = client
+        .download_artifact(url)
+        .await
+        .map_err(|error| format!("cannot fetch hosted wheel metadata: {error}"))?;
+    decode_hosted_wheel_metadata(&bytes, sha256)
 }
 
 const SETUP_ALTERNATIVE: &str =
@@ -101,6 +163,7 @@ async fn read_regular_to_string(path: &Path) -> std::io::Result<String> {
 /// stale-but-valid, which is otherwise invisible.
 async fn detect_pypi_flavor(
     project_root: &Path,
+    target: Option<(&str, &str)>,
 ) -> Result<(PypiFlavor, Vec<VendorWarning>), (&'static str, String)> {
     let exists = |name: &str| {
         let p = project_root.join(name);
@@ -113,7 +176,7 @@ async fn detect_pypi_flavor(
     let has_pipfile = exists("Pipfile").await;
 
     // Coexisting tool locks: wire the precedence winner, warn about the rest.
-    let present: Vec<&str> = [
+    let mut present: Vec<&str> = [
         ("uv.lock", has_uv_lock),
         ("poetry.lock", has_poetry_lock),
         ("pdm.lock", has_pdm_lock),
@@ -122,7 +185,46 @@ async fn detect_pypi_flavor(
     .into_iter()
     .filter_map(|(name, present)| present.then_some(name))
     .collect();
+    let additional_locks: Vec<String> = crate::utils::python_lock::python_lock_paths(project_root)
+        .map_err(|error| ("pypi_lock_read_failed", error.to_string()))?
+        .into_iter()
+        .filter(|path| path != "uv.lock")
+        .collect();
     let mut warnings = Vec::new();
+    let matching_additional_lock = if has_uv_lock {
+        false
+    } else if let Some((name, version)) = target {
+        super::pypi_lock::contains_target(project_root, &additional_locks, name, version).await?
+    } else {
+        !additional_locks.is_empty()
+    };
+    if !has_uv_lock && matching_additional_lock {
+        if exists("requirements.txt").await {
+            present.push("requirements.txt");
+        }
+        if !present.is_empty() {
+            warnings.push(VendorWarning::new(
+                "pypi_multiple_lockfiles",
+                format!(
+                    "wiring {}; installs driven by {} retain their existing sources",
+                    additional_locks.join(", "),
+                    present.join(", ")
+                ),
+            ));
+        }
+        return Ok((PypiFlavor::PythonLocks, warnings));
+    }
+    if has_uv_lock {
+        present.extend(additional_locks.iter().map(String::as_str));
+    } else if !additional_locks.is_empty() {
+        warnings.push(VendorWarning::new(
+            "pypi_unmatched_lockfiles",
+            format!(
+                "{} do not contain this package version; their sources are unchanged",
+                additional_locks.join(", ")
+            ),
+        ));
+    }
     if present.len() > 1 {
         let winner = present[0];
         let losers = present[1..].join(", ");
@@ -224,6 +326,7 @@ async fn detect_pypi_flavor(
 /// project is reused so the lock is parsed once).
 enum WiringPlan {
     Uv(Box<UvProject>),
+    PythonLocks(super::pypi_lock::PythonLocks),
     Requirements,
     Poetry(Box<PoetryProject>),
     Pdm(Box<PdmProject>),
@@ -359,10 +462,11 @@ pub async fn vendor_pypi(
         );
     };
 
-    let (flavor, flavor_warnings) = match detect_pypi_flavor(project_root).await {
-        Ok(f) => f,
-        Err((code, detail)) => return refused(code, detail),
-    };
+    let (flavor, flavor_warnings) =
+        match detect_pypi_flavor(project_root, Some((&canon_name, version))).await {
+            Ok(f) => f,
+            Err((code, detail)) => return refused(code, detail),
+        };
 
     // Pre-flight the wiring guards BEFORE building anything, so refusals
     // leave the tree byte-untouched.
@@ -392,6 +496,25 @@ pub async fn vendor_pypi(
                     WiringPlan::Uv(Box::new(project))
                 }
                 Err((code, detail)) => return refused(code, detail),
+            }
+        }
+        PypiFlavor::PythonLocks => {
+            let project = match super::pypi_lock::load_python_locks(
+                project_root,
+                &canon_name,
+                version,
+                &record.uuid,
+            )
+            .await
+            {
+                Ok(project) => project,
+                Err((code, detail)) => return refused(code, detail),
+            };
+            if project.in_sync {
+                wired_pin = project.pin;
+                WiringPlan::InSync
+            } else {
+                WiringPlan::PythonLocks(project)
             }
         }
         PypiFlavor::Requirements => {
@@ -551,6 +674,9 @@ pub async fn vendor_pypi(
     if platform_locked {
         let per_flavor = match flavor {
             PypiFlavor::UvProject => "uv.lock now resolves it from this single-platform wheel only",
+            PypiFlavor::PythonLocks => {
+                "Python lockfiles now resolve it from this single-platform wheel only"
+            }
             PypiFlavor::Poetry => {
                 "poetry.lock now resolves it from this single-platform wheel only"
             }
@@ -638,6 +764,16 @@ pub async fn vendor_pypi(
         )
         .await
         .map(|(wiring, meta)| (wiring, MetaSlot::Uv(Some(meta)))),
+        WiringPlan::PythonLocks(project) => super::pypi_lock::wire_python_locks(
+            &project,
+            project_root,
+            &canon_name,
+            version,
+            &rel_wheel,
+            &artifact.sha256_hex,
+        )
+        .await
+        .map(|wiring| (wiring, MetaSlot::None)),
         WiringPlan::Requirements => wire_requirements(
             project_root,
             &canon_name,
@@ -748,6 +884,9 @@ pub async fn revert_pypi_opts(
     } = opts;
     let mut outcome = match entry.flavor.as_deref() {
         Some("uv") => revert_uv(entry, project_root, dry_run).await,
+        Some("python-lock") => {
+            super::pypi_lock::revert_python_locks(entry, project_root, dry_run).await
+        }
         Some("requirements") => revert_requirements(entry, project_root, dry_run).await,
         Some("poetry") => super::pypi_poetry::revert_poetry(entry, project_root, dry_run).await,
         Some("pdm") => super::pypi_pdm::revert_pdm(entry, project_root, dry_run).await,
@@ -1110,7 +1249,7 @@ mod tests {
     async fn flavor_routing_table_v2_precedence() {
         let flavor = |tmp: &Path| {
             let tmp = tmp.to_path_buf();
-            async move { detect_pypi_flavor(&tmp).await.map(|(f, _)| f) }
+            async move { detect_pypi_flavor(&tmp, None).await.map(|(f, _)| f) }
         };
 
         // 1. uv.lock wins outright (even over requirements + other markers).
@@ -1118,6 +1257,13 @@ mod tests {
         touch(tmp.path(), "uv.lock", "version = 1\n").await;
         touch(tmp.path(), "requirements.txt", "six==1.16.0\n").await;
         assert_eq!(flavor(tmp.path()).await.unwrap(), PypiFlavor::UvProject);
+        touch(tmp.path(), "pylock.toml", "lock-version = \"1.0\"\n").await;
+        let (selected, warnings) = detect_pypi_flavor(tmp.path(), None).await.unwrap();
+        assert_eq!(selected, PypiFlavor::UvProject);
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.code == "pypi_multiple_lockfiles"
+                && warning.detail.contains("pylock.toml")));
 
         // 2-4. Tool locks route to their flavors.
         let tmp = tempfile::tempdir().unwrap();
@@ -1136,7 +1282,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         touch(tmp.path(), "poetry.lock", "").await;
         touch(tmp.path(), "Pipfile.lock", "{}").await;
-        let (f, warnings) = detect_pypi_flavor(tmp.path()).await.unwrap();
+        let (f, warnings) = detect_pypi_flavor(tmp.path(), None).await.unwrap();
         assert_eq!(f, PypiFlavor::Poetry);
         assert_eq!(warnings.len(), 1);
         assert_eq!(warnings[0].code, "pypi_multiple_lockfiles");
@@ -1154,7 +1300,7 @@ mod tests {
             "[project]\nname = \"x\"\n\n[tool.uv]\ndev = true\n",
         )
         .await;
-        let err = detect_pypi_flavor(tmp.path()).await.unwrap_err();
+        let err = detect_pypi_flavor(tmp.path(), None).await.unwrap_err();
         assert_eq!(err.0, "pypi_uv_no_lockfile");
         assert!(err.1.contains("uv lock"));
         assert!(err.1.contains("socket-patch setup"));
@@ -1166,21 +1312,21 @@ mod tests {
             "[tool.poetry]\nname = \"x\"\n",
         )
         .await;
-        let err = detect_pypi_flavor(tmp.path()).await.unwrap_err();
+        let err = detect_pypi_flavor(tmp.path(), None).await.unwrap_err();
         assert_eq!(err.0, "pypi_poetry_no_lockfile");
         assert!(err.1.contains("poetry lock"));
 
         let tmp = tempfile::tempdir().unwrap();
         touch(tmp.path(), "pyproject.toml", "[tool.pdm]\n").await;
         assert_eq!(
-            detect_pypi_flavor(tmp.path()).await.unwrap_err().0,
+            detect_pypi_flavor(tmp.path(), None).await.unwrap_err().0,
             "pypi_pdm_no_lockfile"
         );
 
         let tmp = tempfile::tempdir().unwrap();
         touch(tmp.path(), "Pipfile", "").await;
         assert_eq!(
-            detect_pypi_flavor(tmp.path()).await.unwrap_err().0,
+            detect_pypi_flavor(tmp.path(), None).await.unwrap_err().0,
             "pypi_pipenv_no_lockfile"
         );
 
@@ -1212,13 +1358,13 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         touch(tmp.path(), "pyproject.toml", "[project]\nname = \"x\"\n").await;
         assert_eq!(
-            detect_pypi_flavor(tmp.path()).await.unwrap_err().0,
+            detect_pypi_flavor(tmp.path(), None).await.unwrap_err().0,
             "pypi_pyproject_only"
         );
 
         // 8. nothing at all.
         let tmp = tempfile::tempdir().unwrap();
-        let err = detect_pypi_flavor(tmp.path()).await.unwrap_err();
+        let err = detect_pypi_flavor(tmp.path(), None).await.unwrap_err();
         assert_eq!(err.0, "pypi_no_requirements");
         assert!(err.1.contains("socket-patch setup"));
     }
@@ -1260,7 +1406,7 @@ mod tests {
         // the runtime waits for on shutdown; connect a writer to release
         // it so the test can FAIL instead of hanging the whole suite.
         let deadline = std::time::Duration::from_secs(5);
-        let Ok(routed) = tokio::time::timeout(deadline, detect_pypi_flavor(tmp.path())).await
+        let Ok(routed) = tokio::time::timeout(deadline, detect_pypi_flavor(tmp.path(), None)).await
         else {
             let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
             panic!("detect_pypi_flavor must complete promptly with a FIFO pyproject.toml");
@@ -1275,6 +1421,59 @@ mod tests {
         assert!(has_table("[ tool.uv ] # padded\n", "tool.uv"));
         assert!(!has_table("# [tool.uv]\nx = \"[tool.uv]\"\n", "tool.uv"));
         assert!(!has_table("[tool.uvloop]\n", "tool.uv"));
+    }
+
+    fn metadata_wheel(metadata: &str) -> Vec<u8> {
+        super::super::common::write_zip_entries(&[(
+            "widget-1.0.dist-info/METADATA".to_string(),
+            metadata.as_bytes().to_vec(),
+            0o644,
+        )])
+        .unwrap()
+    }
+
+    #[test]
+    fn hosted_wheel_metadata_verifies_hash_and_preserves_dependencies() {
+        let bytes = metadata_wheel("Metadata-Version: 2.1\nName: widget\nVersion: 1.0\nRequires-Dist: requests[socks]>=2; python_version >= '3.9'\nProvides-Extra: secure\n\nBody\n");
+        let sha = hex::encode(Sha256::digest(&bytes));
+        let block = decode_hosted_wheel_metadata(&bytes, &sha).unwrap().unwrap();
+        let document: toml_edit::DocumentMut = block.parse().unwrap();
+        assert_eq!(
+            document["package"]["metadata"]["requires-dist"][0]["name"].as_str(),
+            Some("requests")
+        );
+        assert_eq!(
+            document["package"]["metadata"]["requires-dist"][0]["specifier"].as_str(),
+            Some(">=2")
+        );
+        assert_eq!(
+            document["package"]["metadata"]["requires-dist"][0]["extras"][0].as_str(),
+            Some("socks")
+        );
+        assert_eq!(
+            document["package"]["metadata"]["provides-extras"][0].as_str(),
+            Some("secure")
+        );
+        assert!(decode_hosted_wheel_metadata(&bytes, &"0".repeat(64))
+            .unwrap_err()
+            .contains("does not match"));
+        assert!(decode_hosted_wheel_metadata(&bytes, "short")
+            .unwrap_err()
+            .contains("64 hexadecimal"));
+    }
+
+    #[test]
+    fn hosted_wheel_metadata_distinguishes_no_dependencies_from_invalid_wheels() {
+        let bytes = metadata_wheel("Metadata-Version: 2.1\nName: widget\nVersion: 1.0\n\nRequires-Dist: description-only\n");
+        assert!(
+            decode_hosted_wheel_metadata(&bytes, &hex::encode(Sha256::digest(&bytes)))
+                .unwrap()
+                .is_none()
+        );
+        for bytes in [b"not a zip".to_vec(), metadata_wheel("not metadata"), metadata_wheel("Metadata-Version: 2.1\nName: widget\nVersion: 1.0\nRequires-Dist: other @ https://example.test/other.whl\n")] {
+            let sha = hex::encode(Sha256::digest(&bytes));
+            assert!(decode_hosted_wheel_metadata(&bytes, &sha).is_err());
+        }
     }
 
     struct E2eFixture {
@@ -2991,7 +3190,10 @@ wheels = [
             "no files hash line ⇒ no pin (the guard stays off rather than guessing)"
         );
         assert_eq!(
-            splice_lock_wired_pin(&poetry, ".socket/vendor/pypi/00000000-0000-4000-8000-000000000000"),
+            splice_lock_wired_pin(
+                &poetry,
+                ".socket/vendor/pypi/00000000-0000-4000-8000-000000000000"
+            ),
             None,
             "a foreign uuid dir pins nothing of ours"
         );
@@ -3017,10 +3219,7 @@ wheels = [
                 }
             }
         });
-        assert_eq!(
-            pipenv_wired_pin(&lock, &dir_rel),
-            Some((rel_wheel, sha))
-        );
+        assert_eq!(pipenv_wired_pin(&lock, &dir_rel), Some((rel_wheel, sha)));
         let no_ref = serde_json::json!({
             "default": {"six": {"version": "==1.16.0", "hashes": ["sha256:eee"]}}
         });
@@ -4289,8 +4488,16 @@ wheels = [
                 "version = [broken\n",
                 "pypi_poetry_lock_parse_failed",
             ),
-            ("pdm.lock", "version = [broken\n", "pypi_pdm_lock_parse_failed"),
-            ("Pipfile.lock", "{ not json", "pypi_pipenv_lock_parse_failed"),
+            (
+                "pdm.lock",
+                "version = [broken\n",
+                "pypi_pdm_lock_parse_failed",
+            ),
+            (
+                "Pipfile.lock",
+                "{ not json",
+                "pypi_pipenv_lock_parse_failed",
+            ),
         ];
         for (lock_file, broken, expected_code) in cases {
             let fx = e2e_fixture().await;
@@ -4322,7 +4529,11 @@ wheels = [
                 POETRY_LOCK_REGISTRY,
                 "pypi_poetry_source_already_exists",
             ),
-            ("pdm.lock", PDM_LOCK_REGISTRY, "pypi_pdm_source_already_exists"),
+            (
+                "pdm.lock",
+                PDM_LOCK_REGISTRY,
+                "pypi_pdm_source_already_exists",
+            ),
             (
                 "Pipfile.lock",
                 PIPENV_LOCK_REGISTRY,
@@ -4333,8 +4544,7 @@ wheels = [
             let fx = e2e_fixture().await;
             swap_to_lock_flavor(&fx, &[(lock_file, lock_text)]).await;
             let sources = PatchSources::blobs_only(&fx.blobs);
-            let VendorOutcome::Done { result, .. } = vendor_six(&fx, &sources, None).await
-            else {
+            let VendorOutcome::Done { result, .. } = vendor_six(&fx, &sources, None).await else {
                 panic!("{lock_file}: first vendor must be Done");
             };
             assert!(result.success, "{lock_file}: {:?}", result.error);
@@ -4394,8 +4604,7 @@ wheels = [
             let fx = e2e_fixture().await;
             swap_to_lock_flavor(&fx, &[(lock_file, lock_text)]).await;
             let sources = PatchSources::blobs_only(&fx.blobs);
-            let VendorOutcome::Done { result, entry, .. } =
-                vendor_six(&fx, &sources, None).await
+            let VendorOutcome::Done { result, entry, .. } = vendor_six(&fx, &sources, None).await
             else {
                 panic!("{lock_file}: first vendor must be Done");
             };
@@ -4582,5 +4791,161 @@ wheels = [
             stripped,
             "the hand-stripped lock is left alone"
         );
+    }
+    #[tokio::test]
+    async fn standalone_python_locks_vendor_and_revert_real_wheels() {
+        let original = r#"# original byte formatting
+lock-version = "1.0"
+created-by = "uv"
+requires-python = ">=3.9"
+
+[[packages]]
+name = "six"
+version = "1.16.0"
+wheels = [{url = "https://files.pythonhosted.org/six.whl", hashes = {sha256 = "upstream"}}]
+"#;
+        for name in ["pylock.toml", "pylock.production.toml"] {
+            full_cycle_lock_flavor("python-lock", name, original, "python_lock_document").await;
+        }
+    }
+
+    #[tokio::test]
+    async fn script_python_lock_pairs_metadata_and_restores_original_bytes() {
+        let fx = e2e_fixture().await;
+        let script = r#"#!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.9"
+# dependencies = ["six==1.16.0"]
+# ///
+print('preserved')
+"#;
+        let lock = r#"version = 1
+revision = 3
+requires-python = ">=3.9"
+
+[manifest]
+requirements = [{name = "six", specifier = "==1.16.0"}]
+
+[[package]]
+name = "six"
+version = "1.16.0"
+source = {registry = "https://pypi.org/simple"}
+wheels = [{url = "https://files.pythonhosted.org/six.whl", hash = "sha256:upstream"}]
+"#;
+        swap_to_lock_flavor(&fx, &[("example.py", script), ("example.py.lock", lock)]).await;
+        let sources = PatchSources::blobs_only(&fx.blobs);
+        let VendorOutcome::Done { result, entry, .. } = vendor_six(&fx, &sources, None).await
+        else {
+            panic!("expected completed vendor");
+        };
+        assert!(result.success, "{:?}", result.error);
+        let entry = entry.unwrap();
+        let script_after = tokio::fs::read_to_string(fx.root.join("example.py"))
+            .await
+            .unwrap();
+        assert!(script_after.contains(&entry.artifact.path));
+        assert!(script_after.ends_with("# ///\nprint('preserved')\n"));
+        let lock_after = tokio::fs::read_to_string(fx.root.join("example.py.lock"))
+            .await
+            .unwrap();
+        let document: toml_edit::DocumentMut = lock_after.parse().unwrap();
+        assert_eq!(
+            document["manifest"]["requirements"][0]["path"].as_str(),
+            Some(entry.artifact.path.as_str())
+        );
+        assert!(lock_after.contains(&entry.artifact.sha256));
+        let VendorOutcome::Done {
+            result: repeated,
+            entry: repeated_entry,
+            ..
+        } = vendor_six(&fx, &sources, None).await
+        else {
+            panic!("expected idempotent vendor");
+        };
+        assert!(repeated.success);
+        assert!(repeated_entry.is_none());
+        for (file, original, tampered) in [
+            (
+                "example.py",
+                &script_after,
+                script_after.replace(&entry.artifact.path, "user/six.whl"),
+            ),
+            (
+                "example.py.lock",
+                &lock_after,
+                lock_after.replace(&entry.artifact.sha256, &"f".repeat(64)),
+            ),
+        ] {
+            touch(&fx.root, file, &tampered).await;
+            let script_before = tokio::fs::read_to_string(fx.root.join("example.py"))
+                .await
+                .unwrap();
+            let lock_before = tokio::fs::read_to_string(fx.root.join("example.py.lock"))
+                .await
+                .unwrap();
+            let refused = revert_pypi(&entry, &fx.root, false).await;
+            assert!(refused.success);
+            assert!(refused.kept_artifact);
+            assert!(refused.drift_skipped());
+            assert_eq!(
+                tokio::fs::read_to_string(fx.root.join("example.py"))
+                    .await
+                    .unwrap(),
+                script_before
+            );
+            assert_eq!(
+                tokio::fs::read_to_string(fx.root.join("example.py.lock"))
+                    .await
+                    .unwrap(),
+                lock_before
+            );
+            assert!(fx.root.join(&entry.artifact.path).is_file());
+            touch(&fx.root, file, original).await;
+        }
+        let reverted = revert_pypi(&entry, &fx.root, false).await;
+        assert!(reverted.success, "{:?}", reverted.error);
+        assert!(reverted.warnings.is_empty(), "{:?}", reverted.warnings);
+        assert_eq!(
+            tokio::fs::read_to_string(fx.root.join("example.py"))
+                .await
+                .unwrap(),
+            script
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(fx.root.join("example.py.lock"))
+                .await
+                .unwrap(),
+            lock
+        );
+        assert!(!uuid_dir_of(&fx).exists());
+    }
+    #[tokio::test]
+    async fn unrelated_script_lock_does_not_block_requirements_vendoring() {
+        let fx = e2e_fixture().await;
+        let unrelated = "version = 1\n[[package]]\nname = \"other\"\nversion = \"1\"\nsource = {registry = \"https://pypi.org/simple\"}\n";
+        touch(&fx.root, "job.py.lock", unrelated).await;
+        let sources = PatchSources::blobs_only(&fx.blobs);
+        let outcome = vendor_six(&fx, &sources, None).await;
+        let VendorOutcome::Done {
+            result,
+            entry,
+            warnings,
+        } = outcome
+        else {
+            panic!("expected requirements fallback, got {outcome:?}");
+        };
+        assert!(result.success, "{:?}", result.error);
+        let entry = entry.unwrap();
+        assert_eq!(entry.flavor.as_deref(), Some("requirements"));
+        assert!(read_requirements(&fx).await.contains(&entry.artifact.path));
+        assert_eq!(
+            tokio::fs::read_to_string(fx.root.join("job.py.lock"))
+                .await
+                .unwrap(),
+            unrelated
+        );
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.code == "pypi_unmatched_lockfiles"));
     }
 }

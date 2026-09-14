@@ -9,8 +9,8 @@
 //! PR flow) and by this CLI, so a customer gets the same result whether Socket
 //! opens the PR or they run `socket-patch scan --redirect` locally.
 //!
-//! Non-JSON formats are edited SURGICALLY (regex/string) to stay byte-stable
-//! and reproducible across languages; JSON uses `serde_json` with
+//! Python lockfiles use TOML-aware edits to keep source identities consistent.
+//! Other non-JSON formats use targeted text edits; JSON uses `serde_json` with
 //! `preserve_order` (2-space pretty + trailing newline) to match the TS
 //! `JSON.stringify(v, null, 2) + '\n'`.
 
@@ -21,11 +21,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::crawlers::composer_crawler::normalize_version;
-use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::vendor::yarn_berry_lock::yarnrc_compression_level;
 
 pub mod golang_local;
 mod replay;
+mod requirements;
 mod state;
 mod takeover;
 pub use replay::{revert_remaining_redirect_edits, GroupRefusal, ReplayOutcome};
@@ -195,6 +195,14 @@ pub fn rewrite_registry_redirect(
     files: &BTreeMap<String, String>,
     overrides: &[DepOverride],
 ) -> RewriteResult {
+    rewrite_registry_redirect_with_python_metadata(files, overrides, &BTreeMap::new())
+}
+
+pub fn rewrite_registry_redirect_with_python_metadata(
+    files: &BTreeMap<String, String>,
+    overrides: &[DepOverride],
+    python_metadata: &BTreeMap<String, String>,
+) -> RewriteResult {
     let mut result = RewriteResult::default();
     rewrite_npm_lock(files, overrides, &mut result);
     rewrite_pnpm_lock(files, overrides, &mut result);
@@ -202,7 +210,7 @@ pub fn rewrite_registry_redirect(
     rewrite_yarn_berry(files, overrides, &mut result);
     rewrite_bun_lock(files, overrides, &mut result);
     rewrite_pypi_requirements(files, overrides, &mut result);
-    rewrite_uv_lock(files, overrides, &mut result);
+    rewrite_uv_lock(files, overrides, python_metadata, &mut result);
     rewrite_cargo(files, overrides, &mut result);
     rewrite_composer_lock(files, overrides, &mut result);
     rewrite_nuget(files, overrides, &mut result);
@@ -498,104 +506,7 @@ fn rewrite_pypi_requirements(
     overrides: &[DepOverride],
     result: &mut RewriteResult,
 ) {
-    let pypi: Vec<&DepOverride> = overrides.iter().filter(|o| o.ecosystem == "pypi").collect();
-    if pypi.is_empty() || !files.contains_key("requirements.txt") {
-        return;
-    }
-    let name_re = Regex::new(r"^([A-Za-z0-9._-]+)\s*(?:[=<>~!]=?|@|;|\s|$)")
-        .expect("static requirements-name regex is valid");
-    let mut lines: Vec<String> = files["requirements.txt"]
-        .split('\n')
-        .map(|s| s.to_string())
-        .collect();
-    let mut changed = false;
-    for dep in &pypi {
-        let Some(sha256) = dep.integrity.sha256.clone() else {
-            result.warnings.push(RewriteWarning {
-                code: "redirect_requirements_missing_sha256".into(),
-                detail: format!("{} has no sha256 integrity", dep.name),
-            });
-            continue;
-        };
-        let target = canonicalize_pypi_name(&dep.name);
-        let mut matched_any = false;
-        for raw in lines.iter_mut() {
-            let line = raw.trim();
-            if line.is_empty() || line.starts_with('#') || line.starts_with('-') {
-                continue;
-            }
-            let Some(caps) = name_re.captures(line) else {
-                continue;
-            };
-            if canonicalize_pypi_name(&caps[1]) != target {
-                continue;
-            }
-            matched_any = true;
-            // pip-compile --generate-hashes emits backslash continuations
-            // (`foo==1.2 \` + indented `--hash=…` lines). Rewriting only the
-            // first physical line would orphan the old hash lines and — with
-            // an environment marker — leave a mid-line `\` that makes pip
-            // fail with InvalidMarker. Refuse rather than corrupt.
-            if line.ends_with('\\') {
-                result.warnings.push(RewriteWarning {
-                    code: "redirect_requirements_continuation".into(),
-                    detail: format!(
-                        "{}@{} uses backslash continuations; not rewritten",
-                        dep.name, dep.version
-                    ),
-                });
-                continue;
-            }
-            // Take the marker from the requirement portion only — everything
-            // BEFORE any per-requirement ` --` option. Grabbing to end-of-line
-            // would swallow a previously appended `--hash=…` and duplicate it
-            // on every re-run.
-            let req_part = line.split(" --").next().unwrap_or(line).trim_end();
-            let marker = match req_part.find(';') {
-                Some(idx) => req_part[idx..].trim_end(),
-                None => "",
-            };
-            let rewritten = if marker.is_empty() {
-                format!("{} @ {} --hash=sha256:{sha256}", dep.name, dep.artifact_url)
-            } else {
-                format!(
-                    "{} @ {} {marker} --hash=sha256:{sha256}",
-                    dep.name, dep.artifact_url
-                )
-            };
-            if rewritten != *raw {
-                result.edits.push(FileEdit {
-                    path: "requirements.txt".into(),
-                    kind: "redirect_requirements_line".into(),
-                    action: "rewritten".into(),
-                    key: Some(dep.name.clone()),
-                    original: Some(Value::String(raw.clone())),
-                    new: Some(Value::String(rewritten.clone())),
-                });
-                *raw = rewritten;
-                changed = true;
-            }
-        }
-        // Parity with the npm/pnpm/berry/uv rewriters: a granted dep no line
-        // accounted for — omitted (a transitive dep the file never pins), or
-        // spelled in a form the name matcher cannot parse (a PEP 508 extras
-        // bracket) — must be SAID, not silently dropped from the redirected
-        // count. A found-but-refused line (continuation) already warned above.
-        if !matched_any {
-            result.warnings.push(RewriteWarning {
-                code: "redirect_requirements_entry_not_found".into(),
-                detail: format!(
-                    "no requirements.txt entry for {}@{}",
-                    dep.name, dep.version
-                ),
-            });
-        }
-    }
-    if changed {
-        result
-            .files
-            .insert("requirements.txt".into(), lines.join("\n"));
-    }
+    requirements::rewrite(files, overrides, result);
 }
 
 // ── cargo (Cargo.toml + .cargo/config.toml + Cargo.lock) ─────────────────────
@@ -2622,122 +2533,238 @@ fn is_prior_hosted_bun_spec(spec: &str, fname: &str, current_url: &str) -> bool 
 }
 
 // ── uv.lock ──────────────────────────────────────────────────────────────────
-fn rewrite_uv_lock(
-    files: &BTreeMap<String, String>,
-    overrides: &[DepOverride],
+fn python_lock_blocks(text: &str) -> Vec<&str> {
+    let mut starts = vec![0];
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        if offset != 0
+            && matches!(
+                line.trim(),
+                "[[package]]" | "[[packages]]" | "[[distribution]]"
+            )
+        {
+            starts.push(offset);
+        }
+        offset += line.len();
+    }
+    starts.push(text.len());
+    starts
+        .windows(2)
+        .map(|bounds| &text[bounds[0]..bounds[1]])
+        .collect()
+}
+
+fn record_python_lock_edits(
+    path: &str,
+    dep: &DepOverride,
+    original: &str,
+    rewritten: &str,
     result: &mut RewriteResult,
 ) {
-    let pypi: Vec<&DepOverride> = overrides.iter().filter(|o| o.ecosystem == "pypi").collect();
-    if pypi.is_empty() || !files.contains_key("uv.lock") {
-        return;
-    }
-    let mut content = files["uv.lock"].clone();
-    let wheel_re = Regex::new(r#"\{ url = "[^"]*", hash = "sha256:[^"]*"([^}]*) \}"#)
-        .expect("static uv wheel-entry regex is valid");
-    let name_re = Regex::new(r#"name = "([^"]+)""#).expect("static name-field regex is valid");
-    let mut changed = false;
-    for dep in &pypi {
-        let Some(sha256) = dep.integrity.sha256.clone() else {
-            result.warnings.push(RewriteWarning {
-                code: "redirect_uv_missing_sha256".into(),
-                detail: format!("{} has no sha256 integrity", dep.name),
-            });
-            continue;
-        };
-        // Find the [[package]] block for this name+version by string bounds
-        // (no lookahead in Rust regex). Iterate over [[package]] starts.
-        let target = canonicalize_pypi_name(&dep.name);
-        let mut matched = false;
-        let marker = "[[package]]\n";
-        let mut search = 0usize;
-        while let Some(rel) = content[search..].find(marker) {
-            let block_start = search + rel;
-            let body_start = block_start + marker.len();
-            let block_end = match content[body_start..].find("\n[[package]]") {
-                Some(r) => body_start + r + 1,
-                None => content.len(),
-            };
-            let block = content[block_start..block_end].to_string();
-            search = block_end;
-            let name_ok = name_re
-                .captures(&block)
-                .map(|c| canonicalize_pypi_name(&c[1]) == target)
-                .unwrap_or(false);
-            let version_ok = block.contains(&format!("version = \"{}\"\n", dep.version))
-                || block.contains(&format!("version = \"{}\"", dep.version));
-            if !name_ok || !version_ok {
-                continue;
-            }
-            // Split the head (`[[package]]\nname\nversion\n` — 3 lines) from the
-            // body, so the recorded edit is the BODY (matches the TS rewriter,
-            // whose regex captured head + body separately).
-            let head_end = {
-                let mut nl = 0;
-                let mut idx = block.len();
-                for (i, ch) in block.char_indices() {
-                    if ch == '\n' {
-                        nl += 1;
-                        if nl == 3 {
-                            idx = i + 1;
-                            break;
-                        }
-                    }
-                }
-                idx
-            };
-            let head = block[..head_end].to_string();
-            let body = block[head_end..].to_string();
-            if !wheel_re.is_match(&body) {
-                continue;
-            }
-            // Repoint EVERY url/hash entry in the block — sdist AND all
-            // wheels. uv prefers a wheel, so an upstream `wheels` entry left
-            // behind installs the unpatched artifact while the redirect is
-            // reported (and attested) as landed.
-            let new_body = wheel_re
-                .replace_all(
-                    &body,
-                    format!(
-                        "{{ url = \"{}\", hash = \"sha256:{sha256}\"${{1}} }}",
-                        dep.artifact_url
-                    )
-                    .as_str(),
-                )
-                .to_string();
-            if new_body == body {
-                // Already redirected (re-run): the entry exists at the target
-                // values — not "entry not found".
-                matched = true;
-                continue;
-            }
-            content = format!(
-                "{}{}{}{}",
-                &content[..block_start],
-                head,
-                new_body,
-                &content[block_end..]
-            );
-            matched = true;
-            changed = true;
+    let original_blocks = python_lock_blocks(original);
+    let rewritten_blocks = python_lock_blocks(rewritten);
+    let blocks = if original_blocks.len() == rewritten_blocks.len() {
+        original_blocks.into_iter().zip(rewritten_blocks).collect()
+    } else {
+        vec![(original, rewritten)]
+    };
+    for (original, rewritten) in blocks {
+        if original != rewritten {
             result.edits.push(FileEdit {
-                path: "uv.lock".into(),
+                path: path.to_string(),
                 kind: "redirect_uv_lock_wheel".into(),
                 action: "rewritten".into(),
                 key: Some(format!("{}@{}", dep.name, dep.version)),
-                original: Some(Value::String(body)),
-                new: Some(Value::String(new_body)),
-            });
-            break;
-        }
-        if !matched {
-            result.warnings.push(RewriteWarning {
-                code: "redirect_uv_entry_not_found".into(),
-                detail: format!("no uv.lock wheel entry for {}@{}", dep.name, dep.version),
+                original: Some(Value::String(original.to_string())),
+                new: Some(Value::String(rewritten.to_string())),
             });
         }
     }
-    if changed {
-        result.files.insert("uv.lock".into(), content);
+}
+
+struct PythonMetadataEdit {
+    path: String,
+    original: String,
+    rewritten: String,
+    script: bool,
+}
+
+fn plan_python_metadata(
+    path: &str,
+    lock: &str,
+    files: &BTreeMap<String, String>,
+    dep: &DepOverride,
+    result: &RewriteResult,
+) -> Result<(Option<PythonMetadataEdit>, Option<String>), RewriteWarning> {
+    use crate::utils::python_lock::{check_python_lock_source_scope, ArtifactSource};
+    use crate::utils::python_script::{rewrite_project_metadata, rewrite_script_metadata};
+
+    let script = path.ends_with(".py.lock");
+    let metadata_path = if script {
+        path.strip_suffix(".lock")
+            .expect("script lock suffix")
+            .to_string()
+    } else if path == "uv.lock" && files.contains_key("pyproject.toml") {
+        "pyproject.toml".to_string()
+    } else {
+        return Ok((None, None));
+    };
+    let Some(original) = result
+        .files
+        .get(&metadata_path)
+        .or_else(|| files.get(&metadata_path))
+        .cloned()
+    else {
+        return Err(RewriteWarning {
+            code: "redirect_uv_script_missing".into(),
+            detail: format!("{path} requires its paired {metadata_path}"),
+        });
+    };
+    let unsupported = |detail| RewriteWarning {
+        code: if script {
+            "redirect_uv_script_unsupported"
+        } else {
+            "redirect_uv_project_unsupported"
+        }
+        .into(),
+        detail: format!("{metadata_path}: {detail}"),
+    };
+    check_python_lock_source_scope(lock, &dep.name, &dep.version).map_err(unsupported)?;
+    let rewritten = if script {
+        rewrite_script_metadata(
+            &original,
+            &dep.name,
+            &dep.version,
+            ArtifactSource::Url(&dep.artifact_url),
+        )
+    } else {
+        rewrite_project_metadata(
+            &original,
+            &dep.name,
+            &dep.version,
+            ArtifactSource::Url(&dep.artifact_url),
+        )
+    }
+    .map_err(unsupported)?;
+    let project = (!script).then(|| rewritten.as_ref().unwrap_or(&original).clone());
+    let edit = rewritten.map(|rewritten| PythonMetadataEdit {
+        path: metadata_path,
+        original,
+        rewritten,
+        script,
+    });
+    Ok((edit, project))
+}
+
+fn record_python_metadata_edit(
+    edit: PythonMetadataEdit,
+    dep: &DepOverride,
+    result: &mut RewriteResult,
+) {
+    let (original, rewritten) = if edit.script {
+        let original_span = crate::utils::python_script::script_metadata(&edit.original)
+            .expect("validated script metadata")
+            .0;
+        let rewritten_span = crate::utils::python_script::script_metadata(&edit.rewritten)
+            .expect("validated script metadata")
+            .0;
+        (
+            edit.original[original_span].to_string(),
+            edit.rewritten[rewritten_span].to_string(),
+        )
+    } else {
+        (edit.original, edit.rewritten.clone())
+    };
+    result.edits.push(FileEdit {
+        path: edit.path.clone(),
+        kind: "redirect_uv_lock_wheel".into(),
+        action: "rewritten".into(),
+        key: Some(format!("{}@{}", dep.name, dep.version)),
+        original: Some(Value::String(original)),
+        new: Some(Value::String(rewritten)),
+    });
+    result.files.insert(edit.path, edit.rewritten);
+}
+
+fn rewrite_uv_lock(
+    files: &BTreeMap<String, String>,
+    overrides: &[DepOverride],
+    python_metadata: &BTreeMap<String, String>,
+    result: &mut RewriteResult,
+) {
+    use crate::utils::python_lock::{
+        complete_python_lock_metadata, is_python_lock_name, rewrite_python_lock, ArtifactSource,
+    };
+
+    for (path, original) in files.iter().filter(|(path, _)| is_python_lock_name(path)) {
+        let mut content = original.clone();
+        for dep in overrides.iter().filter(|dep| dep.ecosystem == "pypi") {
+            let Some(sha256) = dep.integrity.sha256.as_deref() else {
+                result.warnings.push(RewriteWarning {
+                    code: "redirect_uv_missing_sha256".into(),
+                    detail: format!("{} has no sha256 integrity", dep.name),
+                });
+                continue;
+            };
+            let rewritten = match rewrite_python_lock(
+                &content,
+                &dep.name,
+                &dep.version,
+                ArtifactSource::Url(&dep.artifact_url),
+                sha256,
+            ) {
+                Ok(Some(rewritten)) => rewritten,
+                Ok(None) => {
+                    result.warnings.push(RewriteWarning {
+                        code: "redirect_uv_entry_not_found".into(),
+                        detail: format!("no {path} archive entry for {}@{}", dep.name, dep.version),
+                    });
+                    continue;
+                }
+                Err(detail) => {
+                    result.warnings.push(RewriteWarning {
+                        code: "redirect_uv_lock_unsupported".into(),
+                        detail: format!("{path}: {detail}"),
+                    });
+                    continue;
+                }
+            };
+            let (metadata_edit, project) =
+                match plan_python_metadata(path, &content, files, dep, result) {
+                    Ok(plan) => plan,
+                    Err(warning) => {
+                        result.warnings.push(warning);
+                        continue;
+                    }
+                };
+            let rewritten = match complete_python_lock_metadata(
+                &rewritten,
+                project.as_deref(),
+                &dep.name,
+                &dep.version,
+                ArtifactSource::Url(&dep.artifact_url),
+                python_metadata.get(&dep.artifact_url).map(String::as_str),
+            ) {
+                Ok(rewritten) => rewritten,
+                Err(detail) => {
+                    result.warnings.push(RewriteWarning {
+                        code: "redirect_uv_metadata_unsupported".into(),
+                        detail: format!("{path}: {detail}"),
+                    });
+                    continue;
+                }
+            };
+            if let Some(edit) = metadata_edit {
+                record_python_metadata_edit(edit, dep, result);
+            }
+            if rewritten != content {
+                record_python_lock_edits(path, dep, &content, &rewritten, result);
+                content = rewritten;
+            }
+        }
+        if content != *original {
+            result.files.insert(path.clone(), content);
+        }
     }
 }
 
@@ -5917,116 +5944,6 @@ mod tests {
         );
     }
 
-    /// pip-compile --generate-hashes continuation lines are refused (warning)
-    /// rather than corrupted: rewriting only the first physical line would
-    /// orphan the old `--hash` lines, and with a marker pip hard-fails on the
-    /// mid-line backslash (InvalidMarker).
-    #[test]
-    fn requirements_continuation_lines_are_refused() {
-        let mut files = BTreeMap::new();
-        files.insert(
-            "requirements.txt".to_string(),
-            "requests==2.28.1 ; python_version >= \"3.7\" \\\n    --hash=sha256:OLDOLDOLD\n"
-                .to_string(),
-        );
-        let overrides = vec![pypi_override(
-            "requests",
-            "2.28.1",
-            "http://patch.test/requests-2.28.1-py3-none-any.whl",
-            &"c".repeat(64),
-        )];
-        let result = rewrite_registry_redirect(&files, &overrides);
-        assert!(
-            result.files.is_empty() && result.edits.is_empty(),
-            "continuation input must not be rewritten: {:?}",
-            result.files
-        );
-        assert!(
-            result
-                .warnings
-                .iter()
-                .any(|w| w.code == "redirect_requirements_continuation"),
-            "must surface the continuation refusal: {:?}",
-            result.warnings
-        );
-    }
-
-    /// A granted pypi dep whose requirements.txt line the name matcher cannot
-    /// parse (a PEP 508 extras bracket terminates the name run before any
-    /// terminator alternative) — or that the file omits entirely — must be
-    /// SAID with an entry-not-found warning, matching npm/pnpm/yarn/berry/
-    /// bun/uv/cargo/composer, not silently dropped from the redirected count.
-    #[test]
-    fn requirements_unmatched_dep_warns_entry_not_found() {
-        let mut files = BTreeMap::new();
-        files.insert(
-            "requirements.txt".to_string(),
-            "requests[security]==2.28.1\n".to_string(),
-        );
-        let overrides = vec![pypi_override(
-            "requests",
-            "2.28.1",
-            "http://patch.test/requests-2.28.1-py3-none-any.whl",
-            &"c".repeat(64),
-        )];
-        let r = rewrite_registry_redirect(&files, &overrides);
-        // The extras spelling itself is a recorded TS-parity residual (the
-        // line matching needs a coordinated TS+Rust fix) — the line stays.
-        assert!(
-            r.files.is_empty() && r.edits.is_empty(),
-            "extras line must not be rewritten: {:?}",
-            r.files
-        );
-        assert!(
-            warning_codes(&r).contains(&"redirect_requirements_entry_not_found"),
-            "the un-wired dep must be SAID, not silent: {:?}",
-            r.warnings
-        );
-    }
-
-    /// The not-found warning fires ONLY for a dep no line accounted for: a
-    /// rewritten line and a continuation-refused line (which carries its own
-    /// warning) both count as found.
-    #[test]
-    fn requirements_matched_or_refused_dep_gets_no_not_found_warning() {
-        let overrides = vec![pypi_override(
-            "requests",
-            "2.28.1",
-            "http://patch.test/requests-2.28.1-py3-none-any.whl",
-            &"c".repeat(64),
-        )];
-        // Plain match: rewritten, no not-found.
-        let mut files = BTreeMap::new();
-        files.insert(
-            "requirements.txt".to_string(),
-            "requests==2.28.1\n".to_string(),
-        );
-        let r = rewrite_registry_redirect(&files, &overrides);
-        assert!(!r.edits.is_empty(), "plain pin rewritten");
-        assert!(
-            !warning_codes(&r).contains(&"redirect_requirements_entry_not_found"),
-            "a rewritten dep is not not-found: {:?}",
-            r.warnings
-        );
-        // Continuation refusal: found-but-refused must not ALSO say not-found.
-        let mut files = BTreeMap::new();
-        files.insert(
-            "requirements.txt".to_string(),
-            "requests==2.28.1 \\\n    --hash=sha256:OLDOLDOLD\n".to_string(),
-        );
-        let r = rewrite_registry_redirect(&files, &overrides);
-        assert!(
-            warning_codes(&r).contains(&"redirect_requirements_continuation"),
-            "{:?}",
-            r.warnings
-        );
-        assert!(
-            !warning_codes(&r).contains(&"redirect_requirements_entry_not_found"),
-            "a refused-with-cause dep is not not-found: {:?}",
-            r.warnings
-        );
-    }
-
     fn berry_override(name: &str, version: &str, url: &str, checksum: &str) -> DepOverride {
         DepOverride {
             integrity: Integrity {
@@ -6823,14 +6740,8 @@ mod tests {
         }
     }
 
-    /// A realistic uv.lock block carries BOTH an `sdist` entry and a `wheels`
-    /// entry. Every `{ url, hash }` in the block must be repointed at the
-    /// hosted patch: uv PREFERS a wheel, so leaving `wheels` at the upstream
-    /// URL/hash makes the install silently use the UNPATCHED artifact while
-    /// the scan confirms the dep as redirected (the artifact URL landed in
-    /// the sdist slot).
     #[test]
-    fn uv_lock_sdist_and_wheels_all_repointed() {
+    fn uv_lock_uses_direct_source_and_matching_archive() {
         let lock = "version = 1\nrequires-python = \">=3.8\"\n\n[[package]]\nname = \"requests\"\nversion = \"2.28.1\"\nsource = { registry = \"https://pypi.org/simple\" }\nsdist = { url = \"https://files.pythonhosted.org/packages/aa/requests-2.28.1.tar.gz\", hash = \"sha256:aaaa\" }\nwheels = [\n    { url = \"https://files.pythonhosted.org/packages/bb/requests-2.28.1-py3-none-any.whl\", hash = \"sha256:bbbb\" },\n]\n";
         let mut files = BTreeMap::new();
         files.insert("uv.lock".to_string(), lock.to_string());
@@ -6845,13 +6756,13 @@ mod tests {
         assert_eq!(
             out.matches(url).count(),
             2,
-            "sdist AND wheel repointed: {out}"
+            "direct source and wheel URL agree: {out}"
         );
         assert_eq!(
             out.matches(&format!("hash = \"sha256:{}\"", "c".repeat(64)))
                 .count(),
-            2,
-            "both hashes pinned: {out}"
+            1,
+            "one patched wheel hash is pinned: {out}"
         );
 
         // Re-run over the rewritten output: a no-op, and NOT reported as
@@ -11416,8 +11327,7 @@ packages:
         );
         files.insert(
             "yarn.lock".to_string(),
-            "left-pad@^1.3.0:\n  version \"1.3.0\"\n  resolved \"https://x/lp.tgz\"\n"
-                .to_string(),
+            "left-pad@^1.3.0:\n  version \"1.3.0\"\n  resolved \"https://x/lp.tgz\"\n".to_string(),
         );
         files.insert(
             "bun.lock".to_string(),
@@ -11520,8 +11430,7 @@ packages:
         files.insert("composer.lock".to_string(), "{}\n".to_string());
         files.insert(
             "go.mod".to_string(),
-            "module example.com/app\n\ngo 1.21\n\nrequire github.com/foo/bar v1.4.2\n"
-                .to_string(),
+            "module example.com/app\n\ngo 1.21\n\nrequire github.com/foo/bar v1.4.2\n".to_string(),
         );
         let overrides = vec![
             cargo_dep,
@@ -11643,7 +11552,11 @@ packages:
         );
         files.insert(
             ".cargo/config.toml".to_string(),
-            format!("[registries.{}]\nindex = \"{}\"\n", cargo_reg(), cargo_index_url()),
+            format!(
+                "[registries.{}]\nindex = \"{}\"\n",
+                cargo_reg(),
+                cargo_index_url()
+            ),
         );
         let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
         assert!(
@@ -11707,9 +11620,7 @@ packages:
             "the alias table gains the registry line: {toml}"
         );
         assert!(
-            toml.contains(
-                "[dependencies.serde]\npackage = \"leftpad\"\nversion = \"1.0.0\""
-            ),
+            toml.contains("[dependencies.serde]\npackage = \"leftpad\"\nversion = \"1.0.0\""),
             "the key-colliding rename of another crate is untouched: {toml}"
         );
         assert!(r.warnings.is_empty(), "{:?}", r.warnings);
@@ -12225,7 +12136,11 @@ packages:
         let out = r.files.get("uv.lock").expect("uv.lock rewritten");
         assert!(out.contains(alpha), "alpha block byte-identical: {out}");
         assert!(out.contains(zulu), "zulu block byte-identical: {out}");
-        assert_eq!(out.matches(url).count(), 2, "sdist + wheel repointed: {out}");
+        assert_eq!(
+            out.matches(url).count(),
+            2,
+            "source and wheel repointed: {out}"
+        );
         assert_eq!(r.edits.len(), 1, "{:?}", r.edits);
         assert!(r.warnings.is_empty(), "{:?}", r.warnings);
     }
@@ -12328,7 +12243,10 @@ packages:
             .to_string(),
         );
         let r = rewrite_registry_redirect(&files, &[nuget_override()]);
-        let config = r.files.get("nuget.config").expect("default config authored");
+        let config = r
+            .files
+            .get("nuget.config")
+            .expect("default config authored");
         assert!(
             config.contains(
                 "<add key=\"nuget.org\" value=\"https://api.nuget.org/v3/index.json\" />"

@@ -67,6 +67,7 @@ pub mod nuget_feed;
 pub mod pnpm_lock;
 pub mod pnpm_lock_legacy;
 pub mod pypi;
+mod pypi_lock;
 pub mod pypi_pdm;
 pub mod pypi_pipenv;
 pub mod pypi_poetry;

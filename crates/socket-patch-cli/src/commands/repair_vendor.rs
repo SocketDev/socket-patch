@@ -128,7 +128,24 @@ const WIRING_FILES: &[&str] = &[
 pub(crate) async fn scan_vendor_references(project_root: &Path) -> Vec<(String, String, String)> {
     let mut seen: HashSet<(String, String)> = HashSet::new();
     let mut out = Vec::new();
-    for file in WIRING_FILES {
+    let mut files: Vec<String> = WIRING_FILES
+        .iter()
+        .map(|file| (*file).to_string())
+        .collect();
+    if let Ok(paths) = socket_patch_core::utils::python_lock::python_lock_paths(project_root) {
+        for path in paths {
+            if let Some(script) = path
+                .strip_suffix(".py.lock")
+                .map(|prefix| format!("{prefix}.py"))
+            {
+                files.push(script);
+            }
+            files.push(path);
+        }
+    }
+    files.sort();
+    files.dedup();
+    for file in files {
         let Ok(text) = tokio::fs::read_to_string(project_root.join(file)).await else {
             continue;
         };
@@ -202,6 +219,26 @@ fn synth_entry(eco: &str, uuid: &str, artifact_path: &str, base_purl: &str) -> V
 /// routes to the package-lock backend, whose guard also fails closed on
 /// unwired entries.
 async fn detect_reference_flavor(project_root: &Path, eco: &str, uuid: &str) -> Option<String> {
+    if eco == "pypi" {
+        let needle = format!(".socket/vendor/pypi/{uuid}/");
+        for file in socket_patch_core::utils::python_lock::python_lock_paths(project_root).ok()? {
+            if tokio::fs::read_to_string(project_root.join(&file))
+                .await
+                .ok()
+                .is_some_and(|text| text.contains(&needle))
+            {
+                return Some(
+                    if file == "uv.lock" {
+                        "uv"
+                    } else {
+                        "python-lock"
+                    }
+                    .to_string(),
+                );
+            }
+        }
+        return None;
+    }
     if eco != "npm" {
         return None;
     }
@@ -1408,6 +1445,32 @@ fn npm_coords(base_purl: &str) -> Option<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn scan_recovers_script_and_pep751_vendor_references() {
+        let tmp = tempfile::tempdir().unwrap();
+        let uuid = "11111111-1111-4111-8111-111111111111";
+        let path = format!(".socket/vendor/pypi/{uuid}/requests-2.28.1-py3-none-any.whl");
+        for file in ["example.py.lock", "pylock.dev.toml"] {
+            tokio::fs::write(
+                tmp.path().join(file),
+                format!("archive = {{ path = '{path}' }}"),
+            )
+            .await
+            .unwrap();
+        }
+        let references = scan_vendor_references(tmp.path()).await;
+        assert_eq!(
+            references,
+            vec![("pypi".to_string(), uuid.to_string(), path)]
+        );
+        assert_eq!(
+            detect_reference_flavor(tmp.path(), "pypi", uuid)
+                .await
+                .as_deref(),
+            Some("python-lock")
+        );
+    }
 
     /// pnpm writes vendored paths in THREE spellings — override values,
     /// `tarball:` fields, and snapshot KEYS with a trailing colon. The
