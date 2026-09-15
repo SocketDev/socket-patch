@@ -1106,8 +1106,15 @@ async fn inventory_pypi_locks(project_root: &Path) -> Option<Vec<LockfileEntry>>
             }
         }
     }
-    // uv.lock stays the EXCLUSIVE project inventory (its precedence over
-    // poetry.lock / requirements.txt predates standalone-lock support). A
+    // A PARSEABLE uv.lock stays the EXCLUSIVE project inventory (its
+    // precedence over poetry.lock / requirements.txt predates standalone-lock
+    // support). Exclusivity is keyed on parse SUCCESS, not on the file's
+    // presence: an unparseable uv.lock contributed nothing above, so it falls
+    // through to poetry.lock / requirements.txt exactly like a package-less
+    // poetry.lock does (`depless_poetry_lock_falls_through_to_requirements`).
+    // Keying on presence would hide every requirements pin behind a corrupt
+    // lock AND diverge from hosted, which skips an unparseable uv.lock with
+    // `redirect_uv_lock_unsupported` and still reads the other pins. A
     // PEP 723 script lock or a PEP 751 lock is scoped to its own install,
     // so it SUPPLEMENTS the project's tool lock: a stray `tool.py.lock`
     // must not hide every poetry.lock / requirements.txt pin from scan's
@@ -4476,6 +4483,61 @@ mod python_lock_union_tests {
         assert_eq!(
             names(&entries),
             vec![("flask".to_string(), "3.0.0".to_string())]
+        );
+    }
+
+    /// Without a uv.lock, poetry.lock is the project's tool lock: it hides
+    /// requirements.txt (the base's poetry → requirements ordering) while a
+    /// script lock still UNIONS with it — the standalone lock supplements
+    /// whichever tool lock the project has, never just uv.lock.
+    #[tokio::test]
+    async fn poetry_lock_unions_with_script_lock_and_hides_requirements() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            tmp.path().join("poetry.lock"),
+            "[[package]]\nname = \"requests\"\nversion = \"2.31.0\"\n\n[metadata]\nlock-version = \"2.0\"\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            tmp.path().join("tool.py.lock"),
+            uv_style_lock("flask", "3.0.0"),
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(tmp.path().join("requirements.txt"), "click==8.1.7\n")
+            .await
+            .unwrap();
+        let entries = inventory_pypi_locks(tmp.path()).await.unwrap();
+        assert_eq!(
+            names(&entries),
+            vec![
+                ("flask".to_string(), "3.0.0".to_string()),
+                ("requests".to_string(), "2.31.0".to_string()),
+            ]
+        );
+    }
+
+    /// Exclusivity is keyed on a uv.lock that PARSES, not on the file's
+    /// presence: garbage TOML contributes nothing and must not hide the
+    /// requirements.txt pins behind it (hosted skips the same file with
+    /// `redirect_uv_lock_unsupported`, so the inventories agree).
+    #[tokio::test]
+    async fn unparseable_uv_lock_falls_through_to_requirements() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            tmp.path().join("uv.lock"),
+            "version = 1\n[[package]\nname = \"flask\"\n= broken\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(tmp.path().join("requirements.txt"), "requests==2.31.0\n")
+            .await
+            .unwrap();
+        let entries = inventory_pypi_locks(tmp.path()).await.unwrap();
+        assert_eq!(
+            names(&entries),
+            vec![("requests".to_string(), "2.31.0".to_string())]
         );
     }
 
