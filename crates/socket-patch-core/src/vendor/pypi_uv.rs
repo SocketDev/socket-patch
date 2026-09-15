@@ -1140,7 +1140,13 @@ fn rewrite_root_metadata_entries(
     // the package unit's source plus the pyproject `[tool.uv.sources]` entry
     // carry the redirect alone. A lock that HAS metadata but lacks the entry
     // is a stale lock and still refuses below.
-    if !unit_text.contains("[package.metadata]") {
+    //
+    // "No metadata" means neither the bare header NOR any `[package.metadata.`
+    // sub-table: `"[package.metadata.requires-dev]".contains("[package.metadata]")`
+    // is false (`.` vs `]`), so keying on the bare header alone would
+    // silently skip the requires-dev repoint should a uv release ever omit
+    // the empty header line — a stale specifier with no refusal.
+    if !unit_text.contains("[package.metadata]") && !unit_text.contains("[package.metadata.") {
         return Ok(Vec::new());
     }
     let needle = format!("name = \"{canon}\"");
@@ -5367,5 +5373,28 @@ six = { path = ".socket/vendor/pypi/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/six-1.1
             "{detail}"
         );
         assert!(!detail.contains("record absolute"), "{detail}");
+    }
+
+    /// `"[package.metadata.requires-dev]".contains("[package.metadata]")` is
+    /// FALSE (`.` vs `]`), so a no-op gate keyed on the bare header alone
+    /// would silently skip the requires-dev repoint if a uv release ever
+    /// omitted the empty `[package.metadata]` line — a stale specifier and a
+    /// red `--locked` with no refusal. A root unit carrying ONLY the
+    /// sub-table must still have its group entry repointed.
+    #[test]
+    fn requires_dev_is_repointed_without_a_bare_package_metadata_header() {
+        let lock = DEV_GROUP_REGISTRY_LOCK.replacen("[package.metadata]\n\n", "", 1);
+        assert!(
+            !lock.contains("[package.metadata]\n"),
+            "fixture must lack the bare header"
+        );
+        let edits = rewrite_root_metadata_entries(&lock, "six", REL_WHEEL).unwrap();
+        assert_eq!(edits.len(), 1, "the requires-dev group entry must be repointed");
+        assert_eq!(edits[0].kind, "uv_lock_requires_dev");
+        assert_eq!(
+            edits[0].new_entry,
+            format!("dev = [{{ name = \"six\", path = \"{REL_WHEEL}\" }}]")
+        );
+        assert_eq!(edits[0].specifier.as_deref(), Some("==1.16.0"));
     }
 }
