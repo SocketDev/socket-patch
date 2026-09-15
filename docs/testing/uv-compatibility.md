@@ -159,19 +159,19 @@ not just with a URL or a success message.
 
 The complete run finished on **2026-09-15**, using **macOS-26.6.2-arm64-arm-64bit** and
 Python **3.9.6**. It tested socket-patch source commit
-`af9c79b8dabf266d991b0ceb5fac6732b06f70bb` (`socket-patch 4.0.0`), with binary
+`310b9042abc8803aa5e302a5902b9f53584f6908` (`socket-patch 4.0.0`), with binary
 SHA-256:
 
 ```text
-7da27a3343d7007ddfdc275a2caae3e196894f540d6a9d2ec9ab3f0df6ebdc3b
+79e900f11714ee1575b57e7f494364094ca7d0ff953abddef597b839c5211379
 ```
 
-All **570 installed-byte comparisons passed**, with zero mismatches. All **234
+All **583 installed-byte comparisons passed**, with zero mismatches. All **240
 recorded lock-preservation checks passed** (`--frozen` and `--locked` installs
 where the binary provides them; `--frozen` never writes the lock, so the
 `--locked` rows are the ones that measure preservation). Ordinary installs
 also delivered the patched bytes. The [machine-readable results](uv-compatibility/results.json)
-contain all 1290 observations and their command definitions. The
+contain all 1324 observations and their command definitions. The
 [binary catalog](uv-compatibility/binaries.json) records each uv wheel's public
 PyPI source and verified hash.
 
@@ -193,7 +193,8 @@ compilation. PEP 751 covers both standalone locks and exported locks.
 | 0.2.17 | `distribution`, v1 | Pass / refused | Pass / Pass | — / — | — / — | — / — | 6 |
 | 0.2.18 | `distribution`, v1 | Pass / refused | Pass / Pass | — / — | — / — | — / — | 6 |
 | 0.2.34 | `distribution`, v1 | Pass / refused | Pass / Pass | — / — | — / — | — / — | 7 |
-| 0.2.35 | `package`, v1 | Pass / refused | Pass / Pass | — / — | — / — | — / — | 7 |
+| 0.2.35 | `package`, v1 | Pass / Pass¹ | Pass / Pass | — / — | — / — | — / — | 10 |
+| 0.2.36 | `package`, v1 | Pass / Pass¹ | Pass / Pass | — / — | — / — | — / — | 10 |
 | 0.2.37 | `package`, v1 | Pass / Pass¹ | Pass / Pass | — / — | — / — | — / — | 10 |
 | 0.3.0 | `package`, v1 | Pass / Pass¹ | Pass / Pass | — / — | — / — | — / — | 10 |
 | 0.3.5 | `package`, v1 | Pass / Pass | Pass / Pass | — / — | — / — | — / — | 10 |
@@ -234,7 +235,7 @@ The nonzero outcomes were the documented boundaries:
   installs — in all three shapes: sub-table artifacts (through 0.2.5), inline
   artifacts with string sources (0.2.6–0.2.17), and inline-table sources
   (0.2.18–0.2.34) — and both requirements modes installed the patch.
-- ¹ uv 0.2.35, 0.2.37 and 0.3.0 cannot build the root fixture from an empty
+- ¹ uv 0.2.35, 0.2.36, 0.2.37 and 0.3.0 cannot build the root fixture from an empty
   cache under `--offline` (`setuptools>=40.8.0` was absent). The
   network-enabled retry (`project-vendored-frozen-sync-root-build-networked`)
   installed the patched wheel; the subsequent locked and ordinary installation

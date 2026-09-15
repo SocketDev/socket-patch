@@ -58,8 +58,12 @@ into the new version's section — see docs/releasing.md.
   and uv-compiled hashed `requirements.txt`, so `uv sync --frozen|--locked`,
   `uv run --script`, and `uv pip sync --require-hashes` install the patched
   wheel instead of the registry artifact. Verified against real uv binaries
-  from every 0.x release family (0.0 through 0.12), first and latest release
-  of each — see `docs/testing/uv-compatibility.md`. Follow-up hardening:
+  from every 0.x release family (0.0 through 0.12) — first and latest release
+  of each plus every observed behaviour boundary — see
+  `docs/testing/uv-compatibility.md`: hosted mode covers every uv release
+  since 0.1 (all three `[[distribution]]` lock shapes and `[[package]]`),
+  vendored native covers every `[[package]]` release (uv ≥ 0.2.35), vendored
+  requirements cover uv ≥ 0.1.24. Follow-up hardening:
   `vendor --revert` refuses to delete a vendored Python wheel a lock still
   references when the ledger entry has no wiring to replay (the shape
   `repair` rebuilds), a script or PEP 751 lock supplements rather than hides
