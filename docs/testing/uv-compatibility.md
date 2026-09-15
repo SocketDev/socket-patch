@@ -33,12 +33,33 @@ frozen, locked, and ordinary installation outcomes separately where supported.
 ## Limits
 
 - uv 0.0 has no native `uv.lock`; its compatibility lane is compiled requirements.
-  uv 0.0.5 rejects the bare local wheel paths emitted by vendored requirements;
-  use hosted mode or upgrade uv. Vendored requirements passed from uv 0.1.45
-  onward in this matrix.
+  `uv pip sync` rejects the bare local wheel paths emitted by vendored
+  requirements through uv 0.1.23 (`Unexpected '.', expected '-c', '-e', '-r'
+  or the start of a requirement`) and accepts them from 0.1.24; use hosted mode
+  or upgrade uv for older binaries.
+- uv 0.1.x and 0.2.0–0.2.34 write the experimental `[[distribution]]` lock
+  grammar; `[[package]]` starts at 0.2.35. The grammar went through three
+  shapes, and the hosted rewriter follows the entry's own shape on each axis:
+  string sources with sub-table artifacts (`source = "registry+…"`,
+  `[distribution.sdist]`, `[[distribution.wheel]]`, source-qualified
+  `[[distribution.dependencies]]`) through 0.2.5; string sources with inline
+  artifacts (`sdist = { … }`, `wheels = [ … ]`) from 0.2.6 through 0.2.17; and
+  inline-table sources (`source = { registry = … }`) from 0.2.18. Emitting the
+  wrong shape is not a parse error the user sees: 0.2.18–0.2.34 reject the
+  string source and silently ignore the lock (`--frozen` / `--locked` fail,
+  an ordinary `uv sync` still installs the patch via the pyproject source),
+  and 0.2.6–0.2.17 ignore an unexpected `[[distribution.wheel]]` and try to
+  build the direct wheel URL as a source archive. The `[[distribution]]`
+  grammar is hosted-only: vendored native wiring is refused with
+  `pypi_uv_legacy_lock_unsupported`, because every shape records absolute file
+  paths for local artifacts.
 - Native lock versions other than `version = 1`, and PEP 751 versions other than
-  `lock-version = "1.0"`, are refused. Native lock revisions and command
-  availability are measured separately by the matrix below.
+  `lock-version = "1.0"`, are refused. Lock `revision` values 1 (0.6.0–0.6.14),
+  2 (0.6.15–0.8.3) and 3 (0.8.4 onward) are all covered by the matrix below.
+- Command availability boundaries observed with real binaries: `uv export`
+  from 0.4.1; `uv lock --script` from 0.5.17; PEP 751 `uv pip compile
+  --output-file pylock.toml` from 0.6.15. Earlier binaries record those lanes
+  as unavailable, not as failures.
 - A script lock requires its paired script and a valid PEP 723 metadata block.
   Missing metadata or an incompatible existing source is reported before either
   file is rewritten.
@@ -53,13 +74,23 @@ frozen, locked, and ordinary installation outcomes separately where supported.
   pins, opaque URLs, and ambiguous unpinned rows are reported as
   `redirect_requirements_version_ambiguous` and preserved.
 - A script lock does not replace the main project's lockfile selection merely
-  by sharing its directory. An unrelated script lock does not block vendoring
-  a package from the project's requirements or Poetry lock. When multiple
+  by sharing its directory: its packages supplement the `poetry.lock` or
+  `requirements.txt` inventory rather than hiding it, and an unrelated script
+  lock does not block vendoring a package from the project's requirements or
+  Poetry lock. `uv.lock` keeps its exclusive precedence. When multiple
   applicable package-manager locks coexist, the CLI reports its precedence
   choice and the locks it leaves unchanged.
-- Vendored installation needs the committed artifact tree. Older uv versions
-  can also require build dependencies for the root project; an unavailable
-  offline build dependency is distinct from failure to install the patched wheel.
+- Vendored installation needs the committed artifact tree. uv 0.2.x and 0.3.0
+  cannot build the ROOT fixture from an empty cache under `--offline`
+  (`setuptools>=40.8.0` is a build dependency of the fixture, not of the
+  patched wheel); the harness retries that install with network access and
+  records it as `project-vendored-frozen-sync-root-build-networked`, distinct
+  from any failure to install the patched wheel.
+- `vendor --revert` refuses to delete a vendored Python wheel while `uv.lock`,
+  a PEP 751 lock, a script, or `requirements.txt` still references it and the
+  ledger entry has no wiring to replay (the shape `socket-patch repair`
+  rebuilds when `state.json` is lost); `vendor_wiring_unknown_revert_blocked`
+  names the file. Restore the pre-vendor files (or re-lock) first.
 
 Revert state retains the original wiring. Script and lock edits are treated as a
 pair: conflicting changes preserve both files and their recovery state rather
@@ -68,28 +99,39 @@ preserving another package's vendored entries.
 
 ## Reproduce the release-family matrix
 
-The matrix pins these 14 binaries: `0.0.5`, `0.1.45`, `0.2.37`, `0.3.5`,
-`0.4.30`, `0.5.31`, `0.6.0`, `0.6.17`, `0.7.22`, `0.8.24`, `0.9.30`,
-`0.10.12`, `0.11.33`, and `0.12.13`. They cover uv 0.0 through 0.12 and the
-additional 0.6 lock-revision boundary. This is release-family coverage, not a
-claim that every patch release was tested.
+The matrix pins 40 binaries: the first and the latest release of every uv 0.x
+family (0.0 through 0.12), plus the releases on either side of every behaviour
+boundary the probes found — `0.1.23`/`0.1.24` (local wheel paths in
+requirements), `0.2.5`/`0.2.6` (sub-table → inline lock artifacts),
+`0.2.17`/`0.2.18` (string → inline-table lock sources),
+`0.2.34`/`0.2.35` (`[[distribution]]` → `[[package]]`),
+`0.4.0`/`0.4.1` (`uv export`), `0.5.16`/`0.5.17` (`uv lock --script`),
+`0.6.14`/`0.6.15` (PEP 751 export; lock revision 2) and `0.8.3`/`0.8.4` (lock
+revision 3). The full list is `VERSIONS` in `scripts/backtest-uv.py`; the
+boundaries were bisected with `scripts/probe-uv-boundaries.py`, which records
+the lock grammar, lock revision, command availability, and local-wheel
+requirement support of any set of uv releases. This is release-family plus
+boundary coverage, not a claim that every patch release was tested.
 
 From the repository root on macOS or Linux:
 
 ```sh
 cargo build -p socket-patch-cli
+cp target/debug/socket-patch /tmp/socket-patch-backtest-bin
 python3 scripts/backtest-uv.py \
-  --socket-patch target/debug/socket-patch \
+  --socket-patch /tmp/socket-patch-backtest-bin \
   --socket-patch-revision "$(git rev-parse HEAD)" \
   --python /path/to/python3 \
   --output /tmp/socket-patch-uv-backtest
 ```
 
 Use Python 3.9 to match the recorded probes; the fixtures declare it as their
-minimum.
-`--versions` can select a smaller diagnostic run. The script downloads pinned uv
-binaries and the pristine urllib3 wheel from PyPI and verifies their registry
-hashes. It runs against the public patch proxy without an API token.
+minimum. Copy the CLI out of `target/` first so a rebuild cannot swap the binary
+under a running matrix. The default list takes roughly half an hour with the
+harness's four workers; `--versions` selects a smaller diagnostic run. The
+script downloads pinned uv binaries and the pristine urllib3 wheel from PyPI and
+verifies their registry hashes. It runs against the public patch proxy without
+an API token.
 
 For each binary, the run records command lines, exit codes, output, artifact
 hashes, and installed `urllib3/response.py` hashes. It exercises native locks,

@@ -505,6 +505,34 @@ pub fn rewrite_python_lock(
         .get_mut(*index)
         .expect("matching package index exists");
     let original_source = package.get("source").cloned();
+    // uv 0.2.20 through 0.2.34 kept the `[[distribution]]` table name but had
+    // already moved to inline-table sources (`source = { registry = … }`,
+    // `wheels = [{ … }]`, `dependencies = [{ name = … }]`). Those binaries
+    // reject the string grammar (`source = "direct+…"`, `[[distribution.wheel]]`)
+    // with "data did not match any variant of untagged enum SourceWire" and
+    // then IGNORE the lock: an ordinary `uv sync` re-resolves from the
+    // pyproject source (still the patch), but `--frozen` / `--locked` fail.
+    // Follow the entry's OWN source shape, not the table name.
+    let legacy_strings = legacy
+        && original_source
+            .as_ref()
+            .and_then(source_identity)
+            .is_some_and(|(kind, _)| kind == "legacy");
+    // The artifact shape flipped separately: uv 0.2.14–0.2.17 still write
+    // string sources but already use inline `sdist = { … }` / `wheels = [ … ]`
+    // instead of `[distribution.sdist]` / `[[distribution.wheel]]` tables.
+    // uv 0.2.17 parses an unexpected `[[distribution.wheel]]` but ignores it,
+    // then treats the direct wheel URL as a source archive ("Unsupported
+    // archive type: …whl"). Decide from the entry's own artifact keys, then
+    // from any sibling entry in the document.
+    let legacy_artifact_tables = legacy
+        && (package.get("wheel").is_some_and(Item::is_array_of_tables)
+            || package.get("sdist").is_some_and(Item::is_table)
+            || (package.get("wheel").is_none()
+                && package.get("wheels").is_none()
+                && package.get("sdist").is_none()
+                && (text.contains("[[distribution.wheel]]")
+                    || text.contains("[distribution.sdist]"))));
     if !pep751
         && !original_source.as_ref().is_some_and(|source| {
             source_identity(source).is_some_and(|(kind, value)| {
@@ -551,11 +579,14 @@ pub fn rewrite_python_lock(
             ])),
         );
     } else {
-        let source = if legacy {
-            match artifact {
-                ArtifactSource::Url(_) => Item::Value(Value::from(format!("direct+{location}"))),
-                ArtifactSource::Path(_) => return Err("uv 0.1 lockfiles require absolute file URLs; portable vendoring needs uv >=0.2".to_string()),
-            }
+        let source = if legacy && matches!(artifact, ArtifactSource::Path(_)) {
+            // Both `[[distribution]]` shapes record ABSOLUTE paths/file URLs
+            // for local artifacts (uv 0.2.34 writes `source = { path = "/abs/…" }`
+            // and `wheels = [{ url = "file:///abs/…" }]`), so a committed
+            // relative wheel cannot be expressed portably before 0.2.35.
+            return Err("uv `[[distribution]]` lockfiles (uv < 0.2.35) record absolute file paths; portable vendoring needs uv >=0.2.35".to_string());
+        } else if legacy_strings {
+            Item::Value(Value::from(format!("direct+{location}")))
         } else {
             Item::Value(inline(&[(artifact.key(), Value::from(location.clone()))]))
         };
@@ -574,7 +605,7 @@ pub fn rewrite_python_lock(
             (artifact_key, Value::from(artifact_location)),
             ("hash", Value::from(format!("sha256:{sha256}"))),
         ]);
-        if legacy && wheel {
+        if legacy_artifact_tables && wheel {
             let mut table = Table::new();
             table["url"] = toml_edit::value(artifact_location);
             table["hash"] = toml_edit::value(format!("sha256:{sha256}"));
@@ -585,6 +616,11 @@ pub fn rewrite_python_lock(
             let mut array = Array::new();
             array.push_formatted(entry);
             package.insert("wheels", Item::Value(Value::Array(array)));
+        } else if legacy_artifact_tables {
+            let mut table = Table::new();
+            table["url"] = toml_edit::value(artifact_location);
+            table["hash"] = toml_edit::value(format!("sha256:{sha256}"));
+            package.insert("sdist", Item::Table(table));
         } else {
             package.insert("sdist", Item::Value(entry));
         }
@@ -735,6 +771,129 @@ hash = "sha256:old"
         assert!(!rewritten.contains("registry+"));
         assert!(!rewritten.contains("distribution.sdist"));
         assert!(rewritten.contains("[[distribution.wheel]]"));
+        assert_eq!(
+            rewrite_python_lock(
+                &rewritten,
+                "urllib3",
+                "1.26.18",
+                ArtifactSource::Url(URL),
+                SHA256
+            )
+            .unwrap()
+            .unwrap(),
+            rewritten
+        );
+    }
+
+    /// uv 0.2.20–0.2.34 (`uv lock` as shipped): `[[distribution]]` tables
+    /// with INLINE-TABLE sources. Emitting the string grammar here made those
+    /// binaries reject the lock ("data did not match any variant of untagged
+    /// enum SourceWire") and re-resolve, so `--frozen` / `--locked` failed.
+    #[test]
+    fn hybrid_distribution_lock_keeps_inline_table_sources() {
+        let text = r#"version = 1
+requires-python = ">=3.9"
+
+[[distribution]]
+name = "socket-uv-patch-fixture"
+version = "0.1.0"
+source = { editable = "." }
+dependencies = [
+    { name = "urllib3" },
+]
+
+[[distribution]]
+name = "urllib3"
+version = "1.26.18"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/urllib3-1.26.18.tar.gz", hash = "sha256:old", size = 305687 }
+wheels = [
+    { url = "https://files.pythonhosted.org/urllib3-1.26.18-py2.py3-none-any.whl", hash = "sha256:old", size = 143835 },
+]
+"#;
+        let rewritten =
+            rewrite_python_lock(text, "urllib3", "1.26.18", ArtifactSource::Url(URL), SHA256)
+                .unwrap()
+                .unwrap();
+        assert!(rewritten.contains("[[distribution]]"), "{rewritten}");
+        assert!(
+            rewritten.contains(&format!("source = {{ url = \"{URL}\" }}")),
+            "{rewritten}"
+        );
+        assert!(
+            rewritten.contains(&format!("{{ url = \"{URL}\", hash = \"sha256:{SHA256}\" }}")),
+            "{rewritten}"
+        );
+        assert!(!rewritten.contains("direct+"), "{rewritten}");
+        assert!(!rewritten.contains("[[distribution.wheel]]"), "{rewritten}");
+        assert!(!rewritten.contains("sdist"), "{rewritten}");
+        assert!(!rewritten.contains("pythonhosted"), "{rewritten}");
+        // The root entry's edge and source are untouched; re-run is a no-op.
+        assert!(rewritten.contains("source = { editable = \".\" }"));
+        assert_eq!(
+            rewrite_python_lock(
+                &rewritten,
+                "urllib3",
+                "1.26.18",
+                ArtifactSource::Url(URL),
+                SHA256
+            )
+            .unwrap()
+            .unwrap(),
+            rewritten
+        );
+        // Vendoring stays refused for every `[[distribution]]` shape.
+        let refused = rewrite_python_lock(
+            text,
+            "urllib3",
+            "1.26.18",
+            ArtifactSource::Path(".socket/vendor/pypi/x/urllib3-1.26.18-py2.py3-none-any.whl"),
+            SHA256,
+        )
+        .unwrap_err();
+        assert!(refused.contains("0.2.35"), "{refused}");
+    }
+
+    /// uv 0.2.14–0.2.17: string sources, but INLINE `sdist = {…}` /
+    /// `wheels = [{…}]` artifacts and bare `[[distribution.dependencies]]`
+    /// edges. Emitting `[[distribution.wheel]]` here left the binary with a
+    /// direct URL and no wheel, which it tried to build as an sdist
+    /// ("Unsupported archive type: urllib3-….whl").
+    #[test]
+    fn string_source_inline_artifact_lock_keeps_inline_wheels() {
+        let text = r#"version = 1
+requires-python = ">=3.9"
+
+[[distribution]]
+name = "socket-uv-patch-fixture"
+version = "0.1.0"
+source = "editable+."
+
+[[distribution.dependencies]]
+name = "urllib3"
+
+[[distribution]]
+name = "urllib3"
+version = "1.26.18"
+source = "registry+https://pypi.org/simple"
+sdist = { url = "https://files.pythonhosted.org/urllib3-1.26.18.tar.gz", hash = "sha256:old", size = 305687 }
+wheels = [{ url = "https://files.pythonhosted.org/urllib3-1.26.18-py2.py3-none-any.whl", hash = "sha256:old", size = 143835 }]
+"#;
+        let rewritten =
+            rewrite_python_lock(text, "urllib3", "1.26.18", ArtifactSource::Url(URL), SHA256)
+                .unwrap()
+                .unwrap();
+        assert!(
+            rewritten.contains(&format!("source = \"direct+{URL}\"")),
+            "{rewritten}"
+        );
+        assert!(
+            rewritten.contains(&format!("wheels = [{{ url = \"{URL}\", hash = \"sha256:{SHA256}\" }}]")),
+            "{rewritten}"
+        );
+        assert!(!rewritten.contains("[[distribution.wheel]]"), "{rewritten}");
+        assert!(!rewritten.contains("sdist"), "{rewritten}");
+        assert!(rewritten.contains("[[distribution.dependencies]]\nname = \"urllib3\""), "{rewritten}");
         assert_eq!(
             rewrite_python_lock(
                 &rewritten,

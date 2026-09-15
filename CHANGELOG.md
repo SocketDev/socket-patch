@@ -65,7 +65,7 @@ into the new version's section — see docs/releasing.md.
   `repair` rebuilds), a script or PEP 751 lock supplements rather than hides
   `poetry.lock`/`requirements.txt` pins, symlinked locks are discovered, CRLF
   locks keep their line endings, and the hosted `[tool.uv.sources]` edit
-  renders as a header after `[project]` the way uv writes it. (#238)
+  renders as a header after `[project]` the way uv writes it. (#238, #239)
 
 - **Path targeting on `scan` and `rollback`.** `scan [PATHS]...` scopes
   discovery to packages with an installed copy under a matching glob

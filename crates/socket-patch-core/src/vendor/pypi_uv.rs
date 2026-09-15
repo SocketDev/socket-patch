@@ -114,7 +114,7 @@ pub(super) async fn load_uv_project(root: &Path) -> Result<UvProject, (&'static 
     if lock.contains_key("distribution") {
         return Err((
             "pypi_uv_legacy_lock_unsupported",
-            "uv 0.1 lockfiles require absolute file URLs; upgrade to uv >=0.2 for portable native vendoring, or use a requirements.txt installation".to_string(),
+            "uv `[[distribution]]` lockfiles (uv < 0.2.35) record absolute file paths; upgrade to uv >=0.2.35 for portable native vendoring, or use a requirements.txt installation".to_string(),
         ));
     }
 

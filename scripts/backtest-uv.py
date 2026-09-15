@@ -19,6 +19,11 @@ import urllib.request
 # releases on either side of each behaviour boundary observed with real
 # binaries (the lower one is the last release WITHOUT the feature):
 #   0.1.23 / 0.1.24  `uv pip sync` accepts bare `./wheel` requirement paths
+#   0.2.5  / 0.2.6   `[[distribution]]` artifacts: `[distribution.sdist]` /
+#                    `[[distribution.wheel]]` tables -> inline `sdist = {…}` /
+#                    `wheels = [...]` values
+#   0.2.17 / 0.2.18  `[[distribution]]` sources: `"registry+…"` strings ->
+#                    inline tables (`{ registry = … }`)
 #   0.2.34 / 0.2.35  uv.lock `[[distribution]]` -> `[[package]]` grammar
 #   0.4.0  / 0.4.1   `uv export`
 #   0.5.16 / 0.5.17  `uv lock --script`
@@ -31,6 +36,10 @@ VERSIONS = [
     '0.1.24',
     '0.1.45',
     '0.2.0',
+    '0.2.5',
+    '0.2.6',
+    '0.2.17',
+    '0.2.18',
     '0.2.34',
     '0.2.35',
     '0.2.37',
