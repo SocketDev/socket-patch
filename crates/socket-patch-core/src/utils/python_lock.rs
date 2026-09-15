@@ -220,6 +220,32 @@ fn rewrite_manifest(document: &mut DocumentMut, name: &str, artifact: ArtifactSo
     else {
         return;
     };
+    // `[tool.uv] constraint-dependencies` / `build-constraint-dependencies`
+    // land here as `{ name, specifier }`; uv >= 0.5.6 re-serializes a sourced
+    // package's element as `{ name, url|path }` (specifier dropped), so a
+    // stale specifier keeps `uv lock --check` / `uv sync --locked` at exit 2
+    // and a plain sync churns the lock. Repoint every matching element in
+    // both arrays, independent of the `requirements` key below (a project
+    // lock has none — only script locks do).
+    for key in ["constraints", "build-constraints"] {
+        if let Some(constraints) = manifest.get_mut(key).and_then(Item::as_array_mut) {
+            for constraint in constraints
+                .iter_mut()
+                .filter_map(Value::as_inline_table_mut)
+            {
+                if constraint
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| canonicalize_pypi_name(value) == name)
+                {
+                    constraint.remove("specifier");
+                    constraint.remove("url");
+                    constraint.remove("path");
+                    constraint.insert(artifact.key(), Value::from(artifact.location()));
+                }
+            }
+        }
+    }
     if !manifest.contains_key("requirements") {
         return;
     }
@@ -1126,6 +1152,82 @@ mod discovery_and_line_ending_tests {
         assert_eq!(
             python_lock_paths(root).unwrap(),
             vec!["pylock.toml".to_string(), "tool.py.lock".to_string()]
+        );
+    }
+}
+
+#[cfg(test)]
+mod manifest_constraints_tests {
+    use super::{rewrite_python_lock, ArtifactSource};
+
+    const URL: &str = "https://patch.socket.dev/pkg/urllib3-1.26.18-py2.py3-none-any.whl";
+    const SHA256: &str = "ccc9a9e0b18a5efc7038c504cfc580e47d2e02e5390f2e29cad833cbccb956b6";
+
+    /// `[tool.uv] constraint-dependencies` / `build-constraint-dependencies`
+    /// land in `[manifest] constraints` / `build-constraints` as
+    /// `{ name, specifier }`; uv >= 0.5.6 re-serializes a sourced package's
+    /// element as `{ name, url|path }`, so a stale specifier keeps
+    /// `uv lock --check` / `uv sync --locked` at exit 2 after a hosted scan.
+    /// Both arrays are repointed even when the project lock has no
+    /// `requirements` key (only script locks carry one), and no `overrides`
+    /// array is invented for a direct dependency.
+    #[test]
+    fn hosted_rewrite_repoints_manifest_constraints_and_build_constraints() {
+        let text = r#"version = 1
+revision = 3
+requires-python = ">=3.9"
+
+[manifest]
+constraints = [{ name = "urllib3", specifier = "==1.26.18" }]
+build-constraints = [
+    { name = "other", specifier = "==1.0" },
+    { name = "urllib3", specifier = ">=1.26" },
+]
+
+[[package]]
+name = "fixture"
+version = "0.1.0"
+source = { virtual = "." }
+dependencies = [
+    { name = "urllib3" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "urllib3", specifier = "==1.26.18" }]
+
+[[package]]
+name = "urllib3"
+version = "1.26.18"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://pypi.org/urllib3-1.26.18.tar.gz", hash = "sha256:old", size = 123 }
+wheels = [
+    { url = "https://pypi.org/urllib3-1.26.18-py2.py3-none-any.whl", hash = "sha256:old", size = 123 },
+]
+"#;
+        let rewritten = rewrite_python_lock(
+            text,
+            "urllib3",
+            "1.26.18",
+            ArtifactSource::Url(URL),
+            SHA256,
+        )
+        .unwrap()
+        .unwrap();
+        let document: toml_edit::DocumentMut = rewritten.parse().unwrap();
+        let manifest = &document["manifest"];
+        let constraint = manifest["constraints"][0].as_inline_table().unwrap();
+        assert_eq!(constraint["url"].as_str(), Some(URL));
+        assert!(constraint.get("specifier").is_none(), "{rewritten}");
+        let build = manifest["build-constraints"].as_array().unwrap();
+        let foreign = build.get(0).unwrap().as_inline_table().unwrap();
+        assert_eq!(foreign["specifier"].as_str(), Some("==1.0"));
+        assert!(foreign.get("url").is_none(), "a foreign constraint is untouched");
+        let ours = build.get(1).unwrap().as_inline_table().unwrap();
+        assert_eq!(ours["url"].as_str(), Some(URL));
+        assert!(ours.get("specifier").is_none(), "{rewritten}");
+        assert!(
+            manifest.as_table_like().unwrap().get("overrides").is_none(),
+            "a direct dependency must not gain an overrides array: {rewritten}"
         );
     }
 }

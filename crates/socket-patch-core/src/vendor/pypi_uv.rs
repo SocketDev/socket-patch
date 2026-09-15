@@ -653,6 +653,25 @@ pub(super) async fn wire_uv(
         }
     }
 
+    // [manifest] constraints / build-constraints naming the target (either
+    // class). Recorded LAST so the reverse-order revert restores these
+    // whole-line fragments before the requires-dist element they may be
+    // byte-identical to is searched for.
+    let constraint_edits = rewrite_manifest_constraints(&new_lock, canon_name, rel_wheel)?;
+    for edit in constraint_edits.iter().rev() {
+        new_lock.replace_range(edit.span.clone(), &edit.new_entry);
+    }
+    for edit in constraint_edits {
+        wiring.push(record(
+            "uv.lock",
+            edit.kind,
+            WiringAction::Rewritten,
+            canon_name,
+            Some(edit.old_entry),
+            edit.new_entry,
+        ));
+    }
+
     // ── commit: pyproject first, then the lock; unwind on lock failure ────
     // Mode-preserving: both are user-owned files we merely edit, so the
     // swapped-in inode must keep its permission bits rather than reset them
@@ -734,7 +753,10 @@ pub(super) async fn revert_uv(entry: &VendorEntry, root: &Path, dry_run: bool) -
             )
         };
         match rec.kind.as_str() {
-            "uv_lock_package" | "uv_lock_requires_dist" | "uv_lock_requires_dev" => {
+            "uv_lock_package"
+            | "uv_lock_requires_dist"
+            | "uv_lock_requires_dev"
+            | "uv_lock_manifest_constraints" => {
                 match replace_fragment(&lock_text, new_text, original_text) {
                     Some(t) => lock_text = t,
                     None => {
@@ -1187,6 +1209,92 @@ fn rewrite_root_metadata_entries(
                  for {canon}; run `uv lock` first"
             ),
         ));
+    }
+    Ok(edits)
+}
+
+/// Find + transform every `[manifest] constraints` / `build-constraints`
+/// element naming `canon` (`[tool.uv] constraint-dependencies` /
+/// `build-constraint-dependencies`). uv >= 0.5.6 re-serializes a sourced
+/// package's element as `{ name, path }` (specifier dropped — uv 0.12.15
+/// ground truth), so an element left with its specifier keeps `uv lock
+/// --check` / `uv sync --locked` at exit 2 and a plain sync churns the
+/// lock. One edit per key, spanning the whole `<key> = […]` line with every
+/// matching element rewritten: the key prefix keeps revert's text match from
+/// confusing the element with a byte-identical requires-dist one. A lock
+/// without `[manifest]` or without the keys yields no edits (most locks).
+fn rewrite_manifest_constraints(
+    lock_text: &str,
+    canon: &str,
+    rel_wheel: &str,
+) -> Result<Vec<RequiresDistEdit>, (&'static str, String)> {
+    let index = line_index(lock_text);
+    let Some(h) = index.iter().position(|(_, l)| l.trim_end() == "[manifest]") else {
+        return Ok(Vec::new());
+    };
+    // Section spans until the next top-level header.
+    let section_end_line = index[h + 1..]
+        .iter()
+        .position(|(_, l)| l.starts_with('['))
+        .map(|i| h + 1 + i)
+        .unwrap_or(index.len());
+    let section_start = index[h].0;
+    let section_end = index
+        .get(section_end_line)
+        .map(|(off, _)| *off)
+        .unwrap_or(lock_text.len());
+    let section = &lock_text[section_start..section_end];
+    let needle = format!("name = \"{canon}\"");
+    let mut edits: Vec<RequiresDistEdit> = Vec::new();
+
+    for key in ["constraints", "build-constraints"] {
+        let prefix = format!("{key} = [");
+        // Keys sit at line start, so `constraints = [` can never match inside
+        // `build-constraints = [`.
+        let Some(line_off) = line_index(section)
+            .iter()
+            .find(|(_, l)| l.starts_with(&prefix))
+            .map(|(off, _)| *off)
+        else {
+            continue;
+        };
+        let arr_open = line_off + prefix.len() - 1;
+        let arr_end = balanced_span(section, arr_open).ok_or_else(|| {
+            (
+                "pypi_uv_lock_parse_failed",
+                format!("uv.lock [manifest] {key} array is unbalanced"),
+            )
+        })?;
+        let array_text = &section[arr_open..arr_end];
+        let mut new_array = String::with_capacity(array_text.len());
+        let mut last = 0;
+        let mut specifier: Option<String> = None;
+        let mut matched = false;
+        for (s, e) in top_level_brace_groups(array_text) {
+            let entry = &array_text[s..e];
+            if !entry.contains(&needle) {
+                continue;
+            }
+            let (new_entry, spec) = path_source_entry(entry, rel_wheel);
+            if specifier.is_none() {
+                specifier = spec;
+            }
+            new_array.push_str(&array_text[last..s]);
+            new_array.push_str(&new_entry);
+            last = e;
+            matched = true;
+        }
+        if !matched {
+            continue;
+        }
+        new_array.push_str(&array_text[last..]);
+        edits.push(RequiresDistEdit {
+            span: (section_start + line_off)..(section_start + arr_end),
+            old_entry: section[line_off..arr_end].to_string(),
+            new_entry: format!("{}{}", &section[line_off..arr_open], new_array),
+            specifier,
+            kind: "uv_lock_manifest_constraints",
+        });
     }
     Ok(edits)
 }
@@ -4987,5 +5095,105 @@ wheels = [
             advisories.is_empty(),
             "a direct dependency needs no override advisory: {advisories:?}"
         );
+    }
+
+    // ── [tool.uv] constraint-dependencies (uv 0.12.15 ground truth) ─────
+    // A constrained package is recorded in `[manifest] constraints`
+    // (resp. `build-constraints` for build-constraint-dependencies) as
+    // `{ name, specifier }`; once the package has a path source uv >= 0.5.6
+    // re-serializes the element as `{ name, path }` — a stale specifier
+    // keeps `uv lock --check` / `uv sync --locked` at exit 2.
+
+    const CONSTRAINTS_REGISTRY_PYPROJECT: &str = r#"[project]
+name = "proj"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = ["six==1.16.0"]
+
+[tool.uv]
+constraint-dependencies = ["six==1.16.0"]
+"#;
+
+    const CONSTRAINTS_PATH_PYPROJECT: &str = r#"[project]
+name = "proj"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = ["six==1.16.0"]
+
+[tool.uv]
+constraint-dependencies = ["six==1.16.0"]
+
+[tool.uv.sources]
+six = { path = ".socket/vendor/pypi/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/six-1.16.0-py2.py3-none-any.whl" }
+"#;
+
+    /// `[manifest] constraints` AND `build-constraints` elements naming the
+    /// target are repointed to the path shape (one whole-line record per
+    /// key, kind `uv_lock_manifest_constraints`) and revert restores them
+    /// byte-exactly. Fixtures: the DIRECT pair with the uv 0.12.15
+    /// `[manifest]` block prepended.
+    #[tokio::test]
+    async fn constraint_dependencies_manifest_entries_repointed_and_reverted() {
+        let manifest = "[manifest]\nconstraints = [{ name = \"six\", specifier = \"==1.16.0\" }]\nbuild-constraints = [{ name = \"six\", specifier = \">=1.16\" }]\n\n";
+        let registry_lock = DIRECT_REGISTRY_LOCK.replacen("[[package]]", &format!("{manifest}[[package]]"), 1);
+        let path_manifest = format!(
+            "[manifest]\nconstraints = [{{ name = \"six\", path = \"{REL_WHEEL}\" }}]\nbuild-constraints = [{{ name = \"six\", path = \"{REL_WHEEL}\" }}]\n\n"
+        );
+        let path_lock = DIRECT_PATH_LOCK.replacen("[[package]]", &format!("{path_manifest}[[package]]"), 1);
+
+        let tmp = write_pair(CONSTRAINTS_REGISTRY_PYPROJECT, &registry_lock).await;
+        let p = load_uv_project(tmp.path()).await.unwrap();
+        let (wiring, meta, _) = wire_uv(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UUID,
+        )
+        .await
+        .unwrap();
+
+        let (pyproject, lock) = read_pair(tmp.path()).await;
+        assert_eq!(pyproject, CONSTRAINTS_PATH_PYPROJECT);
+        assert_eq!(
+            lock, path_lock,
+            "both [manifest] constraint arrays must carry `path` (uv 0.12.15 shape)"
+        );
+        let kinds: Vec<&str> = wiring.iter().map(|w| w.kind.as_str()).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "uv_sources_entry",
+                "uv_lock_package",
+                "uv_lock_requires_dist",
+                "uv_lock_manifest_constraints",
+                "uv_lock_manifest_constraints",
+            ]
+        );
+        let constraint_records: Vec<&WiringRecord> = wiring
+            .iter()
+            .filter(|w| w.kind == "uv_lock_manifest_constraints")
+            .collect();
+        assert_eq!(
+            constraint_records[0].original.as_ref().and_then(|v| v.as_str()),
+            Some("constraints = [{ name = \"six\", specifier = \"==1.16.0\" }]"),
+            "the fragment spans the whole key line so revert cannot confuse it \
+             with an identical requires-dist element"
+        );
+        assert_eq!(
+            constraint_records[1].original.as_ref().and_then(|v| v.as_str()),
+            Some("build-constraints = [{ name = \"six\", specifier = \">=1.16\" }]")
+        );
+
+        let entry = entry_for(wiring, meta);
+        let outcome = revert_uv(&entry, tmp.path(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        let (pyproject, lock) = read_pair(tmp.path()).await;
+        assert_eq!(pyproject, CONSTRAINTS_REGISTRY_PYPROJECT);
+        assert_eq!(lock, registry_lock);
     }
 }
