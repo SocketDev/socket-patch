@@ -861,7 +861,20 @@ mod tests {
         let missing = read_regular_to_string_sync(&tmp.path().join("absent")).unwrap_err();
         assert_eq!(missing.kind(), std::io::ErrorKind::NotFound);
         let dir = read_regular_to_string_sync(tmp.path()).unwrap_err();
+        // Unix opens a directory read-only and the fstat check classifies it;
+        // Windows' CreateFileW refuses the open outright with
+        // ERROR_ACCESS_DENIED (PermissionDenied). Either way it is an error
+        // the callers skip, never a wedge.
+        #[cfg(unix)]
         assert_eq!(dir.kind(), std::io::ErrorKind::InvalidInput, "{dir}");
+        #[cfg(not(unix))]
+        assert!(
+            matches!(
+                dir.kind(),
+                std::io::ErrorKind::InvalidInput | std::io::ErrorKind::PermissionDenied
+            ),
+            "{dir}"
+        );
         let file = tmp.path().join("ok.txt");
         std::fs::write(&file, "packages:\n").unwrap();
         assert_eq!(read_regular_to_string_sync(&file).unwrap(), "packages:\n");
