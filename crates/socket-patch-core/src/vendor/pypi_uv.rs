@@ -23,6 +23,7 @@ use toml_edit::{DocumentMut, Item, Table, Value};
 
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::utils::fs::atomic_write_bytes_preserving_mode;
+use crate::utils::python_lock::preserve_line_endings;
 
 use super::common::{item_get, pep508_name, pep621_declared_names, record};
 use super::state::{UvMeta, VendorEntry, WiringAction, WiringRecord};
@@ -557,6 +558,10 @@ pub(super) async fn wire_uv(
                     .and_then(Item::as_value)
                     .map(|v| v.to_string().trim().to_string())
                     .unwrap_or_default();
+                // Multi-line arrays render LF; record both fragments in the
+                // file's own convention or revert's exact-text splice misses.
+                let old_text = preserve_line_endings(&p.pyproject_text, old_text);
+                let new_text = preserve_line_endings(&p.pyproject_text, new_text);
                 wiring.push(record(
                     "pyproject.toml",
                     "uv_override",
@@ -591,7 +596,9 @@ pub(super) async fn wire_uv(
         None,
         format!("{canon_name} = {{ path = \"{rel_wheel}\" }}"),
     ));
-    let new_pyproject = doc.to_string();
+    // toml_edit re-emits every newline as LF; a CRLF pyproject would come
+    // back all-LF (whole-file churn, and revert splices never restore it).
+    let new_pyproject = preserve_line_endings(&p.pyproject_text, doc.to_string());
 
     // ── uv.lock text surgery (fully computed before any write) ────────────
     let mut new_lock = p.lock_text.clone();
@@ -782,10 +789,12 @@ pub(super) async fn revert_uv(entry: &VendorEntry, root: &Path, dry_run: bool) -
                     };
                     // A created [manifest] section was inserted with a blank
                     // separator line; a created overrides key is one line.
+                    // Both were terminated with the lock's own newline.
+                    let nl = newline_of(&lock_text);
                     let removed = if new.starts_with("[manifest]") {
-                        remove_substring(&lock_text, &format!("{new}\n\n"))
+                        remove_substring(&lock_text, &format!("{new}{nl}{nl}"))
                     } else {
-                        remove_substring(&lock_text, &format!("{new}\n"))
+                        remove_substring(&lock_text, &format!("{new}{nl}"))
                     };
                     match removed {
                         Some(t) => lock_text = t,
@@ -921,6 +930,18 @@ pub(super) async fn revert_uv(entry: &VendorEntry, root: &Path, dry_run: bool) -
 
 // ── helpers ──────────────────────────────────────────────────────────────
 
+/// The lock's line terminator. uv writes LF, but git autocrlf on Windows
+/// hands us a CRLF file; every fragment we splice, append or remove must be
+/// built with the file's own terminator or the lock comes back with mixed
+/// endings and revert's exact-text removals miss.
+fn newline_of(text: &str) -> &'static str {
+    if text.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    }
+}
+
 /// Walk/create the table chain, marking CREATED intermediates implicit so
 /// they never render stray `[tool]` headers.
 fn ensure_table<'a>(
@@ -992,13 +1013,17 @@ fn rewrite_target_package_unit(
     wheel_sha256_hex: &str,
     metadata_block: Option<&str>,
 ) -> Result<(String, String), (&'static str, String)> {
+    let nl = newline_of(lock_text);
     let span = find_unit_span(lock_text, |lines| unit_has_name(lines, canon)).ok_or_else(|| {
         (
             "pypi_uv_lock_package_missing",
             format!("uv.lock has no [[package]] entry for {canon}"),
         )
     })?;
-    let old_unit = lock_text[span].to_string();
+    // `find_unit_span` ends at the last line's content, which in a CRLF lock
+    // is its trailing `\r`; keep the fragment CR-free at both ends so the
+    // rebuilt unit splices back in front of the same `\r\n`.
+    let old_unit = lock_text[span].trim_end_matches('\r').to_string();
     let unit: Vec<&str> = old_unit.lines().collect();
     let wheels_lines = [
         "wheels = [".to_string(),
@@ -1046,12 +1071,18 @@ fn rewrite_target_package_unit(
         }
         out.splice(pos..pos, wheels_lines.iter().cloned());
     }
-    let mut new_unit = out.join("\n");
+    let mut new_unit = out.join(nl);
     if let Some(block) = metadata_block {
         // uv emits [package.metadata] as a sub-table after the [[package]]
         // body, separated by one blank line (fixture shape: `]\n\n[package…`).
-        new_unit.push_str("\n\n");
-        new_unit.push_str(block);
+        // The block is rendered LF; re-terminate it for a CRLF lock.
+        new_unit.push_str(nl);
+        new_unit.push_str(nl);
+        if nl == "\n" {
+            new_unit.push_str(block);
+        } else {
+            new_unit.push_str(&block.replace('\n', nl));
+        }
     }
     Ok((old_unit, new_unit))
 }
@@ -1332,6 +1363,9 @@ fn add_manifest_override(
     rel_wheel: &str,
 ) -> Result<(WiringRecord, String), (&'static str, String)> {
     let element = format!("{{ name = \"{canon}\", path = \"{rel_wheel}\" }}");
+    // Every created/spliced fragment is built with the lock's own terminator
+    // (revert removes `{new}{nl}` / `{new}{nl}{nl}` with the same detection).
+    let nl = newline_of(lock_text);
     let index = line_index(lock_text);
     let manifest_line = index.iter().position(|(_, l)| l.trim_end() == "[manifest]");
 
@@ -1348,9 +1382,9 @@ fn add_manifest_override(
                     "uv.lock has no [[package]] entries".to_string(),
                 )
             })?;
-        let section = format!("[manifest]\noverrides = [{element}]");
+        let section = format!("[manifest]{nl}overrides = [{element}]");
         let mut text = lock_text.to_string();
-        text.insert_str(first_pkg, &format!("{section}\n\n"));
+        text.insert_str(first_pkg, &format!("{section}{nl}{nl}"));
         return Ok((
             record(
                 "uv.lock",
@@ -1389,7 +1423,7 @@ fn add_manifest_override(
         let new_array = if old_array.contains('\n') {
             // multi-line: add an indented element before the closing bracket
             let body = &old_array[..old_array.rfind(']').unwrap_or(old_array.len())];
-            format!("{body}    {element},\n]")
+            format!("{body}    {element},{nl}]")
         } else if old_array[1..old_array.len() - 1].trim().is_empty() {
             // `overrides = []` (hand-edited; uv omits the key when empty):
             // no existing element to comma-separate from
@@ -1423,7 +1457,7 @@ fn add_manifest_override(
         .map(|(off, _)| *off)
         .unwrap_or(lock_text.len());
     let mut text = lock_text.to_string();
-    text.insert_str(insert_at, &format!("{line}\n"));
+    text.insert_str(insert_at, &format!("{line}{nl}"));
     Ok((
         record(
             "uv.lock",
@@ -5195,5 +5229,117 @@ six = { path = ".socket/vendor/pypi/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/six-1.1
         let (pyproject, lock) = read_pair(tmp.path()).await;
         assert_eq!(pyproject, CONSTRAINTS_REGISTRY_PYPROJECT);
         assert_eq!(lock, registry_lock);
+    }
+
+    /// Whether `text` holds a `\n` that is not part of a `\r\n` pair.
+    fn has_bare_lf(text: &str) -> bool {
+        let bytes = text.as_bytes();
+        bytes
+            .iter()
+            .enumerate()
+            .any(|(i, &b)| b == b'\n' && (i == 0 || bytes[i - 1] != b'\r'))
+    }
+
+    /// A pure-CRLF pair (git autocrlf on Windows) must wire to a pure-CRLF
+    /// pair and revert byte-exactly. `doc.to_string()` re-emits every
+    /// pyproject newline as LF, the lock surgery joined rebuilt units and
+    /// created `[manifest]` fragments with LF (mixed endings), and revert's
+    /// hardcoded `"{new}\n"` removals then missed. Covers the Direct,
+    /// Transitive (created override + created `[manifest]`), Rewritten
+    /// override (multi-line arrays in both files) and requires-dev shapes.
+    #[tokio::test]
+    async fn crlf_pyproject_and_lock_round_trip_byte_exact() {
+        let existing_override_pyproject = format!(
+            "{TRANSITIVE_REGISTRY_PYPROJECT}\n[tool.uv]\noverride-dependencies = [\n    \"attrs==23.1.0\",\n]\n"
+        );
+        let existing_override_lock = TRANSITIVE_REGISTRY_LOCK.replacen(
+            "[[package]]",
+            "[manifest]\noverrides = [\n    { name = \"attrs\", specifier = \"==23.1.0\" },\n]\n\n[[package]]",
+            1,
+        );
+        let cases: [(&str, &str, &str); 4] = [
+            ("direct", DIRECT_REGISTRY_PYPROJECT, DIRECT_REGISTRY_LOCK),
+            (
+                "transitive",
+                TRANSITIVE_REGISTRY_PYPROJECT,
+                TRANSITIVE_REGISTRY_LOCK,
+            ),
+            (
+                "existing-override",
+                &existing_override_pyproject,
+                &existing_override_lock,
+            ),
+            ("dev-group", DEV_GROUP_REGISTRY_PYPROJECT, DEV_GROUP_REGISTRY_LOCK),
+        ];
+        for (label, pyproject_lf, lock_lf) in cases {
+            let pyproject_crlf = pyproject_lf.replace('\n', "\r\n");
+            let lock_crlf = lock_lf.replace('\n', "\r\n");
+            let tmp = write_pair(&pyproject_crlf, &lock_crlf).await;
+            let p = load_uv_project(tmp.path()).await.unwrap();
+            let (wiring, meta, _) = wire_uv(
+                &p,
+                tmp.path(),
+                "six",
+                "1.16.0",
+                REL_WHEEL,
+                WHEEL_NAME,
+                WHEEL_SHA,
+                UUID,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{label}: {e:?}"));
+
+            let (pyproject, lock) = read_pair(tmp.path()).await;
+            assert!(
+                !has_bare_lf(&pyproject),
+                "{label}: wired pyproject.toml must stay pure CRLF:\n{pyproject:?}"
+            );
+            assert!(
+                !has_bare_lf(&lock),
+                "{label}: wired uv.lock must stay pure CRLF:\n{lock:?}"
+            );
+            assert!(
+                lock.contains(REL_WHEEL) && pyproject.contains(REL_WHEEL),
+                "{label}: the pair must actually be wired"
+            );
+            // Modulo line endings the wired pair is the LF pair's wiring.
+            let tmp_lf = write_pair(pyproject_lf, lock_lf).await;
+            let p_lf = load_uv_project(tmp_lf.path()).await.unwrap();
+            wire_uv(
+                &p_lf,
+                tmp_lf.path(),
+                "six",
+                "1.16.0",
+                REL_WHEEL,
+                WHEEL_NAME,
+                WHEEL_SHA,
+                UUID,
+            )
+            .await
+            .unwrap();
+            let (pyproject_expect, lock_expect) = read_pair(tmp_lf.path()).await;
+            assert_eq!(
+                pyproject.replace("\r\n", "\n"),
+                pyproject_expect,
+                "{label}: pyproject wiring differs beyond line endings"
+            );
+            assert_eq!(
+                lock.replace("\r\n", "\n"),
+                lock_expect,
+                "{label}: lock wiring differs beyond line endings"
+            );
+
+            let entry = entry_for(wiring, meta);
+            let outcome = revert_uv(&entry, tmp.path(), false).await;
+            assert!(outcome.success, "{label}: {:?}", outcome.error);
+            assert!(
+                outcome.warnings.is_empty(),
+                "{label}: {:?}",
+                outcome.warnings
+            );
+            let (pyproject, lock) = read_pair(tmp.path()).await;
+            assert_eq!(pyproject, pyproject_crlf, "{label}: pyproject not restored");
+            assert_eq!(lock, lock_crlf, "{label}: lock not restored");
+        }
     }
 }
