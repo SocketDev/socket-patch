@@ -6,7 +6,10 @@
 //! to the registry by a plain `uv sync`. So vendor always writes BOTH — the
 //! pyproject sources entry (plus, for transitive deps, a
 //! `[tool.uv] override-dependencies` pin, which sources DO apply to — claim
-//! 8) and the lock's `[[package]]` / `requires-dist` / `[manifest]` fragments.
+//! 8 — but only on uv >= 0.5.6: 0.2.35–0.5.3 ignore sources for overrides
+//! and a plain `uv sync` there reinstalls the registry wheel, hence the
+//! `pypi_uv_override_requires_uv_0_5_6` advisory on that branch) and the
+//! lock's `[[package]]` / `requires-dist` / `[manifest]` fragments.
 //!
 //! All lock edits are targeted text surgery rather than a TOML re-serialize:
 //! the spike proved a surgical edit reproduces uv's own serializer output
@@ -487,6 +490,19 @@ pub(super) async fn wire_uv(
         .is_none();
 
     if class == UvDepClass::Transitive {
+        // uv 0.2.35–0.5.3 do NOT apply [tool.uv.sources] to
+        // override-dependencies: a plain `uv sync` on those releases silently
+        // reinstalls the registry wheel (the lock still names the vendored
+        // path, so `--frozen` installs it). No lock-shape marker separates
+        // 0.5.3 from 0.5.6, so this cannot be an offline refusal — advise.
+        advisories.push(VendorWarning::new(
+            "pypi_uv_override_requires_uv_0_5_6",
+            format!(
+                "transitive wiring of {canon_name} via [tool.uv] override-dependencies is \
+                 honored only by uv >= 0.5.6; older uv reinstalls the registry wheel on a \
+                 plain `uv sync` — pin uv or make the package a direct dependency"
+            ),
+        ));
         let spec = format!("{canon_name}=={version}");
         let uv_table = ensure_table(&mut doc, &["tool", "uv"])?;
         if !had_uv_table {
@@ -4919,5 +4935,57 @@ wheels = [
         let (pyproject, lock) = read_pair(tmp.path()).await;
         assert_eq!(pyproject, EXTRAS_DUP_REGISTRY_PYPROJECT);
         assert_eq!(lock, EXTRAS_DUP_REGISTRY_LOCK);
+    }
+
+    /// uv 0.2.35–0.5.3 do NOT apply `[tool.uv.sources]` to
+    /// override-dependencies: a transitive target wired through the override
+    /// branch is silently reinstalled from the registry by a plain `uv sync`
+    /// on those releases, and no lock-shape marker separates 0.5.3 from
+    /// 0.5.6, so an offline refusal is impossible. The branch must surface a
+    /// stable advisory; the Direct branch must stay silent.
+    #[tokio::test]
+    async fn override_branch_emits_uv_version_advisory() {
+        let tmp = write_pair(TRANSITIVE_REGISTRY_PYPROJECT, TRANSITIVE_REGISTRY_LOCK).await;
+        let p = load_uv_project(tmp.path()).await.unwrap();
+        let (_, meta, advisories) = wire_uv(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UUID,
+        )
+        .await
+        .unwrap();
+        assert_eq!(meta.dep_class, "override");
+        let codes: Vec<&str> = advisories.iter().map(|w| w.code).collect();
+        assert_eq!(codes, vec!["pypi_uv_override_requires_uv_0_5_6"]);
+        let detail = &advisories[0].detail;
+        assert!(
+            detail.contains("0.5.6") && detail.contains("override-dependencies"),
+            "{detail}"
+        );
+
+        let tmp = write_pair(DIRECT_REGISTRY_PYPROJECT, DIRECT_REGISTRY_LOCK).await;
+        let p = load_uv_project(tmp.path()).await.unwrap();
+        let (_, meta, advisories) = wire_uv(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UUID,
+        )
+        .await
+        .unwrap();
+        assert_eq!(meta.dep_class, "direct");
+        assert!(
+            advisories.is_empty(),
+            "a direct dependency needs no override advisory: {advisories:?}"
+        );
     }
 }
