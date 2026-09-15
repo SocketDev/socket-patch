@@ -60,16 +60,63 @@ into the new version's section — see docs/releasing.md.
   wheel instead of the registry artifact. Verified against real uv binaries
   from every 0.x release family (0.0 through 0.12) — first and latest release
   of each plus every observed behaviour boundary — see
-  `docs/testing/uv-compatibility.md`: hosted mode covers every uv release
-  since 0.1 (all three `[[distribution]]` lock shapes and `[[package]]`),
-  vendored native covers every `[[package]]` release (uv ≥ 0.2.35), vendored
-  requirements cover uv ≥ 0.1.24. Follow-up hardening:
+  `docs/testing/uv-compatibility.md`: hosted mode covers requirements from
+  uv 0.0.5 and native `uv.lock` from 0.1.45 — the first release whose
+  `uv lock` writes one — through all three `[[distribution]]` lock shapes
+  and `[[package]]`; vendored native covers every `[[package]]` release
+  (uv ≥ 0.2.35), vendored requirements cover uv ≥ 0.1.24 (hash-enforced by
+  `uv pip sync --require-hashes` from 0.1.32 and by default from 0.5.x).
+  Follow-up hardening:
   `vendor --revert` refuses to delete a vendored Python wheel a lock still
   references when the ledger entry has no wiring to replay (the shape
   `repair` rebuilds), a script or PEP 751 lock supplements rather than hides
-  `poetry.lock`/`requirements.txt` pins, symlinked locks are discovered, CRLF
-  locks keep their line endings, and the hosted `[tool.uv.sources]` edit
-  renders as a header after `[project]` the way uv writes it. (#238, #239)
+  `poetry.lock`/`requirements.txt` pins, symlinked locks are discovered, and
+  refused before any write (never rewritten in place — uv writes through the
+  link, an atomic rename would replace it; hosted
+  `redirect_symlinked_file_unsupported`, vendored
+  `pypi_uv_symlink_unsupported` / `pypi_lock_symlink_unsupported`), CRLF
+  locks keep their line endings in both the hosted rewriter and the vendored
+  uv backend (`pyproject.toml`, the rewritten `[[package]]` unit and the
+  appended `[manifest]` / `[package.metadata]` fragments, plus their revert),
+  and the hosted `[tool.uv.sources]` edit renders as a header after
+  `[project]` the way uv writes it. (#238, #239)
+- **uv `--locked` survives the project shapes the plain fixture never
+  reached.** A package listed only in `[tool.uv] dev-dependencies` is now
+  classified as a direct dependency (it was wired as a transitive override
+  and its `requires-dev` entry left stale), and every duplicate
+  `requires-dist` / `requires-dev` entry for the package — extras, markers —
+  is repointed rather than only the first, so `uv sync --locked` and
+  `uv lock --check` accept the patched lock instead of exiting 2 and a plain
+  `uv sync` no longer rewrites it. `[tool.uv] constraint-dependencies` /
+  `build-constraint-dependencies` naming the package have their `[manifest]`
+  `constraints` / `build-constraints` entries repointed too (uv ≥ 0.5.6
+  serializes them with the package's source). The transitive
+  (override-dependencies) branch emits the advisory
+  `pypi_uv_override_requires_uv_0_5_6`: uv applies `[tool.uv.sources]` to
+  overrides only from 0.5.6, so on 0.2.35–0.5.3 `--frozen` installs the
+  patch but a plain `uv sync` reinstalls the registry wheel. The
+  `[[distribution]]`-grammar vendoring refusal now names the real reasons
+  (relative path sources unparseable through 0.2.6, rejected by `--locked`
+  and absolutized by `uv lock` / `uv sync` on 0.2.17–0.2.34) instead of
+  "records absolute paths". `scripts/backtest-uv.py` gains a project-variant
+  lane covering these shapes on every `[[package]]` binary and a
+  `--render-doc-table` mode that prints the doc's results tables from
+  `results.json`; its export lane reads `uv export` from stdout because
+  `--output-file` only exists from 0.4.7. (#239)
+- **Unwired Python vendor entries revert safely.** `vendor --revert` /
+  `rollback` on a ledger entry without wiring to replay (the shape `repair`
+  reconstructs) skips the lock-reference guard under `--preserve-state`
+  (nothing is deleted, so nothing needs protecting), refuses fail-closed when
+  the project root cannot be listed or a lock's symlink target cannot be
+  read (instead of treating "could not enumerate locks" as "no lock
+  references it" and deleting the wheel), probes `-r` / `--requirement`
+  includes of `requirements.txt` alongside the root file — the orphan sweep
+  and `repair` see include-hosted pins too — and reclaims a genuinely
+  orphaned artifact directory whose lock is gone or whose ledger flavor is
+  unknown instead of failing forever. Hosted `scan` / `get`, `repair`, and
+  ledger-less `rollback` read candidate lockfiles through the FIFO-safe
+  reader, so a named pipe at a lockfile name no longer wedges the command in
+  `open(2)`. (#239)
 
 - **Path targeting on `scan` and `rollback`.** `scan [PATHS]...` scopes
   discovery to packages with an installed copy under a matching glob
