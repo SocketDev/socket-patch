@@ -28,6 +28,13 @@
     "filename": "uv-0.1.24-py3-none-macosx_10_12_x86_64.macosx_11_0_arm64.macosx_10_12_universal2.whl"
   },
   {
+    "version": "0.1.44",
+    "url": "https://files.pythonhosted.org/packages/85/6a/4e98521c359f593cdd8cebc6381c09be1d133bd93031e76accc6b8aa7788/uv-0.1.44-py3-none-macosx_11_0_arm64.whl",
+    "sha256": "e247dca0d8d42d71032ac99ef3d72a4fcbad4ae3114ef5979878a81a40fed274",
+    "uploaded": "2024-05-14T14:28:43.548037Z",
+    "filename": "uv-0.1.44-py3-none-macosx_11_0_arm64.whl"
+  },
+  {
     "version": "0.1.45",
     "url": "https://files.pythonhosted.org/packages/7f/15/46efcaa86ebef51b8663d8beb95c8376fbdaaf45aeffbc269bf0a3527092/uv-0.1.45-py3-none-macosx_11_0_arm64.whl",
     "sha256": "4e5d55f0f8b6ae416c72d78106e224c8e8338356da21ddebecc7b1723de80924",

@@ -88,8 +88,13 @@ frozen, locked, and ordinary installation outcomes separately where supported.
   accepts the lock. `[tool.uv] constraint-dependencies` /
   `build-constraint-dependencies` naming the package are repointed in the
   lock's `[manifest]` `constraints` / `build-constraints` entries, which uv
-  ≥ 0.5.6 serializes with the package's source. The project-variant lane
-  below exercises both.
+  ≥ 0.5.6 serializes with the package's source. uv 0.2.37–0.5.3 serialize
+  constraints as `{ name, specifier }` regardless of sources, so on those
+  releases the repointed entry makes `uv sync --locked` fail (`--frozen` and
+  a plain `uv sync` still install the patch; the plain sync rewrites the
+  entry back). The CLI cannot tell those binaries apart from the lock, so the
+  repoint emits the advisory `pypi_uv_constraints_require_uv_0_5_6`. The
+  project-variant lane below exercises both shapes.
 - Transitive targets are wired through `[tool.uv] override-dependencies` plus
   a `[tool.uv.sources]` entry. uv applies sources to overrides only from
   0.5.6: on 0.2.35–0.5.3 `--frozen` installs the patched wheel from the lock,
@@ -255,23 +260,23 @@ not just with a URL or a success message.
      `python3 scripts/backtest-uv.py --render-doc-table <output>/results.json`;
      regenerate it after a matrix run instead of editing by hand. -->
 The complete run finished on **2026-09-15**, using
-**macOS-26.6.2-arm64-arm-64bit** and Python **3.9.6**. It tested
-socket-patch source commit `310b9042abc8803aa5e302a5902b9f53584f6908`
+**macOS-26.6.2-arm64-arm-64bit-Mach-O** and Python **3.9.6**. It tested
+socket-patch source commit `17d0dcb84bab1bec030117e0f111c7bfd893c2eb`
 (`socket-patch 4.0.0`), with binary SHA-256:
 
 ```text
-79e900f11714ee1575b57e7f494364094ca7d0ff953abddef597b839c5211379
+be7a0e3dd86d540b0dc038437410bec6042bcaad5ae8beba92fae23015b56548
 ```
 
-**583 installed-byte comparisons** ran, with **0 mismatches**. **240
+**1403 installed-byte comparisons** ran, with **18 mismatches**. **1086
 lock-preservation checks** were recorded — every install attempt against a
 patched lock (`--frozen` and `--locked` where the binary provides them, plain
 `uv sync` where it does not, `uv run --frozen --script`, `uv pip sync
 pylock.toml`, and the project-variant installs), including failed installs whose
-lock was left untouched — and **0 changed the lock**. `--frozen` never writes
-the lock, so the 101 `--locked` rows are the ones that measure preservation; 101
+lock was left untouched — and **32 changed the lock**. `--frozen` never writes
+the lock, so the 383 `--locked` rows are the ones that measure preservation; 351
 of them exited 0. The [machine-readable results](uv-compatibility/results.json)
-contain all 1324 observations and their command definitions. The [binary
+contain all 2769 observations and their command definitions. The [binary
 catalog](uv-compatibility/binaries.json) records each uv wheel's public PyPI
 source and verified hash.
 
@@ -286,6 +291,7 @@ compilation. PEP 751 covers both standalone locks and exported locks.
 | 0.1.0 | No native lock | — / — | Pass / rejected path | — / — | — / — | — / — | 2 |
 | 0.1.23 | No native lock | — / — | Pass / rejected path | — / — | — / — | — / — | 2 |
 | 0.1.24 | No native lock | — / — | Pass / Pass | — / — | — / — | — / — | 4 |
+| 0.1.44 | No native lock | — / — | Pass / Pass | — / — | — / — | — / — | 4 |
 | 0.1.45 | `distribution`, v1 | Pass / refused | Pass / Pass | — / — | — / — | — / — | 6 |
 | 0.2.0 | `distribution`, v1 | Pass / refused | Pass / Pass | — / — | — / — | — / — | 6 |
 | 0.2.5 | `distribution`, v1 | Pass / refused | Pass / Pass | — / — | — / — | — / — | 6 |
@@ -293,36 +299,36 @@ compilation. PEP 751 covers both standalone locks and exported locks.
 | 0.2.17 | `distribution`, v1 | Pass / refused | Pass / Pass | — / — | — / — | — / — | 6 |
 | 0.2.18 | `distribution`, v1 | Pass / refused | Pass / Pass | — / — | — / — | — / — | 6 |
 | 0.2.34 | `distribution`, v1 | Pass / refused | Pass / Pass | — / — | — / — | — / — | 7 |
-| 0.2.35 | `package`, v1 | Pass / Pass¹ | Pass / Pass | — / — | — / — | — / — | 10 |
-| 0.2.36 | `package`, v1 | Pass / Pass¹ | Pass / Pass | — / — | — / — | — / — | 10 |
-| 0.2.37 | `package`, v1 | Pass / Pass¹ | Pass / Pass | — / — | — / — | — / — | 10 |
-| 0.3.0 | `package`, v1 | Pass / Pass¹ | Pass / Pass | — / — | — / — | — / — | 10 |
-| 0.3.5 | `package`, v1 | Pass / Pass | Pass / Pass | — / — | — / — | — / — | 10 |
-| 0.4.0 | `package`, v1 | Pass / Pass | Pass / Pass | — / — | — / — | — / — | 10 |
-| 0.4.1 | `package`, v1 | Pass / Pass | Pass / Pass | — / — | — / — | — / — | 10 |
-| 0.4.30 | `package`, v1 | Pass / Pass | Pass / Pass | Pass / Pass | — / — | — / — | 12 |
-| 0.5.0 | `package`, v1 | Pass / Pass | Pass / Pass | Pass / Pass | — / — | — / — | 12 |
-| 0.5.16 | `package`, v1 | Pass / Pass | Pass / Pass | Pass / Pass | — / — | — / — | 12 |
-| 0.5.17 | `package`, v1 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | — / — | 18 |
-| 0.5.31 | `package`, v1 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | — / — | 18 |
-| 0.6.0 | `package`, v1 r1 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | — / — | 18 |
-| 0.6.14 | `package`, v1 r1 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | — / — | 18 |
-| 0.6.15 | `package`, v1 r2 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | 22 |
-| 0.6.17 | `package`, v1 r2 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | 22 |
-| 0.7.0 | `package`, v1 r2 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | 22 |
-| 0.7.22 | `package`, v1 r2 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | 22 |
-| 0.8.0 | `package`, v1 r2 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | 22 |
-| 0.8.3 | `package`, v1 r2 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | 22 |
-| 0.8.4 | `package`, v1 r3 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | 22 |
-| 0.8.24 | `package`, v1 r3 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | 22 |
-| 0.9.0 | `package`, v1 r3 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | 22 |
-| 0.9.30 | `package`, v1 r3 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | 22 |
-| 0.10.0 | `package`, v1 r3 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | 22 |
-| 0.10.12 | `package`, v1 r3 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | 22 |
-| 0.11.0 | `package`, v1 r3 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | 22 |
-| 0.11.33 | `package`, v1 r3 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | 22 |
-| 0.12.0 | `package`, v1 r3 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | 22 |
-| 0.12.15 | `package`, v1 r3 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | 22 |
+| 0.2.35 | `package`, v1 | Pass / Pass¹ | Pass / Pass | — / — | — / — | — / — | 24 |
+| 0.2.36 | `package`, v1 | Pass / Pass¹ | Pass / Pass | — / — | — / — | — / — | 24 |
+| 0.2.37 | `package`, v1 | Pass / Pass¹ | Pass / Pass | — / — | — / — | — / — | 28 |
+| 0.3.0 | `package`, v1 | Pass / Pass¹ | Pass / Pass | — / — | — / — | — / — | 28 |
+| 0.3.5 | `package`, v1 | Pass / Pass | Pass / Pass | — / — | — / — | — / — | 28 |
+| 0.4.0 | `package`, v1 | Pass / Pass | Pass / Pass | — / — | — / — | — / — | 28 |
+| 0.4.1 | `package`, v1 | Pass / Pass | Pass / Pass | Pass / Pass | — / — | — / — | 30 |
+| 0.4.30 | `package`, v1 | Pass / Pass | Pass / Pass | Pass / Pass | — / — | — / — | 36 |
+| 0.5.0 | `package`, v1 | Pass / Pass | Pass / Pass | Pass / Pass | — / — | — / — | 36 |
+| 0.5.16 | `package`, v1 | Pass / Pass | Pass / Pass | Pass / Pass | — / — | — / — | 42 |
+| 0.5.17 | `package`, v1 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | — / — | 48 |
+| 0.5.31 | `package`, v1 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | — / — | 48 |
+| 0.6.0 | `package`, v1 r1 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | — / — | 48 |
+| 0.6.14 | `package`, v1 r1 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | — / — | 48 |
+| 0.6.15 | `package`, v1 r2 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | 52 |
+| 0.6.17 | `package`, v1 r2 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | 52 |
+| 0.7.0 | `package`, v1 r2 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | 52 |
+| 0.7.22 | `package`, v1 r2 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | 52 |
+| 0.8.0 | `package`, v1 r2 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | 52 |
+| 0.8.3 | `package`, v1 r2 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | 52 |
+| 0.8.4 | `package`, v1 r3 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | 52 |
+| 0.8.24 | `package`, v1 r3 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | 52 |
+| 0.9.0 | `package`, v1 r3 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | 52 |
+| 0.9.30 | `package`, v1 r3 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | 52 |
+| 0.10.0 | `package`, v1 r3 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | 52 |
+| 0.10.12 | `package`, v1 r3 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | 52 |
+| 0.11.0 | `package`, v1 r3 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | 52 |
+| 0.11.33 | `package`, v1 r3 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | 52 |
+| 0.12.0 | `package`, v1 r3 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | 52 |
+| 0.12.15 | `package`, v1 r3 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | 52 |
 
 ### Project variants (uv ≥ 0.2.35)
 
@@ -336,46 +342,83 @@ and left the lock unpatched; “—” means the binary cannot lock that shape (
 `[dependency-groups]`, no `[manifest]` constraints, or no `exclude-newer`
 setting).
 
-_This results.json predates the project-variant lane; rerun the matrix to populate this table._
+| uv | tool-uv-dev H/V | dependency-groups H/V | extras-duplicate H/V | constraints H/V | transitive H/V |
+|----|-----------------|-----------------------|----------------------|-----------------|----------------|
+| 0.2.35 | Pass / Pass | — / — | Pass / Pass | — / — | Fail: locked, plain / Fail: locked, plain |
+| 0.2.36 | Pass / Pass | — / — | Pass / Pass | — / — | Fail: locked, plain / Fail: locked, plain |
+| 0.2.37 | Pass / Pass | — / — | Pass / Pass | Fail: locked / Fail: locked | Fail: locked, plain / Fail: locked, plain |
+| 0.3.0 | Pass / Pass | — / — | Pass / Pass | Fail: locked / Fail: locked | Fail: locked, plain / Fail: locked, plain |
+| 0.3.5 | Pass / Pass | — / — | Pass / Pass | Fail: locked / Fail: locked | Fail: locked, plain / Fail: locked, plain |
+| 0.4.0 | Pass / Pass | — / — | Pass / Pass | Fail: locked / Fail: locked | Fail: locked, plain / Fail: locked, plain |
+| 0.4.1 | Pass / Pass | — / — | Pass / Pass | Fail: locked / Fail: locked | Fail: locked, plain / Fail: locked, plain |
+| 0.4.30 | Pass / Pass | Pass / Pass | Pass / Pass | Fail: locked / Fail: locked | Fail: locked, plain / Fail: locked, plain |
+| 0.5.0 | Pass / Pass | Pass / Pass | Pass / Pass | Fail: locked / Fail: locked | Fail: locked, plain / Fail: locked, plain |
+| 0.5.16 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass |
+| 0.5.17 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass |
+| 0.5.31 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass |
+| 0.6.0 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass |
+| 0.6.14 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass |
+| 0.6.15 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass |
+| 0.6.17 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass |
+| 0.7.0 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass |
+| 0.7.22 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass |
+| 0.8.0 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass |
+| 0.8.3 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass |
+| 0.8.4 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass |
+| 0.8.24 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass |
+| 0.9.0 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass |
+| 0.9.30 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass |
+| 0.10.0 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass |
+| 0.10.12 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass |
+| 0.11.0 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass |
+| 0.11.33 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass |
+| 0.12.0 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass |
+| 0.12.15 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass |
 <!-- GENERATED:END -->
 
-Nonzero outcomes in this run, and what each one is:
+Nonzero outcomes and mismatches in this run, and what each one is:
 
 - uv 0.0.5 through 0.1.23 rejected vendored requirements' local wheel path
   syntax (`Unexpected '.', expected '-c', '-e', '-r' or the start of a
   requirement`); 0.1.24 onward accepted it. Both hosted requirements variants
-  installed the patch on every binary.
+  installed the patch on every binary. uv 0.0.5–0.1.44 have no working
+  `uv lock` (the `lock` rows exit 2), so their native lanes are `—`.
 - Native vendoring on every `[[distribution]]`-grammar binary (0.1.45 through
   0.2.34) was refused with `pypi_uv_legacy_lock_unsupported`; hosted native
   installs — in all three shapes: sub-table artifacts (through 0.2.5), inline
   artifacts with string sources (0.2.6–0.2.17), and inline-table sources
   (0.2.18–0.2.34) — and both requirements modes installed the patch.
-- ¹ uv 0.2.35, 0.2.36, 0.2.37 and 0.3.0 cannot build the root fixture from an empty
-  cache under `--offline` (`setuptools>=40.8.0` was absent). The
+- ¹ uv 0.2.35, 0.2.36, 0.2.37 and 0.3.0 cannot build the root fixture from an
+  empty cache under `--offline` (`setuptools>=40.8.0` was absent). The
   network-enabled retry (`project-vendored-frozen-sync-root-build-networked`)
   installed the patched wheel; the subsequent locked and ordinary installation
   checks also passed.
 - Export, script-lock, and PEP 751 commands unavailable in older binaries were
   recorded as unavailable, not installation successes (`uv export` from 0.4.1,
-  `uv lock --script` from 0.5.17, PEP 751 compilation from 0.6.15). Some older
-  uv binaries accepted an output filename ending in `pylock.toml` but emitted
-  requirements text; those results have `formatSupported: false`.
-- The 0.4.1 export rows (`project-*-export-*`, exit 2, `unexpected argument
-  '--output-file'`) are a harness gap, not a uv boundary: `uv export` exists on
-  0.4.1 but its `--output-file` flag only from 0.4.7, and this run passed the
-  flag. The harness now reads the export from stdout; on the next run the
-  0.4.1 "Requirements export" cell records the real install result (a
-  diagnostic run against the fixed harness installed the patched wheel in both
-  modes).
-- The project-variant table is empty for this run because the lane was added
-  afterwards. A diagnostic run of the lane against the same CLI build on uv
-  0.12.15 and 0.2.37 found the defects it was written to catch: vendored
-  `[tool.uv] dev-dependencies` and duplicate `requires-dist` entries and both
-  modes of `[manifest]` constraints failed `uv sync --locked` (`a hash was
-  expected but one was not found`), and on 0.2.37 the `[tool.uv]
-  dev-dependencies` and transitive fixtures also had a plain `uv sync` reinstall
-  the pristine wheel. The full rerun after the fixes replaces this note with
-  the table.
+  `uv lock --script` from 0.5.17, PEP 751 compilation from 0.6.15 — 0.6.14
+  exits 2 on the `pylock.toml` output). Some older uv binaries accepted an
+  output filename ending in `pylock.toml` but emitted requirements text; those
+  results have `formatSupported: false`.
+- The **18 installed-byte mismatches** are all the `transitive` variant's plain
+  `uv sync` rows on 0.2.35–0.5.0 (nine binaries, both modes): those releases
+  do not apply `[tool.uv.sources]` to `override-dependencies`, so the plain
+  sync re-resolves the override against the registry and installs the pristine
+  wheel; `--frozen` installed the patch on every one of them. This is the
+  boundary the `pypi_uv_override_requires_uv_0_5_6` advisory names; from
+  0.5.16 (the first ≥ 0.5.6 binary in the matrix) every install passes.
+- The **32 lock changes** and the 32 non-zero `--locked` rows are those same
+  18 transitive rows plus the `constraints` variant's plain-sync / `--locked`
+  rows on 0.2.37–0.5.0 (seven binaries, both modes): those releases serialize
+  `[manifest] constraints` as `{ name, specifier }` regardless of sources, so
+  they reject the repointed entry under `--locked` and rewrite it back on a
+  plain sync — which still installed the patch (no mismatch). 0.2.35 and
+  0.2.36 do not record constraints in the lock (`—`). This is the boundary the
+  `pypi_uv_constraints_require_uv_0_5_6` advisory names; from 0.5.16 every
+  constraints install passes with the lock untouched.
+- Every other `--locked`, `--frozen`, plain, script and PEP 751 install
+  delivered the patched bytes with the lock byte-unchanged, including the
+  `[tool.uv] dev-dependencies`, `[dependency-groups]` and extras-duplicate
+  shapes on every binary that can lock them.
 
 ## Completed conditional-requirements and refusal checks
 
