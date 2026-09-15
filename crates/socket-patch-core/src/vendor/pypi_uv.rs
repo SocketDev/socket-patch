@@ -663,6 +663,24 @@ pub(super) async fn wire_uv(
     // whole-line fragments before the requires-dist element they may be
     // byte-identical to is searched for.
     let constraint_edits = rewrite_manifest_constraints(&new_lock, canon_name, rel_wheel)?;
+    if !constraint_edits.is_empty() {
+        // uv 0.2.37–0.5.3 serialize `[manifest] constraints` as
+        // `{ name, specifier }` regardless of sources, so the repointed entry
+        // makes `uv sync --locked` fail there (a plain `uv sync` rewrites the
+        // entry back and still installs the patch; `--frozen` is unaffected);
+        // uv >= 0.5.6 REQUIRES the repoint. Same no-lock-marker situation as
+        // the override branch (matrix: 0.2.37–0.5.0 fail, 0.5.16+ pass) —
+        // advise rather than refuse.
+        advisories.push(VendorWarning::new(
+            "pypi_uv_constraints_require_uv_0_5_6",
+            format!(
+                "[manifest] constraints for {canon_name} were repointed at the vendored wheel, \
+                 the shape uv >= 0.5.6 writes; uv 0.2.37–0.5.3 reject it under `uv sync \
+                 --locked` (`--frozen` and a plain `uv sync` still install the patch) — pin uv \
+                 >= 0.5.6 or drop the constraint on the patched package"
+            ),
+        ));
+    }
     for edit in constraint_edits.iter().rev() {
         new_lock.replace_range(edit.span.clone(), &edit.new_entry);
     }
@@ -5212,7 +5230,7 @@ six = { path = ".socket/vendor/pypi/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/six-1.1
 
         let tmp = write_pair(CONSTRAINTS_REGISTRY_PYPROJECT, &registry_lock).await;
         let p = load_uv_project(tmp.path()).await.unwrap();
-        let (wiring, meta, _) = wire_uv(
+        let (wiring, meta, advisories) = wire_uv(
             &p,
             tmp.path(),
             "six",
@@ -5224,6 +5242,12 @@ six = { path = ".socket/vendor/pypi/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/six-1.1
         )
         .await
         .unwrap();
+
+        // The repoint is the uv >= 0.5.6 shape; 0.2.37–0.5.3 reject it under
+        // `--locked` (matrix: 0.2.37–0.5.0 fail, 0.5.16+ pass), so it advises.
+        let codes: Vec<&str> = advisories.iter().map(|w| w.code).collect();
+        assert_eq!(codes, vec!["pypi_uv_constraints_require_uv_0_5_6"]);
+        assert!(advisories[0].detail.contains("0.5.6"), "{}", advisories[0].detail);
 
         let (pyproject, lock) = read_pair(tmp.path()).await;
         assert_eq!(pyproject, CONSTRAINTS_PATH_PYPROJECT);

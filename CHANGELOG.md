@@ -90,7 +90,9 @@ into the new version's section — see docs/releasing.md.
   `uv sync` no longer rewrites it. `[tool.uv] constraint-dependencies` /
   `build-constraint-dependencies` naming the package have their `[manifest]`
   `constraints` / `build-constraints` entries repointed too (uv ≥ 0.5.6
-  serializes them with the package's source). The transitive
+  serializes them with the package's source; 0.2.37–0.5.3 reject the
+  repointed entry under `--locked`, so the repoint emits the advisory
+  `pypi_uv_constraints_require_uv_0_5_6`). The transitive
   (override-dependencies) branch emits the advisory
   `pypi_uv_override_requires_uv_0_5_6`: uv applies `[tool.uv.sources]` to
   overrides only from 0.5.6, so on 0.2.35–0.5.3 `--frozen` installs the
