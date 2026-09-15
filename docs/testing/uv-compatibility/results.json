@@ -1,0 +1,3897 @@
+{
+  "date": "2026-09-14",
+  "scope": "14 pinned uv releases on macOS-26.6.2-arm64-arm-64bit; interpreter /usr/bin/python3",
+  "socketPatchRevision": "e11bd419ea9c01b3ecd1aa894b55874718a3ff0a",
+  "socketPatchVersion": "socket-patch 4.0.0",
+  "socketPatchBinarySha256": "eb5f6695a06c2124ac5c09f2117bf42e8777d767aec09c1de6ee16cd9dc4adee",
+  "patchUuid": "e828efa5-5c6d-43f3-9909-03f5ac232b98",
+  "originalWheelSha256": "34b97092d7e0a3a8cf7cd10e386f401b3737364026c45e622aa02903dffe0f07",
+  "patchedWheelSha256": "ccc9a9e0b18a5efc7038c504cfc580e47d2e02e5390f2e29cad833cbccb956b6",
+  "patchedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+  "commands": {
+    "lock": {
+      "args": [
+        "<output>/bin/<uv-version>/uv",
+        "lock",
+        "--python",
+        "/usr/bin/python3"
+      ],
+      "cwd": "<output>/matrix/<uv-version>/original"
+    },
+    "requirements-hosted-socket-patch": {
+      "args": [
+        "<socket-patch>",
+        "scan",
+        "--cwd",
+        "<output>/matrix/<uv-version>/requirements-hosted",
+        "--mode",
+        "hosted",
+        "--json",
+        "--yes",
+        "--no-telemetry"
+      ],
+      "cwd": "<output>/matrix/<uv-version>/requirements-hosted"
+    },
+    "requirements-hosted-pip-sync": {
+      "args": [
+        "<output>/bin/<uv-version>/uv",
+        "pip",
+        "sync",
+        "requirements.txt"
+      ],
+      "cwd": "<output>/matrix/<uv-version>/requirements-hosted"
+    },
+    "requirements-vendored-socket-patch": {
+      "args": [
+        "<socket-patch>",
+        "scan",
+        "--cwd",
+        "<output>/matrix/<uv-version>/requirements-vendored",
+        "--mode",
+        "vendored",
+        "--json",
+        "--yes",
+        "--no-telemetry"
+      ],
+      "cwd": "<output>/matrix/<uv-version>/requirements-vendored"
+    },
+    "requirements-vendored-pip-sync": {
+      "args": [
+        "<output>/bin/<uv-version>/uv",
+        "pip",
+        "sync",
+        "requirements.txt"
+      ],
+      "cwd": "<output>/matrix/<uv-version>/requirements-vendored"
+    },
+    "compile-plain": {
+      "args": [
+        "<output>/bin/<uv-version>/uv",
+        "pip",
+        "compile",
+        "requirements.in",
+        "-o",
+        "requirements.txt"
+      ],
+      "cwd": "<output>/matrix/<uv-version>/requirements-plain-hosted"
+    },
+    "requirements-plain-hosted-socket-patch": {
+      "args": [
+        "<socket-patch>",
+        "scan",
+        "--cwd",
+        "<output>/matrix/<uv-version>/requirements-plain-hosted",
+        "--mode",
+        "hosted",
+        "--json",
+        "--yes",
+        "--no-telemetry"
+      ],
+      "cwd": "<output>/matrix/<uv-version>/requirements-plain-hosted"
+    },
+    "requirements-plain-hosted-pip-sync": {
+      "args": [
+        "<output>/bin/<uv-version>/uv",
+        "pip",
+        "sync",
+        "requirements.txt"
+      ],
+      "cwd": "<output>/matrix/<uv-version>/requirements-plain-hosted"
+    },
+    "compile-plain-variant-2": {
+      "args": [
+        "<output>/bin/<uv-version>/uv",
+        "pip",
+        "compile",
+        "requirements.in",
+        "-o",
+        "requirements.txt"
+      ],
+      "cwd": "<output>/matrix/<uv-version>/requirements-plain-vendored"
+    },
+    "requirements-plain-vendored-socket-patch": {
+      "args": [
+        "<socket-patch>",
+        "scan",
+        "--cwd",
+        "<output>/matrix/<uv-version>/requirements-plain-vendored",
+        "--mode",
+        "vendored",
+        "--json",
+        "--yes",
+        "--no-telemetry"
+      ],
+      "cwd": "<output>/matrix/<uv-version>/requirements-plain-vendored"
+    },
+    "requirements-plain-vendored-pip-sync": {
+      "args": [
+        "<output>/bin/<uv-version>/uv",
+        "pip",
+        "sync",
+        "requirements.txt"
+      ],
+      "cwd": "<output>/matrix/<uv-version>/requirements-plain-vendored"
+    },
+    "script-lock-hosted": {
+      "args": [
+        "<output>/bin/<uv-version>/uv",
+        "lock",
+        "--script",
+        "example.py",
+        "--python",
+        "/usr/bin/python3"
+      ],
+      "cwd": "<output>/matrix/<uv-version>/script-direct-hosted"
+    },
+    "script-lock-vendored": {
+      "args": [
+        "<output>/bin/<uv-version>/uv",
+        "lock",
+        "--script",
+        "example.py",
+        "--python",
+        "/usr/bin/python3"
+      ],
+      "cwd": "<output>/matrix/<uv-version>/script-direct-vendored"
+    },
+    "compile-pylock-hosted": {
+      "args": [
+        "<output>/bin/<uv-version>/uv",
+        "pip",
+        "compile",
+        "requirements.in",
+        "--python-version",
+        "3.9",
+        "-o",
+        "pylock.toml"
+      ],
+      "cwd": "<output>/matrix/<uv-version>/pylock-direct-hosted"
+    },
+    "compile-pylock-vendored": {
+      "args": [
+        "<output>/bin/<uv-version>/uv",
+        "pip",
+        "compile",
+        "requirements.in",
+        "--python-version",
+        "3.9",
+        "-o",
+        "pylock.toml"
+      ],
+      "cwd": "<output>/matrix/<uv-version>/pylock-direct-vendored"
+    },
+    "project-hosted-socket-patch": {
+      "args": [
+        "<socket-patch>",
+        "scan",
+        "--cwd",
+        "<output>/matrix/<uv-version>/project-hosted",
+        "--mode",
+        "hosted",
+        "--json",
+        "--yes",
+        "--no-telemetry"
+      ],
+      "cwd": "<output>/matrix/<uv-version>/project-hosted"
+    },
+    "project-hosted-export-requirements-txt": {
+      "args": [
+        "<output>/bin/<uv-version>/uv",
+        "export",
+        "--frozen",
+        "--format",
+        "requirements-txt",
+        "--output-file",
+        "export-requirements.txt"
+      ],
+      "cwd": "<output>/matrix/<uv-version>/project-hosted"
+    },
+    "project-hosted-export-pylock.toml": {
+      "args": [
+        "<output>/bin/<uv-version>/uv",
+        "export",
+        "--frozen",
+        "--format",
+        "pylock.toml",
+        "--output-file",
+        "pylock.toml"
+      ],
+      "cwd": "<output>/matrix/<uv-version>/project-hosted"
+    },
+    "project-hosted-lock-sync": {
+      "args": [
+        "<output>/bin/<uv-version>/uv",
+        "sync",
+        "--python",
+        "/usr/bin/python3"
+      ],
+      "cwd": "<output>/matrix/<uv-version>/project-hosted"
+    },
+    "project-vendored-socket-patch": {
+      "args": [
+        "<socket-patch>",
+        "scan",
+        "--cwd",
+        "<output>/matrix/<uv-version>/project-vendored",
+        "--mode",
+        "vendored",
+        "--json",
+        "--yes",
+        "--no-telemetry"
+      ],
+      "cwd": "<output>/matrix/<uv-version>/project-vendored"
+    },
+    "project-hosted-unfrozen-install": {
+      "args": [
+        "<output>/bin/<uv-version>/uv",
+        "sync",
+        "--python",
+        "/usr/bin/python3"
+      ],
+      "cwd": "<output>/matrix/<uv-version>/project-unfrozen-hosted"
+    },
+    "project-hosted-lock-sync-variant-2": {
+      "args": [
+        "<output>/bin/<uv-version>/uv",
+        "sync",
+        "--python",
+        "/usr/bin/python3",
+        "--frozen"
+      ],
+      "cwd": "<output>/matrix/<uv-version>/project-hosted"
+    },
+    "project-vendored-export-requirements-txt": {
+      "args": [
+        "<output>/bin/<uv-version>/uv",
+        "export",
+        "--frozen",
+        "--format",
+        "requirements-txt",
+        "--output-file",
+        "export-requirements.txt"
+      ],
+      "cwd": "<output>/matrix/<uv-version>/project-vendored"
+    },
+    "project-vendored-export-pylock.toml": {
+      "args": [
+        "<output>/bin/<uv-version>/uv",
+        "export",
+        "--frozen",
+        "--format",
+        "pylock.toml",
+        "--output-file",
+        "pylock.toml"
+      ],
+      "cwd": "<output>/matrix/<uv-version>/project-vendored"
+    },
+    "project-vendored-lock-sync": {
+      "args": [
+        "<output>/bin/<uv-version>/uv",
+        "sync",
+        "--python",
+        "/usr/bin/python3",
+        "--frozen",
+        "--offline"
+      ],
+      "cwd": "<output>/matrix/<uv-version>/project-vendored"
+    },
+    "project-vendored-frozen-sync-root-build-networked": {
+      "args": [
+        "<output>/bin/<uv-version>/uv",
+        "sync",
+        "--frozen",
+        "--python",
+        "/usr/bin/python3"
+      ],
+      "cwd": "<output>/matrix/<uv-version>/project-vendored"
+    },
+    "project-hosted-locked-install": {
+      "args": [
+        "<output>/bin/<uv-version>/uv",
+        "sync",
+        "--locked",
+        "--python",
+        "/usr/bin/python3"
+      ],
+      "cwd": "<output>/matrix/<uv-version>/project-unfrozen-hosted"
+    },
+    "project-vendored-locked-install": {
+      "args": [
+        "<output>/bin/<uv-version>/uv",
+        "sync",
+        "--locked",
+        "--python",
+        "/usr/bin/python3"
+      ],
+      "cwd": "<output>/matrix/<uv-version>/project-unfrozen-vendored"
+    },
+    "project-vendored-unfrozen-install": {
+      "args": [
+        "<output>/bin/<uv-version>/uv",
+        "sync",
+        "--python",
+        "/usr/bin/python3"
+      ],
+      "cwd": "<output>/matrix/<uv-version>/project-unfrozen-vendored"
+    },
+    "project-hosted-lock-sync-variant-3": {
+      "args": [
+        "<output>/bin/<uv-version>/uv",
+        "sync",
+        "--python",
+        "/usr/bin/python3",
+        "--frozen",
+        "--no-install-project"
+      ],
+      "cwd": "<output>/matrix/<uv-version>/project-hosted"
+    },
+    "project-vendored-lock-sync-variant-2": {
+      "args": [
+        "<output>/bin/<uv-version>/uv",
+        "sync",
+        "--python",
+        "/usr/bin/python3",
+        "--frozen",
+        "--no-install-project",
+        "--offline"
+      ],
+      "cwd": "<output>/matrix/<uv-version>/project-vendored"
+    },
+    "project-hosted-locked-install-variant-2": {
+      "args": [
+        "<output>/bin/<uv-version>/uv",
+        "sync",
+        "--locked",
+        "--python",
+        "/usr/bin/python3",
+        "--no-install-project"
+      ],
+      "cwd": "<output>/matrix/<uv-version>/project-unfrozen-hosted"
+    },
+    "project-hosted-unfrozen-install-variant-2": {
+      "args": [
+        "<output>/bin/<uv-version>/uv",
+        "sync",
+        "--python",
+        "/usr/bin/python3",
+        "--no-install-project"
+      ],
+      "cwd": "<output>/matrix/<uv-version>/project-unfrozen-hosted"
+    },
+    "project-vendored-locked-install-variant-2": {
+      "args": [
+        "<output>/bin/<uv-version>/uv",
+        "sync",
+        "--locked",
+        "--python",
+        "/usr/bin/python3",
+        "--no-install-project"
+      ],
+      "cwd": "<output>/matrix/<uv-version>/project-unfrozen-vendored"
+    },
+    "project-vendored-unfrozen-install-variant-2": {
+      "args": [
+        "<output>/bin/<uv-version>/uv",
+        "sync",
+        "--python",
+        "/usr/bin/python3",
+        "--no-install-project"
+      ],
+      "cwd": "<output>/matrix/<uv-version>/project-unfrozen-vendored"
+    },
+    "requirements-hosted-export-sync": {
+      "args": [
+        "<output>/bin/<uv-version>/uv",
+        "pip",
+        "sync",
+        "requirements.txt"
+      ],
+      "cwd": "<output>/matrix/<uv-version>/export-requirements-hosted"
+    },
+    "requirements-vendored-export-sync": {
+      "args": [
+        "<output>/bin/<uv-version>/uv",
+        "pip",
+        "sync",
+        "requirements.txt",
+        "--offline"
+      ],
+      "cwd": "<output>/matrix/<uv-version>/export-requirements-vendored"
+    },
+    "script-direct-hosted-socket-patch": {
+      "args": [
+        "<socket-patch>",
+        "scan",
+        "--cwd",
+        "<output>/matrix/<uv-version>/script-direct-hosted",
+        "--mode",
+        "hosted",
+        "--json",
+        "--yes",
+        "--no-telemetry"
+      ],
+      "cwd": "<output>/matrix/<uv-version>/script-direct-hosted"
+    },
+    "script-direct-hosted-install": {
+      "args": [
+        "<output>/bin/<uv-version>/uv",
+        "run",
+        "--frozen",
+        "--python",
+        "/usr/bin/python3",
+        "--script",
+        "example.py"
+      ],
+      "cwd": "<output>/matrix/<uv-version>/script-direct-hosted"
+    },
+    "script-direct-vendored-socket-patch": {
+      "args": [
+        "<socket-patch>",
+        "scan",
+        "--cwd",
+        "<output>/matrix/<uv-version>/script-direct-vendored",
+        "--mode",
+        "vendored",
+        "--json",
+        "--yes",
+        "--no-telemetry"
+      ],
+      "cwd": "<output>/matrix/<uv-version>/script-direct-vendored"
+    },
+    "script-direct-vendored-install": {
+      "args": [
+        "<output>/bin/<uv-version>/uv",
+        "run",
+        "--offline",
+        "--frozen",
+        "--python",
+        "/usr/bin/python3",
+        "--script",
+        "example.py"
+      ],
+      "cwd": "<output>/matrix/<uv-version>/script-direct-vendored"
+    },
+    "script-hosted-locked-install": {
+      "args": [
+        "<output>/bin/<uv-version>/uv",
+        "run",
+        "--locked",
+        "--python",
+        "/usr/bin/python3",
+        "--script",
+        "example.py"
+      ],
+      "cwd": "<output>/matrix/<uv-version>/script-unfrozen-hosted"
+    },
+    "script-hosted-unfrozen-install": {
+      "args": [
+        "<output>/bin/<uv-version>/uv",
+        "run",
+        "--python",
+        "/usr/bin/python3",
+        "--script",
+        "example.py"
+      ],
+      "cwd": "<output>/matrix/<uv-version>/script-unfrozen-hosted"
+    },
+    "script-vendored-locked-install": {
+      "args": [
+        "<output>/bin/<uv-version>/uv",
+        "run",
+        "--locked",
+        "--python",
+        "/usr/bin/python3",
+        "--script",
+        "example.py"
+      ],
+      "cwd": "<output>/matrix/<uv-version>/script-unfrozen-vendored"
+    },
+    "script-vendored-unfrozen-install": {
+      "args": [
+        "<output>/bin/<uv-version>/uv",
+        "run",
+        "--python",
+        "/usr/bin/python3",
+        "--script",
+        "example.py"
+      ],
+      "cwd": "<output>/matrix/<uv-version>/script-unfrozen-vendored"
+    },
+    "pylock-hosted-export-sync": {
+      "args": [
+        "<output>/bin/<uv-version>/uv",
+        "pip",
+        "sync",
+        "pylock.toml"
+      ],
+      "cwd": "<output>/matrix/<uv-version>/export-pylock-hosted"
+    },
+    "pylock-vendored-export-sync": {
+      "args": [
+        "<output>/bin/<uv-version>/uv",
+        "pip",
+        "sync",
+        "pylock.toml",
+        "--offline"
+      ],
+      "cwd": "<output>/matrix/<uv-version>/export-pylock-vendored"
+    },
+    "pylock-direct-hosted-socket-patch": {
+      "args": [
+        "<socket-patch>",
+        "scan",
+        "--cwd",
+        "<output>/matrix/<uv-version>/pylock-direct-hosted",
+        "--mode",
+        "hosted",
+        "--json",
+        "--yes",
+        "--no-telemetry"
+      ],
+      "cwd": "<output>/matrix/<uv-version>/pylock-direct-hosted"
+    },
+    "pylock-direct-hosted-install": {
+      "args": [
+        "<output>/bin/<uv-version>/uv",
+        "pip",
+        "sync",
+        "pylock.toml"
+      ],
+      "cwd": "<output>/matrix/<uv-version>/pylock-direct-hosted"
+    },
+    "pylock-direct-vendored-socket-patch": {
+      "args": [
+        "<socket-patch>",
+        "scan",
+        "--cwd",
+        "<output>/matrix/<uv-version>/pylock-direct-vendored",
+        "--mode",
+        "vendored",
+        "--json",
+        "--yes",
+        "--no-telemetry"
+      ],
+      "cwd": "<output>/matrix/<uv-version>/pylock-direct-vendored"
+    },
+    "pylock-direct-vendored-install": {
+      "args": [
+        "<output>/bin/<uv-version>/uv",
+        "pip",
+        "--offline",
+        "sync",
+        "pylock.toml"
+      ],
+      "cwd": "<output>/matrix/<uv-version>/pylock-direct-vendored"
+    }
+  },
+  "versions": [
+    {
+      "version": "0.0.5",
+      "lockSchema": null,
+      "lockVersion": null,
+      "lockRevision": null,
+      "observations": [
+        {
+          "command": "lock",
+          "exitCode": 2,
+          "diagnostic": "error: unrecognized subcommand 'lock'\n\n  tip: a similar subcommand exists: 'uv pip compile'\n\nUsage: uv [OPTIONS] <COMMAND>\n\nFor more information, try '--help'.\n"
+        },
+        {
+          "command": "requirements-hosted-socket-patch",
+          "exitCode": 0,
+          "rewrittenFiles": [
+            "requirements.txt"
+          ],
+          "redirected": 1,
+          "warnings": []
+        },
+        {
+          "command": "requirements-hosted-pip-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "requirements-vendored-socket-patch",
+          "exitCode": 0,
+          "vendorSummary": {
+            "applied": 1,
+            "failed": 0
+          },
+          "vendorErrors": []
+        },
+        {
+          "command": "requirements-vendored-pip-sync",
+          "exitCode": 2,
+          "diagnostic": "error: Unexpected '.', expected '-c', '-e', '-r' or the start of a requirement in `requirements.txt` at position 144\n"
+        },
+        {
+          "command": "compile-plain",
+          "exitCode": 0
+        },
+        {
+          "command": "requirements-plain-hosted-socket-patch",
+          "exitCode": 0,
+          "rewrittenFiles": [
+            "requirements.txt"
+          ],
+          "redirected": 1,
+          "warnings": []
+        },
+        {
+          "command": "requirements-plain-hosted-pip-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "compile-plain-variant-2",
+          "exitCode": 0
+        },
+        {
+          "command": "requirements-plain-vendored-socket-patch",
+          "exitCode": 0,
+          "vendorSummary": {
+            "applied": 1,
+            "failed": 0
+          },
+          "vendorErrors": []
+        },
+        {
+          "command": "requirements-plain-vendored-pip-sync",
+          "exitCode": 2,
+          "diagnostic": "error: Unexpected '.', expected '-c', '-e', '-r' or the start of a requirement in `requirements.txt` at position 126\n"
+        },
+        {
+          "command": "script-lock-hosted",
+          "exitCode": 2,
+          "diagnostic": "error: unrecognized subcommand 'lock'\n\n  tip: a similar subcommand exists: 'uv pip compile'\n\nUsage: uv [OPTIONS] <COMMAND>\n\nFor more information, try '--help'.\n"
+        },
+        {
+          "command": "script-lock-vendored",
+          "exitCode": 2,
+          "diagnostic": "error: unrecognized subcommand 'lock'\n\n  tip: a similar subcommand exists: 'uv pip compile'\n\nUsage: uv [OPTIONS] <COMMAND>\n\nFor more information, try '--help'.\n"
+        },
+        {
+          "command": "compile-pylock-hosted",
+          "exitCode": 0,
+          "formatSupported": false
+        },
+        {
+          "command": "compile-pylock-vendored",
+          "exitCode": 0,
+          "formatSupported": false
+        }
+      ]
+    },
+    {
+      "version": "0.1.45",
+      "lockSchema": "distribution",
+      "lockVersion": 1,
+      "lockRevision": null,
+      "observations": [
+        {
+          "command": "lock",
+          "exitCode": 0
+        },
+        {
+          "command": "project-hosted-socket-patch",
+          "exitCode": 0,
+          "rewrittenFiles": [
+            "pyproject.toml",
+            "uv.lock"
+          ],
+          "redirected": 1,
+          "warnings": []
+        },
+        {
+          "command": "project-hosted-export-requirements-txt",
+          "exitCode": 2,
+          "diagnostic": "error: unrecognized subcommand 'export'\n\nUsage: uv [OPTIONS] <COMMAND>\n\nFor more information, try '--help'.\n"
+        },
+        {
+          "command": "project-hosted-export-pylock.toml",
+          "exitCode": 2,
+          "diagnostic": "error: unrecognized subcommand 'export'\n\nUsage: uv [OPTIONS] <COMMAND>\n\nFor more information, try '--help'.\n"
+        },
+        {
+          "command": "project-hosted-lock-sync",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "project-vendored-socket-patch",
+          "exitCode": 1,
+          "vendorSummary": {
+            "applied": 0,
+            "failed": 1
+          },
+          "vendorErrors": [
+            {
+              "action": "failed",
+              "purl": "pkg:pypi/urllib3@1.26.18?artifact_id=py2-py3-none-any-whl",
+              "errorCode": "pypi_uv_legacy_lock_unsupported",
+              "error": "uv 0.1 lockfiles require absolute file URLs; upgrade to uv >=0.2 for portable native vendoring, or use a requirements.txt installation"
+            }
+          ]
+        },
+        {
+          "command": "requirements-hosted-socket-patch",
+          "exitCode": 0,
+          "rewrittenFiles": [
+            "requirements.txt"
+          ],
+          "redirected": 1,
+          "warnings": []
+        },
+        {
+          "command": "requirements-hosted-pip-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "requirements-vendored-socket-patch",
+          "exitCode": 0,
+          "vendorSummary": {
+            "applied": 1,
+            "failed": 0
+          },
+          "vendorErrors": []
+        },
+        {
+          "command": "requirements-vendored-pip-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "compile-plain",
+          "exitCode": 0
+        },
+        {
+          "command": "requirements-plain-hosted-socket-patch",
+          "exitCode": 0,
+          "rewrittenFiles": [
+            "requirements.txt"
+          ],
+          "redirected": 1,
+          "warnings": []
+        },
+        {
+          "command": "requirements-plain-hosted-pip-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "compile-plain-variant-2",
+          "exitCode": 0
+        },
+        {
+          "command": "requirements-plain-vendored-socket-patch",
+          "exitCode": 0,
+          "vendorSummary": {
+            "applied": 1,
+            "failed": 0
+          },
+          "vendorErrors": []
+        },
+        {
+          "command": "requirements-plain-vendored-pip-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "script-lock-hosted",
+          "exitCode": 2,
+          "diagnostic": "error: unexpected argument '--script' found\n\nUsage: uv lock [OPTIONS]\n\nFor more information, try '--help'.\n"
+        },
+        {
+          "command": "script-lock-vendored",
+          "exitCode": 2,
+          "diagnostic": "error: unexpected argument '--script' found\n\nUsage: uv lock [OPTIONS]\n\nFor more information, try '--help'.\n"
+        },
+        {
+          "command": "compile-pylock-hosted",
+          "exitCode": 0,
+          "formatSupported": false
+        },
+        {
+          "command": "compile-pylock-vendored",
+          "exitCode": 0,
+          "formatSupported": false
+        },
+        {
+          "command": "project-hosted-unfrozen-install",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        }
+      ]
+    },
+    {
+      "version": "0.2.37",
+      "lockSchema": "package",
+      "lockVersion": 1,
+      "lockRevision": null,
+      "observations": [
+        {
+          "command": "lock",
+          "exitCode": 0
+        },
+        {
+          "command": "project-hosted-socket-patch",
+          "exitCode": 0,
+          "rewrittenFiles": [
+            "pyproject.toml",
+            "uv.lock"
+          ],
+          "redirected": 1,
+          "warnings": []
+        },
+        {
+          "command": "project-hosted-export-requirements-txt",
+          "exitCode": 2,
+          "diagnostic": "error: unrecognized subcommand 'export'\n\nUsage: uv [OPTIONS] <COMMAND>\n\nFor more information, try '--help'.\n"
+        },
+        {
+          "command": "project-hosted-export-pylock.toml",
+          "exitCode": 2,
+          "diagnostic": "error: unrecognized subcommand 'export'\n\nUsage: uv [OPTIONS] <COMMAND>\n\nFor more information, try '--help'.\n"
+        },
+        {
+          "command": "project-hosted-lock-sync-variant-2",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "project-vendored-socket-patch",
+          "exitCode": 0,
+          "vendorSummary": {
+            "applied": 1,
+            "failed": 0
+          },
+          "vendorErrors": []
+        },
+        {
+          "command": "project-vendored-export-requirements-txt",
+          "exitCode": 2,
+          "diagnostic": "error: unrecognized subcommand 'export'\n\nUsage: uv [OPTIONS] <COMMAND>\n\nFor more information, try '--help'.\n"
+        },
+        {
+          "command": "project-vendored-export-pylock.toml",
+          "exitCode": 2,
+          "diagnostic": "error: unrecognized subcommand 'export'\n\nUsage: uv [OPTIONS] <COMMAND>\n\nFor more information, try '--help'.\n"
+        },
+        {
+          "command": "project-vendored-lock-sync",
+          "exitCode": 2,
+          "lockUnchanged": true,
+          "diagnostic": "warning: `uv sync` is experimental and may change without warning\nUsing Python 3.9.6 interpreter at: /Applications/Xcode.app/Contents/Developer/usr/bin/python3\nCreating virtualenv at: .venv\nerror: Failed to prepare distributions\n  Caused by: Failed to fetch wheel: socket-uv-patch-fixture @ file://<output>/matrix/0.2.37/project-vendored\n  Caused by: Failed to install requirements from setup.py build (resolve)\n  Caused by: No solution found when resolving: setuptools>=40.8.0\n  Caused by: Because setuptools was not found in the cache and you require setuptools>=40.8.0, we can conclude that your requirements are unsatisfiable.\n\nhint: Packages were unavailable because the network was disabled\n"
+        },
+        {
+          "command": "requirements-hosted-socket-patch",
+          "exitCode": 0,
+          "rewrittenFiles": [
+            "requirements.txt"
+          ],
+          "redirected": 1,
+          "warnings": []
+        },
+        {
+          "command": "requirements-hosted-pip-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "requirements-vendored-socket-patch",
+          "exitCode": 0,
+          "vendorSummary": {
+            "applied": 1,
+            "failed": 0
+          },
+          "vendorErrors": []
+        },
+        {
+          "command": "requirements-vendored-pip-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "compile-plain",
+          "exitCode": 0
+        },
+        {
+          "command": "requirements-plain-hosted-socket-patch",
+          "exitCode": 0,
+          "rewrittenFiles": [
+            "requirements.txt"
+          ],
+          "redirected": 1,
+          "warnings": []
+        },
+        {
+          "command": "requirements-plain-hosted-pip-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "compile-plain-variant-2",
+          "exitCode": 0
+        },
+        {
+          "command": "requirements-plain-vendored-socket-patch",
+          "exitCode": 0,
+          "vendorSummary": {
+            "applied": 1,
+            "failed": 0
+          },
+          "vendorErrors": []
+        },
+        {
+          "command": "requirements-plain-vendored-pip-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "project-vendored-frozen-sync-root-build-networked",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "script-lock-hosted",
+          "exitCode": 2,
+          "diagnostic": "error: unexpected argument '--script' found\n\nUsage: uv lock [OPTIONS]\n\nFor more information, try '--help'.\n"
+        },
+        {
+          "command": "script-lock-vendored",
+          "exitCode": 2,
+          "diagnostic": "error: unexpected argument '--script' found\n\nUsage: uv lock [OPTIONS]\n\nFor more information, try '--help'.\n"
+        },
+        {
+          "command": "compile-pylock-hosted",
+          "exitCode": 0,
+          "formatSupported": false
+        },
+        {
+          "command": "compile-pylock-vendored",
+          "exitCode": 0,
+          "formatSupported": false
+        },
+        {
+          "command": "project-hosted-locked-install",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "project-hosted-unfrozen-install",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "project-vendored-locked-install",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "project-vendored-unfrozen-install",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        }
+      ]
+    },
+    {
+      "version": "0.3.5",
+      "lockSchema": "package",
+      "lockVersion": 1,
+      "lockRevision": null,
+      "observations": [
+        {
+          "command": "lock",
+          "exitCode": 0
+        },
+        {
+          "command": "project-hosted-socket-patch",
+          "exitCode": 0,
+          "rewrittenFiles": [
+            "pyproject.toml",
+            "uv.lock"
+          ],
+          "redirected": 1,
+          "warnings": []
+        },
+        {
+          "command": "project-hosted-export-requirements-txt",
+          "exitCode": 2,
+          "diagnostic": "error: unrecognized subcommand 'export'\n\nUsage: uv [OPTIONS] <COMMAND>\n\nFor more information, try '--help'.\n"
+        },
+        {
+          "command": "project-hosted-export-pylock.toml",
+          "exitCode": 2,
+          "diagnostic": "error: unrecognized subcommand 'export'\n\nUsage: uv [OPTIONS] <COMMAND>\n\nFor more information, try '--help'.\n"
+        },
+        {
+          "command": "project-hosted-lock-sync-variant-3",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "project-vendored-socket-patch",
+          "exitCode": 0,
+          "vendorSummary": {
+            "applied": 1,
+            "failed": 0
+          },
+          "vendorErrors": []
+        },
+        {
+          "command": "project-vendored-export-requirements-txt",
+          "exitCode": 2,
+          "diagnostic": "error: unrecognized subcommand 'export'\n\nUsage: uv [OPTIONS] <COMMAND>\n\nFor more information, try '--help'.\n"
+        },
+        {
+          "command": "project-vendored-export-pylock.toml",
+          "exitCode": 2,
+          "diagnostic": "error: unrecognized subcommand 'export'\n\nUsage: uv [OPTIONS] <COMMAND>\n\nFor more information, try '--help'.\n"
+        },
+        {
+          "command": "project-vendored-lock-sync-variant-2",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "requirements-hosted-socket-patch",
+          "exitCode": 0,
+          "rewrittenFiles": [
+            "requirements.txt"
+          ],
+          "redirected": 1,
+          "warnings": []
+        },
+        {
+          "command": "requirements-hosted-pip-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "requirements-vendored-socket-patch",
+          "exitCode": 0,
+          "vendorSummary": {
+            "applied": 1,
+            "failed": 0
+          },
+          "vendorErrors": []
+        },
+        {
+          "command": "requirements-vendored-pip-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "compile-plain",
+          "exitCode": 0
+        },
+        {
+          "command": "requirements-plain-hosted-socket-patch",
+          "exitCode": 0,
+          "rewrittenFiles": [
+            "requirements.txt"
+          ],
+          "redirected": 1,
+          "warnings": []
+        },
+        {
+          "command": "requirements-plain-hosted-pip-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "compile-plain-variant-2",
+          "exitCode": 0
+        },
+        {
+          "command": "requirements-plain-vendored-socket-patch",
+          "exitCode": 0,
+          "vendorSummary": {
+            "applied": 1,
+            "failed": 0
+          },
+          "vendorErrors": []
+        },
+        {
+          "command": "requirements-plain-vendored-pip-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "script-lock-hosted",
+          "exitCode": 2,
+          "diagnostic": "error: unexpected argument '--script' found\n\nUsage: uv lock [OPTIONS]\n\nFor more information, try '--help'.\n"
+        },
+        {
+          "command": "script-lock-vendored",
+          "exitCode": 2,
+          "diagnostic": "error: unexpected argument '--script' found\n\nUsage: uv lock [OPTIONS]\n\nFor more information, try '--help'.\n"
+        },
+        {
+          "command": "compile-pylock-hosted",
+          "exitCode": 0,
+          "formatSupported": false
+        },
+        {
+          "command": "compile-pylock-vendored",
+          "exitCode": 0,
+          "formatSupported": false
+        },
+        {
+          "command": "project-hosted-locked-install-variant-2",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "project-hosted-unfrozen-install-variant-2",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "project-vendored-locked-install-variant-2",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "project-vendored-unfrozen-install-variant-2",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        }
+      ]
+    },
+    {
+      "version": "0.4.30",
+      "lockSchema": "package",
+      "lockVersion": 1,
+      "lockRevision": null,
+      "observations": [
+        {
+          "command": "lock",
+          "exitCode": 0
+        },
+        {
+          "command": "project-hosted-socket-patch",
+          "exitCode": 0,
+          "rewrittenFiles": [
+            "pyproject.toml",
+            "uv.lock"
+          ],
+          "redirected": 1,
+          "warnings": []
+        },
+        {
+          "command": "project-hosted-export-requirements-txt",
+          "exitCode": 0
+        },
+        {
+          "command": "project-hosted-export-pylock.toml",
+          "exitCode": 2,
+          "diagnostic": "error: invalid value 'pylock.toml' for '--format <FORMAT>'\n  [possible values: requirements-txt]\n\nFor more information, try '--help'.\n"
+        },
+        {
+          "command": "project-hosted-lock-sync-variant-3",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "project-vendored-socket-patch",
+          "exitCode": 0,
+          "vendorSummary": {
+            "applied": 1,
+            "failed": 0
+          },
+          "vendorErrors": []
+        },
+        {
+          "command": "project-vendored-export-requirements-txt",
+          "exitCode": 0
+        },
+        {
+          "command": "project-vendored-export-pylock.toml",
+          "exitCode": 2,
+          "diagnostic": "error: invalid value 'pylock.toml' for '--format <FORMAT>'\n  [possible values: requirements-txt]\n\nFor more information, try '--help'.\n"
+        },
+        {
+          "command": "project-vendored-lock-sync-variant-2",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "requirements-hosted-socket-patch",
+          "exitCode": 0,
+          "rewrittenFiles": [
+            "requirements.txt"
+          ],
+          "redirected": 1,
+          "warnings": []
+        },
+        {
+          "command": "requirements-hosted-pip-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "requirements-vendored-socket-patch",
+          "exitCode": 0,
+          "vendorSummary": {
+            "applied": 1,
+            "failed": 0
+          },
+          "vendorErrors": []
+        },
+        {
+          "command": "requirements-vendored-pip-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "compile-plain",
+          "exitCode": 0
+        },
+        {
+          "command": "requirements-plain-hosted-socket-patch",
+          "exitCode": 0,
+          "rewrittenFiles": [
+            "requirements.txt"
+          ],
+          "redirected": 1,
+          "warnings": []
+        },
+        {
+          "command": "requirements-plain-hosted-pip-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "compile-plain-variant-2",
+          "exitCode": 0
+        },
+        {
+          "command": "requirements-plain-vendored-socket-patch",
+          "exitCode": 0,
+          "vendorSummary": {
+            "applied": 1,
+            "failed": 0
+          },
+          "vendorErrors": []
+        },
+        {
+          "command": "requirements-plain-vendored-pip-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "requirements-hosted-export-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "requirements-vendored-export-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "script-lock-hosted",
+          "exitCode": 2,
+          "diagnostic": "error: unexpected argument '--script' found\n\nUsage: uv lock [OPTIONS]\n\nFor more information, try '--help'.\n"
+        },
+        {
+          "command": "script-lock-vendored",
+          "exitCode": 2,
+          "diagnostic": "error: unexpected argument '--script' found\n\nUsage: uv lock [OPTIONS]\n\nFor more information, try '--help'.\n"
+        },
+        {
+          "command": "compile-pylock-hosted",
+          "exitCode": 0,
+          "formatSupported": false
+        },
+        {
+          "command": "compile-pylock-vendored",
+          "exitCode": 0,
+          "formatSupported": false
+        },
+        {
+          "command": "project-hosted-locked-install-variant-2",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "project-hosted-unfrozen-install-variant-2",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "project-vendored-locked-install-variant-2",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "project-vendored-unfrozen-install-variant-2",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        }
+      ]
+    },
+    {
+      "version": "0.5.31",
+      "lockSchema": "package",
+      "lockVersion": 1,
+      "lockRevision": null,
+      "observations": [
+        {
+          "command": "lock",
+          "exitCode": 0
+        },
+        {
+          "command": "project-hosted-socket-patch",
+          "exitCode": 0,
+          "rewrittenFiles": [
+            "pyproject.toml",
+            "uv.lock"
+          ],
+          "redirected": 1,
+          "warnings": []
+        },
+        {
+          "command": "project-hosted-export-requirements-txt",
+          "exitCode": 0
+        },
+        {
+          "command": "project-hosted-export-pylock.toml",
+          "exitCode": 2,
+          "diagnostic": "error: invalid value 'pylock.toml' for '--format <FORMAT>'\n  [possible values: requirements-txt]\n\nFor more information, try '--help'.\n"
+        },
+        {
+          "command": "project-hosted-lock-sync-variant-3",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "project-vendored-socket-patch",
+          "exitCode": 0,
+          "vendorSummary": {
+            "applied": 1,
+            "failed": 0
+          },
+          "vendorErrors": []
+        },
+        {
+          "command": "project-vendored-export-requirements-txt",
+          "exitCode": 0
+        },
+        {
+          "command": "project-vendored-export-pylock.toml",
+          "exitCode": 2,
+          "diagnostic": "error: invalid value 'pylock.toml' for '--format <FORMAT>'\n  [possible values: requirements-txt]\n\nFor more information, try '--help'.\n"
+        },
+        {
+          "command": "project-vendored-lock-sync-variant-2",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "requirements-hosted-socket-patch",
+          "exitCode": 0,
+          "rewrittenFiles": [
+            "requirements.txt"
+          ],
+          "redirected": 1,
+          "warnings": []
+        },
+        {
+          "command": "requirements-hosted-pip-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "requirements-vendored-socket-patch",
+          "exitCode": 0,
+          "vendorSummary": {
+            "applied": 1,
+            "failed": 0
+          },
+          "vendorErrors": []
+        },
+        {
+          "command": "requirements-vendored-pip-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "compile-plain",
+          "exitCode": 0
+        },
+        {
+          "command": "requirements-plain-hosted-socket-patch",
+          "exitCode": 0,
+          "rewrittenFiles": [
+            "requirements.txt"
+          ],
+          "redirected": 1,
+          "warnings": []
+        },
+        {
+          "command": "requirements-plain-hosted-pip-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "compile-plain-variant-2",
+          "exitCode": 0
+        },
+        {
+          "command": "requirements-plain-vendored-socket-patch",
+          "exitCode": 0,
+          "vendorSummary": {
+            "applied": 1,
+            "failed": 0
+          },
+          "vendorErrors": []
+        },
+        {
+          "command": "requirements-plain-vendored-pip-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "requirements-hosted-export-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "requirements-vendored-export-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "script-lock-hosted",
+          "exitCode": 0
+        },
+        {
+          "command": "script-direct-hosted-socket-patch",
+          "exitCode": 0,
+          "rewrittenFiles": [
+            "example.py",
+            "example.py.lock"
+          ],
+          "redirected": 1,
+          "warnings": []
+        },
+        {
+          "command": "script-direct-hosted-install",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "script-lock-vendored",
+          "exitCode": 0
+        },
+        {
+          "command": "script-direct-vendored-socket-patch",
+          "exitCode": 0,
+          "vendorSummary": {
+            "applied": 1,
+            "failed": 0
+          },
+          "vendorErrors": []
+        },
+        {
+          "command": "script-direct-vendored-install",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "compile-pylock-hosted",
+          "exitCode": 0,
+          "formatSupported": false
+        },
+        {
+          "command": "compile-pylock-vendored",
+          "exitCode": 0,
+          "formatSupported": false
+        },
+        {
+          "command": "project-hosted-locked-install-variant-2",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "project-hosted-unfrozen-install-variant-2",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "project-vendored-locked-install-variant-2",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "project-vendored-unfrozen-install-variant-2",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "script-hosted-locked-install",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "script-hosted-unfrozen-install",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "script-vendored-locked-install",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "script-vendored-unfrozen-install",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        }
+      ]
+    },
+    {
+      "version": "0.6.0",
+      "lockSchema": "package",
+      "lockVersion": 1,
+      "lockRevision": 1,
+      "observations": [
+        {
+          "command": "lock",
+          "exitCode": 0
+        },
+        {
+          "command": "project-hosted-socket-patch",
+          "exitCode": 0,
+          "rewrittenFiles": [
+            "pyproject.toml",
+            "uv.lock"
+          ],
+          "redirected": 1,
+          "warnings": []
+        },
+        {
+          "command": "project-hosted-export-requirements-txt",
+          "exitCode": 0
+        },
+        {
+          "command": "project-hosted-export-pylock.toml",
+          "exitCode": 2,
+          "diagnostic": "error: invalid value 'pylock.toml' for '--format <FORMAT>'\n  [possible values: requirements-txt]\n\nFor more information, try '--help'.\n"
+        },
+        {
+          "command": "project-hosted-lock-sync-variant-3",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "project-vendored-socket-patch",
+          "exitCode": 0,
+          "vendorSummary": {
+            "applied": 1,
+            "failed": 0
+          },
+          "vendorErrors": []
+        },
+        {
+          "command": "project-vendored-export-requirements-txt",
+          "exitCode": 0
+        },
+        {
+          "command": "project-vendored-export-pylock.toml",
+          "exitCode": 2,
+          "diagnostic": "error: invalid value 'pylock.toml' for '--format <FORMAT>'\n  [possible values: requirements-txt]\n\nFor more information, try '--help'.\n"
+        },
+        {
+          "command": "project-vendored-lock-sync-variant-2",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "requirements-hosted-socket-patch",
+          "exitCode": 0,
+          "rewrittenFiles": [
+            "requirements.txt"
+          ],
+          "redirected": 1,
+          "warnings": []
+        },
+        {
+          "command": "requirements-hosted-pip-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "requirements-vendored-socket-patch",
+          "exitCode": 0,
+          "vendorSummary": {
+            "applied": 1,
+            "failed": 0
+          },
+          "vendorErrors": []
+        },
+        {
+          "command": "requirements-vendored-pip-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "compile-plain",
+          "exitCode": 0
+        },
+        {
+          "command": "requirements-plain-hosted-socket-patch",
+          "exitCode": 0,
+          "rewrittenFiles": [
+            "requirements.txt"
+          ],
+          "redirected": 1,
+          "warnings": []
+        },
+        {
+          "command": "requirements-plain-hosted-pip-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "compile-plain-variant-2",
+          "exitCode": 0
+        },
+        {
+          "command": "requirements-plain-vendored-socket-patch",
+          "exitCode": 0,
+          "vendorSummary": {
+            "applied": 1,
+            "failed": 0
+          },
+          "vendorErrors": []
+        },
+        {
+          "command": "requirements-plain-vendored-pip-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "requirements-hosted-export-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "requirements-vendored-export-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "script-lock-hosted",
+          "exitCode": 0
+        },
+        {
+          "command": "script-direct-hosted-socket-patch",
+          "exitCode": 0,
+          "rewrittenFiles": [
+            "example.py",
+            "example.py.lock"
+          ],
+          "redirected": 1,
+          "warnings": []
+        },
+        {
+          "command": "script-direct-hosted-install",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "script-lock-vendored",
+          "exitCode": 0
+        },
+        {
+          "command": "script-direct-vendored-socket-patch",
+          "exitCode": 0,
+          "vendorSummary": {
+            "applied": 1,
+            "failed": 0
+          },
+          "vendorErrors": []
+        },
+        {
+          "command": "script-direct-vendored-install",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "compile-pylock-hosted",
+          "exitCode": 0,
+          "formatSupported": false
+        },
+        {
+          "command": "compile-pylock-vendored",
+          "exitCode": 0,
+          "formatSupported": false
+        },
+        {
+          "command": "project-hosted-locked-install-variant-2",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "project-hosted-unfrozen-install-variant-2",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "project-vendored-locked-install-variant-2",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "project-vendored-unfrozen-install-variant-2",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "script-hosted-locked-install",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "script-hosted-unfrozen-install",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "script-vendored-locked-install",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "script-vendored-unfrozen-install",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        }
+      ]
+    },
+    {
+      "version": "0.6.17",
+      "lockSchema": "package",
+      "lockVersion": 1,
+      "lockRevision": 2,
+      "observations": [
+        {
+          "command": "lock",
+          "exitCode": 0
+        },
+        {
+          "command": "project-hosted-socket-patch",
+          "exitCode": 0,
+          "rewrittenFiles": [
+            "pyproject.toml",
+            "uv.lock"
+          ],
+          "redirected": 1,
+          "warnings": []
+        },
+        {
+          "command": "project-hosted-export-requirements-txt",
+          "exitCode": 0
+        },
+        {
+          "command": "project-hosted-export-pylock.toml",
+          "exitCode": 0
+        },
+        {
+          "command": "project-hosted-lock-sync-variant-3",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "project-vendored-socket-patch",
+          "exitCode": 0,
+          "vendorSummary": {
+            "applied": 1,
+            "failed": 0
+          },
+          "vendorErrors": []
+        },
+        {
+          "command": "project-vendored-export-requirements-txt",
+          "exitCode": 0
+        },
+        {
+          "command": "project-vendored-export-pylock.toml",
+          "exitCode": 0
+        },
+        {
+          "command": "project-vendored-lock-sync-variant-2",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "requirements-hosted-socket-patch",
+          "exitCode": 0,
+          "rewrittenFiles": [
+            "requirements.txt"
+          ],
+          "redirected": 1,
+          "warnings": []
+        },
+        {
+          "command": "requirements-hosted-pip-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "requirements-vendored-socket-patch",
+          "exitCode": 0,
+          "vendorSummary": {
+            "applied": 1,
+            "failed": 0
+          },
+          "vendorErrors": []
+        },
+        {
+          "command": "requirements-vendored-pip-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "compile-plain",
+          "exitCode": 0
+        },
+        {
+          "command": "requirements-plain-hosted-socket-patch",
+          "exitCode": 0,
+          "rewrittenFiles": [
+            "requirements.txt"
+          ],
+          "redirected": 1,
+          "warnings": []
+        },
+        {
+          "command": "requirements-plain-hosted-pip-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "compile-plain-variant-2",
+          "exitCode": 0
+        },
+        {
+          "command": "requirements-plain-vendored-socket-patch",
+          "exitCode": 0,
+          "vendorSummary": {
+            "applied": 1,
+            "failed": 0
+          },
+          "vendorErrors": []
+        },
+        {
+          "command": "requirements-plain-vendored-pip-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "requirements-hosted-export-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "pylock-hosted-export-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "requirements-vendored-export-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "pylock-vendored-export-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "script-lock-hosted",
+          "exitCode": 0
+        },
+        {
+          "command": "script-direct-hosted-socket-patch",
+          "exitCode": 0,
+          "rewrittenFiles": [
+            "example.py",
+            "example.py.lock"
+          ],
+          "redirected": 1,
+          "warnings": []
+        },
+        {
+          "command": "script-direct-hosted-install",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "script-lock-vendored",
+          "exitCode": 0
+        },
+        {
+          "command": "script-direct-vendored-socket-patch",
+          "exitCode": 0,
+          "vendorSummary": {
+            "applied": 1,
+            "failed": 0
+          },
+          "vendorErrors": []
+        },
+        {
+          "command": "script-direct-vendored-install",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "compile-pylock-hosted",
+          "exitCode": 0,
+          "formatSupported": true
+        },
+        {
+          "command": "pylock-direct-hosted-socket-patch",
+          "exitCode": 0,
+          "rewrittenFiles": [
+            "pylock.toml"
+          ],
+          "redirected": 1,
+          "warnings": []
+        },
+        {
+          "command": "pylock-direct-hosted-install",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "compile-pylock-vendored",
+          "exitCode": 0,
+          "formatSupported": true
+        },
+        {
+          "command": "pylock-direct-vendored-socket-patch",
+          "exitCode": 0,
+          "vendorSummary": {
+            "applied": 1,
+            "failed": 0
+          },
+          "vendorErrors": []
+        },
+        {
+          "command": "pylock-direct-vendored-install",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "project-hosted-locked-install-variant-2",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "project-hosted-unfrozen-install-variant-2",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "project-vendored-locked-install-variant-2",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "project-vendored-unfrozen-install-variant-2",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "script-hosted-locked-install",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "script-hosted-unfrozen-install",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "script-vendored-locked-install",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "script-vendored-unfrozen-install",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        }
+      ]
+    },
+    {
+      "version": "0.7.22",
+      "lockSchema": "package",
+      "lockVersion": 1,
+      "lockRevision": 2,
+      "observations": [
+        {
+          "command": "lock",
+          "exitCode": 0
+        },
+        {
+          "command": "project-hosted-socket-patch",
+          "exitCode": 0,
+          "rewrittenFiles": [
+            "pyproject.toml",
+            "uv.lock"
+          ],
+          "redirected": 1,
+          "warnings": []
+        },
+        {
+          "command": "project-hosted-export-requirements-txt",
+          "exitCode": 0
+        },
+        {
+          "command": "project-hosted-export-pylock.toml",
+          "exitCode": 0
+        },
+        {
+          "command": "project-hosted-lock-sync-variant-3",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "project-vendored-socket-patch",
+          "exitCode": 0,
+          "vendorSummary": {
+            "applied": 1,
+            "failed": 0
+          },
+          "vendorErrors": []
+        },
+        {
+          "command": "project-vendored-export-requirements-txt",
+          "exitCode": 0
+        },
+        {
+          "command": "project-vendored-export-pylock.toml",
+          "exitCode": 0
+        },
+        {
+          "command": "project-vendored-lock-sync-variant-2",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "requirements-hosted-socket-patch",
+          "exitCode": 0,
+          "rewrittenFiles": [
+            "requirements.txt"
+          ],
+          "redirected": 1,
+          "warnings": []
+        },
+        {
+          "command": "requirements-hosted-pip-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "requirements-vendored-socket-patch",
+          "exitCode": 0,
+          "vendorSummary": {
+            "applied": 1,
+            "failed": 0
+          },
+          "vendorErrors": []
+        },
+        {
+          "command": "requirements-vendored-pip-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "compile-plain",
+          "exitCode": 0
+        },
+        {
+          "command": "requirements-plain-hosted-socket-patch",
+          "exitCode": 0,
+          "rewrittenFiles": [
+            "requirements.txt"
+          ],
+          "redirected": 1,
+          "warnings": []
+        },
+        {
+          "command": "requirements-plain-hosted-pip-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "compile-plain-variant-2",
+          "exitCode": 0
+        },
+        {
+          "command": "requirements-plain-vendored-socket-patch",
+          "exitCode": 0,
+          "vendorSummary": {
+            "applied": 1,
+            "failed": 0
+          },
+          "vendorErrors": []
+        },
+        {
+          "command": "requirements-plain-vendored-pip-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "requirements-hosted-export-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "pylock-hosted-export-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "requirements-vendored-export-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "pylock-vendored-export-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "script-lock-hosted",
+          "exitCode": 0
+        },
+        {
+          "command": "script-direct-hosted-socket-patch",
+          "exitCode": 0,
+          "rewrittenFiles": [
+            "example.py",
+            "example.py.lock"
+          ],
+          "redirected": 1,
+          "warnings": []
+        },
+        {
+          "command": "script-direct-hosted-install",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "script-lock-vendored",
+          "exitCode": 0
+        },
+        {
+          "command": "script-direct-vendored-socket-patch",
+          "exitCode": 0,
+          "vendorSummary": {
+            "applied": 1,
+            "failed": 0
+          },
+          "vendorErrors": []
+        },
+        {
+          "command": "script-direct-vendored-install",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "compile-pylock-hosted",
+          "exitCode": 0,
+          "formatSupported": true
+        },
+        {
+          "command": "pylock-direct-hosted-socket-patch",
+          "exitCode": 0,
+          "rewrittenFiles": [
+            "pylock.toml"
+          ],
+          "redirected": 1,
+          "warnings": []
+        },
+        {
+          "command": "pylock-direct-hosted-install",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "compile-pylock-vendored",
+          "exitCode": 0,
+          "formatSupported": true
+        },
+        {
+          "command": "pylock-direct-vendored-socket-patch",
+          "exitCode": 0,
+          "vendorSummary": {
+            "applied": 1,
+            "failed": 0
+          },
+          "vendorErrors": []
+        },
+        {
+          "command": "pylock-direct-vendored-install",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "project-hosted-locked-install-variant-2",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "project-hosted-unfrozen-install-variant-2",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "project-vendored-locked-install-variant-2",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "project-vendored-unfrozen-install-variant-2",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "script-hosted-locked-install",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "script-hosted-unfrozen-install",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "script-vendored-locked-install",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "script-vendored-unfrozen-install",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        }
+      ]
+    },
+    {
+      "version": "0.8.24",
+      "lockSchema": "package",
+      "lockVersion": 1,
+      "lockRevision": 3,
+      "observations": [
+        {
+          "command": "lock",
+          "exitCode": 0
+        },
+        {
+          "command": "project-hosted-socket-patch",
+          "exitCode": 0,
+          "rewrittenFiles": [
+            "pyproject.toml",
+            "uv.lock"
+          ],
+          "redirected": 1,
+          "warnings": []
+        },
+        {
+          "command": "project-hosted-export-requirements-txt",
+          "exitCode": 0
+        },
+        {
+          "command": "project-hosted-export-pylock.toml",
+          "exitCode": 0
+        },
+        {
+          "command": "project-hosted-lock-sync-variant-3",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "project-vendored-socket-patch",
+          "exitCode": 0,
+          "vendorSummary": {
+            "applied": 1,
+            "failed": 0
+          },
+          "vendorErrors": []
+        },
+        {
+          "command": "project-vendored-export-requirements-txt",
+          "exitCode": 0
+        },
+        {
+          "command": "project-vendored-export-pylock.toml",
+          "exitCode": 0
+        },
+        {
+          "command": "project-vendored-lock-sync-variant-2",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "requirements-hosted-socket-patch",
+          "exitCode": 0,
+          "rewrittenFiles": [
+            "requirements.txt"
+          ],
+          "redirected": 1,
+          "warnings": []
+        },
+        {
+          "command": "requirements-hosted-pip-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "requirements-vendored-socket-patch",
+          "exitCode": 0,
+          "vendorSummary": {
+            "applied": 1,
+            "failed": 0
+          },
+          "vendorErrors": []
+        },
+        {
+          "command": "requirements-vendored-pip-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "compile-plain",
+          "exitCode": 0
+        },
+        {
+          "command": "requirements-plain-hosted-socket-patch",
+          "exitCode": 0,
+          "rewrittenFiles": [
+            "requirements.txt"
+          ],
+          "redirected": 1,
+          "warnings": []
+        },
+        {
+          "command": "requirements-plain-hosted-pip-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "compile-plain-variant-2",
+          "exitCode": 0
+        },
+        {
+          "command": "requirements-plain-vendored-socket-patch",
+          "exitCode": 0,
+          "vendorSummary": {
+            "applied": 1,
+            "failed": 0
+          },
+          "vendorErrors": []
+        },
+        {
+          "command": "requirements-plain-vendored-pip-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "requirements-hosted-export-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "pylock-hosted-export-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "requirements-vendored-export-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "pylock-vendored-export-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "script-lock-hosted",
+          "exitCode": 0
+        },
+        {
+          "command": "script-direct-hosted-socket-patch",
+          "exitCode": 0,
+          "rewrittenFiles": [
+            "example.py",
+            "example.py.lock"
+          ],
+          "redirected": 1,
+          "warnings": []
+        },
+        {
+          "command": "script-direct-hosted-install",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "script-lock-vendored",
+          "exitCode": 0
+        },
+        {
+          "command": "script-direct-vendored-socket-patch",
+          "exitCode": 0,
+          "vendorSummary": {
+            "applied": 1,
+            "failed": 0
+          },
+          "vendorErrors": []
+        },
+        {
+          "command": "script-direct-vendored-install",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "compile-pylock-hosted",
+          "exitCode": 0,
+          "formatSupported": true
+        },
+        {
+          "command": "pylock-direct-hosted-socket-patch",
+          "exitCode": 0,
+          "rewrittenFiles": [
+            "pylock.toml"
+          ],
+          "redirected": 1,
+          "warnings": []
+        },
+        {
+          "command": "pylock-direct-hosted-install",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "compile-pylock-vendored",
+          "exitCode": 0,
+          "formatSupported": true
+        },
+        {
+          "command": "pylock-direct-vendored-socket-patch",
+          "exitCode": 0,
+          "vendorSummary": {
+            "applied": 1,
+            "failed": 0
+          },
+          "vendorErrors": []
+        },
+        {
+          "command": "pylock-direct-vendored-install",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "project-hosted-locked-install-variant-2",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "project-hosted-unfrozen-install-variant-2",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "project-vendored-locked-install-variant-2",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "project-vendored-unfrozen-install-variant-2",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "script-hosted-locked-install",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "script-hosted-unfrozen-install",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "script-vendored-locked-install",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "script-vendored-unfrozen-install",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        }
+      ]
+    },
+    {
+      "version": "0.9.30",
+      "lockSchema": "package",
+      "lockVersion": 1,
+      "lockRevision": 3,
+      "observations": [
+        {
+          "command": "lock",
+          "exitCode": 0
+        },
+        {
+          "command": "project-hosted-socket-patch",
+          "exitCode": 0,
+          "rewrittenFiles": [
+            "pyproject.toml",
+            "uv.lock"
+          ],
+          "redirected": 1,
+          "warnings": []
+        },
+        {
+          "command": "project-hosted-export-requirements-txt",
+          "exitCode": 0
+        },
+        {
+          "command": "project-hosted-export-pylock.toml",
+          "exitCode": 0
+        },
+        {
+          "command": "project-hosted-lock-sync-variant-3",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "project-vendored-socket-patch",
+          "exitCode": 0,
+          "vendorSummary": {
+            "applied": 1,
+            "failed": 0
+          },
+          "vendorErrors": []
+        },
+        {
+          "command": "project-vendored-export-requirements-txt",
+          "exitCode": 0
+        },
+        {
+          "command": "project-vendored-export-pylock.toml",
+          "exitCode": 0
+        },
+        {
+          "command": "project-vendored-lock-sync-variant-2",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "requirements-hosted-socket-patch",
+          "exitCode": 0,
+          "rewrittenFiles": [
+            "requirements.txt"
+          ],
+          "redirected": 1,
+          "warnings": []
+        },
+        {
+          "command": "requirements-hosted-pip-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "requirements-vendored-socket-patch",
+          "exitCode": 0,
+          "vendorSummary": {
+            "applied": 1,
+            "failed": 0
+          },
+          "vendorErrors": []
+        },
+        {
+          "command": "requirements-vendored-pip-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "compile-plain",
+          "exitCode": 0
+        },
+        {
+          "command": "requirements-plain-hosted-socket-patch",
+          "exitCode": 0,
+          "rewrittenFiles": [
+            "requirements.txt"
+          ],
+          "redirected": 1,
+          "warnings": []
+        },
+        {
+          "command": "requirements-plain-hosted-pip-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "compile-plain-variant-2",
+          "exitCode": 0
+        },
+        {
+          "command": "requirements-plain-vendored-socket-patch",
+          "exitCode": 0,
+          "vendorSummary": {
+            "applied": 1,
+            "failed": 0
+          },
+          "vendorErrors": []
+        },
+        {
+          "command": "requirements-plain-vendored-pip-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "requirements-hosted-export-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "pylock-hosted-export-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "requirements-vendored-export-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "pylock-vendored-export-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "script-lock-hosted",
+          "exitCode": 0
+        },
+        {
+          "command": "script-direct-hosted-socket-patch",
+          "exitCode": 0,
+          "rewrittenFiles": [
+            "example.py",
+            "example.py.lock"
+          ],
+          "redirected": 1,
+          "warnings": []
+        },
+        {
+          "command": "script-direct-hosted-install",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "script-lock-vendored",
+          "exitCode": 0
+        },
+        {
+          "command": "script-direct-vendored-socket-patch",
+          "exitCode": 0,
+          "vendorSummary": {
+            "applied": 1,
+            "failed": 0
+          },
+          "vendorErrors": []
+        },
+        {
+          "command": "script-direct-vendored-install",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "compile-pylock-hosted",
+          "exitCode": 0,
+          "formatSupported": true
+        },
+        {
+          "command": "pylock-direct-hosted-socket-patch",
+          "exitCode": 0,
+          "rewrittenFiles": [
+            "pylock.toml"
+          ],
+          "redirected": 1,
+          "warnings": []
+        },
+        {
+          "command": "pylock-direct-hosted-install",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "compile-pylock-vendored",
+          "exitCode": 0,
+          "formatSupported": true
+        },
+        {
+          "command": "pylock-direct-vendored-socket-patch",
+          "exitCode": 0,
+          "vendorSummary": {
+            "applied": 1,
+            "failed": 0
+          },
+          "vendorErrors": []
+        },
+        {
+          "command": "pylock-direct-vendored-install",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "project-hosted-locked-install-variant-2",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "project-hosted-unfrozen-install-variant-2",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "project-vendored-locked-install-variant-2",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "project-vendored-unfrozen-install-variant-2",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "script-hosted-locked-install",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "script-hosted-unfrozen-install",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "script-vendored-locked-install",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "script-vendored-unfrozen-install",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        }
+      ]
+    },
+    {
+      "version": "0.10.12",
+      "lockSchema": "package",
+      "lockVersion": 1,
+      "lockRevision": 3,
+      "observations": [
+        {
+          "command": "lock",
+          "exitCode": 0
+        },
+        {
+          "command": "project-hosted-socket-patch",
+          "exitCode": 0,
+          "rewrittenFiles": [
+            "pyproject.toml",
+            "uv.lock"
+          ],
+          "redirected": 1,
+          "warnings": []
+        },
+        {
+          "command": "project-hosted-export-requirements-txt",
+          "exitCode": 0
+        },
+        {
+          "command": "project-hosted-export-pylock.toml",
+          "exitCode": 0
+        },
+        {
+          "command": "project-hosted-lock-sync-variant-3",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "project-vendored-socket-patch",
+          "exitCode": 0,
+          "vendorSummary": {
+            "applied": 1,
+            "failed": 0
+          },
+          "vendorErrors": []
+        },
+        {
+          "command": "project-vendored-export-requirements-txt",
+          "exitCode": 0
+        },
+        {
+          "command": "project-vendored-export-pylock.toml",
+          "exitCode": 0
+        },
+        {
+          "command": "project-vendored-lock-sync-variant-2",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "requirements-hosted-socket-patch",
+          "exitCode": 0,
+          "rewrittenFiles": [
+            "requirements.txt"
+          ],
+          "redirected": 1,
+          "warnings": []
+        },
+        {
+          "command": "requirements-hosted-pip-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "requirements-vendored-socket-patch",
+          "exitCode": 0,
+          "vendorSummary": {
+            "applied": 1,
+            "failed": 0
+          },
+          "vendorErrors": []
+        },
+        {
+          "command": "requirements-vendored-pip-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "compile-plain",
+          "exitCode": 0
+        },
+        {
+          "command": "requirements-plain-hosted-socket-patch",
+          "exitCode": 0,
+          "rewrittenFiles": [
+            "requirements.txt"
+          ],
+          "redirected": 1,
+          "warnings": []
+        },
+        {
+          "command": "requirements-plain-hosted-pip-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "compile-plain-variant-2",
+          "exitCode": 0
+        },
+        {
+          "command": "requirements-plain-vendored-socket-patch",
+          "exitCode": 0,
+          "vendorSummary": {
+            "applied": 1,
+            "failed": 0
+          },
+          "vendorErrors": []
+        },
+        {
+          "command": "requirements-plain-vendored-pip-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "requirements-hosted-export-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "pylock-hosted-export-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "requirements-vendored-export-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "pylock-vendored-export-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "script-lock-hosted",
+          "exitCode": 0
+        },
+        {
+          "command": "script-direct-hosted-socket-patch",
+          "exitCode": 0,
+          "rewrittenFiles": [
+            "example.py",
+            "example.py.lock"
+          ],
+          "redirected": 1,
+          "warnings": []
+        },
+        {
+          "command": "script-direct-hosted-install",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "script-lock-vendored",
+          "exitCode": 0
+        },
+        {
+          "command": "script-direct-vendored-socket-patch",
+          "exitCode": 0,
+          "vendorSummary": {
+            "applied": 1,
+            "failed": 0
+          },
+          "vendorErrors": []
+        },
+        {
+          "command": "script-direct-vendored-install",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "compile-pylock-hosted",
+          "exitCode": 0,
+          "formatSupported": true
+        },
+        {
+          "command": "pylock-direct-hosted-socket-patch",
+          "exitCode": 0,
+          "rewrittenFiles": [
+            "pylock.toml"
+          ],
+          "redirected": 1,
+          "warnings": []
+        },
+        {
+          "command": "pylock-direct-hosted-install",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "compile-pylock-vendored",
+          "exitCode": 0,
+          "formatSupported": true
+        },
+        {
+          "command": "pylock-direct-vendored-socket-patch",
+          "exitCode": 0,
+          "vendorSummary": {
+            "applied": 1,
+            "failed": 0
+          },
+          "vendorErrors": []
+        },
+        {
+          "command": "pylock-direct-vendored-install",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "project-hosted-locked-install-variant-2",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "project-hosted-unfrozen-install-variant-2",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "project-vendored-locked-install-variant-2",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "project-vendored-unfrozen-install-variant-2",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "script-hosted-locked-install",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "script-hosted-unfrozen-install",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "script-vendored-locked-install",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "script-vendored-unfrozen-install",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        }
+      ]
+    },
+    {
+      "version": "0.11.33",
+      "lockSchema": "package",
+      "lockVersion": 1,
+      "lockRevision": 3,
+      "observations": [
+        {
+          "command": "lock",
+          "exitCode": 0
+        },
+        {
+          "command": "project-hosted-socket-patch",
+          "exitCode": 0,
+          "rewrittenFiles": [
+            "pyproject.toml",
+            "uv.lock"
+          ],
+          "redirected": 1,
+          "warnings": []
+        },
+        {
+          "command": "project-hosted-export-requirements-txt",
+          "exitCode": 0
+        },
+        {
+          "command": "project-hosted-export-pylock.toml",
+          "exitCode": 0
+        },
+        {
+          "command": "project-hosted-lock-sync-variant-3",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "project-vendored-socket-patch",
+          "exitCode": 0,
+          "vendorSummary": {
+            "applied": 1,
+            "failed": 0
+          },
+          "vendorErrors": []
+        },
+        {
+          "command": "project-vendored-export-requirements-txt",
+          "exitCode": 0
+        },
+        {
+          "command": "project-vendored-export-pylock.toml",
+          "exitCode": 0
+        },
+        {
+          "command": "project-vendored-lock-sync-variant-2",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "requirements-hosted-socket-patch",
+          "exitCode": 0,
+          "rewrittenFiles": [
+            "requirements.txt"
+          ],
+          "redirected": 1,
+          "warnings": []
+        },
+        {
+          "command": "requirements-hosted-pip-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "requirements-vendored-socket-patch",
+          "exitCode": 0,
+          "vendorSummary": {
+            "applied": 1,
+            "failed": 0
+          },
+          "vendorErrors": []
+        },
+        {
+          "command": "requirements-vendored-pip-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "compile-plain",
+          "exitCode": 0
+        },
+        {
+          "command": "requirements-plain-hosted-socket-patch",
+          "exitCode": 0,
+          "rewrittenFiles": [
+            "requirements.txt"
+          ],
+          "redirected": 1,
+          "warnings": []
+        },
+        {
+          "command": "requirements-plain-hosted-pip-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "compile-plain-variant-2",
+          "exitCode": 0
+        },
+        {
+          "command": "requirements-plain-vendored-socket-patch",
+          "exitCode": 0,
+          "vendorSummary": {
+            "applied": 1,
+            "failed": 0
+          },
+          "vendorErrors": []
+        },
+        {
+          "command": "requirements-plain-vendored-pip-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "requirements-hosted-export-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "pylock-hosted-export-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "requirements-vendored-export-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "pylock-vendored-export-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "script-lock-hosted",
+          "exitCode": 0
+        },
+        {
+          "command": "script-direct-hosted-socket-patch",
+          "exitCode": 0,
+          "rewrittenFiles": [
+            "example.py",
+            "example.py.lock"
+          ],
+          "redirected": 1,
+          "warnings": []
+        },
+        {
+          "command": "script-direct-hosted-install",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "script-lock-vendored",
+          "exitCode": 0
+        },
+        {
+          "command": "script-direct-vendored-socket-patch",
+          "exitCode": 0,
+          "vendorSummary": {
+            "applied": 1,
+            "failed": 0
+          },
+          "vendorErrors": []
+        },
+        {
+          "command": "script-direct-vendored-install",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "compile-pylock-hosted",
+          "exitCode": 0,
+          "formatSupported": true
+        },
+        {
+          "command": "pylock-direct-hosted-socket-patch",
+          "exitCode": 0,
+          "rewrittenFiles": [
+            "pylock.toml"
+          ],
+          "redirected": 1,
+          "warnings": []
+        },
+        {
+          "command": "pylock-direct-hosted-install",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "compile-pylock-vendored",
+          "exitCode": 0,
+          "formatSupported": true
+        },
+        {
+          "command": "pylock-direct-vendored-socket-patch",
+          "exitCode": 0,
+          "vendorSummary": {
+            "applied": 1,
+            "failed": 0
+          },
+          "vendorErrors": []
+        },
+        {
+          "command": "pylock-direct-vendored-install",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "project-hosted-locked-install-variant-2",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "project-hosted-unfrozen-install-variant-2",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "project-vendored-locked-install-variant-2",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "project-vendored-unfrozen-install-variant-2",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "script-hosted-locked-install",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "script-hosted-unfrozen-install",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "script-vendored-locked-install",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "script-vendored-unfrozen-install",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        }
+      ]
+    },
+    {
+      "version": "0.12.13",
+      "lockSchema": "package",
+      "lockVersion": 1,
+      "lockRevision": 3,
+      "observations": [
+        {
+          "command": "lock",
+          "exitCode": 0
+        },
+        {
+          "command": "project-hosted-socket-patch",
+          "exitCode": 0,
+          "rewrittenFiles": [
+            "pyproject.toml",
+            "uv.lock"
+          ],
+          "redirected": 1,
+          "warnings": []
+        },
+        {
+          "command": "project-hosted-export-requirements-txt",
+          "exitCode": 0
+        },
+        {
+          "command": "project-hosted-export-pylock.toml",
+          "exitCode": 0
+        },
+        {
+          "command": "project-hosted-lock-sync-variant-3",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "project-vendored-socket-patch",
+          "exitCode": 0,
+          "vendorSummary": {
+            "applied": 1,
+            "failed": 0
+          },
+          "vendorErrors": []
+        },
+        {
+          "command": "project-vendored-export-requirements-txt",
+          "exitCode": 0
+        },
+        {
+          "command": "project-vendored-export-pylock.toml",
+          "exitCode": 0
+        },
+        {
+          "command": "project-vendored-lock-sync-variant-2",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "requirements-hosted-socket-patch",
+          "exitCode": 0,
+          "rewrittenFiles": [
+            "requirements.txt"
+          ],
+          "redirected": 1,
+          "warnings": []
+        },
+        {
+          "command": "requirements-hosted-pip-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "requirements-vendored-socket-patch",
+          "exitCode": 0,
+          "vendorSummary": {
+            "applied": 1,
+            "failed": 0
+          },
+          "vendorErrors": []
+        },
+        {
+          "command": "requirements-vendored-pip-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "compile-plain",
+          "exitCode": 0
+        },
+        {
+          "command": "requirements-plain-hosted-socket-patch",
+          "exitCode": 0,
+          "rewrittenFiles": [
+            "requirements.txt"
+          ],
+          "redirected": 1,
+          "warnings": []
+        },
+        {
+          "command": "requirements-plain-hosted-pip-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "compile-plain-variant-2",
+          "exitCode": 0
+        },
+        {
+          "command": "requirements-plain-vendored-socket-patch",
+          "exitCode": 0,
+          "vendorSummary": {
+            "applied": 1,
+            "failed": 0
+          },
+          "vendorErrors": []
+        },
+        {
+          "command": "requirements-plain-vendored-pip-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "requirements-hosted-export-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "pylock-hosted-export-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "requirements-vendored-export-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "pylock-vendored-export-sync",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "script-lock-hosted",
+          "exitCode": 0
+        },
+        {
+          "command": "script-direct-hosted-socket-patch",
+          "exitCode": 0,
+          "rewrittenFiles": [
+            "example.py",
+            "example.py.lock"
+          ],
+          "redirected": 1,
+          "warnings": []
+        },
+        {
+          "command": "script-direct-hosted-install",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "script-lock-vendored",
+          "exitCode": 0
+        },
+        {
+          "command": "script-direct-vendored-socket-patch",
+          "exitCode": 0,
+          "vendorSummary": {
+            "applied": 1,
+            "failed": 0
+          },
+          "vendorErrors": []
+        },
+        {
+          "command": "script-direct-vendored-install",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "compile-pylock-hosted",
+          "exitCode": 0,
+          "formatSupported": true
+        },
+        {
+          "command": "pylock-direct-hosted-socket-patch",
+          "exitCode": 0,
+          "rewrittenFiles": [
+            "pylock.toml"
+          ],
+          "redirected": 1,
+          "warnings": []
+        },
+        {
+          "command": "pylock-direct-hosted-install",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "compile-pylock-vendored",
+          "exitCode": 0,
+          "formatSupported": true
+        },
+        {
+          "command": "pylock-direct-vendored-socket-patch",
+          "exitCode": 0,
+          "vendorSummary": {
+            "applied": 1,
+            "failed": 0
+          },
+          "vendorErrors": []
+        },
+        {
+          "command": "pylock-direct-vendored-install",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "project-hosted-locked-install-variant-2",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "project-hosted-unfrozen-install-variant-2",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "project-vendored-locked-install-variant-2",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "project-vendored-unfrozen-install-variant-2",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "script-hosted-locked-install",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "script-hosted-unfrozen-install",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "script-vendored-locked-install",
+          "exitCode": 0,
+          "lockUnchanged": true,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        },
+        {
+          "command": "script-vendored-unfrozen-install",
+          "exitCode": 0,
+          "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+          "installedPatch": true
+        }
+      ]
+    }
+  ]
+}

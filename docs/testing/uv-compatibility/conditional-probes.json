@@ -1,0 +1,573 @@
+{
+  "date": "2026-09-14",
+  "uvVersion": "0.12.13",
+  "pythonVersion": "3.9.6",
+  "provenance": "Supplemental real-service probes captured during implementation; an exact CLI binary hash was not recorded for these individual probes. The separately recorded release-family matrix identifies its tested source and binary.",
+  "redactions": [
+    "Working directories and executable paths use placeholders.",
+    "Hosted artifact URLs are redacted to remove download grants.",
+    "CLI output keeps command results and refusal details; patch catalog descriptions are omitted."
+  ],
+  "cases": [
+    {
+      "case": "conditional-unpatched-version",
+      "otherVersionRequirementByteIdentical": true,
+      "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+      "expectedPatchedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+      "commands": [
+        {
+          "command": [
+            "<uv-0.12.13>",
+            "venv",
+            ".venv",
+            "--python",
+            "/usr/bin/python3"
+          ],
+          "cwd": "<case>",
+          "key": "venv",
+          "exitCode": 0,
+          "stderr": "Using CPython 3.9.6 interpreter at: /Applications/Xcode.app/Contents/Developer/usr/bin/python3\nCreating virtual environment at: .venv\nActivate with: source .venv/bin/activate\n"
+        },
+        {
+          "command": [
+            "<uv-0.12.13>",
+            "pip",
+            "install",
+            "--python",
+            "<case>/.venv/bin/python",
+            "<pristine-wheel>"
+          ],
+          "cwd": "<case>",
+          "key": "install-original",
+          "exitCode": 0,
+          "stderr": "Resolved 1 package in 0.82ms\nPrepared 1 package in 5ms\nInstalled 1 package in 1ms\n + urllib3==1.26.18 (from file://<pristine-wheel>)\n"
+        },
+        {
+          "command": [
+            "<socket-patch>",
+            "scan",
+            "--cwd",
+            "<case>",
+            "--mode",
+            "hosted",
+            "--json",
+            "--yes",
+            "--no-telemetry"
+          ],
+          "cwd": "<case>",
+          "key": "scan-single-published-version",
+          "exitCode": 0,
+          "cliResult": {
+            "status": "success",
+            "scannedPackages": 2,
+            "lockfileOnlyPackages": 1,
+            "redirect": {
+              "mode": "hosted",
+              "redirected": 1,
+              "rewrittenFiles": [
+                "requirements.txt"
+              ],
+              "skipped": [],
+              "warnings": [],
+              "dryRun": false
+            }
+          },
+          "stderr": "No SOCKET_API_TOKEN set (and no socket-cli login found) \u2014 using the public patch API proxy (free patches only). Run `socket login` or set SOCKET_API_TOKEN to access org patches.\nNon-interactive mode: auto-selecting first option.\n"
+        },
+        {
+          "command": [
+            "<uv-0.12.13>",
+            "venv",
+            ".venv-sync",
+            "--python",
+            "/usr/bin/python3"
+          ],
+          "cwd": "<case>",
+          "key": "fresh-venv",
+          "exitCode": 0,
+          "stderr": "Using CPython 3.9.6 interpreter at: /Applications/Xcode.app/Contents/Developer/usr/bin/python3\nCreating virtual environment at: .venv-sync\nActivate with: source .venv-sync/bin/activate\n"
+        },
+        {
+          "command": [
+            "<uv-0.12.13>",
+            "pip",
+            "sync",
+            "--python",
+            "<case>/.venv-sync/bin/python",
+            "--require-hashes",
+            "requirements.txt"
+          ],
+          "cwd": "<case>",
+          "key": "hash-verified-sync",
+          "exitCode": 0,
+          "stderr": "Using Python 3.9.6 environment at: .venv-sync\nResolved 1 package in 551ms\nPrepared 1 package in 157ms\nInstalled 1 package in 5ms\n + urllib3==1.26.18 (from https://patch.socket.dev/<redacted-artifact-url>\n"
+        }
+      ]
+    },
+    {
+      "case": "conditional-two-patched-versions",
+      "bothPublishedVersionsRetainOwnArtifact": true,
+      "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+      "expectedPatchedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+      "commands": [
+        {
+          "command": [
+            "<uv-0.12.13>",
+            "venv",
+            ".venv",
+            "--python",
+            "/usr/bin/python3"
+          ],
+          "cwd": "<case>",
+          "key": "venv",
+          "exitCode": 0,
+          "stderr": "Using CPython 3.9.6 interpreter at: /Applications/Xcode.app/Contents/Developer/usr/bin/python3\nCreating virtual environment at: .venv\nActivate with: source .venv/bin/activate\n"
+        },
+        {
+          "command": [
+            "<uv-0.12.13>",
+            "pip",
+            "install",
+            "--python",
+            "<case>/.venv/bin/python",
+            "<pristine-wheel>"
+          ],
+          "cwd": "<case>",
+          "key": "install-original",
+          "exitCode": 0,
+          "stderr": "Resolved 1 package in 1ms\nPrepared 1 package in 6ms\nInstalled 1 package in 1ms\n + urllib3==1.26.18 (from file://<pristine-wheel>)\n"
+        },
+        {
+          "command": [
+            "<socket-patch>",
+            "scan",
+            "--cwd",
+            "<case>",
+            "--mode",
+            "hosted",
+            "--json",
+            "--yes",
+            "--no-telemetry"
+          ],
+          "cwd": "<case>",
+          "key": "scan-two-published-versions-rerun",
+          "exitCode": 0,
+          "cliResult": {
+            "status": "success",
+            "scannedPackages": 1,
+            "lockfileOnlyPackages": 0,
+            "redirect": {
+              "mode": "hosted",
+              "redirected": 1,
+              "rewrittenFiles": [],
+              "skipped": [],
+              "warnings": [],
+              "dryRun": false
+            }
+          },
+          "stderr": "No SOCKET_API_TOKEN set (and no socket-cli login found) \u2014 using the public patch API proxy (free patches only). Run `socket login` or set SOCKET_API_TOKEN to access org patches.\nNon-interactive mode: auto-selecting first option.\n"
+        },
+        {
+          "command": [
+            "<uv-0.12.13>",
+            "venv",
+            ".venv-sync",
+            "--python",
+            "/usr/bin/python3"
+          ],
+          "cwd": "<case>",
+          "key": "fresh-venv",
+          "exitCode": 0,
+          "stderr": "Using CPython 3.9.6 interpreter at: /Applications/Xcode.app/Contents/Developer/usr/bin/python3\nCreating virtual environment at: .venv-sync\nActivate with: source .venv-sync/bin/activate\n"
+        },
+        {
+          "command": [
+            "<uv-0.12.13>",
+            "pip",
+            "sync",
+            "--python",
+            "<case>/.venv-sync/bin/python",
+            "--require-hashes",
+            "requirements.txt"
+          ],
+          "cwd": "<case>",
+          "key": "hash-verified-sync",
+          "exitCode": 0,
+          "stderr": "Using Python 3.9.6 environment at: .venv-sync\nResolved 1 package in 1.75s\nPrepared 1 package in 218ms\nInstalled 1 package in 4ms\n + urllib3==1.26.18 (from https://patch.socket.dev/<redacted-artifact-url>\n"
+        }
+      ]
+    },
+    {
+      "case": "extras-and-marker",
+      "installedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+      "expectedPatchedResponseSha256": "21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4",
+      "commands": [
+        {
+          "command": [
+            "<uv-0.12.13>",
+            "pip",
+            "compile",
+            "requirements.in",
+            "--generate-hashes",
+            "--universal",
+            "--no-strip-extras",
+            "--no-strip-markers",
+            "-o",
+            "requirements.txt"
+          ],
+          "cwd": "<case>",
+          "key": "compile",
+          "exitCode": 0,
+          "stdout": "# This file was autogenerated by uv via the following command:\n#    uv pip compile requirements.in --generate-hashes --universal --no-strip-extras --no-strip-markers -o requirements.txt\npysocks==1.7.1 ; sys_platform == 'darwin' \\\n    --hash=sha256:08e69f092cc6dbe92a0fdd16eeb9b9ffbc13cadfe5ca4c7bd92ffb078b293299 \\\n    --hash=sha256:2725bd0a9925919b9b51739eea5f9e2bae91e83288108a9ad338b2e3a4435ee5 \\\n    --hash=sha256:3f8804571ebe159c380ac6de37643bb4685970655d3bba243530d6558b799aa0\n    # via urllib3\nurllib3[socks]==1.26.18 ; sys_platform == 'darwin' \\\n    --hash=sha256:34b97092d7e0a3a8cf7cd10e386f401b3737364026c45e622aa02903dffe0f07 \\\n    --hash=sha256:f8ecc1bba5667413457c529ab955bf8c67b45db799d159066261719e328580a0\n    # via -r requirements.in\n",
+          "stderr": "Resolved 2 packages in 261ms\n"
+        },
+        {
+          "command": [
+            "<uv-0.12.13>",
+            "venv",
+            ".venv",
+            "--python",
+            "/usr/bin/python3"
+          ],
+          "cwd": "<case>",
+          "key": "venv",
+          "exitCode": 0,
+          "stderr": "Using CPython 3.9.6 interpreter at: /Applications/Xcode.app/Contents/Developer/usr/bin/python3\nCreating virtual environment at: .venv\nActivate with: source .venv/bin/activate\n"
+        },
+        {
+          "command": [
+            "<uv-0.12.13>",
+            "pip",
+            "install",
+            "--python",
+            "<case>/.venv/bin/python",
+            "<pristine-wheel>"
+          ],
+          "cwd": "<case>",
+          "key": "install-original",
+          "exitCode": 0,
+          "stderr": "Resolved 1 package in 0.84ms\nPrepared 1 package in 6ms\nInstalled 1 package in 1ms\n + urllib3==1.26.18 (from file://<pristine-wheel>)\n"
+        },
+        {
+          "command": [
+            "<socket-patch>",
+            "scan",
+            "--cwd",
+            "<case>",
+            "--mode",
+            "hosted",
+            "--json",
+            "--yes",
+            "--no-telemetry"
+          ],
+          "cwd": "<case>",
+          "key": "socket-patch",
+          "exitCode": 0,
+          "cliResult": {
+            "status": "success",
+            "scannedPackages": 2,
+            "lockfileOnlyPackages": 1,
+            "redirect": {
+              "mode": "hosted",
+              "redirected": 1,
+              "rewrittenFiles": [
+                "requirements.txt"
+              ],
+              "skipped": [],
+              "warnings": [],
+              "dryRun": false
+            }
+          },
+          "stderr": "No SOCKET_API_TOKEN set (and no socket-cli login found) \u2014 using the public patch API proxy (free patches only). Run `socket login` or set SOCKET_API_TOKEN to access org patches.\nNon-interactive mode: auto-selecting first option.\n"
+        },
+        {
+          "command": [
+            "<uv-0.12.13>",
+            "venv",
+            ".venv-sync",
+            "--python",
+            "/usr/bin/python3"
+          ],
+          "cwd": "<case>",
+          "key": "fresh-venv",
+          "exitCode": 0,
+          "stderr": "Using CPython 3.9.6 interpreter at: /Applications/Xcode.app/Contents/Developer/usr/bin/python3\nCreating virtual environment at: .venv-sync\nActivate with: source .venv-sync/bin/activate\n"
+        },
+        {
+          "command": [
+            "<uv-0.12.13>",
+            "pip",
+            "sync",
+            "--python",
+            "<case>/.venv-sync/bin/python",
+            "--require-hashes",
+            "requirements.txt"
+          ],
+          "cwd": "<case>",
+          "key": "hashed-sync",
+          "exitCode": 0,
+          "stderr": "Using Python 3.9.6 environment at: .venv-sync\nResolved 2 packages in 424ms\nPrepared 2 packages in 142ms\nInstalled 2 packages in 4ms\n + pysocks==1.7.1\n + urllib3==1.26.18 (from https://patch.socket.dev/<redacted-artifact-url>\n"
+        }
+      ]
+    },
+    {
+      "case": "script-hosted-refusal",
+      "kind": "script",
+      "mode": "hosted",
+      "filesByteIdentical": {
+        "job.py": true,
+        "job.py.lock": true
+      },
+      "commands": [
+        {
+          "command": [
+            "<uv-0.12.13>",
+            "venv",
+            ".venv",
+            "--python",
+            "/usr/bin/python3"
+          ],
+          "cwd": "<case>",
+          "key": "venv",
+          "exitCode": 0,
+          "stderr": "Using CPython 3.9.6 interpreter at: /Applications/Xcode.app/Contents/Developer/usr/bin/python3\nCreating virtual environment at: .venv\nActivate with: source .venv/bin/activate\n"
+        },
+        {
+          "command": [
+            "<uv-0.12.13>",
+            "pip",
+            "install",
+            "--python",
+            "<case>/.venv/bin/python",
+            "<pristine-wheel>"
+          ],
+          "cwd": "<case>",
+          "key": "install-original",
+          "exitCode": 0,
+          "stderr": "Resolved 1 package in 1ms\nPrepared 1 package in 7ms\nInstalled 1 package in 1ms\n + urllib3==1.26.18 (from file://<pristine-wheel>)\n"
+        },
+        {
+          "command": [
+            "<socket-patch>",
+            "scan",
+            "--cwd",
+            "<case>",
+            "--mode",
+            "hosted",
+            "--json",
+            "--yes",
+            "--no-telemetry"
+          ],
+          "cwd": "<case>",
+          "key": "scan",
+          "exitCode": 0,
+          "cliResult": {
+            "status": "success",
+            "scannedPackages": 2,
+            "lockfileOnlyPackages": 1,
+            "redirect": {
+              "mode": "hosted",
+              "redirected": 0,
+              "rewrittenFiles": [],
+              "skipped": [],
+              "warnings": [
+                {
+                  "code": "redirect_uv_lock_unsupported",
+                  "detail": "job.py.lock: urllib3 resolves to multiple versions; a global uv source would replace other versions, so marker-specific source mappings are required"
+                },
+                {
+                  "code": "redirect_uv_lock_unsupported",
+                  "detail": "job.py.lock: urllib3 resolves to multiple versions; a global uv source would replace other versions, so marker-specific source mappings are required"
+                }
+              ],
+              "dryRun": false
+            }
+          },
+          "stderr": "No SOCKET_API_TOKEN set (and no socket-cli login found) \u2014 using the public patch API proxy (free patches only). Run `socket login` or set SOCKET_API_TOKEN to access org patches.\nNon-interactive mode: auto-selecting first option.\nNon-interactive mode: auto-selecting first option.\n"
+        }
+      ]
+    },
+    {
+      "case": "script-vendored-refusal",
+      "kind": "script",
+      "mode": "vendored",
+      "filesByteIdentical": {
+        "job.py": true,
+        "job.py.lock": true
+      },
+      "commands": [
+        {
+          "command": [
+            "<uv-0.12.13>",
+            "venv",
+            ".venv",
+            "--python",
+            "/usr/bin/python3"
+          ],
+          "cwd": "<case>",
+          "key": "venv",
+          "exitCode": 0,
+          "stderr": "Using CPython 3.9.6 interpreter at: /Applications/Xcode.app/Contents/Developer/usr/bin/python3\nCreating virtual environment at: .venv\nActivate with: source .venv/bin/activate\n"
+        },
+        {
+          "command": [
+            "<uv-0.12.13>",
+            "pip",
+            "install",
+            "--python",
+            "<case>/.venv/bin/python",
+            "<pristine-wheel>"
+          ],
+          "cwd": "<case>",
+          "key": "install-original",
+          "exitCode": 0,
+          "stderr": "Resolved 1 package in 1ms\nPrepared 1 package in 13ms\nInstalled 1 package in 1ms\n + urllib3==1.26.18 (from file://<pristine-wheel>)\n"
+        },
+        {
+          "command": [
+            "<socket-patch>",
+            "scan",
+            "--cwd",
+            "<case>",
+            "--mode",
+            "vendored",
+            "--json",
+            "--yes",
+            "--no-telemetry"
+          ],
+          "cwd": "<case>",
+          "key": "scan",
+          "exitCode": 1,
+          "cliResult": {
+            "status": "partial_failure",
+            "scannedPackages": 2,
+            "lockfileOnlyPackages": 1,
+            "vendor": {
+              "status": "partialFailure",
+              "events": [
+                {
+                  "action": "skipped",
+                  "purl": "pkg:pypi/urllib3@2.0.0?artifact_id=py3-none-any-whl",
+                  "reason": "pkg:pypi/urllib3@2.0.0?artifact_id=py3-none-any-whl is not installed; fetched the pristine artifact from https://files.pythonhosted.org/packages/ca/25/fe81738a115a2f1005b19bd69b6253b7b5cd6c9119164f13f02ec627fc41/urllib3-2.0.0-py3-none-any.whl (integrity verified) and vendored from that copy \u2014 the project tree was not touched",
+                  "errorCode": "vendor_fetched_missing"
+                },
+                {
+                  "action": "failed",
+                  "purl": "pkg:pypi/urllib3@1.26.18?artifact_id=py2-py3-none-any-whl",
+                  "errorCode": "pypi_lock_unsupported",
+                  "error": "job.py.lock: urllib3 resolves to multiple versions; a global uv source would replace other versions, so marker-specific source mappings are required"
+                },
+                {
+                  "action": "failed",
+                  "purl": "pkg:pypi/urllib3@2.0.0?artifact_id=py3-none-any-whl",
+                  "errorCode": "pypi_lock_unsupported",
+                  "error": "job.py.lock: urllib3 resolves to multiple versions; a global uv source would replace other versions, so marker-specific source mappings are required"
+                }
+              ],
+              "summary": {
+                "discovered": 0,
+                "downloaded": 0,
+                "applied": 0,
+                "updated": 0,
+                "skipped": 0,
+                "failed": 2,
+                "removed": 0,
+                "verified": 0
+              }
+            }
+          },
+          "stderr": "No SOCKET_API_TOKEN set (and no socket-cli login found) \u2014 using the public patch API proxy (free patches only). Run `socket login` or set SOCKET_API_TOKEN to access org patches.\nNon-interactive mode: auto-selecting first option.\nNon-interactive mode: auto-selecting first option.\nNo SOCKET_API_TOKEN set (and no socket-cli login found) \u2014 using the public patch API proxy (free patches only). Run `socket login` or set SOCKET_API_TOKEN to access org patches.\nNo SOCKET_API_TOKEN set (and no socket-cli login found) \u2014 using the public patch API proxy (free patches only). Run `socket login` or set SOCKET_API_TOKEN to access org patches.\nNo SOCKET_API_TOKEN set (and no socket-cli login found) \u2014 using the public patch API proxy (free patches only). Run `socket login` or set SOCKET_API_TOKEN to access org patches.\n"
+        }
+      ]
+    },
+    {
+      "case": "project-hosted-refusal",
+      "kind": "project",
+      "mode": "hosted",
+      "filesByteIdentical": {
+        "pyproject.toml": true,
+        "uv.lock": true
+      },
+      "commands": [
+        {
+          "command": [
+            "<uv-0.12.13>",
+            "lock",
+            "--python",
+            "/usr/bin/python3"
+          ],
+          "cwd": "<case>",
+          "key": "original-lock",
+          "exitCode": 0,
+          "stderr": "Using CPython 3.9.6 interpreter at: /Applications/Xcode.app/Contents/Developer/usr/bin/python3\nResolved 3 packages in 251ms\nwarning: `urllib3==2.0.0` is yanked (reason: \"Truncated response bodies when streaming a large compressed body. Upgrade to at least 2.0.2 (See: https://github.com/urllib3/urllib3/issues/3009)\")\n"
+        },
+        {
+          "command": [
+            "<uv-0.12.13>",
+            "venv",
+            ".venv",
+            "--python",
+            "/usr/bin/python3"
+          ],
+          "cwd": "<case>",
+          "key": "venv",
+          "exitCode": 0,
+          "stderr": "Using CPython 3.9.6 interpreter at: /Applications/Xcode.app/Contents/Developer/usr/bin/python3\nCreating virtual environment at: .venv\nActivate with: source .venv/bin/activate\n"
+        },
+        {
+          "command": [
+            "<uv-0.12.13>",
+            "pip",
+            "install",
+            "--python",
+            "<case>/.venv/bin/python",
+            "<pristine-wheel>"
+          ],
+          "cwd": "<case>",
+          "key": "install-original",
+          "exitCode": 0,
+          "stderr": "Resolved 1 package in 0.79ms\nPrepared 1 package in 6ms\nInstalled 1 package in 1ms\n + urllib3==1.26.18 (from file://<pristine-wheel>)\n"
+        },
+        {
+          "command": [
+            "<socket-patch>",
+            "scan",
+            "--cwd",
+            "<case>",
+            "--mode",
+            "hosted",
+            "--json",
+            "--yes",
+            "--no-telemetry"
+          ],
+          "cwd": "<case>",
+          "key": "scan",
+          "exitCode": 0,
+          "cliResult": {
+            "status": "success",
+            "scannedPackages": 2,
+            "lockfileOnlyPackages": 1,
+            "redirect": {
+              "mode": "hosted",
+              "redirected": 0,
+              "rewrittenFiles": [],
+              "skipped": [],
+              "warnings": [
+                {
+                  "code": "redirect_uv_project_unsupported",
+                  "detail": "pyproject.toml: urllib3 resolves to multiple versions; a global uv source would replace other versions, so marker-specific source mappings are required"
+                },
+                {
+                  "code": "redirect_uv_project_unsupported",
+                  "detail": "pyproject.toml: urllib3 resolves to multiple versions; a global uv source would replace other versions, so marker-specific source mappings are required"
+                }
+              ],
+              "dryRun": false
+            }
+          },
+          "stderr": "No SOCKET_API_TOKEN set (and no socket-cli login found) \u2014 using the public patch API proxy (free patches only). Run `socket login` or set SOCKET_API_TOKEN to access org patches.\nNon-interactive mode: auto-selecting first option.\nNon-interactive mode: auto-selecting first option.\n"
+        }
+      ]
+    }
+  ]
+}

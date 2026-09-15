@@ -3,6 +3,8 @@ pub mod fs;
 pub(crate) mod http;
 pub mod process;
 pub mod purl;
+pub mod python_lock;
+pub mod python_script;
 pub(crate) mod serde;
 pub mod socket_cli_config;
 pub(crate) mod toml_edit_ext;

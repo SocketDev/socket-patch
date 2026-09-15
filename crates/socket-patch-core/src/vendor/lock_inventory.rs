@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use serde_json::Value;
+use toml_edit::{DocumentMut, Item, TableLike, Value as TomlValue};
 
 use crate::crawlers::composer_crawler::normalize_version;
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
@@ -1090,8 +1091,21 @@ fn parse_gem_spec_line(line: &str) -> Option<(String, String)> {
 /// DISCOVERY-only entries (no recorded URL; platform-independent wheel
 /// choice is not derivable offline). Pipenv/pdm locks: not yet read.
 async fn inventory_pypi_locks(project_root: &Path) -> Option<Vec<LockfileEntry>> {
-    if let Some(out) = inventory_uv_lock(project_root).await {
-        return Some(out);
+    let mut out = Vec::new();
+    let mut found = false;
+    if let Ok(paths) = crate::utils::python_lock::python_lock_paths(project_root) {
+        for path in paths {
+            let Ok(text) = read_regular_to_string(&project_root.join(path)).await else {
+                continue;
+            };
+            if let Some(entries) = python_lock_inventory(&text) {
+                found = true;
+                out.extend(entries);
+            }
+        }
+    }
+    if found {
+        return Some(dedup_prefer_integrity(out));
     }
     if let Some(out) = inventory_poetry_lock(project_root).await {
         return Some(out);
@@ -1099,84 +1113,122 @@ async fn inventory_pypi_locks(project_root: &Path) -> Option<Vec<LockfileEntry>>
     inventory_requirements_txt(project_root).await
 }
 
-/// uv.lock: TOML `[[package]]` blocks with `name`/`version` and
-/// `wheels = [{ url, hash = "sha256:…" }, …]` entries.
-async fn inventory_uv_lock(project_root: &Path) -> Option<Vec<LockfileEntry>> {
-    let text = read_regular_to_string(&project_root.join("uv.lock"))
-        .await
-        .ok()?;
-    let mut out = Vec::new();
-    // Line-oriented: uv emits `[[package]]` blocks; wheels live either as
-    // inline `{ url = "…", hash = "sha256:…" }` table rows or one-line
-    // arrays. A pure wheel ends `-none-any.whl` ([`pure_wheel_from_uv_unit`],
-    // the same rule the ledger recovery applies).
-    let mut name: Option<String> = None;
-    let mut version: Option<String> = None;
-    let mut sourced_registry = true;
-    let mut wheel: Option<(String, String)> = None;
-    let flush = |name: &mut Option<String>,
-                 version: &mut Option<String>,
-                 sourced_registry: &mut bool,
-                 wheel: &mut Option<(String, String)>,
-                 out: &mut Vec<LockfileEntry>| {
-        if let (Some(n), Some(v)) = (name.take(), version.take()) {
-            let canonical = canonicalize_pypi_name(&n);
-            if *sourced_registry
-                && path_safety::is_safe_single_segment(&canonical)
-                && path_safety::is_safe_single_segment(&v)
-            {
-                let (resolved, integrity) = match wheel.take() {
-                    Some((url, sha)) => (http_url(&url), LockIntegrity::Sha256Hex(sha)),
-                    None => (None, LockIntegrity::None),
-                };
-                out.push(LockfileEntry {
-                    ecosystem: "pypi",
-                    purl: format!("pkg:pypi/{canonical}@{v}"),
-                    name: canonical,
-                    version: v,
-                    resolved,
-                    integrity,
-                });
+fn python_archive(archive: &dyn TableLike) -> Option<(String, String)> {
+    let url = archive.get("url")?.as_str()?;
+    if !url.split(['?', '#']).next()?.ends_with("-none-any.whl") {
+        return None;
+    }
+    let sha = archive
+        .get("hash")
+        .and_then(Item::as_str)
+        .and_then(|value| value.strip_prefix("sha256:"))
+        .or_else(|| {
+            archive
+                .get("hashes")?
+                .as_table_like()?
+                .get("sha256")?
+                .as_str()
+        })?;
+    if !is_hex_of_len(sha, 64) {
+        return None;
+    }
+    Some((http_url(url)?, sha.to_ascii_lowercase()))
+}
+
+fn python_package_archive(package: &dyn TableLike) -> Option<(String, String)> {
+    if let Some(archive) = package
+        .get("archive")
+        .and_then(Item::as_table_like)
+        .and_then(python_archive)
+    {
+        return Some(archive);
+    }
+    if let Some(wheels) = package.get("wheels").and_then(Item::as_array) {
+        for wheel in wheels.iter().filter_map(TomlValue::as_inline_table) {
+            if let Some(archive) = python_archive(wheel) {
+                return Some(archive);
             }
         }
-        *sourced_registry = true;
-        *wheel = None;
-    };
-    for line in text.lines() {
-        let t = line.trim();
-        if t == "[[package]]" {
-            flush(
-                &mut name,
-                &mut version,
-                &mut sourced_registry,
-                &mut wheel,
-                &mut out,
-            );
-            continue;
-        }
-        if let Some(v) = t.strip_prefix("name = ") {
-            name = Some(v.trim_matches('"').to_string());
-        } else if let Some(v) = t.strip_prefix("version = ") {
-            version = Some(v.trim_matches('"').to_string());
-        } else if t.starts_with("source = ") {
-            // Registry packages: `source = { registry = "…" }`; editable/
-            // virtual/path/git sources are not fetchable artifacts.
-            sourced_registry = t.contains("registry");
-        } else if wheel.is_none() {
-            // One line may hold several `{ url = "…", hash = "sha256:…" }`
-            // wheels (one-line arrays); pair the pure wheel with ITS OWN
-            // hash, never the line's first url/hash.
-            wheel = pure_wheel_from_uv_unit(t);
+    }
+    if let Some(wheels) = package.get("wheel").and_then(Item::as_array_of_tables) {
+        for wheel in wheels.iter() {
+            if let Some(archive) = python_archive(wheel) {
+                return Some(archive);
+            }
         }
     }
-    flush(
-        &mut name,
-        &mut version,
-        &mut sourced_registry,
-        &mut wheel,
-        &mut out,
-    );
-    Some(dedup_prefer_integrity(out))
+    None
+}
+
+fn python_lock_inventory(text: &str) -> Option<Vec<LockfileEntry>> {
+    let document: DocumentMut = text.parse().ok()?;
+    let pep751 = document.get("lock-version").is_some();
+    let collection = if pep751 {
+        if document.get("lock-version").and_then(Item::as_str) != Some("1.0") {
+            return None;
+        }
+        "packages"
+    } else {
+        if document.get("version").and_then(Item::as_integer) != Some(1) {
+            return None;
+        }
+        if document.contains_key("distribution") {
+            "distribution"
+        } else {
+            "package"
+        }
+    };
+    let mut out = Vec::new();
+    let packages = document.get(collection)?.as_array_of_tables()?;
+    for package in packages.iter() {
+        let Some(name) = package
+            .get("name")
+            .and_then(Item::as_str)
+            .map(canonicalize_pypi_name)
+        else {
+            continue;
+        };
+        let Some(version) = package.get("version").and_then(Item::as_str) else {
+            continue;
+        };
+        if !path_safety::is_safe_single_segment(&name)
+            || !path_safety::is_safe_single_segment(version)
+        {
+            continue;
+        }
+        let remote = if pep751 {
+            !package.contains_key("vcs")
+                && !package.contains_key("directory")
+                && !package
+                    .get("archive")
+                    .and_then(Item::as_table_like)
+                    .is_some_and(|archive| archive.contains_key("path"))
+        } else {
+            package.get("source").is_some_and(|source| {
+                source.as_str().is_some_and(|value| {
+                    value.starts_with("registry+") || value.starts_with("direct+")
+                }) || source.as_table_like().is_some_and(|table| {
+                    table.contains_key("registry") || table.contains_key("url")
+                })
+            })
+        };
+        if !remote {
+            continue;
+        }
+        let (resolved, integrity) = match python_package_archive(package) {
+            Some((url, sha)) => (Some(url), LockIntegrity::Sha256Hex(sha)),
+            None => (None, LockIntegrity::None),
+        };
+        out.push(LockfileEntry {
+            ecosystem: "pypi",
+            purl: format!("pkg:pypi/{name}@{version}"),
+            name,
+            version: version.to_string(),
+            resolved,
+            integrity,
+        });
+    }
+    Some(out)
 }
 
 /// poetry.lock: `[[package]]` blocks with `name`/`version` — discovery
@@ -1401,6 +1453,31 @@ pub async fn recover_lock_entry(
                         .to_string(),
                 );
             }
+            for wiring in entry
+                .wiring
+                .iter()
+                .filter(|wiring| wiring.kind == "python_lock_document")
+            {
+                if let Some(text) = wiring.original.as_ref().and_then(Value::as_str) {
+                    if let Some(entries) = python_lock_inventory(text) {
+                        if let Some(resolution) = entries.into_iter().find(|candidate| {
+                            candidate.name == name
+                                && candidate.version == version
+                                && candidate.resolved.is_some()
+                                && candidate.integrity != LockIntegrity::None
+                        }) {
+                            return Ok(resolution);
+                        }
+                    }
+                }
+            }
+            if entry
+                .wiring
+                .iter()
+                .any(|wiring| wiring.kind == "python_lock_document")
+            {
+                return Err("the pre-vendor Python lock has no hash-pinned pure wheel for this package; reinstall it before repair".to_string());
+            }
             // Every pypi package manager records the pre-vendor resolution under
             // its own wiring kind — uv writes `uv_lock_package`, pdm
             // `pdm_lock_package`, poetry `poetry_lock_package`, pipenv
@@ -1410,6 +1487,7 @@ pub async fn recover_lock_entry(
                 entry,
                 &[
                     "uv_lock_package",
+                    "python_lock_document",
                     "pdm_lock_package",
                     "poetry_lock_package",
                     "pipenv_lock_entry",
@@ -1457,6 +1535,73 @@ pub async fn wired_vendor_integrity(
     artifact_rel: &str,
 ) -> Option<LockIntegrity> {
     let rel = artifact_rel.trim_start_matches("./");
+
+    if rel.starts_with(".socket/vendor/pypi/") {
+        let mut pinned = None;
+        for path in crate::utils::python_lock::python_lock_paths(project_root).ok()? {
+            let Ok(text) = read_regular_to_string(&project_root.join(path)).await else {
+                continue;
+            };
+            let Ok(document) = text.parse::<DocumentMut>() else {
+                continue;
+            };
+            let collection = if document.contains_key("lock-version") {
+                "packages"
+            } else {
+                "package"
+            };
+            let Some(packages) = document.get(collection).and_then(Item::as_array_of_tables) else {
+                continue;
+            };
+            for package in packages.iter() {
+                let archive = package.get("archive").and_then(Item::as_table_like);
+                let source =
+                    archive.or_else(|| package.get("source").and_then(Item::as_table_like));
+                if source
+                    .and_then(|source| source.get("path"))
+                    .and_then(Item::as_str)
+                    .is_none_or(|path| path.trim_start_matches("./") != rel)
+                {
+                    continue;
+                }
+                let sha = if let Some(archive) = archive {
+                    archive
+                        .get("hashes")
+                        .and_then(Item::as_table_like)
+                        .and_then(|hashes| hashes.get("sha256"))
+                        .and_then(Item::as_str)
+                } else {
+                    package
+                        .get("wheels")
+                        .and_then(Item::as_array)
+                        .and_then(|wheels| {
+                            wheels
+                                .iter()
+                                .filter_map(TomlValue::as_inline_table)
+                                .find_map(|wheel| {
+                                    if wheel.get("filename").and_then(TomlValue::as_str)
+                                        != rel.rsplit('/').next()
+                                    {
+                                        return None;
+                                    }
+                                    wheel
+                                        .get("hash")
+                                        .and_then(TomlValue::as_str)
+                                        .and_then(|value| value.strip_prefix("sha256:"))
+                                })
+                        })
+                };
+                let sha = sha
+                    .filter(|sha| is_hex_of_len(sha, 64))
+                    .map(str::to_ascii_lowercase)?;
+                if pinned.as_ref().is_some_and(|previous| previous != &sha) {
+                    return None;
+                }
+                pinned = Some(sha);
+            }
+        }
+        return pinned.map(LockIntegrity::Sha256Hex);
+    }
 
     // JSON locks: resolved == "file:<rel>" (npm writes exactly this form).
     for lock in ["npm-shrinkwrap.json", "package-lock.json"] {
@@ -2892,6 +3037,69 @@ checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     }
 
     #[tokio::test]
+    async fn inventories_script_and_pylock_files_without_installed_packages() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sha = "a".repeat(64);
+        write(tmp.path(), "example.py.lock", &format!("version=1\n[[package]]\nname='alpha'\nversion='1'\nsource={{registry='https://pypi.org/simple'}}\nwheels=[{{url='https://pypi.org/alpha-1-py3-none-any.whl',hash='sha256:{sha}'}}]\n")).await;
+        write(tmp.path(), "pylock.dev.toml", &format!("lock-version='1.0'\n[[packages]]\nname='bravo'\nversion='2'\narchive={{url='https://pypi.org/bravo-2-py3-none-any.whl',hashes={{sha256='{sha}'}}}}\n[[packages]]\nname='local'\nversion='1'\narchive={{path='.socket/vendor/pypi/uuid/local-1-py3-none-any.whl',hashes={{sha256='{sha}'}}}}\n")).await;
+        let entries = inventory_pypi_locks(tmp.path()).await.unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            entry(&entries, "alpha").integrity,
+            LockIntegrity::Sha256Hex(sha.clone())
+        );
+        assert_eq!(
+            entry(&entries, "bravo").integrity,
+            LockIntegrity::Sha256Hex(sha)
+        );
+        assert!(!entries.iter().any(|entry| entry.name == "local"));
+    }
+
+    #[tokio::test]
+    async fn pylock_repair_uses_the_exact_artifact_hash_and_refuses_conflicts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = ".socket/vendor/pypi/uuid/alpha-1-py3-none-any.whl";
+        let sha = "a".repeat(64);
+        let pylock = format!("lock-version='1.0'\n[[packages]]\nname='alpha'\nversion='1'\narchive={{path='{path}',hashes={{sha256='{sha}'}}}}\n");
+        write(tmp.path(), "pylock.toml", &pylock).await;
+        assert_eq!(
+            wired_vendor_integrity(tmp.path(), path).await,
+            Some(LockIntegrity::Sha256Hex(sha.clone()))
+        );
+        assert_eq!(
+            wired_vendor_integrity(tmp.path(), &format!("{path}.other")).await,
+            None
+        );
+        write(tmp.path(), "example.py.lock", &format!("version=1\n[[package]]\nname='alpha'\nversion='1'\nsource={{path='{path}'}}\nwheels=[{{filename='alpha-1-py3-none-any.whl',hash='sha256:{sha}'}}]\n")).await;
+        assert_eq!(
+            wired_vendor_integrity(tmp.path(), path).await,
+            Some(LockIntegrity::Sha256Hex(sha.clone()))
+        );
+        write(
+            tmp.path(),
+            "pylock.toml",
+            &pylock.replace(&sha, &"b".repeat(64)),
+        )
+        .await;
+        assert_eq!(wired_vendor_integrity(tmp.path(), path).await, None);
+    }
+
+    #[test]
+    fn legacy_and_pep751_archive_hashes_stay_with_their_own_wheels() {
+        let sha = "b".repeat(64);
+        let legacy = format!("version=1\n[[distribution]]\nname='alpha'\nversion='1'\nsource='registry+https://pypi.org/simple'\n[[distribution.wheel]]\nurl='https://pypi.org/alpha-1-py3-none-any.whl'\nhash='sha256:{sha}'\n");
+        assert_eq!(
+            python_lock_inventory(&legacy).unwrap()[0].integrity,
+            LockIntegrity::Sha256Hex(sha.clone())
+        );
+        let lock = format!("lock-version='1.0'\n[[packages]]\nname='alpha'\nversion='1'\nwheels=[{{url='https://pypi.org/alpha-1-py3-none-any.whl'}},{{url='https://pypi.org/alpha-1-cp312-cp312-macosx.whl',hashes={{sha256='{sha}'}}}}]\n");
+        let entries = python_lock_inventory(&lock).unwrap();
+        assert_eq!(entries[0].integrity, LockIntegrity::None);
+        assert_eq!(entries[0].resolved, None);
+        assert!(python_lock_inventory("version=2\n[[package]]\nname='x'\nversion='1'").is_none());
+    }
+
+    #[tokio::test]
     async fn uv_lock_inventories_pure_wheels() {
         let tmp = tempfile::tempdir().unwrap();
         write(
@@ -3279,7 +3487,10 @@ source = { editable = "." }
             LockIntegrity::Sha256Hex("d".repeat(64)),
             "the [metadata] line's checksum must not bleed into the last block"
         );
-        assert!(!entries.iter().any(|e| e.name.contains("..")), "{entries:?}");
+        assert!(
+            !entries.iter().any(|e| e.name.contains("..")),
+            "{entries:?}"
+        );
         assert!(!entries.iter().any(|e| e.name == "foo"), "{entries:?}");
     }
 
@@ -3533,7 +3744,12 @@ packages:
             "[metadata]\nlock-version = \"2.0\"\n",
         )
         .await;
-        write(tmp.path(), "requirements.txt", "requests==2.31.0\nbad==vNaN\n").await;
+        write(
+            tmp.path(),
+            "requirements.txt",
+            "requests==2.31.0\nbad==vNaN\n",
+        )
+        .await;
         let entries = inventory_pypi_locks(tmp.path()).await.unwrap();
         assert_eq!(
             sorted_pairs(&entries),
@@ -3557,7 +3773,8 @@ packages:
     /// http(s) all yield None — fail-closed, never a guessed pairing.
     #[tokio::test]
     async fn pure_wheel_rejects_short_hash_missing_hash_and_non_http_url() {
-        let short = "wheels = [{ url = \"https://h/x-1.0-py3-none-any.whl\", hash = \"sha256:abcd\" }]";
+        let short =
+            "wheels = [{ url = \"https://h/x-1.0-py3-none-any.whl\", hash = \"sha256:abcd\" }]";
         assert_eq!(pure_wheel_from_uv_unit(short), None, "short hash");
 
         let hashless = "wheels = [{ url = \"https://h/x-1.0-py3-none-any.whl\" }]";
@@ -3653,6 +3870,23 @@ mod recover_tests {
             original: Some(original),
             new: None,
         }
+    }
+
+    #[tokio::test]
+    async fn python_document_recovery_selects_the_requested_package() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sha = "c".repeat(64);
+        let lock = format!("lock-version='1.0'\n[[packages]]\nname='other'\nversion='1'\narchive={{url='https://pypi.org/other-1-py3-none-any.whl',hashes={{sha256='{}'}}}}\n[[packages]]\nname='target'\nversion='2'\narchive={{url='https://pypi.org/target-2-py3-none-any.whl',hashes={{sha256='{sha}'}}}}\n", "d".repeat(64));
+        let record = rec("python_lock_document", serde_json::json!(lock));
+        let ledger = entry("pypi", "pkg:pypi/target@2", vec![record.clone()]);
+        let recovered = recover_lock_entry(tmp.path(), &ledger).await.unwrap();
+        assert_eq!(
+            recovered.resolved.as_deref(),
+            Some("https://pypi.org/target-2-py3-none-any.whl")
+        );
+        assert_eq!(recovered.integrity, LockIntegrity::Sha256Hex(sha));
+        let absent = entry("pypi", "pkg:pypi/target@3", vec![record]);
+        assert!(recover_lock_entry(tmp.path(), &absent).await.is_err());
     }
 
     #[tokio::test]
