@@ -960,7 +960,7 @@ pub async fn revert_pypi_opts(
         dry_run,
         keep_artifact,
     } = opts;
-    if entry.wiring.is_empty() {
+    if !keep_artifact && entry.wiring.is_empty() {
         let uuid_dir_rel = vendor_uuid_dir_rel("pypi", &entry.uuid)
             .unwrap_or_else(|| format!(".socket/vendor/pypi/{:?}", entry.uuid));
         if let Some(blocked) =
