@@ -5274,6 +5274,31 @@ mod tests {
         );
     }
 
+    /// An inline comment after the marker must not swallow the appended
+    /// `--hash=…` (pip would then treat the hash as comment text and skip
+    /// enforcement). The comment is split off and re-appended AFTER the hash
+    /// so the pin stays active and the user's note survives.
+    #[test]
+    fn requirements_marker_comment_keeps_hash_active() {
+        let original = "requests==2.28.1 ; python_version >= \"3.7\" # explanation\n";
+        let files = BTreeMap::from([("requirements.txt".to_string(), original.to_string())]);
+        let sha256 = "c".repeat(64);
+        let url = "https://patch.socket.dev/requests-2.28.1-py3-none-any.whl";
+        let overrides = vec![pypi_override("requests", "2.28.1", url, &sha256)];
+        let first = rewrite_registry_redirect(&files, &overrides);
+        let output = first.files.get("requirements.txt").expect("rewritten");
+        assert_eq!(
+            output,
+            &format!(
+                "requests @ {url} ; python_version >= \"3.7\" --hash=sha256:{sha256} # explanation\n"
+            )
+        );
+        let again = BTreeMap::from([("requirements.txt".to_string(), output.clone())]);
+        let second = rewrite_registry_redirect(&again, &overrides);
+        assert!(second.files.is_empty());
+        assert!(second.edits.is_empty());
+    }
+
     const MAVEN_SUFFIXED: &str = "1.7.36-socket.aaaaaaaa";
 
     /// A fail-closed override (suffixed version + jar/pom sha256 present).

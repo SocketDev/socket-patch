@@ -891,3 +891,91 @@ fn pip_requirements_vendor_fresh_checkout_no_index_and_revert() {
         ".socket/vendor must be fully removed after revert"
     );
 }
+
+#[test]
+#[serial_test::serial]
+fn pip_vendored_requirements_evaluate_environment_markers() {
+    let python = find_python().expect("Python is required for the pip marker regression");
+    let tmp = tempfile::tempdir().unwrap();
+    for (label, marker, installed) in [
+        ("excluded", "python_version < '2'", false),
+        ("included", "python_version >= '2'", true),
+    ] {
+        let project = tmp.path().join(label);
+        std::fs::create_dir_all(&project).unwrap();
+        assert_tool_ok(
+            &tool(Path::new(python), &project, &["-m", "venv", ".venv"], &[]),
+            "create source venv",
+        );
+        let venv = project.join(".venv");
+        assert_tool_ok(
+            &tool(
+                &venv.join("bin/pip"),
+                &project,
+                &["install", "--disable-pip-version-check", "six==1.16.0"],
+                &[],
+            ),
+            "install upstream six",
+        );
+        stage_patch(&project, &site_packages(&venv).join("six.py"));
+        let original = format!("six==1.16.0 ; {marker}\n");
+        std::fs::write(project.join("requirements.txt"), &original).unwrap();
+        let (code, stdout, stderr) = run_vendored(&VendorDriver::VendorOffline, &project);
+        assert_eq!(code, 0, "vendor failed: {stdout}\n{stderr}");
+        assert_vendored_applied(&parse_envelope(&stdout));
+
+        let fresh = project.join("fresh");
+        std::fs::create_dir_all(&fresh).unwrap();
+        std::fs::copy(
+            project.join("requirements.txt"),
+            fresh.join("requirements.txt"),
+        )
+        .unwrap();
+        copy_dir_recursive(&project.join(".socket"), &fresh.join(".socket"));
+        assert_tool_ok(
+            &tool(Path::new(python), &fresh, &["-m", "venv", ".venv"], &[]),
+            "create fresh venv",
+        );
+        let fresh_venv = fresh.join(".venv");
+        assert_tool_ok(
+            &tool(
+                &fresh_venv.join("bin/pip"),
+                &fresh,
+                &[
+                    "install",
+                    "--disable-pip-version-check",
+                    "--no-index",
+                    "--require-hashes",
+                    "-r",
+                    "requirements.txt",
+                ],
+                &[],
+            ),
+            "install vendored marker requirement",
+        );
+        let probe = tool(
+            &fresh_venv.join("bin/python"),
+            &fresh,
+            &[
+                "-c",
+                "import importlib.util; print(importlib.util.find_spec('six') is not None)",
+            ],
+            &[],
+        );
+        assert_tool_ok(&probe, "inspect installed package");
+        assert_eq!(
+            String::from_utf8_lossy(&probe.stdout).trim(),
+            if installed { "True" } else { "False" }
+        );
+        if installed {
+            assert_eq!(python_oracle(&fresh_venv, &fresh), "1");
+        }
+        let (code, stdout, stderr) =
+            run_socket(&project, &["vendor", "--revert", "--offline", "--json"]);
+        assert_eq!(code, 0, "revert failed: {stdout}\n{stderr}");
+        assert_eq!(
+            std::fs::read_to_string(project.join("requirements.txt")).unwrap(),
+            original
+        );
+    }
+}
