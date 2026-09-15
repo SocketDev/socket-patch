@@ -237,9 +237,14 @@ pub(super) async fn load_uv_project(root: &Path) -> Result<UvProject, (&'static 
 }
 
 /// Direct iff the package is named (PEP 508 name, canonicalized) anywhere in
-/// `project.dependencies`, `project.optional-dependencies`, or the PEP 735
-/// `dependency-groups` — every surface `[tool.uv.sources]` applies to without
-/// an override.
+/// `project.dependencies`, `project.optional-dependencies`, the PEP 735
+/// `dependency-groups`, or the legacy `[tool.uv] dev-dependencies` array —
+/// every surface `[tool.uv.sources]` applies to without an override. uv
+/// (through 0.12.15, with a deprecation warning) still honours the legacy
+/// array and records it exactly like `dependency-groups.dev`: in the root
+/// unit's `[package.metadata.requires-dev]`. Classifying it Transitive
+/// would take the override branch and leave that entry's `specifier` in
+/// place — `uv lock --check` / `uv sync --locked` red on every uv >= 0.2.37.
 fn classify_dependency(p: &UvProject, canon_name: &str) -> UvDepClass {
     let mut declared: Vec<String> = Vec::new();
     pep621_declared_names(&p.pyproject, &mut declared);
@@ -259,6 +264,19 @@ fn classify_dependency(p: &UvProject, canon_name: &str) -> UvDepClass {
                 );
             }
         }
+    }
+    if let Some(dev) = p
+        .pyproject
+        .get("tool")
+        .and_then(|t| item_get(t, "uv"))
+        .and_then(|u| item_get(u, "dev-dependencies"))
+        .and_then(Item::as_array)
+    {
+        declared.extend(
+            dev.iter()
+                .filter_map(Value::as_str)
+                .map(|s| pep508_name(s).to_string()),
+        );
     }
     if declared
         .iter()
@@ -426,7 +444,8 @@ pub(super) fn wired_pin(
 /// Wire the pair for the vendored wheel. Writes `pyproject.toml` FIRST, then
 /// `uv.lock`; a failed lock write unwinds the pyproject from the recorded
 /// original so the pair is never left half-wired (either half alone is a
-/// silent no-op or a silent revert — spike claims 7/9).
+/// silent no-op or a silent revert — spike claims 7/9). The third element
+/// carries wiring-time advisories (non-fatal, surfaced with the outcome).
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn wire_uv(
     p: &UvProject,
@@ -437,7 +456,7 @@ pub(super) async fn wire_uv(
     wheel_file_name: &str,
     wheel_sha256_hex: &str,
     record_uuid: &str,
-) -> Result<(Vec<WiringRecord>, UvMeta), (&'static str, String)> {
+) -> Result<(Vec<WiringRecord>, UvMeta, Vec<VendorWarning>), (&'static str, String)> {
     match check_target_guards(p, canon_name, record_uuid)? {
         // Defensive: the orchestrator short-circuits in-sync pre-flight and
         // never calls wire on it (we must never re-record our own edit as an
@@ -456,6 +475,7 @@ pub(super) async fn wire_uv(
     }
     let class = classify_dependency(p, canon_name);
     let mut wiring: Vec<WiringRecord> = Vec::new();
+    let mut advisories: Vec<VendorWarning> = Vec::new();
 
     // ── pyproject.toml (computed in memory; committed before the lock) ────
     let mut doc = p.pyproject.clone();
@@ -653,7 +673,7 @@ pub(super) async fn wire_uv(
         created_sources_table,
         lock_revision: p.lock_revision,
     };
-    Ok((wiring, meta))
+    Ok((wiring, meta, advisories))
 }
 
 /// Reverse the wiring: restore verbatim originals (or delete added fragments)
@@ -1009,18 +1029,23 @@ struct RequiresDistEdit {
     kind: &'static str,
 }
 
-/// Find + transform EVERY root-package metadata entry for `canon`: the
-/// `[package.metadata]` `requires-dist` array (project.dependencies /
-/// optional-dependencies) AND each `[package.metadata.requires-dev]` group
-/// array (PEP 735 `[dependency-groups]` — uv records group deps there, never
-/// in requires-dist, and rewrites ALL entries to the path shape when a
-/// source applies; spike-verified against uv 0.11.19). Each entry:
-/// `{ name = "x", specifier = "==v" }` → `{ name = "x", path = "<rel>" }`
-/// (uv DROPS the specifier for path sources — recorded for revert). Returns
-/// absolute byte spans, ascending, so the caller splices by range, never by
-/// string search (a bare `{ name = "x" }` entry would collide with
-/// `dependencies` arrays elsewhere in the lock). requires-dev fragments span
-/// the whole `<group> = […]` line so identically-pinned groups stay
+/// Find + transform EVERY root-package metadata entry for `canon`: each
+/// matching element of the `[package.metadata]` `requires-dist` array
+/// (project.dependencies / optional-dependencies — a package in both has
+/// TWO entries, the extra's with `marker = "extra == '…'"`) AND each
+/// `[package.metadata.requires-dev]` group array (PEP 735
+/// `[dependency-groups]` and the legacy `[tool.uv] dev-dependencies` — uv
+/// records those there, never in requires-dist). uv rewrites ALL of them to
+/// the path shape when a source applies (verified against uv 0.11.19 and
+/// 0.12.15), so one left with its specifier keeps `--locked` red. Each
+/// entry: `{ name = "x", specifier = "==v" }` → `{ name = "x", path =
+/// "<rel>" }` (uv DROPS the specifier for path sources — recorded for
+/// revert). Returns absolute byte spans, ascending and non-overlapping, so
+/// the caller splices by range, never by string search (a bare `{ name = "x"
+/// }` entry would collide with `dependencies` arrays elsewhere in the lock).
+/// Each requires-dist element is its own edit (one wiring record per
+/// element); a requires-dev fragment spans the whole `<group> = […]` line
+/// with every matching element rewritten, so identically-pinned groups stay
 /// distinguishable when revert matches fragments by text.
 fn rewrite_root_metadata_entries(
     lock_text: &str,
@@ -1067,6 +1092,10 @@ fn rewrite_root_metadata_entries(
                 continue;
             }
             let (new_entry, specifier) = path_source_entry(entry, rel_wheel);
+            // No early exit: a package in both project.dependencies and an
+            // optional-dependencies extra has TWO entries here (the second
+            // carries `marker = "extra == '…'"`) and uv repoints both; one
+            // left with its specifier keeps `--locked` red.
             edits.push(RequiresDistEdit {
                 span: (unit_start + arr_open + s)..(unit_start + arr_open + e),
                 old_entry: entry.to_string(),
@@ -1074,7 +1103,6 @@ fn rewrite_root_metadata_entries(
                 specifier,
                 kind: "uv_lock_requires_dist",
             });
-            break;
         }
     }
 
@@ -1097,28 +1125,39 @@ fn rewrite_root_metadata_entries(
                 )
             })?;
             let array_text = &unit_text[arr_open..arr_end];
+            // Rebuild the whole group array with EVERY matching element
+            // repointed (a group may name the package twice under different
+            // markers), so one group is always one non-overlapping edit.
+            let mut new_array = String::with_capacity(array_text.len());
+            let mut last = 0;
+            let mut specifier: Option<String> = None;
+            let mut matched = false;
             for (s, e) in top_level_brace_groups(array_text) {
                 let entry = &array_text[s..e];
                 if !entry.contains(&needle) {
                     continue;
                 }
-                let (new_entry, specifier) = path_source_entry(entry, rel_wheel);
+                let (new_entry, spec) = path_source_entry(entry, rel_wheel);
+                if specifier.is_none() {
+                    specifier = spec;
+                }
+                new_array.push_str(&array_text[last..s]);
+                new_array.push_str(&new_entry);
+                last = e;
+                matched = true;
+            }
+            if matched {
+                new_array.push_str(&array_text[last..]);
                 // Fragment from the group key so revert's text match can't
                 // confuse two groups pinning the same entry.
                 let key_start = unit_text[..arr_open].rfind('\n').map_or(0, |i| i + 1);
                 edits.push(RequiresDistEdit {
                     span: (unit_start + key_start)..(unit_start + arr_end),
                     old_entry: unit_text[key_start..arr_end].to_string(),
-                    new_entry: format!(
-                        "{}{}{}",
-                        &unit_text[key_start..arr_open + s],
-                        new_entry,
-                        &unit_text[arr_open + e..arr_end]
-                    ),
+                    new_entry: format!("{}{}", &unit_text[key_start..arr_open], new_array),
                     specifier,
                     kind: "uv_lock_requires_dev",
                 });
-                break;
             }
             cursor = arr_end;
         }
@@ -1757,7 +1796,7 @@ wheels = [
         assert!(p.warnings.is_empty());
         assert_eq!(classify_dependency(&p, "six"), UvDepClass::Direct);
 
-        let (wiring, meta) = wire_uv(
+        let (wiring, meta, _) = wire_uv(
             &p,
             tmp.path(),
             "six",
@@ -1804,7 +1843,7 @@ wheels = [
         let p = load_uv_project(tmp.path()).await.unwrap();
         assert_eq!(classify_dependency(&p, "six"), UvDepClass::Transitive);
 
-        let (wiring, meta) = wire_uv(
+        let (wiring, meta, _) = wire_uv(
             &p,
             tmp.path(),
             "six",
@@ -2081,7 +2120,7 @@ wheels = [
     async fn revert_direct_restores_originals_byte_identically() {
         let tmp = write_pair(DIRECT_REGISTRY_PYPROJECT, DIRECT_REGISTRY_LOCK).await;
         let p = load_uv_project(tmp.path()).await.unwrap();
-        let (wiring, meta) = wire_uv(
+        let (wiring, meta, _) = wire_uv(
             &p,
             tmp.path(),
             "six",
@@ -2110,7 +2149,7 @@ wheels = [
     async fn revert_override_restores_originals_byte_identically() {
         let tmp = write_pair(TRANSITIVE_REGISTRY_PYPROJECT, TRANSITIVE_REGISTRY_LOCK).await;
         let p = load_uv_project(tmp.path()).await.unwrap();
-        let (wiring, meta) = wire_uv(
+        let (wiring, meta, _) = wire_uv(
             &p,
             tmp.path(),
             "six",
@@ -2197,7 +2236,7 @@ wheels = [
         };
 
         let p = load_uv_project(tmp.path()).await.unwrap();
-        let (wiring, meta) = wire_uv(
+        let (wiring, meta, _) = wire_uv(
             &p,
             tmp.path(),
             "six",
@@ -2231,7 +2270,7 @@ wheels = [
     async fn revert_dry_run_changes_nothing() {
         let tmp = write_pair(DIRECT_REGISTRY_PYPROJECT, DIRECT_REGISTRY_LOCK).await;
         let p = load_uv_project(tmp.path()).await.unwrap();
-        let (wiring, meta) = wire_uv(
+        let (wiring, meta, _) = wire_uv(
             &p,
             tmp.path(),
             "six",
@@ -2259,7 +2298,7 @@ wheels = [
     async fn revert_warns_and_skips_on_drifted_lock_fragment() {
         let tmp = write_pair(DIRECT_REGISTRY_PYPROJECT, DIRECT_REGISTRY_LOCK).await;
         let p = load_uv_project(tmp.path()).await.unwrap();
-        let (wiring, meta) = wire_uv(
+        let (wiring, meta, _) = wire_uv(
             &p,
             tmp.path(),
             "six",
@@ -2619,7 +2658,7 @@ wheels = [
 
         let p = load_uv_project(tmp.path()).await.unwrap();
         assert_eq!(classify_dependency(&p, "widget"), UvDepClass::Direct);
-        let (wiring, meta) = wire_uv(
+        let (wiring, meta, _) = wire_uv(
             &p,
             tmp.path(),
             "widget",
@@ -2681,7 +2720,7 @@ wheels = [
         );
         let tmp = write_pair(TRANSITIVE_REGISTRY_PYPROJECT, &empty_overrides_lock).await;
         let p = load_uv_project(tmp.path()).await.unwrap();
-        let (wiring, meta) = wire_uv(
+        let (wiring, meta, _) = wire_uv(
             &p,
             tmp.path(),
             "six",
@@ -2910,7 +2949,7 @@ wheels = [
         let p = load_uv_project(tmp.path()).await.unwrap();
         assert_eq!(classify_dependency(&p, "six"), UvDepClass::Direct);
 
-        let (wiring, meta) = wire_uv(
+        let (wiring, meta, _) = wire_uv(
             &p,
             tmp.path(),
             "six",
@@ -2959,7 +2998,7 @@ wheels = [
         let p = load_uv_project(tmp.path()).await.unwrap();
         assert_eq!(classify_dependency(&p, "six"), UvDepClass::Direct);
 
-        let (wiring, meta) = wire_uv(
+        let (wiring, meta, _) = wire_uv(
             &p,
             tmp.path(),
             "six",
@@ -3094,7 +3133,7 @@ wheels = [
         assert!(p.warnings.is_empty(), "{:?}", p.warnings);
         assert_eq!(p.lock_revision, None);
 
-        let (_, meta) = wire_uv(
+        let (_, meta, _) = wire_uv(
             &p,
             tmp.path(),
             "six",
@@ -3165,7 +3204,7 @@ wheels = [
         let p = load_uv_project(tmp.path()).await.unwrap();
         assert_eq!(classify_dependency(&p, "six"), UvDepClass::Transitive);
 
-        let (wiring, meta) = wire_uv(
+        let (wiring, meta, _) = wire_uv(
             &p,
             tmp.path(),
             "six",
@@ -3225,7 +3264,7 @@ wheels = [
         );
         let tmp = write_pair(TRANSITIVE_REGISTRY_PYPROJECT, &input_lock).await;
         let p = load_uv_project(tmp.path()).await.unwrap();
-        let (wiring, meta) = wire_uv(
+        let (wiring, meta, _) = wire_uv(
             &p,
             tmp.path(),
             "six",
@@ -3284,7 +3323,7 @@ wheels = [
         );
         let tmp = write_pair(TRANSITIVE_REGISTRY_PYPROJECT, &input_lock).await;
         let p = load_uv_project(tmp.path()).await.unwrap();
-        let (wiring, meta) = wire_uv(
+        let (wiring, meta, _) = wire_uv(
             &p,
             tmp.path(),
             "six",
@@ -3334,7 +3373,7 @@ wheels = [
         );
         let tmp = write_pair(TRANSITIVE_REGISTRY_PYPROJECT, &input_lock).await;
         let p = load_uv_project(tmp.path()).await.unwrap();
-        let (wiring, meta) = wire_uv(
+        let (wiring, meta, _) = wire_uv(
             &p,
             tmp.path(),
             "six",
@@ -3393,7 +3432,7 @@ wheels = [
         );
         let tmp = write_pair(TRANSITIVE_REGISTRY_PYPROJECT, &input_lock).await;
         let p = load_uv_project(tmp.path()).await.unwrap();
-        let (wiring, meta) = wire_uv(
+        let (wiring, meta, _) = wire_uv(
             &p,
             tmp.path(),
             "six",
@@ -3458,7 +3497,7 @@ wheels = [
     async fn revert_warns_and_skips_when_sources_line_was_edited() {
         let tmp = write_pair(DIRECT_REGISTRY_PYPROJECT, DIRECT_REGISTRY_LOCK).await;
         let p = load_uv_project(tmp.path()).await.unwrap();
-        let (wiring, meta) = wire_uv(
+        let (wiring, meta, _) = wire_uv(
             &p,
             tmp.path(),
             "six",
@@ -3521,7 +3560,7 @@ wheels = [
         ] {
             let tmp = write_pair(registry_py, registry_lock).await;
             let p = load_uv_project(tmp.path()).await.unwrap();
-            let (wiring, meta) = wire_uv(
+            let (wiring, meta, _) = wire_uv(
                 &p,
                 tmp.path(),
                 target,
@@ -3567,7 +3606,7 @@ wheels = [
     async fn revert_pypi_converged_uv_cleans_up_the_artifact() {
         let tmp = write_pair(DIRECT_REGISTRY_PYPROJECT, DIRECT_REGISTRY_LOCK).await;
         let p = load_uv_project(tmp.path()).await.unwrap();
-        let (wiring, meta) = wire_uv(
+        let (wiring, meta, _) = wire_uv(
             &p,
             tmp.path(),
             "six",
@@ -3615,7 +3654,7 @@ wheels = [
     async fn revert_pypi_drifted_uv_keeps_artifact() {
         let tmp = write_pair(DIRECT_REGISTRY_PYPROJECT, DIRECT_REGISTRY_LOCK).await;
         let p = load_uv_project(tmp.path()).await.unwrap();
-        let (wiring, meta) = wire_uv(
+        let (wiring, meta, _) = wire_uv(
             &p,
             tmp.path(),
             "six",
@@ -3672,7 +3711,7 @@ wheels = [
     async fn revert_warns_and_skips_when_added_override_line_was_edited() {
         let tmp = write_pair(TRANSITIVE_REGISTRY_PYPROJECT, TRANSITIVE_REGISTRY_LOCK).await;
         let p = load_uv_project(tmp.path()).await.unwrap();
-        let (wiring, meta) = wire_uv(
+        let (wiring, meta, _) = wire_uv(
             &p,
             tmp.path(),
             "six",
@@ -3803,7 +3842,7 @@ wheels = [
         use std::os::unix::fs::PermissionsExt;
         let tmp = write_pair(DIRECT_REGISTRY_PYPROJECT, DIRECT_REGISTRY_LOCK).await;
         let p = load_uv_project(tmp.path()).await.unwrap();
-        let (wiring, meta) = wire_uv(
+        let (wiring, meta, _) = wire_uv(
             &p,
             tmp.path(),
             "six",
@@ -3873,7 +3912,7 @@ wheels = [
 
         let tmp = write_pair(DIRECT_REGISTRY_PYPROJECT, &sdist_only_lock).await;
         let p = load_uv_project(tmp.path()).await.unwrap();
-        let (wiring, meta) = wire_uv(
+        let (wiring, meta, _) = wire_uv(
             &p,
             tmp.path(),
             "six",
@@ -4317,7 +4356,7 @@ wheels = [
     async fn revert_warns_when_created_manifest_section_still_routes_after_reshape() {
         let tmp = write_pair(TRANSITIVE_REGISTRY_PYPROJECT, TRANSITIVE_REGISTRY_LOCK).await;
         let p = load_uv_project(tmp.path()).await.unwrap();
-        let (wiring, meta) = wire_uv(
+        let (wiring, meta, _) = wire_uv(
             &p,
             tmp.path(),
             "six",
@@ -4387,7 +4426,7 @@ wheels = [
         );
         let tmp = write_pair(TRANSITIVE_REGISTRY_PYPROJECT, &input_lock).await;
         let p = load_uv_project(tmp.path()).await.unwrap();
-        let (wiring, meta) = wire_uv(
+        let (wiring, meta, _) = wire_uv(
             &p,
             tmp.path(),
             "six",
@@ -4426,7 +4465,7 @@ wheels = [
         );
         let tmp = write_pair(&pyproject, TRANSITIVE_REGISTRY_LOCK).await;
         let p = load_uv_project(tmp.path()).await.unwrap();
-        let (wiring, meta) = wire_uv(
+        let (wiring, meta, _) = wire_uv(
             &p,
             tmp.path(),
             "six",
@@ -4461,7 +4500,7 @@ wheels = [
         );
         let tmp = write_pair(&pyproject, TRANSITIVE_REGISTRY_LOCK).await;
         let p = load_uv_project(tmp.path()).await.unwrap();
-        let (wiring, meta) = wire_uv(
+        let (wiring, meta, _) = wire_uv(
             &p,
             tmp.path(),
             "six",
@@ -4662,5 +4701,223 @@ wheels = [
         let err = add_manifest_override(lock, "six", REL_WHEEL).unwrap_err();
         assert_eq!(err.0, "pypi_uv_lock_parse_failed");
         assert!(err.1.contains("overrides array is unbalanced"), "{}", err.1);
+    }
+
+    // ── legacy `[tool.uv] dev-dependencies` (uv 0.12.15 ground truth) ───
+    // uv still honours the deprecated array (with a warning) and records it
+    // EXACTLY like `[dependency-groups] dev`: a `[package.dev-dependencies]
+    // dev` edge plus a `[package.metadata.requires-dev] dev` entry, never a
+    // requires-dist one. The lock shapes are therefore the dev-group ones.
+
+    const TOOL_UV_DEV_REGISTRY_PYPROJECT: &str = r#"[project]
+name = "proj"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.uv]
+dev-dependencies = ["six==1.16.0"]
+"#;
+
+    const TOOL_UV_DEV_PATH_PYPROJECT: &str = r#"[project]
+name = "proj"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.uv]
+dev-dependencies = ["six==1.16.0"]
+
+[tool.uv.sources]
+six = { path = ".socket/vendor/pypi/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/six-1.16.0-py2.py3-none-any.whl" }
+"#;
+
+    /// A target declared ONLY in the legacy `[tool.uv] dev-dependencies`
+    /// array is a Direct dependency: `[tool.uv.sources]` applies to it and
+    /// the lock keeps it in `[package.metadata.requires-dev]`. Classifying
+    /// it Transitive took the override branch and left the requires-dev
+    /// `specifier` in place, so every uv >= 0.2.37 `uv sync --locked` /
+    /// `uv lock --check` failed after a "successful" vendored scan (and a
+    /// plain `uv sync` on 0.2.37/0.4.30 reinstalled the pristine wheel).
+    #[tokio::test]
+    async fn tool_uv_dev_dependencies_classify_direct_and_repoint_requires_dev() {
+        let tmp = write_pair(TOOL_UV_DEV_REGISTRY_PYPROJECT, DEV_GROUP_REGISTRY_LOCK).await;
+        let p = load_uv_project(tmp.path()).await.unwrap();
+        assert_eq!(
+            classify_dependency(&p, "six"),
+            UvDepClass::Direct,
+            "[tool.uv] dev-dependencies is a declaration surface sources apply to"
+        );
+
+        let (wiring, meta, _) = wire_uv(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UUID,
+        )
+        .await
+        .unwrap();
+
+        let kinds: Vec<&str> = wiring.iter().map(|w| w.kind.as_str()).collect();
+        assert_eq!(
+            kinds,
+            vec!["uv_sources_entry", "uv_lock_package", "uv_lock_requires_dev"],
+            "a requires-dev repoint and NO override record"
+        );
+        assert_eq!(meta.dep_class, "direct");
+        assert_eq!(meta.original_specifier.as_deref(), Some("==1.16.0"));
+        let (pyproject, lock) = read_pair(tmp.path()).await;
+        assert!(
+            !pyproject.contains("override-dependencies"),
+            "no override pin may be layered on a declared dependency:\n{pyproject}"
+        );
+        assert_eq!(pyproject, TOOL_UV_DEV_PATH_PYPROJECT);
+        assert_eq!(
+            lock, DEV_GROUP_PATH_LOCK,
+            "the requires-dev entry must carry `path` (uv 0.12.15 shape)"
+        );
+
+        let entry = entry_for(wiring, meta);
+        let outcome = revert_uv(&entry, tmp.path(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        let (pyproject, lock) = read_pair(tmp.path()).await;
+        assert_eq!(pyproject, TOOL_UV_DEV_REGISTRY_PYPROJECT);
+        assert_eq!(lock, DEV_GROUP_REGISTRY_LOCK);
+    }
+
+    // ── extras duplicate (uv 0.12.15 ground truth) ───────────────────────
+    // A package in BOTH project.dependencies and an optional-dependencies
+    // extra yields two requires-dist entries (the second carries
+    // `marker = "extra == '…'"`); a path source repoints BOTH.
+
+    const EXTRAS_DUP_REGISTRY_PYPROJECT: &str = r#"[project]
+name = "proj"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = ["six==1.16.0"]
+
+[project.optional-dependencies]
+socks = ["six==1.16.0"]
+"#;
+
+    const EXTRAS_DUP_REGISTRY_LOCK: &str = r#"version = 1
+revision = 3
+requires-python = ">=3.10"
+
+[[package]]
+name = "proj"
+version = "0.1.0"
+source = { virtual = "." }
+dependencies = [
+    { name = "six" },
+]
+
+[package.optional-dependencies]
+socks = [
+    { name = "six" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "six", specifier = "==1.16.0" },
+    { name = "six", marker = "extra == 'socks'", specifier = "==1.16.0" },
+]
+provides-extras = ["socks"]
+
+[[package]]
+name = "six"
+version = "1.16.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/71/39/171f1c67cd00715f190ba0b100d606d440a28c93c7714febeca8b79af85e/six-1.16.0.tar.gz", hash = "sha256:1e61c37477a1626458e36f7b1d82aa5c9b094fa4802892072e49de9c60c4c926", size = 34041, upload-time = "2021-05-05T14:18:18.379Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d9/5a/e7c31adbe875f2abbb91bd84cf2dc52d792b5a01506781dbcf25c91daf11/six-1.16.0-py2.py3-none-any.whl", hash = "sha256:8abb2f1d86890a2dfb989f9a77cfcfd3e47c2a354b01111771326f8aa26e0254", size = 11053, upload-time = "2021-05-05T14:18:17.237Z" },
+]
+"#;
+
+    const EXTRAS_DUP_PATH_LOCK: &str = r#"version = 1
+revision = 3
+requires-python = ">=3.10"
+
+[[package]]
+name = "proj"
+version = "0.1.0"
+source = { virtual = "." }
+dependencies = [
+    { name = "six" },
+]
+
+[package.optional-dependencies]
+socks = [
+    { name = "six" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "six", path = ".socket/vendor/pypi/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/six-1.16.0-py2.py3-none-any.whl" },
+    { name = "six", marker = "extra == 'socks'", path = ".socket/vendor/pypi/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/six-1.16.0-py2.py3-none-any.whl" },
+]
+provides-extras = ["socks"]
+
+[[package]]
+name = "six"
+version = "1.16.0"
+source = { path = ".socket/vendor/pypi/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/six-1.16.0-py2.py3-none-any.whl" }
+wheels = [
+    { filename = "six-1.16.0-py2.py3-none-any.whl", hash = "sha256:8abb2f1d86890a2dfb989f9a77cfcfd3e47c2a354b01111771326f8aa26e0254" },
+]
+"#;
+
+    /// Both requires-dist entries for one package (bare + extra-marker) are
+    /// repointed — one wiring record each — and revert restores both. The
+    /// first-match `break` left the marker entry with its `specifier`, so
+    /// `uv lock --check` / `uv sync --locked` failed after vendoring.
+    #[tokio::test]
+    async fn duplicate_requires_dist_entries_all_repointed() {
+        let tmp = write_pair(EXTRAS_DUP_REGISTRY_PYPROJECT, EXTRAS_DUP_REGISTRY_LOCK).await;
+        let p = load_uv_project(tmp.path()).await.unwrap();
+        assert_eq!(classify_dependency(&p, "six"), UvDepClass::Direct);
+
+        let (wiring, meta, _) = wire_uv(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UUID,
+        )
+        .await
+        .unwrap();
+
+        let kinds: Vec<&str> = wiring.iter().map(|w| w.kind.as_str()).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "uv_sources_entry",
+                "uv_lock_package",
+                "uv_lock_requires_dist",
+                "uv_lock_requires_dist"
+            ],
+            "one record per repointed requires-dist entry"
+        );
+        let (_, lock) = read_pair(tmp.path()).await;
+        assert_eq!(
+            lock, EXTRAS_DUP_PATH_LOCK,
+            "both the bare and the extra-marker entries must carry `path`"
+        );
+
+        let entry = entry_for(wiring, meta);
+        let outcome = revert_uv(&entry, tmp.path(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        let (pyproject, lock) = read_pair(tmp.path()).await;
+        assert_eq!(pyproject, EXTRAS_DUP_REGISTRY_PYPROJECT);
+        assert_eq!(lock, EXTRAS_DUP_REGISTRY_LOCK);
     }
 }

@@ -763,7 +763,10 @@ pub async fn vendor_pypi(
             &record.uuid,
         )
         .await
-        .map(|(wiring, meta)| (wiring, MetaSlot::Uv(Some(meta)))),
+        .map(|(wiring, meta, advisories)| {
+            warnings.extend(advisories);
+            (wiring, MetaSlot::Uv(Some(meta)))
+        }),
         WiringPlan::PythonLocks(project) => super::pypi_lock::wire_python_locks(
             &project,
             project_root,
