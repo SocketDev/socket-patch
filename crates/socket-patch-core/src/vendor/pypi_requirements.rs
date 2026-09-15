@@ -603,6 +603,82 @@ fn vendor_line(
 /// must never edit them. The root file is always element 0.
 async fn collect_requirements_files(root: &Path) -> Result<Vec<ReqFile>, (&'static str, String)> {
     let mut out: Vec<ReqFile> = Vec::new();
+    walk_requirements_tree(root, |rel, path, read| match read {
+        Ok(content) => {
+            // Out-of-root (`../`) and absolute includes resolve outside any
+            // committable root — readable so a pin inside can refuse, never
+            // editable. (`Path::join` passes an absolute `rel` through
+            // verbatim.)
+            let editable = is_in_root_rel(rel);
+            out.push(ReqFile {
+                rel: rel.to_string(),
+                content,
+                editable,
+            });
+            Ok(true)
+        }
+        Err(_) if out.is_empty() => Err((
+            "pypi_no_requirements",
+            format!("cannot read {}", path.display()),
+        )),
+        // A broken include is pip's error to report; vendor just can't see
+        // inside it. Skip.
+        Err(_) => Ok(false),
+    })
+    .await?;
+    // Depth-first stack order put the root last among pushes; restore "root
+    // first" deterministically.
+    out.sort_by_key(|f| f.rel != "requirements.txt");
+    Ok(out)
+}
+
+/// Every requirements file the vendor planner may have written a pin into:
+/// the root `requirements.txt` plus each IN-ROOT `-r`/`--requirement`
+/// include it reaches (same walk as the planner, so a vendored pin hosted in
+/// an include is found where the planner put it). Names are root-relative
+/// (`requirements/base.txt`), the root first; a file that does not exist is
+/// still named (so a caller probing it sees a clean "absent"), it is just
+/// not descended into. FIFO-safe. `Err` when a reached file EXISTS but
+/// cannot be read (a permission-denied include, a FIFO in its place): the
+/// tree is then unknowable, and callers that must prove the absence of a
+/// reference — the unwired-revert guard — fail closed on it. Out-of-root
+/// and absolute includes are never editable, so they are neither named nor
+/// followed.
+pub async fn requirements_include_names(root: &Path) -> std::io::Result<Vec<String>> {
+    let mut names: Vec<String> = Vec::new();
+    walk_requirements_tree(root, |rel, _path, read| {
+        if !is_in_root_rel(rel) {
+            return Ok(false);
+        }
+        names.push(rel.to_string());
+        match read {
+            Ok(_) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e),
+        }
+    })
+    .await?;
+    names.sort_by_key(|rel| rel != "requirements.txt");
+    Ok(names)
+}
+
+/// A root-relative requirements path that stays inside the project root
+/// (not `../…`, not absolute) — the only files the planner may edit.
+fn is_in_root_rel(rel: &str) -> bool {
+    !rel.starts_with("../") && !Path::new(rel).is_absolute()
+}
+
+/// The shared include walk behind [`collect_requirements_files`] and
+/// [`requirements_include_names`]: depth-first from the root
+/// `requirements.txt`, each `-r`/`--requirement` target resolved against the
+/// INCLUDING file's directory and lexically normalized, visited-set cycle
+/// guard, FIFO-safe reads. `visit` sees every reached file with its read
+/// result and answers whether to descend into its includes (`Ok(true)`), or
+/// aborts the walk with its own error.
+async fn walk_requirements_tree<E>(
+    root: &Path,
+    mut visit: impl FnMut(&str, &Path, std::io::Result<String>) -> Result<bool, E>,
+) -> Result<(), E> {
     let mut visited: HashSet<String> = HashSet::new();
     let mut stack: Vec<(String, PathBuf)> = vec![(
         "requirements.txt".to_string(),
@@ -612,47 +688,37 @@ async fn collect_requirements_files(root: &Path) -> Result<Vec<ReqFile>, (&'stat
         if !visited.insert(rel.clone()) {
             continue;
         }
-        let Ok(content) = read_regular_to_string(&path).await else {
-            if out.is_empty() {
-                return Err((
-                    "pypi_no_requirements",
-                    format!("cannot read {}", path.display()),
-                ));
+        let read = read_regular_to_string(&path).await;
+        // Parse the includes BEFORE handing the content over (the visitor
+        // takes it by value); nothing is pushed unless it asks to descend.
+        let includes: Vec<String> = match &read {
+            Ok(content) => {
+                let include_dir = match rel.rfind('/') {
+                    Some(i) => rel[..i].to_string(),
+                    None => String::new(),
+                };
+                logical_lines(content)
+                    .iter()
+                    .filter_map(|ll| include_target(&ll.text))
+                    .map(|target| {
+                        let joined = if include_dir.is_empty() {
+                            target.to_string()
+                        } else {
+                            format!("{include_dir}/{target}")
+                        };
+                        normalize_rel_path(&joined)
+                    })
+                    .collect()
             }
-            // A broken include is pip's error to report; vendor just can't
-            // see inside it. Skip.
-            continue;
+            Err(_) => Vec::new(),
         };
-        // Out-of-root (`../`) and absolute includes resolve outside any
-        // committable root — readable so a pin inside can refuse, never
-        // editable. (`Path::join` passes an absolute `rel` through verbatim.)
-        let editable = !rel.starts_with("../") && !Path::new(&rel).is_absolute();
-        let include_dir = match rel.rfind('/') {
-            Some(i) => rel[..i].to_string(),
-            None => String::new(),
-        };
-        for ll in logical_lines(&content) {
-            let Some(target) = include_target(&ll.text) else {
-                continue;
-            };
-            let joined = if include_dir.is_empty() {
-                target.to_string()
-            } else {
-                format!("{include_dir}/{target}")
-            };
-            let normalized = normalize_rel_path(&joined);
-            stack.push((normalized.clone(), root.join(&normalized)));
+        if visit(&rel, &path, read)? {
+            for normalized in includes {
+                stack.push((normalized.clone(), root.join(&normalized)));
+            }
         }
-        out.push(ReqFile {
-            rel,
-            content,
-            editable,
-        });
     }
-    // Depth-first stack order put the root last among pushes; restore "root
-    // first" deterministically.
-    out.sort_by_key(|f| f.rel != "requirements.txt");
-    Ok(out)
+    Ok(())
 }
 
 /// The `-r`/`--requirement` include target of a logical line, if any.
@@ -831,6 +897,73 @@ fn parse_requirement_line(text: &str) -> Option<ParsedRequirement> {
 mod tests {
     use super::*;
     use crate::vendor::state::VendorArtifact;
+
+    /// [`requirements_include_names`] names every file the planner may
+    /// have pinned into — root first, nested includes resolved against the
+    /// including file, a missing include still named but not descended —
+    /// and never an out-of-root include (never editable). A reached
+    /// include that exists but cannot be read (a FIFO here) is an `Err`,
+    /// so a fail-closed caller can refuse.
+    #[tokio::test]
+    async fn requirements_include_names_walks_in_root_includes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        tokio::fs::create_dir(root.join("requirements")).await.unwrap();
+        tokio::fs::write(
+            root.join("requirements.txt"),
+            "-r requirements/base.txt\n-c constraints.txt\n-r ../shared.txt\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(root.join("constraints.txt"), "six<2\n")
+            .await
+            .unwrap();
+        tokio::fs::write(
+            root.join("requirements/base.txt"),
+            "--requirement=dev.txt\n-r missing.txt\nsix==1.16.0\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(root.join("requirements/dev.txt"), "pytest\n")
+            .await
+            .unwrap();
+        let names = requirements_include_names(root).await.unwrap();
+        assert_eq!(names[0], "requirements.txt", "{names:?}");
+        let mut rest = names[1..].to_vec();
+        rest.sort();
+        assert_eq!(
+            rest,
+            vec![
+                "requirements/base.txt".to_string(),
+                "requirements/dev.txt".to_string(),
+                "requirements/missing.txt".to_string(),
+            ],
+            "constraints and out-of-root includes are never named"
+        );
+
+        // No root requirements.txt at all: still names the root (absent).
+        let empty = tempfile::tempdir().unwrap();
+        assert_eq!(
+            requirements_include_names(empty.path()).await.unwrap(),
+            vec!["requirements.txt".to_string()]
+        );
+
+        #[cfg(unix)]
+        {
+            tokio::fs::remove_file(root.join("requirements/dev.txt"))
+                .await
+                .unwrap();
+            let fifo = std::ffi::CString::new(
+                root.join("requirements/dev.txt").to_str().unwrap(),
+            )
+            .unwrap();
+            assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) }, 0);
+            let err = requirements_include_names(root)
+                .await
+                .expect_err("an include that exists but cannot be read is an Err");
+            assert_ne!(err.kind(), std::io::ErrorKind::NotFound, "{err:?}");
+        }
+    }
 
     const UUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
     const REL_WHEEL: &str =

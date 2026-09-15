@@ -84,6 +84,7 @@ pub(crate) mod yarn_classic_lock;
 mod yarn_layering_tests;
 
 pub use path::{ecosystem_dir_for_purl, parse_vendor_path};
+pub use pypi_requirements::requirements_include_names;
 pub use state::{
     carry_forward_wiring, load_state, lookup_entry, save_state, VendorEntry, VendorState,
     VENDOR_STATE_REL,

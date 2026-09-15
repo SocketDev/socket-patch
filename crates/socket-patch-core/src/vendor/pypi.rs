@@ -886,55 +886,15 @@ pub async fn revert_pypi(entry: &VendorEntry, project_root: &Path, dry_run: bool
 /// the pylock, the script, or requirements.txt still resolve through the
 /// vendored wheel — every later `--frozen` / `--offline` install fails.
 /// Refuse whenever any Python project file still mentions the uuid dir, or
-/// exists but cannot be read to prove it does not. With no reference left
-/// the revert is a plain orphan cleanup and proceeds.
+/// exists but cannot be read to prove it does not — or the project cannot
+/// be enumerated to know which files to probe. With no reference left the
+/// revert is a plain orphan cleanup and proceeds.
 async fn guard_unwired_pypi_revert(
     project_root: &Path,
     uuid: &str,
     uuid_dir_rel: &str,
 ) -> Option<RevertOutcome> {
-    let needle = format!(".socket/vendor/pypi/{uuid}/");
-    let mut names: Vec<String> = [
-        "pyproject.toml",
-        "requirements.txt",
-        "poetry.lock",
-        "pdm.lock",
-        "Pipfile",
-        "Pipfile.lock",
-    ]
-    .iter()
-    .map(|name| (*name).to_string())
-    .collect();
-    if let Ok(locks) = crate::utils::python_lock::python_lock_paths(project_root) {
-        for lock in locks {
-            if let Some(script) = lock.strip_suffix(".lock").filter(|s| s.ends_with(".py")) {
-                names.push(script.to_string());
-            }
-            names.push(lock);
-        }
-    }
-    let mut clause = None;
-    for name in &names {
-        let path = project_root.join(name);
-        if matches!(tokio::fs::try_exists(&path).await, Ok(false)) {
-            continue;
-        }
-        match read_regular_to_string(&path).await {
-            Ok(text) if text.contains(&needle) => {
-                clause = Some(format!("{name} still resolves through it"));
-                break;
-            }
-            Ok(_) => {}
-            // Fail-closed: a file we cannot read may still reference it.
-            Err(_) => {
-                clause = Some(format!(
-                    "{name} exists but could not be read to prove it no longer references it"
-                ));
-                break;
-            }
-        }
-    }
-    let clause = clause?;
+    let clause = unwired_pypi_reference_clause(project_root, uuid).await?;
     let detail = format!(
         "refusing to remove {uuid_dir_rel}: the ledger entry records no pre-vendor wiring to \
          replay (it was likely reconstructed by `socket-patch repair`; the pre-vendor Python \
@@ -954,6 +914,119 @@ async fn guard_unwired_pypi_revert(
     })
 }
 
+/// The in-use probe behind [`guard_unwired_pypi_revert`]: `None` when every
+/// Python project file was read and none mentions the uuid dir; otherwise
+/// the human clause naming what blocks the revert. The probe list is the
+/// statically named project files, the root `requirements.txt` plus every
+/// `-r` include the planner may have written a pin into, and every Python
+/// lock the root directory LISTS (`uv.lock`, `pylock*.toml`, `*.py.lock`
+/// with its paired script). Every step fails closed: a root that cannot be
+/// listed, an include tree that cannot be read, or a listed lock (a symlink
+/// included — lstat only, so an unreadable target is still probed) that
+/// exists but cannot be read all block the revert, because none of them
+/// can prove the absence of a reference.
+async fn unwired_pypi_reference_clause(project_root: &Path, uuid: &str) -> Option<String> {
+    let needle = format!(".socket/vendor/pypi/{uuid}/");
+    let mut names: Vec<String> = [
+        "pyproject.toml",
+        "uv.lock",
+        "pylock.toml",
+        "poetry.lock",
+        "pdm.lock",
+        "Pipfile",
+        "Pipfile.lock",
+    ]
+    .iter()
+    .map(|name| (*name).to_string())
+    .collect();
+    match super::pypi_requirements::requirements_include_names(project_root).await {
+        Ok(includes) => names.extend(includes),
+        Err(_) => {
+            return Some(
+                "the requirements.txt include tree could not be read to prove no requirements \
+                 file references it"
+                    .to_string(),
+            )
+        }
+    }
+    // Enumerate the locks ourselves instead of through
+    // `python_lock_paths`, which follows symlinks and DROPS every entry
+    // whose target cannot be stat'ed — and whose `Err` the previous shape
+    // read as "no Python locks here". Neither may fail open here.
+    let listing = match std::fs::read_dir(project_root) {
+        Ok(listing) => listing,
+        Err(_) => {
+            return Some(
+                "the project directory could not be listed to prove no Python lock references \
+                 it"
+                .to_string(),
+            )
+        }
+    };
+    for entry in listing {
+        let Ok(entry) = entry else {
+            return Some(
+                "the project directory could not be listed to prove no Python lock references \
+                 it"
+                .to_string(),
+            );
+        };
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if !crate::utils::python_lock::is_python_lock_name(&name) {
+            continue;
+        }
+        // lstat only: a regular file or ANY symlink is probed (the read
+        // below fails closed on a target that cannot be opened); dirs,
+        // FIFOs and sockets under a lock name are not locks. A failed
+        // file_type() is probed too.
+        if entry
+            .file_type()
+            .is_ok_and(|ft| !ft.is_file() && !ft.is_symlink())
+        {
+            continue;
+        }
+        if let Some(script) = name.strip_suffix(".lock").filter(|s| s.ends_with(".py")) {
+            names.push(script.to_string());
+        }
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    for name in &names {
+        let path = project_root.join(name);
+        if matches!(tokio::fs::try_exists(&path).await, Ok(false)) {
+            continue;
+        }
+        match read_regular_to_string(&path).await {
+            Ok(text) if text.contains(&needle) => {
+                return Some(format!("{name} still resolves through it"));
+            }
+            Ok(_) => {}
+            // Fail-closed: a file we cannot read may still reference it.
+            Err(_) => {
+                return Some(format!(
+                    "{name} exists but could not be read to prove it no longer references it"
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// `VendorEntry::flavor` values the dispatch below knows how to revert —
+/// the set an UNWIRED entry must belong to (or be `None`) before it is
+/// treated as a reclaimable orphan.
+const KNOWN_PYPI_FLAVORS: [&str; 6] = [
+    "uv",
+    "python-lock",
+    "requirements",
+    "poetry",
+    "pdm",
+    "pipenv",
+];
+
 pub async fn revert_pypi_opts(
     entry: &VendorEntry,
     project_root: &Path,
@@ -963,7 +1036,37 @@ pub async fn revert_pypi_opts(
         dry_run,
         keep_artifact,
     } = opts;
-    if entry.wiring.is_empty() {
+    let mut outcome = if entry.wiring.is_empty() {
+        // Nothing to replay (a `repair`-reconstructed entry): no project
+        // file can be restored, so the only work left is the artifact
+        // deletion below. Under `keep_artifact` (`--preserve-state`) even
+        // that is skipped — the revert is a no-op and the in-use guard,
+        // which exists only to protect the deletion, has nothing to
+        // protect (npm's precedent). Otherwise the artifact may only go
+        // when no Python project file provably resolves through it. Once
+        // the guard clears, the entry is a plain orphan: the flavor
+        // dispatch is skipped on purpose — flavor `uv` with uv.lock gone
+        // fails "cannot read uv.lock", and flavor `None` (what `repair`
+        // stamps for requirements/poetry/pdm/pipenv reconstructions) is
+        // unknown to the dispatch — and either would leave the orphan
+        // unreclaimable forever.
+        if keep_artifact {
+            return RevertOutcome::ok();
+        }
+        // An UNKNOWN flavor (a newer binary's backend) still fails closed
+        // even here: its project files may reference the artifact from a
+        // place this guard does not know to probe. `None` is `repair`'s
+        // own stamp and every known flavor's files are probed.
+        if let Some(flavor) = entry
+            .flavor
+            .as_deref()
+            .filter(|f| !KNOWN_PYPI_FLAVORS.contains(f))
+        {
+            return RevertOutcome::failed(format!(
+                "unknown pypi vendor flavor {:?}; cannot revert",
+                Some(flavor)
+            ));
+        }
         let uuid_dir_rel = vendor_uuid_dir_rel("pypi", &entry.uuid)
             .unwrap_or_else(|| format!(".socket/vendor/pypi/{:?}", entry.uuid));
         if let Some(blocked) =
@@ -971,20 +1074,26 @@ pub async fn revert_pypi_opts(
         {
             return blocked;
         }
-    }
-    let mut outcome = match entry.flavor.as_deref() {
-        Some("uv") => revert_uv(entry, project_root, dry_run).await,
-        Some("python-lock") => {
-            super::pypi_lock::revert_python_locks(entry, project_root, dry_run).await
-        }
-        Some("requirements") => revert_requirements(entry, project_root, dry_run).await,
-        Some("poetry") => super::pypi_poetry::revert_poetry(entry, project_root, dry_run).await,
-        Some("pdm") => super::pypi_pdm::revert_pdm(entry, project_root, dry_run).await,
-        Some("pipenv") => super::pypi_pipenv::revert_pipenv(entry, project_root, dry_run).await,
-        other => {
-            return RevertOutcome::failed(format!(
-                "unknown pypi vendor flavor {other:?}; cannot revert"
-            ))
+        RevertOutcome::ok()
+    } else {
+        match entry.flavor.as_deref() {
+            Some("uv") => revert_uv(entry, project_root, dry_run).await,
+            Some("python-lock") => {
+                super::pypi_lock::revert_python_locks(entry, project_root, dry_run).await
+            }
+            Some("requirements") => revert_requirements(entry, project_root, dry_run).await,
+            Some("poetry") => {
+                super::pypi_poetry::revert_poetry(entry, project_root, dry_run).await
+            }
+            Some("pdm") => super::pypi_pdm::revert_pdm(entry, project_root, dry_run).await,
+            Some("pipenv") => {
+                super::pypi_pipenv::revert_pipenv(entry, project_root, dry_run).await
+            }
+            other => {
+                return RevertOutcome::failed(format!(
+                    "unknown pypi vendor flavor {other:?}; cannot revert"
+                ))
+            }
         }
     };
     if !outcome.success || dry_run {
@@ -3020,6 +3129,379 @@ wheels = [
         let outcome = revert_pypi(&entry, root, false).await;
         assert!(outcome.success, "{:?}", outcome.error);
         assert!(!wheel.exists(), "the orphaned artifact dir is removed");
+    }
+
+    /// An unwired entry with a wheel still referenced by the project files.
+    /// Returns the wheel path (so the caller can assert survival/removal).
+    async fn unwired_uv_fixture(root: &Path, rel_wheel: &str) -> PathBuf {
+        tokio::fs::write(
+            root.join("pyproject.toml"),
+            format!("[project]\nname = \"p\"\ndependencies = [\"six==1.16.0\"]\n\n[tool.uv.sources]\nsix = {{ path = \"{rel_wheel}\" }}\n"),
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            root.join("uv.lock"),
+            format!("version = 1\n\n[[package]]\nname = \"six\"\nversion = \"1.16.0\"\nsource = {{ path = \"{rel_wheel}\" }}\n"),
+        )
+        .await
+        .unwrap();
+        let wheel = root.join(rel_wheel);
+        tokio::fs::create_dir_all(wheel.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&wheel, b"wheel bytes").await.unwrap();
+        wheel
+    }
+
+    /// `rollback/remove --preserve-state` (`keep_artifact`) never deletes the
+    /// artifact, and an unwired entry has nothing to restore — so there is
+    /// nothing for the in-use guard to protect. It used to refuse with
+    /// `vendor_wiring_unknown_revert_blocked` although the revert would
+    /// have touched nothing (npm skips the guard under `keep_artifact` for
+    /// exactly this reason: the refusal exists only to protect the deletion).
+    #[tokio::test]
+    async fn unwired_entry_preserve_state_skips_guard() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let rel_wheel = format!(".socket/vendor/pypi/{UUID}/six-1.16.0-py2.py3-none-any.whl");
+        let wheel = unwired_uv_fixture(root, &rel_wheel).await;
+        let entry = revert_entry("uv", &rel_wheel, Vec::new());
+        for dry_run in [true, false] {
+            let outcome = revert_pypi_opts(
+                &entry,
+                root,
+                RevertOpts {
+                    dry_run,
+                    keep_artifact: true,
+                },
+            )
+            .await;
+            assert!(
+                outcome.success,
+                "dry_run={dry_run}: preserve-state revert of an unwired entry must succeed: \
+                 {outcome:?}"
+            );
+            assert!(
+                outcome.warnings.is_empty(),
+                "dry_run={dry_run}: no refusal warning: {:?}",
+                outcome.warnings
+            );
+            assert!(!outcome.kept_artifact, "keep_artifact is not a drift-keep");
+            assert!(wheel.is_file(), "dry_run={dry_run}: the wheel is kept");
+        }
+    }
+
+    /// Restores a directory mode on drop so a failing assertion never leaves
+    /// an unlistable/unreadable tempdir behind for `TempDir` to choke on.
+    #[cfg(unix)]
+    struct ModeGuard(PathBuf);
+    #[cfg(unix)]
+    impl Drop for ModeGuard {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt as _;
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    /// The guard used to treat a `read_dir` failure on the project root as
+    /// "no Python locks here" (and its static list lacked uv.lock and
+    /// pylock.toml), so on an execute-only root nothing was probed and the
+    /// referenced wheel was deleted while uv.lock / pylock.toml still
+    /// resolved through it. An unlistable root cannot prove the absence of
+    /// a reference: refuse, fail-closed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unwired_python_entry_revert_refuses_when_root_unlistable() {
+        use std::os::unix::fs::PermissionsExt as _;
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipping: running as root, directory perms are not enforced");
+            return;
+        }
+        let rel_wheel = format!(".socket/vendor/pypi/{UUID}/six-1.16.0-py2.py3-none-any.whl");
+        // Only the LOCK references the wheel (pyproject.toml was already
+        // hand-restored): the reference is reachable through the listing
+        // alone, not through a statically named project file.
+        let cases: Vec<(&str, Vec<(&str, String)>)> = vec![
+            (
+                "uv",
+                vec![
+                    (
+                        "pyproject.toml",
+                        "[project]\nname = \"p\"\ndependencies = [\"six==1.16.0\"]\n".to_string(),
+                    ),
+                    (
+                        "uv.lock",
+                        format!("version = 1\n\n[[package]]\nname = \"six\"\nversion = \"1.16.0\"\nsource = {{ path = \"{rel_wheel}\" }}\n"),
+                    ),
+                ],
+            ),
+            (
+                "python-lock",
+                vec![(
+                    "pylock.toml",
+                    format!("lock-version = \"1.0\"\n\n[[packages]]\nname = \"six\"\nversion = \"1.16.0\"\narchive = {{ path = \"{rel_wheel}\" }}\n"),
+                )],
+            ),
+        ];
+        for (flavor, files) in cases {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path();
+            for (name, text) in &files {
+                tokio::fs::write(root.join(name), text).await.unwrap();
+            }
+            let wheel = root.join(&rel_wheel);
+            tokio::fs::create_dir_all(wheel.parent().unwrap())
+                .await
+                .unwrap();
+            tokio::fs::write(&wheel, b"wheel bytes").await.unwrap();
+            let entry = revert_entry(flavor, &rel_wheel, Vec::new());
+            // Execute-only: paths under the root still resolve (the wheel
+            // and every known lock name), only the listing is denied.
+            std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o311)).unwrap();
+            let _restore = ModeGuard(root.to_path_buf());
+            assert!(
+                std::fs::read_dir(root).is_err(),
+                "0o311 must make the root unlistable on this host"
+            );
+            let outcome = revert_pypi(&entry, root, false).await;
+            assert!(
+                !outcome.success,
+                "{flavor}: revert under an unlistable root must refuse: {outcome:?}"
+            );
+            assert_eq!(outcome.warnings.len(), 1, "{flavor}: {:?}", outcome.warnings);
+            assert_eq!(
+                outcome.warnings[0].code,
+                "vendor_wiring_unknown_revert_blocked"
+            );
+            assert!(
+                outcome.warnings[0].detail.contains("could not be listed"),
+                "{flavor}: {}",
+                outcome.warnings[0].detail
+            );
+            assert!(!outcome.kept_artifact);
+            assert!(
+                wheel.is_file(),
+                "{flavor}: the referenced artifact must survive"
+            );
+        }
+    }
+
+    /// A lock that is a SYMLINK whose target cannot be stat'ed used to be
+    /// dropped from the probe list (the lister follows the link and drops
+    /// any entry whose metadata fails), so the guard never saw it and the
+    /// wheel it may reference was deleted. Listing must keep symlinks on
+    /// lstat alone; the unreadable target then hits the fail-closed read.
+    /// Both a static-list name and a listing-only name are covered.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unwired_python_entry_revert_refuses_when_lock_target_unstatable() {
+        use std::os::unix::fs::PermissionsExt as _;
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipping: running as root, directory perms are not enforced");
+            return;
+        }
+        let rel_wheel = format!(".socket/vendor/pypi/{UUID}/six-1.16.0-py2.py3-none-any.whl");
+        for lock_name in ["pylock.toml", "pylock.dev.toml"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path();
+            let locked = root.join("locked");
+            tokio::fs::create_dir(&locked).await.unwrap();
+            tokio::fs::write(
+                locked.join(lock_name),
+                format!("lock-version = \"1.0\"\n\n[[packages]]\nname = \"six\"\nversion = \"1.16.0\"\narchive = {{ path = \"{rel_wheel}\" }}\n"),
+            )
+            .await
+            .unwrap();
+            tokio::fs::symlink(format!("locked/{lock_name}"), root.join(lock_name))
+                .await
+                .unwrap();
+            let wheel = root.join(&rel_wheel);
+            tokio::fs::create_dir_all(wheel.parent().unwrap())
+                .await
+                .unwrap();
+            tokio::fs::write(&wheel, b"wheel bytes").await.unwrap();
+            let entry = revert_entry("python-lock", &rel_wheel, Vec::new());
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let _restore = ModeGuard(locked.clone());
+            assert!(
+                std::fs::metadata(root.join(lock_name)).is_err(),
+                "{lock_name}: the link target must be unstatable on this host"
+            );
+            let outcome = revert_pypi(&entry, root, false).await;
+            assert!(
+                !outcome.success,
+                "{lock_name}: revert with an unreadable lock target must refuse: {outcome:?}"
+            );
+            assert_eq!(
+                outcome.warnings.len(),
+                1,
+                "{lock_name}: {:?}",
+                outcome.warnings
+            );
+            assert_eq!(
+                outcome.warnings[0].code,
+                "vendor_wiring_unknown_revert_blocked"
+            );
+            assert!(
+                outcome
+                    .warnings[0]
+                    .detail
+                    .contains(&format!("{lock_name} exists but could not be read")),
+                "{lock_name}: {}",
+                outcome.warnings[0].detail
+            );
+            assert!(
+                wheel.is_file(),
+                "{lock_name}: the referenced artifact must survive"
+            );
+        }
+    }
+
+    /// Once the guard finds no reference, an unwired entry is a plain
+    /// orphan and must be reclaimable. Dispatching it by flavor used to
+    /// fail forever: flavor `uv` with uv.lock gone → "cannot read uv.lock".
+    #[tokio::test]
+    async fn unwired_uv_entry_without_uv_lock_reclaims_orphan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        tokio::fs::write(
+            root.join("pyproject.toml"),
+            "[project]\nname = \"p\"\ndependencies = [\"six==1.16.0\"]\n",
+        )
+        .await
+        .unwrap();
+        let rel_wheel = format!(".socket/vendor/pypi/{UUID}/six-1.16.0-py2.py3-none-any.whl");
+        let wheel = root.join(&rel_wheel);
+        tokio::fs::create_dir_all(wheel.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&wheel, b"wheel bytes").await.unwrap();
+        let entry = revert_entry("uv", &rel_wheel, Vec::new());
+        let dry = revert_pypi(&entry, root, true).await;
+        assert!(dry.success, "dry run previews the orphan cleanup: {dry:?}");
+        assert!(wheel.is_file(), "dry run deletes nothing");
+        let outcome = revert_pypi(&entry, root, false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(!outcome.kept_artifact);
+        assert!(
+            !root.join(format!(".socket/vendor/pypi/{UUID}")).exists(),
+            "the orphaned artifact dir is removed"
+        );
+    }
+
+    /// Same reclaim contract for flavor `None` — the shape `repair` stamps
+    /// for requirements/poetry/pdm/pipenv reconstructions, which the
+    /// dispatch used to reject with "unknown pypi vendor flavor None".
+    #[tokio::test]
+    async fn unwired_entry_flavor_none_reclaims_orphan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        tokio::fs::write(root.join("requirements.txt"), "six==1.16.0\n")
+            .await
+            .unwrap();
+        let rel_wheel = format!(".socket/vendor/pypi/{UUID}/six-1.16.0-py2.py3-none-any.whl");
+        let wheel = root.join(&rel_wheel);
+        tokio::fs::create_dir_all(wheel.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&wheel, b"wheel bytes").await.unwrap();
+        let mut entry = revert_entry("uv", &rel_wheel, Vec::new());
+        entry.flavor = None;
+        let outcome = revert_pypi(&entry, root, false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(!outcome.kept_artifact);
+        assert!(
+            !root.join(format!(".socket/vendor/pypi/{UUID}")).exists(),
+            "the orphaned artifact dir is removed"
+        );
+        // An UNKNOWN flavor fails closed whether wired or not: a newer
+        // backend's project files may reference the artifact from a place
+        // this guard does not probe.
+        let mut unknown = revert_entry("uv", &rel_wheel, Vec::new());
+        unknown.flavor = Some("frobnicate".into());
+        let outcome = revert_pypi(&unknown, root, false).await;
+        assert!(!outcome.success, "{outcome:?}");
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("unknown pypi vendor flavor")),
+            "{outcome:?}"
+        );
+        let mut wired = revert_entry("uv", &rel_wheel, Vec::new());
+        wired.flavor = Some("frobnicate".into());
+        wired.wiring.push(WiringRecord {
+            file: "requirements.txt".into(),
+            kind: "requirements_line".into(),
+            action: WiringAction::Added,
+            key: None,
+            original: None,
+            new: None,
+        });
+        let outcome = revert_pypi(&wired, root, false).await;
+        assert!(!outcome.success, "{outcome:?}");
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("unknown pypi vendor flavor")),
+            "{outcome:?}"
+        );
+    }
+
+    /// The requirements planner writes vendored pins into `-r` includes, so
+    /// a reference may live ONLY in an include. The guard used to probe the
+    /// root requirements.txt alone and let the include-referenced wheel go.
+    #[tokio::test]
+    async fn unwired_requirements_entry_refuses_on_include_reference() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let rel_wheel = format!(".socket/vendor/pypi/{UUID}/six-1.16.0-py2.py3-none-any.whl");
+        tokio::fs::write(root.join("requirements.txt"), "-r requirements/base.txt\n")
+            .await
+            .unwrap();
+        tokio::fs::create_dir(root.join("requirements")).await.unwrap();
+        let include = format!(
+            "./{rel_wheel} --hash=sha256:{}  # socket-patch vendor: six==1.16.0\n",
+            "0".repeat(64)
+        );
+        tokio::fs::write(root.join("requirements/base.txt"), &include)
+            .await
+            .unwrap();
+        let wheel = root.join(&rel_wheel);
+        tokio::fs::create_dir_all(wheel.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&wheel, b"wheel bytes").await.unwrap();
+        let entry = revert_entry("requirements", &rel_wheel, Vec::new());
+        for dry_run in [true, false] {
+            let outcome = revert_pypi(&entry, root, dry_run).await;
+            assert!(
+                !outcome.success,
+                "dry_run={dry_run}: include-referenced revert must refuse: {outcome:?}"
+            );
+            assert_eq!(outcome.warnings.len(), 1, "{:?}", outcome.warnings);
+            assert_eq!(
+                outcome.warnings[0].code,
+                "vendor_wiring_unknown_revert_blocked"
+            );
+            assert!(
+                outcome.warnings[0]
+                    .detail
+                    .contains("requirements/base.txt still resolves through it"),
+                "{}",
+                outcome.warnings[0].detail
+            );
+        }
+        assert!(wheel.is_file(), "the include-referenced wheel must survive");
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("requirements/base.txt"))
+                .await
+                .unwrap(),
+            include,
+            "the include is untouched"
+        );
     }
 
     const PIPENV_REGISTRY_LOCK: &str = r#"{
