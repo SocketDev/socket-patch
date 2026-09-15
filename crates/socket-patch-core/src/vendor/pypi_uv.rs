@@ -22,7 +22,13 @@ use std::path::Path;
 use toml_edit::{DocumentMut, Item, Table, Value};
 
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
-use crate::utils::fs::atomic_write_bytes_preserving_mode;
+// `read_regular_to_string` is the FIFO-safe guarded reader (`O_NONBLOCK`
+// open + fstat regular-file check): a FIFO planted as `pyproject.toml` or
+// `uv.lock` fails fast instead of wedging every uv-project vendor run (and
+// revert) forever in an `open(2)` that waits for a writer — the
+// flavor-routing probes ahead of the load are metadata-only, so these are
+// the first opens.
+use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
 use crate::utils::python_lock::preserve_line_endings;
 
 use super::common::{item_get, pep508_name, pep621_declared_names, record};
@@ -42,21 +48,6 @@ const HIGHEST_TESTED_LOCK_REVISION: u64 = 3;
 /// source's `[package.metadata]` block — a sane ceiling for a core-metadata
 /// header block (real ones are a few KiB).
 const MAX_WHEEL_METADATA_BYTES: u64 = 4 * 1024 * 1024;
-
-/// Guarded read shared in shape with the sibling backend twins:
-/// `open_regular_file` opens with `O_NONBLOCK` and rejects non-regular
-/// files, so a FIFO planted as `pyproject.toml` or `uv.lock` fails fast
-/// instead of wedging every uv-project vendor run (and revert) forever in
-/// an `open(2)` that waits for a writer — the flavor-routing probes ahead
-/// of the load are metadata-only, so these are the first opens.
-async fn read_regular_to_string(path: &Path) -> std::io::Result<String> {
-    use tokio::io::AsyncReadExt as _;
-
-    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
-    let mut content = String::with_capacity(metadata.len() as usize);
-    file.read_to_string(&mut content).await?;
-    Ok(content)
-}
 
 /// How the target package is declared, which picks the wiring strategy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -466,6 +457,8 @@ pub(super) async fn wire_uv(
     wheel_sha256_hex: &str,
     record_uuid: &str,
 ) -> Result<(Vec<WiringRecord>, UvMeta, Vec<VendorWarning>), (&'static str, String)> {
+    // Before ANY write: a symlinked half would be replaced by the rename.
+    refuse_symlinked_pair(root).await?;
     match check_target_guards(p, canon_name, record_uuid)? {
         // Defensive: the orchestrator short-circuits in-sync pre-flight and
         // never calls wire on it (we must never re-record our own edit as an
@@ -733,6 +726,16 @@ pub(super) async fn wire_uv(
 pub(super) async fn revert_uv(entry: &VendorEntry, root: &Path, dry_run: bool) -> RevertOutcome {
     let pyproject_path = root.join("pyproject.toml");
     let lock_path = root.join("uv.lock");
+    // A symlinked half would be replaced by the rename-over write: keep the
+    // artifact (the wiring still routes through it) and fail the revert.
+    if let Err((code, detail)) = refuse_symlinked_pair(root).await {
+        return RevertOutcome {
+            kept_artifact: true,
+            success: false,
+            warnings: Vec::new(),
+            error: Some(format!("{code}: {detail}")),
+        };
+    }
     let mut pyproject_text = match read_regular_to_string(&pyproject_path).await {
         Ok(t) => t,
         Err(e) => return RevertOutcome::failed(format!("cannot read pyproject.toml: {e}")),
@@ -934,6 +937,27 @@ pub(super) async fn revert_uv(entry: &VendorEntry, root: &Path, dry_run: bool) -
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────
+
+/// Refuse when `pyproject.toml` or `uv.lock` is itself a symlink. The
+/// writers stage a replacement next to the path and rename over it, which
+/// would REPLACE the link with a regular file — the target left stale, git
+/// showing a typechange — so both wire and revert check before any write
+/// (uv itself writes through the link). `Err` names the offending file.
+async fn refuse_symlinked_pair(root: &Path) -> Result<(), (&'static str, String)> {
+    for name in ["pyproject.toml", "uv.lock"] {
+        if crate::utils::fs::is_symlink(&root.join(name)).await {
+            return Err((
+                "pypi_uv_symlink_unsupported",
+                format!(
+                    "{name} is a symbolic link; the atomic rewrite would replace the link with \
+                     a regular file and leave its target stale — vendor the real file's \
+                     directory instead"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
 
 /// The lock's line terminator. uv writes LF, but git autocrlf on Windows
 /// hands us a CRLF file; every fragment we splice, append or remove must be
@@ -5396,5 +5420,92 @@ six = { path = ".socket/vendor/pypi/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/six-1.1
             format!("dev = [{{ name = \"six\", path = \"{REL_WHEEL}\" }}]")
         );
         assert_eq!(edits[0].specifier.as_deref(), Some("==1.16.0"));
+    }
+
+    /// atomic_write_bytes_preserving_mode stages a file next to the path and
+    /// renames over it: a symlinked pyproject.toml / uv.lock would be
+    /// REPLACED by a regular file (target left stale, git shows a
+    /// typechange). Wire refuses before ANY write with
+    /// `pypi_uv_symlink_unsupported` naming the file; revert keeps the
+    /// artifact and fails. The link stays a link, its target keeps its bytes,
+    /// and nothing under `.socket/` appears.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlinked_uv_lock_or_pyproject_refused_before_write() {
+        for linked in ["pyproject.toml", "uv.lock"] {
+            let tmp = write_pair(DIRECT_REGISTRY_PYPROJECT, DIRECT_REGISTRY_LOCK).await;
+            let real = tmp.path().join("real");
+            tokio::fs::create_dir(&real).await.unwrap();
+            let target = real.join(linked);
+            tokio::fs::rename(tmp.path().join(linked), &target)
+                .await
+                .unwrap();
+            std::os::unix::fs::symlink(&target, tmp.path().join(linked)).unwrap();
+            let target_before = tokio::fs::read(&target).await.unwrap();
+            let other = if linked == "pyproject.toml" {
+                "uv.lock"
+            } else {
+                "pyproject.toml"
+            };
+            let other_before = tokio::fs::read(tmp.path().join(other)).await.unwrap();
+
+            let p = load_uv_project(tmp.path()).await.unwrap();
+            let (code, detail) = wire_uv(
+                &p,
+                tmp.path(),
+                "six",
+                "1.16.0",
+                REL_WHEEL,
+                WHEEL_NAME,
+                WHEEL_SHA,
+                UUID,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(code, "pypi_uv_symlink_unsupported", "{linked}: {detail}");
+            assert!(detail.contains(linked), "{linked}: {detail}");
+            let meta = tokio::fs::symlink_metadata(tmp.path().join(linked))
+                .await
+                .unwrap();
+            assert!(meta.file_type().is_symlink(), "{linked}: link replaced");
+            assert_eq!(
+                tokio::fs::read(&target).await.unwrap(),
+                target_before,
+                "{linked}: target rewritten through the link"
+            );
+            assert_eq!(
+                tokio::fs::read(tmp.path().join(other)).await.unwrap(),
+                other_before,
+                "{linked}: the sibling file must be untouched"
+            );
+            assert!(
+                !tmp.path().join(".socket").exists(),
+                "{linked}: no vendor dir may appear"
+            );
+
+            // Revert against a symlinked pair: keep the artifact, fail.
+            let entry = entry_for(
+                Vec::new(),
+                UvMeta {
+                    dep_class: "direct".into(),
+                    original_specifier: None,
+                    created_sources_table: true,
+                    lock_revision: Some(3),
+                },
+            );
+            let outcome = revert_uv(&entry, tmp.path(), false).await;
+            assert!(!outcome.success, "{linked}: revert must fail");
+            assert!(outcome.kept_artifact, "{linked}: artifact must be kept");
+            let error = outcome.error.unwrap_or_default();
+            assert!(
+                error.contains("pypi_uv_symlink_unsupported") && error.contains(linked),
+                "{linked}: {error}"
+            );
+            let meta = tokio::fs::symlink_metadata(tmp.path().join(linked))
+                .await
+                .unwrap();
+            assert!(meta.file_type().is_symlink(), "{linked}: link replaced by revert");
+            assert_eq!(tokio::fs::read(&target).await.unwrap(), target_before);
+        }
     }
 }
