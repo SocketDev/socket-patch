@@ -1,11 +1,10 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use tokio::io::AsyncReadExt as _;
 use toml_edit::{DocumentMut, Item, Table, TableLike, Value};
 
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
-use crate::utils::fs::{atomic_write_bytes_preserving_mode, open_regular_file};
+use crate::utils::fs::{atomic_write_bytes_preserving_mode, is_symlink, read_regular_to_string};
 use crate::utils::python_lock::{
     is_python_lock_name, python_lock_paths, rewrite_python_lock, ArtifactSource,
 };
@@ -33,27 +32,48 @@ pub(super) struct PythonLocks {
     pub pin: Option<(String, String)>,
 }
 
+/// FIFO-safe read that FOLLOWS a symlink to a regular file. Discovery
+/// (`python_lock_paths`) follows links too, so a shared `pylock.dev.toml`
+/// link beside a regular `pylock.toml` reads like the file it points at —
+/// an lstat-based "is this a regular file" pre-check here rejected the
+/// link, and because `contains_target`/`load_python_locks` bubble the FIRST
+/// unreadable sibling, one stray link blocked vendoring of the whole
+/// project. Whether a linked file may be WRITTEN is a separate question,
+/// answered by [`refuse_symlinked`] right before the writers run.
 async fn read_file(path: &Path) -> Result<String, Failure> {
-    let metadata = tokio::fs::symlink_metadata(path).await.map_err(|error| {
+    read_regular_to_string(path).await.map_err(|error| {
         (
             "pypi_lock_read_failed",
-            format!("cannot read {}: {error}", path.display()),
+            if error.kind() == std::io::ErrorKind::InvalidInput {
+                error.to_string()
+            } else {
+                format!("cannot read {}: {error}", path.display())
+            },
         )
-    })?;
-    if !metadata.is_file() {
-        return Err((
-            "pypi_lock_read_failed",
-            format!("{} is not a regular file", path.display()),
-        ));
+    })
+}
+
+/// Every writer here stages a replacement next to `file` and renames over
+/// it, which REPLACES a symlink with a regular file: the link target goes
+/// stale (uv itself writes through the link), and a later revert restores
+/// bytes but never the link (git shows a 120000→100644 typechange). Refuse
+/// before the first write instead — same fail-closed policy as the hosted
+/// replay flush guard.
+fn symlink_refusal(file: &str) -> String {
+    format!(
+        "{file} is a symbolic link; socket-patch rewrites files in place with an atomic \
+         rename, which would replace the link — replace the link with a regular file (or \
+         run socket-patch in the directory it points to) and re-run"
+    )
+}
+
+async fn refuse_symlinked(root: &Path, files: impl Iterator<Item = &String>) -> Option<String> {
+    for file in files {
+        if is_symlink(&root.join(file)).await {
+            return Some(symlink_refusal(file));
+        }
     }
-    let (mut file, _) = open_regular_file(path)
-        .await
-        .map_err(|error| ("pypi_lock_read_failed", error.to_string()))?;
-    let mut text = String::new();
-    file.read_to_string(&mut text)
-        .await
-        .map_err(|error| ("pypi_lock_read_failed", error.to_string()))?;
-    Ok(text)
+    None
 }
 
 fn package<'a>(document: &'a DocumentMut, name: &str, version: &str) -> Option<&'a Table> {
@@ -299,6 +319,9 @@ pub(super) async fn wire_python_locks(
         if rewritten != file.text {
             edits.push((file.name.clone(), file.text.clone(), rewritten, KIND));
         }
+    }
+    if let Some(detail) = refuse_symlinked(root, edits.iter().map(|(file, ..)| file)).await {
+        return Err(("pypi_lock_symlink_unsupported", detail));
     }
     for (file, original, _, _) in &edits {
         if read_file(&root.join(file)).await? != *original {
@@ -578,6 +601,12 @@ pub(super) async fn revert_python_locks(
         }
     }
     if !dry_run && warnings.is_empty() {
+        // A refused write fails the revert outright: the artifact and the
+        // ledger entry stay so the restore can be retried once the link is
+        // a regular file again.
+        if let Some(detail) = refuse_symlinked(root, edits.iter().map(|(file, ..)| file)).await {
+            return RevertOutcome::failed(detail);
+        }
         for (file, original, _) in &edits {
             match read_file(&root.join(file)).await {
                 Ok(live) if live == *original => {}
@@ -820,5 +849,419 @@ mod tests {
         assert!(allowed_file("job.py.lock", KIND));
         assert!(allowed_file("job.py", SCRIPT_KIND));
         assert!(!allowed_file("../job.py", SCRIPT_KIND));
+    }
+
+    /// The two-package PEP 751 document with every newline CRLF.
+    fn crlf(text: &str) -> String {
+        text.replace('\n', "\r\n")
+    }
+
+    const UUID: &str = "11111111-1111-4111-8111-111111111111";
+
+    /// `pylock.toml` locking `one` and `two` upstream, plus the second copy a
+    /// sibling symlink points at.
+    async fn write_pylock(root: &Path, name: &str, text: &str) {
+        tokio::fs::write(root.join(name), text).await.unwrap();
+    }
+
+    /// A stray `pylock.dev.toml` SYMLINK (pointing at a lock that does not
+    /// contain the target) beside a REGULAR `pylock.toml` that does. On main
+    /// the symlink was invisible (`python_lock_paths` skipped links); since
+    /// discovery started following links, `read_file`'s
+    /// `symlink_metadata().is_file()` pre-check rejected it with
+    /// `pypi_lock_read_failed`, and because `contains_target` /
+    /// `load_python_locks` bubble the FIRST unreadable sibling, the stray link
+    /// blocked vendoring of the whole project. A link to a regular file must
+    /// read like the file (`open_regular_file`'s fstat already accepts it).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stray_sibling_symlink_does_not_block_regular_pylock() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        write_pylock(root, "pylock.toml", LOCK).await;
+        let other = "lock-version = \"1.0\"\n\n[[packages]]\nname = \"other\"\nversion = \"9\"\nwheels = [{url = \"https://example.test/other.whl\", hashes = {sha256 = \"other\"}}]\n";
+        std::fs::create_dir_all(root.join("shared")).unwrap();
+        write_pylock(root, "shared/pylock.dev.toml", other).await;
+        std::os::unix::fs::symlink("shared/pylock.dev.toml", root.join("pylock.dev.toml"))
+            .unwrap();
+
+        let paths = python_lock_paths(root).unwrap();
+        assert_eq!(
+            paths,
+            vec!["pylock.dev.toml".to_string(), "pylock.toml".to_string()],
+            "discovery must still FOLLOW the link (a shared pylock is a real project file)"
+        );
+        assert_eq!(
+            contains_target(root, &paths, "one", "1").await,
+            Ok(true),
+            "a readable non-referencing sibling link must not fail the routing probe"
+        );
+        assert_eq!(
+            contains_target(root, &paths, "other", "9").await,
+            Ok(true),
+            "the link itself reads like the file it points at"
+        );
+        let project = load_python_locks(root, "one", "1", UUID).await.unwrap();
+        assert!(!project.in_sync);
+        let records = wire_python_locks(
+            &project,
+            root,
+            "one",
+            "1",
+            ".socket/vendor/pypi/11111111-1111-4111-8111-111111111111/one-1-py3-none-any.whl",
+            &"a".repeat(64),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            records.iter().map(|r| r.file.as_str()).collect::<Vec<_>>(),
+            vec!["pylock.toml"],
+            "only the regular lock that contains the target is wired"
+        );
+        assert!(
+            std::fs::read_to_string(root.join("pylock.toml"))
+                .unwrap()
+                .contains("one-1-py3-none-any.whl")
+        );
+        assert!(
+            std::fs::symlink_metadata(root.join("pylock.dev.toml"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the stray link is left alone"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("shared/pylock.dev.toml")).unwrap(),
+            other
+        );
+    }
+
+    /// A DANGLING sibling link is not a lock: discovery's `fs::metadata`
+    /// follow fails, so the name is skipped and the regular lock beside it
+    /// routes/wires as if the link were absent.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dangling_sibling_symlink_is_ignored() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        write_pylock(root, "pylock.toml", LOCK).await;
+        std::os::unix::fs::symlink("missing/pylock.dev.toml", root.join("pylock.dev.toml"))
+            .unwrap();
+
+        let paths = python_lock_paths(root).unwrap();
+        assert_eq!(paths, vec!["pylock.toml".to_string()]);
+        assert_eq!(contains_target(root, &paths, "one", "1").await, Ok(true));
+        let project = load_python_locks(root, "one", "1", UUID).await.unwrap();
+        assert_eq!(project.files.len(), 1);
+        // Reading the dangling name directly still fails as unreadable — the
+        // filter lives in discovery, not in a swallowed read error.
+        assert!(matches!(
+            read_file(&root.join("pylock.dev.toml")).await,
+            Err(("pypi_lock_read_failed", _))
+        ));
+    }
+
+    fn symlink_refusal_names(result: &Result<Vec<WiringRecord>, Failure>, file: &str) {
+        match result {
+            Err((code, detail)) => {
+                assert_eq!(*code, "pypi_lock_symlink_unsupported", "{detail}");
+                assert!(
+                    detail.starts_with(&format!("{file} is a symbolic link")),
+                    "the refusal must name the linked file: {detail}"
+                );
+                assert!(detail.contains("atomic rename"), "{detail}");
+                assert!(detail.contains("re-run"), "{detail}");
+            }
+            Ok(records) => panic!("must refuse before writing, wired {records:?}"),
+        }
+    }
+
+    /// The lock the wiring is about to rewrite is a symlink. Every writer
+    /// here stages next to the path and renames over it, which REPLACES the
+    /// link with a regular file (the target goes stale, rollback restores
+    /// bytes but never the link — git shows a 120000→100644 typechange). The
+    /// hosted replay side already refuses such a flush; the vendored write
+    /// side must refuse BEFORE touching anything, with a stable code naming
+    /// the file.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlinked_target_lock_refused_before_write() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::create_dir_all(root.join("shared")).unwrap();
+        write_pylock(root, "shared/pylock.toml", LOCK).await;
+        std::os::unix::fs::symlink("shared/pylock.toml", root.join("pylock.toml")).unwrap();
+
+        let project = load_python_locks(root, "one", "1", UUID).await.unwrap();
+        let result = wire_python_locks(
+            &project,
+            root,
+            "one",
+            "1",
+            ".socket/vendor/pypi/11111111-1111-4111-8111-111111111111/one-1-py3-none-any.whl",
+            &"a".repeat(64),
+        )
+        .await;
+        symlink_refusal_names(&result, "pylock.toml");
+        assert!(
+            std::fs::symlink_metadata(root.join("pylock.toml"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the link must survive: a rename-over would have turned it into a regular file"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("shared/pylock.toml")).unwrap(),
+            LOCK,
+            "the link target must stay byte-identical"
+        );
+        assert!(!root.join(".socket").exists());
+    }
+
+    /// The paired PEP 723 script is the symlink (its `.py.lock` is regular):
+    /// the script's `[tool.uv.sources]` rewrite goes through the same
+    /// rename-over writer, so the refusal must cover it too and name the
+    /// SCRIPT, not the lock.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlinked_paired_script_refused_before_write() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let lock = "version = 1\n[[package]]\nname = \"one\"\nversion = \"1\"\nsource = {registry = \"https://pypi.org/simple\"}\n";
+        let script = "# /// script\n# dependencies = [\"one==1\"]\n# ///\nprint('hi')\n";
+        write_pylock(root, "example.py.lock", lock).await;
+        std::fs::create_dir_all(root.join("shared")).unwrap();
+        tokio::fs::write(root.join("shared/example.py"), script)
+            .await
+            .unwrap();
+        std::os::unix::fs::symlink("shared/example.py", root.join("example.py")).unwrap();
+
+        let project = load_python_locks(root, "one", "1", UUID).await.unwrap();
+        let result = wire_python_locks(
+            &project,
+            root,
+            "one",
+            "1",
+            "one-1-py3-none-any.whl",
+            &"a".repeat(64),
+        )
+        .await;
+        symlink_refusal_names(&result, "example.py");
+        assert!(
+            std::fs::symlink_metadata(root.join("example.py"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("shared/example.py")).unwrap(),
+            script
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("example.py.lock")).unwrap(),
+            lock,
+            "the regular lock must not be written when its paired script is refused"
+        );
+    }
+
+    /// Revert twin: the lock was wired as a regular file, then the checkout
+    /// restored the committed SYMLINK (git typechange back) pointing at a copy
+    /// carrying the vendored bytes. `read_file` follows the link fine, so the
+    /// restore plan is computable — but writing it would replace the link.
+    /// The revert must FAIL (artifact + ledger entry kept, nothing written).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn revert_refuses_symlinked_lock_and_keeps_artifact() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        write_pylock(root, "pylock.toml", LOCK).await;
+        let project = load_python_locks(root, "one", "1", UUID).await.unwrap();
+        let wheel = ".socket/vendor/pypi/11111111-1111-4111-8111-111111111111/one-1-py3-none-any.whl";
+        let records = wire_python_locks(&project, root, "one", "1", wheel, &"a".repeat(64))
+            .await
+            .unwrap();
+        let vendored = std::fs::read_to_string(root.join("pylock.toml")).unwrap();
+        assert_ne!(vendored, LOCK);
+        let entry: VendorEntry = serde_json::from_value(serde_json::json!({
+            "ecosystem": "pypi",
+            "basePurl": "pkg:pypi/one@1",
+            "uuid": UUID,
+            "artifact": { "path": wheel, "sha256": "a".repeat(64) },
+            "wiring": serde_json::to_value(&records).unwrap(),
+            "flavor": "python-lock",
+        }))
+        .unwrap();
+
+        std::fs::create_dir_all(root.join("shared")).unwrap();
+        std::fs::rename(root.join("pylock.toml"), root.join("shared/pylock.toml")).unwrap();
+        std::os::unix::fs::symlink("shared/pylock.toml", root.join("pylock.toml")).unwrap();
+
+        let outcome = revert_python_locks(&entry, root, false).await;
+        assert!(!outcome.success, "{outcome:?}");
+        let error = outcome.error.expect("a failed revert carries its reason");
+        assert!(
+            error.starts_with("pylock.toml is a symbolic link"),
+            "the failure must name the linked file: {error}"
+        );
+        assert!(error.contains("atomic rename"), "{error}");
+        assert!(
+            std::fs::symlink_metadata(root.join("pylock.toml"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the link must survive the refused revert"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("shared/pylock.toml")).unwrap(),
+            vendored,
+            "the target keeps the vendored bytes: nothing was restored through the link"
+        );
+        // Dry runs plan only — they never reach the writer, so the link is no
+        // obstacle and the plan reports a clean restore.
+        let dry = revert_python_locks(&entry, root, true).await;
+        assert!(dry.success && dry.warnings.is_empty(), "{dry:?}");
+    }
+
+    /// `restore_document`'s post-restore `preserve_line_endings`: the ledger
+    /// recorded LF `original`/`new`, but the live file is the vendored text
+    /// checked out under autocrlf (every newline CRLF). `live != new`
+    /// byte-wise, so this takes the structural path (not the `live == new`
+    /// short-circuit) and must converge on the ORIGINAL in the live file's
+    /// CRLF convention with no drift.
+    #[test]
+    fn restore_document_converges_lf_ledger_crlf_live() {
+        let new = rewrite_python_lock(
+            LOCK,
+            "one",
+            "1",
+            ArtifactSource::Path(".socket/vendor/one-1-py3-none-any.whl"),
+            "first",
+        )
+        .unwrap()
+        .unwrap();
+        let live = crlf(&new);
+        assert_ne!(live, new, "the CRLF live text must not short-circuit");
+        let (restored, drifted) = restore_document(&live, LOCK, &new).unwrap();
+        assert!(!drifted, "a pure line-ending difference is not drift");
+        assert_eq!(restored, crlf(LOCK));
+    }
+
+    /// The mirror: CRLF-recorded `original`/`new` (vendored on Windows), live
+    /// file normalized to LF by a later checkout. Converges on the original
+    /// content in LF.
+    #[test]
+    fn restore_document_converges_crlf_ledger_lf_live() {
+        let original = crlf(LOCK);
+        let new = rewrite_python_lock(
+            &original,
+            "one",
+            "1",
+            ArtifactSource::Path(".socket/vendor/one-1-py3-none-any.whl"),
+            "first",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(new.contains("\r\n"), "the rewriter keeps the CRLF convention");
+        let live = new.replace("\r\n", "\n");
+        let (restored, drifted) = restore_document(&live, &original, &new).unwrap();
+        assert!(!drifted);
+        assert_eq!(restored, LOCK);
+    }
+
+    /// Two packages vendored in sequence under CRLF and reverted OUT of
+    /// order (`one` first, while `two`'s edit is still live). The
+    /// single-package pure-CRLF revert short-circuits at `live == new`, so
+    /// only this shape exercises the structural restore + line-ending
+    /// re-application on a CRLF document — both steps must converge without
+    /// drift and the final text must be the CRLF original.
+    #[test]
+    fn crlf_two_package_reverts_converge_out_of_order() {
+        let original = crlf(LOCK);
+        let first = rewrite_python_lock(
+            &original,
+            "one",
+            "1",
+            ArtifactSource::Path(".socket/vendor/one-1-py3-none-any.whl"),
+            "first",
+        )
+        .unwrap()
+        .unwrap();
+        let both = rewrite_python_lock(
+            &first,
+            "two",
+            "2",
+            ArtifactSource::Path(".socket/vendor/two-2-py3-none-any.whl"),
+            "second",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(both.contains("\r\n") && !both.replace("\r\n", "").contains('\n'));
+        let (second_only, drifted) = restore_document(&both, &original, &first).unwrap();
+        assert!(!drifted);
+        assert!(second_only.contains("https://example.test/one.whl"));
+        assert!(second_only.contains(".socket/vendor/two-2-py3-none-any.whl"));
+        assert!(
+            !second_only.replace("\r\n", "").contains('\n'),
+            "the intermediate document keeps CRLF throughout: {second_only:?}"
+        );
+        let (restored, drifted) = restore_document(&second_only, &first, &both).unwrap();
+        assert!(!drifted);
+        assert_eq!(restored, original);
+    }
+
+    /// KNOWN LIMITATION (documented, not fixed here): two TRANSITIVE deps
+    /// vendored into one PEP 723 script share the `[tool.uv]
+    /// override-dependencies` ARRAY. Reverting the OLDER one first (`one`,
+    /// while `two`'s override is still live) cannot be expressed by
+    /// `restore_value`: the array grew from absent → 1 → 2 entries, the live
+    /// 2-entry array matches neither recorded shape, and an array is not
+    /// table-like, so the key is flagged as drift and the script is left
+    /// untouched (`vendor_lock_entry_drifted`, entry kept). Reverting `two`
+    /// first (`live == new`) then `one` converges; so does a SECOND pass over
+    /// `one` after `two` is gone. Direct deps (`[tool.uv.sources]` table
+    /// entries) revert in any order — see
+    /// `script_sources_revert_out_of_order_without_empty_tables`.
+    #[test]
+    fn script_transitive_pair_revert_out_of_order() {
+        let metadata = "dependencies = [\"top==1\"]\n";
+        let script =
+            replace_script_metadata("# /// script\n# ///\nprint('unchanged')\n", metadata).unwrap();
+        let first = rewrite_script_metadata(
+            &script,
+            "one",
+            "1",
+            ArtifactSource::Path(".socket/vendor/one.whl"),
+        )
+        .unwrap()
+        .unwrap();
+        let both = rewrite_script_metadata(
+            &first,
+            "two",
+            "2",
+            ArtifactSource::Path(".socket/vendor/two.whl"),
+        )
+        .unwrap()
+        .unwrap();
+        let (_, first_metadata) = script_metadata(&first).unwrap();
+        let (_, both_metadata) = script_metadata(&both).unwrap();
+        assert!(both_metadata.contains("override-dependencies"));
+
+        // Older first: flagged as drift, text preserved verbatim.
+        let (kept, drifted) = restore_document(&both_metadata, metadata, &first_metadata).unwrap();
+        assert!(
+            drifted,
+            "current behavior: the shared override array reads as drift"
+        );
+        assert_eq!(kept, both_metadata, "drift keeps the live text untouched");
+
+        // Newer first converges (short-circuit), then the older one does too.
+        let (second_reverted, drifted) =
+            restore_document(&both_metadata, &first_metadata, &both_metadata).unwrap();
+        assert!(!drifted);
+        assert_eq!(second_reverted, first_metadata);
+        let (restored, drifted) =
+            restore_document(&second_reverted, metadata, &first_metadata).unwrap();
+        assert!(!drifted);
+        assert_eq!(restored, metadata);
     }
 }
