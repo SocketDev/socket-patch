@@ -245,6 +245,11 @@ pub fn rewrite_project_metadata(
         .get("project")
         .and_then(Item::as_table_like)
         .ok_or("pyproject.toml has no project table")?;
+    let tool_uv = document
+        .get("tool")
+        .and_then(Item::as_table_like)
+        .and_then(|tool| tool.get("uv"))
+        .and_then(Item::as_table_like);
     let direct = contains_dependency(project.get("dependencies"), &name)
         || project
             .get("optional-dependencies")
@@ -261,14 +266,15 @@ pub fn rewrite_project_metadata(
                 groups
                     .iter()
                     .any(|(_, group)| contains_dependency(Some(group), &name))
-            });
-    if document
-        .get("tool")
-        .and_then(Item::as_table_like)
-        .and_then(|tool| tool.get("uv"))
-        .and_then(Item::as_table_like)
-        .is_some_and(|uv| uv.contains_key("workspace"))
-    {
+            })
+        // The legacy `[tool.uv] dev-dependencies` array (still honoured by uv
+        // with a deprecation warning) is a direct declaration too: uv records
+        // it under `[package.metadata.requires-dev]`, so an override here
+        // would be redundant — and ignored by uv < 0.5.6, which does not
+        // apply `[tool.uv.sources]` to `override-dependencies`.
+        || tool_uv
+            .is_some_and(|uv| contains_dependency(uv.get("dev-dependencies"), &name));
+    if tool_uv.is_some_and(|uv| uv.contains_key("workspace")) {
         return Err(
             "hosted sources for uv workspaces require a package-scoped source mapping".to_string(),
         );
@@ -412,6 +418,33 @@ mod rendering_tests {
     use super::*;
 
     const URL: &str = "https://patch.socket.dev/alpha-1.0.0-py3-none-any.whl";
+
+    /// A package declared only in the legacy `[tool.uv] dev-dependencies`
+    /// array is a DIRECT dependency for hosted wiring: uv tracks it under
+    /// `[package.metadata.requires-dev]`, so the source alone redirects it and
+    /// no `override-dependencies` entry may be added (uv < 0.5.6 ignores
+    /// sources on overrides and would reinstall the registry wheel).
+    #[test]
+    fn tool_uv_dev_dependencies_count_as_direct_for_hosted_sources() {
+        let out = rewrite_project_metadata(
+            "[project]\nname = \"p\"\ndependencies = []\n\n[tool.uv]\ndev-dependencies = [\"alpha==1.0.0\"]\n",
+            "alpha",
+            "1.0.0",
+            ArtifactSource::Url(URL),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!out.contains("override-dependencies"), "{out}");
+        assert!(
+            out.contains(&format!("[tool.uv.sources]\nalpha = {{ url = \"{URL}\" }}")),
+            "{out}"
+        );
+        assert!(
+            rewrite_project_metadata(&out, "alpha", "1.0.0", ArtifactSource::Url(URL))
+                .unwrap()
+                .is_none()
+        );
+    }
 
     /// A second pass over a rendering must be a no-op: the source is
     /// recognised as already present and nothing is re-emitted.

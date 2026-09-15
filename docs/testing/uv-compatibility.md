@@ -159,10 +159,12 @@ preserving another package's vendored entries.
 
 ## Reproduce the release-family matrix
 
-The matrix pins 41 binaries: the first and the latest release of every uv 0.x
+The matrix pins 42 binaries: the first and the latest release of every uv 0.x
 family (0.0 through 0.12), plus the releases on either side of every behaviour
 boundary the probes found — `0.1.23`/`0.1.24` (local wheel paths in
-requirements), `0.2.5`/`0.2.6` (sub-table → inline lock artifacts),
+requirements), `0.1.44`/`0.1.45` (`uv lock` writes a lock; the subcommand
+exists from 0.1.42 and panics `not yet implemented` through 0.1.44),
+`0.2.5`/`0.2.6` (sub-table → inline lock artifacts),
 `0.2.17`/`0.2.18` (string → inline-table lock sources),
 `0.2.34`/`0.2.35` (`[[distribution]]` → `[[package]]`), `0.2.36`/`0.2.37`
 (root `[package.metadata]` appears),
@@ -173,11 +175,11 @@ boundaries were bisected with `scripts/probe-uv-boundaries.py`, which records
 the lock grammar, lock revision, command availability (including whether the
 `uv lock` subcommand exists and actually writes a lock, and whether `uv export`
 accepts `--output-file`), and local-wheel requirement support of any set of uv
-releases. Boundaries the probe pins but the matrix does not bracket with a
-pinned pair: `uv lock` 0.1.44/0.1.45 (the subcommand exists from 0.1.42 and
-panics through 0.1.44) and `uv export --output-file` 0.4.6/0.4.7. This is
-release-family plus boundary coverage, not a claim that every patch release
-was tested.
+releases. The one probe-pinned boundary the matrix does not bracket is the
+`uv export --output-file` flag (0.4.6/0.4.7): the harness reads the export
+from stdout, so it is a harness detail rather than a compatibility boundary.
+This is release-family plus boundary coverage, not a claim that every patch
+release was tested.
 
 From the repository root on macOS or Linux:
 
