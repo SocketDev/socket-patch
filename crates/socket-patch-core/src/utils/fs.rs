@@ -134,6 +134,33 @@ pub(crate) async fn open_regular_file(
     Ok((file, metadata))
 }
 
+/// Read a regular file to a `String` through [`open_regular_file`]: the
+/// FIFO-safe reader (non-blocking open, fstat regular-file check on the
+/// opened descriptor) that the ecosystem modules had each re-declared
+/// privately. Follows a symlink to a regular file; a FIFO, directory or
+/// socket fails fast with `InvalidInput` instead of wedging in open(2).
+/// `pub` so the CLI crate's raw `read_to_string` sites can share it.
+pub async fn read_regular_to_string(path: &Path) -> std::io::Result<String> {
+    use tokio::io::AsyncReadExt as _;
+
+    let (mut file, metadata) = open_regular_file(path).await?;
+    let mut content = String::with_capacity(metadata.len() as usize);
+    file.read_to_string(&mut content).await?;
+    Ok(content)
+}
+
+/// True when `path` ITSELF is a symbolic link (lstat; the link target is not
+/// consulted, so a dangling link is still `true`). Writers that stage a
+/// replacement next to `path` and rename over it would replace the link with
+/// a regular file (leaving the target stale) — they use this to refuse
+/// fail-closed before any write, mirroring the hosted replay guard.
+pub async fn is_symlink(path: &Path) -> bool {
+    tokio::fs::symlink_metadata(path)
+        .await
+        .map(|metadata| metadata.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
 /// Return the raw `FileType` for `entry`, swallowing stat errors.
 ///
 /// Use this instead of `entry_is_dir` when the caller needs to
