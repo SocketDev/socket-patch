@@ -1093,24 +1093,42 @@ fn parse_gem_spec_line(line: &str) -> Option<(String, String)> {
 async fn inventory_pypi_locks(project_root: &Path) -> Option<Vec<LockfileEntry>> {
     let mut out = Vec::new();
     let mut found = false;
+    let mut uv_lock = false;
     if let Ok(paths) = crate::utils::python_lock::python_lock_paths(project_root) {
         for path in paths {
-            let Ok(text) = read_regular_to_string(&project_root.join(path)).await else {
+            let Ok(text) = read_regular_to_string(&project_root.join(&path)).await else {
                 continue;
             };
             if let Some(entries) = python_lock_inventory(&text) {
                 found = true;
+                uv_lock |= path == "uv.lock";
                 out.extend(entries);
             }
         }
     }
-    if found {
-        return Some(dedup_prefer_integrity(out));
+    // A PARSEABLE uv.lock stays the EXCLUSIVE project inventory (its
+    // precedence over poetry.lock / requirements.txt predates standalone-lock
+    // support). Exclusivity is keyed on parse SUCCESS, not on the file's
+    // presence: an unparseable uv.lock contributed nothing above, so it falls
+    // through to poetry.lock / requirements.txt exactly like a package-less
+    // poetry.lock does (`depless_poetry_lock_falls_through_to_requirements`).
+    // Keying on presence would hide every requirements pin behind a corrupt
+    // lock AND diverge from hosted, which skips an unparseable uv.lock with
+    // `redirect_uv_lock_unsupported` and still reads the other pins. A
+    // PEP 723 script lock or a PEP 751 lock is scoped to its own install,
+    // so it SUPPLEMENTS the project's tool lock: a stray `tool.py.lock`
+    // must not hide every poetry.lock / requirements.txt pin from scan's
+    // lockfile supplement and vendor's lookup.
+    if !uv_lock {
+        if let Some(entries) = inventory_poetry_lock(project_root).await {
+            found = true;
+            out.extend(entries);
+        } else if let Some(entries) = inventory_requirements_txt(project_root).await {
+            found = true;
+            out.extend(entries);
+        }
     }
-    if let Some(out) = inventory_poetry_lock(project_root).await {
-        return Some(out);
-    }
-    inventory_requirements_txt(project_root).await
+    found.then(|| dedup_prefer_integrity(out))
 }
 
 fn python_archive(archive: &dyn TableLike) -> Option<(String, String)> {
@@ -1453,6 +1471,10 @@ pub async fn recover_lock_entry(
                         .to_string(),
                 );
             }
+            // The inventory canonicalizes names (PEP 503); the purl may carry
+            // the project's own spelling (`PyYAML`, `typing_extensions`) —
+            // compare in normalized form like `lookup` does.
+            let canonical_name = canonicalize_pypi_name(&name);
             for wiring in entry
                 .wiring
                 .iter()
@@ -1461,7 +1483,7 @@ pub async fn recover_lock_entry(
                 if let Some(text) = wiring.original.as_ref().and_then(Value::as_str) {
                     if let Some(entries) = python_lock_inventory(text) {
                         if let Some(resolution) = entries.into_iter().find(|candidate| {
-                            candidate.name == name
+                            candidate.name == canonical_name
                                 && candidate.version == version
                                 && candidate.resolved.is_some()
                                 && candidate.integrity != LockIntegrity::None
@@ -4397,6 +4419,174 @@ mod recover_tests {
         assert!(
             err.contains("no pre-vendor npm registry fragment"),
             "every invalid fragment must fall through to the fail-closed error: {err}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod python_lock_union_tests {
+    use super::*;
+
+    const WHEEL_SHA: &str = "abababababababababababababababababababababababababababababababab";
+
+    fn uv_style_lock(name: &str, version: &str) -> String {
+        format!(
+            "version = 1\n\n[[package]]\nname = \"{name}\"\nversion = \"{version}\"\nsource = {{ registry = \"https://pypi.org/simple\" }}\nwheels = [{{ url = \"https://files.pythonhosted.org/{name}-{version}-py3-none-any.whl\", hash = \"sha256:{WHEEL_SHA}\" }}]\n"
+        )
+    }
+
+    fn names(entries: &[LockfileEntry]) -> Vec<(String, String)> {
+        let mut pairs: Vec<_> = entries
+            .iter()
+            .map(|entry| (entry.name.clone(), entry.version.clone()))
+            .collect();
+        pairs.sort();
+        pairs
+    }
+
+    /// A script lock is scoped to its script: it must ADD to the project's
+    /// requirements.txt / poetry.lock pins, not replace them (the base only
+    /// ever let uv.lock short-circuit the fallbacks).
+    #[tokio::test]
+    async fn script_lock_supplements_project_pins() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(tmp.path().join("requirements.txt"), "requests==2.31.0\n")
+            .await
+            .unwrap();
+        tokio::fs::write(
+            tmp.path().join("tool.py.lock"),
+            uv_style_lock("flask", "3.0.0"),
+        )
+        .await
+        .unwrap();
+        let entries = inventory_pypi_locks(tmp.path()).await.unwrap();
+        assert_eq!(
+            names(&entries),
+            vec![
+                ("flask".to_string(), "3.0.0".to_string()),
+                ("requests".to_string(), "2.31.0".to_string()),
+            ]
+        );
+    }
+
+    /// uv.lock keeps its exclusive precedence over the fallbacks.
+    #[tokio::test]
+    async fn uv_lock_still_hides_requirements_pins() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(tmp.path().join("requirements.txt"), "requests==2.31.0\n")
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.path().join("uv.lock"), uv_style_lock("flask", "3.0.0"))
+            .await
+            .unwrap();
+        let entries = inventory_pypi_locks(tmp.path()).await.unwrap();
+        assert_eq!(
+            names(&entries),
+            vec![("flask".to_string(), "3.0.0".to_string())]
+        );
+    }
+
+    /// Without a uv.lock, poetry.lock is the project's tool lock: it hides
+    /// requirements.txt (the base's poetry → requirements ordering) while a
+    /// script lock still UNIONS with it — the standalone lock supplements
+    /// whichever tool lock the project has, never just uv.lock.
+    #[tokio::test]
+    async fn poetry_lock_unions_with_script_lock_and_hides_requirements() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            tmp.path().join("poetry.lock"),
+            "[[package]]\nname = \"requests\"\nversion = \"2.31.0\"\n\n[metadata]\nlock-version = \"2.0\"\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            tmp.path().join("tool.py.lock"),
+            uv_style_lock("flask", "3.0.0"),
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(tmp.path().join("requirements.txt"), "click==8.1.7\n")
+            .await
+            .unwrap();
+        let entries = inventory_pypi_locks(tmp.path()).await.unwrap();
+        assert_eq!(
+            names(&entries),
+            vec![
+                ("flask".to_string(), "3.0.0".to_string()),
+                ("requests".to_string(), "2.31.0".to_string()),
+            ]
+        );
+    }
+
+    /// Exclusivity is keyed on a uv.lock that PARSES, not on the file's
+    /// presence: garbage TOML contributes nothing and must not hide the
+    /// requirements.txt pins behind it (hosted skips the same file with
+    /// `redirect_uv_lock_unsupported`, so the inventories agree).
+    #[tokio::test]
+    async fn unparseable_uv_lock_falls_through_to_requirements() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            tmp.path().join("uv.lock"),
+            "version = 1\n[[package]\nname = \"flask\"\n= broken\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(tmp.path().join("requirements.txt"), "requests==2.31.0\n")
+            .await
+            .unwrap();
+        let entries = inventory_pypi_locks(tmp.path()).await.unwrap();
+        assert_eq!(
+            names(&entries),
+            vec![("requests".to_string(), "2.31.0".to_string())]
+        );
+    }
+
+    /// Ledger recovery must match a purl spelled the project's way
+    /// (`PyYAML`) against the PEP 503 names the inventory records.
+    #[tokio::test]
+    async fn python_document_recovery_canonicalizes_the_purl_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lock = format!(
+            "lock-version = '1.0'\n[[packages]]\nname = 'pyyaml'\nversion = '6.0.1'\narchive = {{ url = 'https://pypi.org/PyYAML-6.0.1-py3-none-any.whl', hashes = {{ sha256 = '{WHEEL_SHA}' }} }}\n"
+        );
+        let entry = crate::vendor::state::VendorEntry {
+            ecosystem: "pypi".into(),
+            base_purl: "pkg:pypi/PyYAML@6.0.1".into(),
+            uuid: "11111111-1111-4111-8111-111111111111".into(),
+            artifact: crate::vendor::state::VendorArtifact {
+                path: ".socket/vendor/pypi/11111111-1111-4111-8111-111111111111/PyYAML-6.0.1-py3-none-any.whl".into(),
+                sha256: String::new(),
+                size: None,
+                platform_locked: None,
+                file_inventory: None,
+            },
+            wiring: vec![crate::vendor::state::WiringRecord {
+                file: "pylock.toml".into(),
+                kind: "python_lock_document".into(),
+                action: crate::vendor::state::WiringAction::Rewritten,
+                key: Some("pyyaml".into()),
+                original: Some(serde_json::Value::String(lock)),
+                new: None,
+            }],
+            lock: None,
+            took_over_go_patches: false,
+            detached: false,
+            record: None,
+            flavor: Some("python-lock".into()),
+            uv: None,
+            pnpm: None,
+            poetry: None,
+            pdm: None,
+            pipenv: None,
+        };
+        let recovered = recover_lock_entry(tmp.path(), &entry).await.unwrap();
+        assert_eq!(
+            recovered.resolved.as_deref(),
+            Some("https://pypi.org/PyYAML-6.0.1-py3-none-any.whl")
+        );
+        assert_eq!(
+            recovered.integrity,
+            LockIntegrity::Sha256Hex(WHEEL_SHA.into())
         );
     }
 }

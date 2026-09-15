@@ -2696,16 +2696,29 @@ fn rewrite_uv_lock(
         complete_python_lock_metadata, is_python_lock_name, rewrite_python_lock, ArtifactSource,
     };
 
-    for (path, original) in files.iter().filter(|(path, _)| is_python_lock_name(path)) {
+    let locks: Vec<(&String, &String)> = files
+        .iter()
+        .filter(|(path, _)| is_python_lock_name(path))
+        .collect();
+    if locks.is_empty() {
+        return;
+    }
+    // Intake gate ONCE per dep, not once per lock file: a project carrying
+    // uv.lock + pylock.toml + a script lock would otherwise repeat the same
+    // missing-integrity warning three times.
+    let mut usable: Vec<(&DepOverride, &str)> = Vec::new();
+    for dep in overrides.iter().filter(|dep| dep.ecosystem == "pypi") {
+        match dep.integrity.sha256.as_deref() {
+            Some(sha256) => usable.push((dep, sha256)),
+            None => result.warnings.push(RewriteWarning {
+                code: "redirect_uv_missing_sha256".into(),
+                detail: format!("{} has no sha256 integrity", dep.name),
+            }),
+        }
+    }
+    for (path, original) in locks {
         let mut content = original.clone();
-        for dep in overrides.iter().filter(|dep| dep.ecosystem == "pypi") {
-            let Some(sha256) = dep.integrity.sha256.as_deref() else {
-                result.warnings.push(RewriteWarning {
-                    code: "redirect_uv_missing_sha256".into(),
-                    detail: format!("{} has no sha256 integrity", dep.name),
-                });
-                continue;
-            };
+        for &(dep, sha256) in &usable {
             let rewritten = match rewrite_python_lock(
                 &content,
                 &dep.name,
@@ -13259,6 +13272,46 @@ packages:
                 "replace github.com/foo/bar v1.4.2 => {}",
                 golang_socket_module()
             )))
+        );
+    }
+}
+
+#[cfg(test)]
+mod python_lock_warning_tests {
+    use super::*;
+
+    #[test]
+    fn missing_sha256_warns_once_across_python_lock_files() {
+        let dep = DepOverride {
+            ecosystem: "pypi".into(),
+            name: "requests".into(),
+            namespace: None,
+            version: "2.28.1".into(),
+            token: "11111111-1111-4111-8111-111111111111".into(),
+            patch_uuid: "22222222-2222-4222-8222-222222222222".into(),
+            artifact_url: "https://patch.socket.dev/requests-2.28.1-py3-none-any.whl".into(),
+            berry_zip_url: None,
+            registry_override: None,
+            integrity: Integrity::default(),
+        };
+        let files = BTreeMap::from([
+            ("uv.lock".to_string(), "version = 1\n".to_string()),
+            (
+                "pylock.toml".to_string(),
+                "lock-version = \"1.0\"\n".to_string(),
+            ),
+            ("tool.py.lock".to_string(), "version = 1\n".to_string()),
+        ]);
+        let result = rewrite_registry_redirect(&files, &[dep]);
+        assert!(result.files.is_empty() && result.edits.is_empty());
+        let codes: Vec<&str> = result.warnings.iter().map(|w| w.code.as_str()).collect();
+        assert_eq!(
+            codes
+                .iter()
+                .filter(|code| **code == "redirect_uv_missing_sha256")
+                .count(),
+            1,
+            "{codes:?}"
         );
     }
 }
