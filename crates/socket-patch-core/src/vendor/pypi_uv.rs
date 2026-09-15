@@ -115,10 +115,15 @@ pub(super) async fn load_uv_project(root: &Path) -> Result<UvProject, (&'static 
         )
     })?;
 
+    // Real-binary behavior behind the wording: <= 0.2.6 cannot parse a
+    // relative path source at all; 0.2.17–0.2.34 install one under --frozen
+    // / plain sync, but `--locked` rejects any non-canonical spelling, plain
+    // sync (0.2.34) and every `uv lock` absolutize it, resolution is
+    // CWD-relative, and 0.2.17/0.2.18 never verify the wheel hash.
     if lock.contains_key("distribution") {
         return Err((
             "pypi_uv_legacy_lock_unsupported",
-            "uv `[[distribution]]` lockfiles (uv < 0.2.35) record absolute file paths; upgrade to uv >=0.2.35 for portable native vendoring, or use a requirements.txt installation".to_string(),
+            "uv `[[distribution]]` lockfiles (uv < 0.2.35, experimental `uv lock`) cannot carry a portable local wheel: `--locked` rejects relative paths and `uv lock`/`uv sync` rewrite them to absolute ones; upgrade to uv >=0.2.35 for native vendoring, or use a requirements.txt installation".to_string(),
         ));
     }
 
@@ -5341,5 +5346,26 @@ six = { path = ".socket/vendor/pypi/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/six-1.1
             assert_eq!(pyproject, pyproject_crlf, "{label}: pyproject not restored");
             assert_eq!(lock, lock_crlf, "{label}: lock not restored");
         }
+    }
+
+    /// The `[[distribution]]` refusal names the REAL limitation measured
+    /// against the 0.1.45–0.2.34 binaries (relative path sources are
+    /// rejected by `--locked` and absolutized by `uv lock` / `uv sync`),
+    /// not the old "records absolute file paths" folklore, and points at
+    /// both exits (uv >= 0.2.35, or a requirements.txt install).
+    #[tokio::test]
+    async fn legacy_distribution_lock_refusal_names_the_real_limitation() {
+        let legacy_lock = "version = 1\nrequires-python = \">=3.9\"\n\n[[distribution]]\nname = \"proj\"\nversion = \"0.1.0\"\nsource = { editable = \".\" }\n";
+        let tmp = write_pair(DIRECT_REGISTRY_PYPROJECT, legacy_lock).await;
+        let (code, detail) = load_uv_project(tmp.path()).await.unwrap_err();
+        assert_eq!(code, "pypi_uv_legacy_lock_unsupported");
+        assert!(
+            detail.contains("`--locked` rejects relative paths")
+                && detail.contains("rewrite them to absolute ones")
+                && detail.contains("uv >=0.2.35")
+                && detail.contains("requirements.txt"),
+            "{detail}"
+        );
+        assert!(!detail.contains("record absolute"), "{detail}");
     }
 }

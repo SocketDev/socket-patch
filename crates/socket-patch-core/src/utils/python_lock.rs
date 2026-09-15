@@ -610,7 +610,7 @@ pub fn rewrite_python_lock(
             // for local artifacts (uv 0.2.34 writes `source = { path = "/abs/…" }`
             // and `wheels = [{ url = "file:///abs/…" }]`), so a committed
             // relative wheel cannot be expressed portably before 0.2.35.
-            return Err("uv `[[distribution]]` lockfiles (uv < 0.2.35) record absolute file paths; portable vendoring needs uv >=0.2.35".to_string());
+            return Err("uv `[[distribution]]` lockfiles (uv < 0.2.35, experimental `uv lock`) cannot carry a portable local wheel: `--locked` rejects relative paths and `uv lock`/`uv sync` rewrite them to absolute ones; upgrade to uv >=0.2.35 for native vendoring, or use a requirements.txt installation".to_string());
         } else if legacy_strings {
             Item::Value(Value::from(format!("direct+{location}")))
         } else {
