@@ -15,21 +15,52 @@ import platform
 import sys
 import urllib.request
 
+# Every 0.x release family, first and latest release of each, plus the
+# releases on either side of each behaviour boundary observed with real
+# binaries (the lower one is the last release WITHOUT the feature):
+#   0.1.23 / 0.1.24  `uv pip sync` accepts bare `./wheel` requirement paths
+#   0.2.34 / 0.2.35  uv.lock `[[distribution]]` -> `[[package]]` grammar
+#   0.4.0  / 0.4.1   `uv export`
+#   0.5.16 / 0.5.17  `uv lock --script`
+#   0.6.14 / 0.6.15  PEP 751 `pip compile -o pylock.toml`; lock revision 1 -> 2
+#   0.8.3  / 0.8.4   lock revision 2 -> 3
 VERSIONS = [
     '0.0.5',
+    '0.1.0',
+    '0.1.23',
+    '0.1.24',
     '0.1.45',
+    '0.2.0',
+    '0.2.34',
+    '0.2.35',
     '0.2.37',
+    '0.3.0',
     '0.3.5',
+    '0.4.0',
+    '0.4.1',
     '0.4.30',
+    '0.5.0',
+    '0.5.16',
+    '0.5.17',
     '0.5.31',
     '0.6.0',
+    '0.6.14',
+    '0.6.15',
     '0.6.17',
+    '0.7.0',
     '0.7.22',
+    '0.8.0',
+    '0.8.3',
+    '0.8.4',
     '0.8.24',
+    '0.9.0',
     '0.9.30',
+    '0.10.0',
     '0.10.12',
+    '0.11.0',
     '0.11.33',
-    '0.12.13',
+    '0.12.0',
+    '0.12.15',
 ]
 parser = argparse.ArgumentParser()
 parser.add_argument('--socket-patch', type=Path, required=True)
@@ -40,7 +71,7 @@ parser.add_argument('--versions', nargs='+', default=VERSIONS)
 args = parser.parse_args()
 ROOT = args.output.resolve()
 CLI = args.socket_patch.resolve()
-BOOTSTRAP = ROOT / 'bin/0.12.13/uv'
+BOOTSTRAP = ROOT / 'bin/0.12.15/uv'
 WHEEL = ROOT / 'urllib3-1.26.18-py2.py3-none-any.whl'
 ENV = {
     key: value
@@ -78,7 +109,7 @@ def install_binaries():
         raise ValueError('This backtest requires macOS or Linux')
     registry = fetch_json('https://pypi.org/pypi/uv/json')
     records = []
-    for version in dict.fromkeys([*args.versions, '0.12.13']):
+    for version in dict.fromkeys([*args.versions, '0.12.15']):
         file = next(
             file
             for file in registry['releases'][version]
@@ -362,7 +393,19 @@ def requirements_matrix(version):
             sync['installedResponseSha256'] = hashlib.sha256(
                 target.read_bytes()
             ).hexdigest()
-    if version == '0.2.37':
+    # Older uv binaries (0.2.x, 0.3.0) cannot build the ROOT fixture from an
+    # empty cache under --offline: `setuptools>=40.8.0` is a build dependency
+    # of the fixture itself, not of the patched wheel. Distinguish that from a
+    # failure to install the patched wheel by retrying the frozen install with
+    # network access and recording it as its own row.
+    backtest = json.loads((base / 'backtest.json').read_text())['commands']
+    offline_root_build_failure = any(
+        row['key'] == 'project-vendored-lock-sync'
+        and row['exitCode'] != 0
+        and 'setuptools' in row['stderr']
+        for row in backtest
+    )
+    if offline_root_build_failure:
         case = base / 'project-vendored'
         sync = run(
             exe,

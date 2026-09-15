@@ -290,7 +290,10 @@ pub(super) async fn wire_python_locks(
                         }
                     }
                 }
-                rewritten = document.to_string();
+                rewritten = crate::utils::python_lock::preserve_line_endings(
+                    &file.text,
+                    document.to_string(),
+                );
             }
         }
         if rewritten != file.text {
@@ -498,7 +501,7 @@ fn restore_document(live: &str, original: &str, new: &str) -> Result<(String, bo
         if drifted {
             current_text
         } else {
-            live.to_string()
+            crate::utils::python_lock::preserve_line_endings(&current_text, live.to_string())
         },
         drifted,
     ))

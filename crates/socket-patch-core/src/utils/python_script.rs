@@ -91,10 +91,44 @@ fn same_hosted_artifact(previous: &str, current: &str) -> bool {
         && uuid::Uuid::parse_str(current_path[grant_index + 1]).is_ok()
 }
 
-fn dotted_table() -> Item {
-    let mut table = Table::new();
-    table.set_dotted(true);
-    Item::Table(table)
+/// How a freshly created `[tool.uv.sources]` is laid out.
+///
+/// A PEP 723 script block is reverted by DOCUMENT restore
+/// (`vendor::pypi_lock::restore_document`), which can only converge on the
+/// exact pre-vendor bytes after an out-of-order multi-package revert when
+/// the tables we created vanish once empty. Only DOTTED keys do that after a
+/// parse round trip (dotted-ness is syntax; `implicit` is not), so the script
+/// block keeps `tool.uv.sources.x = { … }` right after `dependencies`, where
+/// placement was never a problem.
+///
+/// A `pyproject.toml` is reverted by exact text replay of the recorded
+/// original, so it can use uv's own layout: header-less `[tool]` / `[tool.uv]`
+/// parents and a real `[tool.uv.sources]` table AFTER `[project]`. (Dotted
+/// keys rendered as `tool.uv.sources.x = …` in the ROOT body — i.e. ABOVE
+/// `[project]` — whenever the pyproject had no `[tool]` header yet.)
+#[derive(Clone, Copy)]
+enum SourcesLayout {
+    Dotted,
+    Tables,
+}
+
+impl SourcesLayout {
+    fn parent(self) -> Item {
+        let mut table = Table::new();
+        match self {
+            Self::Dotted => table.set_dotted(true),
+            Self::Tables => table.set_implicit(true),
+        }
+        Item::Table(table)
+    }
+
+    fn leaf(self) -> Item {
+        let mut table = Table::new();
+        if matches!(self, Self::Dotted) {
+            table.set_dotted(true);
+        }
+        Item::Table(table)
+    }
 }
 
 fn rewrite_sources(
@@ -103,21 +137,22 @@ fn rewrite_sources(
     version: &str,
     artifact: ArtifactSource<'_>,
     direct: bool,
+    layout: SourcesLayout,
 ) -> Result<(), String> {
     let (key, location) = match artifact {
         ArtifactSource::Url(location) => ("url", location),
         ArtifactSource::Path(location) => ("path", location),
     };
-    let tool = document.entry("tool").or_insert(dotted_table());
+    let tool = document.entry("tool").or_insert(layout.parent());
     let uv = tool
         .as_table_like_mut()
         .ok_or("Python tool metadata must be a table")?
         .entry("uv")
-        .or_insert(dotted_table());
+        .or_insert(layout.parent());
     let uv = uv
         .as_table_like_mut()
         .ok_or("Python tool.uv metadata must be a table")?;
-    let sources = uv.entry("sources").or_insert(dotted_table());
+    let sources = uv.entry("sources").or_insert(layout.leaf());
     let sources = sources
         .as_table_like_mut()
         .ok_or("Python tool.uv.sources must be a table")?;
@@ -226,8 +261,15 @@ pub fn rewrite_project_metadata(
             "hosted sources for uv workspaces require a package-scoped source mapping".to_string(),
         );
     }
-    rewrite_sources(&mut document, &name, version, artifact, direct)?;
-    let output = document.to_string();
+    rewrite_sources(
+        &mut document,
+        &name,
+        version,
+        artifact,
+        direct,
+        SourcesLayout::Tables,
+    )?;
+    let output = crate::utils::python_lock::preserve_line_endings(text, document.to_string());
     Ok((output != text).then_some(output))
 }
 
@@ -250,7 +292,14 @@ pub fn rewrite_script_metadata(
                 .filter_map(Value::as_str)
                 .any(|spec| dependency_name(spec) == name)
         });
-    rewrite_sources(&mut document, &name, version, artifact, direct)?;
+    rewrite_sources(
+        &mut document,
+        &name,
+        version,
+        artifact,
+        direct,
+        SourcesLayout::Dotted,
+    )?;
     let output = replace_script_metadata(text, &document.to_string())?;
     Ok((output != text).then_some(output))
 }
@@ -342,6 +391,85 @@ mod tests {
         assert_eq!(
             document["tool"]["uv"]["override-dependencies"][0].as_str(),
             Some("urllib3==1.26.18")
+        );
+    }
+}
+
+#[cfg(test)]
+mod rendering_tests {
+    use super::*;
+
+    const URL: &str = "https://patch.socket.dev/alpha-1.0.0-py3-none-any.whl";
+
+    /// Byte-level shape of a pyproject edit: uv's own layout — a
+    /// `[tool.uv.sources]` header AFTER `[project]`, never dotted keys at the
+    /// top of the file; a transitive dep adds `[tool.uv]` with its override.
+    #[test]
+    fn project_sources_render_as_uv_style_headers_after_project() {
+        let direct = rewrite_project_metadata(
+            "[project]\nname = \"p\"\nversion = \"0.1.0\"\ndependencies = [\"alpha==1.0.0\"]\n",
+            "alpha",
+            "1.0.0",
+            ArtifactSource::Url(URL),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            direct,
+            format!("[project]\nname = \"p\"\nversion = \"0.1.0\"\ndependencies = [\"alpha==1.0.0\"]\n\n[tool.uv.sources]\nalpha = {{ url = \"{URL}\" }}\n")
+        );
+        let transitive = rewrite_project_metadata(
+            "[project]\nname = \"p\"\ndependencies = [\"requests\"]\n",
+            "alpha",
+            "1.0.0",
+            ArtifactSource::Url(URL),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            transitive,
+            format!("[project]\nname = \"p\"\ndependencies = [\"requests\"]\n\n[tool.uv]\noverride-dependencies = [\"alpha==1.0.0\"]\n\n[tool.uv.sources]\nalpha = {{ url = \"{URL}\" }}\n")
+        );
+        // An existing `[tool.uv]` header gains the sources as its own
+        // sub-table; a CRLF pyproject stays CRLF.
+        let existing = rewrite_project_metadata(
+            "[project]\r\nname = \"p\"\r\ndependencies = [\"alpha==1.0.0\"]\r\n\r\n[tool.uv]\r\ndev-dependencies = [\"pytest\"]\r\n",
+            "alpha",
+            "1.0.0",
+            ArtifactSource::Url(URL),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            existing,
+            format!("[project]\r\nname = \"p\"\r\ndependencies = [\"alpha==1.0.0\"]\r\n\r\n[tool.uv]\r\ndev-dependencies = [\"pytest\"]\r\n\r\n[tool.uv.sources]\r\nalpha = {{ url = \"{URL}\" }}\r\n")
+        );
+        // An existing `[tool.uv.sources]` header is reused as-is.
+        let header = rewrite_project_metadata(
+            "[project]\nname = \"p\"\ndependencies = [\"alpha==1.0.0\", \"beta\"]\n\n[tool.uv.sources]\nbeta = { git = \"https://example.test/beta\" }\n",
+            "alpha",
+            "1.0.0",
+            ArtifactSource::Url(URL),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            header,
+            format!("[project]\nname = \"p\"\ndependencies = [\"alpha==1.0.0\", \"beta\"]\n\n[tool.uv.sources]\nbeta = {{ git = \"https://example.test/beta\" }}\nalpha = {{ url = \"{URL}\" }}\n")
+        );
+    }
+
+    /// The PEP 723 block keeps the fully dotted shape so that document
+    /// restore can drop it without a trace once every source is reverted.
+    #[test]
+    fn script_sources_stay_dotted_inside_the_metadata_block() {
+        let script = "# /// script\n# dependencies = [\"alpha==1.0.0\"]\n# ///\nprint('x')\n";
+        let out = rewrite_script_metadata(script, "alpha", "1.0.0", ArtifactSource::Url(URL))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            out,
+            format!("# /// script\n# dependencies = [\"alpha==1.0.0\"]\n# tool.uv.sources.alpha = {{ url = \"{URL}\" }}\n# ///\nprint('x')\n")
         );
     }
 }

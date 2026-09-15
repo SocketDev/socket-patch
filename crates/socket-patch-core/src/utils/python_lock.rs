@@ -36,19 +36,59 @@ pub fn is_python_lock_name(name: &str) -> bool {
 pub fn python_lock_paths(root: &Path) -> std::io::Result<Vec<String>> {
     let mut paths = Vec::new();
     for entry in std::fs::read_dir(root)? {
-        let entry = entry?;
-        if !entry.file_type()?.is_file() {
+        // One unreadable directory entry must not hide every other lock:
+        // the callers treat an `Err` as "no Python locks here", which would
+        // silently drop the whole project from inventory, repair, and the
+        // hosted candidate list.
+        let Ok(entry) = entry else {
             continue;
-        }
+        };
         let Some(name) = entry.file_name().to_str().map(str::to_string) else {
             continue;
         };
-        if is_python_lock_name(&name) {
-            paths.push(name);
+        if !is_python_lock_name(&name) {
+            continue;
         }
+        // `DirEntry::file_type` does NOT follow symlinks, so a lock that is a
+        // symlink (a shared pylock, a checked-in link) was never discovered
+        // even though every reader opens it fine. `fs::metadata` follows the
+        // link; a link to a directory or FIFO is still excluded by `is_file`.
+        if !std::fs::metadata(entry.path())
+            .map(|metadata| metadata.is_file())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        paths.push(name);
     }
     paths.sort();
     Ok(paths)
+}
+
+/// Re-apply the input's CRLF convention to a toml_edit rendering.
+///
+/// toml_edit (0.25.x) re-emits every newline as `\n`: a CRLF document comes
+/// back entirely LF even when nothing was edited, so a rewritten lock or
+/// pyproject would churn on every line under git and a byte-exact revert
+/// could never converge. When the input used CRLF exclusively, convert the
+/// rendering back; mixed-ending files are left as rendered rather than
+/// half-converted.
+pub fn preserve_line_endings(original: &str, rendered: String) -> String {
+    let uses_crlf = original.contains("\r\n");
+    let has_bare_lf = original.replace("\r\n", "").contains('\n');
+    if !uses_crlf || has_bare_lf {
+        return rendered;
+    }
+    let mut output = String::with_capacity(rendered.len() + rendered.matches('\n').count());
+    let mut previous = '\0';
+    for character in rendered.chars() {
+        if character == '\n' && previous != '\r' {
+            output.push('\r');
+        }
+        output.push(character);
+        previous = character;
+    }
+    output
 }
 
 fn inline(entries: &[(&str, Value)]) -> Value {
@@ -405,7 +445,7 @@ pub fn complete_python_lock_metadata(
             }
         }
     }
-    Ok(document.to_string())
+    Ok(preserve_line_endings(text, document.to_string()))
 }
 
 pub fn rewrite_python_lock(
@@ -561,7 +601,7 @@ pub fn rewrite_python_lock(
     if !pep751 && !legacy {
         rewrite_manifest(&mut document, &name, artifact);
     }
-    Ok(Some(document.to_string()))
+    Ok(Some(preserve_line_endings(text, document.to_string())))
 }
 
 #[cfg(test)]
@@ -854,5 +894,79 @@ wheels = [{url = "https://pypi.org/urllib3.whl", hashes = {sha256 = "old"}}]
         for name in ["poetry.lock", "script.py", "uv.lock.bak", "pylock.toml.bak"] {
             assert!(!is_python_lock_name(name));
         }
+    }
+}
+
+#[cfg(test)]
+mod discovery_and_line_ending_tests {
+    use super::*;
+
+    #[test]
+    fn crlf_locks_keep_their_line_endings_through_a_rewrite() {
+        let lock = "lock-version = \"1.0\"\r\ncreated-by = \"uv\"\r\n\r\n[[packages]]\r\nname = \"requests\"\r\nversion = \"2.28.1\"\r\nwheels = [{ name = \"requests-2.28.1-py3-none-any.whl\", url = \"https://pypi.org/requests-2.28.1-py3-none-any.whl\", hashes = { sha256 = \"old\" } }]\r\n";
+        let url = "https://patch.socket.dev/requests-2.28.1-py3-none-any.whl";
+        let out = rewrite_python_lock(
+            lock,
+            "requests",
+            "2.28.1",
+            ArtifactSource::Url(url),
+            &"a".repeat(64),
+        )
+        .unwrap()
+        .expect("rewritten");
+        assert!(out.contains(url) && !out.contains("pypi.org"), "{out}");
+        assert!(!out.contains("\r\r"), "{out:?}");
+        assert_eq!(
+            out.matches("\r\n").count(),
+            out.matches('\n').count(),
+            "every newline must stay CRLF: {out:?}"
+        );
+        // Re-running over the CRLF output is byte-stable.
+        assert_eq!(
+            rewrite_python_lock(
+                &out,
+                "requests",
+                "2.28.1",
+                ArtifactSource::Url(url),
+                &"a".repeat(64)
+            )
+            .unwrap()
+            .as_deref(),
+            Some(out.as_str())
+        );
+    }
+
+    #[test]
+    fn line_endings_are_restored_only_for_pure_crlf_inputs() {
+        assert_eq!(
+            preserve_line_endings("a\r\nb\r\n", "a\nb\n".into()),
+            "a\r\nb\r\n"
+        );
+        assert_eq!(
+            preserve_line_endings("a\r\nb\nc", "a\nb\nc".into()),
+            "a\nb\nc"
+        );
+        assert_eq!(preserve_line_endings("a\nb\n", "a\nb\n".into()), "a\nb\n");
+        assert_eq!(
+            preserve_line_endings("a\r\n", "a\r\nb\n".into()),
+            "a\r\nb\r\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn python_lock_paths_follow_symlinks_and_skip_non_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("shared.toml"), "lock-version = \"1.0\"\n").unwrap();
+        std::os::unix::fs::symlink(root.join("shared.toml"), root.join("pylock.toml")).unwrap();
+        std::fs::write(root.join("tool.py.lock"), "version = 1\n").unwrap();
+        // A directory that merely carries a lock name, and a dangling link.
+        std::fs::create_dir(root.join("uv.lock")).unwrap();
+        std::os::unix::fs::symlink(root.join("missing"), root.join("pylock.dev.toml")).unwrap();
+        assert_eq!(
+            python_lock_paths(root).unwrap(),
+            vec!["pylock.toml".to_string(), "tool.py.lock".to_string()]
+        );
     }
 }

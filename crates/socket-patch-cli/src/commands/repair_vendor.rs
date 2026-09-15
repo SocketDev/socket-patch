@@ -15,9 +15,9 @@
 //! from the lockfile path itself (the contract's uuid-in-path rule), the
 //! record from the manifest (or the patch API, yielding a detached entry),
 //! and a fresh ledger entry is re-synthesized so sweep/GC/revert know the
-//! artifact again — stamped with the npm lockfile FLAVOR the reference was
-//! found in, so a later `vendor --revert` routes to the backend whose
-//! unwired-revert guard probes the right lockfile. WIRING reconstruction is
+//! artifact again — stamped with the lockfile FLAVOR the reference was
+//! found in (npm family and pypi), so a later `vendor --revert` routes to the
+//! backend whose unwired-revert guard probes the right lockfile. WIRING reconstruction is
 //! per-ecosystem: gem recognizes
 //! its own Gemfile/lock wiring and rebuilds full revert-capable records
 //! ([`socket_patch_core::vendor::gem::reconstruct_gem_wiring`]); the other
@@ -221,7 +221,13 @@ fn synth_entry(eco: &str, uuid: &str, artifact_path: &str, base_purl: &str) -> V
 async fn detect_reference_flavor(project_root: &Path, eco: &str, uuid: &str) -> Option<String> {
     if eco == "pypi" {
         let needle = format!(".socket/vendor/pypi/{uuid}/");
-        for file in socket_patch_core::utils::python_lock::python_lock_paths(project_root).ok()? {
+        let mut files =
+            socket_patch_core::utils::python_lock::python_lock_paths(project_root).ok()?;
+        // uv.lock outranks the standalone locks (the vendor backend's own
+        // precedence): a pylock EXPORTED from the wired project lock must not
+        // relabel the entry `python-lock`. Alphabetical order would.
+        files.sort_by_key(|file| file != "uv.lock");
+        for file in files {
             if tokio::fs::read_to_string(project_root.join(&file))
                 .await
                 .ok()
@@ -1462,13 +1468,26 @@ mod tests {
         let references = scan_vendor_references(tmp.path()).await;
         assert_eq!(
             references,
-            vec![("pypi".to_string(), uuid.to_string(), path)]
+            vec![("pypi".to_string(), uuid.to_string(), path.clone())]
         );
         assert_eq!(
             detect_reference_flavor(tmp.path(), "pypi", uuid)
                 .await
                 .as_deref(),
             Some("python-lock")
+        );
+        // The project lock outranks a pylock exported from it.
+        tokio::fs::write(
+            tmp.path().join("uv.lock"),
+            format!("version = 1\n\n[[package]]\nname = \"requests\"\nversion = \"2.28.1\"\nsource = {{ path = \"{path}\" }}\n"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            detect_reference_flavor(tmp.path(), "pypi", uuid)
+                .await
+                .as_deref(),
+            Some("uv")
         );
     }
 

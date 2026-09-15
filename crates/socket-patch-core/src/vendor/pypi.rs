@@ -873,6 +873,84 @@ pub async fn revert_pypi(entry: &VendorEntry, project_root: &Path, dry_run: bool
 
 /// [`revert_pypi`] with full [`RevertOpts`]: `keep_artifact` skips the
 /// artifact deletion while the per-flavor wiring restore runs unchanged.
+/// Fail-closed twin of [`super::npm_lock::guard_unwired_textual_revert`]
+/// for the Python backends. A ledger entry with NO wiring records cannot
+/// restore any project file — that is the shape `socket-patch repair`
+/// re-synthesizes when state.json is lost (flavor stamped from the lock the
+/// reference was found in, wiring not offline-recoverable). Routing such an
+/// entry into a flavor revert that iterates zero records "succeeds", after
+/// which the caller deletes the uuid dir and drops the entry while uv.lock,
+/// the pylock, the script, or requirements.txt still resolve through the
+/// vendored wheel — every later `--frozen` / `--offline` install fails.
+/// Refuse whenever any Python project file still mentions the uuid dir, or
+/// exists but cannot be read to prove it does not. With no reference left
+/// the revert is a plain orphan cleanup and proceeds.
+async fn guard_unwired_pypi_revert(
+    project_root: &Path,
+    uuid: &str,
+    uuid_dir_rel: &str,
+) -> Option<RevertOutcome> {
+    let needle = format!(".socket/vendor/pypi/{uuid}/");
+    let mut names: Vec<String> = [
+        "pyproject.toml",
+        "requirements.txt",
+        "poetry.lock",
+        "pdm.lock",
+        "Pipfile",
+        "Pipfile.lock",
+    ]
+    .iter()
+    .map(|name| (*name).to_string())
+    .collect();
+    if let Ok(locks) = crate::utils::python_lock::python_lock_paths(project_root) {
+        for lock in locks {
+            if let Some(script) = lock.strip_suffix(".lock").filter(|s| s.ends_with(".py")) {
+                names.push(script.to_string());
+            }
+            names.push(lock);
+        }
+    }
+    let mut clause = None;
+    for name in &names {
+        let path = project_root.join(name);
+        if matches!(tokio::fs::try_exists(&path).await, Ok(false)) {
+            continue;
+        }
+        match read_regular_to_string(&path).await {
+            Ok(text) if text.contains(&needle) => {
+                clause = Some(format!("{name} still resolves through it"));
+                break;
+            }
+            Ok(_) => {}
+            // Fail-closed: a file we cannot read may still reference it.
+            Err(_) => {
+                clause = Some(format!(
+                    "{name} exists but could not be read to prove it no longer references it"
+                ));
+                break;
+            }
+        }
+    }
+    let clause = clause?;
+    let detail = format!(
+        "refusing to remove {uuid_dir_rel}: the ledger entry records no pre-vendor wiring to \
+         replay (it was likely reconstructed by `socket-patch repair`; the pre-vendor Python \
+         lock fragments are not offline-recoverable) and {clause} — deleting the artifact \
+         would make every subsequent install fail; run `socket-patch repair` to keep the \
+         vendored artifact healthy, and revert by restoring the pre-vendor files (or by \
+         removing the dependency and re-locking) before re-running `vendor --revert`"
+    );
+    Some(RevertOutcome {
+        success: false,
+        warnings: vec![VendorWarning::new(
+            "vendor_wiring_unknown_revert_blocked",
+            detail.clone(),
+        )],
+        error: Some(detail),
+        kept_artifact: false,
+    })
+}
+
 pub async fn revert_pypi_opts(
     entry: &VendorEntry,
     project_root: &Path,
@@ -882,6 +960,15 @@ pub async fn revert_pypi_opts(
         dry_run,
         keep_artifact,
     } = opts;
+    if entry.wiring.is_empty() {
+        let uuid_dir_rel = vendor_uuid_dir_rel("pypi", &entry.uuid)
+            .unwrap_or_else(|| format!(".socket/vendor/pypi/{:?}", entry.uuid));
+        if let Some(blocked) =
+            guard_unwired_pypi_revert(project_root, &entry.uuid, &uuid_dir_rel).await
+        {
+            return blocked;
+        }
+    }
     let mut outcome = match entry.flavor.as_deref() {
         Some("uv") => revert_uv(entry, project_root, dry_run).await,
         Some("python-lock") => {
@@ -2814,6 +2901,122 @@ wheels = [
             pdm: None,
             pipenv: None,
         }
+    }
+
+    /// A ledger entry with NO wiring (the shape `socket-patch repair`
+    /// re-synthesizes when state.json is lost) cannot restore any file.
+    /// Routing it into a flavor revert that iterates zero records used to
+    /// "succeed", after which the caller deleted the uuid dir and dropped
+    /// the entry while the lock still resolved through the vendored wheel.
+    /// Both Python-lock backends must refuse while anything references it.
+    #[tokio::test]
+    async fn unwired_python_entry_revert_refuses_while_lock_references_artifact() {
+        let rel_wheel = format!(".socket/vendor/pypi/{UUID}/six-1.16.0-py2.py3-none-any.whl");
+        let cases: Vec<(&str, Vec<(&str, String)>)> = vec![
+            (
+                "uv",
+                vec![
+                    (
+                        "pyproject.toml",
+                        format!("[project]\nname = \"p\"\ndependencies = [\"six==1.16.0\"]\n\n[tool.uv.sources]\nsix = {{ path = \"{rel_wheel}\" }}\n"),
+                    ),
+                    (
+                        "uv.lock",
+                        format!("version = 1\n\n[[package]]\nname = \"six\"\nversion = \"1.16.0\"\nsource = {{ path = \"{rel_wheel}\" }}\n"),
+                    ),
+                ],
+            ),
+            (
+                "python-lock",
+                vec![(
+                    "pylock.toml",
+                    format!("lock-version = \"1.0\"\n\n[[packages]]\nname = \"six\"\nversion = \"1.16.0\"\narchive = {{ path = \"{rel_wheel}\" }}\n"),
+                )],
+            ),
+            (
+                "python-lock",
+                vec![
+                    ("tool.py.lock", "version = 1\n".to_string()),
+                    (
+                        "tool.py",
+                        format!("# /// script\n# dependencies = [\"six==1.16.0\"]\n# [tool.uv.sources]\n# six = {{ path = \"{rel_wheel}\" }}\n# ///\n"),
+                    ),
+                ],
+            ),
+        ];
+        for (flavor, files) in cases {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path();
+            for (name, text) in &files {
+                tokio::fs::write(root.join(name), text).await.unwrap();
+            }
+            let wheel = root.join(&rel_wheel);
+            tokio::fs::create_dir_all(wheel.parent().unwrap())
+                .await
+                .unwrap();
+            tokio::fs::write(&wheel, b"wheel bytes").await.unwrap();
+            let entry = revert_entry(flavor, &rel_wheel, Vec::new());
+            for dry_run in [true, false] {
+                let outcome = revert_pypi(&entry, root, dry_run).await;
+                assert!(
+                    !outcome.success,
+                    "{flavor} dry_run={dry_run}: unwired revert must refuse: {outcome:?}"
+                );
+                assert_eq!(
+                    outcome.warnings.len(),
+                    1,
+                    "{flavor}: {:?}",
+                    outcome.warnings
+                );
+                assert_eq!(
+                    outcome.warnings[0].code,
+                    "vendor_wiring_unknown_revert_blocked"
+                );
+                assert!(!outcome.kept_artifact);
+            }
+            assert!(
+                wheel.is_file(),
+                "{flavor}: the referenced artifact must survive"
+            );
+            for (name, text) in &files {
+                assert_eq!(
+                    &tokio::fs::read_to_string(root.join(name)).await.unwrap(),
+                    text,
+                    "{flavor}: {name} must be untouched"
+                );
+            }
+        }
+    }
+
+    /// Nothing references the artifact any more (the user re-locked by
+    /// hand): an unwired entry's revert is a plain orphan cleanup and may
+    /// proceed — the guard is about live references, not about wiring.
+    #[tokio::test]
+    async fn unwired_python_entry_revert_proceeds_when_nothing_references_artifact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        tokio::fs::write(
+            root.join("pyproject.toml"),
+            "[project]\nname = \"p\"\ndependencies = [\"six==1.16.0\"]\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            root.join("uv.lock"),
+            "version = 1\n\n[[package]]\nname = \"six\"\nversion = \"1.16.0\"\nsource = { registry = \"https://pypi.org/simple\" }\n",
+        )
+        .await
+        .unwrap();
+        let rel_wheel = format!(".socket/vendor/pypi/{UUID}/six-1.16.0-py2.py3-none-any.whl");
+        let wheel = root.join(&rel_wheel);
+        tokio::fs::create_dir_all(wheel.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&wheel, b"wheel bytes").await.unwrap();
+        let entry = revert_entry("uv", &rel_wheel, Vec::new());
+        let outcome = revert_pypi(&entry, root, false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(!wheel.exists(), "the orphaned artifact dir is removed");
     }
 
     const PIPENV_REGISTRY_LOCK: &str = r#"{
