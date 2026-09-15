@@ -1035,6 +1035,15 @@ fn rewrite_root_metadata_entries(
     })?;
     let unit_start = unit_span.start;
     let unit_text = &lock_text[unit_span];
+    // uv 0.2.35 and 0.2.36 — the first `[[package]]`-grammar releases — wrote
+    // no `[package.metadata]` at all (it arrived in 0.2.37). There is no
+    // requires-dist entry to repoint and nothing for `--locked` to compare;
+    // the package unit's source plus the pyproject `[tool.uv.sources]` entry
+    // carry the redirect alone. A lock that HAS metadata but lacks the entry
+    // is a stale lock and still refuses below.
+    if !unit_text.contains("[package.metadata]") {
+        return Ok(Vec::new());
+    }
     let needle = format!("name = \"{canon}\"");
     let mut edits: Vec<RequiresDistEdit> = Vec::new();
 
@@ -2407,6 +2416,24 @@ wheels = [
     }
 
     // ── path-source [package.metadata] reconstruction ──────────────────
+
+    /// uv 0.2.35/0.2.36 locks have a root `[[package]]` but no
+    /// `[package.metadata]`: the metadata step is a no-op rather than a
+    /// refusal. A lock that carries metadata without the entry still refuses.
+    #[test]
+    fn root_metadata_rewrite_is_a_noop_for_locks_without_package_metadata() {
+        let without = "version = 1\nrequires-python = \">=3.9\"\n\n[[package]]\nname = \"fixture\"\nversion = \"0.1.0\"\nsource = { editable = \".\" }\ndependencies = [\n    { name = \"six\" },\n]\n\n[[package]]\nname = \"six\"\nversion = \"1.16.0\"\nsource = { registry = \"https://pypi.org/simple\" }\nwheels = [\n    { url = \"https://files.pythonhosted.org/six-1.16.0-py2.py3-none-any.whl\", hash = \"sha256:old\" },\n]\n";
+        let edits = rewrite_root_metadata_entries(without, "six", REL_WHEEL).unwrap();
+        assert!(edits.is_empty());
+        let stale = without.replace(
+            "dependencies = [\n    { name = \"six\" },\n]\n",
+            "dependencies = [\n    { name = \"six\" },\n]\n\n[package.metadata]\nrequires-dist = [{ name = \"other\", specifier = \"==1\" }]\n",
+        );
+        let err = rewrite_root_metadata_entries(&stale, "six", REL_WHEEL)
+            .err()
+            .expect("metadata without the entry must refuse");
+        assert_eq!(err.0, "pypi_uv_lock_package_missing");
+    }
 
     #[test]
     fn parse_requires_dist_pulls_apart_name_extras_specifier_marker() {

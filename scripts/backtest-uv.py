@@ -25,6 +25,7 @@ import urllib.request
 #   0.2.17 / 0.2.18  `[[distribution]]` sources: `"registry+…"` strings ->
 #                    inline tables (`{ registry = … }`)
 #   0.2.34 / 0.2.35  uv.lock `[[distribution]]` -> `[[package]]` grammar
+#   0.2.36 / 0.2.37  root `[package.metadata]` (requires-dist) appears
 #   0.4.0  / 0.4.1   `uv export`
 #   0.5.16 / 0.5.17  `uv lock --script`
 #   0.6.14 / 0.6.15  PEP 751 `pip compile -o pylock.toml`; lock revision 1 -> 2
@@ -42,6 +43,7 @@ VERSIONS = [
     '0.2.18',
     '0.2.34',
     '0.2.35',
+    '0.2.36',
     '0.2.37',
     '0.3.0',
     '0.3.5',
