@@ -3,11 +3,14 @@
 For every requested uv release this downloads the PyPI wheel for the current
 platform (hash-verified), extracts the `uv` binary, and records:
 
-- whether `uv lock` exists and which native lock grammar it writes
-  (`[[distribution]]` vs `[[package]]`), whether sources are strings or
-  inline tables, whether artifacts are sub-tables or inline values, plus the
-  lock `revision`;
-- whether `uv export` and `uv lock --script` exist;
+- whether the `uv lock` subcommand exists (`lockCommand`; it appears in
+  0.1.42 but panics "not yet implemented" through 0.1.44) and whether it
+  actually writes a lock (`lock`; first true at 0.1.45), which native lock
+  grammar it writes (`[[distribution]]` vs `[[package]]`), whether sources
+  are strings or inline tables, whether artifacts are sub-tables or inline
+  values, plus the lock `revision`;
+- whether `uv export` (0.4.1), its `--output-file` flag (0.4.7; the backtest
+  reads stdout below that) and `uv lock --script` (0.5.17) exist;
 - whether `uv pip compile --output-file pylock.toml` writes PEP 751;
 - whether `uv pip sync` accepts a bare `./wheel --hash=…` requirement line
   (the shape vendored requirements use).
@@ -114,6 +117,19 @@ def run(exe, arguments, cwd):
     return process.returncode, process.stdout, process.stderr
 
 
+def diagnostic_line(stderr):
+    """The line that names the failure: a panic location or `error:` line if
+    present (a panic's LAST line is only the RUST_BACKTRACE hint), else the
+    last non-empty line."""
+    lines = [line for line in stderr.strip().splitlines() if line.strip()]
+    if not lines:
+        return ''
+    for line in lines:
+        if 'panicked at' in line or line.startswith('error'):
+            return line[:160]
+    return lines[-1][:160]
+
+
 def probe(version):
     exe = binary(version)
     with tempfile.TemporaryDirectory() as raw:
@@ -122,8 +138,12 @@ def probe(version):
             '[project]\nname = "probe"\nversion = "0.1.0"\n'
             'requires-python = ">=3.9"\ndependencies = ["urllib3==1.26.18"]\n'
         )
-        lock_rc, _, _ = run(exe, ['lock', '--python', args.python], cwd)
+        lock_rc, _, lock_err = run(exe, ['lock', '--python', args.python], cwd)
         lock = (cwd / 'uv.lock').read_text() if (cwd / 'uv.lock').exists() else ''
+        # clap reports a missing subcommand as exit 2 "unrecognized subcommand";
+        # 0.1.42–0.1.44 accept `lock` and then panic (exit 101), so the
+        # subcommand's existence and a written lock are separate facts.
+        lock_command = 'unrecognized subcommand' not in lock_err
         if '[[distribution]]' in lock:
             schema = 'distribution'
         elif '[[package]]' in lock:
@@ -153,6 +173,7 @@ def probe(version):
             artifact_style = 'inline'
         _, help_out, _ = run(exe, ['--help'], cwd)
         _, lock_help, _ = run(exe, ['lock', '--help'], cwd)
+        _, export_help, _ = run(exe, ['export', '--help'], cwd)
         (cwd / 'requirements.in').write_text('urllib3==1.26.18\n')
         run(
             exe,
@@ -169,12 +190,15 @@ def probe(version):
         local_ok = venv_rc == 0 and sync_rc == 0
         return {
             'uv': version,
-            'lock': lock_rc == 0,
+            'lockCommand': lock_command,
+            'lock': lock_rc == 0 and bool(lock),
+            'lockError': '' if lock_rc == 0 else diagnostic_line(lock_err),
             'lockSchema': schema,
             'lockRevision': int(revision) if revision else None,
             'lockSourceStyle': source_style,
             'lockArtifactStyle': artifact_style,
             'export': 'export' in help_out,
+            'exportOutputFile': '--output-file' in export_help,
             'lockScript': '--script' in lock_help,
             'pep751Compile': 'lock-version = ' in pylock,
             'localWheelRequirements': local_ok,
