@@ -55,6 +55,7 @@ use socket_patch_core::api::client::{get_api_client_with_overrides, ApiClient};
 use socket_patch_core::crawlers::CrawlerOptions;
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
 use socket_patch_core::patch::copy_tree::remove_tree;
+use socket_patch_core::utils::fs::read_regular_to_string;
 use socket_patch_core::utils::purl::{
     normalize_purl, percent_decode_purl_component, strip_purl_qualifiers,
 };
@@ -98,6 +99,8 @@ struct Candidate {
 
 /// Files the vendor backends rewire — the search space for
 /// `.socket/vendor/<eco>/<uuid>/<leaf>` references when the ledger is gone.
+/// The Python locks the root LISTS (`pylock*.toml`, `*.py.lock` + script)
+/// and the requirements `-r` include tree are appended at scan time.
 const WIRING_FILES: &[&str] = &[
     "package-lock.json",
     "npm-shrinkwrap.json",
@@ -143,10 +146,23 @@ pub(crate) async fn scan_vendor_references(project_root: &Path) -> Vec<(String, 
             files.push(path);
         }
     }
+    // The requirements planner writes a vendored pin where the original pin
+    // was — possibly inside a `-r` include — so the root requirements.txt
+    // alone would miss it (and the orphan sweep, which reuses this scan,
+    // would delete the include-referenced wheel). An unreadable include
+    // tree degrades to the root file, matching the per-file tolerance
+    // below.
+    if let Ok(includes) =
+        socket_patch_core::vendor::requirements_include_names(project_root).await
+    {
+        files.extend(includes);
+    }
     files.sort();
     files.dedup();
     for file in files {
-        let Ok(text) = tokio::fs::read_to_string(project_root.join(file)).await else {
+        // FIFO-safe: a pipe under a wiring-file name must be skipped, not
+        // waited on forever in open(2).
+        let Ok(text) = read_regular_to_string(&project_root.join(file)).await else {
             continue;
         };
         let mut rest = text.as_str();
@@ -228,7 +244,7 @@ async fn detect_reference_flavor(project_root: &Path, eco: &str, uuid: &str) -> 
         // relabel the entry `python-lock`. Alphabetical order would.
         files.sort_by_key(|file| file != "uv.lock");
         for file in files {
-            if tokio::fs::read_to_string(project_root.join(&file))
+            if read_regular_to_string(&project_root.join(&file))
                 .await
                 .ok()
                 .is_some_and(|text| text.contains(&needle))
@@ -250,7 +266,7 @@ async fn detect_reference_flavor(project_root: &Path, eco: &str, uuid: &str) -> 
     }
     let needle = format!(".socket/vendor/npm/{uuid}/");
     let read = |name: &'static str| async move {
-        tokio::fs::read_to_string(project_root.join(name))
+        read_regular_to_string(&project_root.join(name))
             .await
             .ok()
     };
@@ -1451,6 +1467,96 @@ fn npm_coords(base_purl: &str) -> Option<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A FIFO under a wiring-file name (here the paired `<script>.py` of a
+    /// `*.py.lock`, which the lister cannot filter because it derives the
+    /// script name without stat'ing it) used to wedge `repair` forever: a
+    /// plain `read_to_string` blocks in open(2) waiting for a writer. Every
+    /// reference read must go through the FIFO-safe reader and skip it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn repair_returns_with_fifo_script() {
+        use std::time::Duration;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let uuid = "11111111-1111-4111-8111-111111111111";
+        let path = format!(".socket/vendor/pypi/{uuid}/requests-2.28.1-py3-none-any.whl");
+        tokio::fs::write(
+            root.join("tool.py.lock"),
+            format!("archive = {{ path = '{path}' }}"),
+        )
+        .await
+        .unwrap();
+        let fifos = ["tool.py", "bun.lock"];
+        for name in fifos {
+            let c = std::ffi::CString::new(root.join(name).to_str().unwrap()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0, "mkfifo {name}");
+        }
+        // Release valve: if a read DID wedge in open(2), connecting a
+        // writer lets the blocking thread finish so the runtime can shut
+        // down and the test fails on the timeout instead of hanging.
+        let release = || {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            for name in fifos {
+                let _ = std::fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(root.join(name));
+            }
+        };
+
+        let scanned =
+            tokio::time::timeout(Duration::from_secs(5), scan_vendor_references(root)).await;
+        release();
+        let refs = scanned.expect("scan_vendor_references must not wedge on a FIFO script");
+        assert_eq!(
+            refs,
+            vec![("pypi".to_string(), uuid.to_string(), path.clone())],
+            "the lock reference is still recovered around the FIFO"
+        );
+
+        let flavor = tokio::time::timeout(
+            Duration::from_secs(5),
+            detect_reference_flavor(root, "npm", uuid),
+        )
+        .await;
+        release();
+        assert_eq!(
+            flavor.expect("detect_reference_flavor must not wedge on a FIFO lock"),
+            None
+        );
+    }
+
+    /// The requirements planner writes vendored pins into `-r` includes,
+    /// so a reference may live ONLY in an include. The scan used to read
+    /// the root requirements.txt alone, leaving such a wheel unrecoverable
+    /// by `repair` and deletable by the orphan sweep.
+    #[tokio::test]
+    async fn scan_recovers_include_hosted_requirements_reference() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let uuid = "11111111-1111-4111-8111-111111111111";
+        let path = format!(".socket/vendor/pypi/{uuid}/six-1.16.0-py2.py3-none-any.whl");
+        tokio::fs::write(root.join("requirements.txt"), "-r requirements/base.txt\n")
+            .await
+            .unwrap();
+        tokio::fs::create_dir(root.join("requirements")).await.unwrap();
+        tokio::fs::write(
+            root.join("requirements/base.txt"),
+            format!(
+                "./{path} --hash=sha256:{}  # socket-patch vendor: six==1.16.0\n",
+                "0".repeat(64)
+            ),
+        )
+        .await
+        .unwrap();
+        let refs = scan_vendor_references(root).await;
+        assert_eq!(
+            refs,
+            vec![("pypi".to_string(), uuid.to_string(), path)],
+            "{refs:?}"
+        );
+    }
 
     #[tokio::test]
     async fn scan_recovers_script_and_pep751_vendor_references() {
