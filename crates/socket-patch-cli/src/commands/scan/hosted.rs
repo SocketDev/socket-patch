@@ -17,12 +17,7 @@ const REDIRECT_CANDIDATE_FILES: &[&str] = &[
     "package-lock.json",
     "npm-shrinkwrap.json",
     "pnpm-lock.yaml",
-    // pnpm-family MARKERS, never rewritten: `shrinkwrap.yaml` is the
-    // pnpm <=2-era lock (npm never emits that filename) and
-    // `node_modules/.modules.yaml` is pnpm's installer state file. The npm
-    // rewriter's no-lockfile diagnostic keys its family wording off their
-    // presence — without them a pnpm 1/2 project gets told "no
-    // package-lock.json present", npm advice that dead-ends.
+    // pnpm <=2 uses the same package identities under the old filename.
     "shrinkwrap.yaml",
     "node_modules/.modules.yaml",
     "yarn.lock",
@@ -170,10 +165,9 @@ fn pnpm_trust_manual_guidance(server: &str) -> String {
 /// option, so headlining it here would hand users a command that errors.
 fn pnpm_trust_legacy_detail(server: &str) -> String {
     format!(
-        "pnpm-lock.yaml was repointed at {server}. This is a legacy \
-         (lockfileVersion 5.x/6.0) lock read by pnpm 7/8, which have no \
-         lockfile trust policy: installs work unchanged on pnpm 7/8 and no \
-         trust step exists or is needed. Do NOT regenerate the lockfile \
+        "The pnpm lockfile was repointed at {server}. This is a legacy \
+         lock read by pnpm 1–8, which have no \
+         lockfile trust policy: no trust step exists or is needed. Do NOT regenerate the lockfile \
          (deleting it, or re-resolving on a newer pnpm): that silently \
          discards the redirect and reinstalls the vulnerable upstream \
          artifact. If the project later moves to pnpm >=9, re-run \
@@ -1482,7 +1476,7 @@ pub(crate) async fn run_redirect_selected(
                 std::path::Path::new(key)
                     .file_name()
                     .and_then(|n| n.to_str())
-                    == Some("pnpm-lock.yaml")
+                    .is_some_and(|name| matches!(name, "pnpm-lock.yaml" | "shrinkwrap.yaml"))
             })
             .map(|(_, content)| content)
             .collect();
@@ -1550,9 +1544,12 @@ pub(crate) async fn run_redirect_selected(
             // users a command that errors. An unparseable version stays on
             // the manual guidance: never claim "no trust step needed" for a
             // lock whose era is unknown.
-            let all_locks_legacy = pnpm_lock_texts
-                .iter()
-                .all(|text| pnpm_lock_version_major(text).is_some_and(|major| major < 9));
+            let all_locks_legacy = pnpm_lock_texts.iter().all(|text| {
+                pnpm_lock_version_major(text).is_some_and(|major| major < 9)
+                    || text
+                        .lines()
+                        .any(|line| line.starts_with("shrinkwrapVersion:"))
+            });
             let detail = if all_locks_legacy {
                 pnpm_trust_legacy_detail(&server)
             } else if !root_lock_v9 || common.no_trust_lockfile_config {
@@ -1611,7 +1608,16 @@ pub(crate) async fn run_redirect_selected(
             };
             pnpm_warnings.push(serde_json::json!({
                 "code": "redirect_pnpm_trust_lockfile",
-                "detail": detail,
+                "detail": format!(
+                    "{}. After a lock-only change, existing node_modules or a warm pnpm store \
+                     can still contain upstream files. For a reliable reinstall, use a clean \
+                     node_modules tree and an empty store with \
+                     `pnpm install --frozen-lockfile --store-dir <new-empty-directory>` \
+                     (pnpm 1–4 accepts the option `--store`). Do not rely on `--force`: some \
+                     versions re-resolve the upstream artifact. Run `socket-patch vex` after \
+                     installation to verify the patched files.",
+                    detail.trim_end_matches('.')
+                ),
             }));
         }
     }
@@ -1643,6 +1649,9 @@ pub(crate) async fn run_redirect_selected(
         .iter()
         .filter(
             |(purl, uuid, artifact_url, index_url, suffixed_version, go_module_path)| {
+                if rewrite.refused_pnpm_uuids.contains(uuid) {
+                    return false;
+                }
                 // Cargo is transactional: the rewriter reports exactly which
                 // patch uuids FULLY landed (manifest pin + lock + registry
                 // block). Substring presence must never confirm a cargo dep —
@@ -2241,8 +2250,7 @@ mod tests {
             !legacy.contains("trustLockfile"),
             "pnpm 7/8 ignore the setting — recommending it is noise: {legacy}"
         );
-        assert!(legacy.contains("pnpm 7/8"), "{legacy}");
-        assert!(legacy.contains("installs work unchanged"), "{legacy}");
+        assert!(legacy.contains("pnpm 1–8"), "{legacy}");
         assert!(legacy.contains("no trust step"), "{legacy}");
         // The vulnerable-reinstall caution survives the split: regenerating
         // the lock still silently discards the redirect.

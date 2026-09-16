@@ -143,27 +143,21 @@ answers 200 with an empty body. Unreachable today — bundler only falls back to
 the Dependency fetcher when the compact index is unavailable — but it would
 resurface as a confusing Marshal error if the compact index ever broke again.
 
-### 2. `pnpm` — pnpm 11 rejects hosted lockfiles by default (CLI UX gap)
+### 2. `pnpm` — trust configuration and cache handling
 
-pnpm 11 added a lockfile supply-chain policy that compares every entry's tarball
-URL against the registry's published metadata. Hosted mode deliberately rewrites
-that URL, so the policy rejects the lockfile:
+The CLI now configures `trustLockfile: true` for root lockfileVersion 9 projects
+unless the project explicitly disables it or the user passes
+`--no-trust-lockfile-config`. This accepts hosted tarball URLs on pnpm >=11;
+it disables registry re-verification for the entire lock while retaining
+per-artifact integrity checks. The historical missing-warning gap is closed.
 
-```
-[ERR_PNPM_TARBALL_URL_MISMATCH] minimist@1.2.2 has a tarball URL
-(https://patch.socket.dev/...) that does not match the registry's published
-metadata (https://registry.npmjs.org/minimist/-/minimist-1.2.2.tgz)
-```
-
-`pnpm install --trust-lockfile` is pnpm's documented opt-out and works (verified:
-the patched artifact installs cleanly). Neither `--trust-policy-exclude` nor
-`--no-verify-store-integrity` helps — this is a distinct check.
-
-**Fix belongs in the CLI**: `scan --mode hosted` should emit a `redirect_pnpm_*`
-warning naming `--trust-lockfile` when it rewrites a `pnpm-lock.yaml`, the way it
-already warns for `redirect_gem_no_checksums_section` and
-`redirect_rush_repo_state_stale`. The suite currently retries with the flag and
-reports the gap loudly.
+An installed tree or warm store can still retain upstream bytes. Use a clean
+install tree and an empty store, then verify with `socket-patch vex`.
+`--force` alone is not a portable recovery. The required
+[pnpm compatibility matrix](pnpm-compatibility.md) tests this distinction,
+integrity rejection, peer instances, and rollback across pnpm majors 1–12.
+The production pnpm test proves installation from the public hosted service;
+it does not test the SBOM backend, dashboard badges, policies, or alert counts.
 
 ### 3. `uv.lock` — the `sdist` entry is rewritten to a wheel URL (CLI, minor)
 

@@ -14,7 +14,7 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
 
 | Ecosystem | agent (`--mode agent`) | vendored (`--mode vendored`) | hosted (`--mode hosted`) |
 |-----------|------------------------|------------------------------|--------------------------|
-| npm (`npm`) — pnpm / yarn / berry / bun | ✅ any install layout; `setup` postinstall hook | ✅ six lockfile flavors: package-lock, yarn classic, yarn berry (node-modules linker; PnP refused), pnpm v9, pnpm legacy v5.4/v6.0 (`pnpm 7/8` — frozen installs are path-bound because those majors absolutize `file:` override specifiers; moved checkouts run one `pnpm install --offline --no-frozen-lockfile`, surfaced as `vendor_pnpm_legacy_absolute_specifier`), bun `bun.lock` (binary `bun.lockb` refused with a `--save-text-lockfile` pointer). Rush monorepos refused (`vendor_rush_unsupported`) — see [Rush notes](#npm-rush-monorepos) | ✅ package-lock / npm-shrinkwrap, pnpm-lock.yaml (pnpm v5.4/v6.0/v9 — every major since pnpm 7), yarn classic, yarn berry, bun — pnpm, berry, and bun carry constraints, see [npm hosted-mode notes](#npm-hosted-mode-notes) |
+| npm (`npm`) — pnpm / yarn / berry / bun | ✅ any install layout; `setup` postinstall hook | ✅ six lockfile flavors: package-lock, yarn classic, yarn berry (node-modules linker; PnP refused), pnpm v9, pnpm legacy v5.4/v6.0 (`pnpm 7/8` — frozen installs are path-bound because those majors absolutize `file:` override specifiers; moved checkouts run one `pnpm install --offline --no-frozen-lockfile`, surfaced as `vendor_pnpm_legacy_absolute_specifier`), bun `bun.lock` (binary `bun.lockb` refused with a `--save-text-lockfile` pointer). Rush monorepos refused (`vendor_rush_unsupported`) — see [Rush notes](#npm-rush-monorepos) | ✅ package-lock / npm-shrinkwrap, pnpm-lock.yaml and legacy shrinkwrap.yaml (pnpm majors 1–12; block and flow resolutions), yarn classic, yarn berry, bun — pnpm, berry, and bun carry constraints, see [npm hosted-mode notes](#npm-hosted-mode-notes) |
 | PyPI (`pypi`) — uv / poetry / pdm / pipenv / pip | ✅ `.pth` startup hook via `setup` | ✅ uv project/script locks, PEP 751 `pylock.toml` / `pylock.<name>.toml`, poetry, pdm, pipenv (lock rewired, but pipenv doesn't hash-check file entries — `vendor_integrity_unverified` warning; the committed wheel bytes are the protection), and requirements.txt. Native uv vendoring requires uv ≥ 0.2; see [uv compatibility](testing/uv-compatibility.md). | ✅ requirements.txt including hash continuations, uv project/script locks, and PEP 751 locks. Version/source ambiguity is refused; see [uv compatibility](testing/uv-compatibility.md). **poetry / pdm / pipenv locks are not rewritten** — use vendored |
 | Cargo (`cargo`) | ✅ in-place + `.cargo-checksum.json` rewrite (shared registry-cache caveat — see [Cargo: shared registry cache](#cargo-shared-registry-cache)) | ✅ `[patch.crates-io]` path entry | ✅ per-patch sparse registry (`[registries.socket-patch-<uuid>]` + Cargo.lock source/checksum) |
 | RubyGems (`gem`) | ✅ Bundler plugin via `setup` — needs bundler ≥ 2.2 (1.x cannot load `plugin ... path:` directives; `setup` refuses below the floor and `setup --check` red-flags a wired 1.x project) | ✅ Gemfile + Gemfile.lock path pair (`Gemfile` spelling only — a `gems.rb` project cannot vendor yet) | ✅ per-dep `source` block — edits `gems.rb` + `gems.locked` when present (bundler prefers them over `Gemfile`; spellings that diverge beyond Socket's own edits fail closed with `redirect_gem_gemfile_spellings_diverge`); the `CHECKSUMS` pin needs bundler ≥ 2.6 (older locks get a `redirect_gem_no_checksums_section` warning); a stale pre-redirect materialization that `bundle install` would reuse instead of refetching is flagged `redirect_gem_stale_install` with a prescriptive remedy (see CLI_CONTRACT.md's "Gem stale-install guard") |
@@ -35,17 +35,25 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
 
 ## npm hosted-mode notes
 
-- **pnpm** — lockfileVersion 5.4 (`pnpm 7`), 6.0 (`pnpm 8`), and 9 (`pnpm >=9`) are all
-  rewritten. Legacy grammars carry per-instance `packages:` keys — v6 embeds resolved
-  peers in the key itself (`/name@1.0.0(peer@2.0.0)`), v5.x is path-style
-  (`/name/1.0.0`, peer-suffixed `/name/1.0.0_peer@2.0.0`) — and the rewrite splices
-  EVERY instance of the dep (each key owns its own `resolution:`), recording one
-  revert-ledger edit per instance; a partial rewrite is never possible. On 9.0 locks
-  the run also configures `trustLockfile: true` in `pnpm-workspace.yaml` (created or
-  merged, ledger-recorded, opt out with `--no-trust-lockfile-config`) so pnpm ≥ 11's
-  lockfile verification accepts the repointed tarballs with no flags and no CI
-  changes; pnpm ≤ 10 ignores the key. Legacy 5.4/6.0 locks skip the trust config —
-  pnpm 7/8 have no such verification.
+- **pnpm** — hosted rewriting supports legacy `shrinkwrap.yaml` (pnpm 1/2),
+  lockfileVersion 5.x (pnpm 3–7), 6.0 (pnpm 8), and 9.0 (pnpm 9–12).
+  Early pnpm 1 locks with shrinkwrapVersion 3 and no positive minor version
+  are refused because those installers discard hosted URLs; the tested
+  pnpm 1 floor is 1.43.1. Upgrade and regenerate that lock, or use agent mode.
+  Block and flow resolutions, scoped names, aliases, nested peer contexts,
+  workspaces, nested Rush locks, and LF/CRLF line endings are handled. Every
+  matching package instance is rewritten; an unsupported instance prevents
+  confirming that dependency across the lockfile set. Rollback preserves the
+  original resolution fragments.
+  For root 9.0 locks, the CLI configures `trustLockfile: true` in
+  `pnpm-workspace.yaml` unless opted out with `--no-trust-lockfile-config` or
+  explicitly disabled by the project. pnpm >=11 needs this for hosted URLs.
+  This skips registry re-verification for the whole lock; tarball integrity
+  remains enforced. pnpm <=10 does not need the setting.
+  **Reinstall after redirecting:** a successful warm-cache install can retain
+  upstream bytes. Use a clean install tree and an empty store; `--force` is not
+  a reliable substitute. Run `socket-patch vex` after installation to verify
+  the patched files. See the [compatibility matrix and workflow](testing/pnpm-compatibility.md).
 - **yarn berry** — the redirect edits the `yarn.lock` entry only (cacheKey `10c0` /
   yarn 4), and `.yarnrc.yml`'s `compressionLevel` must stay 0. The node-modules linker
   is e2e-covered; PnP is untested for hosted — the lock rewrite fires, but PnP's

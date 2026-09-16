@@ -1,0 +1,101 @@
+name: pnpm hosted compatibility
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Compile CLI and pnpm integration test once
+        run: |
+          cargo test --locked -p socket-patch-cli --test e2e_redirect_pnpm_build --no-run --message-format=json > target-build.json
+          python3 - <<'PY'
+          import json, pathlib, shutil
+          dest = pathlib.Path('target/pnpm-e2e')
+          dest.mkdir(parents=True, exist_ok=True)
+          shutil.copy2('target/debug/socket-patch', dest / 'socket-patch')
+          for line in pathlib.Path('target-build.json').read_text().splitlines():
+              item = json.loads(line)
+              if item.get('target', {}).get('name') == 'e2e_redirect_pnpm_build' and item.get('executable'):
+                  shutil.copy2(item['executable'], dest / 'pnpm-e2e')
+          assert (dest / 'pnpm-e2e').is_file()
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: pnpm-e2e
+          path: target/pnpm-e2e/
+          if-no-files-found: error
+          retention-days: 7
+
+  install-proof:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 1.0.0 must explicitly refuse its non-durable shrinkwrap format.
+          - {pnpm: '1.0.0', node: '10.24.1'}
+          - {pnpm: '1.43.1', node: '10.24.1'}
+          - {pnpm: '2.0.0', node: '10.24.1'}
+          - {pnpm: '2.25.7', node: '10.24.1'}
+          - {pnpm: '3.0.0', node: '10.24.1'}
+          - {pnpm: '3.8.1', node: '10.24.1'}
+          - {pnpm: '4.0.0', node: '16.20.2'}
+          - {pnpm: '4.14.4', node: '16.20.2'}
+          - {pnpm: '5.0.0', node: '16.20.2'}
+          - {pnpm: '5.18.11', node: '16.20.2'}
+          - {pnpm: '6.0.0', node: '16.20.2'}
+          - {pnpm: '6.35.1', node: '16.20.2'}
+          - {pnpm: '7.0.0', node: '16.20.2'}
+          - {pnpm: '7.33.7', node: '16.20.2'}
+          - {pnpm: '8.0.0', node: '16.20.2'}
+          - {pnpm: '8.15.9', node: '16.20.2'}
+          - {pnpm: '9.0.0', node: '24.11.1'}
+          - {pnpm: '9.15.9', node: '24.11.1'}
+          - {pnpm: '10.0.0', node: '24.11.1'}
+          - {pnpm: '10.33.0', node: '24.11.1'}
+          - {pnpm: '10.34.5', node: '24.11.1'}
+          - {pnpm: '11.0.0', node: '24.11.1'}
+          - {pnpm: '11.27.0', node: '24.11.1'}
+          - {pnpm: '12.0.0', node: '24.11.1'}
+          - {pnpm: '12.4.2', node: '24.11.1'}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: pnpm-e2e
+          path: bin
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24.11.1'
+      - name: Install the pinned package manager
+        env:
+          PNPM_TEST_VERSION: ${{ matrix.pnpm }}
+        run: |
+          npm install --prefix "$RUNNER_TEMP/pnpm-tool" --no-audit --no-fund "pnpm@$PNPM_TEST_VERSION"
+          echo "SOCKET_PATCH_PNPM_E2E_BIN=$RUNNER_TEMP/pnpm-tool/node_modules/.bin/pnpm" >> "$GITHUB_ENV"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Require installation, verified VEX, rollback and integrity rejection
+        env:
+          SOCKET_PATCH_PNPM_E2E_VERSION: ${{ matrix.pnpm }}
+          SOCKET_PATCH_PNPM_E2E_REQUIRED: '1'
+          SOCKET_NO_CONFIG: '1'
+          SOCKET_NO_UPDATE_CHECK: '1'
+        run: |
+          chmod +x bin/socket-patch bin/pnpm-e2e
+          export SOCKET_PATCH_PNPM_E2E_SOCKET_BIN="$PWD/bin/socket-patch"
+          bin/pnpm-e2e pnpm_pinned_matrix --ignored --nocapture

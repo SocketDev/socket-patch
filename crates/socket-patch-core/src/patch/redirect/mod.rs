@@ -24,6 +24,7 @@ use crate::crawlers::composer_crawler::normalize_version;
 use crate::vendor::yarn_berry_lock::yarnrc_compression_level;
 
 pub mod golang_local;
+mod pnpm;
 mod replay;
 mod requirements;
 mod state;
@@ -170,6 +171,9 @@ pub struct RewriteResult {
     /// presence in rewritten files (a `[registries.…]` config block alone
     /// pins nothing).
     pub confirmed_cargo_uuids: std::collections::BTreeSet<String>,
+    /// An incomplete pnpm rewrite must not be confirmed by finding its URL
+    /// in another instance, a comment, or another lockfile.
+    pub refused_pnpm_uuids: std::collections::BTreeSet<String>,
 }
 
 /// Combined name as it appears in registry coordinates / lock keys.
@@ -256,28 +260,13 @@ fn rewrite_npm_lock(
                 || k == "bun.lockb"
                 || k == "pnpm-lock.yaml"
                 || k.ends_with("/pnpm-lock.yaml")
+                || k == "shrinkwrap.yaml"
+                || k.ends_with("/shrinkwrap.yaml")
         });
         if !sibling_lock_present {
-            // Family selection is marker-aware: `shrinkwrap.yaml` is the
-            // pnpm <=2-era lock (pnpm 3 renamed it to pnpm-lock.yaml; npm
-            // never emits that filename), and `node_modules/.modules.yaml`
-            // is pnpm's installer state file — either one proves the
-            // project is pnpm, where the npm "no package-lock.json"
-            // wording sends users to the wrong package manager. Both are
-            // read-only markers handed in via the CLI's candidate list; no
-            // rewriter edits them. The shrinkwrap check runs first so a
-            // fresh clone (shrinkwrap.yaml committed, node_modules absent)
-            // still names the legacy lock.
-            let warning = if files.contains_key("shrinkwrap.yaml") {
-                RewriteWarning {
-                    code: "redirect_pnpm_legacy_lockfile".into(),
-                    detail: "shrinkwrap.yaml is the pnpm <=2-era lockfile; the \
-                             redirect only rewrites pnpm-lock.yaml — upgrade pnpm \
-                             (>=3) and reinstall so it emits pnpm-lock.yaml, then \
-                             re-run"
-                        .into(),
-                }
-            } else if files.contains_key("node_modules/.modules.yaml") {
+            // Without a lock, the installer-state marker still identifies
+            // pnpm so the diagnostic names the right package manager.
+            let warning = if files.contains_key("node_modules/.modules.yaml") {
                 RewriteWarning {
                     code: "redirect_pnpm_no_lockfile".into(),
                     detail: "pnpm project (node_modules/.modules.yaml present) but \
@@ -1466,79 +1455,24 @@ fn plan_cargo_config(
 
 // ── pnpm-lock.yaml ───────────────────────────────────────────────────────────
 
-/// LOOSE post-splice residual probe for ONE dep over one pnpm lock text: the
-/// lock instance keys of `<fname>@<version>` — in ANY grammar pnpm has
-/// shipped (v9 `name@version`, quoted scoped spellings, v6
-/// `/name@version(peers…)` including NESTED peer parens the splice regex
-/// provably cannot match, v5 `/name/version` with `_` suffixes) and with ANY
-/// suffix spelling, anticipated or not — whose own `resolution:` block does
-/// NOT reference `artifact_url`.
-///
-/// The splice regex is the WRITER and must stay strict (it rebuilds the
-/// resolution byte-surgically). This probe is the AUDITOR: it only answers
-/// "does an instance of this exact name@version remain pointed somewhere
-/// else?", so it is deliberately looser than the writer — an instance key
-/// the writer's grammar cannot even parse still shows up here, and the
-/// caller then refuses the dep instead of shipping a partial rewrite (the
-/// fail-open the original pre-splice `redirect_pnpm_unsupported_lock_key`
-/// refusal guarded against).
-///
-/// Keys are recognized version-exactly: `<fname>@<version>` / v5
-/// `<fname>/<version>` followed by nothing or by a character that cannot
-/// extend a version (so `left-pad@1.3.0` never claims `left-pad@1.3.01`).
-/// v9 `snapshots:` instance keys carry no `resolution:` line and pin
-/// nothing, so a key with no resolution in its block does not count.
+/// Audit every matching package instance after planning edits. A malformed
+/// resolution or unsupported suffix refuses this dependency across all locks;
+/// snapshots and other versions do not participate in resolution.
 fn pnpm_unrewritten_instances(
     content: &str,
     fname: &str,
     version: &str,
     artifact_url: &str,
 ) -> Vec<String> {
-    let at_form = format!("{fname}@{version}");
-    let slash_form = format!("{fname}/{version}");
-    // A character that could extend `version` into a LONGER version string
-    // (semver body chars) — anything else marks a suffix boundary.
-    let extends_version = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+');
-    let mut residual: Vec<String> = Vec::new();
-    let lines: Vec<&str> = content.lines().collect();
-    for (i, line) in lines.iter().enumerate() {
-        // Lock instance keys are 2-space-indented mapping keys: `  <key>:`.
-        let Some(rest) = line.strip_prefix("  ") else {
-            continue;
-        };
-        if rest.starts_with(' ') {
-            continue;
-        }
-        let Some(raw_key) = rest.strip_suffix(':') else {
-            continue;
-        };
-        let unquoted = raw_key.trim_matches(|c| c == '\'' || c == '"');
-        let key = unquoted.strip_prefix('/').unwrap_or(unquoted);
-        let Some(suffix) = key
-            .strip_prefix(&at_form)
-            .or_else(|| key.strip_prefix(&slash_form))
-        else {
-            continue;
-        };
-        if suffix.chars().next().is_some_and(extends_version) {
-            continue;
-        }
-        // The entry's block: the following deeper-indented lines. A
-        // `resolution:` pointing anywhere but the hosted artifact is a
-        // residual; no resolution at all (v9 `snapshots:` keys) pins nothing.
-        for entry_line in &lines[i + 1..] {
-            if !entry_line.trim().is_empty() && !entry_line.starts_with("    ") {
-                break;
-            }
-            if entry_line.trim_start().starts_with("resolution:")
-                && !entry_line.contains(artifact_url)
-            {
-                residual.push(raw_key.to_string());
-                break;
-            }
-        }
-    }
-    residual
+    pnpm::entries(content)
+        .into_iter()
+        .filter_map(|entry| {
+            pnpm::suffix(entry.key, fname, version)?;
+            let rewritten =
+                pnpm::resolution(&entry).is_some_and(|r| r.tarball() == Some(artifact_url));
+            (!rewritten).then(|| entry.key.to_string())
+        })
+        .collect()
 }
 
 fn rewrite_pnpm_lock(
@@ -1553,38 +1487,40 @@ fn rewrite_pnpm_lock(
     // iterates keys sorted, so goldens are stable across every lock in the set.
     let lock_keys: Vec<&String> = files
         .keys()
-        .filter(|k| k.as_str() == "pnpm-lock.yaml" || k.ends_with("/pnpm-lock.yaml"))
+        .filter(|k| {
+            matches!(
+                k.rsplit('/').next(),
+                Some("pnpm-lock.yaml" | "shrinkwrap.yaml")
+            )
+        })
         .collect();
     if npm.is_empty() || lock_keys.is_empty() {
         return;
     }
-    // Work on an editable copy of each lock so a single dep can be rewritten
-    // in whichever locks contain it. A CRLF lock can never match the rewrite
-    // grammar (its pattern anchors on `):\n`, but every CRLF line puts a `\r`
-    // byte before the `\n`), so the miss used to surface per-dep as a
-    // misleading `redirect_pnpm_entry_not_found`. Name the real cause instead
-    // and skip the lock (fail-closed, as before).
-    let mut contents: Vec<(&String, String, bool)> = Vec::new();
-    for k in &lock_keys {
-        let content = files[*k].clone();
-        if content.contains("\r\n") {
+    let mut contents: Vec<(&String, String, bool)> = lock_keys
+        .iter()
+        .map(|k| (*k, files[*k].clone(), false))
+        .collect();
+    for dep in &npm {
+        let fname = full_name(dep);
+        let unsafe_locks: Vec<_> = contents
+            .iter()
+            .filter(|(_, content, _)| {
+                pnpm::unsupported_early_shrinkwrap(content)
+                    && pnpm::entries(content)
+                        .iter()
+                        .any(|e| pnpm::suffix(e.key, &fname, &dep.version).is_some())
+            })
+            .map(|(path, _, _)| path.as_str())
+            .collect();
+        if !unsafe_locks.is_empty() {
+            result.refused_pnpm_uuids.insert(dep.patch_uuid.clone());
             result.warnings.push(RewriteWarning {
-                code: "redirect_pnpm_crlf_unsupported".into(),
-                detail: format!(
-                    "{k} has CRLF (Windows) line endings; the redirect's \
-                     byte-surgical rewrite only supports LF — normalize the \
-                     file to LF line endings and re-run"
-                ),
+                code: "redirect_pnpm_legacy_lockfile_unsupported".into(),
+                detail: format!("{} uses early pnpm 1 shrinkwrapVersion 3 without a supported minor version. Those installers discard hosted tarball URLs; {fname}@{} was left unchanged in every lock. Upgrade to a tested pnpm release (1.43.1 or newer) and regenerate the lock, or use `scan --mode agent` for installed-file patching.", unsafe_locks.join(", "), dep.version),
             });
             continue;
         }
-        contents.push((*k, content, false));
-    }
-    if contents.is_empty() {
-        return;
-    }
-    for dep in &npm {
-        let fname = full_name(dep);
         let Some(sha512) = dep.integrity.sha512.clone() else {
             result.warnings.push(RewriteWarning {
                 code: "redirect_pnpm_missing_sha512".into(),
@@ -1592,34 +1528,8 @@ fn rewrite_pnpm_lock(
             });
             continue;
         };
-        // One `packages:`-section entry per INSTANCE of the dep, across every
-        // lock grammar pnpm has shipped (each carries its own `resolution:`
-        // block — verified against locks emitted by corepack pnpm@7.33.5 and
-        // pnpm@8.15.9, 2026-08-18):
-        //   v9:   `<fn>@<ver>:` — single-quoted when the name starts with `@`
-        //         (YAML forbids a plain scalar starting with `@`); resolved
-        //         peers live in `snapshots:` keys, which carry no resolution.
-        //   v6:   `/<fn>@<ver>:` plus one `/<fn>@<ver>(peerA@x)(peerB@y):`
-        //         per resolved-peer combination.
-        //   v5.x: `/<fn>/<ver>:` plus `/<fn>/<ver>_<peer-suffix>:` per
-        //         combination (`_react@18.2.0`, or a hash for long sets).
-        // EVERY matching instance is spliced. Rewriting only the first would
-        // fail open: a v6 lock holding both `/pkg@1.0.0:` and
-        // `/pkg@1.0.0(peer@2.0.0):` would confirm and attest the dep while
-        // every dependent resolving through the peered entry still installs
-        // the unpatched upstream tarball.
-        let key = regex::escape(&fname) + "@" + &regex::escape(&dep.version);
-        let pat = String::from(r"(?m)(^ {2}('")
-            + &key
-            + r"'|/?"
-            + &key
-            + r"(?:\([^)\n]*\))*|/"
-            + &regex::escape(&fname)
-            + "/"
-            + &regex::escape(&dep.version)
-            + r"(?:_[^:\n]*)?):\n(?: {4,}.*\n)*? {4,}resolution: )\{([^}\n]*)\}";
-        let re =
-            Regex::new(&pat).expect("resolution regex from the escaped name@version key is valid");
+        // Every peer instance must be redirected, including nested peer
+        // contexts and the block resolutions emitted by pnpm 1–5.
         let mut matched_any = false;
         // Per-lock rewrites are PLANNED first and committed only after the
         // residual gate below proves no instance of this dep escaped the
@@ -1634,67 +1544,33 @@ fn rewrite_pnpm_lock(
             // instances of one dep live in the same lock.
             let mut splices: Vec<(std::ops::Range<usize>, String)> = Vec::new();
             let mut instance_edits: Vec<FileEdit> = Vec::new();
-            for caps in re.captures_iter(content) {
-                matched_any = true;
-                let whole = caps.get(0).expect("group 0 is the whole match");
-                let prefix = caps
-                    .get(1)
-                    .expect("resolution regex always captures group 1 (prefix)")
-                    .as_str();
-                let key_text = caps
-                    .get(2)
-                    .expect("resolution regex always captures group 2 (the lock key)")
-                    .as_str();
-                let inner = caps
-                    .get(3)
-                    .expect("resolution regex always captures group 3 (inner)")
-                    .as_str();
-                let original = format!("{{{inner}}}");
-                let mut fields: Vec<String> = vec![
-                    format!("integrity: {sha512}"),
-                    format!("tarball: {}", dep.artifact_url),
-                ];
-                for f in inner.split(',') {
-                    let t = f.trim();
-                    if !t.is_empty() && !t.starts_with("integrity:") && !t.starts_with("tarball:") {
-                        fields.push(t.to_string());
-                    }
+            for entry in pnpm::entries(content) {
+                let Some(suffix) = pnpm::suffix(entry.key, &fname, &dep.version) else {
+                    continue;
+                };
+                if !pnpm::supported_suffix(suffix) {
+                    continue;
                 }
-                let rebuilt = format!("{{{}}}", fields.join(", "));
-                // Already redirected (re-run): no edit, no ledger growth.
+                let Some(resolution) = pnpm::resolution(&entry) else {
+                    continue;
+                };
+                matched_any = true;
+                let original = &content[resolution.range.clone()];
+                let rebuilt = resolution.rewrite(&sha512, &dep.artifact_url);
                 if rebuilt == original {
                     continue;
                 }
-                // Canonical instance key: quotes and the leading `/` are lock
-                // spelling, not identity, and v5's `/<fn>/<ver><suffix>` is
-                // respelled `<fn>@<ver><suffix>` — so a plain instance's key
-                // is `<fn>@<ver>` in every grammar (the shape the golden
-                // fixtures pin) and peered instances stay distinct.
-                let instance_key = if let Some(quoted) = key_text
-                    .strip_prefix('\'')
-                    .and_then(|k| k.strip_suffix('\''))
-                {
-                    quoted.to_string()
-                } else if let Some(slashed) = key_text.strip_prefix('/') {
-                    match slashed.strip_prefix(&format!("{fname}/")) {
-                        Some(rest) => format!("{fname}@{rest}"),
-                        None => slashed.to_string(),
-                    }
-                } else {
-                    key_text.to_string()
-                };
-                splices.push((whole.range(), format!("{prefix}{rebuilt}")));
+                splices.push((resolution.range, rebuilt.clone()));
                 instance_edits.push(FileEdit {
                     path: (*lock_key).clone(),
                     kind: "redirect_pnpm_resolution".into(),
                     action: "rewritten".into(),
-                    key: Some(instance_key),
-                    original: Some(Value::String(original)),
+                    key: Some(format!("{fname}@{}{suffix}", dep.version)),
+                    original: Some(Value::String(original.to_string())),
                     new: Some(Value::String(rebuilt)),
                 });
             }
-            // Splice by byte range (captures_iter yields non-overlapping
-            // matches in order) — a string replace could hit the wrong
+            // Splice by byte range (package blocks are disjoint and ordered) — a string replace could hit the wrong
             // instance when two entries share identical surrounding bytes.
             let candidate: Option<String> = if splices.is_empty() {
                 None
@@ -1712,7 +1588,7 @@ fn rewrite_pnpm_lock(
             // Residual gate, run over the POST-splice text: any instance of
             // this exact name@version still resolving somewhere other than
             // the hosted artifact — in a spelling the splice grammar cannot
-            // parse (e.g. v6 NESTED peer parens) — makes this a partial
+            // parse (e.g. an unbalanced peer suffix) — makes this a partial
             // rewrite. Shipping it would confirm and VEX-attest the dep while
             // dependents through the unmatched instance keep installing the
             // unpatched upstream tarball, so the dep is refused instead.
@@ -1736,6 +1612,7 @@ fn rewrite_pnpm_lock(
         // committed in one lock while another still resolves the dep
         // upstream would confirm the dep set-wide.
         if !residuals.is_empty() {
+            result.refused_pnpm_uuids.insert(dep.patch_uuid.clone());
             for (lock_key, keys) in &residuals {
                 result.warnings.push(RewriteWarning {
                     code: "redirect_pnpm_unsupported_lock_key".into(),
@@ -1813,7 +1690,7 @@ fn rewrite_pnpm_lock(
             } else {
                 result.warnings.push(RewriteWarning {
                     code: "redirect_pnpm_entry_not_found".into(),
-                    detail: format!("no inline resolution for {fname}@{}", dep.version),
+                    detail: format!("no resolution for {fname}@{}", dep.version),
                 });
             }
         }
@@ -9836,18 +9713,8 @@ packages:
         );
     }
 
-    /// pnpm v6 peers-of-peers NEST the parens in the `packages:` key
-    /// (`/pkg@1.0.0(react@18.2.0(scheduler@0.23.2)):`) — a spelling the
-    /// splice regex's `\([^)\n]*\)` groups provably cannot match. Splicing
-    /// AROUND it would be the exact fail-open the old pre-splice refusal
-    /// guarded: the plain instance rewritten, the dep confirmed and
-    /// VEX-attested, while every dependent resolving through the nested-peer
-    /// instance keeps installing the unpatched upstream tarball. The
-    /// post-splice residual gate must refuse the dep — nothing rewritten,
-    /// no edits, a `redirect_pnpm_unsupported_lock_key` warning naming the
-    /// residual key.
     #[test]
-    fn pnpm_v6_nested_paren_peer_key_refuses_the_dep_fail_closed() {
+    fn pnpm_v6_nested_paren_peer_key_rewrites_every_instance() {
         let lock = "lockfileVersion: '6.0'
 
 dependencies:
@@ -9872,36 +9739,16 @@ packages:
         let url = "http://patch.test/left-pad-1.3.0.tgz";
         let overrides = vec![npm_override("left-pad", "1.3.0", url, "sha512-PATCHED==")];
         let r = rewrite_registry_redirect(&files, &overrides);
-        assert!(
-            r.files.is_empty() && r.edits.is_empty(),
-            "a partial rewrite must not ship: files={:?} edits={:?}",
-            r.files.keys(),
-            r.edits
-        );
-        let warning = r
-            .warnings
-            .iter()
-            .find(|w| w.code == "redirect_pnpm_unsupported_lock_key")
-            .unwrap_or_else(|| panic!("the residual must be warned about: {:?}", r.warnings));
-        assert!(
-            warning
-                .detail
-                .contains("/left-pad@1.3.0(react@18.2.0(scheduler@0.23.2))"),
-            "the warning must name the residual key: {}",
-            warning.detail
-        );
-        assert!(
-            !r.warnings
-                .iter()
-                .any(|w| w.code == "redirect_pnpm_entry_not_found"),
-            "the residual refusal must not double-report as not-found: {:?}",
-            r.warnings
-        );
+        let rewritten = &r.files["pnpm-lock.yaml"];
+        assert_eq!(rewritten.matches("tarball: http://patch.test/").count(), 2);
+        assert!(rewritten.contains("/left-pad@1.3.0(react@18.2.0(scheduler@0.23.2)):"));
+        assert_eq!(r.edits.len(), 2);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
     }
 
     /// The residual gate is SET-WIDE: a Rush-style repo whose root v9 lock
     /// splices fully while a nested lock resolves the same dep only through
-    /// a nested-peer key must refuse the dep in EVERY lock. Committing the
+    /// an unbalanced peer key must refuse the dep in EVERY lock. Committing the
     /// root rewrite alone would land the artifact URL in the project — the
     /// CLI's substring confirmation probe would then confirm and attest the
     /// dep while the nested lock's dependents stay on the upstream tarball.
@@ -9927,7 +9774,7 @@ snapshots:
 
 packages:
 
-  /left-pad@1.3.0(react@18.2.0(scheduler@0.23.2)):
+  /left-pad@1.3.0(react@18.2.0(scheduler@0.23.2):
     resolution: {integrity: sha512-UPSTREAM==}
     dev: false
 ";
@@ -10598,14 +10445,8 @@ snapshots:
         );
     }
 
-    /// pnpm 1/2 projects lock with `shrinkwrap.yaml` (the pre-rename v5
-    /// grammar — real layout captured in the 2026-08-18 legacy matrix:
-    /// shrinkwrap.yaml + node_modules/.modules.yaml, no pnpm-lock.yaml and
-    /// no package-lock.json). The no-lockfile diagnostic must be
-    /// pnpm-flavored there — the npm "no package-lock.json" wording
-    /// dead-ends (running `npm i --package-lock-only` would fork the
-    /// project onto npm). Marker-aware family selection, fail-closed:
-    /// nothing is rewritten either way.
+    /// Legacy shrinkwrap files are rewritten; a marker without a lock still
+    /// produces a pnpm-specific missing-lock diagnostic.
     #[test]
     fn no_lockfile_warning_is_pnpm_flavored_when_pnpm_markers_present() {
         let ovr = npm_override(
@@ -10616,14 +10457,14 @@ snapshots:
         );
 
         // shrinkwrap.yaml present (with or without node_modules — a fresh
-        // clone has only the committed lock): name the legacy lock.
+        // clone has only the committed lock): rewrite its block resolution.
         for with_marker in [true, false] {
             let mut files = BTreeMap::new();
             files.insert(
                 "shrinkwrap.yaml".to_string(),
                 "dependencies:\n  left-pad: 1.3.0\npackages:\n  /left-pad/1.3.0:\n    \
                  dev: false\n    resolution:\n      integrity: sha512-UPSTREAM==\n\
-                 shrinkwrapVersion: 3\n"
+                 shrinkwrapMinorVersion: 6\nshrinkwrapVersion: 3\n"
                     .to_string(),
             );
             if with_marker {
@@ -10633,24 +10474,9 @@ snapshots:
                 );
             }
             let r = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
-            assert!(
-                r.files.is_empty(),
-                "nothing may be rewritten (markers are read-only): {:?}",
-                r.files.keys()
-            );
-            assert_eq!(
-                warning_codes(&r),
-                vec!["redirect_pnpm_legacy_lockfile"],
-                "shrinkwrap.yaml (with_marker={with_marker}) must select the \
-                 pnpm-legacy wording, never redirect_npm_no_lockfile: {:?}",
-                r.warnings
-            );
-            assert!(
-                r.warnings[0].detail.contains("shrinkwrap.yaml")
-                    && r.warnings[0].detail.contains("pnpm-lock.yaml"),
-                "detail must name the legacy lock and the upgrade target: {}",
-                r.warnings[0].detail
-            );
+            assert!(r.files["shrinkwrap.yaml"]
+                .contains("tarball: http://patch.test/left-pad-1.3.0.tgz"));
+            assert!(r.warnings.is_empty(), "{:?}", r.warnings);
         }
 
         // pnpm marker only (lock deleted / never committed): pnpm-flavored
@@ -10816,11 +10642,9 @@ packages:
         );
     }
 
-    /// A CRLF pnpm lock gets a dedicated CRLF warning instead of the
-    /// misleading per-dep `redirect_pnpm_entry_not_found` (the entry exists;
-    /// only the LF-anchored grammar cannot see it). Fail-closed either way.
+    /// CRLF locks preserve their newline style through hosted rewriting.
     #[test]
-    fn pnpm_crlf_lock_gets_dedicated_crlf_warning() {
+    fn pnpm_crlf_lock_is_rewritten_without_changing_line_endings() {
         let ovr = npm_override(
             "left-pad",
             "1.3.0",
@@ -10834,19 +10658,10 @@ packages:
         );
         let mut r = RewriteResult::default();
         rewrite_pnpm_lock(&files, std::slice::from_ref(&ovr), &mut r);
-        assert!(r.files.is_empty(), "CRLF lock must not be rewritten");
-        assert_eq!(
-            warning_codes(&r),
-            vec!["redirect_pnpm_crlf_unsupported"],
-            "the refusal must name CRLF, not entry-not-found: {:?}",
-            r.warnings
-        );
-        assert!(
-            r.warnings[0].detail.contains("pnpm-lock.yaml")
-                && r.warnings[0].detail.contains("CRLF"),
-            "detail must name the file and the line endings: {}",
-            r.warnings[0].detail
-        );
+        let out = &r.files["pnpm-lock.yaml"];
+        assert!(out.contains("tarball: http://patch.test/left-pad-1.3.0.tgz"));
+        assert!(!out.replace("\r\n", "").contains('\n'));
+        assert!(r.warnings.is_empty());
     }
 
     // ── golang ───────────────────────────────────────────────────────────────
