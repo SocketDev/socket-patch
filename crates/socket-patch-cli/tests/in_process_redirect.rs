@@ -1798,18 +1798,17 @@ async fn redirect_inbundle_only_dep_is_skipped_not_confirmed() {
 }
 
 /// A pnpm v6 lock resolving the patched dep through BOTH a plain key and a
-/// nested-peer-paren key (`/pkg@1.0.0(react@18.2.0(scheduler@0.23.2)):` —
-/// a spelling the splice grammar cannot parse) must be refused whole:
+/// malformed peer key with an unclosed parenthesis must be refused whole:
 /// `redirected: 0`, the lock byte-untouched, the hosted URL nowhere (a
 /// partial splice would have landed it in the lock, and the confirmation
 /// probe would then confirm + VEX-attest the dep while dependents through
-/// the nested-peer instance keep installing the unpatched upstream tarball),
+/// the unsupported instance keep installing the unpatched upstream tarball),
 /// a `redirect_pnpm_unsupported_lock_key` warning naming the residual key,
 /// and no redirect-ledger record claiming the purl. Subprocess so the
 /// `--json` envelope's `redirected` count and `warnings[]` can be read back.
 #[tokio::test]
 #[serial]
-async fn redirect_pnpm_nested_peer_residual_refuses_dep_not_confirmed() {
+async fn redirect_pnpm_malformed_peer_residual_refuses_dep_not_confirmed() {
     let server = MockServer::start().await;
     mock_discovery(&server).await;
     mock_reference(&server).await;
@@ -1843,13 +1842,13 @@ packages:
     resolution: {{integrity: sha512-UPSTREAMupstream==}}
     dev: false
 
-  /{NAME}@{VERSION}(react@18.2.0(scheduler@0.23.2)):
+  /{NAME}@{VERSION}(react@18.2.0(scheduler@0.23.2):
     resolution: {{integrity: sha512-UPSTREAMupstream==}}
     dev: false
 "
     );
     std::fs::write(tmp.path().join("pnpm-lock.yaml"), &lock)
-        .expect("write the mixed plain + nested-peer pnpm lock");
+        .expect("write the mixed plain + malformed-peer pnpm lock");
 
     let env = run_redirect_subprocess(tmp.path(), &server.uri());
     assert_eq!(
