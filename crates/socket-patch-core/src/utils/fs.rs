@@ -134,6 +134,82 @@ pub(crate) async fn open_regular_file(
     Ok((file, metadata))
 }
 
+/// Read a regular file to a `String` through [`open_regular_file`]: the
+/// FIFO-safe reader (non-blocking open, fstat regular-file check on the
+/// opened descriptor) that the ecosystem modules had each re-declared
+/// privately. Follows a symlink to a regular file; a FIFO, directory or
+/// socket fails fast with `InvalidInput` instead of wedging in open(2).
+/// `pub` so the CLI crate's raw `read_to_string` sites can share it.
+pub async fn read_regular_to_string(path: &Path) -> std::io::Result<String> {
+    use tokio::io::AsyncReadExt as _;
+
+    let (mut file, metadata) = open_regular_file(path).await?;
+    let mut content = String::with_capacity(metadata.len() as usize);
+    file.read_to_string(&mut content).await?;
+    Ok(content)
+}
+
+/// True when `path` ITSELF is a symbolic link (lstat; the link target is not
+/// consulted, so a dangling link is still `true`). Writers that stage a
+/// replacement next to `path` and rename over it would replace the link with
+/// a regular file (leaving the target stale) — they use this to refuse
+/// fail-closed before any write, mirroring the hosted replay guard.
+pub async fn is_symlink(path: &Path) -> bool {
+    tokio::fs::symlink_metadata(path)
+        .await
+        .map(|metadata| metadata.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
+/// Blocking twin of [`read_regular_to_string`] for the few synchronous
+/// helpers that read project files (the hosted flow's pnpm-workspace probe):
+/// same non-blocking open + fstat regular-file check, so a FIFO planted at
+/// the path fails fast with `InvalidInput` instead of wedging in open(2).
+/// Every other error keeps its kind (`NotFound`, `PermissionDenied`,
+/// `InvalidData` from the UTF-8 decode) so callers can classify it.
+pub fn read_regular_to_string_sync(path: &Path) -> std::io::Result<String> {
+    use std::io::Read as _;
+
+    #[cfg(unix)]
+    let mut file = {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(path)?
+    };
+    #[cfg(not(unix))]
+    let mut file = std::fs::File::open(path)?;
+
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    let mut content = String::with_capacity(metadata.len() as usize);
+    file.read_to_string(&mut content)?;
+    Ok(content)
+}
+
+/// The first of `rels` (root-relative, in the caller's order) that is a
+/// symbolic link — see [`is_symlink`]. Rewriters that are about to
+/// stage-and-rename over a whole file set use this to refuse the entire set
+/// fail-closed before the first write; a missing path (a file the rewrite
+/// would CREATE) is not a link.
+pub async fn first_symlink<'a>(
+    root: &Path,
+    rels: impl IntoIterator<Item = &'a str>,
+) -> Option<&'a str> {
+    for rel in rels {
+        if is_symlink(&root.join(rel)).await {
+            return Some(rel);
+        }
+    }
+    None
+}
+
 /// Return the raw `FileType` for `entry`, swallowing stat errors.
 ///
 /// Use this instead of `entry_is_dir` when the caller needs to
@@ -774,5 +850,104 @@ mod tests {
             "entry_file_type must surface the link kind"
         );
         assert!(!ft.is_dir(), "entry_file_type must not resolve the target");
+    }
+
+    /// `read_regular_to_string_sync` keeps the error kinds its callers
+    /// classify on (absent vs. unreadable vs. undecodable) and follows a
+    /// symlink to a regular file like the async reader.
+    #[test]
+    fn read_regular_to_string_sync_classifies_like_the_async_reader() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = read_regular_to_string_sync(&tmp.path().join("absent")).unwrap_err();
+        assert_eq!(missing.kind(), std::io::ErrorKind::NotFound);
+        let dir = read_regular_to_string_sync(tmp.path()).unwrap_err();
+        // Unix opens a directory read-only and the fstat check classifies it;
+        // Windows' CreateFileW refuses the open outright with
+        // ERROR_ACCESS_DENIED (PermissionDenied). Either way it is an error
+        // the callers skip, never a wedge.
+        #[cfg(unix)]
+        assert_eq!(dir.kind(), std::io::ErrorKind::InvalidInput, "{dir}");
+        #[cfg(not(unix))]
+        assert!(
+            matches!(
+                dir.kind(),
+                std::io::ErrorKind::InvalidInput | std::io::ErrorKind::PermissionDenied
+            ),
+            "{dir}"
+        );
+        let file = tmp.path().join("ok.txt");
+        std::fs::write(&file, "packages:\n").unwrap();
+        assert_eq!(read_regular_to_string_sync(&file).unwrap(), "packages:\n");
+        let invalid = tmp.path().join("bad.txt");
+        std::fs::write(&invalid, b"\xff\xfe").unwrap();
+        assert_eq!(
+            read_regular_to_string_sync(&invalid).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        #[cfg(unix)]
+        {
+            let link = tmp.path().join("link.txt");
+            std::os::unix::fs::symlink("ok.txt", &link).unwrap();
+            assert_eq!(read_regular_to_string_sync(&link).unwrap(), "packages:\n");
+        }
+    }
+
+    /// A FIFO at the path must fail fast (`InvalidInput`), never block in
+    /// open(2) waiting for a writer.
+    #[cfg(unix)]
+    #[test]
+    fn read_regular_to_string_sync_rejects_a_fifo_without_blocking() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let fifo = tmp.path().join("pnpm-workspace.yaml");
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) }, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let probe = fifo.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(read_regular_to_string_sync(&probe).map_err(|e| e.kind()));
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(result) => assert_eq!(result, Err(std::io::ErrorKind::InvalidInput)),
+            Err(_) => {
+                // Release the wedged opener so the suite can fail cleanly.
+                let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
+                panic!("the sync reader wedged in open(2) on a FIFO");
+            }
+        }
+    }
+
+    /// `first_symlink` reports the first LINK in iteration order, treats
+    /// absent paths (files a rewrite would create) as non-links and does not
+    /// follow the link to judge its target.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn first_symlink_reports_links_in_caller_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("package-lock.json"), "{}").unwrap();
+        std::fs::write(tmp.path().join("real.lock"), "x").unwrap();
+        std::os::unix::fs::symlink("real.lock", tmp.path().join("uv.lock")).unwrap();
+        std::os::unix::fs::symlink("missing", tmp.path().join("dangling.lock")).unwrap();
+        assert_eq!(
+            first_symlink(
+                tmp.path(),
+                ["package-lock.json", "pnpm-workspace.yaml", "real.lock"]
+            )
+            .await,
+            None
+        );
+        assert_eq!(
+            first_symlink(
+                tmp.path(),
+                ["package-lock.json", "uv.lock", "dangling.lock"]
+            )
+            .await,
+            Some("uv.lock")
+        );
+        assert_eq!(
+            first_symlink(tmp.path(), ["dangling.lock", "uv.lock"]).await,
+            Some("dangling.lock"),
+            "a dangling link is still a link the rename would replace"
+        );
     }
 }

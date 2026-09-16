@@ -6,7 +6,10 @@
 //! to the registry by a plain `uv sync`. So vendor always writes BOTH — the
 //! pyproject sources entry (plus, for transitive deps, a
 //! `[tool.uv] override-dependencies` pin, which sources DO apply to — claim
-//! 8) and the lock's `[[package]]` / `requires-dist` / `[manifest]` fragments.
+//! 8 — but only on uv >= 0.5.6: 0.2.35–0.5.3 ignore sources for overrides
+//! and a plain `uv sync` there reinstalls the registry wheel, hence the
+//! `pypi_uv_override_requires_uv_0_5_6` advisory on that branch) and the
+//! lock's `[[package]]` / `requires-dist` / `[manifest]` fragments.
 //!
 //! All lock edits are targeted text surgery rather than a TOML re-serialize:
 //! the spike proved a surgical edit reproduces uv's own serializer output
@@ -19,7 +22,14 @@ use std::path::Path;
 use toml_edit::{DocumentMut, Item, Table, Value};
 
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
-use crate::utils::fs::atomic_write_bytes_preserving_mode;
+// `read_regular_to_string` is the FIFO-safe guarded reader (`O_NONBLOCK`
+// open + fstat regular-file check): a FIFO planted as `pyproject.toml` or
+// `uv.lock` fails fast instead of wedging every uv-project vendor run (and
+// revert) forever in an `open(2)` that waits for a writer — the
+// flavor-routing probes ahead of the load are metadata-only, so these are
+// the first opens.
+use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
+use crate::utils::python_lock::preserve_line_endings;
 
 use super::common::{item_get, pep508_name, pep621_declared_names, record};
 use super::state::{UvMeta, VendorEntry, WiringAction, WiringRecord};
@@ -38,21 +48,6 @@ const HIGHEST_TESTED_LOCK_REVISION: u64 = 3;
 /// source's `[package.metadata]` block — a sane ceiling for a core-metadata
 /// header block (real ones are a few KiB).
 const MAX_WHEEL_METADATA_BYTES: u64 = 4 * 1024 * 1024;
-
-/// Guarded read shared in shape with the sibling backend twins:
-/// `open_regular_file` opens with `O_NONBLOCK` and rejects non-regular
-/// files, so a FIFO planted as `pyproject.toml` or `uv.lock` fails fast
-/// instead of wedging every uv-project vendor run (and revert) forever in
-/// an `open(2)` that waits for a writer — the flavor-routing probes ahead
-/// of the load are metadata-only, so these are the first opens.
-async fn read_regular_to_string(path: &Path) -> std::io::Result<String> {
-    use tokio::io::AsyncReadExt as _;
-
-    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
-    let mut content = String::with_capacity(metadata.len() as usize);
-    file.read_to_string(&mut content).await?;
-    Ok(content)
-}
 
 /// How the target package is declared, which picks the wiring strategy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,10 +106,15 @@ pub(super) async fn load_uv_project(root: &Path) -> Result<UvProject, (&'static 
         )
     })?;
 
+    // Real-binary behavior behind the wording: <= 0.2.6 cannot parse a
+    // relative path source at all; 0.2.17–0.2.34 install one under --frozen
+    // / plain sync, but `--locked` rejects any non-canonical spelling, plain
+    // sync (0.2.34) and every `uv lock` absolutize it, resolution is
+    // CWD-relative, and 0.2.17/0.2.18 never verify the wheel hash.
     if lock.contains_key("distribution") {
         return Err((
             "pypi_uv_legacy_lock_unsupported",
-            "uv 0.1 lockfiles require absolute file URLs; upgrade to uv >=0.2 for portable native vendoring, or use a requirements.txt installation".to_string(),
+            "uv `[[distribution]]` lockfiles (uv < 0.2.35, experimental `uv lock`) cannot carry a portable local wheel: `--locked` rejects relative paths and `uv lock`/`uv sync` rewrite them to absolute ones; upgrade to uv >=0.2.35 for native vendoring, or use a requirements.txt installation".to_string(),
         ));
     }
 
@@ -237,9 +237,14 @@ pub(super) async fn load_uv_project(root: &Path) -> Result<UvProject, (&'static 
 }
 
 /// Direct iff the package is named (PEP 508 name, canonicalized) anywhere in
-/// `project.dependencies`, `project.optional-dependencies`, or the PEP 735
-/// `dependency-groups` — every surface `[tool.uv.sources]` applies to without
-/// an override.
+/// `project.dependencies`, `project.optional-dependencies`, the PEP 735
+/// `dependency-groups`, or the legacy `[tool.uv] dev-dependencies` array —
+/// every surface `[tool.uv.sources]` applies to without an override. uv
+/// (through 0.12.15, with a deprecation warning) still honours the legacy
+/// array and records it exactly like `dependency-groups.dev`: in the root
+/// unit's `[package.metadata.requires-dev]`. Classifying it Transitive
+/// would take the override branch and leave that entry's `specifier` in
+/// place — `uv lock --check` / `uv sync --locked` red on every uv >= 0.2.37.
 fn classify_dependency(p: &UvProject, canon_name: &str) -> UvDepClass {
     let mut declared: Vec<String> = Vec::new();
     pep621_declared_names(&p.pyproject, &mut declared);
@@ -259,6 +264,19 @@ fn classify_dependency(p: &UvProject, canon_name: &str) -> UvDepClass {
                 );
             }
         }
+    }
+    if let Some(dev) = p
+        .pyproject
+        .get("tool")
+        .and_then(|t| item_get(t, "uv"))
+        .and_then(|u| item_get(u, "dev-dependencies"))
+        .and_then(Item::as_array)
+    {
+        declared.extend(
+            dev.iter()
+                .filter_map(Value::as_str)
+                .map(|s| pep508_name(s).to_string()),
+        );
     }
     if declared
         .iter()
@@ -426,7 +444,8 @@ pub(super) fn wired_pin(
 /// Wire the pair for the vendored wheel. Writes `pyproject.toml` FIRST, then
 /// `uv.lock`; a failed lock write unwinds the pyproject from the recorded
 /// original so the pair is never left half-wired (either half alone is a
-/// silent no-op or a silent revert — spike claims 7/9).
+/// silent no-op or a silent revert — spike claims 7/9). The third element
+/// carries wiring-time advisories (non-fatal, surfaced with the outcome).
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn wire_uv(
     p: &UvProject,
@@ -437,7 +456,9 @@ pub(super) async fn wire_uv(
     wheel_file_name: &str,
     wheel_sha256_hex: &str,
     record_uuid: &str,
-) -> Result<(Vec<WiringRecord>, UvMeta), (&'static str, String)> {
+) -> Result<(Vec<WiringRecord>, UvMeta, Vec<VendorWarning>), (&'static str, String)> {
+    // Before ANY write: a symlinked half would be replaced by the rename.
+    refuse_symlinked_pair(root).await?;
     match check_target_guards(p, canon_name, record_uuid)? {
         // Defensive: the orchestrator short-circuits in-sync pre-flight and
         // never calls wire on it (we must never re-record our own edit as an
@@ -456,6 +477,7 @@ pub(super) async fn wire_uv(
     }
     let class = classify_dependency(p, canon_name);
     let mut wiring: Vec<WiringRecord> = Vec::new();
+    let mut advisories: Vec<VendorWarning> = Vec::new();
 
     // ── pyproject.toml (computed in memory; committed before the lock) ────
     let mut doc = p.pyproject.clone();
@@ -467,6 +489,19 @@ pub(super) async fn wire_uv(
         .is_none();
 
     if class == UvDepClass::Transitive {
+        // uv 0.2.35–0.5.3 do NOT apply [tool.uv.sources] to
+        // override-dependencies: a plain `uv sync` on those releases silently
+        // reinstalls the registry wheel (the lock still names the vendored
+        // path, so `--frozen` installs it). No lock-shape marker separates
+        // 0.5.3 from 0.5.6, so this cannot be an offline refusal — advise.
+        advisories.push(VendorWarning::new(
+            "pypi_uv_override_requires_uv_0_5_6",
+            format!(
+                "transitive wiring of {canon_name} via [tool.uv] override-dependencies is \
+                 honored only by uv >= 0.5.6; older uv reinstalls the registry wheel on a \
+                 plain `uv sync` — pin uv or make the package a direct dependency"
+            ),
+        ));
         let spec = format!("{canon_name}=={version}");
         let uv_table = ensure_table(&mut doc, &["tool", "uv"])?;
         if !had_uv_table {
@@ -521,6 +556,10 @@ pub(super) async fn wire_uv(
                     .and_then(Item::as_value)
                     .map(|v| v.to_string().trim().to_string())
                     .unwrap_or_default();
+                // Multi-line arrays render LF; record both fragments in the
+                // file's own convention or revert's exact-text splice misses.
+                let old_text = preserve_line_endings(&p.pyproject_text, old_text);
+                let new_text = preserve_line_endings(&p.pyproject_text, new_text);
                 wiring.push(record(
                     "pyproject.toml",
                     "uv_override",
@@ -555,7 +594,9 @@ pub(super) async fn wire_uv(
         None,
         format!("{canon_name} = {{ path = \"{rel_wheel}\" }}"),
     ));
-    let new_pyproject = doc.to_string();
+    // toml_edit re-emits every newline as LF; a CRLF pyproject would come
+    // back all-LF (whole-file churn, and revert splices never restore it).
+    let new_pyproject = preserve_line_endings(&p.pyproject_text, doc.to_string());
 
     // ── uv.lock text surgery (fully computed before any write) ────────────
     let mut new_lock = p.lock_text.clone();
@@ -617,6 +658,43 @@ pub(super) async fn wire_uv(
         }
     }
 
+    // [manifest] constraints / build-constraints naming the target (either
+    // class). Recorded LAST so the reverse-order revert restores these
+    // whole-line fragments before the requires-dist element they may be
+    // byte-identical to is searched for.
+    let constraint_edits = rewrite_manifest_constraints(&new_lock, canon_name, rel_wheel)?;
+    if !constraint_edits.is_empty() {
+        // uv 0.2.37–0.5.3 serialize `[manifest] constraints` as
+        // `{ name, specifier }` regardless of sources, so the repointed entry
+        // makes `uv sync --locked` fail there (a plain `uv sync` rewrites the
+        // entry back and still installs the patch; `--frozen` is unaffected);
+        // uv >= 0.5.6 REQUIRES the repoint. Same no-lock-marker situation as
+        // the override branch (matrix: 0.2.37–0.5.0 fail, 0.5.16+ pass) —
+        // advise rather than refuse.
+        advisories.push(VendorWarning::new(
+            "pypi_uv_constraints_require_uv_0_5_6",
+            format!(
+                "[manifest] constraints for {canon_name} were repointed at the vendored wheel, \
+                 the shape uv >= 0.5.6 writes; uv 0.2.37–0.5.3 reject it under `uv sync \
+                 --locked` (`--frozen` and a plain `uv sync` still install the patch) — pin uv \
+                 >= 0.5.6 or drop the constraint on the patched package"
+            ),
+        ));
+    }
+    for edit in constraint_edits.iter().rev() {
+        new_lock.replace_range(edit.span.clone(), &edit.new_entry);
+    }
+    for edit in constraint_edits {
+        wiring.push(record(
+            "uv.lock",
+            edit.kind,
+            WiringAction::Rewritten,
+            canon_name,
+            Some(edit.old_entry),
+            edit.new_entry,
+        ));
+    }
+
     // ── commit: pyproject first, then the lock; unwind on lock failure ────
     // Mode-preserving: both are user-owned files we merely edit, so the
     // swapped-in inode must keep its permission bits rather than reset them
@@ -653,7 +731,7 @@ pub(super) async fn wire_uv(
         created_sources_table,
         lock_revision: p.lock_revision,
     };
-    Ok((wiring, meta))
+    Ok((wiring, meta, advisories))
 }
 
 /// Reverse the wiring: restore verbatim originals (or delete added fragments)
@@ -666,6 +744,16 @@ pub(super) async fn wire_uv(
 pub(super) async fn revert_uv(entry: &VendorEntry, root: &Path, dry_run: bool) -> RevertOutcome {
     let pyproject_path = root.join("pyproject.toml");
     let lock_path = root.join("uv.lock");
+    // A symlinked half would be replaced by the rename-over write: keep the
+    // artifact (the wiring still routes through it) and fail the revert.
+    if let Err((code, detail)) = refuse_symlinked_pair(root).await {
+        return RevertOutcome {
+            kept_artifact: true,
+            success: false,
+            warnings: Vec::new(),
+            error: Some(format!("{code}: {detail}")),
+        };
+    }
     let mut pyproject_text = match read_regular_to_string(&pyproject_path).await {
         Ok(t) => t,
         Err(e) => return RevertOutcome::failed(format!("cannot read pyproject.toml: {e}")),
@@ -698,7 +786,10 @@ pub(super) async fn revert_uv(entry: &VendorEntry, root: &Path, dry_run: bool) -
             )
         };
         match rec.kind.as_str() {
-            "uv_lock_package" | "uv_lock_requires_dist" | "uv_lock_requires_dev" => {
+            "uv_lock_package"
+            | "uv_lock_requires_dist"
+            | "uv_lock_requires_dev"
+            | "uv_lock_manifest_constraints" => {
                 match replace_fragment(&lock_text, new_text, original_text) {
                     Some(t) => lock_text = t,
                     None => {
@@ -724,10 +815,12 @@ pub(super) async fn revert_uv(entry: &VendorEntry, root: &Path, dry_run: bool) -
                     };
                     // A created [manifest] section was inserted with a blank
                     // separator line; a created overrides key is one line.
+                    // Both were terminated with the lock's own newline.
+                    let nl = newline_of(&lock_text);
                     let removed = if new.starts_with("[manifest]") {
-                        remove_substring(&lock_text, &format!("{new}\n\n"))
+                        remove_substring(&lock_text, &format!("{new}{nl}{nl}"))
                     } else {
-                        remove_substring(&lock_text, &format!("{new}\n"))
+                        remove_substring(&lock_text, &format!("{new}{nl}"))
                     };
                     match removed {
                         Some(t) => lock_text = t,
@@ -863,6 +956,39 @@ pub(super) async fn revert_uv(entry: &VendorEntry, root: &Path, dry_run: bool) -
 
 // ── helpers ──────────────────────────────────────────────────────────────
 
+/// Refuse when `pyproject.toml` or `uv.lock` is itself a symlink. The
+/// writers stage a replacement next to the path and rename over it, which
+/// would REPLACE the link with a regular file — the target left stale, git
+/// showing a typechange — so both wire and revert check before any write
+/// (uv itself writes through the link). `Err` names the offending file.
+async fn refuse_symlinked_pair(root: &Path) -> Result<(), (&'static str, String)> {
+    for name in ["pyproject.toml", "uv.lock"] {
+        if crate::utils::fs::is_symlink(&root.join(name)).await {
+            return Err((
+                "pypi_uv_symlink_unsupported",
+                format!(
+                    "{name} is a symbolic link; the atomic rewrite would replace the link with \
+                     a regular file and leave its target stale — vendor the real file's \
+                     directory instead"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The lock's line terminator. uv writes LF, but git autocrlf on Windows
+/// hands us a CRLF file; every fragment we splice, append or remove must be
+/// built with the file's own terminator or the lock comes back with mixed
+/// endings and revert's exact-text removals miss.
+fn newline_of(text: &str) -> &'static str {
+    if text.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    }
+}
+
 /// Walk/create the table chain, marking CREATED intermediates implicit so
 /// they never render stray `[tool]` headers.
 fn ensure_table<'a>(
@@ -934,13 +1060,17 @@ fn rewrite_target_package_unit(
     wheel_sha256_hex: &str,
     metadata_block: Option<&str>,
 ) -> Result<(String, String), (&'static str, String)> {
+    let nl = newline_of(lock_text);
     let span = find_unit_span(lock_text, |lines| unit_has_name(lines, canon)).ok_or_else(|| {
         (
             "pypi_uv_lock_package_missing",
             format!("uv.lock has no [[package]] entry for {canon}"),
         )
     })?;
-    let old_unit = lock_text[span].to_string();
+    // `find_unit_span` ends at the last line's content, which in a CRLF lock
+    // is its trailing `\r`; keep the fragment CR-free at both ends so the
+    // rebuilt unit splices back in front of the same `\r\n`.
+    let old_unit = lock_text[span].trim_end_matches('\r').to_string();
     let unit: Vec<&str> = old_unit.lines().collect();
     let wheels_lines = [
         "wheels = [".to_string(),
@@ -988,12 +1118,18 @@ fn rewrite_target_package_unit(
         }
         out.splice(pos..pos, wheels_lines.iter().cloned());
     }
-    let mut new_unit = out.join("\n");
+    let mut new_unit = out.join(nl);
     if let Some(block) = metadata_block {
         // uv emits [package.metadata] as a sub-table after the [[package]]
         // body, separated by one blank line (fixture shape: `]\n\n[package…`).
-        new_unit.push_str("\n\n");
-        new_unit.push_str(block);
+        // The block is rendered LF; re-terminate it for a CRLF lock.
+        new_unit.push_str(nl);
+        new_unit.push_str(nl);
+        if nl == "\n" {
+            new_unit.push_str(block);
+        } else {
+            new_unit.push_str(&block.replace('\n', nl));
+        }
     }
     Ok((old_unit, new_unit))
 }
@@ -1009,18 +1145,23 @@ struct RequiresDistEdit {
     kind: &'static str,
 }
 
-/// Find + transform EVERY root-package metadata entry for `canon`: the
-/// `[package.metadata]` `requires-dist` array (project.dependencies /
-/// optional-dependencies) AND each `[package.metadata.requires-dev]` group
-/// array (PEP 735 `[dependency-groups]` — uv records group deps there, never
-/// in requires-dist, and rewrites ALL entries to the path shape when a
-/// source applies; spike-verified against uv 0.11.19). Each entry:
-/// `{ name = "x", specifier = "==v" }` → `{ name = "x", path = "<rel>" }`
-/// (uv DROPS the specifier for path sources — recorded for revert). Returns
-/// absolute byte spans, ascending, so the caller splices by range, never by
-/// string search (a bare `{ name = "x" }` entry would collide with
-/// `dependencies` arrays elsewhere in the lock). requires-dev fragments span
-/// the whole `<group> = […]` line so identically-pinned groups stay
+/// Find + transform EVERY root-package metadata entry for `canon`: each
+/// matching element of the `[package.metadata]` `requires-dist` array
+/// (project.dependencies / optional-dependencies — a package in both has
+/// TWO entries, the extra's with `marker = "extra == '…'"`) AND each
+/// `[package.metadata.requires-dev]` group array (PEP 735
+/// `[dependency-groups]` and the legacy `[tool.uv] dev-dependencies` — uv
+/// records those there, never in requires-dist). uv rewrites ALL of them to
+/// the path shape when a source applies (verified against uv 0.11.19 and
+/// 0.12.15), so one left with its specifier keeps `--locked` red. Each
+/// entry: `{ name = "x", specifier = "==v" }` → `{ name = "x", path =
+/// "<rel>" }` (uv DROPS the specifier for path sources — recorded for
+/// revert). Returns absolute byte spans, ascending and non-overlapping, so
+/// the caller splices by range, never by string search (a bare `{ name = "x"
+/// }` entry would collide with `dependencies` arrays elsewhere in the lock).
+/// Each requires-dist element is its own edit (one wiring record per
+/// element); a requires-dev fragment spans the whole `<group> = […]` line
+/// with every matching element rewritten, so identically-pinned groups stay
 /// distinguishable when revert matches fragments by text.
 fn rewrite_root_metadata_entries(
     lock_text: &str,
@@ -1035,6 +1176,21 @@ fn rewrite_root_metadata_entries(
     })?;
     let unit_start = unit_span.start;
     let unit_text = &lock_text[unit_span];
+    // uv 0.2.35 and 0.2.36 — the first `[[package]]`-grammar releases — wrote
+    // no `[package.metadata]` at all (it arrived in 0.2.37). There is no
+    // requires-dist entry to repoint and nothing for `--locked` to compare;
+    // the package unit's source plus the pyproject `[tool.uv.sources]` entry
+    // carry the redirect alone. A lock that HAS metadata but lacks the entry
+    // is a stale lock and still refuses below.
+    //
+    // "No metadata" means neither the bare header NOR any `[package.metadata.`
+    // sub-table: `"[package.metadata.requires-dev]".contains("[package.metadata]")`
+    // is false (`.` vs `]`), so keying on the bare header alone would
+    // silently skip the requires-dev repoint should a uv release ever omit
+    // the empty header line — a stale specifier with no refusal.
+    if !unit_text.contains("[package.metadata]") && !unit_text.contains("[package.metadata.") {
+        return Ok(Vec::new());
+    }
     let needle = format!("name = \"{canon}\"");
     let mut edits: Vec<RequiresDistEdit> = Vec::new();
 
@@ -1058,6 +1214,10 @@ fn rewrite_root_metadata_entries(
                 continue;
             }
             let (new_entry, specifier) = path_source_entry(entry, rel_wheel);
+            // No early exit: a package in both project.dependencies and an
+            // optional-dependencies extra has TWO entries here (the second
+            // carries `marker = "extra == '…'"`) and uv repoints both; one
+            // left with its specifier keeps `--locked` red.
             edits.push(RequiresDistEdit {
                 span: (unit_start + arr_open + s)..(unit_start + arr_open + e),
                 old_entry: entry.to_string(),
@@ -1065,7 +1225,6 @@ fn rewrite_root_metadata_entries(
                 specifier,
                 kind: "uv_lock_requires_dist",
             });
-            break;
         }
     }
 
@@ -1088,28 +1247,39 @@ fn rewrite_root_metadata_entries(
                 )
             })?;
             let array_text = &unit_text[arr_open..arr_end];
+            // Rebuild the whole group array with EVERY matching element
+            // repointed (a group may name the package twice under different
+            // markers), so one group is always one non-overlapping edit.
+            let mut new_array = String::with_capacity(array_text.len());
+            let mut last = 0;
+            let mut specifier: Option<String> = None;
+            let mut matched = false;
             for (s, e) in top_level_brace_groups(array_text) {
                 let entry = &array_text[s..e];
                 if !entry.contains(&needle) {
                     continue;
                 }
-                let (new_entry, specifier) = path_source_entry(entry, rel_wheel);
+                let (new_entry, spec) = path_source_entry(entry, rel_wheel);
+                if specifier.is_none() {
+                    specifier = spec;
+                }
+                new_array.push_str(&array_text[last..s]);
+                new_array.push_str(&new_entry);
+                last = e;
+                matched = true;
+            }
+            if matched {
+                new_array.push_str(&array_text[last..]);
                 // Fragment from the group key so revert's text match can't
                 // confuse two groups pinning the same entry.
                 let key_start = unit_text[..arr_open].rfind('\n').map_or(0, |i| i + 1);
                 edits.push(RequiresDistEdit {
                     span: (unit_start + key_start)..(unit_start + arr_end),
                     old_entry: unit_text[key_start..arr_end].to_string(),
-                    new_entry: format!(
-                        "{}{}{}",
-                        &unit_text[key_start..arr_open + s],
-                        new_entry,
-                        &unit_text[arr_open + e..arr_end]
-                    ),
+                    new_entry: format!("{}{}", &unit_text[key_start..arr_open], new_array),
                     specifier,
                     kind: "uv_lock_requires_dev",
                 });
-                break;
             }
             cursor = arr_end;
         }
@@ -1123,6 +1293,92 @@ fn rewrite_root_metadata_entries(
                  for {canon}; run `uv lock` first"
             ),
         ));
+    }
+    Ok(edits)
+}
+
+/// Find + transform every `[manifest] constraints` / `build-constraints`
+/// element naming `canon` (`[tool.uv] constraint-dependencies` /
+/// `build-constraint-dependencies`). uv >= 0.5.6 re-serializes a sourced
+/// package's element as `{ name, path }` (specifier dropped — uv 0.12.15
+/// ground truth), so an element left with its specifier keeps `uv lock
+/// --check` / `uv sync --locked` at exit 2 and a plain sync churns the
+/// lock. One edit per key, spanning the whole `<key> = […]` line with every
+/// matching element rewritten: the key prefix keeps revert's text match from
+/// confusing the element with a byte-identical requires-dist one. A lock
+/// without `[manifest]` or without the keys yields no edits (most locks).
+fn rewrite_manifest_constraints(
+    lock_text: &str,
+    canon: &str,
+    rel_wheel: &str,
+) -> Result<Vec<RequiresDistEdit>, (&'static str, String)> {
+    let index = line_index(lock_text);
+    let Some(h) = index.iter().position(|(_, l)| l.trim_end() == "[manifest]") else {
+        return Ok(Vec::new());
+    };
+    // Section spans until the next top-level header.
+    let section_end_line = index[h + 1..]
+        .iter()
+        .position(|(_, l)| l.starts_with('['))
+        .map(|i| h + 1 + i)
+        .unwrap_or(index.len());
+    let section_start = index[h].0;
+    let section_end = index
+        .get(section_end_line)
+        .map(|(off, _)| *off)
+        .unwrap_or(lock_text.len());
+    let section = &lock_text[section_start..section_end];
+    let needle = format!("name = \"{canon}\"");
+    let mut edits: Vec<RequiresDistEdit> = Vec::new();
+
+    for key in ["constraints", "build-constraints"] {
+        let prefix = format!("{key} = [");
+        // Keys sit at line start, so `constraints = [` can never match inside
+        // `build-constraints = [`.
+        let Some(line_off) = line_index(section)
+            .iter()
+            .find(|(_, l)| l.starts_with(&prefix))
+            .map(|(off, _)| *off)
+        else {
+            continue;
+        };
+        let arr_open = line_off + prefix.len() - 1;
+        let arr_end = balanced_span(section, arr_open).ok_or_else(|| {
+            (
+                "pypi_uv_lock_parse_failed",
+                format!("uv.lock [manifest] {key} array is unbalanced"),
+            )
+        })?;
+        let array_text = &section[arr_open..arr_end];
+        let mut new_array = String::with_capacity(array_text.len());
+        let mut last = 0;
+        let mut specifier: Option<String> = None;
+        let mut matched = false;
+        for (s, e) in top_level_brace_groups(array_text) {
+            let entry = &array_text[s..e];
+            if !entry.contains(&needle) {
+                continue;
+            }
+            let (new_entry, spec) = path_source_entry(entry, rel_wheel);
+            if specifier.is_none() {
+                specifier = spec;
+            }
+            new_array.push_str(&array_text[last..s]);
+            new_array.push_str(&new_entry);
+            last = e;
+            matched = true;
+        }
+        if !matched {
+            continue;
+        }
+        new_array.push_str(&array_text[last..]);
+        edits.push(RequiresDistEdit {
+            span: (section_start + line_off)..(section_start + arr_end),
+            old_entry: section[line_off..arr_end].to_string(),
+            new_entry: format!("{}{}", &section[line_off..arr_open], new_array),
+            specifier,
+            kind: "uv_lock_manifest_constraints",
+        });
     }
     Ok(edits)
 }
@@ -1160,6 +1416,9 @@ fn add_manifest_override(
     rel_wheel: &str,
 ) -> Result<(WiringRecord, String), (&'static str, String)> {
     let element = format!("{{ name = \"{canon}\", path = \"{rel_wheel}\" }}");
+    // Every created/spliced fragment is built with the lock's own terminator
+    // (revert removes `{new}{nl}` / `{new}{nl}{nl}` with the same detection).
+    let nl = newline_of(lock_text);
     let index = line_index(lock_text);
     let manifest_line = index.iter().position(|(_, l)| l.trim_end() == "[manifest]");
 
@@ -1176,9 +1435,9 @@ fn add_manifest_override(
                     "uv.lock has no [[package]] entries".to_string(),
                 )
             })?;
-        let section = format!("[manifest]\noverrides = [{element}]");
+        let section = format!("[manifest]{nl}overrides = [{element}]");
         let mut text = lock_text.to_string();
-        text.insert_str(first_pkg, &format!("{section}\n\n"));
+        text.insert_str(first_pkg, &format!("{section}{nl}{nl}"));
         return Ok((
             record(
                 "uv.lock",
@@ -1217,7 +1476,7 @@ fn add_manifest_override(
         let new_array = if old_array.contains('\n') {
             // multi-line: add an indented element before the closing bracket
             let body = &old_array[..old_array.rfind(']').unwrap_or(old_array.len())];
-            format!("{body}    {element},\n]")
+            format!("{body}    {element},{nl}]")
         } else if old_array[1..old_array.len() - 1].trim().is_empty() {
             // `overrides = []` (hand-edited; uv omits the key when empty):
             // no existing element to comma-separate from
@@ -1251,7 +1510,7 @@ fn add_manifest_override(
         .map(|(off, _)| *off)
         .unwrap_or(lock_text.len());
     let mut text = lock_text.to_string();
-    text.insert_str(insert_at, &format!("{line}\n"));
+    text.insert_str(insert_at, &format!("{line}{nl}"));
     Ok((
         record(
             "uv.lock",
@@ -1748,7 +2007,7 @@ wheels = [
         assert!(p.warnings.is_empty());
         assert_eq!(classify_dependency(&p, "six"), UvDepClass::Direct);
 
-        let (wiring, meta) = wire_uv(
+        let (wiring, meta, _) = wire_uv(
             &p,
             tmp.path(),
             "six",
@@ -1795,7 +2054,7 @@ wheels = [
         let p = load_uv_project(tmp.path()).await.unwrap();
         assert_eq!(classify_dependency(&p, "six"), UvDepClass::Transitive);
 
-        let (wiring, meta) = wire_uv(
+        let (wiring, meta, _) = wire_uv(
             &p,
             tmp.path(),
             "six",
@@ -2072,7 +2331,7 @@ wheels = [
     async fn revert_direct_restores_originals_byte_identically() {
         let tmp = write_pair(DIRECT_REGISTRY_PYPROJECT, DIRECT_REGISTRY_LOCK).await;
         let p = load_uv_project(tmp.path()).await.unwrap();
-        let (wiring, meta) = wire_uv(
+        let (wiring, meta, _) = wire_uv(
             &p,
             tmp.path(),
             "six",
@@ -2101,7 +2360,7 @@ wheels = [
     async fn revert_override_restores_originals_byte_identically() {
         let tmp = write_pair(TRANSITIVE_REGISTRY_PYPROJECT, TRANSITIVE_REGISTRY_LOCK).await;
         let p = load_uv_project(tmp.path()).await.unwrap();
-        let (wiring, meta) = wire_uv(
+        let (wiring, meta, _) = wire_uv(
             &p,
             tmp.path(),
             "six",
@@ -2188,7 +2447,7 @@ wheels = [
         };
 
         let p = load_uv_project(tmp.path()).await.unwrap();
-        let (wiring, meta) = wire_uv(
+        let (wiring, meta, _) = wire_uv(
             &p,
             tmp.path(),
             "six",
@@ -2222,7 +2481,7 @@ wheels = [
     async fn revert_dry_run_changes_nothing() {
         let tmp = write_pair(DIRECT_REGISTRY_PYPROJECT, DIRECT_REGISTRY_LOCK).await;
         let p = load_uv_project(tmp.path()).await.unwrap();
-        let (wiring, meta) = wire_uv(
+        let (wiring, meta, _) = wire_uv(
             &p,
             tmp.path(),
             "six",
@@ -2250,7 +2509,7 @@ wheels = [
     async fn revert_warns_and_skips_on_drifted_lock_fragment() {
         let tmp = write_pair(DIRECT_REGISTRY_PYPROJECT, DIRECT_REGISTRY_LOCK).await;
         let p = load_uv_project(tmp.path()).await.unwrap();
-        let (wiring, meta) = wire_uv(
+        let (wiring, meta, _) = wire_uv(
             &p,
             tmp.path(),
             "six",
@@ -2407,6 +2666,24 @@ wheels = [
     }
 
     // ── path-source [package.metadata] reconstruction ──────────────────
+
+    /// uv 0.2.35/0.2.36 locks have a root `[[package]]` but no
+    /// `[package.metadata]`: the metadata step is a no-op rather than a
+    /// refusal. A lock that carries metadata without the entry still refuses.
+    #[test]
+    fn root_metadata_rewrite_is_a_noop_for_locks_without_package_metadata() {
+        let without = "version = 1\nrequires-python = \">=3.9\"\n\n[[package]]\nname = \"fixture\"\nversion = \"0.1.0\"\nsource = { editable = \".\" }\ndependencies = [\n    { name = \"six\" },\n]\n\n[[package]]\nname = \"six\"\nversion = \"1.16.0\"\nsource = { registry = \"https://pypi.org/simple\" }\nwheels = [\n    { url = \"https://files.pythonhosted.org/six-1.16.0-py2.py3-none-any.whl\", hash = \"sha256:old\" },\n]\n";
+        let edits = rewrite_root_metadata_entries(without, "six", REL_WHEEL).unwrap();
+        assert!(edits.is_empty());
+        let stale = without.replace(
+            "dependencies = [\n    { name = \"six\" },\n]\n",
+            "dependencies = [\n    { name = \"six\" },\n]\n\n[package.metadata]\nrequires-dist = [{ name = \"other\", specifier = \"==1\" }]\n",
+        );
+        let err = rewrite_root_metadata_entries(&stale, "six", REL_WHEEL)
+            .err()
+            .expect("metadata without the entry must refuse");
+        assert_eq!(err.0, "pypi_uv_lock_package_missing");
+    }
 
     #[test]
     fn parse_requires_dist_pulls_apart_name_extras_specifier_marker() {
@@ -2592,7 +2869,7 @@ wheels = [
 
         let p = load_uv_project(tmp.path()).await.unwrap();
         assert_eq!(classify_dependency(&p, "widget"), UvDepClass::Direct);
-        let (wiring, meta) = wire_uv(
+        let (wiring, meta, _) = wire_uv(
             &p,
             tmp.path(),
             "widget",
@@ -2654,7 +2931,7 @@ wheels = [
         );
         let tmp = write_pair(TRANSITIVE_REGISTRY_PYPROJECT, &empty_overrides_lock).await;
         let p = load_uv_project(tmp.path()).await.unwrap();
-        let (wiring, meta) = wire_uv(
+        let (wiring, meta, _) = wire_uv(
             &p,
             tmp.path(),
             "six",
@@ -2883,7 +3160,7 @@ wheels = [
         let p = load_uv_project(tmp.path()).await.unwrap();
         assert_eq!(classify_dependency(&p, "six"), UvDepClass::Direct);
 
-        let (wiring, meta) = wire_uv(
+        let (wiring, meta, _) = wire_uv(
             &p,
             tmp.path(),
             "six",
@@ -2932,7 +3209,7 @@ wheels = [
         let p = load_uv_project(tmp.path()).await.unwrap();
         assert_eq!(classify_dependency(&p, "six"), UvDepClass::Direct);
 
-        let (wiring, meta) = wire_uv(
+        let (wiring, meta, _) = wire_uv(
             &p,
             tmp.path(),
             "six",
@@ -3067,7 +3344,7 @@ wheels = [
         assert!(p.warnings.is_empty(), "{:?}", p.warnings);
         assert_eq!(p.lock_revision, None);
 
-        let (_, meta) = wire_uv(
+        let (_, meta, _) = wire_uv(
             &p,
             tmp.path(),
             "six",
@@ -3138,7 +3415,7 @@ wheels = [
         let p = load_uv_project(tmp.path()).await.unwrap();
         assert_eq!(classify_dependency(&p, "six"), UvDepClass::Transitive);
 
-        let (wiring, meta) = wire_uv(
+        let (wiring, meta, _) = wire_uv(
             &p,
             tmp.path(),
             "six",
@@ -3198,7 +3475,7 @@ wheels = [
         );
         let tmp = write_pair(TRANSITIVE_REGISTRY_PYPROJECT, &input_lock).await;
         let p = load_uv_project(tmp.path()).await.unwrap();
-        let (wiring, meta) = wire_uv(
+        let (wiring, meta, _) = wire_uv(
             &p,
             tmp.path(),
             "six",
@@ -3257,7 +3534,7 @@ wheels = [
         );
         let tmp = write_pair(TRANSITIVE_REGISTRY_PYPROJECT, &input_lock).await;
         let p = load_uv_project(tmp.path()).await.unwrap();
-        let (wiring, meta) = wire_uv(
+        let (wiring, meta, _) = wire_uv(
             &p,
             tmp.path(),
             "six",
@@ -3307,7 +3584,7 @@ wheels = [
         );
         let tmp = write_pair(TRANSITIVE_REGISTRY_PYPROJECT, &input_lock).await;
         let p = load_uv_project(tmp.path()).await.unwrap();
-        let (wiring, meta) = wire_uv(
+        let (wiring, meta, _) = wire_uv(
             &p,
             tmp.path(),
             "six",
@@ -3366,7 +3643,7 @@ wheels = [
         );
         let tmp = write_pair(TRANSITIVE_REGISTRY_PYPROJECT, &input_lock).await;
         let p = load_uv_project(tmp.path()).await.unwrap();
-        let (wiring, meta) = wire_uv(
+        let (wiring, meta, _) = wire_uv(
             &p,
             tmp.path(),
             "six",
@@ -3431,7 +3708,7 @@ wheels = [
     async fn revert_warns_and_skips_when_sources_line_was_edited() {
         let tmp = write_pair(DIRECT_REGISTRY_PYPROJECT, DIRECT_REGISTRY_LOCK).await;
         let p = load_uv_project(tmp.path()).await.unwrap();
-        let (wiring, meta) = wire_uv(
+        let (wiring, meta, _) = wire_uv(
             &p,
             tmp.path(),
             "six",
@@ -3494,7 +3771,7 @@ wheels = [
         ] {
             let tmp = write_pair(registry_py, registry_lock).await;
             let p = load_uv_project(tmp.path()).await.unwrap();
-            let (wiring, meta) = wire_uv(
+            let (wiring, meta, _) = wire_uv(
                 &p,
                 tmp.path(),
                 target,
@@ -3540,7 +3817,7 @@ wheels = [
     async fn revert_pypi_converged_uv_cleans_up_the_artifact() {
         let tmp = write_pair(DIRECT_REGISTRY_PYPROJECT, DIRECT_REGISTRY_LOCK).await;
         let p = load_uv_project(tmp.path()).await.unwrap();
-        let (wiring, meta) = wire_uv(
+        let (wiring, meta, _) = wire_uv(
             &p,
             tmp.path(),
             "six",
@@ -3588,7 +3865,7 @@ wheels = [
     async fn revert_pypi_drifted_uv_keeps_artifact() {
         let tmp = write_pair(DIRECT_REGISTRY_PYPROJECT, DIRECT_REGISTRY_LOCK).await;
         let p = load_uv_project(tmp.path()).await.unwrap();
-        let (wiring, meta) = wire_uv(
+        let (wiring, meta, _) = wire_uv(
             &p,
             tmp.path(),
             "six",
@@ -3645,7 +3922,7 @@ wheels = [
     async fn revert_warns_and_skips_when_added_override_line_was_edited() {
         let tmp = write_pair(TRANSITIVE_REGISTRY_PYPROJECT, TRANSITIVE_REGISTRY_LOCK).await;
         let p = load_uv_project(tmp.path()).await.unwrap();
-        let (wiring, meta) = wire_uv(
+        let (wiring, meta, _) = wire_uv(
             &p,
             tmp.path(),
             "six",
@@ -3776,7 +4053,7 @@ wheels = [
         use std::os::unix::fs::PermissionsExt;
         let tmp = write_pair(DIRECT_REGISTRY_PYPROJECT, DIRECT_REGISTRY_LOCK).await;
         let p = load_uv_project(tmp.path()).await.unwrap();
-        let (wiring, meta) = wire_uv(
+        let (wiring, meta, _) = wire_uv(
             &p,
             tmp.path(),
             "six",
@@ -3846,7 +4123,7 @@ wheels = [
 
         let tmp = write_pair(DIRECT_REGISTRY_PYPROJECT, &sdist_only_lock).await;
         let p = load_uv_project(tmp.path()).await.unwrap();
-        let (wiring, meta) = wire_uv(
+        let (wiring, meta, _) = wire_uv(
             &p,
             tmp.path(),
             "six",
@@ -4290,7 +4567,7 @@ wheels = [
     async fn revert_warns_when_created_manifest_section_still_routes_after_reshape() {
         let tmp = write_pair(TRANSITIVE_REGISTRY_PYPROJECT, TRANSITIVE_REGISTRY_LOCK).await;
         let p = load_uv_project(tmp.path()).await.unwrap();
-        let (wiring, meta) = wire_uv(
+        let (wiring, meta, _) = wire_uv(
             &p,
             tmp.path(),
             "six",
@@ -4360,7 +4637,7 @@ wheels = [
         );
         let tmp = write_pair(TRANSITIVE_REGISTRY_PYPROJECT, &input_lock).await;
         let p = load_uv_project(tmp.path()).await.unwrap();
-        let (wiring, meta) = wire_uv(
+        let (wiring, meta, _) = wire_uv(
             &p,
             tmp.path(),
             "six",
@@ -4399,7 +4676,7 @@ wheels = [
         );
         let tmp = write_pair(&pyproject, TRANSITIVE_REGISTRY_LOCK).await;
         let p = load_uv_project(tmp.path()).await.unwrap();
-        let (wiring, meta) = wire_uv(
+        let (wiring, meta, _) = wire_uv(
             &p,
             tmp.path(),
             "six",
@@ -4434,7 +4711,7 @@ wheels = [
         );
         let tmp = write_pair(&pyproject, TRANSITIVE_REGISTRY_LOCK).await;
         let p = load_uv_project(tmp.path()).await.unwrap();
-        let (wiring, meta) = wire_uv(
+        let (wiring, meta, _) = wire_uv(
             &p,
             tmp.path(),
             "six",
@@ -4635,5 +4912,624 @@ wheels = [
         let err = add_manifest_override(lock, "six", REL_WHEEL).unwrap_err();
         assert_eq!(err.0, "pypi_uv_lock_parse_failed");
         assert!(err.1.contains("overrides array is unbalanced"), "{}", err.1);
+    }
+
+    // ── legacy `[tool.uv] dev-dependencies` (uv 0.12.15 ground truth) ───
+    // uv still honours the deprecated array (with a warning) and records it
+    // EXACTLY like `[dependency-groups] dev`: a `[package.dev-dependencies]
+    // dev` edge plus a `[package.metadata.requires-dev] dev` entry, never a
+    // requires-dist one. The lock shapes are therefore the dev-group ones.
+
+    const TOOL_UV_DEV_REGISTRY_PYPROJECT: &str = r#"[project]
+name = "proj"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.uv]
+dev-dependencies = ["six==1.16.0"]
+"#;
+
+    const TOOL_UV_DEV_PATH_PYPROJECT: &str = r#"[project]
+name = "proj"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.uv]
+dev-dependencies = ["six==1.16.0"]
+
+[tool.uv.sources]
+six = { path = ".socket/vendor/pypi/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/six-1.16.0-py2.py3-none-any.whl" }
+"#;
+
+    /// A target declared ONLY in the legacy `[tool.uv] dev-dependencies`
+    /// array is a Direct dependency: `[tool.uv.sources]` applies to it and
+    /// the lock keeps it in `[package.metadata.requires-dev]`. Classifying
+    /// it Transitive took the override branch and left the requires-dev
+    /// `specifier` in place, so every uv >= 0.2.37 `uv sync --locked` /
+    /// `uv lock --check` failed after a "successful" vendored scan (and a
+    /// plain `uv sync` on 0.2.37/0.4.30 reinstalled the pristine wheel).
+    #[tokio::test]
+    async fn tool_uv_dev_dependencies_classify_direct_and_repoint_requires_dev() {
+        let tmp = write_pair(TOOL_UV_DEV_REGISTRY_PYPROJECT, DEV_GROUP_REGISTRY_LOCK).await;
+        let p = load_uv_project(tmp.path()).await.unwrap();
+        assert_eq!(
+            classify_dependency(&p, "six"),
+            UvDepClass::Direct,
+            "[tool.uv] dev-dependencies is a declaration surface sources apply to"
+        );
+
+        let (wiring, meta, _) = wire_uv(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UUID,
+        )
+        .await
+        .unwrap();
+
+        let kinds: Vec<&str> = wiring.iter().map(|w| w.kind.as_str()).collect();
+        assert_eq!(
+            kinds,
+            vec!["uv_sources_entry", "uv_lock_package", "uv_lock_requires_dev"],
+            "a requires-dev repoint and NO override record"
+        );
+        assert_eq!(meta.dep_class, "direct");
+        assert_eq!(meta.original_specifier.as_deref(), Some("==1.16.0"));
+        let (pyproject, lock) = read_pair(tmp.path()).await;
+        assert!(
+            !pyproject.contains("override-dependencies"),
+            "no override pin may be layered on a declared dependency:\n{pyproject}"
+        );
+        assert_eq!(pyproject, TOOL_UV_DEV_PATH_PYPROJECT);
+        assert_eq!(
+            lock, DEV_GROUP_PATH_LOCK,
+            "the requires-dev entry must carry `path` (uv 0.12.15 shape)"
+        );
+
+        let entry = entry_for(wiring, meta);
+        let outcome = revert_uv(&entry, tmp.path(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        let (pyproject, lock) = read_pair(tmp.path()).await;
+        assert_eq!(pyproject, TOOL_UV_DEV_REGISTRY_PYPROJECT);
+        assert_eq!(lock, DEV_GROUP_REGISTRY_LOCK);
+    }
+
+    // ── extras duplicate (uv 0.12.15 ground truth) ───────────────────────
+    // A package in BOTH project.dependencies and an optional-dependencies
+    // extra yields two requires-dist entries (the second carries
+    // `marker = "extra == '…'"`); a path source repoints BOTH.
+
+    const EXTRAS_DUP_REGISTRY_PYPROJECT: &str = r#"[project]
+name = "proj"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = ["six==1.16.0"]
+
+[project.optional-dependencies]
+socks = ["six==1.16.0"]
+"#;
+
+    const EXTRAS_DUP_REGISTRY_LOCK: &str = r#"version = 1
+revision = 3
+requires-python = ">=3.10"
+
+[[package]]
+name = "proj"
+version = "0.1.0"
+source = { virtual = "." }
+dependencies = [
+    { name = "six" },
+]
+
+[package.optional-dependencies]
+socks = [
+    { name = "six" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "six", specifier = "==1.16.0" },
+    { name = "six", marker = "extra == 'socks'", specifier = "==1.16.0" },
+]
+provides-extras = ["socks"]
+
+[[package]]
+name = "six"
+version = "1.16.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/71/39/171f1c67cd00715f190ba0b100d606d440a28c93c7714febeca8b79af85e/six-1.16.0.tar.gz", hash = "sha256:1e61c37477a1626458e36f7b1d82aa5c9b094fa4802892072e49de9c60c4c926", size = 34041, upload-time = "2021-05-05T14:18:18.379Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d9/5a/e7c31adbe875f2abbb91bd84cf2dc52d792b5a01506781dbcf25c91daf11/six-1.16.0-py2.py3-none-any.whl", hash = "sha256:8abb2f1d86890a2dfb989f9a77cfcfd3e47c2a354b01111771326f8aa26e0254", size = 11053, upload-time = "2021-05-05T14:18:17.237Z" },
+]
+"#;
+
+    const EXTRAS_DUP_PATH_LOCK: &str = r#"version = 1
+revision = 3
+requires-python = ">=3.10"
+
+[[package]]
+name = "proj"
+version = "0.1.0"
+source = { virtual = "." }
+dependencies = [
+    { name = "six" },
+]
+
+[package.optional-dependencies]
+socks = [
+    { name = "six" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "six", path = ".socket/vendor/pypi/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/six-1.16.0-py2.py3-none-any.whl" },
+    { name = "six", marker = "extra == 'socks'", path = ".socket/vendor/pypi/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/six-1.16.0-py2.py3-none-any.whl" },
+]
+provides-extras = ["socks"]
+
+[[package]]
+name = "six"
+version = "1.16.0"
+source = { path = ".socket/vendor/pypi/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/six-1.16.0-py2.py3-none-any.whl" }
+wheels = [
+    { filename = "six-1.16.0-py2.py3-none-any.whl", hash = "sha256:8abb2f1d86890a2dfb989f9a77cfcfd3e47c2a354b01111771326f8aa26e0254" },
+]
+"#;
+
+    /// Both requires-dist entries for one package (bare + extra-marker) are
+    /// repointed — one wiring record each — and revert restores both. The
+    /// first-match `break` left the marker entry with its `specifier`, so
+    /// `uv lock --check` / `uv sync --locked` failed after vendoring.
+    #[tokio::test]
+    async fn duplicate_requires_dist_entries_all_repointed() {
+        let tmp = write_pair(EXTRAS_DUP_REGISTRY_PYPROJECT, EXTRAS_DUP_REGISTRY_LOCK).await;
+        let p = load_uv_project(tmp.path()).await.unwrap();
+        assert_eq!(classify_dependency(&p, "six"), UvDepClass::Direct);
+
+        let (wiring, meta, _) = wire_uv(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UUID,
+        )
+        .await
+        .unwrap();
+
+        let kinds: Vec<&str> = wiring.iter().map(|w| w.kind.as_str()).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "uv_sources_entry",
+                "uv_lock_package",
+                "uv_lock_requires_dist",
+                "uv_lock_requires_dist"
+            ],
+            "one record per repointed requires-dist entry"
+        );
+        let (_, lock) = read_pair(tmp.path()).await;
+        assert_eq!(
+            lock, EXTRAS_DUP_PATH_LOCK,
+            "both the bare and the extra-marker entries must carry `path`"
+        );
+
+        let entry = entry_for(wiring, meta);
+        let outcome = revert_uv(&entry, tmp.path(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        let (pyproject, lock) = read_pair(tmp.path()).await;
+        assert_eq!(pyproject, EXTRAS_DUP_REGISTRY_PYPROJECT);
+        assert_eq!(lock, EXTRAS_DUP_REGISTRY_LOCK);
+    }
+
+    /// uv 0.2.35–0.5.3 do NOT apply `[tool.uv.sources]` to
+    /// override-dependencies: a transitive target wired through the override
+    /// branch is silently reinstalled from the registry by a plain `uv sync`
+    /// on those releases, and no lock-shape marker separates 0.5.3 from
+    /// 0.5.6, so an offline refusal is impossible. The branch must surface a
+    /// stable advisory; the Direct branch must stay silent.
+    #[tokio::test]
+    async fn override_branch_emits_uv_version_advisory() {
+        let tmp = write_pair(TRANSITIVE_REGISTRY_PYPROJECT, TRANSITIVE_REGISTRY_LOCK).await;
+        let p = load_uv_project(tmp.path()).await.unwrap();
+        let (_, meta, advisories) = wire_uv(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UUID,
+        )
+        .await
+        .unwrap();
+        assert_eq!(meta.dep_class, "override");
+        let codes: Vec<&str> = advisories.iter().map(|w| w.code).collect();
+        assert_eq!(codes, vec!["pypi_uv_override_requires_uv_0_5_6"]);
+        let detail = &advisories[0].detail;
+        assert!(
+            detail.contains("0.5.6") && detail.contains("override-dependencies"),
+            "{detail}"
+        );
+
+        let tmp = write_pair(DIRECT_REGISTRY_PYPROJECT, DIRECT_REGISTRY_LOCK).await;
+        let p = load_uv_project(tmp.path()).await.unwrap();
+        let (_, meta, advisories) = wire_uv(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UUID,
+        )
+        .await
+        .unwrap();
+        assert_eq!(meta.dep_class, "direct");
+        assert!(
+            advisories.is_empty(),
+            "a direct dependency needs no override advisory: {advisories:?}"
+        );
+    }
+
+    // ── [tool.uv] constraint-dependencies (uv 0.12.15 ground truth) ─────
+    // A constrained package is recorded in `[manifest] constraints`
+    // (resp. `build-constraints` for build-constraint-dependencies) as
+    // `{ name, specifier }`; once the package has a path source uv >= 0.5.6
+    // re-serializes the element as `{ name, path }` — a stale specifier
+    // keeps `uv lock --check` / `uv sync --locked` at exit 2.
+
+    const CONSTRAINTS_REGISTRY_PYPROJECT: &str = r#"[project]
+name = "proj"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = ["six==1.16.0"]
+
+[tool.uv]
+constraint-dependencies = ["six==1.16.0"]
+"#;
+
+    const CONSTRAINTS_PATH_PYPROJECT: &str = r#"[project]
+name = "proj"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = ["six==1.16.0"]
+
+[tool.uv]
+constraint-dependencies = ["six==1.16.0"]
+
+[tool.uv.sources]
+six = { path = ".socket/vendor/pypi/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/six-1.16.0-py2.py3-none-any.whl" }
+"#;
+
+    /// `[manifest] constraints` AND `build-constraints` elements naming the
+    /// target are repointed to the path shape (one whole-line record per
+    /// key, kind `uv_lock_manifest_constraints`) and revert restores them
+    /// byte-exactly. Fixtures: the DIRECT pair with the uv 0.12.15
+    /// `[manifest]` block prepended.
+    #[tokio::test]
+    async fn constraint_dependencies_manifest_entries_repointed_and_reverted() {
+        let manifest = "[manifest]\nconstraints = [{ name = \"six\", specifier = \"==1.16.0\" }]\nbuild-constraints = [{ name = \"six\", specifier = \">=1.16\" }]\n\n";
+        let registry_lock = DIRECT_REGISTRY_LOCK.replacen("[[package]]", &format!("{manifest}[[package]]"), 1);
+        let path_manifest = format!(
+            "[manifest]\nconstraints = [{{ name = \"six\", path = \"{REL_WHEEL}\" }}]\nbuild-constraints = [{{ name = \"six\", path = \"{REL_WHEEL}\" }}]\n\n"
+        );
+        let path_lock = DIRECT_PATH_LOCK.replacen("[[package]]", &format!("{path_manifest}[[package]]"), 1);
+
+        let tmp = write_pair(CONSTRAINTS_REGISTRY_PYPROJECT, &registry_lock).await;
+        let p = load_uv_project(tmp.path()).await.unwrap();
+        let (wiring, meta, advisories) = wire_uv(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UUID,
+        )
+        .await
+        .unwrap();
+
+        // The repoint is the uv >= 0.5.6 shape; 0.2.37–0.5.3 reject it under
+        // `--locked` (matrix: 0.2.37–0.5.0 fail, 0.5.16+ pass), so it advises.
+        let codes: Vec<&str> = advisories.iter().map(|w| w.code).collect();
+        assert_eq!(codes, vec!["pypi_uv_constraints_require_uv_0_5_6"]);
+        assert!(advisories[0].detail.contains("0.5.6"), "{}", advisories[0].detail);
+
+        let (pyproject, lock) = read_pair(tmp.path()).await;
+        assert_eq!(pyproject, CONSTRAINTS_PATH_PYPROJECT);
+        assert_eq!(
+            lock, path_lock,
+            "both [manifest] constraint arrays must carry `path` (uv 0.12.15 shape)"
+        );
+        let kinds: Vec<&str> = wiring.iter().map(|w| w.kind.as_str()).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "uv_sources_entry",
+                "uv_lock_package",
+                "uv_lock_requires_dist",
+                "uv_lock_manifest_constraints",
+                "uv_lock_manifest_constraints",
+            ]
+        );
+        let constraint_records: Vec<&WiringRecord> = wiring
+            .iter()
+            .filter(|w| w.kind == "uv_lock_manifest_constraints")
+            .collect();
+        assert_eq!(
+            constraint_records[0].original.as_ref().and_then(|v| v.as_str()),
+            Some("constraints = [{ name = \"six\", specifier = \"==1.16.0\" }]"),
+            "the fragment spans the whole key line so revert cannot confuse it \
+             with an identical requires-dist element"
+        );
+        assert_eq!(
+            constraint_records[1].original.as_ref().and_then(|v| v.as_str()),
+            Some("build-constraints = [{ name = \"six\", specifier = \">=1.16\" }]")
+        );
+
+        let entry = entry_for(wiring, meta);
+        let outcome = revert_uv(&entry, tmp.path(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        let (pyproject, lock) = read_pair(tmp.path()).await;
+        assert_eq!(pyproject, CONSTRAINTS_REGISTRY_PYPROJECT);
+        assert_eq!(lock, registry_lock);
+    }
+
+    /// Whether `text` holds a `\n` that is not part of a `\r\n` pair.
+    fn has_bare_lf(text: &str) -> bool {
+        let bytes = text.as_bytes();
+        bytes
+            .iter()
+            .enumerate()
+            .any(|(i, &b)| b == b'\n' && (i == 0 || bytes[i - 1] != b'\r'))
+    }
+
+    /// A pure-CRLF pair (git autocrlf on Windows) must wire to a pure-CRLF
+    /// pair and revert byte-exactly. `doc.to_string()` re-emits every
+    /// pyproject newline as LF, the lock surgery joined rebuilt units and
+    /// created `[manifest]` fragments with LF (mixed endings), and revert's
+    /// hardcoded `"{new}\n"` removals then missed. Covers the Direct,
+    /// Transitive (created override + created `[manifest]`), Rewritten
+    /// override (multi-line arrays in both files) and requires-dev shapes.
+    #[tokio::test]
+    async fn crlf_pyproject_and_lock_round_trip_byte_exact() {
+        let existing_override_pyproject = format!(
+            "{TRANSITIVE_REGISTRY_PYPROJECT}\n[tool.uv]\noverride-dependencies = [\n    \"attrs==23.1.0\",\n]\n"
+        );
+        let existing_override_lock = TRANSITIVE_REGISTRY_LOCK.replacen(
+            "[[package]]",
+            "[manifest]\noverrides = [\n    { name = \"attrs\", specifier = \"==23.1.0\" },\n]\n\n[[package]]",
+            1,
+        );
+        let cases: [(&str, &str, &str); 4] = [
+            ("direct", DIRECT_REGISTRY_PYPROJECT, DIRECT_REGISTRY_LOCK),
+            (
+                "transitive",
+                TRANSITIVE_REGISTRY_PYPROJECT,
+                TRANSITIVE_REGISTRY_LOCK,
+            ),
+            (
+                "existing-override",
+                &existing_override_pyproject,
+                &existing_override_lock,
+            ),
+            ("dev-group", DEV_GROUP_REGISTRY_PYPROJECT, DEV_GROUP_REGISTRY_LOCK),
+        ];
+        for (label, pyproject_lf, lock_lf) in cases {
+            let pyproject_crlf = pyproject_lf.replace('\n', "\r\n");
+            let lock_crlf = lock_lf.replace('\n', "\r\n");
+            let tmp = write_pair(&pyproject_crlf, &lock_crlf).await;
+            let p = load_uv_project(tmp.path()).await.unwrap();
+            let (wiring, meta, _) = wire_uv(
+                &p,
+                tmp.path(),
+                "six",
+                "1.16.0",
+                REL_WHEEL,
+                WHEEL_NAME,
+                WHEEL_SHA,
+                UUID,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{label}: {e:?}"));
+
+            let (pyproject, lock) = read_pair(tmp.path()).await;
+            assert!(
+                !has_bare_lf(&pyproject),
+                "{label}: wired pyproject.toml must stay pure CRLF:\n{pyproject:?}"
+            );
+            assert!(
+                !has_bare_lf(&lock),
+                "{label}: wired uv.lock must stay pure CRLF:\n{lock:?}"
+            );
+            assert!(
+                lock.contains(REL_WHEEL) && pyproject.contains(REL_WHEEL),
+                "{label}: the pair must actually be wired"
+            );
+            // Modulo line endings the wired pair is the LF pair's wiring.
+            let tmp_lf = write_pair(pyproject_lf, lock_lf).await;
+            let p_lf = load_uv_project(tmp_lf.path()).await.unwrap();
+            wire_uv(
+                &p_lf,
+                tmp_lf.path(),
+                "six",
+                "1.16.0",
+                REL_WHEEL,
+                WHEEL_NAME,
+                WHEEL_SHA,
+                UUID,
+            )
+            .await
+            .unwrap();
+            let (pyproject_expect, lock_expect) = read_pair(tmp_lf.path()).await;
+            assert_eq!(
+                pyproject.replace("\r\n", "\n"),
+                pyproject_expect,
+                "{label}: pyproject wiring differs beyond line endings"
+            );
+            assert_eq!(
+                lock.replace("\r\n", "\n"),
+                lock_expect,
+                "{label}: lock wiring differs beyond line endings"
+            );
+
+            let entry = entry_for(wiring, meta);
+            let outcome = revert_uv(&entry, tmp.path(), false).await;
+            assert!(outcome.success, "{label}: {:?}", outcome.error);
+            assert!(
+                outcome.warnings.is_empty(),
+                "{label}: {:?}",
+                outcome.warnings
+            );
+            let (pyproject, lock) = read_pair(tmp.path()).await;
+            assert_eq!(pyproject, pyproject_crlf, "{label}: pyproject not restored");
+            assert_eq!(lock, lock_crlf, "{label}: lock not restored");
+        }
+    }
+
+    /// The `[[distribution]]` refusal names the REAL limitation measured
+    /// against the 0.1.45–0.2.34 binaries (relative path sources are
+    /// rejected by `--locked` and absolutized by `uv lock` / `uv sync`),
+    /// not the old "records absolute file paths" folklore, and points at
+    /// both exits (uv >= 0.2.35, or a requirements.txt install).
+    #[tokio::test]
+    async fn legacy_distribution_lock_refusal_names_the_real_limitation() {
+        let legacy_lock = "version = 1\nrequires-python = \">=3.9\"\n\n[[distribution]]\nname = \"proj\"\nversion = \"0.1.0\"\nsource = { editable = \".\" }\n";
+        let tmp = write_pair(DIRECT_REGISTRY_PYPROJECT, legacy_lock).await;
+        let (code, detail) = load_uv_project(tmp.path()).await.unwrap_err();
+        assert_eq!(code, "pypi_uv_legacy_lock_unsupported");
+        assert!(
+            detail.contains("`--locked` rejects relative paths")
+                && detail.contains("rewrite them to absolute ones")
+                && detail.contains("uv >=0.2.35")
+                && detail.contains("requirements.txt"),
+            "{detail}"
+        );
+        assert!(!detail.contains("record absolute"), "{detail}");
+    }
+
+    /// `"[package.metadata.requires-dev]".contains("[package.metadata]")` is
+    /// FALSE (`.` vs `]`), so a no-op gate keyed on the bare header alone
+    /// would silently skip the requires-dev repoint if a uv release ever
+    /// omitted the empty `[package.metadata]` line — a stale specifier and a
+    /// red `--locked` with no refusal. A root unit carrying ONLY the
+    /// sub-table must still have its group entry repointed.
+    #[test]
+    fn requires_dev_is_repointed_without_a_bare_package_metadata_header() {
+        let lock = DEV_GROUP_REGISTRY_LOCK.replacen("[package.metadata]\n\n", "", 1);
+        assert!(
+            !lock.contains("[package.metadata]\n"),
+            "fixture must lack the bare header"
+        );
+        let edits = rewrite_root_metadata_entries(&lock, "six", REL_WHEEL).unwrap();
+        assert_eq!(edits.len(), 1, "the requires-dev group entry must be repointed");
+        assert_eq!(edits[0].kind, "uv_lock_requires_dev");
+        assert_eq!(
+            edits[0].new_entry,
+            format!("dev = [{{ name = \"six\", path = \"{REL_WHEEL}\" }}]")
+        );
+        assert_eq!(edits[0].specifier.as_deref(), Some("==1.16.0"));
+    }
+
+    /// atomic_write_bytes_preserving_mode stages a file next to the path and
+    /// renames over it: a symlinked pyproject.toml / uv.lock would be
+    /// REPLACED by a regular file (target left stale, git shows a
+    /// typechange). Wire refuses before ANY write with
+    /// `pypi_uv_symlink_unsupported` naming the file; revert keeps the
+    /// artifact and fails. The link stays a link, its target keeps its bytes,
+    /// and nothing under `.socket/` appears.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlinked_uv_lock_or_pyproject_refused_before_write() {
+        for linked in ["pyproject.toml", "uv.lock"] {
+            let tmp = write_pair(DIRECT_REGISTRY_PYPROJECT, DIRECT_REGISTRY_LOCK).await;
+            let real = tmp.path().join("real");
+            tokio::fs::create_dir(&real).await.unwrap();
+            let target = real.join(linked);
+            tokio::fs::rename(tmp.path().join(linked), &target)
+                .await
+                .unwrap();
+            std::os::unix::fs::symlink(&target, tmp.path().join(linked)).unwrap();
+            let target_before = tokio::fs::read(&target).await.unwrap();
+            let other = if linked == "pyproject.toml" {
+                "uv.lock"
+            } else {
+                "pyproject.toml"
+            };
+            let other_before = tokio::fs::read(tmp.path().join(other)).await.unwrap();
+
+            let p = load_uv_project(tmp.path()).await.unwrap();
+            let (code, detail) = wire_uv(
+                &p,
+                tmp.path(),
+                "six",
+                "1.16.0",
+                REL_WHEEL,
+                WHEEL_NAME,
+                WHEEL_SHA,
+                UUID,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(code, "pypi_uv_symlink_unsupported", "{linked}: {detail}");
+            assert!(detail.contains(linked), "{linked}: {detail}");
+            let meta = tokio::fs::symlink_metadata(tmp.path().join(linked))
+                .await
+                .unwrap();
+            assert!(meta.file_type().is_symlink(), "{linked}: link replaced");
+            assert_eq!(
+                tokio::fs::read(&target).await.unwrap(),
+                target_before,
+                "{linked}: target rewritten through the link"
+            );
+            assert_eq!(
+                tokio::fs::read(tmp.path().join(other)).await.unwrap(),
+                other_before,
+                "{linked}: the sibling file must be untouched"
+            );
+            assert!(
+                !tmp.path().join(".socket").exists(),
+                "{linked}: no vendor dir may appear"
+            );
+
+            // Revert against a symlinked pair: keep the artifact, fail.
+            let entry = entry_for(
+                Vec::new(),
+                UvMeta {
+                    dep_class: "direct".into(),
+                    original_specifier: None,
+                    created_sources_table: true,
+                    lock_revision: Some(3),
+                },
+            );
+            let outcome = revert_uv(&entry, tmp.path(), false).await;
+            assert!(!outcome.success, "{linked}: revert must fail");
+            assert!(outcome.kept_artifact, "{linked}: artifact must be kept");
+            let error = outcome.error.unwrap_or_default();
+            assert!(
+                error.contains("pypi_uv_symlink_unsupported") && error.contains(linked),
+                "{linked}: {error}"
+            );
+            let meta = tokio::fs::symlink_metadata(tmp.path().join(linked))
+                .await
+                .unwrap();
+            assert!(meta.file_type().is_symlink(), "{linked}: link replaced by revert");
+            assert_eq!(tokio::fs::read(&target).await.unwrap(), target_before);
+        }
     }
 }

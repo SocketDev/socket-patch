@@ -2731,6 +2731,53 @@ mod gc_tests {
         assert!(!manifest.patches.contains_key(PURL), "{manifest:?}");
     }
 
+    /// The orphan sweep keeps every un-ledgered dir a project file still
+    /// points at. A vendored requirements pin may live ONLY in a `-r`
+    /// include (the planner writes it where the original pin was), and
+    /// the sweep used to consult the root requirements.txt alone — so
+    /// after a state.json loss it deleted the include-referenced wheel as
+    /// `vendor_orphan_removed` and bricked the next `pip install`.
+    #[tokio::test]
+    async fn orphan_sweep_keeps_include_referenced_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let uuid = "1a2b3c4d-5e6f-4a1b-8c2d-9e0f1a2b3c4d";
+        let rel_wheel = format!(".socket/vendor/pypi/{uuid}/six-1.16.0-py2.py3-none-any.whl");
+        let wheel = root.join(&rel_wheel);
+        tokio::fs::create_dir_all(wheel.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&wheel, b"wheel bytes").await.unwrap();
+        tokio::fs::write(root.join("requirements.txt"), "-r requirements/base.txt\n")
+            .await
+            .unwrap();
+        tokio::fs::create_dir(root.join("requirements")).await.unwrap();
+        tokio::fs::write(
+            root.join("requirements/base.txt"),
+            format!(
+                "./{rel_wheel} --hash=sha256:{}  # socket-patch vendor: six==1.16.0\n",
+                "0".repeat(64)
+            ),
+        )
+        .await
+        .unwrap();
+
+        let sweep = sweep_orphan_vendor_dirs(root, &VendorState::default(), false).await;
+        assert_eq!(sweep.still_wired.len(), 1, "{:?}", sweep.still_wired);
+        assert_eq!(sweep.still_wired[0].uuid, uuid);
+        assert!(sweep.removed.is_empty(), "{:?}", sweep.removed);
+        assert!(wheel.is_file(), "the include-referenced wheel must survive");
+
+        // Drop the include reference: the dir is a true orphan now.
+        tokio::fs::write(root.join("requirements/base.txt"), "six==1.16.0\n")
+            .await
+            .unwrap();
+        let sweep = sweep_orphan_vendor_dirs(root, &VendorState::default(), false).await;
+        assert_eq!(sweep.removed.len(), 1, "{:?}", sweep.removed);
+        assert!(sweep.still_wired.is_empty());
+        assert!(!wheel.exists(), "the unreferenced orphan is reclaimed");
+    }
+
     /// (c) uuid dirs with no owning ledger entry are swept (wet) / counted
     /// (dry).
     #[tokio::test]

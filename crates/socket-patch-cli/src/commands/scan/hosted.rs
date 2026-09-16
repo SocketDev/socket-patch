@@ -209,8 +209,12 @@ fn pnpm_trust_workspace_unreadable_detail(server: &str, err: &std::io::Error) ->
 /// present-but-unreadable workspace file was planned as a Create and
 /// OVERWRITTEN with the root-only scaffold, destroying the user's
 /// `packages:` globs.
+///
+/// FIFO-safe (`read_regular_to_string_sync`: non-blocking open + fstat): a
+/// FIFO planted at the path classifies as unreadable (`InvalidInput`) instead
+/// of wedging the run in `open(2)`.
 fn read_workspace_for_trust(path: &std::path::Path) -> std::io::Result<Option<String>> {
-    match std::fs::read_to_string(path) {
+    match socket_patch_core::utils::fs::read_regular_to_string_sync(path) {
         Ok(text) => Ok(Some(text)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e),
@@ -343,9 +347,23 @@ fn plan_workspace_trust(existing: Option<&str>) -> TrustPlan {
 /// in JSON mode today) the bare envelope is emitted. A `--json` consumer must
 /// always get parseable stdout — never empty output plus an exit code.
 fn emit_json_error(scan_result: Option<serde_json::Value>, message: &str) {
+    emit_json_error_with_code(scan_result, None, message);
+}
+
+/// `emit_json_error` plus an additive top-level `errorCode` (the stable
+/// routing tag the CLI contract gives every classified failure) when the
+/// refusal has one; `error` stays the human message.
+fn emit_json_error_with_code(
+    scan_result: Option<serde_json::Value>,
+    code: Option<&str>,
+    message: &str,
+) {
     let mut result = scan_result.unwrap_or_else(|| serde_json::json!({ "status": "error" }));
     result["status"] = serde_json::json!("error");
     result["error"] = serde_json::json!(message);
+    if let Some(code) = code {
+        result["errorCode"] = serde_json::json!(code);
+    }
     if !result.get("redirect").is_some_and(|r| r.is_object()) {
         result["redirect"] = serde_json::json!({ "mode": "hosted" });
     }
@@ -1253,10 +1271,17 @@ pub(crate) async fn run_redirect_selected(
         }
     }
 
-    // Read the project's candidate files, run the rewriters.
+    // Read the project's candidate files, run the rewriters. Every read goes
+    // through the FIFO-safe reader (non-blocking open + fstat regular-file
+    // check): a FIFO planted under any candidate name — pyproject.toml,
+    // uv.lock, a paired script, a rush lock — wedged `scan`/`get --mode
+    // hosted` forever in a plain `read_to_string` open(2) waiting for a
+    // writer. A non-regular file now reads as "unreadable" and is skipped
+    // exactly like a missing one.
+    use socket_patch_core::utils::fs::read_regular_to_string;
     let mut files: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
     for name in REDIRECT_CANDIDATE_FILES {
-        if let Ok(content) = std::fs::read_to_string(common.cwd.join(name)) {
+        if let Ok(content) = read_regular_to_string(&common.cwd.join(name)).await {
             files.insert((*name).to_string(), content);
         }
     }
@@ -1267,11 +1292,12 @@ pub(crate) async fn run_redirect_selected(
                 .strip_suffix(".py.lock")
                 .map(|prefix| format!("{prefix}.py"))
             {
-                if let Ok(content) = std::fs::read_to_string(common.cwd.join(&script_path)) {
+                if let Ok(content) = read_regular_to_string(&common.cwd.join(&script_path)).await
+                {
                     files.insert(script_path, content);
                 }
             }
-            if let Ok(content) = std::fs::read_to_string(common.cwd.join(&path)) {
+            if let Ok(content) = read_regular_to_string(&common.cwd.join(&path)).await {
                 files.insert(path, content);
             }
         }
@@ -1287,7 +1313,7 @@ pub(crate) async fn run_redirect_selected(
     let mut rush_lock_keys: Vec<String> = Vec::new();
     if common.cwd.join("rush.json").is_file() {
         let common_lock = socket_patch_core::constants::npm_family::RUSH_COMMON_LOCK_REL;
-        if let Ok(content) = std::fs::read_to_string(common.cwd.join(common_lock)) {
+        if let Ok(content) = read_regular_to_string(&common.cwd.join(common_lock)).await {
             files.insert(common_lock.to_string(), content);
             rush_lock_keys.push(common_lock.to_string());
         }
@@ -1305,7 +1331,7 @@ pub(crate) async fn run_redirect_selected(
                     continue;
                 };
                 let key = format!("common/config/subspaces/{name}/pnpm-lock.yaml");
-                if let Ok(content) = std::fs::read_to_string(dir.join("pnpm-lock.yaml")) {
+                if let Ok(content) = read_regular_to_string(&dir.join("pnpm-lock.yaml")).await {
                     files.insert(key.clone(), content);
                     rush_lock_keys.push(key);
                 }
@@ -1699,6 +1725,41 @@ pub(crate) async fn run_redirect_selected(
     let mut records: std::collections::BTreeMap<String, PatchRecord> =
         std::collections::BTreeMap::new();
     let mut record_warnings: Vec<serde_json::Value> = Vec::new();
+
+    // SYMLINK GUARD — fail-closed, whole rewrite, before the ledger and before
+    // any write (hosted rewrites are transactional). The writer below stages
+    // next to the path and renames over it, which REPLACES a symbolic link
+    // with a detached regular copy: the link target goes stale (uv itself
+    // writes THROUGH a linked uv.lock/pylock/pyproject), and `--revert`
+    // restores bytes but never the link (git shows a 120000→100644
+    // typechange). Since Python lock discovery follows links, a shared
+    // symlinked lock reaches this point as an ordinary rewrite target; the
+    // revert side (replay.rs) already refuses linked files, so the write
+    // side must too. Applies to every ecosystem's files (a symlinked
+    // package-lock.json has the same defect) and to dry runs, so a dry run
+    // predicts the refusal instead of a rewrite that will never happen.
+    if let Some(linked) = socket_patch_core::utils::fs::first_symlink(
+        &common.cwd,
+        rewrite.files.keys().map(String::as_str),
+    )
+    .await
+    {
+        let message = format!(
+            "{linked} is a symbolic link; socket-patch rewrites files in place with an atomic \
+             rename, which would replace the link — replace the link with a regular file (or \
+             run socket-patch in the directory it points to) and re-run; nothing was written"
+        );
+        eprintln!("Error (redirect_symlinked_file_unsupported): {message}");
+        if common.json {
+            emit_json_error_with_code(
+                scan_result.take(),
+                Some("redirect_symlinked_file_unsupported"),
+                &message,
+            );
+        }
+        return 1;
+    }
+
     if !common.dry_run {
         for (purl, uuid) in &confirmed {
             match api_client.fetch_patch(effective_org_slug, uuid).await {
