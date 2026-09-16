@@ -753,18 +753,17 @@ gem 'colorize', '1.1.0'
         );
         return;
     }
-    // Find the gem directory.
-    let mut lib_file = None;
-    let bundle_root = tmp.path().join("vendor/bundle/ruby");
-    if let Ok(entries) = std::fs::read_dir(&bundle_root) {
-        for entry in entries.flatten() {
-            let candidate = entry.path().join("gems/colorize-1.1.0/lib/colorize.rb");
-            if candidate.exists() {
-                lib_file = Some(candidate);
-                break;
-            }
-        }
-    }
+    // Bundler 1 treats BUNDLE_PATH as the gem home itself; newer versions
+    // append ruby/<ABI>. Both are real vendored layouts of the same fixture.
+    let bundle_root = tmp.path().join("vendor/bundle");
+    let direct = bundle_root.join("gems/colorize-1.1.0/lib/colorize.rb");
+    let lib_file = direct.is_file().then_some(direct).or_else(|| {
+        std::fs::read_dir(bundle_root.join("ruby"))
+            .ok()?
+            .flatten()
+            .map(|entry| entry.path().join("gems/colorize-1.1.0/lib/colorize.rb"))
+            .find(|candidate| candidate.is_file())
+    });
     // bundle install reported success, so the gem and its lib file MUST be
     // present under the vendored bundle. A miss here is a real regression
     // (changed vendor layout / gem-discovery break), not a skip.
